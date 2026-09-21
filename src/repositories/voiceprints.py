@@ -27,6 +27,7 @@ Two of those queries have failure modes that are invisible in production:
   "nothing", and here that would match one company's voice against another's profiles. A
   missing company id raises.
 """
+import datetime
 import logging
 
 from psycopg.rows import dict_row
@@ -402,6 +403,39 @@ def add_sample(conn, company_id, voiceprint_id, embedding, source, s3_key, windo
     One row per event rather than an averaged vector per person: §6's withdrawal needs each
     contribution individually removable, and an average cannot be un-poisoned.
 
+    **Multi-occasion enrolment (2026-09-20 spec §3) is this function, called more than
+    once, from more than one recording session.** A profile built from a single recording
+    condition carries that condition's channel and room characteristics baked into the
+    vector — the cross-session measurement found enrolments from one session do not
+    recognise the same speaker in a different session's audio. There is no separate API:
+    a clean read-aloud sample and a site-condition sample are both just calls to this
+    function, distinguished only by `s3_key`/`window` pointing at different recordings and
+    by `source` (both are `'correction'` when a human vouched for the window, whatever
+    recording it came from).
+
+    A site-condition sample cannot be manufactured; the practical source is a turn already
+    `confirmed` for this profile under `decide_name`, with high margin and duration well
+    over `DEFAULT_MIN_TURN_S`, offered back to this function as an ordinary enrolment. This
+    is consent-compatible only when the underlying recording already carries consent for
+    voiceprint use from that person — this function's own agreement guard and
+    `upsert_profile`'s consent preconditions are not relaxed for this path.
+
+    The homogeneity guard (`window_is_homogeneous`, called by the embedder before this
+    function ever sees a window) is not loosened to admit a noisy-but-real target-
+    environment chunk — it cannot tell "more background noise than its neighbours" from
+    "two voices", and both look like a wider spread. The correct practice, not a code
+    change: enrol from the chunks of a target-environment recording that pass the guard,
+    and accept losing the ones that do not. A multi-occasion profile needs one homogeneous
+    window from the new condition, not every chunk of it.
+
+    NOTE: multi-occasion enrolment as a widespread practice is a HYPOTHESIS from the spec,
+    not a result measured in this codebase. What IS measured (Phase 0, cross-session): same-
+    person cosine similarity across sessions landed in the 0.12-0.45 range, overlapping the
+    different-person range — which is why voiceprint identification is currently OFF in
+    prod, and why mean pooling, the calibrated floor, and margin scaling (Tasks 1-3) had to
+    land first. Whether pooling several single-condition samples across occasions actually
+    closes that gap is expected, not demonstrated, and nothing here claims otherwise.
+
     `admitted_max_spread` is the homogeneity limit this window got past, and it is stored
     only when it was NOT the compiled-in default. NULL therefore means "the ordinary guard",
     and the non-NULL rows are exactly the ones worth re-examining if the loosened limit turns
@@ -577,6 +611,107 @@ def confirmations_count(conn, company_id, voiceprint_id) -> int:
         (company_id, voiceprint_id),
     ).fetchone()
     return int((row or {}).get("n") or 0)
+
+
+#: Tuning knobs, not settings anyone should trust yet (spec S1.3, S1.5). Six enrolled
+#: voices across four dates cannot fit a percentile or a minimum sample count without
+#: repeating the exact overfitting mistake DEFAULT_MIN_MARGIN's docstring warns against.
+#: Both are here, named, so the eventual calibration against real per-company correction
+#: volume changes one number in one place rather than a magic literal buried in a query.
+DEFAULT_FLOOR_PERCENTILE = 5
+DEFAULT_FLOOR_MIN_SAMPLES = 20
+
+#: When aggregate_scores switched from max to mean pooling (Task 1 of this plan). Every
+#: source='correction' row written before this carries a `best` score computed under the
+#: OLD pooling -- mixing it with post-cutover scores in one calibration set would describe
+#: neither distribution, since mean pooling systematically shifts `best` (spec S7).
+#: recompute_company_floor discards anything before this and rebuilds from post-cutover
+#: corrections only; a company with too few of those simply returns to the S1.5 no-floor
+#: fallback until enough accumulate -- a safe, already-specified state, not a new one
+#: invented for this cutover.
+MEAN_POOLING_CUTOVER = datetime.datetime(2026, 9, 20, tzinfo=datetime.timezone.utc)
+
+
+def recompute_company_floor(conn, company_id, percentile=DEFAULT_FLOOR_PERCENTILE,
+                            min_samples=DEFAULT_FLOOR_MIN_SAMPLES,
+                            since=MEAN_POOLING_CUTOVER) -> dict | None:
+    """Rebuild one company's rejection floor from its OWN human-asserted corrections.
+
+    **Only `source='correction'` rows enter this.** The alternative -- calibrating from
+    everything `decide_name` confirms -- is circular and already named as the mistake to
+    avoid: on 2026-09-10 the existing margin-only chain confirmed a stranger at
+    `best=0.445`, and a distribution that already contains 0.445 has a low percentile at
+    or below 0.445, so the floor could never again reject that exact class of error. Every
+    wrong confirmation would lower the bar for the next one. `source='correction_
+    propagation'` (one human assertion spread by the model's own similarity judgment,
+    lambda_voiceprint_writer.py:116 — "only `source='correction'` counts"),
+    `source='voiceprint_match'` (the system's own guess, lambda_voiceprint_writer.py:308 —
+    "`source='voiceprint_match'`, never `'correction'`"), and `source='label_inheritance'`
+    (inherited from a transcriber label, not independently asserted) are excluded for the
+    same reason, one level removed each.
+
+    `best` here is the score `decide_name` ranked first for the turn a correction landed
+    on -- `speaker_turn_names.score`, stamped at write time by whichever caller recorded
+    the correction. A turn with no stored score (an older row, or one written before
+    scoring existed) cannot be measured and is excluded rather than treated as zero.
+
+    Returns `None` and writes nothing below `min_samples` qualifying rows -- a floor
+    calibrated from too few points is noise, and no floor (today's margin-only behaviour)
+    is safer than a wrong one (spec S1.5).
+
+    `since` excludes any `source='correction'` row written before it (default
+    `MEAN_POOLING_CUTOVER`). A row written before the cutover has a `best` score computed
+    under the OLD (max) pooling; re-scoring it under the new (mean) pooling would require
+    re-running match arithmetic against embeddings that may since have been withdrawn -- a
+    clean discard-and-rebuild is cheaper and costs only a longer stay in the no-floor
+    fallback (S1.5), which is already the safe state for a company with too little evidence.
+    A company whose corrections are ALL pre-cutover therefore has zero qualifying rows here
+    and gets `None` -- never a floor computed from too few post-cutover rows, and never one
+    built from a mix of the two scales.
+    """
+    _require_company(company_id)
+    cur = conn.cursor(row_factory=dict_row)
+    count_row = cur.execute(
+        "SELECT count(*) AS n FROM speaker_turn_names "
+        "WHERE company_id = %s AND source = 'correction' "
+        "  AND score IS NOT NULL AND superseded_at IS NULL "
+        "  AND created_at >= %s",
+        (company_id, since)).fetchone()
+    n = int((count_row or {}).get("n") or 0)
+    if n < min_samples:
+        return None
+    rows = cur.execute(
+        "SELECT score FROM speaker_turn_names "
+        "WHERE company_id = %s AND source = 'correction' "
+        "  AND score IS NOT NULL AND superseded_at IS NULL "
+        "  AND created_at >= %s",
+        (company_id, since)).fetchall()
+    import numpy as np
+    scores = np.array([float(r["score"]) for r in rows], dtype=np.float64)
+    floor = float(np.percentile(scores, percentile))
+    cur.execute(
+        "INSERT INTO speaker_voiceprint_company_floors "
+        "(company_id, floor, sample_count, computed_at) "
+        "VALUES (%s, %s, %s, now()) "
+        "ON CONFLICT (company_id) DO UPDATE "
+        "  SET floor = EXCLUDED.floor, sample_count = EXCLUDED.sample_count, "
+        "      computed_at = now()",
+        (company_id, floor, n))
+    return {"company_id": company_id, "floor": floor, "sample_count": n}
+
+
+def company_floor(conn, company_id) -> float | None:
+    """This company's current rejection floor, or None if it has none.
+
+    None covers two cases the caller must treat identically: nobody has run the recompute
+    job yet, and the company has too few `source='correction'` rows to calibrate
+    responsibly (spec S1.5). Both mean "apply no floor", never a borrowed default.
+    """
+    _require_company(company_id)
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT floor FROM speaker_voiceprint_company_floors WHERE company_id = %s",
+        (company_id,)).fetchone()
+    return float(row["floor"]) if row else None
 
 
 def record_turn_name(conn, company_id, session_base, turn_ref, state, source,

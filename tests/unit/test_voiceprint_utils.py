@@ -106,6 +106,127 @@ def test_the_margin_is_configurable_but_its_default_is_not_the_fitted_cut():
     assert d.status == "tentative"
 
 
+# ----------------------------------------------------------
+# The rejection floor (2026-09-20 spec S1). A NEW, FINAL check, after the margin, before
+# returning confirmed. It can only ever demote confirmed -> tentative, never produce
+# unknown by itself (duration and "no profiles" already own that path) and never promote.
+# Absent (floor=None, today's default) it is a no-op -- every existing test above this
+# block must keep passing unchanged.
+# ----------------------------------------------------------
+
+
+def test_a_would_be_confirmation_below_the_floor_is_downgraded_to_tentative():
+    """The 09-10 shape: a clear margin, but the winning score itself is not plausible for
+    this company's own corrected history."""
+    d = vp.decide_name({"Mike": 0.445, "Leo": 0.177}, duration_s=6.0, floor=0.50)
+    assert d.status == "tentative"
+    assert d.name == "Mike", "the lean is still shown -- a demotion is not a withholding"
+    assert "floor" in d.reason.lower()
+
+
+def test_a_would_be_confirmation_above_the_floor_stays_confirmed():
+    d = vp.decide_name({"Ben": 0.65, "Zoe": 0.20}, duration_s=6.0, floor=0.50)
+    assert d.status == "confirmed" and d.name == "Ben"
+
+
+def test_no_floor_is_a_no_op_exactly_as_today():
+    """Every company runs margin-only until it calibrates one (S1.5). floor=None, the
+    default, must reproduce every pre-floor test in this file with no other change."""
+    d = vp.decide_name({"Ben": 0.48, "Zoe": 0.08, "Mike": 0.07}, duration_s=6.0)
+    assert d.status == "confirmed" and d.name == "Ben"
+
+
+def test_the_floor_never_turns_a_tentative_result_into_a_confirmation():
+    """The floor is a final, demotion-only check. It has nothing to promote from a
+    tentative margin outcome, and this pins that it never tries."""
+    d = vp.decide_name({"Ben": 0.30, "Zoe": 0.26}, duration_s=8.0, floor=0.0)
+    assert d.status == "tentative", (
+        "a floor of 0.0 (trivially cleared) must not rescue a result the margin already "
+        "downgraded")
+
+
+def test_the_floor_never_fires_on_a_single_profile_result():
+    """Single-profile decisions are already tentative (no runner-up to beat) and stay
+    tentative -- the floor has nothing to demote and must not raise or change the reason
+    in a way that hides the real one."""
+    d = vp.decide_name({"Ben": 0.9}, duration_s=10.0, floor=0.99)
+    assert d.status == "tentative" and d.name == "Ben"
+    assert "runner-up" in d.reason.lower()
+
+
+def test_the_floor_never_produces_unknown():
+    """Failing the floor is a lean, not a refusal -- unknown stays owned by duration and
+    'no profiles', per S1.4."""
+    d = vp.decide_name({"Mike": 0.10, "Leo": -0.05}, duration_s=6.0, floor=0.9)
+    assert d.status != "unknown"
+
+
+# ----------------------------------------------------------
+# Margin scaling with the candidate pool (2026-09-20 spec S4). profiles_for_matching
+# returns every consented profile for a company, unlimited -- decide_name's runner-up is
+# drawn from a POOL whose size, not the number of people actually in the room, is what the
+# margin has to survive. A fixed margin comfortable at 6 profiles becomes a harder bar at
+# 60 for reasons that have nothing to do with matching getting worse.
+#
+# No curve is fit here -- six enrolled voices across four dates cannot support one without
+# repeating the +0.262 overfitting mistake this module's own docstring already warns
+# against. What ships is the SHAPE: a pool-size-aware lookup, with today's fixed margin as
+# the fallback below a size threshold, exactly as the floor falls back to "no floor" below
+# its own minimum (S1.5) -- the same shape, twice, for the same reason.
+# ----------------------------------------------------------
+
+
+def test_below_the_scale_threshold_the_margin_is_unchanged():
+    """The pool sizes every existing test in this file was written against (2-3 profiles)
+    must reproduce today's DEFAULT_MIN_MARGIN exactly -- this task must not silently
+    change any decision already pinned above."""
+    assert vp.effective_margin(pool_size=3) == vp.DEFAULT_MIN_MARGIN
+    assert vp.effective_margin(pool_size=vp.DEFAULT_MARGIN_SCALE_THRESHOLD) == vp.DEFAULT_MIN_MARGIN
+
+
+def test_an_explicit_min_margin_override_is_never_replaced_by_the_scaled_value():
+    """Existing callers pass min_margin explicitly (e.g. the fitted-cut test). An explicit
+    override is a caller's deliberate choice and the scaling mechanism must not second-guess
+    it -- only the DEFAULT is pool-size-aware."""
+    d = vp.decide_name({"Ben": 0.5, "Zoe": 0.2}, duration_s=6.0, min_margin=0.9)
+    assert d.status == "tentative"
+
+
+def test_decide_name_still_defaults_correctly_at_small_pool_sizes():
+    """Every pre-existing decide_name test above this block used 1-3 profiles and no
+    min_margin override -- this pins that Task 3 did not move their outcomes."""
+    d = vp.decide_name({"Ben": 0.48, "Zoe": 0.08, "Mike": 0.07}, duration_s=6.0)
+    assert d.status == "confirmed" and d.name == "Ben"
+
+
+def test_a_large_pool_uses_a_wider_effective_margin_by_default():
+    """The mechanism, not a fitted number: a pool past the threshold must not silently keep
+    using the same constant a 6-profile company gets, or DEFAULT_MIN_MARGIN would already be
+    "the curve" in disguise."""
+    small_margin = vp.effective_margin(pool_size=3)
+    large_margin = vp.effective_margin(pool_size=vp.DEFAULT_MARGIN_SCALE_THRESHOLD * 5)
+    assert large_margin >= small_margin
+    assert large_margin > vp.DEFAULT_MIN_MARGIN, (
+        "a pool well past the threshold that still gets exactly today's constant means "
+        "nothing about scale actually changed the bar")
+
+
+def test_decide_name_uses_pool_size_for_its_default_margin():
+    """A margin that would confirm at a small pool size may no longer clear at a large one,
+    with nothing else about the scores changed -- the mechanism reaching decide_name, not
+    just existing as a standalone function."""
+    scores_small_pool = {"Ben": 0.40, "Zoe": 0.24}   # margin 0.16, clears 0.15
+    d_small = vp.decide_name(scores_small_pool, duration_s=6.0)
+    assert d_small.status == "confirmed"
+
+    huge_pool = {"Ben": 0.40, "Zoe": 0.24}
+    huge_pool.update({f"stranger_{i}": 0.10 for i in range(vp.DEFAULT_MARGIN_SCALE_THRESHOLD * 5)})
+    d_large = vp.decide_name(huge_pool, duration_s=6.0)
+    assert d_large.status == "tentative", (
+        "the same 0.16 margin over the SAME runner-up must be judged against a wider "
+        "effective margin once the pool is large, or pool size never actually mattered")
+
+
 # ---- the enrolment contamination guard (v2 §6) ----
 
 def test_a_window_containing_two_voices_is_refused_for_enrolment():
@@ -143,17 +264,8 @@ def test_no_frames_at_all_is_not_a_pass():
 # ----------------------------------------------------------
 
 
-def test_two_samples_of_one_person_collapse_to_their_best():
-    rows = [
-        {"person_key": "ben", "score": 0.31},
-        {"person_key": "ben", "score": 0.43},
-        {"person_key": "zoe", "score": 0.08},
-    ]
-    assert vp.aggregate_scores(rows) == {"ben": 0.43, "zoe": 0.08}
-
-
 def test_a_person_with_two_profiles_no_longer_beats_himself():
-    """The Phase 0 case, with its measured numbers rather than invented ones.
+    """The Phase 0 case, restated with its measured numbers.
 
     Ben's own two profiles sit ~0.08 apart and the nearest other voice is far below both.
     Ungrouped they are each other's runner-up and the margin never clears 0.15."""
@@ -169,6 +281,57 @@ def test_a_person_with_two_profiles_no_longer_beats_himself():
     decision = vp.decide_name(vp.aggregate_scores(rows), duration_s=5.0)
     assert decision.status == "confirmed"
     assert decision.name == "ben"
+
+
+# ----------------------------------------------------------
+# Mean, not max (2026-09-20). A profile pooled across recording conditions (a clean
+# read-aloud sample plus a site-condition sample) spikes under max whenever one sample's
+# ACOUSTIC CONDITIONS match a stranger's turn, not because the person is present -- measured
+# on 09-10, where a pooled-MAX profile put a person who was never in the room top of the
+# list at +0.054/+0.055. Mean absorbs that spike into an average across conditions.
+# ----------------------------------------------------------
+
+
+def test_two_samples_of_one_person_collapse_to_their_mean_not_their_max():
+    rows = [
+        {"person_key": "ben", "score": 0.31},
+        {"person_key": "ben", "score": 0.43},
+        {"person_key": "zoe", "score": 0.08},
+    ]
+    assert vp.aggregate_scores(rows) == pytest.approx({"ben": 0.37, "zoe": 0.08})
+
+
+def test_a_stray_high_sample_no_longer_wins_on_its_own():
+    """The exact failure mode mean pooling exists to remove: one sample scoring high for
+    reasons that have nothing to do with the turn's speaker (matching acoustic conditions,
+    not matching voice) used to carry the whole profile under max. Under mean it is pulled
+    back toward the profile's other, more representative samples."""
+    rows = [
+        {"person_key": "ben", "score": 0.05},
+        {"person_key": "ben", "score": 0.06},
+        {"person_key": "ben", "score": 0.62},  # a site-condition spike, not a real match
+        {"person_key": "mike", "score": 0.10},
+    ]
+    scores = vp.aggregate_scores(rows)
+    assert scores["ben"] == pytest.approx((0.05 + 0.06 + 0.62) / 3)
+    assert scores["ben"] < 0.62, (
+        "max pooling would have reported 0.62 here -- the whole point of this change is "
+        "that a single spiking sample no longer speaks for the profile")
+
+
+def test_a_person_with_two_profiles_no_longer_beats_himself_under_mean():
+    """The Phase 0 case restated under mean pooling. Aggregation still has to happen before
+    the margin means anything -- mean pooling does not remove the need for `person_key`
+    grouping, it only changes what happens once rows are grouped."""
+    rows = [
+        {"person_key": "ben", "score": 0.425},
+        {"person_key": "ben", "score": 0.505},
+        {"person_key": "zoe", "score": 0.078},
+    ]
+    decision = vp.decide_name(vp.aggregate_scores(rows), duration_s=5.0)
+    assert decision.status == "confirmed"
+    assert decision.name == "ben"
+    assert decision.margin == pytest.approx((0.425 + 0.505) / 2 - 0.078)
 
 
 def test_profiles_without_a_user_do_not_collide():

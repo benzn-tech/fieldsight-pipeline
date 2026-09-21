@@ -3758,6 +3758,88 @@ Resources:
       Policies:
         - VPCAccessPolicy: {}
 
+  # ------------------------------------------------------------------
+  # Per-company voiceprint rejection floor -- scheduled recompute
+  # (docs/superpowers/specs/2026-09-20-a-voice-the-library-does-not-know.md S1.3)
+  #
+  # decide_name's margin check alone confirms whoever is least wrong among the enrolled
+  # profiles even when nobody enrolled was in the room (measured 2026-09-10: a stranger
+  # confirmed at best=0.445, margin 0.268). The floor is a second, company-calibrated
+  # check on top, and it must be recomputed on a schedule rather than at match time --
+  # matching the existing "derived/materialized state, recomputed by a job" pattern
+  # `_write_snapshot` uses for programmes/{site_id}/programme.json.
+  #
+  # Shares VoiceprintWriterFunction's handler and DB wiring verbatim (same in-VPC half,
+  # same PsycopgLayer, same deploy-time credential injection -- BUG-36: in-VPC with no
+  # NAT, so a runtime Secrets Manager call black-holes with zero log output) rather than
+  # a second copy of the connection plumbing. `Input` on the Schedule event supplies the
+  # op key the handler dispatches on, since an EventBridge Schedule invokes with a fixed
+  # event and this dispatcher is op-keyed -- an S3 event once reached this same handler
+  # with no `op` at all and died in 3ms with "unknown op None" (see
+  # test_an_s3_event_is_understood_rather_than_rejected in the embedder's tests, the same
+  # class of mistake one layer over).
+  #
+  # Cadence: rate(6 hours), not ExtractionBacklogFunction's hourly. The floor only moves
+  # when new source='correction' rows accumulate, and corrections are rare by construction
+  # (spec S1.5: a company can accumulate plenty of matched turns and still have too few
+  # corrected ones to calibrate). Hourly would recompute against unchanged data on most
+  # runs -- all cost, no freshness gained -- for a check whose worst-case staleness is "a
+  # demotion-only safety net is a few hours behind", not a user-facing outage.
+  # VoiceReaperFunction's rate(6 hours) is the closer precedent by cadence even though
+  # ExtractionBacklogFunction is the closer precedent by shape (a single sweep, no
+  # per-item fan-out, no reserved concurrency); this copies the shape from one and the
+  # cadence reasoning from the other rather than picking one silently.
+  #
+  # Timeout: 120s, same as VoiceprintWriterFunction and ExtractionBacklogFunction, well
+  # under the rate(6 hours)=21600s interval enforced by
+  # test_template_timeout_invariants.py::test_a_scheduled_function_is_shorter_than_its_interval.
+  # No ReservedConcurrentExecutions cap: unlike RecordingSegmentsFunction's 5-minute dirty-
+  # day sweep, a 6-hour cadence with a 120s timeout cannot overlap itself under any
+  # realistic company count, so FinalizeSweepFunction's OVERLAP_ACCEPTED reason does not
+  # apply here and this function is not added to that dict.
+  #
+  # The handler loops over every company in one invocation (repositories.companies.
+  # list_companies) rather than fanning out one invocation per company: the Schedule
+  # trigger has no natural payload to drive a per-company fan-out with, and
+  # ExtractionBacklogFunction's own shape (a single sweep, not one invocation per backlog
+  # item) is the direct precedent for not inventing one.
+  # ------------------------------------------------------------------
+  FloorRecomputeFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-floor-recompute", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_voiceprint_writer.lambda_handler
+      Timeout: 120
+      MemorySize: 256
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          # Deploy-time credential injection — see MigrateFunction notes (BUG-36: in-VPC with
+          # no NAT, so a Secrets Manager call at runtime black-holes with zero log output).
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+      Policies:
+        - VPCAccessPolicy: {}
+      Events:
+        FloorSweep:
+          Type: Schedule
+          Properties:
+            Schedule: rate(6 hours)
+            Description: Recompute every company's speaker-voiceprint rejection floor from its own human corrections.
+            Input: '{"op": "recompute_floors"}'
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
+
   SuggestionWriterFunction:
     Type: AWS::Serverless::Function
     Condition: HasDb

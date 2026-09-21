@@ -533,9 +533,11 @@ def test_the_rewritten_text_is_what_gets_embedded(monkeypatch):
     assert seen["texts"] == ["when is James finishing the grid?"]
 
 
-def test_the_answering_prompt_gets_the_original_and_no_history(monkeypatch):
-    """SS2's whole claim. Assert the ABSENCE explicitly: no history text reaches
-    build_rag_prompt, and it is called with the caller's original question."""
+def test_the_answering_prompt_gets_asked_when_rewritten_and_no_history(monkeypatch):
+    """Spec 2026-09-20 SS3.2: when a rewrite ran, the answering prompt must be
+    built from `asked` -- the standalone text retrieval already searched with
+    -- not the caller's literal pronoun-bearing text. Still assert the
+    ABSENCE explicitly: no history text reaches build_rag_prompt."""
     monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")  # Task 10: gated
     wire(monkeypatch, chunks=[{"chunk_text": "level 3 grid note", "id": "c-1",
                                "topic_id": "t-1", "source_s3_key": "x",
@@ -555,9 +557,64 @@ def test_the_answering_prompt_gets_the_original_and_no_history(monkeypatch):
                                   "answer": "level 3 is behind"}]})
 
     asked_with, kwargs = prompts[0]
-    assert asked_with == "when is he finishing it?"
+    assert asked_with == "rewritten", "the answering prompt must see what retrieval searched for"
     assert "history" not in kwargs
     assert "level 3 is behind" not in str(kwargs)
+
+
+def test_the_answering_prompt_gets_the_original_when_not_rewritten(monkeypatch):
+    """Spec 2026-09-20 SS3.1: when no rewrite ran, the answering prompt is
+    byte-identical to today -- built from the caller's own `question`."""
+    wire(monkeypatch, chunks=[{"chunk_text": "level 3 grid note", "id": "c-1",
+                               "topic_id": "t-1", "source_s3_key": "x",
+                               "report_date": "2026-09-17"}])
+
+    prompts = []
+    real_build = laa.build_rag_prompt
+    def spy_build(question, chunks, **kw):
+        prompts.append((question, kw))
+        return real_build(question, chunks, **kw)
+    monkeypatch.setattr(laa, "build_rag_prompt", spy_build)
+
+    laa._rag_answer({"question": "what happened at Ellesmere?", "caller_sub": SUB})
+
+    asked_with, kwargs = prompts[0]
+    assert asked_with == "what happened at Ellesmere?"
+    assert "history" not in kwargs
+
+
+def test_the_retry_prompt_also_gets_asked_when_rewritten(monkeypatch):
+    """Spec 2026-09-20: the 1-in-13 language-leak retry must not regress to
+    pronoun-blind answering just because it rebuilds the prompt at a second
+    call site (src/lambda_ask_agent.py:1672)."""
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")  # Task 10: gated
+    wire(monkeypatch, chunks=[{"chunk_text": "level 3 grid note", "id": "c-1",
+                               "topic_id": "t-1", "source_s3_key": "x",
+                               "report_date": "2026-09-17"}])
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: ("rewritten", True))
+    # `answer_language` is imported inside _rag_answer, so it is NOT an
+    # attribute of `laa` -- patch the module object the function-local import
+    # resolves to. See Step 1.
+    import answer_language
+    monkeypatch.setattr(answer_language, "violates",
+                        lambda answer: True)  # force the retry every time
+
+    prompts = []
+    real_build = laa.build_rag_prompt
+    def spy_build(question, chunks, **kw):
+        prompts.append((question, kw))
+        return real_build(question, chunks, **kw)
+    monkeypatch.setattr(laa, "build_rag_prompt", spy_build)
+
+    laa._rag_answer({"question": "when is he finishing it?", "caller_sub": SUB,
+                     "history": [{"question": "ceiling grid?",
+                                  "answer": "level 3 is behind"}]})
+
+    assert len(prompts) == 2, "expected the primary prompt and the retry prompt"
+    for asked_with, kwargs in prompts:
+        assert asked_with == "rewritten"
+        assert "history" not in kwargs
 
 
 def test_a_body_without_history_sends_the_payload_it_sends_today(monkeypatch):
