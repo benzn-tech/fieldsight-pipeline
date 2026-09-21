@@ -403,9 +403,16 @@ def _recompute_floors(event):
                 logger.exception(
                     "floor recompute failed for company %s -- its floor is left "
                     "unchanged and the sweep continues with the next company", c["id"])
-                results.append({"company_id": c["id"], "floor": None, "error": True})
+                results.append({"company_id": str(c["id"]), "floor": None, "error": True})
                 continue
-            results.append(result or {"company_id": c["id"], "floor": None})
+            # str() the id before it enters the response: psycopg hands back
+            # uuid.UUID for a uuid column, and the Lambda runtime marshals this
+            # return value with json.dumps, which cannot serialise one. The unit
+            # fakes pass string ids, so the whole suite stayed green while the
+            # deployed function raised Runtime.MarshalError on every real run.
+            row = result or {"company_id": c["id"], "floor": None}
+            row["company_id"] = str(row["company_id"])
+            results.append(row)
     written = sum(1 for r in results if r.get("floor") is not None)
     logger.info("floor recompute: %d/%d compan%s now have a floor (%d failed)",
                 written, len(results), "y" if len(results) == 1 else "ies", failed)
