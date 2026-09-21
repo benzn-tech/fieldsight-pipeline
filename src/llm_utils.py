@@ -26,6 +26,8 @@ import time
 
 import urllib3
 
+from llm_usage import log_usage as _log_usage
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -160,6 +162,13 @@ def qwen_model_for(thinking):
     return QWEN_MODEL_NONTHINKING
 
 
+# `_log_usage` used to be defined here. It now lives in llm_usage.py (imported
+# above as `_log_usage` to keep every existing call site in this file
+# unchanged) so corroboration_client.py can write the identical LLM_USAGE line
+# without importing this module -- see llm_usage.py's docstring for why that
+# specific direction matters.
+
+
 def api_key_configured():
     """True if the active provider's key is set (used for fail-fast checks)."""
     if LLM_PROVIDER == "qwen":
@@ -168,7 +177,7 @@ def api_key_configured():
 
 
 def call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None,
-             model=None, deadline=None):
+             model=None, deadline=None, caller="unknown"):
     """Return (text, None) on success or (None, error_string) on failure.
 
     `deadline` (seconds from now) bounds the whole retry ladder, and is opt-in
@@ -194,6 +203,11 @@ def call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None,
     thinking modes -- the Ask function answers on a screen, where a slower and
     more discursive model is fine, and into a speaker, where it is not.
 
+    caller: a short tag (e.g. "rewrite", "answer", "extraction", "verdict")
+    naming the call site, carried on the LLM_USAGE log line so cost can be
+    attributed to it. Optional -- every pre-existing caller keeps logging as
+    "unknown" until it opts in; nothing about their behaviour changes.
+
     Measured 2026-09-09 on the same voice-shaped prompt, three runs each:
 
         meta/muse-spark-1.3-contributor   6.53s   651 completion, 599 REASONING
@@ -203,8 +217,8 @@ def call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None,
     """
     if LLM_PROVIDER == "qwen":
         return _call_qwen(prompt, max_tokens, force_json, enable_thinking, model,
-                          deadline=deadline)
-    return _call_anthropic(prompt, max_tokens, deadline=deadline)
+                          deadline=deadline, caller=caller)
+    return _call_anthropic(prompt, max_tokens, deadline=deadline, caller=caller)
 
 
 def active_model(enable_thinking=None):
@@ -320,7 +334,7 @@ def _post_with_retry(url, body, headers, deadline=None, clock=time.monotonic):
     return None, last_error
 
 
-def _call_anthropic(prompt, max_tokens, deadline=None):
+def _call_anthropic(prompt, max_tokens, deadline=None, caller="unknown"):
     if not ANTHROPIC_API_KEY:
         logger.error("ANTHROPIC_API_KEY not set")
         return None, "ANTHROPIC_API_KEY not configured"
@@ -339,6 +353,7 @@ def _call_anthropic(prompt, max_tokens, deadline=None):
     # the nine callers never asked for a deadline and nothing about their path,
     # including how it is spelled, should move.
     _bound = {"deadline": deadline} if deadline is not None else {}
+    started = time.monotonic()
     resp, err = _post_with_retry(
         "https://api.anthropic.com/v1/messages",
         body,
@@ -349,12 +364,32 @@ def _call_anthropic(prompt, max_tokens, deadline=None):
         },
         **_bound,
     )
+    elapsed = time.monotonic() - started
     if resp is None:
         logger.error(f"Claude API call failed: {err}")
         return None, err
     data = json.loads(resp.data.decode("utf-8"))
     if resp.status == 200:
         blocks = [b["text"] for b in data.get("content", []) if b.get("type") == "text"]
+        # FAIL OPEN: a telemetry bug must never become an Ask outage. The
+        # vendor's usage shape is read here on a best-effort basis and any
+        # surprise in it (missing key, unexpected type) must not stop the
+        # caller from getting its answer.
+        try:
+            usage = data.get("usage") or {}
+            _log_usage(
+                "anthropic", data.get("model") or CLAUDE_MODEL, caller, elapsed,
+                prompt_tokens=usage.get("input_tokens"),
+                completion_tokens=usage.get("output_tokens"),
+                # Anthropic has no separate "reasoning" bucket in this API
+                # shape (extended-thinking tokens, when used, are counted
+                # inside output_tokens) -- left absent rather than guessed.
+                reasoning_tokens=None,
+                cache_read_tokens=usage.get("cache_read_input_tokens"),
+                cache_write_tokens=usage.get("cache_creation_input_tokens"),
+            )
+        except Exception:  # noqa: BLE001 - telemetry must never break the call
+            logger.warning("LLM_USAGE logging failed (anthropic)", exc_info=True)
         return "\n".join(blocks), None
     msg = data.get("error", {}).get("message", f"HTTP {resp.status}")
     logger.error(f"Claude API error: {msg}")
@@ -377,7 +412,7 @@ def _is_dashscope(base_url):
 
 
 def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
-               deadline=None):
+               deadline=None, caller="unknown"):
     if not QWEN_API_KEY:
         logger.error("QWEN_API_KEY / DASHSCOPE_API_KEY not set")
         return None, "QWEN_API_KEY not configured"
@@ -539,6 +574,26 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
             data.get("model"), elapsed, usage.get("prompt_tokens"), completion,
             detail.get("reasoning_tokens"), choice.get("finish_reason"),
             (" %.1f tok/s" % (completion / elapsed)) if completion and elapsed > 0 else "")
+        # FAIL OPEN, same as the anthropic path: a shape surprise here (a
+        # vendor behind OpenRouter that omits `usage`, or nests cache counters
+        # differently) must never cost the caller its already-successful
+        # answer.
+        try:
+            prompt_detail = usage.get("prompt_tokens_details") or {}
+            _log_usage(
+                "qwen", data.get("model") or payload["model"], caller, elapsed,
+                prompt_tokens=usage.get("prompt_tokens"),
+                completion_tokens=completion,
+                reasoning_tokens=detail.get("reasoning_tokens"),
+                # OpenRouter/OpenAI-shaped vendors report a cache HIT as
+                # prompt_tokens_details.cached_tokens; there is no separate
+                # cache-write counter on this path today, so it stays absent
+                # rather than guessed at.
+                cache_read_tokens=prompt_detail.get("cached_tokens"),
+                cache_write_tokens=None,
+            )
+        except Exception:  # noqa: BLE001 - telemetry must never break the call
+            logger.warning("LLM_USAGE logging failed (qwen)", exc_info=True)
         return content, None
     err_obj = data.get("error") or {}
     msg = err_obj.get("message", f"HTTP {resp.status}")

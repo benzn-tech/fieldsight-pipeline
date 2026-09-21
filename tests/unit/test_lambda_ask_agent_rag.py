@@ -94,7 +94,7 @@ def wire(monkeypatch, *, chunks=None, embed_vec=None, claude_answer=("Grounded a
     fake_client = FakeLambdaClient({"chunks": chunks if chunks is not None else []})
     monkeypatch.setattr(laa, "_get_lambda_client", lambda: fake_client)
 
-    monkeypatch.setattr(llm_utils, "call_llm", lambda prompt, max_tokens=4096, force_json=False: claude_answer)
+    monkeypatch.setattr(llm_utils, "call_llm", lambda prompt, max_tokens=4096, force_json=False, **kw: claude_answer)
 
     return fake_client
 
@@ -124,7 +124,7 @@ def test_embeds_question(monkeypatch):
     monkeypatch.setattr(dashscope_utils, "embed", fake_embed)
     fake_client = FakeLambdaClient({"chunks": []})
     monkeypatch.setattr(laa, "_get_lambda_client", lambda: fake_client)
-    monkeypatch.setattr(llm_utils, "call_llm", lambda p, max_tokens=4096, force_json=False: ("unused", None))
+    monkeypatch.setattr(llm_utils, "call_llm", lambda p, max_tokens=4096, force_json=False, **kw: ("unused", None))
 
     invoke(make_event(question="  What happened?  "))
 
@@ -155,7 +155,7 @@ def test_default_k_is_5(monkeypatch):
 
 
 def test_no_chunks_returns_not_found_empty_citations(monkeypatch):
-    def fail_if_called(prompt, max_tokens=4096, force_json=False):
+    def fail_if_called(prompt, max_tokens=4096, force_json=False, **kw):
         raise AssertionError("call_llm must not be called when there are no chunks")
 
     wire(monkeypatch, chunks=[])
@@ -176,7 +176,7 @@ def test_no_chunks_returns_not_found_empty_citations(monkeypatch):
 def test_prompt_contains_numbered_chunks(monkeypatch):
     captured = {}
 
-    def fake_call_llm(prompt, max_tokens=4096, force_json=False):
+    def fake_call_llm(prompt, max_tokens=4096, force_json=False, **kw):
         captured["prompt"] = prompt
         return "answer", None
 

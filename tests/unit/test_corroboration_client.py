@@ -16,6 +16,7 @@ tests are carried over deliberately rather than rewritten from scratch, so a
 reader can see the guarantees survived the port.
 """
 import json
+import logging
 
 import pytest
 
@@ -308,3 +309,128 @@ def test_the_api_key_is_never_returned_in_the_reply(monkeypatch):
     _install(monkeypatch, FakePool(FakeResponse(401, {"error": {"message": "bad key"}})))
     reply = client.call("q", timeout=13)
     assert "test-key" not in repr(reply)
+
+
+# ------------------------------------------------------ LLM_USAGE telemetry
+#
+# `ask_rewrite.standalone_question`, `web_answer._verdict` and
+# `web_answer._ask_the_web` are the calls the shared `llm_utils.call_llm`
+# telemetry cannot see -- they go through this client instead, which is the
+# entire reason it needs the same log line. One format, via the shared
+# `llm_usage.log_usage` helper (never a second implementation here): see
+# `test_the_client_is_one_vendor_on_every_stack` above for why this module may
+# not import `llm_utils` to get it.
+
+def _usage_lines(caplog):
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("LLM_USAGE")]
+
+
+def test_usage_is_logged_with_reasoning_and_cache_and_caller(monkeypatch, caplog):
+    """The OpenAI-compatible chat/completions `usage` shape this vendor
+    actually returns: completion-side reasoning nests under
+    `completion_tokens_details`, a cache HIT nests under
+    `prompt_tokens_details.cached_tokens`. Not assumed from any other client
+    in this repo -- read directly off a fixture shaped the way this vendor's
+    docs and this repo's other OpenRouter-shaped reads describe it."""
+    payload = {
+        "model": "google/gemini-3.8-flash",
+        "choices": [{"message": {"content": "an answer"}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": 4200,
+            "completion_tokens": 65,
+            "completion_tokens_details": {"reasoning_tokens": 0},
+            "prompt_tokens_details": {"cached_tokens": 3800},
+        },
+    }
+    _install(monkeypatch, FakePool(FakeResponse(200, payload)))
+    with caplog.at_level(logging.INFO):
+        reply = client.call("q", timeout=13, caller="rewrite")
+    assert reply.ok
+    lines = _usage_lines(caplog)
+    assert len(lines) == 1, lines
+    line = lines[0]
+    assert "provider=openrouter" in line
+    assert "model=google/gemini-3.8-flash" in line
+    assert "caller=rewrite" in line
+    assert "prompt_tokens=4200" in line
+    assert "completion_tokens=65" in line
+    assert "reasoning_tokens=0" in line
+    assert "cache_read_tokens=3800" in line
+    # Never the prompt or the completion text.
+    assert "an answer" not in line
+
+
+def test_the_three_real_call_sites_are_distinguishable(monkeypatch, caplog):
+    """The whole point of this round: the rewrite, the web verdict and the web
+    answer must never collapse into the same tag, because they are the
+    comparison the caching decision depends on."""
+    payload = {"choices": [{"message": {"content": "x"}, "finish_reason": "stop"}],
+              "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+    for tag in ("rewrite", "web_verdict", "web_answer"):
+        _install(monkeypatch, FakePool(FakeResponse(200, payload)))
+        with caplog.at_level(logging.INFO):
+            client.call("q", timeout=13, caller=tag)
+    lines = _usage_lines(caplog)
+    assert len(lines) == 3
+    tags = {line.split("caller=")[1].split()[0] for line in lines}
+    assert tags == {"rewrite", "web_verdict", "web_answer"}
+
+
+def test_missing_usage_key_fails_open(monkeypatch, caplog):
+    """A vendor 200 that omits `usage` entirely must not cost the reader their
+    already-successful reply -- a telemetry bug must never become an outage.
+    This is the case that matters most here: the rewrite's documented
+    degradation path is falling back to the caller's own question, and
+    telemetry must never be what triggers that fallback."""
+    payload = {"choices": [{"message": {"content": "an answer"}, "finish_reason": "stop"}]}
+    _install(monkeypatch, FakePool(FakeResponse(200, payload)))
+    with caplog.at_level(logging.INFO):
+        reply = client.call("q", timeout=13, caller="rewrite")
+    assert reply.ok
+    assert reply.text == "an answer"
+    lines = _usage_lines(caplog)
+    assert len(lines) == 1
+    assert "prompt_tokens=-" in lines[0]
+    assert "completion_tokens=-" in lines[0]
+    assert "reasoning_tokens=-" in lines[0]
+    assert "cache_read_tokens=-" in lines[0]
+
+
+def test_a_malformed_usage_value_fails_open_and_still_returns_the_reply(monkeypatch, caplog):
+    """A shape surprise (not just a missing key) inside `usage` must not raise
+    out of `call` -- the fail-open try/except has to catch more than the
+    happy-path absence case."""
+    payload = {"choices": [{"message": {"content": "an answer"}, "finish_reason": "stop"}],
+              "usage": "not a dict"}
+    _install(monkeypatch, FakePool(FakeResponse(200, payload)))
+    with caplog.at_level(logging.INFO):
+        reply = client.call("q", timeout=13, caller="rewrite")
+    assert reply.ok
+    assert reply.text == "an answer"
+
+
+def test_caller_defaults_to_unknown_when_not_passed(monkeypatch, caplog):
+    """Every call site that has not opted in yet keeps working, tagged
+    'unknown' rather than raising or silently vanishing from the log."""
+    payload = {"choices": [{"message": {"content": "an answer"}, "finish_reason": "stop"}],
+              "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+    _install(monkeypatch, FakePool(FakeResponse(200, payload)))
+    with caplog.at_level(logging.INFO):
+        client.call("q", timeout=13)
+    lines = _usage_lines(caplog)
+    assert "caller=unknown" in lines[0]
+
+
+def test_an_empty_completion_still_logs_usage(monkeypatch, caplog):
+    """`call` turns an empty completion into an error (`reply.error ==
+    "empty completion"`), but the tokens the vendor billed for producing that
+    empty string are still real spend and still worth a line."""
+    payload = {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}],
+              "usage": {"prompt_tokens": 50, "completion_tokens": 0}}
+    _install(monkeypatch, FakePool(FakeResponse(200, payload)))
+    with caplog.at_level(logging.INFO):
+        reply = client.call("q", timeout=13, caller="web_answer")
+    assert not reply.ok and reply.error == "empty completion"
+    lines = _usage_lines(caplog)
+    assert len(lines) == 1
+    assert "caller=web_answer" in lines[0]

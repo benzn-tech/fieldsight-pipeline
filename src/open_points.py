@@ -307,7 +307,7 @@ def attach_resolutions(points, call_llm):
     # of whichever call ran last. Off: this is a short, tightly-shaped answer,
     # and thinking measured ~10x on this provider.
     raw, err = call_llm(prompt, max_tokens=2000, force_json=True,
-                        enable_thinking=False)
+                        enable_thinking=False, caller="open_points_resolution")
     if err or not raw:
         stats["error"] = err or "empty reply"
         return stats

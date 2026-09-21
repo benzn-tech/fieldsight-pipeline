@@ -60,7 +60,7 @@ def test_unknown_mode_falls_back_to_screen():
 def test_rag_answer_threads_mode_voice(monkeypatch):
     captured = {}
 
-    def fake_call_llm(prompt, max_tokens=4096, force_json=False):
+    def fake_call_llm(prompt, max_tokens=4096, force_json=False, **kw):
         captured["prompt"] = prompt
         return "Spoken answer.", None
 

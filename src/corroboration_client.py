@@ -60,6 +60,8 @@ import time
 
 import urllib3
 
+from llm_usage import log_usage
+
 logger = logging.getLogger()
 
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -182,7 +184,8 @@ def _parse(data) -> Reply:
 
 
 def call(prompt, *, timeout, model=None, max_tokens=1024, web=False,
-         effort="low", system=None, retry_budget=None) -> Reply:
+         effort="low", system=None, retry_budget=None,
+         caller="unknown") -> Reply:
     """One call, bounded by `timeout` seconds, with at most one retry.
 
     `timeout` is per attempt and is not a suggestion: it is the caller's share of
@@ -195,6 +198,13 @@ def call(prompt, *, timeout, model=None, max_tokens=1024, web=False,
     happens only when the failure was retryable AND that number covers another
     full attempt. The default is no retry at all, because a caller that has not
     thought about its budget must not be allowed to spend it twice.
+
+    `caller`: a short tag naming the call site (e.g. "rewrite", "web_verdict",
+    "web_answer"), carried on the LLM_USAGE log line via the shared
+    `llm_usage.log_usage` helper -- one log format for every LLM client this
+    repo carries. Optional so an untagged call still logs, as
+    `caller="unknown"`, rather than raising; a guard test is what makes
+    "unknown" in production logs impossible rather than this default.
     """
     api_key = os.environ.get("CORROBORATION_API_KEY")
     if not api_key:
@@ -250,7 +260,8 @@ def call(prompt, *, timeout, model=None, max_tokens=1024, web=False,
 
         elapsed = time.time() - attempt_start
         if resp.status == 200:
-            reply = _parse(json.loads(resp.data.decode("utf-8")))
+            data = json.loads(resp.data.decode("utf-8"))
+            reply = _parse(data)
             reply.elapsed = time.time() - started
             if not (reply.text or "").strip():
                 # A 200 carrying nothing. Measured shape: with no plugin
@@ -259,6 +270,36 @@ def call(prompt, *, timeout, model=None, max_tokens=1024, web=False,
                 # said nothing", which is a claim about the world where the
                 # truth is a claim about our configuration.
                 reply.error = "empty completion"
+            # FAIL OPEN, same posture the other production LLM client in this
+            # repo takes: a telemetry bug must never cost the reader their
+            # answer or their corroboration cards. `usage` is read on a
+            # best-effort basis; any surprise in its shape (missing key,
+            # unexpected type) must not stop `reply` from reaching the caller.
+            #
+            # This is the OpenAI-compatible chat/completions `usage` object --
+            # completion-side reasoning tokens nest under
+            # `completion_tokens_details`, a cache HIT (there is no separate
+            # cache-WRITE counter on this shape) nests under
+            # `prompt_tokens_details.cached_tokens`. NOT assumed identical to
+            # any other vendor's usage shape in this repo: this client is a
+            # different code path on a different endpoint, and the two are
+            # read independently rather than by analogy.
+            try:
+                usage = data.get("usage") or {}
+                completion_detail = usage.get("completion_tokens_details") or {}
+                prompt_detail = usage.get("prompt_tokens_details") or {}
+                log_usage(
+                    "openrouter", data.get("model") or model or DEFAULT_MODEL,
+                    caller, reply.elapsed,
+                    prompt_tokens=usage.get("prompt_tokens"),
+                    completion_tokens=usage.get("completion_tokens"),
+                    reasoning_tokens=completion_detail.get("reasoning_tokens"),
+                    cache_read_tokens=prompt_detail.get("cached_tokens"),
+                    cache_write_tokens=None,
+                )
+            except Exception:  # noqa: BLE001 - telemetry must never break the call
+                logger.warning("LLM_USAGE logging failed (corroboration)",
+                               exc_info=True)
             return reply
 
         if resp.status in _RETRYABLE and attempt + 1 < attempts_left:

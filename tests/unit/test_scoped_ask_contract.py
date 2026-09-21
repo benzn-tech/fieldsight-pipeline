@@ -104,7 +104,7 @@ def wire_ask(mp, answer=("Grounded answer [1].", None)):
     mp.setattr(laa, "_get_lambda_client", lambda: client)
     seen = {"llm_calls": 0}
 
-    def fake_llm(prompt, max_tokens=4096, force_json=False):
+    def fake_llm(prompt, max_tokens=4096, force_json=False, **kw):
         seen["prompt"] = prompt
         seen["llm_calls"] += 1
         return answer

@@ -1654,7 +1654,7 @@ def extract_group(bucket, artifact):
     n_segments = sum(len(s['turns']) for s in sources)
     raw_response, error = llm_utils.call_llm(
         prompt, max_tokens=max_tokens_for(n_segments), force_json=True,
-        enable_thinking=True)
+        enable_thinking=True, caller="extract_group")
     if raw_response is None:
         logger.error("group %s: LLM call failed: %s", artifact['groupId'], error)
         return None
@@ -1883,8 +1883,12 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
     # Tier selects the model mode: the live pass must stay well inside the
     # Lambda timeout (thinking mode routinely blew past llm_utils.HTTP_TIMEOUT
     # and got hard-killed at 180s), the final pass buys quality with time.
+    # The two tiers are also two different COST shapes (thinking off vs on),
+    # so they get two different caller tags rather than one "extract_session"
+    # average that would hide which one dominates.
     raw_response, error = llm_utils.call_llm(
-        prompt, max_tokens=max_tokens, force_json=True, enable_thinking=final)
+        prompt, max_tokens=max_tokens, force_json=True, enable_thinking=final,
+        caller="extract_session_final" if final else "extract_session_live")
     if raw_response is None:
         raise RuntimeError(f"Claude call failed for session {session_base}: {error}")
 

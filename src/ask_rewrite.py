@@ -97,8 +97,14 @@ def standalone_question(question, history, *, call, timeout, clock=time.monotoni
         return original, False
 
     try:
+        # caller="rewrite" so this call is distinguishable, on the LLM_USAGE
+        # log line, from the verdict and web-answer calls the same client
+        # serves -- the comparison this telemetry exists to answer: whether
+        # the conversation history in PROMPT (up to 6 turns, 2000 chars each)
+        # makes this the prompt worth caching.
         reply = call(PROMPT.format(history=block, question=original),
-                     timeout=timeout, max_tokens=MAX_TOKENS, effort="low")
+                     timeout=timeout, max_tokens=MAX_TOKENS, effort="low",
+                     caller="rewrite")
     except Exception as e:                        # noqa: BLE001 - any transport failure
         logger.warning("ask rewrite: transport failed: %s", e)
         return original, False
