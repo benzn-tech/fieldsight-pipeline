@@ -615,6 +615,12 @@ def _match(event):
     # withdrawn profile that still matches is not a withdrawal. Duplicating that filter
     # here would be a second place for it to be forgotten.
     profiles = event.get("profiles") or []
+    # This company's calibrated rejection floor, or None if it has not crossed the
+    # minimum source='correction' sample count yet (repositories.voiceprints.
+    # company_floor). It travels on the event rather than being read here because this
+    # function is non-VPC and cannot reach Aurora -- the writer's `_profiles` reads it
+    # once per invocation and hands it across with the vectors.
+    floor = event.get("company_floor")
     by_key = {}
     for p in profiles:
         by_key.setdefault(p["person_key"], p)
@@ -635,7 +641,7 @@ def _match(event):
         v = embed_audio(clip, sr)
         rows = [{"person_key": p["person_key"],
                  "score": vp.cosine(v, p["embedding"])} for p in profiles]
-        d = vp.decide_name(vp.aggregate_scores(rows), duration_s=duration)
+        d = vp.decide_name(vp.aggregate_scores(rows), duration_s=duration, floor=floor)
         status = d.status
         if status == "confirmed" and by_key.get(d.name, {}).get("status") == "tentative":
             # (see below) a profile that has not earned confirmation cannot hand one out —
@@ -1196,8 +1202,14 @@ def _from_match_artifact(bucket, key):
             f"match artifact {key} is missing company_id/user_folder/date/session_base; the "
             f"producer has all four and guessing any of them reads a key that cannot exist")
 
-    profiles = invoke_writer({"op": "profiles", "company_id": company_id,
-                              "site_id": req.get("site_id")}).get("profiles") or []
+    profiles_reply = invoke_writer({"op": "profiles", "company_id": company_id,
+                                    "site_id": req.get("site_id")})
+    profiles = profiles_reply.get("profiles") or []
+    # The company's calibrated rejection floor, read once here (not per turn) and passed
+    # to `_match` below -- dropping it on this hop would leave a calibrated floor sitting
+    # in the database doing nothing, since this S3-triggered path is the one production
+    # actually runs the matcher through.
+    company_floor_value = profiles_reply.get("company_floor")
     if not profiles:
         # Not an error, and worth a line rather than a silent zero: "nobody was recognised"
         # and "there was nobody to recognise" look identical downstream, and on TEST the
@@ -1232,7 +1244,8 @@ def _from_match_artifact(bucket, key):
         return {"session": session, "matched": 0, "profiles": 0, "mode": req.get("mode")}
 
     out = _match({"session": session, "user_folder": folder, "date": date,
-                  "profiles": profiles, "turns": req.get("turns") or []})
+                  "profiles": profiles, "turns": req.get("turns") or [],
+                  "company_floor": company_floor_value})
 
     by_key = {p["person_key"]: p for p in profiles}
     named = []

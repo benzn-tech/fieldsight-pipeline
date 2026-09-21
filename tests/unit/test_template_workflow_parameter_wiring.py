@@ -871,7 +871,7 @@ def test_the_voiceprint_writer_has_the_layer_the_embedder_cannot_have():
     raising ModuleNotFoundError on every invocation behind a green deploy.
     """
     t = open(TEMPLATE, encoding="utf-8").read()
-    block = t[t.index("  VoiceprintWriterFunction:"):t.index("  SuggestionWriterFunction:")]
+    block = _top_level_block(t, "  VoiceprintWriterFunction:")
     assert "!Ref PsycopgLayer" in block, "the writer cannot reach Aurora without psycopg"
     assert "VadLayerArn" not in block, (
         "the writer took the cp312 layer as well; the two are mutually exclusive")
@@ -885,7 +885,7 @@ def test_the_embedder_may_invoke_the_writer_and_nothing_else():
     missing grant here fails at runtime with an AccessDenied nobody sees until a real
     correction is made."""
     t = open(TEMPLATE, encoding="utf-8").read()
-    block = t[t.index("  SpeakerEmbedFunction:"):t.index("  VoiceprintWriterFunction:")]
+    block = _top_level_block(t, "  SpeakerEmbedFunction:")
     assert "lambda:InvokeFunction" in block
     assert "voiceprint-writer" in block
     assert "Resource: '*'" not in block and 'Resource: "*"' not in block

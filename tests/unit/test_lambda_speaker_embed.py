@@ -396,6 +396,32 @@ def test_a_match_scores_against_the_profiles_in_the_payload(stub_embedder, monke
     assert out["results"][0]["name"] == "ben"
 
 
+def test_match_passes_the_companys_floor_into_decide_name(stub_embedder, monkeypatch):
+    """The floor arrives on the event (from the writer's _profiles response) and must
+    reach decide_name, or a calibrated floor sits in the database doing nothing."""
+    captured = {}
+    real_decide_name = vp.decide_name
+
+    def spy(scores, duration_s, **kwargs):
+        captured["floor"] = kwargs.get("floor")
+        return real_decide_name(scores, duration_s, **kwargs)
+
+    monkeypatch.setattr(se.vp, "decide_name", spy)
+    key = "users/u/audio/2026-08-13/x_c0000.wav"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes()}))
+    se.lambda_handler({"op": "match", "session": "s", "user_folder": "u",
+                       "date": "2026-08-13", "company_floor": 0.42,
+                       "profiles": [
+                           {"person_key": "ben", "status": "confirmed",
+                            "embedding": list(np.ones(192))},
+                           {"person_key": "zoe", "status": "confirmed",
+                            "embedding": list(np.concatenate([np.ones(96),
+                                                              -np.ones(96)]))}],
+                       "turns": [{"source_filename": "x_c0000.wav",
+                                  "start_sec": 0.0, "end_sec": 5.0}]}, None)
+    assert captured["floor"] == 0.42
+
+
 def test_an_enrolment_returns_the_vector_instead_of_storing_it(stub_embedder, monkeypatch):
     """The writer stores it, in VPC, in the column that already requires consent. Returning
     it keeps the vector out of S3 entirely -- the biometric-residence defect that moved
