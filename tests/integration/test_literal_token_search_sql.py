@@ -11,6 +11,39 @@ production by SQL that no test ever ran (project memory), so this file is the
 one place the keyword arm's UNION, the GIN expression index, and the shared
 _scope_predicate() are actually executed rather than string-matched.
 
+HOW TO GET A REAL POSTGRES FOR THIS FILE (2026-09-21)
+----------------------------------------------------
+These are skipped unless TEST_DATABASE_URL is set. Aurora is in-VPC and not
+reachable from a developer machine, so the route that works locally is an
+embedded Postgres:
+
+    uv run --with pgserver python -c "import pgserver, tempfile;         print(pgserver.get_server(tempfile.mkdtemp()).get_uri())"
+
+then export that URI as TEST_DATABASE_URL.
+
+USE `uv run --with pgserver`, NOT `uv pip install pgserver` into a venv. The two
+install routes ship DIFFERENT extension sets, measured on the same machine on
+the same day: under `uv run --with pgserver`, `pgcrypto` is present and
+`CREATE EXTENSION pgcrypto` succeeds, so migration 0001 applies as written.
+Under a venv install, `pgcrypto.control` is absent and 0001 fails, and the only
+way forward is hand-stubbing a no-op control file inside the package tree --
+which works, but makes a green run depend on an undocumented local hack. If you
+hit that failure, you are on the wrong install route; switch rather than stub.
+
+(The one thing this repo uses pgcrypto for is `gen_random_uuid()` as a column
+default, which has been a Postgres core builtin since v13 and needs no
+extension. That is why stubbing works at all. It is not a reason to stub.)
+
+Two caveats kept deliberately, neither checked by anyone:
+  * This is local PostgreSQL 16.2, not TEST/prod Aurora. If Aurora's text-search
+    configuration were ever changed from the stock 'english', the tokenisation
+    these tests rely on would not carry over.
+  * This pgserver build ships no tzdata, so `SHOW timezone` is GMT and
+    `pg_timezone_names` raises. Five tests in
+    tests/integration/test_closure_kpi_and_batch_lookup.py fail here for that
+    reason alone; they fail identically on a clean checkout of origin/develop,
+    so they are the environment, not this branch.
+
 Uses the `db` fixture from tests/conftest.py: migrated once per session,
 rolled back per test (`tests/integration/test_scope_acl.py`'s pattern) rather
 than the older raw-psycopg-connect-and-rollback style in
