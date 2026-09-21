@@ -1252,10 +1252,13 @@ def _rag_answer(body):
         # Ask conversation memory (spec 2026-09-17 SS2, SS3.1-3.3, SS4.3): a
         # follow-up such as "when is he finishing it?" embeds to nothing
         # useful and parses no date. Spend the history HERE, on producing one
-        # standalone question to retrieve with, and nowhere else -- the
-        # answering prompt below still gets the caller's own `question`, not
-        # `asked` (SS2: a chat history is a copy taken before a deletion and
-        # must never be the thing retrieval or the web branch acts on).
+        # standalone question to retrieve with, and nowhere else -- `history`
+        # itself never reaches the answering prompt below or the web branch
+        # (SS2: a chat history is a copy taken before a deletion and must
+        # never be the thing retrieval or the web branch acts on). As of
+        # spec 2026-09-20, `asked` -- the rewrite's own output, not the
+        # history -- does reach the answering prompt when a rewrite ran; see
+        # the comment at :1600.
         #
         # `ask_history` is imported HERE for the same reason `query_slots` is
         # below: the legacy hand-built prod zips a fixed file list and
@@ -1597,7 +1600,19 @@ def _rag_answer(body):
                 "asked": asked if rewritten else None,
             }
 
-        prompt = build_rag_prompt(question, chunks, mode=body.get("mode"),
+        # Spec 2026-09-20 (amends the 2026-09-17 SS2 comment above): the
+        # answering prompt must see what retrieval actually searched for. A
+        # rewrite that resolved "it" to "PS4" for the embed at :1400 and the
+        # web verdict at :1590 must resolve it here too, or the model has no
+        # antecedent for the pronoun the rewrite already solved -- measured
+        # UCPK2 2026-09-20, turn 2 of 3: "why do we talk it? who requested?"
+        # retrieved the right chunks and then answered "the excerpts do not
+        # contain enough context to identify what 'it' refers to." `question`
+        # only when `rewritten` is False (SS3.1): byte-identical to today for
+        # every first-turn question. Still no `history` parameter here --
+        # that boundary (spec 2026-09-17 SS2) is unchanged.
+        prompt = build_rag_prompt(asked if rewritten else question, chunks,
+                                  mode=body.get("mode"),
                                   today=today, basis=basis, pinned_topic=pinned_topic)
         # A spoken answer and a screen answer are the same question asked of two
         # different products, so they may reach two different models. Measured
@@ -1661,7 +1676,11 @@ def _rag_answer(body):
                         answer_language.cjk_ratio(answer))
         if not err and answer_language.violates(answer):
             logger.warning("  Ask answer language leaked; retrying once")
-            retry_prompt = build_rag_prompt(question, chunks, mode=body.get("mode"),
+            # Same substitution as the primary prompt above and for the same
+            # reason: the retry must not silently revert to pronoun-blind
+            # answering on the 1-in-13 turns that need it.
+            retry_prompt = build_rag_prompt(asked if rewritten else question, chunks,
+                                            mode=body.get("mode"),
                                             today=today, basis=basis,
                                             insist_language=True, pinned_topic=pinned_topic)
             retried, retry_err = llm_utils.call_llm(retry_prompt, max_tokens=MAX_ANSWER_TOKENS,
