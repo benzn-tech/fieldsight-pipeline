@@ -43,12 +43,45 @@ def _iter_source_files():
             yield os.path.join(SRC_DIR, name)
 
 
+_UNPARSEABLE_MARKERS = ("call_llm", "corroboration_client")
+
+
+def _parse_or_skip(path):
+    """The file's AST, or None when it cannot be parsed AS THE DEPLOY TARGET PARSES IT.
+
+    CI runs Python 3.11 -- the Lambda runtime's version -- while a developer machine
+    here runs 3.12+, where PEP 701 made an f-string with a backslash inside the
+    expression part legal. `src/patch_report_generator.py` contains exactly that, so
+    this walk raised SyntaxError on CI and passed locally: the guard was checking a
+    different language than production runs.
+
+    Skipping unparseable files outright would be the wrong repair, because then an
+    untagged call site inside one would never be caught -- a guard that quietly stops
+    looking. So a file that cannot be parsed is skipped ONLY when it does not mention
+    either client by name anywhere in its text; if it does, this FAILS, because at that
+    point the honest statement is "I cannot verify this file", not "this file is fine".
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        src = f.read()
+    try:
+        return ast.parse(src, filename=path)
+    except SyntaxError:
+        mentioned = [m for m in _UNPARSEABLE_MARKERS if m in src]
+        assert not mentioned, (
+            f"{path} cannot be parsed by this interpreter yet mentions {mentioned}; "
+            f"this guard cannot verify its call sites are tagged. Either make the file "
+            f"parse on the deploy target's Python version, or move it out of src/ if it "
+            f"is a developer script rather than shipped code.")
+        return None
+
+
 def _call_llm_sites(path):
     """(lineno, has_caller) for every `call_llm(...)` / `x.call_llm(...)` CALL
     node in this file -- never a substring match, so text that merely mentions
     `call_llm(` in a docstring or comment is invisible to this walk."""
-    with open(path, "r", encoding="utf-8") as f:
-        tree = ast.parse(f.read(), filename=path)
+    tree = _parse_or_skip(path)
+    if tree is None:
+        return []
 
     sites = []
     for node in ast.walk(tree):
@@ -94,8 +127,9 @@ def _corroboration_call_sites(path):
     covered by a direct behavioural test instead
     (test_ask_rewrite.py::test_the_rewrite_call_is_tagged).
     """
-    with open(path, "r", encoding="utf-8") as f:
-        tree = ast.parse(f.read(), filename=path)
+    tree = _parse_or_skip(path)
+    if tree is None:
+        return []
 
     aliases = _corroboration_client_aliases(tree)
     if not aliases:
@@ -218,3 +252,28 @@ def test_an_unrelated_dot_call_is_not_mistaken_for_the_llm_client():
             f.write("def f(some_mock):\n"
                     "    return some_mock.call('p', timeout=5)\n")
         assert _corroboration_call_sites(unrelated) == []
+
+
+def test_an_unparseable_file_is_skipped_only_when_it_mentions_neither_client(tmp_path):
+    """The skip is the dangerous half of this guard, so it is pinned both ways.
+
+    Version-independent on purpose: it uses a file that no Python parses, rather than
+    the 3.11-vs-3.12 f-string difference that produced the real failure, so this test
+    keeps meaning the same thing whichever interpreter runs it.
+    """
+    import pytest
+
+    quiet = tmp_path / "quiet.py"
+    quiet.write_text("def (:\n", encoding="utf-8")
+    assert _parse_or_skip(str(quiet)) is None, (
+        "a file that cannot be parsed and never mentions either client carries no "
+        "call site this guard could miss, so skipping it is safe")
+
+    loud = tmp_path / "loud.py"
+    loud.write_text("def (:\n# call_llm(prompt)\n", encoding="utf-8")
+    with pytest.raises(AssertionError) as exc:
+        _parse_or_skip(str(loud))
+    assert "cannot be parsed" in str(exc.value), (
+        "an unparseable file that DOES mention a client must fail loudly -- silently "
+        "skipping it is how a guard stops guarding without anyone noticing")
+
