@@ -376,7 +376,8 @@ def _generate_document(artifact, context=None):
             "generation budget exhausted before the model call: %.1fs left "
             "after reserving %.1fs for the render and result write"
             % (model_budget, RENDER_AND_WRITE_RESERVE_SECONDS))
-    text, err = llm_utils.call_llm(prompt, max_tokens=8000, deadline=model_budget)
+    text, err = llm_utils.call_llm(prompt, max_tokens=8000, deadline=model_budget,
+                                   caller="session_report")
     if err or not (text or "").strip():
         raise RuntimeError(err or "empty answer from model")
 

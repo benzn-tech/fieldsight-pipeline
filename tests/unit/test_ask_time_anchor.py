@@ -58,7 +58,7 @@ def wire(monkeypatch, responses, answer="Grounded answer [1]."):
     monkeypatch.setattr(laa, "_get_lambda_client", lambda: client)
     seen = {}
 
-    def fake_llm(prompt, max_tokens=4096, force_json=False):
+    def fake_llm(prompt, max_tokens=4096, force_json=False, **kw):
         seen["prompt"] = prompt
         return (answer, None)
 

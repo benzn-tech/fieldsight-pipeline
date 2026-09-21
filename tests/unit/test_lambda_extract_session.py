@@ -119,7 +119,7 @@ OUT_KEY = f"extractions/Benl1/2026-07-06/{SESSION_BASE}.json"
 
 
 def _fake_call_llm_returning(payload):
-    def _fake(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
+    def _fake(prompt, max_tokens=4096, force_json=False, enable_thinking=None, **kw):
         return json.dumps(payload), None
     return _fake
 
@@ -189,7 +189,7 @@ def test_prompt_contains_all_segment_turns(monkeypatch):
 
     captured = {}
 
-    def fake_call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
+    def fake_call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None, **kw):
         captured["prompt"] = prompt
         captured["max_tokens"] = max_tokens
         return json.dumps({"topics": [], "declared_site": None}), None
@@ -217,7 +217,7 @@ def test_extract_session_requests_force_json(monkeypatch):
 
     captured = {}
 
-    def _cap(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
+    def _cap(prompt, max_tokens=4096, force_json=False, enable_thinking=None, **kw):
         captured["force_json"] = force_json
         return json.dumps({"topics": [], "declared_site": None}), None
 
@@ -368,7 +368,7 @@ def test_claude_failure_raises(monkeypatch):
     # call_llm itself fails
     monkeypatch.setattr(
         llm_utils, "call_llm",
-        lambda prompt, max_tokens=4096, force_json=False, enable_thinking=None: (None, "boom"),
+        lambda prompt, max_tokens=4096, force_json=False, enable_thinking=None, **kw: (None, "boom"),
     )
     with pytest.raises(RuntimeError):
         les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
@@ -377,7 +377,7 @@ def test_claude_failure_raises(monkeypatch):
     # call_llm succeeds but returns unparseable JSON
     monkeypatch.setattr(
         llm_utils, "call_llm",
-        lambda prompt, max_tokens=4096, force_json=False, enable_thinking=None: ("not json at all {{{", None),
+        lambda prompt, max_tokens=4096, force_json=False, enable_thinking=None, **kw: ("not json at all {{{", None),
     )
     with pytest.raises(RuntimeError):
         les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
@@ -462,7 +462,7 @@ def test_live_pass_is_throttled_within_the_interval(monkeypatch):
     monkeypatch.setattr(les, "s3", lambda: fake_s3)
     calls = []
 
-    def _counting(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
+    def _counting(prompt, max_tokens=4096, force_json=False, enable_thinking=None, **kw):
         calls.append(enable_thinking)
         return json.dumps({"topics": [], "declared_site": None}), None
 
@@ -482,7 +482,7 @@ def test_final_pass_ignores_the_throttle_and_uses_thinking(monkeypatch):
     monkeypatch.setattr(les, "s3", lambda: fake_s3)
     calls = []
 
-    def _counting(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
+    def _counting(prompt, max_tokens=4096, force_json=False, enable_thinking=None, **kw):
         calls.append(enable_thinking)
         return json.dumps({"topics": [], "declared_site": None}), None
 
@@ -646,7 +646,7 @@ def test_final_request_artifact_routes_to_a_final_pass(monkeypatch):
     monkeypatch.setattr(les, "S3_BUCKET", BUCKET)
     calls = []
 
-    def _counting(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
+    def _counting(prompt, max_tokens=4096, force_json=False, enable_thinking=None, **kw):
         calls.append(enable_thinking)
         return json.dumps({"topics": [], "declared_site": None}), None
 

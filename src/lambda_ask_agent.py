@@ -503,9 +503,15 @@ def build_prompt(question, report_text, transcript_text, scope, metadata):
 def call_claude(prompt, max_tokens=MAX_ANSWER_TOKENS):
     """Prose answer via llm_utils (provider-dispatched). Lazy import keeps the
     legacy minimal-zip deploy target working. force_json stays False -- the ask
-    path returns markdown/plain prose, not JSON."""
+    path returns markdown/plain prose, not JSON.
+
+    caller="ask_legacy": the S3-file (non-RAG) answer path, kept separate from
+    the RAG synthesis tags below -- it is a different prompt shape (whole
+    report+transcript, not cited excerpts) and its cost should never be read
+    as part of the RAG number."""
     import llm_utils
-    return llm_utils.call_llm(prompt, max_tokens=max_tokens, force_json=False)
+    return llm_utils.call_llm(prompt, max_tokens=max_tokens, force_json=False,
+                              caller="ask_legacy")
 
 
 # ============================================================
@@ -1749,13 +1755,18 @@ def _rag_answer(body):
         if voice_model.lower() in ("", "none"):
             voice_model = None
         _t_synthesis = time.monotonic()
+        # caller="ask_answer" on both branches below -- voice-model and
+        # screen-model are the same logical call (the RAG synthesis) reached
+        # by two different models, not two different call SHAPES. The retry a
+        # few lines down gets its own tag because it is a genuinely separate,
+        # rare cost that would otherwise be folded into this one's average.
         if voice and voice_model:
             answer, err = llm_utils.call_llm(
                 prompt, max_tokens=MAX_ANSWER_TOKENS, force_json=False,
-                enable_thinking=False, model=voice_model)
+                enable_thinking=False, model=voice_model, caller="ask_answer")
         else:
             answer, err = llm_utils.call_llm(prompt, max_tokens=MAX_ANSWER_TOKENS,
-                                             force_json=False)
+                                             force_json=False, caller="ask_answer")
         # The primary synthesis call only -- the language-leak retry a few
         # lines below is a distinct, rare cost and would otherwise inflate
         # this stage's usual number for the one turn in ~13 that needs it.
@@ -1795,7 +1806,7 @@ def _rag_answer(body):
                                             today=today, basis=basis,
                                             insist_language=True, pinned_topic=pinned_topic)
             retried, retry_err = llm_utils.call_llm(retry_prompt, max_tokens=MAX_ANSWER_TOKENS,
-                                                    force_json=False)
+                                                    force_json=False, caller="ask_answer_retry")
             if not retry_err and retried and not answer_language.violates(retried):
                 logger.info("  Ask answer language recovered on retry")
                 answer = retried

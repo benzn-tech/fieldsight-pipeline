@@ -602,7 +602,8 @@ Rules:
 
 def call_claude_structured(prompt, max_tokens=4096):
     """Delegates to llm_utils (provider-dispatched). force_json: structured task."""
-    return llm_utils.call_llm(prompt, max_tokens=max_tokens, force_json=True)
+    return llm_utils.call_llm(prompt, max_tokens=max_tokens, force_json=True,
+                              caller="meeting_minutes")
 
 
 def extract_json_from_response(raw_text):

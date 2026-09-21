@@ -479,7 +479,7 @@ def brief_from_turns(turns, call_llm=None, *, owner_name=None):
     # the env would mean every number this was designed against was measured on
     # a configuration that never shipped.
     raw, _err = call_llm(build_brief_prompt(turns, owner_name=owner_name), max_tokens=MAX_TOKENS,
-                         force_json=True, enable_thinking=True)
+                         force_json=True, enable_thinking=True, caller="session_brief")
     brief = parse_brief(raw)
     if not brief:
         return None

@@ -114,7 +114,7 @@ def _clean_match_setup(monkeypatch, confidence=0.9, suggested_progress=100,
     monkeypatch.setattr(lpm.dashscope_utils, "embed", lambda texts: [[1.0, 0.0]] * len(texts))
     monkeypatch.setattr(
         llm_utils, "call_llm",
-        lambda prompt, max_tokens=512, force_json=False: (
+        lambda prompt, max_tokens=512, force_json=False, **kw: (
             json.dumps({
                 "task_id": "T-1", "confidence": confidence,
                 "suggested_status": "completed", "suggested_progress": suggested_progress,
@@ -354,7 +354,7 @@ def test_handler_invalid_progress_coerced_and_no_status_drops_suggestion(monkeyp
     req_key, fake_lambda = _clean_match_setup(monkeypatch)
     monkeypatch.setattr(
         llm_utils, "call_llm",
-        lambda prompt, max_tokens=512, force_json=False: (
+        lambda prompt, max_tokens=512, force_json=False, **kw: (
             json.dumps({
                 "task_id": "T-1", "confidence": 0.9,
                 "suggested_status": None, "suggested_progress": 105,
@@ -375,7 +375,7 @@ def test_handler_invalid_progress_coerced_valid_status_still_suggests(monkeypatc
     req_key, fake_lambda = _clean_match_setup(monkeypatch)
     monkeypatch.setattr(
         llm_utils, "call_llm",
-        lambda prompt, max_tokens=512, force_json=False: (
+        lambda prompt, max_tokens=512, force_json=False, **kw: (
             json.dumps({
                 "task_id": "T-1", "confidence": 0.9,
                 "suggested_status": "completed", "suggested_progress": 105,
@@ -570,7 +570,7 @@ def test_handler_progress_decrease_not_real_change(monkeypatch):
     # Override the Claude stub to also propose the SAME status as current.
     monkeypatch.setattr(
         llm_utils, "call_llm",
-        lambda prompt, max_tokens=512, force_json=False: (
+        lambda prompt, max_tokens=512, force_json=False, **kw: (
             json.dumps({
                 "task_id": "T-1", "confidence": 0.9,
                 "suggested_status": "in_progress", "suggested_progress": 30,
@@ -697,7 +697,7 @@ def _dispatch_claude(impact_response):
     """A call_llm stub that distinguishes the suggestion-phase prompt
     from the impact-phase prompt by content: build_impact_prompt's finding
     lines always contain "finding_id=", never present in build_prompt."""
-    def _dispatch(prompt, max_tokens=512, force_json=False):
+    def _dispatch(prompt, max_tokens=512, force_json=False, **kw):
         if "finding_id=" in prompt:
             return json.dumps(impact_response), None
         return json.dumps({
@@ -746,7 +746,7 @@ def test_report_artifact_without_findings_skips_impact_phase(monkeypatch):
     req_key, fake_lambda = _clean_match_setup(monkeypatch)
     call_count = {"n": 0}
 
-    def counting_claude(prompt, max_tokens=512, force_json=False):
+    def counting_claude(prompt, max_tokens=512, force_json=False, **kw):
         call_count["n"] += 1
         return json.dumps({
             "task_id": "T-1", "confidence": 0.9,
@@ -785,7 +785,7 @@ def test_zero_survivor_finding_excluded_from_claude_call(monkeypatch):
 
     captured_prompts = []
 
-    def dispatch_and_capture(prompt, max_tokens=512, force_json=False):
+    def dispatch_and_capture(prompt, max_tokens=512, force_json=False, **kw):
         captured_prompts.append(prompt)
         if "finding_id=" in prompt:
             return json.dumps({"impacts": [

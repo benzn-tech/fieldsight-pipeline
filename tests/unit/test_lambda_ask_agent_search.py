@@ -157,7 +157,7 @@ def test_ask_mode_unaffected_still_calls_claude(monkeypatch):
     monkeypatch.setattr(laa, "_get_lambda_client", lambda: fc)
     seen = {}
 
-    def rec(prompt, max_tokens=4096, force_json=False):
+    def rec(prompt, max_tokens=4096, force_json=False, **kw):
         seen["called"] = True
         return ("ans [1]", None)
 
