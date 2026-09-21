@@ -417,6 +417,52 @@ def test_recompute_floors_reports_companies_still_below_the_minimum(monkeypatch)
     assert out["companies"] == 1 and out["floors_written"] == 0
 
 
+def test_the_sweeps_response_survives_the_lambda_runtime_json_marshal(monkeypatch):
+    """The fakes in this file hand `list_companies` string ids; a real psycopg connection
+    hands back `uuid.UUID` for a uuid column. The Lambda runtime marshals the handler's
+    return value with json.dumps, which cannot serialise a UUID -- so every test here
+    passed while the deployed TEST function raised
+
+        Runtime.MarshalError: Object of type UUID is not JSON serializable
+
+    on its first real invocation, AFTER the sweep had already committed and logged
+    "floor recompute: 0/4 companies now have a floor (0 failed)". The work succeeded and
+    the invocation was still recorded as a failure.
+
+    This test uses real UUID objects for that reason. json.dumps IS the assertion.
+    """
+    import json
+    import uuid
+    cid = uuid.uuid4()
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "list_companies", lambda conn: [{"id": cid}])
+    monkeypatch.setattr(vw, "recompute_company_floor",
+                        lambda conn, company_id, **kw: {"company_id": company_id,
+                                                        "floor": 0.3, "sample_count": 20})
+    out = vw.lambda_handler({"op": "recompute_floors"}, None)
+    json.dumps(out)
+    assert out["results"][0]["company_id"] == str(cid)
+
+
+def test_a_failing_companys_row_is_also_json_safe(monkeypatch):
+    """The error path builds its own row from c["id"] rather than from the repository's
+    return, so it needs the same treatment -- and it is the path most likely to run
+    unattended for weeks before anyone looks."""
+    import json
+    import uuid
+    cid = uuid.uuid4()
+
+    def boom(conn, company_id, **kw):
+        raise RuntimeError("no")
+
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "list_companies", lambda conn: [{"id": cid}])
+    monkeypatch.setattr(vw, "recompute_company_floor", boom)
+    out = vw.lambda_handler({"op": "recompute_floors"}, None)
+    json.dumps(out)
+    assert out["failed"] == 1 and out["results"][0]["company_id"] == str(cid)
+
+
 def test_recompute_floors_can_target_one_company_on_demand(monkeypatch):
     """Honoured when present (an operator or a test recomputing one company right after a
     batch of corrections), but the schedule itself never sets this key."""
