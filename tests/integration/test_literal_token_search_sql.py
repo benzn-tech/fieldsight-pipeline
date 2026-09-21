@@ -17,18 +17,27 @@ These are skipped unless TEST_DATABASE_URL is set. Aurora is in-VPC and not
 reachable from a developer machine, so the route that works locally is an
 embedded Postgres:
 
-    uv run --with pgserver python -c "import pgserver, tempfile;         print(pgserver.get_server(tempfile.mkdtemp()).get_uri())"
+    uv run --python 3.12 --with pgserver python -c "import pgserver, tempfile;         print(pgserver.get_server(tempfile.mkdtemp()).get_uri())"
 
 then export that URI as TEST_DATABASE_URL.
 
-USE `uv run --with pgserver`, NOT `uv pip install pgserver` into a venv. The two
-install routes ship DIFFERENT extension sets, measured on the same machine on
-the same day: under `uv run --with pgserver`, `pgcrypto` is present and
-`CREATE EXTENSION pgcrypto` succeeds, so migration 0001 applies as written.
-Under a venv install, `pgcrypto.control` is absent and 0001 fails, and the only
-way forward is hand-stubbing a no-op control file inside the package tree --
-which works, but makes a green run depend on an undocumented local hack. If you
-hit that failure, you are on the wrong install route; switch rather than stub.
+PIN `--python 3.12`. Do not leave the version to resolution, and do not
+`uv pip install pgserver` into a venv. **Which extensions the bundled Postgres
+ships varies with the CPython build uv resolves to**, and migration 0001 needs
+`pgcrypto`:
+
+  * `--python 3.12` -> a build that HAS `pgcrypto`; 0001 applies as written.
+    Confirmed twice on this machine, on 2026-09-21 and again on 2026-09-22.
+  * a cp311 build -> `pgcrypto.control` is absent and 0001 fails. This bit two
+    different sessions, once through a venv install and once through an
+    unpinned `uv run --with pgserver` that happened to resolve to 3.11 --
+    which is why the earlier version of this note, blaming the venv, was only
+    half right. The install route was never the variable. The interpreter was.
+
+If you hit `extension "pgcrypto" is not available`, you are on the wrong build:
+pin the version. Do NOT hand-stub a no-op `pgcrypto.control` into the package
+tree. It works, and it makes a green integration run depend on a local hack
+nobody else has.
 
 (The one thing this repo uses pgcrypto for is `gen_random_uuid()` as a column
 default, which has been a Postgres core builtin since v13 and needs no
