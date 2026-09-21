@@ -73,6 +73,55 @@ def test_sites_has_coordinate_columns():
         conn.close()
 
 
+def test_report_chunks_has_a_tsvector_expression_index():
+    # 0059: literal-token search needs a word-boundary-aware index. This is a
+    # plain (non-CONCURRENT) index on the bare expression, not a stored
+    # column -- CREATE INDEX CONCURRENTLY cannot run inside apply_migrations'
+    # conn.transaction() wrapper, and a GENERATED STORED column's ACCESS
+    # EXCLUSIVE table rewrite has no measurable duration in this repo (no
+    # read-only path to prod's row count). An expression index needs no
+    # column and nothing to keep in sync on future writes.
+    conn = _fresh_conn()
+    try:
+        apply_migrations(conn, MIGRATIONS_DIR)
+        rows = conn.execute(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE tablename='report_chunks' AND indexname='idx_report_chunks_tsv'"
+        ).fetchall()
+        assert rows, "idx_report_chunks_tsv is missing"
+        indexdef = rows[0][0].lower()
+        assert "gin" in indexdef
+        assert "to_tsvector" in indexdef
+        assert "chunk_text" in indexdef
+        # No column was added -- confirms this really is an expression index,
+        # not a stored column with the same index name.
+        cols = {r[0] for r in conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='report_chunks'"
+        ).fetchall()}
+        assert "chunk_tsv" not in cols
+    finally:
+        conn.close()
+
+
+def test_report_chunks_tsv_index_survives_a_second_apply():
+    # IF NOT EXISTS -- also the property the CONCURRENTLY escape hatch (Task 1's
+    # documented manual path) depends on: if a DBA builds the index manually
+    # first, this migration's own CREATE INDEX must be a no-op, not an error.
+    conn = _fresh_conn()
+    try:
+        apply_migrations(conn, MIGRATIONS_DIR)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_report_chunks_tsv "
+            "ON report_chunks USING gin (to_tsvector('english', chunk_text))")
+        rows = conn.execute(
+            "SELECT indexdef FROM pg_indexes WHERE indexname='idx_report_chunks_tsv'"
+        ).fetchall()
+        assert len(rows) == 1
+    finally:
+        conn.close()
+
+
 def test_platform_company_seed_sql_is_idempotent_on_direct_rerun():
     # Belt-and-suspenders on top of the schema_migrations gate (which already
     # prevents a file from re-running via apply_migrations): even a manual

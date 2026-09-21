@@ -916,11 +916,21 @@ def test_a_lexical_chunk_beats_the_distance(monkeypatch, enable_web_answer):
     assert called == [1], "a lexical title match must not gate the verdict"
 
 
-def test_the_lexical_match_is_title_only_not_chunk_text(monkeypatch, enable_web_answer):
-    """Pins the title-only rule (mirrors _aggregate_topics, :845-849): the
-    retrieved chunk text is semantically near the query almost by definition,
-    so matching against chunk_text would make the lexical arm true for nearly
-    everything and the gate would never fire."""
+def test_the_title_heuristic_ignores_raw_chunk_text(monkeypatch, enable_web_answer):
+    """Pins the TITLE HEURISTIC's own rule, which is one of two lexical signals
+    the gate now reads -- not the whole gate. The retrieved chunk text is
+    semantically near the query almost by definition, so letting the heuristic
+    match against raw chunk_text would make it true for nearly everything and
+    the gate would never fire.
+
+    The other signal, `lexical_hit`, DOES come from a chunk_text match, and it
+    does defeat the gate -- but it is the SQL keyword arm's considered verdict
+    (a tsvector match on the indexed expression), not a substring scan done
+    here. This chunk deliberately sets no `lexical_hit`, so only the heuristic
+    is under test. Renamed 2026-09-21: the old name claimed the gate as a whole
+    was title-only, which stopped being true when Task 4 wired `lexical_hit` in,
+    and a guard whose name states the wrong rule teaches it to the next reader.
+    """
     wire(monkeypatch, chunks=[_gate_chunk(
         distance=0.61, topic_title="Door Inspection",
         chunk_text="The scaffold was checked and signed off.")])
@@ -929,6 +939,24 @@ def test_the_lexical_match_is_title_only_not_chunk_text(monkeypatch, enable_web_
     laa._rag_answer({"question": "what does the scaffold report say", "caller_sub": SUB})
 
     assert called == [], "a term present only in chunk_text must not defeat the gate"
+
+
+def test_a_lexical_hit_row_beats_the_distance_even_with_a_cold_title(monkeypatch, enable_web_answer):
+    """Ruling (2026-09-21, Task 4 review Important #4): `lexical_hit` -- the
+    keyword arm's chunk_text match from build_search_sql -- must be ORed into
+    the gate's lexical check alongside the title-only heuristic. A chunk
+    whose title carries no query term but whose text matched the literal
+    token is exactly the case this plan exists to stop sending to the web
+    unverified."""
+    chunk = _gate_chunk(distance=0.61, topic_title="Door Inspection",
+                         chunk_text="The scaffold was checked and signed off.")
+    chunk["lexical_hit"] = True
+    wire(monkeypatch, chunks=[chunk])
+    called = _spy_verdict(monkeypatch)
+
+    laa._rag_answer({"question": "what does the scaffold report say", "caller_sub": SUB})
+
+    assert called == [1], "a lexical_hit row must not let a cold title gate the verdict"
 
 
 # --------------------------------------------------------------------------

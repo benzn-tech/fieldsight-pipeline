@@ -60,7 +60,7 @@ def wired(monkeypatch):
 def wire_search(mp, rows=()):
     calls = []
 
-    def fake(conn, qv, site_ids, k=5, author_ids=None, date_from=None, date_to=None):
+    def fake(conn, qv, site_ids, k=5, author_ids=None, date_from=None, date_to=None, query_text=None):
         calls.append({"site_ids": sorted(site_ids),
                       "author_ids": sorted(author_ids) if author_ids is not None else None,
                       "date_from": date_from, "date_to": date_to})

@@ -79,7 +79,7 @@ def wire_rag(mp, *, sites, authors, topic_result=None, rows=(ROW,)):
               lambda conn, topic_id, site_ids, author_ids:
                   dict(topic_result) if topic_result else None)
     mp.setattr(rag.chunks, "search_chunks",
-              lambda conn, qv, site_ids, k=5, author_ids=None, date_from=None, date_to=None:
+              lambda conn, qv, site_ids, k=5, author_ids=None, date_from=None, date_to=None, query_text=None:
                   [dict(r) for r in rows])
 
 
