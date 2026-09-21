@@ -150,7 +150,9 @@ def test_query_text_is_an_or_join_of_lexical_terms_not_the_raw_question(wired):
     sentence there makes build_search_sql's keyword arm AND every
     non-stopword term, which a natural-language question essentially never
     satisfies. This asserts the ACTUAL string handed to search_chunks is the
-    lexical_terms extraction OR-joined, matching lexical_terms.or_query."""
+    query_terms extraction OR-joined, matching lexical_terms.or_query --
+    query_terms, not lexical_terms, because lexical_terms alone lets English
+    stopwords like 'was'/'when' through (round-2 fix, 2026-09-22)."""
     wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
     captured = {}
 
@@ -164,12 +166,19 @@ def test_query_text_is_an_or_join_of_lexical_terms_not_the_raw_question(wired):
 
     rag.lambda_handler(ev, None)
 
-    from lexical_terms import lexical_terms, or_query
-    assert captured["query_text"] == or_query(lexical_terms("when was the PS4 requested?"))
+    from lexical_terms import or_query, query_terms
+    assert captured["query_text"] == or_query(query_terms("when was the PS4 requested?"))
     # The raw sentence itself must not be what gets bound -- that is exactly
     # the AND-everything bug this fix removes.
     assert captured["query_text"] != "when was the PS4 requested?"
     assert " or " in captured["query_text"]
+    # "was"/"when" are English stopwords (round-2 fix) -- neither may survive
+    # into the OR query, or a bare stopword alone matches nearly every chunk.
+    terms = captured["query_text"].split(" or ")
+    assert "was" not in terms
+    assert "when" not in terms
+    assert "ps4" in terms
+    assert "requested" in terms
 
 
 def test_query_text_is_empty_string_for_a_question_with_no_literal_terms(wired):

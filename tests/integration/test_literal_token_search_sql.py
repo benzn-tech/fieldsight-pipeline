@@ -52,6 +52,7 @@ instead of depending on a pre-existing row to already be in the database.
 """
 import pytest
 
+from lexical_terms import QUERY_STOPWORDS, or_query, query_terms
 from repositories import chunks, companies, redactions, sites, topics, users
 
 pytestmark = pytest.mark.integration
@@ -374,3 +375,90 @@ def test_exact_rfi_1042_still_matches(db):
     assert str(target["id"]) in ids, "the exact identifier 'RFI-1042' must still be found"
     hit = next(r for r in rows if str(r["id"]) == str(target["id"]))
     assert hit["lexical_hit"] is True
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-22 round-2 fix ("the keyword arm can actually fire", again): the
+# controller ran the OWNER'S REAL QUESTION -- a full natural-language
+# sentence, not a bare token -- through the real path and measured three
+# chunks about bathroom tile, Twizel booking, and a concrete pour all match,
+# none related to the question. Cause: lexical_terms() has only a 3-char
+# floor and no stopword filter, so 'when'/'did'/'and'/'why' all survive, and
+# one OR'd stopword matches nearly every chunk in the corpus. Every test
+# above this point drives search_chunks with a BARE TOKEN as query_text
+# ("PS4", "1042", ...) -- that shape cannot see this failure, because a bare
+# token was never a stopword to begin with. These tests are the ones that can.
+# ---------------------------------------------------------------------------
+
+def test_every_query_stopword_is_actually_dropped_by_to_tsvector(db):
+    """Pins lexical_terms.QUERY_STOPWORDS against its own authority: a word
+    belongs in that list exactly when `to_tsvector('english', word)` yields
+    nothing for it. QUERY_STOPWORDS is a hard-coded constant (query_terms()
+    is pure Python -- no psycopg, no DB access, by the module's own design),
+    so nothing else keeps it from silently drifting away from what a real
+    Postgres actually calls a stopword except this test."""
+    for word in sorted(QUERY_STOPWORDS):
+        row = db.execute("SELECT to_tsvector('english', %s)", (word,)).fetchone()
+        assert row[0] == "", (
+            f"{word!r} is in QUERY_STOPWORDS but to_tsvector('english', {word!r}) "
+            f"did not come back empty -- got {row[0]!r}. Either Postgres no longer "
+            "treats it as a stopword, or it never was one and must not be filtered."
+        )
+
+
+def test_a_real_sentence_finds_its_chunk_and_not_three_unrelated_ones(db):
+    """The exact shape that failed twice: a FULL NATURAL-LANGUAGE SENTENCE,
+    not a bare token, run through the actual code path
+    (query_terms -> or_query -> chunks.search_chunks), asserted in BOTH
+    directions against a real Postgres:
+
+      * it still finds the chunk that genuinely contains the identifier
+        ("...pricing and PS4/light pole issues"), AND
+      * it does NOT match chunks that merely share common/stop words --
+        the exact three decoys the controller measured matching, verbatim.
+
+    Token-level cases (the ones above) are necessary but were NOT sufficient
+    to catch this -- this is the evidence for that."""
+    site = _site(db)
+    question = "when did request ps4? and why?"
+
+    target = _insert(db, site["id"], "pricing and PS4/light pole issues", seed=21)
+    decoy_tile = _insert(
+        db, site["id"],
+        "Bathroom tile and finish options were discussed with the client.",
+        seed=22)
+    decoy_twizel = _insert(
+        db, site["id"],
+        "Twizel booking and subs coordination for the week ahead.",
+        seed=23)
+    decoy_pour = _insert(
+        db, site["id"],
+        "The concrete pour is scheduled and the pump has been booked.",
+        seed=24)
+    # Filled with chunks close to the query embedding, matching NONE of
+    # question's terms in chunk_text -- so if a decoy shows up, it can only
+    # be because the keyword arm matched it, exactly the property under test.
+    _fill_with_closer_unrelated_chunks(db, site["id"], query_seed=25)
+
+    query_text = or_query(query_terms(question))
+    # The bug this test exists to catch would make query_text carry a bare
+    # stopword like 'and' -- assert the real extraction does not, so a
+    # regression in query_terms itself fails HERE, not three lines down in a
+    # confusing decoy-match failure.
+    assert "and" not in query_text.split(" or ")
+    assert "why" not in query_text.split(" or ")
+    assert "did" not in query_text.split(" or ")
+    assert "when" not in query_text.split(" or ")
+
+    rows = chunks.search_chunks(db, _flat_embedding(25), [site["id"]], k=30,
+                                query_text=query_text)
+    ids = {str(r["id"]) for r in rows}
+
+    assert str(target["id"]) in ids, \
+        "the sentence must still find the chunk that genuinely contains PS4"
+    assert str(decoy_tile["id"]) not in ids, \
+        "a bare stopword must not match the bathroom-tile chunk"
+    assert str(decoy_twizel["id"]) not in ids, \
+        "a bare stopword must not match the Twizel-booking chunk"
+    assert str(decoy_pour["id"]) not in ids, \
+        "a bare stopword must not match the concrete-pour chunk"

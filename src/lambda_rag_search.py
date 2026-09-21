@@ -15,7 +15,7 @@ an already-computed query_embedding and searches Aurora/pgvector with it.
 
 Event:  {"sub": "<cognito sub>", "query_embedding": [1024 floats], "k": 8,
          optional "question" (raw text; this function extracts its literal
-         terms via lexical_terms.lexical_terms and OR-joins them for the
+         terms via lexical_terms.query_terms and OR-joins them for the
          keyword arm -- Task 3 of the 2026-09-20 "a literal token is
          findable" plan, fixed for real 2026-09-22 -- absent or with no
          literal terms, the keyword arm matches nothing, never everything),
@@ -41,7 +41,7 @@ import json
 import logging
 
 from db.connection import close_cached_connection, get_cached_connection
-from lexical_terms import lexical_terms, or_query
+from lexical_terms import or_query, query_terms
 from repositories import (aliases, chunks, findings, recordings, redactions, scope,
                          sites, topics, users)
 import text_normalize
@@ -238,21 +238,31 @@ def _search(event, context):
     # websearch_to_tsquery AND every non-stopword term together, which a
     # natural-language question essentially never satisfies -- the arm only
     # ever fired when a user happened to type bare terms that all appeared
-    # verbatim in the same chunk. `lexical_terms` extracts the
-    # distinctive/identifier-shaped terms (same extraction
-    # `_aggregate_topics` in lambda_ask_agent.py uses for its own lexical
-    # ranking) and `or_query` joins them with the literal word "or", which
-    # `websearch_to_tsquery` parses as an OR, not an AND -- measured:
-    # `websearch_to_tsquery('simple', 'ps4 or light or pole')` ->
-    # `'ps4' | 'light' | 'pole'`.
+    # verbatim in the same chunk. `or_query` joins the extracted terms with
+    # the literal word "or", which `websearch_to_tsquery` parses as an OR,
+    # not an AND -- measured: `websearch_to_tsquery('simple', 'ps4 or light
+    # or pole')` -> `'ps4' | 'light' | 'pole'`.
     #
-    # A question with no literal terms (e.g. "what safety issues came up
-    # this week", once stopwords/short words are stripped, can still leave
-    # SOME terms, but a purely conceptual question can leave none) yields
-    # `or_query([])` == "" -> `websearch_to_tsquery('simple', '')` is an
-    # empty tsquery that matches NOTHING -- the arm goes inert, never
-    # match-all, exactly as the "" default always meant.
-    query_text = or_query(lexical_terms(event.get("question") or ""))
+    # 2026-09-22 SECOND fix, round 2: the terms fed to `or_query` come from
+    # `query_terms`, NOT `_aggregate_topics`' own `lexical_terms` -- the
+    # controller ran the owner's real question through the real path and
+    # measured `lexical_terms` alone letting 'when'/'did'/'and'/'why' through
+    # (all >=3 characters, none identifier-shaped, so lexical_terms's floor
+    # does not stop them). OR'd into the tsquery, ONE surviving stopword
+    # matches nearly every chunk in the corpus, which made this arm go from
+    # "never fires" to "always fires and matches noise" -- worse than before
+    # this feature shipped. `query_terms` is `lexical_terms` with English
+    # stopwords dropped (see lexical_terms.py's QUERY_STOPWORDS for why this
+    # is a second function rather than a change to the shared one -- it also
+    # drives `_aggregate_topics`' title ranking, English AND Chinese, and
+    # that ranking's tests pin today's un-filtered behavior).
+    #
+    # A question with no literal, non-stopword terms (e.g. "what safety
+    # issues came up this week") yields `or_query([])` == "" ->
+    # `websearch_to_tsquery('simple', '')` is an empty tsquery that matches
+    # NOTHING -- the arm goes inert, never match-all, exactly as the ""
+    # default always meant.
+    query_text = or_query(query_terms(event.get("question") or ""))
     date_from = event.get("date_from") or None
     date_to = event.get("date_to") or None
     site_filter = event.get("site") or None  # scope search to ONE project (within ACL)

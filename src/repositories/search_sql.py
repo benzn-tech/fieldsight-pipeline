@@ -131,12 +131,19 @@ def build_search_sql() -> str:
         "  WHERE " + scope + " "
         "  AND (to_tsvector('english', c.chunk_text) || to_tsvector('simple', regexp_replace(c.chunk_text, '[^a-zA-Z0-9]+', ' ', 'g'))) "
         "  @@ websearch_to_tsquery('simple', %(q_text)s) "
-        # NOTE: this LIMIT has no ORDER BY, so when a term matches more than k
-        # rows Postgres returns a plan-dependent subset, not the top k by
-        # ts_rank. Acceptable for the case this arm exists to serve -- a rare
-        # identifier matching more than k chunks is not the failure being fixed
-        # -- and left undecided here on purpose: ranking policy for the keyword
-        # arm belongs to Task 4, which is where a ts_rank order would go.
+        # 2026-09-22 round-2 fix ("the keyword arm can actually fire"): this
+        # LIMIT used to have NO ORDER BY, which was fine when the arm's query
+        # was an AND of every word (Cause A) -- matches were rare, so
+        # whichever plan-dependent k rows Postgres happened to return were
+        # usually ALL of the matches anyway. Cause A's fix turned the query
+        # into an OR, which makes matches common, so an un-ordered LIMIT now
+        # returns an arbitrary k out of however many rows matched -- not the
+        # arm's best k. ORDER BY ts_rank DESC over the SAME indexed
+        # expression (character-for-character, so the planner can still use
+        # it for the scan) before the LIMIT makes the k rows this arm
+        # contributes its best k by relevance, not whichever k the planner
+        # happened to visit first.
+        "  ORDER BY ts_rank(to_tsvector('english', c.chunk_text) || to_tsvector('simple', regexp_replace(c.chunk_text, '[^a-zA-Z0-9]+', ' ', 'g')), websearch_to_tsquery('simple', %(q_text)s)) DESC "
         "  LIMIT %(k)s"
         ") "
         "SELECT id, chunk_text, chunk_type, topic_id, source_s3_key, "

@@ -252,3 +252,40 @@ def test_outer_order_by_reproduces_pre_keyword_arm_arrival_order():
     assert set(ordered_ids[3:]) == {"l1", "l2"}, (
         "keyword-only rows must be appended after ALL vector rows -- not interleaved"
     )
+
+
+def test_lex_cte_orders_by_ts_rank_before_its_own_limit():
+    """2026-09-22 round-2 fix ("the keyword arm can actually fire"): under
+    Cause A's OR query, a term matching more rows than k is now the COMMON
+    case (a stopword alone can match nearly every chunk), so the lex CTE's
+    LIMIT %(k)s must not be unordered any more -- an unordered LIMIT would
+    return a plan-dependent arbitrary k, not the arm's best k by relevance.
+
+    This orders by ts_rank over the SAME expression the GIN index (migration
+    0061) and the WHERE predicate both use, character for character, so the
+    planner can still use the index for the scan feeding this sort."""
+    sql = build_search_sql()
+
+    lex_start = sql.index("lex AS (")
+    # Slice through the lex CTE's OWN "LIMIT %(k)s" (the first one after
+    # "lex AS ("), which is exactly what sits just before its closing paren.
+    lex_limit_idx = sql.index("LIMIT %(k)s", lex_start)
+    lex_sql = sql[lex_start:lex_limit_idx + len("LIMIT %(k)s")]
+
+    assert "ts_rank(" in lex_sql, "the keyword arm's LIMIT must be preceded by a relevance ORDER BY"
+    rank_idx = lex_sql.index("ORDER BY ts_rank(")
+    limit_idx = lex_sql.index("LIMIT %(k)s")
+    assert rank_idx < limit_idx, "ts_rank ORDER BY must run BEFORE the lex CTE's own LIMIT"
+
+    # ts_rank must be called over the SAME indexed expression (0061's GIN
+    # index) and the SAME tsquery the WHERE predicate already matches on --
+    # a respelled expression would rank without the index's help and could
+    # silently diverge from what the predicate actually matched.
+    assert ("ts_rank(to_tsvector('english', c.chunk_text) || to_tsvector('simple', "
+            "regexp_replace(c.chunk_text, '[^a-zA-Z0-9]+', ' ', 'g')), "
+            "websearch_to_tsquery('simple', %(q_text)s)) DESC") in lex_sql
+
+    # The vec CTE and the outer dedup/re-sort must be untouched by this --
+    # in particular the outer ORDER BY (lexical_hit ASC, distance ASC NULLS
+    # LAST) that preserves the pre-existing vector-arm arrival order.
+    assert "ORDER BY lexical_hit ASC, distance ASC NULLS LAST" in sql
