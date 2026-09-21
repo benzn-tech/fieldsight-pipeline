@@ -26,6 +26,8 @@ import time
 
 import urllib3
 
+from llm_usage import log_usage as _log_usage
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -160,44 +162,11 @@ def qwen_model_for(thinking):
     return QWEN_MODEL_NONTHINKING
 
 
-def _log_usage(provider, model, caller, elapsed, prompt_tokens=None,
-               completion_tokens=None, reasoning_tokens=None,
-               cache_read_tokens=None, cache_write_tokens=None):
-    """One CloudWatch-queryable line per completed call, on BOTH provider paths.
-
-    We have exactly one cost data point in this whole repo: a hand-run bench in
-    a code comment (2026-09-09, two models, three runs each). Every production
-    call before this line existed spent real money and left nothing behind --
-    not the model that actually served it, not the tokens, not whether a cache
-    fired. We are about to decide between models and whether prompt caching is
-    worth wiring up, on zero production evidence.
-
-    Fixed `LLM_USAGE ` prefix + key=value, not prose: the point is
-    `filter @message like /^LLM_USAGE/` and `parse` in CloudWatch Logs
-    Insights, so grep-shaped debugging text would defeat the purpose. Counts
-    and identifiers only -- NEVER prompt or completion text, which is customer
-    conversation data.
-
-    Wrapped by every call site in try/except (see _call_anthropic/_call_qwen):
-    a telemetry bug must never turn into an Ask outage, and a usage line that
-    is never written is worse than no line, because it looks like
-    instrumentation. See the module-level `logger.setLevel(logging.INFO)` for
-    how this reaches CloudWatch at all -- the Lambda runtime otherwise leaves
-    the root logger at WARNING and an INFO line here would be silently
-    dropped, the same failure shape that hid a finalize decision log on
-    TEST (2026-09-18).
-    """
-    logger.info(
-        "LLM_USAGE provider=%s model=%s caller=%s latency_ms=%d prompt_tokens=%s "
-        "completion_tokens=%s reasoning_tokens=%s cache_read_tokens=%s "
-        "cache_write_tokens=%s",
-        provider, model, caller, int(elapsed * 1000),
-        prompt_tokens if prompt_tokens is not None else "-",
-        completion_tokens if completion_tokens is not None else "-",
-        reasoning_tokens if reasoning_tokens is not None else "-",
-        cache_read_tokens if cache_read_tokens is not None else "-",
-        cache_write_tokens if cache_write_tokens is not None else "-",
-    )
+# `_log_usage` used to be defined here. It now lives in llm_usage.py (imported
+# above as `_log_usage` to keep every existing call site in this file
+# unchanged) so corroboration_client.py can write the identical LLM_USAGE line
+# without importing this module -- see llm_usage.py's docstring for why that
+# specific direction matters.
 
 
 def api_key_configured():
