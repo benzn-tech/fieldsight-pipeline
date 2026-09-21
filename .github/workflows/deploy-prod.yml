@@ -138,8 +138,22 @@ jobs:
           # falls back to DashScope with no error anywhere.
           QWEN_CHAT_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
-          ELEVENLABS_ASK_API_KEY: ${{ secrets.ELEVENLABS_ASK_API_KEY }}
-          ELEVENLABS_API_KEY_TTS: ${{ secrets.ELEVENLABS_API_KEY_TTS }}
+          # Both prod Ask voice keys come from ONE prod-only secret, and
+          # deliberately not from the two that were here before:
+          #   * ELEVENLABS_ASK_API_KEY has never existed as a secret, so prod's
+          #     STT key resolved to empty, the guard below dropped the override,
+          #     and prod shipped with no Ask STT key at all -- invisible until
+          #     somebody set the provider to elevenlabs and it refused.
+          #   * ELEVENLABS_API_KEY_TTS is the secret TEST also reads, so prod
+          #     and test were drawing Ask speech from one credit pool. Measured
+          #     2026-09-21: identical key on both ask-agents. That is the same
+          #     shape as the shared transcription key of 2026-08-08 -- a test
+          #     run spending prod's quota, presenting as "the feature stopped".
+          # Per-environment, not per-purpose: prod TTS and prod STT share this
+          # pool, so exhausting it takes both down together. Accepted by the
+          # owner 2026-09-22; split it if Ask voice ever carries real load.
+          ELEVENLABS_ASK_API_KEY: ${{ secrets.ELEVENLABS_ASK_API_KEY_PROD }}
+          ELEVENLABS_API_KEY_TTS: ${{ secrets.ELEVENLABS_ASK_API_KEY_PROD }}
           FARGATE_SUBNET_IDS: ${{ secrets.FARGATE_SUBNET_IDS }}
           FARGATE_VPC_ID: ${{ secrets.FARGATE_VPC_ID }}
         run: |

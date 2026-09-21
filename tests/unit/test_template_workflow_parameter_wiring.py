@@ -281,6 +281,41 @@ def test_the_test_key_does_not_silently_fall_back_to_prods():
     assert "||" not in line[0], "no silent fallback to prod's key"
 
 
+# ---- the Ask voice keys are per environment too --------------------------
+
+_ASK_VOICE_KEYS = ("ELEVENLABS_ASK_API_KEY", "ELEVENLABS_API_KEY_TTS")
+
+
+def test_the_ask_voice_keys_are_not_shared_between_the_stacks():
+    """Same lesson as the transcription key above, learned twice.
+
+    Measured 2026-09-21 on the deployed functions: both ask-agents carried the
+    SAME TTS key, because both workflows read `secrets.ELEVENLABS_API_KEY_TTS`
+    -- so a spoken answer tried on test spent prod's allowance, and exhaustion
+    would present as Ask simply going quiet.
+    """
+    for var in _ASK_VOICE_KEYS:
+        prod = _secret_bound_to("prod", var)
+        test = _secret_bound_to("test", var)
+        assert prod and test, f"{var}: no binding (prod={prod}, test={test})"
+        assert prod != test, (
+            f"{var}: both workflows read secrets.{prod} -- test Ask voice "
+            "would spend prod's ElevenLabs allowance")
+
+
+def test_prods_ask_voice_keys_name_a_secret_that_exists():
+    """`ELEVENLABS_ASK_API_KEY` was never a repo secret, and a secret that does
+    not exist resolves to the empty string rather than failing. The guard in
+    the workflow then drops the parameter, the stack deploys green, and the
+    key is simply absent from the deployed function -- which is invisible
+    until the provider is switched to elevenlabs and every spoken question is
+    refused. Pin the name so the binding cannot drift back to a ghost.
+    """
+    for var in _ASK_VOICE_KEYS:
+        assert _secret_bound_to("prod", var) == "ELEVENLABS_ASK_API_KEY_PROD", (
+            f"{var} on prod must read the prod-only Ask voice secret")
+
+
 # ---- the group-merge tunables ------------------------------------------
 
 _MERGE_TUNABLES = {
