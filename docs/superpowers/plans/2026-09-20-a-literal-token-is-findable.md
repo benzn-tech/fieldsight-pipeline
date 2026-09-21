@@ -785,7 +785,47 @@ Also run for real this session: the two pre-existing Chinese unit tests
 (`test_a_chinese_question_still_ranks_a_word_match_first`,
 `test_a_chinese_question_no_longer_loses_a_distant_match`) both PASS unchanged — though note they use
 a fake connection that records SQL without executing it, so they attest to the Python-side ranking, not
-to the tokenizer. The tokenizer question is answered by the table above instead. Full unit suite:
+to the tokenizer. The tokenizer question is answered by the table above instead.
+
+### Owner decisions, 2026-09-21 — two known gaps ship with this plan
+
+Both were measured, both were put to the owner with options, and the owner ruled. They are gaps in the
+feature as shipped, not defects in it, and Task 7's PR body must carry both.
+
+**Gap 1 — the bare number does not find the hyphenated identifier. SHIPPING AS IS; a separate round
+will fix it.** Three routes were measured on a real PostgreSQL 16.2:
+
+| Route | `1042` finds `RFI-1042` | `RFI-1042` finds it | `PS4` avoids `PS40` |
+|---|---|---|---|
+| today | no | yes | **yes** |
+| trigram / substring (`ILIKE '%1042%'`) | yes | yes | **NO — collision returns** |
+| also index digit runs | yes | yes | **yes** |
+
+Substring matching was rejected on measurement, not taste: `'Light pole PS40 done' ILIKE '%PS4%'` is
+TRUE, so it reintroduces exactly the precision failure this plan just confirmed absent.
+
+The route that works is to widen the indexed expression to
+`to_tsvector('english', chunk_text) || to_tsvector('simple', regexp_replace(chunk_text, '[^0-9]+', ' ', 'g'))`.
+Measured on that expression: bare `1042` matches, `RFI-1042` still matches, `PS4` still does NOT match
+`PS40`, `1043` does not match `RFI-1042`. One noise finding to carry forward: `PS4` also emits a
+single-character digit run `'4'`, so a search for `4` would match — restrict extraction to runs of two
+or more digits when this is built.
+Why it is not in this round: it changes migration 0059's indexed expression, and Tasks 1/3 pinned the
+rule that the query must repeat that expression byte for byte. So it needs a new migration, an updated
+expression-match test and an updated query — a task of its own, on top of a plan already at two fix
+rounds. **Consequence to state outward: describe this as "search a complete identifier", never as
+"search an RFI number", because someone told the latter will type the number alone.**
+
+**Gap 2 — no literal search for Chinese. NOT IN THIS PLAN; recorded.** Measured above: the whole
+CJK string becomes one lexeme under `'english'`, so the keyword arm cannot match a word inside it.
+Note carefully what is and is not missing: **semantic search in Chinese works and is unaffected** —
+that is the vector arm with DashScope embeddings — and `_UNSPACED_RUN` shingling still supplies
+client-side lexical ranking. What is missing is literal matching, which is most valuable for exactly
+the thing embeddings are worst at: identifiers.
+The measured route is substring/trigram matching (`'脚手架已经检查并签字' ILIKE '%脚手架%'` is TRUE,
+and a different string does not false-positive), which needs `pg_trgm`. **We enable only `vector` and
+`pgcrypto` today (`src/migrations/0001_extensions.sql`), and whether `pg_trgm` is available on OUR
+Aurora cluster has NOT been checked. Do not plan on it until someone has run that check.** Full unit suite:
 `python -m pytest tests/unit -q` -> 5441 passed, 2 skipped (`test_lambda_ws_authorizer.py` needs PyJWT;
 `test_voiceprint_onnx_parity.py` missing a fixture), 0 failed; both skips pre-existing and unrelated.
 
