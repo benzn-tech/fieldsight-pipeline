@@ -149,7 +149,7 @@ from repositories import (action_items, aliases, chunks, classification_feedback
                           programme_delay_flags, programme_import,
                           programme_snapshot,
                           programme_suggestions, programme_tasks, programme_window,
-                          recordings, redactions, rollup, scope,
+                          recordings, redactions, report_templates, rollup, scope,
                           session_group,
                           sites, threads, topics, users, voice_messages,
                           voiceprints)
@@ -575,6 +575,39 @@ def dispatch(conn, event, method, route):
         return get_org_media_presigned_url(conn, caller, event)
     if route == "/media/keyframe" and method == "DELETE":
         return delete_keyframe_endpoint(conn, caller, parse_body(event))
+    # --- Report templates (migration 0062) -------------------------------
+    # ORDER MATTERS HERE. "/templates/bindings" must be matched before the
+    # "/templates/{id}" pattern below, or "bindings" is read as a template id
+    # and the bindings endpoints answer 404 for everyone -- a failure that
+    # looks like a permissions problem and is not one.
+    if route == "/templates" and method == "GET":
+        return list_report_templates(conn, caller, event)
+    if route == "/templates" and method == "POST":
+        return create_report_template(conn, caller, event)
+    if route == "/templates/bindings" and method == "GET":
+        return list_report_template_bindings(conn, caller, event)
+    m_tb = re.match(r"^/templates/bindings/([^/]+)$", route)
+    if m_tb and method == "PUT":
+        return set_report_template_binding(conn, caller, m_tb.group(1), event)
+    m_tvr = re.match(r"^/templates/([^/]+)/versions/([^/]+)/restore$", route)
+    if m_tvr and method == "POST":
+        return restore_report_template_version(conn, caller, m_tvr.group(1), m_tvr.group(2))
+    m_tv = re.match(r"^/templates/([^/]+)/versions$", route)
+    if m_tv and method == "GET":
+        return list_report_template_versions(conn, caller, m_tv.group(1))
+    if m_tv and method == "POST":
+        return add_report_template_version(conn, caller, m_tv.group(1), event)
+    m_tc = re.match(r"^/templates/([^/]+)/copy$", route)
+    if m_tc and method == "POST":
+        return copy_report_template(conn, caller, m_tc.group(1), event)
+    m_t = re.match(r"^/templates/([^/]+)$", route)
+    if m_t and method == "GET":
+        return get_report_template(conn, caller, m_t.group(1), event)
+    if m_t and method == "PATCH":
+        return update_report_template(conn, caller, m_t.group(1), event)
+    if m_t and method == "DELETE":
+        return archive_report_template(conn, caller, m_t.group(1))
+
     if route == "/reports/history" and method == "GET":
         return get_org_report_history(conn, caller, event)
     if route == "/reports/regenerate" and method == "POST":
@@ -8958,3 +8991,423 @@ def get_org_media_presigned_url(conn, caller, event):
         "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
         ExpiresIn=PRESIGNED_URL_EXPIRY)
     return ok({"url": url, "expires_in": PRESIGNED_URL_EXPIRY})
+
+
+# =====================================================================
+# Report templates (migration 0062)
+#
+# The Library has shipped in the UI since Sprint 10 against localStorage: a
+# template lived as long as the tab that made it and was invisible to everyone
+# else in the company. These routes are that feature becoming real.
+#
+# WHO MAY DO WHAT, in one place so it can be read as a whole:
+#
+#   read org templates        anyone signed in, in their own company
+#   read own personal ones    the owner, and nobody else -- gm/admin included
+#   write own personal ones   the owner
+#   write org templates       gm / admin (platform_admin across companies)
+#   bind a scheduled report   gm / admin only -- the nightly reports go out to
+#                             customers under the company's name, so which
+#                             template writes them is not an individual choice
+#
+# `platform_admin` reach is granted PER ENDPOINT below, never inherited from a
+# shared helper: this repo has a standing trap where a missing cross-company
+# branch turns into a 200 with an empty list rather than a 403, and a role that
+# silently sees nothing is indistinguishable from a company that owns nothing.
+# =====================================================================
+
+_TEMPLATE_WRITE_ROLES = ("admin", "gm", "platform_admin")
+_REPORT_TYPES = ("daily", "weekly", "monthly", "session", "day", "custom")
+_BINDABLE_TYPES = ("daily", "weekly", "monthly")
+_MAX_TEMPLATE_NAME = 120
+
+
+def _template_company(conn, caller, event):
+    """Which company's templates this request is about.
+
+    A platform_admin sits in its own operator company, so defaulting to
+    `caller["company_id"]` would show it an empty Library and say nothing about
+    why. It may name a company; everybody else is pinned to their own whatever
+    they send, so there is no parameter a normal caller can set to reach
+    another tenant.
+    """
+    p = event.get("queryStringParameters") or {}
+    requested = p.get("company_id")
+    if requested and str(requested) != str(caller["company_id"]):
+        if not is_cross_company(caller["global_role"]):
+            return None, error("only platform_admin may act in another company", 403)
+        if companies.get_company_by_id(conn, requested) is None:
+            return None, error("company not found", 404)
+        return str(requested), None
+    return str(caller["company_id"]), None
+
+
+def _may_write_template(caller, template):
+    """None when this caller may change `template`, else an error response.
+
+    Ownership first, role second. A worker owns their personal templates
+    outright; a gm owns none of anybody's. The org arm is the only one where
+    the role decides anything.
+    """
+    if template["scope"] == "personal":
+        if str(template["owner_user_id"]) != str(caller["id"]):
+            # Same wording as the read side's miss, deliberately: confirming
+            # that somebody else's template exists is exactly the disclosure
+            # personal scope promises not to make.
+            return error("template not found", 404)
+        return None
+    if caller["global_role"] not in _TEMPLATE_WRITE_ROLES:
+        return error("admin, gm or platform_admin role required to change an "
+                     "organisation template", 403)
+    if str(template["company_id"]) != str(caller["company_id"]) \
+            and not is_cross_company(caller["global_role"]):
+        return error("template not found", 404)
+    return None
+
+
+def _template_payload(row, versions=None):
+    out = {
+        "id": str(row["id"]),
+        "company_id": str(row["company_id"]),
+        "scope": row["scope"],
+        "owner_user_id": str(row["owner_user_id"]) if row.get("owner_user_id") else None,
+        "slug": row["slug"],
+        "name": row["name"],
+        "description": row["description"],
+        "report_type": row["report_type"],
+        "current_version": row["current_version"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+    if versions is not None:
+        out["versions"] = versions
+    return out
+
+
+def _version_payload(row):
+    return {
+        "id": str(row["id"]),
+        "template_id": str(row["template_id"]),
+        "version": row["version"],
+        "body": row["body"],
+        "change_note": row["change_note"],
+        "created_by": str(row["created_by"]),
+        "created_at": row["created_at"],
+    }
+
+
+def _validated_template_body(body):
+    """(template body, error). Shared by create, new-version and restore so the
+    three cannot drift on what a valid template is."""
+    if body is None:
+        return None, error("malformed JSON body", 400)
+    tpl = body.get("body")
+    why = report_template.validate_body(tpl)
+    if why:
+        return None, error(why, 400)
+    return tpl, None
+
+
+def _template_name(body, fallback=None):
+    """(name, error). Empty is refused rather than defaulted: a template nobody
+    named is one nobody will find again."""
+    raw = body.get("name")
+    if raw is None and fallback is not None:
+        return fallback, None
+    if not isinstance(raw, str) or not raw.strip():
+        return None, error("name is required", 400)
+    name = raw.strip()
+    if len(name) > _MAX_TEMPLATE_NAME:
+        return None, error("name must be %d characters or fewer" % _MAX_TEMPLATE_NAME, 400)
+    return name, None
+
+
+def list_report_templates(conn, caller, event):
+    """GET /api/org/templates?scope=org|personal|all"""
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    p = event.get("queryStringParameters") or {}
+    scope = (p.get("scope") or "all").strip()
+    if scope not in ("org", "personal", "all"):
+        return error("scope must be org, personal or all", 400)
+    rows = report_templates.list_visible(
+        conn, company_id, caller["id"], None if scope == "all" else scope)
+    return ok({"templates": [_template_payload(r) for r in rows]})
+
+
+def get_report_template(conn, caller, template_id, event):
+    """GET /api/org/templates/{id}"""
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    row = report_templates.get_visible(conn, company_id, caller["id"], template_id)
+    if row is None:
+        return error("template not found", 404)
+    return ok(_template_payload(row))
+
+
+def create_report_template(conn, caller, event):
+    """POST /api/org/templates
+
+    A template is created WITH its first body. The two-statement split lives in
+    the repository (the row must exist before a version can reference it), but
+    a caller has no use for a template that says nothing, and allowing one
+    would put `current_version = 0` in front of the Library for real.
+    """
+    body = parse_body(event)
+    tpl, err = _validated_template_body(body)
+    if err is not None:
+        return err
+
+    scope = (body.get("scope") or "personal").strip()
+    if scope not in ("org", "personal"):
+        return error("scope must be org or personal", 400)
+    if scope == "org" and caller["global_role"] not in _TEMPLATE_WRITE_ROLES:
+        return error("admin, gm or platform_admin role required to create an "
+                     "organisation template", 403)
+
+    report_type = (body.get("report_type") or "custom").strip()
+    if report_type not in _REPORT_TYPES:
+        return error("report_type must be one of: %s" % ", ".join(_REPORT_TYPES), 400)
+
+    name, err = _template_name(body)
+    if err is not None:
+        return err
+    description = body.get("description")
+    if description is not None and not isinstance(description, str):
+        return error("description must be a string", 400)
+
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    owner = None if scope == "org" else caller["id"]
+    slug = report_template.slugify(name, "tpl-" + uuid.uuid4().hex[:8])
+    try:
+        row = report_templates.create(conn, company_id, scope, owner, slug, name,
+                                      description or "", report_type, caller["id"])
+    except UniqueViolation:
+        # The slug is derived from the name, so a collision here is a duplicate
+        # NAME, which is what the message has to say -- "slug" is a word this
+        # product never shows anybody.
+        return error("a template called that already exists here", 409)
+    version = report_templates.add_version(conn, row["id"], tpl,
+                                           body.get("change_note") or "Created",
+                                           caller["id"])
+    fresh = report_templates.get_any(conn, row["id"])
+    return ok(_template_payload(fresh, versions=[_version_payload(version)]), 201)
+
+
+def update_report_template(conn, caller, template_id, event):
+    """PATCH /api/org/templates/{id} -- name and description only.
+
+    The body is deliberately not settable here: changing what a template SAYS
+    creates a version, and a route that could do both would let an edit land
+    with no version behind it, which is the one thing the history exists to
+    rule out.
+    """
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    if "body" in body:
+        return error("use POST /templates/{id}/versions to change what a "
+                     "template says, so the change gets a version", 400)
+    row = report_templates.get_visible(conn, caller["company_id"], caller["id"], template_id)
+    if row is None:
+        return error("template not found", 404)
+    err = _may_write_template(caller, row)
+    if err is not None:
+        return err
+
+    name = None
+    if body.get("name") is not None:
+        name, err = _template_name(body)
+        if err is not None:
+            return err
+    description = body.get("description")
+    if description is not None and not isinstance(description, str):
+        return error("description must be a string", 400)
+    updated = report_templates.update_meta(conn, template_id, name, description)
+    return ok(_template_payload(updated))
+
+
+def list_report_template_versions(conn, caller, template_id):
+    """GET /api/org/templates/{id}/versions"""
+    row = report_templates.get_visible(conn, caller["company_id"], caller["id"], template_id)
+    if row is None:
+        return error("template not found", 404)
+    return ok({"versions": [_version_payload(v)
+                            for v in report_templates.list_versions(conn, template_id)]})
+
+
+def add_report_template_version(conn, caller, template_id, event):
+    """POST /api/org/templates/{id}/versions -- the only way content changes."""
+    body = parse_body(event)
+    tpl, err = _validated_template_body(body)
+    if err is not None:
+        return err
+    row = report_templates.get_visible(conn, caller["company_id"], caller["id"], template_id)
+    if row is None:
+        return error("template not found", 404)
+    err = _may_write_template(caller, row)
+    if err is not None:
+        return err
+    note = body.get("change_note")
+    if note is not None and not isinstance(note, str):
+        return error("change_note must be a string", 400)
+    try:
+        version = report_templates.add_version(conn, template_id, tpl, note, caller["id"])
+    except UniqueViolation:
+        # Somebody else saved between this caller's read and this write. 409,
+        # not 500: their edit is intact, it simply is not the one that landed,
+        # and the only correct next step is theirs to take.
+        return error("someone else saved a change to this template just now -- "
+                     "reload it and re-apply your edit", 409)
+    return ok(_version_payload(version), 201)
+
+
+def restore_report_template_version(conn, caller, template_id, version):
+    """POST /api/org/templates/{id}/versions/{version}/restore
+
+    Writes the old body as a NEW version. Nothing moves backwards: a report
+    that recorded (template, v2) must keep naming a body that still exists
+    exactly as it was.
+    """
+    row = report_templates.get_visible(conn, caller["company_id"], caller["id"], template_id)
+    if row is None:
+        return error("template not found", 404)
+    err = _may_write_template(caller, row)
+    if err is not None:
+        return err
+    try:
+        wanted = int(version)
+    except (TypeError, ValueError):
+        return error("version must be a number", 400)
+    old = report_templates.get_version(conn, template_id, wanted)
+    if old is None:
+        return error("no such version", 404)
+    try:
+        version_row = report_templates.add_version(
+            conn, template_id, old["body"], "Restored from v%d" % wanted, caller["id"])
+    except UniqueViolation:
+        return error("someone else saved a change to this template just now -- "
+                     "reload it and try again", 409)
+    return ok(_version_payload(version_row), 201)
+
+
+def copy_report_template(conn, caller, template_id, event):
+    """POST /api/org/templates/{id}/copy -- into the caller's own library.
+
+    Open to every role on purpose. Copying is how somebody who may not change
+    the company's template gets one they can change; taking it away would make
+    "org templates are read-only for most people" mean "most people cannot
+    have a template at all".
+    """
+    body = parse_body(event) or {}
+    src = report_templates.get_visible(conn, caller["company_id"], caller["id"], template_id)
+    if src is None:
+        return error("template not found", 404)
+    name, err = _template_name(body, fallback="%s (my copy)" % src["name"])
+    if err is not None:
+        return err
+    slug = report_template.slugify(name, "tpl-" + uuid.uuid4().hex[:8])
+    try:
+        copied = report_templates.copy_to_personal(conn, template_id, caller["id"],
+                                                   slug, name, caller["id"])
+    except UniqueViolation:
+        return error("you already have a template called that", 409)
+    if copied is None:
+        return error("that template has no content to copy yet", 409)
+    return ok(_template_payload(copied), 201)
+
+
+def archive_report_template(conn, caller, template_id):
+    """DELETE /api/org/templates/{id} -- soft delete; versions are kept.
+
+    Refuses while a schedule still points at it. The foreign key is ON DELETE
+    RESTRICT, but archiving is an UPDATE and no constraint can catch it: an
+    archived-but-bound template leaves the nightly run pointing at something
+    the Library no longer shows, and the report quietly comes out in the
+    default format -- which nobody would notice until a customer did.
+    """
+    row = report_templates.get_visible(conn, caller["company_id"], caller["id"], template_id)
+    if row is None:
+        return error("template not found", 404)
+    err = _may_write_template(caller, row)
+    if err is not None:
+        return err
+    if report_templates.is_bound(conn, template_id):
+        return error("this template is still in use by a scheduled report -- "
+                     "point that schedule at another template first", 409)
+    report_templates.archive(conn, template_id)
+    return ok({"ok": True, "archived": str(template_id)})
+
+
+def list_report_template_bindings(conn, caller, event):
+    """GET /api/org/templates/bindings -- readable by anyone in the company.
+
+    Only gm/admin may set these, but a worker is entitled to know what format
+    the report going out under their name is written to.
+    """
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    rows = report_templates.list_bindings(conn, company_id)
+    return ok({"bindings": [{
+        "report_type": r["report_type"],
+        "template_id": str(r["template_id"]),
+        "template_name": r["template_name"],
+        "template_slug": r["template_slug"],
+        "pinned_version": r["pinned_version"],
+        "effective_version": r["pinned_version"] or r["current_version"],
+        "set_by": str(r["set_by"]),
+        "set_at": r["set_at"],
+    } for r in rows]})
+
+
+def set_report_template_binding(conn, caller, report_type, event):
+    """PUT /api/org/templates/bindings/{report_type} -- gm/admin only."""
+    if caller["global_role"] not in _TEMPLATE_WRITE_ROLES:
+        return error("admin, gm or platform_admin role required to choose the "
+                     "template a scheduled report uses", 403)
+    if report_type not in _BINDABLE_TYPES:
+        return error("report_type must be one of: %s" % ", ".join(_BINDABLE_TYPES), 400)
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    template_id = body.get("template_id")
+    if not template_id:
+        return error("template_id is required", 400)
+
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    target = report_templates.get_visible(conn, company_id, caller["id"], template_id)
+    if target is None:
+        return error("template not found", 404)
+    # A personal template cannot write the company's nightly report: nobody
+    # else can see it, so nobody else could say what the report even is.
+    if target["scope"] != "org":
+        return error("only an organisation template can be used for a scheduled "
+                     "report", 400)
+    if target["current_version"] < 1:
+        return error("that template has no content yet", 400)
+
+    pinned = body.get("pinned_version")
+    if pinned is not None:
+        try:
+            pinned = int(pinned)
+        except (TypeError, ValueError):
+            return error("pinned_version must be a number", 400)
+        if report_templates.get_version(conn, template_id, pinned) is None:
+            return error("no such version", 404)
+    row = report_templates.set_binding(conn, company_id, report_type, template_id,
+                                       pinned, caller["id"])
+    return ok({
+        "report_type": row["report_type"],
+        "template_id": str(row["template_id"]),
+        "pinned_version": row["pinned_version"],
+        "effective_version": row["pinned_version"] or target["current_version"],
+        "set_by": str(row["set_by"]),
+        "set_at": row["set_at"],
+    })
