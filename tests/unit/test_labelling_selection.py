@@ -14,6 +14,12 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "scripts", "labelling"))
 
+#: The rule, in one line, stated where a future whole-repo audit will look for it:
+#: **importorskip is for third-party dependencies an environment may legitimately lack
+#: (psycopg, onnxruntime, docx, yaml); a module from this repository is imported directly,
+#: so a missing one fails.** Full reasoning in
+#: `tests/unit/test_no_cross_company_voice_identity.py`, where the same rule was arrived at
+#: by shipping a guard that had never once run.
 try:
     import select_turns as sel
 except ImportError as exc:  # pragma: no cover - the message IS the point
