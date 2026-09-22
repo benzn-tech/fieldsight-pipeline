@@ -308,27 +308,71 @@ Feasibility section explains why no number can honestly be written today.
 
 # Feasibility — the precondition for A.4 and C
 
-Already measured, not speculation:
-`docs/superpowers/specs/2026-08-30-voiceprint-cross-session-measured.md`
+## The 2026-08-30 "no signal" result is superseded. Do not quote it as current.
 
-- 4 real prod sessions (Ben_UCPK2: 07-31, 08-11, 08-13, 08-27), 119 turns >= 3s, embedded
-  with the **deployed** `models/ecapa_tdnn.onnx`.
-- Within-session same-label: 0.517-0.539. Cross-session centroids (>= 15s each): **0.45 at
-  best, most 0.12-0.25** — the range a stranger occupies. The wearer speaks in all four, so
-  at least one cross pair is genuinely same-person; none reaches the within-session level.
-- Independent second data point: 2026-09-10, **nobody in the enrolment library attended**,
-  and margin alone still produced a "confirmed" at best=0.445 / margin=0.268
-  (migration 0060:7-11). The margin cannot reject a stranger on its own — that is why 0060's
-  floor exists.
+`docs/superpowers/specs/2026-08-30-voiceprint-cross-session-measured.md` measured 4 real prod
+sessions (119 turns >= 3s, deployed `ecapa_tdnn.onnx`) and found cross-session centroids at
+**0.45 at best, most 0.12-0.25** — a stranger's range — against a within-session 0.517-0.539.
 
-Cross-company matching is cross-session matching by definition, plus a change of device, site
-and acoustic environment. So on the evidence available today there is **no threshold that
-separates "same person, different company" from "different person"** — any value chosen now
-would be invented, and at global pool size a wrong automatic name is written into a customer
-report about a person who was never in the room.
+That document itself named the one design change its data suggested: **profiles pooled across
+several recording sessions** rather than single-session. All three changes that followed from
+it **shipped on 2026-09-20**, and this investigation initially missed that:
 
-This does not close requirement A. It says the threshold has to be **measured**, and the
-measurement is the next piece of work.
+| Prescribed change | Shipped | Evidence |
+|---|---|---|
+| multi-occasion enrolment | yes | `repositories/voiceprints.py:398` `add_sample` docstring, "2026-09-20 spec §3 is this function, called more than once, from more than one recording session" |
+| mean, not max, aggregation | yes | `voiceprint_utils.py:95-106`; commit 2026-09-20 "Aggregate a person's sample scores by mean, not max" |
+| a rejection floor under the margin | yes | migration `0060`; commit 2026-09-20 |
+
+Every number in the 08-30 document was produced under **max** aggregation and
+**single-session** profiles. Both are now false of the deployed system.
+
+## What the current configuration measures (2026-09-18)
+
+Ben's profile rebuilt from clean read-aloud + an 08-13 session centroid + a 09-17 simulated
+site centroid, then tested **only on days that did not contribute to the profile** — 08-07
+(Ben present) and 09-10 (negative control, nobody in the library attended):
+
+- **Recall rises sharply, on all three embedders.** 08-07 margins went from negative/marginal
+  to >= +0.15 throughout (ECAPA top score .439 -> .635).
+- **Max aggregation manufactures a new false positive**: on 09-10 Ben became top scorer
+  (ECAPA margin +.055; CAM++ +.195/+.252, i.e. *confirmed* for a person who was not there).
+  **Mean pooling removes it**: ECAPA 08-07 margins +.313/+.272/+.366/+.219 all confirmed,
+  09-10 margins -.141/-.111, Ben no longer surfaces. This is exactly the change that shipped.
+- **A usable absolute window appears, and does not exist without pooled enrolment**: ECAPA
+  under mean pooling gives 08-07 true positives at .574-.586 against a 09-10 maximum of .445.
+  A floor near **0.50** separates them — which is what migration 0060 is for.
+- **Do not change the embedder.** Three models compared on one 265-turn set: ERes2NetV2 has
+  the best CN-Celeb EER and gives a 09-10 false positive of .528 against a .545 true positive
+  — no usable absolute threshold exists on it at all. CAM++ suppresses false positives only
+  by flattening every score, taking the true positives down with them. ECAPA is the only one
+  with a threshold window. Benchmark EER ranking has **zero** correlation with this scenario.
+
+## So the honest verdict
+
+**Cross-session signal exists under the shipped configuration.** The earlier "no signal"
+statement described a configuration that no longer runs.
+
+It is still not enough to open `auto`, for three specific reasons:
+
+1. **n = 2 days, one rebuilt profile.** One person's profile was rebuilt; the pre-existing
+   false positives for the other two people on 09-10 were untouched, so the floor is doing
+   real work and has not been stress-tested.
+2. **A known optimistic bias.** The two site-condition samples were *multi-turn centroids*
+   (71 and 5 turns); production samples are single windows. Centroids are smoother, which
+   flatters the result.
+3. **Still no human ground truth.** Nobody has listened to this audio. 09-10 scoring as
+   "Mike" may mean the speaker really was not Ben. Without labels there is no ROC, and a
+   threshold quoted off unlabelled data is a threshold fitted to its own material — the
+   mistake 08-30 explicitly warns about.
+
+And cross-company matching adds a change of device, site and acoustic environment on top of
+cross-session, none of which the 09-18 run varied deliberately.
+
+**Consequence for requirement A: build all of it, ship it to TEST behind
+`GLOBAL_MATCH_MODE=suggest`, and let M1/M2 decide whether `auto` opens and at what number.**
+The starting hypothesis for the threshold is ~0.50 from the 09-18 window — a hypothesis to be
+tested, never a constant to be written into source.
 
 ## Measurement plan (M0-M4)
 
