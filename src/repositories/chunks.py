@@ -69,9 +69,17 @@ def search_chunks(conn, query_embedding, accessible_site_ids, k=5,
     the vector arm's real distance (build_search_sql's DISTINCT ON).
 
     `query_text` defaults to "" so every existing caller that does not pass it
-    keeps working: `websearch_to_tsquery('english', '')` returns an empty
+    keeps working: `websearch_to_tsquery('simple', '')` returns an empty
     tsquery that matches nothing, which is correct for "no text was given to
     search on" (never matches everything).
+
+    `query_text` is bound VERBATIM into build_search_sql()'s keyword arm as a
+    parameter -- this function does no term extraction or OR-joining of its
+    own. A caller that wants OR semantics over a natural-language question
+    (2026-09-22 fix, "the keyword arm can actually fire") must build that
+    string itself, e.g. `lexical_terms.or_query(lexical_terms.lexical_terms(q))`
+    -- see lambda_rag_search.py's `_search`, the only production caller that
+    receives a raw question rather than an already-literal term.
     """
     return conn.cursor(row_factory=dict_row).execute(
         build_search_sql(),

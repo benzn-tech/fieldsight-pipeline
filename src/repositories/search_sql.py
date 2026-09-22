@@ -34,13 +34,34 @@ def build_search_sql() -> str:
     # token is findable"). A rare identifier like "PS4" or an RFI number
     # carries almost no embedding signal and systematically loses the top-k
     # cosine race against topically-similar prose -- the chunk that contains
-    # the exact string a user typed can lose to forty unrelated chunks. The
-    # keyword arm runs to_tsvector('english', c.chunk_text) @@
-    # websearch_to_tsquery on the SAME scope predicate as the vector arm
-    # (never a looser one -- see _scope_predicate's own docstring on why that
-    # would resurrect a closed deleted-recording leak). The expression here
-    # MUST match idx_report_chunks_tsv's definition (0059 migration) character
-    # for character or Postgres silently falls back to a sequential scan --
+    # the exact string a user typed can lose to forty unrelated chunks.
+    #
+    # 2026-09-22 fix ("the keyword arm can actually fire"): the FIRST shipped
+    # version of this arm (PR #886) bound the caller's whole question as one
+    # websearch_to_tsquery input, which ANDs every non-stopword term together
+    # -- a natural-language question essentially never satisfies that -- and
+    # matched only on 'english', which hands one lexeme per whitespace run,
+    # so an identifier touching punctuation ("PS4/light") never matched a bare
+    # "PS4" query either. Both are fixed now:
+    #   * the CALLER (lambda_rag_search.py, fed by lambda_ask_agent.py's
+    #     _lexical_terms via the shared lexical_terms module) is responsible
+    #     for turning the question into an OR query BEFORE it reaches here --
+    #     this function still just binds whatever %(q_text)s it is given
+    #     verbatim; it does not know or care whether that text is one term,
+    #     an "a or b or c" OR list, or (for a caller that wants literal
+    #     AND/phrase behavior) an unmodified sentence. An empty %(q_text)s
+    #     yields an empty tsquery that matches NOTHING, never everything.
+    #   * the EXPRESSION below now matches BOTH the stemmed 'english' vector
+    #     (today's behavior) and a 'simple' (non-stemming) vector over the
+    #     same text with every run of non-alnum characters collapsed to a
+    #     space -- so "PS4/light" contributes 'ps4' and 'light' as separate
+    #     literal simple-config lexemes, restoring the word boundary the raw
+    #     punctuation destroyed. The query side uses websearch_to_tsquery
+    #     with the 'simple' config to match that half of the vector (see
+    #     migration 0061's own header for the six measured cases this fixes).
+    # The expression here MUST match idx_report_chunks_tsv_multi_config's
+    # definition (0061 migration) character for character or Postgres
+    # silently falls back to a sequential scan --
     # test_keyword_arm_expression_matches_the_index_exactly pins this.
     #
     # The keyword arm's rows carry NO meaningful cosine distance (never scored
@@ -108,13 +129,21 @@ def build_search_sql() -> str:
         "  LEFT JOIN topics t ON t.id = c.topic_id "
         "  LEFT JOIN sites s ON s.id = c.site_id "
         "  WHERE " + scope + " "
-        "  AND to_tsvector('english', c.chunk_text) @@ websearch_to_tsquery('english', %(q_text)s) "
-        # NOTE: this LIMIT has no ORDER BY, so when a term matches more than k
-        # rows Postgres returns a plan-dependent subset, not the top k by
-        # ts_rank. Acceptable for the case this arm exists to serve -- a rare
-        # identifier matching more than k chunks is not the failure being fixed
-        # -- and left undecided here on purpose: ranking policy for the keyword
-        # arm belongs to Task 4, which is where a ts_rank order would go.
+        "  AND (to_tsvector('english', c.chunk_text) || to_tsvector('simple', regexp_replace(c.chunk_text, '[^a-zA-Z0-9]+', ' ', 'g'))) "
+        "  @@ websearch_to_tsquery('simple', %(q_text)s) "
+        # 2026-09-22 round-2 fix ("the keyword arm can actually fire"): this
+        # LIMIT used to have NO ORDER BY, which was fine when the arm's query
+        # was an AND of every word (Cause A) -- matches were rare, so
+        # whichever plan-dependent k rows Postgres happened to return were
+        # usually ALL of the matches anyway. Cause A's fix turned the query
+        # into an OR, which makes matches common, so an un-ordered LIMIT now
+        # returns an arbitrary k out of however many rows matched -- not the
+        # arm's best k. ORDER BY ts_rank DESC over the SAME indexed
+        # expression (character-for-character, so the planner can still use
+        # it for the scan) before the LIMIT makes the k rows this arm
+        # contributes its best k by relevance, not whichever k the planner
+        # happened to visit first.
+        "  ORDER BY ts_rank(to_tsvector('english', c.chunk_text) || to_tsvector('simple', regexp_replace(c.chunk_text, '[^a-zA-Z0-9]+', ' ', 'g')), websearch_to_tsquery('simple', %(q_text)s)) DESC "
         "  LIMIT %(k)s"
         ") "
         "SELECT id, chunk_text, chunk_type, topic_id, source_s3_key, "

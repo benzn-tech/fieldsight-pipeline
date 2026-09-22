@@ -74,25 +74,37 @@ def test_sites_has_coordinate_columns():
 
 
 def test_report_chunks_has_a_tsvector_expression_index():
-    # 0059: literal-token search needs a word-boundary-aware index. This is a
-    # plain (non-CONCURRENT) index on the bare expression, not a stored
-    # column -- CREATE INDEX CONCURRENTLY cannot run inside apply_migrations'
+    # 0059 created idx_report_chunks_tsv (a plain, non-CONCURRENT expression
+    # index -- CREATE INDEX CONCURRENTLY cannot run inside apply_migrations'
     # conn.transaction() wrapper, and a GENERATED STORED column's ACCESS
-    # EXCLUSIVE table rewrite has no measurable duration in this repo (no
-    # read-only path to prod's row count). An expression index needs no
-    # column and nothing to keep in sync on future writes.
+    # EXCLUSIVE table rewrite has no measurable duration in this repo, no
+    # read-only path to prod's row count). 0061 (2026-09-22, "the keyword arm
+    # can actually fire") REPLACES it with idx_report_chunks_tsv_multi_config
+    # -- the 'english' vector OR'd with a 'simple' vector over punctuation-
+    # split text, needed so an identifier touching punctuation (PS4/light)
+    # is still findable -- and DROPs the old one, since its expression no
+    # longer appears anywhere in build_search_sql()'s output.
     conn = _fresh_conn()
     try:
         apply_migrations(conn, MIGRATIONS_DIR)
         rows = conn.execute(
             "SELECT indexdef FROM pg_indexes "
-            "WHERE tablename='report_chunks' AND indexname='idx_report_chunks_tsv'"
+            "WHERE tablename='report_chunks' AND indexname='idx_report_chunks_tsv_multi_config'"
         ).fetchall()
-        assert rows, "idx_report_chunks_tsv is missing"
+        assert rows, "idx_report_chunks_tsv_multi_config is missing"
         indexdef = rows[0][0].lower()
         assert "gin" in indexdef
         assert "to_tsvector" in indexdef
         assert "chunk_text" in indexdef
+        assert "regexp_replace" in indexdef, \
+            "the 'simple' half of the combined expression is missing -- an " \
+            "identifier touching punctuation would not be findable again"
+
+        old = conn.execute(
+            "SELECT 1 FROM pg_indexes WHERE indexname='idx_report_chunks_tsv'"
+        ).fetchall()
+        assert not old, "idx_report_chunks_tsv should have been dropped by migration 0061"
+
         # No column was added -- confirms this really is an expression index,
         # not a stored column with the same index name.
         cols = {r[0] for r in conn.execute(
@@ -105,17 +117,19 @@ def test_report_chunks_has_a_tsvector_expression_index():
 
 
 def test_report_chunks_tsv_index_survives_a_second_apply():
-    # IF NOT EXISTS -- also the property the CONCURRENTLY escape hatch (Task 1's
+    # IF NOT EXISTS -- also the property the CONCURRENTLY escape hatch (0061's
     # documented manual path) depends on: if a DBA builds the index manually
     # first, this migration's own CREATE INDEX must be a no-op, not an error.
     conn = _fresh_conn()
     try:
         apply_migrations(conn, MIGRATIONS_DIR)
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_report_chunks_tsv "
-            "ON report_chunks USING gin (to_tsvector('english', chunk_text))")
+            "CREATE INDEX IF NOT EXISTS idx_report_chunks_tsv_multi_config "
+            "ON report_chunks USING gin ("
+            "(to_tsvector('english', chunk_text) "
+            "|| to_tsvector('simple', regexp_replace(chunk_text, '[^a-zA-Z0-9]+', ' ', 'g'))))")
         rows = conn.execute(
-            "SELECT indexdef FROM pg_indexes WHERE indexname='idx_report_chunks_tsv'"
+            "SELECT indexdef FROM pg_indexes WHERE indexname='idx_report_chunks_tsv_multi_config'"
         ).fetchall()
         assert len(rows) == 1
     finally:

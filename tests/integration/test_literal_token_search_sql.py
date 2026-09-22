@@ -17,18 +17,27 @@ These are skipped unless TEST_DATABASE_URL is set. Aurora is in-VPC and not
 reachable from a developer machine, so the route that works locally is an
 embedded Postgres:
 
-    uv run --with pgserver python -c "import pgserver, tempfile;         print(pgserver.get_server(tempfile.mkdtemp()).get_uri())"
+    uv run --python 3.12 --with pgserver python -c "import pgserver, tempfile;         print(pgserver.get_server(tempfile.mkdtemp()).get_uri())"
 
 then export that URI as TEST_DATABASE_URL.
 
-USE `uv run --with pgserver`, NOT `uv pip install pgserver` into a venv. The two
-install routes ship DIFFERENT extension sets, measured on the same machine on
-the same day: under `uv run --with pgserver`, `pgcrypto` is present and
-`CREATE EXTENSION pgcrypto` succeeds, so migration 0001 applies as written.
-Under a venv install, `pgcrypto.control` is absent and 0001 fails, and the only
-way forward is hand-stubbing a no-op control file inside the package tree --
-which works, but makes a green run depend on an undocumented local hack. If you
-hit that failure, you are on the wrong install route; switch rather than stub.
+PIN `--python 3.12`. Do not leave the version to resolution, and do not
+`uv pip install pgserver` into a venv. **Which extensions the bundled Postgres
+ships varies with the CPython build uv resolves to**, and migration 0001 needs
+`pgcrypto`:
+
+  * `--python 3.12` -> a build that HAS `pgcrypto`; 0001 applies as written.
+    Confirmed twice on this machine, on 2026-09-21 and again on 2026-09-22.
+  * a cp311 build -> `pgcrypto.control` is absent and 0001 fails. This bit two
+    different sessions, once through a venv install and once through an
+    unpinned `uv run --with pgserver` that happened to resolve to 3.11 --
+    which is why the earlier version of this note, blaming the venv, was only
+    half right. The install route was never the variable. The interpreter was.
+
+If you hit `extension "pgcrypto" is not available`, you are on the wrong build:
+pin the version. Do NOT hand-stub a no-op `pgcrypto.control` into the package
+tree. It works, and it makes a green integration run depend on a local hack
+nobody else has.
 
 (The one thing this repo uses pgcrypto for is `gen_random_uuid()` as a column
 default, which has been a Postgres core builtin since v13 and needs no
@@ -52,6 +61,7 @@ instead of depending on a pre-existing row to already be in the database.
 """
 import pytest
 
+from lexical_terms import QUERY_STOPWORDS, or_query, query_terms
 from repositories import chunks, companies, redactions, sites, topics, users
 
 pytestmark = pytest.mark.integration
@@ -259,11 +269,18 @@ def test_ps40_does_not_match_ps4_word_boundary(db):
 def test_the_gin_expression_index_is_actually_used_by_the_planner(db):
     """Task 1 Step 5's check, run for real: on a table with enough rows that a
     sequential scan is not simply cheaper, the planner must choose
-    idx_report_chunks_tsv for the keyword arm's own predicate, not a Seq Scan.
-    If this ever goes red, the expression in build_search_sql() no longer
-    matches the index's expression character-for-character -- the exact
-    silent-fallback failure test_keyword_arm_expression_matches_the_index_exactly
-    (unit suite) exists to catch before it reaches here."""
+    idx_report_chunks_tsv_multi_config (migration 0061, 2026-09-22 fix: "the
+    keyword arm can actually fire") for the keyword arm's own predicate, not
+    a Seq Scan. If this ever goes red, the expression in build_search_sql()
+    no longer matches the index's expression character-for-character -- the
+    exact silent-fallback failure
+    test_keyword_arm_expression_matches_the_index_exactly (unit suite)
+    exists to catch before it reaches here.
+
+    The EXPLAIN'd predicate below is the combined-vector expression + the
+    'simple'-config query side, not the old 'english'-only one -- migration
+    0061 DROPs idx_report_chunks_tsv, so the old expression would now have
+    nothing to match and would legitimately Seq Scan."""
     site = _site(db)
     for i in range(3000):
         _insert(db, site["id"], f"Unrelated electrical hold-up note number {i}", seed=i)
@@ -271,9 +288,186 @@ def test_the_gin_expression_index_is_actually_used_by_the_planner(db):
 
     plan = "\n".join(r[0] for r in db.execute(
         "EXPLAIN SELECT id FROM report_chunks WHERE "
-        "to_tsvector('english', chunk_text) @@ websearch_to_tsquery('english', 'PS4')"
+        "(to_tsvector('english', chunk_text) || to_tsvector('simple', "
+        "regexp_replace(chunk_text, '[^a-zA-Z0-9]+', ' ', 'g'))) "
+        "@@ websearch_to_tsquery('simple', 'PS4')"
     ).fetchall())
-    assert "idx_report_chunks_tsv" in plan, (
+    assert "idx_report_chunks_tsv_multi_config" in plan, (
         "the planner did not choose the GIN expression index on a "
         f"3000-row table -- got:\n{plan}")
     assert "Seq Scan" not in plan, f"planner fell back to a sequential scan:\n{plan}"
+
+
+def test_the_dropped_idx_report_chunks_tsv_is_actually_gone(db):
+    """Migration 0061 DROP INDEXes idx_report_chunks_tsv (0059) because its
+    'english'-only expression no longer appears anywhere in
+    build_search_sql()'s output -- the planner would never choose it again,
+    so it would only keep costing writes to maintain. This is the one place
+    that runs the migration against a real Postgres and checks the drop
+    actually took, rather than trusting the migration file's own comment."""
+    row = db.execute(
+        "SELECT 1 FROM pg_indexes WHERE indexname = 'idx_report_chunks_tsv'"
+    ).fetchone()
+    assert row is None, "idx_report_chunks_tsv should have been dropped by migration 0061"
+
+    row = db.execute(
+        "SELECT 1 FROM pg_indexes WHERE indexname = 'idx_report_chunks_tsv_multi_config'"
+    ).fetchone()
+    assert row is not None, "idx_report_chunks_tsv_multi_config should exist after migration 0061"
+
+
+# ---------------------------------------------------------------------------
+# The six acceptance cases from the 2026-09-22 fix ("the keyword arm can
+# actually fire"), run through chunks.search_chunks -- the actual code path,
+# not a hand-written EXPLAIN -- with query_text already OR-ready (a single
+# bare term), mirroring what lambda_rag_search.py now sends after
+# lexical_terms.or_query(lexical_terms.lexical_terms(question)).
+# ---------------------------------------------------------------------------
+
+def test_ps4_finds_a_chunk_where_ps4_touches_punctuation(db):
+    """The motivating case (Cause B): the owner's real data has 'PS4/light
+    pole issues', where PS4 touches a slash rather than whitespace. Under
+    'english' alone, to_tsvector('english', 'pricing and PS4/light pole
+    issues') yields the single lexeme 'ps4/light' -- a bare 'PS4' query never
+    matched it, even after Cause A (the AND-vs-OR fix) is fixed. This is the
+    case that only migration 0061's 'simple' + regexp_replace vector fixes."""
+    site = _site(db)
+    target = _insert(db, site["id"], "pricing and PS4/light pole issues", seed=13)
+    _fill_with_closer_unrelated_chunks(db, site["id"], query_seed=14)
+
+    rows = chunks.search_chunks(db, _flat_embedding(14), [site["id"]], k=30, query_text="PS4")
+    ids = {str(r["id"]) for r in rows}
+    assert str(target["id"]) in ids, \
+        "PS4 must find 'PS4/light' after the punctuation split -- this is the owner's own case"
+    hit = next(r for r in rows if str(r["id"]) == str(target["id"]))
+    assert hit["lexical_hit"] is True
+
+
+def test_bare_1042_finds_rfi_1042(db):
+    """A bare numeric identifier must find it inside a hyphenated compound
+    ('RFI-1042') the same way PS4 must find 'PS4/light' -- the same
+    Cause B fix, a different punctuation character."""
+    site = _site(db)
+    target = _insert(db, site["id"], "RFI-1042 raised today", seed=15)
+    _fill_with_closer_unrelated_chunks(db, site["id"], query_seed=16)
+
+    rows = chunks.search_chunks(db, _flat_embedding(16), [site["id"]], k=30, query_text="1042")
+    ids = {str(r["id"]) for r in rows}
+    assert str(target["id"]) in ids, "bare 1042 must find RFI-1042 after the punctuation split"
+    hit = next(r for r in rows if str(r["id"]) == str(target["id"]))
+    assert hit["lexical_hit"] is True
+
+
+def test_1042_does_not_match_rfi_1043(db):
+    """The word-boundary property (same reasoning as PS4/PS40) applied to a
+    numeric identifier: 1042 must not match a chunk that only contains 1043."""
+    site = _site(db)
+    decoy = _insert(db, site["id"], "RFI-1043 raised today", seed=17)
+    _fill_with_closer_unrelated_chunks(db, site["id"], query_seed=18)
+
+    rows = chunks.search_chunks(db, _flat_embedding(18), [site["id"]], k=30, query_text="1042")
+    assert str(decoy["id"]) not in {str(r["id"]) for r in rows}, \
+        "1042 must not match a chunk containing only 1043"
+
+
+def test_exact_rfi_1042_still_matches(db):
+    """The full identifier, hyphen and all, typed exactly as it appears in
+    the text, must still be found -- the punctuation split must not break the
+    exact-match case it is meant to widen."""
+    site = _site(db)
+    target = _insert(db, site["id"], "RFI-1042 raised today", seed=19)
+    _fill_with_closer_unrelated_chunks(db, site["id"], query_seed=20)
+
+    rows = chunks.search_chunks(db, _flat_embedding(20), [site["id"]], k=30,
+                                query_text="RFI-1042")
+    ids = {str(r["id"]) for r in rows}
+    assert str(target["id"]) in ids, "the exact identifier 'RFI-1042' must still be found"
+    hit = next(r for r in rows if str(r["id"]) == str(target["id"]))
+    assert hit["lexical_hit"] is True
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-22 round-2 fix ("the keyword arm can actually fire", again): the
+# controller ran the OWNER'S REAL QUESTION -- a full natural-language
+# sentence, not a bare token -- through the real path and measured three
+# chunks about bathroom tile, Twizel booking, and a concrete pour all match,
+# none related to the question. Cause: lexical_terms() has only a 3-char
+# floor and no stopword filter, so 'when'/'did'/'and'/'why' all survive, and
+# one OR'd stopword matches nearly every chunk in the corpus. Every test
+# above this point drives search_chunks with a BARE TOKEN as query_text
+# ("PS4", "1042", ...) -- that shape cannot see this failure, because a bare
+# token was never a stopword to begin with. These tests are the ones that can.
+# ---------------------------------------------------------------------------
+
+def test_every_query_stopword_is_actually_dropped_by_to_tsvector(db):
+    """Pins lexical_terms.QUERY_STOPWORDS against its own authority: a word
+    belongs in that list exactly when `to_tsvector('english', word)` yields
+    nothing for it. QUERY_STOPWORDS is a hard-coded constant (query_terms()
+    is pure Python -- no psycopg, no DB access, by the module's own design),
+    so nothing else keeps it from silently drifting away from what a real
+    Postgres actually calls a stopword except this test."""
+    for word in sorted(QUERY_STOPWORDS):
+        row = db.execute("SELECT to_tsvector('english', %s)", (word,)).fetchone()
+        assert row[0] == "", (
+            f"{word!r} is in QUERY_STOPWORDS but to_tsvector('english', {word!r}) "
+            f"did not come back empty -- got {row[0]!r}. Either Postgres no longer "
+            "treats it as a stopword, or it never was one and must not be filtered."
+        )
+
+
+def test_a_real_sentence_finds_its_chunk_and_not_three_unrelated_ones(db):
+    """The exact shape that failed twice: a FULL NATURAL-LANGUAGE SENTENCE,
+    not a bare token, run through the actual code path
+    (query_terms -> or_query -> chunks.search_chunks), asserted in BOTH
+    directions against a real Postgres:
+
+      * it still finds the chunk that genuinely contains the identifier
+        ("...pricing and PS4/light pole issues"), AND
+      * it does NOT match chunks that merely share common/stop words --
+        the exact three decoys the controller measured matching, verbatim.
+
+    Token-level cases (the ones above) are necessary but were NOT sufficient
+    to catch this -- this is the evidence for that."""
+    site = _site(db)
+    question = "when did request ps4? and why?"
+
+    target = _insert(db, site["id"], "pricing and PS4/light pole issues", seed=21)
+    decoy_tile = _insert(
+        db, site["id"],
+        "Bathroom tile and finish options were discussed with the client.",
+        seed=22)
+    decoy_twizel = _insert(
+        db, site["id"],
+        "Twizel booking and subs coordination for the week ahead.",
+        seed=23)
+    decoy_pour = _insert(
+        db, site["id"],
+        "The concrete pour is scheduled and the pump has been booked.",
+        seed=24)
+    # Filled with chunks close to the query embedding, matching NONE of
+    # question's terms in chunk_text -- so if a decoy shows up, it can only
+    # be because the keyword arm matched it, exactly the property under test.
+    _fill_with_closer_unrelated_chunks(db, site["id"], query_seed=25)
+
+    query_text = or_query(query_terms(question))
+    # The bug this test exists to catch would make query_text carry a bare
+    # stopword like 'and' -- assert the real extraction does not, so a
+    # regression in query_terms itself fails HERE, not three lines down in a
+    # confusing decoy-match failure.
+    assert "and" not in query_text.split(" or ")
+    assert "why" not in query_text.split(" or ")
+    assert "did" not in query_text.split(" or ")
+    assert "when" not in query_text.split(" or ")
+
+    rows = chunks.search_chunks(db, _flat_embedding(25), [site["id"]], k=30,
+                                query_text=query_text)
+    ids = {str(r["id"]) for r in rows}
+
+    assert str(target["id"]) in ids, \
+        "the sentence must still find the chunk that genuinely contains PS4"
+    assert str(decoy_tile["id"]) not in ids, \
+        "a bare stopword must not match the bathroom-tile chunk"
+    assert str(decoy_twizel["id"]) not in ids, \
+        "a bare stopword must not match the Twizel-booking chunk"
+    assert str(decoy_pour["id"]) not in ids, \
+        "a bare stopword must not match the concrete-pour chunk"

@@ -144,6 +144,80 @@ def test_search_chunks_receives_vector_and_k(wired):
     assert res["chunks"] == [{"chunk_text": "hello"}]
 
 
+def test_query_text_is_an_or_join_of_lexical_terms_not_the_raw_question(wired):
+    """2026-09-22 fix ("the keyword arm can actually fire", Cause A): the raw
+    question must never reach search_chunks's query_text -- binding a whole
+    sentence there makes build_search_sql's keyword arm AND every
+    non-stopword term, which a natural-language question essentially never
+    satisfies. This asserts the ACTUAL string handed to search_chunks is the
+    query_terms extraction OR-joined, matching lexical_terms.or_query --
+    query_terms, not lexical_terms, because lexical_terms alone lets English
+    stopwords like 'was'/'when' through (round-2 fix, 2026-09-22)."""
+    wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
+    captured = {}
+
+    def fake_search(conn, qv, site_ids, k=5, date_from=None, date_to=None, author_ids=None, query_text=None):
+        captured["query_text"] = query_text
+        return []
+
+    wired.setattr(rag.chunks, "search_chunks", fake_search)
+    ev = make_event()
+    ev["question"] = "when was the PS4 requested?"
+
+    rag.lambda_handler(ev, None)
+
+    from lexical_terms import or_query, query_terms
+    assert captured["query_text"] == or_query(query_terms("when was the PS4 requested?"))
+    # The raw sentence itself must not be what gets bound -- that is exactly
+    # the AND-everything bug this fix removes.
+    assert captured["query_text"] != "when was the PS4 requested?"
+    assert " or " in captured["query_text"]
+    # "was"/"when" are English stopwords (round-2 fix) -- neither may survive
+    # into the OR query, or a bare stopword alone matches nearly every chunk.
+    terms = captured["query_text"].split(" or ")
+    assert "was" not in terms
+    assert "when" not in terms
+    assert "ps4" in terms
+    assert "requested" in terms
+
+
+def test_query_text_is_empty_string_for_a_question_with_no_literal_terms(wired):
+    """Cause A's empty-term-list rule: a question lexical_terms reduces to
+    nothing (e.g. only stopwords/short words) must leave the keyword arm
+    inert -- query_text == "" -- never fall back to the raw sentence, which
+    would silently reintroduce the AND-everything bug for exactly the
+    questions this fix is meant to help."""
+    wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
+    captured = {}
+
+    def fake_search(conn, qv, site_ids, k=5, date_from=None, date_to=None, author_ids=None, query_text=None):
+        captured["query_text"] = query_text
+        return []
+
+    wired.setattr(rag.chunks, "search_chunks", fake_search)
+    ev = make_event()
+    ev["question"] = "is it"  # both words are short/stopwords -> no lexical terms
+
+    rag.lambda_handler(ev, None)
+
+    assert captured["query_text"] == ""
+
+
+def test_query_text_defaults_to_empty_string_with_no_question(wired):
+    wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
+    captured = {}
+
+    def fake_search(conn, qv, site_ids, k=5, date_from=None, date_to=None, author_ids=None, query_text=None):
+        captured["query_text"] = query_text
+        return []
+
+    wired.setattr(rag.chunks, "search_chunks", fake_search)
+
+    rag.lambda_handler(make_event(), None)  # no "question" key at all
+
+    assert captured["query_text"] == ""
+
+
 def test_default_k_is_8(wired):
     wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
     captured = {}
