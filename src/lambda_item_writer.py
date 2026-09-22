@@ -1340,25 +1340,29 @@ def apply_retag_batch(event):
     """
     run_id = event.get("run_id")
     company_id = event.get("company_id")
-    tagged = event.get("tagged") or []
     applied = covered = 0
+    # (kind, id-field, rows) -- two tables, one loop, so the slug resolution
+    # and the run stamping cannot drift between them.
+    batches = (("topic", "topic_id", event.get("tagged") or []),
+               ("action_item", "action_item_id", event.get("tagged_actions") or []))
     with get_connection() as conn:
-        for row in tagged:
-            covered += 1
-            slugs = row.get("slugs") or []
-            if not slugs:
-                continue
-            by_slug = tags.ids_for_slugs(conn, company_id, slugs)
-            ids = [by_slug[s] for s in slugs if s in by_slug]
-            missing = [s for s in slugs if s not in by_slug]
-            if missing:
-                logger.warning("retag: %d slug(s) have no row for this company "
-                               "and were dropped (%s)", len(missing),
-                               ", ".join(sorted(missing)))
-            if ids:
-                applied += tag_writes.apply_tags(
-                    conn, "topic", row["topic_id"], ids,
-                    source="classifier", run_id=run_id)
+        for kind, id_field, rows in batches:
+            for row in rows:
+                covered += 1
+                slugs = row.get("slugs") or []
+                if not slugs:
+                    continue
+                by_slug = tags.ids_for_slugs(conn, company_id, slugs)
+                ids = [by_slug[s] for s in slugs if s in by_slug]
+                missing = [s for s in slugs if s not in by_slug]
+                if missing:
+                    logger.warning("retag: %d slug(s) have no row for this company "
+                                   "and were dropped (%s)", len(missing),
+                                   ", ".join(sorted(missing)))
+                if ids:
+                    applied += tag_writes.apply_tags(
+                        conn, kind, row[id_field], ids,
+                        source="classifier", run_id=run_id)
         # Closed HERE, inside the connection, so the run's status is durable
         # in the same transaction as the rows it describes. A run left open is
         # indistinguishable from one still going, and nobody can tell whether

@@ -196,7 +196,12 @@ def test_the_answer_carries_slugs_and_nothing_else(retag, monkeypatch):
     assert payloads == [{"op": "apply_tags", "run_id": "run-1",
                          "company_id": "co-1",
                          "tagged": [{"topic_id": "t-1",
-                                     "slugs": ["structure.concrete"]}]}]
+                                     "slugs": ["structure.concrete"]}],
+                         "tagged_actions": []}]
+    # The whole payload, asserted as a whole: there is no field for a title, a
+    # summary or any other text, so a re-tag cannot alter what was written.
+    assert set(payloads[0]) == {"op", "run_id", "company_id", "tagged",
+                                "tagged_actions"}
 
 
 def test_a_topic_the_model_abstained_on_is_still_reported(retag, monkeypatch):
@@ -338,3 +343,127 @@ def test_an_s3_event_is_still_an_s3_event(writer):
     assert iw._is_tag_op({"op": "apply_tags"}) is True
     assert iw._is_tag_op({"Records": [{"s3": {"object": {"key": "x"}}}]}) is False
     assert iw._is_tag_op({}) is False
+
+
+# ---------------------------------------------------------------------------
+# Action items ride the same three hops.
+#
+# Chosen by measurement, not by symmetry with topics: three arms over 90 real
+# action items, four runs of the classifier. It scored 0.861 against an
+# independent second annotator's labels, inheritance scored 0.644 and tagging
+# nothing scored 0.411. A and inheritance find a right leaf about equally
+# often (48 vs 47 of 57); the classifier's whole advantage is not adding wrong
+# ones (precision 0.866 vs 0.657), which for a filter is the difference
+# between useful and noisy.
+#
+# THE CONTEXT IS THE ACTION'S TEXT PLUS ITS TOPIC'S TITLE, AND NOT THE TOPIC'S
+# TAGS. Both are produced in the same pass, so the title exists and the tags
+# do not yet. Giving the tags would make the tagger better informed than the
+# system can be; giving nothing would make it blinder. The same context was in
+# the blind-annotation pack, so annotator, model and production all read the
+# same thing.
+# ---------------------------------------------------------------------------
+
+def test_the_request_can_carry_actions_as_well_as_topics():
+    s3 = FakeS3()
+    retag_request.emit(s3, "bucket", "run-1", "co-1",
+                       [{"id": "t-1", "title": "Concrete", "summary": "Poured."}],
+                       actions=[{"id": "a-1", "text": "Order rebar",
+                                 "topic_title": "Concrete"}])
+    body = s3.puts[0]["body"]
+    assert body["actions"] == [{"id": "a-1", "text": "Order rebar",
+                                "topic_title": "Concrete"}]
+
+
+def test_an_action_only_batch_is_still_a_batch():
+    """A re-tag run walks topics and actions separately; a batch of one kind
+    must not be mistaken for nothing to do."""
+    s3 = FakeS3()
+    key = retag_request.emit(s3, "b", "run-1", "co-1", [],
+                             actions=[{"id": "a-1", "text": "x", "topic_title": "T"}])
+    assert key is not None and s3.puts[0]["body"]["topics"] == []
+
+
+def test_an_action_carries_no_more_than_the_tagger_reads():
+    """Its text and its topic's TITLE. Not the topic's tags, not the
+    responsible person, not the deadline -- none of which the tagger is
+    allowed to see or has any use for, and all of which would be a second copy
+    of a row crossing a trust boundary."""
+    s3 = FakeS3()
+    retag_request.emit(s3, "b", "run-1", "co-1", [],
+                       actions=[{"id": "a-1", "text": "x", "topic_title": "T",
+                                 "responsible": "Neil", "deadline": "Friday",
+                                 "topic_tags": ["structure.concrete"]}])
+    assert set(s3.puts[0]["body"]["actions"][0]) == {"id", "text", "topic_title"}
+
+
+def test_the_non_vpc_hop_classifies_actions_with_their_topic_title(retag, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(retag, "s3", lambda: _s3_with(
+        {"run_id": "run-1", "company_id": "co-1", "topics": [],
+         "actions": [{"id": "a-1", "text": "Order rebar", "topic_title": "Slab pour"}]}))
+    monkeypatch.setattr(retag.tagging, "classify_actions_with_stats",
+                        lambda items, leaves, call: (
+                            seen.update({"items": items}) or
+                            ([["structure.concrete"]], {"unanswered": 0})))
+    payloads = []
+    monkeypatch.setattr(retag, "_invoke_writer", lambda p: payloads.append(p))
+    retag.lambda_handler(_event(), None)
+    assert seen["items"][0]["topic_title"] == "Slab pour"
+    assert payloads[0]["tagged_actions"] == [
+        {"action_item_id": "a-1", "slugs": ["structure.concrete"]}]
+
+
+def test_an_unanswered_action_batch_is_not_a_batch_of_abstentions(retag, monkeypatch):
+    monkeypatch.setattr(retag, "s3", lambda: _s3_with(
+        {"run_id": "run-1", "company_id": "co-1", "topics": [],
+         "actions": [{"id": "a-1", "text": "x", "topic_title": "T"}]}))
+    monkeypatch.setattr(retag.tagging, "classify_actions_with_stats",
+                        lambda *a, **k: ([[]], {"unanswered": 1}))
+    monkeypatch.setattr(retag, "_invoke_writer",
+                        lambda p: pytest.fail("the writer was called"))
+    with pytest.raises(RuntimeError):
+        retag.lambda_handler(_event(), None)
+
+
+def test_the_write_hop_applies_action_tags_to_the_action_table(writer):
+    writer["slugs"] = {"structure.concrete"}
+    writer["iw"].lambda_handler(
+        {"op": "apply_tags", "run_id": "run-1", "company_id": "co-1",
+         "tagged": [],
+         "tagged_actions": [{"action_item_id": "a-1",
+                             "slugs": ["structure.concrete"]}]}, None)
+    kinds = [(k, e, i) for k, e, i, _kw in writer["applied"]]
+    assert kinds == [("action_item", "a-1", ["id-structure.concrete"])]
+
+
+def test_an_action_the_model_abstained_on_writes_nothing(writer):
+    writer["slugs"] = {"structure.concrete"}
+    writer["iw"].lambda_handler(
+        {"op": "apply_tags", "run_id": "run-1", "company_id": "co-1",
+         "tagged": [], "tagged_actions": [{"action_item_id": "a-1", "slugs": []}]},
+        None)
+    assert writer["applied"] == []
+    assert writer["finished"], "the run must still be closed"
+
+
+def test_the_selection_for_actions_carries_its_topic_title():
+    conn = RecordingConn()
+    tags.actions_to_retag(conn, "co-1")
+    sql, params = conn.executed[0]
+    assert "action_items" in sql and "topics" in sql, "it must join its topic"
+    selected = sql.split("SELECT", 1)[1].split(" FROM")[0]
+    assert "title" in selected and "text" in selected
+    for never in ("responsible", "deadline", "priority"):
+        assert never not in selected, never
+
+
+def test_the_selection_for_actions_excludes_deleted_topics_with_both_arms():
+    """An action under a deleted recording's topic must not be re-tagged, and
+    the source arm is the load-bearing one for the same reason it is on the
+    topic side: a re-extracted day's topics come back with new uuids."""
+    conn = RecordingConn()
+    tags.actions_to_retag(conn, "co-1")
+    sql, _ = conn.executed[0]
+    assert "scope = 'deleted'" in sql and "reverted_at IS NULL" in sql
+    assert "target_key" in sql

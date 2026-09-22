@@ -122,38 +122,50 @@ def classify_with_stats(topics, leaves, call_llm):
     trusted for, so the one thing that must never be silently faked is an
     abstention.
     """
-    out = [[] for _ in topics]
-    if not topics:
+    return _classify(topics, leaves, call_llm, build_prompt,
+                     caller="topic_tagging", what="topic")
+
+
+def _classify(items, leaves, call_llm, build, *, caller, what):
+    """The half both taggers share: batch, call, parse, count what failed.
+
+    One implementation rather than two, because the thing that must not drift
+    between them is the unanswered-batch accounting -- two copies of that is
+    two chances for one of them to start reading an empty reply as a batch of
+    abstentions.
+    """
+    out = [[] for _ in items]
+    if not items:
         return out, {"batches": 0, "unanswered": 0, "tagged": 0, "abstained": 0}
 
     valid = {l["slug"] for l in leaves}
     batches = unanswered = 0
-    for start in range(0, len(topics), BATCH):
-        chunk = topics[start:start + BATCH]
+    for start in range(0, len(items), BATCH):
+        chunk = items[start:start + BATCH]
         batches += 1
         text, err = call_llm(
-            build_prompt(chunk, leaves, offset=start),
+            build(chunk, leaves, offset=start),
             max_tokens=2000,
             enable_thinking=False,
-            caller="topic_tagging",
+            caller=caller,
         )
         if err or not (text or "").strip():
             unanswered += 1
-            logger.warning("tagging: batch at %d returned nothing (%s) -- "
-                           "its topics stay untagged, which is NOT an abstention",
-                           start, err or "empty body")
+            logger.warning("tagging: %s batch at %d returned nothing (%s) -- "
+                           "its items stay untagged, which is NOT an abstention",
+                           what, start, err or "empty body")
             continue
         if not _parse(text, valid, out, start, start + len(chunk)):
             unanswered += 1
-            logger.warning("tagging: batch at %d had no readable JSON (%.80r)",
-                           start, text)
+            logger.warning("tagging: %s batch at %d had no readable JSON (%.80r)",
+                           what, start, text)
 
     tagged = sum(1 for s in out if s)
     stats = {"batches": batches, "unanswered": unanswered,
-             "tagged": tagged, "abstained": len(out) - tagged - 0}
-    logger.info("tagging: %d topic(s), %d tagged, %d left untagged, "
+             "tagged": tagged, "abstained": len(out) - tagged}
+    logger.info("tagging: %d %s(s), %d tagged, %d left untagged, "
                 "%d batch(es), %d unanswered",
-                len(topics), tagged, len(out) - tagged, batches, unanswered)
+                len(items), what, tagged, len(out) - tagged, batches, unanswered)
     return out, stats
 
 
@@ -163,3 +175,65 @@ def classify(topics, leaves, call_llm):
     to stay distinguishable, so anything that RECORDS the result should use the
     other one."""
     return classify_with_stats(topics, leaves, call_llm)[0]
+
+
+# The action prompt, verbatim from scripts/bakeoff_action_tagging.py. It is the
+# one that was measured -- 0.861 against an independent annotator over 90 real
+# action items, four runs -- and a reworded copy would describe something
+# nobody ran. The two prompts differ in one instruction that carries the whole
+# result: LABEL THE ACTION, NOT THE TOPIC.
+ACTION_PROMPT = """You are labelling ACTION ITEMS from construction site conversations.
+
+Each item is a task somebody was asked to do, shown with the title of the
+conversation topic it came out of. LABEL THE ACTION, not the topic.
+
+TAXONOMY (use the slug on the left, nothing else):
+{taxonomy}
+
+RULES
+- Return 0 to 3 slugs per action. Fewer is better than more.
+- An EMPTY list is the correct answer for an action that is not about
+  construction work: a product or software task, a meeting to arrange, a
+  personal errand, or anything else off the site. Do not reach for a label
+  that is merely adjacent.
+- The topic title is CONTEXT. An action can be about something the topic only
+  mentioned in passing -- label what the action says.
+- Use only slugs from the list above. Never invent one.
+
+ACTIONS
+{items}
+
+Return ONLY a JSON object mapping each number to its list of slugs:
+{{"0": ["programme.schedule"], "1": [], ...}}
+No prose, no markdown fences."""
+
+
+def build_action_prompt(batch, leaves, offset=0):
+    """The prompt for one batch of actions, byte-for-byte the shape the
+    bake-off measured: the action's text, then its topic's title on its own
+    indented line as context."""
+    taxonomy = "\n".join(
+        f"  {l['slug']}  ({l.get('parent', '')} > {l['label']})" for l in leaves)
+    items = "\n\n".join(
+        f"[{offset + i}] {' '.join((a.get('text') or '').split())[:300]}\n"
+        f"    (from topic: {a.get('topic_title') or ''})"
+        for i, a in enumerate(batch))
+    return ACTION_PROMPT.format(taxonomy=taxonomy, items=items)
+
+
+def classify_actions_with_stats(actions, leaves, call_llm):
+    """The same contract as classify_with_stats, for action items.
+
+    A SEPARATE CALL FROM THE TOPICS, not one prompt doing both. Measured
+    separately, and the instruction that makes it work ("label the action, not
+    the topic") is the opposite of what a combined prompt would have to say.
+    Inheriting the topic's labels instead was measured too and is worse where
+    it matters: it finds a right leaf about as often (47 of 57 against 48) and
+    adds a wrong one on 46 of 57, because a topic's tag set is wider than any
+    single action under it.
+
+    Unanswered batches are counted, never read as abstentions -- see
+    classify_with_stats.
+    """
+    return _classify(actions, leaves, call_llm, build_action_prompt,
+                     caller="action_tagging", what="action")

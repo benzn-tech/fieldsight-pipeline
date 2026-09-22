@@ -98,12 +98,22 @@ def lambda_handler(event, _context):
         key = unquote_plus(record["s3"]["object"]["key"])
         req = json.loads(s3().get_object(Bucket=S3_BUCKET, Key=key)["Body"].read())
         topics = req.get("topics") or []
-        if not topics:
-            logger.info("retag: %s carries no topics", key)
+        actions = req.get("actions") or []
+        if not topics and not actions:
+            logger.info("retag: %s carries nothing to tag", key)
             continue
 
+        # TWO CALLS, NOT ONE PROMPT DOING BOTH. Measured separately, and the
+        # instruction that makes the action pass work -- "label the action,
+        # not the topic" -- is the opposite of what a combined prompt would
+        # have to say. Either list may be empty; classify_* answers [] for an
+        # empty input without calling anything.
         labels, stats = tagging.classify_with_stats(
             topics, taxonomy_base.LEAVES, llm_utils.call_llm)
+        action_labels, action_stats = tagging.classify_actions_with_stats(
+            actions, taxonomy_base.LEAVES, llm_utils.call_llm)
+        stats = {k: stats.get(k, 0) + action_stats.get(k, 0)
+                 for k in set(stats) | set(action_stats)}
 
         if stats.get("unanswered"):
             # NOT written. An unanswered batch and a batch of abstentions have
@@ -127,8 +137,11 @@ def lambda_handler(event, _context):
             # never tell the two apart.
             "tagged": [{"topic_id": t["id"], "slugs": slugs}
                        for t, slugs in zip(topics, labels)],
+            "tagged_actions": [{"action_item_id": a["id"], "slugs": slugs}
+                               for a, slugs in zip(actions, action_labels)],
         })
-        written += len(topics)
-        logger.info("retag: %s -> %d topic(s) handed to the writer, %d tagged",
-                    key, len(topics), stats.get("tagged", 0))
+        written += len(topics) + len(actions)
+        logger.info("retag: %s -> %d topic(s) and %d action(s) handed to the "
+                    "writer, %d tagged", key, len(topics), len(actions),
+                    stats.get("tagged", 0))
     return {"topics": written}

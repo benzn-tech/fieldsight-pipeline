@@ -254,14 +254,17 @@ def retag_wired(wired, monkeypatch):
     state.update({"emitted": [], "started": [], "rolled": [], "topics": []})
     monkeypatch.setattr(org.tags, "topics_to_retag",
                         lambda conn, cid, **kw: list(state["topics"]))
+    monkeypatch.setattr(org.tags, "actions_to_retag",
+                        lambda conn, cid, **kw: list(state.get("actions") or []))
     monkeypatch.setattr(org.tag_writes, "start_run",
                         lambda conn, **kw: state["started"].append(kw) or {"id": "run-9"})
     monkeypatch.setattr(org.tag_writes, "rollback_run",
                         lambda conn, rid: state["rolled"].append(rid))
     monkeypatch.setattr(org.retag_request, "emit",
-                        lambda s3, bucket, run_id, cid, topics, batch=0:
-                            state["emitted"].append({"run": run_id, "batch": batch,
-                                                     "n": len(topics)})
+                        lambda s3, bucket, run_id, cid, topics, batch=0, actions=None:
+                            state["emitted"].append(
+                                {"run": run_id, "batch": batch, "n": len(topics),
+                                 "actions": len(actions or [])})
                             or f"retag_requests/{run_id}/{batch:04d}.json")
     monkeypatch.setattr(org, "s3", lambda: object())
     return state
@@ -291,6 +294,7 @@ def test_a_company_with_nothing_to_retag_opens_no_run(retag_wired):
     close it, and a run that never finishes reads like one still going."""
     retag_wired["role"] = "admin"
     retag_wired["topics"] = []
+    retag_wired["actions"] = []
     res = org.lambda_handler(make_event("POST", "/api/org/tags/retag", {}), None)
     assert res["statusCode"] == 200
     assert retag_wired["started"] == [] and retag_wired["emitted"] == []
@@ -310,3 +314,28 @@ def test_an_admin_can_undo_a_run_by_its_id(retag_wired):
         make_event("POST", "/api/org/tags/retag/run-9/rollback", {}), None)
     assert res["statusCode"] == 200
     assert retag_wired["rolled"] == ["run-9"]
+
+
+def test_actions_are_batched_separately_from_topics(retag_wired):
+    """Two prompts, so two batches -- the action prompt says "label the action,
+    not the topic", which is the instruction its whole measurement rests on and
+    the opposite of what a mixed batch would have to say."""
+    retag_wired["role"] = "admin"
+    retag_wired["topics"] = [{"id": f"t-{i}", "title": "T", "summary": "S"}
+                             for i in range(25)]
+    retag_wired["actions"] = [{"id": f"a-{i}", "text": "x", "topic_title": "T"}
+                              for i in range(30)]
+    res = org.lambda_handler(make_event("POST", "/api/org/tags/retag", {}), None)
+    assert res["statusCode"] == 200, body_of(res)
+    shapes = [(e["n"], e["actions"]) for e in retag_wired["emitted"]]
+    assert shapes == [(20, 0), (5, 0), (0, 20), (0, 10)]
+    assert body_of(res)["run"]["actions"] == 30
+
+
+def test_a_company_with_only_actions_still_gets_a_run(retag_wired):
+    retag_wired["role"] = "admin"
+    retag_wired["topics"] = []
+    retag_wired["actions"] = [{"id": "a-1", "text": "x", "topic_title": "T"}]
+    res = org.lambda_handler(make_event("POST", "/api/org/tags/retag", {}), None)
+    assert res["statusCode"] == 200
+    assert retag_wired["started"], "a run with only actions is still a run"

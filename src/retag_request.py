@@ -35,12 +35,25 @@ def key_for(run_id, batch):
     return f"{PREFIX}{run_id}/{int(batch):04d}.json"
 
 
-def emit(s3, bucket, run_id, company_id, topics, batch=0):
+def emit(s3, bucket, run_id, company_id, topics, batch=0, actions=None):
     """Write one batch of a re-tag run. Returns the key, or None when there is
     nothing to write -- an empty batch makes no S3 call, so "wrote nothing" and
     "was never asked" stay distinguishable at the call site rather than
-    becoming an artifact with an empty list in it."""
-    if not topics:
+    becoming an artifact with an empty list in it.
+
+    A batch may carry topics, actions, or both: a run walks the two separately
+    and a batch of one kind is still a batch.
+
+    AN ACTION CARRIES ITS TEXT AND ITS TOPIC'S TITLE. Not the topic's tags --
+    both are computed in the same pass, so in production the tags do not exist
+    yet and a tagger given them would be better informed than the system can
+    be. Not the responsible person or the deadline either: the tagger has no
+    use for them and they would be a second copy of a row crossing a trust
+    boundary. The blind-annotation pack carried exactly these two fields, so
+    what was measured is what runs.
+    """
+    actions = actions or []
+    if not topics and not actions:
         return None
     key = key_for(run_id, batch)
     s3.put_object(
@@ -54,6 +67,9 @@ def emit(s3, bucket, run_id, company_id, topics, batch=0):
             "topics": [{"id": str(t["id"]), "title": t.get("title") or "",
                         "summary": t.get("summary") or ""}
                        for t in topics],
+            "actions": [{"id": str(a["id"]), "text": a.get("text") or "",
+                         "topic_title": a.get("topic_title") or ""}
+                        for a in actions],
         }),
         ContentType="application/json",
     )

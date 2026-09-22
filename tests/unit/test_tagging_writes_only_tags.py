@@ -88,7 +88,12 @@ ALLOWED = {"INSERT tag_run", "UPDATE tag_run", "INSERT topic_tags",
 
 
 def _full_run(conn):
-    """One complete re-tag: open a run, tag a topic, tag an action, close it."""
+    """One complete re-tag: open a run, tag a topic, tag an action, close it.
+
+    BOTH KINDS, because the boundary has to hold on both paths. Action tagging
+    was added after this test existed, and a capture that only walked the topic
+    path would have gone on passing while the new one wrote whatever it liked.
+    """
     run = tag_writes.start_run(conn, company_id="co-1", taxonomy_version=1,
                                method="classifier", created_by="u-1")
     tag_writes.apply_tags(conn, "topic", "t-1", ["tag-a", "tag-b"],

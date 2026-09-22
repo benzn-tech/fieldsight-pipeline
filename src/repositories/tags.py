@@ -188,6 +188,44 @@ def topics_to_retag(conn, company_id, *, after_id=None, limit=500) -> list[dict]
     ).fetchall()
 
 
+
+def actions_to_retag(conn, company_id, *, after_id=None, limit=500) -> list[dict]:
+    """The action items one re-tag run covers: id, text, and the TITLE of the
+    topic each came out of.
+
+    THE TOPIC'S TITLE AND NOT ITS TAGS, which is the context the measurement
+    used and the context production can actually supply: an action and its
+    topic are labelled in the same pass, so the title exists and the tags do
+    not yet. Nothing else travels -- not the responsible person, not the
+    deadline, not the priority. The tagger has no use for them and they would
+    be a second copy of a row crossing the VPC wall as an S3 artifact.
+
+    Deleted topics are excluded with BOTH arms, through the join: an action
+    under a deleted recording's topic must not be re-tagged, and the source arm
+    is load-bearing for the same reason it is on the topic side -- a
+    re-extracted day's topics come back with new uuids that no topic-keyed
+    tombstone names.
+
+    Keyset pagination on the ACTION's id, for the same reason the topic
+    selection uses one: a run walks the whole company and OFFSET re-scans
+    everything it has already passed.
+    """
+    where = ["t.site_id IN (SELECT id FROM sites WHERE company_id = %s)"]
+    params = [str(company_id)]
+    if after_id:
+        where.append("a.id > %s")
+        params.append(str(after_id))
+    params.append(int(limit))
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT a.id, a.text, t.title AS topic_title "
+        "FROM action_items a JOIN topics t ON t.id = a.topic_id WHERE "
+        + " AND ".join(where)
+        + f" AND {visible_topics_predicate('t')} "
+        "ORDER BY a.id LIMIT %s",
+        tuple(params),
+    ).fetchall()
+
+
 def ids_for_slugs(conn, company_id, slugs) -> dict:
     """{slug: tag_id} for the slugs this company can actually use.
 

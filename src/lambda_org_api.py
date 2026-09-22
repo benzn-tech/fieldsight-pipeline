@@ -6521,22 +6521,32 @@ def start_retag_run(conn, caller):
         return error("re-tagging requires admin or gm role", 403)
 
     rows = tags.topics_to_retag(conn, caller["company_id"])
-    if not rows:
-        return ok({"run": None, "topics": 0,
+    actions = tags.actions_to_retag(conn, caller["company_id"])
+    if not rows and not actions:
+        return ok({"run": None, "topics": 0, "actions": 0,
                    "message": "nothing to re-tag"})
 
     run = tag_writes.start_run(conn, company_id=caller["company_id"],
                                taxonomy_version=1, method="classifier",
                                created_by=caller["id"])
+    # Topics and actions are batched SEPARATELY, not interleaved: they are two
+    # different prompts (the action one says "label the action, not the topic",
+    # which is the instruction the whole action measurement rests on), and a
+    # mixed batch would have to pick one of them.
     batches = 0
     for start in range(0, len(rows), RETAG_BATCH):
         retag_request.emit(s3(), S3_BUCKET, run["id"], caller["company_id"],
                            rows[start:start + RETAG_BATCH], batch=batches)
         batches += 1
-    logger.info("retag: run %s opened over %d topic(s) in %d batch(es)",
-                run["id"], len(rows), batches)
+    for start in range(0, len(actions), RETAG_BATCH):
+        retag_request.emit(s3(), S3_BUCKET, run["id"], caller["company_id"],
+                           [], batch=batches,
+                           actions=actions[start:start + RETAG_BATCH])
+        batches += 1
+    logger.info("retag: run %s opened over %d topic(s) and %d action(s) in "
+                "%d batch(es)", run["id"], len(rows), len(actions), batches)
     return ok({"run": {"id": str(run["id"]), "topics": len(rows),
-                       "batches": batches}})
+                       "actions": len(actions), "batches": batches}})
 
 
 def rollback_retag_run(conn, caller, run_id):
