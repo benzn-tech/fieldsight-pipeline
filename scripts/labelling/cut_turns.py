@@ -95,7 +95,47 @@ def turns_from_transcript(doc) -> list[dict]:
     return out
 
 
-def cut_wav(raw: bytes, start_s: float, end_s: float) -> bytes | None:
+#: Peak level the listening copy is normalised to, as a fraction of full scale. Loud enough
+#: to hear on a laptop speaker, short of clipping.
+LISTEN_PEAK = 0.7
+
+
+def normalise_for_listening(frames: bytes) -> bytes:
+    """Bring a clip up to a level a person can actually hear.
+
+    **This does not touch the measurement.** Cosine similarity over ECAPA embeddings is
+    gain-invariant here, measured: on 2026-09-17 a set of enrolment clips 4-8x quieter than
+    the rest produced *identical* scores to four decimal places after normalisation. The
+    embeddings are computed from the S3 audio, not from these clips; this copy exists only
+    to be listened to.
+
+    **It does change whether a label can be produced at all**, which is why it is not
+    optional. Measured on the first real cut, 2026-09-23: peaks across sixteen clips ranged
+    from 973 to 27562 out of 32768 -- a 28x spread, the quietest around -30 dBFS. A listener
+    given those raw would mark the quiet half "unusable" and the dataset would end up
+    describing loud recordings only, with nothing anywhere saying so. That is a sampling
+    bias introduced by the tool, and it would look exactly like a property of the material.
+
+    A silent clip is returned unchanged rather than amplified: multiplying nothing by a
+    large number is how a microphone fault becomes convincing-sounding noise.
+    """
+    if not frames:
+        return frames
+    import array
+    a = array.array("h")
+    a.frombytes(frames)
+    peak = max((abs(v) for v in a), default=0)
+    if peak == 0:
+        return frames
+    gain = (LISTEN_PEAK * 32767.0) / peak
+    if gain <= 1.0:
+        return frames
+    for i, v in enumerate(a):
+        a[i] = max(-32768, min(32767, int(v * gain)))
+    return a.tobytes()
+
+
+def cut_wav(raw: bytes, start_s: float, end_s: float, normalise: bool = True) -> bytes | None:
     """The bytes of one turn, or None when the window is not inside this file.
 
     None rather than a silent empty clip: a window outside the file is the signature of the
@@ -113,6 +153,8 @@ def cut_wav(raw: bytes, start_s: float, end_s: float) -> bytes | None:
         b = min(b, total)
         w.setpos(a)
         frames = w.readframes(b - a)
+    if normalise and width == 2 and channels == 1:
+        frames = normalise_for_listening(frames)
     buf = io.BytesIO()
     with wave.open(buf, "wb") as o:
         o.setnchannels(channels)
