@@ -37,6 +37,7 @@ import time
 import boto3
 import urllib3
 import urllib.parse as _urlparse
+from concurrent.futures import ThreadPoolExecutor
 
 
 def _q(s):
@@ -1620,6 +1621,26 @@ def _rag_answer(body):
         # made to wait for a web search, and the voice prompt forbids the URLs
         # a sourced answer needs.
         web = None
+        # `_grounded` carries the (answer, err) tuple from a synthesis call
+        # made CONCURRENTLY with the web path below, when that path runs at
+        # all. It lets the sequential call further down be skipped so a
+        # matching prompt is never sent to call_llm twice. None means "not
+        # attempted here" -- voice mode, a scoped/pinned ask, or no chunks all
+        # skip the web-check branch entirely and leave this to the ordinary
+        # sequential call below, unchanged from before this file's concurrent
+        # path existed.
+        _grounded = None
+
+        # Built here, ahead of the web-check branch, so BOTH arms that may
+        # need it -- the concurrent synthesis thread below and the ordinary
+        # sequential fallback further down -- read the identical prompt built
+        # once. Nothing in it depends on the web path's outcome. See the spec
+        # 2026-09-20 comment near the old call site (now removed) for why
+        # `asked` only replaces `question` when a rewrite actually ran.
+        prompt = build_rag_prompt(asked if rewritten else question, chunks,
+                                  mode=body.get("mode"),
+                                  today=today, basis=basis, pinned_topic=pinned_topic)
+
         # With no chunks this can only be a pinned topic, which is the reader's
         # own record; asking the web whether records answer it would judge an
         # empty list.
@@ -1691,37 +1712,118 @@ def _rag_answer(body):
             # every chunk to the web here.
             _skip = (bool(_dists) and not _lexical and not basis.get("widened")
                      and min(_dists) > _DISTANCE_GATE)
+
+            # THE RECORDS GET THEIR OWN ANSWER TOO (owner decision, 2026-09-22):
+            # the grounded synthesis does not depend on the web verdict's
+            # outcome -- only on `chunks`, already resolved above -- so it runs
+            # on an ordinary thread ALONGSIDE the web path (verdict + lookup)
+            # instead of after it. Both sides are plain I/O-bound HTTP calls,
+            # so `concurrent.futures` threads are enough; no process pool.
+            #
+            # STARTS ALONGSIDE THE VERDICT, not after it. Waiting for the
+            # verdict to choose the web first would add the verdict's own time
+            # (median 2718ms, budgeted up to web_answer.VERDICT_BUDGET=8s) to
+            # the critical path before synthesis even began, for nothing --
+            # synthesis cannot use the verdict's answer either way, and
+            # forking immediately costs nothing measurable: web_answer.answer's
+            # own worst case is already budgeted to fit under
+            # HARD_STOP_SECONDS=27s (web_answer.py's own comment: "8 + 14 = 22
+            # plus the 2s floor fits the 27s stop, which fits API Gateway's
+            # 29s"), and synthesis alone runs far under that -- the last 24h of
+            # LLM_USAGE telemetry put ask_answer's median at 7043ms, well
+            # inside web_verdict(2718ms) + web_answer(9973ms) = 12691ms.  Wall
+            # clock becomes max(synthesis, verdict+lookup), not their sum, so
+            # running them together does not push the total past the existing
+            # 27s/29s ceiling this file already enforces -- it only removes
+            # the ~7s a SERIAL synthesis-after-web would have added (24.15s
+            # measured web-only total + ~7s median synthesis = ~31s, over the
+            # 29s gateway ceiling the problem this branch exists to avoid;
+            # concurrent stays at ~24.15s in the median case because synthesis
+            # finishes first and is simply discarded from the critical path).
+            #
+            # NEITHER SIDE MAY LOSE THE OTHER: each future's result is pulled
+            # inside its OWN try/except below, so a raised exception (or an
+            # internal timeout surfacing as one) on either side can never take
+            # the other down with it. A crash in the grounded call still lets
+            # the web answer reach the reader (falls back to today's web-only
+            # response, a few lines down). A crash in the web call still lets
+            # the grounded answer reach the reader (falls through to the
+            # ordinary grounded return further below, exactly as it already
+            # does today when web_answer.answer() itself returns None).
+            #
             # The verdict judges `asked` (what retrieval actually searched for);
             # the lookup and the admission screen still see the asker's own
             # `question`, so nothing history-derived leaves the account. See
             # web_answer.answer's docstring for the measurement behind this.
-            web = web_answer.answer(question, chunks, skip_verdict=_skip,
-                                    verdict_question=asked)
+            _t_synthesis = time.monotonic()
+            with ThreadPoolExecutor(max_workers=2) as _pool:
+                _fut_web = _pool.submit(web_answer.answer, question, chunks,
+                                        skip_verdict=_skip, verdict_question=asked)
+                _fut_syn = _pool.submit(llm_utils.call_llm, prompt,
+                                        max_tokens=MAX_ANSWER_TOKENS,
+                                        force_json=False, caller="ask_answer")
+                try:
+                    web = _fut_web.result()
+                except Exception as _web_exc:                # noqa: BLE001
+                    logger.error("  Ask web-answer thread failed: %s", _web_exc)
+                    web = None
+                try:
+                    _grounded = _fut_syn.result()
+                except Exception as _syn_exc:                # noqa: BLE001
+                    logger.error("  Ask concurrent synthesis thread failed: %s", _syn_exc)
+                    _grounded = (None, str(_syn_exc))
+            marks["synthesis"] = time.monotonic() - _t_synthesis
+
         if web is not None and web.get("answer"):
-            # Union, not either/or (spec 2026-09-22): the verdict said the
-            # records could not fully answer this, but the excerpts retrieval
-            # already paid for are still often useful, so they travel with
-            # the web answer instead of being thrown away. `citations` here
-            # are the SAME chunks the verdict was given, built the same way
-            # as the grounded path (_build_citations) -- but this is not a
-            # grounded answer's source list.
+            # Union, not either/or (owner decision, 2026-09-22): the verdict
+            # said the records could not fully answer this, but the reader
+            # gets the grounded synthesis -- computed concurrently above, from
+            # the SAME chunks the verdict judged -- as the MAIN answer now,
+            # with the web prose alongside it rather than instead of it.
             #
             # THE HAZARD (do not remove this without re-reading it): the web
             # prose in `web["answer"]` carries its OWN inline [1]/[2]/...
             # markers pointing at WEB sources -- see web_answer.answer. The
-            # grounded path's `citations` carry a CONTRACT (above, at the
+            # grounded answer's `citations` carry a CONTRACT (above, at the
             # list comprehension this shares via _build_citations) that card
-            # [i+1] maps positionally to an inline [n] IN THIS SAME ANSWER
-            # TEXT. Neither is true here: these cards are not numbered
-            # references inside `web["answer"]`, they are a separate "what we
-            # found in your records" block. `grounded` stays False and `web`
-            # stays its own block for exactly this reason -- the UI must key
-            # its rendering off `from_web`, never merge this list into the
-            # web answer's own source list, and never label it as if [n] in
-            # the prose points into it. A reader who cannot tell what came
-            # from their meetings from what came off the internet has no
-            # reason to suspect they need to check -- that principle survives
-            # this change; only "the records are silently discarded" does not.
+            # [i+1] maps positionally to an inline [n] IN THE GROUNDED TEXT --
+            # which is `answer` below now, not `web["answer"]`. The two must
+            # never merge into one block of prose: `grounded` and `from_web`
+            # both stay set here (this answer IS grounded, AND a web block
+            # travels with it) and `web` stays its own block for exactly the
+            # reason the prior version of this comment gave -- the UI must key
+            # its rendering off `from_web`, never merge the web block's own
+            # source list into `citations`, and never label the web prose's
+            # [n] markers as if they point into `citations`. A reader who
+            # cannot tell what came from their meetings from what came off the
+            # internet has no reason to suspect they need to check -- that
+            # principle survives this change; only "the main answer used to BE
+            # the web prose when from_web is true" does not, which is exactly
+            # what a frontend keyed on that assumption needs to know (see
+            # fieldsight-ui, scripts/composites/ask-chat.js -- not in this repo,
+            # so verify there, this comment cannot).
+            #
+            # A failed concurrent synthesis (`_grounded` never ran, or came
+            # back with an error or an empty answer) must not turn a working
+            # web answer into an error: fall back to exactly the response this
+            # file shipped before this change -- the web prose as the main
+            # answer, `grounded` False -- rather than losing the reader's
+            # answer entirely.
+            if _grounded and _grounded[0] and not _grounded[1]:
+                return {
+                    "answer": _grounded[0],
+                    "citations": _build_citations(chunks),
+                    "grounded": True,
+                    "from_web": True,
+                    "web": web,
+                    "basis": basis,
+                    "applied_scope": applied_scope,
+                    "asked": asked if rewritten else None,
+                }
+            logger.warning(
+                "  Ask concurrent synthesis unavailable; the web answer "
+                "carries the response alone (err=%s)",
+                _grounded[1] if _grounded else "not attempted")
             return {
                 "answer": web["answer"],
                 "citations": _build_citations(chunks),
@@ -1744,9 +1846,11 @@ def _rag_answer(body):
         # only when `rewritten` is False (SS3.1): byte-identical to today for
         # every first-turn question. Still no `history` parameter here --
         # that boundary (spec 2026-09-17 SS2) is unchanged.
-        prompt = build_rag_prompt(asked if rewritten else question, chunks,
-                                  mode=body.get("mode"),
-                                  today=today, basis=basis, pinned_topic=pinned_topic)
+        #
+        # `prompt` was already built above, ahead of the web-check branch, so
+        # it is not rebuilt here -- both possible producers of the answer
+        # below (the concurrent thread above, and the sequential call just
+        # under this comment) read that one prompt.
         # A spoken answer and a screen answer are the same question asked of two
         # different products, so they may reach two different models. Measured
         # 2026-09-09 on the voice-shaped prompt, three runs each:
@@ -1770,23 +1874,32 @@ def _rag_answer(body):
         voice_model = os.environ.get("ASK_VOICE_MODEL", "").strip()
         if voice_model.lower() in ("", "none"):
             voice_model = None
-        _t_synthesis = time.monotonic()
-        # caller="ask_answer" on both branches below -- voice-model and
-        # screen-model are the same logical call (the RAG synthesis) reached
-        # by two different models, not two different call SHAPES. The retry a
-        # few lines down gets its own tag because it is a genuinely separate,
-        # rare cost that would otherwise be folded into this one's average.
-        if voice and voice_model:
-            answer, err = llm_utils.call_llm(
-                prompt, max_tokens=MAX_ANSWER_TOKENS, force_json=False,
-                enable_thinking=False, model=voice_model, caller="ask_answer")
+        if _grounded is not None:
+            # Already computed on the concurrent thread above (chunks present,
+            # unscoped, no pinned topic, screen mode -- the only case that ever
+            # sets `_grounded`) and the web side did not produce a usable
+            # answer, so this call reuses that result instead of paying for a
+            # second, identical call_llm. `marks["synthesis"]` was already set
+            # alongside it, timed from when the thread was forked.
+            answer, err = _grounded
         else:
-            answer, err = llm_utils.call_llm(prompt, max_tokens=MAX_ANSWER_TOKENS,
-                                             force_json=False, caller="ask_answer")
-        # The primary synthesis call only -- the language-leak retry a few
-        # lines below is a distinct, rare cost and would otherwise inflate
-        # this stage's usual number for the one turn in ~13 that needs it.
-        marks["synthesis"] = time.monotonic() - _t_synthesis
+            _t_synthesis = time.monotonic()
+            # caller="ask_answer" on both branches below -- voice-model and
+            # screen-model are the same logical call (the RAG synthesis) reached
+            # by two different models, not two different call SHAPES. The retry a
+            # few lines down gets its own tag because it is a genuinely separate,
+            # rare cost that would otherwise be folded into this one's average.
+            if voice and voice_model:
+                answer, err = llm_utils.call_llm(
+                    prompt, max_tokens=MAX_ANSWER_TOKENS, force_json=False,
+                    enable_thinking=False, model=voice_model, caller="ask_answer")
+            else:
+                answer, err = llm_utils.call_llm(prompt, max_tokens=MAX_ANSWER_TOKENS,
+                                                 force_json=False, caller="ask_answer")
+            # The primary synthesis call only -- the language-leak retry a few
+            # lines below is a distinct, rare cost and would otherwise inflate
+            # this stage's usual number for the one turn in ~13 that needs it.
+            marks["synthesis"] = time.monotonic() - _t_synthesis
 
         # READ WHAT CAME BACK, do not trust that the rule was followed. The
         # rule existed for months at the top of the system context and still

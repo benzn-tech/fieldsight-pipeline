@@ -365,6 +365,12 @@ def test_rag_return_web_with_chunks(monkeypatch):
 # --------------------------------------------------------------------------
 
 def test_web_branch_returns_the_record_citations_instead_of_discarding_them(monkeypatch):
+    """Updated 2026-09-22 (records get their own answer too): the grounded
+    synthesis now runs CONCURRENTLY with the web check and, on success,
+    becomes the MAIN answer -- `grounded` is True here, not False, and
+    `answer` is the synthesis text (`wire()`'s default "Grounded answer
+    [1]."), not the web prose. The web prose still travels, untouched, in its
+    own `web` block."""
     wire(monkeypatch, web={"answer": "From the web [1]."})
     out = ask(question="concrete issues")
     assert out.get("from_web") is True
@@ -379,9 +385,50 @@ def test_web_branch_returns_the_record_citations_instead_of_discarding_them(monk
         "time_start": None,
     }]
     # The web block stays separate -- its own prose and, if it has one, its
-    # own source list -- never merged into a grounded answer.
-    assert out["grounded"] is False
+    # own source list -- never merged into the grounded answer.
+    assert out["grounded"] is True
+    assert out["answer"] == "Grounded answer [1]."
     assert out["web"]["answer"] == "From the web [1]."
+
+
+# --------------------------------------------------------------------------
+# The grounded synthesis and the web path now run CONCURRENTLY
+# (2026-09-22): neither side may take the other down with it. These pin both
+# failure directions explicitly, per the task's non-negotiable #1.
+# --------------------------------------------------------------------------
+
+def test_a_synthesis_failure_still_delivers_the_web_answer(monkeypatch):
+    """If the concurrent grounded-synthesis call raises, the web answer --
+    computed on the OTHER thread -- must still reach the reader instead of
+    the whole request turning into an error."""
+    wire(monkeypatch, web={"answer": "From the web."})
+    monkeypatch.setattr(llm_utils, "call_llm",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("synthesis boom")))
+
+    out = ask(question="concrete issues")
+
+    assert out.get("from_web") is True
+    assert out["answer"] == "From the web."
+    assert out["grounded"] is False
+    assert out["web"]["answer"] == "From the web."
+    assert "error" not in out
+
+
+def test_a_web_failure_still_delivers_the_grounded_answer(monkeypatch):
+    """If the concurrent web-answer call raises, the grounded synthesis --
+    computed on the OTHER thread -- must still reach the reader as an
+    ordinary grounded answer, exactly as if web_answer.answer() had simply
+    returned None."""
+    wire(monkeypatch)
+    monkeypatch.setattr(web_answer, "answer",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("web boom")))
+
+    out = ask(question="concrete issues")
+
+    assert "from_web" not in out
+    assert out["answer"] == "Grounded answer [1]."
+    assert out["grounded"] is True
+    assert "error" not in out
 
 
 def test_web_branch_with_no_chunks_still_returns_an_empty_list(monkeypatch):
@@ -725,12 +772,20 @@ def test_a_site_only_scope_with_chunks_never_runs_the_web_check(monkeypatch):
 
 
 def test_an_unscoped_ask_with_chunks_still_runs_the_web_check(monkeypatch):
+    """Records get their own answer too (2026-09-22): the grounded synthesis
+    now runs CONCURRENTLY with the web check, not only after it declines, so
+    `llm_calls` is 1 here, not 0 -- and the MAIN `answer` is the grounded
+    text, not the web prose, even though `from_web`/`web` still carry the web
+    block alongside it (union, not either/or)."""
     _, seen = wire(monkeypatch)
     calls = _count_web(monkeypatch)
     out = ask(question="What are the next steps?")
     assert calls == [[CHUNK]]
-    assert out.get("from_web") is True and out["answer"] == WEB["answer"]
-    assert seen["llm_calls"] == 0
+    assert out.get("from_web") is True
+    assert out["answer"] == "Grounded answer [1]."
+    assert out["web"] == WEB
+    assert out["grounded"] is True
+    assert seen["llm_calls"] == 1
 
 
 def test_a_legacy_date_without_the_gate_still_runs_the_web_check(monkeypatch):
@@ -738,4 +793,6 @@ def test_a_legacy_date_without_the_gate_still_runs_the_web_check(monkeypatch):
     calls = _count_web(monkeypatch)
     out = ask(question="What are the next steps?", date="2026-09-03", **LEGACY)
     assert len(calls) == 1
-    assert out.get("from_web") is True and out["answer"] == WEB["answer"]
+    assert out.get("from_web") is True
+    assert out["answer"] == "Grounded answer [1]."
+    assert out["web"] == WEB
