@@ -24,12 +24,31 @@ ing = pytest.importorskip("lambda_ingest", reason="requires psycopg (installed i
 _real_embed_from_sidecar = ing.embed_from_sidecar
 
 
+class _FakeCursor:
+    def fetchone(self):
+        return None
+
+    def fetchall(self):
+        return []
+
+
 class FakeConn:
+    def __init__(self):
+        #: Every statement the production code issued, so a test can assert on
+        #: one that has no other observable effect. The day-wide advisory lock
+        #: the photo rebind takes is exactly that: an unlocked rebind and a
+        #: locked one behave identically until two of them interleave.
+        self.executed = []
+
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb):
         return False
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        return _FakeCursor()
 
 
 class _FakeS3Exceptions:
@@ -1019,6 +1038,30 @@ PICTURES_PREFIX = "users/Jarley_Trainor/pictures/2026-03-02/"
 PHOTO_KEY = PICTURES_PREFIX + "Benl1_2026-03-02_09-02-00.jpg"
 
 
+def _ingest_day_rebind(wired, day_topics):
+    """Wire the day-wide photo rebind and return the rows it writes.
+
+    These two tests used to assert on `upsert_topic(photos=...)`. That writer
+    is gone from BOTH paths: it matched the whole day's photos against one
+    artifact's topics, so on a mid-flip day where a report and extractions both
+    exist the two writers could bind the same photo once each -- the
+    report-path half of the defect that put 22 prod photos under more than one
+    topic. topic_photos has one writer now (photo_rebind.rebind_day_photos),
+    after the loop, over every topic the day has.
+    """
+    wired.setattr(ing.topics, "list_day_topics_for_binding",
+                  lambda conn, folder, date: day_topics)
+    wired.setattr(ing.recordings, "session_local_span", lambda *a, **k: None)
+    written = []
+    wired.setattr(ing.topics, "replace_day_photo_bindings",
+                  lambda conn, folder, date, rows: written.append(list(rows)))
+    return written
+
+
+_INGEST_ONE_TOPIC_DAY = [{"id": "topic-uuid-0", "time_range": "09:00 - 09:05",
+                          "source_s3_key": REPORT_KEY}]
+
+
 def test_ingest_binds_photos_to_report_topics(wired):
     # make_report()'s one topic has time_range "09:00 - 09:05"; the photo's
     # filename encodes 09:02 (BUG-01-safe extraction), inside that window.
@@ -1026,23 +1069,36 @@ def test_ingest_binds_photos_to_report_topics(wired):
         REPORT_KEY: json.dumps(make_report()),
         PHOTO_KEY: b"",
     }))
-    captured = []
-    wired.setattr(
-        ing.topics, "upsert_topic",
-        lambda conn, site_id, report_date, title, **kw:
-            captured.append(kw) or {"id": "topic-uuid-0"},
-    )
+    written = _ingest_day_rebind(wired, _INGEST_ONE_TOPIC_DAY)
 
     result = ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
 
     assert result["topics"] == 1
-    assert len(captured) == 1
-    assert captured[0]["photos"] == [{"s3_key": PHOTO_KEY, "caption_text": None}]
+    assert written == [[{"topic_id": "topic-uuid-0", "s3_key": PHOTO_KEY,
+                         "caption_text": None}]]
 
 
 def test_ingest_missing_pictures_prefix_is_noop(wired):
     # wired's default FakeS3 only has REPORT_KEY -- the pictures listing
-    # returns zero Contents (empty prefix -> photos=[], not a crash).
+    # returns zero Contents.
+    #
+    # The rebind still RUNS and writes nothing, which is how a day whose photos
+    # were all deleted gets cleared. "Wrote no rows" and "never ran" must stay
+    # distinguishable.
+    written = _ingest_day_rebind(wired, _INGEST_ONE_TOPIC_DAY)
+
+    ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+
+    assert written == [[]], "the rebind must run and write nothing, not be skipped"
+
+
+def test_ingest_upsert_topic_is_no_longer_a_photo_writer(wired):
+    """Pinned separately: the kwarg going unread looks identical to it going
+    unpassed, and would leave two writers racing over one table."""
+    wired.setattr(ing, "_s3_client", FakeS3({
+        REPORT_KEY: json.dumps(make_report()), PHOTO_KEY: b"",
+    }))
+    _ingest_day_rebind(wired, _INGEST_ONE_TOPIC_DAY)
     captured = []
     wired.setattr(
         ing.topics, "upsert_topic",
@@ -1053,7 +1109,7 @@ def test_ingest_missing_pictures_prefix_is_noop(wired):
     ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
 
     assert len(captured) == 1
-    assert captured[0]["photos"] == []
+    assert "photos" not in captured[0], captured[0].get("photos")
 
 
 def test_ingest_defer_day_lists_no_pictures(wired):

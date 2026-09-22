@@ -1,0 +1,41 @@
+-- A topic_photos row says WHO put it there.
+--
+-- Three writers share this table and only one of them may be replaced
+-- wholesale by the day-wide rebind (fix/a-photo-belongs-to-the-day-not-the-
+-- session):
+--
+--   'binding'  -- lambda_item_writer / lambda_ingest, time-correlated from
+--                the day's photo list. Rebuilt from scratch on every run, so
+--                these rows are derived data and nothing is lost by deleting
+--                them.
+--   'keyframe' -- lambda_keyframe, a synthetic frame pulled out of a video.
+--                The FILE is the evidence; there is no time window to
+--                re-derive the bind from, so a rebind that swept these away
+--                would delete the only record that the frame belongs to that
+--                topic.
+--   'human'    -- someone chose this. Never derived, never re-derivable,
+--                never replaced by a machine.
+--
+-- DEFAULT 'binding' is right for every existing row: at the time this runs,
+-- lambda_keyframe is gated off in production (EnableKeyframes=false on the
+-- prod stack, checked 2026-09-23) and no human-bind surface exists yet, so
+-- every row in the table was written by the time-correlation path. A later
+-- backfill cannot recover this distinction -- a keyframe key is recognisable
+-- by its '_kf_' marker but a human bind would not be -- so the column is
+-- added before either of the other two writers can produce rows.
+ALTER TABLE topic_photos ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'binding';
+
+-- The rebind deletes by (topic, source) across a whole day, and the day is
+-- reached through topics. Without this it is a sequential scan of the table
+-- per session of every day that gets re-driven.
+CREATE INDEX IF NOT EXISTS idx_topic_photos_source ON topic_photos (source);
+
+-- NOT a UNIQUE constraint on s3_key, deliberately.
+--
+-- "One photo, one topic" is true of a single day's machine binding and is
+-- enforced there, by computing the whole day in one pass (photo_binding.
+-- photos_for_topics has always guaranteed it per call). It is NOT true of the
+-- table: a human may bind a photo to a second topic on purpose, and a
+-- keyframe's file can legitimately evidence a topic that the same key also
+-- reaches through binding. A unique index would turn both of those into a
+-- write that fails at 3am inside someone else's transaction.

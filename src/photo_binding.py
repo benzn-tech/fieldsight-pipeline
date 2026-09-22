@@ -143,7 +143,51 @@ def _distance(p_minutes, window):
     return min(abs(p_minutes - start), abs(p_minutes - end))
 
 
-def photos_for_topics(photo_objects, topics):
+def _eligible_windows(p_minutes, windows, topic_sessions, session_spans):
+    """The windows this photo is allowed to be judged against.
+
+    A PHOTO TAKEN WHILE SESSION A WAS RECORDING IS NOT SESSION B'S. That is
+    the whole rule, and it only ever REMOVES candidates -- the tolerance and
+    carry-forward rules below are unchanged for everything it lets through.
+
+    It exists because the day-wide rebind puts every session's topics in one
+    call for the first time, so "the nearest window" can now be a window from a
+    recording that was not running when the shutter went. Prod, 2026-09-11:
+    one photo at 14:37:31 sat under six topics from six different sessions
+    spanning 14:31-14:39. Collapsing that to one is what the day-wide call
+    does; choosing the RIGHT one is what this does.
+
+    FAILS OPEN, deliberately, in both directions:
+
+      * a photo inside no session's span is unrestricted -- photos taken
+        between sessions are the inspection case this product exists for, and
+        they bound yesterday;
+      * a topic whose session span is unknown always competes.
+        `session_span` returns None for RealPTT days, days predating migration
+        0009 and lake-fed files -- "a real answer, not an error" in its own
+        words -- and a topic we cannot place in time must not be silently
+        excluded from every photo on the day.
+
+    Returns None when nothing is restricted, so the caller can tell "no
+    restriction" from "restricted to nothing".
+    """
+    if not session_spans or not topic_sessions:
+        return None
+    covering = {k for k, span in session_spans.items()
+                if span and span[0] <= p_minutes <= span[1]}
+    if not covering:
+        return None                      # between sessions: no evidence, no rule
+    allowed = {i for i in windows
+               if topic_sessions.get(i) is None or topic_sessions.get(i) in covering}
+    # Restricted to nothing is not an answer. If the spans disagree with every
+    # topic the day has, the spans are the less trustworthy of the two (they
+    # come from `recordings` rows that a lake-fed or RealPTT day may never have
+    # written) and the ordinary rule stands.
+    return allowed or None
+
+
+def photos_for_topics(photo_objects, topics, *, topic_sessions=None,
+                      session_spans=None):
     """PURE. photo_objects: [{key, filename, hhmm}] -- hhmm ('HH:MM') is
     already derived by the caller (list_pictures) from the BUG-01-safe
     transcript_utils filename extractor. topics: the topic dicts of an
@@ -153,6 +197,20 @@ def photos_for_topics(photo_objects, topics):
     EVERY topic index (callers may still use .get(i, [])). A photo attaches
     to AT MOST one topic, or to none at all if no topic's window is within
     PHOTO_TOLERANCE_MIN minutes. See the module docstring for the rule.
+
+    THAT GUARANTEE IS PER CALL, which is the whole reason the caller changed.
+    Called once per extraction over a day-wide photo list -- which is what
+    `lambda_item_writer` did until 2026-09-23 -- it hands the same photo to a
+    topic in every session of the day, and `delete_topics_for_source` cannot
+    clean up after it because idempotency is keyed on the source key. Measured
+    on prod the day it was fixed: 22 of 161 distinct bound photos (13.7%) held
+    more than one row, the worst under six topics. Give this function the
+    WHOLE DAY's topics and its existing guarantee becomes the global one.
+
+    `topic_sessions` {topic_index: session_key or None} and `session_spans`
+    {session_key: (start_min, end_min)} are optional and opt-in: omit both and
+    the result is byte-identical to the signature that existed before. See
+    _eligible_windows for what they buy and where they fail open.
 
     NOTE: the `topics` parameter name intentionally shadows the callers'
     `repositories.topics` import -- this function is pure and never touches
@@ -170,20 +228,35 @@ def photos_for_topics(photo_objects, topics):
 
     capped = 0
     carried_count = 0
+    excluded_by_session = 0
     for p in photo_objects:
         hhmm = p.get("hhmm")
         if not hhmm:
             continue
         p_minutes = _hhmm_to_minutes(hhmm)
+        allowed = _eligible_windows(p_minutes, windows, topic_sessions, session_spans)
+        if allowed is None:
+            eligible = windows
+        else:
+            eligible = {i: w for i, w in windows.items() if i in allowed}
+            if len(eligible) < len(windows):
+                excluded_by_session += 1
         # Qualifying candidates only: inside the window, or within
         # PHOTO_TOLERANCE_MIN minutes of an edge. Beyond that a topic does
         # not compete at all -- there is no "nearest of everything" fallback.
-        qualifying = [i for i in windows if _distance(p_minutes, windows[i]) <= PHOTO_TOLERANCE_MIN]
+        qualifying = [i for i in eligible if _distance(p_minutes, eligible[i]) <= PHOTO_TOLERANCE_MIN]
         carried = False
         if not qualifying:
             # Nothing was being said when this was taken. Fall back to what was
             # last said BEFORE it, bounded -- the inspection case.
-            qualifying = _carry_forward(p_minutes, windows)
+            # `eligible`, not `windows`: the carry-forward is exactly where
+            # the session rule earns its keep. A photo taken in the middle of
+            # session B's silent stretch is 20 minutes after session A's last
+            # word, which is inside the 30-minute carry-forward -- so without
+            # this the rule would be enforced on the tolerance path and
+            # bypassed on the fallback path, which is the one that fires for
+            # the inspection shape this whole feature exists for.
+            qualifying = _carry_forward(p_minutes, eligible)
             carried = bool(qualifying)
         if not qualifying:
             logger.info("photo %s dropped: no topic window within %d min and "
@@ -196,7 +269,7 @@ def photos_for_topics(photo_objects, topics):
         # just the winner) is what lets an at-cap topic cascade to the next-
         # nearest QUALIFYING one, so the cap only drops a photo when every
         # qualifying topic is full.
-        order = sorted(qualifying, key=lambda i: (_distance(p_minutes, windows[i]), i))
+        order = sorted(qualifying, key=lambda i: (_distance(p_minutes, eligible[i]), i))
         target = next((i for i in order if len(result[i]) < PHOTOS_PER_TOPIC_CAP), None)
         if target is None:
             capped += 1
@@ -217,6 +290,14 @@ def photos_for_topics(photo_objects, topics):
     if capped:
         logger.info("photo binding: %d photo(s) past the per-topic cap of %d "
                     "(visible in the day list, not lost)", capped, PHOTOS_PER_TOPIC_CAP)
+    if excluded_by_session:
+        # The only trace this rule leaves. It removes candidates and never adds
+        # one, so when it is wrong the symptom is a photo under a topic that
+        # looks further away than one it was not allowed to have -- with no
+        # error and nothing to grep for. This is the number that moves.
+        logger.info("photo binding: %d photo(s) judged only against the "
+                    "session that was recording when they were taken",
+                    excluded_by_session)
     if carried_count:
         # Counted separately from the ordinary binds, because these are the
         # weaker claim: they say "nothing was being said, so we attributed this
