@@ -58,6 +58,10 @@ import boto3
 import lambda_ingest
 import keyframe_request
 import match_request
+# NOT `match_request` above, which is the PROGRAMME matcher's request builder. Two unrelated
+# matchers, and the names are one word apart — spelled out here because importing the wrong
+# one would type-check, run, and write an artifact nothing consumes.
+import speaker_match_request
 from db.connection import get_connection
 from keyframe_selection import keyframe_seconds
 from photo_binding import PHOTOS_PER_TOPIC_CAP  # noqa: F401  (re-export)
@@ -93,6 +97,22 @@ EMIT_KEYFRAME_REQUESTS = os.environ.get("EMIT_KEYFRAME_REQUESTS", "false").lower
 #: other switch in this feature: it costs ~100 s of ONNX on a shared concurrency slot, and a
 #: session with no groups reads exactly as it read before this existed.
 REBIND_SPEAKERS = os.environ.get("REBIND_SPEAKERS", "false").lower() == "true"
+
+# Whether a finalized session is matched against the company's stored voiceprints without
+# anyone asking. False is the deployed default and the rollback.
+#
+# Separate from REBIND_SPEAKERS because the two do different things: the re-bind is
+# anonymous (it groups spk_0/spk_1 within one session and names nobody) and this one puts a
+# person's name on a passage. Separate from SPEAKER_IDENTITY_MODE because it is a COST
+# change as well — every finalized session pays for ONNX over its turns — and folding it
+# into the mode would make "stop paying for this" and "turn naming off for everyone" the
+# same action.
+MATCH_ON_FINALIZE = os.environ.get("MATCH_ON_FINALIZE", "false").lower() == "true"
+
+# Read here only to refuse when naming is switched off entirely; this lambda does no naming
+# itself. `off` is the feature's rollback, and a producer that kept queueing work under it
+# would leave that switch meaning nothing.
+SPEAKER_IDENTITY_MODE = os.environ.get("SPEAKER_IDENTITY_MODE", "off").lower()
 # Propose which earlier subject a new topic is a restatement of. Off by
 # default so the write path ships inert: this only ever writes rows to
 # topic_thread_suggestions, which nothing reads yet.
@@ -578,6 +598,75 @@ def _request_rebind(company_id, session_base, artifact, put=None):
         return False
     logger.info("rebind: requested for %s (%d pairs across %d calls)",
                 session_base, len(pairs), len(calls))
+    return True
+
+
+def _request_match(company_id, session_base, artifact, site_id=None, put=None):
+    """Ask the embedder to name this session from the profiles the company already holds.
+
+    **The gap this closes.** Until 2026-09-23 the ONLY producer of a match request was
+    `lambda_org_api.speaker_match`, an endpoint no frontend has ever called — verified by
+    grep, twice. So naming a speaker propagated the name inside that one meeting and the
+    next meeting started at `spk_0` again. "The system recognises Ben" was true of a code
+    path nothing reached.
+
+    Anonymous re-binding beside this does run automatically and always has; it groups
+    `spk_0`/`spk_1` within one session and carries no name. The two are independent on
+    purpose and stay independent here: `_request_rebind` is gated on `REBIND_SPEAKERS` and
+    this is gated on `MATCH_ON_FINALIZE`, so either can be turned off without the other.
+
+    **A separate switch, not `SPEAKER_IDENTITY_MODE != off`.** Automatic matching is a cost
+    change as much as a behaviour change — every finalized session now pays for ONNX over
+    its turns — and folding it into the mode would mean the only way to stop paying is to
+    turn naming off entirely for everyone. It also means the rollback is a variable, not a
+    deploy.
+
+    Best effort, like the re-bind. A match that does not happen leaves the transcript
+    reading exactly as it reads today; a match that takes the item write down with it trades
+    a working feature for a cosmetic one.
+    """
+    if not MATCH_ON_FINALIZE:
+        return False
+    if SPEAKER_IDENTITY_MODE == "off":
+        # The one gate that is NOT independent: `off` is this feature's rollback, and a
+        # producer that kept writing requests under it would leave the switch meaning
+        # nothing. The embedder would refuse them anyway; paying for the invocation to find
+        # that out is the part worth skipping.
+        logger.info("match: not requested for %s — speaker identity is off", session_base)
+        return False
+    turns = artifact.get("speaker_turns") or []
+    put = put or _put_finalize_request
+    try:
+        requests = speaker_match_request.build(
+            company_id=company_id,
+            session_base=session_base,
+            user_folder=artifact.get("userFolder") or artifact.get("user_folder"),
+            date=artifact.get("date"),
+            turns=turns,
+            mode=SPEAKER_IDENTITY_MODE,
+            site_id=site_id,
+            # Who asked. No user id here by construction — nobody asked, the session ended
+            # — and saying `finalize` is what lets an operator tell an automatic name apart
+            # from one a person requested when a wrong one turns up.
+            source="finalize")
+    except ValueError:
+        # A session with no `sid`, or missing folder/date. Legacy recordings are the
+        # ordinary case and are not an error; they simply cannot be grouped into a session.
+        logger.info("match: not requested for %s — not a session-shaped recording",
+                    session_base)
+        return False
+    if not requests:
+        logger.info("match: not requested for %s — no transcribed turns", session_base)
+        return False
+    try:
+        for req in requests:
+            put(f"voiceprint_requests/{company_id}/{session_base}/match-{req['request_id']}.json",
+                req)
+    except Exception:
+        logger.exception("match: could not enqueue for %s", session_base)
+        return False
+    logger.info("match: requested for %s (%d turns across %d run(s), mode=%s)",
+                session_base, len(turns), len(requests), SPEAKER_IDENTITY_MODE)
     return True
 
 
@@ -1158,6 +1247,17 @@ def write_extraction_items(date, user_folder, extraction_key):
     # tombstone does not reach.
     if REBIND_SPEAKERS:
         _request_rebind(company["id"], session_base, extraction)
+
+    # Naming, which is the other half and gated separately. Same placement and the same
+    # reasons: post-commit, and after the deleted-source gate, so a session the customer
+    # deleted is never matched — the names would outlive the deletion in a table the
+    # tombstone does not reach.
+    #
+    # `site` narrows the candidate pool to the people who were on that site, which is what
+    # keeps the margin meaningful as a company accumulates profiles. It is already resolved
+    # above by the ladder BUG-41 settled, and None is a valid answer meaning "no narrowing".
+    _request_match(company["id"], session_base, extraction,
+                   site_id=(site or {}).get("id"))
 
     return {"skipped": False, "topics": topics_n}
 
