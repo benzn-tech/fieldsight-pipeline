@@ -178,9 +178,14 @@ def test_the_speed_actually_goes_on_the_wire(monkeypatch):
     assert sent["voice_settings"]["speed"] == 1.2
 
 
-def test_speed_one_sends_nothing(monkeypatch):
-    """1.0 is "as written", and sending it would be a settings object that says
-    nothing -- which is how a future reader concludes the field is required."""
+def test_speed_one_is_still_sent(monkeypatch):
+    """This test used to assert the opposite, on the reading that 1.0 is "as
+    written" so sending it says nothing. Measured 2026-09-22 on James, the
+    same sentence through the same endpoint: no voice_settings gave 1.90s and
+    2.04s of audio, explicit speed 1.0 gave 2.18s and 2.23s. Omitting the
+    field does not mean the API default -- it means the settings saved against
+    that voice in the ElevenLabs workspace, a web console no deploy can see.
+    So 1.0 has to go on the wire like any other value."""
     monkeypatch.setattr(el, "ELEVENLABS_TTS_API_KEY", "k")
     monkeypatch.setattr(el, "ELEVENLABS_TTS_SPEED", 1.0)
     seen = {}
@@ -197,14 +202,28 @@ def test_speed_one_sends_nothing(monkeypatch):
     monkeypatch.setattr(el.urllib3, "PoolManager", lambda *a, **k: _Pool())
     el.tts("hello")
     import json as _j
-    assert "voice_settings" not in _j.loads(seen["body"])
+    assert _j.loads(seen["body"])["voice_settings"]["speed"] == 1.0
 
 
-def test_the_conversational_model_is_the_default():
-    """Chosen on measurement, not on the docs: the vendor documents
-    v3-conversational on the Text-to-Dialogue WebSocket, and the plain HTTP
-    /stream endpoint was verified to accept it. If someone later "fixes" this
-    back to flash for speed, the trade being made is 0.51s against the
-    expressiveness of a voice a person on a site listens to."""
-    assert el.ELEVENLABS_TTS_MODEL == "eleven_v3_conversational"
-    assert el.ELEVENLABS_TTS_VOICE == "bPkjmCb0W1xUBvyH2Afs"
+def test_the_steady_model_is_the_default():
+    """This test used to pin eleven_v3_conversational, chosen purely on speed
+    (1.01s against eleven_v3's 2.83s and DashScope's 2.07s, measured
+    2026-09-09).
+
+    That comparison never asked whether the voice stays the same voice. It
+    does not: ElevenLabs renders are not deterministic -- one sentence, four
+    runs, 2026-09-22: 32645 / 34735 / 33481 / 33899 bytes, four different
+    hashes -- and on v3-conversational the ACCENT drifts with it. A New
+    Zealand voice came back American from a render made with exactly the
+    parameters that had just been approved.
+
+    eleven_multilingual_v2 holds the accent for about half a second more per
+    answer (1.58-1.72s against 0.98-1.20s, same day, same sentence). Anyone
+    moving this back to a faster model is trading a voice the customer
+    recognises every time for that half second.
+
+    Why it matters only here: a bundled device prompt is a FILE, approved
+    once and shipped byte for byte, so it cannot drift. A spoken answer is
+    rendered per question, so the model is the only place to decide it."""
+    assert el.ELEVENLABS_TTS_MODEL == "eleven_multilingual_v2"
+    assert el.ELEVENLABS_TTS_VOICE == "QlZn2MPaf2jDn0461bnj"
