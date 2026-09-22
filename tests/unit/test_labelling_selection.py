@@ -14,7 +14,16 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "scripts", "labelling"))
 
-sel = pytest.importorskip("select_turns")
+try:
+    import select_turns as sel
+except ImportError as exc:  # pragma: no cover - the message IS the point
+    # NOT `pytest.importorskip`, which is this suite's house style. That helper exists for a
+    # module a test environment may legitimately lack (psycopg, onnxruntime, docx). This one
+    # is a file in this repository, reached through the `sys.path` line above — so the only
+    # way the import fails is that the path is wrong or the file moved, and either of those
+    # should be red. Skipped, the whole file reports as a passing suite while none of it has
+    # run, which is how 84 tests in this repo went unexecuted in CI for weeks.
+    raise AssertionError(f"scripts/labelling/select_turns.py is not importable: {exc}")
 
 
 def key(folder, date, device="Benl1", sid="a" * 32, chunk="c0000", time="09-00-00"):
