@@ -161,6 +161,7 @@ from photo_binding import parse_time_range
 import batch_cover
 import batch_stitch
 import deletion_mirror
+import speaker_match_request
 import turn_name_overlay
 from transcript_utils import extract_base_time_from_filename, speaker_turns_from_items
 
@@ -1868,24 +1869,20 @@ def _session_turns(conn, folder, date, session_base):
 # A three-hour meeting exceeds it, and the failure would be a timeout at the very end with
 # nothing written, so the work is split instead. The splits are independent: each fetches its
 # own profiles and names its own turns, and no turn's answer depends on another's.
-MATCH_SECONDS_PER_RUN = float(os.environ.get("MATCH_SECONDS_PER_RUN", "3600"))
-MATCH_TURNS_PER_RUN = int(os.environ.get("MATCH_TURNS_PER_RUN", "400"))
+MATCH_SECONDS_PER_RUN = float(os.environ.get(
+    "MATCH_SECONDS_PER_RUN", str(speaker_match_request.DEFAULT_SECONDS_PER_RUN)))
+MATCH_TURNS_PER_RUN = int(os.environ.get(
+    "MATCH_TURNS_PER_RUN", str(speaker_match_request.DEFAULT_TURNS_PER_RUN)))
 
 
 def _split_for_budget(turns):
-    """Group turns into runs that fit one invocation. Never splits a turn."""
-    runs, current, seconds = [], [], 0.0
-    for t in turns:
-        dur = max(0.0, float(t.get("end_sec", 0)) - float(t.get("start_sec", 0)))
-        if current and (seconds + dur > MATCH_SECONDS_PER_RUN
-                        or len(current) >= MATCH_TURNS_PER_RUN):
-            runs.append(current)
-            current, seconds = [], 0.0
-        current.append(t)
-        seconds += dur
-    if current:
-        runs.append(current)
-    return runs
+    """Group turns into runs that fit one invocation. Never splits a turn.
+
+    The env overrides stay here -- this half is the one an operator tunes -- while the
+    arithmetic lives in `speaker_match_request` so the finalize producer splits identically.
+    """
+    return speaker_match_request.split_for_budget(
+        turns, MATCH_SECONDS_PER_RUN, MATCH_TURNS_PER_RUN)
 
 
 def list_voiceprints(conn, caller):
@@ -1955,18 +1952,15 @@ def _site_for_session(conn, company_id, user_folder, date, session_base):
 
 
 def _label_map(turns):
-    """(turn_ref, source_filename, speaker_label) for every turn — no audio, no vectors.
+    """Delegates to `speaker_match_request.label_map`.
 
-    The transcriber's own grouping, in the one form the writer can act on. Sent whole rather
-    than per run because inheritance is the single thing in this chain whose answer for one
-    turn depends on ANOTHER turn — which is exactly the invariant `_split_for_budget` relies
-    on ("no turn's answer depends on another's").
+    Kept as a name because the call sites read better with it, but NOT as a second
+    implementation: `lambda_item_writer` builds the same artifact at finalize, and a map two
+    producers compute separately is a map that drifts. The hop between these two halves has
+    already dropped this exact key once, and label inheritance was then unreachable code
+    that reported success.
     """
-    return [{"turn_ref": turn_name_overlay.turn_ref(t["source_filename"],
-                                                    float(t["start_sec"])),
-             "source_filename": t["source_filename"],
-             "speaker_label": t.get("speaker_label")}
-            for t in turns or []]
+    return speaker_match_request.label_map(turns)
 
 
 def _same_company_as_folder(conn, caller, folder, what):

@@ -292,6 +292,7 @@ jobs:
               "AskDistanceGate=${{ vars.PROD_ASK_DISTANCE_GATE || '0.55' }}" \
               "UploadVerifyMode=${{ vars.PROD_UPLOAD_VERIFY_MODE || 'observe' }}" \
               "SpeakerIdentityMode=${{ vars.PROD_SPEAKER_IDENTITY_MODE || 'off' }}" \
+              "MatchOnFinalize=${{ vars.PROD_MATCH_ON_FINALIZE || 'false' }}" \
               "EnrolOnCorrection=${{ vars.PROD_ENROL_ON_CORRECTION || 'false' }}" \
               "VoiceprintMaxFrameSpread=${{ vars.PROD_VOICEPRINT_MAX_FRAME_SPREAD || 'default' }}" \
               "AlertEmail=${{ vars.PROD_ALERT_EMAIL || 'none' }}" \
