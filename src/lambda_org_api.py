@@ -150,7 +150,7 @@ from repositories import (action_items, aliases, chunks, classification_feedback
                           programme_suggestions, programme_tasks, programme_window,
                           recordings, redactions, rollup, scope,
                           session_group,
-                          sites, threads, topics, users, voice_messages,
+                          sites, tags, threads, topics, users, voice_messages,
                           voiceprints)
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import diff_candidates, first_match_span, normalize, occurrences
@@ -440,6 +440,15 @@ def dispatch(conn, event, method, route):
             return get_me(conn, caller)
         if method == "PATCH":
             return patch_me(conn, caller, parse_body(event))
+
+    if route == "/tags":
+        if method == "GET":
+            return list_tags(conn, caller, event)
+        if method == "POST":
+            return create_tag(conn, caller, parse_body(event))
+    m_tag = re.match(r"^/tags/([^/]+)$", route)
+    if m_tag and method == "PATCH":
+        return patch_tag(conn, caller, m_tag.group(1), parse_body(event))
 
     if route == "/sites":
         if method == "GET":
@@ -6349,6 +6358,133 @@ def reject_suggestion(conn, caller, suggestion_id):
         return error("access denied to this site", 403)
     programme_suggestions.decide(conn, suggestion_id, "rejected", decided_by=caller["id"])
     return ok({"rejected": True})
+
+
+# ----------------------------------------------------------
+# ----------------------------------------------------------
+# /tags — the taxonomy (migration 0065)
+#
+# Reading it is open to every role: a picker nobody can read is a picker
+# nobody can use, and the vocabulary is not sensitive.
+#
+# Writing it is two different permissions, because a COMPANY-wide word and a
+# word one project added for itself are two different decisions:
+#
+#   company-wide   admin / gm          -- `_MANAGER_ROLES` minus pm. A company's
+#                                          vocabulary is a company-level choice
+#                                          and pm is not who makes it.
+#   site-level     + pm, site_manager  -- and a site_manager only for a site
+#                                          they are actually on.
+#
+# "Project lead" was the product wording. It has no counterpart in this
+# codebase: `pm` here is a COMPANY-wide role (it appears in `_MANAGER_ROLES`
+# alongside admin and gm) and the per-site role is `site_manager`. The gate
+# below is the one that already exists for the same shape of decision -- who
+# may confirm a thread -- rather than a new role invented to match a sentence.
+#
+# The global base set is writable by NOBODY. That is enforced twice, here and
+# in repositories/tags.update, because it is the one thing that would be wrong
+# for every customer at once.
+# ----------------------------------------------------------
+_TAG_COMPANY_ROLES = ("admin", "gm")
+_TAG_SITE_ROLES = ("admin", "gm", "pm", "site_manager")
+
+
+def list_tags(conn, caller, event):
+    """The taxonomy this caller can see: the base set, their company's own
+    tags, and the tags of the sites they can reach."""
+    params = event.get("queryStringParameters") or {}
+    include_inactive = str(params.get("includeInactive", "")).lower() in ("1", "true", "yes")
+    rows = tags.list_visible(
+        conn, caller["company_id"], sorted(_allowed_site_ids(conn, caller)),
+        include_inactive=include_inactive)
+    return ok({"tags": [_tag_payload(t) for t in rows]})
+
+
+def _tag_payload(t):
+    return {
+        "id": str(t["id"]),
+        "parent_id": str(t["parent_id"]) if t.get("parent_id") else None,
+        "site_id": str(t["site_id"]) if t.get("site_id") else None,
+        "slug": t["slug"],
+        "label": t["label"],
+        "is_active": t["is_active"],
+        "sort_order": t["sort_order"],
+        # Not the company id: the only distinction a client needs is whether a
+        # tag is ours (and therefore read-only to them) or theirs.
+        "scope": ("global" if t.get("company_id") is None
+                  else ("site" if t.get("site_id") else "company")),
+    }
+
+
+def create_tag(conn, caller, body):
+    if body is None:
+        return error("malformed JSON body", 400)
+    slug = (body.get("slug") or "").strip()
+    label = (body.get("label") or "").strip()
+    if not slug or not label:
+        return error("slug and label are required", 400)
+
+    site_id = body.get("siteId")
+    if site_id:
+        if caller["global_role"] not in _TAG_SITE_ROLES:
+            return error("adding a project tag requires manager or site-manager role", 403)
+        # The membership check, not just the role. A site_manager is a manager
+        # of THEIR sites; without this the role alone would let one project's
+        # manager write vocabulary into another's.
+        if str(site_id) not in _allowed_site_ids(conn, caller):
+            return error("site not accessible", 403)
+    elif caller["global_role"] not in _TAG_COMPANY_ROLES:
+        return error("adding a company tag requires admin or gm role", 403)
+
+    try:
+        row = tags.create(conn, company_id=caller["company_id"], site_id=site_id,
+                          parent_id=body.get("parentId"), slug=slug, label=label,
+                          created_by=caller["id"],
+                          sort_order=int(body.get("sortOrder") or 0))
+    except tags.NotWritable as e:
+        return error(str(e), 403)
+    except UniqueViolation:
+        return error(f"a tag with slug {slug!r} already exists in that scope", 409)
+    return ok({"tag": _tag_payload(row)})
+
+
+def patch_tag(conn, caller, tag_id, body):
+    if body is None:
+        return error("malformed JSON body", 400)
+    if "slug" in body:
+        # REFUSED, not ignored. A caller told their rename worked while every
+        # tagged row silently keeps the old word is worse off than one told no:
+        # the slug is what an assignment and a prompt both name.
+        return error("a tag's slug cannot be changed; create a new tag instead", 400)
+
+    existing = tags.get(conn, tag_id)
+    if existing is None:
+        # 404 before the role check, and only for a tag that truly does not
+        # exist. Answering 403 for both would tell a stranger which ids are real.
+        return error("not found", 404)
+
+    if existing.get("site_id"):
+        if caller["global_role"] not in _TAG_SITE_ROLES:
+            return error("editing a project tag requires manager or site-manager role", 403)
+        if str(existing["site_id"]) not in _allowed_site_ids(conn, caller):
+            return error("site not accessible", 403)
+    elif caller["global_role"] not in _TAG_COMPANY_ROLES:
+        return error("editing a company tag requires admin or gm role", 403)
+
+    try:
+        row = tags.update(conn, tag_id, company_id=caller["company_id"],
+                          label=body.get("label"),
+                          is_active=body.get("isActive"),
+                          sort_order=body.get("sortOrder"))
+    except tags.NotWritable as e:
+        # The base set, or another company's row. A 403 rather than the 500
+        # an uncaught exception would give: the one thing nobody may do must
+        # not look like a server fault.
+        return error(str(e), 403)
+    if row is None:
+        return error("not found", 404)
+    return ok({"tag": _tag_payload(row)})
 
 
 # ----------------------------------------------------------
