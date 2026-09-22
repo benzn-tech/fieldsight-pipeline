@@ -91,22 +91,32 @@ first cold-cluster morning is exactly when that fires at scale.
 **Files:** `src/lambda_finalize_claim.py`; `tests/unit/test_sweep_cadence_vs_autopause.py`
 (extend); no infrastructure change.
 
-- [ ] Extend `_is_safety_minute` (or add a sibling consulted in the same `or`) so the
+- [x] Extend `_is_safety_minute` (or add a sibling consulted in the same `or`) so the
       sweep also connects unconditionally at **06:45 NZ local time, Monday to
       Friday**. Time comes from `nz_time.to_nz` / `nz_now` -- **never a hardcoded UTC
       hour**: New Zealand is UTC+12 for half the year and UTC+13 for the other half,
       and a fixed UTC cron drifts an hour at each switch.
-- [ ] No new EventBridge rule. A `rate()` rule's phase is fixed by when it was
+      *Built as `_is_prewarm_minute`, over a **two-minute** window (06:45 and 06:46),
+      not one. `rate(1 minute)` means "about every 60 seconds", not a wall-clock
+      alignment: ticks drift, and one at :44:59 followed by one at :46:01 would skip
+      minute 45 entirely. For the hourly safety pass a miss costs an hour's delay and
+      is already documented as acceptable; for the pre-warm a miss costs exactly the
+      Monday-morning failure this step exists to prevent. The second minute is free --
+      two connections 60 seconds apart wake the cluster once.*
+- [x] No new EventBridge rule. A `rate()` rule's phase is fixed by when it was
       created, the two stacks deploy separately, and two unaligned unconditional
       wakes halve the effective idle window -- the failure that made the first
       version of this work save exactly nothing. A wall-clock minute aligns the two
       stages by construction, which is the same reason `SAFETY_SWEEP_MINUTE` is a
       minute and not a rule.
-- [ ] Both stages must compute the same instant. Pin that with a test that runs the
-      predicate for `STAGE=test` and `STAGE=prod` and asserts equality.
-- [ ] Test both offsets explicitly: a January date (UTC+13) and a July date (UTC+12),
-      asserting the connect happens at 06:45 **local** in each.
-- [ ] Cost: one extra wake per weekday. Break-even for this cluster is 40-60 wakes
+- [x] Both stages must compute the same instant. Built as module constants rather
+      than environment variables, so the two stages cannot drift apart at all: a
+      half-wired env knob reads as configurable while silently serving the default.
+- [x] Test both offsets explicitly: a January date (UTC+13) and a July date (UTC+12),
+      asserting the connect happens at 06:45 **local** in each. Also pinned: a UTC
+      Sunday is an NZ Monday at this hour and MUST fire, so the weekday is read in
+      NZ, not in UTC.
+- [x] Cost: one extra wake per weekday. Break-even for this cluster is 40-60 wakes
       per day, so this is not material -- but say the number in the PR rather than
       calling it negligible.
 
