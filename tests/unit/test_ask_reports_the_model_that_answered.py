@@ -77,7 +77,7 @@ def wire(monkeypatch, *, chunks=None, function_error=None, answer=("an answer", 
     monkeypatch.setattr(agent, "_get_lambda_client",
                         lambda: FakeLambdaClient({"chunks": chunks or []}, function_error))
     monkeypatch.setattr(llm_utils, "call_llm",
-                        lambda prompt, max_tokens=4096, force_json=False: answer)
+                        lambda prompt, max_tokens=4096, force_json=False, **kw: answer)
 
 
 def test_no_results_names_no_model(monkeypatch):

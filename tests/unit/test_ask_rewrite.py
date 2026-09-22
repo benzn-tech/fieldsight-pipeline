@@ -8,7 +8,7 @@ class FakeReply:
 
 def _call(reply, counter):
     def call(prompt, **kw):
-        counter.append(prompt)
+        counter.append(dict(kw, prompt=prompt))
         if isinstance(reply, Exception):
             raise reply
         return reply
@@ -80,3 +80,19 @@ def test_a_not_ok_reply_returns_the_original():
         "when is he finishing it?", HISTORY,
         call=_call(FakeReply(None, ok=False, error="429"), []), timeout=4.0)
     assert (text, rewritten) == ("when is he finishing it?", False)
+
+
+def test_the_rewrite_call_is_tagged():
+    """The one production call site an AST alias-scoped guard cannot see,
+    because `standalone_question` receives its transport as an injected `call`
+    parameter rather than importing `corroboration_client` itself (see the
+    module's own PURE docstring). Covered here directly instead: the LLM_USAGE
+    comparison this telemetry exists for -- rewrite vs web verdict vs web
+    answer -- depends on this tag never silently reverting to "unknown"."""
+    calls = []
+    ask_rewrite.standalone_question(
+        "when is he finishing it?", HISTORY,
+        call=_call(FakeReply("when is James finishing the level 3 ceiling grid?"), calls),
+        timeout=4.0)
+    assert len(calls) == 1
+    assert calls[0]["caller"] == "rewrite"

@@ -108,7 +108,8 @@ def summarize_turns(turns, call_llm=None, max_tokens=4000):
     if call_llm is None:
         import llm_utils
         call_llm = llm_utils.call_llm
-    raw, _err = call_llm(build_rolling_prompt(turns), max_tokens=max_tokens, force_json=True)
+    raw, _err = call_llm(build_rolling_prompt(turns), max_tokens=max_tokens, force_json=True,
+                         caller="rolling_summary")
     if not raw:
         return None
     return parse_rolling_summary(raw)

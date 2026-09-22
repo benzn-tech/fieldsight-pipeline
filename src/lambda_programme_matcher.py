@@ -557,7 +557,8 @@ def _process_suggestion(req, topic, topic_id, title, summary, report_date,
     # report_date -- so build_prompt's Date line was always empty until
     # this injects it per-topic (Fable review MINOR #8).
     prompt = build_prompt({**topic, "report_date": report_date}, survivors)
-    raw, error = llm_utils.call_llm(prompt, max_tokens=512, force_json=True)
+    raw, error = llm_utils.call_llm(prompt, max_tokens=512, force_json=True,
+                                    caller="programme_matcher_suggestion")
     if raw is None:
         raise RuntimeError(f"Claude call failed for topic {topic_id}: {error}")
 
@@ -650,7 +651,8 @@ def _process_impacts(topic, topic_findings, finding_vecs, cands, task_vecs, prog
     n = len(surviving_findings)
     prompt = build_impact_prompt(topic, surviving_findings, cands)
     max_tokens = min(512 + 256 * n, 2000)
-    raw, error = llm_utils.call_llm(prompt, max_tokens=max_tokens, force_json=True)
+    raw, error = llm_utils.call_llm(prompt, max_tokens=max_tokens, force_json=True,
+                                    caller="programme_matcher_impact")
     if raw is None:
         raise RuntimeError(
             f"Claude call failed for impact phase, topic={topic.get('topic_id')}: {error}"

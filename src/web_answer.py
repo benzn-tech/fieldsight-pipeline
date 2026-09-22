@@ -225,7 +225,8 @@ def _spent(*, timed_out=False, failed=False, refused=None):
 def _verdict(question, chunks, budget):
     reply = client.call(
         VERDICT_PROMPT.format(question=question, excerpts=_excerpt_block(chunks)),
-        timeout=budget, model=CHEAP_MODEL, max_tokens=512, effort="low")
+        timeout=budget, model=CHEAP_MODEL, max_tokens=512, effort="low",
+        caller="web_verdict")
     if not reply.ok:
         return None, reply.error
     parsed = _loads(reply.text)
@@ -239,7 +240,8 @@ def _ask_the_web(question, budget):
     its own queries from the question, which is why `question_admission` runs
     before this and not after."""
     return client.call(WEB_PROMPT.format(question=question),
-                       timeout=budget, max_tokens=2048, web=True, effort="low")
+                       timeout=budget, max_tokens=2048, web=True, effort="low",
+                       caller="web_answer")
 
 
 def _sources(reply, limit=4):

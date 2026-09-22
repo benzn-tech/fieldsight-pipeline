@@ -503,9 +503,15 @@ def build_prompt(question, report_text, transcript_text, scope, metadata):
 def call_claude(prompt, max_tokens=MAX_ANSWER_TOKENS):
     """Prose answer via llm_utils (provider-dispatched). Lazy import keeps the
     legacy minimal-zip deploy target working. force_json stays False -- the ask
-    path returns markdown/plain prose, not JSON."""
+    path returns markdown/plain prose, not JSON.
+
+    caller="ask_legacy": the S3-file (non-RAG) answer path, kept separate from
+    the RAG synthesis tags below -- it is a different prompt shape (whole
+    report+transcript, not cited excerpts) and its cost should never be read
+    as part of the RAG number."""
     import llm_utils
-    return llm_utils.call_llm(prompt, max_tokens=max_tokens, force_json=False)
+    return llm_utils.call_llm(prompt, max_tokens=max_tokens, force_json=False,
+                              caller="ask_legacy")
 
 
 # ============================================================
@@ -818,41 +824,13 @@ def _rerank_chunks(question, chunks, keep):
 
 _NO_LEX_MAX_DIST = 0.55  # non-lexical topics past this cosine distance are dropped as irrelevant
 
-# Latin/digit runs, and the scripts written without spaces between words (CJK
-# ideographs and kana). They need different handling, which is the whole point:
-# splitting on `[^a-z0-9]+` produced NO terms at all for a Chinese question, so
-# no row could ever be `lexical`, the lexical-first ordering did nothing, and
-# only rows inside _NO_LEX_MAX_DIST survived. The same question asked in Chinese
-# returned strictly less than in English, and sometimes nothing.
-_LATIN_RUN = re.compile(r"[a-z0-9]+")
-_UNSPACED_RUN = re.compile(r"[㐀-䶿一-鿿぀-ヿ豈-﫿]+")
-# A token mixing letters and digits is an identifier — "b2", "k1", "sb1108" —
-# and the 3-character floor was dropping exactly the zone and grid references
-# people search for, in English as much as in Chinese.
-_IDENTIFIER = re.compile(r"[a-z]\d|\d[a-z]")
-
-
-def _lexical_terms(question):
-    """Terms for the literal-containment half of the hybrid ranking.
-
-    Latin runs keep the 3-character floor, which exists so "we"/"is"/"of" do not
-    make every row lexical; an identifier is exempt from it.
-
-    A run of an unspaced script becomes overlapping 2-character shingles rather
-    than one long token: "钢筋合格证" as a whole almost never appears verbatim in
-    a title, while "钢筋" does. Standard cheap approach, and it leaves the
-    ranking design untouched — Chinese simply gets to participate in it.
-
-    Other scripts (Cyrillic, Greek, …) yield no terms, exactly as today.
-    Shingling a space-separated script would over-match, and no product language
-    needs it yet.
-    """
-    q = (question or "").lower()
-    terms = [t for t in _LATIN_RUN.findall(q)
-             if len(t) >= 3 or _IDENTIFIER.search(t)]
-    for run in _UNSPACED_RUN.findall(q):
-        terms.extend(run[i:i + 2] for i in range(len(run) - 1))
-    return terms
+# Extraction moved to lexical_terms.py (2026-09-22, "the keyword arm can
+# actually fire") so lambda_rag_search.py can build the SAME OR query for
+# build_search_sql's keyword arm without importing this whole lambda module
+# (which eagerly touches boto3/S3 and several sibling modules at import
+# time). `_lexical_terms` stays as the local name every call site here
+# already used before the move.
+from lexical_terms import lexical_terms as _lexical_terms  # noqa: E402
 
 
 def _derived_title(c):
@@ -1033,6 +1011,29 @@ def _citation_time_start(c):
     if not isinstance(span, str) or "–" not in span:
         return None
     return span.split("–", 1)[0].strip() or None
+
+
+def _build_citations(chunks):
+    """Same fields, same order, for both the grounded path and the web-branch
+    record block below -- one definition so the two can never drift apart.
+    CONTRACT for the grounded caller: citations MUST stay in the same order
+    as the prompt's [n] excerpt numbering (enumerate(chunks, start=1)) so the
+    UI can map card [i+1] <-> inline [n] positionally. The web-branch caller
+    has no such [n] prompt numbering to stay aligned with -- see the comment
+    at its call site for why that matters."""
+    return [
+        {
+            "source_s3_key": c.get("source_s3_key"),
+            "report_date": str(c.get("report_date", "") or ""),
+            "site_name": c.get("site_name"),
+            "site_slug": c.get("site_slug"),  # project slug for citation-click selector sync (联动)
+            "topic_title": c.get("topic_title"),
+            "chunk_type": c.get("chunk_type"),
+            "snippet": (c.get("chunk_text") or "")[:200],
+            "time_start": _citation_time_start(c),
+        }
+        for c in chunks
+    ]
 
 
 def _parse_now(raw):
@@ -1697,12 +1698,33 @@ def _rag_answer(body):
             web = web_answer.answer(question, chunks, skip_verdict=_skip,
                                     verdict_question=asked)
         if web is not None and web.get("answer"):
-            # Its own block, never merged into the grounded answer. A reader who
-            # cannot tell what came from their meetings from what came off the
-            # internet has no reason to suspect they need to check.
+            # Union, not either/or (spec 2026-09-22): the verdict said the
+            # records could not fully answer this, but the excerpts retrieval
+            # already paid for are still often useful, so they travel with
+            # the web answer instead of being thrown away. `citations` here
+            # are the SAME chunks the verdict was given, built the same way
+            # as the grounded path (_build_citations) -- but this is not a
+            # grounded answer's source list.
+            #
+            # THE HAZARD (do not remove this without re-reading it): the web
+            # prose in `web["answer"]` carries its OWN inline [1]/[2]/...
+            # markers pointing at WEB sources -- see web_answer.answer. The
+            # grounded path's `citations` carry a CONTRACT (above, at the
+            # list comprehension this shares via _build_citations) that card
+            # [i+1] maps positionally to an inline [n] IN THIS SAME ANSWER
+            # TEXT. Neither is true here: these cards are not numbered
+            # references inside `web["answer"]`, they are a separate "what we
+            # found in your records" block. `grounded` stays False and `web`
+            # stays its own block for exactly this reason -- the UI must key
+            # its rendering off `from_web`, never merge this list into the
+            # web answer's own source list, and never label it as if [n] in
+            # the prose points into it. A reader who cannot tell what came
+            # from their meetings from what came off the internet has no
+            # reason to suspect they need to check -- that principle survives
+            # this change; only "the records are silently discarded" does not.
             return {
                 "answer": web["answer"],
-                "citations": [],
+                "citations": _build_citations(chunks),
                 "grounded": False,
                 "from_web": True,
                 "web": web,
@@ -1749,13 +1771,18 @@ def _rag_answer(body):
         if voice_model.lower() in ("", "none"):
             voice_model = None
         _t_synthesis = time.monotonic()
+        # caller="ask_answer" on both branches below -- voice-model and
+        # screen-model are the same logical call (the RAG synthesis) reached
+        # by two different models, not two different call SHAPES. The retry a
+        # few lines down gets its own tag because it is a genuinely separate,
+        # rare cost that would otherwise be folded into this one's average.
         if voice and voice_model:
             answer, err = llm_utils.call_llm(
                 prompt, max_tokens=MAX_ANSWER_TOKENS, force_json=False,
-                enable_thinking=False, model=voice_model)
+                enable_thinking=False, model=voice_model, caller="ask_answer")
         else:
             answer, err = llm_utils.call_llm(prompt, max_tokens=MAX_ANSWER_TOKENS,
-                                             force_json=False)
+                                             force_json=False, caller="ask_answer")
         # The primary synthesis call only -- the language-leak retry a few
         # lines below is a distinct, rare cost and would otherwise inflate
         # this stage's usual number for the one turn in ~13 that needs it.
@@ -1795,7 +1822,7 @@ def _rag_answer(body):
                                             today=today, basis=basis,
                                             insist_language=True, pinned_topic=pinned_topic)
             retried, retry_err = llm_utils.call_llm(retry_prompt, max_tokens=MAX_ANSWER_TOKENS,
-                                                    force_json=False)
+                                                    force_json=False, caller="ask_answer_retry")
             if not retry_err and retried and not answer_language.violates(retried):
                 logger.info("  Ask answer language recovered on retry")
                 answer = retried
@@ -1815,20 +1842,8 @@ def _rag_answer(body):
         # CONTRACT: citations MUST stay in the same order as the prompt's [n]
         # excerpt numbering above (enumerate(chunks, start=1)) so the UI can
         # map card [i+1] <-> inline [n] positionally. Do not filter/dedupe/
-        # reorder here without also renumbering the prompt.
-        citations = [
-            {
-                "source_s3_key": c.get("source_s3_key"),
-                "report_date": str(c.get("report_date", "") or ""),
-                "site_name": c.get("site_name"),
-                "site_slug": c.get("site_slug"),  # project slug for citation-click selector sync (联动)
-                "topic_title": c.get("topic_title"),
-                "chunk_type": c.get("chunk_type"),
-                "snippet": (c.get("chunk_text") or "")[:200],
-                "time_start": _citation_time_start(c),
-            }
-            for c in chunks
-        ]
+        # reorder here without also renumbering the prompt. See _build_citations.
+        citations = _build_citations(chunks)
 
         return {
             "answer": answer,

@@ -176,7 +176,7 @@ def wire(mp, responses=({"chunks": [CHUNK]},), answer=("Grounded answer [1].", N
     mp.setattr(laa, "_get_lambda_client", lambda: client)
     seen = {"llm_calls": 0}
 
-    def fake_llm(prompt, max_tokens=4096, force_json=False):
+    def fake_llm(prompt, max_tokens=4096, force_json=False, **kw):
         seen["prompt"] = prompt
         seen["llm_calls"] += 1
         return answer
@@ -353,6 +353,42 @@ def test_rag_return_web_with_chunks(monkeypatch):
     wire(monkeypatch, web={"answer": "From the web."})
     out = ask(question="concrete issues")
     assert out.get("from_web") is True
+
+
+# --------------------------------------------------------------------------
+# Union, not either/or (spec 2026-09-22): the web branch used to discard the
+# retrieved record excerpts (`"citations": []`) once the verdict judged them
+# unable to fully answer the question -- that was the decision this plan
+# overturns. Before this change, the assertion below was
+# `assert out["citations"] == []`; the web answer replaced the records
+# instead of joining them.
+# --------------------------------------------------------------------------
+
+def test_web_branch_returns_the_record_citations_instead_of_discarding_them(monkeypatch):
+    wire(monkeypatch, web={"answer": "From the web [1]."})
+    out = ask(question="concrete issues")
+    assert out.get("from_web") is True
+    assert out["citations"] == [{
+        "source_s3_key": "reports/2026-09-03/Ben/daily_report.json",
+        "report_date": "2026-09-03",
+        "site_name": "UC PK",
+        "site_slug": "uc-pk",
+        "topic_title": "Scaffold",
+        "chunk_type": "topic",
+        "snippet": "Scaffold tagged.",
+        "time_start": None,
+    }]
+    # The web block stays separate -- its own prose and, if it has one, its
+    # own source list -- never merged into a grounded answer.
+    assert out["grounded"] is False
+    assert out["web"]["answer"] == "From the web [1]."
+
+
+def test_web_branch_with_no_chunks_still_returns_an_empty_list(monkeypatch):
+    wire(monkeypatch, responses=[{"chunks": []}], web={"answer": "From the web."})
+    out = ask(question="concrete issues")
+    assert out.get("from_web") is True
+    assert out["citations"] == []
     _assert_scoped(out)
 
 

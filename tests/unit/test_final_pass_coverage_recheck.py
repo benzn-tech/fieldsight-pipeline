@@ -131,7 +131,7 @@ def _rerun_requests(fake_s3):
 def _llm_that_lands_a_transcript_midcall(fake_s3, key, text="the missing ten minutes"):
     """The whole bug in one fixture: a transcript arrives while the model is
     thinking. 21 of them did, over ~170 seconds."""
-    def _call(prompt, max_tokens=None, force_json=False, enable_thinking=None):
+    def _call(prompt, max_tokens=None, force_json=False, enable_thinking=None, **kw):
         fake_s3.objects[key] = json.dumps(make_transcribe_json(text, start=30.0))
         return json.dumps({"topics": [], "declared_site": None}), None
     return _call
