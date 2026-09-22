@@ -16,7 +16,6 @@ name: Deploy FieldSight PROD (SAM)
 # for a reason that has nothing to do with the change being deployed — which is
 # how a perfectly good deploy gets diagnosed as broken code. Merging a few PRs
 # in quick succession, or two people merging at once, is enough to trigger it.
-#
 # cancel-in-progress is deliberately FALSE: queueing is the point. Cancelling a
 # run mid-CloudFormation-update would leave the stack half-applied, which is
 # strictly worse than waiting.
@@ -230,6 +229,20 @@ jobs:
           # never passed here, so both stacks ran template defaults and the
           # "just flip a variable" rollback did not exist. Unset vars keep those
           # same defaults, so adding them changes nothing until someone sets one.
+          # ElevenLabsTtsVoice / ElevenLabsTtsSpeed are passed EXPLICITLY below,
+          # because a template Default does not reach a stack that already exists.
+          # sam deploy sends only the parameters named in --parameter-overrides;
+          # CloudFormation carries its PREVIOUS value forward for every one it does
+          # not see, so a Default governs a brand-new stack and nothing else.
+          # Measured 2026-09-22: the Default was changed to James, TEST deployed
+          # 02:16Z, prod deployed 02:34Z, and BOTH stacks still reported
+          # ElevenLabsTtsVoice=bPkjmCb0W1xUBvyH2Afs. Green CI, two successful
+          # deploys, the old voice, no error anywhere.
+          #
+          # Literals rather than repo variables: one voice and one speed for both
+          # environments is the product decision (TEST is where the voice gets
+          # judged). The three copies -- both workflows and the template Default --
+          # are pinned equal by test_the_voice_and_speed_are_wired_not_just_defaulted.
           sam deploy --config-env prod \
             --no-confirm-changeset --no-fail-on-empty-changeset \
             --parameter-overrides \
@@ -316,6 +329,8 @@ jobs:
               $NONWORK_SINCE_PARAM \
               "AskSttProvider=${{ vars.PROD_ASK_STT_PROVIDER || 'dashscope' }}" \
               "AskTtsProvider=${{ vars.PROD_ASK_TTS_PROVIDER || 'dashscope' }}" \
+              "ElevenLabsTtsVoice=QlZn2MPaf2jDn0461bnj" \
+              "ElevenLabsTtsSpeed=1.10" \
               $EL_TTS_KEY_PARAM \
               "AskVoiceModel=${{ vars.PROD_ASK_VOICE_MODEL || 'none' }}" \
               $EL_ASK_KEY_PARAM \
