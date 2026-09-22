@@ -18,7 +18,16 @@ together in this repo before: changing how the model is asked to write changes
 what it admits. So this is a second call over the ALREADY-EXTRACTED topics, and
 a test below pins that the extraction schema is unchanged.
 """
+import io
+import os
+import re
+
 import pytest
+
+
+def _src(name):
+    return os.path.join(os.path.dirname(__file__), "..", "..", "src", name)
+
 
 # NO importorskip. `tagging` has no external dependency, so the only reason it
 # could fail to import is that it does not exist -- and importorskip would turn
@@ -196,49 +205,79 @@ def test_the_tagging_prompt_asks_for_labels_and_nothing_else():
 
 
 # ---------------------------------------------------------------------------
-# Wired into the pipeline: extracted in the non-VPC lambda, written by the
-# in-VPC one. Same split location_markers already uses, for the same reason.
+# WHERE IT RUNS, AND WHERE IT MUST NOT.
+#
+# Tagging does NOT happen inside lambda_extract_session. It used to, and the
+# arithmetic says it cannot: the recorder's confirmation email is sent once the
+# extraction artifact lands (lambda_item_writer._final_email_context), that
+# path measures p90 163s against a 180s budget, and one tagging call measures
+# 27-48s. Seventeen seconds of headroom does not absorb thirty, so at p90 it
+# does not "maybe" breach -- it breaches.
+#
+# It runs off that path instead, on the chain that already exists for exactly
+# this: item-writer emits a retag_requests/ artifact AFTER the topics are
+# committed and the email is enqueued, the non-VPC RetagFunction classifies,
+# and item-writer writes the tags back. Labels arrive a few minutes late, and
+# nothing waits on them -- the email carries `openTodos` and no tags, checked
+# rather than assumed (email_sender, lambda_finalize_claim and session_brief
+# mention tags nowhere).
 # ---------------------------------------------------------------------------
 
-def test_the_extraction_lambda_tags_after_the_topics_exist(monkeypatch):
-    """A SECOND call over topics that are already parsed -- not a field asked
-    for in the extraction itself."""
+def test_the_extraction_lambda_does_not_tag_anything():
+    """The property, stated as an absence. If a `tag_topics` call ever comes
+    back to this module, it comes back onto the email's path with it."""
     import lambda_extract_session as ex
-    seen = {}
-    monkeypatch.setattr(ex, "ENABLE_TOPIC_TAGGING", True)
-    monkeypatch.setattr(ex.tagging, "classify_with_stats",
-                        lambda topics, leaves, call: (
-                            seen.update({"n": len(topics), "leaves": len(leaves)})
-                            or ([["safety.hazard"]] * len(topics), {"unanswered": 0})))
-    topics = [{"topic_title": "A", "summary": "x"}, {"topic_title": "B", "summary": "y"}]
-    ex.tag_topics(topics)
-    assert seen == {"n": 2, "leaves": 72}   # the base set, all of it
-    assert [t["tags"] for t in topics] == [["safety.hazard"], ["safety.hazard"]]
+    assert not hasattr(ex, "tag_topics"), (
+        "tagging is back inside extract_session, which is the path the "
+        "stop-recording email waits on")
+    src = io.open(_src("lambda_extract_session.py"), encoding="utf-8").read()
+    code = re.sub(r"#.*", "", src)
+    assert "tagging." not in code and "import tagging" not in code, (
+        "extract_session imports the tagger again")
+
+
+def test_the_writer_asks_for_tagging_after_the_email_is_enqueued(monkeypatch):
+    """Order is the whole point. Emitting the request before the email is
+    enqueued would put the S3 write, and anything that retries behind it, in
+    front of the thing with seventeen seconds of headroom."""
+    src = io.open(_src("lambda_item_writer.py"), encoding="utf-8").read()
+    i_email = src.index("_enqueue_final_email")
+    i_tag = src.index("tag_request.emit") if "tag_request.emit" in src else -1
+    assert i_tag > 0, "item-writer never asks for tagging"
+    assert i_tag > i_email, (
+        "the tagging request is emitted before the email is enqueued")
 
 
 def test_tagging_is_off_until_it_is_switched_on(monkeypatch):
-    """Ships inert, like every other switch in this pipeline: with the flag off
-    no call is made and the artifact gains no field."""
-    import lambda_extract_session as ex
-    monkeypatch.setattr(ex, "ENABLE_TOPIC_TAGGING", False)
-    monkeypatch.setattr(ex.tagging, "classify_with_stats",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("called")))
-    topics = [{"topic_title": "A", "summary": "x"}]
-    ex.tag_topics(topics)
-    assert "tags" not in topics[0]
+    """Ships inert, like every other switch in this pipeline."""
+    import lambda_item_writer as iw
+    monkeypatch.setattr(iw, "ENABLE_TOPIC_TAGGING", False)
+    emitted = []
+    monkeypatch.setattr(iw.retag_request, "emit",
+                        lambda *a, **k: emitted.append(a))
+    iw._request_topic_tagging(None, "co-1", [{"id": "t-1", "title": "A", "summary": "x"}])
+    assert emitted == []
 
 
-def test_a_failed_tagging_pass_never_fails_the_extraction(monkeypatch):
-    """A label is an addition to an extraction that is already correct. A
-    tagging call that can fail the session would be a worse bug than an
-    untagged topic."""
-    import lambda_extract_session as ex
-    monkeypatch.setattr(ex, "ENABLE_TOPIC_TAGGING", True)
-    monkeypatch.setattr(ex.tagging, "classify_with_stats",
-                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
-    topics = [{"topic_title": "A", "summary": "x"}]
-    ex.tag_topics(topics)                      # must not raise
-    assert topics[0].get("tags", []) == []
+def test_a_failed_tagging_request_never_fails_the_extraction(monkeypatch):
+    """A label is an addition to an extraction that is already correct, and
+    this now runs AFTER the email. A failure here must cost the label and
+    nothing else."""
+    import lambda_item_writer as iw
+    monkeypatch.setattr(iw, "ENABLE_TOPIC_TAGGING", True)
+    monkeypatch.setattr(iw.retag_request, "emit",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("s3 down")))
+    iw._request_topic_tagging(None, "co-1",
+                              [{"id": "t-1", "title": "A", "summary": "x"}])   # no raise
+
+
+def test_nothing_to_tag_asks_for_nothing(monkeypatch):
+    import lambda_item_writer as iw
+    monkeypatch.setattr(iw, "ENABLE_TOPIC_TAGGING", True)
+    emitted = []
+    monkeypatch.setattr(iw.retag_request, "emit", lambda *a, **k: emitted.append(a))
+    iw._request_topic_tagging(None, "co-1", [])
+    assert emitted == []
 
 
 def test_the_writer_resolves_slugs_and_records_who_said_so(monkeypatch):

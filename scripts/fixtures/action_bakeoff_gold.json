@@ -1,0 +1,1142 @@
+[
+ {
+  "i": 0,
+  "id": "e5fa4870-209b-47aa-bee1-470d1b0f08fc",
+  "topic_id": "9b1f39ff-071c-4704-bc69-cc55086ac52e",
+  "topic_title": "Shelf Brackets Installation",
+  "topic_gold": [
+   "finishes.fixtures-and-fittings"
+  ],
+  "text": "Shelf brackets -- install two additional",
+  "gold": [
+   "finishes.fixtures-and-fittings"
+  ]
+ },
+ {
+  "i": 1,
+  "id": "2bc1153f-db60-40fc-b96a-9bee5fa9671a",
+  "topic_id": "4bf42fa9-6442-4998-ad2e-ef989a5c72b3",
+  "topic_title": "Staffing Model and Succession Planning",
+  "topic_gold": [],
+  "text": "Venue operator -- assess head chef capability",
+  "gold": []
+ },
+ {
+  "i": 2,
+  "id": "a2db89fc-a090-462d-90d1-1c5fb0f9e358",
+  "topic_id": "ab78051f-0996-4a12-8bea-c749dafdb95a",
+  "topic_title": "Follow-ups & Next Steps",
+  "topic_gold": [],
+  "text": "Get formal clarity from PT on whether they will invest resources in this technology project",
+  "gold": []
+ },
+ {
+  "i": 3,
+  "id": "839ffb9a-191f-441d-895c-b1119209feb0",
+  "topic_id": "3eb877e7-fc12-49fb-ae75-7dd169f0430f",
+  "topic_title": "Floor Box Leveling and Materials Storage",
+  "topic_gold": [
+   "electrical.power",
+   "finishes.floor-finish",
+   "programme.delivery-and-materials"
+  ],
+  "text": "Coordinate with flooring contractors to feather out floor around floor boxes",
+  "gold": [
+   "finishes.floor-finish"
+  ]
+ },
+ {
+  "i": 4,
+  "id": "cdc5ef65-82a8-4c6a-917f-0de0fe97171e",
+  "topic_id": "cca99530-1373-4f3d-a3b7-b1bb41667141",
+  "topic_title": "Eyeglasses Polishing for Client",
+  "topic_gold": [],
+  "text": "129 eyeglasses -- polish and gift",
+  "gold": []
+ },
+ {
+  "i": 5,
+  "id": "3c15ac51-9d3e-4155-8615-821e2d466aa1",
+  "topic_id": "db61125f-c3c1-4b39-88a0-bea93343ee59",
+  "topic_title": "Scaffolders Contract Status",
+  "topic_gold": [
+   "commercial.contract-and-scope",
+   "sitework.temporary-works"
+  ],
+  "text": "Scaffolders contract -- chase and assign to Daniel",
+  "gold": [
+   "commercial.contract-and-scope"
+  ]
+ },
+ {
+  "i": 6,
+  "id": "6dde88b3-8d7b-4145-8812-2a04d9aa7d8e",
+  "topic_id": "87b67561-dd0a-4a0e-913d-633720464c89",
+  "topic_title": "Floor Box Installation and Multi-Building Coordination",
+  "topic_gold": [
+   "electrical.power",
+   "finishes.floor-finish",
+   "programme.access-and-sequencing"
+  ],
+  "text": "Complete 3 floor boxes in Building 2",
+  "gold": [
+   "electrical.power"
+  ]
+ },
+ {
+  "i": 7,
+  "id": "cbf753ee-7ffd-4232-b93c-9a61b487d0cd",
+  "topic_id": "b1872f2e-d126-4be7-9eab-26364f942bbf",
+  "topic_title": "Weekly Schedule & FieldSight AI",
+  "topic_gold": [],
+  "text": "Neil meeting -- schedule for Monday",
+  "gold": []
+ },
+ {
+  "i": 8,
+  "id": "5066718f-cd92-477b-8d9a-f1bef57f4135",
+  "topic_id": "28239685-ab92-4c81-ae05-758597c34037",
+  "topic_title": "Catch-up with Brad OpenSpace Platform Introduction",
+  "topic_gold": [],
+  "text": "Schedule a catch-up with Brad this week or next week to introduce OpenSpace platform and 360-camera workflows",
+  "gold": []
+ },
+ {
+  "i": 9,
+  "id": "4b891527-4bf7-4005-8e4b-b69bb204a9fa",
+  "topic_id": "fcab95e9-9a41-4c07-8cf7-8c38b32d93ec",
+  "topic_title": "Inaudible Recording With Water Flow Sound",
+  "topic_gold": [],
+  "text": "Clarify intent of recording and re-submit verbal report if work was performed",
+  "gold": []
+ },
+ {
+  "i": 10,
+  "id": "fc817394-723d-43ce-8abc-f1d3b181e7fc",
+  "topic_id": "ad419cdf-f5b0-4546-831e-c347406b1b24",
+  "topic_title": "Design Workshops and Steel Scope",
+  "topic_gold": [
+   "envelope.waterproofing",
+   "mechanical.plumbing",
+   "structure.steelwork"
+  ],
+  "text": "Flat slab drawings -- issue to Margaret as RFI for approval",
+  "gold": [
+   "structure.slab"
+  ]
+ },
+ {
+  "i": 11,
+  "id": "58508675-8364-4d3b-93f7-669a539c195a",
+  "topic_id": "b1872f2e-d126-4be7-9eab-26364f942bbf",
+  "topic_title": "Weekly Schedule & FieldSight AI",
+  "topic_gold": [],
+  "text": "FJS meeting -- reschedule to Monday",
+  "gold": []
+ },
+ {
+  "i": 12,
+  "id": "e466c1b2-6390-4e02-a29e-cc572f9fac7f",
+  "topic_id": "3eb877e7-fc12-49fb-ae75-7dd169f0430f",
+  "topic_title": "Floor Box Leveling and Materials Storage",
+  "topic_gold": [
+   "electrical.power",
+   "finishes.floor-finish",
+   "programme.delivery-and-materials"
+  ],
+  "text": "Remove concrete bags from black ute before rain or move to covered storage",
+  "gold": [
+   "programme.delivery-and-materials"
+  ]
+ },
+ {
+  "i": 13,
+  "id": "599efd07-61ca-41d0-b965-56a5f73575e6",
+  "topic_id": "4fda772c-f40d-4a36-9003-830b4012d3cd",
+  "topic_title": "Meeting device and mic testing",
+  "topic_gold": [],
+  "text": "Multi-device meeting -- enable join",
+  "gold": []
+ },
+ {
+  "i": 14,
+  "id": "a87e9531-866c-4efd-a1a2-dc7b977d4e64",
+  "topic_id": "758a8c64-55de-4a4e-89f1-761af8a20c44",
+  "topic_title": "Flat slabs TA access",
+  "topic_gold": [
+   "safety.method-statement"
+  ],
+  "text": "TA folder access -- resolve IT ticket",
+  "gold": [
+   "safety.method-statement"
+  ]
+ },
+ {
+  "i": 15,
+  "id": "c0fa22a5-80ad-4d72-a319-7270b390c994",
+  "topic_id": "8d711411-b336-47b1-8129-6d56a782c43c",
+  "topic_title": "Site Delineation and Access Requirements",
+  "topic_gold": [
+   "programme.access-and-sequencing",
+   "sitework.paving"
+  ],
+  "text": "Install delineation mats at each building entrance with walkways",
+  "gold": [
+   "programme.access-and-sequencing"
+  ]
+ },
+ {
+  "i": 16,
+  "id": "20b98317-d3e2-46f5-8320-509af2e35995",
+  "topic_id": "86b51ecb-dd62-4edc-a685-a2e613482416",
+  "topic_title": "Dust Control and Work Area Management",
+  "topic_gold": [
+   "finishes.floor-finish",
+   "quality.defect"
+  ],
+  "text": "Vacuum dust off finished carpet and implement covering protocols",
+  "gold": [
+   "finishes.floor-finish",
+   "quality.defect"
+  ]
+ },
+ {
+  "i": 17,
+  "id": "2f215fe8-f44c-4db3-9bd4-872b477bfc48",
+  "topic_id": "6fa873ca-bbd0-4ff6-a3da-f97ab9ca5387",
+  "topic_title": "UC Site rollout strategy",
+  "topic_gold": [],
+  "text": "UC Site rollout -- switch top-down",
+  "gold": []
+ },
+ {
+  "i": 18,
+  "id": "c838aecf-a75a-4ab4-a5e4-1756d238aaf6",
+  "topic_id": "ab78051f-0996-4a12-8bea-c749dafdb95a",
+  "topic_title": "Follow-ups & Next Steps",
+  "topic_gold": [],
+  "text": "Conduct user research with site managers and QS personnel to understand their actual workflows and pain points",
+  "gold": []
+ },
+ {
+  "i": 19,
+  "id": "7feeccfb-798a-43a0-aa0b-5591fb0813ff",
+  "topic_id": "539146ad-fb98-4ace-b27d-670b29c4afb0",
+  "topic_title": "Corner Bead Correction and Surface Protection",
+  "topic_gold": [
+   "architecture.ceilings",
+   "finishes.plastering",
+   "quality.defect"
+  ],
+  "text": "Install plastic and cardboard protection on floor and counter before starting work",
+  "gold": [
+   "finishes.floor-finish"
+  ]
+ },
+ {
+  "i": 20,
+  "id": "9cbf6880-3cfe-402b-8717-e532877aeee0",
+  "topic_id": "3e660b99-a834-400c-83bb-00c0919e1d87",
+  "topic_title": "Software System Testing and Defects",
+  "topic_gold": [],
+  "text": "Logistics data capture fix for Topic view display",
+  "gold": []
+ },
+ {
+  "i": 21,
+  "id": "1b818eb8-bf40-43af-8e23-396941413c17",
+  "topic_id": "e03ec45e-5f0a-4e4f-af2b-3c263061c21b",
+  "topic_title": "Tiling painting flooring subs",
+  "topic_gold": [
+   "commercial.cost-and-pricing",
+   "finishes.painting",
+   "finishes.tiling"
+  ],
+  "text": "Tiling subcontractor -- call Ima Tiling if evaluation struggles",
+  "gold": [
+   "finishes.tiling",
+   "stakeholders.subcontractor"
+  ]
+ },
+ {
+  "i": 22,
+  "id": "6f0523f3-5ce0-4a1d-b21a-f3a33d06190e",
+  "topic_id": "d5c1dd61-6430-48a0-8433-5214391d9e59",
+  "topic_title": "Column 3 Formwork Removal",
+  "topic_gold": [
+   "quality.inspection",
+   "structure.concrete"
+  ],
+  "text": "Column 3 re-inspection -- conduct after removal",
+  "gold": [
+   "quality.inspection",
+   "structure.concrete"
+  ]
+ },
+ {
+  "i": 23,
+  "id": "5faeab4e-2f90-4f31-9f40-9463514443da",
+  "topic_id": "e8017734-9bed-44ff-b45d-f186a57a5987",
+  "topic_title": "Client Program Update",
+  "topic_gold": [
+   "programme.schedule",
+   "stakeholders.client"
+  ],
+  "text": "Update program -- send to client",
+  "gold": [
+   "programme.schedule",
+   "stakeholders.client"
+  ]
+ },
+ {
+  "i": 24,
+  "id": "b99664f1-ef69-4d11-b774-f6b6fb08c3f8",
+  "topic_id": "87b67561-dd0a-4a0e-913d-633720464c89",
+  "topic_title": "Floor Box Installation and Multi-Building Coordination",
+  "topic_gold": [
+   "electrical.power",
+   "finishes.floor-finish",
+   "programme.access-and-sequencing"
+  ],
+  "text": "Continue floor box installations in Building 3 as areas become ready",
+  "gold": [
+   "electrical.power"
+  ]
+ },
+ {
+  "i": 25,
+  "id": "a6767131-554a-4ad8-aca0-1b2235ef105a",
+  "topic_id": "0b67b087-a57d-4318-b26c-6f981124c258",
+  "topic_title": "Joinery procurement and programme wins",
+  "topic_gold": [
+   "architecture.joinery",
+   "commercial.procurement",
+   "programme.schedule"
+  ],
+  "text": "Obtain full H3 shop drawings for dimension base",
+  "gold": [
+   "architecture.joinery"
+  ]
+ },
+ {
+  "i": 26,
+  "id": "396293de-a56a-4699-8633-b5ea40837dba",
+  "topic_id": "c7f8f7d9-ce7c-44d4-8cec-0c282a832b11",
+  "topic_title": "App Development & Outlook Integration",
+  "topic_gold": [],
+  "text": "Outlook calendar integration -- develop for app",
+  "gold": []
+ },
+ {
+  "i": 27,
+  "id": "639ac6e6-682a-4cb2-835f-1731d354adff",
+  "topic_id": "26639d70-0859-42dd-8523-e279e3b212bc",
+  "topic_title": "Cell Phone Apps Review",
+  "topic_gold": [],
+  "text": "66 cell phone apps -- review",
+  "gold": []
+ },
+ {
+  "i": 28,
+  "id": "8aff45ed-60e1-4b62-87b8-2d2f18ccd5ec",
+  "topic_id": "ab78051f-0996-4a12-8bea-c749dafdb95a",
+  "topic_title": "Follow-ups & Next Steps",
+  "topic_gold": [],
+  "text": "Research competitive landscape (Cubicost, OpenSpace) and potential partnership opportunities",
+  "gold": []
+ },
+ {
+  "i": 29,
+  "id": "2b27aa99-eca3-4002-812b-c847b9bec820",
+  "topic_id": "87b67561-dd0a-4a0e-913d-633720464c89",
+  "topic_title": "Floor Box Installation and Multi-Building Coordination",
+  "topic_gold": [
+   "electrical.power",
+   "finishes.floor-finish",
+   "programme.access-and-sequencing"
+  ],
+  "text": "Install carpet in Building 3",
+  "gold": [
+   "finishes.floor-finish"
+  ]
+ },
+ {
+  "i": 30,
+  "id": "53089339-748b-4eee-81dd-c81fdf279b3c",
+  "topic_id": "3e660b99-a834-400c-83bb-00c0919e1d87",
+  "topic_title": "Software System Testing and Defects",
+  "topic_gold": [],
+  "text": "Email summary feature correction to provide summaries instead of notifications",
+  "gold": []
+ },
+ {
+  "i": 31,
+  "id": "81b312c1-e474-490e-adde-cd4a3c44b298",
+  "topic_id": "c0b3bf91-3c1b-47e1-aaa9-09724134288c",
+  "topic_title": "Ceiling Work Photo Documentation",
+  "topic_gold": [
+   "architecture.ceilings",
+   "quality.defect"
+  ],
+  "text": "Send photo of pipe below ceiling to David",
+  "gold": [
+   "architecture.ceilings"
+  ]
+ },
+ {
+  "i": 32,
+  "id": "786eba0b-9ea6-4280-9725-c2fddd46be3b",
+  "topic_id": "9b206ee1-e4c4-4d78-98c3-2dc95aacd3b0",
+  "topic_title": "Equipment Issues & Emergency Procedures",
+  "topic_gold": [
+   "safety.emergency-preparedness"
+  ],
+  "text": "Replace camera battery and source AAA batteries",
+  "gold": []
+ },
+ {
+  "i": 33,
+  "id": "43fb2739-4b80-406c-ae54-b9a2e3f97529",
+  "topic_id": "3ed4a585-f23f-4c7b-aa0d-10d630588fb9",
+  "topic_title": "QA Inspections & Concrete Testing",
+  "topic_gold": [
+   "quality.inspection",
+   "quality.test-and-commissioning",
+   "structure.concrete"
+  ],
+  "text": "Concrete cylinder tests -- send 7 and 28-day results to QA",
+  "gold": [
+   "quality.test-and-commissioning",
+   "structure.concrete"
+  ]
+ },
+ {
+  "i": 34,
+  "id": "aa07f3a4-f613-4d0e-b96c-05d6a31eb8f3",
+  "topic_id": "3f92dc20-1806-447b-9f38-18de13c318ef",
+  "topic_title": "Concrete Pour Dates & Upcoming Schedule",
+  "topic_gold": [
+   "programme.delivery-and-materials",
+   "programme.schedule",
+   "structure.concrete"
+  ],
+  "text": "Updated program -- share with Nate",
+  "gold": [
+   "programme.schedule"
+  ]
+ },
+ {
+  "i": 35,
+  "id": "ebcd824d-8446-42b1-8b14-155e231b24bd",
+  "topic_id": "3e660b99-a834-400c-83bb-00c0919e1d87",
+  "topic_title": "Software System Testing and Defects",
+  "topic_gold": [],
+  "text": "Website timeline data enhancement for sufficient group information",
+  "gold": []
+ },
+ {
+  "i": 36,
+  "id": "b504b10a-c790-4d49-abcb-81d813bd4c51",
+  "topic_id": "5c50cdfd-9000-44e0-83f2-58c2bed799c7",
+  "topic_title": "Fieldside AI Platform Change – Qwen / ElevenLabs to Replace Claude and AWS Transcribe",
+  "topic_gold": [],
+  "text": "Discuss and progress the proposed replacement of Claude and AWS Transcribe with Qwen / ElevenLabs for fieldside AI functions",
+  "gold": []
+ },
+ {
+  "i": 37,
+  "id": "a2b9a5ff-e667-4fc4-9934-af7f18ac9a76",
+  "topic_id": "bc7a1849-4faa-4f88-8197-442b314d40a7",
+  "topic_title": "Temporary Works Permits Propping",
+  "topic_gold": [
+   "safety.permit-and-isolation",
+   "sitework.temporary-works"
+  ],
+  "text": "Propping plans to be converted to for-construction and inspected before load/unload",
+  "gold": [
+   "quality.consent-and-code",
+   "sitework.temporary-works"
+  ]
+ },
+ {
+  "i": 38,
+  "id": "9febe2d2-3d21-4a97-9fa6-c972545f3dac",
+  "topic_id": "3dab1370-2a63-4a54-aaa9-7cdb4098c371",
+  "topic_title": "UC/PK Building Door Damage Inspection and Replacement Scheduling",
+  "topic_gold": [
+   "architecture.windows-and-doors",
+   "quality.defect"
+  ],
+  "text": "Replace damaged doors on remaining 3 floors of the PK building",
+  "gold": [
+   "architecture.windows-and-doors"
+  ]
+ },
+ {
+  "i": 39,
+  "id": "cbece2a8-298d-47b1-bde1-125f5be31c65",
+  "topic_id": "ab78051f-0996-4a12-8bea-c749dafdb95a",
+  "topic_title": "Follow-ups & Next Steps",
+  "topic_gold": [],
+  "text": "Consult Luis on IP ownership strategy and legal positioning",
+  "gold": []
+ },
+ {
+  "i": 40,
+  "id": "c5860d4d-f9e3-4c7c-93e3-6eba73834e5e",
+  "topic_id": "53dd0c83-84e3-4c23-b933-8de447b006b5",
+  "topic_title": "Delivery Apps and POS Integration",
+  "topic_gold": [],
+  "text": "Delivery menu -- optimize for UberEats/DoorDash",
+  "gold": []
+ },
+ {
+  "i": 41,
+  "id": "348ee164-98a4-44b9-9f8a-dddb0b17320e",
+  "topic_id": "b2e842e3-7812-438e-a1b3-9d2ac0a53400",
+  "topic_title": "Variations Meeting Preparation",
+  "topic_gold": [
+   "commercial.variation"
+  ],
+  "text": "Variations -- review with Benny",
+  "gold": [
+   "commercial.variation"
+  ]
+ },
+ {
+  "i": 42,
+  "id": "d2b73ac9-7d75-400d-888b-fced9d8b24c7",
+  "topic_id": "85bccc86-7416-492c-92d2-a49e03dc9a8a",
+  "topic_title": "Level 3 Slab Rebar & Trimmer Bars",
+  "topic_gold": [
+   "quality.inspection",
+   "structure.slab"
+  ],
+  "text": "Trimmer bar RFI -- raise with designer",
+  "gold": [
+   "stakeholders.consultant",
+   "structure.slab"
+  ]
+ },
+ {
+  "i": 43,
+  "id": "2648fdd1-a1ca-47f8-8f6a-811e1e9cf604",
+  "topic_id": "0125ef0d-c102-48bf-bd3c-81b24b60d19a",
+  "topic_title": "Business Valuation and Exit Strategy",
+  "topic_gold": [],
+  "text": "Exit strategy -- evaluate succession options",
+  "gold": []
+ },
+ {
+  "i": 44,
+  "id": "b260a9ba-3239-4c49-b929-7b0c18c3d8ef",
+  "topic_id": "ee4c96d9-41c1-4f21-ae3c-6d0b96731cef",
+  "topic_title": "Design Issues & Shop Drawings",
+  "topic_gold": [
+   "envelope.insulation",
+   "mechanical.plumbing",
+   "programme.delay-and-disruption"
+  ],
+  "text": "Fly slab shop drawings -- chase with Paul",
+  "gold": [
+   "structure.slab"
+  ]
+ },
+ {
+  "i": 45,
+  "id": "498a78b8-58a5-4632-abd9-ab337db6072e",
+  "topic_id": "c906a383-49b7-4362-81ce-e64a89b3000c",
+  "topic_title": "Team Meeting Coordination and Personal Schedule",
+  "topic_gold": [],
+  "text": "Find a time to meet with Mario and Jim next Thursday afternoon.",
+  "gold": []
+ },
+ {
+  "i": 46,
+  "id": "f50a86b5-e04f-41b1-9338-9eb3fe77afca",
+  "topic_id": "3ea7e690-0285-4b56-9cc8-85b0be227409",
+  "topic_title": "Procurement support and finishes pricing",
+  "topic_gold": [
+   "commercial.cost-and-pricing",
+   "commercial.procurement"
+  ],
+  "text": "Rendering scope RFI -- issue so Dan knows scope",
+  "gold": [
+   "commercial.contract-and-scope"
+  ]
+ },
+ {
+  "i": 47,
+  "id": "0bda6923-96af-4f3a-9a2c-b7f4d2e06846",
+  "topic_id": "c7f8f7d9-ce7c-44d4-8cec-0c282a832b11",
+  "topic_title": "App Development & Outlook Integration",
+  "topic_gold": [],
+  "text": "AI knowledge base -- build for construction terms",
+  "gold": []
+ },
+ {
+  "i": 48,
+  "id": "1da50464-58ab-4d4f-a424-6ec6db80ec9f",
+  "topic_id": "dacace7f-c3c3-4a8e-a118-99ffc8d26907",
+  "topic_title": "Calculation-Based Deadline Reference",
+  "topic_gold": [
+   "programme.schedule"
+  ],
+  "text": "Clarify what task or deliverable is due by next Wednesday based on the referenced calculations",
+  "gold": [
+   "programme.schedule"
+  ]
+ },
+ {
+  "i": 49,
+  "id": "47fc2000-4e09-4ae8-b297-1364ec450aec",
+  "topic_id": "539146ad-fb98-4ace-b27d-670b29c4afb0",
+  "topic_title": "Corner Bead Correction and Surface Protection",
+  "topic_gold": [
+   "architecture.ceilings",
+   "finishes.plastering",
+   "quality.defect"
+  ],
+  "text": "Remove existing corner bead and reinstall level with ceiling, shave gib if necessary",
+  "gold": [
+   "finishes.plastering",
+   "quality.rework"
+  ]
+ },
+ {
+  "i": 50,
+  "id": "281eb25e-790d-40fb-afb9-28fe43354c6b",
+  "topic_id": "b6fdffd6-b0d6-408b-bcfd-78ace0da0768",
+  "topic_title": "Plywood Wall Bracing Specifications Review",
+  "topic_gold": [
+   "architecture.walls",
+   "structure.framing"
+  ],
+  "text": "Hold off on ply installation until walls are ready to be erected",
+  "gold": [
+   "programme.access-and-sequencing",
+   "structure.framing"
+  ]
+ },
+ {
+  "i": 51,
+  "id": "8189351d-0e66-4849-9afd-847642901742",
+  "topic_id": "f661cff6-8ab8-4b7c-b3e9-40aef33083d8",
+  "topic_title": "Door Hardware Specifications and Installation Requirements",
+  "topic_gold": [
+   "architecture.windows-and-doors",
+   "finishes.fixtures-and-fittings"
+  ],
+  "text": "Coordinate with Sam on door handle installation requirements",
+  "gold": [
+   "architecture.windows-and-doors"
+  ]
+ },
+ {
+  "i": 52,
+  "id": "d53da508-db2f-4a54-b3f8-b7c8797af21f",
+  "topic_id": "3f92dc20-1806-447b-9f38-18de13c318ef",
+  "topic_title": "Concrete Pour Dates & Upcoming Schedule",
+  "topic_gold": [
+   "programme.delivery-and-materials",
+   "programme.schedule",
+   "structure.concrete"
+  ],
+  "text": "Stantec inspection -- confirm date",
+  "gold": [
+   "quality.inspection"
+  ]
+ },
+ {
+  "i": 53,
+  "id": "594a09de-e000-4336-908a-6c363b27ef22",
+  "topic_id": "845437b3-f879-4884-a6e1-70b25fb3061b",
+  "topic_title": "Manager batch work split",
+  "topic_gold": [],
+  "text": "Manager changes batch -- process 21 rows from Meg and Daryl ends",
+  "gold": []
+ },
+ {
+  "i": 54,
+  "id": "63a41220-7b47-42db-9e09-46acf993904a",
+  "topic_id": "c86e1443-f7fa-4776-a23b-7743eb3c6d54",
+  "topic_title": "Electrical Work and Floor Box Installation Coordination",
+  "topic_gold": [
+   "electrical.power",
+   "finishes.floor-finish",
+   "programme.access-and-sequencing"
+  ],
+  "text": "Prepare Building 2 for carpet installation",
+  "gold": [
+   "finishes.floor-finish",
+   "programme.access-and-sequencing"
+  ]
+ },
+ {
+  "i": 55,
+  "id": "44878dbd-799f-4bc4-8f4a-6ec67e3715f1",
+  "topic_id": "4b5f1601-3e68-4beb-8c56-4d012f2d182f",
+  "topic_title": "Venue Space Utilization and Hours",
+  "topic_gold": [],
+  "text": "Space utilization -- optimize indoor/outdoor areas",
+  "gold": []
+ },
+ {
+  "i": 56,
+  "id": "91b8e61c-b46e-4802-ae8d-5f343920f8b4",
+  "topic_id": "87b67561-dd0a-4a0e-913d-633720464c89",
+  "topic_title": "Floor Box Installation and Multi-Building Coordination",
+  "topic_gold": [
+   "electrical.power",
+   "finishes.floor-finish",
+   "programme.access-and-sequencing"
+  ],
+  "text": "Complete plaster work before vinyl installation",
+  "gold": [
+   "finishes.plastering",
+   "programme.access-and-sequencing"
+  ]
+ },
+ {
+  "i": 57,
+  "id": "d7ccc2a6-7214-4e16-ba06-9384c0dab43f",
+  "topic_id": "b6fdffd6-b0d6-408b-bcfd-78ace0da0768",
+  "topic_title": "Plywood Wall Bracing Specifications Review",
+  "topic_gold": [
+   "architecture.walls",
+   "structure.framing"
+  ],
+  "text": "Review nail pattern detail on computer for bracing specifications",
+  "gold": [
+   "structure.framing"
+  ]
+ },
+ {
+  "i": 58,
+  "id": "2d6d247b-57cc-4885-a014-62a64c7d265b",
+  "topic_id": "da6536e4-f7ba-4b75-98d0-9615cb514025",
+  "topic_title": "Electrical Cables Procurement",
+  "topic_gold": [
+   "commercial.procurement",
+   "electrical.power"
+  ],
+  "text": "2500 km electrical cables -- procure",
+  "gold": [
+   "commercial.procurement",
+   "electrical.power"
+  ]
+ },
+ {
+  "i": 59,
+  "id": "de1f002a-2a20-4e6f-9026-c0afb359c171",
+  "topic_id": "06eb8ae4-0a0f-4430-8f76-ff6123d8290f",
+  "topic_title": "Balustrade detailing and supply",
+  "topic_gold": [
+   "architecture.stairs",
+   "commercial.procurement"
+  ],
+  "text": "Balustrade spacing detail -- chase Max and involve HDA/Polish",
+  "gold": [
+   "architecture.stairs"
+  ]
+ },
+ {
+  "i": 60,
+  "id": "d76e5f5c-0afe-4318-b319-97f19173357f",
+  "topic_id": "866dda0d-2c73-407f-b578-dc9b13ee06f1",
+  "topic_title": "Voiceprint Recording System Test",
+  "topic_gold": [],
+  "text": "Voiceprint registration -- record audio sample",
+  "gold": []
+ },
+ {
+  "i": 61,
+  "id": "01ab5153-a440-46e4-8280-d6c15cb3e38b",
+  "topic_id": "930f444e-a0a6-43a8-b7aa-29354eabe3be",
+  "topic_title": "Steel Rebar Certificates",
+  "topic_gold": [
+   "quality.consent-and-code",
+   "structure.concrete"
+  ],
+  "text": "Steel rebar certificates -- follow up with supplier",
+  "gold": [
+   "quality.consent-and-code",
+   "structure.concrete"
+  ]
+ },
+ {
+  "i": 62,
+  "id": "b9d2fba0-dbbe-4097-a8d5-f1afbd1dd7e5",
+  "topic_id": "ab78051f-0996-4a12-8bea-c749dafdb95a",
+  "topic_title": "Follow-ups & Next Steps",
+  "topic_gold": [],
+  "text": "Test AI capabilities for visual pattern recognition with construction-specific use cases",
+  "gold": []
+ },
+ {
+  "i": 63,
+  "id": "1d6d1c4a-fbe5-4509-8624-d8133bcb683b",
+  "topic_id": "c4fa91b6-d222-4308-9e79-38d73686c5bf",
+  "topic_title": "Concrete Pour Dates & Upcoming Schedule",
+  "topic_gold": [
+   "programme.delivery-and-materials",
+   "programme.schedule",
+   "structure.concrete"
+  ],
+  "text": "Stantec inspection -- confirm date",
+  "gold": [
+   "quality.inspection"
+  ]
+ },
+ {
+  "i": 64,
+  "id": "cb635883-73c6-4d26-aaf1-2049a178aa04",
+  "topic_id": "68bf50ea-3069-4814-9ef3-ea65fa21c2e9",
+  "topic_title": "Site visit and FJS scan",
+  "topic_gold": [],
+  "text": "Site visit -- conduct FJS scan",
+  "gold": []
+ },
+ {
+  "i": 65,
+  "id": "a0811621-8ced-4abe-9a10-395570f0390d",
+  "topic_id": "da45d9de-7d2e-434c-9c6e-eaa89b852fd1",
+  "topic_title": "Core Tech Evaluation & Alternative Sensors",
+  "topic_gold": [],
+  "text": "Evaluate alternative sensor collection",
+  "gold": []
+ },
+ {
+  "i": 66,
+  "id": "40dbc5cc-1e0a-4f3d-9299-d8b37f28a0fc",
+  "topic_id": "bef62312-3e2d-4159-868d-0ff641e3cbf8",
+  "topic_title": "Site Access, Handrail Configuration, and Material Supply",
+  "topic_gold": [
+   "architecture.stairs",
+   "programme.delivery-and-materials",
+   "sitework.paving"
+  ],
+  "text": "Install handrail at fire exit with existing stair configuration",
+  "gold": [
+   "architecture.stairs"
+  ]
+ },
+ {
+  "i": 67,
+  "id": "519ce40f-30d9-49ab-af47-92f5211f8f50",
+  "topic_id": "dcea5358-fafd-4edc-abfb-6a8ec6cbd70b",
+  "topic_title": "Kitchenette Reinstatement and 3D Scanning",
+  "topic_gold": [
+   "architecture.joinery",
+   "quality.as-built"
+  ],
+  "text": "Complete 3D building scan",
+  "gold": [
+   "quality.as-built"
+  ]
+ },
+ {
+  "i": 68,
+  "id": "869c78c9-cf71-42c2-9e5d-7f59f59cfa66",
+  "topic_id": "ad419cdf-f5b0-4546-831e-c347406b1b24",
+  "topic_title": "Design Workshops and Steel Scope",
+  "topic_gold": [
+   "envelope.waterproofing",
+   "mechanical.plumbing",
+   "structure.steelwork"
+  ],
+  "text": "Joinery stone RFI -- review together this afternoon",
+  "gold": [
+   "architecture.joinery"
+  ]
+ },
+ {
+  "i": 69,
+  "id": "c5079aa5-a6b9-45d1-b178-e9c006c64a12",
+  "topic_id": "13b76e8f-d765-444d-8ded-7cd39cedea54",
+  "topic_title": "Roof Membrane & Design Modeling",
+  "topic_gold": [
+   "architecture.roofing",
+   "commercial.cost-and-pricing",
+   "envelope.waterproofing"
+  ],
+  "text": "Assess roof membrane and old roof coding for pricing",
+  "gold": [
+   "architecture.roofing",
+   "commercial.cost-and-pricing"
+  ]
+ },
+ {
+  "i": 70,
+  "id": "bf861f13-97f0-41d9-9d64-daccd0735941",
+  "topic_id": "bef62312-3e2d-4159-868d-0ff641e3cbf8",
+  "topic_title": "Site Access, Handrail Configuration, and Material Supply",
+  "topic_gold": [
+   "architecture.stairs",
+   "programme.delivery-and-materials",
+   "sitework.paving"
+  ],
+  "text": "Load best pallets onto telly, strap and deliver around site",
+  "gold": [
+   "programme.delivery-and-materials"
+  ]
+ },
+ {
+  "i": 71,
+  "id": "75682ad3-f810-4a7b-9af4-4f06b8866939",
+  "topic_id": "4fda772c-f40d-4a36-9003-830b4012d3cd",
+  "topic_title": "Meeting device and mic testing",
+  "topic_gold": [],
+  "text": "Microphone noise -- improve cancellation",
+  "gold": []
+ },
+ {
+  "i": 72,
+  "id": "7d4bbb5d-2d0f-4f25-ae21-fb9b2585e472",
+  "topic_id": "c86e1443-f7fa-4776-a23b-7743eb3c6d54",
+  "topic_title": "Electrical Work and Floor Box Installation Coordination",
+  "topic_gold": [
+   "electrical.power",
+   "finishes.floor-finish",
+   "programme.access-and-sequencing"
+  ],
+  "text": "Complete remaining 44 floor boxes plus carpet preparation",
+  "gold": [
+   "electrical.power",
+   "finishes.floor-finish"
+  ]
+ },
+ {
+  "i": 73,
+  "id": "2fe65852-c2d5-4db6-a59b-6ebd745948c4",
+  "topic_id": "3dab1370-2a63-4a54-aaa9-7cdb4098c371",
+  "topic_title": "UC/PK Building Door Damage Inspection and Replacement Scheduling",
+  "topic_gold": [
+   "architecture.windows-and-doors",
+   "quality.defect"
+  ],
+  "text": "Conduct follow-up inspection of door replacement work",
+  "gold": [
+   "architecture.windows-and-doors",
+   "quality.inspection"
+  ]
+ },
+ {
+  "i": 74,
+  "id": "38598bcf-d82b-4f9b-bf0a-2ec0d9fd42e4",
+  "topic_id": "d5c1dd61-6430-48a0-8433-5214391d9e59",
+  "topic_title": "Column 3 Formwork Removal",
+  "topic_gold": [
+   "quality.inspection",
+   "structure.concrete"
+  ],
+  "text": "Column 3 formwork -- remove at 8 AM",
+  "gold": [
+   "structure.concrete"
+  ]
+ },
+ {
+  "i": 75,
+  "id": "3999103d-dd4c-41d5-aca4-61b59fd68f73",
+  "topic_id": "b1872f2e-d126-4be7-9eab-26364f942bbf",
+  "topic_title": "Weekly Schedule & FieldSight AI",
+  "topic_gold": [],
+  "text": "FieldSight AI -- promote with DeAndre",
+  "gold": []
+ },
+ {
+  "i": 76,
+  "id": "ddc63491-3c14-46c8-a8fc-54fa848481dd",
+  "topic_id": "3dab1370-2a63-4a54-aaa9-7cdb4098c371",
+  "topic_title": "UC/PK Building Door Damage Inspection and Replacement Scheduling",
+  "topic_gold": [
+   "architecture.windows-and-doors",
+   "quality.defect"
+  ],
+  "text": "Replace damaged doors on floors 1–3 of the PK building",
+  "gold": [
+   "architecture.windows-and-doors"
+  ]
+ },
+ {
+  "i": 77,
+  "id": "baca805e-95ad-4de9-8c3f-10bea2c96db0",
+  "topic_id": "bef62312-3e2d-4159-868d-0ff641e3cbf8",
+  "topic_title": "Site Access, Handrail Configuration, and Material Supply",
+  "topic_gold": [
+   "architecture.stairs",
+   "programme.delivery-and-materials",
+   "sitework.paving"
+  ],
+  "text": "Fill and patch landscape area with timber edge installed",
+  "gold": [
+   "sitework.landscaping"
+  ]
+ },
+ {
+  "i": 78,
+  "id": "0f27379e-fb65-45d7-8f05-41599fc1ebac",
+  "topic_id": "ee4c96d9-41c1-4f21-ae3c-6d0b96731cef",
+  "topic_title": "Design Issues & Shop Drawings",
+  "topic_gold": [
+   "envelope.insulation",
+   "mechanical.plumbing",
+   "programme.delay-and-disruption"
+  ],
+  "text": "Stormwater line design -- submit RFI",
+  "gold": [
+   "envelope.external-drainage",
+   "sitework.services-trenching"
+  ]
+ },
+ {
+  "i": 79,
+  "id": "39451f10-dd46-4633-a795-1ce5e272e362",
+  "topic_id": "0b67b087-a57d-4318-b26c-6f981124c258",
+  "topic_title": "Joinery procurement and programme wins",
+  "topic_gold": [
+   "architecture.joinery",
+   "commercial.procurement",
+   "programme.schedule"
+  ],
+  "text": "Get client confirmation on light vs dark units and bath vs shower to release joinery",
+  "gold": [
+   "architecture.joinery",
+   "stakeholders.client"
+  ]
+ },
+ {
+  "i": 80,
+  "id": "8337be8d-9640-49bb-8da7-98528a07de76",
+  "topic_id": "c4fa91b6-d222-4308-9e79-38d73686c5bf",
+  "topic_title": "Concrete Pour Dates & Upcoming Schedule",
+  "topic_gold": [
+   "programme.delivery-and-materials",
+   "programme.schedule",
+   "structure.concrete"
+  ],
+  "text": "Updated program -- share with Nate",
+  "gold": [
+   "programme.schedule"
+  ]
+ },
+ {
+  "i": 81,
+  "id": "71c080cd-0c3d-498c-ae86-533d73b73404",
+  "topic_id": "10db3d41-1cac-4b26-8103-cea6e9052262",
+  "topic_title": "Emergency evacuation drill",
+  "topic_gold": [
+   "safety.emergency-preparedness"
+  ],
+  "text": "Add Jesse/Ali/Dan names to SafeBase evacuation record",
+  "gold": [
+   "safety.emergency-preparedness"
+  ]
+ },
+ {
+  "i": 82,
+  "id": "8f42800c-dc08-4f49-9044-c3a396ce8875",
+  "topic_id": "f661cff6-8ab8-4b7c-b3e9-40aef33083d8",
+  "topic_title": "Door Hardware Specifications and Installation Requirements",
+  "topic_gold": [
+   "architecture.windows-and-doors",
+   "finishes.fixtures-and-fittings"
+  ],
+  "text": "Remove improperly installed component (Dante's work)",
+  "gold": [
+   "quality.rework"
+  ]
+ },
+ {
+  "i": 83,
+  "id": "8d6cc824-a453-4c8f-b9bd-cab8ddf571ff",
+  "topic_id": "53dd0c83-84e3-4c23-b933-8de447b006b5",
+  "topic_title": "Delivery Apps and POS Integration",
+  "topic_gold": [],
+  "text": "POS integration -- automate delivery app orders",
+  "gold": []
+ },
+ {
+  "i": 84,
+  "id": "8e65d7a9-d503-44a5-bc48-c07da71efc73",
+  "topic_id": "4cbf950d-3a84-4409-b488-d468292457e4",
+  "topic_title": "Building 3 Completion Status",
+  "topic_gold": [
+   "finishes.fixtures-and-fittings",
+   "programme.schedule"
+  ],
+  "text": "Complete remaining bits and pieces in Learning Hub 3",
+  "gold": [
+   "programme.schedule"
+  ]
+ },
+ {
+  "i": 85,
+  "id": "97d2ca8f-a33c-42e0-a02d-910bc2ac7238",
+  "topic_id": "061d8556-4b70-403f-ab0e-abc09cc5b7f4",
+  "topic_title": "Scaffolding Inspection",
+  "topic_gold": [
+   "quality.inspection",
+   "sitework.temporary-works"
+  ],
+  "text": "Scaffolding -- inspect before Monday",
+  "gold": [
+   "quality.inspection",
+   "sitework.temporary-works"
+  ]
+ },
+ {
+  "i": 86,
+  "id": "c7cccdf9-69c8-4f72-ad68-1663fb292331",
+  "topic_id": "6fa873ca-bbd0-4ff6-a3da-f97ab9ca5387",
+  "topic_title": "UC Site rollout strategy",
+  "topic_gold": [],
+  "text": "Peer success -- engage PMs/GMs",
+  "gold": []
+ },
+ {
+  "i": 87,
+  "id": "175ffff3-81ad-46b1-8bec-c4770f405052",
+  "topic_id": "ab4c41e3-8f8b-48c3-9c60-170740c92e41",
+  "topic_title": "Finishes Procurement - Tiling Painting Flooring",
+  "topic_gold": [
+   "commercial.procurement",
+   "finishes.painting",
+   "finishes.tiling"
+  ],
+  "text": "Tiling package -- involve contact for price drop evaluation",
+  "gold": [
+   "commercial.cost-and-pricing",
+   "finishes.tiling"
+  ]
+ },
+ {
+  "i": 88,
+  "id": "274ac82d-9f89-48fd-86fc-e9a89f1b4bf9",
+  "topic_id": "f661cff6-8ab8-4b7c-b3e9-40aef33083d8",
+  "topic_title": "Door Hardware Specifications and Installation Requirements",
+  "topic_gold": [
+   "architecture.windows-and-doors",
+   "finishes.fixtures-and-fittings"
+  ],
+  "text": "Check door stop availability for Buildings 2 and Senior area",
+  "gold": [
+   "architecture.windows-and-doors",
+   "programme.delivery-and-materials"
+  ]
+ },
+ {
+  "i": 89,
+  "id": "d7aa48ed-cb40-41d2-8f6a-ac6d0d4f6b81",
+  "topic_id": "85bccc86-7416-492c-92d2-a49e03dc9a8a",
+  "topic_title": "Level 3 Slab Rebar & Trimmer Bars",
+  "topic_gold": [
+   "quality.inspection",
+   "structure.slab"
+  ],
+  "text": "Trimmer bars -- sort for pre-pour",
+  "gold": [
+   "structure.slab"
+  ]
+ }
+]

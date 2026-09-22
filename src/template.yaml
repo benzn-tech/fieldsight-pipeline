@@ -1032,19 +1032,27 @@ Parameters:
     Default: 'false'
     AllowedValues: ['true', 'false']
     Description: >-
-      Whether each extracted topic is labelled with the taxonomy (migration
-      0065). This is a SEPARATE model call over the topics that already exist,
-      never a field added to the extraction prompt: admission and style drift
-      together in this pipeline, so asking the extraction to also emit labels
-      would put the topics and action items themselves at risk for a label.
-      Chosen by measurement over 100 real prod topics, four runs each -- the
-      classifier call scored macro F1 0.839 against 0.590 for embedding
-      nearest-neighbour, and abstained correctly on 50/50 of the untaggable
-      half every single run. That abstention is the property worth protecting:
-      half a real corpus takes no construction tag, a third of it because this
-      product is talking about itself. Measured cost 0.0014 USD per hundred
-      items and 27-48 seconds per batch of twenty. Default OFF so the change
-      ships inert.
+      Whether a finished session's topics are labelled with the taxonomy
+      (migration 0065). Read by ItemWriterFunction, which emits a
+      retag_requests/ artifact AFTER the topics are committed and the
+      recorder's confirmation email is enqueued; RetagFunction then classifies
+      and hands the labels back. Labels arrive minutes later and nothing waits
+      on them.
+
+      IT IS NOT DONE INSIDE THE EXTRACTION, and that is the decision rather
+      than an omission. One tagging call measures 27-48s; the confirmation
+      email's path measures p90 163s against a 180s budget. Seventeen seconds
+      of headroom does not absorb thirty, so doing it inline breaches at p90
+      rather than maybe-breaching. Anyone wanting synchronous tagging has
+      those numbers to beat, re-measured rather than assumed to have improved.
+
+      Chosen by measurement over 100 real prod topics, four runs each: the
+      classifier call scored macro F1 0.845 against an independent second
+      annotator's labels (95% of the 0.888 the two annotators reach against
+      each other) and abstained correctly on 50/50 of the untaggable half in
+      every run. That abstention is the property worth protecting: half a real
+      corpus takes no construction tag. Measured cost 0.0014 USD per hundred
+      items. Default OFF so the change ships inert.
   EmitEvidence:
     Type: String
     Default: 'false'
@@ -2587,7 +2595,6 @@ Resources:
       Environment:
         Variables:
           EMIT_EVIDENCE: !Ref EmitEvidence
-          ENABLE_TOPIC_TAGGING: !Ref EnableTopicTagging
           EVIDENCE_WINDOW_SEC: !Ref EvidenceWindowSec
           EVIDENCE_FUZZY_THRESHOLD: !Ref EvidenceFuzzyThreshold
           EVIDENCE_FLOOR_TOKENS: !Ref EvidenceFloorTokens
@@ -3537,6 +3544,7 @@ Resources:
           # video-keyframe plan: emit keyframe_requests/ post-commit only when
           # this stage flag is on (ships inert otherwise).
           EMIT_KEYFRAME_REQUESTS: !Ref EnableKeyframes
+          ENABLE_TOPIC_TAGGING: !Ref EnableTopicTagging
           REBIND_SPEAKERS: !Ref RebindSpeakers
           # recurring-item threading: propose which earlier subject a new
           # topic restates. Writes suggestions only; never links.
@@ -3564,6 +3572,13 @@ Resources:
               # above). Its own PutObject grant, gated to the disjoint prefix.
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/keyframe_requests/*
+            - Effect: Allow
+              # Taxonomy tagging: the same shape again, and for the same
+              # reason. Asked for AFTER the confirmation email is enqueued, so
+              # its 27-48 seconds land off the path that has 17 seconds of
+              # headroom. Its own PutObject grant on a disjoint prefix.
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/retag_requests/*
             - Effect: Allow
               # Phase C multi-device merge: once the merged topics are durable,
               # every member is told to look at them. Enqueued HERE and not by
