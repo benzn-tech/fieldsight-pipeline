@@ -35,5 +35,8 @@ jobs:
       # suite is green over a path nothing checked. Keep this list identical to
       # the one in deploy-prod.yml — that one has been short an entry before, and
       # the miss showed up as `skipped`, not `failed`, so nothing alerted.
-      - run: pip install "psycopg[binary]>=3.1" "pgvector>=0.3" "PyJWT[crypto]>=2.8" boto3 numpy "python-docx>=1.1" pytest pytest-cov
+      # pglast is libpg_query -- PostgreSQL's own parser. Without it the SQL
+      # parse guards do not fail, they SKIP, and a skipped test proves nothing
+      # while still reading as a green suite.
+      - run: pip install "psycopg[binary]>=3.1" "pgvector>=0.3" "PyJWT[crypto]>=2.8" boto3 numpy "python-docx>=1.1" "pglast>=7" pytest pytest-cov
       - run: python -m pytest -v
