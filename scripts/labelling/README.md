@@ -88,6 +88,30 @@ Two of these are worth more than the rest, and the tool marks them:
 
 ---
 
+## Before any threshold is written down: re-run the ONNX parity check
+
+Every number this pack exists to settle — `DEFAULT_MIN_MARGIN` (0.15),
+`DEFAULT_MAX_FRAME_SPREAD` (0.35), the Phase 0 separation, and the ~0.50 window seen on
+2026-09-18 — is a statement about **one particular ONNX export** of the ECAPA model. The
+Lambda cannot carry torch and speechbrain, so it runs that export; an export that drifted
+would move every similarity score a little, and every threshold would quietly stop meaning
+what it says while nothing failed.
+
+`tests/unit/test_voiceprint_onnx_parity.py` is the gate for exactly this. It **does not run
+in CI**, deliberately: the comparison needs the 84 MB model from S3, which CI has no reason
+to download. That is a sound trade and the file argues it well ("a guard that is skipped
+wherever it would fire is not a guard", plus a companion test so the skip cannot become
+silence). It was last executed against the real model on **2026-08-13**.
+
+So: **run it against the model in S3 before quoting a threshold from this labelling round.**
+Otherwise the threshold is fitted to one export and applied to another, and the drift is
+invisible from every direction — it is the one failure mode that would make a clean ROC
+wrong rather than merely weak.
+
+```bash
+ECAPA_ONNX_PATH=/path/to/ecapa_tdnn.onnx pytest tests/unit/test_voiceprint_onnx_parity.py -q
+```
+
 ## What happens next
 
 The labels go into the M2 analysis: cosine distributions split same-speaker / different-speaker,
