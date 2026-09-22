@@ -1027,6 +1027,24 @@ Parameters:
       switching it back off leaves the merged record and does not restore what
       was deleted. Flip it on a day when a two-device recording can be watched.
 
+  EnableTopicTagging:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Whether each extracted topic is labelled with the taxonomy (migration
+      0065). This is a SEPARATE model call over the topics that already exist,
+      never a field added to the extraction prompt: admission and style drift
+      together in this pipeline, so asking the extraction to also emit labels
+      would put the topics and action items themselves at risk for a label.
+      Chosen by measurement over 100 real prod topics, four runs each -- the
+      classifier call scored macro F1 0.839 against 0.590 for embedding
+      nearest-neighbour, and abstained correctly on 50/50 of the untaggable
+      half every single run. That abstention is the property worth protecting:
+      half a real corpus takes no construction tag, a third of it because this
+      product is talking about itself. Measured cost 0.0014 USD per hundred
+      items and 27-48 seconds per batch of twenty. Default OFF so the change
+      ships inert.
   EmitEvidence:
     Type: String
     Default: 'false'
@@ -2558,6 +2576,7 @@ Resources:
       Environment:
         Variables:
           EMIT_EVIDENCE: !Ref EmitEvidence
+          ENABLE_TOPIC_TAGGING: !Ref EnableTopicTagging
           EVIDENCE_WINDOW_SEC: !Ref EvidenceWindowSec
           EVIDENCE_FUZZY_THRESHOLD: !Ref EvidenceFuzzyThreshold
           EVIDENCE_FLOOR_TOKENS: !Ref EvidenceFloorTokens

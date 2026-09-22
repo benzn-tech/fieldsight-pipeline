@@ -68,7 +68,8 @@ import thread_match
 from repositories import location_markers
 from repositories import (companies, findings, meeting_session, recordings,
                           redactions,
-                          session_group, sites, threads, topics)
+                          session_group, sites, tag_writes, tags, threads,
+                          topics)
 # The extraction-key shape lives in session_scope now (the read side needs the
 # SAME parse to derive session_id from topics.source_s3_key -- see that
 # module). Re-exported under the historical private names so existing callers
@@ -629,6 +630,38 @@ def _put_finalize_request(key, body, only_if_absent=False):
 # existing callers and tests.
 # ----------------------------------------------------------
 
+
+def _write_topic_tags(conn, company_id, topic_id, slugs):
+    """Persist one topic's extraction-time labels. Never raises.
+
+    `source='extraction'`, which is what decides who may replace them later: a
+    re-tag run may, and a human's correction may not be replaced by anything.
+    Same vocabulary the photo binding had to learn.
+
+    A slug the database has no row for is DROPPED, not invented. The tagger
+    already refuses to emit a slug outside the base set, so a miss here means
+    the two copies of the base set have drifted -- which
+    tests/unit/test_the_base_set_is_one_vocabulary.py exists to prevent, and
+    which this must not paper over by guessing a nearby tag.
+
+    No tags is the common case -- half of a real corpus abstains -- and it
+    costs ZERO queries rather than one lookup per untagged topic.
+    """
+    if not slugs:
+        return 0
+    by_slug = tags.ids_for_slugs(conn, company_id, slugs)
+    ids = [by_slug[s] for s in slugs if s in by_slug]
+    missing = [s for s in slugs if s not in by_slug]
+    if missing:
+        logger.warning("tagging: %d slug(s) have no row for this company and were "
+                       "dropped (%s) -- the base set in code and in the database "
+                       "may have drifted", len(missing), ", ".join(sorted(missing)))
+    if not ids:
+        return 0
+    return tag_writes.apply_tags(conn, "topic", topic_id, ids,
+                                 source="extraction", run_id=None)
+
+
 def _list_pictures(prefix):
     """Pictures listing bound to THIS module's S3 client + bucket (the
     shared lister is client-parameterized so lambda_ingest can reuse it)."""
@@ -1029,6 +1062,12 @@ def write_extraction_items(date, user_folder, extraction_key):
             # [] -> insert_findings returns [] -> zero rows, zero crash.
             finding_rows = findings.insert_findings(
                 conn, row["id"], site["id"], t.get("findings") or [])
+
+            # The labels the extraction's SECOND call produced, if it ran.
+            # `t.get("tags")` is absent on every artifact written before
+            # tagging existed and on every one written with the switch off --
+            # both mean "no labels", both cost zero queries.
+            _write_topic_tags(conn, company["id"], row["id"], t.get("tags"))
 
             # Snapshot for the match_requests/ artifact (Task 4) -- the
             # non-VPC MatcherFunction reads this, never Aurora directly, so

@@ -148,6 +148,41 @@ def update(conn, tag_id, *, company_id, label=None, is_active=None,
     ).fetchone()
 
 
+def ids_for_slugs(conn, company_id, slugs) -> dict:
+    """{slug: tag_id} for the slugs this company can actually use.
+
+    A COMPANY'S OWN ROW WINS OVER THE GLOBAL ONE of the same slug. That is what
+    shadowing is for: a company that renames 'Walls' creates its own row with
+    the same slug, and everything written afterwards must point at theirs, or
+    their rename would be visible in the picker and invisible on the data.
+
+    Site-level tags are NOT resolved here. This is called by the writer that
+    persists an extraction's labels, and that labelling is done outside the VPC
+    from the base set alone (taxonomy_base) -- it cannot emit a site slug, so
+    accepting one would be resolving a word nothing can produce.
+
+    A slug with no row is simply ABSENT from the result. The caller drops it
+    rather than inventing a tag: a label the vocabulary does not have must not
+    become a row that looks deliberate.
+    """
+    wanted = sorted({s for s in (slugs or []) if s})
+    if not wanted:
+        return {}
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT slug, id, company_id FROM tag "
+        "WHERE site_id IS NULL AND slug = ANY(%s) "
+        "AND (company_id IS NULL OR company_id = %s)",
+        (wanted, str(company_id) if company_id else None),
+    ).fetchall()
+    out = {}
+    for r in rows:
+        # The company's row overwrites the global one; the global one never
+        # overwrites the company's, whatever order the rows arrive in.
+        if r["company_id"] is not None or r["slug"] not in out:
+            out[r["slug"]] = r["id"]
+    return out
+
+
 def children_of(conn, tag_id) -> list[dict]:
     """Used before deactivating a parent, so the caller can say what else it
     is about to hide rather than discovering it afterwards."""

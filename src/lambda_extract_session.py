@@ -49,6 +49,8 @@ import agent_turn_filter
 from output_language import OUTPUT_LANGUAGE_RULE
 import evidence_match
 import llm_utils
+import tagging
+import taxonomy_base
 import batch_stitch
 import chunk_stitch
 from transcript_utils import (
@@ -286,6 +288,16 @@ FILTER_AUDIO_EVENT_TAGS = os.environ.get(
 # because it changes the extraction PROMPT, and a prompt change is not something
 # to discover the morning after.
 EMIT_EVIDENCE = os.environ.get('EMIT_EVIDENCE', 'false').lower() == 'true'
+
+# Label this session's topics with the taxonomy, in a SEPARATE call. Off by
+# default, like every other switch in this pipeline, so the change ships inert.
+#
+# Separate, and NOT a field in EXTRACTION_SCHEMA, deliberately: admission and
+# style drift together here -- changing how the model is asked to write changes
+# WHAT IT ADMITS -- and risking the topics and action items themselves for a
+# label would be a bad trade at any price. Asking separately costs $0.0014 per
+# hundred items, measured.
+ENABLE_TOPIC_TAGGING = os.environ.get('ENABLE_TOPIC_TAGGING', 'false').lower() == 'true'
 
 
 # Calibrated 2026-08-10 against two real sessions; the reasoning is in the
@@ -1732,6 +1744,44 @@ def extraction_key(user_folder, date, session_base):
 UNKNOWN = object()
 
 
+
+def tag_topics(topics):
+    """Put `tags: [slug, ...]` on each topic, in place. Never raises.
+
+    THE VOCABULARY IS THE BASE SET ONLY. A company's own tags and a project's
+    own children live in Aurora, which this lambda cannot reach -- so what is
+    labelled here is exactly the 70 leaves the bake-off measured. Tagging with
+    a company's extensions needs the request/response shape the programme
+    matcher already uses (an in-VPC writer emits an artifact, a non-VPC lambda
+    answers it); bolting a database grant onto this lambda to avoid that would
+    be the wrong end of the trade.
+
+    NEVER FATAL. A label is an addition to an extraction that is already
+    correct, and a tagging call that could fail a session would be a worse bug
+    than an untagged topic. The failure is logged and the topics keep the empty
+    list they started with -- which is honest, because "nothing was tagged" is
+    also what a correct abstention looks like, and the log line is the only
+    thing that tells them apart.
+    """
+    if not ENABLE_TOPIC_TAGGING or not topics:
+        return
+    try:
+        labels, stats = tagging.classify_with_stats(
+            topics, taxonomy_base.LEAVES, llm_utils.call_llm)
+    except Exception:
+        logger.exception('tagging: the pass failed entirely -- '
+                         'the extraction is unaffected and no topic is tagged')
+        for t in topics:
+            t.setdefault('tags', [])
+        return
+    for t, slugs in zip(topics, labels):
+        t['tags'] = slugs
+    if stats.get('unanswered'):
+        logger.warning('tagging: %d batch(es) went unanswered; those topics are '
+                       'untagged because the CALL failed, not because the model '
+                       'abstained', stats['unanswered'])
+
+
 def read_existing_extraction(bucket, out_key):
     """What is currently published for this session. Three distinct answers:
 
@@ -1919,6 +1969,13 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
     # action_items passes through untouched (item-writer contract).
     for topic in parsed_topics:
         topic['safety_flags'] = _derive_safety_flags(topic.get('findings'))
+
+    # Labels, from a SECOND call over the topics that now exist. Carried on the
+    # artifact for `lambda_item_writer` to persist -- the same split
+    # `location_markers` uses, and for the same reason: this lambda runs
+    # outside the VPC and can reach the model; that one runs inside it and can
+    # reach the database. Neither can do both.
+    tag_topics(parsed_topics)
 
     # Verify the citations while `turns` is still in hand -- the transcript the
     # model actually saw, post-filter, which is the only set a quote can honestly
