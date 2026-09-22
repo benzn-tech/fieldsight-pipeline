@@ -31,6 +31,17 @@ _TEMPLATE_COLS = (
     "report_type, current_version, archived_at, created_by, created_at, updated_at"
 )
 
+# How many sections the current version has, as a correlated subquery rather
+# than a second round trip per row. The Library shows "N sections" on every
+# row, and fetching each row's body to count them would be one query per
+# template for a number.
+_SECTION_COUNT = (
+    "(SELECT jsonb_array_length(v.body->'sections') "
+    " FROM report_template_versions v "
+    " WHERE v.template_id = report_templates.id "
+    "   AND v.version = report_templates.current_version) AS section_count"
+)
+
 
 def _decoded(row, key="body"):
     """psycopg hands jsonb back as str on some paths and dict on others."""
@@ -55,7 +66,7 @@ def list_visible(conn, company_id, user_id, scope=None):
         where.append("scope = %s")
         args.append(scope)
     return conn.cursor(row_factory=dict_row).execute(
-        f"SELECT {_TEMPLATE_COLS} FROM report_templates "
+        f"SELECT {_TEMPLATE_COLS}, {_SECTION_COUNT} FROM report_templates "
         f"WHERE {' AND '.join(where)} "
         "ORDER BY scope, name",
         tuple(args),

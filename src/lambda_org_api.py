@@ -9107,6 +9107,21 @@ def _may_write_template(caller, template):
 
 
 def _template_payload(row, versions=None):
+    """One template as a client sees it.
+
+    `versions` USED TO BE OPTIONAL AND ALMOST NOBODY PASSED IT. Only `create`
+    did, so a template read back through list or get arrived with no versions
+    at all -- and the Library takes its section list from exactly there. The
+    template was intact in the database and the page said "No schema available
+    yet", which is a sentence about the template rather than about the request
+    that dropped half of it.
+
+    It is still optional, because list deliberately does not carry every
+    version of every template, but list now sends `section_count` so a row can
+    say how big a template is without being handed its whole body, and get
+    sends the current version because that is the one thing the page cannot
+    render without.
+    """
     out = {
         "id": str(row["id"]),
         "company_id": str(row["company_id"]),
@@ -9120,6 +9135,11 @@ def _template_payload(row, versions=None):
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+    # Absent rather than 0 when the query did not compute it: 0 sections and
+    # "this query did not ask" are different facts, and a client cannot tell
+    # them apart from a number alone.
+    if row.get("section_count") is not None:
+        out["section_count"] = row["section_count"]
     if versions is not None:
         out["versions"] = versions
     return out
@@ -9185,7 +9205,12 @@ def get_report_template(conn, caller, template_id, event):
     row = report_templates.get_visible(conn, company_id, caller["id"], template_id)
     if row is None:
         return error("template not found", 404)
-    return ok(_template_payload(row))
+    # The current version travels with it. Opening a template is exactly the
+    # moment its sections are needed, and a caller that had to ask twice would
+    # render an empty template in between -- which is what it used to do.
+    current = (report_templates.get_version(conn, template_id, None)
+               if row["current_version"] else None)
+    return ok(_template_payload(row, versions=[_version_payload(current)] if current else []))
 
 
 def create_report_template(conn, caller, event):
@@ -9269,7 +9294,12 @@ def update_report_template(conn, caller, template_id, event):
     if description is not None and not isinstance(description, str):
         return error("description must be a string", 400)
     updated = report_templates.update_meta(conn, template_id, name, description)
-    return ok(_template_payload(updated))
+    # Renaming does not change the body, but the client replaces its selected
+    # template with this response -- so a payload without sections empties the
+    # panel the person is looking at. Same reason as `get`.
+    current = (report_templates.get_version(conn, template_id, None)
+               if updated["current_version"] else None)
+    return ok(_template_payload(updated, versions=[_version_payload(current)] if current else []))
 
 
 def list_report_template_versions(conn, caller, template_id):
@@ -9359,7 +9389,11 @@ def copy_report_template(conn, caller, template_id, event):
         return error("you already have a template called that", 409)
     if copied is None:
         return error("that template has no content to copy yet", 409)
-    return ok(_template_payload(copied), 201)
+    # A copy is opened immediately after it is made. copy_to_personal only
+    # returns when there WAS a body to copy, so there is always one here.
+    current = report_templates.get_version(conn, copied["id"], None)
+    return ok(_template_payload(copied, versions=[_version_payload(current)] if current else []),
+              201)
 
 
 def archive_report_template(conn, caller, template_id):
