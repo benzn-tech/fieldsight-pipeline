@@ -18,6 +18,7 @@ happily update a global row is one careless route away from someone renaming
 'Safety' for every customer, and this repo has shipped an endpoint with no
 authorization at all before.
 """
+from deleted_predicates import visible_topics_predicate
 from psycopg.rows import dict_row
 
 _COLS = ("id, company_id, site_id, parent_id, slug, label, is_active, "
@@ -146,6 +147,45 @@ def update(conn, tag_id, *, company_id, label=None, is_active=None,
         f"UPDATE tag SET {', '.join(sets)} WHERE id = %s RETURNING {_COLS}",
         tuple(params),
     ).fetchone()
+
+
+def topics_to_retag(conn, company_id, *, after_id=None, limit=500) -> list[dict]:
+    """The topics one re-tag run covers: id, title and summary, oldest first.
+
+    ONLY WHAT THE MODEL HAS TO READ. Not the action items, not the evidence,
+    not the participants -- this list crosses the VPC wall as an S3 artifact
+    and an artifact that carries a session's words a second time is a second
+    copy to keep in step with the first.
+
+    Deleted topics are excluded with BOTH arms. The source arm is the
+    load-bearing one, as it was for the photo binding: a day whose recording
+    was deleted gets re-extracted and its topics come back with NEW uuids that
+    no topic-keyed tombstone names, still carrying the tombstoned
+    `source_s3_key`. A re-tag that labelled those would put a deleted
+    recording's content back into a filter.
+
+    TOPICS ALREADY TAGGED ARE NOT SKIPPED. A re-tag exists precisely because
+    the vocabulary changed, so a topic labelled under the old one is the main
+    thing it is for. Nothing is deleted here either: `apply_tags` is
+    ON CONFLICT DO NOTHING, so a re-run adds what is new and leaves the rest,
+    and undoing a run is `rollback_run`'s job.
+
+    Keyset pagination on `id`, not OFFSET: a run walks the whole company and
+    OFFSET re-scans everything it has already passed.
+    """
+    where = ["site_id IN (SELECT id FROM sites WHERE company_id = %s)"]
+    params = [str(company_id)]
+    if after_id:
+        where.append("id > %s")
+        params.append(str(after_id))
+    params.append(int(limit))
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, title, summary FROM topics WHERE "
+        + " AND ".join(where)
+        + f" AND {visible_topics_predicate('topics')} "
+        "ORDER BY id LIMIT %s",
+        tuple(params),
+    ).fetchall()
 
 
 def ids_for_slugs(conn, company_id, slugs) -> dict:

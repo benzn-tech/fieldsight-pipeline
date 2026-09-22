@@ -1256,8 +1256,72 @@ def _source_is_deleted(conn, source_s3_key) -> bool:
     return bool(hit)
 
 
+def _is_tag_op(event):
+    """Is this a re-tag write, rather than the S3 event this lambda was built
+    for? Asked as its own function so the dispatch is one testable fact.
+
+    Keyed on an explicit `op`, not on the ABSENCE of `Records`: an S3 event
+    that arrived malformed would otherwise fall through into the write path
+    with no topics and quietly close somebody's run."""
+    return isinstance(event, dict) and event.get("op") == "apply_tags"
+
+
+def apply_retag_batch(event):
+    """The in-VPC half of a re-tag run (see lambda_retag for the other two).
+
+    Arrives by direct invoke from the non-VPC classifier -- the same
+    non-VPC -> in-VPC direction the programme matcher uses, because an in-VPC
+    function cannot reach the model and this one cannot reach the database.
+
+    The payload carries topic ids and slugs and NOTHING ELSE. There is no field
+    for a title or a summary, so a re-tag cannot alter what was written however
+    this function behaves: the owner's boundary is in the shape of the message,
+    not in anyone's memory.
+
+    `source='classifier'`, not 'extraction': these labels came from a re-tag,
+    and the source is what decides who may replace them. A human's correction
+    is never replaced by anything.
+
+    A topic with NO slugs is reported and writes nothing. Half a real corpus
+    abstains, so that is the ordinary case and not a failure -- and it still
+    counts as covered, which is why the run can be closed at the end.
+    """
+    run_id = event.get("run_id")
+    company_id = event.get("company_id")
+    tagged = event.get("tagged") or []
+    applied = covered = 0
+    with get_connection() as conn:
+        for row in tagged:
+            covered += 1
+            slugs = row.get("slugs") or []
+            if not slugs:
+                continue
+            by_slug = tags.ids_for_slugs(conn, company_id, slugs)
+            ids = [by_slug[s] for s in slugs if s in by_slug]
+            missing = [s for s in slugs if s not in by_slug]
+            if missing:
+                logger.warning("retag: %d slug(s) have no row for this company "
+                               "and were dropped (%s)", len(missing),
+                               ", ".join(sorted(missing)))
+            if ids:
+                applied += tag_writes.apply_tags(
+                    conn, "topic", row["topic_id"], ids,
+                    source="classifier", run_id=run_id)
+        # Closed HERE, inside the connection, so the run's status is durable
+        # in the same transaction as the rows it describes. A run left open is
+        # indistinguishable from one still going, and nobody can tell whether
+        # to roll it back.
+        tag_writes.finish_run(conn, run_id,
+                              stats={"topics": covered, "tags": applied})
+    logger.info("retag: run %s covered %d topic(s), wrote %d tag(s)",
+                run_id, covered, applied)
+    return {"run_id": run_id, "topics": covered, "tags": applied}
+
+
 def lambda_handler(event, context):
     event = event or {}
+    if _is_tag_op(event):
+        return apply_retag_batch(event)
     results = []
     for record in event.get("Records", []):
         key = unquote_plus(record["s3"]["object"]["key"])

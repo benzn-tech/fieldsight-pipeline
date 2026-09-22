@@ -43,6 +43,7 @@ EMBED_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-embed-repor
 EXTRACT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-extract-session"
 ITEM_WRITER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-item-writer"
 MATCHER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-programme-matcher"
+RETAG_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-retag"
 KEYFRAME_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-keyframe"
 SESSION_REPORT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-session-report"
 REPORT_GENERATOR_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-report-generator"
@@ -171,6 +172,21 @@ if fn_exists "${PREFIX}-programme-matcher"; then
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-programme-matcher not deployed — skipping programme-matcher trigger"
+fi
+# NOTE(taxonomy re-tag): the non-VPC retag function triggers on
+# retag_requests/*.json, written by OrgApiFunction when an admin starts a run.
+# Prefix "retag_requests/" is disjoint from every other prefix wired here, so
+# no object double-triggers. Without this entry the run opens, the artifacts
+# land, and nothing ever reads them — the run sits at 'running' for ever and
+# looks exactly like one still going.
+if fn_exists "${PREFIX}-retag"; then
+  WIRE_FNS+=("${PREFIX}-retag")
+  DESIRED=$(jq -c --arg arn "$RETAG_ARN" '. + [
+    {"Id":"fs-retag","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"retag_requests/"},{"Name":"suffix","Value":".json"}]}}}
+  ]' <<<"$DESIRED")
+else
+  echo "NOTE: ${PREFIX}-retag not deployed — skipping retag trigger"
 fi
 # NOTE(video-keyframe plan): the in-VPC keyframe extractor triggers on
 # keyframe_requests/*.json, written post-commit by item-writer. Prefix is

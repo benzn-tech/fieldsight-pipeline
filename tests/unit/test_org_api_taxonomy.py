@@ -233,3 +233,80 @@ def test_a_create_without_a_slug_or_label_is_rejected(wired):
         res = org.lambda_handler(make_event("POST", "/api/org/tags", bad), None)
         assert res["statusCode"] == 400, bad
     assert wired["created"] == []
+
+
+# ---------------------------------------------------------------------------
+# Starting and undoing a re-tag run
+#
+# The route is the in-VPC end of the chain: it picks what to re-tag, opens the
+# run, and writes the request artifacts. It cannot classify -- an in-VPC
+# function reaches Aurora and nothing else -- so it hands the work to S3 and
+# stops.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def retag_wired(wired, monkeypatch):
+    # `wired` IN PLACE, not dict(wired). The `wired` fixture's own stubs close
+    # over that dict, so a copy would leave `state["role"] = "pm"` invisible to
+    # get_user_by_sub -- every caller would stay admin and the 403 assertions
+    # below could not fail for the reason they claim to test.
+    state = wired
+    state.update({"emitted": [], "started": [], "rolled": [], "topics": []})
+    monkeypatch.setattr(org.tags, "topics_to_retag",
+                        lambda conn, cid, **kw: list(state["topics"]))
+    monkeypatch.setattr(org.tag_writes, "start_run",
+                        lambda conn, **kw: state["started"].append(kw) or {"id": "run-9"})
+    monkeypatch.setattr(org.tag_writes, "rollback_run",
+                        lambda conn, rid: state["rolled"].append(rid))
+    monkeypatch.setattr(org.retag_request, "emit",
+                        lambda s3, bucket, run_id, cid, topics, batch=0:
+                            state["emitted"].append({"run": run_id, "batch": batch,
+                                                     "n": len(topics)})
+                            or f"retag_requests/{run_id}/{batch:04d}.json")
+    monkeypatch.setattr(org, "s3", lambda: object())
+    return state
+
+
+def test_starting_a_retag_run_is_an_admin_action(retag_wired):
+    for role in ("pm", "site_manager", "worker"):
+        retag_wired["role"] = role
+        res = org.lambda_handler(make_event("POST", "/api/org/tags/retag", {}), None)
+        assert res["statusCode"] == 403, role
+    assert retag_wired["started"] == []
+
+
+def test_a_run_opens_and_emits_one_artifact_per_batch(retag_wired):
+    retag_wired["role"] = "admin"
+    retag_wired["topics"] = [{"id": f"t-{i}", "title": "T", "summary": "S"}
+                             for i in range(45)]
+    res = org.lambda_handler(make_event("POST", "/api/org/tags/retag", {}), None)
+    assert res["statusCode"] == 200, body_of(res)
+    assert retag_wired["started"][0]["method"] == "classifier"
+    assert [e["n"] for e in retag_wired["emitted"]] == [20, 20, 5]
+    assert body_of(res)["run"]["topics"] == 45
+
+
+def test_a_company_with_nothing_to_retag_opens_no_run(retag_wired):
+    """An empty run would sit at 'running' forever with nothing coming to
+    close it, and a run that never finishes reads like one still going."""
+    retag_wired["role"] = "admin"
+    retag_wired["topics"] = []
+    res = org.lambda_handler(make_event("POST", "/api/org/tags/retag", {}), None)
+    assert res["statusCode"] == 200
+    assert retag_wired["started"] == [] and retag_wired["emitted"] == []
+
+
+def test_undoing_a_run_is_also_an_admin_action(retag_wired):
+    retag_wired["role"] = "worker"
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/tags/retag/run-9/rollback", {}), None)
+    assert res["statusCode"] == 403
+    assert retag_wired["rolled"] == []
+
+
+def test_an_admin_can_undo_a_run_by_its_id(retag_wired):
+    retag_wired["role"] = "admin"
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/tags/retag/run-9/rollback", {}), None)
+    assert res["statusCode"] == 200
+    assert retag_wired["rolled"] == ["run-9"]

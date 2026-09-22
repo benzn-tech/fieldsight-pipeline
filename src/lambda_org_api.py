@@ -150,8 +150,10 @@ from repositories import (action_items, aliases, chunks, classification_feedback
                           programme_suggestions, programme_tasks, programme_window,
                           recordings, redactions, rollup, scope,
                           session_group,
-                          sites, tags, threads, topics, users, voice_messages,
+                          sites, tag_writes, tags, threads, topics, users,
+                          voice_messages,
                           voiceprints)
+import retag_request
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import diff_candidates, first_match_span, normalize, occurrences
 # Keyframe Q7 telemetry derivation (all AWS-free, pure helpers): the deleted
@@ -446,6 +448,11 @@ def dispatch(conn, event, method, route):
             return list_tags(conn, caller, event)
         if method == "POST":
             return create_tag(conn, caller, parse_body(event))
+    if route == "/tags/retag" and method == "POST":
+        return start_retag_run(conn, caller)
+    m_rb = re.match(r"^/tags/retag/([^/]+)/rollback$", route)
+    if m_rb and method == "POST":
+        return rollback_retag_run(conn, caller, m_rb.group(1))
     m_tag = re.match(r"^/tags/([^/]+)$", route)
     if m_tag and method == "PATCH":
         return patch_tag(conn, caller, m_tag.group(1), parse_body(event))
@@ -6485,6 +6492,65 @@ def patch_tag(conn, caller, tag_id, body):
     if row is None:
         return error("not found", 404)
     return ok({"tag": _tag_payload(row)})
+
+
+
+#: How many topics travel in one request artifact. 20 is what the bake-off
+#: measured: 127 prompt tokens and 8 completion tokens per item, 27-48 seconds
+#: per call. Bigger batches re-send the taxonomy less often but push a single
+#: call closer to the endpoint's ceiling; smaller ones pay for the taxonomy
+#: again every time.
+RETAG_BATCH = 20
+
+
+def start_retag_run(conn, caller):
+    """Open a re-tag run and hand its work to S3.
+
+    THIS FUNCTION CANNOT DO THE TAGGING and is not trying to. org-api is
+    in-VPC: it reaches Aurora and nothing else, because the VPC has an S3
+    gateway endpoint and no NAT. So it picks what to re-tag, opens the run,
+    writes one `retag_requests/` artifact per batch, and stops. The non-VPC
+    RetagFunction is triggered by those artifacts and invokes the in-VPC
+    writer back. Same three-hop shape the programme matcher already uses.
+
+    A COMPANY WITH NOTHING TO RE-TAG OPENS NO RUN. An empty run would sit at
+    'running' for ever with nothing coming to close it, and a run that never
+    finishes reads exactly like one still going.
+    """
+    if caller["global_role"] not in _TAG_COMPANY_ROLES:
+        return error("re-tagging requires admin or gm role", 403)
+
+    rows = tags.topics_to_retag(conn, caller["company_id"])
+    if not rows:
+        return ok({"run": None, "topics": 0,
+                   "message": "nothing to re-tag"})
+
+    run = tag_writes.start_run(conn, company_id=caller["company_id"],
+                               taxonomy_version=1, method="classifier",
+                               created_by=caller["id"])
+    batches = 0
+    for start in range(0, len(rows), RETAG_BATCH):
+        retag_request.emit(s3(), S3_BUCKET, run["id"], caller["company_id"],
+                           rows[start:start + RETAG_BATCH], batch=batches)
+        batches += 1
+    logger.info("retag: run %s opened over %d topic(s) in %d batch(es)",
+                run["id"], len(rows), batches)
+    return ok({"run": {"id": str(run["id"]), "topics": len(rows),
+                       "batches": batches}})
+
+
+def rollback_retag_run(conn, caller, run_id):
+    """Undo one batch of tagging. Removes what the RUN wrote and nothing else.
+
+    `rollback_run` bounds the delete on `source <> 'human'`: a person can
+    correct one row in the middle of a batch, and undoing the batch must leave
+    their correction standing. The run row is marked, never deleted -- "this
+    was rolled back" is the fact somebody will be looking for.
+    """
+    if caller["global_role"] not in _TAG_COMPANY_ROLES:
+        return error("undoing a re-tag run requires admin or gm role", 403)
+    tag_writes.rollback_run(conn, run_id)
+    return ok({"run_id": run_id, "status": "rolled_back"})
 
 
 # ----------------------------------------------------------
