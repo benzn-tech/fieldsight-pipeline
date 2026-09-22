@@ -1,0 +1,402 @@
+{
+ "bt-315fa11df6": {
+  "gold_index": 0,
+  "topic_id": "c4fa91b6-d222-4308-9e79-38d73686c5bf"
+ },
+ "bt-6bbf2851e1": {
+  "gold_index": 1,
+  "topic_id": "866dda0d-2c73-407f-b578-dc9b13ee06f1"
+ },
+ "bt-7ae3aa579c": {
+  "gold_index": 2,
+  "topic_id": "4cbf950d-3a84-4409-b488-d468292457e4"
+ },
+ "bt-ea1c858ad3": {
+  "gold_index": 3,
+  "topic_id": "26639d70-0859-42dd-8523-e279e3b212bc"
+ },
+ "bt-826463a030": {
+  "gold_index": 4,
+  "topic_id": "fcab95e9-9a41-4c07-8cf7-8c38b32d93ec"
+ },
+ "bt-d6459cbaee": {
+  "gold_index": 5,
+  "topic_id": "68bf50ea-3069-4814-9ef3-ea65fa21c2e9"
+ },
+ "bt-02ccd5cbc5": {
+  "gold_index": 6,
+  "topic_id": "4b4e6e3f-b199-4fdc-b147-3312be0b75dd"
+ },
+ "bt-7e5a2fccb0": {
+  "gold_index": 7,
+  "topic_id": "3eb877e7-fc12-49fb-ae75-7dd169f0430f"
+ },
+ "bt-54d71767b6": {
+  "gold_index": 8,
+  "topic_id": "9b1f39ff-071c-4704-bc69-cc55086ac52e"
+ },
+ "bt-bc69d21f06": {
+  "gold_index": 9,
+  "topic_id": "40a4250a-e0af-49f6-ae3b-34ba9a616a09"
+ },
+ "bt-2827f307bc": {
+  "gold_index": 10,
+  "topic_id": "dcea5358-fafd-4edc-abfb-6a8ec6cbd70b"
+ },
+ "bt-51ed6ce5cc": {
+  "gold_index": 11,
+  "topic_id": "ad419cdf-f5b0-4546-831e-c347406b1b24"
+ },
+ "bt-9f12b92b5d": {
+  "gold_index": 12,
+  "topic_id": "28239685-ab92-4c81-ae05-758597c34037"
+ },
+ "bt-d23af0a680": {
+  "gold_index": 13,
+  "topic_id": "740bb191-c12a-4dd5-b909-39016bebde95"
+ },
+ "bt-67d193fc17": {
+  "gold_index": 14,
+  "topic_id": "08ce55b3-b8f5-4d9a-8aeb-79728470a04c"
+ },
+ "bt-0b90eede2c": {
+  "gold_index": 15,
+  "topic_id": "b6fdffd6-b0d6-408b-bcfd-78ace0da0768"
+ },
+ "bt-b551a980ee": {
+  "gold_index": 16,
+  "topic_id": "d1d9b0cc-d8b3-4366-8bc7-9af2406432e0"
+ },
+ "bt-b5b166d5a6": {
+  "gold_index": 17,
+  "topic_id": "aec108c8-eecc-4bfc-8ef6-59c9093159b7"
+ },
+ "bt-45f1e61264": {
+  "gold_index": 18,
+  "topic_id": "4bf42fa9-6442-4998-ad2e-ef989a5c72b3"
+ },
+ "bt-4f9bbb35d9": {
+  "gold_index": 19,
+  "topic_id": "db61125f-c3c1-4b39-88a0-bea93343ee59"
+ },
+ "bt-ca82447243": {
+  "gold_index": 20,
+  "topic_id": "51217b5e-0973-4b58-b4e8-22982f817cf7"
+ },
+ "bt-b54ee5e9ff": {
+  "gold_index": 21,
+  "topic_id": "8d711411-b336-47b1-8129-6d56a782c43c"
+ },
+ "bt-254cecc8c6": {
+  "gold_index": 22,
+  "topic_id": "5c189ab4-957b-47f0-9931-a7c09cc82401"
+ },
+ "bt-342485ddda": {
+  "gold_index": 23,
+  "topic_id": "5796f7cb-46c7-43b0-a1fb-fe7422a7f875"
+ },
+ "bt-9cf41beca1": {
+  "gold_index": 24,
+  "topic_id": "86b51ecb-dd62-4edc-a685-a2e613482416"
+ },
+ "bt-4f069e1252": {
+  "gold_index": 25,
+  "topic_id": "10db3d41-1cac-4b26-8103-cea6e9052262"
+ },
+ "bt-9385670429": {
+  "gold_index": 26,
+  "topic_id": "c86e1443-f7fa-4776-a23b-7743eb3c6d54"
+ },
+ "bt-794be9155e": {
+  "gold_index": 27,
+  "topic_id": "3ea7e690-0285-4b56-9cc8-85b0be227409"
+ },
+ "bt-a572ff4764": {
+  "gold_index": 28,
+  "topic_id": "c7f8f7d9-ce7c-44d4-8cec-0c282a832b11"
+ },
+ "bt-3752e6f35f": {
+  "gold_index": 29,
+  "topic_id": "bc7a1849-4faa-4f88-8197-442b314d40a7"
+ },
+ "bt-33b10424b2": {
+  "gold_index": 30,
+  "topic_id": "3ed4a585-f23f-4c7b-aa0d-10d630588fb9"
+ },
+ "bt-39c53f4e07": {
+  "gold_index": 31,
+  "topic_id": "1e204adb-1221-4478-8dd3-830019da3e4a"
+ },
+ "bt-05f50bea48": {
+  "gold_index": 32,
+  "topic_id": "dacace7f-c3c3-4a8e-a118-99ffc8d26907"
+ },
+ "bt-c0d6d405be": {
+  "gold_index": 33,
+  "topic_id": "d83eeb91-feb0-42c6-a13b-92695654d72c"
+ },
+ "bt-e634d6881b": {
+  "gold_index": 34,
+  "topic_id": "3dab1370-2a63-4a54-aaa9-7cdb4098c371"
+ },
+ "bt-a174758f62": {
+  "gold_index": 35,
+  "topic_id": "75704c40-8ed8-4a9a-ad0a-294627948067"
+ },
+ "bt-6bc3d54159": {
+  "gold_index": 36,
+  "topic_id": "84d0f999-ce6c-47ef-b558-463079dcda96"
+ },
+ "bt-298cc25cb0": {
+  "gold_index": 37,
+  "topic_id": "38522b22-2f80-4c37-be73-e3eb57f4e161"
+ },
+ "bt-ce686c2933": {
+  "gold_index": 38,
+  "topic_id": "85bccc86-7416-492c-92d2-a49e03dc9a8a"
+ },
+ "bt-7525134f0b": {
+  "gold_index": 39,
+  "topic_id": "7477fb2d-c53e-4d60-9c79-79fa58d02fa7"
+ },
+ "bt-831ab60e47": {
+  "gold_index": 40,
+  "topic_id": "5c50cdfd-9000-44e0-83f2-58c2bed799c7"
+ },
+ "bt-1bfb48fabe": {
+  "gold_index": 41,
+  "topic_id": "06eb8ae4-0a0f-4430-8f76-ff6123d8290f"
+ },
+ "bt-4d5f19b596": {
+  "gold_index": 42,
+  "topic_id": "b82d565a-8ffe-4605-8fd1-fc8fdd65c1c1"
+ },
+ "bt-06ae4de71d": {
+  "gold_index": 43,
+  "topic_id": "930f444e-a0a6-43a8-b7aa-29354eabe3be"
+ },
+ "bt-1f1e305e54": {
+  "gold_index": 44,
+  "topic_id": "758a8c64-55de-4a4e-89f1-761af8a20c44"
+ },
+ "bt-03bcc2d79e": {
+  "gold_index": 45,
+  "topic_id": "5764c827-877a-4eae-a5e7-1f394aed322d"
+ },
+ "bt-23980d9019": {
+  "gold_index": 46,
+  "topic_id": "49c1582f-192f-4d56-be0a-850eb07bcc6b"
+ },
+ "bt-a82b4aa2f1": {
+  "gold_index": 47,
+  "topic_id": "e2e87b81-69c0-45e7-b9b3-6efd748c30bd"
+ },
+ "bt-e85227d3d0": {
+  "gold_index": 48,
+  "topic_id": "0125ef0d-c102-48bf-bd3c-81b24b60d19a"
+ },
+ "bt-afd97ea71c": {
+  "gold_index": 49,
+  "topic_id": "e8017734-9bed-44ff-b45d-f186a57a5987"
+ },
+ "bt-d01087d961": {
+  "gold_index": 50,
+  "topic_id": "bef62312-3e2d-4159-868d-0ff641e3cbf8"
+ },
+ "bt-68fb8e603b": {
+  "gold_index": 51,
+  "topic_id": "ab4c41e3-8f8b-48c3-9c60-170740c92e41"
+ },
+ "bt-6d40b8d576": {
+  "gold_index": 52,
+  "topic_id": "2e759a7a-9380-4dd6-898c-f2466207694c"
+ },
+ "bt-96a41eb2e0": {
+  "gold_index": 53,
+  "topic_id": "9b206ee1-e4c4-4d78-98c3-2dc95aacd3b0"
+ },
+ "bt-7ce1b083cd": {
+  "gold_index": 54,
+  "topic_id": "b1872f2e-d126-4be7-9eab-26364f942bbf"
+ },
+ "bt-24330214dd": {
+  "gold_index": 55,
+  "topic_id": "845437b3-f879-4884-a6e1-70b25fb3061b"
+ },
+ "bt-fe57a8b8de": {
+  "gold_index": 56,
+  "topic_id": "35660a39-cde2-4001-8f8b-35753912fa92"
+ },
+ "bt-d61bf811ad": {
+  "gold_index": 57,
+  "topic_id": "ad2c7fb5-05d6-4576-9f00-c4928d929b7f"
+ },
+ "bt-dd9d641299": {
+  "gold_index": 58,
+  "topic_id": "62fd3501-5d06-4e36-94ab-f8ef3c7bf385"
+ },
+ "bt-60ae7d70fc": {
+  "gold_index": 59,
+  "topic_id": "3073ce47-c9d8-457a-8cdb-65ae94deb122"
+ },
+ "bt-7a7afc1719": {
+  "gold_index": 60,
+  "topic_id": "53dd0c83-84e3-4c23-b933-8de447b006b5"
+ },
+ "bt-f5b44de2a1": {
+  "gold_index": 61,
+  "topic_id": "0b67b087-a57d-4318-b26c-6f981124c258"
+ },
+ "bt-94844ce09a": {
+  "gold_index": 62,
+  "topic_id": "6fa873ca-bbd0-4ff6-a3da-f97ab9ca5387"
+ },
+ "bt-13b7669d49": {
+  "gold_index": 63,
+  "topic_id": "c906a383-49b7-4362-81ce-e64a89b3000c"
+ },
+ "bt-fcaac733b1": {
+  "gold_index": 64,
+  "topic_id": "4b5f1601-3e68-4beb-8c56-4d012f2d182f"
+ },
+ "bt-ea5279f66b": {
+  "gold_index": 65,
+  "topic_id": "14101b83-dc4f-4848-bddc-c6bb991d5509"
+ },
+ "bt-341f933822": {
+  "gold_index": 66,
+  "topic_id": "6bca0eec-3a9d-4307-b387-3d3f56cbec09"
+ },
+ "bt-c16b377afd": {
+  "gold_index": 67,
+  "topic_id": "b6bcbcc4-8248-4ac4-aff5-e6f3e910be6f"
+ },
+ "bt-2167c6874d": {
+  "gold_index": 68,
+  "topic_id": "da45d9de-7d2e-434c-9c6e-eaa89b852fd1"
+ },
+ "bt-c0eff563ae": {
+  "gold_index": 69,
+  "topic_id": "b2e842e3-7812-438e-a1b3-9d2ac0a53400"
+ },
+ "bt-a426dfd5f4": {
+  "gold_index": 70,
+  "topic_id": "87b67561-dd0a-4a0e-913d-633720464c89"
+ },
+ "bt-364a17e5a3": {
+  "gold_index": 71,
+  "topic_id": "f0c30d89-474e-4ade-b3ba-b01c5d888da2"
+ },
+ "bt-7733062ff2": {
+  "gold_index": 72,
+  "topic_id": "fb547a15-1f0c-4553-a2b4-19a6c268930d"
+ },
+ "bt-ae4161e953": {
+  "gold_index": 73,
+  "topic_id": "ee4c96d9-41c1-4f21-ae3c-6d0b96731cef"
+ },
+ "bt-c6ec3d5221": {
+  "gold_index": 74,
+  "topic_id": "054fdb9d-2136-4869-80c1-5546142d478f"
+ },
+ "bt-d4d6a45b4d": {
+  "gold_index": 75,
+  "topic_id": "ab78051f-0996-4a12-8bea-c749dafdb95a"
+ },
+ "bt-bd6a2dee95": {
+  "gold_index": 76,
+  "topic_id": "a77587ad-a17b-414c-b80e-d8ec61676a61"
+ },
+ "bt-4c4c4f2369": {
+  "gold_index": 77,
+  "topic_id": "28bc106a-1e9e-45e2-9542-df171c4842cc"
+ },
+ "bt-45d81e775a": {
+  "gold_index": 78,
+  "topic_id": "e03ec45e-5f0a-4e4f-af2b-3c263061c21b"
+ },
+ "bt-65677ec97c": {
+  "gold_index": 79,
+  "topic_id": "d5c1dd61-6430-48a0-8433-5214391d9e59"
+ },
+ "bt-2704fcf510": {
+  "gold_index": 80,
+  "topic_id": "da6536e4-f7ba-4b75-98d0-9615cb514025"
+ },
+ "bt-8a460a5cce": {
+  "gold_index": 81,
+  "topic_id": "7a6542f9-1d9c-431f-b302-a6baec945107"
+ },
+ "bt-043f90f087": {
+  "gold_index": 82,
+  "topic_id": "f661cff6-8ab8-4b7c-b3e9-40aef33083d8"
+ },
+ "bt-e2ec52f5f1": {
+  "gold_index": 83,
+  "topic_id": "3e660b99-a834-400c-83bb-00c0919e1d87"
+ },
+ "bt-c4577c40c9": {
+  "gold_index": 84,
+  "topic_id": "899ff845-98e5-4130-9a8d-9d780383eeae"
+ },
+ "bt-c2d850475c": {
+  "gold_index": 85,
+  "topic_id": "67b3efff-6ee2-47b3-92dd-1bbcd8f6c79e"
+ },
+ "bt-3757a2eec0": {
+  "gold_index": 86,
+  "topic_id": "4fda772c-f40d-4a36-9003-830b4012d3cd"
+ },
+ "bt-15c0151813": {
+  "gold_index": 87,
+  "topic_id": "061d8556-4b70-403f-ab0e-abc09cc5b7f4"
+ },
+ "bt-cfa3be5206": {
+  "gold_index": 88,
+  "topic_id": "c0b3bf91-3c1b-47e1-aaa9-09724134288c"
+ },
+ "bt-e4e04e5dc3": {
+  "gold_index": 89,
+  "topic_id": "1570bc27-e32e-4c5b-aa32-6aae432852d4"
+ },
+ "bt-4ac7642edf": {
+  "gold_index": 90,
+  "topic_id": "0e1dcb62-cb44-4f0f-80a8-90b8bc0ca6d1"
+ },
+ "bt-e05087c2be": {
+  "gold_index": 91,
+  "topic_id": "f00ec078-845c-4d08-8836-be9978c561ae"
+ },
+ "bt-129ba83728": {
+  "gold_index": 92,
+  "topic_id": "cca99530-1373-4f3d-a3b7-b1bb41667141"
+ },
+ "bt-fb2da8fbfc": {
+  "gold_index": 93,
+  "topic_id": "bfec0676-c034-47a6-8044-ddade2765cf0"
+ },
+ "bt-8e6fda045f": {
+  "gold_index": 94,
+  "topic_id": "dd8cf5e7-2d32-4e2a-b300-9822665f9393"
+ },
+ "bt-c14c7b482e": {
+  "gold_index": 95,
+  "topic_id": "539146ad-fb98-4ace-b27d-670b29c4afb0"
+ },
+ "bt-b449f2e9ae": {
+  "gold_index": 96,
+  "topic_id": "13b76e8f-d765-444d-8ded-7cd39cedea54"
+ },
+ "bt-7914c21253": {
+  "gold_index": 97,
+  "topic_id": "c8c98d66-016f-49a6-ab08-5dc22c6a5995"
+ },
+ "bt-feeb390a50": {
+  "gold_index": 98,
+  "topic_id": "561bf05c-1a67-44d2-8ce2-99ccb9a41434"
+ },
+ "bt-c0ef52e883": {
+  "gold_index": 99,
+  "topic_id": "3f92dc20-1806-447b-9f38-18de13c318ef"
+ }
+}
