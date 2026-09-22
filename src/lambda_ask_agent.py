@@ -1013,6 +1013,29 @@ def _citation_time_start(c):
     return span.split("–", 1)[0].strip() or None
 
 
+def _build_citations(chunks):
+    """Same fields, same order, for both the grounded path and the web-branch
+    record block below -- one definition so the two can never drift apart.
+    CONTRACT for the grounded caller: citations MUST stay in the same order
+    as the prompt's [n] excerpt numbering (enumerate(chunks, start=1)) so the
+    UI can map card [i+1] <-> inline [n] positionally. The web-branch caller
+    has no such [n] prompt numbering to stay aligned with -- see the comment
+    at its call site for why that matters."""
+    return [
+        {
+            "source_s3_key": c.get("source_s3_key"),
+            "report_date": str(c.get("report_date", "") or ""),
+            "site_name": c.get("site_name"),
+            "site_slug": c.get("site_slug"),  # project slug for citation-click selector sync (联动)
+            "topic_title": c.get("topic_title"),
+            "chunk_type": c.get("chunk_type"),
+            "snippet": (c.get("chunk_text") or "")[:200],
+            "time_start": _citation_time_start(c),
+        }
+        for c in chunks
+    ]
+
+
 def _parse_now(raw):
     """An ISO instant, or None. Never raises: a malformed one falls back to the
     real clock rather than failing an answer over a debugging field."""
@@ -1675,12 +1698,33 @@ def _rag_answer(body):
             web = web_answer.answer(question, chunks, skip_verdict=_skip,
                                     verdict_question=asked)
         if web is not None and web.get("answer"):
-            # Its own block, never merged into the grounded answer. A reader who
-            # cannot tell what came from their meetings from what came off the
-            # internet has no reason to suspect they need to check.
+            # Union, not either/or (spec 2026-09-22): the verdict said the
+            # records could not fully answer this, but the excerpts retrieval
+            # already paid for are still often useful, so they travel with
+            # the web answer instead of being thrown away. `citations` here
+            # are the SAME chunks the verdict was given, built the same way
+            # as the grounded path (_build_citations) -- but this is not a
+            # grounded answer's source list.
+            #
+            # THE HAZARD (do not remove this without re-reading it): the web
+            # prose in `web["answer"]` carries its OWN inline [1]/[2]/...
+            # markers pointing at WEB sources -- see web_answer.answer. The
+            # grounded path's `citations` carry a CONTRACT (above, at the
+            # list comprehension this shares via _build_citations) that card
+            # [i+1] maps positionally to an inline [n] IN THIS SAME ANSWER
+            # TEXT. Neither is true here: these cards are not numbered
+            # references inside `web["answer"]`, they are a separate "what we
+            # found in your records" block. `grounded` stays False and `web`
+            # stays its own block for exactly this reason -- the UI must key
+            # its rendering off `from_web`, never merge this list into the
+            # web answer's own source list, and never label it as if [n] in
+            # the prose points into it. A reader who cannot tell what came
+            # from their meetings from what came off the internet has no
+            # reason to suspect they need to check -- that principle survives
+            # this change; only "the records are silently discarded" does not.
             return {
                 "answer": web["answer"],
-                "citations": [],
+                "citations": _build_citations(chunks),
                 "grounded": False,
                 "from_web": True,
                 "web": web,
@@ -1798,20 +1842,8 @@ def _rag_answer(body):
         # CONTRACT: citations MUST stay in the same order as the prompt's [n]
         # excerpt numbering above (enumerate(chunks, start=1)) so the UI can
         # map card [i+1] <-> inline [n] positionally. Do not filter/dedupe/
-        # reorder here without also renumbering the prompt.
-        citations = [
-            {
-                "source_s3_key": c.get("source_s3_key"),
-                "report_date": str(c.get("report_date", "") or ""),
-                "site_name": c.get("site_name"),
-                "site_slug": c.get("site_slug"),  # project slug for citation-click selector sync (联动)
-                "topic_title": c.get("topic_title"),
-                "chunk_type": c.get("chunk_type"),
-                "snippet": (c.get("chunk_text") or "")[:200],
-                "time_start": _citation_time_start(c),
-            }
-            for c in chunks
-        ]
+        # reorder here without also renumbering the prompt. See _build_citations.
+        citations = _build_citations(chunks)
 
         return {
             "answer": answer,
