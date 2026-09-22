@@ -108,6 +108,22 @@ STAGE = os.environ.get("STAGE", "prod")
 # equal intervals mean the idle timer never expires and the cluster never sleeps.
 # Pinned by tests/unit/test_sweep_cadence_vs_autopause.py.
 SAFETY_SWEEP_MINUTE = int(os.environ.get("SAFETY_SWEEP_MINUTE", "7"))
+# Weekday pre-warm, NZ LOCAL time (see _is_prewarm_minute). Deliberately NOT
+# environment-driven: an env knob is only real when the variable, the template
+# Parameter and the workflow override all exist, and a half-wired one silently
+# serves the default while reading as configurable. This is a product decision
+# about when people start work, so it lives in code where a change is a
+# reviewable one-line diff. Both stages run the same constant, which is what
+# keeps their two wakes on the same minute of the same shared cluster.
+PREWARM_NZ_HOUR = 6
+# TWO minutes, not one. `rate(1 minute)` is "about every 60 seconds", not a
+# wall-clock alignment: ticks drift, and a tick at :44:59 followed by one at
+# :46:01 would skip minute 45 entirely. For the hourly safety pass a miss costs
+# an hour's delay and is documented as acceptable; for the pre-warm a miss
+# costs exactly the Monday-morning failure this exists to prevent. A second
+# minute removes that, and costs nothing: two connections 60 seconds apart wake
+# the cluster once.
+PREWARM_NZ_MINUTES = (45, 46)
 
 
 def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_rolling,
@@ -887,6 +903,41 @@ def _is_safety_minute(now) -> bool:
     return now.minute == SAFETY_SWEEP_MINUTE
 
 
+def _is_prewarm_minute(now) -> bool:
+    """Is this the tick that wakes the cluster BEFORE the first person arrives?
+
+    Once SWEEP_REQUIRE_PENDING is on in prod the cluster sleeps at night and at
+    weekends, and a resume after a long pause can take longer than API
+    Gateway's 29s ceiling -- so the first request of a quiet Monday can fail
+    while nothing is wrong. Connecting once on a weekday morning moves that
+    resume to a time when nobody is looking at it.
+
+    NZ LOCAL TIME, via nz_time, never a hardcoded UTC hour: New Zealand is
+    UTC+12 for half the year and UTC+13 for the other half, so a fixed UTC cron
+    drifts an hour at each switch and would land at 05:45 or 07:45 depending on
+    the season. `nz_time` is the same rule the org-api calendar uses.
+
+    Same reasoning as _is_safety_minute for why this is a wall-clock test and
+    not a second EventBridge rule: a `rate()` rule's phase is fixed by whenever
+    it was created, the two stacks deploy separately, and two unaligned
+    unconditional wakes halve the effective idle window -- the mistake that
+    made the first version of this work save exactly nothing.
+
+    Cost: one extra wake per weekday. Break-even for this cluster is 40-60
+    wakes/day, so it is not material -- but that is a measured comparison, not
+    a shrug.
+    """
+    local = nz_time.to_nz(now)
+    if local is None:
+        return False
+    # Monday..Friday only. A Saturday resume costs a wake that nobody needed;
+    # anyone working at the weekend meets the same slow first request they
+    # would have met anyway, which is the trade the owner accepted.
+    if local.weekday() >= 5:
+        return False
+    return local.hour == PREWARM_NZ_HOUR and local.minute in PREWARM_NZ_MINUTES
+
+
 def lambda_handler(event, context):
     """Scheduled (~1 min) grace sweep + reconcile — see the module docstring. Opens an
     in-VPC Aurora connection, finalizes every due session, and moves already-sent
@@ -901,7 +952,16 @@ def lambda_handler(event, context):
 
     from db.connection import get_connection
 
-    safety_pass = _is_safety_minute(datetime.now(timezone.utc))
+    now = datetime.now(timezone.utc)
+    prewarm = _is_prewarm_minute(now)
+    safety_pass = _is_safety_minute(now) or prewarm
+    if prewarm:
+        # Logged for the same reason the skip below is: a decision nobody can
+        # see is a decision nobody can show ran. This one line is how the
+        # weekday pre-warm gets verified on prod without guessing from the
+        # capacity graph.
+        logger.info("finalize sweep: pre-warm connect (weekday %02d:%02d NZ)",
+                    PREWARM_NZ_HOUR, PREWARM_NZ_MINUTES[0])
     if SWEEP_REQUIRE_PENDING and not safety_pass:
         if not sweep_state.is_pending(STAGE):
             # Must be logged: without this line there is no way to verify the
