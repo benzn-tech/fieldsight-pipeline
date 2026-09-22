@@ -1544,7 +1544,7 @@ def session_report_generate(conn, caller, session_id, event):
     if err is not None:
         return err
 
-    generate, gen_error = _generation_request(body, deliver)
+    generate, gen_error = _generation_request(body, deliver, conn, caller)
     if gen_error:
         return error(gen_error, 400)
 
@@ -1656,10 +1656,28 @@ def _assemble_day_report(conn, caller, date, event, selected=None):
     }, None
 
 
-def _generation_request(body, deliver=None):
-    """The template a report is written to, validated here so a bad name fails the
-    request instead of the worker -- the caller is still on the line at this point.
-    Absent template = today's assembled report (spec 2026-09-15 §5.3).
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def _generation_request(body, deliver=None, conn=None, caller=None):
+    """The template a report is written to, resolved and validated here so a bad
+    name fails the request instead of the worker -- the caller is still on the
+    line at this point. Absent template = today's assembled report
+    (spec 2026-09-15 SS5.3).
+
+    TWO KINDS OF TEMPLATE, ONE ANSWER. A slug names a template that ships as a
+    file in this repo; a uuid names one a company wrote in the Library
+    (migration 0062). Both end up as the same body, because report_template's
+    file format IS the Library's body format -- that was the point of choosing
+    it.
+
+    THE BODY TRAVELS WITH THE REQUEST. lambda_session_report is non-VPC and
+    cannot reach Aurora, so a stored template has to be resolved HERE, in the
+    VPC, and written into the artifact. That is not a workaround: it also means
+    the artifact records the exact text the document was written to, so
+    "which template wrote this" stays answerable after the template is edited.
+    The file-backed templates are inlined the same way, so the worker has ONE
+    way of getting a body rather than two.
 
     `deliver` (optional): the worker's generate branch never emails -- it always
     writes `emailed: false` -- so a request that names a template AND asks for
@@ -1670,15 +1688,44 @@ def _generation_request(body, deliver=None):
         return None, None
     if deliver == "email":
         return None, "a generated report can only be downloaded for now"
+
+    if _UUID_RE.match(str(template_id)):
+        if conn is None or caller is None:
+            # Never fall back to the file templates on a uuid: a uuid that
+            # cannot be resolved is a stored template this caller may not see
+            # or that does not exist, and quietly writing the report to some
+            # other template would make the name in the artifact a lie.
+            return None, "no such template: %s" % template_id
+        tpl = report_templates.get_visible(conn, caller["company_id"], caller["id"], template_id)
+        if tpl is None:
+            return None, "no such template: %s" % template_id
+        raw_version = (body or {}).get("templateVersion")
+        if raw_version is None:
+            version = tpl["current_version"]
+        else:
+            try:
+                version = int(raw_version)
+            except (TypeError, ValueError):
+                return None, "templateVersion must be a number"
+        if version < 1:
+            return None, "that template has no content yet"
+        stored = report_templates.get_version(conn, template_id, version)
+        if stored is None:
+            return None, "no such template: %s v%s" % (template_id, version)
+        return {"templateId": str(template_id), "templateVersion": version,
+                "templateName": tpl["name"], "templateBody": stored["body"]}, None
+
     try:
         version = int((body or {}).get("templateVersion"))
     except (TypeError, ValueError):
         return None, "templateVersion must be a number"
     try:
-        report_template.load_template(template_id, version)
+        loaded = report_template.load_template(template_id, version)
     except report_template.TemplateNotFound:
         return None, "no such template: %s v%s" % (template_id, version)
-    return {"templateId": template_id, "templateVersion": version}, None
+    return {"templateId": template_id, "templateVersion": version,
+            "templateName": loaded.get("name") or template_id,
+            "templateBody": loaded}, None
 
 
 def _excluded_topics_for(conn, caller, folder, date, session_id=None):
@@ -1767,7 +1814,7 @@ def day_report_generate(conn, caller, date, event):
     if err is not None:
         return err
 
-    generate, gen_error = _generation_request(body, deliver)
+    generate, gen_error = _generation_request(body, deliver, conn, caller)
     if gen_error:
         return error(gen_error, 400)
 
