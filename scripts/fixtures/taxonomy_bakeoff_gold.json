@@ -1,0 +1,859 @@
+[
+ {
+  "i": 0,
+  "id": "c4fa91b6-d222-4308-9e79-38d73686c5bf",
+  "title": "Concrete Pour Dates & Upcoming Schedule",
+  "summary": "Reviewed upcoming concrete pour dates, with a backup pour on the 16th and Zone 1 slab pour on the 30th. Consultant inspections with Margot moved to the 8th. Tank deliveries (11s) are delayed. Scaffold will be progressively moved between zones.",
+  "gold": [
+   "programme.delivery-and-materials",
+   "programme.schedule",
+   "structure.concrete"
+  ]
+ },
+ {
+  "i": 1,
+  "id": "866dda0d-2c73-407f-b578-dc9b13ee06f1",
+  "title": "Voiceprint Recording System Test",
+  "summary": "Ben records a short audio clip to test and register his voiceprint for the site documentation system. The objective is to improve speaker identification accuracy in future transcripts and replace generic speaker labels.",
+  "gold": []
+ },
+ {
+  "i": 2,
+  "id": "4cbf950d-3a84-4409-b488-d468292457e4",
+  "title": "Building 3 Completion Status",
+  "summary": "Brief check on Building 3 (Learning Hub 3) status with confirmation that splash backs are installed and only minor bits and pieces remain to be completed.",
+  "gold": [
+   "finishes.fixtures-and-fittings",
+   "programme.schedule"
+  ]
+ },
+ {
+  "i": 3,
+  "id": "26639d70-0859-42dd-8523-e279e3b212bc",
+  "title": "Cell Phone Apps Review",
+  "summary": "Speaker needs to look through 66 apps inside a cell phone as a follow-up item.",
+  "gold": []
+ },
+ {
+  "i": 4,
+  "id": "fcab95e9-9a41-4c07-8cf7-8c38b32d93ec",
+  "title": "Inaudible Recording With Water Flow Sound",
+  "summary": "The sole recording from the session contained no speech and consisted only of water flowing background noise. No work activities, locations, decisions, or outcomes were described. No further documentation could be extracted from the audio.",
+  "gold": []
+ },
+ {
+  "i": 5,
+  "id": "68bf50ea-3069-4814-9ef3-ea65fa21c2e9",
+  "title": "Site visit and FJS scan",
+  "summary": "计划周三与杨志前往一个 site 进行接触和沟通，并提及了名为 FJS 的扫描工作。",
+  "gold": []
+ },
+ {
+  "i": 6,
+  "id": "4b4e6e3f-b199-4fdc-b147-3312be0b75dd",
+  "title": "Press Conference Banter",
+  "summary": "Speaker discusses a recent press conference that had no questions and mentions being scared of seeing someone. This is casual, non-work conversation.",
+  "gold": []
+ },
+ {
+  "i": 7,
+  "id": "3eb877e7-fc12-49fb-ae75-7dd169f0430f",
+  "title": "Floor Box Leveling and Materials Storage",
+  "summary": "Follow-up discussion with Dave and flooring contractors about floor box leveling issues. Flooring team confirmed for tomorrow to feather out uneven areas around floor boxes. Concrete bags discussed - two bags in senior area, concern raised about concrete bags left in black ute with rain forecast tomorrow creating risk of bags hardening.",
+  "gold": [
+   "electrical.power",
+   "finishes.floor-finish",
+   "programme.delivery-and-materials"
+  ]
+ },
+ {
+  "i": 8,
+  "id": "9b1f39ff-071c-4704-bc69-cc55086ac52e",
+  "title": "Shelf Brackets Installation",
+  "summary": "It is identified that a specific shelf requires two additional brackets for support. A measurement of 0.5 meters is also noted during the observation.",
+  "gold": [
+   "finishes.fixtures-and-fittings"
+  ]
+ },
+ {
+  "i": 9,
+  "id": "40a4250a-e0af-49f6-ae3b-34ba9a616a09",
+  "title": "Recording Device Testing",
+  "summary": "James tested the audio recording device, confirming the clarity of the recording and verifying the press-and-hold function to finish the recording.",
+  "gold": []
+ },
+ {
+  "i": 10,
+  "id": "dcea5358-fafd-4edc-abfb-6a8ec6cbd70b",
+  "title": "Kitchenette Reinstatement and 3D Scanning",
+  "summary": "Reviewed the planned removal and subsequent reinstatement of a kitchenette area. Discussed the ongoing 3D scanning of the entire building open space to capture detailed point data for the design team's use.",
+  "gold": [
+   "architecture.joinery",
+   "quality.as-built"
+  ]
+ },
+ {
+  "i": 11,
+  "id": "ad419cdf-f5b0-4546-831e-c347406b1b24",
+  "title": "Design Workshops and Steel Scope",
+  "summary": "Tuesday design workshops clearing roadblocks with Max driving. Waterproof heavy dwang detail and plumbing RFI near close. Ignite joinery engagement deferred, Cook Brothers benchmark used. Structural extra weight confirmed by Margaret but left open; more factory scope offered to Hector Egan.",
+  "gold": [
+   "envelope.waterproofing",
+   "mechanical.plumbing",
+   "structure.steelwork"
+  ]
+ },
+ {
+  "i": 12,
+  "id": "28239685-ab92-4c81-ae05-758597c34037",
+  "title": "Catch-up with Brad OpenSpace Platform Introduction",
+  "summary": "Ben plans to schedule a catch-up with Brad this week or next week to introduce the OpenSpace platform and 360-camera capture capability for the Heless Fram project (or similar site). The goal is to demonstrate how OpenSpace can be used for site documentation and walkthroughs.",
+  "gold": []
+ },
+ {
+  "i": 13,
+  "id": "740bb191-c12a-4dd5-b909-39016bebde95",
+  "title": "Edit Log and Audit Trail",
+  "summary": "John asked about an edit log for transcript corrections and a track record for deliberate changes. The team confirmed all history and versions are stored in the background with Procore-like activity history, but not shown to site managers, only to admin/GM level. Reliability was stressed because decisions such as two meters versus one meter can become a cost.",
+  "gold": []
+ },
+ {
+  "i": 14,
+  "id": "08ce55b3-b8f5-4d9a-8aeb-79728470a04c",
+  "title": "System Test Hypothetical Example",
+  "summary": "Ben provides a hypothetical example about Daniel having questions regarding drawings to illustrate how the voice recording system works. He clarifies that this is not a real task and no action is required.",
+  "gold": []
+ },
+ {
+  "i": 15,
+  "id": "b6fdffd6-b0d6-408b-bcfd-78ace0da0768",
+  "title": "Plywood Wall Bracing Specifications Review",
+  "summary": "Detailed review of plywood bracing specifications for wall assembly. Confirmed requirement for 7mm ply bracing to walls with 3.5mm long firm structural nails as per plans. Reviewed drawings to locate nail pattern specifications. Discussion about timing of ply installation before walls go up. Plans checked to verify one-sided bracing requirement.",
+  "gold": [
+   "architecture.walls",
+   "structure.framing"
+  ]
+ },
+ {
+  "i": 16,
+  "id": "d1d9b0cc-d8b3-4366-8bc7-9af2406432e0",
+  "title": "Worker Health and Door Installation Quality",
+  "summary": "Casual discussion about worker pain management and medication. Positive feedback given on door installation quality. Discussion about site instructions and whether work is being paid per square meter. Comments on effort required for the door installation work.",
+  "gold": [
+   "architecture.windows-and-doors",
+   "commercial.cost-and-pricing"
+  ]
+ },
+ {
+  "i": 17,
+  "id": "aec108c8-eecc-4bfc-8ef6-59c9093159b7",
+  "title": "Level One Kitchenette Scope",
+  "summary": "A decision was made not to reinstate the kitchenette on level one. The client has confirmed in writing that the kitchenette is out of scope, so the area will be left as is and the item closed.",
+  "gold": [
+   "architecture.joinery",
+   "commercial.contract-and-scope"
+  ]
+ },
+ {
+  "i": 18,
+  "id": "4bf42fa9-6442-4998-ad2e-ef989a5c72b3",
+  "title": "Staffing Model and Succession Planning",
+  "summary": "Evaluated the head chef, Greg, as a potential venue operator despite his reluctance to stay in the kitchen long-term. Discussed the successful staffing model of hiring local year 12/13 students and the high retention rate compared to industry norms.",
+  "gold": []
+ },
+ {
+  "i": 19,
+  "id": "db61125f-c3c1-4b39-88a0-bea93343ee59",
+  "title": "Scaffolders Contract Status",
+  "summary": "The scaffolders are not yet on contract. Jesse will add them to the tracking system and assign Daniel to follow up and resolve the contract status.",
+  "gold": [
+   "commercial.contract-and-scope",
+   "sitework.temporary-works"
+  ]
+ },
+ {
+  "i": 20,
+  "id": "51217b5e-0973-4b58-b4e8-22982f817cf7",
+  "title": "Unintelligible Recording Segment",
+  "summary": "The recorded session contains a single utterance consisting only of the word 'Oh' from speaker spk_0. No meaningful content, context, or operational information can be extracted from this segment. No topics, actions, findings, decisions, or questions can be identified. The session provides no usable field data.",
+  "gold": []
+ },
+ {
+  "i": 21,
+  "id": "8d711411-b336-47b1-8129-6d56a782c43c",
+  "title": "Site Delineation and Access Requirements",
+  "summary": "Site manager emphasized need for delineation matting around doors and proper walkway installation. Repeated weekly reminders about site access requirements and protecting finished paving. Specification for one delineation mat per building with clear walkway access.",
+  "gold": [
+   "programme.access-and-sequencing",
+   "sitework.paving"
+  ]
+ },
+ {
+  "i": 22,
+  "id": "5c189ab4-957b-47f0-9931-a7c09cc82401",
+  "title": "Work Stoppage -- Rain",
+  "summary": "The speaker observes that it has started raining and states they are leaving the area. This indicates a temporary halt or departure due to adverse weather conditions.",
+  "gold": [
+   "programme.delay-and-disruption"
+  ]
+ },
+ {
+  "i": 23,
+  "id": "5796f7cb-46c7-43b0-a1fb-fe7422a7f875",
+  "title": "Unclear Conversation Fragment",
+  "summary": "The transcript consists of a single incomplete sentence fragment without any clear context, subject, or actionable information.",
+  "gold": []
+ },
+ {
+  "i": 24,
+  "id": "86b51ecb-dd62-4edc-a685-a2e613482416",
+  "title": "Dust Control and Work Area Management",
+  "summary": "Site manager instructed worker JR to vacuum dust after sanding operations and properly cover work areas. Load of dust observed on finished carpet requiring immediate attention and proper work area protection protocols.",
+  "gold": [
+   "finishes.floor-finish",
+   "quality.defect"
+  ]
+ },
+ {
+  "i": 25,
+  "id": "10db3d41-1cac-4b26-8103-cea6e9052262",
+  "title": "Emergency evacuation drill",
+  "summary": "Held evacuation at lunch area not usual site muster as crews on lunch, 7 falsework guys plus others. Connor raised non-sign-in personnel. Ben noted main outcome empty site matters. To reference in SafeBase HSE Level 1 fire competency. Tremors felt 2-3 times overnight.",
+  "gold": [
+   "safety.induction"
+  ]
+ },
+ {
+  "i": 26,
+  "id": "c86e1443-f7fa-4776-a23b-7743eb3c6d54",
+  "title": "Electrical Work and Floor Box Installation Coordination",
+  "summary": "Discussion of remaining floor box installations with 44 boxes remaining plus carpet work. Coordination for Building 2 readiness on Wednesday. Electrical team confirmed to have completed diving work and removed equipment. Carpet work scheduled to begin in Building 2.",
+  "gold": [
+   "electrical.power",
+   "finishes.floor-finish",
+   "programme.access-and-sequencing"
+  ]
+ },
+ {
+  "i": 27,
+  "id": "3ea7e690-0285-4b56-9cc8-85b0be227409",
+  "title": "Procurement support and finishes pricing",
+  "summary": "Rocky may join next week to help close seven trades. Rendering RFI, metalwork stairs at 50k, and internal doors with no shop drawings are reviewed. Internal doors will be priced per opening size.",
+  "gold": [
+   "commercial.cost-and-pricing",
+   "commercial.procurement"
+  ]
+ },
+ {
+  "i": 28,
+  "id": "c7f8f7d9-ce7c-44d4-8cec-0c282a832b11",
+  "title": "App Development & Outlook Integration",
+  "summary": "Discussed developing a proprietary 'Pro' app for construction to capture on-site and online meetings. Agreed to integrate with Outlook calendar via ICS files to automatically log toolbox meetings and attendees into FieldSight, acting as an AI secretary with construction-specific knowledge. Debated data privacy regarding company versus personal accounts.",
+  "gold": []
+ },
+ {
+  "i": 29,
+  "id": "bc7a1849-4faa-4f88-8197-442b314d40a7",
+  "title": "Temporary Works Permits Propping",
+  "summary": "Kenneth at Enris at $180/hr provides quick memos for bigger fixings, posts and propping. Team recalled Northbrook permit-to-load/unload gap where propping plan stamped not-for-construction was not converted or checked. Agreed old mate must sign off construction version and inspect before loading or striking props.",
+  "gold": [
+   "safety.permit-and-isolation",
+   "sitework.temporary-works"
+  ]
+ },
+ {
+  "i": 30,
+  "id": "3ed4a585-f23f-4c7b-aa0d-10d630588fb9",
+  "title": "QA Inspections & Concrete Testing",
+  "summary": "Geotech inspections are not needed until level one. Structural and hydraulic inspections are closed. QA post-pour and NDM testing for backfill will be required. Concrete cylinder tests (7 and 28 day) will be sent through in a single QA document.",
+  "gold": [
+   "quality.inspection",
+   "quality.test-and-commissioning",
+   "structure.concrete"
+  ]
+ },
+ {
+  "i": 31,
+  "id": "1e204adb-1221-4478-8dd3-830019da3e4a",
+  "title": "Equipment Operation Training",
+  "summary": "Jarley provided instruction on equipment operation, specifically discussing how to avoid triggering two functions simultaneously. He explained the proper start sequence, screen timeout functionality to preserve battery, and the long press function to turn off the device when finished.",
+  "gold": []
+ },
+ {
+  "i": 32,
+  "id": "dacace7f-c3c3-4a8e-a118-99ffc8d26907",
+  "title": "Calculation-Based Deadline Reference",
+  "summary": "A brief remark was made referencing a deadline of next Wednesday based on calculations. The context is incomplete, but the mention of calculations suggests a work-related scheduling or estimation activity. No further detail, participants, or decisions were captured in this single short utterance.",
+  "gold": [
+   "programme.schedule"
+  ]
+ },
+ {
+  "i": 33,
+  "id": "d83eeb91-feb0-42c6-a13b-92695654d72c",
+  "title": "Program Milestones & Weather Impacts",
+  "summary": "Discussed 4-week milestones and the impact of recent weather on the schedule. Nate explained that float is built into the schedule to accommodate weather and other delays, ensuring target dates are met without weekend work. Engineer inspections require a week's notice.",
+  "gold": [
+   "programme.delay-and-disruption",
+   "programme.schedule"
+  ]
+ },
+ {
+  "i": 34,
+  "id": "3dab1370-2a63-4a54-aaa9-7cdb4098c371",
+  "title": "UC/PK Building Door Damage Inspection and Replacement Scheduling",
+  "summary": "A site inspector (spk_0) identified damaged doors at both a UC building and a PK building and discussed replacement with a contractor named Alex from a company referred to as 'two specialists'. It was agreed that the contractor would replace doors on the first 3 floors by next Tuesday, with the remaining 3 floors completed the week after. The inspector confirmed they would conduct a follow-up inspection next Tuesday.",
+  "gold": [
+   "architecture.windows-and-doors",
+   "quality.defect"
+  ]
+ },
+ {
+  "i": 35,
+  "id": "75704c40-8ed8-4a9a-ad0a-294627948067",
+  "title": "Unclear Communication Recording",
+  "summary": "A brief 15-second recording was captured in Mandarin Chinese. The content appears to be a question about clarity or long-term matters ('你说的对吗？那就是最长期。哪一个更清楚，刚才还有现在更清楚'), but does not contain identifiable construction site activities, safety matters, or project-specific information. The recording may have been accidental or requires translation and context to determine relevance to site operations.",
+  "gold": []
+ },
+ {
+  "i": 36,
+  "id": "84d0f999-ce6c-47ef-b558-463079dcda96",
+  "title": "Spreader Bar Rigging Calculation",
+  "summary": "For 15m panels team set spreader bar pick points at half then half again, about 3.5-3.75m in from each end, to sit plumb above ends. Bar to be adjusted per panel length and aligned to triple studs not floating in top plate.",
+  "gold": [
+   "programme.plant-and-equipment",
+   "structure.precast"
+  ]
+ },
+ {
+  "i": 37,
+  "id": "38522b22-2f80-4c37-be73-e3eb57f4e161",
+  "title": "Video Recording Preview Function",
+  "summary": "Speaker explained that pressing the video recording button shows a preview. Noted that some clients sensitive about facial privacy prefer audio-only recording and do not use video.",
+  "gold": []
+ },
+ {
+  "i": 38,
+  "id": "85bccc86-7416-492c-92d2-a49e03dc9a8a",
+  "title": "Level 3 Slab Rebar & Trimmer Bars",
+  "summary": "Discussion regarding incomplete rebar and trimmer bars on the Level 3 slab east side due to unclear drawings. An RFI will be raised with the designer, and the trim bars must be sorted before the 8:30 AM pre-pour inspection tomorrow to avoid losing the pour.",
+  "gold": [
+   "quality.inspection",
+   "structure.slab"
+  ]
+ },
+ {
+  "i": 39,
+  "id": "7477fb2d-c53e-4d60-9c79-79fa58d02fa7",
+  "title": "Personal Conversation - Emma",
+  "summary": "A brief, fragmented radio transmission mentioning a person named Emma. No construction-related operations, safety, quality, or progress topics were discussed.",
+  "gold": []
+ },
+ {
+  "i": 40,
+  "id": "5c50cdfd-9000-44e0-83f2-58c2bed799c7",
+  "title": "Fieldside AI Platform Change – Qwen / ElevenLabs to Replace Claude and AWS Transcribe",
+  "summary": "The speaker proposes replacing the two major fieldside AI functions – currently running on Claude and AWS Transcribe – with Qwen / ElevenLabs (likely a phonetic reference to an alternative tool). A discussion is to be held by this Friday (2026-07-25, i.e. tomorrow relative to the recording date) to progress this decision. No final decision has been confirmed yet.",
+  "gold": []
+ },
+ {
+  "i": 41,
+  "id": "06eb8ae4-0a0f-4430-8f76-ff6123d8290f",
+  "title": "Balustrade detailing and supply",
+  "summary": "External balustrade spacing vs structure needs review with Max, Tim, HDA and Polish. Internal balustrade price held, joiners may install. Screen at $19 per linear metre from Aussie needs lead time allowance.",
+  "gold": [
+   "architecture.stairs",
+   "commercial.procurement"
+  ]
+ },
+ {
+  "i": 42,
+  "id": "b82d565a-8ffe-4605-8fd1-fc8fdd65c1c1",
+  "title": "Wall Demolition and Fire Rating Defects",
+  "summary": "Neil considers leaving a specific wall intact to avoid disrupting its internal power, as drilling can be performed from above. They note that demolished walls must be reinstated exactly and identify existing quality defects, including improperly fire-rated wall interfaces and excessive bracing.",
+  "gold": [
+   "architecture.walls",
+   "quality.defect"
+  ]
+ },
+ {
+  "i": 43,
+  "id": "930f444e-a0a6-43a8-b7aa-29354eabe3be",
+  "title": "Steel Rebar Certificates",
+  "summary": "The compliance certificates for last week's batch of steel rebar have not arrived. A follow-up will be made today to expedite them.",
+  "gold": [
+   "quality.consent-and-code",
+   "structure.concrete"
+  ]
+ },
+ {
+  "i": 44,
+  "id": "758a8c64-55de-4a4e-89f1-761af8a20c44",
+  "title": "Flat slabs TA access",
+  "summary": "James and Jamie discuss task analysis access. James has only seen a screenshot and has logged an IT ticket for folder access. They clarify the approved TA on SafeFace for modulars starting tomorrow versus the flat slabs TA currently assigned to James. They note the document is 25 pages long and Jamie had only read to the signature page.",
+  "gold": [
+   "safety.induction"
+  ]
+ },
+ {
+  "i": 45,
+  "id": "5764c827-877a-4eae-a5e7-1f394aed322d",
+  "title": "Equipment GPS and Video Testing",
+  "summary": "Workers are testing the video recording and GPS signal acquisition of a device outdoors. They observe that the device successfully acquires a GPS signal in about 2 seconds, which is noted as very good performance.",
+  "gold": []
+ },
+ {
+  "i": 46,
+  "id": "49c1582f-192f-4d56-be0a-850eb07bcc6b",
+  "title": "Personal Chat Regarding Housing Market",
+  "summary": "The team engaged in a personal conversation about the high cost of housing and the challenges of relocation. One speaker mentioned selling their house and the financial aspects of moving.",
+  "gold": []
+ },
+ {
+  "i": 47,
+  "id": "e2e87b81-69c0-45e7-b9b3-6efd748c30bd",
+  "title": "Microphone Test",
+  "summary": "The speaker conducted a microphone and audio recording test, explicitly stating that the recording should be ignored. The test consisted of repeatedly counting from one to ten in Chinese to verify equipment functionality.",
+  "gold": []
+ },
+ {
+  "i": 48,
+  "id": "0125ef0d-c102-48bf-bd3c-81b24b60d19a",
+  "title": "Business Valuation and Exit Strategy",
+  "summary": "Discussion on the business's current valuation dropping to $600K, delaying the owners' exit strategy. Explored options include waiting for market recovery, succession planning with their daughter returning from the UK, or retaining ownership and installing an operator.",
+  "gold": []
+ },
+ {
+  "i": 49,
+  "id": "e8017734-9bed-44ff-b45d-f186a57a5987",
+  "title": "Client Program Update",
+  "summary": "Yang Ming is required to send the updated construction program to the client by the end of the day on Thursday.",
+  "gold": [
+   "programme.schedule",
+   "stakeholders.client"
+  ]
+ },
+ {
+  "i": 50,
+  "id": "bef62312-3e2d-4159-868d-0ff641e3cbf8",
+  "title": "Site Access, Handrail Configuration, and Material Supply",
+  "summary": "David discussed asphalt quality and site access restoration. Reviewed fire exit configuration with school, deciding to install small handrail while maintaining existing stair layout for secondary RTA building exit. Coordinated pallet delivery to school - multiple loads already delivered with more available. School requested additional pallets for garden beds. Discussed timber edge installation for landscaping to prevent material pushing out.",
+  "gold": [
+   "architecture.stairs",
+   "programme.delivery-and-materials",
+   "sitework.paving"
+  ]
+ },
+ {
+  "i": 51,
+  "id": "ab4c41e3-8f8b-48c3-9c60-170740c92e41",
+  "title": "Finishes Procurement - Tiling Painting Flooring",
+  "summary": "Tiling budget tight; Emo Tiling proposed as reliable with four defects on prior swimming pool job and Wanaka resource. Painting flagged for resource risk, flooring has decent $50k allowance. Insulation noted as funded with Victory cheap install option.",
+  "gold": [
+   "commercial.procurement",
+   "finishes.painting",
+   "finishes.tiling"
+  ]
+ },
+ {
+  "i": 52,
+  "id": "2e759a7a-9380-4dd6-898c-f2466207694c",
+  "title": "General building process changes",
+  "summary": "Speaker makes general remarks about basic building matters, ticking boxes, and change related to construction. No specific work item, observation, or decision is identifiable.",
+  "gold": []
+ },
+ {
+  "i": 53,
+  "id": "9b206ee1-e4c4-4d78-98c3-2dc95aacd3b0",
+  "title": "Equipment Issues & Emergency Procedures",
+  "summary": "The team checks emergency procedures and encounters equipment issues during the site walk. The camera battery is draining quickly due to the cold, and they lack AAA batteries for a torch needed in dark areas.",
+  "gold": [
+   "safety.induction"
+  ]
+ },
+ {
+  "i": 54,
+  "id": "b1872f2e-d126-4be7-9eab-26364f942bbf",
+  "title": "Weekly Schedule & FieldSight AI",
+  "summary": "Speaker is reorganizing their weekly calendar, moving the FJS meeting to Monday afternoon and planning a Tuesday meeting. On Wednesday, they will visit the site with DeAndre to promote FieldSight AI, and they also plan to meet Neil on Monday.",
+  "gold": []
+ },
+ {
+  "i": 55,
+  "id": "845437b3-f879-4884-a6e1-70b25fb3061b",
+  "title": "Manager batch work split",
+  "summary": "Noted next twenty-one entries are manager changes. Checked whether remote access to DPM is possible to work together. Proposed starting from opposite ends with one from Meg and the other from Daryl.",
+  "gold": []
+ },
+ {
+  "i": 56,
+  "id": "35660a39-cde2-4001-8f8b-35753912fa92",
+  "title": "Radio communication check",
+  "summary": "The speaker tests the radio equipment, noting they haven't used it yet, and initiates a greeting to establish communication.",
+  "gold": []
+ },
+ {
+  "i": 57,
+  "id": "ad2c7fb5-05d6-4576-9f00-c4928d929b7f",
+  "title": "Voice Recording System Onboarding and Setup",
+  "summary": "Three speakers discuss how the voice recording system works, including how to start a recording, automatic cloud upload on completion, and connectivity options. It is noted that the system uses Wi-Fi as the primary upload method, with a SIM card as a fallback for sites without reliable reception. Video content is specified to use Wi-Fi mainly.",
+  "gold": []
+ },
+ {
+  "i": 58,
+  "id": "62fd3501-5d06-4e36-94ab-f8ef3c7bf385",
+  "title": "Platform Login and Action Tracking",
+  "summary": "The platform supports Wi-Fi connection and account login via QR code scan, similar to WhatsApp or WeChat, suited to the small screen. Information is separated by role, with a default stacked action list extracted from conversations including auto-detected due dates that users can edit. Progress is versioned to keep history rather than overwriting, and meetings can generate an email to send out.",
+  "gold": []
+ },
+ {
+  "i": 59,
+  "id": "3073ce47-c9d8-457a-8cdb-65ae94deb122",
+  "title": "Car Park Site Inspection",
+  "summary": "Speaker announced the start of site inspections and movement toward the car park. No observations, findings, decisions, or actions were recorded in this segment.",
+  "gold": [
+   "quality.inspection"
+  ]
+ },
+ {
+  "i": 60,
+  "id": "53dd0c83-84e3-4c23-b933-8de447b006b5",
+  "title": "Delivery Apps and POS Integration",
+  "summary": "Discussed using UberEats and DoorDash strategically as marketing tools despite high commissions. Advised on offering a narrow, optimized menu for delivery, integrating orders directly with the POS, and using delivery platforms to reach new customer demographics.",
+  "gold": []
+ },
+ {
+  "i": 61,
+  "id": "0b67b087-a57d-4318-b26c-6f981124c258",
+  "title": "Joinery procurement and programme wins",
+  "summary": "Knight interior not engaged, client using own designer via Cooks. ETC01 only pricing info, risk of shop-drawing variations. Target Prime joinery, review H3 shop drawings as base. Wins to come from finishing trades for Dec 15 lockup then cladding/joinery post-Christmas.",
+  "gold": [
+   "architecture.joinery",
+   "commercial.procurement",
+   "programme.schedule"
+  ]
+ },
+ {
+  "i": 62,
+  "id": "6fa873ca-bbd0-4ff6-a3da-f97ab9ca5387",
+  "title": "UC Site rollout strategy",
+  "summary": "讨论了在 UC Site 推广系统使用遇到的阻力，现场人员有明显抵触情绪。决定放弃自下而上的推广方式，改为自上而下策略，通过 PM、GM 和区域经理等管理层来推动。",
+  "gold": []
+ },
+ {
+  "i": 63,
+  "id": "c906a383-49b7-4362-81ce-e64a89b3000c",
+  "title": "Team Meeting Coordination and Personal Schedule",
+  "summary": "The team is trying to schedule a meeting with Mario and Jim for next Thursday afternoon, but coordination is difficult as most people are overseas in Singapore and Australia. The speaker also mentions a personal appointment to see the doctor on Thursday.",
+  "gold": []
+ },
+ {
+  "i": 64,
+  "id": "4b5f1601-3e68-4beb-8c56-4d012f2d182f",
+  "title": "Venue Space Utilization and Hours",
+  "summary": "Analyzed the venue's large footprint and underutilized outdoor spaces like the Eastern Conservatory and Northern deck. Reviewed operating hours, the decision to remain open over the Christmas/New Year period, and revenue patterns across brunch, dinner, and functions.",
+  "gold": []
+ },
+ {
+  "i": 65,
+  "id": "14101b83-dc4f-4848-bddc-c6bb991d5509",
+  "title": "FieldSight Voiceprint Recording",
+  "summary": "Ben records a 30-second Chinese voice sample to capture his voiceprint and accent. This is intended to improve speech recognition accuracy and speaker identification in the FieldSight application.",
+  "gold": []
+ },
+ {
+  "i": 66,
+  "id": "6bca0eec-3a9d-4307-b387-3d3f56cbec09",
+  "title": "Microphone Noise Reduction Testing",
+  "summary": "The speakers conducted physical noise reduction tests on a microphone to filter out clothing and footstep friction sounds. They recorded baseline audio and then tested the effectiveness of cotton and sponge covers in dampening the unwanted noise.",
+  "gold": []
+ },
+ {
+  "i": 67,
+  "id": "b6bcbcc4-8248-4ac4-aff5-e6f3e910be6f",
+  "title": "Join Meeting Multi-Device Sync",
+  "summary": "Discussed the not-yet-implemented Join Meeting function intended to synchronize multiple recording devices during inspections and large toolbox meetings. Single-device audio pickup was noted as insufficient when two site managers cover different areas. A suggestion was raised to automatically merge recordings using identical timestamps plus audio or content overlap.",
+  "gold": []
+ },
+ {
+  "i": 68,
+  "id": "da45d9de-7d2e-434c-9c6e-eaa89b852fd1",
+  "title": "Core Tech Evaluation & Alternative Sensors",
+  "summary": "Questioned whether the current wearable technology is the optimal solution for construction bottlenecks. Explored alternative data collection methods, such as fixed sensors or drones, to bypass human resistance and privacy issues.",
+  "gold": []
+ },
+ {
+  "i": 69,
+  "id": "b2e842e3-7812-438e-a1b3-9d2ac0a53400",
+  "title": "Variations Meeting Preparation",
+  "summary": "Ben has a meeting scheduled with Benny tomorrow to go through the project variations. This is a personal action item for Ben.",
+  "gold": [
+   "commercial.variation"
+  ]
+ },
+ {
+  "i": 70,
+  "id": "87b67561-dd0a-4a0e-913d-633720464c89",
+  "title": "Floor Box Installation and Multi-Building Coordination",
+  "summary": "Coordination of floor box installations across multiple buildings with crews returning from Twizel providing additional manpower. Three floor boxes confirmed ready tomorrow morning in Building 2. Discussion about sequencing vinyl and plaster work, with agreement that plaster must be completed before vinyl installation but painting can follow. Site manager considering taking week off to allow trades to complete their work. Carpet installation timing discussed for Building 3 with estimated one week completion time due to cleaner conditions compared to Senior area.",
+  "gold": [
+   "electrical.power",
+   "finishes.floor-finish",
+   "programme.access-and-sequencing"
+  ]
+ },
+ {
+  "i": 71,
+  "id": "f0c30d89-474e-4ade-b3ba-b01c5d888da2",
+  "title": "Personal Supermarket Meetup",
+  "summary": "The speaker coordinates a personal meetup with another person at a supermarket. They mention finishing a drink, feeling cold from a temperature drop, and confirm they are walking to the location.",
+  "gold": []
+ },
+ {
+  "i": 72,
+  "id": "fb547a15-1f0c-4553-a2b4-19a6c268930d",
+  "title": "Recording System Account Query",
+  "summary": "Worker inquired about how previous conversations would be attributed and displayed on their account within the recording system.",
+  "gold": []
+ },
+ {
+  "i": 73,
+  "id": "ee4c96d9-41c1-4f21-ae3c-6d0b96731cef",
+  "title": "Design Issues & Shop Drawings",
+  "summary": "Fly slab shop drawings are delayed due to paperwork; the deadline is pushed to next week. Penetration details are closed. Insulation R-value confirmed at 1.8, with extra ordered in case 3.6 is needed. RG locations for basement plumbing were moved due to clashes, awaiting final confirmation. Stormwater line scope and RFI discussed.",
+  "gold": [
+   "envelope.insulation",
+   "mechanical.plumbing",
+   "programme.delay-and-disruption"
+  ]
+ },
+ {
+  "i": 74,
+  "id": "054fdb9d-2136-4869-80c1-5546142d478f",
+  "title": "App Lockdown and Connectivity",
+  "summary": "Speakers discussed restricting devices to the recording app and prohibiting return to the desktop, so the app remains always in the foreground. The proposal was acknowledged as a direction to pursue. They also briefly noted a connectivity requirement involving Wi-Fi.",
+  "gold": []
+ },
+ {
+  "i": 75,
+  "id": "ab78051f-0996-4a12-8bea-c749dafdb95a",
+  "title": "Follow-ups & Next Steps",
+  "summary": "Parked for future discussion: Detailed technical specification documentation for camera hardware capabilities; Business model development for selling to insurance companies; Expansion into non-construction markets (airports, defense, space, farming, fisheries); Integration strategy with existing asset management software platforms; Manufacturing quality control applications using visual inspection technology",
+  "gold": []
+ },
+ {
+  "i": 76,
+  "id": "a77587ad-a17b-414c-b80e-d8ec61676a61",
+  "title": "Background Radio Broadcast",
+  "summary": "Extended capture of Newstalk ZB radio programming including news, sports results, weather forecasts, advertisements, and talkback segments regarding small business payments and financial advice. No construction-related discussion occurs between site personnel during this period.",
+  "gold": []
+ },
+ {
+  "i": 77,
+  "id": "28bc106a-1e9e-45e2-9542-df171c4842cc",
+  "title": "FieldSight AI Sync Test",
+  "summary": "Speaker conducted a test recording to verify FieldSight AI synchronization with construction site photos. Noted an issue with photos being captured upside down and adjusted capture settings accordingly.",
+  "gold": []
+ },
+ {
+  "i": 78,
+  "id": "e03ec45e-5f0a-4e4f-af2b-3c263061c21b",
+  "title": "Tiling painting flooring subs",
+  "summary": "Tiling budget is tight, painting budget and resourcing are risks, flooring has decent money. Ima Tiling with four defects offered as option, Sharky painting questioned on resource. Mirrors around 5k.",
+  "gold": [
+   "commercial.cost-and-pricing",
+   "finishes.painting",
+   "finishes.tiling"
+  ]
+ },
+ {
+  "i": 79,
+  "id": "d5c1dd61-6430-48a0-8433-5214391d9e59",
+  "title": "Column 3 Formwork Removal",
+  "summary": "Formwork for Column 3 will be removed tomorrow at 8 AM. The area must remain untouched until a re-inspection is completed.",
+  "gold": [
+   "quality.inspection",
+   "structure.concrete"
+  ]
+ },
+ {
+  "i": 80,
+  "id": "da6536e4-f7ba-4b75-98d0-9615cb514025",
+  "title": "Electrical Cables Procurement",
+  "summary": "Follow-up item regarding the procurement of 2,500 kilometers of electrical cables for a different project on Rosa ruler.",
+  "gold": [
+   "commercial.procurement",
+   "electrical.power"
+  ]
+ },
+ {
+  "i": 81,
+  "id": "7a6542f9-1d9c-431f-b302-a6baec945107",
+  "title": "Confirmation of Water Tower Cutting Schedule",
+  "summary": "Site manager confirmed with tradesperson that data contractors will cut off water towers through the floor this afternoon, ensuring area will be ready for floor layers tomorrow.",
+  "gold": [
+   "finishes.floor-finish",
+   "programme.access-and-sequencing"
+  ]
+ },
+ {
+  "i": 82,
+  "id": "f661cff6-8ab8-4b7c-b3e9-40aef33083d8",
+  "title": "Door Hardware Specifications and Installation Requirements",
+  "summary": "Detailed discussion about door stops for aluminium doors across different buildings. Building C and Building 1 confirmed completed, only Building 2 and Senior area remaining. Discussion about door handle requirements and concerns about rattling due to seal issues. Powder-coated hardware versus standard hardware debate, with decision to follow existing approach. Worker Dante criticized for improper installation that needs to be removed.",
+  "gold": [
+   "architecture.windows-and-doors",
+   "finishes.fixtures-and-fittings"
+  ]
+ },
+ {
+  "i": 83,
+  "id": "3e660b99-a834-400c-83bb-00c0919e1d87",
+  "title": "Software System Testing and Defects",
+  "summary": "The team tested the system with a reduced range of 0.2 to evaluate content capture. They identified defects where the email feature only sends notifications instead of summaries, the website timeline lacks sufficient information, and logistics data is missing from the Topic view.",
+  "gold": []
+ },
+ {
+  "i": 84,
+  "id": "899ff845-98e5-4130-9a8d-9d780383eeae",
+  "title": "AI Speaker Recognition Testing",
+  "summary": "Petros is running a test recording to generate files for upload and to check if AI can distinguish between the three speakers. John was asked to speak as a test sample, jokingly claiming to be Petros. Discussion followed on where to record voice samples to train AI recognition and how the website streams and updates after stopping the recording.",
+  "gold": []
+ },
+ {
+  "i": 85,
+  "id": "67b3efff-6ee2-47b3-92dd-1bbcd8f6c79e",
+  "title": "Reinforcement Installation Check",
+  "summary": "Confirmed that D12 and D10 reinforcement bars have been installed in the stands. Material certs and records are up to date.",
+  "gold": [
+   "quality.consent-and-code",
+   "quality.inspection",
+   "structure.concrete"
+  ]
+ },
+ {
+  "i": 86,
+  "id": "4fda772c-f40d-4a36-9003-830b4012d3cd",
+  "title": "Meeting device and mic testing",
+  "summary": "讨论了产品更新，实现多台设备同时加入同一场会议以提升开会效果。同时进行了麦克风收音测试，发现旁边有人说话会干扰收音效果。",
+  "gold": []
+ },
+ {
+  "i": 87,
+  "id": "061d8556-4b70-403f-ab0e-abc09cc5b7f4",
+  "title": "Scaffolding Inspection",
+  "summary": "The speakers note that the scaffolding needs to be checked before Monday to ensure it is safe and ready for use.",
+  "gold": [
+   "quality.inspection",
+   "sitework.temporary-works"
+  ]
+ },
+ {
+  "i": 88,
+  "id": "c0b3bf91-3c1b-47e1-aaa9-09724134288c",
+  "title": "Ceiling Work Photo Documentation",
+  "summary": "Brief exchange about pipe below ceiling. Request for photo to be sent to mobile number 02. Dennis confirmed patches have been completed.",
+  "gold": [
+   "architecture.ceilings",
+   "quality.defect"
+  ]
+ },
+ {
+  "i": 89,
+  "id": "1570bc27-e32e-4c5b-aa32-6aae432852d4",
+  "title": "Site Navigation and Casual Conversation",
+  "summary": "The team navigated the site while engaging in casual conversation about school, dissection, parking, and seafood. No specific work-related subjects were discussed during this initial walk.",
+  "gold": []
+ },
+ {
+  "i": 90,
+  "id": "0e1dcb62-cb44-4f0f-80a8-90b8bc0ca6d1",
+  "title": "House Building Consideration",
+  "summary": "Speaker made a brief, fragmentary remark about something under consideration. He referenced building houses as something that has to be done. No detail, decision, or actionable task was stated.",
+  "gold": []
+ },
+ {
+  "i": 91,
+  "id": "f00ec078-845c-4d08-8836-be9978c561ae",
+  "title": "Program Milestones & Weather Impacts",
+  "summary": "Discussed 4-week milestones and the impact of recent weather on the schedule. Nate explained that float is built into the schedule to accommodate weather and other delays, ensuring target dates are met without weekend work. Engineer inspections require a week's notice.",
+  "gold": [
+   "programme.delay-and-disruption",
+   "programme.schedule"
+  ]
+ },
+ {
+  "i": 92,
+  "id": "cca99530-1373-4f3d-a3b7-b1bb41667141",
+  "title": "Eyeglasses Polishing for Client",
+  "summary": "Speaker needs to polish 129 eyeglasses to give back to a client as a gift.",
+  "gold": []
+ },
+ {
+  "i": 93,
+  "id": "bfec0676-c034-47a6-8044-ddade2765cf0",
+  "title": "Indicator Lights – Red Recording Status",
+  "summary": "Speakers discussed use of red and yellow indicator lights, noting that red indicates recording. One speaker noted the red light can sometimes be occupied by other functions. The recording ends with an incomplete mention of migration.",
+  "gold": []
+ },
+ {
+  "i": 94,
+  "id": "dd8cf5e7-2d32-4e2a-b300-9822665f9393",
+  "title": "On-Site Hardware & Usability Friction",
+  "summary": "Discussion on the usability of recording devices like Plaud versus cell phones and iPads on construction sites. Noted the friction of using mobile phones while wearing safety gloves and the preference for larger iPad screens by some inspectors.",
+  "gold": []
+ },
+ {
+  "i": 95,
+  "id": "539146ad-fb98-4ace-b27d-670b29c4afb0",
+  "title": "Corner Bead Correction and Surface Protection",
+  "summary": "Jarley inspected a corner bead installation that appears incorrectly stepped, causing the ceiling to dip. He instructed the worker to remove shoes with mud, install proper floor protection using plastic and hard cardboard taped down, protect the counter area, then remove and reinstall the corner bead level with the ceiling. May require shaving of gib board.",
+  "gold": [
+   "architecture.ceilings",
+   "finishes.plastering",
+   "quality.defect"
+  ]
+ },
+ {
+  "i": 96,
+  "id": "13b76e8f-d765-444d-8ded-7cd39cedea54",
+  "title": "Roof Membrane & Design Modeling",
+  "summary": "The group inspects the roof membrane and discusses the complexities of pricing and coding the old roof. They also touch on design and modeling, noting that forecasting and inflation add significant challenges to the project.",
+  "gold": [
+   "architecture.roofing",
+   "commercial.cost-and-pricing",
+   "envelope.waterproofing"
+  ]
+ },
+ {
+  "i": 97,
+  "id": "c8c98d66-016f-49a6-ab08-5dc22c6a5995",
+  "title": "Initial Site Walkthrough and Project Scope Overview",
+  "summary": "MPI1 conducted initial site orientation discussing gas monitor requirements for tunnel work, project team structure, and mechanical site supervisor roles. Discussion included reference to Rosedale project for comparison, though this job identified as very different in nature. Team structure clarified with MPI1 potentially working between site and office depending on daily requirements, with Christian managing multiple projects.",
+  "gold": [
+   "commercial.contract-and-scope",
+   "safety.hazard"
+  ]
+ },
+ {
+  "i": 98,
+  "id": "561bf05c-1a67-44d2-8ce2-99ccb9a41434",
+  "title": "Engineering and Architect Inspections",
+  "summary": "The speaker announces an upcoming engineering inspection scheduled for this afternoon and an architect's inspection for tomorrow. They briefly question or confirm the architect's schedule for the following day.",
+  "gold": [
+   "quality.inspection",
+   "stakeholders.consultant"
+  ]
+ },
+ {
+  "i": 99,
+  "id": "3f92dc20-1806-447b-9f38-18de13c318ef",
+  "title": "Concrete Pour Dates & Upcoming Schedule",
+  "summary": "Reviewed upcoming concrete pour dates, with a backup pour on the 16th and Zone 1 slab pour on the 30th. Consultant inspections with Margot moved to the 8th. Tank deliveries (11s) are delayed. Scaffold will be progressively moved between zones.",
+  "gold": [
+   "programme.delivery-and-materials",
+   "programme.schedule",
+   "structure.concrete"
+  ]
+ }
+]

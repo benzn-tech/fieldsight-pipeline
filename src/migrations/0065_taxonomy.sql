@@ -85,6 +85,17 @@ CREATE INDEX IF NOT EXISTS idx_tag_run_company ON tag_run (company_id, started_a
 --
 -- `source` is the same vocabulary the photo binding learned the hard way:
 -- a machine may replace what a machine wrote, and never what a person chose.
+--
+-- NOTE THE ASYMMETRY, and it is deliberate: `tag.parent_id` is RESTRICT while
+-- `tag_id` here is CASCADE. Deleting a PARENT would take a company's whole
+-- sub-vocabulary with it and must be refused; deleting a TAG has to be
+-- possible, because deleting a SITE cascades to that site's tags and a
+-- RESTRICT here would make removing a project fail on any tag anyone had used.
+-- Verified against a real database (inside a rollback-only transaction on
+-- TEST): deleting a topic removes its tag rows, and deleting a tag removes its
+-- assignments. Nothing in the API can delete a tag -- deactivation is the only
+-- route offered -- so the cascade is reachable by a site or company delete and
+-- by nothing else.
 CREATE TABLE IF NOT EXISTS topic_tags (
   topic_id   uuid NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
   tag_id     uuid NOT NULL REFERENCES tag(id) ON DELETE CASCADE,
