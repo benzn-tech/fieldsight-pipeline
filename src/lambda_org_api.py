@@ -133,6 +133,7 @@ import device_status
 import nz_time
 import reindex
 import recording_blocks
+import report_download_name
 import report_sections
 import report_template
 import session_scope
@@ -2577,6 +2578,34 @@ def _without_vendor_metadata(doc):
     return doc
 
 
+def _presign_report_doc(doc_key, folder, date, result):
+    """Presign the generated document, served under a name a person can read.
+
+    The browser names a download after the last segment of the URL, and these
+    keys end in the requestId -- so every report ever downloaded arrived as a
+    uuid. `ResponseContentDisposition` overrides that at serve time. The KEY IS
+    UNCHANGED: nothing about the storage layout, the deletion mirror or any
+    object already written moves, because this is a header the object is served
+    with, not a property of the object.
+
+    Non-Latin folder names survive intact (report_download_name carries the
+    real name on RFC 6266's `filename*`); the ASCII fallback beside it is built
+    by replacement, never by stripping. Building the name must never be the
+    reason a finished report cannot be handed over, so a failure here falls
+    back to the bare presign -- a uuid filename, which is what this endpoint
+    did for its whole life -- and says so loudly enough to be found.
+    """
+    params = {"Bucket": LAKE_BUCKET, "Key": doc_key}
+    try:
+        params["ResponseContentDisposition"] = report_download_name.content_disposition(
+            report_download_name.display_name(
+                folder, result.get("templateId"), result.get("templateVersion"), date))
+    except Exception:
+        logger.exception("could not build a download name for %s; serving it unnamed", doc_key)
+    return s3().generate_presigned_url(
+        "get_object", Params=params, ExpiresIn=PRESIGNED_URL_EXPIRY)
+
+
 def _generation_provenance(result):
     """Echo the worker's generation provenance -- which template wrote the
     document -- when the result carries it. `promptChars` is internal noise,
@@ -2634,9 +2663,7 @@ def session_report_status(conn, caller, session_id, event):
     result = json.loads(obj["Body"].read().decode("utf-8"))
     status = result.get("status")
     if status == "done" and result.get("docKey"):
-        url = s3().generate_presigned_url(
-            "get_object", Params={"Bucket": LAKE_BUCKET, "Key": result["docKey"]},
-            ExpiresIn=PRESIGNED_URL_EXPIRY)
+        url = _presign_report_doc(result["docKey"], folder, date, result)
         return ok({"status": "done", "docUrl": url, "emailed": bool(result.get("emailed")),
                    **_generation_provenance(result)})
     if status == "error":
@@ -2688,9 +2715,7 @@ def day_report_status(conn, caller, date, event):
         if _any_session_removed(session_ids, folders, date):
             logger.info("day report %s: a session in it was deleted -- not served", request_id)
             return ok({"status": "removed"})
-        url = s3().generate_presigned_url(
-            "get_object", Params={"Bucket": LAKE_BUCKET, "Key": result["docKey"]},
-            ExpiresIn=PRESIGNED_URL_EXPIRY)
+        url = _presign_report_doc(result["docKey"], folder, date, result)
         return ok({"status": "done", "docUrl": url, "emailed": bool(result.get("emailed")),
                    **_generation_provenance(result)})
     if status == "error":
