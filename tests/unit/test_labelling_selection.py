@@ -72,7 +72,7 @@ def test_a_sample_that_falls_short_says_so_in_the_words_of_the_rule():
     missing = sel.shortfalls(sel.select([r for r in rows if r]))
     joined = " ".join(missing)
     assert "sessions" in joined
-    assert "people" in joined
+    assert "folders" in joined
     assert "days" in joined
     assert "two devices" in joined
 
@@ -90,7 +90,13 @@ def test_a_sample_that_meets_every_quota_reports_nothing():
     # and one of them on a second device, which is the clause with teeth
     rows.append(sel.parse_key(key("Ben_UCPK2", "2026-08-14", device="Benl2",
                                   sid="b" * 32)))
-    assert sel.shortfalls(sel.select(rows)) == []
+    missing = sel.shortfalls(sel.select(rows))
+    # The hand-check note is not a shortfall: a folder is not a person and no amount of
+    # metadata can settle that, so it is always emitted once the folder quota is met.
+    assert [m for m in missing if not m.startswith("CHECK BY HAND")] == []
+    assert any(m.startswith("CHECK BY HAND") for m in missing), (
+        "the folder-is-not-a-person warning disappeared; nine folders read as nine people "
+        "on prod, and five of them were one man")
 
 
 def test_the_pack_is_the_same_pack_on_a_second_run():
@@ -111,3 +117,37 @@ def test_turns_below_the_attribution_floor_are_never_asked_about():
     produce."""
     picked = sel.select([sel.parse_key(key("Ben_UCPK2", "2026-08-13"))])
     assert picked[0]["min_turn_s"] == sel.MIN_TURN_S == 3.0
+
+
+def test_a_folder_prefix_with_underscores_is_still_read():
+    """The bug this file exists to have caught, found against real prod keys 2026-09-23.
+
+    Legacy RealPTT names carry one bare token (`Benl1_2026-03-20_...`); the app writes the
+    FOLDER as the prefix and folders have underscores (`ben_ucpk2_...`, `petros_pan_...`).
+    A device pattern of `[A-Za-z0-9]+` matches `ben`, then demands a date where `ucpk2_` is,
+    and returns None.
+
+    It failed in the safe direction, which is why it survived: the scan found ONE session
+    across thirteen folders and months of recordings, and reported a quota shortfall -- a
+    number indistinguishable from "there is not enough material yet".
+    """
+    row = sel.parse_key(
+        "transcripts/Ben_UCPK2/2026-09-22/"
+        "ben_ucpk2_2026-09-22_15-32-00_sid" + "2" * 32 + "_c0000_srcwav.json")
+    assert row is not None, "the current app naming convention is unreadable"
+    assert row["device"] == "ben_ucpk2"
+    assert row["date"] == "2026-09-22"
+
+    legacy = sel.parse_key(
+        "transcripts/Jarley_Trainor/2026-03-20/"
+        "Benl1_2026-03-20_12-18-34_sid" + "3" * 32 + "_c0000_srcwav.json")
+    assert legacy is not None and legacy["device"] == "Benl1", "the old convention broke"
+
+
+def test_the_prefix_never_swallows_the_date():
+    """`.+?` is non-greedy and anchored on the date, so a filename carrying two date-shaped
+    runs still takes the first as the recording date rather than the last."""
+    row = sel.parse_key(
+        "transcripts/X/2026-09-22/a_b_2026-09-22_15-32-00_sid" + "4" * 32 + "_c0.json")
+    assert row["date"] == "2026-09-22"
+    assert row["device"] == "a_b"
