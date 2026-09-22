@@ -244,9 +244,44 @@ def run_embedding(rows, leaves, log):
 
 # ---------------------------------------------------------------------------
 
+def recall_at_k(rows, leaves, log):
+    """Could the embedding be used as a CANDIDATE GENERATOR for the classifier?
+
+    That hybrid -- cosine picks the top k leaves, the model chooses among them --
+    only helps if the right leaf is inside the top k. Its ceiling is therefore
+    this recall, and no prompt can recover a leaf the shortlist dropped.
+
+    Measured rather than assumed, because "use embeddings to cut the prompt" is
+    the kind of optimisation that sounds free and quietly caps quality.
+    """
+    import dashscope_utils
+    leaf_texts = [f"{l['parent']}: {l['label']}" for l in leaves]
+    topic_texts = [f"{r['title']}. {' '.join(r['summary'].split())}" for r in rows]
+    lv = dashscope_utils.embed(leaf_texts)
+    tv = dashscope_utils.embed(topic_texts)
+    taggable = [(r, [_cos(tv[i], v) for v in lv]) for i, r in enumerate(rows) if r["gold"]]
+    out = {}
+    for k in (3, 5, 8, 12, 20, 30):
+        covered = total = 0
+        whole = 0
+        for row, sims in taggable:
+            top = {leaves[i]["slug"] for i in
+                   sorted(range(len(leaves)), key=lambda j: -sims[j])[:k]}
+            gold = set(row["gold"])
+            covered += len(gold & top)
+            total += len(gold)
+            whole += int(gold <= top)
+        out[k] = (covered / total, whole / len(taggable))
+        log(f"  top-{k:<2d}  {covered}/{total} gold leaves in the shortlist "
+            f"({out[k][0]:.0%}), all of them for {whole}/{len(taggable)} items")
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--only", choices=["A", "B"])
+    ap.add_argument("--only", choices=["A", "B", "K"],
+                    help="K measures the embedding's recall@k -- the ceiling "
+                         "of using it as a candidate generator for A.")
     ap.add_argument("--runs", type=int, default=1,
                     help="repeat method A this many times. ONE RUN OF A MODEL "
                          "SAYS NOTHING -- the repo's own admission eval exists "
@@ -272,6 +307,14 @@ def main():
             print(f"{label}")
             preds, meta = run_classifier(rows, leaves, log)
             results[label] = (score(rows, preds), meta, preds)
+    if args.only == "K":
+        load_env_from_lambda("fieldsight-prod-embed-report",
+                             ("DASHSCOPE_API_KEY", "DASHSCOPE_BASE_URL",
+                              "DASHSCOPE_EMBED_MODEL", "DASHSCOPE_EMBED_DIM"))
+        print("\nK  embedding as a candidate generator -- recall@k on the taggable")
+        recall_at_k(rows, leaves, log)
+        return
+
     if args.only in (None, "B"):
         load_env_from_lambda("fieldsight-prod-embed-report",
                              ("DASHSCOPE_API_KEY", "DASHSCOPE_BASE_URL",
