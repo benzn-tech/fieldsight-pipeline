@@ -121,7 +121,7 @@ CREATE INDEX IF NOT EXISTS idx_action_item_tags_tag ON action_item_tags (tag_id)
 CREATE INDEX IF NOT EXISTS idx_action_item_tags_run ON action_item_tags (run_id) WHERE run_id IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
--- The global base set: 12 level-1, 70 level-2.
+-- The global base set: 12 level-1, 72 level-2.
 -- ---------------------------------------------------------------------------
 --
 -- Seeded HERE rather than by a script, because it is reference data with fixed
@@ -130,7 +130,7 @@ CREATE INDEX IF NOT EXISTS idx_action_item_tags_run ON action_item_tags (run_id)
 -- environment nobody was looking at.
 --
 -- Counted against a real database rather than by eye: applying this file inside
--- a rollback-only transaction on TEST yields 12 parents, 70 children, 82 rows,
+-- a rollback-only transaction on TEST yields 12 parents, 72 children, 84 rows,
 -- every child's slug prefixed by its parent's, and no third level. The first
 -- draft of this comment said 65, which is what counting in your head gets you.
 --
@@ -145,6 +145,32 @@ CREATE INDEX IF NOT EXISTS idx_action_item_tags_run ON action_item_tags (run_id)
 -- anything that duplicates a column that already exists (work/non-work,
 -- inspection/meeting origin, severity), and anything that is a person or a
 -- place -- those are `participants` and the location markers.
+--
+-- THERE IS NO 'PRODUCT' OR 'TOOL' GROUP, AND THAT IS A DECISION, NOT AN
+-- OVERSIGHT. Someone reading the data will notice a large block of obviously
+-- work-related conversation carrying no label at all -- device tests, app
+-- features, AI trials, voiceprint capture -- and will reasonably wonder
+-- whether tagging is broken. It is not. Measured on 100 real prod topics,
+-- 31 of them are this product talking about itself, and two annotators
+-- labelling them blind BOTH left all of them empty without any rule telling
+-- them to.
+--
+-- They are left empty because:
+--
+--   * this is a taxonomy of construction work. A group that absorbs
+--     "everything else this company talks about" stops it being one, and the
+--     first thing that lands in it is the second thing, and then everything;
+--   * those topics are OUR dogfooding, not a customer's site. A customer's
+--     corpus does not contain them, so the group would be a permanent empty
+--     branch in every account that pays for this;
+--   * the question they really raise -- "which recordings are not customer
+--     content" -- is a fact about the RECORDING, not about what was discussed.
+--     `topics.work_class` is already that shape. Answering it with a
+--     construction tag would put the answer in the one place that cannot be
+--     filtered on without also filtering real work.
+--
+-- If that question ever needs answering, it needs a corpus-level flag. It does
+-- not need a branch of this tree.
 INSERT INTO tag (company_id, site_id, parent_id, slug, label, sort_order)
 SELECT NULL, NULL, NULL, v.slug, v.label, v.ord
   FROM (VALUES
@@ -227,6 +253,18 @@ SELECT NULL, NULL, p.id, v.slug, v.label, v.ord
     ('safety',       'safety.permit-and-isolation',      'Permit & isolation',     40),
     ('safety',       'safety.traffic-management',        'Traffic management',     50),
     ('safety',       'safety.induction',                 'Induction',              60),
+    -- ADDED AFTER MEASUREMENT, not from the armchair. Two independent
+    -- annotators labelled the same 100 prod topics without seeing each other's
+    -- answers, and THREE items had no leaf either of them could honestly use:
+    -- an evacuation drill, a Task Analysis document nobody could open, and
+    -- emergency procedures raised during a site walk. One of us binned all
+    -- three under `induction`; the other scattered them to `hazard`,
+    -- `incident-or-near-miss`, `structure.slab` and `plant-and-equipment`.
+    -- Those three items are 3 of the 4 where the two annotators shared no leaf
+    -- at all -- three quarters of the total hard disagreement came from one
+    -- missing concept, split in two.
+    ('safety',       'safety.emergency-preparedness',    'Emergency preparedness', 70),
+    ('safety',       'safety.method-statement',          'Method statement / TA',  80),
 
     ('commercial',   'commercial.variation',             'Variation',              10),
     ('commercial',   'commercial.cost-and-pricing',      'Cost & pricing',         20),

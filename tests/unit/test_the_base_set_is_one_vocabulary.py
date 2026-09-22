@@ -76,9 +76,15 @@ def test_no_slug_appears_twice():
 
 
 def test_the_counts_are_the_ones_that_were_measured():
-    """12 and 70, counted against a real database rather than by eye -- the
-    first draft of the migration comment said 65. If either number moves, the
-    bake-off's 100 gold labels were scored against a different vocabulary and
-    have to be re-run rather than carried forward."""
+    """12 and 72, counted against a real database rather than by eye -- the
+    first draft of the migration comment said 65 and the count was 70. If
+    either number moves, the bake-off's 100 gold labels were scored against a
+    different vocabulary and have to be RE-RUN rather than carried forward.
+
+    It moved once, from 70 to 72, and the re-run happened: two annotators
+    labelling the same 100 topics blind both ran out of vocabulary on the same
+    three items (an evacuation drill, a Task Analysis nobody could open,
+    emergency procedures on a site walk), so `safety.emergency-preparedness`
+    and `safety.method-statement` were added and the gold re-hashed."""
     assert len(taxonomy_base.PARENTS) == 12
-    assert len(taxonomy_base.LEAVES) == 70
+    assert len(taxonomy_base.LEAVES) == 72

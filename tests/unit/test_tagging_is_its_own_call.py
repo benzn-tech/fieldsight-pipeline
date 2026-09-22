@@ -212,7 +212,7 @@ def test_the_extraction_lambda_tags_after_the_topics_exist(monkeypatch):
                             or ([["safety.hazard"]] * len(topics), {"unanswered": 0})))
     topics = [{"topic_title": "A", "summary": "x"}, {"topic_title": "B", "summary": "y"}]
     ex.tag_topics(topics)
-    assert seen == {"n": 2, "leaves": 70}
+    assert seen == {"n": 2, "leaves": 72}   # the base set, all of it
     assert [t["tags"] for t in topics] == [["safety.hazard"], ["safety.hazard"]]
 
 
