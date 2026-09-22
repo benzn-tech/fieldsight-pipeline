@@ -44,8 +44,17 @@ def list_visible(conn, company_id, site_ids, *, include_inactive=False) -> list[
     every picker, and INCLUDED on request because otherwise the admin screen
     could never show one to switch it back on.
 
-    Ordered so a caller can render the tree without sorting: parents first by
-    their own order, then children under them.
+    Ordered by (sort_order, label) and NOTHING ELSE. The first draft tried to
+    group each parent with its children in SQL --
+    `ORDER BY COALESCE(parent_id::text, id::text), ...` -- which does group
+    them, and then orders the GROUPS by a uuid rendered as text. The twelve
+    top-level tags would have come out in an order nobody chose and that
+    changes every time the base set is re-seeded into a fresh database. A unit
+    test on the client's tree builder is what caught it.
+
+    The client builds the tree (api/tags.js asTree) and sorts each level by
+    the same two columns, so the ordering lives in one shape rather than being
+    half-expressed here and half there.
     """
     where = ("(company_id IS NULL "
              " OR (company_id = %s AND site_id IS NULL) "
@@ -55,9 +64,7 @@ def list_visible(conn, company_id, site_ids, *, include_inactive=False) -> list[
     if not include_inactive:
         where += " AND is_active"
     return conn.cursor(row_factory=dict_row).execute(
-        f"SELECT {_COLS} FROM tag WHERE {where} "
-        "ORDER BY COALESCE(parent_id::text, id::text), parent_id NULLS FIRST, "
-        "sort_order, label",
+        f"SELECT {_COLS} FROM tag WHERE {where} ORDER BY sort_order, label",
         tuple(params),
     ).fetchall()
 
