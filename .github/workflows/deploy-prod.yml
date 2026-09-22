@@ -82,7 +82,11 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m pip install --upgrade pip
-      - run: pip install "psycopg[binary]>=3.1" "pgvector>=0.3" "PyJWT[crypto]>=2.8" boto3 numpy "python-docx>=1.1" pytest pytest-cov
+      # Identical to test.yml's list on purpose -- see the note there. PyYAML
+      # is what makes the four template/workflow guards actually run; a prod
+      # gate that skips them is a gate that reports green over the checks most
+      # specific to deploying.
+      - run: pip install "psycopg[binary]>=3.1" "pgvector>=0.3" "PyJWT[crypto]>=2.8" PyYAML boto3 numpy "python-docx>=1.1" pytest pytest-cov
       - run: python -m pytest -v
 
   deploy-prod:
@@ -303,6 +307,7 @@ jobs:
               "RebindSpeakers=${{ vars.PROD_REBIND_SPEAKERS || 'false' }}" \
               "EnableTodoCollapse=${{ vars.PROD_ENABLE_TODO_COLLAPSE || 'false' }}" \
               "EnableThreadSuggestions=${{ vars.PROD_ENABLE_THREAD_SUGGESTIONS || 'true' }}" \
+              "EnableTopicTagging=${{ vars.PROD_ENABLE_TOPIC_TAGGING || 'false' }}" \
               $KF_LAYER_PARAM \
               "RealPTTAccount=$REALPTT_ACCOUNT" \
               "RealPTTPassword=$REALPTT_PASSWORD" \

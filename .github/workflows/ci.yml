@@ -32,4 +32,17 @@ jobs:
         # Retry a newer version deliberately; do not drop the pin to "get green".
         run: pip install 'cfn-lint==1.53.3'
       - name: Lint CloudFormation templates (SAM transform + plain CFN)
+        # TO RUN THIS LOCALLY, RUN THIS LINE. Not a paraphrase of it:
+        #   cfn-lint src/template.yaml infra/db-template.yaml
+        # at the version pinned above, and read cfn-lint's OWN exit code.
+        # Three ways a local run has passed while saying nothing:
+        #   * a different version -- 1.22.3 accepts what 1.53.3 rejects;
+        #   * `template.yaml` -- there is no template at the repo root, and the
+        #     E0003 "could not be processed by glob.glob" that you get instead
+        #     looks like a finding about the template rather than about the path;
+        #   * `cfn-lint ... | tail` -- the pipeline's exit code belongs to
+        #     `tail`, which always succeeds. Use `set -o pipefail` or no pipe.
+        # And lint BOTH templates: the second one is a plain CFN stack that the
+        # SAM transform never touches, so the first file passing says nothing
+        # about it.
         run: cfn-lint src/template.yaml infra/db-template.yaml
