@@ -178,9 +178,14 @@ def test_the_speed_actually_goes_on_the_wire(monkeypatch):
     assert sent["voice_settings"]["speed"] == 1.2
 
 
-def test_speed_one_sends_nothing(monkeypatch):
-    """1.0 is "as written", and sending it would be a settings object that says
-    nothing -- which is how a future reader concludes the field is required."""
+def test_speed_one_is_still_sent(monkeypatch):
+    """This test used to assert the opposite, on the reading that 1.0 is "as
+    written" so sending it says nothing. Measured 2026-09-22 on James, the
+    same sentence through the same endpoint: no voice_settings gave 1.90s and
+    2.04s of audio, explicit speed 1.0 gave 2.18s and 2.23s. Omitting the
+    field does not mean the API default -- it means the settings saved against
+    that voice in the ElevenLabs workspace, a web console no deploy can see.
+    So 1.0 has to go on the wire like any other value."""
     monkeypatch.setattr(el, "ELEVENLABS_TTS_API_KEY", "k")
     monkeypatch.setattr(el, "ELEVENLABS_TTS_SPEED", 1.0)
     seen = {}
@@ -197,7 +202,7 @@ def test_speed_one_sends_nothing(monkeypatch):
     monkeypatch.setattr(el.urllib3, "PoolManager", lambda *a, **k: _Pool())
     el.tts("hello")
     import json as _j
-    assert "voice_settings" not in _j.loads(seen["body"])
+    assert _j.loads(seen["body"])["voice_settings"]["speed"] == 1.0
 
 
 def test_the_conversational_model_is_the_default():
@@ -207,4 +212,4 @@ def test_the_conversational_model_is_the_default():
     back to flash for speed, the trade being made is 0.51s against the
     expressiveness of a voice a person on a site listens to."""
     assert el.ELEVENLABS_TTS_MODEL == "eleven_v3_conversational"
-    assert el.ELEVENLABS_TTS_VOICE == "bPkjmCb0W1xUBvyH2Afs"
+    assert el.ELEVENLABS_TTS_VOICE == "QlZn2MPaf2jDn0461bnj"

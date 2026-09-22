@@ -27,6 +27,7 @@ The contract, in full:
   * every value the template will accept has a branch.
 """
 import importlib
+import json
 import re
 
 import pytest
@@ -165,3 +166,41 @@ def test_an_unknown_provider_falls_back_rather_than_crashing(monkeypatch):
     monkeypatch.setattr(dashscope_utils, "stt", lambda audio, fmt=None: "dashscope")
     monkeypatch.setenv("ASK_STT_PROVIDER", "elevnlabs")
     assert laa._stt(b"clip", "m4a") == "dashscope"
+
+# ---- the voice's settings come from this repo, not from a web console -----
+
+def test_the_speed_setting_is_always_on_the_wire(monkeypatch):
+    """`voice_settings` used to be omitted when speed was exactly 1.0, on the
+    reading that 1.0 is the default anyway. It is not: omitting it tells
+    ElevenLabs to use whatever the VOICE has saved in the workspace, which is
+    a dashboard any account holder can edit and no deploy can see. Measured
+    2026-09-22 on James, same sentence, same endpoint: no voice_settings gave
+    1.90s and 2.04s of audio, explicit speed 1.0 gave 2.18s and 2.23s -- so
+    the omission silently handed the product's voice to a web console.
+    """
+    import elevenlabs_utils as el
+
+    sent = {}
+
+    class Resp:
+        status = 200
+        data = b"pcm"
+
+    class Fake:
+        def __init__(self, *a, **kw):
+            pass
+
+        def request(self, method, url, body=None, headers=None, **kw):
+            sent["body"] = json.loads(body)
+            return Resp()
+
+    monkeypatch.setattr(el, "ELEVENLABS_TTS_API_KEY", "k")
+    monkeypatch.setattr(el.urllib3, "PoolManager", Fake)
+
+    for speed in (1.0, 1.10, 1.2):
+        sent.clear()
+        monkeypatch.setattr(el, "ELEVENLABS_TTS_SPEED", speed)
+        el.tts("say something")
+        assert "voice_settings" in sent["body"], (
+            "speed %s: omitting voice_settings defers to the workspace" % speed)
+        assert sent["body"]["voice_settings"]["speed"] == speed
