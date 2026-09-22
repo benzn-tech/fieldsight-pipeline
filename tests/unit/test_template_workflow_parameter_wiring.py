@@ -281,6 +281,57 @@ def test_the_test_key_does_not_silently_fall_back_to_prods():
     assert "||" not in line[0], "no silent fallback to prod's key"
 
 
+# ---- a Default is not a deployed value -----------------------------------
+
+_WIRED_LITERALS = {
+    "ElevenLabsTtsVoice": "QlZn2MPaf2jDn0461bnj",
+    "ElevenLabsTtsSpeed": "1.10",
+    "ElevenLabsTtsModel": "eleven_multilingual_v2",
+}
+
+
+def _override_literal(env, parameter):
+    """The literal a workflow passes for one --parameter-overrides entry."""
+    text = open(WORKFLOWS[env], encoding="utf-8").read()
+    m = re.search(r'"%s=([^"]*)"' % parameter, text)
+    return m.group(1) if m else None
+
+
+def _template_default(parameter):
+    text = open("src/template.yaml", encoding="utf-8").read()
+    block = text[text.index("\n  %s:\n" % parameter):]
+    m = re.search(r"^\s*Default:\s*'?([^'\s]+)'?\s*$", block, re.MULTILINE)
+    assert m, "%s declares no Default" % parameter
+    return m.group(1)
+
+
+@pytest.mark.parametrize("parameter,expected", sorted(_WIRED_LITERALS.items()))
+def test_the_voice_and_speed_are_wired_not_just_defaulted(parameter, expected):
+    """A template Default does not reach a stack that already exists.
+
+    sam deploy sends only the parameters it is given; CloudFormation carries
+    its PREVIOUS value forward for every parameter it does not see. So a
+    Default governs a brand-new stack and nothing else.
+
+    Measured 2026-09-22, which is the only reason this test exists:
+    ElevenLabsTtsVoice's Default was changed to James, TEST deployed at
+    02:16Z, prod deployed at 02:34Z, and BOTH stacks still reported
+    ElevenLabsTtsVoice=bPkjmCb0W1xUBvyH2Afs. Green CI, two successful
+    deploys, the old voice, and no error anywhere to notice.
+
+    So both workflows pass these explicitly, and all three copies -- the two
+    workflow literals and the template Default -- must agree, because three
+    places holding one value is three places to drift.
+    """
+    for env in ("test", "prod"):
+        assert _override_literal(env, parameter) == expected, (
+            "%s does not pass %s=%s; a Default alone changes nothing on a "
+            "stack that already exists" % (WORKFLOWS[env], parameter, expected))
+    assert _template_default(parameter) == expected, (
+        "%s: the template Default disagrees with what the workflows pass"
+        % parameter)
+
+
 # ---- the Ask voice keys are per environment too --------------------------
 
 _ASK_VOICE_KEYS = ("ELEVENLABS_ASK_API_KEY", "ELEVENLABS_API_KEY_TTS")
