@@ -1,0 +1,29 @@
+{
+  "scope": {
+    "kind": "time_range",
+    "folder": "Ben_UCPK2",
+    "date": "2026-09-10",
+    "from": "09:00",
+    "to": "11:30",
+    "objects_selected": 70,
+    "objects_in_day": 229
+  },
+  "template": {
+    "id": "personal-meeting",
+    "version": 3,
+    "name": "Personal Meeting Notes (tight, complete action list)"
+  },
+  "model": "muse-spark-1.3-contributor",
+  "generated_at": "2026-09-16T05:06:24+00:00",
+  "usage": {
+    "completion_tokens": 14428,
+    "prompt_tokens": 67891,
+    "total_tokens": 82319,
+    "completion_tokens_details": {
+      "reasoning_tokens": 13654
+    },
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}
