@@ -1027,6 +1027,32 @@ Parameters:
       switching it back off leaves the merged record and does not restore what
       was deleted. Flip it on a day when a two-device recording can be watched.
 
+  EnableTopicTagging:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Whether a finished session's topics are labelled with the taxonomy
+      (migration 0065). Read by ItemWriterFunction, which emits a
+      retag_requests/ artifact AFTER the topics are committed and the
+      recorder's confirmation email is enqueued; RetagFunction then classifies
+      and hands the labels back. Labels arrive minutes later and nothing waits
+      on them.
+
+      IT IS NOT DONE INSIDE THE EXTRACTION, and that is the decision rather
+      than an omission. One tagging call measures 27-48s; the confirmation
+      email's path measures p90 163s against a 180s budget. Seventeen seconds
+      of headroom does not absorb thirty, so doing it inline breaches at p90
+      rather than maybe-breaching. Anyone wanting synchronous tagging has
+      those numbers to beat, re-measured rather than assumed to have improved.
+
+      Chosen by measurement over 100 real prod topics, four runs each: the
+      classifier call scored macro F1 0.845 against an independent second
+      annotator's labels (95% of the 0.888 the two annotators reach against
+      each other) and abstained correctly on 50/50 of the untaggable half in
+      every run. That abstention is the property worth protecting: half a real
+      corpus takes no construction tag. Measured cost 0.0014 USD per hundred
+      items. Default OFF so the change ships inert.
   EmitEvidence:
     Type: String
     Default: 'false'
@@ -2197,6 +2223,17 @@ Resources:
                 - s3:PutObject
                 - s3:GetObject
               Resource: !Sub arn:aws:s3:::${DataBucketName}/programmes/*
+            - Effect: Allow
+              # Starting a re-tag run writes one retag_requests/ artifact per
+              # batch. PutObject ONLY, and into the LAKE bucket, because that
+              # is where RetagFunction reads from -- org-api writes most things
+              # to DataBucketName and this one has to go where its reader is.
+              #
+              # Write-only on purpose: nothing in org-api reads these back, and
+              # a grant wider than the one use is how a request handler ends up
+              # able to touch an artifact it has no business reading.
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/retag_requests/*
             - Effect: Allow
               # Site coordinates, published for the report generator.
               #
@@ -3507,6 +3544,7 @@ Resources:
           # video-keyframe plan: emit keyframe_requests/ post-commit only when
           # this stage flag is on (ships inert otherwise).
           EMIT_KEYFRAME_REQUESTS: !Ref EnableKeyframes
+          ENABLE_TOPIC_TAGGING: !Ref EnableTopicTagging
           REBIND_SPEAKERS: !Ref RebindSpeakers
           # recurring-item threading: propose which earlier subject a new
           # topic restates. Writes suggestions only; never links.
@@ -3534,6 +3572,13 @@ Resources:
               # above). Its own PutObject grant, gated to the disjoint prefix.
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/keyframe_requests/*
+            - Effect: Allow
+              # Taxonomy tagging: the same shape again, and for the same
+              # reason. Asked for AFTER the confirmation email is enqueued, so
+              # its 27-48 seconds land off the path that has 17 seconds of
+              # headroom. Its own PutObject grant on a disjoint prefix.
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/retag_requests/*
             - Effect: Allow
               # Phase C multi-device merge: once the merged topics are durable,
               # every member is told to look at them. Enqueued HERE and not by
@@ -4014,6 +4059,80 @@ Resources:
                 StringLike:
                   s3:prefix:
                     - match_requests/*
+
+  # ----------------------------------------------------------
+  # Re-tag: the non-VPC hop of a re-tag run.
+  #
+  # Re-tagging existing data needs the model AND the database, and no single
+  # function can have both: the VPC has an S3 gateway endpoint and no NAT
+  # (BUG-36). So it is three hops, and this is the middle one -- exactly the
+  # shape MatcherFunction/SuggestionWriterFunction already use:
+  #
+  #   OrgApiFunction    in-VPC   opens the run, writes retag_requests/
+  #   RetagFunction     non-VPC  this one; classifies; invokes ->
+  #   ItemWriterFunction in-VPC  op:"apply_tags", writes and closes the run
+  #
+  # NO VpcConfig and NO PG credentials: this function reaches the model and S3
+  # and nothing else, and giving it a database grant to save a hop is the wrong
+  # end of the trade.
+  #
+  # NO Events: S3 wired manually per BUG-33 -- scripts/wire-s3-events.sh
+  # carries the entry (fs-retag, retag_requests/ prefix, .json suffix).
+  #
+  # Condition HasDb, for the same reason MatcherFunction has it: the env and
+  # policy reference ItemWriterFunction, which only exists when HasDb is true.
+  # ----------------------------------------------------------
+  RetagFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-retag", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_retag.lambda_handler
+      # One artifact is 20 topics = one model call, measured at 27-48 seconds.
+      # 300 leaves room for the retry ladder inside llm_utils without leaving a
+      # whole batch hanging on a slow endpoint.
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref IngestBucketName
+          # Ref on a Lambda resource returns its physical function name --
+          # same pattern as MatcherFunction's SUGGESTION_WRITER_FUNCTION.
+          TAG_WRITER_FUNCTION: !Ref ItemWriterFunction
+          ANTHROPIC_API_KEY: !Ref ClaudeApiKey
+          CLAUDE_MODEL: claude-sonnet-4-6
+          LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
+          QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
+          QWEN_BASE_URL: !Ref QwenBaseUrl
+          # THE MODEL THE BAKE-OFF MEASURED, which is the one
+          # ExtractSessionFunction runs (QwenModelPlus). There is a cheaper
+          # QwenModelFast parameter and it is deliberately not used here:
+          # macro F1 0.875 and the 50/50 abstention were measured on Plus, and
+          # shipping a different model would make those numbers describe
+          # something nobody ran.
+          QWEN_MODEL: !Ref QwenModelPlus
+          LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
+          QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ItemWriterFunction
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/retag_requests/*
+            - Effect: Allow
+              # Without ListBucket, S3 answers 403 rather than 404 for a
+              # missing key under a prefix this role cannot list -- the
+              # failure this repo has shipped eight times.
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - retag_requests/*
 
   # ----------------------------------------------------------
   # Lambda 16: RAG Search (Phase 5) — in-VPC ACL-scoped semantic

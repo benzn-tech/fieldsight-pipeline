@@ -58,6 +58,7 @@ import boto3
 import lambda_ingest
 import keyframe_request
 import match_request
+import retag_request
 from db.connection import get_connection
 from keyframe_selection import keyframe_seconds
 from photo_binding import PHOTOS_PER_TOPIC_CAP  # noqa: F401  (re-export)
@@ -68,7 +69,8 @@ import thread_match
 from repositories import location_markers
 from repositories import (companies, findings, meeting_session, recordings,
                           redactions,
-                          session_group, sites, threads, topics)
+                          session_group, sites, tag_writes, tags, threads,
+                          topics)
 # The extraction-key shape lives in session_scope now (the read side needs the
 # SAME parse to derive session_id from topics.source_s3_key -- see that
 # module). Re-exported under the historical private names so existing callers
@@ -88,6 +90,16 @@ COMPANY_NAME = os.environ.get("COMPANY_NAME", "FieldSight")
 # video-keyframe plan: ship the pipeline change inert -- only when
 # EnableKeyframes flips this env true does item-writer emit keyframe_requests/.
 EMIT_KEYFRAME_REQUESTS = os.environ.get("EMIT_KEYFRAME_REQUESTS", "false").lower() == "true"
+
+#: Label a freshly-written session's topics with the taxonomy.
+#:
+#: ASKED FOR HERE, AND AFTER THE EMAIL, because of where the time goes. The
+#: tagging call measures 27-48s; the recorder's confirmation email is sent from
+#: this function and its path measures p90 163s against a 180s budget. Doing it
+#: inside lambda_extract_session put thirty seconds in front of seventeen
+#: seconds of headroom. Emitting a request instead costs one S3 PUT, the
+#: labels arrive minutes later on the retag chain, and nothing waits on them.
+ENABLE_TOPIC_TAGGING = os.environ.get("ENABLE_TOPIC_TAGGING", "false").lower() == "true"
 
 #: Ask for an anonymous speaker re-bind at the end of a session. Off by default, like every
 #: other switch in this feature: it costs ~100 s of ONNX on a shared concurrency slot, and a
@@ -629,6 +641,66 @@ def _put_finalize_request(key, body, only_if_absent=False):
 # existing callers and tests.
 # ----------------------------------------------------------
 
+
+
+def _request_topic_tagging(conn, company_id, topics):
+    """Ask for this session's topics to be labelled, off the critical path.
+
+    The whole point is WHERE this is not. The tagging call takes 27-48 seconds
+    and the recorder's confirmation email is sent from this same function on a
+    path measured at p90 163s against a 180s budget -- so the work is handed to
+    the retag chain (RetagFunction, non-VPC) rather than done inline. One S3
+    PUT here; the labels land minutes later and nothing waits for them.
+
+    No run ledger row: this is not a re-tag BATCH, it is one session catching
+    up, and a tag_run per session would fill the table with rows nobody will
+    ever roll back. `run_id` is NULL on the resulting assignments, which is
+    what distinguishes "tagged as it arrived" from "tagged by run X".
+
+    NEVER RAISES. It runs after the rows are durable and after the email is
+    enqueued, so a failure here costs a label and nothing else.
+    """
+    if not ENABLE_TOPIC_TAGGING or not topics:
+        return
+    try:
+        retag_request.emit(s3(), S3_BUCKET, f"session-{topics[0]['id']}",
+                           company_id, topics)
+    except Exception:  # noqa: BLE001 -- see above
+        logger.exception("tagging request not emitted for %d topic(s); they "
+                         "stay untagged and nothing else is affected", len(topics))
+
+
+def _write_topic_tags(conn, company_id, topic_id, slugs):
+    """Persist one topic's extraction-time labels. Never raises.
+
+    `source='extraction'`, which is what decides who may replace them later: a
+    re-tag run may, and a human's correction may not be replaced by anything.
+    Same vocabulary the photo binding had to learn.
+
+    A slug the database has no row for is DROPPED, not invented. The tagger
+    already refuses to emit a slug outside the base set, so a miss here means
+    the two copies of the base set have drifted -- which
+    tests/unit/test_the_base_set_is_one_vocabulary.py exists to prevent, and
+    which this must not paper over by guessing a nearby tag.
+
+    No tags is the common case -- half of a real corpus abstains -- and it
+    costs ZERO queries rather than one lookup per untagged topic.
+    """
+    if not slugs:
+        return 0
+    by_slug = tags.ids_for_slugs(conn, company_id, slugs)
+    ids = [by_slug[s] for s in slugs if s in by_slug]
+    missing = [s for s in slugs if s not in by_slug]
+    if missing:
+        logger.warning("tagging: %d slug(s) have no row for this company and were "
+                       "dropped (%s) -- the base set in code and in the database "
+                       "may have drifted", len(missing), ", ".join(sorted(missing)))
+    if not ids:
+        return 0
+    return tag_writes.apply_tags(conn, "topic", topic_id, ids,
+                                 source="extraction", run_id=None)
+
+
 def _list_pictures(prefix):
     """Pictures listing bound to THIS module's S3 client + bucket (the
     shared lister is client-parameterized so lambda_ingest can reuse it)."""
@@ -1030,6 +1102,12 @@ def write_extraction_items(date, user_folder, extraction_key):
             finding_rows = findings.insert_findings(
                 conn, row["id"], site["id"], t.get("findings") or [])
 
+            # The labels the extraction's SECOND call produced, if it ran.
+            # `t.get("tags")` is absent on every artifact written before
+            # tagging existed and on every one written with the switch off --
+            # both mean "no labels", both cost zero queries.
+            _write_topic_tags(conn, company["id"], row["id"], t.get("tags"))
+
             # Snapshot for the match_requests/ artifact (Task 4) -- the
             # non-VPC MatcherFunction reads this, never Aurora directly, so
             # every field it needs (the durable topic id + the same
@@ -1100,6 +1178,11 @@ def write_extraction_items(date, user_folder, extraction_key):
         if extraction.get("tier") == "final":
             final_email_ctx = _final_email_context(conn, session_base, extraction, date)
 
+        # Resolved INSIDE the block, used after it: psycopg3's `with conn:`
+        # closes the connection on exit, and `company` is only in scope here.
+        # The same reason final_email_ctx is resolved here and enqueued below.
+        company_id_for_tagging = company["id"]
+
         if ENABLE_GROUP_MERGE and extraction.get("tier") == "group" and topics_n:
             session_group.mark_result(conn, extraction["groupId"], "merged")
             # Resolved HERE because the connection dies with the block below,
@@ -1125,6 +1208,14 @@ def write_extraction_items(date, user_folder, extraction_key):
             # undo them. The sweep's backstop still mails this session.
             logger.exception("session %s: topics written but the confirmation "
                              "email could not be enqueued", final_email_ctx.get("sessionId"))
+
+    # AFTER the email, deliberately -- see _request_topic_tagging. `collected_
+    # topics` carries the durable ids and the text the tagger reads, which is
+    # everything the request needs and nothing else.
+    _request_topic_tagging(None, company_id_for_tagging,
+                           [{"id": t["topic_id"], "title": t["title"],
+                             "summary": t.get("summary") or ""}
+                            for t in collected_topics])
 
     if ENABLE_GROUP_MERGE and extraction.get("tier") == "group" and topics_n:
         try:
@@ -1217,8 +1308,76 @@ def _source_is_deleted(conn, source_s3_key) -> bool:
     return bool(hit)
 
 
+def _is_tag_op(event):
+    """Is this a re-tag write, rather than the S3 event this lambda was built
+    for? Asked as its own function so the dispatch is one testable fact.
+
+    Keyed on an explicit `op`, not on the ABSENCE of `Records`: an S3 event
+    that arrived malformed would otherwise fall through into the write path
+    with no topics and quietly close somebody's run."""
+    return isinstance(event, dict) and event.get("op") == "apply_tags"
+
+
+def apply_retag_batch(event):
+    """The in-VPC half of a re-tag run (see lambda_retag for the other two).
+
+    Arrives by direct invoke from the non-VPC classifier -- the same
+    non-VPC -> in-VPC direction the programme matcher uses, because an in-VPC
+    function cannot reach the model and this one cannot reach the database.
+
+    The payload carries topic ids and slugs and NOTHING ELSE. There is no field
+    for a title or a summary, so a re-tag cannot alter what was written however
+    this function behaves: the owner's boundary is in the shape of the message,
+    not in anyone's memory.
+
+    `source='classifier'`, not 'extraction': these labels came from a re-tag,
+    and the source is what decides who may replace them. A human's correction
+    is never replaced by anything.
+
+    A topic with NO slugs is reported and writes nothing. Half a real corpus
+    abstains, so that is the ordinary case and not a failure -- and it still
+    counts as covered, which is why the run can be closed at the end.
+    """
+    run_id = event.get("run_id")
+    company_id = event.get("company_id")
+    applied = covered = 0
+    # (kind, id-field, rows) -- two tables, one loop, so the slug resolution
+    # and the run stamping cannot drift between them.
+    batches = (("topic", "topic_id", event.get("tagged") or []),
+               ("action_item", "action_item_id", event.get("tagged_actions") or []))
+    with get_connection() as conn:
+        for kind, id_field, rows in batches:
+            for row in rows:
+                covered += 1
+                slugs = row.get("slugs") or []
+                if not slugs:
+                    continue
+                by_slug = tags.ids_for_slugs(conn, company_id, slugs)
+                ids = [by_slug[s] for s in slugs if s in by_slug]
+                missing = [s for s in slugs if s not in by_slug]
+                if missing:
+                    logger.warning("retag: %d slug(s) have no row for this company "
+                                   "and were dropped (%s)", len(missing),
+                                   ", ".join(sorted(missing)))
+                if ids:
+                    applied += tag_writes.apply_tags(
+                        conn, kind, row[id_field], ids,
+                        source="classifier", run_id=run_id)
+        # Closed HERE, inside the connection, so the run's status is durable
+        # in the same transaction as the rows it describes. A run left open is
+        # indistinguishable from one still going, and nobody can tell whether
+        # to roll it back.
+        tag_writes.finish_run(conn, run_id,
+                              stats={"topics": covered, "tags": applied})
+    logger.info("retag: run %s covered %d topic(s), wrote %d tag(s)",
+                run_id, covered, applied)
+    return {"run_id": run_id, "topics": covered, "tags": applied}
+
+
 def lambda_handler(event, context):
     event = event or {}
+    if _is_tag_op(event):
+        return apply_retag_batch(event)
     results = []
     for record in event.get("Records", []):
         key = unquote_plus(record["s3"]["object"]["key"])

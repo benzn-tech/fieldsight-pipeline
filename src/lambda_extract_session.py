@@ -287,6 +287,26 @@ FILTER_AUDIO_EVENT_TAGS = os.environ.get(
 # to discover the morning after.
 EMIT_EVIDENCE = os.environ.get('EMIT_EVIDENCE', 'false').lower() == 'true'
 
+# TAGGING IS NOT DONE HERE, AND THAT IS THE DECISION, not an omission.
+#
+# It was, for one commit. The arithmetic is why it moved: the recorder's
+# confirmation email is sent once this artifact lands (lambda_item_writer's
+# _final_email_context), that path measures p90 163s against a 180s budget,
+# and one tagging call measures 27-48s. Seventeen seconds of headroom does not
+# absorb thirty -- at p90 it does not "maybe" breach, it breaches. Measuring it
+# on TEST first would only have told us how thin the margin already is.
+#
+# So tagging runs OFF this path, on the chain that exists for exactly that:
+# lambda_item_writer emits a retag_requests/ artifact after the topics are
+# committed and the email is enqueued, the non-VPC RetagFunction classifies,
+# and item-writer writes the tags back. Labels arrive minutes late and nothing
+# waits on them -- the email carries `openTodos` and no tags (checked:
+# email_sender, lambda_finalize_claim and session_brief mention tags nowhere).
+#
+# If anyone ever wants synchronous tagging here, the numbers above are the
+# thing to beat, and they have to be re-measured -- not assumed to have
+# improved.
+
 
 # Calibrated 2026-08-10 against two real sessions; the reasoning is in the
 # template Parameters and the PR. The code defaults are kept EQUAL to the
@@ -1730,6 +1750,7 @@ def extraction_key(user_folder, date, session_base):
 #: None, which means "nothing is published". Conflating them is what makes a
 #: silent read failure look like permission to overwrite.
 UNKNOWN = object()
+
 
 
 def read_existing_extraction(bucket, out_key):

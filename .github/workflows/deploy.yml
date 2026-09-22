@@ -225,6 +225,7 @@ jobs:
               "RebindSpeakers=${{ vars.TEST_REBIND_SPEAKERS || 'false' }}" \
               "EnableTodoCollapse=${{ vars.TEST_ENABLE_TODO_COLLAPSE || 'false' }}" \
               "EnableThreadSuggestions=${{ vars.TEST_ENABLE_THREAD_SUGGESTIONS || 'true' }}" \
+              "EnableTopicTagging=${{ vars.TEST_ENABLE_TOPIC_TAGGING || 'false' }}" \
               $KF_LAYER_PARAM \
               $VAD_LAYER_PARAM \
               "ItemsTableName=fieldsight-test-items" \

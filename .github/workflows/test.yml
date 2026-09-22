@@ -35,5 +35,12 @@ jobs:
       # suite is green over a path nothing checked. Keep this list identical to
       # the one in deploy-prod.yml — that one has been short an entry before, and
       # the miss showed up as `skipped`, not `failed`, so nothing alerted.
-      - run: pip install "psycopg[binary]>=3.1" "pgvector>=0.3" "PyJWT[crypto]>=2.8" boto3 numpy "python-docx>=1.1" pytest pytest-cov
+      # PyYAML is on this list for the same reason python-docx is, and it was
+      # missing for longer. Four test files open with `importorskip("yaml")`
+      # because they read the template and the workflows as YAML -- among them
+      # test_template_workflow_parameter_wiring.py, which exists BECAUSE a
+      # toggle shipped unwired on 2026-08-08. Without PyYAML that guard was
+      # skipped in CI and locally, i.e. it had never run anywhere since it was
+      # written, and it went red the first time it was given the chance.
+      - run: pip install "psycopg[binary]>=3.1" "pgvector>=0.3" "PyJWT[crypto]>=2.8" PyYAML boto3 numpy "python-docx>=1.1" pytest pytest-cov
       - run: python -m pytest -v
