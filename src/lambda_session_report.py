@@ -329,7 +329,20 @@ def _put_document(artifact, buf):
 def _generate_document(artifact, context=None):
     """Returns (buffer, meta). Raises on anything that must not produce a document."""
     gen = artifact["generate"]
-    template = report_template.load_template(gen["templateId"], int(gen["templateVersion"]))
+    # THE BODY ARRIVES WITH THE REQUEST. This function runs non-VPC and cannot
+    # reach Aurora, so a template a company wrote in the Library could never be
+    # read from here. org-api resolves it in the VPC and inlines it, and inlines
+    # the file-backed ones the same way so there is ONE path rather than two.
+    #
+    # The fallback to disk is for artifacts enqueued BEFORE this field existed
+    # and still sitting in the bucket when this deploys. It is deliberately not
+    # a fallback for a uuid: report_template.load_template rejects anything that
+    # is not a slug, so a stored template with no inlined body raises
+    # TemplateNotFound rather than silently writing the report to some other
+    # template -- which would make the template name in the result a lie.
+    template = gen.get("templateBody")
+    if not template:
+        template = report_template.load_template(gen["templateId"], int(gen["templateVersion"]))
     content = artifact.get("content") or {}
     date = artifact.get("date") or content.get("date")
     window = artifact.get("window") or {}

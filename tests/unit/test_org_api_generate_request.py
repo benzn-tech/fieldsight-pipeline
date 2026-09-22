@@ -102,8 +102,24 @@ def day_generate(day):
 def test_a_named_template_reaches_the_worker_with_the_window(day_generate):
     put = day_generate(_body(**{"from": "09:00", "to": "11:30"}))
     artifact = json.loads(put["Body"])
-    assert artifact["generate"] == {"templateId": "personal-meeting", "templateVersion": 3}
+    gen = artifact["generate"]
+    assert gen["templateId"] == "personal-meeting" and gen["templateVersion"] == 3
     assert artifact["window"] == {"from": "09:00", "to": "11:30"}
+
+
+def test_the_body_travels_with_the_request_not_just_its_name(day_generate):
+    """lambda_session_report is non-VPC and cannot reach Aurora, so a stored
+    template has to be resolved in here and written into the artifact. The
+    file-backed templates go the same way, so the worker has ONE way of getting
+    a body rather than two -- and the artifact records the exact text the
+    document was written to, which keeps "which template wrote this" answerable
+    after somebody edits the template."""
+    artifact = json.loads(day_generate(_body())["Body"])
+    body = artifact["generate"]["templateBody"]
+    assert [s["title"] for s in body["sections"]] == [
+        "What this was", "Decided", "Still open", "Actions"]
+    assert body["catch_all"]["title"] == "Anything else"
+    assert body["style"], "the house style rides with the template"
 
 
 def test_an_unknown_template_is_refused_before_anything_is_enqueued(day_generate_raw):
@@ -248,7 +264,9 @@ def test_session_generate_reaches_the_worker_with_generate_and_window(day):
     assert res["statusCode"] == 202, res
     assert len(puts) == 1
     artifact = json.loads(puts[0]["Body"])
-    assert artifact["generate"] == {"templateId": "personal-meeting", "templateVersion": 3}
+    gen = artifact["generate"]
+    assert gen["templateId"] == "personal-meeting" and gen["templateVersion"] == 3
+    assert gen["templateBody"]["sections"], "the session path inlines the body too"
     assert artifact["window"] == {"from": "09:00", "to": "11:30"}
 
 
