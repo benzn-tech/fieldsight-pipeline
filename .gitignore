@@ -49,3 +49,8 @@ _*.json
 # dependency decision: no workflow or script reads it, and committing it makes an ad-hoc
 # tool run look like one.
 uv.lock
+
+# Labelling runs: real site audio and real names. Cut locally, kept in S3
+# (voiceprint_eval/), never in the repository.
+runs/
+clips*.json

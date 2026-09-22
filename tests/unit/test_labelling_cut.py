@@ -90,3 +90,30 @@ def test_a_provider_without_audio_segments_still_yields_turns():
          "alternatives": [{"content": "there"}]},
     ]}}
     assert ct.turns_from_transcript(doc), "items-only transcripts produced no turns"
+
+
+def test_a_quiet_clip_is_brought_up_so_it_can_be_labelled_at_all():
+    """Measured on the first real cut, 2026-09-23: peaks across sixteen clips ran 973 to
+    27562 out of 32768, a 28x spread. A listener given those raw marks the quiet half
+    'unusable' and the dataset ends up describing loud recordings only, with nothing
+    anywhere saying so -- a sampling bias the tool introduced that looks exactly like a
+    property of the material."""
+    quiet = struct.pack("<8h", *([300, -300] * 4))
+    out = ct.normalise_for_listening(quiet)
+    peak = max(abs(v) for v in struct.unpack("<8h", out))
+    assert peak > 20000, "a quiet clip was left unhearable"
+
+
+def test_a_loud_clip_is_left_alone():
+    """Gain is only ever applied upward; scaling a clip down would be changing material the
+    listener is meant to judge for no reason."""
+    loud = struct.pack("<4h", *[30000, -30000, 30000, -30000])
+    assert ct.normalise_for_listening(loud) == loud
+
+
+def test_silence_is_not_amplified_into_something_that_sounds_like_audio():
+    """Multiplying nothing by a large number is how a microphone fault becomes convincing
+    noise -- and a silent capture is a known unfixed defect here, not a rarity."""
+    silence = struct.pack("<8h", *([0] * 8))
+    assert ct.normalise_for_listening(silence) == silence
+    assert ct.normalise_for_listening(b"") == b""
