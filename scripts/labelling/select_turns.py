@@ -57,8 +57,23 @@ MIN_MULTI_DEVICE_PEOPLE = 1
 #: not decide a label, few enough that the whole pack stays inside a sitting.
 TURNS_PER_VOICE = 4
 
+# The device prefix is `.+?`, NOT `[A-Za-z0-9]+`, and the difference is the whole file.
+#
+# The legacy RealPTT convention was one bare token (`Benl1_2026-03-20_…`). The app writes
+# the FOLDER as the prefix, and folders carry underscores: `ben_ucpk2_2026-09-22_…`,
+# `petros_pan_2026-09-22_…`. A character class without `_` matches `ben`, then demands a
+# date where `ucpk2_…` sits, and returns None.
+#
+# It fails the way this repository's filename bugs always fail: silently and in the safe
+# direction. Measured against real prod keys on 2026-09-23, the strict version found **one**
+# session across thirteen folders and months of recordings, and reported it as a quota
+# shortfall — a number that looks exactly like "there is not enough material yet" rather
+# than like a parser that cannot read the current naming convention.
+#
+# Non-greedy, and anchored on the DATE rather than on the prefix's shape: the date is the
+# one part of this filename whose format is fixed by something other than convention.
 _NAME_RE = re.compile(
-    r"^(?P<device>[A-Za-z0-9]+)_(?P<date>\d{4}-\d{2}-\d{2})_(?P<time>\d{2}-\d{2}-\d{2})"
+    r"^(?P<device>.+?)_(?P<date>\d{4}-\d{2}-\d{2})_(?P<time>\d{2}-\d{2}-\d{2})"
     r"(?:_(?P<sid>sid[0-9a-f]{32}))?")
 
 
@@ -104,7 +119,21 @@ def shortfalls(selected) -> list[str]:
     if len(sessions) < MIN_SESSIONS:
         out.append(f"{len(sessions)} sessions, need {MIN_SESSIONS}")
     if len(folders) < MIN_SPEAKERS:
-        out.append(f"{len(folders)} people, need {MIN_SPEAKERS}")
+        out.append(f"{len(folders)} folders, need {MIN_SPEAKERS}")
+    else:
+        # A FOLDER IS NOT A PERSON, and this is the one quota that cannot be checked from
+        # metadata. Measured on prod 2026-09-23: nine folders, of which `Ben_UCPK2`,
+        # `Ben_UCPK`, `Ben_UCPK_`, `Ben_Lin` and `Ben_Lin_test2` are one human -- so the
+        # honest count was six, not nine.
+        #
+        # Left as a warning rather than a name-similarity heuristic. "Ben_Lin and Ben_UCPK2
+        # are the same person" is exactly the inference this whole line exists to make from
+        # VOICE, and having the sampler guess it from spellings would seed the measurement
+        # with the answer it is supposed to produce.
+        out.append(
+            f"CHECK BY HAND: {len(folders)} folders is not {len(folders)} people. "
+            f"Folders: {', '.join(sorted(folders))}. Count the distinct humans before "
+            f"trusting the >= {MIN_SPEAKERS} speakers quota.")
     span = _span_days([r["date"] for r in selected])
     if span < MIN_SPAN_DAYS:
         out.append(f"spans {span} days, need {MIN_SPAN_DAYS}")
