@@ -497,4 +497,21 @@ the bucket grants.
 4. Prod is on `shadow` today: names **already** reach a customer-visible transcript viewer
    while enrolment is off. Does the owner know this combination is live?
 5. "Transcription doesn't sync" needs one real reproduction (which page, which session, what
-   name was changed) before I will characterise it.
+   name was changed) before I will characterise it. Discriminators below.
+
+## Appendix — telling the three "not synced" causes apart
+
+Written ahead of the reproduction so that a one-sentence description from the reporter is
+enough to place it, rather than starting an investigation from zero. Each cause has a
+symptom only it produces.
+
+| Cause | Discriminating symptom | Confirm by |
+|---|---|---|
+| **(a) 202 + backoff re-fetch** (transcript-list.js:505-508) | The name **appears on its own** after a few seconds, or after one manual refresh. A banner reading "Naming…" is on screen the whole time. Only the clicked session is affected, every time, for every name. | Wait 30s without touching anything. If it resolves, it is this. Nothing is broken — the UI just has no push channel. |
+| **(b) orphaned row after final-pass re-assembly** (turn_name_overlay.py:12-21) | The name **never** appears, however long you wait or how often you refresh — but `unmatchedNames` in the `/api/org/transcripts` response is **> 0**. Tends to hit sessions extracted twice (live then final), and typically loses *some* turns of a session while others keep the name. | Read `unmatchedNames` in the network response. `> 0` is conclusive: the row exists and matches no turn, because `start_sec` moved more than the 0.5s tolerance. |
+| **(c) shadow-mode surface boundary** (template.yaml:1252-1256) | The name **does** appear in the transcript viewer but is missing from Overview / Action Items / the draft email / the generated report. Nothing is late; the transcript itself is correct. | Compare the transcript tab against any other panel. This is by design, not a fault — `turn_name_overlay` has exactly one call site and those surfaces are deliberately not it. |
+
+A fourth possibility worth ruling out first, because it looks like (b) and is not: the name
+was written, then the **recording was deleted** by its owner — `_session_was_removed` hides
+the session and the name goes with it. Distinguished by the session disappearing entirely
+rather than reappearing unnamed.
