@@ -331,6 +331,7 @@ jobs:
               "AskTtsProvider=${{ vars.PROD_ASK_TTS_PROVIDER || 'dashscope' }}" \
               "ElevenLabsTtsVoice=QlZn2MPaf2jDn0461bnj" \
               "ElevenLabsTtsSpeed=1.10" \
+              "ElevenLabsTtsModel=eleven_multilingual_v2" \
               $EL_TTS_KEY_PARAM \
               "AskVoiceModel=${{ vars.PROD_ASK_VOICE_MODEL || 'none' }}" \
               $EL_ASK_KEY_PARAM \

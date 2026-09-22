@@ -495,14 +495,30 @@ Parameters:
   ElevenLabsTtsModel:
     Type: String
     Description: >-
-      Measured on the plain HTTP /stream endpoint 2026-09-09, one two-sentence
-      answer: DashScope 2.07s, eleven_v3_conversational 1.01s, eleven_v3 2.83s,
-      eleven_flash_v2_5 0.51s. v3-conversational is twice as fast as the
-      incumbent AND the expressive model; the vendor documents it on the
-      Text-to-Dialogue WebSocket, but the plain endpoint accepts it (verified,
-      200 with real audio). Flash remains the fallback if expressiveness stops
-      being worth half a second.
-    Default: eleven_v3_conversational
+      Chosen for a STEADY accent, not for speed.
+
+      Speed was the original criterion, measured on the plain HTTP /stream
+      endpoint 2026-09-09, one two-sentence answer: DashScope 2.07s,
+      eleven_v3_conversational 1.01s, eleven_v3 2.83s, eleven_flash_v2_5
+      0.51s. On that basis v3-conversational was the default.
+
+      What that comparison never asked was whether the voice stays the same
+      voice. It does not. ElevenLabs renders are not deterministic -- the same
+      request, four times, 2026-09-22: 32645, 34735, 33481, 33899 bytes, four
+      different hashes -- and on v3-conversational the accent drifts with it.
+      The owner heard a New Zealand voice come back American on a take
+      generated from exactly the parameters they had just approved.
+
+      eleven_multilingual_v2 holds the accent. It costs about half a second
+      per answer (measured the same day, one sentence, James, speed 1.10:
+      1.58-1.72s against v3-conversational's 0.98-1.20s), which is inside the
+      voice path's budget and buys a voice the customer recognises every time.
+
+      This matters ONLY for live renders. A bundled device prompt is a file:
+      it is recorded once, listened to, and shipped byte for byte, so it
+      cannot drift. A spoken answer is rendered on every question, so the
+      model is the only place its steadiness can be decided.
+    Default: eleven_multilingual_v2
 
   ElevenLabsTtsSpeed:
     Type: String

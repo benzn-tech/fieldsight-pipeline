@@ -286,6 +286,7 @@ def test_the_test_key_does_not_silently_fall_back_to_prods():
 _WIRED_LITERALS = {
     "ElevenLabsTtsVoice": "QlZn2MPaf2jDn0461bnj",
     "ElevenLabsTtsSpeed": "1.10",
+    "ElevenLabsTtsModel": "eleven_multilingual_v2",
 }
 
 
