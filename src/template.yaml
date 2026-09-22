@@ -470,8 +470,27 @@ Parameters:
 
   ElevenLabsTtsVoice:
     Type: String
-    Description: ElevenLabs voice id for the spoken Ask answer.
-    Default: bPkjmCb0W1xUBvyH2Afs
+    Description: >-
+      ElevenLabs voice id for the spoken Ask answer. James - Friendly, Warm,
+      Kiwi.
+
+      It matches the device, and that is the whole requirement: every bundled
+      prompt the F2SP already speaks ("Ready. Go ahead.", "Audio recording
+      started", "Recording stopped. Has the meeting ended?") is this voice,
+      so an answer in any other one sounds like a second person joined the
+      conversation. The previous default was bPkjmCb0W1xUBvyH2Afs (Belinda -
+      Calm & Soothing Kiwi), chosen before the spoken answer had to sit next
+      to those prompts.
+
+      Measured through /v1/text-to-speech/{id}/stream on
+      eleven_v3_conversational at speed 1.2, one sentence, 2026-09-21:
+      James 1.66s / 71098 bytes against Belinda 1.35s / 85308 bytes. Both are
+      far inside the voice path's budget, so this is a product choice, not a
+      latency one.
+
+      Not wired as a per-environment override: TEST and prod deliberately
+      speak with the same voice, because TEST is where the voice gets judged.
+    Default: QlZn2MPaf2jDn0461bnj
 
   ElevenLabsTtsModel:
     Type: String
