@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Voice labelling</title>
+<!--
+  Offline speaker labelling. Open this file directly (file://) next to the downloaded
+  clips; it makes no network requests and sends nothing anywhere.
+
+  Why it is this plain: the scarce resource is the listener's attention, not the interface.
+  One clip, one question, one keystroke. Everything else - progress, ordering, the reason a
+  clip matters - is arranged so the listener never has to decide anything except who they
+  just heard.
+
+  Two rules the design is built around, both from the measurement this feeds:
+
+  * "Not sure" is a FIRST-CLASS answer and is one keypress away, the same as every name.
+    A forced guess is indistinguishable from a confident label once it is in the file, and
+    the whole point of collecting ground truth is that it is ground truth. An ROC built on
+    quietly-guessed labels is worse than no ROC, because it looks like one.
+
+  * "Nobody in the list" is a separate answer from "not sure". The negative control - a
+    session where nobody in the enrolment library was present - is the sample that decides
+    whether a rejection floor is possible at all, and it is only usable if the listener can
+    say "this is a real person and they are none of these" without hedging.
+-->
+<style>
+  :root {
+    --bg: #F7F8FA; --panel: #FFFFFF; --ink: #111827; --muted: #6B7280;
+    --line: #E5E7EB; --accent: #102A43; --warn: #B45309; --ok: #15803D;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0A1018; --panel: #111827; --ink: #F3F4F6; --muted: #9CA3AF;
+      --line: #1F2937; --accent: #9CC2FF; --warn: #FBBF24; --ok: #6EE7A8;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 16px; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 680px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 16px; margin-bottom: 16px;
+  }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  button, .filebtn {
+    font: inherit; padding: 8px 14px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+  }
+  button.primary { background: var(--accent); color: #FFF; border-color: transparent; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) button.primary { color: #0A1018; }
+  }
+  button[disabled] { opacity: .45; cursor: not-allowed; }
+  input[type=file] { display: none; }
+  .clipmeta { font-size: 13px; color: var(--muted); margin-bottom: 10px; }
+  .why {
+    font-size: 13px; color: var(--warn); border-left: 3px solid var(--warn);
+    padding-left: 10px; margin: 10px 0;
+  }
+  audio { width: 100%; margin: 10px 0; }
+  .choices { display: grid; gap: 8px; margin-top: 12px; }
+  .choice {
+    display: flex; gap: 10px; align-items: center; padding: 10px 12px;
+    border: 1px solid var(--line); border-radius: 8px; cursor: pointer;
+  }
+  .choice:hover { border-color: var(--accent); }
+  .choice kbd {
+    font: 12px/1 ui-monospace, monospace; padding: 3px 6px; border-radius: 4px;
+    border: 1px solid var(--line); color: var(--muted);
+  }
+  .choice--special { color: var(--muted); }
+  .progress { font-size: 13px; color: var(--muted); }
+  .done { color: var(--ok); font-weight: 600; }
+  .empty { color: var(--muted); font-size: 14px; }
+  code { font: 13px/1 ui-monospace, monospace; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Voice labelling</h1>
+  <div class="sub">Runs entirely in this browser. Nothing is uploaded.</div>
+
+  <div class="panel" id="setup">
+    <div class="row">
+      <label class="filebtn">Load clips.json<input type="file" id="pickList" accept=".json" /></label>
+      <label class="filebtn">Load audio files<input type="file" id="pickAudio" accept="audio/*" multiple /></label>
+      <span class="progress" id="setupState">No clip list loaded.</span>
+    </div>
+  </div>
+
+  <div class="panel" id="work" hidden>
+    <div class="clipmeta" id="meta"></div>
+    <div class="why" id="why" hidden></div>
+    <audio id="player" controls preload="none"></audio>
+    <div class="choices" id="choices"></div>
+    <div class="row" style="margin-top:14px">
+      <button id="back">Back</button>
+      <span class="progress" id="progress"></span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <button class="primary" id="save" disabled>Download labels.json</button>
+      <span class="progress" id="saveState">Answers are kept in this browser as you go.</span>
+    </div>
+  </div>
+</main>
+
+<script>
+(function () {
+  'use strict';
+
+  var STORE = 'fs.voicelabels.v1';
+  var clips = [], audio = {}, answers = {}, at = 0;
+
+  /* Browser storage can throw outright in a private window or with site data blocked, and
+     this page is opened from file:// where that is more likely than usual. Every read and
+     write is guarded, and the page works correctly with none of it - the answers are still
+     in memory, and the download button is the real output. */
+  function load() {
+    try { answers = JSON.parse(localStorage.getItem(STORE) || '{}') || {}; }
+    catch (_) { answers = {}; }
+  }
+  function persist() {
+    try { localStorage.setItem(STORE, JSON.stringify(answers)); } catch (_) {}
+  }
+
+  function el(id) { return document.getElementById(id); }
+
+  /* The file input hands back File objects with no path, so clips are matched to audio by
+     BASENAME. Anything unmatched is reported rather than skipped: a clip silently absent
+     from the pack is a hole in the sample that nothing downstream would notice. */
+  function basename(p) { return String(p || '').split(/[\\/]/).pop(); }
+
+  function audioName(clip) {
+    /* The fetch list names transcripts; the audio beside them is the VAD segment with the
+       same stem. Reading the wrong one is the defect the 2026-09-17 run made twice: chunk
+       filenames carry each chunk's own timestamp, so a name derived from the stem fetches
+       a file whose timeline is not this one's, and every turn past the first 30 seconds is
+       cut from audio that is not its own. */
+    return basename(clip.key).replace(/\.json$/, '.wav');
+  }
+
+  function names() {
+    var seen = {};
+    clips.forEach(function (c) { if (c.folder) seen[c.folder] = true; });
+    return Object.keys(seen).sort().map(function (f) {
+      return f.replace(/_/g, ' ').trim();
+    });
+  }
+
+  var SPECIAL = [
+    { id: '__none__', label: 'A real person, none of the above',
+      note: 'The answer the negative control needs. Different from "not sure".' },
+    { id: '__unsure__', label: 'Not sure',
+      note: 'A first-class answer. A forced guess is indistinguishable from a real label.' },
+    { id: '__unusable__', label: 'Unusable clip (silence, noise, cut off)' }
+  ];
+
+  function render() {
+    if (!clips.length) { el('work').hidden = true; return; }
+    el('work').hidden = false;
+    var c = clips[at];
+    el('meta').textContent = (c.folder || '?') + ' · ' + (c.date || '?')
+      + ' · device ' + (c.device || '?') + ' · session ' + String(c.session || '').slice(0, 11) + '…';
+
+    /* Why THIS clip matters, when it does. The negative control is the sample that decides
+       whether a rejection floor is possible at all, and a listener who does not know that
+       will treat it as one more clip. */
+    var why = el('why');
+    if (c.why) { why.hidden = false; why.textContent = c.why; }
+    else { why.hidden = true; }
+
+    var f = audio[audioName(c)];
+    var player = el('player');
+    if (f) {
+      if (player.dataset.url) URL.revokeObjectURL(player.dataset.url);
+      var url = URL.createObjectURL(f);
+      player.dataset.url = url; player.src = url;
+    } else {
+      player.removeAttribute('src');
+    }
+
+    var box = el('choices');
+    box.textContent = '';
+    var opts = names().map(function (n, i) { return { id: n, label: n, key: String(i + 1) }; });
+    SPECIAL.forEach(function (s, i) {
+      opts.push({ id: s.id, label: s.label, note: s.note, key: String(opts.length + 1), special: true });
+    });
+    opts.forEach(function (o) {
+      var row = document.createElement('label');
+      row.className = 'choice' + (o.special ? ' choice--special' : '');
+      var r = document.createElement('input');
+      r.type = 'radio'; r.name = 'who';
+      r.checked = answers[c.key] === o.id;
+      r.addEventListener('change', function () { answer(o.id); });
+      var k = document.createElement('kbd'); k.textContent = o.key;
+      var s = document.createElement('span');
+      s.textContent = o.label + (o.note ? ' — ' + o.note : '');
+      row.appendChild(r); row.appendChild(k); row.appendChild(s);
+      box.appendChild(row);
+    });
+    if (!f) {
+      var miss = document.createElement('div');
+      miss.className = 'empty';
+      miss.textContent = 'Audio file not loaded: ' + audioName(c)
+        + '. Load it above, or mark the clip unusable.';
+      box.appendChild(miss);
+    }
+
+    var n = Object.keys(answers).length;
+    el('progress').innerHTML = (at + 1) + ' of ' + clips.length
+      + ' · <span class="' + (n === clips.length ? 'done' : '') + '">' + n + ' answered</span>';
+    el('back').disabled = at === 0;
+    el('save').disabled = n === 0;
+  }
+
+  function answer(id) {
+    answers[clips[at].key] = id;
+    persist();
+    /* Straight on to the next clip. Listening is the expensive part; a confirm step between
+       every answer would double the interactions without improving one label. */
+    if (at < clips.length - 1) { at += 1; }
+    render();
+  }
+
+  document.addEventListener('keydown', function (e) {
+    if (el('work').hidden) return;
+    if (e.key === 'ArrowLeft' && at > 0) { at -= 1; render(); return; }
+    if (e.key === 'ArrowRight' && at < clips.length - 1) { at += 1; render(); return; }
+    var n = parseInt(e.key, 10);
+    if (!isNaN(n)) {
+      var rows = el('choices').querySelectorAll('.choice');
+      if (rows[n - 1]) rows[n - 1].querySelector('input').click();
+    }
+  });
+
+  el('back').addEventListener('click', function () { if (at > 0) { at -= 1; render(); } });
+
+  el('pickList').addEventListener('change', function (e) {
+    var f = e.target.files[0];
+    if (!f) return;
+    var fr = new FileReader();
+    fr.onload = function () {
+      try {
+        var parsed = JSON.parse(fr.result);
+        clips = parsed.clips || parsed;
+        at = 0;
+        el('setupState').textContent = clips.length + ' clips loaded.';
+        render();
+      } catch (_) {
+        el('setupState').textContent = 'That file is not a clip list.';
+      }
+    };
+    fr.readAsText(f);
+  });
+
+  el('pickAudio').addEventListener('change', function (e) {
+    Array.prototype.forEach.call(e.target.files, function (f) { audio[basename(f.name)] = f; });
+    var have = clips.filter(function (c) { return audio[audioName(c)]; }).length;
+    el('setupState').textContent = have + ' of ' + clips.length + ' clips have audio.';
+    render();
+  });
+
+  el('save').addEventListener('click', function () {
+    /* The unanswered clips travel too, explicitly. A results file that simply omitted them
+       would let a half-finished pack read as a complete one, and the count is what the
+       shortfall check downstream reads. */
+    var rows = clips.map(function (c) {
+      return { key: c.key, folder: c.folder, date: c.date, device: c.device,
+               session: c.session, label: answers[c.key] || null };
+    });
+    var blob = new Blob([JSON.stringify({
+      labelled_at: new Date().toISOString(),
+      answered: rows.filter(function (r) { return r.label; }).length,
+      total: rows.length,
+      rows: rows
+    }, null, 2)], { type: 'application/json' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'labels.json';
+    a.click();
+    el('saveState').textContent = 'Saved. Send labels.json back.';
+  });
+
+  load();
+  render();
+})();
+</script>
+</body>
+</html>
