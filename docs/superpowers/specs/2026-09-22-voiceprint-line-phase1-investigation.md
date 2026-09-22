@@ -245,7 +245,11 @@ consent-holder's own record.
 ## A.4 Automatic renaming, with provenance
 
 `decide_name` gains a tier-aware result, and every automatic name records how it was reached.
-New columns on `speaker_turn_names` (migration 0061):
+New columns on `speaker_turn_names` (migration **0064** -- allocated 2026-09-23 across the
+three parallel lines: reports 0062, topics 0063, this one 0064. `develop` already carries an
+0061 (`report_chunks_tsv_multi_config_idx`) that was not present when this document was first
+written, which is the whole reason numbers are allocated rather than chosen: the collision is
+invisible locally and only fails on merge, wearing someone else's error message):
 
 ```sql
 ALTER TABLE speaker_turn_names
