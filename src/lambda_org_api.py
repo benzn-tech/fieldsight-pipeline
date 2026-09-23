@@ -1713,8 +1713,14 @@ def _generation_request(body, deliver=None, conn=None, caller=None):
         stored = report_templates.get_version(conn, template_id, version)
         if stored is None:
             return None, "no such template: %s v%s" % (template_id, version)
+        # WHICH KIND OF TEMPLATE THIS IS travels with the request. The worker
+        # cannot work it out for itself: a Library body and a file body are the
+        # same shape by the time they are inlined, and any marker put INSIDE the
+        # body could be typed by the customer who wrote it. Only the branch taken
+        # here knows, so only here can say.
         return {"templateId": str(template_id), "templateVersion": version,
-                "templateName": tpl["name"], "templateBody": stored["body"]}, None
+                "templateName": tpl["name"], "templateBody": stored["body"],
+                "templateSource": report_template.SOURCE_LIBRARY}, None
 
     try:
         version = int((body or {}).get("templateVersion"))
@@ -1726,7 +1732,8 @@ def _generation_request(body, deliver=None, conn=None, caller=None):
         return None, "no such template: %s v%s" % (template_id, version)
     return {"templateId": template_id, "templateVersion": version,
             "templateName": loaded.get("name") or template_id,
-            "templateBody": loaded}, None
+            "templateBody": loaded,
+            "templateSource": report_template.SOURCE_BUILTIN}, None
 
 
 def _excluded_topics_for(conn, caller, folder, date, session_id=None):

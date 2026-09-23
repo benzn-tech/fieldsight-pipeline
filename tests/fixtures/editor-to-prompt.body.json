@@ -4,6 +4,7 @@
       "title": "What this was",
       "kind": "narrative",
       "fields": [],
+      "always_present": false,
       "key": "what-this-was",
       "purpose": "Whose meeting it was and what it covered."
     },
@@ -13,6 +14,7 @@
       "fields": [
         "hazard"
       ],
+      "always_present": false,
       "key": "safety",
       "purpose": "Only hazards raised by name, and whether a control was agreed."
     },
@@ -23,6 +25,7 @@
         "action",
         "owner"
       ],
+      "always_present": false,
       "key": "actions",
       "purpose": "One line per action."
     }
