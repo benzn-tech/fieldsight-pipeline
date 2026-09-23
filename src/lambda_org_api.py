@@ -2673,7 +2673,8 @@ def _presign_report_doc(doc_key, folder, date, result):
     try:
         params["ResponseContentDisposition"] = report_download_name.content_disposition(
             report_download_name.display_name(
-                folder, result.get("templateId"), result.get("templateVersion"), date))
+                folder, result.get("templateId"), result.get("templateVersion"), date,
+                template_name=result.get("templateName")))
     except Exception:
         logger.exception("could not build a download name for %s; serving it unnamed", doc_key)
     return s3().generate_presigned_url(
