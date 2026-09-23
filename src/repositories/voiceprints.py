@@ -335,6 +335,27 @@ def get_profile(conn, company_id, voiceprint_id) -> dict | None:
     ).fetchone()
 
 
+class EnrolmentAfterWithdrawal(Exception):
+    """A vector arrived for a profile that has been withdrawn, or no longer exists.
+
+    Not an error in anything the caller did: enrolment is asynchronous and slow -- the
+    embedder narrows a window, checks homogeneity and embeds it -- so a withdrawal made
+    while that is in flight will always be able to land behind it. Measured on TEST
+    2026-09-23 with 80 seconds between the two.
+
+    It is raised rather than ignored because the two outcomes are different and only one is
+    visible. The profile is out of `profiles_for_matching` either way, so nobody is named;
+    what silence would leave behind is a biometric vector on a profile somebody asked to
+    have destroyed, discoverable only by reading the table.
+    """
+
+    def __init__(self, voiceprint_id):
+        self.voiceprint_id = voiceprint_id
+        super().__init__(
+            f"profile {voiceprint_id} is withdrawn or absent; a withdrawal made while this "
+            f"enrolment was in flight must not be undone by it")
+
+
 class EnrolmentBelongsToSomebodyElse(Exception):
     """A sample was about to join a profile it resembles LESS than it resembles another.
 
@@ -451,6 +472,26 @@ def add_sample(conn, company_id, voiceprint_id, embedding, source, s3_key, windo
     order rather than testing a threshold.
     """
     _require_company(company_id)
+    # A WITHDRAWN profile takes no more vectors. Measured on TEST 2026-09-23: a correction
+    # was made, the withdrawal ran while the embedder was still working on its window, and
+    # the sample landed 80 seconds AFTER the profile was withdrawn. `withdraw` deletes the
+    # rows that exist when it runs and reported `samplesRemoved: 0` quite correctly; nothing
+    # stopped the one in flight.
+    #
+    # The profile stays out of `profiles_for_matching` either way, so nothing was named --
+    # which is exactly why this is worth a guard rather than a log line. The visible
+    # behaviour is already correct, and what is left behind is a biometric vector on a
+    # profile somebody asked to have destroyed. That is the one thing a withdrawal is for,
+    # and the only way to notice is to go looking in the table.
+    #
+    # Here rather than in a caller, for the reason the agreement guard below is here: there
+    # are two enrolment paths and a rule that only one of them runs is a rule the other
+    # quietly does without.
+    live = conn.cursor(row_factory=dict_row).execute(
+        "SELECT status FROM speaker_voiceprints WHERE company_id = %s AND id = %s",
+        (company_id, voiceprint_id)).fetchone()
+    if live is None or live.get("status") == "withdrawn":
+        raise EnrolmentAfterWithdrawal(voiceprint_id)
     own, best_other, nearest_other_id = _agreement(conn, company_id, voiceprint_id,
                                                    embedding)
     if own is not None and best_other is not None and best_other > own:
