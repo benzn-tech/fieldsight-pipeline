@@ -468,6 +468,124 @@ def add_sample(conn, company_id, voiceprint_id, embedding, source, s3_key, windo
     ).fetchone()
 
 
+#: How similar a sample must be to the profile's core to stay live. NOT a fitted number and
+#: not the same kind of number as `DEFAULT_MAX_FRAME_SPREAD`: that one is a spread WITHIN one
+#: window, this is a mean cosine between whole samples of one person.
+#:
+#: Measured 2026-09-23 on the three profiles that existed: coherent profiles ran 0.625 and
+#: 0.794 mean-to-core, while the wind-noise vectors sat at -0.09 to +0.04 against every sample
+#: of the person they were filed under AND against two other people's. The gap is enormous, so
+#: the value only has to sit inside it; 0.20 is low in that gap on purpose, because the cost of
+#: quarantining a real sample (a slightly weaker profile) is smaller than the cost of keeping a
+#: foreign one (every score for that person drops, invisibly).
+DEFAULT_QUARANTINE_FLOOR = 0.20
+
+#: Never set aside more than this fraction of a profile in one pass. A bug in the clustering,
+#: or a profile whose samples are all mutually unlike, would otherwise empty a library in one
+#: run and report success -- and an empty profile names nobody, silently, which is the exact
+#: shape of failure this whole subsystem keeps producing.
+MAX_QUARANTINE_FRACTION = 0.5
+
+
+def requarantine_profile(conn, company_id, voiceprint_id,
+                         floor: float = DEFAULT_QUARANTINE_FLOOR,
+                         cosine=None) -> dict:
+    """Re-judge every sample of one profile against the rest, and set aside the strangers.
+
+    **Whole-set, not per-insert, and that is the design.** Judging each new sample against
+    what is already stored gets the answer backwards when the FIRST sample was the bad one:
+    every later, correct sample then looks like the outlier. Re-clustering the whole set has
+    no such order dependence — it asks which samples agree with each other, and the answer
+    does not change with the sequence they arrived in.
+
+    **The core is the largest group, with human backing as the tie-break** — and the opposite
+    order was tried first, because "trust what a person vouched for" is the obvious rule. It
+    is wrong, and the measured case is why: the wind-noise enrolment was made by TWO explicit
+    corrections, while the four good samples beside it came from one correction and three
+    propagations. Ranking by human count would have kept the noise and set aside the person.
+
+    A person vouching for a window says they recognised the SPEAKER. It says nothing about
+    whether the audio carries enough of that speaker to be a sample, which is a different
+    question they were never asked and cannot hear the answer to. So the count of humans is a
+    weaker signal here than the count of samples that agree with each other.
+
+    **What this cannot fix**: a profile whose majority is genuinely the wrong person, vouched
+    for repeatedly. Nothing in the vectors can distinguish that from a correct profile — it
+    needs somebody to listen. The `MAX_QUARANTINE_FRACTION` cap below is what keeps such a
+    profile visible as incoherent rather than silently rebuilt around the mistake.
+
+    Returns what it did, including when it did nothing, because "nothing to quarantine" and
+    "the clustering failed" are the same silence otherwise.
+    """
+    _require_company(company_id)
+    if cosine is None:
+        # From the numpy-free module: this repository is imported by the in-VPC writer, which
+        # has the psycopg layer and no numpy. Importing `voiceprint_utils` here is what killed
+        # enrolment once already, after the guard had logged that it accepted the window.
+        from vector_math import cosine as _cos
+        cosine = _cos
+
+    cur = conn.cursor(row_factory=dict_row)
+    rows = _decode(cur.execute(
+        "SELECT id, embedding, source, quarantined_at "
+        "FROM speaker_voiceprint_samples "
+        "WHERE company_id = %s AND voiceprint_id = %s ORDER BY created_at",
+        (company_id, voiceprint_id)).fetchall())
+    live = [r for r in rows if r.get("quarantined_at") is None]
+    if len(live) < 3:
+        # Two samples either agree or they do not, and there is no majority to be the core.
+        # Quarantining one of a pair is a coin toss dressed as a judgement.
+        return {"checked": len(live), "quarantined": 0, "reason": "fewer than 3 live samples"}
+
+    n = len(live)
+    sim = [[1.0 if i == j else cosine(live[i]["embedding"], live[j]["embedding"])
+            for j in range(n)] for i in range(n)]
+
+    # Group by mutual similarity: a sample joins a group when it is at or above the floor
+    # against every member. Complete linkage, like `cluster_turns` and for the same reason --
+    # a single outlying pair must not chain two groups into one.
+    groups: list[list[int]] = []
+    for i in range(n):
+        for g in groups:
+            if all(sim[i][j] >= floor for j in g):
+                g.append(i)
+                break
+        else:
+            groups.append([i])
+
+    def rank(g):
+        # Size first. Human count breaks ties and does not decide them -- see the docstring:
+        # the wind-noise cluster carried MORE explicit corrections than the real one.
+        return (len(g), sum(1 for i in g if live[i]["source"] == "correction"))
+
+    core = max(groups, key=rank)
+    outliers = [i for i in range(n) if i not in core]
+    if not outliers:
+        return {"checked": n, "quarantined": 0, "reason": "all samples agree"}
+    if len(outliers) > n * MAX_QUARANTINE_FRACTION:
+        # Refused rather than applied. A profile whose samples mostly disagree is a profile
+        # nobody should trust, but emptying it here would hide that behind a working-looking
+        # library; the number is returned so an operator can see it.
+        return {"checked": n, "quarantined": 0,
+                "reason": f"would set aside {len(outliers)} of {n} — over the "
+                          f"{MAX_QUARANTINE_FRACTION:.0%} cap, so the profile is reported "
+                          f"as incoherent rather than silently halved"}
+
+    done = []
+    for i in outliers:
+        score = sum(sim[i][j] for j in core) / len(core)
+        cur.execute(
+            "UPDATE speaker_voiceprint_samples "
+            "SET quarantined_at = now(), quarantine_reason = %s, quarantine_score = %s "
+            "WHERE company_id = %s AND id = %s",
+            (f"mean cosine {score:.3f} to the profile's core of {len(core)} sample(s), "
+             f"below the {floor:.2f} floor", score, company_id, live[i]["id"]))
+        done.append({"id": str(live[i]["id"]), "score": round(score, 4)})
+    logger.info("quarantine: profile %s — %d of %d samples set aside (core=%d): %s",
+                voiceprint_id, len(done), n, len(core), done)
+    return {"checked": n, "quarantined": len(done), "core": len(core), "samples": done}
+
+
 def profiles_for_matching(conn, company_id, site_id=None) -> list[dict]:
     """Every profile this company may currently match against, optionally narrowed to a site.
 
@@ -504,6 +622,7 @@ def profiles_for_matching(conn, company_id, site_id=None) -> list[dict]:
             "       s.embedding "
             "FROM speaker_voiceprints p "
             "JOIN speaker_voiceprint_samples s ON s.voiceprint_id = p.id "
+            "                                 AND s.quarantined_at IS NULL "
             "WHERE p.company_id = %s "
             "  AND p.consent_at IS NOT NULL "
             "  AND p.status <> 'withdrawn' ")
@@ -914,8 +1033,15 @@ def list_profiles(conn, company_id) -> list[dict]:
         "SELECT p.id, p.display_name, p.status, p.user_id, p.consent_at, p.consented_by, "
         "       p.linked_on, p.linked_at, "
         "       p.last_attempt_at, p.last_attempt_outcome, p.last_attempt_detail, "
-        "       count(s.id) AS samples, "
-        "       count(s.id) FILTER (WHERE s.source = 'correction') AS human_samples "
+        # `samples` counts the LIVE ones, because that is the number that decides whether a
+        # profile does anything -- a quarantined vector matches nobody. `quarantined` is
+        # reported beside it rather than folded in: "4 samples" and "4 samples, 2 of them set
+        # aside as not sounding like this person" are different facts about a profile, and a
+        # listing that shows only the first hides the reason it is behaving badly.
+        "       count(s.id) FILTER (WHERE s.quarantined_at IS NULL) AS samples, "
+        "       count(s.id) FILTER (WHERE s.source = 'correction' "
+        "                             AND s.quarantined_at IS NULL) AS human_samples, "
+        "       count(s.id) FILTER (WHERE s.quarantined_at IS NOT NULL) AS quarantined "
         "FROM speaker_voiceprints p "
         "LEFT JOIN speaker_voiceprint_samples s ON s.voiceprint_id = p.id "
         "WHERE p.company_id = %s "
