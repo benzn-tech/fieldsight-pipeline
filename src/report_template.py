@@ -102,3 +102,100 @@ def render_prompt(template, scope, action_items, transcript):
     ).format(folder=scope["folder"], date=scope["date"], frm=scope["from"], to=scope["to"],
              n=scope["recordings"], sections="\n\n".join(sections), leave_out=leave_out,
              style=style, actions=actions, transcript=transcript)
+
+
+# ---------------------------------------------------------------------------
+# Stored templates: validation and naming
+#
+# Everything above this line serves the templates that ship as files in this
+# repo, which are reviewed before they land. Everything below serves templates
+# a customer types into the Library, which are not -- so the shapes render_prompt
+# takes for granted have to be established at the door instead.
+#
+# render_prompt reads `template["catch_all"]` by subscript, and `s["title"]` /
+# `s["purpose"]` for every section. A body missing any of those does not produce
+# a worse report; it raises inside the worker, which runs non-VPC and reports
+# the failure long after the person who saved the template has gone home.
+# ---------------------------------------------------------------------------
+
+MAX_SECTIONS = 40
+MAX_STYLE_RULES = 30
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _section_error(section, where):
+    if not isinstance(section, dict):
+        return "%s must be an object" % where
+    for field in ("title", "purpose"):
+        value = section.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return "%s needs a non-empty %s" % (where, field)
+    key = section.get("key")
+    if key is not None and (not isinstance(key, str) or not key.strip()):
+        return "%s has an empty key" % where
+    return None
+
+
+def validate_body(body):
+    """None when `body` is a template render_prompt can consume, else why not.
+
+    Returns a message rather than raising: the caller is an HTTP route and the
+    person on the other end needs to be told which field they got wrong, not
+    handed a 500.
+    """
+    if not isinstance(body, dict):
+        return "template body must be an object"
+
+    sections = body.get("sections")
+    if not isinstance(sections, list) or not sections:
+        return "template body needs at least one section"
+    if len(sections) > MAX_SECTIONS:
+        return "a template may have at most %d sections" % MAX_SECTIONS
+    for i, section in enumerate(sections):
+        err = _section_error(section, "section %d" % (i + 1))
+        if err:
+            return err
+
+    # Subscripted, not .get()ed, by render_prompt -- so absence is fatal there.
+    if "catch_all" not in body:
+        return "template body needs a catch_all section"
+    err = _section_error(body["catch_all"], "catch_all")
+    if err:
+        return err
+
+    excluded = body.get("excluded_subjects", [])
+    if not isinstance(excluded, list):
+        return "excluded_subjects must be a list"
+    for i, item in enumerate(excluded):
+        if not isinstance(item, dict) or not isinstance(item.get("covers"), str) \
+                or not item["covers"].strip():
+            return "excluded_subjects[%d] needs a non-empty covers" % i
+
+    style = body.get("style", [])
+    if not isinstance(style, list):
+        return "style must be a list of rules"
+    if len(style) > MAX_STYLE_RULES:
+        return "a template may have at most %d style rules" % MAX_STYLE_RULES
+    for i, rule in enumerate(style):
+        if not isinstance(rule, str) or not rule.strip():
+            return "style[%d] must be a non-empty string" % i
+
+    return None
+
+
+def slugify(name, fallback):
+    """A stable [a-z0-9-] identifier for a template, from whatever it is called.
+
+    NEVER RETURNS AN EMPTY STRING, and that is the whole point. A template named
+    entirely in Chinese reduces to nothing under an ASCII rule, and an empty
+    slug would either collide with every other such template on the unique
+    index or -- worse -- be accepted once and then silently shadow the next one.
+    Both of those read to the user as "my template disappeared".
+
+    So a name that carries no ASCII keeps its NAME intact in the `name` column
+    (which is where people read it) and takes `fallback` as its slug. The slug
+    is an identifier, not a label; it is not shown, and it does not need to be
+    translatable.
+    """
+    slug = _SLUG_RE.sub("-", (name or "").strip().lower()).strip("-")[:64]
+    return slug or fallback

@@ -82,7 +82,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m pip install --upgrade pip
-      - run: pip install "psycopg[binary]>=3.1" "pgvector>=0.3" "PyJWT[crypto]>=2.8" boto3 numpy "python-docx>=1.1" pytest pytest-cov
+      - run: pip install "psycopg[binary]>=3.1" "pgvector>=0.3" "PyJWT[crypto]>=2.8" boto3 numpy "python-docx>=1.1" "pglast>=7" pytest pytest-cov
       - run: python -m pytest -v
 
   deploy-prod:
@@ -292,6 +292,7 @@ jobs:
               "AskDistanceGate=${{ vars.PROD_ASK_DISTANCE_GATE || '0.55' }}" \
               "UploadVerifyMode=${{ vars.PROD_UPLOAD_VERIFY_MODE || 'observe' }}" \
               "SpeakerIdentityMode=${{ vars.PROD_SPEAKER_IDENTITY_MODE || 'off' }}" \
+              "MatchOnFinalize=${{ vars.PROD_MATCH_ON_FINALIZE || 'false' }}" \
               "EnrolOnCorrection=${{ vars.PROD_ENROL_ON_CORRECTION || 'false' }}" \
               "VoiceprintMaxFrameSpread=${{ vars.PROD_VOICEPRINT_MAX_FRAME_SPREAD || 'default' }}" \
               "AlertEmail=${{ vars.PROD_ALERT_EMAIL || 'none' }}" \

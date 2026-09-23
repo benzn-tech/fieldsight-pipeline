@@ -329,7 +329,20 @@ def _put_document(artifact, buf):
 def _generate_document(artifact, context=None):
     """Returns (buffer, meta). Raises on anything that must not produce a document."""
     gen = artifact["generate"]
-    template = report_template.load_template(gen["templateId"], int(gen["templateVersion"]))
+    # THE BODY ARRIVES WITH THE REQUEST. This function runs non-VPC and cannot
+    # reach Aurora, so a template a company wrote in the Library could never be
+    # read from here. org-api resolves it in the VPC and inlines it, and inlines
+    # the file-backed ones the same way so there is ONE path rather than two.
+    #
+    # The fallback to disk is for artifacts enqueued BEFORE this field existed
+    # and still sitting in the bucket when this deploys. It is deliberately not
+    # a fallback for a uuid: report_template.load_template rejects anything that
+    # is not a slug, so a stored template with no inlined body raises
+    # TemplateNotFound rather than silently writing the report to some other
+    # template -- which would make the template name in the result a lie.
+    template = gen.get("templateBody")
+    if not template:
+        template = report_template.load_template(gen["templateId"], int(gen["templateVersion"]))
     content = artifact.get("content") or {}
     date = artifact.get("date") or content.get("date")
     window = artifact.get("window") or {}
@@ -382,12 +395,31 @@ def _generate_document(artifact, context=None):
         raise RuntimeError(err or "empty answer from model")
 
     buf = lambda_meeting_minutes.generate_prose_document(
-        artifact.get("title") or template.get("name") or "Report",
+        artifact.get("title") or gen.get("templateName") or template.get("name") or "Report",
         "%s  %s - %s" % (date, window.get("from") or "00:00", window.get("to") or "23:59"),
         _prose_sections(text),
         _action_items_for_prompt(content))
-    meta = {"generated": True, "templateId": template["template_id"],
-            "templateVersion": template["version"], "model": llm_utils.active_model(),
+    # WHICH TEMPLATE THIS WAS comes from the REQUEST, not from the template's
+    # own text. The files in report_templates/ carry `template_id` and
+    # `version` inside them; a template written in the Library does not -- its
+    # body is sections, catch_all, excluded_subjects and style, and nothing
+    # else. Reading identity off the body worked for exactly as long as every
+    # template was a file, and raised KeyError('template_id') the first time a
+    # customer generated from their own template. The error reached the screen
+    # as the word 'template_id' and nothing else.
+    #
+    # `gen` is the right place regardless: it is what was ASKED for, and it is
+    # already what the status endpoint echoes back as provenance.
+    meta = {"generated": True,
+            "templateId": gen.get("templateId") or template.get("template_id"),
+            "templateVersion": gen.get("templateVersion") or template.get("version"),
+            # For the filename, and only for it. A uuid identifies the template
+            # to the system; the NAME is what the person who made it called it,
+            # and the file lands in their Downloads folder. It is recorded in
+            # the result rather than looked up later because the presign runs
+            # in-VPC and the name it wants is a fact about this generation.
+            "templateName": gen.get("templateName") or template.get("name"),
+            "model": llm_utils.active_model(),
             "promptChars": len(prompt)}
     return buf, meta
 
@@ -448,7 +480,8 @@ def process_request(artifact, context=None):
             logger.exception("report: generation failed for %s", artifact.get("requestId"))
             _write_result(artifact["resultKey"],
                           dict({"status": "error", "requestId": artifact.get("requestId"),
-                                "error": str(exc)}, **_scope_result_fields(artifact)))
+                                "error": _failure_message(exc)},
+                               **_scope_result_fields(artifact)))
             return
         doc_key = _put_document(artifact, buf)
         _write_result(artifact["resultKey"],
@@ -476,8 +509,29 @@ def process_request(artifact, context=None):
                                    "docKey": doc_key, "emailed": emailed, **scope_fields})
     except Exception as e:
         logger.exception("session report generation failed for %s", request_id)
-        _write_result(result_key, {"status": "error", "requestId": request_id, "error": str(e),
-                                   **scope_fields})
+        _write_result(result_key, {"status": "error", "requestId": request_id,
+                                   "error": _failure_message(e), **scope_fields})
+
+
+def _failure_message(exc):
+    """A sentence, not a token.
+
+    `str(KeyError("template_id"))` is `"'template_id'"`. That went straight into
+    the result, and the screen showed a customer the single quoted word
+    `'template_id'` with no download and no next step -- a string that reads
+    like a leak rather than a message, because it is one.
+
+    Every exception type has this problem to some degree: `str(IndexError())`
+    is empty, `str(TimeoutError())` often is too. So the type is always named
+    and a plain-English lead always precedes it. The detail stays attached,
+    because the person reporting this is the fastest route to whoever fixes it
+    and a screenshot is what they will send.
+    """
+    detail = str(exc).strip()
+    kind = type(exc).__name__
+    if not detail:
+        return "The report could not be generated (%s)." % kind
+    return "The report could not be generated (%s: %s)." % (kind, detail)
 
 
 def lambda_handler(event, context):

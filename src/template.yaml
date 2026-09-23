@@ -1244,6 +1244,26 @@ Parameters:
       asserted_by naming who made the claim. It records a claim and does not verify one;
       the basis is stored on every row so a later decision can find exactly that population.
 
+  MatchOnFinalize:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Whether a finalized session is matched against the company's stored voiceprints
+      without anyone asking. False is the deployed default and the rollback.
+
+      Until 2026-09-23 the only producer of a match request was org-api's speaker-match
+      endpoint, which no frontend has ever called -- so naming a speaker propagated the name
+      inside that one meeting and the next meeting started at spk_0 again. This is what
+      makes recognition continuous.
+
+      Separate from RebindSpeakers, which is anonymous (it groups spk_0/spk_1 inside one
+      session and names nobody), and separate from SpeakerIdentityMode because this is a
+      COST change as well: every finalized session pays for ONNX over its turns. Folding it
+      into the mode would make "stop paying for this" and "turn naming off for everyone"
+      the same action. SpeakerIdentityMode=off still refuses it -- that switch is the
+      feature's rollback and a producer that ignored it would leave it meaning nothing.
+
   SpeakerIdentityMode:
     Type: String
     Default: 'off'
@@ -3508,6 +3528,11 @@ Resources:
           # this stage flag is on (ships inert otherwise).
           EMIT_KEYFRAME_REQUESTS: !Ref EnableKeyframes
           REBIND_SPEAKERS: !Ref RebindSpeakers
+          # The NAMED half, gated separately from the anonymous re-bind above.
+          MATCH_ON_FINALIZE: !Ref MatchOnFinalize
+          # Read only to refuse when naming is switched off entirely. This function does no
+          # naming itself; it queues the request the embedder acts on.
+          SPEAKER_IDENTITY_MODE: !Ref SpeakerIdentityMode
           # recurring-item threading: propose which earlier subject a new
           # topic restates. Writes suggestions only; never links.
           SUGGEST_THREADS: !Ref EnableThreadSuggestions
