@@ -291,7 +291,20 @@ def is_bound(conn, template_id):
     schedule pointing at something the Library no longer shows, which is the
     silent fallback-to-default this design exists to prevent.
     """
-    return conn.execute(
-        "SELECT count(*) FROM report_template_bindings WHERE template_id = %s",
+    return bool(bound_report_types(conn, template_id))
+
+
+def bound_report_types(conn, template_id):
+    """WHICH schedules point at it -- ['daily', 'weekly'] -- not merely whether
+    any does.
+
+    A count answers the guard's question and nothing else. The person being
+    refused has to go and find which report is using it, and this is the only
+    place that knows. Sorted so the refusal reads the same way twice.
+    """
+    rows = conn.execute(
+        "SELECT report_type FROM report_template_bindings WHERE template_id = %s "
+        "ORDER BY report_type",
         (str(template_id),),
-    ).fetchone()[0] > 0
+    ).fetchall()
+    return [r[0] for r in rows]

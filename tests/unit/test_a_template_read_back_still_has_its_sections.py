@@ -118,6 +118,9 @@ class _Repo:
     def is_bound(self, conn, template_id):
         return False
 
+    def bound_report_types(self, conn, template_id):
+        return []
+
 
 @pytest.fixture()
 def repo(monkeypatch):

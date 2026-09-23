@@ -140,7 +140,11 @@ class _Repo:
         return row
 
     def is_bound(self, conn, template_id):
-        return any(str(b["template_id"]) == str(template_id) for b in self.bindings.values())
+        return bool(self.bound_report_types(conn, template_id))
+
+    def bound_report_types(self, conn, template_id):
+        return sorted(b["report_type"] for b in self.bindings.values()
+                      if str(b["template_id"]) == str(template_id))
 
 
 @pytest.fixture()
@@ -357,7 +361,9 @@ def test_a_bound_template_cannot_be_archived(repo):
     oa.set_report_template_binding(None, GM, "daily", _event("PUT", "/b", {"template_id": t["id"]}))
     resp = oa.archive_report_template(None, GM, t["id"])
     assert resp["statusCode"] == 409
-    assert "scheduled report" in _body(resp)["error"]
+    # NAMES THE SCHEDULE. "A scheduled report" leaves the person to go and
+    # find which of three it is, and the server is the only thing that knows.
+    assert "daily" in _body(resp)["error"]
 
 
 def test_an_unbound_template_archives(repo):
