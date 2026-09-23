@@ -1032,12 +1032,26 @@ def test_no_parameter_in_the_attempt_update_is_untyped_in_a_null_test():
 
 def test_the_listing_counts_human_samples_separately_from_harvested_ones():
     """The distinction the whole harvest design rests on: a profile built only from
-    inference must not read as one somebody vouched for."""
+    inference must not read as one somebody vouched for.
+
+    Both counts became quarantine-aware in 0064, and the assertion follows the MEANING
+    rather than the old literal: `samples` is what still matches, so a set-aside vector must
+    not inflate it. A listing that counted quarantined rows as samples would say a profile
+    holds twelve when four of them match nobody — which is precisely the state this listing
+    exists to make visible.
+    """
     conn = FakeConn([[{"id": "vp-1"}]])
     voiceprints.list_profiles(conn, CO)
     sql = " ".join(conn.calls[0]["sql"].split())
-    assert "count(s.id) AS samples" in sql
-    assert "FILTER (WHERE s.source = 'correction')" in sql
+    assert "AS samples" in sql
+    assert "s.source = 'correction'" in sql
+    assert "AS human_samples" in sql
+    # Both counts exclude the set-aside rows, and the set-aside count is reported beside
+    # them rather than folded in: "4 samples" and "4 samples, 2 set aside" are different
+    # facts about a profile.
+    assert sql.count("s.quarantined_at IS NULL") >= 2, (
+        "a quarantined vector still counts towards `samples` or `human_samples`")
+    assert "AS quarantined" in sql
 
 
 def test_the_listing_is_a_left_join_so_an_empty_profile_still_appears():
