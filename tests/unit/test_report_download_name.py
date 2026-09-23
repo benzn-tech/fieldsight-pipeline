@@ -131,3 +131,54 @@ def test_the_same_name_spelled_two_ways_gives_one_filename():
     precomposed = dn.display_name("René", None, None, "2026-09-10")
     combining = dn.display_name("René", None, None, "2026-09-10")
     assert precomposed == combining
+
+
+# ---- the name, not the id ---------------------------------------------------
+
+def test_THE_test_a_library_template_is_named_not_uuided():
+    """The first report generated from a Library template came out as
+    `Ben_UCPK2_df153e1c-fef4-4c0a-bdb3-84fbb507c2ec-v3_2026-08-12.docx`, which
+    is a database key with a date on the end. The id identifies the template to
+    the system; the NAME is what the person who made it called it, and the
+    filename is for them."""
+    name = dn.display_name("Ben_UCPK2", "df153e1c-fef4-4c0a-bdb3-84fbb507c2ec", 3,
+                           "2026-08-12", template_name="Site Daily Report")
+    assert name == "Ben_UCPK2_Site_Daily_Report-v3_2026-08-12.docx"
+    assert "df153e1c" not in name
+
+
+def test_a_chinese_template_name_reaches_the_filename():
+    """The slug rule keeps CJK -- it strips what filesystems refuse, not what
+    is unfamiliar. The ASCII fallback in the header covers old clients."""
+    name = dn.display_name("Ben_UCPK2", "df153e1c-fef4-4c0a-bdb3-84fbb507c2ec", 1,
+                           "2026-08-12", template_name="每日工地报告")
+    assert "每日工地报告" in name
+    assert "df153e1c" not in name
+    dn.content_disposition(name).encode("ascii")   # header stays ascii
+
+
+def test_no_name_falls_back_to_the_id_rather_than_nothing():
+    """Old artifacts carry no name. A uuid is a poor filename; an empty
+    segment is a worse one."""
+    name = dn.display_name("Ben_UCPK2", "df153e1c-fef4-4c0a-bdb3-84fbb507c2ec", 3,
+                           "2026-08-12")
+    assert "df153e1c" in name
+
+
+def test_a_file_template_is_unaffected():
+    """Their ids are slugs and were always readable."""
+    assert dn.display_name("Ben_UCPK2", "personal-meeting", 3, "2026-08-12") == \
+        "Ben_UCPK2_personal-meeting-v3_2026-08-12.docx"
+
+
+def test_a_name_that_survives_nothing_falls_back_to_the_id():
+    name = dn.display_name("Ben_UCPK2", "df153e1c-fef4-4c0a-bdb3-84fbb507c2ec", 2,
+                           "2026-08-12", template_name="///")
+    assert "df153e1c" in name
+
+
+def test_a_template_named_after_its_own_id_still_does_not_print_a_uuid_twice():
+    name = dn.display_name("Ben_UCPK2", "df153e1c-fef4-4c0a-bdb3-84fbb507c2ec", 2,
+                           "2026-08-12",
+                           template_name="df153e1c-fef4-4c0a-bdb3-84fbb507c2ec")
+    assert name.count("df153e1c") == 1

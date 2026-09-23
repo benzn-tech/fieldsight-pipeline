@@ -30,6 +30,9 @@ DOC = "session_reports/James_Lamb/2026-09-10/%s.docx" % RID
 
 GENERATED = {"status": "done", "docKey": DOC, "emailed": False,
              "generated": True, "templateId": "personal-meeting", "templateVersion": 3}
+LIBRARY = {"status": "done", "docKey": DOC, "emailed": False, "generated": True,
+           "templateId": "df153e1c-fef4-4c0a-bdb3-84fbb507c2ec", "templateVersion": 3,
+           "templateName": "Site Daily Report"}
 ASSEMBLED = {"status": "done", "docKey": DOC, "emailed": False}
 
 
@@ -145,3 +148,36 @@ def test_a_broken_name_still_serves_the_report(monkeypatch):
     assert json.loads(resp["body"])["status"] == "done"
     assert "ResponseContentDisposition" not in signed[0]
     assert signed[0]["Key"] == DOC
+
+
+# ---- the name has to survive the wiring, not just the helper ----------------
+
+def test_a_library_template_downloads_under_its_name(monkeypatch):
+    """The helper preferring the name proves nothing if the presign never
+    passes one. Twice today a correct function sat behind an unwired caller."""
+    signed = _wire(monkeypatch, LIBRARY)
+    oa.session_report_status(None, CALLER, SID, _session_event())
+    disp = signed[0]["ResponseContentDisposition"]
+    assert "Site_Daily_Report-v3" in disp
+    assert "df153e1c" not in disp, "the uuid is the thing this replaces"
+
+
+def test_the_day_endpoint_names_it_too(monkeypatch):
+    signed = _wire(monkeypatch, _as_day(LIBRARY))
+    oa.day_report_status(None, CALLER, DATE, _day_event())
+    assert "Site_Daily_Report-v3" in signed[0]["ResponseContentDisposition"]
+
+
+def test_a_result_with_no_name_still_downloads(monkeypatch):
+    """Artifacts enqueued before the name travelled. A uuid filename is poor;
+    a failed download is worse."""
+    signed = _wire(monkeypatch, dict(LIBRARY, templateName=None))
+    oa.session_report_status(None, CALLER, SID, _session_event())
+    assert "df153e1c" in signed[0]["ResponseContentDisposition"]
+
+
+def test_the_name_is_not_echoed_to_the_client(monkeypatch):
+    """It exists for the filename. The status response keeps its shape."""
+    _wire(monkeypatch, LIBRARY)
+    body = json.loads(oa.session_report_status(None, CALLER, SID, _session_event())["body"])
+    assert "templateName" not in body

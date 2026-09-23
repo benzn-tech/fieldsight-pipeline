@@ -36,8 +36,28 @@ _EMPTY_STEM = re.compile(r"^[\s_.\-]*$")
 _MAX_STEM = 120          # keeps the whole header well inside any client's limit
 
 
-def template_label(template_id, template_version):
-    """`personal-meeting-v3`, or `report` when no template was named.
+_UUIDISH = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def template_label(template_id, template_version, template_name=None):
+    """`site-daily-v3`, or `report` when no template was named.
+
+    THE NAME, NOT THE ID. A template that ships as a file in this repo has a
+    slug for an id -- `personal-meeting` -- so using the id read perfectly well
+    for as long as those were the only templates. A template written in the
+    Library has a uuid, and the first report generated from one came out as
+
+        Ben_UCPK2_df153e1c-fef4-4c0a-bdb3-84fbb507c2ec-v3_2026-08-12.docx
+
+    which is not a filename, it is a database key with a date on the end. The
+    id identifies the template to the system; the NAME is what the person who
+    made it called it, and the filename is for them.
+
+    Falls back to the id when no name travelled -- an old artifact, or the file
+    templates, whose ids are readable anyway. And if a name reduces to nothing
+    printable (it may be written entirely in a script this slug rule cannot
+    represent), the id is better than an empty segment: display_name carries
+    the real name through Content-Disposition regardless.
 
     The assembled path names no template -- it is not a generation at all --
     and calling that file `...-None-vNone...` would state something false about
@@ -45,9 +65,16 @@ def template_label(template_id, template_version):
     """
     if not template_id:
         return "report"
+    label = _tidy(template_name) if template_name else ""
+    if not label:
+        label = str(template_id)
+    elif _UUIDISH.match(label):
+        # A template somebody named after its own id. Unlikely, and harmless,
+        # but the point of this function is not to print a uuid.
+        label = str(template_id)
     if template_version is None:
-        return str(template_id)
-    return "%s-v%s" % (template_id, template_version)
+        return label
+    return "%s-v%s" % (label, template_version)
 
 
 def _tidy(text):
@@ -62,7 +89,8 @@ def _tidy(text):
     return text.strip("_. ")
 
 
-def display_name(folder, template_id, template_version, date, ext=".docx"):
+def display_name(folder, template_id, template_version, date, ext=".docx",
+                 template_name=None):
     """`{who}_{template}_{when}{ext}` -- the name a person would have given it.
 
     `folder` is the recording folder, which is how this system already spells a
@@ -73,7 +101,8 @@ def display_name(folder, template_id, template_version, date, ext=".docx"):
     ` (1)` suffix says a second copy arrived -- which is true and is what the
     person expects to see.
     """
-    parts = [_tidy(p) for p in (folder, template_label(template_id, template_version), date)]
+    parts = [_tidy(p) for p in
+             (folder, template_label(template_id, template_version, template_name), date)]
     stem = "_".join(p for p in parts if p)
     if _EMPTY_STEM.match(stem):
         stem = "report"

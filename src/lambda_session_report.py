@@ -413,6 +413,12 @@ def _generate_document(artifact, context=None):
     meta = {"generated": True,
             "templateId": gen.get("templateId") or template.get("template_id"),
             "templateVersion": gen.get("templateVersion") or template.get("version"),
+            # For the filename, and only for it. A uuid identifies the template
+            # to the system; the NAME is what the person who made it called it,
+            # and the file lands in their Downloads folder. It is recorded in
+            # the result rather than looked up later because the presign runs
+            # in-VPC and the name it wants is a fact about this generation.
+            "templateName": gen.get("templateName") or template.get("name"),
             "model": llm_utils.active_model(),
             "promptChars": len(prompt)}
     return buf, meta
