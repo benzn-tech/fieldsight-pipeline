@@ -980,3 +980,33 @@ def test_a_worker_cannot_list_voiceprints(wired, monkeypatch):
 def test_listing_404s_when_the_feature_is_off(wired, monkeypatch):
     monkeypatch.setattr(org, "SPEAKER_IDENTITY_MODE", "off")
     assert org.lambda_handler(_list_event(), None)["statusCode"] == 404
+
+
+def test_the_listing_says_how_many_samples_were_set_aside(wired, monkeypatch):
+    """`samples` counts the live ones, so a poisoned profile looks thin rather than poisoned.
+
+    This assertion exists because the SQL and the serialisation were changed in separate
+    edits and only the SQL landed: `list_profiles` returned the count, the response dropped
+    it, and the page showed a profile with eight samples that was actually twelve with four
+    set aside. Nothing failed. A column added to a query is not a field on a response.
+    """
+    monkeypatch.setattr(org.voiceprints, "list_profiles", lambda conn, co: [
+        {"id": "vp-1", "display_name": "Ben Lin", "status": "confirmed", "user_id": None,
+         "linked_on": None, "consent_at": None, "samples": 8, "human_samples": 1,
+         "quarantined": 4,
+         "last_attempt_at": None, "last_attempt_outcome": None, "last_attempt_detail": None}])
+    row = _body(org.lambda_handler(_list_event(), None))["voiceprints"][0]
+    assert row["samples"] == 8 and row["quarantined"] == 4
+
+
+def test_the_listing_says_whether_the_company_can_enrol_at_all(wired, monkeypatch):
+    """Zero rows with a consent basis means "new". Zero rows without one means "never" —
+    naming a speaker in that company creates no profile, so the library cannot fill by
+    being used. Same zero rows; only one of them is somebody's to fix."""
+    monkeypatch.setattr(org.voiceprints, "list_profiles", lambda conn, co: [])
+    monkeypatch.setattr(org.users, "get_user_by_sub",
+                        lambda conn, sub: dict(CALLER, voiceprint_consent_basis="notice"))
+    assert _body(org.lambda_handler(_list_event(), None))["consentBasis"] == "notice"
+
+    monkeypatch.setattr(org.users, "get_user_by_sub", lambda conn, sub: dict(CALLER))
+    assert _body(org.lambda_handler(_list_event(), None))["consentBasis"] is None

@@ -1987,7 +1987,18 @@ def list_voiceprints(conn, caller):
     if caller["global_role"] not in _CORRECTION_ROLES:
         return error("admin, gm, pm, site_manager or platform_admin role required", 403)
     rows = voiceprints.list_profiles(conn, str(caller["company_id"]))
-    return ok({"voiceprints": [{
+    return ok({
+        # WHY an empty list is empty, which the list itself cannot say. A company that has
+        # settled no `voiceprint_consent_basis` enrols nobody -- naming a speaker creates no
+        # profile at all -- so its library is empty permanently and for a reason somebody can
+        # act on. A company that HAS one and is simply new is empty temporarily.
+        #
+        # Those are the same zero rows. Serving only the rows makes a fixable configuration
+        # gap look like "nobody has got round to it yet", which is the same failure this
+        # endpoint exists to end: before it, "empty because the enrolment window was refused"
+        # and "empty because the embedder died" were also the same row.
+        "consentBasis": caller.get("voiceprint_consent_basis"),
+        "voiceprints": [{
         "id": str(r["id"]),
         "displayName": r.get("display_name"),
         "status": r.get("status"),
@@ -1996,6 +2007,13 @@ def list_voiceprints(conn, caller):
         "consentAt": r.get("consent_at"),
         "samples": int(r.get("samples") or 0),
         "humanSamples": int(r.get("human_samples") or 0),
+        # Set aside by `requarantine_profile` as not sounding like this person. Reported
+        # rather than folded into `samples`, because "4 samples" and "4 samples, 2 of them
+        # set aside" are different facts about a profile -- and the second is the reason a
+        # profile that looks well-stocked can be matching badly. Measured: a profile with
+        # twelve samples, four of them a wind recording, scored 0.192 where the eight real
+        # ones score 0.257.
+        "quarantined": int(r.get("quarantined") or 0),
         "lastAttemptAt": r.get("last_attempt_at"),
         "lastAttemptOutcome": r.get("last_attempt_outcome"),
         "lastAttemptDetail": r.get("last_attempt_detail"),
