@@ -9412,9 +9412,13 @@ def archive_report_template(conn, caller, template_id):
     err = _may_write_template(caller, row)
     if err is not None:
         return err
-    if report_templates.is_bound(conn, template_id):
-        return error("this template is still in use by a scheduled report -- "
-                     "point that schedule at another template first", 409)
+    bound = report_templates.bound_report_types(conn, template_id)
+    if bound:
+        # NAMES THE SCHEDULE. "A scheduled report" leaves the person to go and
+        # find which of three it is, and this is the only place that knows.
+        which = " and ".join(", ".join(bound).rsplit(", ", 1))
+        return error("this template is still writing the %s report -- point "
+                     "that schedule at another template first" % which, 409)
     report_templates.archive(conn, template_id)
     return ok({"ok": True, "archived": str(template_id)})
 
