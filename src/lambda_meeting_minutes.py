@@ -684,6 +684,19 @@ def _add_markdown_table(doc, rows):
     if not cells:
         return
     width = max(len(c) for c in cells)
+    if width < 2:
+        # A ONE-COLUMN TABLE IS NOT A TABLE, and this is not a hypothetical: a
+        # section that said "table" and named no columns got exactly this from
+        # the model -- a single column headed with the section's own title,
+        # holding lines that had read perfectly well as sentences the day
+        # before. The prompt now names the columns, so this should not arrive;
+        # when it does anyway, the lines are worth more as lines than as a
+        # column of boxes.
+        for row in cells:
+            text = (row[0] if row else "").strip()
+            if text:
+                doc.add_paragraph(text, style="List Bullet")
+        return
     table = doc.add_table(rows=len(cells), cols=width)
     table.style = "Table Grid"
     for r, row in enumerate(cells):
