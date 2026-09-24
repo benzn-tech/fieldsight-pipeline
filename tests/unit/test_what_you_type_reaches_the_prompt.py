@@ -52,7 +52,13 @@ def body():
 
 
 def _prompt(body, actions=None, transcript="[09:05:00] Ben: roofing"):
-    return report_template.render_prompt(body, SCOPE, actions or [], transcript)
+    # SOURCE_LIBRARY, because that is what this fixture IS: a body the browser
+    # half produced from the editor. Rendering it as a reviewed file template
+    # would have kept every assertion below green while testing a framing this
+    # body can never be given in production -- the join would still join, to
+    # the wrong end.
+    return report_template.render_prompt(body, SCOPE, actions or [], transcript,
+                                         source=report_template.SOURCE_LIBRARY)
 
 
 # ---- THE test ---------------------------------------------------------------
@@ -147,6 +153,16 @@ def test_the_kinds_and_fields_do_not_leak_into_the_prompt(body):
     prompt = _prompt(body)
     assert '"kind"' not in prompt and "'kind'" not in prompt
     assert '"fields"' not in prompt
+
+
+def test_the_typed_sentence_arrives_inside_the_data_region(body):
+    """Where it arrives is now part of what "reaches the prompt" means. The
+    chain this file guards ends at a fenced region, and a sentence that landed
+    outside it would be the same words doing a different job."""
+    prompt = _prompt(body)
+    plan = prompt[prompt.index(report_template.FENCE_BEGIN):
+                  prompt.index(report_template.FENCE_END)]
+    assert TYPED in plan
 
 
 # ---- the actions block, which is data and not instruction -------------------

@@ -658,6 +658,54 @@ def save_debug_record(bucket, target_date, meeting_title, prompt, raw_response,
 # Word Document Generation
 # ============================================================
 
+_TABLE_RULE_RE = re.compile(r"^[\s|:-]+$")
+
+
+def _is_table_row(text):
+    return text.startswith("|") and text.count("|") >= 2
+
+
+def _split_table_row(text):
+    return [c.strip() for c in text.strip().strip("|").split("|")]
+
+
+def _add_markdown_table(doc, rows):
+    """Render the pipe rows the model was asked for as an actual table.
+
+    A section whose `kind` is "table" now tells the model to write a markdown
+    table, and this is the half that makes that request honest: without it the
+    document carries the pipe characters themselves, which is what a reader
+    would have got from choosing "Table" in the editor -- a control that could
+    be set, stored and previewed, and whose only effect on the output was to
+    make it worse.
+    """
+    cells = [_split_table_row(r) for r in rows if not _TABLE_RULE_RE.match(r)]
+    cells = [c for c in cells if any(x for x in c)]
+    if not cells:
+        return
+    width = max(len(c) for c in cells)
+    if width < 2:
+        # A ONE-COLUMN TABLE IS NOT A TABLE, and this is not a hypothetical: a
+        # section that said "table" and named no columns got exactly this from
+        # the model -- a single column headed with the section's own title,
+        # holding lines that had read perfectly well as sentences the day
+        # before. The prompt now names the columns, so this should not arrive;
+        # when it does anyway, the lines are worth more as lines than as a
+        # column of boxes.
+        for row in cells:
+            text = (row[0] if row else "").strip()
+            if text:
+                doc.add_paragraph(text, style="List Bullet")
+        return
+    table = doc.add_table(rows=len(cells), cols=width)
+    table.style = "Table Grid"
+    for r, row in enumerate(cells):
+        for c in range(width):
+            table.cell(r, c).text = row[c] if c < len(row) else ""
+    for run in table.rows[0].cells[0].paragraphs[0].runs or []:
+        run.bold = True
+
+
 def generate_prose_document(title, subtitle, sections, actions):
     """A record whose headings come from its template, not from this function.
 
@@ -681,14 +729,22 @@ def generate_prose_document(title, subtitle, sections, actions):
         if section_title.strip().lower() == "actions":
             has_actions_section = True
         doc.add_heading(section_title, level=1)
-        for para in section.get("paragraphs") or []:
-            text = (para or "").strip()
-            if not text:
+        paragraphs = [p for p in (section.get("paragraphs") or []) if (p or "").strip()]
+        i = 0
+        while i < len(paragraphs):
+            text = paragraphs[i].strip()
+            if _is_table_row(text):
+                rows = []
+                while i < len(paragraphs) and _is_table_row(paragraphs[i].strip()):
+                    rows.append(paragraphs[i].strip())
+                    i += 1
+                _add_markdown_table(doc, rows)
                 continue
             if text.startswith("- ") or text.startswith("* "):
                 doc.add_paragraph(text[2:].strip(), style="List Bullet")
             else:
                 doc.add_paragraph(text)
+            i += 1
 
     if actions:
         # A prose section titled "Actions" already wrote this heading above; the
