@@ -650,6 +650,11 @@ def _match(event):
             # A profile that has not earned confirmation cannot hand one out.
             status = "tentative"
         results.append({"turn": turn, "status": status, "name": d.name,
+                        # The winner's own similarity. The writer has always asked for it
+                        # (`score=r.get("score")`); until now nothing put it here, so
+                        # `speaker_turn_names.score` was NULL on every row and the floor
+                        # this score calibrates could never be computed from it.
+                        "score": d.score,
                         "margin": d.margin, "reason": d.reason})
     return {"session": event.get("session"), "results": results}
 
@@ -1275,6 +1280,10 @@ def _from_match_artifact(bucket, key):
             # reader sees has to come from the profile, or the transcript shows a uuid.
             "display_name": (by_key.get(r["name"]) or {}).get("display_name"),
             "margin": r.get("margin"),
+            # Rebuilt row, so a field added to `_match`'s result does NOT arrive here by
+            # itself -- which is how `score` went missing for 604 rows while the writer
+            # was already asking for it. The seam test is what catches the omission.
+            "score": r.get("score"),
         })
 
     if skipped_no_runner_up:
