@@ -14,7 +14,7 @@
 
 ## Global Constraints
 
-- **Never delete a row a human has touched.** Physical delete of topics is reserved for the deletion feature (`redactions` tombstones) and `lambda_nonwork_expiry`. Re-extraction supersedes.
+- **Never delete a row a human has touched.** Physical delete of topics is reserved for the deletion paths that already exist (the `redactions` tombstone mirror; `lambda_nonwork_expiry` redacts rather than deletes, so it is not one). Re-extraction supersedes.
 - **A wrong carry-forward is worse than a lost one** (`lambda_item_writer.py:984-993`). Exact hash first; fuzzy only above 0.90 on normalised text, one-to-one, within the same source key and site; a tie or a second candidate within 0.05 is a miss, not a guess.
 - **Readers must exclude superseded rows through ONE predicate**, added to `deleted_predicates.py`, never inlined. That module exists because eleven inlined copies drifted once already.
 - **Every child table that gets `stable_id` gets it `NOT NULL DEFAULT gen_random_uuid()`** so existing rows are valid immediately and the column can be added without a backfill step.
@@ -129,13 +129,13 @@ CREATE INDEX IF NOT EXISTS idx_decision_records_kind_time ON decision_records (c
 - Modify: `src/repositories/topics.py` (add `supersede_topics_for_source`, `supersede_topics_for_source_prefix`; keep the delete functions for the deletion/expiry paths)
 - Modify: `src/lambda_item_writer.py:995-1009`, `:891`, `_delete_member_topics`
 - Modify: `src/lambda_ingest.py:657`, `:670`
-- Modify: `src/lambda_nonwork_expiry.py` (its delete must also remove superseded rows of the expired topics, or they linger forever)
+- Modify: `src/lambda_nonwork_expiry.py` (it redacts by topic id and re-indexes; it must select superseded rows of an expired day too, or they stay unredacted and reachable to a future reader that drops the live predicate)
 - Test: `tests/unit/test_item_writer_supersedes_not_deletes.py`, `tests/integration/test_supersede_two_passes.py`
 
 - [ ] **Step 1:** `supersede_topics_for_source(conn, source_s3_key, run) -> list[dict]` executes `UPDATE topics SET superseded_at=now(), superseded_by_run=%s WHERE source_s3_key=%s AND superseded_at IS NULL RETURNING id, title, summary` and returns the rows it retired (Task 4 needs them). Same for the prefix form, with the existing `_escape_like`.
 - [ ] **Step 2:** Replace the three delete calls. The `_warn_if_discarding_checkoffs` call stays for one release but its message changes to "N closed action items on rows being superseded" (it is now a count of what Task 4 must carry, not a loss). `run` = `f"{extraction.get('tier')}:{extraction.get('extracted_at')}"`.
 - [ ] **Step 3:** `_source_is_deleted` ordering is unchanged: the deleted-source gate still runs after the advisory lock and before the supersede.
-- [ ] **Step 4: Unit test:** replay the actual defect — a `_Conn` double records SQL; assert the writer issues `UPDATE topics SET superseded_at` and never `DELETE FROM topics` on the extraction path; the group path supersedes member keys. **Integration test:** live pass then final pass on one key → two topic rows, one superseded, both present; `nonwork_expiry` on the day removes both.
+- [ ] **Step 4: Unit test:** replay the actual defect — a `_Conn` double records SQL; assert the writer issues `UPDATE topics SET superseded_at` and never `DELETE FROM topics` on the extraction path; the group path supersedes member keys. **Integration test:** live pass then final pass on one key → two topic rows, one superseded, both present; `nonwork_expiry` on the day redacts both.
 - [ ] **Step 5: Row growth note** in the module docstring: a session produces 2–4 passes, so topics rows grow ~3×. At current volume (hundreds of topics per site-month) this is nothing; the partial index keeps live reads at today's cost.
 
 ---
