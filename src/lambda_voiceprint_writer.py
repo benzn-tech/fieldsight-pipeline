@@ -69,7 +69,10 @@ def _require(event, key):
 def _rebind(event):
     """Store one session's anonymous speaker groups, replacing whatever was there.
 
-    Letters, not names: nothing here identifies anybody and no vector is stored. It lives on
+    Letters, not names: nothing here identifies anybody. It DOES now store a vector -- the
+    centroid the grouping was decided on (0065) -- which the previous wording explicitly
+    denied, so read the column comment before treating this as anonymous in a privacy
+    answer: a voice summary is not a name, but it is not nothing either. It lives on
     this side of the boundary for the ordinary reason — the embedder is non-VPC and cannot
     reach Aurora, so the same invoke the enrolment path already uses carries the result across.
 
