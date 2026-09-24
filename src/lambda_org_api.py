@@ -163,6 +163,7 @@ import batch_cover
 import batch_stitch
 import deletion_mirror
 import speaker_match_request
+from repositories import speaker_name_proposals
 import turn_name_overlay
 from transcript_utils import extract_base_time_from_filename, speaker_turns_from_items
 
@@ -744,6 +745,9 @@ def dispatch(conn, event, method, route):
     m_rg = re.match(r"^/sessions/([^/]+)/regenerate$", route)
     if m_rg and method == "POST":
         return regenerate_session(conn, caller, m_rg.group(1), event)
+    m_np = re.match(r"^/name-proposals/([^/]+)$", route)
+    if m_np and method == "POST":
+        return decide_name_proposal(conn, caller, m_np.group(1), event)
     m_sc = re.match(r"^/sessions/([^/]+)/speaker-corrections$", route)
     if m_sc and method == "POST":
         return speaker_corrections(conn, caller, m_sc.group(1), event)
@@ -2354,6 +2358,92 @@ def _employer_result(name, source, profile):
     return {"stored": True,
             "name": profile.get("employer_name"),
             "source": profile.get("employer_source")}
+
+
+def decide_name_proposal(conn, caller, proposal_id, event):
+    """POST /api/org/name-proposals/{id} — a human answers one proposed name.
+
+    Body: `{"decision": "confirmed" | "rejected"}`.
+
+    **`confirmed` does not write a name here. It delegates to `speaker_corrections`**, and
+    that delegation is the single most load-bearing line in this feature.
+
+    The reason is a string. `lambda_voiceprint_writer` stores
+    `source="correction" if asserted else "correction_propagation"`, and
+    `recompute_company_floor` counts ONLY `source='correction'` -- deliberately, because a
+    floor calibrated from the system's own guesses would lower its own bar every time it
+    was wrong. Twenty of those rows is what a company needs before `decide_name` can return
+    `confirmed` at all. So this queue's entire purpose is to produce them.
+
+    A confirmation written straight to the database here would name the person correctly,
+    render correctly, satisfy the user, and contribute **nothing** -- and every test would
+    be green, because nothing about the outcome would look wrong. Going through the
+    correction endpoint is what makes a confirmation the same act as a rename, which is the
+    act the calibration counts. It is pinned by a seam test for exactly that reason.
+
+    `rejected` records the judgement and writes no name. A rejection is information: it
+    says "this is not that person", which stays true however many times the cluster is
+    recomputed, and it is why the candidate never comes back.
+
+    **There is no third value.** Closing the popup is not a decision and must not reach
+    this route -- the row stays `pending` and the bell carries it. A dismissal that
+    consumed the candidate would burn, silently and five at a time, the human decisions the
+    company's floor is built from.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    body = parse_body(event) or {}
+    decision = (body.get("decision") or "").strip().lower()
+    if decision not in ("confirmed", "rejected"):
+        return error("decision must be 'confirmed' or 'rejected'; closing the dialog is "
+                     "not a decision and leaves the proposal pending", 400)
+
+    company_id = str(caller["company_id"])
+    # Company from the caller, never the path -- a valid uuid from another tenant would
+    # otherwise be a button that names people in their recordings.
+    row = speaker_name_proposals.decide(conn, company_id, proposal_id, decision,
+                                        decided_by=caller["id"])
+    if row is None:
+        # Already answered, or not this company's. Both are "there is nothing here for you
+        # to decide", and telling them apart would confirm the existence of another
+        # tenant's row.
+        return error("no pending proposal with that id", 404)
+    if decision == "rejected":
+        return ok({"proposalId": row["id"], "decision": "rejected"})
+
+    person = voiceprints.get_profile(conn, company_id, row["voiceprint_id"])
+    if person is None or not person.get("display_name"):
+        return error("the proposed profile has no name to apply", 409)
+
+    # Off the ROW, not re-derived. `speaker_label_groups` carries neither, and resolving
+    # them at decision time would make answering an old proposal depend on data that may
+    # have moved since it was offered.
+    session_base = row["session_base"]
+    folder, date = row["user_folder"], str(row["session_date"])
+
+    # WHICH passage to mark. A cluster is many turns; the correction endpoint marks one
+    # window and lets propagation spread it over the voice. The LONGEST turn is chosen
+    # because it carries the most evidence for the enrolment the correction may also
+    # trigger -- the homogeneity guard refuses thin windows, and picking the first turn
+    # would hand it whichever passage happened to be transcribed first.
+    turns = [t for t in _session_turns(conn, folder, date, session_base)
+             if t.get("source_filename") == row["source_filename"]
+             and t.get("speaker_label") == row["speaker_label"]]
+    if not turns:
+        return error("that proposal's passage is no longer in the transcript", 409)
+    best = max(turns, key=lambda t: float(t.get("end_sec", 0)) - float(t.get("start_sec", 0)))
+
+    # The delegation. Same handler, same artifact, same `source='correction'` on the row
+    # that lands -- see this function's docstring for why nothing may shortcut it.
+    return speaker_corrections(conn, caller, session_base, dict(event, body=json.dumps({
+        "user": folder,
+        "source_filename": row["source_filename"],
+        "start_sec": best["start_sec"],
+        "end_sec": best["end_sec"],
+        "display_name": person["display_name"],
+    })))
 
 
 def speaker_corrections(conn, caller, session_base, event):
