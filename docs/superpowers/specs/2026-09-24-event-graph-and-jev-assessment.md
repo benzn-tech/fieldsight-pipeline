@@ -230,7 +230,12 @@ Track A 与 B 互不依赖；A 的结论决定 C 里"决策引擎"那格是 Jev 
 
 ---
 
-## 7. 需要 owner 决定的事
+## 7. 需要 owner 决定的事（2026-09-24 已决，记录在此）
+
+**已决**：①事件 = findings + action_items + decisions + questions 四类行，topic 为容器；②Jev 出境接受，但只送结构化事件 JSON、不送转写、人名脱敏，先 TEST；③对外工作流目标 = Procore；④Location 先做 2 层；⑤标签只开平台级词表；⑥Track A 与 B 并行。实施计划：`plans/2026-09-24-track-a-jev-shadow-eval.md`、`plans/2026-09-24-track-b-stable-identity-and-decision-records.md`。
+
+原始问题保留如下。
+
 
 1. **"事件"的粒度**：附件例子"Ductwork incomplete"对应本仓的 `finding`，不是 `topic`。
    建议：事件 = findings + action_items + decisions + questions（四种类型的行），topic 降为
