@@ -128,3 +128,9 @@ thickenings	thick-en-ings		thickenings
 FieldSight		fiːldsaɪt	FieldSight
 SiteSync		saɪtsɪŋk	SiteSync
 RealPTT	real-pee-tee-tee		RealPTT
+# People whose names the transcriber has been measured to get wrong. Both the full name
+# and the first name are listed: keyterms are a per-word whitelist with NO spillover
+# (measured 2026-08-29 -- added terms went 0 -> 9/10/1 hits while a deliberately omitted
+# control term got WORSE), so "Petros Pan" as a phrase does not rescue a bare "Petros".
+Petros	pet-ross		Petros
+Petros Pan	pet-ross pan		Petros Pan
