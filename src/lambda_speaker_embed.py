@@ -986,6 +986,12 @@ def _rebind(req):
     rows = [{"source_filename": keys[i][0], "speaker_label": keys[i][1],
              "group_label": chr(ord("A") + assignment[i]),
              "spread": spreads[i],
+             # The vector this grouping was decided on, kept rather than discarded (0065).
+             # It is the only stored summary of what a PASSAGE sounds like, and without it
+             # "which past passages sound like this person" costs a re-read and a re-embed
+             # of the audio -- about 4s per cluster, growing with how busy the customer is.
+             # `tolist()` because it crosses a JSON hop to the in-VPC writer.
+             "centroid": centroids[i].tolist(),
              "turns": evidence[i][0], "seconds": evidence[i][1]}
             for i in range(len(keys))]
     logger.info("rebind: %d (call,label) pairs -> %d groups at similarity %.2f",

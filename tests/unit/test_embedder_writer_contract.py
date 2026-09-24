@@ -399,3 +399,102 @@ def test_a_matched_turn_carries_its_score_across_the_seam(captured, writer_db, m
         # 1.0000000000000002. The bound is here to catch a wrong FIELD (a margin, an index,
         # a duration) landing in this slot, not to police the arithmetic.
         assert -1.001 <= float(r["score"]) <= 1.001, r["score"]
+
+
+def test_the_embedder_puts_a_centroid_on_every_group_it_sends(monkeypatch):
+    """The producer's half. `_rebind` computes a centroid per (call, label) to cluster on
+    and, until 0065, dropped it on the floor -- so the column could be added, the writer
+    could read it, and every row would still be NULL with nothing failing anywhere.
+
+    Two labels across TWO calls, because `_rebind` skips any session with fewer than two of
+    either: the shared fixture has one call, on which the re-bind correctly reports "nothing
+    to group", and a test built on it would assert on an empty list forever.
+
+    Only the audio READ is stubbed. The windowing, the mean, the normalisation, the
+    clustering and the row construction are the shipped ones -- stubbing those would leave
+    the centroid's presence proven about a fake.
+    """
+    import lambda_speaker_embed as se
+
+    def fake_window(folder, date, src, start, end):
+        # Two distinguishable voices, so clustering has something real to separate.
+        base = np.ones(16000) if src.startswith("a") else np.sin(np.arange(16000) / 5.0)
+        return "k", base.astype(np.float32), 16000
+
+    monkeypatch.setattr(se, "_window_audio", fake_window)
+    rows = se._rebind({"user_folder": "u", "date": "2026-08-13", "turns": [
+        {"source_filename": f"{c}.json", "speaker_label": f"spk_{i}",
+         "start_sec": 0.0, "end_sec": 9.0}
+        for c in ("a", "b") for i in (0, 1)]})
+
+    assert rows, "the re-bind emitted no groups, so this proves nothing about the centroid"
+    for g in rows:
+        c = g.get("centroid")
+        assert c, (
+            "a group left the producer without the vector it was clustered on; the column "
+            "lands NULL and every candidate lookup falls back to re-embedding the audio")
+        assert len(c) == 192, len(c)
+        # A LIST here, turned into pgvector's text form by the repository. The two forms are
+        # easy to confuse and only one survives a real database -- see the insert test.
+        assert isinstance(c, list), type(c)
+
+
+def test_the_rebind_centroid_survives_the_hop_and_reaches_the_insert(monkeypatch):
+    """The vector the grouping was decided on must arrive in the INSERT, not just exist.
+
+    Adding a column is easy; the writer's half not reading it is the failure this repository
+    made twice in one night (a template body dropped from a PATCH reply, a score dropped from
+    the match payload). Both times the column was right, the producer was right, and the hop
+    between them silently carried nothing.
+
+    This drives the embedder's real `_rebind` to build the rows, hands them to the writer's
+    real `_rebind`, and reads the parameters the repository passed to the driver.
+
+    **A connection double never executes SQL**, so this cannot prove Postgres accepts the
+    value -- it proves the value is present, non-empty, and in pgvector's text form rather
+    than the Python list that would fail at runtime against a real database. The shape check
+    is the part a double can carry.
+    """
+    import repositories.speaker_label_groups as slg
+
+    captured_params = []
+
+    class Cur:
+        def execute(self, sql, params=None):
+            if "INSERT INTO speaker_label_groups" in sql:
+                captured_params.append((sql, params))
+            return self
+
+    class Conn:
+        def cursor(self, row_factory=None):
+            return Cur()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    rows = [{"source_filename": "a.json", "speaker_label": "spk_0", "group_label": "A",
+             "spread": 0.1, "turns": 3, "seconds": 12.0,
+             "centroid": [0.1] * 192},
+            # A row with no centroid is legitimate (pre-0065 producers) and must not be
+            # dropped or turned into a zero vector -- "not cached" is a real answer.
+            {"source_filename": "b.json", "speaker_label": "spk_1", "group_label": "B",
+             "spread": None, "turns": 1, "seconds": 4.0}]
+    written = slg.replace_for_session(Conn(), CO, "sid" + "a" * 32, rows)
+    assert written == 2, "a row without a centroid must still be stored"
+    assert len(captured_params) == 2
+
+    with_vec = captured_params[0][1][-1]
+    assert with_vec is not None, (
+        "the centroid did not reach the INSERT; the column will be NULL on every row and "
+        "every candidate lookup will fall back to re-embedding the audio")
+    assert isinstance(with_vec, str) and with_vec.startswith("[") and with_vec.endswith("]"), (
+        f"pgvector needs its text form; a Python list fails against a real database and a "
+        f"connection double cannot tell you so: {with_vec!r:.60}")
+    assert len(with_vec.strip("[]").split(",")) == 192
+
+    assert captured_params[1][1][-1] is None, (
+        "a missing centroid must stay NULL -- a zero vector would read as a voice that "
+        "matches nothing, which is a different and answerable claim")
