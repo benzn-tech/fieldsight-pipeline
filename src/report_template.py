@@ -33,17 +33,47 @@ SECTION_KINDS = {
     "narrative": "in plain paragraphs",
     "list": "as a list, one item per line, each line starting with \"- \"",
     "kpi": "as a list of figures, one per line, written as \"- Label: value\"",
-    "table": ("as a markdown table with a header row, pipes between columns, "
-              "and no blank lines inside it"),
+    # `table` takes its columns from the section (see _table_shape). The string
+    # here is the fallback wording only; nothing uses it without columns.
+    "table": "as a markdown table",
 }
 DEFAULT_SECTION_KIND = "narrative"
 
-# `photos` is refused at the door rather than listed above. A generated report is
-# prose the model writes; nothing in this path inserts an image, so a "Photos"
-# section could only ever be a heading with a sentence under it. Giving it a
-# sentence in SECTION_KINDS would make this table say the renderer does something
-# it does not do -- the same defect as the unwired control it is replacing.
-REFUSED_SECTION_KINDS = {"photos": "photos cannot be placed in a generated report yet"}
+# WHAT A TABLE'S COLUMNS ARE WHEN NOBODY SAID. Asking for "a markdown table" and
+# nothing else was measured, on the customer's own daily report: the section
+# said `Outstanding tasks` and the model, given no columns, invented ONE -- a
+# single-column table whose header was the section's own title, holding lines
+# that had read perfectly well as sentences the day before. The control made the
+# document worse than not having it.
+#
+# These three are the shape this product already uses for task-like tables in
+# the two places a customer sees one: the stop-recording email
+# (`AGENDA ITEM / ASSIGNED / DUE DATE`) and the Actions table in every generated
+# document (`Action / Owner / When`). A section that wants different columns
+# names them; a section that names none gets the house shape rather than a
+# guess.
+DEFAULT_TABLE_COLUMNS = ["Item", "Assigned", "Due"]
+MAX_TABLE_COLUMNS = 8
+
+# `photos` is not in the table above and is NOT refused either, and the two
+# halves of that need saying separately.
+#
+# Not in the table: a generated report is prose the model writes, and nothing in
+# that path inserts an image. Giving `photos` a sentence would make this table
+# claim the renderer does something it does not do.
+#
+# Not refused: it was, for about an hour, and the first template it met was the
+# customer's own live one -- `Photos` with kind `photos`, saved months ago,
+# generating reports every day. Refusing the value did not stop anything
+# reaching the prompt (the lookup already ignores it); all it did was make an
+# existing template impossible to SAVE, with an error naming a section the
+# person had not touched. A door that turns away what is already inside the
+# house is not a guard.
+#
+# So: the editor no longer OFFERS photos, and a body that already carries it
+# still saves and still behaves exactly as it did -- heading, and whatever the
+# model writes under it.
+LEGACY_SECTION_KINDS = {"photos"}
 
 
 class TemplateNotFound(Exception):
@@ -86,9 +116,30 @@ def _section_shape(section):
     kind = kind.strip().lower()
     if kind == DEFAULT_SECTION_KIND:
         return None
+    if kind == "table":
+        return _table_shape(section)
     # Unknown takes the explicit default, which is what the model does anyway,
     # so it needs no line. What it must never do is reach the prompt itself.
     return SECTION_KINDS.get(kind)
+
+
+def _table_columns(section):
+    """The columns for a `table` section: the ones it names, else the house set."""
+    cols = section.get("columns")
+    if isinstance(cols, list):
+        named = [c.strip() for c in cols if isinstance(c, str) and c.strip()]
+        if named:
+            return named[:MAX_TABLE_COLUMNS]
+    return list(DEFAULT_TABLE_COLUMNS)
+
+
+def _table_shape(section):
+    cols = _table_columns(section)
+    return ("as a markdown table with exactly these columns, in this order: "
+            "%s. One row per item, pipes between columns, a header row, and no "
+            "blank lines inside the table. Where a column has nothing for a "
+            "row, leave that cell empty rather than dropping the row"
+            % " | ".join(cols))
 
 
 def _shape_rules(sections):
@@ -292,11 +343,22 @@ def _section_error(section, where):
         if not isinstance(kind, str):
             return "%s: kind must be a string" % where
         k = kind.strip().lower()
-        if k in REFUSED_SECTION_KINDS:
-            return "%s: %s" % (where, REFUSED_SECTION_KINDS[k])
-        if k not in SECTION_KINDS:
+        if k not in SECTION_KINDS and k not in LEGACY_SECTION_KINDS:
             return "%s: kind must be one of %s" % (
                 where, ", ".join(sorted(SECTION_KINDS)))
+
+    cols = section.get("columns")
+    if cols is not None:
+        if not isinstance(cols, list):
+            return "%s: columns must be a list" % where
+        if len(cols) > MAX_TABLE_COLUMNS:
+            return "%s: at most %d columns" % (where, MAX_TABLE_COLUMNS)
+        for c in cols:
+            if not isinstance(c, str):
+                return "%s: every column must be a name" % where
+            if len(c) > MAX_TITLE_CHARS:
+                return "%s: a column name is longer than %d characters" % (
+                    where, MAX_TITLE_CHARS)
 
     present = section.get("always_present")
     if present is not None and not isinstance(present, bool):

@@ -83,6 +83,30 @@ def test_a_sentence_with_a_pipe_in_it_is_not_a_table():
     assert "The board reads Gate A | Gate B." in [p.text for p in doc.paragraphs]
 
 
+def test_a_one_column_table_comes_out_as_lines():
+    """Measured, not imagined: a section that said "table" and named no columns
+    got a single column from the model, headed with the section's own title,
+    holding lines that had read fine as sentences the day before. The prompt
+    names the columns now, so this should not arrive -- and when it does, the
+    lines are worth more as lines than as a column of boxes."""
+    doc = _rendered(["| Open Actions |",
+                     "| **no owner recorded** - Platform login |",
+                     "| **no owner recorded** - Onboarding session |"])
+    assert not doc.tables, "one column is not a table"
+    texts = [p.text for p in doc.paragraphs]
+    assert "Open Actions" in texts
+    assert "**no owner recorded** - Platform login" in texts
+    for p in doc.paragraphs:
+        assert "|" not in p.text
+
+
+def test_two_columns_is_still_a_table():
+    """The floor is at one, not at three -- a two-column table is a table."""
+    doc = _rendered(["| Item | Due |", "|---|---|", "| Crane pad | Friday |"])
+    assert len(doc.tables) == 1
+    assert [c.text for c in doc.tables[0].rows[1].cells] == ["Crane pad", "Friday"]
+
+
 def test_bullets_and_prose_are_unchanged():
     """Nothing above may cost the two things this renderer already did."""
     doc = _rendered(["- first", "* second", "a sentence"])

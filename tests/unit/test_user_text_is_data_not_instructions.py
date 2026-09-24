@@ -206,15 +206,29 @@ def test_always_present_does_not_ask_for_content_on_an_empty_day():
 
 # ---- validation: the gap that wiring `kind` activated -----------------------
 
-def test_photos_is_refused_rather_than_accepted_with_nothing_behind_it():
-    """Nothing in the generated-report path inserts an image. A "Photos" kind
-    could only ever be a heading with a sentence under it, so it is refused at
-    the door instead of being given a sentence that describes work the renderer
-    does not do."""
+def test_photos_is_not_given_behaviour_and_is_not_refused_either():
+    """THIS TEST USED TO ASSERT THE OPPOSITE, and the reversal is the point.
+
+    It read `assert err and "photos" in err` -- refuse the value at the door,
+    on the reasoning that nothing in the generated path inserts an image, so a
+    Photos section could only ever be a heading with a sentence under it.
+
+    That reasoning was sound about behaviour and wrong about the door. The
+    first stored template the refusal met was the customer's own live daily
+    report, which has carried `kind: "photos"` for months: it still generated
+    fine, and it could no longer be SAVED, with an error naming a section they
+    had not touched. Refusing protected nothing -- SECTION_KINDS never held
+    `photos`, so it reached the prompt neither before nor after.
+
+    The half that was right is kept below: no behaviour, no shape line. The
+    half that was wrong is inverted here rather than deleted, because a test
+    that simply disappeared would leave the next person free to re-add the
+    refusal for the same reasoning that failed the first time.
+    """
     body = _body()
     body["sections"][0]["kind"] = "photos"
-    err = rt.validate_body(body)
-    assert err and "photos" in err
+    assert rt.validate_body(body) is None, "an existing template must stay saveable"
+    assert '- Write "Daily Summary"' not in _prompt(body), "and stay behaviourless"
 
 
 @pytest.mark.parametrize("kind", ["gantt", 7, "narrative "])
