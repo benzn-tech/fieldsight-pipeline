@@ -20,7 +20,7 @@
 - **No transcript text in any state.** The state builder works from an allowlist of structured fields (Task 3). A test pins the allowlist.
 - **Names are masked before leaving the process.** `name_aliases` reverse map plus `corroboration_gate._NAME_WORD` → `PERSON_n`. Company and product names stay (they are the signal for trade/entity questions).
 - **The exported label files contain customer text and are never committed.** `scripts/fixtures/jev_eval/` is gitignored; only `counts.json` is committed.
-- **Secrets from env only:** `TYPESAFE_API_KEY`. Never in a fixture, never in a log line. `llm_usage` logs tokens, never text.
+- **Secrets from env only:** `DECISIONS_API_KEY` (= `OPENROUTER_API_KEY` on the chosen route). Never in a fixture, never in a log line. `llm_usage` logs tokens, never text.
 - **Jev limits (from public docs, re-verify against docs.typesafe.ai before Task 2):** `POST https://api.typesafe.ai/v1/systemone`, `model: jev-latest`, `state` + `questions` map of `choice` (≤255 options) / `score` (2–10 levels) / `noul`; 64k context, `state` + longest question ≤ 32k tokens; 1200 rpm. Output is probabilities, never text.
 - **The decision rule is pre-registered in Task 8 and copied into the findings doc before Task 6 runs.**
 
@@ -57,11 +57,12 @@
 
 **Interfaces:**
 - `ask(state: str | dict, questions: dict, *, model=None, timeout=None, caller=None) -> dict` returning `{"answers": {name: {"noul": p} | {"choice": x, "probabilities": {...}, "confidence": c} | {"score": s, "probabilities": {...}}}, "usage": {...}, "latency_ms": int}`.
-- Env: `TYPESAFE_API_KEY` (required), `TYPESAFE_BASE_URL` (default `https://api.typesafe.ai`), `TYPESAFE_MODEL` (default `jev-latest`), `TYPESAFE_HTTP_TIMEOUT` (default 10).
+- Env: `DECISIONS_API_KEY` (required; on OpenRouter this is the existing `OPENROUTER_API_KEY` — the same secret `corroboration_client` already uses), `DECISIONS_URL` (default `https://openrouter.ai/api/alpha/decisions`; TypeSafe direct is `https://api.typesafe.ai/v1/systemone`), `DECISIONS_MODEL` (default `~typesafe/jev-latest` on OpenRouter, `jev-latest` direct), `DECISIONS_HTTP_TIMEOUT` (default 10).
+- **Owner decision 2026-09-24: use the OpenRouter route.** Public notes on it (re-verify against `openrouter.ai/docs/guides/community/jev` before writing code): it is a dedicated **Decisions** endpoint, *not* chat completions — an OpenAI-compatible SDK cannot call it; the body is the same `model` / `state` / `questions` shape as TypeSafe's own API; the listing shows a **32k** context (TypeSafe direct says 64k), so the client's pre-send size check is sized for 32k total; the endpoint is marked **alpha**, so the client keeps `DECISIONS_URL` switchable and the findings doc records which route produced every row. Error codes seen: 400, 401, 402 (credits), 404, 413 (payload too large), 429, 5xx.
 
-- [ ] **Step 1: Write the client** in the style of `llm_utils._call_qwen`: urllib, one retry on 429/5xx with the `Retry-After` header honoured, a 200 with an empty `answers` map treated as failure (`llm_utils.py:555-564` precedent). Refuse before sending when the serialised state exceeds a conservative 24k-token estimate (4 chars/token) — the documented cap is 32k for state + longest question, and a silent truncation would be exactly the BUG-15 shape.
-- [ ] **Step 2: Log usage** through `llm_usage` with `provider=typesafe`, `model`, `caller`, `latency_ms`, `prompt_tokens` from the response usage block if present. Never the state.
-- [ ] **Step 3: Tests with a fake transport** (monkeypatch `urllib.request.urlopen`): request body carries `model`, `state`, `questions` exactly as given; a `noul` answer is a float in [0,1]; a `choice` answer's probabilities sum to ~1 and the chosen option is in the options list; 429 → one retry then raise; oversize state raises before any request; missing API key raises with a message naming the env var.
+- [ ] **Step 1: Write the client** in the style of `llm_utils._call_qwen`: urllib, one retry on 429/5xx with the `Retry-After` header honoured, a 200 with an empty `answers` map treated as failure (`llm_utils.py:555-564` precedent). Refuse before sending when the serialised state plus questions exceeds a conservative 20k-token estimate (4 chars/token) — the OpenRouter listing caps the whole request at 32k, and a 413 or a silent truncation would be exactly the BUG-15 shape.
+- [ ] **Step 2: Log usage** through `llm_usage` with `provider=openrouter-decisions` (or `typesafe` when `DECISIONS_URL` is the direct host), `model`, `caller`, `latency_ms`, `prompt_tokens` from the response usage block if present. Never the state.
+- [ ] **Step 3: Tests with a fake transport** (monkeypatch `urllib.request.urlopen`): request body carries `model`, `state`, `questions` exactly as given; a `noul` answer is a float in [0,1]; a `choice` answer's probabilities sum to ~1 and the chosen option is in the options list; 429 → one retry then raise; oversize state raises before any request; missing API key raises with a message naming the env var; a 413 raises with the estimated token count in the message.
 
 ---
 
@@ -139,7 +140,7 @@
 - Create: `scripts/jev_shadow_eval.py`
 - Output: `scripts/fixtures/jev_eval/results/{set}.{arm}.run{n}.jsonl` (gitignored)
 
-- [ ] **Step 1: CLI**: `--set programme_match|threads|work_class|all`, `--arms baseline,broad,decomposed,control`, `--runs 2`, `--limit N`, `--database fieldsight_test`. Requires `TYPESAFE_API_KEY` for the Jev arms; refuses to start if the set's `counts.json` entry is missing.
+- [ ] **Step 1: CLI**: `--set programme_match|threads|work_class|all`, `--arms baseline,broad,decomposed,control`, `--runs 2`, `--limit N`, `--database fieldsight_test`. Requires `DECISIONS_API_KEY` for the Jev arms; refuses to start if the set's `counts.json` entry is missing.
 - [ ] **Step 2: Per row, per arm, per run:** build state (Task 3) → questions (Task 4) → `systemone_client.ask` → write `{id, label, arm, run, answers, score, latency_ms, tokens}`. Concurrency 4, sleep on 429. Broad, decomposed and control arms share one `ask` call where possible? **No** — one call per arm, because the control changes the state; keep the arms independent.
 - [ ] **Step 3: Cost and latency** totals printed at the end per arm, and written to `results/summary.json`.
 - [ ] **Step 4: Idempotent**: re-running with the same args skips rows already present in the run file, so a 429 storm can be resumed.
@@ -194,4 +195,4 @@
 
 ## Out of scope
 
-Calling Jev from any Lambda; fine-tuning (Jev has none); Cloudflare or Pydantic routes (direct API only, so the numbers describe one thing); any change to matcher thresholds or prompts as a result of this track — that is Track C's call after the findings are read.
+Calling Jev from any Lambda; fine-tuning (Jev has none); Cloudflare or Pydantic routes (one route per run, so the numbers describe one thing); any change to matcher thresholds or prompts as a result of this track — that is Track C's call after the findings are read.
