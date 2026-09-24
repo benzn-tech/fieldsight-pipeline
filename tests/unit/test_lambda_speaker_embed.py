@@ -161,6 +161,10 @@ def test_two_samples_of_one_person_are_one_candidate(stub_embedder, monkeypatch)
     v_ben, v_other = np.ones(192), np.concatenate([np.ones(96), -np.ones(96)])
     out = se.lambda_handler({"op": "match", "session": "s", "user_folder": "u",
                              "date": "2026-08-11",
+                             # Present because a company WITHOUT one is now capped at
+                             # `tentative` -- this test is about aggregation, not about
+                             # the missing-standard cap, so it supplies the standard.
+                             "company_floor": 0.5,
                              "profiles": [
                                  {"person_key": "ben", "display_name": "Ben",
                                   "status": "confirmed", "embedding": v_ben * 0.9},
