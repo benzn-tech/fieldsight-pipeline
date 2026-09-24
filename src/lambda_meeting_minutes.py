@@ -728,7 +728,12 @@ def generate_prose_document(title, subtitle, sections, actions):
         section_title = section.get("title") or ""
         if section_title.strip().lower() == "actions":
             has_actions_section = True
-        doc.add_heading(section_title, level=1)
+        # `level` defaults to 1, so every existing caller is unchanged; a
+        # section that came back nested asks for 2. Heading 2 is in python-docx's
+        # default template -- checked before the prompt was taught to ask for
+        # `####`, because asking for something the renderer flattens is how a
+        # wired control still produces nothing.
+        doc.add_heading(section_title, level=int(section.get("level") or 1))
         paragraphs = [p for p in (section.get("paragraphs") or []) if (p or "").strip()]
         i = 0
         while i < len(paragraphs):

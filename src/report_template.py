@@ -142,6 +142,47 @@ def _table_shape(section):
             % " | ".join(cols))
 
 
+MAX_SECTION_DEPTH = 1
+
+
+def _rendered_section(section, authored, depth):
+    """One section and, under it, the sections it contains.
+
+    CHILDREN USED TO BE DROPPED HERE, silently. The editor supports one level of
+    nesting, the api layer converts it recursively, the server stores it, and
+    this function iterated `template["sections"]` at the top level only -- so a
+    sub-section could be dragged into place, saved, reloaded and previewed, and
+    was simply absent from the report, with nothing said. The owner had one in
+    his own template within a day of the nesting shipping.
+
+    The heading goes one level deeper per level of nesting, which is only
+    useful because the document renderer was checked first: `Heading 2` exists
+    in python-docx's default template, and `_prose_sections` now carries the
+    depth through to it. Rendering `####` into a prompt whose document renderer
+    flattened every heading would have been the `kind: table` mistake again --
+    the model doing exactly as asked, and the output not showing it.
+    """
+    title, purpose = section["title"], section["purpose"]
+    if authored:
+        title, purpose = _fenceable(title), _fenceable(purpose)
+    hashes = "#" * (3 + min(depth, MAX_SECTION_DEPTH))
+    out = ["%s %s\n%s" % (hashes, title, purpose)]
+    if depth < MAX_SECTION_DEPTH:
+        for child in list(section.get("children") or []):
+            out.extend(_rendered_section(child, authored, depth + 1))
+    return out
+
+
+def _walk(sections):
+    """Every section and sub-section, flat -- for the rules that are about a
+    section whatever its depth."""
+    out = []
+    for s in sections or []:
+        out.append(s)
+        out.extend(_walk(s.get("children") or []))
+    return out
+
+
 def _shape_rules(sections):
     """How each section is to be SHAPED, in our words, outside the data region.
 
@@ -153,7 +194,7 @@ def _shape_rules(sections):
     field an effect is what takes that traffic back out of the free text.
     """
     out = []
-    for s in sections:
+    for s in _walk(sections):
         title = (s.get("title") or "").strip()
         shape = _section_shape(s)
         if shape:
@@ -207,10 +248,7 @@ def render_prompt(template, scope, action_items, transcript, source=SOURCE_BUILT
 
     rendered = []
     for s in all_sections:
-        title, purpose = s["title"], s["purpose"]
-        if authored:
-            title, purpose = _fenceable(title), _fenceable(purpose)
-        rendered.append("### %s\n%s" % (title, purpose))
+        rendered.extend(_rendered_section(s, authored, depth=0))
     sections = "\n\n".join(rendered)
     if authored:
         sections = "%s\n%s\n%s" % (FENCE_BEGIN, sections, FENCE_END)
@@ -346,6 +384,18 @@ def _section_error(section, where):
         if k not in SECTION_KINDS and k not in LEGACY_SECTION_KINDS:
             return "%s: kind must be one of %s" % (
                 where, ", ".join(sorted(SECTION_KINDS)))
+
+    children = section.get("children")
+    if children is not None:
+        if not isinstance(children, list):
+            return "%s: children must be a list" % where
+        for i, child in enumerate(children):
+            if isinstance(child, dict) and (child.get("children") or []):
+                return ("%s: a sub-section cannot have sub-sections of its own"
+                        % where)
+            err = _section_error(child, "%s, sub-section %d" % (where, i + 1))
+            if err:
+                return err
 
     cols = section.get("columns")
     if cols is not None:
