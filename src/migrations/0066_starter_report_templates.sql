@@ -58,31 +58,37 @@ ALTER TABLE report_templates ADD CONSTRAINT report_templates_report_type_check
   CHECK (report_type IN ('daily', 'weekly', 'monthly',
                          'session', 'day', 'custom', 'incident'));
 
-DO $$
+-- THE BODIES LIVE HERE AND NOWHERE ELSE.
+--
+-- Two callers need them: this migration, for the companies that already exist,
+-- and lambda_org_seed, for every company created from now on. A copy in Python
+-- beside a copy in SQL is two copies, and the one that gets edited is not
+-- reliably the one that runs. So the bodies live in a function, and both
+-- callers call the function.
+--
+-- Changing a starter later means a new migration that CREATE OR REPLACEs this.
+-- It does not reach back into templates already seeded, and that is correct:
+-- by then they are the company's, not ours -- they may have been edited, and a
+-- report that recorded (template, version) must keep naming a body that still
+-- exists exactly as it was.
+CREATE OR REPLACE FUNCTION seed_starter_report_templates(
+  p_company uuid,
+  p_author  uuid
+) RETURNS integer
+LANGUAGE plpgsql AS $fn$
 DECLARE
-  co       record;
-  author   uuid;
-  tpl_id   uuid;
   starter  record;
+  tpl_id   uuid;
+  n        integer := 0;
 BEGIN
-  FOR co IN SELECT id FROM companies LOOP
+  IF p_company IS NULL OR p_author IS NULL THEN
+    -- created_by is NOT NULL and references a real person. A company with
+    -- nobody in it has no one to name and no one to see a template.
+    RETURN 0;
+  END IF;
 
-    -- WHO IS RECORDED AS HAVING MADE THEM. created_by is NOT NULL and points
-    -- at a real person, so a seeded row has to name one. A company officer is
-    -- preferred over an arbitrary member: these are org templates, and org
-    -- templates are the officers' to manage. A company with no users at all is
-    -- skipped -- there is nobody to see a template there, and nobody to name.
-    SELECT u.id INTO author
-      FROM users u
-     WHERE u.company_id = co.id
-       AND u.archived_at IS NULL
-     ORDER BY (u.global_role IN ('gm', 'admin')) DESC, u.created_at ASC
-     LIMIT 1;
-
-    CONTINUE WHEN author IS NULL;
-
-    FOR starter IN
-      SELECT * FROM (VALUES
+  FOR starter IN
+    SELECT * FROM (VALUES
         ('daily-report-standard', 'Daily Report — Standard', 'daily',
          'The standard end-of-day record: what happened, who was on site, what was decided, what is still open, and the safety and quality picture.',
          $body$
@@ -179,30 +185,62 @@ BEGIN
            "style": []
          }
          $body$::jsonb)
-      ) AS t(slug, name, report_type, description, body)
-    LOOP
+    ) AS t(slug, name, report_type, description, body)
+  LOOP
+    -- Idempotent on the same key report_templates_slug_uq enforces. Re-running
+    -- adds nothing, and a company that archived a starter does not have it
+    -- reappear -- that was their decision about their own library.
+    CONTINUE WHEN EXISTS (
+      SELECT 1 FROM report_templates rt
+       WHERE rt.company_id = p_company
+         AND rt.scope = 'org'
+         AND rt.slug = starter.slug
+         AND rt.archived_at IS NULL
+    );
 
-      CONTINUE WHEN EXISTS (
-        SELECT 1 FROM report_templates rt
-         WHERE rt.company_id = co.id
-           AND rt.scope = 'org'
-           AND rt.slug = starter.slug
-           AND rt.archived_at IS NULL
-      );
+    INSERT INTO report_templates
+      (company_id, scope, owner_user_id, slug, name, description,
+       report_type, current_version, created_by)
+    VALUES
+      (p_company, 'org', NULL, starter.slug, starter.name, starter.description,
+       starter.report_type, 1, p_author)
+    RETURNING id INTO tpl_id;
 
-      INSERT INTO report_templates
-        (company_id, scope, owner_user_id, slug, name, description,
-         report_type, current_version, created_by)
-      VALUES
-        (co.id, 'org', NULL, starter.slug, starter.name, starter.description,
-         starter.report_type, 1, author)
-      RETURNING id INTO tpl_id;
+    INSERT INTO report_template_versions
+      (template_id, version, body, change_note, created_by)
+    VALUES
+      (tpl_id, 1, starter.body, 'Starter template', p_author);
 
-      INSERT INTO report_template_versions
-        (template_id, version, body, change_note, created_by)
-      VALUES
-        (tpl_id, 1, starter.body, 'Starter template', author);
+    n := n + 1;
+  END LOOP;
 
-    END LOOP;
+  RETURN n;
+END
+$fn$;
+
+COMMENT ON FUNCTION seed_starter_report_templates(uuid, uuid) IS
+  'Gives one company its own copies of the four starter templates. Per company, '
+  'never shared: each row carries that company_id, and editing one cannot touch '
+  'another company. Idempotent, and silent for a company that has them or has '
+  'archived them. Called here for the companies that existed when this ran, and '
+  'by lambda_org_seed for every company created after.';
+
+-- The companies that exist now.
+DO $$
+DECLARE
+  co     record;
+  author uuid;
+BEGIN
+  FOR co IN SELECT id FROM companies LOOP
+    -- A company officer is preferred over an arbitrary member: these are org
+    -- templates, and org templates are the officers' to manage.
+    SELECT u.id INTO author
+      FROM users u
+     WHERE u.company_id = co.id
+       AND u.archived_at IS NULL
+     ORDER BY (u.global_role IN ('gm', 'admin')) DESC, u.created_at ASC
+     LIMIT 1;
+
+    PERFORM seed_starter_report_templates(co.id, author);
   END LOOP;
 END $$;

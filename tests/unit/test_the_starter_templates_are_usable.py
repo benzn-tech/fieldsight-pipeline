@@ -174,7 +174,42 @@ def test_the_starters_are_org_scope_and_own_no_user():
     """report_templates_owner_matches_scope refuses an org row with an owner.
     The insert says NULL; this pins that it keeps saying NULL."""
     sql = io.open(MIGRATION, encoding="utf-8").read()
-    assert "(co.id, 'org', NULL, starter.slug" in sql
+    assert "(p_company, 'org', NULL, starter.slug" in sql
+
+
+def test_the_bodies_live_in_one_place_and_both_callers_call_it():
+    """Two callers need these: this migration, for the companies that already
+    exist, and lambda_org_seed, for every company made from now on.
+
+    A copy in Python beside a copy in SQL is two copies, and the one that gets
+    edited is not reliably the one that runs. So the bodies are in a function
+    and both callers call it -- which is also why this file can read them out
+    of the migration and know it is reading what ships."""
+    sql = io.open(MIGRATION, encoding="utf-8").read()
+    assert "CREATE OR REPLACE FUNCTION seed_starter_report_templates" in sql
+    assert "PERFORM seed_starter_report_templates(co.id, author)" in sql
+
+    seed = io.open(os.path.join(os.path.dirname(__file__), "..", "..", "src",
+                                "lambda_org_seed.py"), encoding="utf-8").read()
+    assert "seed_starter_report_templates" in seed or "seed_starters" in seed,         "a company created after this migration would get nothing"
+
+
+def test_each_company_gets_its_own_copies_not_a_shared_row():
+    """Per company, never shared. Every row carries its own company_id, so a
+    company editing a starter cannot touch another company's -- which is the
+    whole reason these are seeded per company rather than kept as one global
+    template everyone points at."""
+    sql = io.open(MIGRATION, encoding="utf-8").read()
+    assert "p_company, 'org', NULL" in sql
+    assert "rt.company_id = p_company" in sql, "and the idempotence check is per company too"
+
+
+def test_a_company_with_nobody_in_it_is_skipped_rather_than_failing():
+    """created_by is NOT NULL and references users(id). Seeding a company that
+    has no users yet would raise, and it would raise inside a deploy."""
+    sql = io.open(MIGRATION, encoding="utf-8").read()
+    assert "IF p_company IS NULL OR p_author IS NULL THEN" in sql
+    assert "RETURN 0;" in sql
 
 
 def test_nothing_is_bound_or_activated():
