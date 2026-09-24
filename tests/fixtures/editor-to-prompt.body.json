@@ -5,6 +5,7 @@
       "kind": "narrative",
       "fields": [],
       "always_present": false,
+      "columns": [],
       "key": "what-this-was",
       "purpose": "Whose meeting it was and what it covered."
     },
@@ -15,6 +16,7 @@
         "hazard"
       ],
       "always_present": false,
+      "columns": [],
       "key": "safety",
       "purpose": "Only hazards raised by name, and whether a control was agreed."
     },
@@ -26,6 +28,7 @@
         "owner"
       ],
       "always_present": false,
+      "columns": [],
       "key": "actions",
       "purpose": "One line per action."
     }
