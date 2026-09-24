@@ -14,7 +14,7 @@
 
 ## Global Constraints
 
-- **Read-only, everywhere.** `extraction_ab.py`'s two rules apply verbatim: import the real code paths (`lambda_programme_matcher.build_prompt`, `parse_verdict`, `thread_match.score_pairs`) rather than re-deriving them, and never publish to a real key.
+- **Read-only, everywhere.** `extraction_ab.py`'s two rules apply verbatim: import the real code paths (`lambda_programme_matcher.build_prompt`, `parse_verdict`, `thread_match.score_pair` / `find_candidates`) rather than re-deriving them, and never publish to a real key.
 - **Same config twice before reading any difference** (CLAUDE.md "Method rules that generalise"). `--runs 2` is the minimum; a single run measures sampling.
 - **A control arm is what turns "no effect" into a finding.** Every question set has a control where the thing being judged is removed from the state; Jev must move toward "no" or the set is unreachable, not decided.
 - **No transcript text in any state.** The state builder works from an allowlist of structured fields (Task 3). A test pins the allowlist.
