@@ -415,9 +415,24 @@ def test_the_embedder_puts_a_centroid_on_every_group_it_sends(monkeypatch):
     not**: the mean, the unit normalisation, the clustering and the row construction are
     the shipped ones. Stubbing those would prove the centroid's presence about a fake.
 
-    (The first version of this test stubbed only the read, passed locally against a stale
-    virtualenv that happened to have `onnxruntime`, and failed in CI with
-    `ModuleNotFoundError`. Local green says nothing about what CI imports.)
+    (The first version of this test stubbed only the read, passed locally on a machine that
+    happens to have `onnxruntime`, and failed in CI with `ModuleNotFoundError`. Local green
+    says nothing about what CI imports. The fix was verified by blocking `onnxruntime` at
+    the import hook and re-running -- not by running it again locally, which is the evidence
+    that had already failed.)
+
+    **WHAT THIS TEST DOES NOT COVER, and must not be read as covering.** By stubbing
+    `embed_audio` it never reaches this lambda's lazy `onnxruntime` import, so **it says
+    nothing about whether `lambda_speaker_embed` can be imported in production**. That is
+    not a small caveat here: `SpeakerEmbedFunction` once deployed with cfn-lint clean and
+    2637 tests passing while **every single invocation raised ModuleNotFoundError**,
+    precisely because every unit test monkeypatched the import away. The risk is not this
+    test -- it is nobody remembering afterwards that import health has no unit-test guard
+    at all.
+
+    What does guard it: `test_voiceprint_onnx_parity.py` (skipped in CI by design -- the
+    wheel is ~200MB and its exclusion is a decision, not an oversight) and calling the
+    deployed function for real after a deploy. Neither runs here.
     """
     import lambda_speaker_embed as se
 
