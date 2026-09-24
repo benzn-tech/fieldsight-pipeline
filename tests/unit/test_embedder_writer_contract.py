@@ -410,18 +410,29 @@ def test_the_embedder_puts_a_centroid_on_every_group_it_sends(monkeypatch):
     either: the shared fixture has one call, on which the re-bind correctly reports "nothing
     to group", and a test built on it would assert on an empty list forever.
 
-    Only the audio READ is stubbed. The windowing, the mean, the normalisation, the
-    clustering and the row construction are the shipped ones -- stubbing those would leave
-    the centroid's presence proven about a fake.
+    The audio read and the ONNX forward pass are stubbed -- the latter because CI has no
+    `onnxruntime` and the former because there is no S3. **The arithmetic under test is
+    not**: the mean, the unit normalisation, the clustering and the row construction are
+    the shipped ones. Stubbing those would prove the centroid's presence about a fake.
+
+    (The first version of this test stubbed only the read, passed locally against a stale
+    virtualenv that happened to have `onnxruntime`, and failed in CI with
+    `ModuleNotFoundError`. Local green says nothing about what CI imports.)
     """
     import lambda_speaker_embed as se
 
     def fake_window(folder, date, src, start, end):
-        # Two distinguishable voices, so clustering has something real to separate.
-        base = np.ones(16000) if src.startswith("a") else np.sin(np.arange(16000) / 5.0)
-        return "k", base.astype(np.float32), 16000
+        return "k", np.zeros(16000, dtype=np.float32), 16000
+
+    def fake_embed(audio, sr, _src=[None]):
+        # Two distinguishable voices, so the clustering has something real to separate and
+        # the normalisation has something other than a unit vector to normalise.
+        v = np.arange(192, dtype=np.float32) if _src[0] else np.ones(192, dtype=np.float32)
+        _src[0] = not _src[0]
+        return v
 
     monkeypatch.setattr(se, "_window_audio", fake_window)
+    monkeypatch.setattr(se, "embed_audio", fake_embed)
     rows = se._rebind({"user_folder": "u", "date": "2026-08-13", "turns": [
         {"source_filename": f"{c}.json", "speaker_label": f"spk_{i}",
          "start_sec": 0.0, "end_sec": 9.0}
