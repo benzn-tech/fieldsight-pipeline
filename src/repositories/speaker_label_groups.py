@@ -51,12 +51,29 @@ def replace_for_session(conn, company_id, session_base, rows) -> int:
         cur.execute(
             "INSERT INTO speaker_label_groups "
             "(company_id, session_base, source_filename, speaker_label, group_label, "
-            " spread, turns, seconds) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            " spread, turns, seconds, centroid) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (company_id, session_base, r["source_filename"], r["speaker_label"],
-             r["group_label"], r.get("spread"), r.get("turns"), r.get("seconds")))
+             r["group_label"], r.get("spread"), r.get("turns"), r.get("seconds"),
+             # Text, not a list: pgvector's input form, and the same spelling
+             # `speaker_voiceprint_samples` is written with. A Python list reaches the
+             # driver as an array and the insert fails at runtime, which a connection
+             # double cannot discover because it never types anything.
+             _vector_literal(r.get("centroid"))))
         written += 1
     return written
+
+
+def _vector_literal(values):
+    """pgvector's text input, or None.
+
+    None when there is no centroid, and None must stay distinguishable from a zero vector:
+    "this row predates the column" and "this voice summed to nothing" are different facts
+    and only one of them is a bug.
+    """
+    if values is None:
+        return None
+    return "[" + ",".join(repr(float(v)) for v in values) + "]"
 
 
 def for_session(conn, company_id, session_base) -> dict:
