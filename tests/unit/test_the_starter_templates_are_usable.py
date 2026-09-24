@@ -34,8 +34,14 @@ import pytest
 
 rt = pytest.importorskip("report_template")
 
+# 0067, not 0066: `0066_speaker_name_proposals.sql` shipped from the voiceprint
+# line while this was in review and is already applied on prod. The runner
+# handles a duplicate number correctly -- schema_migrations is keyed on the full
+# filename and pending_versions tie-breaks on it, so both apply in a defined
+# order -- and two such collisions have shipped before. Renumbering costs
+# nothing and does not add a third to a ledger that already carries two.
 MIGRATION = os.path.join(os.path.dirname(__file__), "..", "..", "src",
-                         "migrations", "0066_starter_report_templates.sql")
+                         "migrations", "0067_starter_report_templates.sql")
 
 SCOPE = {"folder": "Ben_UCPK2", "date": "2026-09-24", "from": "00:00", "to": "23:59",
          "recordings": 3}
