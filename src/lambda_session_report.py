@@ -343,6 +343,16 @@ def _generate_document(artifact, context=None):
     template = gen.get("templateBody")
     if not template:
         template = report_template.load_template(gen["templateId"], int(gen["templateVersion"]))
+    # An artifact enqueued before org-api started saying this carries an inlined
+    # body and no source. It is treated as customer-written, because the two
+    # mistakes are not symmetrical: calling a reviewed template customer-written
+    # costs a fence around text that did not need one, and calling a customer
+    # template reviewed hands unreviewed text the instruction layer. Loaded from
+    # disk just above, it is ours by construction.
+    source = gen.get("templateSource")
+    if not source:
+        source = (report_template.SOURCE_LIBRARY if gen.get("templateBody")
+                  else report_template.SOURCE_BUILTIN)
     content = artifact.get("content") or {}
     date = artifact.get("date") or content.get("date")
     window = artifact.get("window") or {}
@@ -378,7 +388,8 @@ def _generate_document(artifact, context=None):
          "from": window.get("from") or "00:00", "to": window.get("to") or "23:59",
          "recordings": len(picked)},
         _action_items_for_prompt(content),
-        "\n".join(t["line"] for t in turns))
+        "\n".join(t["line"] for t in turns),
+        source=source)
 
     # Recomputed from `context` (not reused from `read_budget`) because this is the
     # actual authority on what is left after the read phase ran, not an estimate
