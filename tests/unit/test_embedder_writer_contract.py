@@ -368,3 +368,34 @@ def test_no_field_crosses_this_seam_unread_in_either_direction():
             read = re.search(r'\.get\("%s"|\["%s"\]' % (key, key), callers) is not None
             assert read, (
                 f"the writer's {fname} returns {key!r} and no caller reads it")
+
+
+def test_a_matched_turn_carries_its_score_across_the_seam(captured, writer_db, monkeypatch):
+    """The writer has always asked for `score`; for 604 rows nothing sent one.
+
+    This is the seam's own failure shape, and it stayed invisible for the usual reason: the
+    writer's half was correct (`score=r.get("score")` has been there all along) and the
+    embedder's half was correct about everything it did send. Nobody asked whether the key
+    existed in between, so `speaker_turn_names.score` was NULL on every row ever written,
+    `recompute_company_floor` never reached its minimum sample count, and no company ever
+    calibrated a floor -- which is the whole reason a confident name cannot currently be
+    justified.
+
+    `match_names` is the op that carries it, so this asserts on the op rather than on a
+    database the double does not really have.
+    """
+    writer_db["floor_by_company"][CO] = 0.1
+    _run_embedder(monkeypatch, _artifact(op="match", mode="on", site_id="st-1"))
+    # `person_key`, not `name`: the writer payload is a REBUILT row, not `_match`'s own
+    # dict, and that rebuild is exactly where the score was being dropped.
+    named = [r for p in captured if p.get("op") == "match_names"
+             for r in (p.get("results") or []) if r.get("person_key")]
+    assert named, "the match run named nothing, so this proves nothing about the score"
+    for r in named:
+        assert r.get("score") is not None, (
+            "a named turn crossed the seam without the score it was named on; the writer "
+            "will store NULL and the company's floor can never be computed from it")
+        # Cosine's range, with float slop -- an identical pair came back as
+        # 1.0000000000000002. The bound is here to catch a wrong FIELD (a margin, an index,
+        # a duration) landing in this slot, not to police the arithmetic.
+        assert -1.001 <= float(r["score"]) <= 1.001, r["score"]

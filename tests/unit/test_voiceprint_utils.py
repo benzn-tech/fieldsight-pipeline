@@ -55,14 +55,14 @@ def test_a_turn_below_the_floor_gets_no_name_however_good_the_scores():
 
 
 def test_a_turn_at_the_floor_is_allowed():
-    d = vp.decide_name({"Ben": 0.90, "Zoe": 0.10}, duration_s=3.0)
+    d = vp.decide_name({"Ben": 0.90, "Zoe": 0.10}, duration_s=3.0, floor=0.5)
     assert d.status == "confirmed" and d.name == "Ben"
 
 
 # ---- nearest profile plus a margin, never an absolute cut ----
 
 def test_a_clear_winner_is_confirmed():
-    d = vp.decide_name({"Ben": 0.48, "Zoe": 0.08, "Mike": 0.07}, duration_s=6.0)
+    d = vp.decide_name({"Ben": 0.48, "Zoe": 0.08, "Mike": 0.07}, duration_s=6.0, floor=0.4)
     assert d.status == "confirmed" and d.name == "Ben"
     assert d.margin == pytest.approx(0.40)
 
@@ -129,11 +129,46 @@ def test_a_would_be_confirmation_above_the_floor_stays_confirmed():
     assert d.status == "confirmed" and d.name == "Ben"
 
 
-def test_no_floor_is_a_no_op_exactly_as_today():
-    """Every company runs margin-only until it calibrates one (S1.5). floor=None, the
-    default, must reproduce every pre-floor test in this file with no other change."""
+def test_a_company_without_a_calibrated_floor_never_gets_a_confirmation():
+    """This replaces `test_no_floor_is_a_no_op_exactly_as_today`, whose contract was that
+    floor=None reproduced margin-only behaviour. That contract is what confirmed an
+    unenrolled stranger at best=0.445 / margin=0.268 on 2026-09-10 -- the exact case the
+    floor was later added to catch. A company with no floor is not a company where the
+    plausibility check passes; it is one where the check has not run, and a confident name
+    on the strength of a check that did not run is the failure this system prices highest.
+
+    The name is still offered. `tentative` is the claim the evidence supports."""
     d = vp.decide_name({"Ben": 0.48, "Zoe": 0.08, "Mike": 0.07}, duration_s=6.0)
+    assert d.status == "tentative" and d.name == "Ben"
+    assert "no calibrated floor" in d.reason
+
+
+def test_the_same_scores_are_confirmed_once_the_company_has_a_floor():
+    """The cap is not a new refusal of these scores -- it is a refusal to judge them
+    without a standard. Same turn, same margin, floor present: confirmed."""
+    d = vp.decide_name({"Ben": 0.48, "Zoe": 0.08, "Mike": 0.07}, duration_s=6.0, floor=0.4)
     assert d.status == "confirmed" and d.name == "Ben"
+
+
+def test_the_2026_09_10_stranger_is_no_longer_confirmed():
+    """The measured case, with its measured numbers: a speaker who was not enrolled at all
+    still produces a winner -- the least-dissimilar profile present -- and a wide margin
+    over weak candidates confirmed it. Pinned here so the regression has a name."""
+    d = vp.decide_name({"nearest": 0.445, "next": 0.177}, duration_s=6.0)
+    assert d.margin == pytest.approx(0.268)
+    assert d.status == "tentative", (
+        "0.445 with a 0.268 margin is the exact shape that was confirmed on 2026-09-10; "
+        "margin alone cannot tell a plausible match from the least implausible stranger")
+
+
+def test_the_decision_carries_the_winners_score():
+    """`speaker_turn_names.score` was NULL on all 604 rows ever written because nothing
+    produced this value, so `recompute_company_floor` could never reach its minimum sample
+    count and no company ever got a floor -- which is why the cap above exists at all."""
+    assert vp.decide_name({"Ben": 0.48, "Zoe": 0.08}, duration_s=6.0).score == pytest.approx(0.48)
+    assert vp.decide_name({"Ben": 0.48}, duration_s=6.0).score == pytest.approx(0.48)
+    assert vp.decide_name({"Ben": 0.9}, duration_s=1.0).score is None, "nothing was scored"
+    assert vp.decide_name({}, duration_s=6.0).score is None, "nothing to score against"
 
 
 def test_the_floor_never_turns_a_tentative_result_into_a_confirmation():
@@ -195,7 +230,7 @@ def test_an_explicit_min_margin_override_is_never_replaced_by_the_scaled_value()
 def test_decide_name_still_defaults_correctly_at_small_pool_sizes():
     """Every pre-existing decide_name test above this block used 1-3 profiles and no
     min_margin override -- this pins that Task 3 did not move their outcomes."""
-    d = vp.decide_name({"Ben": 0.48, "Zoe": 0.08, "Mike": 0.07}, duration_s=6.0)
+    d = vp.decide_name({"Ben": 0.48, "Zoe": 0.08, "Mike": 0.07}, duration_s=6.0, floor=0.4)
     assert d.status == "confirmed" and d.name == "Ben"
 
 
@@ -216,12 +251,12 @@ def test_decide_name_uses_pool_size_for_its_default_margin():
     with nothing else about the scores changed -- the mechanism reaching decide_name, not
     just existing as a standalone function."""
     scores_small_pool = {"Ben": 0.40, "Zoe": 0.24}   # margin 0.16, clears 0.15
-    d_small = vp.decide_name(scores_small_pool, duration_s=6.0)
+    d_small = vp.decide_name(scores_small_pool, duration_s=6.0, floor=0.3)
     assert d_small.status == "confirmed"
 
     huge_pool = {"Ben": 0.40, "Zoe": 0.24}
     huge_pool.update({f"stranger_{i}": 0.10 for i in range(vp.DEFAULT_MARGIN_SCALE_THRESHOLD * 5)})
-    d_large = vp.decide_name(huge_pool, duration_s=6.0)
+    d_large = vp.decide_name(huge_pool, duration_s=6.0, floor=0.3)
     assert d_large.status == "tentative", (
         "the same 0.16 margin over the SAME runner-up must be judged against a wider "
         "effective margin once the pool is large, or pool size never actually mattered")
@@ -278,7 +313,7 @@ def test_a_person_with_two_profiles_no_longer_beats_himself():
         {"person_key": "ben", "score": 0.505},
         {"person_key": "zoe", "score": 0.078},
     ]
-    decision = vp.decide_name(vp.aggregate_scores(rows), duration_s=5.0)
+    decision = vp.decide_name(vp.aggregate_scores(rows), duration_s=5.0, floor=0.4)
     assert decision.status == "confirmed"
     assert decision.name == "ben"
 
@@ -328,7 +363,7 @@ def test_a_person_with_two_profiles_no_longer_beats_himself_under_mean():
         {"person_key": "ben", "score": 0.505},
         {"person_key": "zoe", "score": 0.078},
     ]
-    decision = vp.decide_name(vp.aggregate_scores(rows), duration_s=5.0)
+    decision = vp.decide_name(vp.aggregate_scores(rows), duration_s=5.0, floor=0.4)
     assert decision.status == "confirmed"
     assert decision.name == "ben"
     assert decision.margin == pytest.approx((0.425 + 0.505) / 2 - 0.078)
