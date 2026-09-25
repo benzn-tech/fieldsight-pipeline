@@ -24,8 +24,21 @@ class FakeCursor:
         self.conn = conn
         self._rows = []
 
+    #: The liveness check `add_sample` makes before anything else (the withdrawal-in-flight
+    #: guard). Answered here rather than queued, for two reasons: every test in this file
+    #: is about a LIVE profile, and this double serves results POSITIONALLY -- so a new
+    #: query at the front of the function would shift every queued result by one and break
+    #: nine tests that have nothing to do with withdrawal. Queue a `[{"status":
+    #: "withdrawn"}]` explicitly to exercise the refusal; `test_withdrawal_beats_an_
+    #: enrolment_in_flight.py` is where that is done.
+    _LIVENESS = "SELECT status FROM speaker_voiceprints"
+
     def execute(self, sql, params=None):
-        self.conn.calls.append({"sql": " ".join(sql.split()), "params": params})
+        flat = " ".join(sql.split())
+        self.conn.calls.append({"sql": flat, "params": params})
+        if flat.startswith(self._LIVENESS) and not self.conn.answer_liveness_from_queue:
+            self._rows = [{"status": "tentative"}]
+            return self
         self._rows = self.conn._pop_result()
         return self
 
@@ -37,6 +50,9 @@ class FakeCursor:
 
 
 class FakeConn:
+    #: Let a test take over the liveness answer when the withdrawal guard is the subject.
+    answer_liveness_from_queue = False
+
     def __init__(self, results=None):
         self.calls = []
         self._results = list(results or [])
