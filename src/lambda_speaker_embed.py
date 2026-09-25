@@ -992,6 +992,10 @@ def _rebind(req):
              # of the audio -- about 4s per cluster, growing with how busy the customer is.
              # `tolist()` because it crosses a JSON hop to the in-VPC writer.
              "centroid": centroids[i].tolist(),
+             # Where and when, kept for the same reason as the centroid (0068): the
+             # correction path addresses a session as (folder, date, session_base), and
+             # without these a cluster cannot be turned into a proposal anybody can answer.
+             "user_folder": folder, "session_date": date,
              "turns": evidence[i][0], "seconds": evidence[i][1]}
             for i in range(len(keys))]
     logger.info("rebind: %d (call,label) pairs -> %d groups at similarity %.2f",

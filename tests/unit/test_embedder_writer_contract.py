@@ -512,7 +512,14 @@ def test_the_rebind_centroid_survives_the_hop_and_reaches_the_insert(monkeypatch
     assert written == 2, "a row without a centroid must still be stored"
     assert len(captured_params) == 2
 
-    with_vec = captured_params[0][1][-1]
+    # By NAME-of-position, not `[-1]`: 0068 appended `user_folder` and `session_date`
+    # after the centroid, and an index counted from the end silently started asserting
+    # about a date. Found by this test going red on that change, which is the only reason
+    # it was not a wrong assertion that kept passing.
+    sql, params = captured_params[0]
+    cols = sql.split("(", 1)[1].split(")", 1)[0]
+    idx = [c.strip() for c in cols.split(",")].index("centroid")
+    with_vec = params[idx]
     assert with_vec is not None, (
         "the centroid did not reach the INSERT; the column will be NULL on every row and "
         "every candidate lookup will fall back to re-embedding the audio")
@@ -521,6 +528,6 @@ def test_the_rebind_centroid_survives_the_hop_and_reaches_the_insert(monkeypatch
         f"connection double cannot tell you so: {with_vec!r:.60}")
     assert len(with_vec.strip("[]").split(",")) == 192
 
-    assert captured_params[1][1][-1] is None, (
+    assert captured_params[1][1][idx] is None, (
         "a missing centroid must stay NULL -- a zero vector would read as a voice that "
         "matches nothing, which is a different and answerable claim")
