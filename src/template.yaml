@@ -1244,6 +1244,16 @@ Parameters:
       asserted_by naming who made the claim. It records a claim and does not verify one;
       the basis is stored on every row so a later decision can find exactly that population.
 
+  ProposalWindowHours:
+    Type: String
+    Default: '72'
+    Description: >-
+      How far back to look for other passages that sound like a newly enrolled person.
+      A parameter and not a constant because the value is expected to move: crew
+      composition follows a site over days, and nobody has measured the right span.
+      Only affects which candidates are OFFERED to a human -- it decides nothing about
+      whether a candidate is a match.
+
   MatchOnFinalize:
     Type: String
     Default: 'false'
@@ -3818,6 +3828,7 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          PROPOSAL_WINDOW_HOURS: !Ref ProposalWindowHours
           # Deploy-time credential injection — see MigrateFunction notes (BUG-36: in-VPC with
           # no NAT, so a Secrets Manager call at runtime black-holes with zero log output).
           PGHOST: !ImportValue
