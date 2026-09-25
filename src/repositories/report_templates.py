@@ -308,3 +308,23 @@ def bound_report_types(conn, template_id):
         (str(template_id),),
     ).fetchall()
     return [r[0] for r in rows]
+
+
+def seed_starters(conn, company_id, author_user_id):
+    """Give one company its own copies of the four starter templates.
+
+    The bodies are NOT here. They are in the function migration 0066 defines,
+    because two places need them -- that migration, for the companies that
+    already existed, and lambda_org_seed, for every company made after. A copy
+    in Python beside a copy in SQL is two copies, and the one that gets edited
+    is not reliably the one that runs.
+
+    PER COMPANY, NEVER SHARED: every row carries its own company_id, so a
+    company editing a starter cannot touch another company's. Returns how many
+    were inserted -- 0 for a company that already has them, has archived them,
+    or has nobody in it to name as their author.
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        row = cur.execute("SELECT seed_starter_report_templates(%s, %s) AS n",
+                          (company_id, author_user_id)).fetchone()
+    return (row or {}).get("n") or 0

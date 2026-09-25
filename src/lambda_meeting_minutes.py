@@ -658,6 +658,24 @@ def save_debug_record(bucket, target_date, meeting_title, prompt, raw_response,
 # Word Document Generation
 # ============================================================
 
+def _add_photo_strip(doc, streams):
+    """A row of pictures, or nothing. Never raises: the prose is the
+    deliverable and the pictures support it, so one unreadable file costs
+    itself and not the report."""
+    streams = [s for s in (streams or []) if s is not None]
+    if not streams:
+        return
+    strip = doc.add_paragraph()
+    for stream in streams:
+        try:
+            strip.add_run().add_picture(stream, width=Inches(2.4))
+        except Exception:
+            # exc_info, not a bare message (BUG-40): the first writing of this
+            # handler hid a corrupt fixture behind "could not place".
+            logger.warning("skipping a photo python-docx could not place",
+                           exc_info=True)
+
+
 _TABLE_RULE_RE = re.compile(r"^[\s|:-]+$")
 
 
@@ -728,7 +746,12 @@ def generate_prose_document(title, subtitle, sections, actions):
         section_title = section.get("title") or ""
         if section_title.strip().lower() == "actions":
             has_actions_section = True
-        doc.add_heading(section_title, level=1)
+        # `level` defaults to 1, so every existing caller is unchanged; a
+        # section that came back nested asks for 2. Heading 2 is in python-docx's
+        # default template -- checked before the prompt was taught to ask for
+        # `####`, because asking for something the renderer flattens is how a
+        # wired control still produces nothing.
+        doc.add_heading(section_title, level=int(section.get("level") or 1))
         paragraphs = [p for p in (section.get("paragraphs") or []) if (p or "").strip()]
         i = 0
         while i < len(paragraphs):
@@ -745,6 +768,13 @@ def generate_prose_document(title, subtitle, sections, actions):
             else:
                 doc.add_paragraph(text)
             i += 1
+
+        # THE PHOTOGRAPHS OF WHAT THIS SECTION IS ABOUT, under it rather than
+        # in a heap at the end. The strip is the same one the assembled report
+        # has always drawn per topic -- same width, same tolerance for a file
+        # python-docx cannot place -- because a reader should not be able to
+        # tell which path wrote the document.
+        _add_photo_strip(doc, section.get("photo_streams"))
 
     if actions:
         # A prose section titled "Actions" already wrote this heading above; the

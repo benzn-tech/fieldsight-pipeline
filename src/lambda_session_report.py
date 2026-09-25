@@ -15,6 +15,7 @@ import datetime
 import json
 import logging
 import os
+import re
 import time
 from io import BytesIO
 from urllib.parse import unquote_plus
@@ -123,6 +124,90 @@ def _fetch_photos(folder, date, filenames, budget):
         streams.append(BytesIO(body))
         budget[0] -= len(body)
     return streams
+
+
+def _photo_topics(artifact, budget):
+    """(offer, streams_by_ref) for the topics of this report that have photos.
+
+    `offer` is what the prompt shows the model: a stable ref, the time range and
+    the title. `streams_by_ref` is what the renderer places. Both are built here
+    from the same walk, so a ref the model is shown is a ref that has bytes
+    behind it -- an offer listing a topic whose photograph could not be read
+    would put an empty promise in front of the model.
+
+    THE ORDER IS THE TOPICS' OWN, and the shared byte budget is spent walking
+    it, so an early photo-heavy topic cannot silently starve a later one. That
+    property already existed in the assembled path; it is repeated here rather
+    than reached for, because the two paths do not share a caller.
+
+    A PHOTOGRAPH IS FETCHED ONCE even when two topics name it. Prod has
+    measured 13.7% of photographs bound to more than one topic -- the binding
+    unit is the session, not the day -- so without this a report would carry
+    the same picture twice and charge the budget twice for it.
+    """
+    seen = {}
+    offer, streams = [], {}
+    folder = artifact.get("folder")
+    content = artifact.get("content") or {}
+    date = artifact.get("date") or content.get("date")
+    for i, topic in enumerate(content.get("topics") or []):
+        names = [n for n in (topic.get("related_photos") or []) if n]
+        if not names:
+            continue
+        fresh = [n for n in names if n not in seen]
+        got = _fetch_photos(folder, date, fresh, budget) if fresh else []
+        for name, stream in zip(fresh, got):
+            seen[name] = stream
+        mine = [seen[n] for n in names if n in seen]
+        if not mine:
+            continue
+        ref = "t%d" % i
+        streams[ref] = mine
+        offer.append({"ref": ref,
+                      "title": topic.get("topic_title"),
+                      "time_range": topic.get("time_range"),
+                      "photos": len(mine)})
+    return offer, streams
+
+
+def _place_photos(sections, streams_by_ref):
+    """Put each topic's photographs under the section that said it covered it.
+
+    A photograph appears ONCE. Two sections naming the same topic is not an
+    error -- a day's work does not divide neatly into headings -- but printing
+    the picture twice would read as a mistake, so the first section to claim it
+    keeps it.
+
+    ANYTHING UNCLAIMED GOES UNDER THE LAST HEADING rather than being dropped.
+    That is the same floor the prompt already states for text nobody covered:
+    what the recording holds has to appear somewhere. A photograph that quietly
+    vanished because the model forgot a line would be indistinguishable from a
+    photograph that was never taken.
+    """
+    if not streams_by_ref or not sections:
+        return 0, 0
+    placed, taken = 0, set()
+    for section in sections:
+        mine = []
+        for ref in section.get("covers") or []:
+            if ref in taken:
+                continue
+            for stream in streams_by_ref.get(ref) or []:
+                mine.append(stream)
+            if ref in streams_by_ref:
+                taken.add(ref)
+        if mine:
+            section["photo_streams"] = mine
+            placed += len(mine)
+
+    leftover = []
+    for ref, streams in streams_by_ref.items():
+        if ref not in taken:
+            leftover.extend(streams)
+    if leftover:
+        last = sections[-1]
+        last["photo_streams"] = (last.get("photo_streams") or []) + leftover
+    return placed, len(leftover)
 
 
 def _content_to_minutes(artifact):
@@ -300,16 +385,57 @@ def _action_items_for_prompt(content):
     return out
 
 
+_COVERS_RE = re.compile(r"^\[covers:\s*([^\]]*)\]$", re.IGNORECASE)
+_REF_RE = re.compile(r"t\d+", re.IGNORECASE)
+
+
+def _covers_refs(line):
+    """The topic refs on a `[covers: ...]` line, lowercased, in order, unique.
+
+    Deliberately forgiving about what surrounds them and strict about their
+    shape: the model writes this line, and a model that writes `[covers: t1 and
+    t3]` or `[covers: T1,T3]` means the same thing. What it cannot do is invent
+    a topic -- every ref is checked against the ones actually offered before a
+    photograph moves anywhere.
+    """
+    m = _COVERS_RE.match(line)
+    if not m:
+        return []
+    body = m.group(1).strip()
+    if body.lower() == report_template.COVERS_NONE:
+        return []
+    out = []
+    for ref in _REF_RE.findall(body):
+        ref = ref.lower()
+        if ref not in out:
+            out.append(ref)
+    return out
+
+
 def _prose_sections(text):
     """Split the model's markdown back into {title, paragraphs}. Anything before the
     first heading is kept under an empty title rather than dropped."""
-    sections, current = [], {"title": "", "paragraphs": []}
+    sections, current = [], {"title": "", "paragraphs": [], "level": 1,
+                             "covers": []}
     for raw in (text or "").splitlines():
         line = raw.rstrip()
         if line.startswith("#"):
             if current["title"] or current["paragraphs"]:
                 sections.append(current)
-            current = {"title": line.lstrip("#").strip(), "paragraphs": []}
+            # THE DEPTH IS PART OF THE HEADING and used to be thrown away with
+            # the hashes. A sub-section asked for as `####` came back as `####`
+            # and was rendered at the same level as its parent, which reads as
+            # the nesting having been ignored -- the fault it was meant to fix,
+            # wearing a different face.
+            depth = len(line) - len(line.lstrip("#"))
+            current = {"title": line.lstrip("#").strip(), "paragraphs": [],
+                       "level": 2 if depth > 3 else 1, "covers": []}
+        elif _COVERS_RE.match(line.strip()):
+            # OUR OWN SCAFFOLDING, and it never reaches the page. The model is
+            # asked to end each section with it so the renderer knows which
+            # topics that section reported -- see report_template._covers_block
+            # for why the model is asked rather than the renderer guessing.
+            current["covers"] = _covers_refs(line.strip())
         elif line.strip():
             current["paragraphs"].append(line.strip())
     if current["title"] or current["paragraphs"]:
@@ -382,6 +508,13 @@ def _generate_document(artifact, context=None):
     if not turns:
         raise RuntimeError("no recorded speech in this window after exclusions")
 
+    # THE PHOTOGRAPHS ARE FETCHED BEFORE THE PROMPT IS BUILT, because the
+    # prompt has to offer the model exactly the topics that have bytes behind
+    # them. Offering one whose photograph could not be read would invite a
+    # reference to a picture that never arrives.
+    photo_budget = [MAX_PHOTO_BYTES_TOTAL]
+    photo_offer, photo_streams = _photo_topics(artifact, photo_budget)
+
     prompt = report_template.render_prompt(
         template,
         {"folder": artifact["folder"], "date": date,
@@ -389,7 +522,8 @@ def _generate_document(artifact, context=None):
          "recordings": len(picked)},
         _action_items_for_prompt(content),
         "\n".join(t["line"] for t in turns),
-        source=source)
+        source=source,
+        photo_topics=photo_offer)
 
     # Recomputed from `context` (not reused from `read_budget`) because this is the
     # actual authority on what is left after the read phase ran, not an estimate
@@ -405,10 +539,21 @@ def _generate_document(artifact, context=None):
     if err or not (text or "").strip():
         raise RuntimeError(err or "empty answer from model")
 
+    prose = _prose_sections(text)
+    placed, orphaned = _place_photos(prose, photo_streams)
+    if photo_streams:
+        # Counted, not assumed. "Did the model answer with the lines we asked
+        # for" is the one question this feature turns on, and the only way to
+        # know is from the output end -- a prompt that contains the request is
+        # not a model that obeyed it.
+        logger.info("photos: %d offered, %d placed under a section, %d fell to "
+                    "the last heading", sum(len(v) for v in photo_streams.values()),
+                    placed, orphaned)
+
     buf = lambda_meeting_minutes.generate_prose_document(
         artifact.get("title") or gen.get("templateName") or template.get("name") or "Report",
         "%s  %s - %s" % (date, window.get("from") or "00:00", window.get("to") or "23:59"),
-        _prose_sections(text),
+        prose,
         _action_items_for_prompt(content))
     # WHICH TEMPLATE THIS WAS comes from the REQUEST, not from the template's
     # own text. The files in report_templates/ carry `template_id` and
@@ -431,7 +576,12 @@ def _generate_document(artifact, context=None):
             # in-VPC and the name it wants is a fact about this generation.
             "templateName": gen.get("templateName") or template.get("name"),
             "model": llm_utils.active_model(),
-            "promptChars": len(prompt)}
+            "promptChars": len(prompt),
+            # Provenance for the one thing that cannot be read back off the
+            # document: a photograph under the last heading looks exactly like
+            # a photograph the model placed there on purpose.
+            "photosPlaced": placed,
+            "photosUnplaced": orphaned}
     return buf, meta
 
 

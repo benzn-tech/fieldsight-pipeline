@@ -314,3 +314,26 @@ def resolve_display_name(conn, company_id, name):
         return None, "ambiguous"
     return None, "not-in-directory"
 
+
+def first_officer_or_member(conn, company_id):
+    """The person to record as author for something the company owns, or None.
+
+    Anything written on a company's behalf still needs a real person on it:
+    report_templates.created_by is NOT NULL and references users(id). An
+    officer is preferred because the things seeded this way are org-scoped, and
+    org-scoped things are the officers' to manage -- but any live member is
+    better than failing, and a company with nobody in it returns None rather
+    than raising, because there is also nobody there to see the result.
+
+    ORDER BY on a boolean, not a role list in Python: the tie-break has to be
+    deterministic or re-running a seed names a different author each time, and
+    an author that moves is an audit trail that says nothing.
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        rows = cur.execute(
+            f"SELECT {_COLS} FROM users "
+            "WHERE company_id = %s AND archived_at IS NULL "
+            "ORDER BY (global_role IN ('gm', 'admin')) DESC, created_at ASC, id ASC "
+            "LIMIT 1",
+            (company_id,)).fetchall()
+    return rows[0] if rows else None
