@@ -506,6 +506,56 @@ def session_span(conn, company_id, user_folder, date, session_base):
     return row["lo"], row["hi"]
 
 
+def session_local_span(conn, company_id, user_folder, date, session_base):
+    """(start_minute, end_minute) of one session IN THE DEVICE'S LOCAL CLOCK,
+    or None when it cannot be known.
+
+    A SECOND SPAN FUNCTION, and the reason is the clock, not the query.
+    `session_span` above answers in `timestamptz`, which is right for the
+    deletion tombstone it feeds because that compares against other
+    timestamptz values. Photo binding does not: a photo's time comes from its
+    FILENAME (`..._2026-09-22_15-22-34.jpg`, parsed by transcript_utils), which
+    is the device's local wall clock with no zone on it. Comparing the two
+    would be the BUG-19/BUG-37 family -- the one this repo has produced every
+    time a UTC value met a local one -- and it would be SILENT: a span off by
+    twelve or thirteen hours does not raise, it simply stops covering anything,
+    and a rule that never fires looks exactly like a rule that is satisfied.
+
+    So the bounds are read from the same place the photo's is: the s3_key
+    filename for the start, plus `duration_s` (a scalar, and therefore
+    zone-free) for the end. A row whose filename carries no parseable time
+    contributes nothing; a row with a NULL duration contributes its start only,
+    mirroring session_span's COALESCE(ended_at, started_at).
+
+    None is a real answer -- see session_span. Callers must fail OPEN on it: a
+    session we cannot place must not stop competing for the day's photos.
+    """
+    from transcript_utils import extract_base_time_from_filename
+
+    sid = session_base[3:] if session_base.startswith("sid") else session_base
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT s3_key, duration_s FROM recordings "
+        "WHERE company_id = %s AND kind IN ('audio','video') "
+        "AND s3_key LIKE %s ESCAPE '\\' AND s3_key LIKE %s ESCAPE '\\'",
+        (company_id,
+         f"users/{_escape_like(user_folder)}/%/{date}/%",
+         f"%{_escape_like(sid)}%"),
+    ).fetchall()
+
+    lo = hi = None
+    for r in rows:
+        base = extract_base_time_from_filename(r["s3_key"].rsplit("/", 1)[-1])
+        if base is None:
+            continue
+        start = base.hour * 60 + base.minute
+        end = start + int((r["duration_s"] or 0) // 60)
+        lo = start if lo is None else min(lo, start)
+        hi = end if hi is None else max(hi, end)
+    if lo is None:
+        return None
+    return lo, hi
+
+
 def photo_keys_in_span(conn, company_id, user_folder, date, lo, hi) -> list:
     """Photo keys captured inside a session's span, for that folder and day.
 

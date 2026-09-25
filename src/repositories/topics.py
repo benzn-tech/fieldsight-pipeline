@@ -285,6 +285,94 @@ def delete_topics_for_source(conn, source_s3_key) -> int:
     return cur.rowcount
 
 
+def list_day_topics_for_binding(conn, user_folder, report_date) -> list[dict]:
+    """Every topic of one (folder, day) that a photo could belong to.
+
+    THE SCOPE IS FOLDER + DATE, matching the photo prefix exactly
+    (`users/{folder}/pictures/{date}/`). It is deliberately NOT (site_id,
+    user_id): both are resolved per extraction through the identity bridge and
+    both can come back None or differ between two sessions of one day, and a
+    rebind that saw a narrower set than the photo list would leave the topics
+    it could not see holding stale rows -- which is the defect it exists to
+    fix, one layer in.
+
+    Both source shapes a day can have are covered, and they must both be:
+
+      extractions/{folder}/{date}/{session}.json   (lambda_item_writer)
+      reports/{date}/{folder}/daily_report.json    (lambda_ingest)
+
+    A day under the authority flip has only the first; a zero-extraction
+    fallback day has only the second; a day mid-flip can briefly have both,
+    and on that day a photo must not be bound once by each.
+
+    Deleted topics are excluded, and with BOTH arms. The first draft carried
+    only `DELETED_TOPIC_PREDICATE` and tests/unit/test_deleted_read_paths.py
+    caught it: the source arm is the load-bearing one here, because a day whose
+    recording was deleted gets re-extracted and its topics come back with NEW
+    uuids that no topic-keyed tombstone names -- while still carrying the
+    tombstoned `source_s3_key`. Binding the day's photos onto those would put
+    a deleted recording's evidence back on screen.
+
+    Ordered by (time_range, id) so a rebind is deterministic: the matcher
+    breaks ties by index, and an unordered SELECT would make which topic wins
+    a tie depend on the physical row order.
+    """
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, time_range, source_s3_key FROM topics "
+        "WHERE (source_s3_key LIKE %s ESCAPE '\\' OR source_s3_key = %s) "
+        f"AND {visible_topics_predicate('topics')} "
+        "ORDER BY time_range NULLS LAST, id",
+        (f"extractions/{_escape_like(user_folder)}/{_escape_like(report_date)}/%",
+         f"reports/{report_date}/{user_folder}/daily_report.json"),
+    ).fetchall()
+
+
+def replace_day_photo_bindings(conn, user_folder, report_date, rows) -> int:
+    """Replace one (folder, day)'s MACHINE photo bindings with `rows`.
+
+    `rows` is [{topic_id, s3_key, caption_text}] -- the output of one day-wide
+    `photo_binding.photos_for_topics` pass, in which a photo appears at most
+    once by construction.
+
+    DELETE-THEN-INSERT over the whole day, not an upsert per row, because the
+    thing being repaired is a row that should no longer exist. An insert-only
+    writer is exactly what produced 22 multi-bound photos on prod: each session
+    added its own and nothing was ever responsible for removing another's.
+
+    `source='binding'` bounds the delete, and the bound is the point:
+
+      * 'keyframe' rows have no time window to be re-derived from -- the file
+        IS the evidence -- so sweeping them would delete the only record that
+        frame belongs to that topic;
+      * 'human' rows are somebody's decision. A machine that overwrites those
+        is worse than one that binds nothing.
+
+    Scoped through `topics` rather than by s3_key prefix: `topic_photos` has no
+    folder or date of its own, and matching on the key's text would also catch
+    a keyframe whose synthetic filename lives under the same prefix.
+
+    The inner SELECT DELIBERATELY DOES NOT exclude deleted topics, which is why
+    this function is in test_deleted_read_paths.EXEMPT. Filtering them would
+    leave a tombstoned topic holding its stale binding rows forever -- the
+    opposite of what the exclusion is for. Nothing here reads a topic's
+    content; the scope is a delete's reach.
+    """
+    deleted = conn.execute(
+        "DELETE FROM topic_photos WHERE source = 'binding' AND topic_id IN ("
+        "  SELECT id FROM topics WHERE source_s3_key LIKE %s ESCAPE '\\' "
+        "     OR source_s3_key = %s)",
+        (f"extractions/{_escape_like(user_folder)}/{_escape_like(report_date)}/%",
+         f"reports/{report_date}/{user_folder}/daily_report.json"),
+    ).rowcount
+    for r in rows:
+        conn.execute(
+            "INSERT INTO topic_photos (topic_id, s3_key, caption_text, source) "
+            "VALUES (%s,%s,%s,'binding')",
+            (r["topic_id"], r["s3_key"], r.get("caption_text")),
+        )
+    return deleted
+
+
 def delete_topics_for_source_prefix(conn, source_prefix) -> int:
     """Delete topics rows whose source_s3_key starts with source_prefix.
 

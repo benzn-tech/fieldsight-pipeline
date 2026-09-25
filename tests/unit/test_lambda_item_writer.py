@@ -887,13 +887,56 @@ def test_unparseable_time_range_gets_no_photos():
 # EXISTING topics.upsert_topic(photos=...) support (topics.py:38-42).
 # ---------------------------------------------------------------------------
 
-def test_item_writer_upserts_topic_photos(wired):
+def _day_rebind(wired, day_topics):
+    """Wire the day-wide photo rebind (fix/a-photo-belongs-to-the-day) and
+    return the list of binding rows it writes.
+
+    These three tests used to assert on `upsert_topic(photos=...)`. That writer
+    is gone: it inserted only its OWN extraction's binds while listing the
+    whole DAY's photos, so a second session of the same day added its own and
+    nothing ever removed either -- 22 multi-bound photos on prod. topic_photos
+    now has ONE writer, after the topic loop, over the whole day. The
+    assertions below are the same facts asked of that writer.
+    """
+    wired.setattr(iw.topics, "list_day_topics_for_binding",
+                  lambda conn, folder, date: day_topics)
+    wired.setattr(iw.recordings, "session_local_span", lambda *a, **k: None)
+    written = []
+    wired.setattr(iw.topics, "replace_day_photo_bindings",
+                  lambda conn, folder, date, rows: written.extend(rows))
+    return written
+
+
+_ONE_TOPIC_DAY = [{"id": "topic-uuid-0", "time_range": "10:00 – 10:05",
+                   "source_s3_key": EXTRACTION_KEY}]
+
+
+def test_item_writer_binds_the_days_photos(wired):
     pictures_prefix = "users/Jarley_Trainor/pictures/2026-07-06/"
     photo_key = pictures_prefix + "Benl1_2026-07-06_10-02-00.jpg"
     wired.setattr(iw, "_s3_client", FakeS3({
         EXTRACTION_KEY: json.dumps(make_extraction()),
         photo_key: b"",
     }))
+    written = _day_rebind(wired, _ONE_TOPIC_DAY)
+
+    result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert result == {"skipped": False, "topics": 1}
+    # make_extraction()'s one topic has time_range "10:00 – 10:05";
+    # the photo's filename encodes 10:02, inside that window.
+    assert written == [{"topic_id": "topic-uuid-0", "s3_key": photo_key,
+                        "caption_text": None}]
+
+
+def test_upsert_topic_is_no_longer_a_photo_writer(wired):
+    """Pinned separately, because the old kwarg going unread would look
+    identical to it going unpassed -- and would leave two writers racing."""
+    photo_key = "users/Jarley_Trainor/pictures/2026-07-06/Benl1_2026-07-06_10-02-00.jpg"
+    wired.setattr(iw, "_s3_client", FakeS3({
+        EXTRACTION_KEY: json.dumps(make_extraction()), photo_key: b"",
+    }))
+    _day_rebind(wired, _ONE_TOPIC_DAY)
     captured = []
     wired.setattr(
         iw.topics, "upsert_topic",
@@ -901,13 +944,10 @@ def test_item_writer_upserts_topic_photos(wired):
             captured.append(kw) or {"id": "topic-uuid-0"},
     )
 
-    result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
 
-    assert result == {"skipped": False, "topics": 1}
     assert len(captured) == 1
-    # make_extraction()'s one topic has time_range "10:00 – 10:05";
-    # the photo's filename encodes 10:02, inside that window.
-    assert captured[0]["photos"] == [{"s3_key": photo_key, "caption_text": None}]
+    assert "photos" not in captured[0], captured[0].get("photos")
 
 
 def test_item_writer_captions_kf_files_on_rebind(wired):
@@ -922,35 +962,32 @@ def test_item_writer_captions_kf_files_on_rebind(wired):
         EXTRACTION_KEY: json.dumps(make_extraction()),   # one topic, 10:00 – 10:05
         kf_key: b"", normal_key: b"",
     }))
-    captured = []
-    wired.setattr(
-        iw.topics, "upsert_topic",
-        lambda conn, site_id, report_date, title, **kw:
-            captured.append(kw) or {"id": "topic-uuid-0"},
-    )
+    written = _day_rebind(wired, _ONE_TOPIC_DAY)
 
     iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
 
-    assert len(captured) == 1
-    photos = {p["s3_key"]: p["caption_text"] for p in captured[0]["photos"]}
+    photos = {r["s3_key"]: r["caption_text"] for r in written}
     assert photos == {kf_key: "Auto keyframe", normal_key: None}
 
 
 def test_missing_pictures_prefix_is_noop(wired):
     # wired's default FakeS3 only has EXTRACTION_KEY -- the pictures prefix
     # listing returns zero Contents (empty prefix -> no-op, not a crash).
-    captured = []
-    wired.setattr(
-        iw.topics, "upsert_topic",
-        lambda conn, site_id, report_date, title, **kw:
-            captured.append(kw) or {"id": "topic-uuid-0"},
-    )
+    #
+    # The rebind still RUNS with zero photos, and that is the point: it is what
+    # clears a day whose photos were all deleted. "Wrote no rows" and "never
+    # ran" must not be the same outcome.
+    ran = []
+    wired.setattr(iw.topics, "list_day_topics_for_binding",
+                  lambda conn, folder, date: _ONE_TOPIC_DAY)
+    wired.setattr(iw.recordings, "session_local_span", lambda *a, **k: None)
+    wired.setattr(iw.topics, "replace_day_photo_bindings",
+                  lambda conn, folder, date, rows: ran.append(list(rows)))
 
     result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
 
     assert result == {"skipped": False, "topics": 1}
-    assert len(captured) == 1
-    assert captured[0]["photos"] == []
+    assert ran == [[]], "the rebind must run and write nothing, not be skipped"
 
 
 # ---------------------------------------------------------------------------
