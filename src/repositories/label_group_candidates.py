@@ -86,26 +86,20 @@ def candidates_for_person(conn, company_id, voiceprint_id, since_hours=72,
     proposed again" -- so a `NOT EXISTS` against that table with no `state` filter is the
     correct exclusion, not a bug that happens to look like one.
 
-    **`site_id` is accepted but NOT applied**, and that is a documented gap rather than an
-    invented join. `recordings.site_for_media` / `site_for_day` are how this codebase
-    resolves a site for a piece of media, but both key on `user_folder` and `date` derived
-    from an S3 path (`users/{folder}/.../{date}/{session_base}.ext`) -- fields
-    `speaker_label_groups` does not carry (it has only `company_id, session_base,
-    source_filename, speaker_label, ...`; see 0059/0065). Reusing either function here would
-    mean fabricating a join this table's schema does not support, which is exactly the
-    "inventing a wrong join" this function was told not to do. Until `speaker_label_groups`
-    gains a site-bearing column (or a real link to `recordings`), `site_id` is honoured only
-    as "accepted for forward compatibility" and every candidate in the window is returned
-    regardless of site. `site_id=None` therefore behaves identically to any other value
-    today -- narrowing to nothing is never acceptable, so the safe default was to apply no
-    narrowing at all rather than guess a join and risk narrowing to nothing by accident.
+    **`site_id` is accepted and still NOT applied, but the reason has changed and shrunk.**
+    0068 gave this table `user_folder` and `session_date`, which is exactly what
+    `recordings.site_for_day` keys on -- so the join the earlier version of this docstring
+    called impossible is now possible. It is deliberately not made here, because
+    `site_for_day` answers "which site did this FOLDER work at on this DATE", one lookup per
+    (folder, date) pair, and doing that inside this query means either a correlated subquery
+    per candidate row or a second round trip. At the measured volume -- 0 to 19 clusters in
+    a 72 hour window, worst case ~54 -- neither is worth building before anyone has asked
+    the question with a site in hand.
 
-    Ordering watches for the NULL-sorts-first-under-DESC trap
-    (`voiceprints.py`/`speaker_name_proposals.py` both call this out): `ORDER BY score DESC
-    NULLS LAST` even though `score` cannot be NULL here (every row scored survived a
-    non-empty CROSS JOIN), kept for the same reason `pending_for_person` keeps it on a
-    nullable column -- a future caller reusing this pattern with a nullable score should not
-    have to rediscover the trap.
+    So this is now a deferred join rather than a missing column, and the next person has
+    everything they need. `site_id=None` and any other value still behave identically.
+    Narrowing to nothing is never acceptable; returning the whole window is the safe side.
+
     """
     _require_company(company_id)
     if not voiceprint_id:
@@ -141,6 +135,7 @@ def candidates_for_person(conn, company_id, voiceprint_id, since_hours=72,
         "    AND p.consent_at IS NOT NULL "
         ") "
         "SELECT g.session_base, g.source_filename, g.speaker_label, "
+        "       g.user_folder, g.session_date, "
         # 1 - distance, NOT the raw `<=>` operator -- pgvector's `<=>` is cosine distance,
         # and presenting it unconverted would rank correctly (ORDER BY still needs the
         # transform to point the right way) but read backwards to every caller downstream.
@@ -160,7 +155,12 @@ def candidates_for_person(conn, company_id, voiceprint_id, since_hours=72,
         # "already asked" (0066's own header). A rejected candidate must not resurface --
         # that is a human's "not this person", not an open question.
         "      ) "
-        "GROUP BY g.session_base, g.source_filename, g.speaker_label "
+        # Every non-aggregated column in the SELECT must appear here or Postgres rejects
+        # the statement -- and a connection double never parses SQL, so this is
+        # invisible to the unit suite and shows up as a 500 in production. That has
+        # happened here twice.
+        "GROUP BY g.session_base, g.source_filename, g.speaker_label, "
+        "         g.user_folder, g.session_date "
         "ORDER BY score DESC NULLS LAST "
         "LIMIT %s",
         (company_id, str(voiceprint_id), company_id,
@@ -170,7 +170,12 @@ def candidates_for_person(conn, company_id, voiceprint_id, since_hours=72,
 
     candidates = [
         {"session_base": r["session_base"], "source_filename": r["source_filename"],
-         "speaker_label": r["speaker_label"], "score": float(r["score"])}
+         "speaker_label": r["speaker_label"], "score": float(r["score"]),
+         # Required NOT NULL by `speaker_name_proposals`, because answering a proposal goes
+         # through the correction path and that addresses a session as (folder, date,
+         # session_base). Before 0068 this table did not carry them and a candidate could
+         # not be turned into a proposal at all.
+         "user_folder": r["user_folder"], "session_date": r["session_date"]}
         for r in rows
     ]
     return {"candidates": candidates, "uncached": uncached}
