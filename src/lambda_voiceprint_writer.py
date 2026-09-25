@@ -43,9 +43,11 @@ Spec: docs/superpowers/specs/2026-08-13-speaker-correction-propagation.md
 Plan: docs/superpowers/plans/2026-08-13-correction-propagation-implementation.md (P4)
 """
 import logging
+import os
 
 from db.connection import get_connection
-from repositories import speaker_label_groups
+from repositories import (label_group_candidates, speaker_label_groups,
+                          speaker_name_proposals)
 from repositories.companies import list_companies
 from repositories.voiceprints import (EnrolmentAfterWithdrawal,
                                       EnrolmentBelongsToSomebodyElse, add_sample,
@@ -57,6 +59,19 @@ from turn_name_overlay import _SOURCE_RANK
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+# How far back to look for other passages that sound like a newly enrolled person.
+#
+# A knob, not a constant, because the owner said the value will move -- and a switch that
+# only exists in code is one nobody can turn. All three segments (repo variable, workflow
+# override, template Parameter) or it silently serves this default forever.
+PROPOSAL_WINDOW_HOURS = int(os.environ.get("PROPOSAL_WINDOW_HOURS", "72"))
+
+# How many questions to ask at once. A SCREEN-SIZE choice and explicitly not a threshold:
+# nothing here decides whether a candidate IS a match, only how many of the best-ranked
+# ones a person is shown. An admission cut arriving as a "limit" would be the absolute
+# threshold this system has refused to invent, wearing a different name.
+PROPOSAL_LIMIT = int(os.environ.get("PROPOSAL_LIMIT", "5"))
 
 
 def _require(event, key):
@@ -245,6 +260,13 @@ def _propagation(event):
                 logger.warning("harvest sample refused: %s", exc)
                 harvest_refused += 1
 
+        # After the harvest, not after the anchor: a candidate's score is the MEAN over this
+        # person's samples, so running it between the two would score every cluster against
+        # a one-sample profile and then never revisit it.
+        if enrol and not enrol_refusal:
+            _propose_where_else_this_voice_was_heard(
+                conn, company_id, enrol["voiceprint_id"])
+
         inherited = _inherit_labels(conn, company_id, session_base,
                                     event.get("label_map"))
     # `enrol` is cleared when the embedder refused, so this asks whether anything was
@@ -298,6 +320,54 @@ def _enrol(event):
                     "own": exc.own, "bestOther": exc.best_other,
                     "nearestOtherId": str(exc.nearest_other_id)}
     return {"stored": 1}
+
+
+def _propose_where_else_this_voice_was_heard(conn, company_id, voiceprint_id) -> int:
+    """This person now has a vector. Ask where else that voice appears. Never raises.
+
+    CALLED FROM `_propagation`, NOT from `_enrol`. That is not a style choice: **nothing in
+    this repository sends `op="enrol"`.** Its only mentions are two doc comments, and the
+    real enrolment happens inside the propagation payload's `enrol` sub-object. Wiring this
+    into `_enrol` -- the obvious place, and where it was written first -- puts it in a
+    function production never calls, so it would have shipped completely inert with every
+    test green. The seam census caught it by refusing a new unread return key.
+
+    And not at the moment of the rename either, because at that moment there is nothing to
+    compare with: `speaker_corrections` creates the profile and queues the audio, and the
+    vector does not exist until this function's caller has just stored it. A candidate
+    search run any earlier scores against an empty sample set and finds nothing, which is
+    indistinguishable from "this voice appears nowhere else".
+
+    WHY IT MATTERS MORE THAN IT LOOKS. A company cannot get a calibrated rejection floor --
+    and therefore cannot get a confirmed name out of the matcher at all -- until twenty
+    rows of `source='correction'` exist, and one rename produces exactly one. Everything it
+    propagates to is `correction_propagation`, which the calibration excludes. So the only
+    way a company reaches twenty in less than months is by being ASKED, five at a time.
+    This function is where the asking starts.
+
+    **It swallows everything.** The enrolment is the act the user performed and it has
+    already succeeded by the time we get here; a failure to think of follow-up questions
+    must not be reported as a failure to store their voice. The log line is the record.
+    """
+    try:
+        found = label_group_candidates.candidates_for_person(
+            conn, company_id, voiceprint_id,
+            since_hours=PROPOSAL_WINDOW_HOURS, limit=PROPOSAL_LIMIT)
+        rows = found.get("candidates") or []
+        n = speaker_name_proposals.propose(conn, company_id, voiceprint_id, rows)
+        # Three numbers, because they answer three different questions and collapsing them
+        # hides the one that matters. `uncached` is how many clusters in the window could
+        # not be scored at all for want of a stored centroid -- rows written before 0065.
+        # Without it, "this voice appears nowhere else" and "most of the window has never
+        # been summarised" read identically, and only the second is somebody's to fix.
+        logger.info("proposals for %s: %d candidate(s) -> %d new question(s), "
+                    "%d cluster(s) in the window had no centroid to score",
+                    voiceprint_id, len(rows), n, found.get("uncached", 0))
+        return n
+    except Exception:
+        logger.exception("proposals for %s could not be built; the enrolment itself stands",
+                         voiceprint_id)
+        return 0
 
 
 def _profiles(event):
