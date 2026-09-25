@@ -52,6 +52,17 @@ def test_handler_seeds_company_users_sites_memberships(monkeypatch):
     monkeypatch.setattr(seed.companies, "get_company_by_name", lambda c, n: None)
     monkeypatch.setattr(seed.companies, "create_company",
                         lambda c, n: {"id": uuid.UUID("dc2eafa9-1260-4bd9-8d65-862f47dacb3c"), "name": n})
+
+    # THE STARTER TEMPLATES, stubbed at the same layer as every other
+    # repository call here. They are part of what this lambda does now: a
+    # company created without them is a company whose Library is empty, which
+    # is the state the owner hit on prod ("I log in and see no templates").
+    calls["seed_starters"] = []
+    monkeypatch.setattr(seed.users, "first_officer_or_member",
+                        lambda c, cid: {"id": "user-officer"})
+    monkeypatch.setattr(seed.report_templates, "seed_starters",
+                        lambda c, cid, author: (calls["seed_starters"].append((cid, author))
+                                                or 4))
     monkeypatch.setattr(seed.sites, "get_company_site_by_name", lambda c, cid, n: None)
     monkeypatch.setattr(seed.sites, "create_site",
                         lambda c, cid, name, **kw: (calls["sites"].append(name)
@@ -168,6 +179,17 @@ def _install_fake_repo(monkeypatch, mapping, cognito_users):
         site["slug"] = slug
         return site
 
+
+    # THE STARTER TEMPLATES, stubbed at the same layer as every other
+    # repository call here. They are part of what this lambda does now: a
+    # company created without them is a company whose Library is empty, which
+    # is the state the owner hit on prod ("I log in and see no templates").
+    calls["seed_starters"] = []
+    monkeypatch.setattr(seed.users, "first_officer_or_member",
+                        lambda c, cid: {"id": "user-officer"})
+    monkeypatch.setattr(seed.report_templates, "seed_starters",
+                        lambda c, cid, author: (calls["seed_starters"].append((cid, author))
+                                                or 4))
     monkeypatch.setattr(seed.sites, "get_company_site_by_name", fake_get_site_by_name)
     monkeypatch.setattr(seed.sites, "create_site", fake_create_site)
     monkeypatch.setattr(seed.sites, "set_slug", fake_set_slug)
@@ -331,3 +353,36 @@ def test_empty_cognito_name_skips_set_folder_name(monkeypatch):
 
     assert calls["set_folder_name"] == []
     assert out["login_folder_set"] == 0
+
+
+# ---- the starter templates --------------------------------------------------
+
+def test_a_company_gets_its_own_starter_templates(monkeypatch):
+    """The gap this closed: the migration seeds the companies that existed when
+    it ran, and a company created afterwards would have had an empty Library
+    forever. That state is not hypothetical -- it is what prod looked like the
+    first time somebody logged in and looked for a template."""
+    calls, _ = _install_fake_repo(monkeypatch, MAPPING, COGNITO_USERS)
+    out = seed.lambda_handler({}, None)
+    assert calls["seed_starters"], "a new company must get the four starters"
+    assert out["starter_templates"] == 4
+
+
+def test_the_author_is_a_real_person_and_the_company_is_its_own(monkeypatch):
+    """created_by is NOT NULL and references users(id); and the templates are
+    per company, never shared, so the company id has to be the one just made."""
+    calls, _ = _install_fake_repo(monkeypatch, MAPPING, COGNITO_USERS)
+    seed.lambda_handler({}, None)
+    company_id, author = calls["seed_starters"][0]
+    assert company_id == "company-1"
+    assert author == "user-officer"
+
+
+def test_a_company_with_nobody_in_it_seeds_nothing_rather_than_raising(monkeypatch):
+    """A company has no users at the instant it is created, and created_by
+    cannot be NULL. Seeding anyway would raise inside a deploy."""
+    calls, _ = _install_fake_repo(monkeypatch, MAPPING, COGNITO_USERS)
+    monkeypatch.setattr(seed.users, "first_officer_or_member", lambda c, cid: None)
+    out = seed.lambda_handler({}, None)
+    assert calls["seed_starters"] == []
+    assert out["starter_templates"] == 0
