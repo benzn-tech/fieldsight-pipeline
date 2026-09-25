@@ -6,7 +6,7 @@
 
 **Architecture:** Stop physically deleting a source key's topics on re-extraction. Mark them `superseded_at` (the `speaker_turn_names` supersede-then-insert precedent, migration 0040) and insert the new pass beside them. Children carry a `stable_id` that is **carried forward** from the superseded pass when the text matches (exact `content_hash`, else a high fuzzy floor), and a human's edits ride with it. An old row a human touched that finds no successor is **kept and surfaced**, never silently lost — which is what `_warn_if_discarding_checkoffs` said the only safe rule was. Every gated AI verdict — accepted *and* rejected — is written to one `decision_records` table, and the confirm/reject endpoints stamp the human outcome onto the same row.
 
-**Tech Stack:** Postgres (Aurora), psycopg3, Python 3.11 Lambda, SAM. Migration numbering continues from `0064_quarantine_incoherent_samples.sql` (0063 is unused; there are two 0041s and two 0044s, so take the next free number at merge time).
+**Tech Stack:** Postgres (Aurora), psycopg3, Python 3.11 Lambda, SAM. Migration numbering: `develop` is at `0067` as of 2026-09-25 (0063 is unused; there are two 0041s and two 0044s). Take the next free number at merge time and expect to renumber once.
 
 **Spec:** `docs/superpowers/specs/2026-09-24-event-graph-and-jev-assessment.md` §2.1, §2.2, §6.
 
