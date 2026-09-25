@@ -20,6 +20,19 @@ VP = "22222222-2222-2222-2222-222222222222"
 
 
 class FakeCursor:
+    """⚠️ RESULTS ARE SERVED POSITIONALLY, in the order a test queued them.
+
+    So **adding any query near the front of a function under test shifts every queued
+    result after it**, and the tests that break are the ones with nothing to do with your
+    change. That has happened once: the withdrawal-in-flight guard put a liveness check at
+    the top of `add_sample` and nine unrelated tests went red, all raising the guard's own
+    exception -- which reads as "this guard refuses everything" when what it refuses is a
+    profile this double never said existed.
+
+    Nine tests failing at once with one exception is a symptom of the DOUBLE, not of the
+    code. Check here before changing the thing under test to suit it.
+    """
+
     def __init__(self, conn):
         self.conn = conn
         self._rows = []
