@@ -228,6 +228,8 @@ Track C  边、claim_type、生命周期、Procore（B 之后）
 
 Track A 与 B 互不依赖；A 的结论决定 C 里"决策引擎"那格是 Jev 主导还是 LLM 主导 + Jev 门控。
 
+**2026-09-25 补充：Track L（按位置分组的报告）**。owner 提出"Level 1 / Room 101 的 topic 和照片在报告里捆在一起"。照片→topic 的时间绑定和 org-api 的 `photo_groups`（按口述位置分组照片）已经存在，缺的是位置文本归一、topic 的位置归属、以及两个报告渲染器里的 Locations 段。全部在读端算，不依赖 A/B，计划 `plans/2026-09-25-track-l-photos-and-topics-by-location.md`。位置只来自 inspector 口述（不用 GPS/EXIF），这是 owner 定的规则。**Procore 线 2026-09-25 起暂停**（探针与 runbook 保留，凭据到手再跑）。执行指南：`plans/2026-09-25-execution-guide-event-graph-tracks.md`。
+
 ---
 
 ## 7. 需要 owner 决定的事（2026-09-24 已决，记录在此）
