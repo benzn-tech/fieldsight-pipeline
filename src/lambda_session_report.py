@@ -303,13 +303,20 @@ def _action_items_for_prompt(content):
 def _prose_sections(text):
     """Split the model's markdown back into {title, paragraphs}. Anything before the
     first heading is kept under an empty title rather than dropped."""
-    sections, current = [], {"title": "", "paragraphs": []}
+    sections, current = [], {"title": "", "paragraphs": [], "level": 1}
     for raw in (text or "").splitlines():
         line = raw.rstrip()
         if line.startswith("#"):
             if current["title"] or current["paragraphs"]:
                 sections.append(current)
-            current = {"title": line.lstrip("#").strip(), "paragraphs": []}
+            # THE DEPTH IS PART OF THE HEADING and used to be thrown away with
+            # the hashes. A sub-section asked for as `####` came back as `####`
+            # and was rendered at the same level as its parent, which reads as
+            # the nesting having been ignored -- the fault it was meant to fix,
+            # wearing a different face.
+            depth = len(line) - len(line.lstrip("#"))
+            current = {"title": line.lstrip("#").strip(), "paragraphs": [],
+                       "level": 2 if depth > 3 else 1}
         elif line.strip():
             current["paragraphs"].append(line.strip())
     if current["title"] or current["paragraphs"]:
