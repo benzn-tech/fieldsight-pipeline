@@ -658,6 +658,24 @@ def save_debug_record(bucket, target_date, meeting_title, prompt, raw_response,
 # Word Document Generation
 # ============================================================
 
+def _add_photo_strip(doc, streams):
+    """A row of pictures, or nothing. Never raises: the prose is the
+    deliverable and the pictures support it, so one unreadable file costs
+    itself and not the report."""
+    streams = [s for s in (streams or []) if s is not None]
+    if not streams:
+        return
+    strip = doc.add_paragraph()
+    for stream in streams:
+        try:
+            strip.add_run().add_picture(stream, width=Inches(2.4))
+        except Exception:
+            # exc_info, not a bare message (BUG-40): the first writing of this
+            # handler hid a corrupt fixture behind "could not place".
+            logger.warning("skipping a photo python-docx could not place",
+                           exc_info=True)
+
+
 _TABLE_RULE_RE = re.compile(r"^[\s|:-]+$")
 
 
@@ -750,6 +768,13 @@ def generate_prose_document(title, subtitle, sections, actions):
             else:
                 doc.add_paragraph(text)
             i += 1
+
+        # THE PHOTOGRAPHS OF WHAT THIS SECTION IS ABOUT, under it rather than
+        # in a heap at the end. The strip is the same one the assembled report
+        # has always drawn per topic -- same width, same tolerance for a file
+        # python-docx cannot place -- because a reader should not be able to
+        # tell which path wrote the document.
+        _add_photo_strip(doc, section.get("photo_streams"))
 
     if actions:
         # A prose section titled "Actions" already wrote this heading above; the
