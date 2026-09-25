@@ -47,7 +47,8 @@ import logging
 from db.connection import get_connection
 from repositories import speaker_label_groups
 from repositories.companies import list_companies
-from repositories.voiceprints import (EnrolmentBelongsToSomebodyElse, add_sample,
+from repositories.voiceprints import (EnrolmentAfterWithdrawal,
+                                      EnrolmentBelongsToSomebodyElse, add_sample,
                                       company_floor, live_turn_names,
                                       profiles_for_matching, record_attempt,
                                       record_turn_name, recompute_company_floor,
@@ -194,6 +195,13 @@ def _propagation(event):
                            created_by=enrol.get("created_by"),
                            correction_ref=correction_ref,
                            admitted_max_spread=enrol.get("admitted_max_spread"))
+            except EnrolmentAfterWithdrawal as exc:
+                # Same treatment as the refusal below, for the same reason: the names
+                # describe THIS meeting. A withdrawal that landed mid-flight is not a reason
+                # to roll them back — `withdraw` un-names what the PROFILE justified, and
+                # these were justified by a person's assertion in this meeting.
+                logger.warning("enrol refused: %s", exc)
+                enrol_refusal = {"reason": "profile-withdrawn"}
             except EnrolmentBelongsToSomebodyElse as exc:
                 # Caught, not propagated: the names describe THIS meeting and were earned by
                 # the user's own assertion. Letting a refused enrolment roll them back would
@@ -226,9 +234,14 @@ def _propagation(event):
                            correction_ref=correction_ref,
                            admitted_max_spread=h.get("admitted_max_spread"))
                 harvested += 1
-            except EnrolmentBelongsToSomebodyElse as exc:
+            except (EnrolmentAfterWithdrawal, EnrolmentBelongsToSomebodyElse) as exc:
                 # PER SAMPLE. One refusal must not discard the rest: they are independent
                 # windows and only the refused one is suspect.
+                #
+                # A withdrawal joins the same arm rather than breaking the loop. It will
+                # refuse every remaining member too — the profile is gone for all of them —
+                # and counting each refusal separately keeps `harvest_refused` meaning "how
+                # many windows did not become samples", which is what the number is read as.
                 logger.warning("harvest sample refused: %s", exc)
                 harvest_refused += 1
 
@@ -273,6 +286,9 @@ def _enrol(event):
                        created_by=event.get("created_by"),
                        correction_ref=event.get("correction_ref"),
                        admitted_max_spread=event.get("admitted_max_spread"))
+        except EnrolmentAfterWithdrawal as exc:
+            logger.warning("enrol refused: %s", exc)
+            return {"stored": 0, "reason": "profile-withdrawn"}
         except EnrolmentBelongsToSomebodyElse as exc:
             # Same refusal as the propagation path, and it has to be spelled out twice
             # because the two paths report different shapes. What must NOT differ is the
