@@ -227,6 +227,10 @@ UPLOAD_VERIFY_MODE = os.environ.get("UPLOAD_VERIFY_MODE", "off").lower()
 # exist -- this repo has shipped a documented rollback that was never wired, twice).
 SPEAKER_IDENTITY_MODE = os.environ.get("SPEAKER_IDENTITY_MODE", "off").lower()
 
+# How many of a person's pending candidates the dialog asks about at once. A SCREEN-SIZE
+# choice: it decides how long the list is, never whether a candidate is a match.
+PROPOSAL_PAGE = int(os.environ.get("PROPOSAL_PAGE", "5"))
+
 # Whether naming a speaker is itself taken as the claim that they agreed to a voiceprint.
 #
 # Off, the endpoint keeps the pre-existing rule: enrolment happens only when the caller sends
@@ -745,6 +749,8 @@ def dispatch(conn, event, method, route):
     m_rg = re.match(r"^/sessions/([^/]+)/regenerate$", route)
     if m_rg and method == "POST":
         return regenerate_session(conn, caller, m_rg.group(1), event)
+    if route == "/name-proposals" and method == "GET":
+        return list_name_proposals(conn, caller, event)
     m_np = re.match(r"^/name-proposals/([^/]+)$", route)
     if m_np and method == "POST":
         return decide_name_proposal(conn, caller, m_np.group(1), event)
@@ -2360,6 +2366,77 @@ def _employer_result(name, source, profile):
             "source": profile.get("employer_source")}
 
 
+def list_name_proposals(conn, caller, event):
+    """GET /api/org/name-proposals — whose voices are waiting to be confirmed.
+
+    Two shapes from one route, because the bell and the dialog want different things and
+    making the bell pay for the dialog's work would put a transcript read on every page load.
+
+    Without `?voiceprint=`: a count per person. Cheap -- one grouped query, no transcript
+    touched -- which is what a badge polled from every page has to be.
+
+    With `?voiceprint=<id>`: that person's top candidates WITH the words, which means reading
+    the session transcripts. Only on opening the dialog, and only for the handful shown.
+
+    The passage text is the point of the second shape. A row that says
+    `spk_1 @ 2026-09-22 / 41.2s` is an identifier, not a question -- nobody can answer it
+    without listening first, and most people will not. The transcriber's words are wrong
+    often enough to be useless as an answer and right often enough to place the passage,
+    which is exactly what is needed to decide whether it is worth playing.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    company_id = str(caller["company_id"])
+    qs = event.get("queryStringParameters") or {}
+    vp = (qs.get("voiceprint") or "").strip()
+
+    if not vp:
+        people = speaker_name_proposals.pending_by_person(conn, company_id)
+        return ok({"people": [{"voiceprintId": r["voiceprint_id"],
+                               "displayName": r["display_name"],
+                               "pending": int(r["pending"]),
+                               "newest": r["newest"]} for r in people],
+                   "total": sum(int(r["pending"]) for r in people)})
+
+    rows = speaker_name_proposals.pending_for_person(
+        conn, company_id, vp, limit=PROPOSAL_PAGE)
+    # Transcripts are read per SESSION, not per candidate: several candidates routinely come
+    # from one session, and a naive loop would fetch the same transcript five times.
+    cache, out = {}, []
+    for r in rows:
+        sid = (r["session_base"], r["user_folder"], str(r["session_date"]))
+        if sid not in cache:
+            try:
+                cache[sid] = _session_turns(conn, sid[1], sid[2], sid[0])
+            except Exception:
+                logger.exception("proposal %s: could not read its transcript", r["id"])
+                cache[sid] = []
+        # The LONGEST turn of that cluster, the same one a confirmation would mark -- so the
+        # words shown are the words of the passage the decision actually lands on.
+        turns = [t for t in cache[sid]
+                 if t.get("source_filename") == r["source_filename"]
+                 and t.get("speaker_label") == r["speaker_label"]]
+        best = max(turns, key=lambda t: float(t.get("end_sec", 0)) - float(t.get("start_sec", 0)),
+                   default=None)
+        out.append({
+            "id": r["id"], "sessionBase": r["session_base"], "date": str(r["session_date"]),
+            # The folder is what turns this passage into a playable key
+            # (`audio_segments/{folder}/{date}/{stem}.wav`). Without it the dialog can show
+            # the words and never the voice -- and the voice is what is being judged.
+            "userFolder": r["user_folder"],
+            "sourceFilename": r["source_filename"], "speakerLabel": r["speaker_label"],
+            "score": None if r.get("score") is None else round(float(r["score"]), 3),
+            # Absent rather than empty when the transcript could not be read: "no words" and
+            # "we could not look" are different, and only one of them is worth retrying.
+            "text": (best or {}).get("text"),
+            "startSec": (best or {}).get("start_sec"),
+            "endSec": (best or {}).get("end_sec"),
+        })
+    return ok({"voiceprintId": vp, "proposals": out})
+
+
 def decide_name_proposal(conn, caller, proposal_id, event):
     """POST /api/org/name-proposals/{id} — a human answers one proposed name.
 
@@ -3907,6 +3984,25 @@ def create_member(conn, caller, body):
             logger.warning("create_member: no free folder_name for %s -- left unset", sub)
     created = [memberships.ensure_membership(conn, user["id"], mem["site_id"],
                                              mem["role"]) for mem in wanted]
+
+    # THE COMPANY'S STARTER TEMPLATES, if it does not have them yet. This is
+    # the path a company actually gets its people through -- the invitation --
+    # and it was the one path that did not seed. The migration seeds the
+    # companies that existed when it ran; lambda_org_seed seeds on a manual
+    # backfill. A company that was created empty and then got its first person
+    # by invitation (Briv, on prod) kept an empty Library forever, which is the
+    # exact symptom the owner reported on Southbase: "I can't see any template".
+    #
+    # Safe on every invitation, not just the first: the function is idempotent
+    # per company, returns 0 for a company that has them, and does not put back
+    # one the company has archived -- that was their decision about their own
+    # library. The author is the company's first officer (or member), the same
+    # rule the other two callers use, rather than the inviter -- who may be a
+    # platform_admin from a different company.
+    author = users.first_officer_or_member(conn, target_company_id)
+    if author is not None:
+        report_templates.seed_starters(conn, target_company_id, author["id"])
+
     return ok({"user": user, "memberships": created}, 201)
 
 

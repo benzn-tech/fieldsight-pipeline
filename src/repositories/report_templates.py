@@ -313,7 +313,8 @@ def bound_report_types(conn, template_id):
 def seed_starters(conn, company_id, author_user_id):
     """Give one company its own copies of the four starter templates.
 
-    The bodies are NOT here. They are in the function migration 0066 defines,
+    The bodies are NOT here. They are in the function migration 0067 defines
+    (renumbered from 0066, which the voiceprint line shipped first),
     because two places need them -- that migration, for the companies that
     already existed, and lambda_org_seed, for every company made after. A copy
     in Python beside a copy in SQL is two copies, and the one that gets edited

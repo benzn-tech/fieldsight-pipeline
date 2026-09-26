@@ -171,43 +171,65 @@ def _photo_topics(artifact, budget):
 
 
 def _place_photos(sections, streams_by_ref):
-    """Put each topic's photographs under the section that said it covered it.
+    """Put each topic's photographs as close as the model said they belong.
 
-    A photograph appears ONCE. Two sections naming the same topic is not an
-    error -- a day's work does not divide neatly into headings -- but printing
-    the picture twice would read as a mistake, so the first section to claim it
-    keeps it.
+    Returns (under_a_line, under_a_section, fell_to_the_end) as photograph
+    counts. Three tiers, most precise first, each a fallback for the one above:
 
-    ANYTHING UNCLAIMED GOES UNDER THE LAST HEADING rather than being dropped.
-    That is the same floor the prompt already states for text nobody covered:
-    what the recording holds has to appear somewhere. A photograph that quietly
-    vanished because the model forgot a line would be indistinguishable from a
-    photograph that was never taken.
+      1. DIRECTLY UNDER THE LINE that names the topic -- a paragraph, a list
+         item or a table row ending in `[t1]`. This is what the owner asked
+         for: the photograph beside what was said about it, as the Timeline
+         shows it.
+      2. At the end of a SECTION whose `[covers: ...]` line names it. The
+         prompt no longer asks for this; it stays because a model that writes
+         it anyway should not lose the photograph for having done so.
+      3. Under the LAST HEADING, for anything nobody claimed -- the same floor
+         the prompt states for text nobody covered. A photograph that vanished
+         because the model forgot a tag would be indistinguishable from one
+         that was never taken.
+
+    A photograph appears ONCE, under the first line that names its topic. A
+    day's work does not divide neatly and two lines naming the same topic is
+    not an error, but the picture printed twice would read as one.
     """
     if not streams_by_ref or not sections:
-        return 0, 0
-    placed, taken = 0, set()
+        return 0, 0, 0
+    at_line = at_section = 0
+    taken = set()
+
+    def claim(ref):
+        if ref in taken or ref not in streams_by_ref:
+            return []
+        taken.add(ref)
+        return list(streams_by_ref[ref])
+
+    for section in sections:
+        after = {}
+        for i, refs in enumerate(section.get("line_refs") or []):
+            mine = []
+            for ref in refs:
+                mine.extend(claim(ref))
+            if mine:
+                after[i] = mine
+                at_line += len(mine)
+        if after:
+            section["photos_after"] = after
+
     for section in sections:
         mine = []
         for ref in section.get("covers") or []:
-            if ref in taken:
-                continue
-            for stream in streams_by_ref.get(ref) or []:
-                mine.append(stream)
-            if ref in streams_by_ref:
-                taken.add(ref)
+            mine.extend(claim(ref))
         if mine:
-            section["photo_streams"] = mine
-            placed += len(mine)
+            section["photo_streams"] = (section.get("photo_streams") or []) + mine
+            at_section += len(mine)
 
     leftover = []
-    for ref, streams in streams_by_ref.items():
-        if ref not in taken:
-            leftover.extend(streams)
+    for ref in streams_by_ref:
+        leftover.extend(claim(ref))
     if leftover:
         last = sections[-1]
         last["photo_streams"] = (last.get("photo_streams") or []) + leftover
-    return placed, len(leftover)
+    return at_line, at_section, len(leftover)
 
 
 def _content_to_minutes(artifact):
@@ -387,6 +409,26 @@ def _action_items_for_prompt(content):
 
 _COVERS_RE = re.compile(r"^\[covers:\s*([^\]]*)\]$", re.IGNORECASE)
 _REF_RE = re.compile(r"t\d+", re.IGNORECASE)
+# `... signed off by the engineer. [t1]` / `[t1, t3]` / `[T1 and T3]`, at the END
+# of a line only. Anchored to the end so a bracket in the middle of a sentence
+# -- "[sic]", a citation, a quoted form number -- is never read as a reference;
+# and only `t` followed by digits, so nothing a person would naturally write in
+# brackets can move a photograph.
+_LINE_TAG_RE = re.compile(
+    r"\s*\[\s*(t\d+(?:\s*(?:,|and|&)\s*t\d+)*)\s*\]\s*$", re.IGNORECASE)
+
+
+def _line_refs(line):
+    """(line without its tag, [refs]) -- the refs lowercased, unique, in order."""
+    m = _LINE_TAG_RE.search(line)
+    if not m:
+        return line, []
+    refs = []
+    for ref in _REF_RE.findall(m.group(1)):
+        ref = ref.lower()
+        if ref not in refs:
+            refs.append(ref)
+    return line[:m.start()].rstrip(), refs
 
 
 def _covers_refs(line):
@@ -416,7 +458,7 @@ def _prose_sections(text):
     """Split the model's markdown back into {title, paragraphs}. Anything before the
     first heading is kept under an empty title rather than dropped."""
     sections, current = [], {"title": "", "paragraphs": [], "level": 1,
-                             "covers": []}
+                             "covers": [], "line_refs": []}
     for raw in (text or "").splitlines():
         line = raw.rstrip()
         if line.startswith("#"):
@@ -429,7 +471,8 @@ def _prose_sections(text):
             # wearing a different face.
             depth = len(line) - len(line.lstrip("#"))
             current = {"title": line.lstrip("#").strip(), "paragraphs": [],
-                       "level": 2 if depth > 3 else 1, "covers": []}
+                       "level": 2 if depth > 3 else 1, "covers": [],
+                       "line_refs": []}
         elif _COVERS_RE.match(line.strip()):
             # OUR OWN SCAFFOLDING, and it never reaches the page. The model is
             # asked to end each section with it so the renderer knows which
@@ -437,7 +480,13 @@ def _prose_sections(text):
             # for why the model is asked rather than the renderer guessing.
             current["covers"] = _covers_refs(line.strip())
         elif line.strip():
-            current["paragraphs"].append(line.strip())
+            # The tag comes off before the line is kept, so it can never reach
+            # the page -- including when the line is a table row, where it
+            # would otherwise sit in the last cell.
+            text, refs = _line_refs(line.strip())
+            if text:
+                current["paragraphs"].append(text)
+                current["line_refs"].append(refs)
     if current["title"] or current["paragraphs"]:
         sections.append(current)
     return [s for s in sections if s["title"] or s["paragraphs"]]
@@ -540,15 +589,17 @@ def _generate_document(artifact, context=None):
         raise RuntimeError(err or "empty answer from model")
 
     prose = _prose_sections(text)
-    placed, orphaned = _place_photos(prose, photo_streams)
+    at_line, at_section, orphaned = _place_photos(prose, photo_streams)
+    placed = at_line + at_section
     if photo_streams:
-        # Counted, not assumed. "Did the model answer with the lines we asked
-        # for" is the one question this feature turns on, and the only way to
-        # know is from the output end -- a prompt that contains the request is
-        # not a model that obeyed it.
-        logger.info("photos: %d offered, %d placed under a section, %d fell to "
-                    "the last heading", sum(len(v) for v in photo_streams.values()),
-                    placed, orphaned)
+        # Counted, not assumed, and BY TIER. "Did the model tag the lines we
+        # asked it to" is the question this feature turns on, and only the
+        # output end can answer it: a prompt that contains the request is not
+        # a model that obeyed it.
+        logger.info("photos: %d offered, %d under a line, %d under a section, "
+                    "%d fell to the last heading",
+                    sum(len(v) for v in photo_streams.values()),
+                    at_line, at_section, orphaned)
 
     buf = lambda_meeting_minutes.generate_prose_document(
         artifact.get("title") or gen.get("templateName") or template.get("name") or "Report",
@@ -581,6 +632,8 @@ def _generate_document(artifact, context=None):
             # document: a photograph under the last heading looks exactly like
             # a photograph the model placed there on purpose.
             "photosPlaced": placed,
+            "photosUnderALine": at_line,
+            "photosUnderASection": at_section,
             "photosUnplaced": orphaned}
     return buf, meta
 

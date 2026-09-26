@@ -113,6 +113,35 @@ def pending_count(conn, company_id) -> int:
     return int((row or {}).get("n") or 0)
 
 
+def pending_by_person(conn, company_id) -> list:
+    """Unanswered questions grouped by WHOSE voice they are about — what the bell reads.
+
+    Grouped, not listed, and that is the whole point of this function existing beside
+    `pending_for_person`. A bell that said "14 clips to check" describes a chore. "Three
+    voices to confirm" describes a decision somebody can picture finishing, and the unit a
+    person actually thinks in is the person, not the passage.
+
+    It joins `speaker_voiceprints` for the name because a uuid is not something a bell can
+    say, and it filters on that join rather than trusting the proposal row: a profile
+    withdrawn after its proposals were queued must stop being asked about, and the row
+    itself has no way to know that happened.
+
+    `newest` rides along so the bell can order by what turned up most recently rather than
+    by name — the questions a person has not seen yet are the ones worth putting first.
+    """
+    _require_company(company_id)
+    return cur_rows(conn.cursor(row_factory=dict_row).execute(
+        "SELECT p.voiceprint_id::text AS voiceprint_id, v.display_name, "
+        "       count(*) AS pending, max(p.created_at) AS newest "
+        "FROM speaker_name_proposals p "
+        "JOIN speaker_voiceprints v ON v.id = p.voiceprint_id "
+        "WHERE p.company_id = %s AND p.state = 'pending' "
+        "  AND v.company_id = %s AND v.status <> 'withdrawn' "
+        "GROUP BY p.voiceprint_id, v.display_name "
+        "ORDER BY max(p.created_at) DESC",
+        (company_id, company_id)))
+
+
 def decide(conn, company_id, proposal_id, state, decided_by=None) -> dict | None:
     """Record an answer. Returns the row, or None if it was not this company's to answer.
 
