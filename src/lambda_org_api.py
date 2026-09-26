@@ -2422,6 +2422,10 @@ def list_name_proposals(conn, caller, event):
                    default=None)
         out.append({
             "id": r["id"], "sessionBase": r["session_base"], "date": str(r["session_date"]),
+            # The folder is what turns this passage into a playable key
+            # (`audio_segments/{folder}/{date}/{stem}.wav`). Without it the dialog can show
+            # the words and never the voice -- and the voice is what is being judged.
+            "userFolder": r["user_folder"],
             "sourceFilename": r["source_filename"], "speakerLabel": r["speaker_label"],
             "score": None if r.get("score") is None else round(float(r["score"]), 3),
             # Absent rather than empty when the transcript could not be read: "no words" and

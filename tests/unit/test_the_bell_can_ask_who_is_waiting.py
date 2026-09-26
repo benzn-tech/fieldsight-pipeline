@@ -117,6 +117,9 @@ def test_the_words_are_the_longest_turn_of_that_cluster(wired):
     decision on words the decision does not land on."""
     p = _body(org.lambda_handler(_event({"voiceprint": VP}), None))["proposals"][0]
     assert (p["startSec"], p["endSec"]) == (9.0, 31.0)
+    # And the folder, or the passage has words but no voice: the dialog builds the audio
+    # key from it, and the voice is the thing being judged.
+    assert p["userFolder"] == "Ben_UCPK"
     assert p["text"] == "the long one, which is the passage"
 
 
