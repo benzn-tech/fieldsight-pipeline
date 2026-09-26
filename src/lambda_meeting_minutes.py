@@ -683,6 +683,55 @@ def _is_table_row(text):
     return text.startswith("|") and text.count("|") >= 2
 
 
+# A GFM delimiter row: `---|---`, `| :--- | ---: |`, with or without the outer
+# pipes. It must contain at least one pipe -- a bare `---` is a horizontal rule
+# or a setext underline, not a table.
+_DELIMITER_RE = re.compile(r"^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?$")
+
+
+def _is_delimiter_row(text):
+    return "|" in text and bool(_DELIMITER_RE.match(text.strip()))
+
+
+def _table_at(paragraphs, i):
+    """How many lines starting at `i` form a markdown table, or 0.
+
+    THE OUTER PIPES ARE OPTIONAL in GitHub-flavoured markdown, and the model
+    uses both forms. The first version of this only recognised rows that
+    started with `|`, so a table written as
+
+        Item | Assigned | Due
+        ---|---|---
+        Pour | Sam | Friday
+
+    was rendered line by line as paragraphs -- pipe characters and the dashed
+    rule printed into the Word document, which is precisely what teaching the
+    renderer about tables was meant to stop. It was found in a report generated
+    from the ordinary browser flow, a day after the fix that introduced it
+    shipped; the reports that had been checked all happened to use outer pipes.
+
+    So the reliable signal is the DELIMITER ROW, which GFM requires and which a
+    sentence that merely contains a `|` never has. A header line followed by a
+    delimiter row starts a table; lines containing a pipe continue it. Rows that
+    start with `|` are still accepted without a delimiter, because that is the
+    form the model used before and the renderer already handled it.
+    """
+    line = paragraphs[i].strip()
+    if (i + 1 < len(paragraphs) and "|" in line
+            and not _is_delimiter_row(line)
+            and _is_delimiter_row(paragraphs[i + 1].strip())):
+        j = i + 2
+        while j < len(paragraphs) and "|" in paragraphs[j] and paragraphs[j].strip():
+            j += 1
+        return j - i
+    if _is_table_row(line):
+        j = i
+        while j < len(paragraphs) and _is_table_row(paragraphs[j].strip()):
+            j += 1
+        return j - i
+    return 0
+
+
 def _split_table_row(text):
     return [c.strip() for c in text.strip().strip("|").split("|")]
 
@@ -756,12 +805,10 @@ def generate_prose_document(title, subtitle, sections, actions):
         i = 0
         while i < len(paragraphs):
             text = paragraphs[i].strip()
-            if _is_table_row(text):
-                rows = []
-                while i < len(paragraphs) and _is_table_row(paragraphs[i].strip()):
-                    rows.append(paragraphs[i].strip())
-                    i += 1
-                _add_markdown_table(doc, rows)
+            n = _table_at(paragraphs, i)
+            if n:
+                _add_markdown_table(doc, [r.strip() for r in paragraphs[i:i + n]])
+                i += n
                 continue
             if text.startswith("- ") or text.startswith("* "):
                 doc.add_paragraph(text[2:].strip(), style="List Bullet")

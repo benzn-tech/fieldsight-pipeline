@@ -107,6 +107,64 @@ def test_two_columns_is_still_a_table():
     assert [c.text for c in doc.tables[0].rows[1].cells] == ["Crane pad", "Friday"]
 
 
+# ---- the outer pipes are optional ------------------------------------------
+
+# Verbatim from a report generated through the ordinary browser flow on TEST,
+# 2026-09-26, template "daily report" v10. The renderer printed all four lines
+# as paragraphs -- pipes and the dashed rule in the Word document -- because it
+# only recognised rows that START with `|`. The outer pipes are optional in
+# GitHub-flavoured markdown and the model uses both forms; the reports checked
+# before shipping all happened to use outer pipes.
+NO_OUTER_PIPES = [
+    "Item | Assigned | Due",
+    "---|---|---",
+    "**no owner recorded** - Platform initial login using temporary password then "
+    "change to own password per PDF - *no date* | no owner recorded | no date",
+    "**no owner recorded** - Elevation onboarding session to attend tomorrow at "
+    "eleven o'clock - *tomorrow morning, eleven o'clock* | no owner recorded | "
+    "tomorrow morning, eleven o'clock",
+]
+
+
+def test_a_table_without_outer_pipes_is_still_a_table():
+    """THE regression. The delimiter row is the signal, not a leading pipe."""
+    doc = _rendered(NO_OUTER_PIPES)
+    assert len(doc.tables) == 1, "it was printed as four paragraphs of pipes"
+    table = doc.tables[0]
+    assert [c.text for c in table.rows[0].cells] == ["Item", "Assigned", "Due"]
+    assert len(table.rows) == 3, "the ---|---|--- line is a rule, not a row"
+    assert [c.text for c in table.rows[1].cells][1:] == ["no owner recorded", "no date"]
+    for p in doc.paragraphs:
+        assert "|" not in p.text, "a pipe in the prose is the defect itself"
+        assert not p.text.startswith("---"), "the delimiter row leaked as text"
+
+
+def test_aligned_delimiters_count_too():
+    doc = _rendered(["Item | Due", ":--- | ---:", "Pour | Friday"])
+    assert len(doc.tables) == 1
+    assert [c.text for c in doc.tables[0].rows[1].cells] == ["Pour", "Friday"]
+
+
+def test_text_after_a_pipeless_table_is_not_swallowed_into_it():
+    doc = _rendered(["Item | Due", "---|---", "Pour | Friday", "Nothing else moved."])
+    assert len(doc.tables) == 1
+    assert len(doc.tables[0].rows) == 2
+    assert "Nothing else moved." in [p.text for p in doc.paragraphs]
+
+
+def test_two_sentences_with_pipes_are_not_a_table():
+    """Without a delimiter row there is no table, however many pipes the prose
+    happens to contain -- that is what makes the delimiter a safe signal."""
+    doc = _rendered(["The board reads Gate A | Gate B.", "Signage says North | South."])
+    assert not doc.tables
+
+
+def test_a_bare_rule_is_not_a_delimiter():
+    """`---` alone is a horizontal rule or a setext underline, not a table."""
+    doc = _rendered(["Heading-ish line", "---", "More text."])
+    assert not doc.tables
+
+
 def test_bullets_and_prose_are_unchanged():
     """Nothing above may cost the two things this renderer already did."""
     doc = _rendered(["- first", "* second", "a sentence"])
