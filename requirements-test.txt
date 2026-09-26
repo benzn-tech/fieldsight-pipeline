@@ -1,0 +1,41 @@
+# The ONE list of what the test suite needs. CI, the production deploy's test gate and
+# anybody running the suite locally install from this file and from nowhere else.
+#
+# It exists because the list used to live in three places -- test.yml, deploy-prod.yml and
+# the backend skill's command -- and on 2026-09-25 all three were different:
+#
+#   * the local command was four packages short, so 31 tests never ran on the machine that
+#     was reporting "full suite passed";
+#   * all three lacked PyYAML, so four files skipped IN CI -- including the one whose first
+#     line is "a switch you cannot set is not a switch", plus two IAM grant guards and the
+#     prompt-limit ceiling test. 86 tests, every one guarding a failure invisible from the
+#     outside, silently off.
+#
+# test.yml already carried a comment warning that the prod list "has been short an entry
+# before, and the miss showed up as `skipped`, not `failed`, so nothing alerted". It
+# happened again, to the same list, the same way. A list copied three times with nothing
+# that goes red when the copies drift WILL drift; a comment is not that thing, and
+# tests/unit/test_one_list_of_test_dependencies.py is.
+#
+# `pytest.importorskip` on any of these turns a missing line here into a skip, not a
+# failure. That is the mechanism that hid all of the above -- so when adding a package a
+# test needs, add it HERE, not only to your own environment.
+psycopg[binary]>=3.1
+pgvector>=0.3
+PyJWT[crypto]>=2.8
+boto3
+# numpy -- for the scripts/ tools (multichannel_probe), not for any deployed lambda; those
+#   get it from the VAD layer. Without it the probe tests fail to IMPORT.
+numpy
+# python-docx -- the Word-export tests open with importorskip("docx"); without it they
+#   SKIP and the suite is green over a path nothing checked.
+python-docx>=1.1
+# pglast -- libpg_query, PostgreSQL's own parser. Without it the SQL parse guards SKIP,
+#   and a skipped SQL guard is exactly the check a connection double cannot make.
+pglast>=7
+# PyYAML -- the template/workflow wiring guards parse the SAM template. Missing until
+#   2026-09-25, so those four files skipped in CI the whole time they existed.
+PyYAML>=6
+urllib3
+pytest
+pytest-cov
