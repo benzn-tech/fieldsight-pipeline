@@ -135,6 +135,10 @@ def test_an_enrolment_that_fails_still_keeps_the_two_apart(upload, caplog):
 def test_creating_the_second_namesake_gives_them_a_folder(monkeypatch):
     """create_member used to leave folder_name unset here, which is where the
     whole thing started."""
+    monkeypatch.setattr(org.users, "first_officer_or_member",
+                        lambda conn, cid: {"id": "u-officer"})
+    monkeypatch.setattr(org.report_templates, "seed_starters",
+                        lambda conn, cid, author: 0)
     admin = {**NAMESAKE, "cognito_sub": "sub-1", "global_role": "admin",
              "folder_name": "Admin"}
     state = {"set": []}

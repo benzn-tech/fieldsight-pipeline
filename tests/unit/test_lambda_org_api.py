@@ -81,6 +81,15 @@ def wired(monkeypatch):
     # body omits slug; default "no collision" so existing create-site tests
     # (which don't stub this) don't hit FakeConn's missing .cursor().
     monkeypatch.setattr(org.sites, "get_company_site_by_slug", lambda conn, cid, slug: None)
+    # create_member now gives the company its starter templates on every
+    # invitation. Both calls go through a real cursor, which FakeConn does not
+    # have -- the same way the org-seed tests broke when that lambda learned to
+    # seed. Stubbed here, and the behaviour itself is pinned in
+    # test_an_invited_company_gets_its_templates.py.
+    monkeypatch.setattr(org.users, "first_officer_or_member",
+                        lambda conn, cid: {"id": "u-officer"})
+    monkeypatch.setattr(org.report_templates, "seed_starters",
+                        lambda conn, cid, author: 0)
     return monkeypatch
 
 
@@ -4943,6 +4952,105 @@ def test_create_member_platform_admin_targets_other_company(member_wired):
     }), None)
     assert res["statusCode"] == 201
     assert seen["company_id"] == "c-uuid-B"
+
+
+# ---- an invited company gets its starter templates -------------------------
+#
+# The invitation is how a company actually gets its people, and it was the one
+# path that did not seed. The migration seeds the companies that existed when it
+# ran; lambda_org_seed seeds on a manual backfill. Briv, on prod, was created
+# empty and has 0 templates -- and the first person invited into it would have
+# found an empty Library, the symptom the owner reported on Southbase.
+#
+# What these tests can and cannot show: they pin that create_member CALLS the
+# seeding with the right company and author. That the SQL function is idempotent
+# (a second invitation adds nothing, an archived starter is not put back) lives
+# in the function, and FakeConn never executes SQL -- so it is not proven here.
+
+def _seed_recorder(wired):
+    calls = {"seed": [], "author_for": []}
+    wired.setattr(org.users, "first_officer_or_member",
+                  lambda conn, cid: (calls["author_for"].append(cid) or {"id": "u-officer-" + str(cid)}))
+    wired.setattr(org.report_templates, "seed_starters",
+                  lambda conn, cid, author: (calls["seed"].append((cid, author)) or 4))
+    wired.setattr(org.users, "upsert_user",
+                  lambda conn, sub, email, **kw: {"id": "u-new", "cognito_sub": sub,
+                                                   "email": email, **kw})
+    return calls
+
+
+def test_an_invitation_gives_the_company_its_starter_templates(member_wired):
+    wired, fake = member_wired
+    calls = _seed_recorder(wired)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "first@briv.nz"}), None)
+    assert res["statusCode"] == 201
+    assert len(calls["seed"]) == 1, "the invitation path must seed"
+    assert calls["seed"][0][0] == CALLER["company_id"]
+
+
+def test_the_seeding_happens_after_the_new_person_exists(member_wired):
+    """For a company with nobody in it, the person being invited is the only
+    possible author -- and they exist only after upsert_user. Seeding before it
+    finds no author, seeds nothing, and says nothing: the original defect back,
+    silently. So the order is pinned."""
+    wired, fake = member_wired
+    order = []
+    wired.setattr(org.users, "upsert_user",
+                  lambda conn, sub, email, **kw: (order.append("upsert")
+                                                   or {"id": "u-new", "cognito_sub": sub,
+                                                       "email": email, **kw}))
+    wired.setattr(org.users, "first_officer_or_member",
+                  lambda conn, cid: (order.append("author") or {"id": "u-new"}))
+    wired.setattr(org.report_templates, "seed_starters",
+                  lambda conn, cid, author: (order.append("seed") or 4))
+    org.lambda_handler(make_event("POST", "/api/org/members", body={"email": "a@b.nz"}), None)
+    assert order.index("upsert") < order.index("author") < order.index("seed")
+
+
+def test_every_invitation_asks_and_the_function_decides(member_wired):
+    """Called on the second invitation too. Not 'only when empty' in Python:
+    the function already knows, per company, whether the starters are there
+    or were archived -- a second check here would be a second copy of that
+    rule, and the two would drift."""
+    wired, fake = member_wired
+    calls = _seed_recorder(wired)
+    for email in ("first@x.nz", "second@x.nz"):
+        org.lambda_handler(make_event("POST", "/api/org/members", body={"email": email}), None)
+    assert len(calls["seed"]) == 2
+    assert calls["seed"][0][0] == calls["seed"][1][0]
+
+
+def test_a_platform_admin_inviting_elsewhere_seeds_that_company_with_its_own_author(member_wired):
+    """The inviter may belong to a different company. The templates are the
+    TARGET company's, and so is the person named as their author -- a row in
+    Southbase's library created_by somebody from FieldSight-platform would be
+    a small lie in an audit trail."""
+    wired, fake = member_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: ({**CALLER, "global_role": "platform_admin"}
+                                     if sub == "sub-1" else None))
+    wired.setattr(org.companies, "get_company_by_id",
+                  lambda conn, cid: {"id": cid, "name": "Other Co"})
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": "c-uuid-B"})
+    calls = _seed_recorder(wired)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "new@b.nz", "target_company_id": "c-uuid-B",
+        "memberships": [{"site_id": "s-1", "role": "worker"}]}), None)
+    assert res["statusCode"] == 201
+    assert calls["seed"] == [("c-uuid-B", "u-officer-c-uuid-B")]
+    assert calls["author_for"] == ["c-uuid-B"], "the author is looked up in the target company"
+
+
+def test_no_one_to_name_as_author_seeds_nothing_and_still_invites(member_wired):
+    wired, fake = member_wired
+    calls = _seed_recorder(wired)
+    wired.setattr(org.users, "first_officer_or_member", lambda conn, cid: None)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "x@x.nz"}), None)
+    assert res["statusCode"] == 201
+    assert calls["seed"] == []
 
 
 def test_create_member_non_platform_cannot_target_other_company_403(member_wired):
