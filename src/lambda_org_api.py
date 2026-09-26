@@ -3907,6 +3907,25 @@ def create_member(conn, caller, body):
             logger.warning("create_member: no free folder_name for %s -- left unset", sub)
     created = [memberships.ensure_membership(conn, user["id"], mem["site_id"],
                                              mem["role"]) for mem in wanted]
+
+    # THE COMPANY'S STARTER TEMPLATES, if it does not have them yet. This is
+    # the path a company actually gets its people through -- the invitation --
+    # and it was the one path that did not seed. The migration seeds the
+    # companies that existed when it ran; lambda_org_seed seeds on a manual
+    # backfill. A company that was created empty and then got its first person
+    # by invitation (Briv, on prod) kept an empty Library forever, which is the
+    # exact symptom the owner reported on Southbase: "I can't see any template".
+    #
+    # Safe on every invitation, not just the first: the function is idempotent
+    # per company, returns 0 for a company that has them, and does not put back
+    # one the company has archived -- that was their decision about their own
+    # library. The author is the company's first officer (or member), the same
+    # rule the other two callers use, rather than the inviter -- who may be a
+    # platform_admin from a different company.
+    author = users.first_officer_or_member(conn, target_company_id)
+    if author is not None:
+        report_templates.seed_starters(conn, target_company_id, author["id"])
+
     return ok({"user": user, "memberships": created}, 201)
 
 
