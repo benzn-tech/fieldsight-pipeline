@@ -416,6 +416,24 @@ def _agreement(conn, company_id, voiceprint_id, embedding):
     return own, best_other, nearest_other_id
 
 
+#: The conflict target must repeat 0069's index predicate, or Postgres cannot infer the
+#: partial index and the INSERT fails outright. Pinned against the migration text by
+#: `test_one_window_is_one_sample.py`.
+_WINDOW_PREDICATE = ("s3_key IS NOT NULL AND window_start_s IS NOT NULL "
+                     "AND window_end_s IS NOT NULL")
+_UPGRADE = ("CASE WHEN EXCLUDED.source = 'correction' "
+            "AND speaker_voiceprint_samples.source <> 'correction' ")
+_ONE_SAMPLE_PER_WINDOW = (
+    "ON CONFLICT (voiceprint_id, s3_key, window_start_s, window_end_s) "
+    "WHERE " + _WINDOW_PREDICATE + " DO UPDATE SET "
+    "source = " + _UPGRADE + "THEN EXCLUDED.source "
+    "ELSE speaker_voiceprint_samples.source END, "
+    "created_by = " + _UPGRADE + "THEN EXCLUDED.created_by "
+    "ELSE speaker_voiceprint_samples.created_by END, "
+    "correction_ref = " + _UPGRADE + "THEN EXCLUDED.correction_ref "
+    "ELSE speaker_voiceprint_samples.correction_ref END ")
+
+
 def add_sample(conn, company_id, voiceprint_id, embedding, source, s3_key, window,
                created_by=None, correction_ref=None,
                admitted_max_spread=None) -> dict | None:
@@ -497,12 +515,21 @@ def add_sample(conn, company_id, voiceprint_id, embedding, source, s3_key, windo
     if own is not None and best_other is not None and best_other > own:
         raise EnrolmentBelongsToSomebodyElse(own, best_other, nearest_other_id)
     start_s, end_s = (window or (None, None))
+    # One row per (profile, audio, window) -- migration 0069. The same window arrives again
+    # when a passage is renamed twice, a cluster propagated twice, or a harvested window is
+    # later renamed on its own; each used to become a second copy of an identical vector,
+    # which the mean then counted twice. A repeat is not an error: it returns the row
+    # already held. The one thing a repeat may change is a propagation becoming a
+    # correction -- a person has now vouched for a window the clustering only suggested,
+    # and `source` is what tells those apart at deletion time.
     return conn.cursor(row_factory=dict_row).execute(
         "INSERT INTO speaker_voiceprint_samples "
         "(company_id, voiceprint_id, embedding, source, s3_key, window_start_s, "
         " window_end_s, created_by, correction_ref, agreement_own, "
         " agreement_best_other, nearest_other_id, admitted_max_spread) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        + _ONE_SAMPLE_PER_WINDOW +
+        "RETURNING id",
         (company_id, voiceprint_id, _vector_literal(embedding), source, s3_key,
          start_s, end_s, created_by, correction_ref, own, best_other, nearest_other_id,
          admitted_max_spread),
