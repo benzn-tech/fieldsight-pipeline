@@ -23,11 +23,42 @@ def _pytest_workflows():
             continue
         for line in text.splitlines():
             m = PIP_INSTALL.search(line)
-            if m and "pytest" in m.group(1):
-                out[path.name] = frozenset(
-                    tok.strip('"\'') for tok in m.group(1).split()
-                )
+            if not m:
+                continue
+            deps = _expand(m.group(1))
+            if "pytest" in deps:
+                out[path.name] = deps
     return out
+
+
+def _expand(args):
+    """The packages a `pip install ...` line installs, following `-r FILE`.
+
+    The workflows now install from requirements-test.txt instead of listing packages
+    inline. Before this learned to follow `-r` it found no inline list at all, saw zero
+    pytest workflows and failed -- the right outcome for a guard that could no longer see
+    what it guards. It follows the file rather than being deleted, so the parity it pins
+    still holds if a second requirements file ever appears.
+
+    Why this test did not catch the 2026-09-25 drift: it compares the workflows with EACH
+    OTHER, and both were identically missing PyYAML. What the tests actually NEED is pinned
+    separately, in test_one_list_of_test_dependencies.py.
+    """
+    toks = [t.strip('"\'') for t in args.split()]
+    deps = set()
+    i = 0
+    while i < len(toks):
+        if toks[i] == "-r" and i + 1 < len(toks):
+            req = WORKFLOWS.parents[1] / toks[i + 1]
+            for ln in req.read_text(encoding="utf-8").splitlines():
+                ln = ln.split("#", 1)[0].strip()
+                if ln:
+                    deps.add(ln)
+            i += 2
+            continue
+        deps.add(toks[i])
+        i += 1
+    return frozenset(deps)
 
 
 def test_more_than_one_workflow_runs_pytest():
