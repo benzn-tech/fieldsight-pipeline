@@ -25,6 +25,15 @@
 -- added before either of the other two writers can produce rows.
 ALTER TABLE topic_photos ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'binding';
 
+-- The premise above is a fact about the stack settings on one day, not about
+-- the rows: keyframes were switchable before they were gated off, and a row
+-- written then would take the default here and be swept by the first rebind.
+-- A keyframe's key carries '_kf_' (keyframe_selection.keyframe_filename), so
+-- those rows are marked for what they are. No keyframe in the table makes
+-- this a no-op; it is here so that is a measurement rather than an assumption.
+UPDATE topic_photos SET source = 'keyframe'
+ WHERE source = 'binding' AND s3_key LIKE '%\_kf\_%' ESCAPE '\';
+
 -- The rebind deletes by (topic, source) across a whole day, and the day is
 -- reached through topics. Without this it is a sequential scan of the table
 -- per session of every day that gets re-driven.

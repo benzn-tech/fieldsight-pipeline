@@ -1047,13 +1047,20 @@ def add_topic_photo_if_absent(conn, topic_id, s3_key, caption_text):
     per-row inside a SAVEPOINT (conn.transaction()) so the aborted statement
     rolls back to the savepoint and the caller's outer transaction stays usable:
     one racing topic is skipped, the whole keyframe request is NOT lost. Does
-    not raise for that race."""
+    not raise for that race.
+
+    `source='keyframe'` is written explicitly. Left to the column default it
+    would read 'binding', and the next day-wide rebind -- which deletes exactly
+    the 'binding' rows -- would sweep the keyframe away with nothing to
+    re-derive it from. Keyframes are gated off on both stacks today; this is
+    what keeps that from being the only thing standing between a keyframe and
+    the rebind."""
     try:
         with conn.transaction():
             row = conn.execute(
                 """
-                INSERT INTO topic_photos (topic_id, s3_key, caption_text)
-                SELECT %(tid)s, %(key)s, %(cap)s
+                INSERT INTO topic_photos (topic_id, s3_key, caption_text, source)
+                SELECT %(tid)s, %(key)s, %(cap)s, 'keyframe'
                 WHERE NOT EXISTS (
                     SELECT 1 FROM topic_photos WHERE topic_id = %(tid)s AND s3_key = %(key)s
                 )
