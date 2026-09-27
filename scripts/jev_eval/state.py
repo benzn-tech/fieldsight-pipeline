@@ -167,6 +167,19 @@ class _Masker:
         self.mapping: dict[str, str] = {}
         self._next_id = 1
 
+        # Compiled once per _Masker instance (the alias pairs are fixed at
+        # construction time and never mutated afterwards), reused across
+        # every call to mask() instead of being recompiled per string.
+        all_terms = sorted(
+            {term for pair in self._person_pairs for term in pair},
+            key=len,
+            reverse=True,
+        )
+        self._alias_pattern = (
+            re.compile(r"\b(?:" + "|".join(re.escape(term) for term in all_terms) + r")\b")
+            if all_terms else None
+        )
+
     def _next_placeholder(self) -> str:
         placeholder = f"PERSON_{self._next_id}"
         self._next_id += 1
@@ -188,15 +201,7 @@ class _Masker:
         # alias rows -- one for the first name, one for the full name -- get
         # separate placeholders, since nothing ties them together as the same
         # person. Pinned by test.
-        all_terms = sorted(
-            {term for pair in self._person_pairs for term in pair},
-            key=len,
-            reverse=True,
-        )
-        if all_terms:
-            alias_pattern = re.compile(
-                r"\b(?:" + "|".join(re.escape(term) for term in all_terms) + r")\b"
-            )
+        if self._alias_pattern is not None:
 
             def _replace_alias(match: re.Match) -> str:
                 term = match.group(0)
@@ -210,7 +215,7 @@ class _Masker:
                         self.mapping[t] = placeholder
                 return placeholder
 
-            text = alias_pattern.sub(_replace_alias, text)
+            text = self._alias_pattern.sub(_replace_alias, text)
 
         # Layer 2: generic two-capitalised-word name shape, skipping anything
         # protected as a known company/product alias term.
