@@ -1,0 +1,387 @@
+"""Unit tests for the Task 10 owner-labelled batch: sampler, label page, and
+importer (Track A, Jev shadow eval).
+
+All of this runs against synthetic in-memory data -- no database, no `aws`
+call. `tests/integration/test_jev_eval_sample_batch_sql.py` covers the SQL
+itself against a real Postgres.
+"""
+import json
+
+import pytest
+
+from scripts.jev_eval import import_labels as il
+from scripts.jev_eval import label_page as lp
+from scripts.jev_eval import sample_batch as sb
+
+
+# ---------------------------------------------------------------------------
+# SQL shape
+# ---------------------------------------------------------------------------
+
+def test_every_sql_string_starts_with_select_or_with():
+    sqls = [
+        sb.sql_threads_topics(120),
+        sb.sql_threads_existing_pairs(),
+        sb.sql_work_class_topics(),
+        sb.sql_work_class_existing(),
+    ]
+    for sql in sqls:
+        stripped = sql.strip().upper()
+        assert stripped.startswith("SELECT") or stripped.startswith("WITH"), sql
+
+
+# ---------------------------------------------------------------------------
+# threads: synthetic topic pool
+# ---------------------------------------------------------------------------
+
+def _topic(id_, title, summary, report_date, site_id="s1", open_items=1, company_id="c1"):
+    return {
+        "id": id_, "title": title, "summary": summary, "report_date": report_date,
+        "site_id": site_id, "open_items": open_items, "company_id": company_id,
+    }
+
+
+def _synthetic_thread_pool():
+    """A pool engineered to land in all three strata:
+    - t2/t1: same distinctive subject ("door hardware"), both have open work,
+      21 day gap -> high stratum (score >= thread_match.MIN_SCORE).
+    - t4/t3: weaker overlap, still eligible -> mid stratum.
+    - t6/t5: below the lowered floor, but share a title token, NOT eligible
+      (t5 has zero open items) -> low stratum only, never high/mid.
+    """
+    return [
+        _topic("t1", "Door hardware ordered", "Handles and hinges ordered for level 2.",
+               "2026-05-01", open_items=1),
+        _topic("t2", "Door hardware installed", "Handles and hinges fitted on level 2.",
+               "2026-05-22", open_items=1),
+        _topic("t3", "Floor box location confirmed", "Floor box position agreed with electrician.",
+               "2026-05-10", open_items=1),
+        _topic("t4", "Floor box installed downstairs", "Box fitted downstairs near the meter.",
+               "2026-05-30", open_items=1),
+        _topic("t5", "Documentation review scaffold permit safety induction paperwork "
+                     "toolbox crane inspection ladder harness",
+               "General discussion scaffold permits induction paperwork roster crane "
+               "lift plan review harness checklist survey.",
+               "2026-04-01", open_items=0),
+        _topic("t6", "Documentation follow-up weather delay reporting insurance claim "
+                     "concrete pour timeline budget variance",
+               "Follow-up weather delay reporting insurance claim concrete pour timeline "
+               "update summary budget forecast variance review.",
+               "2026-06-01", open_items=1),
+    ]
+
+
+def test_generate_thread_pairs_produces_all_three_strata():
+    topics = _synthetic_thread_pool()
+    pairs = sb.generate_thread_pairs(sb.group_by_site(topics))
+    strata = {sb._stratum_for_score(p["score"]) for p in pairs}
+    assert "high" in strata or "mid" in strata  # eligible pairs found
+    assert "low" in strata  # ineligible-but-token-sharing pair found
+    # the t5/t6 pair must be present despite t5 having zero open items --
+    # find_candidates would never surface it, the low-stratum harvest does.
+    low_pairs = [p for p in pairs if sb._stratum_for_score(p["score"]) == "low"]
+    assert any(p["later"]["id"] == "t6" and p["earlier"]["id"] == "t5" for p in low_pairs)
+
+
+def test_stratify_thread_pairs_fills_quotas_and_is_deterministic():
+    topics = _synthetic_thread_pool()
+    # Duplicate the pool across a few more synthetic sites so each stratum
+    # has more than enough candidates to fill a small quota.
+    all_topics = []
+    for i in range(4):
+        for t in _synthetic_thread_pool():
+            t2 = dict(t)
+            t2["id"] = f"{t['id']}-{i}"
+            t2["site_id"] = f"site-{i}"
+            all_topics.append(t2)
+
+    pairs = sb.generate_thread_pairs(sb.group_by_site(all_topics))
+    chosen_a, counts_a = sb.stratify_thread_pairs(pairs, size=10, seed=42)
+    chosen_b, counts_b = sb.stratify_thread_pairs(pairs, size=10, seed=42)
+
+    ids_a = [(p["later"]["id"], p["earlier"]["id"], s) for p, s in chosen_a]
+    ids_b = [(p["later"]["id"], p["earlier"]["id"], s) for p, s in chosen_b]
+    assert ids_a == ids_b  # same seed -> same sample
+    assert counts_a == counts_b
+
+    total_sampled = sum(v["sampled"] for v in counts_a.values())
+    assert total_sampled <= 10
+    assert counts_a["low"]["sampled"] > 0  # low stratum has candidates and gets some
+
+
+def test_stratify_thread_pairs_different_seed_can_differ():
+    all_topics = []
+    for i in range(4):
+        for t in _synthetic_thread_pool():
+            t2 = dict(t)
+            t2["id"] = f"{t['id']}-{i}"
+            t2["site_id"] = f"site-{i}"
+            all_topics.append(t2)
+    pairs = sb.generate_thread_pairs(sb.group_by_site(all_topics))
+    chosen_1, _ = sb.stratify_thread_pairs(pairs, size=10, seed=1)
+    chosen_2, _ = sb.stratify_thread_pairs(pairs, size=10, seed=2)
+    ids_1 = [(p["later"]["id"], p["earlier"]["id"]) for p, _ in chosen_1]
+    ids_2 = [(p["later"]["id"], p["earlier"]["id"]) for p, _ in chosen_2]
+    assert ids_1 != ids_2
+
+
+def test_thread_pair_id_is_stable_and_direction_sensitive():
+    id_1 = sb.thread_pair_id("later-uuid", "earlier-uuid")
+    id_2 = sb.thread_pair_id("later-uuid", "earlier-uuid")
+    assert id_1 == id_2
+    id_swapped = sb.thread_pair_id("earlier-uuid", "later-uuid")
+    assert id_swapped != id_1
+
+
+def test_apply_thread_exclusions_drops_already_suggested_pairs():
+    topics = _synthetic_thread_pool()
+    pairs = sb.generate_thread_pairs(sb.group_by_site(topics))
+    assert pairs  # sanity: the pool does produce pairs
+    some_pair = pairs[0]
+    existing = {(some_pair["later"]["id"], some_pair["earlier"]["id"])}
+    filtered = sb.apply_thread_exclusions(pairs, existing)
+    assert len(filtered) == len(pairs) - 1
+    assert all(
+        (p["later"]["id"], p["earlier"]["id"]) not in existing for p in filtered
+    )
+
+
+# ---------------------------------------------------------------------------
+# work_class: synthetic topic pool
+# ---------------------------------------------------------------------------
+
+def _wc_topic(id_, work_class, confidence, site_id="s1", company_id="c1"):
+    return {
+        "id": id_, "title": f"Topic {id_}", "summary": "summary", "category": "general",
+        "work_class": work_class, "work_confidence": confidence,
+        "site_id": site_id, "company_id": company_id,
+    }
+
+
+def test_apply_work_class_exclusions_drops_fed_back_topics():
+    topics = [_wc_topic("w1", "work", 0.9), _wc_topic("w2", "non_work", 0.5)]
+    filtered = sb.apply_work_class_exclusions(topics, already_fed_back={"w1"})
+    assert [t["id"] for t in filtered] == ["w2"]
+
+
+def test_stratify_work_class_is_fifty_fifty_and_oversamples_low_confidence():
+    topics = (
+        [_wc_topic(f"work-hi-{i}", "work", 0.95) for i in range(10)]
+        + [_wc_topic(f"work-lo-{i}", "work", 0.4) for i in range(3)]
+        + [_wc_topic(f"nonwork-hi-{i}", "non_work", 0.95) for i in range(10)]
+        + [_wc_topic(f"nonwork-lo-{i}", "non_work", 0.3) for i in range(3)]
+    )
+    chosen, counts = sb.stratify_work_class(topics, size=10, seed=7)
+    labels = [t["work_class"] for t, _ in chosen]
+    assert labels.count("work") == 5
+    assert labels.count("non_work") == 5
+
+    work_ids = [t["id"] for t, s in chosen if s == "work"]
+    # all 3 low-confidence "work" topics must be included before any high-confidence one
+    assert all(i.startswith("work-lo") for i in work_ids[:3])
+
+
+def test_stratify_work_class_deterministic_with_seed():
+    topics = (
+        [_wc_topic(f"w{i}", "work", 0.95) for i in range(6)]
+        + [_wc_topic(f"n{i}", "non_work", 0.95) for i in range(6)]
+    )
+    chosen_a, _ = sb.stratify_work_class(topics, size=6, seed=3)
+    chosen_b, _ = sb.stratify_work_class(topics, size=6, seed=3)
+    assert [t["id"] for t, _ in chosen_a] == [t["id"] for t, _ in chosen_b]
+
+
+# ---------------------------------------------------------------------------
+# batch row shape
+# ---------------------------------------------------------------------------
+
+def test_build_thread_batch_row_shape():
+    topics = _synthetic_thread_pool()
+    pairs = sb.generate_thread_pairs(sb.group_by_site(topics))
+    pair = pairs[0]
+    row = sb.build_thread_batch_row(pair, "high")
+    assert row["set"] == "threads"
+    assert row["label"] is None
+    assert row["label_source"] == "owner"
+    assert set(row["features"]) == {"earlier", "later", "gap_days"}
+    assert set(row["baseline"]) == {"score"}
+    assert "stratum" in row and "stratum" not in row["features"]
+
+
+def test_build_work_class_batch_row_shape():
+    topic = _wc_topic("w1", "non_work", 0.4)
+    row = sb.build_work_class_batch_row(topic, "non_work")
+    assert row["set"] == "work_class"
+    assert row["label"] is None
+    assert row["baseline"] == {"classifier_verdict": "non_work", "classifier_confidence": 0.4}
+    assert set(row["features"]) == {"title", "summary", "category"}
+
+
+# ---------------------------------------------------------------------------
+# label_page.py
+# ---------------------------------------------------------------------------
+
+def _batch_rows_for_page():
+    return [
+        {
+            "set": "threads", "id": "threads:aaa", "label": None, "label_source": "owner",
+            "features": {"earlier": {"title": "A"}, "later": {"title": "B"}, "gap_days": 5},
+            "display": {"earlier_title": "Door hardware ordered",
+                        "later_title": "Door hardware installed", "gap_days": 21},
+            "site_id": "s1", "company_id": "c1", "baseline": {"score": 0.61}, "stratum": "high",
+        },
+        {
+            "set": "threads", "id": "threads:bbb", "label": None, "label_source": "owner",
+            "features": {"earlier": {"title": "C"}, "later": {"title": "D"}, "gap_days": 9},
+            "display": {"earlier_title": "Floor box ordered",
+                        "later_title": "Floor box installed", "gap_days": 20},
+            "site_id": "s1", "company_id": "c1", "baseline": {"score": 0.31}, "stratum": "mid",
+        },
+    ]
+
+
+def test_page_contains_every_batch_id():
+    rows = _batch_rows_for_page()
+    html = lp.build_html("threads", rows)
+    for row in rows:
+        assert row["id"] in html
+
+
+def test_page_has_no_http_url():
+    rows = _batch_rows_for_page()
+    html = lp.build_html("threads", rows)
+    assert "http://" not in html
+    assert "https://" not in html
+
+
+def test_page_never_shows_stratum_or_score():
+    rows = _batch_rows_for_page()
+    html = lp.build_html("threads", rows)
+    assert "stratum" not in html.lower()
+    assert "0.61" not in html
+    assert "0.31" not in html
+    assert "baseline" not in html.lower()
+
+
+def test_page_shows_question_and_work_class_note():
+    rows = [
+        {"id": "w1", "display": {"title": "T", "summary": "S", "category": "general"}},
+    ]
+    html = lp.build_html("work_class", rows)
+    assert "NOT work" in html
+    assert lp.QUESTION_TEXT["work_class"].split("\n")[0] in html
+
+
+def test_build_items_payload_excludes_features_and_baseline():
+    rows = _batch_rows_for_page()
+    items = lp.build_items_payload(rows)
+    for item in items:
+        assert set(item) == {"id", "display"}
+
+
+def test_batch_hash_stable_for_same_ids():
+    rows = _batch_rows_for_page()
+    assert lp.batch_hash(rows) == lp.batch_hash(rows)
+    assert lp.batch_hash(rows) != lp.batch_hash(rows[:1])
+
+
+# ---------------------------------------------------------------------------
+# import_labels.py
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def fixtures_and_batch(tmp_path):
+    fixtures_dir = tmp_path / "fixtures"
+    batch_dir = fixtures_dir / "batch"
+    batch_dir.mkdir(parents=True)
+    batch_rows = [
+        {
+            "set": "threads", "id": "threads:aaa", "label": None, "label_source": "owner",
+            "features": {"earlier": {"title": "A"}, "later": {"title": "B"}, "gap_days": 5},
+            "display": {}, "site_id": "s1", "company_id": "c1",
+            "baseline": {"score": 0.61}, "stratum": "high",
+        },
+        {
+            "set": "threads", "id": "threads:bbb", "label": None, "label_source": "owner",
+            "features": {"earlier": {"title": "C"}, "later": {"title": "D"}, "gap_days": 9},
+            "display": {}, "site_id": "s1", "company_id": "c1",
+            "baseline": {"score": 0.31}, "stratum": "mid",
+        },
+        {
+            "set": "threads", "id": "threads:ccc", "label": None, "label_source": "owner",
+            "features": {"earlier": {"title": "E"}, "later": {"title": "F"}, "gap_days": 2},
+            "display": {}, "site_id": "s1", "company_id": "c1",
+            "baseline": {"score": 0.02}, "stratum": "low",
+        },
+    ]
+    with open(batch_dir / "threads.batch.jsonl", "w", encoding="utf-8") as fh:
+        for row in batch_rows:
+            fh.write(json.dumps(row) + "\n")
+    return fixtures_dir, batch_dir
+
+
+def test_import_labels_drops_unsure_and_counts_it(tmp_path, fixtures_and_batch):
+    fixtures_dir, batch_dir = fixtures_and_batch
+    labels_path = tmp_path / "threads.labels.json"
+    labels_path.write_text(json.dumps({
+        "threads:aaa": "yes", "threads:bbb": "no", "threads:ccc": "unsure",
+    }), encoding="utf-8")
+
+    result = il.import_set("threads", labels_path, batch_dir=batch_dir, fixtures_dir=fixtures_dir,
+                            now_iso="2026-09-28T00:00:00+00:00")
+
+    assert result["imported_yes_no"] == 2
+    assert result["unsure_dropped"] == 1
+
+    merged = il.load_jsonl(fixtures_dir / "threads.jsonl")
+    assert {r["id"]: r["label"] for r in merged} == {"threads:aaa": "yes", "threads:bbb": "no"}
+    assert all(r["label_source"] == "owner" for r in merged)
+    assert all(r["decided_at"] == "2026-09-28T00:00:00+00:00" for r in merged)
+
+
+def test_import_labels_is_idempotent_on_reimport(tmp_path, fixtures_and_batch):
+    fixtures_dir, batch_dir = fixtures_and_batch
+    labels_path = tmp_path / "threads.labels.json"
+    labels_path.write_text(json.dumps({"threads:aaa": "yes"}), encoding="utf-8")
+
+    il.import_set("threads", labels_path, batch_dir=batch_dir, fixtures_dir=fixtures_dir,
+                   now_iso="2026-09-28T00:00:00+00:00")
+    il.import_set("threads", labels_path, batch_dir=batch_dir, fixtures_dir=fixtures_dir,
+                   now_iso="2026-09-28T01:00:00+00:00")
+
+    merged = il.load_jsonl(fixtures_dir / "threads.jsonl")
+    assert len(merged) == 1  # no duplicate row for the same id
+    assert merged[0]["decided_at"] == "2026-09-28T01:00:00+00:00"  # replaced, not appended
+
+
+def test_import_labels_refreshes_counts_preserving_existing_fields(tmp_path, fixtures_and_batch):
+    fixtures_dir, batch_dir = fixtures_and_batch
+    counts_path = fixtures_dir / "counts.json"
+    counts_path.write_text(json.dumps({
+        "threads": {
+            "n": 0, "positives": 0, "negatives": 0, "descriptive_only": True,
+            "database": "fieldsight", "exported_at": "2026-09-01T00:00:00+00:00",
+            "exclusions": {"orphaned_parent": 1},
+        },
+        "route_note": "labels exported read-only; no rows written",
+    }), encoding="utf-8")
+
+    labels_path = tmp_path / "threads.labels.json"
+    labels_path.write_text(json.dumps({
+        "threads:aaa": "yes", "threads:bbb": "no",
+    }), encoding="utf-8")
+
+    result = il.import_set("threads", labels_path, batch_dir=batch_dir, fixtures_dir=fixtures_dir,
+                            now_iso="2026-09-28T00:00:00+00:00")
+
+    counts = json.loads(counts_path.read_text(encoding="utf-8"))
+    entry = counts["threads"]
+    assert entry["n"] == 2
+    assert entry["positives"] == 1
+    assert entry["negatives"] == 1
+    assert entry["label_source_breakdown"] == {"owner": 2}
+    # untouched fields from the original export preserved
+    assert entry["database"] == "fieldsight"
+    assert entry["exported_at"] == "2026-09-01T00:00:00+00:00"
+    assert entry["exclusions"] == {"orphaned_parent": 1}
+    assert result["counts"]["n"] == 2
