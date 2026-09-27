@@ -30,8 +30,11 @@ vw = pytest.importorskip("lambda_voiceprint_writer", reason="requires psycopg")
 CO = "11111111-1111-1111-1111-111111111111"
 VP = "22222222-2222-2222-2222-222222222222"
 PROP = "33333333-3333-3333-3333-333333333333"
-SESSION = "Benl1_2026-08-13_11-49-00_sid9db9293e82b94a4d9611572b1233f82d"
-SRC = "Benl1_2026-08-13_11-49-00_off0.0_to60.0_srcwav.json"
+# The shape the proposals table ACTUALLY stores: the canonical key, which carries no
+# date. This fixture used to hold a full dated spelling, and that is why a real 400 --
+# `speaker_corrections` refusing a session id with no date -- passed every test here.
+SESSION = "sid9db9293e82b94a4d9611572b1233f82d"
+SRC = "Benl1_2026-08-13_11-49-00_sid9db9293e82b94a4d9611572b1233f82d_c0000_off0.0_to60.0_srcwav.json"
 
 CALLER = {"id": "u-1", "cognito_sub": "sub-1", "company_id": CO, "email": "a@x.nz",
           "first_name": "Ada", "last_name": "L", "folder_name": "Ada_L",
@@ -39,8 +42,24 @@ CALLER = {"id": "u-1", "cognito_sub": "sub-1", "company_id": CO, "email": "a@x.n
 
 
 class FakeConn:
+    #: Every `conn.transaction()` block's outcome: "commit" or "rollback".
+    outcomes = []
+
     def __enter__(self):
         return self
+
+    def transaction(self):
+        conn = self
+
+        class _Tx:
+            def __enter__(self):
+                return conn
+
+            def __exit__(self, exc_type, *a):
+                FakeConn.outcomes.append("rollback" if exc_type else "commit")
+                return False
+
+        return _Tx()
 
     def __exit__(self, *a):
         return False
@@ -182,3 +201,25 @@ def test_closing_the_dialog_is_not_a_decision_this_route_accepts(wired):
         resp = org.lambda_handler(_event(bad), None)
         assert resp["statusCode"] == 400, repr(bad) + " was accepted as a decision"
     assert wired == []
+
+
+def test_a_confirmation_returns_what_a_rename_returns(wired):
+    """Measured on TEST 2026-09-27: "Yes, it's them" came back 400 and named nobody."""
+    resp = org.lambda_handler(_event("confirmed"), None)
+    assert resp["statusCode"] == 202, resp
+    assert wired and wired[0]["correction"]["display_name"] == "Ben Lin"
+
+
+def test_a_refused_correction_leaves_the_proposal_pending(wired, monkeypatch):
+    """The decision and the correction commit together or not at all.
+
+    On TEST the proposal was flipped to `confirmed` and THEN the correction was refused, so
+    the row claimed a confirmation that named nobody and, no longer pending, could never be
+    answered again.
+    """
+    FakeConn.outcomes = []
+    monkeypatch.setattr(org, "speaker_corrections",
+                        lambda conn, caller, sb, event: org.error("refused", 400))
+    resp = org.lambda_handler(_event("confirmed"), None)
+    assert resp["statusCode"] == 400
+    assert FakeConn.outcomes == ["rollback"], FakeConn.outcomes

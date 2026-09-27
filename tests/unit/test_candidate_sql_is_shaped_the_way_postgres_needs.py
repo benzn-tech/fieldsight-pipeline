@@ -93,3 +93,34 @@ def test_no_admission_threshold_hides_in_the_module():
         f"bare float constant(s) {floats} in the candidate module. If one of these is a "
         f"similarity cut, it is the thing this line has refused to invent without measured "
         f"support; if it is something else, name it and exclude it here deliberately")
+
+
+def test_a_passage_already_named_as_this_person_is_not_offered():
+    """On TEST 2026-09-27 all five questions were about passages the transcript already
+    called Sam Yu: the rename that stored the vector had just propagated the name over the
+    very session the search then ranked highest."""
+    sql = _statements()
+    assert "NOT EXISTS ( SELECT 1 FROM speaker_turn_names n" in sql
+    assert "n.superseded_at IS NULL" in sql
+    # By id OR by name: a propagated row carries the name and no voiceprint id.
+    assert "n.voiceprint_id = %s OR n.display_name = (" in sql
+    # Not LIKE: filenames are full of underscores, which LIKE reads as wildcards.
+    assert "split_part(n.turn_ref, '@', 1)" in sql
+
+
+def test_every_placeholder_has_a_parameter():
+    """A placeholder added to the text and not to the tuple is a runtime error on the first
+    real call -- and the double does not count them."""
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(lgc))
+    for call in ast.walk(tree):
+        if not (isinstance(call, ast.Call) and getattr(call.func, "attr", "") == "execute"
+                and len(call.args) == 2):
+            continue
+        text = "".join(n.value for n in ast.walk(call.args[0])
+                       if isinstance(n, ast.Constant) and isinstance(n.value, str))
+        if "WITH person" in text:
+            assert text.count("%s") == len(call.args[1].elts)
+            return
+    raise AssertionError("candidate query not found")
