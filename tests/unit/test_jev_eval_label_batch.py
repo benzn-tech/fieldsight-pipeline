@@ -686,3 +686,31 @@ def test_import_labels_refreshes_counts_preserving_existing_fields(tmp_path, fix
     assert entry["exported_at"] == "2026-09-01T00:00:00+00:00"
     assert entry["exclusions"] == {"orphaned_parent": 1}
     assert result["counts"]["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 4, D18: --work-class-stratum-limit default 150, plus a Python-side
+# safety check estimating response size before any transaction opens.
+# ---------------------------------------------------------------------------
+
+def test_default_work_class_stratum_limit_is_150():
+    assert sb.DEFAULT_WORK_CLASS_STRATUM_LIMIT == 150
+
+
+def test_check_stratum_limit_safe_accepts_the_default():
+    sb.check_stratum_limit_safe(sb.DEFAULT_WORK_CLASS_STRATUM_LIMIT)  # must not raise
+
+
+def test_check_stratum_limit_safe_rejects_a_too_large_limit():
+    with pytest.raises(sb.BatchSizeError, match="1 MiB"):
+        sb.check_stratum_limit_safe(1000)
+
+
+def test_sample_work_class_refuses_before_opening_a_transaction(monkeypatch):
+    def _boom(*args, **kwargs):
+        raise AssertionError("must not begin a transaction for an unsafe stratum_limit")
+
+    monkeypatch.setattr(sb.ex, "_begin_transaction", _boom)
+
+    with pytest.raises(sb.BatchSizeError):
+        sb.sample_work_class("fieldsight_test", stratum_limit=1000)

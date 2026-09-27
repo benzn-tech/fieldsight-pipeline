@@ -143,8 +143,48 @@ DEFAULT_SEED = 0
 # 1 MiB. `sql_work_class_topics_stratum` bounds the classifier's whole-history
 # scan to this many days (a flag, not hardcoded), and `k` (the per-stratum
 # LIMIT) below is sized with headroom over what `stratify_work_class` needs.
+# Fix wave 4, D18: default lowered 500 -> 150 (still well over what
+# `stratify_work_class` ever draws from one stratum) and paired with a
+# Python-side safety check (`_check_stratum_limit_safe`) rather than relying
+# on the 1,000-char SQL truncation alone -- a caller can still pass a higher
+# `--work-class-stratum-limit` and get a clear, pre-flight error instead of a
+# 1 MiB-response failure discovered mid-export.
 DEFAULT_WORK_CLASS_WINDOW_DAYS = 365
-DEFAULT_WORK_CLASS_STRATUM_LIMIT = 500
+DEFAULT_WORK_CLASS_STRATUM_LIMIT = 150
+
+# Fix wave 4, D18: a generous per-row byte estimate for one
+# `sql_work_class_topics_stratum` row -- title (up to ~200 bytes in
+# practice, no hard cap in schema) + the 1,000-char (up to ~3,000 bytes
+# worst-case UTF-8) truncated summary + category/verdict/confidence/uuid
+# columns + JSON/Data-API framing overhead per field. Deliberately generous
+# (rounds up) so the safety check errs toward refusing rather than passing
+# through a response that then hits the real 1 MiB cap.
+ESTIMATED_MAX_ROW_BYTES = 4000
+# ~900 KB, a safety margin under the RDS Data API's 1 MiB (1,048,576 byte)
+# single-statement response cap.
+MAX_RESPONSE_BYTES_ESTIMATE = 900_000
+
+
+class BatchSizeError(ValueError):
+    """Raised when a requested `--work-class-stratum-limit` would risk
+    exceeding the RDS Data API's ~1 MiB single-statement response cap,
+    estimated from row count x a generous per-row byte estimate (fix wave
+    4, D18) -- a clear, pre-flight error instead of discovering the failure
+    mid-export."""
+
+
+def check_stratum_limit_safe(stratum_limit: int) -> None:
+    estimated_bytes = stratum_limit * ESTIMATED_MAX_ROW_BYTES
+    if estimated_bytes > MAX_RESPONSE_BYTES_ESTIMATE:
+        max_safe = MAX_RESPONSE_BYTES_ESTIMATE // ESTIMATED_MAX_ROW_BYTES
+        raise BatchSizeError(
+            f"--work-class-stratum-limit={stratum_limit} estimates "
+            f"~{estimated_bytes:,} bytes for one stratum query "
+            f"({ESTIMATED_MAX_ROW_BYTES:,} bytes/row x {stratum_limit} rows), over the "
+            f"~{MAX_RESPONSE_BYTES_ESTIMATE:,}-byte safety margin under the RDS Data "
+            f"API's 1 MiB single-statement response cap. Use "
+            f"--work-class-stratum-limit <= {max_safe} instead."
+        )
 
 # Bounds on the threads pair-generation work (fix round 1, Important #2):
 # `score_pair` rebuilds its IDF map over the whole per-site corpus on every
@@ -788,6 +828,10 @@ def sample_work_class(database: str, *, size: int = DEFAULT_SIZE, seed: int = DE
                        window_days: int = DEFAULT_WORK_CLASS_WINDOW_DAYS,
                        stratum_limit: int = DEFAULT_WORK_CLASS_STRATUM_LIMIT,
                        profile: str = ex.DEFAULT_PROFILE, region: str = ex.DEFAULT_REGION) -> dict:
+    # Fix wave 4, D18: checked BEFORE opening a transaction / making any aws
+    # call -- a bad --work-class-stratum-limit fails fast and cheaply.
+    check_stratum_limit_safe(stratum_limit)
+
     tx = ex._begin_transaction(database, profile, region)
     try:
         # Fix wave 3, I3: four bounded per-stratum queries (windowed to
