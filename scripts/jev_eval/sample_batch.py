@@ -41,13 +41,20 @@ reimplemented) -- never a re-derived scorer:
   misses) in one pass.
 - A separate harvest produces the "low" stratum: pairs scoring BELOW
   `LOWERED_FLOOR` on the same `score_pair` but sharing at least one title
-  token. This harvest applies `find_candidates`' eligibility rules WHERE THEY
-  APPLY (dispatch instruction, fix round 1): `open_items > 0` on the LATER
-  topic, and the gap capped at `thread_match.MAX_GAP_DAYS` -- the same two
-  gates `find_candidates` itself enforces. It does NOT require `open_items`
-  on the EARLIER side, which is the one respect in which it differs from
-  `find_candidates` (that asymmetry is what lets a topic with no open work of
-  its own still serve as a "why did you say no to this" hard negative).
+  token. This harvest applies `find_candidates`' FULL eligibility (fix round 2
+  correction -- fix round 1's "not on the earlier side" was wrong): `open_items
+  > 0` on BOTH the later topic AND the earlier topic, plus the gap capped at
+  `thread_match.MAX_GAP_DAYS` -- exactly the same gates `find_candidates`
+  itself enforces, and the same gate `repositories.threads.candidate_corpus`'s
+  own SQL applies before a topic ever reaches the corpus
+  (`HAVING count(a.id) FILTER (WHERE a.status='open') > 0`). An earlier topic
+  with zero open items is one the real matcher could never propose at ANY
+  score -- it is not a hard negative, it is a pair the matcher never sees, so
+  admitting it would defeat the stratum's purpose. The low stratum differs
+  from `find_candidates` ONLY in the score band it keeps (below
+  `LOWERED_FLOOR` instead of at/above it) and in NOT requiring the pair's
+  score to clear any floor -- eligibility itself (gap, open work on both
+  sides) is identical.
   Cost is bounded two ways (fix round 1, Important #2): `cap_topics_per_site`
   keeps at most `--max-topics-per-site` (default 200) of the MOST RECENT
   topics per site before any pair is generated or scored, and for each later
@@ -254,11 +261,17 @@ def generate_thread_pairs(topics_by_site: dict, *,
     High/mid strata come from the REAL `thread_match.find_candidates` with a
     lowered floor (its own eligibility rules apply unmodified). The low
     stratum is harvested separately with the REAL `thread_match.score_pair`,
-    applying `find_candidates`' eligibility WHERE IT APPLIES (dispatch
-    instruction, fix round 1): `open_items > 0` on the LATER topic, and the
-    gap capped at `thread_match.MAX_GAP_DAYS` -- but NOT `open_items` on the
-    earlier side, so a topic with no open work of its own can still surface
-    as a hard negative.
+    applying `find_candidates`' FULL eligibility (fix round 2 correction --
+    round 1 wrongly exempted the earlier side): `open_items > 0` on BOTH the
+    later topic and the earlier topic, and the gap capped at
+    `thread_match.MAX_GAP_DAYS`. `find_candidates` itself
+    (src/thread_match.py) never proposes an earlier topic with no open
+    items, and `candidate_corpus`'s own SQL (src/repositories/threads.py,
+    `HAVING ... open_items > 0`) never puts one in the corpus to begin with
+    -- so a pair whose earlier side has zero open items is not a hard
+    negative, it is one the real matcher could never see at any score. The
+    low stratum differs from `find_candidates` only in which score band it
+    keeps, not in eligibility.
 
     Bounded (fix round 1, Important #2): for each later topic, at most
     `max_pairs_per_topic` of its eligible earlier topics are scored, chosen
@@ -307,6 +320,14 @@ def generate_thread_pairs(topics_by_site: dict, *,
                     continue
                 if (later["id"], earlier["id"]) in seen_high_mid:
                     continue
+                if not (earlier.get("open_items") or 0):
+                    continue  # eligibility: open_items on the EARLIER topic too --
+                    # find_candidates (src/thread_match.py:173) skips any candidate
+                    # with no open work, and candidate_corpus's own SQL (src/
+                    # repositories/threads.py, HAVING open_items > 0) never puts a
+                    # topic with none into the corpus in the first place. The real
+                    # matcher could never propose this pair at ANY score, so it is
+                    # not a hard negative -- it is one the matcher never sees.
                 earlier_date = _as_date(earlier.get("report_date"))
                 if earlier_date is None or earlier_date >= later_date:
                     continue

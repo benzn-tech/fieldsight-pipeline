@@ -46,12 +46,12 @@ def _synthetic_thread_pool():
     - t2/t1: same distinctive subject ("door hardware"), both have open work,
       21 day gap -> high stratum (score >= thread_match.MIN_SCORE).
     - t4/t3: weaker overlap, still eligible -> mid stratum.
-    - t6/t5: below the lowered floor, but share a title token; t5 (the
-      EARLIER side) has zero open items so find_candidates would never
-      surface it, but the low-stratum harvest still applies its own
-      eligibility -- open_items on the LATER topic (t6 has 1) and the gap
-      capped at thread_match.MAX_GAP_DAYS (39 days here, comfortably under
-      the 45-day cap) -- so it is eligible for that harvest.
+    - t6/t5: below the lowered floor, but share a title token ("documentation");
+      both sides carry open work and the gap (39 days) sits comfortably under
+      thread_match.MAX_GAP_DAYS (45) -- i.e. this pair meets find_candidates'
+      FULL eligibility, it just scores below LOWERED_FLOOR. This is what a
+      genuine low-stratum hard negative looks like: the matcher COULD have
+      proposed it, and would have said no on the words alone.
     """
     return [
         _topic("t1", "Door hardware ordered", "Handles and hinges ordered for level 2.",
@@ -66,7 +66,7 @@ def _synthetic_thread_pool():
                      "toolbox crane inspection ladder harness",
                "General discussion scaffold permits induction paperwork roster crane "
                "lift plan review harness checklist survey.",
-               "2026-04-01", open_items=0),
+               "2026-04-01", open_items=1),
         _topic("t6", "Documentation follow-up weather delay reporting insurance claim "
                      "concrete pour timeline budget variance",
                "Follow-up weather delay reporting insurance claim concrete pour timeline "
@@ -80,11 +80,7 @@ def test_generate_thread_pairs_produces_all_three_strata():
     pairs, diagnostics = sb.generate_thread_pairs(sb.group_by_site(topics))
     strata = {sb._stratum_for_score(p["score"]) for p in pairs}
     assert "high" in strata or "mid" in strata  # eligible pairs found
-    assert "low" in strata  # ineligible-but-token-sharing pair found
-    # the t5/t6 pair must be present despite t5 having zero open items --
-    # find_candidates would never surface it (both sides need open_items),
-    # but the low-stratum harvest only requires open_items on the LATER
-    # topic (t6), so it still gets scored.
+    assert "low" in strata  # eligible-but-below-floor pair found
     low_pairs = [p for p in pairs if sb._stratum_for_score(p["score"]) == "low"]
     assert any(p["later"]["id"] == "t6" and p["earlier"]["id"] == "t5" for p in low_pairs)
     assert "s1" in diagnostics
@@ -92,8 +88,8 @@ def test_generate_thread_pairs_produces_all_three_strata():
     assert diagnostics["s1"]["low_pairs_scored"] > 0
 
 
-def test_generate_thread_pairs_low_stratum_respects_max_gap_and_open_items():
-    # Same as the pair above, but t6 now sits 100 days after t5 -- beyond
+def test_generate_thread_pairs_low_stratum_respects_full_eligibility():
+    # Same base pair as above, but t6 now sits 100 days after t5 -- beyond
     # thread_match.MAX_GAP_DAYS (45) -- so it must never appear in ANY
     # stratum, low included.
     topics = _synthetic_thread_pool()
@@ -103,14 +99,27 @@ def test_generate_thread_pairs_low_stratum_respects_max_gap_and_open_items():
     pairs, _ = sb.generate_thread_pairs(sb.group_by_site(topics))
     assert not any(p["later"]["id"] == "t6" and p["earlier"]["id"] == "t5" for p in pairs)
 
-    # And: a later topic with zero open_items contributes NO low-stratum
-    # pairs at all, no matter how much title vocabulary it shares.
+    # A later topic with zero open_items contributes NO low-stratum pairs at
+    # all, no matter how much title vocabulary it shares.
     topics2 = _synthetic_thread_pool()
     for t in topics2:
         if t["id"] == "t6":
             t["open_items"] = 0
     pairs2, _ = sb.generate_thread_pairs(sb.group_by_site(topics2))
     assert not any(p["later"]["id"] == "t6" for p in pairs2)
+
+    # Fix round 2: an EARLIER topic with zero open_items must ALSO never
+    # appear in any stratum -- find_candidates (src/thread_match.py:173)
+    # would never propose it, and candidate_corpus's own SQL (src/
+    # repositories/threads.py, HAVING open_items > 0) would never have put
+    # it in the corpus at all, so it is not a hard negative -- it is a pair
+    # the real matcher can never see.
+    topics3 = _synthetic_thread_pool()
+    for t in topics3:
+        if t["id"] == "t5":
+            t["open_items"] = 0
+    pairs3, _ = sb.generate_thread_pairs(sb.group_by_site(topics3))
+    assert not any(p["earlier"]["id"] == "t5" for p in pairs3)
 
 
 def test_stratify_thread_pairs_fills_quotas_and_is_deterministic():
