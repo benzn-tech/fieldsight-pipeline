@@ -1,0 +1,584 @@
+"""Export labelled decision sets for the Jev shadow evaluation (Track A, Task 1).
+
+READ-ONLY. Every query below is a SELECT (or a WITH ... SELECT), run inside a
+begin-transaction / execute-statement / rollback-transaction cycle (the same
+RDS Data API pattern `scripts/verify_programme_schema.py` uses for its own
+read-only probes) so the script cannot write by accident even though nothing
+here needs to. The transaction is ALWAYS rolled back, in a `finally`, whether
+the export succeeded or one of the execute-statement calls raised.
+
+What gets written, all under `scripts/fixtures/jev_eval/` (gitignored --
+only `counts.json` is tracked):
+
+- `programme_match.jsonl`, `threads.jsonl`, `work_class.jsonl` -- one row per
+  decided (confirmed/rejected) human label, in the shape
+  `{"set", "id", "label", "features", "site_id", "company_id", "decided_at",
+  "baseline"}`. `features` is the exact nested shape `scripts/jev_eval/state.py`
+  consumes; `baseline` carries the stored gate output for the baseline arm and
+  is never fed to `build_state` (kept out of `features` on purpose --
+  `match_evidence` in particular can carry quoted transcript text and is
+  never selected at all).
+- `name_aliases.json` -- the `{wrong_term, right_term, kind}` rows
+  `build_state`'s masker consumes, for the companies actually present in the
+  export: active `name_aliases` rows, one `kind="person"` row per user
+  mapping their full name to their first name, and one `kind="company"` row
+  per company name (protects it from the generic two-word masking pass).
+- `counts.json` -- the only fixture file this repo commits. Per set: `n`,
+  `positives`, `negatives`, `descriptive_only` (n < 30), `database`,
+  `exported_at`, and `exclusions` (rows dropped and why). Top-level
+  `route_note` records that this is a read path.
+
+Database: `fieldsight_test` by default. `--database fieldsight` (prod) is
+refused unless `--allow-prod` is also given -- checked before any `aws` call
+is made, so a typo cannot touch prod's Data API even read-only.
+
+Threads' `earlier` side (controller ruling): `topic_thread_suggestions` has
+`topic_id` (the later topic) and exactly one of `thread_id` / `parent_topic_id`
+(migration 0032's CHECK). For `parent_topic_id`, `earlier` is that topic,
+directly. For `thread_id`, the row that set it (`lambda_item_writer.py`'s
+`_suggest_threads_inner`) picked `thread_id` because the CANDIDATE it scored
+highest (`best`, a row from `threads.candidate_corpus`) already had a
+`thread_id` of its own -- so the topic actually compared against is not
+recoverable from the suggestion row itself, only the thread it belongs to is.
+This export uses the EARLIEST topic on that thread (by `report_date`) as a
+stand-in for "the earlier restatement a human would see when confirming this
+link" -- the topic that anchored the thread in the first place. In practice
+this branch is inert on today's data: prod holds zero rows in `topic_threads`
+(2026-09-01 count), so no topic has ever had a `thread_id` to be picked as a
+`best` candidate, and the code handles it defensively rather than because it
+is exercised.
+
+Both `topic_id` and `parent_topic_id` on `topic_thread_suggestions` are
+`ON DELETE CASCADE` (migration 0032). Deleting either topic deletes the whole
+suggestion row, not just one side's join -- so a hard-deleted "later" topic
+makes its label vanish from the database entirely, uncountable from here;
+`counts.json` records that as `"deleted_topic_rows": "invisible (FK cascades)"`
+rather than a number it cannot actually produce. `classification_feedback.topic_id`
+(work_class) carries no FK at all, so a topic that later disappears leaves a
+feedback row whose join to `topics` comes back empty -- that case IS visible
+and IS counted (`exclusions.topic_missing`).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from scripts.verify_programme_schema import CLUSTER, SECRET
+
+DEFAULT_DATABASE = "fieldsight_test"
+PROD_DATABASE = "fieldsight"
+DEFAULT_PROFILE = "fieldsight-deployer"
+DEFAULT_REGION = "ap-southeast-2"
+
+FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "jev_eval"
+
+ROUTE_NOTE = "labels exported read-only; no rows written"
+
+MIN_N_FOR_CONCLUSIONS = 30
+
+SETS = ("programme_match", "threads", "work_class")
+
+
+# ---------------------------------------------------------------------------
+# SQL, one function per set -- pure, no I/O. Every string starts with SELECT
+# or WITH (asserted by tests/unit/test_jev_eval_export_shapes.py).
+# ---------------------------------------------------------------------------
+
+PROGRAMME_MATCH_COLUMNS = (
+    "id", "state", "decided_at", "report_date", "topic_title", "topic_summary",
+    "task_name", "task_status_before", "task_progress_before",
+    "suggested_status", "suggested_progress", "confidence", "task_id",
+    "site_id", "company_id",
+)
+
+
+def sql_programme_match() -> str:
+    """`programme_progress_suggestions` already holds the topic text the
+    matcher saw (task/programme rulings, `programme_suggestions.py:_COLS`),
+    so no join to `topics` is needed and topic-id churn is irrelevant here."""
+    return (
+        "SELECT s.id, s.state, s.decided_at, s.report_date, "
+        "s.topic_title, s.topic_summary, "
+        "s.task_name, s.task_status_before, s.task_progress_before, "
+        "s.suggested_status, s.suggested_progress, s.confidence, s.task_id, "
+        "s.site_id, si.company_id "
+        "FROM programme_progress_suggestions s "
+        "JOIN sites si ON si.id = s.site_id "
+        "WHERE s.state IN ('confirmed','rejected')"
+    )
+
+
+THREADS_COLUMNS = (
+    "id", "status", "score", "gap_days", "resolved_at",
+    "later_title", "later_summary", "later_date", "site_id", "company_id",
+    "sugg_thread_id", "sugg_parent_topic_id",
+    "parent_title", "parent_summary", "parent_date",
+    "thread_title", "thread_summary", "thread_date",
+)
+
+
+def sql_threads() -> str:
+    """See the module docstring for the `earlier` choice. `earliest_thread_topic`
+    picks, per thread, the topic with the lowest `report_date` (ties broken by
+    `id` for determinism) -- the topic that anchored the thread."""
+    return (
+        "WITH earliest_thread_topic AS ("
+        "    SELECT DISTINCT ON (thread_id) thread_id, id, title, summary, report_date "
+        "    FROM topics "
+        "    WHERE thread_id IS NOT NULL "
+        "    ORDER BY thread_id, report_date ASC, id ASC"
+        ") "
+        "SELECT s.id, s.status, s.score, s.gap_days, s.resolved_at, "
+        "       t.title AS later_title, t.summary AS later_summary, "
+        "       t.report_date AS later_date, t.site_id AS site_id, "
+        "       si.company_id AS company_id, "
+        "       s.thread_id AS sugg_thread_id, s.parent_topic_id AS sugg_parent_topic_id, "
+        "       p.title AS parent_title, p.summary AS parent_summary, "
+        "       p.report_date AS parent_date, "
+        "       et.title AS thread_title, et.summary AS thread_summary, "
+        "       et.report_date AS thread_date "
+        "FROM topic_thread_suggestions s "
+        "JOIN topics t ON t.id = s.topic_id "
+        "JOIN sites si ON si.id = t.site_id "
+        "LEFT JOIN topics p ON p.id = s.parent_topic_id "
+        "LEFT JOIN earliest_thread_topic et ON et.thread_id = s.thread_id "
+        "WHERE s.status IN ('confirmed','rejected')"
+    )
+
+
+WORK_CLASS_COLUMNS = (
+    "id", "human_verdict", "category", "classifier_verdict",
+    "classifier_confidence", "created_at", "topic_id", "title", "summary",
+    "site_id", "company_id",
+)
+
+
+def sql_work_class() -> str:
+    """`classification_feedback.topic_id` carries no FK, so a topic that has
+    since disappeared leaves the LEFT JOIN empty rather than cascading the
+    feedback row away -- that case is visible and counted (`topic_missing`)."""
+    return (
+        "SELECT cf.id, cf.human_verdict, "
+        "       COALESCE(cf.topic_category, t.category) AS category, "
+        "       cf.classifier_verdict, cf.classifier_confidence, cf.created_at, "
+        "       t.id AS topic_id, t.title, t.summary, t.site_id, si.company_id "
+        "FROM classification_feedback cf "
+        "LEFT JOIN topics t ON t.id = cf.topic_id "
+        "LEFT JOIN sites si ON si.id = t.site_id "
+        "WHERE cf.human_verdict IN ('confirm_non_work','reject_is_work','missed_personal')"
+    )
+
+
+NAME_ALIASES_COLUMNS = ("wrong_term", "right_term", "kind")
+
+
+def sql_name_aliases(company_ids) -> str:
+    """`company_ids` come from rows this same transaction already read back
+    from the Data API (trusted uuid strings), not user input -- string
+    interpolation here matches the practice in
+    `scripts/verify_programme_schema.py`."""
+    ids = ",".join(f"'{cid}'" for cid in company_ids)
+    return (
+        "SELECT wrong_term, right_term, kind FROM name_aliases "
+        f"WHERE status='active' AND company_id IN ({ids})"
+    )
+
+
+USERS_COLUMNS = ("first_name", "last_name")
+
+
+def sql_users(company_ids) -> str:
+    ids = ",".join(f"'{cid}'" for cid in company_ids)
+    return f"SELECT first_name, last_name FROM users WHERE company_id IN ({ids})"
+
+
+COMPANIES_COLUMNS = ("name",)
+
+
+def sql_companies(company_ids) -> str:
+    ids = ",".join(f"'{cid}'" for cid in company_ids)
+    return f"SELECT name FROM companies WHERE id IN ({ids})"
+
+
+# ---------------------------------------------------------------------------
+# RDS Data API record decoding -- pure.
+# ---------------------------------------------------------------------------
+
+def decode_field(value):
+    """One Data API typed-value dict -> a plain Python value."""
+    if not isinstance(value, dict):
+        return value
+    if value.get("isNull"):
+        return None
+    for key in ("stringValue", "longValue", "doubleValue", "booleanValue"):
+        if key in value:
+            return value[key]
+    return None
+
+
+def record_to_dict(columns, record) -> dict:
+    """One Data API record (a list of typed-value dicts, positional) plus the
+    column names in the same order as the SELECT -> a plain dict."""
+    return {col: decode_field(field) for col, field in zip(columns, record)}
+
+
+# ---------------------------------------------------------------------------
+# Row mappers -- pure. One Data API record (already decoded to a plain dict)
+# -> one output row, or an exclusion marker `{"_excluded": reason}`.
+# ---------------------------------------------------------------------------
+
+_LABEL_PROGRAMME_MATCH = {"confirmed": "yes", "rejected": "no"}
+_LABEL_THREADS = {"confirmed": "yes", "rejected": "no"}
+_LABEL_WORK_CLASS = {
+    "confirm_non_work": "yes",
+    "missed_personal": "yes",
+    "reject_is_work": "no",
+}
+
+
+def map_programme_match_row(rec: dict) -> dict:
+    label = _LABEL_PROGRAMME_MATCH.get(rec.get("state"))
+    if label is None:
+        return {"_excluded": "unmapped_state"}
+    features = {
+        "observation": {
+            "title": rec.get("topic_title"),
+            "summary": rec.get("topic_summary"),
+            "date": rec.get("report_date"),
+        },
+        "task": {
+            "name": rec.get("task_name"),
+            "status": rec.get("task_status_before"),
+            "progress_pct": rec.get("task_progress_before"),
+        },
+    }
+    baseline = {
+        "confidence": rec.get("confidence"),
+        "suggested_status": rec.get("suggested_status"),
+        "suggested_progress": rec.get("suggested_progress"),
+        "task_id": rec.get("task_id"),
+    }
+    return {
+        "set": "programme_match",
+        "id": rec.get("id"),
+        "label": label,
+        "features": features,
+        "site_id": rec.get("site_id"),
+        "company_id": rec.get("company_id"),
+        "decided_at": rec.get("decided_at"),
+        "baseline": baseline,
+    }
+
+
+def map_threads_row(rec: dict) -> dict:
+    label = _LABEL_THREADS.get(rec.get("status"))
+    if label is None:
+        return {"_excluded": "unmapped_status"}
+
+    if rec.get("sugg_parent_topic_id") is not None:
+        if rec.get("parent_title") is None:
+            return {"_excluded": "orphaned_parent"}
+        earlier = {
+            "title": rec.get("parent_title"),
+            "summary": rec.get("parent_summary"),
+            "date": rec.get("parent_date"),
+        }
+    elif rec.get("sugg_thread_id") is not None:
+        if rec.get("thread_title") is None:
+            return {"_excluded": "orphaned_thread"}
+        earlier = {
+            "title": rec.get("thread_title"),
+            "summary": rec.get("thread_summary"),
+            "date": rec.get("thread_date"),
+        }
+    else:
+        # migration 0032's CHECK forbids this; defensive only.
+        return {"_excluded": "malformed_target"}
+
+    features = {
+        "earlier": earlier,
+        "later": {
+            "title": rec.get("later_title"),
+            "summary": rec.get("later_summary"),
+            "date": rec.get("later_date"),
+        },
+        "gap_days": rec.get("gap_days"),
+    }
+    baseline = {"score": rec.get("score")}
+    return {
+        "set": "threads",
+        "id": rec.get("id"),
+        "label": label,
+        "features": features,
+        "site_id": rec.get("site_id"),
+        "company_id": rec.get("company_id"),
+        "decided_at": rec.get("resolved_at"),
+        "baseline": baseline,
+    }
+
+
+def map_work_class_row(rec: dict) -> dict:
+    if rec.get("topic_id") is None:
+        return {"_excluded": "topic_missing"}
+    label = _LABEL_WORK_CLASS.get(rec.get("human_verdict"))
+    if label is None:
+        return {"_excluded": "unmapped_verdict"}
+    features = {
+        "title": rec.get("title"),
+        "summary": rec.get("summary"),
+        "category": rec.get("category"),
+    }
+    baseline = {
+        "classifier_verdict": rec.get("classifier_verdict"),
+        "classifier_confidence": rec.get("classifier_confidence"),
+    }
+    return {
+        "set": "work_class",
+        "id": rec.get("id"),
+        "label": label,
+        "features": features,
+        "site_id": rec.get("site_id"),
+        "company_id": rec.get("company_id"),
+        "decided_at": rec.get("created_at"),
+        "baseline": baseline,
+    }
+
+
+MAPPERS = {
+    "programme_match": map_programme_match_row,
+    "threads": map_threads_row,
+    "work_class": map_work_class_row,
+}
+
+
+# ---------------------------------------------------------------------------
+# Alias fixture builder -- pure.
+# ---------------------------------------------------------------------------
+
+def _clean_term(term):
+    if term is None:
+        return None
+    term = str(term).strip()
+    return term or None
+
+
+def _is_word_char(ch: str) -> bool:
+    return ch.isalnum() or ch == "_"
+
+
+def _anchorable(term: str) -> bool:
+    """A term `state.py`'s `\\b...\\b` regex can actually anchor on: it must
+    start and end with a word character (single-character terms count)."""
+    if not term:
+        return False
+    return _is_word_char(term[0]) and _is_word_char(term[-1])
+
+
+def build_alias_rows(alias_rows: list, user_rows: list, company_rows: list) -> list:
+    """(a) active `name_aliases` rows as-is, (b) one person row per user
+    (full name -> first name), (c) one company row per company name.
+    De-duplicates on (wrong_term, right_term, kind); drops terms that are
+    blank after stripping or would not anchor with `\\b` in `state.py`."""
+    out = []
+    seen = set()
+
+    def _add(wrong, right, kind):
+        wrong = _clean_term(wrong)
+        right = _clean_term(right)
+        if wrong is None or right is None:
+            return
+        if not _anchorable(wrong) or not _anchorable(right):
+            return
+        key = (wrong, right, kind)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append({"wrong_term": wrong, "right_term": right, "kind": kind})
+
+    for row in alias_rows:
+        _add(row.get("wrong_term"), row.get("right_term"), row.get("kind"))
+
+    for row in user_rows:
+        first = _clean_term(row.get("first_name"))
+        if not first:
+            continue
+        last = _clean_term(row.get("last_name"))
+        full = f"{first} {last}".strip() if last else first
+        _add(full, first, "person")
+
+    for row in company_rows:
+        name = _clean_term(row.get("name"))
+        if name is None:
+            continue
+        _add(name, name, "company")
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Counts -- pure.
+# ---------------------------------------------------------------------------
+
+def summarize_set(set_name: str, rows: list, exclusions: dict, database: str) -> dict:
+    n = len(rows)
+    positives = sum(1 for r in rows if r["label"] == "yes")
+    negatives = sum(1 for r in rows if r["label"] == "no")
+    return {
+        "n": n,
+        "positives": positives,
+        "negatives": negatives,
+        "descriptive_only": n < MIN_N_FOR_CONCLUSIONS,
+        "database": database,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "exclusions": exclusions,
+    }
+
+
+# ---------------------------------------------------------------------------
+# I/O: the RDS Data API runner. Everything above this line is pure and
+# unit-tested without a database or the aws CLI.
+# ---------------------------------------------------------------------------
+
+def _aws(args: list):
+    result = subprocess.run(["aws"] + args, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip()[:4000])
+    return json.loads(result.stdout) if result.stdout.strip() else {}
+
+
+def _begin_transaction(database: str, profile: str, region: str) -> str:
+    return _aws([
+        "rds-data", "begin-transaction",
+        "--resource-arn", CLUSTER, "--secret-arn", SECRET,
+        "--database", database, "--profile", profile, "--region", region,
+        "--output", "json",
+    ])["transactionId"]
+
+
+def _execute(database: str, tx: str, sql: str, profile: str, region: str) -> dict:
+    return _aws([
+        "rds-data", "execute-statement",
+        "--resource-arn", CLUSTER, "--secret-arn", SECRET,
+        "--database", database, "--transaction-id", tx, "--sql", sql,
+        "--profile", profile, "--region", region, "--output", "json",
+    ])
+
+
+def _rollback(tx: str, profile: str, region: str) -> dict:
+    return _aws([
+        "rds-data", "rollback-transaction",
+        "--resource-arn", CLUSTER, "--secret-arn", SECRET,
+        "--transaction-id", tx, "--profile", profile, "--region", region,
+        "--output", "json",
+    ])
+
+
+def _process(result: dict, columns: tuple, mapper) -> tuple:
+    rows = []
+    exclusions: dict = {}
+    for record in result.get("records", []):
+        rec = record_to_dict(columns, record)
+        mapped = mapper(rec)
+        if "_excluded" in mapped:
+            reason = mapped["_excluded"]
+            exclusions[reason] = exclusions.get(reason, 0) + 1
+            continue
+        rows.append(mapped)
+    return rows, exclusions
+
+
+def _write_jsonl(path: Path, rows: list) -> None:
+    with open(path, "w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, sort_keys=True))
+            fh.write("\n")
+
+
+def _write_json(path: Path, payload) -> None:
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+def run_export(database: str, *, profile: str = DEFAULT_PROFILE,
+                region: str = DEFAULT_REGION, out_dir: Path | None = None) -> dict:
+    """Runs all three set queries plus the alias lookups inside ONE
+    transaction, always rolled back in `finally` -- this cannot write, even
+    if every statement in it is a SELECT."""
+    out_dir = out_dir or FIXTURES_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    tx = _begin_transaction(database, profile, region)
+    try:
+        counts: dict = {}
+        company_ids: set = set()
+
+        pm_result = _execute(database, tx, sql_programme_match(), profile, region)
+        pm_rows, pm_excl = _process(pm_result, PROGRAMME_MATCH_COLUMNS,
+                                    map_programme_match_row)
+        _write_jsonl(out_dir / "programme_match.jsonl", pm_rows)
+        counts["programme_match"] = summarize_set("programme_match", pm_rows, pm_excl, database)
+        company_ids.update(r["company_id"] for r in pm_rows if r.get("company_id"))
+
+        th_result = _execute(database, tx, sql_threads(), profile, region)
+        th_rows, th_excl = _process(th_result, THREADS_COLUMNS, map_threads_row)
+        th_excl.setdefault("deleted_topic_rows", "invisible (FK cascades)")
+        _write_jsonl(out_dir / "threads.jsonl", th_rows)
+        counts["threads"] = summarize_set("threads", th_rows, th_excl, database)
+        company_ids.update(r["company_id"] for r in th_rows if r.get("company_id"))
+
+        wc_result = _execute(database, tx, sql_work_class(), profile, region)
+        wc_rows, wc_excl = _process(wc_result, WORK_CLASS_COLUMNS, map_work_class_row)
+        _write_jsonl(out_dir / "work_class.jsonl", wc_rows)
+        counts["work_class"] = summarize_set("work_class", wc_rows, wc_excl, database)
+        company_ids.update(r["company_id"] for r in wc_rows if r.get("company_id"))
+
+        alias_rows: list = []
+        user_rows: list = []
+        company_rows: list = []
+        if company_ids:
+            ar = _execute(database, tx, sql_name_aliases(company_ids), profile, region)
+            alias_rows = [record_to_dict(NAME_ALIASES_COLUMNS, r) for r in ar.get("records", [])]
+            ur = _execute(database, tx, sql_users(company_ids), profile, region)
+            user_rows = [record_to_dict(USERS_COLUMNS, r) for r in ur.get("records", [])]
+            cr = _execute(database, tx, sql_companies(company_ids), profile, region)
+            company_rows = [record_to_dict(COMPANIES_COLUMNS, r) for r in cr.get("records", [])]
+
+        aliases = build_alias_rows(alias_rows, user_rows, company_rows)
+        _write_json(out_dir / "name_aliases.json", aliases)
+
+        counts["route_note"] = ROUTE_NOTE
+        _write_json(out_dir / "counts.json", counts)
+        return counts
+    finally:
+        _rollback(tx, profile, region)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--database", default=DEFAULT_DATABASE)
+    parser.add_argument("--allow-prod", action="store_true",
+                        help="required to target --database fieldsight")
+    parser.add_argument("--profile", default=DEFAULT_PROFILE)
+    parser.add_argument("--region", default=DEFAULT_REGION)
+    args = parser.parse_args(argv)
+
+    if args.database == PROD_DATABASE and not args.allow_prod:
+        print(
+            f"refusing --database {PROD_DATABASE!r} without --allow-prod "
+            "(this is prod)",
+            file=sys.stderr,
+        )
+        return 2
+
+    counts = run_export(args.database, profile=args.profile, region=args.region)
+    print(json.dumps(counts, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
