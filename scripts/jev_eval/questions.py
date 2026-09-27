@@ -70,13 +70,14 @@ def _clip01(value: float) -> float:
 
 def _noul(answers: dict, name: str) -> float:
     """Read `answers[name]["noul"]`, raising -- never defaulting to 0 -- if
-    the sub-answer is missing. A missing key here means the endpoint did not
-    answer a question the composite depends on; silently treating that as
-    "no" would quietly turn an API gap into a label."""
+    the sub-answer is missing or malformed (present but not a dict, so it
+    cannot carry a "noul" key at all). A missing/malformed key here means the
+    endpoint did not answer a question the composite depends on; silently
+    treating that as "no" would quietly turn an API gap into a label."""
     try:
         return answers[name]["noul"]
-    except KeyError as exc:
-        raise JevQuestionsError(f"missing required sub-answer: {name!r}") from exc
+    except (KeyError, TypeError) as exc:
+        raise JevQuestionsError(f"missing or malformed sub-answer: {name!r}") from exc
 
 
 def _stable_index(key, n: int) -> int:
@@ -87,10 +88,31 @@ def _stable_index(key, n: int) -> int:
 
 
 _WORD_RE = re.compile(r"[A-Za-z0-9]+")
+_PUNCT_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
+_WHITESPACE_RE = re.compile(r"\s+")
 
 
 def _words(text: str) -> set:
     return set(_WORD_RE.findall(text.lower()))
+
+
+def _normalise(text: str) -> str:
+    """Casefold, strip punctuation, and collapse whitespace, so two donor
+    texts that only differ in case/punctuation/spacing are recognised as the
+    same text -- used to reject a donor that would produce a no-op control
+    (e.g. two sites both naming a task "Site establishment.")."""
+    text = _PUNCT_RE.sub("", text.casefold())
+    return _WHITESPACE_RE.sub(" ", text).strip()
+
+
+def _assert_changed(original, new, description: str) -> None:
+    """Cheap post-condition: raise if a control ended up producing the exact
+    same value it started with. Defense in depth behind the donor-exclusion
+    filters above -- an unchanged control would silently pass the Task 7
+    "control differs from state" check."""
+    if original == new:
+        raise JevQuestionsError(
+            f"control produced no change in {description}; refusing a no-op control")
 
 
 # ---------------------------------------------------------------------------
@@ -168,21 +190,29 @@ def _broad_score_programme_match(answers: dict) -> float:
 def _control_programme_match(state: dict, donors: list, key) -> dict:
     """Replace only `task.name` with a donor's `task.name`, preferring a
     donor whose task name shares a word with the original (the "same trade
-    word if possible" rule), falling back to any donor with a usable name."""
+    word if possible" rule), falling back to any donor with a usable name.
+
+    Donors whose task name normalises to the same text as the original are
+    excluded before either pool is built: generic task names ("Site
+    establishment") recur across programmes, and picking one of those would
+    produce a no-op control that silently passes the Task 7 control check."""
+    original_name = None
+    task = state.get("task")
+    if isinstance(task, dict):
+        original_name = task.get("name")
+    original_norm = _normalise(original_name) if original_name else None
+
     candidates = [
         donor for donor in donors
         if isinstance(donor, dict)
         and isinstance(donor.get("task"), dict)
         and donor["task"].get("name")
+        and (original_norm is None or _normalise(donor["task"]["name"]) != original_norm)
     ]
     if not candidates:
         raise JevQuestionsError(
-            "programme_match control: no donor has a usable task.name")
-
-    original_name = None
-    task = state.get("task")
-    if isinstance(task, dict):
-        original_name = task.get("name")
+            "programme_match control: no donor has a usable task.name "
+            "distinct from the original")
 
     preferred = []
     if original_name:
@@ -198,6 +228,7 @@ def _control_programme_match(state: dict, donors: list, key) -> dict:
     new_state = copy.deepcopy(state)
     new_state.setdefault("task", {})
     new_state["task"]["name"] = donor["task"]["name"]
+    _assert_changed(original_name, new_state["task"]["name"], "task.name")
     return new_state
 
 
@@ -266,15 +297,34 @@ def _broad_score_threads(answers: dict) -> float:
 
 def _control_threads(state: dict, donors: list, key) -> dict:
     """Replace only `earlier` with a donor's `earlier`, preferring the donor
-    whose `gap_days` is closest to the row's."""
-    candidates = [
-        donor for donor in donors
-        if isinstance(donor, dict) and isinstance(donor.get("earlier"), dict)
-        and donor["earlier"]
-    ]
+    whose `gap_days` is closest to the row's.
+
+    Donors whose `earlier.title` normalises to the same text as the
+    original's `earlier.title` are excluded before either pool is built --
+    the same no-op-control risk as programme_match's task name (generic
+    topic titles recur, e.g. "Site walk")."""
+    original_earlier = state.get("earlier")
+    original_title = None
+    if isinstance(original_earlier, dict):
+        original_title = original_earlier.get("title")
+    original_title_norm = _normalise(original_title) if original_title else None
+
+    def _usable(donor):
+        if not (isinstance(donor, dict) and isinstance(donor.get("earlier"), dict)
+                and donor["earlier"]):
+            return False
+        if original_title_norm is None:
+            return True
+        donor_title = donor["earlier"].get("title")
+        if not donor_title:
+            return True
+        return _normalise(donor_title) != original_title_norm
+
+    candidates = [donor for donor in donors if _usable(donor)]
     if not candidates:
         raise JevQuestionsError(
-            "threads control: no donor has a usable 'earlier' topic")
+            "threads control: no donor has a usable 'earlier' topic "
+            "distinct from the original")
 
     original_gap = state.get("gap_days")
     preferred = []
@@ -295,6 +345,7 @@ def _control_threads(state: dict, donors: list, key) -> dict:
 
     new_state = copy.deepcopy(state)
     new_state["earlier"] = copy.deepcopy(donor["earlier"])
+    _assert_changed(original_earlier, new_state["earlier"], "earlier")
     return new_state
 
 
@@ -358,9 +409,9 @@ def _broad_score_work_class(answers: dict) -> float:
     try:
         probabilities = answers["work_class"]["probabilities"]
         return _clip01(probabilities["non_work"])
-    except KeyError as exc:
+    except (KeyError, TypeError) as exc:
         raise JevQuestionsError(
-            "missing required broad answer: 'work_class' -> "
+            "missing or malformed required broad answer: 'work_class' -> "
             "probabilities['non_work']") from exc
 
 
@@ -409,6 +460,9 @@ def question_hash(set_name: str, arm: str) -> str:
     """sha256 hex digest of the canonical JSON of `QUESTION_SETS[set_name][arm]`
     (`arm` is `"broad"` or `"decomposed"`), so a results row can be stamped
     with exactly which question text produced it."""
+    if arm not in ("broad", "decomposed"):
+        raise JevQuestionsError(
+            f"question_hash only supports 'broad' or 'decomposed' arms, got {arm!r}")
     try:
         questions = QUESTION_SETS[set_name][arm]
     except KeyError as exc:

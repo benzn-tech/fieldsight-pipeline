@@ -165,6 +165,18 @@ def test_question_hash_raises_for_unknown_set_or_arm():
         question_hash("programme_match", "not_an_arm")
 
 
+def test_question_hash_raises_for_arm_other_than_broad_or_decomposed():
+    # These are real keys in QUESTION_SETS[set_name] but not valid `arm`
+    # values for question_hash -- must be rejected explicitly, not produce
+    # a TypeError from trying to json.dumps a function.
+    with pytest.raises(JevQuestionsError):
+        question_hash("programme_match", "composite")
+    with pytest.raises(JevQuestionsError):
+        question_hash("programme_match", "control")
+    with pytest.raises(JevQuestionsError):
+        question_hash("programme_match", "broad_score")
+
+
 # ---------------------------------------------------------------------------
 # composites
 # ---------------------------------------------------------------------------
@@ -187,6 +199,15 @@ def test_programme_match_composite_raises_on_missing_sub_answer():
     composite = QUESTION_SETS["programme_match"]["composite"]
     with pytest.raises(JevQuestionsError):
         composite(_noul_answers(same_work_item=1.0, task_named=1.0))  # same_trade missing
+
+
+def test_composite_raises_jevquestionserror_when_sub_answer_is_not_a_dict():
+    composite = QUESTION_SETS["programme_match"]["composite"]
+    with pytest.raises(JevQuestionsError):
+        # same_work_item is a bare float, not {"noul": ...} -- would raise a
+        # bare TypeError on subscript if not caught explicitly.
+        composite({"same_work_item": 0.5, "task_named": {"noul": 1.0},
+                    "same_trade": {"noul": 1.0}})
 
 
 def test_threads_composite_boundaries_and_clipping():
@@ -266,6 +287,17 @@ def test_work_class_broad_score_raises_if_probabilities_missing():
         broad_score({})
 
 
+def test_work_class_broad_score_raises_jevquestionserror_when_not_a_dict():
+    broad_score = QUESTION_SETS["work_class"]["broad_score"]
+    # probabilities present but not a dict -- subscripting raises TypeError,
+    # not KeyError, and must still surface as JevQuestionsError.
+    with pytest.raises(JevQuestionsError):
+        broad_score({"work_class": {"probabilities": ["work", "non_work"]}})
+    # the whole answer entry is a string, not a dict.
+    with pytest.raises(JevQuestionsError):
+        broad_score({"work_class": "non_work"})
+
+
 # ---------------------------------------------------------------------------
 # control: programme_match
 # ---------------------------------------------------------------------------
@@ -320,6 +352,40 @@ def test_programme_match_control_raises_with_no_usable_donor():
         control(state, [{"task": {}}, {"observation": {}}], key="row-4")
 
 
+def test_programme_match_control_never_picks_an_identical_task_name():
+    control = QUESTION_SETS["programme_match"]["control"]
+    state = {"task": {"name": "Site establishment"}}
+    donors = [
+        {"task": {"name": "Site establishment"}},  # identical -- must be excluded
+        {"task": {"name": "Level 3 slab pour"}},
+    ]
+    for k in ("row-a", "row-b", "row-c", "row-d", "row-e"):
+        result = control(state, donors, key=k)
+        assert result["task"]["name"] == "Level 3 slab pour"
+
+
+def test_programme_match_control_excludes_donor_name_equal_after_normalisation():
+    control = QUESTION_SETS["programme_match"]["control"]
+    state = {"task": {"name": "Site Establishment."}}
+    donors = [
+        {"task": {"name": "site   establishment"}},  # same after casefold/punct/whitespace
+        {"task": {"name": "Roof flashing repair"}},
+    ]
+    result = control(state, donors, key="row-f")
+    assert result["task"]["name"] == "Roof flashing repair"
+
+
+def test_programme_match_control_raises_when_only_identical_name_donors_exist():
+    control = QUESTION_SETS["programme_match"]["control"]
+    state = {"task": {"name": "Site establishment"}}
+    donors = [
+        {"task": {"name": "Site establishment"}},
+        {"task": {"name": "SITE ESTABLISHMENT!!"}},
+    ]
+    with pytest.raises(JevQuestionsError):
+        control(state, donors, key="row-g")
+
+
 # ---------------------------------------------------------------------------
 # control: threads
 # ---------------------------------------------------------------------------
@@ -359,6 +425,40 @@ def test_threads_control_raises_with_no_usable_donor():
         control(state, [], key="row-7")
     with pytest.raises(JevQuestionsError):
         control(state, [{"later": {"title": "x"}}], key="row-7")
+
+
+def test_threads_control_never_picks_an_identical_earlier_title():
+    control = QUESTION_SETS["threads"]["control"]
+    state = {"earlier": {"title": "Site walk"}}
+    donors = [
+        {"earlier": {"title": "Site walk"}},  # identical -- must be excluded
+        {"earlier": {"title": "Fence repair"}},
+    ]
+    for k in ("row-a", "row-b", "row-c", "row-d", "row-e"):
+        result = control(state, donors, key=k)
+        assert result["earlier"]["title"] == "Fence repair"
+
+
+def test_threads_control_excludes_donor_title_equal_after_normalisation():
+    control = QUESTION_SETS["threads"]["control"]
+    state = {"earlier": {"title": "Site Walk."}}
+    donors = [
+        {"earlier": {"title": "site   walk"}},  # same after casefold/punct/whitespace
+        {"earlier": {"title": "Roof inspection"}},
+    ]
+    result = control(state, donors, key="row-f")
+    assert result["earlier"]["title"] == "Roof inspection"
+
+
+def test_threads_control_raises_when_only_identical_title_donors_exist():
+    control = QUESTION_SETS["threads"]["control"]
+    state = {"earlier": {"title": "Site walk"}}
+    donors = [
+        {"earlier": {"title": "Site walk"}},
+        {"earlier": {"title": "SITE WALK!!"}},
+    ]
+    with pytest.raises(JevQuestionsError):
+        control(state, donors, key="row-g")
 
 
 # ---------------------------------------------------------------------------
