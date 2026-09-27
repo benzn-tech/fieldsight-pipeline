@@ -113,7 +113,12 @@ def test_a_resolved_person_is_keyed_on_their_identity():
     vp.upsert_profile(conn, CO, display_name="Clement", user_id=SUBJECT,
                       consent_basis="attestation", asserted_by=ASSERTER)
     select = next(s for s in conn.cur.sql if s.startswith("SELECT"))
-    assert "user_id = %s" in select and "display_name" not in select
+    assert "user_id = %s" in select
+    # The name appears only to adopt an EMPTY unlinked profile (a duplicate left by a
+    # refused enrolment); a same-name profile holding samples may be another person.
+    assert select.count("display_name") == 1
+    assert "display_name = %s AND NOT EXISTS (SELECT 1 FROM speaker_voiceprint_samples" \
+        in " ".join(select.split())
 
 
 def test_an_unresolved_name_duplicates_rather_than_merges():
