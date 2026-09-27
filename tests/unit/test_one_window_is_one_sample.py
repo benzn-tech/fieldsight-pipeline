@@ -1,0 +1,89 @@
+"""The same window of the same recording is stored once, however many times it arrives.
+
+On TEST (2026-09-27) six windows of one profile were each held twice with identical
+vectors: a passage renamed twice, a cluster propagated twice, and a harvested window later
+renamed on its own. Profiles match on the MEAN of their samples, so each of those counted
+double.
+
+The fix is a partial unique index (migration 0069) plus an upsert in `add_sample`. The
+double below never parses SQL, so these tests pin the TEXT: the conflict target must
+repeat the index's predicate exactly, or Postgres refuses to infer the index and every
+enrolment fails -- which no fake connection would notice.
+"""
+import re
+from pathlib import Path
+
+from repositories import voiceprints
+
+CO = "11111111-1111-1111-1111-111111111111"
+VP = "22222222-2222-2222-2222-222222222222"
+MIGRATION = (Path(__file__).resolve().parents[2] / "src" / "migrations"
+             / "0069_one_sample_per_window.sql")
+
+
+def _flat(s):
+    return " ".join(s.split())
+
+
+class _Cur:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def execute(self, sql, params=None):
+        self.conn.sqls.append(_flat(sql))
+        return self
+
+    def fetchone(self):
+        return {"status": "tentative", "id": "s1"}
+
+    def fetchall(self):
+        return []
+
+
+class _Conn:
+    def __init__(self):
+        self.sqls = []
+
+    def cursor(self, row_factory=None):
+        return _Cur(self)
+
+
+def _insert_sql():
+    conn = _Conn()
+    voiceprints.add_sample(conn, CO, VP, [0.1] * 192, source="correction", s3_key="k",
+                           window=(1.0, 11.0))
+    [sql] = [s for s in conn.sqls if s.startswith("INSERT INTO speaker_voiceprint_samples")]
+    return sql
+
+
+def _index_sql():
+    text = "\n".join(line.split("--")[0] for line in MIGRATION.read_text().splitlines())
+    m = re.search(r"CREATE UNIQUE INDEX[^;]*;", text)
+    assert m, "0069 no longer creates the unique index"
+    return _flat(m.group(0))
+
+
+def test_a_repeat_window_updates_instead_of_inserting_a_second_copy():
+    assert "ON CONFLICT" in _insert_sql()
+
+
+def test_the_conflict_target_is_the_index_that_0069_creates():
+    index = _index_sql()
+    cols = re.search(r"\(([^)]*)\) WHERE", index).group(1)
+    predicate = index.split(" WHERE ", 1)[1].rstrip(";").strip()
+    assert f"ON CONFLICT ({cols}) WHERE {predicate} DO UPDATE" in _insert_sql()
+
+
+def test_a_human_assertion_outranks_a_propagation_of_the_same_window():
+    # `source` is what separates "a person said so" from "the clustering suggested it" when
+    # a bad batch is deleted. A repeat may promote a propagation, never demote a correction.
+    sql = _insert_sql()
+    for col in ("source", "created_by", "correction_ref"):
+        assert (f"{col} = CASE WHEN EXCLUDED.source = 'correction' "
+                f"AND speaker_voiceprint_samples.source <> 'correction' "
+                f"THEN EXCLUDED.{col} ELSE speaker_voiceprint_samples.{col} END") in sql
+
+
+def test_the_collapse_keeps_the_correction_copy():
+    text = _flat(MIGRATION.read_text())
+    assert "ORDER BY (source = 'correction') DESC" in text
