@@ -109,6 +109,7 @@ import argparse
 import json
 import os
 import statistics
+import subprocess
 import sys
 import threading
 import time
@@ -763,6 +764,76 @@ def _print_score_table(all_scores: dict) -> None:
             )
 
 
+def _git_head_sha():
+    """Best-effort git HEAD sha for a `scores.json` provenance stamp. Never
+    raises: a checkout without git on PATH, or one that is not a git
+    worktree at all, gets `None` rather than blocking scoring, which only
+    reads files already on disk and has no other reason to fail here."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+    except Exception:  # noqa: BLE001 - provenance is best-effort, never fatal
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def _result_file_stats(results_dir: Path, set_name: str) -> tuple:
+    """Per-`(arm, run)` raw line count and row-after-dedup count for
+    `set_name`'s result files, plus the sorted list of file names read.
+    Parses file names the same way `load_results` does (this IS the
+    provenance for that function's own dedup step), so the two can never
+    disagree about which files exist or how they're named. "Rows after
+    dedup" here means distinct ids in the file -- the same count
+    `load_results` would collapse each file down to, one row per id."""
+    files_read: list = []
+    per_arm_run: dict = {}
+    if not results_dir.exists():
+        return files_read, per_arm_run
+
+    prefix = f"{set_name}."
+    for path in sorted(results_dir.glob(f"{set_name}.*.run*.jsonl")):
+        rest = path.name[len(prefix):]
+        if not rest.endswith(".jsonl"):
+            continue
+        rest = rest[: -len(".jsonl")]
+        arm, sep, run_str = rest.rpartition(".run")
+        if not sep or not run_str.isdigit():
+            continue
+        run = int(run_str)
+
+        lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        ids = {json.loads(ln).get("id") for ln in lines}
+        files_read.append(path.name)
+        per_arm_run[f"{arm}.run{run}"] = {
+            "raw_lines": len(lines),
+            "rows_after_dedup": len(ids),
+        }
+    return files_read, per_arm_run
+
+
+def _provenance_for_set(set_name: str) -> dict:
+    """Everything a reader needs to tell a partial `scores.json` run from a
+    full one, without re-deriving it from the raw result files: which files
+    were read, per-(arm,run) raw-vs-deduped row counts, the git HEAD sha the
+    run happened at (best-effort, see `_git_head_sha`), when scoring ran, and
+    which of the five arms were expected but had no result file at all."""
+    files_read, per_arm_run = _result_file_stats(RESULTS_DIR, set_name)
+    arms_present = {key.split(".run")[0] for key in per_arm_run}
+    missing_arms = sorted(arm for arm in ALL_ARMS if arm not in arms_present)
+    return {
+        "results_files_read": files_read,
+        "per_arm_run": per_arm_run,
+        "git_head_sha": _git_head_sha(),
+        "scored_at": _now_iso(),
+        "arms_expected_but_missing": missing_arms,
+    }
+
+
 def _run_score(sets: list, args) -> int:
     """`--score`: load the already-written result files (via `load_results`,
     which collapses the append-only log to one row per (id, arm, run) --
@@ -786,6 +857,7 @@ def _run_score(sets: list, args) -> int:
         all_scores[set_name] = {
             "scores": scores,
             "baseline_threshold": BASELINE_THRESHOLDS[set_name],
+            "provenance": _provenance_for_set(set_name),
         }
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)

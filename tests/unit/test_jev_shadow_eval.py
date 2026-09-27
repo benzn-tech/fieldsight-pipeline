@@ -557,3 +557,53 @@ def test_score_mode_calls_neither_ask_nor_aws(tmp_path, monkeypatch):
 
     payload = json.loads((results_dir / "scores.json").read_text(encoding="utf-8"))
     assert payload["programme_match"]["baseline_threshold"] == lambda_programme_matcher.CONF_MIN
+
+
+# ---------------------------------------------------------------------------
+# --score mode: provenance (Task 9, carried item) -- a reader must be able to
+# tell a partial run from a full one from scores.json alone.
+# ---------------------------------------------------------------------------
+
+def test_scores_json_provenance_reports_files_dedup_and_missing_arms(tmp_path, monkeypatch):
+    fixtures_dir = tmp_path / "jev_eval"
+    fixtures_dir.mkdir(parents=True)
+    results_dir = fixtures_dir / "results"
+    monkeypatch.setattr(jse, "FIXTURES_DIR", fixtures_dir)
+    monkeypatch.setattr(jse, "RESULTS_DIR", results_dir)
+    monkeypatch.delenv("DECISIONS_API_KEY", raising=False)
+
+    # A retried id: the same id appears twice in the raw file (an old error
+    # line plus a later ok line) -- raw_lines must count both, rows_after_dedup
+    # must count it once, exactly like load_results' own collapse.
+    rows = (
+        [_result_row(f"y{i}", "yes", "baseline", 1, score=0.9) for i in range(4)]
+        + [_result_row(f"n{i}", "no", "baseline", 1, score=0.1) for i in range(3)]
+        + [_result_row("n0", "no", "baseline", 1, score=None,
+                        error="SomeError: transient")]
+    )
+    _write_results_jsonl(results_dir, "work_class", "baseline", 1, rows)
+
+    rc = jse.main(["--set", "work_class", "--score"])
+    assert rc == 0
+
+    payload = json.loads((results_dir / "scores.json").read_text(encoding="utf-8"))
+    prov = payload["work_class"]["provenance"]
+
+    assert prov["results_files_read"] == ["work_class.baseline.run1.jsonl"]
+    assert prov["per_arm_run"]["baseline.run1"]["raw_lines"] == 8
+    assert prov["per_arm_run"]["baseline.run1"]["rows_after_dedup"] == 7
+    assert set(prov["arms_expected_but_missing"]) == {
+        "broad", "decomposed", "control_broad", "control_decomposed",
+    }
+    assert "scored_at" in prov and prov["scored_at"]
+    # git_head_sha is best-effort: either a real sha string or None, never
+    # missing from the payload.
+    assert "git_head_sha" in prov
+
+
+def test_git_head_sha_tolerates_git_being_unavailable(monkeypatch):
+    def _explode(*a, **k):
+        raise FileNotFoundError("git not found")
+
+    monkeypatch.setattr(jse.subprocess, "run", _explode)
+    assert jse._git_head_sha() is None
