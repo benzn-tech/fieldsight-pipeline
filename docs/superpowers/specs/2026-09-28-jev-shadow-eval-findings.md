@@ -115,11 +115,17 @@ Source: controller's read-only, rolled-back RDS Data API queries, 2026-09-27.
 
 **Note on `work_class`:** every decided label in both environments, under both "confirmed" and
 "missed" outcome labels, falls on the "is non-work" side of the binary. There are currently
-**zero negative (work) labels** anywhere. Precision and recall for `work_class` are therefore
-undefined by clause (f) regardless of n — a set with 0 rows of one class cannot support a
-precision/recall computation, only descriptive per-row score inspection. This is unchanged by
-the owner's 2026-09-27 decision (below); it is why that decision calls for a new owner-labelled
-batch rather than treating the existing labels as sufficient.
+**zero negative (work) labels** anywhere. This affects precision and recall differently, per
+`scripts/jev_eval/score.py`'s `_metrics_at_threshold` (~lines 214-245): recall = tp/(tp+fn) is
+well-defined and meaningful on the current labels, since fn only requires actual-positive rows,
+which exist. Precision = tp/(tp+fp) is not informative — with every label "yes", fp is
+structurally 0, so precision is trivially 1.0 whenever the arm predicts anything positive at
+all (and `None` only when it predicts nothing positive). A trivial 1.0 says nothing about the
+classifier. `coverage_at_p95`, which is built on precision crossing the 0.95 target, inherits
+this: it says nothing meaningful until work-labelled negatives exist. The set stays descriptive
+only under clause (f) either way, regardless of which metrics happen to be well-defined — this
+is unchanged by the owner's 2026-09-27 decision (below); it is why that decision calls for a new
+owner-labelled batch with both classes rather than treating the existing labels as sufficient.
 
 **Owner decision, 2026-09-27:** rather than pausing labelling, the owner chose to build a new,
 owner-labelled batch (planned as Task 10) with balanced classes. The existing prod labels
