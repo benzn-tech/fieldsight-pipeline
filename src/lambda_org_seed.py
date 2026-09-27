@@ -16,7 +16,8 @@ import os
 import boto3
 
 from db.connection import get_connection
-from repositories import companies, memberships, sites, users
+from repositories import (companies, memberships, report_templates,
+                          sites, users)
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -166,10 +167,26 @@ def lambda_handler(event, context):
                         info.get("role", "worker"))
                     n_memberships += 1
 
+        # THE COMPANY'S OWN COPIES OF THE FOUR STARTER TEMPLATES. Inside the
+        # connection block and at the END of it, because the author has to be a
+        # real person: created_by is NOT NULL and references users(id), and a
+        # company has no users at the instant it is created. By this point it
+        # has them.
+        #
+        # An officer is preferred over an arbitrary member -- these are org
+        # templates and org templates are the officers' to manage. Idempotent,
+        # so re-running this lambda (which is its whole design) adds nothing,
+        # and a company that archived a starter does not get it back.
+        author = users.first_officer_or_member(conn, company["id"])
+        n_starters = (report_templates.seed_starters(conn, company["id"], author["id"])
+                      if author else 0)
+
     logger.info("seed done: company=%s users=%d sites=%d memberships=%d "
-                "sites_backfilled=%d login_folder_set=%d field_only_enrolled=%d",
+                "sites_backfilled=%d login_folder_set=%d field_only_enrolled=%d "
+                "starter_templates=%d",
                 company_name, n_users, n_sites, n_memberships,
-                n_sites_backfilled, n_login_folder_set, n_field_only_enrolled)
+                n_sites_backfilled, n_login_folder_set, n_field_only_enrolled,
+                n_starters)
     # company["id"] is a uuid.UUID (psycopg dict_row) — Lambda marshals the
     # return value with plain json (no default=str, unlike the API's ok()),
     # so coerce to str or the invoke fails with Runtime.MarshalError.
@@ -177,4 +194,5 @@ def lambda_handler(event, context):
             "users": n_users, "sites": n_sites, "memberships": n_memberships,
             "sites_backfilled": n_sites_backfilled,
             "login_folder_set": n_login_folder_set,
-            "field_only_enrolled": n_field_only_enrolled}
+            "field_only_enrolled": n_field_only_enrolled,
+            "starter_templates": n_starters}

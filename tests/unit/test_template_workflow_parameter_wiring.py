@@ -1221,3 +1221,30 @@ def test_the_flag_is_wired_in_all_three_places(param):
     assert f"!Ref {param}" in _env_text("AskAgentFunction")
     for wf in ("deploy.yml", "deploy-prod.yml"):
         assert f"{param}=" in _workflow(wf)
+
+
+def test_the_proposal_window_is_wired_end_to_end_not_just_declared():
+    """All three segments, or it is a switch nobody can turn.
+
+    This repository has shipped a documented rollback that was never wired, twice, and the
+    shape is always the same: the code reads an env var, nothing ever sets it, and the
+    default serves forever while a repo variable sits there looking authoritative. Nothing
+    fails -- the feature simply behaves as though the switch does not exist.
+
+    Checking one segment catches none of it, which is why this checks all three: the
+    Parameter, the function's environment, and BOTH workflow overrides.
+    """
+    text = open(TEMPLATE, encoding="utf-8").read()
+    assert "\n  ProposalWindowHours:" in text, "no Parameter in the template"
+
+    # On the WRITER specifically. The proposals are built there, and an env var on some
+    # other function is the same as no env var at all.
+    writer = text.split("  VoiceprintWriterFunction:")[1][:6000]
+    assert "PROPOSAL_WINDOW_HOURS: !Ref ProposalWindowHours" in writer, (
+        "ProposalWindowHours does not reach VoiceprintWriterFunction's environment, so "
+        "the os.environ.get default in the code is what runs whatever anyone configures")
+
+    for env, path in WORKFLOWS.items():
+        assert "ProposalWindowHours" in _overrides(path), (
+            f"{env} never overrides ProposalWindowHours, so that environment is pinned to "
+            f"the template default whatever its repo variable says")

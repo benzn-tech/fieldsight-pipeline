@@ -133,6 +133,7 @@ import device_status
 import nz_time
 import reindex
 import recording_blocks
+import report_download_name
 import report_sections
 import report_template
 import session_scope
@@ -148,7 +149,7 @@ from repositories import (action_items, aliases, chunks, classification_feedback
                           programme_delay_flags, programme_import,
                           programme_snapshot,
                           programme_suggestions, programme_tasks, programme_window,
-                          recordings, redactions, rollup, scope,
+                          recordings, redactions, report_templates, rollup, scope,
                           session_group,
                           sites, threads, topics, users, voice_messages,
                           voiceprints)
@@ -161,6 +162,8 @@ from photo_binding import parse_time_range
 import batch_cover
 import batch_stitch
 import deletion_mirror
+import speaker_match_request
+from repositories import speaker_name_proposals
 import turn_name_overlay
 from transcript_utils import extract_base_time_from_filename, speaker_turns_from_items
 
@@ -224,6 +227,10 @@ UPLOAD_VERIFY_MODE = os.environ.get("UPLOAD_VERIFY_MODE", "off").lower()
 # exist -- this repo has shipped a documented rollback that was never wired, twice).
 SPEAKER_IDENTITY_MODE = os.environ.get("SPEAKER_IDENTITY_MODE", "off").lower()
 
+# How many of a person's pending candidates the dialog asks about at once. A SCREEN-SIZE
+# choice: it decides how long the list is, never whether a candidate is a match.
+PROPOSAL_PAGE = int(os.environ.get("PROPOSAL_PAGE", "5"))
+
 # Whether naming a speaker is itself taken as the claim that they agreed to a voiceprint.
 #
 # Off, the endpoint keeps the pre-existing rule: enrolment happens only when the caller sends
@@ -231,8 +238,11 @@ SPEAKER_IDENTITY_MODE = os.environ.get("SPEAKER_IDENTITY_MODE", "off").lower()
 # a single profile — the subject needs an account, and on a site the people most often named
 # do not have one.
 #
-# On, a correction also creates the profile, recorded as `consent_basis='attestation'` with
-# `asserted_by` naming who made the claim. It records a claim; it does not verify one, and
+# On, a correction also creates the profile, recorded with the COMPANY's own
+# `voiceprint_consent_basis` -- whichever of notice / attestation / confirmed the company
+# declared -- and `asserted_by` naming who applied it. (This comment used to say every such
+# row was recorded as 'attestation'. The code has always written the company's value; a
+# comment that misstates which legal basis a biometric record carries is worse than none.) It records a claim; it does not verify one, and
 # nothing here can. The basis is on every row so a later decision — a stricter standard, a
 # purge, an opt-out register — can find exactly this population in one query.
 ENROL_ON_CORRECTION = os.environ.get("ENROL_ON_CORRECTION", "false").lower() == "true"
@@ -574,6 +584,39 @@ def dispatch(conn, event, method, route):
         return get_org_media_presigned_url(conn, caller, event)
     if route == "/media/keyframe" and method == "DELETE":
         return delete_keyframe_endpoint(conn, caller, parse_body(event))
+    # --- Report templates (migration 0062) -------------------------------
+    # ORDER MATTERS HERE. "/templates/bindings" must be matched before the
+    # "/templates/{id}" pattern below, or "bindings" is read as a template id
+    # and the bindings endpoints answer 404 for everyone -- a failure that
+    # looks like a permissions problem and is not one.
+    if route == "/templates" and method == "GET":
+        return list_report_templates(conn, caller, event)
+    if route == "/templates" and method == "POST":
+        return create_report_template(conn, caller, event)
+    if route == "/templates/bindings" and method == "GET":
+        return list_report_template_bindings(conn, caller, event)
+    m_tb = re.match(r"^/templates/bindings/([^/]+)$", route)
+    if m_tb and method == "PUT":
+        return set_report_template_binding(conn, caller, m_tb.group(1), event)
+    m_tvr = re.match(r"^/templates/([^/]+)/versions/([^/]+)/restore$", route)
+    if m_tvr and method == "POST":
+        return restore_report_template_version(conn, caller, m_tvr.group(1), m_tvr.group(2))
+    m_tv = re.match(r"^/templates/([^/]+)/versions$", route)
+    if m_tv and method == "GET":
+        return list_report_template_versions(conn, caller, m_tv.group(1))
+    if m_tv and method == "POST":
+        return add_report_template_version(conn, caller, m_tv.group(1), event)
+    m_tc = re.match(r"^/templates/([^/]+)/copy$", route)
+    if m_tc and method == "POST":
+        return copy_report_template(conn, caller, m_tc.group(1), event)
+    m_t = re.match(r"^/templates/([^/]+)$", route)
+    if m_t and method == "GET":
+        return get_report_template(conn, caller, m_t.group(1), event)
+    if m_t and method == "PATCH":
+        return update_report_template(conn, caller, m_t.group(1), event)
+    if m_t and method == "DELETE":
+        return archive_report_template(conn, caller, m_t.group(1))
+
     if route == "/reports/history" and method == "GET":
         return get_org_report_history(conn, caller, event)
     if route == "/reports/regenerate" and method == "POST":
@@ -709,6 +752,11 @@ def dispatch(conn, event, method, route):
     m_rg = re.match(r"^/sessions/([^/]+)/regenerate$", route)
     if m_rg and method == "POST":
         return regenerate_session(conn, caller, m_rg.group(1), event)
+    if route == "/name-proposals" and method == "GET":
+        return list_name_proposals(conn, caller, event)
+    m_np = re.match(r"^/name-proposals/([^/]+)$", route)
+    if m_np and method == "POST":
+        return decide_name_proposal(conn, caller, m_np.group(1), event)
     m_sc = re.match(r"^/sessions/([^/]+)/speaker-corrections$", route)
     if m_sc and method == "POST":
         return speaker_corrections(conn, caller, m_sc.group(1), event)
@@ -1510,7 +1558,7 @@ def session_report_generate(conn, caller, session_id, event):
     if err is not None:
         return err
 
-    generate, gen_error = _generation_request(body, deliver)
+    generate, gen_error = _generation_request(body, deliver, conn, caller)
     if gen_error:
         return error(gen_error, 400)
 
@@ -1622,10 +1670,28 @@ def _assemble_day_report(conn, caller, date, event, selected=None):
     }, None
 
 
-def _generation_request(body, deliver=None):
-    """The template a report is written to, validated here so a bad name fails the
-    request instead of the worker -- the caller is still on the line at this point.
-    Absent template = today's assembled report (spec 2026-09-15 §5.3).
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def _generation_request(body, deliver=None, conn=None, caller=None):
+    """The template a report is written to, resolved and validated here so a bad
+    name fails the request instead of the worker -- the caller is still on the
+    line at this point. Absent template = today's assembled report
+    (spec 2026-09-15 SS5.3).
+
+    TWO KINDS OF TEMPLATE, ONE ANSWER. A slug names a template that ships as a
+    file in this repo; a uuid names one a company wrote in the Library
+    (migration 0062). Both end up as the same body, because report_template's
+    file format IS the Library's body format -- that was the point of choosing
+    it.
+
+    THE BODY TRAVELS WITH THE REQUEST. lambda_session_report is non-VPC and
+    cannot reach Aurora, so a stored template has to be resolved HERE, in the
+    VPC, and written into the artifact. That is not a workaround: it also means
+    the artifact records the exact text the document was written to, so
+    "which template wrote this" stays answerable after the template is edited.
+    The file-backed templates are inlined the same way, so the worker has ONE
+    way of getting a body rather than two.
 
     `deliver` (optional): the worker's generate branch never emails -- it always
     writes `emailed: false` -- so a request that names a template AND asks for
@@ -1636,15 +1702,51 @@ def _generation_request(body, deliver=None):
         return None, None
     if deliver == "email":
         return None, "a generated report can only be downloaded for now"
+
+    if _UUID_RE.match(str(template_id)):
+        if conn is None or caller is None:
+            # Never fall back to the file templates on a uuid: a uuid that
+            # cannot be resolved is a stored template this caller may not see
+            # or that does not exist, and quietly writing the report to some
+            # other template would make the name in the artifact a lie.
+            return None, "no such template: %s" % template_id
+        tpl = report_templates.get_visible(conn, caller["company_id"], caller["id"], template_id)
+        if tpl is None:
+            return None, "no such template: %s" % template_id
+        raw_version = (body or {}).get("templateVersion")
+        if raw_version is None:
+            version = tpl["current_version"]
+        else:
+            try:
+                version = int(raw_version)
+            except (TypeError, ValueError):
+                return None, "templateVersion must be a number"
+        if version < 1:
+            return None, "that template has no content yet"
+        stored = report_templates.get_version(conn, template_id, version)
+        if stored is None:
+            return None, "no such template: %s v%s" % (template_id, version)
+        # WHICH KIND OF TEMPLATE THIS IS travels with the request. The worker
+        # cannot work it out for itself: a Library body and a file body are the
+        # same shape by the time they are inlined, and any marker put INSIDE the
+        # body could be typed by the customer who wrote it. Only the branch taken
+        # here knows, so only here can say.
+        return {"templateId": str(template_id), "templateVersion": version,
+                "templateName": tpl["name"], "templateBody": stored["body"],
+                "templateSource": report_template.SOURCE_LIBRARY}, None
+
     try:
         version = int((body or {}).get("templateVersion"))
     except (TypeError, ValueError):
         return None, "templateVersion must be a number"
     try:
-        report_template.load_template(template_id, version)
+        loaded = report_template.load_template(template_id, version)
     except report_template.TemplateNotFound:
         return None, "no such template: %s v%s" % (template_id, version)
-    return {"templateId": template_id, "templateVersion": version}, None
+    return {"templateId": template_id, "templateVersion": version,
+            "templateName": loaded.get("name") or template_id,
+            "templateBody": loaded,
+            "templateSource": report_template.SOURCE_BUILTIN}, None
 
 
 def _excluded_topics_for(conn, caller, folder, date, session_id=None):
@@ -1733,7 +1835,7 @@ def day_report_generate(conn, caller, date, event):
     if err is not None:
         return err
 
-    generate, gen_error = _generation_request(body, deliver)
+    generate, gen_error = _generation_request(body, deliver, conn, caller)
     if gen_error:
         return error(gen_error, 400)
 
@@ -1801,7 +1903,7 @@ def _may_correct_speakers(conn, caller, folder):
     return folder == scope.visible_scope(conn, caller).get("self_folder")
 
 
-def _session_turns(conn, folder, date, session_base):
+def _session_turns(conn, folder, date, session_base, with_text=False):
     """Every turn of one session, as (file, offset) pairs the embedder can cut audio with.
 
     Reads the same transcripts the viewer does and keeps only this session — a day can hold
@@ -1847,6 +1949,11 @@ def _session_turns(conn, folder, date, session_base):
                     # about turns too short for any acoustic judgement, and until now that
                     # statement never reached the layer that declines to judge them.
                     "speaker_label": seg.get("speaker_label")})
+        # Only for a reader that shows words. The embedder artifacts carry turns by the
+        # hundred and never read the text; the name-proposal dialog shows it and had
+        # nothing to show -- every passage read "No words to show" on TEST 2026-09-27.
+        if with_text:
+            out[-1]["text"] = seg.get("text")
     # WHY it is empty, when it is. An empty turn list is a legitimate outcome — a session
     # with nothing transcribed yet — and it is also what a session-id mismatch, a missing
     # `chunk_start` and an empty read all look like. Four investigations into one enrolment
@@ -1868,24 +1975,20 @@ def _session_turns(conn, folder, date, session_base):
 # A three-hour meeting exceeds it, and the failure would be a timeout at the very end with
 # nothing written, so the work is split instead. The splits are independent: each fetches its
 # own profiles and names its own turns, and no turn's answer depends on another's.
-MATCH_SECONDS_PER_RUN = float(os.environ.get("MATCH_SECONDS_PER_RUN", "3600"))
-MATCH_TURNS_PER_RUN = int(os.environ.get("MATCH_TURNS_PER_RUN", "400"))
+MATCH_SECONDS_PER_RUN = float(os.environ.get(
+    "MATCH_SECONDS_PER_RUN", str(speaker_match_request.DEFAULT_SECONDS_PER_RUN)))
+MATCH_TURNS_PER_RUN = int(os.environ.get(
+    "MATCH_TURNS_PER_RUN", str(speaker_match_request.DEFAULT_TURNS_PER_RUN)))
 
 
 def _split_for_budget(turns):
-    """Group turns into runs that fit one invocation. Never splits a turn."""
-    runs, current, seconds = [], [], 0.0
-    for t in turns:
-        dur = max(0.0, float(t.get("end_sec", 0)) - float(t.get("start_sec", 0)))
-        if current and (seconds + dur > MATCH_SECONDS_PER_RUN
-                        or len(current) >= MATCH_TURNS_PER_RUN):
-            runs.append(current)
-            current, seconds = [], 0.0
-        current.append(t)
-        seconds += dur
-    if current:
-        runs.append(current)
-    return runs
+    """Group turns into runs that fit one invocation. Never splits a turn.
+
+    The env overrides stay here -- this half is the one an operator tunes -- while the
+    arithmetic lives in `speaker_match_request` so the finalize producer splits identically.
+    """
+    return speaker_match_request.split_for_budget(
+        turns, MATCH_SECONDS_PER_RUN, MATCH_TURNS_PER_RUN)
 
 
 def list_voiceprints(conn, caller):
@@ -1955,18 +2058,15 @@ def _site_for_session(conn, company_id, user_folder, date, session_base):
 
 
 def _label_map(turns):
-    """(turn_ref, source_filename, speaker_label) for every turn — no audio, no vectors.
+    """Delegates to `speaker_match_request.label_map`.
 
-    The transcriber's own grouping, in the one form the writer can act on. Sent whole rather
-    than per run because inheritance is the single thing in this chain whose answer for one
-    turn depends on ANOTHER turn — which is exactly the invariant `_split_for_budget` relies
-    on ("no turn's answer depends on another's").
+    Kept as a name because the call sites read better with it, but NOT as a second
+    implementation: `lambda_item_writer` builds the same artifact at finalize, and a map two
+    producers compute separately is a map that drifts. The hop between these two halves has
+    already dropped this exact key once, and label inheritance was then unreachable code
+    that reported success.
     """
-    return [{"turn_ref": turn_name_overlay.turn_ref(t["source_filename"],
-                                                    float(t["start_sec"])),
-             "source_filename": t["source_filename"],
-             "speaker_label": t.get("speaker_label")}
-            for t in turns or []]
+    return speaker_match_request.label_map(turns)
 
 
 def _same_company_as_folder(conn, caller, folder, what):
@@ -2274,6 +2374,190 @@ def _employer_result(name, source, profile):
             "source": profile.get("employer_source")}
 
 
+def list_name_proposals(conn, caller, event):
+    """GET /api/org/name-proposals — whose voices are waiting to be confirmed.
+
+    Two shapes from one route, because the bell and the dialog want different things and
+    making the bell pay for the dialog's work would put a transcript read on every page load.
+
+    Without `?voiceprint=`: a count per person. Cheap -- one grouped query, no transcript
+    touched -- which is what a badge polled from every page has to be.
+
+    With `?voiceprint=<id>`: that person's top candidates WITH the words, which means reading
+    the session transcripts. Only on opening the dialog, and only for the handful shown.
+
+    The passage text is the point of the second shape. A row that says
+    `spk_1 @ 2026-09-22 / 41.2s` is an identifier, not a question -- nobody can answer it
+    without listening first, and most people will not. The transcriber's words are wrong
+    often enough to be useless as an answer and right often enough to place the passage,
+    which is exactly what is needed to decide whether it is worth playing.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    company_id = str(caller["company_id"])
+    qs = event.get("queryStringParameters") or {}
+    vp = (qs.get("voiceprint") or "").strip()
+
+    if not vp:
+        people = speaker_name_proposals.pending_by_person(conn, company_id)
+        return ok({"people": [{"voiceprintId": r["voiceprint_id"],
+                               "displayName": r["display_name"],
+                               "pending": int(r["pending"]),
+                               "newest": r["newest"]} for r in people],
+                   "total": sum(int(r["pending"]) for r in people)})
+
+    rows = speaker_name_proposals.pending_for_person(
+        conn, company_id, vp, limit=PROPOSAL_PAGE)
+    # Transcripts are read per SESSION, not per candidate: several candidates routinely come
+    # from one session, and a naive loop would fetch the same transcript five times.
+    cache, out = {}, []
+    for r in rows:
+        sid = (r["session_base"], r["user_folder"], str(r["session_date"]))
+        if sid not in cache:
+            try:
+                cache[sid] = _session_turns(conn, sid[1], sid[2], sid[0], with_text=True)
+            except Exception:
+                logger.exception("proposal %s: could not read its transcript", r["id"])
+                cache[sid] = []
+        # The LONGEST turn of that cluster, the same one a confirmation would mark -- so the
+        # words shown are the words of the passage the decision actually lands on.
+        turns = [t for t in cache[sid]
+                 if t.get("source_filename") == r["source_filename"]
+                 and t.get("speaker_label") == r["speaker_label"]]
+        best = max(turns, key=lambda t: float(t.get("end_sec", 0)) - float(t.get("start_sec", 0)),
+                   default=None)
+        out.append({
+            "id": r["id"], "sessionBase": r["session_base"], "date": str(r["session_date"]),
+            # The folder is what turns this passage into a playable key
+            # (`audio_segments/{folder}/{date}/{stem}.wav`). Without it the dialog can show
+            # the words and never the voice -- and the voice is what is being judged.
+            "userFolder": r["user_folder"],
+            "sourceFilename": r["source_filename"], "speakerLabel": r["speaker_label"],
+            "score": None if r.get("score") is None else round(float(r["score"]), 3),
+            # Absent rather than empty when the transcript could not be read: "no words" and
+            # "we could not look" are different, and only one of them is worth retrying.
+            "text": (best or {}).get("text"),
+            "startSec": (best or {}).get("start_sec"),
+            "endSec": (best or {}).get("end_sec"),
+        })
+    return ok({"voiceprintId": vp, "proposals": out})
+
+
+def decide_name_proposal(conn, caller, proposal_id, event):
+    """POST /api/org/name-proposals/{id} — a human answers one proposed name.
+
+    Body: `{"decision": "confirmed" | "rejected"}`.
+
+    **`confirmed` does not write a name here. It delegates to `speaker_corrections`**, and
+    that delegation is the single most load-bearing line in this feature.
+
+    The reason is a string. `lambda_voiceprint_writer` stores
+    `source="correction" if asserted else "correction_propagation"`, and
+    `recompute_company_floor` counts ONLY `source='correction'` -- deliberately, because a
+    floor calibrated from the system's own guesses would lower its own bar every time it
+    was wrong. Twenty of those rows is what a company needs before `decide_name` can return
+    `confirmed` at all. So this queue's entire purpose is to produce them.
+
+    A confirmation written straight to the database here would name the person correctly,
+    render correctly, satisfy the user, and contribute **nothing** -- and every test would
+    be green, because nothing about the outcome would look wrong. Going through the
+    correction endpoint is what makes a confirmation the same act as a rename, which is the
+    act the calibration counts. It is pinned by a seam test for exactly that reason.
+
+    `rejected` records the judgement and writes no name. A rejection is information: it
+    says "this is not that person", which stays true however many times the cluster is
+    recomputed, and it is why the candidate never comes back.
+
+    **There is no third value.** Closing the popup is not a decision and must not reach
+    this route -- the row stays `pending` and the bell carries it. A dismissal that
+    consumed the candidate would burn, silently and five at a time, the human decisions the
+    company's floor is built from.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    body = parse_body(event) or {}
+    decision = (body.get("decision") or "").strip().lower()
+    if decision not in ("confirmed", "rejected"):
+        return error("decision must be 'confirmed' or 'rejected'; closing the dialog is "
+                     "not a decision and leaves the proposal pending", 400)
+
+    company_id = str(caller["company_id"])
+    # Company from the caller, never the path -- a valid uuid from another tenant would
+    # otherwise be a button that names people in their recordings.
+    # ONE transaction for the decision and the correction it delegates to. `decide` flips
+    # the row out of `pending`; if the correction is then refused, a committed flip leaves a
+    # proposal that says `confirmed` while nothing was named -- and, no longer pending, it
+    # can never be answered again. That is what the 400 above did on TEST 2026-09-27.
+    try:
+        with conn.transaction():
+            row = speaker_name_proposals.decide(conn, company_id, proposal_id, decision,
+                                                decided_by=caller["id"])
+            if row is None:
+                # Already answered, or not this company's. Both are "there is nothing here
+                # for you to decide", and telling them apart would confirm the existence of
+                # another tenant's row.
+                return error("no pending proposal with that id", 404)
+            if decision == "rejected":
+                return ok({"proposalId": row["id"], "decision": "rejected"})
+            resp = _apply_confirmed_proposal(conn, caller, company_id, row, event)
+            if int(resp.get("statusCode", 500)) >= 300:
+                raise _ConfirmationNotApplied(resp)
+            return resp
+    except _ConfirmationNotApplied as exc:
+        return exc.response
+
+
+class _ConfirmationNotApplied(Exception):
+    """The delegated correction was refused -- undo the proposal's decision with it."""
+
+    def __init__(self, response):
+        super().__init__(response.get("statusCode"))
+        self.response = response
+
+
+def _apply_confirmed_proposal(conn, caller, company_id, row, event):
+    """Turn a confirmed proposal into the correction a rename would have made."""
+    person = voiceprints.get_profile(conn, company_id, row["voiceprint_id"])
+    if person is None or not person.get("display_name"):
+        return error("the proposed profile has no name to apply", 409)
+
+    # Off the ROW, not re-derived. `speaker_label_groups` carries neither, and resolving
+    # them at decision time would make answering an old proposal depend on data that may
+    # have moved since it was offered.
+    folder, date = row["user_folder"], str(row["session_date"])
+
+    # WHICH passage to mark. A cluster is many turns; the correction endpoint marks one
+    # window and lets propagation spread it over the voice. The LONGEST turn is chosen
+    # because it carries the most evidence for the enrolment the correction may also
+    # trigger -- the homogeneity guard refuses thin windows, and picking the first turn
+    # would hand it whichever passage happened to be transcribed first.
+    turns = [t for t in _session_turns(conn, folder, date, row["session_base"])
+             if t.get("source_filename") == row["source_filename"]
+             and t.get("speaker_label") == row["speaker_label"]]
+    if not turns:
+        return error("that proposal's passage is no longer in the transcript", 409)
+    best = max(turns, key=lambda t: float(t.get("end_sec", 0)) - float(t.get("start_sec", 0)))
+
+    # The delegation. Same handler, same artifact, same `source='correction'` on the row
+    # that lands -- see `decide_name_proposal`'s docstring for why nothing may shortcut it.
+    # The SESSION ID is the passage's own filename, not `row["session_base"]`. The row
+    # stores the canonical key (`sid<32 hex>`), which carries no date, and
+    # `speaker_corrections` refuses a session id without one. Measured on TEST
+    # 2026-09-27: "Yes, it's them" returned 400 and named nobody. The filename carries
+    # both the date and the sid, and it is what the transcript viewer's own rename sends.
+    return speaker_corrections(conn, caller, row["source_filename"], dict(event, body=json.dumps({
+        "user": folder,
+        "source_filename": row["source_filename"],
+        "start_sec": best["start_sec"],
+        "end_sec": best["end_sec"],
+        "display_name": person["display_name"],
+    })))
+
+
 def speaker_corrections(conn, caller, session_base, event):
     """POST /api/org/sessions/{session_base}/speaker-corrections
 
@@ -2577,6 +2861,35 @@ def _without_vendor_metadata(doc):
     return doc
 
 
+def _presign_report_doc(doc_key, folder, date, result):
+    """Presign the generated document, served under a name a person can read.
+
+    The browser names a download after the last segment of the URL, and these
+    keys end in the requestId -- so every report ever downloaded arrived as a
+    uuid. `ResponseContentDisposition` overrides that at serve time. The KEY IS
+    UNCHANGED: nothing about the storage layout, the deletion mirror or any
+    object already written moves, because this is a header the object is served
+    with, not a property of the object.
+
+    Non-Latin folder names survive intact (report_download_name carries the
+    real name on RFC 6266's `filename*`); the ASCII fallback beside it is built
+    by replacement, never by stripping. Building the name must never be the
+    reason a finished report cannot be handed over, so a failure here falls
+    back to the bare presign -- a uuid filename, which is what this endpoint
+    did for its whole life -- and says so loudly enough to be found.
+    """
+    params = {"Bucket": LAKE_BUCKET, "Key": doc_key}
+    try:
+        params["ResponseContentDisposition"] = report_download_name.content_disposition(
+            report_download_name.display_name(
+                folder, result.get("templateId"), result.get("templateVersion"), date,
+                template_name=result.get("templateName")))
+    except Exception:
+        logger.exception("could not build a download name for %s; serving it unnamed", doc_key)
+    return s3().generate_presigned_url(
+        "get_object", Params=params, ExpiresIn=PRESIGNED_URL_EXPIRY)
+
+
 def _generation_provenance(result):
     """Echo the worker's generation provenance -- which template wrote the
     document -- when the result carries it. `promptChars` is internal noise,
@@ -2634,9 +2947,7 @@ def session_report_status(conn, caller, session_id, event):
     result = json.loads(obj["Body"].read().decode("utf-8"))
     status = result.get("status")
     if status == "done" and result.get("docKey"):
-        url = s3().generate_presigned_url(
-            "get_object", Params={"Bucket": LAKE_BUCKET, "Key": result["docKey"]},
-            ExpiresIn=PRESIGNED_URL_EXPIRY)
+        url = _presign_report_doc(result["docKey"], folder, date, result)
         return ok({"status": "done", "docUrl": url, "emailed": bool(result.get("emailed")),
                    **_generation_provenance(result)})
     if status == "error":
@@ -2688,9 +2999,7 @@ def day_report_status(conn, caller, date, event):
         if _any_session_removed(session_ids, folders, date):
             logger.info("day report %s: a session in it was deleted -- not served", request_id)
             return ok({"status": "removed"})
-        url = s3().generate_presigned_url(
-            "get_object", Params={"Bucket": LAKE_BUCKET, "Key": result["docKey"]},
-            ExpiresIn=PRESIGNED_URL_EXPIRY)
+        url = _presign_report_doc(result["docKey"], folder, date, result)
         return ok({"status": "done", "docUrl": url, "emailed": bool(result.get("emailed")),
                    **_generation_provenance(result)})
     if status == "error":
@@ -3710,6 +4019,25 @@ def create_member(conn, caller, body):
             logger.warning("create_member: no free folder_name for %s -- left unset", sub)
     created = [memberships.ensure_membership(conn, user["id"], mem["site_id"],
                                              mem["role"]) for mem in wanted]
+
+    # THE COMPANY'S STARTER TEMPLATES, if it does not have them yet. This is
+    # the path a company actually gets its people through -- the invitation --
+    # and it was the one path that did not seed. The migration seeds the
+    # companies that existed when it ran; lambda_org_seed seeds on a manual
+    # backfill. A company that was created empty and then got its first person
+    # by invitation (Briv, on prod) kept an empty Library forever, which is the
+    # exact symptom the owner reported on Southbase: "I can't see any template".
+    #
+    # Safe on every invitation, not just the first: the function is idempotent
+    # per company, returns 0 for a company that has them, and does not put back
+    # one the company has archived -- that was their decision about their own
+    # library. The author is the company's first officer (or member), the same
+    # rule the other two callers use, rather than the inviter -- who may be a
+    # platform_admin from a different company.
+    author = users.first_officer_or_member(conn, target_company_id)
+    if author is not None:
+        report_templates.seed_starters(conn, target_company_id, author["id"])
+
     return ok({"user": user, "memberships": created}, 201)
 
 
@@ -8933,3 +9261,461 @@ def get_org_media_presigned_url(conn, caller, event):
         "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
         ExpiresIn=PRESIGNED_URL_EXPIRY)
     return ok({"url": url, "expires_in": PRESIGNED_URL_EXPIRY})
+
+
+# =====================================================================
+# Report templates (migration 0062)
+#
+# The Library has shipped in the UI since Sprint 10 against localStorage: a
+# template lived as long as the tab that made it and was invisible to everyone
+# else in the company. These routes are that feature becoming real.
+#
+# WHO MAY DO WHAT, in one place so it can be read as a whole:
+#
+#   read org templates        anyone signed in, in their own company
+#   read own personal ones    the owner, and nobody else -- gm/admin included
+#   write own personal ones   the owner
+#   write org templates       gm / admin (platform_admin across companies)
+#   bind a scheduled report   gm / admin only -- the nightly reports go out to
+#                             customers under the company's name, so which
+#                             template writes them is not an individual choice
+#
+# `platform_admin` reach is granted PER ENDPOINT below, never inherited from a
+# shared helper: this repo has a standing trap where a missing cross-company
+# branch turns into a 200 with an empty list rather than a 403, and a role that
+# silently sees nothing is indistinguishable from a company that owns nothing.
+# =====================================================================
+
+_TEMPLATE_WRITE_ROLES = ("admin", "gm", "platform_admin")
+_REPORT_TYPES = ("daily", "weekly", "monthly", "session", "day", "custom")
+_BINDABLE_TYPES = ("daily", "weekly", "monthly")
+_MAX_TEMPLATE_NAME = 120
+
+
+def _template_company(conn, caller, event):
+    """Which company's templates this request is about.
+
+    A platform_admin sits in its own operator company, so defaulting to
+    `caller["company_id"]` would show it an empty Library and say nothing about
+    why. It may name a company; everybody else is pinned to their own whatever
+    they send, so there is no parameter a normal caller can set to reach
+    another tenant.
+    """
+    p = event.get("queryStringParameters") or {}
+    requested = p.get("company_id")
+    if requested and str(requested) != str(caller["company_id"]):
+        if not is_cross_company(caller["global_role"]):
+            return None, error("only platform_admin may act in another company", 403)
+        if companies.get_company_by_id(conn, requested) is None:
+            return None, error("company not found", 404)
+        return str(requested), None
+    return str(caller["company_id"]), None
+
+
+def _may_write_template(caller, template):
+    """None when this caller may change `template`, else an error response.
+
+    Ownership first, role second. A worker owns their personal templates
+    outright; a gm owns none of anybody's. The org arm is the only one where
+    the role decides anything.
+    """
+    if template["scope"] == "personal":
+        if str(template["owner_user_id"]) != str(caller["id"]):
+            # Same wording as the read side's miss, deliberately: confirming
+            # that somebody else's template exists is exactly the disclosure
+            # personal scope promises not to make.
+            return error("template not found", 404)
+        return None
+    if caller["global_role"] not in _TEMPLATE_WRITE_ROLES:
+        return error("admin, gm or platform_admin role required to change an "
+                     "organisation template", 403)
+    if str(template["company_id"]) != str(caller["company_id"]) \
+            and not is_cross_company(caller["global_role"]):
+        return error("template not found", 404)
+    return None
+
+
+def _template_payload(row, versions=None):
+    """One template as a client sees it.
+
+    `versions` USED TO BE OPTIONAL AND ALMOST NOBODY PASSED IT. Only `create`
+    did, so a template read back through list or get arrived with no versions
+    at all -- and the Library takes its section list from exactly there. The
+    template was intact in the database and the page said "No schema available
+    yet", which is a sentence about the template rather than about the request
+    that dropped half of it.
+
+    It is still optional, because list deliberately does not carry every
+    version of every template, but list now sends `section_count` so a row can
+    say how big a template is without being handed its whole body, and get
+    sends the current version because that is the one thing the page cannot
+    render without.
+    """
+    out = {
+        "id": str(row["id"]),
+        "company_id": str(row["company_id"]),
+        "scope": row["scope"],
+        "owner_user_id": str(row["owner_user_id"]) if row.get("owner_user_id") else None,
+        "slug": row["slug"],
+        "name": row["name"],
+        "description": row["description"],
+        "report_type": row["report_type"],
+        "current_version": row["current_version"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+    # Absent rather than 0 when the query did not compute it: 0 sections and
+    # "this query did not ask" are different facts, and a client cannot tell
+    # them apart from a number alone.
+    if row.get("section_count") is not None:
+        out["section_count"] = row["section_count"]
+    if versions is not None:
+        out["versions"] = versions
+    return out
+
+
+def _version_payload(row):
+    return {
+        "id": str(row["id"]),
+        "template_id": str(row["template_id"]),
+        "version": row["version"],
+        "body": row["body"],
+        "change_note": row["change_note"],
+        "created_by": str(row["created_by"]),
+        "created_at": row["created_at"],
+    }
+
+
+def _validated_template_body(body):
+    """(template body, error). Shared by create, new-version and restore so the
+    three cannot drift on what a valid template is."""
+    if body is None:
+        return None, error("malformed JSON body", 400)
+    tpl = body.get("body")
+    why = report_template.validate_body(tpl)
+    if why:
+        return None, error(why, 400)
+    return tpl, None
+
+
+def _template_name(body, fallback=None):
+    """(name, error). Empty is refused rather than defaulted: a template nobody
+    named is one nobody will find again."""
+    raw = body.get("name")
+    if raw is None and fallback is not None:
+        return fallback, None
+    if not isinstance(raw, str) or not raw.strip():
+        return None, error("name is required", 400)
+    name = raw.strip()
+    if len(name) > _MAX_TEMPLATE_NAME:
+        return None, error("name must be %d characters or fewer" % _MAX_TEMPLATE_NAME, 400)
+    return name, None
+
+
+def list_report_templates(conn, caller, event):
+    """GET /api/org/templates?scope=org|personal|all"""
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    p = event.get("queryStringParameters") or {}
+    scope = (p.get("scope") or "all").strip()
+    if scope not in ("org", "personal", "all"):
+        return error("scope must be org, personal or all", 400)
+    rows = report_templates.list_visible(
+        conn, company_id, caller["id"], None if scope == "all" else scope)
+    return ok({"templates": [_template_payload(r) for r in rows]})
+
+
+def get_report_template(conn, caller, template_id, event):
+    """GET /api/org/templates/{id}"""
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    row = report_templates.get_visible(conn, company_id, caller["id"], template_id)
+    if row is None:
+        return error("template not found", 404)
+    # The current version travels with it. Opening a template is exactly the
+    # moment its sections are needed, and a caller that had to ask twice would
+    # render an empty template in between -- which is what it used to do.
+    current = (report_templates.get_version(conn, template_id, None)
+               if row["current_version"] else None)
+    return ok(_template_payload(row, versions=[_version_payload(current)] if current else []))
+
+
+def create_report_template(conn, caller, event):
+    """POST /api/org/templates
+
+    A template is created WITH its first body. The two-statement split lives in
+    the repository (the row must exist before a version can reference it), but
+    a caller has no use for a template that says nothing, and allowing one
+    would put `current_version = 0` in front of the Library for real.
+    """
+    body = parse_body(event)
+    tpl, err = _validated_template_body(body)
+    if err is not None:
+        return err
+
+    scope = (body.get("scope") or "personal").strip()
+    if scope not in ("org", "personal"):
+        return error("scope must be org or personal", 400)
+    if scope == "org" and caller["global_role"] not in _TEMPLATE_WRITE_ROLES:
+        return error("admin, gm or platform_admin role required to create an "
+                     "organisation template", 403)
+
+    report_type = (body.get("report_type") or "custom").strip()
+    if report_type not in _REPORT_TYPES:
+        return error("report_type must be one of: %s" % ", ".join(_REPORT_TYPES), 400)
+
+    name, err = _template_name(body)
+    if err is not None:
+        return err
+    description = body.get("description")
+    if description is not None and not isinstance(description, str):
+        return error("description must be a string", 400)
+
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    owner = None if scope == "org" else caller["id"]
+    slug = report_template.slugify(name, "tpl-" + uuid.uuid4().hex[:8])
+    try:
+        row = report_templates.create(conn, company_id, scope, owner, slug, name,
+                                      description or "", report_type, caller["id"])
+    except UniqueViolation:
+        # The slug is derived from the name, so a collision here is a duplicate
+        # NAME, which is what the message has to say -- "slug" is a word this
+        # product never shows anybody.
+        return error("a template called that already exists here", 409)
+    version = report_templates.add_version(conn, row["id"], tpl,
+                                           body.get("change_note") or "Created",
+                                           caller["id"])
+    fresh = report_templates.get_any(conn, row["id"])
+    return ok(_template_payload(fresh, versions=[_version_payload(version)]), 201)
+
+
+def update_report_template(conn, caller, template_id, event):
+    """PATCH /api/org/templates/{id} -- name and description only.
+
+    The body is deliberately not settable here: changing what a template SAYS
+    creates a version, and a route that could do both would let an edit land
+    with no version behind it, which is the one thing the history exists to
+    rule out.
+    """
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    if "body" in body:
+        return error("use POST /templates/{id}/versions to change what a "
+                     "template says, so the change gets a version", 400)
+    row = report_templates.get_visible(conn, caller["company_id"], caller["id"], template_id)
+    if row is None:
+        return error("template not found", 404)
+    err = _may_write_template(caller, row)
+    if err is not None:
+        return err
+
+    name = None
+    if body.get("name") is not None:
+        name, err = _template_name(body)
+        if err is not None:
+            return err
+    description = body.get("description")
+    if description is not None and not isinstance(description, str):
+        return error("description must be a string", 400)
+    updated = report_templates.update_meta(conn, template_id, name, description)
+    # Renaming does not change the body, but the client replaces its selected
+    # template with this response -- so a payload without sections empties the
+    # panel the person is looking at. Same reason as `get`.
+    current = (report_templates.get_version(conn, template_id, None)
+               if updated["current_version"] else None)
+    return ok(_template_payload(updated, versions=[_version_payload(current)] if current else []))
+
+
+def list_report_template_versions(conn, caller, template_id):
+    """GET /api/org/templates/{id}/versions"""
+    row = report_templates.get_visible(conn, caller["company_id"], caller["id"], template_id)
+    if row is None:
+        return error("template not found", 404)
+    return ok({"versions": [_version_payload(v)
+                            for v in report_templates.list_versions(conn, template_id)]})
+
+
+def add_report_template_version(conn, caller, template_id, event):
+    """POST /api/org/templates/{id}/versions -- the only way content changes."""
+    body = parse_body(event)
+    tpl, err = _validated_template_body(body)
+    if err is not None:
+        return err
+    row = report_templates.get_visible(conn, caller["company_id"], caller["id"], template_id)
+    if row is None:
+        return error("template not found", 404)
+    err = _may_write_template(caller, row)
+    if err is not None:
+        return err
+    note = body.get("change_note")
+    if note is not None and not isinstance(note, str):
+        return error("change_note must be a string", 400)
+    try:
+        version = report_templates.add_version(conn, template_id, tpl, note, caller["id"])
+    except UniqueViolation:
+        # Somebody else saved between this caller's read and this write. 409,
+        # not 500: their edit is intact, it simply is not the one that landed,
+        # and the only correct next step is theirs to take.
+        return error("someone else saved a change to this template just now -- "
+                     "reload it and re-apply your edit", 409)
+    return ok(_version_payload(version), 201)
+
+
+def restore_report_template_version(conn, caller, template_id, version):
+    """POST /api/org/templates/{id}/versions/{version}/restore
+
+    Writes the old body as a NEW version. Nothing moves backwards: a report
+    that recorded (template, v2) must keep naming a body that still exists
+    exactly as it was.
+    """
+    row = report_templates.get_visible(conn, caller["company_id"], caller["id"], template_id)
+    if row is None:
+        return error("template not found", 404)
+    err = _may_write_template(caller, row)
+    if err is not None:
+        return err
+    try:
+        wanted = int(version)
+    except (TypeError, ValueError):
+        return error("version must be a number", 400)
+    old = report_templates.get_version(conn, template_id, wanted)
+    if old is None:
+        return error("no such version", 404)
+    try:
+        version_row = report_templates.add_version(
+            conn, template_id, old["body"], "Restored from v%d" % wanted, caller["id"])
+    except UniqueViolation:
+        return error("someone else saved a change to this template just now -- "
+                     "reload it and try again", 409)
+    return ok(_version_payload(version_row), 201)
+
+
+def copy_report_template(conn, caller, template_id, event):
+    """POST /api/org/templates/{id}/copy -- into the caller's own library.
+
+    Open to every role on purpose. Copying is how somebody who may not change
+    the company's template gets one they can change; taking it away would make
+    "org templates are read-only for most people" mean "most people cannot
+    have a template at all".
+    """
+    body = parse_body(event) or {}
+    src = report_templates.get_visible(conn, caller["company_id"], caller["id"], template_id)
+    if src is None:
+        return error("template not found", 404)
+    name, err = _template_name(body, fallback="%s (my copy)" % src["name"])
+    if err is not None:
+        return err
+    slug = report_template.slugify(name, "tpl-" + uuid.uuid4().hex[:8])
+    try:
+        copied = report_templates.copy_to_personal(conn, template_id, caller["id"],
+                                                   slug, name, caller["id"])
+    except UniqueViolation:
+        return error("you already have a template called that", 409)
+    if copied is None:
+        return error("that template has no content to copy yet", 409)
+    # A copy is opened immediately after it is made. copy_to_personal only
+    # returns when there WAS a body to copy, so there is always one here.
+    current = report_templates.get_version(conn, copied["id"], None)
+    return ok(_template_payload(copied, versions=[_version_payload(current)] if current else []),
+              201)
+
+
+def archive_report_template(conn, caller, template_id):
+    """DELETE /api/org/templates/{id} -- soft delete; versions are kept.
+
+    Refuses while a schedule still points at it. The foreign key is ON DELETE
+    RESTRICT, but archiving is an UPDATE and no constraint can catch it: an
+    archived-but-bound template leaves the nightly run pointing at something
+    the Library no longer shows, and the report quietly comes out in the
+    default format -- which nobody would notice until a customer did.
+    """
+    row = report_templates.get_visible(conn, caller["company_id"], caller["id"], template_id)
+    if row is None:
+        return error("template not found", 404)
+    err = _may_write_template(caller, row)
+    if err is not None:
+        return err
+    bound = report_templates.bound_report_types(conn, template_id)
+    if bound:
+        # NAMES THE SCHEDULE. "A scheduled report" leaves the person to go and
+        # find which of three it is, and this is the only place that knows.
+        which = " and ".join(", ".join(bound).rsplit(", ", 1))
+        return error("this template is still writing the %s report -- point "
+                     "that schedule at another template first" % which, 409)
+    report_templates.archive(conn, template_id)
+    return ok({"ok": True, "archived": str(template_id)})
+
+
+def list_report_template_bindings(conn, caller, event):
+    """GET /api/org/templates/bindings -- readable by anyone in the company.
+
+    Only gm/admin may set these, but a worker is entitled to know what format
+    the report going out under their name is written to.
+    """
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    rows = report_templates.list_bindings(conn, company_id)
+    return ok({"bindings": [{
+        "report_type": r["report_type"],
+        "template_id": str(r["template_id"]),
+        "template_name": r["template_name"],
+        "template_slug": r["template_slug"],
+        "pinned_version": r["pinned_version"],
+        "effective_version": r["pinned_version"] or r["current_version"],
+        "set_by": str(r["set_by"]),
+        "set_at": r["set_at"],
+    } for r in rows]})
+
+
+def set_report_template_binding(conn, caller, report_type, event):
+    """PUT /api/org/templates/bindings/{report_type} -- gm/admin only."""
+    if caller["global_role"] not in _TEMPLATE_WRITE_ROLES:
+        return error("admin, gm or platform_admin role required to choose the "
+                     "template a scheduled report uses", 403)
+    if report_type not in _BINDABLE_TYPES:
+        return error("report_type must be one of: %s" % ", ".join(_BINDABLE_TYPES), 400)
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    template_id = body.get("template_id")
+    if not template_id:
+        return error("template_id is required", 400)
+
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    target = report_templates.get_visible(conn, company_id, caller["id"], template_id)
+    if target is None:
+        return error("template not found", 404)
+    # A personal template cannot write the company's nightly report: nobody
+    # else can see it, so nobody else could say what the report even is.
+    if target["scope"] != "org":
+        return error("only an organisation template can be used for a scheduled "
+                     "report", 400)
+    if target["current_version"] < 1:
+        return error("that template has no content yet", 400)
+
+    pinned = body.get("pinned_version")
+    if pinned is not None:
+        try:
+            pinned = int(pinned)
+        except (TypeError, ValueError):
+            return error("pinned_version must be a number", 400)
+        if report_templates.get_version(conn, template_id, pinned) is None:
+            return error("no such version", 404)
+    row = report_templates.set_binding(conn, company_id, report_type, template_id,
+                                       pinned, caller["id"])
+    return ok({
+        "report_type": row["report_type"],
+        "template_id": str(row["template_id"]),
+        "pinned_version": row["pinned_version"],
+        "effective_version": row["pinned_version"] or target["current_version"],
+        "set_by": str(row["set_by"]),
+        "set_at": row["set_at"],
+    })

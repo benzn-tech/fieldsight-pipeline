@@ -658,7 +658,170 @@ def save_debug_record(bucket, target_date, meeting_title, prompt, raw_response,
 # Word Document Generation
 # ============================================================
 
-def generate_prose_document(title, subtitle, sections, actions):
+def _add_photo_strip(doc, streams):
+    """A row of pictures, or nothing. Never raises: the prose is the
+    deliverable and the pictures support it, so one unreadable file costs
+    itself and not the report."""
+    streams = [s for s in (streams or []) if s is not None]
+    if not streams:
+        return
+    strip = doc.add_paragraph()
+    for stream in streams:
+        try:
+            strip.add_run().add_picture(stream, width=Inches(2.4))
+        except Exception:
+            # exc_info, not a bare message (BUG-40): the first writing of this
+            # handler hid a corrupt fixture behind "could not place".
+            logger.warning("skipping a photo python-docx could not place",
+                           exc_info=True)
+
+
+_TABLE_RULE_RE = re.compile(r"^[\s|:-]+$")
+
+
+def _is_table_row(text):
+    return text.startswith("|") and text.count("|") >= 2
+
+
+# A GFM delimiter row: `---|---`, `| :--- | ---: |`, with or without the outer
+# pipes. It must contain at least one pipe -- a bare `---` is a horizontal rule
+# or a setext underline, not a table.
+_DELIMITER_RE = re.compile(r"^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?$")
+
+
+def _is_delimiter_row(text):
+    return "|" in text and bool(_DELIMITER_RE.match(text.strip()))
+
+
+def _table_at(paragraphs, i):
+    """How many lines starting at `i` form a markdown table, or 0.
+
+    THE OUTER PIPES ARE OPTIONAL in GitHub-flavoured markdown, and the model
+    uses both forms. The first version of this only recognised rows that
+    started with `|`, so a table written as
+
+        Item | Assigned | Due
+        ---|---|---
+        Pour | Sam | Friday
+
+    was rendered line by line as paragraphs -- pipe characters and the dashed
+    rule printed into the Word document, which is precisely what teaching the
+    renderer about tables was meant to stop. It was found in a report generated
+    from the ordinary browser flow, a day after the fix that introduced it
+    shipped; the reports that had been checked all happened to use outer pipes.
+
+    So the reliable signal is the DELIMITER ROW, which GFM requires and which a
+    sentence that merely contains a `|` never has. A header line followed by a
+    delimiter row starts a table; lines containing a pipe continue it. Rows that
+    start with `|` are still accepted without a delimiter, because that is the
+    form the model used before and the renderer already handled it.
+    """
+    line = paragraphs[i].strip()
+    if (i + 1 < len(paragraphs) and "|" in line
+            and not _is_delimiter_row(line)
+            and _is_delimiter_row(paragraphs[i + 1].strip())):
+        j = i + 2
+        while j < len(paragraphs) and "|" in paragraphs[j] and paragraphs[j].strip():
+            j += 1
+        return j - i
+    if _is_table_row(line):
+        j = i
+        while j < len(paragraphs) and _is_table_row(paragraphs[j].strip()):
+            j += 1
+        return j - i
+    return 0
+
+
+def _split_table_row(text):
+    return [c.strip() for c in text.strip().strip("|").split("|")]
+
+
+def _add_markdown_table(doc, rows):
+    """Render the pipe rows the model was asked for as an actual table.
+
+    A section whose `kind` is "table" now tells the model to write a markdown
+    table, and this is the half that makes that request honest: without it the
+    document carries the pipe characters themselves, which is what a reader
+    would have got from choosing "Table" in the editor -- a control that could
+    be set, stored and previewed, and whose only effect on the output was to
+    make it worse.
+    """
+    cells = [_split_table_row(r) for r in rows if not _TABLE_RULE_RE.match(r)]
+    cells = [c for c in cells if any(x for x in c)]
+    if not cells:
+        return
+    width = max(len(c) for c in cells)
+    if width < 2:
+        # A ONE-COLUMN TABLE IS NOT A TABLE, and this is not a hypothetical: a
+        # section that said "table" and named no columns got exactly this from
+        # the model -- a single column headed with the section's own title,
+        # holding lines that had read perfectly well as sentences the day
+        # before. The prompt now names the columns, so this should not arrive;
+        # when it does anyway, the lines are worth more as lines than as a
+        # column of boxes.
+        for row in cells:
+            text = (row[0] if row else "").strip()
+            if text:
+                doc.add_paragraph(text, style="List Bullet")
+        return
+    table = doc.add_table(rows=len(cells), cols=width)
+    table.style = "Table Grid"
+    for r, row in enumerate(cells):
+        for c in range(width):
+            table.cell(r, c).text = row[c] if c < len(row) else ""
+    for run in table.rows[0].cells[0].paragraphs[0].runs or []:
+        run.bold = True
+
+
+def _add_prose_section(doc, section):
+    """One section of a template-shaped record: its heading, its lines, and the
+    photographs placed under them."""
+    section_title = section.get("title") or ""
+    # `level` defaults to 1, so every existing caller is unchanged; a
+    # section that came back nested asks for 2. Heading 2 is in python-docx's
+    # default template -- checked before the prompt was taught to ask for
+    # `####`, because asking for something the renderer flattens is how a
+    # wired control still produces nothing.
+    doc.add_heading(section_title, level=int(section.get("level") or 1))
+    # Indices into the section's own paragraph list, so the blanks are NOT
+    # filtered out here -- the splitter already drops empty lines, and
+    # re-filtering would shift every index the photo placement recorded.
+    paragraphs = list(section.get("paragraphs") or [])
+    after = section.get("photos_after") or {}
+    i = 0
+    while i < len(paragraphs):
+        text = (paragraphs[i] or "").strip()
+        if not text:
+            i += 1
+            continue
+        n = _table_at(paragraphs, i)
+        if n:
+            _add_markdown_table(doc, [r.strip() for r in paragraphs[i:i + n]])
+            # A tag on any row of the table puts its photograph under the
+            # whole table: a picture cannot sit between two rows.
+            strip = []
+            for k in range(i, i + n):
+                strip.extend(after.get(k) or [])
+            _add_photo_strip(doc, strip)
+            i += n
+            continue
+        if text.startswith("- ") or text.startswith("* "):
+            doc.add_paragraph(text[2:].strip(), style="List Bullet")
+        else:
+            doc.add_paragraph(text)
+        # THE PHOTOGRAPH OF WHAT THIS LINE SAID, directly under it.
+        _add_photo_strip(doc, after.get(i))
+        i += 1
+
+    # THE PHOTOGRAPHS OF WHAT THIS SECTION IS ABOUT, under it rather than
+    # in a heap at the end. The strip is the same one the assembled report
+    # has always drawn per topic -- same width, same tolerance for a file
+    # python-docx cannot place -- because a reader should not be able to
+    # tell which path wrote the document.
+    _add_photo_strip(doc, section.get("photo_streams"))
+
+
+def generate_prose_document(title, subtitle, sections, actions, closing=None):
     """A record whose headings come from its template, not from this function.
 
     `generate_word_document` below renders the fixed meeting-minutes layout and is
@@ -677,18 +840,9 @@ def generate_prose_document(title, subtitle, sections, actions):
 
     has_actions_section = False
     for section in sections or []:
-        section_title = section.get("title") or ""
-        if section_title.strip().lower() == "actions":
+        if (section.get("title") or "").strip().lower() == "actions":
             has_actions_section = True
-        doc.add_heading(section_title, level=1)
-        for para in section.get("paragraphs") or []:
-            text = (para or "").strip()
-            if not text:
-                continue
-            if text.startswith("- ") or text.startswith("* "):
-                doc.add_paragraph(text[2:].strip(), style="List Bullet")
-            else:
-                doc.add_paragraph(text)
+        _add_prose_section(doc, section)
 
     if actions:
         # A prose section titled "Actions" already wrote this heading above; the
@@ -705,6 +859,9 @@ def generate_prose_document(title, subtitle, sections, actions):
             row[0].text = (a.get("action") or "").strip()
             row[1].text = (a.get("owner") or "").strip() or "no owner recorded"
             row[2].text = (a.get("deadline") or "").strip() or "no date"
+
+    if closing:
+        _add_prose_section(doc, closing)
 
     buf = BytesIO()
     doc.save(buf)

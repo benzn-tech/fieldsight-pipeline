@@ -73,6 +73,16 @@ class Decision:
     name: str | None
     margin: float | None
     reason: str
+    #: The winner's own similarity -- what `best` was when this decision was made, or None
+    #: when no candidate was scored at all (too short, or nothing enrolled).
+    #:
+    #: It is on the Decision because the decision is the only place that knows which
+    #: candidate won, and because its ABSENCE had a cost: `speaker_turn_names.score` was
+    #: NULL on all 604 rows ever written, so `recompute_company_floor` could never reach
+    #: its minimum sample count and `speaker_voiceprint_company_floors` stayed empty from
+    #: the day it was created. The writer was already asking for this value
+    #: (`lambda_voiceprint_writer.py` `score=r.get("score")`); nothing produced it.
+    score: float | None = None
 
 
 # ONE definition, and it lives in the numpy-free module because the in-VPC writer imports it
@@ -156,11 +166,18 @@ def decide_name(scores, duration_s: float,
 
     `floor` is this company's own calibrated rejection floor (`repositories.voiceprints.
     company_floor`), a low percentile of that company's `source='correction'` scores, or
-    `None` when the company has not calibrated one yet (spec S1.5) — `None` is a no-op,
-    reproducing today's margin-only behaviour exactly. It never promotes: a turn the margin
-    already sent to `tentative` (or `unknown`) is untouched by this check, because the
-    floor answers "is the winner's score itself plausible", which only matters once
-    something has already tried to be a winner.
+    `None` when the company has not calibrated one yet (spec S1.5). It never promotes: a
+    turn the margin already sent to `tentative` (or `unknown`) is untouched by this check,
+    because the floor answers "is the winner's score itself plausible", which only matters
+    once something has already tried to be a winner.
+
+    **`None` is no longer a no-op, and that is the change.** It used to mean "skip the
+    plausibility check and confirm on the margin alone", which is the configuration that
+    confirmed an unenrolled stranger at best=0.445 / margin=0.268 on 2026-09-10 — the very
+    case the floor was added to catch. A company without a floor is therefore not a company
+    where the check passes; it is one where the check has not run. `None` now caps the
+    outcome at `tentative`: the name is still offered, as a lean, which is the strongest
+    claim the evidence supports.
     """
     if duration_s is None or duration_s < min_turn_s:
         return Decision("unknown", None, None,
@@ -175,14 +192,16 @@ def decide_name(scores, duration_s: float,
         # Nothing to be better than. Confirming here would be confirming on an absolute
         # score, which is exactly what the overlapping distributions forbid.
         return Decision("tentative", best_name, None,
-                        "only one enrolled profile, so there is no runner-up to beat")
+                        "only one enrolled profile, so there is no runner-up to beat",
+                        score=best)
 
     required_margin = min_margin if min_margin is not None else effective_margin(len(scores))
     margin = best - ranked[1][1]
     if margin < required_margin:
         return Decision("tentative", best_name, margin,
                         f"only {margin:.3f} clear of {ranked[1][0]}; below the "
-                        f"{required_margin:.3f} margin this is a lean, not an identification")
+                        f"{required_margin:.3f} margin this is a lean, not an identification",
+                        score=best)
 
     # The floor: a company-calibrated final check, and a DEMOTION only. A turn with no
     # enrolled speaker present still produces a winner — the least-dissimilar profile in
@@ -193,9 +212,31 @@ def decide_name(scores, duration_s: float,
         return Decision("tentative", best_name, margin,
                         f"clear of the runner-up by {margin:.3f}, but {best:.3f} is below "
                         f"this company's calibrated floor of {floor:.3f} — a wide margin "
-                        f"over weak candidates is not the same as a plausible match")
+                        f"over weak candidates is not the same as a plausible match",
+                        score=best)
+    if floor is None:
+        # No calibrated floor yet, so nothing here can answer "is this score plausible at
+        # all" -- only "is it further from the runner-up than 0.15". Those are different
+        # questions, and the margin alone has a MEASURED failure: on 2026-09-10 a speaker
+        # who was not enrolled at all was confirmed at best=0.445, margin=0.268. The floor
+        # below exists to catch exactly that, and a company without one is a company where
+        # that case is unguarded.
+        #
+        # So the strongest honest answer while the standard is missing is "sounds like
+        # this person", which is what `tentative` means and what the viewer renders with a
+        # question mark. This invents no threshold: it declines to make a confident claim
+        # on the strength of a check that is not running.
+        #
+        # It lifts by itself. `recompute_company_floor` builds the floor from 20 of the
+        # company's OWN human corrections, so a company earns `confirmed` back by being
+        # used -- no number has to be chosen by anybody.
+        return Decision("tentative", best_name, margin,
+                        f"clear of the runner-up by {margin:.3f}, but this company has no "
+                        f"calibrated floor yet, so how plausible {best:.3f} is on its own "
+                        f"has not been checked",
+                        score=best)
     return Decision("confirmed", best_name, margin,
-                    f"clear of the runner-up by {margin:.3f}")
+                    f"clear of the runner-up by {margin:.3f}", score=best)
 
 
 def window_is_homogeneous(frame_embeddings,

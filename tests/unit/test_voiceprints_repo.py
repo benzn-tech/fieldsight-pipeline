@@ -20,12 +20,38 @@ VP = "22222222-2222-2222-2222-222222222222"
 
 
 class FakeCursor:
+    """⚠️ RESULTS ARE SERVED POSITIONALLY, in the order a test queued them.
+
+    So **adding any query near the front of a function under test shifts every queued
+    result after it**, and the tests that break are the ones with nothing to do with your
+    change. That has happened once: the withdrawal-in-flight guard put a liveness check at
+    the top of `add_sample` and nine unrelated tests went red, all raising the guard's own
+    exception -- which reads as "this guard refuses everything" when what it refuses is a
+    profile this double never said existed.
+
+    Nine tests failing at once with one exception is a symptom of the DOUBLE, not of the
+    code. Check here before changing the thing under test to suit it.
+    """
+
     def __init__(self, conn):
         self.conn = conn
         self._rows = []
 
+    #: The liveness check `add_sample` makes before anything else (the withdrawal-in-flight
+    #: guard). Answered here rather than queued, for two reasons: every test in this file
+    #: is about a LIVE profile, and this double serves results POSITIONALLY -- so a new
+    #: query at the front of the function would shift every queued result by one and break
+    #: nine tests that have nothing to do with withdrawal. Queue a `[{"status":
+    #: "withdrawn"}]` explicitly to exercise the refusal; `test_withdrawal_beats_an_
+    #: enrolment_in_flight.py` is where that is done.
+    _LIVENESS = "SELECT status FROM speaker_voiceprints"
+
     def execute(self, sql, params=None):
-        self.conn.calls.append({"sql": " ".join(sql.split()), "params": params})
+        flat = " ".join(sql.split())
+        self.conn.calls.append({"sql": flat, "params": params})
+        if flat.startswith(self._LIVENESS) and not self.conn.answer_liveness_from_queue:
+            self._rows = [{"status": "tentative"}]
+            return self
         self._rows = self.conn._pop_result()
         return self
 
@@ -37,6 +63,9 @@ class FakeCursor:
 
 
 class FakeConn:
+    #: Let a test take over the liveness answer when the withdrawal guard is the subject.
+    answer_liveness_from_queue = False
+
     def __init__(self, results=None):
         self.calls = []
         self._results = list(results or [])
@@ -1032,12 +1061,26 @@ def test_no_parameter_in_the_attempt_update_is_untyped_in_a_null_test():
 
 def test_the_listing_counts_human_samples_separately_from_harvested_ones():
     """The distinction the whole harvest design rests on: a profile built only from
-    inference must not read as one somebody vouched for."""
+    inference must not read as one somebody vouched for.
+
+    Both counts became quarantine-aware in 0064, and the assertion follows the MEANING
+    rather than the old literal: `samples` is what still matches, so a set-aside vector must
+    not inflate it. A listing that counted quarantined rows as samples would say a profile
+    holds twelve when four of them match nobody — which is precisely the state this listing
+    exists to make visible.
+    """
     conn = FakeConn([[{"id": "vp-1"}]])
     voiceprints.list_profiles(conn, CO)
     sql = " ".join(conn.calls[0]["sql"].split())
-    assert "count(s.id) AS samples" in sql
-    assert "FILTER (WHERE s.source = 'correction')" in sql
+    assert "AS samples" in sql
+    assert "s.source = 'correction'" in sql
+    assert "AS human_samples" in sql
+    # Both counts exclude the set-aside rows, and the set-aside count is reported beside
+    # them rather than folded in: "4 samples" and "4 samples, 2 set aside" are different
+    # facts about a profile.
+    assert sql.count("s.quarantined_at IS NULL") >= 2, (
+        "a quarantined vector still counts towards `samples` or `human_samples`")
+    assert "AS quarantined" in sql
 
 
 def test_the_listing_is_a_left_join_so_an_empty_profile_still_appears():

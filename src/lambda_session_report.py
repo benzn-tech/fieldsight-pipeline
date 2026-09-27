@@ -15,12 +15,14 @@ import datetime
 import json
 import logging
 import os
+import re
 import time
 from io import BytesIO
 from urllib.parse import unquote_plus
 
 import boto3
 
+import chunking
 import lambda_meeting_minutes
 import llm_utils
 import report_template
@@ -123,6 +125,191 @@ def _fetch_photos(folder, date, filenames, budget):
         streams.append(BytesIO(body))
         budget[0] -= len(body)
     return streams
+
+
+def _in_window(topic, date, win_from, win_to):
+    """True when a topic's time_range overlaps [win_from, win_to).
+
+    A time_range that does not parse cannot be placed, so it is in the window
+    only when the window is the whole day -- where every topic of the scope is
+    in it by definition. Anywhere narrower it is left out rather than guessed
+    in: the coverage note would otherwise say "recorded in this window" about a
+    topic that may have been recorded outside it."""
+    parsed = chunking.parse_time_range(topic.get("time_range"))
+    day = datetime.datetime.strptime(date, "%Y-%m-%d")
+    whole_day = (win_from <= day and win_to >= day + datetime.timedelta(hours=23, minutes=59))
+    if not parsed:
+        return whole_day
+    start = day + datetime.timedelta(seconds=parsed[0])
+    end = day + datetime.timedelta(seconds=parsed[1])
+    # A collapsed range (start == end, BUG-09) is a point; it is in the window
+    # when the point is.
+    return (start < win_to and end > win_from) or (start == end and win_from <= start < win_to)
+
+
+def _offered_topics(artifact, budget, win_from, win_to):
+    """(offer, streams_by_ref) for the topics of this report inside the window.
+
+    `offer` is what the prompt shows the model: a stable ref, the time range,
+    the title and how many photographs it has. `streams_by_ref` is what the
+    renderer places, for the topics that have any. Both come from one walk, so
+    a photograph count the model is shown has bytes behind it.
+
+    EVERY TOPIC IN THE WINDOW IS OFFERED, not only the ones with photographs.
+    The ref a line ends with is how a photograph finds its line, and it is also
+    the one thing in the model's answer that says which topic a line reported.
+    Counting the refs that came back -- outside the model -- is what lets the
+    report say which recorded topics it does not mention (see
+    _coverage_note). A topic offered only when it had a photograph could not
+    be counted when it had none.
+
+    THE ORDER IS THE TOPICS' OWN, and the shared byte budget is spent walking
+    it, so an early photo-heavy topic cannot silently starve a later one.
+
+    A PHOTOGRAPH IS FETCHED ONCE even when two topics name it. Prod has
+    measured 13.7% of photographs bound to more than one topic -- the binding
+    unit is the session, not the day -- so without this a report would carry
+    the same picture twice and charge the budget twice for it.
+
+    A topic whose photographs could not be read is still offered, as a topic
+    with none: losing the pictures must not also lose it from the count.
+    """
+    seen = {}
+    offer, streams = [], {}
+    folder = artifact.get("folder")
+    content = artifact.get("content") or {}
+    date = artifact.get("date") or content.get("date")
+    for i, topic in enumerate(content.get("topics") or []):
+        if not _in_window(topic, date, win_from, win_to):
+            continue
+        ref = "t%d" % i
+        names = [n for n in (topic.get("related_photos") or []) if n]
+        fresh = [n for n in names if n not in seen]
+        got = _fetch_photos(folder, date, fresh, budget) if fresh else []
+        for name, stream in zip(fresh, got):
+            seen[name] = stream
+        mine = [seen[n] for n in names if n in seen]
+        if mine:
+            streams[ref] = mine
+        offer.append({"ref": ref,
+                      "title": topic.get("topic_title"),
+                      "time_range": topic.get("time_range"),
+                      "photos": len(mine)})
+    return offer, streams
+
+
+def _referenced(sections):
+    """Every topic ref the answer names, on a line or on a `[covers:]` line."""
+    out = set()
+    for section in sections:
+        for refs in section.get("line_refs") or []:
+            out.update(refs)
+        out.update(section.get("covers") or [])
+    return out
+
+
+COVERAGE_TITLE = "Also recorded"
+COVERAGE_INTRO = "Recorded in this window, but not referred to by any line above:"
+
+
+def _coverage_note(offer, sections):
+    """The section the report ends with when a recorded topic went unmentioned,
+    or None when every offered topic was named somewhere.
+
+    WHY THIS IS WRITTEN HERE AND NOT BY THE MODEL. A section description can
+    tell the model what to leave out, and the owner has decided descriptions
+    keep that power ("NO DATA TODAY" is a feature). Probe 3 measured a
+    description beating the house rule 10 times out of 10 with the fence in
+    place, so nothing written INTO the prompt can make leaving something out
+    visible. This note is built after the answer, from a count, and rendered
+    by our code: no description reaches it, and it cannot be reworded, moved
+    or dropped by one.
+
+    WHAT IT RESTS ON, stated so nobody quotes it as more: the refs are the
+    model's own statement of which topic a line reported. It catches a topic
+    the model did not write about -- the shape a description-driven omission
+    takes -- and it does not catch a line tagged with a topic it did not
+    actually report. The wording says "not referred to", which is what was
+    counted, rather than "left out", which was not.
+
+    Each line carries its topic's ref, so a photograph of a topic nobody wrote
+    about lands under the line that names it instead of under whatever heading
+    happened to be last.
+    """
+    named = _referenced(sections)
+    missing = [t for t in offer if t["ref"] not in named]
+    if not missing:
+        return None
+    paragraphs, line_refs = [COVERAGE_INTRO], [[]]
+    for t in missing:
+        when = (t.get("time_range") or "").strip() or "time not recorded"
+        title = (t.get("title") or "").strip() or "Untitled topic"
+        paragraphs.append("- %s  %s" % (when, title))
+        line_refs.append([t["ref"]])
+    return {"title": COVERAGE_TITLE, "paragraphs": paragraphs, "level": 1,
+            "covers": [], "line_refs": line_refs, "coverage_note": True}
+
+
+def _place_photos(sections, streams_by_ref):
+    """Put each topic's photographs as close as the model said they belong.
+
+    Returns (under_a_line, under_a_section, fell_to_the_end) as photograph
+    counts. Three tiers, most precise first, each a fallback for the one above:
+
+      1. DIRECTLY UNDER THE LINE that names the topic -- a paragraph, a list
+         item or a table row ending in `[t1]`. This is what the owner asked
+         for: the photograph beside what was said about it, as the Timeline
+         shows it.
+      2. At the end of a SECTION whose `[covers: ...]` line names it. The
+         prompt no longer asks for this; it stays because a model that writes
+         it anyway should not lose the photograph for having done so.
+      3. Under the LAST HEADING, for anything nobody claimed -- the same floor
+         the prompt states for text nobody covered. A photograph that vanished
+         because the model forgot a tag would be indistinguishable from one
+         that was never taken.
+
+    A photograph appears ONCE, under the first line that names its topic. A
+    day's work does not divide neatly and two lines naming the same topic is
+    not an error, but the picture printed twice would read as one.
+    """
+    if not streams_by_ref or not sections:
+        return 0, 0, 0
+    at_line = at_section = 0
+    taken = set()
+
+    def claim(ref):
+        if ref in taken or ref not in streams_by_ref:
+            return []
+        taken.add(ref)
+        return list(streams_by_ref[ref])
+
+    for section in sections:
+        after = {}
+        for i, refs in enumerate(section.get("line_refs") or []):
+            mine = []
+            for ref in refs:
+                mine.extend(claim(ref))
+            if mine:
+                after[i] = mine
+                at_line += len(mine)
+        if after:
+            section["photos_after"] = after
+
+    for section in sections:
+        mine = []
+        for ref in section.get("covers") or []:
+            mine.extend(claim(ref))
+        if mine:
+            section["photo_streams"] = (section.get("photo_streams") or []) + mine
+            at_section += len(mine)
+
+    leftover = []
+    for ref in streams_by_ref:
+        leftover.extend(claim(ref))
+    if leftover:
+        last = sections[-1]
+        last["photo_streams"] = (last.get("photo_streams") or []) + leftover
+    return at_line, at_section, len(leftover)
 
 
 def _content_to_minutes(artifact):
@@ -300,18 +487,86 @@ def _action_items_for_prompt(content):
     return out
 
 
+_COVERS_RE = re.compile(r"^\[covers:\s*([^\]]*)\]$", re.IGNORECASE)
+_REF_RE = re.compile(r"t\d+", re.IGNORECASE)
+# `... signed off by the engineer. [t1]` / `[t1, t3]` / `[T1 and T3]`, at the END
+# of a line only. Anchored to the end so a bracket in the middle of a sentence
+# -- "[sic]", a citation, a quoted form number -- is never read as a reference;
+# and only `t` followed by digits, so nothing a person would naturally write in
+# brackets can move a photograph.
+_LINE_TAG_RE = re.compile(
+    r"\s*\[\s*(t\d+(?:\s*(?:,|and|&)\s*t\d+)*)\s*\]\s*$", re.IGNORECASE)
+
+
+def _line_refs(line):
+    """(line without its tag, [refs]) -- the refs lowercased, unique, in order."""
+    m = _LINE_TAG_RE.search(line)
+    if not m:
+        return line, []
+    refs = []
+    for ref in _REF_RE.findall(m.group(1)):
+        ref = ref.lower()
+        if ref not in refs:
+            refs.append(ref)
+    return line[:m.start()].rstrip(), refs
+
+
+def _covers_refs(line):
+    """The topic refs on a `[covers: ...]` line, lowercased, in order, unique.
+
+    Deliberately forgiving about what surrounds them and strict about their
+    shape: the model writes this line, and a model that writes `[covers: t1 and
+    t3]` or `[covers: T1,T3]` means the same thing. What it cannot do is invent
+    a topic -- every ref is checked against the ones actually offered before a
+    photograph moves anywhere.
+    """
+    m = _COVERS_RE.match(line)
+    if not m:
+        return []
+    body = m.group(1).strip()
+    if body.lower() == report_template.COVERS_NONE:
+        return []
+    out = []
+    for ref in _REF_RE.findall(body):
+        ref = ref.lower()
+        if ref not in out:
+            out.append(ref)
+    return out
+
+
 def _prose_sections(text):
     """Split the model's markdown back into {title, paragraphs}. Anything before the
     first heading is kept under an empty title rather than dropped."""
-    sections, current = [], {"title": "", "paragraphs": []}
+    sections, current = [], {"title": "", "paragraphs": [], "level": 1,
+                             "covers": [], "line_refs": []}
     for raw in (text or "").splitlines():
         line = raw.rstrip()
         if line.startswith("#"):
             if current["title"] or current["paragraphs"]:
                 sections.append(current)
-            current = {"title": line.lstrip("#").strip(), "paragraphs": []}
+            # THE DEPTH IS PART OF THE HEADING and used to be thrown away with
+            # the hashes. A sub-section asked for as `####` came back as `####`
+            # and was rendered at the same level as its parent, which reads as
+            # the nesting having been ignored -- the fault it was meant to fix,
+            # wearing a different face.
+            depth = len(line) - len(line.lstrip("#"))
+            current = {"title": line.lstrip("#").strip(), "paragraphs": [],
+                       "level": 2 if depth > 3 else 1, "covers": [],
+                       "line_refs": []}
+        elif _COVERS_RE.match(line.strip()):
+            # OUR OWN SCAFFOLDING, and it never reaches the page. The model is
+            # asked to end each section with it so the renderer knows which
+            # topics that section reported -- see report_template._covers_block
+            # for why the model is asked rather than the renderer guessing.
+            current["covers"] = _covers_refs(line.strip())
         elif line.strip():
-            current["paragraphs"].append(line.strip())
+            # The tag comes off before the line is kept, so it can never reach
+            # the page -- including when the line is a table row, where it
+            # would otherwise sit in the last cell.
+            text, refs = _line_refs(line.strip())
+            if text:
+                current["paragraphs"].append(text)
+                current["line_refs"].append(refs)
     if current["title"] or current["paragraphs"]:
         sections.append(current)
     return [s for s in sections if s["title"] or s["paragraphs"]]
@@ -329,7 +584,30 @@ def _put_document(artifact, buf):
 def _generate_document(artifact, context=None):
     """Returns (buffer, meta). Raises on anything that must not produce a document."""
     gen = artifact["generate"]
-    template = report_template.load_template(gen["templateId"], int(gen["templateVersion"]))
+    # THE BODY ARRIVES WITH THE REQUEST. This function runs non-VPC and cannot
+    # reach Aurora, so a template a company wrote in the Library could never be
+    # read from here. org-api resolves it in the VPC and inlines it, and inlines
+    # the file-backed ones the same way so there is ONE path rather than two.
+    #
+    # The fallback to disk is for artifacts enqueued BEFORE this field existed
+    # and still sitting in the bucket when this deploys. It is deliberately not
+    # a fallback for a uuid: report_template.load_template rejects anything that
+    # is not a slug, so a stored template with no inlined body raises
+    # TemplateNotFound rather than silently writing the report to some other
+    # template -- which would make the template name in the result a lie.
+    template = gen.get("templateBody")
+    if not template:
+        template = report_template.load_template(gen["templateId"], int(gen["templateVersion"]))
+    # An artifact enqueued before org-api started saying this carries an inlined
+    # body and no source. It is treated as customer-written, because the two
+    # mistakes are not symmetrical: calling a reviewed template customer-written
+    # costs a fence around text that did not need one, and calling a customer
+    # template reviewed hands unreviewed text the instruction layer. Loaded from
+    # disk just above, it is ours by construction.
+    source = gen.get("templateSource")
+    if not source:
+        source = (report_template.SOURCE_LIBRARY if gen.get("templateBody")
+                  else report_template.SOURCE_BUILTIN)
     content = artifact.get("content") or {}
     date = artifact.get("date") or content.get("date")
     window = artifact.get("window") or {}
@@ -359,13 +637,21 @@ def _generate_document(artifact, context=None):
     if not turns:
         raise RuntimeError("no recorded speech in this window after exclusions")
 
+    # THE PHOTOGRAPHS ARE FETCHED BEFORE THE PROMPT IS BUILT, because the
+    # prompt tells the model how many each topic has, and that number has to
+    # have bytes behind it.
+    photo_budget = [MAX_PHOTO_BYTES_TOTAL]
+    topic_offer, photo_streams = _offered_topics(artifact, photo_budget, win_from, win_to)
+
     prompt = report_template.render_prompt(
         template,
         {"folder": artifact["folder"], "date": date,
          "from": window.get("from") or "00:00", "to": window.get("to") or "23:59",
          "recordings": len(picked)},
         _action_items_for_prompt(content),
-        "\n".join(t["line"] for t in turns))
+        "\n".join(t["line"] for t in turns),
+        source=source,
+        topics=topic_offer)
 
     # Recomputed from `context` (not reused from `read_budget`) because this is the
     # actual authority on what is left after the read phase ran, not an estimate
@@ -381,14 +667,70 @@ def _generate_document(artifact, context=None):
     if err or not (text or "").strip():
         raise RuntimeError(err or "empty answer from model")
 
+    prose = _prose_sections(text)
+    # Counted here, after the answer and outside it -- see _coverage_note.
+    note = _coverage_note(topic_offer, prose)
+    named = _referenced(prose)
+    not_referenced = [t for t in topic_offer if t["ref"] not in named]
+    at_line, at_section, orphaned = _place_photos(prose + ([note] if note else []),
+                                                  photo_streams)
+    placed = at_line + at_section
+    if topic_offer:
+        logger.info("coverage: %d topics offered, %d referenced, not referenced: %s",
+                    len(topic_offer), len(topic_offer) - len(not_referenced),
+                    ",".join(t["ref"] for t in not_referenced) or "none")
+    if photo_streams:
+        # Counted, not assumed, and BY TIER. "Did the model tag the lines we
+        # asked it to" is the question this feature turns on, and only the
+        # output end can answer it: a prompt that contains the request is not
+        # a model that obeyed it.
+        logger.info("photos: %d offered, %d under a line, %d under a section, "
+                    "%d fell to the last heading",
+                    sum(len(v) for v in photo_streams.values()),
+                    at_line, at_section, orphaned)
+
     buf = lambda_meeting_minutes.generate_prose_document(
-        artifact.get("title") or template.get("name") or "Report",
+        artifact.get("title") or gen.get("templateName") or template.get("name") or "Report",
         "%s  %s - %s" % (date, window.get("from") or "00:00", window.get("to") or "23:59"),
-        _prose_sections(text),
-        _action_items_for_prompt(content))
-    meta = {"generated": True, "templateId": template["template_id"],
-            "templateVersion": template["version"], "model": llm_utils.active_model(),
-            "promptChars": len(prompt)}
+        prose,
+        _action_items_for_prompt(content),
+        closing=note)
+    # WHICH TEMPLATE THIS WAS comes from the REQUEST, not from the template's
+    # own text. The files in report_templates/ carry `template_id` and
+    # `version` inside them; a template written in the Library does not -- its
+    # body is sections, catch_all, excluded_subjects and style, and nothing
+    # else. Reading identity off the body worked for exactly as long as every
+    # template was a file, and raised KeyError('template_id') the first time a
+    # customer generated from their own template. The error reached the screen
+    # as the word 'template_id' and nothing else.
+    #
+    # `gen` is the right place regardless: it is what was ASKED for, and it is
+    # already what the status endpoint echoes back as provenance.
+    meta = {"generated": True,
+            "templateId": gen.get("templateId") or template.get("template_id"),
+            "templateVersion": gen.get("templateVersion") or template.get("version"),
+            # For the filename, and only for it. A uuid identifies the template
+            # to the system; the NAME is what the person who made it called it,
+            # and the file lands in their Downloads folder. It is recorded in
+            # the result rather than looked up later because the presign runs
+            # in-VPC and the name it wants is a fact about this generation.
+            "templateName": gen.get("templateName") or template.get("name"),
+            "model": llm_utils.active_model(),
+            "promptChars": len(prompt),
+            # Provenance for the one thing that cannot be read back off the
+            # document: a photograph under the last heading looks exactly like
+            # a photograph the model placed there on purpose.
+            "photosPlaced": placed,
+            "photosUnderALine": at_line,
+            "photosUnderASection": at_section,
+            "photosUnplaced": orphaned,
+            # What the coverage note was built from. `topicsNotReferenced` is
+            # exactly what the note printed; it is here because the note is in
+            # a Word file and this is not.
+            "topicsOffered": len(topic_offer),
+            "topicsNotReferenced": [{"ref": t["ref"], "title": t.get("title"),
+                                     "time_range": t.get("time_range")}
+                                    for t in not_referenced]}
     return buf, meta
 
 
@@ -448,7 +790,8 @@ def process_request(artifact, context=None):
             logger.exception("report: generation failed for %s", artifact.get("requestId"))
             _write_result(artifact["resultKey"],
                           dict({"status": "error", "requestId": artifact.get("requestId"),
-                                "error": str(exc)}, **_scope_result_fields(artifact)))
+                                "error": _failure_message(exc)},
+                               **_scope_result_fields(artifact)))
             return
         doc_key = _put_document(artifact, buf)
         _write_result(artifact["resultKey"],
@@ -476,8 +819,29 @@ def process_request(artifact, context=None):
                                    "docKey": doc_key, "emailed": emailed, **scope_fields})
     except Exception as e:
         logger.exception("session report generation failed for %s", request_id)
-        _write_result(result_key, {"status": "error", "requestId": request_id, "error": str(e),
-                                   **scope_fields})
+        _write_result(result_key, {"status": "error", "requestId": request_id,
+                                   "error": _failure_message(e), **scope_fields})
+
+
+def _failure_message(exc):
+    """A sentence, not a token.
+
+    `str(KeyError("template_id"))` is `"'template_id'"`. That went straight into
+    the result, and the screen showed a customer the single quoted word
+    `'template_id'` with no download and no next step -- a string that reads
+    like a leak rather than a message, because it is one.
+
+    Every exception type has this problem to some degree: `str(IndexError())`
+    is empty, `str(TimeoutError())` often is too. So the type is always named
+    and a plain-English lead always precedes it. The detail stays attached,
+    because the person reporting this is the fastest route to whoever fixes it
+    and a screenshot is what they will send.
+    """
+    detail = str(exc).strip()
+    kind = type(exc).__name__
+    if not detail:
+        return "The report could not be generated (%s)." % kind
+    return "The report could not be generated (%s: %s)." % (kind, detail)
 
 
 def lambda_handler(event, context):
