@@ -54,6 +54,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -205,8 +206,11 @@ def ask(state, questions: dict, *, model=None, timeout=None, caller=None) -> dic
         "Content-Type": "application/json",
         "Authorization": "Bearer " + api_key,
     }
+    # Fix wave 3, minor 6: 20s default (was 10s) -- the Decisions endpoint is
+    # alpha and 10s left no margin for its own latency being on the slower
+    # side of a retryable-but-not-yet-failing call.
     http_timeout = timeout if timeout is not None else float(
-        os.environ.get("DECISIONS_HTTP_TIMEOUT", "10"))
+        os.environ.get("DECISIONS_HTTP_TIMEOUT", "20"))
 
     started = time.time()
     last_error = None
@@ -244,8 +248,16 @@ def ask(state, questions: dict, *, model=None, timeout=None, caller=None) -> dic
                 detail = detail.get("message")
             raise SystemOneError(
                 f"HTTP {status}" + (f": {detail}" if detail else "")) from e
-        except urllib.error.URLError as e:
-            last_error = str(e.reason)
+        except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+            # Fix wave 3, minor 6: a READ timeout does not always surface as
+            # `urllib.error.URLError` -- `urlopen`/`http.client` can raise a
+            # bare `socket.timeout` (an alias of `TimeoutError` since Python
+            # 3.10) directly, which is NOT a `URLError` subclass. Before this,
+            # such a timeout escaped this function uncaught and was never
+            # retried, unlike every other retryable failure here. `.reason`
+            # only exists on `URLError`; a bare timeout has no such attribute.
+            reason = getattr(e, "reason", None)
+            last_error = str(reason) if reason is not None else (str(e) or "timed out")
             if attempt < MAX_ATTEMPTS - 1:
                 logger.warning("systemone: request failed (%s), retrying", last_error)
                 time.sleep(DEFAULT_BACKOFF_SECONDS)

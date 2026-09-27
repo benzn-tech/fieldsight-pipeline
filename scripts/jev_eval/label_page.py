@@ -88,6 +88,16 @@ _LABEL_FIELD_TITLES = {
 }
 
 
+def _safe_json(value) -> str:
+    """`json.dumps` with every `</` escaped to `<\\/` (fix wave 3, minor 1) --
+    customer text embedded in `display` can legitimately contain the literal
+    substring `</script>` (e.g. someone reading it aloud on a recording), and
+    without this a summary containing it would close the page's own
+    `<script>` block early, breaking the page (and, worse, letting whatever
+    text follows `</script>` render as raw, unescaped HTML)."""
+    return json.dumps(value, sort_keys=True).replace("</", "<\\/")
+
+
 def build_html(set_name: str, batch_rows: list) -> str:
     if set_name not in QUESTION_TEXT:
         raise ValueError(f"unknown set: {set_name!r}")
@@ -95,8 +105,8 @@ def build_html(set_name: str, batch_rows: list) -> str:
     items = build_items_payload(batch_rows)
     question = QUESTION_TEXT[set_name]
     b_hash = batch_hash(batch_rows)
-    field_titles_json = json.dumps(_LABEL_FIELD_TITLES, sort_keys=True)
-    items_json = json.dumps(items, sort_keys=True)
+    field_titles_json = _safe_json(_LABEL_FIELD_TITLES)
+    items_json = _safe_json(items)
 
     # Everything below is inlined -- no <script src=...>, no <link rel=stylesheet
     # href=...>, no fetch()/XHR of any kind. The storage key mixes the set name
@@ -167,10 +177,10 @@ def build_html(set_name: str, batch_rows: list) -> str:
 <script>
 (function () {{
   "use strict";
-  var SET_NAME = {json.dumps(set_name)};
-  var BATCH_HASH = {json.dumps(b_hash)};
+  var SET_NAME = {_safe_json(set_name)};
+  var BATCH_HASH = {_safe_json(b_hash)};
   var ITEMS = {items_json};
-  var QUESTION = {json.dumps(question)};
+  var QUESTION = {_safe_json(question)};
   var FIELD_TITLES = {field_titles_json};
   var STORAGE_KEY = "jev_label_progress_v1:" + SET_NAME + ":" + BATCH_HASH;
 

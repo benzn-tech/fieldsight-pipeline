@@ -6,6 +6,7 @@ for the task brief this file implements.
 """
 import io
 import json
+import socket
 import urllib.error
 
 import pytest
@@ -145,6 +146,34 @@ def test_429_retries_once_then_raises(monkeypatch):
     with pytest.raises(client.SystemOneError):
         client.ask("state text", {"q": {"type": "noul"}})
     assert len(transport.requests) == 2
+
+
+def test_read_timeout_retries_once_then_raises(monkeypatch):
+    # A bare socket.timeout (== TimeoutError in modern Python) is what a real
+    # read timeout raises -- not urllib.error.URLError. Before fix wave 3,
+    # minor 6, this escaped ask() uncaught on the first attempt.
+    transport = _install(monkeypatch, socket.timeout("timed out"), socket.timeout("timed out"))
+    with pytest.raises(client.SystemOneError) as exc_info:
+        client.ask("state text", {"q": {"type": "noul"}})
+    assert len(transport.requests) == 2
+    assert "timed out" in str(exc_info.value)
+
+
+def test_timeout_then_success_on_retry_succeeds(monkeypatch):
+    transport = _install(
+        monkeypatch,
+        TimeoutError("timed out"),
+        FakeHTTPResponse(200, _decisions_payload()),
+    )
+    result = client.ask("state text", {"q": {"type": "noul"}})
+    assert len(transport.requests) == 2
+    assert result["answers"]["is_urgent"]["noul"] == 0.73
+
+
+def test_default_http_timeout_is_20_seconds(monkeypatch):
+    transport = _install(monkeypatch, FakeHTTPResponse(200, _decisions_payload()))
+    client.ask("state text", {"q": {"type": "noul"}})
+    assert transport.requests[0]["timeout"] == 20.0
 
 
 def test_oversize_state_raises_before_any_request(monkeypatch):

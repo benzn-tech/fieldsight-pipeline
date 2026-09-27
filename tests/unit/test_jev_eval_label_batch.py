@@ -521,6 +521,23 @@ def test_page_has_no_http_url():
     assert "https://" not in html
 
 
+def test_page_escapes_closing_script_tag_in_customer_text():
+    rows = [
+        {
+            "set": "threads", "id": "threads:zzz", "label": None, "label_source": "owner",
+            "features": {}, "display": {"earlier_title": "Say </script><b>hi</b> now"},
+            "site_id": "s1", "company_id": "c1", "baseline": {"score": 0.1}, "stratum": "low",
+        },
+    ]
+    html = lp.build_html("threads", rows)
+    assert "</script><b>" not in html
+    assert "<\\/script>" in html
+    # The page must still have exactly the two real <script> tags (open/close
+    # of the one inline block) -- the embedded text must not add a third.
+    assert html.count("<script>") == 1
+    assert html.count("</script>") == 1
+
+
 def test_page_never_shows_stratum_or_score():
     rows = _batch_rows_for_page()
     html = lp.build_html("threads", rows)
@@ -599,10 +616,27 @@ def test_import_labels_drops_unsure_and_counts_it(tmp_path, fixtures_and_batch):
 
     assert result["imported_yes_no"] == 2
     assert result["unsure_dropped"] == 1
+    assert result["skipped_unknown_id"] == 0
 
     merged = il.load_jsonl(fixtures_dir / "threads.jsonl")
     assert {r["id"]: r["label"] for r in merged} == {"threads:aaa": "yes", "threads:bbb": "no"}
     assert all(r["label_source"] == "owner" for r in merged)
+
+
+def test_import_labels_counts_ids_not_in_the_batch(tmp_path, fixtures_and_batch):
+    fixtures_dir, batch_dir = fixtures_and_batch
+    labels_path = tmp_path / "threads.labels.json"
+    labels_path.write_text(json.dumps({
+        "threads:aaa": "yes", "threads:not-in-batch": "no",
+    }), encoding="utf-8")
+
+    result = il.import_set("threads", labels_path, batch_dir=batch_dir, fixtures_dir=fixtures_dir,
+                            now_iso="2026-09-28T00:00:00+00:00")
+
+    assert result["imported_yes_no"] == 1
+    assert result["skipped_unknown_id"] == 1
+    merged = il.load_jsonl(fixtures_dir / "threads.jsonl")
+    assert {r["id"] for r in merged} == {"threads:aaa"}
     assert all(r["decided_at"] == "2026-09-28T00:00:00+00:00" for r in merged)
 
 
