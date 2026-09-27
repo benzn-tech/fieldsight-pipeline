@@ -34,6 +34,20 @@ ece10, coverage_at_p95) use run 1 only (ruling #3). `run_agreement` compares
 run 1 and run 2 on the same ids, and also reports the mean absolute score
 difference between runs -- the noise floor a real effect has to clear.
 
+`coverage_at_p95` (controller ruling, fix round 1) is a dict, not a bare
+number: `{"pooled": ..., "a_to_b": ..., "b_to_a": ..., "in_sample": ...}`.
+`pooled`/`a_to_b`/`b_to_a` are HELD-OUT: on the fit half, take the lowest
+threshold whose precision on the fit half is >= 0.95, then report that
+threshold's precision and coverage on the OTHER (held-out) half; `pooled`
+combines both directions' held-out predictions (every usable row is
+held-out in exactly one direction, so this covers all of them without ever
+scoring a row against a threshold fit with that row in it). `in_sample` is
+the older, optimistic, same-rows-fit-and-scored number -- kept for
+comparison, explicitly labelled so nobody reads it as the gate. Likewise
+`run_agreement` under a `"fit"` policy pools each half's agreement using
+that half's held-out threshold (fit on the OTHER half), never a single
+threshold applied to ids it was fit on.
+
 Split-half (ruling #4): ids are partitioned by the parity of
 `int(sha256(id).hexdigest(), 16)` -- deterministic, no RNG, no dependency on
 id ordering. Half A and half B are always disjoint and always cover every id
@@ -47,7 +61,12 @@ choice-type sub-answers are excluded) via plain-numpy gradient descent with
 an L2 penalty (`L2_PENALTY` below) -- with ~13 rows per half an
 unregularised fit on near-separable synthetic-looking label patterns would
 blow up. Both the fitted weights and the v0-vs-fitted comparison are
-reported under `decomposed_fit`.
+reported under `decomposed_fit`. Per the controller's fix-round-1 ruling,
+the p95 threshold for this arm is fit on the FITTED composite's predicted
+probabilities on the same fit half the weights came from, and evaluated on
+the other half -- `decomposed_fit["a_to_b"]["p95"]` /
+`["b_to_a"]["p95"]` / `["p95_pooled"]`, mirroring the non-decomposed
+`coverage_at_p95` shape.
 
 Control check (ruling #6): for each Jev arm that has a paired control arm
 (`broad`/`control_broad`, `decomposed`/`control_decomposed`), compares the
@@ -104,6 +123,28 @@ def _usable_rows(rows: list) -> list:
 
 def _label_bit(row: dict) -> int:
     return 1 if row["label"] == "yes" else 0
+
+
+def _has_both_classes(usable_rows: list) -> bool:
+    saw_yes = any(r["label"] == "yes" for r in usable_rows)
+    saw_no = any(r["label"] == "no" for r in usable_rows)
+    return saw_yes and saw_no
+
+
+def _class_balance_reason(rows: list) -> str | None:
+    """None if `rows` has usable rows of both labels (safe to fit a
+    threshold on); otherwise a reason string. A fit half with only one
+    label class produces a degenerate threshold (any value clears the
+    "maximise accuracy on this half" bar when everyone shares a label) --
+    controller ruling (fix round 1, finding #3): every threshold-dependent
+    metric fit on such a half must come back None with this reason, not a
+    threshold nobody chose for a real reason."""
+    usable = _usable_rows(rows)
+    if not usable:
+        return "fit half has no usable rows"
+    if not _has_both_classes(usable):
+        return "fit half has fewer than one row of each label"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -209,10 +250,14 @@ def _metrics_at_threshold(rows: list, threshold: float) -> dict:
 # ---------------------------------------------------------------------------
 
 def coverage_at_p95(rows: list) -> tuple:
-    """Largest share of usable rows an arm may auto-accept (score >=
-    threshold) while precision on the accepted set stays >= 0.95. Returns
-    (coverage, threshold). 0 / None when no threshold reaches it (brief
-    Step 4 -- this is the one metric that is 0, not None, when undefined)."""
+    """IN-SAMPLE ONLY -- fits the threshold and measures coverage/precision
+    on the SAME rows. Kept because it is a cheap sanity number, but it reads
+    optimistic (a threshold can always be chosen to fit its own data) and is
+    never the gate number reported by `score_set` (that is the held-out
+    figure computed by `_coverage_at_p95_split` / `_fit_decomposed`, labelled
+    `coverage_at_p95.pooled`). Returns (coverage, threshold); 0 / None when
+    no threshold reaches 0.95 precision even in-sample (brief Step 4 -- the
+    one metric that is 0, not None, when undefined)."""
     usable = _usable_rows(rows)
     if not usable:
         return 0, None
@@ -237,6 +282,125 @@ def coverage_at_p95(rows: list) -> tuple:
     if best_threshold is None:
         return 0, None
     return best_coverage, best_threshold
+
+
+# ---------------------------------------------------------------------------
+# coverage_at_p95, split-half / held-out (controller ruling, fix round 1)
+#
+# On the FIT half: take the LOWEST threshold whose precision on the fit half
+# is >= 0.95 (not the one maximising in-sample coverage -- the lowest
+# qualifying threshold is the most permissive one that still cleared the bar
+# on data it was chosen from). Report that threshold's precision and
+# coverage on the HELD-OUT half, in both directions, plus a pooled figure
+# (the held-out predictions from both directions combined -- covers every
+# usable row exactly once, since each row is held out in exactly one
+# direction). If no threshold on the fit half reaches 0.95, that direction's
+# coverage is 0 with a reason -- never silently the in-sample number.
+# ---------------------------------------------------------------------------
+
+def _lowest_threshold_at_target_precision(
+    scores: list, labels: list, target: float = COVERAGE_PRECISION_TARGET
+) -> tuple:
+    """`labels` is a parallel list of bool (True = positive/"yes"). Returns
+    (threshold, precision_at_that_threshold), or (None, None) if `scores` is
+    empty, has only one label class, or no threshold reaches `target`."""
+    if not scores or not (any(labels) and not all(labels)):
+        return None, None
+    qualifying = []
+    for threshold in sorted(set(scores)):
+        accepted_idx = [i for i, s in enumerate(scores) if s >= threshold]
+        if not accepted_idx:
+            continue
+        precision = sum(1 for i in accepted_idx if labels[i]) / len(accepted_idx)
+        if precision >= target:
+            qualifying.append((threshold, precision))
+    if not qualifying:
+        return None, None
+    return min(qualifying, key=lambda pair: pair[0])
+
+
+def _p95_direction(fit_rows: list, score_rows: list) -> dict:
+    """Fit the p95 threshold on `fit_rows`, evaluate it on `score_rows`
+    (disjoint by id -- the caller partitions via `split_half`). Internal key
+    `_pool` (a tuple `(n_accepted, n_positive)`) is used by the caller to
+    build the pooled figure across both directions and is stripped before
+    the result is returned to `score_set`'s output."""
+    reason = _class_balance_reason(fit_rows)
+    fit_usable = _usable_rows(fit_rows)
+    score_usable = _usable_rows(score_rows)
+
+    if reason:
+        return {
+            "threshold": None, "precision_on_fit_half": None,
+            "coverage_on_held_out": 0, "precision_on_held_out": None,
+            "n_fit": len(fit_usable), "n_held_out": len(score_usable),
+            "reason": reason,
+        }
+
+    scores_fit = [r["score"] for r in fit_usable]
+    labels_fit = [r["label"] == "yes" for r in fit_usable]
+    threshold, precision_on_fit = _lowest_threshold_at_target_precision(scores_fit, labels_fit)
+
+    if threshold is None:
+        return {
+            "threshold": None, "precision_on_fit_half": None,
+            "coverage_on_held_out": 0, "precision_on_held_out": None,
+            "n_fit": len(fit_usable), "n_held_out": len(score_usable),
+            "reason": "no threshold on fit half reaches 0.95 precision",
+        }
+
+    accepted = [r for r in score_usable if r["score"] >= threshold]
+    if accepted:
+        positives = sum(1 for r in accepted if r["label"] == "yes")
+        precision_held = positives / len(accepted)
+        coverage_held = len(accepted) / len(score_usable) if score_usable else 0.0
+    else:
+        positives = 0
+        precision_held = None
+        coverage_held = 0.0
+
+    return {
+        "threshold": threshold,
+        "precision_on_fit_half": precision_on_fit,
+        "coverage_on_held_out": coverage_held,
+        "precision_on_held_out": precision_held,
+        "n_fit": len(fit_usable),
+        "n_held_out": len(score_usable),
+        "_pool": (len(accepted), positives),
+    }
+
+
+def _coverage_at_p95_split(rows_a: list, rows_b: list) -> dict:
+    """Both directions (fit on A / score on B, fit on B / score on A) plus a
+    pooled figure combining the held-out predictions from each -- this
+    pooled figure, not either direction alone and never the in-sample
+    `coverage_at_p95`, is the number `score_set` reports as the gate."""
+    dir_ab = _p95_direction(rows_a, rows_b)  # fit on A, held-out = B
+    dir_ba = _p95_direction(rows_b, rows_a)  # fit on B, held-out = A
+
+    pooled_n = dir_ab["n_held_out"] + dir_ba["n_held_out"]
+    pooled_accepted = 0
+    pooled_positive = 0
+    for direction in (dir_ab, dir_ba):
+        n_accepted, n_positive = direction.pop("_pool", (0, 0))
+        pooled_accepted += n_accepted
+        pooled_positive += n_positive
+
+    if pooled_n == 0:
+        pooled = {"coverage": 0, "precision": None, "n": 0, "reason": "no usable rows"}
+    elif pooled_accepted == 0:
+        pooled = {
+            "coverage": 0, "precision": None, "n": pooled_n,
+            "reason": "no threshold reached 0.95 precision on either fit half",
+        }
+    else:
+        pooled = {
+            "coverage": pooled_accepted / pooled_n,
+            "precision": pooled_positive / pooled_accepted,
+            "n": pooled_n,
+        }
+
+    return {"a_to_b": dir_ab, "b_to_a": dir_ba, "pooled": pooled}
 
 
 # ---------------------------------------------------------------------------
@@ -269,14 +433,66 @@ def run_agreement(run1_rows: list, run2_rows: list, threshold: float) -> dict:
     }
 
 
+def _run_agreement_split(
+    run1_rows: list, run2_rows: list, half_a_ids: set, half_b_ids: set, threshold_split: dict
+) -> dict:
+    """Run agreement under a fitted ("fit") threshold policy, without ever
+    scoring a row against a threshold fitted with that row in it (controller
+    ruling, fix round 1, finding #2). A half-A id is scored with the
+    threshold fit on half B (`threshold_split["b_to_a"]`, i.e. fit on B and
+    used to score A); a half-B id uses the threshold fit on half A
+    (`threshold_split["a_to_b"]`). Results from both halves are pooled into
+    one agreement figure and one noise-floor figure."""
+    threshold_for_half_a = threshold_split["b_to_a"]["threshold"]
+    threshold_for_half_b = threshold_split["a_to_b"]["threshold"]
+
+    usable1 = {r["id"]: r for r in _usable_rows(run1_rows)}
+    usable2 = {r["id"]: r for r in _usable_rows(run2_rows)}
+    common_ids = set(usable1) & set(usable2)
+
+    same_side = 0
+    abs_diffs = []
+    n_used = 0
+    for id_ in common_ids:
+        if id_ in half_a_ids:
+            threshold = threshold_for_half_a
+        elif id_ in half_b_ids:
+            threshold = threshold_for_half_b
+        else:
+            continue
+        if threshold is None:
+            continue
+        s1, s2 = usable1[id_]["score"], usable2[id_]["score"]
+        if (s1 >= threshold) == (s2 >= threshold):
+            same_side += 1
+        abs_diffs.append(abs(s1 - s2))
+        n_used += 1
+
+    if n_used == 0:
+        return {
+            "value": None, "mean_abs_score_diff": None,
+            "reason": "no common ids had an out-of-sample threshold available", "n": 0,
+        }
+    return {
+        "value": same_side / n_used,
+        "mean_abs_score_diff": sum(abs_diffs) / len(abs_diffs),
+        "n": n_used,
+    }
+
+
 # ---------------------------------------------------------------------------
-# Threshold fitting (split-half)
+# Threshold fitting (split-half, accuracy-maximising -- used for the main
+# accuracy/precision/recall numbers and for run_agreement's out-of-sample
+# threshold. The p95-targeted split lives above in `_coverage_at_p95_split`.)
 # ---------------------------------------------------------------------------
 
 def _fit_best_accuracy_threshold(rows: list) -> float | None:
     """Threshold maximising accuracy on `rows` (the fit half). Candidate
     thresholds are the observed scores themselves -- exhaustive and exact
-    for this n."""
+    for this n. Caller must already have confirmed the fit half has both
+    label classes (`_class_balance_reason`) -- with only one class this
+    would return a degenerate threshold that happens to clear an
+    unconstraining bar (controller ruling, fix round 1, finding #3)."""
     usable = _usable_rows(rows)
     if not usable:
         return None
@@ -293,20 +509,24 @@ def _fit_best_accuracy_threshold(rows: list) -> float | None:
 def _fit_threshold_split(rows_a: list, rows_b: list) -> dict:
     """Fit on one half, score on the other, both directions. Never fits and
     scores the same rows -- `rows_a`/`rows_b` must already be disjoint by id
-    (the caller partitions via `split_half`)."""
+    (the caller partitions via `split_half`). A fit half with fewer than one
+    row of each label returns `threshold: None` with a reason for the whole
+    direction (finding #3) rather than a degenerate threshold."""
     result = {}
     for name, fit_rows, score_rows in (
         ("a_to_b", rows_a, rows_b),
         ("b_to_a", rows_b, rows_a),
     ):
-        threshold = _fit_best_accuracy_threshold(fit_rows)
-        if threshold is None:
+        reason = _class_balance_reason(fit_rows)
+        if reason:
             result[name] = {
-                "threshold": None, "n_fit": len(fit_rows), "n_score": len(score_rows),
+                "threshold": None, "n_fit": len(_usable_rows(fit_rows)),
+                "n_score": len(_usable_rows(score_rows)),
                 "accuracy": None, "precision": None, "recall": None,
-                "reason": "fit half has no usable rows",
+                "reason": reason,
             }
             continue
+        threshold = _fit_best_accuracy_threshold(fit_rows)
         metrics = _metrics_at_threshold(score_rows, threshold)
         result[name] = {
             "threshold": threshold,
@@ -421,41 +641,128 @@ def _predict_logreg(X: np.ndarray, weights: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
 
 
+_EMPTY_P95 = {
+    "threshold": None, "precision_on_fit_half": None,
+    "coverage_on_held_out": 0, "precision_on_held_out": None,
+}
+
+
 def _fit_decomposed_direction(fit_rows: list, score_rows: list) -> dict:
-    fit_extraction = _extract_noul_features(fit_rows)
-    if not fit_extraction[0]:
+    """Fits the composite weights AND the p95 threshold on `fit_rows`, both
+    evaluated on `score_rows` (controller ruling, fix round 1: "the
+    composite weights and the p95 threshold are both fitted on the same fit
+    half and evaluated on the other"). A fit half with fewer than one row of
+    each label (finding #3) short-circuits every threshold-dependent number
+    in this direction, including p95."""
+    n_score_usable = len(_usable_rows(score_rows))
+
+    class_reason = _class_balance_reason(fit_rows)
+    if class_reason:
         return {
             "weights": {}, "n_fit": 0, "n_score": 0, "brier": None,
-            "reason": "fit half has no rows with usable noul answers",
+            "p95": {**_EMPTY_P95, "n_fit": 0, "n_held_out": n_score_usable, "reason": class_reason},
+            "reason": class_reason,
+        }
+
+    fit_extraction = _extract_noul_features(fit_rows)
+    if not fit_extraction[0]:
+        reason = "fit half has no rows with usable noul answers"
+        return {
+            "weights": {}, "n_fit": 0, "n_score": 0, "brier": None,
+            "p95": {**_EMPTY_P95, "n_fit": 0, "n_held_out": n_score_usable, "reason": reason},
+            "reason": reason,
         }
     feature_names, X_fit, y_fit, _ = fit_extraction
     weights = _fit_logreg_l2(X_fit, y_fit)
+    fit_predicted = _predict_logreg(X_fit, weights)
+    threshold, precision_on_fit = _lowest_threshold_at_target_precision(
+        fit_predicted.tolist(), [bool(v) for v in y_fit.tolist()]
+    )
 
     score_extraction = _extract_noul_features(score_rows)
     if not score_extraction[0] or score_extraction[0] != feature_names:
         # Score half must offer the exact same feature set the fit used.
+        reason = "score half is missing one or more fitted sub-answer keys"
         return {
             "weights": dict(zip(["intercept"] + feature_names, weights.tolist())),
             "n_fit": len(y_fit), "n_score": 0, "brier": None,
-            "reason": "score half is missing one or more fitted sub-answer keys",
+            "p95": {
+                "threshold": threshold, "precision_on_fit_half": precision_on_fit,
+                "coverage_on_held_out": 0, "precision_on_held_out": None,
+                "n_fit": len(y_fit), "n_held_out": n_score_usable, "reason": reason,
+            },
+            "reason": reason,
         }
     _, X_score, y_score, _ = score_extraction
-    predicted = _predict_logreg(X_score, weights)
-    brier = float(np.mean((predicted - y_score) ** 2))
+    predicted_score = _predict_logreg(X_score, weights)
+    brier = float(np.mean((predicted_score - y_score) ** 2))
+
+    if threshold is None:
+        p95 = {
+            **_EMPTY_P95, "n_fit": len(y_fit), "n_held_out": len(y_score),
+            "reason": "no threshold on fit half reaches 0.95 precision",
+        }
+    else:
+        predicted_list = predicted_score.tolist()
+        accepted_idx = [i for i, p in enumerate(predicted_list) if p >= threshold]
+        if accepted_idx:
+            positives = sum(1 for i in accepted_idx if bool(y_score[i]))
+            precision_held = positives / len(accepted_idx)
+            coverage_held = len(accepted_idx) / len(y_score) if len(y_score) else 0.0
+        else:
+            positives = 0
+            precision_held = None
+            coverage_held = 0.0
+        p95 = {
+            "threshold": threshold,
+            "precision_on_fit_half": precision_on_fit,
+            "coverage_on_held_out": coverage_held,
+            "precision_on_held_out": precision_held,
+            "n_fit": len(y_fit),
+            "n_held_out": len(y_score),
+            "_pool": (len(accepted_idx), positives),
+        }
 
     return {
         "weights": dict(zip(["intercept"] + feature_names, weights.tolist())),
         "n_fit": len(y_fit),
         "n_score": len(y_score),
         "brier": brier,
+        "p95": p95,
     }
 
 
 def _fit_decomposed(rows_a: list, rows_b: list) -> dict:
     v0_brier = brier_score(rows_a + rows_b)
+    dir_ab = _fit_decomposed_direction(rows_a, rows_b)
+    dir_ba = _fit_decomposed_direction(rows_b, rows_a)
+
+    pooled_n = dir_ab["p95"]["n_held_out"] + dir_ba["p95"]["n_held_out"]
+    pooled_accepted = 0
+    pooled_positive = 0
+    for direction in (dir_ab, dir_ba):
+        n_accepted, n_positive = direction["p95"].pop("_pool", (0, 0))
+        pooled_accepted += n_accepted
+        pooled_positive += n_positive
+
+    if pooled_n == 0:
+        p95_pooled = {"coverage": 0, "precision": None, "n": 0, "reason": "no usable rows"}
+    elif pooled_accepted == 0:
+        p95_pooled = {
+            "coverage": 0, "precision": None, "n": pooled_n,
+            "reason": "no threshold reached 0.95 precision on either fit half",
+        }
+    else:
+        p95_pooled = {
+            "coverage": pooled_accepted / pooled_n,
+            "precision": pooled_positive / pooled_accepted,
+            "n": pooled_n,
+        }
+
     return {
-        "a_to_b": _fit_decomposed_direction(rows_a, rows_b),
-        "b_to_a": _fit_decomposed_direction(rows_b, rows_a),
+        "a_to_b": dir_ab,
+        "b_to_a": dir_ba,
+        "p95_pooled": p95_pooled,
         "v0_unfitted": {
             "brier": v0_brier,
             "n": len(_usable_rows(rows_a + rows_b)),
@@ -512,19 +819,37 @@ def _score_one_arm(arm: str, runs: dict, policy) -> dict:
 
     brier = brier_score(usable1)
     ece = ece10(usable1)
-    coverage, threshold_p95 = coverage_at_p95(usable1)
+    in_sample_coverage, in_sample_threshold = coverage_at_p95(usable1)
 
     ids = [r["id"] for r in usable1]
     half_a_ids, half_b_ids = split_half(ids)
     rows_a = [r for r in usable1 if r["id"] in half_a_ids]
     rows_b = [r for r in usable1 if r["id"] in half_b_ids]
 
+    threshold_split = _fit_threshold_split(rows_a, rows_b)
+
     if arm == "decomposed":
         decomposed_fit = _fit_decomposed(rows_a, rows_b)
+        p95_a_to_b = decomposed_fit["a_to_b"]["p95"]
+        p95_b_to_a = decomposed_fit["b_to_a"]["p95"]
+        p95_pooled = decomposed_fit["p95_pooled"]
     else:
         decomposed_fit = None
+        p95_split = _coverage_at_p95_split(rows_a, rows_b)
+        p95_a_to_b = p95_split["a_to_b"]
+        p95_b_to_a = p95_split["b_to_a"]
+        p95_pooled = p95_split["pooled"]
 
-    threshold_split = _fit_threshold_split(rows_a, rows_b)
+    coverage_at_p95_result = {
+        "pooled": p95_pooled,
+        "a_to_b": p95_a_to_b,
+        "b_to_a": p95_b_to_a,
+        "in_sample": {"coverage": in_sample_coverage, "threshold": in_sample_threshold},
+    }
+    threshold_at_p95 = {
+        "a_to_b": p95_a_to_b.get("threshold"),
+        "b_to_a": p95_b_to_a.get("threshold"),
+    }
 
     if isinstance(policy, str):
         if policy != "fit":
@@ -545,17 +870,13 @@ def _score_one_arm(arm: str, runs: dict, policy) -> dict:
             f"threshold_policy for arm {arm!r} must be a number or 'fit', got {policy!r}")
 
     if main_threshold is not None:
+        # A fixed threshold is not fit from this data, so there is no
+        # held-out concern -- score every common id against it directly.
         run_agree = run_agreement(run1, run2, main_threshold)
     else:
-        # "fit" policy with cross-fit predictions per-half: use whichever
-        # direction's threshold is available for run agreement, preferring
-        # a_to_b's threshold (used to score half B) if present, else b_to_a's.
-        candidate = threshold_split["a_to_b"]["threshold"] or threshold_split["b_to_a"]["threshold"]
-        if candidate is not None:
-            run_agree = run_agreement(run1, run2, candidate)
-        else:
-            run_agree = {"value": None, "mean_abs_score_diff": None,
-                         "reason": "no fitted threshold available for run agreement", "n": 0}
+        # "fit" policy: each half must be scored with the OTHER half's
+        # threshold (finding #2) -- never the threshold it was fit on.
+        run_agree = _run_agreement_split(run1, run2, half_a_ids, half_b_ids, threshold_split)
 
     result = {
         "n": len(usable1),
@@ -566,8 +887,8 @@ def _score_one_arm(arm: str, runs: dict, policy) -> dict:
         "brier": brier,
         "ece10": ece,
         "run_agreement": run_agree,
-        "coverage_at_p95": coverage,
-        "threshold_at_p95": threshold_p95,
+        "coverage_at_p95": coverage_at_p95_result,
+        "threshold_at_p95": threshold_at_p95,
         "fixed_threshold": fixed_metrics,
         "split_half": threshold_split,
     }

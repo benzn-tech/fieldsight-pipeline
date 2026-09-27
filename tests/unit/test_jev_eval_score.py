@@ -17,6 +17,7 @@ import hashlib
 
 import pytest
 
+from scripts.jev_eval import score as score_module
 from scripts.jev_eval.score import (
     JevScoreError,
     control_check,
@@ -308,3 +309,124 @@ def test_score_set_raises_on_unknown_threshold_policy_type():
     rows_by_arm_run = {"baseline": {1: run1, 2: run2}}
     with pytest.raises(JevScoreError):
         score_set(rows_by_arm_run, {"baseline": "not-a-real-policy"})
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1, finding #1: coverage_at_p95 must be held-out, not in-sample.
+# ---------------------------------------------------------------------------
+
+def test_coverage_at_p95_split_reports_lower_than_in_sample():
+    """A case engineered so the in-sample (fit-and-score-on-everything)
+    coverage figure looks better than what either split-half direction
+    actually delivers out-of-sample -- the exact gap ruling #1 exists to
+    surface instead of hide."""
+    rows_a = (
+        [_row(f"a-yes-{i}", "yes", 0.9) for i in range(10)]
+        + [_row("a-no-0", "no", 0.5)]
+    )
+    rows_b = (
+        [_row(f"b-yes-{i}", "yes", 0.6) for i in range(10)]
+        + [_row("b-no-0", "no", 0.55)]
+    )
+
+    # Directions must partition disjoint ids.
+    ids_a = {r["id"] for r in rows_a}
+    ids_b = {r["id"] for r in rows_b}
+    assert ids_a & ids_b == set()
+
+    split_result = score_module._coverage_at_p95_split(rows_a, rows_b)
+
+    # Fit on A (threshold 0.9, precision 1.0 in-sample) applied to B: nothing
+    # in B reaches 0.9 -> zero coverage on the held-out half.
+    assert split_result["a_to_b"]["threshold"] == pytest.approx(0.9)
+    assert split_result["a_to_b"]["coverage_on_held_out"] == 0
+
+    # Fit on B (threshold 0.6) applied to A: the 10 yes@0.9 rows clear it,
+    # the one no@0.5 does not -> perfect precision, high coverage.
+    assert split_result["b_to_a"]["threshold"] == pytest.approx(0.6)
+    assert split_result["b_to_a"]["coverage_on_held_out"] == pytest.approx(10 / 11)
+
+    pooled_coverage = split_result["pooled"]["coverage"]
+
+    in_sample_coverage, _ = coverage_at_p95(rows_a + rows_b)
+
+    # In-sample fits and scores on the SAME 22 rows, so it can pick a
+    # threshold (0.55: 21 of 22 rows, 20 "yes" -> precision 20/21 = 0.952)
+    # that happens to cover both score bands at once -- a choice no
+    # split-half direction gets to make against unseen data.
+    assert in_sample_coverage == pytest.approx(21 / 22)
+    assert pooled_coverage < in_sample_coverage
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1, finding #2: run_agreement under "fit" must use each half's
+# OUT-OF-SAMPLE threshold, not one threshold applied to every id.
+# ---------------------------------------------------------------------------
+
+def test_run_agreement_split_uses_out_of_sample_threshold_per_half():
+    half_a_ids = {"a1"}
+    half_b_ids = {"b1"}
+    threshold_split = {
+        "a_to_b": {"threshold": 0.5},  # fit on A, used to score B
+        "b_to_a": {"threshold": 0.8},  # fit on B, used to score A
+    }
+    # a1 (half A) must be scored with threshold_split["b_to_a"] (0.8):
+    # run1=0.6 (<0.8), run2=0.9 (>=0.8) -> different sides -> disagree.
+    # If the buggy behaviour (a single a_to_b threshold=0.5 for all ids)
+    # were used instead, both would read >=0.5 -> agree.
+    run1 = [_row("a1", "yes", 0.6, run=1), _row("b1", "yes", 0.4, run=1)]
+    run2 = [_row("a1", "yes", 0.9, run=2), _row("b1", "yes", 0.6, run=2)]
+    # b1 (half B) must be scored with threshold_split["a_to_b"] (0.5):
+    # run1=0.4 (<0.5), run2=0.6 (>=0.5) -> different sides -> disagree.
+
+    result = score_module._run_agreement_split(run1, run2, half_a_ids, half_b_ids, threshold_split)
+    assert result["value"] == pytest.approx(0.0)
+    assert result["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1, finding #3: a fit half with only one label class must not
+# yield a silent, degenerate threshold.
+# ---------------------------------------------------------------------------
+
+def test_fit_threshold_split_single_class_fit_half_returns_none_with_reason():
+    all_no = [_row(f"no{i}", "no", 0.4) for i in range(5)]
+    mixed = [_row(f"m{i}", "yes" if i % 2 == 0 else "no", 0.5 + i * 0.01) for i in range(6)]
+
+    result = score_module._fit_threshold_split(all_no, mixed)
+    direction = result["a_to_b"]  # fit on all_no (single class)
+    assert direction["threshold"] is None
+    assert direction["accuracy"] is None
+    assert direction["precision"] is None
+    assert direction["recall"] is None
+    assert "reason" in direction
+
+
+def test_p95_direction_single_class_fit_half_returns_none_with_reason():
+    all_no = [_row(f"no{i}", "no", 0.4) for i in range(5)]
+    mixed = [_row(f"m{i}", "yes" if i % 2 == 0 else "no", 0.5 + i * 0.01) for i in range(6)]
+
+    split_result = score_module._coverage_at_p95_split(all_no, mixed)
+    direction = split_result["a_to_b"]  # fit on all_no (single class)
+    assert direction["threshold"] is None
+    assert direction["coverage_on_held_out"] == 0
+    assert "reason" in direction
+
+
+def test_decomposed_direction_single_class_fit_half_returns_none_with_reason():
+    def _make(id_, label, val):
+        return _row(
+            id_, label, 0.5, answers={
+                "same_work_item": {"noul": val},
+                "task_named": {"noul": val},
+                "same_trade": {"noul": 0.5},
+            },
+        )
+
+    all_no = [_make(f"no{i}", "no", 0.0) for i in range(5)]
+    mixed = [_make(f"m{i}", "yes" if i % 2 == 0 else "no", 1.0 if i % 2 == 0 else 0.0) for i in range(6)]
+
+    result = score_module._fit_decomposed_direction(all_no, mixed)
+    assert result["p95"]["threshold"] is None
+    assert "reason" in result["p95"]
+    assert result["weights"] == {}
