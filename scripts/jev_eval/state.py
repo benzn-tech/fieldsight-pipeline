@@ -119,6 +119,16 @@ _TWO_TOKEN_NAME = re.compile(rf"({_NAME_WORD})\s+({_NAME_WORD})")
 # little under-masking (a person literally named e.g. "Roof") for a lot less
 # over-masking of ordinary construction phrases; see the module docstring.
 _DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+# Fix wave 4, C13: month names are deliberately NOT in `_STOPLIST` (they used
+# to be). A month followed by a real name ("May Chen", "June Wilson", "April
+# Ng") must be masked -- a month name is not, by itself, evidence the second
+# word is not a person. The date case ("May 2026", "June 3") never reaches
+# `_TWO_TOKEN_NAME` at all: `_NAME_WORD` requires the token to START WITH A
+# LETTER, so a digit-first second token structurally never matches the
+# two-capitalised-word shape in the first place -- no digit-specific check is
+# needed here. A spelled-out ordinal date ("May Third") is still protected,
+# because "Third" is (and remains) in `_ORDINAL_WORDS` below, independently
+# of whatever precedes it.
 _MONTHS = (
     "January", "February", "March", "April", "May", "June", "July",
     "August", "September", "October", "November", "December",
@@ -137,7 +147,33 @@ _STOPLIST = frozenset({
     "Level", "Floor", "Site", "Ground", "Roof", "Stage", "Block", "Room",
     "Unit", "Area", "Zone", "North", "South", "East", "West", "Main", "New",
     "Old", "Phase", "Building", "Wall", "Door", "Window", "Stair",
-    *_DAYS, *_MONTHS, *_NUMBER_WORDS, *_ORDINAL_WORDS,
+    # Fix wave 4, C12: sentence-initial relative-day words -- without these,
+    # "Yesterday Sarah Jones" reads "Yesterday Sarah" as a candidate name pair
+    # (neither word stoplisted) before "Sarah Jones" is ever tried.
+    "Yesterday", "Today", "Tomorrow",
+    *_DAYS, *_NUMBER_WORDS, *_ORDINAL_WORDS,
+})
+
+# Fix wave 4, C14: alias terms that are ordinary English words are matched
+# CASE-SENSITIVELY (capitalised form only) -- an unqualified case-insensitive
+# match on a word this common (e.g. "will", "may", "rose") over-masks
+# construction text far more than it protects a real name. Every other alias
+# term stays case-insensitive, as before. Compared against an alias term's
+# OWN casefold, never the matched text's case.
+#
+# "ben" is deliberately NOT in this list even though the brief's own draft
+# names it: it is the primary account holder's own first name, aliased on
+# every export (`export_labels.build_alias_rows`), and under-masking it
+# (missing a lowercase "ben" the way this list would produce) is the
+# privacy failure this module exists to prevent -- over-masking the common
+# word "ben" is comparatively harmless and rare in construction text.
+_COMMON_WORD_ALIASES = frozenset({
+    "will", "may", "mark", "love", "bill", "grant", "rose", "hope", "joy",
+    "faith", "dawn", "rich", "frank", "ray", "sky", "summer", "june", "april",
+    "august", "jack", "pat", "sue", "drew", "gene", "lee", "long", "young",
+    "white", "black", "brown", "green", "king", "hall", "wood", "stone",
+    "field", "park", "bell", "hill", "ward", "page", "lane", "cook", "rob",
+    "art", "chance", "sunny", "max",
 })
 
 # Contact info -- masked in every string, ahead of the name passes.
@@ -146,6 +182,11 @@ _PHONE_RE = re.compile(r"\+?\d(?:[ \-]?\d){6,}")
 # The one carve-out: this schema's own ISO `date` fields ("2026-09-20") are
 # 8-10 digits and would otherwise be swallowed whole by _PHONE_RE.
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# Fix wave 4, C16: an ISO date immediately followed by a bare time
+# ("2026-09-20 0800") is one continuous digit run under _PHONE_RE's own
+# rules (it allows a single embedded space) and must not become "PHONE"
+# either.
+_ISO_DATE_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{3,6}$")
 
 # Fields where the generic two-token pass must never run (see docstring):
 # dotted paths within the built `state` tree, matched exactly.
@@ -292,29 +333,73 @@ class _Masker:
         # Compiled once per _Masker instance (the alias pairs are fixed at
         # construction time and never mutated afterwards), reused across
         # every call to mask() instead of being recompiled per string.
-        # ASCII (word-character) terms get a `\b...\b` anchor; a term
-        # containing any CJK character gets none, because `\b` never fires
-        # between two adjacent CJK characters (see module docstring) --
-        # each alternative in the alternation carries its own anchoring
-        # rather than one `\b` wrapping the whole group.
+        #
+        # Fix wave 4, C11: an ASCII (word-character) term used to get a
+        # `\b...\b` anchor. Python's `\b` is a transition between \w and
+        # non-\w, and Python's default (Unicode) `\w` treats CJK ideographs
+        # as word characters too -- so there is NEVER a `\b` boundary between
+        # an ASCII letter and an immediately adjacent CJK character, and
+        # "Ben说好" (no space) could never match `\bBen\b` at all. ASCII terms
+        # now use explicit ASCII-only lookaround assertions instead --
+        # `(?<![A-Za-z0-9])term(?![A-Za-z0-9])` -- which only refuses to
+        # match when the ADJACENT character is itself an ASCII letter/digit
+        # (so "Bench"/"Benefit" still correctly do not match), and happily
+        # matches next to a CJK character, punctuation, or string edge. A
+        # term containing any CJK character keeps no anchor at all, because
+        # `\b` (and this ASCII lookaround) never fires between two adjacent
+        # CJK characters either way (see module docstring).
+        #
+        # Fix wave 4, C14: alias terms that are ordinary English words
+        # (`_COMMON_WORD_ALIASES`) are matched case-sensitively (their own
+        # exact casing only); every other term stays case-insensitive. This
+        # is done per-alternative with Python's scoped inline-flag group
+        # `(?i:...)`, rather than one `re.IGNORECASE` over the whole pattern,
+        # so the two behaviours can coexist inside one compiled regex.
         all_terms = sorted(
             {term for pair in self._person_pairs for term in pair},
             key=len,
             reverse=True,
         )
         if all_terms:
-            parts = [
-                re.escape(term) if _has_cjk(term)
-                else r"\b" + re.escape(term) + r"\b"
-                for term in all_terms
-            ]
-            self._alias_pattern = re.compile("|".join(parts), re.IGNORECASE)
+            parts = []
+            for term in all_terms:
+                escaped = re.escape(term)
+                body = escaped if _has_cjk(term) else (
+                    r"(?<![A-Za-z0-9])" + escaped + r"(?![A-Za-z0-9])"
+                )
+                if term.casefold() in _COMMON_WORD_ALIASES:
+                    parts.append(body)  # case-sensitive: exact casing only
+                else:
+                    parts.append(f"(?i:{body})")
+            self._alias_pattern = re.compile("|".join(parts))
             self._casefold_to_term: dict[str, str] = {}
             for term in all_terms:
                 self._casefold_to_term.setdefault(term.casefold(), term)
         else:
             self._alias_pattern = None
             self._casefold_to_term = {}
+
+        # Fix wave 4, C15: protected company/site/task terms (any word
+        # count, case-insensitive, an optional possessive "'s"/"'s") are
+        # substituted for an opaque sentinel BEFORE both the alias pass and
+        # the generic pass, and restored afterwards -- "SB1108 Ellesmere
+        # College", "Smith Scaffolding Ltd", "Naylor Love's crew" all need
+        # this: the old code only ever compared a whole TWO-token generic
+        # candidate against `self._protected` verbatim, so a 3+-word
+        # protected term (or a substring of one that happens to look like a
+        # name, e.g. "Ellesmere College" inside "SB1108 Ellesmere College")
+        # was never actually protected, and a protected term sharing a word
+        # with a real person alias (e.g. "Love") could still be shredded by
+        # the alias pass before the generic pass ever ran.
+        if self._protected:
+            protected_sorted = sorted(self._protected, key=len, reverse=True)
+            protected_parts = [
+                re.escape(term) + r"(?:['’]s)?" for term in protected_sorted
+            ]
+            self._protected_pattern = re.compile(
+                "(?:" + "|".join(protected_parts) + ")", re.IGNORECASE)
+        else:
+            self._protected_pattern = None
 
     def _next_placeholder(self) -> str:
         placeholder = f"PERSON_{self._next_id}"
@@ -325,8 +410,22 @@ class _Masker:
         text = _EMAIL_RE.sub("EMAIL", text)
 
         def _replace_phone(match: re.Match) -> str:
+            # Fix wave 4, C16: two more digit-run shapes that are not a
+            # phone number and must not be swallowed. `full_text`/`start`/
+            # `end` let both checks look OUTSIDE the matched span itself
+            # (the "$" before it, the "k"/"m"/"million" suffix after it) --
+            # neither is part of `_PHONE_RE`'s own match.
             candidate = match.group(0)
             if _ISO_DATE_RE.fullmatch(candidate):
+                return candidate
+            if _ISO_DATE_TIME_RE.fullmatch(candidate):
+                return candidate
+            full_text = match.string
+            start, end = match.start(), match.end()
+            if start > 0 and full_text[start - 1] == "$":
+                return candidate
+            suffix = full_text[end:end + 10].lstrip().lower()
+            if suffix.startswith("k") or suffix.startswith("m"):
                 return candidate
             return "PHONE"
 
@@ -349,17 +448,66 @@ class _Masker:
                 self.mapping[t] = placeholder
         return placeholder
 
-    def _replace_generic(self, match: re.Match) -> str:
-        candidate = match.group(0)
-        if candidate in self._protected:
-            return candidate
-        if match.group(1) in _STOPLIST or match.group(2) in _STOPLIST:
-            return candidate
-        placeholder = self.mapping.get(candidate)
-        if placeholder is None:
-            placeholder = self._next_placeholder()
-            self.mapping[candidate] = placeholder
-        return placeholder
+    def _apply_generic_pass(self, text: str) -> str:
+        """Fix wave 4, C12: scans for the two-capitalised-word shape with an
+        explicit position cursor instead of `re.sub` (which only ever
+        advances to the END of the current match). The old code, on hitting
+        a stoplisted pair like "Friday Sarah", consumed BOTH tokens and
+        resumed scanning after "Sarah" -- so "Sarah Jones" was never tried as
+        its own pair, and "Friday Sarah Jones confirmed" came out completely
+        unmasked. Here, a skip (stoplist OR a still-protected two-word
+        candidate) advances the cursor to the end of the FIRST token only,
+        so the second token gets a fresh chance to pair with whatever
+        follows it -- "Friday Sarah Jones confirmed" -> "Friday PERSON_1
+        confirmed"."""
+        out = []
+        pos = 0
+        length = len(text)
+        while pos < length:
+            match = _TWO_TOKEN_NAME.search(text, pos)
+            if not match:
+                out.append(text[pos:])
+                break
+            word1, word2 = match.group(1), match.group(2)
+            if word1 in _STOPLIST or word2 in _STOPLIST:
+                first_end = match.end(1)
+                out.append(text[pos:first_end])
+                pos = first_end
+                continue
+            candidate = match.group(0)
+            if candidate in self._protected:
+                out.append(text[pos:match.end()])
+                pos = match.end()
+                continue
+            placeholder = self.mapping.get(candidate)
+            if placeholder is None:
+                placeholder = self._next_placeholder()
+                self.mapping[candidate] = placeholder
+            out.append(text[pos:match.start()])
+            out.append(placeholder)
+            pos = match.end()
+        return "".join(out)
+
+    def _protect(self, text: str) -> tuple[str, dict]:
+        """Fix wave 4, C15: substitute every occurrence of a protected
+        company/site/task term for an opaque sentinel BEFORE the alias and
+        generic passes run, so neither pass can see (and therefore cannot
+        shred) any part of it -- restored verbatim by `_unprotect`."""
+        if self._protected_pattern is None:
+            return text, {}
+        stash: dict[str, str] = {}
+
+        def _sub(match: re.Match) -> str:
+            key = f"\x00PROT{len(stash)}\x00"
+            stash[key] = match.group(0)
+            return key
+
+        return self._protected_pattern.sub(_sub, text), stash
+
+    def _unprotect(self, text: str, stash: dict) -> str:
+        for key, original in stash.items():
+            text = text.replace(key, original)
+        return text
 
     def mask(self, text: str, apply_generic: bool = True) -> str:
         if not isinstance(text, str) or not text:
@@ -369,27 +517,39 @@ class _Masker:
         # every string, ahead of the name passes.
         text = self._mask_contact_info(text)
 
+        # Fix wave 4, C15: protect company/site/task terms (any word count,
+        # case-insensitive, possessive "'s" allowed) BEFORE either name pass
+        # sees the text at all.
+        text, protect_stash = self._protect(text)
+
         # Layer 1: known person alias pairs/groups (wrong_term / right_term,
         # or a whole alias_group, collapse to the same placeholder). Matched
-        # case-insensitively; ASCII terms on a word boundary -- not
-        # `str.replace` -- so a single-token term like "Ben" masks "Ben
-        # said" and "Ben's" but leaves "Bench" and "Benefit" alone. Longest
-        # term first (both in the sort and in the regex alternation, which
-        # tries alternatives left-to-right) so "Ben Lin" wins over "Ben" when
-        # both are present. "Ben" and "Ben Lin" get the SAME placeholder only
-        # if they come from the same alias group (an explicit `alias_group`,
-        # or one row's own wrong_term/right_term pair containing both); two
-        # separate, ungrouped alias rows -- one for the first name, one for
-        # the full name -- get separate placeholders, since nothing ties them
+        # case-insensitively (except `_COMMON_WORD_ALIASES` terms, fix wave
+        # 4 C14 -- those match their own exact casing only); ASCII terms
+        # anchored so they cannot match inside a longer ASCII word (fix wave
+        # 4 C11) -- so a single-token term like "Ben" masks "Ben said" and
+        # "Ben's" but leaves "Bench" and "Benefit" alone, AND masks "Ben说好"
+        # (no space before the CJK). Longest term first (both in the sort
+        # and in the regex alternation, which tries alternatives
+        # left-to-right) so "Ben Lin" wins over "Ben" when both are present.
+        # "Ben" and "Ben Lin" get the SAME placeholder only if they come from
+        # the same alias group (an explicit `alias_group`, or one row's own
+        # wrong_term/right_term pair containing both); two separate,
+        # ungrouped alias rows -- one for the first name, one for the full
+        # name -- get separate placeholders, since nothing ties them
         # together as the same person. Pinned by test.
         if self._alias_pattern is not None:
             text = self._alias_pattern.sub(self._replace_alias, text)
 
         # Layer 2: generic two-capitalised-word name shape, skipping known
-        # company/product alias terms and any pair touching `_STOPLIST`.
+        # company/product alias terms and any pair touching `_STOPLIST`, with
+        # a skip advancing only past the first token (fix wave 4, C12) so a
+        # stoplisted lead word never swallows the real name that follows it.
         # Skipped entirely for fields in `_NO_GENERIC_PATHS` (task.name).
         if apply_generic:
-            text = _TWO_TOKEN_NAME.sub(self._replace_generic, text)
+            text = self._apply_generic_pass(text)
+
+        text = self._unprotect(text, protect_stash)
 
         return text
 

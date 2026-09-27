@@ -377,3 +377,173 @@ def test_typical_state_serialises_under_4k_chars():
     }
     state = build_state("programme_match", features, COMPANY_ALIASES)
     assert len(json.dumps(state)) < 4000
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 4, C11: an ASCII alias term must mask right next to a CJK
+# character with no space -- `\b` never fires there.
+# ---------------------------------------------------------------------------
+
+BEN_ALIAS = [{"wrong_term": "Ben", "right_term": "Ben", "kind": "person"}]
+
+
+def test_ascii_alias_masks_adjacent_to_cjk_with_no_space():
+    text, mapping = mask_names("Ben说好", BEN_ALIAS)
+    assert text == "PERSON_1说好"
+    assert mapping
+
+
+def test_ascii_alias_still_respects_ascii_word_boundary():
+    # Unchanged behaviour: "Bench"/"Benefit" must still NOT match "Ben".
+    text, _ = mask_names("Bench and Benefit are not Ben.", BEN_ALIAS)
+    assert text == "Bench and Benefit are not PERSON_1."
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 4, C12: a stoplisted lead word must not swallow the real name
+# that follows it -- the scan must continue past only the first token.
+# ---------------------------------------------------------------------------
+
+def test_stoplisted_lead_word_does_not_swallow_the_following_name():
+    text, mapping = mask_names("Friday Sarah Jones confirmed", [])
+    assert text == "Friday PERSON_1 confirmed"
+    assert mapping == {"Sarah Jones": "PERSON_1"}
+
+
+def test_yesterday_does_not_swallow_the_following_name():
+    text, mapping = mask_names("Yesterday Sarah Jones", [])
+    assert text == "Yesterday PERSON_1"
+    assert mapping == {"Sarah Jones": "PERSON_1"}
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 4, C13: month names are masked when followed by a real name;
+# a date (digit-first second token) never matches the name shape at all.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("text,expected_mapped", [
+    ("May Chen confirmed the delivery", "May Chen"),
+    ("June Wilson signed off the report", "June Wilson"),
+    ("April Ng will be on site", "April Ng"),
+])
+def test_month_name_followed_by_a_real_name_is_masked(text, expected_mapped):
+    masked, mapping = mask_names(text, [])
+    assert expected_mapped in mapping
+    assert expected_mapped not in masked
+
+
+def test_month_name_followed_by_a_date_is_not_masked():
+    text, mapping = mask_names("Delivery scheduled for May 2026", [])
+    assert text == "Delivery scheduled for May 2026"
+    assert mapping == {}
+
+
+def test_month_name_followed_by_a_day_number_is_not_masked():
+    text, mapping = mask_names("Delivery scheduled for June 3", [])
+    assert text == "Delivery scheduled for June 3"
+    assert mapping == {}
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 4, C14: alias terms that are ordinary English words match
+# case-sensitively (their own exact casing only); other aliases stay
+# case-insensitive.
+# ---------------------------------------------------------------------------
+
+def test_common_word_alias_matches_only_its_capitalised_form():
+    aliases = [{"wrong_term": "Will", "right_term": "Will", "kind": "person"}]
+    masked_cap, mapping_cap = mask_names("Will is on site today", aliases)
+    assert "PERSON_1" in masked_cap
+    assert mapping_cap
+
+    masked_lower, mapping_lower = mask_names(
+        "the crew will arrive at noon", aliases)
+    assert masked_lower == "the crew will arrive at noon"
+    assert mapping_lower == {}
+
+
+def test_non_common_word_alias_still_matches_case_insensitively():
+    aliases = [{"wrong_term": "Heidi", "right_term": "Heidi", "kind": "person"}]
+    text, mapping = mask_names("heidi flagged a defect", aliases)
+    assert "PERSON_1" in text
+    assert mapping
+
+
+def test_ben_is_not_in_the_common_word_list_and_stays_case_insensitive():
+    from scripts.jev_eval.state import _COMMON_WORD_ALIASES
+    assert "ben" not in _COMMON_WORD_ALIASES
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 4, C15: protected company/site/task terms win over BOTH the
+# alias pass and the generic pass, for terms of any word count, and a
+# possessive "'s".
+# ---------------------------------------------------------------------------
+
+def test_protected_multiword_company_name_with_extra_words_is_kept_intact():
+    aliases = [
+        {"wrong_term": "SB1108 Ellesmere College", "right_term": "SB1108 Ellesmere College",
+         "kind": "company"},
+    ]
+    text, mapping = mask_names("SB1108 Ellesmere College pour", aliases)
+    assert text == "SB1108 Ellesmere College pour"
+    assert mapping == {}
+
+
+def test_protected_company_name_with_ltd_suffix_is_kept_intact():
+    aliases = [
+        {"wrong_term": "Smith Scaffolding Ltd", "right_term": "Smith Scaffolding Ltd",
+         "kind": "company"},
+    ]
+    text, mapping = mask_names("Invoice from Smith Scaffolding Ltd this week", aliases)
+    assert "Smith Scaffolding Ltd" in text
+    assert mapping == {}
+
+
+def test_protected_site_name_is_kept_intact():
+    aliases = [
+        {"wrong_term": "UC Pharmacy Kiosk", "right_term": "UC Pharmacy Kiosk", "kind": "company"},
+    ]
+    text, mapping = mask_names("Delivery arrived at UC Pharmacy Kiosk", aliases)
+    assert "UC Pharmacy Kiosk" in text
+    assert mapping == {}
+
+
+def test_protected_term_survives_possessive_and_a_colliding_person_alias():
+    aliases = [
+        {"wrong_term": "Naylor Love", "right_term": "Naylor Love", "kind": "company"},
+        {"wrong_term": "Love", "right_term": "Love", "kind": "person"},
+    ]
+    text, mapping = mask_names("Naylor Love's crew arrived early", aliases)
+    assert "Naylor Love's crew arrived early" == text
+    assert mapping == {}
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 4, C16: PHONE must not swallow an ISO date+time or a money
+# amount.
+# ---------------------------------------------------------------------------
+
+def test_iso_date_with_bare_time_is_not_masked_as_phone():
+    text, _ = mask_names("Logged at 2026-09-20 0800 this morning", [])
+    assert text == "Logged at 2026-09-20 0800 this morning"
+
+
+def test_dollar_amount_is_not_masked_as_phone():
+    text, _ = mask_names("Invoice total was $1234567 for the job", [])
+    assert text == "Invoice total was $1234567 for the job"
+
+
+def test_money_amount_with_k_suffix_is_not_masked_as_phone():
+    text, _ = mask_names("Budget is 1234567k for the extension", [])
+    assert text == "Budget is 1234567k for the extension"
+
+
+def test_money_amount_with_million_suffix_is_not_masked_as_phone():
+    text, _ = mask_names("Contract value 1234567 million overall", [])
+    assert text == "Contract value 1234567 million overall"
+
+
+def test_plain_phone_number_is_still_masked():
+    text, _ = mask_names("Call 021 555 1234 about the delivery.", [])
+    assert text == "Call PHONE about the delivery."
