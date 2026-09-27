@@ -516,11 +516,16 @@ def _informative_decomposed_rows(arm, n_per_class=25, base_flip_rate=0.0, seed=0
 
 
 def test_verdict_informative_model_beats_weak_baseline_is_replace():
-    base_r1, base_r2 = _constant_rows("baseline", base_score=0.5, jitter=0.001)
-    dec_r1, dec_r2 = _informative_decomposed_rows("decomposed")
+    # Fix wave 4, A1: the precision floor is now the Clopper-Pearson LOWER
+    # bound of held-out precision (>= 0.90), which needs ~28 accepted rows
+    # all correct -- n_per_class=25 (the pre-wave-4 size) no longer clears
+    # it even with perfect separation, so this uses 40 per class.
+    base_r1, base_r2 = _constant_rows("baseline", n_per_class=40, base_score=0.5, jitter=0.001)
+    dec_r1, dec_r2 = _informative_decomposed_rows("decomposed", n_per_class=40)
     # Control state must NOT reproduce the real signal -- constant, close to
     # the overall base rate, well under the real arm's mean on yes rows.
-    ctrl_r1, ctrl_r2 = _constant_rows("control_decomposed", base_score=0.3, jitter=0.001)
+    ctrl_r1, ctrl_r2 = _constant_rows(
+        "control_decomposed", n_per_class=40, base_score=0.3, jitter=0.001)
 
     rows_by_arm_run = {
         "baseline": {1: base_r1, 2: base_r2},
@@ -647,3 +652,307 @@ def test_decomposed_held_out_records_use_refit_probability_not_v0_score():
     yes_scores = [rec["score"] for rec in records.values() if rec["label"] == "yes"]
     no_scores = [rec["score"] for rec in records.values() if rec["label"] == "no"]
     assert min(yes_scores) > max(no_scores)
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 4, A1: the precision floor is the Clopper-Pearson LOWER bound of
+# held-out precision, not the raw point estimate.
+# ---------------------------------------------------------------------------
+
+def test_clopper_pearson_lower_28_of_28_matches_known_value():
+    # 28/28 -> lower bound ~= 0.899 at one-sided 95% (brief's own pinned value).
+    lower = score_module.clopper_pearson_lower(28, 28)
+    assert lower == pytest.approx(0.899, abs=0.001)
+
+
+def test_clopper_pearson_lower_zero_successes_is_zero():
+    assert score_module.clopper_pearson_lower(0, 10) == 0.0
+
+
+def test_clopper_pearson_lower_zero_trials_is_undefined():
+    assert score_module.clopper_pearson_lower(0, 0) is None
+
+
+def test_clopper_pearson_lower_below_28_of_28_does_not_meet_090_floor():
+    # 25/25 perfect precision still does not clear the 0.90 floor -- this is
+    # exactly why the earlier n=25-per-class "informative" test needed to
+    # grow to n=40 (see test_verdict_informative_model_beats_weak_baseline_is_replace).
+    lower = score_module.clopper_pearson_lower(25, 25)
+    assert lower < score_module.PRECISION_FLOOR
+
+
+def test_floored_coverage_uses_clopper_pearson_not_raw_precision():
+    # 25/25 accepted, all correct: raw precision is 1.0, but the CP lower
+    # bound (~0.887) is below the 0.90 floor -- coverage must count as 0.
+    records = {
+        f"id{i}": {"id": f"id{i}", "label": "yes", "score": 0.9, "decision": True}
+        for i in range(25)
+    }
+    ids = list(records)
+    coverage, precision, floor_met, lower_bound = score_module._floored_coverage(records, ids)
+    assert precision == 1.0
+    assert lower_bound < score_module.PRECISION_FLOOR
+    assert floor_met is False
+    assert coverage == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 4, A2: augment now needs the SAME coverage-difference CI
+# lower-bound-positive condition replace does -- a point estimate of exactly
+# 0 (which the old "coverage_point >= 0" check happily accepted) must not
+# reach augment when the CI itself straddles/touches zero.
+# ---------------------------------------------------------------------------
+
+def _identical_records(n=30, label="yes", decision=True, score=0.9):
+    return {
+        f"id{i}": {"id": f"id{i}", "label": label, "score": score, "decision": decision}
+        for i in range(n)
+    }
+
+
+def test_augment_requires_ci_lower_bound_positive_not_just_point_nonneg():
+    # jev and baseline share IDENTICAL held-out records (same decisions, same
+    # labels) -- every bootstrap resample computes the same coverage for
+    # both, so point_estimate and ci_90 are both exactly 0. The precision
+    # floor is cleared (30/30 -> CP lower ~0.905 >= 0.90).
+    records = _identical_records(n=30)
+    scores = {
+        "decomposed": {
+            "n_yes": 30, "n_no": 30,
+            "held_out_records": list(records.values()),
+            "stability": {"pass": True},
+        },
+        "baseline": {
+            "n_yes": 30, "n_no": 30,
+            "held_out_records": list(records.values()),
+            "brier_calibrated_records": list(records.values()),
+        },
+        "_control_checks": {"decomposed": {"result": "pass"}},
+    }
+    result = score_module._compute_arm_verdict("decomposed", scores)
+    assert result["coverage_diff"]["point_estimate"] == pytest.approx(0.0)
+    assert result["coverage_diff"]["ci_90"] == [pytest.approx(0.0), pytest.approx(0.0)]
+    assert result["verdict"] == "not_adopted"
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 4, A3: the control check reads the SAME score the other gates
+# read for that arm -- for `decomposed`, the control arm's sub-answers are
+# scored through the REAL arm's fitted cross-fit composite weights, never
+# the control arm's own raw v0 `score`.
+# ---------------------------------------------------------------------------
+
+def test_decomposed_control_records_scored_via_real_arms_fitted_weights():
+    weights_a_to_b = {"intercept": -10.0, "f": 20.0}  # fit on real half A, scores half B
+    weights_b_to_a = {"intercept": 10.0, "f": -20.0}  # fit on real half B, scores half A
+    half_a_ids = {"a1"}
+    half_b_ids = {"b1"}
+    control_rows = [
+        _row("a1", "yes", 0.9, answers={"f": {"noul": 0.0}}),
+        _row("b1", "yes", 0.9, answers={"f": {"noul": 1.0}}),
+    ]
+    records = score_module._decomposed_control_records(
+        control_rows, half_a_ids, half_b_ids, weights_a_to_b, weights_b_to_a)
+    by_id = {r["id"]: r for r in records}
+
+    # a1 (half A) is scored via weights_b_to_a: 10 + (-20)*0.0 = 10 -> sigmoid ~= 1.
+    assert by_id["a1"]["score"] == pytest.approx(1.0, abs=1e-3)
+    # b1 (half B) is scored via weights_a_to_b: -10 + 20*1.0 = 10 -> sigmoid ~= 1.
+    assert by_id["b1"]["score"] == pytest.approx(1.0, abs=1e-3)
+    # Neither reads the row's own raw v0 `score` (0.9) directly.
+    assert by_id["a1"]["score"] != 0.9
+    assert by_id["b1"]["score"] != 0.9
+
+
+def test_score_set_control_check_decomposed_ignores_sabotaged_raw_v0_score():
+    dec_r1, dec_r2 = _informative_decomposed_rows(
+        "decomposed", n_per_class=15, id_prefix="ctrlfix")
+
+    # A proper control state: NO signal in the noul sub-answers (constant),
+    # but the raw v0 `score` is sabotaged to look strongly label-separated
+    # anyway -- proving the control check no longer reads it.
+    ctrl_r1 = []
+    for row in dec_r1:
+        ctrl_row = dict(row)
+        ctrl_row["arm"] = "control_decomposed"
+        ctrl_row["answers"] = {
+            "same_work_item": {"noul": 0.5}, "task_named": {"noul": 0.5},
+            "same_trade": {"noul": 0.5},
+        }
+        ctrl_row["score"] = 0.95 if row["label"] == "yes" else 0.05
+        ctrl_r1.append(ctrl_row)
+    ctrl_r2 = [dict(r) for r in ctrl_r1]
+    for r in ctrl_r2:
+        r["run"] = 2
+
+    rows_by_arm_run = {
+        "decomposed": {1: dec_r1, 2: dec_r2},
+        "control_decomposed": {1: ctrl_r1, 2: ctrl_r2},
+    }
+    scores = score_module.score_set(rows_by_arm_run, {})
+    control = scores["_control_checks"]["decomposed"]
+    assert control["control_mean"] is not None
+    # Must NOT read the sabotaged raw mean (0.95) -- the fitted composite,
+    # applied to a constant/uninformative feature, produces a value far from it.
+    assert control["control_mean"] < 0.8
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 4, A4: a failed decomposed fit half keeps its held-out rows (with
+# decision=False), never drops them from the paired comparison.
+# ---------------------------------------------------------------------------
+
+def test_decomposed_direction_failed_fit_keeps_held_out_records():
+    def _make(id_, label, val):
+        return _row(
+            id_, label, 0.42, answers={
+                "same_work_item": {"noul": val},
+                "task_named": {"noul": val},
+                "same_trade": {"noul": 0.5},
+            },
+        )
+
+    all_no = [_make(f"no{i}", "no", 0.0) for i in range(5)]
+    mixed = [_make(f"m{i}", "yes" if i % 2 == 0 else "no", 1.0 if i % 2 == 0 else 0.0)
+             for i in range(6)]
+
+    result = score_module._fit_decomposed_direction(all_no, mixed)
+    records = result["_records"]
+    assert len(records) == len(mixed)
+    assert {r["id"] for r in records} == {r["id"] for r in mixed}
+    assert all(r["decision"] is False for r in records)
+    # Falls back to the row's own stored v0 score (there is no fitted
+    # composite to score it with).
+    assert all(r["score"] == 0.42 for r in records)
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 4, A5: a baseline score that is not a probability is Platt-scaled
+# (1-feature cross-fit logistic) before the paired Brier comparison.
+# ---------------------------------------------------------------------------
+
+def test_baseline_brier_calibrated_records_are_platt_scaled_not_raw_score():
+    base_rows = []
+    for i in range(20):
+        base_rows.append(_row(f"row-yes-{i}", "yes", 10.0, run=1, arm="baseline"))
+        base_rows.append(_row(f"row-no-{i}", "no", -10.0, run=1, arm="baseline"))
+
+    rows_by_arm_run = {"baseline": {1: base_rows, 2: base_rows}}
+    scores = score_module.score_set(rows_by_arm_run, {})
+    records = scores["baseline"]["brier_calibrated_records"]
+    assert records
+    for rec in records:
+        assert 0.0 <= rec["score"] <= 1.0  # a real probability, not the raw +-10
+        if rec["label"] == "yes":
+            assert rec["score"] > 0.9
+        else:
+            assert rec["score"] < 0.1
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 4, A8: Monte-Carlo sweep over a fixed set of seeds at n=130
+# (65 per class) -- a control that passes, a near-constant model and a
+# random model must never reach augment/replace; an informative model
+# reaches replace in the majority of seeds. `n_reps` is reduced from
+# production (2000) to keep this file's runtime under ~60s -- never reduced
+# in `score.py` itself.
+# ---------------------------------------------------------------------------
+
+import random as _random  # noqa: E402
+
+MC_SEEDS = range(5)
+MC_N_REPS = 100
+MC_N_PER_CLASS = 65  # n=130 total, per the brief
+
+
+def _mc_constant_rows(arm, seed, n_per_class, base_score, id_prefix):
+    rng = _random.Random(seed)
+    rows1, rows2 = [], []
+    for label in ("yes", "no"):
+        for k in range(n_per_class):
+            row_id = f"{id_prefix}-{label}-{k}"
+            answers = {"same_work_item": {"noul": 0.5}, "task_named": {"noul": 0.5},
+                       "same_trade": {"noul": 0.5}}
+            score1 = min(1.0, max(0.0, base_score + rng.uniform(-0.05, 0.05)))
+            score2 = min(1.0, max(0.0, base_score + rng.uniform(-0.05, 0.05)))
+            rows1.append(_row(row_id, label, score1, run=1, arm=arm, answers=answers))
+            rows2.append(_row(row_id, label, score2, run=2, arm=arm, answers=answers))
+    return rows1, rows2
+
+
+def _mc_random_rows(arm, seed, n_per_class, id_prefix):
+    rng = _random.Random(seed)
+    rows1, rows2 = [], []
+    for label in ("yes", "no"):
+        for k in range(n_per_class):
+            row_id = f"{id_prefix}-{label}-{k}"
+            s1, s2 = rng.random(), rng.random()
+            answers1 = {"same_work_item": {"noul": s1}, "task_named": {"noul": s1},
+                        "same_trade": {"noul": 0.5}}
+            answers2 = {"same_work_item": {"noul": s2}, "task_named": {"noul": s2},
+                        "same_trade": {"noul": 0.5}}
+            rows1.append(_row(row_id, label, s1, run=1, arm=arm, answers=answers1))
+            rows2.append(_row(row_id, label, s2, run=2, arm=arm, answers=answers2))
+    return rows1, rows2
+
+
+def test_mc_near_constant_model_never_reaches_augment_or_replace():
+    for seed in MC_SEEDS:
+        prefix = f"nc{seed}"
+        base_r1, base_r2 = _mc_constant_rows(
+            "baseline", seed, MC_N_PER_CLASS, 0.5, prefix)
+        dec_r1, dec_r2 = _mc_constant_rows(
+            "decomposed", seed + 1000, MC_N_PER_CLASS, 0.5, prefix)
+        ctrl_r1, ctrl_r2 = _mc_constant_rows(
+            "control_decomposed", seed + 2000, MC_N_PER_CLASS, 0.45, prefix)
+
+        rows_by_arm_run = {
+            "baseline": {1: base_r1, 2: base_r2},
+            "decomposed": {1: dec_r1, 2: dec_r2},
+            "control_decomposed": {1: ctrl_r1, 2: ctrl_r2},
+        }
+        scores = score_module.score_set(rows_by_arm_run, {"baseline": "fit"})
+        result = score_module.verdict(scores, n_reps=MC_N_REPS, seed=seed)
+        assert result["verdict"] not in ("augment", "replace"), (seed, result["reasons"])
+
+
+def test_mc_random_model_never_reaches_augment_or_replace():
+    for seed in MC_SEEDS:
+        prefix = f"rnd{seed}"
+        base_r1, base_r2 = _mc_constant_rows(
+            "baseline", seed, MC_N_PER_CLASS, 0.5, prefix)
+        dec_r1, dec_r2 = _mc_random_rows(
+            "decomposed", seed + 3000, MC_N_PER_CLASS, prefix)
+        ctrl_r1, ctrl_r2 = _mc_constant_rows(
+            "control_decomposed", seed + 4000, MC_N_PER_CLASS, 0.4, prefix)
+
+        rows_by_arm_run = {
+            "baseline": {1: base_r1, 2: base_r2},
+            "decomposed": {1: dec_r1, 2: dec_r2},
+            "control_decomposed": {1: ctrl_r1, 2: ctrl_r2},
+        }
+        scores = score_module.score_set(rows_by_arm_run, {"baseline": "fit"})
+        result = score_module.verdict(scores, n_reps=MC_N_REPS, seed=seed)
+        assert result["verdict"] not in ("augment", "replace"), (seed, result["reasons"])
+
+
+def test_mc_informative_model_reaches_replace_in_majority_of_seeds():
+    n_replace = 0
+    for seed in MC_SEEDS:
+        prefix = f"info{seed}"
+        dec_r1, dec_r2 = _informative_decomposed_rows(
+            "decomposed", n_per_class=40, id_prefix=prefix)
+        base_r1, base_r2 = _mc_constant_rows("baseline", seed, 40, 0.5, prefix)
+        ctrl_r1, ctrl_r2 = _mc_constant_rows(
+            "control_decomposed", seed + 5000, 40, 0.3, prefix)
+
+        rows_by_arm_run = {
+            "baseline": {1: base_r1, 2: base_r2},
+            "decomposed": {1: dec_r1, 2: dec_r2},
+            "control_decomposed": {1: ctrl_r1, 2: ctrl_r2},
+        }
+        scores = score_module.score_set(rows_by_arm_run, {"baseline": "fit"})
+        result = score_module.verdict(scores, n_reps=MC_N_REPS, seed=seed)
+        if result["verdict"] == "replace":
+            n_replace += 1
+    assert n_replace > len(MC_SEEDS) / 2, f"only {n_replace}/{len(MC_SEEDS)} seeds reached replace"

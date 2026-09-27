@@ -78,6 +78,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+from functools import lru_cache
 from typing import Any
 
 import numpy as np
@@ -116,6 +117,110 @@ _NON_NOUL_SUBANSWER_KEYS = {"status_claimed"}
 
 class JevScoreError(ValueError):
     """Raised on a malformed or unsupported call into this module."""
+
+
+# ---------------------------------------------------------------------------
+# Clopper-Pearson (fix wave 4, A1): the precision floor is the one-sided 95%
+# LOWER confidence bound of held-out precision, not the raw point estimate --
+# a raw "28/28 = 1.0" says nothing about the next row, while its
+# Clopper-Pearson lower bound (~0.899) is a real statement about what
+# fraction of future accepted rows are correct. Implemented with numpy/stdlib
+# only (no scipy): the lower bound at confidence `1 - alpha` for `successes`
+# out of `n` trials is Beta_ppf(alpha; successes, n - successes + 1) when
+# successes > 0, else 0.0 exactly (the standard convention: a lower bound of
+# zero needs no numerical inversion). `n == 0` is undefined -> None, per the
+# brief ("0/0 -> undefined -> floor fails").
+#
+# The inverse Beta CDF is found by bisection on the regularised incomplete
+# beta function `_betainc` (Numerical-Recipes-style continued fraction via
+# `_betacf`, using `math.lgamma` for the log-Beta normaliser) -- pinned
+# against a known value: 28/28 -> lower bound ~= 0.899 at one-sided 95%.
+# `lru_cache` matters here: `_bootstrap_coverage_diff` calls this inside every
+# bootstrap rep, and a paired resample of a small held-out set revisits the
+# same (successes, n) integer pair many times.
+# ---------------------------------------------------------------------------
+
+def _betacf(a: float, b: float, x: float, max_iter: int = 100, eps: float = 1e-8) -> float:
+    """Continued-fraction evaluation used by `_betainc` (Numerical Recipes
+    `betacf`). Converges quickly for the small integer (a, b) this module
+    ever calls it with."""
+    qab = a + b
+    qap = a + 1.0
+    qam = a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < 1e-30:
+        d = 1e-30
+    d = 1.0 / d
+    h = d
+    for m in range(1, max_iter + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < 1e-30:
+            d = 1e-30
+        c = 1.0 + aa / c
+        if abs(c) < 1e-30:
+            c = 1e-30
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < 1e-30:
+            d = 1e-30
+        c = 1.0 + aa / c
+        if abs(c) < 1e-30:
+            c = 1e-30
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < eps:
+            break
+    return h
+
+
+def _betainc(x: float, a: float, b: float) -> float:
+    """Regularised incomplete beta function I_x(a, b), x in [0, 1]."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    ln_beta = math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)
+    front = math.exp(math.log(x) * a + math.log(1.0 - x) * b - ln_beta)
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * _betacf(a, b, x) / a
+    return 1.0 - front * _betacf(b, a, 1.0 - x) / b
+
+
+def _beta_ppf(p: float, a: float, b: float, tol: float = 1e-9, max_iter: int = 100) -> float:
+    """Inverse CDF (quantile) of Beta(a, b) at probability `p`, via
+    bisection over `_betainc` -- exact enough for a 0.90 floor comparison,
+    and far cheaper per call than a tighter tolerance would be given how
+    often `clopper_pearson_lower` is called inside the bootstrap."""
+    lo, hi = 0.0, 1.0
+    for _ in range(max_iter):
+        mid = (lo + hi) / 2.0
+        if _betainc(mid, a, b) < p:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < tol:
+            break
+    return (lo + hi) / 2.0
+
+
+@lru_cache(maxsize=None)
+def clopper_pearson_lower(successes: int, n: int, confidence: float = 0.95) -> float | None:
+    """One-sided Clopper-Pearson LOWER bound of a binomial proportion at
+    `confidence` (default 0.95). `None` when `n == 0` (undefined -- the
+    precision floor fails on an empty accepted set, per the brief). Cached:
+    only ever called with small non-negative integers."""
+    if n == 0 or successes < 0 or successes > n:
+        return None
+    if successes == 0:
+        return 0.0
+    alpha = 1.0 - confidence
+    return _beta_ppf(alpha, successes, n - successes + 1)
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +715,60 @@ def _metrics_from_pooled_predictions(pooled: list) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Platt scaling for the Brier comparison (fix wave 4, A5). A raw arm score
+# that is not itself a calibrated probability -- threads' baseline is lexical
+# similarity, not P(match) -- makes a squared-error (Brier) comparison
+# against a Jev arm's real probability unfair in either direction. This
+# fits a 1-feature L2 logistic regression (raw score -> label) on one split
+# half and applies it to the other, cross-fit exactly like every other
+# threshold/weight in this module -- never fit and scored on the same rows.
+# Computed for every arm passed through `_score_one_arm` (cheap, one extra
+# 1-D logistic fit per direction); only the BASELINE arm's version is read by
+# `_compute_arm_verdict` for the paired Brier condition, per the brief
+# ("do this for every set's baseline so the comparison is fair both ways") --
+# a Jev arm's own `held_out_records` are already a probability (clause 2) and
+# do not need it, but computing it for every arm keeps this function generic
+# rather than baseline-specific.
+# ---------------------------------------------------------------------------
+
+def _platt_scale_direction(fit_rows: list, score_rows: list) -> dict:
+    """Fit a 1-feature L2 logistic regression (raw `score` -> label) on
+    `fit_rows`, apply it to `score_rows`. Returns `{"records": [...],
+    "reason": str|None}`; `records` is empty with a reason when the fit half
+    has fewer than one row of each label (mirrors `_class_balance_reason`
+    everywhere else in this module)."""
+    reason = _class_balance_reason(fit_rows)
+    if reason:
+        return {"records": [], "reason": reason}
+
+    fit_usable = _usable_rows(fit_rows)
+    score_usable = _usable_rows(score_rows)
+    X_fit = np.array([[float(r["score"])] for r in fit_usable])
+    y_fit = np.array([_label_bit(r) for r in fit_usable], dtype=float)
+    weights = _fit_logreg_l2(X_fit, y_fit)
+
+    if not score_usable:
+        return {"records": [], "reason": None}
+    X_score = np.array([[float(r["score"])] for r in score_usable])
+    probs = _predict_logreg(X_score, weights).tolist()
+    records = [
+        {"id": r["id"], "label": r["label"], "score": float(p)}
+        for r, p in zip(score_usable, probs)
+    ]
+    return {"records": records, "reason": None}
+
+
+def _platt_scale_pooled(rows_a: list, rows_b: list) -> list:
+    """Pooled Platt-scaled held-out predictions: half B calibrated by half
+    A's fit, half A calibrated by half B's fit -- every usable row is
+    calibrated by a fit that never saw it, same cross-fit shape as every
+    other split-half computation here."""
+    dir_ab = _platt_scale_direction(rows_a, rows_b)  # fit on A, score B
+    dir_ba = _platt_scale_direction(rows_b, rows_a)  # fit on B, score A
+    return dir_ab["records"] + dir_ba["records"]
+
+
+# ---------------------------------------------------------------------------
 # Decomposed composite-weight fitting (logistic regression, ruling #5)
 # ---------------------------------------------------------------------------
 
@@ -679,25 +838,36 @@ def _fit_decomposed_direction(fit_rows: list, score_rows: list) -> dict:
     half and evaluated on the other"). A fit half with fewer than one row of
     each label (finding #3) short-circuits every threshold-dependent number
     in this direction, including p95."""
-    n_score_usable = len(_usable_rows(score_rows))
+    score_usable_all = _usable_rows(score_rows)
+    n_score_usable = len(score_usable_all)
+
+    # Fix wave 4, A4: a failed fit half must not drop its held-out rows from
+    # the paired comparison -- it keeps them with decision=False (mirroring
+    # `_p95_direction`'s own reason branch) and the row's own stored v0
+    # `score` as a fallback (there is no fitted composite to score it with).
+    def _fallback_records() -> list:
+        return [
+            {"id": r["id"], "label": r["label"], "score": r["score"], "decision": False}
+            for r in score_usable_all
+        ]
 
     class_reason = _class_balance_reason(fit_rows)
     if class_reason:
         return {
-            "weights": {}, "n_fit": 0, "n_score": 0, "brier": None,
+            "weights": {}, "n_fit": 0, "n_score": n_score_usable, "brier": None,
             "p95": {**_EMPTY_P95, "n_fit": 0, "n_held_out": n_score_usable, "reason": class_reason},
             "reason": class_reason,
-            "_records": [],
+            "_records": _fallback_records(),
         }
 
     fit_extraction = _extract_noul_features(fit_rows)
     if not fit_extraction[0]:
         reason = "fit half has no rows with usable noul answers"
         return {
-            "weights": {}, "n_fit": 0, "n_score": 0, "brier": None,
+            "weights": {}, "n_fit": 0, "n_score": n_score_usable, "brier": None,
             "p95": {**_EMPTY_P95, "n_fit": 0, "n_held_out": n_score_usable, "reason": reason},
             "reason": reason,
-            "_records": [],
+            "_records": _fallback_records(),
         }
     feature_names, X_fit, y_fit, _ = fit_extraction
     weights = _fit_logreg_l2(X_fit, y_fit)
@@ -712,14 +882,14 @@ def _fit_decomposed_direction(fit_rows: list, score_rows: list) -> dict:
         reason = "score half is missing one or more fitted sub-answer keys"
         return {
             "weights": dict(zip(["intercept"] + feature_names, weights.tolist())),
-            "n_fit": len(y_fit), "n_score": 0, "brier": None,
+            "n_fit": len(y_fit), "n_score": n_score_usable, "brier": None,
             "p95": {
                 "threshold": threshold, "precision_on_fit_half": precision_on_fit,
                 "coverage_on_held_out": 0, "precision_on_held_out": None,
                 "n_fit": len(y_fit), "n_held_out": n_score_usable, "reason": reason,
             },
             "reason": reason,
-            "_records": [],
+            "_records": _fallback_records(),
         }
     _, X_score, y_score, score_usable_rows = score_extraction
     predicted_score = _predict_logreg(X_score, weights)
@@ -939,6 +1109,12 @@ def _score_one_arm(arm: str, runs: dict, policy) -> dict:
     n_yes = sum(1 for r in usable1 if r["label"] == "yes")
     n_no = sum(1 for r in usable1 if r["label"] == "no")
 
+    # Fix wave 4, A5: Platt-scaled (calibrated) held-out score for every arm,
+    # cross-fit the same way as everything else -- only the baseline arm's
+    # version is actually read (by `_compute_arm_verdict`'s paired Brier
+    # condition), but computed here for every arm so this stays generic.
+    brier_calibrated_records = _platt_scale_pooled(rows_a, rows_b)
+
     result = {
         "n": len(usable1),
         "n_failed": n_failed,
@@ -955,11 +1131,44 @@ def _score_one_arm(arm: str, runs: dict, policy) -> dict:
         "fixed_threshold": fixed_metrics,
         "split_half": threshold_split,
         "held_out_records": held_out_records,
+        "brier_calibrated_records": brier_calibrated_records,
         "stability": stability,
     }
     if decomposed_fit is not None:
         result["decomposed_fit"] = decomposed_fit
     return result
+
+
+def _decomposed_control_records(
+    control_rows: list, half_a_ids: set, half_b_ids: set,
+    weights_a_to_b: dict | None, weights_b_to_a: dict | None,
+) -> list:
+    """Fix wave 4, A3: score the CONTROL arm's rows through the SAME
+    held-out cross-fit weights the real `decomposed` arm's fit halves
+    produced -- a control id in half B is scored with the weights fit on the
+    real arm's half A (`weights_a_to_b`), and a control id in half A with the
+    weights fit on the real arm's half B (`weights_b_to_a`), mirroring
+    exactly how `_fit_decomposed` pools the real arm's own held-out
+    predictions. Without this, the control check would compare the real
+    arm's cross-fit probability against the control arm's raw, never-refit
+    v0 composite score -- two different scores about two different models,
+    which is exactly the inconsistency the amended rule's clause 2 exists to
+    remove. A control row outside both halves, or missing a fitted feature
+    key, is skipped (never fabricated)."""
+    usable = _usable_rows(control_rows)
+    out = []
+    for row in usable:
+        if row["id"] in half_a_ids:
+            weights = weights_b_to_a
+        elif row["id"] in half_b_ids:
+            weights = weights_a_to_b
+        else:
+            continue
+        score = _decomposed_row_score(row, weights)
+        if score is None:
+            continue
+        out.append({"id": row["id"], "label": row["label"], "score": score})
+    return out
 
 
 def score_set(rows_by_arm_run: dict, threshold_policy: dict | None = None) -> dict:
@@ -975,9 +1184,27 @@ def score_set(rows_by_arm_run: dict, threshold_policy: dict | None = None) -> di
     control_checks = {}
     for real_arm, control_arm in _CONTROL_PAIRS:
         if real_arm in rows_by_arm_run and control_arm in rows_by_arm_run:
-            real_rows = rows_by_arm_run[real_arm].get(1, [])
-            control_rows = rows_by_arm_run[control_arm].get(1, [])
-            control_checks[real_arm] = control_check(real_rows, control_rows)
+            # Fix wave 4, A3: the control check reads the SAME score every
+            # other gate reads for that arm (clause 2) -- the real arm's own
+            # cross-fit held-out records, and, for `decomposed`, the control
+            # arm's sub-answers run through that SAME fit (never the control
+            # arm's raw v0 composite `score`). `broad` needs no such
+            # transform: its held-out records already ARE the raw
+            # probability (clause 2 reads it directly), so the control side
+            # stays its own raw run-1 rows, unchanged from before.
+            real_records = result[real_arm].get("held_out_records", [])
+            if real_arm == "decomposed":
+                control_run1 = rows_by_arm_run[control_arm].get(1, [])
+                real_run1_usable = _usable_rows(rows_by_arm_run[real_arm].get(1, []))
+                half_a_ids, half_b_ids = split_half([r["id"] for r in real_run1_usable])
+                decomposed_fit = result[real_arm].get("decomposed_fit") or {}
+                weights_a_to_b = decomposed_fit.get("a_to_b", {}).get("weights") or None
+                weights_b_to_a = decomposed_fit.get("b_to_a", {}).get("weights") or None
+                control_records = _decomposed_control_records(
+                    control_run1, half_a_ids, half_b_ids, weights_a_to_b, weights_b_to_a)
+            else:
+                control_records = rows_by_arm_run[control_arm].get(1, [])
+            control_checks[real_arm] = control_check(real_records, control_records)
     result["_control_checks"] = control_checks
 
     return result
@@ -1151,11 +1378,21 @@ def _coverage_and_precision(records: dict, ids: list) -> tuple:
 
 
 def _floored_coverage(records: dict, ids: list) -> tuple:
-    """(coverage-or-0, precision, floor_met) -- clause 4: below the 0.90
-    precision floor, the arm's coverage counts as 0 for the verdict."""
+    """(coverage-or-0, precision, floor_met, precision_lower_bound) -- clause 4
+    (fix wave 4, A1): the floor is the one-sided 95% Clopper-Pearson LOWER
+    bound of held-out precision, not the raw point estimate (a raw 28/28 =
+    1.0 says nothing about the next row; its lower bound, ~0.899, does).
+    `precision` (the raw point estimate) is still returned, descriptive only.
+    Below the floor -- including when the lower bound is undefined (0
+    accepted rows) -- the arm's coverage counts as 0 for the verdict."""
     coverage, precision = _coverage_and_precision(records, ids)
-    floor_met = precision is not None and precision >= PRECISION_FLOOR
-    return (coverage if floor_met else 0.0), precision, floor_met
+    accepted = sum(1 for id_ in ids if records[id_]["decision"])
+    positive = sum(
+        1 for id_ in ids if records[id_]["decision"] and records[id_]["label"] == "yes"
+    )
+    lower_bound = clopper_pearson_lower(positive, accepted) if accepted > 0 else None
+    floor_met = lower_bound is not None and lower_bound >= PRECISION_FLOOR
+    return (coverage if floor_met else 0.0), precision, floor_met, lower_bound
 
 
 def _bootstrap_coverage_diff(
@@ -1180,8 +1417,10 @@ def _bootstrap_coverage_diff(
             "reason": "no overlapping held-out ids between the two arms",
         }
 
-    jev_point_cov, jev_precision, jev_floor_met = _floored_coverage(jev_records, common_ids)
-    base_point_cov, base_precision, base_floor_met = _floored_coverage(baseline_records, common_ids)
+    jev_point_cov, jev_precision, jev_floor_met, jev_lower = _floored_coverage(
+        jev_records, common_ids)
+    base_point_cov, base_precision, base_floor_met, base_lower = _floored_coverage(
+        baseline_records, common_ids)
     point_estimate = jev_point_cov - base_point_cov
 
     rng = np.random.default_rng(seed)
@@ -1190,8 +1429,8 @@ def _bootstrap_coverage_diff(
     diffs = np.empty(n_reps)
     for i in range(n_reps):
         sample_ids = ids_arr[rng.integers(0, n, size=n)].tolist()
-        jc, _, _ = _floored_coverage(jev_records, sample_ids)
-        bc, _, _ = _floored_coverage(baseline_records, sample_ids)
+        jc, _, _, _ = _floored_coverage(jev_records, sample_ids)
+        bc, _, _, _ = _floored_coverage(baseline_records, sample_ids)
         diffs[i] = jc - bc
     lo, hi = np.percentile(diffs, [5.0, 95.0])
 
@@ -1201,6 +1440,7 @@ def _bootstrap_coverage_diff(
         "n": n, "n_reps": n_reps, "seed": seed,
         "jev_coverage": float(jev_point_cov), "baseline_coverage": float(base_point_cov),
         "jev_precision": jev_precision, "baseline_precision": base_precision,
+        "jev_precision_lower_bound": jev_lower, "baseline_precision_lower_bound": base_lower,
         "jev_precision_floor_met": jev_floor_met,
         "baseline_precision_floor_met": base_floor_met,
     }
@@ -1258,12 +1498,18 @@ def _bootstrap_brier_diff(
 # Clause 9: the verdict, applied mechanically.
 # ---------------------------------------------------------------------------
 
-def _compute_arm_verdict(jev_arm_key: str, scores: dict) -> dict:
+def _compute_arm_verdict(
+    jev_arm_key: str, scores: dict,
+    n_reps: int = BOOTSTRAP_REPS, seed: int = BOOTSTRAP_SEED,
+) -> dict:
     """Runs clauses 1-9 for one Jev arm (`jev_arm_key`) against `baseline`.
     Used for `decomposed` (the rule's subject -- drives `verdict()`'s
     top-level result) and, per the brief, for `broad` too (reported
     alongside using the same machinery, but never overriding the top-level
-    verdict, which is `decomposed`'s alone)."""
+    verdict, which is `decomposed`'s alone). `n_reps`/`seed` are passed
+    through to both bootstraps -- production always uses the module defaults;
+    tests may pass a smaller `n_reps` to keep a Monte-Carlo sweep over many
+    seeds fast (fix wave 4, A8), never by reducing it in this module itself."""
     if jev_arm_key not in scores or "baseline" not in scores:
         return {
             "verdict": "descriptive_only",
@@ -1293,8 +1539,18 @@ def _compute_arm_verdict(jev_arm_key: str, scores: dict) -> dict:
 
     jev_records = {rec["id"]: rec for rec in jev.get("held_out_records", [])}
     base_records = {rec["id"]: rec for rec in baseline.get("held_out_records", [])}
+    # Fix wave 4, A5: the baseline side of the paired Brier comparison reads
+    # its Platt-scaled (cross-fit calibrated) score, not its raw stored
+    # score -- a raw score that is not itself a probability (e.g. threads'
+    # lexical similarity) makes squared-error-against-the-label an unfair
+    # comparison against a Jev arm's real probability. The Jev arm's own
+    # `held_out_records` are already a probability (clause 2) and need no
+    # such transform.
+    base_brier_records = {
+        rec["id"]: rec for rec in baseline.get("brier_calibrated_records", [])
+    }
 
-    coverage_diff = _bootstrap_coverage_diff(jev_records, base_records)
+    coverage_diff = _bootstrap_coverage_diff(jev_records, base_records, n_reps=n_reps, seed=seed)
     # Clause 4 gates the JEV arm's own operating point -- an accepted
     # decision must actually meet the deployed precision bar to be worth
     # replacing/augmenting anything with. The baseline's floor is not a
@@ -1308,7 +1564,7 @@ def _compute_arm_verdict(jev_arm_key: str, scores: dict) -> dict:
             f"held-out precision floor (>= {PRECISION_FLOOR}) not met by {jev_arm_key!r}"
         )
 
-    brier = _bootstrap_brier_diff(jev_records, base_records)
+    brier = _bootstrap_brier_diff(jev_records, base_brier_records, n_reps=n_reps, seed=seed)
     brier_pass = brier.get("point_estimate") is not None and brier["point_estimate"] <= 0
     if brier.get("point_estimate") is None:
         reasons.append("paired Brier undefined: no overlapping held-out ids between the arms")
@@ -1318,21 +1574,30 @@ def _compute_arm_verdict(jev_arm_key: str, scores: dict) -> dict:
     if not stability_pass:
         reasons.append("stability check failed or undefined (flips exceed the allowance)")
 
+    # Fix wave 4, A2: augment now needs the SAME coverage-difference CI
+    # lower-bound-positive condition replace does (not merely a nonnegative
+    # point estimate, which a noisy/uninformative model clears far too
+    # easily) -- replace = augment's conditions + the paired Brier condition.
     ci_lower = (coverage_diff.get("ci_90") or [None, None])[0]
-    coverage_point = coverage_diff.get("point_estimate")
     coverage_ci_lower_positive = ci_lower is not None and ci_lower > 0
-    coverage_point_nonneg = coverage_point is not None and coverage_point >= 0
 
-    if control_pass and precision_floor_met and coverage_ci_lower_positive and brier_pass and stability_pass:
+    augment_conditions_met = (
+        control_pass and precision_floor_met and coverage_ci_lower_positive and stability_pass
+    )
+    if augment_conditions_met and brier_pass:
         result = "replace"
-    elif control_pass and precision_floor_met and coverage_point_nonneg and stability_pass:
+    elif augment_conditions_met:
         result = "augment"
-        if not brier_pass:
-            reasons.append("paired Brier condition failed (allowed for augment)")
+        reasons.append("paired Brier condition failed (allowed for augment)")
     else:
         result = "not_adopted"
-        if control_pass and precision_floor_met and coverage_point is not None and not coverage_point_nonneg:
-            reasons.append("coverage-difference point estimate < 0")
+        coverage_point = coverage_diff.get("point_estimate")
+        if (control_pass and precision_floor_met and stability_pass
+                and coverage_point is not None and not coverage_ci_lower_positive):
+            reasons.append(
+                "coverage-difference 90% CI lower bound is not > 0 "
+                f"(point_estimate={coverage_point}, ci_90={coverage_diff.get('ci_90')})"
+            )
 
     return {
         "verdict": result,
@@ -1345,14 +1610,22 @@ def _compute_arm_verdict(jev_arm_key: str, scores: dict) -> dict:
     }
 
 
-def verdict(scores: dict) -> dict:
+def verdict(
+    scores: dict, n_reps: int = BOOTSTRAP_REPS, seed: int = BOOTSTRAP_SEED,
+) -> dict:
     """Clause 9, applied mechanically. `scores` is `score_set(...)`'s own
     output. The Jev arm judged is `decomposed` (the rule's subject); `broad`
     is computed the same way and reported alongside under
     `inputs["broad"]`, per the brief, but never changes the top-level
-    `verdict`/`reasons`, which are `decomposed`'s alone."""
-    decomposed_inputs = _compute_arm_verdict("decomposed", scores)
-    broad_inputs = _compute_arm_verdict("broad", scores) if "broad" in scores else None
+    `verdict`/`reasons`, which are `decomposed`'s alone. `n_reps`/`seed`
+    default to the production bootstrap settings; pass a smaller `n_reps`
+    only from a test that needs to sweep many seeds quickly (fix wave 4,
+    A8) -- production call sites never override this."""
+    decomposed_inputs = _compute_arm_verdict("decomposed", scores, n_reps=n_reps, seed=seed)
+    broad_inputs = (
+        _compute_arm_verdict("broad", scores, n_reps=n_reps, seed=seed)
+        if "broad" in scores else None
+    )
     return {
         "verdict": decomposed_inputs["verdict"],
         "reasons": decomposed_inputs["reasons"],

@@ -459,26 +459,35 @@ def load_results(results_dir: Path, set_name: str) -> dict:
 
 
 def rejoin_current_labels(rows_by_arm_run: dict, current_rows: list) -> tuple:
-    """Fix wave 3, minor 4: overwrite every scored row's `label` with the
-    CURRENT value from `{set}.jsonl`, keyed by id -- a relabel (a re-import
-    of owner labels, or a re-export) must not leave a stale `label` baked
-    into an already-written `results/*.jsonl` row that `--score` later reads.
-    Returns `(rows_by_arm_run, missing_ids)`: `missing_ids` is every row id
-    present in the results but absent from the current fixture (its `label`
-    is left as-is -- there is nothing current to re-join to -- but the id is
-    reported so a stale/relabelled run does not silently score against a
-    row that no longer exists)."""
+    """Fix wave 3, minor 4 / fix wave 4, A7: overwrite every scored row's
+    `label` with the CURRENT value from `{set}.jsonl`, keyed by id -- a
+    relabel (a re-import of owner labels, or a re-export) must not leave a
+    stale `label` baked into an already-written `results/*.jsonl` row that
+    `--score` later reads. A row whose id no longer exists in the current
+    fixture at all (a hard delete, or the export dropping it) is EXCLUDED
+    from the returned rows entirely -- fix wave 3 left it in place with its
+    stale label, which meant `--score` still scored it against a label that
+    no longer exists anywhere. Returns `(rows_by_arm_run, missing_ids)`:
+    `missing_ids` is every excluded row's id, so a stale/relabelled run does
+    not silently drop rows without anyone noticing."""
     current_by_id = {row["id"]: row for row in current_rows}
     missing_ids = set()
-    for by_run in rows_by_arm_run.values():
-        for rows in by_run.values():
+    result: dict = {}
+    for arm, by_run in rows_by_arm_run.items():
+        new_by_run = {}
+        for run, rows in by_run.items():
+            kept = []
             for row in rows:
                 current = current_by_id.get(row.get("id"))
                 if current is None:
                     missing_ids.add(row.get("id"))
                     continue
+                row = dict(row)
                 row["label"] = current.get("label")
-    return rows_by_arm_run, sorted(missing_ids, key=str)
+                kept.append(row)
+            new_by_run[run] = kept
+        result[arm] = new_by_run
+    return result, sorted(missing_ids, key=str)
 
 
 # ---------------------------------------------------------------------------
@@ -1054,7 +1063,8 @@ def _run_score(sets: list, args) -> int:
             if missing_ids:
                 print(
                     f"warning: {len(missing_ids)} scored row id(s) for {set_name!r} "
-                    f"no longer exist in {set_name}.jsonl (label not re-joined): "
+                    f"no longer exist in {set_name}.jsonl -- EXCLUDED from scoring "
+                    f"(fix wave 4, A7 -- never scored with a stale label): "
                     f"{missing_ids}",
                     file=sys.stderr,
                 )

@@ -697,7 +697,10 @@ def test_score_mode_refuses_on_ambiguous_question_hash(tmp_path, monkeypatch):
     assert not (results_dir / "scores.json").exists()
 
 
-def test_rejoin_current_labels_overwrites_stale_labels_and_reports_missing():
+def test_rejoin_current_labels_overwrites_stale_labels_and_excludes_missing():
+    # Fix wave 4, A7: a result row whose id no longer exists in the current
+    # {set}.jsonl is EXCLUDED from scoring (never scored with a stale label)
+    # and counted via `missing_ids`.
     rows_by_arm_run = {
         "broad": {1: [
             {"id": "a", "label": "no"},   # stale -- current says "yes"
@@ -708,8 +711,9 @@ def test_rejoin_current_labels_overwrites_stale_labels_and_reports_missing():
 
     updated, missing_ids = jse.rejoin_current_labels(rows_by_arm_run, current_rows)
 
+    assert len(updated["broad"][1]) == 1
+    assert updated["broad"][1][0]["id"] == "a"
     assert updated["broad"][1][0]["label"] == "yes"
-    assert updated["broad"][1][1]["label"] == "yes"  # untouched: id absent from current
     assert missing_ids == ["gone"]
 
 
