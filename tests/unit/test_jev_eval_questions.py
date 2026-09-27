@@ -483,3 +483,16 @@ def test_work_class_control_ignores_donors_and_key():
     result_a = control(state, donors=[{"title": "irrelevant"}], key="row-9")
     result_b = control(state, donors=[], key="another-row")
     assert result_a == result_b
+
+
+def test_work_class_control_raises_when_already_general_discussion():
+    control = QUESTION_SETS["work_class"]["control"]
+    state = {
+        "title": "General discussion.",
+        "summary": "General discussion.",
+        "category": "site",
+    }
+    original = copy.deepcopy(state)
+    with pytest.raises(JevQuestionsError):
+        control(state, donors=[], key="row-10")
+    assert state == original

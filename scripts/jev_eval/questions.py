@@ -421,9 +421,15 @@ def _control_work_class(state: dict, donors: list, key) -> dict:
     brief names only title and summary as the swap target, and category is
     a coarse label rather than the free-text content the control needs to
     neutralise."""
+    original_title = state.get("title")
+    original_summary = state.get("summary")
     new_state = copy.deepcopy(state)
     new_state["title"] = "General discussion."
     new_state["summary"] = "General discussion."
+    _assert_changed(
+        (original_title, original_summary),
+        (new_state["title"], new_state["summary"]),
+        "title/summary")
     return new_state
 
 
