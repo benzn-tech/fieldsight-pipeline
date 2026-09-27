@@ -214,11 +214,28 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
                 "ORDER BY created_at LIMIT 1",
                 (company_id, external_source, external_ref)).fetchone()
         elif user_id:
+            # The person's own linked profile first; failing that, an EMPTY unlinked
+            # profile of the same name, which the branch below then links. A name that
+            # resolved to nobody once (the namer was not on that person's roster) and to
+            # their account the next time otherwise produced two profiles for one person --
+            # TEST 2026-09-27: two "Sam Yu", one empty after a refused enrolment.
+            #
+            # EMPTY only. Two people who share a name must stay two profiles (see
+            # `test_a_resolved_person_is_keyed_on_their_identity`), and an unlinked profile
+            # that holds samples may be the other one -- adopting it would put a
+            # stranger's voice under this account. An empty one holds no voice to
+            # misattribute, so adopting it only removes a duplicate. One statement, so the
+            # tests' positional doubles stay aligned.
             found = cur.execute(
                 "SELECT id FROM speaker_voiceprints "
-                "WHERE company_id = %s AND user_id = %s AND status <> 'withdrawn' "
-                "ORDER BY created_at LIMIT 1",
-                (company_id, user_id)).fetchone()
+                "WHERE company_id = %s AND status <> 'withdrawn' "
+                "  AND (user_id = %s "
+                "       OR (user_id IS NULL AND external_ref IS NULL "
+                "           AND display_name = %s "
+                "           AND NOT EXISTS (SELECT 1 FROM speaker_voiceprint_samples s "
+                "                           WHERE s.voiceprint_id = speaker_voiceprints.id))) "
+                "ORDER BY (user_id IS NOT NULL) DESC, created_at LIMIT 1",
+                (company_id, user_id, display_name)).fetchone()
         else:
             anchor = consented_by or asserted_by
             found = cur.execute(
