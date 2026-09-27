@@ -68,10 +68,19 @@ below was read out of `src/template.yaml:3976-3978`:
 `FunctionName: !Sub ["${P}-programme-matcher", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]`
 with `StageConfig.test.Prefix = fieldsight-test` (`src/template.yaml:1339-1340`)
 -> `fieldsight-test-programme-matcher`.
+
+`load_deployed_llm_env` copies the deployed env vars into `os.environ` AND
+`importlib.reload`s `llm_utils` in the same call, because `llm_utils` reads
+`os.environ` only once, at import time, into module-level constants that
+`call_llm` reads directly -- a copy into `os.environ` alone would be inert.
+`baseline_config()` reads those `llm_utils` constants back, never
+`os.environ`, so it can only ever report the config calls are actually
+running under.
 """
 from __future__ import annotations
 
 import hashlib
+import importlib
 import inspect
 import json
 import os
@@ -128,16 +137,38 @@ class JevBaselineError(ValueError):
 def load_deployed_llm_env(function_name, *, profile=DEFAULT_PROFILE,
                            region=DEFAULT_REGION, run=subprocess.run):
     """Copy the deployed function's LLM-related env vars into THIS process's
-    `os.environ`, so `llm_utils`'s module-level env reads (evaluated at
-    import time) pick up the same provider/model/temperature TEST's
-    programme-matcher actually runs under -- not this workflow's own default.
+    `os.environ`, then RELOAD `llm_utils` so its module-level constants
+    (`LLM_PROVIDER`, `CLAUDE_MODEL`, `QWEN_MODEL`, ...) actually pick up the
+    new values -- `llm_utils` reads `os.environ` only once, at import time
+    (`src/llm_utils.py:34-68`), into plain module globals that `call_llm` /
+    `_call_qwen` / `_call_anthropic` read directly. `baseline.py` already did
+    `import llm_utils` (module import, not `from llm_utils import X`) before
+    this function ever runs, so setting `os.environ` afterwards was, on its
+    own, invisible to it: every subsequent `llm_utils.call_llm` call would
+    keep using whatever provider/model this PROCESS started with, while
+    `baseline_config()` (if it read `os.environ`) would report the copied
+    one -- a real config, silently swapped for a different one, with no
+    error anywhere (fix round 1, finding #1).
+
+    `importlib.reload(llm_utils)` re-executes the module body in place --
+    same module object, same identity -- so every existing `import llm_utils`
+    reference anywhere in the process (this module, and
+    `lambda_programme_matcher`, which also does a bare `import llm_utils`
+    and reads `llm_utils.call_llm` / `llm_utils.extract_json` as attributes
+    at call time, never `from llm_utils import ...`) sees the reloaded
+    constants without needing its own reload. `src/thread_match.py` does not
+    import `llm_utils` at all. Checked: no module in this arm's call path
+    binds an `llm_utils` name via `from llm_utils import X` (that binding
+    would freeze to the pre-reload value and reload would not fix it).
 
     Style follows `scripts/eval_task_admission.py:16-21`: read the deployed
     function's configuration and copy an explicit allowlist of keys, never
     the whole environment. Controller ruling #3 moves the transport from
     boto3 to the `aws` CLI (matching `export_labels.py`'s `_aws` helper) so a
     test can inject a fake `subprocess.run` and this function is never
-    called for real outside a human running the eval by hand.
+    called for real outside a human running the eval by hand. `src/llm_utils.py`
+    itself is never modified -- the reload is entirely this module's own
+    remedy for its own late env-var write.
 
     Returns the sorted list of key NAMES actually copied (present and
     truthy in the deployed config) -- never the values, so a report or log
@@ -166,23 +197,35 @@ def load_deployed_llm_env(function_name, *, profile=DEFAULT_PROFILE,
         if value:
             os.environ[key] = value
             copied.append(key)
+
+    # Without this, every `os.environ[key] = value` two lines up is dead
+    # for `llm_utils`'s purposes: its provider/model/temperature are plain
+    # module globals set once at import, and this module already imported
+    # it before `load_deployed_llm_env` ever runs.
+    importlib.reload(llm_utils)
+
     return sorted(copied)
 
 
 def baseline_config() -> dict:
-    """Snapshot of the provider/model/temperature this process is about to
-    run the programme_match baseline under, for the runner to stamp into
-    results alongside every row -- so a results file self-documents which
-    gate configuration produced it without a separate lookup."""
-    provider = os.environ.get("LLM_PROVIDER", "anthropic")
-    if provider == "qwen":
-        model = os.environ.get("QWEN_MODEL")
-    else:
-        model = os.environ.get("CLAUDE_MODEL")
+    """Snapshot of the provider/model/temperature `llm_utils.call_llm` will
+    ACTUALLY use for the next call, for the runner to stamp into results
+    alongside every row -- so a results file self-documents which gate
+    configuration produced it without a separate lookup.
+
+    Reads `llm_utils`'s own module constants, never `os.environ` directly:
+    `os.environ` can carry a value `llm_utils` has not (yet, or ever) picked
+    up -- exactly the gap `load_deployed_llm_env`'s `importlib.reload` above
+    exists to close. Reading through `llm_utils` itself means this function
+    can never claim a config that isn't the one calls are actually using,
+    even if some future caller changes `os.environ` without reloading.
+    """
+    provider = llm_utils.LLM_PROVIDER
+    model = llm_utils.QWEN_MODEL if provider == "qwen" else llm_utils.CLAUDE_MODEL
     return {
         "provider": provider,
         "model": model,
-        "temperature": os.environ.get("LLM_TEMPERATURE"),
+        "temperature": llm_utils.LLM_TEMPERATURE,
     }
 
 

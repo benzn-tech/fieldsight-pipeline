@@ -10,8 +10,10 @@ re-derived".
 from __future__ import annotations
 
 import hashlib
+import importlib
 import inspect
 import json
+import os
 
 import pytest
 
@@ -341,11 +343,131 @@ def test_load_deployed_llm_env_raises_on_aws_failure():
         baseline.load_deployed_llm_env(baseline.PROGRAMME_MATCHER_FUNCTION, run=fake_run)
 
 
-def test_baseline_config_reads_from_environ(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("CLAUDE_MODEL", "claude-sonnet-4-6")
-    monkeypatch.setenv("LLM_TEMPERATURE", "0.2")
+def test_baseline_config_reads_from_llm_utils_module_not_os_environ(monkeypatch):
+    """`baseline_config()` must report what `llm_utils.call_llm` will
+    actually use -- its own module constants -- never `os.environ` directly.
+    Proven by setting `os.environ` to one thing and `llm_utils`'s constants
+    to something else: the environ value must be ignored."""
+    import llm_utils
+
+    monkeypatch.setenv("LLM_PROVIDER", "qwen")  # os.environ says qwen...
+    monkeypatch.setattr(llm_utils, "LLM_PROVIDER", "anthropic")  # ...llm_utils says anthropic
+    monkeypatch.setattr(llm_utils, "CLAUDE_MODEL", "claude-sonnet-4-6")
+    monkeypatch.setattr(llm_utils, "LLM_TEMPERATURE", 0.2)
+
     config = baseline.baseline_config()
     assert config["provider"] == "anthropic"
     assert config["model"] == "claude-sonnet-4-6"
-    assert config["temperature"] == "0.2"
+    assert config["temperature"] == 0.2
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1, finding #1: load_deployed_llm_env's os.environ write is
+# invisible to llm_utils (module-level constants, read once at import) unless
+# llm_utils is reloaded. These tests drive the REAL llm_utils.call_llm end to
+# end, with urllib3 faked out, to prove the copied model actually reaches the
+# outgoing request -- not just that os.environ was set.
+# ---------------------------------------------------------------------------
+
+class _FakeQwenResponse:
+    status = 200
+
+    def __init__(self, model_sent):
+        self.data = json.dumps({
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {},
+        }).encode("utf-8")
+
+
+class _FakeUnreachablePoolManager:
+    """Fails loudly if constructed -- guards against a test silently making
+    a real network call because the patch didn't take."""
+    def __init__(self, *a, **kw):
+        raise AssertionError("real urllib3.PoolManager() constructed in a test")
+
+
+def test_load_deployed_llm_env_reload_makes_call_llm_use_the_copied_model(monkeypatch):
+    import llm_utils
+
+    # Snapshot every constant this test or the reload touches, to restore
+    # afterwards so no other test in the file/session sees a mutated
+    # llm_utils (or a reload triggered by an unrelated os.environ leftover).
+    snapshot_env = {
+        k: os.environ.get(k) for k in (
+            "LLM_PROVIDER", "QWEN_MODEL", "QWEN_API_KEY", "QWEN_BASE_URL",
+            "ANTHROPIC_API_KEY", "CLAUDE_MODEL", "LLM_TEMPERATURE",
+        )
+    }
+    try:
+        env_vars = {
+            "LLM_PROVIDER": "qwen",
+            "QWEN_MODEL": "fake-jev-eval-qwen-model",
+            "QWEN_API_KEY": "fake-qwen-key-for-this-test-only",
+        }
+        fake_run = _fake_run(env_vars)
+
+        copied = baseline.load_deployed_llm_env(
+            baseline.PROGRAMME_MATCHER_FUNCTION, run=fake_run)
+        assert "LLM_PROVIDER" in copied and "QWEN_MODEL" in copied
+
+        # (a) llm_utils's OWN constants must equal the copied values -- not
+        # just os.environ.
+        assert llm_utils.LLM_PROVIDER == "qwen"
+        assert llm_utils.QWEN_MODEL == "fake-jev-eval-qwen-model"
+
+        # (b) drive the REAL llm_utils.call_llm, capturing the outgoing
+        # request body via a fake urllib3.PoolManager (this module's own
+        # transport -- not urllib.request).
+        captured = {}
+
+        class _FakePoolManager:
+            def request(self, method, url, body=None, headers=None, timeout=None):
+                captured["url"] = url
+                captured["body"] = json.loads(body)
+                return _FakeQwenResponse(captured["body"].get("model"))
+
+        monkeypatch.setattr(llm_utils.urllib3, "PoolManager", _FakePoolManager)
+
+        raw, error = llm_utils.call_llm("hello", max_tokens=64, caller="jev_test")
+        assert error is None
+        assert raw == "ok"
+        assert captured["body"]["model"] == "fake-jev-eval-qwen-model"
+
+        # (c) baseline_config() must agree with what the real call just used.
+        config = baseline.baseline_config()
+        assert config["provider"] == "qwen"
+        assert config["model"] == captured["body"]["model"] == "fake-jev-eval-qwen-model"
+    finally:
+        for key, value in snapshot_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        importlib.reload(llm_utils)
+
+
+def test_load_deployed_llm_env_reload_does_not_touch_urllib3_when_unused(monkeypatch):
+    """Sanity check on the fake above: if the reload/env copy were a no-op,
+    call_llm would still dispatch to whatever provider this test PROCESS
+    started with, not qwen -- guard against the fix silently not mattering
+    by making a real PoolManager() construction fail the test loudly."""
+    import llm_utils
+
+    snapshot_env = {k: os.environ.get(k) for k in ("LLM_PROVIDER", "ANTHROPIC_API_KEY")}
+    try:
+        monkeypatch.setattr(llm_utils.urllib3, "PoolManager", _FakeUnreachablePoolManager)
+        # Force a provider with no configured key so call_llm fails BEFORE
+        # ever touching the (intentionally broken) PoolManager -- this just
+        # proves the fake is wired to the same attribute call_llm reads.
+        monkeypatch.setattr(llm_utils, "ANTHROPIC_API_KEY", "")
+        monkeypatch.setattr(llm_utils, "LLM_PROVIDER", "anthropic")
+        raw, error = llm_utils.call_llm("hello", max_tokens=64)
+        assert raw is None
+        assert "ANTHROPIC_API_KEY" in error
+    finally:
+        for key, value in snapshot_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        importlib.reload(llm_utils)
