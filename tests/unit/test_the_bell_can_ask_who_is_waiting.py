@@ -73,9 +73,12 @@ def wired(monkeypatch):
                              "speaker_label": "spk_1", "user_folder": "Ben_UCPK",
                              "session_date": "2026-08-13", "score": None}])
 
-    def turns(conn, folder, date, sb):
+    # Text only when asked for, as the real `_session_turns` does. This fake used to return
+    # it unconditionally, and so passed while the real dialog showed "No words to show" for
+    # every passage (TEST 2026-09-27).
+    def turns(conn, folder, date, sb, with_text=False):
         reads.append((folder, date, sb))
-        return [
+        rows = [
             {"source_filename": SRC, "speaker_label": "spk_0",
              "start_sec": 0.0, "end_sec": 4.0, "text": "short one"},
             {"source_filename": SRC, "speaker_label": "spk_0",
@@ -83,6 +86,8 @@ def wired(monkeypatch):
             {"source_filename": SRC, "speaker_label": "spk_1",
              "start_sec": 40.0, "end_sec": 55.0, "text": "somebody else entirely"},
         ]
+        return rows if with_text else [
+            {k: v for k, v in r.items() if k != "text"} for r in rows]
 
     monkeypatch.setattr(org, "_session_turns", turns)
     return reads
