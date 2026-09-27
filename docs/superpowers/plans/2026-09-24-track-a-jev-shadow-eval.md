@@ -168,7 +168,7 @@
 **Files:**
 - Create: `docs/superpowers/specs/2026-XX-XX-jev-shadow-eval-findings.md` (date at write time)
 
-- [ ] **Step 1: Write the decision rule first, before Task 6 runs, and commit it:**
+- [x] **Step 1: Write the decision rule first, before Task 6 runs, and commit it:**
 
   > Jev (decomposed) **replaces** today's gate on a set only if, on the held-out half: coverage_at_p95 ≥ the baseline's coverage_at_p95, AND run_agreement ≥ 0.95, AND ECE10 ≤ 0.10, AND the control check passes. Jev **augments** the gate (runs alongside as an extra signal in `decision_records`, Track C) if it meets two of the three numeric conditions. Otherwise it is **not adopted** for that set and the finding is recorded with the numbers.
 
