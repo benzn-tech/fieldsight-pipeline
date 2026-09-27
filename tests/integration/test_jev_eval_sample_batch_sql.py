@@ -102,7 +102,7 @@ def test_threads_pipeline_excludes_deleted_and_already_suggested(db):
     existing_pairs = {(r["topic_id"], r["parent_topic_id"]) for r in existing_records}
 
     topics_by_site = sb.group_by_site(topic_records)
-    pairs = sb.generate_thread_pairs(topics_by_site)
+    pairs, _ = sb.generate_thread_pairs(topics_by_site)
     filtered = sb.apply_thread_exclusions(pairs, existing_pairs)
 
     kept_pairs = {(p["later"]["id"], p["earlier"]["id"]) for p in filtered}

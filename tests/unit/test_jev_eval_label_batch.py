@@ -46,8 +46,12 @@ def _synthetic_thread_pool():
     - t2/t1: same distinctive subject ("door hardware"), both have open work,
       21 day gap -> high stratum (score >= thread_match.MIN_SCORE).
     - t4/t3: weaker overlap, still eligible -> mid stratum.
-    - t6/t5: below the lowered floor, but share a title token, NOT eligible
-      (t5 has zero open items) -> low stratum only, never high/mid.
+    - t6/t5: below the lowered floor, but share a title token; t5 (the
+      EARLIER side) has zero open items so find_candidates would never
+      surface it, but the low-stratum harvest still applies its own
+      eligibility -- open_items on the LATER topic (t6 has 1) and the gap
+      capped at thread_match.MAX_GAP_DAYS (39 days here, comfortably under
+      the 45-day cap) -- so it is eligible for that harvest.
     """
     return [
         _topic("t1", "Door hardware ordered", "Handles and hinges ordered for level 2.",
@@ -67,20 +71,46 @@ def _synthetic_thread_pool():
                      "concrete pour timeline budget variance",
                "Follow-up weather delay reporting insurance claim concrete pour timeline "
                "update summary budget forecast variance review.",
-               "2026-06-01", open_items=1),
+               "2026-05-10", open_items=1),
     ]
 
 
 def test_generate_thread_pairs_produces_all_three_strata():
     topics = _synthetic_thread_pool()
-    pairs = sb.generate_thread_pairs(sb.group_by_site(topics))
+    pairs, diagnostics = sb.generate_thread_pairs(sb.group_by_site(topics))
     strata = {sb._stratum_for_score(p["score"]) for p in pairs}
     assert "high" in strata or "mid" in strata  # eligible pairs found
     assert "low" in strata  # ineligible-but-token-sharing pair found
     # the t5/t6 pair must be present despite t5 having zero open items --
-    # find_candidates would never surface it, the low-stratum harvest does.
+    # find_candidates would never surface it (both sides need open_items),
+    # but the low-stratum harvest only requires open_items on the LATER
+    # topic (t6), so it still gets scored.
     low_pairs = [p for p in pairs if sb._stratum_for_score(p["score"]) == "low"]
     assert any(p["later"]["id"] == "t6" and p["earlier"]["id"] == "t5" for p in low_pairs)
+    assert "s1" in diagnostics
+    assert diagnostics["s1"]["n_topics"] == len(topics)
+    assert diagnostics["s1"]["low_pairs_scored"] > 0
+
+
+def test_generate_thread_pairs_low_stratum_respects_max_gap_and_open_items():
+    # Same as the pair above, but t6 now sits 100 days after t5 -- beyond
+    # thread_match.MAX_GAP_DAYS (45) -- so it must never appear in ANY
+    # stratum, low included.
+    topics = _synthetic_thread_pool()
+    for t in topics:
+        if t["id"] == "t6":
+            t["report_date"] = "2026-07-10"  # ~100 days after t5's 2026-04-01
+    pairs, _ = sb.generate_thread_pairs(sb.group_by_site(topics))
+    assert not any(p["later"]["id"] == "t6" and p["earlier"]["id"] == "t5" for p in pairs)
+
+    # And: a later topic with zero open_items contributes NO low-stratum
+    # pairs at all, no matter how much title vocabulary it shares.
+    topics2 = _synthetic_thread_pool()
+    for t in topics2:
+        if t["id"] == "t6":
+            t["open_items"] = 0
+    pairs2, _ = sb.generate_thread_pairs(sb.group_by_site(topics2))
+    assert not any(p["later"]["id"] == "t6" for p in pairs2)
 
 
 def test_stratify_thread_pairs_fills_quotas_and_is_deterministic():
@@ -95,7 +125,7 @@ def test_stratify_thread_pairs_fills_quotas_and_is_deterministic():
             t2["site_id"] = f"site-{i}"
             all_topics.append(t2)
 
-    pairs = sb.generate_thread_pairs(sb.group_by_site(all_topics))
+    pairs, _ = sb.generate_thread_pairs(sb.group_by_site(all_topics))
     chosen_a, counts_a = sb.stratify_thread_pairs(pairs, size=10, seed=42)
     chosen_b, counts_b = sb.stratify_thread_pairs(pairs, size=10, seed=42)
 
@@ -117,7 +147,7 @@ def test_stratify_thread_pairs_different_seed_can_differ():
             t2["id"] = f"{t['id']}-{i}"
             t2["site_id"] = f"site-{i}"
             all_topics.append(t2)
-    pairs = sb.generate_thread_pairs(sb.group_by_site(all_topics))
+    pairs, _ = sb.generate_thread_pairs(sb.group_by_site(all_topics))
     chosen_1, _ = sb.stratify_thread_pairs(pairs, size=10, seed=1)
     chosen_2, _ = sb.stratify_thread_pairs(pairs, size=10, seed=2)
     ids_1 = [(p["later"]["id"], p["earlier"]["id"]) for p, _ in chosen_1]
@@ -135,7 +165,7 @@ def test_thread_pair_id_is_stable_and_direction_sensitive():
 
 def test_apply_thread_exclusions_drops_already_suggested_pairs():
     topics = _synthetic_thread_pool()
-    pairs = sb.generate_thread_pairs(sb.group_by_site(topics))
+    pairs, _ = sb.generate_thread_pairs(sb.group_by_site(topics))
     assert pairs  # sanity: the pool does produce pairs
     some_pair = pairs[0]
     existing = {(some_pair["later"]["id"], some_pair["earlier"]["id"])}
@@ -144,6 +174,107 @@ def test_apply_thread_exclusions_drops_already_suggested_pairs():
     assert all(
         (p["later"]["id"], p["earlier"]["id"]) not in existing for p in filtered
     )
+
+
+# ---------------------------------------------------------------------------
+# threads: cost caps (fix round 1, Important #2)
+# ---------------------------------------------------------------------------
+
+def _many_topics(n, site_id="s1"):
+    return [
+        _topic(f"m{i}", f"Topic number {i} about widgets and gadgets",
+               f"Summary text number {i} describing widgets and gadgets in detail today.",
+               f"2026-05-{(i % 27) + 1:02d}", site_id=site_id, open_items=1)
+        for i in range(n)
+    ]
+
+
+def test_cap_topics_per_site_keeps_most_recent_n():
+    topics = [
+        _topic("old", "Old topic", "old", "2026-01-01"),
+        _topic("mid", "Mid topic", "mid", "2026-03-01"),
+        _topic("new", "New topic", "new", "2026-06-01"),
+    ]
+    capped = sb.cap_topics_per_site(sb.group_by_site(topics), max_topics_per_site=2)
+    kept_ids = {t["id"] for t in capped["s1"]}
+    assert kept_ids == {"mid", "new"}
+
+
+def test_cap_topics_per_site_is_a_noop_under_the_limit():
+    topics = _synthetic_thread_pool()
+    capped = sb.cap_topics_per_site(sb.group_by_site(topics), max_topics_per_site=200)
+    assert len(capped["s1"]) == len(topics)
+
+
+def test_generate_thread_pairs_bounds_low_stratum_score_pair_calls():
+    # 40 topics on one site, all eligible for each other (open_items=1, all
+    # within a month) -- without a cap this would score up to 40*39 pairs
+    # per later topic's eligible set; with max_pairs_per_topic=5 it must
+    # score at most 5 per later topic.
+    topics = _many_topics(40)
+    pairs, diagnostics = sb.generate_thread_pairs(
+        sb.group_by_site(topics), max_pairs_per_topic=5, seed=0)
+    n_topics = len(topics)
+    assert diagnostics["s1"]["low_pairs_scored"] <= n_topics * 5
+
+
+def test_generate_thread_pairs_low_stratum_sampling_is_deterministic():
+    topics = _many_topics(30)
+    pairs_a, diag_a = sb.generate_thread_pairs(
+        sb.group_by_site(topics), max_pairs_per_topic=4, seed=99)
+    pairs_b, diag_b = sb.generate_thread_pairs(
+        sb.group_by_site(topics), max_pairs_per_topic=4, seed=99)
+    ids_a = sorted((p["later"]["id"], p["earlier"]["id"]) for p in pairs_a)
+    ids_b = sorted((p["later"]["id"], p["earlier"]["id"]) for p in pairs_b)
+    assert ids_a == ids_b
+    assert diag_a == diag_b
+
+
+def test_sample_threads_caps_are_wired_through_cli(monkeypatch, tmp_path):
+    # Exercise the full sample_threads() pipeline with tiny caps, using fake
+    # DB calls, to prove main()'s --max-topics-per-site/--max-pairs-per-topic
+    # actually reach generate_thread_pairs/cap_topics_per_site rather than
+    # only existing as unused CLI flags. Batch output redirected to tmp_path
+    # so this never touches the real scripts/fixtures/jev_eval/batch/ dir.
+    from scripts.jev_eval import export_labels as ex
+
+    monkeypatch.setattr(sb, "BATCH_DIR", tmp_path / "batch")
+
+    topics = _many_topics(10)
+
+    def fake_begin_transaction(database, profile, region):
+        return "tx"
+
+    calls = {"n": 0}
+
+    def fake_execute(database, tx, sql, profile, region):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            records = []
+            for t in topics:
+                records.append([
+                    {"stringValue": t["id"]}, {"stringValue": t["report_date"]},
+                    {"stringValue": t["site_id"]}, {"stringValue": t["company_id"]},
+                    {"stringValue": t["title"]}, {"stringValue": t["summary"]},
+                    {"longValue": t["open_items"]},
+                ])
+            return {"records": records}
+        return {"records": []}
+
+    def fake_rollback(tx, profile, region):
+        return None
+
+    monkeypatch.setattr(ex, "_begin_transaction", fake_begin_transaction)
+    monkeypatch.setattr(ex, "_execute", fake_execute)
+    monkeypatch.setattr(ex, "_rollback", fake_rollback)
+
+    result = sb.sample_threads(
+        "fieldsight_test", size=5, seed=0,
+        max_topics_per_site=3, max_pairs_per_topic=2)
+
+    assert result["max_topics_per_site"] == 3
+    assert result["max_pairs_per_topic"] == 2
+    assert result["per_site_diagnostics"]["s1"]["n_topics"] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +328,7 @@ def test_stratify_work_class_deterministic_with_seed():
 
 def test_build_thread_batch_row_shape():
     topics = _synthetic_thread_pool()
-    pairs = sb.generate_thread_pairs(sb.group_by_site(topics))
+    pairs, _ = sb.generate_thread_pairs(sb.group_by_site(topics))
     pair = pairs[0]
     row = sb.build_thread_batch_row(pair, "high")
     assert row["set"] == "threads"

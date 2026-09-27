@@ -41,10 +41,25 @@ reimplemented) -- never a re-derived scorer:
   misses) in one pass.
 - A separate harvest produces the "low" stratum: pairs scoring BELOW
   `LOWERED_FLOOR` on the same `score_pair` but sharing at least one title
-  token. These are deliberately NOT run through `find_candidates`' own
-  eligibility (open items, gap cap) -- they exist to test whether the owner
-  says "no" to two topics that merely share vocabulary, which is exactly the
-  case `find_candidates`' gates were built to keep out from the other end.
+  token. This harvest applies `find_candidates`' eligibility rules WHERE THEY
+  APPLY (dispatch instruction, fix round 1): `open_items > 0` on the LATER
+  topic, and the gap capped at `thread_match.MAX_GAP_DAYS` -- the same two
+  gates `find_candidates` itself enforces. It does NOT require `open_items`
+  on the EARLIER side, which is the one respect in which it differs from
+  `find_candidates` (that asymmetry is what lets a topic with no open work of
+  its own still serve as a "why did you say no to this" hard negative).
+  Cost is bounded two ways (fix round 1, Important #2): `cap_topics_per_site`
+  keeps at most `--max-topics-per-site` (default 200) of the MOST RECENT
+  topics per site before any pair is generated or scored, and for each later
+  topic, at most `--max-pairs-per-topic` (default 15) eligible earlier
+  topics are chosen (via the seeded RNG, so this stays deterministic) before
+  the REAL `thread_match.score_pair` is called on them -- `score_pair` itself
+  rebuilds its IDF map over the whole per-site corpus on every call, so
+  scoring every eligible pair unconditionally is cubic in topics-per-site;
+  capping the number of `score_pair` CALLS per later topic keeps the total
+  work quadratic in the (now also capped) topic count instead. Per-site
+  topic counts and the number of `score_pair` calls made are printed by the
+  CLI (`sample_threads`).
 
 Excludes any (topic_id, parent_topic_id) pair already present in
 `topic_thread_suggestions`, in ANY status (a rejected pair re-appearing in a
@@ -93,6 +108,14 @@ BATCH_DIR = ex.FIXTURES_DIR / "batch"
 DEFAULT_SIZE = 100
 DEFAULT_WINDOW_DAYS = 120
 DEFAULT_SEED = 0
+
+# Bounds on the threads pair-generation work (fix round 1, Important #2):
+# `score_pair` rebuilds its IDF map over the whole per-site corpus on every
+# call, so scoring every eligible pair in the low-stratum harvest
+# unconditionally is O(topics-per-site^3). These two caps keep it bounded
+# regardless of how many topics a site accumulates in the window.
+DEFAULT_MAX_TOPICS_PER_SITE = 200
+DEFAULT_MAX_PAIRS_PER_TOPIC = 15
 
 # Below thread_match.MIN_SCORE, above this: the "mid" (near-miss) stratum.
 # Well below thread_match's own floor so find_candidates' eligibility rules
@@ -205,15 +228,54 @@ def _shares_title_token(a: dict, b: dict) -> bool:
     return bool(thread_match._tokens(a.get("title")) & thread_match._tokens(b.get("title")))
 
 
-def generate_thread_pairs(topics_by_site: dict) -> list:
-    """One dict per (later, earlier) candidate pair: `{"later", "earlier",
-    "score", "gap_days"}`. High/mid strata come from the REAL
-    `thread_match.find_candidates` with a lowered floor (its own eligibility
-    rules apply); the low stratum is harvested separately with
-    `thread_match.score_pair` and NO eligibility rules, on purpose (see
-    module docstring)."""
+def cap_topics_per_site(topics_by_site: dict, max_topics_per_site: int) -> dict:
+    """Keep at most `max_topics_per_site` topics per site -- the MOST RECENT
+    ones by `report_date` (ties broken by id, descending, for a stable,
+    order-independent cap). Bounds every downstream O(n^2)/O(n^3) loop in
+    `generate_thread_pairs` regardless of how many topics a site accumulates
+    inside the window (fix round 1, Important #2)."""
+    out = {}
+    for site_id, site_topics in topics_by_site.items():
+        ordered = sorted(
+            site_topics,
+            key=lambda t: (_as_date(t.get("report_date")) or date.min, str(t["id"])),
+            reverse=True,
+        )
+        out[site_id] = ordered[:max_topics_per_site]
+    return out
+
+
+def generate_thread_pairs(topics_by_site: dict, *,
+                           max_pairs_per_topic: int = DEFAULT_MAX_PAIRS_PER_TOPIC,
+                           seed: int = DEFAULT_SEED) -> tuple:
+    """`(pairs, diagnostics)`. `pairs` is one dict per (later, earlier)
+    candidate: `{"later", "earlier", "score", "gap_days"}`.
+
+    High/mid strata come from the REAL `thread_match.find_candidates` with a
+    lowered floor (its own eligibility rules apply unmodified). The low
+    stratum is harvested separately with the REAL `thread_match.score_pair`,
+    applying `find_candidates`' eligibility WHERE IT APPLIES (dispatch
+    instruction, fix round 1): `open_items > 0` on the LATER topic, and the
+    gap capped at `thread_match.MAX_GAP_DAYS` -- but NOT `open_items` on the
+    earlier side, so a topic with no open work of its own can still surface
+    as a hard negative.
+
+    Bounded (fix round 1, Important #2): for each later topic, at most
+    `max_pairs_per_topic` of its eligible earlier topics are scored, chosen
+    with `random.Random(seed)` from the eligible set sorted by id first (so
+    the choice is deterministic and independent of database row order) --
+    `score_pair` rebuilds its IDF map over the whole per-site corpus on every
+    call, so scoring every eligible pair unconditionally would be cubic in
+    topics-per-site.
+
+    `diagnostics` is `{site_id: {"n_topics", "low_pairs_scored"}}` -- the
+    per-site topic count actually used and the number of REAL `score_pair`
+    calls made, for the CLI to print and for tests to assert the caps hold."""
     pairs = []
-    for site_topics in topics_by_site.values():
+    diagnostics = {}
+    rng = random.Random(seed)
+
+    for site_id, site_topics in topics_by_site.items():
         site_pairs = []
         for later in site_topics:
             for cand in thread_match.find_candidates(
@@ -229,10 +291,17 @@ def generate_thread_pairs(topics_by_site: dict) -> list:
             (p["later"]["id"], p["earlier"]["id"])
             for p in site_pairs
         }
-        for later in site_topics:
+
+        low_pairs_scored = 0
+        later_sorted = sorted(site_topics, key=lambda t: str(t["id"]))
+        for later in later_sorted:
             later_date = _as_date(later.get("report_date"))
             if later_date is None:
                 continue
+            if not (later.get("open_items") or 0):
+                continue  # eligibility: open_items on the LATER topic
+
+            eligible = []
             for earlier in site_topics:
                 if earlier is later or earlier.get("id") == later.get("id"):
                     continue
@@ -241,17 +310,35 @@ def generate_thread_pairs(topics_by_site: dict) -> list:
                 earlier_date = _as_date(earlier.get("report_date"))
                 if earlier_date is None or earlier_date >= later_date:
                     continue
+                gap = (later_date - earlier_date).days
+                if gap > thread_match.MAX_GAP_DAYS:
+                    continue  # eligibility: same gap cap find_candidates uses
+                eligible.append((earlier, gap))
+
+            eligible.sort(key=lambda pair: str(pair[0]["id"]))  # stable before sampling
+            if len(eligible) > max_pairs_per_topic:
+                chosen = rng.sample(eligible, max_pairs_per_topic)
+            else:
+                chosen = eligible
+
+            for earlier, gap in chosen:
                 score = thread_match.score_pair(later, earlier, site_topics)
+                low_pairs_scored += 1
                 if score >= LOWERED_FLOOR:
                     continue
                 if not _shares_title_token(later, earlier):
                     continue
                 site_pairs.append({
                     "later": later, "earlier": earlier, "score": score,
-                    "gap_days": (later_date - earlier_date).days,
+                    "gap_days": gap,
                 })
+
+        diagnostics[site_id] = {
+            "n_topics": len(site_topics),
+            "low_pairs_scored": low_pairs_scored,
+        }
         pairs.extend(site_pairs)
-    return pairs
+    return pairs, diagnostics
 
 
 def thread_pair_id(later_id, earlier_id) -> str:
@@ -436,6 +523,8 @@ def _write_batch(set_name: str, rows: list) -> Path:
 
 def sample_threads(database: str, *, size: int = DEFAULT_SIZE,
                     window_days: int = DEFAULT_WINDOW_DAYS, seed: int = DEFAULT_SEED,
+                    max_topics_per_site: int = DEFAULT_MAX_TOPICS_PER_SITE,
+                    max_pairs_per_topic: int = DEFAULT_MAX_PAIRS_PER_TOPIC,
                     profile: str = ex.DEFAULT_PROFILE, region: str = ex.DEFAULT_REGION) -> dict:
     tx = ex._begin_transaction(database, profile, region)
     try:
@@ -454,13 +543,25 @@ def sample_threads(database: str, *, size: int = DEFAULT_SIZE,
         ex._rollback(tx, profile, region)
 
     topics_by_site = group_by_site(topic_rows)
-    pairs = generate_thread_pairs(topics_by_site)
+    topics_by_site = cap_topics_per_site(topics_by_site, max_topics_per_site)
+    pairs, diagnostics = generate_thread_pairs(
+        topics_by_site, max_pairs_per_topic=max_pairs_per_topic, seed=seed)
     pairs = apply_thread_exclusions(pairs, existing_pairs)
     chosen, counts = stratify_thread_pairs(pairs, size, seed)
     rows = [build_thread_batch_row(pair, stratum) for pair, stratum in chosen]
     path = _write_batch("threads", rows)
+
+    for site_id, site_diag in sorted(diagnostics.items(), key=str):
+        print(f"site {site_id}: {site_diag['n_topics']} topics "
+              f"(capped at {max_topics_per_site}), "
+              f"{site_diag['low_pairs_scored']} low-stratum pairs scored "
+              f"(capped at {max_pairs_per_topic} per later topic)")
+
     return {"set": "threads", "n": len(rows), "strata": counts, "path": str(path),
-            "database": database, "window_days": window_days, "seed": seed}
+            "database": database, "window_days": window_days, "seed": seed,
+            "max_topics_per_site": max_topics_per_site,
+            "max_pairs_per_topic": max_pairs_per_topic,
+            "per_site_diagnostics": diagnostics}
 
 
 def sample_work_class(database: str, *, size: int = DEFAULT_SIZE, seed: int = DEFAULT_SEED,
@@ -494,6 +595,12 @@ def main(argv=None) -> int:
     parser.add_argument("--size", type=int, default=DEFAULT_SIZE)
     parser.add_argument("--window-days", type=int, default=DEFAULT_WINDOW_DAYS)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--max-topics-per-site", type=int, default=DEFAULT_MAX_TOPICS_PER_SITE,
+                         help="threads only: cap topics per site to the most recent N "
+                              "before generating pairs")
+    parser.add_argument("--max-pairs-per-topic", type=int, default=DEFAULT_MAX_PAIRS_PER_TOPIC,
+                         help="threads only: cap eligible earlier topics scored per later "
+                              "topic in the low-stratum harvest")
     parser.add_argument("--database", default=ex.DEFAULT_DATABASE)
     parser.add_argument("--allow-prod", action="store_true",
                          help="required to target --database fieldsight")
@@ -515,7 +622,9 @@ def main(argv=None) -> int:
         if set_name == "threads":
             summary["threads"] = sample_threads(
                 args.database, size=args.size, window_days=args.window_days,
-                seed=args.seed, profile=args.profile, region=args.region)
+                seed=args.seed, max_topics_per_site=args.max_topics_per_site,
+                max_pairs_per_topic=args.max_pairs_per_topic,
+                profile=args.profile, region=args.region)
         else:
             summary["work_class"] = sample_work_class(
                 args.database, size=args.size, seed=args.seed,
