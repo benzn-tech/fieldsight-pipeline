@@ -416,15 +416,15 @@ def _agreement(conn, company_id, voiceprint_id, embedding):
     return own, best_other, nearest_other_id
 
 
-#: The conflict target must repeat 0069's index predicate, or Postgres cannot infer the
-#: partial index and the INSERT fails outright. Pinned against the migration text by
+#: The conflict target must repeat 0070's index expressions and predicate, or Postgres
+#: cannot infer the partial index and the INSERT fails outright. Pinned against the text by
 #: `test_one_window_is_one_sample.py`.
 _WINDOW_PREDICATE = ("s3_key IS NOT NULL AND window_start_s IS NOT NULL "
                      "AND window_end_s IS NOT NULL")
 _UPGRADE = ("CASE WHEN EXCLUDED.source = 'correction' "
             "AND speaker_voiceprint_samples.source <> 'correction' ")
 _ONE_SAMPLE_PER_WINDOW = (
-    "ON CONFLICT (voiceprint_id, s3_key, window_start_s, window_end_s) "
+    "ON CONFLICT (voiceprint_id, s3_key, round(window_start_s), round(window_end_s)) "
     "WHERE " + _WINDOW_PREDICATE + " DO UPDATE SET "
     "source = " + _UPGRADE + "THEN EXCLUDED.source "
     "ELSE speaker_voiceprint_samples.source END, "
@@ -515,7 +515,7 @@ def add_sample(conn, company_id, voiceprint_id, embedding, source, s3_key, windo
     if own is not None and best_other is not None and best_other > own:
         raise EnrolmentBelongsToSomebodyElse(own, best_other, nearest_other_id)
     start_s, end_s = (window or (None, None))
-    # One row per (profile, audio, window) -- migration 0069. The same window arrives again
+    # One row per (profile, audio, window to the second) -- 0069/0070. The same window arrives again
     # when a passage is renamed twice, a cluster propagated twice, or a harvested window is
     # later renamed on its own; each used to become a second copy of an identical vector,
     # which the mean then counted twice. A repeat is not an error: it returns the row
