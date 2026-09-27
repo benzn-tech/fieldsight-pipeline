@@ -67,7 +67,8 @@ from keyframe_selection import keyframe_seconds
 from photo_binding import PHOTOS_PER_TOPIC_CAP  # noqa: F401  (re-export)
 from photo_binding import list_pictures as _pb_list_pictures
 from repositories import users as users_repo
-from photo_binding import photos_for_topics as _photos_for_topics
+from photo_binding import photos_for_topics as _photos_for_topics  # noqa: F401  (re-export)
+import photo_rebind
 import thread_match
 from repositories import location_markers
 from repositories import (companies, findings, meeting_session, recordings,
@@ -1009,12 +1010,19 @@ def write_extraction_items(date, user_folder, extraction_key):
             _delete_member_topics(conn, extraction)
 
         # Task 3 (authority-flip plan) -- list the pictures prefix ONCE per
-        # invocation (paginator, outside the per-topic loop below), then
-        # pure-match photos to topics by time_range before the loop uses it.
+        # invocation (paginator, outside the per-topic loop below).
+        #
+        # THE LIST IS DAY-WIDE AND ALWAYS HAS BEEN. Until 2026-09-23 it was
+        # matched against THIS EXTRACTION's topics only, which is the whole
+        # defect: idempotency is keyed on source_s3_key, so session B's run
+        # never cleared session A's bindings and both kept the same photo.
+        # Ben_UCPK2 produced seven artifacts for one afternoon; prod held 22
+        # multi-bound photos out of 161, the worst under six topics spanning
+        # seven minutes. The binding now happens once for the whole day, after
+        # this extraction's own topics are in -- see photo_rebind.py.
         pictures_prefix = f"users/{user_folder}/pictures/{date}/"
         photo_objects = _list_pictures(pictures_prefix)
         extraction_topics = extraction.get("topics", [])
-        photos_by_topic = _photos_for_topics(photo_objects, extraction_topics)
 
         # The day's location markers, written where the READER can reach them.
         #
@@ -1045,7 +1053,6 @@ def write_extraction_items(date, user_folder, extraction_key):
         keyframe_topics = []  # video-keyframe plan: {topic_id, time_range} of gate-passers
         for i, t in enumerate(extraction_topics):
             mapped_action_items = lambda_ingest._map_action_items(t.get("action_items"), date)
-            matched_photos = photos_by_topic.get(i, [])
             # Sanitize work_class/work_confidence before the upsert (Fable
             # review #7): the columns carry CHECK constraints (work_class IN
             # ('work','non_work'); work_confidence is real) so a raw bad LLM
@@ -1101,13 +1108,12 @@ def write_extraction_items(date, user_folder, extraction_key):
                            if (d.get("decision") if isinstance(d, dict) else d)] or None,
                 work_class=_wc, work_confidence=_wconf, is_mixed=(t.get("is_mixed") is True),
                 evidence=_evidence_payload(t),
-                # video-keyframe plan (Task 4): re-bound synthetic keyframes
-                # (filename carries the '_kf_' marker) keep an "Auto keyframe"
-                # caption so the UI can still distinguish them after an
-                # item-writer re-run; real photos stay caption-less (None).
-                photos=[{"s3_key": p["key"],
-                         "caption_text": "Auto keyframe" if "_kf_" in p["filename"] else None}
-                        for p in matched_photos],
+                # NO `photos=` ANY MORE. Two writers for one table is how the
+                # rows diverged: this one inserted its own session's binds and
+                # nothing was ever responsible for removing another session's.
+                # `photo_rebind.rebind_day_photos` owns topic_photos for the whole
+                # day, and it runs after this loop because it needs these rows
+                # to exist before it can bind to them.
             )
             # Task 2 (programme-impact-link plan) -- persist this topic's
             # rich extraction findings in the SAME transaction as the topic
@@ -1153,6 +1159,16 @@ def write_extraction_items(date, user_folder, extraction_key):
                 keyframe_topics.append({"topic_id": str(row["id"]),
                                         "time_range": t.get("time_range")})
             topics_n += 1
+
+        # THE DAY'S PHOTOS, BOUND ONCE, AFTER THIS EXTRACTION'S TOPICS EXIST.
+        # Never fatal: a rebind that turned a good extraction into a failed one
+        # would be a worse bug than a misplaced thumbnail, and the day view
+        # lists every photo regardless of binding.
+        try:
+            photo_rebind.rebind_day_photos(
+                conn, company["id"], user_folder, date, photo_objects)
+        except Exception:  # noqa: BLE001 -- see above
+            logger.exception("day photo rebind failed for %s/%s", user_folder, date)
 
         if collected_topics:
             if SUGGEST_THREADS:

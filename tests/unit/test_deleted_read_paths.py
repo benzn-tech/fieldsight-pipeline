@@ -29,6 +29,10 @@ EXEMPT = {
                                  "to re-extract; hiding deleted rows here would make it "
                                  "re-extract them and resurrect the content",
     "has_topics_for_source_prefix": "the same existence probe in prefix form; filtering it would make the pipeline re-extract and resurrect the content",
+    "replace_day_photo_bindings": "the topics SELECT is a DELETE's reach, not a read — it "
+                                 "must still cover a tombstoned topic, or that topic keeps "
+                                 "its stale binding rows forever, which is the opposite of "
+                                 "what the exclusion is for. No topic content is read.",
     "list_expired_non_work": "the retention sweep, which must still SEE deleted topics — "
                              "hiding them here would leave their vectors alive forever, "
                              "the opposite of what a deletion is for",
