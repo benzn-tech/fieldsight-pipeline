@@ -147,6 +147,15 @@ def effective_margin(pool_size: int, base_margin: float = DEFAULT_MIN_MARGIN,
     return base_margin + scale_step * (pool_size - scale_threshold)
 
 
+#: Below this, no enrolled voice is close enough to offer a name at all -- used only while
+#: a company has no calibrated floor of its own. Measured 2026-09-28 on 42 clips the owner
+#: labelled by ear: across every profile the highest score of somebody who was NOT that
+#: person was 0.274, and 16 of Ben's 19 and 5 of Sam's 6 own clips scored above 0.35 (the
+#: misses were all 5 s or shorter). n is small -- 36 usable clips, 5 true strangers -- so
+#: this is a starting point, not a fitted cut, and a name above it is still only a lean.
+DEFAULT_ABSENT_FLOOR = 0.35
+
+
 def decide_name(scores, duration_s: float,
                 min_turn_s: float = DEFAULT_MIN_TURN_S,
                 min_margin: float | None = None,
@@ -188,6 +197,14 @@ def decide_name(scores, duration_s: float,
 
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     best_name, best = ranked[0]
+    # Before the margin, and only without a calibrated floor. With one profile (the 1:1
+    # case -- a company that has enrolled one person) there is no runner-up, so without
+    # this every voice in the room was offered as that person with a question mark.
+    if floor is None and best < DEFAULT_ABSENT_FLOOR:
+        return Decision("unknown", None, None,
+                        f"best match {best_name} at {best:.3f} is below "
+                        f"{DEFAULT_ABSENT_FLOOR:.2f}; no enrolled voice is close enough",
+                        score=best)
     if len(ranked) == 1:
         # Nothing to be better than. Confirming here would be confirming on an absolute
         # score, which is exactly what the overlapping distributions forbid.
