@@ -173,6 +173,17 @@ class RunnerRefusal(RuntimeError):
     """Raised for every precondition this runner checks before doing work."""
 
 
+class AmbiguousQuestionHashError(RuntimeError):
+    """Fix wave 3, minor 4: one arm's already-written result rows carry more
+    than one distinct `question_hash` -- e.g. a question definition changed
+    (`questions.py` edited, or a deploy that changed
+    `lambda_programme_matcher.build_prompt`) between two runs that share the
+    same `results/{set}.{arm}.run*.jsonl` files. Scoring fits/compares a
+    single composite or threshold per arm; silently pooling rows produced
+    under two different question sets would score against a comparison that
+    was never actually held constant."""
+
+
 # ---------------------------------------------------------------------------
 # Fixture loading -- pure I/O, no database, ever.
 # ---------------------------------------------------------------------------
@@ -428,7 +439,46 @@ def load_results(results_dir: Path, set_name: str) -> dict:
 
         result.setdefault(arm, {})[run] = collapsed
 
+    # Fix wave 3, minor 4: refuse if one arm's rows (across every run) carry
+    # more than one distinct question_hash -- see AmbiguousQuestionHashError.
+    for arm, by_run in result.items():
+        all_hashes = {
+            row.get("question_hash")
+            for rows in by_run.values() for row in rows
+            if row.get("question_hash") is not None
+        }
+        if len(all_hashes) > 1:
+            raise AmbiguousQuestionHashError(
+                f"arm {arm!r} of set {set_name!r} has rows scored under "
+                f"{len(all_hashes)} different question_hash values "
+                f"({sorted(all_hashes, key=str)}); refusing to score a mixed "
+                "batch -- re-run this arm from scratch after a question "
+                "definition change")
+
     return result
+
+
+def rejoin_current_labels(rows_by_arm_run: dict, current_rows: list) -> tuple:
+    """Fix wave 3, minor 4: overwrite every scored row's `label` with the
+    CURRENT value from `{set}.jsonl`, keyed by id -- a relabel (a re-import
+    of owner labels, or a re-export) must not leave a stale `label` baked
+    into an already-written `results/*.jsonl` row that `--score` later reads.
+    Returns `(rows_by_arm_run, missing_ids)`: `missing_ids` is every row id
+    present in the results but absent from the current fixture (its `label`
+    is left as-is -- there is nothing current to re-join to -- but the id is
+    reported so a stale/relabelled run does not silently score against a
+    row that no longer exists)."""
+    current_by_id = {row["id"]: row for row in current_rows}
+    missing_ids = set()
+    for by_run in rows_by_arm_run.values():
+        for rows in by_run.values():
+            for row in rows:
+                current = current_by_id.get(row.get("id"))
+                if current is None:
+                    missing_ids.add(row.get("id"))
+                    continue
+                row["label"] = current.get("label")
+    return rows_by_arm_run, sorted(missing_ids, key=str)
 
 
 # ---------------------------------------------------------------------------
@@ -667,7 +717,6 @@ def _run_live(sets: list, arms: list, args) -> int:
         jev_route, jev_provider, jev_model = _resolve_jev_stamps()
 
     per_set_state = {}
-    tasks = []  # (set_name, row, arm, run)
 
     for set_name in sets:
         rows = load_rows(set_name)
@@ -682,32 +731,71 @@ def _run_live(sets: list, arms: list, args) -> int:
                 set_name, rows, states_by_id)
 
         per_set_state[set_name] = {
+            "rows": rows,
             "states": states_by_id,
             "control_states": control_states,
             "control_errors": control_errors,
         }
 
-        for arm in arms:
-            for run in range(1, args.runs + 1):
+    # Fix wave 3, minor 3: run 1 must finish completely -- every set, every
+    # arm, every row -- before run 2's first task is even submitted, never
+    # interleaved on the same executor. Interleaving them let run 2's calls
+    # share a warm connection/cache window with a still-in-flight run 1 call,
+    # which is exactly the kind of correlation a stability check across runs
+    # is supposed to rule out.
+    for run in range(1, args.runs + 1):
+        # For run > 1: read run-1's already-written files fresh from disk
+        # (the same collapse `load_results` uses -- last ok row per id, else
+        # last error) so `identical_to_previous_run` is available even when
+        # run 1 was completed in an EARLIER invocation of this script (a
+        # resumed run), not only when this same call just produced it.
+        previous_run_answers: dict = {}
+        if run > 1:
+            for set_name in sets:
+                for arm in arms:
+                    prev_path = RESULTS_DIR / f"{set_name}.{arm}.run{run - 1}.jsonl"
+                    if not prev_path.exists():
+                        continue
+                    lines_by_id: dict = {}
+                    for line in prev_path.read_text(encoding="utf-8").splitlines():
+                        if not line.strip():
+                            continue
+                        r = json.loads(line)
+                        lines_by_id.setdefault(r.get("id"), []).append(r)
+                    for row_id, lines in lines_by_id.items():
+                        ok_lines = [r for r in lines if r.get("error") is None]
+                        if ok_lines:
+                            previous_run_answers[(set_name, arm, row_id)] = ok_lines[-1].get("answers")
+
+        tasks = []  # (set_name, row, arm)
+        for set_name in sets:
+            rows = per_set_state[set_name]["rows"]
+            for arm in arms:
                 out_path = RESULTS_DIR / f"{set_name}.{arm}.run{run}.jsonl"
                 ok_ids = _load_existing_ok_ids(out_path)
                 for row in rows:
                     if row["id"] in ok_ids:
                         continue
-                    tasks.append((set_name, row, arm, run))
+                    tasks.append((set_name, row, arm))
 
-    with ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
-        futures = {
-            executor.submit(
-                _process_task, set_name, row, arm, run,
-                per_set_state[set_name], sleeper, jev_route, jev_provider, jev_model,
-            ): (set_name, arm, run)
-            for (set_name, row, arm, run) in tasks
-        }
-        for future in as_completed(futures):
-            set_name, arm, run = futures[future]
-            out_row = future.result()
-            writer.write(set_name, arm, run, out_row)
+        with ThreadPoolExecutor(max_workers=CONCURRENCY) as executor:
+            futures = {
+                executor.submit(
+                    _process_task, set_name, row, arm, run,
+                    per_set_state[set_name], sleeper, jev_route, jev_provider, jev_model,
+                ): (set_name, row, arm)
+                for (set_name, row, arm) in tasks
+            }
+            for future in as_completed(futures):
+                set_name, row, arm = futures[future]
+                out_row = future.result()
+                key = (set_name, arm, out_row.get("id"))
+                if run > 1 and key in previous_run_answers:
+                    out_row["identical_to_previous_run"] = (
+                        out_row.get("answers") == previous_run_answers[key]
+                        if out_row.get("error") is None else None
+                    )
+                writer.write(set_name, arm, run, out_row)
 
     writer.close()
 
@@ -950,6 +1038,27 @@ def _run_score(sets: list, args) -> int:
         rows_by_arm_run = load_results(RESULTS_DIR, set_name)
         if not rows_by_arm_run:
             continue
+
+        # Fix wave 3, minor 4: re-join labels from the current {set}.jsonl
+        # rather than trusting whatever label a row was written with -- a
+        # relabel must not leave a stale label in the scored rows. Skipped
+        # (not fatal) when the current fixture file is missing entirely, so
+        # scoring an old results/ directory after fixtures moved elsewhere
+        # still works, just without the re-join.
+        try:
+            current_rows = load_rows(set_name)
+        except RunnerRefusal:
+            current_rows = None
+        if current_rows is not None:
+            rows_by_arm_run, missing_ids = rejoin_current_labels(rows_by_arm_run, current_rows)
+            if missing_ids:
+                print(
+                    f"warning: {len(missing_ids)} scored row id(s) for {set_name!r} "
+                    f"no longer exist in {set_name}.jsonl (label not re-joined): "
+                    f"{missing_ids}",
+                    file=sys.stderr,
+                )
+
         threshold_policy = {}
         if "baseline" in rows_by_arm_run:
             threshold_policy["baseline"] = BASELINE_THRESHOLDS[set_name]
@@ -977,7 +1086,11 @@ def main(argv=None) -> int:
     sets = list(SETS) if args.set_name == "all" else [args.set_name]
 
     if args.score:
-        return _run_score(sets, args)
+        try:
+            return _run_score(sets, args)
+        except AmbiguousQuestionHashError as exc:
+            print(f"refusing to score: {exc}", file=sys.stderr)
+            return 2
 
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
     unknown = [a for a in arms if a not in ALL_ARMS]
@@ -991,10 +1104,20 @@ def main(argv=None) -> int:
         print(f"refusing to start: {exc}", file=sys.stderr)
         return 2
 
+    # Fix wave 3, minor 5: skip the aws call and env-var copy entirely when
+    # programme_match is not selected OR has zero rows to run -- there is
+    # nothing for the baseline arm's config to apply to, and this call was
+    # previously made (and could fail loudly, or just spend a network round
+    # trip) whenever "baseline"+"programme_match" were both selected, even
+    # with an empty/limited-to-zero programme_match.jsonl.
     if "baseline" in arms and "programme_match" in sets and not args.dry_run:
-        copied = baseline_mod.load_deployed_llm_env(
-            args.baseline_function, profile=args.profile, region=args.region)
-        print(f"loaded deployed LLM env from {args.baseline_function}: {copied}")
+        programme_match_rows = load_rows("programme_match")
+        if args.limit:
+            programme_match_rows = programme_match_rows[: args.limit]
+        if programme_match_rows:
+            copied = baseline_mod.load_deployed_llm_env(
+                args.baseline_function, profile=args.profile, region=args.region)
+            print(f"loaded deployed LLM env from {args.baseline_function}: {copied}")
 
     try:
         if args.dry_run:

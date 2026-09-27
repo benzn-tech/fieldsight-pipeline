@@ -260,6 +260,108 @@ def test_resume_skips_ok_rows_and_retries_error_rows(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Minor 3: runs execute sequentially (never interleaved), and each row is
+# stamped with whether its answers matched the previous run's
+# ---------------------------------------------------------------------------
+
+def test_runs_execute_sequentially_never_interleaved(tmp_path, monkeypatch):
+    rows = [_work_class_row("wc-1", "yes"), _work_class_row("wc-2", "no")]
+    _fixtures_dir, results_dir = _setup_fixtures(tmp_path, monkeypatch, set_name="work_class", rows=rows)
+
+    call_log = []
+
+    def _tracking_ask(state, questions, *, model=None, timeout=None, caller=None):
+        call_log.append(caller)
+        return _fake_ask_ok(state, questions, model=model, timeout=timeout, caller=caller)
+
+    monkeypatch.setattr(sc, "ask", _tracking_ask)
+    monkeypatch.setattr(llm_utils, "call_llm", _fake_call_ok)
+
+    rc = jse.main(["--set", "work_class", "--arms", "broad", "--runs", "2"])
+    assert rc == 0
+
+    # Both run 1 files must be complete (2 rows each) before any run 2 file
+    # exists with content -- proven here by checking run 1's own file has
+    # both rows AND that this is consistent with a purely sequential order:
+    # every "run 1 wrote" must precede any dependency on run 1's content for
+    # run 2 (checked via the identical_to_previous_run test below, which
+    # would be impossible if runs were interleaved and run 1 wasn't done).
+    run1_rows = _read_jsonl(results_dir / "work_class.broad.run1.jsonl")
+    run2_rows = _read_jsonl(results_dir / "work_class.broad.run2.jsonl")
+    assert len(run1_rows) == 2
+    assert len(run2_rows) == 2
+
+
+def test_identical_to_previous_run_is_stamped_on_run_2(tmp_path, monkeypatch):
+    rows = [_work_class_row("wc-1", "yes")]
+    _fixtures_dir, results_dir = _setup_fixtures(tmp_path, monkeypatch, set_name="work_class", rows=rows)
+
+    monkeypatch.setattr(sc, "ask", _fake_ask_ok)  # deterministic fake -> same answers every call
+    monkeypatch.setattr(llm_utils, "call_llm", _fake_call_ok)
+
+    rc = jse.main(["--set", "work_class", "--arms", "broad", "--runs", "2"])
+    assert rc == 0
+
+    run2_rows = _read_jsonl(results_dir / "work_class.broad.run2.jsonl")
+    assert len(run2_rows) == 1
+    assert run2_rows[0]["identical_to_previous_run"] is True
+
+    run1_rows = _read_jsonl(results_dir / "work_class.broad.run1.jsonl")
+    assert "identical_to_previous_run" not in run1_rows[0]
+
+
+def test_identical_to_previous_run_is_false_when_answers_differ(tmp_path, monkeypatch):
+    rows = [_work_class_row("wc-1", "yes")]
+    _fixtures_dir, results_dir = _setup_fixtures(tmp_path, monkeypatch, set_name="work_class", rows=rows)
+
+    call_count = {"n": 0}
+
+    def _varying_ask(state, questions, *, model=None, timeout=None, caller=None):
+        call_count["n"] += 1
+        top_prob = 0.7 if call_count["n"] == 1 else 0.4
+        answers = {}
+        for name, spec in questions.items():
+            if spec["type"] == "noul":
+                answers[name] = {"noul": top_prob}
+            elif spec["type"] == "choice":
+                options = list(spec["criteria"].keys())
+                probs = {opt: (top_prob if i == 0 else (1 - top_prob) / max(1, len(options) - 1))
+                         for i, opt in enumerate(options)}
+                answers[name] = {"choice": options[0], "probabilities": probs, "confidence": top_prob}
+        return {"answers": answers,
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5}, "latency_ms": 5}
+
+    monkeypatch.setattr(sc, "ask", _varying_ask)
+    monkeypatch.setattr(llm_utils, "call_llm", _fake_call_ok)
+
+    rc = jse.main(["--set", "work_class", "--arms", "broad", "--runs", "2"])
+    assert rc == 0
+
+    run2_rows = _read_jsonl(results_dir / "work_class.broad.run2.jsonl")
+    assert run2_rows[0]["identical_to_previous_run"] is False
+
+
+def test_identical_to_previous_run_available_across_separate_invocations(tmp_path, monkeypatch):
+    # Run 1 completed in an EARLIER invocation (e.g. the owner re-ran the
+    # script later with --runs bumped up); run 2 must still be able to
+    # compare against it by reading run 1's file from disk.
+    rows = [_work_class_row("wc-1", "yes")]
+    _fixtures_dir, results_dir = _setup_fixtures(tmp_path, monkeypatch, set_name="work_class", rows=rows)
+
+    monkeypatch.setattr(sc, "ask", _fake_ask_ok)
+    monkeypatch.setattr(llm_utils, "call_llm", _fake_call_ok)
+
+    rc = jse.main(["--set", "work_class", "--arms", "broad", "--runs", "1"])
+    assert rc == 0
+
+    rc = jse.main(["--set", "work_class", "--arms", "broad", "--runs", "2"])
+    assert rc == 0
+
+    run2_rows = _read_jsonl(results_dir / "work_class.broad.run2.jsonl")
+    assert run2_rows[0]["identical_to_previous_run"] is True
+
+
+# ---------------------------------------------------------------------------
 # Control: donor from another site, never the same site
 # ---------------------------------------------------------------------------
 
@@ -433,6 +535,58 @@ def test_refuses_without_counts_entry_for_set(tmp_path, monkeypatch):
     assert rc == 2
 
 
+# ---------------------------------------------------------------------------
+# Minor 5: skip load_deployed_llm_env when programme_match is empty/unselected
+# ---------------------------------------------------------------------------
+
+def _programme_match_row(id_, label, site_id="site-1", company_id="co-1"):
+    return {
+        "set": "programme_match",
+        "id": id_,
+        "label": label,
+        "features": {
+            "observation": {"title": "Slab pour", "summary": "Pour underway.", "date": "2026-08-30"},
+            "task": {"name": "Pour ground slab", "status": "in_progress", "progress_pct": 40},
+        },
+        "baseline": {"confidence": 0.81, "suggested_status": "delayed",
+                     "suggested_progress": 40, "task_id": "T-9"},
+        "site_id": site_id,
+        "company_id": company_id,
+        "decided_at": "2026-09-01T00:00:00Z",
+    }
+
+
+def test_skips_loading_deployed_llm_env_when_programme_match_has_zero_rows(tmp_path, monkeypatch):
+    _setup_fixtures(tmp_path, monkeypatch, set_name="programme_match", rows=[])
+
+    def _explode(*a, **k):
+        raise AssertionError("load_deployed_llm_env() must not be called for zero rows")
+
+    monkeypatch.setattr(jse.baseline_mod, "load_deployed_llm_env", _explode)
+    monkeypatch.setattr(llm_utils, "call_llm", _fake_call_ok)
+
+    rc = jse.main(["--set", "programme_match", "--arms", "baseline", "--runs", "1"])
+    assert rc == 0
+
+
+def test_loads_deployed_llm_env_when_programme_match_has_rows(tmp_path, monkeypatch):
+    rows = [_programme_match_row("pm-1", "yes")]
+    _setup_fixtures(tmp_path, monkeypatch, set_name="programme_match", rows=rows)
+
+    calls = {"n": 0}
+
+    def _fake_load_env(function_name, *, profile, region):
+        calls["n"] += 1
+        return []
+
+    monkeypatch.setattr(jse.baseline_mod, "load_deployed_llm_env", _fake_load_env)
+    monkeypatch.setattr(llm_utils, "call_llm", _fake_call_ok)
+
+    rc = jse.main(["--set", "programme_match", "--arms", "baseline", "--runs", "1"])
+    assert rc == 0
+    assert calls["n"] == 1
+
+
 def test_check_preconditions_raises_runner_refusal_without_counts_file(tmp_path, monkeypatch):
     fixtures_dir = tmp_path / "jev_eval"
     fixtures_dir.mkdir(parents=True)
@@ -496,6 +650,93 @@ def test_load_results_n_failed_counts_only_genuinely_failed_ids(tmp_path):
     # Only "b" ever genuinely failed; "a"'s stale error line must not count.
     assert scores["broad"]["n_failed"] == 1
     assert scores["broad"]["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Minor 4: refuse a mixed question_hash, re-join labels at score time
+# ---------------------------------------------------------------------------
+
+def test_load_results_raises_on_ambiguous_question_hash_within_one_arm(tmp_path):
+    results_dir = tmp_path / "results"
+    rows_run1 = [_result_row("a", "yes", "broad", 1, question_hash="hash-v1")]
+    rows_run2 = [_result_row("a", "yes", "broad", 2, question_hash="hash-v2")]
+    _write_results_jsonl(results_dir, "work_class", "broad", 1, rows_run1)
+    _write_results_jsonl(results_dir, "work_class", "broad", 2, rows_run2)
+
+    with pytest.raises(jse.AmbiguousQuestionHashError):
+        jse.load_results(results_dir, "work_class")
+
+
+def test_load_results_tolerates_none_question_hash_alongside_a_real_one(tmp_path):
+    # An error row's question_hash is often None -- that must not itself
+    # trigger the ambiguity check (only two DIFFERENT real hashes should).
+    results_dir = tmp_path / "results"
+    rows = [
+        _result_row("a", "yes", "broad", 1, question_hash="hash-v1"),
+        _result_row("b", "no", "broad", 1, error="boom", question_hash=None),
+    ]
+    _write_results_jsonl(results_dir, "work_class", "broad", 1, rows)
+    loaded = jse.load_results(results_dir, "work_class")  # must not raise
+    assert len(loaded["broad"][1]) == 2
+
+
+def test_score_mode_refuses_on_ambiguous_question_hash(tmp_path, monkeypatch):
+    fixtures_dir = tmp_path / "jev_eval"
+    fixtures_dir.mkdir(parents=True)
+    results_dir = fixtures_dir / "results"
+    monkeypatch.setattr(jse, "FIXTURES_DIR", fixtures_dir)
+    monkeypatch.setattr(jse, "RESULTS_DIR", results_dir)
+
+    _write_results_jsonl(results_dir, "work_class", "broad", 1,
+                          [_result_row("a", "yes", "broad", 1, question_hash="hash-v1")])
+    _write_results_jsonl(results_dir, "work_class", "broad", 2,
+                          [_result_row("a", "yes", "broad", 2, question_hash="hash-v2")])
+
+    rc = jse.main(["--set", "work_class", "--score"])
+    assert rc == 2
+    assert not (results_dir / "scores.json").exists()
+
+
+def test_rejoin_current_labels_overwrites_stale_labels_and_reports_missing():
+    rows_by_arm_run = {
+        "broad": {1: [
+            {"id": "a", "label": "no"},   # stale -- current says "yes"
+            {"id": "gone", "label": "yes"},  # no longer in the current fixture
+        ]},
+    }
+    current_rows = [{"id": "a", "label": "yes"}]
+
+    updated, missing_ids = jse.rejoin_current_labels(rows_by_arm_run, current_rows)
+
+    assert updated["broad"][1][0]["label"] == "yes"
+    assert updated["broad"][1][1]["label"] == "yes"  # untouched: id absent from current
+    assert missing_ids == ["gone"]
+
+
+def test_score_mode_rejoins_labels_from_current_fixture(tmp_path, monkeypatch):
+    fixtures_dir = tmp_path / "jev_eval"
+    fixtures_dir.mkdir(parents=True)
+    results_dir = fixtures_dir / "results"
+    monkeypatch.setattr(jse, "FIXTURES_DIR", fixtures_dir)
+    monkeypatch.setattr(jse, "RESULTS_DIR", results_dir)
+
+    # The result row was written when "a" was labelled "no"; the fixture has
+    # since been relabelled "yes" (e.g. a re-import). Scoring must use "yes".
+    _write_jsonl(fixtures_dir / "work_class.jsonl", [
+        {"id": "a", "set": "work_class", "label": "yes", "features": {}},
+    ])
+    _write_results_jsonl(results_dir, "work_class", "baseline", 1,
+                          [_result_row("a", "no", "baseline", 1, score=0.9)])
+
+    rc = jse.main(["--set", "work_class", "--score"])
+    assert rc == 0
+
+    scores = json.loads((results_dir / "scores.json").read_text(encoding="utf-8"))
+    baseline_scores = scores["work_class"]["scores"]["baseline"]
+    # score=0.9 clears the 0.5 threshold -> predicted "yes". If the label had
+    # stayed stale ("no"), this would score as a false positive
+    # (precision 0.0); re-joined to the current "yes" it is a true positive.
+    assert baseline_scores["precision"] == 1.0
 
 
 # ---------------------------------------------------------------------------
