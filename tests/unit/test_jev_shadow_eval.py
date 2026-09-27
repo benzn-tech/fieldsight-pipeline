@@ -13,9 +13,12 @@ import json
 
 import pytest
 
+import lambda_programme_matcher
 import llm_utils
+import thread_match
 import scripts.jev_shadow_eval as jse
 import systemone_client as sc
+from scripts.jev_eval import score as score_mod
 from scripts.jev_eval.questions import JevQuestionsError
 
 
@@ -105,6 +108,30 @@ def _read_jsonl(path):
     if not path.exists():
         return []
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _write_results_jsonl(results_dir, set_name, arm, run, rows):
+    results_dir.mkdir(parents=True, exist_ok=True)
+    path = results_dir / f"{set_name}.{arm}.run{run}.jsonl"
+    with open(path, "a", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row))
+            fh.write("\n")
+    return path
+
+
+def _result_row(id_, label, arm, run, *, score=0.8, error=None, set_name="work_class", **extra):
+    row = {
+        "id": id_, "label": label, "arm": arm, "run": run,
+        "score": score if error is None else None,
+        "answers": {} if error is None else None,
+        "question_hash": "hash", "latency_ms": 10, "tokens": 50,
+        "error": error,
+        "set": set_name, "route": None, "model": "m", "provider": "p",
+        "temperature": None, "started_at": "2026-09-28T00:00:00+00:00",
+    }
+    row.update(extra)
+    return row
 
 
 @pytest.fixture(autouse=True)
@@ -391,3 +418,142 @@ def test_check_preconditions_raises_runner_refusal_without_counts_file(tmp_path,
 
     with pytest.raises(jse.RunnerRefusal):
         jse.check_preconditions(["work_class"], ["baseline"], False)
+
+
+# ---------------------------------------------------------------------------
+# load_results: the append-only log's file -> score.py boundary
+# (coordinator fix round 1, finding #1)
+# ---------------------------------------------------------------------------
+
+def test_load_results_collapses_duplicates_keeping_last_ok_row(tmp_path):
+    results_dir = tmp_path / "results"
+    rows = [
+        _result_row("a", "yes", "broad", 1, error="SystemOneError: boom"),
+        _result_row("a", "yes", "broad", 1, score=0.9),  # later ok row supersedes
+        _result_row("b", "no", "broad", 1, error="SystemOneError: still failing"),
+    ]
+    _write_results_jsonl(results_dir, "work_class", "broad", 1, rows)
+
+    loaded = jse.load_results(results_dir, "work_class")
+    broad_run1 = loaded["broad"][1]
+    by_id = {r["id"]: r for r in broad_run1}
+
+    assert len(broad_run1) == 2  # one row per id, not three (no duplicates)
+    assert by_id["a"]["error"] is None
+    assert by_id["a"]["score"] == 0.9
+    assert by_id["b"]["error"] is not None  # error-only id stays a single error row
+
+
+def test_load_results_keeps_last_error_when_no_ok_row_exists(tmp_path):
+    results_dir = tmp_path / "results"
+    rows = [
+        _result_row("b", "no", "broad", 1, error="SystemOneError: first failure"),
+        _result_row("b", "no", "broad", 1, error="SystemOneError: second failure"),
+    ]
+    _write_results_jsonl(results_dir, "work_class", "broad", 1, rows)
+
+    loaded = jse.load_results(results_dir, "work_class")
+    (row,) = loaded["broad"][1]
+    assert row["id"] == "b"
+    assert "second failure" in row["error"]
+
+
+def test_load_results_n_failed_counts_only_genuinely_failed_ids(tmp_path):
+    results_dir = tmp_path / "results"
+    rows = [
+        _result_row("a", "yes", "broad", 1, error="SystemOneError: boom"),
+        _result_row("a", "yes", "broad", 1, score=0.9),  # "a" later succeeded
+        _result_row("b", "no", "broad", 1, error="SystemOneError: still failing"),
+        _result_row("c", "yes", "broad", 1, score=0.2),
+    ]
+    _write_results_jsonl(results_dir, "work_class", "broad", 1, rows)
+
+    loaded = jse.load_results(results_dir, "work_class")
+    scores = score_mod.score_set(loaded)
+    # Only "b" ever genuinely failed; "a"'s stale error line must not count.
+    assert scores["broad"]["n_failed"] == 1
+    assert scores["broad"]["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# --score mode
+# ---------------------------------------------------------------------------
+
+def test_score_mode_end_to_end_writes_scores_json(tmp_path, monkeypatch):
+    fixtures_dir = tmp_path / "jev_eval"
+    fixtures_dir.mkdir(parents=True)
+    results_dir = fixtures_dir / "results"
+    monkeypatch.setattr(jse, "FIXTURES_DIR", fixtures_dir)
+    monkeypatch.setattr(jse, "RESULTS_DIR", results_dir)
+    monkeypatch.delenv("DECISIONS_API_KEY", raising=False)
+
+    rows = (
+        [_result_row(f"y{i}", "yes", "baseline", 1, score=0.9) for i in range(4)]
+        + [_result_row(f"n{i}", "no", "baseline", 1, score=0.1) for i in range(4)]
+    )
+    _write_results_jsonl(results_dir, "work_class", "baseline", 1, rows)
+
+    rc = jse.main(["--set", "work_class", "--score"])
+    assert rc == 0
+
+    scores_path = results_dir / "scores.json"
+    assert scores_path.exists()
+    payload = json.loads(scores_path.read_text(encoding="utf-8"))
+    assert payload["work_class"]["baseline_threshold"] == 0.5
+    assert "baseline" in payload["work_class"]["scores"]
+    assert payload["work_class"]["scores"]["baseline"]["n"] == 8
+
+
+def test_score_mode_uses_deployed_gate_threshold_for_baseline(tmp_path, monkeypatch):
+    fixtures_dir = tmp_path / "jev_eval"
+    fixtures_dir.mkdir(parents=True)
+    results_dir = fixtures_dir / "results"
+    monkeypatch.setattr(jse, "FIXTURES_DIR", fixtures_dir)
+    monkeypatch.setattr(jse, "RESULTS_DIR", results_dir)
+    monkeypatch.delenv("DECISIONS_API_KEY", raising=False)
+
+    rows = [
+        _result_row(f"t{i}", "yes" if i % 2 else "no", "baseline", 1,
+                    score=0.3, set_name="threads")
+        for i in range(6)
+    ]
+    _write_results_jsonl(results_dir, "threads", "baseline", 1, rows)
+
+    rc = jse.main(["--set", "threads", "--score"])
+    assert rc == 0
+
+    payload = json.loads((results_dir / "scores.json").read_text(encoding="utf-8"))
+    assert payload["threads"]["baseline_threshold"] == thread_match.MIN_SCORE
+    assert (payload["threads"]["scores"]["baseline"]["fixed_threshold"]["threshold"]
+            == thread_match.MIN_SCORE)
+
+
+def test_score_mode_calls_neither_ask_nor_aws(tmp_path, monkeypatch):
+    fixtures_dir = tmp_path / "jev_eval"
+    fixtures_dir.mkdir(parents=True)
+    results_dir = fixtures_dir / "results"
+    monkeypatch.setattr(jse, "FIXTURES_DIR", fixtures_dir)
+    monkeypatch.setattr(jse, "RESULTS_DIR", results_dir)
+    monkeypatch.delenv("DECISIONS_API_KEY", raising=False)
+
+    def _explode_ask(*a, **k):
+        raise AssertionError("ask() must never be called during --score")
+
+    def _explode_load_env(*a, **k):
+        raise AssertionError("load_deployed_llm_env() must never be called during --score")
+
+    monkeypatch.setattr(sc, "ask", _explode_ask)
+    monkeypatch.setattr(jse.baseline_mod, "load_deployed_llm_env", _explode_load_env)
+
+    rows = [
+        _result_row(f"pm{i}", "yes" if i % 2 else "no", "baseline", 1,
+                    score=0.8, set_name="programme_match")
+        for i in range(4)
+    ]
+    _write_results_jsonl(results_dir, "programme_match", "baseline", 1, rows)
+
+    rc = jse.main(["--set", "programme_match", "--score"])
+    assert rc == 0
+
+    payload = json.loads((results_dir / "scores.json").read_text(encoding="utf-8"))
+    assert payload["programme_match"]["baseline_threshold"] == lambda_programme_matcher.CONF_MIN

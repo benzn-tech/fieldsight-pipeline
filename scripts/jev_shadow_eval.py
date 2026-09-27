@@ -64,6 +64,25 @@ error line is left in place -- this file is a log, not a keyed table). This
 means a run interrupted mid-flight, or one that hit a 429 storm, can simply
 be re-invoked with the same arguments.
 
+Because the log is append-only and never deduped on disk, `--score` is the
+runner's own file -> `scripts/jev_eval/score.py` boundary: `load_results()`
+collapses each `(id, arm, run)` down to exactly one row (the last ok row if
+one exists, else the last error row) before handing anything to
+`score.score_set`, so a retried id's stale error line is never counted
+alongside its later success.
+
+## --score
+
+`--score` reads the already-written `results/{set}.*.run*.jsonl` files (via
+`load_results`), scores them with `scripts/jev_eval/score.py`, and writes
+`results/scores.json`. No network or `aws` call, and no `DECISIONS_API_KEY`
+-- it only reads files already on disk. The baseline arm's threshold is
+fixed at the DEPLOYED gate's own threshold (`BASELINE_THRESHOLDS`, imported
+from `lambda_programme_matcher.CONF_MIN` / `thread_match.MIN_SCORE`, and the
+literal 0.5 for `work_class`'s P(non_work) midpoint, since it has no
+analogous gate constant); every Jev arm is left to `score_set`'s own "fit"
+(split-half) default.
+
 ## Refusals (before any work, and before any network/aws call)
 
 - `scripts/fixtures/jev_eval/counts.json` is missing, or has no entry for a
@@ -98,9 +117,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
+import lambda_programme_matcher
+import thread_match
 import systemone_client as sc
 
 from scripts.jev_eval import baseline as baseline_mod
+from scripts.jev_eval import score as score_mod
 from scripts.jev_eval.questions import (
     QUESTION_SETS,
     JevQuestionsError,
@@ -129,6 +151,20 @@ COST_PER_MILLION_INPUT_TOKENS = 0.042
 
 DEFAULT_BASELINE_FUNCTION = baseline_mod.PROGRAMME_MATCHER_FUNCTION
 DEFAULT_DATABASE = "fieldsight_test"
+
+# --score mode: the baseline arm's threshold is fixed at the DEPLOYED gate's
+# own threshold (imported, never re-derived -- same "call the real code"
+# ruling as scripts/jev_eval/baseline.py). work_class has no analogous gate
+# constant to import: 0.5 is the natural midpoint of its P(non_work) score,
+# per controller ruling (fix round 1). Every Jev arm is left out of this map
+# on purpose -- `score.score_set` defaults an arm missing from
+# `threshold_policy` to "fit" (split-half fitted), which is what a Jev arm
+# with no deployed threshold of its own should use.
+BASELINE_THRESHOLDS = {
+    "programme_match": lambda_programme_matcher.CONF_MIN,
+    "threads": thread_match.MIN_SCORE,
+    "work_class": 0.5,
+}
 
 
 class RunnerRefusal(RuntimeError):
@@ -341,6 +377,56 @@ def _load_existing_ok_ids(path: Path) -> set:
         if row.get("error") is None:
             ok_ids.add(row.get("id"))
     return ok_ids
+
+
+def load_results(results_dir: Path, set_name: str) -> dict:
+    """Read every `results/{set_name}.{arm}.run{n}.jsonl` file under
+    `results_dir` and collapse the append-only log to exactly one row per
+    `(id, arm, run)`: the LAST ok row (`error is None`) for that id if one
+    exists in the file, else the LAST error row.
+
+    This is the runner's own file -> `score.score_set` boundary (controller
+    ruling, fix round 1): the log stays append-only (a retried row leaves
+    its old error line in place, by design -- it's a log, not a keyed
+    table), but nothing downstream of this function ever sees a stale error
+    line for an id that later succeeded, or double-counts a row that
+    appears twice.
+
+    Returns `{arm: {run: [rows]}}`, exactly the shape
+    `scripts.jev_eval.score.score_set` expects. Rows within each `[rows]`
+    list are sorted by id for determinism.
+    """
+    result: dict = {}
+    if not results_dir.exists():
+        return result
+
+    prefix = f"{set_name}."
+    for path in sorted(results_dir.glob(f"{set_name}.*.run*.jsonl")):
+        rest = path.name[len(prefix):]
+        if not rest.endswith(".jsonl"):
+            continue
+        rest = rest[: -len(".jsonl")]
+        arm, sep, run_str = rest.rpartition(".run")
+        if not sep or not run_str.isdigit():
+            continue
+        run = int(run_str)
+
+        lines_by_id: dict = {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            lines_by_id.setdefault(row.get("id"), []).append(row)
+
+        collapsed = []
+        for row_id in sorted(lines_by_id, key=str):
+            lines = lines_by_id[row_id]
+            ok_lines = [r for r in lines if r.get("error") is None]
+            collapsed.append(ok_lines[-1] if ok_lines else lines[-1])
+
+        result.setdefault(arm, {})[run] = collapsed
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -653,19 +739,78 @@ def _parse_args(argv=None) -> argparse.Namespace:
         "--dry-run", action="store_true",
         help="build every state (and control state) that would be sent and "
              "write it to results/preview_states.jsonl; no network or aws call")
+    parser.add_argument(
+        "--score", action="store_true",
+        help="score the already-written results/{set}.*.run*.jsonl files via "
+             "scripts/jev_eval/score.py and write results/scores.json; no "
+             "network or aws call, no API key needed, ignores --arms")
     return parser.parse_args(argv)
+
+
+def _print_score_table(all_scores: dict) -> None:
+    for set_name, payload in all_scores.items():
+        threshold = payload["baseline_threshold"]
+        print(f"== {set_name} (baseline threshold={threshold}) ==")
+        for arm, metrics in payload["scores"].items():
+            if arm == "_control_checks":
+                continue
+            print(
+                f"  {arm:22s} n={metrics.get('n')!s:>4}  "
+                f"n_failed={metrics.get('n_failed')!s:>4}  "
+                f"accuracy={metrics.get('accuracy')}  "
+                f"precision={metrics.get('precision')}  "
+                f"recall={metrics.get('recall')}"
+            )
+
+
+def _run_score(sets: list, args) -> int:
+    """`--score`: load the already-written result files (via `load_results`,
+    which collapses the append-only log to one row per (id, arm, run) --
+    ruling #1) and score them with `scripts.jev_eval.score.score_set`. No
+    network or aws call is made, and no `DECISIONS_API_KEY` is needed --
+    this only reads files already on disk under `results/`.
+
+    Baseline's threshold is fixed at the deployed gate's own threshold
+    (`BASELINE_THRESHOLDS`, imported from the real gate modules, never
+    hardcoded/re-derived); every Jev arm is left to `score_set`'s own "fit"
+    default (split-half fitted), per the controller's ruling."""
+    all_scores: dict = {}
+    for set_name in sets:
+        rows_by_arm_run = load_results(RESULTS_DIR, set_name)
+        if not rows_by_arm_run:
+            continue
+        threshold_policy = {}
+        if "baseline" in rows_by_arm_run:
+            threshold_policy["baseline"] = BASELINE_THRESHOLDS[set_name]
+        scores = score_mod.score_set(rows_by_arm_run, threshold_policy)
+        all_scores[set_name] = {
+            "scores": scores,
+            "baseline_threshold": BASELINE_THRESHOLDS[set_name],
+        }
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    scores_path = RESULTS_DIR / "scores.json"
+    scores_path.write_text(
+        json.dumps(all_scores, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    _print_score_table(all_scores)
+    print(f"wrote {scores_path}")
+    return 0
 
 
 def main(argv=None) -> int:
     args = _parse_args(argv)
+
+    sets = list(SETS) if args.set_name == "all" else [args.set_name]
+
+    if args.score:
+        return _run_score(sets, args)
 
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
     unknown = [a for a in arms if a not in ALL_ARMS]
     if unknown:
         print(f"unknown arm(s) {unknown}; choose from {list(ALL_ARMS)}", file=sys.stderr)
         return 2
-
-    sets = list(SETS) if args.set_name == "all" else [args.set_name]
 
     try:
         check_preconditions(sets, arms, args.dry_run)
