@@ -238,8 +238,11 @@ PROPOSAL_PAGE = int(os.environ.get("PROPOSAL_PAGE", "5"))
 # a single profile — the subject needs an account, and on a site the people most often named
 # do not have one.
 #
-# On, a correction also creates the profile, recorded as `consent_basis='attestation'` with
-# `asserted_by` naming who made the claim. It records a claim; it does not verify one, and
+# On, a correction also creates the profile, recorded with the COMPANY's own
+# `voiceprint_consent_basis` -- whichever of notice / attestation / confirmed the company
+# declared -- and `asserted_by` naming who applied it. (This comment used to say every such
+# row was recorded as 'attestation'. The code has always written the company's value; a
+# comment that misstates which legal basis a biometric record carries is worse than none.) It records a claim; it does not verify one, and
 # nothing here can. The basis is on every row so a later decision — a stricter standard, a
 # purge, an opt-out register — can find exactly this population in one query.
 ENROL_ON_CORRECTION = os.environ.get("ENROL_ON_CORRECTION", "false").lower() == "true"

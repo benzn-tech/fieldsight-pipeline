@@ -100,6 +100,16 @@ def candidates_for_person(conn, company_id, voiceprint_id, since_hours=72,
     everything they need. `site_id=None` and any other value still behave identically.
     Narrowing to nothing is never acceptable; returning the whole window is the safe side.
 
+
+    **Verified against a real database, and what that did and did not show.** On
+    2026-09-26 (develop `d207f1a`, TEST `fieldsight_test`) the exact string this function
+    sends -- taken with `ast`, so byte-for-byte what `execute()` receives -- ran against
+    Sam Yu's profile and returned 5 clusters, descending, scores 0.70-0.78. That proves the
+    SQL parses and runs on real pgvector data and ranks. **It does not prove the ranking
+    tells different people apart**: those clusters are Sam's own session, the one his
+    samples came from, so high scores were the expected answer and a broken discriminator
+    would have produced them too. Separation needs labelled data, which is what the
+    labelling pack is for.
     """
     _require_company(company_id)
     if not voiceprint_id:
