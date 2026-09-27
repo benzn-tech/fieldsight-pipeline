@@ -91,7 +91,7 @@ def _decisions_payload(answers=None, model="~typesafe/jev-latest",
 def test_request_body_carries_model_state_and_questions_verbatim(monkeypatch, caplog):
     transport = _install(monkeypatch, FakeHTTPResponse(200, _decisions_payload()))
     state = {"topic": "safety walk", "notes": "loose railing on level 3"}
-    questions = {"is_urgent": {"type": "noul", "prompt": "Is this urgent?"}}
+    questions = {"is_urgent": {"type": "noul", "instructions": "Is this urgent?"}}
 
     with caplog.at_level("INFO"):
         result = client.ask(state, questions, caller="unit-test")
@@ -123,10 +123,14 @@ def test_choice_answer_probabilities_sum_to_one_and_choice_is_in_options(monkeyp
             "confidence": 0.81,
         },
     })))
-    questions = {"severity": {"type": "choice", "options": ["low", "medium", "high"]}}
+    questions = {"severity": {"type": "choice", "criteria": {
+        "low": "no immediate risk to people or property",
+        "medium": "a risk that should be addressed this week",
+        "high": "an immediate risk requiring action today",
+    }}}
     result = client.ask("state text", questions)
     answer = result["answers"]["severity"]
-    assert answer["choice"] in questions["severity"]["options"]
+    assert answer["choice"] in questions["severity"]["criteria"]
     total = sum(answer["probabilities"].values())
     assert abs(total - 1.0) < 1e-6
     assert answer["confidence"] == 0.81
