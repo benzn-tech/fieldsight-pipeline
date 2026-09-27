@@ -77,6 +77,7 @@ real_mean - control_mean >= CONTROL_MARGIN (0.2). No yes rows on either side
 from __future__ import annotations
 
 import hashlib
+import math
 from typing import Any
 
 import numpy as np
@@ -88,6 +89,14 @@ import numpy as np
 ECE_N_BINS = 10
 COVERAGE_PRECISION_TARGET = 0.95
 CONTROL_MARGIN = 0.2
+
+# Amended decision rule (2026-09-28, docs/superpowers/specs/
+# 2026-09-28-jev-shadow-eval-findings.md, section 2 addendum). See
+# `verdict()` below for the mechanical application of clause 9.
+ELIGIBILITY_MIN_PER_CLASS = 20
+PRECISION_FLOOR = 0.90
+BOOTSTRAP_REPS = 2000
+BOOTSTRAP_SEED = 20260928
 
 # L2 (ridge) penalty for the decomposed-weight logistic regression. With as
 # few as ~13 rows per split half, an unregularised fit on any near-separable
@@ -335,6 +344,10 @@ def _p95_direction(fit_rows: list, score_rows: list) -> dict:
             "coverage_on_held_out": 0, "precision_on_held_out": None,
             "n_fit": len(fit_usable), "n_held_out": len(score_usable),
             "reason": reason,
+            "_records": [
+                {"id": r["id"], "label": r["label"], "score": r["score"], "decision": False}
+                for r in score_usable
+            ],
         }
 
     scores_fit = [r["score"] for r in fit_usable]
@@ -347,6 +360,10 @@ def _p95_direction(fit_rows: list, score_rows: list) -> dict:
             "coverage_on_held_out": 0, "precision_on_held_out": None,
             "n_fit": len(fit_usable), "n_held_out": len(score_usable),
             "reason": "no threshold on fit half reaches 0.95 precision",
+            "_records": [
+                {"id": r["id"], "label": r["label"], "score": r["score"], "decision": False}
+                for r in score_usable
+            ],
         }
 
     accepted = [r for r in score_usable if r["score"] >= threshold]
@@ -359,6 +376,11 @@ def _p95_direction(fit_rows: list, score_rows: list) -> dict:
         precision_held = None
         coverage_held = 0.0
 
+    records = [
+        {"id": r["id"], "label": r["label"], "score": r["score"], "decision": r["score"] >= threshold}
+        for r in score_usable
+    ]
+
     return {
         "threshold": threshold,
         "precision_on_fit_half": precision_on_fit,
@@ -367,6 +389,7 @@ def _p95_direction(fit_rows: list, score_rows: list) -> dict:
         "n_fit": len(fit_usable),
         "n_held_out": len(score_usable),
         "_pool": (len(accepted), positives),
+        "_records": records,
     }
 
 
@@ -381,10 +404,12 @@ def _coverage_at_p95_split(rows_a: list, rows_b: list) -> dict:
     pooled_n = dir_ab["n_held_out"] + dir_ba["n_held_out"]
     pooled_accepted = 0
     pooled_positive = 0
+    pooled_records: list = []
     for direction in (dir_ab, dir_ba):
         n_accepted, n_positive = direction.pop("_pool", (0, 0))
         pooled_accepted += n_accepted
         pooled_positive += n_positive
+        pooled_records.extend(direction.pop("_records", []))
 
     if pooled_n == 0:
         pooled = {"coverage": 0, "precision": None, "n": 0, "reason": "no usable rows"}
@@ -400,7 +425,7 @@ def _coverage_at_p95_split(rows_a: list, rows_b: list) -> dict:
             "n": pooled_n,
         }
 
-    return {"a_to_b": dir_ab, "b_to_a": dir_ba, "pooled": pooled}
+    return {"a_to_b": dir_ab, "b_to_a": dir_ba, "pooled": pooled, "pooled_records": pooled_records}
 
 
 # ---------------------------------------------------------------------------
@@ -662,6 +687,7 @@ def _fit_decomposed_direction(fit_rows: list, score_rows: list) -> dict:
             "weights": {}, "n_fit": 0, "n_score": 0, "brier": None,
             "p95": {**_EMPTY_P95, "n_fit": 0, "n_held_out": n_score_usable, "reason": class_reason},
             "reason": class_reason,
+            "_records": [],
         }
 
     fit_extraction = _extract_noul_features(fit_rows)
@@ -671,6 +697,7 @@ def _fit_decomposed_direction(fit_rows: list, score_rows: list) -> dict:
             "weights": {}, "n_fit": 0, "n_score": 0, "brier": None,
             "p95": {**_EMPTY_P95, "n_fit": 0, "n_held_out": n_score_usable, "reason": reason},
             "reason": reason,
+            "_records": [],
         }
     feature_names, X_fit, y_fit, _ = fit_extraction
     weights = _fit_logreg_l2(X_fit, y_fit)
@@ -692,18 +719,23 @@ def _fit_decomposed_direction(fit_rows: list, score_rows: list) -> dict:
                 "n_fit": len(y_fit), "n_held_out": n_score_usable, "reason": reason,
             },
             "reason": reason,
+            "_records": [],
         }
-    _, X_score, y_score, _ = score_extraction
+    _, X_score, y_score, score_usable_rows = score_extraction
     predicted_score = _predict_logreg(X_score, weights)
     brier = float(np.mean((predicted_score - y_score) ** 2))
+    predicted_list = predicted_score.tolist()
 
     if threshold is None:
         p95 = {
             **_EMPTY_P95, "n_fit": len(y_fit), "n_held_out": len(y_score),
             "reason": "no threshold on fit half reaches 0.95 precision",
         }
+        records = [
+            {"id": r["id"], "label": r["label"], "score": float(p), "decision": False}
+            for r, p in zip(score_usable_rows, predicted_list)
+        ]
     else:
-        predicted_list = predicted_score.tolist()
         accepted_idx = [i for i, p in enumerate(predicted_list) if p >= threshold]
         if accepted_idx:
             positives = sum(1 for i in accepted_idx if bool(y_score[i]))
@@ -722,6 +754,10 @@ def _fit_decomposed_direction(fit_rows: list, score_rows: list) -> dict:
             "n_held_out": len(y_score),
             "_pool": (len(accepted_idx), positives),
         }
+        records = [
+            {"id": r["id"], "label": r["label"], "score": float(p), "decision": p >= threshold}
+            for r, p in zip(score_usable_rows, predicted_list)
+        ]
 
     return {
         "weights": dict(zip(["intercept"] + feature_names, weights.tolist())),
@@ -729,6 +765,7 @@ def _fit_decomposed_direction(fit_rows: list, score_rows: list) -> dict:
         "n_score": len(y_score),
         "brier": brier,
         "p95": p95,
+        "_records": records,
     }
 
 
@@ -740,10 +777,12 @@ def _fit_decomposed(rows_a: list, rows_b: list) -> dict:
     pooled_n = dir_ab["p95"]["n_held_out"] + dir_ba["p95"]["n_held_out"]
     pooled_accepted = 0
     pooled_positive = 0
+    pooled_records: list = []
     for direction in (dir_ab, dir_ba):
         n_accepted, n_positive = direction["p95"].pop("_pool", (0, 0))
         pooled_accepted += n_accepted
         pooled_positive += n_positive
+        pooled_records.extend(direction.pop("_records", []))
 
     if pooled_n == 0:
         p95_pooled = {"coverage": 0, "precision": None, "n": 0, "reason": "no usable rows"}
@@ -763,6 +802,7 @@ def _fit_decomposed(rows_a: list, rows_b: list) -> dict:
         "a_to_b": dir_ab,
         "b_to_a": dir_ba,
         "p95_pooled": p95_pooled,
+        "pooled_records": pooled_records,
         "v0_unfitted": {
             "brier": v0_brier,
             "n": len(_usable_rows(rows_a + rows_b)),
@@ -833,12 +873,19 @@ def _score_one_arm(arm: str, runs: dict, policy) -> dict:
         p95_a_to_b = decomposed_fit["a_to_b"]["p95"]
         p95_b_to_a = decomposed_fit["b_to_a"]["p95"]
         p95_pooled = decomposed_fit["p95_pooled"]
+        held_out_records = decomposed_fit.pop("pooled_records")
+        decomposed_weights = {
+            "a_to_b": decomposed_fit["a_to_b"].get("weights") or None,
+            "b_to_a": decomposed_fit["b_to_a"].get("weights") or None,
+        }
     else:
         decomposed_fit = None
         p95_split = _coverage_at_p95_split(rows_a, rows_b)
         p95_a_to_b = p95_split["a_to_b"]
         p95_b_to_a = p95_split["b_to_a"]
         p95_pooled = p95_split["pooled"]
+        held_out_records = p95_split["pooled_records"]
+        decomposed_weights = None
 
     coverage_at_p95_result = {
         "pooled": p95_pooled,
@@ -878,9 +925,25 @@ def _score_one_arm(arm: str, runs: dict, policy) -> dict:
         # threshold (finding #2) -- never the threshold it was fit on.
         run_agree = _run_agreement_split(run1, run2, half_a_ids, half_b_ids, threshold_split)
 
+    # Amended rule clause 7: stability is flips at the SAME held-out p95
+    # operating point coverage was judged at -- never the accuracy-maximising
+    # threshold `run_agreement`/`_run_agreement_split` above use. For the
+    # decomposed arm, run 2's rows must be scored through the SAME fitted
+    # composite weights run 1's fit half produced (clause 2/g) -- never
+    # run 2's own v0 composite `score`.
+    stability = stability_at_p95(
+        run1, run2, half_a_ids, half_b_ids, threshold_at_p95,
+        decomposed_weights=decomposed_weights,
+    )
+
+    n_yes = sum(1 for r in usable1 if r["label"] == "yes")
+    n_no = sum(1 for r in usable1 if r["label"] == "no")
+
     result = {
         "n": len(usable1),
         "n_failed": n_failed,
+        "n_yes": n_yes,
+        "n_no": n_no,
         "accuracy": main_metrics.get("accuracy"),
         "precision": main_metrics.get("precision"),
         "recall": main_metrics.get("recall"),
@@ -891,6 +954,8 @@ def _score_one_arm(arm: str, runs: dict, policy) -> dict:
         "threshold_at_p95": threshold_at_p95,
         "fixed_threshold": fixed_metrics,
         "split_half": threshold_split,
+        "held_out_records": held_out_records,
+        "stability": stability,
     }
     if decomposed_fit is not None:
         result["decomposed_fit"] = decomposed_fit
@@ -916,3 +981,380 @@ def score_set(rows_by_arm_run: dict, threshold_policy: dict | None = None) -> di
     result["_control_checks"] = control_checks
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Amended decision rule (2026-09-28 findings-doc amendment, owner-approved
+# before any result exists -- see wave1-brief.md). Original wording is kept,
+# superseded, in the findings doc; this module computes the OPERATIVE rule.
+#
+# Clause 2 (one score per row -- the cross-fit held-out probability):
+#   - `broad`/`baseline`: the row's own `score` (already a probability /
+#     the deployed gate's stored output) -- never re-fit.
+#   - `decomposed`: the L2-logistic refit's held-out prediction, i.e. each
+#     half's rows scored by the OTHER half's fitted weights (`_fit_decomposed`
+#     already computes exactly this; `_score_one_arm` pools it into
+#     `held_out_records`).
+# `held_out_records` (`_score_one_arm`'s output) is therefore already the
+# clause-2 score for every arm, in the shape `{"id", "label", "score",
+# "decision"}` -- `decision` is that row's accept/reject at the SAME p95
+# operating point `coverage_at_p95` was judged at (clause 3), or `False`
+# when no fit-half threshold reached 0.95 precision.
+# ---------------------------------------------------------------------------
+
+
+def _decomposed_row_score(row: dict, weights_dict: dict | None) -> float | None:
+    """Apply a fitted decomposed-composite `weights_dict` (as stored in
+    `decomposed_fit[direction]["weights"]`, an ordered {"intercept": ...,
+    <feature>: ...} map) to `row`'s own noul sub-answers. Returns `None` if
+    there are no weights to apply, or `row` is missing one of the fitted
+    feature keys -- never a fabricated score."""
+    if not weights_dict:
+        return None
+    feature_names = [key for key in weights_dict if key != "intercept"]
+    answers = row.get("answers")
+    if not isinstance(answers, dict):
+        return None
+    try:
+        x = np.array([[float(answers[name]["noul"]) for name in feature_names]])
+    except (KeyError, TypeError):
+        return None
+    weights = np.array([weights_dict["intercept"]] + [weights_dict[name] for name in feature_names])
+    return float(_predict_logreg(x, weights)[0])
+
+
+def stability_at_p95(
+    run1_rows: list, run2_rows: list, half_a_ids: set, half_b_ids: set,
+    p95_thresholds: dict, decomposed_weights: dict | None = None,
+) -> dict:
+    """Amended rule clause 7 (replaces `run_agreement >= 0.95`): run 1 vs
+    run 2 decisions at the SAME held-out p95 operating point coverage was
+    judged at -- never the accuracy-maximising threshold `run_agreement`/
+    `_run_agreement_split` use. `p95_thresholds` = `{"a_to_b": ..., "b_to_a":
+    ...}` (a half-A id is judged by the threshold fit on B, i.e.
+    `p95_thresholds["b_to_a"]`, and vice versa -- mirrors `_run_agreement_split`).
+
+    For the decomposed arm, `decomposed_weights` (same shape, each value the
+    `weights` dict that direction's fit produced, or `None` if that
+    direction had no fit) must be passed so run 2's rows are scored through
+    the SAME fitted composite run 1's fit half produced -- never run 2's own
+    v0 composite `score` (clause 2/g). For every other arm, `decomposed_
+    weights=None` and both runs' raw `score` fields are compared directly.
+
+    Also reports `identical_answer_fraction` -- the fraction of common ids
+    whose `answers` were byte-identical across runs (a provider cache would
+    make this 1.0, which is itself a finding, per the brief)."""
+    usable1 = {r["id"]: r for r in _usable_rows(run1_rows)}
+    usable2 = {r["id"]: r for r in _usable_rows(run2_rows)}
+    common_ids = sorted(set(usable1) & set(usable2), key=str)
+
+    if not common_ids:
+        return {
+            "flips": None, "n": 0, "allowed_flips": None, "pass": None,
+            "identical_answer_fraction": None,
+            "reason": "no overlapping usable ids between runs",
+        }
+
+    flips = 0
+    n_scored = 0
+    identical = 0
+    for id_ in common_ids:
+        if id_ in half_a_ids:
+            threshold = p95_thresholds.get("b_to_a")  # fit on B, scores A
+            weights = (decomposed_weights or {}).get("b_to_a") if decomposed_weights is not None else None
+        elif id_ in half_b_ids:
+            threshold = p95_thresholds.get("a_to_b")  # fit on A, scores B
+            weights = (decomposed_weights or {}).get("a_to_b") if decomposed_weights is not None else None
+        else:
+            continue
+        if threshold is None:
+            continue
+
+        r1, r2 = usable1[id_], usable2[id_]
+        if decomposed_weights is not None:
+            score1 = _decomposed_row_score(r1, weights)
+            score2 = _decomposed_row_score(r2, weights)
+            if score1 is None or score2 is None:
+                continue
+        else:
+            score1, score2 = r1["score"], r2["score"]
+
+        decision1 = score1 >= threshold
+        decision2 = score2 >= threshold
+        if decision1 != decision2:
+            flips += 1
+        n_scored += 1
+        if r1.get("answers") == r2.get("answers"):
+            identical += 1
+
+    if n_scored == 0:
+        return {
+            "flips": None, "n": 0, "allowed_flips": None, "pass": None,
+            "identical_answer_fraction": None,
+            "reason": "no common ids had an out-of-sample p95 threshold available",
+        }
+
+    allowed = max(1, math.floor(0.05 * n_scored))
+    return {
+        "flips": flips,
+        "n": n_scored,
+        "allowed_flips": allowed,
+        "pass": flips <= allowed,
+        "identical_answer_fraction": identical / n_scored,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Clause 1 (eligibility, replaces clause f): >= 20 usable rows of EACH class,
+# for BOTH the Jev arm being judged and the baseline it is compared against
+# -- a set is not eligible for a verdict just because one side clears the
+# bar while the other is thin.
+# ---------------------------------------------------------------------------
+
+def _eligibility(jev_arm_result: dict, baseline_arm_result: dict) -> dict:
+    counts = {
+        "jev_n_yes": jev_arm_result.get("n_yes", 0),
+        "jev_n_no": jev_arm_result.get("n_no", 0),
+        "baseline_n_yes": baseline_arm_result.get("n_yes", 0),
+        "baseline_n_no": baseline_arm_result.get("n_no", 0),
+    }
+    eligible = all(v >= ELIGIBILITY_MIN_PER_CLASS for v in counts.values())
+    reason = None
+    if not eligible:
+        detail = ", ".join(f"{key}={value}" for key, value in counts.items())
+        reason = (
+            f"fewer than {ELIGIBILITY_MIN_PER_CLASS} usable rows of some class ({detail})"
+        )
+    return {"eligible": eligible, "reason": reason, **counts}
+
+
+# ---------------------------------------------------------------------------
+# Clauses 4/5: precision floor + seeded paired bootstrap over held-out rows.
+# ---------------------------------------------------------------------------
+
+def _coverage_and_precision(records: dict, ids: list) -> tuple:
+    accepted = 0
+    positive = 0
+    total = 0
+    for id_ in ids:
+        rec = records[id_]
+        total += 1
+        if rec["decision"]:
+            accepted += 1
+            if rec["label"] == "yes":
+                positive += 1
+    if total == 0:
+        return 0.0, None
+    coverage = accepted / total
+    precision = (positive / accepted) if accepted > 0 else None
+    return coverage, precision
+
+
+def _floored_coverage(records: dict, ids: list) -> tuple:
+    """(coverage-or-0, precision, floor_met) -- clause 4: below the 0.90
+    precision floor, the arm's coverage counts as 0 for the verdict."""
+    coverage, precision = _coverage_and_precision(records, ids)
+    floor_met = precision is not None and precision >= PRECISION_FLOOR
+    return (coverage if floor_met else 0.0), precision, floor_met
+
+
+def _bootstrap_coverage_diff(
+    jev_records: dict, baseline_records: dict,
+    n_reps: int = BOOTSTRAP_REPS, seed: int = BOOTSTRAP_SEED,
+) -> dict:
+    """Clause 5: a seeded paired bootstrap over row ids (2000 reps, seed
+    fixed and recorded) of `coverage_Jev - coverage_baseline`, resampling the
+    pooled held-out predictions and recomputing coverage AND the precision
+    floor (clause 4) inside every rep -- an arm whose resampled precision
+    falls below 0.90 in a given rep contributes 0 coverage for that rep, not
+    its raw (possibly noise-inflated) coverage number."""
+    jev_records = {k: v for k, v in jev_records.items() if v is not None}
+    baseline_records = {k: v for k, v in baseline_records.items() if v is not None}
+    common_ids = sorted(set(jev_records) & set(baseline_records), key=str)
+
+    if not common_ids:
+        return {
+            "point_estimate": None, "ci_90": [None, None], "n": 0,
+            "n_reps": n_reps, "seed": seed,
+            "jev_precision_floor_met": False, "baseline_precision_floor_met": False,
+            "reason": "no overlapping held-out ids between the two arms",
+        }
+
+    jev_point_cov, jev_precision, jev_floor_met = _floored_coverage(jev_records, common_ids)
+    base_point_cov, base_precision, base_floor_met = _floored_coverage(baseline_records, common_ids)
+    point_estimate = jev_point_cov - base_point_cov
+
+    rng = np.random.default_rng(seed)
+    n = len(common_ids)
+    ids_arr = np.array(common_ids, dtype=object)
+    diffs = np.empty(n_reps)
+    for i in range(n_reps):
+        sample_ids = ids_arr[rng.integers(0, n, size=n)].tolist()
+        jc, _, _ = _floored_coverage(jev_records, sample_ids)
+        bc, _, _ = _floored_coverage(baseline_records, sample_ids)
+        diffs[i] = jc - bc
+    lo, hi = np.percentile(diffs, [5.0, 95.0])
+
+    return {
+        "point_estimate": float(point_estimate),
+        "ci_90": [float(lo), float(hi)],
+        "n": n, "n_reps": n_reps, "seed": seed,
+        "jev_coverage": float(jev_point_cov), "baseline_coverage": float(base_point_cov),
+        "jev_precision": jev_precision, "baseline_precision": base_precision,
+        "jev_precision_floor_met": jev_floor_met,
+        "baseline_precision_floor_met": base_floor_met,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Clause 6: paired Brier (replaces ECE10 <= 0.10).
+# ---------------------------------------------------------------------------
+
+def _bootstrap_brier_diff(
+    jev_records: dict, baseline_records: dict,
+    n_reps: int = BOOTSTRAP_REPS, seed: int = BOOTSTRAP_SEED,
+) -> dict:
+    """Clause 6: paired Brier_Jev - Brier_baseline on the SAME held-out rows
+    (never each arm's full, differently-failed set), point estimate plus the
+    bootstrap 90% CI of the difference -- same seeded paired resampling as
+    the coverage-difference bootstrap."""
+    jev_records = {k: v for k, v in jev_records.items() if v is not None}
+    baseline_records = {k: v for k, v in baseline_records.items() if v is not None}
+    common_ids = sorted(set(jev_records) & set(baseline_records), key=str)
+
+    if not common_ids:
+        return {
+            "point_estimate": None, "ci_90": [None, None], "n": 0,
+            "n_reps": n_reps, "seed": seed,
+            "reason": "no overlapping held-out ids between the two arms",
+        }
+
+    def _label_bit_of(rec):
+        return 1.0 if rec["label"] == "yes" else 0.0
+
+    jev_brier = np.array([(jev_records[i]["score"] - _label_bit_of(jev_records[i])) ** 2 for i in common_ids])
+    base_brier = np.array(
+        [(baseline_records[i]["score"] - _label_bit_of(baseline_records[i])) ** 2 for i in common_ids]
+    )
+    point_estimate = float(np.mean(jev_brier) - np.mean(base_brier))
+
+    rng = np.random.default_rng(seed)
+    n = len(common_ids)
+    diffs = np.empty(n_reps)
+    for i in range(n_reps):
+        idx = rng.integers(0, n, size=n)
+        diffs[i] = np.mean(jev_brier[idx]) - np.mean(base_brier[idx])
+    lo, hi = np.percentile(diffs, [5.0, 95.0])
+
+    return {
+        "point_estimate": point_estimate,
+        "ci_90": [float(lo), float(hi)],
+        "n": n, "n_reps": n_reps, "seed": seed,
+        "jev_brier": float(np.mean(jev_brier)), "baseline_brier": float(np.mean(base_brier)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Clause 9: the verdict, applied mechanically.
+# ---------------------------------------------------------------------------
+
+def _compute_arm_verdict(jev_arm_key: str, scores: dict) -> dict:
+    """Runs clauses 1-9 for one Jev arm (`jev_arm_key`) against `baseline`.
+    Used for `decomposed` (the rule's subject -- drives `verdict()`'s
+    top-level result) and, per the brief, for `broad` too (reported
+    alongside using the same machinery, but never overriding the top-level
+    verdict, which is `decomposed`'s alone)."""
+    if jev_arm_key not in scores or "baseline" not in scores:
+        return {
+            "verdict": "descriptive_only",
+            "reasons": [f"missing {jev_arm_key!r} or 'baseline' arm in scores"],
+            "eligibility": None, "control": None,
+            "coverage_diff": None, "brier": None, "stability": None,
+        }
+
+    jev = scores[jev_arm_key]
+    baseline = scores["baseline"]
+    reasons: list = []
+
+    eligibility = _eligibility(jev, baseline)
+    if not eligibility["eligible"]:
+        return {
+            "verdict": "descriptive_only",
+            "reasons": [eligibility["reason"]],
+            "eligibility": eligibility, "control": None,
+            "coverage_diff": None, "brier": None, "stability": None,
+        }
+
+    control = scores.get("_control_checks", {}).get(jev_arm_key)
+    control_result = control["result"] if control else "unreachable"
+    control_pass = control_result == "pass"
+    if not control_pass:
+        reasons.append(f"control check for {jev_arm_key!r}: {control_result!r} (need 'pass')")
+
+    jev_records = {rec["id"]: rec for rec in jev.get("held_out_records", [])}
+    base_records = {rec["id"]: rec for rec in baseline.get("held_out_records", [])}
+
+    coverage_diff = _bootstrap_coverage_diff(jev_records, base_records)
+    # Clause 4 gates the JEV arm's own operating point -- an accepted
+    # decision must actually meet the deployed precision bar to be worth
+    # replacing/augmenting anything with. The baseline's floor is not a
+    # verdict condition in its own right: when the baseline misses it, its
+    # coverage is correctly counted as 0 inside the diff (clause 4/5), and
+    # the coverage-difference CI (not a second floor check) is what decides
+    # whether that makes Jev look better for a real reason or by noise.
+    precision_floor_met = bool(coverage_diff.get("jev_precision_floor_met"))
+    if not precision_floor_met:
+        reasons.append(
+            f"held-out precision floor (>= {PRECISION_FLOOR}) not met by {jev_arm_key!r}"
+        )
+
+    brier = _bootstrap_brier_diff(jev_records, base_records)
+    brier_pass = brier.get("point_estimate") is not None and brier["point_estimate"] <= 0
+    if brier.get("point_estimate") is None:
+        reasons.append("paired Brier undefined: no overlapping held-out ids between the arms")
+
+    stability = jev.get("stability", {}) or {}
+    stability_pass = stability.get("pass") is True
+    if not stability_pass:
+        reasons.append("stability check failed or undefined (flips exceed the allowance)")
+
+    ci_lower = (coverage_diff.get("ci_90") or [None, None])[0]
+    coverage_point = coverage_diff.get("point_estimate")
+    coverage_ci_lower_positive = ci_lower is not None and ci_lower > 0
+    coverage_point_nonneg = coverage_point is not None and coverage_point >= 0
+
+    if control_pass and precision_floor_met and coverage_ci_lower_positive and brier_pass and stability_pass:
+        result = "replace"
+    elif control_pass and precision_floor_met and coverage_point_nonneg and stability_pass:
+        result = "augment"
+        if not brier_pass:
+            reasons.append("paired Brier condition failed (allowed for augment)")
+    else:
+        result = "not_adopted"
+        if control_pass and precision_floor_met and coverage_point is not None and not coverage_point_nonneg:
+            reasons.append("coverage-difference point estimate < 0")
+
+    return {
+        "verdict": result,
+        "reasons": reasons,
+        "eligibility": eligibility,
+        "control": control,
+        "coverage_diff": coverage_diff,
+        "brier": brier,
+        "stability": stability,
+    }
+
+
+def verdict(scores: dict) -> dict:
+    """Clause 9, applied mechanically. `scores` is `score_set(...)`'s own
+    output. The Jev arm judged is `decomposed` (the rule's subject); `broad`
+    is computed the same way and reported alongside under
+    `inputs["broad"]`, per the brief, but never changes the top-level
+    `verdict`/`reasons`, which are `decomposed`'s alone."""
+    decomposed_inputs = _compute_arm_verdict("decomposed", scores)
+    broad_inputs = _compute_arm_verdict("broad", scores) if "broad" in scores else None
+    return {
+        "verdict": decomposed_inputs["verdict"],
+        "reasons": decomposed_inputs["reasons"],
+        "inputs": {"decomposed": decomposed_inputs, "broad": broad_inputs},
+    }

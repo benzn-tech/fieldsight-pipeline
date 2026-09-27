@@ -755,12 +755,41 @@ def _print_score_table(all_scores: dict) -> None:
         for arm, metrics in payload["scores"].items():
             if arm == "_control_checks":
                 continue
+            pooled = (metrics.get("coverage_at_p95") or {}).get("pooled") or {}
             print(
                 f"  {arm:22s} n={metrics.get('n')!s:>4}  "
                 f"n_failed={metrics.get('n_failed')!s:>4}  "
+                f"n_yes={metrics.get('n_yes')!s:>3}  n_no={metrics.get('n_no')!s:>3}  "
                 f"accuracy={metrics.get('accuracy')}  "
                 f"precision={metrics.get('precision')}  "
-                f"recall={metrics.get('recall')}"
+                f"recall={metrics.get('recall')}  "
+                f"held_out_coverage={pooled.get('coverage')}  "
+                f"held_out_precision={pooled.get('precision')}"
+            )
+
+        verdict_obj = payload.get("verdict") or {}
+        print(f"  -- verdict (decomposed vs baseline): {verdict_obj.get('verdict')} --")
+        for reason in verdict_obj.get("reasons", []):
+            print(f"     reason: {reason}")
+
+        for arm_name, arm_inputs in (verdict_obj.get("inputs") or {}).items():
+            if not arm_inputs:
+                continue
+            elig = arm_inputs.get("eligibility") or {}
+            control = arm_inputs.get("control") or {}
+            cov = arm_inputs.get("coverage_diff") or {}
+            brier = arm_inputs.get("brier") or {}
+            stability = arm_inputs.get("stability") or {}
+            print(
+                f"     [{arm_name}] arm_verdict={arm_inputs.get('verdict')}  "
+                f"eligible={elig.get('eligible')}  "
+                f"control={control.get('result') if control else None}  "
+                f"coverage_diff_point={cov.get('point_estimate')}  "
+                f"coverage_diff_ci90={cov.get('ci_90')}  "
+                f"paired_brier_diff_point={brier.get('point_estimate')}  "
+                f"paired_brier_diff_ci90={brier.get('ci_90')}  "
+                f"stability_flips={stability.get('flips')}/{stability.get('allowed_flips')}  "
+                f"identical_answers_fraction={stability.get('identical_answer_fraction')}"
             )
 
 
@@ -858,6 +887,7 @@ def _run_score(sets: list, args) -> int:
             "scores": scores,
             "baseline_threshold": BASELINE_THRESHOLDS[set_name],
             "provenance": _provenance_for_set(set_name),
+            "verdict": score_mod.verdict(scores),
         }
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)

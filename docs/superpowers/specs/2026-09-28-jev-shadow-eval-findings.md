@@ -23,14 +23,90 @@ plan's arm list and is not scored under this rule unless a later addendum adds i
 
 ## 2. Pre-registered decision rule
 
-Plan text, verbatim (`docs/superpowers/plans/2026-09-24-track-a-jev-shadow-eval.md`, Task 8
-Step 1):
+**Amended 2026-09-28, before any result exists.** Reason: an independent review found the
+original rule runs backwards at these sizes -- see the review's measured evidence below. Owner
+decision (2026-09-28): amend the rule now, while no results exist yet, per
+`.superpowers/sdd/2026-09-24-track-a-jev-shadow-eval/wave1-brief.md`. The original wording is
+kept below as a historical, superseded block; it is not the operative rule.
 
+> **Original wording (superseded 2026-09-28 before any result, reason: independent review)**
+>
 > Jev (decomposed) **replaces** today's gate on a set only if, on the held-out half:
 > coverage_at_p95 ≥ the baseline's coverage_at_p95, AND run_agreement ≥ 0.95, AND ECE10 ≤ 0.10,
 > AND the control check passes. Jev **augments** the gate (runs alongside as an extra signal in
 > `decision_records`, Track C) if it meets two of the three numeric conditions. Otherwise it is
 > **not adopted** for that set and the finding is recorded with the numbers.
+> (`docs/superpowers/plans/2026-09-24-track-a-jev-shadow-eval.md`, Task 8 Step 1, verbatim.)
+
+**Why the original wording was unreliable (independent review, Monte-Carlo with `score.py`'s own
+functions, at n <= 130):**
+
+- ECE10 <= 0.10 runs backwards: a perfectly calibrated model passes 0.3% at n=26, 25% at n=65; a
+  near-constant base-rate model (no real discrimination at all) passes 63% at n=26.
+- "Augment = 2 of 3 numeric conditions" is reachable by noise (an uninformative model passes
+  ECE + run_agreement together 44% of the time at n=100) and does not require the control check
+  to pass at all.
+- coverage_at_p95 had no held-out precision floor: held-out precision at the fit-half p95
+  threshold has median 0.83, p10 0.00, at n=26 -- "0.95 on the fit half" said nothing reliable
+  about held-out precision.
+- The coverage point comparison alone is too noisy to read (10-90% spread ~0.2 at n=100; 0 on
+  15-23% of draws at n=26); "Jev >= baseline" is trivially true whenever the baseline lands on 0.
+- run_agreement was measured at the accuracy-maximising threshold, not the p95 operating point
+  the rest of the rule is judged at.
+- For the decomposed arm specifically, coverage read the L2 logistic refit's held-out prediction
+  while ECE and run_agreement read the stored v0 composite score (not a probability) -- three
+  different numbers about three different scores, read as if they were one model.
+
+### The amended (operative) rule
+
+1. **Eligibility (replaces clause f below):** a set gets a verdict only if the scored rows for
+   BOTH the Jev arm being judged (`decomposed`) and the `baseline` arm contain at least **20 of
+   EACH class**. Below that, the set is descriptive only -- no replace/augment/not-adopted
+   verdict is drawn. (Implemented: `score.py`'s `_eligibility`, `ELIGIBILITY_MIN_PER_CLASS = 20`.)
+2. **Scores:** every gate for an arm reads ONE score per row -- the cross-fit held-out
+   probability (`score.py`'s `held_out_records`, per arm). For `broad` that is `broad_score`
+   (already a probability, read directly, never re-fit). For `decomposed` it is the L2-logistic
+   refit's held-out prediction: each split half's rows are scored by the OTHER half's fitted
+   composite weights (never the row's own stored v0 composite `score`). For `baseline` it is the
+   stored/produced baseline score, read directly (the deployed gate is not re-fit here either).
+   The v0 composite stays reported (`decomposed_fit.v0_unfitted`) as descriptive only.
+3. **Operating point (unchanged):** for each arm and each direction, the threshold is the lowest
+   threshold whose precision on the FIT half is >= 0.95.
+4. **Precision floor:** the Jev arm's (`decomposed`'s) pooled held-out precision at that
+   operating point must be >= 0.90. Below it, that arm's coverage counts as 0 for the verdict --
+   this is not a second independent gate on the baseline arm; a baseline that misses its own
+   floor is correctly counted as 0 coverage inside the comparison in clause 5, and the
+   coverage-difference CI (not a second floor check) decides whether that makes Jev look better
+   for a real reason or by noise. (`score.py`: `PRECISION_FLOOR = 0.90`, `_floored_coverage`.)
+5. **Coverage comparison:** a seeded paired bootstrap over row ids (2000 reps, seed fixed and
+   recorded -- `score.py`'s `BOOTSTRAP_REPS`/`BOOTSTRAP_SEED`) of `coverage_Jev -
+   coverage_baseline`. Rather than recomputing the cross-fit inside each rep, it resamples the
+   pooled held-out predictions (each row's held-out score and its operating-point decision) and
+   recomputes coverage and the precision floor (clause 4) per rep. Reports the point estimate and
+   the 90% CI. (`score.py`'s `_bootstrap_coverage_diff`.)
+6. **Calibration (replaces ECE10 <= 0.10):** paired Brier, `Brier_Jev <= Brier_baseline`, on the
+   SAME held-out rows (point estimate; also reports the bootstrap 90% CI of the difference, same
+   seeded paired resampling as clause 5). ECE10 stays reported as descriptive only.
+   (`score.py`'s `_bootstrap_brier_diff`.)
+7. **Stability (replaces run_agreement >= 0.95):** run 1 vs run 2 decisions at the SAME held-out
+   p95 operating point coverage was judged at (never the accuracy-maximising threshold the old
+   `run_agreement` metric uses); count flips; pass if flips <= max(1, 5% of n). Also reports the
+   fraction of rows whose `answers` were byte-identical across runs (a provider cache would make
+   this 1.0, which is itself a finding). (`score.py`'s `stability_at_p95`.)
+8. **Control (unchanged mechanics):** mean score on label=="yes" rows, real arm minus its paired
+   control arm, pass only if the difference is >= `CONTROL_MARGIN = 0.2`. "Unreachable" or "fail"
+   both mean NOT ADOPTED for that set (no augment either).
+9. **Verdict**, applied mechanically (`score.py`'s `verdict()`):
+   - **REPLACE** if: eligible, control passes, precision floor met, coverage-difference 90% CI
+     lower bound > 0, paired Brier condition met, stability passes.
+   - **AUGMENT** if: eligible, control passes, precision floor met, coverage-difference point
+     estimate >= 0, stability passes (the paired Brier condition may fail).
+   - Otherwise **NOT ADOPTED**.
+10. Clauses on failed rows (never scored as 0), provenance, and the 20-largest-disagreements
+    human read (below, unchanged from the original rule) still apply.
+
+`verdict()`'s Jev arm is `decomposed` (the rule's subject); `broad` is run through the same
+machinery and reported alongside for comparison, but never changes the top-level verdict.
 
 Operational definitions (controller, binding for how `scripts/jev_eval/score.py` output is
 read):
@@ -73,10 +149,12 @@ e. **Baseline arm thresholds** are the deployed production gates, not re-tuned f
      `non_work`; `1 - confidence` when it is `work`, matching the human label convention where
      "yes" means non-work, per `scripts/jev_eval/baseline.py` and `export_labels.py`).
 
-f. **n < 30 labelled rows, or fewer than 5 rows of either class**, makes a set descriptive
-   only: the numbers in Section 5 are reported as-is, but no replace/augment/not-adopted
-   verdict is drawn for that set under this rule. This is a hard gate applied before clauses
-   a–d are read as a decision, not a note added after the fact.
+f. **Superseded 2026-09-28 -- see Section 2's amended clause 1.** Original wording: "n < 30
+   labelled rows, or fewer than 5 rows of either class, makes a set descriptive only." The
+   operative eligibility rule is now: a set gets a verdict only if the scored rows for BOTH the
+   Jev arm being judged and the baseline arm contain at least 20 of EACH class. This is a hard
+   gate applied before the rest of the rule is read as a decision, not a note added after the
+   fact.
 
 g. **Rows whose call failed** (`error` set or `score` is `None` in the row contract) are
    excluded from every metric and counted separately as `n_failed` for that arm/run. They are
@@ -92,9 +170,9 @@ h. **Provenance is mandatory.** Every results row in Section 5 carries provider,
    temperature/question-hash recorded, so the data could not prove what produced it).
 
 i. **A person reads the 20 largest Jev-vs-baseline disagreements per set** (Task 8 Step 3)
-   before any verdict from clauses a–f is acted on — i.e. before a set is actually switched to
-   "replace" or "augment" in Track C. A number alone, however clean, is not a decision input
-   until this read has happened for that set.
+   before any verdict from the amended rule (Section 2) is acted on — i.e. before a set is
+   actually switched to "replace" or "augment" in Track C. A number alone, however clean, is not
+   a decision input until this read has happened for that set.
 
 ---
 
@@ -102,14 +180,14 @@ i. **A person reads the 20 largest Jev-vs-baseline disagreements per set** (Task
 
 Source: controller's read-only, rolled-back RDS Data API queries, 2026-09-27.
 
-| Set | Env | Decided | Pending | Class breakdown | Status under clause (f) |
+| Set | Env | Decided | Pending | Class breakdown | Status under the amended eligibility rule (>= 20 of EACH class, both arms) |
 |---|---|---|---|---|---|
-| `programme_match` | TEST | 0 | 1 | — | Descriptive only (n=0 < 30) |
-| `programme_match` | prod | 0 | 1 | — | Descriptive only (n=0 < 30) |
-| `threads` | TEST | 0 | 1 | — | Descriptive only (n=0 < 30) |
-| `threads` | prod | 26 | — | 5 confirmed / 21 rejected | Descriptive only (n=26 < 30; also confirmed=5 is at the minimum-class floor, not comfortably above it) |
-| `work_class` | TEST | 7 | — | 7 `missed_personal` (all one class) | Descriptive only (n=7 < 30; 0 rows of the other class) |
-| `work_class` | prod | 27 | — | 14 `confirm_non_work` + 13 `missed_personal` = 27 "is non-work"; 0 `reject_is_work` | Descriptive only (n=27 < 30; 0 rows of the other class) |
+| `programme_match` | TEST | 0 | 1 | — | Descriptive only (0 rows of either class) |
+| `programme_match` | prod | 0 | 1 | — | Descriptive only (0 rows of either class) |
+| `threads` | TEST | 0 | 1 | — | Descriptive only (0 rows of either class) |
+| `threads` | prod | 26 | — | 5 confirmed / 21 rejected | Descriptive only (confirmed=5 < 20) |
+| `work_class` | TEST | 7 | — | 7 `missed_personal` (all one class) | Descriptive only (7 < 20; 0 rows of the other class) |
+| `work_class` | prod | 27 | — | 14 `confirm_non_work` + 13 `missed_personal` = 27 "is non-work"; 0 `reject_is_work` | Descriptive only (0 rows of the other class < 20) |
 | `name_aliases` | TEST | 0 | — | — | Not scored under this rule (not in plan's arm list); descriptive if used |
 | `name_aliases` | prod | 4 | — | 4, all `kind='other'` | Not scored under this rule; also 0 class diversity |
 
@@ -123,14 +201,15 @@ structurally 0, so precision is trivially 1.0 whenever the arm predicts anything
 all (and `None` only when it predicts nothing positive). A trivial 1.0 says nothing about the
 classifier. `coverage_at_p95`, which is built on precision crossing the 0.95 target, inherits
 this: it says nothing meaningful until work-labelled negatives exist. The set stays descriptive
-only under clause (f) either way, regardless of which metrics happen to be well-defined — this
-is unchanged by the owner's 2026-09-27 decision (below); it is why that decision calls for a new
-owner-labelled batch with both classes rather than treating the existing labels as sufficient.
+only under the amended eligibility rule either way, regardless of which metrics happen to be
+well-defined — this is unchanged by the owner's 2026-09-27 decision (below); it is why that
+decision calls for a new owner-labelled batch with both classes rather than treating the
+existing labels as sufficient.
 
 **Owner decision, 2026-09-27:** rather than pausing labelling, the owner chose to build a new,
 owner-labelled batch (planned as Task 10) with balanced classes. The existing prod labels
 above are a descriptive dry run only — not inputs to a replace/augment/not-adopted verdict, per
-clause (f), and not to be treated as if they were.
+the amended eligibility rule, and not to be treated as if they were.
 
 ---
 

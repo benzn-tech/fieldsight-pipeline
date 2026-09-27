@@ -430,3 +430,220 @@ def test_decomposed_direction_single_class_fit_half_returns_none_with_reason():
     assert result["p95"]["threshold"] is None
     assert "reason" in result["p95"]
     assert result["weights"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 1: amended decision rule (2026-09-28 findings-doc amendment).
+# TDD case (b): a near-constant, base-rate-only model is exactly the case
+# the ORIGINAL rule passed (Monte-Carlo: 63% at n=26) -- it must now come
+# back "not_adopted" under the amended rule (precision floor / coverage-diff
+# CI / control all reject a model with no real discrimination).
+# ---------------------------------------------------------------------------
+
+def _constant_rows(arm, n_per_class=25, base_score=0.5, jitter=0.0, id_prefix="row"):
+    """`n_per_class` yes rows and `n_per_class` no rows, all scored at
+    (near-)`base_score` regardless of label -- a model with no real
+    discrimination between the classes. `id_prefix` defaults to a shared
+    scheme so different arms scoring the SAME underlying rows share ids
+    (required for the paired coverage/Brier comparisons)."""
+    rows_run1, rows_run2 = [], []
+    i = 0
+    for label in ("yes", "no"):
+        for k in range(n_per_class):
+            row_id = f"{id_prefix}-{label}-{k}"
+            # Deterministic tiny jitter so scores aren't bit-identical, but
+            # carries no information about the label.
+            delta = jitter * (1 if (i % 2 == 0) else -1)
+            score = base_score + delta
+            answers = {
+                "same_work_item": {"noul": 0.5},
+                "task_named": {"noul": 0.5},
+                "same_trade": {"noul": 0.5},
+            }
+            rows_run1.append(_row(row_id, label, score, run=1, arm=arm, answers=answers))
+            rows_run2.append(_row(row_id, label, score, run=2, arm=arm, answers=answers))
+            i += 1
+    return rows_run1, rows_run2
+
+
+def test_verdict_near_constant_model_is_not_adopted():
+    base_r1, base_r2 = _constant_rows("baseline", base_score=0.5, jitter=0.001)
+    dec_r1, dec_r2 = _constant_rows("decomposed", base_score=0.5, jitter=0.001)
+    ctrl_r1, ctrl_r2 = _constant_rows("control_decomposed", base_score=0.48, jitter=0.001)
+
+    rows_by_arm_run = {
+        "baseline": {1: base_r1, 2: base_r2},
+        "decomposed": {1: dec_r1, 2: dec_r2},
+        "control_decomposed": {1: ctrl_r1, 2: ctrl_r2},
+    }
+    scores = score_module.score_set(rows_by_arm_run, {"baseline": "fit"})
+    result = score_module.verdict(scores)
+
+    assert result["verdict"] == "not_adopted"
+    assert result["reasons"], "not_adopted must carry at least one reason"
+
+
+# ---------------------------------------------------------------------------
+# TDD case (a): an informative, well-calibrated decomposed model clearly
+# beats a weak (coin-flip) baseline -> replace.
+# ---------------------------------------------------------------------------
+
+def _informative_decomposed_rows(arm, n_per_class=25, base_flip_rate=0.0, seed=0, id_prefix="row"):
+    """Rows whose noul sub-answers (and hence the fitted composite) strongly
+    separate the classes, and whose stored `score` mirrors that separation
+    -- deterministic across calls. Shares `id_prefix`'s scheme with
+    `_constant_rows` so different arms scoring the SAME underlying rows
+    share ids (required for the paired coverage/Brier comparisons)."""
+    rows_run1, rows_run2 = [], []
+    i = 0
+    for label in ("yes", "no"):
+        for k in range(n_per_class):
+            row_id = f"{id_prefix}-{label}-{k}"
+            val = 1.0 if label == "yes" else 0.0
+            score = 0.92 if label == "yes" else 0.05
+            answers = {
+                "same_work_item": {"noul": val},
+                "task_named": {"noul": val},
+                "same_trade": {"noul": 0.5},
+            }
+            rows_run1.append(_row(row_id, label, score, run=1, arm=arm, answers=answers))
+            # Run 2: tiny, label-preserving jitter -- same decisions, near-
+            # identical answers (not a provider cache, but stable).
+            score2 = min(1.0, max(0.0, score + (0.01 if i % 2 == 0 else -0.01)))
+            rows_run2.append(_row(row_id, label, score2, run=2, arm=arm, answers=answers))
+            i += 1
+    return rows_run1, rows_run2
+
+
+def test_verdict_informative_model_beats_weak_baseline_is_replace():
+    base_r1, base_r2 = _constant_rows("baseline", base_score=0.5, jitter=0.001)
+    dec_r1, dec_r2 = _informative_decomposed_rows("decomposed")
+    # Control state must NOT reproduce the real signal -- constant, close to
+    # the overall base rate, well under the real arm's mean on yes rows.
+    ctrl_r1, ctrl_r2 = _constant_rows("control_decomposed", base_score=0.3, jitter=0.001)
+
+    rows_by_arm_run = {
+        "baseline": {1: base_r1, 2: base_r2},
+        "decomposed": {1: dec_r1, 2: dec_r2},
+        "control_decomposed": {1: ctrl_r1, 2: ctrl_r2},
+    }
+    scores = score_module.score_set(rows_by_arm_run, {"baseline": "fit"})
+    result = score_module.verdict(scores)
+
+    assert result["verdict"] == "replace", result["reasons"]
+
+
+# ---------------------------------------------------------------------------
+# TDD case (c): control fails -> not_adopted even when the numeric gates
+# (coverage, precision floor, Brier, stability) all pass.
+# ---------------------------------------------------------------------------
+
+def test_verdict_control_fail_is_not_adopted_even_with_good_numerics():
+    base_r1, base_r2 = _constant_rows("baseline", base_score=0.5, jitter=0.001)
+    dec_r1, dec_r2 = _informative_decomposed_rows("decomposed")
+    # Control reproduces the SAME separation as the real arm -- the model is
+    # reading something present even in the donor-substituted state, so the
+    # margin (real_mean - control_mean on label=='yes' rows) fails.
+    ctrl_r1, ctrl_r2 = _informative_decomposed_rows("control_decomposed")
+
+    rows_by_arm_run = {
+        "baseline": {1: base_r1, 2: base_r2},
+        "decomposed": {1: dec_r1, 2: dec_r2},
+        "control_decomposed": {1: ctrl_r1, 2: ctrl_r2},
+    }
+    scores = score_module.score_set(rows_by_arm_run, {"baseline": "fit"})
+    assert scores["_control_checks"]["decomposed"]["result"] == "fail"
+
+    result = score_module.verdict(scores)
+    assert result["verdict"] == "not_adopted"
+    assert any("control" in reason for reason in result["reasons"])
+
+
+# ---------------------------------------------------------------------------
+# TDD case (d): fewer than 20 rows of one class -> descriptive_only.
+# ---------------------------------------------------------------------------
+
+def test_verdict_descriptive_only_below_eligibility_floor():
+    # Only 10 of each class -- under the 20-per-class eligibility floor.
+    base_r1, base_r2 = _constant_rows("baseline", n_per_class=10, base_score=0.5)
+    dec_r1, dec_r2 = _informative_decomposed_rows("decomposed", n_per_class=10)
+
+    rows_by_arm_run = {
+        "baseline": {1: base_r1, 2: base_r2},
+        "decomposed": {1: dec_r1, 2: dec_r2},
+    }
+    scores = score_module.score_set(rows_by_arm_run, {"baseline": "fit"})
+    result = score_module.verdict(scores)
+
+    assert result["verdict"] == "descriptive_only"
+    assert "20" in result["reasons"][0]
+
+
+# ---------------------------------------------------------------------------
+# TDD case (e): the bootstrap is deterministic under the fixed seed.
+# ---------------------------------------------------------------------------
+
+def test_bootstrap_coverage_diff_is_deterministic():
+    dec_r1, _ = _informative_decomposed_rows("decomposed")
+    base_r1, _ = _constant_rows("baseline", base_score=0.5, jitter=0.001)
+    rows_by_arm_run = {
+        "baseline": {1: base_r1, 2: base_r1},
+        "decomposed": {1: dec_r1, 2: dec_r1},
+    }
+    scores = score_module.score_set(rows_by_arm_run, {"baseline": "fit"})
+    jev_records = {r["id"]: r for r in scores["decomposed"]["held_out_records"]}
+    base_records = {r["id"]: r for r in scores["baseline"]["held_out_records"]}
+
+    first = score_module._bootstrap_coverage_diff(jev_records, base_records)
+    second = score_module._bootstrap_coverage_diff(jev_records, base_records)
+    assert first == second
+
+
+# ---------------------------------------------------------------------------
+# TDD case (f): stability counts flips at the p95 threshold, not the
+# accuracy-maximising threshold.
+# ---------------------------------------------------------------------------
+
+def test_stability_at_p95_uses_p95_threshold_not_accuracy_threshold():
+    half_a_ids = {"a1"}
+    half_b_ids = {"b1"}
+    # p95 threshold (fit on the OTHER half) is much higher than any
+    # accuracy-maximising threshold would be -- a1's run1/run2 scores
+    # straddle the p95 threshold (0.8) but would agree under a lower
+    # accuracy threshold (e.g. 0.5).
+    p95_thresholds = {"a_to_b": 0.5, "b_to_a": 0.8}
+    run1 = [_row("a1", "yes", 0.6, run=1), _row("b1", "yes", 0.4, run=1)]
+    run2 = [_row("a1", "yes", 0.9, run=2), _row("b1", "yes", 0.6, run=2)]
+
+    result = score_module.stability_at_p95(run1, run2, half_a_ids, half_b_ids, p95_thresholds)
+    # a1 (half A) is judged by threshold_split["b_to_a"] = 0.8:
+    #   run1=0.6 (<0.8), run2=0.9 (>=0.8) -> flip.
+    # b1 (half B) is judged by threshold_split["a_to_b"] = 0.5:
+    #   run1=0.4 (<0.5), run2=0.6 (>=0.5) -> flip.
+    assert result["flips"] == 2
+    assert result["n"] == 2
+    assert result["pass"] is False  # 2 flips > max(1, 5% of 2) = 1
+
+
+# ---------------------------------------------------------------------------
+# TDD case (g): the decomposed arm's gates all read the held-out refit
+# probability -- never the row's own stored v0 composite `score`.
+# ---------------------------------------------------------------------------
+
+def test_decomposed_held_out_records_use_refit_probability_not_v0_score():
+    dec_r1, dec_r2 = _informative_decomposed_rows("decomposed")
+    # Sabotage every row's stored v0 `score` so it disagrees with the label
+    # (and with the noul answers the refit is actually fit on).
+    for row in dec_r1 + dec_r2:
+        row["score"] = 0.999 if row["label"] == "no" else 0.001
+
+    rows_by_arm_run = {"decomposed": {1: dec_r1, 2: dec_r2}}
+    scores = score_module.score_set(rows_by_arm_run, {})
+    records = {r["id"]: r for r in scores["decomposed"]["held_out_records"]}
+
+    # The refit reads the (uncorrupted) noul answers, which still separate
+    # the classes cleanly -- so held-out scores must still track the label,
+    # not the sabotaged v0 `score` (which would show the opposite pattern).
+    yes_scores = [rec["score"] for rec in records.values() if rec["label"] == "yes"]
+    no_scores = [rec["score"] for rec in records.values() if rec["label"] == "no"]
+    assert min(yes_scores) > max(no_scores)

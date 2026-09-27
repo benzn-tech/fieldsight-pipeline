@@ -503,6 +503,11 @@ def test_score_mode_end_to_end_writes_scores_json(tmp_path, monkeypatch):
     assert "baseline" in payload["work_class"]["scores"]
     assert payload["work_class"]["scores"]["baseline"]["n"] == 8
 
+    # Amended rule (fix wave 1): --score also writes a verdict object.
+    verdict_obj = payload["work_class"]["verdict"]
+    assert verdict_obj["verdict"] == "descriptive_only"  # no decomposed arm here
+    assert "inputs" in verdict_obj and "decomposed" in verdict_obj["inputs"]
+
 
 def test_score_mode_uses_deployed_gate_threshold_for_baseline(tmp_path, monkeypatch):
     fixtures_dir = tmp_path / "jev_eval"
