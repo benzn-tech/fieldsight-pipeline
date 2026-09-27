@@ -351,10 +351,20 @@ def test_summarize_set_marks_small_n_descriptive_only():
     assert "exported_at" in counts
 
 
-def test_summarize_set_marks_thirty_plus_as_not_descriptive_only():
-    rows = [{"label": "yes"}] * 15 + [{"label": "no"}] * 15
+def test_summarize_set_marks_twenty_per_class_as_not_descriptive_only():
+    # Fix wave 4, A6: descriptive_only is now the >= 20-per-EACH-class
+    # eligibility gate (score.ELIGIBILITY_MIN_PER_CLASS), not a bare n < 30.
+    rows = [{"label": "yes"}] * 20 + [{"label": "no"}] * 20
     counts = ex.summarize_set("programme_match", rows, {}, "fieldsight_test")
     assert counts["descriptive_only"] is False
+
+
+def test_summarize_set_thirty_total_but_one_class_thin_is_still_descriptive_only():
+    # 29 yes / 1 no: n=30 (the OLD threshold) but nowhere near eligible under
+    # the amended rule -- proves this is no longer a bare n < 30 check.
+    rows = [{"label": "yes"}] * 29 + [{"label": "no"}] * 1
+    counts = ex.summarize_set("threads", rows, {}, "fieldsight_test")
+    assert counts["descriptive_only"] is True
 
 
 # ---------------------------------------------------------------------------

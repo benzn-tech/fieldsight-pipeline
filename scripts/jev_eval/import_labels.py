@@ -125,7 +125,12 @@ def refresh_counts(counts_path: Path, set_name: str, merged_rows: list) -> dict:
     entry["n"] = n
     entry["positives"] = positives
     entry["negatives"] = negatives
-    entry["descriptive_only"] = n < ex.MIN_N_FOR_CONCLUSIONS
+    # Fix wave 4, A6: matches export_labels.summarize_set's own >= 20-per-class
+    # eligibility check, not a bare n < 30.
+    entry["descriptive_only"] = (
+        positives < ex.MIN_N_PER_CLASS_FOR_CONCLUSIONS
+        or negatives < ex.MIN_N_PER_CLASS_FOR_CONCLUSIONS
+    )
     entry["label_source_breakdown"] = _label_source_breakdown(merged_rows)
     counts[set_name] = entry
     counts.setdefault("route_note", ex.ROUTE_NOTE)

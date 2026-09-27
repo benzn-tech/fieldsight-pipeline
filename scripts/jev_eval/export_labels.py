@@ -95,6 +95,7 @@ from pathlib import Path
 
 from deleted_predicates import visible_topics_predicate
 from repositories.programme_suggestions import VISIBLE as _PROGRAMME_MATCH_VISIBLE
+from scripts.jev_eval.score import ELIGIBILITY_MIN_PER_CLASS
 from scripts.verify_programme_schema import CLUSTER, SECRET
 
 DEFAULT_DATABASE = "fieldsight_test"
@@ -106,7 +107,14 @@ FIXTURES_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "jev_eval"
 
 ROUTE_NOTE = "labels exported read-only; no rows written"
 
-MIN_N_FOR_CONCLUSIONS = 30
+# Fix wave 4, A6: `descriptive_only` used to be a bare `n < 30` -- superseded
+# by the amended decision rule's own eligibility gate (score.py's
+# ELIGIBILITY_MIN_PER_CLASS, clause 1): a set needs >= 20 rows of EACH class,
+# not just 30 rows total (a 29-yes/1-no set was never eligible for a verdict
+# either way, but the old check called it descriptive only past n=30 anyway).
+# Kept as a module-level re-export (not a bare literal) so this file and
+# score.py's own eligibility constant cannot silently drift apart.
+MIN_N_PER_CLASS_FOR_CONCLUSIONS = ELIGIBILITY_MIN_PER_CLASS
 
 SETS = ("programme_match", "threads", "work_class")
 
@@ -597,7 +605,10 @@ def summarize_set(set_name: str, rows: list, exclusions: dict, database: str) ->
         "n": n,
         "positives": positives,
         "negatives": negatives,
-        "descriptive_only": n < MIN_N_FOR_CONCLUSIONS,
+        "descriptive_only": (
+            positives < MIN_N_PER_CLASS_FOR_CONCLUSIONS
+            or negatives < MIN_N_PER_CLASS_FOR_CONCLUSIONS
+        ),
         "database": database,
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "exclusions": exclusions,
