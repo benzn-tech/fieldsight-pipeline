@@ -194,6 +194,20 @@ def test_usage_logged_with_typesafe_provider_for_direct_url(monkeypatch):
     assert logged["args"][0] == "typesafe"
 
 
+def test_decisions_model_env_var_is_used_when_no_kwarg_given(monkeypatch):
+    monkeypatch.setenv("DECISIONS_MODEL", "~typesafe/jev-pinned")
+    transport = _install(monkeypatch, FakeHTTPResponse(200, _decisions_payload()))
+    client.ask("state text", {"q": {"type": "noul"}})
+    assert transport.requests[0]["body"]["model"] == "~typesafe/jev-pinned"
+
+
+def test_model_kwarg_beats_decisions_model_env_var(monkeypatch):
+    monkeypatch.setenv("DECISIONS_MODEL", "~typesafe/jev-pinned")
+    transport = _install(monkeypatch, FakeHTTPResponse(200, _decisions_payload()))
+    client.ask("state text", {"q": {"type": "noul"}}, model="~typesafe/jev-explicit")
+    assert transport.requests[0]["body"]["model"] == "~typesafe/jev-explicit"
+
+
 def test_never_logs_the_state(monkeypatch, caplog):
     with caplog.at_level("DEBUG"):
         _install(monkeypatch, FakeHTTPResponse(200, _decisions_payload()))

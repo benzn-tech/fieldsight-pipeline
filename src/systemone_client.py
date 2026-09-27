@@ -192,7 +192,11 @@ def ask(state, questions: dict, *, model=None, timeout=None, caller=None) -> dic
     # constant would freeze whichever value was set when this module first
     # imported, in this process, for the rest of the process's life.
     url = os.environ.get("DECISIONS_URL", DEFAULT_OPENROUTER_URL)
-    resolved_model = model or _default_model(url)
+    # Per-call kwarg beats the deploy's env default, which beats the route's
+    # own built-in default -- same precedence `llm_utils._call_qwen` uses for
+    # its own model override (the call knows more than the deploy, the deploy
+    # knows more than a hardcoded fallback).
+    resolved_model = model or os.environ.get("DECISIONS_MODEL") or _default_model(url)
     caller = caller or "unknown"
 
     payload = {"model": resolved_model, "state": state, "questions": questions}
