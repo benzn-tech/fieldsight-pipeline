@@ -186,6 +186,21 @@
 
 ---
 
+### Task 10: An owner-labelled batch (added 2026-09-27)
+
+**Why:** the label counts on 2026-09-27 (rolled-back reads) were TEST ≈ 0 decided in every set; prod programme_match 0, threads 26 (5 yes / 21 no), work_class 27 — all one class ("is non-work"). No set reaches 30 and work_class has no negatives. The owner chose to build labels rather than pause.
+
+**Files:**
+- Create: `scripts/jev_eval/sample_batch.py`, `scripts/jev_eval/label_page.py`, `scripts/jev_eval/import_labels.py`
+- Test: `tests/unit/test_jev_eval_label_batch.py`, and `tests/integration/` for any new SQL
+
+- [ ] **Step 1: Sample (read-only, owner-run against prod with `--allow-prod`, same begin/rollback runner as Task 1).** threads: for recent topics per site, run the REAL `repositories.threads.candidate_corpus` query shape and `thread_match.find_candidates` / `score_pair` with a lowered floor, then stratify pairs by score (above `MIN_SCORE`, just below it, low) so the batch contains hard negatives, not only the matcher's own picks. work_class: topics stratified by `work_class` and `work_confidence` (oversample low confidence), both verdicts. Exclude anything already in `topic_thread_suggestions` / `classification_feedback`. Apply the deletion predicates (Task 1's). Rows use exactly the Task 1 export shape (`features`, `baseline`), with `label: null` and `label_source: "owner"`. Default size 100 per set. programme_match is out of this batch (candidate generation needs the matcher's embedding gate; revisit only if prod has programmes with tasks).
+- [ ] **Step 2: A local labelling page.** One self-contained HTML file written next to the batch (gitignored), opened from disk: one item at a time, Yes / No / Unsure, keyboard shortcuts, progress, and a "Download labels" button that saves a JSON of `{id: yes|no|unsure}`. The page carries customer text, so it is never published or committed. Show the question in plain words per set ("Is the later topic a follow-up of the earlier one?", "Is this conversation about something other than the job?").
+- [ ] **Step 3: Import.** Merge the downloaded labels into `{set}.jsonl` (unsure dropped and counted), refresh `counts.json` with `label_source` breakdown. Re-importing is idempotent.
+- [ ] **Step 4: Tests.** Sampler SQL starts SELECT/WITH and applies the deletion predicates (integration test with a deleted topic); strata are filled; exclusions work; importer idempotent; page file contains every batch id and nothing outside the Task 1 allowlist plus the baseline block.
+
+---
+
 ## Verification (owner reads)
 
 1. `counts.json` committed with per-set n and the descriptive-only flags.
