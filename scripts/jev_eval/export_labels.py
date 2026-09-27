@@ -18,11 +18,18 @@ only `counts.json` is tracked):
   is never fed to `build_state` (kept out of `features` on purpose --
   `match_evidence` in particular can carry quoted transcript text and is
   never selected at all).
-- `name_aliases.json` -- the `{wrong_term, right_term, kind}` rows
-  `build_state`'s masker consumes, for the companies actually present in the
-  export: active `name_aliases` rows, one `kind="person"` row per user
-  mapping their full name to their first name, and one `kind="company"` row
-  per company name (protects it from the generic two-word masking pass).
+- `name_aliases.json` -- the `{wrong_term, right_term, kind}` rows (plus an
+  optional `alias_group` key -- see `build_alias_rows`) `build_state`'s
+  masker consumes, for the companies actually present in the export: active
+  `name_aliases` rows; for each user with a last name, three `kind="person"`
+  rows sharing one `alias_group` (first name, last name and full name, all
+  mapping to the SAME placeholder -- fix wave 2, closing the "surname only"
+  gap where the full name still leaked); for a user with no last name, one
+  ungrouped row mapping their name to itself; and one `kind="company"` row
+  each for every company name, every site name, and every programme task
+  name of those companies' sites (protects them from the generic two-word
+  masking pass -- fix wave 2 I1: previously only the recorder's own company
+  was protected this way).
 - `counts.json` -- the only fixture file this repo commits. Per set: `n`,
   `positives`, `negatives`, `descriptive_only` (n < 30), `database`,
   `exported_at`, and `exclusions` (rows dropped and why). Top-level
@@ -282,6 +289,53 @@ def sql_companies(company_ids) -> str:
     return f"SELECT name FROM companies WHERE id IN ({ids})"
 
 
+SITES_COLUMNS = ("name",)
+
+
+def sql_sites(company_ids) -> str:
+    """Site names for the exported companies, protected from the generic
+    two-word masking pass the same way company names already are (fix wave 2
+    I1 -- previously only company names were protected, so subcontractor and
+    site names were masked).
+
+    `archived_at IS NULL` mirrors the default guard
+    `repositories/sites.py`'s `list_company_sites`/`list_all_sites` apply --
+    an archived site's name is still a legitimate masking-protection term,
+    but this follows the repo's own "current" convention rather than
+    diverging from it silently. `sites` has no `redactions`-style tombstone
+    (that mechanism only covers `topics`/`recordings`, see
+    `deleted_predicates.py`), so nothing from that module applies here."""
+    ids = ",".join(f"'{cid}'" for cid in company_ids)
+    return f"SELECT name FROM sites WHERE company_id IN ({ids}) AND archived_at IS NULL"
+
+
+PROGRAMME_TASK_NAMES_COLUMNS = ("name",)
+
+
+def sql_programme_task_names(company_ids) -> str:
+    """Programme task names for the exported companies' sites, protected
+    from the generic two-word masking pass the same way company/site names
+    are (fix wave 2 I1 -- task names are exactly the signal the eval's
+    programme_match set exists to compare).
+
+    `removed_in_version IS NULL` mirrors the guard `repositories/
+    programme_tasks.py` applies everywhere it reads "current" tasks (the
+    `idx_ptasks_window` index, `list_tasks`'s default) -- a task superseded
+    by a later import is not a term this export needs to protect. If a
+    company has no programmes/tasks at all, this simply returns zero rows
+    (skip quietly, per the brief) -- there is no separate "programme data
+    absent" branch to write. `programme_tasks`/`sites`/`programmes` carry no
+    `redactions`-style tombstone (see `sql_sites` above), so nothing from
+    `deleted_predicates` applies here either."""
+    ids = ",".join(f"'{cid}'" for cid in company_ids)
+    return (
+        "SELECT DISTINCT pt.name FROM programme_tasks pt "
+        "JOIN programmes p ON p.id = pt.programme_id "
+        "JOIN sites s ON s.id = p.site_id "
+        f"WHERE s.company_id IN ({ids}) AND pt.removed_in_version IS NULL"
+    )
+
+
 # ---------------------------------------------------------------------------
 # RDS Data API record decoding -- pure.
 # ---------------------------------------------------------------------------
@@ -456,39 +510,73 @@ def _anchorable(term: str) -> bool:
     return _is_word_char(term[0]) and _is_word_char(term[-1])
 
 
-def build_alias_rows(alias_rows: list, user_rows: list, company_rows: list) -> list:
-    """(a) active `name_aliases` rows as-is, (b) one person row per user
-    (full name -> first name), (c) one company row per company name.
-    De-duplicates on (wrong_term, right_term, kind); drops terms that are
-    blank after stripping or would not anchor with `\\b` in `state.py`."""
+def build_alias_rows(alias_rows: list, user_rows: list, company_rows: list,
+                      site_rows: list | None = None,
+                      task_rows: list | None = None) -> list:
+    """(a) active `name_aliases` rows as-is, (b) for each user WITH a last
+    name, three person rows sharing one `alias_group` (first name, last
+    name, full name -> first name) so all three collapse to the SAME
+    placeholder in `state.py` -- closing the "surname only" gap where the
+    full name mapped to the first name but the surname and full name
+    themselves were never masked; a user with no last name still gets a
+    single ungrouped row mapping their name to itself, exactly as before,
+    (c) one company row per company name, site name and programme task name.
+    De-duplicates on (wrong_term, right_term, kind, alias_group); drops terms
+    that are blank after stripping or would not anchor with a word-boundary
+    match in `state.py`.
+
+    `alias_group` is omitted from a row entirely when it is `None`, so an
+    ungrouped row (every non-person row, and a user with no last name) has
+    the exact same shape it always did -- backwards compatible with any
+    fixture written before this fix."""
     out = []
     seen = set()
 
-    def _add(wrong, right, kind):
+    def _add(wrong, right, kind, group=None):
         wrong = _clean_term(wrong)
         right = _clean_term(right)
         if wrong is None or right is None:
             return
         if not _anchorable(wrong) or not _anchorable(right):
             return
-        key = (wrong, right, kind)
+        key = (wrong, right, kind, group)
         if key in seen:
             return
         seen.add(key)
-        out.append({"wrong_term": wrong, "right_term": right, "kind": kind})
+        row = {"wrong_term": wrong, "right_term": right, "kind": kind}
+        if group is not None:
+            row["alias_group"] = group
+        out.append(row)
 
     for row in alias_rows:
         _add(row.get("wrong_term"), row.get("right_term"), row.get("kind"))
 
-    for row in user_rows:
+    for index, row in enumerate(user_rows):
         first = _clean_term(row.get("first_name"))
         if not first:
             continue
         last = _clean_term(row.get("last_name"))
-        full = f"{first} {last}".strip() if last else first
-        _add(full, first, "person")
+        if last:
+            group = f"user-{index}"
+            _add(first, first, "person", group)
+            _add(last, last, "person", group)
+            _add(f"{first} {last}", first, "person", group)
+        else:
+            _add(first, first, "person")
 
     for row in company_rows:
+        name = _clean_term(row.get("name"))
+        if name is None:
+            continue
+        _add(name, name, "company")
+
+    for row in (site_rows or []):
+        name = _clean_term(row.get("name"))
+        if name is None:
+            continue
+        _add(name, name, "company")
+
+    for row in (task_rows or []):
         name = _clean_term(row.get("name"))
         if name is None:
             continue
@@ -622,6 +710,8 @@ def run_export(database: str, *, profile: str = DEFAULT_PROFILE,
         alias_rows: list = []
         user_rows: list = []
         company_rows: list = []
+        site_rows: list = []
+        task_rows: list = []
         if company_ids:
             ar = _execute(database, tx, sql_name_aliases(company_ids), profile, region)
             alias_rows = [record_to_dict(NAME_ALIASES_COLUMNS, r) for r in ar.get("records", [])]
@@ -629,8 +719,12 @@ def run_export(database: str, *, profile: str = DEFAULT_PROFILE,
             user_rows = [record_to_dict(USERS_COLUMNS, r) for r in ur.get("records", [])]
             cr = _execute(database, tx, sql_companies(company_ids), profile, region)
             company_rows = [record_to_dict(COMPANIES_COLUMNS, r) for r in cr.get("records", [])]
+            sr = _execute(database, tx, sql_sites(company_ids), profile, region)
+            site_rows = [record_to_dict(SITES_COLUMNS, r) for r in sr.get("records", [])]
+            tr = _execute(database, tx, sql_programme_task_names(company_ids), profile, region)
+            task_rows = [record_to_dict(PROGRAMME_TASK_NAMES_COLUMNS, r) for r in tr.get("records", [])]
 
-        aliases = build_alias_rows(alias_rows, user_rows, company_rows)
+        aliases = build_alias_rows(alias_rows, user_rows, company_rows, site_rows, task_rows)
         _write_json(out_dir / "name_aliases.json", aliases)
 
         counts["route_note"] = ROUTE_NOTE

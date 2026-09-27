@@ -16,7 +16,7 @@ every other file in this directory.
 import pytest
 from psycopg.rows import dict_row
 
-from repositories import companies, redactions, sites, topics
+from repositories import companies, programme_tasks, redactions, sites, topics
 from scripts.jev_eval import export_labels as ex
 
 pytestmark = pytest.mark.integration
@@ -179,3 +179,45 @@ def test_work_class_excludes_a_customer_deleted_topic(db):
     # this query (visibility is ANDed into the LEFT JOIN's ON clause), so it
     # lands in the SAME exclusion bucket a hard-missing topic would.
     assert excluded_reasons == ["topic_missing"]
+
+
+# ---------------------------------------------------------------------------
+# sites / programme task names -- masking-protection queries (fix wave 2 I1)
+# ---------------------------------------------------------------------------
+
+def test_sql_sites_excludes_archived_sites(db):
+    co, s = _seed_company_site(db)
+    archived = sites.create_site(db, co["id"], "Old Site")
+    sites.archive_site(db, archived["id"], co["id"])
+
+    records = _fetch(db, ex.sql_sites([co["id"]]))
+    names = {r["name"] for r in records}
+
+    assert "Jev-Site" in names
+    assert "Old Site" not in names
+
+
+def test_sql_programme_task_names_excludes_removed_tasks(db):
+    co, s = _seed_company_site(db)
+    programme = programme_tasks.create_programme(
+        db, site_id=s["id"], name="Main programme", source_format="p6")
+    db.execute(
+        "INSERT INTO programme_tasks (programme_id, origin, name, removed_in_version) "
+        "VALUES (%s, 'local', 'Roof Framing', NULL)", (programme["id"],))
+    db.execute(
+        "INSERT INTO programme_tasks (programme_id, origin, name, removed_in_version) "
+        "VALUES (%s, 'local', 'Superseded Task', 1)", (programme["id"],))
+
+    records = _fetch(db, ex.sql_programme_task_names([co["id"]]))
+    names = {r["name"] for r in records}
+
+    assert "Roof Framing" in names
+    assert "Superseded Task" not in names
+
+
+def test_sql_programme_task_names_empty_when_no_programme_data(db):
+    co, _s = _seed_company_site(db)
+    # No programme/tasks created for this company at all -- must return
+    # zero rows quietly, not raise.
+    records = _fetch(db, ex.sql_programme_task_names([co["id"]]))
+    assert records == []

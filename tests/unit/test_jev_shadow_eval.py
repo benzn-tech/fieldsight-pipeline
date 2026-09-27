@@ -325,6 +325,29 @@ def test_control_arm_uses_a_real_donor_from_another_site(tmp_path, monkeypatch):
 # Dry run: writes preview, calls neither ask nor aws
 # ---------------------------------------------------------------------------
 
+def test_dry_run_prints_masking_stats_per_set(tmp_path, monkeypatch, capsys):
+    # I1 requirement 5: --dry-run must surface over-masking, not just leaks --
+    # one row whose title is entirely a placeholder (over-masked), one whose
+    # title is untouched.
+    rows = [
+        _work_class_row("wc-1", "yes"),
+        _work_class_row("wc-2", "no"),
+    ]
+    rows[0]["features"]["title"] = "Ben Lin"  # generic pass eats the whole title
+    rows[1]["features"]["title"] = "Fix leaking valve"
+
+    _fixtures_dir, results_dir = _setup_fixtures(tmp_path, monkeypatch, set_name="work_class", rows=rows)
+    monkeypatch.delenv("DECISIONS_API_KEY", raising=False)
+
+    rc = jse.main(["--set", "work_class", "--dry-run"])
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert "masking stats [work_class]" in out
+    assert "mean_placeholders_per_state=" in out
+    assert "title_all_placeholder_fraction=50.0%" in out
+
+
 def test_dry_run_writes_preview_and_calls_nothing(tmp_path, monkeypatch):
     rows = [
         _work_class_row("wc-1", "yes", site_id="site-1", company_id="co-1"),

@@ -90,9 +90,13 @@ def test_threads_allowlist():
 
 
 def test_work_class_allowlist():
+    # Owner decision 2026-09-28: work_class sends ONLY title + category, no
+    # summary -- work_class positives are the recorder's private
+    # conversations (health, family), and summary is where that lives.
     features = {"title": "Fix leaking valve", "summary": "Valve on level 3 leaking.", "category": "plumbing", "cost": 500}
     state = build_state("work_class", features, [])
-    assert state == {"title": "Fix leaking valve", "summary": "Valve on level 3 leaking.", "category": "plumbing"}
+    assert state == {"title": "Fix leaking valve", "category": "plumbing"}
+    assert "summary" not in state
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +240,119 @@ def test_build_state_mapping_never_appears_in_output():
 # ---------------------------------------------------------------------------
 # Size
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# I1: over-masking fixes
+# ---------------------------------------------------------------------------
+
+def test_task_name_never_hits_the_generic_two_token_pass():
+    # Probe from the brief: task.name must never be over-masked by the
+    # generic pass, even without a stoplist word or alias protecting it.
+    features = {"task": {"name": "Roof Framing Inspection", "status": "in_progress"}}
+    state = build_state("programme_match", features, [])
+    assert state["task"]["name"] == "Roof Framing Inspection"
+
+
+def test_task_name_short_form_never_masked_either():
+    features = {"task": {"name": "Roof Framing"}}
+    state = build_state("programme_match", features, [])
+    assert state["task"]["name"] == "Roof Framing"
+
+
+def test_task_name_still_masks_known_person_aliases():
+    # Person aliases still apply to task.name -- only the generic pass is
+    # disabled for it.
+    aliases = [{"wrong_term": "Ben Lin", "right_term": "Ben Lin", "kind": "person"}]
+    features = {"task": {"name": "Ben Lin door install"}}
+    state = build_state("programme_match", features, aliases)
+    assert state["task"]["name"] == "PERSON_1 door install"
+
+
+def test_stoplist_prevents_construction_phrase_masking_in_free_text():
+    text, mapping = mask_names("The Scaffold crew finished Level Two", [])
+    assert text == "The Scaffold crew finished Level Two"
+    assert mapping == {}
+
+
+def test_stoplist_word_first_token():
+    text, mapping = mask_names("Roof Framing needs another look", [])
+    assert text == "Roof Framing needs another look"
+    assert mapping == {}
+
+
+def test_stoplist_does_not_suppress_a_real_two_word_name():
+    text, mapping = mask_names("Sarah Jones confirmed the pour", [])
+    assert text == "PERSON_1 confirmed the pour"
+    assert mapping == {"Sarah Jones": "PERSON_1"}
+
+
+# ---------------------------------------------------------------------------
+# I4: privacy gaps
+# ---------------------------------------------------------------------------
+
+def test_cjk_alias_masks_without_word_boundary():
+    aliases = [{"wrong_term": "林本", "right_term": "林本", "kind": "person"}]
+    text, mapping = mask_names("林本说明天去医院", aliases)
+    assert "林本" not in text
+    assert text.startswith("PERSON_1")
+    assert mapping == {"林本": "PERSON_1"}
+
+
+def test_alias_matching_is_case_insensitive():
+    aliases = [{"wrong_term": "Ben", "right_term": "Ben", "kind": "person"},
+               {"wrong_term": "Lin", "right_term": "Lin", "kind": "person"}]
+    text, mapping = mask_names("ben and lin are on site", aliases)
+    assert "ben" not in text.lower().replace("person", "")
+    assert "PERSON_" in text
+    assert mapping["Ben"] == "PERSON_1"
+    assert mapping["Lin"] == "PERSON_2"
+
+
+def test_user_first_last_full_name_share_one_placeholder_via_alias_group():
+    aliases = [
+        {"wrong_term": "Ben", "right_term": "Ben", "kind": "person", "alias_group": "user-0"},
+        {"wrong_term": "Lin", "right_term": "Lin", "kind": "person", "alias_group": "user-0"},
+        {"wrong_term": "Ben Lin", "right_term": "Ben", "kind": "person", "alias_group": "user-0"},
+    ]
+    text, mapping = mask_names("Ben Lin said it, then Lin confirmed, then Ben agreed.", aliases)
+    assert text == "PERSON_1 said it, then PERSON_1 confirmed, then PERSON_1 agreed."
+    assert mapping == {"Ben": "PERSON_1", "Lin": "PERSON_1", "Ben Lin": "PERSON_1"}
+
+
+def test_ungrouped_two_term_alias_row_still_works():
+    # Backwards compatibility: a row with no alias_group behaves exactly as
+    # before.
+    aliases = [{"wrong_term": "Ben Lynn", "right_term": "Ben Lin", "kind": "person"}]
+    text, mapping = mask_names("Ben Lynn said it, then Ben Lin confirmed it.", aliases)
+    assert text == "PERSON_1 said it, then PERSON_1 confirmed it."
+    assert mapping == {"Ben Lynn": "PERSON_1", "Ben Lin": "PERSON_1"}
+
+
+def test_email_is_masked_in_every_string():
+    text, _mapping = mask_names("Contact ben.lin@example.com for details.", [])
+    assert text == "Contact EMAIL for details."
+
+
+def test_phone_number_is_masked():
+    text, _mapping = mask_names("Call 021 234 5678 about the delivery.", [])
+    assert text == "Call PHONE about the delivery."
+
+
+def test_phone_number_with_plus_and_dashes_is_masked():
+    text, _mapping = mask_names("Reach +64-21-234-5678 anytime.", [])
+    assert text == "Reach PHONE anytime."
+
+
+def test_short_digit_runs_are_not_treated_as_phone_numbers():
+    text, _mapping = mask_names("Level 2 slab pour, 6 workers on site.", [])
+    assert text == "Level 2 slab pour, 6 workers on site."
+
+
+def test_iso_date_is_not_masked_as_a_phone_number():
+    features = {"observation": {"title": "x", "summary": "y", "date": "2026-09-20"}}
+    state = build_state("programme_match", features, [])
+    assert state["observation"]["date"] == "2026-09-20"
+
 
 def test_typical_state_serialises_under_4k_chars():
     features = {

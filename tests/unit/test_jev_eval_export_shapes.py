@@ -40,10 +40,24 @@ def test_every_sql_string_starts_with_select_or_with():
         ex.sql_name_aliases(["11111111-1111-1111-1111-111111111111"]),
         ex.sql_users(["11111111-1111-1111-1111-111111111111"]),
         ex.sql_companies(["11111111-1111-1111-1111-111111111111"]),
+        ex.sql_sites(["11111111-1111-1111-1111-111111111111"]),
+        ex.sql_programme_task_names(["11111111-1111-1111-1111-111111111111"]),
     ]
     for sql in sqls:
         stripped = sql.strip().upper()
         assert stripped.startswith("SELECT") or stripped.startswith("WITH"), sql
+
+
+def test_sql_sites_filters_by_company_and_excludes_archived():
+    sql = ex.sql_sites(["co-1"])
+    assert "company_id IN ('co-1')" in sql
+    assert "archived_at IS NULL" in sql
+
+
+def test_sql_programme_task_names_filters_by_company_and_excludes_removed():
+    sql = ex.sql_programme_task_names(["co-1"])
+    assert "s.company_id IN ('co-1')" in sql
+    assert "removed_in_version IS NULL" in sql
 
 
 # ---------------------------------------------------------------------------
@@ -251,9 +265,29 @@ def test_build_alias_rows_includes_active_aliases_as_is():
     assert rows == [{"wrong_term": "Ben Lynn", "right_term": "Ben Lin", "kind": "person"}]
 
 
-def test_build_alias_rows_maps_full_name_to_first_name():
+def test_build_alias_rows_user_with_last_name_groups_first_last_and_full():
+    # Fix wave 2 I4: the old behaviour emitted ONLY "Heidi Ansell" -> "Heidi",
+    # which left the bare surname "Ansell" (and the full name itself)
+    # unmasked. Now all three collapse to one placeholder via alias_group.
     rows = ex.build_alias_rows([], [{"first_name": "Heidi", "last_name": "Ansell"}], [])
-    assert rows == [{"wrong_term": "Heidi Ansell", "right_term": "Heidi", "kind": "person"}]
+    assert len(rows) == 3
+    groups = {row["alias_group"] for row in rows}
+    assert len(groups) == 1
+    by_wrong = {row["wrong_term"]: row for row in rows}
+    assert set(by_wrong) == {"Heidi", "Ansell", "Heidi Ansell"}
+    assert by_wrong["Heidi"]["right_term"] == "Heidi"
+    assert by_wrong["Ansell"]["right_term"] == "Ansell"
+    assert by_wrong["Heidi Ansell"]["right_term"] == "Heidi"
+    for row in rows:
+        assert row["kind"] == "person"
+
+
+def test_build_alias_rows_two_users_get_separate_alias_groups():
+    rows = ex.build_alias_rows(
+        [], [{"first_name": "Heidi", "last_name": "Ansell"},
+             {"first_name": "Ben", "last_name": "Lin"}], [])
+    groups = {row["alias_group"] for row in rows}
+    assert len(groups) == 2
 
 
 def test_build_alias_rows_skips_users_with_no_first_name():
@@ -271,6 +305,17 @@ def test_build_alias_rows_single_token_user_maps_to_self():
 def test_build_alias_rows_protects_company_names():
     rows = ex.build_alias_rows([], [], [{"name": "Naylor Love"}])
     assert rows == [{"wrong_term": "Naylor Love", "right_term": "Naylor Love", "kind": "company"}]
+
+
+def test_build_alias_rows_protects_site_names():
+    rows = ex.build_alias_rows([], [], [], [{"name": "SB1108 Ellesmere College"}], [])
+    assert rows == [{"wrong_term": "SB1108 Ellesmere College",
+                     "right_term": "SB1108 Ellesmere College", "kind": "company"}]
+
+
+def test_build_alias_rows_protects_programme_task_names():
+    rows = ex.build_alias_rows([], [], [], [], [{"name": "Roof Framing"}])
+    assert rows == [{"wrong_term": "Roof Framing", "right_term": "Roof Framing", "kind": "company"}]
 
 
 def test_build_alias_rows_drops_terms_that_cannot_anchor():

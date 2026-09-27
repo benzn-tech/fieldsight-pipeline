@@ -302,6 +302,22 @@ def test_work_class_broad_score_raises_jevquestionserror_when_not_a_dict():
 # control: programme_match
 # ---------------------------------------------------------------------------
 
+def test_control_donor_preference_ignores_person_placeholder_tokens():
+    # I1 probe: a masked donor's "PERSON_n" placeholder must not be treated
+    # as a shared word with the original -- otherwise every masked donor is
+    # spuriously "preferred" via the literal token "person".
+    control = QUESTION_SETS["programme_match"]["control"]
+    state = {"task": {"name": "PERSON_1 door install"}}
+    donors = [
+        # Shares nothing but the placeholder token with the original.
+        {"task": {"name": "PERSON_2 roof flashing repair"}},
+        # Shares a real word ("door") and should be preferred instead.
+        {"task": {"name": "Ground floor door frames"}},
+    ]
+    result = control(state, donors, key="row-ph")
+    assert result["task"]["name"] == "Ground floor door frames"
+
+
 def test_programme_match_control_swaps_only_task_name():
     control = QUESTION_SETS["programme_match"]["control"]
     state = {

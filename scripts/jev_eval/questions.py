@@ -90,10 +90,19 @@ def _stable_index(key, n: int) -> int:
 _WORD_RE = re.compile(r"[A-Za-z0-9]+")
 _PUNCT_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
 _WHITESPACE_RE = re.compile(r"\s+")
+# state.py's masker replaces every masked person's name with a PERSON_n
+# placeholder -- stripped before tokenising so donor preference never treats
+# "both texts mention a person" as a shared word. Without this, every masked
+# donor state trivially shares "person" with every other masked state, which
+# defeats the "prefers a donor that shares a word" rule entirely (fix wave 2,
+# I1 probe: "_words makes every masked donor preferred via the token
+# 'person'").
+_PLACEHOLDER_RE = re.compile(r"PERSON_\d+", flags=re.IGNORECASE)
 
 
 def _words(text: str) -> set:
-    return set(_WORD_RE.findall(text.lower()))
+    text = _PLACEHOLDER_RE.sub(" ", text)
+    return {w for w in _WORD_RE.findall(text.lower()) if w != "person"}
 
 
 def _normalise(text: str) -> str:

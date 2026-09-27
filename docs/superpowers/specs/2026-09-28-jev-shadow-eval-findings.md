@@ -218,17 +218,70 @@ the amended eligibility rule, and not to be treated as if they were.
 - Only structured event JSON is sent to the Jev API — never raw transcripts.
 - Fields sent are allowlisted (per `scripts/jev_eval/export_labels.py` / `questions.py`); no
   field outside that allowlist reaches the request payload.
-- Names are masked before export: known `name_aliases` entries, users' own names, and a
-  generic `_NAME_WORD` two-token pass over the remaining text.
-- Deleted content is excluded at export time (never enters the exported set at all).
+- **Owner decision, 2026-09-28 (fix wave 2):** `work_class` sends ONLY `title` and `category`
+  — never `summary`. `work_class` positives are, by construction, the recorder's private
+  conversations (health, family), and `summary` is exactly where that private content lives.
+  The label review page may still show the summary to the owner locally; it is stripped before
+  the state is built for export, so it never reaches this pipeline's output at all.
+- Names are masked before export: known `name_aliases` entries (including, as of this wave, a
+  grouped first-name/last-name/full-name mapping per user so all three collapse to ONE
+  placeholder — the old code masked only the full name and left a bare surname mention
+  unmasked), and a generic `_NAME_WORD` two-token pass over the remaining text, bounded by a
+  stoplist of sentence-start/construction words (`the`, `level`, `roof`, weekday/month names,
+  number words, …) so ordinary phrases like "Roof Framing" or "The Scaffold crew" are no longer
+  swallowed whole as a person's name. Emails are masked to `EMAIL` and phone-shaped digit runs
+  (7+ digits, allowing spaces/dashes/a leading `+`) to `PHONE`, in every string, with a
+  carve-out for this schema's own `YYYY-MM-DD` date fields so dates are not destroyed as
+  false-positive phone numbers.
+- **`programme_match`'s `task.name` field never runs the generic two-token pass at all**
+  (person aliases still apply to it). Task/programme names are exactly the signal the baseline
+  sees raw and this eval exists to compare Jev against; the generic pass's non-overlapping
+  match behaviour was masking the entire field on short task names (`"Roof Framing Inspection"`
+  → `"PERSON_1 Inspection"`), which biases the comparison against Jev rather than protecting
+  anyone.
+- Company names, site names, and programme task names of the exported companies/sites are all
+  protected from the generic masking pass (`name_aliases` rows of `kind="company"`) — before
+  this wave only the recorder's own company name was protected this way; subcontractor names,
+  site names and task names were being masked as if they were people.
+- `--dry-run` now also prints, per set, the mean number of `PERSON_n` placeholders per state and
+  the fraction of states whose title (or, for `programme_match`, `task.name`) is made up
+  entirely of placeholders — so the owner can see over-masking, not only check for leaks, before
+  the first real API call.
+- Deleted content is excluded at export time (never enters the exported set at all). **Because
+  that exclusion is evaluated once, at export time, the fixtures must be re-exported
+  immediately before the real run** — a customer deletion made between export and run would
+  otherwise still be sitting in `scripts/fixtures/jev_eval/*.jsonl` and get sent.
 - `--dry-run` output is reviewed by the owner before the first real API call is made for any
   set (per the plan and per §4.4 of the assessment spec's data-egress gate).
 
-**Known residual gap:** a single first name that is in neither the `users` table nor
-`name_aliases` passes through the masking pipeline unredacted. This is a known, unfixed gap in
-the masking coverage, not a defect introduced by this eval — it applies to whatever text is
-exported for any set. Recorded here so it is not silently rediscovered during the disagreement
-read (Section 6).
+**Closed this wave (fix wave 2):**
+- Generic two-token pass no longer runs on `task.name` (I1.1).
+- Company/site/programme-task names are all protected from the generic pass, not just the
+  recorder's own company (I1.2).
+- Stoplist added for the generic pass to reduce over-masking of construction phrases (I1.3).
+- Donor preference (`_words`) in the control functions no longer treats the literal token
+  "person" (from a `PERSON_n` placeholder) as a shared word between two masked states (I1.4).
+- `--dry-run` reports over-masking stats, not just leak checks (I1.5).
+- CJK alias terms match without a `\b` word-boundary anchor, since `\b` never fires between two
+  adjacent CJK characters (I4).
+- Alias matching is case-insensitive (I4).
+- A user's first name, last name and full name now all collapse to ONE placeholder via a shared
+  `alias_group`, instead of only the full name being masked and the bare surname leaking (I4).
+- Email addresses and phone-shaped digit runs are masked in every string (I4).
+- `work_class`'s allowlist dropped `summary` per the owner decision above (I4).
+
+**Known residual gap, unchanged by this wave:** a single first name that is in neither the
+`users` table nor `name_aliases` passes through the masking pipeline unredacted (e.g. a visitor
+or a subcontractor mentioned once, by first name only, who is not an enrolled user). This is a
+known, unfixed gap in the masking coverage, not a defect introduced by this eval — it applies to
+whatever text is exported for any set. Recorded here so it is not silently rediscovered during
+the disagreement read (Section 6).
+
+**New residual gap, introduced by the stoplist (I1.3):** a real person surnamed after one of the
+stoplist words (e.g. a person literally named "Roof") would not be masked by the generic pass —
+the stoplist cannot distinguish "Roof Jenkins, a person" from "Roof Framing, a task". This is the
+accepted trade named in the brief: a little under-masking of names that collide with stoplist
+words, in exchange for a large reduction in over-masking of ordinary construction phrases.
 
 ---
 

@@ -108,6 +108,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -522,6 +523,72 @@ def _process_task(set_name: str, row: dict, arm: str, run: int, state_bundle,
 # Dry run -- builds every state that WOULD be sent, sends nothing.
 # ---------------------------------------------------------------------------
 
+# Fix wave 2, I1 requirement 5: --dry-run must show over-masking, not just
+# leaks. Any run of PERSON_n placeholders, counted per state (not deduped --
+# a state with the same person mentioned three times should show 3, since
+# that's three tokens actually sent).
+_PLACEHOLDER_COUNT_RE = re.compile(r"PERSON_\d+")
+# A "title" field (or task.name for programme_match) that, once whitespace
+# and light punctuation are stripped away, is made up ENTIRELY of PERSON_n
+# placeholders -- the over-masking failure mode the brief's own probes hit
+# ("Roof Framing" -> "PERSON_1"): the whole field is gone, not just a name
+# inside it.
+_PLACEHOLDER_ONLY_RE = re.compile(r"^(?:PERSON_\d+[\s.,!?]*)+$")
+
+
+def _title_like(set_name: str, state: dict):
+    """The one field per set that stands in for "the readable label a human
+    reviewer would look at first" -- what the over-masking fraction checks."""
+    if set_name == "work_class":
+        return state.get("title")
+    if set_name == "programme_match":
+        task = state.get("task") or {}
+        return task.get("name")
+    if set_name == "threads":
+        later = state.get("later") or {}
+        return later.get("title")
+    return None
+
+
+def _masking_stats(set_name: str, states_by_id: dict) -> dict:
+    """Per-set over-masking stats for --dry-run: mean PERSON_n placeholders
+    per state, and the fraction of states whose title-like field is made up
+    entirely of placeholders. Returns `None` for both fractions when there
+    are no states (n=0) or no checkable titles, rather than dividing by
+    zero."""
+    states = [entry["state"] for entry in states_by_id.values()]
+    n = len(states)
+    if n == 0:
+        return {"n": 0, "mean_placeholders_per_state": None,
+                "title_all_placeholder_fraction": None}
+
+    total_placeholders = sum(
+        len(_PLACEHOLDER_COUNT_RE.findall(json.dumps(state))) for state in states
+    )
+    titles = [_title_like(set_name, state) for state in states]
+    checkable = [t for t in titles if isinstance(t, str) and t]
+    all_placeholder = sum(1 for t in checkable if _PLACEHOLDER_ONLY_RE.fullmatch(t))
+    fraction = (all_placeholder / len(checkable)) if checkable else None
+
+    return {
+        "n": n,
+        "mean_placeholders_per_state": total_placeholders / n,
+        "title_all_placeholder_fraction": fraction,
+    }
+
+
+def _print_masking_stats(set_name: str, stats: dict) -> None:
+    mean_ph = stats["mean_placeholders_per_state"]
+    frac = stats["title_all_placeholder_fraction"]
+    mean_str = f"{mean_ph:.2f}" if mean_ph is not None else "n/a"
+    frac_str = f"{frac:.1%}" if frac is not None else "n/a"
+    print(
+        f"masking stats [{set_name}]: n={stats['n']} "
+        f"mean_placeholders_per_state={mean_str} "
+        f"title_all_placeholder_fraction={frac_str}"
+    )
+
+
 def _run_dry_run(sets: list, arms: list, args) -> int:
     jev_arms_selected = [arm for arm in arms if arm in JEV_ARMS]
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -529,6 +596,7 @@ def _run_dry_run(sets: list, arms: list, args) -> int:
 
     n_entries = 0
     max_size = 0
+    masking_stats_by_set: dict = {}
     with open(preview_path, "w", encoding="utf-8") as fh:
         for set_name in sets:
             rows = load_rows(set_name)
@@ -536,6 +604,7 @@ def _run_dry_run(sets: list, arms: list, args) -> int:
                 rows = rows[: args.limit]
             aliases = load_aliases()
             states_by_id = _build_states(set_name, rows, aliases)
+            masking_stats_by_set[set_name] = _masking_stats(set_name, states_by_id)
 
             control_states, control_errors = {}, {}
             if any(arm in ("control_broad", "control_decomposed") for arm in jev_arms_selected):
@@ -570,6 +639,8 @@ def _run_dry_run(sets: list, arms: list, args) -> int:
         f"dry run: {n_entries} state(s) previewed across {len(sets)} set(s); "
         f"max serialised entry size = {max_size} bytes; wrote {preview_path}"
     )
+    for set_name in sets:
+        _print_masking_stats(set_name, masking_stats_by_set[set_name])
     return 0
 
 
