@@ -24,18 +24,30 @@ Masking has two layers:
 - Known corrections from `name_aliases` (kind='person'): both `wrong_term`
   and `right_term` are treated as the same person and masked to the same
   placeholder (the table stores ASR corrections, e.g. wrong "Ben Lynn" ->
-  right "Ben Lin" -- both spellings must collapse to one PERSON_n).
+  right "Ben Lin" -- both spellings must collapse to one PERSON_n). Task 1
+  also feeds the company's user first and last names in this way, some of
+  them single tokens (e.g. "Heidi"), so this layer matches on a word
+  boundary, case-sensitively -- never a bare substring check -- so that a
+  single-token term like "Ben" masks "Ben said" and "Ben's" without also
+  matching inside "Bench" or "Benefit".
 - A generic two-capitalised-word pass using `_NAME_WORD` (imported, not
   copied, from `corroboration_gate`) for everything prod has not yet
   aliased. Prod currently has zero person aliases, so in practice this
-  generic pass carries nearly all of the load. Its known cost: it will also
-  mask some non-person capitalised two-word strings that happen to share the
-  shape of a name (e.g. "Level One"), which is why `name_aliases` rows of
-  kind company/product are checked first and protected from it -- but an
-  unaliased company/product term with no corporate marker will still be
-  masked. That is an accepted false positive, not a bug: a masked company
-  name costs the reader a lookup; an unmasked person's name is the thing the
-  owner promised would never leave.
+  generic pass carries nearly all of the load. Its known cost (over-masking):
+  it will also mask some non-person capitalised two-word strings that happen
+  to share the shape of a name (e.g. "Level One"), which is why
+  `name_aliases` rows of kind company/product are checked first and
+  protected from it -- but an unaliased company/product term with no
+  corporate marker will still be masked. That is an accepted false positive,
+  not a bug: a masked company name costs the reader a lookup; an unmasked
+  person's name is the thing the owner promised would never leave.
+
+  The residual gap runs the other way (under-masking): the generic pass is
+  deliberately NOT broadened to catch single-token names (ruling: Task 1
+  supplies known first/last names as aliases instead, see above) -- so a
+  single first name that is in neither `users` nor `name_aliases` (a
+  visitor, a subcontractor mentioned once) passes through unmasked. Closing
+  that gap is Task 1's alias coverage, not a regex change here.
 """
 from __future__ import annotations
 
@@ -165,25 +177,40 @@ class _Masker:
             return text
 
         # Layer 1: known person alias pairs (wrong_term / right_term collapse
-        # to the same placeholder), longest term first so one pair's term
-        # being a substring of another's cannot cut a replacement in half.
+        # to the same placeholder). Matched on a word boundary, case-sensitive
+        # regex -- not `str.replace` -- so a single-token term like "Ben"
+        # masks "Ben said" and "Ben's" but leaves "Bench" and "Benefit"
+        # alone. Longest term first (both in the sort and in the regex
+        # alternation, which tries alternatives left-to-right) so "Ben Lin"
+        # wins over "Ben" when both are present. "Ben" and "Ben Lin" get the
+        # SAME placeholder only if they come from the same alias row (i.e.
+        # one row's wrong_term/right_term pair contains both); two separate
+        # alias rows -- one for the first name, one for the full name -- get
+        # separate placeholders, since nothing ties them together as the same
+        # person. Pinned by test.
         all_terms = sorted(
             {term for pair in self._person_pairs for term in pair},
             key=len,
             reverse=True,
         )
-        for term in all_terms:
-            if term not in text:
-                continue
-            placeholder = self.mapping.get(term)
-            if placeholder is None:
-                pair = next(p for p in self._person_pairs if term in p)
-                placeholder = next((self.mapping[t] for t in pair if t in self.mapping), None)
+        if all_terms:
+            alias_pattern = re.compile(
+                r"\b(?:" + "|".join(re.escape(term) for term in all_terms) + r")\b"
+            )
+
+            def _replace_alias(match: re.Match) -> str:
+                term = match.group(0)
+                placeholder = self.mapping.get(term)
                 if placeholder is None:
-                    placeholder = self._next_placeholder()
-                for t in pair:
-                    self.mapping[t] = placeholder
-            text = text.replace(term, placeholder)
+                    pair = next(p for p in self._person_pairs if term in p)
+                    placeholder = next((self.mapping[t] for t in pair if t in self.mapping), None)
+                    if placeholder is None:
+                        placeholder = self._next_placeholder()
+                    for t in pair:
+                        self.mapping[t] = placeholder
+                return placeholder
+
+            text = alias_pattern.sub(_replace_alias, text)
 
         # Layer 2: generic two-capitalised-word name shape, skipping anything
         # protected as a known company/product alias term.

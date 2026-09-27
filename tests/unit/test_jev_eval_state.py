@@ -163,6 +163,53 @@ def test_mask_names_two_different_names_get_different_placeholders():
     assert mapping == {"Ben Lin": "PERSON_1", "Sarah Jones": "PERSON_2"}
 
 
+def test_mask_names_single_token_person_alias_is_masked():
+    # Task 1 feeds user first/last names in as person aliases, some single-token.
+    aliases = [{"wrong_term": "Heidi", "right_term": "Heidi", "kind": "person"}]
+    text, mapping = mask_names("Heidi flagged a defect", aliases)
+    assert text == "PERSON_1 flagged a defect"
+    assert mapping == {"Heidi": "PERSON_1"}
+
+
+def test_mask_names_single_token_alias_respects_word_boundaries():
+    # "Ben" must not match inside "Bench" or "Benefit" -- word-boundary, not substring.
+    aliases = [{"wrong_term": "Ben", "right_term": "Ben", "kind": "person"}]
+    text, mapping = mask_names("Bench pour and Benefit review scheduled.", aliases)
+    assert text == "Bench pour and Benefit review scheduled."
+    assert mapping == {}
+
+
+def test_mask_names_single_token_alias_masks_at_word_boundary():
+    aliases = [{"wrong_term": "Ben", "right_term": "Ben", "kind": "person"}]
+    text, mapping = mask_names("Ben said the slab is late, and Ben's crew agreed.", aliases)
+    assert text == "PERSON_1 said the slab is late, and PERSON_1's crew agreed."
+    assert mapping == {"Ben": "PERSON_1"}
+
+
+def test_mask_names_ben_and_ben_lin_from_separate_alias_rows_get_separate_placeholders():
+    # "Ben" (a first-name alias row) and "Ben Lin" (an unrelated full-name alias row)
+    # are NOT tied together as the same person -- nothing in the data says they are the
+    # same row, so they get separate placeholders. Longest term ("Ben Lin") still wins
+    # the match where the two overlap.
+    aliases = [
+        {"wrong_term": "Ben", "right_term": "Ben", "kind": "person"},
+        {"wrong_term": "Ben Lynn", "right_term": "Ben Lin", "kind": "person"},
+    ]
+    text, mapping = mask_names("Ben Lin confirmed it, and Ben also agreed.", aliases)
+    assert text == "PERSON_1 confirmed it, and PERSON_2 also agreed."
+    assert mapping == {"Ben Lynn": "PERSON_1", "Ben Lin": "PERSON_1", "Ben": "PERSON_2"}
+
+
+def test_mask_names_ben_and_ben_lin_from_the_same_alias_row_share_a_placeholder():
+    # When a single alias row's own wrong/right pair contains both a first name and a
+    # full name, they DO share a placeholder -- the row itself asserts they're the same
+    # person.
+    aliases = [{"wrong_term": "Ben", "right_term": "Ben Lin", "kind": "person"}]
+    text, mapping = mask_names("Ben said it, then Ben Lin confirmed it.", aliases)
+    assert text == "PERSON_1 said it, then PERSON_1 confirmed it."
+    assert mapping == {"Ben": "PERSON_1", "Ben Lin": "PERSON_1"}
+
+
 def test_build_state_masks_names_consistently_across_the_whole_state():
     features = {
         "observation": {
