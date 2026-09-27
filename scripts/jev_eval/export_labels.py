@@ -57,6 +57,25 @@ rather than a number it cannot actually produce. `classification_feedback.topic_
 (work_class) carries no FK at all, so a topic that later disappears leaves a
 feedback row whose join to `topics` comes back empty -- that case IS visible
 and IS counted (`exclusions.topic_missing`).
+
+Separately from that hard-delete/FK story: a CUSTOMER-FACING delete
+(spec docs/superpowers/specs/2026-08-14-user-deletes-a-recording.md) is soft
+-- the topic row survives, a `redactions` tombstone just hides it -- so none
+of the above catches it. Every query here applies the repo's own visibility
+predicates (`repositories.programme_suggestions.VISIBLE`,
+`deleted_predicates.visible_topics_predicate`), imported rather than copied,
+over every `topics`/`programme_progress_suggestions` alias: `sql_programme_match`
+(the suggestion row itself, in `WHERE`), `sql_threads` (`t` in `WHERE`, `p`
+and the `earliest_thread_topic` CTE's own topic scan, both ANDed into their
+joins/WHERE the same way `repositories/threads.py` does), and `sql_work_class`
+(`t`, ANDed into its `LEFT JOIN`). Where that predicate makes a LEFT-JOINed
+row come back NULL (`p`, `earliest_thread_topic`, work_class's `t`), the
+existing `orphaned_parent`/`orphaned_thread`/`topic_missing` exclusion
+buckets count it for free. Where it excludes the primary row directly
+(`sql_programme_match`, and threads' own `t`), the row is simply absent from
+the output and NOT separately counted -- doing so would need a second query
+per set, which the brief allows skipping in favour of stating it plainly, as
+this paragraph does.
 """
 from __future__ import annotations
 
@@ -67,6 +86,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from deleted_predicates import visible_topics_predicate
+from repositories.programme_suggestions import VISIBLE as _PROGRAMME_MATCH_VISIBLE
 from scripts.verify_programme_schema import CLUSTER, SECRET
 
 DEFAULT_DATABASE = "fieldsight_test"
@@ -99,16 +120,39 @@ PROGRAMME_MATCH_COLUMNS = (
 def sql_programme_match() -> str:
     """`programme_progress_suggestions` already holds the topic text the
     matcher saw (task/programme rulings, `programme_suggestions.py:_COLS`),
-    so no join to `topics` is needed and topic-id churn is irrelevant here."""
+    so no join to `topics` is needed and topic-id churn is irrelevant here.
+
+    Uses `repositories.programme_suggestions.VISIBLE` -- the SAME predicate
+    `list_for_site`/`get` apply, imported rather than copied so a future
+    change to what "deleted" means for this table reaches this export too.
+    It hardcodes the unaliased table name (matching how the repo itself uses
+    it), so this table is NOT aliased here. `VISIBLE` is a `NOT EXISTS`
+    covering both the topic-tombstone arm and the source/recording-tombstone
+    arm -- see its comment in `repositories/programme_suggestions.py` for why
+    a suggestion's FROZEN COPY of a deleted topic's words needs both. Applied
+    in `WHERE`, exactly where the repo's own callers put it: a redacted row
+    is excluded and NOT separately counted here (would need a second query
+    per set; the brief allows stating that instead)."""
     return (
-        "SELECT s.id, s.state, s.decided_at, s.report_date, "
-        "s.topic_title, s.topic_summary, "
-        "s.task_name, s.task_status_before, s.task_progress_before, "
-        "s.suggested_status, s.suggested_progress, s.confidence, s.task_id, "
-        "s.site_id, si.company_id "
-        "FROM programme_progress_suggestions s "
-        "JOIN sites si ON si.id = s.site_id "
-        "WHERE s.state IN ('confirmed','rejected')"
+        "SELECT programme_progress_suggestions.id, "
+        "programme_progress_suggestions.state, "
+        "programme_progress_suggestions.decided_at, "
+        "programme_progress_suggestions.report_date, "
+        "programme_progress_suggestions.topic_title, "
+        "programme_progress_suggestions.topic_summary, "
+        "programme_progress_suggestions.task_name, "
+        "programme_progress_suggestions.task_status_before, "
+        "programme_progress_suggestions.task_progress_before, "
+        "programme_progress_suggestions.suggested_status, "
+        "programme_progress_suggestions.suggested_progress, "
+        "programme_progress_suggestions.confidence, "
+        "programme_progress_suggestions.task_id, "
+        "programme_progress_suggestions.site_id, "
+        "si.company_id "
+        "FROM programme_progress_suggestions "
+        "JOIN sites si ON si.id = programme_progress_suggestions.site_id "
+        "WHERE programme_progress_suggestions.state IN ('confirmed','rejected') "
+        f"AND {_PROGRAMME_MATCH_VISIBLE}"
     )
 
 
@@ -124,12 +168,37 @@ THREADS_COLUMNS = (
 def sql_threads() -> str:
     """See the module docstring for the `earlier` choice. `earliest_thread_topic`
     picks, per thread, the topic with the lowest `report_date` (ties broken by
-    `id` for determinism) -- the topic that anchored the thread."""
+    `id` for determinism) -- the topic that anchored the thread.
+
+    Visibility uses `deleted_predicates.visible_topics_predicate`, imported
+    (not copied) -- the same predicate `repositories/threads.py` applies to
+    every read of `topics` in this feature (`candidate_corpus`, `list_pending`,
+    `thread_facts`), so a future change to what "deleted" means reaches this
+    export too:
+
+    - `t` (the LATER topic, `topic_id`): visibility is ANDed into `WHERE`,
+      the same place `list_pending` puts its own `_VISIBLE_T` check on `t`. A
+      row whose later topic was deleted is excluded but not separately
+      counted (would need a second query per set).
+    - `p` (`parent_topic_id`): visibility is ANDed into the `LEFT JOIN`'s
+      `ON` clause, exactly like `list_pending`'s
+      `LEFT JOIN topics p ON p.id = s.parent_topic_id AND {_VISIBLE_P}`. A
+      deleted parent makes `p` come back NULL, which the `orphaned_parent`
+      mapper branch already catches and counts -- no new exclusion bucket
+      needed.
+    - `earliest_thread_topic`: visibility is ANDed into the CTE's own
+      `WHERE`, mirroring `candidate_corpus`'s pattern -- a deleted topic is
+      never a candidate to be picked as a thread's earliest. If deletion
+      empties a thread entirely, `et` comes back NULL and the existing
+      `orphaned_thread` mapper branch counts it."""
+    visible_t = visible_topics_predicate("t")
+    visible_p = visible_topics_predicate("p")
+    visible_et = visible_topics_predicate("t")
     return (
         "WITH earliest_thread_topic AS ("
         "    SELECT DISTINCT ON (thread_id) thread_id, id, title, summary, report_date "
-        "    FROM topics "
-        "    WHERE thread_id IS NOT NULL "
+        "    FROM topics t "
+        f"    WHERE thread_id IS NOT NULL AND {visible_et} "
         "    ORDER BY thread_id, report_date ASC, id ASC"
         ") "
         "SELECT s.id, s.status, s.score, s.gap_days, s.resolved_at, "
@@ -144,9 +213,10 @@ def sql_threads() -> str:
         "FROM topic_thread_suggestions s "
         "JOIN topics t ON t.id = s.topic_id "
         "JOIN sites si ON si.id = t.site_id "
-        "LEFT JOIN topics p ON p.id = s.parent_topic_id "
+        f"LEFT JOIN topics p ON p.id = s.parent_topic_id AND {visible_p} "
         "LEFT JOIN earliest_thread_topic et ON et.thread_id = s.thread_id "
-        "WHERE s.status IN ('confirmed','rejected')"
+        "WHERE s.status IN ('confirmed','rejected') "
+        f"AND {visible_t}"
     )
 
 
@@ -160,14 +230,22 @@ WORK_CLASS_COLUMNS = (
 def sql_work_class() -> str:
     """`classification_feedback.topic_id` carries no FK, so a topic that has
     since disappeared leaves the LEFT JOIN empty rather than cascading the
-    feedback row away -- that case is visible and counted (`topic_missing`)."""
+    feedback row away -- that case is visible and counted (`topic_missing`).
+
+    Visibility uses `deleted_predicates.visible_topics_predicate("t")`
+    (imported, not copied), ANDed into the `topics` `LEFT JOIN`'s `ON`
+    clause -- a soft-deleted topic then comes back NULL exactly like a
+    physically-missing one, and the existing `topic_missing` mapper branch
+    (`rec["topic_id"] is None`) counts both without a second query or a new
+    exclusion bucket."""
+    visible_t = visible_topics_predicate("t")
     return (
         "SELECT cf.id, cf.human_verdict, "
         "       COALESCE(cf.topic_category, t.category) AS category, "
         "       cf.classifier_verdict, cf.classifier_confidence, cf.created_at, "
         "       t.id AS topic_id, t.title, t.summary, t.site_id, si.company_id "
         "FROM classification_feedback cf "
-        "LEFT JOIN topics t ON t.id = cf.topic_id "
+        f"LEFT JOIN topics t ON t.id = cf.topic_id AND {visible_t} "
         "LEFT JOIN sites si ON si.id = t.site_id "
         "WHERE cf.human_verdict IN ('confirm_non_work','reject_is_work','missed_personal')"
     )
@@ -508,7 +586,11 @@ def run_export(database: str, *, profile: str = DEFAULT_PROFILE,
                 region: str = DEFAULT_REGION, out_dir: Path | None = None) -> dict:
     """Runs all three set queries plus the alias lookups inside ONE
     transaction, always rolled back in `finally` -- this cannot write, even
-    if every statement in it is a SELECT."""
+    if every statement in it is a SELECT.
+
+    Trusts its caller: the `--database fieldsight` / `--allow-prod` gate
+    lives in `main()`, not here. Calling `run_export("fieldsight", ...)`
+    directly bypasses that gate."""
     out_dir = out_dir or FIXTURES_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
 
