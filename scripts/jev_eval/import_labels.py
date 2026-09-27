@@ -88,6 +88,10 @@ def build_import_rows(set_name: str, batch_rows: list, labels: dict, now_iso: st
             "decided_at": now_iso,
             "baseline": batch_row.get("baseline"),
             "label_source": "owner",
+            # Fix wave 4, B9: carried through so export_labels.py can
+            # re-check this row's topic(s) are still visible on every
+            # export, not just at labelling time.
+            "topic_ids": batch_row.get("topic_ids"),
         })
     return new_rows, n_unsure, n_skipped_unknown_id
 

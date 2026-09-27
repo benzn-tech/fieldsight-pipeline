@@ -688,6 +688,56 @@ def _label_source_breakdown(rows: list) -> dict:
     return breakdown
 
 
+def owner_row_topic_ids(row: dict) -> list:
+    """Topic ids an owner-labelled row's deletion-predicate recheck needs to
+    verify are still visible -- fix wave 4, B9: both topics for `threads`,
+    the one topic for `work_class` (`sample_batch.py` writes a `topic_ids`
+    list on every owner-labelled batch row for exactly this purpose). A
+    DB-sourced row needs no recheck here (its own SELECT already applied the
+    visibility predicate this same transaction); an owner row written before
+    this fix (no `topic_ids` field) has nothing to recheck and is kept, not
+    dropped."""
+    if row.get("label_source") != "owner":
+        return []
+    return [tid for tid in (row.get("topic_ids") or []) if tid]
+
+
+def apply_owner_deletion_predicate(rows: list, visible_topic_ids: set) -> tuple:
+    """`(kept_rows, n_dropped)` -- fix wave 4, B9: re-applies the SAME
+    deletion/visibility predicate every DB-sourced row already passed
+    through its export SELECT to owner-labelled rows too, on EVERY export
+    (not just once, at labelling time). A topic visible when the owner
+    labelled it can be soft-deleted later; without this recheck, that row
+    would sit in `{set}.jsonl` forever, immune to `merge_export_rows`
+    always keeping `label_source == "owner"` rows. A row with no ids to
+    check (DB-sourced, or an owner row predating `topic_ids`) is kept
+    unconditionally; an owner row is dropped only if ANY of its topic ids is
+    no longer visible."""
+    kept = []
+    n_dropped = 0
+    for row in rows:
+        ids = owner_row_topic_ids(row)
+        if ids and not all(tid in visible_topic_ids for tid in ids):
+            n_dropped += 1
+            continue
+        kept.append(row)
+    return kept, n_dropped
+
+
+def sql_visible_topic_ids(topic_ids) -> str:
+    """Which of `topic_ids` are still visible under `visible_topics_predicate`
+    -- `topic_ids` are uuids this script already read back from its own
+    fixture files (owner-labelled rows), interpolated the same trusted way
+    `sql_name_aliases` interpolates its own already-fetched company ids."""
+    visible_t = visible_topics_predicate("t")
+    ids = ",".join(f"'{_sql_quote(tid)}'" for tid in topic_ids)
+    return f"SELECT t.id FROM topics t WHERE t.id IN ({ids}) AND {visible_t}"
+
+
+def _sql_quote(value) -> str:
+    return str(value).replace("'", "''")
+
+
 def merge_export_rows(existing_rows: list, new_rows: list) -> list:
     """Fix wave 3, I5: `_write_jsonl` used to open `{set}.jsonl` with `"w"`,
     so a re-export silently wiped out every row `import_labels.py` had
@@ -741,26 +791,65 @@ def run_export(database: str, *, profile: str = DEFAULT_PROFILE,
                                     map_programme_match_row)
         pm_existing = _load_jsonl(out_dir / "programme_match.jsonl")
         pm_merged = merge_export_rows(pm_existing, pm_rows)
-        _write_jsonl(out_dir / "programme_match.jsonl", pm_merged)
-        counts["programme_match"] = summarize_set("programme_match", pm_merged, pm_excl, database)
-        company_ids.update(r["company_id"] for r in pm_rows if r.get("company_id"))
 
         th_result = _execute(database, tx, sql_threads(), profile, region)
         th_rows, th_excl = _process(th_result, THREADS_COLUMNS, map_threads_row)
         th_excl.setdefault("deleted_topic_rows", "invisible (FK cascades)")
         th_existing = _load_jsonl(out_dir / "threads.jsonl")
         th_merged = merge_export_rows(th_existing, th_rows)
-        _write_jsonl(out_dir / "threads.jsonl", th_merged)
-        counts["threads"] = summarize_set("threads", th_merged, th_excl, database)
-        company_ids.update(r["company_id"] for r in th_rows if r.get("company_id"))
 
         wc_result = _execute(database, tx, sql_work_class(), profile, region)
         wc_rows, wc_excl = _process(wc_result, WORK_CLASS_COLUMNS, map_work_class_row)
         wc_existing = _load_jsonl(out_dir / "work_class.jsonl")
         wc_merged = merge_export_rows(wc_existing, wc_rows)
+
+        # Fix wave 4, B9: re-apply the deletion/visibility predicate to
+        # OWNER-labelled rows too, on every export -- `merge_export_rows`
+        # keeps them unconditionally (that is what protects them from
+        # `import_labels.py`'s work being silently overwritten), but a
+        # topic visible when the owner labelled it can be soft-deleted
+        # later, and nothing else ever rechecks it. One query for every
+        # owner row's topic id(s) across all three sets, inside the same
+        # rolled-back transaction.
+        all_owner_topic_ids: set = set()
+        for rows in (pm_merged, th_merged, wc_merged):
+            for row in rows:
+                all_owner_topic_ids.update(owner_row_topic_ids(row))
+
+        visible_topic_ids: set = set()
+        if all_owner_topic_ids:
+            vis_result = _execute(
+                database, tx, sql_visible_topic_ids(all_owner_topic_ids), profile, region)
+            visible_topic_ids = {
+                decode_field(r[0]) for r in vis_result.get("records", [])
+            }
+
+        pm_merged, pm_owner_dropped = apply_owner_deletion_predicate(pm_merged, visible_topic_ids)
+        th_merged, th_owner_dropped = apply_owner_deletion_predicate(th_merged, visible_topic_ids)
+        wc_merged, wc_owner_dropped = apply_owner_deletion_predicate(wc_merged, visible_topic_ids)
+
+        _write_jsonl(out_dir / "programme_match.jsonl", pm_merged)
+        pm_counts = summarize_set("programme_match", pm_merged, pm_excl, database)
+        pm_counts["owner_rows_dropped_deleted"] = pm_owner_dropped
+        counts["programme_match"] = pm_counts
+        # Fix wave 4, B10: company ids for the alias lookups must include
+        # OWNER rows too (`pm_merged`, not just the fresh `pm_rows`) -- an
+        # owner-labelled batch can be the only source for a company's rows
+        # in this export, and without this its users/sites/tasks would never
+        # be protected by `build_alias_rows`.
+        company_ids.update(r["company_id"] for r in pm_merged if r.get("company_id"))
+
+        _write_jsonl(out_dir / "threads.jsonl", th_merged)
+        th_counts = summarize_set("threads", th_merged, th_excl, database)
+        th_counts["owner_rows_dropped_deleted"] = th_owner_dropped
+        counts["threads"] = th_counts
+        company_ids.update(r["company_id"] for r in th_merged if r.get("company_id"))
+
         _write_jsonl(out_dir / "work_class.jsonl", wc_merged)
-        counts["work_class"] = summarize_set("work_class", wc_merged, wc_excl, database)
-        company_ids.update(r["company_id"] for r in wc_rows if r.get("company_id"))
+        wc_counts = summarize_set("work_class", wc_merged, wc_excl, database)
+        wc_counts["owner_rows_dropped_deleted"] = wc_owner_dropped
+        counts["work_class"] = wc_counts
+        company_ids.update(r["company_id"] for r in wc_merged if r.get("company_id"))
 
         alias_rows: list = []
         user_rows: list = []

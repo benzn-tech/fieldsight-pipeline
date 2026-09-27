@@ -528,3 +528,144 @@ def test_run_export_keeps_owner_rows_after_a_re_export(monkeypatch, tmp_path):
     assert threads_rows[0]["label_source"] == "owner"
     assert counts["threads"]["n"] == 1
     assert counts["threads"]["label_source_breakdown"] == {"owner": 1}
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 4, B9: owner-labelled rows are re-checked against the deletion
+# predicate on EVERY export, not just once at labelling time.
+# ---------------------------------------------------------------------------
+
+def test_owner_row_topic_ids_only_for_owner_rows_with_the_field():
+    assert ex.owner_row_topic_ids({"label_source": "db", "topic_ids": ["t1"]}) == []
+    assert ex.owner_row_topic_ids({"label_source": "owner"}) == []  # pre-fix owner row
+    assert ex.owner_row_topic_ids({"label_source": "owner", "topic_ids": ["t1", "t2"]}) == [
+        "t1", "t2",
+    ]
+    assert ex.owner_row_topic_ids(
+        {"label_source": "owner", "topic_ids": ["t1", None]}) == ["t1"]
+
+
+def test_apply_owner_deletion_predicate_drops_rows_with_any_invisible_topic():
+    rows = [
+        {"id": "a", "label_source": "owner", "topic_ids": ["t1", "t2"]},  # both visible
+        {"id": "b", "label_source": "owner", "topic_ids": ["t1", "t3"]},  # t3 not visible
+        {"id": "c", "label_source": "db"},  # nothing to check -- kept
+        {"id": "d", "label_source": "owner"},  # pre-fix, no topic_ids -- kept
+    ]
+    kept, n_dropped = ex.apply_owner_deletion_predicate(rows, {"t1", "t2"})
+    assert {r["id"] for r in kept} == {"a", "c", "d"}
+    assert n_dropped == 1
+
+
+def test_run_export_drops_owner_row_whose_topic_was_soft_deleted(monkeypatch, tmp_path):
+    (tmp_path / "work_class.jsonl").write_text(
+        json.dumps({
+            "id": "topic-deleted", "set": "work_class", "label": "yes",
+            "features": {}, "site_id": "s1", "company_id": "c1",
+            "decided_at": "2026-09-01T00:00:00Z", "baseline": {},
+            "label_source": "owner", "topic_ids": ["topic-deleted"],
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    empty_result = json.dumps({"records": []})
+
+    def _fake_run(args, capture_output=True, text=True):
+        if "begin-transaction" in args:
+            return _FakeCompleted(stdout=json.dumps({"transactionId": "tx-1"}))
+        if "execute-statement" in args:
+            sql_index = args.index("--sql") + 1
+            sql = args[sql_index]
+            if "FROM topics t WHERE t.id IN" in sql:
+                # The owner row's topic was soft-deleted since labelling --
+                # it is no longer in the visible set.
+                return _FakeCompleted(stdout=empty_result)
+            return _FakeCompleted(stdout=empty_result)
+        if "rollback-transaction" in args:
+            return _FakeCompleted(stdout=json.dumps({"transactionStatus": "RolledBack"}))
+        raise AssertionError(f"unexpected aws call: {args}")
+
+    monkeypatch.setattr(ex.subprocess, "run", _fake_run)
+
+    counts = ex.run_export("fieldsight_test", out_dir=tmp_path)
+
+    wc_rows = [json.loads(line) for line in
+               (tmp_path / "work_class.jsonl").read_text(encoding="utf-8").splitlines() if line]
+    assert wc_rows == []
+    assert counts["work_class"]["owner_rows_dropped_deleted"] == 1
+
+
+def test_run_export_keeps_owner_row_whose_topic_is_still_visible(monkeypatch, tmp_path):
+    (tmp_path / "work_class.jsonl").write_text(
+        json.dumps({
+            "id": "topic-live", "set": "work_class", "label": "yes",
+            "features": {}, "site_id": "s1", "company_id": "c1",
+            "decided_at": "2026-09-01T00:00:00Z", "baseline": {},
+            "label_source": "owner", "topic_ids": ["topic-live"],
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    def _fake_run(args, capture_output=True, text=True):
+        if "begin-transaction" in args:
+            return _FakeCompleted(stdout=json.dumps({"transactionId": "tx-1"}))
+        if "execute-statement" in args:
+            sql_index = args.index("--sql") + 1
+            sql = args[sql_index]
+            if "FROM topics t WHERE t.id IN" in sql:
+                return _FakeCompleted(stdout=json.dumps(
+                    {"records": [[{"stringValue": "topic-live"}]]}))
+            return _FakeCompleted(stdout=json.dumps({"records": []}))
+        if "rollback-transaction" in args:
+            return _FakeCompleted(stdout=json.dumps({"transactionStatus": "RolledBack"}))
+        raise AssertionError(f"unexpected aws call: {args}")
+
+    monkeypatch.setattr(ex.subprocess, "run", _fake_run)
+
+    counts = ex.run_export("fieldsight_test", out_dir=tmp_path)
+
+    wc_rows = [json.loads(line) for line in
+               (tmp_path / "work_class.jsonl").read_text(encoding="utf-8").splitlines() if line]
+    assert len(wc_rows) == 1
+    assert wc_rows[0]["id"] == "topic-live"
+    assert counts["work_class"]["owner_rows_dropped_deleted"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 4, B10: alias-lookup company ids must include owner rows, not
+# only fresh DB rows.
+# ---------------------------------------------------------------------------
+
+def test_run_export_includes_owner_row_company_id_in_alias_lookup(monkeypatch, tmp_path):
+    (tmp_path / "threads.jsonl").write_text(
+        json.dumps({
+            "id": "owner-row-2", "set": "threads", "label": "yes",
+            "features": {}, "site_id": "s1", "company_id": "owner-only-co",
+            "decided_at": "2026-09-01T00:00:00Z", "baseline": {"score": 0.5},
+            "label_source": "owner",
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    seen_company_id_queries = []
+
+    def _fake_run(args, capture_output=True, text=True):
+        if "begin-transaction" in args:
+            return _FakeCompleted(stdout=json.dumps({"transactionId": "tx-1"}))
+        if "execute-statement" in args:
+            sql_index = args.index("--sql") + 1
+            sql = args[sql_index]
+            if "owner-only-co" in sql:
+                seen_company_id_queries.append(sql)
+            return _FakeCompleted(stdout=json.dumps({"records": []}))
+        if "rollback-transaction" in args:
+            return _FakeCompleted(stdout=json.dumps({"transactionStatus": "RolledBack"}))
+        raise AssertionError(f"unexpected aws call: {args}")
+
+    monkeypatch.setattr(ex.subprocess, "run", _fake_run)
+
+    ex.run_export("fieldsight_test", out_dir=tmp_path)
+
+    # The owner row's company id must have reached at least one of the
+    # alias-lookup queries (name_aliases/users/companies/sites/tasks).
+    assert seen_company_id_queries

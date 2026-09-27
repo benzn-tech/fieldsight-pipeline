@@ -609,6 +609,11 @@ def build_thread_batch_row(pair: dict, stratum: str, site_topics: list) -> dict:
         "company_id": later.get("company_id"),
         "baseline": deployed_thread_baseline(pair, site_topics),
         "stratum": stratum,
+        # Fix wave 4, B9: both topic ids, kept ONLY for export_labels.py's
+        # per-export deletion-predicate recheck of owner-labelled rows --
+        # never rendered by label_page.py (like `stratum`), and not part of
+        # the Task 1 `features`/`baseline` shape sent anywhere.
+        "topic_ids": [later.get("id"), earlier.get("id")],
     }
 
 
@@ -681,6 +686,8 @@ def build_work_class_batch_row(topic: dict, stratum: str) -> dict:
             "classifier_confidence": topic.get("work_confidence"),
         },
         "stratum": stratum,
+        # Fix wave 4, B9: see the matching comment in build_thread_batch_row.
+        "topic_ids": [topic.get("id")],
     }
 
 
