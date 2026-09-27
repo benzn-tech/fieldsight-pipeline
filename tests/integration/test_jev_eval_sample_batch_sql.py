@@ -4,9 +4,17 @@ against a real PostgreSQL (Track A).
 Same pattern as tests/integration/test_jev_eval_export_labels_sql.py: seed
 minimal rows -- including a deleted topic that must not come back, and a
 pair/topic already resolved that must be excludable -- and run the real
-`sql_threads_topics()` / `sql_threads_existing_pairs()` /
-`sql_work_class_topics()` / `sql_work_class_existing()` strings through a
-real connection.
+`sql_threads_site_ids()` / `sql_threads_topics_for_site()` /
+`sql_threads_existing_pairs()` / `sql_work_class_topics_stratum()` /
+`sql_work_class_existing()` strings through a real connection.
+
+Fix wave 3, I3: threads topics are now paged one site at a time (bounded by
+LIMIT + a 1,000-char summary truncation) and work_class topics are sampled
+per (work_class, confidence-band) stratum (also LIMIT-bounded) -- both
+replacing a single unbounded query, to stay well under the RDS Data API's
+1 MiB single-statement response cap on prod. These tests cover the new SQL's
+LIMIT/ordering behaviour in addition to the deleted-topic exclusion the old
+tests already covered.
 
 Skipped unless `TEST_DATABASE_URL` is set (tests/conftest.py).
 """
@@ -39,7 +47,7 @@ def _fetch(db, sql):
 # threads: candidate topics excludes a deleted topic
 # ---------------------------------------------------------------------------
 
-def test_threads_topics_excludes_a_deleted_topic(db):
+def test_threads_site_ids_and_topics_for_site_excludes_a_deleted_topic(db):
     co, s = _seed_company_site(db)
     live = _topic_with_open_item(db, s["id"], "Door hardware install",
                                  report_date="2026-06-01", summary="Handles fitted.")
@@ -48,23 +56,58 @@ def test_threads_topics_excludes_a_deleted_topic(db):
     redactions.create_redaction(
         db, co["id"], deleted["id"], "user deleted", None, "worker", scope="deleted")
 
-    records = _fetch(db, sb.sql_threads_topics(120))
+    site_records = _fetch(db, sb.sql_threads_site_ids(120))
+    site_ids = {r["site_id"] for r in site_records}
+    assert s["id"] in site_ids
+
+    records = _fetch(db, sb.sql_threads_topics_for_site(s["id"], 120, 200))
     ids = {r["id"] for r in records}
     assert live["id"] in ids
     assert deleted["id"] not in ids
 
 
-def test_threads_topics_respects_window(db):
+def test_threads_topics_for_site_respects_window(db):
     co, s = _seed_company_site(db)
-    recent = _topic_with_open_item(db, s["id"], "Recent topic", report_date="2026-06-01")
     old = _topic_with_open_item(db, s["id"], "Old topic", report_date="2020-01-01")
 
-    records = _fetch(db, sb.sql_threads_topics(30))
+    records = _fetch(db, sb.sql_threads_topics_for_site(s["id"], 30, 200))
     ids = {r["id"] for r in records}
-    # `recent` may or may not fall inside a 30-day window depending on
-    # CURRENT_DATE at test time, so only assert on what is unambiguous:
-    # the topic from 2020 is never inside any realistic window.
+    # 2020 is never inside any realistic 30-day window from CURRENT_DATE.
     assert old["id"] not in ids
+
+
+def test_threads_topics_for_site_limit_keeps_most_recent(db):
+    co, s = _seed_company_site(db)
+    older = _topic_with_open_item(db, s["id"], "Older topic", report_date="2026-01-01")
+    newer = _topic_with_open_item(db, s["id"], "Newer topic", report_date="2026-06-01")
+
+    records = _fetch(db, sb.sql_threads_topics_for_site(s["id"], 365, 1))
+    assert len(records) == 1
+    assert records[0]["id"] == newer["id"]
+    assert older["id"] not in {r["id"] for r in records}
+
+
+def test_threads_topics_for_site_truncates_summary_to_1000_chars(db):
+    co, s = _seed_company_site(db)
+    long_summary = "x" * 2000
+    topic = _topic_with_open_item(db, s["id"], "Long summary topic",
+                                  report_date="2026-06-01", summary=long_summary)
+
+    records = _fetch(db, sb.sql_threads_topics_for_site(s["id"], 120, 200))
+    row = next(r for r in records if r["id"] == topic["id"])
+    assert len(row["summary"]) == 1000
+
+
+def test_threads_topics_for_site_only_returns_the_named_site(db):
+    co, s1 = _seed_company_site(db)
+    s2 = sites.create_site(db, co["id"], "Jev-Batch-Site-2")
+    t1 = _topic_with_open_item(db, s1["id"], "Site 1 topic", report_date="2026-06-01")
+    t2 = _topic_with_open_item(db, s2["id"], "Site 2 topic", report_date="2026-06-01")
+
+    records = _fetch(db, sb.sql_threads_topics_for_site(s1["id"], 120, 200))
+    ids = {r["id"] for r in records}
+    assert t1["id"] in ids
+    assert t2["id"] not in ids
 
 
 def test_threads_existing_pairs_lists_parent_topic_id_pairs(db):
@@ -97,7 +140,7 @@ def test_threads_pipeline_excludes_deleted_and_already_suggested(db):
         "VALUES (%s,%s,0.4,19,'rejected')",
         (later_already_suggested["id"], earlier["id"]))
 
-    topic_records = _fetch(db, sb.sql_threads_topics(120))
+    topic_records = _fetch(db, sb.sql_threads_topics_for_site(s["id"], 120, 200))
     existing_records = _fetch(db, sb.sql_threads_existing_pairs())
     existing_pairs = {(r["topic_id"], r["parent_topic_id"]) for r in existing_records}
 
@@ -115,10 +158,24 @@ def test_threads_pipeline_excludes_deleted_and_already_suggested(db):
 
 
 # ---------------------------------------------------------------------------
-# work_class
+# work_class -- I3's four per-stratum queries, merged the same way
+# sample_work_class() merges them (dedup on id).
 # ---------------------------------------------------------------------------
 
-def test_work_class_topics_excludes_a_deleted_topic(db):
+def _fetch_all_work_class_strata(db, window_days=365, seed=0, limit=500):
+    rows = []
+    seen = set()
+    for work_class, low_confidence in sb.WORK_CLASS_STRATA:
+        sql = sb.sql_work_class_topics_stratum(work_class, low_confidence, window_days, seed, limit)
+        for row in _fetch(db, sql):
+            if row["id"] in seen:
+                continue
+            seen.add(row["id"])
+            rows.append(row)
+    return rows
+
+
+def test_work_class_stratum_queries_exclude_a_deleted_topic(db):
     co, s = _seed_company_site(db)
     live = topics.upsert_topic(db, s["id"], "2026-06-01", "Chat about weekend",
                                summary="Personal chat.", category="personal",
@@ -129,22 +186,59 @@ def test_work_class_topics_excludes_a_deleted_topic(db):
     redactions.create_redaction(
         db, co["id"], deleted["id"], "user deleted", None, "worker", scope="deleted")
 
-    records = _fetch(db, sb.sql_work_class_topics())
-    ids = {r["id"] for r in records}
+    ids = {r["id"] for r in _fetch_all_work_class_strata(db)}
     assert live["id"] in ids
     assert deleted["id"] not in ids
 
 
-def test_work_class_topics_requires_non_null_work_class(db):
+def test_work_class_stratum_queries_require_matching_work_class(db):
     co, s = _seed_company_site(db)
     classified = topics.upsert_topic(db, s["id"], "2026-06-01", "Slab pour",
                                      work_class="work", work_confidence=0.95)
     unclassified = topics.upsert_topic(db, s["id"], "2026-06-01", "Unlabelled topic")
 
-    records = _fetch(db, sb.sql_work_class_topics())
-    ids = {r["id"] for r in records}
+    ids = {r["id"] for r in _fetch_all_work_class_strata(db)}
     assert classified["id"] in ids
     assert unclassified["id"] not in ids
+
+
+def test_work_class_stratum_query_respects_confidence_band(db):
+    co, s = _seed_company_site(db)
+    low = topics.upsert_topic(db, s["id"], "2026-06-01", "Low confidence work",
+                              work_class="work", work_confidence=0.4)
+    high = topics.upsert_topic(db, s["id"], "2026-06-01", "High confidence work",
+                               work_class="work", work_confidence=0.95)
+
+    low_sql = sb.sql_work_class_topics_stratum("work", True, 365, 0, 500)
+    high_sql = sb.sql_work_class_topics_stratum("work", False, 365, 0, 500)
+    low_ids = {r["id"] for r in _fetch(db, low_sql)}
+    high_ids = {r["id"] for r in _fetch(db, high_sql)}
+
+    assert low["id"] in low_ids and low["id"] not in high_ids
+    assert high["id"] in high_ids and high["id"] not in low_ids
+
+
+def test_work_class_stratum_query_limit_is_honoured(db):
+    co, s = _seed_company_site(db)
+    for i in range(5):
+        topics.upsert_topic(db, s["id"], "2026-06-01", f"Work topic {i}",
+                            work_class="work", work_confidence=0.95)
+
+    sql = sb.sql_work_class_topics_stratum("work", False, 365, 0, 2)
+    records = _fetch(db, sql)
+    assert len(records) == 2
+
+
+def test_work_class_stratum_query_truncates_summary_to_1000_chars(db):
+    co, s = _seed_company_site(db)
+    long_summary = "y" * 2000
+    topic = topics.upsert_topic(db, s["id"], "2026-06-01", "Long summary work topic",
+                                summary=long_summary, work_class="work", work_confidence=0.95)
+
+    sql = sb.sql_work_class_topics_stratum("work", False, 365, 0, 500)
+    records = _fetch(db, sql)
+    row = next(r for r in records if r["id"] == topic["id"])
+    assert len(row["summary"]) == 1000
 
 
 def test_work_class_existing_and_pipeline_excludes_already_fed_back(db):
@@ -159,7 +253,7 @@ def test_work_class_existing_and_pipeline_excludes_already_fed_back(db):
         "VALUES (%s,%s,'work',0.5,'reject_is_work')",
         (co["id"], fed_back["id"]))
 
-    topic_records = _fetch(db, sb.sql_work_class_topics())
+    topic_records = _fetch_all_work_class_strata(db)
     existing_records = _fetch(db, sb.sql_work_class_existing())
     already_fed_back = {r["topic_id"] for r in existing_records}
 

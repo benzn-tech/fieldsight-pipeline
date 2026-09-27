@@ -481,21 +481,38 @@ def test_threads_control_raises_when_only_identical_title_donors_exist():
 # control: work_class
 # ---------------------------------------------------------------------------
 
-def test_work_class_control_replaces_title_and_summary_only():
+def test_work_class_control_replaces_title_only_no_summary_added():
+    # Owner decision 2026-09-28 (carried from wave 2 / fix wave 3 item 7):
+    # work_class states carry only title + category, never summary -- the
+    # control must not manufacture a summary key the real state never has.
     control = QUESTION_SETS["work_class"]["control"]
-    state = {"title": "Site walk", "summary": "Discussed formwork.", "category": "site"}
+    state = {"title": "Site walk", "category": "site"}
     original = copy.deepcopy(state)
     result = control(state, donors=[], key="row-8")
 
     assert state == original
     assert result["title"] == "General discussion."
-    assert result["summary"] == "General discussion."
+    assert result["category"] == "site"
+    assert "summary" not in result
+
+
+def test_work_class_control_leaves_a_legacy_summary_key_untouched():
+    # Backward compatibility only: an older fixture row that still carries a
+    # summary key must not have it neutralised (that would add content the
+    # current real state never carries) -- but the title-only change must
+    # still register as "changed".
+    control = QUESTION_SETS["work_class"]["control"]
+    state = {"title": "Site walk", "summary": "Discussed formwork.", "category": "site"}
+    result = control(state, donors=[], key="row-8")
+
+    assert result["title"] == "General discussion."
+    assert result["summary"] == "Discussed formwork."
     assert result["category"] == "site"
 
 
 def test_work_class_control_ignores_donors_and_key():
     control = QUESTION_SETS["work_class"]["control"]
-    state = {"title": "Site walk", "summary": "Discussed formwork."}
+    state = {"title": "Site walk", "category": "site"}
     result_a = control(state, donors=[{"title": "irrelevant"}], key="row-9")
     result_b = control(state, donors=[], key="another-row")
     assert result_a == result_b
@@ -503,12 +520,19 @@ def test_work_class_control_ignores_donors_and_key():
 
 def test_work_class_control_raises_when_already_general_discussion():
     control = QUESTION_SETS["work_class"]["control"]
+    state = {"title": "General discussion.", "category": "site"}
+    original = copy.deepcopy(state)
+    with pytest.raises(JevQuestionsError):
+        control(state, donors=[], key="row-10")
+    assert state == original
+
+
+def test_work_class_control_raises_when_legacy_summary_also_unchanged():
+    control = QUESTION_SETS["work_class"]["control"]
     state = {
         "title": "General discussion.",
         "summary": "General discussion.",
         "category": "site",
     }
-    original = copy.deepcopy(state)
     with pytest.raises(JevQuestionsError):
-        control(state, donors=[], key="row-10")
-    assert state == original
+        control(state, donors=[], key="row-11")

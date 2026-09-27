@@ -118,7 +118,19 @@ def _assert_changed(original, new, description: str) -> None:
     """Cheap post-condition: raise if a control ended up producing the exact
     same value it started with. Defense in depth behind the donor-exclusion
     filters above -- an unchanged control would silently pass the Task 7
-    "control differs from state" check."""
+    "control differs from state" check.
+
+    `original`/`new` may each be a same-length tuple of fields instead of a
+    single scalar (the work_class control -- fix wave 3, item 7 / carried
+    from wave 2 -- passes `(title,)` or `(title, summary)` depending on
+    whether the state carries a `summary` key at all): a tuple passes as
+    "changed" if ANY position differs, so a control that only ever touches
+    `title` is not blocked by an unrelated field being identical."""
+    if isinstance(original, tuple) and isinstance(new, tuple):
+        if any(o != n for o, n in zip(original, new)):
+            return
+        raise JevQuestionsError(
+            f"control produced no change in {description}; refusing a no-op control")
     if original == new:
         raise JevQuestionsError(
             f"control produced no change in {description}; refusing a no-op control")
@@ -425,20 +437,34 @@ def _broad_score_work_class(answers: dict) -> float:
 
 
 def _control_work_class(state: dict, donors: list, key) -> dict:
-    """Ignores `donors` and `key` (per the brief): replaces `title` and
-    `summary` with a neutral sentence. `category` is left untouched -- the
-    brief names only title and summary as the swap target, and category is
-    a coarse label rather than the free-text content the control needs to
-    neutralise."""
+    """Ignores `donors` and `key` (per the brief): replaces ONLY `title` with
+    a neutral sentence. `category` is left untouched, same as before.
+
+    Carried from wave 2 / fix wave 3 item 7 (owner decision, 2026-09-28):
+    work_class states no longer carry a `summary` key at all
+    (`state.py::_build_work_class` sends only `title` + `category` --
+    `summary` is exactly where the recorder's private-life content lives).
+    The control must only replace keys the real state actually has -- adding
+    a `summary` key here would hand `label_page.py`/the runner a field the
+    real broad/decomposed states never carry, silently telling Jev this
+    control row has content the matched real row does not."""
     original_title = state.get("title")
-    original_summary = state.get("summary")
     new_state = copy.deepcopy(state)
     new_state["title"] = "General discussion."
-    new_state["summary"] = "General discussion."
-    _assert_changed(
-        (original_title, original_summary),
-        (new_state["title"], new_state["summary"]),
-        "title/summary")
+
+    before = (original_title,)
+    after = (new_state["title"],)
+    if "summary" in state:
+        # Backward compatibility only: an older fixture row that still
+        # carries a summary key is left AS IS -- never neutralised, since
+        # the current work_class state (`state.py::_build_work_class`) never
+        # has one, and this control must not manufacture a key the real
+        # state does not have. Comparing it here (unchanged, on both sides)
+        # never blocks the title-only change from counting as "changed".
+        before = (original_title, state.get("summary"))
+        after = (new_state["title"], new_state.get("summary"))
+
+    _assert_changed(before, after, "title")
     return new_state
 
 

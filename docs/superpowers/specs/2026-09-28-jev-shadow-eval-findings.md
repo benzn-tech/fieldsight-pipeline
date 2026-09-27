@@ -211,6 +211,24 @@ owner-labelled batch (planned as Task 10) with balanced classes. The existing pr
 above are a descriptive dry run only — not inputs to a replace/augment/not-adopted verdict, per
 the amended eligibility rule, and not to be treated as if they were.
 
+**Fix wave 3, I6 — what the exported `threads`/`programme_match` labels can and cannot show:**
+every row in both sets above exists ONLY because `topic_thread_suggestions` /
+`programme_progress_suggestions` already carries it — i.e. because the deployed gate proposed
+that pair/match in the first place and a human then confirmed or rejected it. A topic the gate
+never proposed (a real restatement/match it missed) never enters `topic_thread_suggestions` /
+`programme_progress_suggestions` at all, so it can never appear in these exported sets no matter
+how the human would have labelled it. These two sets therefore measure **"can Jev filter the
+gate's false positives out of what the gate already proposed"** — a precision-side question —
+**never the gate's recall**: a Jev arm that agrees with every human "no" on these sets says
+nothing about how many real restatements/matches the deployed gate silently missed. `sample_batch.py`'s
+owner-labelled `threads` batch (I6) partly compensates by also recomputing `baseline.score`/
+`baseline.top_hit` under the DEPLOYED gate's own corpus definition (same site, `MAX_GAP_DAYS`
+window, `open_items > 0`) for every sampled pair, so a batch row can at least say whether the
+deployed gate would have proposed THIS pair as its top hit — but even that batch is drawn from
+pairs `find_candidates`/`score_pair` are capable of producing at all, not from restatements the
+gate's own eligibility rules (open items on both sides, the gap cap) rule out before scoring ever
+starts.
+
 ---
 
 ## 4. Privacy conditions in force

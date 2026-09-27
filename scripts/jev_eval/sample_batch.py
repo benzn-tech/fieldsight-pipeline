@@ -24,10 +24,15 @@ the matcher's embedding gate).
 
 ## threads
 
-Per site, pull topics from the last `--window-days` days (default 120),
-shaped exactly like `repositories.threads.candidate_corpus` (title / summary
-/ open_items / report_date / id), with `deleted_predicates.visible_topics_predicate`
-applied to the `topics` alias. Pairs are generated in PYTHON with the REAL
+Fix wave 3, I3: pulled ONE SITE AT A TIME (`sql_threads_site_ids` then
+`sql_threads_topics_for_site` per site), each query capped to the
+`--max-topics-per-site` most recent topics and `summary` truncated to 1,000
+characters -- the previous single, all-sites, full-summary, 120-day query
+risked exceeding the RDS Data API's 1 MiB single-statement response cap on
+prod. Shaped exactly like `repositories.threads.candidate_corpus` (title /
+summary / open_items / report_date / id), with
+`deleted_predicates.visible_topics_predicate` applied to the `topics` alias.
+Pairs are generated in PYTHON with the REAL
 `thread_match.score_pair` / `thread_match.find_candidates` (imported, not
 reimplemented) -- never a re-derived scorer:
 
@@ -77,10 +82,28 @@ data; the exclusion set only needs the direct parent_topic_id shape.
 
 ## work_class
 
-Topics with `work_class` NOT NULL, `visible_topics_predicate` applied,
-excluding any topic already in `classification_feedback` (any row). Stratified
-~50/50 by `work_class` ('work'/'non_work'), oversampling `work_confidence < 0.8`
-within each half (low-confidence rows are the ones worth a second human look).
+Fix wave 3, I3: four bounded per-stratum queries
+(`sql_work_class_topics_stratum`, one per (work_class, confidence-band)
+combination), each windowed to `--work-class-window-days` (default 365) and
+capped to `--work-class-stratum-limit` rows via
+`ORDER BY md5(id || seed) LIMIT` -- replacing a single query for "every topic
+with `work_class` NOT NULL across all history", which risked the same 1 MiB
+cap. `visible_topics_predicate` applied to every stratum query; any topic
+already in `classification_feedback` (any row) is excluded afterwards, same
+as before. Stratified ~50/50 by `work_class` ('work'/'non_work'), oversampling
+`work_confidence < 0.8` within each half (low-confidence rows are the ones
+worth a second human look).
+
+## Labelling order (fix wave 3, I2)
+
+`stratify_thread_pairs`/`stratify_work_class` build their `chosen` list
+stratum by stratum, which used to leak straight through to the written batch
+file and then to `label_page.py`'s rendering order -- the labeller would see
+every high-score pair before any mid/low one, or every classifier-`work`
+topic before any `non_work` one, which anchors a human on the matcher's own
+judgement before they answer. `order_for_labelling` shuffles the FINAL row
+list with a key derived from `sha256(seed:id)` -- deterministic per seed,
+independent of stratum/verdict order and of database row order.
 
 ## Output
 
@@ -102,7 +125,7 @@ import hashlib
 import json
 import random
 import sys
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import thread_match
@@ -115,6 +138,13 @@ BATCH_DIR = ex.FIXTURES_DIR / "batch"
 DEFAULT_SIZE = 100
 DEFAULT_WINDOW_DAYS = 120
 DEFAULT_SEED = 0
+
+# Fix wave 3, I3: prod's RDS Data API caps a single statement's response at
+# 1 MiB. `sql_work_class_topics_stratum` bounds the classifier's whole-history
+# scan to this many days (a flag, not hardcoded), and `k` (the per-stratum
+# LIMIT) below is sized with headroom over what `stratify_work_class` needs.
+DEFAULT_WORK_CLASS_WINDOW_DAYS = 365
+DEFAULT_WORK_CLASS_STRATUM_LIMIT = 500
 
 # Bounds on the threads pair-generation work (fix round 1, Important #2):
 # `score_pair` rebuilds its IDF map over the whole per-site corpus on every
@@ -144,29 +174,66 @@ THREADS_TOPIC_COLUMNS = (
 )
 
 
-def sql_threads_topics(window_days: int) -> str:
+def _sql_quote(value) -> str:
+    """Escape a single value for interpolation into a literal -- the same
+    single-quote doubling `export_labels.sql_name_aliases` relies on for its
+    trusted, already-fetched-from-the-database uuid strings. Every caller of
+    this in this module interpolates values read back from this script's own
+    earlier queries (site ids), never user-typed text."""
+    return str(value).replace("'", "''")
+
+
+def sql_threads_site_ids(window_days: int) -> str:
+    """Site ids with at least one visible topic inside the window -- the
+    first half of the fix for I3 (RDS Data API's 1 MiB response cap):
+    `sample_threads` pages topics ONE SITE AT A TIME (`sql_threads_topics_for_site`)
+    rather than pulling every site's topics in one statement, and this small
+    (site-id-only) query is what it loops over."""
+    visible_t = visible_topics_predicate("t")
+    window_days = int(window_days)
+    return (
+        "SELECT DISTINCT t.site_id "
+        "FROM topics t "
+        f"WHERE t.report_date >= (CURRENT_DATE - {window_days}::int) "
+        f"AND {visible_t}"
+    )
+
+
+def sql_threads_topics_for_site(site_id, window_days: int, limit: int) -> str:
     """Same shape as `repositories.threads.candidate_corpus` (title / summary /
-    open_items / report_date / id), but across ALL sites within the window --
-    grouping into per-site corpora happens in Python (`group_by_site`) so this
-    stays one query rather than one per site. `window_days` is an int this
-    script's own CLI/default supplies, never user text -- interpolated the
-    same way `export_labels.sql_name_aliases` interpolates its trusted
+    open_items / report_date / id), for exactly ONE site, capped to the
+    `limit` most recent topics and with `summary` truncated to 1,000
+    characters -- the two bounds fix wave 3's I3 requires so a single
+    statement's rows stay well under the RDS Data API's 1 MiB response cap,
+    even on prod's largest site. `window_days`/`limit` are ints this script's
+    own CLI/default supplies; `site_id` is a uuid this script already read
+    back from `sql_threads_site_ids` in the SAME transaction -- interpolated
+    the same way `export_labels.sql_name_aliases` interpolates its trusted
     company_ids.
 
     Visibility uses `deleted_predicates.visible_topics_predicate("t")`
     (imported, not copied) -- the same predicate `candidate_corpus` applies,
-    ANDed into `WHERE` exactly where that function puts it."""
+    ANDed into `WHERE` exactly where that function puts it. Ordering by
+    `report_date DESC, id DESC` before the `LIMIT` is what makes the cap keep
+    the MOST RECENT topics (mirrors `cap_topics_per_site`'s own tie-break),
+    rather than an arbitrary `limit`-sized slice."""
     visible_t = visible_topics_predicate("t")
     window_days = int(window_days)
+    limit = int(limit)
+    site_id = _sql_quote(site_id)
     return (
-        "SELECT t.id, t.report_date, t.site_id, si.company_id, t.title, t.summary, "
+        "SELECT t.id, t.report_date, t.site_id, si.company_id, t.title, "
+        "       left(t.summary, 1000) AS summary, "
         "       count(a.id) FILTER (WHERE a.status='open') AS open_items "
         "FROM topics t "
         "JOIN sites si ON si.id = t.site_id "
         "LEFT JOIN action_items a ON a.topic_id = t.id "
-        f"WHERE t.report_date >= (CURRENT_DATE - {window_days}::int) "
+        f"WHERE t.site_id = '{site_id}' "
+        f"AND t.report_date >= (CURRENT_DATE - {window_days}::int) "
         f"AND {visible_t} "
-        "GROUP BY t.id, si.company_id"
+        "GROUP BY t.id, si.company_id "
+        "ORDER BY t.report_date DESC, t.id DESC "
+        f"LIMIT {limit}"
     )
 
 
@@ -191,16 +258,47 @@ WORK_CLASS_TOPIC_COLUMNS = (
     "site_id", "company_id",
 )
 
+# (work_class, low_confidence) -- the four strata I3's per-stratum sampling
+# draws from, mirroring `stratify_work_class`'s own ~50/50 x low/high split.
+WORK_CLASS_STRATA = (
+    ("work", True), ("work", False),
+    ("non_work", True), ("non_work", False),
+)
 
-def sql_work_class_topics() -> str:
-    """Topics with a classifier verdict, visibility predicate applied on `t`."""
+
+def sql_work_class_topics_stratum(work_class: str, low_confidence: bool,
+                                   window_days: int, seed: int, limit: int) -> str:
+    """One (work_class, confidence-band) stratum, windowed to `window_days`
+    (default 365, a flag -- fix wave 3 I3) and capped to `limit` rows chosen
+    by `ORDER BY md5(t.id::text || seed) LIMIT limit` -- a deterministic,
+    seed-stable pseudo-random sample rather than "every topic with a
+    classifier verdict across all history", which is what made this query
+    risk the RDS Data API's 1 MiB response cap on prod. `summary` is
+    truncated to 1,000 characters, same as `sql_threads_topics_for_site`.
+
+    `work_class` is always one of this module's own `WORK_CLASS_STRATA`
+    values (never user text); `window_days`/`seed`/`limit` are ints this
+    script's CLI/default supplies -- all interpolated the same way
+    `export_labels.sql_name_aliases` interpolates its trusted values."""
     visible_t = visible_topics_predicate("t")
+    window_days = int(window_days)
+    limit = int(limit)
+    work_class = _sql_quote(work_class)
+    salt = _sql_quote(seed)
+    conf_clause = (
+        "t.work_confidence < 0.8" if low_confidence
+        else "(t.work_confidence IS NULL OR t.work_confidence >= 0.8)"
+    )
     return (
-        "SELECT t.id, t.title, t.summary, t.category, t.work_class, t.work_confidence, "
-        "       t.site_id, si.company_id "
+        "SELECT t.id, t.title, left(t.summary, 1000) AS summary, t.category, "
+        "       t.work_class, t.work_confidence, t.site_id, si.company_id "
         "FROM topics t "
         "JOIN sites si ON si.id = t.site_id "
-        f"WHERE t.work_class IS NOT NULL AND {visible_t}"
+        f"WHERE t.work_class = '{work_class}' AND {conf_clause} "
+        f"AND t.report_date >= (CURRENT_DATE - {window_days}::int) "
+        f"AND {visible_t} "
+        f"ORDER BY md5(t.id::text || '{salt}') "
+        f"LIMIT {limit}"
     )
 
 
@@ -369,6 +467,59 @@ def thread_pair_id(later_id, earlier_id) -> str:
     return f"threads:{digest[:24]}"
 
 
+# ---------------------------------------------------------------------------
+# I6: recompute baseline.score/top_hit under the DEPLOYED gate's corpus
+# definition, not this script's own (wider, lowered-floor) sampling corpus.
+# ---------------------------------------------------------------------------
+
+def deployed_corpus_for(later: dict, site_topics: list) -> list:
+    """The corpus `repositories.threads.candidate_corpus` would build for
+    `later` if it were the topic just written by the item-writer: same site
+    (implicit -- `site_topics` is already one site's pool), strictly earlier,
+    within `thread_match.MAX_GAP_DAYS`, and carrying open work. Built from
+    `site_topics` (this script's own already-fetched, recency-capped per-site
+    pool -- see `sql_threads_topics_for_site`) rather than a fresh query,
+    since every pair this script ever samples already has its gap capped at
+    MAX_GAP_DAYS and both sides' open_items > 0 (`generate_thread_pairs`'s own
+    eligibility rules), so the earlier topic of any sampled pair is always a
+    member of this set."""
+    later_date = _as_date(later.get("report_date"))
+    if later_date is None:
+        return []
+    floor = later_date - timedelta(days=thread_match.MAX_GAP_DAYS)
+    out = []
+    for t in site_topics:
+        if t is later or t.get("id") == later.get("id"):
+            continue
+        t_date = _as_date(t.get("report_date"))
+        if t_date is None or not (floor <= t_date < later_date):
+            continue
+        if not (t.get("open_items") or 0):
+            continue
+        out.append(t)
+    return out
+
+
+def deployed_thread_baseline(pair: dict, site_topics: list) -> dict:
+    """`{"score", "top_hit"}` for a sampled (later, earlier) pair, computed
+    against the corpus the DEPLOYED gate (`lambda_item_writer._suggest_threads_inner`)
+    would actually see for `later`'s date, not the batch's own wider/lowered-
+    floor sampling corpus (fix wave 3, I6). `score` is the real
+    `thread_match.score_pair` over that corpus; `top_hit` is whether
+    `earlier` is exactly `find_candidates(...)[0]` under it -- i.e. whether
+    the deployed gate would have proposed THIS pair as its single suggestion.
+    Mirrors `_suggest_threads_inner` exactly: the later topic joins its own
+    corpus for IDF only (`list(corpus) + [later]`), and `find_candidates` is
+    never given a lowered floor here."""
+    later, earlier = pair["later"], pair["earlier"]
+    corpus = deployed_corpus_for(later, site_topics)
+    corpus_with_self = list(corpus) + [later]
+    score = thread_match.score_pair(later, earlier, corpus_with_self)
+    hits = thread_match.find_candidates(later, corpus_with_self)
+    top_hit = bool(hits) and hits[0].get("id") == earlier.get("id")
+    return {"score": score, "top_hit": top_hit}
+
+
 def apply_thread_exclusions(pairs: list, existing_pairs: set) -> list:
     """Drop any pair already present in `topic_thread_suggestions`, in ANY
     status. `existing_pairs` is a set of (topic_id, parent_topic_id) tuples."""
@@ -418,7 +569,12 @@ def stratify_thread_pairs(pairs: list, size: int, seed: int) -> tuple:
     return chosen, counts
 
 
-def build_thread_batch_row(pair: dict, stratum: str) -> dict:
+def build_thread_batch_row(pair: dict, stratum: str, site_topics: list) -> dict:
+    """`site_topics` is the sampled pool for `pair["later"]`'s site (as
+    fetched by `sql_threads_topics_for_site`) -- passed through so `baseline`
+    can be recomputed under the DEPLOYED gate's own corpus definition
+    (`deployed_thread_baseline`, fix wave 3 I6) rather than carrying this
+    script's own wider/lowered-floor sampling score."""
     later, earlier = pair["later"], pair["earlier"]
     features = {
         "earlier": {
@@ -451,7 +607,7 @@ def build_thread_batch_row(pair: dict, stratum: str) -> dict:
         "display": display,
         "site_id": later.get("site_id"),
         "company_id": later.get("company_id"),
-        "baseline": {"score": pair["score"]},
+        "baseline": deployed_thread_baseline(pair, site_topics),
         "stratum": stratum,
     }
 
@@ -542,6 +698,22 @@ def _write_batch(set_name: str, rows: list) -> Path:
     return path
 
 
+def order_for_labelling(rows: list, seed: int) -> list:
+    """Fix wave 3, I2: `stratify_thread_pairs`/`stratify_work_class` build
+    `rows` stratum by stratum (all `high` before all `mid` before all `low`;
+    all `work` before all `non_work`), and until this fix `label_page.py`
+    rendered them in exactly that order -- so position alone told the
+    labeller the matcher's own stratum/verdict before they answered a single
+    question. This shuffles the FINAL row list with a key derived from
+    `sha256(seed:id)`, deterministic for a given seed (a re-run with the same
+    seed produces the same order, so a resumed labelling session's
+    `localStorage` progress still lines up) and independent of both database
+    row order and the stratum the row came from."""
+    def _key(row):
+        return hashlib.sha256(f"{seed}:{row['id']}".encode("utf-8")).hexdigest()
+    return sorted(rows, key=_key)
+
+
 def sample_threads(database: str, *, size: int = DEFAULT_SIZE,
                     window_days: int = DEFAULT_WINDOW_DAYS, seed: int = DEFAULT_SEED,
                     max_topics_per_site: int = DEFAULT_MAX_TOPICS_PER_SITE,
@@ -549,11 +721,25 @@ def sample_threads(database: str, *, size: int = DEFAULT_SIZE,
                     profile: str = ex.DEFAULT_PROFILE, region: str = ex.DEFAULT_REGION) -> dict:
     tx = ex._begin_transaction(database, profile, region)
     try:
-        topics_result = ex._execute(database, tx, sql_threads_topics(window_days), profile, region)
-        topic_rows = [
-            ex.record_to_dict(THREADS_TOPIC_COLUMNS, r)
-            for r in topics_result.get("records", [])
-        ]
+        # Fix wave 3, I3: page one site at a time (`sql_threads_topics_for_site`,
+        # capped to `max_topics_per_site` most-recent topics and 1,000-char
+        # summaries) rather than pulling every site's topics in one statement
+        # -- the RDS Data API caps a single response at 1 MiB, and prod's full
+        # 120-day, all-sites, full-summary query risked exceeding it.
+        sites_result = ex._execute(database, tx, sql_threads_site_ids(window_days), profile, region)
+        site_ids = sorted(
+            {ex.decode_field(r[0]) for r in sites_result.get("records", [])}, key=str)
+
+        topic_rows = []
+        for site_id in site_ids:
+            site_result = ex._execute(
+                database, tx,
+                sql_threads_topics_for_site(site_id, window_days, max_topics_per_site),
+                profile, region)
+            topic_rows.extend(
+                ex.record_to_dict(THREADS_TOPIC_COLUMNS, r)
+                for r in site_result.get("records", []))
+
         existing_result = ex._execute(database, tx, sql_threads_existing_pairs(), profile, region)
         existing_pairs = {
             (ex.record_to_dict(THREADS_EXISTING_COLUMNS, r)["topic_id"],
@@ -564,12 +750,18 @@ def sample_threads(database: str, *, size: int = DEFAULT_SIZE,
         ex._rollback(tx, profile, region)
 
     topics_by_site = group_by_site(topic_rows)
+    # Defensive, not load-bearing now that the SQL itself caps each site to
+    # `max_topics_per_site` -- a no-op whenever the SQL's own LIMIT held.
     topics_by_site = cap_topics_per_site(topics_by_site, max_topics_per_site)
     pairs, diagnostics = generate_thread_pairs(
         topics_by_site, max_pairs_per_topic=max_pairs_per_topic, seed=seed)
     pairs = apply_thread_exclusions(pairs, existing_pairs)
     chosen, counts = stratify_thread_pairs(pairs, size, seed)
-    rows = [build_thread_batch_row(pair, stratum) for pair, stratum in chosen]
+    rows = [
+        build_thread_batch_row(pair, stratum, topics_by_site[pair["later"]["site_id"]])
+        for pair, stratum in chosen
+    ]
+    rows = order_for_labelling(rows, seed)
     path = _write_batch("threads", rows)
 
     for site_id, site_diag in sorted(diagnostics.items(), key=str):
@@ -586,14 +778,31 @@ def sample_threads(database: str, *, size: int = DEFAULT_SIZE,
 
 
 def sample_work_class(database: str, *, size: int = DEFAULT_SIZE, seed: int = DEFAULT_SEED,
+                       window_days: int = DEFAULT_WORK_CLASS_WINDOW_DAYS,
+                       stratum_limit: int = DEFAULT_WORK_CLASS_STRATUM_LIMIT,
                        profile: str = ex.DEFAULT_PROFILE, region: str = ex.DEFAULT_REGION) -> dict:
     tx = ex._begin_transaction(database, profile, region)
     try:
-        topics_result = ex._execute(database, tx, sql_work_class_topics(), profile, region)
-        topic_rows = [
-            ex.record_to_dict(WORK_CLASS_TOPIC_COLUMNS, r)
-            for r in topics_result.get("records", [])
-        ]
+        # Fix wave 3, I3: four bounded per-stratum queries (windowed to
+        # `window_days`, capped to `stratum_limit` rows each via
+        # `ORDER BY md5(id||seed) LIMIT`) instead of "every topic with a
+        # classifier verdict across all history" -- the query this replaced
+        # risked the RDS Data API's 1 MiB response cap on prod.
+        topic_rows = []
+        seen_ids = set()
+        for work_class, low_confidence in WORK_CLASS_STRATA:
+            stratum_result = ex._execute(
+                database, tx,
+                sql_work_class_topics_stratum(
+                    work_class, low_confidence, window_days, seed, stratum_limit),
+                profile, region)
+            for r in stratum_result.get("records", []):
+                row = ex.record_to_dict(WORK_CLASS_TOPIC_COLUMNS, r)
+                if row["id"] in seen_ids:
+                    continue
+                seen_ids.add(row["id"])
+                topic_rows.append(row)
+
         existing_result = ex._execute(database, tx, sql_work_class_existing(), profile, region)
         already_fed_back = {
             ex.decode_field(r[0]) for r in existing_result.get("records", [])
@@ -604,9 +813,11 @@ def sample_work_class(database: str, *, size: int = DEFAULT_SIZE, seed: int = DE
     topics = apply_work_class_exclusions(topic_rows, already_fed_back)
     chosen, counts = stratify_work_class(topics, size, seed)
     rows = [build_work_class_batch_row(topic, stratum) for topic, stratum in chosen]
+    rows = order_for_labelling(rows, seed)
     path = _write_batch("work_class", rows)
     return {"set": "work_class", "n": len(rows), "strata": counts, "path": str(path),
-            "database": database, "seed": seed}
+            "database": database, "seed": seed, "window_days": window_days,
+            "stratum_limit": stratum_limit}
 
 
 def main(argv=None) -> int:
@@ -622,6 +833,12 @@ def main(argv=None) -> int:
     parser.add_argument("--max-pairs-per-topic", type=int, default=DEFAULT_MAX_PAIRS_PER_TOPIC,
                          help="threads only: cap eligible earlier topics scored per later "
                               "topic in the low-stratum harvest")
+    parser.add_argument("--work-class-window-days", type=int,
+                         default=DEFAULT_WORK_CLASS_WINDOW_DAYS,
+                         help="work_class only: history window for the per-stratum sample")
+    parser.add_argument("--work-class-stratum-limit", type=int,
+                         default=DEFAULT_WORK_CLASS_STRATUM_LIMIT,
+                         help="work_class only: per-(work_class,confidence-band) row cap")
     parser.add_argument("--database", default=ex.DEFAULT_DATABASE)
     parser.add_argument("--allow-prod", action="store_true",
                          help="required to target --database fieldsight")
@@ -649,6 +866,8 @@ def main(argv=None) -> int:
         else:
             summary["work_class"] = sample_work_class(
                 args.database, size=args.size, seed=args.seed,
+                window_days=args.work_class_window_days,
+                stratum_limit=args.work_class_stratum_limit,
                 profile=args.profile, region=args.region)
 
     print(json.dumps(summary, indent=2, sort_keys=True, default=str))

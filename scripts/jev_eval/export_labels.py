@@ -593,7 +593,7 @@ def summarize_set(set_name: str, rows: list, exclusions: dict, database: str) ->
     n = len(rows)
     positives = sum(1 for r in rows if r["label"] == "yes")
     negatives = sum(1 for r in rows if r["label"] == "no")
-    return {
+    summary = {
         "n": n,
         "positives": positives,
         "negatives": negatives,
@@ -602,6 +602,12 @@ def summarize_set(set_name: str, rows: list, exclusions: dict, database: str) ->
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "exclusions": exclusions,
     }
+    # Fix wave 3, I5: recomputed from the MERGED rows (this export's fresh DB
+    # rows plus any surviving owner rows) so a re-export never drops the
+    # breakdown `import_labels.py` had already written.
+    if any(r.get("label_source") for r in rows):
+        summary["label_source_breakdown"] = _label_source_breakdown(rows)
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -664,6 +670,45 @@ def _write_jsonl(path: Path, rows: list) -> None:
             fh.write("\n")
 
 
+def _load_jsonl(path: Path) -> list:
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            rows.append(json.loads(line))
+    return rows
+
+
+def _label_source_breakdown(rows: list) -> dict:
+    breakdown: dict = {}
+    for row in rows:
+        source = row.get("label_source") or "unknown"
+        breakdown[source] = breakdown.get(source, 0) + 1
+    return breakdown
+
+
+def merge_export_rows(existing_rows: list, new_rows: list) -> list:
+    """Fix wave 3, I5: `_write_jsonl` used to open `{set}.jsonl` with `"w"`,
+    so a re-export silently wiped out every row `import_labels.py` had
+    already merged in from an owner-labelled batch. This keeps any existing
+    row whose `label_source == "owner"` -- an owner override always wins on
+    an id collision -- and replaces every other id with this export's fresh
+    DB-sourced row (tagged `label_source: "db"` here; the mapper functions
+    never set it, so `test_*_row_has_exact_keys_and_shape`'s exact-key
+    assertions on `map_*_row`'s OWN output are unaffected). Sorted by id for
+    a stable diff, same convention as `import_labels.merge_rows`."""
+    tagged = []
+    for row in new_rows:
+        row = dict(row)
+        row.setdefault("label_source", "db")
+        tagged.append(row)
+    owner_by_id = {r["id"]: r for r in existing_rows if r.get("label_source") == "owner"}
+    merged = {r["id"]: r for r in tagged}
+    merged.update(owner_by_id)
+    return [merged[key] for key in sorted(merged, key=str)]
+
+
 def _write_json(path: Path, payload) -> None:
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, sort_keys=True)
@@ -687,24 +732,34 @@ def run_export(database: str, *, profile: str = DEFAULT_PROFILE,
         counts: dict = {}
         company_ids: set = set()
 
+        # Fix wave 3, I5: merge each set's fresh DB rows with any existing
+        # file's owner-labelled rows (`merge_export_rows`) BEFORE writing --
+        # `_write_jsonl` opening with "w" used to wipe out every row
+        # `import_labels.py` had merged in from an owner-labelled batch.
         pm_result = _execute(database, tx, sql_programme_match(), profile, region)
         pm_rows, pm_excl = _process(pm_result, PROGRAMME_MATCH_COLUMNS,
                                     map_programme_match_row)
-        _write_jsonl(out_dir / "programme_match.jsonl", pm_rows)
-        counts["programme_match"] = summarize_set("programme_match", pm_rows, pm_excl, database)
+        pm_existing = _load_jsonl(out_dir / "programme_match.jsonl")
+        pm_merged = merge_export_rows(pm_existing, pm_rows)
+        _write_jsonl(out_dir / "programme_match.jsonl", pm_merged)
+        counts["programme_match"] = summarize_set("programme_match", pm_merged, pm_excl, database)
         company_ids.update(r["company_id"] for r in pm_rows if r.get("company_id"))
 
         th_result = _execute(database, tx, sql_threads(), profile, region)
         th_rows, th_excl = _process(th_result, THREADS_COLUMNS, map_threads_row)
         th_excl.setdefault("deleted_topic_rows", "invisible (FK cascades)")
-        _write_jsonl(out_dir / "threads.jsonl", th_rows)
-        counts["threads"] = summarize_set("threads", th_rows, th_excl, database)
+        th_existing = _load_jsonl(out_dir / "threads.jsonl")
+        th_merged = merge_export_rows(th_existing, th_rows)
+        _write_jsonl(out_dir / "threads.jsonl", th_merged)
+        counts["threads"] = summarize_set("threads", th_merged, th_excl, database)
         company_ids.update(r["company_id"] for r in th_rows if r.get("company_id"))
 
         wc_result = _execute(database, tx, sql_work_class(), profile, region)
         wc_rows, wc_excl = _process(wc_result, WORK_CLASS_COLUMNS, map_work_class_row)
-        _write_jsonl(out_dir / "work_class.jsonl", wc_rows)
-        counts["work_class"] = summarize_set("work_class", wc_rows, wc_excl, database)
+        wc_existing = _load_jsonl(out_dir / "work_class.jsonl")
+        wc_merged = merge_export_rows(wc_existing, wc_rows)
+        _write_jsonl(out_dir / "work_class.jsonl", wc_merged)
+        counts["work_class"] = summarize_set("work_class", wc_merged, wc_excl, database)
         company_ids.update(r["company_id"] for r in wc_rows if r.get("company_id"))
 
         alias_rows: list = []

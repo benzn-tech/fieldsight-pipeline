@@ -462,3 +462,69 @@ def test_run_export_writes_fixtures_and_rolls_back_on_success(monkeypatch, tmp_p
 
     rollback_calls = [c for c in calls if "rollback-transaction" in c]
     assert len(rollback_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# I5: re-export must not wipe owner-labelled rows
+# ---------------------------------------------------------------------------
+
+def test_merge_export_rows_keeps_owner_rows_on_id_collision():
+    existing = [
+        {"id": "a", "label": "yes", "label_source": "owner"},
+        {"id": "b", "label": "no", "label_source": "db"},
+    ]
+    new_db_rows = [
+        {"id": "a", "label": "no"},   # DB export disagrees with the owner
+        {"id": "c", "label": "yes"},
+    ]
+    merged = ex.merge_export_rows(existing, new_db_rows)
+    by_id = {r["id"]: r for r in merged}
+    assert by_id["a"]["label"] == "yes"
+    assert by_id["a"]["label_source"] == "owner"
+    assert by_id["c"]["label_source"] == "db"
+    assert "b" not in by_id  # dropped: was db-sourced and absent from this export
+
+
+def test_merge_export_rows_tags_new_rows_db_without_mutating_input():
+    new_rows = [{"id": "x", "label": "yes"}]
+    merged = ex.merge_export_rows([], new_rows)
+    assert merged == [{"id": "x", "label": "yes", "label_source": "db"}]
+    assert "label_source" not in new_rows[0]  # input untouched
+
+
+def test_run_export_keeps_owner_rows_after_a_re_export(monkeypatch, tmp_path):
+    (tmp_path / "threads.jsonl").write_text(
+        json.dumps({
+            "id": "owner-row-1", "set": "threads", "label": "yes",
+            "features": {}, "site_id": "s1", "company_id": "c1",
+            "decided_at": "2026-09-01T00:00:00Z", "baseline": {"score": 0.5},
+            "label_source": "owner",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "counts.json").write_text(json.dumps({
+        "threads": {"label_source_breakdown": {"owner": 1}},
+    }), encoding="utf-8")
+
+    empty_result = json.dumps({"records": []})
+
+    def _fake_run(args, capture_output=True, text=True):
+        if "begin-transaction" in args:
+            return _FakeCompleted(stdout=json.dumps({"transactionId": "tx-1"}))
+        if "execute-statement" in args:
+            return _FakeCompleted(stdout=empty_result)
+        if "rollback-transaction" in args:
+            return _FakeCompleted(stdout=json.dumps({"transactionStatus": "RolledBack"}))
+        raise AssertionError(f"unexpected aws call: {args}")
+
+    monkeypatch.setattr(ex.subprocess, "run", _fake_run)
+
+    counts = ex.run_export("fieldsight_test", out_dir=tmp_path)
+
+    threads_rows = [json.loads(line) for line in
+                    (tmp_path / "threads.jsonl").read_text(encoding="utf-8").splitlines() if line]
+    assert len(threads_rows) == 1
+    assert threads_rows[0]["id"] == "owner-row-1"
+    assert threads_rows[0]["label_source"] == "owner"
+    assert counts["threads"]["n"] == 1
+    assert counts["threads"]["label_source_breakdown"] == {"owner": 1}

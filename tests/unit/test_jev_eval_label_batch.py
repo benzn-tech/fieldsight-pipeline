@@ -20,14 +20,37 @@ from scripts.jev_eval import sample_batch as sb
 
 def test_every_sql_string_starts_with_select_or_with():
     sqls = [
-        sb.sql_threads_topics(120),
+        sb.sql_threads_site_ids(120),
+        sb.sql_threads_topics_for_site("11111111-1111-1111-1111-111111111111", 120, 200),
         sb.sql_threads_existing_pairs(),
-        sb.sql_work_class_topics(),
         sb.sql_work_class_existing(),
     ]
+    for work_class, low_confidence in sb.WORK_CLASS_STRATA:
+        sqls.append(sb.sql_work_class_topics_stratum(work_class, low_confidence, 365, 0, 500))
     for sql in sqls:
         stripped = sql.strip().upper()
         assert stripped.startswith("SELECT") or stripped.startswith("WITH"), sql
+
+
+def test_sql_threads_topics_for_site_filters_site_and_bounds_response():
+    sql = sb.sql_threads_topics_for_site("site-1", 120, 200)
+    assert "t.site_id = 'site-1'" in sql
+    assert "left(t.summary, 1000)" in sql
+    assert "LIMIT 200" in sql
+    assert "ORDER BY t.report_date DESC, t.id DESC" in sql
+
+
+def test_sql_work_class_topics_stratum_filters_class_confidence_and_bounds_response():
+    sql_low = sb.sql_work_class_topics_stratum("work", True, 365, 7, 500)
+    assert "t.work_class = 'work'" in sql_low
+    assert "t.work_confidence < 0.8" in sql_low
+    assert "left(t.summary, 1000)" in sql_low
+    assert "LIMIT 500" in sql_low
+    assert "'7'" in sql_low
+
+    sql_high = sb.sql_work_class_topics_stratum("non_work", False, 365, 7, 500)
+    assert "t.work_class = 'non_work'" in sql_high
+    assert "work_confidence IS NULL OR t.work_confidence >= 0.8" in sql_high
 
 
 # ---------------------------------------------------------------------------
@@ -258,17 +281,22 @@ def test_sample_threads_caps_are_wired_through_cli(monkeypatch, tmp_path):
 
     def fake_execute(database, tx, sql, profile, region):
         calls["n"] += 1
-        if calls["n"] == 1:
-            records = []
-            for t in topics:
-                records.append([
-                    {"stringValue": t["id"]}, {"stringValue": t["report_date"]},
-                    {"stringValue": t["site_id"]}, {"stringValue": t["company_id"]},
-                    {"stringValue": t["title"]}, {"stringValue": t["summary"]},
-                    {"longValue": t["open_items"]},
-                ])
-            return {"records": records}
-        return {"records": []}
+        if sql.startswith("SELECT DISTINCT t.site_id"):
+            return {"records": [[{"stringValue": "s1"}]]}
+        if "topic_thread_suggestions" in sql:
+            return {"records": []}
+        # the per-site topics query (sql_threads_topics_for_site) -- the fake
+        # ignores the site filter/LIMIT clause itself, since capping is what
+        # this test is checking downstream via cap_topics_per_site.
+        records = []
+        for t in topics:
+            records.append([
+                {"stringValue": t["id"]}, {"stringValue": t["report_date"]},
+                {"stringValue": t["site_id"]}, {"stringValue": t["company_id"]},
+                {"stringValue": t["title"]}, {"stringValue": t["summary"]},
+                {"longValue": t["open_items"]},
+            ])
+        return {"records": records}
 
     def fake_rollback(tx, profile, region):
         return None
@@ -339,13 +367,69 @@ def test_build_thread_batch_row_shape():
     topics = _synthetic_thread_pool()
     pairs, _ = sb.generate_thread_pairs(sb.group_by_site(topics))
     pair = pairs[0]
-    row = sb.build_thread_batch_row(pair, "high")
+    row = sb.build_thread_batch_row(pair, "high", topics)
     assert row["set"] == "threads"
     assert row["label"] is None
     assert row["label_source"] == "owner"
     assert set(row["features"]) == {"earlier", "later", "gap_days"}
-    assert set(row["baseline"]) == {"score"}
+    assert set(row["baseline"]) == {"score", "top_hit"}
     assert "stratum" in row and "stratum" not in row["features"]
+
+
+# ---------------------------------------------------------------------------
+# I6: thread baseline fidelity -- recomputed under the DEPLOYED gate's corpus
+# ---------------------------------------------------------------------------
+
+def test_deployed_corpus_for_matches_candidate_corpus_eligibility():
+    # Same pool as candidate_corpus would apply: same site, earlier, within
+    # MAX_GAP_DAYS, open_items > 0. A topic outside the gap, or with no open
+    # items, or on/after the later date, must be excluded.
+    later = _topic("t_later", "Door hardware installed", "Handles fitted.",
+                    "2026-06-15", open_items=1)
+    in_window = _topic("t_in", "Door hardware ordered", "Order placed.",
+                        "2026-06-01", open_items=1)
+    too_old = _topic("t_old", "Door hardware first raised", "First mention.",
+                      "2026-01-01", open_items=1)
+    no_open_items = _topic("t_zero", "Door hardware note", "No open work.",
+                            "2026-06-05", open_items=0)
+    same_day = _topic("t_same", "Door hardware same day", "Same day note.",
+                       "2026-06-15", open_items=1)
+    later_topic = _topic("t_future", "Door hardware future", "Future note.",
+                          "2026-06-20", open_items=1)
+    pool = [later, in_window, too_old, no_open_items, same_day, later_topic]
+
+    corpus = sb.deployed_corpus_for(later, pool)
+    ids = {t["id"] for t in corpus}
+    assert ids == {"t_in"}
+
+
+def test_deployed_thread_baseline_top_hit_true_when_earlier_is_the_best_candidate():
+    later = _topic("t2", "Door hardware installed", "Handles and hinges fitted on level 2.",
+                    "2026-05-22", open_items=1)
+    earlier = _topic("t1", "Door hardware ordered", "Handles and hinges ordered for level 2.",
+                      "2026-05-01", open_items=1)
+    distractor = _topic("t3", "Unrelated concrete pour", "Concrete pour scheduling notes.",
+                         "2026-05-10", open_items=1)
+    site_topics = [later, earlier, distractor]
+    pair = {"later": later, "earlier": earlier, "score": 0.9, "gap_days": 21}
+
+    baseline = sb.deployed_thread_baseline(pair, site_topics)
+    assert baseline["top_hit"] is True
+    assert isinstance(baseline["score"], float)
+
+
+def test_deployed_thread_baseline_top_hit_false_when_a_better_candidate_exists():
+    later = _topic("t2", "Door hardware installed", "Handles and hinges fitted on level 2.",
+                    "2026-05-22", open_items=1)
+    weak_earlier = _topic("t1", "Something else entirely", "Totally unrelated text about paint.",
+                           "2026-05-01", open_items=1)
+    strong_earlier = _topic("t3", "Door hardware ordered handles hinges", "Handles hinges ordered.",
+                             "2026-05-10", open_items=1)
+    site_topics = [later, weak_earlier, strong_earlier]
+    pair = {"later": later, "earlier": weak_earlier, "score": 0.01, "gap_days": 21}
+
+    baseline = sb.deployed_thread_baseline(pair, site_topics)
+    assert baseline["top_hit"] is False
 
 
 def test_build_work_class_batch_row_shape():
@@ -355,6 +439,49 @@ def test_build_work_class_batch_row_shape():
     assert row["label"] is None
     assert row["baseline"] == {"classifier_verdict": "non_work", "classifier_confidence": 0.4}
     assert set(row["features"]) == {"title", "summary", "category"}
+
+
+# ---------------------------------------------------------------------------
+# I2: labelling order does not leak the stratum
+# ---------------------------------------------------------------------------
+
+def _longest_run(values: list) -> int:
+    best = cur = 0
+    prev = object()
+    for v in values:
+        cur = cur + 1 if v == prev else 1
+        best = max(best, cur)
+        prev = v
+    return best
+
+
+def test_order_for_labelling_breaks_up_stratum_runs():
+    rows = (
+        [{"id": f"high-{i}", "stratum": "high"} for i in range(20)]
+        + [{"id": f"mid-{i}", "stratum": "mid"} for i in range(20)]
+        + [{"id": f"low-{i}", "stratum": "low"} for i in range(20)]
+    )
+    ordered = sb.order_for_labelling(rows, seed=42)
+    assert {r["id"] for r in ordered} == {r["id"] for r in rows}
+    strata_sequence = [r["stratum"] for r in ordered]
+    # A perfectly-shuffled 60-row/3-class sequence should never keep an
+    # entire class run intact (20) -- a small bound well under that catches
+    # "still grouped by stratum" without demanding exact uniform mixing.
+    assert _longest_run(strata_sequence) <= 8
+
+
+def test_order_for_labelling_is_deterministic_for_a_seed():
+    rows = [{"id": f"r{i}", "stratum": "high"} for i in range(10)]
+    ordered_a = sb.order_for_labelling(rows, seed=7)
+    ordered_b = sb.order_for_labelling(rows, seed=7)
+    assert [r["id"] for r in ordered_a] == [r["id"] for r in ordered_b]
+
+
+def test_order_for_labelling_different_seed_can_differ():
+    rows = [{"id": f"r{i}", "stratum": "high"} for i in range(10)]
+    ordered_1 = [r["id"] for r in sb.order_for_labelling(rows, seed=1)]
+    ordered_2 = [r["id"] for r in sb.order_for_labelling(rows, seed=2)]
+    assert ordered_1 != ordered_2
 
 
 # ---------------------------------------------------------------------------
