@@ -104,6 +104,10 @@ BOOTSTRAP_SEED = 20260928
 # label pattern diverges (weights -> +/-inf); this keeps it bounded. Not
 # tuned against real data yet -- revisit once owner labelling grows n.
 L2_PENALTY = 1.0
+# Fix wave 5, item 4: Platt scaling fits on the STANDARDISED baseline score
+# (z-scored on the fit half), so its penalty only has to guard against
+# complete separation, not tame the raw score's scale -- a small penalty.
+PLATT_L2_PENALTY = 0.01
 _LOGREG_LR = 0.5
 _LOGREG_ITERS = 2000
 
@@ -123,7 +127,8 @@ class JevScoreError(ValueError):
 # Clopper-Pearson (fix wave 4, A1): the precision floor is the one-sided 95%
 # LOWER confidence bound of held-out precision, not the raw point estimate --
 # a raw "28/28 = 1.0" says nothing about the next row, while its
-# Clopper-Pearson lower bound (~0.899) is a real statement about what
+# Clopper-Pearson lower bound (~0.8985 -- just BELOW 0.90, so the floor
+# needs 29/29, or 46 accepted with one error) is a real statement about what
 # fraction of future accepted rows are correct. Implemented with numpy/stdlib
 # only (no scipy): the lower bound at confidence `1 - alpha` for `successes`
 # out of `n` trials is Beta_ppf(alpha; successes, n - successes + 1) when
@@ -430,7 +435,25 @@ def _lowest_threshold_at_target_precision(
             qualifying.append((threshold, precision))
     if not qualifying:
         return None, None
-    return min(qualifying, key=lambda pair: pair[0])
+    lowest, _ = min(qualifying, key=lambda pair: pair[0])
+
+    # Fix wave 5, item 3 (clause 3): do not sit ON a negative that buys no
+    # positive coverage. Every fit-half row scored in [lowest, s_p), where
+    # s_p is the lowest POSITIVE at or above `lowest`, is a negative:
+    # accepting it adds no coverage of positives and puts the boundary
+    # inside the negative cluster, where run-2 jitter flips held-out
+    # negatives across it (a sharply separated model failed stability MORE
+    # than a noisy one). Move up to s_p -- identical positives accepted on
+    # the fit half, fewer or equal negatives, so precision only rises -- and
+    # place the threshold at the midpoint of the gap below s_p (the
+    # max-margin boundary that makes the same fit-half decisions).
+    positives_at_or_above = [s for s, lab in zip(scores, labels) if lab and s >= lowest]
+    s_p = min(positives_at_or_above)
+    below = [s for s in scores if s < s_p]
+    threshold = (s_p + max(below)) / 2.0 if below else s_p
+    accepted_idx = [i for i, s in enumerate(scores) if s >= threshold]
+    precision = sum(1 for i in accepted_idx if labels[i]) / len(accepted_idx)
+    return threshold, precision
 
 
 def _p95_direction(fit_rows: list, score_rows: list) -> dict:
@@ -743,14 +766,30 @@ def _platt_scale_direction(fit_rows: list, score_rows: list) -> dict:
 
     fit_usable = _usable_rows(fit_rows)
     score_usable = _usable_rows(score_rows)
-    X_fit = np.array([[float(r["score"])] for r in fit_usable])
+    raw_fit = np.array([float(r["score"]) for r in fit_usable])
+    # Fix wave 5, item 4: standardise on the FIT half (mean/sd of the fit
+    # half only -- never the held-out half) and apply the same transform to
+    # the held-out half. Wave 4 fitted the L2 logistic on the raw score, so
+    # the penalty dominated any small-range score: an informative baseline
+    # on a 0..0.1 scale calibrated to the base rate (Brier 0.253 vs 0.117
+    # for the same information on any scale), biasing the paired Brier gate
+    # toward Jev. A constant fit half (sd 0) carries no information: every
+    # z is 0 and the fit reduces to the intercept (the fit half's base rate).
+    mean = float(raw_fit.mean())
+    sd = float(raw_fit.std())
+
+    def _z(values: np.ndarray) -> np.ndarray:
+        if sd <= 0.0:
+            return np.zeros((len(values), 1))
+        return ((values - mean) / sd).reshape(-1, 1)
+
     y_fit = np.array([_label_bit(r) for r in fit_usable], dtype=float)
-    weights = _fit_logreg_l2(X_fit, y_fit)
+    weights = _fit_logreg_l2(_z(raw_fit), y_fit, l2=PLATT_L2_PENALTY)
 
     if not score_usable:
         return {"records": [], "reason": None}
-    X_score = np.array([[float(r["score"])] for r in score_usable])
-    probs = _predict_logreg(X_score, weights).tolist()
+    raw_score = np.array([float(r["score"]) for r in score_usable])
+    probs = _predict_logreg(_z(raw_score), weights).tolist()
     records = [
         {"id": r["id"], "label": r["label"], "score": float(p)}
         for r, p in zip(score_usable, probs)
@@ -845,9 +884,14 @@ def _fit_decomposed_direction(fit_rows: list, score_rows: list) -> dict:
     # the paired comparison -- it keeps them with decision=False (mirroring
     # `_p95_direction`'s own reason branch) and the row's own stored v0
     # `score` as a fallback (there is no fitted composite to score it with).
+    # Fix wave 5, item 7: these records are flagged `fallback` -- they keep
+    # the coverage comparison honest (decision=False, never dropped) but
+    # their v0 score is not the clause-2 probability, so the paired Brier
+    # and the control check exclude them (counted, never silently).
     def _fallback_records() -> list:
         return [
-            {"id": r["id"], "label": r["label"], "score": r["score"], "decision": False}
+            {"id": r["id"], "label": r["label"], "score": r["score"], "decision": False,
+             "fallback": True}
             for r in score_usable_all
         ]
 
@@ -1203,8 +1247,17 @@ def score_set(rows_by_arm_run: dict, threshold_policy: dict | None = None) -> di
                 control_records = _decomposed_control_records(
                     control_run1, half_a_ids, half_b_ids, weights_a_to_b, weights_b_to_a)
             else:
-                control_records = rows_by_arm_run[control_arm].get(1, [])
-            control_checks[real_arm] = control_check(real_records, control_records)
+                control_records = _usable_rows(rows_by_arm_run[control_arm].get(1, []))
+            # Fix wave 5, item 7: both sides are judged on the SAME ids --
+            # never a real side that still carries a failed direction's v0
+            # fallback rows the control side could not be scored on.
+            real_usable = [r for r in real_records if not r.get("fallback")]
+            shared_ids = {r["id"] for r in real_usable} & {r["id"] for r in control_records}
+            real_paired = [r for r in real_usable if r["id"] in shared_ids]
+            control = control_check(
+                real_paired, [r for r in control_records if r["id"] in shared_ids])
+            control["n_excluded_unpaired"] = len(real_records) - len(real_paired)
+            control_checks[real_arm] = control
     result["_control_checks"] = control_checks
 
     return result
@@ -1377,19 +1430,28 @@ def _coverage_and_precision(records: dict, ids: list) -> tuple:
     return coverage, precision
 
 
-def _floored_coverage(records: dict, ids: list) -> tuple:
-    """(coverage-or-0, precision, floor_met, precision_lower_bound) -- clause 4
-    (fix wave 4, A1): the floor is the one-sided 95% Clopper-Pearson LOWER
-    bound of held-out precision, not the raw point estimate (a raw 28/28 =
-    1.0 says nothing about the next row; its lower bound, ~0.899, does).
-    `precision` (the raw point estimate) is still returned, descriptive only.
-    Below the floor -- including when the lower bound is undefined (0
-    accepted rows) -- the arm's coverage counts as 0 for the verdict."""
+def _floored_coverage(records: dict, ids: list, use_clopper_pearson: bool = True) -> tuple:
+    """(coverage-or-0, precision, floor_met, precision_lower_bound) -- clause 4.
+
+    On the POINT estimate (`use_clopper_pearson=True`, fix wave 4 A1) the
+    floor is the one-sided 95% Clopper-Pearson LOWER bound of held-out
+    precision (29/29 gives 0.902 and passes; 28/28 gives 0.8985 and fails;
+    with one error 46 accepted rows are needed). Inside each bootstrap rep
+    (`use_clopper_pearson=False`, fix wave 5 item 3) the floor is the RAW
+    resampled precision >= 0.90: the bootstrap already carries the sampling
+    uncertainty, and applying the CP bound inside every rep as well counted
+    it twice -- a 64/65-correct model lost its coverage CI because the reps
+    that resampled 3 false positives fell below the CP bound. `precision`
+    (raw point estimate) is always returned. Below the floor -- including 0
+    accepted rows -- the arm's coverage counts as 0."""
     coverage, precision = _coverage_and_precision(records, ids)
     accepted = sum(1 for id_ in ids if records[id_]["decision"])
     positive = sum(
         1 for id_ in ids if records[id_]["decision"] and records[id_]["label"] == "yes"
     )
+    if not use_clopper_pearson:
+        floor_met = precision is not None and precision >= PRECISION_FLOOR
+        return (coverage if floor_met else 0.0), precision, floor_met, None
     lower_bound = clopper_pearson_lower(positive, accepted) if accepted > 0 else None
     floor_met = lower_bound is not None and lower_bound >= PRECISION_FLOOR
     return (coverage if floor_met else 0.0), precision, floor_met, lower_bound
@@ -1429,8 +1491,8 @@ def _bootstrap_coverage_diff(
     diffs = np.empty(n_reps)
     for i in range(n_reps):
         sample_ids = ids_arr[rng.integers(0, n, size=n)].tolist()
-        jc, _, _, _ = _floored_coverage(jev_records, sample_ids)
-        bc, _, _, _ = _floored_coverage(baseline_records, sample_ids)
+        jc, _, _, _ = _floored_coverage(jev_records, sample_ids, use_clopper_pearson=False)
+        bc, _, _, _ = _floored_coverage(baseline_records, sample_ids, use_clopper_pearson=False)
         diffs[i] = jc - bc
     lo, hi = np.percentile(diffs, [5.0, 95.0])
 
@@ -1460,12 +1522,17 @@ def _bootstrap_brier_diff(
     the coverage-difference bootstrap."""
     jev_records = {k: v for k, v in jev_records.items() if v is not None}
     baseline_records = {k: v for k, v in baseline_records.items() if v is not None}
+    # Fix wave 5, item 7: a failed decomposed direction's v0 fallback rows
+    # are not the clause-2 probability -- excluded from the Brier, counted.
+    fallback_ids = {k for k, v in jev_records.items() if v.get("fallback")}
+    jev_records = {k: v for k, v in jev_records.items() if k not in fallback_ids}
+    n_excluded_fallback = len(fallback_ids & set(baseline_records))
     common_ids = sorted(set(jev_records) & set(baseline_records), key=str)
 
     if not common_ids:
         return {
             "point_estimate": None, "ci_90": [None, None], "n": 0,
-            "n_reps": n_reps, "seed": seed,
+            "n_reps": n_reps, "seed": seed, "n_excluded_fallback": n_excluded_fallback,
             "reason": "no overlapping held-out ids between the two arms",
         }
 
@@ -1491,6 +1558,7 @@ def _bootstrap_brier_diff(
         "ci_90": [float(lo), float(hi)],
         "n": n, "n_reps": n_reps, "seed": seed,
         "jev_brier": float(np.mean(jev_brier)), "baseline_brier": float(np.mean(base_brier)),
+        "n_excluded_fallback": n_excluded_fallback,
     }
 
 

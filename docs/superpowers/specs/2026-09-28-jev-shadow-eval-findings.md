@@ -76,15 +76,34 @@ functions, at n <= 130):**
    control arm's sub-answers are run through the real arm's own fitted cross-fit composite weights
    (never the control arm's own raw v0 `score`), closing a gap where the control check compared two
    different kinds of number.
-3. **Operating point (unchanged):** for each arm and each direction, the threshold is the lowest
-   threshold whose precision on the FIT half is >= 0.95.
+3. **Operating point (amended, fix wave 5):** for each arm and each direction, start from the lowest
+   threshold whose precision on the FIT half is >= 0.95; then move up to the lowest fit-half
+   *positive* at or above it, and place the threshold at the midpoint of the gap between that
+   positive and the next-lower fit-half score. The fit half accepts exactly the same positives,
+   with fewer or equal negatives (every row skipped is a negative that bought no positive coverage),
+   so fit-half precision only rises. **Why:** the unamended point sits ON the highest accepted
+   negative -- inside the negative cluster for a sharply separated model, where run-2 jitter flips
+   held-out negatives across it. In the wave-4 Monte-Carlo a sharper model failed MORE: Beta(200,2)
+   sub-answers failed stability in 20/20 seeds (7-26 flips at n=130) and the accepted negatives
+   also pulled held-out precision under the Clopper-Pearson floor in ~8/20 seeds for Beta(20,2).
+   After the amendment those models pass stability in every seed (0-1 flips) and uninformative
+   models still never augment (Monte-Carlo in the wave-5 report). Applies to every arm, the
+   baseline included. (`score.py`'s `_lowest_threshold_at_target_precision`.)
 4. **Precision floor (fix wave 4, A1 -- amended from the 2026-09-28 wording below):** the Jev arm's
    (`decomposed`'s) pooled held-out precision at that operating point must clear 0.90 as a
    **one-sided 95% Clopper-Pearson LOWER confidence bound**, not the raw point estimate. A raw
    "28/28 = 1.0" says nothing about the next row; its Clopper-Pearson lower bound (~0.899) is a
-   real statement about what fraction of future accepted rows are correct, and needs roughly 28
-   accepted rows, all correct, to clear 0.90 -- far more than the raw point estimate implied at
-   these sizes. `n = 0` accepted rows is undefined, which counts as the floor failing. Below the
+   real statement about what fraction of future accepted rows are correct. It needs **29**
+   accepted rows all correct to clear 0.90 (28/28 gives 0.8985 and fails), **46** accepted rows
+   with one error, or 61 with two -- far more than the raw point estimate implied at these sizes.
+   So at base rate 0.2 with n <= 130 (26 positives) replace/augment is structurally unreachable,
+   whatever the model. `n = 0` accepted rows is undefined, which counts as the floor failing.
+   **Fix wave 5:** the Clopper-Pearson bound applies to the POINT estimate only. Inside each
+   bootstrap rep (clause 5) the floor is the raw resampled precision >= 0.90 -- the bootstrap
+   already carries the sampling uncertainty, and applying the CP bound inside every rep as well
+   counted it twice (a 64/65-correct model lost its coverage CI because ~8% of reps resampled 3
+   false positives and fell below the bound; in the wave-4 Monte-Carlo a realistic strong model
+   reached replace in only 1-2 of 30 seeds at n=130). Below the
    floor, that arm's coverage counts as 0 for the verdict -- this is not a second independent gate
    on the baseline arm; a baseline that misses its own floor is correctly counted as 0 coverage
    inside the comparison in clause 5, and the coverage-difference CI (not a second floor check)
@@ -94,8 +113,9 @@ functions, at n <= 130):**
    recorded -- `score.py`'s `BOOTSTRAP_REPS`/`BOOTSTRAP_SEED`) of `coverage_Jev -
    coverage_baseline`. Rather than recomputing the cross-fit inside each rep, it resamples the
    pooled held-out predictions (each row's held-out score and its operating-point decision) and
-   recomputes coverage and the precision floor (clause 4) per rep. Reports the point estimate and
-   the 90% CI. (`score.py`'s `_bootstrap_coverage_diff`.)
+   recomputes coverage and the precision floor per rep -- the RAW precision >= 0.90 inside a rep,
+   not the Clopper-Pearson bound (fix wave 5, see clause 4). Reports the point estimate and the
+   90% CI. (`score.py`'s `_bootstrap_coverage_diff`.)
 6. **Calibration (replaces ECE10 <= 0.10):** paired Brier, `Brier_Jev <= Brier_baseline`, on the
    SAME held-out rows (point estimate; also reports the bootstrap 90% CI of the difference, same
    seeded paired resampling as clause 5). **Fix wave 4, A5:** the baseline side of this comparison
@@ -103,8 +123,16 @@ functions, at n <= 130):**
    a raw baseline score that is not itself a calibrated probability (e.g. threads' lexical
    similarity) makes a squared-error comparison against a Jev arm's real probability unfair; the
    Jev arm's own held-out score is already a probability (clause 2) and needs no such transform.
-   ECE10 stays reported as descriptive only. (`score.py`'s `_bootstrap_brier_diff`,
-   `_platt_scale_pooled`.)
+   **Fix wave 5:** the Platt fit standardises the baseline score on the fit half (mean/sd of the fit
+   half, applied unchanged to the held-out half) and uses a small penalty (0.01, only a guard
+   against complete separation). Wave 4 fitted the L2 logistic on the raw score, so the penalty
+   dominated small-range scores: the same informative baseline calibrated to Brier 0.253 on a
+   0..0.1 scale, 0.217 on 0..0.4 (threads-like) and 0.153 on 0..1, against 0.117 when fitted
+   properly -- a bias toward Jev on the Brier gate. The calibrated Brier is now invariant to the raw
+   score's scale (pinned by test). Rows of a failed `decomposed` direction whose held-out score is
+   the v0 fallback (clause 10) are excluded from the paired Brier and counted
+   (`n_excluded_fallback`). ECE10 stays reported as descriptive only. (`score.py`'s
+   `_bootstrap_brier_diff`, `_platt_scale_pooled`.)
 7. **Stability (replaces run_agreement >= 0.95):** run 1 vs run 2 decisions at the SAME held-out
    p95 operating point coverage was judged at (never the accuracy-maximising threshold the old
    `run_agreement` metric uses); count flips; pass if flips <= `max(1, floor(0.05 * n))` -- a
@@ -116,7 +144,9 @@ functions, at n <= 130):**
 8. **Control (unchanged mechanics, fix wave 4 A3 changes what score it reads -- see clause 2):**
    mean score on label=="yes" rows, real arm minus its paired control arm, pass only if the
    difference is >= `CONTROL_MARGIN = 0.2`. "Unreachable" or "fail" both mean NOT ADOPTED for that
-   set (no augment either).
+   set (no augment either). **Fix wave 5:** both sides are judged on the SAME ids -- a real-arm row
+   whose held-out score is a v0 fallback (a failed decomposed direction) or that has no scorable
+   control counterpart is excluded from both sides and counted (`n_excluded_unpaired`).
 9. **Verdict**, applied mechanically (`score.py`'s `verdict()`):
    - **REPLACE** if: eligible, control passes, precision floor met, coverage-difference 90% CI
      lower bound > 0, paired Brier condition met, stability passes.
@@ -396,6 +426,16 @@ behaviour of the same rules):**
   mobile" / "… kept ringing" went out unmasked.
 - **Common-word aliases** (Will, May, Mark, Love, …) match their capitalised and ALL-CAPS forms,
   whatever casing the user row stored, and never the lowercase common word.
+- **Owner-labelled rows fail closed on the deletion re-check.** Every export re-checks each owner
+  row's topic ids against `visible_topics_predicate` (topic and source arms) and drops a row if
+  any of them is no longer visible (`owner_rows_dropped_deleted`). Wave 4 kept an owner row with
+  no `topic_ids` unconditionally; now a `work_class` row falls back to its own id (it IS the topic
+  id), and a `threads` row without topic ids cannot be verified and is dropped
+  (`owner_rows_dropped_no_topic_ids`). `import_labels.py` applies the same rule at import time
+  (`skipped_no_topic_ids`), so a batch sampled before wave 4 never imports a row that can't be
+  checked. The check's SQL runs against a real database in
+  `tests/integration/test_jev_eval_export_labels_sql.py` (CI; skipped without
+  `TEST_DATABASE_URL`).
 
 ---
 

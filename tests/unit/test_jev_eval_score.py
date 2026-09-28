@@ -336,14 +336,16 @@ def test_coverage_at_p95_split_reports_lower_than_in_sample():
 
     split_result = score_module._coverage_at_p95_split(rows_a, rows_b)
 
-    # Fit on A (threshold 0.9, precision 1.0 in-sample) applied to B: nothing
-    # in B reaches 0.9 -> zero coverage on the held-out half.
-    assert split_result["a_to_b"]["threshold"] == pytest.approx(0.9)
+    # Fit on A (precision 1.0 in-sample) applied to B: nothing in B reaches
+    # it -> zero coverage on the held-out half. Fix wave 5 (clause 3): the
+    # threshold sits in the gap below the lowest accepted positive, midway
+    # between no@0.5 and yes@0.9.
+    assert split_result["a_to_b"]["threshold"] == pytest.approx(0.7)
     assert split_result["a_to_b"]["coverage_on_held_out"] == 0
 
-    # Fit on B (threshold 0.6) applied to A: the 10 yes@0.9 rows clear it,
-    # the one no@0.5 does not -> perfect precision, high coverage.
-    assert split_result["b_to_a"]["threshold"] == pytest.approx(0.6)
+    # Fit on B (midway between no@0.55 and yes@0.6) applied to A: the 10
+    # yes@0.9 rows clear it, the one no@0.5 does not -> perfect precision.
+    assert split_result["b_to_a"]["threshold"] == pytest.approx(0.575)
     assert split_result["b_to_a"]["coverage_on_held_out"] == pytest.approx(10 / 11)
 
     pooled_coverage = split_result["pooled"]["coverage"]
@@ -896,63 +898,263 @@ def _mc_random_rows(arm, seed, n_per_class, id_prefix):
     return rows1, rows2
 
 
-def test_mc_near_constant_model_never_reaches_augment_or_replace():
-    for seed in MC_SEEDS:
-        prefix = f"nc{seed}"
-        base_r1, base_r2 = _mc_constant_rows(
-            "baseline", seed, MC_N_PER_CLASS, 0.5, prefix)
-        dec_r1, dec_r2 = _mc_constant_rows(
-            "decomposed", seed + 1000, MC_N_PER_CLASS, 0.5, prefix)
-        ctrl_r1, ctrl_r2 = _mc_constant_rows(
-            "control_decomposed", seed + 2000, MC_N_PER_CLASS, 0.45, prefix)
+# ---------------------------------------------------------------------------
+# Fix wave 5, item 5: Monte-Carlo tests that bite. Wave 4's versions never
+# had a passing control (margin ~0 in every seed), so "never augment/replace"
+# held for the wrong reason, and the "informative" model was a perfect,
+# seed-independent 0/1 separator. Here:
+#   - near-constant and random models are judged with a control that DOES
+#     pass (asserted), so the precision floor / coverage CI / stability are
+#     the only things that can stop them. An uninformative model cannot pass
+#     a real control through the cross-fit refit (its weights are ~0), so
+#     the pass is injected -- the adversarial case the floor must survive;
+#   - a realistic strong model (noisy Beta-distributed sub-answers, jittered
+#     run 2, a control whose answers look like the "no" class) reaches
+#     replace in a majority of seeds at n=130, base rate 0.5, through the
+#     real pipeline end to end.
+# ---------------------------------------------------------------------------
 
-        rows_by_arm_run = {
-            "baseline": {1: base_r1, 2: base_r2},
-            "decomposed": {1: dec_r1, 2: dec_r2},
-            "control_decomposed": {1: ctrl_r1, 2: ctrl_r2},
+import numpy as _np  # noqa: E402
+
+MC5_SEEDS = range(6)
+MC5_N_REPS = 300
+
+
+def _mc5_rows(arm, model, labels, rng, as_control=False):
+    rows1, rows2 = [], []
+    for k, label in enumerate(labels):
+        positive = label == "yes" and not as_control
+        if model == "near_constant":
+            f = [0.5 + rng.uniform(-0.02, 0.02) for _ in range(3)]
+            g = [0.5 + rng.uniform(-0.02, 0.02) for _ in range(3)]
+        elif model == "random_stable":
+            f = [rng.random() for _ in range(3)]
+            g = list(f)
+        elif model == "random_unstable":
+            f = [rng.random() for _ in range(3)]
+            g = [rng.random() for _ in range(3)]
+        elif model == "strong":
+            f = [rng.beta(20, 2) if positive else rng.beta(2, 20) for _ in range(2)]
+            f.append(rng.random())
+            g = [float(_np.clip(v + rng.normal(0, 0.03), 0, 1)) for v in f]
+        else:  # pragma: no cover
+            raise AssertionError(model)
+        f = [float(v) for v in f]
+        g = [float(v) for v in g]
+
+        def _answers(v):
+            return {"same_work_item": {"noul": v[0]}, "task_named": {"noul": v[1]},
+                    "same_trade": {"noul": v[2]}}
+        rows1.append(_row(f"r{k}", label, float(_np.mean(f)), run=1, arm=arm, answers=_answers(f)))
+        rows2.append(_row(f"r{k}", label, float(_np.mean(g)), run=2, arm=arm, answers=_answers(g)))
+    return rows1, rows2
+
+
+def _mc5_scores(model, seed, n=130, base_rate=0.5, force_control_pass=False):
+    n_yes = round(n * base_rate)
+    labels = ["yes"] * n_yes + ["no"] * (n - n_yes)
+    rng = _np.random.default_rng(1000 * seed + 7)
+    dec = _mc5_rows("decomposed", model, labels, rng)
+    ctrl = _mc5_rows("control_decomposed", model, labels, rng, as_control=True)
+    base = [_row(f"r{k}", label, 0.0, run=1, arm="baseline") for k, label in enumerate(labels)]
+    scores = score_module.score_set({
+        "baseline": {1: base, 2: base},
+        "decomposed": {1: dec[0], 2: dec[1]},
+        "control_decomposed": {1: ctrl[0], 2: ctrl[1]},
+    }, {})
+    if force_control_pass:
+        scores["_control_checks"]["decomposed"] = {
+            "result": "pass", "real_mean": 0.9, "control_mean": 0.1, "margin": 0.8,
+            "n_real": n_yes, "n_control": n_yes,
         }
-        scores = score_module.score_set(rows_by_arm_run, {"baseline": "fit"})
-        result = score_module.verdict(scores, n_reps=MC_N_REPS, seed=seed)
-        assert result["verdict"] not in ("augment", "replace"), (seed, result["reasons"])
+    return scores
 
 
-def test_mc_random_model_never_reaches_augment_or_replace():
-    for seed in MC_SEEDS:
-        prefix = f"rnd{seed}"
-        base_r1, base_r2 = _mc_constant_rows(
-            "baseline", seed, MC_N_PER_CLASS, 0.5, prefix)
-        dec_r1, dec_r2 = _mc_random_rows(
-            "decomposed", seed + 3000, MC_N_PER_CLASS, prefix)
-        ctrl_r1, ctrl_r2 = _mc_constant_rows(
-            "control_decomposed", seed + 4000, MC_N_PER_CLASS, 0.4, prefix)
-
-        rows_by_arm_run = {
-            "baseline": {1: base_r1, 2: base_r2},
-            "decomposed": {1: dec_r1, 2: dec_r2},
-            "control_decomposed": {1: ctrl_r1, 2: ctrl_r2},
-        }
-        scores = score_module.score_set(rows_by_arm_run, {"baseline": "fit"})
-        result = score_module.verdict(scores, n_reps=MC_N_REPS, seed=seed)
-        assert result["verdict"] not in ("augment", "replace"), (seed, result["reasons"])
+@pytest.mark.parametrize("model", ["near_constant", "random_stable", "random_unstable"])
+def test_mc_uninformative_model_never_augments_even_with_a_passing_control(model):
+    for seed in MC5_SEEDS:
+        scores = _mc5_scores(model, seed, force_control_pass=True)
+        assert scores["_control_checks"]["decomposed"]["result"] == "pass"
+        result = score_module.verdict(scores, n_reps=MC5_N_REPS, seed=seed)
+        assert result["verdict"] not in ("augment", "replace"), (model, seed, result["reasons"])
 
 
-def test_mc_informative_model_reaches_replace_in_majority_of_seeds():
-    n_replace = 0
-    for seed in MC_SEEDS:
-        prefix = f"info{seed}"
-        dec_r1, dec_r2 = _informative_decomposed_rows(
-            "decomposed", n_per_class=40, id_prefix=prefix)
-        base_r1, base_r2 = _mc_constant_rows("baseline", seed, 40, 0.5, prefix)
-        ctrl_r1, ctrl_r2 = _mc_constant_rows(
-            "control_decomposed", seed + 5000, 40, 0.3, prefix)
+def test_mc_realistic_strong_model_reaches_replace_in_majority_of_seeds():
+    verdicts = []
+    for seed in MC5_SEEDS:
+        scores = _mc5_scores("strong", seed)
+        # The control is computed through the real pipeline, not injected.
+        assert scores["_control_checks"]["decomposed"]["result"] == "pass"
+        verdicts.append(score_module.verdict(scores, n_reps=MC5_N_REPS, seed=seed)["verdict"])
+    n_replace = sum(1 for v in verdicts if v == "replace")
+    assert n_replace > len(MC5_SEEDS) / 2, verdicts
 
-        rows_by_arm_run = {
-            "baseline": {1: base_r1, 2: base_r2},
-            "decomposed": {1: dec_r1, 2: dec_r2},
-            "control_decomposed": {1: ctrl_r1, 2: ctrl_r2},
-        }
-        scores = score_module.score_set(rows_by_arm_run, {"baseline": "fit"})
-        result = score_module.verdict(scores, n_reps=MC_N_REPS, seed=seed)
-        if result["verdict"] == "replace":
-            n_replace += 1
-    assert n_replace > len(MC_SEEDS) / 2, f"only {n_replace}/{len(MC_SEEDS)} seeds reached replace"
+
+# ---------------------------------------------------------------------------
+# Fix wave 5, item 3: the Clopper-Pearson floor applies to the POINT
+# estimate only; inside each bootstrap rep the raw held-out precision >= 0.90
+# is the floor. Applying CP inside every rep double-counted uncertainty: a
+# model at 64/65 accepted correct (CP lower 0.929) lost the coverage CI
+# because the reps that resampled 3+ false positives fell below the CP bound
+# and counted as 0 coverage.
+# ---------------------------------------------------------------------------
+
+def _records(n_accept_yes, n_accept_no, n_reject_yes, n_reject_no, prefix="r"):
+    recs = {}
+    i = 0
+    for label, decision, count in (("yes", True, n_accept_yes), ("no", True, n_accept_no),
+                                   ("yes", False, n_reject_yes), ("no", False, n_reject_no)):
+        for _ in range(count):
+            recs[f"{prefix}{i}"] = {"id": f"{prefix}{i}", "label": label, "score": 0.5,
+                                    "decision": decision}
+            i += 1
+    return recs
+
+
+def test_bootstrap_reps_use_raw_precision_floor_not_clopper_pearson():
+    jev = _records(64, 1, 1, 64)
+    base = {k: {**v, "decision": False} for k, v in jev.items()}
+    result = score_module._bootstrap_coverage_diff(jev, base, n_reps=2000, seed=1)
+    assert result["jev_precision_floor_met"] is True
+    assert result["ci_90"][0] > 0, result["ci_90"]
+
+
+def test_point_estimate_still_uses_clopper_pearson():
+    # 25/25 accepted, all correct: raw precision 1.0 but CP lower 0.887 < 0.90.
+    jev = _records(25, 0, 40, 65)
+    base = {k: {**v, "decision": False} for k, v in jev.items()}
+    result = score_module._bootstrap_coverage_diff(jev, base, n_reps=200, seed=1)
+    assert result["jev_precision_floor_met"] is False
+    assert result["jev_coverage"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 5, item 4: Platt scaling standardises the baseline score on the
+# fit half before the 1-feature logistic fit, so the calibrated Brier does
+# not depend on the raw score's range (wave 4's ridge penalty on the raw
+# score crushed a 0..0.1-range baseline to the base rate: 0.253 vs 0.117).
+# ---------------------------------------------------------------------------
+
+def _platt_brier(scale, seed=3):
+    rng = _np.random.default_rng(seed)
+    rows = []
+    for k in range(130):
+        label = "yes" if k % 2 == 0 else "no"
+        x = scale * (0.35 + 0.4 * (label == "yes") + rng.normal(0, 0.2))
+        rows.append(_row(f"p{k}", label, float(max(x, 0.0)), run=1, arm="baseline"))
+    scores = score_module.score_set({"baseline": {1: rows, 2: rows}}, {})
+    recs = scores["baseline"]["brier_calibrated_records"]
+    assert len(recs) == 130
+    return float(_np.mean([(r["score"] - (r["label"] == "yes")) ** 2 for r in recs]))
+
+
+def test_platt_calibrated_brier_is_invariant_to_raw_score_scale():
+    briers = [_platt_brier(scale) for scale in (0.1, 0.4, 1.0)]
+    assert max(briers) - min(briers) < 0.005, briers
+    # And it is a real calibration of an informative score, not the base rate.
+    assert max(briers) < 0.15, briers
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 5, item 7 (minors): a failed decomposed direction's v0 fallback
+# rows never enter the paired Brier (counted instead), and the control check
+# compares the SAME row set on both sides.
+# ---------------------------------------------------------------------------
+
+def test_v0_fallback_records_excluded_from_paired_brier_and_counted():
+    jev = _records(40, 0, 0, 40, prefix="x")
+    for i, key in enumerate(sorted(jev)):
+        jev[key]["score"] = 0.9 if jev[key]["label"] == "yes" else 0.1
+        if i < 10:
+            jev[key]["fallback"] = True
+    base = {k: {"id": k, "label": v["label"], "score": 0.5} for k, v in jev.items()}
+    brier = score_module._bootstrap_brier_diff(jev, base, n_reps=50, seed=0)
+    assert brier["n"] == 70
+    assert brier["n_excluded_fallback"] == 10
+
+
+def test_failed_decomposed_direction_marks_its_records_as_fallback():
+    def _make(id_, label, val):
+        return _row(id_, label, 0.42, arm="decomposed", answers={
+            "same_work_item": {"noul": val}, "task_named": {"noul": val},
+            "same_trade": {"noul": 0.5}})
+    all_no = [_make(f"no{i}", "no", 0.0) for i in range(5)]
+    mixed = [_make(f"m{i}", "yes" if i % 2 == 0 else "no", 1.0 if i % 2 == 0 else 0.0)
+             for i in range(6)]
+    records = score_module._fit_decomposed_direction(all_no, mixed)["_records"]
+    assert records and all(r.get("fallback") is True for r in records)
+
+
+def test_control_check_decomposed_uses_identical_row_sets_when_a_direction_fails():
+    # Every half-A id is "yes", so the fit on half A is single-class and
+    # fails; the real side must not keep half-B v0 fallback rows the control
+    # side cannot be scored on.
+    ids = [f"c{i}" for i in range(80)]
+    half_a, half_b = score_module.split_half(ids)
+    dec_r1, ctrl_r1 = [], []
+    for i, id_ in enumerate(ids):
+        label = "yes" if (id_ in half_a or i % 2 == 0) else "no"
+        v = 1.0 if label == "yes" else 0.0
+        ans = {"same_work_item": {"noul": v}, "task_named": {"noul": v},
+               "same_trade": {"noul": 0.5}}
+        dec_r1.append(_row(id_, label, 0.99, arm="decomposed", answers=ans))
+        cans = {"same_work_item": {"noul": 0.0}, "task_named": {"noul": 0.0},
+                "same_trade": {"noul": 0.5}}
+        ctrl_r1.append(_row(id_, label, 0.99, arm="control_decomposed", answers=cans))
+    scores = score_module.score_set({
+        "decomposed": {1: dec_r1, 2: dec_r1},
+        "control_decomposed": {1: ctrl_r1, 2: ctrl_r1},
+    }, {})
+    control = scores["_control_checks"]["decomposed"]
+    assert control["n_real"] == control["n_control"], control
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 5, item 3 (clause 3): the operating point is not placed ON a
+# negative's score when the negatives it accepts buy no positive coverage.
+# The lowest threshold with fit-half precision >= 0.95 sits on the highest
+# accepted negative -- inside the negative cluster for a sharply separated
+# model, where run-2 jitter flips held-out negatives across it (a sharper
+# model failed stability MORE: 0/20 seeds reached replace at Beta(200,2)).
+# The threshold now moves up to the lowest fit-half POSITIVE at or above
+# that point and sits at the midpoint of the gap below it -- the same
+# fit-half positives accepted, fewer or equal negatives.
+# ---------------------------------------------------------------------------
+
+def test_operating_point_sits_in_the_gap_for_a_separated_fit_half():
+    negatives = [0.01 + 0.001 * i for i in range(32)]
+    positives = [0.90 + 0.002 * i for i in range(33)]
+    scores = negatives + positives
+    labels = [False] * len(negatives) + [True] * len(positives)
+    threshold, precision = score_module._lowest_threshold_at_target_precision(scores, labels)
+    assert max(negatives) < threshold < min(positives)
+    assert threshold == pytest.approx((max(negatives) + min(positives)) / 2)
+    assert precision == 1.0
+
+
+def test_operating_point_keeps_negatives_that_sit_between_positives():
+    # A negative ABOVE the lowest accepted positive does buy coverage (the
+    # positives below it); it stays accepted, precision still >= 0.95.
+    scores = [0.1, 0.2, 0.5] + [0.4] + [0.6 + 0.01 * i for i in range(30)]
+    labels = [False, False, False] + [True] + [True] * 30
+    threshold, precision = score_module._lowest_threshold_at_target_precision(scores, labels)
+    assert 0.2 < threshold <= 0.4
+    assert precision == pytest.approx(31 / 32)
+
+
+def test_sharply_separated_model_passes_stability():
+    rng = _np.random.default_rng(0)
+    labels = ["yes"] * 65 + ["no"] * 65
+    dec1, dec2 = [], []
+    for k, label in enumerate(labels):
+        pos = label == "yes"
+        f = [rng.beta(200, 2) if pos else rng.beta(2, 200) for _ in range(2)] + [rng.random()]
+        g = [float(_np.clip(v + rng.normal(0, 0.03), 0, 1)) for v in f]
+
+        def _a(v):
+            return {"same_work_item": {"noul": float(v[0])}, "task_named": {"noul": float(v[1])},
+                    "same_trade": {"noul": float(v[2])}}
+        dec1.append(_row(f"r{k}", label, float(_np.mean(f)), run=1, arm="decomposed", answers=_a(f)))
+        dec2.append(_row(f"r{k}", label, float(_np.mean(g)), run=2, arm="decomposed", answers=_a(g)))
+    scores = score_module.score_set({"decomposed": {1: dec1, 2: dec2}}, {})
+    assert scores["decomposed"]["stability"]["pass"] is True, scores["decomposed"]["stability"]
