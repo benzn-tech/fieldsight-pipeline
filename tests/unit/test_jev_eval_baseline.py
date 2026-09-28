@@ -283,14 +283,14 @@ def test_baseline_row_raises_on_unknown_set():
 # load_deployed_llm_env: no aws, no network -- fake `run`.
 # ---------------------------------------------------------------------------
 
-def _fake_run(env_vars, returncode=0, stderr=""):
+def _fake_run(env_vars, returncode=0, stderr=b""):
     class _Result:
         pass
-    def run(args, capture_output=True, text=True):
+    def run(args, **kwargs):
         r = _Result()
         r.returncode = returncode
         r.stderr = stderr
-        r.stdout = json.dumps({"Environment": {"Variables": env_vars}})
+        r.stdout = json.dumps({"Environment": {"Variables": env_vars}}).encode("utf-8")
         return r
     return run
 

@@ -413,16 +413,18 @@ def test_test_database_default_does_not_require_allow_prod(monkeypatch):
 # ---------------------------------------------------------------------------
 
 class _FakeCompleted:
+    """Mirrors subprocess.run with no text=/encoding= -- stdout/stderr are
+    bytes. A str convenience arg is auto-encoded UTF-8."""
     def __init__(self, returncode=0, stdout="", stderr=""):
         self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = stderr
+        self.stdout = stdout.encode("utf-8") if isinstance(stdout, str) else stdout
+        self.stderr = stderr.encode("utf-8") if isinstance(stderr, str) else stderr
 
 
 def test_run_export_rolls_back_even_when_execute_raises(monkeypatch, tmp_path):
     calls = []
 
-    def _fake_run(args, capture_output=True, text=True):
+    def _fake_run(args, **kwargs):
         calls.append(args)
         if "begin-transaction" in args:
             return _FakeCompleted(stdout=json.dumps({"transactionId": "tx-1"}))
@@ -446,7 +448,7 @@ def test_run_export_writes_fixtures_and_rolls_back_on_success(monkeypatch, tmp_p
 
     empty_result = json.dumps({"records": []})
 
-    def _fake_run(args, capture_output=True, text=True):
+    def _fake_run(args, **kwargs):
         calls.append(args)
         if "begin-transaction" in args:
             return _FakeCompleted(stdout=json.dumps({"transactionId": "tx-1"}))
@@ -518,7 +520,7 @@ def test_run_export_keeps_owner_rows_after_a_re_export(monkeypatch, tmp_path):
 
     empty_result = json.dumps({"records": []})
 
-    def _fake_run(args, capture_output=True, text=True):
+    def _fake_run(args, **kwargs):
         if "begin-transaction" in args:
             return _FakeCompleted(stdout=json.dumps({"transactionId": "tx-1"}))
         if "execute-statement" in args:
@@ -613,7 +615,7 @@ def test_run_export_checks_pre_wave4_work_class_owner_row_by_its_id(monkeypatch,
     )
     seen_visibility_sql = []
 
-    def _fake_run(args, capture_output=True, text=True):
+    def _fake_run(args, **kwargs):
         if "begin-transaction" in args:
             return _FakeCompleted(stdout=json.dumps({"transactionId": "tx-1"}))
         if "execute-statement" in args:
@@ -648,7 +650,7 @@ def test_run_export_drops_owner_row_whose_topic_was_soft_deleted(monkeypatch, tm
 
     empty_result = json.dumps({"records": []})
 
-    def _fake_run(args, capture_output=True, text=True):
+    def _fake_run(args, **kwargs):
         if "begin-transaction" in args:
             return _FakeCompleted(stdout=json.dumps({"transactionId": "tx-1"}))
         if "execute-statement" in args:
@@ -684,7 +686,7 @@ def test_run_export_keeps_owner_row_whose_topic_is_still_visible(monkeypatch, tm
         encoding="utf-8",
     )
 
-    def _fake_run(args, capture_output=True, text=True):
+    def _fake_run(args, **kwargs):
         if "begin-transaction" in args:
             return _FakeCompleted(stdout=json.dumps({"transactionId": "tx-1"}))
         if "execute-statement" in args:
@@ -727,7 +729,7 @@ def test_run_export_includes_owner_row_company_id_in_alias_lookup(monkeypatch, t
 
     seen_company_id_queries = []
 
-    def _fake_run(args, capture_output=True, text=True):
+    def _fake_run(args, **kwargs):
         if "begin-transaction" in args:
             return _FakeCompleted(stdout=json.dumps({"transactionId": "tx-1"}))
         if "execute-statement" in args:

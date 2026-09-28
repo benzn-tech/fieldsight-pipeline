@@ -86,8 +86,24 @@ this paragraph does.
 """
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+# Bootstrap: when this script is run directly (`python
+# scripts/jev_eval/export_labels.py ...`), the repo root and `src/` are NOT
+# on `sys.path` -- only pytest puts them there, via `pyproject.toml`'s
+# `pythonpath = ["src", "."]`. Without this, the very first repo import below
+# (`deleted_predicates`) fails with `ModuleNotFoundError`, which the test
+# suite never saw. Idempotent (checked before insert) so re-import or a
+# double bootstrap is a no-op.
+_REPO_ROOT = _Path(__file__).resolve().parents[2]
+for _p in (_REPO_ROOT, _REPO_ROOT / "src"):
+    if str(_p) not in _sys.path:
+        _sys.path.insert(0, str(_p))
+
 import argparse
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -627,10 +643,53 @@ def summarize_set(set_name: str, rows: list, exclusions: dict, database: str) ->
 # ---------------------------------------------------------------------------
 
 def _aws(args: list):
-    result = subprocess.run(["aws"] + args, capture_output=True, text=True)
+    """Runs the aws CLI with explicit UTF-8 decoding. Without this, on a
+    Chinese-locale Windows box the subprocess inherits the console's GBK
+    codepage and a non-ASCII byte anywhere in the response (BUG-35 --
+    frequently a programme task name) is either mis-decoded or raises
+    outright.
+
+    `env` FORCES `PYTHONUTF8`/`PYTHONIOENCODING`/`AWS_CLI_FILE_ENCODING` to
+    UTF-8 on the child -- always, never `setdefault` -- because an inherited
+    GBK value for any of them is exactly the bug this exists to fix; every
+    OTHER inherited var is left alone (`dict(os.environ)`, only these three
+    keys overwritten).
+
+    stdout and stderr are captured as raw BYTES (no `text=`/`encoding=` on
+    `subprocess.run`) and decoded separately, on purpose:
+    - stdout is decoded `"utf-8"` STRICT. A replacement character here would
+      silently corrupt a customer name (or any other field) before
+      `json.loads` ever sees it, and that corrupted value would flow
+      straight into `name_aliases.json` -- wrong output with no error is
+      worse than a loud one. A decode failure raises a `RuntimeError` naming
+      the aws subcommand, never a raw `UnicodeDecodeError` from deep inside
+      `subprocess`.
+    - stderr is decoded with `errors="replace"` -- it only ever becomes part
+      of an exception MESSAGE (never parsed, never written to a fixture), so
+      a replacement character there is the right trade: an aws CLI failure
+      must still raise even if its own error text isn't valid UTF-8."""
+    env = dict(os.environ)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["AWS_CLI_FILE_ENCODING"] = "UTF-8"
+    result = subprocess.run(
+        ["aws"] + args,
+        capture_output=True,
+        env=env,
+    )
     if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip()[:4000])
-    return json.loads(result.stdout) if result.stdout.strip() else {}
+        stderr = (result.stderr or b"").decode("utf-8", errors="replace")
+        raise RuntimeError(stderr.strip()[:4000])
+    if not result.stdout or not result.stdout.strip():
+        return {}
+    try:
+        stdout = result.stdout.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        cmd = " ".join(args[:2]) if len(args) >= 2 else (args[0] if args else "")
+        raise RuntimeError(
+            f"aws {cmd} returned non-UTF-8 stdout ({exc})"
+        ) from exc
+    return json.loads(stdout)
 
 
 def _begin_transaction(database: str, profile: str, region: str) -> str:
@@ -675,10 +734,19 @@ def _process(result: dict, columns: tuple, mapper) -> tuple:
 
 
 def _write_jsonl(path: Path, rows: list) -> None:
-    with open(path, "w", encoding="utf-8") as fh:
+    """Write to a temp file in the same directory, then `os.replace` it onto
+    `path` -- an atomic rename on both POSIX and Windows (NTFS), so a crash
+    or an out-of-space error mid-write leaves the PREVIOUS `path` untouched
+    rather than a half-written file. `run_export` also arranges for every
+    row to already be gathered in memory before any `_write_jsonl`/
+    `_write_json` call runs, so a read-side failure (an `aws` call raising
+    partway through the export) never reaches this function at all."""
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
         for row in rows:
             fh.write(json.dumps(row, sort_keys=True))
             fh.write("\n")
+    os.replace(tmp, path)
 
 
 def _load_jsonl(path: Path) -> list:
@@ -791,9 +859,13 @@ def merge_export_rows(existing_rows: list, new_rows: list) -> list:
 
 
 def _write_json(path: Path, payload) -> None:
-    with open(path, "w", encoding="utf-8") as fh:
+    """Same temp-file-then-`os.replace` atomicity as `_write_jsonl` -- see
+    its docstring."""
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, sort_keys=True)
         fh.write("\n")
+    os.replace(tmp, path)
 
 
 def run_export(database: str, *, profile: str = DEFAULT_PROFILE,
@@ -801,6 +873,17 @@ def run_export(database: str, *, profile: str = DEFAULT_PROFILE,
     """Runs all three set queries plus the alias lookups inside ONE
     transaction, always rolled back in `finally` -- this cannot write, even
     if every statement in it is a SELECT.
+
+    Every read (every `_execute`/`_load_jsonl` call and everything derived
+    from them -- merges, the owner deletion-predicate recheck, alias rows)
+    happens FIRST, entirely in memory; the five output files are written
+    only in one block at the end, after the whole read transaction has
+    already succeeded. A failure anywhere in the reads (an `aws` call
+    raising, e.g. the mid-export crash this docstring used to not mention)
+    is raised before a single `_write_jsonl`/`_write_json` call runs, so the
+    PREVIOUS export on disk is left exactly as it was -- no set of three
+    fresh `.jsonl` files sitting next to a stale `counts.json`/
+    `name_aliases.json` from a run that never finished.
 
     Trusts its caller: the `--database fieldsight` / `--allow-prod` gate
     lives in `main()`, not here. Calling `run_export("fieldsight", ...)`
@@ -863,7 +946,6 @@ def run_export(database: str, *, profile: str = DEFAULT_PROFILE,
         wc_merged, wc_owner_dropped, wc_owner_no_ids = apply_owner_deletion_predicate(
             wc_merged, visible_topic_ids, "work_class")
 
-        _write_jsonl(out_dir / "programme_match.jsonl", pm_merged)
         pm_counts = summarize_set("programme_match", pm_merged, pm_excl, database)
         pm_counts["owner_rows_dropped_deleted"] = pm_owner_dropped
         pm_counts["owner_rows_dropped_no_topic_ids"] = pm_owner_no_ids
@@ -875,14 +957,12 @@ def run_export(database: str, *, profile: str = DEFAULT_PROFILE,
         # be protected by `build_alias_rows`.
         company_ids.update(r["company_id"] for r in pm_merged if r.get("company_id"))
 
-        _write_jsonl(out_dir / "threads.jsonl", th_merged)
         th_counts = summarize_set("threads", th_merged, th_excl, database)
         th_counts["owner_rows_dropped_deleted"] = th_owner_dropped
         th_counts["owner_rows_dropped_no_topic_ids"] = th_owner_no_ids
         counts["threads"] = th_counts
         company_ids.update(r["company_id"] for r in th_merged if r.get("company_id"))
 
-        _write_jsonl(out_dir / "work_class.jsonl", wc_merged)
         wc_counts = summarize_set("work_class", wc_merged, wc_excl, database)
         wc_counts["owner_rows_dropped_deleted"] = wc_owner_dropped
         wc_counts["owner_rows_dropped_no_topic_ids"] = wc_owner_no_ids
@@ -907,9 +987,15 @@ def run_export(database: str, *, profile: str = DEFAULT_PROFILE,
             task_rows = [record_to_dict(PROGRAMME_TASK_NAMES_COLUMNS, r) for r in tr.get("records", [])]
 
         aliases = build_alias_rows(alias_rows, user_rows, company_rows, site_rows, task_rows)
-        _write_json(out_dir / "name_aliases.json", aliases)
-
         counts["route_note"] = ROUTE_NOTE
+
+        # Every read above has already succeeded -- only now does anything
+        # touch disk (see `run_export`'s docstring for why this is one
+        # block, at the end, not interleaved with the reads).
+        _write_jsonl(out_dir / "programme_match.jsonl", pm_merged)
+        _write_jsonl(out_dir / "threads.jsonl", th_merged)
+        _write_jsonl(out_dir / "work_class.jsonl", wc_merged)
+        _write_json(out_dir / "name_aliases.json", aliases)
         _write_json(out_dir / "counts.json", counts)
         return counts
     finally:

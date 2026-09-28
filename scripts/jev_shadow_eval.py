@@ -105,6 +105,19 @@ runner-level retry.
 """
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+# Bootstrap: run directly (`python scripts/jev_shadow_eval.py ...`), the
+# repo root and `src/` are not on `sys.path` (only pytest's
+# `pythonpath = ["src", "."]` puts them there) -- without this, the first
+# repo import below (`lambda_programme_matcher`) fails with
+# `ModuleNotFoundError`.
+_REPO_ROOT = _Path(__file__).resolve().parents[1]
+for _p in (_REPO_ROOT, _REPO_ROOT / "src"):
+    if str(_p) not in _sys.path:
+        _sys.path.insert(0, str(_p))
+
 import argparse
 import json
 import os

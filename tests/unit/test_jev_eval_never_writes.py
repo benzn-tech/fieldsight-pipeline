@@ -155,10 +155,12 @@ def _programme_match_row():
 
 
 class _FakeCompleted:
+    """Mirrors subprocess.run with no text=/encoding= -- stdout/stderr are
+    bytes. A str convenience arg is auto-encoded UTF-8."""
     def __init__(self, returncode=0, stdout="", stderr=""):
         self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = stderr
+        self.stdout = stdout.encode("utf-8") if isinstance(stdout, str) else stdout
+        self.stderr = stderr.encode("utf-8") if isinstance(stderr, str) else stderr
 
 
 def _fake_call_ok(prompt, max_tokens=512, force_json=True, caller=None):
@@ -211,7 +213,7 @@ def _install_recording_aws(monkeypatch):
     other test in this repo already does for this function."""
     argvs = []
 
-    def _fake_run(args, capture_output=True, text=True):
+    def _fake_run(args, **kwargs):
         argvs.append(args)
         return _FakeCompleted(stdout=json.dumps({
             "Environment": {"Variables": {"LLM_PROVIDER": "anthropic"}}
@@ -246,7 +248,7 @@ def test_the_forbidden_argv_check_actually_bites(tmp_path, monkeypatch):
     _setup_normal_run(tmp_path, monkeypatch)
     argvs = []
 
-    def _fake_run_with_forbidden_call(args, capture_output=True, text=True):
+    def _fake_run_with_forbidden_call(args, **kwargs):
         argvs.append(args)
         # A forbidden call injected on purpose, to prove the check below
         # actually fails when one occurs.
@@ -280,7 +282,7 @@ def test_the_forbidden_argv_check_actually_bites(tmp_path, monkeypatch):
 def _fake_export_transport(calls):
     empty_result = json.dumps({"records": []})
 
-    def _fake_run(args, capture_output=True, text=True):
+    def _fake_run(args, **kwargs):
         calls.append(args)
         if "begin-transaction" in args:
             return _FakeCompleted(stdout=json.dumps({"transactionId": "tx-1"}))
@@ -329,8 +331,8 @@ def test_the_commit_transaction_check_actually_bites(monkeypatch, tmp_path):
     calls = []
     real_fake_run = _fake_export_transport(calls)
 
-    def _fake_run_with_commit(args, capture_output=True, text=True):
-        result = real_fake_run(args, capture_output=capture_output, text=text)
+    def _fake_run_with_commit(args, **kwargs):
+        result = real_fake_run(args, **kwargs)
         if "rollback-transaction" in args:
             calls.append(["aws", "rds-data", "commit-transaction",
                            "--transaction-id", "tx-1"])
