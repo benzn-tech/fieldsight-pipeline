@@ -76,10 +76,21 @@ WORK_END_HOUR = 17
 RAIN_HOUR_MM = 0.2          # an hour counts as wet at or above this
 RAIN_REPORT_MM = 1.0        # a spell is reported at or above this total...
 RAIN_REPORT_PROB = 50       # ...or at or above this peak probability
-WIND_GUST_KMH = 40          # gusts that affect lifting and work at height
-WIND_STOP_KMH = 60          # gusts at which lifting stops
-HEAT_C = 28
-COLD_C = 3
+# SOURCES for the generic thresholds (owner asked they be looked up, 2026-09-29).
+# They are starting points for a site with no plan of its own, not rules for
+# every site; a company's own limits replace them when there are any.
+#
+# Wind is forecast at 10 m and is about 50% stronger 20 m up.
+#   EWPA NZ: an EWP used outdoors must be rated for at least 12.5 m/s (45 km/h).
+#   Scaffolding guidance: above 50 km/h, work on exposed scaffolding stops.
+# Concrete -- NZS 3109: do not place below 5 C with the temperature falling;
+#   30 C is the upper practical ambient limit for placing.
+# Paint -- Resene: waterborne paint does not dry below 10 C.
+WIND_GUST_KMH = 40          # caution: at 20 m this is already past an EWP's 45 km/h
+WIND_STOP_KMH = 50          # lifting and exposed scaffold work stop
+HEAT_C = 30                 # NZS 3109 upper practical limit for placing concrete
+COLD_C = 5                  # NZS 3109: no placing below 5 C
+PAINT_MIN_C = 10            # Resene: waterborne paint does not dry below 10 C
 
 FINISH_BUFFER_HOURS = 2     # finish sensitive work this long before onset
 REMIND_BEFORE_MINUTES = 60  # remind this long before the finish-by time
@@ -95,7 +106,8 @@ GENERAL_IMPACT = {
     "rain": ["exterior painting", "concrete pours"],
     "wind": ["crane lifts", "work at height"],
     "heat": ["concrete pours"],
-    "cold": ["concrete pours", "coatings"],
+    "cold": ["concrete pours", "exterior painting"],
+    "cool": ["exterior painting"],
 }
 
 # Which work each kind of weather hits. Matched against the day's planned
@@ -107,7 +119,8 @@ SENSITIVE_WORK = {
     "wind": ("crane lift", "lifting", "work at height", "scaffold", "roofing",
              "cladding"),
     "heat": ("concrete pour", "asphalt"),
-    "cold": ("concrete pour", "curing", "coating", "sealant"),
+    "cold": ("concrete pour", "curing", "coating", "sealant", "paint"),
+    "cool": ("paint", "coating", "sealant"),
 }
 
 
@@ -253,17 +266,23 @@ def assess(hours, planned=None, work_start=WORK_START_HOUR, work_end=WORK_END_HO
             peak_h = max(work, key=lambda h: h["temp_c"] if h["temp_c"] is not None else -99)
             items.append(_item("heat", peak_h["hour"], peak_h["hour"] + 1, None, None,
                                None, round(max(temps)), impacts, basis, work_start))
-    if temps and min(temps) <= COLD_C:
-        impacts, basis = _conflicts("cold", planned)
-        if impacts:
-            low_h = min(work, key=lambda h: h["temp_c"] if h["temp_c"] is not None else 99)
-            # "Until" is when it is warm enough again, not the hour after the
-            # coldest one: the first working hour after the low that is above
-            # the threshold, or the end of the day if it never gets there.
-            warm = [h["hour"] for h in work
-                    if h["hour"] > low_h["hour"] and (h["temp_c"] or -99) > COLD_C]
-            items.append(_item("cold", low_h["hour"], warm[0] if warm else work_end, None, None,
-                               None, round(min(temps)), impacts, basis, work_start))
+    # Cold (concrete and paint) and cool (paint only) are one start-of-day
+    # finding, not two: the colder one is reported when both apply.
+    for kind, limit in (("cold", COLD_C), ("cool", PAINT_MIN_C)):
+        if not temps or min(temps) > limit:
+            continue
+        impacts, basis = _conflicts(kind, planned)
+        if not impacts:
+            continue
+        low_h = min(work, key=lambda h: h["temp_c"] if h["temp_c"] is not None else 99)
+        # "Until" is when it is warm enough again, not the hour after the
+        # coldest one: the first working hour after the low that is above
+        # the limit, or the end of the day if it never gets there.
+        warm = [h["hour"] for h in work
+                if h["hour"] > low_h["hour"] and (h["temp_c"] or -99) > limit]
+        items.append(_item(kind, low_h["hour"], warm[0] if warm else work_end, None, None,
+                           None, round(min(temps)), impacts, basis, work_start))
+        break
 
     items.sort(key=lambda i: i["onset"])
     if actual:
@@ -287,7 +306,7 @@ def _item(kind, onset, end, prob, mm, gust, temp, impacts, basis, work_start):
             advice_kind = "finish_before"
     elif kind == "heat":
         advice_kind = "pour_early"
-    elif kind == "cold":
+    elif kind in ("cold", "cool"):
         advice_kind = "delay_start"
     return {
         "kind": kind, "onset": onset_s, "end": _clock(end), "period": part_of_day(onset),
@@ -333,6 +352,8 @@ def _advice_text(item):
         return "hold lifts and work at height until the wind drops"
     if item["kind"] == "heat":
         return "pour early and keep crews hydrated"
+    if item["kind"] == "cool":
+        return "start exterior painting after %s" % item["end"]
     return "start temperature-sensitive work after %s" % item["end"]
 
 
@@ -350,6 +371,8 @@ def template_sentence(item):
         fact = "Strong gusts %s (from %s, up to %d km/h)." % (per, item["onset"], item["gust_kmh"])
     elif item["kind"] == "heat":
         fact = "Hot %s (around %s, up to %d°C)." % (per, item["onset"], item["temp_c"])
+    elif item["kind"] == "cool":
+        fact = "Cool start %s (down to %d°C, until about %s)." % (per, item["temp_c"], item["end"])
     else:
         fact = "Cold start %s (down to %d°C, until about %s)." % (per, item["temp_c"], item["end"])
     return "%s Impact: %s. Advice: %s." % (fact, _impact_text(item), _advice_text(item))
