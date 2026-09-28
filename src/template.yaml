@@ -2342,6 +2342,13 @@ Resources:
                     # delete. The DB half commits regardless, which is why deleting has
                     # always LOOKED like it worked.
                     - redactions/*
+                    # The site coordinate file, the same shape again: publishing
+                    # READS it first to merge, a missing object answered 403, and
+                    # so its first write could never happen -- on either stage, and
+                    # every production daily report went out without weather. The
+                    # one key, not config/*: nothing here should learn what else
+                    # lives in config/.
+                    - config/site-coords.json
                     # In-app updates (GET /api/org/app/latest). Without this a stage with no
                     # release yet answers AccessDenied instead of NoSuchKey, and the route
                     # reports it -- correctly -- as 503 rather than "no update".
