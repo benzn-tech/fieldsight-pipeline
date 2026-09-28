@@ -547,3 +547,109 @@ def test_money_amount_with_million_suffix_is_not_masked_as_phone():
 def test_plain_phone_number_is_still_masked():
     text, _ = mask_names("Call 021 555 1234 about the delivery.", [])
     assert text == "Call PHONE about the delivery."
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 5, item 1 (Critical): protected company/site/task terms must be
+# ANCHORED (never matched inside another word), a protected term shorter than
+# 3 characters protects nothing, and a SINGLE-token protected term never
+# overrides a person alias or a generic two-token name candidate. Wave 4's
+# unanchored, case-insensitive substring protection let every one of these
+# names leave unmasked (all were masked before wave 4).
+# ---------------------------------------------------------------------------
+
+def _protected(*names):
+    return [{"wrong_term": n, "right_term": n, "kind": "company"} for n in names]
+
+
+@pytest.mark.parametrize("text,protected_term,name", [
+    ("Caroline Smith rang about the pour", "Line", "Caroline Smith"),
+    ("Martin Jones rang about the pour", "Art", "Martin Jones"),
+    ("Lucy Smith rang about the pour", "UC", "Lucy Smith"),
+    ("Clayton Reid rang about the pour", "Lay", "Clayton Reid"),
+    ("Tom Hawkins rang about the pour", "Hawkins", "Tom Hawkins"),
+])
+def test_protected_term_never_shields_a_name_it_is_part_of(text, protected_term, name):
+    masked, mapping = mask_names(text, _protected(protected_term))
+    assert name not in masked
+    for token in name.split():
+        assert token not in masked, (token, masked)
+
+
+def test_single_character_protected_term_protects_nothing():
+    masked, _ = mask_names("Friday Sarah Jones confirmed", _protected("A"))
+    assert masked == "Friday PERSON_1 confirmed"
+
+
+def test_single_token_protected_term_does_not_override_a_person_alias():
+    aliases = _protected("Hawkins") + [
+        {"wrong_term": "Hawkins", "right_term": "Hawkins", "kind": "person",
+         "alias_group": "user-0"},
+        {"wrong_term": "Tom", "right_term": "Tom", "kind": "person", "alias_group": "user-0"},
+    ]
+    masked, _ = mask_names("Hawkins rang, then Tom Hawkins rang again", aliases)
+    assert "Hawkins" not in masked
+    assert "Tom" not in masked
+
+
+def test_protected_multiword_term_is_anchored_not_a_substring():
+    # "UC PK" must not protect the inside of "LUC PKG" -- anchoring applies
+    # to multi-token protected terms too.
+    masked, _ = mask_names("Delivered to UC PK today", _protected("UC PK"))
+    assert masked == "Delivered to UC PK today"
+    masked2, _ = mask_names("Sarah Jones at UC PK", _protected("UC PK"))
+    assert masked2 == "PERSON_1 at UC PK"
+
+
+def test_wave4_protected_keep_cases_still_hold_together():
+    aliases = _protected(
+        "Naylor Love", "SB1108 Ellesmere College", "Smith Scaffolding Ltd", "UC Pharmacy Kiosk",
+    ) + [{"wrong_term": "Love", "right_term": "Love", "kind": "person"}]
+    for text in ("Naylor Love's crew arrived early", "SB1108 Ellesmere College pour",
+                 "Invoice from Smith Scaffolding Ltd", "Delivery at UC Pharmacy Kiosk"):
+        masked, mapping = mask_names(text, aliases)
+        assert masked == text, (text, masked)
+        assert mapping == {}
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 5, item 2: a phone number followed by an ordinary word that
+# merely STARTS with k/m is still a phone number -- only a bare k / m /
+# million suffix (or a leading "$") marks a money amount.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("text,expected", [
+    ("Mike's number is 021 555 1234 mate", "Mike's number is PHONE mate"),
+    ("ring 021 555 1234 mobile", "ring PHONE mobile"),
+    ("021 555 1234 kept ringing", "PHONE kept ringing"),
+    ("021 555 1234 Mark's phone", "PHONE Mark's phone"),
+])
+def test_phone_followed_by_a_word_starting_with_k_or_m_is_still_masked(text, expected):
+    masked, _ = mask_names(text, [])
+    assert masked == expected
+
+
+@pytest.mark.parametrize("text", [
+    "Budget $1 250 000 approved", "Budget 1234567k approved", "Budget 1234567 m approved",
+    "Budget 1234567M approved", "Contract value 1234567 million overall",
+])
+def test_money_amounts_are_not_phone(text):
+    masked, _ = mask_names(text, [])
+    assert masked == text
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 5, item 7 (C14): a common-word alias matches its capitalised
+# form and its ALL-CAPS form regardless of how the user row stored it, and
+# never the lowercase common word.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("stored", ["Will", "will", "WILL"])
+def test_common_word_alias_matches_capitalised_and_all_caps_forms(stored):
+    aliases = [{"wrong_term": stored, "right_term": stored, "kind": "person"}]
+    for text in ("Will is on site", "WILL is on site"):
+        masked, _ = mask_names(text, aliases)
+        assert masked == "PERSON_1 is on site", (stored, text, masked)
+    masked, mapping = mask_names("the crew will arrive", aliases)
+    assert masked == "the crew will arrive"
+    assert mapping == {}

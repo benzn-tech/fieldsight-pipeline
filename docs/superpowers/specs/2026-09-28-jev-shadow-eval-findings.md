@@ -374,6 +374,29 @@ the stoplist cannot distinguish "Roof Jenkins, a person" from "Roof Framing, a t
 accepted trade named in the brief: a little under-masking of names that collide with stoplist
 words, in exchange for a large reduction in over-masking of ordinary construction phrases.
 
+**Fix wave 5 — protected terms, phone numbers, common-word aliases (supersedes the wave-4
+behaviour of the same rules):**
+- **Protected company/site/task terms are anchored and multi-token only.** Wave 4 made every
+  protected term (any length, case-insensitive, matched as a raw *substring*) win over person
+  masking. That leaked names that had been masked before wave 4: a task named "Line" shielded
+  "Caroline Smith", "Art" shielded "Martin Jones", a site "UC" shielded "Lucy Smith", a task
+  "Lay" shielded "Clayton Reid", a company "Hawkins" shielded "Tom Hawkins", and a one-letter
+  task "A" shielded every "a" in the text. The rule now: a protected term is matched only on ASCII
+  letter/digit boundaries (CJK terms unanchored, same as aliases); a term shorter than 3
+  characters protects nothing; and only terms of two or more tokens are protected at all. A
+  single-token protected term never overrides a person alias or a two-token name candidate, so
+  "Tom Hawkins" is masked even though "Hawkins" is a company. "Naylor Love's crew" (with a user
+  surnamed Love), "SB1108 Ellesmere College pour", "Smith Scaffolding Ltd" and "UC Pharmacy
+  Kiosk" still keep their names. **Accepted residual:** a multi-token protected term that itself
+  contains a person's name (a task literally named "Sarah's office fit-out") keeps that name, by
+  the controller's "protected terms win" ruling.
+- **Phone numbers:** a digit run is exempted as money only when a `$` directly precedes it or the
+  text directly after it is a bare `k` / `m` / `million` (case-insensitive, whole word). Wave 4
+  exempted any following word that merely started with k or m, so "021 555 1234 mate" / "…
+  mobile" / "… kept ringing" went out unmasked.
+- **Common-word aliases** (Will, May, Mark, Love, …) match their capitalised and ALL-CAPS forms,
+  whatever casing the user row stored, and never the lowercase common word.
+
 ---
 
 ## 5. Results

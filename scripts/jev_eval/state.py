@@ -62,7 +62,11 @@ Masking has these layers, in order:
   - `name_aliases` rows of kind company/product (and, as of this fix, every
     exported company name, every exported site name and every programme
     task name of those sites -- see `export_labels.build_alias_rows`) are
-    checked first and protected from it.
+    checked first and protected from it -- but only MULTI-TOKEN terms of 3+
+    characters, matched on ASCII word boundaries (fix wave 5): a single-token
+    protected term ("Hawkins", "UC", a task named "Line") never shields a
+    person alias or a two-token name candidate ("Tom Hawkins", "Caroline
+    Smith").
   - `_STOPLIST` (a module constant): a two-word match is skipped if EITHER
     word is a common sentence-start or construction word (see the constant
     itself for the exact list). This trades a small amount of under-masking
@@ -155,7 +159,8 @@ _STOPLIST = frozenset({
 })
 
 # Fix wave 4, C14: alias terms that are ordinary English words are matched
-# CASE-SENSITIVELY (capitalised form only) -- an unqualified case-insensitive
+# in their CAPITALISED and ALL-CAPS forms only, whatever casing the user row
+# stored (fix wave 5) -- an unqualified case-insensitive
 # match on a word this common (e.g. "will", "may", "rose") over-masks
 # construction text far more than it protects a real name. Every other alias
 # term stays case-insensitive, as before. Compared against an alias term's
@@ -187,6 +192,9 @@ _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # rules (it allows a single embedded space) and must not become "PHONE"
 # either.
 _ISO_DATE_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{3,6}$")
+# Fix wave 5, item 2: the ONLY suffixes that make a digit run a money
+# amount rather than a phone number.
+_MONEY_SUFFIX_RE = re.compile(r"\s*(?:k|m|million)\b", re.IGNORECASE)
 
 # Fields where the generic two-token pass must never run (see docstring):
 # dotted paths within the built `state` tree, matched exactly.
@@ -350,8 +358,8 @@ class _Masker:
         # CJK characters either way (see module docstring).
         #
         # Fix wave 4, C14: alias terms that are ordinary English words
-        # (`_COMMON_WORD_ALIASES`) are matched case-sensitively (their own
-        # exact casing only); every other term stays case-insensitive. This
+        # (`_COMMON_WORD_ALIASES`) match only their capitalised and ALL-CAPS
+        # forms (fix wave 5); every other term stays case-insensitive. This
         # is done per-alternative with Python's scoped inline-flag group
         # `(?i:...)`, rather than one `re.IGNORECASE` over the whole pattern,
         # so the two behaviours can coexist inside one compiled regex.
@@ -368,7 +376,15 @@ class _Masker:
                     r"(?<![A-Za-z0-9])" + escaped + r"(?![A-Za-z0-9])"
                 )
                 if term.casefold() in _COMMON_WORD_ALIASES:
-                    parts.append(body)  # case-sensitive: exact casing only
+                    # Fix wave 5, item 7: the capitalised form and the
+                    # ALL-CAPS form, whatever casing the user row stored
+                    # ("will"/"Will"/"WILL" all mask "Will" and "WILL") --
+                    # never the lowercase common word.
+                    lower = term.casefold()
+                    forms = {lower[:1].upper() + lower[1:], lower.upper()}
+                    alternation = "|".join(re.escape(f) for f in sorted(forms))
+                    parts.append(
+                        r"(?<![A-Za-z0-9])(?:" + alternation + r")(?![A-Za-z0-9])")
                 else:
                     parts.append(f"(?i:{body})")
             self._alias_pattern = re.compile("|".join(parts))
@@ -379,23 +395,41 @@ class _Masker:
             self._alias_pattern = None
             self._casefold_to_term = {}
 
-        # Fix wave 4, C15: protected company/site/task terms (any word
-        # count, case-insensitive, an optional possessive "'s"/"'s") are
-        # substituted for an opaque sentinel BEFORE both the alias pass and
-        # the generic pass, and restored afterwards -- "SB1108 Ellesmere
-        # College", "Smith Scaffolding Ltd", "Naylor Love's crew" all need
-        # this: the old code only ever compared a whole TWO-token generic
-        # candidate against `self._protected` verbatim, so a 3+-word
-        # protected term (or a substring of one that happens to look like a
-        # name, e.g. "Ellesmere College" inside "SB1108 Ellesmere College")
-        # was never actually protected, and a protected term sharing a word
-        # with a real person alias (e.g. "Love") could still be shredded by
-        # the alias pass before the generic pass ever ran.
-        if self._protected:
-            protected_sorted = sorted(self._protected, key=len, reverse=True)
-            protected_parts = [
-                re.escape(term) + r"(?:['’]s)?" for term in protected_sorted
-            ]
+        # Fix wave 4, C15 / fix wave 5, item 1: protected company/site/task
+        # terms are substituted for an opaque sentinel BEFORE both the alias
+        # pass and the generic pass, and restored afterwards -- so "SB1108
+        # Ellesmere College pour", "Smith Scaffolding Ltd" and "Naylor Love's
+        # crew" (with a user surnamed Love) keep their names.
+        #
+        # Wave 4 matched these terms as unanchored, case-insensitive
+        # SUBSTRINGS and let every one of them win over masking -- so a task
+        # named "Line" shielded "Caroline", a site named "UC" shielded
+        # "Lucy", a single-letter task "A" shielded every "a", and a company
+        # named "Hawkins" shielded "Tom Hawkins". Names masked before wave 4
+        # left unmasked. The rules now (controller ruling, fix wave 5):
+        #   - a protected term is ANCHORED with the same ASCII letter/digit
+        #     lookarounds as the alias terms (CJK terms unanchored, as
+        #     there), so it never matches inside another word;
+        #   - a term shorter than 3 characters protects nothing;
+        #   - only MULTI-TOKEN terms are sentinel-protected. A single-token
+        #     term never overrides a person alias or a generic two-token
+        #     name candidate ("Tom Hawkins" is masked even though "Hawkins"
+        #     is a company) -- and since a lone capitalised token is never
+        #     masked by either pass unless it IS a person alias, a
+        #     single-token protected term has nothing left to protect, so it
+        #     is simply not added to the sentinel pattern.
+        protected_multi = sorted(
+            (term for term in self._protected
+             if len(term) >= 3 and len(term.split()) >= 2),
+            key=len, reverse=True,
+        )
+        if protected_multi:
+            protected_parts = []
+            for term in protected_multi:
+                body = re.escape(term) + r"(?:['’]s)?"
+                if not _has_cjk(term):
+                    body = r"(?<![A-Za-z0-9])" + body + r"(?![A-Za-z0-9])"
+                protected_parts.append(body)
             self._protected_pattern = re.compile(
                 "(?:" + "|".join(protected_parts) + ")", re.IGNORECASE)
         else:
@@ -424,8 +458,11 @@ class _Masker:
             start, end = match.start(), match.end()
             if start > 0 and full_text[start - 1] == "$":
                 return candidate
-            suffix = full_text[end:end + 10].lstrip().lower()
-            if suffix.startswith("k") or suffix.startswith("m"):
+            # Fix wave 5, item 2: only a bare k / m / million suffix marks a
+            # money amount -- wave 4 exempted any following WORD that merely
+            # started with k or m ("021 555 1234 mate", "... mobile", "...
+            # kept ringing"), which left real phone numbers unmasked.
+            if _MONEY_SUFFIX_RE.match(full_text, end):
                 return candidate
             return "PHONE"
 
@@ -525,7 +562,7 @@ class _Masker:
         # Layer 1: known person alias pairs/groups (wrong_term / right_term,
         # or a whole alias_group, collapse to the same placeholder). Matched
         # case-insensitively (except `_COMMON_WORD_ALIASES` terms, fix wave
-        # 4 C14 -- those match their own exact casing only); ASCII terms
+        # 4 C14 / wave 5 -- capitalised and ALL-CAPS forms only); ASCII terms
         # anchored so they cannot match inside a longer ASCII word (fix wave
         # 4 C11) -- so a single-token term like "Ben" masks "Ben said" and
         # "Ben's" but leaves "Bench" and "Benefit" alone, AND masks "Ben说好"
