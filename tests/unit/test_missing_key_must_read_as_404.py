@@ -46,6 +46,9 @@ MISSING_KEY_IS_NORMAL = [
      "read_programme on a site that has never had a programme uploaded"),
     ("OrgApiFunction", "redactions/*",
      "the deletion mirror, missing because nothing has been deleted yet"),
+    ("OrgApiFunction", "config/site-coords.json",
+     "the site coordinate file, missing until its first write -- which read it "
+     "first, got 403, and so could never happen (2026-09-29, ninth recurrence)"),
     ("IngestFunction", "embeddings/*",
      "ingest_report skips a report whose vector sidecar was never written"),
     ("IngestFunction", "redactions/*",
