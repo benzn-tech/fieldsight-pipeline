@@ -152,14 +152,22 @@ DEFAULT_SEED = 0
 DEFAULT_WORK_CLASS_WINDOW_DAYS = 365
 DEFAULT_WORK_CLASS_STRATUM_LIMIT = 150
 
-# Fix wave 4, D18: a generous per-row byte estimate for one
-# `sql_work_class_topics_stratum` row -- title (up to ~200 bytes in
-# practice, no hard cap in schema) + the 1,000-char (up to ~3,000 bytes
-# worst-case UTF-8) truncated summary + category/verdict/confidence/uuid
-# columns + JSON/Data-API framing overhead per field. Deliberately generous
-# (rounds up) so the safety check errs toward refusing rather than passing
-# through a response that then hits the real 1 MiB cap.
-ESTIMATED_MAX_ROW_BYTES = 4000
+# Fix wave 5, item 7 (D18): the title is truncated in SQL too (wave 4 left
+# it unbounded), so a row's text is bounded by construction.
+WORK_CLASS_TITLE_MAX_CHARS = 300
+WORK_CLASS_SUMMARY_MAX_CHARS = 1000
+# Per-row framing: three uuids (id, site_id, company_id), work_class,
+# confidence, and the Data API's JSON wrapper per field ({"stringValue":
+# ...}, escapes). Generous on purpose.
+PER_ROW_FRAMING_BYTES = 600
+# Static pre-flight bound (no DB call): the worst case a row can be, every
+# character 4 bytes in UTF-8 (fix wave 4 used a flat 4,000, which a
+# 1,000-character summary of 4-byte characters alone exceeds). The MEASURED
+# check (`check_measured_stratum_bytes`) runs per stratum inside the
+# transaction and is the one that normally decides.
+ESTIMATED_MAX_ROW_BYTES = (
+    4 * (WORK_CLASS_TITLE_MAX_CHARS + WORK_CLASS_SUMMARY_MAX_CHARS) + PER_ROW_FRAMING_BYTES
+)
 # ~900 KB, a safety margin under the RDS Data API's 1 MiB (1,048,576 byte)
 # single-statement response cap.
 MAX_RESPONSE_BYTES_ESTIMATE = 900_000
@@ -184,6 +192,25 @@ def check_stratum_limit_safe(stratum_limit: int) -> None:
             f"~{MAX_RESPONSE_BYTES_ESTIMATE:,}-byte safety margin under the RDS Data "
             f"API's 1 MiB single-statement response cap. Use "
             f"--work-class-stratum-limit <= {max_safe} instead."
+        )
+
+
+def check_measured_stratum_bytes(stratum_limit: int, measured_max_text_bytes: int) -> None:
+    """Fix wave 5, item 7 (D18): `stratum_limit` rows x (the stratum's
+    MEASURED largest row -- octets of the truncated title + summary +
+    category, from `sql_work_class_stratum_max_row_bytes` -- plus framing)
+    must stay under the ~900 KB margin. Raises before the stratum's rows are
+    fetched."""
+    per_row = int(measured_max_text_bytes or 0) + PER_ROW_FRAMING_BYTES
+    estimated = stratum_limit * per_row
+    if estimated > MAX_RESPONSE_BYTES_ESTIMATE:
+        max_safe = max(1, MAX_RESPONSE_BYTES_ESTIMATE // per_row)
+        raise BatchSizeError(
+            f"--work-class-stratum-limit={stratum_limit}: the largest row in this stratum "
+            f"measured {measured_max_text_bytes:,} text bytes (+{PER_ROW_FRAMING_BYTES} "
+            f"framing), ~{estimated:,} bytes for the stratum query, over the "
+            f"~{MAX_RESPONSE_BYTES_ESTIMATE:,}-byte margin under the RDS Data API's 1 MiB "
+            f"response cap. Use --work-class-stratum-limit <= {max_safe}."
         )
 
 # Bounds on the threads pair-generation work (fix round 1, Important #2):
@@ -330,7 +357,8 @@ def sql_work_class_topics_stratum(work_class: str, low_confidence: bool,
         else "(t.work_confidence IS NULL OR t.work_confidence >= 0.8)"
     )
     return (
-        "SELECT t.id, t.title, left(t.summary, 1000) AS summary, t.category, "
+        f"SELECT t.id, left(t.title, {WORK_CLASS_TITLE_MAX_CHARS}) AS title, "
+        f"left(t.summary, {WORK_CLASS_SUMMARY_MAX_CHARS}) AS summary, t.category, "
         "       t.work_class, t.work_confidence, t.site_id, si.company_id "
         "FROM topics t "
         "JOIN sites si ON si.id = t.site_id "
@@ -339,6 +367,31 @@ def sql_work_class_topics_stratum(work_class: str, low_confidence: bool,
         f"AND {visible_t} "
         f"ORDER BY md5(t.id::text || '{salt}') "
         f"LIMIT {limit}"
+    )
+
+
+def sql_work_class_stratum_max_row_bytes(work_class: str, low_confidence: bool,
+                                         window_days: int) -> str:
+    """Fix wave 5, item 7 (D18): the largest row, in BYTES (octet_length,
+    not characters), that `sql_work_class_topics_stratum` would return for
+    this stratum -- same WHERE clause, same truncation. One integer back."""
+    visible_t = visible_topics_predicate("t")
+    window_days = int(window_days)
+    work_class = _sql_quote(work_class)
+    conf_clause = (
+        "t.work_confidence < 0.8" if low_confidence
+        else "(t.work_confidence IS NULL OR t.work_confidence >= 0.8)"
+    )
+    return (
+        "SELECT COALESCE(MAX("
+        f"COALESCE(octet_length(left(t.title, {WORK_CLASS_TITLE_MAX_CHARS})), 0) + "
+        f"COALESCE(octet_length(left(t.summary, {WORK_CLASS_SUMMARY_MAX_CHARS})), 0) + "
+        "COALESCE(octet_length(t.category), 0)), 0) AS max_bytes "
+        "FROM topics t "
+        "JOIN sites si ON si.id = t.site_id "
+        f"WHERE t.work_class = '{work_class}' AND {conf_clause} "
+        f"AND t.report_date >= (CURRENT_DATE - {window_days}::int) "
+        f"AND {visible_t}"
     )
 
 
@@ -842,6 +895,15 @@ def sample_work_class(database: str, *, size: int = DEFAULT_SIZE, seed: int = DE
         topic_rows = []
         seen_ids = set()
         for work_class, low_confidence in WORK_CLASS_STRATA:
+            # Fix wave 5, item 7 (D18): measure this stratum's largest row
+            # (bytes, as returned) before fetching it.
+            size_result = ex._execute(
+                database, tx,
+                sql_work_class_stratum_max_row_bytes(work_class, low_confidence, window_days),
+                profile, region)
+            size_records = size_result.get("records") or [[{"longValue": 0}]]
+            measured = ex.decode_field(size_records[0][0]) or 0
+            check_measured_stratum_bytes(stratum_limit, int(measured))
             stratum_result = ex._execute(
                 database, tx,
                 sql_work_class_topics_stratum(

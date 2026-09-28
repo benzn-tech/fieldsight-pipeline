@@ -261,3 +261,18 @@ def test_work_class_existing_and_pipeline_excludes_already_fed_back(db):
     ids = {t["id"] for t in filtered}
     assert fed_back["id"] not in ids
     assert fresh["id"] in ids
+
+
+def test_work_class_stratum_max_row_bytes_counts_octets_and_title_is_truncated(db):
+    # Fix wave 5, item 7 (D18): bytes, not characters -- a CJK character is
+    # 3 bytes in UTF-8 -- and the title is truncated in SQL like the summary.
+    co, s = _seed_company_site(db)
+    title = "林" * 400
+    topics.upsert_topic(db, s["id"], "2026-06-01", title, summary="x" * 10,
+                        category="general", work_class="work", work_confidence=0.95)
+
+    measured = _fetch(db, sb.sql_work_class_stratum_max_row_bytes("work", False, 365))
+    assert measured[0]["max_bytes"] == 3 * sb.WORK_CLASS_TITLE_MAX_CHARS + 10 + len("general")
+
+    rows = _fetch(db, sb.sql_work_class_topics_stratum("work", False, 365, 0, 500))
+    assert len(rows[0]["title"]) == sb.WORK_CLASS_TITLE_MAX_CHARS

@@ -753,3 +753,52 @@ def test_import_set_reports_rows_dropped_for_missing_topic_ids(tmp_path, fixture
                             now_iso="2026-09-28T00:00:00+00:00")
     assert result["imported_yes_no"] == 1
     assert result["skipped_no_topic_ids"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 5, item 7 (D18): the byte check uses the MEASURED max row size
+# (title + summary + category, in bytes, as the stratum query returns them)
+# and the title is truncated in SQL too.
+# ---------------------------------------------------------------------------
+
+def test_sql_work_class_topics_stratum_truncates_title_too():
+    sql = sb.sql_work_class_topics_stratum("work", False, 365, 0, 150)
+    assert f"left(t.title, {sb.WORK_CLASS_TITLE_MAX_CHARS}) AS title" in sql
+
+
+def test_sql_work_class_stratum_max_row_bytes_measures_octets_of_the_returned_columns():
+    sql = sb.sql_work_class_stratum_max_row_bytes("work", True, 365)
+    assert sql.startswith("SELECT")
+    assert f"octet_length(left(t.title, {sb.WORK_CLASS_TITLE_MAX_CHARS}))" in sql
+    assert "octet_length(left(t.summary, 1000))" in sql
+    assert "t.work_class = 'work'" in sql
+    assert "t.work_confidence < 0.8" in sql
+
+
+def test_check_measured_stratum_bytes_rejects_when_measured_rows_are_large():
+    # 150 rows x (6,000 measured bytes + 600 framing) = 990 KB: over the margin.
+    with pytest.raises(sb.BatchSizeError, match="measured"):
+        sb.check_measured_stratum_bytes(150, 6000)
+    sb.check_measured_stratum_bytes(150, 2000)  # 150 x ~2.6 KB: fine
+
+
+def test_sample_work_class_measures_each_stratum_before_fetching_it(monkeypatch, tmp_path):
+    from scripts.jev_eval import export_labels as ex
+    monkeypatch.setattr(sb, "BATCH_DIR", tmp_path / "batch")
+    seen = []
+
+    def fake_execute(database, tx, sql, profile, region):
+        seen.append(sql)
+        if "octet_length" in sql:
+            return {"records": [[{"longValue": 9000}]]}  # a 9 KB row in this stratum
+        return {"records": []}
+
+    monkeypatch.setattr(ex, "_begin_transaction", lambda *a: "tx")
+    monkeypatch.setattr(ex, "_execute", fake_execute)
+    monkeypatch.setattr(ex, "_rollback", lambda *a: None)
+
+    with pytest.raises(sb.BatchSizeError, match="measured"):
+        sb.sample_work_class("fieldsight_test", stratum_limit=150)
+    # The measuring query ran, and the (too large) stratum fetch never did.
+    assert any("octet_length" in s for s in seen)
+    assert not any("ORDER BY md5" in s for s in seen)
