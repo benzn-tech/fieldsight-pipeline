@@ -174,17 +174,19 @@ def load_deployed_llm_env(function_name, *, profile=DEFAULT_PROFILE,
     truthy in the deployed config) -- never the values, so a report or log
     line built from this return value cannot leak a secret.
     """
-    # BUG-35: on a Chinese-locale Windows box a non-ASCII byte in the
-    # response (or, here, in the deployed function's env) raises
-    # `UnicodeDecodeError` under the console's default GBK codepage before
-    # `returncode` is even checked. `errors="replace"` is the fallback only
-    # -- decoding is `utf-8` first, matching `export_labels._aws`. `env` is
-    # the current environment plus three UTF-8-forcing vars, never a
-    # replacement for it.
+    # BUG-35 / same fix as `export_labels._aws`: FORCE (not setdefault)
+    # PYTHONUTF8/PYTHONIOENCODING/AWS_CLI_FILE_ENCODING on the child -- an
+    # inherited GBK value for any of them, under a Chinese-locale Windows
+    # console, is exactly the bug this exists to fix. Every other inherited
+    # var is left alone. stdout/stderr are captured as raw bytes (no
+    # `text=`/`encoding=`) and decoded separately: stdout strict `"utf-8"`
+    # (a replacement char here would silently corrupt a deployed env value
+    # before `json.loads` sees it), stderr with `errors="replace"` since it
+    # only ever becomes part of an exception message.
     aws_env = dict(os.environ)
-    aws_env.setdefault("PYTHONUTF8", "1")
-    aws_env.setdefault("PYTHONIOENCODING", "utf-8")
-    aws_env.setdefault("AWS_CLI_FILE_ENCODING", "UTF-8")
+    aws_env["PYTHONUTF8"] = "1"
+    aws_env["PYTHONIOENCODING"] = "utf-8"
+    aws_env["AWS_CLI_FILE_ENCODING"] = "UTF-8"
     result = run(
         [
             "aws", "lambda", "get-function-configuration",
@@ -193,16 +195,26 @@ def load_deployed_llm_env(function_name, *, profile=DEFAULT_PROFILE,
             "--output", "json",
         ],
         capture_output=True,
-        encoding="utf-8",
-        errors="replace",
         env=aws_env,
     )
     if result.returncode != 0:
+        stderr = (result.stderr or b"")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
         raise RuntimeError(
             f"aws lambda get-function-configuration failed for "
-            f"{function_name!r}: {result.stderr.strip()[:4000]}"
+            f"{function_name!r}: {stderr.strip()[:4000]}"
         )
-    config = json.loads(result.stdout)
+    stdout = result.stdout or b""
+    if isinstance(stdout, bytes):
+        try:
+            stdout = stdout.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(
+                f"aws lambda get-function-configuration returned non-UTF-8 "
+                f"stdout for {function_name!r}: {exc}"
+            ) from exc
+    config = json.loads(stdout)
     env = (config.get("Environment") or {}).get("Variables") or {}
 
     copied = []

@@ -646,26 +646,50 @@ def _aws(args: list):
     """Runs the aws CLI with explicit UTF-8 decoding. Without this, on a
     Chinese-locale Windows box the subprocess inherits the console's GBK
     codepage and a non-ASCII byte anywhere in the response (BUG-35 --
-    frequently a programme task name) raises `UnicodeDecodeError` from
-    `subprocess` itself, before this function's own `returncode` check ever
-    runs. `errors="replace"` is the fallback only -- decoding is `utf-8`
-    first, same encoding the RDS Data API and the aws CLI both emit.
-    `env` is the current environment plus three UTF-8-forcing vars, never a
-    replacement for it -- an existing value for any of them is left alone."""
+    frequently a programme task name) is either mis-decoded or raises
+    outright.
+
+    `env` FORCES `PYTHONUTF8`/`PYTHONIOENCODING`/`AWS_CLI_FILE_ENCODING` to
+    UTF-8 on the child -- always, never `setdefault` -- because an inherited
+    GBK value for any of them is exactly the bug this exists to fix; every
+    OTHER inherited var is left alone (`dict(os.environ)`, only these three
+    keys overwritten).
+
+    stdout and stderr are captured as raw BYTES (no `text=`/`encoding=` on
+    `subprocess.run`) and decoded separately, on purpose:
+    - stdout is decoded `"utf-8"` STRICT. A replacement character here would
+      silently corrupt a customer name (or any other field) before
+      `json.loads` ever sees it, and that corrupted value would flow
+      straight into `name_aliases.json` -- wrong output with no error is
+      worse than a loud one. A decode failure raises a `RuntimeError` naming
+      the aws subcommand, never a raw `UnicodeDecodeError` from deep inside
+      `subprocess`.
+    - stderr is decoded with `errors="replace"` -- it only ever becomes part
+      of an exception MESSAGE (never parsed, never written to a fixture), so
+      a replacement character there is the right trade: an aws CLI failure
+      must still raise even if its own error text isn't valid UTF-8."""
     env = dict(os.environ)
-    env.setdefault("PYTHONUTF8", "1")
-    env.setdefault("PYTHONIOENCODING", "utf-8")
-    env.setdefault("AWS_CLI_FILE_ENCODING", "UTF-8")
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["AWS_CLI_FILE_ENCODING"] = "UTF-8"
     result = subprocess.run(
         ["aws"] + args,
         capture_output=True,
-        encoding="utf-8",
-        errors="replace",
         env=env,
     )
     if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip()[:4000])
-    return json.loads(result.stdout) if result.stdout.strip() else {}
+        stderr = (result.stderr or b"").decode("utf-8", errors="replace")
+        raise RuntimeError(stderr.strip()[:4000])
+    if not result.stdout or not result.stdout.strip():
+        return {}
+    try:
+        stdout = result.stdout.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        cmd = " ".join(args[:2]) if len(args) >= 2 else (args[0] if args else "")
+        raise RuntimeError(
+            f"aws {cmd} returned non-UTF-8 stdout ({exc})"
+        ) from exc
+    return json.loads(stdout)
 
 
 def _begin_transaction(database: str, profile: str, region: str) -> str:

@@ -155,10 +155,12 @@ def _programme_match_row():
 
 
 class _FakeCompleted:
+    """Mirrors subprocess.run with no text=/encoding= -- stdout/stderr are
+    bytes. A str convenience arg is auto-encoded UTF-8."""
     def __init__(self, returncode=0, stdout="", stderr=""):
         self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = stderr
+        self.stdout = stdout.encode("utf-8") if isinstance(stdout, str) else stdout
+        self.stderr = stderr.encode("utf-8") if isinstance(stderr, str) else stderr
 
 
 def _fake_call_ok(prompt, max_tokens=512, force_json=True, caller=None):

@@ -81,14 +81,24 @@ def test_entry_script_runs_standalone_with_help(script, tmp_path):
 # ---------------------------------------------------------------------------
 
 class _FakeCompleted:
+    """Mirrors what `subprocess.run` returns with NO `text=`/`encoding=`
+    passed -- `stdout`/`stderr` are bytes. Accepts a plain `str` for
+    convenience at call sites that don't care about encoding (auto-encoded
+    UTF-8); pass real `bytes` directly to exercise decode failures."""
     def __init__(self, returncode=0, stdout="", stderr=""):
         self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = stderr
+        self.stdout = stdout.encode("utf-8") if isinstance(stdout, str) else stdout
+        self.stderr = stderr.encode("utf-8") if isinstance(stderr, str) else stderr
 
 
-def test_aws_passes_utf8_encoding_and_forcing_env_vars(monkeypatch):
+def test_aws_forces_utf8_env_vars_and_preserves_other_vars(monkeypatch):
     monkeypatch.setenv("SOME_PRE_EXISTING_VAR", "keep-me")
+    # Inherited BAD values for the three forced vars -- must be overridden,
+    # not merely defaulted, because an inherited gbk value is exactly the
+    # bug this fixes.
+    monkeypatch.setenv("PYTHONUTF8", "0")
+    monkeypatch.setenv("PYTHONIOENCODING", "gbk")
+    monkeypatch.setenv("AWS_CLI_FILE_ENCODING", "GBK")
     captured = {}
 
     def _fake_run(args, **kwargs):
@@ -101,15 +111,17 @@ def test_aws_passes_utf8_encoding_and_forcing_env_vars(monkeypatch):
     ex._aws(["sts", "get-caller-identity"])
 
     kwargs = captured["kwargs"]
-    assert kwargs.get("encoding") == "utf-8"
-    assert kwargs.get("errors") == "replace"
+    # No text=/encoding= on subprocess.run itself -- stdout/stderr come back
+    # as bytes and _aws decodes them itself (strict for stdout).
+    assert "encoding" not in kwargs
+    assert "text" not in kwargs
 
     env = kwargs.get("env")
     assert env is not None
-    assert env.get("PYTHONUTF8") == "1"
-    assert env.get("PYTHONIOENCODING") == "utf-8"
-    assert env.get("AWS_CLI_FILE_ENCODING") == "UTF-8"
-    # never removes anything already in os.environ
+    assert env["PYTHONUTF8"] == "1"
+    assert env["PYTHONIOENCODING"] == "utf-8"
+    assert env["AWS_CLI_FILE_ENCODING"] == "UTF-8"
+    # never removes anything else already in os.environ
     assert env.get("SOME_PRE_EXISTING_VAR") == "keep-me"
 
 
@@ -121,7 +133,6 @@ def test_aws_decodes_non_ascii_response_correctly(monkeypatch):
     payload = {"records": [{"stringValue": "façade 验收 扫描"}]}
 
     def _fake_run(args, **kwargs):
-        assert kwargs.get("encoding") == "utf-8"
         return _FakeCompleted(stdout=json.dumps(payload, ensure_ascii=False))
 
     monkeypatch.setattr(ex.subprocess, "run", _fake_run)
@@ -139,6 +150,37 @@ def test_aws_raises_runtime_error_with_stderr_on_failure(monkeypatch):
 
     with pytest.raises(RuntimeError, match="boom: syntax error"):
         ex._aws(["rds-data", "execute-statement"])
+
+
+def test_aws_raises_on_invalid_utf8_stdout_naming_the_command(monkeypatch):
+    """A replacement char in stdout would silently corrupt a customer name
+    before `json.loads` -- so an undecodable stdout byte must raise, never
+    fall back to `errors="replace"`. The message names the aws subcommand
+    that produced it."""
+    def _fake_run(args, **kwargs):
+        return _FakeCompleted(stdout=b"not valid utf-8: \xff\xfe")
+
+    monkeypatch.setattr(ex.subprocess, "run", _fake_run)
+
+    with pytest.raises(RuntimeError, match="rds-data execute-statement"):
+        ex._aws(["rds-data", "execute-statement"])
+
+
+def test_aws_replaces_invalid_utf8_stderr_in_error_message(monkeypatch):
+    """stderr only ever becomes exception-message text, never parsed data --
+    an undecodable byte there is replaced, not fatal on its own; the aws
+    failure itself still raises."""
+    def _fake_run(args, **kwargs):
+        return _FakeCompleted(returncode=1, stderr=b"boom: \xff bad byte")
+
+    monkeypatch.setattr(ex.subprocess, "run", _fake_run)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        ex._aws(["rds-data", "execute-statement"])
+
+    message = str(exc_info.value)
+    assert "boom:" in message
+    assert "�" in message
 
 
 # ---------------------------------------------------------------------------

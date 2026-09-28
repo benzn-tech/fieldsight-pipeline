@@ -413,10 +413,12 @@ def test_test_database_default_does_not_require_allow_prod(monkeypatch):
 # ---------------------------------------------------------------------------
 
 class _FakeCompleted:
+    """Mirrors subprocess.run with no text=/encoding= -- stdout/stderr are
+    bytes. A str convenience arg is auto-encoded UTF-8."""
     def __init__(self, returncode=0, stdout="", stderr=""):
         self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = stderr
+        self.stdout = stdout.encode("utf-8") if isinstance(stdout, str) else stdout
+        self.stderr = stderr.encode("utf-8") if isinstance(stderr, str) else stderr
 
 
 def test_run_export_rolls_back_even_when_execute_raises(monkeypatch, tmp_path):
