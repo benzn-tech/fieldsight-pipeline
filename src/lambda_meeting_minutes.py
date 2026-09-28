@@ -773,7 +773,55 @@ def _add_markdown_table(doc, rows):
         run.bold = True
 
 
-def generate_prose_document(title, subtitle, sections, actions):
+def _add_prose_section(doc, section):
+    """One section of a template-shaped record: its heading, its lines, and the
+    photographs placed under them."""
+    section_title = section.get("title") or ""
+    # `level` defaults to 1, so every existing caller is unchanged; a
+    # section that came back nested asks for 2. Heading 2 is in python-docx's
+    # default template -- checked before the prompt was taught to ask for
+    # `####`, because asking for something the renderer flattens is how a
+    # wired control still produces nothing.
+    doc.add_heading(section_title, level=int(section.get("level") or 1))
+    # Indices into the section's own paragraph list, so the blanks are NOT
+    # filtered out here -- the splitter already drops empty lines, and
+    # re-filtering would shift every index the photo placement recorded.
+    paragraphs = list(section.get("paragraphs") or [])
+    after = section.get("photos_after") or {}
+    i = 0
+    while i < len(paragraphs):
+        text = (paragraphs[i] or "").strip()
+        if not text:
+            i += 1
+            continue
+        n = _table_at(paragraphs, i)
+        if n:
+            _add_markdown_table(doc, [r.strip() for r in paragraphs[i:i + n]])
+            # A tag on any row of the table puts its photograph under the
+            # whole table: a picture cannot sit between two rows.
+            strip = []
+            for k in range(i, i + n):
+                strip.extend(after.get(k) or [])
+            _add_photo_strip(doc, strip)
+            i += n
+            continue
+        if text.startswith("- ") or text.startswith("* "):
+            doc.add_paragraph(text[2:].strip(), style="List Bullet")
+        else:
+            doc.add_paragraph(text)
+        # THE PHOTOGRAPH OF WHAT THIS LINE SAID, directly under it.
+        _add_photo_strip(doc, after.get(i))
+        i += 1
+
+    # THE PHOTOGRAPHS OF WHAT THIS SECTION IS ABOUT, under it rather than
+    # in a heap at the end. The strip is the same one the assembled report
+    # has always drawn per topic -- same width, same tolerance for a file
+    # python-docx cannot place -- because a reader should not be able to
+    # tell which path wrote the document.
+    _add_photo_strip(doc, section.get("photo_streams"))
+
+
+def generate_prose_document(title, subtitle, sections, actions, closing=None):
     """A record whose headings come from its template, not from this function.
 
     `generate_word_document` below renders the fixed meeting-minutes layout and is
@@ -792,51 +840,9 @@ def generate_prose_document(title, subtitle, sections, actions):
 
     has_actions_section = False
     for section in sections or []:
-        section_title = section.get("title") or ""
-        if section_title.strip().lower() == "actions":
+        if (section.get("title") or "").strip().lower() == "actions":
             has_actions_section = True
-        # `level` defaults to 1, so every existing caller is unchanged; a
-        # section that came back nested asks for 2. Heading 2 is in python-docx's
-        # default template -- checked before the prompt was taught to ask for
-        # `####`, because asking for something the renderer flattens is how a
-        # wired control still produces nothing.
-        doc.add_heading(section_title, level=int(section.get("level") or 1))
-        # Indices into the section's own paragraph list, so the blanks are NOT
-        # filtered out here -- the splitter already drops empty lines, and
-        # re-filtering would shift every index the photo placement recorded.
-        paragraphs = list(section.get("paragraphs") or [])
-        after = section.get("photos_after") or {}
-        i = 0
-        while i < len(paragraphs):
-            text = (paragraphs[i] or "").strip()
-            if not text:
-                i += 1
-                continue
-            n = _table_at(paragraphs, i)
-            if n:
-                _add_markdown_table(doc, [r.strip() for r in paragraphs[i:i + n]])
-                # A tag on any row of the table puts its photograph under the
-                # whole table: a picture cannot sit between two rows.
-                strip = []
-                for k in range(i, i + n):
-                    strip.extend(after.get(k) or [])
-                _add_photo_strip(doc, strip)
-                i += n
-                continue
-            if text.startswith("- ") or text.startswith("* "):
-                doc.add_paragraph(text[2:].strip(), style="List Bullet")
-            else:
-                doc.add_paragraph(text)
-            # THE PHOTOGRAPH OF WHAT THIS LINE SAID, directly under it.
-            _add_photo_strip(doc, after.get(i))
-            i += 1
-
-        # THE PHOTOGRAPHS OF WHAT THIS SECTION IS ABOUT, under it rather than
-        # in a heap at the end. The strip is the same one the assembled report
-        # has always drawn per topic -- same width, same tolerance for a file
-        # python-docx cannot place -- because a reader should not be able to
-        # tell which path wrote the document.
-        _add_photo_strip(doc, section.get("photo_streams"))
+        _add_prose_section(doc, section)
 
     if actions:
         # A prose section titled "Actions" already wrote this heading above; the
@@ -853,6 +859,9 @@ def generate_prose_document(title, subtitle, sections, actions):
             row[0].text = (a.get("action") or "").strip()
             row[1].text = (a.get("owner") or "").strip() or "no owner recorded"
             row[2].text = (a.get("deadline") or "").strip() or "no date"
+
+    if closing:
+        _add_prose_section(doc, closing)
 
     buf = BytesIO()
     doc.save(buf)

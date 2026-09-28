@@ -100,6 +100,16 @@ def candidates_for_person(conn, company_id, voiceprint_id, since_hours=72,
     everything they need. `site_id=None` and any other value still behave identically.
     Narrowing to nothing is never acceptable; returning the whole window is the safe side.
 
+
+    **Verified against a real database, and what that did and did not show.** On
+    2026-09-26 (develop `d207f1a`, TEST `fieldsight_test`) the exact string this function
+    sends -- taken with `ast`, so byte-for-byte what `execute()` receives -- ran against
+    Sam Yu's profile and returned 5 clusters, descending, scores 0.70-0.78. That proves the
+    SQL parses and runs on real pgvector data and ranks. **It does not prove the ranking
+    tells different people apart**: those clusters are Sam's own session, the one his
+    samples came from, so high scores were the expected answer and a broken discriminator
+    would have produced them too. Separation needs labelled data, which is what the
+    labelling pack is for.
     """
     _require_company(company_id)
     if not voiceprint_id:
@@ -155,6 +165,24 @@ def candidates_for_person(conn, company_id, voiceprint_id, since_hours=72,
         # "already asked" (0066's own header). A rejected candidate must not resurface --
         # that is a human's "not this person", not an open question.
         "      ) "
+        # Nor a passage ALREADY named as this person. Asking "is this Sam?" about a passage
+        # the transcript already calls Sam is a question with no information in it, and on
+        # TEST 2026-09-27 all five questions were exactly that: the rename that stored the
+        # vector had just propagated the name over the same session the search then ranked
+        # highest. Matched by the person's id OR their name, because a propagated row
+        # carries the name and no voiceprint id. The file is matched through `turn_ref`
+        # (`<stem>@<offset>`) with `split_part`, not LIKE, because filenames are full of the
+        # underscores LIKE treats as wildcards.
+        "  AND NOT EXISTS ( "
+        "        SELECT 1 FROM speaker_turn_names n "
+        "        WHERE n.company_id = %s AND n.session_base = g.session_base "
+        "          AND n.superseded_at IS NULL "
+        "          AND split_part(n.turn_ref, '@', 1) "
+        "              = regexp_replace(g.source_filename, '[.]json$', '') "
+        "          AND (n.voiceprint_id = %s OR n.display_name = ( "
+        "                SELECT display_name FROM speaker_voiceprints "
+        "                WHERE company_id = %s AND id = %s)) "
+        "      ) "
         # Every non-aggregated column in the SELECT must appear here or Postgres rejects
         # the statement -- and a connection double never parses SQL, so this is
         # invisible to the unit suite and shows up as a 500 in production. That has
@@ -166,6 +194,7 @@ def candidates_for_person(conn, company_id, voiceprint_id, since_hours=72,
         (company_id, str(voiceprint_id), company_id,
          company_id, since_hours,
          company_id, str(voiceprint_id),
+         company_id, str(voiceprint_id), company_id, str(voiceprint_id),
          int(limit))).fetchall()
 
     candidates = [

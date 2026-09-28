@@ -22,6 +22,7 @@ from urllib.parse import unquote_plus
 
 import boto3
 
+import chunking
 import lambda_meeting_minutes
 import llm_utils
 import report_template
@@ -126,24 +127,52 @@ def _fetch_photos(folder, date, filenames, budget):
     return streams
 
 
-def _photo_topics(artifact, budget):
-    """(offer, streams_by_ref) for the topics of this report that have photos.
+def _in_window(topic, date, win_from, win_to):
+    """True when a topic's time_range overlaps [win_from, win_to).
 
-    `offer` is what the prompt shows the model: a stable ref, the time range and
-    the title. `streams_by_ref` is what the renderer places. Both are built here
-    from the same walk, so a ref the model is shown is a ref that has bytes
-    behind it -- an offer listing a topic whose photograph could not be read
-    would put an empty promise in front of the model.
+    A time_range that does not parse cannot be placed, so it is in the window
+    only when the window is the whole day -- where every topic of the scope is
+    in it by definition. Anywhere narrower it is left out rather than guessed
+    in: the coverage note would otherwise say "recorded in this window" about a
+    topic that may have been recorded outside it."""
+    parsed = chunking.parse_time_range(topic.get("time_range"))
+    day = datetime.datetime.strptime(date, "%Y-%m-%d")
+    whole_day = (win_from <= day and win_to >= day + datetime.timedelta(hours=23, minutes=59))
+    if not parsed:
+        return whole_day
+    start = day + datetime.timedelta(seconds=parsed[0])
+    end = day + datetime.timedelta(seconds=parsed[1])
+    # A collapsed range (start == end, BUG-09) is a point; it is in the window
+    # when the point is.
+    return (start < win_to and end > win_from) or (start == end and win_from <= start < win_to)
+
+
+def _offered_topics(artifact, budget, win_from, win_to):
+    """(offer, streams_by_ref) for the topics of this report inside the window.
+
+    `offer` is what the prompt shows the model: a stable ref, the time range,
+    the title and how many photographs it has. `streams_by_ref` is what the
+    renderer places, for the topics that have any. Both come from one walk, so
+    a photograph count the model is shown has bytes behind it.
+
+    EVERY TOPIC IN THE WINDOW IS OFFERED, not only the ones with photographs.
+    The ref a line ends with is how a photograph finds its line, and it is also
+    the one thing in the model's answer that says which topic a line reported.
+    Counting the refs that came back -- outside the model -- is what lets the
+    report say which recorded topics it does not mention (see
+    _coverage_note). A topic offered only when it had a photograph could not
+    be counted when it had none.
 
     THE ORDER IS THE TOPICS' OWN, and the shared byte budget is spent walking
-    it, so an early photo-heavy topic cannot silently starve a later one. That
-    property already existed in the assembled path; it is repeated here rather
-    than reached for, because the two paths do not share a caller.
+    it, so an early photo-heavy topic cannot silently starve a later one.
 
     A PHOTOGRAPH IS FETCHED ONCE even when two topics name it. Prod has
     measured 13.7% of photographs bound to more than one topic -- the binding
     unit is the session, not the day -- so without this a report would carry
     the same picture twice and charge the budget twice for it.
+
+    A topic whose photographs could not be read is still offered, as a topic
+    with none: losing the pictures must not also lose it from the count.
     """
     seen = {}
     offer, streams = [], {}
@@ -151,23 +180,74 @@ def _photo_topics(artifact, budget):
     content = artifact.get("content") or {}
     date = artifact.get("date") or content.get("date")
     for i, topic in enumerate(content.get("topics") or []):
-        names = [n for n in (topic.get("related_photos") or []) if n]
-        if not names:
+        if not _in_window(topic, date, win_from, win_to):
             continue
+        ref = "t%d" % i
+        names = [n for n in (topic.get("related_photos") or []) if n]
         fresh = [n for n in names if n not in seen]
         got = _fetch_photos(folder, date, fresh, budget) if fresh else []
         for name, stream in zip(fresh, got):
             seen[name] = stream
         mine = [seen[n] for n in names if n in seen]
-        if not mine:
-            continue
-        ref = "t%d" % i
-        streams[ref] = mine
+        if mine:
+            streams[ref] = mine
         offer.append({"ref": ref,
                       "title": topic.get("topic_title"),
                       "time_range": topic.get("time_range"),
                       "photos": len(mine)})
     return offer, streams
+
+
+def _referenced(sections):
+    """Every topic ref the answer names, on a line or on a `[covers:]` line."""
+    out = set()
+    for section in sections:
+        for refs in section.get("line_refs") or []:
+            out.update(refs)
+        out.update(section.get("covers") or [])
+    return out
+
+
+COVERAGE_TITLE = "Also recorded"
+COVERAGE_INTRO = "Recorded in this window, but not referred to by any line above:"
+
+
+def _coverage_note(offer, sections):
+    """The section the report ends with when a recorded topic went unmentioned,
+    or None when every offered topic was named somewhere.
+
+    WHY THIS IS WRITTEN HERE AND NOT BY THE MODEL. A section description can
+    tell the model what to leave out, and the owner has decided descriptions
+    keep that power ("NO DATA TODAY" is a feature). Probe 3 measured a
+    description beating the house rule 10 times out of 10 with the fence in
+    place, so nothing written INTO the prompt can make leaving something out
+    visible. This note is built after the answer, from a count, and rendered
+    by our code: no description reaches it, and it cannot be reworded, moved
+    or dropped by one.
+
+    WHAT IT RESTS ON, stated so nobody quotes it as more: the refs are the
+    model's own statement of which topic a line reported. It catches a topic
+    the model did not write about -- the shape a description-driven omission
+    takes -- and it does not catch a line tagged with a topic it did not
+    actually report. The wording says "not referred to", which is what was
+    counted, rather than "left out", which was not.
+
+    Each line carries its topic's ref, so a photograph of a topic nobody wrote
+    about lands under the line that names it instead of under whatever heading
+    happened to be last.
+    """
+    named = _referenced(sections)
+    missing = [t for t in offer if t["ref"] not in named]
+    if not missing:
+        return None
+    paragraphs, line_refs = [COVERAGE_INTRO], [[]]
+    for t in missing:
+        when = (t.get("time_range") or "").strip() or "time not recorded"
+        title = (t.get("title") or "").strip() or "Untitled topic"
+        paragraphs.append("- %s  %s" % (when, title))
+        line_refs.append([t["ref"]])
+    return {"title": COVERAGE_TITLE, "paragraphs": paragraphs, "level": 1,
+            "covers": [], "line_refs": line_refs, "coverage_note": True}
 
 
 def _place_photos(sections, streams_by_ref):
@@ -558,11 +638,10 @@ def _generate_document(artifact, context=None):
         raise RuntimeError("no recorded speech in this window after exclusions")
 
     # THE PHOTOGRAPHS ARE FETCHED BEFORE THE PROMPT IS BUILT, because the
-    # prompt has to offer the model exactly the topics that have bytes behind
-    # them. Offering one whose photograph could not be read would invite a
-    # reference to a picture that never arrives.
+    # prompt tells the model how many each topic has, and that number has to
+    # have bytes behind it.
     photo_budget = [MAX_PHOTO_BYTES_TOTAL]
-    photo_offer, photo_streams = _photo_topics(artifact, photo_budget)
+    topic_offer, photo_streams = _offered_topics(artifact, photo_budget, win_from, win_to)
 
     prompt = report_template.render_prompt(
         template,
@@ -572,7 +651,7 @@ def _generate_document(artifact, context=None):
         _action_items_for_prompt(content),
         "\n".join(t["line"] for t in turns),
         source=source,
-        photo_topics=photo_offer)
+        topics=topic_offer)
 
     # Recomputed from `context` (not reused from `read_budget`) because this is the
     # actual authority on what is left after the read phase ran, not an estimate
@@ -589,8 +668,17 @@ def _generate_document(artifact, context=None):
         raise RuntimeError(err or "empty answer from model")
 
     prose = _prose_sections(text)
-    at_line, at_section, orphaned = _place_photos(prose, photo_streams)
+    # Counted here, after the answer and outside it -- see _coverage_note.
+    note = _coverage_note(topic_offer, prose)
+    named = _referenced(prose)
+    not_referenced = [t for t in topic_offer if t["ref"] not in named]
+    at_line, at_section, orphaned = _place_photos(prose + ([note] if note else []),
+                                                  photo_streams)
     placed = at_line + at_section
+    if topic_offer:
+        logger.info("coverage: %d topics offered, %d referenced, not referenced: %s",
+                    len(topic_offer), len(topic_offer) - len(not_referenced),
+                    ",".join(t["ref"] for t in not_referenced) or "none")
     if photo_streams:
         # Counted, not assumed, and BY TIER. "Did the model tag the lines we
         # asked it to" is the question this feature turns on, and only the
@@ -605,7 +693,8 @@ def _generate_document(artifact, context=None):
         artifact.get("title") or gen.get("templateName") or template.get("name") or "Report",
         "%s  %s - %s" % (date, window.get("from") or "00:00", window.get("to") or "23:59"),
         prose,
-        _action_items_for_prompt(content))
+        _action_items_for_prompt(content),
+        closing=note)
     # WHICH TEMPLATE THIS WAS comes from the REQUEST, not from the template's
     # own text. The files in report_templates/ carry `template_id` and
     # `version` inside them; a template written in the Library does not -- its
@@ -634,7 +723,14 @@ def _generate_document(artifact, context=None):
             "photosPlaced": placed,
             "photosUnderALine": at_line,
             "photosUnderASection": at_section,
-            "photosUnplaced": orphaned}
+            "photosUnplaced": orphaned,
+            # What the coverage note was built from. `topicsNotReferenced` is
+            # exactly what the note printed; it is here because the note is in
+            # a Word file and this is not.
+            "topicsOffered": len(topic_offer),
+            "topicsNotReferenced": [{"ref": t["ref"], "title": t.get("title"),
+                                     "time_range": t.get("time_range")}
+                                    for t in not_referenced]}
     return buf, meta
 
 

@@ -238,8 +238,11 @@ PROPOSAL_PAGE = int(os.environ.get("PROPOSAL_PAGE", "5"))
 # a single profile — the subject needs an account, and on a site the people most often named
 # do not have one.
 #
-# On, a correction also creates the profile, recorded as `consent_basis='attestation'` with
-# `asserted_by` naming who made the claim. It records a claim; it does not verify one, and
+# On, a correction also creates the profile, recorded with the COMPANY's own
+# `voiceprint_consent_basis` -- whichever of notice / attestation / confirmed the company
+# declared -- and `asserted_by` naming who applied it. (This comment used to say every such
+# row was recorded as 'attestation'. The code has always written the company's value; a
+# comment that misstates which legal basis a biometric record carries is worse than none.) It records a claim; it does not verify one, and
 # nothing here can. The basis is on every row so a later decision — a stricter standard, a
 # purge, an opt-out register — can find exactly this population in one query.
 ENROL_ON_CORRECTION = os.environ.get("ENROL_ON_CORRECTION", "false").lower() == "true"
@@ -1900,7 +1903,7 @@ def _may_correct_speakers(conn, caller, folder):
     return folder == scope.visible_scope(conn, caller).get("self_folder")
 
 
-def _session_turns(conn, folder, date, session_base):
+def _session_turns(conn, folder, date, session_base, with_text=False):
     """Every turn of one session, as (file, offset) pairs the embedder can cut audio with.
 
     Reads the same transcripts the viewer does and keeps only this session — a day can hold
@@ -1946,6 +1949,11 @@ def _session_turns(conn, folder, date, session_base):
                     # about turns too short for any acoustic judgement, and until now that
                     # statement never reached the layer that declines to judge them.
                     "speaker_label": seg.get("speaker_label")})
+        # Only for a reader that shows words. The embedder artifacts carry turns by the
+        # hundred and never read the text; the name-proposal dialog shows it and had
+        # nothing to show -- every passage read "No words to show" on TEST 2026-09-27.
+        if with_text:
+            out[-1]["text"] = seg.get("text")
     # WHY it is empty, when it is. An empty turn list is a legitimate outcome — a session
     # with nothing transcribed yet — and it is also what a session-id mismatch, a missing
     # `chunk_start` and an empty read all look like. Four investigations into one enrolment
@@ -2409,7 +2417,7 @@ def list_name_proposals(conn, caller, event):
         sid = (r["session_base"], r["user_folder"], str(r["session_date"]))
         if sid not in cache:
             try:
-                cache[sid] = _session_turns(conn, sid[1], sid[2], sid[0])
+                cache[sid] = _session_turns(conn, sid[1], sid[2], sid[0], with_text=True)
             except Exception:
                 logger.exception("proposal %s: could not read its transcript", r["id"])
                 cache[sid] = []
@@ -2480,16 +2488,39 @@ def decide_name_proposal(conn, caller, proposal_id, event):
     company_id = str(caller["company_id"])
     # Company from the caller, never the path -- a valid uuid from another tenant would
     # otherwise be a button that names people in their recordings.
-    row = speaker_name_proposals.decide(conn, company_id, proposal_id, decision,
-                                        decided_by=caller["id"])
-    if row is None:
-        # Already answered, or not this company's. Both are "there is nothing here for you
-        # to decide", and telling them apart would confirm the existence of another
-        # tenant's row.
-        return error("no pending proposal with that id", 404)
-    if decision == "rejected":
-        return ok({"proposalId": row["id"], "decision": "rejected"})
+    # ONE transaction for the decision and the correction it delegates to. `decide` flips
+    # the row out of `pending`; if the correction is then refused, a committed flip leaves a
+    # proposal that says `confirmed` while nothing was named -- and, no longer pending, it
+    # can never be answered again. That is what the 400 above did on TEST 2026-09-27.
+    try:
+        with conn.transaction():
+            row = speaker_name_proposals.decide(conn, company_id, proposal_id, decision,
+                                                decided_by=caller["id"])
+            if row is None:
+                # Already answered, or not this company's. Both are "there is nothing here
+                # for you to decide", and telling them apart would confirm the existence of
+                # another tenant's row.
+                return error("no pending proposal with that id", 404)
+            if decision == "rejected":
+                return ok({"proposalId": row["id"], "decision": "rejected"})
+            resp = _apply_confirmed_proposal(conn, caller, company_id, row, event)
+            if int(resp.get("statusCode", 500)) >= 300:
+                raise _ConfirmationNotApplied(resp)
+            return resp
+    except _ConfirmationNotApplied as exc:
+        return exc.response
 
+
+class _ConfirmationNotApplied(Exception):
+    """The delegated correction was refused -- undo the proposal's decision with it."""
+
+    def __init__(self, response):
+        super().__init__(response.get("statusCode"))
+        self.response = response
+
+
+def _apply_confirmed_proposal(conn, caller, company_id, row, event):
+    """Turn a confirmed proposal into the correction a rename would have made."""
     person = voiceprints.get_profile(conn, company_id, row["voiceprint_id"])
     if person is None or not person.get("display_name"):
         return error("the proposed profile has no name to apply", 409)
@@ -2497,7 +2528,6 @@ def decide_name_proposal(conn, caller, proposal_id, event):
     # Off the ROW, not re-derived. `speaker_label_groups` carries neither, and resolving
     # them at decision time would make answering an old proposal depend on data that may
     # have moved since it was offered.
-    session_base = row["session_base"]
     folder, date = row["user_folder"], str(row["session_date"])
 
     # WHICH passage to mark. A cluster is many turns; the correction endpoint marks one
@@ -2505,7 +2535,7 @@ def decide_name_proposal(conn, caller, proposal_id, event):
     # because it carries the most evidence for the enrolment the correction may also
     # trigger -- the homogeneity guard refuses thin windows, and picking the first turn
     # would hand it whichever passage happened to be transcribed first.
-    turns = [t for t in _session_turns(conn, folder, date, session_base)
+    turns = [t for t in _session_turns(conn, folder, date, row["session_base"])
              if t.get("source_filename") == row["source_filename"]
              and t.get("speaker_label") == row["speaker_label"]]
     if not turns:
@@ -2513,8 +2543,13 @@ def decide_name_proposal(conn, caller, proposal_id, event):
     best = max(turns, key=lambda t: float(t.get("end_sec", 0)) - float(t.get("start_sec", 0)))
 
     # The delegation. Same handler, same artifact, same `source='correction'` on the row
-    # that lands -- see this function's docstring for why nothing may shortcut it.
-    return speaker_corrections(conn, caller, session_base, dict(event, body=json.dumps({
+    # that lands -- see `decide_name_proposal`'s docstring for why nothing may shortcut it.
+    # The SESSION ID is the passage's own filename, not `row["session_base"]`. The row
+    # stores the canonical key (`sid<32 hex>`), which carries no date, and
+    # `speaker_corrections` refuses a session id without one. Measured on TEST
+    # 2026-09-27: "Yes, it's them" returned 400 and named nobody. The filename carries
+    # both the date and the sid, and it is what the transcript viewer's own rename sends.
+    return speaker_corrections(conn, caller, row["source_filename"], dict(event, body=json.dumps({
         "user": folder,
         "source_filename": row["source_filename"],
         "start_sec": best["start_sec"],

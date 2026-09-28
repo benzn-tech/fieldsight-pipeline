@@ -66,6 +66,7 @@ import boto3
 import deadline_parse
 import match_request
 import photo_binding
+import photo_rebind
 import reindex
 import agent_turn_filter
 from chunking import chunk_report, chunk_transcripts
@@ -677,14 +678,20 @@ def ingest_report(date, user_folder, report_key):
         collected_topics = []
         if not defer_to_extraction:
             # P4 (2026-07-23 prod-media-binding plan): list the pictures
-            # prefix ONCE (paginator, outside the loop) and time-correlate it
-            # against this report's topics with the shared matcher, so
-            # report-sourced topics carry photos exactly like extraction ones.
-            # Only this branch lists -- a defer day writes no report topics
-            # and must not spend the S3 LIST.
+            # prefix ONCE (paginator, outside the loop), so report-sourced
+            # topics carry photos exactly like extraction ones. Only this
+            # branch lists -- a defer day writes no report topics and must not
+            # spend the S3 LIST.
+            #
+            # The MATCHING left this loop on 2026-09-23. It ran here against
+            # THIS report's topics while listing the whole DAY -- the same
+            # shape that let one photo reach a topic in every session of the
+            # day on the extraction path, and on a mid-flip day where both a
+            # report and extractions exist, the two writers could bind the same
+            # photo once each. It happens once now, after the loop, over every
+            # topic the day has (photo_rebind.rebind_day_photos).
             report_topics = report.get("topics", [])
-            photos_by_topic = photo_binding.photos_for_topics(
-                _list_report_pictures(user_folder, date), report_topics)
+            report_photo_objects = _list_report_pictures(user_folder, date)
             for i, t in enumerate(report_topics):
                 mapped_action_items = _map_action_items(t.get("action_items"), date)
                 row = topics.upsert_topic(
@@ -705,8 +712,8 @@ def ingest_report(date, user_folder, report_key):
                     # what lambda_report_generator emits); the extraction schema
                     # spells it `decisions` (objects). One column holds both.
                     decisions=t.get("key_decisions") or t.get("decisions"),
-                    photos=[{"s3_key": p["key"], "caption_text": None}
-                            for p in photos_by_topic.get(i, [])],
+                    # NO `photos=`. topic_photos has one writer now, and it is
+                    # the day-wide rebind after this loop -- see above.
                 )
                 # None keys stay out of the map: a literal "topic_id": null
                 # topic must not adopt the unassigned transcript windows
@@ -723,6 +730,16 @@ def ingest_report(date, user_folder, report_key):
                     "user_id": str(user_id) if user_id is not None else None,
                     "action_items": [{"text": a["text"]} for a in mapped_action_items],
                 })
+
+            # The day's photos, bound once, after this report's topics exist.
+            # Never fatal: a rebind that turned a good ingest into a failed one
+            # would be worse than a misplaced thumbnail, and the day view lists
+            # every photo regardless of binding.
+            try:
+                photo_rebind.rebind_day_photos(
+                    conn, company["id"], user_folder, date, report_photo_objects)
+            except Exception:  # noqa: BLE001 -- see above
+                logger.exception("day photo rebind failed for %s/%s", user_folder, date)
 
         # Re-hide anything just re-created under a source its owner deleted. IN THE SAME
         # TRANSACTION as the insert, so there is no window in which the resurrected rows

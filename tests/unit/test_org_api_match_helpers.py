@@ -296,3 +296,14 @@ def test_the_connection_reaches_the_reader_that_filters_deleted_sessions(monkeyp
     assert seen["conn"] is _CONN, (
         "the connection did not reach the reader, so the deleted-session filter runs in its "
         "fail-open state and a tombstoned session's turns come back")
+
+
+def test_the_words_travel_only_to_a_reader_that_shows_them(monkeypatch):
+    """The name-proposal dialog quotes the passage; on TEST 2026-09-27 every passage read
+    "No words to show" because the turn list never carried text. The embedder artifacts
+    carry turns by the hundred and never read it, so they still do not get it."""
+    seg = dict(_seg(SID_A, 2.0), text="pour is booked for Tuesday")
+    monkeypatch.setattr(org, "_read_org_transcripts", lambda *a, **k: _payload(seg))
+    assert org._session_turns(_CONN, "Benl1", "2026-04-29", SID_A,
+                              with_text=True)[0]["text"] == "pour is booked for Tuesday"
+    assert "text" not in org._session_turns(_CONN, "Benl1", "2026-04-29", SID_A)[0]

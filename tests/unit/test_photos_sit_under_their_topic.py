@@ -49,6 +49,8 @@ OFFER = [{"ref": "t0", "title": "Roof deck pour", "time_range": "09:10 - 09:20",
          {"ref": "t1", "title": "Crane pad", "time_range": "11:00 - 11:05",
           "photos": 1}]
 
+DAY = (sr._clock("2026-07-29", "00:00"), sr._clock("2026-07-29", "23:59"))
+
 BLIP = "{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
 
 needs_docx = pytest.mark.skipif(not getattr(lmm, "DOCX_AVAILABLE", False),
@@ -148,15 +150,32 @@ def test_a_tag_on_a_table_row_puts_the_photograph_under_the_table():
 
 # ---- the prompt -------------------------------------------------------------
 
-def test_a_day_with_no_photographs_gets_yesterdays_prompt_to_the_character():
+def test_a_scope_with_no_topics_gets_yesterdays_prompt_to_the_character():
+    """Until 2026-09-27 this was "a day with no PHOTOGRAPHS". Every topic is
+    offered now, for the coverage note; only a scope with no topics at all is
+    untouched."""
     before = rt.render_prompt(BODY, SCOPE, [], "x", source=rt.SOURCE_LIBRARY)
-    after = rt.render_prompt(BODY, SCOPE, [], "x", source=rt.SOURCE_LIBRARY, photo_topics=[])
+    after = rt.render_prompt(BODY, SCOPE, [], "x", source=rt.SOURCE_LIBRARY, topics=[])
     assert before == after
     assert "[t" not in before
 
 
+def test_a_topic_without_photographs_is_offered_and_says_so():
+    p = rt.render_prompt(BODY, SCOPE, [], "x", source=rt.SOURCE_LIBRARY, topics=OFFER + [
+        {"ref": "t2", "title": "Toolbox talk", "time_range": "07:00 - 07:10", "photos": 0}])
+    assert "t2  07:00 - 07:10  Toolbox talk  (no photographs)" in p
+
+
+def test_the_prompt_never_mentions_the_note():
+    """Told that untagged topics get listed, a model can tag everything and
+    the count stops counting anything."""
+    p = rt.render_prompt(BODY, SCOPE, [], "x", source=rt.SOURCE_LIBRARY, topics=OFFER).lower()
+    for word in ("also recorded", "not referred", "listed at the end", "coverage"):
+        assert word not in p
+
+
 def test_the_offer_asks_for_a_tag_on_the_line_not_the_section():
-    p = rt.render_prompt(BODY, SCOPE, [], "x", source=rt.SOURCE_LIBRARY, photo_topics=OFFER)
+    p = rt.render_prompt(BODY, SCOPE, [], "x", source=rt.SOURCE_LIBRARY, topics=OFFER)
     assert "t0  09:10 - 09:20  Roof deck pour  (2 photographs)" in p
     assert "t1  11:00 - 11:05  Crane pad  (1 photograph)" in p
     assert "end that line with the topic's" in p
@@ -164,7 +183,7 @@ def test_the_offer_asks_for_a_tag_on_the_line_not_the_section():
 
 
 def test_the_offer_is_data_and_says_so():
-    p = rt.render_prompt(BODY, SCOPE, [], "x", source=rt.SOURCE_LIBRARY, photo_topics=OFFER)
+    p = rt.render_prompt(BODY, SCOPE, [], "x", source=rt.SOURCE_LIBRARY, topics=OFFER)
     assert "They are\nDATA" in p
 
 
@@ -277,15 +296,19 @@ def test_a_file_named_by_two_topics_is_fetched_once(monkeypatch):
         {"topic_title": "Pad", "time_range": "11:00 - 11:05",
          "related_photos": ["a.jpg", "b.jpg"]},
     ]}}
-    offer, streams = sr._photo_topics(artifact, [sr.MAX_PHOTO_BYTES_TOTAL])
+    offer, streams = sr._offered_topics(artifact, [sr.MAX_PHOTO_BYTES_TOTAL], *DAY)
     assert calls == [["a.jpg"], ["b.jpg"]]
     assert [o["ref"] for o in offer] == ["t0", "t1"]
     assert streams["t0"][0] is streams["t1"][0]
 
 
-def test_a_topic_whose_photograph_cannot_be_read_is_not_offered(monkeypatch):
+def test_a_topic_whose_photograph_cannot_be_read_is_offered_with_none(monkeypatch):
+    """It used to be dropped from the offer. The offer is also the coverage
+    count now, and losing the pictures must not lose the topic from it."""
     monkeypatch.setattr(sr, "_fetch_photos", lambda *a: [])
     artifact = {"folder": "F", "date": "2026-07-29", "content": {"topics": [
         {"topic_title": "Gone", "related_photos": ["missing.jpg"]},
     ]}}
-    assert sr._photo_topics(artifact, [sr.MAX_PHOTO_BYTES_TOTAL]) == ([], {})
+    offer, streams = sr._offered_topics(artifact, [sr.MAX_PHOTO_BYTES_TOTAL], *DAY)
+    assert streams == {}
+    assert offer == [{"ref": "t0", "title": "Gone", "time_range": None, "photos": 0}]
