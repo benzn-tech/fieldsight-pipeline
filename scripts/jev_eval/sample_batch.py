@@ -120,6 +120,18 @@ tests; `label_page.py` never renders it.
 """
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+# Bootstrap: run directly (`python scripts/jev_eval/sample_batch.py ...`),
+# the repo root and `src/` are not on `sys.path` (only pytest's
+# `pythonpath = ["src", "."]` puts them there) -- without this, the first
+# repo import below (`thread_match`) fails with `ModuleNotFoundError`.
+_REPO_ROOT = _Path(__file__).resolve().parents[2]
+for _p in (_REPO_ROOT, _REPO_ROOT / "src"):
+    if str(_p) not in _sys.path:
+        _sys.path.insert(0, str(_p))
+
 import argparse
 import hashlib
 import json

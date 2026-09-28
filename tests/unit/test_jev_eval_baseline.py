@@ -286,7 +286,7 @@ def test_baseline_row_raises_on_unknown_set():
 def _fake_run(env_vars, returncode=0, stderr=""):
     class _Result:
         pass
-    def run(args, capture_output=True, text=True):
+    def run(args, **kwargs):
         r = _Result()
         r.returncode = returncode
         r.stderr = stderr

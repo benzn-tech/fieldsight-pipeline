@@ -174,6 +174,17 @@ def load_deployed_llm_env(function_name, *, profile=DEFAULT_PROFILE,
     truthy in the deployed config) -- never the values, so a report or log
     line built from this return value cannot leak a secret.
     """
+    # BUG-35: on a Chinese-locale Windows box a non-ASCII byte in the
+    # response (or, here, in the deployed function's env) raises
+    # `UnicodeDecodeError` under the console's default GBK codepage before
+    # `returncode` is even checked. `errors="replace"` is the fallback only
+    # -- decoding is `utf-8` first, matching `export_labels._aws`. `env` is
+    # the current environment plus three UTF-8-forcing vars, never a
+    # replacement for it.
+    aws_env = dict(os.environ)
+    aws_env.setdefault("PYTHONUTF8", "1")
+    aws_env.setdefault("PYTHONIOENCODING", "utf-8")
+    aws_env.setdefault("AWS_CLI_FILE_ENCODING", "UTF-8")
     result = run(
         [
             "aws", "lambda", "get-function-configuration",
@@ -181,7 +192,10 @@ def load_deployed_llm_env(function_name, *, profile=DEFAULT_PROFILE,
             "--profile", profile, "--region", region,
             "--output", "json",
         ],
-        capture_output=True, text=True,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        env=aws_env,
     )
     if result.returncode != 0:
         raise RuntimeError(

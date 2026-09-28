@@ -23,6 +23,18 @@ Reads a `{set}.labels.json` file downloaded from `label_page.py` (`{id:
 """
 from __future__ import annotations
 
+import sys as _sys
+from pathlib import Path as _Path
+
+# Bootstrap: run directly (`python scripts/jev_eval/import_labels.py ...`),
+# the repo root is not on `sys.path` (only pytest's `pythonpath = ["src",
+# "."]` puts it there) -- without this, the `scripts.jev_eval.export_labels`
+# import below fails with `ModuleNotFoundError`.
+_REPO_ROOT = _Path(__file__).resolve().parents[2]
+for _p in (_REPO_ROOT, _REPO_ROOT / "src"):
+    if str(_p) not in _sys.path:
+        _sys.path.insert(0, str(_p))
+
 import argparse
 import json
 import sys
