@@ -191,3 +191,33 @@ def test_the_general_trades_are_two_different_trades():
     for kind, names in wa.GENERAL_IMPACT.items():
         assert len(set(names)) == len(names)
     assert wa.GENERAL_IMPACT["wind"] == ["crane lifts", "work at height"]
+
+
+# ---- the looked-up thresholds (2026-09-29) --------------------------------------
+
+def test_thresholds_follow_the_sources():
+    """NZS 3109 (5 C / 30 C for concrete), Resene (10 C for paint), EWPA and
+    scaffold guidance for wind. Changing one of these is a decision, not a
+    tidy-up, so it goes red here first."""
+    assert (wa.COLD_C, wa.HEAT_C, wa.PAINT_MIN_C) == (5, 30, 10)
+    assert (wa.WIND_GUST_KMH, wa.WIND_STOP_KMH) == (40, 50)
+
+
+def test_a_cool_morning_affects_painting_only():
+    cool = hours(h7={"temp_c": 7.0}, h8={"temp_c": 9.0}, h9={"temp_c": 11.0})
+    f = wa.assess(cool, planned=None)
+    assert [i["kind"] for i in f["items"]] == ["cool"]
+    assert wa.render_template(f) == [
+        "Cool start this morning (down to 7°C, until about 09:00). "
+        "Impact: exterior painting. Advice: start exterior painting after 09:00."]
+
+
+def test_a_cold_morning_is_reported_once_not_as_cold_and_cool():
+    cold = hours(h7={"temp_c": 2.0}, h8={"temp_c": 6.0}, h9={"temp_c": 11.0})
+    kinds = [i["kind"] for i in wa.assess(cold, planned=None)["items"]]
+    assert kinds == ["cold"]
+
+
+def test_29_degrees_is_not_hot_for_concrete_and_30_is():
+    assert not wa.assess(hours(h13={"temp_c": 29.0}), planned=["concrete pour"])["items"]
+    assert wa.assess(hours(h13={"temp_c": 30.0}), planned=["concrete pour"])["items"][0]["kind"] == "heat"

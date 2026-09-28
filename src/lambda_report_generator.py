@@ -68,6 +68,7 @@ import urllib3
 import agent_turn_filter
 from output_language import OUTPUT_LANGUAGE_RULE
 import weather
+import weather_advice
 import site_coords
 import llm_utils
 import report_sections
@@ -540,6 +541,51 @@ def build_weather_block_for_site(site_info, target_date, today_iso,
     except Exception as e:
         logger.warning(f"weather fetch failed for {target_date}: {e}")
         return None
+
+
+def build_weather_findings(site_info, target_date, today_iso,
+                           fetch=weather_advice.hourly_forecast):
+    """What the weather meant for the day's work, DECIDED BY CODE.
+
+    Until 2026-09-29 the report handed the model one sentence of daily totals
+    and asked it to "note the linkage" between weather and work -- every
+    threshold, every trade, left to the model and decided differently each
+    night. weather_advice.assess makes those calls from the hourly actuals;
+    the lines here are its fixed template, so the compliance record says the
+    same thing about the same weather every time.
+
+    Generic impacts for now (owner, 2026-09-29): the day's programme is not
+    matched yet, so the trades named are the ones that weather affects in
+    general, and `impact_basis` says so. None when the site has no coordinate
+    or the fetch fails -- the report says "not recorded" rather than guessing.
+    """
+    lat = site_info.get("latitude")
+    lng = site_info.get("longitude")
+    if lat is None or lng is None:
+        return None
+    historical = bool(today_iso and target_date < today_iso)
+    try:
+        hours = fetch(lat, lng, target_date, historical)
+    except Exception as e:
+        logger.warning(f"hourly weather fetch failed for {target_date}: {e}")
+        return None
+    if not hours:
+        return None
+    f = weather_advice.assess(hours, planned=None, actual=historical)
+    return {
+        "lines": weather_advice.render_template(f),
+        "weather_day": f["weather_day"] if historical else None,
+        "actual": historical,
+        "impact_basis": "general",
+        "items": f["items"],
+    }
+
+
+def weather_record_key(site_id, target_date, actual):
+    """Where one site's weather for one day is kept: the finding the reports
+    read, and what a later count of weather days (for extension-of-time claims)
+    adds up."""
+    return f"weather/{site_id}/{target_date}/{'actual' if actual else 'forecast'}.json"
 
 
 def build_daily_prompt(transcripts_with_photos, user_name, site_name, target_date,
@@ -1044,6 +1090,39 @@ def render_sections_into(doc, sections):
                     cells[i].text = '' if value is None else str(value)
 
 
+def render_weather_into(doc, report_data):
+    """The Weather section of the Word report: the day's totals, then what they
+    meant for the work, as weather_advice decided it. A per-person daily report
+    without a weather record says "Not recorded" -- on a compliance record a
+    missing section reads as a fine day."""
+    findings = report_data.get("weather_findings")
+    daily = report_data.get("weather")
+    if findings is None and daily is None:
+        if report_data.get("recording_session", {}).get("worker"):
+            doc.add_heading("Weather", level=1)
+            doc.add_paragraph("Not recorded for this report.")
+        return
+    doc.add_heading("Weather", level=1)
+    if daily:
+        doc.add_paragraph(weather_totals_line(daily))
+    for line in (findings or {}).get("lines") or []:
+        doc.add_paragraph(line, style="List Bullet")
+
+
+def weather_totals_line(w):
+    """The day's measured totals in one line, as the web viewer shows them."""
+    bits = []
+    if w.get("condition_label"):
+        bits.append(w["condition_label"])
+    if w.get("temp_min_c") is not None and w.get("temp_max_c") is not None:
+        bits.append(f"{w['temp_min_c']}–{w['temp_max_c']}°C")
+    if w.get("precip_mm") is not None:
+        bits.append(f"{w['precip_mm']} mm rain")
+    if w.get("windspeed_kmh") is not None:
+        bits.append(f"wind to {w['windspeed_kmh']} km/h")
+    return " · ".join(bits)
+
+
 def generate_word_document(report_data, title):
     if not DOCX_AVAILABLE:
         return None
@@ -1085,6 +1164,8 @@ def generate_word_document(report_data, title):
                     for run in paragraph.runs:
                         run.bold = True
         doc.add_paragraph('')
+
+    render_weather_into(doc, report_data)
 
     # One definition of what this report is. Where sections exist -- the daily
     # report and the meeting compat report -- they are what both artifacts show.
@@ -1562,17 +1643,31 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
         user_site_info = sites_info.get(user_site_id, {})
         user_site_name = site_name_for(user_site_info)
 
-        weather_block = build_weather_block_for_site(
-            user_site_info, target_date, get_nzdt_now().strftime('%Y-%m-%d'))
+        today_iso = get_nzdt_now().strftime('%Y-%m-%d')
+        weather_block = build_weather_block_for_site(user_site_info, target_date, today_iso)
+        weather_findings = build_weather_findings(user_site_info, target_date, today_iso)
+        if weather_findings and user_site_id:
+            try:
+                s3_client.put_object(
+                    Bucket=S3_BUCKET,
+                    Key=weather_record_key(user_site_id, target_date, weather_findings["actual"]),
+                    Body=json.dumps({"site_id": user_site_id, "date": target_date,
+                                     "daily": weather_block, **weather_findings},
+                                    default=str).encode("utf-8"),
+                    ContentType="application/json")
+            except Exception as e:
+                logger.warning(f"could not keep the weather record for {user_site_id}/{target_date}: {e}")
 
         prompt = build_daily_prompt(
             correlated, user_name, user_site_name, target_date,
             role=user_role, total_duration=user_data['total_duration'],
             num_photos=len(user_data['photos']), name_mapping=user_mapping,
         )
-        if weather_block:
-            prompt += ("\n\n## Site Weather (for AI correlation)\n"
-                       + weather.weather_prompt_block(weather_block))
+        # NO WEATHER IN THE PROMPT. The model used to be told the day's totals
+        # and asked to judge the impact; that judgement is weather_findings
+        # now, made by code and rendered as it is (owner, 2026-09-29: the code
+        # decides, the model words). The transcript can still mention the
+        # weather -- that is what was said, and stays.
 
         max_tokens = min(8192 + n_transcripts * 700, llm_utils.ANSWER_TOKEN_CEILING)
         logger.info(f"  {user_name}: {n_transcripts} transcripts \u2192 max_tokens={max_tokens}")
@@ -1654,6 +1749,7 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
                 'per_recording': recording_durations,
             },
             'weather': weather_block,
+            'weather_findings': weather_findings,
             'executive_summary': claude_output.get('executive_summary', ''),
             'quality_and_compliance': claude_output.get('quality_and_compliance', []),
             'safety_observations': claude_output.get('safety_observations', []),
