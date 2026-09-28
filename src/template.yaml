@@ -2493,6 +2493,17 @@ Resources:
             Method: post
             Auth:
               Authorizer: NONE
+        # Publishes every site's coordinate for the (non-VPC) report generator,
+        # half an hour before the 05:00 NZDT daily reports. Saving a site
+        # publishes only that site; this is what places the ones nobody edits.
+        # See lambda_org_api.republish_all_site_coords.
+        SiteCoordsRepublish:
+          Type: Schedule
+          Properties:
+            Schedule: cron(30 15 * * ? *)
+            Description: Republish site coordinates before the daily reports
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
+            Input: '{"task": "republish_site_coords"}'
 
   # ----------------------------------------------------------
   # Lambda 11: Org Seed (Phase 3) — one-shot idempotent backfill of
