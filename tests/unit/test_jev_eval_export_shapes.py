@@ -508,7 +508,7 @@ def test_run_export_keeps_owner_rows_after_a_re_export(monkeypatch, tmp_path):
             "id": "owner-row-1", "set": "threads", "label": "yes",
             "features": {}, "site_id": "s1", "company_id": "c1",
             "decided_at": "2026-09-01T00:00:00Z", "baseline": {"score": 0.5},
-            "label_source": "owner",
+            "label_source": "owner", "topic_ids": ["t-later", "t-earlier"],
         }) + "\n",
         encoding="utf-8",
     )
@@ -522,6 +522,9 @@ def test_run_export_keeps_owner_rows_after_a_re_export(monkeypatch, tmp_path):
         if "begin-transaction" in args:
             return _FakeCompleted(stdout=json.dumps({"transactionId": "tx-1"}))
         if "execute-statement" in args:
+            if "FROM topics t WHERE t.id IN" in args[args.index("--sql") + 1]:
+                return _FakeCompleted(stdout=json.dumps({"records": [
+                    [{"stringValue": "t-later"}], [{"stringValue": "t-earlier"}]]}))
             return _FakeCompleted(stdout=empty_result)
         if "rollback-transaction" in args:
             return _FakeCompleted(stdout=json.dumps({"transactionStatus": "RolledBack"}))
@@ -546,13 +549,22 @@ def test_run_export_keeps_owner_rows_after_a_re_export(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_owner_row_topic_ids_only_for_owner_rows_with_the_field():
-    assert ex.owner_row_topic_ids({"label_source": "db", "topic_ids": ["t1"]}) == []
-    assert ex.owner_row_topic_ids({"label_source": "owner"}) == []  # pre-fix owner row
-    assert ex.owner_row_topic_ids({"label_source": "owner", "topic_ids": ["t1", "t2"]}) == [
-        "t1", "t2",
-    ]
+    assert ex.owner_row_topic_ids({"label_source": "db", "topic_ids": ["t1"]}, "threads") == []
     assert ex.owner_row_topic_ids(
-        {"label_source": "owner", "topic_ids": ["t1", None]}) == ["t1"]
+        {"label_source": "owner", "topic_ids": ["t1", "t2"]}, "threads") == ["t1", "t2"]
+    # Fix wave 5, item 6: a partially-missing id list is unverifiable, not
+    # "check the ids that are there".
+    assert ex.owner_row_topic_ids(
+        {"label_source": "owner", "topic_ids": ["t1", None]}, "threads") is None
+
+
+def test_owner_row_without_topic_ids_fails_closed():
+    # Fix wave 5, item 6: work_class ids ARE topic ids -> fall back to the id;
+    # a threads id is a hash of two topic ids -> unverifiable (None).
+    assert ex.owner_row_topic_ids(
+        {"id": "topic-9", "label_source": "owner"}, "work_class") == ["topic-9"]
+    assert ex.owner_row_topic_ids(
+        {"id": "threads:abc", "label_source": "owner"}, "threads") is None
 
 
 def test_apply_owner_deletion_predicate_drops_rows_with_any_invisible_topic():
@@ -560,11 +572,67 @@ def test_apply_owner_deletion_predicate_drops_rows_with_any_invisible_topic():
         {"id": "a", "label_source": "owner", "topic_ids": ["t1", "t2"]},  # both visible
         {"id": "b", "label_source": "owner", "topic_ids": ["t1", "t3"]},  # t3 not visible
         {"id": "c", "label_source": "db"},  # nothing to check -- kept
-        {"id": "d", "label_source": "owner"},  # pre-fix, no topic_ids -- kept
+        {"id": "d", "label_source": "owner"},  # pre-wave-4 threads row -- unverifiable
     ]
-    kept, n_dropped = ex.apply_owner_deletion_predicate(rows, {"t1", "t2"})
-    assert {r["id"] for r in kept} == {"a", "c", "d"}
-    assert n_dropped == 1
+    kept, n_deleted, n_unverifiable = ex.apply_owner_deletion_predicate(
+        rows, {"t1", "t2"}, "threads")
+    assert {r["id"] for r in kept} == {"a", "c"}
+    assert n_deleted == 1
+    assert n_unverifiable == 1
+
+
+def test_apply_owner_deletion_predicate_work_class_falls_back_to_row_id():
+    rows = [
+        {"id": "t1", "label_source": "owner"},  # pre-wave-4, topic visible
+        {"id": "t9", "label_source": "owner"},  # pre-wave-4, topic deleted
+    ]
+    kept, n_deleted, n_unverifiable = ex.apply_owner_deletion_predicate(
+        rows, {"t1"}, "work_class")
+    assert [r["id"] for r in kept] == ["t1"]
+    assert (n_deleted, n_unverifiable) == (1, 0)
+
+
+def test_run_export_checks_pre_wave4_work_class_owner_row_by_its_id(monkeypatch, tmp_path):
+    (tmp_path / "work_class.jsonl").write_text(
+        json.dumps({
+            "id": "topic-gone", "set": "work_class", "label": "yes",
+            "features": {}, "site_id": "s1", "company_id": "c1",
+            "decided_at": "2026-09-01T00:00:00Z", "baseline": {},
+            "label_source": "owner",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "threads.jsonl").write_text(
+        json.dumps({
+            "id": "threads:old", "set": "threads", "label": "yes",
+            "features": {}, "site_id": "s1", "company_id": "c1",
+            "decided_at": "2026-09-01T00:00:00Z", "baseline": {"score": 0.5},
+            "label_source": "owner",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    seen_visibility_sql = []
+
+    def _fake_run(args, capture_output=True, text=True):
+        if "begin-transaction" in args:
+            return _FakeCompleted(stdout=json.dumps({"transactionId": "tx-1"}))
+        if "execute-statement" in args:
+            sql = args[args.index("--sql") + 1]
+            if "FROM topics t WHERE t.id IN" in sql:
+                seen_visibility_sql.append(sql)
+            return _FakeCompleted(stdout=json.dumps({"records": []}))
+        if "rollback-transaction" in args:
+            return _FakeCompleted(stdout=json.dumps({"transactionStatus": "RolledBack"}))
+        raise AssertionError(f"unexpected aws call: {args}")
+
+    monkeypatch.setattr(ex.subprocess, "run", _fake_run)
+    counts = ex.run_export("fieldsight_test", out_dir=tmp_path)
+
+    assert any("topic-gone" in sql for sql in seen_visibility_sql)
+    assert (tmp_path / "work_class.jsonl").read_text(encoding="utf-8").strip() == ""
+    assert (tmp_path / "threads.jsonl").read_text(encoding="utf-8").strip() == ""
+    assert counts["work_class"]["owner_rows_dropped_deleted"] == 1
+    assert counts["threads"]["owner_rows_dropped_no_topic_ids"] == 1
 
 
 def test_run_export_drops_owner_row_whose_topic_was_soft_deleted(monkeypatch, tmp_path):
@@ -652,7 +720,7 @@ def test_run_export_includes_owner_row_company_id_in_alias_lookup(monkeypatch, t
             "id": "owner-row-2", "set": "threads", "label": "yes",
             "features": {}, "site_id": "s1", "company_id": "owner-only-co",
             "decided_at": "2026-09-01T00:00:00Z", "baseline": {"score": 0.5},
-            "label_source": "owner",
+            "label_source": "owner", "topic_ids": ["tA", "tB"],
         }) + "\n",
         encoding="utf-8",
     )
@@ -667,6 +735,9 @@ def test_run_export_includes_owner_row_company_id_in_alias_lookup(monkeypatch, t
             sql = args[sql_index]
             if "owner-only-co" in sql:
                 seen_company_id_queries.append(sql)
+            if "FROM topics t WHERE t.id IN" in sql:
+                return _FakeCompleted(stdout=json.dumps(
+                    {"records": [[{"stringValue": "tA"}], [{"stringValue": "tB"}]]}))
             return _FakeCompleted(stdout=json.dumps({"records": []}))
         if "rollback-transaction" in args:
             return _FakeCompleted(stdout=json.dumps({"transactionStatus": "RolledBack"}))

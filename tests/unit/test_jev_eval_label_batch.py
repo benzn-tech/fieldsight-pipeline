@@ -583,19 +583,19 @@ def fixtures_and_batch(tmp_path):
             "set": "threads", "id": "threads:aaa", "label": None, "label_source": "owner",
             "features": {"earlier": {"title": "A"}, "later": {"title": "B"}, "gap_days": 5},
             "display": {}, "site_id": "s1", "company_id": "c1",
-            "baseline": {"score": 0.61}, "stratum": "high",
+            "baseline": {"score": 0.61}, "stratum": "high", "topic_ids": ["t-a2", "t-a1"],
         },
         {
             "set": "threads", "id": "threads:bbb", "label": None, "label_source": "owner",
             "features": {"earlier": {"title": "C"}, "later": {"title": "D"}, "gap_days": 9},
             "display": {}, "site_id": "s1", "company_id": "c1",
-            "baseline": {"score": 0.31}, "stratum": "mid",
+            "baseline": {"score": 0.31}, "stratum": "mid", "topic_ids": ["t-b2", "t-b1"],
         },
         {
             "set": "threads", "id": "threads:ccc", "label": None, "label_source": "owner",
             "features": {"earlier": {"title": "E"}, "later": {"title": "F"}, "gap_days": 2},
             "display": {}, "site_id": "s1", "company_id": "c1",
-            "baseline": {"score": 0.02}, "stratum": "low",
+            "baseline": {"score": 0.02}, "stratum": "low", "topic_ids": ["t-c2", "t-c1"],
         },
     ]
     with open(batch_dir / "threads.batch.jsonl", "w", encoding="utf-8") as fh:
@@ -714,3 +714,42 @@ def test_sample_work_class_refuses_before_opening_a_transaction(monkeypatch):
 
     with pytest.raises(sb.BatchSizeError):
         sb.sample_work_class("fieldsight_test", stratum_limit=1000)
+
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 5, item 6: import never passes a None topic_ids through for a
+# pre-wave-4 batch -- work_class derives it from the id (the id IS the topic
+# id), threads rows without it are dropped and counted (their id is a hash).
+# ---------------------------------------------------------------------------
+
+def test_build_import_rows_derives_or_drops_missing_topic_ids():
+    wc_batch = [{"id": "topic-1", "features": {}, "baseline": {}}]
+    rows, _unsure, _unknown, n_no_ids = il.build_import_rows(
+        "work_class", wc_batch, {"topic-1": "yes"}, "2026-09-28T00:00:00+00:00")
+    assert rows[0]["topic_ids"] == ["topic-1"]
+    assert n_no_ids == 0
+
+    th_batch = [{"id": "threads:x", "features": {}, "baseline": {}},
+                {"id": "threads:y", "features": {}, "baseline": {}, "topic_ids": ["a", "b"]}]
+    rows, _unsure, _unknown, n_no_ids = il.build_import_rows(
+        "threads", th_batch, {"threads:x": "yes", "threads:y": "no"}, "2026-09-28T00:00:00+00:00")
+    assert [r["id"] for r in rows] == ["threads:y"]
+    assert rows[0]["topic_ids"] == ["a", "b"]
+    assert n_no_ids == 1
+
+
+def test_import_set_reports_rows_dropped_for_missing_topic_ids(tmp_path, fixtures_and_batch):
+    fixtures_dir, batch_dir = fixtures_and_batch
+    path = batch_dir / "threads.batch.jsonl"
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+    rows[0].pop("topic_ids")
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    labels_path = tmp_path / "threads.labels.json"
+    labels_path.write_text(json.dumps({"threads:aaa": "yes", "threads:bbb": "no"}),
+                           encoding="utf-8")
+
+    result = il.import_set("threads", labels_path, batch_dir=batch_dir, fixtures_dir=fixtures_dir,
+                            now_iso="2026-09-28T00:00:00+00:00")
+    assert result["imported_yes_no"] == 1
+    assert result["skipped_no_topic_ids"] == 1

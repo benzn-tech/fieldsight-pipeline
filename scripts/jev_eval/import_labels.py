@@ -58,7 +58,15 @@ def load_labels(path: Path) -> dict:
 
 
 def build_import_rows(set_name: str, batch_rows: list, labels: dict, now_iso: str) -> tuple:
-    """`(new_rows, n_unsure, n_skipped_unknown_id)`. `new_rows` are the Task
+    """`(new_rows, n_unsure, n_skipped_unknown_id, n_skipped_no_topic_ids)`.
+
+    Fix wave 5, item 6: every imported row carries real `topic_ids` so
+    `export_labels.py` can re-check deletion on every export. A batch
+    sampled before wave 4 has none: for `work_class` the id IS the topic id
+    and is used; a `threads` row (id = hash of two topic ids) cannot be
+    re-checked and is dropped and counted, never imported with `None`.
+
+    The rest: `new_rows` are the Task
     1-shaped rows for every yes/no label whose id is present in
     `batch_rows`; a label id with no matching batch row (fix wave 3, minor
     2: it belongs to a different, or a since-resampled, batch) is skipped
@@ -68,6 +76,7 @@ def build_import_rows(set_name: str, batch_rows: list, labels: dict, now_iso: st
     new_rows = []
     n_unsure = 0
     n_skipped_unknown_id = 0
+    n_skipped_no_topic_ids = 0
     for item_id, verdict in labels.items():
         if verdict == "unsure":
             n_unsure += 1
@@ -78,6 +87,13 @@ def build_import_rows(set_name: str, batch_rows: list, labels: dict, now_iso: st
         if batch_row is None:
             n_skipped_unknown_id += 1
             continue
+        topic_ids = batch_row.get("topic_ids")
+        if not topic_ids or not all(topic_ids):
+            if set_name == "work_class":
+                topic_ids = [item_id]
+            else:
+                n_skipped_no_topic_ids += 1
+                continue
         new_rows.append({
             "set": set_name,
             "id": item_id,
@@ -91,9 +107,9 @@ def build_import_rows(set_name: str, batch_rows: list, labels: dict, now_iso: st
             # Fix wave 4, B9: carried through so export_labels.py can
             # re-check this row's topic(s) are still visible on every
             # export, not just at labelling time.
-            "topic_ids": batch_row.get("topic_ids"),
+            "topic_ids": list(topic_ids),
         })
-    return new_rows, n_unsure, n_skipped_unknown_id
+    return new_rows, n_unsure, n_skipped_unknown_id, n_skipped_no_topic_ids
 
 
 def merge_rows(existing_rows: list, new_rows: list) -> list:
@@ -153,7 +169,7 @@ def import_set(set_name: str, labels_path: Path, *, batch_dir: Path = BATCH_DIR,
     batch_rows = load_jsonl(batch_path)
 
     labels = load_labels(labels_path)
-    new_rows, n_unsure, n_skipped_unknown_id = build_import_rows(
+    new_rows, n_unsure, n_skipped_unknown_id, n_skipped_no_topic_ids = build_import_rows(
         set_name, batch_rows, labels, now_iso)
 
     fixture_path = fixtures_dir / f"{set_name}.jsonl"
@@ -168,6 +184,7 @@ def import_set(set_name: str, labels_path: Path, *, batch_dir: Path = BATCH_DIR,
         "imported_yes_no": len(new_rows),
         "unsure_dropped": n_unsure,
         "skipped_unknown_id": n_skipped_unknown_id,
+        "skipped_no_topic_ids": n_skipped_no_topic_ids,
         "total_after_merge": len(merged_rows),
         "fixture_path": str(fixture_path),
         "counts": counts[set_name],

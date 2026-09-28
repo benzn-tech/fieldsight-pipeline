@@ -221,3 +221,27 @@ def test_sql_programme_task_names_empty_when_no_programme_data(db):
     # zero rows quietly, not raise.
     records = _fetch(db, ex.sql_programme_task_names([co["id"]]))
     assert records == []
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 5, item 6: the owner-row deletion recheck's own SQL, run for real.
+# The unit tests only prove what the export does with a faked response.
+# ---------------------------------------------------------------------------
+
+def test_sql_visible_topic_ids_excludes_deleted_topics_and_deleted_sources(db):
+    co, s = _seed_company_site(db)
+    live = _topic(db, s["id"], "Live topic", source_s3_key="users/a/audio/live.wav")
+    topic_deleted = _topic(db, s["id"], "Deleted topic", source_s3_key="users/a/audio/t.wav")
+    source_deleted = _topic(db, s["id"], "From a deleted recording",
+                            source_s3_key="users/a/audio/gone.wav")
+
+    redactions.create_redaction(
+        db, co["id"], topic_deleted["id"], "user deleted", None, "worker", scope="deleted")
+    redactions.create_recording_tombstone(
+        db, co["id"], "users/a/audio/gone", "user deleted recording", None, "worker")
+
+    missing = "00000000-0000-0000-0000-000000000000"
+    ids = [str(live["id"]), str(topic_deleted["id"]), str(source_deleted["id"]), missing]
+    records = _fetch(db, ex.sql_visible_topic_ids(ids))
+
+    assert {str(r["id"]) for r in records} == {str(live["id"])}

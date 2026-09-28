@@ -699,40 +699,60 @@ def _label_source_breakdown(rows: list) -> dict:
     return breakdown
 
 
-def owner_row_topic_ids(row: dict) -> list:
+def owner_row_topic_ids(row: dict, set_name: str):
     """Topic ids an owner-labelled row's deletion-predicate recheck needs to
     verify are still visible -- fix wave 4, B9: both topics for `threads`,
     the one topic for `work_class` (`sample_batch.py` writes a `topic_ids`
     list on every owner-labelled batch row for exactly this purpose). A
     DB-sourced row needs no recheck here (its own SELECT already applied the
-    visibility predicate this same transaction); an owner row written before
-    this fix (no `topic_ids` field) has nothing to recheck and is kept, not
-    dropped."""
+    visibility predicate this same transaction) -> `[]`.
+
+    Fix wave 5, item 6 -- FAIL CLOSED. Wave 4 kept an owner row with no
+    `topic_ids` (labelled from a batch sampled before the field existed)
+    unconditionally, so a topic the user deleted afterwards -- for
+    `work_class`, a private conversation -- could still be sent. Now:
+    - `work_class`: the row id IS the topic id (`sample_batch.py`
+      `build_work_class_batch_row`), so it is checked by its id;
+    - anything else (`threads`, whose id is a hash of two topic ids): the
+      row cannot be verified -> `None`, and the caller drops it. A list
+      with a missing entry is unverifiable too, never "check what is
+      there"."""
     if row.get("label_source") != "owner":
         return []
-    return [tid for tid in (row.get("topic_ids") or []) if tid]
+    ids = row.get("topic_ids")
+    if ids:
+        if not all(ids):
+            return None
+        return list(ids)
+    if set_name == "work_class" and row.get("id"):
+        return [row["id"]]
+    return None
 
 
-def apply_owner_deletion_predicate(rows: list, visible_topic_ids: set) -> tuple:
-    """`(kept_rows, n_dropped)` -- fix wave 4, B9: re-applies the SAME
-    deletion/visibility predicate every DB-sourced row already passed
-    through its export SELECT to owner-labelled rows too, on EVERY export
-    (not just once, at labelling time). A topic visible when the owner
-    labelled it can be soft-deleted later; without this recheck, that row
-    would sit in `{set}.jsonl` forever, immune to `merge_export_rows`
-    always keeping `label_source == "owner"` rows. A row with no ids to
-    check (DB-sourced, or an owner row predating `topic_ids`) is kept
-    unconditionally; an owner row is dropped only if ANY of its topic ids is
-    no longer visible."""
+def apply_owner_deletion_predicate(rows: list, visible_topic_ids: set, set_name: str) -> tuple:
+    """`(kept_rows, n_dropped_deleted, n_dropped_no_topic_ids)` -- fix wave
+    4, B9 / fix wave 5, item 6: re-applies the SAME deletion/visibility
+    predicate every DB-sourced row already passed through its export SELECT
+    to owner-labelled rows too, on EVERY export (not just once, at
+    labelling time). A topic visible when the owner labelled it can be
+    soft-deleted later; without this recheck, that row would sit in
+    `{set}.jsonl` forever, immune to `merge_export_rows` always keeping
+    `label_source == "owner"` rows. An owner row is dropped if ANY of its
+    topic ids is no longer visible, and -- failing closed -- also if its
+    topic ids cannot be determined at all (counted separately)."""
     kept = []
-    n_dropped = 0
+    n_deleted = 0
+    n_unverifiable = 0
     for row in rows:
-        ids = owner_row_topic_ids(row)
+        ids = owner_row_topic_ids(row, set_name)
+        if ids is None:
+            n_unverifiable += 1
+            continue
         if ids and not all(tid in visible_topic_ids for tid in ids):
-            n_dropped += 1
+            n_deleted += 1
             continue
         kept.append(row)
-    return kept, n_dropped
+    return kept, n_deleted, n_unverifiable
 
 
 def sql_visible_topic_ids(topic_ids) -> str:
@@ -823,9 +843,10 @@ def run_export(database: str, *, profile: str = DEFAULT_PROFILE,
         # owner row's topic id(s) across all three sets, inside the same
         # rolled-back transaction.
         all_owner_topic_ids: set = set()
-        for rows in (pm_merged, th_merged, wc_merged):
+        for set_name, rows in (("programme_match", pm_merged), ("threads", th_merged),
+                               ("work_class", wc_merged)):
             for row in rows:
-                all_owner_topic_ids.update(owner_row_topic_ids(row))
+                all_owner_topic_ids.update(owner_row_topic_ids(row, set_name) or [])
 
         visible_topic_ids: set = set()
         if all_owner_topic_ids:
@@ -835,13 +856,17 @@ def run_export(database: str, *, profile: str = DEFAULT_PROFILE,
                 decode_field(r[0]) for r in vis_result.get("records", [])
             }
 
-        pm_merged, pm_owner_dropped = apply_owner_deletion_predicate(pm_merged, visible_topic_ids)
-        th_merged, th_owner_dropped = apply_owner_deletion_predicate(th_merged, visible_topic_ids)
-        wc_merged, wc_owner_dropped = apply_owner_deletion_predicate(wc_merged, visible_topic_ids)
+        pm_merged, pm_owner_dropped, pm_owner_no_ids = apply_owner_deletion_predicate(
+            pm_merged, visible_topic_ids, "programme_match")
+        th_merged, th_owner_dropped, th_owner_no_ids = apply_owner_deletion_predicate(
+            th_merged, visible_topic_ids, "threads")
+        wc_merged, wc_owner_dropped, wc_owner_no_ids = apply_owner_deletion_predicate(
+            wc_merged, visible_topic_ids, "work_class")
 
         _write_jsonl(out_dir / "programme_match.jsonl", pm_merged)
         pm_counts = summarize_set("programme_match", pm_merged, pm_excl, database)
         pm_counts["owner_rows_dropped_deleted"] = pm_owner_dropped
+        pm_counts["owner_rows_dropped_no_topic_ids"] = pm_owner_no_ids
         counts["programme_match"] = pm_counts
         # Fix wave 4, B10: company ids for the alias lookups must include
         # OWNER rows too (`pm_merged`, not just the fresh `pm_rows`) -- an
@@ -853,12 +878,14 @@ def run_export(database: str, *, profile: str = DEFAULT_PROFILE,
         _write_jsonl(out_dir / "threads.jsonl", th_merged)
         th_counts = summarize_set("threads", th_merged, th_excl, database)
         th_counts["owner_rows_dropped_deleted"] = th_owner_dropped
+        th_counts["owner_rows_dropped_no_topic_ids"] = th_owner_no_ids
         counts["threads"] = th_counts
         company_ids.update(r["company_id"] for r in th_merged if r.get("company_id"))
 
         _write_jsonl(out_dir / "work_class.jsonl", wc_merged)
         wc_counts = summarize_set("work_class", wc_merged, wc_excl, database)
         wc_counts["owner_rows_dropped_deleted"] = wc_owner_dropped
+        wc_counts["owner_rows_dropped_no_topic_ids"] = wc_owner_no_ids
         counts["work_class"] = wc_counts
         company_ids.update(r["company_id"] for r in wc_merged if r.get("company_id"))
 
