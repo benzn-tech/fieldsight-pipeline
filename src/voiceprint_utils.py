@@ -61,7 +61,21 @@ DEFAULT_MARGIN_SCALE_STEP = 0.01
 
 # How far apart two frames of one window may be before the window is treated as holding
 # more than one voice (v2 §6). Cosine distance, i.e. 1 - similarity.
-DEFAULT_MAX_FRAME_SPREAD = 0.35
+#
+# 0.40 since 2026-09-28, from 0.35. 0.35 was measured on read speech and had no negatives
+# behind it; on the owner's real speech it refused most single-speaker windows (Ben's own
+# turns were refused three times running on prod). Measured with the prod model on:
+#   * 42 clips the owner labelled by ear: adjacent 10 s frame pairs of ONE person pass 41%
+#     at 0.35, 55% at 0.40; pairs of TWO people (6,303, across recordings) -- none at 0.40,
+#     nearest 0.417.
+#   * one meeting with two people in one room (08-27, Ben and Benny, frames labelled by
+#     voice): 12,920 cross pairs, nearest 0.448; 36 real speaker-change boundaries,
+#     nearest 0.483; same-person adjacent pairs pass 29% at 0.35, 47% at 0.40.
+# 0.40 keeps a margin under every two-voice pair seen. 0.45 would enrol more (68-72%) but
+# already admits a same-room cross pair at 0.448 -- too close for a biometric store. The
+# samples it lets in are still checked twice more: against other profiles
+# (`EnrolmentBelongsToSomebodyElse`) and against the profile's own core (quarantine).
+DEFAULT_MAX_FRAME_SPREAD = 0.40
 
 
 @dataclass
