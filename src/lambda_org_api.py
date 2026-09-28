@@ -367,7 +367,17 @@ def parse_body(event):
     return parsed if isinstance(parsed, dict) else None
 
 
+REPUBLISH_SITE_COORDS_TASK = "republish_site_coords"
+
+
 def lambda_handler(event, context):
+    # SCHEDULED, not routed. EventBridge invokes this with a constant input
+    # carrying `task`; an API Gateway event is a proxy envelope whose top-level
+    # keys come from API Gateway, never from the request, so no caller can
+    # reach this branch through the API.
+    if isinstance(event, dict) and event.get("task") == REPUBLISH_SITE_COORDS_TASK:
+        with get_connection() as conn:
+            return republish_all_site_coords(conn)
     method = event.get("httpMethod", "")
     path = event.get("path", "")
     m = re.match(r"^/api/org(/.*)?$", path)
@@ -3616,6 +3626,38 @@ def _publish_site_coords(row):
         logger.info("site-coords: published %s (%d site(s) placed)", slug, len(merged))
     except Exception:  # noqa: BLE001 - see docstring
         logger.exception("site-coords: publish failed for %s", (row or {}).get("id"))
+
+
+def republish_all_site_coords(conn):
+    """Publish EVERY site's coordinate, once a day, before the daily reports.
+
+    _publish_site_coords runs when a site is saved, and only then. Found on
+    2026-09-29: config/site-coords.json had never been written on prod -- no
+    site had been saved with a coordinate since the publish shipped -- so every
+    production daily report still went out with no weather, the defect the
+    publish existed to fix. A write that happens only on edit leaves every
+    site nobody edits unplaced, silently.
+
+    So the whole set is published from Aurora on a schedule (04:30 NZ, ahead
+    of the 05:00 reports). One read, one merge, and no write when nothing
+    changed. Archived sites are left as they are: an archived site writes no
+    reports, and removing its entry would only churn the object.
+    """
+    rows = sites.list_all_sites(conn, include_archived=False)
+    doc = _get_lake_json(site_coords.KEY) or {}
+    merged = dict(doc)
+    for row in rows:
+        merged = site_coords.merge_site(merged, row)
+    placed = sum(1 for r in rows if site_coords.entry_for_site(r))
+    if merged == doc:
+        logger.info("site-coords: republish found nothing to change (%d placed)", len(merged))
+        return {"changed": False, "sites": len(rows), "placed": placed}
+    s3().put_object(
+        Bucket=LAKE_BUCKET, Key=site_coords.KEY,
+        Body=json.dumps(merged, indent=2, default=str).encode("utf-8"),
+        ContentType="application/json")
+    logger.info("site-coords: republished %d site(s), %d placed", len(rows), placed)
+    return {"changed": True, "sites": len(rows), "placed": placed}
 
 
 def list_site_members(conn, caller, site_id):

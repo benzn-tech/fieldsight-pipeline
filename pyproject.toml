@@ -42,7 +42,10 @@ python-preference = "managed"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+# pytest inserts these into sys.path in reverse order, so "." (last) ends up
+# ahead of "src" -- a future repo-root file/package named like a src module
+# would shadow it.
+pythonpath = ["src", "."]
 markers = [
   "integration: touches a real PostgreSQL (skipped unless TEST_DATABASE_URL is set)",
 ]

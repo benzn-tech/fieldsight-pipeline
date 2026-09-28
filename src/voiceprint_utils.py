@@ -61,7 +61,21 @@ DEFAULT_MARGIN_SCALE_STEP = 0.01
 
 # How far apart two frames of one window may be before the window is treated as holding
 # more than one voice (v2 §6). Cosine distance, i.e. 1 - similarity.
-DEFAULT_MAX_FRAME_SPREAD = 0.35
+#
+# 0.40 since 2026-09-28, from 0.35. 0.35 was measured on read speech and had no negatives
+# behind it; on the owner's real speech it refused most single-speaker windows (Ben's own
+# turns were refused three times running on prod). Measured with the prod model on:
+#   * 42 clips the owner labelled by ear: adjacent 10 s frame pairs of ONE person pass 41%
+#     at 0.35, 55% at 0.40; pairs of TWO people (6,303, across recordings) -- none at 0.40,
+#     nearest 0.417.
+#   * one meeting with two people in one room (08-27, Ben and Benny, frames labelled by
+#     voice): 12,920 cross pairs, nearest 0.448; 36 real speaker-change boundaries,
+#     nearest 0.483; same-person adjacent pairs pass 29% at 0.35, 47% at 0.40.
+# 0.40 keeps a margin under every two-voice pair seen. 0.45 would enrol more (68-72%) but
+# already admits a same-room cross pair at 0.448 -- too close for a biometric store. The
+# samples it lets in are still checked twice more: against other profiles
+# (`EnrolmentBelongsToSomebodyElse`) and against the profile's own core (quarantine).
+DEFAULT_MAX_FRAME_SPREAD = 0.40
 
 
 @dataclass
@@ -147,6 +161,15 @@ def effective_margin(pool_size: int, base_margin: float = DEFAULT_MIN_MARGIN,
     return base_margin + scale_step * (pool_size - scale_threshold)
 
 
+#: Below this, no enrolled voice is close enough to offer a name at all -- used only while
+#: a company has no calibrated floor of its own. Measured 2026-09-28 on 42 clips the owner
+#: labelled by ear: across every profile the highest score of somebody who was NOT that
+#: person was 0.274, and 16 of Ben's 19 and 5 of Sam's 6 own clips scored above 0.35 (the
+#: misses were all 5 s or shorter). n is small -- 36 usable clips, 5 true strangers -- so
+#: this is a starting point, not a fitted cut, and a name above it is still only a lean.
+DEFAULT_ABSENT_FLOOR = 0.35
+
+
 def decide_name(scores, duration_s: float,
                 min_turn_s: float = DEFAULT_MIN_TURN_S,
                 min_margin: float | None = None,
@@ -188,6 +211,14 @@ def decide_name(scores, duration_s: float,
 
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     best_name, best = ranked[0]
+    # Before the margin, and only without a calibrated floor. With one profile (the 1:1
+    # case -- a company that has enrolled one person) there is no runner-up, so without
+    # this every voice in the room was offered as that person with a question mark.
+    if floor is None and best < DEFAULT_ABSENT_FLOOR:
+        return Decision("unknown", None, None,
+                        f"best match {best_name} at {best:.3f} is below "
+                        f"{DEFAULT_ABSENT_FLOOR:.2f}; no enrolled voice is close enough",
+                        score=best)
     if len(ranked) == 1:
         # Nothing to be better than. Confirming here would be confirming on an absolute
         # score, which is exactly what the overlapping distributions forbid.

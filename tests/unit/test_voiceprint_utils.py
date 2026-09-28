@@ -68,15 +68,16 @@ def test_a_clear_winner_is_confirmed():
 
 
 def test_two_close_scores_are_tentative_rather_than_a_coin_flip():
-    """This is the shape of the Phase 0 miss: 0.111 against 0.104. Naming the winner there
-    is a wrong confident name, which v2 §1 prices above a missing one."""
-    d = vp.decide_name({"Ben": 0.111, "Zoe": 0.104}, duration_s=6.0)
+    """The shape of the Phase 0 miss (0.111 against 0.104), lifted above the absence floor
+    so the margin rule is what is tested. Naming the winner of a near-tie is a wrong
+    confident name, which v2 §1 prices above a missing one."""
+    d = vp.decide_name({"Ben": 0.411, "Zoe": 0.404}, duration_s=6.0)
     assert d.status == "tentative" and d.name == "Ben"
 
 
 def test_a_tentative_name_still_says_who_it_leans_towards():
     """Viewer-only, per v2 §1 — the guess is shown as a guess, not withheld entirely."""
-    d = vp.decide_name({"Ben": 0.30, "Zoe": 0.26}, duration_s=8.0)
+    d = vp.decide_name({"Ben": 0.50, "Zoe": 0.46}, duration_s=8.0)
     assert d.name == "Ben" and d.status == "tentative"
 
 
@@ -587,3 +588,28 @@ def test_every_candidate_but_the_cluster_count_grows_with_frame_count():
     large = vp.frame_statistics(pool)
     assert large["pair_max"] >= small["pair_max"]
     assert large["frames"] > small["frames"]
+
+
+# ---- the absence floor (owner-labelled clips, 2026-09-28) ------------------------------
+
+
+def test_with_no_calibrated_floor_a_weak_best_names_nobody():
+    """Across 42 labelled clips the highest score of someone who was NOT that person was
+    0.274. The Phase 0 pair (0.111 / 0.104) sits among strangers, not among Ben's clips."""
+    d = vp.decide_name({"Ben": 0.111, "Zoe": 0.104}, duration_s=6.0)
+    assert d.status == "unknown" and d.name is None
+
+
+def test_one_profile_is_one_to_one_not_a_name_for_everyone():
+    """A company with one enrolled person used to get that name, with a question mark, on
+    every voice in the room -- there was no runner-up to lose to."""
+    assert vp.decide_name({"Petros": 0.22}, duration_s=8.0).status == "unknown"
+    d = vp.decide_name({"Petros": 0.61}, duration_s=8.0)
+    assert d.status == "tentative" and d.name == "Petros"
+
+
+def test_a_calibrated_floor_replaces_the_default():
+    """The default is for companies with no evidence of their own; it must not overrule a
+    floor fitted to theirs."""
+    d = vp.decide_name({"Ben": 0.30, "Zoe": 0.05}, duration_s=8.0, floor=0.25)
+    assert d.status == "confirmed" and d.name == "Ben"
