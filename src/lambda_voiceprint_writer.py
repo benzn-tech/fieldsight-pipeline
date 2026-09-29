@@ -46,8 +46,8 @@ import logging
 import os
 
 from db.connection import get_connection
-from repositories import (label_group_candidates, speaker_label_groups,
-                          speaker_name_proposals)
+from repositories import (label_group_candidates, site_attendance,
+                          speaker_label_groups, speaker_name_proposals)
 from repositories.companies import list_companies
 from repositories.voiceprints import (EnrolmentAfterWithdrawal,
                                       EnrolmentBelongsToSomebodyElse, add_sample,
@@ -388,17 +388,40 @@ def _profiles(event):
     exactly one home.
     """
     company_id = _require(event, "company_id")
+    site_id, date = event.get("site_id"), event.get("date")
     with get_connection() as conn:
-        rows = profiles_for_matching(conn, company_id, site_id=event.get("site_id"))
+        rows = profiles_for_matching(conn, company_id, site_id=site_id)
         # Read once per invocation, not once per turn: the floor is derived/materialized
         # state (recomputed on a schedule, spec S1.3) and must not move mid-decision
         # because one turn happened to land during a recompute.
         floor = company_floor(conn, company_id)
-    return {"profiles": [{"person_key": str(r["id"]),
-                          "display_name": r["display_name"],
-                          "status": r["status"],
-                          "embedding": r["embedding"]} for r in rows],
-            "company_floor": floor}
+        # The roster (plan Task 3). Both `site_id` and `date` are required, or `on_roster`
+        # is left off every profile entirely -- not `False` -- because "checked, nobody on
+        # it" and "not asked for" are different facts the embedder's roster rule treats
+        # differently (voiceprint_utils.decide_with_roster: an empty/absent roster narrows
+        # nothing, exactly today's behaviour). `None` here rather than `set()` is what
+        # carries "not asked" through to the loop below.
+        on_roster_ids = None
+        if site_id and date:
+            try:
+                on_roster_ids = site_attendance.on_roster_profile_ids(
+                    conn, company_id, site_id, date)
+            except Exception:
+                # Narrows, never blocks (spec consumer 1): a broken roster read must not
+                # stop matching, and the safe degradation is exactly the no-roster shape.
+                logger.exception("roster read failed for company %s site %s date %s; "
+                                 "matching proceeds unnarrowed", company_id, site_id, date)
+                on_roster_ids = None
+    profiles = [{"person_key": str(r["id"]),
+                "display_name": r["display_name"],
+                "status": r["status"],
+                "embedding": r["embedding"]} for r in rows]
+    reply = {"profiles": profiles, "company_floor": floor}
+    if on_roster_ids is not None:
+        for p, r in zip(profiles, rows):
+            p["on_roster"] = str(r["id"]) in on_roster_ids
+        reply["roster_size"] = len(on_roster_ids)
+    return reply
 
 
 def _match_names(event):
