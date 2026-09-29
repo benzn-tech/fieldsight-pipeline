@@ -40,6 +40,16 @@ Entry point (event shape):
     S3 event notifications encode spaces as '+' and other special chars as
     %XX -- the key is ALWAYS unquote_plus'd before use.
 
+Row growth (Track B Task 3): re-extraction no longer DELETEs a source key's prior topics --
+it marks them `superseded_at` and leaves them in the table (see repositories.topics.
+supersede_topics_for_source). A session typically gets 2-4 passes (live, one or more
+mid-session live updates, final -- occasionally a group merge on top), so its topics rows
+now persist at roughly 3x the row count a single-pass session used to leave behind. At
+today's volume (hundreds of topics per site-month) that is nothing; migration 0071's
+`idx_topics_live_source` partial index (`WHERE superseded_at IS NULL`) keeps every live read
+this task touched at its pre-Task-3 cost regardless of how many superseded passes pile up
+underneath.
+
 Environment Variables:
     S3_BUCKET     - S3 bucket name (the data lake -- IngestBucketName)
     CONFIG_KEY    - S3 key for user/site mapping (default: config/user_mapping.json,
@@ -253,20 +263,21 @@ def _group_supersedes_solo(conn, session_base, extraction):
     return "suppress"
 
 
-def _delete_member_topics(conn, artifact, delete=None):
-    """Remove each member's solo topics so the merged set is the only record.
+def _supersede_member_topics(conn, artifact, run, supersede=None):
+    """Retire each member's solo topics (Track B Task 3: supersede, not delete) so the
+    merged set is the only LIVE record.
 
-    A zero rowcount is logged loudly. The delete is keyed on source_s3_key and
-    delete_topics_for_source returns a count rather than raising, so a key that
-    differs by one character (a date derived in UTC instead of NZ, say) removes
-    nothing and leaves exactly the duplicate this whole feature exists to
-    eliminate -- with no error anywhere to notice."""
-    delete = delete or topics.delete_topics_for_source
+    A zero-row supersede is logged loudly. The call is keyed on source_s3_key and
+    supersede_topics_for_source returns the rows it retired rather than raising, so a key
+    that differs by one character (a date derived in UTC instead of NZ, say) retires nothing
+    and leaves exactly the duplicate this whole feature exists to eliminate -- with no error
+    anywhere to notice."""
+    supersede = supersede or topics.supersede_topics_for_source
     for key in artifact.get("mergedMembers") or []:
-        n = delete(conn, key)
-        if not n:
+        retired = supersede(conn, key, run)
+        if not retired:
             logger.warning(
-                "group %s: %s removed 0 topics -- that member's solo items will "
+                "group %s: %s superseded 0 topics -- that member's solo items will "
                 "now duplicate the merged record", artifact.get("groupId"), key)
 
 
@@ -853,6 +864,18 @@ def write_extraction_items(date, user_folder, extraction_key):
     raw = s3().get_object(Bucket=S3_BUCKET, Key=extraction_key)["Body"].read()
     extraction = json.loads(raw.decode("utf-8"))
 
+    # Track B Task 3: identifies THIS pass to repositories.topics.supersede_topics_for_source
+    # (stamped onto the retired row's superseded_by_run) -- tier + extracted_at is unique per
+    # pass of a given extraction key (live/final tiers of the same key share out_key but never
+    # extracted_at; a group pass carries its own).
+    run = f"{extraction.get('tier')}:{extraction.get('extracted_at')}"
+
+    # Rows this invocation retires, across every supersede call below -- both the authority-
+    # flip branch (report_source_key) and this key's own idempotent clear write into it. Not
+    # consumed here; Task 4 reads it to carry stable ids and human edits from a retired row to
+    # the row that replaced it.
+    retired_topics = []
+
     with get_connection() as conn:
         # I-3: serialize concurrent writers on this extraction key. Delete-
         # then-insert is not concurrency-safe on its own (two overlapping
@@ -889,9 +912,10 @@ def write_extraction_items(date, user_folder, extraction_key):
             # become session-scoped again. So the extraction wins. Only this
             # (date, user)'s report rows go; its chunks survive (topic_id is ON
             # DELETE SET NULL) and the next ingest of that report re-links them.
-            removed = topics.delete_topics_for_source(conn, report_source_key)
-            logger.info("%s: authority flip -- replaced %s report topic(s) from %s",
-                        extraction_key, removed, report_source_key)
+            retired_report = topics.supersede_topics_for_source(conn, report_source_key, run)
+            retired_topics.extend(retired_report)
+            logger.info("%s: authority flip -- superseded %s report topic(s) from %s",
+                        extraction_key, len(retired_report), report_source_key)
 
         company = lambda_ingest.resolve_company(conn, user_folder)
         if company is None:
@@ -979,22 +1003,29 @@ def write_extraction_items(date, user_folder, extraction_key):
             logger.info("%s: source is deleted — writing no topics", extraction_key)
             return {"skipped": "source_deleted", "key": extraction_key}
 
-        # Source-key idempotency (Phase 4a pattern): clear this extraction's
-        # prior rows before re-inserting.
+        # Source-key idempotency (Phase 4a pattern): supersede this extraction's prior rows
+        # (Track B Task 3) before re-inserting -- an UPDATE that stamps superseded_at /
+        # superseded_by_run, not a DELETE, so the row and its children (action_items,
+        # findings, ...) survive in the table. Task 2's read predicates already hide a
+        # superseded row from every display path, so a reader sees exactly what it saw when
+        # this was delete-then-insert; what changed is that nothing underneath is gone.
         #
-        # This CASCADEs `action_items`, and the check-off is `action_items.status` -- a
-        # column on the cascaded row. The live and final tiers write to the SAME key
-        # (`extract_session.out_key` is computed once; the tier rides inside the artifact),
-        # so every final pass destroys whatever a person ticked while the meeting was still
-        # running. Nothing carries it across, and re-matching by text is the wrong fix: the
+        # The check-off IS `action_items.status` -- a column on the now-superseded row. The
+        # live and final tiers write to the SAME key (`extract_session.out_key` is computed
+        # once; the tier rides inside the artifact), so every final pass retires whatever a
+        # person ticked while the meeting was still running. It is not lost -- it sits on the
+        # hidden row until Task 4 carries it forward to its replacement by stable_id -- but
+        # nothing carries it forward YET, so until Task 4 lands it is exactly as unreachable to
+        # a reader as a deleted row was. Re-matching by text is the wrong fix regardless: the
         # model rewords, merges and splits, and a confident wrong match puts a supervisor's
-        # tick on a DIFFERENT action item where nobody would ever see it.
+        # tick on a DIFFERENT action item where nobody would ever see it -- matching by
+        # stable_id (Task 4) is the only safe rule.
         #
-        # So this does not try to save it. It makes the loss VISIBLE, which is the part that
-        # was missing: a silent permanent loss and "nothing was ticked" produced identical
-        # output, and nobody can look for a problem that leaves no trace.
+        # _warn_if_discarding_checkoffs stays for this release: it is now a count of what
+        # Task 4 must carry forward, not a loss, but the number an operator needs to see is
+        # the same one.
         _warn_if_discarding_checkoffs(conn, extraction_key)
-        topics.delete_topics_for_source(conn, extraction_key)
+        retired_topics.extend(topics.supersede_topics_for_source(conn, extraction_key, run))
 
         # A MERGED artifact additionally supersedes each member's own topics.
         # BEFORE the writes below, never after: this key's own rows were just
@@ -1007,7 +1038,7 @@ def write_extraction_items(date, user_folder, extraction_key):
         # know to look -- merge_result stays NULL (it is gated on topics_n
         # below), so the group reads as still-in-flight rather than as damage.
         if extraction.get("tier") == "group" and extraction.get("topics"):
-            _delete_member_topics(conn, extraction)
+            _supersede_member_topics(conn, extraction, run)
 
         # Task 3 (authority-flip plan) -- list the pictures prefix ONCE per
         # invocation (paginator, outside the per-topic loop below).
@@ -1282,12 +1313,15 @@ def write_extraction_items(date, user_folder, extraction_key):
 # Entry point — S3 event
 # ----------------------------------------------------------
 def _warn_if_discarding_checkoffs(conn, extraction_key):
-    """Log when this supersession is about to CASCADE away a ticked action item.
+    """Log when this supersession is about to retire a ticked action item.
 
-    Counted, not prevented. Preventing it needs a rule for carrying human decisions across
-    a re-extraction, and the only safe rule is to ask a person -- which is a feature, not a
-    line in a writer. What this buys is a number that can be alarmed on and a log line that
-    names the key, so the next person to ask "did we lose ticks?" has an answer.
+    Counted, not carried -- carrying a human decision across a re-extraction needs a rule for
+    matching an old row to its replacement, and the only safe one is by stable_id (Task 4).
+    Until that lands, a superseded row's check-off is exactly as unreachable to a reader as a
+    deleted one was, even though the row itself now survives in the table (Track B Task 3:
+    supersede, not delete). What this buys is a number that can be alarmed on and a log line
+    that names the key, so the next person to ask "did we lose ticks?" has an answer -- and,
+    once Task 4 lands, a count of exactly what it has to carry.
 
     Never raises. A count that fails must not stop an extraction from landing.
     """
@@ -1299,8 +1333,8 @@ def _warn_if_discarding_checkoffs(conn, extraction_key):
         n = (row or [0])[0] or 0
         if n:
             logger.warning(
-                "supersession discards %d closed action item(s) for %s -- the live tier's "
-                "check-offs are CASCADEd by the final tier writing the same key",
+                "%d closed action item(s) on rows being superseded for %s -- Task 4 must "
+                "carry them forward to the replacement rows",
                 n, extraction_key)
     except Exception:
         logger.exception("could not count closed action items for %s", extraction_key)

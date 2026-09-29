@@ -645,17 +645,31 @@ def ingest_report(date, user_folder, report_key):
 
         user_id = resolve_user(conn, company["id"], user_folder)
 
-        # Source-key idempotency: clear everything THIS report produced
-        # before re-inserting. Keyed on source_s3_key, not (site, date,
-        # user_id) — a NULL-user scope key let two same-site/same-date
-        # reports (MPI1 + MPI2, both unresolved users) delete each other,
-        # and identity fixes + rerun would duplicate (Fable review C1/I1).
+        # Track B Task 3: identifies THIS ingest pass to repositories.topics.
+        # supersede_topics_for_source[_prefix] (stamped onto the retired row's
+        # superseded_by_run). The report JSON carries its own generation timestamp
+        # (lambda_report_generator writes it to `_report_metadata.generated_at`) --
+        # that is preferred over utcnow() here because it identifies the REPORT
+        # (the artifact whose ingest is retiring these rows), which is stable across
+        # a re-ingest of the same S3 object, where an ingest-time now() would not
+        # be. Falls back to the report key itself for an older report with no
+        # metadata block.
+        run = "report:" + str(
+            (report.get("_report_metadata") or {}).get("generated_at") or report_key)
+
+        # Source-key idempotency: supersede everything THIS report produced
+        # before re-inserting (Track B Task 3 -- see lambda_item_writer's own
+        # idempotent clear for the non-destructive rationale). Keyed on
+        # source_s3_key, not (site, date, user_id) — a NULL-user scope key let
+        # two same-site/same-date reports (MPI1 + MPI2, both unresolved users)
+        # collide, and identity fixes + rerun would duplicate (Fable review C1/I1).
         extraction_prefix = f"extractions/{user_folder}/{date}/"
         defer_to_extraction = AUTHORITY_FLIP and _should_defer(
             conn, user_id, user_folder, date)
 
         chunks.delete_chunks_for_source(conn, report_key)
-        topics.delete_topics_for_source(conn, report_key)  # always: clears stale pre-flip report rows
+        # always: supersedes stale pre-flip report rows
+        topics.supersede_topics_for_source(conn, report_key, run)
         if defer_to_extraction:
             # Authority flip (spec §6): the day's extraction topics ARE the
             # item store; the report is a document artifact only. No
@@ -668,7 +682,7 @@ def ingest_report(date, user_folder, report_key):
         else:
             # Nightly report supersedes that day's session-sourced (live
             # extraction) items — Phase 4b.
-            topics.delete_topics_for_source_prefix(conn, extraction_prefix)
+            topics.supersede_topics_for_source_prefix(conn, extraction_prefix, run)
 
         topic_seq_to_id = {}
         if defer_to_extraction:

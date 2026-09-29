@@ -44,8 +44,8 @@ REPORT_KEY = "reports/2026-07-06/Jarley_Trainor/daily_report.json"
 def _record(wired_mp, conn):
     wired_mp.setattr(iw, "get_connection", lambda *a, **k: conn)
     calls = []
-    wired_mp.setattr(iw.topics, "delete_topics_for_source",
-                     lambda c, key: calls.append(("delete", key)) or 0)
+    wired_mp.setattr(iw.topics, "supersede_topics_for_source",
+                     lambda c, key, run: calls.append(("supersede", key)) or [])
     wired_mp.setattr(iw.topics, "upsert_topic",
                      lambda *a, **k: calls.append(("upsert",)) or {"id": "t-new"})
     return calls
@@ -59,7 +59,7 @@ def test_under_the_flip_a_late_extraction_replaces_the_report_topics(wired):
     result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
 
     assert not (isinstance(result, dict) and result.get("skipped")), result
-    assert ("delete", REPORT_KEY) in calls, calls
+    assert ("supersede", REPORT_KEY) in calls, calls
     assert ("upsert",) in calls, "the extraction must actually be written"
 
 
@@ -71,7 +71,7 @@ def test_the_report_topics_go_before_the_extraction_is_written(wired):
 
     iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
 
-    assert calls.index(("delete", REPORT_KEY)) < calls.index(("upsert",)), calls
+    assert calls.index(("supersede", REPORT_KEY)) < calls.index(("upsert",)), calls
 
 
 def test_only_that_days_report_for_that_person_is_removed(wired):
@@ -82,7 +82,7 @@ def test_only_that_days_report_for_that_person_is_removed(wired):
 
     iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
 
-    removed = [k for op, *rest in calls if op == "delete" for k in rest]
+    removed = [k for op, *rest in calls if op == "supersede" for k in rest]
     assert set(removed) <= {REPORT_KEY, EXTRACTION_KEY}, removed
 
 
@@ -104,7 +104,7 @@ def test_a_day_with_no_report_topics_is_untouched_by_the_change(wired):
 
     iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
 
-    assert ("delete", REPORT_KEY) not in calls
+    assert ("supersede", REPORT_KEY) not in calls
 
 
 def _resource_body(name):

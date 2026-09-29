@@ -140,7 +140,7 @@ def wired(monkeypatch):
     # Same default as site_for_media: no app tag unless a test supplies one, so
     # the pre-existing membership-fallback expectations stay meaningful.
     monkeypatch.setattr(iw.recordings, "site_for_day", lambda *a, **k: None)
-    monkeypatch.setattr(iw.topics, "delete_topics_for_source", lambda *a, **k: 0)
+    monkeypatch.setattr(iw.topics, "supersede_topics_for_source", lambda *a, **k: [])
     monkeypatch.setattr(iw.topics, "upsert_topic", lambda *a, **k: {"id": "topic-uuid-0"})
     monkeypatch.setattr(iw.findings, "insert_findings", lambda *a, **k: [])
     # match_request.emit does a real s3.put_object -- FakeS3 above only
@@ -199,8 +199,8 @@ def test_site_bridge_fallback_and_skip(wired):
             resolve_calls.append((report, user_folder)) or None,
     )
     write_calls = []
-    wired.setattr(iw.topics, "delete_topics_for_source",
-                  lambda *a, **k: write_calls.append("delete_topics"))
+    wired.setattr(iw.topics, "supersede_topics_for_source",
+                  lambda *a, **k: write_calls.append("supersede_topics") or [])
     wired.setattr(iw.topics, "upsert_topic",
                   lambda *a, **k: write_calls.append("upsert_topic") or {"id": "x"})
 
@@ -217,19 +217,20 @@ def test_site_bridge_fallback_and_skip(wired):
 # Idempotency — source-key delete before insert
 # ---------------------------------------------------------------------------
 
-def test_idempotent_delete_before_insert(wired):
+def test_idempotent_supersede_before_insert(wired):
     order = []
-    wired.setattr(iw.topics, "delete_topics_for_source",
-                  lambda *a, **k: order.append("delete_topics"))
+    wired.setattr(iw.topics, "supersede_topics_for_source",
+                  lambda *a, **k: order.append("supersede_topics") or [])
     wired.setattr(iw.topics, "upsert_topic",
                   lambda *a, **k: order.append("upsert_topic") or {"id": "topic-uuid-0"})
 
     iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
 
-    assert order == ["delete_topics", "upsert_topic"]
+    assert order == ["supersede_topics", "upsert_topic"]
 
     # and it must be keyed on THIS extraction's key
-    wired.setattr(iw.topics, "delete_topics_for_source", lambda conn, key: order.append(key))
+    wired.setattr(iw.topics, "supersede_topics_for_source",
+                  lambda conn, key, run: order.append(key) or [])
     order.clear()
     iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
     assert order[0] == EXTRACTION_KEY
@@ -417,25 +418,25 @@ def test_user_bridge_miss_does_not_skip(wired):
 
 # ---------------------------------------------------------------------------
 # I-3 regression test: the advisory lock is acquired (on this extraction's
-# key) before delete_topics_for_source/upsert_topic -- serializes concurrent
-# writers on the same key, since delete-then-insert isn't concurrency-safe
+# key) before supersede_topics_for_source/upsert_topic -- serializes concurrent
+# writers on the same key, since supersede-then-insert isn't concurrency-safe
 # and upsert_topic is INSERT-only.
 # ---------------------------------------------------------------------------
 
-def test_advisory_lock_acquired_before_delete_and_insert(wired):
+def test_advisory_lock_acquired_before_supersede_and_insert(wired):
     conn = FakeConn()
     wired.setattr(iw, "get_connection", lambda *a, **k: conn)
 
     order = []
-    wired.setattr(iw.topics, "delete_topics_for_source",
-                  lambda *a, **k: order.append("delete_topics"))
+    wired.setattr(iw.topics, "supersede_topics_for_source",
+                  lambda *a, **k: order.append("supersede_topics") or [])
     wired.setattr(iw.topics, "upsert_topic",
                   lambda *a, **k: order.append("upsert_topic") or {"id": "topic-uuid-0"})
 
     iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
 
     assert conn.executed[0] == ("SELECT pg_advisory_xact_lock(hashtext(%s))", (EXTRACTION_KEY,))
-    assert order == ["delete_topics", "upsert_topic"]
+    assert order == ["supersede_topics", "upsert_topic"]
 
 
 # ---------------------------------------------------------------------------
@@ -449,8 +450,8 @@ def test_report_already_ingested_supersedes_late_extraction(wired):
     wired.setattr(iw, "get_connection", lambda *a, **k: conn)
 
     write_calls = []
-    wired.setattr(iw.topics, "delete_topics_for_source",
-                  lambda *a, **k: write_calls.append("delete_topics"))
+    wired.setattr(iw.topics, "supersede_topics_for_source",
+                  lambda *a, **k: write_calls.append("supersede_topics") or [])
     wired.setattr(iw.topics, "upsert_topic",
                   lambda *a, **k: write_calls.append("upsert_topic") or {"id": "x"})
 

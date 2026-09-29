@@ -276,12 +276,52 @@ def delete_topics_for_source(conn, source_s3_key) -> int:
     modes a (site, date, user_id) scope key had — Fable review C1/I1).
     Children (action_items, safety_observations, topic_photos) are removed
     automatically via ON DELETE CASCADE FKs to topics
-    (see 0003_dashboard_readmodel.sql) — no separate child deletes needed."""
+    (see 0003_dashboard_readmodel.sql) — no separate child deletes needed.
+
+    Track B Task 3: the re-extraction paths (lambda_item_writer,
+    lambda_ingest) no longer call this — they call supersede_topics_for_source
+    below, which marks a row instead of removing it, so a re-extraction no
+    longer destroys the check-offs and findings a person made against the
+    pass it replaces. This function stays for a caller that means an actual,
+    irreversible delete."""
     cur = conn.execute(
         "DELETE FROM topics WHERE source_s3_key=%s",
         (source_s3_key,),
     )
     return cur.rowcount
+
+
+def supersede_topics_for_source(conn, source_s3_key, run) -> list[dict]:
+    """Retire this source key's LIVE topics instead of deleting them (Track B Task 3).
+
+    The non-destructive sibling of delete_topics_for_source, and the one the re-extraction
+    paths use: an UPDATE that stamps `superseded_at=now()`, `superseded_by_run=run` rather
+    than a DELETE, so the row and its children (action_items, findings, topic_photos, ...)
+    survive in the table instead of being lost to the topics -> action_items CASCADE. Task
+    2's read predicates (deleted_predicates.LIVE_TOPIC_PREDICATE) already hide a superseded
+    row from every display path, so a reader sees the same thing it saw when this was a
+    DELETE; what changed is that nothing is gone underneath.
+
+    `run` is the caller's own identifier for the pass doing the retiring (lambda_item_writer
+    uses f"{tier}:{extracted_at}"; lambda_ingest uses a "report:..." form) — stamped onto
+    `superseded_by_run` so a later reader can tell which pass replaced a given row. It is
+    opaque here: this function does not parse or validate it.
+
+    `WHERE superseded_at IS NULL` makes a second call with the same key a no-op (matches
+    delete_topics_for_source's rowcount going to zero on a second DELETE) — a row already
+    retired by an earlier call, here or via supersede_topics_for_source_prefix, is left alone
+    rather than having its superseded_by_run overwritten.
+
+    Returns the RETURNING rows (id, title, summary) of every row this call retired. Task 4
+    reads them to carry stable ids and human edits from a retired row to its replacement.
+    Row order is whatever Postgres returns for an UPDATE ... RETURNING (unspecified) — a
+    caller that needs a stable order must sort."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "UPDATE topics SET superseded_at=now(), superseded_by_run=%s "
+        "WHERE source_s3_key=%s AND superseded_at IS NULL "
+        "RETURNING id, title, summary",
+        (run, source_s3_key),
+    ).fetchall()
 
 
 def list_day_topics_for_binding(conn, user_folder, report_date) -> list[dict]:
@@ -391,13 +431,32 @@ def delete_topics_for_source_prefix(conn, source_prefix) -> int:
     (e.g. 'extractions/JarleyXTrainor/...'). ESCAPE '\\' designates '\\' as
     the escape character, so '\\_'/'\\%' in the pattern are literal; only
     the trailing '%' appended here (unescaped) is a real wildcard.
-    """
+
+    Track B Task 3: lambda_ingest's nightly-report supersession now calls
+    supersede_topics_for_source_prefix below instead — kept for a caller that
+    means an actual, irreversible delete (see delete_topics_for_source)."""
     escaped = _escape_like(source_prefix)
     cur = conn.execute(
         "DELETE FROM topics WHERE source_s3_key LIKE %s ESCAPE '\\'",
         (escaped + '%',),
     )
     return cur.rowcount
+
+
+def supersede_topics_for_source_prefix(conn, source_prefix, run) -> list[dict]:
+    """Prefix form of supersede_topics_for_source (Track B Task 3) — the non-destructive
+    sibling of delete_topics_for_source_prefix, for lambda_ingest's nightly-report
+    supersession of that day's session-sourced (live extraction) topics. Same LIKE-wildcard
+    escaping as delete_topics_for_source_prefix (S3 user folders contain literal
+    underscores — see _escape_like's docstring) and the same `run` / return contract as
+    supersede_topics_for_source."""
+    escaped = _escape_like(source_prefix)
+    return conn.cursor(row_factory=dict_row).execute(
+        "UPDATE topics SET superseded_at=now(), superseded_by_run=%s "
+        "WHERE source_s3_key LIKE %s ESCAPE '\\' AND superseded_at IS NULL "
+        "RETURNING id, title, summary",
+        (run, escaped + '%'),
+    ).fetchall()
 
 
 def has_topics_for_source(conn, source_s3_key, *, include_superseded=False) -> bool:
