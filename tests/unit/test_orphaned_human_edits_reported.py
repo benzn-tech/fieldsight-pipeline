@@ -93,3 +93,96 @@ def test_carry_forward_one_table_skips_the_new_query_when_nothing_old_was_touche
     n = iw._carry_forward_one_table(None, _EmptyOldRepo, ["old-topic"], ["new-topic"], "site-1")
     assert n == 0
     assert calls == [["old-topic"]], "must ask for the OLD pool once and stop there"
+
+
+# ---------------------------------------------------------------------------------------
+# Fix round 1 -- Ruling R10: carry_forward must DEGRADE, not abort the pass.
+# ---------------------------------------------------------------------------------------
+
+class _FakeTxn:
+    """Mirrors psycopg3's real nested-transaction (SAVEPOINT) context manager only as far as
+    the caller relies on it: enter, and let an exception propagate out of the `with` block
+    rather than swallowing it -- same posture as test_lambda_item_writer.FakeConn's own
+    `_FakeTransaction`. What it does NOT model is Postgres actually rolling back only the
+    savepoint's own statements while leaving the enclosing transaction alive; that guarantee
+    only exists against a real database, proven in
+    tests/integration/test_supersede_two_passes.py."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeConn:
+    def transaction(self):
+        return _FakeTxn()
+
+
+def test_carry_forward_children_degrades_instead_of_raising_on_a_matcher_crash(
+        monkeypatch, caplog, capsys):
+    """Ruling R10: a bug inside carry_forward must not propagate past `_carry_forward_children`
+    -- Postgres aborts the WHOLE enclosing transaction on a raised SQL error, and a bare
+    try/except cannot un-abort it, so the SAVEPOINT (`conn.transaction()`) is what makes
+    "degrade, don't abort" actually true. This pins the CONTROL FLOW at the unit level: the
+    exception is caught at this boundary, never reaches the caller, an ERROR-level
+    `logger.exception` names the key, and the metric reports the human-touched fallback count
+    (not 0) because nothing was actually carried. Whether the pass's own new topics really do
+    survive is proven for real against Postgres in test_supersede_two_passes.py."""
+    def _boom(*a, **k):
+        raise RuntimeError("matcher exploded")
+
+    monkeypatch.setattr(iw, "_carry_forward_one_table", _boom)
+    monkeypatch.setattr(iw, "_count_human_touched_old", lambda *a, **k: 2)
+
+    with caplog.at_level("WARNING"):
+        iw._carry_forward_children(  # must not raise
+            _FakeConn(), ["old-topic"], ["new-topic"], "site-1", KEY)
+
+    error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any("carry_forward failed" in r.getMessage() and KEY in r.getMessage()
+              for r in error_records), error_records
+    warning_records = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any("2" in r.getMessage() and KEY in r.getMessage() for r in warning_records), (
+        "the WARNING must report the FALLBACK count, not silence", warning_records)
+
+    lines = _emf_lines(capsys)
+    assert len(lines) == 1, lines
+    assert lines[0]["OrphanedHumanEdits"] == 2, (
+        "a crash must not read as 0 orphans -- nothing was carried, so every human-touched "
+        "old row IS one")
+
+
+def test_count_human_touched_old_sums_both_tables(monkeypatch):
+    class _Repo:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def list_for_carry_forward(self, conn, topic_ids, site_id):
+            return self._rows
+
+    monkeypatch.setattr(iw, "action_items", _Repo([
+        {"id": "a1", "human_touched": True}, {"id": "a2", "human_touched": False}]))
+    monkeypatch.setattr(iw, "findings", _Repo([{"id": "f1", "human_touched": True}]))
+
+    n = iw._count_human_touched_old(None, ["old-topic"], "site-1", KEY)
+    assert n == 2
+
+
+def test_count_human_touched_old_never_raises(monkeypatch, caplog):
+    """The fallback counter is itself instrumentation, one layer further down -- if IT fails
+    too there is no better number left, and a raise here would defeat the whole point of
+    Ruling R10's SAVEPOINT one function up."""
+    class _BoomRepo:
+        @staticmethod
+        def list_for_carry_forward(conn, topic_ids, site_id):
+            raise RuntimeError("db gone")
+
+    monkeypatch.setattr(iw, "action_items", _BoomRepo)
+    monkeypatch.setattr(iw, "findings", _BoomRepo)
+
+    with caplog.at_level("ERROR"):
+        n = iw._count_human_touched_old(None, ["old-topic"], "site-1", KEY)   # must not raise
+    assert n == 0
+    assert any(r.levelname == "ERROR" for r in caplog.records)

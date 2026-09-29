@@ -87,8 +87,9 @@ def match(old, new, *, fuzzy_floor=0.90, tie_margin=0.05):
         for nid in remaining_new:
             ratio[(oid, nid)] = difflib.SequenceMatcher(None, ok, new_keys[nid]).ratio()
 
-    def _best_and_margin(anchor_ids, other_ids, key):
-        """Best (ratio, other_id) for `key(anchor)` and how far the runner-up trails it.
+    def _best_and_margin(other_ids, key):
+        """Best (ratio, other_id) over `other_ids`, keyed by `key(other_id)` into `ratio`,
+        and how far the runner-up trails it.
 
         A single candidate has no runner-up, which reads as an infinite margin -- exactly
         right, since there is nothing to be a near-tie with."""
@@ -100,13 +101,13 @@ def match(old, new, *, fuzzy_floor=0.90, tie_margin=0.05):
         return best_id, best_ratio, best_ratio - runner
 
     for oid in remaining_old:
-        row_best = _best_and_margin(None, remaining_new, lambda n: (oid, n))
+        row_best = _best_and_margin(remaining_new, lambda n: (oid, n))
         if row_best is None:
             continue
         best_nid, best_ratio, row_margin = row_best
         if best_ratio < fuzzy_floor or row_margin <= tie_margin:
             continue                      # below the floor, or a tie/near-tie on OUR side
-        col_best = _best_and_margin(None, remaining_old, lambda o: (o, best_nid))
+        col_best = _best_and_margin(remaining_old, lambda o: (o, best_nid))
         if col_best is None:
             continue
         best_oid, col_ratio, col_margin = col_best

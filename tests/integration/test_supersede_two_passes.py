@@ -343,7 +343,18 @@ def test_write_extraction_items_two_passes_leave_one_superseded_and_one_live(
 # End-to-end: Track B Task 4 -- a human's tick survives the SAME two real passes above.
 # ---------------------------------------------------------------------------
 
-def _carry_forward_extraction(tier, extracted_at, action_text, finding_text):
+def _carry_forward_extraction(tier, extracted_at, action_text, finding_text,
+                              action_text_2=None, finding_text_2=None):
+    """`action_text_2`/`finding_text_2` are a SECOND action item / finding on the same topic
+    -- the untouched pair fix-round-1 adds below, kept to one topic rather than a second one
+    so the test drives exactly the same single-topic shape as the touched pair above."""
+    action_items = [{"action": action_text}]
+    if action_text_2:
+        action_items.append({"action": action_text_2})
+    findings = [{"observation": finding_text, "domain": "safety", "severity": "minor"}]
+    if finding_text_2:
+        findings.append({"observation": finding_text_2, "domain": "safety",
+                         "severity": "minor"})
     return {
         "schema_version": 1,
         "tier": tier,
@@ -354,9 +365,8 @@ def _carry_forward_extraction(tier, extracted_at, action_text, finding_text):
             "summary": "summary",
             "time_range": "10:00 – 10:05",
             "participants": [],
-            "action_items": [{"action": action_text}],
-            "findings": [{"observation": finding_text, "domain": "safety",
-                         "severity": "minor"}],
+            "action_items": action_items,
+            "findings": findings,
             "safety_flags": [],
         }],
     }
@@ -377,6 +387,13 @@ def test_carry_forward_survives_a_live_then_final_pass(monkeypatch, migrated_db_
     ACTION_FINAL = "Confirm the crane booking for Thursday"          # measured ratio 0.9444
     FINDING_LIVE = "Formwork stripped early on level 3"
     FINDING_FINAL = "Formwork was stripped early on level 3"          # measured ratio 0.9444
+    # The UNTOUCHED pair (fix round 1): nobody sets status/updated_by on these -- only a
+    # column no human sets is mutated below, to prove the untouched branch of carry_identity
+    # moves ONLY stable_id/carried_from and leaves everything else for the fresh extraction.
+    ACTION_LIVE_2 = "Order rebar for level 4"
+    ACTION_FINAL_2 = "Order the rebar for level 4"                    # measured ratio 0.92
+    FINDING_LIVE_2 = "Guardrail missing on north stair"
+    FINDING_FINAL_2 = "Guardrail was missing on north stair"          # measured ratio 0.9412
     try:
         company_name = f"Writer4-Co-{tag}"
         co = companies.create_company(seed, company_name)
@@ -390,7 +407,8 @@ def test_carry_forward_survives_a_live_then_final_pass(monkeypatch, migrated_db_
         extraction_key = f"extractions/{folder}/{date}/{session_base}.json"
         fake_s3 = _FakeS3({
             extraction_key: json.dumps(_carry_forward_extraction(
-                "live", "2026-09-29T10:00:00Z", ACTION_LIVE, FINDING_LIVE)),
+                "live", "2026-09-29T10:00:00Z", ACTION_LIVE, FINDING_LIVE,
+                ACTION_LIVE_2, FINDING_LIVE_2)),
         })
 
         monkeypatch.setattr(lambda_item_writer.lambda_ingest, "COMPANY_NAME", company_name)
@@ -404,12 +422,24 @@ def test_carry_forward_survives_a_live_then_final_pass(monkeypatch, migrated_db_
 
         old_action = seed.execute(
             "SELECT a.id, a.stable_id FROM action_items a JOIN topics t ON t.id=a.topic_id "
-            "WHERE t.source_s3_key=%s", (extraction_key,)).fetchone()
+            "WHERE t.source_s3_key=%s AND a.text=%s", (extraction_key, ACTION_LIVE)).fetchone()
         old_finding = seed.execute(
             "SELECT f.id, f.stable_id FROM findings f JOIN topics t ON t.id=f.topic_id "
-            "WHERE t.source_s3_key=%s", (extraction_key,)).fetchone()
+            "WHERE t.source_s3_key=%s AND f.observation=%s",
+            (extraction_key, FINDING_LIVE)).fetchone()
         old_action_id, old_action_stable_id = old_action
         old_finding_id, old_finding_stable_id = old_finding
+
+        old_action_2 = seed.execute(
+            "SELECT a.id, a.stable_id FROM action_items a JOIN topics t ON t.id=a.topic_id "
+            "WHERE t.source_s3_key=%s AND a.text=%s",
+            (extraction_key, ACTION_LIVE_2)).fetchone()
+        old_finding_2 = seed.execute(
+            "SELECT f.id, f.stable_id FROM findings f JOIN topics t ON t.id=f.topic_id "
+            "WHERE t.source_s3_key=%s AND f.observation=%s",
+            (extraction_key, FINDING_LIVE_2)).fetchone()
+        old_action_2_id, old_action_2_stable_id = old_action_2
+        old_finding_2_id, old_finding_2_stable_id = old_finding_2
 
         # PATCH-equivalent: a person ticks the action item off and sets the finding's status
         # + audience, while the meeting is still "live" -- before the final pass ever runs.
@@ -419,17 +449,28 @@ def test_carry_forward_survives_a_live_then_final_pass(monkeypatch, migrated_db_
         seed.execute("UPDATE findings SET status=%s, audience=%s WHERE id=%s",
                     ("resolved", "owner", old_finding_id))
 
-        # The FINAL pass: same key, reworded text within the fuzzy floor.
+        # The SECOND pair stays UNTOUCHED: no updated_by, status stays 'open' -- so
+        # human_touched is False for both. `priority`/`audience` are mutated directly (a
+        # column no human sets through the app) purely to prove carry_identity's untouched
+        # branch does NOT copy them -- if it did, the new row would read "high"/"owner"
+        # below instead of whatever the fresh extraction wrote.
+        seed.execute("UPDATE action_items SET priority=%s WHERE id=%s",
+                    ("high", old_action_2_id))
+        seed.execute("UPDATE findings SET audience=%s WHERE id=%s",
+                    ("owner", old_finding_2_id))
+
+        # The FINAL pass: same key, reworded text within the fuzzy floor (both pairs).
         fake_s3.objects[extraction_key] = json.dumps(_carry_forward_extraction(
-            "final", "2026-09-29T10:30:00Z", ACTION_FINAL, FINDING_FINAL))
+            "final", "2026-09-29T10:30:00Z", ACTION_FINAL, FINDING_FINAL,
+            ACTION_FINAL_2, FINDING_FINAL_2))
         result_final = lambda_item_writer.write_extraction_items(date, folder, extraction_key)
         assert result_final == {"skipped": False, "topics": 1}, result_final
 
         new_action = seed.execute(
             "SELECT a.id, a.stable_id, a.carried_from, a.status, a.updated_by "
             "FROM action_items a JOIN topics t ON t.id=a.topic_id "
-            "WHERE t.source_s3_key=%s AND t.superseded_at IS NULL",
-            (extraction_key,)).fetchone()
+            "WHERE t.source_s3_key=%s AND t.superseded_at IS NULL AND a.text=%s",
+            (extraction_key, ACTION_FINAL)).fetchone()
         assert new_action is not None
         new_action_id, new_stable_id, new_carried_from, new_status, new_updated_by = new_action
         assert new_action_id != old_action_id, "must be the NEW row, not the old one"
@@ -442,8 +483,8 @@ def test_carry_forward_survives_a_live_then_final_pass(monkeypatch, migrated_db_
         new_finding = seed.execute(
             "SELECT f.id, f.stable_id, f.carried_from, f.status, f.audience "
             "FROM findings f JOIN topics t ON t.id=f.topic_id "
-            "WHERE t.source_s3_key=%s AND t.superseded_at IS NULL",
-            (extraction_key,)).fetchone()
+            "WHERE t.source_s3_key=%s AND t.superseded_at IS NULL AND f.observation=%s",
+            (extraction_key, FINDING_FINAL)).fetchone()
         assert new_finding is not None
         (new_finding_id, new_finding_stable_id, new_finding_carried_from,
          new_finding_status, new_finding_audience) = new_finding
@@ -452,6 +493,47 @@ def test_carry_forward_survives_a_live_then_final_pass(monkeypatch, migrated_db_
         assert new_finding_carried_from == old_finding_id
         assert new_finding_status == "resolved"
         assert new_finding_audience == "owner"
+
+        # Fix round 1 (Important #1): the UNTOUCHED branch of carry_identity -- stable_id and
+        # carried_from move, but nothing else does. Both old rows above were never
+        # human-touched (no updated_by, status stayed 'open'), so the new rows must carry
+        # identity ONLY -- their priority/audience must be whatever the FRESH extraction
+        # wrote (NULL / the 'internal' default), never the "high"/"owner" mutated onto the
+        # old rows.
+        new_action_2 = seed.execute(
+            "SELECT a.id, a.stable_id, a.carried_from, a.status, a.priority "
+            "FROM action_items a JOIN topics t ON t.id=a.topic_id "
+            "WHERE t.source_s3_key=%s AND t.superseded_at IS NULL AND a.text=%s",
+            (extraction_key, ACTION_FINAL_2)).fetchone()
+        assert new_action_2 is not None
+        (new_action_2_id, new_action_2_stable_id, new_action_2_carried_from,
+         new_action_2_status, new_action_2_priority) = new_action_2
+        assert new_action_2_id != old_action_2_id, "must be the NEW row, not the old one"
+        assert new_action_2_stable_id == old_action_2_stable_id, (
+            "identity must still carry forward for an UNTOUCHED old row")
+        assert new_action_2_carried_from == old_action_2_id
+        assert new_action_2_status == "open", (
+            "untouched -- status must be whatever the fresh extraction wrote, not copied")
+        assert new_action_2_priority is None, (
+            "untouched -- priority must NOT be copied from the old row ('high' would mean "
+            "the untouched branch copied it anyway)")
+
+        new_finding_2 = seed.execute(
+            "SELECT f.id, f.stable_id, f.carried_from, f.status, f.audience "
+            "FROM findings f JOIN topics t ON t.id=f.topic_id "
+            "WHERE t.source_s3_key=%s AND t.superseded_at IS NULL AND f.observation=%s",
+            (extraction_key, FINDING_FINAL_2)).fetchone()
+        assert new_finding_2 is not None
+        (new_finding_2_id, new_finding_2_stable_id, new_finding_2_carried_from,
+         new_finding_2_status, new_finding_2_audience) = new_finding_2
+        assert new_finding_2_id != old_finding_2_id
+        assert new_finding_2_stable_id == old_finding_2_stable_id, (
+            "identity must still carry forward for an UNTOUCHED old row")
+        assert new_finding_2_carried_from == old_finding_2_id
+        assert new_finding_2_status == "open"
+        assert new_finding_2_audience == "internal", (
+            "untouched -- audience must NOT be copied from the old row ('owner' would mean "
+            "the untouched branch copied it anyway)")
     finally:
         co_id = co["id"] if co is not None else None
         site_id = site["id"] if site is not None else None

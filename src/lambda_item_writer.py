@@ -1214,6 +1214,13 @@ def write_extraction_items(date, user_folder, extraction_key):
         # branch all ran above, before this loop). A pass that retired nothing has no "old"
         # pool and nothing to report -- the common case, and the whole reason retired_topics
         # is checked here rather than always calling into an empty match.
+        #
+        # _carry_forward_children runs its own work inside a SAVEPOINT, not a bare
+        # try/except (Ruling R10): a bug there must DEGRADE (the topics/findings/action-items
+        # already inserted above still commit) rather than ABORT the whole pass -- and only a
+        # real SAVEPOINT undoes that, since Postgres aborts the enclosing transaction on any
+        # SQL error and a Python try/except cannot un-abort it. See that function's own
+        # docstring for the full reasoning (same shape as _suggest_threads above it).
         if retired_topics:
             _carry_forward_children(
                 conn, [t["id"] for t in retired_topics], new_topic_ids, site["id"],
@@ -1371,14 +1378,57 @@ def _carry_forward_children(conn, old_topic_ids, new_topic_ids, site_id, extract
     topics and this pass's own new topics, never another extraction key's superseded rows
     and never another site's.
 
+    A SAVEPOINT (`conn.transaction()` nested inside the caller's already-open transaction),
+    not a bare try/except -- same reason `_suggest_threads` above uses one (Ruling R10):
+    Postgres aborts the WHOLE enclosing transaction on any SQL error, and catching that in
+    Python does not un-abort it. A bare try/except here would let the exception stop
+    propagating while every later statement in this pass -- the photo rebind below, the
+    final-email lookup, the commit itself -- started failing too, so a carry_forward bug
+    would silently take the whole extraction down with it. The SAVEPOINT makes "degrade, do
+    not abort" (R10) actually true: on failure it rolls back only what carry_forward itself
+    did, leaving the topics/action_items/findings already inserted above intact and
+    committable, exactly like a matcher bug leaves the topics `_suggest_threads` was fed
+    intact today.
+
     Always reports, including zero (Ruling R5) -- an operator reading "0 for that key" is
     the point of an EMF line with a `key` property, not a lucky silence indistinguishable
-    from a producer that never ran."""
-    orphaned = (_carry_forward_one_table(conn, action_items, old_topic_ids,
-                                         new_topic_ids, site_id)
-               + _carry_forward_one_table(conn, findings, old_topic_ids,
-                                          new_topic_ids, site_id))
+    from a producer that never ran. On failure the metric is NOT zero: nothing was carried,
+    so every human-touched old row is -- by definition -- an orphan this pass, and the count
+    is recomputed by a fallback read after the SAVEPOINT has rolled back (R10: "the metric
+    must not read 0 when carry-forward crashed")."""
+    try:
+        with conn.transaction():
+            orphaned = (_carry_forward_one_table(conn, action_items, old_topic_ids,
+                                                 new_topic_ids, site_id)
+                       + _carry_forward_one_table(conn, findings, old_topic_ids,
+                                                  new_topic_ids, site_id))
+    except Exception:
+        logger.exception(
+            "carry_forward failed for %s -- topics were written, no identity was carried "
+            "forward this pass", extraction_key)
+        orphaned = _count_human_touched_old(conn, old_topic_ids, site_id, extraction_key)
     _report_orphaned_human_edits(extraction_key, orphaned)
+
+
+def _count_human_touched_old(conn, old_topic_ids, site_id, extraction_key):
+    """Fallback for `_carry_forward_children`'s except branch: every human-touched OLD row
+    across both child tables, unconditionally -- carry_forward crashed, so none of them found
+    a successor this pass, regardless of which table or which pair was mid-flight when it
+    failed. Runs AFTER the failed SAVEPOINT has already rolled back, as a plain read that was
+    not itself part of what failed.
+
+    Never raises further: if even this cannot run, there is no better number left to report,
+    so it logs and answers 0 -- which undercounts, but a metric that also throws would take
+    the whole pass down for real, the one outcome R10 exists to prevent."""
+    try:
+        return sum(1 for repo in (action_items, findings)
+                   for row in repo.list_for_carry_forward(conn, old_topic_ids, site_id)
+                   if row["human_touched"])
+    except Exception:
+        logger.exception(
+            "could not count human-touched rows for %s after carry_forward failed -- "
+            "OrphanedHumanEdits will under-report for this pass", extraction_key)
+        return 0
 
 
 def _report_orphaned_human_edits(extraction_key, count):
