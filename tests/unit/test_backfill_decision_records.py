@@ -160,7 +160,7 @@ def test_dry_run_never_commits(monkeypatch):
         sql = c[c.index("--sql") + 1]
         assert "INSERT INTO decision_records" not in sql
     assert report["programme_match"] == {
-        "eligible": 5, "skipped_topic_null": 1, "already_present": 2, "would_insert": 3,
+        "eligible": 5, "skipped": 1, "already_present": 2, "would_insert": 3,
     }
     assert report["thread"]["would_insert"] == 3
     assert report["work_class"]["would_insert"] == 0
@@ -184,7 +184,7 @@ def test_apply_commits(monkeypatch):
     execute_calls = [c for c in calls if "execute-statement" in c]
     assert len(execute_calls) == 6  # 3 stats + 3 inserts
     assert report["programme_match"] == {
-        "eligible": 5, "skipped_topic_null": 1, "already_present": 2, "inserted": 3,
+        "eligible": 5, "skipped": 1, "already_present": 2, "inserted": 3,
     }
     assert report["thread"]["inserted"] == 3
     assert report["work_class"]["inserted"] == 0
@@ -247,7 +247,7 @@ def test_execute_statement_sql_values_match_the_pure_sql_functions(monkeypatch):
 
 def test_parse_stats_handles_empty_records():
     assert bk._parse_stats({"records": []}) == {
-        "eligible": 0, "skipped_topic_null": 0, "already_present": 0,
+        "eligible": 0, "skipped": 0, "already_present": 0,
     }
 
 
@@ -329,4 +329,35 @@ def test_programme_match_skips_null_topic_id():
     sql = bk.sql_insert_programme_match()
     assert "topic_id IS NOT NULL" in sql
     stats_sql = bk.sql_stats_programme_match()
-    assert "skipped_topic_null" in stats_sql
+    assert "AS skipped" in stats_sql
+
+
+def test_programme_match_reconstructs_edited_from_applied_vs_suggested():
+    sql = bk._PPS_CTE
+    assert "THEN 'edited'" in sql
+    assert "pps.applied_status IS DISTINCT FROM pps.suggested_status" in sql
+    assert "pps.applied_progress IS DISTINCT FROM pps.suggested_progress" in sql
+    # 'rejected' rows fall straight through via the ELSE, no edited branch
+    # reachable for them (gated on state='confirmed').
+    assert "WHEN pps.state = 'confirmed' AND" in sql
+
+
+def test_work_class_output_uses_the_live_writers_keys():
+    sql = " ".join(bk._CF_CTE.split())  # collapse whitespace/newlines
+    for key, column in (
+        ("'work_class',", "t.work_class,"),
+        ("'work_confidence',", "t.work_confidence,"),
+        ("'is_mixed',", "t.is_mixed"),
+    ):
+        assert f"{key} {column}" in sql, (key, column)
+    assert "'classifier_verdict', cf.classifier_verdict" in sql
+    assert "'human_verdict', cf.human_verdict" in sql
+
+
+def test_work_class_score_prefers_topic_confidence_over_classifier_confidence():
+    assert "COALESCE(t.work_confidence, cf.classifier_confidence)" in bk._CF_CTE
+
+
+def test_work_class_skips_a_dangling_topic_id():
+    assert "topic_row_id IS NOT NULL" in bk.sql_insert_work_class()
+    assert "topic_row_id IS NULL" in bk.sql_stats_work_class()

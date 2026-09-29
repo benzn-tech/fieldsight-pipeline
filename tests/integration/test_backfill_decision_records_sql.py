@@ -79,21 +79,40 @@ def _dr_row(conn, row_id):
 _HISTORICAL_CREATED_AT = "2026-01-15T00:00:00+00:00"
 
 
+# confirm_suggestion ALWAYS passes applied_status/applied_progress to decide()
+# -- whatever it computed as new_status/new_progress, even when that is
+# identical to what the matcher suggested (lambda_org_api.py's
+# confirm_suggestion). A real, un-tampered-with confirmed row therefore has
+# applied_status/applied_progress equal to suggested_status/suggested_progress
+# by default; reject_suggestion never passes either, so they stay NULL for a
+# rejected row. _UNSET lets a caller distinguish "didn't ask" (defaults to
+# this no-edit shape) from "explicitly want NULL" (a real case: a suggestion
+# whose suggested_status was itself None).
+_UNSET = object()
+
+
 def _insert_pps(conn, *, site_id, topic_id, task_id, state, confidence=0.83,
                 suggested_status="completed", suggested_progress=100,
+                applied_status=_UNSET, applied_progress=_UNSET,
                 decided_by=None, dedupe_key=None, created_at=_HISTORICAL_CREATED_AT):
+    if applied_status is _UNSET:
+        applied_status = suggested_status if state == "confirmed" else None
+    if applied_progress is _UNSET:
+        applied_progress = suggested_progress if state == "confirmed" else None
     row = conn.execute(
         "INSERT INTO programme_progress_suggestions "
         "(site_id, task_id, topic_id, topic_title, report_date, source_s3_key, "
         " task_name, suggested_status, suggested_progress, confidence, state, "
-        " decided_by, decided_at, dedupe_key, created_at) "
+        " decided_by, decided_at, dedupe_key, created_at, applied_status, "
+        " applied_progress) "
         "VALUES (%s,%s,%s,'Slab pour','2026-06-01','k/pm', 'Pour slab', %s, %s, %s, %s, "
         " %s, CASE WHEN %s IN ('confirmed','rejected') THEN %s::timestamptz ELSE NULL END, "
-        " %s, %s::timestamptz) "
+        " %s, %s::timestamptz, %s, %s) "
         "RETURNING id, created_at",
         (site_id, task_id, topic_id, suggested_status, suggested_progress, confidence,
          state, decided_by, state, created_at,
-         dedupe_key or f"dedupe-{uuid.uuid4().hex[:12]}", created_at),
+         dedupe_key or f"dedupe-{uuid.uuid4().hex[:12]}", created_at,
+         applied_status, applied_progress),
     ).fetchone()
     return {"id": row[0], "created_at": row[1]}
 
@@ -127,7 +146,7 @@ def test_programme_match_confirmed_rejected_pending_and_null_topic(db):
     # matches the state filter but is not "eligible" (topic_id IS NOT NULL),
     # so it is counted in skipped_topic_null instead.
     assert stats["eligible"] == 2
-    assert stats["skipped_topic_null"] == 1
+    assert stats["skipped"] == 1
     assert stats["already_present"] == 0
 
     ids = _inserted_ids(db, bk.sql_insert_programme_match())
@@ -226,6 +245,50 @@ def test_programme_match_key_parity_with_live_confirm_suggestion(db, monkeypatch
     # side's (subject_stable_id, object_ref) is exactly its OWN source row's
     # (topic_id, str(task_id)) -- neither hardcodes the other's values.
     assert live_key[:2] == backfill_key[:2]
+
+
+@pytest.mark.parametrize(
+    "state,suggested_status,suggested_progress,applied_status,applied_progress,expected",
+    [
+        # No edit at all -- applied equals suggested on both fields.
+        ("confirmed", "completed", 100, "completed", 100, "confirmed"),
+        # Reviewer changed the status.
+        ("confirmed", "completed", 100, "in_progress", 100, "edited"),
+        # Reviewer changed the progress (or the never-lower-progress guard did).
+        ("confirmed", "completed", 100, "completed", 80, "edited"),
+        # suggested_status itself was None (progress-only suggestion) -- both
+        # sides NULL is "no edit", not a false-positive 'edited'.
+        ("confirmed", None, 100, None, 100, "confirmed"),
+        # Rejected: applied_status/applied_progress are never set by
+        # reject_suggestion (stay NULL) -- must never read as 'edited'.
+        ("rejected", "completed", 100, None, None, "rejected"),
+    ],
+)
+def test_programme_match_human_outcome_reconstructs_edited_like_confirm_suggestion(
+        db, state, suggested_status, suggested_progress, applied_status,
+        applied_progress, expected):
+    """lambda_org_api.confirm_suggestion's _stamp_decision call stamps 'edited'
+    (never 'confirmed') whenever the FINAL applied status/progress differs from
+    what the matcher suggested. The backfill has no reviewer request body to
+    replay, but decide() always persists applied_status/applied_progress
+    alongside state -- unconditional since migration 0008 -- so the exact same
+    comparison is reconstructible from the stored row alone."""
+    tag = uuid.uuid4().hex[:8]
+    co, site = _seed_company_site(db, tag)
+    caller_user = _seed_admin(db, co, tag)
+    topic = topics.upsert_topic(
+        db, site["id"], "2026-06-01", f"T-ho-{tag}",
+        source_s3_key=f"extractions/BF7ho-{tag}/2026-06-01/sid{'2'*32}.json")
+    _insert_pps(
+        db, site_id=site["id"], topic_id=topic["id"], task_id="T-HO",
+        state=state, suggested_status=suggested_status,
+        suggested_progress=suggested_progress, applied_status=applied_status,
+        applied_progress=applied_progress, decided_by=caller_user["id"])
+
+    ids = _inserted_ids(db, bk.sql_insert_programme_match())
+    assert len(ids) == 1
+    row = _dr_row(db, ids[0])
+    assert row["human_outcome"] == expected
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +420,7 @@ def test_work_class_human_verdict_mapping(db, verdict, expected_outcome):
     topic = topics.upsert_topic(
         db, site["id"], "2026-06-15", "Lunch chat",
         source_s3_key=f"extractions/BF7w-{tag}-{verdict}/2026-06-15/sid{'9'*32}.json",
-        work_class="non_work")
+        work_class="non_work", work_confidence=0.91, is_mixed=False)
     db.execute(
         "INSERT INTO classification_feedback "
         "(company_id, topic_id, classifier_verdict, classifier_confidence, "
@@ -366,6 +429,7 @@ def test_work_class_human_verdict_mapping(db, verdict, expected_outcome):
 
     stats = _stats(db, bk.sql_stats_work_class())
     assert stats["eligible"] == 1
+    assert stats["skipped"] == 0
     assert stats["already_present"] == 0
 
     ids = _inserted_ids(db, bk.sql_insert_work_class())
@@ -376,55 +440,114 @@ def test_work_class_human_verdict_mapping(db, verdict, expected_outcome):
     assert row["subject_stable_id"] == topic["id"]
     assert row["object_ref"] is None
     assert row["provider"] == "legacy"
-    assert row["score"] == pytest.approx(0.77)
+    # score prefers the TOPIC's own work_confidence (0.91) over
+    # classifier_confidence (0.77) -- matches the live writer's
+    # score=work_confidence exactly, per Ruling R18.
+    assert row["score"] == pytest.approx(0.91)
     assert row["threshold"] is None
     assert row["auto_outcome"] == "accepted"
     assert row["human_outcome"] == expected_outcome
     assert row["human_actor"] == caller_user["id"]
-    assert row["output"] == {"classifier_verdict": "non_work", "human_verdict": verdict}
+    assert row["output"] == {
+        "work_class": "non_work", "work_confidence": 0.91, "is_mixed": False,
+        "classifier_verdict": "non_work", "human_verdict": verdict,
+    }
+
+
+def test_work_class_score_falls_back_to_classifier_confidence_when_topic_value_null(db):
+    """A topic written before migration 0021 (or otherwise never classified)
+    has NULL work_confidence -- the backfill must still produce a usable
+    score rather than a NULL one, falling back to
+    classification_feedback.classifier_confidence."""
+    tag = uuid.uuid4().hex[:8]
+    co, site = _seed_company_site(db, tag)
+    topic = topics.upsert_topic(
+        db, site["id"], "2026-06-15", "Legacy topic, never classified",
+        source_s3_key=f"extractions/BF7wfb-{tag}/2026-06-15/sid{'8'*32}.json")
+    db.execute(
+        "INSERT INTO classification_feedback "
+        "(company_id, topic_id, classifier_verdict, classifier_confidence, human_verdict) "
+        "VALUES (%s,%s,'non_work',0.55,'confirm_non_work')", (co["id"], topic["id"]))
+
+    ids = _inserted_ids(db, bk.sql_insert_work_class())
+    assert len(ids) == 1
+    row = _dr_row(db, ids[0])
+    assert row["score"] == pytest.approx(0.55)
+    assert row["output"]["work_class"] is None
+    assert row["output"]["work_confidence"] is None
+
+
+def test_work_class_skips_and_counts_a_dangling_topic_id(db):
+    """classification_feedback.topic_id carries NO FK (migration 0023) -- a
+    row naming a topic that no longer exists must be skipped and counted, the
+    same 'parent gone' posture programme_match's NULL-topic_id case has,
+    never inserted with a NULL site_id."""
+    tag = uuid.uuid4().hex[:8]
+    co, site = _seed_company_site(db, tag)
+    dangling_topic_id = uuid.uuid4()
+    db.execute(
+        "INSERT INTO classification_feedback "
+        "(company_id, topic_id, classifier_verdict, classifier_confidence, human_verdict) "
+        "VALUES (%s,%s,'non_work',0.6,'confirm_non_work')", (co["id"], dangling_topic_id))
+
+    stats = _stats(db, bk.sql_stats_work_class())
+    assert stats["eligible"] == 0
+    assert stats["skipped"] == 1
+
+    ids = _inserted_ids(db, bk.sql_insert_work_class())
+    assert ids == []
 
 
 def test_work_class_key_parity_with_live_endpoint(db):
-    """One record via the LIVE endpoint (create_classification_feedback_endpoint),
-    one via the backfill SQL on a different, pre-existing feedback row --
-    same (kind, subject_type, object_ref) shape, same human_verdict->human_outcome
-    mapping, proving the two never diverge."""
+    """One record via the LIVE writer (lambda_item_writer._record_work_class_decision,
+    called directly -- the same function every extraction pass calls), one via
+    the backfill SQL, both for the SAME topic -- proving both compute the
+    identical (kind, subject_type, subject_stable_id, object_ref) key, and
+    that the backfill's output key SET is a SUPERSET of the live writer's own
+    keys with matching values (Ruling R18: the live keys must all be
+    present -- classifier_verdict/human_verdict are additive extras)."""
     tag = uuid.uuid4().hex[:8]
     co, site = _seed_company_site(db, tag)
     caller_user = _seed_admin(db, co, tag)
-
-    live_topic = topics.upsert_topic(
+    topic = topics.upsert_topic(
         db, site["id"], "2026-09-30", "Lunch and site chat",
         source_s3_key=f"extractions/BF7wlive-{tag}/2026-09-30/sid{'a'*32}.json",
-        work_class="non_work")
-    verdict_row = decision_records.insert(
-        db, company_id=co["id"], site_id=site["id"], kind="work_class",
-        subject_type="topic", subject_stable_id=live_topic["id"], object_ref=None,
-        provider="anthropic", model="claude-sonnet-4-6", model_version=None,
-        question_set=None, input_key=None, input_hash=None,
-        output={"work_class": "non_work", "work_confidence": 0.9, "is_mixed": False},
-        score=0.9, threshold=None, auto_outcome="accepted")
-    caller = {"id": caller_user["id"], "company_id": co["id"], "global_role": "admin"}
-    body = {"topic_id": str(live_topic["id"]), "human_verdict": "reject_is_work"}
-    result = lambda_org_api.create_classification_feedback_endpoint(db, caller, body)
-    assert result["statusCode"] == 201
-    live_after = _dr_row(db, verdict_row["id"])
-    assert (live_after["kind"], live_after["subject_type"], live_after["object_ref"],
-           live_after["human_outcome"]) == ("work_class", "topic", None, "rejected")
+        work_class="non_work", work_confidence=0.9, is_mixed=False)
 
-    hist_topic = topics.upsert_topic(
-        db, site["id"], "2026-06-01", "Old lunch chat",
-        source_s3_key=f"extractions/BF7whist-{tag}/2026-06-01/sid{'b'*32}.json",
-        work_class="non_work")
+    lambda_item_writer._record_work_class_decision(
+        db, company_id=co["id"], site_id=site["id"], topic_id=topic["id"],
+        work_class="non_work", work_confidence=0.9, is_mixed=False,
+        llm_provider="anthropic", llm_model="claude-sonnet-4-6")
+    live_row = db.cursor(row_factory=dict_row).execute(
+        "SELECT * FROM decision_records WHERE kind='work_class' AND subject_stable_id=%s "
+        "ORDER BY created_at DESC LIMIT 1", (topic["id"],)).fetchone()
+    live_key = (live_row["kind"], live_row["subject_type"], live_row["subject_stable_id"],
+               live_row["object_ref"])
+    assert live_key == ("work_class", "topic", topic["id"], None)
+
+    # A DIFFERENT event on the same topic -- a human's later feedback,
+    # pre-dating decision_records entirely -- backfilled separately from the
+    # live extraction-time record above (different created_at -> no
+    # idempotency collision, both rows legitimately coexist, exactly as they
+    # would in production: one 'accepted' auto record with no human_outcome
+    # yet, one human-decided record from this backfill).
     db.execute(
         "INSERT INTO classification_feedback "
         "(company_id, topic_id, classifier_verdict, classifier_confidence, "
-        " human_verdict, actor_user_id) VALUES (%s,%s,'work',0.6,'reject_is_work',%s)",
-        (co["id"], hist_topic["id"], caller_user["id"]))
+        " human_verdict, actor_user_id, created_at) "
+        "VALUES (%s,%s,'work',0.6,'reject_is_work',%s,%s::timestamptz)",
+        (co["id"], topic["id"], caller_user["id"], _HISTORICAL_CREATED_AT))
     ids = _inserted_ids(db, bk.sql_insert_work_class())
+    assert len(ids) == 1
     backfilled = _dr_row(db, ids[0])
-    assert (backfilled["kind"], backfilled["subject_type"], backfilled["object_ref"],
-           backfilled["human_outcome"]) == ("work_class", "topic", None, "rejected")
+    backfill_key = (backfilled["kind"], backfilled["subject_type"],
+                    backfilled["subject_stable_id"], backfilled["object_ref"])
+    assert backfill_key == live_key
+    assert backfilled["human_outcome"] == "rejected"
+
+    assert set(live_row["output"].keys()) <= set(backfilled["output"].keys())
+    for key in live_row["output"]:
+        assert backfilled["output"][key] == live_row["output"][key], key
 
 
 # ---------------------------------------------------------------------------

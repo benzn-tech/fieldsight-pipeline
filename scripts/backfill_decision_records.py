@@ -18,7 +18,18 @@ row backfilled here and a row written live are the SAME shape to `list_for_eval`
     subject_stable_id=topic_id (lambda_org_api.confirm_suggestion/reject_suggestion),
     object_ref=task_id (task-6b-report.md's note #3: topics are not re-keyed, no
     resolution step). Rows with topic_id IS NULL (ON DELETE SET NULL) are skipped
-    and counted -- there is no subject to key the record on.
+    and counted -- there is no subject to key the record on. human_outcome is NOT
+    simply `state`: confirm_suggestion's own _stamp_decision call stamps 'edited'
+    (never 'confirmed') whenever the FINAL applied status/progress differs from
+    what the matcher suggested -- and decide() always writes applied_status/
+    applied_progress alongside state (repositories/programme_suggestions.py's
+    decide(), unconditional since migration 0008, not a Track-B addition), so the
+    exact same comparison confirm_suggestion made is reconstructible straight from
+    the stored row: state='rejected' -> 'rejected'; state='confirmed' AND
+    (applied_status IS DISTINCT FROM suggested_status OR applied_progress IS
+    DISTINCT FROM suggested_progress) -> 'edited' (IS DISTINCT FROM gives the same
+    None-vs-None/None-vs-value semantics 6b's Python `!=` comparison has); else
+    'confirmed'.
   - topic_thread_suggestions -> kind='thread', subject_type='topic',
     subject_stable_id=topic_id, object_ref=parent_topic_id when set, else the
     object_ref decision_records.object_ref_for_accepted would resolve for this
@@ -36,6 +47,13 @@ row backfilled here and a row written live are the SAME shape to `list_for_eval`
     side'"). human_verdict -> human_outcome: confirm_non_work -> confirmed;
     reject_is_work / missed_personal -> rejected (both are the human overturning
     the classifier, in opposite directions -- same mapping 6b's endpoint uses).
+    `classification_feedback.topic_id` carries NO FK (migration 0023) -- a row
+    naming a topic that no longer exists is skipped and counted, the same "parent
+    gone" posture programme_match's NULL-topic_id case already has, never
+    inserted with site_id NULL. `company_id` comes from `cf.company_id` directly,
+    never through the topic join -- the endpoint itself writes it there from
+    `_topic_authority`'s resolved row at feedback-insert time, so it is
+    trustworthy independent of whether the topic later disappears.
 
 `provider='legacy'` on every backfilled row, not the live writers' own
 'anthropic'/'qwen'/'lexical': none of these three tables recorded which provider
@@ -68,10 +86,21 @@ proven by `tests/integration/test_backfill_decision_records_sql.py`'s
 Postgres's own `jsonb_build_object()` from the source row's typed columns --
 never a Python-side string concatenation, and never a free-text column (plan
 Global Constraint: decision_records never carries transcript text; none of these
-three tables' human-decision columns ARE free text anyway -- `topic_category` is
-deliberately left out of the work_class output for the same reason
-`classification_feedback`'s own migration comment gives: "NEVER the transcript or
-any personal text").
+three tables' human-decision columns ARE free text anyway). work_class's output
+carries the SAME keys `lambda_item_writer._record_work_class_decision` (the live
+writer) does -- work_class/work_confidence/is_mixed -- read off the TOPIC row
+(`topics.work_class`/`work_confidence`/`is_mixed`, migration 0021), not
+`classification_feedback` (which never stored them), plus classifier_verdict/
+human_verdict as additive extras the live writer's shape does not carry. `score`
+follows the same rule: `topics.work_confidence`, falling back to
+`classification_feedback.classifier_confidence` only when the topic's own value
+is NULL -- matching the live writer's `score=work_confidence` exactly whenever a
+value is available. `topic_category` is left out -- not because it is unsafe:
+migration 0023 explicitly calls it a COARSE, safe category, part of "the entire
+signal used to measure/tune the classifier" -- but as a conservative choice: it
+is optional and outside the live writer's own output shape, so including it
+would widen this script's blast radius beyond matching what the live path
+already writes.
 
 `human_actor`: the source table's own actor column, but only when it names a REAL
 row in `users` -- resolved with a LEFT JOIN, never a bare cast. Two of the three
@@ -155,7 +184,7 @@ _INSERT_COLUMNS = (
 )
 _INSERT_PREFIX = f"INSERT INTO decision_records ({', '.join(_INSERT_COLUMNS)})\n"
 
-STATS_COLUMNS = ("eligible", "skipped_topic_null", "already_present")
+STATS_COLUMNS = ("eligible", "skipped", "already_present")
 
 
 def _already_present(alias: str, kind: str) -> str:
@@ -181,7 +210,20 @@ _PPS_CTE = """WITH pps_candidates AS (
            si.company_id,
            pps.task_id::text AS object_ref,
            pps.confidence AS score,
-           pps.state AS human_outcome,
+           -- Reconstructs confirm_suggestion's own outcome decision exactly
+           -- (lambda_org_api.py's _stamp_decision call site): 'edited' whenever
+           -- the FINAL applied status/progress differs from what the matcher
+           -- suggested, 'confirmed'/'rejected' otherwise. decide() always writes
+           -- applied_status/applied_progress alongside state (unconditional
+           -- since migration 0008), so this is available for every historical
+           -- row, not just ones decided after Task 6b shipped.
+           CASE
+               WHEN pps.state = 'confirmed' AND (
+                   pps.applied_status IS DISTINCT FROM pps.suggested_status
+                   OR pps.applied_progress IS DISTINCT FROM pps.suggested_progress
+               ) THEN 'edited'
+               ELSE pps.state
+           END AS human_outcome,
            pps.decided_at AS human_at,
            pps.created_at,
            hu.id AS human_actor,
@@ -205,7 +247,7 @@ def sql_stats_programme_match() -> str:
         _PPS_CTE +
         "SELECT "
         "count(*) FILTER (WHERE topic_id IS NOT NULL) AS eligible, "
-        "count(*) FILTER (WHERE topic_id IS NULL) AS skipped_topic_null, "
+        "count(*) FILTER (WHERE topic_id IS NULL) AS skipped, "
         f"count(*) FILTER (WHERE topic_id IS NOT NULL AND {already}) AS already_present "
         "FROM pps_candidates"
     )
@@ -268,7 +310,7 @@ def sql_stats_thread() -> str:
     already = _already_present("tts_candidates", "thread")
     return (
         _TTS_CTE +
-        "SELECT count(*) AS eligible, 0 AS skipped_topic_null, "
+        "SELECT count(*) AS eligible, 0 AS skipped, "
         f"count(*) FILTER (WHERE {already}) AS already_present "
         "FROM tts_candidates"
     )
@@ -295,10 +337,20 @@ def sql_insert_thread() -> str:
 _CF_CTE = """WITH cf_candidates AS (
     SELECT cf.id AS source_id,
            cf.topic_id,
+           -- t.id (NULL exactly when the topic named by cf.topic_id is gone --
+           -- classification_feedback.topic_id carries no FK, migration 0023) is
+           -- the eligibility/skip gate: t.site_id/t.work_class/t.work_confidence/
+           -- t.is_mixed are only trustworthy, and only ever selected, when this
+           -- is NOT NULL.
+           t.id AS topic_row_id,
            t.site_id,
            cf.company_id,
            NULL::text AS object_ref,
-           cf.classifier_confidence AS score,
+           -- Matches the live writer's score=work_confidence
+           -- (lambda_item_writer._record_work_class_decision) whenever the topic
+           -- carries one; classifier_confidence is only a fallback for a topic
+           -- written before migration 0021 added work_confidence.
+           COALESCE(t.work_confidence, cf.classifier_confidence) AS score,
            CASE cf.human_verdict
                WHEN 'confirm_non_work' THEN 'confirmed'
                ELSE 'rejected'
@@ -306,7 +358,14 @@ _CF_CTE = """WITH cf_candidates AS (
            cf.created_at AS human_at,
            cf.created_at,
            hu.id AS human_actor,
+           -- Same output KEYS the live writer uses (work_class/work_confidence/
+           -- is_mixed, read off the topic row -- classification_feedback never
+           -- stored them), plus classifier_verdict/human_verdict as additive
+           -- extras the live writer's own shape does not carry.
            jsonb_build_object(
+               'work_class', t.work_class,
+               'work_confidence', t.work_confidence,
+               'is_mixed', t.is_mixed,
                'classifier_verdict', cf.classifier_verdict,
                'human_verdict', cf.human_verdict
            ) AS output
@@ -319,13 +378,13 @@ _CF_CTE = """WITH cf_candidates AS (
 
 
 def sql_stats_work_class() -> str:
-    # classification_feedback.topic_id is NOT NULL (no FK, but never absent) --
-    # same "no skip case, kept for shape parity" note as sql_stats_thread.
     already = _already_present("cf_candidates", "work_class")
     return (
         _CF_CTE +
-        "SELECT count(*) AS eligible, 0 AS skipped_topic_null, "
-        f"count(*) FILTER (WHERE {already}) AS already_present "
+        "SELECT "
+        "count(*) FILTER (WHERE topic_row_id IS NOT NULL) AS eligible, "
+        "count(*) FILTER (WHERE topic_row_id IS NULL) AS skipped, "
+        f"count(*) FILTER (WHERE topic_row_id IS NOT NULL AND {already}) AS already_present "
         "FROM cf_candidates"
     )
 
@@ -341,17 +400,18 @@ def sql_insert_work_class() -> str:
     return (
         _CF_CTE + _INSERT_PREFIX +
         f"SELECT {select_list} FROM cf_candidates "
-        f"WHERE NOT {already} "
+        f"WHERE topic_row_id IS NOT NULL AND NOT {already} "
         "RETURNING id"
     )
 
 
-# One entry per source: (report key, stats sql fn, insert sql fn, has a
-# skip-for-null-topic bucket that can be non-zero).
+# One entry per source: (report key, stats sql fn, insert sql fn). Every
+# source's stats query now computes a real "skipped" count (0 as a literal
+# for thread, which has no skip case at all) -- no per-source flag needed.
 SOURCES = (
-    ("programme_match", sql_stats_programme_match, sql_insert_programme_match, True),
-    ("thread", sql_stats_thread, sql_insert_thread, False),
-    ("work_class", sql_stats_work_class, sql_insert_work_class, False),
+    ("programme_match", sql_stats_programme_match, sql_insert_programme_match),
+    ("thread", sql_stats_thread, sql_insert_thread),
+    ("work_class", sql_stats_work_class, sql_insert_work_class),
 )
 
 
@@ -442,16 +502,15 @@ def run_backfill(*, cluster: str, secret: str, database: str, apply: bool,
     committed = False
     try:
         report: dict = {}
-        for name, stats_fn, insert_fn, has_skip_bucket in SOURCES:
+        for name, stats_fn, insert_fn in SOURCES:
             stats = _parse_stats(
                 _execute(cluster, secret, database, tx, stats_fn(), profile, region))
             eligible = stats["eligible"]
-            skipped = stats["skipped_topic_null"] if has_skip_bucket else 0
             already_present = stats["already_present"]
             would_insert = eligible - already_present
             entry = {
                 "eligible": eligible,
-                "skipped_topic_null": skipped,
+                "skipped": stats["skipped"],
                 "already_present": already_present,
             }
             if apply:
