@@ -332,6 +332,37 @@ one homogeneous measurement. **`top_hit` is recorded on every owner-batch row fo
 but `score.py` never reads it — it plays no part in scoring, the precision floor, the coverage
 comparison, or the verdict.**
 
+### 3a. Owner-labelled batch (added 2026-09-29, before any Jev call)
+
+The owner labelled the Task 10 batch (sampler seed 0) in a private claude.ai page; labels were read back
+and merged with `import_labels.py`. Counts after merge (`counts.json`):
+
+| Set | Rows | yes | no | Source | Eligible (>= 20 per class) |
+|---|---|---|---|---|---|
+| threads | 86 | 27 | 59 | 26 DB + 60 owner (1 "unsure" dropped) | yes |
+| work_class | 103 | 82 | 21 | 23 DB + 80 owner (9 "unsure" dropped) | yes, with the definition caveat below |
+
+**Threads: the test accounts are not one site's job.** 55 of the 61 owner-batch pairs come from one
+site that the owner used for self-testing and across several real sites. In the owner's labels every
+"yes" pair falls inside one calendar month, and all 27 cross-month pairs are "no". These labels are
+true, and the deployed gate sees the same mix, but the cross-month pairs are easy negatives. The
+results table therefore reports threads twice: all rows, and same-month pairs only. A verdict that
+holds only on the full set, and not on the same-month subset, is recorded as such, and is not acted on.
+
+**work_class: the owner's definition is wider than the classifier's.** The deployed prompt
+(`lambda_extract_session.py`, rule 2b) defines non_work as "personal/off-work talk: meals, family,
+weekend, banter", and says to choose "work" when unsure. The owner labelled as non-work everything
+that is not this site's construction work: client meetings, sales, and the FieldSight team's own
+product work, as well as private talk. Of the 59 owner "yes" labels, the classifier said "work" on 24.
+Most of those 24 are this definitional gap, not classifier errors. Scored against the owner's labels,
+the baseline answers a different question than the one it was built for, so a work_class result under
+the current labels measures fit to the owner's definition, not the classifier's accuracy on its own
+spec. The fix proposed to the owner: split non-work into "other work" (client meetings, sales,
+FieldSight internal: not this site's report, but not private) and "private" (family, health, personal
+errands, device testing), relabel the owner's yes rows, and score two tasks — private vs the rest (the
+classifier's spec), and this-site work vs the rest (what the owner wants in a site report). Until that
+relabel exists, no work_class verdict is acted on.
+
 ---
 
 ## 4. Privacy conditions in force
