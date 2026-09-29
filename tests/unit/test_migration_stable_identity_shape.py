@@ -108,3 +108,20 @@ def test_decision_records_company_cascades_but_site_is_nullable():
     sql = _flat()
     assert "company_id uuid NOT NULL REFERENCES companies(id) ON DELETE CASCADE" in sql
     assert "site_id uuid REFERENCES sites(id) ON DELETE CASCADE" in sql
+
+
+def test_topic_decisions_and_topic_questions_are_indexed_on_stable_id():
+    """Task 7: the question PATCH endpoint (topic_questions.get_live_by_stable_id,
+    lambda_org_api.py's PATCH /api/org/questions/{stable_id}) and
+    visible_decision_records_predicate's carry-forward resolution (Ruling R17,
+    deleted_predicates.py's _child_branch for kind="decision"/"question") both look
+    up a row by stable_id -- without an index, each such call is a sequential scan."""
+    sql = _flat()
+    assert (
+        "CREATE INDEX IF NOT EXISTS idx_topic_decisions_stable "
+        "ON topic_decisions (stable_id);" in sql
+    )
+    assert (
+        "CREATE INDEX IF NOT EXISTS idx_topic_questions_stable "
+        "ON topic_questions (stable_id);" in sql
+    )

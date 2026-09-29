@@ -50,6 +50,11 @@ CREATE TABLE IF NOT EXISTS topic_decisions (
   created_at  timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_topic_decisions_topic ON topic_decisions (topic_id);
+-- Track B Task 7: the question PATCH endpoint and the decision-records visibility
+-- predicate (visible_decision_records_predicate's carry-forward resolution, Ruling
+-- R17) both look up a row by stable_id -- without this, that lookup is a sequential
+-- scan of the whole table.
+CREATE INDEX IF NOT EXISTS idx_topic_decisions_stable ON topic_decisions (stable_id);
 CREATE TABLE IF NOT EXISTS topic_questions (
   id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   stable_id   uuid NOT NULL DEFAULT gen_random_uuid(),
@@ -64,6 +69,8 @@ CREATE TABLE IF NOT EXISTS topic_questions (
   created_at  timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_topic_questions_topic ON topic_questions (topic_id);
+-- Track B Task 7: same reason as idx_topic_decisions_stable above.
+CREATE INDEX IF NOT EXISTS idx_topic_questions_stable ON topic_questions (stable_id);
 
 -- One row per gated AI verdict, accepted or not, and the human's answer to it. Spec §2.2.
 CREATE TABLE IF NOT EXISTS decision_records (
