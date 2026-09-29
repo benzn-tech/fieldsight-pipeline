@@ -531,3 +531,18 @@ def test_the_rebind_centroid_survives_the_hop_and_reaches_the_insert(monkeypatch
     assert captured_params[1][1][idx] is None, (
         "a missing centroid must stay NULL -- a zero vector would read as a voice that "
         "matches nothing, which is a different and answerable claim")
+
+
+def test_date_on_profiles_and_on_roster_on_the_reply_cross_the_seam_read():
+    """The roster hop (on-site-roster plan, Task 4): the embedder sends `date` on the
+    `profiles` invoke and the writer must read it; the writer may reply with `on_roster`
+    per profile and `roster_size`, and the embedder must read both, or the roster narrows
+    nothing while looking like it works -- the exact shape of this file's other defects."""
+    emb = open("src/lambda_speaker_embed.py", encoding="utf-8").read()
+    wr = open("src/lambda_voiceprint_writer.py", encoding="utf-8").read()
+
+    assert '"op": "profiles"' in emb and '"date": date' in emb
+    assert 'event.get("date")' in wr, "the writer never reads the date the embedder sends"
+
+    assert 'on_roster' in wr, "the writer never builds on_roster"
+    assert 'p.get("on_roster")' in emb, "the embedder never reads on_roster back"
