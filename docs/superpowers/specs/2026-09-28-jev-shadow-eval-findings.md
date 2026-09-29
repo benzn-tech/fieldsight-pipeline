@@ -618,9 +618,30 @@ few accepted rows). Coverage difference 0.0, 90% CI [−0.23, 0.04]. Paired Brie
 
 ## 6. Disagreement read
 
-*(pending — the 20 largest Jev-decomposed vs baseline disagreements per set are prepared for the owner to
-read; clause (i) requires this before any verdict is acted on. With both verdicts "not adopted", no action
-waits on it, but the read is still how the descriptive work_class finding above is confirmed or dropped.)*
+Done by the owner on 2026-09-29, in the private labelling page. Items: every row where Jev-decomposed
+(run 1, stored v0 composite at 0.5) and the baseline (at its deployed threshold) decided differently,
+ranked by Jev's distance from 0.5 — threads 17 (all there were), work_class the top 20 of 41. For each, the
+owner judged only whether their own label was right.
+
+| set | owner's label sides with | label confirmed | label may be wrong | unclear |
+|---|---|---|---|---|
+| threads | Jev (14) | 14 | 0 | 0 |
+| threads | baseline (3) | 3 | 0 | 0 |
+| work_class | Jev (4) | 3 | 1 | 0 |
+| work_class | baseline (16) | 13 | 2 | 1 |
+
+Reading:
+- **threads:** where the two disagree, Jev is right 14 of 17 times and every label stands. Jev ranks
+  follow-ups better than the TF-IDF score, but not well enough to clear any 95%-precision operating point
+  (§5) — the verdict stands.
+- **work_class:** Jev's most confident disagreements are mostly *false* "private" calls — the owner sides
+  with the classifier on 16 of the 20. So Jev's higher recall (§5) comes with confidently wrong private
+  flags at the top of its range, which is exactly what the precision floor exists to catch. The descriptive
+  finding that the deployed classifier misses many private conversations stands (it rests on the 41
+  disagreements and the relabel, not on this top-20), but Jev is not a drop-in fix for it.
+- 3 owner labels were marked "may be wrong" and 1 "unclear" (all work_class). Flipping them cannot change
+  either verdict (the failing conditions are the control check and the precision floor); they are left as
+  labelled and noted here.
 
 ---
 
