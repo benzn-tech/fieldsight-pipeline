@@ -3371,6 +3371,11 @@ Resources:
           CONFIG_KEY: config/user_mapping.json
           MULTI_TENANT_RESOLUTION: !Ref MultiTenantResolution
           AUTHORITY_FLIP: !Ref AuthorityFlip
+          # Ruling R22: carry_forward_apply.py's OrphanedHumanEdits EMF line reads this
+          # (os.environ.get("STAGE", "unknown")) — without it every emission lands under
+          # Stage=unknown instead of test/prod, and Task 8's live TEST check saw exactly
+          # that (0 emitted, but tagged unknown).
+          STAGE: !Ref Stage
       Policies:
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
@@ -3581,6 +3586,11 @@ Resources:
           # recurring-item threading: propose which earlier subject a new
           # topic restates. Writes suggestions only; never links.
           SUGGEST_THREADS: !Ref EnableThreadSuggestions
+          # Ruling R22: carry_forward_apply.py's OrphanedHumanEdits EMF line reads this
+          # (os.environ.get("STAGE", "unknown")) — without it every emission lands under
+          # Stage=unknown instead of test/prod, and Task 8's live TEST check saw exactly
+          # that (0 emitted, but tagged unknown).
+          STAGE: !Ref Stage
       Policies:
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
