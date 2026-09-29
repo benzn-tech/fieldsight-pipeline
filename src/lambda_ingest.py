@@ -63,6 +63,7 @@ from urllib.parse import unquote_plus
 
 import boto3
 
+import carry_forward_apply
 import deadline_parse
 import match_request
 import photo_binding
@@ -72,7 +73,7 @@ import agent_turn_filter
 from chunking import chunk_report, chunk_transcripts
 from db.connection import get_connection
 from repositories import (chunks, companies, memberships, recordings, redactions,
-                          sites, topics, users)
+                          sites, topic_decisions, topic_questions, topics, users)
 import batch_stitch
 import deletion_mirror
 from transcript_utils import normalize_transcript
@@ -669,7 +670,13 @@ def ingest_report(date, user_folder, report_key):
 
         chunks.delete_chunks_for_source(conn, report_key)
         # always: supersedes stale pre-flip report rows
-        topics.supersede_topics_for_source(conn, report_key, run)
+        #
+        # Track B final wave (Ruling R19): every supersede call below writes into
+        # `retired_topics` -- the source-key call always runs, the prefix call only off the
+        # non-flip branch -- so a tick on either kind of retired row is carried forward once,
+        # after the topic-write loop below. Same accumulator shape as
+        # lambda_item_writer.write_extraction_items' own `retired_topics`.
+        retired_topics = list(topics.supersede_topics_for_source(conn, report_key, run))
         if defer_to_extraction:
             # Authority flip (spec §6): the day's extraction topics ARE the
             # item store; the report is a document artifact only. No
@@ -682,7 +689,8 @@ def ingest_report(date, user_folder, report_key):
         else:
             # Nightly report supersedes that day's session-sourced (live
             # extraction) items — Phase 4b.
-            topics.supersede_topics_for_source_prefix(conn, extraction_prefix, run)
+            retired_topics.extend(
+                topics.supersede_topics_for_source_prefix(conn, extraction_prefix, run))
 
         topic_seq_to_id = {}
         if defer_to_extraction:
@@ -690,6 +698,10 @@ def ingest_report(date, user_folder, report_key):
                 conn, site["id"], user_id, date, report.get("topics", []))
 
         collected_topics = []
+        # Track B final wave (Ruling R19): every topic this pass actually WRITES (never
+        # populated on a defer day, which writes none) -- the "new" pool
+        # carry_forward_apply._carry_forward_children matches `retired_topics` against below.
+        new_topic_ids = []
         if not defer_to_extraction:
             # P4 (2026-07-23 prod-media-binding plan): list the pictures
             # prefix ONCE (paginator, outside the loop), so report-sourced
@@ -708,6 +720,19 @@ def ingest_report(date, user_folder, report_key):
             report_photo_objects = _list_report_pictures(user_folder, date)
             for i, t in enumerate(report_topics):
                 mapped_action_items = _map_action_items(t.get("action_items"), date)
+                # Computed once so the jsonb kwargs below and the row-table dual-write right
+                # after them (Track B final wave, Ruling R19) can never disagree about which
+                # decisions/questions this topic carries -- same posture as
+                # lambda_item_writer's own dual-write.
+                #
+                # The report path spells decisions `key_decisions` (plain strings, what
+                # lambda_report_generator emits) and questions `open_questions` (unanswered
+                # questions carried, not folded into summary -- lambda_meeting_minutes
+                # stopped appending them to the summary text when the report gained its own
+                # section for them); the extraction schema spells them `decisions` (objects)
+                # and `questions`. One column (jsonb) and now one row table each hold both.
+                decisions = t.get("key_decisions") or t.get("decisions")
+                open_questions = t.get("open_questions") or t.get("questions")
                 row = topics.upsert_topic(
                     conn, site["id"], date, t.get("topic_title", ""),
                     user_id=user_id, source_s3_key=report_key,
@@ -715,20 +740,22 @@ def ingest_report(date, user_folder, report_key):
                     action_items=mapped_action_items,
                     safety=_map_safety(t.get("safety_flags")),
                     time_range=t.get("time_range"), participants=t.get("participants"),
-                    # Carried, not folded into summary. A meeting's unanswered
-                    # questions reach this table only through this argument now
-                    # -- lambda_meeting_minutes stopped appending them to the
-                    # summary text when the report gained its own section for
-                    # them, and without this line the Timeline loses a day's
-                    # questions entirely.
-                    open_questions=t.get("open_questions") or t.get("questions"),
-                    # The report path spells it `key_decisions` (plain strings,
-                    # what lambda_report_generator emits); the extraction schema
-                    # spells it `decisions` (objects). One column holds both.
-                    decisions=t.get("key_decisions") or t.get("decisions"),
+                    open_questions=open_questions,
+                    decisions=decisions,
                     # NO `photos=`. topic_photos has one writer now, and it is
                     # the day-wide rebind after this loop -- see above.
                 )
+                new_topic_ids.append(row["id"])
+                # Track B final wave (Ruling R19): the SAME row-table dual-write
+                # lambda_item_writer.write_extraction_items does right after upsert_topic --
+                # decisions/open_questions become their OWN rows (stable_id,
+                # carry_forward-matchable) alongside, not instead of, the jsonb column just
+                # written above. Both inserts drop blanks/falsy entries themselves (see their
+                # own docstrings), so this is exactly the item-writer's
+                # `t.get("decisions") or []` shape, just fed from the report's own keys.
+                topic_decisions.insert_decisions(conn, row["id"], site["id"], decisions or [])
+                topic_questions.insert_questions(
+                    conn, row["id"], site["id"], open_questions or [])
                 # None keys stay out of the map: a literal "topic_id": null
                 # topic must not adopt the unassigned transcript windows
                 # (Fable minor 1).
@@ -754,6 +781,24 @@ def ingest_report(date, user_folder, report_key):
                     conn, company["id"], user_folder, date, report_photo_objects)
             except Exception:  # noqa: BLE001 -- see above
                 logger.exception("day photo rebind failed for %s/%s", user_folder, date)
+
+        # Track B final wave (Ruling R19): carry a human's tick/answer/edit on a report-
+        # sourced action item, finding, decision or question across THIS report's own
+        # re-ingest. lambda_item_writer's extraction path has done this since Task 4/5; the
+        # report path superseded topics on every re-ingest (both supersede calls above)
+        # without it, so a tick on a report-sourced item was silently orphaned (final review
+        # Important #1). Same shared function, same SAVEPOINT/degrade posture (Ruling R10)
+        # and same OrphanedHumanEdits report (Ruling R5) as the extraction path --
+        # carry_forward_apply.py.
+        #
+        # Runs even under the authority flip: a defer day writes no report topics
+        # (`new_topic_ids` stays empty), so every human-touched row this pass retired from a
+        # PRIOR non-flip report reports as an orphan -- correct, since the day's authoritative
+        # item store moved to the extraction topics lambda_item_writer already carries
+        # forward on its own pass, not to a report topic this pass never wrote.
+        if retired_topics:
+            carry_forward_apply._carry_forward_children(
+                conn, [t["id"] for t in retired_topics], new_topic_ids, site["id"], report_key)
 
         # Re-hide anything just re-created under a source its owner deleted. IN THE SAME
         # TRANSACTION as the insert, so there is no window in which the resurrected rows

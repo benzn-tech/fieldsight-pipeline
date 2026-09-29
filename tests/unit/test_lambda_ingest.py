@@ -133,6 +133,13 @@ def wired(monkeypatch):
     monkeypatch.setattr(ing.topics, "supersede_topics_for_source_prefix", lambda *a, **k: [])
     monkeypatch.setattr(ing.topics, "upsert_topic",
                         lambda *a, **k: {"id": "topic-uuid-0"})
+    # Track B final wave (Ruling R19): topic_decisions.insert_decisions /
+    # topic_questions.insert_questions hit conn.cursor(...), which FakeConn does not model
+    # (it only implements .execute()) -- stubbed inert by default here, same reasoning
+    # test_lambda_item_writer.py's own `wired` fixture gives for findings/decision_records.
+    # Tests that care about a specific dual-written row override this.
+    monkeypatch.setattr(ing.topic_decisions, "insert_decisions", lambda *a, **k: [])
+    monkeypatch.setattr(ing.topic_questions, "insert_questions", lambda *a, **k: [])
     monkeypatch.setattr(ing.chunks, "insert_chunk", lambda *a, **k: {"id": "chunk-x"})
     monkeypatch.setattr(ing, "_load_vectors", lambda bucket, sidecar_key: {})
     monkeypatch.setattr(ing, "embed_from_sidecar",
