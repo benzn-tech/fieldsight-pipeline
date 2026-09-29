@@ -127,6 +127,10 @@ def wired(monkeypatch):
     monkeypatch.setattr(iw.recordings, "site_for_media", lambda *a, **k: None)
     monkeypatch.setattr(iw.recordings, "site_for_day", lambda *a, **k: None)
     monkeypatch.setattr(iw.topics, "delete_topics_for_source", lambda *a, **k: 0)
+    # Track B (migration 0073) added this call to write_extraction_items between this
+    # test file's ClosingFakeConn (which has no .cursor()) and the real topics repo --
+    # stub it the same way test_lambda_item_writer.py's own FakeConn-based tests do.
+    monkeypatch.setattr(iw.topics, "supersede_topics_for_source", lambda *a, **k: [])
     monkeypatch.setattr(iw.topics, "upsert_topic", lambda *a, **k: {"id": "topic-uuid-0"})
     monkeypatch.setattr(iw.findings, "insert_findings", lambda *a, **k: [])
     monkeypatch.setattr(iw.match_request, "emit", lambda *a, **k: None)
