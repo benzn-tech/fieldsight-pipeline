@@ -17,6 +17,16 @@ object is deleted and no database row is dropped.** The raw data stays for analy
 hiding is a set of tombstone rows in `redactions`, and one row per delete action carries a
 `batch_id` so a single delete can be undone as a unit.
 
+Track B's `decision_records` (the AI-verdict/human-outcome audit trail used by the eval
+export, `decision_records.list_for_eval`) is hidden the same way: by a read-time predicate
+(`deleted_predicates.visible_decision_records_predicate`, Ruling R7), never by deleting the
+row. It has no `topic_id` column of its own, so the predicate resolves each record's
+subject to a topic first (directly for `subject_type='topic'`, via the child table's
+`stable_id` for `finding`/`action_item`/`decision`/`question`) and hides it exactly when
+that topic is deletion-tombstoned — a topic merely *superseded* by a later extraction pass
+does NOT hide its decision records, on purpose: the eval export's whole point is to survive
+re-extraction.
+
 ## 1. The marker — how to find everything this feature ever did
 
 The marker is a column, not a feature flag. A flag that is turned off leaves no way to find

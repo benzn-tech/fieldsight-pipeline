@@ -856,13 +856,26 @@ def _suggest_threads_inner(conn, company_id, site_id, date, written):
             # `c`'s title/summary, which are extraction-derived text (plan
             # Global Constraint: decision_records never carries transcript
             # text).
+            #
+            # Track B Task 6b: `c["thread_id"]` comes straight off
+            # `candidate_corpus`'s SQL (`t.thread_id`) as a `uuid.UUID`
+            # object, not text -- `Jsonb()`'s `json.dumps` cannot serialize
+            # that and raises, which `_suggest_threads`'s SAVEPOINT then
+            # swallows as "thread suggestion pass failed", silently losing
+            # EVERY thread suggestion for every topic in this pass, not just
+            # the one candidate that triggered it. Every candidate scored
+            # against this task before Task 6b only ever had `thread_id`
+            # None (the parent_topic_id branch), so this never fired until
+            # a real candidate that already belongs to a thread was scored.
+            # str() before Jsonb() the same way object_ref is str()'d two
+            # lines above -- `None` stays `None` (json-serializable as-is).
             decision_records.insert(
                 conn, company_id=company_id, site_id=site_id, kind="thread",
                 subject_type="topic", subject_stable_id=t["topic_id"],
                 object_ref=str(c["id"]), provider="lexical", model=None,
                 model_version=None, question_set=None, input_key=None, input_hash=None,
                 output={"match_score": c["match_score"], "gap_days": c["gap_days"],
-                        "thread_id": c.get("thread_id")},
+                        "thread_id": str(c["thread_id"]) if c.get("thread_id") else None},
                 score=c["match_score"], threshold=thread_match.MIN_SCORE,
                 auto_outcome=("accepted" if c["id"] == became_suggestion_id else "rejected"),
             )

@@ -19,6 +19,8 @@ jsonb column (chunks.py/findings.py convention)."""
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from deleted_predicates import visible_decision_records_predicate
+
 _COLS = (
     "id", "company_id", "site_id", "kind", "subject_type", "subject_stable_id",
     "object_ref", "provider", "model", "model_version", "question_set",
@@ -104,14 +106,46 @@ def list_for_eval(conn, company_id, kind, since) -> list[dict]:
     `since`, newest first -- Task 6 brief: "for Track A's export to switch
     to once this lands".
 
-    TODO(Ruling R7, Task 6b): NO deletion-visibility filter yet -- a row
-    whose subject was later redacted/deleted is still returned here. 6b
-    adds that predicate once the deletion mirror (Task 6 Step 5) exists for
-    it to filter against; until then a caller of this function sees rows
-    for deleted subjects too."""
+    Ruling R7 (Task 6b): carries `visible_decision_records_predicate` --
+    the deletion arms only (topic id + source prefix), deliberately NOT the
+    live/supersession arm. A row whose subject a customer actually deleted
+    is excluded; a row whose subject topic was merely superseded by a later
+    extraction pass is NOT -- an eval export that lost a record every time
+    Task 3 re-extracted would defeat the reason decision_records exists.
+    See tests/unit/test_live_topic_predicate_everywhere.py's UNFILTERED
+    entry for this function for the same reasoning, enforced."""
     return conn.cursor(row_factory=dict_row).execute(
-        f"SELECT {_RETURNING} FROM decision_records "
-        f"WHERE company_id=%s AND kind=%s AND created_at >= %s "
-        f"ORDER BY created_at DESC",
+        f"SELECT {', '.join('d.' + c for c in _COLS)} FROM decision_records d "
+        f"WHERE d.company_id=%s AND d.kind=%s AND d.created_at >= %s "
+        f"AND {visible_decision_records_predicate('d')} "
+        f"ORDER BY d.created_at DESC",
         (company_id, kind, since),
     ).fetchall()
+
+
+def object_ref_for_accepted(conn, kind, subject_type, subject_stable_id):
+    """The `object_ref` the writer stamped on the latest 'accepted' record for this
+    subject, or None if there is none.
+
+    Exists for exactly one seam: `topic_thread_suggestions` (migration 0032, predates
+    Track B) carries `thread_id XOR parent_topic_id` -- when a new topic's best-scoring
+    thread candidate already belongs to an existing thread, the suggestion row stores
+    only that THREAD's id, not the specific candidate TOPIC id `_suggest_threads_inner`
+    scored it against. But `decision_records.object_ref` for a `kind='thread'` verdict is
+    always "the earlier topic id" (`lambda_item_writer._suggest_threads_inner`'s
+    `object_ref=str(c["id"])`, never the thread id) -- so a caller holding only
+    `thread_id` cannot reconstruct the object_ref `set_human_outcome` needs to find the
+    right row.
+
+    Safe because a topic id is never reused (topics are not re-keyed across
+    re-extraction -- decision_records.subject_stable_id's own column comment) and
+    `_suggest_threads_inner` runs at most once per topic (when it is first written), so
+    at most one 'accepted' thread record ever exists for a given subject_stable_id;
+    `ORDER BY created_at DESC LIMIT 1` is a safety net, not a real disambiguation."""
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT object_ref FROM decision_records "
+        "WHERE kind=%s AND subject_type=%s AND subject_stable_id=%s "
+        "AND auto_outcome='accepted' ORDER BY created_at DESC LIMIT 1",
+        (kind, subject_type, subject_stable_id),
+    ).fetchone()
+    return row["object_ref"] if row else None

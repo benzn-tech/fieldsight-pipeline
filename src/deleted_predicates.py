@@ -130,3 +130,43 @@ def visible_chunks_predicate(alias: str = "c") -> str:
             f"{DELETED_SOURCE_PREDICATE.format(alias=alias)} AND "
             f"(EXISTS (SELECT 1 FROM topics t WHERE t.id = {alias}.topic_id "
             f"AND t.superseded_at IS NULL) OR {alias}.topic_id IS NULL)")
+
+
+def visible_decision_records_predicate(alias: str = "d") -> str:
+    """Ruling R7 (Track B Task 6b): decision_records has no topic_id column of its own --
+    a record's visibility depends on resolving its SUBJECT to a topic and checking that
+    topic is not deletion-tombstoned.
+
+    Deliberately TWO arms, not three: the deletion tombstone (topic id AND source prefix,
+    same reasoning as visible_topics_predicate above), but NEVER LIVE_TOPIC_PREDICATE. Task
+    6's whole point is that a decision record outlives the row it was about being
+    superseded by a later extraction pass -- Track A's eval export (list_for_eval) must
+    still show the record for a re-extracted topic, only an actual customer deletion hides
+    it. Folding in the live arm here would make every re-extraction erase its own history
+    the moment the newer pass writes fresh records, which is backwards: the whole reason
+    Task 3 stopped DELETEing superseded topics was to keep exactly this kind of row alive.
+
+    subject_type 'topic': subject_stable_id IS the topic id directly (topics are not
+    re-keyed -- decision_records.subject_stable_id's own column comment, migration 0073).
+    Every other subject_type names a CHILD row keyed by its OWN stable_id, resolved to its
+    topic_id first. A subject_stable_id that resolves to no row at all (or an
+    unrecognised subject_type) resolves to no topic and is therefore NOT visible --
+    fail-closed rather than showing an orphaned record nothing can attribute to a topic."""
+    resolved_topic_id = (
+        f"(CASE {alias}.subject_type "
+        f"WHEN 'topic' THEN {alias}.subject_stable_id "
+        f"WHEN 'finding' THEN (SELECT f.topic_id FROM findings f "
+        f"  WHERE f.stable_id = {alias}.subject_stable_id) "
+        f"WHEN 'action_item' THEN (SELECT a.topic_id FROM action_items a "
+        f"  WHERE a.stable_id = {alias}.subject_stable_id) "
+        f"WHEN 'decision' THEN (SELECT td.topic_id FROM topic_decisions td "
+        f"  WHERE td.stable_id = {alias}.subject_stable_id) "
+        f"WHEN 'question' THEN (SELECT tq.topic_id FROM topic_questions tq "
+        f"  WHERE tq.stable_id = {alias}.subject_stable_id) "
+        f"ELSE NULL END)"
+    )
+    return (
+        f"EXISTS (SELECT 1 FROM topics t WHERE t.id = {resolved_topic_id} AND "
+        f"{DELETED_TOPIC_PREDICATE.format(alias='t')} AND "
+        f"{DELETED_SOURCE_PREDICATE.format(alias='t')})"
+    )

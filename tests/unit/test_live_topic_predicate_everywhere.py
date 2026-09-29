@@ -43,6 +43,7 @@ from repositories import (
     action_items,
     chunks,
     content,
+    decision_records,
     findings,
     redactions,
     rollup,
@@ -266,6 +267,14 @@ UNFILTERED = {
         "ops/diagnostic tool counting topic_photos binding rows directly, not a topic "
         "content display; must see every row to detect and collapse duplicates regardless "
         "of the parent topic's supersession status",
+    (decision_records, "list_for_eval"):
+        "Ruling R7 (Track B Task 6b) -- deliberately NOT live-filtered. list_for_eval is "
+        "Track A's eval export: a decision record's whole job is to survive the topic it "
+        "was about being superseded by a later extraction pass, so folding in the live "
+        "arm here would make every re-extraction erase its own decision-record history. "
+        "It DOES carry visible_decision_records_predicate (the two deletion arms only) -- "
+        "see that function's docstring and tests/integration/test_decision_records_roundtrip.py "
+        "for the deletion-visibility proof this file does not cover",
 }
 
 

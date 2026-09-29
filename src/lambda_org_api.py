@@ -143,7 +143,7 @@ from psycopg.rows import dict_row as RealDictRow
 import programme_reconcile
 from repositories import day_recording_segments, location_markers
 from repositories import (action_items, aliases, chunks, classification_feedback, companies,
-                          findings, speaker_label_groups,
+                          decision_records, findings, speaker_label_groups,
                           compliance_resolutions, content, content_edits, keyframes,
                           meeting_session, memberships, observations, programme,
                           programme_delay_flags, programme_import,
@@ -5730,6 +5730,16 @@ def create_classification_feedback_endpoint(conn, caller, body):
         conn, row["company_id"], topic_id, verdict,
         classifier_verdict=cv, classifier_confidence=conf,
         topic_category=tc, actor_user_id=caller["id"])
+    # Track B Task 6b. object_ref=None -- a work_class verdict has no "other side"
+    # (unlike a programme_match's task or a thread's earlier topic). 'missed_personal'
+    # maps to 'rejected' like 'reject_is_work': both are the human overturning what the
+    # classifier decided (non_work in the first case, work in the second), never a
+    # confirmation of it.
+    _stamp_decision(
+        conn, kind="work_class", subject_type="topic", subject_stable_id=topic_id,
+        object_ref=None,
+        outcome=("confirmed" if verdict == "confirm_non_work" else "rejected"),
+        actor=caller["id"])
     if verdict == "reject_is_work":                           # Fable review C3
         topics.set_work_class(conn, topic_id, "work")
         try:
@@ -6968,6 +6978,38 @@ _ALLOWED_CONFIRM_STATUSES = ("in_progress", "completed", "blocked", "delayed")
 _SUGGESTION_MANAGER_ROLES = ("admin", "gm", "pm")
 
 
+def _stamp_decision(conn, *, kind, subject_type, subject_stable_id, object_ref, outcome, actor):
+    """Track B Task 6b: best-effort `decision_records.set_human_outcome` call, shared by
+    every endpoint that answers a gated verdict (confirm/reject suggestion, confirm/reject
+    thread suggestion, classification-feedback).
+
+    Runs inside its own SAVEPOINT (`conn.transaction()`) with a WARNING on failure -- same
+    posture as `lambda_suggestion_writer._record_verdict` / `lambda_item_writer`'s
+    `_record_work_class_decision` (Ruling R10/R14). A missing or failed decision record
+    must never fail the human's confirm/reject: every one of this function's callers has
+    already committed (or is about to commit, in the same outer transaction) the REAL
+    effect of the human's decision -- a task write, a thread attach, a work_class flip --
+    and a decision_records row is provenance for that, not a precondition of it.
+
+    0 rows updated is the ordinary case for anything confirmed/rejected before this change
+    landed (no decision_records row exists yet for it) -- not logged, so routine confirms
+    do not spam WARNING. Only a genuine exception (a bad enum value, a DB error) is a
+    WARNING; it still never raises past this function."""
+    try:
+        with conn.transaction():
+            n = decision_records.set_human_outcome(
+                conn, kind=kind, subject_type=subject_type,
+                subject_stable_id=subject_stable_id, object_ref=object_ref,
+                outcome=outcome, actor=actor)
+            if n == 0:
+                logger.debug("decision record stamp matched no row: kind=%s subject=%s object=%s",
+                            kind, subject_stable_id, object_ref)
+    except Exception:
+        logger.warning("decision record stamp failed for kind=%s subject=%s object=%s -- "
+                       "the human decision itself is unaffected",
+                       kind, subject_stable_id, object_ref)
+
+
 class _SuggestionAlreadyDecided(Exception):
     """Another request decided this suggestion first — unwind rather than
     commit a second decision."""
@@ -7119,6 +7161,23 @@ def confirm_suggestion(conn, caller, suggestion_id, body):
                 # other programme write does. The old code wrote the derived
                 # document directly and never touched the table.
                 _write_snapshot(conn, str(row["site_id"]), prog["id"])
+
+            # Track B Task 6b: stamp the matcher's verdict with the human's answer.
+            # `new_status`/`new_progress` (computed above, BEFORE this block) are what
+            # was actually applied -- comparing THEM against the suggestion's own
+            # `suggested_status`/`suggested_progress` is 'edited' vs 'confirmed'
+            # regardless of whether the reviewer typed an explicit override or the
+            # never-lower-progress guard silently raised it; either way the outcome
+            # differs from what the model proposed. Inside this same SAVEPOINT so it
+            # commits with the confirm or not at all, but a decision-record failure
+            # alone (see _stamp_decision) can never turn this 200 into a 500.
+            _stamp_decision(
+                conn, kind="programme_match", subject_type="topic",
+                subject_stable_id=row["topic_id"], object_ref=row["task_id"],
+                outcome=("edited" if (new_status != row["suggested_status"]
+                                      or new_progress != row["suggested_progress"])
+                         else "confirmed"),
+                actor=caller["id"])
     except _SuggestionAlreadyDecided:
         return error("already decided", 409)
     except _SuggestionTaskMoved:
@@ -7139,6 +7198,10 @@ def reject_suggestion(conn, caller, suggestion_id):
     if str(row["site_id"]) not in _allowed_site_ids(conn, caller):
         return error("access denied to this site", 403)
     programme_suggestions.decide(conn, suggestion_id, "rejected", decided_by=caller["id"])
+    # Track B Task 6b.
+    _stamp_decision(conn, kind="programme_match", subject_type="topic",
+                    subject_stable_id=row["topic_id"], object_ref=row["task_id"],
+                    outcome="rejected", actor=caller["id"])
     return ok({"rejected": True})
 
 
@@ -7206,6 +7269,34 @@ def list_thread_suggestions(conn, caller, event):
     } for r in rows]})
 
 
+def _thread_decision_object_ref(conn, row):
+    """The `object_ref` `lambda_item_writer._suggest_threads_inner` used for THIS
+    suggestion's decision_records row -- always "the earlier topic id", never the
+    thread id (Track B Task 6b; see `decision_records.object_ref_for_accepted`'s
+    docstring for the full seam this closes).
+
+    `topic_thread_suggestions` carries `thread_id XOR parent_topic_id` (migration
+    0032's CHECK): when the winning candidate anchored a NEW thread, `parent_topic_id`
+    IS the earlier topic id directly -- cast to text for the object_ref column, same
+    as the writer's own `str(c["id"])`. When it joined an EXISTING thread, only
+    `thread_id` survived onto this row, and the specific candidate topic scored
+    against it is not recoverable from the row alone -- resolved instead by asking
+    decision_records for the object_ref its own writer already stamped.
+
+    Never raises (R10/R14 posture, same as `_stamp_decision` below): a lookup
+    failure here must not turn a successful confirm/reject into a 500. Returns None
+    on failure, which `_stamp_decision`/`set_human_outcome` already treat as a safe
+    no-op (no thread record has a NULL object_ref, so it simply matches nothing)."""
+    if row["parent_topic_id"] is not None:
+        return str(row["parent_topic_id"])
+    try:
+        return decision_records.object_ref_for_accepted(conn, "thread", "topic", row["topic_id"])
+    except Exception:
+        logger.warning("decision record object_ref lookup failed for thread topic=%s",
+                       row["topic_id"])
+        return None
+
+
 def confirm_thread_suggestion(conn, caller, suggestion_id):
     """Link the topic to the subject it restates.
 
@@ -7242,6 +7333,11 @@ def confirm_thread_suggestion(conn, caller, suggestion_id):
 
     threads.attach_topic(conn, row["topic_id"], thread_id, row["topic_date"])
     facts = threads.thread_facts(conn, thread_id)
+    # Track B Task 6b.
+    _stamp_decision(conn, kind="thread", subject_type="topic",
+                    subject_stable_id=row["topic_id"],
+                    object_ref=_thread_decision_object_ref(conn, row),
+                    outcome="confirmed", actor=caller["id"])
     return ok({
         "confirmed": True,
         "threadId": str(thread_id),
@@ -7254,12 +7350,17 @@ def reject_thread_suggestion(conn, caller, suggestion_id):
     """Turn a proposal down. The row is kept, not deleted: the repository
     refuses to propose the same link again, and re-asking a question someone
     already answered is the fastest way to train them to ignore the queue."""
-    _row, err = _thread_suggestion_or_error(conn, caller, suggestion_id)
+    row, err = _thread_suggestion_or_error(conn, caller, suggestion_id)
     if err is not None:
         return err
     if threads.resolve_suggestion(conn, suggestion_id, "rejected",
                                   str(caller["id"])) is None:
         return error("already decided", 409)
+    # Track B Task 6b.
+    _stamp_decision(conn, kind="thread", subject_type="topic",
+                    subject_stable_id=row["topic_id"],
+                    object_ref=_thread_decision_object_ref(conn, row),
+                    outcome="rejected", actor=caller["id"])
     return ok({"rejected": True})
 
 
