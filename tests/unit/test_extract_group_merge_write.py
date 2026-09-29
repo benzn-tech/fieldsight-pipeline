@@ -101,6 +101,37 @@ def test_beyond_the_cap_the_omission_is_recorded_not_silent(monkeypatch, wired):
     assert len(body["mergedMembers"]) == 1
 
 
+def test_group_merge_stamps_llm_provider_and_model(wired, monkeypatch):
+    """Ruling R15 fix round 2: extract_group is the SECOND writer of an
+    extraction artifact (the merged group extraction), and its output must
+    carry llm_provider/llm_model too -- item-writer's work_class records
+    for group-tier topics depend on it."""
+    monkeypatch.setattr(ex.llm_utils, "LLM_PROVIDER", "anthropic")
+    monkeypatch.setattr(ex.llm_utils, "CLAUDE_MODEL", "claude-sonnet-4-6")
+
+    ex.extract_group("bkt", _artifact())
+
+    _, body = wired.puts[0]
+    assert body["llm_provider"] == "anthropic"
+    assert body["llm_model"] == "claude-sonnet-4-6"
+
+
+def test_group_merge_llm_model_uses_the_thinking_on_variant(wired, monkeypatch):
+    """extract_group's own call_llm(...) always passes enable_thinking=True
+    -- llm_model must name the THINKING model (QWEN_MODEL), never
+    QWEN_MODEL_NONTHINKING, on a qwen deploy."""
+    monkeypatch.setattr(ex.llm_utils, "LLM_PROVIDER", "qwen")
+    monkeypatch.setattr(ex.llm_utils, "QWEN_API_KEY", "dashscope-test-dummy-key")
+    monkeypatch.setattr(ex.llm_utils, "QWEN_MODEL", "qwen3.8-flash")
+    monkeypatch.setattr(ex.llm_utils, "QWEN_MODEL_NONTHINKING", "qwen3.6-flash")
+
+    ex.extract_group("bkt", _artifact())
+
+    _, body = wired.puts[0]
+    assert body["llm_provider"] == "qwen"
+    assert body["llm_model"] == "qwen3.8-flash"
+
+
 def test_the_group_prompt_tells_the_model_there_is_no_shared_clock():
     sources = [{"session_id": "sid" + GID,
                 "turns": [{"speaker": "spk_0", "text": "hi", "abs_start_str": "10:00:00"}]}]

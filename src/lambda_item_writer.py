@@ -917,18 +917,22 @@ def _resolve_self_responsible(action_items, name):
     return resolved
 
 
-# Ruling R15 (Track B Task 6a fix round 1): the plan wants the extraction's
-# ACTUAL LLM on the work_class decision record, not a category placeholder.
-# lambda_extract_session.py now stamps `llm_provider`/`llm_model` (additive
-# top-level keys, added and checked against every extraction-JSON reader in
-# that module's own commit) into the extraction it writes. This function
-# still calls no LLM itself -- the values just ride in on the JSON this
-# module already reads, so no LLM_PROVIDER/LLM_TEMPERATURE env pairing is
-# needed on ItemWriterFunction (the invariant
-# test_the_temperature_knob_reaches_every_function_that_calls_an_llm stays
-# green because this function still carries neither). An OLDER extraction
-# written before this existed has neither key -- provider falls back to
-# 'unknown' (never a guessed vendor name; model stays None either way).
+# Ruling R15 (Track B Task 6a fix rounds 1-2): the plan wants the
+# extraction's ACTUAL LLM on the work_class decision record, not a category
+# placeholder. lambda_extract_session.py stamps `llm_provider`/`llm_model`
+# (additive top-level keys, checked against every extraction-JSON reader in
+# that module's own commit) into EVERY extraction artifact it writes --
+# both `extract_session` (live/final tiers) and `extract_group` (group
+# tier) go through that module's shared `_llm_identity` helper, so the two
+# writers cannot drift. This function still calls no LLM itself -- the
+# values just ride in on the JSON this module already reads, so no
+# LLM_PROVIDER/LLM_TEMPERATURE env pairing is needed on ItemWriterFunction
+# (the invariant test_the_temperature_knob_reaches_every_function_that_
+# calls_an_llm stays green because this function still carries neither).
+# An OLDER, already-deployed extraction may still have neither key --
+# provider falls back to 'unknown' (never a guessed vendor name; model
+# stays None either way). See write_extraction_items' own comment at the
+# read site for exactly which older artifacts that covers.
 _WORK_CLASS_PROVIDER_FALLBACK = "unknown"
 
 
@@ -974,11 +978,18 @@ def write_extraction_items(date, user_folder, extraction_key):
     extraction = json.loads(raw.decode("utf-8"))
 
     # Ruling R15: one extraction pass, one LLM call, so these are read ONCE
-    # here and reused for every topic's work_class record below. Absent on
-    # an extraction written before Ruling R15 landed -- fall back rather
-    # than guess a vendor (`llm_model` is already None-safe: a missing key
-    # and an extraction that genuinely couldn't name its model both read
-    # the same way).
+    # here and reused for every topic's work_class record below. BOTH
+    # writers of an extraction artifact -- extract_session (live/final
+    # tiers) and extract_group (group tier, fix round 2) -- stamp these
+    # unconditionally via the shared `_llm_identity` helper, so the fallback
+    # below is for an OLDER deployed artifact only: one written before
+    # Ruling R15 existed at all, or (group tier specifically) one written
+    # after R15 first landed but before fix round 2 added it to
+    # extract_group too -- a real gap, not a hypothetical one: fix round 1
+    # stamped only extract_session's output, so every group-tier extraction
+    # written in that window has neither key. `llm_model` is already
+    # None-safe on its own (a missing key and an extraction that genuinely
+    # couldn't name its model both read the same way).
     extraction_llm_provider = extraction.get("llm_provider") or _WORK_CLASS_PROVIDER_FALLBACK
     extraction_llm_model = extraction.get("llm_model")
 
