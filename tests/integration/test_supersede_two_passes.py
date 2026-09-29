@@ -234,6 +234,14 @@ def test_write_extraction_items_two_passes_leave_one_superseded_and_one_live(
     resolves without any repository function being stubbed out."""
     tag = uuid.uuid4().hex[:8]
     seed = get_connection(migrated_db_url, autocommit=True)
+    # Guard every value the `finally` cleanup needs against a failure before it is assigned
+    # -- this connection is autocommit, unlike every other test in this file (the `db`
+    # fixture rolls its writes back), so a leaked row here survives past this test and into
+    # every test that runs after it for the rest of the session. That is not hypothetical:
+    # this exact leak broke three unrelated integration tests' "empty DB" skip guards
+    # (test_topic_decisions_sql.py, test_topic_evidence_sql.py, test_speaker_employer_sql.py)
+    # by leaving a site/company behind for them to pick up instead of skipping.
+    co = site = user = extraction_key = None
     try:
         company_name = f"Writer3-Co-{tag}"
         co = companies.create_company(seed, company_name)
@@ -292,4 +300,39 @@ def test_write_extraction_items_two_passes_leave_one_superseded_and_one_live(
         assert [r["title"] for r in live_rows] == ["Pour B2 -- final pass"], (
             "the day's live read must show only the pass that replaced the other")
     finally:
+        # Captured BEFORE the deletes below, not re-derived afterwards: the topics/
+        # memberships proof needs the site's id to still mean something after the site row
+        # itself is gone, and a subquery through the (by-then-deleted) sites table would
+        # vacuously find nothing whether or not a leak actually happened.
+        co_id = co["id"] if co is not None else None
+        site_id = site["id"] if site is not None else None
+        user_id = user["id"] if user is not None else None
+
+        # sites.id -> topics.site_id and sites.id -> memberships.site_id are both
+        # ON DELETE CASCADE (0002_core_relational.sql, 0003_dashboard_readmodel.sql), and
+        # topics.id -> {action_items,findings,safety_observations,topic_photos,...} all
+        # CASCADE too -- deleting the site alone takes the whole tree this test grew. Users
+        # and the company have nothing else pointing at them once the site is gone.
+        if site_id is not None:
+            seed.execute("DELETE FROM sites WHERE id=%s", (site_id,))
+        if user_id is not None:
+            seed.execute("DELETE FROM users WHERE id=%s", (user_id,))
+        if co_id is not None:
+            seed.execute("DELETE FROM companies WHERE id=%s", (co_id,))
+
+        # Prove it, rather than assert it: nothing this test created is still reachable by
+        # any of the identifiers it used, through any of the tables it touched. Skipped only
+        # when nothing was ever created (co is None means creation itself failed before
+        # anything could leak).
+        if co_id is not None:
+            remaining = seed.execute(
+                "SELECT "
+                "(SELECT count(*) FROM companies WHERE id=%s), "
+                "(SELECT count(*) FROM sites WHERE id=%s), "
+                "(SELECT count(*) FROM users WHERE id=%s), "
+                "(SELECT count(*) FROM memberships WHERE site_id=%s), "
+                "(SELECT count(*) FROM topics WHERE site_id=%s)",
+                (co_id, site_id, user_id, site_id, site_id),
+            ).fetchone()
+            assert remaining == (0, 0, 0, 0, 0), f"leaked rows after cleanup: {remaining}"
         seed.close()

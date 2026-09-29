@@ -506,7 +506,7 @@ SITE_MATCH_CUTOFF = 0.6
 #           refresh about once a minute instead of nothing until the session ends.
 #   final — runs once the session closes, thinking ON, never throttled; it
 #           overwrites the live extraction at the same key, and item-writer's
-#           delete_topics_for_source + re-insert swaps the topics over.
+#           supersede_topics_for_source + re-insert swaps the topics over.
 #
 # Why the throttle matters even though LLM cost is not the constraint: a Lambda
 # occupies a full account concurrency slot for its whole wall-clock duration
@@ -1505,11 +1505,11 @@ def is_group_request(key):
 
 
 def merged_member_keys(artifact):
-    """Each member's OWN extraction key -- exactly what item-writer deletes.
+    """Each member's OWN extraction key -- exactly what item-writer supersedes.
 
-    Byte-identity matters: the delete is keyed on source_s3_key and
-    delete_topics_for_source returns a rowcount rather than raising, so a key
-    that differs by one character removes nothing and leaves the duplicate the
+    Byte-identity matters: the supersede is keyed on source_s3_key and
+    supersede_topics_for_source returns the retired rows rather than raising, so a
+    key that differs by one character retires nothing and leaves the duplicate the
     merge exists to eliminate.
 
     Each member uses its OWN date. A group can straddle NZ midnight, so members

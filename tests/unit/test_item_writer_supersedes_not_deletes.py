@@ -49,6 +49,13 @@ class _BareCur:
         return []
 
 
+#: What every real supersede_topics_for_source[_prefix] call's RETURNING clause answers with,
+#: in this file -- a single non-empty canned row, so a test can also assert on the return
+#: value (e.g. _supersede_member_topics flattening one row per member), not just the SQL
+#: text. Harmless to every other call that lands on _Cur.fetchall() (there is only the one).
+_RETURNING_ROW = {"id": "retired-stub", "title": "t", "summary": "s"}
+
+
 class _Cur:
     """conn.cursor(row_factory=...).execute(...) -> this -- the calling convention
     supersede_topics_for_source[_prefix]'s RETURNING clause uses (and, incidentally, the
@@ -64,7 +71,7 @@ class _Cur:
         return self
 
     def fetchall(self):
-        return []
+        return [dict(_RETURNING_ROW)]
 
     def fetchone(self):
         return None
@@ -157,14 +164,18 @@ def test_group_path_supersedes_member_keys_with_update_not_delete():
         ],
     }
 
-    iw._supersede_member_topics(conn, artifact, "group:2026-08-07T10:00:00Z",
-                                supersede=_real_supersede_topics_for_source)
+    retired = iw._supersede_member_topics(conn, artifact, "group:2026-08-07T10:00:00Z",
+                                          supersede=_real_supersede_topics_for_source)
 
     sql = _all_sql(conn)
     assert sql.count("UPDATE topics SET superseded_at") == len(artifact["mergedMembers"]), (
         "one real supersede call per member key"
     )
     assert "DELETE FROM topics" not in sql
+    # The real function's RETURNING rows (one per member here) must actually come back out
+    # of _supersede_member_topics -- Task 4 reads this list, and write_extraction_items'
+    # retired_topics accumulator is only as complete as this return value.
+    assert retired == [dict(_RETURNING_ROW)] * len(artifact["mergedMembers"])
 
 
 # ---------------------------------------------------------------------------

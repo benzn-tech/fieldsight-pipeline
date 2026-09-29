@@ -1710,6 +1710,11 @@ def programme_wired(wired):
     wired.setattr(org.programme_import, "record_version",
                   lambda conn, pid, **kw: store.record_version(conn, pid, **kw))
     fake.programme_store = store
+    # confirm_suggestion's Track B Task 3 check (a suggestion whose topic is superseded is
+    # treated like topic_id IS NULL) calls this for every suggestion whose topic_id is set --
+    # default it to "still live" so every OTHER confirm test here, which does not care about
+    # this check, is unaffected; a test that DOES care overrides it to return None.
+    wired.setattr(org.topics, "get_topic", lambda conn, topic_id: {"id": topic_id})
     return wired, fake
 
 
@@ -2701,6 +2706,45 @@ def test_confirm_retracted_topic_marks_stale_409(programme_wired):
         "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
     assert res["statusCode"] == 409
     assert staled == {"sid": "sugg-1"}
+    assert write_calls["n"] == 0
+    assert decide_calls["n"] == 0
+
+
+def test_confirm_superseded_topic_marks_stale_409(programme_wired):
+    """Track B Task 3, fix round 1: re-extraction now SUPERSEDES a topic instead of
+    deleting it, so `topic_id` stays set (this is the common case a re-extraction produces
+    -- unlike test_confirm_retracted_topic_marks_stale_409's topic_id=None, which is what an
+    actual physical delete still looks like). confirm must treat "topic_id set, but
+    topics.get_topic (a superseded row is invisible to it) returns None" exactly like the
+    NULL case: mark_stale, 409, and -- the part a naive fix could get wrong -- never reach
+    the programme task lookup/write."""
+    wired, fake = programme_wired
+    row = _suggestion_row(topic_id="topic-1")
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    # The superseded topic itself: get_topic (visible_topics_predicate underneath) must
+    # return None for it, same as for a topic that no longer exists at all.
+    wired.setattr(org.topics, "get_topic", lambda conn, topic_id: None)
+    staled = {}
+    wired.setattr(org.programme_suggestions, "mark_stale",
+                  lambda conn, sid: (staled.update(sid=sid) or {**row, "state": "stale"}))
+    task_lookups = {"n": 0}
+    wired.setattr(org.programme_tasks, "get_task_by_doc_id",
+                  lambda *a, **k: task_lookups.update(n=task_lookups["n"] + 1))
+    write_calls = {"n": 0}
+    wired.setattr(org.programme, "write_programme",
+                  lambda *a, **k: write_calls.update(n=write_calls["n"] + 1))
+    decide_calls = {"n": 0}
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda *a, **k: decide_calls.update(n=decide_calls["n"] + 1))
+
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
+
+    assert res["statusCode"] == 409
+    assert "superseded" in body_of(res).get("error", "").lower()
+    assert staled == {"sid": "sugg-1"}
+    assert task_lookups["n"] == 0, (
+        "must never reach the programme task lookup once the source topic is gone")
     assert write_calls["n"] == 0
     assert decide_calls["n"] == 0
 

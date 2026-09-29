@@ -6620,12 +6620,17 @@ def confirm_suggestion(conn, caller, suggestion_id, body):
         return error("already decided", 409)
     if str(row["site_id"]) not in _allowed_site_ids(conn, caller):
         return error("access denied to this site", 403)
-    if row["topic_id"] is None:
-        # Fable review IMPORTANT #5: the source topic was deleted/superseded
-        # (ON DELETE SET NULL — topics.py delete_topics_for_source[_prefix])
-        # before anyone reviewed this suggestion. Caught here, at confirm
-        # time, rather than proactively when the topic is superseded (see
-        # programme_suggestions.mark_stale docstring for why).
+    # Fable review IMPORTANT #5, extended for Track B Task 3: the source topic is gone from
+    # this suggestion's point of view either way -- `topic_id IS NULL` (ON DELETE SET NULL,
+    # a genuine physical delete via topics.delete_topics_for_source[_prefix]) or the id is
+    # still there but the row it names is superseded (Task 3: re-extraction marks a row
+    # instead of removing it, so `topic_id` stops going NULL for the common case -- the
+    # re-extraction that made THIS suggestion stale). `topics.get_topic` is the named lookup
+    # (deleted_predicates.visible_topics_predicate under it) rather than an inlined
+    # `superseded_at` check here, so this and every other topic-by-id lookup drift together
+    # or not at all. Caught here, at confirm time, rather than proactively when the topic is
+    # superseded (see programme_suggestions.mark_stale docstring for why).
+    if row["topic_id"] is None or topics.get_topic(conn, row["topic_id"]) is None:
         programme_suggestions.mark_stale(conn, suggestion_id)
         return error("source topic was superseded; re-review", 409)
 

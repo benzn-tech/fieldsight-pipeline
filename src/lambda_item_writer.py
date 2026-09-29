@@ -263,7 +263,7 @@ def _group_supersedes_solo(conn, session_base, extraction):
     return "suppress"
 
 
-def _supersede_member_topics(conn, artifact, run, supersede=None):
+def _supersede_member_topics(conn, artifact, run, supersede=None) -> list[dict]:
     """Retire each member's solo topics (Track B Task 3: supersede, not delete) so the
     merged set is the only LIVE record.
 
@@ -271,14 +271,22 @@ def _supersede_member_topics(conn, artifact, run, supersede=None):
     supersede_topics_for_source returns the rows it retired rather than raising, so a key
     that differs by one character (a date derived in UTC instead of NZ, say) retires nothing
     and leaves exactly the duplicate this whole feature exists to eliminate -- with no error
-    anywhere to notice."""
+    anywhere to notice.
+
+    Returns every retired row across every member, flattened -- write_extraction_items'
+    `retired_topics` accumulator is documented as covering "every supersede call below", and
+    this is one of them; Task 4 needs a member's retired rows the same way it needs the
+    idempotent-clear's."""
     supersede = supersede or topics.supersede_topics_for_source
+    all_retired = []
     for key in artifact.get("mergedMembers") or []:
         retired = supersede(conn, key, run)
+        all_retired.extend(retired)
         if not retired:
             logger.warning(
                 "group %s: %s superseded 0 topics -- that member's solo items will "
                 "now duplicate the merged record", artifact.get("groupId"), key)
+    return all_retired
 
 
 def _brings_new_content(solo, merged):
@@ -870,10 +878,11 @@ def write_extraction_items(date, user_folder, extraction_key):
     # extracted_at; a group pass carries its own).
     run = f"{extraction.get('tier')}:{extraction.get('extracted_at')}"
 
-    # Rows this invocation retires, across every supersede call below -- both the authority-
-    # flip branch (report_source_key) and this key's own idempotent clear write into it. Not
-    # consumed here; Task 4 reads it to carry stable ids and human edits from a retired row to
-    # the row that replaced it.
+    # Rows this invocation retires, across every supersede call below -- the authority-flip
+    # branch (report_source_key), this key's own idempotent clear, and (group tier) each
+    # member's own supersede via _supersede_member_topics all write into it. Not consumed
+    # here; Task 4 reads it to carry stable ids and human edits from a retired row to the
+    # row that replaced it.
     retired_topics = []
 
     with get_connection() as conn:
@@ -1038,7 +1047,7 @@ def write_extraction_items(date, user_folder, extraction_key):
         # know to look -- merge_result stays NULL (it is gated on topics_n
         # below), so the group reads as still-in-flight rather than as damage.
         if extraction.get("tier") == "group" and extraction.get("topics"):
-            _supersede_member_topics(conn, extraction, run)
+            retired_topics.extend(_supersede_member_topics(conn, extraction, run))
 
         # Task 3 (authority-flip plan) -- list the pictures prefix ONCE per
         # invocation (paginator, outside the per-topic loop below).

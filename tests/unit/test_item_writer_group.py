@@ -73,6 +73,40 @@ def test_every_member_key_is_superseded(monkeypatch):
     assert superseded == art["mergedMembers"]
 
 
+def test_retired_rows_across_members_are_flattened_and_returned():
+    """Task 4 needs a member's retired rows the same way it needs the idempotent-clear's --
+    the accumulator in write_extraction_items is documented as covering every supersede call,
+    and this is one of them. Two members, each retiring a DIFFERENT row, so a bug that only
+    kept the LAST member's rows (or dropped the return value entirely) would be caught."""
+    art = {"tier": "group", "groupId": GID,
+           "mergedMembers": [f"extractions/A/2026-08-07/sid{GID}.json",
+                             f"extractions/B/2026-08-08/sid{JOINER}.json"]}
+    by_key = {
+        art["mergedMembers"][0]: [{"id": "t-a1"}, {"id": "t-a2"}],
+        art["mergedMembers"][1]: [{"id": "t-b1"}],
+    }
+
+    retired = iw._supersede_member_topics(
+        object(), art, "run-1", supersede=lambda conn, k, run: by_key[k])
+
+    assert retired == [{"id": "t-a1"}, {"id": "t-a2"}, {"id": "t-b1"}]
+
+
+def test_write_extraction_items_extends_retired_topics_with_the_group_supersede():
+    """Source-position check (retired_topics is a local variable in write_extraction_items,
+    not part of its return value, so this is the seam Task 4 actually has to read from):
+    the group branch's call must be wrapped in `retired_topics.extend(...)`, not a bare call
+    whose return value is thrown away."""
+    import inspect
+    import lambda_item_writer as iw_mod
+    src = inspect.getsource(iw_mod.write_extraction_items)
+    line = next(l for l in src.splitlines() if "_supersede_member_topics(conn" in l)
+    assert line.strip().startswith("retired_topics.extend("), (
+        "the group supersede's retired rows must feed the same accumulator the "
+        "idempotent-clear and authority-flip supersedes do, or Task 4 only ever sees "
+        "two of the three sources -- got: " + line.strip())
+
+
 def test_a_supersede_that_retired_nothing_is_logged_loudly(monkeypatch, caplog):
     art = {"tier": "group", "groupId": GID,
            "mergedMembers": [f"extractions/A/2026-08-07/sid{GID}.json"]}
