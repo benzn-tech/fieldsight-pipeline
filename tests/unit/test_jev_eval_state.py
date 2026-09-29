@@ -363,12 +363,49 @@ def test_known_person_alias_still_masked_even_if_also_a_common_word():
     assert mapping == {"Mark": "PERSON_1"}
 
 
-def test_common_word_in_corpus_leaves_a_colliding_real_name_unmasked_residual():
-    # Accepted residual (documented in the module docstring and findings doc
-    # section 4): if the run's own corpus contains a common word that is also
-    # a real surname, that name is left unmasked.
+def test_common_name_word_in_corpus_no_longer_suppresses_masking_round_2():
+    # Fix round 2 (controller correction): round 1's accepted residual was
+    # that a corpus occurrence of "wood" suppressed masking of "Wood Ward"
+    # everywhere in the run. "wood" is a common given name/surname
+    # (`_COMMON_NAME_WORDS`), so it is now subtracted from the CORPUS-derived
+    # words before the gate is built -- a corpus recurrence of "wood" no
+    # longer protects "Wood Ward".
     text, mapping = mask_names("Wood Ward confirmed the delivery", [], common_words={"wood"})
-    assert text == "Wood Ward confirmed the delivery"
+    assert text == "PERSON_1 confirmed the delivery"
+    assert mapping == {"Wood Ward": "PERSON_1"}
+
+
+def test_common_name_words_from_the_ruling_are_masked_even_with_a_matching_corpus():
+    # Fix round 2's own measured probes: a real-shaped corpus containing
+    # "will", "price", "crane", "may", "june" must not suppress masking of a
+    # real name sharing one of those words.
+    common_words = {"will", "price", "crane", "may", "june"}
+    for text, expected_mapping in [
+        ("Will Chen confirmed", {"Will Chen": "PERSON_1"}),
+        ("John Price", {"John Price": "PERSON_1"}),
+        ("Hector Crane", {"Hector Crane": "PERSON_1"}),
+        ("May Chen confirmed", {"May Chen": "PERSON_1"}),
+        ("June Wilson", {"June Wilson": "PERSON_1"}),
+    ]:
+        masked, mapping = mask_names(text, [], common_words=common_words)
+        assert mapping == expected_mapping, text
+        assert "PERSON_1" in masked
+
+    # The same corpus must still leave a genuine heading protected.
+    masked, mapping = mask_names("Material Procurement", [], common_words=common_words)
+    assert masked == "Material Procurement"
+    assert mapping == {}
+
+
+def test_residual_new_shape_after_round_2_is_narrower_not_zero():
+    # New, narrower residual (round 2): a word that is NEITHER in the fixed
+    # heading list NOR in `_COMMON_NAME_WORDS`, but has a genuine
+    # literal-lowercase occurrence elsewhere in the run's own text, can still
+    # suppress the generic pass -- e.g. "hub" (a business-name word, not a
+    # common given name/surname) protects "Roofing Hub", and the same
+    # mechanism would also protect an unlucky real "Cody Hub".
+    text, mapping = mask_names("Cody Hub confirmed the delivery", [], common_words={"hub"})
+    assert text == "Cody Hub confirmed the delivery"
     assert mapping == {}
 
 
@@ -411,6 +448,40 @@ def test_extract_words_includes_a_token_with_a_genuine_lowercase_occurrence():
 
     words2 = extract_words({"summary": "material handling was slow today."})
     assert "material" in words2
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2 (controller correction, 2026-09-29): a contraction fragment
+# must never enter the corpus. The bare `[A-Za-z]+` word regex split "don't"
+# into "don" and "t"; "don" (a real given name -- see `_COMMON_NAME_WORDS`)
+# then entered the corpus and would have unmasked a genuine "Don Smith".
+# ---------------------------------------------------------------------------
+
+def test_extract_words_drops_a_contraction_fragment():
+    words = extract_words({"summary": "don't forget the delivery"})
+    assert "don" not in words
+    assert "t" not in words
+
+
+def test_common_word_gate_a_corpus_of_only_a_contraction_does_not_unmask_don_smith():
+    common_words = extract_words({"summary": "don't forget the delivery"})
+    text, mapping = mask_names("Don Smith confirmed", [], common_words=common_words)
+    assert text == "PERSON_1 confirmed"
+    assert mapping == {"Don Smith": "PERSON_1"}
+
+
+@pytest.mark.parametrize("sentence,fragment", [
+    ("we're on site", "re"),
+    ("we'll call back", "ll"),
+    ("we've confirmed", "ve"),
+    ("it's delayed", "s"),
+    ("we'd prefer Thursday", "d"),
+])
+def test_extract_words_drops_other_contraction_shapes(sentence, fragment):
+    words = extract_words({"summary": sentence})
+    assert fragment not in words
+    assert "we" not in words
+    assert "it" not in words
 
 
 def test_common_word_gate_still_masks_a_name_seen_only_capitalised_in_the_corpus():

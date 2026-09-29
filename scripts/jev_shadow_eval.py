@@ -260,21 +260,35 @@ def check_preconditions(sets: list, arms: list, dry_run: bool) -> dict:
 # State + donor building -- pure except for the state-builder's own guards.
 # ---------------------------------------------------------------------------
 
-def collect_common_words(sets: list, args) -> set:
+def collect_common_words(sets: list = None, args=None) -> set:
     """Fix wave 6: the `common_words` corpus gate for the generic name pass
-    (see `scripts/jev_eval/state.py`), computed ONCE per run across every
-    selected set's rows, before any state is built -- so broad, decomposed
-    and control states all see the identical gate. Built from the lowercase
+    (see `scripts/jev_eval/state.py`), computed ONCE per run -- so broad,
+    decomposed and control states all see the identical gate. Built from
     words in each row's own ALLOWLISTED text (`build_raw_allowed` applies the
     exact same field allowlist `build_state` does), never from anything
     outside it. Not persisted anywhere -- recomputed fresh on every
-    invocation, including `--dry-run`."""
+    invocation, including `--dry-run`.
+
+    Fix round 2 (controller ruling, minor): this ALWAYS reads the FULL rows
+    of every set present under `FIXTURES_DIR` -- `--set` and `--limit` are
+    IGNORED here on purpose, so a `--dry-run --limit 5` preview masks
+    exactly the same way the full run would (a smaller corpus computed only
+    from the first 5 rows would recover fewer headings than the real run
+    ever will, making the preview a pessimistic, misleading rehearsal of
+    what actually gets sent). The `sets`/`args` parameters are accepted for
+    call-site compatibility but no longer consulted; a set with no fixture
+    file on disk simply contributes nothing (unlike `load_rows`, this never
+    raises `RunnerRefusal` -- a corpus-building pass should not block on a
+    set the caller never asked to run)."""
     words: set = set()
-    for set_name in sets:
-        rows = load_rows(set_name)
-        if args.limit:
-            rows = rows[: args.limit]
-        for row in rows:
+    for set_name in SETS:
+        path = FIXTURES_DIR / f"{set_name}.jsonl"
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
             allowed = build_raw_allowed(set_name, row.get("features") or {})
             words |= extract_words(allowed)
     return words
@@ -694,7 +708,7 @@ def _run_dry_run(sets: list, arms: list, args) -> int:
     n_entries = 0
     max_size = 0
     masking_stats_by_set: dict = {}
-    common_words = collect_common_words(sets, args)
+    common_words = collect_common_words()
     with open(preview_path, "w", encoding="utf-8") as fh:
         for set_name in sets:
             rows = load_rows(set_name)
@@ -765,7 +779,7 @@ def _run_live(sets: list, arms: list, args) -> int:
         jev_route, jev_provider, jev_model = _resolve_jev_stamps()
 
     per_set_state = {}
-    common_words = collect_common_words(sets, args)
+    common_words = collect_common_words()
 
     for set_name in sets:
         rows = load_rows(set_name)
