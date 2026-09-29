@@ -37,12 +37,12 @@
     "exported_at": "2026-09-28T21:14:28.080237+00:00",
     "label_source_breakdown": {
       "db": 23,
-      "owner": 80
+      "owner": 89
     },
-    "n": 103,
-    "negatives": 21,
+    "n": 112,
+    "negatives": 34,
     "owner_rows_dropped_deleted": 0,
     "owner_rows_dropped_no_topic_ids": 0,
-    "positives": 82
+    "positives": 78
   }
 }
