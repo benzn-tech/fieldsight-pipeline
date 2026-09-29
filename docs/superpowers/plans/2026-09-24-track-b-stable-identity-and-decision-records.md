@@ -11,6 +11,7 @@
 **Spec:** `docs/superpowers/specs/2026-09-24-event-graph-and-jev-assessment.md` §2.1, §2.2, §6.
 
 **Owner decisions already taken (2026-09-24):** the event is the item row (finding / action item / decision / question), the topic is its container; Track B runs in parallel with Track A and does not wait for it.
+**Added 2026-09-29 (brainstorm round two):** reserve `audience` on every item table and `kind` + `payload` on findings now, so the subcontractor and developer segments are later migrations that add CHECK values, not re-keys. Field definitions for the new kinds are deliberately not in this plan.
 
 ## Global Constraints
 
@@ -48,6 +49,22 @@ ALTER TABLE findings     ADD COLUMN IF NOT EXISTS carried_from uuid;
 CREATE INDEX IF NOT EXISTS idx_action_items_stable ON action_items (stable_id);
 CREATE INDEX IF NOT EXISTS idx_findings_stable     ON findings (stable_id);
 
+-- Room reserved on 2026-09-29 for the two customer segments (brainstorm round two), so the
+-- segment work is a later migration ADDING CHECK values and payload keys, not re-keying rows.
+-- `audience`: what may leave the company. 'internal' is the default and the only value any
+-- writer sets today; 'owner' is set by a person (site manager) before an owner-facing
+-- publish, never by the extractor alone. On every item table, because publishing is per item.
+-- `kind` on findings: an observation today; 'instruction_received' / 'daywork_record' /
+-- 'delay_event' are the subcontractor segment's event types, whose fields are NOT fixed yet
+-- (they wait on the owner's phone calls) and will live in `payload` when they are.
+ALTER TABLE findings     ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'observation'
+    CHECK (kind IN ('observation','instruction_received','daywork_record','delay_event'));
+ALTER TABLE findings     ADD COLUMN IF NOT EXISTS payload jsonb;
+ALTER TABLE findings     ADD COLUMN IF NOT EXISTS audience text NOT NULL DEFAULT 'internal'
+    CHECK (audience IN ('internal','owner'));
+ALTER TABLE action_items ADD COLUMN IF NOT EXISTS audience text NOT NULL DEFAULT 'internal'
+    CHECK (audience IN ('internal','owner'));
+
 -- Decisions and questions become rows. Mirrors 0010 (site_id denormalised, CASCADE on both FKs).
 -- These tables were declined on 2026-09-07 because ids churned; supersession is what makes them viable.
 CREATE TABLE IF NOT EXISTS topic_decisions (
@@ -59,6 +76,7 @@ CREATE TABLE IF NOT EXISTS topic_decisions (
   decision    text NOT NULL,
   rationale   text,
   decided_by  text,
+  audience    text NOT NULL DEFAULT 'internal' CHECK (audience IN ('internal','owner')),
   created_at  timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_topic_decisions_topic ON topic_decisions (topic_id);
@@ -72,6 +90,7 @@ CREATE TABLE IF NOT EXISTS topic_questions (
   status      text NOT NULL DEFAULT 'open' CHECK (status IN ('open','answered','dropped')),
   answered_by uuid REFERENCES users(id),
   answered_at timestamptz,
+  audience    text NOT NULL DEFAULT 'internal' CHECK (audience IN ('internal','owner')),
   created_at  timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_topic_questions_topic ON topic_questions (topic_id);
@@ -104,7 +123,7 @@ CREATE INDEX IF NOT EXISTS idx_decision_records_subject ON decision_records (sub
 CREATE INDEX IF NOT EXISTS idx_decision_records_kind_time ON decision_records (company_id, kind, created_at DESC);
 ```
 
-- [ ] **Step 2: Shape test** (unit, SQL text): both new child tables carry `ON DELETE CASCADE` on `site_id` (the 2026-09-07 review found a draft that dropped it); `stable_id` columns are `NOT NULL DEFAULT gen_random_uuid()`; the live-source index is partial on `superseded_at IS NULL`.
+- [ ] **Step 2: Shape test** (unit, SQL text): both new child tables carry `ON DELETE CASCADE` on `site_id` (the 2026-09-07 review found a draft that dropped it); `stable_id` columns are `NOT NULL DEFAULT gen_random_uuid()`; the live-source index is partial on `superseded_at IS NULL`; every item table has `audience` defaulting to `'internal'` with the two-value CHECK, and `findings.kind` defaults to `'observation'`.
 - [ ] **Step 3: Integration test** (real Postgres via `migrated_db_url`): insert a topic + action item, `UPDATE topics SET superseded_at=now()`, assert the child row still exists and its `stable_id` is unchanged; delete the topic, assert CASCADE removed the child and the decision_records row survives (it is not FK-bound to the child, by design — the record outlives the row it judged).
 
 ---
@@ -152,7 +171,7 @@ CREATE INDEX IF NOT EXISTS idx_decision_records_kind_time ON decision_records (c
 - `carry_forward.match(old: list[Item], new: list[Item], *, fuzzy_floor=0.90, tie_margin=0.05) -> (pairs: list[(old_id, new_id, how)], orphans: list[old_id])` where `Item = {id, stable_id, text, human_touched: bool}`.
 
 - [ ] **Step 1: The matcher.** Normalise with `content_hash.normalize` (same function `compliance_resolutions` keys on, so the two notions of "same text" cannot drift). Pass 1: exact `content_hash` equality, one-to-one. Pass 2: for the remaining, `difflib.SequenceMatcher(None, a, b).ratio()` on the normalised strings; accept the best pair only if `ratio ≥ 0.90` **and** the runner-up for either side is more than `tie_margin` lower. CJK: strip whitespace inside CJK runs before comparing, exactly as `evidence_match` does — a bilingual product biases the floor otherwise. Everything else is an orphan.
-- [ ] **Step 2: Apply in the writer.** Before the supersede (Task 3 Step 1 returns the old topic rows), load their children with `human_touched = (updated_by IS NOT NULL OR status <> 'open')` for action items and `(status <> 'open')` for findings; after the inserts, run `match` per child table, then `UPDATE <table> SET stable_id = old.stable_id, carried_from = old.id` on each pair, and for action items where the old row was human-touched also copy `status, priority, deadline, deadline_text, responsible, updated_by, updated_at`. Findings: copy `status` only; impact columns are re-derived by the matcher and must not be copied.
+- [ ] **Step 2: Apply in the writer.** Before the supersede (Task 3 Step 1 returns the old topic rows), load their children with `human_touched = (updated_by IS NOT NULL OR status <> 'open')` for action items and `(status <> 'open')` for findings; after the inserts, run `match` per child table, then `UPDATE <table> SET stable_id = old.stable_id, carried_from = old.id` on each pair, and for action items where the old row was human-touched also copy `status, priority, deadline, deadline_text, responsible, updated_by, updated_at`. Findings: copy `status` and `audience` (both human-set); `kind` and `payload` come from the new extraction, never from the old row; impact columns are re-derived by the matcher and must not be copied. Action items, decisions, questions: `audience` is carried like `status`.
 - [ ] **Step 3: Orphans a human touched** are counted and logged as `carry_forward: %d human-touched rows had no successor (key=%s)`, and emitted as a CloudWatch metric `OrphanedHumanEdits` through the same `put_metric_data` path `lambda_extraction_backlog` uses. They remain readable on the superseded topic; a later UI change can list them ("this item you ticked did not appear in the final extraction"). This replaces `_warn_if_discarding_checkoffs` and its test — rewrite `tests/unit/test_supersession_reports_lost_checkoffs.py` to assert the new behaviour and rename it.
 - [ ] **Step 4: Unit tests, replaying real shapes** (take the strings from a real TEST extraction pair, names masked): identical text → exact pair; "Check the scaffolding before Monday" vs "Scaffolding to be checked before Monday" → fuzzy pair (record the actual ratio in the test); two new items both ≥0.90 against one old → orphan, not a guess; an untouched orphan is silent, a touched orphan is counted; CJK pair with different spacing → exact after normalisation.
 - [ ] **Step 5: Integration test** (the defect itself): insert live pass, PATCH the action item `status='done', updated_by=<user>`, run the writer with a final pass whose text is reworded within the floor, assert the new row has the old `stable_id` and `status='done'`.
@@ -219,7 +238,8 @@ CREATE INDEX IF NOT EXISTS idx_decision_records_kind_time ON decision_records (c
 3. `decision_records` contains rejected verdicts, not only accepted ones, and confirm/reject stamps them.
 4. No read path returns a superseded topic (integration test + a search on the test day).
 5. Track A's export (its Task 1) can be re-pointed at `decision_records.list_for_eval` — that is the hand-off between the two tracks.
+6. A finding whose `audience` a site manager set to `'owner'` keeps that value across its session's final pass (the owner-publish path in a later track depends on it).
 
 ## Out of scope
 
-`event_links` (edges), `claim_type`, `location`/`tags` tables, the Procore push, switching the org-api payload to the new decision/question rows, and any change to matcher thresholds — all Track C, after Track A's findings are read.
+The fields inside `findings.payload` for the three subcontractor event types, the owner-publish endpoint that flips `audience`, and the contract clock (`contract_clock.py`) — all wait on the owner's phone calls (brainstorm round two §6). `event_links` (edges), `claim_type`, `location`/`tags` tables, the Procore push, switching the org-api payload to the new decision/question rows, and any change to matcher thresholds — all Track C, after Track A's findings are read.
