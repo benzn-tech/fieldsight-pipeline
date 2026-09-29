@@ -143,7 +143,12 @@ from scripts.jev_eval.questions import (
     JevQuestionsError,
     question_hash,
 )
-from scripts.jev_eval.state import JevStateError, build_state
+from scripts.jev_eval.state import (
+    JevStateError,
+    build_raw_allowed,
+    build_state,
+    extract_words,
+)
 
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "jev_eval"
 RESULTS_DIR = FIXTURES_DIR / "results"
@@ -255,7 +260,41 @@ def check_preconditions(sets: list, arms: list, dry_run: bool) -> dict:
 # State + donor building -- pure except for the state-builder's own guards.
 # ---------------------------------------------------------------------------
 
-def _build_states(set_name: str, rows: list, aliases: list) -> dict:
+def collect_common_words(sets: list = None, args=None) -> set:
+    """Fix wave 6: the `common_words` corpus gate for the generic name pass
+    (see `scripts/jev_eval/state.py`), computed ONCE per run -- so broad,
+    decomposed and control states all see the identical gate. Built from
+    words in each row's own ALLOWLISTED text (`build_raw_allowed` applies the
+    exact same field allowlist `build_state` does), never from anything
+    outside it. Not persisted anywhere -- recomputed fresh on every
+    invocation, including `--dry-run`.
+
+    Fix round 2 (controller ruling, minor): this ALWAYS reads the FULL rows
+    of every set present under `FIXTURES_DIR` -- `--set` and `--limit` are
+    IGNORED here on purpose, so a `--dry-run --limit 5` preview masks
+    exactly the same way the full run would (a smaller corpus computed only
+    from the first 5 rows would recover fewer headings than the real run
+    ever will, making the preview a pessimistic, misleading rehearsal of
+    what actually gets sent). The `sets`/`args` parameters are accepted for
+    call-site compatibility but no longer consulted; a set with no fixture
+    file on disk simply contributes nothing (unlike `load_rows`, this never
+    raises `RunnerRefusal` -- a corpus-building pass should not block on a
+    set the caller never asked to run)."""
+    words: set = set()
+    for set_name in SETS:
+        path = FIXTURES_DIR / f"{set_name}.jsonl"
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            allowed = build_raw_allowed(set_name, row.get("features") or {})
+            words |= extract_words(allowed)
+    return words
+
+
+def _build_states(set_name: str, rows: list, aliases: list, common_words: set | None = None) -> dict:
     """`id -> {"state", "site_id", "company_id"}`. Every row's masked state
     is built exactly once here, shared by the broad/decomposed arms and used
     as the input to `control()` for the control arms (ruling #5). Lets
@@ -264,7 +303,7 @@ def _build_states(set_name: str, rows: list, aliases: list) -> dict:
     swallow and continue past."""
     out = {}
     for row in rows:
-        state = build_state(set_name, row.get("features") or {}, aliases)
+        state = build_state(set_name, row.get("features") or {}, aliases, common_words)
         out[row["id"]] = {
             "state": state,
             "site_id": row.get("site_id"),
@@ -669,13 +708,14 @@ def _run_dry_run(sets: list, arms: list, args) -> int:
     n_entries = 0
     max_size = 0
     masking_stats_by_set: dict = {}
+    common_words = collect_common_words()
     with open(preview_path, "w", encoding="utf-8") as fh:
         for set_name in sets:
             rows = load_rows(set_name)
             if args.limit:
                 rows = rows[: args.limit]
             aliases = load_aliases()
-            states_by_id = _build_states(set_name, rows, aliases)
+            states_by_id = _build_states(set_name, rows, aliases, common_words)
             masking_stats_by_set[set_name] = _masking_stats(set_name, states_by_id)
 
             control_states, control_errors = {}, {}
@@ -739,13 +779,14 @@ def _run_live(sets: list, arms: list, args) -> int:
         jev_route, jev_provider, jev_model = _resolve_jev_stamps()
 
     per_set_state = {}
+    common_words = collect_common_words()
 
     for set_name in sets:
         rows = load_rows(set_name)
         if args.limit:
             rows = rows[: args.limit]
         aliases = load_aliases()
-        states_by_id = _build_states(set_name, rows, aliases)
+        states_by_id = _build_states(set_name, rows, aliases, common_words)
 
         control_states, control_errors = {}, {}
         if any(arm in ("control_broad", "control_decomposed") for arm in arms):

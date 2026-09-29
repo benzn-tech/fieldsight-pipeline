@@ -429,6 +429,90 @@ known, unfixed gap in the masking coverage, not a defect introduced by this eval
 whatever text is exported for any set. Recorded here so it is not silently rediscovered during
 the disagreement read (Section 6).
 
+**Fix wave 6 (2026-09-29) — common-word gate on the generic pass:** measured on the real
+exported data, the generic pass was masking almost every title-case topic heading it saw
+("Material Procurement" x11, "Scaffolding Safety" x9, "Slab Rebar" x7, "Concrete Testing",
+"Device Testing", "Route Planning", "Subcontractor Access", "Crane Restrictions", "Design
+Issues", "Electrical Cables", "Weekly Schedule", "Recording Device", "General Reflection",
+"Anything Else", ...), while correctly catching real names of the same shape ("Hector Eggar",
+"Paul Smith", "Liang Min", "Yang Ming"). A generic candidate is now masked only if NEITHER
+token is a known common word: a built-in module constant covering the words above, or a
+per-run corpus the runner (`scripts/jev_shadow_eval.py collect_common_words`) derives once from
+every selected row's own allowlisted title/summary text, before any state is built — shared
+uniformly by broad, decomposed, control and `--dry-run`. Known person aliases are unaffected: a
+known alias is always masked even if it is also a common word.
+
+**Fix round 1 (2026-09-29, controller correction) — the corpus must count a LITERAL lowercase
+occurrence, not any occurrence lowercased on the way in.** The first version of `extract_words`
+lowercased every token regardless of its original casing, so a name mentioned several times but
+always capitalised (e.g. "Hector Eggar") still entered the corpus as "hector"/"eggar" and was
+treated as common — measured on the real data, this suppressed essentially every generic-pass
+mask, including the real names the pass exists to catch (181 masks before the fix, 0 remaining
+after the flawed first version — a privacy regression, not an improvement). `extract_words` now
+adds a word to the corpus only if it occurs somewhere in the text already written all-lowercase
+(`str.islower()`); a token seen only Capitalised or ALL-CAPS contributes nothing. Re-measured on
+`scripts/fixtures/jev_eval/{threads,work_class}.jsonl` (189 rows, 447 texts) with the corrected
+rule: **64 generic-pass masks remain** (down from the 181-mask baseline with no common-word gate
+at all). All five names the owner asked to confirm are masked: Hector Eggar (x4), Hector Egan
+(x2), Paul Smith (x4), Liang Min (x3), Yang Ming (x2). The top of the remaining list is a mix of
+plausible names/proper nouns ("Southern Lakes" x4, "Cook Brothers" x4, "Deon Jay's" x3, "Roofing
+Hub" x3, "Lake Bradford" x2, "Houses Lotto" x2, "Food Prices" x2, "Zealand Politics" x2, "Mount
+Roskill", "Shortland Street", "Real Estate", "Press Conference", ...) rather than construction
+topic headings — i.e. the fix now targets headings specifically and leaves plausible names (and
+some ambiguous proper-noun phrases like show/place names) masked, which is the intended trade.
+**Accepted residual, unchanged in shape by this correction:** if a word already has a genuine
+lowercase occurrence elsewhere in the run's own text and is also a real surname (the module
+docstring's "Wood Ward" example), that name is left unmasked — this is now a much narrower gap
+than the flawed first version's near-total one, but it is not zero. See the module docstring for
+the exact rule and `extract_words`'s own docstring for the corrected mechanism.
+
+**Fix round 2 (2026-09-29, controller correction) — the corpus must never vouch for a word that
+is also a common name; contraction fragments must never enter the corpus either.** An independent
+review found round 1's residual larger than intended: a corpus word that was ALSO a common NZ/AU
+given name or surname (e.g. "wood", "price", "crane", "will", "may") could still suppress masking
+of that same word used as a real name elsewhere — round 1 only checked HOW a word was written
+(literal lowercase occurrence), never WHAT KIND of word it was. Two fixes:
+- `_COMMON_NAME_WORDS` — a fixed module constant (superset of `_COMMON_WORD_ALIASES`, plus common
+  NZ/AU given names/surnames that double as ordinary words: will, may, mark, grant, bill, rose,
+  june, april, august, jack, pat, sue, drew, dawn, hope, joy, faith, ray, frank, rich, don, jesse,
+  young, brown, black, white, green, king, hill, hall, bell, cook, wood, park, long, price, day,
+  short, field, fields, glass, steel, case, crane, ward, stone, lane, page, fox, wolf, lee, ng,
+  chan) — is now subtracted from the CORPUS-DERIVED words only, before they are unioned with
+  `_BUILT_IN_COMMON_WORDS`. The fixed heading list itself is untouched, EXCEPT that "crane" was
+  removed from it (it doubled as a surname and, unlike a corpus word, could never be excluded for
+  a specific run); "Crane Restrictions" stays protected regardless because "restrictions" alone
+  is already enough to protect a two-token candidate.
+- `extract_words` now recognises a contraction ("don't", "we're", "Jay's", ...) as ONE token
+  including its apostrophe suffix and drops it entirely, rather than letting the bare
+  `[A-Za-z]+` word regex split "don't" into "don" and "t" — "don" is itself in
+  `_COMMON_NAME_WORDS`, so an ordinary contraction anywhere in the corpus text used to be able to
+  suppress masking of a real "Don Smith".
+
+**Re-measured on the real data** (`scripts/fixtures/jev_eval/{threads,work_class}.jsonl`, same
+189 rows / 447 texts): **71 generic-pass masks remain** (up from round 1's 64, since the
+name-word exclusion correctly re-masks phrases round 1 had wrongly protected: "Wood Ties" (x3),
+"Golf Day" (x2), "Balustrade Glass" (x1), "Pegasus Steel" (x1) — 7 occurrences across 4 phrases,
+matching the reviewer's own ~6-occurrence estimate). All five names checked in round 1 remain
+masked (Hector Eggar x4, Hector Egan x2, Paul Smith x4, Liang Min x3, Yang Ming x2), and the
+round-2 probe names hold too: no masked phrase in the real data has "Jesse", "Will", "Price" or
+"Crane" as the token that WOULD have been wrongly protected — "Jesse Workflow" and "Crane
+Restrictions" both remain unmasked, but correctly so (protected via "workflow"/"restrictions",
+the OTHER token in each pair, not via "Jesse"/"Crane"), so neither is evidence the name-word gate
+would fail if such a pairing existed. "Material Procurement" and the other topic headings from
+fix wave 6 stay kept.
+
+**Residual wording correction (per controller ruling): round 1's "a little under-masking of
+names that collide with a common word" was NOT an accurate description for name-shaped common
+words** — under round 1, ANY corpus recurrence of a name-shaped common word suppressed masking of
+that name EVERYWHERE in the run, which is not "a little." After round 2, the residual is
+narrower and specific: a word can still enter the corpus (and suppress the generic pass) only if
+it is common, has a genuine literal-lowercase occurrence elsewhere in the run's text, AND is
+NEITHER in `_BUILT_IN_COMMON_WORDS` NOR in `_COMMON_NAME_WORDS` — e.g. "hub" (not a common given
+name/surname) recurring lower-case would still protect an unlucky real "Cody Hub" the same way it
+protects "Roofing Hub". This is a materially smaller, rarer gap than round 1's, which is why it
+gets its own description rather than reusing round 1's phrasing. See the module docstring's
+round-2 correction for the exact rule.
+
 **New residual gap, introduced by the stoplist (I1.3):** a real person surnamed after one of the
 stoplist words (e.g. a person literally named "Roof") would not be masked by the generic pass —
 the stoplist cannot distinguish "Roof Jenkins, a person" from "Roof Framing, a task". This is the
