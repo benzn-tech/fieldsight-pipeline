@@ -676,3 +676,26 @@ Reading:
 - **programme_match — not measured** (0 labels).
 - **Track C:** on this evidence Jev does not become the decision centre; if used at all, it is a pluggable
   extra signal behind `decision_records`, starting with work_class privacy.
+
+### Follow-up list (owner, 2026-09-29) — not started
+
+1. **Fix the work_class classifier's missed private conversations.** The deployed classifier
+   (`lambda_extract_session.py` rule 2b) found 55% of owner-marked private talk. **Blocked on cleaner
+   data — do not start with today's labels.** Today's set is too narrow to support a prompt change that
+   reaches every customer: most rows come from the owner's own mixed-use accounts (self-testing and several
+   sites on one account, §3a). Before starting:
+   - labels from recorders who use their account for one job only, across at least three users and three
+     sites, not only the owner's accounts;
+   - at least 30 private and 30 not-private rows under the three-way definition used here (A this site's
+     work / B other work / C private), labelled with the date visible;
+   - a fresh baseline measurement of the current rule 2b on that set, run twice (noise floor) before any
+     prompt edit.
+   Then: change the rule (first suspect: "when unsure, choose work"), re-measure on the same rows, and ship
+   only if private recall rises without work rows being flagged private (the owner's reports must not lose
+   real work). The prompt change reaches prod through `main`, so the owner approves it.
+2. **Account hygiene for thread matching.** One account used across tests and several sites breaks
+   threading more than any model (§3a, §5). Worth a product rule or a warning before any further threads
+   work.
+3. **If Jev is ever re-evaluated** for work_class privacy, it needs a new pre-registration with a control
+   built for "private" (a donor work title, not a neutral sentence) and enough accepted rows for the
+   Clopper–Pearson floor.
