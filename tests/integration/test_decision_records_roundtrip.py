@@ -37,8 +37,9 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from db.connection import get_connection
-from repositories import (companies, decision_records, findings, programme_tasks,
-                          redactions, sites, threads, topics, users)
+from repositories import (action_items, companies, decision_records, findings,
+                          programme_tasks, redactions, sites, threads, topic_decisions,
+                          topic_questions, topics, users)
 
 pytestmark = pytest.mark.integration
 
@@ -536,6 +537,54 @@ def test_reject_suggestion_stamps_the_verdict_the_matcher_wrote(db):
     assert after[1] == caller_user["id"]
 
 
+def test_stamp_decision_real_fk_violation_does_not_lose_the_confirm(db, monkeypatch):
+    """R10/R14 posture, proven against a REAL Postgres failure rather than a
+    monkeypatched raise (mirrors 6a's test_verdict_insert_failure_does_not_lose_the_
+    suggestion_row, one level up the call stack): `decision_records.human_actor`
+    REFERENCES users(id), so an actor uuid that does not name a real user makes
+    set_human_outcome's UPDATE raise psycopg's own ForeignKeyViolation -- confirm_
+    suggestion's decide() and task write must still be in effect afterward.
+
+    `write_programme` is already monkeypatched here to skip the real S3 call (as in
+    every other confirm_suggestion seam test in this file); this one ALSO uses it as
+    the injection point -- it runs after decide() and the task write have both
+    already executed but strictly before _stamp_decision, so mutating `caller["id"]`
+    there (read fresh from the dict at call time) is what makes ONLY the stamp's
+    `actor` argument a nonexistent user, without touching decide()'s own
+    `decided_by`, which already committed with the real one."""
+    tag = uuid.uuid4().hex[:8]
+    co, site = _seed_company_site(db, tag)
+    caller_user = _seed_admin(db, co, tag)
+    _topic, task, suggestion_id, verdict_row = _seed_suggestion(db, co, site, caller_user, tag)
+    caller = {"id": caller_user["id"], "company_id": co["id"], "global_role": "admin"}
+
+    def fake_write_programme(s3c, bucket, site_id, doc_, updated_at):
+        caller["id"] = uuid.uuid4()  # a real UUID, naming no real user row
+        return doc_
+    monkeypatch.setattr(lambda_org_api.programme, "write_programme", fake_write_programme)
+
+    result = lambda_org_api.confirm_suggestion(db, caller, suggestion_id, {})
+    assert result["statusCode"] == 200
+
+    suggestion_row = db.execute(
+        "SELECT state, decided_by FROM programme_progress_suggestions WHERE id=%s",
+        (suggestion_id,)).fetchone()
+    assert suggestion_row[0] == "confirmed"
+    assert suggestion_row[1] == caller_user["id"], (
+        "decide() ran BEFORE the mutation and must keep the real user")
+
+    task_row = db.execute(
+        "SELECT status, progress_pct FROM programme_tasks WHERE id=%s", (task["id"],)).fetchone()
+    assert task_row[0] == "completed"
+    assert task_row[1] == 100
+
+    after = db.execute(
+        "SELECT human_outcome, human_actor FROM decision_records WHERE id=%s",
+        (verdict_row["id"],)).fetchone()
+    assert after[0] is None, "the SAVEPOINT must have rolled back the failed stamp"
+    assert after[1] is None
+
+
 # ---------------------------------------------------------------------------
 # Task 6b seam: /threads/suggestions confirm + reject -- both branches of
 # `topic_thread_suggestions`'s `thread_id XOR parent_topic_id`.
@@ -782,6 +831,186 @@ def test_r7_orphaned_subject_resolves_to_no_topic_and_is_fail_closed_invisible(d
     since = datetime.now(timezone.utc) - timedelta(days=1)
     assert decision_records.list_for_eval(db, co["id"], "programme_match", since) == []
     # sanity: the row really was written, it just does not resolve to a topic.
+    stored = db.execute(
+        "SELECT id FROM decision_records WHERE id=%s", (row["id"],)).fetchone()
+    assert stored is not None
+
+
+# ---------------------------------------------------------------------------
+# Ruling R17 (fix round 1) -- a non-topic subject's stable_id is NOT unique.
+# Task 4's carry_forward moves a stable_id FORWARD onto a re-extraction's new
+# row while the OLD, now-superseded row keeps the SAME stable_id too -- one
+# stable_id, two rows, two different topics. `visible_decision_records_predicate`
+# must be EXISTS/NOT EXISTS over every carrier, never a scalar subquery that
+# assumes at most one row (that version raised CardinalityViolation on real
+# Postgres the first time any finding/action_item/decision/question was
+# carried forward).
+# ---------------------------------------------------------------------------
+
+def _supersede(db, topic_id):
+    db.execute("UPDATE topics SET superseded_at=now(), superseded_by_run='final:t2' "
+              "WHERE id=%s", (topic_id,))
+
+
+def _carry_forward_finding(db, site, tag):
+    prefix = f"extractions/R17f-{tag}/2026-09-30/"
+    key = prefix + f"sid{'1' * 32}.json"
+    old_topic = topics.upsert_topic(db, site["id"], "2026-09-29", "Old pass", source_s3_key=key)
+    findings.insert_findings(db, old_topic["id"], site["id"],
+                             [{"observation": "Steel delayed", "domain": "progress",
+                               "severity": "major", "entity": {}}])
+    _supersede(db, old_topic["id"])
+    new_topic = topics.upsert_topic(db, site["id"], "2026-09-30", "New pass", source_s3_key=key)
+    new_row = findings.insert_findings(db, new_topic["id"], site["id"],
+                                       [{"observation": "Steel delayed still", "domain": "progress",
+                                         "severity": "major", "entity": {}}])[0]
+    old_row = findings.list_for_carry_forward(db, [old_topic["id"]], site["id"])[0]
+    findings.carry_identity(db, new_row["id"], old_row)
+    stable_id = db.execute(
+        "SELECT stable_id FROM findings WHERE id=%s", (new_row["id"],)).fetchone()[0]
+    return stable_id, old_topic, new_topic, prefix
+
+
+def _carry_forward_action_item(db, site, tag):
+    prefix = f"extractions/R17a-{tag}/2026-09-30/"
+    key = prefix + f"sid{'2' * 32}.json"
+    old_topic = topics.upsert_topic(
+        db, site["id"], "2026-09-29", "Old pass", source_s3_key=key,
+        action_items=[{"text": "chase concrete supplier", "status": "open"}])
+    _supersede(db, old_topic["id"])
+    new_topic = topics.upsert_topic(
+        db, site["id"], "2026-09-30", "New pass", source_s3_key=key,
+        action_items=[{"text": "chase concrete supplier again", "status": "open"}])
+    new_row = action_items.list_for_carry_forward(db, [new_topic["id"]], site["id"])[0]
+    old_row = action_items.list_for_carry_forward(db, [old_topic["id"]], site["id"])[0]
+    action_items.carry_identity(db, new_row["id"], old_row)
+    stable_id = db.execute(
+        "SELECT stable_id FROM action_items WHERE id=%s", (new_row["id"],)).fetchone()[0]
+    return stable_id, old_topic, new_topic, prefix
+
+
+def _carry_forward_decision(db, site, tag):
+    prefix = f"extractions/R17d-{tag}/2026-09-30/"
+    key = prefix + f"sid{'3' * 32}.json"
+    old_topic = topics.upsert_topic(db, site["id"], "2026-09-29", "Old pass", source_s3_key=key)
+    topic_decisions.insert_decisions(db, old_topic["id"], site["id"],
+                                     [{"decision": "Use precast panels"}])
+    _supersede(db, old_topic["id"])
+    new_topic = topics.upsert_topic(db, site["id"], "2026-09-30", "New pass", source_s3_key=key)
+    new_row = topic_decisions.insert_decisions(db, new_topic["id"], site["id"],
+                                               [{"decision": "Use precast panels, confirmed"}])[0]
+    old_row = topic_decisions.list_for_carry_forward(db, [old_topic["id"]], site["id"])[0]
+    topic_decisions.carry_identity(db, new_row["id"], old_row)
+    stable_id = db.execute(
+        "SELECT stable_id FROM topic_decisions WHERE id=%s", (new_row["id"],)).fetchone()[0]
+    return stable_id, old_topic, new_topic, prefix
+
+
+def _carry_forward_question(db, site, tag):
+    prefix = f"extractions/R17q-{tag}/2026-09-30/"
+    key = prefix + f"sid{'4' * 32}.json"
+    old_topic = topics.upsert_topic(db, site["id"], "2026-09-29", "Old pass", source_s3_key=key)
+    topic_questions.insert_questions(db, old_topic["id"], site["id"],
+                                     [{"question": "Who owns the handover walkthrough?"}])
+    _supersede(db, old_topic["id"])
+    new_topic = topics.upsert_topic(db, site["id"], "2026-09-30", "New pass", source_s3_key=key)
+    new_row = topic_questions.insert_questions(
+        db, new_topic["id"], site["id"],
+        [{"question": "Who owns the handover walkthrough still?"}])[0]
+    old_row = topic_questions.list_for_carry_forward(db, [old_topic["id"]], site["id"])[0]
+    topic_questions.carry_identity(db, new_row["id"], old_row)
+    stable_id = db.execute(
+        "SELECT stable_id FROM topic_questions WHERE id=%s", (new_row["id"],)).fetchone()[0]
+    return stable_id, old_topic, new_topic, prefix
+
+
+_CARRY_FORWARD_SEEDS = [
+    pytest.param(_carry_forward_finding, "finding", id="finding"),
+    pytest.param(_carry_forward_action_item, "action_item", id="action_item"),
+    pytest.param(_carry_forward_decision, "decision", id="decision"),
+    pytest.param(_carry_forward_question, "question", id="question"),
+]
+
+
+@pytest.mark.parametrize("seed_fn,subject_type", _CARRY_FORWARD_SEEDS)
+def test_r17_carried_forward_pair_visible_when_neither_topic_deleted(db, seed_fn, subject_type):
+    """The reproduction: BEFORE R17, this alone raised CardinalityViolation out of
+    list_for_eval -- two rows (old superseded + new live) sharing one stable_id hit
+    the scalar subquery `(SELECT ... WHERE stable_id = ...)` the first version used."""
+    tag = uuid.uuid4().hex[:8]
+    co, site = _seed_company_site(db, tag)
+    stable_id, _old_topic, _new_topic, _prefix = seed_fn(db, site, tag)
+    row = decision_records.insert(
+        db, company_id=co["id"], site_id=site["id"], kind="programme_impact",
+        subject_type=subject_type, subject_stable_id=stable_id, object_ref="T-1",
+        provider="anthropic", model=None, model_version=None, question_set=None,
+        input_key=None, input_hash=None, output={}, score=0.9, threshold=0.7,
+        auto_outcome="accepted")
+    since = datetime.now(timezone.utc) - timedelta(days=1)
+    assert [r["id"] for r in decision_records.list_for_eval(
+        db, co["id"], "programme_impact", since)] == [row["id"]]
+
+
+@pytest.mark.parametrize("seed_fn,subject_type", _CARRY_FORWARD_SEEDS)
+def test_r17_carried_forward_pair_hidden_when_the_live_topic_is_redacted(db, seed_fn, subject_type):
+    """Deletion wins over supersession: redacting only the LIVE carrier's topic must
+    still hide the record even though the superseded carrier's topic is untouched --
+    the old row is not a loophole back into content a customer had redacted."""
+    tag = uuid.uuid4().hex[:8]
+    co, site = _seed_company_site(db, tag)
+    caller_user = _seed_admin(db, co, tag)
+    stable_id, _old_topic, new_topic, _prefix = seed_fn(db, site, tag)
+    row = decision_records.insert(
+        db, company_id=co["id"], site_id=site["id"], kind="programme_impact",
+        subject_type=subject_type, subject_stable_id=stable_id, object_ref="T-1",
+        provider="anthropic", model=None, model_version=None, question_set=None,
+        input_key=None, input_hash=None, output={}, score=0.9, threshold=0.7,
+        auto_outcome="accepted")
+    since = datetime.now(timezone.utc) - timedelta(days=1)
+    assert [r["id"] for r in decision_records.list_for_eval(
+        db, co["id"], "programme_impact", since)] == [row["id"]]
+
+    redactions.create_redaction(db, co["id"], new_topic["id"], "user deleted the recording",
+                                caller_user["id"], "admin", target_type="topic", scope="deleted")
+    assert decision_records.list_for_eval(db, co["id"], "programme_impact", since) == []
+
+
+@pytest.mark.parametrize("seed_fn,subject_type", _CARRY_FORWARD_SEEDS)
+def test_r17_carried_forward_pair_hidden_when_the_recording_is_tombstoned(db, seed_fn, subject_type):
+    """The source-prefix arm: both carriers share the same source_s3_key prefix (one
+    re-extraction of the same recording), so a single recording tombstone must hide
+    the record via EITHER carrier's topic."""
+    tag = uuid.uuid4().hex[:8]
+    co, site = _seed_company_site(db, tag)
+    caller_user = _seed_admin(db, co, tag)
+    stable_id, _old_topic, _new_topic, prefix = seed_fn(db, site, tag)
+    row = decision_records.insert(
+        db, company_id=co["id"], site_id=site["id"], kind="programme_impact",
+        subject_type=subject_type, subject_stable_id=stable_id, object_ref="T-1",
+        provider="anthropic", model=None, model_version=None, question_set=None,
+        input_key=None, input_hash=None, output={}, score=0.9, threshold=0.7,
+        auto_outcome="accepted")
+    since = datetime.now(timezone.utc) - timedelta(days=1)
+    assert [r["id"] for r in decision_records.list_for_eval(
+        db, co["id"], "programme_impact", since)] == [row["id"]]
+
+    redactions.create_recording_tombstone(db, co["id"], prefix, "user deleted the recording",
+                                          caller_user["id"], "admin")
+    assert decision_records.list_for_eval(db, co["id"], "programme_impact", since) == []
+
+
+@pytest.mark.parametrize("subject_type", ["finding", "action_item", "decision", "question"])
+def test_r17_child_subject_with_no_carrier_at_all_is_fail_closed_invisible(db, subject_type):
+    tag = uuid.uuid4().hex[:8]
+    co, site = _seed_company_site(db, tag)
+    row = decision_records.insert(
+        db, company_id=co["id"], site_id=site["id"], kind="programme_impact",
+        subject_type=subject_type, subject_stable_id=uuid.uuid4(), object_ref="T-ghost",
+        provider="anthropic", model=None, model_version=None, question_set=None,
+        input_key=None, input_hash=None, output={}, score=0.5, threshold=0.7,
+        auto_outcome="rejected")
+    since = datetime.now(timezone.utc) - timedelta(days=1)
+    assert decision_records.list_for_eval(db, co["id"], "programme_impact", since) == []
     stored = db.execute(
         "SELECT id FROM decision_records WHERE id=%s", (row["id"],)).fetchone()
     assert stored is not None

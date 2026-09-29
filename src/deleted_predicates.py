@@ -133,40 +133,79 @@ def visible_chunks_predicate(alias: str = "c") -> str:
 
 
 def visible_decision_records_predicate(alias: str = "d") -> str:
-    """Ruling R7 (Track B Task 6b): decision_records has no topic_id column of its own --
-    a record's visibility depends on resolving its SUBJECT to a topic and checking that
-    topic is not deletion-tombstoned.
+    """Ruling R7 (Track B Task 6b), corrected by Ruling R17 (fix round 1):
+    decision_records has no topic_id column of its own -- a record's visibility depends
+    on resolving its SUBJECT to the topic(s) that carry it and checking whether any of
+    them is deletion-tombstoned.
 
-    Deliberately TWO arms, not three: the deletion tombstone (topic id AND source prefix,
-    same reasoning as visible_topics_predicate above), but NEVER LIVE_TOPIC_PREDICATE. Task
-    6's whole point is that a decision record outlives the row it was about being
-    superseded by a later extraction pass -- Track A's eval export (list_for_eval) must
-    still show the record for a re-extracted topic, only an actual customer deletion hides
-    it. Folding in the live arm here would make every re-extraction erase its own history
-    the moment the newer pass writes fresh records, which is backwards: the whole reason
-    Task 3 stopped DELETEing superseded topics was to keep exactly this kind of row alive.
+    Deliberately TWO deletion arms, not three: the deletion tombstone (topic id AND
+    source prefix, same reasoning as visible_topics_predicate above), but NEVER
+    LIVE_TOPIC_PREDICATE. Task 6's whole point is that a decision record outlives the row
+    it was about being superseded by a later extraction pass -- Track A's eval export
+    (list_for_eval) must still show the record for a re-extracted topic, only an actual
+    customer deletion hides it. Folding in the live arm here would make every
+    re-extraction erase its own history the moment the newer pass writes fresh records,
+    which is backwards: the whole reason Task 3 stopped DELETEing superseded topics was
+    to keep exactly this kind of row alive.
+
+    **Ruling R17 -- why this is EXISTS/NOT EXISTS over every carrier, not a scalar
+    subquery picking one.** The first version of this predicate used `(SELECT x.topic_id
+    FROM <table> x WHERE x.stable_id = subject_stable_id)` -- a SCALAR subquery, which
+    silently assumed `stable_id` names at most one row. It does not: Task 4's
+    carry-forward (`findings.carry_identity` / `action_items.carry_identity` /
+    `_carry_forward_one_table` for topic_decisions/topic_questions) moves a stable_id
+    FORWARD onto the new pass's row while the OLD, now-superseded row keeps it too -- one
+    stable_id, two rows, two different topics, the moment a source is re-extracted once.
+    Reviewer reproduced this against real Postgres: `CardinalityViolation: more than one
+    row returned by a subquery used as an expression`, raised out of list_for_eval for
+    the whole company the first time ANY finding/action_item/decision/question got
+    carried forward.
+
+    The semantics that replaces it: a non-topic record is visible iff (a) at least one
+    row still carries that stable_id, AND (b) NONE of the carrying rows' topics is
+    deletion-tombstoned. Deletion wins over supersession by design -- a recording delete
+    tombstones every pass of it (both the live and the superseded rows, same source
+    prefix), and a topic-level redaction of just the LIVE incarnation must still hide the
+    record even though the superseded carrier's topic is untouched; showing it via the
+    old row would leak exactly what the redaction was for. Supersession alone (neither
+    carrier deleted) never hides -- unchanged from the original R7 ruling.
 
     subject_type 'topic': subject_stable_id IS the topic id directly (topics are not
-    re-keyed -- decision_records.subject_stable_id's own column comment, migration 0073).
-    Every other subject_type names a CHILD row keyed by its OWN stable_id, resolved to its
-    topic_id first. A subject_stable_id that resolves to no row at all (or an
-    unrecognised subject_type) resolves to no topic and is therefore NOT visible --
+    re-keyed -- decision_records.subject_stable_id's own column comment, migration 0073;
+    a topic's own id is never carried onto another row, so this arm has no
+    cardinality question to begin with). Every other subject_type names a CHILD table
+    keyed by its OWN `stable_id`. A subject_stable_id with no carrier at all (or an
+    unrecognised subject_type) matches no OR-branch below and is therefore NOT visible --
     fail-closed rather than showing an orphaned record nothing can attribute to a topic."""
-    resolved_topic_id = (
-        f"(CASE {alias}.subject_type "
-        f"WHEN 'topic' THEN {alias}.subject_stable_id "
-        f"WHEN 'finding' THEN (SELECT f.topic_id FROM findings f "
-        f"  WHERE f.stable_id = {alias}.subject_stable_id) "
-        f"WHEN 'action_item' THEN (SELECT a.topic_id FROM action_items a "
-        f"  WHERE a.stable_id = {alias}.subject_stable_id) "
-        f"WHEN 'decision' THEN (SELECT td.topic_id FROM topic_decisions td "
-        f"  WHERE td.stable_id = {alias}.subject_stable_id) "
-        f"WHEN 'question' THEN (SELECT tq.topic_id FROM topic_questions tq "
-        f"  WHERE tq.stable_id = {alias}.subject_stable_id) "
-        f"ELSE NULL END)"
+    def _topic_not_deleted(topic_alias: str) -> str:
+        return (f"({DELETED_TOPIC_PREDICATE.format(alias=topic_alias)} AND "
+                f"{DELETED_SOURCE_PREDICATE.format(alias=topic_alias)})")
+
+    topic_branch = (
+        f"({alias}.subject_type = 'topic' AND EXISTS ("
+        f"SELECT 1 FROM topics t WHERE t.id = {alias}.subject_stable_id "
+        f"AND {_topic_not_deleted('t')}))"
     )
-    return (
-        f"EXISTS (SELECT 1 FROM topics t WHERE t.id = {resolved_topic_id} AND "
-        f"{DELETED_TOPIC_PREDICATE.format(alias='t')} AND "
-        f"{DELETED_SOURCE_PREDICATE.format(alias='t')})"
-    )
+
+    def _child_branch(subject_type: str, table: str, child_alias: str, topic_alias: str) -> str:
+        # (a) at least one carrier exists, AND (b) no carrier's topic is deletion-
+        # tombstoned -- NOT EXISTS a carrier whose topic fails _topic_not_deleted, which
+        # covers "deleted by topic id" OR "deleted by source prefix" without spelling
+        # either out a second time.
+        return (
+            f"({alias}.subject_type = '{subject_type}' AND "
+            f"EXISTS (SELECT 1 FROM {table} {child_alias} "
+            f"WHERE {child_alias}.stable_id = {alias}.subject_stable_id) AND "
+            f"NOT EXISTS (SELECT 1 FROM {table} {child_alias} "
+            f"JOIN topics {topic_alias} ON {topic_alias}.id = {child_alias}.topic_id "
+            f"WHERE {child_alias}.stable_id = {alias}.subject_stable_id "
+            f"AND NOT {_topic_not_deleted(topic_alias)}))"
+        )
+
+    return "(" + " OR ".join([
+        topic_branch,
+        _child_branch("finding", "findings", "f", "tf"),
+        _child_branch("action_item", "action_items", "ai", "tai"),
+        _child_branch("decision", "topic_decisions", "td", "ttd"),
+        _child_branch("question", "topic_questions", "tq", "ttq"),
+    ]) + ")"

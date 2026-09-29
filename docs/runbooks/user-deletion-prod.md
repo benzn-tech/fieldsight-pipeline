@@ -108,7 +108,7 @@ the non-VPC lambdas read those and have no database.
    ```
    Record the returned `batch_id`.
 3. **After — check every surface, not just the one you deleted from.** Each of these has
-   its own code path, and covering four of five is how a leak ships:
+   its own code path, and covering five of six is how a leak ships:
    - the Evidence list and the topic detail
    - **search** (search for a phrase you know is in that recording)
    - **Ask / RAG** (ask a question only that recording answers)
@@ -116,6 +116,21 @@ the non-VPC lambdas read those and have no database.
    - **media playback** and any presigned URL you had open — it must 404, not 403
    - the **nightly report email** for that day (the generator is non-VPC and reads the S3
      mirror, so this is the surface most likely to lag)
+   - **`decision_records`** (Track A's eval export, `decision_records.list_for_eval`) --
+     query it for the deleted topic's company/kind and confirm the row(s) for this
+     recording's topics are gone; this one has no UI, so it is the easiest of the six to
+     forget to check
+
+   ```sql
+   -- run as part of step 3's decision_records check
+   SELECT id, kind, subject_type, subject_stable_id, created_at
+   FROM decision_records
+   WHERE company_id = '<company-id>' AND created_at >= now() - interval '1 day'
+   ORDER BY created_at DESC;
+   -- rows whose subject resolves to the deleted recording's topic(s) must be ABSENT from
+   -- list_for_eval's own query (the table row itself is never dropped -- see deleted_
+   -- predicates.visible_decision_records_predicate)
+   ```
 4. **Prove nothing was destroyed.**
    ```bash
    aws s3 ls s3://<bucket>/audio_segments/<Folder>/<date>/ | grep <base>   # still there
