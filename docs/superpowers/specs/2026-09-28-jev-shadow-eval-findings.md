@@ -429,6 +429,30 @@ known, unfixed gap in the masking coverage, not a defect introduced by this eval
 whatever text is exported for any set. Recorded here so it is not silently rediscovered during
 the disagreement read (Section 6).
 
+**Fix wave 6 (2026-09-29) — common-word gate on the generic pass:** measured on the real
+exported data, the generic pass was masking almost every title-case topic heading it saw
+("Material Procurement" x11, "Scaffolding Safety" x9, "Slab Rebar" x7, "Concrete Testing",
+"Device Testing", "Route Planning", "Subcontractor Access", "Crane Restrictions", "Design
+Issues", "Electrical Cables", "Weekly Schedule", "Recording Device", "General Reflection",
+"Anything Else", ...), while correctly catching real names of the same shape ("Hector Eggar",
+"Paul Smith", "Liang Min", "Yang Ming"). A generic candidate is now masked only if NEITHER
+token is a known common word: a built-in module constant covering the words above, or a
+per-run corpus of lowercase words the runner (`scripts/jev_shadow_eval.py
+collect_common_words`) derives once from every selected row's own allowlisted title/summary
+text, before any state is built — shared uniformly by broad, decomposed, control and
+`--dry-run`. Known person aliases are unaffected: a known alias is always masked even if it is
+also a common word. **Accepted residual, and measured to be much larger on real data than the
+brief's own example suggests:** re-running the generic-vs-known count on
+`scripts/fixtures/jev_eval/{threads,work_class}.jsonl` (189 rows, 447 texts) found 181
+generic-pass masks before this fix and **0 remaining after it** — on this corpus, essentially
+every two-token candidate (including the real names above) has at least one token that recurs
+elsewhere in the same run's own text, so the corpus gate suppresses it. This is the literal,
+measured consequence of "common word = appears lowercase anywhere in this run's corpus" on data
+where the same people are mentioned across many rows, not a hypothetical edge case — see the
+module docstring's "Wood Ward" example for the isolated mechanism. Flagged here for the owner to
+decide whether the corpus should be scoped more narrowly before this masker is relied on for a
+real send.
+
 **New residual gap, introduced by the stoplist (I1.3):** a real person surnamed after one of the
 stoplist words (e.g. a person literally named "Roof") would not be masked by the generic pass —
 the stoplist cannot distinguish "Roof Jenkins, a person" from "Roof Framing, a task". This is the
