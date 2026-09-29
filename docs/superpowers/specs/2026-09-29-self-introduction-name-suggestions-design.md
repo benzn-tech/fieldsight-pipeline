@@ -110,8 +110,9 @@ Defects found against the code, all adopted by the plan
 
 Owner decisions, taken on the owner's standing instruction to choose the long-term option:
 
-1. **Gate on `SPEAKER_IDENTITY_MODE`:** do not store suggestions when identity is off —
-   one switch means one behaviour, and prod is not off.
+1. **Gate on `SPEAKER_IDENTITY_MODE`: the CONFIRM path only.** Suggestions are stored even
+   while identity is off (they hold text and offsets, no biometric data), so the queue is
+   ready the day identity is switched on; confirming them 404s while it is off.
 2. **Detect at 3 s, enrol on the cluster's longest turn** — catches short "Hi, I'm Petros"
    intros without asking the guard to judge 3 s of audio.
 3. **Reject company-word suffixes** ("Cassidy Construction", "Ltd", "Group", "Services")
