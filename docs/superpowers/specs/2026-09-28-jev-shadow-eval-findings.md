@@ -568,13 +568,59 @@ behaviour of the same rules):**
 
 ## 5. Results
 
-*(filled after the first real run)*
+**Run:** 2026-09-29, code at `develop` a5bf0ab (scores.json `provenance.git_sha` came out `None` because the
+worktree was a detached checkout — recorded here by hand), route `openrouter.ai` Decisions endpoint, model
+`~typesafe/jev-latest`, provider `openrouter-decisions`, temperature n/a, 2 runs per arm, run 2 after run 1.
+Smoke test first (3 calls). Latency median ~380-390 ms per call; total cost about US$0.03 for ~1,600 calls.
+Failed rows: threads controls 2 per run (no donor with a distinct earlier topic — guard working);
+work_class baseline 1 (no stored classifier score). Nothing else failed.
+
+**Verdicts under the pre-registered rule: threads — NOT ADOPTED; work_class — NOT ADOPTED.**
+
+### threads (86 rows: 27 yes / 59 no; baseline = stored TF-IDF score, threshold 0.25)
+
+| arm | accuracy | precision | recall | held-out coverage @p95 |
+|---|---|---|---|---|
+| baseline | 0.55 | 0.33 | 0.44 | 0 |
+| Jev broad | 0.65 | 0.41 | 0.26 | 0 |
+| Jev decomposed | 0.67 | 0.48 | 0.41 | 0 |
+
+Reasons (decomposed): control check **fail**; held-out precision floor not met. No arm — Jev or the
+current matcher — reaches an operating point with 95% precision, so nothing could be auto-accepted.
+Paired Brier favours Jev decomposed (difference −0.036, 90% CI [−0.061, −0.013]); stability 0/4 flips.
+
+**Same-month subset (51 rows: 24 yes / 27 no), per §3a:** verdict also NOT ADOPTED; accuracy baseline 0.35,
+Jev broad 0.37, Jev decomposed 0.35 — both the matcher and Jev are at or below chance once the easy
+cross-month negatives are removed. Jev's lead on the full set comes from those easy negatives.
+
+### work_class (112 rows: 78 private / 34 not; baseline = stored classifier, P(non_work) threshold 0.5)
+
+| arm | accuracy | precision | recall | held-out coverage @p95 (held-out precision) |
+|---|---|---|---|---|
+| baseline (classifier) | 0.63 | 0.88 | 0.55 | 0.19 (1.00) |
+| Jev broad | 0.79 | 0.84 | 0.86 | 0.26 (0.86) |
+| Jev decomposed | 0.78 | 0.80 | 0.91 | 0.18 (0.90) |
+
+Reasons (decomposed): control check **fail**; Clopper–Pearson floor not met (held-out precision 0.90 on too
+few accepted rows). Coverage difference 0.0, 90% CI [−0.23, 0.04]. Paired Brier favours Jev decomposed
+(−0.022, CI [−0.038, −0.006]). Stability 1/5 flips.
+
+**Two readings the verdict does not capture (descriptive, not decision inputs):**
+- The deployed classifier finds only **55% of the conversations the owner marks private**; Jev finds 86–91%
+  at similar precision. On the owner's own relabel, the classifier called 21 of 55 private owner rows
+  "work". That is a privacy-relevant miss rate in the current gate, independent of Jev.
+- The work_class control fails for a reason that is partly the control's design: replacing the title with
+  "General discussion." does not make a topic look *less* private — with the work signal removed, Jev leans
+  toward "private" (control recall 0.99). The pre-registered control therefore cannot show a drop for this
+  set. This is recorded, not re-ruled: the rule stands as written for this run.
 
 ---
 
 ## 6. Disagreement read
 
-*(filled after the first real run)*
+*(pending — the 20 largest Jev-decomposed vs baseline disagreements per set are prepared for the owner to
+read; clause (i) requires this before any verdict is acted on. With both verdicts "not adopted", no action
+waits on it, but the read is still how the descriptive work_class finding above is confirmed or dropped.)*
 
 ---
 
@@ -596,4 +642,16 @@ behaviour of the same rules):**
 
 ## 8. Recommendation
 
-*(filled after the first real run)*
+- **threads — not adopted.** Neither Jev nor the TF-IDF matcher can pick follow-ups reliably; within one
+  month both are at chance. Keep the matcher's proposals behind human confirmation as today. Jev is not the
+  lever here; the account hygiene in §3a (one account used across tests and several sites) is a larger
+  source of wrong threads than the model.
+- **work_class — not adopted as a replacement or augment under the rule.** Two follow-ups are worth more
+  than the verdict: (1) the deployed classifier misses ~45% of private conversations on the owner's labels —
+  a prompt/threshold review of rule 2b is warranted on its own, with the "when unsure choose work" bias as
+  the first suspect; (2) if Jev is reconsidered as a privacy signal, it needs a control designed for
+  "private" (e.g. a donor work topic's title, not a neutral sentence) and more accepted rows to clear the
+  Clopper–Pearson floor — that would be a new pre-registration, not an edit to this one.
+- **programme_match — not measured** (0 labels).
+- **Track C:** on this evidence Jev does not become the decision centre; if used at all, it is a pluggable
+  extra signal behind `decision_records`, starting with work_class privacy.
