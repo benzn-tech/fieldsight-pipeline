@@ -51,6 +51,7 @@ import evidence_match
 import llm_utils
 import batch_stitch
 import chunk_stitch
+import self_introduction
 from transcript_utils import (
     extract_base_time_from_filename,
     extract_device_from_filename,
@@ -1814,6 +1815,19 @@ def _supersedes(new_sources, prev):
     return True
 
 
+def _find_self_introductions(turns):
+    """`self_introduction.find`, wrapped so a detector defect cannot fail the extraction
+    it rides on -- never seen a real exception (it is a pure regex module), but "pure
+    today" is not a guarantee against a future edge case, and the whole extraction is not
+    worth losing over a feature that only ever adds a suggestion queue entry."""
+    try:
+        return self_introduction.find(turns)
+    except Exception:
+        logger.exception("self_introduction.find failed -- no introductions recorded "
+                         "for this extraction")
+        return []
+
+
 def extract_session(bucket, user_folder, date, session_base, final=False,
                     min_interval_s=MIN_REEXTRACT_INTERVAL_S, now=None,
                     generation=0, speaker_names=None, sleep=time.sleep):
@@ -2016,6 +2030,17 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
                             'start_sec': t.get('start_sec'),
                             'end_sec': t.get('end_sec')}
                            for t in turns if t.get('speaker')] if final else []),
+        # Self-introductions ("Hi, this is Petros from Cassidy"), final pass only, for the
+        # same reason as `speaker_turns` above: a live pass is provisional and re-runs
+        # constantly, and asking a person to confirm the same voice every throttle interval
+        # would train them to ignore the bell. `self_introduction.find` reads `t['speaker']`
+        # (see its own module docstring and correction 1 in the design review) -- it is
+        # handed `turns`, the SAME list `speaker_turns` above is built from, never a
+        # re-derived one, so the two fields can never disagree on how a turn is addressed.
+        #
+        # Never fatal: a detector defect must not take a whole extraction down with it,
+        # the same rule `location_markers.replace_for_day` follows on the writer side.
+        'self_introductions': _find_self_introductions(turns) if final else [],
     }
 
     s3().put_object(
