@@ -15,11 +15,11 @@ list means no filter" shape this codebase has paid for once already (see
 codebase has twice let [] / None mean both 'no filter' and 'nothing'"). So the uncached
 count travels back to the caller instead of disappearing into a shorter list.
 
-**There is deliberately no admission threshold in this file**, for the same reason
-`speaker_name_proposals` has none: candidates are ranked and cut at `limit`, a screen-size
-choice, not a similarity floor. A constant here deciding whether a candidate "is" a match
-would be the exact cut `0066_speaker_name_proposals.sql` refuses to invent, arriving
-through a different file.
+**No constant here decides whether a candidate "is" the person** -- a person answers
+that; a constant doing it would be the cut `0066_speaker_name_proposals.sql` refuses to
+invent. What the two named constants below decide is only which clusters are worth
+ASKING about, and in what order (most uncertain first, 2026-09-29), on measured support
+from owner-labelled clips.
 """
 from psycopg.rows import dict_row
 
@@ -34,8 +34,21 @@ def _require_company(company_id):
                          "against every company's clusters at once")
 
 
+#: The score the bell's questions cluster around when a company has no calibrated floor
+#: of its own. Mirrors `voiceprint_utils.DEFAULT_ABSENT_FLOOR` (pinned equal by a test);
+#: restated because this module runs in the writer, which must not import numpy.
+DEFAULT_BOUNDARY = 0.35
+
+#: How far below the boundary a cluster may score and still be asked about. Owner-
+#: labelled clips (2026-09-28): nobody else scored above 0.274, so a question much below
+#: the boundary is almost always "no" -- a click that teaches little and wears the asker
+#: out. A little below it is worth asking: a "no" there is exactly the evidence the floor
+#: is built from.
+ASK_BELOW_BOUNDARY = 0.10
+
+
 def candidates_for_person(conn, company_id, voiceprint_id, since_hours=72,
-                          site_id=None, limit=5) -> dict:
+                          site_id=None, limit=5, boundary=None) -> dict:
     """Voice clusters from the last `since_hours` that most resemble `voiceprint_id`.
 
     Returns `{"candidates": [...], "uncached": <int>}`, best-scoring candidate first. Each
@@ -133,7 +146,13 @@ def candidates_for_person(conn, company_id, voiceprint_id, since_hours=72,
         (company_id, since_hours)).fetchone()
     uncached = int((uncached_row or {}).get("n") or 0)
 
+    # Most INFORMATIVE first, not most similar (owner, 2026-09-29). A cluster far above
+    # the boundary is one the matcher already names; a "yes" there teaches it almost
+    # nothing. The ones near the boundary are where a person's answer moves the company's
+    # floor -- and the floor is what the 20 confirmations exist to calibrate.
+    boundary = DEFAULT_BOUNDARY if boundary is None else float(boundary)
     rows = cur.execute(
+        "SELECT * FROM ( "
         "WITH person AS ( "
         "  SELECT s.embedding "
         "  FROM speaker_voiceprint_samples s "
@@ -189,12 +208,15 @@ def candidates_for_person(conn, company_id, voiceprint_id, since_hours=72,
         # happened here twice.
         "GROUP BY g.session_base, g.source_filename, g.speaker_label, "
         "         g.user_folder, g.session_date "
-        "ORDER BY score DESC NULLS LAST "
+        ") c "
+        "WHERE c.score >= %s "
+        "ORDER BY abs(c.score - %s) ASC, c.score DESC "
         "LIMIT %s",
         (company_id, str(voiceprint_id), company_id,
          company_id, since_hours,
          company_id, str(voiceprint_id),
          company_id, str(voiceprint_id), company_id, str(voiceprint_id),
+         boundary - ASK_BELOW_BOUNDARY, boundary,
          int(limit))).fetchall()
 
     candidates = [
