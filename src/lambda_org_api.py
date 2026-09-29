@@ -151,7 +151,8 @@ from repositories import (action_items, aliases, chunks, classification_feedback
                           programme_suggestions, programme_tasks, programme_window,
                           recordings, redactions, report_templates, rollup, scope,
                           session_group,
-                          sites, threads, topics, users, voice_messages,
+                          sites, threads, topic_questions, topics, users,
+                          voice_messages,
                           voiceprints)
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import diff_candidates, first_match_span, normalize, occurrences
@@ -536,6 +537,12 @@ def dispatch(conn, event, method, route):
     m_ai = re.match(r"^/action-items/([^/]+)$", route)
     if m_ai and method == "PATCH":
         return patch_action_item(conn, caller, m_ai.group(1), parse_body(event))
+
+    # Track B Task 5 Step 2 -- addressed by topic_questions.stable_id, not .id (see
+    # patch_question's docstring for why that differs from action-items above).
+    m_q = re.match(r"^/questions/([^/]+)$", route)
+    if m_q and method == "PATCH":
+        return patch_question(conn, caller, m_q.group(1), parse_body(event))
 
     # Durable safety/quality resolved-state (spec 2026-07-26). Literal routes,
     # no id in the path (the row is addressed by its natural key in the body /
@@ -4442,6 +4449,79 @@ def patch_action_item(conn, caller, action_item_id, body):
     return ok(updated)
 
 
+class _QuestionVanished(Exception):
+    """The row disappeared between the ACL read and the UPDATE -- abort the
+    whole transaction rather than commit an audit row for a question that isn't
+    there any more (mirrors _ActionItemVanished)."""
+
+
+_QUESTION_STATUSES = ("open", "answered", "dropped")
+
+
+def patch_question(conn, caller, stable_id, body):
+    """Answer, drop or reopen one topic question (Track B Task 5 Step 2). Addressed by
+    `topic_questions.stable_id`, never `.id` -- a question's row is replaced wholesale on
+    every re-extraction (Task 4's carry_forward assigns the successor a NEW id and only
+    copies `stable_id` across), so the id the client saw when it opened the panel may
+    already be gone by the time this PATCH lands, while the stable_id is not.
+
+    ACL is the SAME two checks patch_action_item makes -- company scope via
+    `is_cross_company`, then the caller's site reach via `_allowed_site_ids` -- with ONE
+    deliberate difference in the OUTCOME, not the check: patch_action_item fetches its row
+    by a fixed id first and can therefore tell "exists, wrong company" (404) apart from
+    "exists, right company, wrong site" (403) as two different facts about a real row it
+    already has in hand. Here the row is reached ONLY by `stable_id` through
+    `topic_questions.get_live_by_stable_id` (itself scoped to the live topic via
+    `visible_topics_predicate`), so a caller who fails either check was never holding a
+    reference to anything they can prove exists -- there is nothing left to leak by
+    collapsing both refusals to 404, and the task brief calls for exactly that: same checks,
+    both refusals 404 (not the 403 patch_action_item uses for its second one).
+
+    Role-gated to `_CORRECTION_ROLES` (no assignee carve-out -- a question has no assignee,
+    unlike an action item's responsible party).
+
+    `status` is the only writable field. 'answered'/'dropped' stamp `answered_by` (the
+    caller's users.id) and `answered_at` (the database's `now()`, in
+    topic_questions.set_status); reopening to 'open' clears both. One `content_edits` row
+    (table_name='topic_questions', field='status') records the transition, and the UPDATE +
+    that audit row share ONE transaction -- CLAUDE.md: a `return error(...)` after a partial
+    write does not roll it back, so both must commit or neither does (same posture as
+    patch_action_item)."""
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    if body is None:
+        return error("malformed JSON body", 400)
+    status = body.get("status")
+    if status not in _QUESTION_STATUSES:
+        return error(f"status must be one of {sorted(_QUESTION_STATUSES)}", 400)
+
+    row = topic_questions.get_live_by_stable_id(conn, stable_id)
+    cross = is_cross_company(caller["global_role"])
+    if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
+        return error("question not found", 404)             # incl. cross-company
+    site_id = str(row["site_id"])
+    if site_id not in _allowed_site_ids(conn, caller):
+        # Same reach gate as patch_action_item's, but 404 rather than 403 -- see docstring.
+        return error("question not found", 404)
+
+    before = row["status"]
+    answered_by = caller["id"] if status != "open" else None
+    try:
+        with conn.transaction():           # UPDATE + audit row commit together
+            updated = topic_questions.set_status(conn, row["id"], status, answered_by)
+            if updated is None:
+                raise _QuestionVanished(stable_id)
+            # Unconditional, unlike patch_action_item's per-field "did it actually change"
+            # guard -- this endpoint writes exactly one field (status), the same posture
+            # patch_content takes for its own single editable field.
+            content_edits.append_content_edit(
+                conn, row["company_id"], "topic_questions", row["id"], "status",
+                before, status, caller["id"], caller["global_role"])
+    except _QuestionVanished:
+        return error("question not found", 404)
+    return ok(updated)
+
+
 # ----------------------------------------------------------
 # GET /action-items/closures?from=&to= — the Today page's weekly KPI.
 #
@@ -7072,6 +7152,14 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
             # emit strings, so strings is the contract, not a simplification.
             # Until 0058 this was a hardcoded [] -- and report_sections,
             # chunking and lambda_ask_agent were all already reading it.
+            #
+            # Track B Task 5: `topics.decisions`/`topics.open_questions` (this jsonb, both
+            # keys below) is now a MIRROR of `topic_decisions`/`topic_questions` -- the two
+            # tables migration 0071 added, dual-written by lambda_item_writer alongside this
+            # same jsonb. This narrowing still reads the jsonb; switching readers over to the
+            # row tables (so a client sees an answered question's status, a decision's
+            # stable_id, etc.) is a separate, later change (Ruling R6) -- payload shape here
+            # is untouched by Task 5.
             "key_decisions": [d if isinstance(d, str) else d.get("decision")
                               for d in (t.get("decisions") or [])
                               if (d.get("decision") if isinstance(d, dict) else d)],

@@ -84,7 +84,8 @@ import thread_match
 from repositories import location_markers
 from repositories import (action_items, companies, findings, meeting_session, recordings,
                           redactions,
-                          session_group, sites, threads, topics)
+                          session_group, sites, threads, topic_decisions, topic_questions,
+                          topics)
 # The extraction-key shape lives in session_scope now (the read side needs the
 # SAME parse to derive session_id from topics.source_s3_key -- see that
 # module). Re-exported under the historical private names so existing callers
@@ -1171,6 +1172,20 @@ def write_extraction_items(date, user_folder, extraction_key):
             finding_rows = findings.insert_findings(
                 conn, row["id"], site["id"], t.get("findings") or [])
 
+            # Track B Task 5 -- decisions/open_questions become their OWN rows, dual-written
+            # in the SAME transaction right after findings above, alongside (not instead of)
+            # the jsonb upsert_topic already wrote a few lines up (decisions=/open_questions=
+            # kwargs). Each insert does its own blank-dropping identical to those kwargs
+            # (see topic_decisions.insert_decisions / topic_questions.insert_questions
+            # docstrings) so the row table and the jsonb mirror never disagree about which
+            # entries exist. A stable_id here is what lets Task 4's carry_forward (below)
+            # keep a decision or an answered question attached to the same commitment
+            # across a re-extraction that reworded it.
+            topic_decisions.insert_decisions(
+                conn, row["id"], site["id"], t.get("decisions") or [])
+            topic_questions.insert_questions(
+                conn, row["id"], site["id"], t.get("questions") or [])
+
             # Snapshot for the match_requests/ artifact (Task 4) -- the
             # non-VPC MatcherFunction reads this, never Aurora directly, so
             # every field it needs (the durable topic id + the same
@@ -1352,10 +1367,11 @@ def _carry_forward_one_table(conn, repo, old_topic_ids, new_topic_ids, site_id):
     any human edit) forward. Returns the number of human-touched OLD rows that found no
     successor -- the caller's contribution to the OrphanedHumanEdits metric/log.
 
-    `repo` is `action_items` or `findings` (Track B Task 4): both now expose
+    `repo` is `action_items`, `findings`, `topic_decisions` or `topic_questions` (Track B
+    Task 4, extended to the last two by Task 5): all four expose
     list_for_carry_forward(conn, topic_ids, site_id) -> rows with a computed `human_touched`,
     and carry_identity(conn, new_id, old_row), with the identical shape -- which is what lets
-    this be one function instead of two near-duplicates."""
+    this be one function instead of four near-duplicates."""
     old_rows = repo.list_for_carry_forward(conn, old_topic_ids, site_id)
     if not old_rows:
         return 0
@@ -1401,6 +1417,10 @@ def _carry_forward_children(conn, old_topic_ids, new_topic_ids, site_id, extract
             orphaned = (_carry_forward_one_table(conn, action_items, old_topic_ids,
                                                  new_topic_ids, site_id)
                        + _carry_forward_one_table(conn, findings, old_topic_ids,
+                                                  new_topic_ids, site_id)
+                       + _carry_forward_one_table(conn, topic_decisions, old_topic_ids,
+                                                  new_topic_ids, site_id)
+                       + _carry_forward_one_table(conn, topic_questions, old_topic_ids,
                                                   new_topic_ids, site_id))
     except Exception:
         logger.exception(
@@ -1412,16 +1432,16 @@ def _carry_forward_children(conn, old_topic_ids, new_topic_ids, site_id, extract
 
 def _count_human_touched_old(conn, old_topic_ids, site_id, extraction_key):
     """Fallback for `_carry_forward_children`'s except branch: every human-touched OLD row
-    across both child tables, unconditionally -- carry_forward crashed, so none of them found
-    a successor this pass, regardless of which table or which pair was mid-flight when it
-    failed. Runs AFTER the failed SAVEPOINT has already rolled back, as a plain read that was
-    not itself part of what failed.
+    across all four child tables, unconditionally -- carry_forward crashed, so none of them
+    found a successor this pass, regardless of which table or which pair was mid-flight when
+    it failed. Runs AFTER the failed SAVEPOINT has already rolled back, as a plain read that
+    was not itself part of what failed.
 
     Never raises further: if even this cannot run, there is no better number left to report,
     so it logs and answers 0 -- which undercounts, but a metric that also throws would take
     the whole pass down for real, the one outcome R10 exists to prevent."""
     try:
-        return sum(1 for repo in (action_items, findings)
+        return sum(1 for repo in (action_items, findings, topic_decisions, topic_questions)
                    for row in repo.list_for_carry_forward(conn, old_topic_ids, site_id)
                    if row["human_touched"])
     except Exception:

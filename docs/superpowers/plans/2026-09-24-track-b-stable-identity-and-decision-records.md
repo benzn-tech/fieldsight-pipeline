@@ -186,10 +186,10 @@ CREATE INDEX IF NOT EXISTS idx_decision_records_kind_time ON decision_records (c
 - Modify: `src/carry_forward.py` call site — both new tables go through Task 4 (`decision` / `question` text), questions carry `status, answered_by, answered_at` forward.
 - Test: `tests/unit/test_decisions_questions_rows.py`, `tests/integration/test_question_answered_survives.py`
 
-- [ ] **Step 1:** Repos and writer, defensive `.get` throughout, blank entries dropped exactly as the jsonb path drops them (`lambda_item_writer.py:1085-1101`).
-- [ ] **Step 2:** `PATCH /api/org/questions/{stable_id}` → `status` in `answered|dropped|open`, roles `_CORRECTION_ROLES`, writes `content_edits` with `table_name='topic_questions'`. Look up by `stable_id` on the **live** topic (join through `visible_topics_predicate`). This is the endpoint the 2026-09-07 spec could not have.
-- [ ] **Step 3:** Integration test: answer a question, re-extract with reworded question text within the floor, assert `status='answered'` on the new row and the same `stable_id`.
-- [ ] **Step 4:** Payload untouched. Add one comment at `lambda_org_api.py:6783` saying the jsonb is now a mirror of `topic_decisions` and the reader switch is a separate change.
+- [x] **Step 1:** Repos and writer, defensive `.get` throughout, blank entries dropped exactly as the jsonb path drops them (`lambda_item_writer.py:1085-1101`). Also wired `topic_decisions`/`topic_questions` into `_carry_forward_children`/`_count_human_touched_old` (Ruling R11: decisions human_touched = `audience<>'internal'`; questions = `status<>'open' OR audience<>'internal'`).
+- [x] **Step 2:** `PATCH /api/org/questions/{stable_id}` → `status` in `answered|dropped|open`, roles `_CORRECTION_ROLES`, writes `content_edits` with `table_name='topic_questions'`. Look up by `stable_id` on the **live** topic (join through `visible_topics_predicate`). Cross-company and non-member-site both 404 (not action-item's 403) — same checks, no row the caller can prove exists to leak a distinction about.
+- [x] **Step 3:** Integration test (`tests/integration/test_question_answered_survives.py`): answered question re-extracted with reworded text (measured ratio 0.9615, floor 0.90) — `status='answered'` and `stable_id` survive on the new row; also a decisions exact-match round-trip and a direct real-Postgres drive of `patch_question`'s own SQL (live update + 404 on a superseded-only stable_id).
+- [x] **Step 4:** Payload untouched. Comment added at `lambda_org_api.py` ~7053-7073 (Ruling R6 — real narrowing is `key_decisions`/`open_questions`, not :6783) saying the jsonb is now a mirror of `topic_decisions`/`topic_questions` and the reader switch is a separate change.
 
 ---
 

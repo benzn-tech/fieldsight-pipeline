@@ -80,8 +80,10 @@ class _Cur:
         # carry_forward.match KeyError on a missing "text". This file is about the supersede
         # SQL, not about carry-forward, so an empty "old" pool (which short-circuits
         # _carry_forward_one_table before it ever calls match) is the answer that leaves
-        # this file's own assertions untouched.
-        if "FROM action_items" in self._sql or "FROM findings" in self._sql:
+        # this file's own assertions untouched. Task 5 added topic_decisions/topic_questions
+        # to the same carry-forward sweep -- same guard, same reason.
+        if ("FROM action_items" in self._sql or "FROM findings" in self._sql
+                or "FROM topic_decisions" in self._sql or "FROM topic_questions" in self._sql):
             return []
         return [dict(_RETURNING_ROW)]
 

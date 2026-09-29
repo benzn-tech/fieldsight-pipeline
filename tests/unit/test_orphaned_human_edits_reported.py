@@ -154,7 +154,7 @@ def test_carry_forward_children_degrades_instead_of_raising_on_a_matcher_crash(
         "old row IS one")
 
 
-def test_count_human_touched_old_sums_both_tables(monkeypatch):
+def test_count_human_touched_old_sums_all_four_tables(monkeypatch):
     class _Repo:
         def __init__(self, rows):
             self._rows = rows
@@ -165,9 +165,13 @@ def test_count_human_touched_old_sums_both_tables(monkeypatch):
     monkeypatch.setattr(iw, "action_items", _Repo([
         {"id": "a1", "human_touched": True}, {"id": "a2", "human_touched": False}]))
     monkeypatch.setattr(iw, "findings", _Repo([{"id": "f1", "human_touched": True}]))
+    # Track B Task 5: two more child tables joined the sum -- decisions/questions rows.
+    monkeypatch.setattr(iw, "topic_decisions", _Repo([{"id": "d1", "human_touched": True}]))
+    monkeypatch.setattr(iw, "topic_questions", _Repo([
+        {"id": "q1", "human_touched": True}, {"id": "q2", "human_touched": False}]))
 
     n = iw._count_human_touched_old(None, ["old-topic"], "site-1", KEY)
-    assert n == 2
+    assert n == 4
 
 
 def test_count_human_touched_old_never_raises(monkeypatch, caplog):
