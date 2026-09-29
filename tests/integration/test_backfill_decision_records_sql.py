@@ -144,7 +144,7 @@ def test_programme_match_confirmed_rejected_pending_and_null_topic(db):
     # confirmed(topic_confirmed) + rejected(topic_rejected) -- the pending row
     # never matches the state filter at all, and the NULL-topic confirmed row
     # matches the state filter but is not "eligible" (topic_id IS NOT NULL),
-    # so it is counted in skipped_topic_null instead.
+    # so it is counted in skipped instead.
     assert stats["eligible"] == 2
     assert stats["skipped"] == 1
     assert stats["already_present"] == 0
