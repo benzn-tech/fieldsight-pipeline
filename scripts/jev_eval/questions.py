@@ -380,32 +380,37 @@ _WORK_CLASS_BROAD = {
         "instructions": "Is this conversation about work or non-work?",
         "criteria": {
             "work": (
-                "The conversation is about construction work, a site, a "
-                "programme, a subcontractor or the business of running the "
-                "job."
+                "The conversation is about work or business of any kind: "
+                "construction on a site, clients, sales, suppliers, or the "
+                "company's own products and operations."
             ),
             "non_work": (
-                "The conversation is about something other than the job: "
-                "the speaker's private life, family, health, unrelated "
-                "business, or testing the recording device."
+                "The conversation is private: the speaker's personal life, "
+                "family, health, personal errands or leisure, or testing "
+                "the recording device itself."
             ),
         },
     },
 }
 
 _WORK_CLASS_DECOMPOSED = {
+    # Key name predates the 2026-09-29 owner relabel (three-way: this site's
+    # work / other work / private) and now covers ANY work or business, not
+    # just "the site" -- kept as-is so composites and question_hash callers
+    # do not have to change.
     "about_the_site": {
         "type": "noul",
         "instructions": (
-            "The conversation is about construction work, a site, a "
-            "programme or a subcontractor."
+            "The conversation is about work or business of any kind "
+            "(construction, clients, sales, suppliers, or the company's "
+            "own products)."
         ),
     },
     "personal": {
         "type": "noul",
         "instructions": (
-            "The conversation is about the recorder's private life, "
-            "family, health or unrelated business."
+            "The conversation is about the speaker's private life: "
+            "family, health, personal errands or leisure."
         ),
     },
     "recording_test": {

@@ -98,13 +98,14 @@ def test_status_claimed_has_the_five_options_from_the_brief():
 def test_work_class_broad_options_are_verbatim_from_the_ruling():
     criteria = QUESTION_SETS["work_class"]["broad"]["work_class"]["criteria"]
     assert criteria["work"] == (
-        "The conversation is about construction work, a site, a "
-        "programme, a subcontractor or the business of running the job."
+        "The conversation is about work or business of any kind: "
+        "construction on a site, clients, sales, suppliers, or the "
+        "company's own products and operations."
     )
     assert criteria["non_work"] == (
-        "The conversation is about something other than the job: the "
-        "speaker's private life, family, health, unrelated business, or "
-        "testing the recording device."
+        "The conversation is private: the speaker's personal life, "
+        "family, health, personal errands or leisure, or testing the "
+        "recording device itself."
     )
 
 
