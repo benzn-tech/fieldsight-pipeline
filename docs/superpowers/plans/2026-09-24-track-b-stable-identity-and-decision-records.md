@@ -32,7 +32,7 @@
 - Create: `src/migrations/00NN_stable_identity.sql`
 - Test: `tests/unit/test_migration_stable_identity_shape.py`, `tests/integration/test_stable_identity_schema.py`
 
-- [ ] **Step 1: Write the migration.**
+- [x] **Step 1: Write the migration.** Filed as `src/migrations/0071_stable_identity.sql` (Ruling R1). Postgres rejects `ADD CONSTRAINT IF NOT EXISTS` (no such grammar) and inline `ADD COLUMN ... CHECK` cannot carry `IF NOT EXISTS` on the CHECK itself either, so `findings.kind`, `findings.audience`, `action_items.audience` are each split into a plain `ADD COLUMN IF NOT EXISTS ...` followed by an unconditional `ADD CONSTRAINT <name> CHECK (...)` — safe because `schema_migrations` guarantees the file runs at most once. Everything else is verbatim from this brief.
 
 ```sql
 -- Supersession instead of deletion for extraction topics. Spec 2026-09-24 §2.1.
@@ -123,8 +123,8 @@ CREATE INDEX IF NOT EXISTS idx_decision_records_subject ON decision_records (sub
 CREATE INDEX IF NOT EXISTS idx_decision_records_kind_time ON decision_records (company_id, kind, created_at DESC);
 ```
 
-- [ ] **Step 2: Shape test** (unit, SQL text): both new child tables carry `ON DELETE CASCADE` on `site_id` (the 2026-09-07 review found a draft that dropped it); `stable_id` columns are `NOT NULL DEFAULT gen_random_uuid()`; the live-source index is partial on `superseded_at IS NULL`; every item table has `audience` defaulting to `'internal'` with the two-value CHECK, and `findings.kind` defaults to `'observation'`.
-- [ ] **Step 3: Integration test** (real Postgres via `migrated_db_url`): insert a topic + action item, `UPDATE topics SET superseded_at=now()`, assert the child row still exists and its `stable_id` is unchanged; delete the topic, assert CASCADE removed the child and the decision_records row survives (it is not FK-bound to the child, by design — the record outlives the row it judged).
+- [x] **Step 2: Shape test** (unit, SQL text): both new child tables carry `ON DELETE CASCADE` on `site_id` (the 2026-09-07 review found a draft that dropped it); `stable_id` columns are `NOT NULL DEFAULT gen_random_uuid()`; the live-source index is partial on `superseded_at IS NULL`; every item table has `audience` defaulting to `'internal'` with the two-value CHECK, and `findings.kind` defaults to `'observation'`. `tests/unit/test_migration_stable_identity_shape.py`, 9 tests, all green.
+- [x] **Step 3: Integration test** (real Postgres via `migrated_db_url`): insert a topic + action item, `UPDATE topics SET superseded_at=now()`, assert the child row still exists and its `stable_id` is unchanged; delete the topic, assert CASCADE removed the child and the decision_records row survives (it is not FK-bound to the child, by design — the record outlives the row it judged). Also covers: partial index hides superseded rows, CHECK rejects a bad `audience`/`kind` on `findings`/`action_items`, and a row inserted without the new columns gets `audience='internal'`, `kind='observation'`, non-null `stable_id`. `tests/integration/test_stable_identity_schema.py`, 8 tests, all green against real local Postgres. `tests/integration/test_migrations_apply.py` (idempotent re-apply) reconfirmed green, 7 tests.
 
 ---
 
