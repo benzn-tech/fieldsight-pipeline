@@ -6,6 +6,42 @@
 
 ---
 
+## Speaker identity — roadmap (owner decisions, 2026-09-29)
+
+Where the voiceprint work goes next. Ordered by value, not by ease. Items marked
+**parked** are decided-for but not scheduled; they stay here so they are not lost.
+
+### Know who is speaking without a rename
+- **Candidates narrowed to who is on site today.** Compare a voice against the few
+  people signed in, not the whole company. Needs upstream integrations: SignOnSite,
+  1Breadcrumb, Outlook/Teams calendar attendees.
+- **Enrol at site sign-in.** 15–20 s of natural speech (name, company, trade, today's
+  task), not a read-out script; the embedder keeps the cleanest 10 s. Consent is taken
+  in the same act.
+- **Self-introduction → name proposal.** "Hi, this is Petros from Cassidy" proposes
+  that voice as Petros via the bell.
+- **Voice sign-in on shared devices.** Replaces or backs up QR login; devices rotate
+  monthly.
+
+### A better library
+- **Condition-aware profiles.** Samples clustered by condition (wind, indoor, vehicle,
+  phone, language); a turn is scored against each person's nearest condition centroid.
+- **Bell asks the most informative passages first** (scores near the threshold), so a
+  company reaches the 20 corrections that calibrate its floor sooner.
+
+### Using the identity
+- **Who said it ≠ who owns it.** A task records the speaker (resolved by voiceprint or
+  by the site roster), the company/trade it binds, and the GC-side owner (the SM/PM for
+  that package). A subcontractor who is not in the library is never made the task owner.
+- **Variation and safety evidence.** Who instructed extra work; who gave and who
+  acknowledged a toolbox talk.
+
+### Privacy and trust
+- **Speaker-based opt-out.** A person who opts out once is redacted from every later
+  recording automatically, not by a one-off deletion.
+- **Self-serve consent page — parked.** The person named gets a link to see, hear and
+  withdraw their own voiceprint.
+
 ## P0 — Ask Agent (对纪要追问)
 
 **Goal:** Users can ask questions about any report/meeting minutes and get answers grounded in transcript + report data.

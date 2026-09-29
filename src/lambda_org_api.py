@@ -150,7 +150,7 @@ from repositories import (action_items, aliases, chunks, classification_feedback
                           programme_snapshot,
                           programme_suggestions, programme_tasks, programme_window,
                           recordings, redactions, report_templates, rollup, scope,
-                          session_group,
+                          session_group, site_attendance,
                           sites, threads, topic_questions, topics, users,
                           voice_messages,
                           voiceprints)
@@ -165,6 +165,7 @@ import batch_stitch
 import deletion_mirror
 import speaker_match_request
 from repositories import speaker_name_proposals
+from repositories import speaker_intro_suggestions
 import turn_name_overlay
 from transcript_utils import extract_base_time_from_filename, speaker_turns_from_items
 
@@ -231,6 +232,9 @@ SPEAKER_IDENTITY_MODE = os.environ.get("SPEAKER_IDENTITY_MODE", "off").lower()
 # How many of a person's pending candidates the dialog asks about at once. A SCREEN-SIZE
 # choice: it decides how long the list is, never whether a candidate is a match.
 PROPOSAL_PAGE = int(os.environ.get("PROPOSAL_PAGE", "5"))
+#: How many pending self-introductions `GET /name-suggestions` lists at once -- a
+#: screen-size choice like PROPOSAL_PAGE, not an admission threshold (owner decision 4).
+SUGGESTION_PAGE = int(os.environ.get("SUGGESTION_PAGE", "20"))
 
 # Whether naming a speaker is itself taken as the claim that they agreed to a voiceprint.
 #
@@ -652,6 +656,9 @@ def dispatch(conn, event, method, route):
     if route == "/rollup/portfolio" and method == "GET":
         return list_portfolio_rollup(conn, caller, event)
 
+    if route == "/weather" and method == "GET":
+        return get_site_weather(conn, caller, event)
+
     if route == "/programme":
         if method == "GET":
             return get_programme(conn, caller, event)
@@ -784,6 +791,11 @@ def dispatch(conn, event, method, route):
     m_np = re.match(r"^/name-proposals/([^/]+)$", route)
     if m_np and method == "POST":
         return decide_name_proposal(conn, caller, m_np.group(1), event)
+    if route == "/name-suggestions" and method == "GET":
+        return list_name_suggestions(conn, caller, event)
+    m_ns = re.match(r"^/name-suggestions/([^/]+)$", route)
+    if m_ns and method == "POST":
+        return decide_name_suggestion(conn, caller, m_ns.group(1), event)
     m_sc = re.match(r"^/sessions/([^/]+)/speaker-corrections$", route)
     if m_sc and method == "POST":
         return speaker_corrections(conn, caller, m_sc.group(1), event)
@@ -801,6 +813,15 @@ def dispatch(conn, event, method, route):
     m_sv = re.match(r"^/sites/([^/]+)/voice$", route)
     if m_sv and method == "GET":
         return list_site_voice(conn, caller, m_sv.group(1), event)
+
+    m_sat = re.match(r"^/sites/([^/]+)/attendance$", route)
+    if m_sat and method == "GET":
+        return list_site_attendance(conn, caller, m_sat.group(1), event)
+    if m_sat and method == "POST":
+        return create_site_attendance(conn, caller, m_sat.group(1), event)
+    m_satr = re.match(r"^/sites/([^/]+)/attendance/([^/]+)$", route)
+    if m_satr and method == "DELETE":
+        return delete_site_attendance(conn, caller, m_satr.group(1), m_satr.group(2), event)
 
     if route == "/auth/qr/create" and method == "POST":
         return create_qr_login_code(conn, caller, event)
@@ -2433,7 +2454,13 @@ def list_name_proposals(conn, caller, event):
                                "displayName": r["display_name"],
                                "pending": int(r["pending"]),
                                "newest": r["newest"]} for r in people],
-                   "total": sum(int(r["pending"]) for r in people)})
+                   "total": sum(int(r["pending"]) for r in people),
+                   # A count, same query shape as `people` above -- no transcript
+                   # touched. Added here rather than folded into `total` because the
+                   # frontend's badge component already reads `total` and a client-side
+                   # arithmetic change is exactly the kind of edit that silently drops a
+                   # field (memory: "ui-api-layer-whitelists-request-body").
+                   "introductions": speaker_intro_suggestions.pending_count(conn, company_id)})
 
     rows = speaker_name_proposals.pending_for_person(
         conn, company_id, vp, limit=PROPOSAL_PAGE)
@@ -2582,6 +2609,141 @@ def _apply_confirmed_proposal(conn, caller, company_id, row, event):
         "start_sec": best["start_sec"],
         "end_sec": best["end_sec"],
         "display_name": person["display_name"],
+    })))
+
+
+def list_name_suggestions(conn, caller, event):
+    """GET /api/org/name-suggestions — pending self-introductions, straight off the rows.
+
+    One shape only, unlike `/name-proposals`: every field the dialog needs (`heard_name`,
+    `quote`, the ingredients of the audio key) is already ON the row --
+    `speaker_intro_suggestions` carries the words `speaker_name_proposals` does not,
+    because there is no enrolled voice yet to look the words up against. No transcript
+    read, same reason as the proposals badge: this is polled/opened often enough that an
+    S3 round trip per row would be a real cost, and there is nothing here it would buy.
+
+    Plain words only, no scores -- the customer rule the design doc states up front. This
+    body has no place a score could even go.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    company_id = str(caller["company_id"])
+    rows = speaker_intro_suggestions.pending(conn, company_id, limit=SUGGESTION_PAGE)
+
+    def _roster_names(r):
+        # Consumer 3 (plan correction 5): the intro dialog prefers roster names for the
+        # prefill ("Petrus Pang" heard -> "Petros Pan", who signed in today). No fuzzy
+        # matching here -- that is a UI choice -- just the day's names for this
+        # suggestion's session's site, or [] when the site cannot be resolved (the same
+        # safe absence `_site_for_session`'s own docstring documents).
+        site = _site_for_session(conn, company_id, r["user_folder"], str(r["session_date"]),
+                                 r["session_base"])
+        if not site:
+            return []
+        return [row["display_name"] for row in
+                site_attendance.for_day(conn, company_id, str(site["id"]),
+                                        str(r["session_date"]))]
+
+    return ok({"suggestions": [{
+        "id": r["id"], "heardName": r["heard_name"], "companyName": r.get("company_name"),
+        "quote": r["quote"], "date": str(r["session_date"]), "userFolder": r["user_folder"],
+        "sessionBase": r["session_base"], "sourceFilename": r["source_filename"],
+        "speakerLabel": r["speaker_label"], "startSec": r["start_sec"],
+        "endSec": r["end_sec"], "createdAt": r["created_at"],
+        "rosterNames": _roster_names(r),
+    } for r in rows]})
+
+
+def decide_name_suggestion(conn, caller, suggestion_id, event):
+    """POST /api/org/name-suggestions/{id} — a human says "yes, that's a name" or "no".
+
+    Body: `{"decision": "confirmed" | "rejected", "display_name"?: string}`.
+
+    **Same delegation as `decide_name_proposal`, for the same reason.** `confirmed` does
+    not write a name here -- it builds a `speaker_corrections` call, because
+    `recompute_company_floor` counts only `source='correction'` rows, and a confirmation
+    written any other way would name the person correctly, satisfy the user and calibrate
+    nothing.
+
+    `display_name` lets a person fix what the transcriber misheard ("Petros Pan" ->
+    "Petrus Pang", the design doc's own example) before it reaches a biometric store --
+    absent, the row's own `heard_name` is used. Present but blank after `.strip()` is
+    refused: silently falling back to `heard_name` there would name someone the caller
+    just tried to clear.
+
+    `rejected` records the judgement and writes no name -- the introduction is not
+    re-offered, same as a rejected proposal. There is no third value: closing the dialog
+    must leave the row `pending` for the bell.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    body = parse_body(event) or {}
+    decision = (body.get("decision") or "").strip().lower()
+    if decision not in ("confirmed", "rejected"):
+        return error("decision must be 'confirmed' or 'rejected'; closing the dialog is "
+                     "not a decision and leaves the suggestion pending", 400)
+
+    raw_name = body.get("display_name")
+    if raw_name is not None and not raw_name.strip():
+        return error("display_name must not be empty", 400)
+
+    company_id = str(caller["company_id"])
+    # ONE transaction for the decision and the correction it delegates to, same reason as
+    # `decide_name_proposal`: a committed 'confirmed' flip whose correction is then
+    # refused would leave a row that claims a decision was made and named nobody, and --
+    # no longer pending -- could never be answered again.
+    try:
+        with conn.transaction():
+            row = speaker_intro_suggestions.decide(conn, company_id, suggestion_id, decision,
+                                                   decided_by=caller["id"])
+            if row is None:
+                return error("no pending suggestion with that id", 404)
+            if decision == "rejected":
+                return ok({"suggestionId": row["id"], "decision": "rejected"})
+            resp = _apply_confirmed_suggestion(
+                conn, caller, company_id, row,
+                (raw_name.strip() if raw_name is not None else None), event)
+            if int(resp.get("statusCode", 500)) >= 300:
+                raise _ConfirmationNotApplied(resp)
+            return resp
+    except _ConfirmationNotApplied as exc:
+        return exc.response
+
+
+def _apply_confirmed_suggestion(conn, caller, company_id, row, display_name, event):
+    """Turn a confirmed introduction into the correction a rename would have made."""
+    name = display_name or row["heard_name"]
+    folder, date = row["user_folder"], str(row["session_date"])
+
+    # The cluster's LONGEST turn, same rule and same reason as `_apply_confirmed_proposal`
+    # (spec correction 5): the introduction itself is often under the ~10 s the homogeneity
+    # guard needs to judge, and picking the intro's own turn would hand the enrolment less
+    # evidence than the meeting actually gives it.
+    turns = [t for t in _session_turns(conn, folder, date, row["session_base"])
+             if t.get("source_filename") == row["source_filename"]
+             and t.get("speaker_label") == row["speaker_label"]]
+    if turns:
+        best = max(turns, key=lambda t: float(t.get("end_sec", 0)) - float(t.get("start_sec", 0)))
+        start_sec, end_sec = best["start_sec"], best["end_sec"]
+    else:
+        # Unlike a name proposal, this is not an error: the suggestion's own detected
+        # window is at least 3 s (self_introduction.find's floor) -- short of the
+        # homogeneity guard's enrolment floor, but still enough for propagation to run.
+        start_sec, end_sec = row["start_sec"], row["end_sec"]
+
+    # The delegation, and the same session-id rule `_apply_confirmed_proposal` states:
+    # the passage's own filename, which carries the date and the sid, not
+    # `row["session_base"]` (the canonical key, which carries neither).
+    return speaker_corrections(conn, caller, row["source_filename"], dict(event, body=json.dumps({
+        "user": folder,
+        "source_filename": row["source_filename"],
+        "start_sec": start_sec,
+        "end_sec": end_sec,
+        "display_name": name,
     })))
 
 
@@ -3229,6 +3391,113 @@ def list_site_voice(conn, caller, site_id, event):
               "createdAt": r["created_at"].isoformat() if hasattr(r["created_at"], "isoformat") else str(r["created_at"])}
              for r in rows]
     return ok({"items": items, "site": str(site_id)})
+
+
+# ----------------------------------------------------------
+# /sites/{id}/attendance — the `manual` roster source (on-site-roster plan, Task 5)
+# ----------------------------------------------------------
+_ATTENDANCE_NAME_CAP = 50
+
+
+def _serialize_attendance_row(r):
+    return {"id": str(r["id"]), "displayName": r["display_name"],
+           "employerName": r.get("employer_name"), "source": r["source"],
+           "resolved": {"userId": str(r["user_id"]) if r.get("user_id") else None,
+                        "voiceprintId": str(r["voiceprint_id"])
+                        if r.get("voiceprint_id") else None}}
+
+
+def list_site_attendance(conn, caller, site_id, event):
+    """GET /api/org/sites/{id}/attendance?date=YYYY-MM-DD — the day's roster, any source.
+
+    Any member may read (unlike the write side, which needs a correction role): a roster
+    that is visible only to managers cannot do what consumer 3 (the intro dialog's prefill)
+    needs, since it renders for whoever is naming a speaker.
+    """
+    if str(site_id) not in _allowed_site_ids(conn, caller):
+        return error("access denied to this site", 403)
+    params = event.get("queryStringParameters") or {}
+    date = params.get("date")
+    if date is not None and not REPORT_DATE_RE.match(date):
+        return error("date must be YYYY-MM-DD", 400)
+    if not date:
+        # The client's own NZ calendar day, never datetime.now().date() (BUG-37) — a UTC
+        # date would answer for a day that, in NZ, has not started or already ended.
+        date = nz_time.nz_today().isoformat()
+    rows = site_attendance.for_day(conn, caller["company_id"], site_id, date)
+    return ok({"site": str(site_id), "date": date,
+              "rows": [_serialize_attendance_row(r) for r in rows]})
+
+
+def create_site_attendance(conn, caller, site_id, event):
+    """POST /api/org/sites/{id}/attendance — a site manager lists today's people.
+
+    `manual` ships first in the roadmap because it needs no third party (spec: "ships
+    first, proves the consumer") — this is that surface. Role gate mirrors every other
+    correction-adjacent write in this file (`_CORRECTION_ROLES`); the site ACL is the same
+    `_allowed_site_ids` every other site-scoped route uses.
+    """
+    if str(site_id) not in _allowed_site_ids(conn, caller):
+        return error("access denied to this site", 403)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    date = body.get("date") or nz_time.nz_today().isoformat()
+    if not isinstance(date, str) or not REPORT_DATE_RE.match(date):
+        return error("date must be YYYY-MM-DD", 400)
+    names = body.get("names")
+    if not isinstance(names, list) or not names:
+        return error("names must be a non-empty list", 400)
+    if len(names) > _ATTENDANCE_NAME_CAP:
+        return error(f"at most {_ATTENDANCE_NAME_CAP} names per request", 400)
+    rows = []
+    for n in names:
+        if not isinstance(n, dict):
+            return error("each name must be an object", 400)
+        display_name = (n.get("displayName") or "").strip()
+        if not display_name:
+            return error("displayName must not be blank", 400)
+        rows.append({"displayName": display_name, "employerName": n.get("employerName")})
+    with conn.transaction():
+        # Company from the CALLER, never the body -- a body-supplied company id would let
+        # one tenant write another's roster (the same rule every write endpoint in this
+        # file follows for the same reason).
+        result = site_attendance.upsert(conn, caller["company_id"], site_id, date, rows,
+                                        source="manual", created_by=caller["id"])
+    listing = site_attendance.for_day(conn, caller["company_id"], site_id, date)
+    return ok({"inserted": result["inserted"], "updated": result["updated"],
+              "rows": [_serialize_attendance_row(r) for r in listing]})
+
+
+def delete_site_attendance(conn, caller, site_id, row_id, event):
+    """DELETE /api/org/sites/{id}/attendance/{rowId}?date=YYYY-MM-DD — manual rows only.
+
+    A connector row (Phase 2/3) is the source's own to remove or overwrite on its next
+    sync (plan correction 7); deleting one here would be silently undone, with nothing on
+    screen explaining why it came back. 409, not a silent no-op, so the caller can tell
+    "removed" from "refused" — the same reason a `return error(...)` here never looks like
+    success.
+    """
+    if str(site_id) not in _allowed_site_ids(conn, caller):
+        return error("access denied to this site", 403)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    params = event.get("queryStringParameters") or {}
+    date = params.get("date")
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date must be YYYY-MM-DD", 400)
+    rows = site_attendance.for_day(conn, caller["company_id"], site_id, date)
+    row = next((r for r in rows if str(r["id"]) == str(row_id)), None)
+    if row is None:
+        return error("not found", 404)
+    if row["source"] != "manual":
+        return error("only a manual row may be removed here; a connector row is the "
+                     "source's own to remove or overwrite on its next sync", 409)
+    with conn.transaction():
+        n = site_attendance.remove(conn, caller["company_id"], site_id, date, row_id)
+    return ok({"removed": n})
 
 
 def create_qr_login_code(conn, caller, event):
@@ -5939,6 +6208,33 @@ def _allowed_site_ids(conn, caller):
 
 _SITE_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
+
+def get_site_weather(conn, caller, event):
+    """GET /api/org/weather?site=<uuid|slug>&date=YYYY-MM-DD -- one site's day.
+
+    Returns {forecast, actual}: the morning forecast the report generator
+    wrote at 05:30 (weather/<uuid>/<date>/forecast.json) and, once the day has
+    been reported, the actuals (actual.json). Each is null when not written --
+    a site with no coordinate, or a day before either job ran. What the
+    weather MEANT is already in `lines`, decided by weather_advice; the page
+    shows them as they are and decides nothing.
+
+    Same ACL as the programme: the site must be one the caller can reach.
+    """
+    params = event.get("queryStringParameters") or {}
+    site_id, err = _resolve_site_param(conn, caller, params.get("site"))
+    if err is not None:
+        return err
+    date = params.get("date") or nz_time.nz_now().strftime("%Y-%m-%d")
+    if not REPORT_DATE_RE.match(date):
+        return error("date must be YYYY-MM-DD", 400)
+    return ok({
+        "site": site_id,
+        "date": date,
+        "forecast": _get_lake_json(f"weather/{site_id}/{date}/forecast.json"),
+        "actual": _get_lake_json(f"weather/{site_id}/{date}/actual.json"),
+    })
 
 
 def _resolve_site_param(conn, caller, site_param):

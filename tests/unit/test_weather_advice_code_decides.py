@@ -221,3 +221,56 @@ def test_a_cold_morning_is_reported_once_not_as_cold_and_cool():
 def test_29_degrees_is_not_hot_for_concrete_and_30_is():
     assert not wa.assess(hours(h13={"temp_c": 29.0}), planned=["concrete pour"])["items"]
     assert wa.assess(hours(h13={"temp_c": 30.0}), planned=["concrete pour"])["items"][0]["kind"] == "heat"
+
+
+# ---- the day's programme (owner, 2026-09-29) ------------------------------------
+
+@pytest.mark.parametrize("kind,name,hit", [
+    ("rain", "Pour L2 slab", True),
+    ("rain", "Roof sheeting - Block B", True),
+    ("rain", "External render to west wall", True),
+    ("rain", "Internal painting - Level 3", False),      # indoors, whatever the trade
+    ("rain", "Level 2 fit-out", False),
+    ("wind", "Steel erection gridline 4", True),
+    ("wind", "Precast panel install", True),
+    ("wind", "Tower crane lifts - roof trusses", True),
+    ("wind", "Interior glazing", False),
+    ("heat", "Pour L2 slab", True),
+    ("cool", "Exterior painting - north elevation", True),
+    ("cool", "Electrical rough-in", False),
+])
+def test_real_task_names_are_matched_by_word_stem(kind, name, hit):
+    assert wa._hits(kind, name) is hit
+
+
+PROGRAMME = {"leaves": [
+    {"name": "Pour L2 slab", "start": "2026-09-29", "end": "2026-09-29", "progress_pct": 0},
+    {"name": "Roof sheeting - Block B", "start": "2026-09-25", "end": "2026-10-03", "progress_pct": 40},
+    {"name": "Excavation - carpark", "start": "2026-09-01", "end": "2026-09-20", "progress_pct": 100},
+    {"name": "Internal linings", "start": "2026-09-28", "end": "2026-10-10", "progress_pct": 10},
+    {"name": "Done early", "start": "2026-09-28", "end": "2026-10-02", "status": "complete"},
+    {"name": "Next week", "start": "2026-10-06", "end": "2026-10-08"},
+]}
+
+
+def test_the_days_plan_is_what_runs_today_and_is_not_finished():
+    assert wa.planned_from_programme(PROGRAMME, "2026-09-29") == [
+        "Pour L2 slab", "Roof sheeting - Block B", "Internal linings"]
+
+
+def test_no_programme_is_none_not_an_empty_day():
+    assert wa.planned_from_programme(None, "2026-09-29") is None
+    assert wa.planned_from_programme({"parents": []}, "2026-09-29") is None
+    assert wa.planned_from_programme({"leaves": []}, "2026-09-29") == []
+
+
+def test_rain_names_the_planned_tasks_it_hits_and_only_those():
+    planned = wa.planned_from_programme(PROGRAMME, "2026-09-29")
+    item = wa.assess(AFTERNOON_RAIN, planned=planned)["items"][0]
+    assert item["impact_basis"] == "planned"
+    assert item["impacts"] == ["Pour L2 slab", "Roof sheeting - Block B"]
+
+
+def test_a_plan_with_nothing_exposed_makes_the_weather_one_line():
+    f = wa.assess(AFTERNOON_RAIN, planned=["Internal linings", "Electrical rough-in"])
+    assert wa.render_template(f) == [wa.NO_IMPACT_LINE]

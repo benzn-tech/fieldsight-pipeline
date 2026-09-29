@@ -1721,6 +1721,16 @@ Resources:
             Description: Daily report generation (5 AM NZDT)
             State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
             Input: '{"report_type": "daily"}'
+        # Today's forecast per site, judged against today's programme, for the
+        # Morning Brief. After the 04:30 coordinate republish (org-api) and the
+        # 05:00 reports, before anyone opens Today.
+        WeatherForecastSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(30 16 * * ? *)
+            Description: Morning weather forecast per site (5:30 AM NZDT)
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
+            Input: '{"report_type": "weather_forecast"}'
         WeeklyReportSchedule:
           Type: Schedule
           Properties:
@@ -2306,6 +2316,9 @@ Resources:
               Resource:
                 - !Sub arn:aws:s3:::${DataBucketName}/audio_segments/*
                 - !Sub arn:aws:s3:::${DataBucketName}/web_video/*
+                # GET /weather: the per-site-day forecast and actual records the
+                # report generator writes (weather_advice). Read-only here.
+                - !Sub arn:aws:s3:::${DataBucketName}/weather/*
             - Effect: Allow
               # Without ListBucket, S3 returns AccessDenied/403 (not
               # NoSuchKey/404) for a missing object under a prefix this
@@ -2349,6 +2362,10 @@ Resources:
                     # one key, not config/*: nothing here should learn what else
                     # lives in config/.
                     - config/site-coords.json
+                    # GET /weather reads a day that may not have been written yet
+                    # (no coordinate, or before 05:30): that must read as null,
+                    # not as a 403 dressed as a 500.
+                    - weather/*
                     # In-app updates (GET /api/org/app/latest). Without this a stage with no
                     # release yet answers AccessDenied instead of NoSuchKey, and the route
                     # reports it -- correctly -- as 503 rather than "no update".

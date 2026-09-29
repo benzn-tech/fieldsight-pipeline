@@ -613,3 +613,76 @@ def test_a_calibrated_floor_replaces_the_default():
     floor fitted to theirs."""
     d = vp.decide_name({"Ben": 0.30, "Zoe": 0.05}, duration_s=8.0, floor=0.25)
     assert d.status == "confirmed" and d.name == "Ben"
+
+
+# ---- roster narrowing (on-site-roster plan, Task 4, correction 3) ----------------------
+#
+# The plan's spec-correction 3 is the authoritative rule (the design doc's own "Review
+# outcome" section, and the plan says the code contradicting the spec wins): score every
+# profile first, take the full-pool winner; an OFF-roster winner is capped at tentative
+# (never renamed to the on-roster runner-up -- that would be the exact wrong-confident-name
+# a naive "margin computed against the subset only" would produce, which the plan calls
+# unsafe and explicitly rejects); an ON-roster winner is re-decided over the on-roster
+# subset alone, which is where the real benefit lives: an absent colleague who used to be
+# the runner-up no longer counts against the margin.
+
+
+def test_no_roster_is_byte_for_byte_todays_decide_name():
+    """Absent/empty roster: decide_with_roster must return the SAME Decision fields as
+    calling decide_name directly, not merely the same status."""
+    scores = {"A": 0.60, "B": 0.58}
+    direct = vp.decide_name(scores, duration_s=8.0, floor=0.1)
+    via_roster = vp.decide_with_roster(scores, on_roster=set(), duration_s=8.0, floor=0.1)
+    assert via_roster == direct
+    via_roster_none = vp.decide_with_roster(scores, on_roster=None, duration_s=8.0, floor=0.1)
+    assert via_roster_none == direct
+
+
+def test_an_off_roster_winner_is_capped_at_tentative_not_renamed():
+    """A off-roster wins by a wide margin with the floor satisfied: without a roster this
+    confirms A; with one, A is still named (the roster narrows, never blocks) but capped at
+    tentative -- and NEVER silently swapped for the on-roster runner-up B."""
+    scores = {"A": 0.80, "B": 0.20}
+    without = vp.decide_name(scores, duration_s=8.0, floor=0.1)
+    assert without.status == "confirmed" and without.name == "A"
+    with_roster = vp.decide_with_roster(scores, on_roster={"B"}, duration_s=8.0, floor=0.1)
+    assert with_roster.status == "tentative"
+    assert with_roster.name == "A", "capped, never renamed to the on-roster runner-up"
+    assert "roster" in with_roster.reason.lower()
+
+
+def test_an_on_roster_winner_is_redecided_over_the_subset():
+    """A (on-roster) beats B (off-roster, an absent colleague) by only 0.02 -- below the
+    margin -- so the full pool alone gives only a tentative lean. C is also on-roster, far
+    behind. Narrowing to the on-roster subset {A, C} drops B, the absent colleague, and the
+    margin against C easily clears the bar -- the roster's whole point."""
+    scores = {"A": 0.60, "B": 0.58, "C": 0.10}
+    without = vp.decide_name(scores, duration_s=8.0, floor=0.1)
+    assert without.status == "tentative" and without.name == "A"
+    with_roster = vp.decide_with_roster(scores, on_roster={"A", "C"}, duration_s=8.0,
+                                        floor=0.1)
+    assert with_roster.status == "confirmed" and with_roster.name == "A"
+
+
+def test_a_single_on_roster_profile_falls_back_to_the_full_pool_result():
+    """A one-person roster narrows nothing (plan correction 3): decide_name over a subset
+    of one profile has no runner-up (margin=None), which downstream would be read as "no
+    runner-up" and the turn dropped -- so this falls back to the full-pool decision,
+    runner-up and all."""
+    scores = {"A": 0.60, "B": 0.58}
+    without = vp.decide_name(scores, duration_s=8.0, floor=0.1)
+    with_roster = vp.decide_with_roster(scores, on_roster={"A"}, duration_s=8.0, floor=0.1)
+    assert with_roster == without
+
+
+def test_duration_floor_still_applies_under_a_roster():
+    d = vp.decide_with_roster({"A": 0.9, "B": 0.1}, on_roster={"A"}, duration_s=2.0)
+    assert d.status == "unknown"
+
+
+def test_absent_floor_still_applies_under_a_roster():
+    """best=0.20 with no company floor is below DEFAULT_ABSENT_FLOOR regardless of the
+    roster -- the roster narrows candidates, it does not lower the plausibility bar."""
+    d = vp.decide_with_roster({"A": 0.20, "B": 0.05}, on_roster={"A"}, duration_s=8.0,
+                              floor=None)
+    assert d.status == "unknown"
