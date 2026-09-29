@@ -65,7 +65,7 @@ from urllib.parse import unquote_plus
 
 import boto3
 
-import carry_forward
+import carry_forward_apply
 import lambda_ingest
 import keyframe_request
 import match_request
@@ -82,7 +82,7 @@ from photo_binding import photos_for_topics as _photos_for_topics  # noqa: F401 
 import photo_rebind
 import thread_match
 from repositories import location_markers
-from repositories import (action_items, companies, decision_records, findings, meeting_session,
+from repositories import (companies, decision_records, findings, meeting_session,
                           recordings, redactions,
                           session_group, sites, threads, topic_decisions, topic_questions,
                           topics)
@@ -1391,14 +1391,15 @@ def write_extraction_items(date, user_folder, extraction_key):
         # pool and nothing to report -- the common case, and the whole reason retired_topics
         # is checked here rather than always calling into an empty match.
         #
-        # _carry_forward_children runs its own work inside a SAVEPOINT, not a bare
+        # _carry_forward_children (carry_forward_apply.py -- final wave, Ruling R19: shared
+        # with lambda_ingest's report path) runs its own work inside a SAVEPOINT, not a bare
         # try/except (Ruling R10): a bug there must DEGRADE (the topics/findings/action-items
         # already inserted above still commit) rather than ABORT the whole pass -- and only a
         # real SAVEPOINT undoes that, since Postgres aborts the enclosing transaction on any
         # SQL error and a Python try/except cannot un-abort it. See that function's own
         # docstring for the full reasoning (same shape as _suggest_threads above it).
         if retired_topics:
-            _carry_forward_children(
+            carry_forward_apply._carry_forward_children(
                 conn, [t["id"] for t in retired_topics], new_topic_ids, site["id"],
                 extraction_key)
 
@@ -1523,135 +1524,6 @@ def write_extraction_items(date, user_folder, extraction_key):
 # ----------------------------------------------------------
 # Entry point — S3 event
 # ----------------------------------------------------------
-def _carry_forward_one_table(conn, repo, old_topic_ids, new_topic_ids, site_id):
-    """Match one child table's retired rows to their replacements and carry stable_id (plus
-    any human edit) forward. Returns the number of human-touched OLD rows that found no
-    successor -- the caller's contribution to the OrphanedHumanEdits metric/log.
-
-    `repo` is `action_items`, `findings`, `topic_decisions` or `topic_questions` (Track B
-    Task 4, extended to the last two by Task 5): all four expose
-    list_for_carry_forward(conn, topic_ids, site_id) -> rows with a computed `human_touched`,
-    and carry_identity(conn, new_id, old_row), with the identical shape -- which is what lets
-    this be one function instead of four near-duplicates."""
-    old_rows = repo.list_for_carry_forward(conn, old_topic_ids, site_id)
-    if not old_rows:
-        return 0
-    new_rows = repo.list_for_carry_forward(conn, new_topic_ids, site_id)
-    old_by_id = {r["id"]: r for r in old_rows}
-    pairs, orphans = carry_forward.match(old_rows, new_rows)
-    for old_id, new_id, _how in pairs:
-        repo.carry_identity(conn, new_id, old_by_id[old_id])
-    return sum(1 for oid in orphans if old_by_id[oid]["human_touched"])
-
-
-def _carry_forward_children(conn, old_topic_ids, new_topic_ids, site_id, extraction_key):
-    """Track B Task 4: carry a human's tick, status, reassignment or deadline edit from a row
-    this pass just superseded to the row that replaced it, matched by TEXT -- the new row's
-    id did not exist when the person made the edit, so stable_id can only be assigned
-    afterwards, by finding which new row is "the same" commitment reworded.
-
-    `old_topic_ids` / `new_topic_ids` are both narrowed to `site_id` inside
-    `list_for_carry_forward` (Ruling R9): the pool is exactly this invocation's retired
-    topics and this pass's own new topics, never another extraction key's superseded rows
-    and never another site's.
-
-    A SAVEPOINT (`conn.transaction()` nested inside the caller's already-open transaction),
-    not a bare try/except -- same reason `_suggest_threads` above uses one (Ruling R10):
-    Postgres aborts the WHOLE enclosing transaction on any SQL error, and catching that in
-    Python does not un-abort it. A bare try/except here would let the exception stop
-    propagating while every later statement in this pass -- the photo rebind below, the
-    final-email lookup, the commit itself -- started failing too, so a carry_forward bug
-    would silently take the whole extraction down with it. The SAVEPOINT makes "degrade, do
-    not abort" (R10) actually true: on failure it rolls back only what carry_forward itself
-    did, leaving the topics/action_items/findings already inserted above intact and
-    committable, exactly like a matcher bug leaves the topics `_suggest_threads` was fed
-    intact today.
-
-    Always reports, including zero (Ruling R5) -- an operator reading "0 for that key" is
-    the point of an EMF line with a `key` property, not a lucky silence indistinguishable
-    from a producer that never ran. On failure the metric is NOT zero: nothing was carried,
-    so every human-touched old row is -- by definition -- an orphan this pass, and the count
-    is recomputed by a fallback read after the SAVEPOINT has rolled back (R10: "the metric
-    must not read 0 when carry-forward crashed")."""
-    try:
-        with conn.transaction():
-            orphaned = (_carry_forward_one_table(conn, action_items, old_topic_ids,
-                                                 new_topic_ids, site_id)
-                       + _carry_forward_one_table(conn, findings, old_topic_ids,
-                                                  new_topic_ids, site_id)
-                       + _carry_forward_one_table(conn, topic_decisions, old_topic_ids,
-                                                  new_topic_ids, site_id)
-                       + _carry_forward_one_table(conn, topic_questions, old_topic_ids,
-                                                  new_topic_ids, site_id))
-    except Exception:
-        logger.exception(
-            "carry_forward failed for %s -- topics were written, no identity was carried "
-            "forward this pass", extraction_key)
-        orphaned = _count_human_touched_old(conn, old_topic_ids, site_id, extraction_key)
-    _report_orphaned_human_edits(extraction_key, orphaned)
-
-
-def _count_human_touched_old(conn, old_topic_ids, site_id, extraction_key):
-    """Fallback for `_carry_forward_children`'s except branch: every human-touched OLD row
-    across all four child tables, unconditionally -- carry_forward crashed, so none of them
-    found a successor this pass, regardless of which table or which pair was mid-flight when
-    it failed. Runs AFTER the failed SAVEPOINT has already rolled back, as a plain read that
-    was not itself part of what failed.
-
-    Never raises further: if even this cannot run, there is no better number left to report,
-    so it logs and answers 0 -- which undercounts, but a metric that also throws would take
-    the whole pass down for real, the one outcome R10 exists to prevent."""
-    try:
-        return sum(1 for repo in (action_items, findings, topic_decisions, topic_questions)
-                   for row in repo.list_for_carry_forward(conn, old_topic_ids, site_id)
-                   if row["human_touched"])
-    except Exception:
-        logger.exception(
-            "could not count human-touched rows for %s after carry_forward failed -- "
-            "OrphanedHumanEdits will under-report for this pass", extraction_key)
-        return 0
-
-
-def _report_orphaned_human_edits(extraction_key, count):
-    """Tell an operator about human-touched rows that carry_forward could not carry.
-
-    Two channels, because they answer two different questions: the WARNING is for someone
-    reading THIS extraction's logs ("did we lose a tick just now?"), the metric is for
-    someone watching the fleet ("is this getting worse?") -- and only the metric is
-    non-zero-suppressed, so a dashboard can tell "nothing lost" from "this key never ran"
-    (Ruling R5).
-
-    Embedded Metric Format printed to stdout, not `put_metric_data`: ItemWriterFunction is
-    in-VPC with no CloudWatch endpoint (CLAUDE.md BUG-36) -- a real API call here would
-    blackhole to a timeout with zero logs, exactly like ExtractionBacklogFunction's working
-    put_metric_data call would if it were deployed in-VPC. Modelled on
-    lambda_transcribe._emit_failure_metric's `_aws` block. Never raises: a metric or a log
-    line that fails must not take an already-committed extraction down with it -- this runs
-    after the transaction line above, by which point the rows are durable either way.
-    """
-    if count:
-        logger.warning(
-            "carry_forward: %d human-touched rows had no successor (key=%s)",
-            count, extraction_key)
-    try:
-        import time as _t
-        print(json.dumps({
-            "_aws": {
-                "Timestamp": int(_t.time() * 1000),
-                "CloudWatchMetrics": [{
-                    "Namespace": "FieldSight/Pipeline",
-                    "Dimensions": [["Stage"]],
-                    "Metrics": [{"Name": "OrphanedHumanEdits", "Unit": "Count"}],
-                }],
-            },
-            "Stage": os.environ.get("STAGE", "unknown"),
-            "OrphanedHumanEdits": count,
-            "key": extraction_key,
-        }))
-    except Exception:
-        logger.warning("could not emit the OrphanedHumanEdits metric for %s", extraction_key)
-
-
 def _source_is_deleted(conn, source_s3_key) -> bool:
     """Whether this extraction's source has been deleted by its owner.
 

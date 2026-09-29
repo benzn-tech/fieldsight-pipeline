@@ -11,6 +11,10 @@ cheap-skip when a table's old pool is empty -- not the matching itself
 (tests/unit/test_carry_forward.py) or the full repository wiring (the Step 5 integration test
 in tests/integration/test_supersede_two_passes.py). Same granularity the file this replaces
 tested at.
+
+The functions under test moved from lambda_item_writer.py into carry_forward_apply.py on the
+final wave (Ruling R19), so lambda_ingest's report path can share them -- import path only,
+same functions, same behaviour.
 """
 import json
 import os
@@ -21,7 +25,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))), "src"))
 
-iw = pytest.importorskip("lambda_item_writer")
+cfa = pytest.importorskip("carry_forward_apply", reason="requires psycopg (installed in CI)")
 
 KEY = "extractions/Ben_UCPK2/2026-08-17/sid9f8c1e2a4b6d47f0a1b2c3d4e5f60718.json"
 
@@ -33,7 +37,7 @@ def _emf_lines(capsys):
 
 def test_it_warns_and_emits_the_metric_when_something_was_orphaned(caplog, capsys):
     with caplog.at_level("WARNING"):
-        iw._report_orphaned_human_edits(KEY, 3)
+        cfa._report_orphaned_human_edits(KEY, 3)
     msgs = [r.getMessage() for r in caplog.records]
     assert any("3" in m and KEY in m for m in msgs), msgs
     assert any("carry_forward" in m for m in msgs), msgs
@@ -56,7 +60,7 @@ def test_zero_is_still_emitted_but_silent(caplog, capsys):
     supersession is exactly the noise the old function was built to avoid, and noise is how
     the next real orphan gets ignored."""
     with caplog.at_level("WARNING"):
-        iw._report_orphaned_human_edits(KEY, 0)
+        cfa._report_orphaned_human_edits(KEY, 0)
     assert [r for r in caplog.records if r.levelname == "WARNING"] == []
 
     lines = _emf_lines(capsys)
@@ -72,9 +76,9 @@ def test_a_failed_metric_emission_never_stops_the_extraction(monkeypatch, caplog
     def _boom(*a, **k):
         raise RuntimeError("stdout gone")
 
-    monkeypatch.setattr(iw.json, "dumps", _boom)
+    monkeypatch.setattr(cfa.json, "dumps", _boom)
     with caplog.at_level("WARNING"):
-        iw._report_orphaned_human_edits(KEY, 1)   # must not raise
+        cfa._report_orphaned_human_edits(KEY, 1)   # must not raise
     assert any("could not emit" in r.getMessage() for r in caplog.records)
 
 
@@ -90,7 +94,7 @@ def test_carry_forward_one_table_skips_the_new_query_when_nothing_old_was_touche
             calls.append(list(topic_ids))
             return []
 
-    n = iw._carry_forward_one_table(None, _EmptyOldRepo, ["old-topic"], ["new-topic"], "site-1")
+    n = cfa._carry_forward_one_table(None, _EmptyOldRepo, ["old-topic"], ["new-topic"], "site-1")
     assert n == 0
     assert calls == [["old-topic"]], "must ask for the OLD pool once and stop there"
 
@@ -133,11 +137,11 @@ def test_carry_forward_children_degrades_instead_of_raising_on_a_matcher_crash(
     def _boom(*a, **k):
         raise RuntimeError("matcher exploded")
 
-    monkeypatch.setattr(iw, "_carry_forward_one_table", _boom)
-    monkeypatch.setattr(iw, "_count_human_touched_old", lambda *a, **k: 2)
+    monkeypatch.setattr(cfa, "_carry_forward_one_table", _boom)
+    monkeypatch.setattr(cfa, "_count_human_touched_old", lambda *a, **k: 2)
 
     with caplog.at_level("WARNING"):
-        iw._carry_forward_children(  # must not raise
+        cfa._carry_forward_children(  # must not raise
             _FakeConn(), ["old-topic"], ["new-topic"], "site-1", KEY)
 
     error_records = [r for r in caplog.records if r.levelname == "ERROR"]
@@ -162,15 +166,15 @@ def test_count_human_touched_old_sums_all_four_tables(monkeypatch):
         def list_for_carry_forward(self, conn, topic_ids, site_id):
             return self._rows
 
-    monkeypatch.setattr(iw, "action_items", _Repo([
+    monkeypatch.setattr(cfa, "action_items", _Repo([
         {"id": "a1", "human_touched": True}, {"id": "a2", "human_touched": False}]))
-    monkeypatch.setattr(iw, "findings", _Repo([{"id": "f1", "human_touched": True}]))
+    monkeypatch.setattr(cfa, "findings", _Repo([{"id": "f1", "human_touched": True}]))
     # Track B Task 5: two more child tables joined the sum -- decisions/questions rows.
-    monkeypatch.setattr(iw, "topic_decisions", _Repo([{"id": "d1", "human_touched": True}]))
-    monkeypatch.setattr(iw, "topic_questions", _Repo([
+    monkeypatch.setattr(cfa, "topic_decisions", _Repo([{"id": "d1", "human_touched": True}]))
+    monkeypatch.setattr(cfa, "topic_questions", _Repo([
         {"id": "q1", "human_touched": True}, {"id": "q2", "human_touched": False}]))
 
-    n = iw._count_human_touched_old(None, ["old-topic"], "site-1", KEY)
+    n = cfa._count_human_touched_old(None, ["old-topic"], "site-1", KEY)
     assert n == 4
 
 
@@ -183,10 +187,10 @@ def test_count_human_touched_old_never_raises(monkeypatch, caplog):
         def list_for_carry_forward(conn, topic_ids, site_id):
             raise RuntimeError("db gone")
 
-    monkeypatch.setattr(iw, "action_items", _BoomRepo)
-    monkeypatch.setattr(iw, "findings", _BoomRepo)
+    monkeypatch.setattr(cfa, "action_items", _BoomRepo)
+    monkeypatch.setattr(cfa, "findings", _BoomRepo)
 
     with caplog.at_level("ERROR"):
-        n = iw._count_human_touched_old(None, ["old-topic"], "site-1", KEY)   # must not raise
+        n = cfa._count_human_touched_old(None, ["old-topic"], "site-1", KEY)   # must not raise
     assert n == 0
     assert any(r.levelname == "ERROR" for r in caplog.records)
