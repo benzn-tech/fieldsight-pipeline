@@ -543,8 +543,25 @@ def build_weather_block_for_site(site_info, target_date, today_iso,
         return None
 
 
+def programme_for_site(site_info, bucket=None):
+    """The site's programme snapshot (programmes/<uuid>/programme.json), or
+    None when the site has no UUID known here or no programme uploaded."""
+    uuid = (site_info or {}).get("site_uuid")
+    if not uuid:
+        return None
+    return download_json_from_s3(bucket or S3_BUCKET, f"programmes/{uuid}/programme.json")
+
+
+def weather_record_site(site_info, fallback_slug):
+    """The id weather records are kept under: the site's UUID, which is what
+    org-api and the Today page know a site by; the slug only when no UUID is
+    known, so a record is never dropped for want of one."""
+    return (site_info or {}).get("site_uuid") or fallback_slug
+
+
 def build_weather_findings(site_info, target_date, today_iso,
-                           fetch=weather_advice.hourly_forecast):
+                           fetch=weather_advice.hourly_forecast,
+                           programme=None):
     """What the weather meant for the day's work, DECIDED BY CODE.
 
     Until 2026-09-29 the report handed the model one sentence of daily totals
@@ -554,10 +571,13 @@ def build_weather_findings(site_info, target_date, today_iso,
     the lines here are its fixed template, so the compliance record says the
     same thing about the same weather every time.
 
-    Generic impacts for now (owner, 2026-09-29): the day's programme is not
-    matched yet, so the trades named are the ones that weather affects in
-    general, and `impact_basis` says so. None when the site has no coordinate
-    or the fetch fails -- the report says "not recorded" rather than guessing.
+    THE DAY'S PROGRAMME decides what is impacted (owner, 2026-09-29): the
+    tasks running on the day and not finished are matched against the
+    weather; a day whose exposed work is all indoors gets one "no impact"
+    line. A site with no programme names the trades weather affects in
+    general. `impact_basis` ("planned" | "general") says which it was.
+    None when the site has no coordinate or the fetch fails -- the report
+    says "not recorded" rather than guessing.
     """
     lat = site_info.get("latitude")
     lng = site_info.get("longitude")
@@ -571,12 +591,14 @@ def build_weather_findings(site_info, target_date, today_iso,
         return None
     if not hours:
         return None
-    f = weather_advice.assess(hours, planned=None, actual=historical)
+    planned = weather_advice.planned_from_programme(programme, target_date)
+    f = weather_advice.assess(hours, planned=planned, actual=historical)
     return {
         "lines": weather_advice.render_template(f),
         "weather_day": f["weather_day"] if historical else None,
         "actual": historical,
-        "impact_basis": "general",
+        "impact_basis": "general" if planned is None else "planned",
+        "planned": planned,
         "items": f["items"],
     }
 
@@ -586,6 +608,45 @@ def weather_record_key(site_id, target_date, actual):
     read, and what a later count of weather days (for extension-of-time claims)
     adds up."""
     return f"weather/{site_id}/{target_date}/{'actual' if actual else 'forecast'}.json"
+
+
+def run_weather_forecasts(date=None, fetch=weather_advice.hourly_forecast):
+    """The morning's weather, for every placed site, before anyone is on site.
+
+    For the Morning Brief on Today (owner, 2026-09-29). Scheduled at 05:30
+    NZDT: every site in config/site-coords.json gets today's hourly forecast
+    judged against today's programme, kept at weather/<uuid>/<date>/forecast.json
+    for org-api to hand to the page. The same judgement the daily report makes
+    the next night on the actuals -- one set of rules, two moments.
+
+    A site with no UUID in the file is skipped rather than keyed by slug: the
+    page asks by UUID, so a slug-keyed forecast would be written and never read.
+    """
+    date = date or get_nzdt_now().strftime('%Y-%m-%d')
+    doc = download_json_from_s3(S3_BUCKET, site_coords.KEY) or {}
+    written, skipped = [], []
+    for slug, entry in (doc.items() if isinstance(doc, dict) else []):
+        if not isinstance(entry, dict) or not entry.get("site_id"):
+            skipped.append(slug)
+            continue
+        info = {"latitude": entry.get("latitude"), "longitude": entry.get("longitude"),
+                "site_uuid": entry["site_id"]}
+        findings = build_weather_findings(info, date, date, fetch=fetch,
+                                          programme=programme_for_site(info))
+        if not findings:
+            skipped.append(slug)
+            continue
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=weather_record_key(entry["site_id"], date, False),
+            Body=json.dumps({"site_id": entry["site_id"], "site_slug": slug, "date": date,
+                             "generated_at": get_nzdt_now().isoformat(), **findings},
+                            default=str).encode("utf-8"),
+            ContentType="application/json")
+        written.append(slug)
+    logger.info(f"weather forecasts for {date}: {len(written)} written, "
+                f"{len(skipped)} skipped ({', '.join(skipped) or 'none'})")
+    return {"date": date, "written": written, "skipped": skipped}
 
 
 def build_daily_prompt(transcripts_with_photos, user_name, site_name, target_date,
@@ -1645,13 +1706,17 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
 
         today_iso = get_nzdt_now().strftime('%Y-%m-%d')
         weather_block = build_weather_block_for_site(user_site_info, target_date, today_iso)
-        weather_findings = build_weather_findings(user_site_info, target_date, today_iso)
-        if weather_findings and user_site_id:
+        weather_findings = build_weather_findings(
+            user_site_info, target_date, today_iso,
+            programme=programme_for_site(user_site_info))
+        record_site = weather_record_site(user_site_info, user_site_id)
+        if weather_findings and record_site:
             try:
                 s3_client.put_object(
                     Bucket=S3_BUCKET,
-                    Key=weather_record_key(user_site_id, target_date, weather_findings["actual"]),
-                    Body=json.dumps({"site_id": user_site_id, "date": target_date,
+                    Key=weather_record_key(record_site, target_date, weather_findings["actual"]),
+                    Body=json.dumps({"site_id": record_site, "site_slug": user_site_id,
+                                     "date": target_date,
                                      "daily": weather_block, **weather_findings},
                                     default=str).encode("utf-8"),
                     ContentType="application/json")
@@ -2290,6 +2355,10 @@ def lambda_handler(event, context):
         return {'statusCode': 200, 'body': json.dumps(outcomes, default=str)}
 
     report_type = event.get('report_type', 'daily')
+
+    if report_type == 'weather_forecast':
+        return {'statusCode': 200,
+                'body': json.dumps(run_weather_forecasts(event.get('date')), default=str)}
 
     if report_type == 'daily':
         target_date = event.get('date', get_yesterday_date())

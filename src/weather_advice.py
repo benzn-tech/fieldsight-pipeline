@@ -110,18 +110,52 @@ GENERAL_IMPACT = {
     "cool": ["exterior painting"],
 }
 
-# Which work each kind of weather hits. Matched against the day's planned
-# work (programme tasks, open items) to find a conflict; used as-is only when
-# there is no plan to match against.
+# Which work each kind of weather hits, as WORD STEMS matched against the
+# start of each word of a programme task's name. Real task names are written
+# the way a planner writes them -- "Pour L2 slab", "Roof sheeting - Block B",
+# "Steel erection gridline 4" -- and a phrase list ("concrete pour") matched
+# none of them.
 SENSITIVE_WORK = {
-    "rain": ("exterior painting", "coating", "concrete pour", "earthworks",
-             "roofing", "membrane", "waterproofing", "blocklaying", "bricklaying"),
-    "wind": ("crane lift", "lifting", "work at height", "scaffold", "roofing",
-             "cladding"),
-    "heat": ("concrete pour", "asphalt"),
-    "cold": ("concrete pour", "curing", "coating", "sealant", "paint"),
-    "cool": ("paint", "coating", "sealant"),
+    "rain": ("paint", "coat", "pour", "concret", "slab", "screed", "earthwork", "excavat",
+             "backfill", "trench", "roof", "membrane", "waterproof", "block", "brick",
+             "render", "sealant", "asphalt", "paving", "kerb", "landscap"),
+    "wind": ("crane", "lift", "precast", "erect", "steel", "roof", "clad", "scaffold",
+             "height", "glaz", "facade", "tilt"),
+    "heat": ("pour", "concret", "slab", "screed", "asphalt"),
+    "cold": ("pour", "concret", "slab", "screed", "paint", "coat", "sealant", "render"),
+    "cool": ("paint", "coat", "sealant", "render"),
 }
+
+# Work done indoors is not stopped by rain or wind, whatever else its name says.
+INDOOR_WORDS = ("internal", "interior", "inside", "indoor")
+_WORD_RE = re.compile(r"[a-z]+")
+
+
+def _hits(kind, name):
+    words = _WORD_RE.findall((name or "").lower())
+    if kind in ("rain", "wind") and any(w in INDOOR_WORDS for w in words):
+        return False
+    return any(w.startswith(stem) for w in words for stem in SENSITIVE_WORK[kind])
+
+
+def planned_from_programme(doc, date):
+    """The day's planned work from a programme snapshot
+    (programmes/<site>/programme.json): the leaves running on `date` that are
+    not finished. None when there is no programme -- which is not the same as
+    an empty day, and the caller says which (impact_basis)."""
+    if not doc or not isinstance(doc.get("leaves"), list):
+        return None
+    out = []
+    for leaf in doc["leaves"]:
+        start, end = leaf.get("start"), leaf.get("end") or leaf.get("start")
+        if not start or not (start[:10] <= date <= end[:10]):
+            continue
+        if (leaf.get("progress_pct") or 0) >= 100 or                 str(leaf.get("status") or "").lower() in ("complete", "completed", "done"):
+            continue
+        name = (leaf.get("name") or "").strip()
+        if name and name not in out:
+            out.append(name)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -202,10 +236,9 @@ def _spells(hours, wet):
 def _conflicts(kind, planned):
     """(impacted work, basis). With a plan: the planned items this weather hits,
     and an empty list means no impact. Without one: the general list."""
-    words = SENSITIVE_WORK[kind]
     if planned is None:
         return list(GENERAL_IMPACT[kind]), "general"
-    hit = [p for p in planned if any(w in (p or "").lower() for w in words)]
+    hit = [p for p in planned if _hits(kind, p)]
     return hit, "planned"
 
 
