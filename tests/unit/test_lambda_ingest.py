@@ -791,23 +791,33 @@ def test_defer_day_links_chunks_to_extraction_topic_by_time(wired):
     # match on time overlap alone.
     wired.setattr(ing, "AUTHORITY_FLIP", True)
     wired.setattr(ing.topics, "has_topics_for_source_prefix", lambda conn, prefix: True)
+    ext_key = "extractions/Jarley_Trainor/2026-03-02/sidEXT1234567890.json"
     wired.setattr(
         ing.topics, "list_extraction_topics_for_day",
         lambda conn, site_id, user_id, report_date: [
-            {"id": "ext-a", "title": "Unrelated title", "occurred_at": "09:02:00"},
+            {"id": "ext-a", "title": "Unrelated title", "occurred_at": "09:02:00",
+             "source_s3_key": ext_key},
         ],
     )
-    captured_topic_ids = []
+    captured = []
     wired.setattr(
         ing.chunks, "insert_chunk",
         lambda conn, site_id, report_date, chunk_type, chunk_text, embedding, **kw:
-            captured_topic_ids.append(kw["topic_id"]) or {"id": "chunk-x"},
+            captured.append(kw) or {"id": "chunk-x"},
     )
 
     ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
 
+    captured_topic_ids = [kw["topic_id"] for kw in captured]
     assert captured_topic_ids
     assert captured_topic_ids[0] == "ext-a"
+
+    # PR #972 review #1: the matched extraction topic's own source_s3_key must land on
+    # the topic-type (chunk_report) chunk's metadata.source_files -- the only thing that
+    # lets archive_chunks_for_session's session_base arm still find this chunk once R21
+    # unbinds its topic_id on a later supersede of "ext-a". `_load_turns` is stubbed to
+    # [] by `wired`, so chunk_transcripts produces no windows and this is the only chunk.
+    assert captured[0]["metadata"]["source_files"] == [ext_key]
 
 
 def test_defer_day_unmatched_report_topic_stays_none(wired):
@@ -892,10 +902,10 @@ def test_defer_day_two_report_topics_do_not_collide_on_one_extraction(monkeypatc
         {"topic_id": 1, "time_range": "09:01 – 09:04", "topic_title": "Toolbox Talk"},
     ]
 
-    seq_to_id = ing._match_report_topics_to_extraction(
+    seq_to_ext = ing._match_report_topics_to_extraction(
         None, "site-1", "user-1", "2026-03-02", report_topics)
 
-    topic_ids = [seq_to_id.get(0), seq_to_id.get(1)]
+    topic_ids = [seq_to_ext.get(0, {}).get("id"), seq_to_ext.get(1, {}).get("id")]
     assert topic_ids[0] != topic_ids[1]
     non_none = [v for v in topic_ids if v is not None]
     assert len(non_none) == 1

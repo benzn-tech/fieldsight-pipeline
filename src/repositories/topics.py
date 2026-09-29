@@ -268,6 +268,20 @@ def get_topic(conn, topic_id):
         (topic_id,)).fetchone()
 
 
+# Shared by supersede_topics_for_source and supersede_topics_for_source_prefix (Ruling
+# R21, fix round 1 minor #4): appended to a `WITH retired AS (UPDATE topics ... RETURNING
+# id, title, summary)` CTE so both a source-key and a prefix supersede unbind the same way,
+# from one definition rather than two copies that could drift on the next edit.
+_UNBIND_RETIRED_CHUNKS_CTE = (
+    "), unbound AS ("
+    "  UPDATE report_chunks SET topic_id = NULL "
+    "  WHERE topic_id IN (SELECT id FROM retired) "
+    "  RETURNING 1"
+    ") "
+    "SELECT id, title, summary FROM retired"
+)
+
+
 def delete_topics_for_source(conn, source_s3_key) -> int:
     """Delete topics rows produced from one source report.
 
@@ -312,14 +326,28 @@ def supersede_topics_for_source(conn, source_s3_key, run) -> list[dict]:
     retired by an earlier call, here or via supersede_topics_for_source_prefix, is left alone
     rather than having its superseded_by_run overwritten.
 
+    Also unbinds `report_chunks.topic_id` for every topic this call retires (Ruling R21,
+    Task 8 live check on TEST). Before Track B, `delete_topics_for_source`'s DELETE let
+    `report_chunks.topic_id REFERENCES topics(id) ON DELETE SET NULL` do this for free, so a
+    superseded day's chunks fell back to the `topic_id IS NULL` (unassigned) bucket, which
+    `visible_chunks_predicate` always shows, and the next nightly re-ingest of that source
+    key deleted them by `delete_chunks_for_source` (no duplicates). Once this UPDATE stopped
+    deleting the row, that SET NULL never fired: a retired topic's chunks stayed bound to it,
+    `visible_chunks_predicate`'s third arm hid them (correctly, by construction), and the new
+    live topic has no chunks of its own until that day's report is re-ingested — which for an
+    older day may never happen, so the session silently drops out of search/Ask. This UPDATE,
+    in the same statement via a CTE, restores the old SET NULL outcome directly.
+
     Returns the RETURNING rows (id, title, summary) of every row this call retired. Task 4
     reads them to carry stable ids and human edits from a retired row to its replacement.
     Row order is whatever Postgres returns for an UPDATE ... RETURNING (unspecified) — a
     caller that needs a stable order must sort."""
     return conn.cursor(row_factory=dict_row).execute(
-        "UPDATE topics SET superseded_at=now(), superseded_by_run=%s "
-        "WHERE source_s3_key=%s AND superseded_at IS NULL "
-        "RETURNING id, title, summary",
+        "WITH retired AS ("
+        "  UPDATE topics SET superseded_at=now(), superseded_by_run=%s "
+        "  WHERE source_s3_key=%s AND superseded_at IS NULL "
+        "  RETURNING id, title, summary"
+        + _UNBIND_RETIRED_CHUNKS_CTE,
         (run, source_s3_key),
     ).fetchall()
 
@@ -449,12 +477,16 @@ def supersede_topics_for_source_prefix(conn, source_prefix, run) -> list[dict]:
     supersession of that day's session-sourced (live extraction) topics. Same LIKE-wildcard
     escaping as delete_topics_for_source_prefix (S3 user folders contain literal
     underscores — see _escape_like's docstring) and the same `run` / return contract as
-    supersede_topics_for_source."""
+    supersede_topics_for_source, including the report_chunks unbind (Ruling R21) — see that
+    function's docstring for why: this UPDATE stopped triggering
+    `report_chunks.topic_id ... ON DELETE SET NULL` the same way, for the same reason."""
     escaped = _escape_like(source_prefix)
     return conn.cursor(row_factory=dict_row).execute(
-        "UPDATE topics SET superseded_at=now(), superseded_by_run=%s "
-        "WHERE source_s3_key LIKE %s ESCAPE '\\' AND superseded_at IS NULL "
-        "RETURNING id, title, summary",
+        "WITH retired AS ("
+        "  UPDATE topics SET superseded_at=now(), superseded_by_run=%s "
+        "  WHERE source_s3_key LIKE %s ESCAPE '\\' AND superseded_at IS NULL "
+        "  RETURNING id, title, summary"
+        + _UNBIND_RETIRED_CHUNKS_CTE,
         (run, escaped + '%'),
     ).fetchall()
 
@@ -513,9 +545,14 @@ def list_extraction_topics_for_day(conn, site_id, user_id, report_date) -> list[
     (Task 7, WS1 root fix), so defer-day chunks carry a real extraction
     topic UUID instead of topic_id=None. source_s3_key prefix here is the
     fixed literal 'extractions/' (not caller input), so no _escape_like()
-    call is needed -- same posture as list_extraction_folder_names_for_date."""
+    call is needed -- same posture as list_extraction_folder_names_for_date.
+
+    `source_s3_key` (fix round 1, PR #972 review #1) rides along so
+    `_match_report_topics_to_extraction` can stamp it into the matched chunk's
+    `metadata.source_files` -- see that function's docstring for why a topic-type
+    report chunk needs one at all."""
     return conn.cursor(row_factory=dict_row).execute(
-        "SELECT id, title, occurred_at FROM topics "
+        "SELECT id, title, occurred_at, source_s3_key FROM topics "
         "WHERE site_id=%s AND user_id=%s AND report_date=%s "
         "AND source_s3_key LIKE 'extractions/%%' AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = topics.id AND r.scope = 'deleted' AND r.reverted_at IS NULL) "
         # Live arm (Track B Task 2): these ids become a defer-day chunk's topic_id, so a
