@@ -360,7 +360,7 @@ def _overlap_or_title_score(report_topic, ext_topic):
 
 
 def _match_report_topics_to_extraction(conn, site_id, user_id, date, report_topics):
-    """Best-effort seq -> extraction-topic-uuid map for one report's topics,
+    """Best-effort seq -> {"id", "source_s3_key"} map for one report's topics,
     used only on an authority-flip defer day (ingest_report below). Loads
     that day's extraction-sourced topics once, scores every (report topic,
     extraction topic) pair with a real seq (topic_id is not None) via
@@ -377,10 +377,25 @@ def _match_report_topics_to_extraction(conn, site_id, user_id, date, report_topi
     absent from the returned dict -- ingest_report's
     topic_seq_to_id.get(seq) then falls through to None, the correct/safe
     outcome (Task 1's title-search hotfix covers it), never a forced
-    second-best collision."""
+    second-best collision.
+
+    Each value carries the matched extraction topic's own `source_s3_key`
+    alongside its id (PR #972 review #1): `ingest_report` stamps it into the
+    matched report topic's `chunk_report` (chunk_type='topic') chunk as
+    `metadata.source_files`, the same shape `chunk_transcripts`'s
+    `transcript_window` chunks already carry. Without it, a topic-type chunk on a
+    defer day has NO source_files at all -- `SESSION_CHUNK_PREDICATE`'s second
+    arm can never match it, so once R21 unbinds its `topic_id` on a later
+    supersede of the matched extraction topic, `archive_chunks_for_session`
+    (the recording-delete path) can no longer find it by EITHER arm, and a
+    deleted recording's report-topic summary stays searchable -- a privacy leak.
+    The extraction topic's `source_s3_key` (`extractions/{folder}/{date}/{session
+    base}.json`) contains that exact session base as a substring, which is all
+    `SESSION_CHUNK_PREDICATE`'s `LIKE '%' || session_base || '%'` needs."""
     ext_topics = topics.list_extraction_topics_for_day(conn, site_id, user_id, date)
     if not ext_topics:
         return {}
+    ext_by_id = {str(e["id"]): e for e in ext_topics}
 
     candidates = []
     for t in report_topics:
@@ -393,14 +408,15 @@ def _match_report_topics_to_extraction(conn, site_id, user_id, date, report_topi
                 candidates.append((score, seq, str(e["id"])))
     candidates.sort(key=lambda c: c[0], reverse=True)
 
-    seq_to_id = {}
+    seq_to_ext = {}
     claimed_ext_ids = set()
     for score, seq, ext_id in candidates:
-        if seq in seq_to_id or ext_id in claimed_ext_ids:
+        if seq in seq_to_ext or ext_id in claimed_ext_ids:
             continue
-        seq_to_id[seq] = ext_id
+        seq_to_ext[seq] = {"id": ext_id,
+                           "source_s3_key": ext_by_id[ext_id].get("source_s3_key")}
         claimed_ext_ids.add(ext_id)
-    return seq_to_id
+    return seq_to_ext
 
 
 # ----------------------------------------------------------
@@ -692,10 +708,16 @@ def ingest_report(date, user_folder, report_key):
             retired_topics.extend(
                 topics.supersede_topics_for_source_prefix(conn, extraction_prefix, run))
 
-        topic_seq_to_id = {}
+        # `topic_seq_to_ext` carries the matched extraction topic's own source_s3_key
+        # alongside its id (PR #972 review #1) -- see _match_report_topics_to_extraction's
+        # docstring. `topic_seq_to_id` stays id-only for every OTHER consumer below
+        # (upsert's topic_id binds, _restamp_deleted_topics, chunk_transcripts' windows,
+        # which already carry their own source_files and need nothing from this map).
+        topic_seq_to_ext = {}
         if defer_to_extraction:
-            topic_seq_to_id = _match_report_topics_to_extraction(
+            topic_seq_to_ext = _match_report_topics_to_extraction(
                 conn, site["id"], user_id, date, report.get("topics", []))
+        topic_seq_to_id = {seq: v["id"] for seq, v in topic_seq_to_ext.items()}
 
         collected_topics = []
         # Track B final wave (Ruling R19): every topic this pass actually WRITES (never
@@ -810,11 +832,27 @@ def ingest_report(date, user_folder, report_key):
         chunks_n = 0
         for c in chunk_report(report):
             embedding = embed_from_sidecar(c["chunk_text"], vectors)
+            metadata = c["metadata"]
+            # PR #972 review #1: chunk_report's topic-type chunks carry no source_files of
+            # their own (unlike chunk_transcripts' transcript_window chunks -- see
+            # chunking._window_metadata). On a defer day this chunk's topic_id is an
+            # EXTRACTION topic (matched above), not this report_key's own row, so it can
+            # independently outlive this ingest and later be superseded by an unrelated
+            # re-extraction -- R21 then unbinds it, and with no source_files there is
+            # nothing left for archive_chunks_for_session's session_base arm to catch on a
+            # recording delete. Stamping the matched extraction topic's own source_s3_key
+            # here (contains the session base as a substring -- see
+            # _match_report_topics_to_extraction's docstring) closes that gap the same way
+            # transcript_window chunks were already closed for.
+            ext = topic_seq_to_ext.get(c["topic_seq"])
+            if ext and ext.get("source_s3_key"):
+                metadata = dict(metadata)
+                metadata["source_files"] = [ext["source_s3_key"]]
             chunks.insert_chunk(
                 conn, site["id"], date, c["chunk_type"], c["chunk_text"], embedding,
                 user_id=user_id, source_s3_key=report_key,
                 topic_id=topic_seq_to_id.get(c["topic_seq"]),
-                metadata=c["metadata"],
+                metadata=metadata,
             )
             chunks_n += 1
 
