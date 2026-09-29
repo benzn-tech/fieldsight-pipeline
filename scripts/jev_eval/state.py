@@ -88,21 +88,30 @@ Masking has these layers, in order:
   Reflection", "Anything Else", ...) because headings share its
   two-capitalised-word shape. A candidate is now masked only if NEITHER
   token is a "known common word": `_BUILT_IN_COMMON_WORDS` (a fixed module
-  constant), OR a lowercase word present in an optional `common_words` set
-  the caller supplies to `mask_names`/`build_state` -- the runner builds this
-  once per run from the lowercase words in every selected row's own
-  allowlisted title/summary text, before any state is built, so the same
-  gate applies uniformly to broad, decomposed and control states. This never
-  weakens person-alias matching: a KNOWN person alias (from `name_aliases`)
-  is always masked even if it is also a common word (the existing
+  constant), OR a word present in an optional `common_words` set the caller
+  supplies to `mask_names`/`build_state` -- the runner builds this once per
+  run, via `extract_words` (below), from every selected row's own allowlisted
+  title/summary text, before any state is built, so the same gate applies
+  uniformly to broad, decomposed and control states. **Fix round 1
+  (controller correction):** the corpus counts a word only if it occurs
+  somewhere in the run's text ALREADY WRITTEN ALL-LOWERCASE -- a first
+  version lowercased every capitalised token too, which meant a name that
+  appears only capitalised (e.g. "Hector Eggar", mentioned several times,
+  always capitalised) still entered the corpus as "hector"/"eggar" and was
+  treated as common, a privacy regression measured on the real data (every
+  generic-pass mask, including real names, dropped to zero). See
+  `extract_words`'s own docstring for the exact rule. This never weakens
+  person-alias matching: a KNOWN person alias (from `name_aliases`) is
+  always masked even if it is also a common word (the existing
   `_COMMON_WORD_ALIASES` case rules for "Will"/"Mark"/etc. are unchanged) --
   only the generic, alias-free two-token pass is gated this way. Accepted
-  residual: if the run's own corpus happens to contain a common word that
-  is also a real surname (e.g. the corpus contains "wood" and a genuine name
-  "Wood Ward" appears elsewhere in the same run), that name is left
-  unmasked -- the corpus gate cannot distinguish the two once "wood" is in
-  the run's vocabulary. Same shape of trade as the stoplist below: a little
-  under-masking for a lot less over-masking. See also
+  residual: if a word ALREADY occurs somewhere in the run's own text
+  all-lowercase and is also a real surname (e.g. the corpus text contains
+  the literal lowercase word "wood" and a genuine name "Wood Ward" appears
+  elsewhere in the same run), that name is left unmasked -- the corpus gate
+  cannot distinguish the two once "wood" has a genuine lowercase occurrence
+  in the run's vocabulary. Same shape of trade as the stoplist below: a
+  little under-masking for a lot less over-masking. See also
   `docs/superpowers/specs/2026-09-28-jev-shadow-eval-findings.md` §4.
 
   Even with the stoplist, an unaliased company/product term with no
@@ -751,8 +760,23 @@ def build_raw_allowed(set_name: str, features: dict) -> dict:
 
 
 def extract_words(value: Any) -> set[str]:
-    """Walk a (possibly nested) dict/list/str tree and return every ASCII
-    alphabetic word found in any string, lowercased."""
+    """Walk a (possibly nested) dict/list/str tree and return every word
+    that occurs somewhere in the text ALREADY written all-lowercase.
+
+    Fix round 1 (controller correction): the ruling is "a token's lowercase
+    form appears AS A LOWERCASE WORD in the corpus" -- an occurrence written
+    all-lowercase, not any occurrence lowercased on the way in. A first
+    version of this function lowercased every token regardless of its
+    original casing, which meant a name that appears ONLY capitalised
+    ("Hector Eggar", mentioned several times, always capitalised) still
+    landed in the corpus as "hector"/"eggar" and got treated as a common
+    word -- exactly the privacy regression this function exists to avoid.
+    Only a token that appears somewhere in the text with NO uppercase
+    letters at all (`str.islower()`) is added; a token seen only
+    Capitalised or ALL-CAPS contributes nothing. "Material Procurement"
+    stays protected because "procurement" also occurs lower-case elsewhere
+    in the run's own text; "Hector Eggar" does not, because "hector" and
+    "eggar" never occur lower-case anywhere."""
     words: set[str] = set()
 
     def _walk(node: Any) -> None:
@@ -764,7 +788,8 @@ def extract_words(value: Any) -> set[str]:
                 _walk(item)
         elif isinstance(node, str):
             for w in _WORD_RE.findall(node):
-                words.add(w.lower())
+                if w.islower():
+                    words.add(w)
 
     _walk(value)
     return words

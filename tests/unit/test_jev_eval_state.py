@@ -18,7 +18,7 @@ import json
 
 import pytest
 
-from scripts.jev_eval.state import build_state, mask_names
+from scripts.jev_eval.state import build_state, extract_words, mask_names
 
 PERSON_ALIASES = [
     {"wrong_term": "Ben Lynn", "right_term": "Ben Lin", "kind": "person"},
@@ -369,6 +369,72 @@ def test_common_word_in_corpus_leaves_a_colliding_real_name_unmasked_residual():
     # a real surname, that name is left unmasked.
     text, mapping = mask_names("Wood Ward confirmed the delivery", [], common_words={"wood"})
     assert text == "Wood Ward confirmed the delivery"
+    assert mapping == {}
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1 (controller correction, 2026-09-29): the corpus must count a
+# word only if it occurs somewhere ALREADY WRITTEN ALL-LOWERCASE -- not any
+# occurrence lowercased on the way in. Without this, a real name mentioned
+# several times but always capitalised ("Hector Eggar") was entering the
+# corpus as "hector"/"eggar" and being treated as common, which measured at
+# 0 generic-pass masks remaining on the real data -- a privacy regression.
+# ---------------------------------------------------------------------------
+
+def test_extract_words_excludes_a_token_seen_only_capitalised():
+    # "Hector" and "Eggar" appear several times, always capitalised, never
+    # written lowercase anywhere -- neither may enter the corpus.
+    text = "Hector Eggar rang. Hector Eggar called back. Ask Hector Eggar again."
+    words = extract_words({"title": text, "summary": text})
+    assert "hector" not in words
+    assert "eggar" not in words
+
+
+def test_extract_words_excludes_a_token_seen_only_all_caps():
+    words = extract_words({"title": "HECTOR EGGAR CONFIRMED"})
+    assert "hector" not in words
+    assert "eggar" not in words
+
+
+def test_extract_words_includes_a_token_with_a_genuine_lowercase_occurrence():
+    # "procurement" occurs lower-case in the summary even though the title
+    # capitalises it -- it belongs in the corpus.
+    words = extract_words({
+        "title": "Material Procurement",
+        "summary": "Waiting on procurement paperwork before the pour.",
+    })
+    assert "procurement" in words
+    # "Material" itself is only ever capitalised here, so it is NOT added by
+    # this token's own occurrence -- a separate row's lower-case "material"
+    # would be what adds it (proven by the next call, a fresh corpus).
+    assert "material" not in words
+
+    words2 = extract_words({"summary": "material handling was slow today."})
+    assert "material" in words2
+
+
+def test_common_word_gate_still_masks_a_name_seen_only_capitalised_in_the_corpus():
+    # End-to-end: build the corpus the way the runner does (via
+    # extract_words) from text where "Hector Eggar" appears several times,
+    # always capitalised, and confirm it is still masked -- this is the
+    # exact regression the controller flagged.
+    corpus_text = (
+        "Hector Eggar rang about the delivery. Hector Eggar confirmed the "
+        "schedule. Ask Hector Eggar to call back."
+    )
+    common_words = extract_words({"summary": corpus_text})
+    text, mapping = mask_names("Hector Eggar rang", [], common_words=common_words)
+    assert text == "PERSON_1 rang"
+    assert mapping == {"Hector Eggar": "PERSON_1"}
+
+
+def test_common_word_gate_still_protects_a_heading_whose_words_recur_lowercase():
+    corpus_text = "Waiting on procurement paperwork; site safety briefing done."
+    common_words = extract_words({"summary": corpus_text})
+    text, mapping = mask_names("Material Procurement", [], common_words=common_words)
+    # "procurement" recurs lower-case in the corpus, and "material" is in
+    # the built-in list regardless -- the heading stays unmasked.
+    assert text == "Material Procurement"
     assert mapping == {}
 
 

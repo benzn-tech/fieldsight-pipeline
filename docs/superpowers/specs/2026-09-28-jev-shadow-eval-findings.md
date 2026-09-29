@@ -437,21 +437,34 @@ Issues", "Electrical Cables", "Weekly Schedule", "Recording Device", "General Re
 "Anything Else", ...), while correctly catching real names of the same shape ("Hector Eggar",
 "Paul Smith", "Liang Min", "Yang Ming"). A generic candidate is now masked only if NEITHER
 token is a known common word: a built-in module constant covering the words above, or a
-per-run corpus of lowercase words the runner (`scripts/jev_shadow_eval.py
-collect_common_words`) derives once from every selected row's own allowlisted title/summary
-text, before any state is built — shared uniformly by broad, decomposed, control and
-`--dry-run`. Known person aliases are unaffected: a known alias is always masked even if it is
-also a common word. **Accepted residual, and measured to be much larger on real data than the
-brief's own example suggests:** re-running the generic-vs-known count on
-`scripts/fixtures/jev_eval/{threads,work_class}.jsonl` (189 rows, 447 texts) found 181
-generic-pass masks before this fix and **0 remaining after it** — on this corpus, essentially
-every two-token candidate (including the real names above) has at least one token that recurs
-elsewhere in the same run's own text, so the corpus gate suppresses it. This is the literal,
-measured consequence of "common word = appears lowercase anywhere in this run's corpus" on data
-where the same people are mentioned across many rows, not a hypothetical edge case — see the
-module docstring's "Wood Ward" example for the isolated mechanism. Flagged here for the owner to
-decide whether the corpus should be scoped more narrowly before this masker is relied on for a
-real send.
+per-run corpus the runner (`scripts/jev_shadow_eval.py collect_common_words`) derives once from
+every selected row's own allowlisted title/summary text, before any state is built — shared
+uniformly by broad, decomposed, control and `--dry-run`. Known person aliases are unaffected: a
+known alias is always masked even if it is also a common word.
+
+**Fix round 1 (2026-09-29, controller correction) — the corpus must count a LITERAL lowercase
+occurrence, not any occurrence lowercased on the way in.** The first version of `extract_words`
+lowercased every token regardless of its original casing, so a name mentioned several times but
+always capitalised (e.g. "Hector Eggar") still entered the corpus as "hector"/"eggar" and was
+treated as common — measured on the real data, this suppressed essentially every generic-pass
+mask, including the real names the pass exists to catch (181 masks before the fix, 0 remaining
+after the flawed first version — a privacy regression, not an improvement). `extract_words` now
+adds a word to the corpus only if it occurs somewhere in the text already written all-lowercase
+(`str.islower()`); a token seen only Capitalised or ALL-CAPS contributes nothing. Re-measured on
+`scripts/fixtures/jev_eval/{threads,work_class}.jsonl` (189 rows, 447 texts) with the corrected
+rule: **64 generic-pass masks remain** (down from the 181-mask baseline with no common-word gate
+at all). All five names the owner asked to confirm are masked: Hector Eggar (x4), Hector Egan
+(x2), Paul Smith (x4), Liang Min (x3), Yang Ming (x2). The top of the remaining list is a mix of
+plausible names/proper nouns ("Southern Lakes" x4, "Cook Brothers" x4, "Deon Jay's" x3, "Roofing
+Hub" x3, "Lake Bradford" x2, "Houses Lotto" x2, "Food Prices" x2, "Zealand Politics" x2, "Mount
+Roskill", "Shortland Street", "Real Estate", "Press Conference", ...) rather than construction
+topic headings — i.e. the fix now targets headings specifically and leaves plausible names (and
+some ambiguous proper-noun phrases like show/place names) masked, which is the intended trade.
+**Accepted residual, unchanged in shape by this correction:** if a word already has a genuine
+lowercase occurrence elsewhere in the run's own text and is also a real surname (the module
+docstring's "Wood Ward" example), that name is left unmasked — this is now a much narrower gap
+than the flawed first version's near-total one, but it is not zero. See the module docstring for
+the exact rule and `extract_words`'s own docstring for the corrected mechanism.
 
 **New residual gap, introduced by the stoplist (I1.3):** a real person surnamed after one of the
 stoplist words (e.g. a person literally named "Roof") would not be masked by the generic pass —
