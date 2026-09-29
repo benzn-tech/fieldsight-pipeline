@@ -360,8 +360,20 @@ the current labels measures fit to the owner's definition, not the classifier's 
 spec. The fix proposed to the owner: split non-work into "other work" (client meetings, sales,
 FieldSight internal: not this site's report, but not private) and "private" (family, health, personal
 errands, device testing), relabel the owner's yes rows, and score two tasks — private vs the rest (the
-classifier's spec), and this-site work vs the rest (what the owner wants in a site report). Until that
-relabel exists, no work_class verdict is acted on.
+classifier's spec), and this-site work vs the rest (what the owner wants in a site report). **Resolved
+2026-09-29 — see below; at the time this paragraph was written, no work_class verdict was acted on.**
+
+**Update, 2026-09-29 — the relabel above has happened.** The owner did a three-way relabel of the 68
+owner rows previously labelled non-work or unsure: A this site's work, B other work (client meetings,
+sales, FieldSight's own product work), C private (family, health, personal errands, testing the
+recording device). This split those 68 rows into 55 private and 13 other-work. work_class labels now
+mean "private = yes" (A and B both score "no"), matching the deployed classifier's own spec
+(`lambda_extract_session.py` rule 2b: non_work = personal/off-work talk) rather than the wider
+"anything that isn't this site's job" reading used above. Totals after the relabel: 112 rows, 78 yes
+(private) / 34 no, eligible. The work_class question set (`scripts/jev_eval/questions.py`) was reworded
+to the same "private" definition before any Jev call was made against these rows. Scored against the
+now-private-only "yes": of the owner's 55 private rows, the classifier said "work" on 21 — these are
+errors under the classifier's own spec, not a definitional artifact.
 
 ---
 
