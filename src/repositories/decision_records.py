@@ -1,4 +1,4 @@
-"""Repository for decision_records (migration 0071) -- Track B Task 6a.
+"""Repository for decision_records (migration 0073) -- Track B Task 6a.
 
 One row per GATED AI verdict -- accepted AND rejected -- plus (Task 6b) the
 human's answer to it. Spec Sec 2.2 / Task 6 brief: prior tasks kept only the

@@ -631,7 +631,7 @@ def _build_match_verdict_record(req, topic_id, element, input_key, input_hash):
     number, and enum values, none of them free text.
 
     `subject` is the topic's OWN id: topics keep their own id as their
-    stable identity (migration 0071's comment on decision_records.
+    stable identity (migration 0073's comment on decision_records.
     subject_stable_id), so no id resolution is needed here the way
     `_build_impact_verdict_record` needs one for a finding row id."""
     output = {k: v for k, v in element.items() if k not in ("evidence", "auto_outcome")}

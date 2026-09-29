@@ -7474,7 +7474,7 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
             #
             # Track B Task 5: `topics.decisions`/`topics.open_questions` (this jsonb, both
             # keys below) is now a MIRROR of `topic_decisions`/`topic_questions` -- the two
-            # tables migration 0071 added, dual-written by lambda_item_writer alongside this
+            # tables migration 0073 added, dual-written by lambda_item_writer alongside this
             # same jsonb. This narrowing still reads the jsonb; switching readers over to the
             # row tables (so a client sees an answered question's status, a decision's
             # stable_id, etc.) is a separate, later change (Ruling R6) -- payload shape here

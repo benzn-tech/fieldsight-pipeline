@@ -1,14 +1,16 @@
-"""Unit: migration 0071 has the shape the repositories and decision-record writers rely on.
+"""Unit: migration 0073 has the shape the repositories and decision-record writers rely on.
 
 Text checks only -- the SQL is applied for real by
 tests/integration/test_stable_identity_schema.py (CI Postgres). The version guard matters
 because two version collisions have already shipped (0041, 0044) and the runner orders ties
-by filename, so a second 0071 from a parallel branch would apply in an order nobody chose.
+by filename, so a second 0073 from a parallel branch would apply in an order nobody chose.
+Originally shipped as 0071_stable_identity.sql; renumbered to 0073 when develop merged in
+0071_speaker_intro_suggestions.sql and 0072_site_attendance.sql from other branches.
 """
 import os
 
 MIGRATIONS = os.path.join(os.path.dirname(__file__), "..", "..", "src", "migrations")
-NAME = "0071_stable_identity.sql"
+NAME = "0073_stable_identity.sql"
 
 
 def _sql():
@@ -20,8 +22,8 @@ def _flat():
     return " ".join(_sql().split())
 
 
-def test_no_other_migration_uses_version_0071():
-    assert [f for f in os.listdir(MIGRATIONS) if f.startswith("0071_")] == [NAME]
+def test_no_other_migration_uses_version_0073():
+    assert [f for f in os.listdir(MIGRATIONS) if f.startswith("0073_")] == [NAME]
 
 
 def test_new_child_tables_cascade_on_site_id():

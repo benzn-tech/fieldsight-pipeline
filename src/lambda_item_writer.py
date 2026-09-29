@@ -45,7 +45,7 @@ it marks them `superseded_at` and leaves them in the table (see repositories.top
 supersede_topics_for_source). A session typically gets 2-4 passes (live, one or more
 mid-session live updates, final -- occasionally a group merge on top), so its topics rows
 now persist at roughly 3x the row count a single-pass session used to leave behind. At
-today's volume (hundreds of topics per site-month) that is nothing; migration 0071's
+today's volume (hundreds of topics per site-month) that is nothing; migration 0073's
 `idx_topics_live_source` partial index (`WHERE superseded_at IS NULL`) keeps every live read
 this task touched at its pre-Task-3 cost regardless of how many superseded passes pile up
 underneath.

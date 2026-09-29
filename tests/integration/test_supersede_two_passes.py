@@ -98,7 +98,7 @@ def test_two_passes_leave_one_superseded_and_one_live_and_reads_return_only_the_
     retired = topics.supersede_topics_for_source(db, source, "live:t1")
     assert [r["id"] for r in retired] == [topic_a["id"]]
 
-    # migration 0071's idx_topics_live_source (partial unique on source_s3_key WHERE
+    # migration 0073's idx_topics_live_source (partial unique on source_s3_key WHERE
     # superseded_at IS NULL) permits this second LIVE row only because the first is
     # already retired -- proves the ordering (supersede BEFORE insert) the writer and
     # ingest both follow is the one that actually works against the real constraint.
@@ -290,7 +290,7 @@ def test_write_extraction_items_two_passes_leave_one_superseded_and_one_live(
             "first's")
         assert [r[1] for r in rows] == [True, False], (
             "the first pass must be superseded, the second live")
-        # superseded_by_run names the pass that DID the retiring (migration 0071: "of the
+        # superseded_by_run names the pass that DID the retiring (migration 0073: "of the
         # pass that replaced it"), so the live row's row carries the FINAL call's own run,
         # not its own.
         assert rows[0][2] == "final:2026-09-29T10:30:00Z", (

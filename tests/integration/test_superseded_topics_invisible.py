@@ -42,7 +42,7 @@ def _seed(db):
 def _seed_two_passes(db):
     """Topic A (superseded) and topic B (live), same source_s3_key -- exactly the shape
     Task 3 will leave behind. A is created and superseded BEFORE B is inserted: migration
-    0071's `idx_topics_live_source` is a partial unique index on `(source_s3_key) WHERE
+    0073's `idx_topics_live_source` is a partial unique index on `(source_s3_key) WHERE
     superseded_at IS NULL`, so two LIVE rows sharing a source key would violate it."""
     co, site, user, source, prefix = _seed(db)
 

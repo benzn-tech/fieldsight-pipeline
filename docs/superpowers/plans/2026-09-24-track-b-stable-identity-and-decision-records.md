@@ -33,6 +33,7 @@
 - Test: `tests/unit/test_migration_stable_identity_shape.py`, `tests/integration/test_stable_identity_schema.py`
 
 - [x] **Step 1: Write the migration.** Filed as `src/migrations/0071_stable_identity.sql` (Ruling R1). Postgres rejects `ADD CONSTRAINT IF NOT EXISTS` (no such grammar) and inline `ADD COLUMN ... CHECK` cannot carry `IF NOT EXISTS` on the CHECK itself either, so `findings.kind`, `findings.audience`, `action_items.audience` are each split into a plain `ADD COLUMN IF NOT EXISTS ...` followed by an unconditional `ADD CONSTRAINT <name> CHECK (...)` — safe because `schema_migrations` guarantees the file runs at most once. Everything else is verbatim from this brief.
+  - Outcome (2026-09-30, merge with develop): renumbered `0071_stable_identity.sql` to `src/migrations/0073_stable_identity.sql` -- develop had since merged `0071_speaker_intro_suggestions.sql` and `0072_site_attendance.sql` from other tracks. All in-repo references to "migration 0071" meaning this file were updated to 0073.
 
 ```sql
 -- Supersession instead of deletion for extraction topics. Spec 2026-09-24 §2.1.

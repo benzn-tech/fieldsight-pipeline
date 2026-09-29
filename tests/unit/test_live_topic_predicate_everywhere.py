@@ -1,5 +1,5 @@
 """Unit: every read path that returns topics or their children carries the LIVE-row arm
-(Track B Task 2 -- migration 0071's `topics.superseded_at`).
+(Track B Task 2 -- migration 0073's `topics.superseded_at`).
 
 Task 3, next, stops DELETEing a source key's prior topics on re-extraction and marks them
 `superseded_at` instead, leaving the row (and its action_items/findings/chunks children) in

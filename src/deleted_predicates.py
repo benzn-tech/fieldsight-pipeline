@@ -20,7 +20,7 @@ moments:
 
 A read path that takes only the first passes every test written today and leaks overnight.
 
-**Supersession is a third, separate condition**, added for Track B (migration 0071:
+**Supersession is a third, separate condition**, added for Track B (migration 0073:
 `topics.superseded_at`): re-extracting a source key no longer DELETEs its prior topics, it
 marks them superseded and leaves the row (and its action_items/findings/chunks children) in
 the table. A read that shows content must exclude those too, or two passes of the same
@@ -54,7 +54,7 @@ DELETED_CHUNK_TOPIC_PREDICATE = (
     "AND r.scope = 'deleted' AND r.reverted_at IS NULL)"
 )
 
-# {alias}.superseded_at — a topic's own supersession flag (migration 0071). A superseded
+# {alias}.superseded_at — a topic's own supersession flag (migration 0073). A superseded
 # topic is not deleted (no redaction row, nothing tombstoned) — it is the STALE half of one
 # source key's two passes, kept in the table on purpose so Track B can carry stable ids and
 # decision-record provenance across a re-extraction instead of destroying them. A read that

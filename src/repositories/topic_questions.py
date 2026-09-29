@@ -1,4 +1,4 @@
-"""Repository for topic_questions (migration 0071) -- Track B Task 5.
+"""Repository for topic_questions (migration 0073) -- Track B Task 5.
 
 A question raised on a topic, as its OWN row with a stable_id, alongside (not instead of)
 the jsonb `topics.open_questions` column upsert_topic already writes -- Step 4/Ruling R6
