@@ -69,13 +69,24 @@ def is_topic_redacted(conn, topic_id) -> bool:
 
 def company_excluded_topic_ids(conn, site_ids) -> set:
     """Topic ids a COMPANY-tier read excludes across site_ids: any topic
-    classified non_work (auto-held) OR carrying an active redaction. The
-    site/self tier does NOT use this. Empty site_ids -> empty set (no query)."""
+    classified non_work (auto-held), carrying an active redaction, OR
+    superseded by a later pass of the same source key. The site/self tier
+    does NOT use this. Empty site_ids -> empty set (no query).
+
+    `rollup.portfolio_counts` is this set's only caller (its four aggregate
+    queries subtract it with `!= ALL(...)` rather than each carrying its own
+    predicate), which is why the superseded arm belongs here rather than
+    inlined four times: one exclusion list, computed once, upstream of every
+    count -- the same choke-point reasoning `deleted_predicates` exists for.
+    Routed through `SUPERSEDED_TOPIC_PREDICATE` (not an inlined
+    `superseded_at IS NOT NULL`) so this stays the one place that string is
+    spelled."""
     if not site_ids:
         return set()
     rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT id FROM topics WHERE site_id = ANY(%s) AND ("
         "  work_class='non_work' "
+        f"  OR {SUPERSEDED_TOPIC_PREDICATE.format(alias='topics')} "
         "  OR id IN (SELECT target_id FROM redactions "
         "            WHERE target_type='topic' AND reverted_at IS NULL))",
         (list(site_ids),)).fetchall()
@@ -116,6 +127,9 @@ from deleted_predicates import (  # noqa: E402,F401
     DELETED_TOPIC_PREDICATE,
     DELETED_SOURCE_PREDICATE,
     DELETED_CHUNK_TOPIC_PREDICATE,
+    LIVE_TOPIC_PREDICATE,
+    SUPERSEDED_TOPIC_PREDICATE,
+    CHILD_OF_VISIBLE_TOPIC,
     visible_topics_predicate,
     visible_chunks_predicate,
 )

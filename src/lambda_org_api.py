@@ -5079,7 +5079,11 @@ def delete_recordings_endpoint(conn, caller, body):
             redactions.create_recording_tombstone(
                 conn, target_company, prefix, reason,
                 caller.get("id"), caller.get("global_role"), batch_id=batch_id)
-            for row in topics.list_topics_for_source_prefix(conn, prefix) or []:
+            # include_superseded=True: this enumeration must tombstone EVERY row under the
+            # deleted prefix, superseded or not -- an untouched superseded copy would sit
+            # outside every batch and never come back with the undelete (Track B Task 2).
+            for row in topics.list_topics_for_source_prefix(
+                    conn, prefix, include_superseded=True) or []:
                 topic_ids.append(row["id"])
                 if redactions.create_redaction(
                         conn, target_company, row["id"], reason,
@@ -5093,7 +5097,8 @@ def delete_recordings_endpoint(conn, caller, body):
         # regenerates the report WITHOUT the deleted session and re-inserts clean topics
         # under new uuids, and a prefix tombstone would keep hiding those forever.
         for row in topics.list_topics_for_source_prefix(
-                conn, f"reports/{rec['date']}/{rec['folder']}/") or []:
+                conn, f"reports/{rec['date']}/{rec['folder']}/",
+                include_superseded=True) or []:
             if redactions.create_redaction(
                     conn, target_company, row["id"], reason,
                     caller.get("id"), caller.get("global_role"),
@@ -5244,8 +5249,10 @@ def undelete_recordings_endpoint(conn, caller, body):
         if not still:
             continue
         company = next((r["company_id"] for r in existing), caller["company_id"])
+        # include_superseded=True: same reason as the delete side -- this re-hide must reach
+        # a superseded report topic too, or it stays outside every batch once freed.
         for row in topics.list_topics_for_source_prefix(
-                conn, f"reports/{date}/{folder}/") or []:
+                conn, f"reports/{date}/{folder}/", include_superseded=True) or []:
             redactions.create_redaction(
                 conn, company, row["id"], reason, caller.get("id"),
                 caller.get("global_role"), target_type="topic", scope="deleted",
