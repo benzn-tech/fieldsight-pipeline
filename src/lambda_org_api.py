@@ -150,7 +150,7 @@ from repositories import (action_items, aliases, chunks, classification_feedback
                           programme_snapshot,
                           programme_suggestions, programme_tasks, programme_window,
                           recordings, redactions, report_templates, rollup, scope,
-                          session_group,
+                          session_group, site_attendance,
                           sites, threads, topics, users, voice_messages,
                           voiceprints)
 from repositories.acl import is_cross_company, resolve_scope
@@ -806,6 +806,15 @@ def dispatch(conn, event, method, route):
     m_sv = re.match(r"^/sites/([^/]+)/voice$", route)
     if m_sv and method == "GET":
         return list_site_voice(conn, caller, m_sv.group(1), event)
+
+    m_sat = re.match(r"^/sites/([^/]+)/attendance$", route)
+    if m_sat and method == "GET":
+        return list_site_attendance(conn, caller, m_sat.group(1), event)
+    if m_sat and method == "POST":
+        return create_site_attendance(conn, caller, m_sat.group(1), event)
+    m_satr = re.match(r"^/sites/([^/]+)/attendance/([^/]+)$", route)
+    if m_satr and method == "DELETE":
+        return delete_site_attendance(conn, caller, m_satr.group(1), m_satr.group(2), event)
 
     if route == "/auth/qr/create" and method == "POST":
         return create_qr_login_code(conn, caller, event)
@@ -2615,12 +2624,28 @@ def list_name_suggestions(conn, caller, event):
         return error("admin, gm, pm, site_manager or platform_admin role required", 403)
     company_id = str(caller["company_id"])
     rows = speaker_intro_suggestions.pending(conn, company_id, limit=SUGGESTION_PAGE)
+
+    def _roster_names(r):
+        # Consumer 3 (plan correction 5): the intro dialog prefers roster names for the
+        # prefill ("Petrus Pang" heard -> "Petros Pan", who signed in today). No fuzzy
+        # matching here -- that is a UI choice -- just the day's names for this
+        # suggestion's session's site, or [] when the site cannot be resolved (the same
+        # safe absence `_site_for_session`'s own docstring documents).
+        site = _site_for_session(conn, company_id, r["user_folder"], str(r["session_date"]),
+                                 r["session_base"])
+        if not site:
+            return []
+        return [row["display_name"] for row in
+                site_attendance.for_day(conn, company_id, str(site["id"]),
+                                        str(r["session_date"]))]
+
     return ok({"suggestions": [{
         "id": r["id"], "heardName": r["heard_name"], "companyName": r.get("company_name"),
         "quote": r["quote"], "date": str(r["session_date"]), "userFolder": r["user_folder"],
         "sessionBase": r["session_base"], "sourceFilename": r["source_filename"],
         "speakerLabel": r["speaker_label"], "startSec": r["start_sec"],
         "endSec": r["end_sec"], "createdAt": r["created_at"],
+        "rosterNames": _roster_names(r),
     } for r in rows]})
 
 
@@ -3359,6 +3384,113 @@ def list_site_voice(conn, caller, site_id, event):
               "createdAt": r["created_at"].isoformat() if hasattr(r["created_at"], "isoformat") else str(r["created_at"])}
              for r in rows]
     return ok({"items": items, "site": str(site_id)})
+
+
+# ----------------------------------------------------------
+# /sites/{id}/attendance — the `manual` roster source (on-site-roster plan, Task 5)
+# ----------------------------------------------------------
+_ATTENDANCE_NAME_CAP = 50
+
+
+def _serialize_attendance_row(r):
+    return {"id": str(r["id"]), "displayName": r["display_name"],
+           "employerName": r.get("employer_name"), "source": r["source"],
+           "resolved": {"userId": str(r["user_id"]) if r.get("user_id") else None,
+                        "voiceprintId": str(r["voiceprint_id"])
+                        if r.get("voiceprint_id") else None}}
+
+
+def list_site_attendance(conn, caller, site_id, event):
+    """GET /api/org/sites/{id}/attendance?date=YYYY-MM-DD — the day's roster, any source.
+
+    Any member may read (unlike the write side, which needs a correction role): a roster
+    that is visible only to managers cannot do what consumer 3 (the intro dialog's prefill)
+    needs, since it renders for whoever is naming a speaker.
+    """
+    if str(site_id) not in _allowed_site_ids(conn, caller):
+        return error("access denied to this site", 403)
+    params = event.get("queryStringParameters") or {}
+    date = params.get("date")
+    if date is not None and not REPORT_DATE_RE.match(date):
+        return error("date must be YYYY-MM-DD", 400)
+    if not date:
+        # The client's own NZ calendar day, never datetime.now().date() (BUG-37) — a UTC
+        # date would answer for a day that, in NZ, has not started or already ended.
+        date = nz_time.nz_today().isoformat()
+    rows = site_attendance.for_day(conn, caller["company_id"], site_id, date)
+    return ok({"site": str(site_id), "date": date,
+              "rows": [_serialize_attendance_row(r) for r in rows]})
+
+
+def create_site_attendance(conn, caller, site_id, event):
+    """POST /api/org/sites/{id}/attendance — a site manager lists today's people.
+
+    `manual` ships first in the roadmap because it needs no third party (spec: "ships
+    first, proves the consumer") — this is that surface. Role gate mirrors every other
+    correction-adjacent write in this file (`_CORRECTION_ROLES`); the site ACL is the same
+    `_allowed_site_ids` every other site-scoped route uses.
+    """
+    if str(site_id) not in _allowed_site_ids(conn, caller):
+        return error("access denied to this site", 403)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    date = body.get("date") or nz_time.nz_today().isoformat()
+    if not isinstance(date, str) or not REPORT_DATE_RE.match(date):
+        return error("date must be YYYY-MM-DD", 400)
+    names = body.get("names")
+    if not isinstance(names, list) or not names:
+        return error("names must be a non-empty list", 400)
+    if len(names) > _ATTENDANCE_NAME_CAP:
+        return error(f"at most {_ATTENDANCE_NAME_CAP} names per request", 400)
+    rows = []
+    for n in names:
+        if not isinstance(n, dict):
+            return error("each name must be an object", 400)
+        display_name = (n.get("displayName") or "").strip()
+        if not display_name:
+            return error("displayName must not be blank", 400)
+        rows.append({"displayName": display_name, "employerName": n.get("employerName")})
+    with conn.transaction():
+        # Company from the CALLER, never the body -- a body-supplied company id would let
+        # one tenant write another's roster (the same rule every write endpoint in this
+        # file follows for the same reason).
+        result = site_attendance.upsert(conn, caller["company_id"], site_id, date, rows,
+                                        source="manual", created_by=caller["id"])
+    listing = site_attendance.for_day(conn, caller["company_id"], site_id, date)
+    return ok({"inserted": result["inserted"], "updated": result["updated"],
+              "rows": [_serialize_attendance_row(r) for r in listing]})
+
+
+def delete_site_attendance(conn, caller, site_id, row_id, event):
+    """DELETE /api/org/sites/{id}/attendance/{rowId}?date=YYYY-MM-DD — manual rows only.
+
+    A connector row (Phase 2/3) is the source's own to remove or overwrite on its next
+    sync (plan correction 7); deleting one here would be silently undone, with nothing on
+    screen explaining why it came back. 409, not a silent no-op, so the caller can tell
+    "removed" from "refused" — the same reason a `return error(...)` here never looks like
+    success.
+    """
+    if str(site_id) not in _allowed_site_ids(conn, caller):
+        return error("access denied to this site", 403)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    params = event.get("queryStringParameters") or {}
+    date = params.get("date")
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date must be YYYY-MM-DD", 400)
+    rows = site_attendance.for_day(conn, caller["company_id"], site_id, date)
+    row = next((r for r in rows if str(r["id"]) == str(row_id)), None)
+    if row is None:
+        return error("not found", 404)
+    if row["source"] != "manual":
+        return error("only a manual row may be removed here; a connector row is the "
+                     "source's own to remove or overwrite on its next sync", 409)
+    with conn.transaction():
+        n = site_attendance.remove(conn, caller["company_id"], site_id, date, row_id)
+    return ok({"removed": n})
 
 
 def create_qr_login_code(conn, caller, event):
