@@ -110,3 +110,22 @@ def test_a_worker_cannot_see_the_list(wired, monkeypatch):
     monkeypatch.setattr(org.users, "get_user_by_sub",
                         lambda conn, sub: dict(CALLER, global_role="worker"))
     assert org.lambda_handler(_event("/api/org/name-suggestions"), None)["statusCode"] == 403
+
+
+# ---- rosterNames (on-site-roster plan, Task 5 Step 4) ----------------------
+
+
+def test_suggestions_carry_roster_names_for_the_sessions_site(wired, monkeypatch):
+    monkeypatch.setattr(org, "_site_for_session",
+                        lambda conn, co, folder, date, sb: {"id": "site-1"})
+    monkeypatch.setattr(org.site_attendance, "for_day",
+                        lambda conn, co, sid, date: [
+                            {"display_name": "Sam Yu"}, {"display_name": "Petros Pan"}])
+    b = _body(org.lambda_handler(_event("/api/org/name-suggestions"), None))
+    assert b["suggestions"][0]["rosterNames"] == ["Sam Yu", "Petros Pan"]
+
+
+def test_suggestions_carry_no_roster_names_when_the_site_is_unknown(wired, monkeypatch):
+    monkeypatch.setattr(org, "_site_for_session", lambda conn, co, folder, date, sb: None)
+    b = _body(org.lambda_handler(_event("/api/org/name-suggestions"), None))
+    assert b["suggestions"][0]["rosterNames"] == []
