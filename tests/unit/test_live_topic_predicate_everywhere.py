@@ -32,6 +32,7 @@ EXEMPT.
 import inspect
 
 from deleted_predicates import (
+    CHILD_OF_UNDELETED_TOPIC,
     CHILD_OF_VISIBLE_TOPIC,
     LIVE_TOPIC_PREDICATE,
     SUPERSEDED_TOPIC_PREDICATE,
@@ -76,6 +77,32 @@ def test_child_of_visible_topic_carries_the_live_arm():
 def test_topics_child_of_visible_topic_is_the_shared_one():
     """Moved into deleted_predicates (R2) -- topics.py must not hold a second copy."""
     assert topics.CHILD_OF_VISIBLE_TOPIC is CHILD_OF_VISIBLE_TOPIC
+
+
+def test_child_of_undeleted_topic_carries_no_live_arm():
+    """Fix round 1: get_topic_full's photos child must stay unfiltered for supersession
+    (R3) while still honouring a deletion tombstone. If this predicate ever gains
+    `superseded_at`, get_topic_full's photos vanish from the reindex read the moment a
+    topic is superseded -- exactly the regression this pins against."""
+    sql = CHILD_OF_UNDELETED_TOPIC.format(alias="topic_photos")
+    assert "superseded_at" not in sql
+    assert "scope = 'deleted'" in sql and "reverted_at IS NULL" in sql
+    assert "topic_photos.topic_id" in sql, "must correlate on the CHILD's own topic_id"
+
+
+def test_get_topic_full_photos_uses_the_deletion_only_child_predicate():
+    """Guards the wiring, not just the predicate: a future edit that swaps
+    CHILD_OF_UNDELETED_TOPIC back for the combined CHILD_OF_VISIBLE_TOPIC on this one
+    line would re-introduce fix round 1's regression even though both predicates still
+    exist correctly in deleted_predicates.py."""
+    src = inspect.getsource(topics.get_topic_full)
+    assert "CHILD_OF_UNDELETED_TOPIC.format(" in src
+    # Not a bare "CHILD_OF_VISIBLE_TOPIC" check -- the docstring above names it
+    # deliberately, to explain why it is NOT used. The regression this guards is a CALL,
+    # so it looks for the call form specifically.
+    assert "CHILD_OF_VISIBLE_TOPIC.format(" not in src, (
+        "get_topic_full must not CALL the live-arm-carrying combined predicate (R3) -- "
+        "that is why the site lives in UNFILTERED, not FILTERED")
 
 
 def test_visible_topics_predicate_carries_the_live_arm():
@@ -179,7 +206,14 @@ def test_the_filtered_sites_are_all_real():
 UNFILTERED = {
     (topics, "get_topic_full"):
         "R3 -- single-topic reindex read; the reindex builder must be able to re-embed a "
-        "topic's corrected content regardless of supersession status",
+        "topic's corrected content regardless of supersession status. Its photos child "
+        "uses CHILD_OF_UNDELETED_TOPIC (deletion-only, no live arm) rather than the "
+        "combined CHILD_OF_VISIBLE_TOPIC -- fix-round-1: the combined constant silently "
+        "started filtering photos here once it grew the live arm, contradicting this "
+        "same R3 ruling for every other child on this read",
+    (threads, "get_suggestion"):
+        "write-guard load for confirm/reject by a known suggestion id; reached only "
+        "through the already-filtered pending queue (controller decision, fix round 1)",
     (topics, "list_expired_non_work"):
         "R3 -- non-work retention sweep; must still see a superseded pass to redact it "
         "(Task 3's integration test proves the sweep reaches both passes of a day)",

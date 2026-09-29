@@ -178,3 +178,43 @@ def test_company_excluded_topic_ids_includes_the_superseded_topic(db):
     excluded = redactions.company_excluded_topic_ids(db, [seeded["site"]["id"]])
     assert seeded["topic_a"]["id"] in excluded
     assert seeded["topic_b"]["id"] not in excluded
+
+
+def test_get_topic_full_still_returns_a_superseded_topics_photos(db):
+    """Fix round 1: get_topic_full (the per-topic reindex builder's read, R3) must stay
+    fully unfiltered for supersession -- including its photos child, which reused
+    CHILD_OF_VISIBLE_TOPIC and silently started dropping a superseded topic's photos the
+    moment that constant grew the live arm. The reindex builder has to be able to re-embed
+    a topic's corrected content, photos included, even mid-supersession."""
+    seeded = _seed_two_passes(db)
+    topic_a_id = seeded["topic_a"]["id"]
+    db.execute(
+        "INSERT INTO topic_photos (topic_id, s3_key, caption_text) VALUES (%s, %s, %s)",
+        (topic_a_id, "reports/2026-09-25/x/p1.jpg", "pass one photo"))
+
+    full = topics.get_topic_full(db, topic_a_id)
+
+    assert full is not None, "get_topic_full must still find a superseded topic by id"
+    assert full["id"] == topic_a_id
+    assert [p["s3_key"] for p in full["photos"]] == ["reports/2026-09-25/x/p1.jpg"], (
+        "a superseded topic's own photos must not vanish from the reindex read")
+
+
+def test_get_topic_full_still_excludes_a_deleted_topics_photos(db):
+    """The other half of the same fix: CHILD_OF_UNDELETED_TOPIC dropped the live arm, not
+    the deletion arm -- a photo bound to a topic that was actually DELETED (not merely
+    superseded) must still be excluded here, same as before this task."""
+    seeded = _seed_two_passes(db)
+    topic_b_id = seeded["topic_b"]["id"]
+    db.execute(
+        "INSERT INTO topic_photos (topic_id, s3_key, caption_text) VALUES (%s, %s, %s)",
+        (topic_b_id, "reports/2026-09-25/x/p2.jpg", "pass two photo"))
+    redactions.create_redaction(
+        db, seeded["co"]["id"], topic_b_id, "removed", seeded["user"]["id"], "admin",
+        target_type="topic", scope="deleted")
+
+    full = topics.get_topic_full(db, topic_b_id)
+
+    assert full["photos"] == [], (
+        "a deleted topic's photos must still be excluded from get_topic_full -- "
+        "CHILD_OF_UNDELETED_TOPIC keeps the deletion arm, only drops the live one")

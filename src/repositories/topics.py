@@ -9,6 +9,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from deleted_predicates import (
+    CHILD_OF_UNDELETED_TOPIC,
     CHILD_OF_VISIBLE_TOPIC,
     LIVE_TOPIC_PREDICATE,
     visible_topics_predicate,
@@ -962,7 +963,14 @@ def get_topic_full(conn, topic_id) -> dict | None:
     safety_observations / findings / photos children, shaped EXACTLY like a
     list_topics_for_source_prefix element so render_report_shape can consume
     [row]. Used by the per-topic reindex builder (reindex.enqueue_topic_
-    reindex). Returns None if the id is missing/malformed."""
+    reindex). Returns None if the id is missing/malformed.
+
+    UNFILTERED for supersession throughout (R3, Track B Task 2): the reindex builder must be
+    able to re-embed a topic's corrected content even mid-supersession. The photos child uses
+    `CHILD_OF_UNDELETED_TOPIC`, not `CHILD_OF_VISIBLE_TOPIC` -- the latter now also carries
+    the live arm, and photos is the one child here that predates this task with a deletion
+    filter already on it; giving it the combined constant would have silently dropped a
+    superseded topic's photos from this read, which nothing else on this function does."""
     rows = conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_TOPIC_COLS_JOINED}, "
         f"s.name AS site_name, "
@@ -994,7 +1002,7 @@ def get_topic_full(conn, topic_id) -> dict | None:
     t["photos"] = conn.cursor(row_factory=dict_row).execute(
         "SELECT id, topic_id, s3_key, caption_text FROM topic_photos "
         "WHERE topic_id = ANY(%s) AND "
-        + CHILD_OF_VISIBLE_TOPIC.format(alias="topic_photos")
+        + CHILD_OF_UNDELETED_TOPIC.format(alias="topic_photos")
         + " ORDER BY created_at", (tids,)).fetchall()
     return t
 

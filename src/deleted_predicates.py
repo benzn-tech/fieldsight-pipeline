@@ -87,6 +87,22 @@ CHILD_OF_VISIBLE_TOPIC = (
     "AND t.superseded_at IS NULL)"
 )
 
+# The DELETION half of CHILD_OF_VISIBLE_TOPIC, alone -- no live arm. For the rare child read
+# that must survive supersession while still honouring a deletion tombstone: R3's
+# get_topic_full (the per-topic reindex builder) is unconditionally unfiltered for
+# supersession on its topic row and its action_items/safety_observations/findings children,
+# but its topic_photos child had been quietly filtered on deletion since before this task
+# and reused CHILD_OF_VISIBLE_TOPIC when that constant grew the live arm -- silently pulling
+# get_topic_full's photos out from under R3's own "stays unfiltered" ruling. This predicate
+# is what topic_photos should carry there: still hidden from a customer-facing delete
+# (get_topic_full's caller does not itself re-check that), but visible on a topic that is
+# merely superseded, matching every other child on that read.
+CHILD_OF_UNDELETED_TOPIC = (
+    "NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' "
+    "AND r.target_id = {alias}.topic_id AND r.scope = 'deleted' "
+    "AND r.reverted_at IS NULL)"
+)
+
 
 def visible_topics_predicate(alias: str = "t") -> str:
     """All three arms, ANDed. What a topic read path carries: not deleted (by topic id),
