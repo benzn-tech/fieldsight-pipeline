@@ -82,8 +82,8 @@ from photo_binding import photos_for_topics as _photos_for_topics  # noqa: F401 
 import photo_rebind
 import thread_match
 from repositories import location_markers
-from repositories import (action_items, companies, findings, meeting_session, recordings,
-                          redactions,
+from repositories import (action_items, companies, decision_records, findings, meeting_session,
+                          recordings, redactions,
                           session_group, sites, threads, topic_decisions, topic_questions,
                           topics)
 # The extraction-key shape lives in session_scope now (the read side needs the
@@ -749,7 +749,19 @@ def _list_pictures(prefix):
 # ----------------------------------------------------------
 # Per-extraction write (commit-per-extraction: one `with get_connection()` here)
 # ----------------------------------------------------------
-def _suggest_threads(conn, site_id, date, written):
+
+# Track B Task 6a: the floor a candidate must clear to be worth a
+# decision_records row at all -- deliberately LOWER than
+# thread_match.MIN_SCORE (the real accept bar the suggestion itself uses).
+# The point of Task 6 is that a REJECTED verdict is recorded too, so a
+# candidate the matcher genuinely considered and turned down (0.10-0.25)
+# gets a row with auto_outcome='rejected'; below 0.10 the pair barely
+# shares vocabulary at all and recording it would just be noise on every
+# site's corpus.
+_THREAD_RECORD_FLOOR = 0.10
+
+
+def _suggest_threads(conn, company_id, site_id, date, written):
     """Propose, for each topic just written, which earlier subject it is a
     restatement of.
 
@@ -768,16 +780,18 @@ def _suggest_threads(conn, site_id, date, written):
     are lost. A bare try/except here would have silently traded the day's
     real content for an optional suggestion. `conn.transaction()` nested
     inside the caller's transaction issues a SAVEPOINT, so a failure unwinds
-    only this pass."""
+    only this pass -- this is also the SAVEPOINT Track B Task 6a's
+    per-candidate decision_records writes below ride inside; they need no
+    savepoint of their own."""
     try:
         with conn.transaction():
-            return _suggest_threads_inner(conn, site_id, date, written)
+            return _suggest_threads_inner(conn, company_id, site_id, date, written)
     except Exception:
         logger.exception("thread suggestion pass failed; topics were written")
         return 0
 
 
-def _suggest_threads_inner(conn, site_id, date, written):
+def _suggest_threads_inner(conn, company_id, site_id, date, written):
     corpus = threads.candidate_corpus(conn, site_id, date,
                                       thread_match.MAX_GAP_DAYS)
     if not corpus:
@@ -801,23 +815,56 @@ def _suggest_threads_inner(conn, site_id, date, written):
         # should account for the document being scored, and on a small
         # site's corpus leaving it out visibly skews the rarity of its
         # own vocabulary. find_candidates skips it as a candidate.
-        hits = thread_match.find_candidates(new_topic, list(corpus) + [new_topic])
-        if not hits:
+        #
+        # Track B Task 6a: scored at _THREAD_RECORD_FLOOR (0.10), not the
+        # real accept bar thread_match.MIN_SCORE (0.25) -- `scored` is a
+        # strict superset of what a plain find_candidates() call would
+        # have returned (same corpus/IDF, only the floor differs, and the
+        # sort order/scores are identical), so filtering it back down to
+        # `hits` below reproduces the pre-Task-6a suggestion logic exactly.
+        scored = thread_match.find_candidates(
+            new_topic, list(corpus) + [new_topic], min_score=_THREAD_RECORD_FLOOR)
+        if not scored:
             continue
-        best = hits[0]
-        # Join the parent's thread if it has one; otherwise anchor a new
-        # thread on the parent itself. Exactly one of these, which the
-        # table's CHECK enforces.
-        if best.get("thread_id"):
-            row = threads.upsert_suggestion(
-                conn, t["topic_id"], thread_id=best["thread_id"],
-                score=best["match_score"], gap_days=best["gap_days"])
-        else:
-            row = threads.upsert_suggestion(
-                conn, t["topic_id"], parent_topic_id=best["id"],
-                score=best["match_score"], gap_days=best["gap_days"])
-        if row is not None:
-            made += 1
+        hits = [c for c in scored if c["match_score"] >= thread_match.MIN_SCORE]
+        winner = hits[0] if hits else None
+        winner_row = None
+        if winner is not None:
+            # Join the parent's thread if it has one; otherwise anchor a new
+            # thread on the parent itself. Exactly one of these, which the
+            # table's CHECK enforces.
+            if winner.get("thread_id"):
+                winner_row = threads.upsert_suggestion(
+                    conn, t["topic_id"], thread_id=winner["thread_id"],
+                    score=winner["match_score"], gap_days=winner["gap_days"])
+            else:
+                winner_row = threads.upsert_suggestion(
+                    conn, t["topic_id"], parent_topic_id=winner["id"],
+                    score=winner["match_score"], gap_days=winner["gap_days"])
+            if winner_row is not None:
+                made += 1
+        # A candidate is 'accepted' only when it is the ONE that actually
+        # became a live suggestion this pass -- `winner_row is None` means
+        # `already_resolved` (a human already answered this exact proposal;
+        # threads.upsert_suggestion docstring), so nothing new was proposed
+        # and every scored candidate here is 'rejected', winner included.
+        became_suggestion_id = winner["id"] if winner_row is not None else None
+        for c in scored:
+            # `output` carries only ids/numbers -- match_score, gap_days,
+            # the earlier topic's OWN thread_id (a uuid, not text) -- never
+            # `c`'s title/summary, which are extraction-derived text (plan
+            # Global Constraint: decision_records never carries transcript
+            # text).
+            decision_records.insert(
+                conn, company_id=company_id, site_id=site_id, kind="thread",
+                subject_type="topic", subject_stable_id=t["topic_id"],
+                object_ref=str(c["id"]), provider="lexical", model=None,
+                model_version=None, question_set=None, input_key=None, input_hash=None,
+                output={"match_score": c["match_score"], "gap_days": c["gap_days"],
+                        "thread_id": c.get("thread_id")},
+                score=c["match_score"], threshold=thread_match.MIN_SCORE,
+                auto_outcome=("accepted" if c["id"] == became_suggestion_id else "rejected"),
+            )
     logger.info("thread suggestions: %d proposed over %d candidates",
                 made, len(corpus))
     return made
@@ -868,6 +915,57 @@ def _resolve_self_responsible(action_items, name):
             item["responsible"] = name
             resolved += 1
     return resolved
+
+
+#  Track B Task 6a: work_class decision_records need a `provider`, and this
+#  function calls no LLM itself -- the classification travelled here inside
+#  the extraction JSON lambda_extract_session already wrote, and that
+#  artifact carries no model/provider identifier at all (grepped
+#  lambda_extract_session.py -- the extraction JSON's schema has no such
+#  field). Naming a specific vendor here (e.g. reading `llm_utils.
+#  LLM_PROVIDER`) would require also wiring LLM_TEMPERATURE onto
+#  ItemWriterFunction to satisfy this repo's own
+#  test_the_temperature_knob_reaches_every_function_that_calls_an_llm
+#  invariant, which exists precisely to flag a function that carries an LLM
+#  knob it never reads -- and this function genuinely never calls an LLM.
+#  '_WORK_CLASS_PROVIDER' is a category, not a vendor name: honest about
+#  what this function actually knows (a classification arrived via SOME
+#  extraction-time LLM call, source unrecorded), same posture as 'lexical'/
+#  'rule' already being non-vendor `provider` values on this same table.
+_WORK_CLASS_PROVIDER = "extraction"
+
+
+def _record_work_class_decision(conn, company_id, site_id, topic_id,
+                                work_class, work_confidence, is_mixed):
+    """Track B Task 6a: one decision_records row for a topic's work_class
+    classification, ONLY when the topic actually has one -- `work_class`
+    here is the ALREADY-sanitized value (the caller's `_wc`: NULL for
+    anything outside the CHECK enum), so a bad/missing LLM value produces
+    no record rather than a bogus one. There is no accept/reject gate on a
+    classification like there is on a programme match -- it always exists
+    or it doesn't -- so `auto_outcome` is always 'accepted' and
+    `threshold` is always None. `model` stays NULL for the same reason
+    `_WORK_CLASS_PROVIDER` is a category: nothing in the extraction JSON
+    names one.
+
+    Wrapped in its OWN SAVEPOINT with a WARNING on failure, same posture as
+    Ruling R10/_suggest_threads: this write must never be able to abort the
+    topic/finding/action-item write it rides alongside."""
+    if work_class is None:
+        return
+    try:
+        with conn.transaction():
+            decision_records.insert(
+                conn, company_id=company_id, site_id=site_id, kind="work_class",
+                subject_type="topic", subject_stable_id=topic_id, object_ref=None,
+                provider=_WORK_CLASS_PROVIDER, model=None, model_version=None,
+                question_set=None, input_key=None, input_hash=None,
+                output={"work_class": work_class, "work_confidence": work_confidence,
+                        "is_mixed": is_mixed},
+                score=work_confidence, threshold=None, auto_outcome="accepted",
+            )
+    except Exception:
+        logger.warning("work_class decision record not stored for topic=%s", topic_id)
 
 
 def write_extraction_items(date, user_folder, extraction_key):
@@ -1162,6 +1260,13 @@ def write_extraction_items(date, user_folder, extraction_key):
                 # to exist before it can bind to them.
             )
             new_topic_ids.append(row["id"])
+            # Track B Task 6a: one work_class decision_records row per topic
+            # that actually carries one (see `_record_work_class_decision`
+            # for what "actually carries one" means and why this must not
+            # be able to abort the write below it).
+            _record_work_class_decision(
+                conn, company["id"], site["id"], row["id"], _wc, _wconf,
+                t.get("is_mixed") is True)
             # Task 2 (programme-impact-link plan) -- persist this topic's
             # rich extraction findings in the SAME transaction as the topic
             # upsert (inherits the I-3 advisory lock + I-4 supersession
@@ -1253,7 +1358,7 @@ def write_extraction_items(date, user_folder, extraction_key):
 
         if collected_topics:
             if SUGGEST_THREADS:
-                _suggest_threads(conn, site["id"], date, collected_topics)
+                _suggest_threads(conn, company["id"], site["id"], date, collected_topics)
             else:
                 # Say that it is off. An env-gated feature that logs nothing
                 # when disabled is indistinguishable from one that is broken,

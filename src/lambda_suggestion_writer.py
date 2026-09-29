@@ -25,8 +25,12 @@ Entry point (event shape):
                       suggested_status, suggested_progress, confidence,
                       match_evidence}, ... ],
    "impacts": [ {finding_id, task_id, impact_severity, impact_note,
-                  impact_task_name, impact_evidence}, ... ]}
-  -> {"written": N, "impacts_applied": M}
+                  impact_task_name, impact_evidence}, ... ],
+   "verdicts": [ {kind, subject_type, subject, subject_is_row_id?,
+                  object_ref, site_id, provider, model, model_version,
+                  question_set, input_key, input_hash, output, score,
+                  threshold, auto_outcome}, ... ]}
+  -> {"written": N, "impacts_applied": M, "verdicts_recorded": K}
 
 `impacts` is the programme-impact-link plan's Task 3 addition (see
 docs/superpowers/plans/2026-07-13-programme-impact-link.md, Task 3): each
@@ -39,6 +43,23 @@ apply_impact is never called and the response carries no
 row vanished under nightly supersession or a racing re-extraction (D4/D5
 of the plan) -- a NORMAL skip, not an error, so it is simply not counted.
 
+`verdicts` is Track B Task 6a's addition: one decision_records row is
+inserted per entry, in the SAME transaction as the suggestion/impact
+writes above -- every gated matcher verdict (accepted AND rejected)
+becomes a durable row, not just the accepted half `programme_suggestions`/
+`findings` ever saw. Backward compatible the same way `impacts` is: a
+missing/empty `verdicts` key (an old matcher deploy mid-rollout) behaves
+EXACTLY as before this existed, and the response carries no
+`verdicts_recorded` key. `site_id` travels on EACH verdict (not just once
+on the event) because `decision_records.company_id` is NOT NULL and this
+writer has no other way to resolve it -- `_company_id_for_site` looks it
+up via `repositories.sites.get_site`, cached per site_id within one
+invocation so a batch of verdicts for the same site costs one query, not
+N. A verdict whose site_id resolves to no company (or whose
+`subject_is_row_id` finding no longer exists) is skipped with a WARNING,
+never allowed to abort the suggestion/impact writes riding in the same
+transaction.
+
 Environment Variables:
     PG*/DATABASE_URL - read by db.connection.get_connection()
 """
@@ -46,7 +67,7 @@ import datetime
 import logging
 
 from db.connection import get_connection
-from repositories import findings, programme_suggestions
+from repositories import decision_records, findings, programme_suggestions, sites
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -63,17 +84,72 @@ def _coerce_report_date(suggestion: dict) -> dict:
     return suggestion
 
 
+def _company_id_for_site(conn, site_id, cache):
+    """company_id for `site_id`, memoised in `cache` for the life of one
+    invocation -- a batch of verdicts almost always shares one site
+    (one match_requests/ artifact = one site, module docstring of
+    lambda_programme_matcher.py), so this is one query, not N. None when
+    the site row does not exist (or site_id is None -- an old-shaped
+    verdict dict missing the field)."""
+    if site_id not in cache:
+        site = sites.get_site(conn, site_id) if site_id is not None else None
+        cache[site_id] = site["company_id"] if site else None
+    return cache[site_id]
+
+
+def _record_verdict(conn, entry, company_id_cache):
+    """Insert one decision_records row for one matcher verdict (Track B
+    Task 6a). Returns True on a successful insert, False on a skip (never
+    raises -- a bad verdict entry must not abort the suggestion/impact
+    writes riding in the same transaction; the caller decides how to make
+    that true, e.g. by wrapping the whole `verdicts` loop in a SAVEPOINT).
+
+    `subject_is_row_id` (set by `_build_impact_verdict_record` for a
+    programme_impact verdict) means `entry["subject"]` is a
+    `findings.id` ROW id, not a `findings.stable_id` -- the matcher is
+    deliberately non-VPC (BUG-36, no Aurora egress) and can only carry the
+    row id it read from the match_requests/ artifact; this in-VPC writer
+    resolves id -> stable_id here, in SQL, before the record is
+    written."""
+    company_id = _company_id_for_site(conn, entry.get("site_id"), company_id_cache)
+    if company_id is None:
+        logger.warning("decision record skipped: no company for site_id=%s", entry.get("site_id"))
+        return False
+
+    subject_stable_id = entry.get("subject")
+    if entry.get("subject_is_row_id"):
+        subject_stable_id = findings.get_stable_id(conn, subject_stable_id)
+        if subject_stable_id is None:
+            logger.warning("decision record skipped: finding row %s not found", entry.get("subject"))
+            return False
+
+    decision_records.insert(
+        conn, company_id=company_id, site_id=entry.get("site_id"),
+        kind=entry["kind"], subject_type=entry["subject_type"],
+        subject_stable_id=subject_stable_id, object_ref=entry.get("object_ref"),
+        provider=entry["provider"], model=entry.get("model"),
+        model_version=entry.get("model_version"), question_set=entry.get("question_set"),
+        input_key=entry.get("input_key"), input_hash=entry.get("input_hash"),
+        output=entry["output"], score=entry.get("score"), threshold=entry.get("threshold"),
+        auto_outcome=entry["auto_outcome"],
+    )
+    return True
+
+
 def lambda_handler(event, _context):
     suggestions = (event or {}).get("suggestions") or []
     impacts = (event or {}).get("impacts") or []
-    if not suggestions and not impacts:
+    verdicts = (event or {}).get("verdicts") or []
+    if not suggestions and not impacts and not verdicts:
         # Guard BEFORE opening a DB connection — an empty batch never
-        # touches Aurora. Both lists must be empty: an impacts-only
-        # payload (no suggestions this run) must still open the connection.
+        # touches Aurora. All three lists must be empty: a verdicts-only
+        # payload (no suggestions/impacts this run -- every verdict was
+        # rejected) must still open the connection.
         return {"written": 0}
 
     written = 0
     impacts_applied = 0
+    verdicts_recorded = 0
     with get_connection() as conn:
         for s in suggestions:
             row = programme_suggestions.upsert_suggestion(conn, **_coerce_report_date(s))
@@ -92,9 +168,18 @@ def lambda_handler(event, _context):
             if row is not None:
                 impacts_applied += 1
 
-    logger.info("suggestion-writer wrote %d/%d suggestions, applied %d/%d impacts",
-                written, len(suggestions), impacts_applied, len(impacts))
+        company_id_cache = {}
+        for entry in verdicts:
+            if _record_verdict(conn, entry, company_id_cache):
+                verdicts_recorded += 1
+
+    logger.info("suggestion-writer wrote %d/%d suggestions, applied %d/%d impacts, "
+                "recorded %d/%d verdicts",
+                written, len(suggestions), impacts_applied, len(impacts),
+                verdicts_recorded, len(verdicts))
     result = {"written": written}
     if impacts:
         result["impacts_applied"] = impacts_applied
+    if verdicts:
+        result["verdicts_recorded"] = verdicts_recorded
     return result

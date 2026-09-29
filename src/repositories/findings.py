@@ -92,6 +92,22 @@ def apply_impact(conn, finding_id, *, task_id, impact_severity, impact_note,
     ).fetchone()
 
 
+def get_stable_id(conn, finding_id):
+    """The stable_id of one finding row (Track B Task 6a). The matcher
+    (src/lambda_programme_matcher.py) only ever carries the ROW id --
+    `findings.id`, via the match_requests/ artifact's `finding_id` field
+    (lambda_item_writer's `collected_topics` never puts `stable_id` in it)
+    -- because it is deliberately non-VPC (BUG-36, no Aurora egress) and
+    cannot resolve id -> stable_id itself. This in-VPC writer resolves it
+    here, in SQL, before writing a programme_impact decision record.
+
+    None when the finding row no longer exists -- nightly supersession or
+    a re-extraction racing in between the matcher's read and this write
+    (same posture as `apply_impact`), or a malformed id."""
+    row = conn.execute("SELECT stable_id FROM findings WHERE id=%s", (finding_id,)).fetchone()
+    return row[0] if row else None
+
+
 def list_for_topics(conn, topic_ids) -> list[dict]:
     """Batched read of findings for a set of topic ids -- mirrors
     topics.list_topics_for_date's action_items/safety_observations children
