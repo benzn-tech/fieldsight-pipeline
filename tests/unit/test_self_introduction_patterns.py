@@ -191,3 +191,31 @@ def test_same_speaker_introducing_twice_in_one_file_yields_one_result():
     results = self_introduction.find(first + second)
     assert len(results) == 1
     assert results[0]["heard_name"] == "Petros"
+
+
+# ---- reported and example speech (measured 2026-09-30, prod + TEST transcripts) ----------
+# Five of nine hits over 30 days were somebody else's words. Each sentence below is the
+# real transcript text, trimmed; none of them is the speaker introducing themselves.
+
+import pytest as _pytest
+import self_introduction  # noqa: E402 -- the tests above import it locally
+
+
+@_pytest.mark.parametrize("text", [
+    'So he\'s like, uh, "I\'m Aaron Arnold from Colliers. Uh, I\'m the, uh, I\'m the',
+    'ask them to say, introduce myself, "I\'m," blah, blah, blah. "I\'m Will from '
+    'Cassidy Construction," for example.',
+    "Or what me? 'Cause you just know my name is Camp. And then I'm like,",
+    '"Hi, my name is Jesse. I\'m sharing breakfast at ten AM this Friday."',
+    'introduce each of them and say, "I\'m Ben from DBC or from somewhere, somewhere else,',
+])
+def test_somebody_elses_words_are_not_an_introduction(text):
+    assert self_introduction._detect(text) is None
+
+
+@_pytest.mark.parametrize("text,name", [
+    ("Morning. Morning, mate. I'm James. How are you doing?", "James"),
+    ("Hey, Sam. This is Ben from FieldSight AI company. Can tell you", "Ben"),
+])
+def test_real_introductions_still_count(text, name):
+    assert self_introduction._detect(text)["heard_name"] == name

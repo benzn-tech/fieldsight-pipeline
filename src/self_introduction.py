@@ -87,22 +87,44 @@ def _find_company(text, pos):
     return m.group(1) if m else None
 
 
+# Reported and example speech. Measured 2026-09-30 on 30 days of real transcripts (prod +
+# TEST, 2,339 files): 5 of 9 hits were somebody else's words -- "he's like, 'I'm Aaron Arnold
+# from Colliers'", "ask them to say, 'I'm Will from Cassidy', for example", "you just know my
+# name is Camp", a read-out '"Hi, my name is Jesse"'. Precision 44% against the 80% the plan
+# requires. Every one sat inside an open quotation, or just after a reporting or example
+# cue, so a match is refused in either position.
+_REPORTING_CUE_RE = re.compile(
+    r"\b(?:like|goes|go|went|said|says|say|saying|told|tell|know|asked|ask them to|"
+    r"for example|for instance|e\.g\.)[\s,:\"'“‘]*$",
+    re.IGNORECASE)
+
+
+def _is_reported(text, start):
+    """True when the match at `start` is someone else's words, not the speaker's own."""
+    before = text[:start]
+    # Inside a quotation: the transcriber writes straight quotes for both ends, so an odd
+    # count means one is open; curly quotes are counted as opened minus closed.
+    if before.count('"') % 2 == 1 or before.count("“") > before.count("”"):
+        return True
+    return bool(_REPORTING_CUE_RE.search(before[-45:]))
+
+
 def _detect_english(text):
     if _GREETING_RE.match(text):
         m = _THIS_IS_RE.search(text)
-        if m:
+        if m and not _is_reported(text, m.start()):
             name = _validate_latin_name(m.group(1), text[m.end():])
             if name:
                 return {"heard_name": name, "company_name": _find_company(text, m.end())}
 
     m = _MY_NAME_RE.search(text)
-    if m:
+    if m and not _is_reported(text, m.start()):
         name = _validate_latin_name(m.group(1), text[m.end():])
         if name:
             return {"heard_name": name, "company_name": _find_company(text, m.end())}
 
     m = _IM_RE.search(text)
-    if m:
+    if m and not _is_reported(text, m.start()):
         name = _validate_latin_name(m.group(1), text[m.end():])
         if name:
             followed = bool(_FOLLOW_CONTEXT_RE.match(text[m.end():]))
