@@ -13,20 +13,20 @@
 
 | Track | Plan | Depends on | Session shape |
 |---|---|---|---|
-| **A** Jev shadow eval | `plans/2026-09-24-track-a-jev-shadow-eval.md` | nothing; needs `OPENROUTER_API_KEY` | one session, ~1–2 weeks, read-only, offline scripts |
+| **A** Jev shadow eval | `plans/2026-09-24-track-a-jev-shadow-eval.md` | — | **closed 2026-09-29**: threads and work_class not adopted; Jev at most a pluggable extra signal behind `decision_records`. Findings: `specs/2026-09-28-jev-shadow-eval-findings.md` |
 | **B** stable identity + decision records | `plans/2026-09-24-track-b-stable-identity-and-decision-records.md` | nothing | one session, ~2–4 weeks, migration + writer + endpoints; deploy to TEST |
 | **L** topics and photos by location | `plans/2026-09-25-track-l-photos-and-topics-by-location.md` | nothing (pure read-time) | one session, ~1–2 weeks; Task 1 first, it may re-order the rest |
-| C | edges, claim_type, locations table, tags, Procore blocks | A's findings + B landed | not started; do not begin until A's findings doc exists |
+| C | edges, claim_type, locations table, tags, Procore blocks | B landed | not started. A's verdict is in: Jev is not the decision centre. |
 | Procore | `runbooks/2026-09-24-procore-sandbox-setup.md`, `scripts/procore_probe.py` | sandbox credentials | **paused by the owner 2026-09-25**; run the probe only when credentials arrive |
 
-A, B and L can run in three sessions at once. They touch different files:
+B and L can run in two sessions at once (A is closed). They touch different files:
 A is `scripts/jev_eval/*` + `src/systemone_client.py`; B is migrations, `lambda_item_writer`, repositories, `deleted_predicates`, `lambda_org_api` confirm/reject; L is `place_normalise`, `location_grouping`, `report_sections`, `lambda_session_report`, one function in `lambda_org_api`. The one shared file is `lambda_org_api.py`; B edits the suggestion endpoints (~line 6324–6460), L edits `_photo_groups` (~line 7185). Rebase onto `develop` before opening a PR and the merge is trivial.
 
 ## Branching and PRs (repo convention)
 
 - Start from `develop`: `git fetch origin develop && git checkout -b feature/<track-short-name> origin/develop`. Bring the plans in by merging `feature/event-graph-tracks` or cherry-picking its doc commits; they are documentation only.
 - PR to `develop`. `test.yml` runs the full suite including integration tests against a pgvector Postgres container; `deploy.yml` deploys the TEST stack on merge.
-- **Migration numbers:** `develop` is at `0067` as of 2026-09-25. Take the next free number at merge time and expect to renumber once (it has happened twice this month).
+- **Migration numbers:** `develop` is at `0070` as of 2026-09-29. Take the next free number at merge time and expect to renumber once (it has happened twice this month).
 - Prod (`main`) is not touched by any of these tracks until the owner says so. Track B's flags stay off in prod by default.
 
 ## Session-start prompt (copy, fill the track letter)
