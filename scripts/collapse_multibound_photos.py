@@ -52,49 +52,10 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-import photo_binding                      # noqa: E402
-import photo_rebind                       # noqa: E402
+import json                              # noqa: E402
+
+import photo_collapse                     # noqa: E402
 from db.connection import get_connection   # noqa: E402
-from repositories import topics            # noqa: E402
-
-_MULTIBOUND = """
-SELECT split_part(tp.s3_key, '/', 2)  AS folder,
-       split_part(tp.s3_key, '/', 4)  AS day,
-       count(DISTINCT tp.topic_id)    AS n,
-       count(*)                       AS rows
-  FROM topic_photos tp
- WHERE tp.source = 'binding'
- GROUP BY tp.s3_key
-HAVING count(DISTINCT tp.topic_id) > 1
-"""
-
-
-def affected_days(conn):
-    """{(folder, day): photos_bound_more_than_once}, worst first.
-
-    Folder and day come out of the KEY (`users/{folder}/pictures/{date}/x.jpg`),
-    not out of `topics`, for the same reason the binding scope does: the key is
-    what the photo list was built from, and a topic's site/user can differ
-    between two sessions of one day.
-    """
-    out = {}
-    for r in conn.cursor().execute(_MULTIBOUND).fetchall():
-        folder, day = r[0], r[1]
-        out[(folder, day)] = out.get((folder, day), 0) + 1
-    return dict(sorted(out.items(), key=lambda kv: -kv[1]))
-
-
-def company_of(conn, folder):
-    """The company that owns a folder's recordings, for the session spans.
-
-    None is survivable: `session_local_span` then finds no rows, every span is
-    unknown, and the session rule fails open -- the same answer a RealPTT day
-    gives. The day still collapses to one topic per photo, which is the point.
-    """
-    row = conn.cursor().execute(
-        "SELECT company_id FROM recordings WHERE s3_key LIKE %s LIMIT 1",
-        (f"users/{folder}/%",)).fetchone()
-    return row[0] if row else None
 
 
 def main():
@@ -108,46 +69,12 @@ def main():
     args = ap.parse_args()
 
     import boto3
-    s3 = boto3.client("s3")
-
     with get_connection() as conn:
-        days = affected_days(conn)
-        if args.folder or args.date:
-            days = {k: v for k, v in days.items()
-                    if (not args.folder or k[0] == args.folder)
-                    and (not args.date or k[1] == args.date)}
-        print(f"{len(days)} day(s) hold a photo bound more than once")
-        total_before = total_after = 0
-        for (folder, day), n in days.items():
-            photos = photo_binding.list_pictures(
-                s3, args.bucket, f"users/{folder}/pictures/{day}/")
-            before = conn.cursor().execute(
-                "SELECT count(*) FROM topic_photos tp JOIN topics t ON t.id = tp.topic_id "
-                "WHERE tp.source = 'binding' AND tp.s3_key LIKE %s",
-                (f"users/{folder}/pictures/{day}/%",)).fetchone()[0]
-            if args.apply:
-                written = photo_rebind.rebind_day_photos(
-                    conn, company_of(conn, folder), folder, day, photos)
-            else:
-                # Same computation, no write: resolve the day and count what a
-                # rebind WOULD produce. `replace_day_photo_bindings` is the only
-                # writer and it is not called here.
-                day_topics = topics.list_day_topics_for_binding(conn, folder, day)
-                sessions = {i: photo_rebind.session_of(t.get("source_s3_key"))
-                            for i, t in enumerate(day_topics)}
-                written = sum(len(v) for v in photo_binding.photos_for_topics(
-                    photos, day_topics, topic_sessions=sessions).values())
-            total_before += before
-            total_after += written
-            print(f"  {folder}/{day}: {n} multi-bound photo(s), "
-                  f"{before} row(s) -> {written}")
-        print(f"\n{'APPLIED' if args.apply else 'DRY RUN'}: "
-              f"{total_before} binding row(s) -> {total_after}")
-        if not args.apply:
-            print("nothing was written. Re-run with --apply to write.")
-            # An explicit rollback rather than relying on "we only SELECTed":
-            # a dry run that commits is a dry run in name only.
-            conn.rollback()
+        summary = photo_collapse.run(conn, boto3.client("s3"), args.bucket,
+                                     apply=args.apply, folder=args.folder, date=args.date)
+    print(json.dumps(summary, indent=2, default=str))
+    if not args.apply:
+        print("nothing was written. Re-run with --apply to write.")
 
 
 if __name__ == "__main__":
