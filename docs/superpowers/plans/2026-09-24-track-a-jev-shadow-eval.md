@@ -172,8 +172,8 @@
 
   > Jev (decomposed) **replaces** today's gate on a set only if, on the held-out half: coverage_at_p95 ≥ the baseline's coverage_at_p95, AND run_agreement ≥ 0.95, AND ECE10 ≤ 0.10, AND the control check passes. Jev **augments** the gate (runs alongside as an extra signal in `decision_records`, Track C) if it meets two of the three numeric conditions. Otherwise it is **not adopted** for that set and the finding is recorded with the numbers.
 
-- [ ] **Step 2: Table per set**, arms as rows: n, accuracy, precision, recall, Brier, ECE10, run agreement, coverage@p95, median latency, cost per 1000 rows. Every row carries provider, model, temperature, and the exact question text hash — the 2026-08-12 spec's first harness run recorded none of that and the data could not prove what produced it.
-- [ ] **Step 3: Read the disagreements by hand.** For each set, the 20 rows where Jev-decomposed and the baseline disagree most: which one the human label agrees with, and whether the label itself looks wrong (suggestion labels were given by one reviewer under time pressure). A number is not a decision input until a person has read a sample.
+- [x] **Step 2: Table per set**, arms as rows: n, accuracy, precision, recall, Brier, ECE10, run agreement, coverage@p95, median latency, cost per 1000 rows. Every row carries provider, model, temperature, and the exact question text hash — the 2026-08-12 spec's first harness run recorded none of that and the data could not prove what produced it.
+- [x] **Step 3: Read the disagreements by hand.** For each set, the 20 rows where Jev-decomposed and the baseline disagree most: which one the human label agrees with, and whether the label itself looks wrong (suggestion labels were given by one reviewer under time pressure). A number is not a decision input until a person has read a sample.
 - [x] **Step 4: What this did not measure**, stated: task admission (no exported set — its ground truth is one session's fixture at `tests/fixtures/task_admission_ground_truth.json`, run it descriptively only if time allows), claim_type (no labels exist yet), latency inside a Lambda (this ran from a laptop/CI runner).
 
 ---
@@ -226,3 +226,10 @@ Deviations from the text above, all recorded in the findings doc or the code:
 - work_class label means "is non-work"; no implicit negatives from unflagged topics (circular).
 - Export and sampler exclude customer-deleted content via the repo's own predicates.
 - `--dry-run` writes the exact masked states for the owner to inspect before the first real call; `--score` loads results with (id, arm, run) dedup and stamps provenance.
+
+## Closed (2026-09-29)
+
+Track A is complete. First real run 2026-09-29: threads and work_class both **not adopted** under the
+pre-registered rule; results, the owner's disagreement read and the follow-up list are in
+`docs/superpowers/specs/2026-09-28-jev-shadow-eval-findings.md` §5, §6, §8. programme_match was not measured
+(0 labels). Merged PRs: #944 (harness, squash-merged), #949, #957, #958, #959, #960, #961, #962.
