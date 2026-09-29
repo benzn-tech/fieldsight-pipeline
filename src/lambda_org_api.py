@@ -164,6 +164,7 @@ import batch_stitch
 import deletion_mirror
 import speaker_match_request
 from repositories import speaker_name_proposals
+from repositories import speaker_intro_suggestions
 import turn_name_overlay
 from transcript_utils import extract_base_time_from_filename, speaker_turns_from_items
 
@@ -230,6 +231,9 @@ SPEAKER_IDENTITY_MODE = os.environ.get("SPEAKER_IDENTITY_MODE", "off").lower()
 # How many of a person's pending candidates the dialog asks about at once. A SCREEN-SIZE
 # choice: it decides how long the list is, never whether a candidate is a match.
 PROPOSAL_PAGE = int(os.environ.get("PROPOSAL_PAGE", "5"))
+#: How many pending self-introductions `GET /name-suggestions` lists at once -- a
+#: screen-size choice like PROPOSAL_PAGE, not an admission threshold (owner decision 4).
+SUGGESTION_PAGE = int(os.environ.get("SUGGESTION_PAGE", "20"))
 
 # Whether naming a speaker is itself taken as the claim that they agreed to a voiceprint.
 #
@@ -780,6 +784,11 @@ def dispatch(conn, event, method, route):
     m_np = re.match(r"^/name-proposals/([^/]+)$", route)
     if m_np and method == "POST":
         return decide_name_proposal(conn, caller, m_np.group(1), event)
+    if route == "/name-suggestions" and method == "GET":
+        return list_name_suggestions(conn, caller, event)
+    m_ns = re.match(r"^/name-suggestions/([^/]+)$", route)
+    if m_ns and method == "POST":
+        return decide_name_suggestion(conn, caller, m_ns.group(1), event)
     m_sc = re.match(r"^/sessions/([^/]+)/speaker-corrections$", route)
     if m_sc and method == "POST":
         return speaker_corrections(conn, caller, m_sc.group(1), event)
@@ -2429,7 +2438,13 @@ def list_name_proposals(conn, caller, event):
                                "displayName": r["display_name"],
                                "pending": int(r["pending"]),
                                "newest": r["newest"]} for r in people],
-                   "total": sum(int(r["pending"]) for r in people)})
+                   "total": sum(int(r["pending"]) for r in people),
+                   # A count, same query shape as `people` above -- no transcript
+                   # touched. Added here rather than folded into `total` because the
+                   # frontend's badge component already reads `total` and a client-side
+                   # arithmetic change is exactly the kind of edit that silently drops a
+                   # field (memory: "ui-api-layer-whitelists-request-body").
+                   "introductions": speaker_intro_suggestions.pending_count(conn, company_id)})
 
     rows = speaker_name_proposals.pending_for_person(
         conn, company_id, vp, limit=PROPOSAL_PAGE)
@@ -2578,6 +2593,125 @@ def _apply_confirmed_proposal(conn, caller, company_id, row, event):
         "start_sec": best["start_sec"],
         "end_sec": best["end_sec"],
         "display_name": person["display_name"],
+    })))
+
+
+def list_name_suggestions(conn, caller, event):
+    """GET /api/org/name-suggestions — pending self-introductions, straight off the rows.
+
+    One shape only, unlike `/name-proposals`: every field the dialog needs (`heard_name`,
+    `quote`, the ingredients of the audio key) is already ON the row --
+    `speaker_intro_suggestions` carries the words `speaker_name_proposals` does not,
+    because there is no enrolled voice yet to look the words up against. No transcript
+    read, same reason as the proposals badge: this is polled/opened often enough that an
+    S3 round trip per row would be a real cost, and there is nothing here it would buy.
+
+    Plain words only, no scores -- the customer rule the design doc states up front. This
+    body has no place a score could even go.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    company_id = str(caller["company_id"])
+    rows = speaker_intro_suggestions.pending(conn, company_id, limit=SUGGESTION_PAGE)
+    return ok({"suggestions": [{
+        "id": r["id"], "heardName": r["heard_name"], "companyName": r.get("company_name"),
+        "quote": r["quote"], "date": str(r["session_date"]), "userFolder": r["user_folder"],
+        "sessionBase": r["session_base"], "sourceFilename": r["source_filename"],
+        "speakerLabel": r["speaker_label"], "startSec": r["start_sec"],
+        "endSec": r["end_sec"], "createdAt": r["created_at"],
+    } for r in rows]})
+
+
+def decide_name_suggestion(conn, caller, suggestion_id, event):
+    """POST /api/org/name-suggestions/{id} — a human says "yes, that's a name" or "no".
+
+    Body: `{"decision": "confirmed" | "rejected", "display_name"?: string}`.
+
+    **Same delegation as `decide_name_proposal`, for the same reason.** `confirmed` does
+    not write a name here -- it builds a `speaker_corrections` call, because
+    `recompute_company_floor` counts only `source='correction'` rows, and a confirmation
+    written any other way would name the person correctly, satisfy the user and calibrate
+    nothing.
+
+    `display_name` lets a person fix what the transcriber misheard ("Petros Pan" ->
+    "Petrus Pang", the design doc's own example) before it reaches a biometric store --
+    absent, the row's own `heard_name` is used. Present but blank after `.strip()` is
+    refused: silently falling back to `heard_name` there would name someone the caller
+    just tried to clear.
+
+    `rejected` records the judgement and writes no name -- the introduction is not
+    re-offered, same as a rejected proposal. There is no third value: closing the dialog
+    must leave the row `pending` for the bell.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    body = parse_body(event) or {}
+    decision = (body.get("decision") or "").strip().lower()
+    if decision not in ("confirmed", "rejected"):
+        return error("decision must be 'confirmed' or 'rejected'; closing the dialog is "
+                     "not a decision and leaves the suggestion pending", 400)
+
+    raw_name = body.get("display_name")
+    if raw_name is not None and not raw_name.strip():
+        return error("display_name must not be empty", 400)
+
+    company_id = str(caller["company_id"])
+    # ONE transaction for the decision and the correction it delegates to, same reason as
+    # `decide_name_proposal`: a committed 'confirmed' flip whose correction is then
+    # refused would leave a row that claims a decision was made and named nobody, and --
+    # no longer pending -- could never be answered again.
+    try:
+        with conn.transaction():
+            row = speaker_intro_suggestions.decide(conn, company_id, suggestion_id, decision,
+                                                   decided_by=caller["id"])
+            if row is None:
+                return error("no pending suggestion with that id", 404)
+            if decision == "rejected":
+                return ok({"suggestionId": row["id"], "decision": "rejected"})
+            resp = _apply_confirmed_suggestion(
+                conn, caller, company_id, row,
+                (raw_name.strip() if raw_name is not None else None), event)
+            if int(resp.get("statusCode", 500)) >= 300:
+                raise _ConfirmationNotApplied(resp)
+            return resp
+    except _ConfirmationNotApplied as exc:
+        return exc.response
+
+
+def _apply_confirmed_suggestion(conn, caller, company_id, row, display_name, event):
+    """Turn a confirmed introduction into the correction a rename would have made."""
+    name = display_name or row["heard_name"]
+    folder, date = row["user_folder"], str(row["session_date"])
+
+    # The cluster's LONGEST turn, same rule and same reason as `_apply_confirmed_proposal`
+    # (spec correction 5): the introduction itself is often under the ~10 s the homogeneity
+    # guard needs to judge, and picking the intro's own turn would hand the enrolment less
+    # evidence than the meeting actually gives it.
+    turns = [t for t in _session_turns(conn, folder, date, row["session_base"])
+             if t.get("source_filename") == row["source_filename"]
+             and t.get("speaker_label") == row["speaker_label"]]
+    if turns:
+        best = max(turns, key=lambda t: float(t.get("end_sec", 0)) - float(t.get("start_sec", 0)))
+        start_sec, end_sec = best["start_sec"], best["end_sec"]
+    else:
+        # Unlike a name proposal, this is not an error: the suggestion's own detected
+        # window is at least 3 s (self_introduction.find's floor) -- short of the
+        # homogeneity guard's enrolment floor, but still enough for propagation to run.
+        start_sec, end_sec = row["start_sec"], row["end_sec"]
+
+    # The delegation, and the same session-id rule `_apply_confirmed_proposal` states:
+    # the passage's own filename, which carries the date and the sid, not
+    # `row["session_base"]` (the canonical key, which carries neither).
+    return speaker_corrections(conn, caller, row["source_filename"], dict(event, body=json.dumps({
+        "user": folder,
+        "source_filename": row["source_filename"],
+        "start_sec": start_sec,
+        "end_sec": end_sec,
+        "display_name": name,
     })))
 
 

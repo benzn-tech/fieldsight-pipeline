@@ -74,6 +74,7 @@ from repositories import location_markers
 from repositories import (companies, findings, meeting_session, recordings,
                           redactions,
                           session_group, sites, threads, topics)
+from repositories import speaker_intro_suggestions
 # The extraction-key shape lives in session_scope now (the read side needs the
 # SAME parse to derive session_id from topics.source_s3_key -- see that
 # module). Re-exported under the historical private names so existing callers
@@ -1047,6 +1048,38 @@ def write_extraction_items(date, user_folder, extraction_key):
                 extraction.get("location_markers") or [])
         except Exception:  # noqa: BLE001 -- see above
             logger.exception("location markers not stored for %s/%s", user_folder, date)
+
+        # Self-introduction suggestions ("Hi, this is Petros from Cassidy"), INSIDE the
+        # connection block, deliberately -- `_request_rebind`/`_request_match` below are
+        # called AFTER `with get_connection() as conn:` has closed (psycopg3's `with conn:`
+        # closes it on exit), and a DB write placed there raises on every single run. See
+        # the comment beside the group-merge email a few lines down for the incident that
+        # placement caused once already.
+        #
+        # Gated on tier=='final' as belt and braces: `lambda_extract_session` already
+        # writes `[]` for a live artifact (Task 2), so this should be a no-op for every
+        # live pass, but the writer does not trust the producer alone for a DB write --
+        # the same reasoning `report_already_ingested`'s guard above applies.
+        #
+        # NOT gated on SPEAKER_IDENTITY_MODE (owner decision, spec "Review outcome"
+        # decision 1): a company's queue should already be full of correctly-detected
+        # introductions on the day identity gets switched on, and these rows hold no
+        # biometric data -- only text and offsets. The confirm path is what is gated, in
+        # org-api.
+        #
+        # Never fatal, same rule as `location_markers` just above: a store failure must
+        # not turn a good extraction into a failed one.
+        if extraction.get("tier") == "final" and extraction.get("self_introductions"):
+            try:
+                counts = speaker_intro_suggestions.store(
+                    conn, company["id"], session_base, user_folder, date,
+                    extraction["self_introductions"])
+                logger.info(
+                    "intro suggestions: inserted=%d skipped_named=%d skipped_no_sid=%d",
+                    counts["inserted"], counts["skipped_named"], counts["skipped_no_sid"])
+            except Exception:  # noqa: BLE001 -- see above
+                logger.exception("self-introduction suggestions not stored for %s/%s",
+                                 user_folder, date)
 
         topics_n = 0
         collected_topics = []
