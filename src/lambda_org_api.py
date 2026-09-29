@@ -368,6 +368,7 @@ def parse_body(event):
 
 
 REPUBLISH_SITE_COORDS_TASK = "republish_site_coords"
+COLLAPSE_PHOTOS_TASK = "collapse_multibound_photos"
 
 
 def lambda_handler(event, context):
@@ -378,6 +379,15 @@ def lambda_handler(event, context):
     if isinstance(event, dict) and event.get("task") == REPUBLISH_SITE_COORDS_TASK:
         with get_connection() as conn:
             return republish_all_site_coords(conn)
+    # OPERATOR TASK, invoked by hand with `aws lambda invoke` (IAM decides who
+    # may). The same envelope rule as above keeps it out of reach of the API.
+    # A dry run unless "apply" is exactly true: a typo must not write.
+    if isinstance(event, dict) and event.get("task") == COLLAPSE_PHOTOS_TASK:
+        import photo_collapse
+        with get_connection() as conn:
+            return photo_collapse.run(conn, s3(), LAKE_BUCKET,
+                                      apply=event.get("apply") is True,
+                                      folder=event.get("folder"), date=event.get("date"))
     method = event.get("httpMethod", "")
     path = event.get("path", "")
     m = re.match(r"^/api/org(/.*)?$", path)
