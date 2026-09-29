@@ -917,26 +917,24 @@ def _resolve_self_responsible(action_items, name):
     return resolved
 
 
-#  Track B Task 6a: work_class decision_records need a `provider`, and this
-#  function calls no LLM itself -- the classification travelled here inside
-#  the extraction JSON lambda_extract_session already wrote, and that
-#  artifact carries no model/provider identifier at all (grepped
-#  lambda_extract_session.py -- the extraction JSON's schema has no such
-#  field). Naming a specific vendor here (e.g. reading `llm_utils.
-#  LLM_PROVIDER`) would require also wiring LLM_TEMPERATURE onto
-#  ItemWriterFunction to satisfy this repo's own
-#  test_the_temperature_knob_reaches_every_function_that_calls_an_llm
-#  invariant, which exists precisely to flag a function that carries an LLM
-#  knob it never reads -- and this function genuinely never calls an LLM.
-#  '_WORK_CLASS_PROVIDER' is a category, not a vendor name: honest about
-#  what this function actually knows (a classification arrived via SOME
-#  extraction-time LLM call, source unrecorded), same posture as 'lexical'/
-#  'rule' already being non-vendor `provider` values on this same table.
-_WORK_CLASS_PROVIDER = "extraction"
+# Ruling R15 (Track B Task 6a fix round 1): the plan wants the extraction's
+# ACTUAL LLM on the work_class decision record, not a category placeholder.
+# lambda_extract_session.py now stamps `llm_provider`/`llm_model` (additive
+# top-level keys, added and checked against every extraction-JSON reader in
+# that module's own commit) into the extraction it writes. This function
+# still calls no LLM itself -- the values just ride in on the JSON this
+# module already reads, so no LLM_PROVIDER/LLM_TEMPERATURE env pairing is
+# needed on ItemWriterFunction (the invariant
+# test_the_temperature_knob_reaches_every_function_that_calls_an_llm stays
+# green because this function still carries neither). An OLDER extraction
+# written before this existed has neither key -- provider falls back to
+# 'unknown' (never a guessed vendor name; model stays None either way).
+_WORK_CLASS_PROVIDER_FALLBACK = "unknown"
 
 
 def _record_work_class_decision(conn, company_id, site_id, topic_id,
-                                work_class, work_confidence, is_mixed):
+                                work_class, work_confidence, is_mixed,
+                                llm_provider, llm_model):
     """Track B Task 6a: one decision_records row for a topic's work_class
     classification, ONLY when the topic actually has one -- `work_class`
     here is the ALREADY-sanitized value (the caller's `_wc`: NULL for
@@ -944,9 +942,12 @@ def _record_work_class_decision(conn, company_id, site_id, topic_id,
     no record rather than a bogus one. There is no accept/reject gate on a
     classification like there is on a programme match -- it always exists
     or it doesn't -- so `auto_outcome` is always 'accepted' and
-    `threshold` is always None. `model` stays NULL for the same reason
-    `_WORK_CLASS_PROVIDER` is a category: nothing in the extraction JSON
-    names one.
+    `threshold` is always None.
+
+    `llm_provider`/`llm_model` are the extraction's OWN `llm_provider`/
+    `llm_model` fields (Ruling R15) -- already defaulted by the caller
+    (`llm_provider` to `_WORK_CLASS_PROVIDER_FALLBACK`, `llm_model` to None)
+    for an extraction written before those fields existed.
 
     Wrapped in its OWN SAVEPOINT with a WARNING on failure, same posture as
     Ruling R10/_suggest_threads: this write must never be able to abort the
@@ -958,7 +959,7 @@ def _record_work_class_decision(conn, company_id, site_id, topic_id,
             decision_records.insert(
                 conn, company_id=company_id, site_id=site_id, kind="work_class",
                 subject_type="topic", subject_stable_id=topic_id, object_ref=None,
-                provider=_WORK_CLASS_PROVIDER, model=None, model_version=None,
+                provider=llm_provider, model=llm_model, model_version=None,
                 question_set=None, input_key=None, input_hash=None,
                 output={"work_class": work_class, "work_confidence": work_confidence,
                         "is_mixed": is_mixed},
@@ -971,6 +972,15 @@ def _record_work_class_decision(conn, company_id, site_id, topic_id,
 def write_extraction_items(date, user_folder, extraction_key):
     raw = s3().get_object(Bucket=S3_BUCKET, Key=extraction_key)["Body"].read()
     extraction = json.loads(raw.decode("utf-8"))
+
+    # Ruling R15: one extraction pass, one LLM call, so these are read ONCE
+    # here and reused for every topic's work_class record below. Absent on
+    # an extraction written before Ruling R15 landed -- fall back rather
+    # than guess a vendor (`llm_model` is already None-safe: a missing key
+    # and an extraction that genuinely couldn't name its model both read
+    # the same way).
+    extraction_llm_provider = extraction.get("llm_provider") or _WORK_CLASS_PROVIDER_FALLBACK
+    extraction_llm_model = extraction.get("llm_model")
 
     # Track B Task 3: identifies THIS pass to repositories.topics.supersede_topics_for_source
     # (stamped onto the retired row's superseded_by_run) -- tier + extracted_at is unique per
@@ -1266,7 +1276,7 @@ def write_extraction_items(date, user_folder, extraction_key):
             # be able to abort the write below it).
             _record_work_class_decision(
                 conn, company["id"], site["id"], row["id"], _wc, _wconf,
-                t.get("is_mixed") is True)
+                t.get("is_mixed") is True, extraction_llm_provider, extraction_llm_model)
             # Task 2 (programme-impact-link plan) -- persist this topic's
             # rich extraction findings in the SAME transaction as the topic
             # upsert (inherits the I-3 advisory lock + I-4 supersession

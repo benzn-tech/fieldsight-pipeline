@@ -30,7 +30,7 @@ Entry point (event shape):
                   object_ref, site_id, provider, model, model_version,
                   question_set, input_key, input_hash, output, score,
                   threshold, auto_outcome}, ... ]}
-  -> {"written": N, "impacts_applied": M, "verdicts_recorded": K}
+  -> {"written": N, "impacts_applied": M, "verdicts_recorded": K, "verdicts_failed": F}
 
 `impacts` is the programme-impact-link plan's Task 3 addition (see
 docs/superpowers/plans/2026-07-13-programme-impact-link.md, Task 3): each
@@ -56,9 +56,14 @@ writer has no other way to resolve it -- `_company_id_for_site` looks it
 up via `repositories.sites.get_site`, cached per site_id within one
 invocation so a batch of verdicts for the same site costs one query, not
 N. A verdict whose site_id resolves to no company (or whose
-`subject_is_row_id` finding no longer exists) is skipped with a WARNING,
-never allowed to abort the suggestion/impact writes riding in the same
-transaction.
+`subject_is_row_id` finding no longer exists) is skipped with a WARNING.
+The insert itself (Ruling R14) runs inside its own SAVEPOINT with a
+WARNING on failure -- same posture as lambda_item_writer's work_class
+records (Ruling R10) -- so ANY verdict-record problem, skip or exception,
+degrades only that one record and never aborts the suggestion/impact
+writes riding in the same transaction. The response's `verdicts_recorded`/
+`verdicts_failed` (present whenever `verdicts` is non-empty) sum to
+`len(verdicts)`.
 
 Environment Variables:
     PG*/DATABASE_URL - read by db.connection.get_connection()
@@ -99,10 +104,8 @@ def _company_id_for_site(conn, site_id, cache):
 
 def _record_verdict(conn, entry, company_id_cache):
     """Insert one decision_records row for one matcher verdict (Track B
-    Task 6a). Returns True on a successful insert, False on a skip (never
-    raises -- a bad verdict entry must not abort the suggestion/impact
-    writes riding in the same transaction; the caller decides how to make
-    that true, e.g. by wrapping the whole `verdicts` loop in a SAVEPOINT).
+    Task 6a). Returns True on a successful insert, False on a skip -- never
+    raises.
 
     `subject_is_row_id` (set by `_build_impact_verdict_record` for a
     programme_impact verdict) means `entry["subject"]` is a
@@ -110,7 +113,17 @@ def _record_verdict(conn, entry, company_id_cache):
     deliberately non-VPC (BUG-36, no Aurora egress) and can only carry the
     row id it read from the match_requests/ artifact; this in-VPC writer
     resolves id -> stable_id here, in SQL, before the record is
-    written."""
+    written.
+
+    Ruling R14: the INSERT itself runs inside its OWN SAVEPOINT
+    (`conn.transaction()`, same posture as lambda_item_writer's
+    `_record_work_class_decision`/Ruling R10) -- catching an exception in
+    Python does NOT un-abort the enclosing transaction Postgres already
+    aborted, so without a real SAVEPOINT one malformed verdict entry (e.g.
+    a NOT NULL violation) would take the suggestion/impact writes it shares
+    a transaction with down too. A pre-insert skip (no company_id, a
+    vanished finding row) never reaches the SAVEPOINT at all -- there is
+    nothing to roll back."""
     company_id = _company_id_for_site(conn, entry.get("site_id"), company_id_cache)
     if company_id is None:
         logger.warning("decision record skipped: no company for site_id=%s", entry.get("site_id"))
@@ -123,16 +136,23 @@ def _record_verdict(conn, entry, company_id_cache):
             logger.warning("decision record skipped: finding row %s not found", entry.get("subject"))
             return False
 
-    decision_records.insert(
-        conn, company_id=company_id, site_id=entry.get("site_id"),
-        kind=entry["kind"], subject_type=entry["subject_type"],
-        subject_stable_id=subject_stable_id, object_ref=entry.get("object_ref"),
-        provider=entry["provider"], model=entry.get("model"),
-        model_version=entry.get("model_version"), question_set=entry.get("question_set"),
-        input_key=entry.get("input_key"), input_hash=entry.get("input_hash"),
-        output=entry["output"], score=entry.get("score"), threshold=entry.get("threshold"),
-        auto_outcome=entry["auto_outcome"],
-    )
+    try:
+        with conn.transaction():
+            decision_records.insert(
+                conn, company_id=company_id, site_id=entry.get("site_id"),
+                kind=entry["kind"], subject_type=entry["subject_type"],
+                subject_stable_id=subject_stable_id, object_ref=entry.get("object_ref"),
+                provider=entry["provider"], model=entry.get("model"),
+                model_version=entry.get("model_version"), question_set=entry.get("question_set"),
+                input_key=entry.get("input_key"), input_hash=entry.get("input_hash"),
+                output=entry["output"], score=entry.get("score"), threshold=entry.get("threshold"),
+                auto_outcome=entry["auto_outcome"],
+            )
+    except Exception:
+        logger.warning("decision record insert failed for kind=%s subject=%s -- "
+                       "suggestions/impacts in this batch are unaffected",
+                       entry.get("kind"), entry.get("subject"))
+        return False
     return True
 
 
@@ -172,14 +192,16 @@ def lambda_handler(event, _context):
         for entry in verdicts:
             if _record_verdict(conn, entry, company_id_cache):
                 verdicts_recorded += 1
+    verdicts_failed = len(verdicts) - verdicts_recorded
 
     logger.info("suggestion-writer wrote %d/%d suggestions, applied %d/%d impacts, "
-                "recorded %d/%d verdicts",
+                "recorded %d/%d verdicts (%d failed)",
                 written, len(suggestions), impacts_applied, len(impacts),
-                verdicts_recorded, len(verdicts))
+                verdicts_recorded, len(verdicts), verdicts_failed)
     result = {"written": written}
     if impacts:
         result["impacts_applied"] = impacts_applied
     if verdicts:
         result["verdicts_recorded"] = verdicts_recorded
+        result["verdicts_failed"] = verdicts_failed
     return result

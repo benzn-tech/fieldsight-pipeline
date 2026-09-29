@@ -12,12 +12,27 @@ import pytest
 sw = pytest.importorskip("lambda_suggestion_writer", reason="requires psycopg (installed in CI)")
 
 
+class _FakeTransaction:
+    """psycopg's nested transaction (a SAVEPOINT when one is already open).
+    Modelled only as far as _record_verdict relies on it: enter, and let an
+    exception propagate so _record_verdict's own try/except sees it -- same
+    minimal double as tests/unit/test_lambda_item_writer.py's FakeConn."""
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False          # never swallow -- the caller decides
+
+
 class FakeConn:
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb):
         return False
+
+    def transaction(self):
+        return _FakeTransaction()
 
 
 def _verdict(**overrides):
@@ -155,11 +170,81 @@ def test_suggestions_impacts_and_verdicts_share_one_connection(monkeypatch):
     result = sw.lambda_handler(
         {"suggestions": [suggestion], "impacts": [impact], "verdicts": [_verdict()]}, None)
 
-    assert result == {"written": 1, "impacts_applied": 1, "verdicts_recorded": 1}
+    assert result == {"written": 1, "impacts_applied": 1, "verdicts_recorded": 1, "verdicts_failed": 0}
     # ONE connection for the whole batch -- proves the verdicts loop rides
     # inside the SAME `with get_connection()` block as the other two.
     assert len(connections) == 1
     assert seen_conns == [connections[0]]
+
+
+# ---------------------------------------------------------------------------
+# Ruling R14: a decision_records.insert exception must never take the
+# suggestions/impacts it shares a transaction with down too -- the INSERT
+# runs inside its own SAVEPOINT (same posture as item-writer's
+# _record_work_class_decision, Ruling R10).
+# ---------------------------------------------------------------------------
+
+def test_decision_records_insert_exception_does_not_lose_suggestions_or_impacts(
+        monkeypatch, caplog):
+    monkeypatch.setattr(sw, "get_connection", lambda *a, **k: FakeConn())
+    _wire_sites(monkeypatch)
+    monkeypatch.setattr(sw.programme_suggestions, "upsert_suggestion",
+                        lambda conn, **kw: {"id": "sugg-1"})
+    monkeypatch.setattr(sw.findings, "apply_impact",
+                        lambda conn, finding_id, **kw: {"id": finding_id})
+
+    def boom(conn, **kw):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(sw.decision_records, "insert", boom)
+
+    suggestion = dict(
+        site_id="site-1", task_id="T-004", topic_id="topic-1",
+        topic_title="Floor Inserts", topic_summary="s", topic_user_id="u-1",
+        report_date="2026-07-12", source_s3_key="extractions/x/2026-07-12/y.json",
+        task_name="Floor Inserts", task_status_before="in_progress",
+        task_progress_before=40, suggested_status="in_progress",
+        suggested_progress=60, confidence=0.82, match_evidence={"cosine": 0.12},
+    )
+    impact = dict(finding_id="F-1", task_id="T-1", impact_severity="major",
+                  impact_note="n", impact_task_name="Floor Inserts",
+                  impact_evidence={"cosine": 0.1})
+
+    with caplog.at_level("WARNING"):
+        result = sw.lambda_handler(
+            {"suggestions": [suggestion], "impacts": [impact], "verdicts": [_verdict()]}, None)
+
+    # The suggestion and the impact still landed -- the verdict-record
+    # failure did NOT abort the transaction they share.
+    assert result["written"] == 1
+    assert result["impacts_applied"] == 1
+    assert result["verdicts_recorded"] == 0
+    assert result["verdicts_failed"] == 1
+    assert "decision record insert failed" in caplog.text
+
+
+def test_multiple_verdicts_one_bad_does_not_block_the_others(monkeypatch):
+    """The SAVEPOINT is per-verdict, not per-batch: one bad verdict entry
+    must not also lose every OTHER verdict in the same call."""
+    monkeypatch.setattr(sw, "get_connection", lambda *a, **k: FakeConn())
+    _wire_sites(monkeypatch)
+    calls = []
+
+    def maybe_boom(conn, **kw):
+        calls.append(kw)
+        if kw["object_ref"] == "T-bad":
+            raise RuntimeError("boom")
+        return {"id": "dr-ok"}
+
+    monkeypatch.setattr(sw.decision_records, "insert", maybe_boom)
+
+    verdicts = [_verdict(object_ref="T-1"), _verdict(object_ref="T-bad"),
+               _verdict(object_ref="T-2")]
+    result = sw.lambda_handler({"verdicts": verdicts}, None)
+
+    assert result["verdicts_recorded"] == 2
+    assert result["verdicts_failed"] == 1
+    assert len(calls) == 3  # all three were attempted
 
 
 # ---------------------------------------------------------------------------

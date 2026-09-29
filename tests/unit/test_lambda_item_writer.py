@@ -391,7 +391,10 @@ def test_item_writer_sanitizes_garbage_work_class_fields(wired):
 # actually has a (sanitized) work_class.
 # ---------------------------------------------------------------------------
 
-def test_work_class_decision_recorded_when_present(wired):
+def test_work_class_decision_provider_and_model_from_extraction(wired):
+    """Ruling R15: provider/model on the record are the EXTRACTION's own
+    `llm_provider`/`llm_model` fields (stamped by lambda_extract_session),
+    not a guessed or hardcoded vendor."""
     captured = []
     wired.setattr(iw.decision_records, "insert",
                   lambda conn, **kw: captured.append(kw) or {"id": "dr-1"})
@@ -400,7 +403,8 @@ def test_work_class_decision_recorded_when_present(wired):
     topic.update(work_class="work", work_confidence=0.85, is_mixed=False)
     wired.setattr(
         iw, "_s3_client",
-        FakeS3({EXTRACTION_KEY: json.dumps(make_extraction(topics=[topic]))}),
+        FakeS3({EXTRACTION_KEY: json.dumps(make_extraction(
+            topics=[topic], llm_provider="qwen", llm_model="qwen3.8-flash"))}),
     )
 
     iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
@@ -411,12 +415,35 @@ def test_work_class_decision_recorded_when_present(wired):
     assert r["subject_type"] == "topic"
     assert r["subject_stable_id"] == "topic-uuid-0"
     assert r["object_ref"] is None
-    assert r["provider"] == iw._WORK_CLASS_PROVIDER
-    assert r["model"] is None
+    assert r["provider"] == "qwen"
+    assert r["model"] == "qwen3.8-flash"
     assert r["output"] == {"work_class": "work", "work_confidence": 0.85, "is_mixed": False}
     assert r["score"] == 0.85
     assert r["threshold"] is None
     assert r["auto_outcome"] == "accepted"
+
+
+def test_work_class_decision_falls_back_when_extraction_has_no_llm_keys(wired):
+    """An extraction written before Ruling R15 landed has neither
+    `llm_provider` nor `llm_model` -- provider falls back to 'unknown'
+    (never a guessed vendor name), model stays NULL."""
+    captured = []
+    wired.setattr(iw.decision_records, "insert",
+                  lambda conn, **kw: captured.append(kw) or {"id": "dr-1"})
+
+    topic = make_extraction()["topics"][0]
+    topic.update(work_class="work", work_confidence=0.85, is_mixed=False)
+    # make_extraction() itself carries no llm_provider/llm_model key.
+    wired.setattr(
+        iw, "_s3_client",
+        FakeS3({EXTRACTION_KEY: json.dumps(make_extraction(topics=[topic]))}),
+    )
+
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    r = [c for c in captured if c["kind"] == "work_class"][0]
+    assert r["provider"] == "unknown"
+    assert r["model"] is None
 
 
 def test_work_class_decision_not_recorded_when_absent(wired):

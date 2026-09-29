@@ -323,3 +323,78 @@ def test_suggestion_writer_inserts_verdicts_for_real(monkeypatch, migrated_db_ur
             ).fetchone()
             assert remaining == (0, 0, 0), f"leaked rows after cleanup: {remaining}"
         seed.close()
+
+
+def test_verdict_insert_failure_does_not_lose_the_suggestion_row(monkeypatch, migrated_db_url):
+    """Ruling R14 -- against REAL Postgres, not a mock: a genuinely bad
+    verdict entry must not take the suggestion it shares a transaction
+    with down too. Forces a real exception inside decision_records.insert
+    (a set() is not JSON-serializable, so Jsonb()'s binding raises for
+    real) rather than monkeypatching the function, so this proves the
+    SAVEPOINT itself works against the real driver, not just that Python
+    control flow reaches a try/except."""
+    tag = uuid.uuid4().hex[:8]
+    seed = get_connection(migrated_db_url, autocommit=True)
+    co = site = topic = None
+    try:
+        co = companies.create_company(seed, f"DR6a-R14-Co-{tag}")
+        site = sites.create_site(seed, co["id"], f"DR6a-R14-Site-{tag}")
+        topic = topics.upsert_topic(
+            seed, site["id"], "2026-09-30", "Steel frame progress",
+            source_s3_key=f"extractions/x-r14-{tag}.json")
+
+        monkeypatch.setattr(lambda_suggestion_writer, "get_connection",
+                            lambda *a, **k: get_connection(migrated_db_url))
+
+        suggestion = {
+            "site_id": str(site["id"]), "task_id": "T-1", "topic_id": str(topic["id"]),
+            "topic_title": "Steel frame progress", "topic_summary": "s",
+            "topic_user_id": None, "report_date": "2026-09-30",
+            "source_s3_key": f"extractions/x-r14-{tag}.json", "task_name": "Steel frame",
+            "task_status_before": "in_progress", "task_progress_before": 40,
+            "suggested_status": "completed", "suggested_progress": 100,
+            "confidence": 0.9, "match_evidence": {"cosine": 0.1},
+        }
+        bad_verdict = {
+            "kind": "programme_match", "subject_type": "topic", "subject": str(topic["id"]),
+            "object_ref": "T-1", "site_id": str(site["id"]), "provider": "anthropic",
+            "model": None, "model_version": None, "question_set": "programme_match:abc",
+            "input_key": "match_requests/x.json", "input_hash": "deadbeef",
+            "output": {"cannot_serialize": {1, 2, 3}},   # a set -- not JSON
+            "score": 0.9, "threshold": 0.7, "auto_outcome": "accepted",
+        }
+
+        result = lambda_suggestion_writer.lambda_handler(
+            {"suggestions": [suggestion], "verdicts": [bad_verdict]}, None)
+
+        assert result["written"] == 1
+        assert result["verdicts_recorded"] == 0
+        assert result["verdicts_failed"] == 1
+
+        suggestion_row = seed.execute(
+            "SELECT id FROM programme_progress_suggestions WHERE site_id=%s",
+            (site["id"],)).fetchone()
+        assert suggestion_row is not None, "the suggestion row must have committed"
+
+        decision_row = seed.execute(
+            "SELECT id FROM decision_records WHERE site_id=%s", (site["id"],)).fetchone()
+        assert decision_row is None, "the failed verdict must not have left a row behind"
+    finally:
+        site_id = site["id"] if site is not None else None
+        co_id = co["id"] if co is not None else None
+        if site_id is not None:
+            # ON DELETE CASCADE from sites covers topics, programme_progress_suggestions
+            # and decision_records (all FK to sites) in one statement.
+            seed.execute("DELETE FROM sites WHERE id=%s", (site_id,))
+        if co_id is not None:
+            seed.execute("DELETE FROM companies WHERE id=%s", (co_id,))
+        if co_id is not None:
+            remaining = seed.execute(
+                "SELECT (SELECT count(*) FROM companies WHERE id=%s), "
+                "(SELECT count(*) FROM sites WHERE id=%s), "
+                "(SELECT count(*) FROM programme_progress_suggestions WHERE site_id=%s), "
+                "(SELECT count(*) FROM decision_records WHERE site_id=%s)",
+                (co_id, site_id, site_id, site_id),
+            ).fetchone()
+            assert remaining == (0, 0, 0, 0), f"leaked rows after cleanup: {remaining}"
+        seed.close()

@@ -1956,6 +1956,23 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
         'session_base': session_base,
         'tier': TIER_FINAL if final else TIER_LIVE,
         'source_transcripts': sorted(source_filenames),
+        # Ruling R15 (Track B Task 6a fix round 1): which LLM actually wrote
+        # `topics` (and therefore each topic's `work_class`) above -- ADDITIVE
+        # keys, read by lambda_item_writer for its work_class decision_records
+        # (falls back to provider='unknown'/model=None on an older extraction
+        # written before this existed). Every consumer of this dict was
+        # checked before adding these (grepped every `extractions/` reader in
+        # the repo): only lambda_item_writer.write_extraction_items and this
+        # module's own read_existing_extraction (.get('tier')/.get(
+        # 'extracted_at') only) ever parse the body, and neither validates a
+        # closed key set -- an extra top-level key changes nothing for them.
+        # `llm_model` mirrors `active_model`'s own "a wrong name is worse than
+        # no name" rule (llm_utils.py) -- None for an unrecognised provider,
+        # never a guess. `enable_thinking=final` matches the call above
+        # exactly, so a qwen thinking/non-thinking split names the RIGHT
+        # model variant, not just QWEN_MODEL's default.
+        'llm_provider': llm_utils.LLM_PROVIDER,
+        'llm_model': llm_utils.active_model(enable_thinking=final),
         # How many distinct voices the ASR heard. Consumers need it to know
         # whether "the speaker" is unambiguous: with exactly one, a
         # self-referential responsible party can only be the person wearing the

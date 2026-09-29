@@ -270,6 +270,62 @@ def test_writes_extraction_contract(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Ruling R15 (Track B Task 6a fix round 1) -- llm_provider/llm_model, the
+# ACTUAL provider+model that wrote this pass's `topics`, additive on the
+# extraction contract.
+# ---------------------------------------------------------------------------
+
+def test_writes_llm_provider_and_model(monkeypatch):
+    fake_s3 = FakeS3({SEG1_KEY: json.dumps(make_transcribe_json("hello world"))})
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(llm_utils, "LLM_PROVIDER", "anthropic")
+    monkeypatch.setattr(llm_utils, "CLAUDE_MODEL", "claude-sonnet-4-6")
+    monkeypatch.setattr(
+        llm_utils, "call_llm",
+        _fake_call_llm_returning({"topics": [], "declared_site": None}),
+    )
+
+    extraction = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+
+    assert extraction["llm_provider"] == "anthropic"
+    assert extraction["llm_model"] == "claude-sonnet-4-6"
+    # Written to S3 too -- lambda_item_writer reads the PUBLISHED artifact,
+    # not the return value.
+    written = json.loads(fake_s3.objects[OUT_KEY])
+    assert written["llm_provider"] == "anthropic"
+    assert written["llm_model"] == "claude-sonnet-4-6"
+
+
+def test_llm_model_reflects_the_qwen_thinking_split_live_vs_final(monkeypatch):
+    """The live pass and the final pass can genuinely run DIFFERENT qwen
+    models (llm_utils.QWEN_MODEL_NONTHINKING) -- `llm_model` must name the
+    one THIS pass actually used, matching the `enable_thinking=final`
+    argument the extraction call itself passes, not just QWEN_MODEL's
+    default."""
+    fake_s3 = _s3_with_one_segment()
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(llm_utils, "LLM_PROVIDER", "qwen")
+    # api_key_configured() checks QWEN_API_KEY when LLM_PROVIDER='qwen' --
+    # unset in this test file's env (only ANTHROPIC_API_KEY is dummied at
+    # module scope), so extract_session would fail-fast without this.
+    monkeypatch.setattr(llm_utils, "QWEN_API_KEY", "dashscope-test-dummy-key")
+    monkeypatch.setattr(llm_utils, "QWEN_MODEL", "qwen3.8-flash")
+    monkeypatch.setattr(llm_utils, "QWEN_MODEL_NONTHINKING", "qwen3.6-flash")
+    monkeypatch.setattr(
+        llm_utils, "call_llm",
+        _fake_call_llm_returning({"topics": [], "declared_site": None}),
+    )
+
+    live = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+    final = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE, final=True)
+
+    assert live["llm_provider"] == "qwen"
+    assert live["llm_model"] == "qwen3.6-flash"   # live -> enable_thinking=False
+    assert final["llm_provider"] == "qwen"
+    assert final["llm_model"] == "qwen3.8-flash"  # final -> enable_thinking=True
+
+
+# ---------------------------------------------------------------------------
 # Idempotent overwrite — re-running the same S3 event writes to the same key
 # (also exercises lambda_handler's S3 Records dispatch + key URL-decoding)
 # ---------------------------------------------------------------------------
