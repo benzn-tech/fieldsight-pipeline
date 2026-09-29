@@ -380,6 +380,83 @@ def test_fetching_profiles_hands_the_companys_floor_to_the_embedder(monkeypatch)
     assert out["company_floor"] == 0.42
 
 
+# ---- roster narrowing (on-site-roster plan, Task 3) ------------------------
+#
+# `_profiles` is the only place that can read the roster: it has a connection, and the
+# embedder does not (module docstring). Absent `site_id`/`date`, `on_roster` must not
+# appear at all -- not `False` -- because "the roster was checked and found nobody on
+# it" and "no roster was asked for" are different facts the embedder's roster rule
+# (voiceprint_utils.decide_with_roster) treats completely differently: the first
+# narrows to nothing, the second leaves matching exactly as it is today.
+
+VP_A = "aaaaaaaa-1111-1111-1111-111111111111"
+VP_B = "bbbbbbbb-2222-2222-2222-222222222222"
+SITE = "cccccccc-3333-3333-3333-333333333333"
+
+
+def _two_profiles():
+    return [{"id": VP_A, "display_name": "A", "status": "confirmed", "embedding": [0.1] * 192},
+            {"id": VP_B, "display_name": "B", "status": "confirmed", "embedding": [0.2] * 192}]
+
+
+def test_profiles_carries_on_roster_when_site_and_date_are_given(monkeypatch):
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "profiles_for_matching",
+                        lambda conn, company_id, site_id=None: _two_profiles())
+    monkeypatch.setattr(vw, "company_floor", lambda conn, company_id: None)
+    monkeypatch.setattr(vw.site_attendance, "on_roster_profile_ids",
+                        lambda conn, company_id, site_id, attend_date: {VP_A})
+    out = vw.lambda_handler({"op": "profiles", "company_id": CO, "site_id": SITE,
+                             "date": "2026-09-30"}, None)
+    by_key = {p["person_key"]: p for p in out["profiles"]}
+    assert by_key[VP_A]["on_roster"] is True
+    assert by_key[VP_B]["on_roster"] is False
+    assert out["roster_size"] == 1
+
+
+def test_on_roster_is_absent_without_site_id_or_date(monkeypatch):
+    """No `site_id` or no `date` -- the roster read must not even be attempted, and
+    `on_roster` must be MISSING from every profile, not `False`."""
+    called = []
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "profiles_for_matching",
+                        lambda conn, company_id, site_id=None: _two_profiles())
+    monkeypatch.setattr(vw, "company_floor", lambda conn, company_id: None)
+    monkeypatch.setattr(vw.site_attendance, "on_roster_profile_ids",
+                        lambda conn, company_id, site_id, attend_date:
+                        called.append(1) or {VP_A})
+
+    out = vw.lambda_handler({"op": "profiles", "company_id": CO}, None)
+    assert not called, "no site_id/date: the roster must never be read"
+    for p in out["profiles"]:
+        assert "on_roster" not in p
+    assert "roster_size" not in out
+
+    out2 = vw.lambda_handler({"op": "profiles", "company_id": CO, "site_id": SITE}, None)
+    assert not called, "date missing: the roster must never be read"
+    for p in out2["profiles"]:
+        assert "on_roster" not in p
+
+
+def test_a_roster_read_failure_narrows_nothing_and_does_not_raise(monkeypatch):
+    """The spec's own rule: an absent/broken integration must never make recognition
+    worse. A roster outage degrades to today's no-roster shape, logged, not raised."""
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "profiles_for_matching",
+                        lambda conn, company_id, site_id=None: _two_profiles())
+    monkeypatch.setattr(vw, "company_floor", lambda conn, company_id: None)
+
+    def _boom(conn, company_id, site_id, attend_date):
+        raise RuntimeError("roster table unreachable")
+
+    monkeypatch.setattr(vw.site_attendance, "on_roster_profile_ids", _boom)
+    out = vw.lambda_handler({"op": "profiles", "company_id": CO, "site_id": SITE,
+                             "date": "2026-09-30"}, None)
+    for p in out["profiles"]:
+        assert "on_roster" not in p
+    assert "roster_size" not in out
+
+
 # ---- the scheduled floor recompute ----------------------------------------
 #
 # rate(6 hours), not triggered by a match or a correction (spec S1.3): the floor must not

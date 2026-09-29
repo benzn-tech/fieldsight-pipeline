@@ -1708,3 +1708,68 @@ def test_a_denial_is_still_raised_and_still_named(monkeypatch):
         se._get("some/key.json")
     assert "AccessDenied" in exc.value.response["Error"]["Message"]
     assert "some/key.json" in exc.value.response["Error"]["Message"]
+
+
+# ---- roster narrowing (on-site-roster plan, Task 4) ------------------------------------
+
+
+def _turn():
+    return {"source_filename": "x_c0000.wav", "start_sec": 0.0, "end_sec": 5.0}
+
+
+def test_an_off_roster_winner_is_capped_at_tentative(stub_embedder, monkeypatch):
+    key = "users/u/audio/2026-08-13/x_c0000.wav"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes()}))
+    out = se.lambda_handler({"op": "match", "session": "s", "user_folder": "u",
+                             "date": "2026-08-13", "company_floor": 0.01,
+                             "profiles": [
+                                 {"person_key": "ben", "status": "confirmed",
+                                  "on_roster": False,
+                                  "embedding": list(np.ones(192))},
+                                 {"person_key": "zoe", "status": "confirmed",
+                                  "on_roster": True,
+                                  "embedding": list(np.concatenate([np.ones(96),
+                                                                    -np.ones(96)]))}],
+                             "turns": [_turn()]}, None)
+    r = out["results"][0]
+    assert r["name"] == "ben", "capped, never renamed to the on-roster runner-up"
+    assert r["status"] == "tentative"
+
+
+def test_without_on_roster_keys_the_same_pool_confirms(stub_embedder, monkeypatch):
+    """The identical pool and floor, with no roster info on the profiles at all, must
+    confirm -- proving the cap above is the roster's doing, not the floor's."""
+    key = "users/u/audio/2026-08-13/x_c0000.wav"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes()}))
+    out = se.lambda_handler({"op": "match", "session": "s", "user_folder": "u",
+                             "date": "2026-08-13", "company_floor": 0.01,
+                             "profiles": [
+                                 {"person_key": "ben", "status": "confirmed",
+                                  "embedding": list(np.ones(192))},
+                                 {"person_key": "zoe", "status": "confirmed",
+                                  "embedding": list(np.concatenate([np.ones(96),
+                                                                    -np.ones(96)]))}],
+                             "turns": [_turn()]}, None)
+    r = out["results"][0]
+    assert r["name"] == "ben" and r["status"] == "confirmed"
+
+
+def test_date_reaches_the_writer_on_the_profiles_invoke(monkeypatch):
+    """`_from_match_artifact` is the only producer of the `profiles` invoke; the roster
+    lookup needs one extra key (`date`) on it (plan correction 1) -- nothing else has to
+    be plumbed, since site_id already travels."""
+    sent = {}
+
+    def fake_invoke(payload):
+        if payload.get("op") == "profiles":
+            sent.update(payload)
+            return {"profiles": [], "company_floor": None}
+        return {"written": 0}
+
+    monkeypatch.setattr(se, "invoke_writer", fake_invoke)
+    req = {"request_id": "r1", "session_base": "sid" + "d" * 32, "company_id": "co-1",
+          "user_folder": "u", "date": "2026-09-30", "site_id": "site-1",
+          "turns": [], "label_map": []}
+    monkeypatch.setattr(se, "_get", lambda key: json.dumps(req).encode())
+    se._from_match_artifact("bucket", "voiceprint_requests/co-1/sid/r1.json")
+    assert sent.get("date") == "2026-09-30"
