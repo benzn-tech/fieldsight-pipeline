@@ -65,12 +65,24 @@ class _Cur:
 
     def __init__(self, conn):
         self.conn = conn
+        self._sql = ""
 
     def execute(self, sql, params=None):
+        self._sql = sql
         self.conn.cursor_sql.append((sql, params))
         return self
 
     def fetchall(self):
+        # Track B Task 4's carry_forward.list_for_carry_forward calls also land on this
+        # generic cursor, through the SAME conn.cursor(...).execute(...) convention -- but
+        # their rows have a different shape ({id, text, stable_id, human_touched, ...}) from
+        # a topics RETURNING row, and this file's own canned _RETURNING_ROW would make
+        # carry_forward.match KeyError on a missing "text". This file is about the supersede
+        # SQL, not about carry-forward, so an empty "old" pool (which short-circuits
+        # _carry_forward_one_table before it ever calls match) is the answer that leaves
+        # this file's own assertions untouched.
+        if "FROM action_items" in self._sql or "FROM findings" in self._sql:
+            return []
         return [dict(_RETURNING_ROW)]
 
     def fetchone(self):

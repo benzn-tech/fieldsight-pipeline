@@ -103,6 +103,50 @@ def list_for_topics(conn, topic_ids) -> list[dict]:
     ).fetchall()
 
 
+def list_for_carry_forward(conn, topic_ids, site_id) -> list[dict]:
+    """Findings on a set of topics -- new OR retired -- shaped for Track B Task 4's
+    carry_forward.match: `id`, `text` (the finding's `observation`), `stable_id` plus a
+    computed `human_touched`. Batched with ANY(%s); scoped to `site_id` (Ruling R9) so a
+    stray topic id can never pull another tenant's -- or another site's -- rows into the
+    match pool. Named `list_for_carry_forward` rather than reusing `list_for_topics` above:
+    that function already has callers reading a different column set for a different job
+    (rendering a topic's children), and this one's `human_touched`/`text` shape is specific
+    to the matcher.
+
+    human_touched = status <> 'open' -- findings carry no updated_by column (unlike action
+    items), so a status flip is the only footprint a person's decision leaves on the row.
+    For a freshly-inserted row (the "new" pool) this is always False.
+    """
+    if not topic_ids:
+        return []
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, topic_id, observation AS text, stable_id, status, audience, "
+        "(status <> 'open') AS human_touched "
+        "FROM findings WHERE topic_id = ANY(%s) AND site_id = %s",
+        (list(topic_ids), site_id),
+    ).fetchall()
+
+
+def carry_identity(conn, new_id, old_row) -> None:
+    """Carry `old_row`'s stable identity onto the new finding `new_id` that replaced it
+    (Track B Task 4). Always moves stable_id/carried_from; when the old row was
+    human-touched, also moves status/audience -- the only two columns a human can set on a
+    finding. `kind`/`payload` always come from the fresh extraction and the impact_* columns
+    are re-derived downstream by the programme matcher -- neither is ever copied here."""
+    if old_row.get("human_touched"):
+        conn.execute(
+            "UPDATE findings SET stable_id=%s, carried_from=%s, status=%s, audience=%s "
+            "WHERE id=%s",
+            (old_row["stable_id"], old_row["id"], old_row["status"], old_row["audience"],
+             new_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE findings SET stable_id=%s, carried_from=%s WHERE id=%s",
+            (old_row["stable_id"], old_row["id"], new_id),
+        )
+
+
 def count_by_domain(conn, company_id, domain, date_from, date_to,
                     site_ids=None, author_ids=None) -> dict:
     """How many safety- or quality-domain items in a date range.

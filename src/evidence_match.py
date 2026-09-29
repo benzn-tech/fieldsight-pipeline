@@ -76,26 +76,36 @@ def _is_cjk(ch):
     return bool(_CJK.match(ch))
 
 
+def strip_cjk_spacing(text):
+    """Delete whitespace sitting between two CJK characters.
+
+    Not cosmetic. Turn text is space-joined (transcript_utils' `' '.join(word_list)`) while
+    a model writing Chinese writes it unspaced, so "我 现在" does not contain "我现在" and
+    every Chinese citation would read as fabricated -- and, per Track B Task 4 (Ruling R4),
+    two honestly-identical re-extracted strings can differ only in this spacing.
+
+    A public helper rather than a private loop so `carry_forward.match` can apply the exact
+    same rule without copying the CJK class or re-deriving the loop -- a copy is how the two
+    notions of "same text" would drift apart for a bilingual product.
+    """
+    t = text or ""
+    n = len(t)
+    out = []
+    for i, ch in enumerate(t):
+        if ch == " " and 0 < i < n - 1 and _is_cjk(t[i - 1]) and _is_cjk(t[i + 1]):
+            continue                      # a space between two CJK chars is formatting
+        out.append(ch)
+    return "".join(out)
+
+
 def normalise(text):
     """Casefold, drop punctuation, collapse whitespace -- and delete whitespace
-    INSIDE CJK runs.
-
-    That last part is not cosmetic. Turn text is space-joined
-    (transcript_utils' `' '.join(word_list)`) while a model writing Chinese
-    writes it unspaced, so normalised "我 现在" does not contain "我现在" and
-    every Chinese citation would read as fabricated. On a bilingual product that
-    alone could be most of the unverified count.
+    INSIDE CJK runs (see `strip_cjk_spacing`).
     """
     t = unicodedata.normalize("NFKC", text or "").casefold()
     t = _PUNCT.sub(" ", t)
     t = _WS.sub(" ", t).strip()
-    out = []
-    for i, ch in enumerate(t):
-        if (ch == " " and 0 < i < len(t) - 1
-                and _is_cjk(t[i - 1]) and _is_cjk(t[i + 1])):
-            continue                      # a space between two CJK chars is formatting
-        out.append(ch)
-    return "".join(out)
+    return strip_cjk_spacing(t)
 
 
 def token_count(text):

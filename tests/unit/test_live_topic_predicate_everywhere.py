@@ -244,9 +244,12 @@ UNFILTERED = {
     (lambda_item_writer, "write_extraction_items"):
         "write-path idempotency check (report_already_ingested) that must see every row "
         "under the key, live or superseded, to answer 'has this ever been ingested'",
-    (lambda_item_writer, "_warn_if_discarding_checkoffs"):
-        "audit count of rows about to be superseded; must count every existing row under "
-        "the key, not just the live ones, or the count under-reports what is being lost",
+    (action_items, "list_for_carry_forward"):
+        "Track B Task 4's carry_forward 'old'/'new' pool loader -- reads by an explicit set "
+        "of topic ids (the retired ones, or this pass's own new ones), never by liveness; "
+        "adding the live arm would hide the very retired rows this function exists to reach",
+    (findings, "list_for_carry_forward"):
+        "same as action_items.list_for_carry_forward above, other child table",
     (lambda_keyframe, "process_request"):
         "write guard gating a topic_photos INSERT (keyframe generation), not a display "
         "read -- existence alone, not supersession, decides whether to proceed",

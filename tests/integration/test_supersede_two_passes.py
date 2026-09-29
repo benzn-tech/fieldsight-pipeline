@@ -27,7 +27,8 @@ import uuid
 import pytest
 
 from db.connection import get_connection
-from repositories import companies, memberships, redactions, sites, topics, users
+from repositories import (action_items, companies, findings, memberships, redactions,
+                          sites, topics, users)
 
 pytestmark = pytest.mark.integration
 
@@ -324,6 +325,143 @@ def test_write_extraction_items_two_passes_leave_one_superseded_and_one_live(
         # any of the identifiers it used, through any of the tables it touched. Skipped only
         # when nothing was ever created (co is None means creation itself failed before
         # anything could leak).
+        if co_id is not None:
+            remaining = seed.execute(
+                "SELECT "
+                "(SELECT count(*) FROM companies WHERE id=%s), "
+                "(SELECT count(*) FROM sites WHERE id=%s), "
+                "(SELECT count(*) FROM users WHERE id=%s), "
+                "(SELECT count(*) FROM memberships WHERE site_id=%s), "
+                "(SELECT count(*) FROM topics WHERE site_id=%s)",
+                (co_id, site_id, user_id, site_id, site_id),
+            ).fetchone()
+            assert remaining == (0, 0, 0, 0, 0), f"leaked rows after cleanup: {remaining}"
+        seed.close()
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: Track B Task 4 -- a human's tick survives the SAME two real passes above.
+# ---------------------------------------------------------------------------
+
+def _carry_forward_extraction(tier, extracted_at, action_text, finding_text):
+    return {
+        "schema_version": 1,
+        "tier": tier,
+        "extracted_at": extracted_at,
+        "topics": [{
+            "topic_title": "Crane and formwork -- " + tier,
+            "category": "progress",
+            "summary": "summary",
+            "time_range": "10:00 – 10:05",
+            "participants": [],
+            "action_items": [{"action": action_text}],
+            "findings": [{"observation": finding_text, "domain": "safety",
+                         "severity": "minor"}],
+            "safety_flags": [],
+        }],
+    }
+
+
+def test_carry_forward_survives_a_live_then_final_pass(monkeypatch, migrated_db_url):
+    """The defect Task 4 exists to fix: a person ticks an action item (or sets a finding's
+    status) while a session is still live, the final pass rewords the same commitment within
+    the fuzzy floor, and the tick must land on the NEW row -- by stable_id, carried across
+    the supersession Task 3 already proved happens underneath. Same two-real-passes harness
+    as test_write_extraction_items_two_passes_leave_one_superseded_and_one_live above (a
+    committed connection, not the rolled-back `db` fixture: the second pass has to see the
+    first pass's rows and the PATCH between them)."""
+    tag = uuid.uuid4().hex[:8]
+    seed = get_connection(migrated_db_url, autocommit=True)
+    co = site = user = extraction_key = None
+    ACTION_LIVE = "Confirm crane booking for Thursday"
+    ACTION_FINAL = "Confirm the crane booking for Thursday"          # measured ratio 0.9444
+    FINDING_LIVE = "Formwork stripped early on level 3"
+    FINDING_FINAL = "Formwork was stripped early on level 3"          # measured ratio 0.9444
+    try:
+        company_name = f"Writer4-Co-{tag}"
+        co = companies.create_company(seed, company_name)
+        site = sites.create_site(seed, co["id"], f"Writer4-Site-{tag}")
+        folder = f"Writer4-{tag}"
+        user = users.upsert_field_only_user(seed, co["id"], folder, "Fol", "Der", "worker")
+        memberships.add_membership(seed, user["id"], site["id"], "worker")
+
+        date = DATE
+        session_base = f"sid{tag}"
+        extraction_key = f"extractions/{folder}/{date}/{session_base}.json"
+        fake_s3 = _FakeS3({
+            extraction_key: json.dumps(_carry_forward_extraction(
+                "live", "2026-09-29T10:00:00Z", ACTION_LIVE, FINDING_LIVE)),
+        })
+
+        monkeypatch.setattr(lambda_item_writer.lambda_ingest, "COMPANY_NAME", company_name)
+        monkeypatch.setattr(lambda_item_writer, "_s3_client", fake_s3)
+        monkeypatch.setattr(lambda_item_writer, "get_connection",
+                            lambda *a, **k: get_connection(migrated_db_url))
+        monkeypatch.setattr(lambda_item_writer.match_request, "emit", lambda *a, **k: None)
+
+        result_live = lambda_item_writer.write_extraction_items(date, folder, extraction_key)
+        assert result_live == {"skipped": False, "topics": 1}, result_live
+
+        old_action = seed.execute(
+            "SELECT a.id, a.stable_id FROM action_items a JOIN topics t ON t.id=a.topic_id "
+            "WHERE t.source_s3_key=%s", (extraction_key,)).fetchone()
+        old_finding = seed.execute(
+            "SELECT f.id, f.stable_id FROM findings f JOIN topics t ON t.id=f.topic_id "
+            "WHERE t.source_s3_key=%s", (extraction_key,)).fetchone()
+        old_action_id, old_action_stable_id = old_action
+        old_finding_id, old_finding_stable_id = old_finding
+
+        # PATCH-equivalent: a person ticks the action item off and sets the finding's status
+        # + audience, while the meeting is still "live" -- before the final pass ever runs.
+        updated_by = str(user["id"])
+        action_items.update_action_item_fields(
+            seed, old_action_id, {"status": "done"}, updated_by)
+        seed.execute("UPDATE findings SET status=%s, audience=%s WHERE id=%s",
+                    ("resolved", "owner", old_finding_id))
+
+        # The FINAL pass: same key, reworded text within the fuzzy floor.
+        fake_s3.objects[extraction_key] = json.dumps(_carry_forward_extraction(
+            "final", "2026-09-29T10:30:00Z", ACTION_FINAL, FINDING_FINAL))
+        result_final = lambda_item_writer.write_extraction_items(date, folder, extraction_key)
+        assert result_final == {"skipped": False, "topics": 1}, result_final
+
+        new_action = seed.execute(
+            "SELECT a.id, a.stable_id, a.carried_from, a.status, a.updated_by "
+            "FROM action_items a JOIN topics t ON t.id=a.topic_id "
+            "WHERE t.source_s3_key=%s AND t.superseded_at IS NULL",
+            (extraction_key,)).fetchone()
+        assert new_action is not None
+        new_action_id, new_stable_id, new_carried_from, new_status, new_updated_by = new_action
+        assert new_action_id != old_action_id, "must be the NEW row, not the old one"
+        assert new_stable_id == old_action_stable_id, (
+            "the new row must carry the OLD row's stable_id forward")
+        assert new_carried_from == old_action_id
+        assert new_status == "done", "the tick must survive the reword"
+        assert new_updated_by == updated_by
+
+        new_finding = seed.execute(
+            "SELECT f.id, f.stable_id, f.carried_from, f.status, f.audience "
+            "FROM findings f JOIN topics t ON t.id=f.topic_id "
+            "WHERE t.source_s3_key=%s AND t.superseded_at IS NULL",
+            (extraction_key,)).fetchone()
+        assert new_finding is not None
+        (new_finding_id, new_finding_stable_id, new_finding_carried_from,
+         new_finding_status, new_finding_audience) = new_finding
+        assert new_finding_id != old_finding_id
+        assert new_finding_stable_id == old_finding_stable_id
+        assert new_finding_carried_from == old_finding_id
+        assert new_finding_status == "resolved"
+        assert new_finding_audience == "owner"
+    finally:
+        co_id = co["id"] if co is not None else None
+        site_id = site["id"] if site is not None else None
+        user_id = user["id"] if user is not None else None
+        if site_id is not None:
+            seed.execute("DELETE FROM sites WHERE id=%s", (site_id,))
+        if user_id is not None:
+            seed.execute("DELETE FROM users WHERE id=%s", (user_id,))
+        if co_id is not None:
+            seed.execute("DELETE FROM companies WHERE id=%s", (co_id,))
         if co_id is not None:
             remaining = seed.execute(
                 "SELECT "

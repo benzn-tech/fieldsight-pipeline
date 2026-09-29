@@ -65,6 +65,7 @@ from urllib.parse import unquote_plus
 
 import boto3
 
+import carry_forward
 import lambda_ingest
 import keyframe_request
 import match_request
@@ -81,7 +82,7 @@ from photo_binding import photos_for_topics as _photos_for_topics  # noqa: F401 
 import photo_rebind
 import thread_match
 from repositories import location_markers
-from repositories import (companies, findings, meeting_session, recordings,
+from repositories import (action_items, companies, findings, meeting_session, recordings,
                           redactions,
                           session_group, sites, threads, topics)
 # The extraction-key shape lives in session_scope now (the read side needs the
@@ -1030,10 +1031,10 @@ def write_extraction_items(date, user_folder, extraction_key):
         # tick on a DIFFERENT action item where nobody would ever see it -- matching by
         # stable_id (Task 4) is the only safe rule.
         #
-        # _warn_if_discarding_checkoffs stays for this release: it is now a count of what
-        # Task 4 must carry forward, not a loss, but the number an operator needs to see is
-        # the same one.
-        _warn_if_discarding_checkoffs(conn, extraction_key)
+        # What used to be discarded here is now carried forward by _carry_forward_children,
+        # below the topic-insert loop (Track B Task 4) -- the count an operator needs to see
+        # is now measured AFTER matching (an actual orphan), not before (every closed item
+        # about to be superseded, most of which will find their successor).
         retired_topics.extend(topics.supersede_topics_for_source(conn, extraction_key, run))
 
         # A MERGED artifact additionally supersedes each member's own topics.
@@ -1090,6 +1091,10 @@ def write_extraction_items(date, user_folder, extraction_key):
 
         topics_n = 0
         collected_topics = []
+        # Track B Task 4: the durable ids of THIS pass's own topics (uuid.UUID objects, not
+        # the str(...) collected_topics uses for the match_request artifact) -- the "new"
+        # side of carry_forward's site-scoped pool, gathered once the loop below is done.
+        new_topic_ids = []
         keyframe_topics = []  # video-keyframe plan: {topic_id, time_range} of gate-passers
         for i, t in enumerate(extraction_topics):
             mapped_action_items = lambda_ingest._map_action_items(t.get("action_items"), date)
@@ -1155,6 +1160,7 @@ def write_extraction_items(date, user_folder, extraction_key):
                 # day, and it runs after this loop because it needs these rows
                 # to exist before it can bind to them.
             )
+            new_topic_ids.append(row["id"])
             # Task 2 (programme-impact-link plan) -- persist this topic's
             # rich extraction findings in the SAME transaction as the topic
             # upsert (inherits the I-3 advisory lock + I-4 supersession
@@ -1199,6 +1205,19 @@ def write_extraction_items(date, user_folder, extraction_key):
                 keyframe_topics.append({"topic_id": str(row["id"]),
                                         "time_range": t.get("time_range")})
             topics_n += 1
+
+        # Track B Task 4 -- carry a human's tick, status, reassignment or deadline edit from
+        # a row this pass just superseded to the row that replaced it. Same transaction,
+        # after the new topics/children above are inserted (their ids are only known now)
+        # and after every supersede call this invocation made (retired_topics is complete by
+        # here: the idempotent clear, the group-member supersede, and the authority-flip
+        # branch all ran above, before this loop). A pass that retired nothing has no "old"
+        # pool and nothing to report -- the common case, and the whole reason retired_topics
+        # is checked here rather than always calling into an empty match.
+        if retired_topics:
+            _carry_forward_children(
+                conn, [t["id"] for t in retired_topics], new_topic_ids, site["id"],
+                extraction_key)
 
         # THE DAY'S PHOTOS, BOUND ONCE, AFTER THIS EXTRACTION'S TOPICS EXIST.
         # Never fatal: a rebind that turned a good extraction into a failed one
@@ -1321,32 +1340,86 @@ def write_extraction_items(date, user_folder, extraction_key):
 # ----------------------------------------------------------
 # Entry point — S3 event
 # ----------------------------------------------------------
-def _warn_if_discarding_checkoffs(conn, extraction_key):
-    """Log when this supersession is about to retire a ticked action item.
+def _carry_forward_one_table(conn, repo, old_topic_ids, new_topic_ids, site_id):
+    """Match one child table's retired rows to their replacements and carry stable_id (plus
+    any human edit) forward. Returns the number of human-touched OLD rows that found no
+    successor -- the caller's contribution to the OrphanedHumanEdits metric/log.
 
-    Counted, not carried -- carrying a human decision across a re-extraction needs a rule for
-    matching an old row to its replacement, and the only safe one is by stable_id (Task 4).
-    Until that lands, a superseded row's check-off is exactly as unreachable to a reader as a
-    deleted one was, even though the row itself now survives in the table (Track B Task 3:
-    supersede, not delete). What this buys is a number that can be alarmed on and a log line
-    that names the key, so the next person to ask "did we lose ticks?" has an answer -- and,
-    once Task 4 lands, a count of exactly what it has to carry.
+    `repo` is `action_items` or `findings` (Track B Task 4): both now expose
+    list_for_carry_forward(conn, topic_ids, site_id) -> rows with a computed `human_touched`,
+    and carry_identity(conn, new_id, old_row), with the identical shape -- which is what lets
+    this be one function instead of two near-duplicates."""
+    old_rows = repo.list_for_carry_forward(conn, old_topic_ids, site_id)
+    if not old_rows:
+        return 0
+    new_rows = repo.list_for_carry_forward(conn, new_topic_ids, site_id)
+    old_by_id = {r["id"]: r for r in old_rows}
+    pairs, orphans = carry_forward.match(old_rows, new_rows)
+    for old_id, new_id, _how in pairs:
+        repo.carry_identity(conn, new_id, old_by_id[old_id])
+    return sum(1 for oid in orphans if old_by_id[oid]["human_touched"])
 
-    Never raises. A count that fails must not stop an extraction from landing.
+
+def _carry_forward_children(conn, old_topic_ids, new_topic_ids, site_id, extraction_key):
+    """Track B Task 4: carry a human's tick, status, reassignment or deadline edit from a row
+    this pass just superseded to the row that replaced it, matched by TEXT -- the new row's
+    id did not exist when the person made the edit, so stable_id can only be assigned
+    afterwards, by finding which new row is "the same" commitment reworded.
+
+    `old_topic_ids` / `new_topic_ids` are both narrowed to `site_id` inside
+    `list_for_carry_forward` (Ruling R9): the pool is exactly this invocation's retired
+    topics and this pass's own new topics, never another extraction key's superseded rows
+    and never another site's.
+
+    Always reports, including zero (Ruling R5) -- an operator reading "0 for that key" is
+    the point of an EMF line with a `key` property, not a lucky silence indistinguishable
+    from a producer that never ran."""
+    orphaned = (_carry_forward_one_table(conn, action_items, old_topic_ids,
+                                         new_topic_ids, site_id)
+               + _carry_forward_one_table(conn, findings, old_topic_ids,
+                                          new_topic_ids, site_id))
+    _report_orphaned_human_edits(extraction_key, orphaned)
+
+
+def _report_orphaned_human_edits(extraction_key, count):
+    """Tell an operator about human-touched rows that carry_forward could not carry.
+
+    Two channels, because they answer two different questions: the WARNING is for someone
+    reading THIS extraction's logs ("did we lose a tick just now?"), the metric is for
+    someone watching the fleet ("is this getting worse?") -- and only the metric is
+    non-zero-suppressed, so a dashboard can tell "nothing lost" from "this key never ran"
+    (Ruling R5).
+
+    Embedded Metric Format printed to stdout, not `put_metric_data`: ItemWriterFunction is
+    in-VPC with no CloudWatch endpoint (CLAUDE.md BUG-36) -- a real API call here would
+    blackhole to a timeout with zero logs, exactly like ExtractionBacklogFunction's working
+    put_metric_data call would if it were deployed in-VPC. Modelled on
+    lambda_transcribe._emit_failure_metric's `_aws` block. Never raises: a metric or a log
+    line that fails must not take an already-committed extraction down with it -- this runs
+    after the transaction line above, by which point the rows are durable either way.
     """
+    if count:
+        logger.warning(
+            "carry_forward: %d human-touched rows had no successor (key=%s)",
+            count, extraction_key)
     try:
-        row = conn.execute(
-            "SELECT count(*) FROM action_items a JOIN topics t ON t.id = a.topic_id "
-            "WHERE t.source_s3_key = %s AND a.status <> 'open'",
-            (extraction_key,)).fetchone()
-        n = (row or [0])[0] or 0
-        if n:
-            logger.warning(
-                "%d closed action item(s) on rows being superseded for %s -- Task 4 must "
-                "carry them forward to the replacement rows",
-                n, extraction_key)
+        import time as _t
+        print(json.dumps({
+            "_aws": {
+                "Timestamp": int(_t.time() * 1000),
+                "CloudWatchMetrics": [{
+                    "Namespace": "FieldSight/Pipeline",
+                    "Dimensions": [["Stage"]],
+                    "Metrics": [{"Name": "OrphanedHumanEdits", "Unit": "Count"}],
+                }],
+            },
+            "Stage": os.environ.get("STAGE", "unknown"),
+            "OrphanedHumanEdits": count,
+            "key": extraction_key,
+        }))
     except Exception:
-        logger.exception("could not count closed action items for %s", extraction_key)
+        logger.warning("could not emit the OrphanedHumanEdits metric for %s", extraction_key)
+
 
 def _source_is_deleted(conn, source_s3_key) -> bool:
     """Whether this extraction's source has been deleted by its owner.
