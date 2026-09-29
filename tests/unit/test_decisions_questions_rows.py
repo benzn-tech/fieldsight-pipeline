@@ -490,11 +490,17 @@ QUESTION_ROW = {
 }
 
 
-def _wire_question(wired, row=None):
+def _wire_question(wired, row=None, roles=None):
     row = dict(row or QUESTION_ROW)
     wired.setattr(org.topic_questions, "get_live_by_stable_id",
                   lambda conn, sid: dict(row) if sid == row["stable_id"] else None)
     wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {row["site_id"]})
+    # `roles` mirrors _wire_item's own param (test_lambda_org_api.py) -- the per-site
+    # membership.role map the site-authority tier reads. None leaves the real function
+    # wired (it degrades to {} against a FakeConn with no memberships rows), which is what
+    # every admin-caller test below relies on: is_admin already makes is_site_authority moot.
+    if roles is not None:
+        wired.setattr(org.memberships, "caller_site_roles", lambda conn, uid: roles)
     seen = {"audits": [], "set_status_calls": []}
 
     def fake_set_status(conn, qid, status, answered_by):
@@ -515,6 +521,57 @@ def test_patch_question_role_gate_denies_worker_403(wired):
     res = org.lambda_handler(make_event("PATCH", "/api/org/questions/stable-abc",
                                         body={"status": "answered"}), None)
     assert res["statusCode"] == 403
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: the third authorization tier -- per-site role authority
+# (mirrors patch_action_item's is_admin/is_site_authority exactly; questions have
+# no fourth "assignee" tier). `global_role="pm"` in both tests below (not "admin"/"gm")
+# so resolve_scope != "ALL" and `_CORRECTION_ROLES` still admits the caller -- isolating
+# what the SITE membership role decides, the same reason patch_action_item's own
+# site-authority tests pin a non-admin global role.
+# ---------------------------------------------------------------------------
+
+def test_patch_question_pm_globally_but_worker_at_site_refused(wired):
+    """A global `pm` is not automatically `is_admin` (only admin/gm/platform_admin/
+    cross-company are) -- without a pm/site_manager MEMBERSHIP on this question's own site,
+    the caller fails is_site_authority exactly like they would on an action item there."""
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "pm"})
+    _wire_question(wired, roles={SITE_ID: "worker"})
+    res = org.lambda_handler(make_event("PATCH", "/api/org/questions/stable-abc",
+                                        body={"status": "answered"}), None)
+    assert res["statusCode"] == 404
+
+
+def test_patch_question_site_manager_membership_at_that_site_may_answer(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "pm"})
+    seen, row = _wire_question(wired, roles={SITE_ID: "site_manager"})
+    res = org.lambda_handler(make_event("PATCH", "/api/org/questions/stable-abc",
+                                        body={"status": "answered"}), None)
+    assert res["statusCode"] == 200
+    assert seen["set_status_calls"] == [(row["id"], "answered", CALLER["id"])]
+
+
+def test_patch_question_pm_membership_at_that_site_may_answer(wired):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "site_manager"})
+    seen, row = _wire_question(wired, roles={SITE_ID: "pm"})
+    res = org.lambda_handler(make_event("PATCH", "/api/org/questions/stable-abc",
+                                        body={"status": "answered"}), None)
+    assert res["statusCode"] == 200
+    assert seen["set_status_calls"] == [(row["id"], "answered", CALLER["id"])]
+
+
+def test_patch_question_admin_bypasses_site_authority_even_with_no_membership(wired):
+    """admin/platform_admin behaviour identical to patch_action_item's: is_admin alone is
+    enough, regardless of what (if anything) memberships.caller_site_roles reports."""
+    seen, row = _wire_question(wired, roles={})     # default CALLER is admin; no site role
+    res = org.lambda_handler(make_event("PATCH", "/api/org/questions/stable-abc",
+                                        body={"status": "answered"}), None)
+    assert res["statusCode"] == 200
+    assert seen["set_status_calls"] == [(row["id"], "answered", CALLER["id"])]
 
 
 def test_patch_question_bad_status_value_400(wired):
@@ -556,6 +613,23 @@ def test_patch_question_reopen_clears_answered_by(wired):
                                         body={"status": "open"}), None)
     assert res["statusCode"] == 200
     assert seen["set_status_calls"] == [(row["id"], "open", None)]
+
+
+def test_patch_question_same_status_is_a_noop_no_write_no_audit(wired):
+    """Fix round 1, minor: mirrors patch_action_item's changed-only guard -- re-sending the
+    status the row already has must not call set_status or append_content_edit, and the
+    response is the row as-is (minus the `company_id` key set_status's own RETURNING never
+    carries -- see the handler's no-op branch comment)."""
+    seen, row = _wire_question(wired, row={**QUESTION_ROW, "status": "answered",
+                                           "answered_by": "u-2", "answered_at": "t0"})
+    res = org.lambda_handler(make_event("PATCH", "/api/org/questions/stable-abc",
+                                        body={"status": "answered"}), None)
+    assert res["statusCode"] == 200
+    b = body_of(res)
+    assert b["status"] == "answered" and b["answered_by"] == "u-2" and b["answered_at"] == "t0"
+    assert "company_id" not in b
+    assert seen["set_status_calls"] == []
+    assert seen["audits"] == []
 
 
 def test_patch_question_writes_content_edits_row(wired):

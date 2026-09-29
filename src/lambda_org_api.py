@@ -4465,28 +4465,40 @@ def patch_question(conn, caller, stable_id, body):
     copies `stable_id` across), so the id the client saw when it opened the panel may
     already be gone by the time this PATCH lands, while the stable_id is not.
 
-    ACL is the SAME two checks patch_action_item makes -- company scope via
-    `is_cross_company`, then the caller's site reach via `_allowed_site_ids` -- with ONE
-    deliberate difference in the OUTCOME, not the check: patch_action_item fetches its row
-    by a fixed id first and can therefore tell "exists, wrong company" (404) apart from
-    "exists, right company, wrong site" (403) as two different facts about a real row it
-    already has in hand. Here the row is reached ONLY by `stable_id` through
-    `topic_questions.get_live_by_stable_id` (itself scoped to the live topic via
-    `visible_topics_predicate`), so a caller who fails either check was never holding a
-    reference to anything they can prove exists -- there is nothing left to leak by
-    collapsing both refusals to 404, and the task brief calls for exactly that: same checks,
-    both refusals 404 (not the 403 patch_action_item uses for its second one).
+    ACL is the SAME THREE checks patch_action_item makes -- company scope via
+    `is_cross_company`, the caller's site reach via `_allowed_site_ids`, and per-site role
+    authority (`is_admin` = resolve_scope==ALL or cross; `is_site_authority` = the caller's
+    OWN membership.role at THIS site is pm/site_manager, via
+    `memberships.caller_site_roles` -- reused, not re-derived, so the two endpoints can never
+    drift on what "site authority" means) -- minus patch_action_item's fourth tier
+    (assignee), which does not apply: a question has no responsible party. A caller whose
+    GLOBAL role happens to be pm/site_manager but who is only a `worker` MEMBER at this
+    question's site fails `is_site_authority` exactly like they would on an action item at
+    that site.
 
-    Role-gated to `_CORRECTION_ROLES` (no assignee carve-out -- a question has no assignee,
-    unlike an action item's responsible party).
+    ONE deliberate difference from patch_action_item in the OUTCOME, not the checks:
+    patch_action_item fetches its row by a fixed id first and can therefore tell "exists,
+    wrong company" (404) apart from "exists, right company, wrong site or role" (403) as two
+    different facts about a real row it already has in hand. Here the row is reached ONLY by
+    `stable_id` through `topic_questions.get_live_by_stable_id` (itself scoped to the live
+    topic via `visible_topics_predicate`), so a caller who fails ANY of the three checks was
+    never holding a reference to anything they can prove exists -- there is nothing left to
+    leak by collapsing every refusal to 404, and the task brief calls for exactly that: same
+    checks, every refusal 404 (never the 403 patch_action_item uses for its site-reach and
+    site-authority tiers).
 
-    `status` is the only writable field. 'answered'/'dropped' stamp `answered_by` (the
-    caller's users.id) and `answered_at` (the database's `now()`, in
-    topic_questions.set_status); reopening to 'open' clears both. One `content_edits` row
-    (table_name='topic_questions', field='status') records the transition, and the UPDATE +
-    that audit row share ONE transaction -- CLAUDE.md: a `return error(...)` after a partial
-    write does not roll it back, so both must commit or neither does (same posture as
-    patch_action_item)."""
+    Role-gated to `_CORRECTION_ROLES` first (no assignee carve-out -- a question has no
+    assignee, unlike an action item's responsible party).
+
+    `status` is the only writable field. Re-sending the status the row already has is a
+    no-op -- returned as-is, same "must not litter the History panel" posture
+    patch_action_item's per-field changed-check takes, just applied to this endpoint's one
+    field. Otherwise: 'answered'/'dropped' stamp `answered_by` (the caller's users.id) and
+    `answered_at` (the database's `now()`, in topic_questions.set_status); reopening to
+    'open' clears both. One `content_edits` row (table_name='topic_questions',
+    field='status') records the transition, and the UPDATE + that audit row share ONE
+    transaction -- CLAUDE.md: a `return error(...)` after a partial write does not roll it
+    back, so both must commit or neither does (same posture as patch_action_item)."""
     if caller["global_role"] not in _CORRECTION_ROLES:
         return error("admin, gm, pm, site_manager or platform_admin role required", 403)
     if body is None:
@@ -4503,17 +4515,28 @@ def patch_question(conn, caller, stable_id, body):
     if site_id not in _allowed_site_ids(conn, caller):
         # Same reach gate as patch_action_item's, but 404 rather than 403 -- see docstring.
         return error("question not found", 404)
+    site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
+    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
+    is_site_authority = site_role in ("pm", "site_manager")
+    if not (is_admin or is_site_authority):
+        # Same site-authority gate as patch_action_item's, but 404 rather than 403 -- see
+        # docstring: this endpoint never confirms a row exists to leak *which* check failed.
+        return error("question not found", 404)
 
     before = row["status"]
+    if status == before:
+        # No-op: the row is returned unchanged -- neither the UPDATE nor the content_edits
+        # audit row runs (patch_action_item's own "must not litter the History panel" rule,
+        # applied to this endpoint's one field). `row` carries an extra `company_id` key
+        # `set_status`'s RETURNING does not (topic_questions._COLS), so the response shape
+        # matches the write path exactly.
+        return ok({k: v for k, v in row.items() if k != "company_id"})
     answered_by = caller["id"] if status != "open" else None
     try:
         with conn.transaction():           # UPDATE + audit row commit together
             updated = topic_questions.set_status(conn, row["id"], status, answered_by)
             if updated is None:
                 raise _QuestionVanished(stable_id)
-            # Unconditional, unlike patch_action_item's per-field "did it actually change"
-            # guard -- this endpoint writes exactly one field (status), the same posture
-            # patch_content takes for its own single editable field.
             content_edits.append_content_edit(
                 conn, row["company_id"], "topic_questions", row["id"], "status",
                 before, status, caller["id"], caller["global_role"])
