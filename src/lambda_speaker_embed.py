@@ -624,6 +624,11 @@ def _match(event):
     by_key = {}
     for p in profiles:
         by_key.setdefault(p["person_key"], p)
+    # Who is on site today (on-site-roster plan, Task 4). Built from whatever the profiles
+    # actually carry -- absent on every profile, or True on none of them, both collapse to
+    # an empty set, and `decide_with_roster` treats an empty set as "no roster to narrow
+    # with": exactly today's behaviour (spec consumer 1, "narrows, never blocks").
+    on_roster = {p["person_key"] for p in profiles if p.get("on_roster") is True}
 
     results = []
     for turn in event.get("turns") or []:
@@ -641,7 +646,8 @@ def _match(event):
         v = embed_audio(clip, sr)
         rows = [{"person_key": p["person_key"],
                  "score": vp.cosine(v, p["embedding"])} for p in profiles]
-        d = vp.decide_name(vp.aggregate_scores(rows), duration_s=duration, floor=floor)
+        d = vp.decide_with_roster(vp.aggregate_scores(rows), on_roster,
+                                  duration_s=duration, floor=floor)
         status = d.status
         if status == "confirmed" and by_key.get(d.name, {}).get("status") == "tentative":
             # (see below) a profile that has not earned confirmation cannot hand one out —
@@ -1218,7 +1224,7 @@ def _from_match_artifact(bucket, key):
             f"producer has all four and guessing any of them reads a key that cannot exist")
 
     profiles_reply = invoke_writer({"op": "profiles", "company_id": company_id,
-                                    "site_id": req.get("site_id")})
+                                    "site_id": req.get("site_id"), "date": date})
     profiles = profiles_reply.get("profiles") or []
     # The company's calibrated rejection floor, read once here (not per turn) and passed
     # to `_match` below -- dropping it on this hop would leave a calibrated floor sitting

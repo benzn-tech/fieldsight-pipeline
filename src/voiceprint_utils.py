@@ -270,6 +270,61 @@ def decide_name(scores, duration_s: float,
                     f"clear of the runner-up by {margin:.3f}", score=best)
 
 
+def decide_with_roster(scores, on_roster, duration_s: float,
+                       min_turn_s: float = DEFAULT_MIN_TURN_S,
+                       min_margin: float | None = None,
+                       floor: float | None = None) -> Decision:
+    """`decide_name`, narrowed by who is on site today (on-site-roster plan, Task 4,
+    spec correction 3 -- the design doc's "Review outcome" section, which supersedes the
+    document's earlier "margin computed against the subset only", explicitly named there
+    as unsafe: run over the on-roster subset ALONE, and an unsigned visitor whose voice
+    merely sits nearest an on-roster profile gets CONFIRMED as that person -- the exact
+    wrong-confident-name this whole layer exists to refuse).
+
+    `on_roster` is a set of the `scores` keys attendance puts on site today (or `None`/
+    empty for "no roster to narrow with" -- an absent or broken integration must never
+    make recognition worse than it is today, spec consumer 1). In that case this returns
+    exactly what `decide_name` alone would, the same `Decision` object fields, not merely
+    the same status -- proven by `test_no_roster_is_byte_for_byte_todays_decide_name`.
+
+    The rule, with a roster:
+
+    1. Score every profile and take the full-pool winner (`decide_name` over `scores`,
+       unchanged -- `effective_margin` still sees `len(scores)`, not the subset size).
+    2. Winner OFF the roster: the full-pool answer stands, but its status is capped at
+       `tentative`. The name is NEVER swapped for the on-roster runner-up -- capping, not
+       re-ranking, is what keeps this safe.
+    3. Winner ON the roster: re-run `decide_name` over the on-roster subset alone. This is
+       where the roster actually helps -- an absent colleague who used to be the runner-up,
+       and used to hold the margin down, is no longer in the comparison. The full turn's
+       duration and absent-floor checks, and the company floor, all run again inside that
+       second call, unchanged.
+    4. A subset of fewer than two profiles (the single-on-roster-profile case) has no
+       runner-up to decide anything from, so the full-pool result is used instead of
+       inventing a 1:1 decision the subset cannot support (`decide_name`'s own 1:1 branch
+       returns `margin=None`, which `lambda_speaker_embed._from_match_artifact` reads as
+       "no runner-up" and drops the turn entirely -- silently losing a turn a roster of one
+       was never meant to narrow away).
+    """
+    full = decide_name(scores, duration_s=duration_s, min_turn_s=min_turn_s,
+                       min_margin=min_margin, floor=floor)
+    if not on_roster:
+        return full
+    if full.name is None or full.name not in on_roster:
+        if full.status == "confirmed":
+            return Decision("tentative", full.name, full.margin,
+                            full.reason + " -- but the winner is off today's site roster",
+                            score=full.score)
+        return full
+    subset = {k: v for k, v in (scores or {}).items() if k in on_roster}
+    if len(subset) < 2:
+        # A one-person roster narrows nothing (plan correction 3): the full-pool result,
+        # runner-up and all, is used instead.
+        return full
+    return decide_name(subset, duration_s=duration_s, min_turn_s=min_turn_s,
+                       min_margin=min_margin, floor=floor)
+
+
 def window_is_homogeneous(frame_embeddings,
                           max_spread: float = DEFAULT_MAX_FRAME_SPREAD):
     """Does this window hold one voice? True / False / None for "cannot tell".
