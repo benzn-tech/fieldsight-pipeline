@@ -1,5 +1,7 @@
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
+
+from deleted_predicates import LIVE_TOPIC_PREDICATE
 from repositories.search_sql import build_latest_date_sql, build_search_sql  # re-export
 
 __all__ = ["build_search_sql", "build_latest_date_sql", "insert_chunk", "search_chunks",
@@ -207,10 +209,19 @@ def restore_chunks_for_batch(conn, batch_id) -> int:
     # in this repo for a caller that means an actual, irreversible delete), so a restore
     # never fails the whole undelete transaction on a dangling FK.
     #
-    # The scalar subquery yields NULL for a topic that is gone: not a workaround, but
-    # exactly what ON DELETE SET NULL would have done had the row never left the table.
+    # The scalar subquery yields NULL for a topic that is gone OR superseded (fix round 1,
+    # PR #972 review): "exists" is not enough any more. A chunk can be archived while its
+    # topic is live and restored after that SAME topic was later superseded by an unrelated
+    # re-extraction (the topic row still exists — Task 3 stopped deleting it) — binding the
+    # restored chunk to it would put it right back under `visible_chunks_predicate`'s
+    # superseded-topic arm, hidden, exactly the state R21 exists to repair for a supersede's
+    # own chunks. `LIVE_TOPIC_PREDICATE` (deleted_predicates — one definition, not an inlined
+    # `superseded_at` check that could drift from Task 2's) makes this the same "does the
+    # parent still count" test every other live read uses, so a restored chunk with a
+    # since-superseded topic comes back unbound rather than invisible.
     select_cols = ("a.id, a.site_id, a.user_id, a.source_s3_key, "
-                   "(SELECT t.id FROM topics t WHERE t.id = a.topic_id), "
+                   f"(SELECT t.id FROM topics t WHERE t.id = a.topic_id "
+                   f"AND {LIVE_TOPIC_PREDICATE.format(alias='t')}), "
                    "a.report_date, a.chunk_type, a.chunk_text, a.embedding, "
                    "a.metadata, a.created_at")
     conn.execute(

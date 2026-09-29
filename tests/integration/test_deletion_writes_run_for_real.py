@@ -149,6 +149,36 @@ def test_restore_puts_back_exactly_one_batch(db):
     assert str(a["id"]) in live and str(b["id"]) not in live
 
 
+def test_restore_unbinds_from_a_topic_superseded_while_the_chunk_was_archived(db):
+    """PR #972 review, fix round 1 #2: `restore_chunks_for_batch`'s old scalar subquery
+    (`SELECT t.id FROM topics t WHERE t.id = a.topic_id`) bound a restored chunk to
+    WHATEVER topic row that id still named -- live or superseded. Archive a chunk while its
+    topic is live, supersede that SAME topic (an unrelated later re-extraction) while the
+    chunk sits in the archive, then restore: the chunk must come back UNBOUND, not
+    re-attached to the now-superseded topic, or it lands right back behind
+    `visible_chunks_predicate`'s superseded-topic arm -- an undelete that silently did not
+    bring the content back."""
+    co, s, u = _seed(db)
+    src = f"extractions/Folder/{DATE}/{BASE}.json"
+    t = topics.upsert_topic(db, s["id"], DATE, "Pour", user_id=u["id"], source_s3_key=src)
+    linked = _chunk(db, s["id"], topic_id=t["id"], source_files=[f"x_{BASE}_c1.json"])
+    batch = str(uuid.uuid4())
+
+    chunks.archive_chunks_for_session(db, BASE, [t["id"]], batch, company_id=co["id"])
+    topics.supersede_topics_for_source(db, src, "final:test")
+
+    n = chunks.restore_chunks_for_batch(db, batch)
+
+    assert n == 1
+    row = db.execute(
+        "SELECT topic_id FROM report_chunks WHERE id=%s", (linked["id"],)).fetchone()
+    assert row[0] is None, (
+        "a restored chunk must not rebind to a topic that was superseded while it was "
+        "archived")
+    assert str(linked["id"]) in _live_ids(db, s["id"]), (
+        "the chunk itself must still come back live, just unbound")
+
+
 def test_restore_is_idempotent(db):
     """A retried undelete must not raise on the primary key it already restored."""
     co, s, _ = _seed(db)
