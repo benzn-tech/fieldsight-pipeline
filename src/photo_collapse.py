@@ -59,11 +59,21 @@ def multibound_photo_count(conn):
 def run(conn, s3, bucket, apply=False, folder=None, date=None):
     """Recompute every affected day. Returns a summary a person can read.
 
-    `apply=False` computes what a rebind would write and rolls back.
+    `apply=False` computes what a rebind would write inside a savepoint that is
+    always rolled back -- its own work only, never the caller's transaction.
+    (It used to call conn.rollback(), which undid everything on the
+    connection; the integration test caught it discarding its own seed.)
     `apply=True` rebinds each day through photo_rebind.rebind_day_photos,
     whose writer is bounded on source='binding' -- keyframes and human binds
     are never touched.
     """
+    if apply:
+        return _run(conn, s3, bucket, True, folder, date)
+    with conn.transaction(force_rollback=True):
+        return _run(conn, s3, bucket, False, folder, date)
+
+
+def _run(conn, s3, bucket, apply, folder, date):
     days = affected_days(conn)
     if folder or date:
         days = {k: v for k, v in days.items()
@@ -101,6 +111,4 @@ def run(conn, s3, bucket, apply=False, folder=None, date=None):
         # Counted again after the writes, in the same transaction: "the script
         # said it worked" is not the same as "the table now says so".
         summary["multibound_photos_after"] = multibound_photo_count(conn)
-    else:
-        conn.rollback()
     return summary
