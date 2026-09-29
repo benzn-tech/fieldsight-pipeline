@@ -1,0 +1,48 @@
+{
+  "programme_match": {
+    "database": "fieldsight",
+    "descriptive_only": true,
+    "exclusions": {},
+    "exported_at": "2026-09-28T21:14:28.080237+00:00",
+    "n": 0,
+    "negatives": 0,
+    "owner_rows_dropped_deleted": 0,
+    "owner_rows_dropped_no_topic_ids": 0,
+    "positives": 0
+  },
+  "route_note": "labels exported read-only; no rows written",
+  "threads": {
+    "database": "fieldsight",
+    "descriptive_only": false,
+    "exclusions": {
+      "deleted_topic_rows": "invisible (FK cascades)"
+    },
+    "exported_at": "2026-09-28T21:14:28.080237+00:00",
+    "label_source_breakdown": {
+      "db": 26,
+      "owner": 60
+    },
+    "n": 86,
+    "negatives": 59,
+    "owner_rows_dropped_deleted": 0,
+    "owner_rows_dropped_no_topic_ids": 0,
+    "positives": 27
+  },
+  "work_class": {
+    "database": "fieldsight",
+    "descriptive_only": false,
+    "exclusions": {
+      "topic_missing": 4
+    },
+    "exported_at": "2026-09-28T21:14:28.080237+00:00",
+    "label_source_breakdown": {
+      "db": 23,
+      "owner": 80
+    },
+    "n": 103,
+    "negatives": 21,
+    "owner_rows_dropped_deleted": 0,
+    "owner_rows_dropped_no_topic_ids": 0,
+    "positives": 82
+  }
+}
