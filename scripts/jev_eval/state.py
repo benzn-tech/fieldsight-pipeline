@@ -82,6 +82,65 @@ Masking has these layers, in order:
     (`"Roof Framing Inspection"` -> `"PERSON_1 Inspection"`) rather than a
     plausible name inside it.
 
+  Fix wave 6: even with the stoplist, the generic pass was measured (on the
+  real exported data) to mask almost every title-case TOPIC HEADING it saw
+  ("Material Procurement", "Scaffolding Safety", "Slab Rebar", "General
+  Reflection", "Anything Else", ...) because headings share its
+  two-capitalised-word shape. A candidate is now masked only if NEITHER
+  token is a "known common word": `_BUILT_IN_COMMON_WORDS` (a fixed module
+  constant), OR a word present in an optional `common_words` set the caller
+  supplies to `mask_names`/`build_state` -- the runner builds this once per
+  run, via `extract_words` (below), from every selected row's own allowlisted
+  title/summary text, before any state is built, so the same gate applies
+  uniformly to broad, decomposed and control states.
+
+  **Fix round 1 (controller correction):** the corpus counts a word only if
+  it occurs somewhere in the run's text ALREADY WRITTEN ALL-LOWERCASE -- a
+  first version lowercased every capitalised token too, which meant a name
+  that appears only capitalised (e.g. "Hector Eggar", mentioned several
+  times, always capitalised) still entered the corpus as "hector"/"eggar"
+  and was treated as common, a privacy regression measured on the real data
+  (every generic-pass mask, including real names, dropped to zero).
+
+  **Fix round 2 (controller correction):** even with round 1's fix, a corpus
+  word that is ALSO a common NZ/AU given name or surname (e.g. "wood",
+  "price", "crane", "will", "may") could still vouch for the SAME word used
+  as a real name elsewhere, because round 1 only checked how the word was
+  written, not what kind of word it was. `_COMMON_NAME_WORDS` (a fixed
+  module constant, a superset of `_COMMON_WORD_ALIASES`) is now subtracted
+  from the CORPUS-DERIVED words before they are unioned with
+  `_BUILT_IN_COMMON_WORDS` -- so a corpus occurrence of "wood" or "price" can
+  no longer suppress masking of "Wood Ward" or "John Price", while the FIXED
+  heading list (`_BUILT_IN_COMMON_WORDS`, none of whose entries are common
+  names) is untouched. `extract_words` also now drops contraction fragments
+  ("don't" -> neither "don" nor "t" enters the corpus) -- the bare
+  `[A-Za-z]+` split used to leak "don" (itself in `_COMMON_NAME_WORDS`) into
+  the corpus from an ordinary contraction, which would have suppressed a
+  real "Don Smith".
+
+  This never weakens person-alias matching: a KNOWN person alias (from
+  `name_aliases`) is always masked even if it is also a common word (the
+  existing `_COMMON_WORD_ALIASES` case rules for "Will"/"Mark"/etc. are
+  unchanged) -- only the generic, alias-free two-token pass is gated this
+  way.
+
+  **Residual, corrected wording (round 2): this is no longer "a little
+  under-masking of names that collide with a common word" -- round 1's
+  version of that claim was not accurate for name-words at all, since ANY
+  corpus recurrence of a name-shaped common word suppressed masking of that
+  same name everywhere in the run.** After round 2, the residual is narrower
+  and specific: a word can still enter the corpus (and so suppress the
+  generic pass) if it is a common word that is NEITHER in
+  `_BUILT_IN_COMMON_WORDS` NOR in `_COMMON_NAME_WORDS`, has a genuine
+  literal-lowercase occurrence elsewhere in the run's own text, AND also
+  happens to be a real surname not on either list (e.g. a corpus containing
+  the literal lowercase word "hub" and a genuine name "Roofing Hub" reads as
+  a business, but an actual person surnamed "Hub" would slip through the
+  same way). This is a materially smaller and rarer gap than round 1's,
+  which is why it is described separately rather than reusing round 1's "a
+  little under-masking" phrasing. See also
+  `docs/superpowers/specs/2026-09-28-jev-shadow-eval-findings.md` §4.
+
   Even with the stoplist, an unaliased company/product term with no
   corporate marker and no stoplist word can still be masked. That is an
   accepted false positive, not a bug: a masked company name costs the
@@ -179,6 +238,72 @@ _COMMON_WORD_ALIASES = frozenset({
     "white", "black", "brown", "green", "king", "hall", "wood", "stone",
     "field", "park", "bell", "hill", "ward", "page", "lane", "cook", "rob",
     "art", "chance", "sunny", "max",
+})
+
+# Fix round 2 (controller ruling): the corpus-derived `common_words` set must
+# never vouch for a word that is ALSO a common NZ/AU first name or surname --
+# that is exactly how "Hector Eggar" (fix round 1's regression) happened one
+# level down: a name-shaped word recurring in the corpus (even lower-case
+# somewhere) shielded the same word used as a real name elsewhere. This is
+# subtracted from the CORPUS-DERIVED words only (`_Masker.__init__`, below) --
+# NEVER from `_BUILT_IN_COMMON_WORDS` (the fixed heading list), which stays
+# untouched because none of its entries are common given names/surnames.
+# Superset of `_COMMON_WORD_ALIASES` (a "Will"/"Mark"-shaped word is a common
+# name by definition) plus further common NZ/AU given names and surnames that
+# double as ordinary words, named by the controller after measuring the
+# real data ("Wood Ties", "Balustrade Glass", "Golf Day" collided this way).
+_COMMON_NAME_WORDS = frozenset({
+    "will", "may", "mark", "grant", "bill", "rose", "june", "april", "august",
+    "jack", "pat", "sue", "drew", "dawn", "hope", "joy", "faith", "ray",
+    "frank", "rich", "don", "jesse", "young", "brown", "black", "white",
+    "green", "king", "hill", "hall", "bell", "cook", "wood", "park", "long",
+    "price", "day", "short", "field", "fields", "glass", "steel", "case",
+    "crane", "ward", "stone", "lane", "page", "fox", "wolf", "lee", "ng",
+    "chan",
+}) | _COMMON_WORD_ALIASES
+
+# Fix wave 6: the generic two-token pass, measured against the real exported
+# data, was masking title-case TOPIC HEADINGS -- "Material Procurement" (11),
+# "Scaffolding Safety" (9), "Slab Rebar" (7), "Concrete Testing", "Device
+# Testing", "Route Planning", "Subcontractor Access", "Crane Restrictions",
+# "Design Issues", "Electrical Cables", "Weekly Schedule", "Recording
+# Device", "General Reflection", "Anything Else" -- while correctly catching
+# real names of the same two-capitalised-word shape ("Hector Eggar", "Paul
+# Smith", "Liang Min", "Yang Ming"). Controller's ruling: a generic candidate
+# is masked only if NEITHER token is a "known common word" -- this built-in
+# module constant, OR a word the CALLER supplies via `common_words` (the
+# runner computes it once per run from the lowercase words across every
+# row's allowlisted title/summary text, so the same rule applies uniformly
+# to broad, decomposed and control states). This is unrelated to
+# `_COMMON_WORD_ALIASES` above (which governs case rules for known PERSON
+# aliases, e.g. "Will"/"Mark") and to `_STOPLIST` (which still gates the
+# lead-token scan as before) -- both keep their existing behaviour.
+#
+# Checked against a token's *lowercase* form, so it matches regardless of
+# the casing the generic pass's title-case shape requires.
+#
+# Residual (see the module docstring's round-2 correction for the exact,
+# narrowed shape after `_COMMON_NAME_WORDS` was added): this fixed list is
+# deliberately kept free of common given names/surnames -- e.g. "crane" was
+# REMOVED from here in fix round 2 (it doubles as a surname, and unlike a
+# corpus word it can never be subtracted back out for a specific run). This
+# costs nothing: "Crane Restrictions" stays protected because "restrictions"
+# alone is enough (either token being common is sufficient), so no heading
+# recovery regresses. See also
+# `docs/superpowers/specs/2026-09-28-jev-shadow-eval-findings.md` §4.
+_BUILT_IN_COMMON_WORDS = frozenset({
+    # From the brief's own measured examples (topic headings that were
+    # being over-masked):
+    "material", "procurement", "scaffolding", "safety", "slab", "rebar",
+    "concrete", "testing", "device", "route", "planning", "subcontractor",
+    "access", "restrictions", "design", "issues", "electrical",
+    "cables", "weekly", "schedule", "recording", "general", "reflection",
+    "anything", "else",
+    # Other common heading/construction words named in the brief.
+    "update", "review", "discussion", "meeting", "plan", "issue",
+    "progress", "inspection", "delivery", "system", "platform", "client",
+    "site", "project", "strategy", "check", "setup", "coordination",
+    "options", "daily", "upcoming",
 })
 
 # Contact info -- masked in every string, ahead of the name passes.
@@ -298,9 +423,22 @@ _BUILDERS = {
 class _Masker:
     """Holds the one PERSON_n mapping for a single build_state/mask_names call."""
 
-    def __init__(self, aliases: list | None) -> None:
+    def __init__(self, aliases: list | None, common_words: set | None = None) -> None:
         self._person_pairs: list[tuple[str, ...]] = []
         self._protected: set[str] = set()
+        # Fix wave 6: lowercase common-word gate for the generic pass (see
+        # `_BUILT_IN_COMMON_WORDS`) -- the caller-supplied corpus words are
+        # additive to the built-in list, never a replacement for it.
+        #
+        # Fix round 2: `_COMMON_NAME_WORDS` is subtracted from the
+        # CORPUS-DERIVED words ONLY, before the built-in list is unioned back
+        # in -- a corpus word that is also a common given name/surname must
+        # never vouch for the generic pass skipping it, even though the same
+        # word IS allowed to sit in the fixed `_BUILT_IN_COMMON_WORDS` heading
+        # list (none of those entries are common names).
+        self._common_words: frozenset = (
+            frozenset({w.lower() for w in (common_words or ())}) - _COMMON_NAME_WORDS
+        ) | _BUILT_IN_COMMON_WORDS
 
         # Person aliases group by `alias_group` when present (so first name,
         # last name and full name of one user collapse to the SAME
@@ -506,7 +644,11 @@ class _Masker:
                 out.append(text[pos:])
                 break
             word1, word2 = match.group(1), match.group(2)
-            if word1 in _STOPLIST or word2 in _STOPLIST:
+            if (
+                word1 in _STOPLIST or word2 in _STOPLIST
+                or word1.lower() in self._common_words
+                or word2.lower() in self._common_words
+            ):
                 first_end = match.end(1)
                 out.append(text[pos:first_end])
                 pos = first_end
@@ -605,21 +747,33 @@ def _mask_tree(value: Any, masker: _Masker, path: str = "") -> Any:
     return value
 
 
-def mask_names(text: str, aliases: list) -> tuple[str, dict]:
+def mask_names(text: str, aliases: list, common_words: set | None = None) -> tuple[str, dict]:
     """Mask person names (and contact info) in `text`, returning
     (masked_text, mapping).
+
+    `common_words` (optional): lowercase words the caller has determined are
+    common/ordinary in this run's own text (e.g. every word appearing in the
+    titles/summaries of the rows being masked) -- see `_BUILT_IN_COMMON_WORDS`
+    for how this is used to stop the generic two-token pass from over-masking
+    title-case headings. Additive to the built-in list, never a replacement.
 
     `mapping` (real name -> PERSON_n) is returned to the caller for this one
     call only; `build_state` keeps its own mapping in memory across the whole
     state and never surfaces it in the output.
     """
-    masker = _Masker(aliases)
+    masker = _Masker(aliases, common_words)
     masked = masker.mask(text)
     return masked, dict(masker.mapping)
 
 
-def build_state(set_name: str, features: dict, aliases: list) -> dict:
+def build_state(
+    set_name: str, features: dict, aliases: list, common_words: set | None = None
+) -> dict:
     """Build the small JSON state sent to the third-party (Jev) model.
+
+    `common_words` (optional): see `mask_names`. The runner computes this
+    once per run, across every selected set's rows, before any state is
+    built, so broad/decomposed/control states all see the same gate.
 
     Raises `JevStateError` if `features` contains a transcript-like key
     anywhere, or if `set_name` is not one of the known sets.
@@ -634,5 +788,83 @@ def build_state(set_name: str, features: dict, aliases: list) -> dict:
     _raise_if_transcript_like(features)
 
     state = builder(features)
-    masker = _Masker(aliases)
+    masker = _Masker(aliases, common_words)
     return _mask_tree(state, masker)
+
+
+# ---------------------------------------------------------------------------
+# Corpus-word helpers for the runner (`scripts/jev_shadow_eval.py`): compute
+# the per-run `common_words` set from the ALLOWLISTED text of every row,
+# before any state (and therefore any mapping) is built. Reuses the same
+# `_BUILDERS` the real state build uses, so the corpus is drawn from exactly
+# the fields that would be sent -- never anything outside the allowlist.
+# ---------------------------------------------------------------------------
+
+# Fix round 2: matches a contraction ("don't", "we're", "Jay's", ...) as ONE
+# token including its apostrophe suffix, so `extract_words` can recognise
+# and drop the whole thing -- rather than the bare `[A-Za-z]+` pattern
+# splitting "don't" into "don" and "t" and letting "don" (a real given name,
+# see `_COMMON_NAME_WORDS`) slip into the corpus and unmask "Don Smith". The
+# suffix alternatives are what's left of "n't"/"'s"/"'re"/"'ll"/"'ve"/"'d"
+# AFTER the apostrophe -- the leading "n" of "n't" is itself a letter, so
+# it's already consumed by the `[A-Za-z]+` part ("do" + "n" -> "don").
+_WORD_RE = re.compile(r"[A-Za-z]+(?:['’](?:t|s|re|ll|ve|d))?", re.IGNORECASE)
+
+
+def build_raw_allowed(set_name: str, features: dict) -> dict:
+    """Same field allowlist as `build_state`, but returns the UNMASKED
+    allowed fields -- used only to harvest corpus words for `common_words`,
+    never sent anywhere."""
+    if not isinstance(features, dict):
+        raise JevStateError(f"features must be a dict, got {type(features).__name__}")
+    builder = _BUILDERS.get(set_name)
+    if builder is None:
+        raise JevStateError(f"unknown set: {set_name!r}")
+    return builder(features)
+
+
+def extract_words(value: Any) -> set[str]:
+    """Walk a (possibly nested) dict/list/str tree and return every word
+    that occurs somewhere in the text ALREADY written all-lowercase.
+
+    Fix round 1 (controller correction): the ruling is "a token's lowercase
+    form appears AS A LOWERCASE WORD in the corpus" -- an occurrence written
+    all-lowercase, not any occurrence lowercased on the way in. A first
+    version of this function lowercased every token regardless of its
+    original casing, which meant a name that appears ONLY capitalised
+    ("Hector Eggar", mentioned several times, always capitalised) still
+    landed in the corpus as "hector"/"eggar" and got treated as a common
+    word -- exactly the privacy regression this function exists to avoid.
+    Only a token that appears somewhere in the text with NO uppercase
+    letters at all (`str.islower()`) is added; a token seen only
+    Capitalised or ALL-CAPS contributes nothing. "Material Procurement"
+    stays protected because "procurement" also occurs lower-case elsewhere
+    in the run's own text; "Hector Eggar" does not, because "hector" and
+    "eggar" never occur lower-case anywhere.
+
+    Fix round 2 (controller correction): a contraction fragment never enters
+    the corpus. `_WORD_RE` matches a contraction as ONE token including its
+    apostrophe suffix ("don't", "Jay's", "we're", ...); any such token is
+    dropped entirely here -- neither the fragment before the apostrophe
+    ("don") nor the one after is added. Without this, a corpus containing
+    only "don't" would add the bare word "don" (a real given name, see
+    `_COMMON_NAME_WORDS`) and unmask a genuine "Don Smith" elsewhere in the
+    same run."""
+    words: set[str] = set()
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for sub in node.values():
+                _walk(sub)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+        elif isinstance(node, str):
+            for w in _WORD_RE.findall(node):
+                if "'" in w or "’" in w:
+                    continue
+                if w.islower():
+                    words.add(w)
+
+    _walk(value)
+    return words

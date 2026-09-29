@@ -645,6 +645,9 @@ def dispatch(conn, event, method, route):
     if route == "/rollup/portfolio" and method == "GET":
         return list_portfolio_rollup(conn, caller, event)
 
+    if route == "/weather" and method == "GET":
+        return get_site_weather(conn, caller, event)
+
     if route == "/programme":
         if method == "GET":
             return get_programme(conn, caller, event)
@@ -5829,6 +5832,33 @@ def _allowed_site_ids(conn, caller):
 
 _SITE_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
+
+def get_site_weather(conn, caller, event):
+    """GET /api/org/weather?site=<uuid|slug>&date=YYYY-MM-DD -- one site's day.
+
+    Returns {forecast, actual}: the morning forecast the report generator
+    wrote at 05:30 (weather/<uuid>/<date>/forecast.json) and, once the day has
+    been reported, the actuals (actual.json). Each is null when not written --
+    a site with no coordinate, or a day before either job ran. What the
+    weather MEANT is already in `lines`, decided by weather_advice; the page
+    shows them as they are and decides nothing.
+
+    Same ACL as the programme: the site must be one the caller can reach.
+    """
+    params = event.get("queryStringParameters") or {}
+    site_id, err = _resolve_site_param(conn, caller, params.get("site"))
+    if err is not None:
+        return err
+    date = params.get("date") or nz_time.nz_now().strftime("%Y-%m-%d")
+    if not REPORT_DATE_RE.match(date):
+        return error("date must be YYYY-MM-DD", 400)
+    return ok({
+        "site": site_id,
+        "date": date,
+        "forecast": _get_lake_json(f"weather/{site_id}/{date}/forecast.json"),
+        "actual": _get_lake_json(f"weather/{site_id}/{date}/actual.json"),
+    })
 
 
 def _resolve_site_param(conn, caller, site_param):

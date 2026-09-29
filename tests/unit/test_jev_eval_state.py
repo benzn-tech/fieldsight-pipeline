@@ -18,7 +18,7 @@ import json
 
 import pytest
 
-from scripts.jev_eval.state import build_state, mask_names
+from scripts.jev_eval.state import build_state, extract_words, mask_names
 
 PERSON_ALIASES = [
     {"wrong_term": "Ben Lynn", "right_term": "Ben Lin", "kind": "person"},
@@ -284,6 +284,267 @@ def test_stoplist_does_not_suppress_a_real_two_word_name():
     text, mapping = mask_names("Sarah Jones confirmed the pour", [])
     assert text == "PERSON_1 confirmed the pour"
     assert mapping == {"Sarah Jones": "PERSON_1"}
+
+
+# ---------------------------------------------------------------------------
+# Fix wave 6: common-word gate on the generic pass -- topic headings measured
+# on the real exported data ("Material Procurement" x11, "Scaffolding Safety"
+# x9, "Slab Rebar" x7, ...) were almost all being masked by the generic pass
+# while real names of the same shape ("Hector Eggar", "Paul Smith", "Liang
+# Min", "Yang Ming") were correctly caught. A candidate is now masked only if
+# NEITHER token is a known common word (built-in list, or caller-supplied
+# per-run corpus).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("heading", [
+    "Material Procurement",
+    "Scaffolding Safety Review",
+    "General Reflection – Anything Else to Cover",
+    "Slab Rebar",
+    "Concrete Testing",
+    "Device Testing",
+    "Route Planning",
+    "Subcontractor Access",
+    "Crane Restrictions",
+    "Design Issues",
+    "Electrical Cables",
+    "Weekly Schedule",
+    "Recording Device",
+])
+def test_generic_pass_leaves_title_case_topic_headings_unmasked(heading):
+    text, mapping = mask_names(heading, [])
+    assert text == heading
+    assert mapping == {}
+
+
+def test_generic_pass_still_masks_real_names_not_in_the_common_word_list():
+    text, mapping = mask_names("Hector Eggar rang about the delivery", [])
+    assert text == "PERSON_1 rang about the delivery"
+    assert mapping == {"Hector Eggar": "PERSON_1"}
+
+    text2, mapping2 = mask_names("Paul Smith confirmed the pour", [])
+    assert text2 == "PERSON_1 confirmed the pour"
+    assert mapping2 == {"Paul Smith": "PERSON_1"}
+
+    text3, mapping3 = mask_names("Liang Min will be on site", [])
+    assert text3 == "PERSON_1 will be on site"
+    assert mapping3 == {"Liang Min": "PERSON_1"}
+
+    text4, mapping4 = mask_names("Yang Ming signed off the report", [])
+    assert text4 == "PERSON_1 signed off the report"
+    assert mapping4 == {"Yang Ming": "PERSON_1"}
+
+
+def test_common_words_parameter_protects_a_corpus_specific_heading():
+    # "Foundry Logistics" is not in the built-in list -- without a
+    # caller-supplied corpus it reads as a plausible two-token name and gets
+    # masked. Supplying it via `common_words` (as the runner would, having
+    # seen "Foundry" and "Logistics" elsewhere in this run's own text)
+    # suppresses the generic pass for it.
+    text_without, mapping_without = mask_names("Foundry Logistics update", [])
+    assert text_without == "PERSON_1 update"
+    assert mapping_without == {"Foundry Logistics": "PERSON_1"}
+
+    text_with, mapping_with = mask_names(
+        "Foundry Logistics update", [], common_words={"foundry", "logistics"})
+    assert text_with == "Foundry Logistics update"
+    assert mapping_with == {}
+
+
+def test_known_person_alias_still_masked_even_if_also_a_common_word():
+    # Person aliases are unaffected by the common-word gate -- a known alias
+    # is always masked, even if the term also happens to be a common word.
+    # Existing case rules for common-word aliases (capitalised/ALL-CAPS only)
+    # are unchanged.
+    aliases = [{"wrong_term": "Mark", "right_term": "Mark", "kind": "person"}]
+    text, mapping = mask_names(
+        "Mark reviewed the schedule", aliases, common_words={"mark", "schedule"})
+    assert text == "PERSON_1 reviewed the schedule"
+    assert mapping == {"Mark": "PERSON_1"}
+
+
+def test_common_name_word_in_corpus_no_longer_suppresses_masking_round_2():
+    # Fix round 2 (controller correction): round 1's accepted residual was
+    # that a corpus occurrence of "wood" suppressed masking of "Wood Ward"
+    # everywhere in the run. "wood" is a common given name/surname
+    # (`_COMMON_NAME_WORDS`), so it is now subtracted from the CORPUS-derived
+    # words before the gate is built -- a corpus recurrence of "wood" no
+    # longer protects "Wood Ward".
+    text, mapping = mask_names("Wood Ward confirmed the delivery", [], common_words={"wood"})
+    assert text == "PERSON_1 confirmed the delivery"
+    assert mapping == {"Wood Ward": "PERSON_1"}
+
+
+def test_common_name_words_from_the_ruling_are_masked_even_with_a_matching_corpus():
+    # Fix round 2's own measured probes: a real-shaped corpus containing
+    # "will", "price", "crane", "may", "june" must not suppress masking of a
+    # real name sharing one of those words.
+    common_words = {"will", "price", "crane", "may", "june"}
+    for text, expected_mapping in [
+        ("Will Chen confirmed", {"Will Chen": "PERSON_1"}),
+        ("John Price", {"John Price": "PERSON_1"}),
+        ("Hector Crane", {"Hector Crane": "PERSON_1"}),
+        ("May Chen confirmed", {"May Chen": "PERSON_1"}),
+        ("June Wilson", {"June Wilson": "PERSON_1"}),
+    ]:
+        masked, mapping = mask_names(text, [], common_words=common_words)
+        assert mapping == expected_mapping, text
+        assert "PERSON_1" in masked
+
+    # The same corpus must still leave a genuine heading protected.
+    masked, mapping = mask_names("Material Procurement", [], common_words=common_words)
+    assert masked == "Material Procurement"
+    assert mapping == {}
+
+
+def test_residual_new_shape_after_round_2_is_narrower_not_zero():
+    # New, narrower residual (round 2): a word that is NEITHER in the fixed
+    # heading list NOR in `_COMMON_NAME_WORDS`, but has a genuine
+    # literal-lowercase occurrence elsewhere in the run's own text, can still
+    # suppress the generic pass -- e.g. "hub" (a business-name word, not a
+    # common given name/surname) protects "Roofing Hub", and the same
+    # mechanism would also protect an unlucky real "Cody Hub".
+    text, mapping = mask_names("Cody Hub confirmed the delivery", [], common_words={"hub"})
+    assert text == "Cody Hub confirmed the delivery"
+    assert mapping == {}
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1 (controller correction, 2026-09-29): the corpus must count a
+# word only if it occurs somewhere ALREADY WRITTEN ALL-LOWERCASE -- not any
+# occurrence lowercased on the way in. Without this, a real name mentioned
+# several times but always capitalised ("Hector Eggar") was entering the
+# corpus as "hector"/"eggar" and being treated as common, which measured at
+# 0 generic-pass masks remaining on the real data -- a privacy regression.
+# ---------------------------------------------------------------------------
+
+def test_extract_words_excludes_a_token_seen_only_capitalised():
+    # "Hector" and "Eggar" appear several times, always capitalised, never
+    # written lowercase anywhere -- neither may enter the corpus.
+    text = "Hector Eggar rang. Hector Eggar called back. Ask Hector Eggar again."
+    words = extract_words({"title": text, "summary": text})
+    assert "hector" not in words
+    assert "eggar" not in words
+
+
+def test_extract_words_excludes_a_token_seen_only_all_caps():
+    words = extract_words({"title": "HECTOR EGGAR CONFIRMED"})
+    assert "hector" not in words
+    assert "eggar" not in words
+
+
+def test_extract_words_includes_a_token_with_a_genuine_lowercase_occurrence():
+    # "procurement" occurs lower-case in the summary even though the title
+    # capitalises it -- it belongs in the corpus.
+    words = extract_words({
+        "title": "Material Procurement",
+        "summary": "Waiting on procurement paperwork before the pour.",
+    })
+    assert "procurement" in words
+    # "Material" itself is only ever capitalised here, so it is NOT added by
+    # this token's own occurrence -- a separate row's lower-case "material"
+    # would be what adds it (proven by the next call, a fresh corpus).
+    assert "material" not in words
+
+    words2 = extract_words({"summary": "material handling was slow today."})
+    assert "material" in words2
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2 (controller correction, 2026-09-29): a contraction fragment
+# must never enter the corpus. The bare `[A-Za-z]+` word regex split "don't"
+# into "don" and "t"; "don" (a real given name -- see `_COMMON_NAME_WORDS`)
+# then entered the corpus and would have unmasked a genuine "Don Smith".
+# ---------------------------------------------------------------------------
+
+def test_extract_words_drops_a_contraction_fragment():
+    words = extract_words({"summary": "don't forget the delivery"})
+    assert "don" not in words
+    assert "t" not in words
+
+
+def test_common_word_gate_a_corpus_of_only_a_contraction_does_not_unmask_don_smith():
+    common_words = extract_words({"summary": "don't forget the delivery"})
+    text, mapping = mask_names("Don Smith confirmed", [], common_words=common_words)
+    assert text == "PERSON_1 confirmed"
+    assert mapping == {"Don Smith": "PERSON_1"}
+
+
+@pytest.mark.parametrize("sentence,fragment", [
+    ("we're on site", "re"),
+    ("we'll call back", "ll"),
+    ("we've confirmed", "ve"),
+    ("it's delayed", "s"),
+    ("we'd prefer Thursday", "d"),
+])
+def test_extract_words_drops_other_contraction_shapes(sentence, fragment):
+    words = extract_words({"summary": sentence})
+    assert fragment not in words
+    assert "we" not in words
+    assert "it" not in words
+
+
+def test_common_word_gate_still_masks_a_name_seen_only_capitalised_in_the_corpus():
+    # End-to-end: build the corpus the way the runner does (via
+    # extract_words) from text where "Hector Eggar" appears several times,
+    # always capitalised, and confirm it is still masked -- this is the
+    # exact regression the controller flagged.
+    corpus_text = (
+        "Hector Eggar rang about the delivery. Hector Eggar confirmed the "
+        "schedule. Ask Hector Eggar to call back."
+    )
+    common_words = extract_words({"summary": corpus_text})
+    text, mapping = mask_names("Hector Eggar rang", [], common_words=common_words)
+    assert text == "PERSON_1 rang"
+    assert mapping == {"Hector Eggar": "PERSON_1"}
+
+
+def test_common_word_gate_still_protects_a_heading_whose_words_recur_lowercase():
+    corpus_text = "Waiting on procurement paperwork; site safety briefing done."
+    common_words = extract_words({"summary": corpus_text})
+    text, mapping = mask_names("Material Procurement", [], common_words=common_words)
+    # "procurement" recurs lower-case in the corpus, and "material" is in
+    # the built-in list regardless -- the heading stays unmasked.
+    assert text == "Material Procurement"
+    assert mapping == {}
+
+
+def test_build_state_accepts_common_words_and_protects_headings():
+    features = {"title": "Material Procurement", "summary": "s", "category": "c"}
+    state = build_state("work_class", features, [], common_words=set())
+    assert state["title"] == "Material Procurement"
+
+
+def test_masking_stats_placeholder_fraction_drops_with_common_words(monkeypatch):
+    # Re-runs `--dry-run`'s masking-stats path (jev_shadow_eval._masking_stats)
+    # directly with a synthetic corpus, proving `title_all_placeholder_fraction`
+    # drops once `common_words` is supplied.
+    import scripts.jev_shadow_eval as runner
+
+    # None of these words are in the built-in common-word list, so without a
+    # caller-supplied corpus every heading reads as a plausible two-token
+    # name and gets fully swallowed by the generic pass.
+    headings = ["Foundry Logistics", "Joinery Handover", "Signage Rollout"]
+
+    def _states(common_words):
+        states = {
+            i: {"state": {"title": h, "category": "c"}, "site_id": None, "company_id": None}
+            for i, h in enumerate(headings)
+        }
+        for i, h in enumerate(headings):
+            masked, _ = mask_names(h, [], common_words=common_words)
+            states[i]["state"]["title"] = masked
+        return states
+
+    stats_no_corpus = runner._masking_stats("work_class", _states(None))
+    assert stats_no_corpus["title_all_placeholder_fraction"] == 1.0
+
+    common_words = {"foundry", "logistics", "joinery", "handover", "signage", "rollout"}
+    stats_with_corpus = runner._masking_stats("work_class", _states(common_words))
+    assert stats_with_corpus["title_all_placeholder_fraction"] == 0.0
+
+    # The fraction dropped once the corpus was supplied.
+    assert stats_with_corpus["title_all_placeholder_fraction"] < stats_no_corpus["title_all_placeholder_fraction"]
 
 
 # ---------------------------------------------------------------------------

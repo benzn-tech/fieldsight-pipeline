@@ -38,7 +38,7 @@ def test_every_selected_column_is_grouped_or_aggregated():
     assert m, ("could not find the candidate SELECT; if its shape changed, fix this test "
                "rather than deleting it -- the check it performs is one Postgres does and "
                "no test double can")
-    g = re.search(r"GROUP BY (.*?) ORDER BY", sql)
+    g = re.search(r"GROUP BY (.*?) (?:\) c |ORDER BY)", sql)
     assert g, "the candidate query lost its GROUP BY"
 
     selected = [c.strip() for c in m.group(1).split(",")
@@ -88,6 +88,10 @@ def test_no_admission_threshold_hides_in_the_module():
     # numbers (0.445, 0.574) and those are prose, not thresholds.
     code = re.sub(r"#.*", "", src)
     code = re.sub(r'"""[\s\S]*?"""', "", code)
+    # Named and excluded deliberately (2026-09-29): these decide which clusters are worth
+    # ASKING about, never whether one IS the person -- a person answers that. Measured
+    # support: owner-labelled clips, nobody else above 0.274. Pinned below.
+    code = re.sub(r"DEFAULT_BOUNDARY = [\d.]+|ASK_BELOW_BOUNDARY = [\d.]+", "", code)
     floats = re.findall(r"(?<![\w.])\d+\.\d+", code)
     assert not floats, (
         f"bare float constant(s) {floats} in the candidate module. If one of these is a "
@@ -124,3 +128,17 @@ def test_every_placeholder_has_a_parameter():
             assert text.count("%s") == len(call.args[1].elts)
             return
     raise AssertionError("candidate query not found")
+
+
+def test_the_default_boundary_is_the_matchers_absence_floor():
+    """The bell's questions cluster around the same number decide_name names against. The
+    writer cannot import numpy, so it is restated; this keeps the two from drifting."""
+    vp = pytest.importorskip("voiceprint_utils")
+    assert lgc.DEFAULT_BOUNDARY == vp.DEFAULT_ABSENT_FLOOR
+
+
+def test_questions_are_ordered_by_how_uncertain_they_are():
+    """Most informative first: nearest the boundary, not highest score."""
+    sql = _statements()
+    assert "ORDER BY abs(c.score - %s) ASC" in sql
+    assert "WHERE c.score >= %s" in sql

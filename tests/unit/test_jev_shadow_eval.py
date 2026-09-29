@@ -479,6 +479,46 @@ def test_dry_run_writes_preview_and_calls_nothing(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Fix round 2 (controller ruling, minor): the common-word corpus is built
+# from the FULL rows of every set present on disk, ignoring --set and
+# --limit, so a --dry-run --limit 5 preview masks exactly like the full run.
+# ---------------------------------------------------------------------------
+
+def test_collect_common_words_ignores_set_and_limit(tmp_path, monkeypatch):
+    threads_rows = [
+        _threads_row("th-1", "yes", "site-1", "co-1", "Foundry Logistics"),
+        _threads_row("th-2", "no", "site-2", "co-2", "Joinery Handover"),
+    ]
+    work_rows = [
+        _work_class_row("wc-1", "yes"),
+        _work_class_row("wc-2", "no"),
+    ]
+
+    fixtures_dir = tmp_path / "jev_eval"
+    fixtures_dir.mkdir(parents=True)
+    monkeypatch.setattr(jse, "FIXTURES_DIR", fixtures_dir)
+    monkeypatch.setattr(jse, "RESULTS_DIR", fixtures_dir / "results")
+    _write_jsonl(fixtures_dir / "threads.jsonl", threads_rows)
+    _write_jsonl(fixtures_dir / "work_class.jsonl", work_rows)
+
+    words_no_args = jse.collect_common_words()
+    words_set_threads = jse.collect_common_words(["threads"], jse._parse_args(["--set", "threads"]))
+    words_set_all = jse.collect_common_words(["threads", "work_class"], jse._parse_args(["--set", "all"]))
+    words_limited = jse.collect_common_words(
+        ["threads"], jse._parse_args(["--set", "threads", "--limit", "5"]))
+
+    # Identical regardless of --set/--limit -- the arguments are ignored.
+    assert words_no_args == words_set_threads == words_set_all == words_limited
+
+    # And it is genuinely the union of BOTH sets' full rows, not narrowed by
+    # whichever --set a caller happened to pass: "concrete" only comes from
+    # work_class's category field, "summary" only from threads' "Earlier
+    # summary."/"Later summary." text.
+    assert "concrete" in words_no_args
+    assert "summary" in words_no_args
+
+
+# ---------------------------------------------------------------------------
 # Preview never carries transcript-like keys or unmasked alias names
 # ---------------------------------------------------------------------------
 

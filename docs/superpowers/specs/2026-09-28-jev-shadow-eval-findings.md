@@ -332,6 +332,49 @@ one homogeneous measurement. **`top_hit` is recorded on every owner-batch row fo
 but `score.py` never reads it — it plays no part in scoring, the precision floor, the coverage
 comparison, or the verdict.**
 
+### 3a. Owner-labelled batch (added 2026-09-29, before any Jev call)
+
+The owner labelled the Task 10 batch (sampler seed 0) in a private claude.ai page; labels were read back
+and merged with `import_labels.py`. Counts after merge (`counts.json`):
+
+| Set | Rows | yes | no | Source | Eligible (>= 20 per class) |
+|---|---|---|---|---|---|
+| threads | 86 | 27 | 59 | 26 DB + 60 owner (1 "unsure" dropped) | yes |
+| work_class | 103 | 82 | 21 | 23 DB + 80 owner (9 "unsure" dropped) | yes, with the definition caveat below |
+
+**Threads: the test accounts are not one site's job.** 55 of the 61 owner-batch pairs come from one
+site that the owner used for self-testing and across several real sites. In the owner's labels every
+"yes" pair falls inside one calendar month, and all 27 cross-month pairs are "no". These labels are
+true, and the deployed gate sees the same mix, but the cross-month pairs are easy negatives. The
+results table therefore reports threads twice: all rows, and same-month pairs only. A verdict that
+holds only on the full set, and not on the same-month subset, is recorded as such, and is not acted on.
+
+**work_class: the owner's definition is wider than the classifier's.** The deployed prompt
+(`lambda_extract_session.py`, rule 2b) defines non_work as "personal/off-work talk: meals, family,
+weekend, banter", and says to choose "work" when unsure. The owner labelled as non-work everything
+that is not this site's construction work: client meetings, sales, and the FieldSight team's own
+product work, as well as private talk. Of the 59 owner "yes" labels, the classifier said "work" on 24.
+Most of those 24 are this definitional gap, not classifier errors. Scored against the owner's labels,
+the baseline answers a different question than the one it was built for, so a work_class result under
+the current labels measures fit to the owner's definition, not the classifier's accuracy on its own
+spec. The fix proposed to the owner: split non-work into "other work" (client meetings, sales,
+FieldSight internal: not this site's report, but not private) and "private" (family, health, personal
+errands, device testing), relabel the owner's yes rows, and score two tasks — private vs the rest (the
+classifier's spec), and this-site work vs the rest (what the owner wants in a site report). **Resolved
+2026-09-29 — see below; at the time this paragraph was written, no work_class verdict was acted on.**
+
+**Update, 2026-09-29 — the relabel above has happened.** The owner did a three-way relabel of the 68
+owner rows previously labelled non-work or unsure: A this site's work, B other work (client meetings,
+sales, FieldSight's own product work), C private (family, health, personal errands, testing the
+recording device). This split those 68 rows into 55 private and 13 other-work. work_class labels now
+mean "private = yes" (A and B both score "no"), matching the deployed classifier's own spec
+(`lambda_extract_session.py` rule 2b: non_work = personal/off-work talk) rather than the wider
+"anything that isn't this site's job" reading used above. Totals after the relabel: 112 rows, 78 yes
+(private) / 34 no, eligible. The work_class question set (`scripts/jev_eval/questions.py`) was reworded
+to the same "private" definition before any Jev call was made against these rows. Scored against the
+now-private-only "yes": of the owner's 55 private rows, the classifier said "work" on 21 — these are
+errors under the classifier's own spec, not a definitional artifact.
+
 ---
 
 ## 4. Privacy conditions in force
@@ -398,6 +441,90 @@ known, unfixed gap in the masking coverage, not a defect introduced by this eval
 whatever text is exported for any set. Recorded here so it is not silently rediscovered during
 the disagreement read (Section 6).
 
+**Fix wave 6 (2026-09-29) — common-word gate on the generic pass:** measured on the real
+exported data, the generic pass was masking almost every title-case topic heading it saw
+("Material Procurement" x11, "Scaffolding Safety" x9, "Slab Rebar" x7, "Concrete Testing",
+"Device Testing", "Route Planning", "Subcontractor Access", "Crane Restrictions", "Design
+Issues", "Electrical Cables", "Weekly Schedule", "Recording Device", "General Reflection",
+"Anything Else", ...), while correctly catching real names of the same shape ("Hector Eggar",
+"Paul Smith", "Liang Min", "Yang Ming"). A generic candidate is now masked only if NEITHER
+token is a known common word: a built-in module constant covering the words above, or a
+per-run corpus the runner (`scripts/jev_shadow_eval.py collect_common_words`) derives once from
+every selected row's own allowlisted title/summary text, before any state is built — shared
+uniformly by broad, decomposed, control and `--dry-run`. Known person aliases are unaffected: a
+known alias is always masked even if it is also a common word.
+
+**Fix round 1 (2026-09-29, controller correction) — the corpus must count a LITERAL lowercase
+occurrence, not any occurrence lowercased on the way in.** The first version of `extract_words`
+lowercased every token regardless of its original casing, so a name mentioned several times but
+always capitalised (e.g. "Hector Eggar") still entered the corpus as "hector"/"eggar" and was
+treated as common — measured on the real data, this suppressed essentially every generic-pass
+mask, including the real names the pass exists to catch (181 masks before the fix, 0 remaining
+after the flawed first version — a privacy regression, not an improvement). `extract_words` now
+adds a word to the corpus only if it occurs somewhere in the text already written all-lowercase
+(`str.islower()`); a token seen only Capitalised or ALL-CAPS contributes nothing. Re-measured on
+`scripts/fixtures/jev_eval/{threads,work_class}.jsonl` (189 rows, 447 texts) with the corrected
+rule: **64 generic-pass masks remain** (down from the 181-mask baseline with no common-word gate
+at all). All five names the owner asked to confirm are masked: Hector Eggar (x4), Hector Egan
+(x2), Paul Smith (x4), Liang Min (x3), Yang Ming (x2). The top of the remaining list is a mix of
+plausible names/proper nouns ("Southern Lakes" x4, "Cook Brothers" x4, "Deon Jay's" x3, "Roofing
+Hub" x3, "Lake Bradford" x2, "Houses Lotto" x2, "Food Prices" x2, "Zealand Politics" x2, "Mount
+Roskill", "Shortland Street", "Real Estate", "Press Conference", ...) rather than construction
+topic headings — i.e. the fix now targets headings specifically and leaves plausible names (and
+some ambiguous proper-noun phrases like show/place names) masked, which is the intended trade.
+**Accepted residual, unchanged in shape by this correction:** if a word already has a genuine
+lowercase occurrence elsewhere in the run's own text and is also a real surname (the module
+docstring's "Wood Ward" example), that name is left unmasked — this is now a much narrower gap
+than the flawed first version's near-total one, but it is not zero. See the module docstring for
+the exact rule and `extract_words`'s own docstring for the corrected mechanism.
+
+**Fix round 2 (2026-09-29, controller correction) — the corpus must never vouch for a word that
+is also a common name; contraction fragments must never enter the corpus either.** An independent
+review found round 1's residual larger than intended: a corpus word that was ALSO a common NZ/AU
+given name or surname (e.g. "wood", "price", "crane", "will", "may") could still suppress masking
+of that same word used as a real name elsewhere — round 1 only checked HOW a word was written
+(literal lowercase occurrence), never WHAT KIND of word it was. Two fixes:
+- `_COMMON_NAME_WORDS` — a fixed module constant (superset of `_COMMON_WORD_ALIASES`, plus common
+  NZ/AU given names/surnames that double as ordinary words: will, may, mark, grant, bill, rose,
+  june, april, august, jack, pat, sue, drew, dawn, hope, joy, faith, ray, frank, rich, don, jesse,
+  young, brown, black, white, green, king, hill, hall, bell, cook, wood, park, long, price, day,
+  short, field, fields, glass, steel, case, crane, ward, stone, lane, page, fox, wolf, lee, ng,
+  chan) — is now subtracted from the CORPUS-DERIVED words only, before they are unioned with
+  `_BUILT_IN_COMMON_WORDS`. The fixed heading list itself is untouched, EXCEPT that "crane" was
+  removed from it (it doubled as a surname and, unlike a corpus word, could never be excluded for
+  a specific run); "Crane Restrictions" stays protected regardless because "restrictions" alone
+  is already enough to protect a two-token candidate.
+- `extract_words` now recognises a contraction ("don't", "we're", "Jay's", ...) as ONE token
+  including its apostrophe suffix and drops it entirely, rather than letting the bare
+  `[A-Za-z]+` word regex split "don't" into "don" and "t" — "don" is itself in
+  `_COMMON_NAME_WORDS`, so an ordinary contraction anywhere in the corpus text used to be able to
+  suppress masking of a real "Don Smith".
+
+**Re-measured on the real data** (`scripts/fixtures/jev_eval/{threads,work_class}.jsonl`, same
+189 rows / 447 texts): **71 generic-pass masks remain** (up from round 1's 64, since the
+name-word exclusion correctly re-masks phrases round 1 had wrongly protected: "Wood Ties" (x3),
+"Golf Day" (x2), "Balustrade Glass" (x1), "Pegasus Steel" (x1) — 7 occurrences across 4 phrases,
+matching the reviewer's own ~6-occurrence estimate). All five names checked in round 1 remain
+masked (Hector Eggar x4, Hector Egan x2, Paul Smith x4, Liang Min x3, Yang Ming x2), and the
+round-2 probe names hold too: no masked phrase in the real data has "Jesse", "Will", "Price" or
+"Crane" as the token that WOULD have been wrongly protected — "Jesse Workflow" and "Crane
+Restrictions" both remain unmasked, but correctly so (protected via "workflow"/"restrictions",
+the OTHER token in each pair, not via "Jesse"/"Crane"), so neither is evidence the name-word gate
+would fail if such a pairing existed. "Material Procurement" and the other topic headings from
+fix wave 6 stay kept.
+
+**Residual wording correction (per controller ruling): round 1's "a little under-masking of
+names that collide with a common word" was NOT an accurate description for name-shaped common
+words** — under round 1, ANY corpus recurrence of a name-shaped common word suppressed masking of
+that name EVERYWHERE in the run, which is not "a little." After round 2, the residual is
+narrower and specific: a word can still enter the corpus (and suppress the generic pass) only if
+it is common, has a genuine literal-lowercase occurrence elsewhere in the run's text, AND is
+NEITHER in `_BUILT_IN_COMMON_WORDS` NOR in `_COMMON_NAME_WORDS` — e.g. "hub" (not a common given
+name/surname) recurring lower-case would still protect an unlucky real "Cody Hub" the same way it
+protects "Roofing Hub". This is a materially smaller, rarer gap than round 1's, which is why it
+gets its own description rather than reusing round 1's phrasing. See the module docstring's
+round-2 correction for the exact rule.
+
 **New residual gap, introduced by the stoplist (I1.3):** a real person surnamed after one of the
 stoplist words (e.g. a person literally named "Roof") would not be masked by the generic pass —
 the stoplist cannot distinguish "Roof Jenkins, a person" from "Roof Framing, a task". This is the
@@ -441,13 +568,80 @@ behaviour of the same rules):**
 
 ## 5. Results
 
-*(filled after the first real run)*
+**Run:** 2026-09-29, code at `develop` a5bf0ab (scores.json `provenance.git_sha` came out `None` because the
+worktree was a detached checkout — recorded here by hand), route `openrouter.ai` Decisions endpoint, model
+`~typesafe/jev-latest`, provider `openrouter-decisions`, temperature n/a, 2 runs per arm, run 2 after run 1.
+Smoke test first (3 calls). Latency median ~380-390 ms per call; total cost about US$0.03 for ~1,600 calls.
+Failed rows: threads controls 2 per run (no donor with a distinct earlier topic — guard working);
+work_class baseline 1 (no stored classifier score). Nothing else failed.
+
+**Verdicts under the pre-registered rule: threads — NOT ADOPTED; work_class — NOT ADOPTED.**
+
+### threads (86 rows: 27 yes / 59 no; baseline = stored TF-IDF score, threshold 0.25)
+
+| arm | accuracy | precision | recall | held-out coverage @p95 |
+|---|---|---|---|---|
+| baseline | 0.55 | 0.33 | 0.44 | 0 |
+| Jev broad | 0.65 | 0.41 | 0.26 | 0 |
+| Jev decomposed | 0.67 | 0.48 | 0.41 | 0 |
+
+Reasons (decomposed): control check **fail**; held-out precision floor not met. No arm — Jev or the
+current matcher — reaches an operating point with 95% precision, so nothing could be auto-accepted.
+Paired Brier favours Jev decomposed (difference −0.036, 90% CI [−0.061, −0.013]); stability 0/4 flips.
+
+**Same-month subset (51 rows: 24 yes / 27 no), per §3a:** verdict also NOT ADOPTED; accuracy baseline 0.35,
+Jev broad 0.37, Jev decomposed 0.35 — both the matcher and Jev are at or below chance once the easy
+cross-month negatives are removed. Jev's lead on the full set comes from those easy negatives.
+
+### work_class (112 rows: 78 private / 34 not; baseline = stored classifier, P(non_work) threshold 0.5)
+
+| arm | accuracy | precision | recall | held-out coverage @p95 (held-out precision) |
+|---|---|---|---|---|
+| baseline (classifier) | 0.63 | 0.88 | 0.55 | 0.19 (1.00) |
+| Jev broad | 0.79 | 0.84 | 0.86 | 0.26 (0.86) |
+| Jev decomposed | 0.78 | 0.80 | 0.91 | 0.18 (0.90) |
+
+Reasons (decomposed): control check **fail**; Clopper–Pearson floor not met (held-out precision 0.90 on too
+few accepted rows). Coverage difference 0.0, 90% CI [−0.23, 0.04]. Paired Brier favours Jev decomposed
+(−0.022, CI [−0.038, −0.006]). Stability 1/5 flips.
+
+**Two readings the verdict does not capture (descriptive, not decision inputs):**
+- The deployed classifier finds only **55% of the conversations the owner marks private**; Jev finds 86–91%
+  at similar precision. On the owner's own relabel, the classifier called 21 of 55 private owner rows
+  "work". That is a privacy-relevant miss rate in the current gate, independent of Jev.
+- The work_class control fails for a reason that is partly the control's design: replacing the title with
+  "General discussion." does not make a topic look *less* private — with the work signal removed, Jev leans
+  toward "private" (control recall 0.99). The pre-registered control therefore cannot show a drop for this
+  set. This is recorded, not re-ruled: the rule stands as written for this run.
 
 ---
 
 ## 6. Disagreement read
 
-*(filled after the first real run)*
+Done by the owner on 2026-09-29, in the private labelling page. Items: every row where Jev-decomposed
+(run 1, stored v0 composite at 0.5) and the baseline (at its deployed threshold) decided differently,
+ranked by Jev's distance from 0.5 — threads 17 (all there were), work_class the top 20 of 41. For each, the
+owner judged only whether their own label was right.
+
+| set | owner's label sides with | label confirmed | label may be wrong | unclear |
+|---|---|---|---|---|
+| threads | Jev (14) | 14 | 0 | 0 |
+| threads | baseline (3) | 3 | 0 | 0 |
+| work_class | Jev (4) | 3 | 1 | 0 |
+| work_class | baseline (16) | 13 | 2 | 1 |
+
+Reading:
+- **threads:** where the two disagree, Jev is right 14 of 17 times and every label stands. Jev ranks
+  follow-ups better than the TF-IDF score, but not well enough to clear any 95%-precision operating point
+  (§5) — the verdict stands.
+- **work_class:** Jev's most confident disagreements are mostly *false* "private" calls — the owner sides
+  with the classifier on 16 of the 20. So Jev's higher recall (§5) comes with confidently wrong private
+  flags at the top of its range, which is exactly what the precision floor exists to catch. The descriptive
+  finding that the deployed classifier misses many private conversations stands (it rests on the 41
+  disagreements and the relabel, not on this top-20), but Jev is not a drop-in fix for it.
+- 3 owner labels were marked "may be wrong" and 1 "unclear" (all work_class). Flipping them cannot change
+  either verdict (the failing conditions are the control check and the precision floor); they are left as
+  labelled and noted here.
 
 ---
 
@@ -469,4 +663,39 @@ behaviour of the same rules):**
 
 ## 8. Recommendation
 
-*(filled after the first real run)*
+- **threads — not adopted.** Neither Jev nor the TF-IDF matcher can pick follow-ups reliably; within one
+  month both are at chance. Keep the matcher's proposals behind human confirmation as today. Jev is not the
+  lever here; the account hygiene in §3a (one account used across tests and several sites) is a larger
+  source of wrong threads than the model.
+- **work_class — not adopted as a replacement or augment under the rule.** Two follow-ups are worth more
+  than the verdict: (1) the deployed classifier misses ~45% of private conversations on the owner's labels —
+  a prompt/threshold review of rule 2b is warranted on its own, with the "when unsure choose work" bias as
+  the first suspect; (2) if Jev is reconsidered as a privacy signal, it needs a control designed for
+  "private" (e.g. a donor work topic's title, not a neutral sentence) and more accepted rows to clear the
+  Clopper–Pearson floor — that would be a new pre-registration, not an edit to this one.
+- **programme_match — not measured** (0 labels).
+- **Track C:** on this evidence Jev does not become the decision centre; if used at all, it is a pluggable
+  extra signal behind `decision_records`, starting with work_class privacy.
+
+### Follow-up list (owner, 2026-09-29) — not started
+
+1. **Fix the work_class classifier's missed private conversations.** The deployed classifier
+   (`lambda_extract_session.py` rule 2b) found 55% of owner-marked private talk. **Blocked on cleaner
+   data — do not start with today's labels.** Today's set is too narrow to support a prompt change that
+   reaches every customer: most rows come from the owner's own mixed-use accounts (self-testing and several
+   sites on one account, §3a). Before starting:
+   - labels from recorders who use their account for one job only, across at least three users and three
+     sites, not only the owner's accounts;
+   - at least 30 private and 30 not-private rows under the three-way definition used here (A this site's
+     work / B other work / C private), labelled with the date visible;
+   - a fresh baseline measurement of the current rule 2b on that set, run twice (noise floor) before any
+     prompt edit.
+   Then: change the rule (first suspect: "when unsure, choose work"), re-measure on the same rows, and ship
+   only if private recall rises without work rows being flagged private (the owner's reports must not lose
+   real work). The prompt change reaches prod through `main`, so the owner approves it.
+2. **Account hygiene for thread matching.** One account used across tests and several sites breaks
+   threading more than any model (§3a, §5). Worth a product rule or a warning before any further threads
+   work.
+3. **If Jev is ever re-evaluated** for work_class privacy, it needs a new pre-registration with a control
+   built for "private" (a donor work title, not a neutral sentence) and enough accepted rows for the
+   Clopper–Pearson floor.

@@ -350,9 +350,12 @@ def _propose_where_else_this_voice_was_heard(conn, company_id, voiceprint_id) ->
     must not be reported as a failure to store their voice. The log line is the record.
     """
     try:
+        # Questions cluster around this company's own floor once it has one, and around
+        # the default until then -- the same boundary `decide_name` names against.
         found = label_group_candidates.candidates_for_person(
             conn, company_id, voiceprint_id,
-            since_hours=PROPOSAL_WINDOW_HOURS, limit=PROPOSAL_LIMIT)
+            since_hours=PROPOSAL_WINDOW_HOURS, limit=PROPOSAL_LIMIT,
+            boundary=company_floor(conn, company_id))
         rows = found.get("candidates") or []
         n = speaker_name_proposals.propose(conn, company_id, voiceprint_id, rows)
         # Three numbers, because they answer three different questions and collapsing them
