@@ -92,6 +92,22 @@ def apply_impact(conn, finding_id, *, task_id, impact_severity, impact_note,
     ).fetchone()
 
 
+def get_stable_id(conn, finding_id):
+    """The stable_id of one finding row (Track B Task 6a). The matcher
+    (src/lambda_programme_matcher.py) only ever carries the ROW id --
+    `findings.id`, via the match_requests/ artifact's `finding_id` field
+    (lambda_item_writer's `collected_topics` never puts `stable_id` in it)
+    -- because it is deliberately non-VPC (BUG-36, no Aurora egress) and
+    cannot resolve id -> stable_id itself. This in-VPC writer resolves it
+    here, in SQL, before writing a programme_impact decision record.
+
+    None when the finding row no longer exists -- nightly supersession or
+    a re-extraction racing in between the matcher's read and this write
+    (same posture as `apply_impact`), or a malformed id."""
+    row = conn.execute("SELECT stable_id FROM findings WHERE id=%s", (finding_id,)).fetchone()
+    return row[0] if row else None
+
+
 def list_for_topics(conn, topic_ids) -> list[dict]:
     """Batched read of findings for a set of topic ids -- mirrors
     topics.list_topics_for_date's action_items/safety_observations children
@@ -101,6 +117,50 @@ def list_for_topics(conn, topic_ids) -> list[dict]:
         f"SELECT {_COLS} FROM findings WHERE topic_id = ANY(%s) ORDER BY created_at",
         (list(topic_ids),),
     ).fetchall()
+
+
+def list_for_carry_forward(conn, topic_ids, site_id) -> list[dict]:
+    """Findings on a set of topics -- new OR retired -- shaped for Track B Task 4's
+    carry_forward.match: `id`, `text` (the finding's `observation`), `stable_id` plus a
+    computed `human_touched`. Batched with ANY(%s); scoped to `site_id` (Ruling R9) so a
+    stray topic id can never pull another tenant's -- or another site's -- rows into the
+    match pool. Named `list_for_carry_forward` rather than reusing `list_for_topics` above:
+    that function already has callers reading a different column set for a different job
+    (rendering a topic's children), and this one's `human_touched`/`text` shape is specific
+    to the matcher.
+
+    human_touched = status <> 'open' -- findings carry no updated_by column (unlike action
+    items), so a status flip is the only footprint a person's decision leaves on the row.
+    For a freshly-inserted row (the "new" pool) this is always False.
+    """
+    if not topic_ids:
+        return []
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, topic_id, observation AS text, stable_id, status, audience, "
+        "(status <> 'open') AS human_touched "
+        "FROM findings WHERE topic_id = ANY(%s) AND site_id = %s",
+        (list(topic_ids), site_id),
+    ).fetchall()
+
+
+def carry_identity(conn, new_id, old_row) -> None:
+    """Carry `old_row`'s stable identity onto the new finding `new_id` that replaced it
+    (Track B Task 4). Always moves stable_id/carried_from; when the old row was
+    human-touched, also moves status/audience -- the only two columns a human can set on a
+    finding. `kind`/`payload` always come from the fresh extraction and the impact_* columns
+    are re-derived downstream by the programme matcher -- neither is ever copied here."""
+    if old_row.get("human_touched"):
+        conn.execute(
+            "UPDATE findings SET stable_id=%s, carried_from=%s, status=%s, audience=%s "
+            "WHERE id=%s",
+            (old_row["stable_id"], old_row["id"], old_row["status"], old_row["audience"],
+             new_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE findings SET stable_id=%s, carried_from=%s WHERE id=%s",
+            (old_row["stable_id"], old_row["id"], new_id),
+        )
 
 
 def count_by_domain(conn, company_id, domain, date_from, date_to,

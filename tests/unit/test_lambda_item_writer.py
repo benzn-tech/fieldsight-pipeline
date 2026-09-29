@@ -140,9 +140,14 @@ def wired(monkeypatch):
     # Same default as site_for_media: no app tag unless a test supplies one, so
     # the pre-existing membership-fallback expectations stay meaningful.
     monkeypatch.setattr(iw.recordings, "site_for_day", lambda *a, **k: None)
-    monkeypatch.setattr(iw.topics, "delete_topics_for_source", lambda *a, **k: 0)
+    monkeypatch.setattr(iw.topics, "supersede_topics_for_source", lambda *a, **k: [])
     monkeypatch.setattr(iw.topics, "upsert_topic", lambda *a, **k: {"id": "topic-uuid-0"})
     monkeypatch.setattr(iw.findings, "insert_findings", lambda *a, **k: [])
+    # Track B Task 6a: decision_records.insert hits conn.cursor(...), which
+    # FakeConn does not model (it only implements .execute()/.transaction())
+    # -- stubbed inert by default here, same reasoning as topics/findings
+    # above. Tests that care about a specific decision record override this.
+    monkeypatch.setattr(iw.decision_records, "insert", lambda *a, **k: {"id": "dr-stub"})
     # match_request.emit does a real s3.put_object -- FakeS3 above only
     # implements get_object, so stub emit to a no-op by default here;
     # tests that care about the emit call override this explicitly.
@@ -199,8 +204,8 @@ def test_site_bridge_fallback_and_skip(wired):
             resolve_calls.append((report, user_folder)) or None,
     )
     write_calls = []
-    wired.setattr(iw.topics, "delete_topics_for_source",
-                  lambda *a, **k: write_calls.append("delete_topics"))
+    wired.setattr(iw.topics, "supersede_topics_for_source",
+                  lambda *a, **k: write_calls.append("supersede_topics") or [])
     wired.setattr(iw.topics, "upsert_topic",
                   lambda *a, **k: write_calls.append("upsert_topic") or {"id": "x"})
 
@@ -217,19 +222,20 @@ def test_site_bridge_fallback_and_skip(wired):
 # Idempotency — source-key delete before insert
 # ---------------------------------------------------------------------------
 
-def test_idempotent_delete_before_insert(wired):
+def test_idempotent_supersede_before_insert(wired):
     order = []
-    wired.setattr(iw.topics, "delete_topics_for_source",
-                  lambda *a, **k: order.append("delete_topics"))
+    wired.setattr(iw.topics, "supersede_topics_for_source",
+                  lambda *a, **k: order.append("supersede_topics") or [])
     wired.setattr(iw.topics, "upsert_topic",
                   lambda *a, **k: order.append("upsert_topic") or {"id": "topic-uuid-0"})
 
     iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
 
-    assert order == ["delete_topics", "upsert_topic"]
+    assert order == ["supersede_topics", "upsert_topic"]
 
     # and it must be keyed on THIS extraction's key
-    wired.setattr(iw.topics, "delete_topics_for_source", lambda conn, key: order.append(key))
+    wired.setattr(iw.topics, "supersede_topics_for_source",
+                  lambda conn, key, run: order.append(key) or [])
     order.clear()
     iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
     assert order[0] == EXTRACTION_KEY
@@ -381,6 +387,119 @@ def test_item_writer_sanitizes_garbage_work_class_fields(wired):
 
 
 # ---------------------------------------------------------------------------
+# Track B Task 6a -- one work_class decision_records row per topic that
+# actually has a (sanitized) work_class.
+# ---------------------------------------------------------------------------
+
+def test_work_class_decision_provider_and_model_from_extraction(wired):
+    """Ruling R15: provider/model on the record are the EXTRACTION's own
+    `llm_provider`/`llm_model` fields (stamped by lambda_extract_session),
+    not a guessed or hardcoded vendor."""
+    captured = []
+    wired.setattr(iw.decision_records, "insert",
+                  lambda conn, **kw: captured.append(kw) or {"id": "dr-1"})
+
+    topic = make_extraction()["topics"][0]
+    topic.update(work_class="work", work_confidence=0.85, is_mixed=False)
+    wired.setattr(
+        iw, "_s3_client",
+        FakeS3({EXTRACTION_KEY: json.dumps(make_extraction(
+            topics=[topic], llm_provider="qwen", llm_model="qwen3.8-flash"))}),
+    )
+
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    work_class_records = [c for c in captured if c["kind"] == "work_class"]
+    assert len(work_class_records) == 1
+    r = work_class_records[0]
+    assert r["subject_type"] == "topic"
+    assert r["subject_stable_id"] == "topic-uuid-0"
+    assert r["object_ref"] is None
+    assert r["provider"] == "qwen"
+    assert r["model"] == "qwen3.8-flash"
+    assert r["output"] == {"work_class": "work", "work_confidence": 0.85, "is_mixed": False}
+    assert r["score"] == 0.85
+    assert r["threshold"] is None
+    assert r["auto_outcome"] == "accepted"
+
+
+def test_work_class_decision_falls_back_when_extraction_has_no_llm_keys(wired):
+    """An extraction written before Ruling R15 landed has neither
+    `llm_provider` nor `llm_model` -- provider falls back to 'unknown'
+    (never a guessed vendor name), model stays NULL."""
+    captured = []
+    wired.setattr(iw.decision_records, "insert",
+                  lambda conn, **kw: captured.append(kw) or {"id": "dr-1"})
+
+    topic = make_extraction()["topics"][0]
+    topic.update(work_class="work", work_confidence=0.85, is_mixed=False)
+    # make_extraction() itself carries no llm_provider/llm_model key.
+    wired.setattr(
+        iw, "_s3_client",
+        FakeS3({EXTRACTION_KEY: json.dumps(make_extraction(topics=[topic]))}),
+    )
+
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    r = [c for c in captured if c["kind"] == "work_class"][0]
+    assert r["provider"] == "unknown"
+    assert r["model"] is None
+
+
+def test_work_class_decision_not_recorded_when_absent(wired):
+    """The default fixture extraction has no work_class at all -- no
+    decision record, not one with a NULL work_class in it."""
+    captured = []
+    wired.setattr(iw.decision_records, "insert",
+                  lambda conn, **kw: captured.append(kw) or {"id": "dr-1"})
+
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert [c for c in captured if c["kind"] == "work_class"] == []
+
+
+def test_work_class_decision_not_recorded_when_sanitized_to_none(wired):
+    """A garbage LLM value ('personal') sanitizes to NULL work_class
+    upstream (see test_item_writer_sanitizes_garbage_work_class_fields) --
+    the decision record must follow the SANITIZED value, not the raw one."""
+    captured = []
+    wired.setattr(iw.decision_records, "insert",
+                  lambda conn, **kw: captured.append(kw) or {"id": "dr-1"})
+
+    topic = make_extraction()["topics"][0]
+    topic.update(work_class="personal", work_confidence="high", is_mixed=True)
+    wired.setattr(
+        iw, "_s3_client",
+        FakeS3({EXTRACTION_KEY: json.dumps(make_extraction(topics=[topic]))}),
+    )
+
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert [c for c in captured if c["kind"] == "work_class"] == []
+
+
+def test_work_class_decision_failure_does_not_abort_topic_write(wired, caplog):
+    """Ruling R10 posture: a bug in the decision-record write must DEGRADE,
+    never ABORT the topic/finding/action-item write it rides alongside."""
+    def boom(conn, **kw):
+        raise RuntimeError("boom")
+    wired.setattr(iw.decision_records, "insert", boom)
+
+    topic = make_extraction()["topics"][0]
+    topic.update(work_class="work", work_confidence=0.85, is_mixed=False)
+    wired.setattr(
+        iw, "_s3_client",
+        FakeS3({EXTRACTION_KEY: json.dumps(make_extraction(topics=[topic]))}),
+    )
+
+    with caplog.at_level("WARNING"):
+        result = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert result == {"skipped": False, "topics": 1}
+    assert "work_class decision record not stored" in caplog.text
+
+
+# ---------------------------------------------------------------------------
 # Result shape
 # ---------------------------------------------------------------------------
 
@@ -417,25 +536,25 @@ def test_user_bridge_miss_does_not_skip(wired):
 
 # ---------------------------------------------------------------------------
 # I-3 regression test: the advisory lock is acquired (on this extraction's
-# key) before delete_topics_for_source/upsert_topic -- serializes concurrent
-# writers on the same key, since delete-then-insert isn't concurrency-safe
+# key) before supersede_topics_for_source/upsert_topic -- serializes concurrent
+# writers on the same key, since supersede-then-insert isn't concurrency-safe
 # and upsert_topic is INSERT-only.
 # ---------------------------------------------------------------------------
 
-def test_advisory_lock_acquired_before_delete_and_insert(wired):
+def test_advisory_lock_acquired_before_supersede_and_insert(wired):
     conn = FakeConn()
     wired.setattr(iw, "get_connection", lambda *a, **k: conn)
 
     order = []
-    wired.setattr(iw.topics, "delete_topics_for_source",
-                  lambda *a, **k: order.append("delete_topics"))
+    wired.setattr(iw.topics, "supersede_topics_for_source",
+                  lambda *a, **k: order.append("supersede_topics") or [])
     wired.setattr(iw.topics, "upsert_topic",
                   lambda *a, **k: order.append("upsert_topic") or {"id": "topic-uuid-0"})
 
     iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
 
     assert conn.executed[0] == ("SELECT pg_advisory_xact_lock(hashtext(%s))", (EXTRACTION_KEY,))
-    assert order == ["delete_topics", "upsert_topic"]
+    assert order == ["supersede_topics", "upsert_topic"]
 
 
 # ---------------------------------------------------------------------------
@@ -449,8 +568,8 @@ def test_report_already_ingested_supersedes_late_extraction(wired):
     wired.setattr(iw, "get_connection", lambda *a, **k: conn)
 
     write_calls = []
-    wired.setattr(iw.topics, "delete_topics_for_source",
-                  lambda *a, **k: write_calls.append("delete_topics"))
+    wired.setattr(iw.topics, "supersede_topics_for_source",
+                  lambda *a, **k: write_calls.append("supersede_topics") or [])
     wired.setattr(iw.topics, "upsert_topic",
                   lambda *a, **k: write_calls.append("upsert_topic") or {"id": "x"})
 
@@ -1301,6 +1420,118 @@ def test_a_failure_says_so_and_keeps_the_topics(wired, monkeypatch, caplog):
         res = iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
     assert "failed" in _logged(caplog)
     assert res == {"skipped": False, "topics": 1}
+
+
+# ---------------------------------------------------------------------------
+# Track B Task 6a -- one decision_records row per SCORED thread candidate
+# (score >= _THREAD_RECORD_FLOOR), not just the one that became a
+# suggestion. thread_match.find_candidates itself is stubbed (like
+# threads.candidate_corpus/upsert_suggestion above it) so the scores in
+# play are exact, not whatever the real lexical scorer happens to produce.
+# ---------------------------------------------------------------------------
+
+def test_thread_candidates_record_winner_accepted_others_rejected(wired, monkeypatch):
+    monkeypatch.setattr(iw, "SUGGEST_THREADS", True)
+    monkeypatch.setattr(iw.threads, "candidate_corpus", lambda *a, **k: [
+        {"id": "older-1", "report_date": "2026-07-01", "site_id": "site-1",
+         "title": "t1", "summary": "", "open_items": 2, "thread_id": None},
+        {"id": "older-2", "report_date": "2026-07-02", "site_id": "site-1",
+         "title": "t2", "summary": "", "open_items": 1, "thread_id": "thread-9"},
+    ])
+    # older-1 clears the real accept bar (thread_match.MIN_SCORE=0.25);
+    # older-2 clears only the lower record floor (_THREAD_RECORD_FLOOR=0.10)
+    # -- a candidate the matcher genuinely considered and turned down.
+    scored = [
+        {"id": "older-1", "match_score": 0.40, "gap_days": 5, "thread_id": None},
+        {"id": "older-2", "match_score": 0.15, "gap_days": 3, "thread_id": "thread-9"},
+    ]
+    monkeypatch.setattr(iw.thread_match, "find_candidates", lambda *a, **k: scored)
+    monkeypatch.setattr(iw.threads, "upsert_suggestion", lambda conn, tid, **k: {"id": "s-1"})
+    captured = []
+    wired.setattr(iw.decision_records, "insert",
+                  lambda conn, **kw: captured.append(kw) or {"id": "dr-1"})
+
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    thread_records = [c for c in captured if c["kind"] == "thread"]
+    assert len(thread_records) == 2
+    by_object_ref = {c["object_ref"]: c for c in thread_records}
+    winner = by_object_ref["older-1"]
+    assert winner["auto_outcome"] == "accepted"
+    assert winner["score"] == 0.40
+    assert winner["threshold"] == iw.thread_match.MIN_SCORE
+    assert winner["provider"] == "lexical"
+    assert winner["model"] is None
+    assert winner["subject_type"] == "topic"
+    assert winner["subject_stable_id"] == "topic-uuid-0"
+    loser = by_object_ref["older-2"]
+    assert loser["auto_outcome"] == "rejected"
+    assert loser["score"] == 0.15
+    # Global Constraint: no transcript-derived text (title/summary) in output.
+    assert set(loser["output"]) == {"match_score", "gap_days", "thread_id"}
+
+
+def test_thread_candidates_below_record_floor_are_never_scored(wired, monkeypatch):
+    """find_candidates itself drops anything below its own min_score floor
+    -- this only pins that item-writer passes _THREAD_RECORD_FLOOR (not
+    thread_match.MIN_SCORE) as that floor, so a candidate in
+    [0.10, 0.25) is still visible to record, not silently excluded."""
+    monkeypatch.setattr(iw, "SUGGEST_THREADS", True)
+    monkeypatch.setattr(iw.threads, "candidate_corpus", lambda *a, **k: [
+        {"id": "older", "report_date": "2026-07-01", "site_id": "site-1",
+         "title": "t", "summary": "", "open_items": 1},
+    ])
+    captured_kwargs = {}
+
+    def fake_find_candidates(topic, corpus, **kwargs):
+        captured_kwargs.update(kwargs)
+        return []
+
+    monkeypatch.setattr(iw.thread_match, "find_candidates", fake_find_candidates)
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert captured_kwargs.get("min_score") == iw._THREAD_RECORD_FLOOR
+
+
+def test_thread_candidates_none_scored_writes_no_records(wired, monkeypatch):
+    monkeypatch.setattr(iw, "SUGGEST_THREADS", True)
+    monkeypatch.setattr(iw.threads, "candidate_corpus", lambda *a, **k: [
+        {"id": "older", "report_date": "2026-07-01", "site_id": "site-1",
+         "title": "t", "summary": "", "open_items": 1},
+    ])
+    monkeypatch.setattr(iw.thread_match, "find_candidates", lambda *a, **k: [])
+    captured = []
+    wired.setattr(iw.decision_records, "insert",
+                  lambda conn, **kw: captured.append(kw) or {"id": "dr-1"})
+
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    assert captured == []
+
+
+def test_thread_candidates_already_resolved_winner_all_rejected(wired, monkeypatch):
+    """threads.upsert_suggestion returns None when the exact proposal was
+    already resolved by a human (already_resolved) -- nothing NEW was
+    proposed this pass, so every scored candidate, including the would-be
+    winner, records 'rejected'."""
+    monkeypatch.setattr(iw, "SUGGEST_THREADS", True)
+    monkeypatch.setattr(iw.threads, "candidate_corpus", lambda *a, **k: [
+        {"id": "older", "report_date": "2026-07-01", "site_id": "site-1",
+         "title": "t", "summary": "", "open_items": 1, "thread_id": None},
+    ])
+    monkeypatch.setattr(iw.thread_match, "find_candidates", lambda *a, **k: [
+        {"id": "older", "match_score": 0.40, "gap_days": 5, "thread_id": None},
+    ])
+    monkeypatch.setattr(iw.threads, "upsert_suggestion", lambda conn, tid, **k: None)
+    captured = []
+    wired.setattr(iw.decision_records, "insert",
+                  lambda conn, **kw: captured.append(kw) or {"id": "dr-1"})
+
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    thread_records = [c for c in captured if c["kind"] == "thread"]
+    assert len(thread_records) == 1
+    assert thread_records[0]["auto_outcome"] == "rejected"
 
 
 # ---------------------------------------------------------------------------

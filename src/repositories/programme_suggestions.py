@@ -131,9 +131,14 @@ def mark_stale(conn, suggestion_id) -> dict | None:
     """Marks a suggestion `stale`. Called ONLY from confirm_suggestion
     (lambda_org_api.py), at confirm/review time, in two cases: (1) the
     target task_id is no longer present in programme.json, or (2) the
-    row's topic_id is NULL — its source topic was deleted/superseded via
-    ON DELETE SET NULL (topics.delete_topics_for_source/_prefix) before
-    anyone reviewed it (Fable review #5).
+    row's source topic is gone from confirm's point of view — either
+    `topic_id IS NULL` (ON DELETE SET NULL, a genuine physical delete via
+    topics.delete_topics_for_source/_prefix) or `topic_id` is still set but
+    now names a SUPERSEDED row (Track B Task 3: re-extraction marks a topic
+    instead of removing it, so `topic_id` going NULL is no longer what a
+    re-extracted suggestion's staleness looks like — `topics.get_topic`
+    returning None, via deleted_predicates.visible_topics_predicate, is)
+    (Fable review #5).
 
     NOT called proactively at supersession time, despite what an earlier
     version of this docstring implied: marking a still-pending row stale

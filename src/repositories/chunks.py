@@ -192,12 +192,20 @@ def restore_chunks_for_batch(conn, batch_id) -> int:
             "chunk_type, chunk_text, embedding, metadata, created_at")
     # `topic_id` is resolved through `topics` instead of copied, and the reason is a clock:
     # `report_chunks.topic_id` is `REFERENCES topics(id) ON DELETE SET NULL`, but the
-    # archive is `LIKE report_chunks`, which copies no foreign keys. While a chunk waits in
-    # the archive the nightly ingest hard-deletes and rebuilds that day's topics
-    # (`delete_topics_for_source`, whose own comment says "always"), and nothing nulls the
-    # archived copy. Re-inserting it then violates the FK and fails the whole undelete —
-    # `revert_batch` with it. Delete works tonight; restore would break one nightly run
-    # later, which is the worst possible schedule for a promise of reversibility.
+    # archive is `LIKE report_chunks`, which copies no foreign keys. Before Track B Task 3,
+    # while a chunk waited in the archive the nightly ingest could hard-delete and rebuild
+    # that day's topics (`delete_topics_for_source`, whose own comment said "always"), and
+    # nothing nulled the archived copy. Re-inserting it then violated the FK and failed the
+    # whole undelete — `revert_batch` with it. Delete worked tonight; restore would break one
+    # nightly run later, which is the worst possible schedule for a promise of reversibility.
+    #
+    # Task 3 retargeted the nightly ingest's report-key clear to
+    # `supersede_topics_for_source`, which marks a row instead of removing it, so the topic a
+    # chunk was archived against normally still exists (superseded, not gone) by the time a
+    # restore runs. This resolution stays regardless — belt-and-suspenders for whatever
+    # DOES still physically remove a topics row (`delete_topics_for_source[_prefix]` remain
+    # in this repo for a caller that means an actual, irreversible delete), so a restore
+    # never fails the whole undelete transaction on a dangling FK.
     #
     # The scalar subquery yields NULL for a topic that is gone: not a workaround, but
     # exactly what ON DELETE SET NULL would have done had the row never left the table.

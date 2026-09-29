@@ -45,6 +45,55 @@ def get_action_item(conn, action_item_id) -> dict | None:
         return None
 
 
+def list_for_carry_forward(conn, topic_ids, site_id) -> list[dict]:
+    """Action items on a set of topics -- new OR retired -- shaped for Track B Task 4's
+    carry_forward.match: `id`, `text`, `stable_id` plus a computed `human_touched`.
+    Batched with ANY(%s), same pattern as findings.list_for_topics; scoped to `site_id`
+    (Ruling R9) so a stray topic id can never pull another tenant's -- or another site's --
+    rows into the match pool.
+
+    human_touched = updated_by IS NOT NULL OR status <> 'open' -- either half of a person's
+    footprint on the row: a status flip with no updated_by (a pre-0017 row, or a write that
+    predates the audit column) must still count, and an updated_by with status still 'open'
+    (priority/deadline edited without closing it) must too. For a freshly-inserted row
+    (the "new" pool) this is always False -- exactly the answer wanted, since nothing has
+    touched it yet.
+    """
+    if not topic_ids:
+        return []
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, topic_id, text, stable_id, status, priority, deadline, "
+        "deadline_text, responsible, updated_by, updated_at, audience, "
+        "(updated_by IS NOT NULL OR status <> 'open') AS human_touched "
+        "FROM action_items WHERE topic_id = ANY(%s) AND site_id = %s",
+        (list(topic_ids), site_id),
+    ).fetchall()
+
+
+def carry_identity(conn, new_id, old_row) -> None:
+    """Carry `old_row`'s stable identity onto the new action item `new_id` that replaced it
+    (Track B Task 4). Always moves stable_id/carried_from; when the old row was
+    human-touched, also moves the fields a person can set on it (PATCH's own _EDITABLE, plus
+    the updated_by/updated_at audit pair and audience) so a tick, a reassignment or a
+    deadline edit survives the re-extraction that reworded the row's text around it. A row
+    nobody touched carries only its identity -- its status/priority/etc stay whatever the
+    fresh extraction just wrote, because there is nothing human to preserve."""
+    if old_row.get("human_touched"):
+        conn.execute(
+            "UPDATE action_items SET stable_id=%s, carried_from=%s, status=%s, priority=%s, "
+            "deadline=%s, deadline_text=%s, responsible=%s, updated_by=%s, updated_at=%s, "
+            "audience=%s WHERE id=%s",
+            (old_row["stable_id"], old_row["id"], old_row["status"], old_row["priority"],
+             old_row["deadline"], old_row["deadline_text"], old_row["responsible"],
+             old_row["updated_by"], old_row["updated_at"], old_row["audience"], new_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE action_items SET stable_id=%s, carried_from=%s WHERE id=%s",
+            (old_row["stable_id"], old_row["id"], new_id),
+        )
+
+
 def update_action_item_fields(conn, action_item_id, fields, updated_by) -> dict | None:
     """Whitelisted partial update + last-writer audit (spec §3.6). Only keys
     in _EDITABLE are written, in the caller's own dict order (fields is

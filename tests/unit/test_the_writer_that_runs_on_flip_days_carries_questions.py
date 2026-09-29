@@ -52,6 +52,10 @@ def _capture(wired, topics):
         lambda conn, site_id, report_date, title, **kw:
             captured.append(kw) or {"id": "topic-uuid-0"},
     )
+    # This file is about the jsonb path (upsert_topic's `open_questions=` kwarg) only --
+    # Track B Task 5's row insert is a SEPARATE call the FakeConn here has no `.cursor()` for.
+    wired.setattr(iw.topic_decisions, "insert_decisions", lambda *a, **k: [])
+    wired.setattr(iw.topic_questions, "insert_questions", lambda *a, **k: [])
     iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
     return captured
 

@@ -1710,6 +1710,11 @@ def programme_wired(wired):
     wired.setattr(org.programme_import, "record_version",
                   lambda conn, pid, **kw: store.record_version(conn, pid, **kw))
     fake.programme_store = store
+    # confirm_suggestion's Track B Task 3 check (a suggestion whose topic is superseded is
+    # treated like topic_id IS NULL) calls this for every suggestion whose topic_id is set --
+    # default it to "still live" so every OTHER confirm test here, which does not care about
+    # this check, is unaffected; a test that DOES care overrides it to return None.
+    wired.setattr(org.topics, "get_topic", lambda conn, topic_id: {"id": topic_id})
     return wired, fake
 
 
@@ -2602,6 +2607,146 @@ def test_reject_already_decided_409(programme_wired):
     assert res["statusCode"] == 409
 
 
+# ---------------------------------------------------------------------------
+# Track B Task 6b — decision_records.set_human_outcome wired onto confirm/
+# reject. The seam this closes: set_human_outcome only stamps the RIGHT row
+# if the endpoint passes exactly the (kind, subject_type, subject_stable_id,
+# object_ref) 6a's writer stored for a programme_match verdict -- see
+# task-6a-report.md note #3: subject_stable_id is the suggestion's OWN
+# topic_id (no resolution step, unlike programme_impact's finding case) and
+# object_ref is the suggestion's OWN task_id.
+# ---------------------------------------------------------------------------
+
+def test_confirm_stamps_decision_record_confirmed(programme_wired):
+    wired, fake = programme_wired
+    row = _suggestion_row()  # suggested_status=completed, suggested_progress=100
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    fake.programme_store.seed_tasks(
+        [{"doc_id": "t-1", "status": "in_progress", "progress_pct": 40}])
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda conn, sid, state, decided_by, applied_status=None, applied_progress=None:
+                      {**row, "state": state})
+    wired.setattr(org.programme, "write_programme",
+                  lambda s3c, bucket, site_id, doc_, updated_at: doc_)
+    stamped = {}
+    wired.setattr(org.decision_records, "set_human_outcome",
+                  lambda conn, **kw: (stamped.update(kw) or 1))
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
+    assert res["statusCode"] == 200
+    assert stamped == {"kind": "programme_match", "subject_type": "topic",
+                       "subject_stable_id": "topic-1", "object_ref": "t-1",
+                       "outcome": "confirmed", "actor": "u-uuid-1"}
+
+
+def test_confirm_with_reviewer_override_stamps_edited(programme_wired):
+    """The auto-suggestion said completed/100; the reviewer typed in_progress/75
+    -- that is 'edited', not 'confirmed', regardless that decide() still succeeded."""
+    wired, fake = programme_wired
+    row = _suggestion_row()
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    fake.programme_store.seed_tasks(
+        [{"doc_id": "t-1", "status": "in_progress", "progress_pct": 40}])
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda conn, sid, state, decided_by, applied_status=None, applied_progress=None:
+                      {**row, "state": state})
+    wired.setattr(org.programme, "write_programme",
+                  lambda s3c, bucket, site_id, doc_, updated_at: doc_)
+    stamped = {}
+    wired.setattr(org.decision_records, "set_human_outcome",
+                  lambda conn, **kw: (stamped.update(kw) or 1))
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm",
+        body={"status": "in_progress", "progress_pct": 75}), None)
+    assert res["statusCode"] == 200
+    assert stamped["outcome"] == "edited"
+
+
+def test_confirm_silent_progress_coercion_also_counts_as_edited(programme_wired):
+    """The never-lower-progress guard can silently raise applied_progress above
+    what the model suggested (test_confirm_never_lowers_progress_on_auto_value
+    below covers the guard itself) -- when it does, the FINAL applied value still
+    differs from what was suggested, so this is 'edited' even though the reviewer
+    sent no explicit override."""
+    wired, fake = programme_wired
+    row = _suggestion_row(suggested_status="in_progress", suggested_progress=60,
+                          task_status_before="in_progress", task_progress_before=80)
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    fake.programme_store.seed_tasks(
+        [{"doc_id": "t-1", "status": "in_progress", "progress_pct": 80}])
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda conn, sid, state, decided_by, applied_status=None, applied_progress=None:
+                      {**row, "state": state})
+    wired.setattr(org.programme, "write_programme",
+                  lambda s3c, bucket, site_id, doc_, updated_at: doc_)
+    stamped = {}
+    wired.setattr(org.decision_records, "set_human_outcome",
+                  lambda conn, **kw: (stamped.update(kw) or 1))
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["applied_progress"] == 80          # never lowered
+    assert stamped["outcome"] == "edited"
+
+
+def test_confirm_decision_record_failure_does_not_fail_the_confirm(programme_wired):
+    """R10/R14 posture: a decision_records failure must never turn the human's
+    successful confirm into an error response."""
+    wired, fake = programme_wired
+    row = _suggestion_row()
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    fake.programme_store.seed_tasks(
+        [{"doc_id": "t-1", "status": "in_progress", "progress_pct": 40}])
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda conn, sid, state, decided_by, applied_status=None, applied_progress=None:
+                      {**row, "state": state})
+    wired.setattr(org.programme, "write_programme",
+                  lambda s3c, bucket, site_id, doc_, updated_at: doc_)
+
+    def boom(conn, **kw):
+        raise RuntimeError("decision_records is down")
+    wired.setattr(org.decision_records, "set_human_outcome", boom)
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["confirmed"] is True
+
+
+def test_reject_stamps_decision_record_rejected(programme_wired):
+    wired, fake = programme_wired
+    row = _suggestion_row()
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda conn, sid, state, decided_by, applied_status=None, applied_progress=None:
+                      {**row, "state": state})
+    stamped = {}
+    wired.setattr(org.decision_records, "set_human_outcome",
+                  lambda conn, **kw: (stamped.update(kw) or 1))
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/reject"), None)
+    assert res["statusCode"] == 200
+    assert stamped == {"kind": "programme_match", "subject_type": "topic",
+                       "subject_stable_id": "topic-1", "object_ref": "t-1",
+                       "outcome": "rejected", "actor": "u-uuid-1"}
+
+
+def test_reject_decision_record_failure_does_not_fail_the_reject(programme_wired):
+    wired, fake = programme_wired
+    row = _suggestion_row()
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda conn, sid, state, decided_by, applied_status=None, applied_progress=None:
+                      {**row, "state": state})
+
+    def boom(conn, **kw):
+        raise RuntimeError("decision_records is down")
+    wired.setattr(org.decision_records, "set_human_outcome", boom)
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/reject"), None)
+    assert res["statusCode"] == 200
+    assert body_of(res) == {"rejected": True}
+
+
 def test_confirm_never_lowers_progress_on_auto_value(programme_wired):
     # suggested_progress (60) is below the task's current progress_pct (80)
     # and the reviewer did NOT explicitly send progress_pct -> keep 80.
@@ -2701,6 +2846,45 @@ def test_confirm_retracted_topic_marks_stale_409(programme_wired):
         "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
     assert res["statusCode"] == 409
     assert staled == {"sid": "sugg-1"}
+    assert write_calls["n"] == 0
+    assert decide_calls["n"] == 0
+
+
+def test_confirm_superseded_topic_marks_stale_409(programme_wired):
+    """Track B Task 3, fix round 1: re-extraction now SUPERSEDES a topic instead of
+    deleting it, so `topic_id` stays set (this is the common case a re-extraction produces
+    -- unlike test_confirm_retracted_topic_marks_stale_409's topic_id=None, which is what an
+    actual physical delete still looks like). confirm must treat "topic_id set, but
+    topics.get_topic (a superseded row is invisible to it) returns None" exactly like the
+    NULL case: mark_stale, 409, and -- the part a naive fix could get wrong -- never reach
+    the programme task lookup/write."""
+    wired, fake = programme_wired
+    row = _suggestion_row(topic_id="topic-1")
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    # The superseded topic itself: get_topic (visible_topics_predicate underneath) must
+    # return None for it, same as for a topic that no longer exists at all.
+    wired.setattr(org.topics, "get_topic", lambda conn, topic_id: None)
+    staled = {}
+    wired.setattr(org.programme_suggestions, "mark_stale",
+                  lambda conn, sid: (staled.update(sid=sid) or {**row, "state": "stale"}))
+    task_lookups = {"n": 0}
+    wired.setattr(org.programme_tasks, "get_task_by_doc_id",
+                  lambda *a, **k: task_lookups.update(n=task_lookups["n"] + 1))
+    write_calls = {"n": 0}
+    wired.setattr(org.programme, "write_programme",
+                  lambda *a, **k: write_calls.update(n=write_calls["n"] + 1))
+    decide_calls = {"n": 0}
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda *a, **k: decide_calls.update(n=decide_calls["n"] + 1))
+
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
+
+    assert res["statusCode"] == 409
+    assert "superseded" in body_of(res).get("error", "").lower()
+    assert staled == {"sid": "sugg-1"}
+    assert task_lookups["n"] == 0, (
+        "must never reach the programme task lookup once the source topic is gone")
     assert write_calls["n"] == 0
     assert decide_calls["n"] == 0
 
@@ -6246,6 +6430,59 @@ def test_classification_feedback_bad_classifier_verdict_400(wired):
     assert res["statusCode"] == 400 and called == []
 
 
+# ---------------------------------------------------------------------------
+# Track B Task 6b — decision_records.set_human_outcome wired onto
+# /classification-feedback. kind='work_class', subject_type='topic',
+# subject_stable_id=topic_id, object_ref=None (matches 6a's
+# `_record_work_class_decision`); confirm_non_work -> confirmed,
+# reject_is_work / missed_personal -> rejected (the human is overturning
+# the classifier's call in both of the latter two, non_work and work
+# respectively).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("verdict,expected_outcome", [
+    ("confirm_non_work", "confirmed"),
+    ("reject_is_work", "rejected"),
+    ("missed_personal", "rejected"),
+])
+def test_classification_feedback_stamps_decision_record(wired, verdict, expected_outcome):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.content, "get_content_row",
+                  lambda conn, table, rid: {"company_id": "c-uuid-1", "site_id": SITE_ID,
+                                            "author_user_id": "u-uuid-1"})
+    wired.setattr(org.memberships, "caller_site_roles", lambda conn, uid: {SITE_ID: "site_manager"})
+    wired.setattr(org.classification_feedback, "append_feedback",
+                  lambda conn, cid, tid, v, **k: {"id": "f-1"})
+    wired.setattr(org.topics, "set_work_class", lambda conn, tid, wc: {"id": tid, "work_class": wc})
+    wired.setattr(org, "_enqueue_content_reindex", lambda conn, table, rid: None)
+    stamped = {}
+    wired.setattr(org.decision_records, "set_human_outcome",
+                  lambda conn, **kw: (stamped.update(kw) or 1))
+    res = org.lambda_handler(make_event("POST", "/api/org/classification-feedback",
+                                        body={"topic_id": "t-9", "human_verdict": verdict}), None)
+    assert res["statusCode"] == 201
+    assert stamped == {"kind": "work_class", "subject_type": "topic",
+                       "subject_stable_id": "t-9", "object_ref": None,
+                       "outcome": expected_outcome, "actor": "u-uuid-1"}
+
+
+def test_classification_feedback_decision_record_failure_does_not_fail_the_request(wired):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.content, "get_content_row",
+                  lambda conn, table, rid: {"company_id": "c-uuid-1", "site_id": SITE_ID,
+                                            "author_user_id": "u-uuid-1"})
+    wired.setattr(org.memberships, "caller_site_roles", lambda conn, uid: {SITE_ID: "site_manager"})
+    wired.setattr(org.classification_feedback, "append_feedback",
+                  lambda conn, cid, tid, v, **k: {"id": "f-1"})
+
+    def boom(conn, **kw):
+        raise RuntimeError("decision_records is down")
+    wired.setattr(org.decision_records, "set_human_outcome", boom)
+    res = org.lambda_handler(make_event("POST", "/api/org/classification-feedback",
+                                        body={"topic_id": "t-9", "human_verdict": "confirm_non_work"}), None)
+    assert res["statusCode"] == 201
+
+
 # ---- Task 9 review follow-up: revert endpoint + feedback deny coverage ----
 def test_revert_redaction_ok(wired):
     wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
@@ -7131,6 +7368,79 @@ def test_the_queue_never_widens_past_the_callers_sites(threads_wired):
     res = org.lambda_handler(make_event("GET", "/api/org/threads/suggestions"), None)
     assert res["statusCode"] == 200
     assert OTHER_SITE_ID not in seen["sites"]
+
+
+# ---------------------------------------------------------------------------
+# Track B Task 6b — decision_records.set_human_outcome wired onto thread
+# confirm/reject. The seam: `topic_thread_suggestions` carries `thread_id
+# XOR parent_topic_id` (migration 0032's CHECK), but 6a's writer
+# (`lambda_item_writer._suggest_threads_inner`) always stamped object_ref as
+# the earlier TOPIC's id, never a thread id -- so the parent_topic_id branch
+# reads it straight off the row, and the thread_id branch has to ask
+# decision_records for the object_ref its own writer already recorded
+# (`_thread_decision_object_ref`).
+# ---------------------------------------------------------------------------
+
+def test_confirm_anchoring_stamps_the_parent_topic_id_as_object_ref(threads_wired):
+    """_thread_sugg()'s default shape: parent_topic_id='tp-old', thread_id=None."""
+    stamped = {}
+    threads_wired.setattr(org.decision_records, "set_human_outcome",
+                          lambda conn, **kw: (stamped.update(kw) or 1))
+    obj_ref_calls = []
+    threads_wired.setattr(org.decision_records, "object_ref_for_accepted",
+                          lambda conn, kind, subject_type, subject_stable_id:
+                              obj_ref_calls.append((kind, subject_type, subject_stable_id)))
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/threads/suggestions/sg-1/confirm"), None)
+    assert res["statusCode"] == 200
+    assert stamped == {"kind": "thread", "subject_type": "topic",
+                       "subject_stable_id": "tp-new", "object_ref": "tp-old",
+                       "outcome": "confirmed", "actor": "u-uuid-1"}
+    # The parent_topic_id branch never needs to ask decision_records for it.
+    assert obj_ref_calls == []
+
+
+def test_confirm_into_existing_thread_resolves_object_ref_from_decision_records(threads_wired):
+    """thread_id branch: the row carries only the thread's id, so object_ref
+    must come from the accepted decision record the writer already wrote."""
+    threads_wired.setattr(org.threads, "get_suggestion",
+                          lambda conn, sid: _thread_sugg(thread_id="th-9", parent_topic_id=None))
+    obj_ref_calls = []
+    threads_wired.setattr(org.decision_records, "object_ref_for_accepted",
+                          lambda conn, kind, subject_type, subject_stable_id:
+                              (obj_ref_calls.append((kind, subject_type, subject_stable_id))
+                               or "tp-earlier-candidate"))
+    stamped = {}
+    threads_wired.setattr(org.decision_records, "set_human_outcome",
+                          lambda conn, **kw: (stamped.update(kw) or 1))
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/threads/suggestions/sg-1/confirm"), None)
+    assert res["statusCode"] == 200
+    assert obj_ref_calls == [("thread", "topic", "tp-new")]
+    assert stamped["object_ref"] == "tp-earlier-candidate"
+    assert stamped["subject_stable_id"] == "tp-new"
+
+
+def test_reject_thread_stamps_decision_record_rejected(threads_wired):
+    stamped = {}
+    threads_wired.setattr(org.decision_records, "set_human_outcome",
+                          lambda conn, **kw: (stamped.update(kw) or 1))
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/threads/suggestions/sg-1/reject"), None)
+    assert res["statusCode"] == 200
+    assert stamped == {"kind": "thread", "subject_type": "topic",
+                       "subject_stable_id": "tp-new", "object_ref": "tp-old",
+                       "outcome": "rejected", "actor": "u-uuid-1"}
+
+
+def test_thread_confirm_decision_record_failure_does_not_break_the_confirm(threads_wired):
+    def boom(conn, **kw):
+        raise RuntimeError("decision_records is down")
+    threads_wired.setattr(org.decision_records, "set_human_outcome", boom)
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/threads/suggestions/sg-1/confirm"), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["confirmed"] is True
 
 
 # ---------------------------------------------------------------------------

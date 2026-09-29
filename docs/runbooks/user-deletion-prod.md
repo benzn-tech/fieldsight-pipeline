@@ -17,6 +17,16 @@ object is deleted and no database row is dropped.** The raw data stays for analy
 hiding is a set of tombstone rows in `redactions`, and one row per delete action carries a
 `batch_id` so a single delete can be undone as a unit.
 
+Track B's `decision_records` (the AI-verdict/human-outcome audit trail used by the eval
+export, `decision_records.list_for_eval`) is hidden the same way: by a read-time predicate
+(`deleted_predicates.visible_decision_records_predicate`, Ruling R7), never by deleting the
+row. It has no `topic_id` column of its own, so the predicate resolves each record's
+subject to a topic first (directly for `subject_type='topic'`, via the child table's
+`stable_id` for `finding`/`action_item`/`decision`/`question`) and hides it exactly when
+that topic is deletion-tombstoned — a topic merely *superseded* by a later extraction pass
+does NOT hide its decision records, on purpose: the eval export's whole point is to survive
+re-extraction.
+
 ## 1. The marker — how to find everything this feature ever did
 
 The marker is a column, not a feature flag. A flag that is turned off leaves no way to find
@@ -98,7 +108,7 @@ the non-VPC lambdas read those and have no database.
    ```
    Record the returned `batch_id`.
 3. **After — check every surface, not just the one you deleted from.** Each of these has
-   its own code path, and covering four of five is how a leak ships:
+   its own code path, and covering five of six is how a leak ships:
    - the Evidence list and the topic detail
    - **search** (search for a phrase you know is in that recording)
    - **Ask / RAG** (ask a question only that recording answers)
@@ -106,6 +116,21 @@ the non-VPC lambdas read those and have no database.
    - **media playback** and any presigned URL you had open — it must 404, not 403
    - the **nightly report email** for that day (the generator is non-VPC and reads the S3
      mirror, so this is the surface most likely to lag)
+   - **`decision_records`** (Track A's eval export, `decision_records.list_for_eval`) --
+     query it for the deleted topic's company/kind and confirm the row(s) for this
+     recording's topics are gone; this one has no UI, so it is the easiest of the six to
+     forget to check
+
+   ```sql
+   -- run as part of step 3's decision_records check
+   SELECT id, kind, subject_type, subject_stable_id, created_at
+   FROM decision_records
+   WHERE company_id = '<company-id>' AND created_at >= now() - interval '1 day'
+   ORDER BY created_at DESC;
+   -- rows whose subject resolves to the deleted recording's topic(s) must be ABSENT from
+   -- list_for_eval's own query (the table row itself is never dropped -- see deleted_
+   -- predicates.visible_decision_records_predicate)
+   ```
 4. **Prove nothing was destroyed.**
    ```bash
    aws s3 ls s3://<bucket>/audio_segments/<Folder>/<date>/ | grep <base>   # still there

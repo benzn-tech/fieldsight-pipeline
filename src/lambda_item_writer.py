@@ -40,6 +40,16 @@ Entry point (event shape):
     S3 event notifications encode spaces as '+' and other special chars as
     %XX -- the key is ALWAYS unquote_plus'd before use.
 
+Row growth (Track B Task 3): re-extraction no longer DELETEs a source key's prior topics --
+it marks them `superseded_at` and leaves them in the table (see repositories.topics.
+supersede_topics_for_source). A session typically gets 2-4 passes (live, one or more
+mid-session live updates, final -- occasionally a group merge on top), so its topics rows
+now persist at roughly 3x the row count a single-pass session used to leave behind. At
+today's volume (hundreds of topics per site-month) that is nothing; migration 0073's
+`idx_topics_live_source` partial index (`WHERE superseded_at IS NULL`) keeps every live read
+this task touched at its pre-Task-3 cost regardless of how many superseded passes pile up
+underneath.
+
 Environment Variables:
     S3_BUCKET     - S3 bucket name (the data lake -- IngestBucketName)
     CONFIG_KEY    - S3 key for user/site mapping (default: config/user_mapping.json,
@@ -55,6 +65,7 @@ from urllib.parse import unquote_plus
 
 import boto3
 
+import carry_forward_apply
 import lambda_ingest
 import keyframe_request
 import match_request
@@ -71,9 +82,10 @@ from photo_binding import photos_for_topics as _photos_for_topics  # noqa: F401 
 import photo_rebind
 import thread_match
 from repositories import location_markers
-from repositories import (companies, findings, meeting_session, recordings,
-                          redactions,
-                          session_group, sites, threads, topics)
+from repositories import (companies, decision_records, findings, meeting_session,
+                          recordings, redactions,
+                          session_group, sites, threads, topic_decisions, topic_questions,
+                          topics)
 from repositories import speaker_intro_suggestions
 # The extraction-key shape lives in session_scope now (the read side needs the
 # SAME parse to derive session_id from topics.source_s3_key -- see that
@@ -254,21 +266,30 @@ def _group_supersedes_solo(conn, session_base, extraction):
     return "suppress"
 
 
-def _delete_member_topics(conn, artifact, delete=None):
-    """Remove each member's solo topics so the merged set is the only record.
+def _supersede_member_topics(conn, artifact, run, supersede=None) -> list[dict]:
+    """Retire each member's solo topics (Track B Task 3: supersede, not delete) so the
+    merged set is the only LIVE record.
 
-    A zero rowcount is logged loudly. The delete is keyed on source_s3_key and
-    delete_topics_for_source returns a count rather than raising, so a key that
-    differs by one character (a date derived in UTC instead of NZ, say) removes
-    nothing and leaves exactly the duplicate this whole feature exists to
-    eliminate -- with no error anywhere to notice."""
-    delete = delete or topics.delete_topics_for_source
+    A zero-row supersede is logged loudly. The call is keyed on source_s3_key and
+    supersede_topics_for_source returns the rows it retired rather than raising, so a key
+    that differs by one character (a date derived in UTC instead of NZ, say) retires nothing
+    and leaves exactly the duplicate this whole feature exists to eliminate -- with no error
+    anywhere to notice.
+
+    Returns every retired row across every member, flattened -- write_extraction_items'
+    `retired_topics` accumulator is documented as covering "every supersede call below", and
+    this is one of them; Task 4 needs a member's retired rows the same way it needs the
+    idempotent-clear's."""
+    supersede = supersede or topics.supersede_topics_for_source
+    all_retired = []
     for key in artifact.get("mergedMembers") or []:
-        n = delete(conn, key)
-        if not n:
+        retired = supersede(conn, key, run)
+        all_retired.extend(retired)
+        if not retired:
             logger.warning(
-                "group %s: %s removed 0 topics -- that member's solo items will "
+                "group %s: %s superseded 0 topics -- that member's solo items will "
                 "now duplicate the merged record", artifact.get("groupId"), key)
+    return all_retired
 
 
 def _brings_new_content(solo, merged):
@@ -729,7 +750,19 @@ def _list_pictures(prefix):
 # ----------------------------------------------------------
 # Per-extraction write (commit-per-extraction: one `with get_connection()` here)
 # ----------------------------------------------------------
-def _suggest_threads(conn, site_id, date, written):
+
+# Track B Task 6a: the floor a candidate must clear to be worth a
+# decision_records row at all -- deliberately LOWER than
+# thread_match.MIN_SCORE (the real accept bar the suggestion itself uses).
+# The point of Task 6 is that a REJECTED verdict is recorded too, so a
+# candidate the matcher genuinely considered and turned down (0.10-0.25)
+# gets a row with auto_outcome='rejected'; below 0.10 the pair barely
+# shares vocabulary at all and recording it would just be noise on every
+# site's corpus.
+_THREAD_RECORD_FLOOR = 0.10
+
+
+def _suggest_threads(conn, company_id, site_id, date, written):
     """Propose, for each topic just written, which earlier subject it is a
     restatement of.
 
@@ -748,16 +781,18 @@ def _suggest_threads(conn, site_id, date, written):
     are lost. A bare try/except here would have silently traded the day's
     real content for an optional suggestion. `conn.transaction()` nested
     inside the caller's transaction issues a SAVEPOINT, so a failure unwinds
-    only this pass."""
+    only this pass -- this is also the SAVEPOINT Track B Task 6a's
+    per-candidate decision_records writes below ride inside; they need no
+    savepoint of their own."""
     try:
         with conn.transaction():
-            return _suggest_threads_inner(conn, site_id, date, written)
+            return _suggest_threads_inner(conn, company_id, site_id, date, written)
     except Exception:
         logger.exception("thread suggestion pass failed; topics were written")
         return 0
 
 
-def _suggest_threads_inner(conn, site_id, date, written):
+def _suggest_threads_inner(conn, company_id, site_id, date, written):
     corpus = threads.candidate_corpus(conn, site_id, date,
                                       thread_match.MAX_GAP_DAYS)
     if not corpus:
@@ -781,23 +816,69 @@ def _suggest_threads_inner(conn, site_id, date, written):
         # should account for the document being scored, and on a small
         # site's corpus leaving it out visibly skews the rarity of its
         # own vocabulary. find_candidates skips it as a candidate.
-        hits = thread_match.find_candidates(new_topic, list(corpus) + [new_topic])
-        if not hits:
+        #
+        # Track B Task 6a: scored at _THREAD_RECORD_FLOOR (0.10), not the
+        # real accept bar thread_match.MIN_SCORE (0.25) -- `scored` is a
+        # strict superset of what a plain find_candidates() call would
+        # have returned (same corpus/IDF, only the floor differs, and the
+        # sort order/scores are identical), so filtering it back down to
+        # `hits` below reproduces the pre-Task-6a suggestion logic exactly.
+        scored = thread_match.find_candidates(
+            new_topic, list(corpus) + [new_topic], min_score=_THREAD_RECORD_FLOOR)
+        if not scored:
             continue
-        best = hits[0]
-        # Join the parent's thread if it has one; otherwise anchor a new
-        # thread on the parent itself. Exactly one of these, which the
-        # table's CHECK enforces.
-        if best.get("thread_id"):
-            row = threads.upsert_suggestion(
-                conn, t["topic_id"], thread_id=best["thread_id"],
-                score=best["match_score"], gap_days=best["gap_days"])
-        else:
-            row = threads.upsert_suggestion(
-                conn, t["topic_id"], parent_topic_id=best["id"],
-                score=best["match_score"], gap_days=best["gap_days"])
-        if row is not None:
-            made += 1
+        hits = [c for c in scored if c["match_score"] >= thread_match.MIN_SCORE]
+        winner = hits[0] if hits else None
+        winner_row = None
+        if winner is not None:
+            # Join the parent's thread if it has one; otherwise anchor a new
+            # thread on the parent itself. Exactly one of these, which the
+            # table's CHECK enforces.
+            if winner.get("thread_id"):
+                winner_row = threads.upsert_suggestion(
+                    conn, t["topic_id"], thread_id=winner["thread_id"],
+                    score=winner["match_score"], gap_days=winner["gap_days"])
+            else:
+                winner_row = threads.upsert_suggestion(
+                    conn, t["topic_id"], parent_topic_id=winner["id"],
+                    score=winner["match_score"], gap_days=winner["gap_days"])
+            if winner_row is not None:
+                made += 1
+        # A candidate is 'accepted' only when it is the ONE that actually
+        # became a live suggestion this pass -- `winner_row is None` means
+        # `already_resolved` (a human already answered this exact proposal;
+        # threads.upsert_suggestion docstring), so nothing new was proposed
+        # and every scored candidate here is 'rejected', winner included.
+        became_suggestion_id = winner["id"] if winner_row is not None else None
+        for c in scored:
+            # `output` carries only ids/numbers -- match_score, gap_days,
+            # the earlier topic's OWN thread_id (a uuid, not text) -- never
+            # `c`'s title/summary, which are extraction-derived text (plan
+            # Global Constraint: decision_records never carries transcript
+            # text).
+            #
+            # Track B Task 6b: `c["thread_id"]` comes straight off
+            # `candidate_corpus`'s SQL (`t.thread_id`) as a `uuid.UUID`
+            # object, not text -- `Jsonb()`'s `json.dumps` cannot serialize
+            # that and raises, which `_suggest_threads`'s SAVEPOINT then
+            # swallows as "thread suggestion pass failed", silently losing
+            # EVERY thread suggestion for every topic in this pass, not just
+            # the one candidate that triggered it. Every candidate scored
+            # against this task before Task 6b only ever had `thread_id`
+            # None (the parent_topic_id branch), so this never fired until
+            # a real candidate that already belongs to a thread was scored.
+            # str() before Jsonb() the same way object_ref is str()'d two
+            # lines above -- `None` stays `None` (json-serializable as-is).
+            decision_records.insert(
+                conn, company_id=company_id, site_id=site_id, kind="thread",
+                subject_type="topic", subject_stable_id=t["topic_id"],
+                object_ref=str(c["id"]), provider="lexical", model=None,
+                model_version=None, question_set=None, input_key=None, input_hash=None,
+                output={"match_score": c["match_score"], "gap_days": c["gap_days"],
+                        "thread_id": str(c["thread_id"]) if c.get("thread_id") else None},
+                score=c["match_score"], threshold=thread_match.MIN_SCORE,
+                auto_outcome=("accepted" if c["id"] == became_suggestion_id else "rejected"),
+            )
     logger.info("thread suggestions: %d proposed over %d candidates",
                 made, len(corpus))
     return made
@@ -850,9 +931,83 @@ def _resolve_self_responsible(action_items, name):
     return resolved
 
 
+# Both extraction writers (extract_session, extract_group) stamp
+# llm_provider/llm_model via lambda_extract_session's shared
+# _llm_identity() helper into every extraction artifact. This function
+# still calls no LLM itself -- the values ride in on the JSON it already
+# reads, so no LLM_PROVIDER/LLM_TEMPERATURE env pairing is needed on
+# ItemWriterFunction (test_the_temperature_knob_reaches_every_function_
+# that_calls_an_llm stays green because this function carries neither).
+# The fallback below covers an extraction artifact written before this
+# change was deployed, which has neither key -- 'unknown', never a
+# guessed vendor name; model stays None either way.
+_WORK_CLASS_PROVIDER_FALLBACK = "unknown"
+
+
+def _record_work_class_decision(conn, company_id, site_id, topic_id,
+                                work_class, work_confidence, is_mixed,
+                                llm_provider, llm_model):
+    """Track B Task 6a: one decision_records row for a topic's work_class
+    classification, ONLY when the topic actually has one -- `work_class`
+    here is the ALREADY-sanitized value (the caller's `_wc`: NULL for
+    anything outside the CHECK enum), so a bad/missing LLM value produces
+    no record rather than a bogus one. There is no accept/reject gate on a
+    classification like there is on a programme match -- it always exists
+    or it doesn't -- so `auto_outcome` is always 'accepted' and
+    `threshold` is always None.
+
+    `llm_provider`/`llm_model` are the extraction's OWN `llm_provider`/
+    `llm_model` fields (Ruling R15) -- already defaulted by the caller
+    (`llm_provider` to `_WORK_CLASS_PROVIDER_FALLBACK`, `llm_model` to None)
+    for an extraction written before those fields existed.
+
+    Wrapped in its OWN SAVEPOINT with a WARNING on failure, same posture as
+    Ruling R10/_suggest_threads: this write must never be able to abort the
+    topic/finding/action-item write it rides alongside."""
+    if work_class is None:
+        return
+    try:
+        with conn.transaction():
+            decision_records.insert(
+                conn, company_id=company_id, site_id=site_id, kind="work_class",
+                subject_type="topic", subject_stable_id=topic_id, object_ref=None,
+                provider=llm_provider, model=llm_model, model_version=None,
+                question_set=None, input_key=None, input_hash=None,
+                output={"work_class": work_class, "work_confidence": work_confidence,
+                        "is_mixed": is_mixed},
+                score=work_confidence, threshold=None, auto_outcome="accepted",
+            )
+    except Exception:
+        logger.warning("work_class decision record not stored for topic=%s", topic_id)
+
+
 def write_extraction_items(date, user_folder, extraction_key):
     raw = s3().get_object(Bucket=S3_BUCKET, Key=extraction_key)["Body"].read()
     extraction = json.loads(raw.decode("utf-8"))
+
+    # One extraction pass, one LLM call -- read ONCE here and reused for
+    # every topic's work_class record below. Both extraction writers
+    # (extract_session, extract_group) stamp these via _llm_identity(), so
+    # the fallback covers only an extraction artifact written before this
+    # change was deployed -- 'unknown', never a guessed vendor name.
+    # `llm_model` is already None-safe on its own (a missing key and an
+    # extraction that genuinely couldn't name its model both read the same
+    # way).
+    extraction_llm_provider = extraction.get("llm_provider") or _WORK_CLASS_PROVIDER_FALLBACK
+    extraction_llm_model = extraction.get("llm_model")
+
+    # Track B Task 3: identifies THIS pass to repositories.topics.supersede_topics_for_source
+    # (stamped onto the retired row's superseded_by_run) -- tier + extracted_at is unique per
+    # pass of a given extraction key (live/final tiers of the same key share out_key but never
+    # extracted_at; a group pass carries its own).
+    run = f"{extraction.get('tier')}:{extraction.get('extracted_at')}"
+
+    # Rows this invocation retires, across every supersede call below -- the authority-flip
+    # branch (report_source_key), this key's own idempotent clear, and (group tier) each
+    # member's own supersede via _supersede_member_topics all write into it. Not consumed
+    # here; Task 4 reads it to carry stable ids and human edits from a retired row to the
+    # row that replaced it.
+    retired_topics = []
 
     with get_connection() as conn:
         # I-3: serialize concurrent writers on this extraction key. Delete-
@@ -890,9 +1045,10 @@ def write_extraction_items(date, user_folder, extraction_key):
             # become session-scoped again. So the extraction wins. Only this
             # (date, user)'s report rows go; its chunks survive (topic_id is ON
             # DELETE SET NULL) and the next ingest of that report re-links them.
-            removed = topics.delete_topics_for_source(conn, report_source_key)
-            logger.info("%s: authority flip -- replaced %s report topic(s) from %s",
-                        extraction_key, removed, report_source_key)
+            retired_report = topics.supersede_topics_for_source(conn, report_source_key, run)
+            retired_topics.extend(retired_report)
+            logger.info("%s: authority flip -- superseded %s report topic(s) from %s",
+                        extraction_key, len(retired_report), report_source_key)
 
         company = lambda_ingest.resolve_company(conn, user_folder)
         if company is None:
@@ -980,22 +1136,29 @@ def write_extraction_items(date, user_folder, extraction_key):
             logger.info("%s: source is deleted — writing no topics", extraction_key)
             return {"skipped": "source_deleted", "key": extraction_key}
 
-        # Source-key idempotency (Phase 4a pattern): clear this extraction's
-        # prior rows before re-inserting.
+        # Source-key idempotency (Phase 4a pattern): supersede this extraction's prior rows
+        # (Track B Task 3) before re-inserting -- an UPDATE that stamps superseded_at /
+        # superseded_by_run, not a DELETE, so the row and its children (action_items,
+        # findings, ...) survive in the table. Task 2's read predicates already hide a
+        # superseded row from every display path, so a reader sees exactly what it saw when
+        # this was delete-then-insert; what changed is that nothing underneath is gone.
         #
-        # This CASCADEs `action_items`, and the check-off is `action_items.status` -- a
-        # column on the cascaded row. The live and final tiers write to the SAME key
-        # (`extract_session.out_key` is computed once; the tier rides inside the artifact),
-        # so every final pass destroys whatever a person ticked while the meeting was still
-        # running. Nothing carries it across, and re-matching by text is the wrong fix: the
+        # The check-off IS `action_items.status` -- a column on the now-superseded row. The
+        # live and final tiers write to the SAME key (`extract_session.out_key` is computed
+        # once; the tier rides inside the artifact), so every final pass retires whatever a
+        # person ticked while the meeting was still running. It is not lost -- it sits on the
+        # hidden row until Task 4 carries it forward to its replacement by stable_id -- but
+        # nothing carries it forward YET, so until Task 4 lands it is exactly as unreachable to
+        # a reader as a deleted row was. Re-matching by text is the wrong fix regardless: the
         # model rewords, merges and splits, and a confident wrong match puts a supervisor's
-        # tick on a DIFFERENT action item where nobody would ever see it.
+        # tick on a DIFFERENT action item where nobody would ever see it -- matching by
+        # stable_id (Task 4) is the only safe rule.
         #
-        # So this does not try to save it. It makes the loss VISIBLE, which is the part that
-        # was missing: a silent permanent loss and "nothing was ticked" produced identical
-        # output, and nobody can look for a problem that leaves no trace.
-        _warn_if_discarding_checkoffs(conn, extraction_key)
-        topics.delete_topics_for_source(conn, extraction_key)
+        # What used to be discarded here is now carried forward by _carry_forward_children,
+        # below the topic-insert loop (Track B Task 4) -- the count an operator needs to see
+        # is now measured AFTER matching (an actual orphan), not before (every closed item
+        # about to be superseded, most of which will find their successor).
+        retired_topics.extend(topics.supersede_topics_for_source(conn, extraction_key, run))
 
         # A MERGED artifact additionally supersedes each member's own topics.
         # BEFORE the writes below, never after: this key's own rows were just
@@ -1008,7 +1171,7 @@ def write_extraction_items(date, user_folder, extraction_key):
         # know to look -- merge_result stays NULL (it is gated on topics_n
         # below), so the group reads as still-in-flight rather than as damage.
         if extraction.get("tier") == "group" and extraction.get("topics"):
-            _delete_member_topics(conn, extraction)
+            retired_topics.extend(_supersede_member_topics(conn, extraction, run))
 
         # Task 3 (authority-flip plan) -- list the pictures prefix ONCE per
         # invocation (paginator, outside the per-topic loop below).
@@ -1083,6 +1246,10 @@ def write_extraction_items(date, user_folder, extraction_key):
 
         topics_n = 0
         collected_topics = []
+        # Track B Task 4: the durable ids of THIS pass's own topics (uuid.UUID objects, not
+        # the str(...) collected_topics uses for the match_request artifact) -- the "new"
+        # side of carry_forward's site-scoped pool, gathered once the loop below is done.
+        new_topic_ids = []
         keyframe_topics = []  # video-keyframe plan: {topic_id, time_range} of gate-passers
         for i, t in enumerate(extraction_topics):
             mapped_action_items = lambda_ingest._map_action_items(t.get("action_items"), date)
@@ -1148,6 +1315,14 @@ def write_extraction_items(date, user_folder, extraction_key):
                 # day, and it runs after this loop because it needs these rows
                 # to exist before it can bind to them.
             )
+            new_topic_ids.append(row["id"])
+            # Track B Task 6a: one work_class decision_records row per topic
+            # that actually carries one (see `_record_work_class_decision`
+            # for what "actually carries one" means and why this must not
+            # be able to abort the write below it).
+            _record_work_class_decision(
+                conn, company["id"], site["id"], row["id"], _wc, _wconf,
+                t.get("is_mixed") is True, extraction_llm_provider, extraction_llm_model)
             # Task 2 (programme-impact-link plan) -- persist this topic's
             # rich extraction findings in the SAME transaction as the topic
             # upsert (inherits the I-3 advisory lock + I-4 supersession
@@ -1157,6 +1332,20 @@ def write_extraction_items(date, user_folder, extraction_key):
             # [] -> insert_findings returns [] -> zero rows, zero crash.
             finding_rows = findings.insert_findings(
                 conn, row["id"], site["id"], t.get("findings") or [])
+
+            # Track B Task 5 -- decisions/open_questions become their OWN rows, dual-written
+            # in the SAME transaction right after findings above, alongside (not instead of)
+            # the jsonb upsert_topic already wrote a few lines up (decisions=/open_questions=
+            # kwargs). Each insert does its own blank-dropping identical to those kwargs
+            # (see topic_decisions.insert_decisions / topic_questions.insert_questions
+            # docstrings) so the row table and the jsonb mirror never disagree about which
+            # entries exist. A stable_id here is what lets Task 4's carry_forward (below)
+            # keep a decision or an answered question attached to the same commitment
+            # across a re-extraction that reworded it.
+            topic_decisions.insert_decisions(
+                conn, row["id"], site["id"], t.get("decisions") or [])
+            topic_questions.insert_questions(
+                conn, row["id"], site["id"], t.get("questions") or [])
 
             # Snapshot for the match_requests/ artifact (Task 4) -- the
             # non-VPC MatcherFunction reads this, never Aurora directly, so
@@ -1193,6 +1382,27 @@ def write_extraction_items(date, user_folder, extraction_key):
                                         "time_range": t.get("time_range")})
             topics_n += 1
 
+        # Track B Task 4 -- carry a human's tick, status, reassignment or deadline edit from
+        # a row this pass just superseded to the row that replaced it. Same transaction,
+        # after the new topics/children above are inserted (their ids are only known now)
+        # and after every supersede call this invocation made (retired_topics is complete by
+        # here: the idempotent clear, the group-member supersede, and the authority-flip
+        # branch all ran above, before this loop). A pass that retired nothing has no "old"
+        # pool and nothing to report -- the common case, and the whole reason retired_topics
+        # is checked here rather than always calling into an empty match.
+        #
+        # _carry_forward_children (carry_forward_apply.py -- final wave, Ruling R19: shared
+        # with lambda_ingest's report path) runs its own work inside a SAVEPOINT, not a bare
+        # try/except (Ruling R10): a bug there must DEGRADE (the topics/findings/action-items
+        # already inserted above still commit) rather than ABORT the whole pass -- and only a
+        # real SAVEPOINT undoes that, since Postgres aborts the enclosing transaction on any
+        # SQL error and a Python try/except cannot un-abort it. See that function's own
+        # docstring for the full reasoning (same shape as _suggest_threads above it).
+        if retired_topics:
+            carry_forward_apply._carry_forward_children(
+                conn, [t["id"] for t in retired_topics], new_topic_ids, site["id"],
+                extraction_key)
+
         # THE DAY'S PHOTOS, BOUND ONCE, AFTER THIS EXTRACTION'S TOPICS EXIST.
         # Never fatal: a rebind that turned a good extraction into a failed one
         # would be a worse bug than a misplaced thumbnail, and the day view
@@ -1205,7 +1415,7 @@ def write_extraction_items(date, user_folder, extraction_key):
 
         if collected_topics:
             if SUGGEST_THREADS:
-                _suggest_threads(conn, site["id"], date, collected_topics)
+                _suggest_threads(conn, company["id"], site["id"], date, collected_topics)
             else:
                 # Say that it is off. An env-gated feature that logs nothing
                 # when disabled is indistinguishable from one that is broken,
@@ -1314,30 +1524,6 @@ def write_extraction_items(date, user_folder, extraction_key):
 # ----------------------------------------------------------
 # Entry point — S3 event
 # ----------------------------------------------------------
-def _warn_if_discarding_checkoffs(conn, extraction_key):
-    """Log when this supersession is about to CASCADE away a ticked action item.
-
-    Counted, not prevented. Preventing it needs a rule for carrying human decisions across
-    a re-extraction, and the only safe rule is to ask a person -- which is a feature, not a
-    line in a writer. What this buys is a number that can be alarmed on and a log line that
-    names the key, so the next person to ask "did we lose ticks?" has an answer.
-
-    Never raises. A count that fails must not stop an extraction from landing.
-    """
-    try:
-        row = conn.execute(
-            "SELECT count(*) FROM action_items a JOIN topics t ON t.id = a.topic_id "
-            "WHERE t.source_s3_key = %s AND a.status <> 'open'",
-            (extraction_key,)).fetchone()
-        n = (row or [0])[0] or 0
-        if n:
-            logger.warning(
-                "supersession discards %d closed action item(s) for %s -- the live tier's "
-                "check-offs are CASCADEd by the final tier writing the same key",
-                n, extraction_key)
-    except Exception:
-        logger.exception("could not count closed action items for %s", extraction_key)
-
 def _source_is_deleted(conn, source_s3_key) -> bool:
     """Whether this extraction's source has been deleted by its owner.
 

@@ -4,7 +4,9 @@
 *.key
 
 # Claude Code local settings
-.claude/
+.claude/*
+# Shared agent definitions are repo content; everything else under .claude/ stays local.
+!.claude/agents/
 
 # Python
 __pycache__/

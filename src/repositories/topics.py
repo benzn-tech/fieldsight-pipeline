@@ -8,7 +8,12 @@ from repositories.redactions import DELETED_TOPIC_PREDICATE
 import psycopg
 from psycopg.rows import dict_row
 
-from deleted_predicates import visible_topics_predicate
+from deleted_predicates import (
+    CHILD_OF_UNDELETED_TOPIC,
+    CHILD_OF_VISIBLE_TOPIC,
+    LIVE_TOPIC_PREDICATE,
+    visible_topics_predicate,
+)
 from psycopg.types.json import Jsonb
 
 from repositories import findings
@@ -134,20 +139,11 @@ def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_k
     return topic
 
 
-# A CHILD table's exclusion correlates on the child's OWN `topic_id`, never on a `topics`
-# alias -- `FROM action_items` and `FROM topic_photos` have no such alias in scope, and
-# Postgres resolves that at analysis time: `missing FROM-clause entry for table "t"`, every
-# call, not a weak filter but a crash. Two inlined copies said `t.id` and both were live
-# (`/live-items` and the reindex) until a real database was finally asked.
-#
-# Parameterised on the alias for the same reason `deleted_predicates` exists at all: the
-# eleven inlined copies in this file are what the unused `_visible()` helper was written to
-# prevent, and a copy that names the wrong table is exactly how one drifts.
-CHILD_OF_VISIBLE_TOPIC = (
-    "NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' "
-    "AND r.target_id = {alias}.topic_id AND r.scope = 'deleted' "
-    "AND r.reverted_at IS NULL)"
-)
+# CHILD_OF_VISIBLE_TOPIC now lives in deleted_predicates (Track B Task 2): it grew a
+# supersession arm alongside its deletion arm, and every other shared predicate already
+# lives there so the two do not drift apart. Kept importable from this module under its
+# original name -- tests/unit/test_get_topic_visible_sql.py and the AST scan below both
+# reference `topics.CHILD_OF_VISIBLE_TOPIC`.
 
 
 def _visible(sql: str, alias: str = "topics") -> str:
@@ -176,6 +172,9 @@ def _visible(sql: str, alias: str = "topics") -> str:
 def list_site_topics(conn, site_id, report_date) -> list[dict]:
     return conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_TOPIC_COLS} FROM topics WHERE site_id=%s AND report_date=%s  AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = topics.id AND r.scope = 'deleted' AND r.reverted_at IS NULL)"
+        # Live arm (Track B Task 2): a superseded pass of the same source key must not show
+        # beside the pass that replaced it.
+        f" AND {LIVE_TOPIC_PREDICATE.format(alias='topics')} "
         f"ORDER BY occurred_at NULLS LAST, created_at",
         (site_id, report_date),
     ).fetchall()
@@ -277,12 +276,52 @@ def delete_topics_for_source(conn, source_s3_key) -> int:
     modes a (site, date, user_id) scope key had — Fable review C1/I1).
     Children (action_items, safety_observations, topic_photos) are removed
     automatically via ON DELETE CASCADE FKs to topics
-    (see 0003_dashboard_readmodel.sql) — no separate child deletes needed."""
+    (see 0003_dashboard_readmodel.sql) — no separate child deletes needed.
+
+    Track B Task 3: the re-extraction paths (lambda_item_writer,
+    lambda_ingest) no longer call this — they call supersede_topics_for_source
+    below, which marks a row instead of removing it, so a re-extraction no
+    longer destroys the check-offs and findings a person made against the
+    pass it replaces. This function stays for a caller that means an actual,
+    irreversible delete."""
     cur = conn.execute(
         "DELETE FROM topics WHERE source_s3_key=%s",
         (source_s3_key,),
     )
     return cur.rowcount
+
+
+def supersede_topics_for_source(conn, source_s3_key, run) -> list[dict]:
+    """Retire this source key's LIVE topics instead of deleting them (Track B Task 3).
+
+    The non-destructive sibling of delete_topics_for_source, and the one the re-extraction
+    paths use: an UPDATE that stamps `superseded_at=now()`, `superseded_by_run=run` rather
+    than a DELETE, so the row and its children (action_items, findings, topic_photos, ...)
+    survive in the table instead of being lost to the topics -> action_items CASCADE. Task
+    2's read predicates (deleted_predicates.LIVE_TOPIC_PREDICATE) already hide a superseded
+    row from every display path, so a reader sees the same thing it saw when this was a
+    DELETE; what changed is that nothing is gone underneath.
+
+    `run` is the caller's own identifier for the pass doing the retiring (lambda_item_writer
+    uses f"{tier}:{extracted_at}"; lambda_ingest uses a "report:..." form) — stamped onto
+    `superseded_by_run` so a later reader can tell which pass replaced a given row. It is
+    opaque here: this function does not parse or validate it.
+
+    `WHERE superseded_at IS NULL` makes a second call with the same key a no-op (matches
+    delete_topics_for_source's rowcount going to zero on a second DELETE) — a row already
+    retired by an earlier call, here or via supersede_topics_for_source_prefix, is left alone
+    rather than having its superseded_by_run overwritten.
+
+    Returns the RETURNING rows (id, title, summary) of every row this call retired. Task 4
+    reads them to carry stable ids and human edits from a retired row to its replacement.
+    Row order is whatever Postgres returns for an UPDATE ... RETURNING (unspecified) — a
+    caller that needs a stable order must sort."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "UPDATE topics SET superseded_at=now(), superseded_by_run=%s "
+        "WHERE source_s3_key=%s AND superseded_at IS NULL "
+        "RETURNING id, title, summary",
+        (run, source_s3_key),
+    ).fetchall()
 
 
 def list_day_topics_for_binding(conn, user_folder, report_date) -> list[dict]:
@@ -392,7 +431,10 @@ def delete_topics_for_source_prefix(conn, source_prefix) -> int:
     (e.g. 'extractions/JarleyXTrainor/...'). ESCAPE '\\' designates '\\' as
     the escape character, so '\\_'/'\\%' in the pattern are literal; only
     the trailing '%' appended here (unescaped) is a real wildcard.
-    """
+
+    Track B Task 3: lambda_ingest's nightly-report supersession now calls
+    supersede_topics_for_source_prefix below instead — kept for a caller that
+    means an actual, irreversible delete (see delete_topics_for_source)."""
     escaped = _escape_like(source_prefix)
     cur = conn.execute(
         "DELETE FROM topics WHERE source_s3_key LIKE %s ESCAPE '\\'",
@@ -401,31 +443,65 @@ def delete_topics_for_source_prefix(conn, source_prefix) -> int:
     return cur.rowcount
 
 
-def has_topics_for_source(conn, source_s3_key) -> bool:
-    """Does this exact source key have any topics?
+def supersede_topics_for_source_prefix(conn, source_prefix, run) -> list[dict]:
+    """Prefix form of supersede_topics_for_source (Track B Task 3) — the non-destructive
+    sibling of delete_topics_for_source_prefix, for lambda_ingest's nightly-report
+    supersession of that day's session-sourced (live extraction) topics. Same LIKE-wildcard
+    escaping as delete_topics_for_source_prefix (S3 user folders contain literal
+    underscores — see _escape_like's docstring) and the same `run` / return contract as
+    supersede_topics_for_source."""
+    escaped = _escape_like(source_prefix)
+    return conn.cursor(row_factory=dict_row).execute(
+        "UPDATE topics SET superseded_at=now(), superseded_by_run=%s "
+        "WHERE source_s3_key LIKE %s ESCAPE '\\' AND superseded_at IS NULL "
+        "RETURNING id, title, summary",
+        (run, escaped + '%'),
+    ).fetchall()
+
+
+def has_topics_for_source(conn, source_s3_key, *, include_superseded=False) -> bool:
+    """Does this exact source key have any (live, by default) topics?
 
     The single-key sibling of has_topics_for_source_prefix, for the multi-device
     merge: a joiner's own extraction prefix is empty after the merge deletes it,
     so the nightly defer test has to ask about the MERGED artifact's key
     instead, and that is one key rather than a prefix. Exact equality, so no
-    LIKE escaping is involved."""
+    LIKE escaping is involved.
+
+    `include_superseded=False` (Track B Task 2) is the right default for every caller today:
+    the pipeline (`_should_defer`, `_merge_already_landed`) asks this to decide whether
+    authoritative work already exists, and a superseded pass is exactly the kind of work
+    that is no longer authoritative -- the live pass, if any, is what should answer that
+    question. `include_superseded=True` is for a caller that means "ever, regardless of
+    which pass" (none does today; the kwarg exists so that caller does not have to inline
+    the predicate itself)."""
+    sql = "SELECT 1 FROM topics WHERE source_s3_key = %s"
+    if not include_superseded:
+        sql += f" AND {LIVE_TOPIC_PREDICATE.format(alias='topics')}"
     row = conn.cursor(row_factory=dict_row).execute(
-        "SELECT 1 FROM topics WHERE source_s3_key = %s LIMIT 1",
-        (source_s3_key,),
+        sql + " LIMIT 1", (source_s3_key,),
     ).fetchone()
     return row is not None
 
 
-def has_topics_for_source_prefix(conn, source_prefix) -> bool:
+def has_topics_for_source_prefix(conn, source_prefix, *, include_superseded=False) -> bool:
     """Existence check for the org-api timeline shim (authority-flip Task 4):
-    does ANY topic already exist for this (user, date) extraction prefix?
-    Used to decide report-verbatim vs. Aurora-rendered per day. Same
+    does ANY (live, by default) topic already exist for this (user, date) extraction
+    prefix? Used to decide report-verbatim vs. Aurora-rendered per day. Same
     LIKE-wildcard escaping as delete_topics_for_source_prefix (S3 user
-    folders contain literal underscores)."""
+    folders contain literal underscores).
+
+    `include_superseded=False` is the default for the same reason as
+    `has_topics_for_source`'s (Track B Task 2): after Task 3, a key with a superseded pass
+    and a live pass must still answer True here on the live pass alone -- and a day whose
+    ONLY topics under this prefix are superseded must answer False, the same as a day with
+    none, so the caller falls back correctly rather than rendering a hidden pass."""
     escaped = _escape_like(source_prefix)
+    sql = "SELECT 1 FROM topics WHERE source_s3_key LIKE %s ESCAPE '\\'"
+    if not include_superseded:
+        sql += f" AND {LIVE_TOPIC_PREDICATE.format(alias='topics')}"
     row = conn.cursor(row_factory=dict_row).execute(
-        "SELECT 1 FROM topics WHERE source_s3_key LIKE %s ESCAPE '\\' LIMIT 1",
-        (escaped + '%',),
+        sql + " LIMIT 1", (escaped + '%',),
     ).fetchone()
     return row is not None
 
@@ -441,7 +517,10 @@ def list_extraction_topics_for_day(conn, site_id, user_id, report_date) -> list[
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT id, title, occurred_at FROM topics "
         "WHERE site_id=%s AND user_id=%s AND report_date=%s "
-        "AND source_s3_key LIKE 'extractions/%%' AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = topics.id AND r.scope = 'deleted' AND r.reverted_at IS NULL) ORDER BY occurred_at",
+        "AND source_s3_key LIKE 'extractions/%%' AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = topics.id AND r.scope = 'deleted' AND r.reverted_at IS NULL) "
+        # Live arm (Track B Task 2): these ids become a defer-day chunk's topic_id, so a
+        # superseded candidate here would permanently attach new chunks to a hidden topic.
+        f"AND {LIVE_TOPIC_PREDICATE.format(alias='topics')} ORDER BY occurred_at",
         (site_id, user_id, report_date),
     ).fetchall()
 
@@ -652,7 +731,10 @@ def list_report_dates(conn, site_ids, since_date, *, author_ids=None) -> list:
     Empty site_ids -> [] without a round-trip (mirrors list_topics_for_date)."""
     if not site_ids:
         return []
-    where = "WHERE site_id = ANY(%s::uuid[]) AND report_date >= %s AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = topics.id AND r.scope = 'deleted' AND r.reverted_at IS NULL)"
+    where = ("WHERE site_id = ANY(%s::uuid[]) AND report_date >= %s AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = topics.id AND r.scope = 'deleted' AND r.reverted_at IS NULL)"
+             # Live arm (Track B Task 2): a date whose only topics are superseded must not
+             # keep offering a calendar dot / date-picker entry for the pass that was replaced.
+             f" AND {LIVE_TOPIC_PREDICATE.format(alias='topics')}")
     params = [list(site_ids), since_date]
     if author_ids is not None:
         where += " AND user_id = ANY(%s::uuid[])"
@@ -775,15 +857,21 @@ def report_date_counts(conn, site_ids, since_date, *, author_ids=None) -> list[d
 def _prefix_or_merged(merged_keys):
     """The prefix condition, widened by exact merged keys when there are any.
 
-    UNION ONLY. No deletion predicate is added here, and that is deliberate
+    UNION ONLY. No DELETION predicate is added here, and that is deliberate
     rather than an oversight: this function has never carried one -- the
     NOT EXISTS (... redactions ...) text lives in its DOCSTRING, not its SQL --
     and its callers drop deleted topics in Python afterwards.
 
-    Adding the predicate here would break the delete endpoint. delete_recordings
+    Adding the DELETION predicate here would break the delete endpoint. delete_recordings
     and undelete enumerate topics THROUGH this function in order to tombstone or
     re-hide them; a predicate makes a second delete batch enumerate nothing and
     hands the re-hide logic an empty list.
+
+    The LIVE (supersession) arm is a separate question (Track B Task 2) and is NOT added
+    here either -- it is added by `list_topics_for_source_prefix`, the caller, gated behind
+    `include_superseded`, so the SAME enumeration/display split applies to it: the
+    delete/undelete callers pass `include_superseded=True` and must still see a superseded
+    row to re-tombstone it, while a display caller must not.
 
     A merged record's rows are reached by EXACT key, never by the lead's
     identity: a graded member has author_ids active and the merged rows carry
@@ -797,7 +885,8 @@ def _prefix_or_merged(merged_keys):
     return cond
 
 
-def list_topics_for_source_prefix(conn, source_prefix, *, merged_keys=None) -> list[dict]:
+def list_topics_for_source_prefix(conn, source_prefix, *, merged_keys=None,
+                                  include_superseded=False) -> list[dict]:
     """org-api timeline shim read (authority-flip Task 4): all topics whose
     source_s3_key starts with source_prefix (typically
     f"extractions/{user_folder}/{date}/"), so the shim can render the
@@ -823,8 +912,21 @@ def list_topics_for_source_prefix(conn, source_prefix, *, merged_keys=None) -> l
     this fix makes that layering redundant-but-harmless rather than
     load-bearing (NOTE: get_topic_full, below, is a separate single-topic
     read used only by the reindex builder and is intentionally NOT changed
-    here -- out of this task's scoped call sites)."""
+    here -- out of this task's scoped call sites).
+
+    `include_superseded=False` (Track B Task 2) adds the LIVE arm on top of
+    `_prefix_or_merged`'s (still deliberately deletion-predicate-free) condition -- see that
+    function's docstring for why the two arms are split across caller/callee. The display
+    callers (org-api's timeline shim, both cross-user and own-day) keep the default: a
+    superseded pass must not render beside the pass that replaced it. The delete/undelete
+    enumeration callers pass `include_superseded=True` so a deleted recording's superseded
+    topics are tombstoned/re-hidden along with its live ones -- the enumeration must see
+    every row `superseded_at` or not, or a delete leaves a superseded copy behind that no
+    batch ever covers."""
     escaped = _escape_like(source_prefix)
+    where = f"WHERE ({_prefix_or_merged(merged_keys)})"
+    if not include_superseded:
+        where += f" AND {LIVE_TOPIC_PREDICATE.format(alias='t')}"
     topic_rows = conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_TOPIC_COLS_JOINED}, "
         f"s.name AS site_name, "
@@ -832,7 +934,7 @@ def list_topics_for_source_prefix(conn, source_prefix, *, merged_keys=None) -> l
         f"FROM topics t "
         f"LEFT JOIN sites s ON s.id = t.site_id "
         f"LEFT JOIN users u ON u.id = t.user_id "
-        f"WHERE ({_prefix_or_merged(merged_keys)}) "
+        f"{where} "
         f"ORDER BY t.time_range NULLS LAST, t.created_at, t.id",
         tuple([escaped + '%'] + ([list(merged_keys)] if merged_keys else [])),
     ).fetchall()
@@ -920,7 +1022,14 @@ def get_topic_full(conn, topic_id) -> dict | None:
     safety_observations / findings / photos children, shaped EXACTLY like a
     list_topics_for_source_prefix element so render_report_shape can consume
     [row]. Used by the per-topic reindex builder (reindex.enqueue_topic_
-    reindex). Returns None if the id is missing/malformed."""
+    reindex). Returns None if the id is missing/malformed.
+
+    UNFILTERED for supersession throughout (R3, Track B Task 2): the reindex builder must be
+    able to re-embed a topic's corrected content even mid-supersession. The photos child uses
+    `CHILD_OF_UNDELETED_TOPIC`, not `CHILD_OF_VISIBLE_TOPIC` -- the latter now also carries
+    the live arm, and photos is the one child here that predates this task with a deletion
+    filter already on it; giving it the combined constant would have silently dropped a
+    superseded topic's photos from this read, which nothing else on this function does."""
     rows = conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_TOPIC_COLS_JOINED}, "
         f"s.name AS site_name, "
@@ -952,7 +1061,7 @@ def get_topic_full(conn, topic_id) -> dict | None:
     t["photos"] = conn.cursor(row_factory=dict_row).execute(
         "SELECT id, topic_id, s3_key, caption_text FROM topic_photos "
         "WHERE topic_id = ANY(%s) AND "
-        + CHILD_OF_VISIBLE_TOPIC.format(alias="topic_photos")
+        + CHILD_OF_UNDELETED_TOPIC.format(alias="topic_photos")
         + " ORDER BY created_at", (tids,)).fetchall()
     return t
 

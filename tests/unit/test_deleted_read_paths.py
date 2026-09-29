@@ -36,6 +36,16 @@ EXEMPT = {
     "list_expired_non_work": "the retention sweep, which must still SEE deleted topics — "
                              "hiding them here would leave their vectors alive forever, "
                              "the opposite of what a deletion is for",
+    "get_topic_full": "the per-topic reindex builder's read (R3, Track B Task 2): its "
+                      "top-level topic row and its action_items/safety_observations/"
+                      "findings children carry no deletion predicate by design (see "
+                      "get_topic_visible's own comment: 'NOT get_topic_full: that one is "
+                      "WHERE t.id=%s with no visibility, company, redaction or non_work "
+                      "exclusion'). Only its photos child carries one, via "
+                      "CHILD_OF_UNDELETED_TOPIC.format(...) -- a deletion-only predicate "
+                      "that, unlike CHILD_OF_VISIBLE_TOPIC, this scan's third check does "
+                      "not recognise by name, so this is a deliberate exemption rather "
+                      "than an accidental pass.",
 }
 
 
