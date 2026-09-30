@@ -340,6 +340,14 @@ def test_dry_run_makes_no_llm_call_and_no_deployed_config_load(monkeypatch, tmp_
                          lambda env, **kw: [fake_session])
     monkeypatch.setattr(sessions_mod, "s3_client", lambda **kw: object())
 
+    # main() calls this in-process (never a subprocess), so any env var it sets on
+    # a real run would otherwise outlive this test for the rest of the pytest
+    # session. `main()` itself must not set anything on the --dry-run path (see the
+    # guard test below), but monkeypatch's own teardown is the safety net here --
+    # never rely on `main()`'s own restraint alone for a call inside a test process.
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+
     out_dir = tmp_path / "continuity_eval_runs" / "run1"  # main() refuses to write elsewhere
     plan = run_mod.main(["--env", "test", "--sessions", "1", "--shapes", "a",
                           "--out", str(out_dir), "--dry-run"])
@@ -352,6 +360,33 @@ def test_dry_run_makes_no_llm_call_and_no_deployed_config_load(monkeypatch, tmp_
     assert not (out_dir / "counts.json").exists()  # dry-run never computes counts
     written_sessions = json.loads((out_dir / "sessions.json").read_text(encoding="utf-8"))
     assert written_sessions == [fake_session]
+
+
+def test_dry_run_leaves_aws_profile_and_region_env_unchanged(monkeypatch, tmp_path):
+    """Guard against the exact CI-only leak this harness caused: main() must not set
+    AWS_PROFILE/AWS_DEFAULT_REGION on the --dry-run path, because a caller that runs
+    main() in-process (this test, or a script run's own --dry-run check) shares one
+    os.environ with every AWS client built later in the same process -- including,
+    in CI, unit tests that build a boto3 client and have no `fieldsight-deployer`
+    profile to find."""
+    monkeypatch.setattr(run_mod.llm_utils, "call_llm",
+                         lambda *a, **k: (None, "should never run"))
+    monkeypatch.setattr(run_mod, "load_deployed_llm_env", lambda *a, **k: None)
+    fake_session = {"env": "test", "user_folder": "worker1", "date": "2026-09-01",
+                     "session_base": "sess1", "n_segments": 5}
+    monkeypatch.setattr(sessions_mod, "list_candidate_sessions",
+                         lambda env, **kw: [fake_session])
+    monkeypatch.setattr(sessions_mod, "s3_client", lambda **kw: object())
+
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+
+    out_dir = tmp_path / "continuity_eval_runs" / "run2"
+    run_mod.main(["--env", "test", "--sessions", "1", "--shapes", "a",
+                  "--out", str(out_dir), "--dry-run"])
+
+    assert "AWS_PROFILE" not in os.environ
+    assert "AWS_DEFAULT_REGION" not in os.environ
 
 
 def test_planned_runs_is_pure_and_covers_every_arm_and_rep():

@@ -216,15 +216,6 @@ def main(argv=None):
     parser.add_argument("--region", default=sessions_mod.DEFAULT_REGION)
     args = parser.parse_args(argv)
 
-    # sessions_mod.s3_client() takes an explicit profile/region, but
-    # gather_session_segments / assemble_session_turns / read_existing_extraction
-    # read through lambda_extract_session's own lazily-built client (`les.s3()`),
-    # which has no profile parameter -- it only ever sees the process's ambient AWS
-    # credential chain. setdefault so an operator who already exported AWS_PROFILE
-    # is never overridden.
-    os.environ.setdefault("AWS_PROFILE", args.profile)
-    os.environ.setdefault("AWS_DEFAULT_REGION", args.region)
-
     out_dir = paths_mod.require_run_dir(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -242,6 +233,18 @@ def main(argv=None):
         for entry in plan:
             print(json.dumps(entry))
         return plan
+
+    # gather_session_segments / assemble_session_turns / read_existing_extraction
+    # (called below, on the real run only) read through lambda_extract_session's
+    # own lazily-built client (`les.s3()`), which has no profile parameter -- it
+    # only ever sees the process's ambient AWS credential chain. setdefault so an
+    # operator who already exported AWS_PROFILE is never overridden. Set here, not
+    # earlier, so --dry-run (which never touches S3 through `les.s3()`) never
+    # mutates this process's environment -- a caller that runs `main()` in-process
+    # (e.g. a test) would otherwise leak AWS_PROFILE into every later AWS call in
+    # the same process, dry-run or not.
+    os.environ.setdefault("AWS_PROFILE", args.profile)
+    os.environ.setdefault("AWS_DEFAULT_REGION", args.region)
 
     # Same mechanism as scripts/jev_eval/baseline.py: copies the DEPLOYED extract
     # session function's LLM env vars into this process and reloads llm_utils, so

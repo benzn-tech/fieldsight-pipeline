@@ -1,7 +1,5 @@
 """The continuity block is a parameter; without it the prompt is today's, and the group prompt
 never changes (spec D7, D8)."""
-import importlib
-
 import item_continuity as ic
 import lambda_extract_session as les
 
@@ -52,15 +50,18 @@ def test_block_sits_after_the_transcript_fence_and_before_the_instructions():
 def test_group_prompt_is_byte_identical_under_both_flag_states(monkeypatch):
     """DECLARE_CONTINUITY does not exist as a real switch until a later task -- this test does
     not depend on it doing anything. It proves the group prompt has no continuity text and is
-    identical regardless of what the env looks like, by reloading the module between flag
-    states and comparing the output each time."""
+    identical regardless of the flag, by toggling the module's own flag constant directly and
+    comparing the output each time.
+
+    This monkeypatches `les.DECLARE_CONTINUITY` in place rather than reloading the module: a
+    reload re-executes the module body and rebinds every attribute on the (process-wide, shared)
+    `lambda_extract_session` module object, which would also silently undo any monkeypatch another
+    test in this session had installed on it (e.g. `run_mod.les.build_extraction_prompt` in
+    tests/unit/test_continuity_eval_harness.py) -- a leak this test has no business causing just
+    to flip a flag `build_group_prompt` doesn't even read."""
     artifact, sources = _group_artifact(), _group_sources()
-    monkeypatch.setenv("DECLARE_CONTINUITY", "false")
-    importlib.reload(les)
+    monkeypatch.setattr(les, "DECLARE_CONTINUITY", False)
     off = les.build_group_prompt(artifact, sources)
-    monkeypatch.setenv("DECLARE_CONTINUITY", "true")
-    importlib.reload(les)
+    monkeypatch.setattr(les, "DECLARE_CONTINUITY", True)
     on = les.build_group_prompt(artifact, sources)
-    monkeypatch.setenv("DECLARE_CONTINUITY", "false")
-    importlib.reload(les)
     assert on == off and "PRIOR_ITEMS" not in on and "continues" not in on
