@@ -1014,6 +1014,78 @@ def test_every_function_that_reads_the_speaker_mode_is_given_it():
             f"{fn} reads the mode but the template never gives it")
 
 
+def test_the_derived_roster_switch_is_wired_in_both_environments():
+    """Not a boolean (`on`/`off`, plus a number), so the generic sweep in this file cannot
+    see either Parameter. Miss the workflow line and the Parameter can only ever hold its
+    template default (2026-09-30 plan, correction 7)."""
+    for env, path in WORKFLOWS.items():
+        overrides = _overrides(path)
+        assert "RosterDerived" in overrides, (
+            f"{env} does not pass RosterDerived; the derived roster cannot be switched off")
+        assert "RosterLookbackDays" in overrides, (
+            f"{env} does not pass RosterLookbackDays; the lookback cannot be changed "
+            f"without a code change")
+
+
+def test_the_derived_roster_defaults_to_on_everywhere():
+    """Merging this must change nothing until somebody sets a repo variable off. Both the
+    template default and both workflow fallbacks have to say `on`/`14`, or 'the merge is
+    inert' is a claim rather than a fact."""
+    t = open(TEMPLATE, encoding="utf-8").read()
+    block = _top_level_block(t, "  RosterDerived:")
+    assert "Default: 'on'" in block, "the template default is not on"
+    assert "AllowedValues: ['on', 'off']" in block, "the switch is not constrained to on/off"
+
+    lookback_block = _top_level_block(t, "  RosterLookbackDays:")
+    assert "Default: '14'" in lookback_block, "the lookback default is not 14"
+
+    for env, path in WORKFLOWS.items():
+        lines = open(path, encoding="utf-8").read().splitlines()
+        derived_line = [ln for ln in lines if "RosterDerived=" in ln][0]
+        assert "|| 'on'" in derived_line, f"{env}'s RosterDerived fallback is not on"
+        lookback_line = [ln for ln in lines if "RosterLookbackDays=" in ln][0]
+        assert "|| '14'" in lookback_line, f"{env}'s RosterLookbackDays fallback is not 14"
+
+
+def test_the_writer_is_given_the_roster_switch():
+    """The middle-to-last segment. The repository is only ever called from the writer
+    (`_profiles`), so no other function's environment should mention either variable —
+    a stray `!Ref` elsewhere would be a function reading a switch it cannot possibly act on."""
+    writer_env = _env_text("VoiceprintWriterFunction")
+    assert "ROSTER_DERIVED: !Ref RosterDerived" in writer_env
+    assert "ROSTER_LOOKBACK_DAYS: !Ref RosterLookbackDays" in writer_env
+
+    t = open(TEMPLATE, encoding="utf-8").read()
+    fn_names = re.findall(r"\n  (\w+Function):\n", t)
+    for fn in fn_names:
+        if fn == "VoiceprintWriterFunction":
+            continue
+        try:
+            env = _env_text(fn)
+        except ValueError:
+            continue  # no Environment block on this function -- nothing to check
+        assert "RosterDerived" not in env, f"{fn} reads RosterDerived but is not the writer"
+        assert "RosterLookbackDays" not in env, (
+            f"{fn} reads RosterLookbackDays but is not the writer")
+
+
+def test_the_code_defaults_match_the_template_defaults_for_the_roster_lookback():
+    """Same rule as `test_the_code_defaults_match_the_template_defaults` above, applied to
+    the writer's own module -- the writer uses double-quoted `os.environ.get(...)` calls,
+    unlike lambda_extract_session.py's single-quoted ones, so the regex accepts either."""
+    tpl = open(TEMPLATE, encoding="utf-8").read()
+    src = open(os.path.join(REPO, "src", "lambda_voiceprint_writer.py"),
+              encoding="utf-8").read()
+    pairs = [("RosterLookbackDays", "ROSTER_LOOKBACK_DAYS")]
+    for param, env in pairs:
+        block = re.search(rf"\n  {param}:\n(.*?)(?=\n  \w+:\n)", tpl, re.S).group(1)
+        tpl_default = re.search(r"Default:\s*'([^']+)'", block).group(1)
+        code_default = re.search(
+            rf"os\.environ\.get\([\"']{env}[\"'],\s*[\"']([^\"']+)[\"']\)", src).group(1)
+        assert float(tpl_default) == float(code_default), (
+            f"{env}: template default {tpl_default!r} != code default {code_default!r}")
+
+
 def _top_level_block(text, header):
     """The YAML block under `header`, ending at the next key of the SAME indent.
 
