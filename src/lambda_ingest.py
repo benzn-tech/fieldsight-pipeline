@@ -439,7 +439,13 @@ def _map_action_items(items, report_date=None):
     `report_date` anchors the relative phrasing ("Tomorrow", "Friday"). It is
     optional so existing callers keep working, but WITHOUT it only absolute
     dates resolve -- deadline_parse refuses to fall back to the server's
-    today, which would make a recording's deadlines drift on reprocessing."""
+    today, which would make a recording's deadlines drift on reprocessing.
+
+    This dict literal is a closed key set, so `item_id` (the extractor's own
+    lineage id, spec 2026-09-30) must be listed here explicitly or it is
+    silently dropped on the way to the row insert -- the report path (no
+    item_id in its input) and the email-context path (never reads this key)
+    both pass an extra None through harmlessly."""
     out = []
     for a in items or []:
         deadline = deadline_parse.resolve_deadline(a.get("deadline"), report_date)
@@ -449,6 +455,7 @@ def _map_action_items(items, report_date=None):
             "deadline": deadline,
             "deadline_text": a.get("deadline"),
             "priority": a.get("priority"),
+            "item_id": a.get("item_id"),
         })
     return out
 

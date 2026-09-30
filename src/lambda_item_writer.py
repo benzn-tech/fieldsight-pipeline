@@ -66,6 +66,7 @@ from urllib.parse import unquote_plus
 import boto3
 
 import carry_forward_apply
+import item_continuity
 import lambda_ingest
 import keyframe_request
 import match_request
@@ -1187,6 +1188,15 @@ def write_extraction_items(date, user_folder, extraction_key):
         pictures_prefix = f"users/{user_folder}/pictures/{date}/"
         photo_objects = _list_pictures(pictures_prefix)
         extraction_topics = extraction.get("topics", [])
+
+        # spec 2026-09-30 S5: an item_id the extractor emitted malformed, or reused on
+        # more than one child, is stored as NULL on EVERY copy that wore it -- carry-forward
+        # falls back to matching that row by text instead (Task 4's existing path), rather
+        # than trusting an id that cannot be resolved to exactly one row.
+        cleaned = item_continuity.clean_item_ids(extraction_topics)
+        if cleaned:
+            logger.warning("item_id: %d malformed or duplicated ids stored as NULL (key=%s)",
+                           cleaned, extraction_key)
 
         # The day's location markers, written where the READER can reach them.
         #

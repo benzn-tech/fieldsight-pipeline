@@ -63,7 +63,7 @@ def list_for_carry_forward(conn, topic_ids, site_id) -> list[dict]:
         return []
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT id, topic_id, text, stable_id, status, priority, deadline, "
-        "deadline_text, responsible, updated_by, updated_at, audience, "
+        "deadline_text, responsible, updated_by, updated_at, audience, item_id, "
         "(updated_by IS NOT NULL OR status <> 'open') AS human_touched "
         "FROM action_items WHERE topic_id = ANY(%s) AND site_id = %s",
         (list(topic_ids), site_id),

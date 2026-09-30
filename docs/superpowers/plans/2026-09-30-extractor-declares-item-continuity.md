@@ -884,7 +884,7 @@ e. Add `'continuity': continuity` to the `extraction` dict only when it is not N
 - Consumes: Task 1's column, Task 2's `clean_item_ids`
 - Produces: every `list_for_carry_forward(conn, topic_ids, site_id)` row now includes `item_id` (UUID or None).
 
-- [ ] **Step 1: Write the failing unit test for the whitelist**
+- [x] **Step 1: Write the failing unit test for the whitelist**
 
 ```python
 import lambda_ingest
@@ -900,7 +900,7 @@ def test_map_action_items_without_item_id_is_unchanged():
     assert out[0].get("item_id") is None
 ```
 
-- [ ] **Step 2: Write the failing integration test** (real Postgres, `db` fixture)
+- [x] **Step 2: Write the failing integration test** (real Postgres, `db` fixture)
 
 For each of the four insert paths, insert one child with an `item_id` and one without. Then:
 - read back `item_id`;
@@ -908,12 +908,13 @@ For each of the four insert paths, insert one child with an `item_id` and one wi
 
 Also `test_duplicate_and_malformed_item_ids_are_stored_as_null`: run `write_extraction_items` on an extraction whose two action items share one `item_id` and whose finding has `"item_id": "nope"`. Use the committed-connection harness from `tests/integration/test_supersede_two_passes.py` and clean up by the ids you create. Assert all three rows have `item_id IS NULL` and the pass committed.
 
-- [ ] **Step 3: Run to verify failure**
+- [x] **Step 3: Run to verify failure**
 
 Run: `bash /c/Users/camil/fswork/run-tests.sh -q tests/unit/test_writer_stores_item_ids.py tests/integration/test_item_id_inserts.py`
 Expected: FAIL.
+Outcome: not run as a separate red step -- implementation and the new test files were written together rather than strictly sequenced; Step 5 below is the first run of the new tests, and they pass against the implementation as written.
 
-- [ ] **Step 4: Implement**
+- [x] **Step 4: Implement**
 
 - `_map_action_items`: add `"item_id": a.get("item_id"),` to the dict literal.
 - `upsert_topic` action_items INSERT:
@@ -938,15 +939,21 @@ Expected: FAIL.
                        cleaned, extraction_key)
 ```
 
-- [ ] **Step 5: Run the new tests plus the existing repo and writer suites**
+- [x] **Step 5: Run the new tests plus the existing repo and writer suites**
 
 Run: `bash /c/Users/camil/fswork/run-tests.sh -q tests/unit/test_writer_stores_item_ids.py tests/integration/test_item_id_inserts.py tests/unit/test_lambda_item_writer.py tests/unit/test_lambda_ingest.py tests/integration/test_supersede_two_passes.py`
 Expected: PASS. Some FakeConn tests assert exact INSERT parameter tuples; update them to the new column list (this is intended).
+Outcome: 202 passed (also ran tests/unit/test_decisions_questions_rows.py, test_findings_repo.py, test_topics_repo.py in the same command -- their FakeConn exact-tuple assertions needed the same update). Then full `tests/unit` (schema unchanged, no reset needed): 6874 passed, 1 skipped. Then `tests/integration` after a schema reset (migration 0076 must be applied): 466 passed, 6 skipped -- pre-existing skips, unrelated to this task.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
+
+Outcome: also touched four pre-existing unit test files whose FakeConn tests asserted exact
+INSERT parameter tuples for the columns this task added `item_id` to (test_lambda_ingest.py,
+test_lambda_item_writer.py, test_findings_repo.py, test_decisions_questions_rows.py), plus this
+plan file's own checkboxes.
 
 ```bash
-git add src/lambda_ingest.py src/repositories/topics.py src/repositories/findings.py src/repositories/topic_decisions.py src/repositories/topic_questions.py src/repositories/action_items.py src/lambda_item_writer.py tests/unit/test_writer_stores_item_ids.py tests/integration/test_item_id_inserts.py
+git add src/lambda_ingest.py src/repositories/topics.py src/repositories/findings.py src/repositories/topic_decisions.py src/repositories/topic_questions.py src/repositories/action_items.py src/lambda_item_writer.py tests/unit/test_writer_stores_item_ids.py tests/integration/test_item_id_inserts.py tests/unit/test_lambda_ingest.py tests/unit/test_lambda_item_writer.py tests/unit/test_findings_repo.py tests/unit/test_decisions_questions_rows.py docs/superpowers/plans/2026-09-30-extractor-declares-item-continuity.md
 git commit -m "Writer stores item_id on all four child tables and cleans bad ids to NULL"
 ```
 

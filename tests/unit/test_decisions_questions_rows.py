@@ -126,14 +126,14 @@ def test_insert_decisions_dict_entry_keeps_rationale_and_decided_by():
     assert result == [_decision_row()]
     sql, params = conn.calls[0]["sql"], conn.calls[0]["params"]
     assert "INSERT INTO topic_decisions" in sql and "RETURNING" in sql
-    assert params == ("t-1", "s-1", "Use precast panels", "Faster", "Ben")
+    assert params == ("t-1", "s-1", "Use precast panels", "Faster", "Ben", None)
 
 
 def test_insert_decisions_tolerates_plain_string_entry():
     conn = FakeConn(results=[[_decision_row(rationale=None, decided_by=None)]])
     td_repo.insert_decisions(conn, "t-1", "s-1", ["Use precast panels"])
     params = conn.calls[0]["params"]
-    assert params == ("t-1", "s-1", "Use precast panels", None, None)
+    assert params == ("t-1", "s-1", "Use precast panels", None, None, None)
 
 
 def test_insert_decisions_drops_blank_dict_and_blank_string_entries():
@@ -234,7 +234,7 @@ def test_insert_questions_dict_and_string_entries_blank_dropped():
     assert len(conn.calls) == 1
     sql, params = conn.calls[0]["sql"], conn.calls[0]["params"]
     assert "INSERT INTO topic_questions" in sql and "RETURNING" in sql
-    assert params == ("t-1", "s-1", "When does the pour start?")
+    assert params == ("t-1", "s-1", "When does the pour start?", None)
     assert result == [_question_row()]
 
 
@@ -242,7 +242,7 @@ def test_insert_questions_tolerates_plain_string_entry():
     conn = FakeConn(results=[[_question_row()]])
     tq_repo.insert_questions(conn, "t-1", "s-1", ["When does the pour start?"])
     params = conn.calls[0]["params"]
-    assert params == ("t-1", "s-1", "When does the pour start?")
+    assert params == ("t-1", "s-1", "When does the pour start?", None)
 
 
 def test_questions_list_for_topics_batches():

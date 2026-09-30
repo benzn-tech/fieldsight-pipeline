@@ -421,9 +421,9 @@ def test_map_action_items_carries_raw_deadline_text_alongside_date_filter():
 
     assert mapped == [
         {"text": "Order more hard hats", "responsible": "Bob", "deadline": None,
-         "deadline_text": "Friday", "priority": "high"},
+         "deadline_text": "Friday", "priority": "high", "item_id": None},
         {"text": "Submit permit", "responsible": "Alice", "deadline": "2026-07-06",
-         "deadline_text": "2026-07-06", "priority": None},
+         "deadline_text": "2026-07-06", "priority": None, "item_id": None},
     ]
 
 
