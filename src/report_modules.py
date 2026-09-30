@@ -36,59 +36,63 @@ MAX_NOTE_CHARS = 200
 # templates keep the text they pinned (it is in report_modules from the first
 # time it was synced) and are offered the new one.
 STANDARD = [
+    # CONTENT ONLY -- what belongs, what does not, what each item carries. No
+    # word about sentences, lines, lists or tables: the format is the section's
+    # `kind`, set in the editor and written into the prompt by our own shape
+    # line. A module text that also said "one item per line" contradicted that
+    # line the moment someone switched the format, and a model given two
+    # instructions picks one differently each time (owner, 2026-09-30).
     {"key": "summary", "title": "Daily Summary", "kind": "narrative",
-     "purpose": ("The day in two to four sentences, most important first: the work that "
-                 "moved forward, then anything that changes tomorrow. If any construction "
-                 "progress was recorded, say what it was here, even if it is short. Do not "
-                 "list detail that belongs to a more specific section.")},
+     "purpose": ("The day at a glance, at most four points, most important first: the "
+                 "work that moved forward, then anything that changes tomorrow. If any "
+                 "construction progress was recorded, include it here, however brief. "
+                 "Leave the detail to the more specific sections.")},
     {"key": "work_done", "title": "Work Completed", "kind": "list",
-     "purpose": ("Work that was finished or clearly progressed today, one item per line, "
-                 "with where it happened and who did it when that was said. Only work "
-                 "that happened; plans and intentions are not completed work.")},
+     "purpose": ("Work that was finished or clearly progressed today, each with where it "
+                 "happened and who did it when that was said. Only work that happened; "
+                 "plans and intentions are not completed work.")},
     {"key": "work_not_done", "title": "Work Not Completed", "kind": "list",
      "purpose": ("Work that was planned or expected today and did not happen or did not "
-                 "finish, one item per line, each with the reason given. Work nobody "
-                 "expected today does not belong here.")},
+                 "finish, each with the reason given. Work nobody expected today does "
+                 "not belong here.")},
     {"key": "safety", "title": "Safety", "kind": "list",
      "purpose": ("Hazards raised, incidents, near misses, stop-works, toolbox talks and "
-                 "the controls agreed, one item per line, with who raised it and where. "
-                 "Quality defects are not safety items.")},
+                 "the controls agreed, each with who raised it and where. Quality "
+                 "defects are not safety items.")},
     {"key": "quality", "title": "Quality", "kind": "list",
      "purpose": ("Inspections, hold points, defects raised or closed, non-conformances and "
-                 "anything awaiting sign-off, one item per line, with the location and "
-                 "who is responsible. Safety matters are not quality items.")},
+                 "anything awaiting sign-off, each with the location and who is "
+                 "responsible. Safety matters are not quality items.")},
     {"key": "decisions", "title": "Decisions", "kind": "list",
-     "purpose": ("Decisions actually made, one per line: what was decided, who decided "
-                 "it, and what it changes in programme, cost or scope. Suggestions that "
-                 "were not agreed are not decisions.")},
+     "purpose": ("Decisions actually made: what was decided, who decided it, and what it "
+                 "changes in programme, cost or scope. Suggestions that were not agreed "
+                 "are not decisions.")},
     {"key": "actions", "title": "Actions", "kind": "table", "columns": ["Action", "Owner", "Due"],
-     "purpose": ("The actions already on record for this recording, as they are listed "
-                 "for you, with their owner and date exactly as recorded.")},
+     "purpose": ("The actions already on record for this recording, as they are given "
+                 "to you, with their owner and date exactly as recorded.")},
     {"key": "open_items", "title": "Open Discussion", "kind": "list",
      "purpose": ("Matters raised and not resolved: questions waiting for an answer, points "
-                 "left open, figures or dates marked as to be confirmed, one per line, "
-                 "with who is expected to answer when that was said. Settled matters do "
-                 "not belong here.")},
+                 "left open, figures or dates marked as to be confirmed, each with who is "
+                 "expected to answer when that was said. Settled matters do not belong "
+                 "here.")},
     {"key": "programme", "title": "Programme & Delays", "kind": "list",
-     "purpose": ("Delays and accelerations against the programme, one per line, each with "
-                 "its cause and the activity affected. Weather on its own is not a "
-                 "programme item unless a delay was said to follow from it.")},
+     "purpose": ("Delays and accelerations against the programme, each with its cause and "
+                 "the activity affected. Weather on its own is not a programme item "
+                 "unless a delay was said to follow from it.")},
     {"key": "workforce", "title": "Workforce", "kind": "kpi",
      "purpose": ("Numbers on site by trade or subcontractor, only where a number was "
                  "actually said. Never estimate a headcount.")},
     {"key": "deliveries_plant", "title": "Deliveries & Plant", "kind": "list",
      "purpose": ("Deliveries that arrived or were missed, plant brought on or taken off "
-                 "site, and breakdowns, one per line, with what and where.")},
+                 "site, and breakdowns, each with what and where.")},
     {"key": "commercial", "title": "Commercial", "kind": "list",
      "purpose": ("Variations, site instructions, dayworks, and cost or claim matters that "
-                 "were mentioned, one per line, with any figure exactly as said.")},
+                 "were mentioned, with any figure exactly as said.")},
     {"key": "visitors", "title": "Visitors & Inspections", "kind": "list",
-     "purpose": ("Visits by consultants, the client, council or engineers, one per line: "
-                 "who came, and what they looked at or asked for. Internal staff are not "
-                 "visitors.")},
+     "purpose": ("Visits by consultants, the client, council or engineers: who came, and "
+                 "what they looked at or asked for. Internal staff are not visitors.")},
     {"key": "look_ahead", "title": "Look-ahead", "kind": "list",
-     "purpose": ("What was said to be happening next, one item per line, with the day "
-                 "when it was given.")},
+     "purpose": ("What was said to be happening next, with the day when it was given.")},
 ]
 
 # Filled by code in the report rather than written by the model. Not offered as

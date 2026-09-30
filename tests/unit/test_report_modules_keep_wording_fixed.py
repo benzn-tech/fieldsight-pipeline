@@ -130,3 +130,32 @@ def test_both_save_paths_pin_modules_by_the_templates_company():
     add = add[:add.index("\ndef ")]
     assert "report_modules.pin_modules(conn, company_id, tpl)" in create
     assert 'report_modules.pin_modules(conn, row["company_id"], tpl)' in add
+
+
+# ---- the text is content, the format is a setting (owner, 2026-09-30) ----------
+
+FORMAT_WORDS = ("sentence", "paragraph", "line", "list", "table", "bullet", "column", "row")
+
+
+@pytest.mark.parametrize("module", rm.STANDARD, ids=lambda m: m["key"])
+def test_a_module_text_says_nothing_about_format(module):
+    """Switching a module from narrative to list must not leave its text
+    contradicting the shape line. The first catalogue said "two to four
+    sentences" and "one item per line"; switched, the model got two
+    instructions and picked one."""
+    import re
+    words = re.findall(r"[a-z]+", module["purpose"].lower())
+    hits = [w for w in words if any(w.startswith(f) for f in FORMAT_WORDS)]
+    assert not hits, "%s mentions format: %s" % (module["key"], hits)
+
+
+@pytest.mark.parametrize("kind", ["narrative", "list", "table", "kpi"])
+def test_any_format_leaves_one_shape_instruction(kind):
+    m = rm._standard("summary")
+    s = {"title": m["title"], "purpose": m["purpose"], "kind": kind}
+    p = rt.render_prompt(body(s), {"folder": "F", "date": "2026-09-30", "from": "00:00",
+                                   "to": "23:59", "recordings": 1}, [], "x",
+                         source=rt.SOURCE_LIBRARY)
+    plan = p[p.index(rt.FENCE_BEGIN):p.index(rt.FENCE_END)]
+    import re
+    assert not re.search(r"\b(sentences?|lines?|list|table|paragraphs?)\b", plan.split("### Anything else")[0].lower())
