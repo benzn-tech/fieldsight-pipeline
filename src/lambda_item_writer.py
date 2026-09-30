@@ -66,6 +66,7 @@ from urllib.parse import unquote_plus
 import boto3
 
 import carry_forward_apply
+import continuity_records
 import item_continuity
 import lambda_ingest
 import keyframe_request
@@ -1412,6 +1413,27 @@ def write_extraction_items(date, user_folder, extraction_key):
             carry_forward_apply._carry_forward_children(
                 conn, [t["id"] for t in retired_topics], new_topic_ids, site["id"],
                 extraction_key)
+
+        # Task 7 (spec D6): every continuity claim the extractor made (item_continuity.resolve,
+        # carried in the artifact's `continuity.claims`) becomes its own decision_records row --
+        # Track B's "every gated AI verdict is recorded" rule, extended to this gate. Runs AFTER
+        # carry-forward just above: an accepted claim's subject_stable_id is looked up on the
+        # RETIRED row via old_topic_ids, which only exist because retired_topics was populated
+        # by the supersede calls earlier in this pass; a rejected or unresolvable claim falls
+        # back to the new row via new_topic_ids, unaffected by carry-forward's own outcome.
+        #
+        # Its own SAVEPOINT, not a bare try/except (same posture as _record_work_class_decision
+        # and _carry_forward_children above it, Ruling R10): a records bug must DEGRADE, never
+        # ABORT the topics/findings/action-items already inserted this pass.
+        try:
+            with conn.transaction():
+                claim_stats = continuity_records.record_claims(
+                    conn, extraction, extraction_key, company["id"], site["id"],
+                    [t["id"] for t in retired_topics], new_topic_ids)
+            if claim_stats["unresolved"] > 0:
+                logger.warning("continuity claims: %s key=%s", claim_stats, extraction_key)
+        except Exception:
+            logger.warning("continuity decision records not stored for %s", extraction_key)
 
         # THE DAY'S PHOTOS, BOUND ONCE, AFTER THIS EXTRACTION'S TOPICS EXIST.
         # Never fatal: a rebind that turned a good extraction into a failed one
