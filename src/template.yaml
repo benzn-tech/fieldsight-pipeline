@@ -1254,6 +1254,28 @@ Parameters:
       Only affects which candidates are OFFERED to a human -- it decides nothing about
       whether a candidate is a match.
 
+  RosterDerived:
+    Type: String
+    Default: 'on'
+    AllowedValues: ['on', 'off']
+    Description: >-
+      Whether the on-site roster (site_attendance.on_roster_profile_ids) is the union of
+      explicit rows plus two derived arms -- people who recorded at this site today, and
+      people a human named at this site recently -- or explicit rows only. 'off' is the
+      rollback: it runs the exact statement #969 shipped, byte-for-byte, so a company can
+      go back to a roster that only ever has what somebody typed in. Not a boolean
+      Parameter (AllowedValues here is on/off, not true/false) because the generic wiring
+      sweep in test_template_workflow_parameter_wiring.py only recognises the latter --
+      this switch is pinned by its own explicit test instead.
+
+  RosterLookbackDays:
+    Type: String
+    Default: '14'
+    Description: >-
+      How many NZ days back a human correction at a site still counts as "recently
+      confirmed here" for the derived roster's third arm. Anchored on the roster day being
+      queried, never on today, so re-running an old session stays reproducible.
+
   MatchOnFinalize:
     Type: String
     Default: 'false'
@@ -3874,6 +3896,8 @@ Resources:
       Environment:
         Variables:
           PROPOSAL_WINDOW_HOURS: !Ref ProposalWindowHours
+          ROSTER_DERIVED: !Ref RosterDerived
+          ROSTER_LOOKBACK_DAYS: !Ref RosterLookbackDays
           # Deploy-time credential injection — see MigrateFunction notes (BUG-36: in-VPC with
           # no NAT, so a Secrets Manager call at runtime black-holes with zero log output).
           PGHOST: !ImportValue
