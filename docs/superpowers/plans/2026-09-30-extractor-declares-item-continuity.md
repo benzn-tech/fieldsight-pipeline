@@ -691,7 +691,7 @@ git commit -m "item_continuity: aliases, the prior block, guarded claim resoluti
 - Consumes: `item_continuity.render_block`, `item_continuity.PriorItem`
 - Produces: `build_extraction_prompt(user_folder, date, session_base, turns, n_segments, speaker_names=None, continuity_block="") -> (prompt, stats)`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests** — written to `tests/unit/test_continuity_prompt.py`. `build_group_prompt` indexes `artifact['members'][0]['date']`, so the group test uses a minimal real member/source pair, not `{"members": []}` / `[]` as sketched below.
 
 ```python
 """The continuity block is a parameter; without it the prompt is today's, and the group prompt
@@ -736,16 +736,11 @@ def test_group_prompt_is_byte_identical_under_both_flag_states(monkeypatch):
 
 Check `build_group_prompt`'s real argument shapes in the file. If `([] )` sources is not accepted, build the minimal valid inputs its existing tests use (`tests/unit/test_extract_group_merge_write.py`). Also check that `## Instructions` is the actual heading `_instructions_block()` emits, and use that exact heading.
 
-- [ ] **Step 2: Add a group strip test to `tests/unit/test_group_evidence_strip.py`**
+- [x] **Step 2: Add a group strip test to `tests/unit/test_group_evidence_strip.py`** — added `test_a_group_write_ships_no_continues_claim`. It mocks `s3`/`gather_session_segments`/`assemble_group_turns`/`call_llm`/`extract_json` (the same pattern `test_extract_group_merge_write.py` uses) and calls `ex.extract_group(...)` end to end, since the strip lives in `extract_group`'s post-processing, not in `verify_evidence`.
 
-Follow the file's `_group_result()` pattern. Put `"continues": {"id": "A1", "starts": "x"}` on an action item and a finding in the fake group result, run the group write path, and assert the written artifact's children have no `continues` key.
+- [x] **Step 3: Run to verify failure** — confirmed by `git stash`-ing the `src/lambda_extract_session.py` edit and re-running: `unexpected keyword argument 'continuity_block'` on both prompt tests, and `AssertionError: assert 'continues' not in {...}` on `test_a_group_write_ships_no_continues_claim` (3 failed, 7 passed). Stash popped to restore the implementation.
 
-- [ ] **Step 3: Run to verify failure**
-
-Run: `bash /c/Users/camil/fswork/run-tests.sh -q tests/unit/test_continuity_prompt.py tests/unit/test_group_evidence_strip.py`
-Expected: FAIL (`unexpected keyword argument 'continuity_block'`, and `continues` present in the group artifact).
-
-- [ ] **Step 4: Implement**
+- [x] **Step 4: Implement**
 
 In `build_extraction_prompt`: add `continuity_block=""` as the last keyword parameter. Insert it between the transcript's closing fence and the instructions block. With `""` the output must be byte-identical, so interpolate it directly with no added whitespace:
 
@@ -770,12 +765,9 @@ In `extract_group`, where it loops over topics to set `safety_flags` (~1698), ad
                     child.pop("continues", None)
 ```
 
-- [ ] **Step 5: Run the tests plus the existing extract_session and group suites**
+- [x] **Step 5: Run the tests plus the existing extract_session and group suites** — 54 passed, 0 failed, 0 skipped.
 
-Run: `bash /c/Users/camil/fswork/run-tests.sh -q tests/unit/test_continuity_prompt.py tests/unit/test_group_evidence_strip.py tests/unit/test_lambda_extract_session.py tests/unit/test_extract_group_merge_write.py`
-Expected: PASS.
-
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/lambda_extract_session.py tests/unit/test_continuity_prompt.py tests/unit/test_group_evidence_strip.py
