@@ -174,7 +174,12 @@ Written before any result, per CLAUDE.md "Measure before you change a prompt, an
 
 **Sessions**
 - At least 15 TEST sessions.
-- **Hard-negative group:** pairs of same-topic, same-kind items that gold says are different work. It needs at least 30 such pairs. TEST's mostly short owner recordings may not supply them; if TEST cannot, the **owner decides** whether read-only prod transcripts may be used. Until then the result is "insufficient", not "pass".
+- **Hard-negative group:** pairs of same-topic, same-kind items that gold says are different work. It needs at least 30 such pairs; with fewer, the result is "insufficient", not "pass".
+- **Prod sessions may be used (owner, 2026-09-30).** TEST's mostly short owner recordings are unlikely to supply 30 hard negatives. Conditions:
+  - read-only S3 GET of prod transcripts and extractions; no prod database access and no prod lambda triggered;
+  - the eval's extraction calls use the same model provider prod already uses, so no new third party receives the text;
+  - outputs and labels stay local and gitignored; only counts are committed.
+- **Who labels prod sessions** is an open owner decision: the blind agent annotator (a Claude agent reading customer conversation text — a new place that data goes) or the owner. The harness takes this as a setting (`prod_labeller = agent | owner`). TEST sessions are agent-labelled either way. The owner has accepted the adjudication workload below.
 
 **Gold**
 - Labelling is an **assignment per (prior list, new list)**, not per pair: for each new item, pick its counterpart in the prior list, or "none". "None" is the default.
