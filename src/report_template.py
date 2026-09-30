@@ -45,6 +45,14 @@ SECTION_KINDS = {
 }
 DEFAULT_SECTION_KIND = "narrative"
 
+# WRITTEN BY US, NOT BY THE MODEL (owner, 2026-09-29: the code decides). A
+# section of one of these kinds never reaches the prompt: the worker takes it
+# out of the plan and puts the facts it holds in its place -- the report's
+# details (project, client, date, recorded by) and the day's weather as
+# site_weather recorded it. Not in SECTION_KINDS on purpose: that table is
+# wording for the model, and there is none to give.
+CODE_FILLED_KINDS = {"header", "weather"}
+
 # WHAT A TABLE'S COLUMNS ARE WHEN NOBODY SAID. Asking for "a markdown table" and
 # nothing else was measured, on the customer's own daily report: the section
 # said `Outstanding tasks` and the model, given no columns, invented ONE -- a
@@ -470,9 +478,12 @@ def _section_error(section, where):
         if not isinstance(kind, str):
             return "%s: kind must be a string" % where
         k = kind.strip().lower()
-        if k not in SECTION_KINDS and k not in LEGACY_SECTION_KINDS:
+        if k not in SECTION_KINDS and k not in LEGACY_SECTION_KINDS \
+                and k not in CODE_FILLED_KINDS:
             return "%s: kind must be one of %s" % (
-                where, ", ".join(sorted(SECTION_KINDS)))
+                where, ", ".join(sorted(set(SECTION_KINDS) | CODE_FILLED_KINDS)))
+        if k in CODE_FILLED_KINDS and section.get("children"):
+            return "%s: a %s section cannot have sub-sections" % (where, k)
 
     if kind is not None and str(kind).strip().lower() == "checklist":
         why = checklist.validate_items(section.get("items"), where)
@@ -487,6 +498,10 @@ def _section_error(section, where):
             if isinstance(child, dict) and (child.get("children") or []):
                 return ("%s: a sub-section cannot have sub-sections of its own"
                         % where)
+            if isinstance(child, dict) and \
+                    str(child.get("kind") or "").strip().lower() in CODE_FILLED_KINDS:
+                return ("%s, sub-section %d: report details and weather go at the "
+                        "top level, not inside another section" % (where, i + 1))
             err = _section_error(child, "%s, sub-section %d" % (where, i + 1))
             if err:
                 return err

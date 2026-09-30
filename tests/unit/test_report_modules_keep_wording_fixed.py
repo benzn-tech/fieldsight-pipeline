@@ -95,15 +95,18 @@ def test_the_catalogue_has_unique_keys_and_no_photos_module():
     assert "photos" not in keys, "photos travel with their topic's line (owner, 2026-09-30)"
 
 
-def test_code_filled_modules_are_not_offered_until_the_code_fills_them():
-    keys = {m["key"] for m in rm.STANDARD}
-    assert not keys & set(rm.CODE_FILLED_LATER)
+def test_details_and_weather_are_offered_only_as_sections_the_code_writes():
+    """They were held back until the renderer filled them: a Weather module the
+    model wrote would undo what weather_advice took away from it."""
+    by_key = {m["key"]: m for m in rm.STANDARD}
+    assert by_key["header"]["kind"] == "header" and by_key["weather"]["kind"] == "weather"
+    assert {"header", "weather"} <= rt.CODE_FILLED_KINDS
 
 
 def test_every_module_fits_the_template_limits():
     for m in rm.STANDARD:
         assert len(m["purpose"]) <= rt.MAX_PURPOSE_CHARS and len(m["title"]) <= rt.MAX_TITLE_CHARS
-        assert m["kind"] in rt.SECTION_KINDS
+        assert m["kind"] in set(rt.SECTION_KINDS) | rt.CODE_FILLED_KINDS
 
 
 def test_the_version_is_the_content():

@@ -42,11 +42,20 @@ STANDARD = [
     # line. A module text that also said "one item per line" contradicted that
     # line the moment someone switched the format, and a model given two
     # instructions picks one differently each time (owner, 2026-09-30).
+    #
+    # `header` and `weather` are written by us, not by the model (report_facts);
+    # their purpose never reaches a prompt and is what the editor shows.
+    {"key": "header", "title": "Report Details", "kind": "header",
+     "purpose": ("Filled in by FieldSight from the record: project, client, date, who "
+                 "recorded it and the recording window.")},
     {"key": "summary", "title": "Daily Summary", "kind": "narrative",
      "purpose": ("The day at a glance, at most four points, most important first: the "
                  "work that moved forward, then anything that changes tomorrow. If any "
                  "construction progress was recorded, include it here, however brief. "
                  "Leave the detail to the more specific sections.")},
+    {"key": "weather", "title": "Weather", "kind": "weather",
+     "purpose": ("Filled in by FieldSight from the measured weather at the site that day, "
+                 "and what it meant for the work planned.")},
     {"key": "work_done", "title": "Work Completed", "kind": "list",
      "purpose": ("Work that was finished or clearly progressed today, each with where it "
                  "happened and who did it when that was said. Only work that happened; "
@@ -95,11 +104,6 @@ STANDARD = [
      "purpose": ("What was said to be happening next, with the day when it was given.")},
 ]
 
-# Filled by code in the report rather than written by the model. Not offered as
-# pickable modules until the renderer fills them (owner, 2026-09-29: the code
-# decides, the model words) -- a Weather module today would have the model write
-# the weather, which is exactly what weather_advice took away from it.
-CODE_FILLED_LATER = ("weather", "header", "weather_log")
 
 
 def module_hash(key, purpose):

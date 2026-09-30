@@ -1628,7 +1628,9 @@ def session_report_generate(conn, caller, session_id, event):
         **({"generate": generate,
             "window": {"from": (body.get("from") or "00:00"), "to": (body.get("to") or "23:59")},
             "excludedTopics": _excluded_topics_for(
-                conn, caller, folder, date, session_id=session_id)} if generate else {}),
+                conn, caller, folder, date, session_id=session_id),
+            "reportFacts": _report_facts(conn, caller["company_id"], folder,
+                                         [content.get("siteId")])} if generate else {}),
     }
     # Lake bucket (like the reindex_requests/ chain): org-api is in-VPC and hands
     # off to the non-VPC session-report worker via an S3 request artifact (BUG-36).
@@ -1696,6 +1698,7 @@ def _assemble_day_report(conn, caller, date, event, selected=None):
         "folder": folder,
         "title": f"{date} · {', '.join(site_names)}" if site_names else date,
         "siteNames": site_names,
+        "siteIds": sorted({str(r["site_id"]) for r in rows if r.get("site_id")}),
         "startedAt": min(starts) if starts else None,
         "participants": _session_participants(rows),
         "topics": topics_out,
@@ -1706,6 +1709,27 @@ def _assemble_day_report(conn, caller, date, event, selected=None):
 
 
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def _report_facts(conn, company_id, folder, site_ids):
+    """What a generated report's details and weather sections are written from
+    (report_facts.py in the worker, which cannot reach Aurora): each site's
+    name, client and coordinates, and the recorder's name. A site of another
+    company is left out rather than trusted -- the ids come from topic rows,
+    and a merged meeting can span devices."""
+    def num(v):
+        return float(v) if v is not None else None
+    out = []
+    for sid in sorted({str(s) for s in site_ids or [] if s}):
+        row = sites.get_site(conn, sid)
+        if not row or str(row.get("company_id")) != str(company_id):
+            continue
+        out.append({"id": sid, "name": row.get("name"), "client": row.get("client"),
+                    "latitude": num(row.get("latitude")), "longitude": num(row.get("longitude"))})
+    user = users.get_by_folder_name(conn, company_id, folder) or {}
+    name = " ".join((p or "").strip() for p in (user.get("first_name"), user.get("last_name"))
+                    if (p or "").strip())
+    return {"sites": out, "recordedBy": name or None}
 
 
 def _generation_request(body, deliver=None, conn=None, caller=None):
@@ -1899,7 +1923,9 @@ def day_report_generate(conn, caller, date, event):
         "resultKey": result_key,
         **({"generate": generate,
             "window": {"from": (body.get("from") or "00:00"), "to": (body.get("to") or "23:59")},
-            "excludedTopics": _excluded_topics_for(conn, caller, folder, date)} if generate else {}),
+            "excludedTopics": _excluded_topics_for(conn, caller, folder, date),
+            "reportFacts": _report_facts(conn, caller["company_id"], folder,
+                                         content.get("siteIds"))} if generate else {}),
     }
     s3().put_object(Bucket=LAKE_BUCKET, Key=request_key,
                     Body=json.dumps(artifact, default=str),

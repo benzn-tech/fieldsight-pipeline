@@ -1899,6 +1899,12 @@ Resources:
                 # prompt (transcript_window.select_keys/assemble). This worker had
                 # no read of transcripts/ at all before generation existed.
                 - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
+                # A template's Weather section (report_facts.py): the nightly
+                # record for the site and day, and -- with no record -- the
+                # site's programme, so the weather is judged against the day's
+                # tasks the same way the daily report judges it.
+                - !Sub arn:aws:s3:::${IngestBucketName}/weather/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/programmes/*
             - Effect: Allow
               Action: s3:PutObject
               Resource:
@@ -1920,6 +1926,11 @@ Resources:
                   s3:prefix:
                     - redactions/*
                     - transcripts/*
+                    # Most days have no weather record and most sites no
+                    # programme: without these a missing key reads as
+                    # AccessDenied, not NoSuchKey.
+                    - weather/*
+                    - programmes/*
             - Effect: Allow
               # SES send for the 'email' delivery option — harmless while
               # EMAIL_SENDER=stub (the stub never calls SES). Verified-identity
