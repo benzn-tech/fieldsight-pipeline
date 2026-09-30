@@ -18,6 +18,8 @@ tests already covered.
 
 Skipped unless `TEST_DATABASE_URL` is set (tests/conftest.py).
 """
+from datetime import date, timedelta
+
 import pytest
 from psycopg.rows import dict_row
 
@@ -33,7 +35,20 @@ def _seed_company_site(db):
     return co, s
 
 
-def _topic_with_open_item(db, site_id, title, report_date="2026-06-01", **kwargs):
+def _days_ago(n):
+    """An ISO date n days before today.
+
+    The sampler's windows count back from CURRENT_DATE, so a literal date in a
+    fixture ages out: "2026-06-01" fell outside the 120-day window on 2026-09-30
+    and three tests went red on every branch at once. Every date that must land
+    INSIDE a window is relative, with margins of weeks so the UTC/NZ day
+    boundary can never matter.
+    """
+    return (date.today() - timedelta(days=n)).isoformat()
+
+
+def _topic_with_open_item(db, site_id, title, report_date=None, **kwargs):
+    report_date = report_date or _days_ago(30)
     return topics.upsert_topic(
         db, site_id, report_date, title,
         action_items=[{"text": "Do the thing"}], **kwargs)
@@ -50,9 +65,9 @@ def _fetch(db, sql):
 def test_threads_site_ids_and_topics_for_site_excludes_a_deleted_topic(db):
     co, s = _seed_company_site(db)
     live = _topic_with_open_item(db, s["id"], "Door hardware install",
-                                 report_date="2026-06-01", summary="Handles fitted.")
+                                 report_date=_days_ago(30), summary="Handles fitted.")
     deleted = _topic_with_open_item(db, s["id"], "Door hardware also install",
-                                    report_date="2026-06-02", summary="Also fitted.")
+                                    report_date=_days_ago(29), summary="Also fitted.")
     redactions.create_redaction(
         db, co["id"], deleted["id"], "user deleted", None, "worker", scope="deleted")
 
@@ -78,8 +93,8 @@ def test_threads_topics_for_site_respects_window(db):
 
 def test_threads_topics_for_site_limit_keeps_most_recent(db):
     co, s = _seed_company_site(db)
-    older = _topic_with_open_item(db, s["id"], "Older topic", report_date="2026-01-01")
-    newer = _topic_with_open_item(db, s["id"], "Newer topic", report_date="2026-06-01")
+    older = _topic_with_open_item(db, s["id"], "Older topic", report_date=_days_ago(300))
+    newer = _topic_with_open_item(db, s["id"], "Newer topic", report_date=_days_ago(30))
 
     records = _fetch(db, sb.sql_threads_topics_for_site(s["id"], 365, 1))
     assert len(records) == 1
@@ -91,7 +106,7 @@ def test_threads_topics_for_site_truncates_summary_to_1000_chars(db):
     co, s = _seed_company_site(db)
     long_summary = "x" * 2000
     topic = _topic_with_open_item(db, s["id"], "Long summary topic",
-                                  report_date="2026-06-01", summary=long_summary)
+                                  report_date=_days_ago(30), summary=long_summary)
 
     records = _fetch(db, sb.sql_threads_topics_for_site(s["id"], 120, 200))
     row = next(r for r in records if r["id"] == topic["id"])
@@ -101,8 +116,8 @@ def test_threads_topics_for_site_truncates_summary_to_1000_chars(db):
 def test_threads_topics_for_site_only_returns_the_named_site(db):
     co, s1 = _seed_company_site(db)
     s2 = sites.create_site(db, co["id"], "Jev-Batch-Site-2")
-    t1 = _topic_with_open_item(db, s1["id"], "Site 1 topic", report_date="2026-06-01")
-    t2 = _topic_with_open_item(db, s2["id"], "Site 2 topic", report_date="2026-06-01")
+    t1 = _topic_with_open_item(db, s1["id"], "Site 1 topic", report_date=_days_ago(30))
+    t2 = _topic_with_open_item(db, s2["id"], "Site 2 topic", report_date=_days_ago(30))
 
     records = _fetch(db, sb.sql_threads_topics_for_site(s1["id"], 120, 200))
     ids = {r["id"] for r in records}
@@ -128,11 +143,11 @@ def test_threads_existing_pairs_lists_parent_topic_id_pairs(db):
 def test_threads_pipeline_excludes_deleted_and_already_suggested(db):
     co, s = _seed_company_site(db)
     earlier = _topic_with_open_item(db, s["id"], "Door hardware ordered",
-                                    report_date="2026-05-01", summary="Order placed for handles.")
+                                    report_date=_days_ago(60), summary="Order placed for handles.")
     later_new = _topic_with_open_item(db, s["id"], "Door hardware installed",
-                                      report_date="2026-05-15", summary="Handles fitted at last.")
+                                      report_date=_days_ago(46), summary="Handles fitted at last.")
     later_already_suggested = _topic_with_open_item(
-        db, s["id"], "Door hardware handover", report_date="2026-05-20",
+        db, s["id"], "Door hardware handover", report_date=_days_ago(41),
         summary="Handover of the handles completed.")
     db.execute(
         "INSERT INTO topic_thread_suggestions "
