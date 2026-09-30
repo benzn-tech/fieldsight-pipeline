@@ -672,6 +672,13 @@ to confirm the `evidence_match.is_cjk` rename didn't break another importer; non
 `content_hash.normalize` confirmed NOT to strip punctuation (only NFC + whitespace collapse +
 casefold), so `tokens()`'s own punctuation-stripping pass is load-bearing, not redundant.
 
+Review round 1 (approved on the guards, three fixes): `_scrub` now matches the fence sentinels
+with a case-/whitespace-tolerant regex and strips any leftover `<<<`/`>>>` run;
+`clean_item_ids` groups by the canonical uuid string so a same-id-different-case pair is
+recognised as a duplicate; added the plain positive test for an unclaimed exact match. 25
+passed in `test_item_continuity.py` (was 22), 63 passed with `test_evidence_match*.py`.
+Commit `8c0c997`.
+
 - [x] **Step 6: Commit**
 
 ```bash
