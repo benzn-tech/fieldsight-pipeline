@@ -103,6 +103,20 @@ def set_slug(conn, site_id, slug) -> dict:
     ).fetchone()
 
 
+def move_site_company(conn, site_id, from_company_id, to_company_id) -> dict | None:
+    """Re-file a live site under another company. Guarded on the company the
+    caller just resolved, so a stale read cannot move a site twice. Touches the
+    sites row ONLY: memberships carry no company column and are left alone.
+    The caller must have checked that (to_company_id, slug) is free --
+    idx_sites_company_slug is UNIQUE(company_id, slug)."""
+    return conn.cursor(row_factory=dict_row).execute(
+        f"UPDATE sites SET company_id=%s "
+        f"WHERE id=%s AND company_id=%s AND archived_at IS NULL "
+        f"RETURNING {_COLS}",
+        (to_company_id, site_id, from_company_id),
+    ).fetchone()
+
+
 def update_site(conn, site_id, company_id, name=None, location=None,
                 client=None, industry=None, address=None,
                 latitude=None, longitude=None) -> dict | None:

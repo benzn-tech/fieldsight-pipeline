@@ -3860,10 +3860,24 @@ def patch_org_site(conn, caller, site_id, body):
             return error("name must be a non-empty string", 400)
         name = name.strip()
     icon = body.get("icon_s3_key")
+    final_icon = None
     if icon is not None:
         pending_prefix = f"{ORG_ASSETS_PREFIX}pending/{caller['cognito_sub']}/"
         if not isinstance(icon, str) or not icon.startswith(pending_prefix):
             return error(f"icon_s3_key must be your pending upload ({pending_prefix}…)", 400)
+        # Relocate BEFORE any DB write, the ordering patch_me documents.
+        # This ran AFTER update_site and (once a move was possible) after
+        # move_site_company, and `with conn:` COMMITS on a clean exit --
+        # `error(...)` is a return, not a raise. So a failed relocate
+        # returned 400 while the name edit, and the company move, had
+        # already committed: the caller was told to re-upload and the site
+        # had silently changed tenant. A failure here now costs at most one
+        # unreferenced object in pending/ -- a retry re-uploads -- which is
+        # the tradeoff patch_me already makes for the same reason.
+        final_icon = (f"{ORG_ASSETS_PREFIX}site-icons/{site_id}/"
+                      f"{icon.rsplit('/', 1)[-1]}")
+        if not _relocate_asset(icon, final_icon):
+            return error("upload expired or missing — please re-upload the image", 400)
     lat, lat_err = _coerce_coord(body.get("latitude"), -90.0, 90.0, "latitude")
     if lat_err:
         return lat_err
@@ -3877,11 +3891,66 @@ def patch_org_site(conn, caller, site_id, body):
     # hits 0 rows -> 404 (mirrors the Team/sites cross-company fix in #96 and
     # patch_action_item).
     scope_company_id = caller["company_id"]
+    target = None
     if is_cross_company(caller["global_role"]):
         target = sites.get_site(conn, site_id)
         if target is None:
             return error("site not found", 404)
         scope_company_id = target["company_id"]
+    # Moving a site to another company: the SAME gate as create_org_site's
+    # target_company_id (only is_cross_company roles, target must exist). As in
+    # create_org_site, a value equal to the caller's own company is a no-op for
+    # everyone else (non-cross callers stay pinned to it). A cross-company
+    # caller's own company is NOT special -- moving a site INTO it is a real
+    # move -- so for them "unchanged" means equal to the site's current company.
+    # The scope above is unchanged and still decides which site is reachable;
+    # the move runs only after the scoped update matched, so it cannot widen reach.
+    move_to = None
+    req_company_id = body.get("target_company_id")
+    # NORMALISED before every comparison and before it reaches the DB. A
+    # raw string compare made `ABC-...` a different company from
+    # `abc-...`: the same company in a different case read as a real move,
+    # which then found the site ITSELF in the "target" company and
+    # returned a false 409 -- and gave a non-cross caller a 403 where
+    # create_org_site ignores its own company id. uuid.UUID also accepts
+    # the `{...}`, `urn:` and unhyphenated forms, which were reaching
+    # psycopg unchanged.
+    canon_company_id = None
+    if req_company_id:
+        try:
+            canon_company_id = str(uuid.UUID(str(req_company_id)))
+        except (ValueError, AttributeError, TypeError):
+            canon_company_id = None
+
+    def _names(company_id):
+        """Whether target_company_id refers to `company_id`. Canonical form
+        FIRST, so case and the `{...}`/unhyphenated forms match; raw equality as
+        well, so a value that is not a uuid at all still matches itself exactly
+        rather than being read as some other company -- the weaker check must
+        never be stricter than create_org_site's plain string compare."""
+        return (canon_company_id or str(req_company_id)) == str(company_id) or             str(req_company_id) == str(company_id)
+
+    if req_company_id and not _names(caller["company_id"]):
+        if not is_cross_company(caller["global_role"]):
+            return error("only platform_admin may move a site to another company", 403)
+    if req_company_id and is_cross_company(caller["global_role"]):
+        if canon_company_id is None:
+            return error("target_company_id must be a company id", 400)
+        if companies.get_company_by_id(conn, canon_company_id) is None:
+            return error("target company not found", 404)
+        if not _names(scope_company_id):
+            move_to = canon_company_id
+            # slug is unique per (company_id, slug), not globally. Keep the
+            # slug (deep links and the published site-coords key use it) and
+            # refuse a collision rather than renaming or hitting the index.
+            # `is not None`, not truthiness: '' is an INDEXABLE value --
+            # only NULL is treated as distinct by a unique index -- so an
+            # empty slug skipped the check and hit the index as a 500.
+            slug = (target or {}).get("slug")
+            if slug is not None and sites.get_company_site_by_slug(
+                    conn, move_to, slug) is not None:
+                return error("target company already has a site with slug "
+                             f"'{slug}'", 409)
     row = sites.update_site(
         conn, site_id, scope_company_id,
         name=name, location=body.get("location"),
@@ -3890,12 +3959,18 @@ def patch_org_site(conn, caller, site_id, body):
     )
     if row is None:
         return error("site not found in your company", 404)
-    if icon is not None:
+    if move_to is not None:
+        row = sites.move_site_company(conn, site_id, scope_company_id, move_to)
+        if row is None:
+            # update_site already matched and wrote; only a concurrent
+            # archive or move reaches here. `with conn:` commits on a
+            # clean exit and `error(...)` is a return, so without this
+            # rollback the caller is told 404 while their name and
+            # coordinate edit is committed.
+            conn.rollback()
+            return error("site not found in your company", 404)
+    if final_icon is not None:
         old_icon = row.get("icon_s3_key")
-        fname = icon.rsplit("/", 1)[-1]
-        final_icon = f"{ORG_ASSETS_PREFIX}site-icons/{site_id}/{fname}"
-        if not _relocate_asset(icon, final_icon):
-            return error("upload expired or missing — please re-upload the image", 400)
         row = sites.set_site_icon(conn, site_id, final_icon)
         if old_icon and old_icon != final_icon:
             _delete_asset(old_icon)
