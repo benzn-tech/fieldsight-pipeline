@@ -214,3 +214,13 @@ def test_claim_resolving_to_neither_pool_is_unresolved_not_inserted(monkeypatch)
                              ["topic-old"], ["topic-new"])
 
     assert stats == {"inserted": 0, "skipped_duplicate": 0, "unresolved": 1}
+
+
+# ---------------------------------------------------------------------------
+# _TABLE must never drift from item_continuity.KINDS (both list every kind the extractor
+# can claim continuity for; _TABLE additionally maps each one to the table that carries its
+# stable_id, so it can't just BE KINDS, but its key set must always equal KINDS's).
+# ---------------------------------------------------------------------------
+
+def test_table_kinds_match_item_continuity_kinds():
+    assert set(cr._TABLE) == set(cr.item_continuity.KINDS)

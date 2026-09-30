@@ -19,6 +19,10 @@ import item_continuity
 # topic_questions.py).
 _TABLE = {"action_items": "action_items", "findings": "findings",
           "decisions": "topic_decisions", "questions": "topic_questions"}
+assert set(_TABLE) == set(item_continuity.KINDS), (
+    f"_TABLE's kinds {set(_TABLE)} must match item_continuity.KINDS's kinds "
+    f"{set(item_continuity.KINDS)} -- every kind the extractor can claim needs a table "
+    "here to look its stable_id up in")
 
 
 def _stable_id_for(conn, list_name, item_id, topic_ids):
