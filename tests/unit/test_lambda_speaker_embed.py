@@ -242,6 +242,20 @@ def test_a_homogeneous_window_is_stored_with_its_provenance(stub_embedder, monke
     assert out["window"] == [0.0, 15.0]
 
 
+def test_a_stored_enrolment_carries_its_recording_conditions(stub_embedder, monkeypatch):
+    """Design 2026-09-30 step 1: the three condition numbers travel on the standalone
+    `op=enrol` result too, computed on the window AFTER narrowing -- not the wide one the
+    request asked for, since that is the audio actually embedded."""
+    key = "users/u/audio/2026-08-11/x_c0000.wav"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes(seconds=15.0)}))
+    out = se.lambda_handler({"op": "enrol", "voiceprint_id": "vp1", "user_folder": "u",
+                             "date": "2026-08-11", "source_filename": "x_c0000.wav",
+                             "start_sec": 0.0, "end_sec": 15.0}, None)
+    assert out["status"] == "embedded"
+    for field in ("level_dbfs", "noise_dbfs", "snr_db"):
+        assert isinstance(out.get(field), float), f"{field} missing from the enrolment result"
+
+
 def test_an_unknown_op_is_rejected_rather_than_silently_doing_nothing(monkeypatch):
     with pytest.raises(ValueError):
         se.lambda_handler({"op": "sing"}, None)
@@ -1572,6 +1586,53 @@ def test_the_tail_frame_is_still_gated_on_speech():
     audio = np.concatenate([_tone(12.0, sr), np.zeros(int(2.9 * sr), dtype=np.float32)])
     frames = se._frames(audio, sr)
     assert all(se._dbfs(f) >= se.FRAME_MIN_DBFS for f in frames)
+
+
+# ---- recording conditions (design 2026-09-30, step 1 of 3) ----------------
+#
+# Measured on the 42 owner-labelled clips: SNR vs match score has Spearman rho +0.76, so the
+# pure helper below is what makes that measurable on live data going forward.
+
+
+def test_recording_conditions_measures_level_noise_and_snr():
+    """Known sine + known noise gives the expected level/noise/snr.
+
+    Both segments are exact multiples of the 50 ms condition frame (2.0 s at 16 kHz = 40
+    frames of 800 samples), so no frame straddles a segment boundary and the noise segments'
+    per-frame RMS is uniform -- the 10th percentile lands squarely inside them rather than on
+    an interpolated boundary value.
+    """
+    sr = 16000
+    loud = _tone(2.0, sr, amp=0.5)
+    quiet = _tone(2.0, sr, amp=0.05)
+    audio = np.concatenate([loud, quiet, loud, quiet, loud])
+
+    out = se._recording_conditions(audio, sr)
+
+    expected_level = 20.0 * float(np.log10(np.sqrt(np.mean(audio.astype(np.float64) ** 2))))
+    expected_noise = 20.0 * float(np.log10(0.05 / np.sqrt(2)))
+    assert out["level_dbfs"] == pytest.approx(expected_level, abs=0.05)
+    assert out["noise_dbfs"] == pytest.approx(expected_noise, abs=0.1)
+    assert out["snr_db"] == pytest.approx(out["level_dbfs"] - out["noise_dbfs"], abs=1e-6)
+
+
+def test_a_uniform_window_has_near_zero_snr():
+    """No quiet part at all: level and noise coincide. Guards against a version that picks
+    the loudest frame's percentile instead of the quietest -- that would also read as ~0 here
+    but would invert the moment a real quiet segment existed."""
+    sr = 16000
+    audio = _tone(3.0, sr, amp=0.3)
+    out = se._recording_conditions(audio, sr)
+    assert out["snr_db"] == pytest.approx(0.0, abs=0.2)
+
+
+def test_a_window_shorter_than_one_condition_frame_is_judged_on_itself():
+    """A window this short cannot be subdivided; noise equals level and snr is 0 rather than
+    raising on an empty frame list."""
+    sr = 16000
+    out = se._recording_conditions(_tone(0.01, sr, amp=0.4), sr)
+    assert out["snr_db"] == pytest.approx(0.0, abs=1e-6)
+    assert out["noise_dbfs"] == out["level_dbfs"]
 
 
 # ---- the one function every other test stubs ------------------------------
