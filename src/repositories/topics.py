@@ -120,9 +120,10 @@ def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_k
     for a in (action_items or []):
         conn.execute(
             "INSERT INTO action_items (topic_id, site_id, text, responsible, deadline, "
-            "deadline_text, priority, status) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+            "deadline_text, priority, status, item_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (tid, site_id, a["text"], a.get("responsible"), a.get("deadline"),
-             a.get("deadline_text"), a.get("priority"), a.get("status", "open")),
+             a.get("deadline_text"), a.get("priority"), a.get("status", "open"),
+             a.get("item_id")),
         )
     for o in (safety or []):
         conn.execute(

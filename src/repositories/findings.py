@@ -24,7 +24,7 @@ from deleted_predicates import visible_topics_predicate
 _COLS = ("id, topic_id, site_id, observation, domain, severity, entity_name, "
          "entity_trade, recommended_action, programme_task_id, impact_severity, "
          "impact_note, impact_task_name, impact_evidence, impact_matched_at, "
-         "status, created_at")
+         "status, created_at, item_id")
 
 _VALID_DOMAINS = {"safety", "quality", "progress"}
 _VALID_SEVERITIES = {"none", "minor", "major"}
@@ -53,7 +53,11 @@ def insert_findings(conn, topic_id, site_id, findings: list[dict]) -> list[dict]
 
     Impact columns (programme_task_id, impact_*) are left NULL here --
     they're filled later by apply_impact, downstream of the matcher/writer
-    hop (D2 of the plan). Empty findings -> [] with no query executed."""
+    hop (D2 of the plan). Empty findings -> [] with no query executed.
+
+    item_id (migration 0076) is the extractor's own lineage id, already cleaned to
+    NULL for anything malformed or duplicated (item_continuity.clean_item_ids, called
+    by the writer before this function runs) -- passed straight through here."""
     if not findings:
         return []
     cur = conn.cursor(row_factory=dict_row)
@@ -64,12 +68,13 @@ def insert_findings(conn, topic_id, site_id, findings: list[dict]) -> list[dict]
             entity = {}
         rows.append(cur.execute(
             f"INSERT INTO findings (topic_id, site_id, observation, domain, severity, "
-            f"entity_name, entity_trade, recommended_action) "
-            f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING {_COLS}",
+            f"entity_name, entity_trade, recommended_action, item_id) "
+            f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING {_COLS}",
             (topic_id, site_id, f.get("observation"),
              _clean_enum(f.get("domain"), _VALID_DOMAINS),
              _clean_enum(f.get("severity"), _VALID_SEVERITIES),
-             entity.get("name"), entity.get("trade"), f.get("recommended_action")),
+             entity.get("name"), entity.get("trade"), f.get("recommended_action"),
+             f.get("item_id")),
         ).fetchone())
     return rows
 
@@ -136,7 +141,7 @@ def list_for_carry_forward(conn, topic_ids, site_id) -> list[dict]:
     if not topic_ids:
         return []
     return conn.cursor(row_factory=dict_row).execute(
-        "SELECT id, topic_id, observation AS text, stable_id, status, audience, "
+        "SELECT id, topic_id, observation AS text, stable_id, status, audience, item_id, "
         "(status <> 'open') AS human_touched "
         "FROM findings WHERE topic_id = ANY(%s) AND site_id = %s",
         (list(topic_ids), site_id),

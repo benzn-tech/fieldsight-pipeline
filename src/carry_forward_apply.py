@@ -26,25 +26,57 @@ from repositories import action_items, findings, topic_decisions, topic_question
 logger = logging.getLogger()
 
 
+def _pair_by_item_id(old_rows, new_rows):
+    """Pass 0 (spec 2026-09-30 D2): the extractor already declared these two rows the same
+    commitment, by stamping them with the same `item_id` (Task 5's `item_continuity`
+    lineage). Equal, NON-NULL item_id, one-to-one: a duplicated id on either side means the
+    extractor's own declaration cannot be resolved to a single row, so it pairs nothing and
+    both copies fall through to Track B's existing text passes instead of a guess."""
+    def index(rows):
+        out = {}
+        for r in rows:
+            if r.get("item_id") is not None:
+                out.setdefault(str(r["item_id"]), []).append(r)
+        return out
+    olds, news = index(old_rows), index(new_rows)
+    return [(o[0], news[k][0]) for k, o in olds.items()
+            if len(o) == 1 and len(news.get(k) or []) == 1]
+
+
 def _carry_forward_one_table(conn, repo, old_topic_ids, new_topic_ids, site_id):
     """Match one child table's retired rows to their replacements and carry stable_id (plus
-    any human edit) forward. Returns the number of human-touched OLD rows that found no
-    successor -- the caller's contribution to the OrphanedHumanEdits metric/log.
+    any human edit) forward. Pass 0 pairs on the extractor's own `item_id` declaration first
+    (`_pair_by_item_id`); whatever it leaves unpaired on either side falls through to Track
+    B's existing exact/fuzzy text passes (`carry_forward.match`), unchanged. Returns
+    `(orphans, carried)`: the number of human-touched OLD rows that found no successor at
+    all -- the caller's contribution to the OrphanedHumanEdits metric/log -- and a
+    `{"item_id": n, "exact": n, "fuzzy": n}` count of how many pairs each method produced,
+    for the CarriedByMethod metric.
 
     `repo` is `action_items`, `findings`, `topic_decisions` or `topic_questions` (Track B
     Task 4, extended to the last two by Task 5): all four expose
-    list_for_carry_forward(conn, topic_ids, site_id) -> rows with a computed `human_touched`,
-    and carry_identity(conn, new_id, old_row), with the identical shape -- which is what lets
-    this be one function instead of four near-duplicates."""
+    list_for_carry_forward(conn, topic_ids, site_id) -> rows with a computed `human_touched`
+    and an `item_id`, and carry_identity(conn, new_id, old_row), with the identical shape --
+    which is what lets this be one function instead of four near-duplicates."""
+    carried = {"item_id": 0, "exact": 0, "fuzzy": 0}
     old_rows = repo.list_for_carry_forward(conn, old_topic_ids, site_id)
     if not old_rows:
-        return 0
+        return 0, carried
     new_rows = repo.list_for_carry_forward(conn, new_topic_ids, site_id)
-    old_by_id = {r["id"]: r for r in old_rows}
-    pairs, orphans = carry_forward.match(old_rows, new_rows)
-    for old_id, new_id, _how in pairs:
+    paired_old, paired_new = set(), set()
+    for old, new in _pair_by_item_id(old_rows, new_rows):
+        repo.carry_identity(conn, new["id"], old)
+        paired_old.add(old["id"])
+        paired_new.add(new["id"])
+        carried["item_id"] += 1
+    rest_old = [r for r in old_rows if r["id"] not in paired_old]
+    rest_new = [r for r in new_rows if r["id"] not in paired_new]
+    old_by_id = {r["id"]: r for r in rest_old}
+    pairs, orphans = carry_forward.match(rest_old, rest_new)
+    for old_id, new_id, how in pairs:
         repo.carry_identity(conn, new_id, old_by_id[old_id])
-    return sum(1 for oid in orphans if old_by_id[oid]["human_touched"])
+        carried[how] = carried.get(how, 0) + 1
+    return sum(1 for oid in orphans if old_by_id[oid]["human_touched"]), carried
 
 
 def _carry_forward_children(conn, old_topic_ids, new_topic_ids, site_id, key):
@@ -76,22 +108,24 @@ def _carry_forward_children(conn, old_topic_ids, new_topic_ids, site_id, key):
     human-touched old row is -- by definition -- an orphan this pass, and the count is
     recomputed by a fallback read after the SAVEPOINT has rolled back (R10: "the metric must
     not read 0 when carry-forward crashed")."""
+    carried = None
     try:
         with conn.transaction():
-            orphaned = (_carry_forward_one_table(conn, action_items, old_topic_ids,
-                                                 new_topic_ids, site_id)
-                       + _carry_forward_one_table(conn, findings, old_topic_ids,
-                                                  new_topic_ids, site_id)
-                       + _carry_forward_one_table(conn, topic_decisions, old_topic_ids,
-                                                  new_topic_ids, site_id)
-                       + _carry_forward_one_table(conn, topic_questions, old_topic_ids,
-                                                  new_topic_ids, site_id))
+            orphaned = 0
+            carried = {"item_id": 0, "exact": 0, "fuzzy": 0}
+            for repo in (action_items, findings, topic_decisions, topic_questions):
+                table_orphaned, table_carried = _carry_forward_one_table(
+                    conn, repo, old_topic_ids, new_topic_ids, site_id)
+                orphaned += table_orphaned
+                for method, n in table_carried.items():
+                    carried[method] = carried.get(method, 0) + n
     except Exception:
         logger.exception(
             "carry_forward failed for %s -- topics were written, no identity was carried "
             "forward this pass", key)
         orphaned = _count_human_touched_old(conn, old_topic_ids, site_id, key)
-    _report_orphaned_human_edits(key, orphaned)
+        carried = None
+    _report_orphaned_human_edits(key, orphaned, carried)
 
 
 def _count_human_touched_old(conn, old_topic_ids, site_id, key):
@@ -115,13 +149,21 @@ def _count_human_touched_old(conn, old_topic_ids, site_id, key):
         return 0
 
 
-def _report_orphaned_human_edits(key, count):
-    """Tell an operator about human-touched rows that carry_forward could not carry.
+def _report_orphaned_human_edits(key, count, carried=None):
+    """Tell an operator about human-touched rows that carry_forward could not carry, and
+    (Task 6) how the rows it DID carry were matched.
 
     Two channels, because they answer two different questions: the WARNING is for someone
     reading THIS pass's logs ("did we lose a tick just now?"), the metric is for someone
     watching the fleet ("is this getting worse?") -- and only the metric is non-zero-
     suppressed, so a dashboard can tell "nothing lost" from "this key never ran" (Ruling R5).
+
+    `carried` is the `{"item_id": n, "exact": n, "fuzzy": n}` dict `_carry_forward_children`
+    summed across the four tables, or None on the crash fallback -- nothing was actually
+    carried then, so there is no per-method breakdown to report, only the OrphanedHumanEdits
+    line. When given, one CarriedByMethod EMF line is printed PER METHOD (three lines, not
+    one line with three values): CloudWatch EMF requires every value under one metric name to
+    share the same dimension set, and `Method` only has one value per line.
 
     Embedded Metric Format printed to stdout, not `put_metric_data`: both callers
     (ItemWriterFunction, IngestFunction) are in-VPC with no CloudWatch endpoint (CLAUDE.md
@@ -138,9 +180,10 @@ def _report_orphaned_human_edits(key, count):
             count, key)
     try:
         import time as _t
+        ts = int(_t.time() * 1000)
         print(json.dumps({
             "_aws": {
-                "Timestamp": int(_t.time() * 1000),
+                "Timestamp": ts,
                 "CloudWatchMetrics": [{
                     "Namespace": "FieldSight/Pipeline",
                     "Dimensions": [["Stage"]],
@@ -151,5 +194,21 @@ def _report_orphaned_human_edits(key, count):
             "OrphanedHumanEdits": count,
             "key": key,
         }))
+        if carried is not None:
+            for method, n in carried.items():
+                print(json.dumps({
+                    "_aws": {
+                        "Timestamp": ts,
+                        "CloudWatchMetrics": [{
+                            "Namespace": "FieldSight/Pipeline",
+                            "Dimensions": [["Stage", "Method"]],
+                            "Metrics": [{"Name": "CarriedByMethod", "Unit": "Count"}],
+                        }],
+                    },
+                    "Stage": os.environ.get("STAGE", "unknown"),
+                    "Method": method,
+                    "CarriedByMethod": n,
+                    "key": key,
+                }))
     except Exception:
         logger.warning("could not emit the OrphanedHumanEdits metric for %s", key)

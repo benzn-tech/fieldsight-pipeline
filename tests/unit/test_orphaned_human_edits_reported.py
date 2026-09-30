@@ -94,8 +94,10 @@ def test_carry_forward_one_table_skips_the_new_query_when_nothing_old_was_touche
             calls.append(list(topic_ids))
             return []
 
-    n = cfa._carry_forward_one_table(None, _EmptyOldRepo, ["old-topic"], ["new-topic"], "site-1")
+    n, carried = cfa._carry_forward_one_table(
+        None, _EmptyOldRepo, ["old-topic"], ["new-topic"], "site-1")
     assert n == 0
+    assert carried == {"item_id": 0, "exact": 0, "fuzzy": 0}
     assert calls == [["old-topic"]], "must ask for the OLD pool once and stop there"
 
 

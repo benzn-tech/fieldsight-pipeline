@@ -271,6 +271,7 @@ def test_topic_children_mapped(wired):
     assert kw["action_items"] == [{
         "text": "Order more hard hats", "responsible": "Bob",
         "deadline": "2026-07-10", "deadline_text": "Friday", "priority": None,
+        "item_id": None,
     }]
     # Phase F Task 23 (D8 retirement, spec §8): the item-writer no longer
     # passes safety= to upsert_topic at all -- findings (inserted separately,

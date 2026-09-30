@@ -13,7 +13,7 @@ siblings written before it in the same call -- matches insert_findings)."""
 from psycopg.rows import dict_row
 
 _COLS = ("id, topic_id, site_id, stable_id, carried_from, decision, rationale, "
-         "decided_by, audience, created_at")
+         "decided_by, audience, created_at, item_id")
 
 
 def insert_decisions(conn, topic_id, site_id, decisions: list) -> list[dict]:
@@ -37,16 +37,18 @@ def insert_decisions(conn, topic_id, site_id, decisions: list) -> list[dict]:
             text = d.get("decision")
             rationale = d.get("rationale")
             decided_by = d.get("decided_by")
+            item_id = d.get("item_id")
         else:
             text = d
             rationale = None
             decided_by = None
+            item_id = None
         if not text:
             continue
         rows.append(cur.execute(
-            f"INSERT INTO topic_decisions (topic_id, site_id, decision, rationale, decided_by) "
-            f"VALUES (%s,%s,%s,%s,%s) RETURNING {_COLS}",
-            (topic_id, site_id, text, rationale, decided_by),
+            f"INSERT INTO topic_decisions (topic_id, site_id, decision, rationale, "
+            f"decided_by, item_id) VALUES (%s,%s,%s,%s,%s,%s) RETURNING {_COLS}",
+            (topic_id, site_id, text, rationale, decided_by, item_id),
         ).fetchone())
     return rows
 
@@ -76,7 +78,7 @@ def list_for_carry_forward(conn, topic_ids, site_id) -> list[dict]:
     if not topic_ids:
         return []
     return conn.cursor(row_factory=dict_row).execute(
-        "SELECT id, topic_id, decision AS text, stable_id, audience, "
+        "SELECT id, topic_id, decision AS text, stable_id, audience, item_id, "
         "(audience <> 'internal') AS human_touched "
         "FROM topic_decisions WHERE topic_id = ANY(%s) AND site_id = %s",
         (list(topic_ids), site_id),

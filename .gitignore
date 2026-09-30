@@ -56,3 +56,7 @@ uv.lock
 # (voiceprint_eval/), never in the repository.
 runs/
 clips*.json
+
+# Continuity eval harness output (scripts/continuity_eval): real session transcripts
+# and extractions, from TEST and read-only PROD. Only committed counts leave here.
+continuity_eval_runs/

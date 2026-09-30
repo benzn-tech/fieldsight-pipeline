@@ -17,7 +17,7 @@ from psycopg.rows import dict_row
 from deleted_predicates import visible_topics_predicate
 
 _COLS = ("id, topic_id, site_id, stable_id, carried_from, question, status, "
-         "answered_by, answered_at, audience, created_at")
+         "answered_by, answered_at, audience, created_at, item_id")
 
 
 def insert_questions(conn, topic_id, site_id, questions: list) -> list[dict]:
@@ -37,12 +37,13 @@ def insert_questions(conn, topic_id, site_id, questions: list) -> list[dict]:
     rows = []
     for q in questions:
         text = q.get("question") if isinstance(q, dict) else q
+        item_id = q.get("item_id") if isinstance(q, dict) else None
         if not text:
             continue
         rows.append(cur.execute(
-            f"INSERT INTO topic_questions (topic_id, site_id, question) "
-            f"VALUES (%s,%s,%s) RETURNING {_COLS}",
-            (topic_id, site_id, text),
+            f"INSERT INTO topic_questions (topic_id, site_id, question, item_id) "
+            f"VALUES (%s,%s,%s,%s) RETURNING {_COLS}",
+            (topic_id, site_id, text, item_id),
         ).fetchone())
     return rows
 
@@ -74,7 +75,7 @@ def list_for_carry_forward(conn, topic_ids, site_id) -> list[dict]:
         return []
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT id, topic_id, question AS text, stable_id, status, answered_by, "
-        "answered_at, audience, "
+        "answered_at, audience, item_id, "
         "(status <> 'open' OR audience <> 'internal') AS human_touched "
         "FROM topic_questions WHERE topic_id = ANY(%s) AND site_id = %s",
         (list(topic_ids), site_id),
