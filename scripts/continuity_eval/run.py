@@ -204,7 +204,15 @@ def _select_shapes(names):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--env", choices=("test", "prod"), required=True)
+    parser.add_argument("--env", choices=("test", "prod"), required=True,
+                         help="Where sessions are read from (TEST or prod bucket).")
+    parser.add_argument("--config-env", choices=("test", "prod"), default=None,
+                         help="Which deployed extract_session function's LLM config to "
+                              "load. Defaults to --env. Spec §7 'Decision rule': the "
+                              "measurement itself runs under TEST config even when reading "
+                              "prod sessions for a prod-config run (--env prod "
+                              "--config-env test); a separate prod-config run "
+                              "(--config-env prod) happens before prod.")
     parser.add_argument("--sessions", type=int, default=15,
                          help="How many candidate sessions to take (spec: at least 15).")
     parser.add_argument("--out", required=True, help="Output directory (gitignored).")
@@ -215,6 +223,7 @@ def main(argv=None):
     parser.add_argument("--profile", default=sessions_mod.DEFAULT_PROFILE)
     parser.add_argument("--region", default=sessions_mod.DEFAULT_REGION)
     args = parser.parse_args(argv)
+    config_env = args.config_env if args.config_env is not None else args.env
 
     out_dir = paths_mod.require_run_dir(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -225,11 +234,20 @@ def main(argv=None):
     candidates = sessions_mod.list_candidate_sessions(args.env, client=client)
     chosen = candidates[: args.sessions]
 
+    # sessions.json stays the list `label.py._session_env_by_key` already reads
+    # (each entry's existing "env" field IS data_env, from list_candidate_sessions).
+    # `config_env` is added per entry so a run dir also says whose deployed LLM
+    # config ran the extractions -- the same value as data_env unless the caller
+    # passed `--config-env` (spec §7 "Decision rule": a prod-sessions run under
+    # TEST config).
+    sessions_out = [{**s, "data_env": s.get("env", args.env), "config_env": config_env}
+                     for s in chosen]
     (out_dir / "sessions.json").write_text(
-        json.dumps(chosen, ensure_ascii=False, indent=2), encoding="utf-8")
+        json.dumps(sessions_out, ensure_ascii=False, indent=2), encoding="utf-8")
 
     plan = planned_runs(chosen, shapes_dict)
     if args.dry_run:
+        print(json.dumps({"data_env": args.env, "config_env": config_env}))
         for entry in plan:
             print(json.dumps(entry))
         return plan
@@ -249,9 +267,12 @@ def main(argv=None):
     # Same mechanism as scripts/jev_eval/baseline.py: copies the DEPLOYED extract
     # session function's LLM env vars into this process and reloads llm_utils, so
     # every call_llm below runs under the actual deployed model config, not this
-    # process's own default.
+    # process's own default. Loaded from `config_env`, not `args.env` -- the data
+    # source (where sessions are read from) and the model config under test are
+    # separable per spec §7 "Decision rule" (e.g. --env prod --config-env test
+    # measures prod sessions under TEST's deployed config).
     load_deployed_llm_env(
-        EXTRACT_SESSION_FUNCTION[args.env], profile=args.profile, region=args.region)
+        EXTRACT_SESSION_FUNCTION[config_env], profile=args.profile, region=args.region)
 
     bucket = sessions_mod.BUCKETS[args.env]
     all_records = []
