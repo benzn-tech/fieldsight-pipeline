@@ -469,8 +469,15 @@ def test_config_env_test_loads_the_test_functions_env_for_a_prod_sessions_run(
         return [fake_session]
     monkeypatch.setattr(sessions_mod, "list_candidate_sessions", fake_list)
     monkeypatch.setattr(sessions_mod, "s3_client", lambda **kw: object())
-    monkeypatch.delenv("AWS_PROFILE", raising=False)
-    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    # This path is NOT --dry-run, so main() reaches its
+    # `os.environ.setdefault("AWS_PROFILE", ...)` / `AWS_DEFAULT_REGION` lines for
+    # real -- those calls write straight to os.environ, not through monkeypatch, so
+    # monkeypatch can't auto-undo them. Pre-seed both via monkeypatch.setenv (which
+    # IS tracked) so setdefault is a no-op here and monkeypatch restores/removes them
+    # at teardown -- delenv here (as the dry-run tests above do) would leave them set
+    # for the rest of the pytest process once main() actually sets them.
+    monkeypatch.setenv("AWS_PROFILE", "fieldsight-deployer")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "ap-southeast-2")
 
     out_dir = tmp_path / "continuity_eval_runs" / "run_real"
     run_mod.main(["--env", "prod", "--config-env", "test", "--sessions", "1",
