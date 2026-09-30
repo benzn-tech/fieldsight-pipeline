@@ -69,6 +69,7 @@ import agent_turn_filter
 from output_language import OUTPUT_LANGUAGE_RULE
 import weather
 import weather_advice
+import site_weather
 import site_coords
 import llm_utils
 import report_sections
@@ -526,21 +527,9 @@ def summary_text(report):
     return text or 'No summary available'
 
 
-def build_weather_block_for_site(site_info, target_date, today_iso,
-                                 fetch=weather.fetch_weather):
-    """Fetch the normalized (site, date) weather block, or None when the site
-    has no coordinate (un-backfilled) or the fetch fails. Non-VPC: this runs in
-    ReportGeneratorFunction, which has egress. Coordinate comes from the
-    config/user_mapping.json `sites` block (D-COORD option a)."""
-    lat = site_info.get("latitude")
-    lng = site_info.get("longitude")
-    if lat is None or lng is None:
-        return None
-    try:
-        return fetch(lat, lng, target_date, today_iso)
-    except Exception as e:
-        logger.warning(f"weather fetch failed for {target_date}: {e}")
-        return None
+# Kept under these names: the nightly run and its tests call them from here.
+build_weather_block_for_site = site_weather.build_weather_block_for_site
+build_weather_findings = site_weather.build_weather_findings
 
 
 def programme_for_site(site_info, bucket=None):
@@ -557,50 +546,6 @@ def weather_record_site(site_info, fallback_slug):
     org-api and the Today page know a site by; the slug only when no UUID is
     known, so a record is never dropped for want of one."""
     return (site_info or {}).get("site_uuid") or fallback_slug
-
-
-def build_weather_findings(site_info, target_date, today_iso,
-                           fetch=weather_advice.hourly_forecast,
-                           programme=None):
-    """What the weather meant for the day's work, DECIDED BY CODE.
-
-    Until 2026-09-29 the report handed the model one sentence of daily totals
-    and asked it to "note the linkage" between weather and work -- every
-    threshold, every trade, left to the model and decided differently each
-    night. weather_advice.assess makes those calls from the hourly actuals;
-    the lines here are its fixed template, so the compliance record says the
-    same thing about the same weather every time.
-
-    THE DAY'S PROGRAMME decides what is impacted (owner, 2026-09-29): the
-    tasks running on the day and not finished are matched against the
-    weather; a day whose exposed work is all indoors gets one "no impact"
-    line. A site with no programme names the trades weather affects in
-    general. `impact_basis` ("planned" | "general") says which it was.
-    None when the site has no coordinate or the fetch fails -- the report
-    says "not recorded" rather than guessing.
-    """
-    lat = site_info.get("latitude")
-    lng = site_info.get("longitude")
-    if lat is None or lng is None:
-        return None
-    historical = bool(today_iso and target_date < today_iso)
-    try:
-        hours = fetch(lat, lng, target_date, historical)
-    except Exception as e:
-        logger.warning(f"hourly weather fetch failed for {target_date}: {e}")
-        return None
-    if not hours:
-        return None
-    planned = weather_advice.planned_from_programme(programme, target_date)
-    f = weather_advice.assess(hours, planned=planned, actual=historical)
-    return {
-        "lines": weather_advice.render_template(f),
-        "weather_day": f["weather_day"] if historical else None,
-        "actual": historical,
-        "impact_basis": "general" if planned is None else "planned",
-        "planned": planned,
-        "items": f["items"],
-    }
 
 
 def weather_record_key(site_id, target_date, actual):
