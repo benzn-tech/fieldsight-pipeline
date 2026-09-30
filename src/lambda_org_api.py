@@ -483,6 +483,9 @@ def dispatch(conn, event, method, route):
         if method == "POST":
             return create_org_site(conn, caller, parse_body(event))
 
+    if route == "/companies" and method == "GET":
+        return list_org_companies(conn, caller)
+
     if route == "/members":
         if method == "GET":
             return list_members(conn, caller, event)
@@ -4340,6 +4343,31 @@ def list_site_contributors(conn, caller, site_id, event):
         return error("date required (YYYY-MM-DD)", 400)
     folders = topics.list_contributor_folders_for_site_date(conn, site_id, date)
     return ok({"folders": folders, "site": str(site_id), "date": date})
+
+
+# ----------------------------------------------------------
+# /companies
+# ----------------------------------------------------------
+def list_org_companies(conn, caller):
+    """GET /companies -- {id, name} of every tenant, for the site-create company picker.
+
+    WHO: platform_admin only, and the gate is is_cross_company -- the same predicate
+    that alone lets create_org_site / patch_org_site honour target_company_id. This
+    list exists to feed that parameter, so whoever may not send target_company_id has
+    no use for it. A company admin/gm passes resolve_scope()==ALL but that is a
+    SAME-company scope (list_members gates its company branch on it); it must not buy
+    a directory of other tenants, so resolve_scope is deliberately NOT consulted here.
+    Every other role is refused. The list is every tenant's name: default is refusal.
+
+    WHAT: id and name only. companies.list_companies also selects industry and
+    created_at, and the row may grow; the projection is explicit so a widened repo
+    query cannot leak a new column through this route.
+    """
+    if not is_cross_company(caller["global_role"]):
+        return error("platform_admin role required", 403)
+    return ok({"companies": [
+        {"id": str(c["id"]), "name": c["name"]} for c in companies.list_companies(conn)
+    ]})
 
 
 # ----------------------------------------------------------
