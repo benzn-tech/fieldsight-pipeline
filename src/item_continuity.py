@@ -13,6 +13,7 @@ Pure: no psycopg, no boto3, no LLM, so every guard is unit-testable.
 """
 import hashlib
 import json
+import re
 import unicodedata
 import uuid
 from collections import namedtuple
@@ -32,7 +33,13 @@ MIN_ECHO_TOKENS = 4
 PriorItem = namedtuple("PriorItem", "alias list_name text item_id")
 
 _OPEN, _CLOSE = "<<<PRIOR_ITEMS>>>", "<<<END_PRIOR_ITEMS>>>"
-_SENTINELS = ('"""', _OPEN, _CLOSE)
+# Item text is model output derived from speech, so scrubbing must survive a spaced or
+# differently-cased echo of the real fence ("<<< end_prior_items >>>") and not just the exact
+# literal -- otherwise that echo reads, to whatever re-parses the rendered block, as a genuine
+# structural boundary instead of quoted data.
+_FENCE_RE = re.compile(r"<<<\s*(?:END_)?PRIOR_ITEMS\s*>>>", re.IGNORECASE)
+_TRIPLE_QUOTE_RE = re.compile(r'"\s*"\s*"')
+_PARTIAL_FENCE_RE = re.compile(r"<{3,}|>{3,}")   # a lone run of the fence's own characters
 
 CONTINUITY_INSTRUCTION = (
     "The block below lists the items published from an EARLIER pass over this same session. "
@@ -119,8 +126,9 @@ def prior_items(prev, cap=PRIOR_CAP_PER_KIND):
 
 
 def _scrub(text):
-    for s in _SENTINELS:
-        text = text.replace(s, "")
+    text = _FENCE_RE.sub("", text)
+    text = _TRIPLE_QUOTE_RE.sub("", text)
+    text = _PARTIAL_FENCE_RE.sub("", text)
     return " ".join(text.split())
 
 
@@ -231,16 +239,24 @@ def resolve(topics, prior):
 
 def clean_item_ids(topics):
     """Writer side: a malformed or duplicated item_id is stored as NULL on EVERY copy and matched
-    by text instead (spec S5, final review M6). Returns how many were cleaned."""
+    by text instead (spec S5, final review M6). Returns how many were cleaned.
+
+    Grouped by the CANONICAL uuid string, not the raw one: two copies of the same id that differ
+    only in case are still one id worn twice, and both must be nulled -- keying on the raw string
+    would let the differently-cased copy slip through as if it were a distinct, valid id."""
     seen = {}
     for _ln, child in _children(topics):
         iid = child.get("item_id")
         if iid is None:
             continue
-        seen.setdefault(str(iid) if _valid_uuid(iid) else None, []).append(child)
+        try:
+            key = str(uuid.UUID(str(iid)))
+        except (ValueError, TypeError, AttributeError):
+            key = None
+        seen.setdefault(key, []).append(child)
     cleaned = 0
-    for iid, group in seen.items():
-        if iid is None or len(group) > 1:
+    for key, group in seen.items():
+        if key is None or len(group) > 1:
             for child in group:
                 child["item_id"] = None
                 cleaned += 1
