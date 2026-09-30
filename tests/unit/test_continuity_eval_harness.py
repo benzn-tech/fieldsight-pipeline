@@ -359,7 +359,7 @@ def test_dry_run_makes_no_llm_call_and_no_deployed_config_load(monkeypatch, tmp_
     assert (out_dir / "sessions.json").exists()
     assert not (out_dir / "counts.json").exists()  # dry-run never computes counts
     written_sessions = json.loads((out_dir / "sessions.json").read_text(encoding="utf-8"))
-    assert written_sessions == [fake_session]
+    assert written_sessions == [{**fake_session, "data_env": "test", "config_env": "test"}]
 
 
 def test_dry_run_leaves_aws_profile_and_region_env_unchanged(monkeypatch, tmp_path):
@@ -387,6 +387,97 @@ def test_dry_run_leaves_aws_profile_and_region_env_unchanged(monkeypatch, tmp_pa
 
     assert "AWS_PROFILE" not in os.environ
     assert "AWS_DEFAULT_REGION" not in os.environ
+
+
+# ---------------------------------------------------------------------------
+# --config-env: separable from --env (data source) per spec S7 "Decision rule".
+# ---------------------------------------------------------------------------
+
+def test_config_env_defaults_to_env_on_dry_run(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(run_mod.llm_utils, "call_llm",
+                         lambda *a, **k: (None, "should never run"))
+    monkeypatch.setattr(run_mod, "load_deployed_llm_env", lambda *a, **k: None)
+    fake_session = {"env": "test", "user_folder": "worker1", "date": "2026-09-01",
+                     "session_base": "sess1", "n_segments": 5}
+    monkeypatch.setattr(sessions_mod, "list_candidate_sessions",
+                         lambda env, **kw: [fake_session])
+    monkeypatch.setattr(sessions_mod, "s3_client", lambda **kw: object())
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+
+    out_dir = tmp_path / "continuity_eval_runs" / "run_default"
+    run_mod.main(["--env", "test", "--sessions", "1", "--shapes", "a",
+                  "--out", str(out_dir), "--dry-run"])
+
+    # dry-run output shows both env values, and they're equal since --config-env
+    # was never passed.
+    first_line = json.loads(capsys.readouterr().out.splitlines()[0])
+    assert first_line == {"data_env": "test", "config_env": "test"}
+    written_sessions = json.loads((out_dir / "sessions.json").read_text(encoding="utf-8"))
+    assert written_sessions == [{**fake_session, "data_env": "test", "config_env": "test"}]
+
+
+def test_config_env_diverges_from_env_on_dry_run(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(run_mod.llm_utils, "call_llm",
+                         lambda *a, **k: (None, "should never run"))
+    monkeypatch.setattr(run_mod, "load_deployed_llm_env", lambda *a, **k: None)
+    fake_session = {"env": "prod", "user_folder": "worker1", "date": "2026-09-01",
+                     "session_base": "sess1", "n_segments": 5}
+    list_calls = []
+
+    def fake_list(env, **kw):
+        list_calls.append(env)
+        return [fake_session]
+    monkeypatch.setattr(sessions_mod, "list_candidate_sessions", fake_list)
+    monkeypatch.setattr(sessions_mod, "s3_client", lambda **kw: object())
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+
+    out_dir = tmp_path / "continuity_eval_runs" / "run_diverge"
+    run_mod.main(["--env", "prod", "--config-env", "test", "--sessions", "1",
+                  "--shapes", "a", "--out", str(out_dir), "--dry-run"])
+
+    # Sessions are still listed from the prod bucket/env (--env), not the config env.
+    assert list_calls == ["prod"]
+    first_line = json.loads(capsys.readouterr().out.splitlines()[0])
+    assert first_line == {"data_env": "prod", "config_env": "test"}
+    written_sessions = json.loads((out_dir / "sessions.json").read_text(encoding="utf-8"))
+    assert written_sessions == [{**fake_session, "data_env": "prod", "config_env": "test"}]
+
+
+def test_config_env_test_loads_the_test_functions_env_for_a_prod_sessions_run(
+        monkeypatch, tmp_path):
+    """--env prod --config-env test: sessions come from the prod bucket, but the
+    deployed model config loaded into this process is TEST's -- the harness must pass
+    EXTRACT_SESSION_FUNCTION['test'], not EXTRACT_SESSION_FUNCTION['prod'], to
+    load_deployed_llm_env."""
+    load_calls = []
+    monkeypatch.setattr(run_mod, "load_deployed_llm_env",
+                         lambda function_name, **kw: load_calls.append(function_name))
+    # run_chain and build_counts do real S3/LLM work on a non-dry-run path; stub both
+    # out entirely so this test only exercises which config gets loaded and from
+    # which bucket sessions are listed.
+    monkeypatch.setattr(run_mod, "run_chain", lambda *a, **k: [])
+    monkeypatch.setattr(run_mod, "build_counts", lambda sessions: [])
+
+    fake_session = {"env": "prod", "user_folder": "worker1", "date": "2026-09-01",
+                     "session_base": "sess1", "n_segments": 5}
+    list_calls = []
+
+    def fake_list(env, **kw):
+        list_calls.append(env)
+        return [fake_session]
+    monkeypatch.setattr(sessions_mod, "list_candidate_sessions", fake_list)
+    monkeypatch.setattr(sessions_mod, "s3_client", lambda **kw: object())
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+
+    out_dir = tmp_path / "continuity_eval_runs" / "run_real"
+    run_mod.main(["--env", "prod", "--config-env", "test", "--sessions", "1",
+                  "--shapes", "a", "--out", str(out_dir)])
+
+    assert list_calls == ["prod"]  # data source is --env
+    assert load_calls == [run_mod.EXTRACT_SESSION_FUNCTION["test"]]  # config is --config-env
 
 
 def test_planned_runs_is_pure_and_covers_every_arm_and_rep():
