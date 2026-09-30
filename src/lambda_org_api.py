@@ -136,6 +136,7 @@ import recording_blocks
 import report_download_name
 import report_sections
 import report_template
+import report_modules
 import session_scope
 import sweep_state
 from db.connection import get_connection
@@ -624,6 +625,8 @@ def dispatch(conn, event, method, route):
         return list_report_templates(conn, caller, event)
     if route == "/templates" and method == "POST":
         return create_report_template(conn, caller, event)
+    if route == "/templates/modules" and method == "GET":
+        return list_report_modules(conn, caller, event)
     if route == "/templates/bindings" and method == "GET":
         return list_report_template_bindings(conn, caller, event)
     m_tb = re.match(r"^/templates/bindings/([^/]+)$", route)
@@ -10048,6 +10051,9 @@ def create_report_template(conn, caller, event):
     company_id, err = _template_company(conn, caller, event)
     if err is not None:
         return err
+    tpl, why = report_modules.pin_modules(conn, company_id, tpl)
+    if why:
+        return error(why, 400)
     owner = None if scope == "org" else caller["id"]
     slug = report_template.slugify(name, "tpl-" + uuid.uuid4().hex[:8])
     try:
@@ -10112,6 +10118,22 @@ def list_report_template_versions(conn, caller, template_id):
                             for v in report_templates.list_versions(conn, template_id)]})
 
 
+def list_report_modules(conn, caller, event):
+    """GET /api/org/templates/modules -- the modules this company can pick.
+
+    Each is {key, title, kind, columns?, purpose, hash, source}: the company's
+    own version where we have written one ("company"), else ours ("standard").
+    The editor pins {key, hash} into a section; the save re-checks the pair
+    (report_modules.pin_modules), so this list is a menu, not an authority.
+    """
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    report_modules.sync_standard(conn)
+    return ok({"modules": report_modules.resolve_all(conn, company_id),
+               "note_max_chars": report_modules.MAX_NOTE_CHARS})
+
+
 def add_report_template_version(conn, caller, template_id, event):
     """POST /api/org/templates/{id}/versions -- the only way content changes."""
     body = parse_body(event)
@@ -10124,6 +10146,12 @@ def add_report_template_version(conn, caller, template_id, event):
     err = _may_write_template(caller, row)
     if err is not None:
         return err
+    # Module sections get their published text, by the TEMPLATE's company --
+    # a platform_admin editing another company's template must be checked
+    # against that company's modules, not the operator's own.
+    tpl, why = report_modules.pin_modules(conn, row["company_id"], tpl)
+    if why:
+        return error(why, 400)
     note = body.get("change_note")
     if note is not None and not isinstance(note, str):
         return error("change_note must be a string", 400)
