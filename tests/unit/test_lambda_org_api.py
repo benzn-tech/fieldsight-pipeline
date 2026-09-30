@@ -2803,7 +2803,11 @@ def test_timeline_shim_serves_s3_verbatim_when_no_extraction_topics(presign_wire
     res = org.lambda_handler(make_event("GET", "/api/org/timeline",
                                         params={"date": "2026-07-07", "user": "Ada_L"}), None)
     assert res["statusCode"] == 200
-    assert body_of(res) == verbatim_doc  # EXACT passthrough -- nothing added/dropped/renamed
+    # The document passes through untouched EXCEPT for one added key: `user`, the
+    # folder this response was served for. Equality (not a subset check) is the
+    # point -- a second stray key would fail here, which is what makes this a
+    # guard on the response contract rather than a smoke test.
+    assert body_of(res) == {**verbatim_doc, "user": "Ada_L"}
 
 
 def test_timeline_shim_renders_override_when_extraction_topics_exist(presign_wired):
@@ -3017,7 +3021,7 @@ def test_non_all_scope_user_equals_own_folder_200(presign_wired):
     res = org.lambda_handler(make_event("GET", "/api/org/timeline",
                                         params={"date": "2026-07-14", "user": "Ada_L"}), None)
     assert res["statusCode"] == 200
-    assert body_of(res) == doc
+    assert body_of(res) == {**doc, "user": "Ada_L"}
 
 
 def test_non_all_scope_absent_user_self_serves_200(presign_wired):
@@ -3036,7 +3040,7 @@ def test_non_all_scope_absent_user_self_serves_200(presign_wired):
     # order) before falling back to verbatim S3.
     assert seen == ["extractions/Ada_L/2026-07-14/", "reports/2026-07-14/Ada_L/"]
     assert res["statusCode"] == 200
-    assert body_of(res) == doc
+    assert body_of(res) == {**doc, "user": "Ada_L"}
 
 
 def test_non_all_scope_without_folder_name_403(presign_wired):
@@ -3161,7 +3165,7 @@ def test_admin_one_candidate_recurses_to_single_user(presign_wired):
     res = org.lambda_handler(make_event(
         "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
     assert res["statusCode"] == 200
-    assert body_of(res) == verbatim_doc
+    assert body_of(res) == {**verbatim_doc, "user": "Ada_L"}
 
 
 def test_site_acl_filters_override_rows(presign_wired):
@@ -3537,7 +3541,7 @@ def test_timeline_worker_defaults_to_self(presign_wired):
     res = org.lambda_handler(make_event(
         "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
     assert res["statusCode"] == 200
-    assert body_of(res) == doc
+    assert body_of(res) == {**doc, "user": "Ada_L"}
 
 
 def test_timeline_site_manager_may_view_worker_on_site(presign_wired):
@@ -3788,7 +3792,7 @@ def test_timeline_pm_own_timeline_unaffected_by_clip(presign_wired):
     res = org.lambda_handler(make_event(
         "GET", "/api/org/timeline", params={"date": "2026-07-14", "user": "PM_Folder"}), None)
     assert res["statusCode"] == 200
-    assert body_of(res) == own_doc                       # own timeline served verbatim, prose intact
+    assert body_of(res) == {**own_doc, "user": "PM_Folder"}                       # own timeline served verbatim, prose intact
 
 
 def test_timeline_admin_all_scope_sees_full_target_content(presign_wired):
@@ -3812,7 +3816,7 @@ def test_timeline_admin_all_scope_sees_full_target_content(presign_wired):
     res = org.lambda_handler(make_event(
         "GET", "/api/org/timeline", params={"date": "2026-07-14", "user": "W_Folder"}), None)
     assert res["statusCode"] == 200
-    assert body_of(res) == full_doc                      # admin (ALL scope) still sees everything
+    assert body_of(res) == {**full_doc, "user": "W_Folder"}                      # admin (ALL scope) still sees everything
 
 
 # ----------------------------------------------------------
