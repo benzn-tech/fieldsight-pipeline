@@ -31,6 +31,13 @@ class FakeConn:
         # manager, so the block either runs whole or propagates, like the real one.
         return self
 
+    def rollback(self):
+        # The real connection has this and handlers now use it: `with conn:`
+        # commits on a CLEAN exit, and `error(...)` is a return, so a handler
+        # that has already written must roll back explicitly before answering
+        # with an error. Recorded rather than ignored so a test can assert it.
+        self.rolled_back = True
+
     def execute(self, *a, **k):
         # /me now reads the caller's per-site membership roles: it used to report
         # `global_role` alone, so a person promoted to site_manager ON A SITE showed as
@@ -8051,3 +8058,106 @@ def test_a_row_that_was_never_counted_is_version_one():
     ])
     item = org.render_report_shape([row], None, "2026-09-01", "Ada_L")["topics"][0]["action_items"][0]
     assert item["version"] == 1
+
+
+# ---- patch_org_site: the review round on the move (partial writes, id forms) ----
+# Every test below pins a defect found reviewing the move, not the move itself.
+
+
+def test_patch_site_uppercased_own_company_is_not_read_as_a_move(move_wired):
+    """The SAME company in a different case must not look like another one.
+
+    `target_company_id` was compared as a raw string, so `ABC-...` and `abc-...`
+    -- the same uuid -- read as a real move. The move then looked the site's own
+    slug up in its own company, found the site ITSELF, and answered
+    409 "target company already has a site with slug 'sb1151'": a rename refused
+    on a collision with itself.
+    """
+    wired, calls = move_wired
+    wired.setattr(org.sites, "get_company_site_by_slug",
+                  lambda conn, cid, slug: {"id": "some-other-site"})   # would 409
+    res = _patch({"target_company_id": C_OLD.upper(), "name": "Renamed"})
+    assert res["statusCode"] == 200, res["body"]
+    assert calls["move"] == []                       # no move: same company
+    assert calls["slug_lookup"] == []                # and the slug never consulted
+
+
+def test_patch_site_braced_company_id_reaches_the_db_canonical(move_wired):
+    """uuid.UUID accepts `{...}` and unhyphenated forms; psycopg does not. The
+    braced form was passed through unchanged, so the company lookup and the
+    UPDATE both received a string the database cannot cast."""
+    wired, calls = move_wired
+    res = _patch({"target_company_id": "{" + C_NEW + "}"})
+    assert res["statusCode"] == 200, res["body"]
+    assert calls["company_lookup"] == [C_NEW]        # canonical, not braced
+    assert calls["move"] == [("s-1", C_OLD, C_NEW)]
+
+
+def test_patch_site_non_uuid_own_company_id_is_still_a_noop(move_wired):
+    """Normalising must never be STRICTER than create_org_site's plain compare.
+    A value that is not a uuid at all still matches itself, so a caller echoing
+    back their own company id is a no-op rather than a refusal."""
+    wired, calls = move_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "company_id": "not-a-uuid",
+                                     "global_role": "admin"})
+    res = _patch({"target_company_id": "not-a-uuid", "name": "N"})
+    assert res["statusCode"] == 200, res["body"]
+    assert calls["move"] == []
+
+
+def test_patch_site_empty_slug_is_still_checked_for_collision(move_wired):
+    """'' is an INDEXABLE value -- only NULL is distinct under a unique index --
+    so `if slug and ...` skipped the check for an empty slug and let the move hit
+    idx_sites_company_slug as a 500 instead of a 409."""
+    wired, calls = move_wired
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": C_OLD, "slug": ""})
+    wired.setattr(org.sites, "get_company_site_by_slug",
+                  lambda conn, cid, slug: (calls["slug_lookup"].append((cid, slug))
+                                           or {"id": "incumbent"}))
+    res = _patch({"target_company_id": C_NEW})
+    assert res["statusCode"] == 409, res["body"]
+    assert calls["slug_lookup"] == [(C_NEW, "")]
+    assert calls["move"] == []
+
+
+def test_patch_site_a_null_slug_skips_the_check(move_wired):
+    """The other half: NULL really is distinct under the index, so a site
+    without a slug cannot collide and must not be refused."""
+    wired, calls = move_wired
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": C_OLD, "slug": None})
+    res = _patch({"target_company_id": C_NEW})
+    assert res["statusCode"] == 200, res["body"]
+    assert calls["slug_lookup"] == []
+    assert calls["move"] == [("s-1", C_OLD, C_NEW)]
+
+
+def test_patch_site_a_failed_move_rolls_back_the_update(move_wired):
+    """`with conn:` COMMITS on a clean exit and `error(...)` is a RETURN, not a
+    raise. update_site has already written by the time the move can fail (a
+    concurrent archive), so without an explicit rollback the caller is told 404
+    while their rename is committed."""
+    wired, calls = move_wired
+    wired.setattr(org.sites, "move_site_company", lambda conn, sid, frm, to: None)
+    conn = FakeConn()
+    wired.setattr(org, "get_connection", lambda *a, **k: conn)
+    res = _patch({"target_company_id": C_NEW, "name": "Renamed"})
+    assert res["statusCode"] == 404, res["body"]
+    assert calls["update"], "update_site must have run -- otherwise this proves nothing"
+    assert getattr(conn, "rolled_back", False), "the committed rename is the bug"
+
+
+def test_patch_site_a_failed_icon_upload_writes_nothing(move_wired):
+    """The icon relocate ran AFTER update_site and after the move, and its
+    failure path returns 400 -- a clean exit, which commits. So 'please
+    re-upload the image' was returned with the site already moved to another
+    company. The relocate now happens before any DB write."""
+    wired, calls = move_wired
+    wired.setattr(org, "_relocate_asset", lambda src, dst: False)
+    res = _patch({"target_company_id": C_NEW,
+                  "icon_s3_key": f"{org.ORG_ASSETS_PREFIX}pending/sub-1/i.png"})
+    assert res["statusCode"] == 400, res["body"]
+    assert calls["update"] == [], "no row may be written before the upload is secured"
+    assert calls["move"] == [], "the site must not have changed tenant"
