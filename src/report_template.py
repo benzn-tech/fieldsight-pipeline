@@ -11,6 +11,8 @@ import json
 import os
 import re
 
+import checklist
+
 TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "report_templates")
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
@@ -36,6 +38,10 @@ SECTION_KINDS = {
     # `table` takes its columns from the section (see _table_shape). The string
     # here is the fallback wording only; nothing uses it without columns.
     "table": "as a markdown table",
+    # `checklist` takes its sentence from checklist.shape_sentence and its
+    # questions from the section's `items` (customer data, fenced). The answer
+    # is checked and the table rebuilt in code (checklist.apply).
+    "checklist": "as a checklist",
 }
 DEFAULT_SECTION_KIND = "narrative"
 
@@ -185,6 +191,8 @@ def _section_shape(section):
         return None
     if kind == "table":
         return _table_shape(section)
+    if kind == "checklist":
+        return checklist.shape_sentence()
     # Unknown takes the explicit default, which is what the model does anyway,
     # so it needs no line. What it must never do is reach the prompt itself.
     return SECTION_KINDS.get(kind)
@@ -239,6 +247,11 @@ def _rendered_section(section, authored, depth):
     # this section -- an empty-state wording, a grouping, a threshold.
     body = purpose + ("\nThe customer's note for this section: %s" % note.strip()
                       if note.strip() else "")
+    # A CHECKLIST'S QUESTIONS are the customer's, numbered, in the plan. They
+    # are data like the rest of it: fenced when the template is the customer's.
+    if str(section.get("kind") or "").strip().lower() == "checklist" and section.get("items"):
+        block = checklist.items_block([str(i) for i in section["items"]])
+        body += "\n" + (_fenceable(block) if authored else block)
     out = ["%s %s\n%s" % (hashes, title, body)]
     if depth < MAX_SECTION_DEPTH:
         for child in list(section.get("children") or []):
@@ -460,6 +473,11 @@ def _section_error(section, where):
         if k not in SECTION_KINDS and k not in LEGACY_SECTION_KINDS:
             return "%s: kind must be one of %s" % (
                 where, ", ".join(sorted(SECTION_KINDS)))
+
+    if kind is not None and str(kind).strip().lower() == "checklist":
+        why = checklist.validate_items(section.get("items"), where)
+        if why:
+            return why
 
     children = section.get("children")
     if children is not None:
