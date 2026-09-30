@@ -133,19 +133,36 @@ def test_a_list_item_keeps_its_bullet_and_gets_its_photograph():
 
 
 @needs_docx
-def test_a_tag_on_a_table_row_puts_the_photograph_under_the_table():
-    """A picture cannot sit between two rows."""
-    answer = ("### Actions\nItem | Assigned | Due\n---|---|---\n"
-              "Re-level crane pad | Sam | Friday [t1]\nOrder rebar | Brad | Monday\n")
+def test_a_tag_on_a_table_row_puts_the_photograph_in_that_rows_photos_cell():
+    """One row, one topic, its pictures in the row (owner, 2026-09-30). They
+    used to be gathered under the whole table, away from the line they
+    evidence. The Photos column is added by the renderer, not asked of the
+    model, and only when some row has pictures."""
+    answer = "\n".join(["### Actions", "Item | Assigned | Due", "---|---|---",
+                        "Re-level crane pad | Sam | Friday [t1]",
+                        "Order rebar | Brad | Monday", ""])
     sections = sr._prose_sections(answer)
-    sr._place_photos(sections, {"t1": [_png()]})
+    sr._place_photos(sections, {"t1": [_png(), _png()]})
     doc = _doc(sections)
     assert len(doc.tables) == 1
-    assert [c.text for c in doc.tables[0].rows[1].cells] == ["Re-level crane pad", "Sam", "Friday"]
-    body = doc.element.body
-    kids = list(body)
+    rows = doc.tables[0].rows
+    assert [c.text for c in rows[0].cells] == ["Item", "Assigned", "Due", "Photos"]
+    assert [c.text for c in rows[1].cells[:3]] == ["Re-level crane pad", "Sam", "Friday"]
+    assert len(rows[1].cells[3]._tc.findall(".//" + BLIP)) == 2, "both pictures in the tagged row"
+    assert not rows[2].cells[3]._tc.findall(".//" + BLIP), "none in the untagged row"
+    kids = list(doc.element.body)
     t = kids.index(doc.tables[0]._tbl)
-    assert kids[t + 1].findall(".//" + BLIP), "the photograph comes straight after the table"
+    assert not (t + 1 < len(kids) and kids[t + 1].findall(".//" + BLIP)), "nothing heaped under the table"
+
+
+@needs_docx
+def test_a_table_with_no_photographs_gets_no_photos_column():
+    answer = "\n".join(["### Actions", "Item | Assigned | Due", "---|---|---",
+                        "Order rebar | Brad | Monday", ""])
+    sections = sr._prose_sections(answer)
+    sr._place_photos(sections, {})
+    doc = _doc(sections)
+    assert [c.text for c in doc.tables[0].rows[0].cells] == ["Item", "Assigned", "Due"]
 
 
 # ---- the prompt -------------------------------------------------------------
