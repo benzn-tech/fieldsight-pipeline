@@ -285,6 +285,22 @@ def test_the_admitted_limit_reaches_the_column_it_is_stored_in(monkeypatch):
     assert se._admitted_limit() is None
 
 
+def test_recording_conditions_reach_add_sample_on_every_enrolment_path(captured, writer_db,
+                                                                       monkeypatch):
+    """Design 2026-09-30 step 1: level_dbfs/noise_dbfs/snr_db are computed by the embedder
+    (the numpy side) and must reach `add_sample` on both the anchor enrolment and every
+    harvested sample -- the same seam three earlier defects lived on, driven through both
+    real handlers rather than asserted on either side alone."""
+    _run_embedder(monkeypatch, _artifact(enrol={"voiceprint_id": "vp-1"}))
+    for payload in captured:
+        vw.lambda_handler(payload, None)
+    assert writer_db["samples"], "nothing was stored, so this proves nothing"
+    for kw in writer_db["samples"]:
+        for field in ("level_dbfs", "noise_dbfs", "snr_db"):
+            assert kw.get(field) is not None, (
+                f"a stored sample crossed the seam without {field}")
+
+
 def test_no_field_crosses_this_seam_unread_in_either_direction():
     """The census, kept as a test so it cannot quietly stop being true.
 

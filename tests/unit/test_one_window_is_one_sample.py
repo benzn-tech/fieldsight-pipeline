@@ -100,6 +100,17 @@ def test_windows_a_few_hundredths_apart_are_one_sample():
     assert "ON CONFLICT (voiceprint_id, s3_key, round(window_start_s), "            "round(window_end_s))" in _insert_sql()
 
 
+def test_a_repeat_window_does_not_overwrite_recording_conditions_with_null():
+    """Design 2026-09-30 step 1: an older producer that never computed level_dbfs/noise_dbfs/
+    snr_db must not blank out values a newer producer already stored for the same window --
+    COALESCE keeps whichever side has a value, unlike `source`/`created_by`/`correction_ref`
+    above, which only upgrade in one direction (propagation -> correction)."""
+    sql = _insert_sql()
+    for col in ("level_dbfs", "noise_dbfs", "snr_db"):
+        assert col in sql, f"{col} is missing from the INSERT"
+        assert f"{col} = COALESCE(EXCLUDED.{col}, speaker_voiceprint_samples.{col})" in sql
+
+
 def test_the_exact_window_index_is_dropped():
     """Two unique indexes would each have to be satisfied; the exact one would not be
     inferred by the conflict target and would raise instead of updating."""
