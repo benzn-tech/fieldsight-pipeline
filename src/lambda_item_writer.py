@@ -1433,7 +1433,8 @@ def write_extraction_items(date, user_folder, extraction_key):
             if claim_stats["unresolved"] > 0:
                 logger.warning("continuity claims: %s key=%s", claim_stats, extraction_key)
         except Exception:
-            logger.warning("continuity decision records not stored for %s", extraction_key)
+            logger.warning("continuity decision records not stored for %s", extraction_key,
+                            exc_info=True)
 
         # THE DAY'S PHOTOS, BOUND ONCE, AFTER THIS EXTRACTION'S TOPICS EXIST.
         # Never fatal: a rebind that turned a good extraction into a failed one
