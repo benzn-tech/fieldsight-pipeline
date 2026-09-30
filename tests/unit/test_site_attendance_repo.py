@@ -222,6 +222,54 @@ def test_arm_2_excludes_withdrawn_profiles():
         "both the explicit arm and arm 2 must exclude withdrawn profiles")
 
 
+# ---- arm 3: named at this site in the last N NZ days (Task 3) ----------------
+
+
+def test_arm_3_session_base_and_human_source():
+    conn = FakeConn(results=[[]])
+    site_attendance.on_roster_profile_ids(conn, CO, SITE, "2026-09-30")
+    sql = conn.calls[0]["sql"]
+    assert "t.session_base = 'sid' || ms.session_id" in sql
+    assert "t.source = 'correction'" in sql
+    assert "t.superseded_at IS NULL" in sql
+
+
+def test_arm_3_anchors_on_the_roster_day_not_the_clock():
+    """Correction 3: the lookback is anchored on `attend_date`, never `now()` or
+    `CURRENT_DATE`, so re-running an old session is reproducible."""
+    conn = FakeConn(results=[[]])
+    site_attendance.on_roster_profile_ids(conn, CO, SITE, "2026-09-30")
+    sql = conn.calls[0]["sql"]
+    assert "AT TIME ZONE 'Pacific/Auckland'" in sql
+    assert "BETWEEN %(day)s::date - %(lookback)s AND %(day)s::date" in sql
+    assert "now()" not in sql
+    assert "CURRENT_DATE" not in sql
+
+
+def test_arm_3_name_arm_covers_a_null_voiceprint_id():
+    """Correction 4: a correction row's `voiceprint_id` may be NULL (0040 dropped the NOT
+    NULL for exactly this case), so the profile join must also match by name."""
+    conn = FakeConn(results=[[]])
+    site_attendance.on_roster_profile_ids(conn, CO, SITE, "2026-09-30")
+    sql = conn.calls[0]["sql"]
+    assert "p.id = t.voiceprint_id" in sql
+    assert "t.voiceprint_id IS NULL AND" in sql
+    assert "lower(p.display_name) = lower(t.display_name)" in sql
+
+
+def test_arm_3_site_test_falls_back_to_a_recording_of_the_session():
+    """Correction 2: `meeting_session.site_id` is NULL for every offline-opened session, so
+    the site test must also try a recording of that session (BUG-41 authority)."""
+    conn = FakeConn(results=[[]])
+    site_attendance.on_roster_profile_ids(conn, CO, SITE, "2026-09-30")
+    sql = conn.calls[0]["sql"]
+    assert "ms.site_id = %(site)s OR EXISTS (SELECT 1 FROM recordings" in sql
+    assert "r2.company_id = ms.company_id" in sql
+    assert "r2.user_id = ms.user_id" in sql
+    assert "r2.site_id = %(site)s" in sql
+    assert "ESCAPE '\\'" in sql
+
+
 # ---- for_day / remove --------------------------------------------------------
 
 

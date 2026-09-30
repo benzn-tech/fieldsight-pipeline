@@ -188,6 +188,40 @@ _DERIVED_SQL = (
     "WHERE r.company_id = %(co)s AND r.site_id = %(site)s "
     "  AND r.kind IN ('audio', 'video') "
     "  AND split_part(r.s3_key, '/', 4) = %(day)s "
+    "  AND p.status <> 'withdrawn' "
+
+    # Arm 3 (Task 3): people a human named at this site in the last `lookback_days` NZ
+    # days. Led from `meeting_session`, not from a company-wide scan of
+    # `speaker_turn_names` (correction 6: this query is driven from the writer on every
+    # extraction, live ones included, so it must reach `speaker_turn_names` only through
+    # `idx_turn_names_session`). `t.session_base = 'sid' || ms.session_id` is the join
+    # (correction 2: `session_base` is the canonical `sid{32hex}`, `session_id` is the bare
+    # hex). `source = 'correction' AND superseded_at IS NULL` is the human, live filter
+    # (correction 4); the profile join also matches by name because a correction's
+    # `voiceprint_id` can be NULL (0040). The lookback is anchored on `attend_date`, never
+    # `now()` (correction 3), converted to the session's own NZ day. The site test tries
+    # `meeting_session.site_id` first and falls back to a recording of the same session
+    # (correction 2: offline-opened sessions have `site_id IS NULL`; `recordings.site_id`
+    # is the authority, BUG-41). The `LIKE ... ESCAPE '\'` mirrors
+    # `repositories.recordings.site_for_media`'s own session-key match.
+    "UNION "
+    "SELECT p.id FROM meeting_session ms "
+    "JOIN speaker_turn_names t ON t.company_id = ms.company_id "
+    " AND t.session_base = 'sid' || ms.session_id "
+    " AND t.source = 'correction' AND t.superseded_at IS NULL "
+    "JOIN speaker_voiceprints p ON p.company_id = t.company_id "
+    " AND (p.id = t.voiceprint_id "
+    "      OR (t.voiceprint_id IS NULL AND t.display_name IS NOT NULL "
+    "          AND lower(p.display_name) = lower(t.display_name))) "
+    "WHERE ms.company_id = %(co)s "
+    "  AND (COALESCE(ms.opened_at, ms.created_at) AT TIME ZONE 'Pacific/Auckland')::date "
+    "      BETWEEN %(day)s::date - %(lookback)s AND %(day)s::date "
+    "  AND (ms.site_id = %(site)s "
+    "       OR EXISTS (SELECT 1 FROM recordings r2 "
+    "                   WHERE r2.company_id = ms.company_id AND r2.user_id = ms.user_id "
+    "                     AND r2.site_id = %(site)s "
+    "                     AND r2.s3_key LIKE '%%\\_sid' || ms.session_id || '\\_c%%' "
+    "                     ESCAPE '\\')) "
     "  AND p.status <> 'withdrawn'"
 )
 
