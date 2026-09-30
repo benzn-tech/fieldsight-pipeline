@@ -126,7 +126,7 @@ def test_a_day_with_no_group_is_untouched(presign_wired):
         "GET", "/api/org/timeline", params={"date": DATE, "user": JOINER}), None)
 
     assert res["statusCode"] == 200
-    assert body_of(res) == doc, "byte-verbatim passthrough must survive this change"
+    assert body_of(res) == {**doc, "user": JOINER}, "byte-verbatim passthrough must survive this change"
 
 
 def test_a_group_whose_merge_has_not_landed_changes_nothing(presign_wired):
@@ -144,7 +144,7 @@ def test_a_group_whose_merge_has_not_landed_changes_nothing(presign_wired):
         "GET", "/api/org/timeline", params={"date": DATE, "user": JOINER}), None)
 
     assert res["statusCode"] == 200
-    assert body_of(res) == doc
+    assert body_of(res) == {**doc, "user": JOINER}
 
 
 def test_the_key_is_read_never_re_derived(presign_wired):

@@ -7908,6 +7908,9 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
         # return the same rows twice under a different provenance.
         shape = _aurora_shape(prefix, merged)
         if shape is not None:
+            # `user` = the folder this read actually served, the same key the
+            # 404 envelopes carry. `user_name` is a display name here, not a folder.
+            shape["user"] = user
             return ok(shape)
     if cross_user_clip:
         # CRITICAL-1: no in-scope Aurora topics for this (target, date). The
@@ -7933,7 +7936,8 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
         # would otherwise ride straight through to a customer's browser,
         # because this branch serves the S3 object byte-for-byte. Strip just
         # that one key on the way out; the stored S3 object is untouched.
-        return ok(_without_vendor_metadata(doc))
+        # Same `user` key as the Aurora path and the 404s: the served folder.
+        return ok({**_without_vendor_metadata(doc), "user": user})
     # `user` is the folder as a FIELD. It was only ever in the human-readable
     # message, and the client needs it to build the photo key -- leaving it
     # there would have made a UI parse an English sentence for an identifier.
