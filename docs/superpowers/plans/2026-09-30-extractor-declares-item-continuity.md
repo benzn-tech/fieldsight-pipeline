@@ -972,7 +972,7 @@ git commit -m "Writer stores item_id on all four child tables and cleans bad ids
   - `_carry_forward_one_table(...) -> tuple[int, dict]`: (touched orphans, `{"item_id": n, "exact": n, "fuzzy": n}`)
   - `_report_orphaned_human_edits(key, count, carried=None)` adds a `CarriedByMethod` EMF block when `carried` is given
 
-- [ ] **Step 1: Write the failing unit tests**
+- [x] **Step 1: Write the failing unit tests** — `tests/unit/test_carry_forward_pass0.py`, plus updated the pre-existing `_carry_forward_one_table` int-return assertion in `tests/unit/test_orphaned_human_edits_reported.py`.
 
 ```python
 import carry_forward_apply as cfa
@@ -1017,12 +1017,9 @@ def test_one_table_pass0_runs_before_text_and_counts_per_method(monkeypatch):
 
 Also: `test_emf_line_carries_carried_by_method` (capsys: the printed JSON has `CarriedByMethod` metrics with `Method` dimension values `item_id`/`exact`/`fuzzy`, and `OrphanedHumanEdits` is unchanged). Update existing callers and tests of `_carry_forward_one_table`'s old int return (grep tests for it).
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure** — confirmed (function didn't exist before implementing).
 
-Run: `bash /c/Users/camil/fswork/run-tests.sh -q tests/unit/test_carry_forward_pass0.py`
-Expected: FAIL.
-
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```python
 def _pair_by_item_id(old_rows, new_rows):
@@ -1073,16 +1070,11 @@ In `_carry_forward_children`: sum the orphan ints and add up the `carried` dicts
                 "CarriedByMethod": n, "key": key}))
 ```
 
-- [ ] **Step 4: Write the integration test** (real Postgres, committed-connection harness from `tests/integration/test_supersede_two_passes.py`)
+- [x] **Step 4: Write the integration test** (real Postgres, committed-connection harness from `tests/integration/test_supersede_two_passes.py`) — `tests/integration/test_carry_forward_pass0.py`; a `carry_forward.match` sanity check pins the reworded text really is below the fuzzy floor, so the test only passes if pass 0 (not the pre-existing text passes) did the carrying.
 
-Write a live-pass extraction whose action item has `item_id` X and text "Platform initial login using temporary password". Tick it: `status='done', updated_by=<user>`. Then write a final-pass extraction whose action item has `item_id` X and text "Platform login via temporary password at the site office". That text is far below 0.90, so only pass 0 can pair it. Assert the new live row has the old `stable_id`, `carried_from = old id` and `status='done'`. Clean up by the ids you created.
+- [x] **Step 5: Run** — all green: Step-5 list (37 passed), `tests/unit` (6885 passed, 1 pre-existing skip), `tests/integration` (467 passed, 6 pre-existing skips).
 
-- [ ] **Step 5: Run**
-
-Run: `bash /c/Users/camil/fswork/run-tests.sh -q tests/unit/test_carry_forward_pass0.py tests/integration/test_carry_forward_pass0.py tests/unit/test_orphaned_human_edits_reported.py tests/unit/test_carry_forward.py tests/integration/test_supersede_two_passes.py tests/unit/test_ingest_carries_forward.py`
-Expected: PASS.
-
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/carry_forward_apply.py tests/unit/test_carry_forward_pass0.py tests/integration/test_carry_forward_pass0.py tests/unit/test_orphaned_human_edits_reported.py
