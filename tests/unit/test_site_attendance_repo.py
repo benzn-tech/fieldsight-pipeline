@@ -180,6 +180,48 @@ def test_company_id_is_still_required_on_the_derived_path():
         site_attendance.on_roster_profile_ids(FakeConn(), None, SITE, "2026-09-30")
 
 
+# ---- arm 2: recorded at this site, this NZ day (Task 2) ----------------------
+
+
+def test_arm_2_dates_by_the_key_segment_not_started_at():
+    """Correction 1: `recordings` has no date column. The day is the S3 key's date
+    segment (`split_part(r.s3_key, '/', 4)`); `started_at` (UTC, device wall clock only
+    coincidentally) must not appear anywhere in the derived statement."""
+    conn = FakeConn(results=[[]])
+    site_attendance.on_roster_profile_ids(conn, CO, SITE, "2026-09-30")
+    sql = conn.calls[0]["sql"]
+    assert "split_part(r.s3_key, '/', 4) = %(day)s" in sql
+    assert "started_at" not in sql
+
+
+def test_arm_2_scopes_site_company_and_kind():
+    conn = FakeConn(results=[[]])
+    site_attendance.on_roster_profile_ids(conn, CO, SITE, "2026-09-30")
+    sql = conn.calls[0]["sql"]
+    assert "r.site_id = %(site)s" in sql
+    assert "r.company_id = %(co)s" in sql
+    assert "r.kind IN ('audio', 'video')" in sql
+
+
+def test_arm_2_matches_the_recorder_by_account_or_by_name():
+    """Correction 5: most profiles have `user_id IS NULL`, so the recorder arm must also
+    match by name via `concat_ws` (not `||`, which is NULL-poisoned by a missing last name,
+    `users.py:278`)."""
+    conn = FakeConn(results=[[]])
+    site_attendance.on_roster_profile_ids(conn, CO, SITE, "2026-09-30")
+    sql = conn.calls[0]["sql"]
+    assert "p.user_id = r.user_id" in sql
+    assert "lower(concat_ws(' ', u.first_name, u.last_name))" in sql
+
+
+def test_arm_2_excludes_withdrawn_profiles():
+    conn = FakeConn(results=[[]])
+    site_attendance.on_roster_profile_ids(conn, CO, SITE, "2026-09-30")
+    sql = conn.calls[0]["sql"]
+    assert sql.count("status <> 'withdrawn'") >= 2, (
+        "both the explicit arm and arm 2 must exclude withdrawn profiles")
+
+
 # ---- for_day / remove --------------------------------------------------------
 
 

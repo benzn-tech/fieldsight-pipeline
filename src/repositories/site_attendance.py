@@ -168,7 +168,27 @@ _DERIVED_SQL = (
     "       OR (p.user_id IS NOT NULL AND p.user_id = a.user_id) "
     "       OR lower(p.display_name) = lower(a.display_name)) "
     "WHERE p.company_id = %(co)s AND p.status <> 'withdrawn' "
-    "  AND a.site_id = %(site)s AND a.attend_date = %(day)s"
+    "  AND a.site_id = %(site)s AND a.attend_date = %(day)s "
+
+    # Arm 2 (Task 2): people who recorded at this site on this NZ day. `recordings` has no
+    # date column -- the day is the S3 key's date segment (correction 1: every other reader
+    # in repositories/recordings.py dates this way, and the key is the device's own wall
+    # clock, the same clock the matcher's `date` is on), never `started_at` (UTC, and a
+    # different clock). `kind IN ('audio','video')` excludes photo-only presence (correction
+    # 8). The recorder is matched to a profile by directory account first, then by full name
+    # via `concat_ws` -- not `||`, which is NULL-poisoned by a missing last name -- because
+    # most profiles carry `user_id IS NULL` (correction 5).
+    "UNION "
+    "SELECT p.id FROM recordings r "
+    "JOIN users u ON u.id = r.user_id "
+    "JOIN speaker_voiceprints p ON p.company_id = r.company_id "
+    " AND (p.user_id = r.user_id "
+    "      OR (p.user_id IS NULL "
+    "          AND lower(p.display_name) = lower(concat_ws(' ', u.first_name, u.last_name)))) "
+    "WHERE r.company_id = %(co)s AND r.site_id = %(site)s "
+    "  AND r.kind IN ('audio', 'video') "
+    "  AND split_part(r.s3_key, '/', 4) = %(day)s "
+    "  AND p.status <> 'withdrawn'"
 )
 
 
