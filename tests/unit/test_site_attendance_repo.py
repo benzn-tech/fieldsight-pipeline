@@ -12,6 +12,20 @@ from repositories import site_attendance
 CO = "11111111-1111-1111-1111-111111111111"
 SITE = "33333333-3333-3333-3333-333333333333"
 
+# The exact statement `on_roster_profile_ids` executed for #969, before the derived roster
+# (2026-09-30 plan Task 1), whitespace-normalised the way FakeCursor normalises every call
+# (" ".join(sql.split())). `derived=False` must run this verbatim -- byte-for-byte, not
+# "equivalent" -- forever, since it is the switch's rollback.
+_ROSTER_SQL_969 = " ".join("""
+    SELECT DISTINCT p.id FROM speaker_voiceprints p
+    JOIN site_attendance a ON a.company_id = p.company_id
+      AND (p.id = a.voiceprint_id
+           OR (p.user_id IS NOT NULL AND p.user_id = a.user_id)
+           OR lower(p.display_name) = lower(a.display_name))
+    WHERE p.company_id = %s AND p.status <> 'withdrawn'
+      AND a.site_id = %s AND a.attend_date = %s
+""".split())
+
 
 class FakeCursor:
     def __init__(self, conn):
@@ -128,6 +142,40 @@ def test_on_roster_profile_ids_empty_roster_returns_empty_set():
 
 
 def test_on_roster_profile_ids_requires_company_id():
+    with pytest.raises(ValueError):
+        site_attendance.on_roster_profile_ids(FakeConn(), None, SITE, "2026-09-30")
+
+
+# ---- derived roster (2026-09-30 plan, Task 1) --------------------------------
+
+
+def test_off_runs_exactly_the_969_query():
+    """`derived=False` is the rollback: it must run #969's statement byte-for-byte, with
+    #969's own positional params -- not a derived query that happens to return the same
+    rows today."""
+    conn = FakeConn(results=[[{"id": "vp-1"}]])
+    site_attendance.on_roster_profile_ids(conn, CO, SITE, "2026-09-30", derived=False)
+    assert len(conn.calls) == 1
+    call = conn.calls[0]
+    assert call["sql"] == _ROSTER_SQL_969, call["sql"]
+    assert call["params"] == (CO, SITE, "2026-09-30"), call["params"]
+
+
+def test_derived_is_the_default():
+    conn = FakeConn(results=[[]])
+    site_attendance.on_roster_profile_ids(conn, CO, SITE, "2026-09-30")
+    sql = conn.calls[0]["sql"]
+    assert "FROM recordings" in sql
+    assert "FROM meeting_session" in sql
+
+
+def test_lookback_default_is_fourteen():
+    conn = FakeConn(results=[[]])
+    site_attendance.on_roster_profile_ids(conn, CO, SITE, "2026-09-30")
+    assert conn.calls[0]["params"]["lookback"] == 14, conn.calls[0]["params"]
+
+
+def test_company_id_is_still_required_on_the_derived_path():
     with pytest.raises(ValueError):
         site_attendance.on_roster_profile_ids(FakeConn(), None, SITE, "2026-09-30")
 
