@@ -371,12 +371,12 @@ def render_prompt(template, scope, action_items, transcript,
     if lines:
         actions = (
             "\n## The actions already on record\n"
-            "These were captured from this recording. Write them into the Actions "
-            "section using the owner and date given here, one line each, as\n"
-            "**Owner** - what they will do - *when*.\n"
-            "Where the owner reads 'no owner recorded' or the date reads 'no date', "
-            "write it that way. **Do not invent an owner or a date**, and do not add "
-            "actions that are not in this list.\n\n" + "\n".join(lines) + "\n")
+            "These were captured from this recording. They are added to the document "
+            "as a table under the Actions heading, from this list, by us -- so do NOT "
+            "write them out yourself: if the plan has an Actions section, write its "
+            "heading and nothing under it. Use the list only so that what other "
+            "sections say agrees with it. **Do not invent an owner or a date**, and "
+            "do not add actions that are not in this list.\n\n" + "\n".join(lines) + "\n")
     else:
         actions = (
             "\n## The actions already on record\n"
