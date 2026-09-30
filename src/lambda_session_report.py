@@ -26,6 +26,8 @@ import checklist
 import chunking
 import lambda_meeting_minutes
 import llm_utils
+import nz_time
+import report_facts
 import report_template
 import transcript_window
 from email_sender import get_sender
@@ -646,8 +648,16 @@ def _generate_document(artifact, context=None):
     photo_budget = [MAX_PHOTO_BYTES_TOTAL]
     topic_offer, photo_streams = _offered_topics(artifact, photo_budget, win_from, win_to)
 
+    # REPORT DETAILS AND WEATHER ARE OURS. Those sections leave the plan the
+    # model sees and are written from the facts we hold (report_facts.py);
+    # built now, before the model call, so a slow weather fetch spends the
+    # read budget rather than the render reserve.
+    model_template, code_placements = report_facts.split_plan(template)
+    code_sections, code_meta = report_facts.build(
+        code_placements, artifact, client, S3_BUCKET, nz_time.nz_today().isoformat())
+
     prompt = report_template.render_prompt(
-        template,
+        model_template,
         {"folder": artifact["folder"], "date": date,
          "from": window.get("from") or "00:00", "to": window.get("to") or "23:59",
          "recordings": len(picked)},
@@ -676,6 +686,7 @@ def _generate_document(artifact, context=None):
     # wording, and every item nobody addressed stays blank (checklist.py).
     checklist_reports = checklist.apply(
         prose, template, "\n".join(t["line"] for t in turns))
+    model_copies = report_facts.drop_model_copies(prose, code_placements)
     # Counted here, after the answer and outside it -- see _coverage_note.
     note = _coverage_note(topic_offer, prose)
     named = _referenced(prose)
@@ -696,6 +707,10 @@ def _generate_document(artifact, context=None):
                     "%d fell to the last heading",
                     sum(len(v) for v in photo_streams.values()),
                     at_line, at_section, orphaned)
+
+    # Put in after the photographs were placed, so none can fall to them.
+    report_facts.insert(prose, code_placements, code_sections,
+                        (template.get("catch_all") or {}).get("title"))
 
     buf = lambda_meeting_minutes.generate_prose_document(
         artifact.get("title") or gen.get("templateName") or template.get("name") or "Report",
@@ -740,6 +755,10 @@ def _generate_document(artifact, context=None):
             # evidence each answer stood on -- the audit trail the Word file
             # does not carry.
             "checklists": checklist_reports,
+            # Which sections we wrote, and where each site's weather came
+            # from: the nightly record, computed here, or none.
+            "codeFilled": code_meta,
+            "modelCopiesDropped": model_copies,
             "topicsNotReferenced": [{"ref": t["ref"], "title": t.get("title"),
                                      "time_range": t.get("time_range")}
                                     for t in not_referenced]}
