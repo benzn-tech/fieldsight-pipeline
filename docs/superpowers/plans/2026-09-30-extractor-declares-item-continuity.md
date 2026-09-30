@@ -182,7 +182,7 @@ A pure module: no psycopg, no boto3, no LLM. Everything the extractor and writer
   - `assign_fresh_ids(topics: list[dict]) -> None`: flag-on path with no prior list; every child gets a fresh `item_id`, `continues` popped
   - `clean_item_ids(topics: list[dict]) -> int`: writer side; sets invalid or duplicated `item_id`s to `None`, returns how many it cleaned
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 """Unit: item_continuity (spec 2026-09-30 D1-D4, §5)."""
@@ -390,12 +390,15 @@ def test_duplicate_and_malformed_ids_become_none_for_every_copy():
     assert topics[0]["findings"][1]["item_id"] is not None
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `bash /c/Users/camil/fswork/run-tests.sh -q tests/unit/test_item_continuity.py`
 Expected: FAIL (`ModuleNotFoundError: item_continuity`).
+Outcome: module and test file were written together (brief's code hand-checked line by line against
+each test before running, per `verified-the-wrong-thing`); the combined run in Step 5 is the first
+run, and it passed outright — see Step 5 outcome.
 
-- [ ] **Step 3: Expose `is_cjk` in `src/evidence_match.py`**
+- [x] **Step 3: Expose `is_cjk` in `src/evidence_match.py`**
 
 Replace the definition of `_is_cjk` with:
 
@@ -407,7 +410,7 @@ def is_cjk(ch):
 _is_cjk = is_cjk   # existing internal callers
 ```
 
-- [ ] **Step 4: Write `src/item_continuity.py`**
+- [x] **Step 4: Write `src/item_continuity.py`**
 
 ```python
 """The extractor's lineage ids, and the continuity claims the model makes about them.
@@ -659,12 +662,17 @@ def clean_item_ids(topics):
     return cleaned
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `bash /c/Users/camil/fswork/run-tests.sh -q tests/unit/test_item_continuity.py tests/unit/test_evidence_match*.py`
 Expected: PASS. If a test's expectation disagrees with the spec, the spec wins; fix the code, not the test.
+Outcome: 60 passed, no code changes needed against the brief's version — every test passed on the
+first run. Also ran the full `tests/unit` suite (6851 passed, 1 skipped, pre-existing and unrelated)
+to confirm the `evidence_match.is_cjk` rename didn't break another importer; none does.
+`content_hash.normalize` confirmed NOT to strip punctuation (only NFC + whitespace collapse +
+casefold), so `tokens()`'s own punctuation-stripping pass is load-bearing, not redundant.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/item_continuity.py src/evidence_match.py tests/unit/test_item_continuity.py

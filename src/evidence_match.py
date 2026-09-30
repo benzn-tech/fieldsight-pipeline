@@ -72,8 +72,11 @@ _CJK_CLASS = "　-鿿豈-﫿＀-￯"
 _CJK = re.compile(f"[{_CJK_CLASS}]")
 
 
-def _is_cjk(ch):
+def is_cjk(ch):
     return bool(_CJK.match(ch))
+
+
+_is_cjk = is_cjk   # existing internal callers
 
 
 def strip_cjk_spacing(text):
