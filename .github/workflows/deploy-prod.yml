@@ -294,6 +294,8 @@ jobs:
               "SpeakerIdentityMode=${{ vars.PROD_SPEAKER_IDENTITY_MODE || 'off' }}" \
               "MatchOnFinalize=${{ vars.PROD_MATCH_ON_FINALIZE || 'false' }}" \
               "ProposalWindowHours=${{ vars.PROD_PROPOSAL_WINDOW_HOURS || '72' }}" \
+              "RosterDerived=${{ vars.PROD_ROSTER_DERIVED || 'on' }}" \
+              "RosterLookbackDays=${{ vars.PROD_ROSTER_LOOKBACK_DAYS || '14' }}" \
               "EnrolOnCorrection=${{ vars.PROD_ENROL_ON_CORRECTION || 'false' }}" \
               "VoiceprintMaxFrameSpread=${{ vars.PROD_VOICEPRINT_MAX_FRAME_SPREAD || 'default' }}" \
               "AlertEmail=${{ vars.PROD_ALERT_EMAIL || 'none' }}" \
