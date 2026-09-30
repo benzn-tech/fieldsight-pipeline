@@ -40,6 +40,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from datetime import datetime
 from urllib.parse import unquote_plus
 
@@ -1858,6 +1859,26 @@ def _supersedes(new_sources, prev):
     return True
 
 
+def _assign_fresh_ids_best_effort(topics):
+    """Continuity's fallback when normalise_children/resolve raised on the model's output not
+    fitting the expected shape (a child list sent back as a bare int or string, say). Give every
+    DICT child a fresh item_id and drop any leftover `continues`, but never assume a child field
+    IS a list -- that assumption is exactly what raised upstream. A field in some other shape is
+    left untouched rather than guessed at; only a list is walked, and only its dict entries get
+    an id, so one malformed field does not stop the rest of the topic from getting ids."""
+    for topic in topics if isinstance(topics, list) else []:
+        if not isinstance(topic, dict):
+            continue
+        for list_name in item_continuity.KINDS:
+            children = topic.get(list_name)
+            if not isinstance(children, list):
+                continue
+            for child in children:
+                if isinstance(child, dict):
+                    child.pop("continues", None)
+                    child["item_id"] = str(uuid.uuid4())
+
+
 def _find_self_introductions(turns):
     """`self_introduction.find`, wrapped so a detector defect cannot fail the extraction
     it rides on -- never seen a real exception (it is a pure regex module), but "pure
@@ -1990,14 +2011,32 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
     # Spec D2/D4: every child gets an item_id -- either inherited (an exact match or an accepted
     # claim) or fresh. `continues` never reaches the artifact; `resolve`/`assign_fresh_ids` pop it.
     # `prior_stale` is filled in below, once we know what's published NOW (D9).
+    #
+    # Same posture as verify_evidence/_find_self_introductions below: this is an OPTIONAL step
+    # riding on the model's JSON, and `topics` is only checked above to be a list of dicts, not
+    # that each child field is itself a list -- the model can and does send a bare int/string for
+    # one (M-9 stops there so the artifact can still be written). A defect here must not cost the
+    # whole extraction, which the flag-off path would have written just fine.
     continuity = None
     if DECLARE_CONTINUITY:
-        item_continuity.normalise_children(parsed_topics)
-        claims = (item_continuity.resolve(parsed_topics, continuity_prior) if continuity_prior
-                  else (item_continuity.assign_fresh_ids(parsed_topics) or []))
+        continuity_error = None
+        try:
+            item_continuity.normalise_children(parsed_topics)
+            claims = (item_continuity.resolve(parsed_topics, continuity_prior) if continuity_prior
+                      else (item_continuity.assign_fresh_ids(parsed_topics) or []))
+        except Exception as e:
+            logger.exception(
+                "%s: continuity -- the model's topics did not fit the expected shape (%s); "
+                "writing the extraction anyway, with fresh ids wherever the shape allows it",
+                out_key, type(e).__name__)
+            continuity_error = type(e).__name__
+            claims = []
+            _assign_fresh_ids_best_effort(parsed_topics)
         continuity = {"prior_count": len(continuity_prior),
                       "prior_extracted_at": prior_extracted_at, "prior_stale": False,
                       "question_set": item_continuity.QUESTION_SET, "claims": claims}
+        if continuity_error is not None:
+            continuity["error"] = continuity_error
 
     # Task 1 compatibility bridge: derive legacy safety_flags from the new
     # findings so lambda_item_writer/_map_safety keep working unchanged.

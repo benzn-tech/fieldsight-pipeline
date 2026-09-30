@@ -317,8 +317,10 @@ def test_prior_stale_is_set_when_the_published_extraction_changes_before_the_wri
 
 
 def test_prior_stale_is_false_when_nothing_changed(monkeypatch):
-    """The companion case: same extracted_at on both reads -> not stale. Also covers 'nothing
-    published before and nothing now' via the first-pass scenario in test 2 above (both None)."""
+    """The negative companion to the True case above -- on its own this test cannot catch a
+    deleted prior_stale assignment (both start and stay False), so it only means something read
+    alongside that one. Also covers 'nothing published before and nothing now' via the first-pass
+    scenario in test 2 above (both None)."""
     body = json.dumps({"extracted_at": OLD_AT, "topics": []})
     fake_s3 = _SequencedS3(
         {SEG1_KEY: json.dumps(make_transcribe_json("hello world"))},
@@ -386,3 +388,53 @@ def test_a_standing_down_live_pass_returns_the_published_extraction_unmutated(mo
 
     assert result == published                # unchanged: no item_id, no continuity key
     assert len(fake_s3.put_calls) == 0
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: a malformed child field (the model sends a bare int/string instead of a
+# list) must not lose the whole extraction. normalise_children/resolve are optional, model-
+# output-shaped steps -- same posture as verify_evidence and _find_self_introductions.
+# ---------------------------------------------------------------------------
+
+def test_a_malformed_child_field_falls_back_to_fresh_ids_instead_of_losing_the_extraction(
+        monkeypatch, caplog):
+    fake_s3 = _one_segment_s3()
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(les, "DECLARE_CONTINUITY", True)
+    monkeypatch.setattr(llm_utils, "call_llm", _capturing_llm({
+        "topics": [
+            {
+                "topic_title": "malformed",
+                "decisions": 5,              # not a list -- normalise_children iterates it
+                "action_items": "text",      # not a list either, different shape again
+            },
+            {
+                "topic_title": "fine",
+                "action_items": [
+                    {"action": "Fix scaffold", "responsible": None, "deadline": None,
+                     "priority": None},
+                ],
+            },
+        ],
+        "declared_site": None,
+    })[0])
+    caplog.set_level(logging.ERROR)
+
+    extraction = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+
+    assert extraction is not None
+    assert len(fake_s3.put_calls) == 1
+    # The well-formed sibling topic's child still gets an item_id -- one malformed field
+    # elsewhere does not stop the rest of the pass.
+    good_child = extraction["topics"][1]["action_items"][0]
+    assert uuid.UUID(good_child["item_id"])
+    # The malformed fields themselves are left as the model sent them -- untouched, not guessed.
+    assert extraction["topics"][0]["decisions"] == 5
+    assert extraction["topics"][0]["action_items"] == "text"
+    assert extraction["continuity"]["claims"] == []
+    assert extraction["continuity"]["error"] == "TypeError"
+    assert any(r.levelname == "ERROR" and "continuity" in r.getMessage()
+              for r in caplog.records)
+
+    written = json.loads(fake_s3.objects[OUT_KEY])
+    assert written["continuity"]["error"] == "TypeError"
