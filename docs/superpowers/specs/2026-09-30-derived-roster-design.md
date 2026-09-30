@@ -14,13 +14,21 @@ profile from `site_attendance` (#969). Extend `on_roster_profile_ids` so the ros
 (site, NZ date) is the union of:
 
 1. **Explicit rows** in `site_attendance` (manual today, vendors later) — unchanged.
-2. **People who recorded at this site that day** — `recordings` rows with this
-   `site_id` and this NZ date, joined to the recorder's user → that user's live profile
-   (`speaker_voiceprints.user_id`). The device wearer is nearly always on site.
+2. **People who recorded at this site that day** — `recordings` rows with this `site_id`
+   and this NZ date, dated by the S3 key's date segment (`split_part(s3_key, '/', 4)`),
+   never `started_at` (`recordings` has no date column, and `started_at` is a different
+   clock — see "Review outcome"), joined to the recorder's user → that user's live profile
+   (`speaker_voiceprints.user_id`, or by full name when `user_id IS NULL`, the common
+   case). The device wearer is nearly always on site.
 3. **People recently confirmed at this site** — profiles with a live, human-sourced turn
    name (`speaker_turn_names.source = 'correction'`, not superseded) in a session at this
-   site in the last `ROSTER_LOOKBACK_DAYS` (default 14) NZ days. Regulars who were named
-   here recently are very likely here again.
+   site in the last `ROSTER_LOOKBACK_DAYS` (default 14) NZ days, via the `meeting_session` →
+   `speaker_turn_names` ladder (a session's site is `meeting_session.site_id`, falling back
+   to a recording of that session when the session was opened offline — see "Review
+   outcome"). The lookback window is anchored on the roster day being queried, not on
+   today (so re-running an old session is reproducible), and the name arm also matches a
+   correction whose `voiceprint_id` is NULL. Regulars who were named here recently are
+   very likely here again.
 
 No migration: derived membership is computed at lookup, never written, so it can never go
 stale and a withdrawn profile disappears from it immediately.
@@ -38,6 +46,13 @@ roster is incomplete by design (a visitor who never recorded and was never named
 absent), so the cost of a miss is a question mark on a correct name, never a wrong name.
 Absent everything (new site, no recordings, no names) → the roster is empty → exactly
 today's behaviour, as #969 guarantees.
+
+**Correction 9 (plan):** a one-person derived roster changes behaviour at every site where
+only the device wearer has a profile. With the wearer on the roster and nobody else,
+`decide_with_roster` uses the full-pool result for the wearer (subset < 2 is exempted), but
+caps **every other** full-pool winner at `tentative`. This is the one visible regression a
+customer notices on day one — accepted per the owner decisions above, because no company
+has a calibrated floor yet and names are tentative today regardless.
 
 ## Switch
 
