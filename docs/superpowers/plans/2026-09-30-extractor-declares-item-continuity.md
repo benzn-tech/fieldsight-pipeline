@@ -1307,7 +1307,7 @@ Harness: set `DECLARE_CONTINUITY=true` and reload `lambda_extract_session`. Use 
   - `adjudication_todo.jsonl`: every accepted claim the agent labelled "different", plus a 10% random sample;
   - `results/summary.json`: counts only — the ONE committed file.
 
-- [ ] **Step 1: Write failing scoring tests** with tiny hand-built fixtures, one per bar:
+- [x] **Step 1: Write failing scoring tests** with tiny hand-built fixtures, one per bar:
   - wrong carries counted over accepted claims (0 of N → pass; 1 → fail);
   - hard-negative wrong carries reported separately, with the minimum-30 "insufficient" rule;
   - a merge counts as correct and a split half counts as correct;
@@ -1316,15 +1316,17 @@ Harness: set `DECLARE_CONTINUITY=true` and reload `lambda_extract_session`. Use 
   - the transcript-support bar: block-only unsupported share ≤ baseline-only unsupported share + 5 pp;
   - latency p90 ≤ 20 s at n ≥ 30; below 30 the result is "insufficient";
   - agent–owner agreement below 90% → `summary.json` says the agent labels are not usable alone.
-- [ ] **Step 2: Implement** `label.py`:
+  - Outcome: 8 `score_*` bar functions in `score.py`, each with its own pass/fail/insufficient boundary tests in `tests/unit/test_continuity_eval_score.py`, plus `is_claim_correct` (the merge/split rule) and `overall_verdict`.
+- [x] **Step 2: Implement** `label.py`:
   - `export` writes the todo files;
   - `prompt_for_agent(line)` returns the exact blind instruction for the agent annotator: pick the counterpart or "none", and judge whether the item is supported by the transcript excerpt. It is never shown the claims;
   - `import_labels` merges the done files;
   - the `prod_labeller` setting (`agent|owner`, default `owner` until the owner answers) routes prod sessions' assignments to the owner file instead of the agent file.
 
   Implement `score.py` computing every metric in spec §7, plus the reported-not-gated list (label rate, pre-guard precision, per-guard false rejects, hallucinated-alias rate, cap hits, added tokens), and write `results/summary.json` with `"verdict": "pass" | "fail" | "insufficient"` and one line per bar.
-- [ ] **Step 3: Run the tests** — PASS.
-- [ ] **Step 4: Commit** `git add scripts/continuity_eval/label.py scripts/continuity_eval/score.py tests/unit/test_continuity_eval_score.py && git commit -m "Continuity eval: blind assignment labelling, owner adjudication, pre-registered scoring"`
+  - Outcome: implemented as designed. `label.iter_assignments` walks Task 10's `runs/<shape>/<arm>/<rep>/<session>/<step>.json` files, skips a chain's first step (no prior) and any step marked `void`, and yields one assignment per new item paired against `item_continuity.prior_items()` of the SAME kind from the prior step -- only public fields (`export`'s `_PUBLIC_FIELDS`) ever reach `assignments_todo.<agent|owner>.jsonl`; the model's own claim rides along as a private field used only by `build_adjudication_todo` (owner-facing) and scoring. `export` routes by `sessions.json`'s recorded `env`: TEST always to the agent file; PROD to the agent or owner file per `prod_labeller` (default `owner`). `import_labels` merges agent + owner done files by `assignment_id`, owner always wins regardless of file order. `build_adjudication_todo` seeds a deterministic random sample and never double-counts a disagreement already selected. `score.py`'s bar functions each take a small pre-joined input (a scored-claims list, a scored-assignments list, raw counts) so every one is unit-testable without a run directory; `scored_assignments`/`build_summary` are the glue that joins real run files with a gold `assignments_done.jsonl`. Design note: the hard-negative "same-topic" signal isn't otherwise available in this harness's data model (item_continuity's prior list is flattened per kind, not grouped by topic), so it is carried as an explicit `"hard_negative": true` field a gold done row may set, not auto-derived; admission drift / transcript support / latency / agent-owner-agreement need data beyond one run directory + gold file (per-rep counts, timing, a separate adjudication sample), so `build_summary` accepts those as pre-computed arguments, same as the bar functions do -- flagged for Task 12, which runs the real measurement.
+- [x] **Step 3: Run the tests** — PASS: 63/63 in `test_continuity_eval_score.py` + `test_continuity_eval_label.py`; full `tests/unit`: 6980 passed, 1 skipped (pre-existing skip, unrelated).
+- [x] **Step 4: Commit** `git add scripts/continuity_eval/label.py scripts/continuity_eval/score.py tests/unit/test_continuity_eval_score.py && git commit -m "Continuity eval: blind assignment labelling, owner adjudication, pre-registered scoring"`
 
 ---
 
