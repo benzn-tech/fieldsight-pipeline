@@ -576,8 +576,14 @@ def _tightest_pair(frames, embs, sr):
     step = int(FRAME_SECONDS * sr)
     best, best_spread = None, None
     for i in range(len(frames) - 1):
-        if frames[i + 1][0] != frames[i][0] + step:
-            continue                      # a silent frame was dropped between them
+        # A GAP means a silent frame was dropped between them, and joining them would store
+        # a splice. An OVERLAP is not a gap: `_frames_at` aligns its last frame to the end
+        # of the clip, so the final pair usually overlaps by a second or two, and it is
+        # continuous audio. Requiring exact spacing threw that pair away -- on prod
+        # 2026-10-01 a 13.7 s self-introduction was refused at 0.434 while its tail pair
+        # agreed at 0.274.
+        if frames[i + 1][0] > frames[i][0] + step:
+            continue
         spread = vp.frame_spread([embs[i], embs[i + 1]])
         if spread is None:
             continue
