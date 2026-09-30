@@ -1027,6 +1027,15 @@ Parameters:
       switching it back off leaves the merged record and does not restore what
       was deleted. Flip it on a day when a two-device recording can be watched.
 
+  DeclareContinuity:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Spec 2026-09-30: the extraction call is shown the published items and states which new item
+      continues which; code verifies each claim. Off = today's prompt byte-for-byte. Switch on only
+      after the pre-registered measurement passes.
+
   EmitEvidence:
     Type: String
     Default: 'false'
@@ -2644,6 +2653,7 @@ Resources:
       MemorySize: 256
       Environment:
         Variables:
+          DECLARE_CONTINUITY: !Ref DeclareContinuity
           EMIT_EVIDENCE: !Ref EmitEvidence
           EVIDENCE_WINDOW_SEC: !Ref EvidenceWindowSec
           EVIDENCE_FUZZY_THRESHOLD: !Ref EvidenceFuzzyThreshold

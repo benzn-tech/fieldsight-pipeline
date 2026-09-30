@@ -1201,12 +1201,12 @@ git commit -m "Every continuity claim becomes a decision record, deduped on re-d
   - `.github/workflows/deploy-prod.yml` (~276)
 - Test: `tests/unit/test_template_workflow_parameter_wiring.py` (existing, generic) plus a new env assertion
 
-- [ ] **Step 1: Write the failing test** `tests/unit/test_declare_continuity_wired.py`. Parse `src/template.yaml` the way `tests/unit/test_template_stage_env.py` (Track B R22) does. Assert:
+- [x] **Step 1: Write the failing test** `tests/unit/test_declare_continuity_wired.py`. `tests/unit/test_template_stage_env.py` does not exist on this branch; modeled instead on `tests/unit/test_template_group_merge_flag.py` (same text-level-regex-over-the-raw-template approach, precedent for a flag-wiring test in this repo). Asserts:
   - `ExtractSessionFunction`'s env has `DECLARE_CONTINUITY` referencing `DeclareContinuity`;
   - the Parameter default is `'false'` with `AllowedValues ['true','false']`;
   - both workflows contain `DeclareContinuity=${{ vars.TEST_DECLARE_CONTINUITY || 'false' }}` and `DeclareContinuity=${{ vars.PROD_DECLARE_CONTINUITY || 'false' }}` respectively.
-- [ ] **Step 2: Run it** — FAIL.
-- [ ] **Step 3: Implement.** Parameter:
+- [x] **Step 2: Run it** — confirmed FAIL against pre-edit template/workflows (no `DeclareContinuity` anywhere) before implementing.
+- [x] **Step 3: Implement.** Parameter:
 
 ```yaml
   DeclareContinuity:
@@ -1220,8 +1220,8 @@ git commit -m "Every continuity claim becomes a decision record, deduped on re-d
 ```
 
 Add `DECLARE_CONTINUITY: !Ref DeclareContinuity` to `ExtractSessionFunction`'s `Environment.Variables`. Add `"DeclareContinuity=${{ vars.TEST_DECLARE_CONTINUITY || 'false' }}" \` to deploy.yml's `--parameter-overrides`, and the PROD equivalent to deploy-prod.yml.
-- [ ] **Step 4: Run** `bash /c/Users/camil/fswork/run-tests.sh -q tests/unit/test_declare_continuity_wired.py tests/unit/test_template_workflow_parameter_wiring.py` — PASS.
-- [ ] **Step 5: Commit** `git add src/template.yaml .github/workflows/deploy.yml .github/workflows/deploy-prod.yml tests/unit/test_declare_continuity_wired.py && git commit -m "Wire DECLARE_CONTINUITY: template, both workflows, extract-session env (default off)"`
+- [x] **Step 4: Run** `bash /c/Users/camil/fswork/run-tests.sh -q tests/unit/test_declare_continuity_wired.py tests/unit/test_template_workflow_parameter_wiring.py` — PASS (also ran the full `tests/unit/test_template*.py` sweep, 125 passed).
+- [x] **Step 5: Commit** `git add src/template.yaml .github/workflows/deploy.yml .github/workflows/deploy-prod.yml tests/unit/test_declare_continuity_wired.py docs/superpowers/plans/2026-09-30-extractor-declares-item-continuity.md && git commit -m "Wire DECLARE_CONTINUITY: template, both workflows, extract-session env (default off)"`
 
 ---
 
