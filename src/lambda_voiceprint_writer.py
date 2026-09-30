@@ -74,6 +74,25 @@ PROPOSAL_WINDOW_HOURS = int(os.environ.get("PROPOSAL_WINDOW_HOURS", "72"))
 PROPOSAL_LIMIT = int(os.environ.get("PROPOSAL_LIMIT", "5"))
 
 
+def _derived_from_env(value):
+    """`on`/`off`, case-insensitive, absent -> on. Not a boolean Parameter (plan correction
+    7): the generic wiring sweep only recognises `AllowedValues: ['true','false']`, so this
+    switch needs its own explicit wiring test rather than relying on that sweep."""
+    return (value or "on").strip().lower() != "off"
+
+
+# Whether `_profiles` derives roster membership from recordings and recent corrections
+# (design: docs/superpowers/specs/2026-09-30-derived-roster-design.md) or serves only the
+# explicit `site_attendance` rows (#969's own behaviour, byte-for-byte, when `off`). All
+# three segments (repo variable, workflow override, template Parameter) or this silently
+# serves its default forever -- the same rule PROPOSAL_WINDOW_HOURS is here.
+ROSTER_DERIVED = _derived_from_env(os.environ.get("ROSTER_DERIVED"))
+
+# How many NZ days back a human correction at this site still counts as "recently confirmed
+# here" (design arm 3). Same three-segment rule.
+ROSTER_LOOKBACK_DAYS = int(os.environ.get("ROSTER_LOOKBACK_DAYS", "14"))
+
+
 def _require(event, key):
     value = (event or {}).get(key)
     if not value:
@@ -405,7 +424,10 @@ def _profiles(event):
         if site_id and date:
             try:
                 on_roster_ids = site_attendance.on_roster_profile_ids(
-                    conn, company_id, site_id, date)
+                    conn, company_id, site_id, date,
+                    derived=ROSTER_DERIVED, lookback_days=ROSTER_LOOKBACK_DAYS)
+                logger.info("roster for site %s on %s: %d profile(s) (derived=%s)",
+                           site_id, date, len(on_roster_ids), ROSTER_DERIVED)
             except Exception:
                 # Narrows, never blocks (spec consumer 1): a broken roster read must not
                 # stop matching, and the safe degradation is exactly the no-roster shape.
