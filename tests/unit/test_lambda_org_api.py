@@ -31,6 +31,13 @@ class FakeConn:
         # manager, so the block either runs whole or propagates, like the real one.
         return self
 
+    def rollback(self):
+        # The real connection has this and handlers now use it: `with conn:`
+        # commits on a CLEAN exit, and `error(...)` is a return, so a handler
+        # that has already written must roll back explicitly before answering
+        # with an error. Recorded rather than ignored so a test can assert it.
+        self.rolled_back = True
+
     def execute(self, *a, **k):
         # /me now reads the caller's per-site membership roles: it used to report
         # `global_role` alone, so a person promoted to site_manager ON A SITE showed as
@@ -1255,6 +1262,145 @@ def test_patch_site_platform_admin_edits_cross_company(wired):
                                         body={"name": "Renamed"}), None)
     assert res["statusCode"] == 200
     assert seen["cid"] == "c-customer"  # scoped by site's company, not caller's
+
+
+# ---- patch_org_site: moving a site to another company (tenant boundary) ----
+C_PLATFORM = "6a23c57c-5fa3-4ef4-a93c-88e9543272fc"
+C_OLD = C_PLATFORM
+C_NEW = "7a495d8a-c88a-43ea-bf5b-a6d1c89beb92"
+
+
+@pytest.fixture
+def move_wired(wired):
+    """platform_admin in the operator company, one site filed under C_OLD, and
+    recorders on every write that could change tenancy."""
+    calls = {"update": [], "move": [], "company_lookup": [], "slug_lookup": []}
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "company_id": C_PLATFORM,
+                                     "global_role": "platform_admin"})
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": C_OLD, "slug": "sb1151"})
+    wired.setattr(org.sites, "update_site",
+                  lambda conn, sid, cid, **kw: (calls["update"].append((sid, cid, kw))
+                                                or {"id": sid, "company_id": cid, "icon_s3_key": None}))
+    wired.setattr(org.sites, "move_site_company",
+                  lambda conn, sid, frm, to: (calls["move"].append((sid, frm, to))
+                                              or {"id": sid, "company_id": to, "icon_s3_key": None}))
+    wired.setattr(org.companies, "get_company_by_id",
+                  lambda conn, cid: (calls["company_lookup"].append(cid)
+                                     or ({"id": cid} if cid in (C_OLD, C_NEW) else None)))
+    wired.setattr(org.sites, "get_company_site_by_slug",
+                  lambda conn, cid, slug: (calls["slug_lookup"].append((cid, slug)) or None))
+    return wired, calls
+
+
+def _patch(body, sid="s-1"):
+    return org.lambda_handler(make_event("PATCH", f"/api/org/sites/{sid}", body=body), None)
+
+
+def test_patch_site_cross_company_caller_moves_site(move_wired):
+    wired, calls = move_wired
+    res = _patch({"target_company_id": C_NEW})
+    assert res["statusCode"] == 200
+    assert calls["move"] == [("s-1", C_OLD, C_NEW)]       # from the SITE's company
+    assert json.loads(res["body"])["company_id"] == C_NEW
+
+
+def test_patch_site_non_cross_caller_cannot_move(wired):
+    wired.setattr(org.sites, "update_site", lambda *a, **k: pytest.fail("must not write"))
+    moved = []
+    wired.setattr(org.sites, "move_site_company", lambda *a: moved.append(a))
+    res = _patch({"target_company_id": C_NEW})            # CALLER is a plain admin
+    assert res["statusCode"] == 403
+    assert "only platform_admin" in json.loads(res["body"])["error"]
+    assert moved == []
+
+
+def test_patch_site_non_cross_caller_own_company_id_is_ignored_not_refused(wired):
+    # Mirrors create_org_site: a target equal to the caller's own company is the
+    # default, so it is accepted as a no-op and moves nothing.
+    moved = []
+    wired.setattr(org.sites, "move_site_company", lambda *a: moved.append(a))
+    wired.setattr(org.sites, "update_site",
+                  lambda conn, sid, cid, **kw: {"id": sid, "company_id": cid, "icon_s3_key": None})
+    res = _patch({"target_company_id": CALLER["company_id"], "name": "N"})
+    assert res["statusCode"] == 200 and moved == []
+
+
+def test_patch_site_move_to_unknown_company_refused(move_wired):
+    wired, calls = move_wired
+    res = _patch({"target_company_id": "11111111-1111-1111-1111-111111111111"})
+    assert res["statusCode"] == 404
+    assert calls["move"] == [] and calls["update"] == []
+
+
+def test_patch_site_move_with_malformed_company_id_is_400(move_wired):
+    wired, calls = move_wired
+    assert _patch({"target_company_id": "not-a-uuid"})["statusCode"] == 400
+    assert calls["move"] == []
+
+
+def test_patch_site_cross_company_can_move_into_its_own_company(move_wired):
+    # For a cross-company caller the own company is not "unchanged": the site
+    # lives elsewhere, so this is a real move.
+    wired, calls = move_wired
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": C_NEW, "slug": "x"})
+    assert _patch({"target_company_id": C_PLATFORM})["statusCode"] == 200
+    assert calls["move"] == [("s-1", C_NEW, C_PLATFORM)]
+
+
+def test_patch_site_move_to_current_company_is_a_noop(move_wired):
+    wired, calls = move_wired
+    assert _patch({"target_company_id": C_OLD})["statusCode"] == 200
+    assert calls["move"] == []
+
+
+def test_patch_site_move_refused_on_slug_collision(move_wired):
+    wired, calls = move_wired
+    wired.setattr(org.sites, "get_company_site_by_slug",
+                  lambda conn, cid, slug: {"id": "other"} if (cid, slug) == (C_NEW, "sb1151") else None)
+    res = _patch({"target_company_id": C_NEW})
+    assert res["statusCode"] == 409
+    assert calls["move"] == [] and calls["update"] == []   # nothing written
+
+
+def test_patch_site_move_checks_slug_in_the_target_company(move_wired):
+    wired, calls = move_wired
+    assert _patch({"target_company_id": C_NEW})["statusCode"] == 200
+    assert calls["slug_lookup"] == [(C_NEW, "sb1151")]
+
+
+def test_patch_site_move_does_not_bypass_site_reach(move_wired):
+    # The scoped update runs first and gates the move: a site the scoped update
+    # cannot reach (archived / vanished) is never moved.
+    wired, calls = move_wired
+    wired.setattr(org.sites, "update_site", lambda conn, sid, cid, **kw: None)
+    assert _patch({"target_company_id": C_NEW})["statusCode"] == 404
+    assert calls["move"] == []
+
+
+def test_patch_site_move_unknown_site_404_for_cross_company(move_wired):
+    wired, calls = move_wired
+    wired.setattr(org.sites, "get_site", lambda conn, sid: None)
+    assert _patch({"target_company_id": C_NEW}, sid="nope")["statusCode"] == 404
+    assert calls["move"] == []
+
+
+def test_patch_site_without_company_field_is_unchanged(move_wired):
+    # The regression that matters: no target_company_id -> no company lookup, no
+    # slug lookup, no move, and update_site gets exactly the old arguments.
+    wired, calls = move_wired
+    res = _patch({"name": "Renamed"})
+    assert res["statusCode"] == 200
+    assert calls["move"] == [] and calls["company_lookup"] == [] and calls["slug_lookup"] == []
+    assert calls["update"] == [("s-1", C_OLD, dict(
+        name="Renamed", location=None, client=None, industry=None,
+        address=None, latitude=None, longitude=None))]
+    # empty-string / null company field counts as absent, as in create_org_site
+    assert _patch({"name": "R", "target_company_id": ""})["statusCode"] == 200
+    assert _patch({"name": "R", "target_company_id": None})["statusCode"] == 200
+    assert calls["move"] == []
 
 
 def test_patch_site_swaps_icon_and_deletes_old(presign_wired):
@@ -7602,3 +7748,106 @@ def test_a_row_that_was_never_counted_is_version_one():
     ])
     item = org.render_report_shape([row], None, "2026-09-01", "Ada_L")["topics"][0]["action_items"][0]
     assert item["version"] == 1
+
+
+# ---- patch_org_site: the review round on the move (partial writes, id forms) ----
+# Every test below pins a defect found reviewing the move, not the move itself.
+
+
+def test_patch_site_uppercased_own_company_is_not_read_as_a_move(move_wired):
+    """The SAME company in a different case must not look like another one.
+
+    `target_company_id` was compared as a raw string, so `ABC-...` and `abc-...`
+    -- the same uuid -- read as a real move. The move then looked the site's own
+    slug up in its own company, found the site ITSELF, and answered
+    409 "target company already has a site with slug 'sb1151'": a rename refused
+    on a collision with itself.
+    """
+    wired, calls = move_wired
+    wired.setattr(org.sites, "get_company_site_by_slug",
+                  lambda conn, cid, slug: {"id": "some-other-site"})   # would 409
+    res = _patch({"target_company_id": C_OLD.upper(), "name": "Renamed"})
+    assert res["statusCode"] == 200, res["body"]
+    assert calls["move"] == []                       # no move: same company
+    assert calls["slug_lookup"] == []                # and the slug never consulted
+
+
+def test_patch_site_braced_company_id_reaches_the_db_canonical(move_wired):
+    """uuid.UUID accepts `{...}` and unhyphenated forms; psycopg does not. The
+    braced form was passed through unchanged, so the company lookup and the
+    UPDATE both received a string the database cannot cast."""
+    wired, calls = move_wired
+    res = _patch({"target_company_id": "{" + C_NEW + "}"})
+    assert res["statusCode"] == 200, res["body"]
+    assert calls["company_lookup"] == [C_NEW]        # canonical, not braced
+    assert calls["move"] == [("s-1", C_OLD, C_NEW)]
+
+
+def test_patch_site_non_uuid_own_company_id_is_still_a_noop(move_wired):
+    """Normalising must never be STRICTER than create_org_site's plain compare.
+    A value that is not a uuid at all still matches itself, so a caller echoing
+    back their own company id is a no-op rather than a refusal."""
+    wired, calls = move_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "company_id": "not-a-uuid",
+                                     "global_role": "admin"})
+    res = _patch({"target_company_id": "not-a-uuid", "name": "N"})
+    assert res["statusCode"] == 200, res["body"]
+    assert calls["move"] == []
+
+
+def test_patch_site_empty_slug_is_still_checked_for_collision(move_wired):
+    """'' is an INDEXABLE value -- only NULL is distinct under a unique index --
+    so `if slug and ...` skipped the check for an empty slug and let the move hit
+    idx_sites_company_slug as a 500 instead of a 409."""
+    wired, calls = move_wired
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": C_OLD, "slug": ""})
+    wired.setattr(org.sites, "get_company_site_by_slug",
+                  lambda conn, cid, slug: (calls["slug_lookup"].append((cid, slug))
+                                           or {"id": "incumbent"}))
+    res = _patch({"target_company_id": C_NEW})
+    assert res["statusCode"] == 409, res["body"]
+    assert calls["slug_lookup"] == [(C_NEW, "")]
+    assert calls["move"] == []
+
+
+def test_patch_site_a_null_slug_skips_the_check(move_wired):
+    """The other half: NULL really is distinct under the index, so a site
+    without a slug cannot collide and must not be refused."""
+    wired, calls = move_wired
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": C_OLD, "slug": None})
+    res = _patch({"target_company_id": C_NEW})
+    assert res["statusCode"] == 200, res["body"]
+    assert calls["slug_lookup"] == []
+    assert calls["move"] == [("s-1", C_OLD, C_NEW)]
+
+
+def test_patch_site_a_failed_move_rolls_back_the_update(move_wired):
+    """`with conn:` COMMITS on a clean exit and `error(...)` is a RETURN, not a
+    raise. update_site has already written by the time the move can fail (a
+    concurrent archive), so without an explicit rollback the caller is told 404
+    while their rename is committed."""
+    wired, calls = move_wired
+    wired.setattr(org.sites, "move_site_company", lambda conn, sid, frm, to: None)
+    conn = FakeConn()
+    wired.setattr(org, "get_connection", lambda *a, **k: conn)
+    res = _patch({"target_company_id": C_NEW, "name": "Renamed"})
+    assert res["statusCode"] == 404, res["body"]
+    assert calls["update"], "update_site must have run -- otherwise this proves nothing"
+    assert getattr(conn, "rolled_back", False), "the committed rename is the bug"
+
+
+def test_patch_site_a_failed_icon_upload_writes_nothing(move_wired):
+    """The icon relocate ran AFTER update_site and after the move, and its
+    failure path returns 400 -- a clean exit, which commits. So 'please
+    re-upload the image' was returned with the site already moved to another
+    company. The relocate now happens before any DB write."""
+    wired, calls = move_wired
+    wired.setattr(org, "_relocate_asset", lambda src, dst: False)
+    res = _patch({"target_company_id": C_NEW,
+                  "icon_s3_key": f"{org.ORG_ASSETS_PREFIX}pending/sub-1/i.png"})
+    assert res["statusCode"] == 400, res["body"]
+    assert calls["update"] == [], "no row may be written before the upload is secured"
+    assert calls["move"] == [], "the site must not have changed tenant"
