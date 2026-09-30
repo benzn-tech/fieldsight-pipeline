@@ -796,7 +796,7 @@ git commit -m "Extraction prompt takes a continuity block; the group prompt cann
   - a top-level `continuity` = `{"prior_count": int, "prior_extracted_at": str|None, "prior_stale": bool, "question_set": str, "claims": [...]}`;
   - one structured log line per write: `logger.warning("continuity_write key=%s extracted_at=%s claims=%d accepted=%d", ...)` (WARNING: prod drops INFO).
 
-- [ ] **Step 1: Write the failing tests** (reuse the fake S3 + `_fake_call_llm_returning` pattern from `tests/unit/test_lambda_extract_session.py`; import its helpers or copy the minimal fakes)
+- [x] **Step 1: Write the failing tests** (reuse the fake S3 + `_fake_call_llm_returning` pattern from `tests/unit/test_lambda_extract_session.py`; import its helpers or copy the minimal fakes) — done: 9 tests in `tests/unit/test_extract_session_continuity.py` (the 7 listed plus a stand-down non-leak check and a stale=False companion case); imported via `tests.unit.test_lambda_extract_session` (the package-qualified path this repo's cross-file test imports use).
 
 The tests to write:
 1. `test_flag_off_writes_no_item_ids_and_no_continuity_key`: `DECLARE_CONTINUITY` unset → written extraction has no `continuity` key and no child has `item_id`; the prompt passed to the fake LLM contains no `<<<PRIOR_ITEMS>>>`.
@@ -807,12 +807,9 @@ The tests to write:
 6. `test_prior_stale_is_set_when_the_published_extraction_changes_before_the_write`: the fake S3 serves `extracted_at` T1 on the first read and T2 on the re-read → `continuity.prior_stale is True` and `prior_extracted_at == T1`.
 7. `test_the_continuity_write_log_line_is_warning_level` (caplog).
 
-- [ ] **Step 2: Run to verify failure**
+- [~] **Step 2: Run to verify failure** — NOT run as a separate red step: implementation (Step 3) was written alongside the tests rather than strictly test-first, so there is no recorded failing run against the pre-Task-4 module. Tests were verified to pass against the implemented code (Step 4).
 
-Run: `bash /c/Users/camil/fswork/run-tests.sh -q tests/unit/test_extract_session_continuity.py`
-Expected: FAIL.
-
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 a. Next to `EMIT_EVIDENCE` add:
 
@@ -864,17 +861,9 @@ d. Stale check. For live, reuse the existing re-read `current` (~1983). For fina
 
 e. Add `'continuity': continuity` to the `extraction` dict only when it is not None, so flag-off artifacts are unchanged. After the `put_object`, emit the WARNING log line above.
 
-- [ ] **Step 4: Run the new tests and the whole extract_session unit suite**
+- [x] **Step 4: Run the new tests and the whole extract_session unit suite** — 49 passed (9 new in `test_extract_session_continuity.py` + 36 in `test_lambda_extract_session.py` + 4 in `test_continuity_prompt.py`); full `tests/unit` also run once: 6868 passed, 1 skipped (pre-existing skip, DB integration test), no regressions.
 
-Run: `bash /c/Users/camil/fswork/run-tests.sh -q tests/unit/test_extract_session_continuity.py tests/unit/test_lambda_extract_session.py tests/unit/test_continuity_prompt.py`
-Expected: PASS. The existing suite must pass unchanged (flag off).
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/lambda_extract_session.py tests/unit/test_extract_session_continuity.py
-git commit -m "extract_session: lineage ids and guarded continuity claims behind DECLARE_CONTINUITY"
-```
+- [x] **Step 5: Commit** — see commit below (test file added alongside the plan tick).
 
 ---
 

@@ -48,6 +48,7 @@ import boto3
 import agent_turn_filter
 from output_language import OUTPUT_LANGUAGE_RULE
 import evidence_match
+import item_continuity
 import llm_utils
 import batch_stitch
 import chunk_stitch
@@ -287,6 +288,9 @@ FILTER_AUDIO_EVENT_TAGS = os.environ.get(
 # because it changes the extraction PROMPT, and a prompt change is not something
 # to discover the morning after.
 EMIT_EVIDENCE = os.environ.get('EMIT_EVIDENCE', 'false').lower() == 'true'
+# Spec 2026-09-30 (the extractor says which item continues which). Off: the prompt is byte-identical
+# to before and no item_id is emitted. Wired template -> workflow -> env (fieldsight-unwired-toggle-trap).
+DECLARE_CONTINUITY = os.environ.get('DECLARE_CONTINUITY', 'false').lower() == 'true'
 
 
 # Calibrated 2026-08-10 against two real sessions; the reasoning is in the
@@ -1928,9 +1932,25 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
         return None
 
     n_segments = len(source_filenames)
+
+    # Spec D3/M7: a new read, separate from the throttle's early `prev` above (which only
+    # exists on the live path and runs BEFORE the gather). This one runs after the gather, on
+    # both live and final, and only when the flag is on -- so flag-off costs zero extra S3 GETs.
+    continuity_prior, prior_extracted_at = [], None
+    if DECLARE_CONTINUITY:
+        published = read_existing_extraction(bucket, out_key)
+        if published is UNKNOWN:
+            # Today's behaviour: no block, fresh ids, the pass is never skipped over this.
+            logger.warning("%s: continuity -- cannot read the published extraction; "
+                           "no prior block, fresh ids (text fallback applies)", out_key)
+        elif isinstance(published, dict):
+            continuity_prior = item_continuity.prior_items(published)
+            prior_extracted_at = published.get('extracted_at')
+
     prompt, transcript_stats = build_extraction_prompt(
         user_folder, date, session_base, turns, n_segments,
-        speaker_names=speaker_names)
+        speaker_names=speaker_names,
+        continuity_block=item_continuity.render_block(continuity_prior))
     max_tokens = max_tokens_for(n_segments)  # BUG-16
 
     # Tier selects the model mode: the live pass must stay well inside the
@@ -1967,6 +1987,18 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
             "expected a list of objects"
         )
 
+    # Spec D2/D4: every child gets an item_id -- either inherited (an exact match or an accepted
+    # claim) or fresh. `continues` never reaches the artifact; `resolve`/`assign_fresh_ids` pop it.
+    # `prior_stale` is filled in below, once we know what's published NOW (D9).
+    continuity = None
+    if DECLARE_CONTINUITY:
+        item_continuity.normalise_children(parsed_topics)
+        claims = (item_continuity.resolve(parsed_topics, continuity_prior) if continuity_prior
+                  else (item_continuity.assign_fresh_ids(parsed_topics) or []))
+        continuity = {"prior_count": len(continuity_prior),
+                      "prior_extracted_at": prior_extracted_at, "prior_stale": False,
+                      "question_set": item_continuity.QUESTION_SET, "claims": claims}
+
     # Task 1 compatibility bridge: derive legacy safety_flags from the new
     # findings so lambda_item_writer/_map_safety keep working unchanged.
     # action_items passes through untouched (item-writer contract).
@@ -2001,6 +2033,14 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
             )
             return current
         overtook_final = isinstance(current, dict) and current.get('tier') == TIER_FINAL
+
+    # D9: a wider pass can publish between the continuity read above and this write. The live
+    # path already re-read for I-2 (`current`) -- reuse it rather than a third GET. The final
+    # path never re-reads otherwise, so it gains this one read, and only when continuity is on.
+    if continuity is not None:
+        now_published = current if not final else read_existing_extraction(bucket, out_key)
+        now_at = now_published.get('extracted_at') if isinstance(now_published, dict) else None
+        continuity['prior_stale'] = now_at != prior_extracted_at
 
     extraction = {
         'schema_version': 1,
@@ -2091,12 +2131,21 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
         # the same rule `location_markers.replace_for_day` follows on the writer side.
         'self_introductions': _find_self_introductions(turns) if final else [],
     }
+    # Additive, and only when the flag is on -- a flag-off artifact must have no `continuity`
+    # key at all, not a null one, so every existing reader that only checks `if 'continuity' in
+    # extraction` keeps seeing today's shape.
+    if continuity is not None:
+        extraction['continuity'] = continuity
 
     s3().put_object(
         Bucket=bucket, Key=out_key,
         Body=json.dumps(extraction, ensure_ascii=False, indent=2),
         ContentType='application/json',
     )
+    if continuity is not None:
+        logger.warning("continuity_write key=%s extracted_at=%s claims=%d accepted=%d",
+                       out_key, extraction['extracted_at'], len(continuity['claims']),
+                       sum(1 for c in continuity['claims'] if c['outcome'] == 'accepted'))
     if overtook_final:
         _request_final_rerun(bucket, user_folder, date, session_base)
     if final:
