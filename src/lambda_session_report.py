@@ -22,6 +22,7 @@ from urllib.parse import unquote_plus
 
 import boto3
 
+import checklist
 import chunking
 import lambda_meeting_minutes
 import llm_utils
@@ -541,7 +542,9 @@ def _prose_sections(text):
                              "covers": [], "line_refs": []}
     for raw in (text or "").splitlines():
         line = raw.rstrip()
-        if line.startswith("#"):
+        # A table whose first column is "#" (`# | Action | Owner`) is a header
+        # row, not a heading: read as one it split the table off its section.
+        if line.startswith("#") and not line.lstrip("#").strip().startswith("|"):
             if current["title"] or current["paragraphs"]:
                 sections.append(current)
             # THE DEPTH IS PART OF THE HEADING and used to be thrown away with
@@ -668,6 +671,11 @@ def _generate_document(artifact, context=None):
         raise RuntimeError(err or "empty answer from model")
 
     prose = _prose_sections(text)
+    # CHECKLISTS ARE REBUILT HERE, before anything counts the answer: only rows
+    # whose evidence is in the transcript survive, in the customer's order and
+    # wording, and every item nobody addressed stays blank (checklist.py).
+    checklist_reports = checklist.apply(
+        prose, template, "\n".join(t["line"] for t in turns))
     # Counted here, after the answer and outside it -- see _coverage_note.
     note = _coverage_note(topic_offer, prose)
     named = _referenced(prose)
@@ -728,6 +736,10 @@ def _generate_document(artifact, context=None):
             # exactly what the note printed; it is here because the note is in
             # a Word file and this is not.
             "topicsOffered": len(topic_offer),
+            # Per checklist: items, answered, dropped (with why), and the
+            # evidence each answer stood on -- the audit trail the Word file
+            # does not carry.
+            "checklists": checklist_reports,
             "topicsNotReferenced": [{"ref": t["ref"], "title": t.get("title"),
                                      "time_range": t.get("time_range")}
                                     for t in not_referenced]}
