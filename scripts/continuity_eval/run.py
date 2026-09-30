@@ -83,6 +83,12 @@ def _run_one_step(user_folder, date, session_base, turns, n_segments, *,
         continuity_block=continuity_block)
     prompt_has_block = "<<<PRIOR_ITEMS>>>" in prompt
     prior_count = len(prior_list)
+    # The exact transcript text this step's prompt was built from -- `build_extraction_prompt`
+    # doesn't return it, so it's rendered here the same way (`les.render_transcript`, the
+    # function it calls internally). Kept on the step record (gitignored run dir only) so
+    # Task 11's gold labelling can show the annotator real evidence for the "supported by the
+    # transcript" judgement, instead of asking them to judge it from nothing.
+    transcript_text, _transcript_stats = les.render_transcript(turns)
 
     started = time.time()
     raw, error = llm_utils.call_llm(
@@ -118,6 +124,7 @@ def _run_one_step(user_folder, date, session_base, turns, n_segments, *,
         "error": error,
         "latency_ms": latency_ms,
         "n_segments": n_segments,
+        "transcript_text": transcript_text,
     }
     next_prior = topics if topics else prior_topics
     return record, next_prior

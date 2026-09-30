@@ -161,7 +161,13 @@ def _fake_gather(bucket, user_folder, date, session_base):
 
 
 def _fake_assemble(bucket, keys):
-    turns = [{"abs_start": i, "text": f"turn {i}"} for i in range(len(keys))]
+    # Shaped like real turns (`abs_start_str`/`speaker`/`source_filename`/`text`) because
+    # `run.py` now calls the REAL `les.render_transcript` on these turns directly (to persist
+    # the transcript text on the step record for Task 11's gold labelling), not just the
+    # mocked `build_extraction_prompt`.
+    turns = [{"abs_start": i, "abs_start_str": f"00:00:{i:02d}", "speaker": "spk_0",
+              "source_filename": k.rsplit("/", 1)[-1], "text": f"turn {i}"}
+             for i, k in enumerate(keys)]
     filenames = [k.rsplit("/", 1)[-1] for k in keys]
     return turns, filenames, {}
 
@@ -287,7 +293,12 @@ def test_run_chain_writes_one_step_file_per_pass(monkeypatch, tmp_path):
     written = sorted(p.name for p in session_dir.glob("*.json"))
     assert written == ["0.json", "1.json", "2.json", "3.json"]
     body = json.loads((session_dir / "0.json").read_text(encoding="utf-8"))
-    assert set(body) >= {"prompt_has_block", "prior_count", "extraction", "claims"}
+    assert set(body) >= {"prompt_has_block", "prior_count", "extraction", "claims",
+                          "transcript_text"}
+    # Persisted for Task 11's gold labelling (the "supported by the transcript" judgement
+    # needs real evidence, not nothing) -- rendered by the real `les.render_transcript`, the
+    # same function `build_extraction_prompt` calls internally, not re-derived here.
+    assert "turn 0" in body["transcript_text"]
 
 
 def test_run_chain_records_llm_call_error_without_raising(monkeypatch, tmp_path):

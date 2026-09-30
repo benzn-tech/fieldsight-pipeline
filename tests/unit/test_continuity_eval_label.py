@@ -30,12 +30,13 @@ def _child(list_name, text, item_id=None):
 
 
 def _write_step(run_dir, shape, arm, rep, session, step_idx, *, topics, claims=None,
-                 void=False):
+                 void=False, transcript_text="[00:00] spk_0: placeholder transcript"):
     d = Path(run_dir) / "runs" / shape / arm / str(rep) / session
     d.mkdir(parents=True, exist_ok=True)
     record = {"prompt_has_block": arm == "with_block" and step_idx > 0, "prior_count": 0,
               "extraction": {"topics": topics}, "claims": claims or [], "void": void,
-              "error": None, "latency_ms": 1000, "n_segments": 3, "frac": 1.0}
+              "error": None, "latency_ms": 1000, "n_segments": 3, "frac": 1.0,
+              "transcript_text": transcript_text}
     (d / f"{step_idx}.json").write_text(json.dumps(record), encoding="utf-8")
 
 
@@ -279,3 +280,101 @@ def test_adjudication_todo_sample_is_deterministic_and_does_not_double_count(tmp
     assert len(rows1) == 3
     assert [r["assignment_id"] for r in rows1] == [r["assignment_id"] for r in rows2]
     assert len({r["assignment_id"] for r in rows1}) == 3   # no double counting
+
+
+# =========================================================================================
+# Fix round 1: guard capture, transcript evidence, hard-negative elicitation (controller
+# review of Task 11)
+# =========================================================================================
+
+def test_blind_instruction_asks_for_hard_negatives_with_an_example():
+    text = label.BLIND_LABEL_INSTRUCTION.lower()
+    assert "hard negative" in text
+    assert "for example" in text
+
+
+def test_iter_assignments_captures_the_real_claim_guard(tmp_path):
+    prior_id = str(uuid.uuid4())
+    new_id = str(uuid.uuid4())
+    claim = {"alias": "A1", "prior_item_id": prior_id, "new_item_id": new_id,
+              "outcome": "rejected", "guard": "echo", "list_name": "action_items"}
+    _write_step(tmp_path, "a", "with_block", 1, "sess", 0,
+                topics=[{"action_items": [_child("action_items", "Fix the pump", prior_id)]}])
+    _write_step(tmp_path, "a", "with_block", 1, "sess", 1,
+                topics=[{"action_items": [_child("action_items", "Pump task rework", new_id)]}],
+                claims=[claim])
+    [a] = list(label.iter_assignments(tmp_path))
+    assert a["model_claim_guard"] == "echo"
+    assert "model_claim_guard" not in label._PUBLIC_FIELDS
+
+
+def test_prompt_for_agent_includes_transcript_text_and_still_no_claim_or_arm_info():
+    line = {"prior_list": [{"alias": "A1", "kind": "action_item", "text": "fix the pump"}],
+            "new_item_text": "the pump was fixed", "arm": "with_block",
+            "transcript_text": "[00:00] spk_0: someone said fix the pump please",
+            "model_claim_alias": "F9", "model_claim_outcome": "accepted",
+            "model_claim_guard": "echo"}
+    prompt = label.prompt_for_agent(line)
+    assert "someone said fix the pump please" in prompt
+    assert "with_block" not in prompt
+    assert "F9" not in prompt
+    assert "accepted" not in prompt
+    assert "echo" not in prompt
+
+
+def test_prompt_for_agent_reads_the_transcript_from_a_side_file(tmp_path):
+    transcripts_dir = tmp_path / "transcripts"
+    step_dir = transcripts_dir / "a" / "with_block" / "1" / "sess"
+    step_dir.mkdir(parents=True)
+    (step_dir / "1.txt").write_text("[00:00] spk_0: the real transcript line",
+                                     encoding="utf-8")
+    line = {"prior_list": [], "new_item_text": "new item",
+            "transcript_ref": "a/with_block/1/sess/1.txt"}
+    prompt = label.prompt_for_agent(line, transcripts_dir=transcripts_dir)
+    assert "the real transcript line" in prompt
+
+
+def test_prompt_for_agent_says_unavailable_with_no_transcript_source():
+    prompt = label.prompt_for_agent({"prior_list": [], "new_item_text": "x"})
+    assert "unavailable" in prompt.lower()
+
+
+def test_export_writes_one_transcript_file_shared_by_every_new_item_in_a_step(tmp_path):
+    prior_id = str(uuid.uuid4())
+    session = "user__2026-01-01__base"
+    _write_step(tmp_path, "a", "with_block", 1, session, 0,
+                topics=[{"action_items": [_child("action_items", "Fix the pump", prior_id)]}],
+                transcript_text="[00:00] spk_0: step 0 transcript")
+    _write_step(tmp_path, "a", "with_block", 1, session, 1,
+                topics=[{"action_items": [_child("action_items", "Pump fixed", str(uuid.uuid4())),
+                                            _child("action_items", "Second item",
+                                                    str(uuid.uuid4()))]}],
+                transcript_text="[00:00] spk_0: step 1 transcript, real evidence")
+    _write_sessions_json(tmp_path, [{"env": "test", "user_folder": "user",
+                                      "date": "2026-01-01", "session_base": "base"}])
+    result = label.export(tmp_path, tmp_path / "out")
+    lines = list(label._read_jsonl(tmp_path / "out" / "assignments_todo.agent.jsonl"))
+    assert len(lines) == 2
+    refs = {line["transcript_ref"] for line in lines}
+    assert len(refs) == 1                                    # both new items share one step
+    [ref] = refs
+    transcript_path = Path(result["transcripts_dir"]) / ref
+    assert transcript_path.exists()
+    assert transcript_path.read_text(encoding="utf-8") == \
+        "[00:00] spk_0: step 1 transcript, real evidence"
+
+
+def test_adjudication_row_carries_the_same_transcript_ref(tmp_path):
+    prior_id = str(uuid.uuid4())
+    session = "user__2026-01-01__base"
+    claim = {"alias": "A1", "prior_item_id": prior_id, "new_item_id": prior_id,
+              "outcome": "accepted", "guard": None, "list_name": "action_items"}
+    _two_step_chain(tmp_path, "a", "with_block", 1, session, prior_id, prior_id, claims=[claim])
+    agent_done = tmp_path / "agent_done.jsonl"
+    [assignment] = list(label.iter_assignments(tmp_path))
+    label._write_jsonl(agent_done, [
+        {"assignment_id": assignment["assignment_id"], "counterpart": "none",
+         "supported": True, "labeller": "agent"}])
+    [row] = label.build_adjudication_todo(tmp_path, agent_done, tmp_path / "adj.jsonl",
+                                            sample_rate=0.0)
+    assert row["transcript_ref"] == assignment["transcript_ref"]

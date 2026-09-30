@@ -333,9 +333,6 @@ def test_added_prompt_size_is_chars_and_an_estimate():
 # Glue: real run-directory shape -> scored_assignments -> build_summary
 # =========================================================================================
 
-_FIELD = {"action_items": "action"}
-
-
 def _child(text, item_id=None):
     d = {"action": text}
     if item_id is not None:
@@ -422,3 +419,165 @@ def test_build_summary_writes_a_verdict_and_one_entry_per_bar(tmp_path):
                       "agent_owner_agreement"):
         assert "verdict" in summary["bars"][bar_name]
     assert summary["bars"]["wrong_carries"]["verdict"] == "pass"     # the one claim was correct
+
+
+def _finding(text, item_id=None):
+    d = {"observation": text}
+    if item_id is not None:
+        d["item_id"] = item_id
+    return d
+
+
+# =========================================================================================
+# Fix round 1: no names in summary.json (Critical 1)
+# =========================================================================================
+
+def test_session_refs_are_stable_sorted_opaque_ids():
+    refs = score.session_refs(["zzz", "aaa", "mmm"])
+    assert refs == {"aaa": "s01", "mmm": "s02", "zzz": "s03"}
+
+
+def test_summary_json_contains_no_raw_session_id_or_folder_name(tmp_path):
+    prior_id = str(uuid.uuid4())
+    session = "workername__2026-01-01__base"      # user_folder ("workername") is a person's name
+    claim = {"alias": "A1", "prior_item_id": prior_id, "new_item_id": prior_id,
+              "outcome": "accepted", "guard": None, "list_name": "action_items"}
+    _write_step(tmp_path, "a", "with_block", 1, session, 0,
+                topics=[{"action_items": [_child("Fix the pump", prior_id)]}])
+    _write_step(tmp_path, "a", "with_block", 1, session, 1,
+                topics=[{"action_items": [_child("Pump fixed today", prior_id)]}],
+                claims=[claim])
+    [assignment] = list(label.iter_assignments(tmp_path))
+    gold_done = tmp_path / "gold.jsonl"
+    label._write_jsonl(gold_done, [
+        {"assignment_id": assignment["assignment_id"], "counterpart": "A1",
+         "supported": True, "labeller": "owner"}])
+    out_path = tmp_path / "results" / "summary.json"
+    score.build_summary(tmp_path, gold_done, out_path)
+    raw_text = out_path.read_text(encoding="utf-8")
+    assert "workername" not in raw_text
+    assert session not in raw_text
+
+
+def test_build_summary_writes_the_id_to_ref_map_only_into_the_run_dir(tmp_path):
+    prior_id = str(uuid.uuid4())
+    session = "user__2026-01-01__base"
+    claim = {"alias": "A1", "prior_item_id": prior_id, "new_item_id": prior_id,
+              "outcome": "accepted", "guard": None, "list_name": "action_items"}
+    _write_step(tmp_path, "a", "with_block", 1, session, 0,
+                topics=[{"action_items": [_child("Fix the pump", prior_id)]}])
+    _write_step(tmp_path, "a", "with_block", 1, session, 1,
+                topics=[{"action_items": [_child("Pump fixed today", prior_id)]}],
+                claims=[claim])
+    [assignment] = list(label.iter_assignments(tmp_path))
+    gold_done = tmp_path / "gold.jsonl"
+    label._write_jsonl(gold_done, [
+        {"assignment_id": assignment["assignment_id"], "counterpart": "A1",
+         "supported": True, "labeller": "owner"}])
+    score.build_summary(tmp_path, gold_done, tmp_path / "results" / "summary.json")
+    refs_path = tmp_path / "session_refs.json"
+    assert refs_path.exists()
+    assert json.loads(refs_path.read_text(encoding="utf-8")) == {session: "s01"}
+
+
+# =========================================================================================
+# Fix round 1: the real guard reaches scoring (Critical 2)
+# =========================================================================================
+
+def test_rejected_claim_guards_flow_through_export_import_build_summary(tmp_path):
+    prior_id = str(uuid.uuid4())
+    session = "user__2026-01-01__base"
+    echo_new_id = str(uuid.uuid4())
+    existence_new_id = str(uuid.uuid4())
+    # The action-item claim (alias A1) was rejected by the echo guard even though gold agrees
+    # it IS the same work -- a genuine false reject.
+    echo_claim = {"alias": "A1", "prior_item_id": prior_id, "new_item_id": echo_new_id,
+                   "outcome": "rejected", "guard": "echo", "list_name": "action_items"}
+    # Alias F9 never existed in the offered prior list at all -- the existence guard.
+    existence_claim = {"alias": "F9", "prior_item_id": None, "new_item_id": existence_new_id,
+                         "outcome": "rejected", "guard": "existence", "list_name": "findings"}
+    _write_step(tmp_path, "a", "with_block", 1, session, 0,
+                topics=[{"action_items": [_child("Fix the pump", prior_id)]}])
+    _write_step(tmp_path, "a", "with_block", 1, session, 1,
+                topics=[{"action_items": [_child("Pump task rework", echo_new_id)],
+                          "findings": [_finding("Random leak noticed", existence_new_id)]}],
+                claims=[echo_claim, existence_claim])
+
+    assignments = list(label.iter_assignments(tmp_path))
+    by_list = {a["list_name"]: a for a in assignments}
+    assert by_list["action_items"]["model_claim_guard"] == "echo"
+    assert by_list["findings"]["model_claim_guard"] == "existence"
+
+    export_result = label.export(tmp_path, tmp_path / "todo")
+    agent_lines = list(label._read_jsonl(export_result["agent_path"]))
+    assert agent_lines and not any("model_claim_guard" in line for line in agent_lines)
+
+    agent_done = tmp_path / "agent_done.jsonl"
+    label._write_jsonl(agent_done, [
+        {"assignment_id": by_list["action_items"]["assignment_id"], "counterpart": "A1",
+         "supported": True, "labeller": "agent"},
+        {"assignment_id": by_list["findings"]["assignment_id"], "counterpart": "none",
+         "supported": True, "labeller": "agent"},
+    ])
+    merged = tmp_path / "assignments_done.jsonl"
+    label.import_labels([agent_done], merged)
+
+    summary = score.build_summary(tmp_path, merged, tmp_path / "results" / "summary.json")
+    assert summary["reported"]["false_rejects_per_guard"] == {"echo": 1}
+    assert summary["reported"]["hallucinated_alias_rate"] == 0.5
+
+
+def test_scored_claims_rows_uses_the_real_guard_not_the_coarse_outcome():
+    rows = [{"claim_alias": "A1", "claim_guard": "echo", "gold_counterparts": {"A1"}},
+            {"claim_alias": "A2", "claim_guard": None, "gold_counterparts": {"A2"}}]
+    scored = score.scored_claims_rows(rows)
+    assert scored == [{"guard": "echo", "correct": True}, {"guard": None, "correct": True}]
+
+
+# =========================================================================================
+# Fix round 1 (Ruling C5): hard negatives elicited per assignment, not a corpus-wide flag
+# =========================================================================================
+
+def test_hard_negative_rows_builds_one_pair_per_flagged_alias():
+    rows = [{"session": "s1", "hard_negatives": ["A2", "A3"], "claim_alias": "A2",
+              "claim_outcome": "accepted"},
+            {"session": "s1", "hard_negatives": [], "claim_alias": None,
+              "claim_outcome": None}]
+    pairs = score.hard_negative_rows(rows)
+    assert len(pairs) == 2                      # one row per (new item, hard-negative alias)
+    wrongly = sorted(p["wrongly_carried"] for p in pairs)
+    assert wrongly == [False, True]              # claimed onto A2 (wrong); A3 untouched
+
+
+def test_hard_negative_rows_uses_session_ref_when_given():
+    rows = [{"session": "user__2026-01-01__base", "hard_negatives": ["A2"],
+              "claim_alias": None, "claim_outcome": None}]
+    refs = {"user__2026-01-01__base": "s01"}
+    [pair] = score.hard_negative_rows(rows, session_ref=refs)
+    assert pair["session"] == "s01"
+
+
+def test_scored_assignments_reads_hard_negatives_from_gold_and_scores_the_pair(tmp_path):
+    prior_id = str(uuid.uuid4())         # will be aliased "A1"
+    other_prior_id = str(uuid.uuid4())   # will be aliased "A2"
+    session = "user__2026-01-01__base"
+    claim = {"alias": "A2", "prior_item_id": other_prior_id, "new_item_id": other_prior_id,
+              "outcome": "accepted", "guard": None, "list_name": "action_items"}
+    _write_step(tmp_path, "a", "with_block", 1, session, 0,
+                topics=[{"action_items": [
+                    _child("Fix the leaking valve in room 12", prior_id),
+                    _child("Fix the leaking valve in room 14", other_prior_id)]}])
+    _write_step(tmp_path, "a", "with_block", 1, session, 1,
+                topics=[{"action_items": [_child("Valve in room 12 fixed", other_prior_id)]}],
+                claims=[claim])
+    [assignment] = list(label.iter_assignments(tmp_path))
+    gold_done = tmp_path / "gold.jsonl"
+    label._write_jsonl(gold_done, [
+        {"assignment_id": assignment["assignment_id"], "counterpart": "A1", "supported": True,
+         "labeller": "owner", "hard_negatives": ["A2"]}])
+    [row] = score.scored_assignments(tmp_path, gold_done)
+    assert row["hard_negatives"] == ["A2"]
+    hn_rows = score.hard_negative_rows([row])
+    # The model claimed "A2" (wrong -- gold's real counterpart is "A1"), and gold had
+    # separately flagged "A2" as a hard negative for this new item: a wrong carry onto it.
+    assert hn_rows == [{"session": session, "wrongly_carried": True}]

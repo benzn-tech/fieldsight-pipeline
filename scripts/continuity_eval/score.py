@@ -326,6 +326,17 @@ def _gold_by_assignment(gold_done_path):
     return {row["assignment_id"]: row for row in label_mod._read_jsonl(gold_done_path)}
 
 
+def session_refs(session_ids):
+    """Deterministic opaque per-session reference (`s01`, `s02`, ... in sorted order) so
+    `results/summary.json` -- the one committed file -- never contains a raw session id.
+    Run-directory session ids are `user_folder__date__session_base`, and `user_folder` is a
+    person's name; the id -> ref map is meant to be written only into the gitignored run
+    directory (`build_summary` does this), never into summary.json itself."""
+    ordered = sorted(set(session_ids))
+    width = max(2, len(str(len(ordered))))
+    return {sid: f"s{str(i + 1).zfill(width)}" for i, sid in enumerate(ordered)}
+
+
 def _text_key(text):
     """The same normalisation `carry_forward.match` uses, for identifying an item unique to
     one arm by text (spec S7 "transcript support": "block-only" / "baseline-only")."""
@@ -334,13 +345,13 @@ def _text_key(text):
 
 def scored_assignments(run_dir, gold_done_path):
     """One row per assignment that has a gold label, joining `label.iter_assignments`
-    (private `model_claim_alias`/`_alias_to_item_id`/`new_item_id` fields included) against
-    the gold done file. Each row carries everything the bar functions above need:
-    `session`, `arm`, `list_name`, `gold_counterparts` (alias set), `gold_positive`,
-    `carried`, `claim` (the raw claim outcome/guard if the model made one, else None),
-    `hard_negative` (from an optional `"hard_negative": true` field a gold row may carry --
-    same-topic/same-kind curation is a judgement call this harness has no other signal for,
-    so it is left to whoever labels gold, agent or owner, to flag)."""
+    (private `model_claim_alias`/`model_claim_guard`/`_alias_to_item_id`/`new_item_id` fields
+    included) against the gold done file. Each row carries everything the bar functions above
+    need: `session`, `arm`, `list_name`, `gold_counterparts` (alias set), `gold_positive`,
+    `carried`, `claim_alias`/`claim_outcome`/`claim_guard` (the model's own claim, if any),
+    `hard_negatives` (the gold done row's `hard_negatives` list -- prior aliases from THIS
+    assignment's own prior list that the labeller judged same-kind/same-topic but different
+    work; Ruling C5 -- elicited per assignment, not a corpus-wide auto-derived flag)."""
     gold = _gold_by_assignment(gold_done_path)
     out = []
     for a in label_mod.iter_assignments(run_dir):
@@ -357,28 +368,38 @@ def scored_assignments(run_dir, gold_done_path):
             "gold_counterpart_ids": gold_counterpart_ids, "new_item_id": a.get("new_item_id"),
             "gold_positive": bool(gold_counterparts), "carried": carried,
             "supported": done.get("supported"),
-            "hard_negative": bool(done.get("hard_negative")),
+            "hard_negatives": list(done.get("hard_negatives") or []),
             "claim_alias": a.get("model_claim_alias"),
             "claim_outcome": a.get("model_claim_outcome"),
+            "claim_guard": a.get("model_claim_guard"),
         })
     return out
 
 
-def accepted_claims_rows(rows):
-    """`score_wrong_carries` input from `scored_assignments` rows: one per accepted claim."""
-    return [{"session": r["session"],
+def _ref(session_ref, session):
+    return (session_ref or {}).get(session, session)
+
+
+def accepted_claims_rows(rows, session_ref=None):
+    """`score_wrong_carries` input from `scored_assignments` rows: one per accepted claim.
+    `session_ref`, if given, maps each raw session id to an opaque reference (`session_refs`)
+    so `session` never carries a raw folder name into a bar's output; omitted, the raw session
+    id is used as-is (a caller working entirely with synthetic ids, e.g. a unit test)."""
+    return [{"session": _ref(session_ref, r["session"]),
               "correct": is_claim_correct(r["claim_alias"], r["gold_counterparts"])}
             for r in rows if r["claim_outcome"] == "accepted"]
 
 
-def hard_negative_rows(rows):
-    """`score_hard_negative_wrong_carries` input: every assignment flagged `hard_negative` in
-    gold, whether or not the model claimed on it -- `wrongly_carried` is True only for an
-    ACCEPTED claim gold says is wrong."""
-    return [{"session": r["session"],
-              "wrongly_carried": r["claim_outcome"] == "accepted"
-              and not is_claim_correct(r["claim_alias"], r["gold_counterparts"])}
-            for r in rows if r["hard_negative"]]
+def hard_negative_rows(rows, session_ref=None):
+    """`score_hard_negative_wrong_carries` input (Ruling C5): one row per (new item,
+    hard-negative alias) pair the gold labeller named in that assignment's own
+    `hard_negatives` list -- NOT one row per assignment. `wrongly_carried` is True only when
+    an ACCEPTED claim on that assignment named exactly that hard-negative alias -- the model
+    carried the new item onto the specific distractor gold flagged, not merely onto something
+    gold disagrees with in general (that is the separate, broader `wrong_carries` bar)."""
+    return [{"session": _ref(session_ref, r["session"]),
+              "wrongly_carried": r["claim_outcome"] == "accepted" and r["claim_alias"] == alias}
+            for r in rows for alias in r["hard_negatives"]]
 
 
 def carry_recall_rows(rows, arm="with_block"):
@@ -388,8 +409,12 @@ def carry_recall_rows(rows, arm="with_block"):
 
 def scored_claims_rows(rows):
     """`pre_guard_claim_precision`/`false_rejects_per_guard` input: every assignment the model
-    made ANY claim on (accepted or rejected)."""
-    return [{"guard": r["claim_outcome"] if r["claim_outcome"] != "accepted" else None,
+    made ANY claim on (accepted or rejected). `guard` is the REAL guard name
+    (`item_continuity.resolve`'s "existence"/"kind"/"echo"/"one_to_one"/"prior_exact_matched"/
+    "malformed", or None for an accepted claim) -- not the claim's coarse "accepted"/"rejected"
+    outcome, which is the same literal string "rejected" for every guard and would make every
+    guard indistinguishable from every other."""
+    return [{"guard": r["claim_guard"],
               "correct": is_claim_correct(r["claim_alias"], r["gold_counterparts"])}
             for r in rows if r["claim_alias"] is not None]
 
@@ -410,8 +435,17 @@ def build_summary(run_dir, gold_done_path, out_path, *,
     them; this function's job is only to route real assignment-level data through the bar
     functions and write one JSON file."""
     rows = scored_assignments(run_dir, gold_done_path)
-    accepted = accepted_claims_rows(rows)
-    hard_neg = hard_negative_rows(rows)
+
+    # Opaque per-session refs so no `by_session` breakdown below, and therefore no serialised
+    # summary.json, ever contains a raw session id (a real run's session id is
+    # `user_folder__date__session_base`, and `user_folder` is a person's name). The real
+    # mapping is written only into the gitignored run directory, never returned here.
+    refs = session_refs(r["session"] for r in rows)
+    Path(run_dir, "session_refs.json").write_text(
+        json.dumps(refs, indent=2, sort_keys=True), encoding="utf-8")
+
+    accepted = accepted_claims_rows(rows, session_ref=refs)
+    hard_neg = hard_negative_rows(rows, session_ref=refs)
     recall_rows = carry_recall_rows(rows)
     scored_claims = scored_claims_rows(rows)
 
@@ -432,7 +466,7 @@ def build_summary(run_dir, gold_done_path, out_path, *,
         "pre_guard_claim_precision": pre_guard_claim_precision(scored_claims),
         "false_rejects_per_guard": false_rejects_per_guard(scored_claims),
         "hallucinated_alias_rate": hallucinated_alias_rate(
-            [{"guard": r["claim_outcome"]} for r in rows if r["claim_alias"] is not None]),
+            [{"guard": r["claim_guard"]} for r in rows if r["claim_alias"] is not None]),
     }
     summary = {"verdict": overall_verdict(b["verdict"] for b in bars.values()),
                "bars": bars, "reported": reported}
