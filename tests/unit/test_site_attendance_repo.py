@@ -190,7 +190,7 @@ def test_arm_2_dates_by_the_key_segment_not_started_at():
     conn = FakeConn(results=[[]])
     site_attendance.on_roster_profile_ids(conn, CO, SITE, "2026-09-30")
     sql = conn.calls[0]["sql"]
-    assert "split_part(r.s3_key, '/', 4) = %(day)s" in sql
+    assert "split_part(r.s3_key, '/', 4) = (%(day)s)::date::text" in sql
     assert "started_at" not in sql
 
 
