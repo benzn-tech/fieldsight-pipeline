@@ -736,7 +736,22 @@ def _split_table_row(text):
     return [c.strip() for c in text.strip().strip("|").split("|")]
 
 
-def _add_markdown_table(doc, rows):
+PHOTO_CELL_WIDTH = Inches(1.3) if DOCX_AVAILABLE else None
+
+
+def _add_photos_to_cell(cell, streams):
+    """Pictures inside one table cell. Never raises, like the strip: one
+    unreadable file costs itself, not the row."""
+    para = cell.paragraphs[0]
+    for stream in streams:
+        try:
+            para.add_run().add_picture(stream, width=PHOTO_CELL_WIDTH)
+        except Exception:
+            logger.warning("skipping a photo python-docx could not place in a cell",
+                           exc_info=True)
+
+
+def _add_markdown_table(doc, rows, row_photos=None):
     """Render the pipe rows the model was asked for as an actual table.
 
     A section whose `kind` is "table" now tells the model to write a markdown
@@ -745,9 +760,20 @@ def _add_markdown_table(doc, rows):
     would have got from choosing "Table" in the editor -- a control that could
     be set, stored and previewed, and whose only effect on the output was to
     make it worse.
+
+    ONE ROW, ONE TOPIC, ITS PHOTOGRAPHS IN THE ROW (owner, 2026-09-30). The
+    photographs of a row's topic used to be gathered under the whole table,
+    which separated each picture from the line it evidences. `row_photos` is
+    aligned with `rows` (one stream list per line, from the row's [tN] tag);
+    when any row has photographs, a "Photos" column is added -- by us, not
+    asked of the model -- and each row's pictures go in its own cell.
     """
-    cells = [_split_table_row(r) for r in rows if not _TABLE_RULE_RE.match(r)]
-    cells = [c for c in cells if any(x for x in c)]
+    row_photos = row_photos or [None] * len(rows)
+    kept = [(_split_table_row(r), row_photos[k] or [])
+            for k, r in enumerate(rows) if not _TABLE_RULE_RE.match(r)]
+    kept = [(c, p) for c, p in kept if any(x for x in c)]
+    cells = [c for c, _ in kept]
+    photos = [p for _, p in kept]
     if not cells:
         return
     width = max(len(c) for c in cells)
@@ -759,16 +785,26 @@ def _add_markdown_table(doc, rows):
         # before. The prompt now names the columns, so this should not arrive;
         # when it does anyway, the lines are worth more as lines than as a
         # column of boxes.
-        for row in cells:
+        for row, pics in zip(cells, photos):
             text = (row[0] if row else "").strip()
             if text:
                 doc.add_paragraph(text, style="List Bullet")
+                _add_photo_strip(doc, pics)
         return
-    table = doc.add_table(rows=len(cells), cols=width)
+    with_photos = any(photos[1:])
+    table = doc.add_table(rows=len(cells), cols=width + (1 if with_photos else 0))
     table.style = "Table Grid"
     for r, row in enumerate(cells):
         for c in range(width):
             table.cell(r, c).text = row[c] if c < len(row) else ""
+        if with_photos:
+            if r == 0:
+                table.cell(0, width).text = "Photos"
+            elif photos[r]:
+                _add_photos_to_cell(table.cell(r, width), photos[r])
+    # A tag on the header row has no row of its own to sit in; its pictures
+    # go under the table rather than nowhere.
+    _add_photo_strip(doc, photos[0])
     for run in table.rows[0].cells[0].paragraphs[0].runs or []:
         run.bold = True
 
@@ -796,13 +832,10 @@ def _add_prose_section(doc, section):
             continue
         n = _table_at(paragraphs, i)
         if n:
-            _add_markdown_table(doc, [r.strip() for r in paragraphs[i:i + n]])
-            # A tag on any row of the table puts its photograph under the
-            # whole table: a picture cannot sit between two rows.
-            strip = []
-            for k in range(i, i + n):
-                strip.extend(after.get(k) or [])
-            _add_photo_strip(doc, strip)
+            # Each row's photographs go in that row's Photos cell (see
+            # _add_markdown_table), not in a heap under the table.
+            _add_markdown_table(doc, [r.strip() for r in paragraphs[i:i + n]],
+                                [after.get(k) for k in range(i, i + n)])
             i += n
             continue
         if text.startswith("- ") or text.startswith("* "):
