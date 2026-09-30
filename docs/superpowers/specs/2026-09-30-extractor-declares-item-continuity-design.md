@@ -1,6 +1,6 @@
 # The extractor says which item continues which
 
-**Date:** 2026-09-30 · **Revision:** 2 (after the final review; changes listed in §10)
+**Date:** 2026-09-30 · **Revision:** 3 (after the final review and its re-check; changes listed in §10)
 **Status:** design, awaiting owner review. No code yet.
 **Follows:** Track B (`plans/2026-09-24-track-b-stable-identity-and-decision-records.md`; PRs #971, #972).
 
@@ -42,13 +42,15 @@ The repo has measured this principle once already. Reconciling two model-written
 - **D4. Guards live outside the model.** A claim has the shape `"continues": {"id": "A3", "starts": "<first 3–6 words of A3, copied>"}`. It is accepted only if all of the following hold; otherwise it is dropped and the item gets a fresh `item_id`.
   1. **Existence:** the alias was in the prior list that was sent.
   2. **Kind:** an action item can only continue an action item (likewise findings, decisions, questions).
-  3. **Echo:** after normalisation, `starts` must equal the beginning of the prior item's text. Normalisation is Track B's `content_hash.normalize`, then punctuation dropped, then CJK spacing removed.
-     - Latin text: split on whitespace; the echo's tokens must equal the prior item's first tokens (3 or more).
-     - CJK text: the echo must equal the first 4 or more characters.
-
-     This catches a shifted alias — the model meaning A4 but writing A3 — which a word-overlap veto cannot: sibling items share their subject words (final review I1).
+  3. **Echo, unique among siblings:** `starts`, tokenised, must be a prefix of the claimed prior item's tokens **and of no other prior item of the same kind**.
+     - **Tokeniser:** Track B's normalisation (`content_hash.normalize`, punctuation dropped, CJK spacing removed); Latin runs split on whitespace; every CJK character is one token. Mixed text uses both rules.
+     - **Length:** the echo must have at least `min(4, tokens in the prior item)` tokens. A two-word item ("Call electrician") can be echoed whole.
+     - **Why unique:** the extraction prompt makes items lead with their subject ("the FIRST 2-4 WORDS must carry the real SUBJECT", `lambda_extract_session.py` ~1070). So siblings ("Door delivery level 3…", "Door delivery level 4…") share their opening words. An echo that is a prefix of two same-kind items identifies neither and is rejected. The prompt asks the model to copy enough words to tell the item apart.
+     - This catches the shifted alias — the model meaning A4 but writing A3 while copying A4's words — which a word-overlap veto cannot (final review I1, N1).
   4. **One-to-one:** if two new items claim the same alias, both claims are dropped. A tie is a miss, not a guess (Track B's rule).
-  5. **Exact beats claim:** if a prior item's normalised text exactly equals some new item's, that new item inherits the id automatically, before claims are read. Any other claim on that prior item is dropped (final review I2).
+  5. **Exact beats claim:** if a prior item's normalised text exactly equals a new item's of the same kind, that new item inherits the id automatically, before claims are read.
+     - The exact pass is one-to-one; duplicate texts on either side resolve nothing and fall to the claims.
+     - Any other claim on that prior item is dropped, and so is the matched new item's own claim (final review I2, N6).
 
   Prompt-level instructions are not counted as guards. Text in the prompt can override prompt rules (memory: *user-text-in-the-instruction-region*); only these code checks count.
 - **D5. The text matcher stays as the writer's fallback.** The writer's order:
@@ -64,17 +66,17 @@ The repo has measured this principle once already. Reconciling two model-written
     | column | value |
     |---|---|
     | `kind` | `item_continuity` |
-    | `subject_type` | the prior item's kind when the alias exists, else the new item's kind (always one of `action_item`, `finding`, `decision`, `question`) |
+    | `subject_type` | the kind of whichever row supplied `subject_stable_id`, so the visibility predicate looks in the right table (always one of `action_item`, `finding`, `decision`, `question`; final review N4) |
     | `subject_stable_id` | the DB `stable_id` the writer finds on the retired row with that `prior_item_id`; for a rejected or unresolvable claim, the new row's `stable_id` after carry-forward |
     | `object_ref` | the alias |
     | `provider` / `model` | the extraction's `llm_provider` / `llm_model` |
     | `question_set` | hash of the continuity instruction text (Track B R13) |
-    | `input_key` / `input_hash` | the extraction key / `extracted_at` |
+    | `input_key` / `input_hash` | the extraction key / `extracted_at` (a stretch of `input_hash`'s meaning — the plan records this) |
     | `output` | `{prior_item_id, new_item_id, outcome, guard}` — ids and enums only, never text |
     | `score` / `threshold` | NULL |
     | `auto_outcome` | `accepted`, or `rejected` with the failing guard in `output.guard` |
 
-  - A record is skipped if one with the same (`kind`, `input_key`, `input_hash`, `object_ref`) already exists, so writer re-deliveries do not duplicate.
+  - A record is skipped if one with the same (`kind`, `input_key`, `input_hash`, `object_ref`, `output->>'new_item_id'`) already exists, so writer re-deliveries do not duplicate. The two claims of a double claim stay two records (final review N5).
   - Records exist for the artifacts the writer actually processes. An artifact overwritten before the writer read it has no records; that is counted, not hidden (D9).
 - **D7. Scope: `extract_session` only.**
   - `extract_group` reads transcripts, not member extractions, so member `item_id`s never reach its prompt. Group merge needs its own prior block and is a follow-up.
@@ -91,6 +93,7 @@ The repo has measured this principle once already. Reconciling two model-written
   - The lineage mostly survives this: the in-between pass's items carry the same `item_id`s if it also ran with continuity.
   - The artifact stores `continuity.prior_extracted_at`. At write time the extractor re-reads the published extraction (live already does this; final gains it) and sets `continuity.prior_stale` if it changed.
   - `prior_stale` and "artifact overwritten before the writer read it" are both counted during the TEST week.
+  - Neither lambda can see the second one alone. The extractor logs one structured line per write (key, `extracted_at`), and the writer logs the `extracted_at` it processed. The count is the difference, computed by a Logs Insights query the plan writes down (final review N7).
 
 ## 4. Data flow (flag on)
 
@@ -110,8 +113,8 @@ extract_session(pass N)
 
 lambda_item_writer (order unchanged: supersede -> inserts -> carry-forward savepoint -> ...)
   inserts store item_id on all four child tables
-  carry-forward pass 0: retired rows x new rows with equal item_id (one-to-one; a duplicate id on either side
-                        drops those pairs) -> carry_identity(...) as today; how='item_id'
+  carry-forward pass 0: retired rows x new rows with equal, NON-NULL item_id (one-to-one; a duplicate id on
+                        either side drops those pairs) -> carry_identity(...) as today; how='item_id'
   then Track B exact / fuzzy passes over the rest; OrphanedHumanEdits as today
   EMF: carried count per method (item_id / exact / fuzzy)
   decision_records for continuity.claims (D6)
@@ -174,8 +177,11 @@ Written before any result, per CLAUDE.md "Measure before you change a prompt, an
 - **Hard-negative group:** pairs of same-topic, same-kind items that gold says are different work. It needs at least 30 such pairs. TEST's mostly short owner recordings may not supply them; if TEST cannot, the **owner decides** whether read-only prod transcripts may be used. Until then the result is "insufficient", not "pass".
 
 **Gold**
-- The owner, or a blind second annotator (memory: *second-annotator-gives-the-ceiling*), labels every (prior item, new item) pair of every run as same or different work.
-- Labelling is done blind to the model's claims.
+- Labelling is an **assignment per (prior list, new list)**, not per pair: for each new item, pick its counterpart in the prior list, or "none". "None" is the default.
+- **Expected volume:** 15 sessions × 4 pass steps (1 in shape a, 3 in shape b) × 6 runs × about 10 items ≈ 3,600 assignment decisions. Too many for one person, so:
+  - a blind **agent annotator** labels everything (memory: *second-annotator-gives-the-ceiling*). It never sees the model's claims or the extraction prompt's continuity block.
+  - the **owner** adjudicates every accepted claim the agent calls "different", plus a random 10% of all assignments. Agent–owner agreement on that sample is reported; below 90%, the owner labels another 10% and the agent's labels are not used alone.
+- Labelling is done blind to the model's claims (final review N3).
 - Pre-registered scoring:
   - a claim onto an item that **merged** the prior item with another counts as correct;
   - a claim onto one half of a **split** counts as correct;
@@ -188,8 +194,8 @@ Written before any result, per CLAUDE.md "Measure before you change a prompt, an
 |---|---|---|
 | wrong carries | accepted claims that gold says are different work, over **accepted claims** | **0 overall, and 0 within the hard-negative group**; reported per session, since items within a session are correlated, so no "<5%" rate is claimed |
 | carry recall | gold-positive pairs carried by item_id + exact + fuzzy, vs **text-only recall on the same pairs** | ≥ 80% |
-| admission drift | per kind, the mean absolute difference in item count between with-block and baseline | within the mean absolute difference between baseline runs (3 runs → 3 pairwise differences) |
-| transcript support | block-only items (present with block, absent in all baselines) whose content is supported by the transcript, judged in the gold pass | report the count; any unsupported block-only item fails the bar |
+| admission drift | per session and kind: the mean \|count difference\| over the 9 with-block × baseline run pairs, averaged over sessions | ≤ the **largest** within-arm pairwise difference, averaged the same way over both arms' 3+3 pairs. A tolerance, not a "must beat the noise" test: with no real effect the two quantities are equal in expectation (final review N2) |
+| transcript support | share of **block-only** items (with-block, absent from all baselines) the gold pass judges unsupported by the transcript, vs the share of **baseline-only** items judged unsupported | block-only unsupported share ≤ baseline-only unsupported share + 5 percentage points; both counts reported |
 | added final-pass latency | p90 over at least 30 final passes | ≤ 20 s, which keeps the stop-email budget (memory: *email-generation-3min-budget*) |
 
 **Also reported, not gated**
@@ -253,6 +259,14 @@ Written before any result, per CLAUDE.md "Measure before you change a prompt, an
   - a void condition, a prod-config gate, and a numeric latency bar.
 - **I8:** each prior item is a JSON line in its own fence, with sentinels stripped, placed before the instructions.
 - **I9:** the live test uses a fresh recording, and the owner ticks.
+- **Re-check of revision 2 (same reviewer):**
+  - N1: the echo must be a prefix of exactly one same-kind prior item, with a defined tokeniser and a `min(4, n)` length.
+  - N2: the admission bar is a pre-registered tolerance, and transcript support is compared against baseline-only items.
+  - N3: gold is an assignment per list pair, labelled by a blind agent and adjudicated by the owner, with the volume stated.
+  - N4: `subject_type` follows the row that supplied `subject_stable_id`.
+  - N5: the dedupe key includes `new_item_id`.
+  - N6: pass 0 excludes NULLs; the exact pass is one-to-one and same-kind, and drops the matched item's own claim.
+  - N7: the overwritten-artifact count comes from paired log lines.
 - **Minors:**
   - M1: the cap is per kind, with a prod distribution measured.
   - M2: D7's reason corrected.
