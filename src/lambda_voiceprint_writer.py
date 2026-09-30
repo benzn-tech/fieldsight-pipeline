@@ -228,7 +228,10 @@ def _propagation(event):
                            window=(window[0], window[1]),
                            created_by=enrol.get("created_by"),
                            correction_ref=correction_ref,
-                           admitted_max_spread=enrol.get("admitted_max_spread"))
+                           admitted_max_spread=enrol.get("admitted_max_spread"),
+                           level_dbfs=enrol.get("level_dbfs"),
+                           noise_dbfs=enrol.get("noise_dbfs"),
+                           snr_db=enrol.get("snr_db"))
             except EnrolmentAfterWithdrawal as exc:
                 # Same treatment as the refusal below, for the same reason: the names
                 # describe THIS meeting. A withdrawal that landed mid-flight is not a reason
@@ -266,7 +269,10 @@ def _propagation(event):
                            source="correction_propagation", s3_key=h.get("s3_key"),
                            window=(w[0], w[1]), created_by=h.get("created_by"),
                            correction_ref=correction_ref,
-                           admitted_max_spread=h.get("admitted_max_spread"))
+                           admitted_max_spread=h.get("admitted_max_spread"),
+                           level_dbfs=h.get("level_dbfs"),
+                           noise_dbfs=h.get("noise_dbfs"),
+                           snr_db=h.get("snr_db"))
                 harvested += 1
             except (EnrolmentAfterWithdrawal, EnrolmentBelongsToSomebodyElse) as exc:
                 # PER SAMPLE. One refusal must not discard the rest: they are independent
@@ -326,7 +332,10 @@ def _enrol(event):
                        window=(window[0], window[1]),
                        created_by=event.get("created_by"),
                        correction_ref=event.get("correction_ref"),
-                       admitted_max_spread=event.get("admitted_max_spread"))
+                       admitted_max_spread=event.get("admitted_max_spread"),
+                       level_dbfs=event.get("level_dbfs"),
+                       noise_dbfs=event.get("noise_dbfs"),
+                       snr_db=event.get("snr_db"))
         except EnrolmentAfterWithdrawal as exc:
             logger.warning("enrol refused: %s", exc)
             return {"stored": 0, "reason": "profile-withdrawn"}
