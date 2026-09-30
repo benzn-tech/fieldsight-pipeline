@@ -3877,11 +3877,41 @@ def patch_org_site(conn, caller, site_id, body):
     # hits 0 rows -> 404 (mirrors the Team/sites cross-company fix in #96 and
     # patch_action_item).
     scope_company_id = caller["company_id"]
+    target = None
     if is_cross_company(caller["global_role"]):
         target = sites.get_site(conn, site_id)
         if target is None:
             return error("site not found", 404)
         scope_company_id = target["company_id"]
+    # Moving a site to another company: the SAME gate as create_org_site's
+    # target_company_id (only is_cross_company roles, target must exist). As in
+    # create_org_site, a value equal to the caller's own company is a no-op for
+    # everyone else (non-cross callers stay pinned to it). A cross-company
+    # caller's own company is NOT special -- moving a site INTO it is a real
+    # move -- so for them "unchanged" means equal to the site's current company.
+    # The scope above is unchanged and still decides which site is reachable;
+    # the move runs only after the scoped update matched, so it cannot widen reach.
+    move_to = None
+    req_company_id = body.get("target_company_id")
+    if req_company_id and str(req_company_id) != str(caller["company_id"]):
+        if not is_cross_company(caller["global_role"]):
+            return error("only platform_admin may move a site to another company", 403)
+    if req_company_id and is_cross_company(caller["global_role"]):
+        try:
+            uuid.UUID(str(req_company_id))
+        except ValueError:
+            return error("target_company_id must be a company id", 400)
+        if companies.get_company_by_id(conn, req_company_id) is None:
+            return error("target company not found", 404)
+        if str(req_company_id) != str(scope_company_id):
+            move_to = req_company_id
+            # slug is unique per (company_id, slug), not globally. Keep the
+            # slug (deep links and the published site-coords key use it) and
+            # refuse a collision rather than renaming or hitting the index.
+            slug = (target or {}).get("slug")
+            if slug and sites.get_company_site_by_slug(conn, move_to, slug) is not None:
+                return error("target company already has a site with slug "
+                             f"'{slug}'", 409)
     row = sites.update_site(
         conn, site_id, scope_company_id,
         name=name, location=body.get("location"),
@@ -3890,6 +3920,10 @@ def patch_org_site(conn, caller, site_id, body):
     )
     if row is None:
         return error("site not found in your company", 404)
+    if move_to is not None:
+        row = sites.move_site_company(conn, site_id, scope_company_id, move_to)
+        if row is None:
+            return error("site not found in your company", 404)
     if icon is not None:
         old_icon = row.get("icon_s3_key")
         fname = icon.rsplit("/", 1)[-1]
