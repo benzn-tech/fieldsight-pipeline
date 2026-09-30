@@ -38,14 +38,19 @@
 
 ### Task 1: Migration 0075 — `item_id` on the four child tables
 
+Ruling C1: develop already took 0075 for `0075_report_modules.sql`, so this task shipped as
+`src/migrations/0076_item_continuity.sql` (and the shape test asserts `0076_*` uniqueness). Every
+`0075` below is `0076` in the actual files; the code blocks are kept verbatim as the brief specified
+them.
+
 **Files:**
-- Create: `src/migrations/0075_item_continuity.sql`
+- Create: `src/migrations/0076_item_continuity.sql`
 - Test: `tests/unit/test_migration_item_continuity_shape.py`, `tests/integration/test_item_continuity_schema.py`
 
 **Interfaces:**
 - Produces: nullable column `item_id uuid` on `action_items`, `findings`, `topic_decisions`, `topic_questions`.
 
-- [ ] **Step 1: Write the failing shape test**
+- [x] **Step 1: Write the failing shape test**
 
 ```python
 """Shape of migration 0075 (spec 2026-09-30 D1, §5): a nullable item_id with no default."""
@@ -82,12 +87,13 @@ def test_no_default_and_no_index_so_there_is_no_table_rewrite():
     assert "NOT NULL" not in sql.upper()
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `bash /c/Users/camil/fswork/run-tests.sh -q tests/unit/test_migration_item_continuity_shape.py`
 Expected: FAIL (file not found).
+Outcome: 3 failed, `FileNotFoundError` on `0076_item_continuity.sql`, as expected before Step 3.
 
-- [ ] **Step 3: Write the migration**
+- [x] **Step 3: Write the migration**
 
 ```sql
 -- 0075: the extractor's lineage id. Spec 2026-09-30 (the extractor says which item continues which), D1.
@@ -103,7 +109,7 @@ ALTER TABLE topic_decisions ADD COLUMN IF NOT EXISTS item_id uuid;
 ALTER TABLE topic_questions ADD COLUMN IF NOT EXISTS item_id uuid;
 ```
 
-- [ ] **Step 4: Write the integration test** (real Postgres, `db` fixture; mirror the seeding in `tests/integration/test_stable_identity_schema.py`)
+- [x] **Step 4: Write the integration test** (real Postgres, `db` fixture; mirror the seeding in `tests/integration/test_stable_identity_schema.py`)
 
 ```python
 """0075 applied for real: item_id exists, is nullable, and stores a UUID on every child table."""
@@ -139,12 +145,13 @@ def test_item_id_round_trips_and_defaults_to_null(db, table, text_col):
     assert rows["without id"] is None
 ```
 
-- [ ] **Step 5: Run both tests and the migrations test**
+- [x] **Step 5: Run both tests and the migrations test**
 
 Run: `bash /c/Users/camil/fswork/run-tests.sh -q tests/unit/test_migration_item_continuity_shape.py tests/integration/test_item_continuity_schema.py tests/integration/test_migrations_apply.py`
 Expected: PASS. If the local schema was already migrated, reset it first (drop/recreate `public`).
+Outcome: schema reset (drop/recreate `public`), then 14 passed, 0 failed, 0 skipped.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/migrations/0075_item_continuity.sql tests/unit/test_migration_item_continuity_shape.py tests/integration/test_item_continuity_schema.py
