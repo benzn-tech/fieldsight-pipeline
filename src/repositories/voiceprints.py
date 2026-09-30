@@ -448,12 +448,20 @@ _ONE_SAMPLE_PER_WINDOW = (
     "created_by = " + _UPGRADE + "THEN EXCLUDED.created_by "
     "ELSE speaker_voiceprint_samples.created_by END, "
     "correction_ref = " + _UPGRADE + "THEN EXCLUDED.correction_ref "
-    "ELSE speaker_voiceprint_samples.correction_ref END ")
+    "ELSE speaker_voiceprint_samples.correction_ref END, "
+    # Not the source-upgrade CASE above: these three are facts about the audio, not
+    # attribution that only upgrades in one direction. An older producer that never computed
+    # them sends NULL, and COALESCE keeps whatever this row already has rather than letting
+    # that producer blank out a value a newer one already stored (design 2026-09-30 step 1).
+    "level_dbfs = COALESCE(EXCLUDED.level_dbfs, speaker_voiceprint_samples.level_dbfs), "
+    "noise_dbfs = COALESCE(EXCLUDED.noise_dbfs, speaker_voiceprint_samples.noise_dbfs), "
+    "snr_db = COALESCE(EXCLUDED.snr_db, speaker_voiceprint_samples.snr_db) ")
 
 
 def add_sample(conn, company_id, voiceprint_id, embedding, source, s3_key, window,
                created_by=None, correction_ref=None,
-               admitted_max_spread=None) -> dict | None:
+               admitted_max_spread=None, level_dbfs=None, noise_dbfs=None,
+               snr_db=None) -> dict | None:
     """Record one enrolment contribution.
 
     One row per event rather than an averaged vector per person: §6's withdrawal needs each
@@ -543,13 +551,14 @@ def add_sample(conn, company_id, voiceprint_id, embedding, source, s3_key, windo
         "INSERT INTO speaker_voiceprint_samples "
         "(company_id, voiceprint_id, embedding, source, s3_key, window_start_s, "
         " window_end_s, created_by, correction_ref, agreement_own, "
-        " agreement_best_other, nearest_other_id, admitted_max_spread) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        " agreement_best_other, nearest_other_id, admitted_max_spread, "
+        " level_dbfs, noise_dbfs, snr_db) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
         + _ONE_SAMPLE_PER_WINDOW +
         "RETURNING id",
         (company_id, voiceprint_id, _vector_literal(embedding), source, s3_key,
          start_s, end_s, created_by, correction_ref, own, best_other, nearest_other_id,
-         admitted_max_spread),
+         admitted_max_spread, level_dbfs, noise_dbfs, snr_db),
     ).fetchone()
 
 
