@@ -187,7 +187,7 @@ _DERIVED_SQL = (
     "          AND lower(p.display_name) = lower(concat_ws(' ', u.first_name, u.last_name)))) "
     "WHERE r.company_id = %(co)s AND r.site_id = %(site)s "
     "  AND r.kind IN ('audio', 'video') "
-    "  AND split_part(r.s3_key, '/', 4) = %(day)s "
+    "  AND split_part(r.s3_key, '/', 4) = (%(day)s)::date::text "
     "  AND p.status <> 'withdrawn' "
 
     # Arm 3 (Task 3): people a human named at this site in the last `lookback_days` NZ

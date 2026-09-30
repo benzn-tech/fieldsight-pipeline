@@ -288,3 +288,14 @@ def test_remove_only_deletes_manual_rows():
 def test_remove_requires_company_id():
     with pytest.raises(ValueError):
         site_attendance.remove(FakeConn(), None, SITE, "2026-09-30", "row-1")
+
+
+def test_the_key_date_comparison_casts_the_bound_day_to_text():
+    """`split_part(s3_key, '/', 4)` is text; the caller binds a date. Postgres refuses
+    text = date ("operator does not exist"), and the whole roster query fails. A Data API
+    run with the day pasted in as a string literal did not catch it; CI's real parameters
+    did (2026-09-30)."""
+    import inspect
+    from repositories import site_attendance
+    sql = " ".join(inspect.getsource(site_attendance).split())
+    assert "split_part(r.s3_key, '/', 4) = (%(day)s)::date::text" in sql
