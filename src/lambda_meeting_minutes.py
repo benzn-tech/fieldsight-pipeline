@@ -751,6 +751,33 @@ def _add_photos_to_cell(cell, streams):
                            exc_info=True)
 
 
+_EMPHASIS_RE = re.compile(r"\*\*(.+?)\*\*|(?<![*\w])\*(?!\s)([^*]+?)(?<!\s)\*(?![*\w])")
+
+
+def _add_rich_text(paragraph, text):
+    """`**bold**` and `*italic*` as formatting, not as asterisks. The model
+    writes markdown emphasis (our own prompt asked for it), and every report
+    printed the asterisks: "**no owner recorded**" in a customer's table."""
+    at = 0
+    for m in _EMPHASIS_RE.finditer(text):
+        if m.start() > at:
+            paragraph.add_run(text[at:m.start()])
+        run = paragraph.add_run(m.group(1) if m.group(1) is not None else m.group(2))
+        if m.group(1) is not None:
+            run.bold = True
+        else:
+            run.italic = True
+        at = m.end()
+    if at < len(text):
+        paragraph.add_run(text[at:])
+    return paragraph
+
+
+def _set_cell_text(cell, text):
+    cell.text = ""
+    _add_rich_text(cell.paragraphs[0], text)
+
+
 def _add_markdown_table(doc, rows, row_photos=None):
     """Render the pipe rows the model was asked for as an actual table.
 
@@ -788,7 +815,7 @@ def _add_markdown_table(doc, rows, row_photos=None):
         for row, pics in zip(cells, photos):
             text = (row[0] if row else "").strip()
             if text:
-                doc.add_paragraph(text, style="List Bullet")
+                _add_rich_text(doc.add_paragraph(style="List Bullet"), text)
                 _add_photo_strip(doc, pics)
         return
     with_photos = any(photos[1:])
@@ -796,7 +823,7 @@ def _add_markdown_table(doc, rows, row_photos=None):
     table.style = "Table Grid"
     for r, row in enumerate(cells):
         for c in range(width):
-            table.cell(r, c).text = row[c] if c < len(row) else ""
+            _set_cell_text(table.cell(r, c), row[c] if c < len(row) else "")
         if with_photos:
             if r == 0:
                 table.cell(0, width).text = "Photos"
@@ -839,9 +866,9 @@ def _add_prose_section(doc, section):
             i += n
             continue
         if text.startswith("- ") or text.startswith("* "):
-            doc.add_paragraph(text[2:].strip(), style="List Bullet")
+            _add_rich_text(doc.add_paragraph(style="List Bullet"), text[2:].strip())
         else:
-            doc.add_paragraph(text)
+            _add_rich_text(doc.add_paragraph(), text)
         # THE PHOTOGRAPH OF WHAT THIS LINE SAID, directly under it.
         _add_photo_strip(doc, after.get(i))
         i += 1
@@ -852,6 +879,18 @@ def _add_prose_section(doc, section):
     # python-docx cannot place -- because a reader should not be able to
     # tell which path wrote the document.
     _add_photo_strip(doc, section.get("photo_streams"))
+
+
+def _add_actions_table(doc, actions):
+    table = doc.add_table(rows=1, cols=3)
+    table.style = "Table Grid"
+    for cell, head in zip(table.rows[0].cells, ("Action", "Owner", "When")):
+        cell.text = head
+    for a in actions:
+        row = table.add_row().cells
+        row[0].text = (a.get("action") or "").strip()
+        row[1].text = (a.get("owner") or "").strip() or "no owner recorded"
+        row[2].text = (a.get("deadline") or "").strip() or "no date"
 
 
 def generate_prose_document(title, subtitle, sections, actions, closing=None):
@@ -871,27 +910,27 @@ def generate_prose_document(title, subtitle, sections, actions, closing=None):
         p = doc.add_paragraph(subtitle)
         p.runs[0].italic = True
 
-    has_actions_section = False
+    # THE ACTIONS ARE WRITTEN ONCE, BY US, WHERE THE PLAN PUT THEM. They are
+    # data on record, so the table comes from that record. It used to be added
+    # after every section -- stranded below the catch-all -- while the model
+    # also wrote the same actions into the plan's Actions section: every
+    # generated report carried them twice (TEST, 2026-09-23 "daily report"
+    # v10). The model's copy under that heading is dropped; the table sits
+    # there instead. Without an Actions section in the plan, the table goes
+    # at the end under its own heading, as before.
+    placed = False
     for section in sections or []:
-        if (section.get("title") or "").strip().lower() == "actions":
-            has_actions_section = True
+        if actions and not placed and \
+                (section.get("title") or "").strip().lower() == "actions":
+            _add_prose_section(doc, dict(section, paragraphs=[], photos_after={}))
+            _add_actions_table(doc, actions)
+            placed = True
+            continue
         _add_prose_section(doc, section)
 
-    if actions:
-        # A prose section titled "Actions" already wrote this heading above; the
-        # table renders under it rather than duplicating the heading (a generated
-        # document from the built-in template asks the model for that section).
-        if not has_actions_section:
-            doc.add_heading("Actions", level=1)
-        table = doc.add_table(rows=1, cols=3)
-        table.style = "Table Grid"
-        for cell, head in zip(table.rows[0].cells, ("Action", "Owner", "When")):
-            cell.text = head
-        for a in actions:
-            row = table.add_row().cells
-            row[0].text = (a.get("action") or "").strip()
-            row[1].text = (a.get("owner") or "").strip() or "no owner recorded"
-            row[2].text = (a.get("deadline") or "").strip() or "no date"
+    if actions and not placed:
+        doc.add_heading("Actions", level=1)
+        _add_actions_table(doc, actions)
 
     if closing:
         _add_prose_section(doc, closing)

@@ -61,14 +61,63 @@ def test_a_model_written_actions_section_does_not_duplicate_the_heading():
     renderer must not add its own heading above the table on top of that one --
     confirmed in a real document from TEST as a doubled 'Actions' heading."""
     sections = SECTIONS + [
-        {"title": "Actions", "paragraphs": ["Discussed the outstanding items below."]},
+        {"title": "Actions", "paragraphs": ["**Me** - Raise the flooding item - *today*"]},
     ]
     xml = _text(mm.generate_prose_document("Meeting Notes", "Waipuna Rise", sections, ACTIONS))
     assert _heading_count(xml, "Actions") == 1
-    assert "Discussed the outstanding items below." in xml, "the model's prose must survive"
     assert "Raise the flooding item" in xml, "the table must survive"
+
+
+def test_the_actions_are_written_once_as_our_table_under_the_plans_heading():
+    """The model was asked to write the actions into the Actions section AND the
+    renderer added its own table after every section, below the catch-all: each
+    action twice, once with literal asterisks (TEST, 2026-09-23, "daily report"
+    v10). The record is data; the table is written from it, once, in place."""
+    from docx import Document
+    sections = SECTIONS[:1] + [
+        {"title": "Actions", "paragraphs": ["**Me** - Raise the flooding item - *today*"]},
+    ] + SECTIONS[1:]
+    buf = mm.generate_prose_document("Meeting Notes", "Waipuna Rise", sections, ACTIONS)
+    doc = Document(io.BytesIO(buf.getvalue()))
+    order = []
+    for el in doc.element.body.iterchildren():
+        tag = el.tag.split("}")[1]
+        if tag == "tbl":
+            order.append("TABLE")
+        elif tag == "p":
+            t = "".join(x.text or "" for x in el.iter() if x.tag.endswith("}t")).strip()
+            if t:
+                order.append(t)
+    assert order.index("Actions") + 1 == order.index("TABLE") < order.index("Still open")
+    assert order.count("TABLE") == 1
+    assert _text(buf).count("Raise the flooding item") == 1, "each action once"
+
+
+def test_markdown_emphasis_is_formatting_not_asterisks():
+    from docx import Document
+    sections = [{"title": "Notes", "paragraphs": [
+        "**Dom** to fix the gate - *Friday*", "- a **bold** point", "2 * 3 = 6 and a*b",
+        "Item | Owner", "---|---", "Gate | **no owner recorded**"]}]
+    doc = Document(io.BytesIO(mm.generate_prose_document("T", "", sections, []).getvalue()))
+    texts = [p.text for p in doc.paragraphs]
+    assert "Dom to fix the gate - Friday" in texts and "a bold point" in texts
+    assert "2 * 3 = 6 and a*b" in texts, "a lone asterisk is left alone"
+    p = next(p for p in doc.paragraphs if p.text.startswith("Dom"))
+    assert p.runs[0].bold and p.runs[0].text == "Dom" and p.runs[-1].italic
+    assert doc.tables[0].rows[1].cells[1].text == "no owner recorded"
 
 
 def test_the_renderers_own_actions_heading_still_appears_without_a_prose_section():
     xml = _text(mm.generate_prose_document("Meeting Notes", "Waipuna Rise", SECTIONS, ACTIONS))
     assert _heading_count(xml, "Actions") == 1
+
+
+def test_the_prompt_no_longer_asks_the_model_to_write_the_actions_out():
+    import report_template as rt
+    scope = {"folder": "F", "date": "2026-09-30", "from": "00:00", "to": "23:59", "recordings": 1}
+    tpl = {"sections": [{"title": "Actions", "purpose": "p"}],
+           "catch_all": {"title": "Anything else", "purpose": "Rest."}}
+    p = rt.render_prompt(tpl, scope, ACTIONS, "x")
+    assert "do NOT write them out yourself" in p
+    assert "**Owner** - what they will do" not in p
+    assert "Raise the flooding item | owner: Me | when: today" in p, "still given as context"
