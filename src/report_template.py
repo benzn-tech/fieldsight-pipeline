@@ -230,10 +230,16 @@ def _rendered_section(section, authored, depth):
     the model doing exactly as asked, and the output not showing it.
     """
     title, purpose = section["title"], section["purpose"]
+    note = section.get("note") if isinstance(section.get("note"), str) else ""
     if authored:
-        title, purpose = _fenceable(title), _fenceable(purpose)
+        title, purpose, note = _fenceable(title), _fenceable(purpose), _fenceable(note)
     hashes = "#" * (3 + min(depth, MAX_SECTION_DEPTH))
-    out = ["%s %s\n%s" % (hashes, title, purpose)]
+    # THE CUSTOMER'S NOTE, under the module's text (report_modules): the text
+    # is ours and fixed, the note is the one thing the customer says about
+    # this section -- an empty-state wording, a grouping, a threshold.
+    body = purpose + ("\nThe customer's note for this section: %s" % note.strip()
+                      if note.strip() else "")
+    out = ["%s %s\n%s" % (hashes, title, body)]
     if depth < MAX_SECTION_DEPTH:
         for child in list(section.get("children") or []):
             out.extend(_rendered_section(child, authored, depth + 1))
