@@ -25,6 +25,7 @@ import item_continuity
 import lambda_extract_session as les
 import llm_utils
 
+from scripts.continuity_eval import paths as paths_mod
 from scripts.continuity_eval import sessions as sessions_mod
 from scripts.jev_eval.baseline import load_deployed_llm_env
 
@@ -138,6 +139,7 @@ def run_chain(bucket, session, shape_name, shape_steps, arm, rep, out_dir):
     date = session["date"]
     session_base = session["session_base"]
 
+    out_dir = paths_mod.require_run_dir(out_dir)
     keys = les.gather_session_segments(bucket, user_folder, date, session_base)
     fracs = sessions_mod.fraction_sequence(shape_steps)
 
@@ -223,7 +225,7 @@ def main(argv=None):
     os.environ.setdefault("AWS_PROFILE", args.profile)
     os.environ.setdefault("AWS_DEFAULT_REGION", args.region)
 
-    out_dir = Path(args.out)
+    out_dir = paths_mod.require_run_dir(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     shapes_dict = _select_shapes(args.shapes.split(","))

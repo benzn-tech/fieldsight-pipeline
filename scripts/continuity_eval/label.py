@@ -27,6 +27,8 @@ from pathlib import Path
 
 import item_continuity
 
+from scripts.continuity_eval import paths as paths_mod
+
 AGENT = "agent"
 OWNER = "owner"
 _LABELLERS = (AGENT, OWNER)
@@ -227,6 +229,7 @@ def export(run_dir, out_dir, prod_labeller=OWNER):
     todo file, for the caller to log."""
     if prod_labeller not in _LABELLERS:
         raise ValueError(f"prod_labeller must be 'agent' or 'owner', got {prod_labeller!r}")
+    out_dir = paths_mod.require_run_dir(out_dir)
     envs = _session_env_by_key(run_dir)
     rows = {AGENT: [], OWNER: []}
     transcripts = {}
@@ -235,7 +238,6 @@ def export(run_dir, out_dir, prod_labeller=OWNER):
         dest = _labeller_for(env, prod_labeller)
         rows[dest].append({k: a[k] for k in _PUBLIC_FIELDS})
         transcripts.setdefault(a["transcript_ref"], a.get("_transcript_text") or "")
-    out_dir = Path(out_dir)
     paths = {labeller: out_dir / f"assignments_todo.{labeller}.jsonl" for labeller in _LABELLERS}
     for labeller, path in paths.items():
         _write_jsonl(path, rows[labeller])
@@ -255,6 +257,7 @@ def import_labels(done_paths, out_path):
     initial label and the owner's adjudication of it -- the OWNER's label always wins,
     regardless of which file is processed first: adjudication exists to replace a wrong agent
     label, so an owner record is never overwritten by an agent one for the same id."""
+    out_path = paths_mod.require_run_dir(out_path)
     merged = {}
     for path in done_paths:
         for row in _read_jsonl(path):
@@ -301,6 +304,7 @@ def build_adjudication_todo(run_dir, agent_done_path, out_path, sample_rate=0.10
 
     Only assignments the agent actually labelled (present in `agent_done_path`) are eligible --
     an unlabelled assignment has nothing for the owner to agree or disagree with yet."""
+    out_path = paths_mod.require_run_dir(out_path)
     agent_done = {row["assignment_id"]: row for row in _read_jsonl(agent_done_path)}
     assignments = [a for a in iter_assignments(run_dir) if a["assignment_id"] in agent_done]
 

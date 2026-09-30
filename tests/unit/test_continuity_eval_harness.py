@@ -178,6 +178,7 @@ def _install_gather_and_assemble(monkeypatch):
 
 
 def test_shape_a_first_step_gets_no_continuity_block_even_on_with_block_arm(monkeypatch, tmp_path):
+    tmp_path = tmp_path / "continuity_eval_runs"  # run_chain refuses to write elsewhere
     _install_gather_and_assemble(monkeypatch)
     calls = []
 
@@ -206,6 +207,7 @@ def test_the_prompt_used_is_produced_by_the_real_build_extraction_prompt(monkeyp
     lambda_extract_session.build_extraction_prompt, and the second step of a
     with-block chain must pass it exactly item_continuity.render_block's own output
     for the prior items carried from the first step's resolved extraction."""
+    tmp_path = tmp_path / "continuity_eval_runs"  # run_chain refuses to write elsewhere
     _install_gather_and_assemble(monkeypatch)
     calls = []
 
@@ -256,6 +258,7 @@ def test_the_prompt_used_is_produced_by_the_real_build_extraction_prompt(monkeyp
 
 
 def test_baseline_arm_never_gets_a_continuity_block(monkeypatch, tmp_path):
+    tmp_path = tmp_path / "continuity_eval_runs"  # run_chain refuses to write elsewhere
     _install_gather_and_assemble(monkeypatch)
     calls = []
 
@@ -279,6 +282,7 @@ def test_baseline_arm_never_gets_a_continuity_block(monkeypatch, tmp_path):
 
 
 def test_run_chain_writes_one_step_file_per_pass(monkeypatch, tmp_path):
+    tmp_path = tmp_path / "continuity_eval_runs"  # run_chain refuses to write elsewhere
     _install_gather_and_assemble(monkeypatch)
     monkeypatch.setattr(
         run_mod.les, "build_extraction_prompt",
@@ -302,6 +306,7 @@ def test_run_chain_writes_one_step_file_per_pass(monkeypatch, tmp_path):
 
 
 def test_run_chain_records_llm_call_error_without_raising(monkeypatch, tmp_path):
+    tmp_path = tmp_path / "continuity_eval_runs"  # run_chain refuses to write elsewhere
     _install_gather_and_assemble(monkeypatch)
     monkeypatch.setattr(
         run_mod.les, "build_extraction_prompt",
@@ -335,7 +340,7 @@ def test_dry_run_makes_no_llm_call_and_no_deployed_config_load(monkeypatch, tmp_
                          lambda env, **kw: [fake_session])
     monkeypatch.setattr(sessions_mod, "s3_client", lambda **kw: object())
 
-    out_dir = tmp_path / "run1"
+    out_dir = tmp_path / "continuity_eval_runs" / "run1"  # main() refuses to write elsewhere
     plan = run_mod.main(["--env", "test", "--sessions", "1", "--shapes", "a",
                           "--out", str(out_dir), "--dry-run"])
 

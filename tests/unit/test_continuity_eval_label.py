@@ -129,7 +129,7 @@ def test_export_routes_test_sessions_to_the_agent_file_regardless_of_prod_labell
     _two_step_chain(tmp_path, "a", "with_block", 1, session, prior_id, prior_id)
     _write_sessions_json(tmp_path, [{"env": "test", "user_folder": "user",
                                       "date": "2026-01-01", "session_base": "base"}])
-    result = label.export(tmp_path, tmp_path / "out", prod_labeller="agent")
+    result = label.export(tmp_path, tmp_path / "continuity_eval_runs" / "out", prod_labeller="agent")
     assert result["agent_count"] == 1
     assert result["owner_count"] == 0
 
@@ -140,7 +140,7 @@ def test_export_routes_prod_sessions_to_owner_by_default(tmp_path):
     _two_step_chain(tmp_path, "a", "with_block", 1, session, prior_id, prior_id)
     _write_sessions_json(tmp_path, [{"env": "prod", "user_folder": "user",
                                       "date": "2026-01-01", "session_base": "base"}])
-    result = label.export(tmp_path, tmp_path / "out")   # default prod_labeller="owner"
+    result = label.export(tmp_path, tmp_path / "continuity_eval_runs" / "out")   # default prod_labeller="owner"
     assert result["agent_count"] == 0
     assert result["owner_count"] == 1
 
@@ -151,7 +151,7 @@ def test_export_routes_prod_sessions_to_agent_when_prod_labeller_is_agent(tmp_pa
     _two_step_chain(tmp_path, "a", "with_block", 1, session, prior_id, prior_id)
     _write_sessions_json(tmp_path, [{"env": "prod", "user_folder": "user",
                                       "date": "2026-01-01", "session_base": "base"}])
-    result = label.export(tmp_path, tmp_path / "out", prod_labeller="agent")
+    result = label.export(tmp_path, tmp_path / "continuity_eval_runs" / "out", prod_labeller="agent")
     assert result["agent_count"] == 1
     assert result["owner_count"] == 0
 
@@ -159,7 +159,7 @@ def test_export_routes_prod_sessions_to_agent_when_prod_labeller_is_agent(tmp_pa
 def test_export_rejects_an_unknown_prod_labeller(tmp_path):
     import pytest
     with pytest.raises(ValueError):
-        label.export(tmp_path, tmp_path / "out", prod_labeller="nobody")
+        label.export(tmp_path, tmp_path / "continuity_eval_runs" / "out", prod_labeller="nobody")
 
 
 def test_export_written_lines_carry_no_claim_field(tmp_path):
@@ -170,8 +170,8 @@ def test_export_written_lines_carry_no_claim_field(tmp_path):
     _two_step_chain(tmp_path, "a", "with_block", 1, session, prior_id, prior_id, claims=[claim])
     _write_sessions_json(tmp_path, [{"env": "test", "user_folder": "user",
                                       "date": "2026-01-01", "session_base": "base"}])
-    label.export(tmp_path, tmp_path / "out")
-    lines = list(label._read_jsonl(tmp_path / "out" / "assignments_todo.agent.jsonl"))
+    label.export(tmp_path, tmp_path / "continuity_eval_runs" / "out")
+    lines = list(label._read_jsonl(tmp_path / "continuity_eval_runs" / "out" / "assignments_todo.agent.jsonl"))
     assert len(lines) == 1
     assert "model_claim_alias" not in lines[0]
     assert "model_claim_outcome" not in lines[0]
@@ -189,7 +189,7 @@ def test_import_labels_owner_wins_over_agent_for_the_same_assignment(tmp_path):
         {"assignment_id": "x1", "counterpart": "A1", "supported": True, "labeller": "agent"}])
     label._write_jsonl(owner_path, [
         {"assignment_id": "x1", "counterpart": "none", "supported": False, "labeller": "owner"}])
-    merged = label.import_labels([agent_path, owner_path], tmp_path / "done.jsonl")
+    merged = label.import_labels([agent_path, owner_path], tmp_path / "continuity_eval_runs" / "done.jsonl")
     assert len(merged) == 1
     assert merged[0]["labeller"] == "owner"
     assert merged[0]["counterpart"] == "none"
@@ -202,7 +202,7 @@ def test_import_labels_owner_wins_regardless_of_file_order(tmp_path):
         {"assignment_id": "x1", "counterpart": "A1", "supported": True, "labeller": "agent"}])
     label._write_jsonl(owner_path, [
         {"assignment_id": "x1", "counterpart": "none", "supported": False, "labeller": "owner"}])
-    merged = label.import_labels([owner_path, agent_path], tmp_path / "done.jsonl")
+    merged = label.import_labels([owner_path, agent_path], tmp_path / "continuity_eval_runs" / "done.jsonl")
     assert merged[0]["labeller"] == "owner"
 
 
@@ -213,7 +213,7 @@ def test_import_labels_keeps_unrelated_assignments_from_both_files(tmp_path):
         {"assignment_id": "x1", "counterpart": "A1", "supported": True, "labeller": "agent"}])
     label._write_jsonl(owner_path, [
         {"assignment_id": "x2", "counterpart": "none", "supported": True, "labeller": "owner"}])
-    merged = label.import_labels([agent_path, owner_path], tmp_path / "done.jsonl")
+    merged = label.import_labels([agent_path, owner_path], tmp_path / "continuity_eval_runs" / "done.jsonl")
     assert {r["assignment_id"] for r in merged} == {"x1", "x2"}
 
 
@@ -232,7 +232,7 @@ def test_adjudication_todo_includes_accepted_claims_the_agent_labelled_different
     label._write_jsonl(agent_done, [
         {"assignment_id": assignment["assignment_id"], "counterpart": "none",
          "supported": True, "labeller": "agent"}])
-    rows = label.build_adjudication_todo(tmp_path, agent_done, tmp_path / "adj.jsonl",
+    rows = label.build_adjudication_todo(tmp_path, agent_done, tmp_path / "continuity_eval_runs" / "adj.jsonl",
                                            sample_rate=0.0)
     assert len(rows) == 1
     assert rows[0]["reason"] == "claim_disagreement"
@@ -251,7 +251,7 @@ def test_adjudication_todo_does_not_flag_agreement_as_a_disagreement(tmp_path):
     label._write_jsonl(agent_done, [
         {"assignment_id": assignment["assignment_id"], "counterpart": "A1",
          "supported": True, "labeller": "agent"}])
-    rows = label.build_adjudication_todo(tmp_path, agent_done, tmp_path / "adj.jsonl",
+    rows = label.build_adjudication_todo(tmp_path, agent_done, tmp_path / "continuity_eval_runs" / "adj.jsonl",
                                            sample_rate=0.0)
     assert rows == []
 
@@ -273,9 +273,9 @@ def test_adjudication_todo_sample_is_deterministic_and_does_not_double_count(tmp
     label._write_jsonl(agent_done, [
         {"assignment_id": a["assignment_id"], "counterpart": "none", "supported": True,
          "labeller": "agent"} for a in assignments])
-    rows1 = label.build_adjudication_todo(tmp_path, agent_done, tmp_path / "adj1.jsonl",
+    rows1 = label.build_adjudication_todo(tmp_path, agent_done, tmp_path / "continuity_eval_runs" / "adj1.jsonl",
                                             sample_rate=0.3, seed=7)
-    rows2 = label.build_adjudication_todo(tmp_path, agent_done, tmp_path / "adj2.jsonl",
+    rows2 = label.build_adjudication_todo(tmp_path, agent_done, tmp_path / "continuity_eval_runs" / "adj2.jsonl",
                                             sample_rate=0.3, seed=7)
     assert len(rows1) == 3
     assert [r["assignment_id"] for r in rows1] == [r["assignment_id"] for r in rows2]
@@ -352,8 +352,8 @@ def test_export_writes_one_transcript_file_shared_by_every_new_item_in_a_step(tm
                 transcript_text="[00:00] spk_0: step 1 transcript, real evidence")
     _write_sessions_json(tmp_path, [{"env": "test", "user_folder": "user",
                                       "date": "2026-01-01", "session_base": "base"}])
-    result = label.export(tmp_path, tmp_path / "out")
-    lines = list(label._read_jsonl(tmp_path / "out" / "assignments_todo.agent.jsonl"))
+    result = label.export(tmp_path, tmp_path / "continuity_eval_runs" / "out")
+    lines = list(label._read_jsonl(tmp_path / "continuity_eval_runs" / "out" / "assignments_todo.agent.jsonl"))
     assert len(lines) == 2
     refs = {line["transcript_ref"] for line in lines}
     assert len(refs) == 1                                    # both new items share one step
@@ -375,6 +375,6 @@ def test_adjudication_row_carries_the_same_transcript_ref(tmp_path):
     label._write_jsonl(agent_done, [
         {"assignment_id": assignment["assignment_id"], "counterpart": "none",
          "supported": True, "labeller": "agent"}])
-    [row] = label.build_adjudication_todo(tmp_path, agent_done, tmp_path / "adj.jsonl",
+    [row] = label.build_adjudication_todo(tmp_path, agent_done, tmp_path / "continuity_eval_runs" / "adj.jsonl",
                                             sample_rate=0.0)
     assert row["transcript_ref"] == assignment["transcript_ref"]

@@ -25,6 +25,7 @@ import carry_forward
 import item_continuity
 
 from scripts.continuity_eval import label as label_mod
+from scripts.continuity_eval import paths as paths_mod
 
 HARD_NEGATIVE_MIN_PAIRS = 30
 LATENCY_MIN_N = 30
@@ -434,12 +435,15 @@ def build_summary(run_dir, gold_done_path, out_path, *,
     themselves take pre-joined inputs. Task 12 (which actually runs the measurement) supplies
     them; this function's job is only to route real assignment-level data through the bar
     functions and write one JSON file."""
+    run_dir = paths_mod.require_run_dir(run_dir)
     rows = scored_assignments(run_dir, gold_done_path)
 
     # Opaque per-session refs so no `by_session` breakdown below, and therefore no serialised
     # summary.json, ever contains a raw session id (a real run's session id is
     # `user_folder__date__session_base`, and `user_folder` is a person's name). The real
-    # mapping is written only into the gitignored run directory, never returned here.
+    # mapping is written only into the gitignored run directory -- guarded by `require_run_dir`
+    # above, unlike `out_path`/summary.json below, since this file DOES carry raw session ids
+    # and must never land outside `continuity_eval_runs/` -- never returned here.
     refs = session_refs(r["session"] for r in rows)
     Path(run_dir, "session_refs.json").write_text(
         json.dumps(refs, indent=2, sort_keys=True), encoding="utf-8")
@@ -470,6 +474,11 @@ def build_summary(run_dir, gold_done_path, out_path, *,
     }
     summary = {"verdict": overall_verdict(b["verdict"] for b in bars.values()),
                "bars": bars, "reported": reported}
+    # `out_path` is deliberately NOT passed through `require_run_dir`: this is
+    # `results/summary.json`, spec S7's one committed file (counts, rates and verdicts
+    # only -- never a raw session id, item text or transcript text), so it is meant to be
+    # written to the tracked repo path, outside `continuity_eval_runs/`, when Task 12 commits
+    # a real result.
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")

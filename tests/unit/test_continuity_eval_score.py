@@ -394,6 +394,7 @@ def test_scored_assignments_marks_a_wrong_carry(tmp_path):
 
 
 def test_build_summary_writes_a_verdict_and_one_entry_per_bar(tmp_path):
+    tmp_path = tmp_path / "continuity_eval_runs"  # build_summary refuses to write elsewhere
     prior_id = str(uuid.uuid4())
     session = "user__2026-01-01__base"
     claim = {"alias": "A1", "prior_item_id": prior_id, "new_item_id": prior_id,
@@ -438,6 +439,7 @@ def test_session_refs_are_stable_sorted_opaque_ids():
 
 
 def test_summary_json_contains_no_raw_session_id_or_folder_name(tmp_path):
+    tmp_path = tmp_path / "continuity_eval_runs"  # build_summary refuses to write elsewhere
     prior_id = str(uuid.uuid4())
     session = "workername__2026-01-01__base"      # user_folder ("workername") is a person's name
     claim = {"alias": "A1", "prior_item_id": prior_id, "new_item_id": prior_id,
@@ -460,6 +462,7 @@ def test_summary_json_contains_no_raw_session_id_or_folder_name(tmp_path):
 
 
 def test_build_summary_writes_the_id_to_ref_map_only_into_the_run_dir(tmp_path):
+    tmp_path = tmp_path / "continuity_eval_runs"  # build_summary refuses to write elsewhere
     prior_id = str(uuid.uuid4())
     session = "user__2026-01-01__base"
     claim = {"alias": "A1", "prior_item_id": prior_id, "new_item_id": prior_id,
@@ -485,6 +488,7 @@ def test_build_summary_writes_the_id_to_ref_map_only_into_the_run_dir(tmp_path):
 # =========================================================================================
 
 def test_rejected_claim_guards_flow_through_export_import_build_summary(tmp_path):
+    tmp_path = tmp_path / "continuity_eval_runs"  # export/import_labels/build_summary refuse
     prior_id = str(uuid.uuid4())
     session = "user__2026-01-01__base"
     echo_new_id = str(uuid.uuid4())
