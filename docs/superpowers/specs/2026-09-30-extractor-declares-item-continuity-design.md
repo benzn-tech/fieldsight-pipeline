@@ -179,7 +179,7 @@ Written before any result, per CLAUDE.md "Measure before you change a prompt, an
   - read-only S3 GET of prod transcripts and extractions; no prod database access and no prod lambda triggered;
   - the eval's extraction calls use the same model provider prod already uses, so no new third party receives the text;
   - outputs and labels stay local and gitignored; only counts are committed.
-- **Who labels prod sessions** is an open owner decision: the blind agent annotator (a Claude agent reading customer conversation text — a new place that data goes) or the owner. The harness takes this as a setting (`prod_labeller = agent | owner`). TEST sessions are agent-labelled either way. The owner has accepted the adjudication workload below.
+- **Prod sessions are labelled by the blind agent annotator too (owner, 2026-10-01).** A Claude agent reads the prod conversation text for labelling; the owner accepted that data flow. The owner adjudicates only what the Gold section below routes to them (accepted claims the agent calls "different", plus a 10% random sample). The harness setting is `prod_labeller = agent`. This labelling is a one-off for this measurement; it is repeated only for the prod-config run before prod and after a change of extraction model or prompt.
 
 **Gold**
 - Labelling is an **assignment per (prior list, new list)**, not per pair: for each new item, pick its counterpart in the prior list, or "none". "None" is the default.
@@ -212,7 +212,7 @@ Written before any result, per CLAUDE.md "Measure before you change a prompt, an
 - added prompt tokens.
 
 **Decision rule**
-- All bars pass: switch on for TEST, watch the per-method EMF counts, `OrphanedHumanEdits`, `prior_stale` and the `item_continuity` records for a week, then ask the owner about prod, with a prod-config run first.
+- All bars pass: switch on for TEST and watch the per-method EMF counts, `OrphanedHumanEdits`, `prior_stale` and the `item_continuity` records until **at least 20 real sessions** have run with the flag on, **for at most 2 weeks** (owner, 2026-10-01; TEST traffic is low, so a count, not a calendar week, is what makes the numbers readable). If 2 weeks pass with fewer than 20 sessions, report on what exists. Then ask the owner about prod, with a prod-config run first.
 - Any bar fails: the flag stays off, the numbers are committed, and the spec is revisited. The fuzzy floor is not lowered as a workaround.
 
 ## 8. Testing (implementation)
