@@ -405,7 +405,7 @@ def test_profiles_carries_on_roster_when_site_and_date_are_given(monkeypatch):
                         lambda conn, company_id, site_id=None: _two_profiles())
     monkeypatch.setattr(vw, "company_floor", lambda conn, company_id: None)
     monkeypatch.setattr(vw.site_attendance, "on_roster_profile_ids",
-                        lambda conn, company_id, site_id, attend_date: {VP_A})
+                        lambda conn, company_id, site_id, attend_date, **kw: {VP_A})
     out = vw.lambda_handler({"op": "profiles", "company_id": CO, "site_id": SITE,
                              "date": "2026-09-30"}, None)
     by_key = {p["person_key"]: p for p in out["profiles"]}
@@ -423,7 +423,7 @@ def test_on_roster_is_absent_without_site_id_or_date(monkeypatch):
                         lambda conn, company_id, site_id=None: _two_profiles())
     monkeypatch.setattr(vw, "company_floor", lambda conn, company_id: None)
     monkeypatch.setattr(vw.site_attendance, "on_roster_profile_ids",
-                        lambda conn, company_id, site_id, attend_date:
+                        lambda conn, company_id, site_id, attend_date, **kw:
                         called.append(1) or {VP_A})
 
     out = vw.lambda_handler({"op": "profiles", "company_id": CO}, None)
@@ -446,7 +446,7 @@ def test_a_roster_read_failure_narrows_nothing_and_does_not_raise(monkeypatch):
                         lambda conn, company_id, site_id=None: _two_profiles())
     monkeypatch.setattr(vw, "company_floor", lambda conn, company_id: None)
 
-    def _boom(conn, company_id, site_id, attend_date):
+    def _boom(conn, company_id, site_id, attend_date, **kw):
         raise RuntimeError("roster table unreachable")
 
     monkeypatch.setattr(vw.site_attendance, "on_roster_profile_ids", _boom)
@@ -455,6 +455,67 @@ def test_a_roster_read_failure_narrows_nothing_and_does_not_raise(monkeypatch):
     for p in out["profiles"]:
         assert "on_roster" not in p
     assert "roster_size" not in out
+
+
+# ---- the derived-roster switch (2026-09-30 plan, Task 4) --------------------
+#
+# `_profiles` has to hand the switch through on every call: the writer reads env at import,
+# so the repository takes `derived`/`lookback_days` as plain arguments and never touches the
+# environment itself (plan correction 7) -- which means the only place the switch can leak
+# from the writer's module constants into the actual roster read is this call.
+
+
+def test_profiles_passes_the_derived_switch_and_lookback(monkeypatch):
+    captured = {}
+
+    def _capture(conn, company_id, site_id, attend_date, derived=None, lookback_days=None):
+        captured["derived"] = derived
+        captured["lookback_days"] = lookback_days
+        return {VP_A}
+
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "profiles_for_matching",
+                        lambda conn, company_id, site_id=None: _two_profiles())
+    monkeypatch.setattr(vw, "company_floor", lambda conn, company_id: None)
+    monkeypatch.setattr(vw.site_attendance, "on_roster_profile_ids", _capture)
+    monkeypatch.setattr(vw, "ROSTER_DERIVED", True)
+    monkeypatch.setattr(vw, "ROSTER_LOOKBACK_DAYS", 9)
+
+    vw.lambda_handler({"op": "profiles", "company_id": CO, "site_id": SITE,
+                       "date": "2026-09-30"}, None)
+    assert captured == {"derived": True, "lookback_days": 9}
+
+
+def test_profiles_off_passes_derived_false(monkeypatch):
+    captured = {}
+
+    def _capture(conn, company_id, site_id, attend_date, derived=None, lookback_days=None):
+        captured["derived"] = derived
+        return {VP_A}
+
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "profiles_for_matching",
+                        lambda conn, company_id, site_id=None: _two_profiles())
+    monkeypatch.setattr(vw, "company_floor", lambda conn, company_id: None)
+    monkeypatch.setattr(vw.site_attendance, "on_roster_profile_ids", _capture)
+    monkeypatch.setattr(vw, "ROSTER_DERIVED", False)
+
+    vw.lambda_handler({"op": "profiles", "company_id": CO, "site_id": SITE,
+                       "date": "2026-09-30"}, None)
+    assert captured["derived"] is False
+
+
+def test_the_code_defaults():
+    """The clean-environment default, checked through the parsing helper rather than a
+    module reload -- a reload here would leave `vw` in whatever state the LAST reload left
+    it, which every other test in this file relies on being the normal, env-driven one."""
+    assert vw.ROSTER_DERIVED is True
+    assert vw.ROSTER_LOOKBACK_DAYS == 14
+    assert vw._derived_from_env(None) is True
+    assert vw._derived_from_env("on") is True
+    assert vw._derived_from_env("ON") is True
+    assert vw._derived_from_env("off") is False
+    assert vw._derived_from_env("OFF") is False
 
 
 # ---- the scheduled floor recompute ----------------------------------------
