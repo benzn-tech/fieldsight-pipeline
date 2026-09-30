@@ -2987,7 +2987,11 @@ def test_timeline_shim_serves_s3_verbatim_when_no_extraction_topics(presign_wire
     res = org.lambda_handler(make_event("GET", "/api/org/timeline",
                                         params={"date": "2026-07-07", "user": "Ada_L"}), None)
     assert res["statusCode"] == 200
-    assert body_of(res) == {**verbatim_doc, "user": "Ada_L"}  # EXACT passthrough -- nothing added/dropped/renamed
+    # The document passes through untouched EXCEPT for one added key: `user`, the
+    # folder this response was served for. Equality (not a subset check) is the
+    # point -- a second stray key would fail here, which is what makes this a
+    # guard on the response contract rather than a smoke test.
+    assert body_of(res) == {**verbatim_doc, "user": "Ada_L"}
 
 
 def test_timeline_shim_renders_override_when_extraction_topics_exist(presign_wired):
