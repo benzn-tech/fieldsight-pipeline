@@ -1267,12 +1267,13 @@ Harness: set `DECLARE_CONTINUITY=true` and reload `lambda_extract_session`. Use 
   - `runs/<shape>/<arm>/<rep>/<session>/<step>.json`: `{prompt_has_block, prior_count, extraction, claims}`
   - `counts.json`: per-kind prod item-count distribution, read-only (spec §6.6)
 
-- [ ] **Step 1: Write failing unit tests** for the pure parts:
+- [x] **Step 1: Write failing unit tests** for the pure parts:
   - `prefix_segments(keys, frac)` returns the first `ceil(frac*n)` keys in time order;
   - `shapes()` returns `a` = [(0.95, 1.0)] and `b` = [(0.4, 0.6), (0.6, 0.8), (0.8, 1.0)];
   - `void(run)` is True when an arm is `with_block` and (`prior_count == 0` or `prompt_has_block` is False);
   - the prompt used is produced by `les.build_extraction_prompt` (assert by monkeypatching it and checking it was called with the `continuity_block` from `item_continuity.render_block`).
-- [ ] **Step 2: Implement.**
+  - Outcome: 21 tests in `tests/unit/test_continuity_eval_harness.py` — the four bullets above, plus `fraction_sequence`, `run_chain`'s per-step file writes and LLM-error handling, `list_candidate_sessions` against a fake S3 paginator + fake `gather`, and `--dry-run` (asserts no `call_llm` and no `load_deployed_llm_env` call).
+- [x] **Step 2: Implement.**
   - `sessions.py` lists candidate sessions:
     - TEST: `s3://fieldsight-data-test-509194952652/extractions/**` with ≥ 3 transcript segments;
     - PROD, read-only: `s3://fieldsight-data-509194952652/…`, same filter, profile `fieldsight-deployer`;
@@ -1286,8 +1287,9 @@ Harness: set `DECLARE_CONTINUITY=true` and reload `lambda_extract_session`. Use 
     - records latency and prompt tokens from the `LLM_USAGE` result where available;
     - never writes to S3 or any database;
     - also computes `counts.json`: per-session item counts by kind from prod's published extractions.
-- [ ] **Step 3: Run the unit tests** — PASS.
-- [ ] **Step 4: Commit** `git add scripts/continuity_eval/ tests/unit/test_continuity_eval_harness.py .gitignore && git commit -m "Continuity eval harness: session sets, shapes, arms, void condition"`
+  - Outcome: implemented as designed. `void()` needs no separate "first step of a chain" branch — a chain's first pass always has `prior_count` 0 by construction (nothing published yet to offer), so it is void under the same one rule whenever it runs on the `with_block` arm. `list_candidate_sessions` lists the `extractions/` prefix (a session needs a published extraction to be useful for measurement — shape (a)'s live-vs-final comparison and `counts.json` both need one) and filters each candidate by its own `gather_session_segments` count. `run.py` sets `AWS_PROFILE`/`AWS_DEFAULT_REGION` from `--profile`/`--region` (default `fieldsight-deployer`) so `lambda_extract_session`'s own lazily-built client picks up the right credentials, since that client has no profile parameter of its own. Per-step `latency_ms` is recorded; prompt-token accounting from `LLM_USAGE` is **not** wired in this task — `llm_utils.call_llm` returns only `(text, error)`, no usage dict, so there is nothing to read the tokens from without a `call_llm` change, which is out of this task's file list. Flagged for Task 11/12 to pick up if the added-prompt-tokens metric (spec §7 "Also reported") needs it.
+- [x] **Step 3: Run the unit tests** — PASS: 21/21 in `test_continuity_eval_harness.py`; full `tests/unit` run: 6917 passed, 1 skipped (pre-existing skip, unrelated to this change).
+- [x] **Step 4: Commit** `git add scripts/continuity_eval/ tests/unit/test_continuity_eval_harness.py .gitignore && git commit -m "Continuity eval harness: session sets, shapes, arms, void condition"`
 
 ---
 
