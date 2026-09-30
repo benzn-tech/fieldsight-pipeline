@@ -136,32 +136,130 @@ def remove(conn, company_id, site_id, attend_date, row_id) -> int:
     return len(rows)
 
 
-def on_roster_profile_ids(conn, company_id, site_id, attend_date) -> set:
-    """Every voiceprint profile the roster puts on site that day, resolved NOW rather than
-    read off whatever `upsert` stored (module docstring). Three arms:
 
-      * `p.id = a.voiceprint_id`         -- already resolved, by id or by name at write time
-      * `p.user_id = a.user_id`          -- resolved to a directory account since
-      * `lower(p.display_name) = lower(a.display_name)` -- the name arm, and the one that
-        makes `manual` useful on day one: most profiles today are subcontractors with
-        `user_id IS NULL` (repositories/voiceprints.py:193-200).
+# #969's statement, verbatim -- this is the `derived=False` rollback, and it must never
+# change shape after this line, or the rollback stops being byte-for-byte (2026-09-30 plan,
+# Task 1). Positional params: (company_id, site_id, attend_date).
+_EXPLICIT_SQL = (
+    "SELECT DISTINCT p.id FROM speaker_voiceprints p "
+    "JOIN site_attendance a ON a.company_id = p.company_id "
+    "  AND (p.id = a.voiceprint_id "
+    "       OR (p.user_id IS NOT NULL AND p.user_id = a.user_id) "
+    "       OR lower(p.display_name) = lower(a.display_name)) "
+    "WHERE p.company_id = %s AND p.status <> 'withdrawn' "
+    "  AND a.site_id = %s AND a.attend_date = %s"
+)
+
+# The derived roster (design: docs/superpowers/specs/2026-09-30-derived-roster-design.md,
+# "Review outcome" section). A UNION of #969's explicit rows with two more facts the system
+# already holds: people who recorded at this site on this NZ day (arm 2, Task 2), and people
+# a human named at this site in the last N NZ days (arm 3, Task 3). Named params throughout,
+# because the arms share %(co)s/%(site)s/%(day)s/%(lookback)s and a positional list that long
+# is unreadable and easy to miscount.
+#
+# For now (Task 1) this is the explicit arm alone, rewritten with named params -- Task 2 and
+# Task 3 append their `UNION` legs beneath it. Even with only one arm, `derived=True` (the
+# default) is NOT the same statement object as `_EXPLICIT_SQL`: it is deliberately its own
+# text, so a future edit to one does not silently change the other's rollback guarantee.
+_DERIVED_SQL = (
+    "SELECT DISTINCT p.id FROM speaker_voiceprints p "
+    "JOIN site_attendance a ON a.company_id = p.company_id "
+    "  AND (p.id = a.voiceprint_id "
+    "       OR (p.user_id IS NOT NULL AND p.user_id = a.user_id) "
+    "       OR lower(p.display_name) = lower(a.display_name)) "
+    "WHERE p.company_id = %(co)s AND p.status <> 'withdrawn' "
+    "  AND a.site_id = %(site)s AND a.attend_date = %(day)s "
+
+    # Arm 2 (Task 2): people who recorded at this site on this NZ day. `recordings` has no
+    # date column -- the day is the S3 key's date segment (correction 1: every other reader
+    # in repositories/recordings.py dates this way, and the key is the device's own wall
+    # clock, the same clock the matcher's `date` is on), never `started_at` (UTC, and a
+    # different clock). `kind IN ('audio','video')` excludes photo-only presence (correction
+    # 8). The recorder is matched to a profile by directory account first, then by full name
+    # via `concat_ws` -- not `||`, which is NULL-poisoned by a missing last name -- because
+    # most profiles carry `user_id IS NULL` (correction 5).
+    "UNION "
+    "SELECT p.id FROM recordings r "
+    "JOIN users u ON u.id = r.user_id "
+    "JOIN speaker_voiceprints p ON p.company_id = r.company_id "
+    " AND (p.user_id = r.user_id "
+    "      OR (p.user_id IS NULL "
+    "          AND lower(p.display_name) = lower(concat_ws(' ', u.first_name, u.last_name)))) "
+    "WHERE r.company_id = %(co)s AND r.site_id = %(site)s "
+    "  AND r.kind IN ('audio', 'video') "
+    "  AND split_part(r.s3_key, '/', 4) = (%(day)s)::date::text "
+    "  AND p.status <> 'withdrawn' "
+
+    # Arm 3 (Task 3): people a human named at this site in the last `lookback_days` NZ
+    # days. Led from `meeting_session`, not from a company-wide scan of
+    # `speaker_turn_names` (correction 6: this query is driven from the writer on every
+    # extraction, live ones included, so it must reach `speaker_turn_names` only through
+    # `idx_turn_names_session`). `t.session_base = 'sid' || ms.session_id` is the join
+    # (correction 2: `session_base` is the canonical `sid{32hex}`, `session_id` is the bare
+    # hex). `source = 'correction' AND superseded_at IS NULL` is the human, live filter
+    # (correction 4); the profile join also matches by name because a correction's
+    # `voiceprint_id` can be NULL (0040). The lookback is anchored on `attend_date`, never
+    # `now()` (correction 3), converted to the session's own NZ day. The site test tries
+    # `meeting_session.site_id` first and falls back to a recording of the same session
+    # (correction 2: offline-opened sessions have `site_id IS NULL`; `recordings.site_id`
+    # is the authority, BUG-41). The `LIKE ... ESCAPE '\'` mirrors
+    # `repositories.recordings.site_for_media`'s own session-key match.
+    "UNION "
+    "SELECT p.id FROM meeting_session ms "
+    "JOIN speaker_turn_names t ON t.company_id = ms.company_id "
+    " AND t.session_base = 'sid' || ms.session_id "
+    " AND t.source = 'correction' AND t.superseded_at IS NULL "
+    "JOIN speaker_voiceprints p ON p.company_id = t.company_id "
+    " AND (p.id = t.voiceprint_id "
+    "      OR (t.voiceprint_id IS NULL AND t.display_name IS NOT NULL "
+    "          AND lower(p.display_name) = lower(t.display_name))) "
+    "WHERE ms.company_id = %(co)s "
+    "  AND (COALESCE(ms.opened_at, ms.created_at) AT TIME ZONE 'Pacific/Auckland')::date "
+    "      BETWEEN %(day)s::date - %(lookback)s AND %(day)s::date "
+    "  AND (ms.site_id = %(site)s "
+    "       OR EXISTS (SELECT 1 FROM recordings r2 "
+    "                   WHERE r2.company_id = ms.company_id AND r2.user_id = ms.user_id "
+    "                     AND r2.site_id = %(site)s "
+    "                     AND r2.s3_key LIKE '%%\\_sid' || ms.session_id || '\\_c%%' "
+    "                     ESCAPE '\\')) "
+    "  AND p.status <> 'withdrawn'"
+)
+
+
+def on_roster_profile_ids(conn, company_id, site_id, attend_date,
+                          derived=True, lookback_days=14) -> set:
+    """Every voiceprint profile the roster puts on site that day, resolved NOW rather than
+    read off whatever `upsert` stored (module docstring).
+
+    `derived=False` runs `_EXPLICIT_SQL` -- #969's own statement, unchanged -- and is the
+    rollback the design's switch promises: byte-for-byte, not merely equivalent, because a
+    company that turns the derived roster off must get back exactly what it had before this
+    feature existed, forever, even as the derived arms grow.
+
+    `derived=True` (the default) runs `_DERIVED_SQL`, the union of:
+
+      * the explicit arm (`site_attendance` rows, unchanged) --
+        `p.id = a.voiceprint_id` / `p.user_id = a.user_id` / name match;
+      * arm 2 (Task 2): people who recorded at this site on this NZ day;
+      * arm 3 (Task 3): people a human named at this site in the last `lookback_days` NZ
+        days, anchored on `attend_date` -- not on `now()` -- so re-running an old session is
+        reproducible (correction 3).
 
     `status <> 'withdrawn'` on the profile side, same rule as `profiles_for_matching`: a
     withdrawn profile that still narrows a roster in its favour is not a withdrawal.
 
-    Raises on a missing company_id (`_require_company`). Returns `set()` when the roster is
-    empty -- and the CALLER treats an empty set as "no roster", not "nobody" (the
-    empty-list-means-no-filter trap, deliberately inverted here: an empty roster narrows
+    Raises on a missing company_id (`_require_company`), on both paths. Returns `set()` when
+    the roster is empty -- and the CALLER treats an empty set as "no roster", not "nobody"
+    (the empty-list-means-no-filter trap, deliberately inverted here: an empty roster narrows
     nothing, per the spec's "narrows, never blocks").
     """
     _require_company(company_id)
-    rows = conn.cursor(row_factory=dict_row).execute(
-        "SELECT DISTINCT p.id FROM speaker_voiceprints p "
-        "JOIN site_attendance a ON a.company_id = p.company_id "
-        "  AND (p.id = a.voiceprint_id "
-        "       OR (p.user_id IS NOT NULL AND p.user_id = a.user_id) "
-        "       OR lower(p.display_name) = lower(a.display_name)) "
-        "WHERE p.company_id = %s AND p.status <> 'withdrawn' "
-        "  AND a.site_id = %s AND a.attend_date = %s",
-        (company_id, site_id, attend_date)).fetchall()
+    cur = conn.cursor(row_factory=dict_row)
+    if not derived:
+        rows = cur.execute(_EXPLICIT_SQL, (company_id, site_id, attend_date)).fetchall()
+    else:
+        rows = cur.execute(_DERIVED_SQL, {
+            "co": company_id, "site": site_id, "day": attend_date,
+            "lookback": lookback_days,
+        }).fetchall()
     return {str(r["id"]) for r in rows}
