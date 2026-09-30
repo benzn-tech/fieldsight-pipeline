@@ -1230,7 +1230,7 @@ Add `DECLARE_CONTINUITY: !Ref DeclareContinuity` to `ExtractSessionFunction`'s `
 **Interfaces:**
 - Consumes: everything above. The LLM is stubbed at `llm_utils.call_llm` only, and S3 is an in-memory fake that `extract_session` and `write_extraction_items` share. Everything else is real: the prompt builder, `item_continuity`, `_map_action_items`, the inserts, carry-forward, `continuity_records`.
 
-- [ ] **Step 1: Write the tests**
+- [x] **Step 1: Write the tests** -- `tests/integration/test_continuity_seam.py`, four tests. Flag flipped by `monkeypatch.setattr(les, "DECLARE_CONTINUITY", ...)` (not a reload, per the task brief). One local `_FakeS3` dict shared by `extract_session` and `write_extraction_items` (both read/write the same `extractions/...` key). Identity seeded exactly like `test_supersede_two_passes.py`'s second harness, cleanup by id in a `finally` (extended to also assert `decision_records` for the company is 0 after cleanup).
 
 Harness: set `DECLARE_CONTINUITY=true` and reload `lambda_extract_session`. Use one fake S3 dict for both lambdas. Drive `extract_session(...)` → take the written extraction → `write_extraction_items(...)` on a committed connection (the pattern from `tests/integration/test_supersede_two_passes.py`), with the same identity seeding and id-based cleanup.
 
@@ -1247,9 +1247,9 @@ Harness: set `DECLARE_CONTINUITY=true` and reload `lambda_extract_session`. Use 
    - also assert what the first design got wrong: no step ever wrote an `item_id` into `stable_id`.
 4. `test_flag_off_is_unchanged_end_to_end`: flag off, two passes with verbatim text. Carry works by exact text exactly as in Track B, there are no `item_id`s in the DB, and there are no `item_continuity` records.
 
-- [ ] **Step 2: Run** `bash /c/Users/camil/fswork/run-tests.sh -q tests/integration/test_continuity_seam.py` — iterate until PASS. A failure here is a real defect in Tasks 2–7. Fix it at its source task's code and re-run that task's tests.
-- [ ] **Step 3: Full suite**: `bash /c/Users/camil/fswork/run-tests.sh -q tests/unit` then `tests/integration` (fresh schema). Record the counts in this step's note.
-- [ ] **Step 4: Commit** `git add tests/integration/test_continuity_seam.py && git commit -m "Continuity seam: extractor -> writer -> carry-forward on real Postgres"`
+- [x] **Step 2: Run** `bash /c/Users/camil/fswork/run-tests.sh -q tests/integration/test_continuity_seam.py` — iterate until PASS. A failure here is a real defect in Tasks 2–7. Fix it at its source task's code and re-run that task's tests. Outcome: PASS on the second run (first run had two test-side bugs only -- comparing a psycopg-returned `uuid.UUID` DB column against the JSON-derived `str` in `extraction["continuity"]["claims"][i]["prior_item_id"]`/`new_item_id`; fixed with `str(...)` on the DB side). No production code touched -- no defect found in Tasks 2–7.
+- [x] **Step 3: Full suite**: `bash /c/Users/camil/fswork/run-tests.sh -q tests/unit` then `tests/integration` (fresh schema). Record the counts in this step's note. Outcome: unit 6896 passed, 1 skipped (unchanged from Task 7's baseline -- this task added no unit tests). integration 472 passed, 6 skipped (Task 7's baseline 468/6 plus this task's 4 new tests; skip count unchanged).
+- [x] **Step 4: Commit** `git add tests/integration/test_continuity_seam.py && git commit -m "Continuity seam: extractor -> writer -> carry-forward on real Postgres"`
 
 ---
 
