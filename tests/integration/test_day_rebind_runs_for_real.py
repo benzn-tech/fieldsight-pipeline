@@ -140,3 +140,13 @@ def test_the_rebind_binds_by_location_through_the_real_markers_table(db):
               "hhmm": hhmm} for i, hhmm in enumerate(["13:25", "13:28", "13:28"])]
     assert photo_rebind.rebind_day_photos(db, cid, FOLDER, DATE, shots) == 3
     assert len(_photos(db, walk)) == 3 and _photos(db, chat) == []
+
+
+def test_report_facts_read_the_days_markers_for_real(db):
+    """org-api's _report_facts reads day_location_markers in a savepoint."""
+    import lambda_org_api as org
+    from repositories import location_markers
+    cid, _, _ = _seed(db)
+    location_markers.replace_for_day(db, cid, FOLDER, DATE, [{"at": "13:24", "location": "Level 1"}])
+    facts = org._report_facts(db, cid, FOLDER, [], DATE)
+    assert facts["locations"] == [{"at": "13:24", "location": "Level 1"}]

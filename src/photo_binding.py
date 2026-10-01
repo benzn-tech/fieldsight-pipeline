@@ -404,3 +404,51 @@ def list_pictures(s3_client, bucket, prefix):
                 "hhmm": base_time.strftime("%H:%M"),
             })
     return photo_objects
+
+
+def photo_hhmm(filename):
+    """'HH:MM' a photograph was taken, from its filename, or None."""
+    try:
+        t = extract_base_time_from_filename(filename)
+    except Exception:
+        return None
+    return t.strftime("%H:%M") if t else None
+
+
+def place_at(markers, hhmm):
+    """The place being walked at `hhmm` by the day's markers, or None -- the
+    same stays photos are bound by (_stays), so a report places a photograph
+    by the same answer the binding gave it."""
+    if not hhmm:
+        return None
+    try:
+        p = _hhmm_to_minutes(hhmm)
+    except (ValueError, AttributeError):
+        return None
+    current = None
+    for stay in _stays(markers):
+        if stay[0] <= p:
+            current = stay
+    if current is None or p - current[2] > PHOTO_CARRY_FORWARD_MIN:
+        return None
+    return current[1]
+
+
+_NUMBER_WORDS = {"zero": "0", "ground": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+                 "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10"}
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _place_words(text):
+    words = [_NUMBER_WORDS.get(w, w) for w in _WORD_RE.findall((text or "").lower())]
+    out = " ".join(words)
+    # "Ground floor" and "Level 0" are one place in every customer's forms.
+    return out.replace("0 floor", "level 0").replace("0 level", "level 0")
+
+
+def names_place(line, place):
+    """True when `line` names `place` ("Level one" names "level 1"; "Ground
+    floor" names "level 0" and the other way round)."""
+    if not place:
+        return False
+    return " %s " % _place_words(place) in " %s " % _place_words(line)
