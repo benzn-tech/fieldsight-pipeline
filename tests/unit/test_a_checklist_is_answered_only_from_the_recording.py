@@ -50,7 +50,7 @@ def test_THE_an_answer_whose_evidence_was_never_said_is_dropped_and_its_item_lef
     rows = [p.split(" | ") for p in paragraphs[2:]]
     assert [r[0] for r in rows] == ITEMS, "every item, in the customer's order and words"
     assert rows[1][1:] == ["No", "Needs a tidy up", "Dom", "Friday"]
-    assert rows[4][1:] == ["", "", "", ""], "the invented answer is gone"
+    assert rows[4][1:] == ["", checklist.NOT_COVERED, "", ""], "the invented answer is gone"
     assert report["answered"] == 1
     assert report["dropped"] == [{"item": 5, "reason": "evidence not in the transcript"}]
 
@@ -59,7 +59,7 @@ def test_THE_an_answer_whose_evidence_was_never_said_is_dropped_and_its_item_lef
 
 def test_items_nobody_addressed_stay_blank():
     paragraphs, _, report = checklist.rebuild(model_section([]), ITEMS, TRANSCRIPT)
-    assert all(p.endswith(" |  |  |  | ") for p in paragraphs[2:])
+    assert all(p.endswith(" |  | " + checklist.NOT_COVERED + " |  | ") for p in paragraphs[2:])
     assert report["answered"] == 0
 
 
@@ -184,4 +184,5 @@ def test_the_worker_records_what_each_answer_stood_on(run):
     table = d.tables[0]
     assert [c.text for c in table.rows[0].cells] == checklist.DOC_COLUMNS
     assert [c.text for c in table.rows[1].cells] == [ITEMS[0], "Yes", "Serviced twice weekly", "", ""]
-    assert [c.text for c in table.rows[4].cells][1:] == ["", "", "", ""], "item 4 left blank"
+    assert [c.text for c in table.rows[4].cells][1:] == ["", checklist.NOT_COVERED, "", ""], \
+        "item 4: no answer, and it says why"
