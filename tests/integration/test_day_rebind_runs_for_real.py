@@ -122,3 +122,21 @@ def test_the_backfill_marks_an_existing_keyframe_and_nothing_else(db):
                    "VALUES (%s, %s, 'binding')", (t, key))
     db.execute(_backfill_sql())
     assert _photos(db, t) == sorted([(kf, "keyframe"), (lookalike, "binding")])
+
+
+# ---- the location markers decide first ------------------------------------------
+
+def test_the_rebind_binds_by_location_through_the_real_markers_table(db):
+    """The marker read and its savepoint run for real (owner, 2026-10-01): an
+    inspection walk keeps the photos an interrupting chat overlapped."""
+    import photo_rebind
+    from repositories import location_markers
+    cid, _, sid = _seed(db)
+    walk = _topic(db, sid, "walk", f"extractions/{FOLDER}/{DATE}/s1.json", "13:24 - 13:27")
+    chat = _topic(db, sid, "chat", f"extractions/{FOLDER}/{DATE}/s1.json", "13:27 - 13:28")
+    location_markers.replace_for_day(db, cid, FOLDER, DATE, [
+        {"at": "13:24", "location": "Ground floor"}, {"at": "13:26", "location": "Level 1"}])
+    shots = [{"key": f"users/{FOLDER}/pictures/{DATE}/p{i}.jpg", "filename": f"p{i}.jpg",
+              "hhmm": hhmm} for i, hhmm in enumerate(["13:25", "13:28", "13:28"])]
+    assert photo_rebind.rebind_day_photos(db, cid, FOLDER, DATE, shots) == 3
+    assert len(_photos(db, walk)) == 3 and _photos(db, chat) == []
