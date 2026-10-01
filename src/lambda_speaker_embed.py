@@ -501,6 +501,55 @@ def _frames(audio, sr):
     return [f for _, f in _frames_at(audio, sr)]
 
 
+# How long one frame is when measuring recording conditions -- deliberately NOT
+# FRAME_SECONDS (the homogeneity guard's 5 s frame): a homogeneity frame answers "does this
+# much audio sound like one voice", a condition frame answers "how loud is the quietest
+# stretch inside this window", and 50 ms is short enough that a quiet word gap inside an
+# otherwise loud window gets its own frame rather than being averaged into the speech
+# around it.
+CONDITION_FRAME_SECONDS = 0.05
+
+# The percentile of frame loudness treated as "the noise floor" rather than "the quietest
+# instant" -- one frame of silence between two words is not a measurement of the room.
+NOISE_PERCENTILE = 10
+
+
+def _recording_conditions(clip, sr):
+    """level_dbfs, noise_dbfs and snr_db for the EXACT window this function is handed.
+
+    Design 2026-09-30 (step 1 of 3, "condition-aware profiles"). Measured on the 42
+    owner-labelled clips: signal-to-noise ratio vs match score has Spearman rho +0.76 for
+    Ben Lin's genuine clips (+0.63 after removing the effect of clip length); background
+    noise alone is rho -0.70. Without these numbers on the sample row, step 2 ("does a
+    profile need a sample per condition") and step 3 ("condition-matched comparison") cannot
+    be measured on live data.
+
+    Computed HERE, on the embedder side, because this module already imports numpy and the
+    in-VPC writer deliberately does not (test_writer_needs_no_numpy.py) -- giving the writer
+    a numpy dependency for three scalars would repeat the mistake `_agreement` made once
+    already, when it imported `voiceprint_utils` for one dot product and died with
+    `ModuleNotFoundError` on every invocation.
+
+    `level_dbfs` is the whole window's RMS in dBFS. `noise_dbfs` is the NOISE_PERCENTILE-th
+    percentile of CONDITION_FRAME_SECONDS frame RMS, also in dBFS -- computed directly on
+    the per-frame dBFS values `_dbfs` already knows how to produce (percentile commutes
+    with the monotonic dB transform, so there is no second RMS-then-dBFS conversion to keep
+    in sync with the first). A window shorter than one condition frame is judged on itself
+    as a single frame, so `noise_dbfs` equals `level_dbfs` and `snr_db` is 0 -- the correct
+    answer for a window this function cannot subdivide, not a special case to guard against.
+    """
+    clip = np.asarray(clip, dtype=np.float32)
+    level_dbfs = _dbfs(clip)
+    step = max(1, int(CONDITION_FRAME_SECONDS * sr))
+    frames = [clip[i:i + step] for i in range(0, len(clip), step)]
+    frames = [f for f in frames if len(f)] or [clip]
+    frame_dbfs = [_dbfs(f) for f in frames]
+    noise_dbfs = float(np.percentile(frame_dbfs, NOISE_PERCENTILE))
+    return {"level_dbfs": round(level_dbfs, 2),
+            "noise_dbfs": round(noise_dbfs, 2),
+            "snr_db": round(level_dbfs - noise_dbfs, 2)}
+
+
 def _tightest_pair(frames, embs, sr):
     """The two ADJACENT frames that disagree least, as `(start_sample, end_sample)`.
 
@@ -527,8 +576,14 @@ def _tightest_pair(frames, embs, sr):
     step = int(FRAME_SECONDS * sr)
     best, best_spread = None, None
     for i in range(len(frames) - 1):
-        if frames[i + 1][0] != frames[i][0] + step:
-            continue                      # a silent frame was dropped between them
+        # A GAP means a silent frame was dropped between them, and joining them would store
+        # a splice. An OVERLAP is not a gap: `_frames_at` aligns its last frame to the end
+        # of the clip, so the final pair usually overlaps by a second or two, and it is
+        # continuous audio. Requiring exact spacing threw that pair away -- on prod
+        # 2026-10-01 a 13.7 s self-introduction was refused at 0.434 while its tail pair
+        # agreed at 0.274.
+        if frames[i + 1][0] > frames[i][0] + step:
+            continue
         spread = vp.frame_spread([embs[i], embs[i + 1]])
         if spread is None:
             continue
@@ -606,7 +661,8 @@ def _enrol(event):
             "s3_key": key, "window": [start, end],
             "created_by": event.get("created_by"),
             "correction_ref": event.get("correction_ref"),
-            "admitted_max_spread": _admitted_limit()}
+            "admitted_max_spread": _admitted_limit(),
+            **_recording_conditions(clip, sr)}
 
 
 def _match(event):
@@ -624,6 +680,11 @@ def _match(event):
     by_key = {}
     for p in profiles:
         by_key.setdefault(p["person_key"], p)
+    # Who is on site today (on-site-roster plan, Task 4). Built from whatever the profiles
+    # actually carry -- absent on every profile, or True on none of them, both collapse to
+    # an empty set, and `decide_with_roster` treats an empty set as "no roster to narrow
+    # with": exactly today's behaviour (spec consumer 1, "narrows, never blocks").
+    on_roster = {p["person_key"] for p in profiles if p.get("on_roster") is True}
 
     results = []
     for turn in event.get("turns") or []:
@@ -641,7 +702,8 @@ def _match(event):
         v = embed_audio(clip, sr)
         rows = [{"person_key": p["person_key"],
                  "score": vp.cosine(v, p["embedding"])} for p in profiles]
-        d = vp.decide_name(vp.aggregate_scores(rows), duration_s=duration, floor=floor)
+        d = vp.decide_with_roster(vp.aggregate_scores(rows), on_roster,
+                                  duration_s=duration, floor=floor)
         status = d.status
         if status == "confirmed" and by_key.get(d.name, {}).get("status") == "tentative":
             # (see below) a profile that has not earned confirmation cannot hand one out —
@@ -881,7 +943,8 @@ def _admit_harvest(folder, date, candidates):
         # internally consistent.
         admitted.append({"embedding": [float(x) for x in embed_audio(clip, sr)],
                          "s3_key": key, "window": [start, end],
-                         "admitted_max_spread": _admitted_limit()})
+                         "admitted_max_spread": _admitted_limit(),
+                         **_recording_conditions(clip, sr)})
         # The budget counts what is STORED, not what was offered. Charging a 60 s allowance
         # the full turn length would spend it in one member and call the rest a cap.
         seconds += end - start
@@ -1076,6 +1139,7 @@ def _from_request_artifact(bucket, key):
     # window is one person; storing that same vector as somebody's profile would be
     # disbelieving it in one direction and acting on it in the other.
     enrol = req.get("enrol")
+    conditions = {}
     if enrol:
         # Through the SAME helper as `op=enrol`. A correction names a turn, and under
         # batching a turn is a whole chunk — so this is the site where a 109 s window
@@ -1126,6 +1190,9 @@ def _from_request_artifact(bucket, key):
             logger.info("enrolment accepted (frames=%d spread=%s limit=%.2f)%s", len(frames),
                         "n/a" if spread is None else "%.3f" % spread, MAX_FRAME_SPREAD,
                         _limit_note())
+            # Measured on the window that was actually accepted -- post-narrowing, the same
+            # `clip` the vector above was re-embedded from. Design 2026-09-30 step 1.
+            conditions = _recording_conditions(clip, sr)
     # AFTER the anchor's own checks, never before. `_propagate` runs first, so without this
     # ordering six samples would be stored for a profile whose own corrected window had just
     # been judged to hold two voices — the exact condition one sample is refused for.
@@ -1152,7 +1219,8 @@ def _from_request_artifact(bucket, key):
                     "embedding": [float(x) for x in v],
                     "s3_key": s3_key, "window": [start, end],
                     "created_by": req.get("requested_by"),
-                    "admitted_max_spread": _admitted_limit()} if enrol else None)),
+                    "admitted_max_spread": _admitted_limit(),
+                    **conditions} if enrol else None)),
         # A LIST, and a separate key. Not the same act as the anchor: the anchor is what a
         # person vouched for, these are what the clustering suggested, and the two
         # populations must stay separable forever — for audit, for measurement, and so a bad
@@ -1218,7 +1286,7 @@ def _from_match_artifact(bucket, key):
             f"producer has all four and guessing any of them reads a key that cannot exist")
 
     profiles_reply = invoke_writer({"op": "profiles", "company_id": company_id,
-                                    "site_id": req.get("site_id")})
+                                    "site_id": req.get("site_id"), "date": date})
     profiles = profiles_reply.get("profiles") or []
     # The company's calibrated rejection floor, read once here (not per turn) and passed
     # to `_match` below -- dropping it on this hop would leave a calibrated floor sitting

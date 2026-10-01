@@ -218,3 +218,21 @@ def test_the_harvest_budget_counts_what_is_stored():
 
     body = inspect.getsource(se._admit_harvest)
     assert "seconds += end - start" in body, "the budget still charges the whole turn"
+
+
+def test_an_overlapping_tail_pair_is_continuous_and_offered():
+    """`_frames_at` aligns its last frame to the end of the clip, so the final pair overlaps.
+    Overlap is continuous audio, not a splice. Measured on prod 2026-10-01: a 13.7 s
+    self-introduction had frames at 15.2 / 20.2 / 23.9 s; the first pair disagreed (0.434),
+    the overlapping tail pair agreed (0.274) and was thrown away, so the voice was not saved."""
+    step = int(se.FRAME_SECONDS * SR)
+    tail = 2 * step - step // 4                       # overlaps the previous frame
+    frames = [(0, _tone(200, se.FRAME_SECONDS)), (step, _tone(200, se.FRAME_SECONDS)),
+              (tail, _tone(200, se.FRAME_SECONDS))]
+    a = np.ones(192, dtype=np.float32)
+    far = np.concatenate([np.ones(96), -np.ones(96)]).astype(np.float32)
+    embs = [a, far, far]                              # only the overlapping pair agrees
+
+    span, spread = se._tightest_pair(frames, embs, SR)
+    assert span == (step, tail + step)
+    assert spread == pytest.approx(0.0, abs=1e-6)

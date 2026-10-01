@@ -46,8 +46,8 @@ import logging
 import os
 
 from db.connection import get_connection
-from repositories import (label_group_candidates, speaker_label_groups,
-                          speaker_name_proposals)
+from repositories import (label_group_candidates, site_attendance,
+                          speaker_label_groups, speaker_name_proposals)
 from repositories.companies import list_companies
 from repositories.voiceprints import (EnrolmentAfterWithdrawal,
                                       EnrolmentBelongsToSomebodyElse, add_sample,
@@ -72,6 +72,25 @@ PROPOSAL_WINDOW_HOURS = int(os.environ.get("PROPOSAL_WINDOW_HOURS", "72"))
 # ones a person is shown. An admission cut arriving as a "limit" would be the absolute
 # threshold this system has refused to invent, wearing a different name.
 PROPOSAL_LIMIT = int(os.environ.get("PROPOSAL_LIMIT", "5"))
+
+
+def _derived_from_env(value):
+    """`on`/`off`, case-insensitive, absent -> on. Not a boolean Parameter (plan correction
+    7): the generic wiring sweep only recognises `AllowedValues: ['true','false']`, so this
+    switch needs its own explicit wiring test rather than relying on that sweep."""
+    return (value or "on").strip().lower() != "off"
+
+
+# Whether `_profiles` derives roster membership from recordings and recent corrections
+# (design: docs/superpowers/specs/2026-09-30-derived-roster-design.md) or serves only the
+# explicit `site_attendance` rows (#969's own behaviour, byte-for-byte, when `off`). All
+# three segments (repo variable, workflow override, template Parameter) or this silently
+# serves its default forever -- the same rule PROPOSAL_WINDOW_HOURS is here.
+ROSTER_DERIVED = _derived_from_env(os.environ.get("ROSTER_DERIVED"))
+
+# How many NZ days back a human correction at this site still counts as "recently confirmed
+# here" (design arm 3). Same three-segment rule.
+ROSTER_LOOKBACK_DAYS = int(os.environ.get("ROSTER_LOOKBACK_DAYS", "14"))
 
 
 def _require(event, key):
@@ -209,7 +228,10 @@ def _propagation(event):
                            window=(window[0], window[1]),
                            created_by=enrol.get("created_by"),
                            correction_ref=correction_ref,
-                           admitted_max_spread=enrol.get("admitted_max_spread"))
+                           admitted_max_spread=enrol.get("admitted_max_spread"),
+                           level_dbfs=enrol.get("level_dbfs"),
+                           noise_dbfs=enrol.get("noise_dbfs"),
+                           snr_db=enrol.get("snr_db"))
             except EnrolmentAfterWithdrawal as exc:
                 # Same treatment as the refusal below, for the same reason: the names
                 # describe THIS meeting. A withdrawal that landed mid-flight is not a reason
@@ -247,7 +269,10 @@ def _propagation(event):
                            source="correction_propagation", s3_key=h.get("s3_key"),
                            window=(w[0], w[1]), created_by=h.get("created_by"),
                            correction_ref=correction_ref,
-                           admitted_max_spread=h.get("admitted_max_spread"))
+                           admitted_max_spread=h.get("admitted_max_spread"),
+                           level_dbfs=h.get("level_dbfs"),
+                           noise_dbfs=h.get("noise_dbfs"),
+                           snr_db=h.get("snr_db"))
                 harvested += 1
             except (EnrolmentAfterWithdrawal, EnrolmentBelongsToSomebodyElse) as exc:
                 # PER SAMPLE. One refusal must not discard the rest: they are independent
@@ -307,7 +332,10 @@ def _enrol(event):
                        window=(window[0], window[1]),
                        created_by=event.get("created_by"),
                        correction_ref=event.get("correction_ref"),
-                       admitted_max_spread=event.get("admitted_max_spread"))
+                       admitted_max_spread=event.get("admitted_max_spread"),
+                       level_dbfs=event.get("level_dbfs"),
+                       noise_dbfs=event.get("noise_dbfs"),
+                       snr_db=event.get("snr_db"))
         except EnrolmentAfterWithdrawal as exc:
             logger.warning("enrol refused: %s", exc)
             return {"stored": 0, "reason": "profile-withdrawn"}
@@ -388,17 +416,43 @@ def _profiles(event):
     exactly one home.
     """
     company_id = _require(event, "company_id")
+    site_id, date = event.get("site_id"), event.get("date")
     with get_connection() as conn:
-        rows = profiles_for_matching(conn, company_id, site_id=event.get("site_id"))
+        rows = profiles_for_matching(conn, company_id, site_id=site_id)
         # Read once per invocation, not once per turn: the floor is derived/materialized
         # state (recomputed on a schedule, spec S1.3) and must not move mid-decision
         # because one turn happened to land during a recompute.
         floor = company_floor(conn, company_id)
-    return {"profiles": [{"person_key": str(r["id"]),
-                          "display_name": r["display_name"],
-                          "status": r["status"],
-                          "embedding": r["embedding"]} for r in rows],
-            "company_floor": floor}
+        # The roster (plan Task 3). Both `site_id` and `date` are required, or `on_roster`
+        # is left off every profile entirely -- not `False` -- because "checked, nobody on
+        # it" and "not asked for" are different facts the embedder's roster rule treats
+        # differently (voiceprint_utils.decide_with_roster: an empty/absent roster narrows
+        # nothing, exactly today's behaviour). `None` here rather than `set()` is what
+        # carries "not asked" through to the loop below.
+        on_roster_ids = None
+        if site_id and date:
+            try:
+                on_roster_ids = site_attendance.on_roster_profile_ids(
+                    conn, company_id, site_id, date,
+                    derived=ROSTER_DERIVED, lookback_days=ROSTER_LOOKBACK_DAYS)
+                logger.info("roster for site %s on %s: %d profile(s) (derived=%s)",
+                           site_id, date, len(on_roster_ids), ROSTER_DERIVED)
+            except Exception:
+                # Narrows, never blocks (spec consumer 1): a broken roster read must not
+                # stop matching, and the safe degradation is exactly the no-roster shape.
+                logger.exception("roster read failed for company %s site %s date %s; "
+                                 "matching proceeds unnarrowed", company_id, site_id, date)
+                on_roster_ids = None
+    profiles = [{"person_key": str(r["id"]),
+                "display_name": r["display_name"],
+                "status": r["status"],
+                "embedding": r["embedding"]} for r in rows]
+    reply = {"profiles": profiles, "company_floor": floor}
+    if on_roster_ids is not None:
+        for p, r in zip(profiles, rows):
+            p["on_roster"] = str(r["id"]) in on_roster_ids
+        reply["roster_size"] = len(on_roster_ids)
+    return reply
 
 
 def _match_names(event):

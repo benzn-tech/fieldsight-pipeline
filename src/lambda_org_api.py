@@ -153,7 +153,7 @@ from repositories import (action_items, aliases, chunks, classification_feedback
                           programme_snapshot,
                           programme_suggestions, programme_tasks, programme_window,
                           recordings, redactions, report_templates, rollup, scope,
-                          session_group,
+                          session_group, site_attendance,
                           sites, threads, topics, users, voice_messages,
                           voiceprints)
 from repositories.acl import is_cross_company, resolve_scope
@@ -494,6 +494,9 @@ def dispatch(conn, event, method, route):
         if method == "POST":
             return create_org_site(conn, caller, parse_body(event))
 
+    if route == "/companies" and method == "GET":
+        return list_org_companies(conn, caller)
+
     if route == "/members":
         if method == "GET":
             return list_members(conn, caller, event)
@@ -795,9 +798,28 @@ def dispatch(conn, event, method, route):
         return speaker_known(conn, caller, event)
     if route == "/voiceprints" and method == "GET":
         return list_voiceprints(conn, caller)
+    # A literal segment, so it must not fall to a `{id}` pattern; kept above them.
+    if route == "/voiceprints/same-name" and method == "GET":
+        return same_name_voiceprints(conn, caller, event)
+    # Before `/voiceprints/{id}`: that pattern cannot match a path with a suffix, but the
+    # order is the cheap insurance if somebody loosens it -- the sibling route withdraws a
+    # biometric.
+    m_vr = re.match(r"^/voiceprints/([^/]+)/retry$", route)
+    if m_vr and method == "POST":
+        return retry_voiceprint(conn, caller, m_vr.group(1), event)
+    # Merge routes carry a suffix and so cannot match the bare `{id}` pattern below; they sit
+    # above it anyway for the same reason as the retry route.
+    m_vmc = re.match(r"^/voiceprints/([^/]+)/merge-check$", route)
+    if m_vmc and method == "GET":
+        return merge_check_voiceprint(conn, caller, m_vmc.group(1), event)
+    m_vm = re.match(r"^/voiceprints/([^/]+)/merge$", route)
+    if m_vm and method == "POST":
+        return merge_voiceprint(conn, caller, m_vm.group(1), event)
     m_vw = re.match(r"^/voiceprints/([^/]+)$", route)
     if m_vw and method == "DELETE":
         return withdraw_voiceprint(conn, caller, m_vw.group(1))
+    if m_vw and method == "PATCH":
+        return rename_voiceprint(conn, caller, m_vw.group(1), event)
     m_rg = re.match(r"^/sessions/([^/]+)/regenerate$", route)
     if m_rg and method == "POST":
         return regenerate_session(conn, caller, m_rg.group(1), event)
@@ -828,6 +850,15 @@ def dispatch(conn, event, method, route):
     m_sv = re.match(r"^/sites/([^/]+)/voice$", route)
     if m_sv and method == "GET":
         return list_site_voice(conn, caller, m_sv.group(1), event)
+
+    m_sat = re.match(r"^/sites/([^/]+)/attendance$", route)
+    if m_sat and method == "GET":
+        return list_site_attendance(conn, caller, m_sat.group(1), event)
+    if m_sat and method == "POST":
+        return create_site_attendance(conn, caller, m_sat.group(1), event)
+    m_satr = re.match(r"^/sites/([^/]+)/attendance/([^/]+)$", route)
+    if m_satr and method == "DELETE":
+        return delete_site_attendance(conn, caller, m_satr.group(1), m_satr.group(2), event)
 
     if route == "/auth/qr/create" and method == "POST":
         return create_qr_login_code(conn, caller, event)
@@ -2085,6 +2116,19 @@ def _split_for_budget(turns):
         turns, MATCH_SECONDS_PER_RUN, MATCH_TURNS_PER_RUN)
 
 
+def _identity_fields(r):
+    """The fields that tell two same-named profiles apart, from a `list_profiles` /
+    `same_name_profiles` row. One shape for the Voices page and the naming chooser."""
+    return {
+        "linkedAccount": ({"name": r.get("linked_name"), "email": r.get("linked_email")}
+                          if r.get("user_id") else None),
+        "heardOn": list(r.get("heard_on") or [])[:3],
+        "firstNamed": {"at": _iso_day(r.get("first_named_at") or r.get("created_at")),
+                       "by": r.get("first_named_by")},
+        "employer": r.get("employer_name"),
+    }
+
+
 def list_voiceprints(conn, caller):
     """GET /api/org/voiceprints — every profile this company holds, and why each is as it is.
 
@@ -2105,7 +2149,8 @@ def list_voiceprints(conn, caller):
         return error("not found", 404)
     if caller["global_role"] not in _CORRECTION_ROLES:
         return error("admin, gm, pm, site_manager or platform_admin role required", 403)
-    rows = voiceprints.list_profiles(conn, str(caller["company_id"]))
+    company_id = str(caller["company_id"])
+    rows = voiceprints.list_profiles(conn, company_id)
     return ok({"voiceprints": [{
         "id": str(r["id"]),
         "displayName": r.get("display_name"),
@@ -2118,7 +2163,108 @@ def list_voiceprints(conn, caller):
         "lastAttemptAt": r.get("last_attempt_at"),
         "lastAttemptOutcome": r.get("last_attempt_outcome"),
         "lastAttemptDetail": r.get("last_attempt_detail"),
+        # Identity (spec 2026-10-01): what lets a person tell two "Ben Lin"s apart. Plain
+        # values only -- no similarity score ever reaches a customer.
+        **_identity_fields(r),
+        "mergedInto": ({"id": str(r["merged_into"]),
+                        "displayName": r.get("merged_into_name")}
+                       if r.get("merged_into") else None),
+        # Only a refused row pays for the lookup (a transcript read). Everything else is
+        # null: there is nothing to try again.
+        "retry": (_retry_passage(conn, company_id, r)
+                  if r.get("last_attempt_outcome") == "refused" else None),
     } for r in rows]})
+
+
+def _iso_day(value):
+    """A timestamp as an ISO date string, or None. Tolerates a string (test doubles)."""
+    if not value:
+        return None
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
+def _retry_passage(conn, company_id, profile):
+    """The passage a refused profile's last human correction named, or None.
+
+    `{date, userFolder, sessionBase, sourceFilename, startSec, endSec}`. None means "cannot
+    be retried from here", never "retry something else": every step that fails to resolve
+    returns None rather than a guess, because the retry would name a person from audio
+    nobody chose.
+
+    The folder and date come from `recordings` (or the proposal rows), NOT from the turn_ref:
+    its stem starts with the device name, which is not the user's folder. The end of the
+    passage comes from the transcript turn at that offset.
+    """
+    corr = voiceprints.latest_human_correction(
+        conn, company_id, str(profile["id"]), profile.get("display_name"))
+    if not corr or "@" not in str(corr.get("turn_ref") or ""):
+        return None
+    stem, _, tail = str(corr["turn_ref"]).rpartition("@")
+    try:
+        offset = float(tail)
+    except ValueError:
+        return None
+    sid = corr.get("session_base")
+    where = recordings.locate_session(conn, company_id, sid)
+    if not where:
+        return None
+    folder, date = where
+    try:
+        turns = _session_turns(conn, folder, date, sid)
+    except Exception:
+        logger.exception("voiceprint %s: transcript unreadable for retry", profile.get("id"))
+        return None
+    want = turn_name_overlay._stem(stem)
+    # Half a second: re-extraction shifts offsets slightly (see `turn_name_overlay`), and the
+    # overlay's own join tolerates the same.
+    near = [t for t in turns
+            if turn_name_overlay._stem(t.get("source_filename")) == want
+            and abs(float(t.get("start_sec", 0)) - offset) <= 0.5]
+    if not near:
+        return None
+    t = min(near, key=lambda x: abs(float(x["start_sec"]) - offset))
+    return {"date": str(date), "userFolder": folder, "sessionBase": sid,
+            "sourceFilename": t["source_filename"], "startSec": float(t["start_sec"]),
+            "endSec": float(t["end_sec"])}
+
+
+def retry_voiceprint(conn, caller, voiceprint_id, event):
+    """POST /api/org/voiceprints/{id}/retry — store a refused voice again.
+
+    Recomputes the passage of the profile's last human correction and hands it to
+    `speaker_corrections`, exactly as `_apply_confirmed_proposal` does, so the retry is the
+    same act as the original rename (same artifact, same `source='correction'`). Nothing is
+    written here.
+
+    The company comes from the caller; a profile id from another tenant is a 404.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    company_id = str(caller["company_id"])
+    person = voiceprints.get_profile(conn, company_id, voiceprint_id)
+    if person is None or person.get("status") == "withdrawn":
+        return error("not found", 404)
+    nothing = error("There is nothing to store again for this voice: its last attempt was "
+                    "not refused, or the passage you named can no longer be found. Rename "
+                    "the speaker in a recording to try with a new passage.", 409)
+    if person.get("last_attempt_outcome") != "refused" or not person.get("display_name"):
+        return nothing
+    passage = _retry_passage(conn, company_id, person)
+    if passage is None:
+        return nothing
+    return speaker_corrections(
+        conn, caller, passage["sourceFilename"], dict(event, body=json.dumps({
+            "user": passage["userFolder"],
+            "source_filename": passage["sourceFilename"],
+            "start_sec": passage["startSec"],
+            "end_sec": passage["endSec"],
+            "display_name": person["display_name"],
+            # THIS profile, not whichever same-named one the lookup would pick: a retry
+            # concerns one known row and must never land on (or create) another.
+            "voiceprint_id": str(person["id"]),
+        })))
 
 
 def _site_for_session(conn, company_id, user_folder, date, session_base):
@@ -2356,6 +2502,138 @@ def withdraw_voiceprint(conn, caller, voiceprint_id):
     return ok({"voiceprintId": voiceprint_id, "samplesRemoved": len(removed)})
 
 
+# Customer-facing, plain words, no numbers (spec 2026-10-01).
+_MERGE_MESSAGES = {
+    "alike": "These sound like the same person.",
+    "unsure": ("These may be the same person \u2014 recordings from different devices "
+               "can sound different."),
+}
+
+
+def _merge_message(verdict, target_name):
+    if verdict == "different":
+        return (f"These two voices sound different. Merging them could make "
+                f"{target_name or 'this person'} harder to recognise. Only merge if you are "
+                f"sure it is the same person.")
+    return _MERGE_MESSAGES[verdict]
+
+
+class _MergeFailed(Exception):
+    """Unwinds the merge transaction; carries the response to return afterwards."""
+
+    def __init__(self, response):
+        super().__init__(response.get("statusCode"))
+        self.response = response
+
+
+def _merge_pair(conn, caller, source_id, target_id):
+    """Shared gate for merge-check and merge: mode, role, shapes, both live in the caller's
+    company. Returns `(company_id, source, target, None)` or `(None, None, None, response)`.
+
+    A profile from another tenant and one that does not exist are both 404 -- telling them
+    apart would confirm the existence of another company's row.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return None, None, None, error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return None, None, None, error(
+            "admin, gm, pm, site_manager or platform_admin role required", 403)
+    if not _UUID_RE.match(str(source_id or "")):
+        return None, None, None, error("not found", 404)
+    if not _UUID_RE.match(str(target_id or "")):
+        return None, None, None, error("into must be a voiceprint id", 400)
+    if str(source_id).lower() == str(target_id).lower():
+        return None, None, None, error("a voice cannot be merged into itself", 400)
+    company_id = str(caller["company_id"])
+    source = voiceprints.get_profile(conn, company_id, source_id)
+    target = voiceprints.get_profile(conn, company_id, target_id)
+    if (source is None or source.get("status") == "withdrawn"
+            or target is None or target.get("status") == "withdrawn"):
+        return None, None, None, error("not found", 404)
+    return company_id, source, target, None
+
+
+def merge_check_voiceprint(conn, caller, voiceprint_id, event):
+    """GET /api/org/voiceprints/{id}/merge-check?into={target} — do these sound alike?
+
+    Advice for a person who is about to decide, in plain words. The similarity behind it is
+    deliberately not in the response: a number invites a threshold of the reader's own, and
+    the labelled set it was calibrated on is small. Writes nothing.
+    """
+    into = ((event.get("queryStringParameters") or {}).get("into") or "").strip()
+    company_id, source, target, bad = _merge_pair(conn, caller, voiceprint_id, into)
+    if bad:
+        return bad
+    check = voiceprints.merge_check(conn, company_id, voiceprint_id, into)
+    return ok({"verdict": check["verdict"],
+               "message": _merge_message(check["verdict"], target.get("display_name"))})
+
+
+def merge_voiceprint(conn, caller, voiceprint_id, event):
+    """POST /api/org/voiceprints/{id}/merge {into, confirm} — fold this profile into another.
+
+    Two voices that sound different are refused with a 409 unless `confirm` is exactly true:
+    merging them would make the target harder to recognise for everyone, and it is the one
+    step here that cannot be cleanly undone (the samples move).
+
+    ONE transaction. `lambda_handler` opens the connection with `with get_connection() as
+    conn`, which COMMITS on a clean exit -- so a `return error()` from inside the block would
+    commit whatever ran before it. Failure therefore raises out of `conn.transaction()` (a
+    savepoint) to roll it back, and the response is built after the unwind.
+    """
+    body = parse_body(event)
+    if body is None:
+        return error("invalid JSON body", 400)
+    into = str(body.get("into") or "").strip()
+    company_id, source, target, bad = _merge_pair(conn, caller, voiceprint_id, into)
+    if bad:
+        return bad
+    try:
+        with conn.transaction():
+            check = voiceprints.merge_check(conn, company_id, voiceprint_id, into)
+            if check["verdict"] == "different" and body.get("confirm") is not True:
+                raise _MergeFailed(error(
+                    _merge_message("different", target.get("display_name")), 409,
+                    {"verdict": "different"}))
+            try:
+                result = voiceprints.merge_profiles(
+                    conn, company_id, voiceprint_id, into, caller["id"])
+            except voiceprints.MergeRefused:
+                raise _MergeFailed(error("not found", 404))
+    except _MergeFailed as exc:
+        return exc.response
+    logger.info("voiceprint merged: %s -> %s (%s)", voiceprint_id, into, result)
+    return ok({"mergedInto": into, "samplesMoved": result["samplesMoved"],
+               "samplesDropped": result["samplesDropped"]})
+
+
+def rename_voiceprint(conn, caller, voiceprint_id, event):
+    """PATCH /api/org/voiceprints/{id} {displayName} — so two real Ben Lins can be told apart.
+
+    Updates the profile and the name on the turns it justified, by `voiceprint_id` only, in
+    one transaction. Trimmed, 1-80 characters.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    if not _UUID_RE.match(str(voiceprint_id or "")):
+        return error("not found", 404)
+    body = parse_body(event)
+    if body is None:
+        return error("invalid JSON body", 400)
+    name = body.get("displayName")
+    name = name.strip() if isinstance(name, str) else ""
+    if not 1 <= len(name) <= 80:
+        return error("displayName must be 1 to 80 characters", 400)
+    company_id = str(caller["company_id"])
+    with conn.transaction():
+        found = voiceprints.rename_profile(conn, company_id, voiceprint_id, name)
+    if not found:
+        return error("not found", 404)
+    return ok({"voiceprintId": voiceprint_id, "displayName": name})
+
+
 def company_voiceprint_basis(conn, caller, event):
     """PUT /api/org/company/voiceprint-basis — on what grounds this company may hold voices.
 
@@ -2506,7 +2784,10 @@ def list_name_proposals(conn, caller, event):
                    # frontend's badge component already reads `total` and a client-side
                    # arithmetic change is exactly the kind of edit that silently drops a
                    # field (memory: "ui-api-layer-whitelists-request-body").
-                   "introductions": speaker_intro_suggestions.pending_count(conn, company_id)})
+                   "introductions": speaker_intro_suggestions.pending_count(conn, company_id),
+                   # Voices whose last save was refused this week -- one grouped count,
+                   # no transcript. Same reason as `introductions` for being its own key.
+                   "notSaved": voiceprints.refused_recently_count(conn, company_id)})
 
     rows = speaker_name_proposals.pending_for_person(
         conn, company_id, vp, limit=PROPOSAL_PAGE)
@@ -2655,6 +2936,9 @@ def _apply_confirmed_proposal(conn, caller, company_id, row, event):
         "start_sec": best["start_sec"],
         "end_sec": best["end_sec"],
         "display_name": person["display_name"],
+        # The proposal is about ONE known profile; pass it so the name cannot attach to a
+        # different same-named one (spec 2026-10-01).
+        "voiceprint_id": str(row["voiceprint_id"]),
     })))
 
 
@@ -2677,12 +2961,28 @@ def list_name_suggestions(conn, caller, event):
         return error("admin, gm, pm, site_manager or platform_admin role required", 403)
     company_id = str(caller["company_id"])
     rows = speaker_intro_suggestions.pending(conn, company_id, limit=SUGGESTION_PAGE)
+
+    def _roster_names(r):
+        # Consumer 3 (plan correction 5): the intro dialog prefers roster names for the
+        # prefill ("Petrus Pang" heard -> "Petros Pan", who signed in today). No fuzzy
+        # matching here -- that is a UI choice -- just the day's names for this
+        # suggestion's session's site, or [] when the site cannot be resolved (the same
+        # safe absence `_site_for_session`'s own docstring documents).
+        site = _site_for_session(conn, company_id, r["user_folder"], str(r["session_date"]),
+                                 r["session_base"])
+        if not site:
+            return []
+        return [row["display_name"] for row in
+                site_attendance.for_day(conn, company_id, str(site["id"]),
+                                        str(r["session_date"]))]
+
     return ok({"suggestions": [{
         "id": r["id"], "heardName": r["heard_name"], "companyName": r.get("company_name"),
         "quote": r["quote"], "date": str(r["session_date"]), "userFolder": r["user_folder"],
         "sessionBase": r["session_base"], "sourceFilename": r["source_filename"],
         "speakerLabel": r["speaker_label"], "startSec": r["start_sec"],
         "endSec": r["end_sec"], "createdAt": r["created_at"],
+        "rosterNames": _roster_names(r),
     } for r in rows]})
 
 
@@ -2777,6 +3077,66 @@ def _apply_confirmed_suggestion(conn, caller, company_id, row, display_name, eve
     })))
 
 
+def same_name_voiceprints(conn, caller, event):
+    """GET /api/org/voiceprints/same-name?name=&user= -- would naming this person be ambiguous?
+
+    Spec 2026-10-01. Before a correction is sent the naming panel asks this; when `ask` is
+    true it shows the profiles and lets the namer say which one it is, or "someone else".
+    Writes nothing.
+
+    Authorised exactly as `speaker_corrections` authorises: the folder resolve, then a
+    correction role or the caller's own recording, then the same-company check -- whoever may
+    name a speaker may ask who the name could mean.
+
+    `wouldUse` is what the correction would attach to if sent as it is now: the SAME lookup
+    (`voiceprints.find_existing_profile`), with the caller as asserter and the directory
+    resolution of the name as the user. `ask` is false only when the answer is already
+    certain: no profile of that name (a new one is made), or exactly one and it is the one
+    the lookup would use. Two or more, or one the lookup would NOT use (a duplicate is about
+    to be made), is a question.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    qs = event.get("queryStringParameters") or {}
+    # Collapsed exactly as `speaker_corrections` collapses it. Trimming alone left "ben   LIN"
+    # unresolvable to Ben's account here while the save resolved it, so the check asked a
+    # question the save would never have needed (seen on TEST 2026-10-01).
+    name = voiceprints.collapse_name(qs.get("name"))
+    if not name:
+        return error("name is required", 400)
+    folder, err = _resolve_org_media_folder(conn, caller, (qs.get("user") or "").strip(),
+                                            what="same-name check")
+    if err is not None:
+        return err
+    if not _may_correct_speakers(conn, caller, folder):
+        return error("naming a speaker needs an admin, gm, pm, site_manager or "
+                     "platform_admin role, or your own recording", 403)
+    err = _same_company_as_folder(conn, caller, folder, "same-name check")
+    if err is not None:
+        return err
+    company_id = str(caller["company_id"])
+    rows = voiceprints.same_name_profiles(conn, company_id, name)
+    person, _matched_on = users.resolve_display_name(conn, company_id, name)
+    found = voiceprints.find_existing_profile(
+        conn, company_id, name, str(person["id"]) if person else None, str(caller["id"]))
+    would_use = str(found["id"]) if found else None
+    ids = [str(r["id"]) for r in rows]
+    ask = len(rows) >= 2 or (len(rows) == 1 and would_use != ids[0])
+
+    def _card(r):
+        return {"id": str(r["id"]), "displayName": r.get("display_name"),
+                **_identity_fields(r), "lastHeard": _iso_day(r.get("last_heard"))}
+
+    # Near spellings ("Sam Wu" for "Sam Yu"): suggested, never merged (spec 2026-10-01 s3).
+    similar = voiceprints.similar_name_profiles(conn, company_id, name, exclude_ids=ids)
+    return ok({
+        "profiles": [_card(r) for r in rows],
+        "similar": [_card(r) for r in similar],
+        "wouldUse": would_use,
+        "ask": ask,
+    })
+
+
 def speaker_corrections(conn, caller, session_base, event):
     """POST /api/org/sessions/{session_base}/speaker-corrections
 
@@ -2844,7 +3204,25 @@ def speaker_corrections(conn, caller, session_base, event):
         return error("employer_ref is not accepted yet: it is the sign-in register's key and "
                      "nothing reads it until that adapter ships", 400)
 
-    name = (body.get("display_name") or "").strip()
+    # The two answers to "which same-name person?" (spec 2026-10-01); at most one. They only
+    # matter inside the enrol branch below -- with enrolment off no profile is touched, so
+    # there is nothing to choose between and they are ignored rather than refused (the
+    # propagation half works on audio alone and is the same either way).
+    chosen_id = body.get("voiceprint_id") or None
+    new_person = body.get("new_person") is True
+    if chosen_id is not None and body.get("new_person") not in (None, False):
+        return error("voiceprint_id and new_person are mutually exclusive: it is either "
+                     "this person or someone else with the same name", 400)
+    if chosen_id is not None:
+        try:
+            chosen_id = str(uuid.UUID(str(chosen_id)))
+        except ValueError:
+            return error("voiceprint_id must be a profile id", 400)
+
+    # Trimmed AND internal whitespace collapsed: "ben  lin" is typed spacing, never part of
+    # the name. Case is left alone here -- when the name lands on an existing profile the
+    # profile's own spelling replaces this below (spec 2026-10-01 s2).
+    name = voiceprints.collapse_name(body.get("display_name"))
     if not name:
         return error("display_name is required", 400)
     src = (body.get("source_filename") or "").strip()
@@ -2935,25 +3313,46 @@ def speaker_corrections(conn, caller, session_base, event):
             # a string cannot be narrowed by site, and two people sharing a name land on one
             # profile — an identity is the stabler key.
             person, matched_on = users.resolve_display_name(conn, company_id, name)
-            profile = voiceprints.upsert_profile(
-                conn, company_id, display_name=name,
-                consent_given=not attest,
-                consented_by=body.get("consented_by"),
-                # The claim and who made it, kept apart from the subject. `asserted_by` is
-                # the caller; `consented_by` stays empty on this path because nobody has
-                # said the subject agreed — putting the caller there would make every row
-                # in the table ambiguous about which of the two it records.
-                consent_basis=company_basis if attest else "confirmed",
-                # WHO invoked the company's basis on this occasion. Under `notice` the basis
-                # itself is the induction, not this person's word — but the row still records
-                # which account acted, because "the company had a policy" and "somebody
-                # applied it to this recording" are different facts and an audit needs both.
-                asserted_by=str(caller["id"]) if attest else None,
-                user_id=str(person["id"]) if person else None,
-                linked_by=str(caller["id"]) if person else None,
-                linked_on=matched_on if person else None,
-                employer_name=employer_name, employer_source=employer_source,
-                employer_set_by=str(caller["id"]) if employer_name else None)
+            if chosen_id is not None:
+                # "It is this one": no lookup. It must be a live, consented profile of THIS
+                # company -- never another tenant's, never a withdrawn one, never an
+                # unconsented shell. No account link: the profile keeps whatever link it
+                # has, because two profiles linked to one user is worse than none.
+                profile = voiceprints.get_consented_live_profile(conn, company_id, chosen_id)
+                if profile is None:
+                    return error("voiceprint_id is not a live, consented profile of this "
+                                 "company", 400)
+                if employer_name is not None:
+                    voiceprints.set_employer(conn, company_id, chosen_id, employer_name,
+                                             employer_source, str(caller["id"]))
+                person, matched_on = None, "profile-chosen"
+            else:
+                # "Someone else with this name" always inserts. The directory user is linked
+                # only when they have no live profile yet -- a second profile on one account
+                # is the duplicate the chooser exists to prevent.
+                if new_person and person and voiceprints.user_has_live_profile(
+                        conn, company_id, str(person["id"])):
+                    person, matched_on = None, "has-profile"
+                profile = voiceprints.upsert_profile(
+                    conn, company_id, display_name=name,
+                    force_new=new_person,
+                    consent_given=not attest,
+                    consented_by=body.get("consented_by"),
+                    # The claim and who made it, kept apart from the subject. `asserted_by` is
+                    # the caller; `consented_by` stays empty on this path because nobody has
+                    # said the subject agreed — putting the caller there would make every row
+                    # in the table ambiguous about which of the two it records.
+                    consent_basis=company_basis if attest else "confirmed",
+                    # WHO invoked the company's basis on this occasion. Under `notice` the basis
+                    # itself is the induction, not this person's word — but the row still records
+                    # which account acted, because "the company had a policy" and "somebody
+                    # applied it to this recording" are different facts and an audit needs both.
+                    asserted_by=str(caller["id"]) if attest else None,
+                    user_id=str(person["id"]) if person else None,
+                    linked_by=str(caller["id"]) if person else None,
+                    linked_on=matched_on if person else None,
+                    employer_name=employer_name, employer_source=employer_source,
+                    employer_set_by=str(caller["id"]) if employer_name else None)
         except ValueError as exc:
             return error(str(exc), 400)
         _linked_person, _linked_on = person, matched_on
@@ -2962,6 +3361,13 @@ def speaker_corrections(conn, caller, session_base, event):
         # when there was one, and the employer update runs after that row was fetched — so
         # the object in hand carries the previous employer, not the one just stored.
         profile_row = voiceprints.get_profile(conn, company_id, str(profile["id"]))
+        # One spelling per person: when the profile is an existing one (lookup hit or chosen
+        # `voiceprint_id`) its display name travels to the embedder and back, not the typed
+        # string. A new profile was just inserted with the typed (collapsed) name, so this
+        # is a no-op for it. Only the stored/propagated name changes -- the directory
+        # resolution above already ran on what was typed.
+        if profile_row and profile_row.get("display_name"):
+            name = profile_row["display_name"]
 
     session_turns = _session_turns(conn, folder, date_m.group(1), session_base)
     request_id = uuid.uuid4().hex
@@ -2991,6 +3397,9 @@ def speaker_corrections(conn, caller, session_base, event):
                 session_base, SPEAKER_IDENTITY_MODE, len(artifact["turns"]))
     return ok({
         "requestId": request_id,
+        # The name that was stored and sent to the embedder: the profile's own when the
+        # correction landed on an existing one, else the typed name.
+        "displayName": name,
         # Named separately because they carry different consent obligations, and because a
         # user who was told "done" deserves to know which of the two they got.
         "propagation": "queued",
@@ -3554,6 +3963,113 @@ def list_site_voice(conn, caller, site_id, event):
     return ok({"items": items, "site": str(site_id)})
 
 
+# ----------------------------------------------------------
+# /sites/{id}/attendance — the `manual` roster source (on-site-roster plan, Task 5)
+# ----------------------------------------------------------
+_ATTENDANCE_NAME_CAP = 50
+
+
+def _serialize_attendance_row(r):
+    return {"id": str(r["id"]), "displayName": r["display_name"],
+           "employerName": r.get("employer_name"), "source": r["source"],
+           "resolved": {"userId": str(r["user_id"]) if r.get("user_id") else None,
+                        "voiceprintId": str(r["voiceprint_id"])
+                        if r.get("voiceprint_id") else None}}
+
+
+def list_site_attendance(conn, caller, site_id, event):
+    """GET /api/org/sites/{id}/attendance?date=YYYY-MM-DD — the day's roster, any source.
+
+    Any member may read (unlike the write side, which needs a correction role): a roster
+    that is visible only to managers cannot do what consumer 3 (the intro dialog's prefill)
+    needs, since it renders for whoever is naming a speaker.
+    """
+    if str(site_id) not in _allowed_site_ids(conn, caller):
+        return error("access denied to this site", 403)
+    params = event.get("queryStringParameters") or {}
+    date = params.get("date")
+    if date is not None and not REPORT_DATE_RE.match(date):
+        return error("date must be YYYY-MM-DD", 400)
+    if not date:
+        # The client's own NZ calendar day, never datetime.now().date() (BUG-37) — a UTC
+        # date would answer for a day that, in NZ, has not started or already ended.
+        date = nz_time.nz_today().isoformat()
+    rows = site_attendance.for_day(conn, caller["company_id"], site_id, date)
+    return ok({"site": str(site_id), "date": date,
+              "rows": [_serialize_attendance_row(r) for r in rows]})
+
+
+def create_site_attendance(conn, caller, site_id, event):
+    """POST /api/org/sites/{id}/attendance — a site manager lists today's people.
+
+    `manual` ships first in the roadmap because it needs no third party (spec: "ships
+    first, proves the consumer") — this is that surface. Role gate mirrors every other
+    correction-adjacent write in this file (`_CORRECTION_ROLES`); the site ACL is the same
+    `_allowed_site_ids` every other site-scoped route uses.
+    """
+    if str(site_id) not in _allowed_site_ids(conn, caller):
+        return error("access denied to this site", 403)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    date = body.get("date") or nz_time.nz_today().isoformat()
+    if not isinstance(date, str) or not REPORT_DATE_RE.match(date):
+        return error("date must be YYYY-MM-DD", 400)
+    names = body.get("names")
+    if not isinstance(names, list) or not names:
+        return error("names must be a non-empty list", 400)
+    if len(names) > _ATTENDANCE_NAME_CAP:
+        return error(f"at most {_ATTENDANCE_NAME_CAP} names per request", 400)
+    rows = []
+    for n in names:
+        if not isinstance(n, dict):
+            return error("each name must be an object", 400)
+        display_name = (n.get("displayName") or "").strip()
+        if not display_name:
+            return error("displayName must not be blank", 400)
+        rows.append({"displayName": display_name, "employerName": n.get("employerName")})
+    with conn.transaction():
+        # Company from the CALLER, never the body -- a body-supplied company id would let
+        # one tenant write another's roster (the same rule every write endpoint in this
+        # file follows for the same reason).
+        result = site_attendance.upsert(conn, caller["company_id"], site_id, date, rows,
+                                        source="manual", created_by=caller["id"])
+    listing = site_attendance.for_day(conn, caller["company_id"], site_id, date)
+    return ok({"inserted": result["inserted"], "updated": result["updated"],
+              "rows": [_serialize_attendance_row(r) for r in listing]})
+
+
+def delete_site_attendance(conn, caller, site_id, row_id, event):
+    """DELETE /api/org/sites/{id}/attendance/{rowId}?date=YYYY-MM-DD — manual rows only.
+
+    A connector row (Phase 2/3) is the source's own to remove or overwrite on its next
+    sync (plan correction 7); deleting one here would be silently undone, with nothing on
+    screen explaining why it came back. 409, not a silent no-op, so the caller can tell
+    "removed" from "refused" — the same reason a `return error(...)` here never looks like
+    success.
+    """
+    if str(site_id) not in _allowed_site_ids(conn, caller):
+        return error("access denied to this site", 403)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    params = event.get("queryStringParameters") or {}
+    date = params.get("date")
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date must be YYYY-MM-DD", 400)
+    rows = site_attendance.for_day(conn, caller["company_id"], site_id, date)
+    row = next((r for r in rows if str(r["id"]) == str(row_id)), None)
+    if row is None:
+        return error("not found", 404)
+    if row["source"] != "manual":
+        return error("only a manual row may be removed here; a connector row is the "
+                     "source's own to remove or overwrite on its next sync", 409)
+    with conn.transaction():
+        n = site_attendance.remove(conn, caller["company_id"], site_id, date, row_id)
+    return ok({"removed": n})
+
+
 def create_qr_login_code(conn, caller, event):
     """Self-service: mint a one-time code that logs a terminal into the CALLER's
     own account via Cognito custom auth. Code bound to the caller's sub."""
@@ -3885,10 +4401,24 @@ def patch_org_site(conn, caller, site_id, body):
             return error("name must be a non-empty string", 400)
         name = name.strip()
     icon = body.get("icon_s3_key")
+    final_icon = None
     if icon is not None:
         pending_prefix = f"{ORG_ASSETS_PREFIX}pending/{caller['cognito_sub']}/"
         if not isinstance(icon, str) or not icon.startswith(pending_prefix):
             return error(f"icon_s3_key must be your pending upload ({pending_prefix}…)", 400)
+        # Relocate BEFORE any DB write, the ordering patch_me documents.
+        # This ran AFTER update_site and (once a move was possible) after
+        # move_site_company, and `with conn:` COMMITS on a clean exit --
+        # `error(...)` is a return, not a raise. So a failed relocate
+        # returned 400 while the name edit, and the company move, had
+        # already committed: the caller was told to re-upload and the site
+        # had silently changed tenant. A failure here now costs at most one
+        # unreferenced object in pending/ -- a retry re-uploads -- which is
+        # the tradeoff patch_me already makes for the same reason.
+        final_icon = (f"{ORG_ASSETS_PREFIX}site-icons/{site_id}/"
+                      f"{icon.rsplit('/', 1)[-1]}")
+        if not _relocate_asset(icon, final_icon):
+            return error("upload expired or missing — please re-upload the image", 400)
     lat, lat_err = _coerce_coord(body.get("latitude"), -90.0, 90.0, "latitude")
     if lat_err:
         return lat_err
@@ -3902,11 +4432,66 @@ def patch_org_site(conn, caller, site_id, body):
     # hits 0 rows -> 404 (mirrors the Team/sites cross-company fix in #96 and
     # patch_action_item).
     scope_company_id = caller["company_id"]
+    target = None
     if is_cross_company(caller["global_role"]):
         target = sites.get_site(conn, site_id)
         if target is None:
             return error("site not found", 404)
         scope_company_id = target["company_id"]
+    # Moving a site to another company: the SAME gate as create_org_site's
+    # target_company_id (only is_cross_company roles, target must exist). As in
+    # create_org_site, a value equal to the caller's own company is a no-op for
+    # everyone else (non-cross callers stay pinned to it). A cross-company
+    # caller's own company is NOT special -- moving a site INTO it is a real
+    # move -- so for them "unchanged" means equal to the site's current company.
+    # The scope above is unchanged and still decides which site is reachable;
+    # the move runs only after the scoped update matched, so it cannot widen reach.
+    move_to = None
+    req_company_id = body.get("target_company_id")
+    # NORMALISED before every comparison and before it reaches the DB. A
+    # raw string compare made `ABC-...` a different company from
+    # `abc-...`: the same company in a different case read as a real move,
+    # which then found the site ITSELF in the "target" company and
+    # returned a false 409 -- and gave a non-cross caller a 403 where
+    # create_org_site ignores its own company id. uuid.UUID also accepts
+    # the `{...}`, `urn:` and unhyphenated forms, which were reaching
+    # psycopg unchanged.
+    canon_company_id = None
+    if req_company_id:
+        try:
+            canon_company_id = str(uuid.UUID(str(req_company_id)))
+        except (ValueError, AttributeError, TypeError):
+            canon_company_id = None
+
+    def _names(company_id):
+        """Whether target_company_id refers to `company_id`. Canonical form
+        FIRST, so case and the `{...}`/unhyphenated forms match; raw equality as
+        well, so a value that is not a uuid at all still matches itself exactly
+        rather than being read as some other company -- the weaker check must
+        never be stricter than create_org_site's plain string compare."""
+        return (canon_company_id or str(req_company_id)) == str(company_id) or             str(req_company_id) == str(company_id)
+
+    if req_company_id and not _names(caller["company_id"]):
+        if not is_cross_company(caller["global_role"]):
+            return error("only platform_admin may move a site to another company", 403)
+    if req_company_id and is_cross_company(caller["global_role"]):
+        if canon_company_id is None:
+            return error("target_company_id must be a company id", 400)
+        if companies.get_company_by_id(conn, canon_company_id) is None:
+            return error("target company not found", 404)
+        if not _names(scope_company_id):
+            move_to = canon_company_id
+            # slug is unique per (company_id, slug), not globally. Keep the
+            # slug (deep links and the published site-coords key use it) and
+            # refuse a collision rather than renaming or hitting the index.
+            # `is not None`, not truthiness: '' is an INDEXABLE value --
+            # only NULL is treated as distinct by a unique index -- so an
+            # empty slug skipped the check and hit the index as a 500.
+            slug = (target or {}).get("slug")
+            if slug is not None and sites.get_company_site_by_slug(
+                    conn, move_to, slug) is not None:
+                return error("target company already has a site with slug "
+                             f"'{slug}'", 409)
     row = sites.update_site(
         conn, site_id, scope_company_id,
         name=name, location=body.get("location"),
@@ -3915,12 +4500,18 @@ def patch_org_site(conn, caller, site_id, body):
     )
     if row is None:
         return error("site not found in your company", 404)
-    if icon is not None:
+    if move_to is not None:
+        row = sites.move_site_company(conn, site_id, scope_company_id, move_to)
+        if row is None:
+            # update_site already matched and wrote; only a concurrent
+            # archive or move reaches here. `with conn:` commits on a
+            # clean exit and `error(...)` is a return, so without this
+            # rollback the caller is told 404 while their name and
+            # coordinate edit is committed.
+            conn.rollback()
+            return error("site not found in your company", 404)
+    if final_icon is not None:
         old_icon = row.get("icon_s3_key")
-        fname = icon.rsplit("/", 1)[-1]
-        final_icon = f"{ORG_ASSETS_PREFIX}site-icons/{site_id}/{fname}"
-        if not _relocate_asset(icon, final_icon):
-            return error("upload expired or missing — please re-upload the image", 400)
         row = sites.set_site_icon(conn, site_id, final_icon)
         if old_icon and old_icon != final_icon:
             _delete_asset(old_icon)
@@ -4035,6 +4626,31 @@ def list_site_contributors(conn, caller, site_id, event):
         return error("date required (YYYY-MM-DD)", 400)
     folders = topics.list_contributor_folders_for_site_date(conn, site_id, date)
     return ok({"folders": folders, "site": str(site_id), "date": date})
+
+
+# ----------------------------------------------------------
+# /companies
+# ----------------------------------------------------------
+def list_org_companies(conn, caller):
+    """GET /companies -- {id, name} of every tenant, for the site-create company picker.
+
+    WHO: platform_admin only, and the gate is is_cross_company -- the same predicate
+    that alone lets create_org_site / patch_org_site honour target_company_id. This
+    list exists to feed that parameter, so whoever may not send target_company_id has
+    no use for it. A company admin/gm passes resolve_scope()==ALL but that is a
+    SAME-company scope (list_members gates its company branch on it); it must not buy
+    a directory of other tenants, so resolve_scope is deliberately NOT consulted here.
+    Every other role is refused. The list is every tenant's name: default is refusal.
+
+    WHAT: id and name only. companies.list_companies also selects industry and
+    created_at, and the row may grow; the projection is explicit so a widened repo
+    query cannot leak a new column through this route.
+    """
+    if not is_cross_company(caller["global_role"]):
+        return error("platform_admin role required", 403)
+    return ok({"companies": [
+        {"id": str(c["id"]), "name": c["name"]} for c in companies.list_companies(conn)
+    ]})
 
 
 # ----------------------------------------------------------
@@ -7742,6 +8358,9 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
         # return the same rows twice under a different provenance.
         shape = _aurora_shape(prefix, merged)
         if shape is not None:
+            # `user` = the folder this read actually served, the same key the
+            # 404 envelopes carry. `user_name` is a display name here, not a folder.
+            shape["user"] = user
             return ok(shape)
     if cross_user_clip:
         # CRITICAL-1: no in-scope Aurora topics for this (target, date). The
@@ -7767,7 +8386,8 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
         # would otherwise ride straight through to a customer's browser,
         # because this branch serves the S3 object byte-for-byte. Strip just
         # that one key on the way out; the stored S3 object is untouched.
-        return ok(_without_vendor_metadata(doc))
+        # Same `user` key as the Aurora path and the 404s: the served folder.
+        return ok({**_without_vendor_metadata(doc), "user": user})
     # `user` is the folder as a FIELD. It was only ever in the human-readable
     # message, and the client needs it to build the photo key -- leaving it
     # there would have made a UI parse an English sentence for an identifier.

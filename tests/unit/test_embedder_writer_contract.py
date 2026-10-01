@@ -285,6 +285,22 @@ def test_the_admitted_limit_reaches_the_column_it_is_stored_in(monkeypatch):
     assert se._admitted_limit() is None
 
 
+def test_recording_conditions_reach_add_sample_on_every_enrolment_path(captured, writer_db,
+                                                                       monkeypatch):
+    """Design 2026-09-30 step 1: level_dbfs/noise_dbfs/snr_db are computed by the embedder
+    (the numpy side) and must reach `add_sample` on both the anchor enrolment and every
+    harvested sample -- the same seam three earlier defects lived on, driven through both
+    real handlers rather than asserted on either side alone."""
+    _run_embedder(monkeypatch, _artifact(enrol={"voiceprint_id": "vp-1"}))
+    for payload in captured:
+        vw.lambda_handler(payload, None)
+    assert writer_db["samples"], "nothing was stored, so this proves nothing"
+    for kw in writer_db["samples"]:
+        for field in ("level_dbfs", "noise_dbfs", "snr_db"):
+            assert kw.get(field) is not None, (
+                f"a stored sample crossed the seam without {field}")
+
+
 def test_no_field_crosses_this_seam_unread_in_either_direction():
     """The census, kept as a test so it cannot quietly stop being true.
 
@@ -531,3 +547,18 @@ def test_the_rebind_centroid_survives_the_hop_and_reaches_the_insert(monkeypatch
     assert captured_params[1][1][idx] is None, (
         "a missing centroid must stay NULL -- a zero vector would read as a voice that "
         "matches nothing, which is a different and answerable claim")
+
+
+def test_date_on_profiles_and_on_roster_on_the_reply_cross_the_seam_read():
+    """The roster hop (on-site-roster plan, Task 4): the embedder sends `date` on the
+    `profiles` invoke and the writer must read it; the writer may reply with `on_roster`
+    per profile and `roster_size`, and the embedder must read both, or the roster narrows
+    nothing while looking like it works -- the exact shape of this file's other defects."""
+    emb = open("src/lambda_speaker_embed.py", encoding="utf-8").read()
+    wr = open("src/lambda_voiceprint_writer.py", encoding="utf-8").read()
+
+    assert '"op": "profiles"' in emb and '"date": date' in emb
+    assert 'event.get("date")' in wr, "the writer never reads the date the embedder sends"
+
+    assert 'on_roster' in wr, "the writer never builds on_roster"
+    assert 'p.get("on_roster")' in emb, "the embedder never reads on_roster back"
