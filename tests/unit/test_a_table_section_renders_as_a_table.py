@@ -95,7 +95,7 @@ def test_a_one_column_table_comes_out_as_lines():
     assert not doc.tables, "one column is not a table"
     texts = [p.text for p in doc.paragraphs]
     assert "Open Actions" in texts
-    assert "**no owner recorded** - Platform login" in texts
+    assert "no owner recorded - Platform login" in texts, "emphasis is formatting, not asterisks"
     for p in doc.paragraphs:
         assert "|" not in p.text
 

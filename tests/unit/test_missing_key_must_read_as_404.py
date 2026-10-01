@@ -84,6 +84,15 @@ MISSING_KEY_IS_NORMAL = [
      "_session_was_deleted gates rendering and mailing the on-demand report -- "
      "STRICT since 2026-09-16, a missing grant fails the request rather than "
      "answering 'nothing was deleted'"),
+    ("SessionReportFunction", "weather/*",
+     "report_facts._stored: a template's Weather section reads the nightly "
+     "record; most days have none and fall back to computing it"),
+    ("SessionReportFunction", "programmes/*",
+     "report_facts._programme: most sites have no programme uploaded"),
+    ("OrgApiFunction", "report_photo_selection/*",
+     "GET /days/{date}/photos/selection: most days nobody has chosen anything"),
+    ("SessionReportFunction", "report_photo_selection/*",
+     "report_photos.read_excluded: most days nobody has chosen photographs to leave out"),
     # handoff-sync plan §2.2/§2.3: the FINAL email polls session_brief/ for the
     # brief its sibling `kind:"brief"` request asked for concurrently, and on
     # every attempt but the last (almost always) the key is not there yet --

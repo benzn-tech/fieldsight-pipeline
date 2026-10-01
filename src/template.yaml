@@ -1899,6 +1899,15 @@ Resources:
                 # prompt (transcript_window.select_keys/assemble). This worker had
                 # no read of transcripts/ at all before generation existed.
                 - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
+                # A template's Weather section (report_facts.py): the nightly
+                # record for the site and day, and -- with no record -- the
+                # site's programme, so the weather is judged against the day's
+                # tasks the same way the daily report judges it.
+                - !Sub arn:aws:s3:::${IngestBucketName}/weather/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/programmes/*
+                # The person's choice of photographs to leave out of the day's
+                # reports (report_photos.read_excluded).
+                - !Sub arn:aws:s3:::${IngestBucketName}/report_photo_selection/*
             - Effect: Allow
               Action: s3:PutObject
               Resource:
@@ -1920,6 +1929,12 @@ Resources:
                   s3:prefix:
                     - redactions/*
                     - transcripts/*
+                    # Most days have no weather record and most sites no
+                    # programme: without these a missing key reads as
+                    # AccessDenied, not NoSuchKey.
+                    - weather/*
+                    - programmes/*
+                    - report_photo_selection/*
             - Effect: Allow
               # SES send for the 'email' delivery option — harmless while
               # EMAIL_SENDER=stub (the stub never calls SES). Verified-identity
@@ -2370,6 +2385,9 @@ Resources:
                     # release yet answers AccessDenied instead of NoSuchKey, and the route
                     # reports it -- correctly -- as 503 rather than "no update".
                     - "app-releases/*"
+                    # Most days have no photo selection: reading one must be a
+                    # 404 (nothing left out), not a 403.
+                    - report_photo_selection/*
             - Effect: Allow
               # In-app updates: the release manifest (app-releases/latest.json) and the APKs it
               # names, which GET /api/org/app/latest presigns for signed-in devices. Read only;
@@ -2457,6 +2475,14 @@ Resources:
               # only: the generator reads the request, org-api never does.
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/report_requests/*
+            - Effect: Allow
+              # GET/PUT /api/org/days/{date}/photos/selection: the person's choice
+              # of photographs to leave out of the day's reports (report_photos),
+              # read back by both report paths.
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/report_photo_selection/*
             # A speaker correction, handed OUTWARD across the VPC boundary the same way.
             # Write only, and no grant on voiceprint_results/: those go to the in-VPC
             # writer by direct invoke from the embedder, and a read grant here would be an

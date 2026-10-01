@@ -736,7 +736,49 @@ def _split_table_row(text):
     return [c.strip() for c in text.strip().strip("|").split("|")]
 
 
-def _add_markdown_table(doc, rows):
+PHOTO_CELL_WIDTH = Inches(1.3) if DOCX_AVAILABLE else None
+
+
+def _add_photos_to_cell(cell, streams):
+    """Pictures inside one table cell. Never raises, like the strip: one
+    unreadable file costs itself, not the row."""
+    para = cell.paragraphs[0]
+    for stream in streams:
+        try:
+            para.add_run().add_picture(stream, width=PHOTO_CELL_WIDTH)
+        except Exception:
+            logger.warning("skipping a photo python-docx could not place in a cell",
+                           exc_info=True)
+
+
+_EMPHASIS_RE = re.compile(r"\*\*(.+?)\*\*|(?<![*\w])\*(?!\s)([^*]+?)(?<!\s)\*(?![*\w])")
+
+
+def _add_rich_text(paragraph, text):
+    """`**bold**` and `*italic*` as formatting, not as asterisks. The model
+    writes markdown emphasis (our own prompt asked for it), and every report
+    printed the asterisks: "**no owner recorded**" in a customer's table."""
+    at = 0
+    for m in _EMPHASIS_RE.finditer(text):
+        if m.start() > at:
+            paragraph.add_run(text[at:m.start()])
+        run = paragraph.add_run(m.group(1) if m.group(1) is not None else m.group(2))
+        if m.group(1) is not None:
+            run.bold = True
+        else:
+            run.italic = True
+        at = m.end()
+    if at < len(text):
+        paragraph.add_run(text[at:])
+    return paragraph
+
+
+def _set_cell_text(cell, text):
+    cell.text = ""
+    _add_rich_text(cell.paragraphs[0], text)
+
+
+def _add_markdown_table(doc, rows, row_photos=None):
     """Render the pipe rows the model was asked for as an actual table.
 
     A section whose `kind` is "table" now tells the model to write a markdown
@@ -745,9 +787,20 @@ def _add_markdown_table(doc, rows):
     would have got from choosing "Table" in the editor -- a control that could
     be set, stored and previewed, and whose only effect on the output was to
     make it worse.
+
+    ONE ROW, ONE TOPIC, ITS PHOTOGRAPHS IN THE ROW (owner, 2026-09-30). The
+    photographs of a row's topic used to be gathered under the whole table,
+    which separated each picture from the line it evidences. `row_photos` is
+    aligned with `rows` (one stream list per line, from the row's [tN] tag);
+    when any row has photographs, a "Photos" column is added -- by us, not
+    asked of the model -- and each row's pictures go in its own cell.
     """
-    cells = [_split_table_row(r) for r in rows if not _TABLE_RULE_RE.match(r)]
-    cells = [c for c in cells if any(x for x in c)]
+    row_photos = row_photos or [None] * len(rows)
+    kept = [(_split_table_row(r), row_photos[k] or [])
+            for k, r in enumerate(rows) if not _TABLE_RULE_RE.match(r)]
+    kept = [(c, p) for c, p in kept if any(x for x in c)]
+    cells = [c for c, _ in kept]
+    photos = [p for _, p in kept]
     if not cells:
         return
     width = max(len(c) for c in cells)
@@ -759,16 +812,26 @@ def _add_markdown_table(doc, rows):
         # before. The prompt now names the columns, so this should not arrive;
         # when it does anyway, the lines are worth more as lines than as a
         # column of boxes.
-        for row in cells:
+        for row, pics in zip(cells, photos):
             text = (row[0] if row else "").strip()
             if text:
-                doc.add_paragraph(text, style="List Bullet")
+                _add_rich_text(doc.add_paragraph(style="List Bullet"), text)
+                _add_photo_strip(doc, pics)
         return
-    table = doc.add_table(rows=len(cells), cols=width)
+    with_photos = any(photos[1:])
+    table = doc.add_table(rows=len(cells), cols=width + (1 if with_photos else 0))
     table.style = "Table Grid"
     for r, row in enumerate(cells):
         for c in range(width):
-            table.cell(r, c).text = row[c] if c < len(row) else ""
+            _set_cell_text(table.cell(r, c), row[c] if c < len(row) else "")
+        if with_photos:
+            if r == 0:
+                table.cell(0, width).text = "Photos"
+            elif photos[r]:
+                _add_photos_to_cell(table.cell(r, width), photos[r])
+    # A tag on the header row has no row of its own to sit in; its pictures
+    # go under the table rather than nowhere.
+    _add_photo_strip(doc, photos[0])
     for run in table.rows[0].cells[0].paragraphs[0].runs or []:
         run.bold = True
 
@@ -796,19 +859,16 @@ def _add_prose_section(doc, section):
             continue
         n = _table_at(paragraphs, i)
         if n:
-            _add_markdown_table(doc, [r.strip() for r in paragraphs[i:i + n]])
-            # A tag on any row of the table puts its photograph under the
-            # whole table: a picture cannot sit between two rows.
-            strip = []
-            for k in range(i, i + n):
-                strip.extend(after.get(k) or [])
-            _add_photo_strip(doc, strip)
+            # Each row's photographs go in that row's Photos cell (see
+            # _add_markdown_table), not in a heap under the table.
+            _add_markdown_table(doc, [r.strip() for r in paragraphs[i:i + n]],
+                                [after.get(k) for k in range(i, i + n)])
             i += n
             continue
         if text.startswith("- ") or text.startswith("* "):
-            doc.add_paragraph(text[2:].strip(), style="List Bullet")
+            _add_rich_text(doc.add_paragraph(style="List Bullet"), text[2:].strip())
         else:
-            doc.add_paragraph(text)
+            _add_rich_text(doc.add_paragraph(), text)
         # THE PHOTOGRAPH OF WHAT THIS LINE SAID, directly under it.
         _add_photo_strip(doc, after.get(i))
         i += 1
@@ -819,6 +879,18 @@ def _add_prose_section(doc, section):
     # python-docx cannot place -- because a reader should not be able to
     # tell which path wrote the document.
     _add_photo_strip(doc, section.get("photo_streams"))
+
+
+def _add_actions_table(doc, actions):
+    table = doc.add_table(rows=1, cols=3)
+    table.style = "Table Grid"
+    for cell, head in zip(table.rows[0].cells, ("Action", "Owner", "When")):
+        cell.text = head
+    for a in actions:
+        row = table.add_row().cells
+        row[0].text = (a.get("action") or "").strip()
+        row[1].text = (a.get("owner") or "").strip() or "no owner recorded"
+        row[2].text = (a.get("deadline") or "").strip() or "no date"
 
 
 def generate_prose_document(title, subtitle, sections, actions, closing=None):
@@ -838,27 +910,27 @@ def generate_prose_document(title, subtitle, sections, actions, closing=None):
         p = doc.add_paragraph(subtitle)
         p.runs[0].italic = True
 
-    has_actions_section = False
+    # THE ACTIONS ARE WRITTEN ONCE, BY US, WHERE THE PLAN PUT THEM. They are
+    # data on record, so the table comes from that record. It used to be added
+    # after every section -- stranded below the catch-all -- while the model
+    # also wrote the same actions into the plan's Actions section: every
+    # generated report carried them twice (TEST, 2026-09-23 "daily report"
+    # v10). The model's copy under that heading is dropped; the table sits
+    # there instead. Without an Actions section in the plan, the table goes
+    # at the end under its own heading, as before.
+    placed = False
     for section in sections or []:
-        if (section.get("title") or "").strip().lower() == "actions":
-            has_actions_section = True
+        if actions and not placed and \
+                (section.get("title") or "").strip().lower() == "actions":
+            _add_prose_section(doc, dict(section, paragraphs=[], photos_after={}))
+            _add_actions_table(doc, actions)
+            placed = True
+            continue
         _add_prose_section(doc, section)
 
-    if actions:
-        # A prose section titled "Actions" already wrote this heading above; the
-        # table renders under it rather than duplicating the heading (a generated
-        # document from the built-in template asks the model for that section).
-        if not has_actions_section:
-            doc.add_heading("Actions", level=1)
-        table = doc.add_table(rows=1, cols=3)
-        table.style = "Table Grid"
-        for cell, head in zip(table.rows[0].cells, ("Action", "Owner", "When")):
-            cell.text = head
-        for a in actions:
-            row = table.add_row().cells
-            row[0].text = (a.get("action") or "").strip()
-            row[1].text = (a.get("owner") or "").strip() or "no owner recorded"
-            row[2].text = (a.get("deadline") or "").strip() or "no date"
+    if actions and not placed:
+        doc.add_heading("Actions", level=1)
+        _add_actions_table(doc, actions)
 
     if closing:
         _add_prose_section(doc, closing)

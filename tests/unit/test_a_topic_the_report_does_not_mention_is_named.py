@@ -225,8 +225,11 @@ def test_a_photograph_of_a_topic_nobody_named_sits_under_its_note_line(monkeypat
     png = base64.b64decode(
         b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
         b"z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
-    monkeypatch.setattr(sr, "_fetch_photos",
-                        lambda folder, date, names, budget: [io.BytesIO(png) for _ in names])
+    def fetch(folder, date, names, budget, names_out=None, edge=None):
+        if names_out is not None:
+            names_out.extend(names)
+        return [io.BytesIO(png) for _ in names]
+    monkeypatch.setattr(sr, "_fetch_photos", fetch)
     topics = [dict(TOPICS[0]), dict(TOPICS[1], related_photos=["cam.jpg"]), dict(TOPICS[2])]
     seen = run(ANSWER_WITHOUT_T1, artifact=_artifact(topics=topics))
     assert seen["meta"]["photosUnplaced"] == 0

@@ -69,6 +69,8 @@ import agent_turn_filter
 from output_language import OUTPUT_LANGUAGE_RULE
 import weather
 import weather_advice
+import site_weather
+import report_photos
 import site_coords
 import llm_utils
 import report_sections
@@ -526,21 +528,9 @@ def summary_text(report):
     return text or 'No summary available'
 
 
-def build_weather_block_for_site(site_info, target_date, today_iso,
-                                 fetch=weather.fetch_weather):
-    """Fetch the normalized (site, date) weather block, or None when the site
-    has no coordinate (un-backfilled) or the fetch fails. Non-VPC: this runs in
-    ReportGeneratorFunction, which has egress. Coordinate comes from the
-    config/user_mapping.json `sites` block (D-COORD option a)."""
-    lat = site_info.get("latitude")
-    lng = site_info.get("longitude")
-    if lat is None or lng is None:
-        return None
-    try:
-        return fetch(lat, lng, target_date, today_iso)
-    except Exception as e:
-        logger.warning(f"weather fetch failed for {target_date}: {e}")
-        return None
+# Kept under these names: the nightly run and its tests call them from here.
+build_weather_block_for_site = site_weather.build_weather_block_for_site
+build_weather_findings = site_weather.build_weather_findings
 
 
 def programme_for_site(site_info, bucket=None):
@@ -557,50 +547,6 @@ def weather_record_site(site_info, fallback_slug):
     org-api and the Today page know a site by; the slug only when no UUID is
     known, so a record is never dropped for want of one."""
     return (site_info or {}).get("site_uuid") or fallback_slug
-
-
-def build_weather_findings(site_info, target_date, today_iso,
-                           fetch=weather_advice.hourly_forecast,
-                           programme=None):
-    """What the weather meant for the day's work, DECIDED BY CODE.
-
-    Until 2026-09-29 the report handed the model one sentence of daily totals
-    and asked it to "note the linkage" between weather and work -- every
-    threshold, every trade, left to the model and decided differently each
-    night. weather_advice.assess makes those calls from the hourly actuals;
-    the lines here are its fixed template, so the compliance record says the
-    same thing about the same weather every time.
-
-    THE DAY'S PROGRAMME decides what is impacted (owner, 2026-09-29): the
-    tasks running on the day and not finished are matched against the
-    weather; a day whose exposed work is all indoors gets one "no impact"
-    line. A site with no programme names the trades weather affects in
-    general. `impact_basis` ("planned" | "general") says which it was.
-    None when the site has no coordinate or the fetch fails -- the report
-    says "not recorded" rather than guessing.
-    """
-    lat = site_info.get("latitude")
-    lng = site_info.get("longitude")
-    if lat is None or lng is None:
-        return None
-    historical = bool(today_iso and target_date < today_iso)
-    try:
-        hours = fetch(lat, lng, target_date, historical)
-    except Exception as e:
-        logger.warning(f"hourly weather fetch failed for {target_date}: {e}")
-        return None
-    if not hours:
-        return None
-    planned = weather_advice.planned_from_programme(programme, target_date)
-    f = weather_advice.assess(hours, planned=planned, actual=historical)
-    return {
-        "lines": weather_advice.render_template(f),
-        "weather_day": f["weather_day"] if historical else None,
-        "actual": historical,
-        "impact_basis": "general" if planned is None else "planned",
-        "planned": planned,
-        "items": f["items"],
-    }
 
 
 def weather_record_key(site_id, target_date, actual):
@@ -1015,6 +961,9 @@ def site_name_for(user_site_info):
     return user_site_info.get('name') or ''
 
 
+_PHOTO_KEY_RE = re.compile(r"^users/([^/]+)/pictures/(\d{4}-\d{2}-\d{2})/")
+
+
 def _add_photos_to_document(doc, items, max_photos=None):
     """The photographs themselves, not a list of their filenames.
 
@@ -1023,38 +972,61 @@ def _add_photos_to_document(doc, items, max_photos=None):
     reader that a photograph exists and nothing else. Asked why photos are not
     in the report, that was the answer.
 
+    WHICH, HOW MANY, AT WHAT SIZE follow report_photos -- the same rules as
+    the template report, so one day's two documents carry the same pictures
+    (owner, 2026-10-01): the person's exclusions for the day come off first;
+    up to 60 at page size, up to 120 shrunk automatically; past that, a fair
+    selection and one line saying how many more were taken -- not their
+    filenames.
+
     Every failure here degrades to the filename rather than losing the entry:
     a missing object, a permission the role does not have, an image python-docx
     cannot decode. A report with one photo it could not fetch is still a
     report; an exception inside document generation is no report at all, and
     Word generation already disables itself silently often enough (BUG-24).
 
-    `max_photos` is a ceiling, not a preference. Each embedded image is held in
-    memory while the document is assembled, and a day with two hundred site
-    photographs would rebuild the OOM that BUG-04 fixed elsewhere.
+    `max_photos` clips further (a caller's ceiling); each embedded image is held
+    in memory while the document is assembled (BUG-04), which is why every one
+    is shrunk before it is held.
     """
-    try:
-        limit = int(os.environ.get('REPORT_MAX_EMBEDDED_PHOTOS', '40'))
-    except ValueError:
-        limit = 40
-    if max_photos is not None:
-        limit = max_photos
-
-    shown = 0
+    entries = []
     for item in items:
         if isinstance(item, dict):
             name = str(item.get('name') or '').strip()
             key = str(item.get('key') or '').strip()
         else:
             name, key = str(item).strip(), ''
-        if not (name or key):
+        if name or key:
+            entries.append((name or key.rsplit('/', 1)[-1], key))
+
+    folder = date = None
+    for _, key in entries:
+        m = _PHOTO_KEY_RE.match(key)
+        if m:
+            folder, date = m.group(1), m.group(2)
+            break
+    excluded = (report_photos.read_excluded(s3_client, S3_BUCKET, folder, date)
+                if folder and S3_BUCKET else set())
+    chosen, edge, left_out = report_photos.plan(
+        [("day", [n for n, k in entries if k])], excluded)
+    keep = list(chosen.get("day") or [])
+    if max_photos is not None:
+        left_out += max(0, len(keep) - max_photos)
+        keep = keep[:max_photos]
+    keep = set(keep)
+
+    shown = 0
+    for name, key in entries:
+        if name in excluded:
+            continue                                  # the person left it out
+        if not key:
+            doc.add_paragraph(name, style='List Bullet')
             continue
-        if shown >= limit or not key:
-            doc.add_paragraph(name or key, style='List Bullet')
-            continue
+        if name not in keep:
+            continue                                  # counted in the closing line
         try:
             obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
-            stream = BytesIO(obj['Body'].read())
+            stream = BytesIO(report_photos.shrink(obj['Body'].read(), edge))
             doc.add_picture(stream, width=Inches(5.5))
             caption = doc.add_paragraph(name)
             caption.style = doc.styles['Caption'] if 'Caption' in [
@@ -1063,12 +1035,11 @@ def _add_photos_to_document(doc, items, max_photos=None):
         except Exception as exc:                      # noqa: BLE001 - see above
             logger.warning("photo not embedded, listing name instead: %s (%s)",
                            key, exc)
-            doc.add_paragraph(name or key, style='List Bullet')
+            doc.add_paragraph(name, style='List Bullet')
 
-    remaining = len(items) - shown
-    if shown and remaining > 0:
-        doc.add_paragraph("%d further photo%s listed above by name."
-                          % (remaining, "" if remaining == 1 else "s"))
+    if left_out:
+        doc.add_paragraph("Photographs: %d taken this day; %d included in this report."
+                          % (shown + left_out, shown))
 
 
 def render_sections_into(doc, sections):

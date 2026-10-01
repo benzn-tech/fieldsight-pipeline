@@ -22,9 +22,14 @@ from urllib.parse import unquote_plus
 
 import boto3
 
+import checklist
 import chunking
 import lambda_meeting_minutes
 import llm_utils
+import nz_time
+import photo_binding
+import report_facts
+import report_photos
 import report_template
 import transcript_window
 from email_sender import get_sender
@@ -41,8 +46,30 @@ DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessin
 # one photo-heavy topic eat everything before the later topics are reached.
 # The numbers keep the doc something a site manager actually opens on a phone,
 # and keep the render inside the Lambda's memory.
-MAX_PHOTOS_PER_TOPIC = 4
-MAX_PHOTO_BYTES_TOTAL = 12 * 1024 * 1024
+#
+# The per-topic cap was 4 while photographs went in at camera size (2-4 MB
+# each, so the byte budget held ~4 anyway). An inspection walk is one topic
+# with a photograph per spot -- 7 on the TEST day that raised it (2026-10-01)
+# -- so photographs are now shrunk to what a page shows (PHOTO_MAX_EDGE) and
+# the cap counts pictures a reader can use, not bytes.
+#
+# SIXTY A REPORT (owner, 2026-10-01): a real site day can be a long inspection
+# walk, so the count is per REPORT, not per topic -- one topic may take them
+# all. At page size that is ~15-20 MB of document; the byte budget is now only
+# a guard against a pathological day, not the limit people meet.
+#
+# 60 at page size, then up to 120 shrunk automatically, then the person
+# chooses (owner, 2026-10-01) -- the rules live in report_photos, shared with
+# the nightly daily report.
+MAX_PHOTOS_PER_REPORT = report_photos.MAX_LIMIT
+MAX_PHOTOS_PER_TOPIC = MAX_PHOTOS_PER_REPORT
+MAX_PHOTO_BYTES_TOTAL = 40 * 1024 * 1024
+PHOTO_MAX_EDGE = report_photos.STANDARD_EDGE
+
+
+def _shrink(body, edge=PHOTO_MAX_EDGE):
+    """See report_photos.shrink: upright, `edge` px, JPEG; never raises."""
+    return report_photos.shrink(body, edge)
 
 _s3_client = None
 
@@ -99,7 +126,7 @@ def _humanize(key):
     return str(key).replace("_", " ").title()
 
 
-def _fetch_photos(folder, date, filenames, budget):
+def _fetch_photos(folder, date, filenames, budget, names_out=None, edge=None):
     """Download a topic's photos as open streams, newest failure tolerated.
 
     The renderer does no I/O and must stay that way, so the bytes are fetched
@@ -113,7 +140,7 @@ def _fetch_photos(folder, date, filenames, budget):
     object was deleted would be the wrong trade."""
     streams = []
     for name in (filenames or [])[:MAX_PHOTOS_PER_TOPIC]:
-        if budget[0] <= 0:
+        if budget[0] <= 0 or (len(budget) > 1 and budget[1] <= 0):
             logger.info("photo budget spent; skipping %s", name)
             break
         key = f"users/{folder}/pictures/{date}/{name}"
@@ -122,8 +149,13 @@ def _fetch_photos(folder, date, filenames, budget):
         except Exception:
             logger.warning("could not read photo %s; leaving it out", key)
             continue
+        body = _shrink(body, edge or PHOTO_MAX_EDGE)
         streams.append(BytesIO(body))
+        if names_out is not None:
+            names_out.append(name)       # which file each stream is: a skipped one shifts nothing
         budget[0] -= len(body)
+        if len(budget) > 1:
+            budget[1] -= 1                   # the report-wide count (MAX_PHOTOS_PER_REPORT)
     return streams
 
 
@@ -179,23 +211,124 @@ def _offered_topics(artifact, budget, win_from, win_to):
     folder = artifact.get("folder")
     content = artifact.get("content") or {}
     date = artifact.get("date") or content.get("date")
-    for i, topic in enumerate(content.get("topics") or []):
-        if not _in_window(topic, date, win_from, win_to):
-            continue
+    in_window = [(i, t) for i, t in enumerate(content.get("topics") or [])
+                 if _in_window(t, date, win_from, win_to)]
+    # THE WHOLE REPORT IS PLANNED BEFORE ANYTHING IS FETCHED (report_photos):
+    # the person's own exclusions for the day, one copy of each photograph,
+    # the size the count calls for, and -- past MAX_LIMIT -- a fair share per
+    # topic rather than whatever the first topics happened to hold.
+    excluded = (report_photos.read_excluded(s3(), S3_BUCKET, folder, date)
+                if folder and S3_BUCKET else set())
+    chosen, edge, _ = report_photos.plan(
+        [("t%d" % i, t.get("related_photos") or []) for i, t in in_window], excluded)
+    PLAN_STATS.update({"edge": edge, "excluded": excluded})
+    for i, topic in in_window:
         ref = "t%d" % i
-        names = [n for n in (topic.get("related_photos") or []) if n]
+        names = chosen.get(ref) or []
+        mine_all = [n for n in (topic.get("related_photos") or []) if n and n not in excluded]
         fresh = [n for n in names if n not in seen]
-        got = _fetch_photos(folder, date, fresh, budget) if fresh else []
-        for name, stream in zip(fresh, got):
+        got_names = []
+        got = _fetch_photos(folder, date, fresh, budget, got_names, edge) if fresh else []
+        for name, stream in zip(got_names, got):
             seen[name] = stream
-        mine = [seen[n] for n in names if n in seen]
+        kept = [n for n in names if n in seen]
+        mine = [seen[n] for n in kept]
         if mine:
             streams[ref] = mine
         offer.append({"ref": ref,
                       "title": topic.get("topic_title"),
                       "time_range": topic.get("time_range"),
-                      "photos": len(mine)})
+                      "category": topic.get("category"),
+                      "content": _topic_content(topic),
+                      "photos": len(mine),
+                      # Aligned with streams[ref]: which file each one is, so a
+                      # photograph can be placed by WHERE it was taken.
+                      "photo_names": kept,
+                      # Bound to this topic, not left out by the person, and not
+                      # in the report: past the report's limit, or unreadable.
+                      # Counted, so a report never says less than the day had
+                      # without saying so. A photograph another topic carries
+                      # is not left out.
+                      "photos_left_out": len([n for n in mine_all if n not in seen
+                                              and not _carried_elsewhere(n, chosen, ref)])})
     return offer, streams
+
+
+# The last plan's size and exclusions, for the result's provenance. Module
+# state is safe here: one invocation renders one report at a time.
+PLAN_STATS = {}
+
+
+def _carried_elsewhere(name, chosen, ref):
+    return any(name in names for r, names in chosen.items() if r != ref)
+
+
+def _unanchored(prose, skip_titles=()):
+    """[{section, text}] for every line of the answer that names no topic.
+
+    Counted outside the model, like the coverage note: the report is written
+    from the record (report_template._record_block), and a line that reports
+    no topic is either a summary of several the model forgot to tag or
+    something the record does not hold. Not judged here -- counted, so the
+    number can be watched before anything is ever dropped for it. A table's
+    header and rule rows, "Nothing here." and checklist sections (rebuilt and
+    evidence-checked by code) are not lines of reporting.
+    """
+    skip = {(t or "").strip().lower() for t in skip_titles}
+    out = []
+    for sec in prose:
+        if (sec.get("title") or "").strip().lower() in skip:
+            continue
+        paragraphs = sec.get("paragraphs") or []
+        refs = sec.get("line_refs") or []
+        header_next = True
+        for i, text in enumerate(paragraphs):
+            t = (text or "").strip()
+            is_row = "|" in t
+            if lambda_meeting_minutes._TABLE_RULE_RE.match(t):
+                continue
+            if is_row and header_next and i + 1 < len(paragraphs) and \
+                    lambda_meeting_minutes._TABLE_RULE_RE.match((paragraphs[i + 1] or "").strip()):
+                continue                              # the header row
+            header_next = not is_row
+            if not t or t.rstrip(".").lower() == "nothing here":
+                continue
+            if not (refs[i] if i < len(refs) else []):
+                out.append({"section": sec.get("title"), "text": t[:160]})
+    return out
+
+
+_ITEM_TEXT_KEYS = ("text", "decision", "question", "description", "observation",
+                   "finding", "action", "summary", "title")
+
+
+def _item_text(item):
+    if isinstance(item, dict):
+        for k in _ITEM_TEXT_KEYS:
+            if isinstance(item.get(k), str) and item[k].strip():
+                return item[k].strip()
+        return ""
+    return str(item or "").strip()
+
+
+def _topic_content(topic):
+    """A topic's own content, as the record the report is written from
+    (report_template._record_block): what the page shows for it."""
+    out = []
+    if (topic.get("summary") or "").strip():
+        out.append("Summary: " + " ".join(topic["summary"].split()))
+    for label, key in (("Decided", "key_decisions"), ("Open question", "open_questions"),
+                       ("Safety", "safety_flags"), ("Finding", "findings")):
+        for item in topic.get(key) or []:
+            text = _item_text(item)
+            if text:
+                out.append("%s: %s" % (label, text))
+    for a in topic.get("action_items") or []:
+        text = _item_text(a)
+        if text:
+            who = (a.get("responsible") or a.get("owner") or "") if isinstance(a, dict) else ""
+            out.append("Action: %s%s" % (text, (" (%s)" % who) if who else ""))
+    return out
 
 
 def _referenced(sections):
@@ -250,7 +383,24 @@ def _coverage_note(offer, sections):
             "covers": [], "line_refs": line_refs, "coverage_note": True}
 
 
-def _place_photos(sections, streams_by_ref):
+_SUMMARY_TITLE_RE = re.compile(r"\b(summary|overview)\b", re.IGNORECASE)
+
+
+def _summary_titles(template):
+    """Titles of the plan's overview sections: the standard Summary module, or
+    any section called a summary or an overview."""
+    out = []
+    def walk(sections):
+        for s in sections or []:
+            if ((s.get("module") or {}).get("key") == "summary"
+                    or _SUMMARY_TITLE_RE.search(s.get("title") or "")):
+                out.append(s.get("title") or "")
+            walk(s.get("children"))
+    walk((template or {}).get("sections"))
+    return out
+
+
+def _place_photos(sections, streams_by_ref, no_photos=(), captions=None, places=None):
     """Put each topic's photographs as close as the model said they belong.
 
     Returns (under_a_line, under_a_section, fell_to_the_end) as photograph
@@ -268,12 +418,25 @@ def _place_photos(sections, streams_by_ref):
          because the model forgot a tag would be indistinguishable from one
          that was never taken.
 
-    A photograph appears ONCE, under the first line that names its topic. A
-    day's work does not divide neatly and two lines naming the same topic is
-    not an error, but the picture printed twice would read as one.
+    A photograph appears ONCE. A day's work does not divide neatly and two
+    lines naming the same topic is not an error, but the picture printed twice
+    would read as one. It goes to the MOST SPECIFIC line naming the topic --
+    a table row, then a list item, then a paragraph; the first of equals.
+    "First line" alone put every inspection photograph under the Daily
+    Summary's prose and none in the section that listed the inspections
+    (TEST, Ben_Lin_test2 2026-10-01): the overview cites everything first.
+
+    A SUMMARY HOLDS NO PHOTOGRAPHS (owner, 2026-10-01): sections titled in
+    `no_photos` are skipped by tiers 1 and 2. A topic only the summary named
+    falls to tier 3, where each topic's photographs go under a caption naming
+    it (`captions`: ref -> "title (time)") -- still bound to their topic.
     """
     if not streams_by_ref or not sections:
         return 0, 0, 0
+    skip = {(t or "").strip().lower() for t in no_photos}
+    sections_all = sections
+    sections = [s for s in sections_all
+                if (s.get("title") or "").strip().lower() not in skip] or sections_all[-1:]
     at_line = at_section = 0
     taken = set()
 
@@ -283,17 +446,45 @@ def _place_photos(sections, streams_by_ref):
         taken.add(ref)
         return list(streams_by_ref[ref])
 
-    for section in sections:
-        after = {}
+    cands = {}                                  # ref -> [(rank, order, section, line, text)]
+    order = 0
+    for s, section in enumerate(sections):
+        paragraphs = section.get("paragraphs") or []
+        has_table = any(lambda_meeting_minutes._TABLE_RULE_RE.match(p or "") and "|" in (p or "") for p in paragraphs)
         for i, refs in enumerate(section.get("line_refs") or []):
-            mine = []
+            text = (paragraphs[i] if i < len(paragraphs) else "") or ""
+            rank = 3 if has_table and "|" in text else 2 if text.lstrip().startswith(("- ", "* ")) else 1
             for ref in refs:
-                mine.extend(claim(ref))
-            if mine:
-                after[i] = mine
-                at_line += len(mine)
-        if after:
-            section["photos_after"] = after
+                if ref in streams_by_ref:
+                    cands.setdefault(ref, []).append((rank, order, s, i, text))
+                order += 1
+
+    def put(s, i, streams):
+        after = sections[s].setdefault("photos_after", {})
+        after[i] = after.get(i, []) + streams
+
+    # BY PLACE FIRST, THEN BY HOW SPECIFIC (owner, 2026-10-01): an inspection
+    # written as a Ground floor row and a Level 1 row puts each photograph in
+    # the row naming where it was taken. The place wins over the rank: when
+    # the checklist left Ground floor unanswered, its photographs went into
+    # the Level 1 row -- the only row the topic had -- although a Quality line
+    # said "Ground floor inspection carried out" (TEST run, same day). A
+    # photograph whose place no line names goes to the most specific line.
+    def best(lines):
+        top_rank = max(c[0] for c in lines)
+        return next(c for c in lines if c[0] == top_rank)
+
+    for ref in sorted(cands, key=lambda r: cands[r][0][1]):
+        mine = claim(ref)
+        if not mine:
+            continue
+        where = (places or {}).get(ref) or []
+        for j, stream in enumerate(mine):
+            place = where[j] if j < len(where) else None
+            naming = [c for c in cands[ref] if photo_binding.names_place(c[4], place)]
+            hit = best(naming) if naming else best(cands[ref])
+            put(hit[2], hit[3], [stream])
+        at_line += len(mine)
 
     for section in sections:
         mine = []
@@ -304,11 +495,19 @@ def _place_photos(sections, streams_by_ref):
             at_section += len(mine)
 
     leftover = []
+    last = sections_all[-1]
     for ref in streams_by_ref:
-        leftover.extend(claim(ref))
-    if leftover:
-        last = sections[-1]
-        last["photo_streams"] = (last.get("photo_streams") or []) + leftover
+        mine = claim(ref)
+        if not mine:
+            continue
+        leftover.extend(mine)
+        caption = (captions or {}).get(ref)
+        if caption:
+            last["paragraphs"] = list(last.get("paragraphs") or []) + ["Photos: " + caption]
+            last["line_refs"] = list(last.get("line_refs") or []) + [[]]
+            last.setdefault("photos_after", {})[len(last["paragraphs"]) - 1] = mine
+        else:
+            last["photo_streams"] = (last.get("photo_streams") or []) + mine
     return at_line, at_section, len(leftover)
 
 
@@ -490,25 +689,26 @@ def _action_items_for_prompt(content):
 _COVERS_RE = re.compile(r"^\[covers:\s*([^\]]*)\]$", re.IGNORECASE)
 _REF_RE = re.compile(r"t\d+", re.IGNORECASE)
 # `... signed off by the engineer. [t1]` / `[t1, t3]` / `[T1 and T3]`, at the END
-# of a line only. Anchored to the end so a bracket in the middle of a sentence
-# -- "[sic]", a citation, a quoted form number -- is never read as a reference;
-# and only `t` followed by digits, so nothing a person would naturally write in
-# brackets can move a photograph.
+# of a line or of a table CELL. End-of-line only printed the tag in a customer's
+# checklist, where a row puts it at the end of a cell: "Ground floor inspection
+# carried out [t2] | |" (TEST, 2026-10-01). Still anchored, so a bracket in the
+# middle of a sentence -- "[sic]", a citation, "Section [t1] of the contract" --
+# is never read as a reference; and only `t` followed by digits.
 _LINE_TAG_RE = re.compile(
-    r"\s*\[\s*(t\d+(?:\s*(?:,|and|&)\s*t\d+)*)\s*\]\s*$", re.IGNORECASE)
+    r"\s*\[\s*(t\d+(?:\s*(?:,|and|&)\s*t\d+)*)\s*\](?=\s*(?:\||$))", re.IGNORECASE)
 
 
 def _line_refs(line):
-    """(line without its tag, [refs]) -- the refs lowercased, unique, in order."""
-    m = _LINE_TAG_RE.search(line)
-    if not m:
-        return line, []
+    """(line without its tags, [refs]) -- the refs lowercased, unique, in order."""
     refs = []
-    for ref in _REF_RE.findall(m.group(1)):
-        ref = ref.lower()
-        if ref not in refs:
-            refs.append(ref)
-    return line[:m.start()].rstrip(), refs
+    for m in _LINE_TAG_RE.finditer(line):
+        for ref in _REF_RE.findall(m.group(1)):
+            ref = ref.lower()
+            if ref not in refs:
+                refs.append(ref)
+    if not refs:
+        return line, []
+    return _LINE_TAG_RE.sub("", line).rstrip(), refs
 
 
 def _covers_refs(line):
@@ -541,7 +741,9 @@ def _prose_sections(text):
                              "covers": [], "line_refs": []}
     for raw in (text or "").splitlines():
         line = raw.rstrip()
-        if line.startswith("#"):
+        # A table whose first column is "#" (`# | Action | Owner`) is a header
+        # row, not a heading: read as one it split the table off its section.
+        if line.startswith("#") and not line.lstrip("#").strip().startswith("|"):
             if current["title"] or current["paragraphs"]:
                 sections.append(current)
             # THE DEPTH IS PART OF THE HEADING and used to be thrown away with
@@ -640,11 +842,21 @@ def _generate_document(artifact, context=None):
     # THE PHOTOGRAPHS ARE FETCHED BEFORE THE PROMPT IS BUILT, because the
     # prompt tells the model how many each topic has, and that number has to
     # have bytes behind it.
-    photo_budget = [MAX_PHOTO_BYTES_TOTAL]
+    photo_budget = [MAX_PHOTO_BYTES_TOTAL, MAX_PHOTOS_PER_REPORT]
     topic_offer, photo_streams = _offered_topics(artifact, photo_budget, win_from, win_to)
 
+    # REPORT DETAILS AND WEATHER ARE OURS. Those sections leave the plan the
+    # model sees and are written from the facts we hold (report_facts.py);
+    # built now, before the model call, so a slow weather fetch spends the
+    # read budget rather than the render reserve.
+    model_template, code_placements = report_facts.split_plan(template)
+    code_sections, code_meta = report_facts.build(
+        code_placements, artifact, client, S3_BUCKET, nz_time.nz_today().isoformat(),
+        span=report_facts.recorded_span([t.get("time_range") for t in topic_offer],
+                                        [t.get("at") for t in turns]))
+
     prompt = report_template.render_prompt(
-        template,
+        model_template,
         {"folder": artifact["folder"], "date": date,
          "from": window.get("from") or "00:00", "to": window.get("to") or "23:59",
          "recordings": len(picked)},
@@ -668,12 +880,31 @@ def _generate_document(artifact, context=None):
         raise RuntimeError(err or "empty answer from model")
 
     prose = _prose_sections(text)
+    # CHECKLISTS ARE REBUILT HERE, before anything counts the answer: only rows
+    # whose evidence is in the transcript survive, in the customer's order and
+    # wording, and every item nobody addressed stays blank (checklist.py).
+    checklist_reports = checklist.apply(
+        prose, template, "\n".join(t["line"] for t in turns))
+    model_copies = report_facts.drop_model_copies(prose, code_placements)
+    unanchored = _unanchored(prose, skip_titles=list(checklist_reports))
+    if unanchored:
+        logger.info("record: %d line(s) name no topic", len(unanchored))
     # Counted here, after the answer and outside it -- see _coverage_note.
     note = _coverage_note(topic_offer, prose)
     named = _referenced(prose)
     not_referenced = [t for t in topic_offer if t["ref"] not in named]
-    at_line, at_section, orphaned = _place_photos(prose + ([note] if note else []),
-                                                  photo_streams)
+    at_line, at_section, orphaned = _place_photos(
+        prose + ([note] if note else []), photo_streams,
+        no_photos=_summary_titles(template),
+        captions={t["ref"]: ("%s (%s)" % (t.get("title") or "Untitled", t.get("time_range"))
+                             if t.get("time_range") else (t.get("title") or "Untitled"))
+                  for t in topic_offer},
+        # Where each photograph was taken, by the day's location markers --
+        # the same stays the binding used (photo_binding.place_at).
+        places={t["ref"]: [photo_binding.place_at(
+                    (artifact.get("reportFacts") or {}).get("locations") or [],
+                    photo_binding.photo_hhmm(n)) for n in t.get("photo_names") or []]
+                for t in topic_offer})
     placed = at_line + at_section
     if topic_offer:
         logger.info("coverage: %d topics offered, %d referenced, not referenced: %s",
@@ -689,9 +920,28 @@ def _generate_document(artifact, context=None):
                     sum(len(v) for v in photo_streams.values()),
                     at_line, at_section, orphaned)
 
+    # PAST THE LIMIT, THE REPORT SAYS SO (owner, 2026-10-01): written by us,
+    # at the end, so a reader knows the day had more photographs than the
+    # document carries. No link: a customer document carries no app URL.
+    left_out = sum(t.get("photos_left_out") or 0 for t in topic_offer)
+    if left_out:
+        included = sum(t.get("photos") or 0 for t in topic_offer)
+        line = ("Photographs: %d taken in this window; %d included in this report."
+                % (included + left_out, included))
+        tail = note if note else prose[-1]
+        tail["paragraphs"] = list(tail.get("paragraphs") or []) + [line]
+        tail["line_refs"] = list(tail.get("line_refs") or []) + [[]]
+
+    # Put in after the photographs were placed, so none can fall to them.
+    report_facts.insert(prose, code_placements, code_sections,
+                        (template.get("catch_all") or {}).get("title"))
+
     buf = lambda_meeting_minutes.generate_prose_document(
         artifact.get("title") or gen.get("templateName") or template.get("name") or "Report",
-        "%s  %s - %s" % (date, window.get("from") or "00:00", window.get("to") or "23:59"),
+        # The date only (owner, 2026-10-01): the window asked for is mostly
+        # "everything", 00:00 - 23:59, which says nothing; when there is a
+        # Report Details section it carries what was actually recorded.
+        date,
         prose,
         _action_items_for_prompt(content),
         closing=note)
@@ -724,10 +974,26 @@ def _generate_document(artifact, context=None):
             "photosUnderALine": at_line,
             "photosUnderASection": at_section,
             "photosUnplaced": orphaned,
+            "photosLeftOut": sum(t.get("photos_left_out") or 0 for t in topic_offer),
+            # The size the count called for (report_photos), and how many the
+            # person chose to leave out of the day's reports.
+            "photoEdge": PLAN_STATS.get("edge"),
+            "photosExcludedByChoice": len(PLAN_STATS.get("excluded") or ()),
             # What the coverage note was built from. `topicsNotReferenced` is
             # exactly what the note printed; it is here because the note is in
             # a Word file and this is not.
             "topicsOffered": len(topic_offer),
+            # Per checklist: items, answered, dropped (with why), and the
+            # evidence each answer stood on -- the audit trail the Word file
+            # does not carry.
+            "checklists": checklist_reports,
+            # Which sections we wrote, and where each site's weather came
+            # from: the nightly record, computed here, or none.
+            "codeFilled": code_meta,
+            "modelCopiesDropped": model_copies,
+            # Lines that report no topic of the record -- watched, not yet
+            # acted on (see _unanchored).
+            "linesWithoutATopic": unanchored,
             "topicsNotReferenced": [{"ref": t["ref"], "title": t.get("title"),
                                      "time_range": t.get("time_range")}
                                     for t in not_referenced]}

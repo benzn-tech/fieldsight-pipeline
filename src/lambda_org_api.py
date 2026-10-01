@@ -136,6 +136,9 @@ import recording_blocks
 import report_download_name
 import report_sections
 import report_template
+import report_modules
+import report_photos
+import photo_binding
 import session_scope
 import sweep_state
 from db.connection import get_connection
@@ -373,6 +376,7 @@ def parse_body(event):
 
 REPUBLISH_SITE_COORDS_TASK = "republish_site_coords"
 COLLAPSE_PHOTOS_TASK = "collapse_multibound_photos"
+REBIND_DAY_TASK = "rebind_day_photos"
 
 
 def lambda_handler(event, context):
@@ -386,6 +390,15 @@ def lambda_handler(event, context):
     # OPERATOR TASK, invoked by hand with `aws lambda invoke` (IAM decides who
     # may). The same envelope rule as above keeps it out of reach of the API.
     # A dry run unless "apply" is exactly true: a typo must not write.
+    # Same envelope rule, same dry-run default. One day, under today's binding
+    # rules -- for after a rule change (photo_collapse.rebind_one_day).
+    if isinstance(event, dict) and event.get("task") == REBIND_DAY_TASK:
+        import photo_collapse
+        if not event.get("folder") or not event.get("date"):
+            return {"error": "folder and date are required"}
+        with get_connection() as conn:
+            return photo_collapse.rebind_one_day(conn, s3(), LAKE_BUCKET, event["folder"],
+                                                 event["date"], apply=event.get("apply") is True)
     if isinstance(event, dict) and event.get("task") == COLLAPSE_PHOTOS_TASK:
         import photo_collapse
         with get_connection() as conn:
@@ -617,6 +630,8 @@ def dispatch(conn, event, method, route):
         return list_report_templates(conn, caller, event)
     if route == "/templates" and method == "POST":
         return create_report_template(conn, caller, event)
+    if route == "/templates/modules" and method == "GET":
+        return list_report_modules(conn, caller, event)
     if route == "/templates/bindings" and method == "GET":
         return list_report_template_bindings(conn, caller, event)
     m_tb = re.match(r"^/templates/bindings/([^/]+)$", route)
@@ -760,6 +775,13 @@ def dispatch(conn, event, method, route):
     m_drs = re.match(r"^/days/([^/]+)/report/status$", route)
     if m_drs and method == "GET":
         return day_report_status(conn, caller, m_drs.group(1), event)
+    if route == "/photos/notice" and method == "GET":
+        return get_photo_notice(conn, caller, event)
+    m_dps = re.match(r"^/days/([^/]+)/photos/selection$", route)
+    if m_dps and method == "GET":
+        return get_photo_selection(conn, caller, m_dps.group(1), event)
+    if m_dps and method == "PUT":
+        return put_photo_selection(conn, caller, m_dps.group(1), event)
 
     m_sm = re.match(r"^/sessions/([^/]+)/speaker-match$", route)
     if m_sm and method == "POST":
@@ -1625,7 +1647,9 @@ def session_report_generate(conn, caller, session_id, event):
         **({"generate": generate,
             "window": {"from": (body.get("from") or "00:00"), "to": (body.get("to") or "23:59")},
             "excludedTopics": _excluded_topics_for(
-                conn, caller, folder, date, session_id=session_id)} if generate else {}),
+                conn, caller, folder, date, session_id=session_id),
+            "reportFacts": _report_facts(conn, caller["company_id"], folder,
+                                         [content.get("siteId")], date)} if generate else {}),
     }
     # Lake bucket (like the reindex_requests/ chain): org-api is in-VPC and hands
     # off to the non-VPC session-report worker via an S3 request artifact (BUG-36).
@@ -1693,6 +1717,7 @@ def _assemble_day_report(conn, caller, date, event, selected=None):
         "folder": folder,
         "title": f"{date} · {', '.join(site_names)}" if site_names else date,
         "siteNames": site_names,
+        "siteIds": sorted({str(r["site_id"]) for r in rows if r.get("site_id")}),
         "startedAt": min(starts) if starts else None,
         "participants": _session_participants(rows),
         "topics": topics_out,
@@ -1703,6 +1728,41 @@ def _assemble_day_report(conn, caller, date, event, selected=None):
 
 
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def _report_facts(conn, company_id, folder, site_ids, date=None):
+    """What a generated report's details and weather sections are written from
+    (report_facts.py in the worker, which cannot reach Aurora): each site's
+    name, client and coordinates, and the recorder's name. A site of another
+    company is left out rather than trusted -- the ids come from topic rows,
+    and a merged meeting can span devices."""
+    def num(v):
+        return float(v) if v is not None else None
+    out = []
+    for sid in sorted({str(s) for s in site_ids or [] if s}):
+        row = sites.get_site(conn, sid)
+        if not row or str(row.get("company_id")) != str(company_id):
+            continue
+        out.append({"id": sid, "name": row.get("name"), "client": row.get("client"),
+                    "latitude": num(row.get("latitude")), "longitude": num(row.get("longitude"))})
+    user = users.get_by_folder_name(conn, company_id, folder) or {}
+    name = " ".join((p or "").strip() for p in (user.get("first_name"), user.get("last_name"))
+                    if (p or "").strip())
+    facts = {"sites": out, "recordedBy": name or None}
+    if date:
+        # The day's location markers, so the worker can put each photograph in
+        # the line naming where it was taken (lambda_session_report._place_photos).
+        # Optional: in a savepoint and fail-open, so a report is never refused
+        # for want of them.
+        try:
+            with conn.transaction():
+                marks = location_markers.for_day(conn, company_id, folder, date)
+            facts["locations"] = [{"at": m.get("at"), "location": m.get("location")}
+                                  for m in marks]
+        except Exception:
+            logger.warning("report facts: location markers unreadable for %s/%s",
+                           folder, date, exc_info=True)
+    return facts
 
 
 def _generation_request(body, deliver=None, conn=None, caller=None):
@@ -1896,7 +1956,9 @@ def day_report_generate(conn, caller, date, event):
         "resultKey": result_key,
         **({"generate": generate,
             "window": {"from": (body.get("from") or "00:00"), "to": (body.get("to") or "23:59")},
-            "excludedTopics": _excluded_topics_for(conn, caller, folder, date)} if generate else {}),
+            "excludedTopics": _excluded_topics_for(conn, caller, folder, date),
+            "reportFacts": _report_facts(conn, caller["company_id"], folder,
+                                         content.get("siteIds"), date)} if generate else {}),
     }
     s3().put_object(Bucket=LAKE_BUCKET, Key=request_key,
                     Body=json.dumps(artifact, default=str),
@@ -3119,6 +3181,137 @@ def _any_session_removed(session_ids, folders, date):
         if any(_is_removed_spelling(sid, removed) for sid in session_ids):
             return True
     return False
+
+
+# ---- the day's report photographs: which to leave out ----------------------------
+#
+# Owner, 2026-10-01: up to 60 photographs go into a report at page size, up to
+# 120 shrunk automatically; past 120 the person chooses what to leave out
+# (report_photos). The choice is kept for the day in S3, where both report
+# paths read it -- the nightly generator runs outside the VPC.
+
+_SELECTION_WRITE_ROLES = ("admin", "gm", "platform_admin")
+
+
+def _photo_selection_folder(conn, caller, date, event, write=False):
+    """(folder, None) or (None, error). Reading follows the media rule; choosing
+    is for the person who took them, or a company admin -- the photographs are
+    withheld from site-scoped callers on someone else's day (CRITICAL-1), so
+    they cannot be the ones to choose among them."""
+    if not date or not REPORT_DATE_RE.match(date):
+        return None, error("date required (YYYY-MM-DD)", 400)
+    user = ((event.get("queryStringParameters") or {}).get("user") or "").strip()
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="photos")
+    if err is not None:
+        return None, err
+    own = folder == scope.visible_scope(conn, caller).get("self_folder")
+    if not own and caller.get("global_role") not in _SELECTION_WRITE_ROLES:
+        return None, error("only the person who took the photographs, or an admin, "
+                           "can choose which go into the day's reports", 403)
+    return folder, None
+
+
+def _photo_selection_body(conn, caller, folder, date, excluded):
+    photos = _day_photo_block(conn, caller, folder, date) or []
+    try:
+        with conn.transaction():
+            markers = location_markers.for_day(
+                conn, None if is_cross_company(caller["global_role"]) else caller["company_id"],
+                folder, date)
+    except Exception:
+        logger.warning("photo selection: markers unreadable for %s/%s", folder, date, exc_info=True)
+        markers = []
+    items = []
+    for p in photos:
+        name = p["s3_key"].rsplit("/", 1)[-1]
+        hhmm = photo_binding.photo_hhmm(name)
+        items.append({"filename": name, "time": hhmm,
+                      "place": photo_binding.place_at(markers, hhmm),
+                      "excluded": name in excluded,
+                      "url": s3().generate_presigned_url(
+                          "get_object", Params={"Bucket": LAKE_BUCKET, "Key": p["s3_key"]},
+                          ExpiresIn=PRESIGNED_URL_EXPIRY)})
+    included = sum(1 for i in items if not i["excluded"])
+    return {"date": date, "folder": folder, "photos": items,
+            "limits": {"pageSize": report_photos.STANDARD_LIMIT, "max": report_photos.MAX_LIMIT},
+            "included": included,
+            "shrunk": included > report_photos.STANDARD_LIMIT,
+            "mustChoose": included > report_photos.MAX_LIMIT}
+
+
+def get_photo_selection(conn, caller, date, event):
+    """GET /api/org/days/{date}/photos/selection?user= -- the day's photographs,
+    which are left out of its reports, and whether a choice is needed."""
+    folder, err = _photo_selection_folder(conn, caller, date, event)
+    if err is not None:
+        return err
+    excluded = report_photos.read_excluded(s3(), LAKE_BUCKET, folder, date)
+    return ok(_photo_selection_body(conn, caller, folder, date, excluded))
+
+
+# A heads-up before the size changes, then a call to choose (owner, 2026-10-01).
+PHOTO_NOTICE_AT = 50
+
+
+def get_photo_notice(conn, caller, event):
+    """GET /api/org/photos/notice -- for the bell: whether the CALLER's own
+    photographs today (or yesterday, before its nightly report) cross a line.
+
+    Only the person who took them is told (owner, 2026-10-01), so this reads
+    the caller's own folder and nothing else -- no `user` parameter. Levels:
+      approaching  50-60 today: past 60 they go in smaller
+      smaller      61-120 today: they go in smaller, all of them fit
+      choose       past 120 (today or yesterday): choose which to leave out
+    """
+    folder = scope.visible_scope(conn, caller).get("self_folder")
+    if not folder:
+        return ok({"notices": []})
+    today = nz_time.nz_today()
+    notices = []
+    for day, choose_only in ((today, False), (today - timedelta(days=1), True)):
+        date = day.isoformat()
+        photos = _day_photo_block(conn, caller, folder, date) or []
+        if len(photos) < PHOTO_NOTICE_AT and not choose_only:
+            continue
+        if not photos:
+            continue
+        excluded = report_photos.read_excluded(s3(), LAKE_BUCKET, folder, date)
+        included = sum(1 for p in photos if p["s3_key"].rsplit("/", 1)[-1] not in excluded)
+        if included > report_photos.MAX_LIMIT:
+            level = "choose"
+        elif choose_only:
+            continue
+        elif included > report_photos.STANDARD_LIMIT:
+            level = "smaller"
+        else:
+            level = "approaching"
+        notices.append({"date": date, "folder": folder, "count": len(photos),
+                        "included": included, "level": level})
+    return ok({"notices": notices,
+               "limits": {"pageSize": report_photos.STANDARD_LIMIT,
+                          "max": report_photos.MAX_LIMIT}})
+
+
+def put_photo_selection(conn, caller, date, event):
+    """PUT /api/org/days/{date}/photos/selection?user= {"excluded": [filename]} --
+    replaces the day's choice. Every name must be one of the day's photographs."""
+    folder, err = _photo_selection_folder(conn, caller, date, event, write=True)
+    if err is not None:
+        return err
+    body = parse_body(event)
+    if body is None or not isinstance(body.get("excluded"), list) or \
+            not all(isinstance(n, str) for n in body["excluded"]):
+        return error("excluded must be a list of filenames", 400)
+    day = {p["s3_key"].rsplit("/", 1)[-1] for p in (_day_photo_block(conn, caller, folder, date) or [])}
+    unknown = sorted(set(body["excluded"]) - day)
+    if unknown:
+        return error("not a photograph of this day: %s" % ", ".join(unknown[:5]), 400)
+    excluded = sorted(set(body["excluded"]))
+    s3().put_object(Bucket=LAKE_BUCKET, Key=report_photos.selection_key(folder, date),
+                    Body=json.dumps({"excluded": excluded, "updatedBy": str(caller["id"]),
+                                     "updatedAt": nz_time.nz_now().isoformat()}).encode(),
+                    ContentType="application/json")
+    return ok(_photo_selection_body(conn, caller, folder, date, set(excluded)))
 
 
 def day_report_status(conn, caller, date, event):
@@ -9692,6 +9885,9 @@ def create_report_template(conn, caller, event):
     company_id, err = _template_company(conn, caller, event)
     if err is not None:
         return err
+    tpl, why = report_modules.pin_modules(conn, company_id, tpl)
+    if why:
+        return error(why, 400)
     owner = None if scope == "org" else caller["id"]
     slug = report_template.slugify(name, "tpl-" + uuid.uuid4().hex[:8])
     try:
@@ -9756,6 +9952,22 @@ def list_report_template_versions(conn, caller, template_id):
                             for v in report_templates.list_versions(conn, template_id)]})
 
 
+def list_report_modules(conn, caller, event):
+    """GET /api/org/templates/modules -- the modules this company can pick.
+
+    Each is {key, title, kind, columns?, purpose, hash, source}: the company's
+    own version where we have written one ("company"), else ours ("standard").
+    The editor pins {key, hash} into a section; the save re-checks the pair
+    (report_modules.pin_modules), so this list is a menu, not an authority.
+    """
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    report_modules.sync_standard(conn)
+    return ok({"modules": report_modules.resolve_all(conn, company_id),
+               "note_max_chars": report_modules.MAX_NOTE_CHARS})
+
+
 def add_report_template_version(conn, caller, template_id, event):
     """POST /api/org/templates/{id}/versions -- the only way content changes."""
     body = parse_body(event)
@@ -9768,6 +9980,12 @@ def add_report_template_version(conn, caller, template_id, event):
     err = _may_write_template(caller, row)
     if err is not None:
         return err
+    # Module sections get their published text, by the TEMPLATE's company --
+    # a platform_admin editing another company's template must be checked
+    # against that company's modules, not the operator's own.
+    tpl, why = report_modules.pin_modules(conn, row["company_id"], tpl)
+    if why:
+        return error(why, 400)
     note = body.get("change_note")
     if note is not None and not isinstance(note, str):
         return error("change_note must be a string", 400)

@@ -55,7 +55,11 @@ def day(monkeypatch):
     monkeypatch.setattr(org.users, "get_user_by_sub",
                         lambda conn, sub: dict(CALLER) if sub == "sub-1" else None)
     monkeypatch.setattr(org.users, "get_by_folder_name",
-                        lambda conn, cid, folder: {"id": "u-2", "folder_name": folder})
+                        lambda conn, cid, folder: {"id": "u-2", "folder_name": folder,
+                                                   "first_name": "Ada", "last_name": "L "})
+    monkeypatch.setattr(org.sites, "get_site", lambda conn, sid: {
+        "id": sid, "company_id": "c-uuid-1", "name": "UC PK", "client": "Naylor Love",
+        "latitude": -43.52, "longitude": 172.58} if sid == SITE_ID else None)
     monkeypatch.setattr(org.redactions, "list_active_for_topics", lambda conn, ids: {})
     monkeypatch.setattr(org.redactions, "deleted_source_prefixes",
                         lambda conn, folder=None, date=None: [])
@@ -105,6 +109,24 @@ def test_a_named_template_reaches_the_worker_with_the_window(day_generate):
     gen = artifact["generate"]
     assert gen["templateId"] == "personal-meeting" and gen["templateVersion"] == 3
     assert artifact["window"] == {"from": "09:00", "to": "11:30"}
+
+
+def test_the_facts_for_the_details_and_weather_travel_with_the_request(day_generate):
+    """The worker cannot reach Aurora; a template's details and weather
+    sections are written from what org-api resolves here (report_facts.py)."""
+    artifact = json.loads(day_generate(_body())["Body"])
+    assert artifact["reportFacts"] == {
+        "sites": [{"id": SITE_ID, "name": "UC PK", "client": "Naylor Love",
+                   "latitude": -43.52, "longitude": 172.58}],
+        "recordedBy": "Ada L"}
+
+
+def test_a_site_of_another_company_is_not_in_the_facts(day, monkeypatch):
+    monkeypatch.setattr(org.sites, "get_site", lambda conn, sid: {
+        "id": sid, "company_id": "someone-else", "name": "Their site"})
+    res, puts = _generate_raw(day, _body())
+    assert res["statusCode"] == 202
+    assert json.loads(puts[0]["Body"])["reportFacts"]["sites"] == []
 
 
 def test_the_body_travels_with_the_request_not_just_its_name(day_generate):
@@ -299,3 +321,15 @@ def test_session_generate_with_email_delivery_is_refused_before_anything_is_enqu
     assert res["statusCode"] == 400
     assert "download" in json.loads(res["body"])["error"].lower()
     assert puts == [], "nothing may be enqueued for a template+email combination"
+
+
+def test_the_days_location_markers_travel_with_the_request(day, monkeypatch):
+    """So the worker can put each photograph in the line naming where it was
+    taken (owner, 2026-10-01)."""
+    monkeypatch.setattr(FakeConn, "transaction", lambda self: self, raising=False)
+    monkeypatch.setattr(org.location_markers, "for_day", lambda conn, cid, folder, date: [
+        {"at": "13:24", "location": "Ground floor", "quote": "Ground floor inspection."}])
+    res, puts = _generate_raw(day, _body())
+    assert res["statusCode"] == 202
+    assert json.loads(puts[0]["Body"])["reportFacts"]["locations"] == [
+        {"at": "13:24", "location": "Ground floor"}]
