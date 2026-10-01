@@ -801,9 +801,19 @@ def dispatch(conn, event, method, route):
     m_vr = re.match(r"^/voiceprints/([^/]+)/retry$", route)
     if m_vr and method == "POST":
         return retry_voiceprint(conn, caller, m_vr.group(1), event)
+    # Merge routes carry a suffix and so cannot match the bare `{id}` pattern below; they sit
+    # above it anyway for the same reason as the retry route.
+    m_vmc = re.match(r"^/voiceprints/([^/]+)/merge-check$", route)
+    if m_vmc and method == "GET":
+        return merge_check_voiceprint(conn, caller, m_vmc.group(1), event)
+    m_vm = re.match(r"^/voiceprints/([^/]+)/merge$", route)
+    if m_vm and method == "POST":
+        return merge_voiceprint(conn, caller, m_vm.group(1), event)
     m_vw = re.match(r"^/voiceprints/([^/]+)$", route)
     if m_vw and method == "DELETE":
         return withdraw_voiceprint(conn, caller, m_vw.group(1))
+    if m_vw and method == "PATCH":
+        return rename_voiceprint(conn, caller, m_vw.group(1), event)
     m_rg = re.match(r"^/sessions/([^/]+)/regenerate$", route)
     if m_rg and method == "POST":
         return regenerate_session(conn, caller, m_rg.group(1), event)
@@ -2134,11 +2144,29 @@ def list_voiceprints(conn, caller):
         "lastAttemptAt": r.get("last_attempt_at"),
         "lastAttemptOutcome": r.get("last_attempt_outcome"),
         "lastAttemptDetail": r.get("last_attempt_detail"),
+        # Identity (spec 2026-10-01): what lets a person tell two "Ben Lin"s apart. Plain
+        # values only -- no similarity score ever reaches a customer.
+        "linkedAccount": ({"name": r.get("linked_name"), "email": r.get("linked_email")}
+                          if r.get("user_id") else None),
+        "heardOn": list(r.get("heard_on") or [])[:3],
+        "firstNamed": {"at": _iso_day(r.get("first_named_at") or r.get("created_at")),
+                       "by": r.get("first_named_by")},
+        "employer": r.get("employer_name"),
+        "mergedInto": ({"id": str(r["merged_into"]),
+                        "displayName": r.get("merged_into_name")}
+                       if r.get("merged_into") else None),
         # Only a refused row pays for the lookup (a transcript read). Everything else is
         # null: there is nothing to try again.
         "retry": (_retry_passage(conn, company_id, r)
                   if r.get("last_attempt_outcome") == "refused" else None),
     } for r in rows]})
+
+
+def _iso_day(value):
+    """A timestamp as an ISO date string, or None. Tolerates a string (test doubles)."""
+    if not value:
+        return None
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
 
 
 def _retry_passage(conn, company_id, profile):
@@ -2455,6 +2483,138 @@ def withdraw_voiceprint(conn, caller, voiceprint_id):
     removed = voiceprints.withdraw(conn, str(caller["company_id"]), voiceprint_id)
     logger.info("voiceprint withdrawn: %s (%d samples)", voiceprint_id, len(removed))
     return ok({"voiceprintId": voiceprint_id, "samplesRemoved": len(removed)})
+
+
+# Customer-facing, plain words, no numbers (spec 2026-10-01).
+_MERGE_MESSAGES = {
+    "alike": "These sound like the same person.",
+    "unsure": ("These may be the same person \u2014 recordings from different devices "
+               "can sound different."),
+}
+
+
+def _merge_message(verdict, target_name):
+    if verdict == "different":
+        return (f"These two voices sound different. Merging them could make "
+                f"{target_name or 'this person'} harder to recognise. Only merge if you are "
+                f"sure it is the same person.")
+    return _MERGE_MESSAGES[verdict]
+
+
+class _MergeFailed(Exception):
+    """Unwinds the merge transaction; carries the response to return afterwards."""
+
+    def __init__(self, response):
+        super().__init__(response.get("statusCode"))
+        self.response = response
+
+
+def _merge_pair(conn, caller, source_id, target_id):
+    """Shared gate for merge-check and merge: mode, role, shapes, both live in the caller's
+    company. Returns `(company_id, source, target, None)` or `(None, None, None, response)`.
+
+    A profile from another tenant and one that does not exist are both 404 -- telling them
+    apart would confirm the existence of another company's row.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return None, None, None, error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return None, None, None, error(
+            "admin, gm, pm, site_manager or platform_admin role required", 403)
+    if not _UUID_RE.match(str(source_id or "")):
+        return None, None, None, error("not found", 404)
+    if not _UUID_RE.match(str(target_id or "")):
+        return None, None, None, error("into must be a voiceprint id", 400)
+    if str(source_id).lower() == str(target_id).lower():
+        return None, None, None, error("a voice cannot be merged into itself", 400)
+    company_id = str(caller["company_id"])
+    source = voiceprints.get_profile(conn, company_id, source_id)
+    target = voiceprints.get_profile(conn, company_id, target_id)
+    if (source is None or source.get("status") == "withdrawn"
+            or target is None or target.get("status") == "withdrawn"):
+        return None, None, None, error("not found", 404)
+    return company_id, source, target, None
+
+
+def merge_check_voiceprint(conn, caller, voiceprint_id, event):
+    """GET /api/org/voiceprints/{id}/merge-check?into={target} — do these sound alike?
+
+    Advice for a person who is about to decide, in plain words. The similarity behind it is
+    deliberately not in the response: a number invites a threshold of the reader's own, and
+    the labelled set it was calibrated on is small. Writes nothing.
+    """
+    into = ((event.get("queryStringParameters") or {}).get("into") or "").strip()
+    company_id, source, target, bad = _merge_pair(conn, caller, voiceprint_id, into)
+    if bad:
+        return bad
+    check = voiceprints.merge_check(conn, company_id, voiceprint_id, into)
+    return ok({"verdict": check["verdict"],
+               "message": _merge_message(check["verdict"], target.get("display_name"))})
+
+
+def merge_voiceprint(conn, caller, voiceprint_id, event):
+    """POST /api/org/voiceprints/{id}/merge {into, confirm} — fold this profile into another.
+
+    Two voices that sound different are refused with a 409 unless `confirm` is exactly true:
+    merging them would make the target harder to recognise for everyone, and it is the one
+    step here that cannot be cleanly undone (the samples move).
+
+    ONE transaction. `lambda_handler` opens the connection with `with get_connection() as
+    conn`, which COMMITS on a clean exit -- so a `return error()` from inside the block would
+    commit whatever ran before it. Failure therefore raises out of `conn.transaction()` (a
+    savepoint) to roll it back, and the response is built after the unwind.
+    """
+    body = parse_body(event)
+    if body is None:
+        return error("invalid JSON body", 400)
+    into = str(body.get("into") or "").strip()
+    company_id, source, target, bad = _merge_pair(conn, caller, voiceprint_id, into)
+    if bad:
+        return bad
+    try:
+        with conn.transaction():
+            check = voiceprints.merge_check(conn, company_id, voiceprint_id, into)
+            if check["verdict"] == "different" and body.get("confirm") is not True:
+                raise _MergeFailed(error(
+                    _merge_message("different", target.get("display_name")), 409,
+                    {"verdict": "different"}))
+            try:
+                result = voiceprints.merge_profiles(
+                    conn, company_id, voiceprint_id, into, caller["id"])
+            except voiceprints.MergeRefused:
+                raise _MergeFailed(error("not found", 404))
+    except _MergeFailed as exc:
+        return exc.response
+    logger.info("voiceprint merged: %s -> %s (%s)", voiceprint_id, into, result)
+    return ok({"mergedInto": into, "samplesMoved": result["samplesMoved"],
+               "samplesDropped": result["samplesDropped"]})
+
+
+def rename_voiceprint(conn, caller, voiceprint_id, event):
+    """PATCH /api/org/voiceprints/{id} {displayName} — so two real Ben Lins can be told apart.
+
+    Updates the profile and the name on the turns it justified, by `voiceprint_id` only, in
+    one transaction. Trimmed, 1-80 characters.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    if not _UUID_RE.match(str(voiceprint_id or "")):
+        return error("not found", 404)
+    body = parse_body(event)
+    if body is None:
+        return error("invalid JSON body", 400)
+    name = body.get("displayName")
+    name = name.strip() if isinstance(name, str) else ""
+    if not 1 <= len(name) <= 80:
+        return error("displayName must be 1 to 80 characters", 400)
+    company_id = str(caller["company_id"])
+    with conn.transaction():
+        found = voiceprints.rename_profile(conn, company_id, voiceprint_id, name)
+    if not found:
+        return error("not found", 404)
+    return ok({"voiceprintId": voiceprint_id, "displayName": name})
 
 
 def company_voiceprint_basis(conn, caller, event):
