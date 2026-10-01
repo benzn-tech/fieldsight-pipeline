@@ -654,7 +654,7 @@ def locate_session(conn, company_id, session_base):
     cur = conn.cursor(row_factory=dict_row)
     row = cur.execute(
         "SELECT s3_key FROM recordings "
-        "WHERE company_id = %s AND s3_key LIKE %s ESCAPE '\' "
+        "WHERE company_id = %s AND s3_key LIKE %s ESCAPE '\\' "
         "ORDER BY created_at DESC LIMIT 1",
         (company_id, f"users/%/%/%/%{session_base}%")).fetchone()
     if row:
