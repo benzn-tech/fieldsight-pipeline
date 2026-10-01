@@ -2385,6 +2385,9 @@ Resources:
                     # release yet answers AccessDenied instead of NoSuchKey, and the route
                     # reports it -- correctly -- as 503 rather than "no update".
                     - "app-releases/*"
+                    # Most days have no photo selection: reading one must be a
+                    # 404 (nothing left out), not a 403.
+                    - report_photo_selection/*
             - Effect: Allow
               # In-app updates: the release manifest (app-releases/latest.json) and the APKs it
               # names, which GET /api/org/app/latest presigns for signed-in devices. Read only;
@@ -2472,6 +2475,14 @@ Resources:
               # only: the generator reads the request, org-api never does.
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/report_requests/*
+            - Effect: Allow
+              # GET/PUT /api/org/days/{date}/photos/selection: the person's choice
+              # of photographs to leave out of the day's reports (report_photos),
+              # read back by both report paths.
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/report_photo_selection/*
             # A speaker correction, handed OUTWARD across the VPC boundary the same way.
             # Write only, and no grant on voiceprint_results/: those go to the in-VPC
             # writer by direct invoke from the embedder, and a read grant here would be an

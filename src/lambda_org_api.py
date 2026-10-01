@@ -137,6 +137,8 @@ import report_download_name
 import report_sections
 import report_template
 import report_modules
+import report_photos
+import photo_binding
 import session_scope
 import sweep_state
 from db.connection import get_connection
@@ -773,6 +775,11 @@ def dispatch(conn, event, method, route):
     m_drs = re.match(r"^/days/([^/]+)/report/status$", route)
     if m_drs and method == "GET":
         return day_report_status(conn, caller, m_drs.group(1), event)
+    m_dps = re.match(r"^/days/([^/]+)/photos/selection$", route)
+    if m_dps and method == "GET":
+        return get_photo_selection(conn, caller, m_dps.group(1), event)
+    if m_dps and method == "PUT":
+        return put_photo_selection(conn, caller, m_dps.group(1), event)
 
     m_sm = re.match(r"^/sessions/([^/]+)/speaker-match$", route)
     if m_sm and method == "POST":
@@ -3172,6 +3179,94 @@ def _any_session_removed(session_ids, folders, date):
         if any(_is_removed_spelling(sid, removed) for sid in session_ids):
             return True
     return False
+
+
+# ---- the day's report photographs: which to leave out ----------------------------
+#
+# Owner, 2026-10-01: up to 60 photographs go into a report at page size, up to
+# 120 shrunk automatically; past 120 the person chooses what to leave out
+# (report_photos). The choice is kept for the day in S3, where both report
+# paths read it -- the nightly generator runs outside the VPC.
+
+_SELECTION_WRITE_ROLES = ("admin", "gm", "platform_admin")
+
+
+def _photo_selection_folder(conn, caller, date, event, write=False):
+    """(folder, None) or (None, error). Reading follows the media rule; choosing
+    is for the person who took them, or a company admin -- the photographs are
+    withheld from site-scoped callers on someone else's day (CRITICAL-1), so
+    they cannot be the ones to choose among them."""
+    if not date or not REPORT_DATE_RE.match(date):
+        return None, error("date required (YYYY-MM-DD)", 400)
+    user = ((event.get("queryStringParameters") or {}).get("user") or "").strip()
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="photos")
+    if err is not None:
+        return None, err
+    own = folder == scope.visible_scope(conn, caller).get("self_folder")
+    if not own and caller.get("global_role") not in _SELECTION_WRITE_ROLES:
+        return None, error("only the person who took the photographs, or an admin, "
+                           "can choose which go into the day's reports", 403)
+    return folder, None
+
+
+def _photo_selection_body(conn, caller, folder, date, excluded):
+    photos = _day_photo_block(conn, caller, folder, date) or []
+    try:
+        with conn.transaction():
+            markers = location_markers.for_day(
+                conn, None if is_cross_company(caller["global_role"]) else caller["company_id"],
+                folder, date)
+    except Exception:
+        logger.warning("photo selection: markers unreadable for %s/%s", folder, date, exc_info=True)
+        markers = []
+    items = []
+    for p in photos:
+        name = p["s3_key"].rsplit("/", 1)[-1]
+        hhmm = photo_binding.photo_hhmm(name)
+        items.append({"filename": name, "time": hhmm,
+                      "place": photo_binding.place_at(markers, hhmm),
+                      "excluded": name in excluded,
+                      "url": s3().generate_presigned_url(
+                          "get_object", Params={"Bucket": LAKE_BUCKET, "Key": p["s3_key"]},
+                          ExpiresIn=PRESIGNED_URL_EXPIRY)})
+    included = sum(1 for i in items if not i["excluded"])
+    return {"date": date, "folder": folder, "photos": items,
+            "limits": {"pageSize": report_photos.STANDARD_LIMIT, "max": report_photos.MAX_LIMIT},
+            "included": included,
+            "shrunk": included > report_photos.STANDARD_LIMIT,
+            "mustChoose": included > report_photos.MAX_LIMIT}
+
+
+def get_photo_selection(conn, caller, date, event):
+    """GET /api/org/days/{date}/photos/selection?user= -- the day's photographs,
+    which are left out of its reports, and whether a choice is needed."""
+    folder, err = _photo_selection_folder(conn, caller, date, event)
+    if err is not None:
+        return err
+    excluded = report_photos.read_excluded(s3(), LAKE_BUCKET, folder, date)
+    return ok(_photo_selection_body(conn, caller, folder, date, excluded))
+
+
+def put_photo_selection(conn, caller, date, event):
+    """PUT /api/org/days/{date}/photos/selection?user= {"excluded": [filename]} --
+    replaces the day's choice. Every name must be one of the day's photographs."""
+    folder, err = _photo_selection_folder(conn, caller, date, event, write=True)
+    if err is not None:
+        return err
+    body = parse_body(event)
+    if body is None or not isinstance(body.get("excluded"), list) or \
+            not all(isinstance(n, str) for n in body["excluded"]):
+        return error("excluded must be a list of filenames", 400)
+    day = {p["s3_key"].rsplit("/", 1)[-1] for p in (_day_photo_block(conn, caller, folder, date) or [])}
+    unknown = sorted(set(body["excluded"]) - day)
+    if unknown:
+        return error("not a photograph of this day: %s" % ", ".join(unknown[:5]), 400)
+    excluded = sorted(set(body["excluded"]))
+    s3().put_object(Bucket=LAKE_BUCKET, Key=report_photos.selection_key(folder, date),
+                    Body=json.dumps({"excluded": excluded, "updatedBy": str(caller["id"]),
+                                     "updatedAt": nz_time.nz_now().isoformat()}).encode(),
+                    ContentType="application/json")
+    return ok(_photo_selection_body(conn, caller, folder, date, set(excluded)))
 
 
 def day_report_status(conn, caller, date, event):
