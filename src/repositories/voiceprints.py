@@ -97,13 +97,82 @@ def _require_company(company_id):
     return company_id
 
 
+_SET_EMPLOYER_SQL = (
+    "UPDATE speaker_voiceprints "
+    "SET employer_name = %s, employer_source = %s, "
+    "    employer_set_by = %s, employer_set_at = now() "
+    "WHERE id = %s")
+
+
+def find_existing_profile(conn_or_cur, company_id, display_name, user_id=None, anchor=None,
+                          external_ref=None, external_source=None) -> dict | None:
+    """The live profile `upsert_profile` would reuse for this name, or None. Reads only.
+
+    The one copy of the lookup. `upsert_profile` calls it, and so does the naming chooser
+    (`GET /voiceprints/same-name`, spec 2026-10-01) to say what a name would attach to
+    BEFORE anything is written -- two copies would drift, and the chooser would then promise
+    a profile the correction does not use. `anchor` is `consented_by or asserted_by`: who
+    vouched, for the (name, whoever vouched) fallback. Takes a connection or a cursor; the
+    statements and their order are what the positional test doubles line up on.
+    """
+    cur = (conn_or_cur.cursor(row_factory=dict_row)
+           if hasattr(conn_or_cur, "cursor") else conn_or_cur)
+    if external_ref:
+        # The site sign-in identity, and the first key tried because it is the one the
+        # site actually runs on. A subcontractor signs in at company A's sites under the
+        # same id whether or not they will ever hold a FieldSight account, which is the
+        # population display names were failing.
+        #
+        # Company-scoped, and that is the load-bearing part rather than a detail: the
+        # SAME external id under two companies is two independent profiles, because a
+        # voiceprint built under A's induction has no basis under B.
+        found = cur.execute(
+            "SELECT id FROM speaker_voiceprints "
+            "WHERE company_id = %s AND external_source = %s AND external_ref = %s "
+            "  AND status <> 'withdrawn' "
+            "ORDER BY created_at LIMIT 1",
+            (company_id, external_source, external_ref)).fetchone()
+    elif user_id:
+        # The person's own linked profile first; failing that, an EMPTY unlinked
+        # profile of the same name, which the branch below then links. A name that
+        # resolved to nobody once (the namer was not on that person's roster) and to
+        # their account the next time otherwise produced two profiles for one person --
+        # TEST 2026-09-27: two "Sam Yu", one empty after a refused enrolment.
+        #
+        # EMPTY only. Two people who share a name must stay two profiles (see
+        # `test_a_resolved_person_is_keyed_on_their_identity`), and an unlinked profile
+        # that holds samples may be the other one -- adopting it would put a
+        # stranger's voice under this account. An empty one holds no voice to
+        # misattribute, so adopting it only removes a duplicate. One statement, so the
+        # tests' positional doubles stay aligned.
+        found = cur.execute(
+            "SELECT id FROM speaker_voiceprints "
+            "WHERE company_id = %s AND status <> 'withdrawn' "
+            "  AND (user_id = %s "
+            "       OR (user_id IS NULL AND external_ref IS NULL "
+            "           AND display_name = %s "
+            "           AND NOT EXISTS (SELECT 1 FROM speaker_voiceprint_samples s "
+            "                           WHERE s.voiceprint_id = speaker_voiceprints.id))) "
+            "ORDER BY (user_id IS NOT NULL) DESC, created_at LIMIT 1",
+            (company_id, user_id, display_name)).fetchone()
+    else:
+        found = cur.execute(
+            "SELECT id FROM speaker_voiceprints "
+            "WHERE company_id = %s AND display_name = %s AND user_id IS NULL "
+            "  AND coalesce(consented_by, asserted_by) = %s "
+            "  AND status <> 'withdrawn' "
+            "ORDER BY created_at LIMIT 1",
+            (company_id, display_name, anchor)).fetchone()
+    return found
+
+
 def upsert_profile(conn, company_id, display_name=None, user_id=None,
                    consent_given=False, consented_by=None,
                    linked_by=None, linked_on=None,
                    consent_basis=None, asserted_by=None,
                    external_ref=None, external_source=None,
                    employer_name=None, employer_source=None,
-                   employer_set_by=None) -> dict | None:
+                   employer_set_by=None, force_new=False) -> dict | None:
     """The profile a name attaches to. Existing one if there is one, otherwise a new row.
 
     **Consent is a precondition, not a checkbox** (§6, §10). A voiceprint is biometric
@@ -175,7 +244,9 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
             "a named voiceprint cannot be created without consent from the person whose "
             "voice it is (§6) — an unnamed profile may be created instead")
     cur = conn.cursor(row_factory=dict_row)
-    if display_name:
+    # `force_new` skips the lookup: the namer said "someone else with this name" after being
+    # shown the same-name profiles, so reusing one is exactly what must not happen.
+    if display_name and not force_new:
         # Matched on the PERSON, not on the string. Two real people in one company can share
         # a display name, and merging them stores one person's voice under the other's
         # consent with no way to tell afterwards which samples belong to whom.
@@ -198,53 +269,9 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
         # duplicate degrades into a REFUSAL, because the person becomes his own runner-up and
         # the margin declines to confirm, while a merge is a wrong confident answer about
         # somebody's biometric data.
-        if external_ref:
-            # The site sign-in identity, and the first key tried because it is the one the
-            # site actually runs on. A subcontractor signs in at company A's sites under the
-            # same id whether or not they will ever hold a FieldSight account, which is the
-            # population display names were failing.
-            #
-            # Company-scoped, and that is the load-bearing part rather than a detail: the
-            # SAME external id under two companies is two independent profiles, because a
-            # voiceprint built under A's induction has no basis under B.
-            found = cur.execute(
-                "SELECT id FROM speaker_voiceprints "
-                "WHERE company_id = %s AND external_source = %s AND external_ref = %s "
-                "  AND status <> 'withdrawn' "
-                "ORDER BY created_at LIMIT 1",
-                (company_id, external_source, external_ref)).fetchone()
-        elif user_id:
-            # The person's own linked profile first; failing that, an EMPTY unlinked
-            # profile of the same name, which the branch below then links. A name that
-            # resolved to nobody once (the namer was not on that person's roster) and to
-            # their account the next time otherwise produced two profiles for one person --
-            # TEST 2026-09-27: two "Sam Yu", one empty after a refused enrolment.
-            #
-            # EMPTY only. Two people who share a name must stay two profiles (see
-            # `test_a_resolved_person_is_keyed_on_their_identity`), and an unlinked profile
-            # that holds samples may be the other one -- adopting it would put a
-            # stranger's voice under this account. An empty one holds no voice to
-            # misattribute, so adopting it only removes a duplicate. One statement, so the
-            # tests' positional doubles stay aligned.
-            found = cur.execute(
-                "SELECT id FROM speaker_voiceprints "
-                "WHERE company_id = %s AND status <> 'withdrawn' "
-                "  AND (user_id = %s "
-                "       OR (user_id IS NULL AND external_ref IS NULL "
-                "           AND display_name = %s "
-                "           AND NOT EXISTS (SELECT 1 FROM speaker_voiceprint_samples s "
-                "                           WHERE s.voiceprint_id = speaker_voiceprints.id))) "
-                "ORDER BY (user_id IS NOT NULL) DESC, created_at LIMIT 1",
-                (company_id, user_id, display_name)).fetchone()
-        else:
-            anchor = consented_by or asserted_by
-            found = cur.execute(
-                "SELECT id FROM speaker_voiceprints "
-                "WHERE company_id = %s AND display_name = %s AND user_id IS NULL "
-                "  AND coalesce(consented_by, asserted_by) = %s "
-                "  AND status <> 'withdrawn' "
-                "ORDER BY created_at LIMIT 1",
-                (company_id, display_name, anchor)).fetchone()
+        found = find_existing_profile(cur, company_id, display_name, user_id,
+                                      consented_by or asserted_by,
+                                      external_ref, external_source)
         if found:
             # Link an EXISTING profile too, or the whole thing only works for profiles
             # created after this shipped — and every profile in the database predates it,
@@ -266,10 +293,7 @@ def upsert_profile(conn, company_id, display_name=None, user_id=None,
             # `employer_set_by` / `employer_set_at` exist to record that it happened.
             if employer_name is not None:
                 cur.execute(
-                    "UPDATE speaker_voiceprints "
-                    "SET employer_name = %s, employer_source = %s, "
-                    "    employer_set_by = %s, employer_set_at = now() "
-                    "WHERE id = %s",
+                    _SET_EMPLOYER_SQL,
                     (employer_name, employer_source, employer_set_by, found["id"]))
             return found
     return cur.execute(
@@ -1110,6 +1134,27 @@ def record_attempt(conn, company_id, voiceprint_id, outcome, detail=None) -> Non
         (outcome, detail, company_id, voiceprint_id))
 
 
+# The identity columns shared by `list_profiles` and `same_name_profiles` (spec 2026-10-01):
+# one copy, so the Voices page and the naming chooser describe a profile in the same words.
+# Both queries alias the profile as `p`, its linked account as `lu` and whoever named it as
+# `fu` (`LEFT JOIN users fu ON fu.id = COALESCE(p.asserted_by, p.consented_by)`).
+_IDENTITY_COLUMNS = (
+    "       lu.email AS linked_email, "
+    "       COALESCE(NULLIF(btrim(concat_ws(' ', lu.first_name, lu.last_name)), ''), "
+    "                lu.folder_name, lu.email) AS linked_name, "
+    "       COALESCE(NULLIF(btrim(concat_ws(' ', fu.first_name, fu.last_name)), ''), "
+    "                fu.folder_name, fu.email) AS first_named_by, "
+    "       p.created_at AS first_named_at, "
+    "       (SELECT COALESCE(array_agg(h.folder ORDER BY h.n DESC, h.folder), "
+    "                        ARRAY[]::text[]) "
+    "          FROM (SELECT split_part(hs.s3_key, '/', 2) AS folder, count(*) AS n "
+    "                  FROM speaker_voiceprint_samples hs "
+    "                 WHERE hs.company_id = p.company_id AND hs.voiceprint_id = p.id "
+    "                   AND hs.quarantined_at IS NULL AND hs.s3_key IS NOT NULL "
+    "                   AND split_part(hs.s3_key, '/', 2) <> '' "
+    "                 GROUP BY 1 ORDER BY n DESC, folder LIMIT 3) h) AS heard_on, ")
+
+
 def list_profiles(conn, company_id) -> list[dict]:
     """Every profile this company holds, with enough to explain each one's state.
 
@@ -1147,20 +1192,7 @@ def list_profiles(conn, company_id) -> list[dict]:
         "       p.linked_on, p.linked_at, p.created_at, p.employer_name, "
         "       p.last_attempt_at, p.last_attempt_outcome, p.last_attempt_detail, "
         "       p.merged_into, p.merged_at, mt.display_name AS merged_into_name, "
-        "       lu.email AS linked_email, "
-        "       COALESCE(NULLIF(btrim(concat_ws(' ', lu.first_name, lu.last_name)), ''), "
-        "                lu.folder_name, lu.email) AS linked_name, "
-        "       COALESCE(NULLIF(btrim(concat_ws(' ', fu.first_name, fu.last_name)), ''), "
-        "                fu.folder_name, fu.email) AS first_named_by, "
-        "       p.created_at AS first_named_at, "
-        "       (SELECT COALESCE(array_agg(h.folder ORDER BY h.n DESC, h.folder), "
-        "                        ARRAY[]::text[]) "
-        "          FROM (SELECT split_part(hs.s3_key, '/', 2) AS folder, count(*) AS n "
-        "                  FROM speaker_voiceprint_samples hs "
-        "                 WHERE hs.company_id = p.company_id AND hs.voiceprint_id = p.id "
-        "                   AND hs.quarantined_at IS NULL AND hs.s3_key IS NOT NULL "
-        "                   AND split_part(hs.s3_key, '/', 2) <> '' "
-        "                 GROUP BY 1 ORDER BY n DESC, folder LIMIT 3) h) AS heard_on, "
+        + _IDENTITY_COLUMNS +
         # `samples` counts the LIVE ones, because that is the number that decides whether a
         # profile does anything -- a quarantined vector matches nobody. `quarantined` is
         # reported beside it rather than folded in: "4 samples" and "4 samples, 2 of them set
@@ -1179,6 +1211,72 @@ def list_profiles(conn, company_id) -> list[dict]:
         "WHERE p.company_id = %s "
         "GROUP BY p.id, lu.id, fu.id, mt.id ORDER BY p.created_at DESC",
         (company_id,)).fetchall()
+
+
+def same_name_profiles(conn, company_id, name) -> list[dict]:
+    """The company's live profiles called `name`, with enough to tell them apart.
+
+    Spec 2026-10-01 (naming asks which same-name person). Case- and whitespace-insensitive:
+    "ben  LIN " is "Ben Lin". Live means `status <> 'withdrawn'` (a merged-away row is
+    withdrawn, so it is excluded), as the lookup in `find_existing_profile` does.
+    Company-scoped, oldest first.
+
+    `last_heard` is the newest `speaker_turn_names.created_at` for the profile (any state --
+    it answers "when was this person last heard", not "is the name still showing").
+    """
+    _require_company(company_id)
+    wanted = " ".join((name or "").split())
+    if not wanted:
+        return []
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT p.id, p.display_name, p.user_id, p.employer_name, "
+        + _IDENTITY_COLUMNS +
+        "       (SELECT max(t.created_at) FROM speaker_turn_names t "
+        "         WHERE t.company_id = p.company_id AND t.voiceprint_id = p.id) AS last_heard "
+        "FROM speaker_voiceprints p "
+        "LEFT JOIN users lu ON lu.id = p.user_id "
+        "LEFT JOIN users fu ON fu.id = COALESCE(p.asserted_by, p.consented_by) "
+        "WHERE p.company_id = %s AND p.status <> 'withdrawn' "
+        "  AND lower(regexp_replace(btrim(p.display_name), '[[:space:]]+', ' ', 'g')) = lower(%s) "
+        "ORDER BY p.created_at",
+        (company_id, wanted)).fetchall()
+
+
+def get_consented_live_profile(conn, company_id, voiceprint_id) -> dict | None:
+    """A live profile of this company that carries a consent record, else None.
+
+    What "it is this one" (`voiceprint_id` on a correction) may point at: not another
+    tenant's, not withdrawn, and not an unconsented shell -- naming a speaker must never
+    attach a voice to a profile nobody agreed to.
+    """
+    _require_company(company_id)
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id FROM speaker_voiceprints "
+        "WHERE id = %s AND company_id = %s AND status <> 'withdrawn' "
+        "  AND consent_at IS NOT NULL",
+        (voiceprint_id, company_id)).fetchone()
+
+
+def user_has_live_profile(conn, company_id, user_id) -> bool:
+    """Does this account already have a live profile in the company?
+
+    Decides whether "someone else with this name" may link the directory user to the new
+    profile: a second live profile on one account is the duplicate the chooser prevents.
+    """
+    _require_company(company_id)
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT 1 AS found FROM speaker_voiceprints "
+        "WHERE company_id = %s AND user_id = %s AND status <> 'withdrawn' LIMIT 1",
+        (company_id, user_id)).fetchone() is not None
+
+
+def set_employer(conn, company_id, voiceprint_id, employer_name, employer_source,
+                 employer_set_by) -> None:
+    """Record who a profile's person works for -- the same UPDATE `upsert_profile` runs."""
+    _require_company(company_id)
+    conn.cursor(row_factory=dict_row).execute(
+        _SET_EMPLOYER_SQL,
+        (employer_name, employer_source, employer_set_by, voiceprint_id))
 
 
 def latest_human_correction(conn, company_id, voiceprint_id, display_name) -> dict | None:
