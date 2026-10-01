@@ -86,7 +86,7 @@ def _is_first_party(top):
 # runtime is a ~200 MB wheel, excluded by decision (see test_voiceprint_onnx_parity.py).
 _EXCLUDED_BY_DECISION = {"onnxruntime", "torch", "speechbrain"}
 # Import names that differ from the distribution name.
-_IMPORT_TO_DIST = {"yaml": "pyyaml", "docx": "python-docx", "jwt": "pyjwt"}
+_IMPORT_TO_DIST = {"yaml": "pyyaml", "docx": "python-docx", "jwt": "pyjwt", "pil": "pillow"}
 # Installed as an EXTRA of a listed package rather than named on its own line.
 # `PyJWT[crypto]` pulls in `cryptography`; listing it separately would be a second place
 # to keep its version in step.
