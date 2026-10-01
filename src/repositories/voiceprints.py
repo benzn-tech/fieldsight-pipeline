@@ -104,6 +104,60 @@ _SET_EMPLOYER_SQL = (
     "WHERE id = %s")
 
 
+def collapse_name(name) -> str:
+    """The name as typed, trimmed with internal whitespace runs collapsed ("ben  lin " -> "ben lin")."""
+    return " ".join((name or "").split())
+
+
+def name_key(name) -> str:
+    """The comparison key for a person's name: collapsed and lower-cased.
+
+    Spec 2026-10-01 (normalise case/spacing). Case and spacing never make a new person, so
+    every place that matches by name compares THIS, on both sides. `NAME_KEY_SQL` is the same
+    normalisation as an expression over a column -- keep the two in step.
+    """
+    return collapse_name(name).lower()
+
+
+# `name_key` as SQL over a column: `NAME_KEY_SQL.format(col="display_name")`.
+NAME_KEY_SQL = "lower(btrim(regexp_replace({col}, '[[:space:]]+', ' ', 'g')))"
+
+
+def name_key_sql(col) -> str:
+    return NAME_KEY_SQL.format(col=col)
+
+
+def edit_distance(a, b, limit=None) -> int:
+    """Levenshtein distance between two strings. With `limit`, may stop early and return
+    limit + 1 once the distance is known to exceed it."""
+    if a == b:
+        return 0
+    if len(a) < len(b):
+        a, b = b, a
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        if limit is not None and min(cur) > limit:
+            return limit + 1
+        prev = cur
+    return prev[-1]
+
+
+def similar_name_limit(key) -> int:
+    """How many edits still count as a near spelling: 1 for short names, 2 for longer."""
+    return 1 if len(key) <= 6 else 2
+
+
+def is_similar_name(a, b) -> bool:
+    """Near-but-not-equal spellings (spec 2026-10-01 s3). Suggested to the namer, never merged."""
+    ka, kb = name_key(a), name_key(b)
+    if not ka or not kb or ka == kb:
+        return False
+    return edit_distance(ka, kb, 2) <= similar_name_limit(ka if len(ka) <= len(kb) else kb)
+
+
 def find_existing_profile(conn_or_cur, company_id, display_name, user_id=None, anchor=None,
                           external_ref=None, external_source=None) -> dict | None:
     """The live profile `upsert_profile` would reuse for this name, or None. Reads only.
@@ -150,19 +204,20 @@ def find_existing_profile(conn_or_cur, company_id, display_name, user_id=None, a
             "WHERE company_id = %s AND status <> 'withdrawn' "
             "  AND (user_id = %s "
             "       OR (user_id IS NULL AND external_ref IS NULL "
-            "           AND display_name = %s "
+            "           AND " + name_key_sql("display_name") + " = %s "
             "           AND NOT EXISTS (SELECT 1 FROM speaker_voiceprint_samples s "
             "                           WHERE s.voiceprint_id = speaker_voiceprints.id))) "
             "ORDER BY (user_id IS NOT NULL) DESC, created_at LIMIT 1",
-            (company_id, user_id, display_name)).fetchone()
+            (company_id, user_id, name_key(display_name))).fetchone()
     else:
         found = cur.execute(
             "SELECT id FROM speaker_voiceprints "
-            "WHERE company_id = %s AND display_name = %s AND user_id IS NULL "
+            "WHERE company_id = %s AND " + name_key_sql("display_name") + " = %s "
+            "  AND user_id IS NULL "
             "  AND coalesce(consented_by, asserted_by) = %s "
             "  AND status <> 'withdrawn' "
             "ORDER BY created_at LIMIT 1",
-            (company_id, display_name, anchor)).fetchone()
+            (company_id, name_key(display_name), anchor)).fetchone()
     return found
 
 
@@ -1225,7 +1280,7 @@ def same_name_profiles(conn, company_id, name) -> list[dict]:
     it answers "when was this person last heard", not "is the name still showing").
     """
     _require_company(company_id)
-    wanted = " ".join((name or "").split())
+    wanted = name_key(name)
     if not wanted:
         return []
     return conn.cursor(row_factory=dict_row).execute(
@@ -1237,7 +1292,7 @@ def same_name_profiles(conn, company_id, name) -> list[dict]:
         "LEFT JOIN users lu ON lu.id = p.user_id "
         "LEFT JOIN users fu ON fu.id = COALESCE(p.asserted_by, p.consented_by) "
         "WHERE p.company_id = %s AND p.status <> 'withdrawn' "
-        "  AND lower(regexp_replace(btrim(p.display_name), '[[:space:]]+', ' ', 'g')) = lower(%s) "
+        "  AND " + name_key_sql("p.display_name") + " = %s "
         "ORDER BY p.created_at",
         (company_id, wanted)).fetchall()
 
@@ -1508,3 +1563,31 @@ def rename_profile(conn, company_id, voiceprint_id, display_name) -> bool:
         "WHERE company_id = %s AND voiceprint_id = %s",
         (display_name, company_id, voiceprint_id))
     return True
+
+
+def similar_name_profiles(conn, company_id, name, exclude_ids=()) -> list[dict]:
+    """Live, named profiles of the company whose name is a NEAR spelling of `name`.
+
+    Spec 2026-10-01 s3: normalised name not equal but within edit distance 1 (normalised
+    length <= 6) or 2 (longer). Same row shape as `same_name_profiles`. Computed in Python
+    over the company's live named profiles -- a small set, and no DB extension is needed.
+    Anything in `exclude_ids` (the exact-name matches) is left out. Oldest first.
+    """
+    _require_company(company_id)
+    if not name_key(name):
+        return []
+    skip = {str(i) for i in exclude_ids}
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT p.id, p.display_name, p.user_id, p.employer_name, "
+        + _IDENTITY_COLUMNS +
+        "       (SELECT max(t.created_at) FROM speaker_turn_names t "
+        "         WHERE t.company_id = p.company_id AND t.voiceprint_id = p.id) AS last_heard "
+        "FROM speaker_voiceprints p "
+        "LEFT JOIN users lu ON lu.id = p.user_id "
+        "LEFT JOIN users fu ON fu.id = COALESCE(p.asserted_by, p.consented_by) "
+        "WHERE p.company_id = %s AND p.status <> 'withdrawn' "
+        "  AND p.display_name IS NOT NULL "
+        "ORDER BY p.created_at",
+        (company_id,)).fetchall()
+    return [r for r in rows
+            if str(r["id"]) not in skip and is_similar_name(name, r.get("display_name"))]
