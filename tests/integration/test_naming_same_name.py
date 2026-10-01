@@ -224,3 +224,86 @@ def test_set_employer_stamps_who_and_when(db):
                      "employer_set_at IS NOT NULL FROM speaker_voiceprints WHERE id = %s",
                      (pid,)).fetchone()
     assert row == ("ABC Ltd", "typed", uid, True)
+
+
+# ---- normalised names (spec 2026-10-01-name-normalise-and-did-you-mean) -----------------
+
+def test_upsert_reuses_a_case_and_spacing_variant_in_the_name_and_voucher_branch(db):
+    """(name, whoever vouched) branch: "ben  lin" is "Ben Lin", never a second person."""
+    cid = _company(db)
+    asserter = _user(db, cid, "Ada", "Lovelace", "Ada")
+    existing = _profile(db, cid, "Ben Lin", asserted_by=asserter)
+    before = _count(db, cid)
+    got = _upsert(db, cid, "  ben   LIN ", asserted_by=str(asserter))
+    assert got == existing and _count(db, cid) == before
+    # A different voucher still does not adopt it (the anchor part of the rule is intact).
+    other = _user(db, cid, "Bo", "Peep", "Bo")
+    assert _upsert(db, cid, "ben lin", asserted_by=str(other)) != existing
+
+
+def test_upsert_reuses_a_variant_in_the_empty_unlinked_branch(db):
+    """Resolved-user branch: an EMPTY unlinked profile with a variant spelling is adopted."""
+    cid = _company(db)
+    asserter = _user(db, cid, "Ada", "Lovelace", "Ada")
+    person = _user(db, cid, "Ben", "Lin", "Ben_Lin")
+    empty = _profile(db, cid, "Ben Lin")
+    before = _count(db, cid)
+    got = _upsert(db, cid, "ben  lin", user_id=str(person), asserted_by=str(asserter),
+                  linked_by=str(asserter), linked_on="full_name")
+    assert got == empty and _count(db, cid) == before
+    # ...and the one with samples is still not adopted, whatever the spelling.
+    _sample(db, cid, empty, "users/X/a.wav")
+    assert _upsert(db, cid, "BEN LIN", user_id=str(_user(db, cid, "Ben", "Lin", "B2")),
+                   asserted_by=str(asserter)) != empty
+
+
+def test_similar_name_profiles_returns_near_but_not_equal_live_company_profiles(db):
+    cid, other = _company(db), _company(db, "Other Co")
+    near = _profile(db, cid, "Sam Wu")
+    _profile(db, cid, "Sam Yu")                    # equal to the query: a same-name match
+    _profile(db, cid, " sam  YU ")                 # equal after normalising
+    _profile(db, cid, "Bob Lee")                   # too far
+    _profile(db, cid, "Sam Wu", status="withdrawn")
+    _profile(db, other, "Sam Wu")
+    _profile(db, cid, "Sam Wang")                  # 3 edits from "sam yu"
+    rows = vp.similar_name_profiles(db, cid, "Sam Yu")
+    assert _ids(rows) == [near]
+    assert {"last_heard", "linked_name", "heard_on", "first_named_by"} <= set(rows[0])
+    # Exclusions: anything already listed as a same-name match is left out.
+    assert vp.similar_name_profiles(db, cid, "Sam Yu", exclude_ids=[near]) == []
+    assert vp.similar_name_profiles(db, cid, "   ") == []
+
+
+def _call_same_name(db, monkeypatch, cid, caller_id, name):
+    org = pytest.importorskip("lambda_org_api", reason="requires psycopg")
+    import json
+    caller = {"id": str(caller_id), "company_id": str(cid)}
+    monkeypatch.setattr(org, "SPEAKER_IDENTITY_MODE", "on")
+    monkeypatch.setattr(org, "_resolve_org_media_folder",
+                        lambda conn, c, user, what="media": ("Ada", None))
+    monkeypatch.setattr(org, "_may_correct_speakers", lambda conn, c, f: True)
+    monkeypatch.setattr(org, "_same_company_as_folder", lambda conn, c, f, w: None)
+    resp = org.same_name_voiceprints(db, caller, {"queryStringParameters": {"name": name}})
+    assert resp["statusCode"] == 200, resp
+    return json.loads(resp["body"])
+
+
+def test_same_name_endpoint_does_not_ask_for_a_case_variant_the_lookup_would_use(
+        db, monkeypatch):
+    cid = _company(db)
+    asserter = _user(db, cid, "Ada", "Lovelace", "Ada")
+    pid = _profile(db, cid, "Ben Lin", asserted_by=asserter)
+    body = _call_same_name(db, monkeypatch, cid, asserter, "ben  LIN")
+    assert [p["id"] for p in body["profiles"]] == [str(pid)]
+    assert body["wouldUse"] == str(pid) and body["ask"] is False
+    assert body["similar"] == []
+
+
+def test_same_name_endpoint_suggests_a_near_spelling_without_asking(db, monkeypatch):
+    cid = _company(db)
+    asserter = _user(db, cid, "Ada", "Lovelace", "Ada")
+    near = _profile(db, cid, "Sam Wu", asserted_by=asserter)
+    body = _call_same_name(db, monkeypatch, cid, asserter, "Sam Yu")
+    assert body["profiles"] == [] and body["ask"] is False and body["wouldUse"] is None
+    assert [p["id"] for p in body["similar"]] == [str(near)]
+    assert body["similar"][0]["displayName"] == "Sam Wu"
