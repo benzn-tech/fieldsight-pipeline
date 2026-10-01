@@ -328,4 +328,5 @@ def test_a_topic_whose_photograph_cannot_be_read_is_offered_with_none(monkeypatc
     ]}}
     offer, streams = sr._offered_topics(artifact, [sr.MAX_PHOTO_BYTES_TOTAL], *DAY)
     assert streams == {}
-    assert offer == [{"ref": "t0", "title": "Gone", "time_range": None, "photos": 0}]
+    assert offer == [{"ref": "t0", "title": "Gone", "time_range": None, "category": None,
+                      "content": [], "photos": 0}]
