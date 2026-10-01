@@ -783,6 +783,12 @@ def dispatch(conn, event, method, route):
         return speaker_known(conn, caller, event)
     if route == "/voiceprints" and method == "GET":
         return list_voiceprints(conn, caller)
+    # Before `/voiceprints/{id}`: that pattern cannot match a path with a suffix, but the
+    # order is the cheap insurance if somebody loosens it -- the sibling route withdraws a
+    # biometric.
+    m_vr = re.match(r"^/voiceprints/([^/]+)/retry$", route)
+    if m_vr and method == "POST":
+        return retry_voiceprint(conn, caller, m_vr.group(1), event)
     m_vw = re.match(r"^/voiceprints/([^/]+)$", route)
     if m_vw and method == "DELETE":
         return withdraw_voiceprint(conn, caller, m_vw.group(1))
@@ -2088,7 +2094,8 @@ def list_voiceprints(conn, caller):
         return error("not found", 404)
     if caller["global_role"] not in _CORRECTION_ROLES:
         return error("admin, gm, pm, site_manager or platform_admin role required", 403)
-    rows = voiceprints.list_profiles(conn, str(caller["company_id"]))
+    company_id = str(caller["company_id"])
+    rows = voiceprints.list_profiles(conn, company_id)
     return ok({"voiceprints": [{
         "id": str(r["id"]),
         "displayName": r.get("display_name"),
@@ -2101,7 +2108,92 @@ def list_voiceprints(conn, caller):
         "lastAttemptAt": r.get("last_attempt_at"),
         "lastAttemptOutcome": r.get("last_attempt_outcome"),
         "lastAttemptDetail": r.get("last_attempt_detail"),
+        # Only a refused row pays for the lookup (a transcript read). Everything else is
+        # null: there is nothing to try again.
+        "retry": (_retry_passage(conn, company_id, r)
+                  if r.get("last_attempt_outcome") == "refused" else None),
     } for r in rows]})
+
+
+def _retry_passage(conn, company_id, profile):
+    """The passage a refused profile's last human correction named, or None.
+
+    `{date, userFolder, sessionBase, sourceFilename, startSec, endSec}`. None means "cannot
+    be retried from here", never "retry something else": every step that fails to resolve
+    returns None rather than a guess, because the retry would name a person from audio
+    nobody chose.
+
+    The folder and date come from `recordings` (or the proposal rows), NOT from the turn_ref:
+    its stem starts with the device name, which is not the user's folder. The end of the
+    passage comes from the transcript turn at that offset.
+    """
+    corr = voiceprints.latest_human_correction(
+        conn, company_id, str(profile["id"]), profile.get("display_name"))
+    if not corr or "@" not in str(corr.get("turn_ref") or ""):
+        return None
+    stem, _, tail = str(corr["turn_ref"]).rpartition("@")
+    try:
+        offset = float(tail)
+    except ValueError:
+        return None
+    sid = corr.get("session_base")
+    where = recordings.locate_session(conn, company_id, sid)
+    if not where:
+        return None
+    folder, date = where
+    try:
+        turns = _session_turns(conn, folder, date, sid)
+    except Exception:
+        logger.exception("voiceprint %s: transcript unreadable for retry", profile.get("id"))
+        return None
+    want = turn_name_overlay._stem(stem)
+    # Half a second: re-extraction shifts offsets slightly (see `turn_name_overlay`), and the
+    # overlay's own join tolerates the same.
+    near = [t for t in turns
+            if turn_name_overlay._stem(t.get("source_filename")) == want
+            and abs(float(t.get("start_sec", 0)) - offset) <= 0.5]
+    if not near:
+        return None
+    t = min(near, key=lambda x: abs(float(x["start_sec"]) - offset))
+    return {"date": str(date), "userFolder": folder, "sessionBase": sid,
+            "sourceFilename": t["source_filename"], "startSec": float(t["start_sec"]),
+            "endSec": float(t["end_sec"])}
+
+
+def retry_voiceprint(conn, caller, voiceprint_id, event):
+    """POST /api/org/voiceprints/{id}/retry — store a refused voice again.
+
+    Recomputes the passage of the profile's last human correction and hands it to
+    `speaker_corrections`, exactly as `_apply_confirmed_proposal` does, so the retry is the
+    same act as the original rename (same artifact, same `source='correction'`). Nothing is
+    written here.
+
+    The company comes from the caller; a profile id from another tenant is a 404.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    company_id = str(caller["company_id"])
+    person = voiceprints.get_profile(conn, company_id, voiceprint_id)
+    if person is None or person.get("status") == "withdrawn":
+        return error("not found", 404)
+    nothing = error("There is nothing to store again for this voice: its last attempt was "
+                    "not refused, or the passage you named can no longer be found. Rename "
+                    "the speaker in a recording to try with a new passage.", 409)
+    if person.get("last_attempt_outcome") != "refused" or not person.get("display_name"):
+        return nothing
+    passage = _retry_passage(conn, company_id, person)
+    if passage is None:
+        return nothing
+    return speaker_corrections(
+        conn, caller, passage["sourceFilename"], dict(event, body=json.dumps({
+            "user": passage["userFolder"],
+            "source_filename": passage["sourceFilename"],
+            "start_sec": passage["startSec"],
+            "end_sec": passage["endSec"],
+            "display_name": person["display_name"],
+        })))
 
 
 def _site_for_session(conn, company_id, user_folder, date, session_base):
@@ -2489,7 +2581,10 @@ def list_name_proposals(conn, caller, event):
                    # frontend's badge component already reads `total` and a client-side
                    # arithmetic change is exactly the kind of edit that silently drops a
                    # field (memory: "ui-api-layer-whitelists-request-body").
-                   "introductions": speaker_intro_suggestions.pending_count(conn, company_id)})
+                   "introductions": speaker_intro_suggestions.pending_count(conn, company_id),
+                   # Voices whose last save was refused this week -- one grouped count,
+                   # no transcript. Same reason as `introductions` for being its own key.
+                   "notSaved": voiceprints.refused_recently_count(conn, company_id)})
 
     rows = speaker_name_proposals.pending_for_person(
         conn, company_id, vp, limit=PROPOSAL_PAGE)

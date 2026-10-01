@@ -1,3 +1,4 @@
+import re
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -629,3 +630,46 @@ def site_for_day(conn, company_id, user_folder, date) -> dict | None:
     if row is None:
         return None
     return sites.get_site(conn, row["site_id"])
+
+
+_SID_RE = re.compile(r"^sid[0-9a-f]{32}$")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def locate_session(conn, company_id, session_base):
+    """`(user_folder, date)` for a session, or None when nothing can say.
+
+    A turn_ref's filename stem begins with the DEVICE name, which is not the user's folder,
+    so neither can be read off it. Two sources, in order of authority:
+
+    1. `recordings.s3_key` -- `users/{folder}/{kind}/{date}/{filename}` -- for any recording
+       of this session (newest wins; every chunk of one session shares folder and date).
+    2. the proposal / introduction rows, which carry both on the row.
+
+    `session_base` is interpolated into a LIKE pattern, so only the canonical
+    `sid<32 hex>` is accepted; anything else is None rather than a wildcard.
+    """
+    if not company_id or not _SID_RE.match(str(session_base or "")):
+        return None
+    cur = conn.cursor(row_factory=dict_row)
+    row = cur.execute(
+        "SELECT s3_key FROM recordings "
+        "WHERE company_id = %s AND s3_key LIKE %s ESCAPE '\' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (company_id, f"users/%/%/%/%{session_base}%")).fetchone()
+    if row:
+        parts = str(row["s3_key"]).split("/")
+        if len(parts) >= 5 and parts[0] == "users" and _DATE_RE.match(parts[3]):
+            return parts[1], parts[3]
+    row = cur.execute(
+        "SELECT user_folder, session_date FROM ("
+        "  SELECT user_folder, session_date, created_at FROM speaker_name_proposals "
+        "  WHERE company_id = %s AND session_base = %s "
+        "  UNION ALL "
+        "  SELECT user_folder, session_date, created_at FROM speaker_intro_suggestions "
+        "  WHERE company_id = %s AND session_base = %s"
+        ") t ORDER BY created_at DESC LIMIT 1",
+        (company_id, session_base, company_id, session_base)).fetchone()
+    if row and row.get("user_folder") and row.get("session_date"):
+        return row["user_folder"], str(row["session_date"])
+    return None
