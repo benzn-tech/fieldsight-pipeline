@@ -122,6 +122,58 @@ def _hhmm_to_minutes(hhmm):
     return int(h) * 60 + int(m)
 
 
+def _stays(markers):
+    """[(start_min, location_key, last_mention_min)] -- consecutive markers
+    naming the same place are ONE stay ("Level 1", then "Continue level one
+    inspection" is still Level 1), so a stay starts at its first announcement."""
+    out = []
+    for m in sorted(markers or [], key=lambda m: str(m.get("at") or "")):
+        try:
+            at = _hhmm_to_minutes(str(m.get("at"))[:5])
+        except (ValueError, AttributeError):
+            continue
+        key = " ".join(str(m.get("location") or "").lower().split())
+        if not key:
+            continue
+        if out and out[-1][1] == key and at - out[-1][2] <= PHOTO_CARRY_FORWARD_MIN:
+            out[-1] = (out[-1][0], key, at)          # same stay, later mention
+        else:
+            out.append((at, key, at))
+    return out
+
+
+def _stay_owner(at, windows):
+    """The topic in progress when a place was first announced: its window holds
+    the moment, preferring one that goes on AFTER it (the announcement opens
+    what follows, it does not close what came before) and then the earliest
+    start -- the activity already under way."""
+    holding = [i for i, (s, e) in windows.items() if s <= at <= e]
+    if not holding:
+        return None
+    return min(holding, key=lambda i: (0 if windows[i][1] > at else 1, windows[i][0], i))
+
+
+def _location_owner(p_minutes, stays, windows):
+    """The topic that owns a photo by WHERE it was taken, or None.
+
+    A LOCATION OWNS ITS PHOTOS (owner, 2026-10-01). Binding by clock alone gave
+    an inspection's photos to whatever conversation overlapped them: on TEST,
+    Ben_Lin_test2 2026-10-01, three Level 1 photos went to members of the
+    public asking the way, because that chat was the topic at 13:28. The
+    location markers had it right all along (Ground floor 13:24, Level 1
+    13:26): a photo belongs to the topic that was under way when its place was
+    announced, for as long as the stay lasts (until another place is named,
+    or PHOTO_CARRY_FORWARD_MIN after the stay's last mention).
+    """
+    current = None
+    for stay in stays:
+        if stay[0] <= p_minutes:
+            current = stay
+    if current is None or p_minutes - current[2] > PHOTO_CARRY_FORWARD_MIN:
+        return None
+    return _stay_owner(current[0], windows)
+
+
 def parse_time_range(time_range):
     """'HH:MM – HH:MM' -> (start_minutes, end_minutes), or None if
     time_range is missing/unparseable (never raises -- callers treat 'no
@@ -187,7 +239,7 @@ def _eligible_windows(p_minutes, windows, topic_sessions, session_spans):
 
 
 def photos_for_topics(photo_objects, topics, *, topic_sessions=None,
-                      session_spans=None):
+                      session_spans=None, markers=None):
     """PURE. photo_objects: [{key, filename, hhmm}] -- hhmm ('HH:MM') is
     already derived by the caller (list_pictures) from the BUG-01-safe
     transcript_utils filename extractor. topics: the topic dicts of an
@@ -212,6 +264,10 @@ def photos_for_topics(photo_objects, topics, *, topic_sessions=None,
     the result is byte-identical to the signature that existed before. See
     _eligible_windows for what they buy and where they fail open.
 
+    `markers` (the day's location markers, [{at, location}]) is opt-in the
+    same way: with them, a photo taken during a location stay goes to the
+    topic that stay belongs to, before any clock rule -- see _location_owner.
+
     NOTE: the `topics` parameter name intentionally shadows the callers'
     `repositories.topics` import -- this function is pure and never touches
     that module; the name is kept to match the design's exact signature.
@@ -229,6 +285,8 @@ def photos_for_topics(photo_objects, topics, *, topic_sessions=None,
     capped = 0
     carried_count = 0
     excluded_by_session = 0
+    by_location = 0
+    stays = _stays(markers)
     for p in photo_objects:
         hhmm = p.get("hhmm")
         if not hhmm:
@@ -241,6 +299,14 @@ def photos_for_topics(photo_objects, topics, *, topic_sessions=None,
             eligible = {i: w for i, w in windows.items() if i in allowed}
             if len(eligible) < len(windows):
                 excluded_by_session += 1
+        # WHERE before WHEN: a photo taken during a location stay goes to the
+        # topic that stay belongs to, if that topic may have it (same session,
+        # under the cap). Otherwise the clock rules below decide, unchanged.
+        owner = _location_owner(p_minutes, stays, eligible) if stays else None
+        if owner is not None and len(result[owner]) < PHOTOS_PER_TOPIC_CAP:
+            result[owner].append(p)
+            by_location += 1
+            continue
         # Qualifying candidates only: inside the window, or within
         # PHOTO_TOLERANCE_MIN minutes of an edge. Beyond that a topic does
         # not compete at all -- there is no "nearest of everything" fallback.
@@ -298,6 +364,12 @@ def photos_for_topics(photo_objects, topics, *, topic_sessions=None,
         logger.info("photo binding: %d photo(s) judged only against the "
                     "session that was recording when they were taken",
                     excluded_by_session)
+    if by_location:
+        # The stronger claim, counted on its own: "taken where this topic's
+        # place had just been announced". If the location rule is ever wrong,
+        # this is the number that moves.
+        logger.info("photo binding: %d photo(s) bound by location (where the "
+                    "topic's place had been announced)", by_location)
     if carried_count:
         # Counted separately from the ordinary binds, because these are the
         # weaker claim: they say "nothing was being said, so we attributed this

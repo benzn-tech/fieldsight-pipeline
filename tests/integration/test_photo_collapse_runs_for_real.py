@@ -60,3 +60,23 @@ def test_apply_keeps_the_containing_topic_and_says_so(db):
     assert out["mode"] == "APPLIED"
     assert out["multibound_photos_after"] == 0
     assert _bound_to(db) == [str(right)], "the six-minutes-away row is the one that goes"
+
+
+# ---- one day, under today's rules --------------------------------------------------
+
+def test_one_day_rebinds_by_location_dry_then_for_real(db):
+    """rebind_one_day: the dry run says where the photo would go and writes
+    nothing; apply writes exactly that (owner, 2026-10-01: a location owns its
+    photos)."""
+    from repositories import location_markers
+    right, wrong = _seed(db)
+    # The photo (14:37) is inside "Right" anyway; a marker at 14:31 opening a
+    # stay that "Right" owns makes the answer the location's, not the clock's.
+    cid = db.execute("SELECT company_id FROM sites LIMIT 1").fetchone()[0]
+    location_markers.replace_for_day(db, cid, FOLDER, DATE, [{"at": "14:31", "location": "Level 2"}])
+    dry = photo_collapse.rebind_one_day(db, FakeS3(), "bucket", FOLDER, DATE)
+    assert dry["applied"] is False and dry["binds_written"] == 1
+    assert [t["topic_id"] for t in dry["by_topic"]] == [str(right)]
+    assert _bound_to(db) == sorted([str(right), str(wrong)]), "the dry run wrote nothing"
+    done = photo_collapse.rebind_one_day(db, FakeS3(), "bucket", FOLDER, DATE, apply=True)
+    assert done["applied"] is True and _bound_to(db) == [str(right)]

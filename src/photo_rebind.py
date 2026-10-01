@@ -33,7 +33,7 @@ Nothing about the matcher changed. It is called ONCE, for the whole day.
 import logging
 
 import photo_binding
-from repositories import recordings, topics
+from repositories import location_markers, recordings, topics
 
 logger = logging.getLogger()
 
@@ -94,9 +94,24 @@ def rebind_day_photos(conn, company_id, user_folder, date, photo_objects):
     # window covering nothing -- drop it, so that session always competes.
     spans = {k: v for k, v in spans.items() if v is not None}
 
+    # The day's location markers decide first where they can: a photo taken
+    # where a topic's place had just been announced belongs to that topic, not
+    # to a conversation that happened to overlap it (photo_binding). Read fail-
+    # open: the markers sharpen binding, and a failed read must not cost the
+    # day all of its bindings -- the clock rules still stand without them.
+    try:
+        # A savepoint: a failed statement would otherwise abort the outer
+        # transaction, and the replace below with it.
+        with conn.transaction():
+            markers = location_markers.for_day(conn, company_id, user_folder, date)
+    except Exception:
+        logger.warning("photo rebind %s/%s: location markers unreadable, binding "
+                       "by time only", user_folder, date, exc_info=True)
+        markers = []
     bound = photo_binding.photos_for_topics(
         photo_objects, day_topics,
-        topic_sessions=topic_sessions, session_spans=spans or None)
+        topic_sessions=topic_sessions, session_spans=spans or None,
+        markers=markers)
 
     rows = []
     for i, photos in bound.items():
