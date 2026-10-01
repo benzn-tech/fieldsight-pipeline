@@ -44,8 +44,41 @@ DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessin
 # one photo-heavy topic eat everything before the later topics are reached.
 # The numbers keep the doc something a site manager actually opens on a phone,
 # and keep the render inside the Lambda's memory.
-MAX_PHOTOS_PER_TOPIC = 4
+#
+# The per-topic cap was 4 while photographs went in at camera size (2-4 MB
+# each, so the byte budget held ~4 anyway). An inspection walk is one topic
+# with a photograph per spot -- 7 on the TEST day that raised it (2026-10-01)
+# -- so photographs are now shrunk to what a page shows (PHOTO_MAX_EDGE) and
+# the cap counts pictures a reader can use, not bytes.
+MAX_PHOTOS_PER_TOPIC = 12
 MAX_PHOTO_BYTES_TOTAL = 12 * 1024 * 1024
+PHOTO_MAX_EDGE = 1600        # px, long edge: sharper than a page, a tenth of the bytes
+PHOTO_JPEG_QUALITY = 80
+
+try:                         # the python-docx layer from v3 carries Pillow
+    from PIL import Image, ImageOps
+except ImportError:          # pragma: no cover - older layer: photos go in as taken
+    Image = ImageOps = None
+
+
+def _shrink(body):
+    """A photograph at page size, upright, as JPEG -- or the original bytes when
+    Pillow is not there, the file is not an image it can read, or shrinking
+    would not make it smaller. Never raises: the picture is evidence, and a
+    larger one beats a missing one."""
+    if Image is None:
+        return body
+    try:
+        img = ImageOps.exif_transpose(Image.open(BytesIO(body)))
+        img = img.convert("RGB")
+        img.thumbnail((PHOTO_MAX_EDGE, PHOTO_MAX_EDGE))
+        out = BytesIO()
+        img.save(out, "JPEG", quality=PHOTO_JPEG_QUALITY, optimize=True)
+        small = out.getvalue()
+        return small if len(small) < len(body) else body
+    except Exception:
+        logger.warning("could not shrink a photo; using it as taken", exc_info=True)
+        return body
 
 _s3_client = None
 
@@ -125,6 +158,7 @@ def _fetch_photos(folder, date, filenames, budget):
         except Exception:
             logger.warning("could not read photo %s; leaving it out", key)
             continue
+        body = _shrink(body)
         streams.append(BytesIO(body))
         budget[0] -= len(body)
     return streams
