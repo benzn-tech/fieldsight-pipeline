@@ -27,6 +27,7 @@ import chunking
 import lambda_meeting_minutes
 import llm_utils
 import nz_time
+import photo_binding
 import report_facts
 import report_template
 import transcript_window
@@ -135,7 +136,7 @@ def _humanize(key):
     return str(key).replace("_", " ").title()
 
 
-def _fetch_photos(folder, date, filenames, budget):
+def _fetch_photos(folder, date, filenames, budget, names_out=None):
     """Download a topic's photos as open streams, newest failure tolerated.
 
     The renderer does no I/O and must stay that way, so the bytes are fetched
@@ -160,6 +161,8 @@ def _fetch_photos(folder, date, filenames, budget):
             continue
         body = _shrink(body)
         streams.append(BytesIO(body))
+        if names_out is not None:
+            names_out.append(name)       # which file each stream is: a skipped one shifts nothing
         budget[0] -= len(body)
     return streams
 
@@ -222,10 +225,12 @@ def _offered_topics(artifact, budget, win_from, win_to):
         ref = "t%d" % i
         names = [n for n in (topic.get("related_photos") or []) if n]
         fresh = [n for n in names if n not in seen]
-        got = _fetch_photos(folder, date, fresh, budget) if fresh else []
-        for name, stream in zip(fresh, got):
+        got_names = []
+        got = _fetch_photos(folder, date, fresh, budget, got_names) if fresh else []
+        for name, stream in zip(got_names, got):
             seen[name] = stream
-        mine = [seen[n] for n in names if n in seen]
+        kept = [n for n in names if n in seen]
+        mine = [seen[n] for n in kept]
         if mine:
             streams[ref] = mine
         offer.append({"ref": ref,
@@ -233,7 +238,10 @@ def _offered_topics(artifact, budget, win_from, win_to):
                       "time_range": topic.get("time_range"),
                       "category": topic.get("category"),
                       "content": _topic_content(topic),
-                      "photos": len(mine)})
+                      "photos": len(mine),
+                      # Aligned with streams[ref]: which file each one is, so a
+                      # photograph can be placed by WHERE it was taken.
+                      "photo_names": kept})
     return offer, streams
 
 
@@ -374,7 +382,7 @@ def _summary_titles(template):
     return out
 
 
-def _place_photos(sections, streams_by_ref, no_photos=(), captions=None):
+def _place_photos(sections, streams_by_ref, no_photos=(), captions=None, places=None):
     """Put each topic's photographs as close as the model said they belong.
 
     Returns (under_a_line, under_a_section, fell_to_the_end) as photograph
@@ -420,7 +428,7 @@ def _place_photos(sections, streams_by_ref, no_photos=(), captions=None):
         taken.add(ref)
         return list(streams_by_ref[ref])
 
-    best = {}                                   # ref -> (rank, order, section, line)
+    cands = {}                                  # ref -> [(rank, order, section, line, text)]
     order = 0
     for s, section in enumerate(sections):
         paragraphs = section.get("paragraphs") or []
@@ -429,15 +437,30 @@ def _place_photos(sections, streams_by_ref, no_photos=(), captions=None):
             text = (paragraphs[i] if i < len(paragraphs) else "") or ""
             rank = 3 if has_table and "|" in text else 2 if text.lstrip().startswith(("- ", "* ")) else 1
             for ref in refs:
-                if ref in streams_by_ref and (ref not in best or rank > best[ref][0]):
-                    best[ref] = (rank, order, s, i)
+                if ref in streams_by_ref:
+                    cands.setdefault(ref, []).append((rank, order, s, i, text))
                 order += 1
-    for ref, (_, _, s, i) in sorted(best.items(), key=lambda kv: kv[1][1]):
+
+    def put(s, i, streams):
+        after = sections[s].setdefault("photos_after", {})
+        after[i] = after.get(i, []) + streams
+
+    # BY PLACE, among the topic's most specific lines (owner, 2026-10-01): an
+    # inspection written as a Ground floor row and a Level 1 row puts each
+    # photograph in the row naming where it was taken. A photograph whose
+    # place no line names goes with the first of them, as before.
+    for ref in sorted(cands, key=lambda r: cands[r][0][1]):
         mine = claim(ref)
-        if mine:
-            after = sections[s].setdefault("photos_after", {})
-            after[i] = after.get(i, []) + mine
-            at_line += len(mine)
+        if not mine:
+            continue
+        top_rank = max(c[0] for c in cands[ref])
+        top = [c for c in cands[ref] if c[0] == top_rank]
+        where = (places or {}).get(ref) or []
+        for j, stream in enumerate(mine):
+            place = where[j] if j < len(where) else None
+            hit = next((c for c in top if photo_binding.names_place(c[4], place)), top[0])
+            put(hit[2], hit[3], [stream])
+        at_line += len(mine)
 
     for section in sections:
         mine = []
@@ -851,7 +874,13 @@ def _generate_document(artifact, context=None):
         no_photos=_summary_titles(template),
         captions={t["ref"]: ("%s (%s)" % (t.get("title") or "Untitled", t.get("time_range"))
                              if t.get("time_range") else (t.get("title") or "Untitled"))
-                  for t in topic_offer})
+                  for t in topic_offer},
+        # Where each photograph was taken, by the day's location markers --
+        # the same stays the binding used (photo_binding.place_at).
+        places={t["ref"]: [photo_binding.place_at(
+                    (artifact.get("reportFacts") or {}).get("locations") or [],
+                    photo_binding.photo_hhmm(n)) for n in t.get("photo_names") or []]
+                for t in topic_offer})
     placed = at_line + at_section
     if topic_offer:
         logger.info("coverage: %d topics offered, %d referenced, not referenced: %s",
