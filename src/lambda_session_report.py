@@ -197,8 +197,78 @@ def _offered_topics(artifact, budget, win_from, win_to):
         offer.append({"ref": ref,
                       "title": topic.get("topic_title"),
                       "time_range": topic.get("time_range"),
+                      "category": topic.get("category"),
+                      "content": _topic_content(topic),
                       "photos": len(mine)})
     return offer, streams
+
+
+def _unanchored(prose, skip_titles=()):
+    """[{section, text}] for every line of the answer that names no topic.
+
+    Counted outside the model, like the coverage note: the report is written
+    from the record (report_template._record_block), and a line that reports
+    no topic is either a summary of several the model forgot to tag or
+    something the record does not hold. Not judged here -- counted, so the
+    number can be watched before anything is ever dropped for it. A table's
+    header and rule rows, "Nothing here." and checklist sections (rebuilt and
+    evidence-checked by code) are not lines of reporting.
+    """
+    skip = {(t or "").strip().lower() for t in skip_titles}
+    out = []
+    for sec in prose:
+        if (sec.get("title") or "").strip().lower() in skip:
+            continue
+        paragraphs = sec.get("paragraphs") or []
+        refs = sec.get("line_refs") or []
+        header_next = True
+        for i, text in enumerate(paragraphs):
+            t = (text or "").strip()
+            is_row = "|" in t
+            if lambda_meeting_minutes._TABLE_RULE_RE.match(t):
+                continue
+            if is_row and header_next and i + 1 < len(paragraphs) and \
+                    lambda_meeting_minutes._TABLE_RULE_RE.match((paragraphs[i + 1] or "").strip()):
+                continue                              # the header row
+            header_next = not is_row
+            if not t or t.rstrip(".").lower() == "nothing here":
+                continue
+            if not (refs[i] if i < len(refs) else []):
+                out.append({"section": sec.get("title"), "text": t[:160]})
+    return out
+
+
+_ITEM_TEXT_KEYS = ("text", "decision", "question", "description", "observation",
+                   "finding", "action", "summary", "title")
+
+
+def _item_text(item):
+    if isinstance(item, dict):
+        for k in _ITEM_TEXT_KEYS:
+            if isinstance(item.get(k), str) and item[k].strip():
+                return item[k].strip()
+        return ""
+    return str(item or "").strip()
+
+
+def _topic_content(topic):
+    """A topic's own content, as the record the report is written from
+    (report_template._record_block): what the page shows for it."""
+    out = []
+    if (topic.get("summary") or "").strip():
+        out.append("Summary: " + " ".join(topic["summary"].split()))
+    for label, key in (("Decided", "key_decisions"), ("Open question", "open_questions"),
+                       ("Safety", "safety_flags"), ("Finding", "findings")):
+        for item in topic.get(key) or []:
+            text = _item_text(item)
+            if text:
+                out.append("%s: %s" % (label, text))
+    for a in topic.get("action_items") or []:
+        text = _item_text(a)
+        if text:
+            who = (a.get("responsible") or a.get("owner") or "") if isinstance(a, dict) else ""
+            out.append("Action: %s%s" % (text, (" (%s)" % who) if who else ""))
+    return out
 
 
 def _referenced(sections):
@@ -735,6 +805,9 @@ def _generate_document(artifact, context=None):
     checklist_reports = checklist.apply(
         prose, template, "\n".join(t["line"] for t in turns))
     model_copies = report_facts.drop_model_copies(prose, code_placements)
+    unanchored = _unanchored(prose, skip_titles=list(checklist_reports))
+    if unanchored:
+        logger.info("record: %d line(s) name no topic", len(unanchored))
     # Counted here, after the answer and outside it -- see _coverage_note.
     note = _coverage_note(topic_offer, prose)
     named = _referenced(prose)
@@ -814,6 +887,9 @@ def _generate_document(artifact, context=None):
             # from: the nightly record, computed here, or none.
             "codeFilled": code_meta,
             "modelCopiesDropped": model_copies,
+            # Lines that report no topic of the record -- watched, not yet
+            # acted on (see _unanchored).
+            "linesWithoutATopic": unanchored,
             "topicsNotReferenced": [{"ref": t["ref"], "title": t.get("title"),
                                      "time_range": t.get("time_range")}
                                     for t in not_referenced]}
