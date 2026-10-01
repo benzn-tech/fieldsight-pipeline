@@ -1141,3 +1141,33 @@ def list_profiles(conn, company_id) -> list[dict]:
         "WHERE p.company_id = %s "
         "GROUP BY p.id ORDER BY p.created_at DESC",
         (company_id,)).fetchall()
+
+
+def latest_human_correction(conn, company_id, voiceprint_id, display_name) -> dict | None:
+    """The newest live human correction for a profile: `{session_base, turn_ref}` or None.
+
+    Matched by profile id, OR -- for a correction that created no profile, which stores
+    `voiceprint_id` NULL -- by the name alone. Only `source = 'correction'` counts: a
+    propagated or matched name is the system's guess, and re-offering a guess as "the passage
+    you named" would retry something nobody said.
+    """
+    _require_company(company_id)
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT session_base, turn_ref FROM speaker_turn_names "
+        "WHERE company_id = %s AND source = 'correction' AND superseded_at IS NULL "
+        "  AND (voiceprint_id = %s OR (voiceprint_id IS NULL AND display_name = %s)) "
+        "ORDER BY created_at DESC LIMIT 1",
+        (company_id, voiceprint_id, display_name)).fetchone()
+
+
+def refused_recently_count(conn, company_id, days=7) -> int:
+    """How many live profiles had their last enrolment refused within `days` -- the badge's
+    "not saved" number. One row, no transcript."""
+    _require_company(company_id)
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT count(*) AS n FROM speaker_voiceprints "
+        "WHERE company_id = %s AND status <> 'withdrawn' "
+        "  AND last_attempt_outcome = 'refused' "
+        "  AND last_attempt_at > now() - make_interval(days => %s)",
+        (company_id, days)).fetchone()
+    return int((row or {}).get("n") or 0)
