@@ -167,7 +167,9 @@ def test_retry_delegates_to_speaker_corrections_with_the_same_passage(wired):
     assert resp["statusCode"] == 202, resp
     assert wired["queued"] == [(SRC, {
         "user": "Ben_UCPK", "source_filename": SRC, "start_sec": 9.0, "end_sec": 31.0,
-        "display_name": "Ben Lin"})]
+        "display_name": "Ben Lin",
+        # the known profile, so a retry can never land on a same-named one
+        "voiceprint_id": VP})]
 
 
 def test_retry_with_nothing_to_retry_is_a_plain_409(wired):
