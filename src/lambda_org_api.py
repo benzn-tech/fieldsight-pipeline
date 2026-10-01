@@ -775,6 +775,8 @@ def dispatch(conn, event, method, route):
     m_drs = re.match(r"^/days/([^/]+)/report/status$", route)
     if m_drs and method == "GET":
         return day_report_status(conn, caller, m_drs.group(1), event)
+    if route == "/photos/notice" and method == "GET":
+        return get_photo_notice(conn, caller, event)
     m_dps = re.match(r"^/days/([^/]+)/photos/selection$", route)
     if m_dps and method == "GET":
         return get_photo_selection(conn, caller, m_dps.group(1), event)
@@ -3245,6 +3247,49 @@ def get_photo_selection(conn, caller, date, event):
         return err
     excluded = report_photos.read_excluded(s3(), LAKE_BUCKET, folder, date)
     return ok(_photo_selection_body(conn, caller, folder, date, excluded))
+
+
+# A heads-up before the size changes, then a call to choose (owner, 2026-10-01).
+PHOTO_NOTICE_AT = 50
+
+
+def get_photo_notice(conn, caller, event):
+    """GET /api/org/photos/notice -- for the bell: whether the CALLER's own
+    photographs today (or yesterday, before its nightly report) cross a line.
+
+    Only the person who took them is told (owner, 2026-10-01), so this reads
+    the caller's own folder and nothing else -- no `user` parameter. Levels:
+      approaching  50-60 today: past 60 they go in smaller
+      smaller      61-120 today: they go in smaller, all of them fit
+      choose       past 120 (today or yesterday): choose which to leave out
+    """
+    folder = scope.visible_scope(conn, caller).get("self_folder")
+    if not folder:
+        return ok({"notices": []})
+    today = nz_time.nz_today()
+    notices = []
+    for day, choose_only in ((today, False), (today - timedelta(days=1), True)):
+        date = day.isoformat()
+        photos = _day_photo_block(conn, caller, folder, date) or []
+        if len(photos) < PHOTO_NOTICE_AT and not choose_only:
+            continue
+        if not photos:
+            continue
+        excluded = report_photos.read_excluded(s3(), LAKE_BUCKET, folder, date)
+        included = sum(1 for p in photos if p["s3_key"].rsplit("/", 1)[-1] not in excluded)
+        if included > report_photos.MAX_LIMIT:
+            level = "choose"
+        elif choose_only:
+            continue
+        elif included > report_photos.STANDARD_LIMIT:
+            level = "smaller"
+        else:
+            level = "approaching"
+        notices.append({"date": date, "folder": folder, "count": len(photos),
+                        "included": included, "level": level})
+    return ok({"notices": notices,
+               "limits": {"pageSize": report_photos.STANDARD_LIMIT,
+                          "max": report_photos.MAX_LIMIT}})
 
 
 def put_photo_selection(conn, caller, date, event):

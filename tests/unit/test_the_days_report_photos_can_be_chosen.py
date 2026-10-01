@@ -117,3 +117,47 @@ def test_only_the_photographer_or_an_admin_chooses(api):
     assert code == 403 and store.objects == {}
     code, _ = call("PUT", {"excluded": []}, self="Someone_Else", global_role="admin")
     assert code == 200
+
+
+# ---- the bell's notice: the caller's own day only ------------------------------------
+
+def notice(monkeypatch, store, counts, excluded=None, today="2026-10-01"):
+    import datetime as dt
+    monkeypatch.setattr(org.nz_time, "nz_today", lambda: dt.date.fromisoformat(today))
+    asked = []
+
+    def block(conn, c, folder, date):
+        asked.append((folder, date))
+        return [{"s3_key": "users/%s/pictures/%s/p%03d.jpg" % (folder, date, i)}
+                for i in range(counts.get(date, 0))]
+    monkeypatch.setattr(org, "_day_photo_block", block)
+    if excluded:
+        store.objects["report_photo_selection/%s/%s.json" % (FOLDER, today)] = \
+            json.dumps({"excluded": excluded}).encode()
+    ev = {"httpMethod": "GET", "path": "/api/org/photos/notice", "queryStringParameters": {"user": "Other"},
+          "body": None, "requestContext": {"authorizer": {"claims": {"sub": "s1"}}}}
+    res = org.lambda_handler(ev, None)
+    return json.loads(res["body"])["notices"], asked
+
+
+@pytest.mark.parametrize("n,level", [(49, None), (50, "approaching"), (61, "smaller"), (121, "choose")])
+def test_the_notice_says_what_the_day_count_means(api, monkeypatch, n, level):
+    _, store = api
+    notices, asked = notice(monkeypatch, store, {"2026-10-01": n})
+    assert [x["level"] for x in notices] == ([level] if level else [])
+    assert {f for f, _ in asked} == {FOLDER}, "only the caller's own folder, whatever is asked"
+
+
+def test_yesterday_only_matters_when_it_must_be_chosen(api, monkeypatch):
+    _, store = api
+    notices, _ = notice(monkeypatch, store, {"2026-09-30": 90})
+    assert notices == []
+    notices, _ = notice(monkeypatch, store, {"2026-09-30": 130})
+    assert [(x["date"], x["level"]) for x in notices] == [("2026-09-30", "choose")]
+
+
+def test_a_choice_made_settles_the_notice(api, monkeypatch):
+    _, store = api
+    notices, _ = notice(monkeypatch, store, {"2026-10-01": 125},
+                        excluded=["p%03d.jpg" % i for i in range(10)])
+    assert [(x["level"], x["included"]) for x in notices] == [("smaller", 115)]
