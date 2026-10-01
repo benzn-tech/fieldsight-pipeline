@@ -30,6 +30,9 @@ numpy
 # python-docx -- the Word-export tests open with importorskip("docx"); without it they
 #   SKIP and the suite is green over a path nothing checked.
 python-docx>=1.1
+# Pillow -- report photographs are shrunk to page size (python-docx-layer:3
+#   carries it in Lambda); the shrink tests importorskip("PIL") and would SKIP.
+Pillow>=10
 # pglast -- libpg_query, PostgreSQL's own parser. Without it the SQL parse guards SKIP,
 #   and a skipped SQL guard is exactly the check a connection double cannot make.
 pglast>=7
