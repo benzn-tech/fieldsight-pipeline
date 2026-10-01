@@ -3096,7 +3096,10 @@ def same_name_voiceprints(conn, caller, event):
     if SPEAKER_IDENTITY_MODE == "off":
         return error("not found", 404)
     qs = event.get("queryStringParameters") or {}
-    name = (qs.get("name") or "").strip()
+    # Collapsed exactly as `speaker_corrections` collapses it. Trimming alone left "ben   LIN"
+    # unresolvable to Ben's account here while the save resolved it, so the check asked a
+    # question the save would never have needed (seen on TEST 2026-10-01).
+    name = voiceprints.collapse_name(qs.get("name"))
     if not name:
         return error("name is required", 400)
     folder, err = _resolve_org_media_folder(conn, caller, (qs.get("user") or "").strip(),

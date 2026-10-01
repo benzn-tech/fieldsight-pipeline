@@ -402,3 +402,16 @@ def test_edit_distance_limit_stops_early_but_stays_above_the_limit():
     ("Ben Lin", "", False), ("", "Ben Lin", False)])
 def test_is_similar_name(a, b, similar):
     assert vp.is_similar_name(a, b) is similar
+
+
+def test_the_check_sees_the_name_exactly_as_the_save_will(same, monkeypatch):
+    """`speaker_corrections` collapses inner whitespace before resolving the name; the check
+    must hand the resolver and the lookup the same string, or it asks about a duplicate the
+    save would never make (TEST 2026-10-01: "  ben   LIN " asked while "Ben Lin" did not)."""
+    seen = []
+    same["find_args"].clear()
+    monkeypatch.setattr(org.users, "resolve_display_name",
+                        lambda conn, co, name: (seen.append(name), (None, "x"))[1])
+    _ask({"name": "  ben   LIN "})
+    assert seen == ["ben LIN"]
+    assert same["find_args"][0][1] == "ben LIN"
