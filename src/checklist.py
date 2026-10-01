@@ -26,6 +26,10 @@ ANSWERS = {"yes": "Yes", "y": "Yes", "no": "No", "n": "No", "n/a": "N/A", "na": 
            "not applicable": "N/A"}
 MODEL_COLUMNS = ["Item no", "Answer", "Comment", "Responsible", "Due", "Evidence"]
 DOC_COLUMNS = ["Item", "Answer", "Comment", "Responsible", "Due"]
+# What an item nobody addressed says in its Comment (owner, 2026-10-01). Three
+# empty cells read as "No"; the Answer itself stays empty -- not covered is not
+# a No.
+NOT_COVERED = "Not covered in the recording"
 MAX_ITEMS = 120
 MAX_ITEM_CHARS = 300
 MIN_EVIDENCE_WORDS = 3
@@ -152,7 +156,7 @@ def rebuild(section, items, transcript_text):
             ans, comment, responsible, due, refs = a
             row = [item, ans, comment, responsible, due]
         else:
-            refs, row = [], [item, "", "", "", ""]
+            refs, row = [], [item, "", NOT_COVERED, "", ""]
         paragraphs.append(" | ".join(c.replace("|", "/") for c in row))
         line_refs.append(list(refs))
     return paragraphs, line_refs, report
