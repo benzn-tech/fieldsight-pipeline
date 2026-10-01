@@ -20,6 +20,7 @@ day.
 import datetime as dt
 import json
 import logging
+import re
 
 import report_template
 import site_weather
@@ -104,7 +105,28 @@ def _section(title, paragraphs):
             "level": 1, "covers": []}
 
 
-def header_section(title, artifact, facts):
+_CLOCK_RE = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b")
+
+
+def recorded_span(time_ranges, turn_times=()):
+    """("HH:MM", "HH:MM") from the earliest start to the latest end of the
+    topics in the report -- what was actually recorded, not the window that
+    was asked for: "Everything" is 00:00 - 23:59, which says nothing (owner,
+    2026-10-01). Falls back to the first and last line of speech; None when
+    there is neither."""
+    starts, ends = [], []
+    for tr in time_ranges or []:
+        clocks = ["%02d:%s" % (int(h), m) for h, m in _CLOCK_RE.findall(tr or "")]
+        if clocks:
+            starts.append(clocks[0])
+            ends.append(clocks[-1])
+    if starts:
+        return min(starts), max(ends)
+    times = sorted(t.strftime("%H:%M") for t in turn_times or [] if t is not None)
+    return (times[0], times[-1]) if times else None
+
+
+def header_section(title, artifact, facts, span=None):
     content = artifact.get("content") or {}
     window = artifact.get("window") or {}
     sites = facts.get("sites") or []
@@ -116,8 +138,8 @@ def header_section(title, artifact, facts):
         rows.append(["Client", ", ".join(clients)])
     rows.append(["Date", _long_date(artifact.get("date") or content.get("date"))])
     rows.append(["Recorded by", facts.get("recordedBy") or artifact.get("folder") or ""])
-    rows.append(["Recording window", "%s - %s" % (window.get("from") or "00:00",
-                                                 window.get("to") or "23:59")])
+    frm, to = span or (window.get("from") or "00:00", window.get("to") or "23:59")
+    rows.append(["Recording window", "%s - %s" % (frm, to)])
     return _section(title, _table(rows))
 
 
@@ -200,7 +222,7 @@ def weather_section(title, artifact, facts, s3, bucket, today_iso):
     return _section(title, paragraphs or [NOT_RECORDED]), sources
 
 
-def build(placements, artifact, s3, bucket, today_iso):
+def build(placements, artifact, s3, bucket, today_iso, span=None):
     """The code sections, in placement order, and what each stood on."""
     facts = artifact.get("reportFacts") or {}
     built, meta = [], {}
@@ -208,7 +230,7 @@ def build(placements, artifact, s3, bucket, today_iso):
         s = p["section"]
         title = s.get("title") or ""
         if kind_of(s) == "header":
-            built.append(header_section(title, artifact, facts))
+            built.append(header_section(title, artifact, facts, span))
             meta[title] = {"kind": "header", "facts": bool(facts)}
         else:
             section, sources = weather_section(title, artifact, facts, s3, bucket, today_iso)
