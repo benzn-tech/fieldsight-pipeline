@@ -48,9 +48,10 @@ Live rows first. Withdrawn/merged rows hidden behind "Show deleted (n)".
     1. samples: move source samples to the target; a source sample that would collide with
        a target sample on the one-per-second unique index (0070) is deleted instead
        (the target already holds that window).
-    2. `speaker_turn_names`: rows with `voiceprint_id = source` → target; rows of the same
-       company whose `display_name` = source name and `voiceprint_id IS NULL`, if the
-       target's name differs, get the target's name (only when names differ).
+    2. `speaker_turn_names`: rows with `voiceprint_id = source` → target, and their
+       `display_name` becomes the target's. Rows with no voiceprint are NOT touched by
+       name: another person may share the name, which is the whole problem.
+    2b. every other `voiceprint_id` column (e.g. `site_attendance`) → target.
     3. `speaker_name_proposals`: source → target; drop rows that would collide with an
        existing target row (unique key).
     4. target inherits `user_id` (and link columns) when it has none and the source has one;
@@ -62,6 +63,12 @@ Live rows first. Withdrawn/merged rows hidden behind "Show deleted (n)".
 - Migration (next free number): `speaker_voiceprints` adds nullable `merged_into uuid
   REFERENCES speaker_voiceprints(id)`, `merged_at timestamptz`, `merged_by uuid REFERENCES
   users(id)`.
+
+## Rename — `PATCH /api/org/voiceprints/{id}` `{"displayName": "Ben Lin (Cassidy)"}`
+
+So two genuinely different Ben Lins can be told apart in every transcript. Trimmed, 1–80
+chars, live profile, same company, `_CORRECTION_ROLES`. Updates the profile and the
+`display_name` of its `speaker_turn_names` rows (by `voiceprint_id` only), one transaction.
 
 ## Tests that must go red without the change
 
