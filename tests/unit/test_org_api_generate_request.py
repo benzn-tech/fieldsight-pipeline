@@ -321,3 +321,15 @@ def test_session_generate_with_email_delivery_is_refused_before_anything_is_enqu
     assert res["statusCode"] == 400
     assert "download" in json.loads(res["body"])["error"].lower()
     assert puts == [], "nothing may be enqueued for a template+email combination"
+
+
+def test_the_days_location_markers_travel_with_the_request(day, monkeypatch):
+    """So the worker can put each photograph in the line naming where it was
+    taken (owner, 2026-10-01)."""
+    monkeypatch.setattr(FakeConn, "transaction", lambda self: self, raising=False)
+    monkeypatch.setattr(org.location_markers, "for_day", lambda conn, cid, folder, date: [
+        {"at": "13:24", "location": "Ground floor", "quote": "Ground floor inspection."}])
+    res, puts = _generate_raw(day, _body())
+    assert res["statusCode"] == 202
+    assert json.loads(puts[0]["Body"])["reportFacts"]["locations"] == [
+        {"at": "13:24", "location": "Ground floor"}]
