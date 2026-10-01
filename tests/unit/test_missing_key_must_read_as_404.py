@@ -89,6 +89,8 @@ MISSING_KEY_IS_NORMAL = [
      "record; most days have none and fall back to computing it"),
     ("SessionReportFunction", "programmes/*",
      "report_facts._programme: most sites have no programme uploaded"),
+    ("SessionReportFunction", "report_photo_selection/*",
+     "report_photos.read_excluded: most days nobody has chosen photographs to leave out"),
     # handoff-sync plan §2.2/§2.3: the FINAL email polls session_brief/ for the
     # brief its sibling `kind:"brief"` request asked for concurrently, and on
     # every attempt but the last (almost always) the key is not there yet --

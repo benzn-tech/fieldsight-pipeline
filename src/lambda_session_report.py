@@ -29,6 +29,7 @@ import llm_utils
 import nz_time
 import photo_binding
 import report_facts
+import report_photos
 import report_template
 import transcript_window
 from email_sender import get_sender
@@ -56,36 +57,19 @@ DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessin
 # walk, so the count is per REPORT, not per topic -- one topic may take them
 # all. At page size that is ~15-20 MB of document; the byte budget is now only
 # a guard against a pathological day, not the limit people meet.
-MAX_PHOTOS_PER_REPORT = 60
+#
+# 60 at page size, then up to 120 shrunk automatically, then the person
+# chooses (owner, 2026-10-01) -- the rules live in report_photos, shared with
+# the nightly daily report.
+MAX_PHOTOS_PER_REPORT = report_photos.MAX_LIMIT
 MAX_PHOTOS_PER_TOPIC = MAX_PHOTOS_PER_REPORT
 MAX_PHOTO_BYTES_TOTAL = 40 * 1024 * 1024
-PHOTO_MAX_EDGE = 1600        # px, long edge: sharper than a page, a tenth of the bytes
-PHOTO_JPEG_QUALITY = 80
-
-try:                         # the python-docx layer from v3 carries Pillow
-    from PIL import Image, ImageOps
-except ImportError:          # pragma: no cover - older layer: photos go in as taken
-    Image = ImageOps = None
+PHOTO_MAX_EDGE = report_photos.STANDARD_EDGE
 
 
-def _shrink(body):
-    """A photograph at page size, upright, as JPEG -- or the original bytes when
-    Pillow is not there, the file is not an image it can read, or shrinking
-    would not make it smaller. Never raises: the picture is evidence, and a
-    larger one beats a missing one."""
-    if Image is None:
-        return body
-    try:
-        img = ImageOps.exif_transpose(Image.open(BytesIO(body)))
-        img = img.convert("RGB")
-        img.thumbnail((PHOTO_MAX_EDGE, PHOTO_MAX_EDGE))
-        out = BytesIO()
-        img.save(out, "JPEG", quality=PHOTO_JPEG_QUALITY, optimize=True)
-        small = out.getvalue()
-        return small if len(small) < len(body) else body
-    except Exception:
-        logger.warning("could not shrink a photo; using it as taken", exc_info=True)
-        return body
+def _shrink(body, edge=PHOTO_MAX_EDGE):
+    """See report_photos.shrink: upright, `edge` px, JPEG; never raises."""
+    return report_photos.shrink(body, edge)
 
 _s3_client = None
 
@@ -142,7 +126,7 @@ def _humanize(key):
     return str(key).replace("_", " ").title()
 
 
-def _fetch_photos(folder, date, filenames, budget, names_out=None):
+def _fetch_photos(folder, date, filenames, budget, names_out=None, edge=None):
     """Download a topic's photos as open streams, newest failure tolerated.
 
     The renderer does no I/O and must stay that way, so the bytes are fetched
@@ -165,7 +149,7 @@ def _fetch_photos(folder, date, filenames, budget, names_out=None):
         except Exception:
             logger.warning("could not read photo %s; leaving it out", key)
             continue
-        body = _shrink(body)
+        body = _shrink(body, edge or PHOTO_MAX_EDGE)
         streams.append(BytesIO(body))
         if names_out is not None:
             names_out.append(name)       # which file each stream is: a skipped one shifts nothing
@@ -227,14 +211,24 @@ def _offered_topics(artifact, budget, win_from, win_to):
     folder = artifact.get("folder")
     content = artifact.get("content") or {}
     date = artifact.get("date") or content.get("date")
-    for i, topic in enumerate(content.get("topics") or []):
-        if not _in_window(topic, date, win_from, win_to):
-            continue
+    in_window = [(i, t) for i, t in enumerate(content.get("topics") or [])
+                 if _in_window(t, date, win_from, win_to)]
+    # THE WHOLE REPORT IS PLANNED BEFORE ANYTHING IS FETCHED (report_photos):
+    # the person's own exclusions for the day, one copy of each photograph,
+    # the size the count calls for, and -- past MAX_LIMIT -- a fair share per
+    # topic rather than whatever the first topics happened to hold.
+    excluded = (report_photos.read_excluded(s3(), S3_BUCKET, folder, date)
+                if folder and S3_BUCKET else set())
+    chosen, edge, _ = report_photos.plan(
+        [("t%d" % i, t.get("related_photos") or []) for i, t in in_window], excluded)
+    PLAN_STATS.update({"edge": edge, "excluded": excluded})
+    for i, topic in in_window:
         ref = "t%d" % i
-        names = [n for n in (topic.get("related_photos") or []) if n]
+        names = chosen.get(ref) or []
+        mine_all = [n for n in (topic.get("related_photos") or []) if n and n not in excluded]
         fresh = [n for n in names if n not in seen]
         got_names = []
-        got = _fetch_photos(folder, date, fresh, budget, got_names) if fresh else []
+        got = _fetch_photos(folder, date, fresh, budget, got_names, edge) if fresh else []
         for name, stream in zip(got_names, got):
             seen[name] = stream
         kept = [n for n in names if n in seen]
@@ -250,11 +244,23 @@ def _offered_topics(artifact, budget, win_from, win_to):
                       # Aligned with streams[ref]: which file each one is, so a
                       # photograph can be placed by WHERE it was taken.
                       "photo_names": kept,
-                      # Bound to this topic and not in the report: past the
-                      # report's budget, or unreadable. Counted, so a report
-                      # never says less than the day had without saying so.
-                      "photos_left_out": len(names) - len(kept)})
+                      # Bound to this topic, not left out by the person, and not
+                      # in the report: past the report's limit, or unreadable.
+                      # Counted, so a report never says less than the day had
+                      # without saying so. A photograph another topic carries
+                      # is not left out.
+                      "photos_left_out": len([n for n in mine_all if n not in seen
+                                              and not _carried_elsewhere(n, chosen, ref)])})
     return offer, streams
+
+
+# The last plan's size and exclusions, for the result's provenance. Module
+# state is safe here: one invocation renders one report at a time.
+PLAN_STATS = {}
+
+
+def _carried_elsewhere(name, chosen, ref):
+    return any(name in names for r, names in chosen.items() if r != ref)
 
 
 def _unanchored(prose, skip_titles=()):
@@ -914,6 +920,18 @@ def _generate_document(artifact, context=None):
                     sum(len(v) for v in photo_streams.values()),
                     at_line, at_section, orphaned)
 
+    # PAST THE LIMIT, THE REPORT SAYS SO (owner, 2026-10-01): written by us,
+    # at the end, so a reader knows the day had more photographs than the
+    # document carries. No link: a customer document carries no app URL.
+    left_out = sum(t.get("photos_left_out") or 0 for t in topic_offer)
+    if left_out:
+        included = sum(t.get("photos") or 0 for t in topic_offer)
+        line = ("Photographs: %d taken in this window; %d included in this report."
+                % (included + left_out, included))
+        tail = note if note else prose[-1]
+        tail["paragraphs"] = list(tail.get("paragraphs") or []) + [line]
+        tail["line_refs"] = list(tail.get("line_refs") or []) + [[]]
+
     # Put in after the photographs were placed, so none can fall to them.
     report_facts.insert(prose, code_placements, code_sections,
                         (template.get("catch_all") or {}).get("title"))
@@ -957,6 +975,10 @@ def _generate_document(artifact, context=None):
             "photosUnderASection": at_section,
             "photosUnplaced": orphaned,
             "photosLeftOut": sum(t.get("photos_left_out") or 0 for t in topic_offer),
+            # The size the count called for (report_photos), and how many the
+            # person chose to leave out of the day's reports.
+            "photoEdge": PLAN_STATS.get("edge"),
+            "photosExcludedByChoice": len(PLAN_STATS.get("excluded") or ()),
             # What the coverage note was built from. `topicsNotReferenced` is
             # exactly what the note printed; it is here because the note is in
             # a Word file and this is not.

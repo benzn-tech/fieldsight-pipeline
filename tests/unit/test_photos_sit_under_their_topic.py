@@ -303,7 +303,7 @@ def test_a_file_named_by_two_topics_is_fetched_once(monkeypatch):
     twice would charge the shared byte budget twice for one picture."""
     calls = []
 
-    def fake(folder, date, names, budget, names_out=None):
+    def fake(folder, date, names, budget, names_out=None, edge=None):
         calls.append(list(names))
         if names_out is not None:
             names_out.extend(names)
@@ -318,7 +318,10 @@ def test_a_file_named_by_two_topics_is_fetched_once(monkeypatch):
     offer, streams = sr._offered_topics(artifact, [sr.MAX_PHOTO_BYTES_TOTAL], *DAY)
     assert calls == [["a.jpg"], ["b.jpg"]]
     assert [o["ref"] for o in offer] == ["t0", "t1"]
-    assert streams["t0"][0] is streams["t1"][0]
+    # One copy of each photograph in a report (report_photos.plan, 2026-10-01):
+    # it sits with the first topic that names it, not under both.
+    assert len(streams["t0"]) == 1 and len(streams["t1"]) == 1
+    assert offer[1]["photo_names"] == ["b.jpg"] and offer[1]["photos_left_out"] == 0
 
 
 def test_a_topic_whose_photograph_cannot_be_read_is_offered_with_none(monkeypatch):
