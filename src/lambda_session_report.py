@@ -271,9 +271,13 @@ def _place_photos(sections, streams_by_ref):
          because the model forgot a tag would be indistinguishable from one
          that was never taken.
 
-    A photograph appears ONCE, under the first line that names its topic. A
-    day's work does not divide neatly and two lines naming the same topic is
-    not an error, but the picture printed twice would read as one.
+    A photograph appears ONCE. A day's work does not divide neatly and two
+    lines naming the same topic is not an error, but the picture printed twice
+    would read as one. It goes to the MOST SPECIFIC line naming the topic --
+    a table row, then a list item, then a paragraph; the first of equals.
+    "First line" alone put every inspection photograph under the Daily
+    Summary's prose and none in the section that listed the inspections
+    (TEST, Ben_Lin_test2 2026-10-01): the overview cites everything first.
     """
     if not streams_by_ref or not sections:
         return 0, 0, 0
@@ -286,17 +290,24 @@ def _place_photos(sections, streams_by_ref):
         taken.add(ref)
         return list(streams_by_ref[ref])
 
-    for section in sections:
-        after = {}
+    best = {}                                   # ref -> (rank, order, section, line)
+    order = 0
+    for s, section in enumerate(sections):
+        paragraphs = section.get("paragraphs") or []
+        has_table = any(lambda_meeting_minutes._TABLE_RULE_RE.match(p or "") and "|" in (p or "") for p in paragraphs)
         for i, refs in enumerate(section.get("line_refs") or []):
-            mine = []
+            text = (paragraphs[i] if i < len(paragraphs) else "") or ""
+            rank = 3 if has_table and "|" in text else 2 if text.lstrip().startswith(("- ", "* ")) else 1
             for ref in refs:
-                mine.extend(claim(ref))
-            if mine:
-                after[i] = mine
-                at_line += len(mine)
-        if after:
-            section["photos_after"] = after
+                if ref in streams_by_ref and (ref not in best or rank > best[ref][0]):
+                    best[ref] = (rank, order, s, i)
+                order += 1
+    for ref, (_, _, s, i) in sorted(best.items(), key=lambda kv: kv[1][1]):
+        mine = claim(ref)
+        if mine:
+            after = sections[s].setdefault("photos_after", {})
+            after[i] = after.get(i, []) + mine
+            at_line += len(mine)
 
     for section in sections:
         mine = []
@@ -654,7 +665,9 @@ def _generate_document(artifact, context=None):
     # read budget rather than the render reserve.
     model_template, code_placements = report_facts.split_plan(template)
     code_sections, code_meta = report_facts.build(
-        code_placements, artifact, client, S3_BUCKET, nz_time.nz_today().isoformat())
+        code_placements, artifact, client, S3_BUCKET, nz_time.nz_today().isoformat(),
+        span=report_facts.recorded_span([t.get("time_range") for t in topic_offer],
+                                        [t.get("at") for t in turns]))
 
     prompt = report_template.render_prompt(
         model_template,
@@ -714,7 +727,10 @@ def _generate_document(artifact, context=None):
 
     buf = lambda_meeting_minutes.generate_prose_document(
         artifact.get("title") or gen.get("templateName") or template.get("name") or "Report",
-        "%s  %s - %s" % (date, window.get("from") or "00:00", window.get("to") or "23:59"),
+        # The date only (owner, 2026-10-01): the window asked for is mostly
+        # "everything", 00:00 - 23:59, which says nothing; when there is a
+        # Report Details section it carries what was actually recorded.
+        date,
         prose,
         _action_items_for_prompt(content),
         closing=note)

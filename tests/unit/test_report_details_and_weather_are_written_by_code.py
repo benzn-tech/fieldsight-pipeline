@@ -208,3 +208,7 @@ def test_THE_the_model_is_never_asked_to_write_the_weather(monkeypatch):
     assert "Light rain" in texts and "Naylor Love" in texts
     heads = [b for b in body if b in ("Report details", "Summary", "Weather", "Safety")]
     assert heads == ["Report details", "Summary", "Weather", "Safety"]
+    # The subtitle is the date alone, and the details say what was recorded
+    # (the one line of speech, 09:00), not the 07:00 - 16:30 window asked for.
+    assert body[1] == "2026-09-23"
+    assert "Recording window09:00 - 09:00" in "".join(body)
