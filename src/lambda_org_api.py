@@ -796,6 +796,9 @@ def dispatch(conn, event, method, route):
         return speaker_known(conn, caller, event)
     if route == "/voiceprints" and method == "GET":
         return list_voiceprints(conn, caller)
+    # A literal segment, so it must not fall to a `{id}` pattern; kept above them.
+    if route == "/voiceprints/same-name" and method == "GET":
+        return same_name_voiceprints(conn, caller, event)
     # Before `/voiceprints/{id}`: that pattern cannot match a path with a suffix, but the
     # order is the cheap insurance if somebody loosens it -- the sibling route withdraws a
     # biometric.
@@ -2111,6 +2114,19 @@ def _split_for_budget(turns):
         turns, MATCH_SECONDS_PER_RUN, MATCH_TURNS_PER_RUN)
 
 
+def _identity_fields(r):
+    """The fields that tell two same-named profiles apart, from a `list_profiles` /
+    `same_name_profiles` row. One shape for the Voices page and the naming chooser."""
+    return {
+        "linkedAccount": ({"name": r.get("linked_name"), "email": r.get("linked_email")}
+                          if r.get("user_id") else None),
+        "heardOn": list(r.get("heard_on") or [])[:3],
+        "firstNamed": {"at": _iso_day(r.get("first_named_at") or r.get("created_at")),
+                       "by": r.get("first_named_by")},
+        "employer": r.get("employer_name"),
+    }
+
+
 def list_voiceprints(conn, caller):
     """GET /api/org/voiceprints — every profile this company holds, and why each is as it is.
 
@@ -2147,12 +2163,7 @@ def list_voiceprints(conn, caller):
         "lastAttemptDetail": r.get("last_attempt_detail"),
         # Identity (spec 2026-10-01): what lets a person tell two "Ben Lin"s apart. Plain
         # values only -- no similarity score ever reaches a customer.
-        "linkedAccount": ({"name": r.get("linked_name"), "email": r.get("linked_email")}
-                          if r.get("user_id") else None),
-        "heardOn": list(r.get("heard_on") or [])[:3],
-        "firstNamed": {"at": _iso_day(r.get("first_named_at") or r.get("created_at")),
-                       "by": r.get("first_named_by")},
-        "employer": r.get("employer_name"),
+        **_identity_fields(r),
         "mergedInto": ({"id": str(r["merged_into"]),
                         "displayName": r.get("merged_into_name")}
                        if r.get("merged_into") else None),
@@ -2248,6 +2259,9 @@ def retry_voiceprint(conn, caller, voiceprint_id, event):
             "start_sec": passage["startSec"],
             "end_sec": passage["endSec"],
             "display_name": person["display_name"],
+            # THIS profile, not whichever same-named one the lookup would pick: a retry
+            # concerns one known row and must never land on (or create) another.
+            "voiceprint_id": str(person["id"]),
         })))
 
 
@@ -2920,6 +2934,9 @@ def _apply_confirmed_proposal(conn, caller, company_id, row, event):
         "start_sec": best["start_sec"],
         "end_sec": best["end_sec"],
         "display_name": person["display_name"],
+        # The proposal is about ONE known profile; pass it so the name cannot attach to a
+        # different same-named one (spec 2026-10-01).
+        "voiceprint_id": str(row["voiceprint_id"]),
     })))
 
 
@@ -3058,6 +3075,57 @@ def _apply_confirmed_suggestion(conn, caller, company_id, row, display_name, eve
     })))
 
 
+def same_name_voiceprints(conn, caller, event):
+    """GET /api/org/voiceprints/same-name?name=&user= -- would naming this person be ambiguous?
+
+    Spec 2026-10-01. Before a correction is sent the naming panel asks this; when `ask` is
+    true it shows the profiles and lets the namer say which one it is, or "someone else".
+    Writes nothing.
+
+    Authorised exactly as `speaker_corrections` authorises: the folder resolve, then a
+    correction role or the caller's own recording, then the same-company check -- whoever may
+    name a speaker may ask who the name could mean.
+
+    `wouldUse` is what the correction would attach to if sent as it is now: the SAME lookup
+    (`voiceprints.find_existing_profile`), with the caller as asserter and the directory
+    resolution of the name as the user. `ask` is false only when the answer is already
+    certain: no profile of that name (a new one is made), or exactly one and it is the one
+    the lookup would use. Two or more, or one the lookup would NOT use (a duplicate is about
+    to be made), is a question.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    qs = event.get("queryStringParameters") or {}
+    name = (qs.get("name") or "").strip()
+    if not name:
+        return error("name is required", 400)
+    folder, err = _resolve_org_media_folder(conn, caller, (qs.get("user") or "").strip(),
+                                            what="same-name check")
+    if err is not None:
+        return err
+    if not _may_correct_speakers(conn, caller, folder):
+        return error("naming a speaker needs an admin, gm, pm, site_manager or "
+                     "platform_admin role, or your own recording", 403)
+    err = _same_company_as_folder(conn, caller, folder, "same-name check")
+    if err is not None:
+        return err
+    company_id = str(caller["company_id"])
+    rows = voiceprints.same_name_profiles(conn, company_id, name)
+    person, _matched_on = users.resolve_display_name(conn, company_id, name)
+    found = voiceprints.find_existing_profile(
+        conn, company_id, name, str(person["id"]) if person else None, str(caller["id"]))
+    would_use = str(found["id"]) if found else None
+    ids = [str(r["id"]) for r in rows]
+    ask = len(rows) >= 2 or (len(rows) == 1 and would_use != ids[0])
+    return ok({
+        "profiles": [{"id": str(r["id"]), "displayName": r.get("display_name"),
+                      **_identity_fields(r), "lastHeard": _iso_day(r.get("last_heard"))}
+                     for r in rows],
+        "wouldUse": would_use,
+        "ask": ask,
+    })
+
+
 def speaker_corrections(conn, caller, session_base, event):
     """POST /api/org/sessions/{session_base}/speaker-corrections
 
@@ -3124,6 +3192,21 @@ def speaker_corrections(conn, caller, session_base, event):
     if body.get("employer_ref") is not None:
         return error("employer_ref is not accepted yet: it is the sign-in register's key and "
                      "nothing reads it until that adapter ships", 400)
+
+    # The two answers to "which same-name person?" (spec 2026-10-01); at most one. They only
+    # matter inside the enrol branch below -- with enrolment off no profile is touched, so
+    # there is nothing to choose between and they are ignored rather than refused (the
+    # propagation half works on audio alone and is the same either way).
+    chosen_id = body.get("voiceprint_id") or None
+    new_person = body.get("new_person") is True
+    if chosen_id is not None and body.get("new_person") not in (None, False):
+        return error("voiceprint_id and new_person are mutually exclusive: it is either "
+                     "this person or someone else with the same name", 400)
+    if chosen_id is not None:
+        try:
+            chosen_id = str(uuid.UUID(str(chosen_id)))
+        except ValueError:
+            return error("voiceprint_id must be a profile id", 400)
 
     name = (body.get("display_name") or "").strip()
     if not name:
@@ -3216,25 +3299,46 @@ def speaker_corrections(conn, caller, session_base, event):
             # a string cannot be narrowed by site, and two people sharing a name land on one
             # profile — an identity is the stabler key.
             person, matched_on = users.resolve_display_name(conn, company_id, name)
-            profile = voiceprints.upsert_profile(
-                conn, company_id, display_name=name,
-                consent_given=not attest,
-                consented_by=body.get("consented_by"),
-                # The claim and who made it, kept apart from the subject. `asserted_by` is
-                # the caller; `consented_by` stays empty on this path because nobody has
-                # said the subject agreed — putting the caller there would make every row
-                # in the table ambiguous about which of the two it records.
-                consent_basis=company_basis if attest else "confirmed",
-                # WHO invoked the company's basis on this occasion. Under `notice` the basis
-                # itself is the induction, not this person's word — but the row still records
-                # which account acted, because "the company had a policy" and "somebody
-                # applied it to this recording" are different facts and an audit needs both.
-                asserted_by=str(caller["id"]) if attest else None,
-                user_id=str(person["id"]) if person else None,
-                linked_by=str(caller["id"]) if person else None,
-                linked_on=matched_on if person else None,
-                employer_name=employer_name, employer_source=employer_source,
-                employer_set_by=str(caller["id"]) if employer_name else None)
+            if chosen_id is not None:
+                # "It is this one": no lookup. It must be a live, consented profile of THIS
+                # company -- never another tenant's, never a withdrawn one, never an
+                # unconsented shell. No account link: the profile keeps whatever link it
+                # has, because two profiles linked to one user is worse than none.
+                profile = voiceprints.get_consented_live_profile(conn, company_id, chosen_id)
+                if profile is None:
+                    return error("voiceprint_id is not a live, consented profile of this "
+                                 "company", 400)
+                if employer_name is not None:
+                    voiceprints.set_employer(conn, company_id, chosen_id, employer_name,
+                                             employer_source, str(caller["id"]))
+                person, matched_on = None, "profile-chosen"
+            else:
+                # "Someone else with this name" always inserts. The directory user is linked
+                # only when they have no live profile yet -- a second profile on one account
+                # is the duplicate the chooser exists to prevent.
+                if new_person and person and voiceprints.user_has_live_profile(
+                        conn, company_id, str(person["id"])):
+                    person, matched_on = None, "has-profile"
+                profile = voiceprints.upsert_profile(
+                    conn, company_id, display_name=name,
+                    force_new=new_person,
+                    consent_given=not attest,
+                    consented_by=body.get("consented_by"),
+                    # The claim and who made it, kept apart from the subject. `asserted_by` is
+                    # the caller; `consented_by` stays empty on this path because nobody has
+                    # said the subject agreed — putting the caller there would make every row
+                    # in the table ambiguous about which of the two it records.
+                    consent_basis=company_basis if attest else "confirmed",
+                    # WHO invoked the company's basis on this occasion. Under `notice` the basis
+                    # itself is the induction, not this person's word — but the row still records
+                    # which account acted, because "the company had a policy" and "somebody
+                    # applied it to this recording" are different facts and an audit needs both.
+                    asserted_by=str(caller["id"]) if attest else None,
+                    user_id=str(person["id"]) if person else None,
+                    linked_by=str(caller["id"]) if person else None,
+                    linked_on=matched_on if person else None,
+                    employer_name=employer_name, employer_source=employer_source,
+                    employer_set_by=str(caller["id"]) if employer_name else None)
         except ValueError as exc:
             return error(str(exc), 400)
         _linked_person, _linked_on = person, matched_on
