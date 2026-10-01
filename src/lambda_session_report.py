@@ -51,8 +51,14 @@ DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessin
 # with a photograph per spot -- 7 on the TEST day that raised it (2026-10-01)
 # -- so photographs are now shrunk to what a page shows (PHOTO_MAX_EDGE) and
 # the cap counts pictures a reader can use, not bytes.
-MAX_PHOTOS_PER_TOPIC = 12
-MAX_PHOTO_BYTES_TOTAL = 12 * 1024 * 1024
+#
+# SIXTY A REPORT (owner, 2026-10-01): a real site day can be a long inspection
+# walk, so the count is per REPORT, not per topic -- one topic may take them
+# all. At page size that is ~15-20 MB of document; the byte budget is now only
+# a guard against a pathological day, not the limit people meet.
+MAX_PHOTOS_PER_REPORT = 60
+MAX_PHOTOS_PER_TOPIC = MAX_PHOTOS_PER_REPORT
+MAX_PHOTO_BYTES_TOTAL = 40 * 1024 * 1024
 PHOTO_MAX_EDGE = 1600        # px, long edge: sharper than a page, a tenth of the bytes
 PHOTO_JPEG_QUALITY = 80
 
@@ -150,7 +156,7 @@ def _fetch_photos(folder, date, filenames, budget, names_out=None):
     object was deleted would be the wrong trade."""
     streams = []
     for name in (filenames or [])[:MAX_PHOTOS_PER_TOPIC]:
-        if budget[0] <= 0:
+        if budget[0] <= 0 or (len(budget) > 1 and budget[1] <= 0):
             logger.info("photo budget spent; skipping %s", name)
             break
         key = f"users/{folder}/pictures/{date}/{name}"
@@ -164,6 +170,8 @@ def _fetch_photos(folder, date, filenames, budget, names_out=None):
         if names_out is not None:
             names_out.append(name)       # which file each stream is: a skipped one shifts nothing
         budget[0] -= len(body)
+        if len(budget) > 1:
+            budget[1] -= 1                   # the report-wide count (MAX_PHOTOS_PER_REPORT)
     return streams
 
 
@@ -241,7 +249,11 @@ def _offered_topics(artifact, budget, win_from, win_to):
                       "photos": len(mine),
                       # Aligned with streams[ref]: which file each one is, so a
                       # photograph can be placed by WHERE it was taken.
-                      "photo_names": kept})
+                      "photo_names": kept,
+                      # Bound to this topic and not in the report: past the
+                      # report's budget, or unreadable. Counted, so a report
+                      # never says less than the day had without saying so.
+                      "photos_left_out": len(names) - len(kept)})
     return offer, streams
 
 
@@ -824,7 +836,7 @@ def _generate_document(artifact, context=None):
     # THE PHOTOGRAPHS ARE FETCHED BEFORE THE PROMPT IS BUILT, because the
     # prompt tells the model how many each topic has, and that number has to
     # have bytes behind it.
-    photo_budget = [MAX_PHOTO_BYTES_TOTAL]
+    photo_budget = [MAX_PHOTO_BYTES_TOTAL, MAX_PHOTOS_PER_REPORT]
     topic_offer, photo_streams = _offered_topics(artifact, photo_budget, win_from, win_to)
 
     # REPORT DETAILS AND WEATHER ARE OURS. Those sections leave the plan the
@@ -944,6 +956,7 @@ def _generate_document(artifact, context=None):
             "photosUnderALine": at_line,
             "photosUnderASection": at_section,
             "photosUnplaced": orphaned,
+            "photosLeftOut": sum(t.get("photos_left_out") or 0 for t in topic_offer),
             # What the coverage note was built from. `topicsNotReferenced` is
             # exactly what the note printed; it is here because the note is in
             # a Word file and this is not.

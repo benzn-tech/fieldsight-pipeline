@@ -68,3 +68,32 @@ def test_the_budget_is_spent_on_the_shrunk_bytes(monkeypatch):
     assert len(streams) == 7, "seven inspection photographs all fit"
     assert sr.MAX_PHOTO_BYTES_TOTAL - budget[0] == sum(len(s.getvalue()) for s in streams)
     assert all(len(s.getvalue()) < len(big) for s in streams)
+
+
+def test_sixty_photographs_a_report_and_the_rest_are_counted(monkeypatch):
+    """Owner, 2026-10-01: sixty a report, however they divide between topics;
+    what does not fit is counted in the result, never silently dropped."""
+    import datetime as dt
+    tiny = jpeg(200, 150)
+
+    class S3:
+        def get_object(self, Bucket, Key):
+            return {"Body": io.BytesIO(tiny)}
+    monkeypatch.setattr(sr, "s3", lambda: S3())
+    names = ["p%02d_13-25-%02d.jpg" % (i, i % 60) for i in range(70)]
+    artifact = {"folder": "F", "date": "2026-10-01", "content": {"topics": [
+        {"topic_title": "Walk", "time_range": "13:00 - 14:00", "related_photos": names[:50]},
+        {"topic_title": "Pour", "time_range": "14:00 - 15:00", "related_photos": names[50:]}]}}
+    budget = [sr.MAX_PHOTO_BYTES_TOTAL, sr.MAX_PHOTOS_PER_REPORT]
+    offer, streams = sr._offered_topics(artifact, budget, dt.datetime(2026, 10, 1),
+                                        dt.datetime(2026, 10, 1, 23, 59))
+    assert len(streams["t0"]) == 50, "one topic may take far more than the old 12"
+    assert len(streams["t1"]) == 10 and offer[1]["photos_left_out"] == 10
+    assert sum(len(v) for v in streams.values()) == sr.MAX_PHOTOS_PER_REPORT == 60
+
+
+def test_the_worker_spends_the_report_wide_count():
+    """Wiring, pinned by source: the generate path hands the count to the walk."""
+    import inspect
+    assert "photo_budget = [MAX_PHOTO_BYTES_TOTAL, MAX_PHOTOS_PER_REPORT]" in \
+        inspect.getsource(sr._generate_document)
