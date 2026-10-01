@@ -375,6 +375,7 @@ def parse_body(event):
 
 REPUBLISH_SITE_COORDS_TASK = "republish_site_coords"
 COLLAPSE_PHOTOS_TASK = "collapse_multibound_photos"
+REBIND_DAY_TASK = "rebind_day_photos"
 
 
 def lambda_handler(event, context):
@@ -388,6 +389,15 @@ def lambda_handler(event, context):
     # OPERATOR TASK, invoked by hand with `aws lambda invoke` (IAM decides who
     # may). The same envelope rule as above keeps it out of reach of the API.
     # A dry run unless "apply" is exactly true: a typo must not write.
+    # Same envelope rule, same dry-run default. One day, under today's binding
+    # rules -- for after a rule change (photo_collapse.rebind_one_day).
+    if isinstance(event, dict) and event.get("task") == REBIND_DAY_TASK:
+        import photo_collapse
+        if not event.get("folder") or not event.get("date"):
+            return {"error": "folder and date are required"}
+        with get_connection() as conn:
+            return photo_collapse.rebind_one_day(conn, s3(), LAKE_BUCKET, event["folder"],
+                                                 event["date"], apply=event.get("apply") is True)
     if isinstance(event, dict) and event.get("task") == COLLAPSE_PHOTOS_TASK:
         import photo_collapse
         with get_connection() as conn:

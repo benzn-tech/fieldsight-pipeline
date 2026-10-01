@@ -112,3 +112,34 @@ def _run(conn, s3, bucket, apply, folder, date):
         # said it worked" is not the same as "the table now says so".
         summary["multibound_photos_after"] = multibound_photo_count(conn)
     return summary
+
+
+def rebind_one_day(conn, s3, bucket, folder, date, apply=False):
+    """Rebind ONE day under today's rules, and say where every photo went.
+
+    For a rule change (2026-10-01: a location owns its photos): the days
+    already bound keep the old answer until something rebinds them, and
+    `run` above only visits days with a multi-bound photo. A dry run unless
+    `apply` -- the writes happen in a savepoint that is always rolled back,
+    so the answer is the real rebind's, not a re-implementation of it.
+    """
+    photos = photo_binding.list_pictures(s3, bucket, f"users/{folder}/pictures/{date}/")
+
+    def rebind():
+        written = photo_rebind.rebind_day_photos(
+            conn, company_of(conn, folder), folder, date, photos)
+        rows = conn.cursor().execute(
+            "SELECT t.id, t.title, t.time_range, count(tp.s3_key) "
+            "FROM topics t JOIN topic_photos tp ON tp.topic_id = t.id "
+            "WHERE tp.source = 'binding' AND tp.s3_key LIKE %s "
+            "GROUP BY t.id, t.title, t.time_range ORDER BY t.time_range",
+            (f"users/{folder}/pictures/{date}/%",)).fetchall()
+        return {"folder": folder, "date": date, "applied": apply,
+                "photos_listed": len(photos), "binds_written": written,
+                "by_topic": [{"topic_id": str(r[0]), "title": r[1], "time_range": r[2],
+                              "photos": r[3]} for r in rows]}
+
+    if apply:
+        return rebind()
+    with conn.transaction(force_rollback=True):
+        return rebind()
