@@ -74,3 +74,16 @@ def test_a_photograph_that_cannot_be_read_shifts_no_other_name(monkeypatch):
                                         dt.datetime(2026, 10, 1, 23, 59))
     assert offer[0]["photo_names"] == ["a_13-25-06.jpg", "c_13-28-15.jpg"]
     assert [s.getvalue().decode().rsplit("/", 1)[-1] for s in streams["t0"]] == offer[0]["photo_names"]
+
+
+def test_the_place_beats_the_rank():
+    """TEST run 2026-10-01: the checklist left Level 0 unanswered; the Ground
+    floor photographs went into the Level 1 row although a Quality line named
+    the Ground floor. A line naming the place wins over a more specific one
+    that does not."""
+    secs = sr._prose_sections(
+        "### Quality\n- Ground floor inspection carried out [t2]\n\n"
+        "### Checklist\nItem | Answer\n---|---\nIs the Level 1 inspected? | Yes [t2]\n")
+    sr._place_photos(secs, {"t2": ["g1", "l1"]}, places={"t2": ["ground floor", "level 1"]})
+    assert secs[0]["photos_after"] == {0: ["g1"]}
+    assert secs[1]["photos_after"] == {2: ["l1"]}
