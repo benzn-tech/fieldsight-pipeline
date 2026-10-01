@@ -97,9 +97,18 @@ STANDARD = [
     {"key": "commercial", "title": "Commercial", "kind": "list",
      "purpose": ("Variations, site instructions, dayworks, and cost or claim matters that "
                  "were mentioned, with any figure exactly as said.")},
-    {"key": "visitors", "title": "Visitors & Inspections", "kind": "list",
+    # "Visitors & Inspections" until 2026-10-01: a section of that name drew the
+    # day's own walk-round inspections, which its wording excludes, and showed
+    # "Nothing here." beside them (owner, TEST). Inspections are their own module.
+    {"key": "visitors", "title": "Site Visitors", "kind": "list",
      "purpose": ("Visits by consultants, the client, council or engineers: who came, and "
                  "what they looked at or asked for. Internal staff are not visitors.")},
+    {"key": "inspections", "title": "Inspections", "kind": "table",
+     "columns": ["Area", "What was checked", "Result", "Follow-up"],
+     "purpose": ("Each inspection carried out, one area or element at a time: where it "
+                 "was, what was checked, the result as it was said (passed, things to "
+                 "fix, or not finished), and any follow-up with who will do it and by "
+                 "when. Visits by outside parties belong in Site Visitors.")},
     {"key": "look_ahead", "title": "Look-ahead", "kind": "list",
      "purpose": ("What was said to be happening next, with the day when it was given.")},
 ]
