@@ -253,7 +253,24 @@ def _coverage_note(offer, sections):
             "covers": [], "line_refs": line_refs, "coverage_note": True}
 
 
-def _place_photos(sections, streams_by_ref):
+_SUMMARY_TITLE_RE = re.compile(r"\b(summary|overview)\b", re.IGNORECASE)
+
+
+def _summary_titles(template):
+    """Titles of the plan's overview sections: the standard Summary module, or
+    any section called a summary or an overview."""
+    out = []
+    def walk(sections):
+        for s in sections or []:
+            if ((s.get("module") or {}).get("key") == "summary"
+                    or _SUMMARY_TITLE_RE.search(s.get("title") or "")):
+                out.append(s.get("title") or "")
+            walk(s.get("children"))
+    walk((template or {}).get("sections"))
+    return out
+
+
+def _place_photos(sections, streams_by_ref, no_photos=(), captions=None):
     """Put each topic's photographs as close as the model said they belong.
 
     Returns (under_a_line, under_a_section, fell_to_the_end) as photograph
@@ -278,9 +295,18 @@ def _place_photos(sections, streams_by_ref):
     "First line" alone put every inspection photograph under the Daily
     Summary's prose and none in the section that listed the inspections
     (TEST, Ben_Lin_test2 2026-10-01): the overview cites everything first.
+
+    A SUMMARY HOLDS NO PHOTOGRAPHS (owner, 2026-10-01): sections titled in
+    `no_photos` are skipped by tiers 1 and 2. A topic only the summary named
+    falls to tier 3, where each topic's photographs go under a caption naming
+    it (`captions`: ref -> "title (time)") -- still bound to their topic.
     """
     if not streams_by_ref or not sections:
         return 0, 0, 0
+    skip = {(t or "").strip().lower() for t in no_photos}
+    sections_all = sections
+    sections = [s for s in sections_all
+                if (s.get("title") or "").strip().lower() not in skip] or sections_all[-1:]
     at_line = at_section = 0
     taken = set()
 
@@ -318,11 +344,19 @@ def _place_photos(sections, streams_by_ref):
             at_section += len(mine)
 
     leftover = []
+    last = sections_all[-1]
     for ref in streams_by_ref:
-        leftover.extend(claim(ref))
-    if leftover:
-        last = sections[-1]
-        last["photo_streams"] = (last.get("photo_streams") or []) + leftover
+        mine = claim(ref)
+        if not mine:
+            continue
+        leftover.extend(mine)
+        caption = (captions or {}).get(ref)
+        if caption:
+            last["paragraphs"] = list(last.get("paragraphs") or []) + ["Photos: " + caption]
+            last["line_refs"] = list(last.get("line_refs") or []) + [[]]
+            last.setdefault("photos_after", {})[len(last["paragraphs"]) - 1] = mine
+        else:
+            last["photo_streams"] = (last.get("photo_streams") or []) + mine
     return at_line, at_section, len(leftover)
 
 
@@ -504,25 +538,26 @@ def _action_items_for_prompt(content):
 _COVERS_RE = re.compile(r"^\[covers:\s*([^\]]*)\]$", re.IGNORECASE)
 _REF_RE = re.compile(r"t\d+", re.IGNORECASE)
 # `... signed off by the engineer. [t1]` / `[t1, t3]` / `[T1 and T3]`, at the END
-# of a line only. Anchored to the end so a bracket in the middle of a sentence
-# -- "[sic]", a citation, a quoted form number -- is never read as a reference;
-# and only `t` followed by digits, so nothing a person would naturally write in
-# brackets can move a photograph.
+# of a line or of a table CELL. End-of-line only printed the tag in a customer's
+# checklist, where a row puts it at the end of a cell: "Ground floor inspection
+# carried out [t2] | |" (TEST, 2026-10-01). Still anchored, so a bracket in the
+# middle of a sentence -- "[sic]", a citation, "Section [t1] of the contract" --
+# is never read as a reference; and only `t` followed by digits.
 _LINE_TAG_RE = re.compile(
-    r"\s*\[\s*(t\d+(?:\s*(?:,|and|&)\s*t\d+)*)\s*\]\s*$", re.IGNORECASE)
+    r"\s*\[\s*(t\d+(?:\s*(?:,|and|&)\s*t\d+)*)\s*\](?=\s*(?:\||$))", re.IGNORECASE)
 
 
 def _line_refs(line):
-    """(line without its tag, [refs]) -- the refs lowercased, unique, in order."""
-    m = _LINE_TAG_RE.search(line)
-    if not m:
-        return line, []
+    """(line without its tags, [refs]) -- the refs lowercased, unique, in order."""
     refs = []
-    for ref in _REF_RE.findall(m.group(1)):
-        ref = ref.lower()
-        if ref not in refs:
-            refs.append(ref)
-    return line[:m.start()].rstrip(), refs
+    for m in _LINE_TAG_RE.finditer(line):
+        for ref in _REF_RE.findall(m.group(1)):
+            ref = ref.lower()
+            if ref not in refs:
+                refs.append(ref)
+    if not refs:
+        return line, []
+    return _LINE_TAG_RE.sub("", line).rstrip(), refs
 
 
 def _covers_refs(line):
@@ -704,8 +739,12 @@ def _generate_document(artifact, context=None):
     note = _coverage_note(topic_offer, prose)
     named = _referenced(prose)
     not_referenced = [t for t in topic_offer if t["ref"] not in named]
-    at_line, at_section, orphaned = _place_photos(prose + ([note] if note else []),
-                                                  photo_streams)
+    at_line, at_section, orphaned = _place_photos(
+        prose + ([note] if note else []), photo_streams,
+        no_photos=_summary_titles(template),
+        captions={t["ref"]: ("%s (%s)" % (t.get("title") or "Untitled", t.get("time_range"))
+                             if t.get("time_range") else (t.get("title") or "Untitled"))
+                  for t in topic_offer})
     placed = at_line + at_section
     if topic_offer:
         logger.info("coverage: %d topics offered, %d referenced, not referenced: %s",

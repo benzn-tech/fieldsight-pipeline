@@ -40,7 +40,10 @@ def shape_sentence():
     return ("as a markdown table with exactly these columns, in this order: "
             "%s. One row per checklist item THE RECORDING ACTUALLY ADDRESSED, "
             "where Item no is the item's number from the list under the heading. Answer "
-            "is Yes, No or N/A. Evidence is the exact words from the transcript that "
+            "is Yes, No or N/A. Comment says briefly what was said about the item -- for "
+            "a No, what is wrong. Responsible and Due are who will put right what is "
+            "wrong and by when, only when that was said; otherwise leave them empty. "
+            "Evidence is the exact words from the transcript that "
             "answer the item, copied verbatim. Leave out every item the recording "
             "did not address -- do not guess, and do not answer from general "
             "expectation" % " | ".join(MODEL_COLUMNS))
