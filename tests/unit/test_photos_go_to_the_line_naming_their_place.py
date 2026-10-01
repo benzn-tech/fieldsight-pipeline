@@ -65,7 +65,7 @@ def test_a_photograph_that_cannot_be_read_shifts_no_other_name(monkeypatch):
                 raise RuntimeError("gone")
             return {"Body": io.BytesIO(Key.encode())}
     monkeypatch.setattr(sr, "s3", lambda: S3())
-    monkeypatch.setattr(sr, "_shrink", lambda b: b)
+    monkeypatch.setattr(sr, "_shrink", lambda b, edge=None: b)
     import datetime as dt
     artifact = {"folder": "F", "date": "2026-10-01", "content": {"topics": [
         {"topic_title": "Walk", "time_range": "13:24 - 13:29",

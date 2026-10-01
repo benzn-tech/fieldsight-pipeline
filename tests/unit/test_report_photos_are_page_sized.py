@@ -46,7 +46,7 @@ def test_what_is_not_an_image_goes_in_unchanged():
 
 
 def test_without_pillow_photographs_go_in_as_taken(monkeypatch):
-    monkeypatch.setattr(sr, "Image", None)
+    monkeypatch.setattr(sr.report_photos, "Image", None)
     big = jpeg(2000, 1500)
     assert sr._shrink(big) == big
 
@@ -70,26 +70,42 @@ def test_the_budget_is_spent_on_the_shrunk_bytes(monkeypatch):
     assert all(len(s.getvalue()) < len(big) for s in streams)
 
 
-def test_sixty_photographs_a_report_and_the_rest_are_counted(monkeypatch):
-    """Owner, 2026-10-01: sixty a report, however they divide between topics;
-    what does not fit is counted in the result, never silently dropped."""
+def _walk(monkeypatch, n_walk, n_pour):
     import datetime as dt
     tiny = jpeg(200, 150)
+    edges = []
 
     class S3:
         def get_object(self, Bucket, Key):
             return {"Body": io.BytesIO(tiny)}
     monkeypatch.setattr(sr, "s3", lambda: S3())
-    names = ["p%02d_13-25-%02d.jpg" % (i, i % 60) for i in range(70)]
+    monkeypatch.setattr(sr, "_shrink", lambda b, edge=None: edges.append(edge) or b)
+    names = ["p%03d_13-25-00.jpg" % i for i in range(n_walk + n_pour)]
     artifact = {"folder": "F", "date": "2026-10-01", "content": {"topics": [
-        {"topic_title": "Walk", "time_range": "13:00 - 14:00", "related_photos": names[:50]},
-        {"topic_title": "Pour", "time_range": "14:00 - 15:00", "related_photos": names[50:]}]}}
-    budget = [sr.MAX_PHOTO_BYTES_TOTAL, sr.MAX_PHOTOS_PER_REPORT]
-    offer, streams = sr._offered_topics(artifact, budget, dt.datetime(2026, 10, 1),
-                                        dt.datetime(2026, 10, 1, 23, 59))
-    assert len(streams["t0"]) == 50, "one topic may take far more than the old 12"
-    assert len(streams["t1"]) == 10 and offer[1]["photos_left_out"] == 10
-    assert sum(len(v) for v in streams.values()) == sr.MAX_PHOTOS_PER_REPORT == 60
+        {"topic_title": "Walk", "time_range": "13:00 - 14:00", "related_photos": names[:n_walk]},
+        {"topic_title": "Pour", "time_range": "14:00 - 15:00", "related_photos": names[n_walk:]}]}}
+    offer, streams = sr._offered_topics(artifact, [sr.MAX_PHOTO_BYTES_TOTAL, sr.MAX_PHOTOS_PER_REPORT],
+                                        dt.datetime(2026, 10, 1), dt.datetime(2026, 10, 1, 23, 59))
+    return offer, streams, set(edges)
+
+
+def test_up_to_sixty_go_in_at_page_size(monkeypatch):
+    offer, streams, edges = _walk(monkeypatch, 50, 10)
+    assert sum(len(v) for v in streams.values()) == 60 and edges == {1600}
+
+
+def test_from_61_to_120_all_go_in_shrunk_automatically(monkeypatch):
+    """Owner, 2026-10-01: nobody is asked; they are made smaller."""
+    offer, streams, edges = _walk(monkeypatch, 100, 20)
+    assert sum(len(v) for v in streams.values()) == 120 and edges == {1024}
+    assert sum(o["photos_left_out"] for o in offer) == 0
+
+
+def test_past_120_each_topic_keeps_its_share_and_the_rest_are_counted(monkeypatch):
+    offer, streams, _ = _walk(monkeypatch, 150, 10)
+    assert len(streams["t1"]) == 10, "the long walk does not crowd the pour out"
+    assert len(streams["t0"]) == 110
+    assert sum(o["photos_left_out"] for o in offer) == 40
 
 
 def test_the_worker_spends_the_report_wide_count():

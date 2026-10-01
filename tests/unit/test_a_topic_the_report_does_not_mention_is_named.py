@@ -225,7 +225,7 @@ def test_a_photograph_of_a_topic_nobody_named_sits_under_its_note_line(monkeypat
     png = base64.b64decode(
         b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
         b"z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
-    def fetch(folder, date, names, budget, names_out=None):
+    def fetch(folder, date, names, budget, names_out=None, edge=None):
         if names_out is not None:
             names_out.extend(names)
         return [io.BytesIO(png) for _ in names]

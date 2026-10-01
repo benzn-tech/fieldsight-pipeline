@@ -1905,6 +1905,9 @@ Resources:
                 # tasks the same way the daily report judges it.
                 - !Sub arn:aws:s3:::${IngestBucketName}/weather/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/programmes/*
+                # The person's choice of photographs to leave out of the day's
+                # reports (report_photos.read_excluded).
+                - !Sub arn:aws:s3:::${IngestBucketName}/report_photo_selection/*
             - Effect: Allow
               Action: s3:PutObject
               Resource:
@@ -1931,6 +1934,7 @@ Resources:
                     # AccessDenied, not NoSuchKey.
                     - weather/*
                     - programmes/*
+                    - report_photo_selection/*
             - Effect: Allow
               # SES send for the 'email' delivery option — harmless while
               # EMAIL_SENDER=stub (the stub never calls SES). Verified-identity
