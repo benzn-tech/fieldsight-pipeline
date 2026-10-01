@@ -117,8 +117,9 @@ def test_a_resolved_person_is_keyed_on_their_identity():
     # The name appears only to adopt an EMPTY unlinked profile (a duplicate left by a
     # refused enrolment); a same-name profile holding samples may be another person.
     assert select.count("display_name") == 1
-    assert "display_name = %s AND NOT EXISTS (SELECT 1 FROM speaker_voiceprint_samples" \
-        in " ".join(select.split())
+    # Compared on the normalised key (case/spacing never make a second person).
+    assert vp.NAME_KEY_SQL.format(col="display_name") + " = %s AND NOT EXISTS " \
+        "(SELECT 1 FROM speaker_voiceprint_samples" in " ".join(select.split())
 
 
 def test_an_unresolved_name_duplicates_rather_than_merges():
@@ -134,7 +135,7 @@ def test_an_unresolved_name_duplicates_rather_than_merges():
     vp.upsert_profile(conn, CO, display_name="Clement",
                       consent_basis="attestation", asserted_by=ASSERTER)
     select = next(s for s in conn.cur.sql if s.startswith("SELECT"))
-    assert "display_name = %s" in select
+    assert vp.NAME_KEY_SQL.format(col="display_name") + " = %s" in select
     assert "user_id IS NULL" in select, (
         "without this, an unresolved name could match a profile that HAS an identity and "
         "attach one person's voice to another person's record")

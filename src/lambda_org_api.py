@@ -3119,10 +3119,16 @@ def same_name_voiceprints(conn, caller, event):
     would_use = str(found["id"]) if found else None
     ids = [str(r["id"]) for r in rows]
     ask = len(rows) >= 2 or (len(rows) == 1 and would_use != ids[0])
+
+    def _card(r):
+        return {"id": str(r["id"]), "displayName": r.get("display_name"),
+                **_identity_fields(r), "lastHeard": _iso_day(r.get("last_heard"))}
+
+    # Near spellings ("Sam Wu" for "Sam Yu"): suggested, never merged (spec 2026-10-01 s3).
+    similar = voiceprints.similar_name_profiles(conn, company_id, name, exclude_ids=ids)
     return ok({
-        "profiles": [{"id": str(r["id"]), "displayName": r.get("display_name"),
-                      **_identity_fields(r), "lastHeard": _iso_day(r.get("last_heard"))}
-                     for r in rows],
+        "profiles": [_card(r) for r in rows],
+        "similar": [_card(r) for r in similar],
         "wouldUse": would_use,
         "ask": ask,
     })
@@ -3210,7 +3216,10 @@ def speaker_corrections(conn, caller, session_base, event):
         except ValueError:
             return error("voiceprint_id must be a profile id", 400)
 
-    name = (body.get("display_name") or "").strip()
+    # Trimmed AND internal whitespace collapsed: "ben  lin" is typed spacing, never part of
+    # the name. Case is left alone here -- when the name lands on an existing profile the
+    # profile's own spelling replaces this below (spec 2026-10-01 s2).
+    name = voiceprints.collapse_name(body.get("display_name"))
     if not name:
         return error("display_name is required", 400)
     src = (body.get("source_filename") or "").strip()
@@ -3349,6 +3358,13 @@ def speaker_corrections(conn, caller, session_base, event):
         # when there was one, and the employer update runs after that row was fetched — so
         # the object in hand carries the previous employer, not the one just stored.
         profile_row = voiceprints.get_profile(conn, company_id, str(profile["id"]))
+        # One spelling per person: when the profile is an existing one (lookup hit or chosen
+        # `voiceprint_id`) its display name travels to the embedder and back, not the typed
+        # string. A new profile was just inserted with the typed (collapsed) name, so this
+        # is a no-op for it. Only the stored/propagated name changes -- the directory
+        # resolution above already ran on what was typed.
+        if profile_row and profile_row.get("display_name"):
+            name = profile_row["display_name"]
 
     session_turns = _session_turns(conn, folder, date_m.group(1), session_base)
     request_id = uuid.uuid4().hex
@@ -3378,6 +3394,9 @@ def speaker_corrections(conn, caller, session_base, event):
                 session_base, SPEAKER_IDENTITY_MODE, len(artifact["turns"]))
     return ok({
         "requestId": request_id,
+        # The name that was stored and sent to the embedder: the profile's own when the
+        # correction landed on an existing one, else the typed name.
+        "displayName": name,
         # Named separately because they carry different consent obligations, and because a
         # user who was told "done" deserves to know which of the two they got.
         "propagation": "queued",

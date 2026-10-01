@@ -45,9 +45,11 @@ def _lookup(answers=({"id": "p-old"},)):
 def test_the_account_lookup_falls_back_to_an_unlinked_profile_of_the_same_name():
     conn, _ = _lookup()
     sql, params = conn.calls[0]
-    assert ("OR (user_id IS NULL AND external_ref IS NULL AND display_name = %s "
+    # The name is compared on its normalised key, so "sam  YU" adopts the same profile.
+    assert ("OR (user_id IS NULL AND external_ref IS NULL AND "
+            + voiceprints.NAME_KEY_SQL.format(col="display_name") + " = %s "
             "AND NOT EXISTS (SELECT 1 FROM speaker_voiceprint_samples s") in sql
-    assert params == (CO, USER, "Sam Yu")
+    assert params == (CO, USER, "sam yu")
 
 
 def test_the_persons_own_linked_profile_wins_over_an_unlinked_one():

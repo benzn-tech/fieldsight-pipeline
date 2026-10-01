@@ -73,7 +73,7 @@ def _row(pid, name="Ben Lin", **kw):
 
 @pytest.fixture
 def same(monkeypatch):
-    st = {"rows": [], "would": None, "person": None, "find_args": [], "may": True,
+    st = {"rows": [], "similar": [], "would": None, "person": None, "find_args": [], "may": True,
           "folder": ("Ada_L", None)}
     monkeypatch.setattr(org, "SPEAKER_IDENTITY_MODE", "on")
     monkeypatch.setattr(org, "get_connection", lambda: FakeConn())
@@ -84,6 +84,8 @@ def same(monkeypatch):
     monkeypatch.setattr(org, "_same_company_as_folder", lambda conn, c, f, w: None)
     monkeypatch.setattr(org.voiceprints, "same_name_profiles",
                         lambda conn, co, name: st["rows"])
+    monkeypatch.setattr(org.voiceprints, "similar_name_profiles",
+                        lambda conn, co, name, exclude_ids=(): st["similar"])
     monkeypatch.setattr(org.users, "resolve_display_name",
                         lambda conn, co, name: (st["person"], "full_name")
                         if st["person"] else (None, "not-in-directory"))
@@ -104,7 +106,7 @@ def _ask(qs=None):
 def test_the_route_is_reachable_and_not_taken_by_an_id_pattern(same):
     resp = _ask()
     assert resp["statusCode"] == 200, resp
-    assert _json(resp) == {"profiles": [], "wouldUse": None, "ask": False}
+    assert _json(resp) == {"profiles": [], "similar": [], "wouldUse": None, "ask": False}
 
 
 @pytest.mark.parametrize("rows,would,ask", [
@@ -150,6 +152,16 @@ def test_each_profile_carries_the_identity_fields_and_last_heard(same):
         "employer": "ABC Ltd", "lastHeard": "2026-09-30T04:00:00"}
 
 
+def test_similar_profiles_carry_the_same_fields_and_do_not_change_ask(same):
+    same["similar"] = [_row(B, name="Ben Linn", employer_name="XYZ")]
+    body = _json(_ask())
+    assert body["ask"] is False and body["profiles"] == []
+    assert body["similar"] == [{
+        "id": B, "displayName": "Ben Linn", "linkedAccount": None, "heardOn": [],
+        "firstNamed": {"at": "2026-08-28", "by": "Ben_UCPK2"}, "employer": "XYZ",
+        "lastHeard": None}]
+
+
 def test_a_caller_who_may_not_name_a_speaker_is_refused(same):
     same["may"] = False
     assert _ask()["statusCode"] == 403
@@ -181,7 +193,7 @@ def test_it_is_a_404_when_identity_is_off(same, monkeypatch):
 @pytest.fixture
 def post(monkeypatch):
     st = {"upserts": [], "employer": [], "queued": [], "consented": {A},
-          "has_live": False, "person": None}
+          "has_live": False, "person": None, "profile_name": {}, "upsert_id": NEW}
 
     class S3:
         def put_object(self, **kw):
@@ -202,7 +214,7 @@ def post(monkeypatch):
 
     def upsert(conn, co, **kw):
         st["upserts"].append(kw)
-        return {"id": NEW}
+        return {"id": st["upsert_id"]}
 
     monkeypatch.setattr(org.voiceprints, "upsert_profile", upsert)
     monkeypatch.setattr(org.voiceprints, "get_consented_live_profile",
@@ -214,7 +226,8 @@ def post(monkeypatch):
                         lambda conn, co, uid: st["has_live"])
     monkeypatch.setattr(org.voiceprints, "get_profile",
                         lambda conn, co, vid: {"id": vid, "employer_name": None,
-                                               "employer_source": None})
+                                               "employer_source": None,
+                                               "display_name": st["profile_name"].get(vid)})
     return st
 
 
@@ -311,3 +324,81 @@ def test_the_proposal_accept_passes_the_known_profile(monkeypatch):
     org._apply_confirmed_proposal(FakeConn(), dict(CALLER), CO, row, {})
     assert forwarded and forwarded[0]["voiceprint_id"] == A
     assert forwarded[0]["display_name"] == "Ben Lin"
+
+
+# ---------------------------------------------------------------- one spelling per person
+
+def _artifact_name(post):
+    return post["queued"][-1]["correction"]["display_name"]
+
+
+def test_a_lookup_hit_sends_the_profiles_own_name_not_the_typed_one(post):
+    post["profile_name"][NEW] = "Ben Lin"      # upsert_profile returned the existing row
+    res = _correct(display_name="ben   lin")
+    assert res["statusCode"] == 202
+    assert _artifact_name(post) == "Ben Lin"
+    assert _json(res)["displayName"] == "Ben Lin"
+
+
+def test_a_chosen_voiceprint_id_sends_that_profiles_name(post):
+    post["profile_name"][A] = "Ben Lin"
+    res = _correct(display_name="BEN LIN", voiceprint_id=A)
+    assert _artifact_name(post) == "Ben Lin"
+    assert _json(res)["displayName"] == "Ben Lin"
+
+
+def test_new_person_keeps_the_typed_name_with_whitespace_collapsed(post):
+    post["profile_name"][NEW] = "Ben Lin (Auckland)"     # what the INSERT stored
+    res = _correct(display_name="  Ben   Lin  (Auckland) ", new_person=True)
+    assert post["upserts"][0]["display_name"] == "Ben Lin (Auckland)"
+    assert _artifact_name(post) == "Ben Lin (Auckland)"
+    assert _json(res)["displayName"] == "Ben Lin (Auckland)"
+
+
+def test_the_typed_name_is_the_fallback_when_enrolment_is_off(post, monkeypatch):
+    monkeypatch.setattr(org, "ENROL_ON_CORRECTION", False)
+    _correct(display_name="ben  lin")
+    assert _artifact_name(post) == "ben lin"
+
+
+# ---------------------------------------------------------------- the name helpers
+
+from repositories import voiceprints as vp  # noqa: E402
+
+
+@pytest.mark.parametrize("raw,key", [
+    ("Ben Lin", "ben lin"), ("  ben   LIN ", "ben lin"), ("Ben\tLin\n", "ben lin"),
+    ("", ""), (None, ""), ("BEN", "ben")])
+def test_name_key_collapses_case_and_whitespace(raw, key):
+    assert vp.name_key(raw) == key
+
+
+def test_collapse_name_keeps_case():
+    assert vp.collapse_name("  Ben   Lin ") == "Ben Lin"
+
+
+@pytest.mark.parametrize("a,b,d", [
+    ("abc", "abc", 0), ("abc", "abd", 1), ("abc", "ab", 1), ("", "abc", 3),
+    ("kitten", "sitting", 3), ("ben lin", "benn lin", 1)])
+def test_edit_distance(a, b, d):
+    assert vp.edit_distance(a, b) == d
+    assert vp.edit_distance(b, a) == d
+
+
+def test_edit_distance_limit_stops_early_but_stays_above_the_limit():
+    assert vp.edit_distance("abcdef", "uvwxyz", limit=2) > 2
+
+
+@pytest.mark.parametrize("a,b,similar", [
+    ("Sam Yu", "Sam Wu", True),                 # short name, 1 edit
+    ("Sam Yu", "Sam Wang", False),              # short name, 3 edits
+    ("Ben Lin", "Ben Lin", False),              # equal: a same-name match, not "similar"
+    ("Ben Lin", "ben  LIN", False),             # equal after normalising
+    ("Ben Lin", "Bob Lee", False),
+    ("Ben Lin", "Benn Lin", True),              # 7 chars: threshold 2, 1 edit
+    ("Ben Lin", "Ben Linn", True),
+    ("Ben Lin", "Ben Lynn", True),              # 2 edits, longer than 6
+    ("Sam Yu", "Sam Wuu", False),               # 6 chars -> only 1 edit allowed, this is 2
+    ("Ben Lin", "", False), ("", "Ben Lin", False)])
+def test_is_similar_name(a, b, similar):
+    assert vp.is_similar_name(a, b) is similar
