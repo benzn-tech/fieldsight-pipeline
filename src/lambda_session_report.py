@@ -445,20 +445,26 @@ def _place_photos(sections, streams_by_ref, no_photos=(), captions=None, places=
         after = sections[s].setdefault("photos_after", {})
         after[i] = after.get(i, []) + streams
 
-    # BY PLACE, among the topic's most specific lines (owner, 2026-10-01): an
-    # inspection written as a Ground floor row and a Level 1 row puts each
-    # photograph in the row naming where it was taken. A photograph whose
-    # place no line names goes with the first of them, as before.
+    # BY PLACE FIRST, THEN BY HOW SPECIFIC (owner, 2026-10-01): an inspection
+    # written as a Ground floor row and a Level 1 row puts each photograph in
+    # the row naming where it was taken. The place wins over the rank: when
+    # the checklist left Ground floor unanswered, its photographs went into
+    # the Level 1 row -- the only row the topic had -- although a Quality line
+    # said "Ground floor inspection carried out" (TEST run, same day). A
+    # photograph whose place no line names goes to the most specific line.
+    def best(lines):
+        top_rank = max(c[0] for c in lines)
+        return next(c for c in lines if c[0] == top_rank)
+
     for ref in sorted(cands, key=lambda r: cands[r][0][1]):
         mine = claim(ref)
         if not mine:
             continue
-        top_rank = max(c[0] for c in cands[ref])
-        top = [c for c in cands[ref] if c[0] == top_rank]
         where = (places or {}).get(ref) or []
         for j, stream in enumerate(mine):
             place = where[j] if j < len(where) else None
-            hit = next((c for c in top if photo_binding.names_place(c[4], place)), top[0])
+            naming = [c for c in cands[ref] if photo_binding.names_place(c[4], place)]
+            hit = best(naming) if naming else best(cands[ref])
             put(hit[2], hit[3], [stream])
         at_line += len(mine)
 
