@@ -377,6 +377,7 @@ def parse_body(event):
 REPUBLISH_SITE_COORDS_TASK = "republish_site_coords"
 COLLAPSE_PHOTOS_TASK = "collapse_multibound_photos"
 REBIND_DAY_TASK = "rebind_day_photos"
+RESTORE_MARKERS_TASK = "restore_day_markers"
 
 
 def lambda_handler(event, context):
@@ -390,6 +391,26 @@ def lambda_handler(event, context):
     # OPERATOR TASK, invoked by hand with `aws lambda invoke` (IAM decides who
     # may). The same envelope rule as above keeps it out of reach of the API.
     # A dry run unless "apply" is exactly true: a typo must not write.
+    # Same envelope rule, same dry-run default. Restores a day's location markers
+    # from its sessions' extractions ({"sessions": {session_base: [markers]}}),
+    # merged per session -- for days a later session erased before markers were
+    # kept per session (prod, Ben_Lin_Test 2026-10-02). The operator reads the
+    # extractions; org-api has no grant on them and needs none for this.
+    if isinstance(event, dict) and event.get("task") == RESTORE_MARKERS_TASK:
+        import photo_collapse
+        folder, date, sessions = event.get("folder"), event.get("date"), event.get("sessions")
+        if not folder or not date or not isinstance(sessions, dict):
+            return {"error": "folder, date and sessions are required"}
+        with get_connection() as conn:
+            company = photo_collapse.company_of(conn, folder)
+            with conn.transaction(force_rollback=event.get("apply") is not True):
+                merged = []
+                for session, marks in sessions.items():
+                    merged = location_markers.replace_for_session(
+                        conn, company, folder, date, session, marks or [])
+                return {"applied": event.get("apply") is True, "folder": folder, "date": date,
+                        "markers": [{"at": m["at"], "location": m["location"],
+                                     "session": m.get("session")} for m in merged]}
     # Same envelope rule, same dry-run default. One day, under today's binding
     # rules -- for after a rule change (photo_collapse.rebind_one_day).
     if isinstance(event, dict) and event.get("task") == REBIND_DAY_TASK:
@@ -1783,6 +1804,17 @@ def _report_facts(conn, company_id, folder, site_ids, date=None):
     name = " ".join((p or "").strip() for p in (user.get("first_name"), user.get("last_name"))
                     if (p or "").strip())
     facts = {"sites": out, "recordedBy": name or None}
+    # The company's glossary (name_aliases), site-scoped first: the worker
+    # applies it to everything a report is written from, so a corrected name
+    # is the name in the document (owner, 2026-10-02: "Tikaha" was corrected
+    # to TEKAHA and the report still said Tikaha). Fail-open, in a savepoint.
+    try:
+        with conn.transaction():
+            facts["aliases"] = [
+                {"wrong_term": a["wrong_term"], "right_term": a["right_term"]}
+                for a in aliases.list_active(conn, company_id, site_ids=[s["id"] for s in out])]
+    except Exception:
+        logger.warning("report facts: glossary unreadable for %s", folder, exc_info=True)
     if date:
         # The day's location markers, so the worker can put each photograph in
         # the line naming where it was taken (lambda_session_report._place_photos).
