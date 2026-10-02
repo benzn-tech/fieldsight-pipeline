@@ -1209,16 +1209,20 @@ def write_extraction_items(date, user_folder, extraction_key):
         # meant two new grants of exactly the shape that has silently 403'd
         # eight times in this repo.
         #
-        # Replace, never append: a session is re-driven routinely (finalize,
-        # the backlog probe's repairs, a manual invoke) and each run produces
-        # the day's complete set.
+        # Replace THIS SESSION's markers, keep the day's others. A session is
+        # re-driven routinely (finalize, the backlog probe's repairs, a manual
+        # invoke) and each run produces that SESSION's complete set -- not the
+        # day's: replacing the day let the last session to finish erase every
+        # other session's places (prod, Ben_Lin_Test 2026-10-02).
         #
         # Never fatal. The markers are an addition to a day that already works
         # without them; a write that can turn a good extraction into a failed
-        # one would be a worse bug than ungrouped photos.
+        # one would be a worse bug than ungrouped photos. (The merge runs in a
+        # savepoint, so a failure here cannot abort the extraction's own write.)
         try:
-            location_markers.replace_for_day(
+            location_markers.replace_for_session(
                 conn, company["id"], user_folder, date,
+                _parse_extraction_key(extraction_key)[2],
                 extraction.get("location_markers") or [])
         except Exception:  # noqa: BLE001 -- see above
             logger.exception("location markers not stored for %s/%s", user_folder, date)
