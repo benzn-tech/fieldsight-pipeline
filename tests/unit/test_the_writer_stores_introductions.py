@@ -241,3 +241,14 @@ def test_the_seam_the_writer_reads_the_same_keys_task2_writes(wired):
     artifact_keys = {(i["source_filename"], i["speaker_label"])
                      for i in artifact["self_introductions"]}
     assert sent_keys == artifact_keys
+
+
+def test_the_writer_stores_markers_per_session_not_per_day():
+    """Prod 2026-10-02: replacing the DAY with one session's markers let the last
+    session to finish erase the others'. Pinned by source: the writer merges."""
+    import inspect
+    import lambda_item_writer as iw
+    src = inspect.getsource(iw.write_extraction_items)
+    assert "location_markers.replace_for_session(" in src
+    assert "_parse_extraction_key(extraction_key)[2]" in src
+    assert "location_markers.replace_for_day(" not in src

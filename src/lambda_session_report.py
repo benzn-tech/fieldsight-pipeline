@@ -31,6 +31,7 @@ import photo_binding
 import report_facts
 import report_photos
 import report_template
+import text_normalize
 import transcript_window
 from email_sender import get_sender
 from lambda_meeting_minutes import generate_word_document
@@ -296,6 +297,19 @@ def _unanchored(prose, skip_titles=()):
             if not (refs[i] if i < len(refs) else []):
                 out.append({"section": sec.get("title"), "text": t[:160]})
     return out
+
+
+def _glossed(value, pairs):
+    """Every string inside `value` with the glossary applied (text_normalize:
+    whole-word, case-kept). Keys and non-strings pass through; nothing else
+    about the shape changes."""
+    if isinstance(value, str):
+        return text_normalize.normalize(value, pairs)
+    if isinstance(value, list):
+        return [_glossed(v, pairs) for v in value]
+    if isinstance(value, dict):
+        return {k: _glossed(v, pairs) for k, v in value.items()}
+    return value
 
 
 _ITEM_TEXT_KEYS = ("text", "decision", "question", "description", "observation",
@@ -810,6 +824,12 @@ def _generate_document(artifact, context=None):
     if not source:
         source = (report_template.SOURCE_LIBRARY if gen.get("templateBody")
                   else report_template.SOURCE_BUILTIN)
+    # THE GLOSSARY FIRST: everything the report is written from -- the topics,
+    # their actions, the transcript -- carries the company's corrected names,
+    # so the model never sees the wrong spelling to copy (owner, 2026-10-02).
+    glossary = (artifact.get("reportFacts") or {}).get("aliases") or []
+    if glossary:
+        artifact["content"] = _glossed(artifact.get("content") or {}, glossary)
     content = artifact.get("content") or {}
     date = artifact.get("date") or content.get("date")
     window = artifact.get("window") or {}
@@ -838,6 +858,11 @@ def _generate_document(artifact, context=None):
         transcript_window.assemble(client, S3_BUCKET, picked, deadline=read_deadline), spans)
     if not turns:
         raise RuntimeError("no recorded speech in this window after exclusions")
+    if glossary:
+        # The same text the prompt reads is the text checklist evidence is
+        # checked against, so a quote of the corrected name still matches.
+        turns = [dict(t, line=text_normalize.normalize(t.get("line") or "", glossary))
+                 for t in turns]
 
     # THE PHOTOGRAPHS ARE FETCHED BEFORE THE PROMPT IS BUILT, because the
     # prompt tells the model how many each topic has, and that number has to

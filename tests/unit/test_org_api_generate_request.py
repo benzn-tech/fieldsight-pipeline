@@ -333,3 +333,18 @@ def test_the_days_location_markers_travel_with_the_request(day, monkeypatch):
     assert res["statusCode"] == 202
     assert json.loads(puts[0]["Body"])["reportFacts"]["locations"] == [
         {"at": "13:24", "location": "Ground floor"}]
+
+
+def test_the_companys_glossary_travels_with_the_request(day, monkeypatch):
+    monkeypatch.setattr(FakeConn, "transaction", lambda self: self, raising=False)
+    monkeypatch.setattr(org.location_markers, "for_day", lambda *a: [])
+    seen = {}
+
+    def active(conn, cid, site_ids=None):
+        seen.update(cid=cid, site_ids=site_ids)
+        return [{"wrong_term": "Tikaha", "right_term": "TEKAHA", "id": "x"}]
+    monkeypatch.setattr(org.aliases, "list_active", active)
+    res, puts = _generate_raw(day, _body())
+    assert json.loads(puts[0]["Body"])["reportFacts"]["aliases"] == [
+        {"wrong_term": "Tikaha", "right_term": "TEKAHA"}]
+    assert seen == {"cid": "c-uuid-1", "site_ids": [SITE_ID]}
