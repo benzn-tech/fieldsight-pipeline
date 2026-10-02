@@ -495,8 +495,11 @@ def dispatch(conn, event, method, route):
         if method == "POST":
             return create_org_site(conn, caller, parse_body(event))
 
-    if route == "/companies" and method == "GET":
-        return list_org_companies(conn, caller)
+    if route == "/companies":
+        if method == "GET":
+            return list_org_companies(conn, caller)
+        if method == "POST":
+            return create_org_company(conn, caller, parse_body(event))
 
     if route == "/members":
         if method == "GET":
@@ -4658,6 +4661,53 @@ def list_org_companies(conn, caller):
     return ok({"companies": [
         {"id": str(c["id"]), "name": c["name"]} for c in companies.list_companies(conn)
     ]})
+
+
+def create_org_company(conn, caller, body):
+    """POST /companies -- a new tenant. platform_admin only.
+
+    WHO: the same gate as the GET above, for a stronger reason. Creating a tenant
+    is not something a customer does inside their own company; it is a platform
+    operation, and is_cross_company (platform_admin alone, acl.py) is the only
+    predicate that already means that. resolve_scope()==ALL would let any company
+    admin mint tenants, so it is deliberately not consulted.
+
+    WHY THE DUPLICATE CHECK IS THE POINT: companies.name has NO unique constraint
+    (0002_core_relational.sql). Two tenants with one name are indistinguishable in
+    every list the product shows, their sites and users scatter between two uuids,
+    and nothing can safely merge them afterwards. A double-clicked button or a
+    retried request is enough to cause it. So a name already taken -- ignoring
+    case and surrounding space -- is refused 409, and the refusal CARRIES THE
+    EXISTING ID, because a caller who retried wants the company that exists
+    rather than an error.
+
+    This endpoint does NOT seed the starter report templates, and cannot: they
+    are authored by a user, and a company created here has no members yet.
+    create_member seeds on the first invitation for exactly this case -- the fix
+    for Briv, which was created empty on prod and kept an empty Library until
+    invitation-time seeding shipped.
+    """
+    if not is_cross_company(caller["global_role"]):
+        return error("platform_admin role required", 403)
+    if body is None:
+        return error("malformed JSON body", 400)
+    name = body.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return error("name must be a non-empty string", 400)
+    name = name.strip()
+    industry = body.get("industry")
+    if industry is not None and not isinstance(industry, str):
+        return error("industry must be a string", 400)
+    if industry is not None:
+        industry = industry.strip() or None
+    clash = companies.find_company_by_name_ci(conn, name)
+    if clash is not None:
+        return error(f"a company named '{clash['name']}' already exists "
+                     f"({clash['id']})", 409)
+    row = companies.create_company(conn, name, industry)
+    logger.info("company created: %s (%s) by %s", row["name"], row["id"],
+                caller.get("cognito_sub"))
+    return ok({"company": {"id": str(row["id"]), "name": row["name"]}}, 201)
 
 
 # ----------------------------------------------------------
