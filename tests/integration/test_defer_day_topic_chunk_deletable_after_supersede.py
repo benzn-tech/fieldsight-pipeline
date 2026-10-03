@@ -110,7 +110,6 @@ def test_a_defer_day_topic_chunk_is_still_deletable_after_its_extraction_topic_i
         report = _report(site_name, user_name)
         fake_s3 = _FakeS3({report_key: json.dumps(report)})
 
-        monkeypatch.setattr(lambda_ingest, "COMPANY_NAME", company_name)
         monkeypatch.setattr(lambda_ingest, "AUTHORITY_FLIP", True)
         monkeypatch.setattr(lambda_ingest, "_s3_client", fake_s3)
         monkeypatch.setattr(lambda_ingest, "get_connection",

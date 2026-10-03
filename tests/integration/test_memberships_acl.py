@@ -2,7 +2,6 @@ import pytest
 from repositories import companies, users, sites, memberships
 from repositories.memberships import ensure_membership, list_company_memberships
 from repositories.sites import list_sites_by_ids as sites_list_by_ids, get_company_site_by_name
-from repositories.companies import get_company_by_name
 
 pytestmark = pytest.mark.integration
 
@@ -69,13 +68,6 @@ def test_sites_by_ids_and_by_name(db):
     assert [g["name"] for g in got] == ["Lookup One"]
     assert get_company_site_by_name(db, c["id"], "Lookup Two")["name"] == "Lookup Two"
     assert get_company_site_by_name(db, c["id"], "Nope") is None
-
-
-@pytest.mark.integration
-def test_get_company_by_name(db):
-    companies.create_company(db, "FindMe Ltd")
-    assert get_company_by_name(db, "FindMe Ltd")["name"] == "FindMe Ltd"
-    assert get_company_by_name(db, "Ghost Co") is None
 
 
 @pytest.mark.integration

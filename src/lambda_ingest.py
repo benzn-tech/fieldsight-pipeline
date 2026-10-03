@@ -83,8 +83,6 @@ logger.setLevel(logging.INFO)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 CONFIG_KEY = os.environ.get("CONFIG_KEY", "config/user_mapping.json")
-COMPANY_NAME = os.environ.get("COMPANY_NAME", "FieldSight")
-MULTI_TENANT = os.environ.get("MULTI_TENANT_RESOLUTION", "false") == "true"
 # Authority flip (spec §6, Task 7 of the authority-flip plan): when on AND
 # extraction topics already exist for (user_folder, date), nightly report
 # ingest defers to them instead of overwriting -- see ingest_report below.
@@ -137,17 +135,30 @@ def _should_defer(conn, user_id, user_folder, date):
 
 
 def resolve_company(conn, user_folder):
-    """Owning company for a lake object. MULTI_TENANT (prod stack): the
-    identity directory routes by globally-unique folder_name; unknown folders
-    fall back to the COMPANY_NAME pin (internal). Pinned (test stack):
-    develop-code runs can never write another company's rows."""
-    if MULTI_TENANT:
-        row = users.get_by_folder_name_global(conn, user_folder)
-        if row and row["company_id"]:
-            company = companies.get_company_by_id(conn, row["company_id"])
-            if company is not None:
-                return company
-    return companies.get_company_by_name(conn, COMPANY_NAME)
+    """Owning company for a lake object, read from the identity directory:
+    the globally-unique users.folder_name -> users.company_id.
+
+    A folder no directory row claims has NO company, and None is returned
+    rather than a guess. There used to be a fallback to a company found by a
+    configured name, and a stack switch that pinned every write to it -- but
+    the name defaulted to "FieldSight", which exists in neither database, so
+    both had returned None for as long as anyone could tell. No code may find
+    a company by its name: names are renamed (spec 2026-10-03)."""
+    row = users.get_by_folder_name_global(conn, user_folder)
+    if row and row.get("company_id"):
+        return companies.get_company_by_id(conn, row["company_id"])
+    return None
+
+
+def unknown_folder_error(user_folder):
+    """The error for a lake object whose folder no directory row claims.
+    Shared with lambda_item_writer, which reuses this module by import.
+
+    It used to say "run the org seed". The seed does not fix this -- and
+    running it moved every person of every tenant into one company."""
+    return RuntimeError(
+        f"folder {user_folder!r} has no directory row; not ingesting rather "
+        "than guessing a tenant")
 
 
 REPORTS_PREFIX = "reports/"
@@ -177,7 +188,7 @@ def _list_report_pictures(user_folder, date):
 
 def load_mapping() -> dict:
     """Load + cache config/user_mapping.json for the module's lifetime
-    (warm Lambda container) -- mirrors lambda_org_seed.load_mapping."""
+    (warm Lambda container) -- the retired lambda_org_seed's loader did the same."""
     global _mapping_cache
     if _mapping_cache is None:
         obj = s3().get_object(Bucket=S3_BUCKET, Key=CONFIG_KEY)
@@ -650,11 +661,7 @@ def ingest_report(date, user_folder, report_key):
     with get_connection() as conn:
         company = resolve_company(conn, user_folder)
         if company is None:
-            # Unseeded org DB would otherwise surface as an opaque
-            # 'NoneType' subscript error on every report (Fable minor 6).
-            raise RuntimeError(
-                f"org company {COMPANY_NAME!r} not found — run the org seed "
-                "(fieldsight-*-org-seed) before ingesting")
+            raise unknown_folder_error(user_folder)
         # Site attribution: the app's in-app project pick (recordings.site_id,
         # G5b) is authoritative -- lambda_item_writer already prefers it, and
         # trusting report['site'] instead let the report generator's SITE_NAME

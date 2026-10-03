@@ -140,7 +140,6 @@ def test_question_answered_survives_a_live_then_final_pass(monkeypatch, migrated
                            question_text=QUESTION_LIVE)),
         })
 
-        monkeypatch.setattr(lambda_item_writer.lambda_ingest, "COMPANY_NAME", company_name)
         monkeypatch.setattr(lambda_item_writer, "_s3_client", fake_s3)
         monkeypatch.setattr(lambda_item_writer, "get_connection",
                             lambda *a, **k: get_connection(migrated_db_url))
@@ -262,7 +261,6 @@ def test_decisions_round_trip_stable_id_carried_on_identical_text(monkeypatch, m
                            decision_text=DECISION_TEXT)),
         })
 
-        monkeypatch.setattr(lambda_item_writer.lambda_ingest, "COMPANY_NAME", company_name)
         monkeypatch.setattr(lambda_item_writer, "_s3_client", fake_s3)
         monkeypatch.setattr(lambda_item_writer, "get_connection",
                             lambda *a, **k: get_connection(migrated_db_url))

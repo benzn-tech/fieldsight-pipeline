@@ -23,7 +23,7 @@ def _vec(i, scale=1.0):
 
 
 def _company(db):
-    return db.execute("INSERT INTO companies (name) VALUES ('Merge Co') RETURNING id"
+    return db.execute("INSERT INTO companies (name) VALUES ('Merge Co ' || gen_random_uuid()::text) RETURNING id"
                       ).fetchone()[0]
 
 

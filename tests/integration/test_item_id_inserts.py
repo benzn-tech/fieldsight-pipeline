@@ -218,7 +218,6 @@ def test_duplicate_and_malformed_item_ids_are_stored_as_null(monkeypatch, migrat
         extraction_key = f"extractions/{folder}/{DATE}/{session_base}.json"
         fake_s3 = _FakeS3({extraction_key: json.dumps(_dup_and_malformed_extraction())})
 
-        monkeypatch.setattr(lambda_item_writer.lambda_ingest, "COMPANY_NAME", company_name)
         monkeypatch.setattr(lambda_item_writer, "_s3_client", fake_s3)
         monkeypatch.setattr(lambda_item_writer, "get_connection",
                             lambda *a, **k: get_connection(migrated_db_url))

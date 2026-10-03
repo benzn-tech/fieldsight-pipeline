@@ -97,7 +97,7 @@ def test_the_refusal_names_the_company_that_already_exists(monkeypatch):
     code, body, _ = call(monkeypatch, "platform_admin", {"name": "frequency"},
                          existing=EXISTING)
     assert code == 409
-    assert "Frequency" in body["error"] and "c-old" in body["error"], body["error"]
+    assert "Frequency" in body["error"], body["error"]
 
 
 @pytest.mark.parametrize("body", [{}, {"name": ""}, {"name": "   "},
@@ -190,3 +190,66 @@ def test_get_still_works_on_the_same_route(monkeypatch):
     }, None)
     assert resp["statusCode"] == 200
     assert json.loads(resp["body"])["companies"] == [{"id": "c-old", "name": "Frequency"}]
+
+
+def test_the_refusal_carries_the_existing_company_as_data(monkeypatch):
+    code, body, _ = call(monkeypatch, "platform_admin", {"name": "frequency"},
+                         existing=EXISTING)
+    assert code == 409
+    assert body["existing"] == {"id": "c-old", "name": "Frequency"}
+
+
+@pytest.mark.parametrize("name", ["Frequency	", "Frequency ", " Frequency"])
+def test_tabs_and_nonbreaking_spaces_are_stripped_before_the_check(monkeypatch, name):
+    """REGRESSION PIN, not a proof: the handler already strips with str.strip(),
+    so this passes against the code before this task. It pins the order that
+    matters -- Postgres btrim() strips spaces only, so if the strip ever moved
+    after the lookup, "Frequency\t" would miss "Frequency" and become a tenant."""
+    seen = []
+    caller = {"id": "u-1", "cognito_sub": "sub-1", "company_id": "c-ops",
+              "global_role": "platform_admin", "archived_at": None}
+    monkeypatch.setattr(org, "get_connection", lambda *a, **k: FakeConn())
+    monkeypatch.setattr(org.users, "get_user_by_sub", lambda conn, sub: dict(caller))
+    monkeypatch.setattr(org.device_heartbeat, "record", lambda *a, **k: None)
+    monkeypatch.setattr(org.companies, "find_company_by_name_ci",
+                        lambda conn, n: seen.append(n) or dict(EXISTING))
+    org.lambda_handler({
+        "httpMethod": "POST", "path": "/api/org/companies", "queryStringParameters": None,
+        "body": json.dumps({"name": name}), "headers": {},
+        "requestContext": {"authorizer": {"claims": {"sub": "sub-1"}}}}, None)
+    assert seen == ["Frequency"]
+
+
+def test_a_race_that_reaches_the_index_is_a_409_not_a_500(monkeypatch):
+    """The endpoint's check passed, then a concurrent create took the name."""
+    from psycopg.errors import UniqueViolation
+    lookups = []
+    caller = {"id": "u-1", "cognito_sub": "sub-1", "company_id": "c-ops",
+              "global_role": "platform_admin", "archived_at": None}
+
+    class RollbackConn(FakeConn):
+        rolled_back = False
+
+        def rollback(self):
+            RollbackConn.rolled_back = True
+
+    monkeypatch.setattr(org, "get_connection", lambda *a, **k: RollbackConn())
+    monkeypatch.setattr(org.users, "get_user_by_sub", lambda conn, sub: dict(caller))
+    monkeypatch.setattr(org.device_heartbeat, "record", lambda *a, **k: None)
+
+    def lookup(conn, n):
+        lookups.append(n)
+        return None if len(lookups) == 1 else dict(EXISTING)
+
+    def insert(conn, n, industry=None):
+        raise UniqueViolation("duplicate key value violates unique constraint")
+
+    monkeypatch.setattr(org.companies, "find_company_by_name_ci", lookup)
+    monkeypatch.setattr(org.companies, "create_company", insert)
+    res = org.lambda_handler({
+        "httpMethod": "POST", "path": "/api/org/companies", "queryStringParameters": None,
+        "body": json.dumps({"name": "Frequency"}), "headers": {},
+        "requestContext": {"authorizer": {"claims": {"sub": "sub-1"}}}}, None)
+    assert res["statusCode"] == 409, res["body"]
+    assert json.loads(res["body"])["existing"]["id"] == "c-old"
+    assert RollbackConn.rolled_back, "the aborted transaction must be rolled back before the re-read"

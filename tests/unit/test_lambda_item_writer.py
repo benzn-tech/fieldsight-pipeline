@@ -131,8 +131,8 @@ def wired(monkeypatch):
     Individual tests override as needed."""
     monkeypatch.setattr(iw, "get_connection", lambda *a, **k: FakeConn())
     monkeypatch.setattr(iw, "_s3_client", FakeS3({EXTRACTION_KEY: json.dumps(make_extraction())}))
-    monkeypatch.setattr(iw.companies, "get_company_by_name",
-                        lambda conn, name: {"id": "co-1", "name": name})
+    monkeypatch.setattr(iw.lambda_ingest, "resolve_company",
+                        lambda conn, folder: {"id": "co-1", "name": "Co"})
     monkeypatch.setattr(iw.lambda_ingest, "resolve_site",
                         lambda conn, cid, report, user_folder: {"id": "site-1", "name": "Test Site"})
     monkeypatch.setattr(iw.lambda_ingest, "resolve_user", lambda conn, cid, user_folder: None)
@@ -511,10 +511,12 @@ def test_summary_result_shape(wired):
 
 
 def test_company_missing_raises(wired):
-    wired.setattr(iw.companies, "get_company_by_name", lambda conn, name: None)
+    wired.setattr(iw.lambda_ingest, "resolve_company", lambda conn, folder: None)
 
-    with pytest.raises(RuntimeError, match="org seed"):
+    with pytest.raises(RuntimeError) as exc:
         iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+    assert "has no directory row" in str(exc.value)
+    assert "seed" not in str(exc.value)
 
 
 def test_user_bridge_miss_does_not_skip(wired):

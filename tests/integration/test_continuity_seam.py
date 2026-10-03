@@ -236,7 +236,6 @@ def _s3_and_seg(tag):
 def _wire(monkeypatch, fake_s3, company_name, migrated_db_url):
     monkeypatch.setattr(les, "s3", lambda: fake_s3)
     monkeypatch.setattr(lambda_item_writer, "_s3_client", fake_s3)
-    monkeypatch.setattr(lambda_item_writer.lambda_ingest, "COMPANY_NAME", company_name)
     monkeypatch.setattr(lambda_item_writer, "get_connection",
                         lambda *a, **k: get_connection(migrated_db_url))
     monkeypatch.setattr(lambda_item_writer.match_request, "emit", lambda *a, **k: None)

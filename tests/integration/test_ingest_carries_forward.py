@@ -102,7 +102,6 @@ def test_a_ticked_action_item_survives_the_reports_own_reingest(monkeypatch, mig
         report = _report(site_name, user_name)
         fake_s3 = _FakeS3({report_key: json.dumps(report)})
 
-        monkeypatch.setattr(lambda_ingest, "COMPANY_NAME", company_name)
         monkeypatch.setattr(lambda_ingest, "_s3_client", fake_s3)
         monkeypatch.setattr(lambda_ingest, "get_connection",
                             lambda *a, **k: get_connection(migrated_db_url))

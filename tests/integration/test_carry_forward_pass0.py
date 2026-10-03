@@ -95,7 +95,6 @@ def test_ticked_item_with_far_reworded_text_still_carries_by_item_id(
                 _extraction("live", "2026-09-29T10:00:00Z", ACTION_LIVE, item_id)),
         })
 
-        monkeypatch.setattr(lambda_item_writer.lambda_ingest, "COMPANY_NAME", company_name)
         monkeypatch.setattr(lambda_item_writer, "_s3_client", fake_s3)
         monkeypatch.setattr(lambda_item_writer, "get_connection",
                             lambda *a, **k: get_connection(migrated_db_url))
