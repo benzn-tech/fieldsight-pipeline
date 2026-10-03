@@ -33,6 +33,36 @@ def replace_for_day(conn, company_id, user_folder, date, markers):
     )
 
 
+def replace_for_session(conn, company_id, user_folder, date, session, markers):
+    """Write ONE session's markers into the day, keeping every other session's.
+
+    `replace_for_day` was called with one extraction's markers, and an
+    extraction is a SESSION, not a day: the last session to finish replaced the
+    whole day with its own -- usually none. On prod (Ben_Lin_Test 2026-10-02)
+    the 12:24 "level two" marker was wiped by a later session that announced no
+    place, and every location rule downstream went dark for the day.
+
+    Each marker now carries its `session`; a re-driven session replaces exactly
+    its own. Markers written before this (no `session`) are kept unless this
+    session re-states the same place at the same minute. Serialised per day
+    with an advisory lock: two sessions of one day finishing together would
+    otherwise both read, both merge, and the second write would drop the first.
+    """
+    mine = [dict(m, session=session) for m in (markers or [])
+            if isinstance(m, dict) and m.get("at") and m.get("location")]
+    seen = {(str(m["at"]), str(m["location"]).strip().lower()) for m in mine}
+    with conn.transaction():
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                     ("markers:%s:%s" % (user_folder, date),))
+        keep = [m for m in for_day(conn, company_id, user_folder, date)
+                if m.get("session") != session
+                and not (m.get("session") is None
+                         and (str(m["at"]), str(m["location"]).strip().lower()) in seen)]
+        merged = sorted(keep + mine, key=lambda m: str(m.get("at")))
+        replace_for_day(conn, company_id, user_folder, date, merged)
+    return merged
+
+
 def for_day(conn, company_id, user_folder, date):
     """The day's markers, oldest first, or [] when there are none.
 

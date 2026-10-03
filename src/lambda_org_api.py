@@ -157,7 +157,8 @@ from repositories import (action_items, aliases, chunks, classification_feedback
                           sites, threads, topics, users, voice_messages,
                           voiceprints)
 from repositories.acl import is_cross_company, resolve_scope
-from text_normalize import diff_candidates, first_match_span, normalize, occurrences
+from text_normalize import (diff_candidates, first_match_span, learned_pairs, normalize,
+                            occurrences)
 # Keyframe Q7 telemetry derivation (all AWS-free, pure helpers): the deleted
 # frame's structural signal is reconstructed from the still-live topic row.
 from keyframe_selection import keyframe_seconds
@@ -377,6 +378,7 @@ def parse_body(event):
 REPUBLISH_SITE_COORDS_TASK = "republish_site_coords"
 COLLAPSE_PHOTOS_TASK = "collapse_multibound_photos"
 REBIND_DAY_TASK = "rebind_day_photos"
+RESTORE_MARKERS_TASK = "restore_day_markers"
 
 
 def lambda_handler(event, context):
@@ -390,6 +392,26 @@ def lambda_handler(event, context):
     # OPERATOR TASK, invoked by hand with `aws lambda invoke` (IAM decides who
     # may). The same envelope rule as above keeps it out of reach of the API.
     # A dry run unless "apply" is exactly true: a typo must not write.
+    # Same envelope rule, same dry-run default. Restores a day's location markers
+    # from its sessions' extractions ({"sessions": {session_base: [markers]}}),
+    # merged per session -- for days a later session erased before markers were
+    # kept per session (prod, Ben_Lin_Test 2026-10-02). The operator reads the
+    # extractions; org-api has no grant on them and needs none for this.
+    if isinstance(event, dict) and event.get("task") == RESTORE_MARKERS_TASK:
+        import photo_collapse
+        folder, date, sessions = event.get("folder"), event.get("date"), event.get("sessions")
+        if not folder or not date or not isinstance(sessions, dict):
+            return {"error": "folder, date and sessions are required"}
+        with get_connection() as conn:
+            company = photo_collapse.company_of(conn, folder)
+            with conn.transaction(force_rollback=event.get("apply") is not True):
+                merged = []
+                for session, marks in sessions.items():
+                    merged = location_markers.replace_for_session(
+                        conn, company, folder, date, session, marks or [])
+                return {"applied": event.get("apply") is True, "folder": folder, "date": date,
+                        "markers": [{"at": m["at"], "location": m["location"],
+                                     "session": m.get("session")} for m in merged]}
     # Same envelope rule, same dry-run default. One day, under today's binding
     # rules -- for after a rule change (photo_collapse.rebind_one_day).
     if isinstance(event, dict) and event.get("task") == REBIND_DAY_TASK:
@@ -584,6 +606,11 @@ def dispatch(conn, event, method, route):
     if m_pa and method == "POST":
         return apply_topic_correction(conn, caller, m_pa.group(1), parse_body(event))
 
+    if route == "/aliases" and method == "GET":
+        return list_aliases_endpoint(conn, caller)
+    m_al = re.match(r"^/aliases/([^/]+)$", route)
+    if m_al and method == "DELETE":
+        return retire_alias_endpoint(conn, caller, m_al.group(1))
     if route == "/aliases" and method == "POST":
         return create_alias_endpoint(conn, caller, parse_body(event), event)
 
@@ -1783,6 +1810,17 @@ def _report_facts(conn, company_id, folder, site_ids, date=None):
     name = " ".join((p or "").strip() for p in (user.get("first_name"), user.get("last_name"))
                     if (p or "").strip())
     facts = {"sites": out, "recordedBy": name or None}
+    # The company's glossary (name_aliases), site-scoped first: the worker
+    # applies it to everything a report is written from, so a corrected name
+    # is the name in the document (owner, 2026-10-02: "Tikaha" was corrected
+    # to TEKAHA and the report still said Tikaha). Fail-open, in a savepoint.
+    try:
+        with conn.transaction():
+            facts["aliases"] = [
+                {"wrong_term": a["wrong_term"], "right_term": a["right_term"]}
+                for a in aliases.list_active(conn, company_id, site_ids=[s["id"] for s in out])]
+    except Exception:
+        logger.warning("report facts: glossary unreadable for %s", folder, exc_info=True)
     if date:
         # The day's location markers, so the worker can put each photograph in
         # the line naming where it was taken (lambda_session_report._place_photos).
@@ -5683,7 +5721,48 @@ def patch_content(conn, caller, table, row_id, body):
                           table, row_id)
 
     candidates = diff_candidates(before or "", value)
-    return ok({"row": updated, "candidates": candidates})
+    # THE GLOSSARY LEARNS FROM THE CORRECTION ITSELF (owner, 2026-10-02): a
+    # misheard name fixed by hand -- one word for a name spelled like it -- is
+    # kept for the row's site, so reports and the next edits use it without
+    # anyone confirming a prompt. Visible and undoable (GET/DELETE /aliases).
+    # In a savepoint, and never fails the edit.
+    learned = []
+    try:
+        with conn.transaction():
+            for wrong, right in learned_pairs(before or "", value):
+                row_a = aliases.learn_alias(conn, row["company_id"], site_id, wrong, right,
+                                            caller["id"])
+                if row_a:
+                    learned.append({"id": str(row_a["id"]), "wrong_term": wrong,
+                                    "right_term": right})
+    except Exception:
+        logger.exception("content edit %s/%s: glossary not learned (edit kept)", table, row_id)
+    return ok({"row": updated, "candidates": candidates, "learned": learned})
+
+
+_GLOSSARY_ADMIN_ROLES = ("admin", "gm", "platform_admin")
+
+
+def list_aliases_endpoint(conn, caller):
+    """GET /api/org/aliases -- the company's glossary, for the admin list."""
+    if caller["global_role"] not in _GLOSSARY_ADMIN_ROLES:
+        return error("admin or gm required to view the glossary", 403)
+    rows = aliases.list_for_company(conn, caller["company_id"])
+    return ok({"aliases": [dict(r, id=str(r["id"]),
+                                site_id=str(r["site_id"]) if r["site_id"] else None,
+                                created_at=r["created_at"].isoformat() if r["created_at"] else None)
+                           for r in rows]})
+
+
+def retire_alias_endpoint(conn, caller, alias_id):
+    """DELETE /api/org/aliases/{id} -- undo one glossary entry."""
+    if caller["global_role"] not in _GLOSSARY_ADMIN_ROLES:
+        return error("admin or gm required to change the glossary", 403)
+    if not _UUID_RE.match(alias_id or ""):
+        return error("glossary entry not found", 404)
+    if not aliases.retire(conn, caller["company_id"], alias_id):
+        return error("glossary entry not found", 404)
+    return ok({"retired": alias_id})
 
 
 def _enqueue_content_reindex(conn, table, row_id):
