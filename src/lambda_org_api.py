@@ -4693,6 +4693,16 @@ def list_org_companies(conn, caller):
     ]})
 
 
+def _company_name_taken(clash):
+    """409 for a company name another tenant holds. Carries that company as
+    data, because the caller who retried after a timeout wants the company
+    that exists, not an error message to parse."""
+    if clash is None:   # raced, and the winner is not visible to this read
+        return error("a company with that name already exists", 409)
+    return error(f"a company named '{clash['name']}' already exists", 409,
+                 {"existing": {"id": str(clash["id"]), "name": clash["name"]}})
+
+
 def create_org_company(conn, caller, body):
     """POST /companies -- a new tenant. platform_admin only.
 
@@ -4732,9 +4742,14 @@ def create_org_company(conn, caller, body):
         industry = industry.strip() or None
     clash = companies.find_company_by_name_ci(conn, name)
     if clash is not None:
-        return error(f"a company named '{clash['name']}' already exists "
-                     f"({clash['id']})", 409)
-    row = companies.create_company(conn, name, industry)
+        return _company_name_taken(clash)
+    try:
+        row = companies.create_company(conn, name, industry)
+    except UniqueViolation:
+        # idx_companies_name_ci: a concurrent create took the name after the
+        # check above. The transaction is aborted -- roll back before reading.
+        conn.rollback()
+        return _company_name_taken(companies.find_company_by_name_ci(conn, name))
     logger.info("company created: %s (%s) by %s", row["name"], row["id"],
                 caller.get("cognito_sub"))
     return ok({"company": {"id": str(row["id"]), "name": row["name"]}}, 201)
