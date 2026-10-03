@@ -113,3 +113,43 @@ def test_unreadable_markers_fall_back_to_the_clock(monkeypatch):
     def boom(*a):
         raise RuntimeError("no table")
     assert _rebind(monkeypatch, boom) == {"t1": 4, "t2": 3}
+
+
+# ---- prod, Ben_Lin_Test 2026-10-02: the owner's own count -------------------------
+# Photographs 12:23:52/:55/:58 after "level one inspections" (12:23:40), 12:24:10/:13
+# after "going up to the level two" (12:23:59), 12:44:52/:56 after "the Tikaha room
+# inspections" (12:44:48) -- a different recording.
+
+PROD_TOPICS = [{"time_range": "12:22 – 12:24"},      # 0 Level 1 pre-pour demo   sidA
+               {"time_range": "12:24 – 12:24"},      # 1 Level 2 steel stand-up  sidA
+               {"time_range": "12:43 – 12:43"},      # 2 Isaac reminder          sidC
+               {"time_range": "12:43 – 12:44"},      # 3 Palakioli               sidC
+               {"time_range": "12:44 – 12:45"}]      # 4 Tikaha room             sidC
+PROD_SESSIONS = {0: "sidA", 1: "sidA", 2: "sidC", 3: "sidC", 4: "sidC"}
+PROD_PHOTOS = photos("12:23", "12:23", "12:23", "12:24", "12:24", "12:44", "12:44")
+LEVEL_TWO = [{"at": "12:24", "location": "level two", "session": "sidA"}]
+
+
+def test_level_two_is_opened_by_its_announcement_not_held_by_the_topic_it_ends():
+    """12:24 is the minute Level 1 ends and Level 2 begins; the announcement
+    opens what follows."""
+    r = pb.photos_for_topics(PROD_PHOTOS, PROD_TOPICS, topic_sessions=PROD_SESSIONS,
+                             markers=LEVEL_TWO)
+    assert counts(r)[0] == 3 and counts(r)[1] == 2
+
+
+def test_a_stay_ends_when_its_recording_does():
+    """Without the session cut, "level two" (12:24, sidA) still held the 12:44
+    photographs of a later recording."""
+    r = pb.photos_for_topics(PROD_PHOTOS, PROD_TOPICS, topic_sessions=PROD_SESSIONS,
+                             markers=LEVEL_TWO)
+    assert counts(r)[1] == 2, "nothing from the later recording"
+
+
+def test_a_place_said_in_the_later_recording_takes_its_own_photographs():
+    """What Te Kaha needs: the extraction marking "Here is the Tikaha room
+    inspections" as a place. With that marker the room keeps its photographs."""
+    markers = LEVEL_TWO + [{"at": "12:44", "location": "Tikaha room", "session": "sidC"}]
+    r = pb.photos_for_topics(PROD_PHOTOS, PROD_TOPICS, topic_sessions=PROD_SESSIONS,
+                             markers=markers)
+    assert counts(r) == {0: 3, 1: 2, 2: 0, 3: 0, 4: 2}

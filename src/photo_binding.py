@@ -123,9 +123,10 @@ def _hhmm_to_minutes(hhmm):
 
 
 def _stays(markers):
-    """[(start_min, location_key, last_mention_min)] -- consecutive markers
-    naming the same place are ONE stay ("Level 1", then "Continue level one
-    inspection" is still Level 1), so a stay starts at its first announcement."""
+    """[(start_min, location_key, last_mention_min, session)] -- consecutive
+    markers naming the same place are ONE stay ("Level 1", then "Continue level
+    one inspection" is still Level 1), so a stay starts at its first
+    announcement. `session` is the recording it was said in, when known."""
     out = []
     for m in sorted(markers or [], key=lambda m: str(m.get("at") or "")):
         try:
@@ -135,25 +136,33 @@ def _stays(markers):
         key = " ".join(str(m.get("location") or "").lower().split())
         if not key:
             continue
+        session = m.get("session")
         if out and out[-1][1] == key and at - out[-1][2] <= PHOTO_CARRY_FORWARD_MIN:
-            out[-1] = (out[-1][0], key, at)          # same stay, later mention
+            out[-1] = (out[-1][0], key, at, out[-1][3] or session)   # same stay, later mention
         else:
-            out.append((at, key, at))
+            out.append((at, key, at, session))
     return out
 
 
 def _stay_owner(at, windows):
     """The topic in progress when a place was first announced: its window holds
-    the moment, preferring one that goes on AFTER it (the announcement opens
-    what follows, it does not close what came before) and then the earliest
-    start -- the activity already under way."""
+    the moment, preferring the one that STARTS at it (the announcement opens
+    what follows), then one that goes on after it, then the earliest start --
+    the activity already under way.
+
+    Starts-at comes first because times are whole minutes: on prod (Ben_Lin_Test
+    2026-10-02) "going up to the level two" at 12:23:59 was marked 12:24, the
+    Level 1 topic ran 12:22-12:24 and the Level 2 topic 12:24-12:24; "goes on
+    after it" ties at minute grain and the earliest start gave the Level 2
+    photographs to Level 1."""
     holding = [i for i, (s, e) in windows.items() if s <= at <= e]
     if not holding:
         return None
-    return min(holding, key=lambda i: (0 if windows[i][1] > at else 1, windows[i][0], i))
+    return min(holding, key=lambda i: (0 if windows[i][0] == at else 1,
+                                       0 if windows[i][1] > at else 1, windows[i][0], i))
 
 
-def _location_owner(p_minutes, stays, windows):
+def _location_owner(p_minutes, stays, windows, all_windows=None, topic_sessions=None):
     """The topic that owns a photo by WHERE it was taken, or None.
 
     A LOCATION OWNS ITS PHOTOS (owner, 2026-10-01). Binding by clock alone gave
@@ -164,6 +173,13 @@ def _location_owner(p_minutes, stays, windows):
     13:26): a photo belongs to the topic that was under way when its place was
     announced, for as long as the stay lasts (until another place is named,
     or PHOTO_CARRY_FORWARD_MIN after the stay's last mention).
+
+    A STAY ENDS WITH ITS RECORDING. A topic of ANOTHER session beginning after
+    the stay's last mention and by the photograph means the person stopped and
+    started again elsewhere: on prod (Ben_Lin_Test 2026-10-02) "level two" at
+    12:24 would otherwise have claimed the Te Kaha room photographs at 12:44,
+    from a later recording. A chat inside the SAME recording does not end it --
+    that is the interruption the stay exists to see past.
     """
     current = None
     for stay in stays:
@@ -171,6 +187,11 @@ def _location_owner(p_minutes, stays, windows):
             current = stay
     if current is None or p_minutes - current[2] > PHOTO_CARRY_FORWARD_MIN:
         return None
+    if current[3] and topic_sessions:
+        for i, (start, _end) in (all_windows or windows).items():
+            other = topic_sessions.get(i)
+            if other and other != current[3] and current[2] < start <= p_minutes:
+                return None
     return _stay_owner(current[0], windows)
 
 
@@ -302,7 +323,8 @@ def photos_for_topics(photo_objects, topics, *, topic_sessions=None,
         # WHERE before WHEN: a photo taken during a location stay goes to the
         # topic that stay belongs to, if that topic may have it (same session,
         # under the cap). Otherwise the clock rules below decide, unchanged.
-        owner = _location_owner(p_minutes, stays, eligible) if stays else None
+        owner = (_location_owner(p_minutes, stays, eligible, windows, topic_sessions)
+                 if stays else None)
         if owner is not None and len(result[owner]) < PHOTOS_PER_TOPIC_CAP:
             result[owner].append(p)
             by_location += 1
@@ -331,10 +353,13 @@ def photos_for_topics(photo_objects, topics, *, topic_sessions=None,
             continue
         if carried:
             carried_count += 1
-        # Nearest window first; ties -> lowest index. The full ordering (not
-        # just the winner) is what lets an at-cap topic cascade to the next-
-        # nearest QUALIFYING one, so the cap only drops a photo when every
-        # qualifying topic is full.
+        # Nearest window first; ties -> lowest index. NOT "began latest": the
+        # clock cannot tell a walk that goes on from a chat that interrupts it
+        # (TEST 2026-10-01 wants the earlier topic, prod 2026-10-02 the later
+        # one) -- that is what location markers are for. The full ordering
+        # (not just the winner) is what lets an at-cap topic cascade to the
+        # next-nearest QUALIFYING one, so the cap only drops a photo when
+        # every qualifying topic is full.
         order = sorted(qualifying, key=lambda i: (_distance(p_minutes, eligible[i]), i))
         target = next((i for i in order if len(result[i]) < PHOTOS_PER_TOPIC_CAP), None)
         if target is None:
