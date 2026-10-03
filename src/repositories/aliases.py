@@ -41,3 +41,57 @@ def create_alias(conn, company_id, site_id, wrong_term, right_term, kind,
         f"VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING {_COLS}",
         (company_id, site_id, wrong_term, right_term, kind, source, created_by),
     ).fetchone()
+
+
+def learn_alias(conn, company_id, site_id, wrong_term, right_term, created_by):
+    """Record a correction someone made as a glossary entry (source 'learned').
+
+    One active entry per (company, site, wrong term), compared without case:
+    the same correction again is a no-op, and a different correction of the
+    same word replaces the old one -- the latest person to fix it is right.
+    Returns the active row, or None when nothing changed.
+    """
+    cur = conn.cursor(row_factory=dict_row)
+    # Putting a correction back (TEKAHA -> Tikaha) is an UNDO, not a new fact:
+    # learning it would leave two entries rewriting each other. The entry it
+    # reverses is retired and nothing is learned.
+    reversed_ = cur.execute(
+        "UPDATE name_aliases SET status='retired' WHERE company_id=%s "
+        "AND site_id IS NOT DISTINCT FROM %s AND lower(wrong_term)=lower(%s) "
+        "AND lower(right_term)=lower(%s) AND status='active'",
+        (company_id, site_id, right_term, wrong_term)).rowcount
+    if reversed_:
+        return None
+    existing = cur.execute(
+        f"SELECT {_COLS} FROM name_aliases WHERE company_id=%s "
+        f"AND site_id IS NOT DISTINCT FROM %s AND lower(wrong_term)=lower(%s) "
+        f"AND status='active'",
+        (company_id, site_id, wrong_term)).fetchall()
+    if any(r["right_term"] == right_term for r in existing):
+        return None
+    for r in existing:
+        cur.execute("UPDATE name_aliases SET status='retired' WHERE id=%s", (r["id"],))
+    return create_alias(conn, company_id, site_id, wrong_term, right_term, "other",
+                        created_by, source="learned")
+
+
+def list_for_company(conn, company_id):
+    """Every active glossary entry of a company, newest first, with the site's
+    name and who made it -- the admin list (view and undo)."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT a.id, a.site_id, s.name AS site_name, a.wrong_term, a.right_term, "
+        "a.kind, a.source, a.created_at, "
+        "trim(coalesce(u.first_name,'') || ' ' || coalesce(u.last_name,'')) AS created_by_name "
+        "FROM name_aliases a LEFT JOIN sites s ON s.id = a.site_id "
+        "LEFT JOIN users u ON u.id = a.created_by "
+        "WHERE a.company_id=%s AND a.status='active' ORDER BY a.created_at DESC",
+        (company_id,)).fetchall()
+
+
+def retire(conn, company_id, alias_id):
+    """Undo one entry. Company-pinned: an id from another company retires
+    nothing. Returns True when a row changed."""
+    return conn.execute(
+        "UPDATE name_aliases SET status='retired' "
+        "WHERE id=%s AND company_id=%s AND status='active'",
+        (alias_id, company_id)).rowcount == 1
