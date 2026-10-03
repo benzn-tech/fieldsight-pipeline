@@ -79,9 +79,16 @@ benlin.chch+test2@gmail.com    pm
 benlin.chch+test3@gmail.com    pm
 ```
 
-**Repairing the lookup as written would have handed two Southbase site managers a summary
-containing Fletcher's, Cassidy's and Oceania's reports.** The rename that broke the lookup
-closed a cross-tenant leak by accident. Decision 3 is what makes repairing it safe: the gate
+**Who actually reaches it.** `admin_disambiguation` is only entered by a caller whose
+`visible_scope` is `ALL` — admin, gm, platform_admin (`GRADED_ROLES=true` on prod; the
+non-graded branch forces every non-ALL caller to their own folder first). Site managers and
+pms never reach it. So **repairing the lookup as written would have handed the operator
+company's gm (`sam.kiwi`) a summary containing Fletcher's, Cassidy's and Oceania's reports.**
+The rename that broke the lookup closed a cross-tenant leak by accident.
+
+*Correction, 2026-10-03:* an earlier version of this section said the two Southbase site
+managers would receive it. They would not — they cannot reach the function. The exposure is
+the operator company's ALL-scope members; the decision below is unchanged. Decision 3 is what makes repairing it safe: the gate
 becomes the **role** that is already the only cross-tenant one (`is_cross_company`,
 `acl.py:17`), not company membership.
 
@@ -190,8 +197,9 @@ The Sites page already holds `+ New project`, and its company picker reads
 
 **The safety property, stated separately because it is the reason decision 3 exists:**
 
-- The lake-wide summary is **refused** to a `gm`, a `site_manager` and a `pm` who belong to
-  the operator company, and to an `admin` of a customer company. Granted to `platform_admin`.
+- The lake-wide summary is **refused** to a `gm` and an `admin` who belong to the operator
+  company — the callers who actually reach `admin_disambiguation` and would have received it
+  under the old gate — and to an `admin` of a customer company. Granted to `platform_admin`.
   Testing only "platform_admin gets it" would pass against the leaking version.
 
 Then:
