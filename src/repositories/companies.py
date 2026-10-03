@@ -9,13 +9,6 @@ def create_company(conn, name, industry=None) -> dict:
     ).fetchone()
 
 
-def get_company_by_name(conn, name) -> dict | None:
-    return conn.cursor(row_factory=dict_row).execute(
-        "SELECT id, name, industry, created_at FROM companies WHERE name=%s",
-        (name,),
-    ).fetchone()
-
-
 def find_company_by_name_ci(conn, name) -> dict | None:
     """The company whose name matches `name` ignoring case and surrounding space.
 
@@ -80,4 +73,21 @@ def set_voiceprint_consent_basis(conn, company_id, basis):
         "UPDATE companies SET voiceprint_consent_basis=%s WHERE id=%s "
         "RETURNING id, name, voiceprint_consent_basis",
         (basis, str(company_id)),
+    ).fetchone()
+
+
+def update_company(conn, company_id, **fields) -> dict | None:
+    """Set any of name / industry. A key that is absent is left unchanged; a
+    key present with None stores NULL (that is how industry is cleared).
+    Returns the row, or None for an unknown id."""
+    allowed = {"name", "industry"}
+    unknown = set(fields) - allowed
+    if unknown or not fields:
+        raise ValueError(f"update_company: fields must be a non-empty subset of {allowed}")
+    cols = sorted(fields)
+    sets = ", ".join(f"{c}=%s" for c in cols)
+    return conn.cursor(row_factory=dict_row).execute(
+        f"UPDATE companies SET {sets} WHERE id=%s "
+        "RETURNING id, name, industry, created_at",
+        [fields[c] for c in cols] + [company_id],
     ).fetchone()

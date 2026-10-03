@@ -251,7 +251,6 @@ jobs:
               "AlertEmail=${{ vars.TEST_ALERT_EMAIL || 'none' }}" \
               "ServerBuild=${{ github.sha }}" \
               "DeviceAnnouncementPatterns=${{ vars.TEST_DEVICE_ANNOUNCEMENT_PATTERNS || '[]' }}" \
-              "MultiTenantResolution=${{ vars.TEST_MULTI_TENANT_RESOLUTION || 'true' }}" \
               "VadThreshold=${{ vars.TEST_VAD_THRESHOLD || '0.2' }}" \
               "DropSilentChunks=${{ vars.TEST_DROP_SILENT_CHUNKS || 'true' }}" \
               "NormaliseAudio=${{ vars.TEST_NORMALISE_AUDIO || 'true' }}" \

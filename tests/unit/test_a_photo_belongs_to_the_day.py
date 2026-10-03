@@ -379,8 +379,8 @@ def day_with_an_earlier_session(monkeypatch):
         EXTRACTION_KEY: json.dumps(make_extraction()),
         _PHOTO_KEY: b"",
     }))
-    monkeypatch.setattr(iw.companies, "get_company_by_name",
-                        lambda conn, name: {"id": "co-1", "name": name})
+    monkeypatch.setattr(iw.lambda_ingest, "resolve_company",
+                        lambda conn, folder: {"id": "co-1", "name": "Co"})
     monkeypatch.setattr(iw.lambda_ingest, "resolve_site",
                         lambda conn, cid, report, user_folder: {"id": "site-1", "name": "Test Site"})
     monkeypatch.setattr(iw.lambda_ingest, "resolve_user", lambda conn, cid, user_folder: None)
