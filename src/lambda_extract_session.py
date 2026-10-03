@@ -1022,6 +1022,12 @@ def _instructions_block():
      standing. Marking those would relocate a whole stretch of photos to a room nobody visited.
    - A conversation does not move him. If he announces Room 101 and then discusses a level-three
      delay with someone who walks past, he is STILL IN ROOM 101 until he says otherwise.
+   - NAMING AN INSPECTION OF A PLACE MARKS THE PLACE. "Level one inspections", "doing the level
+     two inspections", "here is the Te Kaha room inspection", "pre-pour check on level 3" -- the
+     place in the inspection's name is where the following work and photos are: mark it, at the
+     time it is said. This holds when he calls it an example or a demonstration, and when he
+     names it rather than saying he walked there. This is not a mere mention: an inspection is
+     done where it is named, and it is the case these markers exist for.
    - `at` is the timestamp of the utterance itself; `quote` is the words verbatim, so a wrong
      marker can be diagnosed instead of guessed at.
    - Most meeting recordings contain NONE of these. An empty array is the normal answer and is
