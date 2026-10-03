@@ -90,8 +90,8 @@ def wired(monkeypatch):
     monkeypatch.setattr(org.sites, "get_company_site_by_slug", lambda conn, cid, slug: None)
     # create_member now gives the company its starter templates on every
     # invitation. Both calls go through a real cursor, which FakeConn does not
-    # have -- the same way the org-seed tests broke when that lambda learned to
-    # seed. Stubbed here, and the behaviour itself is pinned in
+    # have -- the same way the old org-seed tests broke when that lambda learned to
+    # seed (retired 2026-10-03). Stubbed here, and the behaviour itself is pinned in
     # test_an_invited_company_gets_its_templates.py.
     monkeypatch.setattr(org.users, "first_officer_or_member",
                         lambda conn, cid: {"id": "u-officer"})
@@ -5269,7 +5269,7 @@ def test_create_member_platform_admin_targets_other_company(member_wired):
 #
 # The invitation is how a company actually gets its people, and it was the one
 # path that did not seed. The migration seeds the companies that existed when it
-# ran; lambda_org_seed seeds on a manual backfill. Briv, on prod, was created
+# ran; the one-shot seed backfill (retired 2026-10-03) is gone. Briv, on prod, was created
 # empty and has 0 templates -- and the first person invited into it would have
 # found an empty Library, the symptom the owner reported on Southbase.
 #
@@ -7938,8 +7938,6 @@ def test_the_admin_summary_verbatim_serve_is_refused_for_a_date_with_deleted_sou
     monkeypatch.setattr(red, "deleted_source_prefixes",
                         lambda conn, folder=None, date=None: ["extractions/Ada_L/2026-07-14/"])
 
-    # The owner-company check runs before the verbatim serve; make the caller the owner so
-    # the branch is actually reached, which is the branch under test.
     # Only platform_admin reaches the verbatim branch; an admin caller would pass this
     # test without the deleted-sources guard ever being consulted.
     # Everything after the verbatim branch is irrelevant to this test: if the guard works,

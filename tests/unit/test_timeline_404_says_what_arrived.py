@@ -349,7 +349,6 @@ def test_a_truly_empty_day_still_404s_for_an_admin(monkeypatch):
     monkeypatch.setattr(org, "_list_report_folders", lambda date: [])
     monkeypatch.setattr(org.topics, "list_extraction_folder_names_for_date",
                         lambda conn, cid, date: set())
-    monkeypatch.setattr(org.companies, "get_company_by_name", lambda conn, name: None)
     monkeypatch.setattr(org.recordings, "folders_with_uploads_for_date",
                         lambda conn, cid, date: set())
     res = org.admin_disambiguation(FakeConn(), dict(CALLER), DATE)
@@ -382,7 +381,6 @@ def test_an_ordinary_admin_keeps_the_company_pin(monkeypatch):
     monkeypatch.setattr(org, "_list_report_folders", lambda date: [])
     monkeypatch.setattr(org.topics, "list_extraction_folder_names_for_date",
                         lambda conn, cid, date: set())
-    monkeypatch.setattr(org.companies, "get_company_by_name", lambda conn, name: None)
     monkeypatch.setattr(org.recordings, "folders_with_uploads_for_date",
                         lambda conn, cid, date: seen.update(company=cid) or set())
     org.admin_disambiguation(FakeConn(), dict(CALLER), DATE)

@@ -188,7 +188,7 @@ def _list_report_pictures(user_folder, date):
 
 def load_mapping() -> dict:
     """Load + cache config/user_mapping.json for the module's lifetime
-    (warm Lambda container) -- mirrors lambda_org_seed.load_mapping."""
+    (warm Lambda container) -- the retired lambda_org_seed's loader did the same."""
     global _mapping_cache
     if _mapping_cache is None:
         obj = s3().get_object(Bucket=S3_BUCKET, Key=CONFIG_KEY)

@@ -5108,8 +5108,8 @@ def create_member(conn, caller, body):
     # THE COMPANY'S STARTER TEMPLATES, if it does not have them yet. This is
     # the path a company actually gets its people through -- the invitation --
     # and it was the one path that did not seed. The migration seeds the
-    # companies that existed when it ran; lambda_org_seed seeds on a manual
-    # backfill. A company that was created empty and then got its first person
+    # companies that existed when it ran; the retired one-shot
+    # seed backfill (2026-10-03) is gone. A company that was created empty and then got its first person
     # by invitation (Briv, on prod) kept an empty Library forever, which is the
     # exact symptom the owner reported on Southbase: "I can't see any template".
     #

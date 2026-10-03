@@ -55,7 +55,7 @@ def test_the_pin_is_gone():
 
 
 def test_the_pipeline_lambdas_and_the_stack_no_longer_carry_the_pin():
-    # lambda_org_api's COMPANY_NAME is Task 2's; this checks only what Task 1 owns.
+    # Checks only the pipeline lambdas and the stack, not lambda_org_api.
     hits = []
     for name in ("lambda_ingest.py", "lambda_item_writer.py"):
         text = open(os.path.join(SRC, name), encoding="utf-8").read()

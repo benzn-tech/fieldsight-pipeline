@@ -23,6 +23,7 @@ def test_all_pgdatabase_values_are_guarded_by_the_condition():
     # bare !ImportValue (that would be an un-switched function).
     guarded = len(re.findall(r"PGDATABASE:\s*!If \[HasPgDatabaseOverride", t))
     bare = len(re.findall(r"PGDATABASE:\s*!ImportValue", t))
+    # 19 with OrgSeedFunction retired (2026-10-03), its guarded PGDATABASE gone with it.
     # 20 with FloorRecomputeFunction: the scheduled sweep that rebuilds every company's
     # calibrated floor from its own correction history (spec S1.3) has to hold a
     # connection to read that history, so it is in-VPC like every other writer here,
@@ -46,5 +47,5 @@ def test_all_pgdatabase_values_are_guarded_by_the_condition():
     # The count is the point: a new in-VPC function is meant to make this test fail, so
     # that whoever adds one has to look at whether they guarded PGDATABASE rather than
     # discovering months later that test writes went to the prod database.
-    assert guarded == 20, f"expected 20 guarded PGDATABASE, found {guarded}"
+    assert guarded == 19, f"expected 19 guarded PGDATABASE, found {guarded}"
     assert bare == 0, f"found {bare} un-switched bare PGDATABASE !ImportValue"

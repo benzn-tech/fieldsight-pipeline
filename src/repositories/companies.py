@@ -9,13 +9,6 @@ def create_company(conn, name, industry=None) -> dict:
     ).fetchone()
 
 
-def get_company_by_name(conn, name) -> dict | None:
-    return conn.cursor(row_factory=dict_row).execute(
-        "SELECT id, name, industry, created_at FROM companies WHERE name=%s",
-        (name,),
-    ).fetchone()
-
-
 def find_company_by_name_ci(conn, name) -> dict | None:
     """The company whose name matches `name` ignoring case and surrounding space.
 
