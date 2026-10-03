@@ -259,10 +259,6 @@ def test_write_extraction_items_two_passes_leave_one_superseded_and_one_live(
                 _extraction("live", "2026-09-29T10:00:00Z", "Pour B2 -- live pass")),
         })
 
-        # write_extraction_items resolves the company via `lambda_ingest.resolve_company`
-        # (reused by import, per the module docstring), which reads lambda_ingest's OWN
-        # COMPANY_NAME constant -- not lambda_item_writer's.
-        monkeypatch.setattr(lambda_item_writer.lambda_ingest, "COMPANY_NAME", company_name)
         monkeypatch.setattr(lambda_item_writer, "_s3_client", fake_s3)
         monkeypatch.setattr(lambda_item_writer, "get_connection",
                             lambda *a, **k: get_connection(migrated_db_url))
@@ -411,7 +407,6 @@ def test_carry_forward_survives_a_live_then_final_pass(monkeypatch, migrated_db_
                 ACTION_LIVE_2, FINDING_LIVE_2)),
         })
 
-        monkeypatch.setattr(lambda_item_writer.lambda_ingest, "COMPANY_NAME", company_name)
         monkeypatch.setattr(lambda_item_writer, "_s3_client", fake_s3)
         monkeypatch.setattr(lambda_item_writer, "get_connection",
                             lambda *a, **k: get_connection(migrated_db_url))

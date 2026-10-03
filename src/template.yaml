@@ -1162,20 +1162,6 @@ Parameters:
       redeploying, with no code change. Setting it on the live function instead
       is erased by the next CloudFormation reconcile.
 
-  MultiTenantResolution:
-    Type: String
-    Default: 'false'
-    AllowedValues: ['true', 'false']
-    Description: >-
-      When true, ingest/item-writer resolve the owning company per user folder
-      via the identity directory (users.folder_name, globally unique). When
-      false, all pipeline writes are pinned to COMPANY_NAME's company.
-      Prod is true; TEST is now true too (set in deploy.yml). The original pin
-      protected PROD rows when TEST shared prod's DB, but since the fieldsight_test
-      DB-isolation cutover (PR #114) TEST writes reach only the test DB — which
-      holds multi-company seed data (e.g. Southbase / UC PK), so a per-folder
-      resolve is required for a recorder's session to attribute to its real site.
-
   AuthorityFlip:
     Type: String
     Default: 'false'
@@ -2878,7 +2864,7 @@ Resources:
   # the object, so no S3 read grant is needed). Same transcripts/ EventBridge
   # trigger as the rolling summary, but gated ENABLED only with finalize, so it
   # ships INERT on prod (mirrors the sweep's ShouldEnableFinalize gate). Resolution
-  # env mirrors IngestFunction so resolve_company routes per folder (MULTI_TENANT).
+  # env mirrors IngestFunction so resolve_company routes per folder.
   # ----------------------------------------------------------
   SessionActivityFunction:
     Type: AWS::Serverless::Function
@@ -2905,7 +2891,6 @@ Resources:
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
           CONFIG_KEY: config/user_mapping.json
-          MULTI_TENANT_RESOLUTION: !Ref MultiTenantResolution
           # Sets the sweep's pending flag (Aurora scale-to-zero, spec 2026-08-11).
           # This is the path that matters most: a device that dies without
           # /close is finalized only by idle-close inference, so an `open` from
@@ -3427,7 +3412,6 @@ Resources:
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
           CONFIG_KEY: config/user_mapping.json
-          MULTI_TENANT_RESOLUTION: !Ref MultiTenantResolution
           AUTHORITY_FLIP: !Ref AuthorityFlip
           # Ruling R22: carry_forward_apply.py's OrphanedHumanEdits EMF line reads this
           # (os.environ.get("STAGE", "unknown")) — without it every emission lands under
@@ -3631,7 +3615,6 @@ Resources:
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
           CONFIG_KEY: config/user_mapping.json
-          MULTI_TENANT_RESOLUTION: !Ref MultiTenantResolution
           # video-keyframe plan: emit keyframe_requests/ post-commit only when
           # this stage flag is on (ships inert otherwise).
           EMIT_KEYFRAME_REQUESTS: !Ref EnableKeyframes

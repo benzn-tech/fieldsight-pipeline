@@ -54,7 +54,6 @@ Environment Variables:
     S3_BUCKET     - S3 bucket name (the data lake -- IngestBucketName)
     CONFIG_KEY    - S3 key for user/site mapping (default: config/user_mapping.json,
                     read indirectly via lambda_ingest.load_mapping's own env var)
-    COMPANY_NAME  - default: FieldSight (mirrors lambda_ingest's default)
     PG*/DATABASE_URL - read by db.connection.get_connection()
 """
 import json
@@ -103,7 +102,6 @@ logger.setLevel(logging.INFO)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 CONFIG_KEY = os.environ.get("CONFIG_KEY", "config/user_mapping.json")
-COMPANY_NAME = os.environ.get("COMPANY_NAME", "FieldSight")
 
 # video-keyframe plan: ship the pipeline change inert -- only when
 # EnableKeyframes flips this env true does item-writer emit keyframe_requests/.
@@ -1054,12 +1052,7 @@ def write_extraction_items(date, user_folder, extraction_key):
 
         company = lambda_ingest.resolve_company(conn, user_folder)
         if company is None:
-            # Same guard + message as lambda_ingest.ingest_report (Fable
-            # minor 6): an unseeded org DB would otherwise surface as an
-            # opaque 'NoneType' subscript error on every extraction.
-            raise RuntimeError(
-                f"org company {COMPANY_NAME!r} not found — run the org seed "
-                "(fieldsight-*-org-seed) before ingesting")
+            raise lambda_ingest.unknown_folder_error(user_folder)
 
         # Site attribution, in priority order:
         #   1. recordings.site_for_media -- G5b: the app stamps the in-app project

@@ -119,8 +119,8 @@ def wired(monkeypatch):
     conn = ClosingFakeConn()
     monkeypatch.setattr(iw, "get_connection", lambda *a, **k: conn)
     monkeypatch.setattr(iw, "_s3_client", FakeS3({EXTRACTION_KEY: json.dumps(make_extraction())}))
-    monkeypatch.setattr(iw.companies, "get_company_by_name",
-                        lambda conn, name: {"id": "co-1", "name": name})
+    monkeypatch.setattr(iw.lambda_ingest, "resolve_company",
+                        lambda conn, folder: {"id": "co-1", "name": "Co"})
     monkeypatch.setattr(iw.lambda_ingest, "resolve_site",
                         lambda conn, cid, report, user_folder: {"id": "site-1", "name": "Test Site"})
     monkeypatch.setattr(iw.lambda_ingest, "resolve_user", lambda conn, cid, user_folder: None)

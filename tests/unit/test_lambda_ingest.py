@@ -118,8 +118,8 @@ def wired(monkeypatch):
     and inert repo writes. Individual tests override as needed."""
     monkeypatch.setattr(ing, "get_connection", lambda *a, **k: FakeConn())
     monkeypatch.setattr(ing, "_s3_client", FakeS3({REPORT_KEY: json.dumps(make_report())}))
-    monkeypatch.setattr(ing.companies, "get_company_by_name",
-                        lambda conn, name: {"id": "co-1", "name": name})
+    monkeypatch.setattr(ing, "resolve_company",
+                        lambda conn, folder: {"id": "co-1", "name": "Co"})
     monkeypatch.setattr(ing.sites, "get_company_site_by_name",
                         lambda conn, cid, name: {"id": "site-1", "name": name}
                         if name == "Test Site" else None)
@@ -1015,31 +1015,16 @@ def test_match_request_not_emitted_on_identity_skip(wired):
 
 
 class TestResolveCompany:
-    """Task 2 (prod-isolation): resolve_company routes a lake object to its
-    owning company. Pinned (test stack) vs global-folder (prod stack)."""
+    """resolve_company routes a lake object to its owning company through the
+    identity directory (globally-unique folder_name). The old COMPANY_NAME pin
+    and name fallback are gone; see test_company_resolution_is_directory_only."""
 
-    def test_pinned_when_multi_tenant_off(self, monkeypatch):
-        monkeypatch.setattr(ing, "MULTI_TENANT", False)
-        monkeypatch.setattr(ing.users, "get_by_folder_name_global",
-                            lambda conn, f: (_ for _ in ()).throw(AssertionError("must not be called")))
-        monkeypatch.setattr(ing.companies, "get_company_by_name",
-                            lambda conn, name: {"id": "internal-co", "name": name})
-        assert ing.resolve_company(FakeConn(), "Cust_User")["id"] == "internal-co"
-
-    def test_global_folder_lookup_when_on(self, monkeypatch):
-        monkeypatch.setattr(ing, "MULTI_TENANT", True)
+    def test_global_folder_lookup(self, monkeypatch):
         monkeypatch.setattr(ing.users, "get_by_folder_name_global",
                             lambda conn, f: {"id": "u1", "company_id": "cust-co", "folder_name": f})
         monkeypatch.setattr(ing.companies, "get_company_by_id",
                             lambda conn, cid: {"id": cid, "name": "Pilot Co"})
         assert ing.resolve_company(FakeConn(), "Cust_User")["id"] == "cust-co"
-
-    def test_falls_back_to_pin_on_unknown_folder(self, monkeypatch):
-        monkeypatch.setattr(ing, "MULTI_TENANT", True)
-        monkeypatch.setattr(ing.users, "get_by_folder_name_global", lambda conn, f: None)
-        monkeypatch.setattr(ing.companies, "get_company_by_name",
-                            lambda conn, name: {"id": "internal-co", "name": name})
-        assert ing.resolve_company(FakeConn(), "Legacy_Device")["id"] == "internal-co"
 
 
 # ---------------------------------------------------------------------------
