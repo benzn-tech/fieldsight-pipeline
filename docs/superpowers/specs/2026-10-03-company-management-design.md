@@ -36,6 +36,7 @@ GM project creation is already live on prod and is **out of scope**.
 3. **The lake-wide summary goes to `platform_admin` only.**
 4. **An unrecognised recording folder keeps being refused** — with an honest error.
 5. **Only `platform_admin` may rename a company.**
+6. **Retire `lambda_org_seed`** (added 2026-10-03, see §4).
 
 ## The finding that shaped this design
 
@@ -97,7 +98,7 @@ had the column; it fell out once both answers were in.)
 | `lambda_ingest.resolve_company` | drop the name fallback. A folder with no directory row returns `None`. |
 | `lambda_ingest` (~632) and `lambda_item_writer` (~903) | replace the error with the truth: *folder `X` has no directory row; not ingesting rather than guessing a tenant.* Name the folder; never mention the seed. |
 | `lambda_org_api` summary branch (~8615) | gate on `is_cross_company(caller["global_role"])`; delete the `get_company_by_name` call |
-| `lambda_org_seed` (~88) | find-or-create through `companies.find_company_by_name_ci`, so it cannot `INSERT` a case variant into the new unique index |
+| `lambda_org_seed` (~88) | **removed entirely** — see §4 |
 | `COMPANY_NAME` in ingest, item_writer, org-api | delete — unused |
 
 After this, `git grep -n "get_company_by_name(" src/` returns only its definition. A test
@@ -136,6 +137,41 @@ API (`lambda_org_seed`, a hand-written `INSERT`). The index stops all of them.
   stops. That is the intended failure: a duplicate tenant has to be resolved by a person.
 - A `UniqueViolation` raised by the index inside create or rename (the race) is answered
   **409**, not the generic 500.
+
+### 4. Retire `lambda_org_seed` (decision 6, added 2026-10-03)
+
+"Seed" here means *populate a database with its initial data*, not a random-number seed.
+It was the Phase 3 one-shot move of identity from `config/user_mapping.json` into Aurora:
+create the company, copy the Cognito users in, create sites and memberships from the JSON.
+That move finished long ago. The function is still deployed on **both** stacks
+(`fieldsight-{test,prod}-org-seed`), manual-invoke only, and **both read the same shared
+Cognito pool** (`ap-southeast-2_q88pd6XXr`, 29 users).
+
+Read as code rather than as its docstring, one default invoke today would:
+
+| step | effect |
+|---|---|
+| `get_company_by_name("FieldSight")` → none → `create_company("FieldSight")` | a new tenant |
+| `upsert_user(..., company_id=<that tenant>)` for **every** Cognito user — `upsert_user` overwrites `company_id` on conflict | **every person in every tenant moved into one company: multi-tenancy collapses in a single call** |
+| `global_role = resolve_role(...)` from the frozen JSON | every role changed through the org API since is rolled back |
+| `set_folder_name` from the frozen JSON | people re-pointed at folders that may belong to no one (`Ben_Lin`) |
+
+The TEST stack's copy would pull prod-only customers into `fieldsight_test` the same way.
+
+The earlier draft only switched its lookup to the case-insensitive one. That stops it
+colliding with the new unique index and stops nothing in the table above. A guard
+("refuse when more than one company exists") would still leave a deployed function whose
+only purpose is a migration that has already run, so the decision is **removal**:
+
+- delete `OrgSeedFunction` and `OrgSeedLogGroup` from `src/template.yaml`
+- delete `src/lambda_org_seed.py` and `tests/unit/test_lambda_org_seed.py`
+- `tests/unit/test_lambda_org_api.py` and `tests/unit/test_the_starter_templates_are_usable.py`
+  also reference it — read what they use it for; anything still needed moves to where it
+  belongs (starter-template seeding already lives in `report_templates.seed_starters`)
+- recoverable from git history should a fresh stack ever need bootstrapping
+
+This code would produce exactly the misfiling seen on prod — Southbase people inside the
+operator company. **There is no evidence it is what did**; the mechanism matches, nothing more.
 
 ## Web (`fieldsight-ui`, Sites page)
 
@@ -193,6 +229,9 @@ summary-gate test additionally gets the mutation that restores the company-membe
   This design removes the leak they would have caused through the summary branch, but their
   placement is still wrong: anything else gated on company membership treats them as
   operator staff. Correcting it is a data change and the owner's.
-- **`lambda_org_seed` re-applies mapping-derived roles on every run**, overwriting roles
-  changed through the org API since. Not changed here; recorded because §1 touches the file.
-- No company **delete** — `companies` is referenced by 22 foreign keys.
+- No company **delete** — `companies` is referenced by 22 foreign keys. **Archive** is
+  possible (an `archived_at` column, the pattern `sites` and `users` already use); it is
+  deferred because what archiving does to a company's people is a product decision.
+- **Moving a person or site to another company carries no history.** Many tables hold a
+  denormalised `company_id` beside `site_id`/`user_id`; neither #987's site move nor any
+  person move updates them. Not designed here.
