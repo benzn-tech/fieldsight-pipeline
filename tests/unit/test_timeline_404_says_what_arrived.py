@@ -320,7 +320,6 @@ def test_an_admin_day_with_only_uploads_offers_a_picker(monkeypatch):
     monkeypatch.setattr(org, "_list_report_folders", lambda date: [])
     monkeypatch.setattr(org.topics, "list_extraction_folder_names_for_date",
                         lambda conn, cid, date: set())
-    monkeypatch.setattr(org.companies, "get_company_by_name", lambda conn, name: None)
     monkeypatch.setattr(org.recordings, "folders_with_uploads_for_date",
                         lambda conn, cid, date: {"Neil_Blunden", "Sam_Yu"})
     res = org.admin_disambiguation(FakeConn(), dict(CALLER), DATE)
@@ -334,7 +333,6 @@ def test_a_single_upload_only_folder_goes_straight_to_that_day(monkeypatch):
     monkeypatch.setattr(org, "_list_report_folders", lambda date: [])
     monkeypatch.setattr(org.topics, "list_extraction_folder_names_for_date",
                         lambda conn, cid, date: set())
-    monkeypatch.setattr(org.companies, "get_company_by_name", lambda conn, name: None)
     monkeypatch.setattr(org.recordings, "folders_with_uploads_for_date",
                         lambda conn, cid, date: {USER})
     seen = {}
@@ -369,7 +367,10 @@ def test_a_cross_company_admin_is_not_pinned_to_its_own_company(monkeypatch):
     monkeypatch.setattr(org, "_list_report_folders", lambda date: [])
     monkeypatch.setattr(org.topics, "list_extraction_folder_names_for_date",
                         lambda conn, cid, date: set())
-    monkeypatch.setattr(org.companies, "get_company_by_name", lambda conn, name: None)
+    # platform_admin reaches the lake-wide summary branch first; no summary for
+    # this day, so the call falls through to the candidate sources under test.
+    monkeypatch.setattr(org, "_day_has_deleted_sources", lambda conn, folder, date: False)
+    monkeypatch.setattr(org, "_get_lake_json", lambda key: None)
     monkeypatch.setattr(org.recordings, "folders_with_uploads_for_date",
                         lambda conn, cid, date: seen.update(company=cid) or set())
     org.admin_disambiguation(FakeConn(), dict(CALLER, global_role="platform_admin"), DATE)

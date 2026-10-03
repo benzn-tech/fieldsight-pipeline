@@ -1076,13 +1076,6 @@ class FakeS3:
 def presign_wired(wired):
     fake = FakeS3()
     wired.setattr(org, "_s3_client", fake)
-    # Fix wave 1 review finding 1: admin_disambiguation now resolves the
-    # lake-owner company before serving summary_report.json verbatim.
-    # Default it to the CALLER's own company (c-uuid-1) so every existing
-    # admin/gm test keeps its prior behavior unchanged; tests exercising the
-    # gate itself override this per-test.
-    wired.setattr(org.companies, "get_company_by_name",
-                  lambda conn, name: {"id": "c-uuid-1", "name": name})
     # 2026-09-07: admin_disambiguation also unions the folders that captured
     # something but produced no report, so an upload-only day opens onto a
     # picker instead of a bare 404. Defaulted to empty here so every test
@@ -3403,10 +3396,13 @@ def test_admin_no_user_unions_extraction_folders(presign_wired):
 
 
 def test_admin_summary_report_verbatim(presign_wired):
-    # presign_wired's default companies.get_company_by_name pins the "internal"
-    # company to c-uuid-1 -- the same id as CALLER -- so this caller IS the
-    # lake owner and still gets the summary doc verbatim (Fix wave 1 finding 1).
+    # The lake-wide summary is for platform_admin (is_cross_company) only.
     wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "platform_admin"})
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org, "_day_has_deleted_sources", lambda conn, folder, date: False)
+    wired.setattr(org.sites, "list_all_sites", lambda conn: [])
     summary_doc = {"date": "2026-07-14", "company_summary": "All sites green.", "extra": 1}
     fake.objects["reports/2026-07-14/summary_report.json"] = json.dumps(summary_doc).encode()
     res = org.lambda_handler(make_event(
@@ -3415,15 +3411,13 @@ def test_admin_summary_report_verbatim(presign_wired):
     assert body_of(res) == summary_doc
 
 
-def test_admin_summary_report_gated_for_non_owner_company(presign_wired):
+def test_admin_summary_report_refused_to_a_company_admin(presign_wired):
     # Fix wave 1 review finding 1 (CRITICAL cross-tenant leak): the summary
     # doc is a lake-wide aggregate across EVERY company's folders. A caller
-    # whose company isn't the lake owner must never see it verbatim, even
+    # who is not platform_admin must never see it verbatim, even
     # though the doc exists in S3 -- must fall through to the (company-
     # scoped) disambiguation union instead, and must never even GetObject it.
     wired, fake = presign_wired
-    wired.setattr(org.companies, "get_company_by_name",
-                  lambda conn, name: {"id": "OTHER-owner-co", "name": name})
     summary_doc = {"date": "2026-07-14", "company_summary": "All sites green.", "extra": 1}
     fake.objects["reports/2026-07-14/summary_report.json"] = json.dumps(summary_doc).encode()
     # Two candidates -- forces the union envelope response (not the
@@ -3434,23 +3428,6 @@ def test_admin_summary_report_gated_for_non_owner_company(presign_wired):
         "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
     assert res["statusCode"] == 200
     assert body_of(res) == {"date": "2026-07-14", "available_users": ["Ada_L", "Sam_Trainor"]}
-    assert "reports/2026-07-14/summary_report.json" not in fake.get_object_calls
-
-
-def test_admin_summary_report_skipped_when_owner_unresolved(presign_wired):
-    # Fail-closed proof: if the lake-owner company can't be resolved at all
-    # (e.g. COMPANY_NAME points at a company row that doesn't exist), the
-    # summary branch is skipped for EVERYONE, not just non-owners -- it
-    # never falls back to "no gate" behavior.
-    wired, fake = presign_wired
-    wired.setattr(org.companies, "get_company_by_name", lambda conn, name: None)
-    summary_doc = {"date": "2026-07-14", "company_summary": "All sites green.", "extra": 1}
-    fake.objects["reports/2026-07-14/summary_report.json"] = json.dumps(summary_doc).encode()
-    wired.setattr(org.topics, "list_extraction_folder_names_for_date",
-                  lambda conn, cid, date: [])
-    res = org.lambda_handler(make_event(
-        "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
-    assert res["statusCode"] == 404  # no candidates either -- proves it never touched the summary doc
     assert "reports/2026-07-14/summary_report.json" not in fake.get_object_calls
 
 
@@ -7953,7 +7930,7 @@ def test_the_verbatim_timeline_fallback_is_refused_when_the_day_has_deleted_sour
 
 def test_the_admin_summary_verbatim_serve_is_refused_for_a_date_with_deleted_sources(monkeypatch):
     """Same shape, the aggregate door. `summary_report.json` is lake-wide and served
-    byte-verbatim to the owner company -- a deleted session's content sits inside it."""
+    byte-verbatim to platform_admin -- a deleted session's content sits inside it."""
     import repositories.redactions as red
 
     monkeypatch.setattr(org, "_get_lake_json",
@@ -7963,8 +7940,8 @@ def test_the_admin_summary_verbatim_serve_is_refused_for_a_date_with_deleted_sou
 
     # The owner-company check runs before the verbatim serve; make the caller the owner so
     # the branch is actually reached, which is the branch under test.
-    monkeypatch.setattr(org.companies, "get_company_by_name",
-                        lambda conn, name: {"id": CALLER["company_id"]})
+    # Only platform_admin reaches the verbatim branch; an admin caller would pass this
+    # test without the deleted-sources guard ever being consulted.
     # Everything after the verbatim branch is irrelevant to this test: if the guard works,
     # the doc is never fetched. Assert on the FETCH, not on the response shape, so the
     # test cannot pass because some later step happened to fail.
@@ -7973,7 +7950,8 @@ def test_the_admin_summary_verbatim_serve_is_refused_for_a_date_with_deleted_sou
                         lambda key: fetched.append(key) or
                         {"summary": "everything, including the deleted"})
     try:
-        org.admin_disambiguation(object(), CALLER, "2026-07-14")
+        org.admin_disambiguation(object(), {**CALLER, "global_role": "platform_admin"},
+                                 "2026-07-14")
     except Exception:
         pass                       # the later candidate-listing needs a real conn
     assert not any("summary_report.json" in k for k in fetched),         f"the pre-deletion aggregate was fetched: {fetched}"

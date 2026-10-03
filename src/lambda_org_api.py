@@ -183,14 +183,6 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "")
 # module-level s3() client (boto3 clients aren't bucket-bound; Bucket is a
 # per-call param) — no second client needed.
 LAKE_BUCKET = os.environ.get("LAKE_BUCKET", "")
-# Fix wave 1 (review finding 1): the lake-owner/internal company name —
-# reuses the SAME marker lambda_ingest.py/lambda_item_writer.py already
-# introduced for MultiTenantResolution's company pin (resolve_company /
-# COMPANY_NAME), rather than inventing a second one. Resolved to a company
-# row via companies.get_company_by_name at call time (no template.yaml
-# wiring needed here either — those two functions don't wire it as an env
-# var, they rely on this same in-code default).
-COMPANY_NAME = os.environ.get("COMPANY_NAME", "FieldSight")
 ORG_ASSETS_PREFIX = os.environ.get("ORG_ASSETS_PREFIX", "org-assets/")
 COGNITO_USER_POOL_ID = os.environ.get("COGNITO_USER_POOL_ID", "")
 PRESIGNED_URL_EXPIRY = 900
@@ -8196,11 +8188,9 @@ def reject_thread_suggestion(conn, caller, suggestion_id):
 # summary_report.json (admin_disambiguation's first branch) is a day-level
 # aggregate built LAKE-WIDE across every company's folders by the report
 # generator — it has no per-folder identity to ACL-check, so instead the
-# whole branch is gated on the CALLER's company (Fix wave 1 review finding
-# 1): only the lake-owner/internal company (COMPANY_NAME, see above) may
-# see it verbatim; every other company's admin/gm skips straight to the
-# company-scoped disambiguation union below. Fail-closed: if the owner
-# company can't be resolved, the branch is skipped for everyone.
+# whole branch is gated on is_cross_company (platform_admin) -- the only role
+# allowed across tenants (spec 2026-10-03); every other admin/gm skips
+# straight to the company-scoped disambiguation union below.
 # ----------------------------------------------------------
 _LAKE_NOT_FOUND_CODES = ("NoSuchKey", "404")
 
@@ -8903,20 +8893,19 @@ def _day_upload_facts(conn, caller, user, date):
 
 
 def admin_disambiguation(conn, caller, date):
-    """D1(iv): admin/gm asked for a date with no ?user=. Try the day's
-    aggregate summary_report.json verbatim first — but ONLY for the
-    lake-owner/internal company (Fix wave 1 review finding 1): this doc is
-    built LAKE-WIDE across every company's folders by the report generator,
-    so serving it to a customer-company admin was a cross-tenant leak.
-    Fail-closed: if the owner company can't be resolved, the branch is
-    skipped for everyone, not just non-owners. Otherwise union S3-listed
+    """D1(iv): admin/gm asked for a date with no ?user=.
+    Serve the day's aggregate summary_report.json verbatim first -- but ONLY
+    to is_cross_company (platform_admin): the report generator builds it
+    from every tenant's folders. It used to be gated on "the caller's company
+    is the operator company", which would have handed it to that company's gm;
+    the name lookup behind that gate returned None, so the leak was closed only
+    by accident (spec 2026-10-03). Otherwise union S3-listed
     report folders (company-filtered via users.get_by_folder_name —
     RETARGET override 5) with Aurora's extraction-sourced folder names
     (already company-scoped by the repository query itself). One candidate
     recurses into the single-user path; several return the disambiguation
     envelope the UI's meeting-picker expects; none is a 404."""
-    owner = companies.get_company_by_name(conn, COMPANY_NAME)
-    if owner is not None and str(caller["company_id"]) == str(owner["id"]):
+    if is_cross_company(caller["global_role"]):
         # Same door, aggregate form: summary_report.json is lake-wide and byte-verbatim,
         # so a deleted session's words sit inside it whatever the SQL filters say.
         doc = (None if _day_has_deleted_sources(conn, None, date)
