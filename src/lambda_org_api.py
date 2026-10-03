@@ -515,6 +515,10 @@ def dispatch(conn, event, method, route):
         if method == "POST":
             return create_org_company(conn, caller, parse_body(event))
 
+    m_co = re.match(r"^/companies/([^/]+)$", route)
+    if m_co and method == "PATCH":
+        return patch_org_company(conn, caller, m_co.group(1), parse_body(event))
+
     if route == "/members":
         if method == "GET":
             return list_members(conn, caller, event)
@@ -4753,6 +4757,53 @@ def create_org_company(conn, caller, body):
     logger.info("company created: %s (%s) by %s", row["name"], row["id"],
                 caller.get("cognito_sub"))
     return ok({"company": {"id": str(row["id"]), "name": row["name"]}}, 201)
+
+
+def patch_org_company(conn, caller, company_id, body):
+    """PATCH /companies/{id} -- rename a tenant (and/or set its industry).
+    platform_admin only, the same gate as create: a company admin renaming
+    their own tenant would have to be told a name is taken without being told
+    by whom, and that alone discloses that the tenant exists.
+
+    Safe because no code finds a company by its name any more. The duplicate
+    guard EXCLUDES this company, so changing only the case of its own name
+    ("frequency" -> "Frequency") is allowed."""
+    if not is_cross_company(caller["global_role"]):
+        return error("platform_admin role required", 403)
+    if body is None:
+        return error("malformed JSON body", 400)
+    try:
+        company_id = str(uuid.UUID(str(company_id)))
+    except (ValueError, AttributeError, TypeError):
+        return error("company id must be a uuid", 400)
+    changes = {}
+    if "name" in body:
+        name = body.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return error("name must be a non-empty string", 400)
+        changes["name"] = name.strip()
+    if "industry" in body:
+        industry = body.get("industry")
+        if industry is not None and not isinstance(industry, str):
+            return error("industry must be a string", 400)
+        changes["industry"] = (industry or "").strip() or None
+    if not changes:
+        return error("nothing to change: send name and/or industry", 400)
+    if companies.get_company_by_id(conn, company_id) is None:
+        return error("company not found", 404)
+    if "name" in changes:
+        clash = companies.find_company_by_name_ci(conn, changes["name"])
+        if clash is not None and str(clash["id"]) != company_id:
+            return _company_name_taken(clash)
+    try:
+        row = companies.update_company(conn, company_id, **changes)
+    except UniqueViolation:
+        conn.rollback()
+        return _company_name_taken(
+            companies.find_company_by_name_ci(conn, changes.get("name", "")))
+    logger.info("company updated: %s -> %s by %s", company_id, sorted(changes),
+                caller.get("cognito_sub"))
+    return ok({"company": {"id": str(row["id"]), "name": row["name"]}})
 
 
 # ----------------------------------------------------------
