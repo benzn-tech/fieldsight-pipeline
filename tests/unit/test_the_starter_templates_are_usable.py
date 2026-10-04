@@ -185,7 +185,7 @@ def test_the_starters_are_org_scope_and_own_no_user():
 
 def test_the_bodies_live_in_one_place_and_both_callers_call_it():
     """Two callers need these: this migration, for the companies that already
-    exist, and lambda_org_seed, for every company made from now on.
+    exist, and create_member, for every company made from now on (on its first invitation).
 
     A copy in Python beside a copy in SQL is two copies, and the one that gets
     edited is not reliably the one that runs. So the bodies are in a function
@@ -195,9 +195,12 @@ def test_the_bodies_live_in_one_place_and_both_callers_call_it():
     assert "CREATE OR REPLACE FUNCTION seed_starter_report_templates" in sql
     assert "PERFORM seed_starter_report_templates(co.id, author)" in sql
 
-    seed = io.open(os.path.join(os.path.dirname(__file__), "..", "..", "src",
-                                "lambda_org_seed.py"), encoding="utf-8").read()
-    assert "seed_starter_report_templates" in seed or "seed_starters" in seed,         "a company created after this migration would get nothing"
+    # A company made from now on has no members when POST /companies creates
+    # it, so its starters are seeded on the first invitation: create_member.
+    # (lambda_org_seed, the old second caller, was retired 2026-10-03.)
+    api = io.open(os.path.join(os.path.dirname(__file__), "..", "..", "src",
+                               "lambda_org_api.py"), encoding="utf-8").read()
+    assert "report_templates.seed_starters(" in api,         "a company created after this migration would get nothing"
 
 
 def test_each_company_gets_its_own_copies_not_a_shared_row():

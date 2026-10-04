@@ -28,7 +28,7 @@ NEWER = SEGS + [{"start": 39902.0, "end": 39930.0, "session_id": SID,
 
 
 def _user(db, folder):
-    cid = db.execute("INSERT INTO companies (name) VALUES ('C') RETURNING id").fetchone()[0]
+    cid = db.execute("INSERT INTO companies (name) VALUES ('C ' || gen_random_uuid()::text) RETURNING id").fetchone()[0]
     return db.execute(
         "INSERT INTO users (company_id, email, global_role, folder_name) "
         "VALUES (%s, %s, 'worker', %s) RETURNING id",
@@ -242,7 +242,7 @@ def _group(db, *, lead_row=True):
     """A company, a lead user and a member user on a DIFFERENT folder, one group, one solo."""
     from repositories import meeting_session, redactions
 
-    cid = db.execute("INSERT INTO companies (name) VALUES ('G') RETURNING id").fetchone()[0]
+    cid = db.execute("INSERT INTO companies (name) VALUES ('G ' || gen_random_uuid()::text) RETURNING id").fetchone()[0]
     lead_user = db.execute(
         "INSERT INTO users (company_id, email, global_role, folder_name) "
         "VALUES (%s, 'lead@example.test', 'worker', 'Grp_Lead') RETURNING id", (cid,)).fetchone()[0]
@@ -309,7 +309,7 @@ def test_a_lead_with_members_expands_to_the_lead_and_every_member(db):
 def test_a_lead_with_no_members_expands_to_only_itself(db):
     from repositories import meeting_session
 
-    cid = db.execute("INSERT INTO companies (name) VALUES ('GS') RETURNING id").fetchone()[0]
+    cid = db.execute("INSERT INTO companies (name) VALUES ('GS ' || gen_random_uuid()::text) RETURNING id").fetchone()[0]
     lone_lead = "e" * 32
     lone_user = db.execute(
         "INSERT INTO users (company_id, email, global_role, folder_name) "

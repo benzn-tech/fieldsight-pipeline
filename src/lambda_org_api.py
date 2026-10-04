@@ -182,14 +182,6 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "")
 # module-level s3() client (boto3 clients aren't bucket-bound; Bucket is a
 # per-call param) — no second client needed.
 LAKE_BUCKET = os.environ.get("LAKE_BUCKET", "")
-# Fix wave 1 (review finding 1): the lake-owner/internal company name —
-# reuses the SAME marker lambda_ingest.py/lambda_item_writer.py already
-# introduced for MultiTenantResolution's company pin (resolve_company /
-# COMPANY_NAME), rather than inventing a second one. Resolved to a company
-# row via companies.get_company_by_name at call time (no template.yaml
-# wiring needed here either — those two functions don't wire it as an env
-# var, they rely on this same in-code default).
-COMPANY_NAME = os.environ.get("COMPANY_NAME", "FieldSight")
 ORG_ASSETS_PREFIX = os.environ.get("ORG_ASSETS_PREFIX", "org-assets/")
 COGNITO_USER_POOL_ID = os.environ.get("COGNITO_USER_POOL_ID", "")
 PRESIGNED_URL_EXPIRY = 900
@@ -521,6 +513,10 @@ def dispatch(conn, event, method, route):
             return list_org_companies(conn, caller)
         if method == "POST":
             return create_org_company(conn, caller, parse_body(event))
+
+    m_co = re.match(r"^/companies/([^/]+)$", route)
+    if m_co and method == "PATCH":
+        return patch_org_company(conn, caller, m_co.group(1), parse_body(event))
 
     if route == "/members":
         if method == "GET":
@@ -4694,6 +4690,16 @@ def list_org_companies(conn, caller):
     ]})
 
 
+def _company_name_taken(clash):
+    """409 for a company name another tenant holds. Carries that company as
+    data, because the caller who retried after a timeout wants the company
+    that exists, not an error message to parse."""
+    if clash is None:   # raced, and the winner is not visible to this read
+        return error("a company with that name already exists", 409)
+    return error(f"a company named '{clash['name']}' already exists", 409,
+                 {"existing": {"id": str(clash["id"]), "name": clash["name"]}})
+
+
 def create_org_company(conn, caller, body):
     """POST /companies -- a new tenant. platform_admin only.
 
@@ -4733,12 +4739,64 @@ def create_org_company(conn, caller, body):
         industry = industry.strip() or None
     clash = companies.find_company_by_name_ci(conn, name)
     if clash is not None:
-        return error(f"a company named '{clash['name']}' already exists "
-                     f"({clash['id']})", 409)
-    row = companies.create_company(conn, name, industry)
+        return _company_name_taken(clash)
+    try:
+        row = companies.create_company(conn, name, industry)
+    except UniqueViolation:
+        # idx_companies_name_ci: a concurrent create took the name after the
+        # check above. The transaction is aborted -- roll back before reading.
+        conn.rollback()
+        return _company_name_taken(companies.find_company_by_name_ci(conn, name))
     logger.info("company created: %s (%s) by %s", row["name"], row["id"],
                 caller.get("cognito_sub"))
     return ok({"company": {"id": str(row["id"]), "name": row["name"]}}, 201)
+
+
+def patch_org_company(conn, caller, company_id, body):
+    """PATCH /companies/{id} -- rename a tenant (and/or set its industry).
+    platform_admin only, the same gate as create: a company admin renaming
+    their own tenant would have to be told a name is taken without being told
+    by whom, and that alone discloses that the tenant exists.
+
+    Safe because no code finds a company by its name any more. The duplicate
+    guard EXCLUDES this company, so changing only the case of its own name
+    ("frequency" -> "Frequency") is allowed."""
+    if not is_cross_company(caller["global_role"]):
+        return error("platform_admin role required", 403)
+    if body is None:
+        return error("malformed JSON body", 400)
+    try:
+        company_id = str(uuid.UUID(str(company_id)))
+    except (ValueError, AttributeError, TypeError):
+        return error("company id must be a uuid", 400)
+    changes = {}
+    if "name" in body:
+        name = body.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return error("name must be a non-empty string", 400)
+        changes["name"] = name.strip()
+    if "industry" in body:
+        industry = body.get("industry")
+        if industry is not None and not isinstance(industry, str):
+            return error("industry must be a string", 400)
+        changes["industry"] = (industry or "").strip() or None
+    if not changes:
+        return error("nothing to change: send name and/or industry", 400)
+    if companies.get_company_by_id(conn, company_id) is None:
+        return error("company not found", 404)
+    if "name" in changes:
+        clash = companies.find_company_by_name_ci(conn, changes["name"])
+        if clash is not None and str(clash["id"]) != company_id:
+            return _company_name_taken(clash)
+    try:
+        row = companies.update_company(conn, company_id, **changes)
+    except UniqueViolation:
+        conn.rollback()
+        return _company_name_taken(
+            companies.find_company_by_name_ci(conn, changes.get("name", "")))
+    logger.info("company updated: %s -> %s by %s", company_id, sorted(changes),
+                caller.get("cognito_sub"))
+    return ok({"company": {"id": str(row["id"]), "name": row["name"]}})
 
 
 # ----------------------------------------------------------
@@ -5109,8 +5167,8 @@ def create_member(conn, caller, body):
     # THE COMPANY'S STARTER TEMPLATES, if it does not have them yet. This is
     # the path a company actually gets its people through -- the invitation --
     # and it was the one path that did not seed. The migration seeds the
-    # companies that existed when it ran; lambda_org_seed seeds on a manual
-    # backfill. A company that was created empty and then got its first person
+    # companies that existed when it ran; the retired one-shot
+    # seed backfill (2026-10-03) is gone. A company that was created empty and then got its first person
     # by invitation (Briv, on prod) kept an empty Library forever, which is the
     # exact symptom the owner reported on Southbase: "I can't see any template".
     #
@@ -7980,11 +8038,9 @@ def reject_thread_suggestion(conn, caller, suggestion_id):
 # summary_report.json (admin_disambiguation's first branch) is a day-level
 # aggregate built LAKE-WIDE across every company's folders by the report
 # generator — it has no per-folder identity to ACL-check, so instead the
-# whole branch is gated on the CALLER's company (Fix wave 1 review finding
-# 1): only the lake-owner/internal company (COMPANY_NAME, see above) may
-# see it verbatim; every other company's admin/gm skips straight to the
-# company-scoped disambiguation union below. Fail-closed: if the owner
-# company can't be resolved, the branch is skipped for everyone.
+# whole branch is gated on is_cross_company (platform_admin) -- the only role
+# allowed across tenants (spec 2026-10-03); every other admin/gm skips
+# straight to the company-scoped disambiguation union below.
 # ----------------------------------------------------------
 _LAKE_NOT_FOUND_CODES = ("NoSuchKey", "404")
 
@@ -8679,20 +8735,19 @@ def _day_upload_facts(conn, caller, user, date):
 
 
 def admin_disambiguation(conn, caller, date):
-    """D1(iv): admin/gm asked for a date with no ?user=. Try the day's
-    aggregate summary_report.json verbatim first — but ONLY for the
-    lake-owner/internal company (Fix wave 1 review finding 1): this doc is
-    built LAKE-WIDE across every company's folders by the report generator,
-    so serving it to a customer-company admin was a cross-tenant leak.
-    Fail-closed: if the owner company can't be resolved, the branch is
-    skipped for everyone, not just non-owners. Otherwise union S3-listed
+    """D1(iv): admin/gm asked for a date with no ?user=.
+    Serve the day's aggregate summary_report.json verbatim first -- but ONLY
+    to is_cross_company (platform_admin): the report generator builds it
+    from every tenant's folders. It used to be gated on "the caller's company
+    is the operator company", which would have handed it to that company's gm;
+    the name lookup behind that gate returned None, so the leak was closed only
+    by accident (spec 2026-10-03). Otherwise union S3-listed
     report folders (company-filtered via users.get_by_folder_name —
     RETARGET override 5) with Aurora's extraction-sourced folder names
     (already company-scoped by the repository query itself). One candidate
     recurses into the single-user path; several return the disambiguation
     envelope the UI's meeting-picker expects; none is a 404."""
-    owner = companies.get_company_by_name(conn, COMPANY_NAME)
-    if owner is not None and str(caller["company_id"]) == str(owner["id"]):
+    if is_cross_company(caller["global_role"]):
         # Same door, aggregate form: summary_report.json is lake-wide and byte-verbatim,
         # so a deleted session's words sit inside it whatever the SQL filters say.
         doc = (None if _day_has_deleted_sources(conn, None, date)
