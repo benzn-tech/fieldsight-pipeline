@@ -8655,7 +8655,7 @@ def _photo_groups(conn, caller, user, date, photos):
             name = ph["s3_key"].rsplit("/", 1)[-1]
             taken = extract_base_time_from_filename(name)
             where = location_markers.locate(
-                markers, taken.strftime("%H:%M") if taken else None)
+                markers, taken.strftime("%H:%M:%S") if taken else None)
             if where not in groups:
                 groups[where] = []
                 order.append(where)

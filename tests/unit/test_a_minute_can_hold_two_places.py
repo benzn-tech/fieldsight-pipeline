@@ -218,3 +218,16 @@ def test_the_extraction_artifact_carries_the_seconds(monkeypatch):
                              final=True)
 
     assert [m.get("at_s") for m in out["location_markers"]] == ["11:02:05", "11:02:15"]
+
+
+# ---- the day view's photo groups agree with the binding ----------------------------
+
+def test_the_day_views_groups_read_seconds_too():
+    from repositories import location_markers as lm
+    assert lm.locate(MARKERS, "11:02:08") == "level one"
+    assert lm.locate(MARKERS, "11:02:31") == "level two"
+    assert lm.locate(MARKERS, "11:03:32") == "level two"
+    assert lm.locate(MARKERS, "11:03:58") == "Tikaha room"
+    assert lm.locate(MODEL_MARKERS, "11:02:08") == "level two"    # the minute rule, unchanged
+    for t in PHOTOS:
+        assert (lm.locate(MARKERS, t) or "").lower() == pb.place_at(MARKERS, t), t
