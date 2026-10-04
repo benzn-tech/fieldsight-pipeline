@@ -928,7 +928,7 @@ def _generate_document(artifact, context=None):
         # the same stays the binding used (photo_binding.place_at).
         places={t["ref"]: [photo_binding.place_at(
                     (artifact.get("reportFacts") or {}).get("locations") or [],
-                    photo_binding.photo_hhmm(n)) for n in t.get("photo_names") or []]
+                    photo_binding.photo_time(n)) for n in t.get("photo_names") or []]
                 for t in topic_offer})
     placed = at_line + at_section
     if topic_offer:

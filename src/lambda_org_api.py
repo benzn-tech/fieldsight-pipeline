@@ -1825,7 +1825,9 @@ def _report_facts(conn, company_id, folder, site_ids, date=None):
         try:
             with conn.transaction():
                 marks = location_markers.for_day(conn, company_id, folder, date)
-            facts["locations"] = [{"at": m.get("at"), "location": m.get("location")}
+            # `at_s` (to the second) only where extraction timed the quote.
+            facts["locations"] = [dict({"at": m.get("at"), "location": m.get("location")},
+                                       **({"at_s": m["at_s"]} if m.get("at_s") else {}))
                                   for m in marks]
         except Exception:
             logger.warning("report facts: location markers unreadable for %s/%s",
@@ -3672,7 +3674,7 @@ def _photo_selection_body(conn, caller, folder, date, excluded):
         name = p["s3_key"].rsplit("/", 1)[-1]
         hhmm = photo_binding.photo_hhmm(name)
         items.append({"filename": name, "time": hhmm,
-                      "place": photo_binding.place_at(markers, hhmm),
+                      "place": photo_binding.place_at(markers, photo_binding.photo_time(name)),
                       "excluded": name in excluded,
                       "url": s3().generate_presigned_url(
                           "get_object", Params={"Bucket": LAKE_BUCKET, "Key": p["s3_key"]},
