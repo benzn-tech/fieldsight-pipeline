@@ -740,11 +740,13 @@ def get_presigned_url(params, caller=None):
     # == unrestricted", precisely what this branch exists to abolish.
     # Unreachable from lambda_handler today (it always passes a dict), but
     # the default `caller=None` in the signature keeps the door ajar.
-    # reports/{date}/summary_report.json is built across EVERY tenant's reports and this
+    # reports/{date}/summary_report.* is built across EVERY tenant's reports and this
     # gateway cannot scope it by company, so it is never signed -- for any role, admin/gm
     # included (org-api serves it to platform_admin only). Before the role branch on purpose.
+    # Every format, not just .json: the generator writes summary_report.docx beside it with
+    # the same content, and get_report_history lists that key as `docx_key`.
     _segs = s3_key.split('/')
-    if _segs[0] == 'reports' and _segs[-1] == 'summary_report.json':
+    if _segs[0] == 'reports' and _segs[-1].startswith('summary_report.'):
         logger.info("presign denied: lake-wide summary key=%s", s3_key)
         return error('Access denied', 403)
 
