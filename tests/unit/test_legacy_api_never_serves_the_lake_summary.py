@@ -118,12 +118,12 @@ def test_admin_can_still_presign_a_normal_report(fake):
     assert fake.presigned == [f"reports/{DATE}/Ben/daily_report.json"]
 
 
-@pytest.mark.parametrize("fmt", ["docx", "pdf", "md"])
+@pytest.mark.parametrize("fmt", ["docx", "pdf", "md", "_debug.json"])
 @pytest.mark.parametrize("role", ["admin", "gm"])
 def test_presign_of_the_summary_in_any_format_is_403(fake, role, fmt):
     """The generator writes summary_report.docx beside the json with the same content,
     and get_report_history lists it as `docx_key` -- denying only `.json` left that door
     open (review of this PR). Any `summary_report.*` is refused."""
-    res = api.get_presigned_url({"key": f"reports/{DATE}/summary_report.{fmt}"}, caller(role))
+    res = api.get_presigned_url({"key": f"reports/{DATE}/summary_report" + ("" if fmt.startswith("_") else ".") + fmt}, caller(role))
     assert res["statusCode"] == 403
     assert fake.presigned == []
