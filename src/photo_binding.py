@@ -122,26 +122,81 @@ def _hhmm_to_minutes(hhmm):
     return int(h) * 60 + int(m)
 
 
+def _clock_seconds(text, unknown_seconds=0):
+    """'HH:MM:SS' or 'HH:MM' -> seconds of the day, or None. A time given to the
+    minute takes `unknown_seconds` for its seconds."""
+    parts = str(text or "").split(":")
+    if len(parts) not in (2, 3):
+        return None
+    try:
+        h, m = int(parts[0]), int(parts[1])
+        sec = int(parts[2]) if len(parts) == 3 else unknown_seconds
+    except ValueError:
+        return None
+    return h * 3600 + m * 60 + sec
+
+
+def _marker_seconds(m):
+    """When a marker was said: `at_s` (timed from the words, see
+    lambda_extract_session.time_location_markers) when it has one, else the
+    start of its `at` minute."""
+    timed = _clock_seconds(m.get("at_s")) if m.get("at_s") else None
+    if timed is not None:
+        return timed
+    return _clock_seconds(str(m.get("at") or "")[:5])
+
+
+def _photo_seconds(p_minutes, hhmmss=None):
+    """When a photograph was taken, to the second when known. A photo known only
+    to the minute is placed at the END of it, so against markers known only to
+    the minute the comparison is exactly the old minute one (said in that minute
+    or before: it owns the photo)."""
+    sec = _clock_seconds(hhmmss) if hhmmss else None
+    return sec if sec is not None else p_minutes * 60 + 59
+
+
 def _stays(markers):
-    """[(start_min, location_key, last_mention_min, session)] -- consecutive
-    markers naming the same place are ONE stay ("Level 1", then "Continue level
-    one inspection" is still Level 1), so a stay starts at its first
-    announcement. `session` is the recording it was said in, when known."""
-    out = []
-    for m in sorted(markers or [], key=lambda m: str(m.get("at") or "")):
-        try:
-            at = _hhmm_to_minutes(str(m.get("at"))[:5])
-        except (ValueError, AttributeError):
-            continue
+    """[(start_s, location_key, last_mention_s, session, at_min)], in SECONDS of
+    the day -- consecutive markers naming the same place are ONE stay ("Level
+    1", then "Continue level one inspection" is still Level 1), so a stay starts
+    at its first announcement. `session` is the recording it was said in, when
+    known. `at_min` is the first announcement's `at` minute: the clock the
+    topics' time ranges are on, so it is what picks the stay's topic.
+
+    Seconds, because minutes cannot order two places named in one minute: on
+    prod (Ben_Lin_Test 2026-10-05) "back to the level one" (11:02:05) and
+    "moving up to level two" (11:02:15) were both 11:02, and the Level 1
+    photograph taken between them (11:02:08) went to Level 2. Markers with no
+    `at_s` sort at the start of their minute, in the order given."""
+    timed = []
+    for idx, m in enumerate(markers or []):
+        at = _marker_seconds(m)
         key = " ".join(str(m.get("location") or "").lower().split())
-        if not key:
+        if at is None or not key:
             continue
-        session = m.get("session")
-        if out and out[-1][1] == key and at - out[-1][2] <= PHOTO_CARRY_FORWARD_MIN:
-            out[-1] = (out[-1][0], key, at, out[-1][3] or session)   # same stay, later mention
+        at_min = _clock_seconds(str(m.get("at") or "")[:5])
+        timed.append((at, idx, key, m.get("session"), at // 60 if at_min is None else at_min // 60))
+    out = []
+    for at, _idx, key, session, at_min in sorted(timed):
+        if out and out[-1][1] == key and at - out[-1][2] <= PHOTO_CARRY_FORWARD_MIN * 60:
+            prev = out[-1]                                            # same stay, later mention
+            out[-1] = (prev[0], key, at, prev[3] or session, prev[4])
         else:
-            out.append((at, key, at, session))
+            out.append((at, key, at, session, at_min))
     return out
+
+
+def _current_stay(p_seconds, stays):
+    """The stay a moment falls in, or None: the last one announced at or before
+    it, unless its last mention is more than PHOTO_CARRY_FORWARD_MIN minutes
+    old (counted in whole minutes, as it always was)."""
+    current = None
+    for stay in stays:
+        if stay[0] <= p_seconds:
+            current = stay
+    if current is None or p_seconds // 60 - current[2] // 60 > PHOTO_CARRY_FORWARD_MIN:
+        return None
+    return current
 
 
 def _stay_owner(at, windows):
@@ -162,7 +217,7 @@ def _stay_owner(at, windows):
                                        0 if windows[i][1] > at else 1, windows[i][0], i))
 
 
-def _location_owner(p_minutes, stays, windows, all_windows=None, topic_sessions=None):
+def _location_owner(p_seconds, stays, windows, all_windows=None, topic_sessions=None):
     """The topic that owns a photo by WHERE it was taken, or None.
 
     A LOCATION OWNS ITS PHOTOS (owner, 2026-10-01). Binding by clock alone gave
@@ -181,18 +236,15 @@ def _location_owner(p_minutes, stays, windows, all_windows=None, topic_sessions=
     from a later recording. A chat inside the SAME recording does not end it --
     that is the interruption the stay exists to see past.
     """
-    current = None
-    for stay in stays:
-        if stay[0] <= p_minutes:
-            current = stay
-    if current is None or p_minutes - current[2] > PHOTO_CARRY_FORWARD_MIN:
+    current = _current_stay(p_seconds, stays)
+    if current is None:
         return None
     if current[3] and topic_sessions:
         for i, (start, _end) in (all_windows or windows).items():
             other = topic_sessions.get(i)
-            if other and other != current[3] and current[2] < start <= p_minutes:
+            if other and other != current[3] and current[2] // 60 < start <= p_seconds // 60:
                 return None
-    return _stay_owner(current[0], windows)
+    return _stay_owner(current[4], windows)
 
 
 def parse_time_range(time_range):
@@ -323,7 +375,8 @@ def photos_for_topics(photo_objects, topics, *, topic_sessions=None,
         # WHERE before WHEN: a photo taken during a location stay goes to the
         # topic that stay belongs to, if that topic may have it (same session,
         # under the cap). Otherwise the clock rules below decide, unchanged.
-        owner = (_location_owner(p_minutes, stays, eligible, windows, topic_sessions)
+        owner = (_location_owner(_photo_seconds(p_minutes, p.get("hhmmss")), stays,
+                                 eligible, windows, topic_sessions)
                  if stays else None)
         if owner is not None and len(result[owner]) < PHOTOS_PER_TOPIC_CAP:
             result[owner].append(p)
@@ -427,36 +480,38 @@ def list_pictures(s3_client, bucket, prefix):
             photo_objects.append({
                 "key": key, "filename": filename,
                 "hhmm": base_time.strftime("%H:%M"),
+                "hhmmss": base_time.strftime("%H:%M:%S"),
             })
     return photo_objects
 
 
 def photo_hhmm(filename):
     """'HH:MM' a photograph was taken, from its filename, or None."""
+    t = photo_time(filename)
+    return t[:5] if t else None
+
+
+def photo_time(filename):
+    """'HH:MM:SS' a photograph was taken, from its filename, or None."""
     try:
         t = extract_base_time_from_filename(filename)
     except Exception:
         return None
-    return t.strftime("%H:%M") if t else None
+    return t.strftime("%H:%M:%S") if t else None
 
 
-def place_at(markers, hhmm):
-    """The place being walked at `hhmm` by the day's markers, or None -- the
-    same stays photos are bound by (_stays), so a report places a photograph
-    by the same answer the binding gave it."""
-    if not hhmm:
+def place_at(markers, when):
+    """The place being walked at `when` ('HH:MM:SS', or 'HH:MM') by the day's
+    markers, or None -- the same stays photos are bound by (_stays), so a
+    report places a photograph by the same answer the binding gave it. Pass
+    the seconds (photo_time) when there are any: a minute can hold two places."""
+    if not when:
         return None
-    try:
-        p = _hhmm_to_minutes(hhmm)
-    except (ValueError, AttributeError):
+    p = _clock_seconds(when, unknown_seconds=59)
+    if p is None:
         return None
-    current = None
-    for stay in _stays(markers):
-        if stay[0] <= p:
-            current = stay
-    if current is None or p - current[2] > PHOTO_CARRY_FORWARD_MIN:
-        return None
-    return current[1]
+    current = _current_stay(p, _stays(markers))
+    return current[1] if current else None
 
 
 _NUMBER_WORDS = {"zero": "0", "ground": "0", "one": "1", "two": "2", "three": "3", "four": "4",
