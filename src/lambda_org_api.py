@@ -6229,12 +6229,19 @@ def _source_prefixes_for(rec):
     folder, date = rec.get("folder"), rec.get("date")
     base = (rec.get("sessionBase") or "").strip()
     # A session id is a filename stem: `%`, `/` and `\` cannot appear in one. `_` CAN and
-    # does — legacy bases are `{device}_{date}_{time}` — which is why the repository escapes
-    # its bind rather than rejecting the character. Defence in depth, and the two guards
-    # fail differently: this one refuses the request, that one narrows the pattern.
+    # does — legacy bases are `{device}_{date}_{time}` — so it is allowed through. The
+    # repository's LIKE does NOT escape it: `_` matches any one character there, which
+    # over-matches and so withholds more than needed — the safe direction.
     if any(c in base for c in "%/\\"):
         return []
     if not folder or not date or not base:
+        return []
+    # The date segment is what `deleted_source_prefixes(conn, None, date)` matches with
+    # `%/{date}/%` before the lake-wide summary is served. A key stored with any other
+    # date shape ("2026-8-14", a timestamp, a `/`) would be invisible to that guard, and
+    # the summary would go out WITH the deleted session in it. Every read route validates
+    # the date; this write route did not, so refuse here rather than trust the client.
+    if not isinstance(date, str) or not REPORT_DATE_RE.match(date):
         return []
     return [f"extractions/{folder}/{date}/{base}"]
 
