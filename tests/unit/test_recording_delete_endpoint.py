@@ -581,3 +581,20 @@ def test_the_success_path_logs_its_zero_too(monkeypatch, caplog):
     with caplog.at_level(logging.INFO):
         org.delete_recordings_endpoint(_Conn(), CALLER, {"recordings": [REC]})
     assert any("hid 0 photo(s) in span" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("bad_date", ["2026-8-14", "2026-08-14T00:00", "14/08/2026",
+                                      "2026-08-14/x", "", "  ", "2026_08_14"])
+def test_a_date_that_is_not_yyyy_mm_dd_writes_no_tombstone(bad_date):
+    """The tombstone key's date segment is what `deleted_source_prefixes(conn, None, date)`
+    matches with `%/{date}/%` before the lake-wide summary is served. A key stored with any
+    other date shape is invisible to that guard, so the summary would be served WITH the
+    deleted session inside it. Refused here, where the key is built, rather than trusted to
+    every client: the read routes all validate the date, this write route did not."""
+    rec = {"folder": "Ben", "date": bad_date, "sessionBase": "sid0123abcd"}
+    assert org._source_prefixes_for(rec) == []
+
+
+def test_a_well_formed_date_still_builds_the_key():
+    rec = {"folder": "Ben", "date": "2026-08-14", "sessionBase": "sid0123abcd"}
+    assert org._source_prefixes_for(rec) == ["extractions/Ben/2026-08-14/sid0123abcd"]

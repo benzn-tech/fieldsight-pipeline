@@ -208,6 +208,14 @@ def deleted_source_prefixes(conn, folder=None, date=None) -> list:
     if folder and date:
         sql += " AND target_key LIKE %s"
         params.append(f"%/{folder}/{date}/%")
+    elif date:
+        # Every folder, ONE date -- what admin_disambiguation asks before serving the
+        # lake-wide summary. This branch was missing: with folder=None the date was
+        # ignored, the call meant "was anything, anywhere, ever deleted?", and the
+        # summary was withheld on every date once one recording had been
+        # (43179ad8, 2026-08-14).
+        sql += " AND target_key LIKE %s"
+        params.append(f"%/{date}/%")
     rows = conn.cursor(row_factory=dict_row).execute(sql, tuple(params)).fetchall()
     return [r["target_key"] for r in rows]
 
