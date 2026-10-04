@@ -181,7 +181,8 @@ def _deleted_sessions(bucket, user_folder, date, user=None):
 
 def load_report(bucket, date, user):
     """
-    Load daily report JSON. Tries per-user report first, then summary.
+    Load daily report JSON: the person's daily report, else their meeting minutes. Never
+    the lake-wide summary (see the end of this function).
     Returns (report_dict, report_type) or (None, None).
 
     A day with a deleted recording is served NO stored report. This lambda has no database,
@@ -215,11 +216,13 @@ def load_report(bucket, date, user):
         if data:
             return data, 'meeting'
 
-    # Try combined summary
-    key = f"{REPORT_PREFIX}{date}/summary_report.json"
-    data = download_json_from_s3(bucket, key)
-    if data:
-        return data, 'summary'
+    # NO fallback to reports/{date}/summary_report.json. That document is built across
+    # EVERY tenant's daily reports, and a fallback here put it into the prompt for any
+    # caller asking about a (date, person) with no report of their own -- the model then
+    # answered with other companies' content (owner decision 2026-10-05: the lake-wide
+    # summary is never served below platform_admin, and this lambda cannot tell callers
+    # apart by company). `(None, None)` degrades to the day's transcripts, the direction
+    # the docstring above already chooses for a deleted day.
 
     return None, None
 
