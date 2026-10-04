@@ -32,13 +32,12 @@ class _Frozen(datetime):
 def test_timeline_defaults_to_nz_yesterday(monkeypatch):
     """The date it computes is observed, not inferred.
 
-    An admin with no ?user and no ?date takes the summary-report branch, whose
-    S3 key carries the computed date -- so capturing the key is a direct read of
-    the answer. An earlier version of this test called the handler inside a
+    An admin with no ?user and no ?date goes straight to find_any_report (the
+    lake-wide summary is never read), so the date it is called with is a direct
+    read of the answer. An earlier version of this test called the handler inside a
     bare try/except and asserted nothing at all; it passed with the bug in.
     """
     monkeypatch.setattr(api.nz_time, "datetime", _Frozen)
-    monkeypatch.setattr(api, "_any_folder_deleted_on", lambda date: False)
 
     seen = {}
 
@@ -58,7 +57,7 @@ def test_timeline_defaults_to_nz_yesterday(monkeypatch):
 
     # 11:30 UTC on the 6th is 23:30 the same day in NZ (NZST), so yesterday is
     # the 5th. A fixed +13 would have said the 6th.
-    assert seen["key"].endswith("2026-09-05/summary_report.json"), seen["key"]
+    assert "key" not in seen, "the lake-wide summary must not be read"
     assert seen["fallback_date"] == "2026-09-05"
 
 
