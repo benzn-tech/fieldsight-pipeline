@@ -911,6 +911,118 @@ def clean_location_markers(raw):
     return out
 
 
+# How far from the model's `at` a quoted sentence may be found. The model reads
+# a timestamp per TURN, so `at` is the turn's start -- earlier, never later,
+# than the words, by up to a long turn's length.
+MARKER_SEARCH_BEFORE_S = 60
+MARKER_SEARCH_AFTER_S = 180
+MARKER_MATCH_RATIO = 0.6
+_MARKER_TOKEN = re.compile(rf"[{evidence_match._CJK_CLASS}]|[^\s{evidence_match._CJK_CLASS}]+")
+
+
+def _marker_tokens(text):
+    """Comparable tokens: words for Latin script, characters for CJK (whose
+    transcripts do not put spaces between words)."""
+    return _MARKER_TOKEN.findall(evidence_match.normalise(text))
+
+
+def _second_of_day(dt):
+    return dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1e6
+
+
+def time_location_markers(markers, turns):
+    """Each marker timed to the SECOND its quote was said, where the quote can
+    be found in the words; otherwise left exactly as the model gave it.
+
+    The model's `at` is whole minutes, and a minute is too coarse to tell two
+    places apart. On prod (Ben_Lin_Test 2026-10-05) "back to the level one" at
+    11:02:05 and "moving up to level two" at 11:02:14 were both marked 11:02,
+    and the photograph taken at 11:02:08 -- back on Level 1 -- went to Level 2.
+    The words carry their own times, so the quote says when it was said; a
+    marker found that way gains `at_s` ("HH:MM:SS").
+
+    `at` is left as the model gave it, on purpose. It is read off the same
+    per-turn timestamps as the topics' time ranges, so it is what decides which
+    topic a place belongs to (photo_binding._stay_owner); `at_s` only orders
+    the places and the photographs. Moving `at` to the word made "start the
+    level one inspections" (said at 10:59:09 in a turn stamped 10:58) belong
+    to the 10:59 topic instead of the Level 1 one.
+
+    A quote that cannot be found (paraphrased, or said outside the window) is
+    not guessed at: the marker keeps its minute, which is what it had before.
+    """
+    stream = []                      # (token, second of day), in time order
+    for t in turns or []:
+        start = t.get('abs_start')
+        words = t.get('words') or []
+        if start is None or not words:
+            continue
+        if t.get('word_abs') and len(t['word_abs']) == len(words):
+            times = [_second_of_day(w) if w else None for w in t['word_abs']]
+        else:
+            base = _second_of_day(start) - (t.get('start_sec') or 0.0)
+            times = [base + off for _, off in words]
+        for (word, _), when in zip(words, times):
+            if when is None:
+                continue
+            for tok in _marker_tokens(word):
+                stream.append((tok, when))
+    stream.sort(key=lambda x: x[1])
+    if not stream:
+        return markers
+    out = []
+    for m in markers:
+        timed = _time_one_marker(m, stream)
+        out.append(timed if timed is not None else m)
+    return out
+
+
+def _time_one_marker(marker, stream):
+    try:
+        h, mi = str(marker.get('at'))[:5].split(':')
+        at = int(h) * 3600 + int(mi) * 60
+    except (ValueError, AttributeError):
+        return None
+    quote = _marker_tokens(marker.get('quote'))
+    if not quote:
+        return None
+    lo, hi = at - MARKER_SEARCH_BEFORE_S, at + MARKER_SEARCH_AFTER_S
+    window = [x for x in stream if lo <= x[1] < hi]
+    need = min(len(quote), 2)
+    best = None
+    for i in range(len(window)):
+        span = window[i:i + len(quote)]
+        if not span:
+            break
+        sm = difflib.SequenceMatcher(None, quote, [tok for tok, _ in span], autojunk=False)
+        blocks = [b for b in sm.get_matching_blocks() if b.size]
+        matched = sum(b.size for b in blocks)
+        if matched < need or sm.ratio() < MARKER_MATCH_RATIO:
+            continue
+        when = span[blocks[0].b][1]
+        key = (-round(sm.ratio(), 3), 0 if at <= when < at + 60 else 1, abs(when - at))
+        if best is None or key < best[0]:
+            best = (key, when)
+    if best is None:
+        return None
+    sec = int(best[1])
+    at_s = '%02d:%02d:%02d' % (sec // 3600, sec % 3600 // 60, sec % 60)
+    return dict(marker, at_s=at_s)
+
+
+
+def _timed_markers(raw, turns):
+    """clean_location_markers, then time_location_markers -- fail-open: timing
+    is a refinement, and an error in it must not cost the markers."""
+    markers = clean_location_markers(raw)
+    try:
+        return time_location_markers(markers, turns)
+    except Exception:
+        logger.warning("location markers: could not time quotes to the second; "
+                       "keeping the model's minutes", exc_info=True)
+        return markers
+
+
 # ============================================================
 # Prompt construction
 # ============================================================
@@ -1314,6 +1426,10 @@ def _rebase_batch_turns(bucket, key, normalized):
         if end is not None:
             turn['abs_end'] = end
             turn['abs_end_str'] = end.strftime('%H:%M:%S')
+        # Each word through the map too: a turn can span two clips, and the
+        # silence cut between them is not in the file's own seconds.
+        turn['word_abs'] = [batch_stitch.resolve_abs_time(doc, off)
+                            for _, off in turn.get('words') or []]
     return normalized
 
 
@@ -2139,7 +2255,7 @@ def extract_session(bucket, user_folder, date, session_base, final=False,
         # reach the database as a marker with no time. Anything without both an
         # `at` and a `location` is dropped, which makes "no markers" and
         # "markers the shape of nonsense" the same, safe answer.
-        'location_markers': clean_location_markers(parsed.get('location_markers')),
+        'location_markers': _timed_markers(parsed.get('location_markers'), turns),
         'topics': parsed_topics,
         # Where each speaker label was heard, for the anonymous re-bind. Carried HERE, on the
         # final pass only, because of who can do what: this function has the turns and no

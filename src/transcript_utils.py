@@ -311,6 +311,7 @@ def normalize_transcript(transcript_data, filename, user_mapping=None):
     if has_diarization:
         current_speaker = None
         current_words = []
+        current_starts = []
         seg_start_sec = 0.0
         seg_end_sec = 0.0
 
@@ -319,10 +320,12 @@ def normalize_transcript(transcript_data, filename, user_mapping=None):
             if spk != current_speaker and current_words:
                 turn = _build_turn(
                     current_speaker, current_words,
-                    seg_start_sec, seg_end_sec, segment_base
+                    seg_start_sec, seg_end_sec, segment_base,
+                    word_starts=current_starts
                 )
                 speaker_turns.append(turn)
                 current_words = []
+                current_starts = []
                 seg_start_sec = w['start_time']
 
             if not current_words:
@@ -330,12 +333,14 @@ def normalize_transcript(transcript_data, filename, user_mapping=None):
 
             current_speaker = spk
             current_words.append(w['word'])
+            current_starts.append(w['start_time'])
             seg_end_sec = w['end_time']
 
         if current_words:
             turn = _build_turn(
                 current_speaker, current_words,
-                seg_start_sec, seg_end_sec, segment_base
+                seg_start_sec, seg_end_sec, segment_base,
+                word_starts=current_starts
             )
             speaker_turns.append(turn)
     else:
@@ -343,7 +348,8 @@ def normalize_transcript(transcript_data, filename, user_mapping=None):
         if words:
             turn = _build_turn(
                 'unknown', [w['word'] for w in words],
-                words[0]['start_time'], words[-1]['end_time'], segment_base
+                words[0]['start_time'], words[-1]['end_time'], segment_base,
+                word_starts=[w['start_time'] for w in words]
             )
             speaker_turns.append(turn)
 
@@ -369,8 +375,15 @@ def normalize_transcript(transcript_data, filename, user_mapping=None):
     }
 
 
-def _build_turn(speaker, word_list, start_sec, end_sec, segment_base):
-    """Build a single speaker turn dict with absolute timestamps."""
+def _build_turn(speaker, word_list, start_sec, end_sec, segment_base, word_starts=None):
+    """Build a single speaker turn dict with absolute timestamps.
+
+    `words` keeps each word with its offset in seconds from the start of the
+    FILE (as `start_sec` is), so a quoted sentence can be timed to the second
+    (lambda_extract_session.time_location_markers): a turn's own start is often
+    a minute early for something said near its end. A batched transcript's
+    files are several clips joined, so its words are re-timed through the
+    batch map along with the turn (_rebase_batch_turns), not by adding."""
     abs_start = None
     abs_end = None
     abs_start_str = ''
@@ -391,6 +404,8 @@ def _build_turn(speaker, word_list, start_sec, end_sec, segment_base):
         'abs_end': abs_end,
         'abs_start_str': abs_start_str,
         'abs_end_str': abs_end_str,
+        'words': ([(w, round(t, 2)) for w, t in zip(word_list, word_starts)]
+                  if word_starts is not None and len(word_starts) == len(word_list) else []),
     }
 
 
