@@ -403,13 +403,14 @@ def test_presign_other_users_media_key_still_denied(monkeypatch):
     assert fake.presigned == []
 
 
-def test_presign_ownerless_allowed_for_admin(monkeypatch):
-    """Blast radius: admin/gm keep full reach -- they bypass the whole
-    block at :386 and always did."""
-    wire(monkeypatch)
+def test_presign_lake_summary_denied_even_for_admin(monkeypatch):
+    """The lake-wide summary is built across every tenant; this gateway cannot scope it,
+    so even admin/gm are refused (2026-10-05). Other admin/gm reach is unchanged."""
+    fake = wire(monkeypatch)
     res = fapi.get_presigned_url(
         {"key": "reports/2026-07-20/summary_report.json"}, ADMIN_CALLER)
-    assert res["statusCode"] == 200
+    assert res["statusCode"] == 403
+    assert fake.presigned == []
 
 
 def test_presign_absent_caller_denied_for_ownerless_key(monkeypatch):

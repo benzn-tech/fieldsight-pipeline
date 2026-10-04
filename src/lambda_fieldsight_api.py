@@ -115,9 +115,9 @@ def _without_vendor_metadata(doc):
     """A copy of a report/minutes JSON with `_report_metadata['model']`
     removed, if present.
 
-    This legacy gateway serves `daily_report.json` / `summary_report.json`
-    to the customer-facing site byte-for-byte (see get_timeline,
-    find_any_report). `_report_metadata.model` is an internal provenance
+    This legacy gateway serves `daily_report.json` to the customer-facing
+    site byte-for-byte (see get_timeline, find_any_report). It never serves
+    `summary_report.json` (see get_timeline). `_report_metadata.model` is an internal provenance
     field -- it belongs in the S3 object and the debug record beside it, so
     a bad answer can still be traced to the model that wrote it -- but it
     must never reach a customer's browser. Strip just that one key on the
@@ -393,10 +393,8 @@ def _presign_key_is_deleted(s3_key):
     """
     parts = (s3_key or "").split("/")
     # reports/{date}/summary_report.json is only THREE segments, so the length check below
-    # skipped it -- and admin/gm skip the ownership check entirely, so that one object
-    # stayed downloadable byte for byte on a day whose sources were deleted. It is the same
-    # lake-wide file get_timeline already refuses to serve; refusing it in one door and
-    # signing it in the other is not a deletion.
+    # skipped it. get_presigned_url now refuses that key outright, before this runs; the
+    # branch stays as defence in depth for any other three-segment reports/{date}/x key.
     if len(parts) == 3 and parts[0] == "reports" and re.match(r"^\d{4}-\d{2}-\d{2}$",
                                                               parts[1] or ""):
         return _any_folder_deleted_on(parts[1])
@@ -490,20 +488,15 @@ def get_timeline(params, caller):
     elif user:
         if not can_access_user_data(caller, user):
             return error('Access denied to this user', 403)
-    # Management with no user: try summary, then first available
+    # Management with no user: first available report
     elif not user:
         if role in ('admin', 'gm'):
-            key = f"{REPORT_PREFIX}{date}/summary_report.json"
-            try:
-                # Same door, aggregate form. This doc is built across every folder, so one
-                # deleted session's words sit inside it -- go the long way round instead,
-                # where each folder is checked on its own.
-                if _any_folder_deleted_on(date):
-                    return find_any_report(date, caller)
-                obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
-                return ok(_without_vendor_metadata(json.loads(obj['Body'].read().decode('utf-8'))))
-            except s3_client.exceptions.NoSuchKey:
-                return find_any_report(date, caller)
+            # NEVER read reports/{date}/summary_report.json here. It is built across EVERY
+            # tenant's daily reports, and this gateway has no company concept (roles come
+            # from DynamoDB, max admin/gm), so it cannot scope that document to the caller's
+            # company or tell a customer's admin from the operator. org-api serves it to
+            # platform_admin only. Per-folder reports go through find_any_report instead.
+            return find_any_report(date, caller)
         else:
             # PM/site_manager with no user → own data first
             user = resolve_user_display_name(caller)
@@ -676,7 +669,7 @@ def get_dates(params, caller):
                         pass
     except Exception as e:
         logger.error(f"Error scanning dates: {e}")
-    # Enrich with topic counts (use first accessible user or summary)
+    # Enrich with topic counts from the accessible users' own daily reports
     for ds in list(dates.keys()):
         try:
             loaded = False
@@ -700,15 +693,9 @@ def get_dates(params, caller):
                         loaded = True
                     except:
                         pass
-            if not loaded and not _any_folder_deleted_on(ds):
-                # The lake-wide aggregate, same object and same reason as get_timeline's:
-                # no per-folder granularity exists inside it to filter.
-                obj = s3_client.get_object(Bucket=S3_BUCKET, Key=f"{REPORT_PREFIX}{ds}/summary_report.json")
-                report = json.loads(obj['Body'].read().decode('utf-8'))
-                topics = report.get('topics', [])
-                if isinstance(topics, list):
-                    dates[ds]['topics'] = len(topics)
-                    dates[ds]['safety'] = sum(1 for t in topics if t.get('category','').lower()=='safety' or t.get('safety_flags',[]))
+            # No fallback to reports/{date}/summary_report.json when nothing was loaded:
+            # it is built across every tenant and this gateway cannot scope it by company
+            # (org-api serves it to platform_admin only). Such a date keeps its existing counts.
         except Exception:
             pass
     return ok({'dates': dates})
@@ -753,6 +740,14 @@ def get_presigned_url(params, caller=None):
     # == unrestricted", precisely what this branch exists to abolish.
     # Unreachable from lambda_handler today (it always passes a dict), but
     # the default `caller=None` in the signature keeps the door ajar.
+    # reports/{date}/summary_report.json is built across EVERY tenant's reports and this
+    # gateway cannot scope it by company, so it is never signed -- for any role, admin/gm
+    # included (org-api serves it to platform_admin only). Before the role branch on purpose.
+    _segs = s3_key.split('/')
+    if _segs[0] == 'reports' and _segs[-1] == 'summary_report.json':
+        logger.info("presign denied: lake-wide summary key=%s", s3_key)
+        return error('Access denied', 403)
+
     if not caller or caller.get('role') not in ('admin', 'gm'):
         # Extract user folder name from common path patterns:
         #   users/{name}/...  audio_segments/{name}/...  transcripts/{name}/...
