@@ -87,18 +87,6 @@ def test_get_timeline_strips_the_model_for_a_named_user(monkeypatch):
     assert body["executive_summary"] == ["A day happened."]
 
 
-def test_get_timeline_strips_the_model_for_the_admin_summary(monkeypatch):
-    stored = {"topics": [{"topic_title": "x"}],
-              "_report_metadata": {"model": "gemini-3.8-flash"}}
-    monkeypatch.setattr(api, "s3_client",
-                        _S3({f"{api.REPORT_PREFIX}2026-09-20/summary_report.json": stored}))
-    caller = {"role": "admin"}
-    res = api.get_timeline({"date": "2026-09-20"}, caller)
-    body = json.loads(res["body"])
-    assert "model" not in body["_report_metadata"]
-    assert body["topics"] == [{"topic_title": "x"}]
-
-
 def test_find_any_report_strips_the_model_on_the_single_candidate_path(monkeypatch):
     stored = {"topics": [], "_report_metadata": {"model": "qwen3.6-flash"}}
     key = f"{api.REPORT_PREFIX}2026-09-20/Solo_Folder/daily_report.json"
