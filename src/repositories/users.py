@@ -1,5 +1,6 @@
 import re
 
+import folder_key
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -89,7 +90,14 @@ def upsert_field_only_user(conn, company_id, folder_name, first_name,
     cognito_sub is NULL (NULL never collides in a UNIQUE index, so this
     can't reuse upsert_user's ON CONFLICT (cognito_sub) path); conflicts are
     keyed on (company_id, folder_name) instead. email has a NOT NULL
-    constraint -- field_only rows get ''."""
+    constraint -- field_only rows get ''.
+
+    `folder_name` must already be a folder key (folder_key.folder_key); the
+    database CHECK (0081) would refuse anything else, so refuse it here first
+    with a message that says why."""
+    if not folder_key.KEY_RE.match(folder_name or ""):
+        raise ValueError(f"folder_name {folder_name!r} is not a folder key "
+                         "(mint it with folder_key.folder_key)")
     params = {
         "company_id": company_id, "folder_name": folder_name,
         "first": first_name, "last": last_name, "role": global_role,

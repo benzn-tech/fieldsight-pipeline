@@ -130,6 +130,7 @@ import chunk_stitch
 import content_hash
 import device_heartbeat
 import device_status
+import folder_key as folder_key_mod
 import nz_time
 import pipeline_trace
 import trace_views
@@ -961,6 +962,16 @@ def create_recording_upload_url(conn, caller, body, device_ident=None):
         rec_id, key = existing["id"], existing["s3_key"]
     else:
         display_name = caller.get("folder_name") or _enrol_folder_on_upload(conn, caller)
+        # The folder is minted once (folder_key) and used verbatim here. Re-cleansing
+        # it in this route is how `Deandre'_Alberts` became `Deandre__Alberts` on S3
+        # while the directory said otherwise (2026-10-05). A stored folder that
+        # _safe_seg would change is refused loudly -- on a retryable route -- rather
+        # than written under a folder no directory row owns.
+        if _safe_seg(display_name) != display_name:
+            logger.error("upload-url: user %s has an invalid folder_name %r "
+                         "(not [A-Za-z0-9._-]) -- refusing; recording would be stranded",
+                         caller.get("id"), display_name)
+            return error("recording folder is invalid; ask an admin", 409)
         key = _recording_s3_key(display_name, kind, started_at, file_name)
         try:
             # Resolved BEFORE the transaction opens, not inside it. `device_id`
@@ -4891,10 +4902,11 @@ def _free_folder_name(conn, name, sub, user_id=None):
     for want of a folder (prod, 2026-09-11..15, 18 sessions).
 
     So a clash picks the next free name instead: `_2` .. `_9`, then the user id
-    prefix, which cannot clash with anyone. Same normalisation as
-    patch_member_folder and lambda_orchestrator.safe_name."""
-    base = re.sub(r'[<>:"/\\|?*\s]', '_', (name or "").strip())
-    if not base.strip("_"):
+    prefix, which cannot clash with anyone. The base comes from folder_key.folder_key
+    (the one minting rule, shared with patch_member_folder); a name with no usable
+    characters (CJK) gets `u_<user_id[:8]>` instead."""
+    base = folder_key_mod.folder_key(name) or folder_key_mod.fallback_key(user_id)
+    if not base:
         return None
     candidates = [base] + [f"{base}_{n}" for n in range(2, 10)]
     if user_id:
@@ -4925,7 +4937,9 @@ def _enrol_folder_on_upload(conn, caller):
         except Exception:
             logger.exception("upload-url: could not enrol folder %r for user %s",
                              folder, caller.get("id"))
-    fallback = f"{name}_{str(caller.get('id') or 'unknown')[:8]}"
+    minted = folder_key_mod.folder_key(name)
+    fallback = (f"{minted}_{str(caller.get('id') or 'unknown')[:8]}" if minted
+                else folder_key_mod.fallback_key(caller.get("id")) or "u_unknown")
     logger.warning("upload-url: user %s has no folder_name -- writing under %r, "
                    "which no user owns until an admin enrols it", caller.get("id"), fallback)
     return fallback
@@ -4948,7 +4962,10 @@ def patch_member_folder(conn, caller, target_sub, body):
     raw = body.get("folder_name")
     if not isinstance(raw, str) or not raw.strip():
         return error("folder_name is required", 400)
-    folder = re.sub(r'[<>:"/\\|?*\s]', '_', raw.strip())
+    folder = folder_key_mod.folder_key(raw)
+    if folder is None:
+        return error("folder_name must contain at least one letter or digit "
+                     "(A-Z, a-z, 0-9) once accents and punctuation are removed", 400)
     # A platform_admin reaches across tenants by design (D6); every other role
     # stays pinned to its own company. Without the widening the operator account
     # could see a customer's people but not enrol the one field -- folder_name --
