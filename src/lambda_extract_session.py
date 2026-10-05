@@ -46,6 +46,7 @@ from urllib.parse import unquote_plus
 import boto3
 
 import agent_turn_filter
+import pipeline_trace
 from output_language import OUTPUT_LANGUAGE_RULE
 import evidence_match
 import llm_utils
@@ -1950,9 +1951,42 @@ def _find_self_introductions(turns):
         return []
 
 
-def extract_session(bucket, user_folder, date, session_base, final=False,
-                    min_interval_s=MIN_REEXTRACT_INTERVAL_S, now=None,
-                    generation=0, speaker_names=None, sleep=time.sleep):
+def extract_session(bucket, user_folder, date, session_base, final=False, **kw):
+    """_extract_session, recorded on the recording's trace (pipeline_trace):
+    the pass, what it found, every location marker and whether its quote was
+    timed -- and the model calls, which llm_usage adds on its own."""
+    pipeline_trace.begin("extract-session", user_folder=user_folder, date=date,
+                         session=session_base)
+    started = time.time()
+    try:
+        out = _extract_session(bucket, user_folder, date, session_base, final=final, **kw)
+        _trace_extraction(out, final, time.time() - started)
+        return out
+    finally:
+        pipeline_trace.flush(s3, bucket)
+
+
+def _trace_extraction(out, final, seconds):
+    if not isinstance(out, dict):
+        pipeline_trace.event("extraction", "skipped",
+                             detail={"pass": "final" if final else "live"}, seconds=seconds)
+        return
+    markers = out.get("location_markers") or []
+    pipeline_trace.event("extraction", "ok", seconds=seconds, detail={
+        "pass": "final" if final else "live", "generation": out.get("generation"),
+        "topics": len(out.get("topics") or []), "location_markers": len(markers),
+        "markers_timed": sum(1 for m in markers if m.get("at_s")),
+        "declared_site": bool(out.get("declared_site"))})
+    for m in markers:
+        pipeline_trace.event("location_marker", "timed" if m.get("at_s") else "minute_only",
+                             detail={"location": m.get("location"), "at": m.get("at"),
+                                     "at_s": m.get("at_s")},
+                             evidence=m.get("quote"))
+
+
+def _extract_session(bucket, user_folder, date, session_base, final=False,
+                     min_interval_s=MIN_REEXTRACT_INTERVAL_S, now=None,
+                     generation=0, speaker_names=None, sleep=time.sleep):
     # M-5: a stack missing the secret must not retry-storm -- an S3 event
     # retries on a raised exception, and every retry would fail the exact
     # same way. Check upfront (before any S3 gather/Claude work) and bail

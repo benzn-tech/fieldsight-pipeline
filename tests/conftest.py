@@ -21,7 +21,11 @@ for _k, _v in (("AWS_ACCESS_KEY_ID", "testing"),
                # branch exists at all. Five modules set it at their own scope, which
                # only works while one of them imports the lambda first -- the same
                # alphabetical-order contract the comment above describes.
-               ("RAG_SEARCH_FUNCTION", "fieldsight-test-rag-search")):
+               ("RAG_SEARCH_FUNCTION", "fieldsight-test-rag-search"),
+               # pipeline_trace writes an extra object per invocation; off by
+               # default so the many tests that count S3 puts keep their
+               # meaning. The trace tests switch it on (monkeypatch.setenv).
+               ("TRACE_EVENTS", "off")):
     os.environ.setdefault(_k, _v)
 
 TEST_DB_URL = os.environ.get("TEST_DATABASE_URL")

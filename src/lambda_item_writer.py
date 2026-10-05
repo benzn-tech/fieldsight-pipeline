@@ -68,6 +68,7 @@ from photo_binding import list_pictures as _pb_list_pictures
 from repositories import users as users_repo
 from photo_binding import photos_for_topics as _photos_for_topics  # noqa: F401  (re-export)
 import photo_rebind
+import pipeline_trace
 import thread_match
 from repositories import location_markers
 from repositories import (companies, findings, meeting_session, recordings,
@@ -1372,6 +1373,11 @@ def lambda_handler(event, context):
         if parsed is None:
             logger.warning("skipping non-extraction S3 key: %s", key)
             continue
-        user_folder, date, _session_base = parsed
-        results.append(write_extraction_items(date, user_folder, key))
+        user_folder, date, session_base = parsed
+        pipeline_trace.begin("item-writer", user_folder=user_folder, date=date,
+                             session=session_base)
+        try:
+            results.append(write_extraction_items(date, user_folder, key))
+        finally:
+            pipeline_trace.flush(s3, S3_BUCKET)
     return {"results": results}

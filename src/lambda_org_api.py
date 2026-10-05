@@ -131,6 +131,7 @@ import content_hash
 import device_heartbeat
 import device_status
 import nz_time
+import pipeline_trace
 import reindex
 import recording_blocks
 import report_download_name
@@ -5797,7 +5798,22 @@ def patch_content(conn, caller, table, row_id, body):
                                     "right_term": right})
     except Exception:
         logger.exception("content edit %s/%s: glossary not learned (edit kept)", table, row_id)
+    _trace_glossary_learned(row["company_id"], caller, table, learned)
     return ok({"row": updated, "candidates": candidates, "learned": learned})
+
+
+def _trace_glossary_learned(company_id, caller, table, learned):
+    """A hand correction that taught the glossary, on the trace (company-level:
+    an edit belongs to no single recording). Nothing when nothing was learned."""
+    if not learned:
+        return
+    pipeline_trace.begin("org-api", user_folder="_glossary",
+                         date=nz_time.nz_now().strftime("%Y-%m-%d"), company_id=company_id)
+    for a in learned:
+        pipeline_trace.event("glossary_learned", "ok", detail={
+            "wrong_term": a["wrong_term"], "right_term": a["right_term"], "table": table,
+            "by": str(caller.get("id"))})
+    pipeline_trace.flush(s3, LAKE_BUCKET)
 
 
 _GLOSSARY_ADMIN_ROLES = ("admin", "gm", "platform_admin")
