@@ -109,3 +109,17 @@ def test_the_report_dialog_reads_the_days_checks(monkeypatch):
     assert org.get_day_inspections(None, caller, "05-10-2026", {})["statusCode"] == 400
     src = open(org.__file__, encoding="utf-8").read()
     assert 're.match(r"^/days/([^/]+)/inspections$", route)' in src
+
+
+def test_a_full_checklists_section_titles_do_not_capture_other_checks():
+    """"Concrete Pre-pour Inspection Checklist" has a "Safety & Environment"
+    section; a safety inspection is not a pre-pour check."""
+    full = tpl("Concrete Pre-pour Inspection Checklist", sections=(
+        dict(CHECK, title="C. Reinforcement"), dict(CHECK, title="F. Safety & Environment")))
+    assert im.match({"kind": "safety"}, [full])[0] is None
+    assert im.match({"kind": "pre-pour"}, [full])[0]["name"] == full["name"]
+
+
+def test_a_generic_name_falls_back_to_its_section_titles():
+    qa = tpl("QA Checklists", sections=(dict(CHECK, title="Pre-pour"),))
+    assert im.match({"kind": "pre-pour"}, [qa])[0]["name"] == "QA Checklists"
