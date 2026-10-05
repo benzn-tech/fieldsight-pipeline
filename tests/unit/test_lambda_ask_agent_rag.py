@@ -13,7 +13,7 @@ Covers the new RAG path (event/body carries "caller_sub"): embed the
 question -> invoke RAG_SEARCH_FUNCTION (in-VPC rag-search lambda, faked here
 via a stand-in boto3 lambda client) -> synthesize a cited markdown answer via
 llm_utils.call_llm. The pre-existing S3-file path (no caller_sub) is
-asserted to still work unchanged (test_non_rag_event_uses_legacy_path).
+asserted to be refused with 401 (test_non_rag_event_is_refused_without_reading_s3).
 """
 import io
 import json
@@ -279,24 +279,21 @@ def test_claude_error_graceful(monkeypatch):
     assert result["citations"] == []
 
 
-def test_non_rag_event_uses_legacy_path(monkeypatch):
+def test_non_rag_event_is_refused_without_reading_s3(monkeypatch):
+    """No caller_sub used to fall through to a company-blind S3 read; it is now
+    refused (sign-in required) before any of the S3 loaders run."""
     def fail_if_called(*a, **k):
-        raise AssertionError("RAG path (dashscope_utils.embed) must not run for a non-RAG event")
+        raise AssertionError("neither the RAG path nor the S3 path may run without a caller_sub")
 
     monkeypatch.setattr(dashscope_utils, "embed", fail_if_called)
-    monkeypatch.setattr(laa, "load_report",
-                         lambda bucket, date, user: ({"site": "TestSite", "executive_summary": "All good"}, "daily"))
-    monkeypatch.setattr(laa, "load_transcripts", lambda bucket, date, user, topic_time_range=None: [])
-    monkeypatch.setattr(laa, "call_claude", lambda prompt, max_tokens=2048: ("Legacy answer", None))
+    monkeypatch.setattr(laa, "load_report", fail_if_called)
+    monkeypatch.setattr(laa, "load_transcripts", fail_if_called)
 
     event = {"date": "2026-02-09", "user": "Jarley_Trainor", "question": "What happened?", "scope": "both"}
-    result = invoke(event)
+    resp = laa.lambda_handler(event, None)
 
-    assert result["answer"] == "Legacy answer"
-    assert result["grounded"] is True
-    assert result["date"] == "2026-02-09"
-    assert result["user"] == "Jarley_Trainor"
-    assert "citations" not in result  # legacy envelope shape, unchanged
+    assert resp["statusCode"] == 401
+    assert json.loads(resp["body"])["error"] == "sign-in required"
 
 
 # ============================================================

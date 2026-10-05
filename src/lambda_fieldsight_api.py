@@ -1290,6 +1290,10 @@ def trigger_report_generation(body, caller):
 def ask_question(body, caller):
     """Proxy question to Ask Agent Lambda. ACL is enforced downstream by
     rag-search via caller_sub (BUG-39 WS2) -- this proxy no longer gates."""
+    # Fail closed: without a sub the ask-agent would fall to a company-blind S3 read.
+    if not caller.get('sub'):
+        return error('sign-in required', 401)
+
     question = body.get('question', '').strip()
     date = body.get('date', '')
     user = body.get('user', '')
@@ -1409,6 +1413,10 @@ def corroborate_answer(body, caller):
     guard exists so an unhandled exception in the agent does not return a stack
     trace to the client, and this route needs it for exactly the same reason.
     """
+    # Fail closed: without a sub the ask-agent would fall to a company-blind S3 read.
+    if not caller.get('sub'):
+        return error('sign-in required', 401)
+
     question = body.get('question', '').strip()
     answer = body.get('answer', '').strip()
 
@@ -1463,6 +1471,10 @@ def ask_voice(body, caller):
     holds LambdaInvokePolicy on AskAgentFunction and the /api/{proxy+} route.
     caller identity comes from the Cognito authorizer claims -- never from the
     client body (mirrors ask_question's caller_sub bridge)."""
+    # Fail closed: without a sub the ask-agent would fall to a company-blind S3 read.
+    if not caller.get('sub'):
+        return error('sign-in required', 401)
+
     if not caller.get('sub'):
         return error('Unauthenticated', 401)
     audio_b64 = body.get('audio')
@@ -1525,6 +1537,10 @@ def search_topics(body, caller):
     Returns a ranked topic list (no LLM synthesis). ACL is enforced downstream
     in rag-search (org accessible sites via caller_sub), so no per-user gate is
     needed here. date_from/date_to are an optional inclusive range."""
+    # Fail closed: without a sub the ask-agent would fall to a company-blind S3 read.
+    if not caller.get('sub'):
+        return error('sign-in required', 401)
+
     question = (body.get('question') or '').strip()
     if len(question) < 2:
         return ok({'results': [], 'count': 0})

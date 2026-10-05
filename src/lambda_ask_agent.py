@@ -2300,6 +2300,13 @@ def lambda_handler(event, context):
     if not question:
         return error('Missing question')
 
+    # Fail closed. Without a caller_sub the lines below fall through to a
+    # company-blind S3 read of the shared lake. The only deploy target without
+    # RAG_SEARCH_FUNCTION is the hand-built legacy fieldsight-* lambdas (spec
+    # step 6), which are being retired -- so no sign-in means no answer.
+    if not body.get('caller_sub'):
+        return error('sign-in required', 401)
+
     # --- RAG path (Phase 5): triggered when caller_sub is present AND this
     # deploy target actually has a rag-search function wired up, i.e.
     # RAG_SEARCH_FUNCTION is set. Per template.yaml, AskAgentFunction sets
