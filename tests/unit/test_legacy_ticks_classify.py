@@ -46,3 +46,9 @@ def test_unchecked_row_and_text_fallback():
     r["text"] = "Alt"
     c = classify(r)
     assert c["checked"] is False and c["text"] == "Alt"
+
+
+def test_sk_folder_and_user_folder_disagreeing_is_flagged():
+    c = classify(_row("USER#A#TOPIC#0#ACTION#0", user_folder="B"))
+    assert c["folder_conflict"] is True
+    assert classify(_row("USER#A#TOPIC#0#ACTION#0", user_folder="A"))["folder_conflict"] is False

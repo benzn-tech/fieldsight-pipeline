@@ -16,6 +16,7 @@ a burst stamped with the run day would show up as closures made that day.
 import re
 from datetime import datetime, timezone
 
+import psycopg
 from psycopg.rows import dict_row
 
 from repositories import action_items, content_edits
@@ -34,7 +35,10 @@ def classify(row):
     pk, sk = str(row.get("PK") or ""), str(row.get("SK") or "")
     date = pk.split("#", 1)[1] if pk.startswith("ACTIONS#") else None
     m = _SK_RE.match(sk)
-    folder = (m.group("folder") if m else None) or row.get("user_folder") or None
+    sk_folder = (m.group("folder") if m else None) or None
+    attr_folder = row.get("user_folder") or None
+    folder = sk_folder or attr_folder
+    conflict = bool(sk_folder and attr_folder and sk_folder != attr_folder)
     topic = int(m.group("topic")) if m else None
     action = m.group("action") if m else ""
     plain = bool(m) and topic >= 0 and bool(_INT_RE.match(action))
@@ -46,6 +50,7 @@ def classify(row):
         kind = "action"
     text = row.get("action_text")
     return {"date": date, "folder": folder, "topic": topic, "action": action, "kind": kind,
+            "folder_conflict": conflict,
             "text": text if text is not None else row.get("text"),
             "checked": row.get("checked") is True,
             "checked_at": row.get("checked_at"), "checked_by": row.get("checked_by")}
@@ -66,7 +71,9 @@ def _parse_ts(value):
 # does (an active 'deleted' redaction), so a tick can never land on an item the
 # UI no longer renders.
 _CANDIDATES_SQL = (
-    "SELECT ai.id, ai.text, ai.status, s.company_id "
+    "SELECT ai.id, ai.text, ai.status, s.company_id, "
+    "EXISTS (SELECT 1 FROM content_edits ce WHERE ce.table_name = 'action_items' "
+    "AND ce.row_id = ai.id AND ce.field = 'status') AS has_status_edit "
     "FROM action_items ai JOIN sites s ON s.id = ai.site_id "
     "JOIN topics t ON t.id = ai.topic_id "
     "JOIN users u ON u.id = t.user_id "
@@ -82,9 +89,15 @@ def _candidates(conn, date, folder):
 
 
 def run(conn, rows, apply):
-    """In a dry run `applied` lists what WOULD be applied; `apply` in the report says which."""
+    """In a dry run `applied` lists what WOULD be applied; `apply` in the report says which.
+
+    A tick is applied ONLY to an item that is still 'open' AND has no status row in
+    content_edits: any status decision recorded in Aurora (a re-open, an in_progress,
+    a block) outranks a stale legacy tick, so those items go to `superseded`."""
+    apply = apply is True
     report = {"apply": bool(apply), "applied": [], "already_done": [], "unmatched": [],
               "ambiguous": [], "findings": [], "no_folder": [], "no_timestamp": [],
+              "folder_conflict": [], "superseded": [],
               "failed": [], "unchecked": 0}
     seen = set()
     for raw in rows:
@@ -95,6 +108,9 @@ def run(conn, rows, apply):
             continue
         if c["kind"] == "finding":
             report["findings"].append(entry)
+            continue
+        if c["kind"] == "action" and c["folder_conflict"]:
+            report["folder_conflict"].append(entry)
             continue
         if c["kind"] == "no_folder":
             report["no_folder"].append(entry)
@@ -118,21 +134,32 @@ def run(conn, rows, apply):
         if item["status"] == "done" or item["id"] in seen:
             report["already_done"].append(entry)
             continue
+        if item["status"] != "open" or item["has_status_edit"]:
+            report["superseded"].append({**entry, "status": item["status"]})
+            continue
         seen.add(item["id"])
         if not apply:
             report["applied"].append(entry)
             continue
+        if action_items.get_action_item(conn, item["id"]) is None:
+            seen.discard(item["id"])
+            report["failed"].append({**entry, "error": "action item not found"})
+            continue
         try:
             with conn.transaction():
+                # On a SQL error the repo calls conn.rollback(), which psycopg forbids
+                # inside a savepoint: the real cause is then the exception's
+                # __context__, which is what gets recorded below.
                 if action_items.update_action_item_fields(
                         conn, item["id"], {"status": "done"}, None) is None:
-                    raise RuntimeError("update_action_item_fields returned None")
+                    raise RuntimeError("update failed: the row vanished or the UPDATE errored")
                 content_edits.append_content_edit(
                     conn, item["company_id"], "action_items", item["id"], "status",
                     item["status"], "done", None, ACTOR_ROLE, created_at=ts)
         except Exception as e:  # recorded, never counted as applied
             seen.discard(item["id"])
-            report["failed"].append({**entry, "error": str(e)})
+            cause = e.__context__ if isinstance(e, psycopg.ProgrammingError) and e.__context__ else e
+            report["failed"].append({**entry, "error": f"{type(cause).__name__}: {cause}"})
             continue
         report["applied"].append(entry)
     return report

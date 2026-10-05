@@ -121,11 +121,79 @@ def test_deleted_topics_are_not_candidates(db):
     assert len(rep["unmatched"]) == 1 and _edits(db, co) == []
 
 
-def test_failed_update_is_recorded_not_applied(db, monkeypatch):
+def test_a_real_sql_failure_is_recorded_cleanly_and_the_run_continues(db):
+    co, s, folder, _ = _seed(db, texts=("Fix the gate", "Book crane"))
+    db.execute("CREATE FUNCTION tick_boom() RETURNS trigger LANGUAGE plpgsql AS $$ "
+               "BEGIN IF OLD.text = 'Fix the gate' THEN RAISE EXCEPTION 'boom'; END IF; "
+               "RETURN NEW; END $$")
+    db.execute("CREATE TRIGGER tick_boom BEFORE UPDATE ON action_items "
+               "FOR EACH ROW EXECUTE FUNCTION tick_boom()")
+    rep = lt.run(db, [_row(folder, "Fix the gate"), _row(folder, "Book crane", i=1)], apply=True)
+    assert len(rep["failed"]) == 1 and "boom" in rep["failed"][0]["error"]
+    assert "rollback" not in rep["failed"][0]["error"].lower()
+    assert len(rep["applied"]) == 1 and rep["applied"][0]["text"] == "Book crane"
+    assert _ai(db, "Fix the gate")[0][1] == "open" and _ai(db, "Book crane")[0][1] == "done"
+    assert len(_edits(db, co)) == 1
+
+
+def test_a_vanished_item_is_failed_not_found(db, monkeypatch):
     co, s, folder, _ = _seed(db)
-    monkeypatch.setattr(action_items, "update_action_item_fields", lambda *a, **k: None)
+    monkeypatch.setattr(action_items, "get_action_item", lambda *a, **k: None)
     rep = lt.run(db, [_row(folder, "Fix the gate")], apply=True)
-    assert rep["applied"] == [] and len(rep["failed"]) == 1 and _edits(db, co) == []
+    assert rep["applied"] == [] and rep["failed"][0]["error"] == "action item not found"
+
+
+def test_reopened_item_is_superseded_not_reclosed(db):
+    """open today only because someone re-opened it after the legacy tick."""
+    co, s, folder, _ = _seed(db)
+    [(aid, _, _)] = _ai(db, "Fix the gate")
+    content_edits.append_content_edit(db, co["id"], "action_items", aid, "status",
+                                      "done", "open", None, "pm")
+    rep = lt.run(db, [_row(folder, "Fix the gate")], apply=True)
+    assert rep["applied"] == [] and len(rep["superseded"]) == 1
+    assert rep["superseded"][0]["status"] == "open"
+    assert rep["superseded"][0]["action_item_id"] == str(aid)
+    assert _ai(db, "Fix the gate")[0][1] == "open" and len(_edits(db, co)) == 1
+
+
+def test_in_progress_item_is_superseded(db):
+    co, s, folder, _ = _seed(db)
+    db.execute("UPDATE action_items SET status='in_progress' WHERE text='Fix the gate'")
+    rep = lt.run(db, [_row(folder, "Fix the gate")], apply=True)
+    assert rep["applied"] == [] and rep["superseded"][0]["status"] == "in_progress"
+    assert _ai(db, "Fix the gate")[0][1] == "in_progress" and _edits(db, co) == []
+
+
+def test_same_text_same_day_in_another_company_is_untouched(db):
+    co1, s1, f1, _ = _seed(db)
+    co2, s2, f2, _ = _seed(db)
+    rep = lt.run(db, [_row(f1, "Fix the gate")], apply=True)
+    assert len(rep["applied"]) == 1 and len(_edits(db, co1)) == 1
+    assert _edits(db, co2) == []
+    other = db.execute("SELECT a.status FROM action_items a JOIN sites s ON s.id=a.site_id "
+                       "WHERE s.company_id=%s AND a.text='Fix the gate'", (co2["id"],)).fetchone()
+    assert other[0] == "open"
+
+
+def test_two_ticks_on_one_item_in_a_batch_write_once(db):
+    co, s, folder, _ = _seed(db)
+    rows = [_row(folder, "Fix the gate"), _row(folder, "fix  the GATE", i=5)]
+    rep = lt.run(db, rows, apply=True)
+    assert len(rep["applied"]) == 1 and len(rep["already_done"]) == 1
+    assert len(_edits(db, co)) == 1
+
+
+def test_sk_folder_vs_user_folder_conflict_is_not_applied(db):
+    co, s, folder, _ = _seed(db)
+    rep = lt.run(db, [{**_row(folder, "Fix the gate"), "user_folder": "Somebody_Else"}], apply=True)
+    assert len(rep["folder_conflict"]) == 1 and rep["applied"] == []
+    assert _edits(db, co) == []
+
+
+def test_a_string_apply_is_a_dry_run_even_when_called_directly(db):
+    co, s, folder, _ = _seed(db)
+    rep = lt.run(db, [_row(folder, "Fix the gate")], apply="true")
+    assert rep["apply"] is False and _edits(db, co) == []
 
 
 def test_closure_is_attributed_to_the_checked_at_day_not_today(db):
