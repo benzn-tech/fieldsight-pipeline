@@ -1008,10 +1008,17 @@ def clean_inspections(raw):
 
 def time_inspections(items, turns):
     """Each check's window, to the second (voice-triggered checklists, owner
-    2026-09-30): it opens where the start was said and closes where he said it
-    was finished -- or, when he never did, where the recording stopped
-    (`end_source`: "said" | "recording_stop"). A quote that cannot be found
-    keeps the model's minute, as markers do."""
+    2026-09-30): it opens where the start was said and closes at the first of
+    where he said it was finished, where he started the NEXT check, or where
+    the recording stopped (`end_source`: "said" | "next_check" |
+    "recording_stop"). A quote that cannot be found keeps the model's minute,
+    as markers do.
+
+    "Next check" is ours, not the owner's wording: on prod (Ben_Lin_Test
+    2026-10-05) he never said a check was finished, and without it the Level 1
+    pre-pour window ran on through the Level 2 steel inspection to the end of
+    the recording. A check he comes back to is one entry (the prompt says so),
+    so moving on is the end of it."""
     stream = _word_stream(turns)
     ends = [t.get('abs_end') or t.get('abs_start') for t in turns or []
             if (t.get('abs_end') or t.get('abs_start')) is not None]
@@ -1032,7 +1039,24 @@ def time_inspections(items, turns):
             m['end_at'] = stop[:5] if stop else None
             m['end_source'] = 'recording_stop'
         out.append(m)
+    starts = sorted((_clock_s(m.get('start_at_s') or m.get('start_at')), i)
+                    for i, m in enumerate(out))
+    for (start, i), nxt in zip(starts, starts[1:]):
+        end = _clock_s(out[i].get('end_at_s') or out[i].get('end_at'))
+        if start is not None and nxt[0] is not None and nxt[0] > start                 and (end is None or nxt[0] < end):
+            nxt_m = out[nxt[1]]
+            out[i]['end_at_s'] = nxt_m.get('start_at_s') or (nxt_m['start_at'] + ':00')
+            out[i]['end_at'] = out[i]['end_at_s'][:5]
+            out[i]['end_source'] = 'next_check'
     return out
+
+
+def _clock_s(hms):
+    try:
+        parts = [int(x) for x in str(hms).split(':')]
+        return parts[0] * 3600 + parts[1] * 60 + (parts[2] if len(parts) > 2 else 0)
+    except (ValueError, IndexError, TypeError):
+        return None
 
 
 def _timed_inspections(raw, turns):

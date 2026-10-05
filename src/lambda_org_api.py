@@ -147,6 +147,7 @@ from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
 import programme_reconcile
 from repositories import day_recording_segments, location_markers
+from repositories import inspection_windows
 from repositories import (action_items, aliases, chunks, classification_feedback, companies,
                           findings, speaker_label_groups,
                           compliance_resolutions, content, content_edits, keyframes,
@@ -808,6 +809,9 @@ def dispatch(conn, event, method, route):
         return day_report_status(conn, caller, m_drs.group(1), event)
     if route == "/photos/notice" and method == "GET":
         return get_photo_notice(conn, caller, event)
+    m_din = re.match(r"^/days/([^/]+)/inspections$", route)
+    if m_din and method == "GET":
+        return get_day_inspections(conn, caller, m_din.group(1), event)
     m_dps = re.match(r"^/days/([^/]+)/photos/selection$", route)
     if m_dps and method == "GET":
         return get_photo_selection(conn, caller, m_dps.group(1), event)
@@ -3652,6 +3656,25 @@ def _any_session_removed(session_ids, folders, date):
 # paths read it -- the nightly generator runs outside the VPC.
 
 _SELECTION_WRITE_ROLES = ("admin", "gm", "platform_admin")
+
+
+def get_day_inspections(conn, caller, date, event):
+    """GET /api/org/days/{date}/inspections?user= -- the checks spoken that day
+    (voice-triggered checklists): each with its window to the second and the
+    checklist template it matched, for the report dialog to offer in one
+    click. Read like the day's media: whoever may see that person's day."""
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    user = ((event.get("queryStringParameters") or {}).get("user") or "").strip()
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="inspections")
+    if err is not None:
+        return err
+    company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
+    rows = inspection_windows.for_day(conn, company, folder, date)
+    return ok({"date": date, "folder": folder, "inspections": [
+        dict(r, id=str(r["id"]),
+             template_id=str(r["template_id"]) if r.get("template_id") else None)
+        for r in rows]})
 
 
 def _photo_selection_folder(conn, caller, date, event, write=False):

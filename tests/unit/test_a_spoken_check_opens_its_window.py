@@ -66,3 +66,15 @@ def test_the_model_is_asked_for_checks_started_not_checks_discussed():
     src = open(es.__file__, encoding="utf-8").read()
     assert "0b. INSPECTIONS." in src and "only discussed, planned or described" in src
     assert "'inspections': _timed_inspections(parsed.get('inspections'), turns)," in src
+
+
+def test_starting_the_next_check_ends_the_one_before():
+    """Prod 10-05: no check was ever said to be finished; without this the
+    Level 1 pre-pour window ran through the Level 2 steel inspection."""
+    raw = [{"name": "L1 pre-pour", "kind": "pre-pour", "start_at": "11:02",
+            "start_quote": "Starting the pre-pour check on level one."},
+           {"name": "steel inspection", "kind": "steel", "start_at": "11:02",
+            "start_quote": "Now the steel inspection."}]
+    pre, steel = es._timed_inspections(raw, turns())
+    assert (pre["end_at_s"], pre["end_source"]) == ("11:02:51", "next_check")
+    assert (steel["end_at_s"], steel["end_source"]) == ("11:03:21", "recording_stop")

@@ -67,10 +67,11 @@ from photo_binding import PHOTOS_PER_TOPIC_CAP  # noqa: F401  (re-export)
 from photo_binding import list_pictures as _pb_list_pictures
 from repositories import users as users_repo
 from photo_binding import photos_for_topics as _photos_for_topics  # noqa: F401  (re-export)
+import inspection_match
 import photo_rebind
 import pipeline_trace
 import thread_match
-from repositories import location_markers
+from repositories import inspection_windows, location_markers
 from repositories import (companies, findings, meeting_session, recordings,
                           redactions,
                           session_group, sites, threads, topics)
@@ -1047,6 +1048,16 @@ def write_extraction_items(date, user_folder, extraction_key):
         except Exception:  # noqa: BLE001 -- see above
             logger.exception("location markers not stored for %s/%s", user_folder, date)
 
+        # The checks he said he was doing (voice-triggered checklists), each
+        # matched to the company's checklist template by what kind of check it
+        # is (inspection_match). Never fatal, for the same reason as the markers.
+        try:
+            _store_inspections(conn, company["id"], user_id, user_folder, date,
+                               _parse_extraction_key(extraction_key)[2],
+                               extraction.get("inspections") or [])
+        except Exception:  # noqa: BLE001 -- see above
+            logger.exception("inspection windows not stored for %s/%s", user_folder, date)
+
         # Self-introduction suggestions ("Hi, this is Petros from Cassidy"), INSIDE the
         # connection block, deliberately -- `_request_rebind`/`_request_match` below are
         # called AFTER `with get_connection() as conn:` has closed (psycopg3's `with conn:`
@@ -1362,6 +1373,27 @@ def _source_is_deleted(conn, source_s3_key) -> bool:
         return False
     logger.info("deleted-source check: key=%s deleted=%s", source_s3_key, hit)
     return bool(hit)
+
+
+def _store_inspections(conn, company_id, user_id, user_folder, date, session, spoken):
+    """Match each spoken check to a checklist template and keep the windows.
+    On the trace either way: a check that matched nothing is the case the
+    owner most needs to see (a template named differently from how people
+    say it)."""
+    templates = inspection_windows.checklist_templates(conn, company_id, user_id) if spoken else []
+    rows = []
+    for w in spoken:
+        tpl, score = inspection_match.match(w, templates)
+        rows.append(dict(w, start_at=w.get("start_at_s") or (w["start_at"] + ":00"),
+                         end_at=w.get("end_at_s") or ((w["end_at"] + ":00") if w.get("end_at") else None),
+                         template_id=tpl["id"] if tpl else None, match_score=round(score, 2)))
+        pipeline_trace.event("checklist_match", "matched" if tpl else "no_match", detail={
+            "check": w.get("name"), "kind": w.get("kind"),
+            "template": tpl["name"] if tpl else None, "score": round(score, 2),
+            "candidates": sum(1 for t in templates if inspection_match.is_checklist(t.get("body")))},
+            evidence=w.get("start_quote"))
+    inspection_windows.replace_for_session(conn, company_id, user_folder, date, session, rows)
+    return rows
 
 
 def lambda_handler(event, context):
