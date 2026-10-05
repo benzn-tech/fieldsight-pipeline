@@ -54,6 +54,9 @@ def test_has_sub_false_without_sub(monkeypatch, caplog):
     ({"User-Agent": "okhttp/4.12.0"}, "android"),
     ({"User-Agent": "Dalvik/2.1.0 (Linux)"}, "android"),
     ({"User-Agent": "CFNetwork/1494 Darwin/23"}, "ios"),
+    ({"USER-AGENT": "Mozilla/5.0 (X11) Gecko"}, "browser"),
+    ({"User-Agent": "MyApp/3 CFNetwork/1494 Darwin/23.1"}, "ios"),
+    ({"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) AppleWebKit"}, "ios"),
     ({"User-Agent": "curl/8.0"}, "other"),
     ({}, "none"),
     (None, "none"),
@@ -70,3 +73,33 @@ def test_no_param_values_in_any_log_record(monkeypatch, caplog):
 
 def test_health_logs_nothing(monkeypatch, caplog):
     assert _call(monkeypatch, caplog, path="/api/health") == []
+
+
+def test_unknown_path_logs_route_other_once(monkeypatch, caplog):
+    lines = _call(monkeypatch, caplog, path="/api/secret-client-text-12345")
+    assert len(lines) == 1 and _parse(lines[0])["route"] == "other"
+    assert "secret-client-text" not in " ".join(r.getMessage() for r in caplog.records
+                                               if "LEGACY_CALL" in r.getMessage())
+
+
+def test_post_body_values_never_logged(monkeypatch, caplog):
+    monkeypatch.setattr(fapi, "get_caller_identity", lambda e: {"sub": "s", "role": "gm"})
+    monkeypatch.setattr(fapi, "ask_question", lambda b, c: fapi.ok({}))
+    event = {"httpMethod": "POST", "path": "/api/ask", "headers": {},
+             "body": json.dumps({"question": "TopSecretQuestion", "user": "Secret_Folder"})}
+    with caplog.at_level(logging.INFO):
+        fapi.lambda_handler(event, None)
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "TopSecretQuestion" not in text and "Secret_Folder" not in text
+
+
+def test_raising_handler_still_logs_exactly_once(monkeypatch, caplog):
+    monkeypatch.setattr(fapi, "get_caller_identity", lambda e: {"sub": "s", "role": "gm"})
+
+    def boom(p, c):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(fapi, "get_timeline", boom)
+    with caplog.at_level(logging.INFO):
+        res = fapi.lambda_handler({"httpMethod": "GET", "path": "/api/timeline"}, None)
+    assert res["statusCode"] == 500
+    assert len([r for r in caplog.records if "LEGACY_CALL" in r.getMessage()]) == 1

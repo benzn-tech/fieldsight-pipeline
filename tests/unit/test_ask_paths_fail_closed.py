@@ -106,3 +106,21 @@ def test_ask_agent_with_caller_sub_takes_rag_branch(monkeypatch):
         {"question": "q?", "caller_sub": "sub-1"})}, None)
     assert res["statusCode"] == 200
     assert len(seen) == 1
+
+
+def test_ask_agent_empty_string_caller_sub_is_401(monkeypatch):
+    monkeypatch.setenv("RAG_SEARCH_FUNCTION", "rag")
+    hits = _s3_spies(monkeypatch)
+    res = laa.lambda_handler({"body": json.dumps(
+        {"question": "q?", "caller_sub": ""})}, None)
+    assert res["statusCode"] == 401 and hits == []
+
+
+def test_ask_agent_voice_without_caller_sub_is_401_and_stt_not_called(monkeypatch):
+    monkeypatch.setenv("RAG_SEARCH_FUNCTION", "rag")
+    stt = []
+    monkeypatch.setattr(laa, "_stt", lambda *a, **k: stt.append(a) or "x")
+    res = laa.lambda_handler({"body": json.dumps({"audio": "AAAA", "format": "wav"})}, None)
+    assert res["statusCode"] == 401
+    assert json.loads(res["body"])["error"] == "sign-in required"
+    assert stt == []

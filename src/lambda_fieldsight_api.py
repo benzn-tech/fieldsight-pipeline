@@ -1475,8 +1475,6 @@ def ask_voice(body, caller):
     if not caller.get('sub'):
         return error('sign-in required', 401)
 
-    if not caller.get('sub'):
-        return error('Unauthenticated', 401)
     audio_b64 = body.get('audio')
     if not audio_b64 or not isinstance(audio_b64, str):
         return error('Missing audio (base64 clip required)')
@@ -1641,8 +1639,11 @@ def health_check(params):
 
 def _ua_family(headers):
     """Coarse client family from the User-Agent header; never the raw string."""
-    headers = headers or {}
-    ua = headers.get('User-Agent') or headers.get('user-agent') or ''
+    ua = ''
+    for k, v in (headers or {}).items():
+        if str(k).lower() == 'user-agent':
+            ua = v or ''
+            break
     if not ua:
         return 'none'
     low = ua.lower()
@@ -1653,6 +1654,17 @@ def _ua_family(headers):
     if low.startswith('mozilla/'):
         return 'browser'
     return 'other'
+
+
+# Literal routes the dispatcher below serves. LEGACY_CALL logs only these; any
+# other path is client-controlled (a 404) and is logged as 'other'.
+KNOWN_ROUTES = frozenset({
+    '/api/timeline', '/api/dates', '/api/media/presigned-url', '/api/reports/history',
+    '/api/reports/generate', '/api/users', '/api/sites', '/api/site-users',
+    '/api/transcripts', '/api/audio-segments', '/api/video-segments',
+    '/api/recording-stats', '/api/actions/toggle', '/api/actions', '/api/ask',
+    '/api/ask/voice', '/api/ask/corroborate', '/api/search',
+})
 
 
 def lambda_handler(event, context):
@@ -1672,7 +1684,7 @@ def lambda_handler(event, context):
     # Who still calls this gateway? Route/method/role/client family only --
     # no query-param or body values (tenant content).
     logger.info("LEGACY_CALL %s", json.dumps({
-        'route': path, 'method': method, 'role': caller.get('role', ''),
+        'route': path if path in KNOWN_ROUTES else 'other', 'method': method, 'role': caller.get('role', ''),
         'has_sub': bool(caller.get('sub')),
         'ua': _ua_family(event.get('headers')),
     }, sort_keys=True))

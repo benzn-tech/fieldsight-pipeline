@@ -2282,6 +2282,9 @@ def lambda_handler(event, context):
     # managed production account, which runs a different template entirely
     # and never has RAG_SEARCH_FUNCTION -- see fieldsight-two-accounts.)
     if body.get('audio') and os.environ.get('RAG_SEARCH_FUNCTION'):
+        # Refuse before STT is spent: _voice_answer needs a caller_sub for the ACL.
+        if not body.get('caller_sub'):
+            return error('sign-in required', 401)
         return ok(_voice_answer(body))
 
     # --- Corroboration path: question + answer in, external findings out. It
