@@ -371,6 +371,7 @@ REPUBLISH_SITE_COORDS_TASK = "republish_site_coords"
 COLLAPSE_PHOTOS_TASK = "collapse_multibound_photos"
 REBIND_DAY_TASK = "rebind_day_photos"
 RESTORE_MARKERS_TASK = "restore_day_markers"
+BACKFILL_LEGACY_TICKS_TASK = "backfill_legacy_ticks"
 
 
 def lambda_handler(event, context):
@@ -413,6 +414,16 @@ def lambda_handler(event, context):
         with get_connection() as conn:
             return photo_collapse.rebind_one_day(conn, s3(), LAKE_BUCKET, event["folder"],
                                                  event["date"], apply=event.get("apply") is True)
+    # Same envelope rule, same dry-run default. Copies the unambiguous legacy
+    # DynamoDB tick-offs ({"rows": [...]}, exported by scripts/export_legacy_ticks.py)
+    # into action_items.status; org-api has no grant on the audit table.
+    if isinstance(event, dict) and event.get("task") == BACKFILL_LEGACY_TICKS_TASK:
+        import legacy_ticks_backfill
+        rows = event.get("rows")
+        if not isinstance(rows, list):
+            return {"error": "rows (a list) is required"}
+        with get_connection() as conn:
+            return legacy_ticks_backfill.run(conn, rows, apply=event.get("apply") is True)
     if isinstance(event, dict) and event.get("task") == COLLAPSE_PHOTOS_TASK:
         import photo_collapse
         with get_connection() as conn:
