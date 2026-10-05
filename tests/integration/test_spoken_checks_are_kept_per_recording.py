@@ -58,3 +58,14 @@ def test_another_company_never_sees_the_checks(db):
     iw.replace_for_session(db, cid, FOLDER, DATE, "sidA", [row("pre-pour", "10:59:09", tid)])
     assert iw.for_day(db, other, FOLDER, DATE) == []
     assert len(iw.for_day(db, None, FOLDER, DATE)) == 1, "a platform admin spans companies"
+
+
+def test_stretches_are_kept_and_an_old_row_reads_as_one(db):
+    cid, uid, tid = _setup(db)
+    two = dict(row("pre-pour", "11:02:03", tid, "11:03:21"),
+               segments=[{"from": "11:02:03", "to": "11:02:21"}, {"from": "11:02:41", "to": "11:03:21"}])
+    iw.replace_for_session(db, cid, FOLDER, DATE, "sidA", [two])
+    iw.replace_for_session(db, cid, FOLDER, DATE, "sidB", [row("steel", "12:00:00", None, "12:10:00")])
+    a, b = iw.for_day(db, cid, FOLDER, DATE)
+    assert a["segments"] == two["segments"]
+    assert b["segments"] == [{"from": "12:00:00", "to": "12:10:00"}]

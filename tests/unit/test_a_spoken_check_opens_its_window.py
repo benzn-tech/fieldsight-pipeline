@@ -78,3 +78,41 @@ def test_starting_the_next_check_ends_the_one_before():
     pre, steel = es._timed_inspections(raw, turns())
     assert (pre["end_at_s"], pre["end_source"]) == ("11:02:51", "next_check")
     assert (steel["end_at_s"], steel["end_source"]) == ("11:03:21", "recording_stop")
+
+
+INTERRUPTED = [("Starting", 2.0), ("the", 2.3), ("pre-pour", 2.5), ("check.", 3.0),
+               ("Quick", 20.0), ("steel", 20.3), ("inspection", 20.6), ("here.", 21.0),
+               ("Back", 40.0), ("to", 40.2), ("the", 40.4), ("pre-pour.", 40.6), ("Bye.", 80.0)]
+
+
+def interrupted_turns():
+    data = {"results": {"transcripts": [{"transcript": " ".join(w for w, _ in INTERRUPTED)}],
+                        "items": [{"type": "pronunciation", "start_time": str(t),
+                                   "end_time": str(t + 0.3), "speaker_label": "spk_0",
+                                   "alternatives": [{"content": w, "confidence": "1.0"}]}
+                                  for w, t in INTERRUPTED]}}
+    return normalize_transcript(data, FILE)["speaker_turns"]
+
+
+def test_THE_an_interrupted_check_is_two_stretches_and_the_other_check_is_between():
+    """Owner, 2026-10-05: "if it ends where another check is inserted, how do
+    the interrupted parts join up?" -- as segments of one check."""
+    raw = [{"name": "pre-pour", "kind": "pre-pour", "start_at": "11:02",
+            "start_quote": "Starting the pre-pour check.",
+            "resumed": [{"at": "11:02", "quote": "Back to the pre-pour."}]},
+           {"name": "steel", "kind": "steel", "start_at": "11:02",
+            "start_quote": "Quick steel inspection here."}]
+    pre, steel = es._timed_inspections(raw, interrupted_turns())
+    assert pre["segments"] == [{"from": "11:02:03", "to": "11:02:21"},
+                               {"from": "11:02:41", "to": "11:03:21"}]
+    assert (pre["start_at_s"], pre["end_at_s"], pre["end_source"]) == ("11:02:03", "11:03:21", "recording_stop")
+    assert steel["segments"] == [{"from": "11:02:21", "to": "11:02:41"}]
+    assert steel["end_source"] == "next_check"
+
+
+def test_coming_back_without_anything_between_is_one_stretch():
+    raw = [{"name": "pre-pour", "kind": "pre-pour", "start_at": "11:02",
+            "start_quote": "Starting the pre-pour check.",
+            "resumed": [{"at": "11:02", "quote": "Back to the pre-pour."}]}]
+    pre = es._timed_inspections(raw, interrupted_turns())[0]
+    assert pre["segments"] == [{"from": "11:02:03", "to": "11:03:21"}]
