@@ -24,6 +24,7 @@ GENERIC = frozenset((
     "level", "levels", "floor", "room", "area", "zone", "block", "stage", "site", "here", "is",
     "starting", "start", "doing", "now", "new", "form", "sheet", "record", "report", "daily",
     "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "ground",
+    "qa", "qc", "itp", "quality", "assurance", "control", "test", "plan",
 ))
 MIN_SCORE = 0.5
 
@@ -56,11 +57,20 @@ def is_checklist(body):
 
 
 def template_words(template):
-    """A template is known by its name and its checklist sections' titles."""
+    """A template is known by its NAME; its checklist sections' titles only
+    when the name says nothing about the kind of check ("QA Checklists").
+
+    Name first because a full checklist's sections are named for what it
+    covers, not what it is: "Concrete Pre-pour Inspection Checklist" has a
+    section "F. Safety & Environment", and matching on titles made "starting
+    the safety inspection" open the pre-pour checklist."""
+    named = words(template.get("name"))
+    if named:
+        return named
     body = template.get("body") or {}
     titles = [s.get("title") or "" for s in body.get("sections") or []
               if isinstance(s, dict) and str(s.get("kind") or "").lower() == "checklist"]
-    return words(" ".join([template.get("name") or ""] + titles))
+    return words(" ".join(titles))
 
 
 def match(inspection, templates):
