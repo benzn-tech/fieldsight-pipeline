@@ -132,6 +132,7 @@ import device_heartbeat
 import device_status
 import folder_key as folder_key_mod
 import nz_time
+import checklist_reports
 import pipeline_trace
 import trace_views
 import reindex
@@ -833,6 +834,11 @@ def dispatch(conn, event, method, route):
         return day_report_status(conn, caller, m_drs.group(1), event)
     if route == "/photos/notice" and method == "GET":
         return get_photo_notice(conn, caller, event)
+    m_dcr = re.match(r"^/days/([^/]+)/checklist-reports$", route)
+    if m_dcr and method == "GET":
+        return get_day_checklist_reports(conn, caller, m_dcr.group(1), event)
+    if route == "/checklist-reports/recent" and method == "GET":
+        return get_recent_checklist_reports(conn, caller, event)
     m_din = re.match(r"^/days/([^/]+)/inspections$", route)
     if m_din and method == "GET":
         return get_day_inspections(conn, caller, m_din.group(1), event)
@@ -3736,6 +3742,74 @@ def _hms_len(clock):
     """'HH:MM[:SS]' -> seconds of the day (validated by _WINDOW_CLOCK_RE first)."""
     parts = [int(x) for x in clock.split(":")]
     return parts[0] * 3600 + parts[1] * 60 + (parts[2] if len(parts) > 2 else 0)
+
+
+def _checklist_report_status(result_key):
+    """pending | done | error | removed-free status of one auto report, read off
+    the worker's result (no presign here -- the download goes through
+    /days/{date}/report/status, which re-checks deletions first)."""
+    try:
+        obj = s3().get_object(Bucket=LAKE_BUCKET, Key=result_key)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in _LAKE_NOT_FOUND_CODES:
+            return "pending", None
+        raise
+    result = json.loads(obj["Body"].read().decode("utf-8"))
+    return result.get("status") or "pending", result.get("error")
+
+
+def _checklist_report_payload(r):
+    status, err = _checklist_report_status(r["result_key"])
+    return {"id": str(r["id"]), "date": str(r.get("report_date") or ""),
+            "checkName": r["check_name"], "templateName": r["template_name"],
+            "templateId": str(r["template_id"]) if r.get("template_id") else None,
+            "startAt": r["start_at"], "endAt": r.get("end_at"),
+            "segments": r.get("segments"), "requestId": r["request_id"],
+            "status": status, "error": err}
+
+
+def _unmatched_checks(rows):
+    return [{"checkName": r["name"], "startAt": r["start_at"], "endAt": r.get("end_at"),
+             "kind": r.get("kind")} for r in rows if not r.get("template_id")]
+
+
+def get_day_checklist_reports(conn, caller, date, event):
+    """GET /api/org/days/{date}/checklist-reports?user= -- the checklist
+    reports made on their own from that day's spoken checks (checklist_reports),
+    each with its status, and the checks no checklist template matched (owner,
+    2026-10-06: those are a notice, never a report on the wrong form). Read
+    like the day's media."""
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    user = ((event.get("queryStringParameters") or {}).get("user") or "").strip()
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="checklist reports")
+    if err is not None:
+        return err
+    company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
+    rows = checklist_reports.for_day(conn, company, folder, date)
+    checks = inspection_windows.for_day(conn, company, folder, date)
+    return ok({"date": date, "folder": folder,
+               "reports": [_checklist_report_payload(r) for r in rows],
+               "unmatched": _unmatched_checks(checks)})
+
+
+def get_recent_checklist_reports(conn, caller, event):
+    """GET /api/org/checklist-reports/recent -- for the bell: the CALLER's own
+    checklist reports of today and yesterday, and their unmatched checks. Own
+    folder only, like the photo notice."""
+    folder = scope.visible_scope(conn, caller).get("self_folder")
+    if not folder:
+        return ok({"reports": [], "unmatched": []})
+    today = nz_time.nz_today()
+    since = (today - timedelta(days=1)).isoformat()
+    rows = checklist_reports.recent_for_folder(conn, caller["company_id"], folder, since)
+    unmatched = []
+    for day in (today - timedelta(days=1), today):
+        for c in _unmatched_checks(inspection_windows.for_day(
+                conn, caller["company_id"], folder, day.isoformat())):
+            unmatched.append(dict(c, date=day.isoformat()))
+    return ok({"folder": folder, "reports": [_checklist_report_payload(r) for r in rows],
+               "unmatched": unmatched})
 
 
 def _photo_selection_folder(conn, caller, date, event, write=False):

@@ -3596,6 +3596,11 @@ Resources:
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
+          # A spoken check's report is queued with org-api's own code
+          # (checklist_reports -> lambda_org_api.day_report_generate), which
+          # reads these two exactly as org-api does.
+          LAKE_BUCKET: !Ref IngestBucketName
+          GRADED_ROLES: !Ref GradedRoles
           CONFIG_KEY: config/user_mapping.json
           # video-keyframe plan: emit keyframe_requests/ post-commit only when
           # this stage flag is on (ships inert otherwise).
@@ -3657,6 +3662,11 @@ Resources:
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/traces/*
+            # A spoken check's report request for the report worker
+            # (checklist_reports), the same object org-api writes for Generate.
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_report_requests/*
             - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
