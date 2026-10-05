@@ -108,10 +108,34 @@ def test_an_old_request_without_facts_still_gets_its_details():
 def test_the_nightly_record_is_what_the_weather_section_says():
     s3 = FakeS3({"weather/%s/2026-09-23/actual.json" % SITE: RECORD})
     sec, sources = report_facts.weather_section("Weather", artifact(), FACTS, s3, "b", "2026-10-01")
-    assert sec["paragraphs"] == ["Sky | Rain | Temperature | Wind", "---|---|---|---",
-                                 "Light rain | 6.2 mm | 7-14°C | up to 31 km/h",
+    assert sec["paragraphs"] == ["- Light rain", "- Temperature range: 7°C – 14°C",
+                                 "- Rainfall: 6.2mm", "- Max wind speed: 31 km/h",
                                  "- " + RECORD["lines"][0]]
     assert sources == [{"site": SITE, "source": "record"}]
+
+
+def test_a_morning_forecast_without_numbers_gets_them(monkeypatch):
+    """Forecasts written before 2026-10-05 kept only the advice: a same-day
+    report printed "Weather: no impact on site work expected." and nothing
+    else."""
+    advice_only = {"lines": ["Weather: no impact on site work expected."]}
+    s3 = FakeS3({"weather/%s/2026-10-05/forecast.json" % SITE: advice_only})
+    monkeypatch.setattr(report_facts.site_weather, "build_weather_block_for_site",
+                        lambda info, d, today: dict(RECORD["daily"], date=d))
+    sec, _ = report_facts.weather_section("Weather", artifact(date="2026-10-05"), FACTS, s3, "b",
+                                          "2026-10-05")
+    assert sec["paragraphs"] == ["- Light rain", "- Temperature range: 7°C – 14°C",
+                                 "- Rainfall: 6.2mm", "- Max wind speed: 31 km/h",
+                                 "- Weather: no impact on site work expected."]
+
+
+def test_the_facts_leave_out_what_the_source_did_not_give():
+    import weather
+    assert weather.summary_lines(None) == []
+    assert weather.summary_lines({"condition_label": "Unknown", "temp_min_c": 11.8,
+                                  "temp_max_c": None, "precip_mm": 0.0,
+                                  "windspeed_kmh": 16.25}) == [
+        "Rainfall: 0mm", "Max wind speed: 16.2 km/h"]
 
 
 def test_with_no_record_it_is_worked_out_by_the_same_code(monkeypatch):

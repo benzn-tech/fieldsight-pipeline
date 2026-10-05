@@ -556,7 +556,8 @@ def weather_record_key(site_id, target_date, actual):
     return f"weather/{site_id}/{target_date}/{'actual' if actual else 'forecast'}.json"
 
 
-def run_weather_forecasts(date=None, fetch=weather_advice.hourly_forecast):
+def run_weather_forecasts(date=None, fetch=weather_advice.hourly_forecast,
+                          fetch_daily=None):
     """The morning's weather, for every placed site, before anyone is on site.
 
     For the Morning Brief on Today (owner, 2026-09-29). Scheduled at 05:30
@@ -567,6 +568,12 @@ def run_weather_forecasts(date=None, fetch=weather_advice.hourly_forecast):
 
     A site with no UUID in the file is skipped rather than keyed by slug: the
     page asks by UUID, so a slug-keyed forecast would be written and never read.
+
+    The record carries the day's numbers too (`daily`, and `summary` -- the
+    facts as lines, weather.summary_lines). Until 2026-10-05 it carried only
+    what they meant, so on a day with no impact Today read "no impact on site
+    work expected" and nothing else, and a same-day report that found this
+    record printed the same single line.
     """
     date = date or get_nzdt_now().strftime('%Y-%m-%d')
     doc = download_json_from_s3(S3_BUCKET, site_coords.KEY) or {}
@@ -582,11 +589,15 @@ def run_weather_forecasts(date=None, fetch=weather_advice.hourly_forecast):
         if not findings:
             skipped.append(slug)
             continue
+        daily = (build_weather_block_for_site(info, date, date) if fetch_daily is None
+                 else build_weather_block_for_site(info, date, date, fetch=fetch_daily))
         s3_client.put_object(
             Bucket=S3_BUCKET,
             Key=weather_record_key(entry["site_id"], date, False),
             Body=json.dumps({"site_id": entry["site_id"], "site_slug": slug, "date": date,
-                             "generated_at": get_nzdt_now().isoformat(), **findings},
+                             "generated_at": get_nzdt_now().isoformat(),
+                             "daily": daily, "summary": weather.summary_lines(daily),
+                             **findings},
                             default=str).encode("utf-8"),
             ContentType="application/json")
         written.append(slug)
