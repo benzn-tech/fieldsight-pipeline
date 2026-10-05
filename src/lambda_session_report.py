@@ -685,8 +685,13 @@ def _model_budget_seconds(context):
 
 def _clock(date, hhmm):
     """A wall-clock time on the report's own date. No timezone conversion happens
-    anywhere on this path (spec 2026-09-15 global constraints)."""
-    return datetime.datetime.strptime("%s %s" % (date, hhmm), "%Y-%m-%d %H:%M")
+    anywhere on this path (spec 2026-09-15 global constraints).
+
+    'HH:MM' or 'HH:MM:SS': a spoken check's window is to the second
+    (inspection_windows) -- "back to the level one" at 11:02:05 and the next
+    check at 11:02:14 are in one minute."""
+    fmt = "%Y-%m-%d %H:%M:%S" if str(hhmm).count(":") == 2 else "%Y-%m-%d %H:%M"
+    return datetime.datetime.strptime("%s %s" % (date, hhmm), fmt)
 
 
 def _action_items_for_prompt(content):
