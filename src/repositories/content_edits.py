@@ -9,13 +9,23 @@ _COLS_QUALIFIED = ", ".join("ce." + c for c in _COLS.split(", "))
 
 
 def append_content_edit(conn, company_id, table_name, row_id, field,
-                        before_text, after_text, actor_user_id, actor_role):
+                        before_text, after_text, actor_user_id, actor_role,
+                        created_at=None):
+    """`created_at=None` keeps the column default (now()) -- every live writer.
+    A backfill passes the moment the thing really happened, because
+    count_action_closures_by_day buckets by this column."""
+    cols = ("company_id, table_name, row_id, field, before_text, after_text, "
+            "actor_user_id, actor_role")
+    params = [company_id, table_name, row_id, field, before_text, after_text,
+              actor_user_id, actor_role]
+    marks = "%s,%s,%s,%s,%s,%s,%s,%s"
+    if created_at is not None:
+        cols += ", created_at"
+        marks += ",%s"
+        params.append(created_at)
     return conn.cursor(row_factory=dict_row).execute(
-        f"INSERT INTO content_edits (company_id, table_name, row_id, field, "
-        f"before_text, after_text, actor_user_id, actor_role) "
-        f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING {_COLS}",
-        (company_id, table_name, row_id, field, before_text, after_text,
-         actor_user_id, actor_role),
+        f"INSERT INTO content_edits ({cols}) VALUES ({marks}) RETURNING {_COLS}",
+        tuple(params),
     ).fetchone()
 
 
