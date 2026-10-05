@@ -1719,7 +1719,7 @@ def session_report_generate(conn, caller, session_id, event):
         "content": content,
         "resultKey": result_key,
         **({"generate": generate,
-            "window": {"from": (body.get("from") or "00:00"), "to": (body.get("to") or "23:59")},
+            "window": _report_window(body),
             "excludedTopics": _excluded_topics_for(
                 conn, caller, folder, date, session_id=session_id),
             "reportFacts": _report_facts(conn, caller["company_id"], folder,
@@ -2042,7 +2042,7 @@ def day_report_generate(conn, caller, date, event):
         "content": content,
         "resultKey": result_key,
         **({"generate": generate,
-            "window": {"from": (body.get("from") or "00:00"), "to": (body.get("to") or "23:59")},
+            "window": _report_window(body),
             "excludedTopics": _excluded_topics_for(conn, caller, folder, date),
             "reportFacts": _report_facts(conn, caller["company_id"], folder,
                                          content.get("siteIds"), date)} if generate else {}),
@@ -3675,6 +3675,21 @@ def get_day_inspections(conn, caller, date, event):
         dict(r, id=str(r["id"]),
              template_id=str(r["template_id"]) if r.get("template_id") else None)
         for r in rows]})
+
+
+_WINDOW_CLOCK_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$")
+
+
+def _report_window(body):
+    """The report's time window: 'HH:MM' or 'HH:MM:SS' each end (a spoken
+    check is timed to the second), else the whole day. A malformed end is the
+    whole day too, never a crash in the worker that parses it."""
+    frm, to = body.get("from") or "00:00", body.get("to") or "23:59"
+    if not _WINDOW_CLOCK_RE.match(str(frm)):
+        frm = "00:00"
+    if not _WINDOW_CLOCK_RE.match(str(to)):
+        to = "23:59"
+    return {"from": frm, "to": to}
 
 
 def _photo_selection_folder(conn, caller, date, event, write=False):
