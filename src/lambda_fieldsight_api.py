@@ -1290,6 +1290,10 @@ def trigger_report_generation(body, caller):
 def ask_question(body, caller):
     """Proxy question to Ask Agent Lambda. ACL is enforced downstream by
     rag-search via caller_sub (BUG-39 WS2) -- this proxy no longer gates."""
+    # Fail closed: without a sub the ask-agent would fall to a company-blind S3 read.
+    if not caller.get('sub'):
+        return error('sign-in required', 401)
+
     question = body.get('question', '').strip()
     date = body.get('date', '')
     user = body.get('user', '')
@@ -1409,6 +1413,10 @@ def corroborate_answer(body, caller):
     guard exists so an unhandled exception in the agent does not return a stack
     trace to the client, and this route needs it for exactly the same reason.
     """
+    # Fail closed: without a sub the ask-agent would fall to a company-blind S3 read.
+    if not caller.get('sub'):
+        return error('sign-in required', 401)
+
     question = body.get('question', '').strip()
     answer = body.get('answer', '').strip()
 
@@ -1463,8 +1471,10 @@ def ask_voice(body, caller):
     holds LambdaInvokePolicy on AskAgentFunction and the /api/{proxy+} route.
     caller identity comes from the Cognito authorizer claims -- never from the
     client body (mirrors ask_question's caller_sub bridge)."""
+    # Fail closed: without a sub the ask-agent would fall to a company-blind S3 read.
     if not caller.get('sub'):
-        return error('Unauthenticated', 401)
+        return error('sign-in required', 401)
+
     audio_b64 = body.get('audio')
     if not audio_b64 or not isinstance(audio_b64, str):
         return error('Missing audio (base64 clip required)')
@@ -1525,6 +1535,10 @@ def search_topics(body, caller):
     Returns a ranked topic list (no LLM synthesis). ACL is enforced downstream
     in rag-search (org accessible sites via caller_sub), so no per-user gate is
     needed here. date_from/date_to are an optional inclusive range."""
+    # Fail closed: without a sub the ask-agent would fall to a company-blind S3 read.
+    if not caller.get('sub'):
+        return error('sign-in required', 401)
+
     question = (body.get('question') or '').strip()
     if len(question) < 2:
         return ok({'results': [], 'count': 0})
@@ -1623,6 +1637,36 @@ def health_check(params):
 
 # ── Router ───────────────────────────────────────────────────
 
+def _ua_family(headers):
+    """Coarse client family from the User-Agent header; never the raw string."""
+    ua = ''
+    for k, v in (headers or {}).items():
+        if str(k).lower() == 'user-agent':
+            ua = v or ''
+            break
+    if not ua:
+        return 'none'
+    low = ua.lower()
+    if 'okhttp' in low or 'dalvik' in low:
+        return 'android'
+    if 'cfnetwork' in low or 'darwin' in low or 'iphone' in low or 'ios' in low:
+        return 'ios'
+    if low.startswith('mozilla/'):
+        return 'browser'
+    return 'other'
+
+
+# Literal routes the dispatcher below serves. LEGACY_CALL logs only these; any
+# other path is client-controlled (a 404) and is logged as 'other'.
+KNOWN_ROUTES = frozenset({
+    '/api/timeline', '/api/dates', '/api/media/presigned-url', '/api/reports/history',
+    '/api/reports/generate', '/api/users', '/api/sites', '/api/site-users',
+    '/api/transcripts', '/api/audio-segments', '/api/video-segments',
+    '/api/recording-stats', '/api/actions/toggle', '/api/actions', '/api/ask',
+    '/api/ask/voice', '/api/ask/corroborate', '/api/search',
+})
+
+
 def lambda_handler(event, context):
     logger.info(f"Request: {event.get('httpMethod','GET')} {event.get('path','/')}")
     method = event.get('httpMethod', 'GET').upper()
@@ -1637,6 +1681,13 @@ def lambda_handler(event, context):
     if path == '/api/health':
         return health_check(params)
     caller = get_caller_identity(event)
+    # Who still calls this gateway? Route/method/role/client family only --
+    # no query-param or body values (tenant content).
+    logger.info("LEGACY_CALL %s", json.dumps({
+        'route': path if path in KNOWN_ROUTES else 'other', 'method': method, 'role': caller.get('role', ''),
+        'has_sub': bool(caller.get('sub')),
+        'ua': _ua_family(event.get('headers')),
+    }, sort_keys=True))
     try:
         if path == '/api/timeline': return get_timeline(params, caller)
         elif path == '/api/dates': return get_dates(params, caller)
