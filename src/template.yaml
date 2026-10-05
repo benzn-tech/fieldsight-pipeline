@@ -5067,20 +5067,16 @@ Resources:
     Condition: ShouldCreateAlerts
     Properties:
       TopicName: !Sub ["${P}-pipeline-alerts", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
-
-  # Standalone, not the topic's inline `Subscription:`. The prod topic had ZERO
-  # subscriptions on 2026-10-05 (every alarm notified nobody). CloudFormation
-  # creates this once and does NOT repair it on later deploys; the gain is that it
-  # is a first-class resource in the stack (visible, and recreated if the resource
-  # is replaced or removed and re-added). The recipient must click AWS's
-  # confirmation email (prod and TEST) -- until then the subscription is pending.
-  AlertEmailSubscription:
-    Type: AWS::SNS::Subscription
-    Condition: ShouldCreateAlerts
-    Properties:
-      Protocol: email
-      Endpoint: !Ref AlertEmail
-      TopicArn: !Ref AlertTopic
+      # Inline, as before. A standalone subscription resource was tried on 2026-10-05
+      # and the TEST deploy failed: the GitHub deploy role may not call
+      # SNS:ListSubscriptionsByTopic, which CloudFormation needs once this property
+      # changes. CloudFormation never repairs the subscription either way: an
+      # unconfirmed email subscription expires and is deleted (prod had ZERO on
+      # 2026-10-05, so every alarm notified nobody). Check it with
+      # `aws sns list-subscriptions-by-topic` and re-subscribe by hand if empty.
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
 
   # ----------------------------------------------------------
   # CloudWatch Alarms
@@ -5305,37 +5301,8 @@ Resources:
       AlarmActions:
         - !Ref AlertTopic
 
-  # A recording whose folder has no directory row is written to S3 and then
-  # dropped by ingest/item-writer with an exception -- one that the Lambda Errors
-  # alarm sees only as a count, long after the cause. These filters turn the
-  # specific message into its own metric (Deandre, 2026-10-05: 21 raises, 45
-  # minutes of recording invisible on the web). The log groups are the Lambdas'
-  # implicit /aws/lambda/<name> groups (not template resources), so they exist
-  # once the function has run once; both functions are behind HasDb.
-  StrandedRecordingItemWriterFilter:
-    Type: AWS::Logs::MetricFilter
-    Condition: HasDb
-    Properties:
-      LogGroupName: !Sub /aws/lambda/${ItemWriterFunction}
-      FilterPattern: '"has no directory row"'
-      MetricTransformations:
-        - MetricNamespace: FieldSight
-          MetricName: StrandedRecording
-          MetricValue: "1"
-
-  StrandedRecordingIngestFilter:
-    Type: AWS::Logs::MetricFilter
-    Condition: HasDb
-    Properties:
-      LogGroupName: !Sub /aws/lambda/${IngestFunction}
-      FilterPattern: '"has no directory row"'
-      MetricTransformations:
-        - MetricNamespace: FieldSight
-          MetricName: StrandedRecording
-          MetricValue: "1"
-
-  # Needs ShouldAlarmItemWriter (alerts on AND HasDb), not just ShouldCreateAlerts:
-  # the metric filters it watches exist only when the database stack is configured.
+  # Counted by an EMF line from lambda_ingest.unknown_folder_error (shared with the
+  # item-writer): `logs:PutMetricFilter` is denied to the deploy role, EMF needs none.
   RecordingStrandedAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: ShouldAlarmItemWriter
@@ -5347,6 +5314,9 @@ Resources:
         scripts/replay_extractions.py.
       Namespace: FieldSight
       MetricName: StrandedRecording
+      Dimensions:
+        - Name: Stage
+          Value: !Ref Stage
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1

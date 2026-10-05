@@ -150,12 +150,41 @@ def resolve_company(conn, user_folder):
     return None
 
 
+def _emit_stranded_metric(user_folder):
+    """One EMF line counting a recording stranded by an unknown folder. Printed, not
+    logged (EMF needs bare JSON). Never raises."""
+    try:
+        import time as _t
+
+        print(json.dumps({
+            "_aws": {
+                "Timestamp": int(_t.time() * 1000),
+                "CloudWatchMetrics": [{
+                    "Namespace": "FieldSight",
+                    "Dimensions": [["Stage"]],
+                    "Metrics": [{"Name": "StrandedRecording", "Unit": "Count"}],
+                }],
+            },
+            "Stage": os.environ.get("STAGE", "unknown"),
+            "StrandedRecording": 1,
+            "folder": user_folder,
+        }))
+    except Exception:
+        logger.warning("could not emit the stranded-recording metric for %s", user_folder)
+
+
 def unknown_folder_error(user_folder):
     """The error for a lake object whose folder no directory row claims.
     Shared with lambda_item_writer, which reuses this module by import.
 
     It used to say "run the org seed". The seed does not fix this -- and
-    running it moved every person of every tenant into one company."""
+    running it moved every person of every tenant into one company.
+
+    Also emits the StrandedRecording metric (alarm `${P}-recording-stranded`): the
+    recording is in S3 and will never reach Aurora until someone fixes the folder.
+    Embedded Metric Format, like lambda_transcribe._emit_failure_metric --
+    `logs:PutMetricFilter` is denied to the deploy role, EMF needs no permission."""
+    _emit_stranded_metric(user_folder)
     return RuntimeError(
         f"folder {user_folder!r} has no directory row; not ingesting rather "
         "than guessing a tenant")
