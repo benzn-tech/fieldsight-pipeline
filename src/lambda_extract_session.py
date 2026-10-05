@@ -952,7 +952,20 @@ def time_location_markers(markers, turns):
     A quote that cannot be found (paraphrased, or said outside the window) is
     not guessed at: the marker keeps its minute, which is what it had before.
     """
-    stream = []                      # (token, second of day), in time order
+    stream = _word_stream(turns)
+    if not stream:
+        return markers
+    out = []
+    for m in markers:
+        timed = _time_one_marker(m, stream)
+        out.append(timed if timed is not None else m)
+    return out
+
+
+def _word_stream(turns):
+    """[(token, second of day)] for every word of the session, in time order --
+    through the batch map where a turn has one (word_abs)."""
+    stream = []
     for t in turns or []:
         start = t.get('abs_start')
         words = t.get('words') or []
@@ -969,13 +982,72 @@ def time_location_markers(markers, turns):
             for tok in _marker_tokens(word):
                 stream.append((tok, when))
     stream.sort(key=lambda x: x[1])
-    if not stream:
-        return markers
+    return stream
+
+
+def _hms(sec):
+    sec = int(sec)
+    return '%02d:%02d:%02d' % (sec // 3600, sec % 3600 // 60, sec % 60)
+
+
+def clean_inspections(raw):
+    """The model's inspections, or [] -- the same all-or-nothing rule as
+    clean_location_markers: a check with no name or no start cannot open a
+    window, so it is dropped, never repaired."""
     out = []
-    for m in markers:
-        timed = _time_one_marker(m, stream)
-        out.append(timed if timed is not None else m)
+    for m in (raw or []):
+        if not isinstance(m, dict):
+            continue
+        name, start = m.get('name'), m.get('start_at')
+        if not name or not start:
+            continue
+        end = m.get('end_at')
+        out.append({'name': str(name)[:120],
+                    'kind': str(m.get('kind') or '')[:80],
+                    'start_at': str(start)[:5],
+                    'start_quote': str(m.get('start_quote') or '')[:300],
+                    'end_at': str(end)[:5] if end else None,
+                    'end_quote': str(m.get('end_quote') or '')[:300] if end else None})
     return out
+
+
+def time_inspections(items, turns):
+    """Each check's window, to the second (voice-triggered checklists, owner
+    2026-09-30): it opens where the start was said and closes where he said it
+    was finished -- or, when he never did, where the recording stopped
+    (`end_source`: "said" | "recording_stop"). A quote that cannot be found
+    keeps the model's minute, as markers do."""
+    stream = _word_stream(turns)
+    ends = [t.get('abs_end') or t.get('abs_start') for t in turns or []
+            if (t.get('abs_end') or t.get('abs_start')) is not None]
+    stop = _hms(_second_of_day(max(ends))) if ends else None
+    out = []
+    for m in items:
+        m = dict(m)
+        st = _time_one_marker({'at': m['start_at'], 'quote': m['start_quote']}, stream) \
+            if stream else None
+        m['start_at_s'] = st['at_s'] if st else None
+        if m.get('end_at'):
+            en = _time_one_marker({'at': m['end_at'], 'quote': m.get('end_quote')}, stream) \
+                if stream else None
+            m['end_at_s'] = en['at_s'] if en else None
+            m['end_source'] = 'said'
+        else:
+            m['end_at_s'] = stop
+            m['end_at'] = stop[:5] if stop else None
+            m['end_source'] = 'recording_stop'
+        out.append(m)
+    return out
+
+
+def _timed_inspections(raw, turns):
+    items = clean_inspections(raw)
+    try:
+        return time_inspections(items, turns)
+    except Exception:
+        logger.warning("inspections: could not time the windows; keeping the model's "
+                       "minutes", exc_info=True)
+        return items
 
 
 def _time_one_marker(marker, stream):
@@ -1006,9 +1078,7 @@ def _time_one_marker(marker, stream):
             best = (key, when)
     if best is None:
         return None
-    sec = int(best[1])
-    at_s = '%02d:%02d:%02d' % (sec // 3600, sec % 3600 // 60, sec % 60)
-    return dict(marker, at_s=at_s)
+    return dict(marker, at_s=_hms(best[1]))
 
 
 
@@ -1034,6 +1104,16 @@ EXTRACTION_SCHEMA = """{
       "at": "HH:MM  (the timestamp of the utterance itself)",
       "location": "the place named, e.g. Room 101 / Level 5 east",
       "quote": "the words that established it, verbatim"
+    }
+  ],
+  "inspections": [
+    {
+      "name": "the check as he named it, e.g. Level 1 pre-pour inspection",
+      "kind": "the TYPE of check without the place, e.g. pre-pour / steel / fire stopping",
+      "start_at": "HH:MM  (when he said he was starting it)",
+      "start_quote": "those words, verbatim",
+      "end_at": "HH:MM when he said it was finished, or null",
+      "end_quote": "those words, verbatim, or null"
     }
   ],
   "topics": [
@@ -1150,6 +1230,19 @@ def _instructions_block():
      marker can be diagnosed instead of guessed at.
    - Most meeting recordings contain NONE of these. An empty array is the normal answer and is
      strongly preferred over a marker you are unsure about.
+0b. INSPECTIONS. Note every check or inspection the speaker says he is STARTING now -- "starting
+   the pre-pour concrete check", "doing the level two steel inspection", "here is the Te Kaha
+   room inspection" -- and, if he says so, where it FINISHED -- "pre-pour check done", "that's the
+   steel inspection finished". These open the checklist for that check, for exactly that stretch
+   of the recording.
+   - One entry per check he performs. Going away and coming back to it ("back to the level one
+     pre-pour") is the SAME entry, not a new one.
+   - `kind` is the type of check with the place left out ("pre-pour", "steel", "fire stopping");
+     `name` is what he called it, place included.
+   - end_at is null when he never says it ended -- do not guess an end.
+   - Do NOT record a check only discussed, planned or described ("we need the fire stopping
+     inspection next week", "this is how an inspection works"). An empty array is the normal
+     answer for a meeting.
 1. Split the transcript into topics BY SUBJECT -- one topic per distinct subject or work item.
    - Start a NEW topic whenever the conversation moves to a genuinely DIFFERENT subject (a
      different work item, trade, location, or concern) -- even if only a minute passes, even if the
@@ -2040,7 +2133,13 @@ def _trace_extraction(out, final, seconds):
         "pass": "final" if final else "live", "generation": out.get("generation"),
         "topics": len(out.get("topics") or []), "location_markers": len(markers),
         "markers_timed": sum(1 for m in markers if m.get("at_s")),
+        "inspections": len(out.get("inspections") or []),
         "declared_site": bool(out.get("declared_site"))})
+    for i in out.get("inspections") or []:
+        pipeline_trace.event("inspection", i.get("end_source") or "ok", detail={
+            "name": i.get("name"), "kind": i.get("kind"), "start": i.get("start_at_s")
+            or i.get("start_at"), "end": i.get("end_at_s") or i.get("end_at")},
+            evidence=i.get("start_quote"))
     for m in markers:
         pipeline_trace.event("location_marker", "timed" if m.get("at_s") else "minute_only",
                              detail={"location": m.get("location"), "at": m.get("at"),
@@ -2290,6 +2389,10 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
         # `at` and a `location` is dropped, which makes "no markers" and
         # "markers the shape of nonsense" the same, safe answer.
         'location_markers': _timed_markers(parsed.get('location_markers'), turns),
+        # Checks he said he was starting / had finished, each a window to the
+        # second (voice-triggered checklists). item-writer matches each to the
+        # company's checklist templates.
+        'inspections': _timed_inspections(parsed.get('inspections'), turns),
         'topics': parsed_topics,
         # Where each speaker label was heard, for the anonymous re-bind. Carried HERE, on the
         # final pass only, because of who can do what: this function has the turns and no
