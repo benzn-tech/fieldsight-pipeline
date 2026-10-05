@@ -312,7 +312,7 @@ def _eligible_windows(p_minutes, windows, topic_sessions, session_spans):
 
 
 def photos_for_topics(photo_objects, topics, *, topic_sessions=None,
-                      session_spans=None, markers=None):
+                      session_spans=None, markers=None, explain=None):
     """PURE. photo_objects: [{key, filename, hhmm}] -- hhmm ('HH:MM') is
     already derived by the caller (list_pictures) from the BUG-01-safe
     transcript_utils filename extractor. topics: the topic dicts of an
@@ -340,6 +340,11 @@ def photos_for_topics(photo_objects, topics, *, topic_sessions=None,
     `markers` (the day's location markers, [{at, location}]) is opt-in the
     same way: with them, a photo taken during a location stay goes to the
     topic that stay belongs to, before any clock rule -- see _location_owner.
+
+    `explain`, when a dict, is filled with why each photo went where it did:
+    {photo key: "location" | "clock" | "carried" | "capped" | "unbound"} -- for
+    the recording's trace (pipeline_trace), so "why is this photo here" has an
+    answer after the fact.
 
     NOTE: the `topics` parameter name intentionally shadows the callers'
     `repositories.topics` import -- this function is pure and never touches
@@ -381,6 +386,8 @@ def photos_for_topics(photo_objects, topics, *, topic_sessions=None,
         if owner is not None and len(result[owner]) < PHOTOS_PER_TOPIC_CAP:
             result[owner].append(p)
             by_location += 1
+            if explain is not None:
+                explain[p.get("key")] = "location"
             continue
         # Qualifying candidates only: inside the window, or within
         # PHOTO_TOLERANCE_MIN minutes of an edge. Beyond that a topic does
@@ -403,6 +410,8 @@ def photos_for_topics(photo_objects, topics, *, topic_sessions=None,
             logger.info("photo %s dropped: no topic window within %d min and "
                         "nothing said in the %d min before it",
                         p.get("key"), PHOTO_TOLERANCE_MIN, PHOTO_CARRY_FORWARD_MIN)
+            if explain is not None:
+                explain[p.get("key")] = "unbound"
             continue
         if carried:
             carried_count += 1
@@ -417,8 +426,12 @@ def photos_for_topics(photo_objects, topics, *, topic_sessions=None,
         target = next((i for i in order if len(result[i]) < PHOTOS_PER_TOPIC_CAP), None)
         if target is None:
             capped += 1
+            if explain is not None:
+                explain[p.get("key")] = "capped"
             continue
         result[target].append(p)
+        if explain is not None:
+            explain[p.get("key")] = "carried" if carried else "clock"
     # ONE line, not one per photo, and info rather than warning.
     #
     # It used to warn per photo, which was right while a capped photo was LOST:

@@ -28,6 +28,7 @@ import lambda_meeting_minutes
 import llm_utils
 import nz_time
 import photo_binding
+import pipeline_trace
 import report_facts
 import report_photos
 import report_template
@@ -829,6 +830,7 @@ def _generate_document(artifact, context=None):
     # so the model never sees the wrong spelling to copy (owner, 2026-10-02).
     glossary = (artifact.get("reportFacts") or {}).get("aliases") or []
     if glossary:
+        _trace_glossary(artifact.get("content") or {}, glossary)
         artifact["content"] = _glossed(artifact.get("content") or {}, glossary)
     content = artifact.get("content") or {}
     date = artifact.get("date") or content.get("date")
@@ -1079,12 +1081,16 @@ def process_request(artifact, context=None):
             buf, meta = _generate_document(artifact, context)
         except Exception as exc:                      # noqa: BLE001 -- recorded, not retried
             logger.exception("report: generation failed for %s", artifact.get("requestId"))
+            pipeline_trace.event("template_report", "error",
+                                 detail={"error": type(exc).__name__,
+                                         "template": (artifact.get("generate") or {}).get("templateName")})
             _write_result(artifact["resultKey"],
                           dict({"status": "error", "requestId": artifact.get("requestId"),
                                 "error": _failure_message(exc)},
                                **_scope_result_fields(artifact)))
             return
         doc_key = _put_document(artifact, buf)
+        _trace_report(meta)
         _write_result(artifact["resultKey"],
                       dict({"status": "done", "requestId": artifact.get("requestId"),
                             "docKey": doc_key, "emailed": False}, **meta,
@@ -1112,6 +1118,42 @@ def process_request(artifact, context=None):
         logger.exception("session report generation failed for %s", request_id)
         _write_result(result_key, {"status": "error", "requestId": request_id,
                                    "error": _failure_message(e), **scope_fields})
+
+
+def _trace_glossary(content, glossary):
+    """Which glossary terms this report's text actually contained -- the
+    keyword hits -- and the ones it did not, on the recording's trace."""
+    try:
+        text = json.dumps(content, ensure_ascii=False)
+        for a in glossary:
+            n = text_normalize.occurrences(text, a.get("wrong_term"))
+            pipeline_trace.event("glossary", "applied" if n else "no_match",
+                                 detail={"wrong_term": a.get("wrong_term"),
+                                         "right_term": a.get("right_term"), "replaced": n})
+    except Exception:
+        logger.debug("glossary trace skipped", exc_info=True)
+
+
+def _trace_report(meta):
+    """The template report on the recording's trace: which template, what the
+    code wrote, where the photos went, and each checklist -- items answered,
+    and which were dropped and why. Counts and names only."""
+    pipeline_trace.event("template_report", "ok", detail={
+        "template": meta.get("templateName"), "version": meta.get("templateVersion"),
+        "model": meta.get("model"), "topics_offered": meta.get("topicsOffered"),
+        "topics_not_referenced": len(meta.get("topicsNotReferenced") or []),
+        "lines_without_a_topic": len(meta.get("linesWithoutATopic") or []),
+        "code_filled": sorted((meta.get("codeFilled") or {}).keys()),
+        "photos_placed": meta.get("photosPlaced"), "photos_unplaced": meta.get("photosUnplaced"),
+        "photos_left_out": meta.get("photosLeftOut")})
+    for title, rep in (meta.get("checklists") or {}).items():
+        rep = rep or {}
+        pipeline_trace.event(
+            "checklist", "omitted_by_model" if rep.get("omitted_by_model")
+            else ("answered" if rep.get("answered") else "no_match"),
+            detail={"checklist": title, "items": rep.get("items"),
+                    "answered": rep.get("answered"),
+                    "dropped": [d.get("reason") for d in rep.get("dropped") or []]})
 
 
 def _failure_message(exc):
@@ -1145,5 +1187,11 @@ def lambda_handler(event, context):
         key = unquote_plus(key)          # S3 notifications URL-encode the key
         obj = s3().get_object(Bucket=bucket, Key=key)
         artifact = json.loads(obj["Body"].read().decode("utf-8"))
-        process_request(artifact, context)
+        pipeline_trace.begin("session-report", user_folder=artifact.get("folder"),
+                             date=artifact.get("date"), session=artifact.get("sessionId"),
+                             company_id=artifact.get("companyId"))
+        try:
+            process_request(artifact, context)
+        finally:
+            pipeline_trace.flush(s3, S3_BUCKET)
     return {"ok": True}

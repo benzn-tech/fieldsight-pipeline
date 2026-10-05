@@ -73,3 +73,12 @@ def log_usage(provider, model, caller, elapsed, prompt_tokens=None,
         cache_read_tokens if cache_read_tokens is not None else "-",
         cache_write_tokens if cache_write_tokens is not None else "-",
     )
+    # The same call, onto the recording's trace when one is being collected
+    # (pipeline_trace): how many model calls a step made, by whom, at what cost.
+    try:
+        import pipeline_trace
+        pipeline_trace.llm_call(caller, provider, model, elapsed,
+                                prompt_tokens=prompt_tokens,
+                                completion_tokens=completion_tokens)
+    except Exception:
+        pass

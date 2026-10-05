@@ -33,6 +33,7 @@ Nothing about the matcher changed. It is called ONCE, for the whole day.
 import logging
 
 import photo_binding
+import pipeline_trace
 from repositories import location_markers, recordings, topics
 
 logger = logging.getLogger()
@@ -50,6 +51,23 @@ def session_of(source_s3_key):
         return None
     tail = source_s3_key.rsplit("/", 1)[-1]
     return tail[:-5] if tail.endswith(".json") else tail
+
+
+def _trace(photo_objects, day_topics, bound, why, markers):
+    """Each photograph's placement, and the reason, on the recording's trace."""
+    where = {p["key"]: {"id": str(day_topics[i].get("id")), "title": day_topics[i].get("title")}
+             for i, ps in bound.items() for p in ps}
+    counts = {}
+    for p in photo_objects:
+        reason = why.get(p["key"], "unbound")
+        counts[reason] = counts.get(reason, 0) + 1
+        pipeline_trace.event("photo_placed", reason, detail={
+            "photo": p.get("filename"), "taken": p.get("hhmmss") or p.get("hhmm"),
+            "topic": where.get(p["key"]),
+            "place": photo_binding.place_at(markers, p.get("hhmmss") or p.get("hhmm"))})
+    pipeline_trace.event("photo_binding", "ok", detail=dict(
+        {"photos": len(photo_objects), "topics": len(day_topics),
+         "location_markers": len(markers or [])}, **counts))
 
 
 def rebind_day_photos(conn, company_id, user_folder, date, photo_objects):
@@ -81,6 +99,7 @@ def rebind_day_photos(conn, company_id, user_folder, date, photo_objects):
     """
     conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
                  (f"photobind:{user_folder}:{date}",))
+    pipeline_trace.identify(company_id=company_id)
     day_topics = topics.list_day_topics_for_binding(conn, user_folder, date)
 
     topic_sessions, spans = {}, {}
@@ -108,10 +127,12 @@ def rebind_day_photos(conn, company_id, user_folder, date, photo_objects):
         logger.warning("photo rebind %s/%s: location markers unreadable, binding "
                        "by time only", user_folder, date, exc_info=True)
         markers = []
+    why = {}
     bound = photo_binding.photos_for_topics(
         photo_objects, day_topics,
         topic_sessions=topic_sessions, session_spans=spans or None,
-        markers=markers)
+        markers=markers, explain=why)
+    _trace(photo_objects, day_topics, bound, why, markers)
 
     rows = []
     for i, photos in bound.items():

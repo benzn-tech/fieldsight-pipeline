@@ -1930,6 +1930,10 @@ Resources:
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_reports/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_report_results/*
+            # pipeline_trace: what this step did with a recording (traces/, 180 days).
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/traces/*
             - Effect: Allow
               # This function had no ListBucket statement at all. GetObject alone
               # is not enough for the mirror: without ListBucket on the prefix S3
@@ -2500,6 +2504,10 @@ Resources:
                 - s3:GetObject
                 - s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/report_photo_selection/*
+            # pipeline_trace: what this step did with a recording (traces/, 180 days).
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/traces/*
             # A speaker correction, handed OUTWARD across the VPC boundary the same way.
             # Write only, and no grant on voiceprint_results/: those go to the in-VPC
             # writer by direct invoke from the embedder, and a read grant here would be an
@@ -2701,6 +2709,10 @@ Resources:
                 # dropped and the session keeps fast-tier topics forever — the
                 # exact silent-degradation shape a missing grant caused before.
                 - !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
+            # pipeline_trace: what this step did with a recording (traces/, 180 days).
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/traces/*
             # gather_session_segments paginates transcripts/. extractions/ is
             # here for a different reason: S3 only answers 404 NoSuchKey for a
             # missing object to a caller holding ListBucket for that key —
@@ -3629,6 +3641,10 @@ Resources:
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/voiceprint_requests/*
+            # pipeline_trace: what this step did with a recording (traces/, 180 days).
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/traces/*
             - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
