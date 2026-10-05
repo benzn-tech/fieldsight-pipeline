@@ -52,6 +52,38 @@ def normalize_weather(data, date):
     }
 
 
+def _n(x):
+    """12.0 -> '12', 11.8 -> '11.8'."""
+    return ("%.1f" % x).rstrip("0").rstrip(".") if isinstance(x, (int, float)) else str(x)
+
+
+def summary_lines(daily):
+    """The day's weather as short facts, in the owner's wording (2026-10-05):
+
+        Light drizzle
+        Temperature range: 11.8°C – 18.4°C
+        Rainfall: 0.3mm
+        Max wind speed: 16.2 km/h
+
+    One wording for Today and the reports, written here so the two cannot
+    say the same day differently. A fact the source did not give is left out
+    rather than shown empty. [] for no block."""
+    if not daily:
+        return []
+    out = []
+    label = daily.get("condition_label")
+    if label and label != "Unknown":
+        out.append(label)
+    if daily.get("temp_min_c") is not None and daily.get("temp_max_c") is not None:
+        out.append("Temperature range: %s°C – %s°C"
+                   % (_n(daily["temp_min_c"]), _n(daily["temp_max_c"])))
+    if daily.get("precip_mm") is not None:
+        out.append("Rainfall: %smm" % _n(daily["precip_mm"]))
+    if daily.get("windspeed_kmh") is not None:
+        out.append("Max wind speed: %s km/h" % _n(daily["windspeed_kmh"]))
+    return out
+
+
 def weather_prompt_block(weather):
     """Pure. Factual weather sentence + correlation guardrail injected into
     the Claude report prompt -- ground any observation linkage in the actual
