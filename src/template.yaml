@@ -5035,9 +5035,20 @@ Resources:
     Condition: ShouldCreateAlerts
     Properties:
       TopicName: !Sub ["${P}-pipeline-alerts", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
-      Subscription:
-        - Protocol: email
-          Endpoint: !Ref AlertEmail
+
+  # Standalone, not the topic's inline `Subscription:`. The prod topic had ZERO
+  # subscriptions on 2026-10-05 (every alarm notified nobody). CloudFormation
+  # creates this once and does NOT repair it on later deploys; the gain is that it
+  # is a first-class resource in the stack (visible, and recreated if the resource
+  # is replaced or removed and re-added). The recipient must click AWS's
+  # confirmation email (prod and TEST) -- until then the subscription is pending.
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: ShouldCreateAlerts
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+      TopicArn: !Ref AlertTopic
 
   # ----------------------------------------------------------
   # CloudWatch Alarms
@@ -5253,6 +5264,57 @@ Resources:
       Dimensions:
         - Name: FunctionName
           Value: !Ref ItemWriterFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # A recording whose folder has no directory row is written to S3 and then
+  # dropped by ingest/item-writer with an exception -- one that the Lambda Errors
+  # alarm sees only as a count, long after the cause. These filters turn the
+  # specific message into its own metric (Deandre, 2026-10-05: 21 raises, 45
+  # minutes of recording invisible on the web). The log groups are the Lambdas'
+  # implicit /aws/lambda/<name> groups (not template resources), so they exist
+  # once the function has run once; both functions are behind HasDb.
+  StrandedRecordingItemWriterFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: HasDb
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ItemWriterFunction}
+      FilterPattern: '"has no directory row"'
+      MetricTransformations:
+        - MetricNamespace: FieldSight
+          MetricName: StrandedRecording
+          MetricValue: "1"
+
+  StrandedRecordingIngestFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: HasDb
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${IngestFunction}
+      FilterPattern: '"has no directory row"'
+      MetricTransformations:
+        - MetricNamespace: FieldSight
+          MetricName: StrandedRecording
+          MetricValue: "1"
+
+  # Needs ShouldAlarmItemWriter (alerts on AND HasDb), not just ShouldCreateAlerts:
+  # the metric filters it watches exist only when the database stack is configured.
+  RecordingStrandedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldAlarmItemWriter
+    Properties:
+      AlarmName: !Sub ["${P}-recording-stranded", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      AlarmDescription: >-
+        A recording's folder has no directory row: its audio and extraction are in
+        S3 but never reach Aurora. Fix the folder, then replay with
+        scripts/replay_extractions.py.
+      Namespace: FieldSight
+      MetricName: StrandedRecording
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1
