@@ -16,7 +16,7 @@ import unicodedata
 _DROPPED = {"'", "’"}        # apostrophes vanish: O'Brien -> OBrien
 _OUTSIDE = re.compile(r"[^A-Za-z0-9._-]")
 _HAS_ALNUM = re.compile(r"[A-Za-z0-9]")
-KEY_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+KEY_RE = re.compile(r"[A-Za-z0-9._-]+")   # use .fullmatch (never .match: no `$`)
 
 
 def folder_key(display_name):
@@ -27,7 +27,9 @@ def folder_key(display_name):
     text = unicodedata.normalize("NFKD", (display_name or "").strip())
     text = "".join(c for c in text
                    if not unicodedata.combining(c) and c not in _DROPPED)
-    key = _OUTSIDE.sub("_", text)
+    # Leading underscores are what a dropped leading character (a CJK first name)
+    # leaves behind; trailing (`Ben_`, a NULL last name) and inner (`A__B`) stay.
+    key = _OUTSIDE.sub("_", text).lstrip("_")
     return key if _HAS_ALNUM.search(key) else None
 
 

@@ -30,8 +30,9 @@ CJK = "王伟"
     ("a/b:c", "a_b_c"),
     ("Mary-Jane.Smith", "Mary-Jane.Smith"),
     (CJK, None),                                  # CJK only
+    ("_foo", "foo"), ("a\n", "a"),
     ("", None), (None, None), ("___", None), ("'", None),
-    (CJK + " Li", "___Li"),                        # mixed: the kept characters survive
+    (CJK + " Li", "Li"),                        # mixed: the kept characters survive
 ])
 def test_folder_key(name, expected):
     assert fk.folder_key(name) == expected
@@ -140,7 +141,7 @@ def test_an_invalid_stored_folder_is_refused_with_no_row_and_no_presign(upload, 
     mp.setattr(org.users, "get_user_by_sub",
                lambda conn, sub: {**DEANDRE, "folder_name": "Deandre'_Alberts"})
     res = _post()
-    assert res["statusCode"] == 409
+    assert res["statusCode"] == 422
     assert "folder is invalid" in json.loads(res["body"])["error"]
     assert state["inserted"] == [] and s3.presigned == []
     assert any(r.levelname == "ERROR" for r in caplog.records)
@@ -213,3 +214,81 @@ def test_an_admin_typed_value_with_no_usable_characters_is_a_400(patch):
 def test_the_field_only_writer_refuses_a_bad_key_before_touching_the_database():
     with pytest.raises(ValueError):
         users_repo.upsert_field_only_user(None, "c", "Deandre'_Alberts", "D", "A", "worker")
+
+
+# ---- review fix round 1 ------------------------------------------------------------
+
+def test_a_trailing_newline_is_not_a_folder_key():
+    assert fk.KEY_RE.fullmatch("abc\n") is None
+    with pytest.raises(ValueError):
+        users_repo.upsert_field_only_user(None, "c", "abc\n", "D", "A", "worker")
+
+
+def test_a_cjk_first_name_does_not_leave_leading_underscores(monkeypatch):
+    _free(monkeypatch)
+    assert org._free_folder_name(None, CJK + "_Li", "s", "abcdef12-0") == "Li"
+
+
+def test_a_name_that_is_only_underscores_after_stripping_takes_the_id_fallback(monkeypatch):
+    _free(monkeypatch)
+    assert fk.folder_key(CJK + "_" + CJK) is None
+    assert org._free_folder_name(None, CJK + "_" + CJK, "s", "abcdef12-0") == "u_abcdef12"
+
+
+def test_a_resend_for_an_invalid_stored_folder_returns_the_existing_key(upload):
+    mp, s3, state = upload
+    mp.setattr(org.users, "get_user_by_sub",
+               lambda conn, sub: {**DEANDRE, "folder_name": "Deandre'_Alberts"})
+    mp.setattr(org.recordings, "get_by_client_uuid",
+               lambda c, u, cu: {"id": "rec-0", "s3_key": "users/Deandre__Alberts/audio/x/a.wav"})
+    res = _post()
+    assert res["statusCode"] == 200
+    assert json.loads(res["body"])["s3Key"] == "users/Deandre__Alberts/audio/x/a.wav"
+    assert state["inserted"] == []
+
+
+def _old_rule(name):
+    import re
+    return re.sub(r'[<>:"/\\|?*\s]', "_", (name or "").strip())
+
+
+CORPUS = ["Ben Lin", "Ben_", "Ben_UCPK_", "Neil Blunden", "Amy  Rose", "Mary-Jane Smith",
+          "J.R. Smith", "Deandre__Alberts", "Ada_L", "Al\tBo", "a<b>c", 'q"r', "x|y?z*w",
+          "_Hidden", "__Two", "-", "...", "Bob_2", "u_abcdef12", "Li Wei", "ABC123"]
+
+
+@pytest.mark.parametrize("name", CORPUS)
+def test_folder_key_equals_the_old_rule_wherever_the_old_output_was_valid(name):
+    """Exceptions (deliberate, all NEW-user-only): a leading underscore is stripped, and a
+    name with no letter/digit ("-", "...") now gets the id fallback (None here)."""
+    import re
+    old = _old_rule(name)
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", old):
+        pytest.skip("old output was already invalid")
+    new = fk.folder_key(name)
+    if not re.search(r"[A-Za-z0-9]", old):
+        assert new is None
+    else:
+        assert new == old.lstrip("_")
+
+
+def _enrol_caller(**kw):
+    return {**DEANDRE, **kw}
+
+
+def test_enrol_fallback_when_the_write_fails_keeps_a_minted_name_plus_id(monkeypatch):
+    _free(monkeypatch)
+
+    def boom(conn, sub, f):
+        raise RuntimeError("x")
+    monkeypatch.setattr(org.users, "set_folder_name", boom)
+    out = org._enrol_folder_on_upload(FakeConn(), _enrol_caller())
+    assert out == "Deandre_Alberts_d3a4d5e6"
+
+
+def test_enrol_fallback_for_a_cjk_name_with_no_id_is_u_unknown(monkeypatch):
+    _free(monkeypatch)
+    out = org._enrol_folder_on_upload(
+        FakeConn(), _enrol_caller(id=None, first_name=CJK, last_name=CJK))
+    assert out == "u_unknown"
+    assert org._safe_seg(out) == out

@@ -966,12 +966,13 @@ def create_recording_upload_url(conn, caller, body, device_ident=None):
         # it in this route is how `Deandre'_Alberts` became `Deandre__Alberts` on S3
         # while the directory said otherwise (2026-10-05). A stored folder that
         # _safe_seg would change is refused loudly -- on a retryable route -- rather
-        # than written under a folder no directory row owns.
+        # than written under a folder no directory row owns. 422, not 409: 409 here
+        # already means "s3 key already exists" (a duplicate a client may drop).
         if _safe_seg(display_name) != display_name:
             logger.error("upload-url: user %s has an invalid folder_name %r "
                          "(not [A-Za-z0-9._-]) -- refusing; recording would be stranded",
                          caller.get("id"), display_name)
-            return error("recording folder is invalid; ask an admin", 409)
+            return error("recording folder is invalid; ask an admin", 422)
         key = _recording_s3_key(display_name, kind, started_at, file_name)
         try:
             # Resolved BEFORE the transaction opens, not inside it. `device_id`

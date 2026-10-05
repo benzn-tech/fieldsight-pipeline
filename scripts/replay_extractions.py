@@ -26,7 +26,7 @@ ENVS = {
              "function": "fieldsight-test-item-writer"},
 }
 REGION = "ap-southeast-2"
-_FOLDER_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_FOLDER_RE = re.compile(r"[A-Za-z0-9._-]+")
 
 
 def _date(value):
@@ -37,7 +37,7 @@ def _date(value):
 
 
 def _folder(value):
-    if not _FOLDER_RE.match(value):
+    if not _FOLDER_RE.fullmatch(value):
         raise argparse.ArgumentTypeError(
             f"{value!r} is not a folder key ([A-Za-z0-9._-] only)")
     return value

@@ -5069,10 +5069,11 @@ Resources:
       TopicName: !Sub ["${P}-pipeline-alerts", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
 
   # Standalone, not the topic's inline `Subscription:`. The prod topic had ZERO
-  # subscriptions on 2026-10-05 (every alarm notified nobody): an inline
-  # subscription is only reconciled when the topic itself changes, so a lost one
-  # is never recreated. A standalone resource is recreated by any deploy. The
-  # recipient must click AWS's confirmation email once.
+  # subscriptions on 2026-10-05 (every alarm notified nobody). CloudFormation
+  # creates this once and does NOT repair it on later deploys; the gain is that it
+  # is a first-class resource in the stack (visible, and recreated if the resource
+  # is replaced or removed and re-added). The recipient must click AWS's
+  # confirmation email (prod and TEST) -- until then the subscription is pending.
   AlertEmailSubscription:
     Type: AWS::SNS::Subscription
     Condition: ShouldCreateAlerts

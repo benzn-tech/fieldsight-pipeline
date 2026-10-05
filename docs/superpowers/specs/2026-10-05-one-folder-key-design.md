@@ -27,7 +27,7 @@ notifies nobody.
    Used by `_free_folder_name`, `patch_member_folder`, `_enrol_folder_on_upload`, and
    `users.upsert_field_only_user`'s callers. Display names are never altered.
 2. **The upload route never re-cleanses.** It uses `users.folder_name` verbatim; if
-   `_safe_seg(folder) != folder` it refuses (409, `"recording folder is invalid; ask an admin"`)
+   `_safe_seg(folder) != folder` it refuses (422 -- not 409, which the same route uses for a duplicate key -- `"recording folder is invalid; ask an admin"`)
    and logs ERROR — a loud refusal on a retryable route beats a recording written under a
    folder no one owns.
 3. **The database refuses a bad key**: migration `0081` adds
@@ -36,8 +36,11 @@ notifies nobody.
 4. **A stranded recording is noticed**: a log metric filter on `has no directory row` over
    the item-writer and ingest log groups, its own alarm ("recording stranded: folder not in
    directory"), and the alert topic's email subscription becomes a standalone
-   `AWS::SNS::Subscription` resource so a lost subscription is recreated by a deploy
-   (the owner must click the AWS confirmation email once).
+   `AWS::SNS::Subscription` resource. CloudFormation creates it once and does not repair it
+   on later deploys; what changes is that it is a first-class resource in the stack
+   (visible, and recreated if the resource is replaced or removed and re-added). The owner
+   must confirm the AWS email on prod and on TEST (TEST's inline subscription is replaced
+   by a new, pending one).
 5. **One-command recovery**: `scripts/replay_extractions.py --env prod --folder F --date D
    [--apply]` lists `extractions/F/D/*.json` and, only with `--apply`, re-invokes the
    item-writer with the S3 event the bucket would have sent; prints each result.

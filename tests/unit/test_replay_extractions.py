@@ -61,6 +61,7 @@ def test_apply_invokes_the_env_item_writer_once_per_key():
     ["--env", "prod", "--folder", "F", "--date", "2026-13-40"],
     ["--env", "prod", "--folder", "F", "--date", "yesterday"],
     ["--env", "prod", "--folder", "Dea ndre", "--date", "2026-10-05"],
+    ["--env", "prod", "--folder", "F\n", "--date", "2026-10-05"],
     ["--env", "dev", "--folder", "F", "--date", "2026-10-05"],
 ])
 def test_bad_arguments_are_refused(argv):
