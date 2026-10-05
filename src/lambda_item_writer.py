@@ -67,6 +67,7 @@ from photo_binding import PHOTOS_PER_TOPIC_CAP  # noqa: F401  (re-export)
 from photo_binding import list_pictures as _pb_list_pictures
 from repositories import users as users_repo
 from photo_binding import photos_for_topics as _photos_for_topics  # noqa: F401  (re-export)
+import checklist_reports
 import inspection_match
 import photo_rebind
 import pipeline_trace
@@ -1051,8 +1052,9 @@ def write_extraction_items(date, user_folder, extraction_key):
         # The checks he said he was doing (voice-triggered checklists), each
         # matched to the company's checklist template by what kind of check it
         # is (inspection_match). Never fatal, for the same reason as the markers.
+        stored_inspections = []
         try:
-            _store_inspections(conn, company["id"], user_id, user_folder, date,
+            stored_inspections = _store_inspections(conn, company["id"], user_id, user_folder, date,
                                _parse_extraction_key(extraction_key)[2],
                                extraction.get("inspections") or [])
         except Exception:  # noqa: BLE001 -- see above
@@ -1211,6 +1213,20 @@ def write_extraction_items(date, user_folder, extraction_key):
                 conn, company["id"], user_folder, date, photo_objects)
         except Exception:  # noqa: BLE001 -- see above
             logger.exception("day photo rebind failed for %s/%s", user_folder, date)
+
+        # A SPOKEN CHECK'S REPORT, MADE ON ITS OWN (owner, 2026-10-06): each check
+        # of a FINAL extraction that matched a checklist template goes to the
+        # report worker now, after the topics and their photos exist, so the
+        # filled checklist is waiting when he is back at the office. Never fatal.
+        if extraction.get("tier") == "final" and stored_inspections:
+            try:
+                made = checklist_reports.auto_generate(
+                    conn, company["id"], user_folder, date,
+                    _parse_extraction_key(extraction_key)[2], stored_inspections)
+                if made:
+                    logger.info("checklist reports for %s: %s", extraction_key, made)
+            except Exception:  # noqa: BLE001 -- see above
+                logger.exception("checklist reports not queued for %s", extraction_key)
 
         if collected_topics:
             if SUGGEST_THREADS:
