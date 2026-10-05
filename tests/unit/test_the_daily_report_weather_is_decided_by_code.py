@@ -159,7 +159,7 @@ def test_the_morning_forecast_is_written_per_site_by_uuid(monkeypatch):
                         lambda b, k: coords if k == rg.site_coords.KEY else PROG_TODAY)
     puts = []
     monkeypatch.setattr(rg.s3_client, "put_object", lambda **kw: puts.append(kw))
-    out = rg.run_weather_forecasts("2026-09-29", fetch=forecast_rain)
+    out = rg.run_weather_forecasts("2026-09-29", fetch=forecast_rain, fetch_daily=daily_drizzle)
     assert out["written"] == ["uc-pk"] and out["skipped"] == ["legacy"]
     assert puts[0]["Key"] == "weather/u-1/2026-09-29/forecast.json"
     body = json.loads(puts[0]["Body"])
@@ -169,9 +169,20 @@ def test_the_morning_forecast_is_written_per_site_by_uuid(monkeypatch):
         "Impact: Pour L3 slab. Advice: finish the current exterior work before 12:00, "
         "then move to interior work.")
     assert body["items"][0]["remind_at"] == "11:00"
+    # The day's numbers ride with the advice: without them Today showed only
+    # "no impact on site work expected" (owner, 2026-10-05).
+    assert body["daily"]["precip_mm"] == 0.3
+    assert body["summary"] == ["Light drizzle", "Temperature range: 11.8°C – 18.4°C",
+                               "Rainfall: 0.3mm", "Max wind speed: 16.2 km/h"]
 
 
 PROG_TODAY = {"leaves": [{"name": "Pour L3 slab", "start": "2026-09-29", "end": "2026-09-29"}]}
+
+
+def daily_drizzle(lat, lng, date, today_iso):
+    assert today_iso == date, "today is a forecast"
+    return {"date": date, "condition_label": "Light drizzle", "temp_min_c": 11.8,
+            "temp_max_c": 18.4, "precip_mm": 0.3, "windspeed_kmh": 16.2}
 
 
 def forecast_rain(lat, lng, date, historical):

@@ -24,6 +24,7 @@ import re
 
 import report_template
 import site_weather
+import weather
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +176,14 @@ def site_day_weather(s3, bucket, site, date, today_iso):
                            exc_info=True)
             rec = None
         if rec:
-            return rec.get("daily"), list(rec.get("lines") or []), "record"
+            daily = rec.get("daily")
+            if not daily and site.get("latitude") is not None and site.get("longitude") is not None:
+                # A morning forecast written before 2026-10-05 has the advice and
+                # not the numbers; the numbers are one call away.
+                daily = site_weather.build_weather_block_for_site(
+                    {"latitude": site["latitude"], "longitude": site["longitude"]},
+                    date, today_iso)
+            return daily, list(rec.get("lines") or []), "record"
     info = {"latitude": site.get("latitude"), "longitude": site.get("longitude")}
     if info["latitude"] is None or info["longitude"] is None:
         return None, [], "none"
@@ -205,19 +213,24 @@ def weather_section(title, artifact, facts, s3, bucket, today_iso):
     """Returns (section, provenance per site)."""
     date = artifact.get("date") or (artifact.get("content") or {}).get("date")
     sites = [s for s in facts.get("sites") or [] if s.get("id") or s.get("latitude") is not None]
-    rows, lines, sources = [], [], []
+    rows, lines, sources, dailies = [], [], [], []
     many = len(sites) > 1
     for site in sites:
         daily, found, source = site_day_weather(s3, bucket, site, date, today_iso)
         sources.append({"site": site.get("id"), "source": source})
         if daily:
+            dailies.append(daily)
             rows.append(([site.get("name") or ""] if many else []) + _totals(daily))
         prefix = ("%s: " % site["name"]) if many and site.get("name") else ""
         lines.extend("- " + prefix + ln for ln in found)
     paragraphs = []
-    if rows:
-        head = (["Site"] if many else []) + ["Sky", "Rain", "Temperature", "Wind"]
+    if rows and many:
+        head = ["Site", "Sky", "Rain", "Temperature", "Wind"]
         paragraphs += _table([head] + rows)
+    elif dailies:
+        # One site: the facts as a list (owner's wording, weather.summary_lines),
+        # then what they mean for the work.
+        paragraphs += ["- " + ln for ln in weather.summary_lines(dailies[0])]
     paragraphs += lines
     return _section(title, paragraphs or [NOT_RECORDED]), sources
 
