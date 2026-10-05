@@ -318,7 +318,7 @@ def list_day_topics_for_binding(conn, user_folder, report_date) -> list[dict]:
     a tie depend on the physical row order.
     """
     return conn.cursor(row_factory=dict_row).execute(
-        "SELECT id, time_range, source_s3_key FROM topics "
+        "SELECT id, title, time_range, source_s3_key FROM topics "
         "WHERE (source_s3_key LIKE %s ESCAPE '\\' OR source_s3_key = %s) "
         f"AND {visible_topics_predicate('topics')} "
         "ORDER BY time_range NULLS LAST, id",
