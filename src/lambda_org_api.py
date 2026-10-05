@@ -3713,7 +3713,29 @@ def _report_window(body):
         frm = "00:00"
     if not _WINDOW_CLOCK_RE.match(str(to)):
         to = "23:59"
-    return {"from": frm, "to": to}
+    window = {"from": frm, "to": to}
+    # An interrupted check is several stretches (owner, 2026-10-05): the report
+    # covers each and not the gaps. All-or-nothing: one bad stretch and the
+    # window is the plain from-to above.
+    segs = body.get("segments")
+    if isinstance(segs, list) and 1 < len(segs) <= 20:
+        clean = []
+        for sg in segs:
+            if not isinstance(sg, dict):
+                break
+            a, b = str(sg.get("from") or ""), str(sg.get("to") or "")
+            if not (_WINDOW_CLOCK_RE.match(a) and _WINDOW_CLOCK_RE.match(b)) or                     _hms_len(a) >= _hms_len(b) or (clean and _hms_len(a) < _hms_len(clean[-1]["to"])):
+                break
+            clean.append({"from": a, "to": b})
+        else:
+            window = {"from": clean[0]["from"], "to": clean[-1]["to"], "segments": clean}
+    return window
+
+
+def _hms_len(clock):
+    """'HH:MM[:SS]' -> seconds of the day (validated by _WINDOW_CLOCK_RE first)."""
+    parts = [int(x) for x in clock.split(":")]
+    return parts[0] * 3600 + parts[1] * 60 + (parts[2] if len(parts) > 2 else 0)
 
 
 def _photo_selection_folder(conn, caller, date, event, write=False):

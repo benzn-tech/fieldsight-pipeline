@@ -181,7 +181,7 @@ def _in_window(topic, date, win_from, win_to):
     return (start < win_to and end > win_from) or (start == end and win_from <= start < win_to)
 
 
-def _offered_topics(artifact, budget, win_from, win_to):
+def _offered_topics(artifact, budget, win_from, win_to, stretches=None):
     """(offer, streams_by_ref) for the topics of this report inside the window.
 
     `offer` is what the prompt shows the model: a stable ref, the time range,
@@ -213,8 +213,12 @@ def _offered_topics(artifact, budget, win_from, win_to):
     folder = artifact.get("folder")
     content = artifact.get("content") or {}
     date = artifact.get("date") or content.get("date")
+    # An interrupted check's report offers the topics of its stretches, not of
+    # the other check between them (topic times are whole minutes, so one that
+    # shares a minute with a stretch is still offered).
     in_window = [(i, t) for i, t in enumerate(content.get("topics") or [])
-                 if _in_window(t, date, win_from, win_to)]
+                 if (any(_in_window(t, date, a, b) for a, b in stretches) if stretches
+                     else _in_window(t, date, win_from, win_to))]
     # THE WHOLE REPORT IS PLANNED BEFORE ANYTHING IS FETCHED (report_photos):
     # the person's own exclusions for the day, one copy of each photograph,
     # the size the count calls for, and -- past MAX_LIMIT -- a fair share per
@@ -683,6 +687,18 @@ def _model_budget_seconds(context):
     return remaining - RENDER_AND_WRITE_RESERVE_SECONDS
 
 
+def _segment_gaps(date, segments):
+    """[(gap_start, gap_end)] between consecutive stretches of a window, or []."""
+    if not isinstance(segments, list) or len(segments) < 2:
+        return []
+    out = []
+    for a, b in zip(segments, segments[1:]):
+        start, end = _clock(date, a["to"]), _clock(date, b["from"])
+        if end > start:
+            out.append((start, end))
+    return out
+
+
 def _clock(date, hhmm):
     """A wall-clock time on the report's own date. No timezone conversion happens
     anywhere on this path (spec 2026-09-15 global constraints).
@@ -849,6 +865,11 @@ def _generate_document(artifact, context=None):
     # unparseable case (that one still raises, window or no window).
     spans = transcript_window.excluded_spans(date, artifact.get("excludedTopics") or [],
                                              win_from, win_to)
+    # An interrupted check (window.segments): the gaps between its stretches
+    # are left out exactly like an excluded topic's span -- the other check
+    # done in between is not this one.
+    gaps = _segment_gaps(date, window.get("segments"))
+    spans = spans + gaps
 
     read_budget = _model_budget_seconds(context)
     if read_budget <= llm_utils.MIN_USEFUL_SECONDS:
@@ -875,7 +896,10 @@ def _generate_document(artifact, context=None):
     # prompt tells the model how many each topic has, and that number has to
     # have bytes behind it.
     photo_budget = [MAX_PHOTO_BYTES_TOTAL, MAX_PHOTOS_PER_REPORT]
-    topic_offer, photo_streams = _offered_topics(artifact, photo_budget, win_from, win_to)
+    topic_offer, photo_streams = _offered_topics(
+        artifact, photo_budget, win_from, win_to,
+        stretches=[(_clock(date, sg["from"]), _clock(date, sg["to"]))
+                   for sg in window.get("segments") or []] if gaps else None)
 
     # REPORT DETAILS AND WEATHER ARE OURS. Those sections leave the plan the
     # model sees and are written from the facts we hold (report_facts.py);
