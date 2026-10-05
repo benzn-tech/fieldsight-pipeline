@@ -132,6 +132,7 @@ import device_heartbeat
 import device_status
 import nz_time
 import pipeline_trace
+import trace_views
 import reindex
 import recording_blocks
 import report_download_name
@@ -602,6 +603,11 @@ def dispatch(conn, event, method, route):
     m_pa = re.match(r"^/topics/([^/]+)/propagate$", route)
     if m_pa and method == "POST":
         return apply_topic_correction(conn, caller, m_pa.group(1), parse_body(event))
+
+    if route == "/trace/day" and method == "GET":
+        return trace_day_endpoint(conn, caller, event)
+    if route == "/trace/funnel" and method == "GET":
+        return trace_funnel_endpoint(conn, caller, event)
 
     if route == "/aliases" and method == "GET":
         return list_aliases_endpoint(conn, caller)
@@ -5814,6 +5820,58 @@ def _trace_glossary_learned(company_id, caller, table, learned):
             "wrong_term": a["wrong_term"], "right_term": a["right_term"], "table": table,
             "by": str(caller.get("id"))})
     pipeline_trace.flush(s3, LAKE_BUCKET)
+
+
+def _company_names(conn, ids):
+    names = {}
+    for cid in {i for i in ids if i}:
+        try:
+            row = companies.get_company_by_id(conn, cid)
+        except Exception:
+            row = None
+        names[cid] = row["name"] if row else None
+    return names
+
+
+def trace_day_endpoint(conn, caller, event):
+    """GET /api/org/trace/day?date=YYYY-MM-DD[&folder=<user folder>] -- what
+    the pipeline did that day (trace_views.day). platform_admin only: traces
+    span every customer (owner, 2026-10-05)."""
+    if caller["global_role"] != "platform_admin":
+        return error("platform_admin role required", 403)
+    params = event.get("queryStringParameters") or {}
+    date = params.get("date") or nz_time.nz_now().strftime("%Y-%m-%d")
+    if not REPORT_DATE_RE.match(date):
+        return error("date must be YYYY-MM-DD", 400)
+    folder = params.get("folder") or None
+    out = trace_views.day(trace_views.s3_day_reader(s3(), LAKE_BUCKET, folder), date, folder)
+    if folder is None:
+        names = _company_names(conn, [f["company_id"] for f in out["folders"]])
+        for f in out["folders"]:
+            f["company_name"] = names.get(f["company_id"])
+    return ok(out)
+
+
+def trace_funnel_endpoint(conn, caller, event):
+    """GET /api/org/trace/funnel?from=YYYY-MM-DD&to=YYYY-MM-DD -- per folder,
+    how far recordings got (trace_views.funnel). Defaults to the last 7 days."""
+    if caller["global_role"] != "platform_admin":
+        return error("platform_admin role required", 403)
+    params = event.get("queryStringParameters") or {}
+    today = nz_time.nz_now().date()
+    date_to = params.get("to") or today.isoformat()
+    date_from = params.get("from") or (today - timedelta(days=6)).isoformat()
+    if not (REPORT_DATE_RE.match(date_from) and REPORT_DATE_RE.match(date_to)):
+        return error("from and to must be YYYY-MM-DD", 400)
+    try:
+        out = trace_views.funnel(trace_views.s3_day_reader(s3(), LAKE_BUCKET),
+                                 date_from, date_to)
+    except ValueError as exc:
+        return error(str(exc), 400)
+    names = _company_names(conn, [f["company_id"] for f in out["folders"]])
+    for f in out["folders"]:
+        f["company_name"] = names.get(f["company_id"])
+    return ok(out)
 
 
 _GLOSSARY_ADMIN_ROLES = ("admin", "gm", "platform_admin")
