@@ -1,113 +1,166 @@
-# Sub-project 1 — retire the legacy gateway's data routes (design, 2026-10-05)
+# Sub-project 1 — retire the legacy gateway's data routes (design, 2026-10-05, rev 2)
 
-Status: **design.** Part of `2026-10-05-tenancy-roadmap-design.md` (decisions D1–D6).
-Spans `fieldsight-pipeline` and `fieldsight-ui`.
+Status: **design, revised after a fact-check against code and deployed config
+(2026-10-05).** Part of `2026-10-05-tenancy-roadmap-design.md` (decisions D1–D6).
+Spans `fieldsight-pipeline`, `fieldsight-ui`, and two pieces of prod infrastructure.
 
 ## Why
 
-`lambda_fieldsight_api` (`fieldsight-prod-api`) reads tenant data from S3 and DynamoDB
-with **no company concept**: its roles come from DynamoDB and stop at admin/gm,
-`can_access_user_data` returns True for admin/gm, and presign skips owner checks for
-them. So an admin or gm of any customer can read any other customer's reports,
-transcripts, recordings and photos by naming a folder. #1026 closed the lake-wide
-summary; this closes the rest — by taking tenant data out of the gateway, not by
-patching it. The gateway cannot be patched into correctness: it has no database (D2).
+`lambda_fieldsight_api` (`fieldsight-prod-api`, gateway `ys94qy2tk0` `/api/{proxy+}`)
+serves tenant data with **no company concept**. Measured worse than first described:
 
-## Every legacy route, and its fate
+- `/api/actions` GET and `/api/actions/toggle` POST check **nothing about the caller**:
+  any signed-in user of any company reads or writes any date's ticks.
+- `/api/users` returns the **whole** frozen mapping (device, name, role, sites) to any
+  signed-in user; `/api/sites` and `/api/site-users` read the same frozen file.
+- `/timeline`, `/transcripts`, `/audio-segments`, `/video-segments`, presign,
+  `/reports/history`: admin/gm read any folder (`can_access_user_data` → True, presign
+  skips owner checks).
 
-Traffic is prod, 14 days to 2026-10-05.
+#1026 closed the lake-wide summary. This sub-project takes tenant data out of the
+gateway, because it cannot be patched into correctness: it has no database (D2).
 
-| route | calls | data source | ACL today | fate |
+## A second, forgotten gateway
+
+`khfj3p1fkb` → lambda **`fieldsight-api`** (last modified 2026-07-13) is still deployed
+with the same Cognito authorizer, the same company-blind code, no `RAG_SEARCH_FUNCTION`,
+and an old `fieldsight-ask-agent` that falls through to the company-blind S3 path. Zero
+invocations in 60 days — but it answers any valid token. It is retired here too.
+
+## Every route on the live gateway, and its fate
+
+Traffic: prod, 14 days to 2026-10-05 (Logs Insights on `/aws/lambda/fieldsight-prod-api`).
+
+| route | calls | source | ACL today | fate |
 |---|---|---|---|---|
-| `/api/actions` GET | 2559 | DynamoDB `fieldsight-audit`, `PK=ACTIONS#{date}`, checkbox per (date, folder, **position**) | admin/gm any folder | **move to org-api `action_items.status`**, backfill the 356 rows, then **410** |
-| `/api/actions/toggle` POST | 1 | same table | same | **410** after the move |
-| `/api/actions` POST (create) | — | report gateway | same | already rides org-api for edits; create moves too |
-| `/api/timeline` | 777 | S3 reports | admin/gm any folder | web: **stop falling back** (`legacyReadFallback=false`); then **410** |
-| `/api/dates` | 1 | S3 reports | per-folder scope, admin/gm unrestricted | **410** (web reads org-api `/dates`) |
-| `/api/sites` `/api/users` `/api/site-users` | 194 | **frozen `user_mapping.json`** | mapping roster | **move web to org-api** `/sites`, `/members`, `/sites/{id}/members`; then **410** |
-| `/api/sites` `/api/users` POST/PATCH | — | DynamoDB / mapping | — | **410** (org-api owns the directory) |
-| `/api/transcripts` `/api/audio-segments` `/api/video-segments` `/api/media/presigned-url` `/api/reports/history` | ≈0 | S3 | admin/gm unrestricted | **410** now — the web already uses org-api; nobody else is calling |
-| `/api/recording-stats` `/api/reports/generate` | — | — | — | **410** unless a caller is found (step 1) |
-| `/api/search` | 63 | proxies to ask-agent → **rag-search** with `caller_sub` | rag-search scopes by org | **keep** as a proxy (carries no tenant data itself) |
-| `/api/ask` `/api/ask/corroborate` | 15 | proxies to ask-agent → RAG with `caller_sub` | rag-search | **keep** |
-| `/api/ask/voice` | 10 | device → STT → RAG with `caller_sub` | rag-search | **keep** (D6: device contract) |
+| `/api/actions` GET | 2559 | DynamoDB `fieldsight-audit` `ACTIONS#{date}` | **none** | UI stops reading the overlay (see Actions); then **410** |
+| `/api/actions/toggle` POST | 1 | same | **none** | UI stops writing it; then **410** |
+| `/api/actions` POST | — | *no handler* — the dispatcher runs `get_actions` for any method → 400 | — | UI `createAction` is dead today: delete it |
+| `/api/timeline` | 777 | S3 | admin/gm any folder | web: `legacyReadFallback=false`; then **410** |
+| `/api/dates` | 1 | S3 | admin/gm unrestricted | web: same flag (already gated); then **410** |
+| `/api/sites` | 149 | frozen mapping | mapping | web → org `/sites` via an adapter; then **410** |
+| `/api/users` | 26 | frozen mapping | **none** | web → org (see Users); then **410** |
+| `/api/site-users` | 19 | frozen mapping | mapping roster | web → org `/sites/{id}/members`; then **410** |
+| `/api/sites`, `/api/users` POST/PATCH | — | *no handler* (method ignored, list returned) | — | UI `createSite`/`createUser`/`updateUserRole` against these are dead: delete or repoint to org |
+| `/api/transcripts` `/audio-segments` `/video-segments` `/media/presigned-url` `/reports/history` `/recording-stats` | ≈0 | S3 | admin/gm unrestricted | **410** (web already uses org) |
+| `/api/reports/generate` | — | — | — | **already 410** (2026-09-15) |
+| `/api/search` `/api/ask` `/api/ask/corroborate` | 78 | proxy → ask-agent → rag-search with `caller_sub` | in-VPC, by company | **keep**, made fail-closed (below) |
+| `/api/ask/voice` | 10 | device → STT → RAG with `caller_sub` | same | **keep** (D6) |
 | `/api/health` | 26 | — | — | keep |
 
-**After this sub-project the gateway holds no tenant data.** It is an authenticated
-proxy to the RAG/Ask lambdas, whose access decisions are made in-VPC against the
-directory (prod `fieldsight-prod-ask-agent` has `RAG_SEARCH_FUNCTION` set — verified
-2026-10-05). Its DynamoDB user table and `user_mapping.json` reads go with the data
-routes.
+After this sub-project the gateway holds **no tenant data**: it is an authenticated
+proxy to Ask/search, whose decisions are made in-VPC against the directory.
 
-## Order — instrument, move, then close
+## The proxies must fail closed
 
-1. **Know every caller before cutting.** Add one structured log line per request to
-   the gateway: route, method, caller role, whether `caller_sub` is present, and the
-   User-Agent family (browser / Android / other). Ship it, observe for one full working
-   week. This answers what the current logs cannot: whether `/api/timeline`'s 777 calls
-   are the web's fallback or a device, and whether anything still calls the ≈0 routes.
-   **No route is closed while an unexplained caller remains.**
-2. **Move the web off each data route** (fieldsight-ui):
-   - `timeline.js`: legacy fallback off (`FS_LEGACY_READ_FALLBACK=false` on `main`,
-     the Amplify build variable already wired in `amplify.yml`); when org-api denies,
-     the page shows org-api's own message — which already distinguishes "no access"
-     from "this login has no folder".
-   - `sites.js`: `getSites` / `getUsers` / `getSiteUsers` → org-api `/sites`,
-     `/members`, `/sites/{id}/members`. Where a role cannot call `/members`, the page
-     shows what that role's `visible_scope` returns — never a fallback to the mapping.
-   - `actions.js`: checkbox state read from and written to `action_items.status`
-     through org-api (the Tasks page already PATCHes `action_items`).
-3. **Backfill the 356 legacy checkbox rows** into `action_items.status`. Each row
-   carries `PK=ACTIONS#{date}`, an SK with the folder (when present), topic and action
-   positions, and — what makes this safe — **the action's own text** (`action_text`),
-   plus `checked`, `checked_at`, `checked_by`. Match on **text, not position**: within
-   (date, folder), the `action_items` row whose normalised text equals `action_text`.
-   Positions shift when a day's report is regenerated; the text does not. A row with no
-   folder in its SK, or with zero or several text matches, is **listed, never guessed**.
-   A one-off, idempotent, dry-run-first operator task (the `photo_collapse` pattern in
-   org-api: invoked by hand, `apply` must be exactly true). Prod run is the owner's.
-4. **Close the data routes**: they return **410 Gone** with a body naming the org-api
-   replacement. 410, not 404, so a forgotten caller fails loudly and the log line from
-   step 1 names it.
-5. **Remove the dead code** (handlers, DynamoDB users/audit reads, mapping reads) one
-   release after step 4 has been quiet.
+`lambda_ask_agent` takes the RAG path only when **both** `caller_sub` is present and
+`RAG_SEARCH_FUNCTION` is set; otherwise it falls to a company-blind S3 path
+(`load_report` / `load_transcripts` by a named user). Prod has the variable; the risk is
+an empty `caller_sub`. Two guards:
 
-Each step is its own release and independently revertible. Steps 2–3 change no
-behaviour a user can see except that the data now comes from the directory.
+1. Gateway: `/api/search`, `/api/ask*` refuse (401) when the authorizer yields no `sub`.
+2. ask-agent: with no `caller_sub` it **refuses** rather than falling to the S3 path.
+   The S3 path stays reachable only for an internal invocation that carries an explicit,
+   non-user marker (if any internal caller needs it — step 1 finds out); otherwise it is
+   removed in step 5.
 
-## What changes for users
+## Actions: the overlay, and what happens to the ticks
 
-- Nothing visible for the web, except: an admin/gm who was relying on the legacy
-  fallback to see **another company's** day no longer can. That is the fix.
-- Action-item ticks keep their state (backfill).
-- Devices: unchanged (`/api/ask/voice` kept).
+The web deliberately treats done-ness as the **union** of two stores: Aurora
+`action_items.status == 'done'` OR the legacy `ACTIONS#` overlay's `checked`
+(`actions.js`: "~119 check-offs … DONE-NESS IS THE UNION OF BOTH STORES"). Readers of the
+overlay: `compliance-aggregator.js`, `tasks-aggregator.js`, `user-activity-aggregator.js`,
+`action-item-row.js`, `today-adapter.js`. They change **in the same release** as the 410,
+or every one of them errors.
+
+The legacy table (`fieldsight-audit`, prod only — TEST uses `fieldsight-test-audit`),
+full scan 2026-10-05: 356 items = **151 `ACTIONS#`** + 193 `AUDIT#` (append-only tick
+history) + 12 `SITE#…#DATE#…` (written by the report generator; not read by the gateway).
+Of the 151 `ACTIONS#` rows, **136 are checked**. Of those:
+
+- **17 are not action items** — the action part is `flag_N`, `obs_N` or `quality`
+  (findings / observations). They cannot map to `action_items`.
+- **26 rows (15 checked) carry no folder** — `TOPIC#n#ACTION#n` form. Every write since
+  2026-07-21 is folder-less; the folder-bearing `USER#…` form came from an unmerged branch.
+- 2 groups share identical text within a day.
+
+**Ruling (D-A1): backfill only what maps unambiguously; preserve the rest as a record.**
+- A checked row with a folder, an action part that is an action index, and exactly one
+  `action_items` row whose normalised `text` matches within that (date, folder) — joined
+  `action_items.topic_id → topics(report_date, user_id) → users.folder_name` — sets that
+  item's `status` to `done`, unless it is already done.
+- `checked_by` is a display name and `action_items.updated_by` is a Cognito sub; names are
+  not unique, so `updated_by` is **left null**, and the write goes through the repository
+  with a `content_edits` audit row (the `patch_action_item` path), noting the legacy
+  `checked_by` and `checked_at`.
+- Everything else (non-action rows, folder-less rows, ambiguous text) is **written to a
+  frozen, company-scoped record** (`docs/` or an operator S3 object, never shown to
+  customers) and listed in the run's report. Nothing is guessed.
+- Cost if wrong: a handful of historic ticks on findings and folder-less days are no
+  longer shown as ticked in the UI; the record keeps them.
+
+**Write authority narrows** from "anyone" to org-api's `PATCH /action-items/{id}` rule
+(admin/gm/platform_admin, a pm/site_manager of the task's site, or the assignee). Some
+ticks a worker could set before will now 403. That is the fix, not a regression. The
+UI's legacy toggle for id-less (report-sourced) items is removed with the overlay.
+
+## Sites and users: an adapter, and no fake data
+
+- `getSites` → org `GET /sites` (every role, `visible_scope` reach). **The id space
+  changes**: legacy returns the mapping slug as `site_id`, org returns a UUID (with
+  `slug`). Consumers (`today.js`, `compliance-aggregator.js`, `programme.js`,
+  `search-palette.js`, the quality/safety create modals) get an adapter that returns both,
+  and each is moved to the UUID; `today.js` already keeps both maps.
+- `getUsers` → admin/gm/platform_admin: org `GET /members`. **Other roles** (`/members`
+  is 403 for them): the union of `GET /sites/{id}/members` over the caller's sites. Note
+  this is reach-gated, not per-author graded — a worker sees the site's members where the
+  legacy roster showed self only. Ruling (D-A2): acceptable — names of people on your own
+  project are not cross-tenant data — cost if wrong: a worker sees co-workers' names.
+- `getSiteUsers` → org `GET /sites/{id}/members`.
+- **No silent mock fallback.** Today `tasks-aggregator.js`, `evidence.js`, `today.js`
+  catch a failed `getUsers` and substitute fixture data in live mode. In live mode a
+  failure renders as an error/empty state, never as fake people.
+
+## Order — instrument, harden, move, close, remove
+
+1. **Instrument** (pipeline): one structured line per request **after** auth — route,
+   method, role, `caller_sub` present (bool), User-Agent family. No tenant content. Ship,
+   observe one working week. No route closes while an unexplained caller remains.
+2. **Harden the proxies** (pipeline): the two fail-closed guards. Independent of 1.
+3. **Move the web** (ui): sites/users adapter; overlay readers switch to
+   `action_items.status`; legacy toggle and dead writers removed; `timeline`/`dates`
+   already gated — set `FS_LEGACY_READ_FALLBACK=false` on Amplify `main` at release.
+4. **Backfill** (pipeline operator task, `photo_collapse` pattern: hand-invoked, dry run
+   unless `apply` is exactly `true`): dry run on prod is a read — mine; `apply=true` on
+   prod is a write — the owner's.
+5. **Close** the data routes with **410** naming the org replacement, in the same window
+   as 3 reaching prod.
+6. **Retire the forgotten gateway** `khfj3p1fkb` / `fieldsight-api` / old
+   `fieldsight-ask-agent`: disable first (reversible), delete after a quiet week —
+   infrastructure outside the SAM stack; **owner's action**.
+7. **Remove dead code** one release after 5 is quiet: data handlers, the DynamoDB users and
+   audit reads, the mapping reads, the ask-agent S3 path if step 1 found no internal caller.
 
 ## Tests that must go red without the change
 
-- Gateway: each closed route returns 410 with the replacement named — for admin, gm and
-  worker; the kept proxy routes still forward `caller_sub`.
-- No closed route reads S3 tenant data or DynamoDB users: `s3_client.get_object` /
-  `list_objects_v2` / `dynamodb.Table` are never called on a 410 path.
-- Web: `timeline.js` never calls `request('/timeline')` when `legacyReadFallback` is
-  false; `sites.js` and `actions.js` build their requests through `orgRequest`, and the
-  bodies are checked on the request handed to it (the api-layer whitelist trap).
-- Backfill: dry run reports per-row match / no-match and writes nothing; `apply=true`
-  writes only matched rows; a second apply writes nothing (idempotent); an unmatched,
-  ambiguous or folder-less row is listed and left; matching is by text, so a reordered
-  action list still maps each tick to the same task.
-- The instrumentation line carries no tenant content (route, role, flags only).
+- Gateway: each closed route → 410 naming the replacement, for admin, gm, worker; no
+  `s3_client`/`dynamodb` call on a 410 path; proxies refuse an empty `sub`.
+- ask-agent: no `caller_sub` never reaches `load_report`/`load_transcripts`.
+- UI: `getSites`/`getUsers`/`getSiteUsers` go through `orgRequest`; a failed call in live
+  mode yields no fixture data; no module reads the `ACTIONS#` overlay; the adapter maps a
+  legacy slug and a UUID to the same site.
+- Backfill: dry run writes nothing; apply writes only unambiguous matches, via the
+  repository with an audit row and `updated_by` null; a second apply writes nothing;
+  non-action, folder-less and ambiguous rows land in the record, not in `action_items`;
+  matching is by text, so a reordered list maps each tick to the same task.
 
-## Risks
+## Owner touch-points (everything else is mine)
 
-- **An unknown caller of a closed route.** Mitigated by step 1 and by 410 (loud).
-- **A tick lands on the wrong task.** Mitigated by matching on the stored action text
-  within (date, folder), never on position; ambiguous or missing matches are listed and
-  left for a person. Some early rows have no folder in their SK (e.g.
-  `TOPIC#0#ACTION#flag_0`) — those are listed, not spread across every folder that day.
-- **`FS_LEGACY_READ_FALLBACK=false` turns a silent cross-company read into a visible
-  "no access".** Intended.
+- Approve each prod deploy in Actions.
+- The prod `apply=true` of the backfill (after reading the dry run).
+- Disabling, then deleting, the forgotten gateway and its lambdas.
 
 ## Out of scope
 
-The frozen mapping's other readers (sub-project 2), project-owned data (3), lake key
-layout (4), the Cognito pool split (S1), connection pooling (S2).
+Frozen mapping's other readers (sub-project 2), project-owned data (3), lake keys (4),
+Cognito pool split (S1), connection pooling (S2).

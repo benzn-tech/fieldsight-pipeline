@@ -27,6 +27,8 @@ design decisions; this document records them so they can be reviewed and reverse
 | ingest files a recording under the **recorder's** company | `lambda_ingest.resolve_company(folder)` |
 | frozen `config/user_mapping.json` (2026-08-01) is still read by 14 source files | report generator stamps site/role by name; orchestrator idle but armed |
 | test and prod share one Cognito pool | `ap-southeast-2_q88pd6XXr` on both stacks |
+| `/api/actions` and `/api/users` on the legacy gateway check **nothing** about the caller | any signed-in user of any company reads/writes ticks and reads the roster |
+| a second, forgotten legacy gateway is still deployed | `khfj3p1fkb` → `fieldsight-api` (2026-07-13), same authorizer, company-blind, 0 calls in 60 days |
 
 ## Decisions (binding on all four sub-projects)
 
