@@ -36,13 +36,14 @@ def replace_for_session(conn, company_id, user_folder, date, session, windows):
             conn.execute(
                 "INSERT INTO inspection_windows (company_id, user_folder, report_date, session, "
                 "name, kind, start_at, end_at, end_source, start_quote, end_quote, "
-                "template_id, match_score) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "template_id, match_score, segments) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
                 (str(company_id), user_folder, date, session, w["name"], w.get("kind") or "",
                  w["start_at"], w.get("end_at"), w.get("end_source") or "recording_stop",
                  w.get("start_quote") or "", w.get("end_quote"),
                  str(w["template_id"]) if w.get("template_id") else None,
-                 w.get("match_score")))
+                 w.get("match_score"),
+                 json.dumps(w["segments"]) if w.get("segments") else None))
     return len(windows or [])
 
 
@@ -51,9 +52,10 @@ def for_day(conn, company_id, user_folder, date):
 
     company_id=None means no company restriction (a cross-company platform
     admin), the convention the rest of this package uses."""
-    return conn.cursor(row_factory=dict_row).execute(
+    rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT w.id, w.session, w.name, w.kind, w.start_at, w.end_at, w.end_source, "
-        "       w.start_quote, w.end_quote, w.template_id, w.match_score, t.name AS template_name "
+        "       w.start_quote, w.end_quote, w.template_id, w.match_score, w.segments, "
+        "       t.name AS template_name "
         "FROM inspection_windows w LEFT JOIN report_templates t ON t.id = w.template_id "
         "WHERE (%s::uuid IS NULL OR w.company_id = %s::uuid) "
         "AND w.user_folder = %s AND w.report_date = %s "
@@ -61,3 +63,9 @@ def for_day(conn, company_id, user_folder, date):
         (str(company_id) if company_id else None, str(company_id) if company_id else None,
          user_folder, date),
     ).fetchall()
+    for r in rows:
+        if isinstance(r.get("segments"), str):
+            r["segments"] = json.loads(r["segments"])
+        if not r.get("segments"):
+            r["segments"] = [{"from": r["start_at"], "to": r["end_at"]}]   # one stretch
+    return rows

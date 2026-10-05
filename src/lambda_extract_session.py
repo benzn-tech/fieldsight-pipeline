@@ -997,57 +997,87 @@ def clean_inspections(raw):
         if not name or not start:
             continue
         end = m.get('end_at')
+        resumed = [{'at': str(r['at'])[:5], 'quote': str(r.get('quote') or '')[:300]}
+                   for r in (m.get('resumed') or [])
+                   if isinstance(r, dict) and r.get('at')][:20]
         out.append({'name': str(name)[:120],
                     'kind': str(m.get('kind') or '')[:80],
                     'start_at': str(start)[:5],
                     'start_quote': str(m.get('start_quote') or '')[:300],
                     'end_at': str(end)[:5] if end else None,
-                    'end_quote': str(m.get('end_quote') or '')[:300] if end else None})
+                    'end_quote': str(m.get('end_quote') or '')[:300] if end else None,
+                    'resumed': resumed})
     return out
 
 
 def time_inspections(items, turns):
     """Each check's window, to the second (voice-triggered checklists, owner
-    2026-09-30): it opens where the start was said and closes at the first of
-    where he said it was finished, where he started the NEXT check, or where
-    the recording stopped (`end_source`: "said" | "next_check" |
-    "recording_stop"). A quote that cannot be found keeps the model's minute,
-    as markers do.
+    2026-09-30), as one or more SEGMENTS.
 
-    "Next check" is ours, not the owner's wording: on prod (Ben_Lin_Test
-    2026-10-05) he never said a check was finished, and without it the Level 1
-    pre-pour window ran on through the Level 2 steel inspection to the end of
-    the recording. A check he comes back to is one entry (the prompt says so),
-    so moving on is the end of it."""
+    A segment opens where he started the check -- or came back to it -- and
+    closes at the first of: where he said it was finished, where he started
+    or came back to ANOTHER check, or where the recording stopped. The last
+    segment's reason is `end_source` ("said" | "next_check" |
+    "recording_stop"); `start_at`/`end_at` span them all.
+
+    "Another check ends it" is ours, not the owner's wording: on prod
+    (Ben_Lin_Test 2026-10-05) he never said a check was finished, and without
+    it the Level 1 pre-pour window ran on through the Level 2 steel inspection.
+    Segments are the owner's answer to what that costs (2026-10-05: "how do the
+    interrupted parts join up?"): "back to the level one pre-pour" after the
+    steel check opens a second segment of the SAME check, and the report covers
+    both stretches and not the steel check between them.
+
+    A quote that cannot be found keeps the model's minute, as markers do."""
     stream = _word_stream(turns)
     ends = [t.get('abs_end') or t.get('abs_start') for t in turns or []
             if (t.get('abs_end') or t.get('abs_start')) is not None]
-    stop = _hms(_second_of_day(max(ends))) if ends else None
-    out = []
+    stop = _clock_s(_hms(_second_of_day(max(ends)))) if ends else None
+
+    def timed(at, quote):
+        hit = _time_one_marker({'at': at, 'quote': quote}, stream) if stream else None
+        return hit['at_s'] if hit else None
+
+    checks = []
     for m in items:
         m = dict(m)
-        st = _time_one_marker({'at': m['start_at'], 'quote': m['start_quote']}, stream) \
-            if stream else None
-        m['start_at_s'] = st['at_s'] if st else None
+        m['start_at_s'] = timed(m['start_at'], m.get('start_quote'))
+        said = None
         if m.get('end_at'):
-            en = _time_one_marker({'at': m['end_at'], 'quote': m.get('end_quote')}, stream) \
-                if stream else None
-            m['end_at_s'] = en['at_s'] if en else None
-            m['end_source'] = 'said'
+            m['end_at_s'] = timed(m['end_at'], m.get('end_quote'))
+            said = _clock_s(m['end_at_s'] or m['end_at'])
+        m['resumed'] = [dict(r, at_s=timed(r['at'], r.get('quote'))) for r in m.get('resumed') or []]
+        opens = [_clock_s(m['start_at_s'] or m['start_at'])] + \
+            [_clock_s(r['at_s'] or r['at']) for r in m['resumed']]
+        checks.append((m, said, sorted({o for o in opens if o is not None})))
+
+    out = []
+    for i, (m, said, opens) in enumerate(checks):
+        others = sorted(o for j, (_, _, os) in enumerate(checks) if j != i for o in os)
+        segments = []
+        for at in opens:
+            reasons = [(o, 'next_check') for o in others if o > at]
+            if said is not None and said > at:
+                reasons.append((said, 'said'))
+            if stop is not None and stop > at:
+                reasons.append((stop, 'recording_stop'))
+            close, why = min(reasons) if reasons else (None, 'recording_stop')
+            if segments and segments[-1][1] is not None and at <= segments[-1][1]:
+                if close is None or close > segments[-1][1]:
+                    segments[-1] = [segments[-1][0], close, why]      # one stretch
+                continue
+            segments.append([at, close, why])
+        if segments:
+            m['segments'] = [{'from': _hms(a), 'to': _hms(b) if b is not None else None}
+                             for a, b, _ in segments]
+            last = segments[-1]
+            m['end_at_s'] = _hms(last[1]) if last[1] is not None else m.get('end_at_s')
+            m['end_at'] = m['end_at_s'][:5] if m.get('end_at_s') else m.get('end_at')
+            m['end_source'] = last[2]
         else:
-            m['end_at_s'] = stop
-            m['end_at'] = stop[:5] if stop else None
-            m['end_source'] = 'recording_stop'
+            m['segments'] = []
+            m['end_source'] = 'said' if said is not None else 'recording_stop'
         out.append(m)
-    starts = sorted((_clock_s(m.get('start_at_s') or m.get('start_at')), i)
-                    for i, m in enumerate(out))
-    for (start, i), nxt in zip(starts, starts[1:]):
-        end = _clock_s(out[i].get('end_at_s') or out[i].get('end_at'))
-        if start is not None and nxt[0] is not None and nxt[0] > start                 and (end is None or nxt[0] < end):
-            nxt_m = out[nxt[1]]
-            out[i]['end_at_s'] = nxt_m.get('start_at_s') or (nxt_m['start_at'] + ':00')
-            out[i]['end_at'] = out[i]['end_at_s'][:5]
-            out[i]['end_source'] = 'next_check'
     return out
 
 
@@ -1132,7 +1162,11 @@ EXTRACTION_SCHEMA = """{
       "start_at": "HH:MM  (when he said he was starting it)",
       "start_quote": "those words, verbatim",
       "end_at": "HH:MM when he said it was finished, or null",
-      "end_quote": "those words, verbatim, or null"
+      "end_quote": "those words, verbatim, or null",
+      "resumed": [
+        {"at": "HH:MM  (when he came BACK to this check after another one)",
+         "quote": "those words, verbatim"}
+      ]
     }
   ],
   "topics": [
@@ -1255,7 +1289,7 @@ def _instructions_block():
    steel inspection finished". These open the checklist for that check, for exactly that stretch
    of the recording.
    - One entry per check he performs. Going away and coming back to it ("back to the level one
-     pre-pour") is the SAME entry, not a new one.
+     pre-pour") is the SAME entry, not a new one: put the moment he comes back in `resumed`.
    - `kind` is the type of check with the place left out ("pre-pour", "steel", "fire stopping");
      `name` is what he called it, place included.
    - end_at is null when he never says it ended -- do not guess an end.
