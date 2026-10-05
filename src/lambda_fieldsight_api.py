@@ -1623,6 +1623,22 @@ def health_check(params):
 
 # ── Router ───────────────────────────────────────────────────
 
+def _ua_family(headers):
+    """Coarse client family from the User-Agent header; never the raw string."""
+    headers = headers or {}
+    ua = headers.get('User-Agent') or headers.get('user-agent') or ''
+    if not ua:
+        return 'none'
+    low = ua.lower()
+    if 'okhttp' in low or 'dalvik' in low:
+        return 'android'
+    if 'cfnetwork' in low or 'darwin' in low or 'iphone' in low or 'ios' in low:
+        return 'ios'
+    if low.startswith('mozilla/'):
+        return 'browser'
+    return 'other'
+
+
 def lambda_handler(event, context):
     logger.info(f"Request: {event.get('httpMethod','GET')} {event.get('path','/')}")
     method = event.get('httpMethod', 'GET').upper()
@@ -1637,6 +1653,13 @@ def lambda_handler(event, context):
     if path == '/api/health':
         return health_check(params)
     caller = get_caller_identity(event)
+    # Who still calls this gateway? Route/method/role/client family only --
+    # no query-param or body values (tenant content).
+    logger.info("LEGACY_CALL %s", json.dumps({
+        'route': path, 'method': method, 'role': caller.get('role', ''),
+        'has_sub': bool(caller.get('sub')),
+        'ua': _ua_family(event.get('headers')),
+    }, sort_keys=True))
     try:
         if path == '/api/timeline': return get_timeline(params, caller)
         elif path == '/api/dates': return get_dates(params, caller)
