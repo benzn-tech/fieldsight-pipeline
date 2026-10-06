@@ -25,8 +25,9 @@ import logging
 
 from psycopg.rows import dict_row
 
+import inspection_match
 import pipeline_trace
-from repositories import report_templates, users
+from repositories import report_templates, topics as topics_repo, users
 
 logger = logging.getLogger(__name__)
 
@@ -69,13 +70,58 @@ def _record(conn, company_id, folder, date, session, w, tpl_name, request_id, re
          request_id, result_key))
 
 
-def request_body(w, template):
+def _clock(hms):
+    parts = [int(x) for x in str(hms).split(":")]
+    return parts[0] * 3600 + parts[1] * 60 + (parts[2] if len(parts) > 2 else 0)
+
+
+def check_topics(check, others, session_topics):
+    """The topic ids of this check's report: the recording's topics that touch
+    one of its stretches, minus those that are another check's.
+
+    CHOSEN HERE, by the step that knows every check in the recording, because
+    topic times are minute stamps the model writes and they are not where the
+    words were: on TEST (2026-10-06) the pour-booking talk at 17:12:52-17:13:30
+    was stamped "17:12 - 17:12" and the stair-core steel check at 17:15:27 was
+    stamped "17:14". Judged by its minutes the report dropped the first and
+    took the second. A topic touching a stretch (to the minute) is in; one whose
+    title names another check's kind ("Stair Core Steel Check" -- steel) and not
+    this one's is out."""
+    stretches = check.get("segments") or [{"from": check["start_at"], "to": check.get("end_at")}]
+    mine = set(inspection_match.words(check.get("kind")) or inspection_match.words(check.get("name")))
+    theirs = set()
+    for o in others:
+        theirs |= set(inspection_match.words(o.get("kind")) or inspection_match.words(o.get("name")))
+    theirs -= mine
+    out = []
+    for t in session_topics:
+        tr = t.get("time_range") or ""
+        clocks = [c.strip() for c in tr.replace("—", "-").replace("–", "-").split("-") if c.strip()]
+        try:
+            start = _clock(clocks[0]) // 60 * 60
+            end = _clock(clocks[-1]) // 60 * 60 + 59
+        except (ValueError, IndexError):
+            continue
+        touches = any(start < _clock(s["to"] or "23:59:59") and end >= _clock(s["from"])
+                      for s in stretches)
+        if not touches:
+            continue
+        named = set(inspection_match.words(t.get("title")))
+        if named & theirs and not named & mine:
+            continue
+        out.append(str(t["id"]))
+    return out
+
+
+def request_body(w, template, topic_ids=None):
     """The report dialog's request, for one check."""
     body = {"templateId": str(template["id"]), "templateVersion": template["current_version"],
             "title": _title(template["name"], w["name"], w["start_at"]),
             "deliver": "download", "from": w["start_at"], "to": w.get("end_at") or "23:59"}
     if len(w.get("segments") or []) > 1:
         body["segments"] = w["segments"]
+    if topic_ids:
+        body["topicRowIds"] = topic_ids
     return body
 
 
@@ -91,6 +137,8 @@ def auto_generate(conn, company_id, folder, date, session, windows, generate=Non
     matched = [w for w in windows if w.get("template_id")]
     if not matched:
         return out
+    session_topics = [t for t in topics_repo.list_day_topics_for_binding(conn, folder, date)
+                      if session in (t.get("source_s3_key") or "")]
     user = users.get_by_folder_name(conn, company_id, folder) or {}
     caller = users.get_user_by_sub(conn, user["cognito_sub"]) if user.get("cognito_sub") else None
     for w in matched:
@@ -107,7 +155,8 @@ def auto_generate(conn, company_id, folder, date, session, windows, generate=Non
             if not tpl or not tpl.get("current_version"):
                 out.append((w["name"], "template gone"))
                 continue
-            body = request_body(w, tpl)
+            others = [o for o in windows if o is not w]
+            body = request_body(w, tpl, check_topics(w, others, session_topics) or None)
             res = generate(conn, caller, date, {"queryStringParameters": {"user": folder},
                                                 "body": json.dumps(body)})
             payload = json.loads(res.get("body") or "{}")
