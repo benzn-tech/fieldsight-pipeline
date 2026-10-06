@@ -35,10 +35,24 @@ def _title(template_name, check_name, start_at):
     return "%s -- %s (%s)" % (template_name, check_name, (start_at or "")[:5])
 
 
-def already_made(conn, session, template_id, start_at):
-    return conn.execute(
-        "SELECT 1 FROM checklist_reports WHERE session = %s AND template_id = %s AND start_at = %s",
-        (session, str(template_id), start_at)).fetchone() is not None
+def already_made(conn, session, template_id, start_at, end_at=None, segments=None):
+    """True when this check's report exists FOR THE SAME WINDOW.
+
+    The same window, not just the same start: a final extraction often runs
+    before the recording's last transcripts land and is re-run over the fuller
+    set (generation 1, 2...). On TEST (2026-10-06, Ben_Lin_test2 17:12) the
+    first final saw 17:12:52-17:14:13 of a five-minute pre-pour check; keyed on
+    the start alone, the re-run's full window was "already made" and the
+    report stayed the first 80 seconds. A different end or stretches makes it
+    again, replacing the row (_record)."""
+    row = conn.execute(
+        "SELECT end_at, segments FROM checklist_reports "
+        "WHERE session = %s AND template_id = %s AND start_at = %s",
+        (session, str(template_id), start_at)).fetchone()
+    if row is None:
+        return False
+    old_segments = row[1] if not isinstance(row[1], str) else json.loads(row[1])
+    return row[0] == end_at and (old_segments or None) == (segments or None)
 
 
 def _record(conn, company_id, folder, date, session, w, tpl_name, request_id, result_key):
@@ -46,7 +60,10 @@ def _record(conn, company_id, folder, date, session, w, tpl_name, request_id, re
         "INSERT INTO checklist_reports (company_id, user_folder, report_date, session, "
         "template_id, template_name, check_name, start_at, end_at, segments, request_id, "
         "result_key) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s) "
-        "ON CONFLICT (session, template_id, start_at) DO NOTHING",
+        "ON CONFLICT (session, template_id, start_at) DO UPDATE SET "
+        "end_at = EXCLUDED.end_at, segments = EXCLUDED.segments, "
+        "request_id = EXCLUDED.request_id, result_key = EXCLUDED.result_key, "
+        "check_name = EXCLUDED.check_name, created_at = now()",
         (str(company_id), folder, date, session, str(w["template_id"]), tpl_name, w["name"],
          w["start_at"], w.get("end_at"), json.dumps(w.get("segments") or None),
          request_id, result_key))
@@ -82,7 +99,8 @@ def auto_generate(conn, company_id, folder, date, session, windows, generate=Non
                 out.append((w["name"], "no login for %s" % folder))
                 pipeline_trace.event("checklist_report", "no_login", detail={"check": w["name"]})
                 continue
-            if already_made(conn, session, w["template_id"], w["start_at"]):
+            if already_made(conn, session, w["template_id"], w["start_at"], w.get("end_at"),
+                            w.get("segments")):
                 out.append((w["name"], "already made"))
                 continue
             tpl = report_templates.get_any(conn, w["template_id"])
