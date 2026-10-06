@@ -149,3 +149,9 @@ def test_headings_written_without_hashes_are_still_the_templates_sections():
                                           "B. Formwork & Falsework"]
     assert secs[1]["paragraphs"][0].startswith("| Item no")
     assert [s["title"] for s in sr._prose_sections("Pour Details\nx")] == [""], "no titles, as before"
+
+
+def test_chosen_topics_are_taken_as_chosen():
+    src = open(sr.__file__, encoding="utf-8").read()
+    assert 'chosen = bool(artifact.get("requestedTopicRowIds"))' in src
+    assert "test = (lambda *a: True) if chosen else (_mostly_in if precise else _in_window)" in src

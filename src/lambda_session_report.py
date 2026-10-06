@@ -239,7 +239,12 @@ def _offered_topics(artifact, budget, win_from, win_to, stretches=None, precise=
     # An interrupted check's report offers the topics of its stretches, not of
     # the other check between them (topic times are whole minutes, so one that
     # shares a minute with a stretch is still offered).
-    test = _mostly_in if precise else _in_window
+    # A report whose topics were CHOSEN (the dialog's ticks, or a spoken
+    # check's own, checklist_reports.check_topics) takes them as chosen: their
+    # minute stamps are not where their words were, and judging them again by
+    # the window dropped the very topics the check was about.
+    chosen = bool(artifact.get("requestedTopicRowIds"))
+    test = (lambda *a: True) if chosen else (_mostly_in if precise else _in_window)
     in_window = [(i, t) for i, t in enumerate(content.get("topics") or [])
                  if (any(test(t, date, a, b) for a, b in stretches) if stretches
                      else test(t, date, win_from, win_to))]
