@@ -78,3 +78,14 @@ def test_THE_a_checks_report_reads_only_the_speech_inside_its_window():
     src = open(sr.__file__, encoding="utf-8").read()
     assert 'turns = [t for t in turns if (t.get("until") or t["at"]) > win_from and t["at"] < win_to' in src
     assert "precise=_precise(window)" in src
+
+
+def test_a_windowed_report_lists_only_its_topics_actions():
+    content = {"topics": [
+        {"action_items": [{"action": "HVAC email", "responsible": "John"}]},
+        {"action_items": [{"action": "PPE on level two"}]}]}
+    offer = [{"ref": "t0"}]
+    assert [a["action"] for a in sr._action_items_for_prompt(content, offer)] == ["HVAC email"]
+    assert len(sr._action_items_for_prompt(content)) == 2, "no window, every action as before"
+    src = open(sr.__file__, encoding="utf-8").read()
+    assert src.count("_action_items_for_prompt(content, topic_offer)") == 2
