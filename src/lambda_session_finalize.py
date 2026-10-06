@@ -224,8 +224,27 @@ def _pipe_row(cells):
     return "| " + " | ".join(_pipe_cell(c) for c in cells) + " |"
 
 
+def _check_lines(checks):
+    """One sentence per spoken check (owner, 2026-10-06): the checklist report is
+    written after this email goes out, so the email says it is coming -- or that
+    no checklist in the Library matched what was said."""
+    out = []
+    for c in checks or []:
+        if not isinstance(c, dict) or not c.get("check"):
+            continue
+        span = "–".join(x for x in (c.get("from"), c.get("to")) if x)
+        when = f" ({span})" if span else ""
+        if c.get("template"):
+            out.append(f"Checklist: {c['template']} for “{c['check']}”{when} is being "
+                       "filled in — it will be ready in FieldSight in a few minutes.")
+        else:
+            out.append(f"Heard “{c['check']}”{when} — no checklist in your Library "
+                       "matches it, so no checklist report was made.")
+    return out
+
+
 def build_confirmation_email(*, date=None, time_range=None, site_name=None,
-                             summary=None, open_todos=None):
+                             summary=None, open_todos=None, checks=None):
     """(subject, body_text, body_html) for the recorder's confirmation email, built
     from the session's still-open to-dos. Pure — no I/O. To-dos with no text are
     dropped; all HTML content is escaped so transcript text can't inject markup. The
@@ -257,6 +276,9 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
         lines.append(f"Site: {site_name}")
     if stamp:
         lines.append(f"Date: {stamp}")
+    check_lines = _check_lines(checks)
+    if check_lines:
+        lines += [""] + check_lines
     if todos:
         # Plan §1.7: the plain-text flavour is a pipe table with the same three
         # columns and a header separator -- leading AND trailing pipes, exactly
@@ -284,6 +306,8 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
         meta.append(f"<strong>Date:</strong> {esc(stamp)}")
     if meta:
         parts.append("<p>" + "<br>".join(meta) + "</p>")
+    if check_lines:
+        parts.append("<p>" + "<br>".join(esc(x) for x in check_lines) + "</p>")
     if todos:
         def _row(t):
             topic = t["kind"] == "topic"
@@ -776,7 +800,8 @@ def process_finalize_request(artifact, *, send=None, write_result=None, complete
         todos = _rows_from_brief_or_request(artifact, todos, poll_brief=poll_brief)
     subject, text, html = build_confirmation_email(
         date=artifact.get("date"), time_range=artifact.get("timeRange"),
-        site_name=artifact.get("siteName"), summary=summary, open_todos=todos)
+        site_name=artifact.get("siteName"), summary=summary, open_todos=todos,
+        checks=artifact.get("checks"))
     if is_updated:
         # A second email with a different body must not read as a duplicate of
         # the first. The recipient already had one for this meeting.

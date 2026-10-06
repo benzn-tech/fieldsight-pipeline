@@ -399,6 +399,15 @@ def _final_email_context(conn, session_base, extraction, date):
             "openTodos": _final_email_rows(extraction, date) + _topic_rows(extraction)}
 
 
+def email_checks(stored):
+    """[{check, template, from, to}] for the confirmation email: each spoken
+    check, with the checklist whose report is being written, or None when no
+    checklist matched."""
+    return [{"check": w.get("name"), "template": w.get("template_name"),
+             "from": (w.get("start_at") or "")[:5], "to": (w.get("end_at") or "")[:5]}
+            for w in stored or []]
+
+
 def _enqueue_final_email(ctx, put=None):
     """One confirmation email per session, whoever gets there first."""
     put = put or _put_finalize_request
@@ -1280,6 +1289,11 @@ def write_extraction_items(date, user_folder, extraction_key):
     # the merged record, and only the step that LANDS the result knows it
     # landed. This lambda is in-VPC and cannot invoke another (BUG-36), so the
     # request rides the same S3 channel as everything else crossing that line.
+    if final_email_ctx and stored_inspections:
+        # The checks heard in this recording, for one line in the email (owner,
+        # 2026-10-06): the email goes out before a check's report is written, and
+        # without this the recorder learns about it only from the web or the bell.
+        final_email_ctx["checks"] = email_checks(stored_inspections)
     if final_email_ctx:
         try:
             _enqueue_final_email(final_email_ctx)
@@ -1402,7 +1416,9 @@ def _store_inspections(conn, company_id, user_id, user_folder, date, session, sp
         tpl, score = inspection_match.match(w, templates)
         rows.append(dict(w, start_at=w.get("start_at_s") or (w["start_at"] + ":00"),
                          end_at=w.get("end_at_s") or ((w["end_at"] + ":00") if w.get("end_at") else None),
-                         template_id=tpl["id"] if tpl else None, match_score=round(score, 2)))
+                         template_id=tpl["id"] if tpl else None,
+                         template_name=tpl["name"] if tpl else None,
+                         match_score=round(score, 2)))
         pipeline_trace.event("checklist_match", "matched" if tpl else "no_match", detail={
             "check": w.get("name"), "kind": w.get("kind"),
             "template": tpl["name"] if tpl else None, "score": round(score, 2),
