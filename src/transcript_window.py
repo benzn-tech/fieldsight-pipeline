@@ -111,15 +111,80 @@ def assemble(s3, bucket, picked, deadline=None):
             logger.info("window: %s did not normalise -- skipped", name)
             continue
         lines = tu.format_turns_for_prompt(norm, use_absolute_time=True)
+        bmap = body.get(batch_stitch.EMBEDDED_MAP_KEY) if isinstance(body, dict) else None
         for i, line in enumerate(lines):
             if not line or not line.strip():
                 continue
             turn = (norm.get("speaker_turns") or [])[i] if i < len(norm.get("speaker_turns") or []) else None
             at = (turn or {}).get("abs_start") or start
             until = (turn or {}).get("abs_end") or at
-            turns.append({"at": at, "until": until, "line": line})
+            turns.append({"at": at, "until": until, "line": line,
+                          "words": _word_times(turn, bmap)})
     turns.sort(key=lambda t: t["at"])
     return turns
+
+
+def _word_times(turn, bmap):
+    """[(word, datetime)] for a turn, through the batch map when the file has
+    one -- a batch is several clips joined, so file seconds are not clock
+    seconds -- else from the turn's own start. [] when the turn carries no
+    words (older transcripts): the caller then keeps the whole turn."""
+    words = (turn or {}).get("words") or []
+    if not words or turn.get("abs_start") is None:
+        return []
+    out = []
+    for w, off in words:
+        when = None
+        if isinstance(bmap, dict) and bmap.get("members"):
+            try:
+                when = batch_stitch.resolve_abs_time(bmap, off)
+            except Exception:
+                when = None
+        if when is None:
+            when = turn["abs_start"] + dt.timedelta(seconds=off - (turn.get("start_sec") or 0.0))
+        out.append((w, when))
+    return out
+
+
+_HEAD_RE = re.compile(r"^\[[^\]]*\]\s*([^:]{0,80}:\s)?")
+
+
+def clip_to_window(turns, win_from, win_to, gaps=()):
+    """Only the speech inside [win_from, win_to) and outside every gap, to the WORD.
+
+    A turn is one speaker's run, and on a one-person recording that is a whole
+    transcript file -- 90 seconds. Kept or dropped whole, a report on a spoken
+    check either read the next check's words (TEST 2026-10-06: the pre-pour
+    PPE item answered from the Level 2 talk) or, when a 15-second gap touched
+    the turn, lost the 90 seconds around it (the same day: the formwork and
+    reinforcement items had no transcript left). A turn with its word times is
+    cut to the words inside; one without (older transcripts) is kept when it
+    overlaps the window and touches no gap, as before."""
+    def outside(t):
+        return t < win_from or t >= win_to or any(a <= t < b for a, b in gaps)
+
+    out = []
+    for t in turns:
+        words = t.get("words") or []
+        if not words:
+            until = t.get("until") or t["at"]
+            if (until > win_from and t["at"] < win_to or t["at"] == win_from) and \
+                    not any(t["at"] < b and until > a for a, b in gaps):
+                out.append(t)
+            continue
+        kept = [(w, when) for w, when in words if not outside(when)]
+        if not kept:
+            continue
+        if len(kept) == len(words):
+            out.append(t)
+            continue
+        m = _HEAD_RE.match(t["line"])
+        who = (m.group(1) or "") if m else ""
+        first, last = kept[0][1], kept[-1][1]
+        line = "[%s \u2013 %s] %s%s" % (first.strftime("%H:%M:%S"), last.strftime("%H:%M:%S"),
+                                        who, " ".join(w for w, _ in kept))
+        out.append(dict(t, at=first, until=last, line=line, words=kept))
+    return out
 
 
 class UnplaceableExclusion(Exception):
