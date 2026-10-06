@@ -734,11 +734,20 @@ def _clock(date, hhmm):
     return datetime.datetime.strptime("%s %s" % (date, hhmm), fmt)
 
 
-def _action_items_for_prompt(content):
+def _action_items_for_prompt(content, offer=None):
     """The actions the model is given: extraction's, not its own reading of the
-    transcript. Owner and date are already recorded against them."""
+    transcript. Owner and date are already recorded against them.
+
+    `offer` (the topics in this report's window, _offered_topics) limits them
+    to those topics' actions. Without it every action of the day came along: on
+    TEST (2026-10-06) a pre-pour checklist for 10:59-11:02 listed the Level 2
+    PPE action from 11:03."""
+    keep = None if offer is None else {int(t["ref"][1:]) for t in offer
+                                       if str(t.get("ref", "")).startswith("t")}
     out = []
-    for topic in (content.get("topics") or []):
+    for i, topic in enumerate(content.get("topics") or []):
+        if keep is not None and i not in keep:
+            continue
         for a in (topic.get("action_items") or []):
             out.append({"action": a.get("action") or a.get("text"),
                         "owner": a.get("owner") or a.get("responsible"),
@@ -946,7 +955,7 @@ def _generate_document(artifact, context=None):
         {"folder": artifact["folder"], "date": date,
          "from": window.get("from") or "00:00", "to": window.get("to") or "23:59",
          "recordings": len(picked)},
-        _action_items_for_prompt(content),
+        _action_items_for_prompt(content, topic_offer),
         "\n".join(t["line"] for t in turns),
         source=source,
         topics=topic_offer)
@@ -1029,7 +1038,7 @@ def _generate_document(artifact, context=None):
         # Report Details section it carries what was actually recorded.
         date,
         prose,
-        _action_items_for_prompt(content),
+        _action_items_for_prompt(content, topic_offer),
         closing=note)
     # WHICH TEMPLATE THIS WAS comes from the REQUEST, not from the template's
     # own text. The files in report_templates/ carry `template_id` and
