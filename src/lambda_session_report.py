@@ -803,13 +803,27 @@ def _covers_refs(line):
     return out
 
 
-def _prose_sections(text):
+_TITLE_DECOR_RE = re.compile(r"^[\s#*_]+|[\s*_:]+$")
+
+
+def _prose_sections(text, titles=None):
     """Split the model's markdown back into {title, paragraphs}. Anything before the
-    first heading is kept under an empty title rather than dropped."""
+    first heading is kept under an empty title rather than dropped.
+
+    `titles` are the template's own section titles: a line that is exactly one
+    of them -- bare, bold, or with a colon -- is that section's heading even
+    without the `#`. On TEST (2026-10-06) muse-spark wrote "Pour Details" and
+    "A. Documents & Approvals" as plain lines; no section was recognised, the
+    checklists were rebuilt blank at the end, the model's own tables were
+    printed raw, and the code-written sections fell to the bottom."""
+    known = {" ".join(str(t).split()).lower() for t in titles or [] if t}
     sections, current = [], {"title": "", "paragraphs": [], "level": 1,
                              "covers": [], "line_refs": []}
     for raw in (text or "").splitlines():
         line = raw.rstrip()
+        bare = " ".join(_TITLE_DECOR_RE.sub("", line).split())
+        if known and not line.startswith("#") and bare.lower() in known and "|" not in line:
+            line = "## " + bare
         # A table whose first column is "#" (`# | Action | Owner`) is a header
         # row, not a heading: read as one it split the table off its section.
         if line.startswith("#") and not line.lstrip("#").strip().startswith("|"):
@@ -902,7 +916,6 @@ def _generate_document(artifact, context=None):
     # are left out exactly like an excluded topic's span -- the other check
     # done in between is not this one.
     gaps = _segment_gaps(date, window.get("segments"))
-    spans = spans + gaps
 
     read_budget = _model_budget_seconds(context)
     if read_budget <= llm_utils.MIN_USEFUL_SECONDS:
@@ -917,12 +930,13 @@ def _generate_document(artifact, context=None):
                                            win_from, win_to)
     turns = transcript_window.drop_spans(
         transcript_window.assemble(client, S3_BUCKET, picked, deadline=read_deadline), spans)
-    # Only the speech INSIDE the window. select_keys picks whole audio files
-    # that overlap it, and every turn of a file used to come along: on TEST
-    # (2026-10-06) a pre-pour check ending 11:02:14 was filled from the Level 2
-    # steel check later in the same 2-minute file ("No -- glasses and gloves").
-    turns = [t for t in turns if (t.get("until") or t["at"]) > win_from and t["at"] < win_to
-             or t["at"] == win_from]
+    # Only the speech INSIDE the window, and outside the gaps between an
+    # interrupted check's stretches -- to the word (transcript_window.
+    # clip_to_window). select_keys picks whole audio files that overlap it, and
+    # every turn of a file used to come along: on TEST (2026-10-06) a pre-pour
+    # check ending 11:02:14 was filled from the Level 2 steel check later in the
+    # same 2-minute file ("No -- glasses and gloves").
+    turns = transcript_window.clip_to_window(turns, win_from, win_to, gaps)
     if not turns:
         raise RuntimeError("no recorded speech in this window after exclusions")
     if glossary:
@@ -989,7 +1003,9 @@ def _generate_document(artifact, context=None):
     if err or not (text or "").strip():
         raise RuntimeError(err or "empty answer from model")
 
-    prose = _prose_sections(text)
+    prose = _prose_sections(text, titles=[s.get("title") for s in
+                                           (template.get("sections") or [])]
+                            + [(template.get("catch_all") or {}).get("title")])
     # CHECKLISTS ARE REBUILT HERE, before anything counts the answer: only rows
     # whose evidence is in the transcript survive, in the customer's order and
     # wording, and every item nobody addressed stays blank (checklist.py).
