@@ -1,46 +1,41 @@
-"""Answer from the open web when the records cannot.
+"""Ask's general-knowledge flow: classify, then (model draft -> web verify).
 
-Spec: docs/superpowers/specs/2026-09-10-answering-from-the-open-web-design.md
-Plan: docs/superpowers/plans/2026-09-11-answering-from-the-open-web.md
+Spec: docs/superpowers/specs/2026-10-06-ask-knowledge-then-verify-design.md
+(supersedes the web-answer route of 2026-09-10-answering-from-the-open-web).
 
-This is the SMALLEST end-to-end version of that plan: one route, no concurrency,
-no separate door for an empty corpus, no UI beyond a block the client may render.
-It exists so the feature can be judged from use rather than from a document --
-five review rounds produced a design and no working path, and a design nobody has
-felt is a design nobody can correct.
+## Trust by claim type
 
-## The breakdown this replaced, and why
+Project facts (what was said or decided on this site) come only from the
+records. General knowledge (standards, codes, product data, methods) comes from
+the model, checked against the web. When they disagree the answer says so.
 
-The first build broke the question into gate-screened entity NAMES, searched
-those, and composed an answer from the findings -- three model calls, so nothing
-but names would reach a search engine.
+## The three entry points, and the one rule they share
 
-It failed on the most ordinary question there is. Asked *"Which New Zealand
-standard covers timber design?"*, subject extraction returned NOTHING on three
-runs out of four: the question contains no standard number, because **the number
-is the thing the asker does not know, which is why they are asking.**
+  * `classify`        one cheap call after retrieval: kind + "do the records
+                      answer it". Replaces the old verdict call.
+  * `general_answer`  draft (no web) -> verify (web, question + draft only) ->
+                      one retry of verify only if time allows -> else the draft
+                      VERBATIM, labelled unverified.
+  * `compose`         mixed questions: merge the records answer and the general
+                      block with attribution and a conflicts list.
 
-So the question goes out whole, and `question_admission` decides whether it may
--- same protection, admission instead of dissection. Two calls instead of four.
-
-## Why the verdict runs BEFORE the grounded answer
-
-Answering from records first and looking up second does not fit. Measured worst
-case from the HTTP request: retrieval 1.36 + synthesis 11.9 + verdict 3.2 +
-lookup 11.4 = 27.9s against API Gateway's 29s, before anything goes wrong.
-Asking first turns the verdict into a router and both branches fit.
-
-The cost is the verdict call on every question, including the majority the
-corpus answers. The plan's concurrent shape removes it; this is the small
-version.
+The shared rule: nothing here may turn into "nothing". Measured 2026-10-06 on
+the owner's sprinkler question: a lookup that aborted at 11 s left the reader
+with "the excerpts do not contain it", twice. And a model asked to FILL THE GAP
+after a failed search wrote the most confident wrong number ("2.0 m"), so after
+a failed verify the draft is returned as it stands and no further model call is
+made.
 
 ## What crosses which boundary
 
-  * the SEARCH ENGINE receives the QUESTION, once `question_admission` has
-    passed it -- never the excerpts, never a paragraph of context
-  * the LLM PROVIDER receives the question and the excerpts, which it already
-    receives on every `/ask`
-
+  * the SEARCH ENGINE receives the asker's question and the model's own draft --
+    never the excerpts
+  * the LLM PROVIDER receives the question (draft), question + draft (verify),
+    and, for classify/compose, the excerpts / records answer it already sees on
+    every /ask
+  * `classify` judges the REWRITTEN question (`asked`); everything sent out
+    uses the asker's own `question`. That boundary is unchanged: a rewrite is
+    derived from history, and a history is a copy taken before a deletion.
 """
 from __future__ import annotations
 
@@ -55,18 +50,26 @@ import question_admission
 
 logger = logging.getLogger()
 
-# Measured against the deployed vendor: the verdict is a classification
-# (2.4-3.3s over four questions, 6.8s once) and the lookup is a search plus an
-# answer (10.3-11.4s). 8 + 14 = 22 plus the 2s floor fits the 27s stop, which
-# fits API Gateway's 29s.
-VERDICT_BUDGET = 8.0
-WEB_BUDGET = 14.0
+# Per-call ceilings. Measured: classify 2.4-3.3 s; draft ~3-4 s; verify 8.8-11 s
+# (the vendor aborts at ~11 s when it aborts); compose ~3 s. The whole chain is
+# further bounded by the caller-supplied budget, which comes out of
+# HARD_STOP_SECONDS (API Gateway gives up at 29 s).
+CLASSIFY_BUDGET = 8.0
+DRAFT_BUDGET = 8.0
+VERIFY_BUDGET = 14.0
+COMPOSE_BUDGET = 8.0
+# A verify retry (~9 s) is attempted only if at least this many seconds remain.
+VERIFY_RETRY_MIN_LEFT = 10.0
+# Seconds the caller keeps back for compose when it runs after the chain.
+COMPOSE_RESERVE = 4.0
 HARD_STOP_SECONDS = float(os.environ.get("WEB_ANSWER_HARD_STOP", "27"))
 
 CHEAP_MODEL = os.environ.get("CORROBORATION_CHEAP_MODEL", "google/gemini-3.8-flash")
 
-_FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.MULTILINE)
+KINDS = ("project", "general", "mixed")
 
+_FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.MULTILINE)
+_MARKER = re.compile(r"\[(\d+)\]")
 
 
 def enabled():
@@ -75,12 +78,23 @@ def enabled():
     return os.environ.get("ENABLE_WEB_ANSWER", "false").lower() == "true"
 
 
-VERDICT_PROMPT = """Do the excerpts below answer the question?
+CLASSIFY_PROMPT = """Classify this question asked of a construction site's meeting records,
+and say whether the excerpts below answer it.
 
-Answer true only if a reader would get what they asked for from these excerpts
-alone. Excerpts merely about the same site or the same day are not an answer.
+kind:
+- "project": about what was said, decided, agreed, requested or done on this
+  project or site -- people, dates, quantities, tasks, events.
+- "general": about the outside world -- standards, codes, regulations, product
+  data, methods -- the kind of thing a reference book would answer.
+- "mixed": needs both (e.g. whether what the site did meets a standard).
 
-Return only JSON, no prose: {{"answered": true|false}}
+records_answer: true only if a reader would get what they asked for, for the
+project part of the question, from these excerpts alone. Excerpts merely about
+the same site or the same day are not an answer. For a "general" question, true
+only if the excerpts hold a related discussion worth showing alongside.
+
+Return only JSON, no prose:
+{{"kind": "project"|"general"|"mixed", "records_answer": true|false}}
 
 ## Question
 {question}
@@ -89,17 +103,55 @@ Return only JSON, no prose: {{"answered": true|false}}
 {excerpts}
 """
 
-WEB_PROMPT = """Search the open web and answer this question, for a reader working
-on a New Zealand construction site.
-
-Report only what public sources say. Do not speculate, and do not fill a gap with
-general knowledge -- if the sources do not answer the question, say so plainly
-rather than guessing.
-
-Name the source of each fact you use. Be brief.
+# Wording from the 2026-10-06 strategy probe (LLM_ONLY).
+DRAFT_PROMPT = """Answer this question for a reader working on a New Zealand construction site,
+from your own knowledge only. Be brief. Name the standard/clause you rely on. If you
+are not sure of a figure, say so plainly instead of guessing.
 
 ## Question
 {question}
+"""
+
+# Wording from the 2026-10-06 strategy probe (LLM_THEN_WEB). It carries the
+# question and the draft and NOTHING from the records.
+VERIFY_PROMPT = """A colleague answered the question below from memory. Search the open web
+to check it. Keep what the sources confirm, correct what they contradict (citing
+the source), and mark anything still unconfirmed as [unverified]. Be brief.
+
+## Question
+{question}
+
+## Colleague's answer
+{draft}
+"""
+
+COMPOSE_PROMPT = """Merge two answers to one question for a reader working on a New Zealand
+construction site.
+
+Rules:
+- Facts about THIS project (what was said or decided on site, who, when,
+  quantities) may come ONLY from the RECORDS ANSWER.
+- General facts (standards, codes, regulations, product data, methods) may come
+  ONLY from the GENERAL ANSWER.
+- Where the two disagree, list it in "conflicts", one short sentence each, in the
+  form "the records say X; <standard or source> says Y". Also state it in the
+  answer, marked with a warning sign.
+- The RECORDS ANSWER carries inline markers like [1]. Keep every one of them
+  exactly as written, next to the fact it supports. NEVER write a [n] marker of
+  your own, and never reuse one for a general fact -- name the standard or the
+  source in words instead.
+- Be brief. No preamble.
+
+Return only JSON, no prose: {{"answer": "...", "conflicts": ["..."]}}
+
+## Question
+{question}
+
+## RECORDS ANSWER
+{records}
+
+## GENERAL ANSWER
+{general}
 """
 
 
@@ -111,9 +163,9 @@ def _loads(text):
 
 
 def _excerpt_block(chunks, limit=5):
-    """What the gate judges. Deliberately the same text the grounded answer is
-    built from -- a gate reading headers alone would be judging titles, and a
-    topic title says nothing about whether a question was answered."""
+    """What classify judges. Deliberately the same text the grounded answer is
+    built from -- a classifier reading headers alone would be judging titles, and
+    a topic title says nothing about whether a question was answered."""
     out = []
     for i, c in enumerate(chunks[:limit], start=1):
         header = " . ".join(str(p) for p in (
@@ -123,125 +175,180 @@ def _excerpt_block(chunks, limit=5):
     return "\n".join(out)
 
 
-def answer(question, chunks, *, skip_verdict=False, verdict_question=None,
-           clock=time.monotonic):
-    """A web-answer block, or None to leave the grounded path alone.
+# ------------------------------------------------------------------ classify
 
-    `chunks` may be empty: retrieval returning nothing IS the verdict, so that
-    case skips straight to the lookup rather than asking a model whether an
-    empty set answered anything. That is the case the first build missed
-    entirely -- it returned a fixed "no relevant records" string above this hook
-    and never reached it.
+def classify(question, chunks, budget):
+    """`{"kind", "records_answer", "source"}`. Never raises, never returns None.
 
-    `skip_verdict` skips ONLY the verdict model call -- a cheap distance gate
-    upstream (`lambda_ask_agent._rag_answer`) may already know the records
-    cannot answer this. `chunks` are still passed through unchanged and still
-    reach `question_admission.screen()` below: it derives two of its three
-    signals (site names, the account's own words) FROM `chunks`, so calling
-    `answer(question, [])` to skip the verdict would also disarm those checks.
-    Never do that -- this keyword exists so nobody has to.
+    `question` is the question the CLASSIFIER judges (the standalone rewrite when
+    conversation memory ran). `source` is "model", "fallback" or "no_records".
 
-    `verdict_question` is the question the VERDICT judges, when that differs
-    from the one the asker typed. Conversation memory rewrites a follow-up into
-    a standalone question ("When does it have to be finished?" -> "When does
-    the Unit 11 backfill have to be finished?") and retrieves with THAT, so
-    judging the excerpts against the pronoun version asks the model whether
-    records answer a question that names nothing -- it says no, and a records
-    answer that exists gets replaced by a web answer. Measured on TEST
-    2026-09-18: two rewritten follow-ups, both routed to the web, one of them
-    answering "when must the backfill be finished" with New Zealand's two-year
-    building-consent rule while the records said Friday.
-
-    It reaches the verdict and NOTHING else. The lookup below still sends the
-    asker's own `question`, and `question_admission.screen` still screens that
-    same text, so a rewrite -- which is derived from conversation history, and
-    history is a copy taken before a deletion -- never widens what leaves the
-    account. That boundary is the whole reason history stops at the rewrite.
-
-    Never raises. Every failure returns either None or a body whose flags say
-    which -- "we found nothing", "we may not ask" and "we did not look" are
-    three different sentences and only one of them is about the world.
+    FAIL-SAFE (ruling, 2026-10-06): an unreadable or failed classification is not
+    permission to guess narrow. With records in hand it becomes kind="mixed",
+    records_answer=True -- both flows run and `compose` attributes each fact to
+    the side allowed to supply it, so a project question is never answered from
+    the model's general knowledge alone and a general one is never answered from
+    meeting notes alone. With no records it becomes kind="general". The cost is
+    time (an extra compose call), never an empty answer.
     """
-    if not enabled() or not question:
-        return None
+    if not chunks:
+        # Nothing was retrieved: retrieval returning nothing IS the verdict, so
+        # no model is asked whether an empty set answered anything.
+        return {"kind": "general", "records_answer": False, "source": "no_records"}
+    fallback = {"kind": "mixed", "records_answer": True, "source": "fallback"}
+    reply = client.call(
+        CLASSIFY_PROMPT.format(question=question, excerpts=_excerpt_block(chunks)),
+        timeout=budget, model=CHEAP_MODEL, max_tokens=512, effort="low",
+        caller="web_classify")
+    if not reply.ok:
+        logger.warning("ask classify failed: %s", reply.error)
+        return fallback
+    parsed = _loads(reply.text)
+    if (not isinstance(parsed, dict) or parsed.get("kind") not in KINDS
+            or not isinstance(parsed.get("records_answer"), bool)):
+        logger.warning("ask classify: reply was not a classification")
+        return fallback
+    return {"kind": parsed["kind"], "records_answer": parsed["records_answer"],
+            "source": "model"}
 
+
+# ------------------------------------------------------------ general answer
+
+def _block(*, answer=None, sources=(), status="unverified", kind="general",
+           searched=False, timed_out=False, failed=False, refused=None,
+           retried=False, ms=None):
+    """The `web` block. `_trace` is for the caller's ASK_ROUTE line and is popped
+    before the response leaves the lambda."""
+    return {"answer": answer, "sources": list(sources), "status": status,
+            "kind": kind, "conflicts": [], "searched": searched,
+            "timed_out": timed_out, "failed": failed, "refused": refused,
+            "_trace": {"retried": retried, "ms": ms or {}}}
+
+
+def _verify_ok(reply):
+    # Prose describing a search is not evidence one happened (measured on a
+    # second vendor: 200 OK, no results, a paragraph asserting findings).
+    return reply.ok and reply.searched and bool((reply.text or "").strip())
+
+
+def general_answer(question, budget, *, kind="general", clock=time.monotonic):
+    """Draft from the model's knowledge, verify on the web, never nothing.
+
+    `budget` is the seconds this whole chain may take. Returns a `web` block;
+    `answer` is None only when even the draft could not be produced.
+
+      draft   no web. The model says what it knows and where it is unsure.
+      verify  web=True; the prompt carries the question and the draft ONLY.
+      retry   verify once more, only when `VERIFY_RETRY_MIN_LEFT` seconds remain.
+      failed  the draft, VERBATIM, status "unverified". No further model call:
+              asking a model to fill the gap after a failed search invented
+              "2.0 m" (measured 2026-10-06).
+
+    A question over the admission cap is not sent to the web at all; it still
+    gets the draft, with status "too_long".
+    """
     started = clock()
+    ms = {}
 
     def left():
-        return HARD_STOP_SECONDS - (clock() - started)
+        return budget - (clock() - started)
 
-    if chunks and not skip_verdict:
-        judged = (verdict_question or "").strip() or question
-        verdict, err = _verdict(judged, chunks, min(VERDICT_BUDGET, left()))
-        if err or verdict is None:
-            # Fail closed. An unreadable verdict is not permission to search.
-            logger.warning("web answer: verdict failed: %s", err)
-            return None
-        if verdict.get("answered") is True:
-            logger.info("web answer: the records answer it; no lookup")
-            return None
-    elif skip_verdict:
-        logger.info("web answer: distance gate skipped the verdict call")
-    else:
-        logger.info("web answer: nothing retrieved; the records cannot answer it")
+    refused = question_admission.screen(question)
+    if refused == question_admission.EMPTY:
+        return _block(kind=kind, failed=True, refused=refused, ms=ms)
 
-    refused = question_admission.screen(question, chunks)
+    t = clock()
+    draft_reply = client.call(
+        DRAFT_PROMPT.format(question=question),
+        timeout=min(DRAFT_BUDGET, left()), max_tokens=1024, effort="low",
+        caller="web_draft")
+    ms["draft"] = int((clock() - t) * 1000)
+    draft = (draft_reply.text or "").strip() if draft_reply.ok else ""
+    if not draft:
+        logger.warning("ask general: draft failed: %s", draft_reply.error)
+        return _block(kind=kind, failed=True, timed_out=bool(draft_reply.timed_out),
+                      ms=ms)
+
     if refused:
-        # Loud, and returned rather than swallowed: a refusal nobody can see
-        # cannot be measured.
-        logger.info("web answer: question not sent -- %s", refused)
-        return _spent(refused=refused)
+        logger.info("ask general: question not sent to the web -- %s", refused)
+        return _block(answer=draft, status="too_long", kind=kind, refused=refused,
+                      ms=ms)
 
-    if left() < client.MIN_USEFUL_TIMEOUT:
-        return _spent(timed_out=True)
+    retried = False
+    last = None
+    for attempt in (1, 2):
+        if attempt == 2:
+            if left() < VERIFY_RETRY_MIN_LEFT:
+                logger.info("ask general: no retry, %.1fs left", left())
+                break
+            retried = True
+        if left() < client.MIN_USEFUL_TIMEOUT:
+            break
+        t = clock()
+        last = client.call(
+            VERIFY_PROMPT.format(question=question, draft=draft),
+            timeout=min(VERIFY_BUDGET, left()), max_tokens=2048, web=True,
+            effort="low", caller="web_verify")
+        ms["verify" if attempt == 1 else "verify_retry"] = int((clock() - t) * 1000)
+        if _verify_ok(last):
+            logger.info("ask general: verified against %d sources",
+                        len(last.search_results))
+            return _block(answer=last.text.strip(), sources=_sources(last),
+                          status="verified", kind=kind, searched=True,
+                          retried=retried, ms=ms)
+        logger.warning("ask general: verify attempt %d failed: %s (searched=%s)",
+                       attempt, getattr(last, "error", None),
+                       getattr(last, "searched", None))
 
-    found = _ask_the_web(question, min(WEB_BUDGET, left()))
-    if not found.ok:
-        logger.warning("web answer: lookup failed: %s (timed_out=%s)",
-                       found.error, found.timed_out)
-        return _spent(timed_out=bool(found.timed_out),
-                      failed=not found.timed_out)
-    if not found.searched:
-        # Prose describing a search is not evidence one happened. Measured on a
-        # second vendor: 200 OK, no results, a paragraph asserting findings.
-        logger.warning("web answer: no web results came back")
-        return _spent()
-
-    logger.info("web answer: answered from %d sources", len(found.search_results))
-    return {"answer": (found.text or "").strip(),
-            "sources": _sources(found),
-            "searched": True, "timed_out": False, "failed": False,
-            "refused": None}
+    return _block(answer=draft, status="unverified", kind=kind, retried=retried,
+                  timed_out=bool(last is not None and last.timed_out),
+                  failed=True, ms=ms)
 
 
-def _spent(*, timed_out=False, failed=False, refused=None):
-    """A body that says what happened, never an empty one that reads as
-    'the web had nothing to say'. Four states, because they lead four different
-    places: we may not ask, we did not look, we ran out of time, it broke."""
-    return {"answer": None, "sources": [], "searched": False,
-            "timed_out": timed_out, "failed": failed, "refused": refused}
+# ------------------------------------------------------------------- compose
 
+def compose(records_answer_text, general_block, question, budget):
+    """Merge the records answer and the general block for a mixed question.
 
-def _verdict(question, chunks, budget):
+    Returns `{"answer", "conflicts", "composed"}`. On any failure `composed` is
+    False, `answer` is the records answer UNCHANGED and `conflicts` is empty --
+    the caller then shows the general block alongside, as it does for a general
+    question with useful records.
+
+    The citations contract (lambda_ask_agent._build_citations): card [i+1] maps
+    to inline [n] in the records answer. The general text carries its OWN [n]
+    markers pointing at web sources, so they are stripped before the model sees
+    it, and the output is rejected unless every marker in it already occurs in
+    the records answer. A prompt asking for that is not a guard; this check is.
+    """
+    fail = {"answer": records_answer_text, "conflicts": [], "composed": False}
+    general_text = _MARKER.sub("", (general_block or {}).get("answer") or "").strip()
+    if not general_text or not (records_answer_text or "").strip():
+        return fail
+    if budget < client.MIN_USEFUL_TIMEOUT:
+        return fail
     reply = client.call(
-        VERDICT_PROMPT.format(question=question, excerpts=_excerpt_block(chunks)),
-        timeout=budget, model=CHEAP_MODEL, max_tokens=512, effort="low",
-        caller="web_verdict")
+        COMPOSE_PROMPT.format(question=question, records=records_answer_text,
+                              general=general_text),
+        timeout=min(COMPOSE_BUDGET, budget), model=CHEAP_MODEL, max_tokens=2048,
+        effort="low", caller="web_compose")
     if not reply.ok:
-        return None, reply.error
+        logger.warning("ask compose failed: %s", reply.error)
+        return fail
     parsed = _loads(reply.text)
-    if not isinstance(parsed, dict) or "answered" not in parsed:
-        return None, "verdict was not a verdict"
-    return parsed, None
-
-
-def _ask_the_web(question, budget):
-    """One call: the question, the web plugin, an answer. The provider composes
-    its own queries from the question, which is why `question_admission` runs
-    before this and not after."""
-    return client.call(WEB_PROMPT.format(question=question),
-                       timeout=budget, max_tokens=2048, web=True, effort="low",
-                       caller="web_answer")
+    if (not isinstance(parsed, dict) or not isinstance(parsed.get("answer"), str)
+            or not parsed["answer"].strip()
+            or not isinstance(parsed.get("conflicts", []), list)):
+        logger.warning("ask compose: reply was not a composition")
+        return fail
+    allowed = set(_MARKER.findall(records_answer_text))
+    if not set(_MARKER.findall(parsed["answer"])) <= allowed:
+        logger.warning("ask compose: invented a citation marker; discarded")
+        return fail
+    return {"answer": parsed["answer"].strip(),
+            "conflicts": [str(c).strip() for c in parsed.get("conflicts", [])
+                          if str(c).strip()],
+            "composed": True}
 
 
 def _sources(reply, limit=4):

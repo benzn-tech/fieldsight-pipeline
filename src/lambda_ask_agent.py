@@ -1040,6 +1040,58 @@ def _build_citations(chunks):
     ]
 
 
+def _web_answer_enabled():
+    """Lazy for the same reason every other import in `_rag_answer` is: the
+    legacy hand-built prod zip carries no web_answer.py."""
+    import web_answer
+    return web_answer.enabled()
+
+
+def _general_chain(web_answer, question, asked, chunks, gated, started, route):
+    """Classify (when there is something to classify), then run the general
+    flow if the class needs it. Returns `(classification, web_block_or_None)`.
+
+    Runs on a worker thread beside the records synthesis, and writes its own
+    keys of `route` (the ASK_ROUTE record) -- disjoint from anything the main
+    thread writes until both are joined.
+
+    `asked` (the standalone rewrite) is what classify judges; `question` (what
+    the asker typed) is the only text that goes anywhere else. `gated` means the
+    distance gate already knows the records cannot answer: classify is skipped
+    and the general flow runs alone, which is what "project + records_answer
+    false" would have routed to anyway.
+
+    The budget is what is left of HARD_STOP_SECONDS measured from the START of
+    the request, not from this call: retrieval and rewrite already spent some.
+    """
+    def left():
+        return web_answer.HARD_STOP_SECONDS - (time.monotonic() - started)
+
+    t = time.monotonic()
+    if gated and chunks:
+        cls = {"kind": "general", "records_answer": False, "source": "gated"}
+    else:
+        cls = web_answer.classify(asked, chunks,
+                                  min(web_answer.CLASSIFY_BUDGET, left()))
+    route["ms"]["classify"] = int((time.monotonic() - t) * 1000)
+    route["kind"] = cls["kind"]
+    route["records_answer"] = cls["records_answer"]
+    route["classify"] = cls["source"]
+
+    useful = bool(cls["records_answer"]) and bool(chunks)
+    if cls["kind"] == "project" and useful:
+        return cls, None            # today's grounded path, nothing else runs
+
+    # Mixed keeps back time for the compose call that follows the join.
+    reserve = web_answer.COMPOSE_RESERVE if (cls["kind"] == "mixed" and useful) else 0.0
+    gen = web_answer.general_answer(question, left() - reserve, kind=cls["kind"])
+    trace = gen.pop("_trace", {})
+    route["general_status"] = gen["status"]
+    route["retried"] = bool(trace.get("retried"))
+    route["ms"].update(trace.get("ms") or {})
+    return cls, gen
+
+
 def _parse_now(raw):
     """An ISO instant, or None. Never raises: a malformed one falls back to the
     real clock rather than failing an answer over a debugging field."""
@@ -1321,6 +1373,12 @@ def _rag_answer(body):
     # assignment still logs a real count, not a NameError.
     marks = {}
     history_turns = 0
+    # ONE `ASK_ROUTE {json}` line per request (spec 2026-10-06 D6), written from
+    # the `finally` below. No question text and no answer text, ever: it is a
+    # routing record, and what was asked belongs to the asker. `kind` None means
+    # no classification ran (scoped / pinned / voice / flag off / early return).
+    route = {"kind": None, "records_answer": None, "general_status": "not_needed",
+             "retried": False, "ms": {}}
 
     question = (body.get("question") or "").strip()
     caller_sub = body.get("caller_sub")
@@ -1594,13 +1652,31 @@ def _rag_answer(body):
             # depends on the no-answer result.
             if body.get("mode") != "voice" and not result.get("error") and not scoped:
                 import web_answer
-                empty_web = web_answer.answer(question, [])
-                if empty_web is not None and empty_web.get("answer"):
+                if web_answer.enabled() and question:
+                    # Nothing retrieved: no classification is spent (it would
+                    # judge an empty list). The general flow runs alone --
+                    # "project + no records" falls back to it by design (spec D2).
+                    _t_web = time.monotonic()
+                    _cls, empty_web = _general_chain(
+                        web_answer, question, asked, [], False, _started, route)
+                    marks["synthesis"] = time.monotonic() - _t_web
+                    if empty_web.get("answer"):
+                        return {
+                            "answer": empty_web["answer"],
+                            "citations": [],
+                            "grounded": False,
+                            "from_web": True,
+                            "web": empty_web,
+                            "basis": basis,
+                            "applied_scope": applied_scope,
+                            "asked": asked if rewritten else None,
+                        }
+                    # The draft failed too. The reader is still told what
+                    # happened to the outside lookup (D5), never nothing.
                     return {
-                        "answer": empty_web["answer"],
+                        "answer": "No relevant records found for this question.",
                         "citations": [],
-                        "grounded": False,
-                        "from_web": True,
+                        "grounded": True,
                         "web": empty_web,
                         "basis": basis,
                         "applied_scope": applied_scope,
@@ -1652,7 +1728,11 @@ def _rag_answer(body):
         # only `chunks`, never the pinned block, so on TEST it judged a pinned
         # topic's records unable to answer "What are the next steps?" and
         # returned a web block with no citations instead of the topic.
-        if body.get("mode") != "voice" and chunks and not scoped and not pinned_topic:
+        # Flag off (ENABLE_WEB_ANSWER) skips the whole general flow, classify
+        # included: today's records-only behaviour, one synthesis call, below.
+        _cls = None
+        if (body.get("mode") != "voice" and chunks and not scoped
+                and not pinned_topic and _web_answer_enabled()):
             import web_answer
 
             # Seeded at 0.55 because that is the number measured for
@@ -1717,59 +1797,36 @@ def _rag_answer(body):
                      and min(_dists) > _DISTANCE_GATE)
 
             # THE RECORDS GET THEIR OWN ANSWER TOO (owner decision, 2026-09-22):
-            # the grounded synthesis does not depend on the web verdict's
-            # outcome -- only on `chunks`, already resolved above -- so it runs
-            # on an ordinary thread ALONGSIDE the web path (verdict + lookup)
-            # instead of after it. Both sides are plain I/O-bound HTTP calls,
-            # so `concurrent.futures` threads are enough; no process pool.
-            #
-            # STARTS ALONGSIDE THE VERDICT, not after it. Waiting for the
-            # verdict to choose the web first would add the verdict's own time
-            # (median 2718ms, budgeted up to web_answer.VERDICT_BUDGET=8s) to
-            # the critical path before synthesis even began, for nothing --
-            # synthesis cannot use the verdict's answer either way, and
-            # forking immediately costs nothing measurable: web_answer.answer's
-            # own worst case is already budgeted to fit under
-            # HARD_STOP_SECONDS=27s (web_answer.py's own comment: "8 + 14 = 22
-            # plus the 2s floor fits the 27s stop, which fits API Gateway's
-            # 29s"), and synthesis alone runs far under that -- the last 24h of
-            # LLM_USAGE telemetry put ask_answer's median at 7043ms, well
-            # inside web_verdict(2718ms) + web_answer(9973ms) = 12691ms.  Wall
-            # clock becomes max(synthesis, verdict+lookup), not their sum, so
-            # running them together does not push the total past the existing
-            # 27s/29s ceiling this file already enforces -- it only removes
-            # the ~7s a SERIAL synthesis-after-web would have added (24.15s
-            # measured web-only total + ~7s median synthesis = ~31s, over the
-            # 29s gateway ceiling the problem this branch exists to avoid;
-            # concurrent stays at ~24.15s in the median case because synthesis
-            # finishes first and is simply discarded from the critical path).
+            # the grounded synthesis depends only on `chunks`, so it runs on an
+            # ordinary thread ALONGSIDE the classify -> draft -> verify chain
+            # (spec 2026-10-06) instead of after it. Both sides are plain
+            # I/O-bound HTTP calls, so threads are enough. Wall clock is
+            # max(synthesis, chain), not their sum; the synthesis starts
+            # immediately because its prompt cannot use the classification
+            # either way (it is simply unused for a general question whose
+            # records are not useful -- the same cost today's verdict path paid).
             #
             # NEITHER SIDE MAY LOSE THE OTHER: each future's result is pulled
-            # inside its OWN try/except below, so a raised exception (or an
-            # internal timeout surfacing as one) on either side can never take
-            # the other down with it. A crash in the grounded call still lets
-            # the web answer reach the reader (falls back to today's web-only
-            # response, a few lines down). A crash in the web call still lets
-            # the grounded answer reach the reader (falls through to the
-            # ordinary grounded return further below, exactly as it already
-            # does today when web_answer.answer() itself returns None).
+            # inside its OWN try/except, so a raised exception on either side
+            # can never take the other down with it. A crashed chain still lets
+            # the records answer reach the reader; a crashed synthesis still
+            # lets the general answer reach the reader.
             #
-            # The verdict judges `asked` (what retrieval actually searched for);
-            # the lookup and the admission screen still see the asker's own
-            # `question`, so nothing history-derived leaves the account. See
-            # web_answer.answer's docstring for the measurement behind this.
+            # classify judges `asked` (what retrieval searched for); the draft,
+            # verify and compose calls only ever see the asker's `question`, so
+            # nothing history-derived leaves the account.
             _t_synthesis = time.monotonic()
             with ThreadPoolExecutor(max_workers=2) as _pool:
-                _fut_web = _pool.submit(web_answer.answer, question, chunks,
-                                        skip_verdict=_skip, verdict_question=asked)
+                _fut_web = _pool.submit(_general_chain, web_answer, question,
+                                        asked, chunks, _skip, _started, route)
                 _fut_syn = _pool.submit(llm_utils.call_llm, prompt,
                                         max_tokens=MAX_ANSWER_TOKENS,
                                         force_json=False, caller="ask_answer")
                 try:
-                    web = _fut_web.result()
+                    _cls, web = _fut_web.result()
                 except Exception as _web_exc:                # noqa: BLE001
-                    logger.error("  Ask web-answer thread failed: %s", _web_exc)
-                    web = None
+                    logger.error("  Ask general-flow thread failed: %s", _web_exc)
+                    _cls, web = None, None
                 try:
                     _grounded = _fut_syn.result()
                 except Exception as _syn_exc:                # noqa: BLE001
@@ -1778,43 +1835,48 @@ def _rag_answer(body):
             marks["synthesis"] = time.monotonic() - _t_synthesis
 
         if web is not None and web.get("answer"):
-            # Union, not either/or (owner decision, 2026-09-22): the verdict
-            # said the records could not fully answer this, but the reader
-            # gets the grounded synthesis -- computed concurrently above, from
-            # the SAME chunks the verdict judged -- as the MAIN answer now,
-            # with the web prose alongside it rather than instead of it.
+            # ROUTING (spec 2026-10-06 D2), `_cls` is the classification:
             #
-            # THE HAZARD (do not remove this without re-reading it): the web
-            # prose in `web["answer"]` carries its OWN inline [1]/[2]/...
-            # markers pointing at WEB sources -- see web_answer.answer. The
-            # grounded answer's `citations` carry a CONTRACT (above, at the
-            # list comprehension this shares via _build_citations) that card
-            # [i+1] maps positionally to an inline [n] IN THE GROUNDED TEXT --
-            # which is `answer` below now, not `web["answer"]`. The two must
-            # never merge into one block of prose: `grounded` and `from_web`
-            # both stay set here (this answer IS grounded, AND a web block
-            # travels with it) and `web` stays its own block for exactly the
-            # reason the prior version of this comment gave -- the UI must key
-            # its rendering off `from_web`, never merge the web block's own
-            # source list into `citations`, and never label the web prose's
-            # [n] markers as if they point into `citations`. A reader who
-            # cannot tell what came from their meetings from what came off the
-            # internet has no reason to suspect they need to check -- that
-            # principle survives this change; only "the main answer used to BE
-            # the web prose when from_web is true" does not, which is exactly
-            # what a frontend keyed on that assumption needs to know (see
-            # fieldsight-ui, scripts/composites/ask-chat.js -- not in this repo,
-            # so verify there, this comment cannot).
+            #   records useful AND the records answer exists
+            #       general (records ride along) -> answer = RECORDS answer,
+            #           citations = cards, web = the general block. The
+            #           grounded answer's [n] markers point at `citations`;
+            #           that contract (see _build_citations) only holds if the
+            #           text carrying the markers is the text next to the
+            #           cards, so the general answer stays in its own block.
+            #       mixed -> `compose` merges them; every [n] in the merged
+            #           text is one the records answer already had.
+            #   anything else -> the general answer alone: answer = general
+            #       text, citations = [] (no records text, so no [n] to match),
+            #       grounded False. This is also where "project question with
+            #       nothing useful in the records" lands.
             #
-            # A failed concurrent synthesis (`_grounded` never ran, or came
-            # back with an error or an empty answer) must not turn a working
-            # web answer into an error: fall back to exactly the response this
-            # file shipped before this change -- the web prose as the main
-            # answer, `grounded` False -- rather than losing the reader's
-            # answer entirely.
-            if _grounded and _grounded[0] and not _grounded[1]:
+            # THE HAZARD (do not remove this without re-reading it): the
+            # general block's text carries its OWN inline [n] markers for WEB
+            # sources. They must never share a text with `citations`. The UI
+            # keys off `from_web` and must never merge `web.sources` into
+            # `citations` (fieldsight-ui, scripts/composites/ask-chat.js -- not
+            # in this repo, so verify there).
+            _useful = bool(_cls and _cls["records_answer"]) and bool(chunks)
+            _records_ok = bool(_grounded and _grounded[0] and not _grounded[1])
+            if _useful and _records_ok:
+                _answer = _grounded[0]
+                if _cls["kind"] == "mixed":
+                    _t_compose = time.monotonic()
+                    try:
+                        import web_answer
+                        _merged = web_answer.compose(
+                            _grounded[0], web, question,
+                            web_answer.HARD_STOP_SECONDS - (time.monotonic() - _started))
+                    except Exception as _cmp_exc:            # noqa: BLE001
+                        logger.error("  Ask compose failed: %s", _cmp_exc)
+                        _merged = {"answer": _grounded[0], "conflicts": [],
+                                   "composed": False}
+                    route["ms"]["compose"] = int((time.monotonic() - _t_compose) * 1000)
+                    _answer = _merged["answer"]
+                    web["conflicts"] = _merged["conflicts"]
                 return {
-                    "answer": _grounded[0],
+                    "answer": _answer,
                     "citations": _build_citations(chunks),
                     "grounded": True,
                     "from_web": True,
@@ -1823,13 +1885,14 @@ def _rag_answer(body):
                     "applied_scope": applied_scope,
                     "asked": asked if rewritten else None,
                 }
-            logger.warning(
-                "  Ask concurrent synthesis unavailable; the web answer "
-                "carries the response alone (err=%s)",
-                _grounded[1] if _grounded else "not attempted")
+            if _useful:
+                logger.warning(
+                    "  Ask records synthesis unavailable; the general answer "
+                    "carries the response alone (err=%s)",
+                    _grounded[1] if _grounded else "not attempted")
             return {
                 "answer": web["answer"],
-                "citations": _build_citations(chunks),
+                "citations": [],
                 "grounded": False,
                 "from_web": True,
                 "web": web,
@@ -1974,6 +2037,10 @@ def _rag_answer(body):
             "basis": basis,
             "applied_scope": applied_scope,
             "asked": asked if rewritten else None,
+            # The general flow ran and produced nothing: the reader is still
+            # told what happened to the outside lookup (D5). Absent for a
+            # project question, which never ran it.
+            **({"web": web} if web is not None else {}),
         }
     except Exception as e:
         logger.error(f"  RAG path failed: {e}")
@@ -1998,6 +2065,7 @@ def _rag_answer(body):
             marks.get("rewrite", -1), marks.get("retrieval", -1),
             marks.get("synthesis", -1), time.monotonic() - _started,
             history_turns)
+        logger.info("ASK_ROUTE %s", json.dumps(route, sort_keys=True))
 
 
 # ============================================================
