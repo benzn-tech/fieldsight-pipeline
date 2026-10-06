@@ -698,14 +698,21 @@ def test_the_web_answer_branch_receives_the_original_question(monkeypatch):
     previous turn (spec SS2.1/SS4.3)."""
     monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")  # Task 10: gated
     import web_answer
+    from tests.unit.ask_web_fakes import block
+    monkeypatch.setenv("ENABLE_WEB_ANSWER", "true")
     wire(monkeypatch, chunks=[{"chunk_text": "note", "id": "c-1", "topic_id": "t-1",
                                "source_s3_key": "x", "report_date": "2026-09-17"}])
     monkeypatch.setattr(ask_rewrite, "standalone_question",
                         lambda q, h, **kw: ("rewritten question", True))
 
+    # A general question, so the draft/verify chain runs and is handed its text.
     seen = []
-    monkeypatch.setattr(web_answer, "answer",
-                        lambda question, chunks, **kw: seen.append(question) or None)
+    monkeypatch.setattr(web_answer, "classify",
+                        lambda q, chunks, budget: {"kind": "general",
+                                                   "records_answer": False,
+                                                   "source": "model"})
+    monkeypatch.setattr(web_answer, "general_answer",
+                        lambda question, budget, **kw: seen.append(question) or block())
 
     laa._rag_answer({"question": "when is he finishing it?", "caller_sub": SUB,
                      "history": ONE_TURN})
@@ -834,9 +841,9 @@ def test_the_flag_off_payload_is_identical_with_and_without_history(monkeypatch)
 # --------------------------------------------------------------------------
 # Task 6: the distance gate skips the verdict call when retrieval obviously
 # cannot answer, without weakening question_admission's guard (spec SS4.4).
-# `web_answer._verdict` is monkeypatched (not `web_answer.answer`) so the real
-# `answer()` body runs -- including its own `enabled()` check -- and the gate
-# computed in `_rag_answer` is what decides whether `_verdict` is reached.
+# `web_answer.classify` is spied (spec 2026-10-06 replaced the verdict call with
+# it) and the gate computed in `_rag_answer` is what decides whether it is
+# reached. A gated request skips classify and runs the general flow alone.
 # --------------------------------------------------------------------------
 
 def _gate_chunk(distance=None, topic_title="Door Inspection", chunk_text="note"):
@@ -854,11 +861,11 @@ def enable_web_answer(monkeypatch):
 
 
 def _spy_verdict(monkeypatch):
-    import web_answer
-    called = []
-    monkeypatch.setattr(web_answer, "_verdict",
-                        lambda *a, **kw: (called.append(1), ({"answered": True}, None))[1])
-    return called
+    """The recorder for classify. The stub says "project, records answer it", so
+    a request the gate lets through never enters the general flow; a gated one
+    does (classify skipped)."""
+    from tests.unit.ask_web_fakes import stub_web
+    return stub_web(monkeypatch, None).classify
 
 
 def test_a_far_nearest_distance_skips_the_verdict(monkeypatch, enable_web_answer):
@@ -867,7 +874,7 @@ def test_a_far_nearest_distance_skips_the_verdict(monkeypatch, enable_web_answer
 
     laa._rag_answer({"question": "what happened on site", "caller_sub": SUB})
 
-    assert called == [], "nearest distance 0.61 with no lexical match must skip the verdict"
+    assert called == [], "nearest distance 0.61 with no lexical match must skip classify"
 
 
 def test_a_near_distance_still_asks_the_verdict(monkeypatch, enable_web_answer):
@@ -876,7 +883,7 @@ def test_a_near_distance_still_asks_the_verdict(monkeypatch, enable_web_answer):
 
     laa._rag_answer({"question": "what happened on site", "caller_sub": SUB})
 
-    assert called == [1], "nearest distance 0.40 is within the gate; the verdict must run"
+    assert len(called) == 1, "nearest distance 0.40 is within the gate; the verdict must run"
 
 
 def test_an_absent_distance_does_not_gate(monkeypatch, enable_web_answer):
@@ -886,7 +893,7 @@ def test_an_absent_distance_does_not_gate(monkeypatch, enable_web_answer):
 
     laa._rag_answer({"question": "what happened on site", "caller_sub": SUB})
 
-    assert called == [1], "a missing distance must not gate the verdict"
+    assert len(called) == 1, "a missing distance must not gate the verdict"
 
 
 def test_a_widened_basis_does_not_gate(monkeypatch, enable_web_answer):
@@ -899,7 +906,7 @@ def test_a_widened_basis_does_not_gate(monkeypatch, enable_web_answer):
 
     laa._rag_answer({"question": "what happened on site", "caller_sub": SUB})
 
-    assert called == [1], "a widened basis must not gate the verdict"
+    assert len(called) == 1, "a widened basis must not gate the verdict"
 
 
 def test_a_lexical_chunk_beats_the_distance(monkeypatch, enable_web_answer):
@@ -910,7 +917,7 @@ def test_a_lexical_chunk_beats_the_distance(monkeypatch, enable_web_answer):
 
     laa._rag_answer({"question": "what does the scaffold report say", "caller_sub": SUB})
 
-    assert called == [1], "a lexical title match must not gate the verdict"
+    assert len(called) == 1, "a lexical title match must not gate the verdict"
 
 
 def test_the_title_heuristic_ignores_raw_chunk_text(monkeypatch, enable_web_answer):
@@ -953,7 +960,7 @@ def test_a_lexical_hit_row_beats_the_distance_even_with_a_cold_title(monkeypatch
 
     laa._rag_answer({"question": "what does the scaffold report say", "caller_sub": SUB})
 
-    assert called == [1], "a lexical_hit row must not let a cold title gate the verdict"
+    assert len(called) == 1, "a lexical_hit row must not let a cold title gate the verdict"
 
 
 # --------------------------------------------------------------------------
@@ -1031,15 +1038,19 @@ def test_the_verdict_and_the_gate_both_read_the_rewritten_question(monkeypatch):
 
     import web_answer
     seen = {}
-    monkeypatch.setattr(web_answer, "answer",
-                        lambda q, chunks, **kw: seen.update(q=q, kw=kw) or None)
+    monkeypatch.setattr(web_answer, "classify",
+                        lambda q, chunks, budget: seen.update(judged=q) or
+                        {"kind": "project", "records_answer": True, "source": "model"})
+    monkeypatch.setattr(web_answer, "general_answer",
+                        lambda q, budget, **kw: seen.update(sent=q) or
+                        {"answer": None, "status": "unverified", "_trace": {}})
 
     laa._rag_answer({"question": "when does it have to be finished?",
                      "caller_sub": SUB, "history": ONE_TURN})
 
-    assert seen["kw"]["verdict_question"] == "when must the Unit 11 backfill finish?"
-    assert seen["q"] == "when does it have to be finished?", "the lookup keeps the asker's words"
+    assert seen["judged"] == "when must the Unit 11 backfill finish?"
     # The chunk sits at 0.9, far past the 0.55 gate: only the rewritten text
     # shares a term with the title, so reading `question` would open the gate
-    # on exactly the turn the rewrite just made answerable.
-    assert seen["kw"]["skip_verdict"] is False
+    # on exactly the turn the rewrite just made answerable. Classify ran at
+    # all = the gate stayed open; the project verdict means nothing went out.
+    assert "sent" not in seen, "a project question must not reach the general flow"
