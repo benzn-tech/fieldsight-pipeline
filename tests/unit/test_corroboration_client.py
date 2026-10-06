@@ -192,7 +192,17 @@ def test_a_client_error_is_not_retried(monkeypatch):
                                           FakeResponse(200, _body())))
     reply = client.call("q", timeout=5, retry_budget=99)
     assert len(pool.calls) == 1
-    assert reply.error == "bad plugin"
+    # The HTTP status is part of the error (spec 2026-10-06 D6): a 400 and a
+    # 502 used to read the same, and nobody could say which one was recurring.
+    assert reply.error == "HTTP 400: bad plugin"
+
+
+def test_a_failure_is_logged_with_its_http_status(monkeypatch, caplog):
+    _install(monkeypatch, FakePool(FakeResponse(502, {"error": {"message": "The operation was aborted"}})))
+    with caplog.at_level("WARNING"):
+        reply = client.call("q", timeout=5)
+    assert reply.error == "HTTP 502: The operation was aborted"
+    assert any("HTTP 502" in r.getMessage() for r in caplog.records)
 
 
 def test_a_connection_failure_is_reported_not_raised(monkeypatch):
