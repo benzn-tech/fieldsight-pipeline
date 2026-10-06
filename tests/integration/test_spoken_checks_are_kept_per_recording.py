@@ -76,11 +76,13 @@ def test_a_checklist_report_is_recorded_once_and_listed(db):
     cid, uid, tid = _setup(db)
     w = dict(row("pre-pour", "11:02:03", tid, "11:03:21"),
              segments=[{"from": "11:02:03", "to": "11:03:21"}])
-    assert not cr.already_made(db, "sidA", tid, "11:02:03")
-    cr._record(db, cid, FOLDER, DATE, "sidA", w, "Pre-pour Inspection Checklist", "r1", "k1")
-    cr._record(db, cid, FOLDER, DATE, "sidA", w, "Pre-pour Inspection Checklist", "r2", "k2")  # ignored
-    assert cr.already_made(db, "sidA", tid, "11:02:03")
+    segs = [{"from": "11:02:03", "to": "11:03:21"}]
+    assert not cr.already_made(db, "sidA", tid, "11:02:03", "11:03:21", segs)
+    early = dict(w, end_at="11:02:30", segments=[{"from": "11:02:03", "to": "11:02:30"}])
+    cr._record(db, cid, FOLDER, DATE, "sidA", early, "Pre-pour Inspection Checklist", "r1", "k1")
+    assert cr.already_made(db, "sidA", tid, "11:02:03", "11:02:30", early["segments"])
+    assert not cr.already_made(db, "sidA", tid, "11:02:03", "11:03:21", segs), "a fuller window"
+    cr._record(db, cid, FOLDER, DATE, "sidA", w, "Pre-pour Inspection Checklist", "r2", "k2")
     day = cr.for_day(db, cid, FOLDER, DATE)
-    assert [(r["request_id"], r["check_name"], r["segments"]) for r in day] == [
-        ("r1", "pre-pour", [{"from": "11:02:03", "to": "11:03:21"}])]
-    assert [r["request_id"] for r in cr.recent_for_folder(db, cid, FOLDER, "2026-10-01")] == ["r1"]
+    assert [(r["request_id"], r["end_at"], r["segments"]) for r in day] == [("r2", "11:03:21", segs)]
+    assert [r["request_id"] for r in cr.recent_for_folder(db, cid, FOLDER, "2026-10-01")] == ["r2"]

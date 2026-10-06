@@ -27,11 +27,12 @@ def wired(monkeypatch):
     monkeypatch.setattr(cr.users, "get_by_folder_name", lambda c, co, f: USER)
     monkeypatch.setattr(cr.users, "get_user_by_sub", lambda c, sub: dict(USER, global_role="gm"))
     monkeypatch.setattr(cr.report_templates, "get_any", lambda c, tid: TPL)
-    monkeypatch.setattr(cr, "already_made", lambda c, s, t, a: (s, t, a) in st["made"])
+    monkeypatch.setattr(cr, "already_made",
+                        lambda c, s, t, a, e=None, g=None: (s, t, a, e) in st["made"])
 
     def record(conn, co, folder, date, session, w, name, rid, key):
         st["recorded"].append((session, w["template_id"], w["start_at"], rid, key))
-        st["made"].add((session, w["template_id"], w["start_at"]))
+        st["made"].add((session, w["template_id"], w["start_at"], w.get("end_at")))
     monkeypatch.setattr(cr, "_record", record)
 
     def generate(conn, caller, date, event):
@@ -118,3 +119,12 @@ def test_the_endpoints_list_reports_with_status_and_unmatched_checks(monkeypatch
     src = open(org.__file__, encoding="utf-8").read()
     assert 're.match(r"^/days/([^/]+)/checklist-reports$", route)' in src
     assert 'route == "/checklist-reports/recent" and method == "GET"' in src
+
+
+def test_a_rerun_over_the_full_recording_makes_the_report_again(wired):
+    """TEST 2026-10-06: the first final saw 80 seconds of the check; the re-run
+    saw all of it. The report must follow the fuller window."""
+    early = [dict(WINDOWS[0], end_at="11:02:21", segments=[SEGS[0]])]
+    cr.auto_generate(None, "c-1", "Ben_Lin_test2", "2026-10-06", "sidA", early, generate=wired["generate"])
+    cr.auto_generate(None, "c-1", "Ben_Lin_test2", "2026-10-06", "sidA", WINDOWS[:1], generate=wired["generate"])
+    assert [c[3]["to"] for c in wired["calls"]] == ["11:02:21", "11:03:21"]
