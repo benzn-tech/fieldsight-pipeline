@@ -189,8 +189,13 @@ def test_project_question_the_records_cannot_answer_falls_back_to_the_general_fl
     vendor = Vendor(web_classify=[classified("project", records_answer)], **general_script())
     wire(monkeypatch, vendor)
     out = ask("what was the barrier height on level 2")
-    assert out["answer"] == VERIFIED_TEXT and out["from_web"] is True
+    assert out["from_web"] is True
     assert out["grounded"] is False and out["citations"] == []
+    # The CODE says the records do not show it (TEST 2026-10-06: the model
+    # opened with "Project Records: Confirmed. ..."); web.answer stays general.
+    assert out["answer"] == ("Your project records don't show this." + chr(10) * 2
+                             + "Related general guidance:" + chr(10) * 2 + VERIFIED_TEXT)
+    assert out["web"]["answer"] == VERIFIED_TEXT
 
 
 def test_project_question_with_no_records_at_all_falls_back_and_spends_no_classify(monkeypatch):
@@ -263,6 +268,22 @@ def test_a_classify_that_raises_still_pays_for_the_synthesis_and_runs_both(monke
     out = ask()
     assert synth["n"] == 1 and vendor.callers["web_draft"] == 1
     assert out["answer"] == RECORDS_ANSWER
+
+
+def test_the_fixed_lead_is_only_on_the_project_fallback_route(monkeypatch):
+    """General-not-useful, gated and no-records routes return the general answer
+    as it is: the lead says the RECORDS do not show something, which is only
+    the claim on a project question."""
+    lead = "Your project records don't show this."
+    for classify, chunks in ((classified("general", False), (CHUNK,)),
+                             (classified("mixed", False), (CHUNK,)),
+                             (None, (dict(CHUNK, distance=0.9, topic_title="Unrelated"),)),
+                             (None, ())):
+        vendor = Vendor(**({"web_classify": [classify]} if classify else {}),
+                        **general_script())
+        wire(monkeypatch, vendor, chunks=chunks)
+        out = ask()
+        assert out["answer"] == VERIFIED_TEXT and lead not in out["answer"]
 
 
 # ----------------------------------------------------- what the reader is told
