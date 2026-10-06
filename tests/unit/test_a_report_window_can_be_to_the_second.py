@@ -59,7 +59,7 @@ def test_the_steel_check_between_the_stretches_is_not_offered():
             if any(sr._in_window(t, day, a, b) for a, b in stretches)]
     assert kept == ["pre-pour", "pre-pour again"]
     src = open(sr.__file__, encoding="utf-8").read()
-    assert "spans = spans + gaps" in src
+    assert "transcript_window.clip_to_window(turns, win_from, win_to, gaps)" in src
     assert "if (any(test(t, date, a, b) for a, b in stretches) if stretches" in src
 
 
@@ -76,7 +76,7 @@ def test_THE_a_checks_report_reads_only_the_speech_inside_its_window():
     assert not sr._mostly_in(steel, day, a, b), "14 of its 120 seconds"
     assert sr._mostly_in(hvac, day, a, b)
     src = open(sr.__file__, encoding="utf-8").read()
-    assert 'turns = [t for t in turns if (t.get("until") or t["at"]) > win_from and t["at"] < win_to' in src
+    assert "transcript_window.clip_to_window(turns, win_from, win_to, gaps)" in src
     assert "precise=_precise(window)" in src
 
 
@@ -89,3 +89,63 @@ def test_a_windowed_report_lists_only_its_topics_actions():
     assert len(sr._action_items_for_prompt(content)) == 2, "no window, every action as before"
     src = open(sr.__file__, encoding="utf-8").read()
     assert src.count("_action_items_for_prompt(content, topic_offer)") == 2
+
+
+
+# ---- to the word -------------------------------------------------------------------
+
+import transcript_window as tw  # noqa: E402
+
+
+def _turn(start, words):
+    """One 90-second single-speaker turn, as a one-person recording makes."""
+    base = datetime.datetime(2026, 10, 6, 17, 14, 22)
+    ws = [(w, base + datetime.timedelta(seconds=o)) for w, o in words]
+    return {"at": ws[0][1], "until": ws[-1][1], "line": "[17:14:22 – 17:16:10] ben (spk_0): " +
+            " ".join(w for w, _ in words), "words": ws}
+
+
+WALK = _turn(0, [("Formwork", 0), ("set", 1), ("out", 2), ("fine.", 3),
+                 ("Steel", 66), ("sixteens", 67), ("at", 68), ("two", 69), ("hundred.", 70),
+                 ("Reo", 81), ("twelves", 82), ("at", 83), ("two", 84), ("hundred.", 85)])
+
+
+def test_THE_a_gap_cuts_the_words_in_it_not_the_whole_turn():
+    """TEST 2026-10-06: the steel check (17:15:27-17:15:42) sat inside one
+    90-second turn; dropping the turn lost the formwork and reo items around it."""
+    day = datetime.datetime(2026, 10, 6)
+    gap = (day.replace(hour=17, minute=15, second=27), day.replace(hour=17, minute=15, second=42))
+    out = tw.clip_to_window([WALK], day.replace(hour=17, minute=12, second=52),
+                            day.replace(hour=17, minute=17, second=33), [gap])
+    assert len(out) == 1
+    line = out[0]["line"]
+    assert "Formwork set out fine." in line and "Reo twelves at two hundred." in line
+    assert "sixteens" not in line
+    assert line.startswith("[17:14:22 – 17:15:47] ben (spk_0): ")
+
+
+def test_a_window_end_cuts_the_rest_of_the_file():
+    day = datetime.datetime(2026, 10, 6)
+    out = tw.clip_to_window([WALK], day.replace(hour=17, minute=14), day.replace(hour=17, minute=15, second=27))
+    assert "Formwork" in out[0]["line"] and "Steel" not in out[0]["line"]
+
+
+def test_a_turn_without_word_times_is_kept_whole_or_not_at_all():
+    day = datetime.datetime(2026, 10, 6)
+    old = dict(WALK, words=[])
+    gap = (day.replace(hour=17, minute=15, second=27), day.replace(hour=17, minute=15, second=42))
+    assert tw.clip_to_window([old], day.replace(hour=17), day.replace(hour=18)) == [old]
+    assert tw.clip_to_window([old], day.replace(hour=17), day.replace(hour=18), [gap]) == []
+
+
+def test_headings_written_without_hashes_are_still_the_templates_sections():
+    """TEST 2026-10-06: muse-spark wrote the section titles as plain lines."""
+    text = ("Pour Details\nLevel two slab, Thursday 7am. [t0]\n"
+            "**A. Documents & Approvals**\n| Item no | Answer |\n| 1 | Yes |\n"
+            "B. Formwork & Falsework:\nsomething [t1]")
+    secs = sr._prose_sections(text, titles=["Pour Details", "A. Documents & Approvals",
+                                            "B. Formwork & Falsework"])
+    assert [s["title"] for s in secs] == ["Pour Details", "A. Documents & Approvals",
+                                          "B. Formwork & Falsework"]
+    assert secs[1]["paragraphs"][0].startswith("| Item no")
+    assert [s["title"] for s in sr._prose_sections("Pour Details\nx")] == [""], "no titles, as before"
