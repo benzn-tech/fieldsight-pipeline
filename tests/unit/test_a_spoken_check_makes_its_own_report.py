@@ -27,6 +27,7 @@ def wired(monkeypatch):
     monkeypatch.setattr(cr.users, "get_by_folder_name", lambda c, co, f: USER)
     monkeypatch.setattr(cr.users, "get_user_by_sub", lambda c, sub: dict(USER, global_role="gm"))
     monkeypatch.setattr(cr.report_templates, "get_any", lambda c, tid: TPL)
+    monkeypatch.setattr(cr.topics_repo, "list_day_topics_for_binding", lambda c, f, d: [])
     monkeypatch.setattr(cr, "already_made",
                         lambda c, s, t, a, e=None, g=None: (s, t, a, e) in st["made"])
 
@@ -128,3 +129,39 @@ def test_a_rerun_over_the_full_recording_makes_the_report_again(wired):
     cr.auto_generate(None, "c-1", "Ben_Lin_test2", "2026-10-06", "sidA", early, generate=wired["generate"])
     cr.auto_generate(None, "c-1", "Ben_Lin_test2", "2026-10-06", "sidA", WINDOWS[:1], generate=wired["generate"])
     assert [c[3]["to"] for c in wired["calls"]] == ["11:02:21", "11:03:21"]
+
+
+
+# The owner's TEST recording, 2026-10-06 17:12: the topics as extraction stamped them.
+TOPICS_1006 = [
+    {"id": "formwork", "title": "Formwork Setup and Cleanliness", "time_range": "17:12 – 17:14"},
+    {"id": "booking", "title": "Level Two Pour Booking and Approvals", "time_range": "17:12 – 17:12"},
+    {"id": "reo", "title": "Slab Reinforcement and Cover", "time_range": "17:14 – 17:16"},
+    {"id": "scaffold", "title": "Friday Scaffold Delivery Coordination", "time_range": "17:14 – 17:14"},
+    {"id": "steel", "title": "Stair Core Steel Check", "time_range": "17:14 – 17:14"},
+    {"id": "pour", "title": "Pour Logistics and Edge Protection", "time_range": "17:16 – 17:16"},
+    {"id": "services", "title": "Electrical and Plumbing Rough-In", "time_range": "17:16 – 17:16"},
+]
+PREPOUR = {"name": "concrete pre-pour check for the level two slab", "kind": "pre-pour",
+           "start_at": "17:12:52", "end_at": "17:17:33",
+           "segments": [{"from": "17:12:52", "to": "17:15:27"}, {"from": "17:15:42", "to": "17:17:33"}]}
+STEEL = {"name": "steel inspections for the stair core", "kind": "steel",
+         "start_at": "17:15:27", "end_at": "17:15:42"}
+
+
+def test_THE_a_checks_report_takes_its_own_topics_and_not_the_other_checks():
+    """Stamped by the minute, the pour-booking talk (17:12:52-17:13:30) was
+    '17:12 - 17:12' and the steel check (17:15:27) '17:14': judged by the
+    window the report lost the first and took the second."""
+    assert cr.check_topics(PREPOUR, [STEEL], TOPICS_1006) == [
+        "formwork", "booking", "reo", "scaffold", "pour", "services"]
+
+
+def test_the_queued_request_names_them(wired, monkeypatch):
+    monkeypatch.setattr(cr.topics_repo, "list_day_topics_for_binding", lambda c, f, d: [
+        dict(t, source_s3_key="extractions/Ben_Lin_test2/2026-10-06/sidA.json") for t in TOPICS_1006])
+    w = dict(PREPOUR, template_id="t-1")
+    cr.auto_generate(None, "c-1", "Ben_Lin_test2", "2026-10-06", "sidA",
+                     [w, dict(STEEL, template_id=None)], generate=wired["generate"])
+    assert "steel" not in wired["calls"][0][3]["topicRowIds"]
+    assert "booking" in wired["calls"][0][3]["topicRowIds"]
