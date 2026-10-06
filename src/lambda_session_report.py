@@ -969,8 +969,23 @@ def _generate_document(artifact, context=None):
             "generation budget exhausted before the model call: %.1fs left "
             "after reserving %.1fs for the render and result write"
             % (model_budget, RENDER_AND_WRITE_RESERVE_SECONDS))
+    started = time.time()
     text, err = llm_utils.call_llm(prompt, max_tokens=8000, deadline=model_budget,
                                    caller="session_report")
+    if (err or not (text or "").strip()) and "finish_reason=length" in (err or ""):
+        # THE MODEL SPENT THE WHOLE BUDGET THINKING and wrote nothing. Measured on
+        # TEST (2026-10-06): the owner's spoken pre-pour check against a 40-item
+        # checklist took 15,997 of 16,000 tokens in reasoning; the same template on
+        # a quieter recording took 3,671. One retry on the fast path (effort low)
+        # with room for the answer, inside what is left of the budget -- a report
+        # that comes back is worth more than one that thought harder.
+        left = model_budget - (time.time() - started)
+        if left > llm_utils.MIN_USEFUL_SECONDS:
+            logger.warning("report: the model ran out of tokens thinking -- retrying "
+                           "once on the fast path (%.0fs left)", left)
+            text, err = llm_utils.call_llm(prompt, max_tokens=12000, deadline=left,
+                                           enable_thinking=False,
+                                           caller="session_report_retry")
     if err or not (text or "").strip():
         raise RuntimeError(err or "empty answer from model")
 
