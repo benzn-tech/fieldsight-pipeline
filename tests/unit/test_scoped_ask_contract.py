@@ -33,6 +33,7 @@ import lambda_rag_search as rag  # noqa: E402
 import llm_utils                 # noqa: E402
 import dashscope_utils           # noqa: E402
 import web_answer                # noqa: E402
+from tests.unit.ask_web_fakes import stub_web  # noqa: E402
 
 TOPIC_ID = "df023596-1111-4222-8333-444455556666"
 SITE_ID = "5c0e8d7a-1111-4222-8333-444455556666"
@@ -110,7 +111,7 @@ def wire_ask(mp, answer=("Grounded answer [1].", None)):
         return answer
 
     mp.setattr(llm_utils, "call_llm", fake_llm)
-    mp.setattr(web_answer, "answer", lambda question, chunks, **k: None)
+    stub_web(mp, None)
     return client, seen
 
 

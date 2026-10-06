@@ -16,6 +16,7 @@ import lambda_ask_agent as laa   # noqa: E402
 import llm_utils                 # noqa: E402
 import dashscope_utils           # noqa: E402
 import web_answer                # noqa: E402
+from tests.unit.ask_web_fakes import stub_web  # noqa: E402
 
 TOPIC_ID = "df023596-1111-4222-8333-444455556666"
 SITE_ID = "5c0e8d7a-1111-4222-8333-444455556666"
@@ -182,7 +183,9 @@ def wire(mp, responses=({"chunks": [CHUNK]},), answer=("Grounded answer [1].", N
         return answer
 
     mp.setattr(llm_utils, "call_llm", fake_llm)
-    mp.setattr(web_answer, "answer", lambda question, chunks, **k: web)
+    # The general flow is stubbed at its two entry points (ask_web_fakes).
+    # `web` None = the classifier says the records answer it.
+    stub_web(mp, web)
     return client, seen
 
 
@@ -417,10 +420,10 @@ def test_a_synthesis_failure_still_delivers_the_web_answer(monkeypatch):
 def test_a_web_failure_still_delivers_the_grounded_answer(monkeypatch):
     """If the concurrent web-answer call raises, the grounded synthesis --
     computed on the OTHER thread -- must still reach the reader as an
-    ordinary grounded answer, exactly as if web_answer.answer() had simply
-    returned None."""
+    ordinary grounded answer, exactly as if the classifier had simply said
+    the records answer it."""
     wire(monkeypatch)
-    monkeypatch.setattr(web_answer, "answer",
+    monkeypatch.setattr(web_answer, "classify",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("web boom")))
 
     out = ask(question="concrete issues")
@@ -614,7 +617,8 @@ def test_empty_retrieval_with_a_pinned_topic_still_answers_from_it(monkeypatch):
 
     _, seen = wire(monkeypatch, responses=[{"chunks": [], "pinned_topic": PINNED,
                                             "applied": {"dropped": []}}])
-    monkeypatch.setattr(web_answer, "answer", no_web)
+    monkeypatch.setattr(web_answer, "classify", no_web)
+    monkeypatch.setattr(web_answer, "general_answer", no_web)
 
     out = ask(question="Who is responsible for follow-ups?", topic_row_id=TOPIC_ID)
 
@@ -728,14 +732,8 @@ WEB = {"answer": "Public sources cannot answer this question."}
 
 
 def _count_web(monkeypatch):
-    calls = []
-
-    def fake_web(question, chunks, **k):
-        calls.append(list(chunks))
-        return WEB
-
-    monkeypatch.setattr(web_answer, "answer", fake_web)
-    return calls
+    """Re-stub with a general block, and hand back the call recorder."""
+    return stub_web(monkeypatch, WEB)
 
 
 def test_a_pinned_topic_with_chunks_never_runs_the_web_check(monkeypatch):
@@ -748,7 +746,7 @@ def test_a_pinned_topic_with_chunks_never_runs_the_web_check(monkeypatch):
     out = ask(question="What are the next steps?", scoped=True, date="2026-09-03",
               site_id=SITE_ID, author_folder="Ben_UCPK2", topic_row_id=TOPIC_ID)
 
-    assert calls == []
+    assert calls.classify == [] and calls.general == []
     assert "from_web" not in out
     assert seen["llm_calls"] == 1 and HEADER in seen["prompt"]
     assert out["answer"] == "Grounded answer [1]."
@@ -758,7 +756,7 @@ def test_a_scoped_day_with_chunks_never_runs_the_web_check(monkeypatch):
     wire(monkeypatch, responses=[{"chunks": [CHUNK], "applied": {"dropped": []}}])
     calls = _count_web(monkeypatch)
     out = ask(question="What are the next steps?", scoped=True, date="2026-09-03")
-    assert calls == []
+    assert calls.classify == [] and calls.general == []
     assert "from_web" not in out and out["grounded"] is True
 
 
@@ -767,7 +765,7 @@ def test_a_site_only_scope_with_chunks_never_runs_the_web_check(monkeypatch):
                                   "applied": {"site_id": SITE_ID, "dropped": []}}])
     calls = _count_web(monkeypatch)
     out = ask(question="What are the next steps?", site_id=SITE_ID)
-    assert calls == []
+    assert calls.classify == [] and calls.general == []
     assert "from_web" not in out and out["grounded"] is True
 
 
@@ -780,10 +778,10 @@ def test_an_unscoped_ask_with_chunks_still_runs_the_web_check(monkeypatch):
     _, seen = wire(monkeypatch)
     calls = _count_web(monkeypatch)
     out = ask(question="What are the next steps?")
-    assert calls == [[CHUNK]]
+    assert calls.classify == [[CHUNK]]
     assert out.get("from_web") is True
     assert out["answer"] == "Grounded answer [1]."
-    assert out["web"] == WEB
+    assert out["web"]["answer"] == WEB["answer"]
     assert out["grounded"] is True
     assert seen["llm_calls"] == 1
 
@@ -792,7 +790,7 @@ def test_a_legacy_date_without_the_gate_still_runs_the_web_check(monkeypatch):
     wire(monkeypatch)
     calls = _count_web(monkeypatch)
     out = ask(question="What are the next steps?", date="2026-09-03", **LEGACY)
-    assert len(calls) == 1
+    assert len(calls.classify) == 1
     assert out.get("from_web") is True
     assert out["answer"] == "Grounded answer [1]."
-    assert out["web"] == WEB
+    assert out["web"]["answer"] == WEB["answer"]

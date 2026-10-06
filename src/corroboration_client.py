@@ -310,9 +310,14 @@ def call(prompt, *, timeout, model=None, max_tokens=1024, web=False,
 
         try:
             detail = json.loads(resp.data.decode("utf-8"))
-            last_error = detail.get("error", {}).get("message") or f"HTTP {resp.status}"
+            message = detail.get("error", {}).get("message")
+            last_error = f"HTTP {resp.status}: {message}" if message else f"HTTP {resp.status}"
         except Exception:                         # noqa: BLE001 - body may be html
             last_error = f"HTTP {resp.status}"
+        # The status is part of the error AND logged: until 2026-10-06 only the
+        # vendor's message survived ("The operation was aborted"), so a 502 and
+        # a 400 read the same and nobody could say which one was recurring.
+        logger.warning("corroboration: %s after %.2fs", last_error, elapsed)
         break
 
     return Reply(error=last_error or "no response", elapsed=time.time() - started,
