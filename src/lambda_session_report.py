@@ -161,6 +161,29 @@ def _fetch_photos(folder, date, filenames, budget, names_out=None, edge=None):
     return streams
 
 
+def _precise(window):
+    """A window given to the second -- a spoken check's (inspection_windows),
+    never one a person typed into the dialog's HH:MM picker."""
+    return any(str((window or {}).get(k) or "").count(":") == 2 for k in ("from", "to"))
+
+
+def _mostly_in(topic, date, win_from, win_to):
+    """True when most of a topic's minutes fall inside [win_from, win_to).
+
+    Topic times are whole minutes; a check's window is to the second. The
+    Level 2 steel topic ("11:02 - 11:03") shares 14 of its 120 seconds with a
+    pre-pour check that ended at 11:02:14 -- overlap alone put it, and its
+    PPE action, in the pre-pour checklist."""
+    parsed = chunking.parse_time_range(topic.get("time_range"))
+    if not parsed:
+        return False
+    day = datetime.datetime.strptime(date, "%Y-%m-%d")
+    start = day + datetime.timedelta(seconds=parsed[0])
+    end = day + datetime.timedelta(seconds=parsed[1] + 60)       # the last minute, whole
+    inside = (min(end, win_to) - max(start, win_from)).total_seconds()
+    return inside > 0 and inside >= 0.5 * (end - start).total_seconds()
+
+
 def _in_window(topic, date, win_from, win_to):
     """True when a topic's time_range overlaps [win_from, win_to).
 
@@ -181,7 +204,7 @@ def _in_window(topic, date, win_from, win_to):
     return (start < win_to and end > win_from) or (start == end and win_from <= start < win_to)
 
 
-def _offered_topics(artifact, budget, win_from, win_to, stretches=None):
+def _offered_topics(artifact, budget, win_from, win_to, stretches=None, precise=False):
     """(offer, streams_by_ref) for the topics of this report inside the window.
 
     `offer` is what the prompt shows the model: a stable ref, the time range,
@@ -216,9 +239,10 @@ def _offered_topics(artifact, budget, win_from, win_to, stretches=None):
     # An interrupted check's report offers the topics of its stretches, not of
     # the other check between them (topic times are whole minutes, so one that
     # shares a minute with a stretch is still offered).
+    test = _mostly_in if precise else _in_window
     in_window = [(i, t) for i, t in enumerate(content.get("topics") or [])
-                 if (any(_in_window(t, date, a, b) for a, b in stretches) if stretches
-                     else _in_window(t, date, win_from, win_to))]
+                 if (any(test(t, date, a, b) for a, b in stretches) if stretches
+                     else test(t, date, win_from, win_to))]
     # THE WHOLE REPORT IS PLANNED BEFORE ANYTHING IS FETCHED (report_photos):
     # the person's own exclusions for the day, one copy of each photograph,
     # the size the count calls for, and -- past MAX_LIMIT -- a fair share per
@@ -884,6 +908,12 @@ def _generate_document(artifact, context=None):
                                            win_from, win_to)
     turns = transcript_window.drop_spans(
         transcript_window.assemble(client, S3_BUCKET, picked, deadline=read_deadline), spans)
+    # Only the speech INSIDE the window. select_keys picks whole audio files
+    # that overlap it, and every turn of a file used to come along: on TEST
+    # (2026-10-06) a pre-pour check ending 11:02:14 was filled from the Level 2
+    # steel check later in the same 2-minute file ("No -- glasses and gloves").
+    turns = [t for t in turns if (t.get("until") or t["at"]) > win_from and t["at"] < win_to
+             or t["at"] == win_from]
     if not turns:
         raise RuntimeError("no recorded speech in this window after exclusions")
     if glossary:
@@ -897,7 +927,7 @@ def _generate_document(artifact, context=None):
     # have bytes behind it.
     photo_budget = [MAX_PHOTO_BYTES_TOTAL, MAX_PHOTOS_PER_REPORT]
     topic_offer, photo_streams = _offered_topics(
-        artifact, photo_budget, win_from, win_to,
+        artifact, photo_budget, win_from, win_to, precise=_precise(window),
         stretches=[(_clock(date, sg["from"]), _clock(date, sg["to"]))
                    for sg in window.get("segments") or []] if gaps else None)
 

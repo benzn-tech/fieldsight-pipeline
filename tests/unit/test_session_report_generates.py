@@ -120,7 +120,9 @@ def test_an_excluded_topic_wholly_outside_the_window_does_not_abort_and_clips_no
     sr.process_request(art)
     assert written[0]["status"] == "done"
     assert "roofing" in calls["prompt"]
-    assert "unrelated afternoon remark" in calls["prompt"]
+    # Outside the 09:00-11:30 window: since 2026-10-06 the worker reads only the
+    # speech inside the window (a picked file's other turns no longer come along).
+    assert "unrelated afternoon remark" not in calls["prompt"]
 
 
 # ----------------------------------------------------------
