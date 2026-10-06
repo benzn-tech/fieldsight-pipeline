@@ -96,6 +96,9 @@ def _get_lambda_client():
 # Limits
 MAX_TRANSCRIPT_CHARS = int(os.environ.get('ASK_TRANSCRIPT_CHARS', '300000'))
 MAX_REPORT_CHARS = int(os.environ.get('ASK_REPORT_CHARS', '60000'))
+# Fixed lead sentence for a project question the records cannot answer; the
+# general answer follows it.
+PROJECT_FALLBACK_LEAD = "Your project records don't show this.\n\nRelated general guidance:"
 MAX_ANSWER_TOKENS = int(os.environ.get('ASK_ANSWER_TOKENS', '8000'))
 
 # Ask conversation memory (spec 2026-09-17 SS4.5): the whole-request budget
@@ -1924,8 +1927,15 @@ def _rag_answer(body):
                     "  Ask records synthesis unavailable; the general answer "
                     "carries the response alone (err=%s)",
                     _grounded[1] if _grounded else "not attempted")
+            _answer = web["answer"]
+            if _cls is not None and _cls["kind"] == "project" and not _useful:
+                # PROJECT-FALLBACK ROUTE ONLY: a project question the records
+                # could not answer. Said by the CODE, not the model (TEST
+                # 2026-10-06: the model opened with "Project Records:
+                # Confirmed. ..."). `web.answer` stays the general answer alone.
+                _answer = (PROJECT_FALLBACK_LEAD + "\n\n" + _answer)
             return {
-                "answer": web["answer"],
+                "answer": _answer,
                 "citations": [],
                 "grounded": False,
                 "from_web": True,

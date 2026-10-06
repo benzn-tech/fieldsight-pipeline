@@ -348,6 +348,28 @@ def test_compose_accepts_markers_the_records_answer_has(monkeypatch, answer):
     assert out["composed"] is True
 
 
+def test_the_verify_prompt_asks_for_a_final_answer_not_a_review():
+    """WIRING-LEVEL: this reads the prompt text, not model behaviour. The model's
+    obedience was checked on TEST (2026-10-06 showed the review voice that this
+    wording replaces); here we only pin that the instruction is present and the
+    draft is still an input."""
+    prompt = web.VERIFY_PROMPT
+    assert "{draft}" in prompt and "{question}" in prompt
+    assert "FINAL answer" in prompt and "addressed directly to the reader" in prompt
+    assert "Never mention the draft, a colleague, or the checking process" in prompt
+    for word in ("confirmed", "corrected", "verified", "review", "verification"):
+        assert '"%s"' % word in prompt, "the forbidden word list lost " + word
+    assert "colleague answered" not in prompt.lower()
+    assert "[unverified]" in prompt
+
+
+def test_the_draft_is_still_passed_to_verify(monkeypatch):
+    _, script = run_general(monkeypatch, (DRAFT, 3), (VERIFIED, 9))
+    verify = script.calls[1]
+    assert DRAFT.text in verify["prompt"] and Q in verify["prompt"]
+    assert verify["web"] is True
+
+
 def test_the_draft_prompt_tells_the_model_it_cannot_know_the_project():
     assert "only the project's records could answer it" in web.DRAFT_PROMPT
 

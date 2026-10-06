@@ -131,14 +131,24 @@ and do not invent an answer.
 
 # Wording from the 2026-10-06 strategy probe (LLM_THEN_WEB). It carries the
 # question and the draft and NOTHING from the records.
-VERIFY_PROMPT = """A colleague answered the question below from memory. Search the open web
-to check it. Keep what the sources confirm, correct what they contradict (citing
-the source), and mark anything still unconfirmed as [unverified]. Be brief.
+# The reply is shown to the reader VERBATIM, so it must read as an answer, not
+# as a review of someone else's work (TEST 2026-10-06: "### Review and
+# Verification", "**Confirmed.**", "The colleague's answer is accurate...").
+# The draft stays in the prompt as INPUT; the output must not mention it.
+VERIFY_PROMPT = """Answer the question below for a reader working on a New Zealand construction
+site. Below is a draft answer written from memory. Search the open web to check
+it, and write the FINAL answer yourself, addressed directly to the reader:
+- state the correct content directly, and give the source next to each fact;
+- mark anything you could not confirm as [unverified];
+- be brief.
+Never mention the draft, a colleague, or the checking process, and never use
+words such as "confirmed", "corrected", "verified", "review" or "verification".
+Do not use headings.
 
 ## Question
 {question}
 
-## Colleague's answer
+## Draft answer
 {draft}
 """
 
