@@ -60,4 +60,21 @@ def test_the_steel_check_between_the_stretches_is_not_offered():
     assert kept == ["pre-pour", "pre-pour again"]
     src = open(sr.__file__, encoding="utf-8").read()
     assert "spans = spans + gaps" in src
-    assert "if (any(_in_window(t, date, a, b) for a, b in stretches) if stretches" in src
+    assert "if (any(test(t, date, a, b) for a, b in stretches) if stretches" in src
+
+
+
+def test_THE_a_checks_report_reads_only_the_speech_inside_its_window():
+    """TEST, 2026-10-06: the pre-pour check ended 11:02:14, and the Level 2
+    PPE talk later in the same audio file answered its PPE item."""
+    day = "2026-10-05"
+    w = {"from": "10:59:09", "to": "11:02:14"}
+    assert sr._precise(w) and not sr._precise({"from": "09:00", "to": "11:30"})
+    steel = {"time_range": "11:02 – 11:03"}
+    hvac = {"time_range": "10:59 – 11:02"}
+    a, b = sr._clock(day, w["from"]), sr._clock(day, w["to"])
+    assert not sr._mostly_in(steel, day, a, b), "14 of its 120 seconds"
+    assert sr._mostly_in(hvac, day, a, b)
+    src = open(sr.__file__, encoding="utf-8").read()
+    assert 'turns = [t for t in turns if (t.get("until") or t["at"]) > win_from and t["at"] < win_to' in src
+    assert "precise=_precise(window)" in src
