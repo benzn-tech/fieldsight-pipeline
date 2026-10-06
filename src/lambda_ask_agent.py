@@ -1834,16 +1834,32 @@ def _rag_answer(body):
                 _fut_web = (_pool.submit(_general_run, web_answer, question, _cls,
                                          chunks, _started, route)
                             if _run_general else None)
+                # DEADLINE (review F2): llm_utils' ladder is 4 x 150 s, and the
+                # `with` joins this thread, so an unbounded synthesis could hold
+                # an already-finished general answer past API Gateway's 29 s.
+                # When the general flow runs alongside, bound the synthesis by
+                # what is left of the hard stop minus a compose reserve; on
+                # "deadline exceeded" the reader gets the general answer ALONE
+                # (the `_useful and not _records_ok` branch below). A
+                # project-only route is unchanged (no general answer to lose).
+                _syn_kw = {}
+                if _run_general:
+                    _syn_kw["deadline"] = max(1.0, web_answer.HARD_STOP_SECONDS
+                                              - (time.monotonic() - _started)
+                                              - web_answer.COMPOSE_RESERVE)
                 _fut_syn = (_pool.submit(llm_utils.call_llm, prompt,
                                          max_tokens=MAX_ANSWER_TOKENS,
-                                         force_json=False, caller="ask_answer")
+                                         force_json=False, caller="ask_answer",
+                                         **_syn_kw)
                             if _useful else None)
                 if _fut_web is not None:
                     try:
                         web = _fut_web.result()
                     except Exception as _web_exc:            # noqa: BLE001
                         logger.error("  Ask general-flow thread failed: %s", _web_exc)
-                        web = None
+                        web = web_answer._block(kind=_cls["kind"], failed=True)
+                        web.pop("_trace", None)
+                        route["general_status"] = "failed"
                 if _fut_syn is not None:
                     try:
                         _grounded = _fut_syn.result()
@@ -1913,6 +1929,25 @@ def _rag_answer(body):
                 "citations": [],
                 "grounded": False,
                 "from_web": True,
+                "web": web,
+                "basis": basis,
+                "applied_scope": applied_scope,
+                "asked": asked if rewritten else None,
+            }
+
+        if _cls is not None and _grounded is None and web is not None:
+            # The route chose NO records synthesis (gated, records not useful,
+            # project fallback) and the general flow produced no answer (draft
+            # failed or the run crashed). Do not fall into the sequential
+            # synthesis below: it would spend a call on records the classifier
+            # just called useless, with no deadline, after the chain already
+            # used most of the budget (review F1). Same shape as the
+            # empty-retrieval branch: the no-records answer, `web` attached so
+            # the reader is told what happened to the outside lookup.
+            return {
+                "answer": "No relevant records found for this question.",
+                "citations": [],
+                "grounded": True,
                 "web": web,
                 "basis": basis,
                 "applied_scope": applied_scope,

@@ -333,6 +333,25 @@ def test_a_failed_compose_falls_back_to_the_records_answer(monkeypatch, bad):
     assert out == {"answer": RECORDS, "conflicts": [], "composed": False}
 
 
+@pytest.mark.parametrize("answer", [
+    "x [1,3]", "x [1, 3]", "x [1-3]", "x [1][3]", "x [3]", "x [1; 3]", "x [1–3]",
+])
+def test_compose_discards_any_marker_form_naming_a_record_it_lacks(monkeypatch, answer):
+    """RECORDS has only [1] and [2]; each form below names [3]. Review F7."""
+    out, _ = compose_with(monkeypatch, json.dumps({"answer": answer, "conflicts": []}))
+    assert out["composed"] is False and out["answer"] == RECORDS
+
+
+@pytest.mark.parametrize("answer", ["ok [1]", "ok [1,2]", "ok [1-2]", "ok [1][2]", "ok [unverified]"])
+def test_compose_accepts_markers_the_records_answer_has(monkeypatch, answer):
+    out, _ = compose_with(monkeypatch, json.dumps({"answer": answer, "conflicts": []}))
+    assert out["composed"] is True
+
+
+def test_the_draft_prompt_tells_the_model_it_cannot_know_the_project():
+    assert "only the project's records could answer it" in web.DRAFT_PROMPT
+
+
 def test_compose_makes_no_call_without_time(monkeypatch):
     out, script = compose_with(monkeypatch, "{}", budget=1.0)
     assert script.calls == [] and out["composed"] is False

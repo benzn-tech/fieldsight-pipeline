@@ -429,13 +429,133 @@ def test_a_crashed_synthesis_still_delivers_the_general_answer(monkeypatch):
     assert out["citations"] == [], "no records text, so no cards"
 
 
-def test_a_failed_draft_tells_the_reader_and_keeps_the_records_answer(monkeypatch):
-    vendor = Vendor(web_classify=[classified("general", False)],
-                    web_draft=[reply(error="HTTP 500")])
-    wire(monkeypatch, vendor)
-    out = ask()
-    assert out["answer"] == RECORDS_ANSWER
+@pytest.mark.parametrize("label,classify_reply,chunks,question", [
+    ("general, records not useful", classified("general", False), (CHUNK,), SPRINKLER_Q),
+    ("project fallback", classified("project", False), (CHUNK,), "what was the barrier height"),
+    ("distance gated", None, (dict(CHUNK, distance=0.9, topic_title="Unrelated"),), SPRINKLER_Q),
+])
+def test_a_failed_draft_returns_the_no_records_answer_and_never_synthesises(
+        monkeypatch, label, classify_reply, chunks, question):
+    """Review F1: the route chose NO records synthesis, so a failed draft must not
+    fall into the sequential one (records the classifier just called useless,
+    no deadline, after the chain spent the budget). The reader gets the
+    no-records answer with the failed lookup attached."""
+    scripts = {"web_draft": [reply(error="HTTP 500")]}
+    if classify_reply is not None:
+        scripts["web_classify"] = [classify_reply]
+    vendor = Vendor(**scripts)
+    synth = wire(monkeypatch, vendor, chunks=chunks)
+    out = ask(question)
+    assert out["answer"] == "No relevant records found for this question."
+    assert synth["n"] == 0, label
     assert out["web"]["answer"] is None and out["web"]["failed"] is True
+    assert out["web"]["status"] == "unverified" and out["citations"] == []
+    assert "from_web" not in out
+
+
+def test_a_failed_draft_on_a_useful_route_keeps_the_records_answer(monkeypatch):
+    vendor = Vendor(web_classify=[classified("mixed", True)],
+                    web_draft=[reply(error="HTTP 500")])
+    synth = wire(monkeypatch, vendor)
+    out = ask()
+    assert out["answer"] == RECORDS_ANSWER and synth["n"] == 1
+    assert out["web"]["failed"] is True
+
+
+def test_a_crashed_general_run_is_logged_failed_and_does_not_synthesise(monkeypatch, caplog):
+    vendor = Vendor(web_classify=[classified("general", False)])
+    synth = wire(monkeypatch, vendor)
+    monkeypatch.setattr(web_answer, "general_answer",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    with caplog.at_level("INFO"):
+        out = ask()
+    record = json.loads(_route_lines(caplog)[0][len("ASK_ROUTE "):])
+    assert record["general_status"] == "failed"
+    assert out["answer"] == "No relevant records found for this question."
+    assert out["web"]["failed"] is True and synth["n"] == 0
+
+
+# ------------------------------------------------- the hard stop, on a fake clock
+
+class FakeClock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+def _patch_clock(monkeypatch):
+    import time
+    clock = FakeClock()
+    monkeypatch.setattr(time, "monotonic", clock)
+    return clock
+
+
+def test_the_synthesis_is_given_a_deadline_when_the_general_flow_runs_beside_it(monkeypatch):
+    clock = _patch_clock(monkeypatch)
+    vendor = Vendor(web_classify=[classified("mixed", True)],
+                    web_compose=[reply(error="x")], **general_script())
+    wire(monkeypatch, vendor)
+    seen = []
+
+    def fake_llm(prompt, **kw):
+        seen.append(kw)
+        return (RECORDS_ANSWER, None)
+
+    monkeypatch.setattr(llm_utils, "call_llm", fake_llm)
+    ask()
+    assert seen[0]["deadline"] == pytest.approx(
+        web_answer.HARD_STOP_SECONDS - web_answer.COMPOSE_RESERVE)
+
+
+def test_a_synthesis_that_hits_its_deadline_cannot_cost_the_reader_the_general_answer(monkeypatch):
+    """What the reader gets then: the general answer ALONE (grounded False, no
+    cards). The synthesis fake returns what llm_utils returns on the deadline."""
+    _patch_clock(monkeypatch)
+    vendor = Vendor(web_classify=[classified("mixed", True)], **general_script())
+    wire(monkeypatch, vendor, answer=("", "deadline exceeded"))
+    out = ask()
+    assert out["answer"] == VERIFIED_TEXT and out["grounded"] is False
+    assert out["citations"] == [] and out["from_web"] is True
+
+
+def test_the_slowest_mixed_route_stays_under_the_hard_stop(monkeypatch):
+    """Review F10. Every model call takes its ENTIRE timeout. Retrieval 3 s,
+    classify 8, draft 8, verify the 4 s that is left, compose the 4 s reserve:
+    no call may be started with a timeout that ends past the stop."""
+    clock = _patch_clock(monkeypatch)
+    start = clock.t
+    stop = web_answer.HARD_STOP_SECONDS
+    ends = []
+
+    texts = {"web_classify": json.dumps({"kind": "mixed", "records_answer": True}),
+             "web_draft": DRAFT_TEXT, "web_verify": VERIFIED_TEXT,
+             "web_compose": json.dumps({"answer": "merged [1]", "conflicts": []})}
+
+    def slow_vendor(prompt, **kw):
+        timeout = kw["timeout"]
+        ends.append((kw["caller"], clock.t - start + timeout))
+        clock.t += timeout
+        return reply(text=texts[kw["caller"]],
+                     results=SOURCES if kw.get("web") else ())
+
+    wire(monkeypatch, Vendor())
+    monkeypatch.setattr(web_answer.client, "call", slow_vendor)
+
+    class SlowRetrieval(FakeLambdaClient):
+        def invoke(self, **kw):
+            clock.t += 3.0
+            return super().invoke(**kw)
+
+    monkeypatch.setattr(laa, "_get_lambda_client",
+                        lambda: SlowRetrieval([{"chunks": [CHUNK]}]))
+    out = ask()
+    assert [c for c, _ in ends] == ["web_classify", "web_draft", "web_verify", "web_compose"]
+    for caller, end in ends:
+        assert end <= stop + 1e-6, (caller, end)
+    assert clock.t - start <= stop + 1e-6
+    assert out["answer"] == "merged [1]"
 
 
 # ----------------------------------------------------------------- ASK_ROUTE

@@ -69,7 +69,21 @@ CHEAP_MODEL = os.environ.get("CORROBORATION_CHEAP_MODEL", "google/gemini-3.8-fla
 KINDS = ("project", "general", "mixed")
 
 _FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.MULTILINE)
-_MARKER = re.compile(r"\[(\d+)\]")
+# A citation marker in any of its written forms: [1], [1,2], [1; 3], [1-3].
+# `_cited` expands each to the set of numbers it names, so the compose guard
+# cannot be walked past by [1,2], [1-3] or [1][2].
+_MARKER = re.compile(r"\[\s*\d+(?:\s*[-–,;]\s*\d+)*\s*\]")
+_RANGE = re.compile(r"(\d+)(?:\s*[-–]\s*(\d+))?")
+
+
+def _cited(text):
+    """Every record number a text's bracketed markers refer to."""
+    out = set()
+    for m in _MARKER.finditer(text or ""):
+        for a, b in _RANGE.findall(m.group(0)):
+            lo, hi = int(a), int(b or a)
+            out.update(range(lo, min(hi, lo + 100) + 1))
+    return out
 
 
 def enabled():
@@ -107,6 +121,9 @@ Return only JSON, no prose:
 DRAFT_PROMPT = """Answer this question for a reader working on a New Zealand construction site,
 from your own knowledge only. Be brief. Name the standard/clause you rely on. If you
 are not sure of a figure, say so plainly instead of guessing.
+If the question is about a specific project, site, person, meeting or date that
+you cannot know, say plainly that only the project's records could answer it,
+and do not invent an answer.
 
 ## Question
 {question}
@@ -231,7 +248,7 @@ def _verify_ok(reply):
     return reply.ok and reply.searched and bool((reply.text or "").strip())
 
 
-def general_answer(question, budget, *, kind="general", clock=time.monotonic):
+def general_answer(question, budget, *, kind="general", clock=None):
     """Draft from the model's knowledge, verify on the web, never nothing.
 
     `budget` is the seconds this whole chain may take. Returns a `web` block;
@@ -247,6 +264,8 @@ def general_answer(question, budget, *, kind="general", clock=time.monotonic):
     A question over the admission cap is not sent to the web at all; it still
     gets the draft, with status "too_long".
     """
+    # Resolved at call time so a test (or a caller) patching time.monotonic is honoured.
+    clock = clock or time.monotonic
     started = clock()
     ms = {}
 
@@ -341,8 +360,7 @@ def compose(records_answer_text, general_block, question, budget):
             or not isinstance(parsed.get("conflicts", []), list)):
         logger.warning("ask compose: reply was not a composition")
         return fail
-    allowed = set(_MARKER.findall(records_answer_text))
-    if not set(_MARKER.findall(parsed["answer"])) <= allowed:
+    if not _cited(parsed["answer"]) <= _cited(records_answer_text):
         logger.warning("ask compose: invented a citation marker; discarded")
         return fail
     return {"answer": parsed["answer"].strip(),
