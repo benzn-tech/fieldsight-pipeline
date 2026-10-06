@@ -130,18 +130,22 @@ def test_general_question_with_no_useful_records_is_answered_by_the_general_flow
     assert vendor.callers == Counter({"web_classify": 1, "web_draft": 1, "web_verify": 1})
 
 
-def test_general_question_with_useful_records_lets_the_records_answer_ride_along(monkeypatch):
-    """RULING: the records answer stays the `answer` with its cards, because its
-    [n] markers only mean something next to `citations`; the general answer
-    travels in its own `web` block. Nothing is merged."""
-    vendor = Vendor(web_classify=[classified("general", True)], **general_script())
-    wire(monkeypatch, vendor)
+def test_general_question_with_useful_records_is_composed_like_mixed(monkeypatch):
+    """RULING (controller, 2026-10-06): general + records_answer true goes through
+    compose, one merged answer with the records' [n] kept against the cards. The
+    records answer is never the whole answer to a general question."""
+    composed = {"answer": "Records discuss 1.5 m [1]. NZS 4541 says 1.8 m.",
+                "conflicts": ["the records say 1.5 m; NZS 4541 says 1.8 m"]}
+    vendor = Vendor(web_classify=[classified("general", True)],
+                    web_compose=[reply(text=json.dumps(composed))], **general_script())
+    synth = wire(monkeypatch, vendor)
     out = ask()
-    assert out["answer"] == RECORDS_ANSWER and out["grounded"] is True
-    assert out["from_web"] is True
+    assert out["answer"] == composed["answer"]
+    assert out["grounded"] is True and out["from_web"] is True
     assert len(out["citations"]) == 1
-    assert out["web"]["answer"] == VERIFIED_TEXT and out["web"]["kind"] == "general"
-    assert vendor.callers["web_compose"] == 0
+    assert out["web"]["answer"] == VERIFIED_TEXT
+    assert out["web"]["conflicts"] == composed["conflicts"]
+    assert vendor.callers["web_compose"] == 1 and synth["n"] == 1
 
 
 def test_mixed_question_is_composed_with_conflicts_and_the_records_cards(monkeypatch):
@@ -215,6 +219,50 @@ def test_a_far_chunk_set_skips_classify_and_runs_the_general_flow(monkeypatch):
     out = ask()
     assert out["answer"] == VERIFIED_TEXT and out["citations"] == []
     assert vendor.callers["web_classify"] == 0
+
+
+# ------------------------------------------- records synthesis only when usable
+
+def test_no_records_synthesis_for_a_general_question_the_records_cannot_help(monkeypatch):
+    vendor = Vendor(web_classify=[classified("general", False)], **general_script())
+    synth = wire(monkeypatch, vendor)
+    ask()
+    assert synth["n"] == 0
+
+
+def test_no_records_synthesis_for_a_project_question_the_records_cannot_answer(monkeypatch):
+    vendor = Vendor(web_classify=[classified("project", False)], **general_script())
+    synth = wire(monkeypatch, vendor)
+    ask("what was the barrier height on level 2")
+    assert synth["n"] == 0
+
+
+def test_no_records_synthesis_when_the_distance_gate_skips_classify(monkeypatch):
+    vendor = Vendor(**general_script())
+    synth = wire(monkeypatch, vendor, chunks=(dict(CHUNK, distance=0.9, topic_title="Unrelated"),))
+    ask()
+    assert synth["n"] == 0
+
+
+def test_the_synthesis_runs_after_classify_for_project_and_mixed_and_useful_general(monkeypatch):
+    for kind, ra, general_runs in (("project", True, False), ("mixed", True, True),
+                                   ("general", True, True)):
+        vendor = Vendor(web_classify=[classified(kind, ra)], web_compose=[reply(error="x")],
+                        **general_script())
+        synth = wire(monkeypatch, vendor)
+        ask()
+        assert synth["n"] == 1, kind
+        assert (vendor.callers["web_draft"] == 1) is general_runs, kind
+
+
+def test_a_classify_that_raises_still_pays_for_the_synthesis_and_runs_both(monkeypatch):
+    vendor = Vendor(web_compose=[reply(error="x")], **general_script())
+    synth = wire(monkeypatch, vendor)
+    monkeypatch.setattr(web_answer, "classify",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    out = ask()
+    assert synth["n"] == 1 and vendor.callers["web_draft"] == 1
+    assert out["answer"] == RECORDS_ANSWER
 
 
 # ----------------------------------------------------- what the reader is told

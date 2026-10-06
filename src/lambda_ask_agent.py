@@ -1047,49 +1047,53 @@ def _web_answer_enabled():
     return web_answer.enabled()
 
 
-def _general_chain(web_answer, question, asked, chunks, gated, started, route):
-    """Classify (when there is something to classify), then run the general
-    flow if the class needs it. Returns `(classification, web_block_or_None)`.
+def _classify_for_route(web_answer, asked, chunks, gated, started, route):
+    """The classification that decides the route. Never raises.
 
-    Runs on a worker thread beside the records synthesis, and writes its own
-    keys of `route` (the ASK_ROUTE record) -- disjoint from anything the main
-    thread writes until both are joined.
-
-    `asked` (the standalone rewrite) is what classify judges; `question` (what
-    the asker typed) is the only text that goes anywhere else. `gated` means the
+    `asked` (the standalone rewrite) is what classify judges. `gated` means the
     distance gate already knows the records cannot answer: classify is skipped
-    and the general flow runs alone, which is what "project + records_answer
-    false" would have routed to anyway.
+    and the general flow runs alone. A classify that RAISES gets the same
+    fail-safe an unreadable reply gets (mixed + records useful): both sides
+    run, never nothing.
 
-    The budget is what is left of HARD_STOP_SECONDS measured from the START of
-    the request, not from this call: retrieval and rewrite already spent some.
+    Budget is what is left of HARD_STOP_SECONDS from the START of the request.
     """
-    def left():
-        return web_answer.HARD_STOP_SECONDS - (time.monotonic() - started)
-
     t = time.monotonic()
     if gated and chunks:
         cls = {"kind": "general", "records_answer": False, "source": "gated"}
     else:
-        cls = web_answer.classify(asked, chunks,
-                                  min(web_answer.CLASSIFY_BUDGET, left()))
+        try:
+            cls = web_answer.classify(
+                asked, chunks, min(web_answer.CLASSIFY_BUDGET,
+                                   web_answer.HARD_STOP_SECONDS - (time.monotonic() - started)))
+        except Exception as exc:                          # noqa: BLE001
+            logger.error("  Ask classify raised: %s", exc)
+            cls = {"kind": "mixed", "records_answer": True, "source": "fallback"}
     route["ms"]["classify"] = int((time.monotonic() - t) * 1000)
     route["kind"] = cls["kind"]
     route["records_answer"] = cls["records_answer"]
     route["classify"] = cls["source"]
+    return cls
 
-    useful = bool(cls["records_answer"]) and bool(chunks)
-    if cls["kind"] == "project" and useful:
-        return cls, None            # today's grounded path, nothing else runs
 
-    # Mixed keeps back time for the compose call that follows the join.
-    reserve = web_answer.COMPOSE_RESERVE if (cls["kind"] == "mixed" and useful) else 0.0
-    gen = web_answer.general_answer(question, left() - reserve, kind=cls["kind"])
+def _records_useful(cls, chunks):
+    return bool(cls["records_answer"]) and bool(chunks)
+
+
+def _general_run(web_answer, question, cls, chunks, started, route):
+    """draft -> verify for a general or mixed question. Runs on a worker thread
+    beside the records synthesis; writes only its own keys of `route`. Only the
+    asker's own `question` goes out. Mixed (and general with useful records)
+    keeps back time for the compose call that follows the join."""
+    reserve = (web_answer.COMPOSE_RESERVE
+               if cls["kind"] != "project" and _records_useful(cls, chunks) else 0.0)
+    left = web_answer.HARD_STOP_SECONDS - (time.monotonic() - started)
+    gen = web_answer.general_answer(question, left - reserve, kind=cls["kind"])
     trace = gen.pop("_trace", {})
     route["general_status"] = gen["status"]
     route["retried"] = bool(trace.get("retried"))
     route["ms"].update(trace.get("ms") or {})
-    return cls, gen
+    return gen
 
 
 def _parse_now(raw):
@@ -1657,8 +1661,10 @@ def _rag_answer(body):
                     # judge an empty list). The general flow runs alone --
                     # "project + no records" falls back to it by design (spec D2).
                     _t_web = time.monotonic()
-                    _cls, empty_web = _general_chain(
-                        web_answer, question, asked, [], False, _started, route)
+                    _cls = _classify_for_route(web_answer, asked, [], False,
+                                               _started, route)
+                    empty_web = _general_run(web_answer, question, _cls, [],
+                                             _started, route)
                     marks["synthesis"] = time.monotonic() - _t_web
                     if empty_web.get("answer"):
                         return {
@@ -1815,37 +1821,49 @@ def _rag_answer(body):
             # classify judges `asked` (what retrieval searched for); the draft,
             # verify and compose calls only ever see the asker's `question`, so
             # nothing history-derived leaves the account.
+            # SYNTHESIS ONLY WHEN IT CAN BE USED (controller ruling, 2026-10-06,
+            # the owner is short on API credit): classify first, then start the
+            # records synthesis only for a project/mixed question or a general
+            # one whose records are useful. A gated or not-useful set pays no
+            # synthesis. The records path is ~2.5 s slower for it.
+            _cls = _classify_for_route(web_answer, asked, chunks, _skip, _started, route)
+            _useful = _records_useful(_cls, chunks)
+            _run_general = _cls["kind"] != "project" or not _useful
             _t_synthesis = time.monotonic()
             with ThreadPoolExecutor(max_workers=2) as _pool:
-                _fut_web = _pool.submit(_general_chain, web_answer, question,
-                                        asked, chunks, _skip, _started, route)
-                _fut_syn = _pool.submit(llm_utils.call_llm, prompt,
-                                        max_tokens=MAX_ANSWER_TOKENS,
-                                        force_json=False, caller="ask_answer")
-                try:
-                    _cls, web = _fut_web.result()
-                except Exception as _web_exc:                # noqa: BLE001
-                    logger.error("  Ask general-flow thread failed: %s", _web_exc)
-                    _cls, web = None, None
-                try:
-                    _grounded = _fut_syn.result()
-                except Exception as _syn_exc:                # noqa: BLE001
-                    logger.error("  Ask concurrent synthesis thread failed: %s", _syn_exc)
-                    _grounded = (None, str(_syn_exc))
+                _fut_web = (_pool.submit(_general_run, web_answer, question, _cls,
+                                         chunks, _started, route)
+                            if _run_general else None)
+                _fut_syn = (_pool.submit(llm_utils.call_llm, prompt,
+                                         max_tokens=MAX_ANSWER_TOKENS,
+                                         force_json=False, caller="ask_answer")
+                            if _useful else None)
+                if _fut_web is not None:
+                    try:
+                        web = _fut_web.result()
+                    except Exception as _web_exc:            # noqa: BLE001
+                        logger.error("  Ask general-flow thread failed: %s", _web_exc)
+                        web = None
+                if _fut_syn is not None:
+                    try:
+                        _grounded = _fut_syn.result()
+                    except Exception as _syn_exc:            # noqa: BLE001
+                        logger.error("  Ask concurrent synthesis thread failed: %s", _syn_exc)
+                        _grounded = (None, str(_syn_exc))
             marks["synthesis"] = time.monotonic() - _t_synthesis
 
         if web is not None and web.get("answer"):
             # ROUTING (spec 2026-10-06 D2), `_cls` is the classification:
             #
             #   records useful AND the records answer exists
-            #       general (records ride along) -> answer = RECORDS answer,
-            #           citations = cards, web = the general block. The
-            #           grounded answer's [n] markers point at `citations`;
-            #           that contract (see _build_citations) only holds if the
-            #           text carrying the markers is the text next to the
-            #           cards, so the general answer stays in its own block.
-            #       mixed -> `compose` merges them; every [n] in the merged
-            #           text is one the records answer already had.
+            #       general or mixed -> `compose` merges them into ONE answer
+            #           (controller ruling 2026-10-06: a general question must
+            #           not be answered with the records' "the excerpts do not
+            #           contain it" and the real answer in a side block). Every
+            #           [n] in the merged text is one the records answer
+            #           already had, so card [i+1] still matches. If compose
+            #           fails: the records answer with the general block
+            #           alongside, no conflicts.
             #   anything else -> the general answer alone: answer = general
             #       text, citations = [] (no records text, so no [n] to match),
             #       grounded False. This is also where "project question with
@@ -1861,7 +1879,7 @@ def _rag_answer(body):
             _records_ok = bool(_grounded and _grounded[0] and not _grounded[1])
             if _useful and _records_ok:
                 _answer = _grounded[0]
-                if _cls["kind"] == "mixed":
+                if _cls["kind"] != "project":
                     _t_compose = time.monotonic()
                     try:
                         import web_answer
