@@ -19,7 +19,7 @@ def test_THE_the_email_names_the_checklist_being_filled_and_the_unmatched_check(
     assert ("Checklist: Concrete Pre-pour Inspection Checklist for “concrete pre-pour check "
             "for the level two slab” (17:12–17:17) is being filled in — it will be ready in "
             "FieldSight in a few minutes.") in text
-    assert ("Heard “steel inspections for the stair core” (17:15–17:15) — no checklist in "
+    assert ("Heard “steel inspections for the stair core” (17:15) — no checklist in "
             "your Library matches it, so no checklist report was made.") in text
     assert "Concrete Pre-pour Inspection Checklist" in html
 
@@ -41,4 +41,4 @@ def test_item_writer_hands_the_checks_to_the_email():
         {"check": "pre-pour", "template": "Pre-pour", "from": "17:12", "to": "17:17"}]
     src = open(iw.__file__, encoding="utf-8").read()
     assert 'final_email_ctx["checks"] = email_checks(stored_inspections)' in src
-    assert 'checks=artifact.get("checks"))' in open(fin.__file__, encoding="utf-8").read()
+    assert 'checks=artifact.get("checks"), open_url=' in open(fin.__file__, encoding="utf-8").read()

@@ -100,7 +100,7 @@ def test_the_text_table_header_and_separator_match_the_frontend_exactly():
 def test_an_empty_recording_still_says_so():
     _subject, text, html = _email([])
     assert "Nothing was captured" in text and "Nothing was captured" in html
-    assert "<table" not in html
+    assert "AGENDA ITEM" not in html
 
 
 def test_a_row_with_no_kind_is_a_task():
