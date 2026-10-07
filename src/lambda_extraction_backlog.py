@@ -62,6 +62,10 @@ WINDOW_DAYS = int(os.environ.get("BACKLOG_WINDOW_DAYS", "3"))
 
 REQUEST_PREFIX = "extraction_requests/"
 
+#: The pipeline alert topic. Empty on a stack that does not create one (ShouldCreateAlerts
+#: false): the expedite notice is then simply not sent.
+ALERT_TOPIC_ARN = os.environ.get("ALERT_TOPIC_ARN", "").strip()
+
 #: Multi-device meetings are enqueued as `extraction_requests/group-<id>.json`
 #: carrying {groupId, mergedKey, members[]} and NO top-level userFolder. The
 #: solo parse raised KeyError on them, so every meeting since the feature
@@ -277,6 +281,49 @@ def scan(client, now=None):
     return recent, everything, skipped
 
 
+def _sns():
+    return boto3.client("sns")
+
+
+def notify_expedite(m):
+    """Tell the alert topic that a customer asked to expedite. True when sent.
+
+    The marker is the ledger: org-api stamps `expedite_requested_at` (and clears
+    `expedite_notified_at`), this stamps `expedite_notified_at` after a successful publish.
+    Keyed on those two rather than on the `expedite` flag, because the re-drive below
+    clears that flag in the very run that notices it. A failed publish stamps nothing, so
+    the next 5-minute run tries again."""
+    if not m.get("expedite_requested_at") or m.get("expedite_notified_at"):
+        return False
+    if not ALERT_TOPIC_ARN:
+        logger.info("backlog: expedite for %s but no alert topic is configured",
+                    m.get("sessionBase"))
+        return False
+    when = " ".join(p for p in (m.get("date"), m.get("time_range")) if p)
+    text = (f"Customer {m.get('expedite_by_name') or 'unknown'} "
+            f"({m.get('expedite_by_company') or 'unknown company'}) asked to expedite "
+            f"their recording {m.get('sessionBase')} ({when}). "
+            f"Attempts so far: {int(m.get('attempts') or 0)}. "
+            f"Last error: {m.get('last_error') or 'unknown'}.")
+    try:
+        _sns().publish(TopicArn=ALERT_TOPIC_ARN, Subject="FieldSight: customer asked to expedite",
+                       Message=text)
+    except Exception:
+        logger.exception("backlog: could not publish the expedite notice for %s",
+                         m.get("sessionBase"))
+        return False
+    m["expedite_notified_at"] = extraction_pending.iso(datetime.now(timezone.utc))
+    return True
+
+
+def _stamp(client, m):
+    """Persist `expedite_notified_at` when the marker is not being rewritten by a re-drive."""
+    try:
+        extraction_pending.write(client, S3_BUCKET, m)
+    except Exception:
+        logger.exception("backlog: could not stamp expedite_notified_at on %s", m.get("sessionBase"))
+
+
 def redrive(client, now=None):
     """Re-put the original request of every extraction_pending marker that is due.
 
@@ -303,17 +350,24 @@ def redrive(client, now=None):
             # nothing to re-drive, but still counted above once it is stale -- a promise
             # that outlives ALARM_AGE_MINUTES is exactly what the alarm is for.
             continue
+        notified = notify_expedite(m)
         due = extraction_pending.parse_iso(m.get("next_attempt_at"))
         if not (m.get("expedite") or due is None or due <= now):
+            if notified:
+                _stamp(client, m)
             continue
         request_key = m.get("request_key")
         if not request_key:
             logger.warning("backlog: marker for %s has no request_key -- cannot re-drive", base)
+            if notified:
+                _stamp(client, m)
             continue
         try:
             body = client.get_object(Bucket=S3_BUCKET, Key=request_key)["Body"].read()
         except Exception:
             logger.exception("backlog: cannot read request %s for %s", request_key, base)
+            if notified:
+                _stamp(client, m)
             continue
         attempts = int(m.get("attempts") or 0) + 1
         m["attempts"] = attempts

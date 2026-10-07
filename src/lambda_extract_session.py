@@ -2541,9 +2541,16 @@ def _record_pending(bucket, key, user_folder, date, session_base, error):
     Best-effort -- the caller re-raises regardless, so the failure still counts in the
     Lambda Errors metric and the alarm built on it -- but never silent."""
     try:
+        try:
+            segment_keys = gather_session_segments(bucket, user_folder, date, session_base)
+        except Exception:
+            # The time range is a nicety for the web banner; never worth losing the marker.
+            logger.warning("%s: cannot list segments for the pending marker's time range",
+                           session_base, exc_info=True)
+            segment_keys = None
         extraction_pending.record_failure(
             s3(), bucket, user_folder=user_folder, date=date, session_base=session_base,
-            request_key=key, error=error)
+            request_key=key, error=error, segment_keys=segment_keys)
         logger.error("EXTRACTION_PENDING %s: final extraction failed on every model; "
                      "will be re-driven until it succeeds", session_base)
     except Exception:

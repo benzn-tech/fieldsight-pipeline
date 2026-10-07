@@ -2489,6 +2489,9 @@ Resources:
                     # worker has not written the result. Every poll before the
                     # document exists answered 500 instead of `pending`.
                     - session_report_results/*
+                    # GET /sessions/pending and POST /sessions/{id}/expedite: most sessions
+                    # have no marker, and that must read as 404/empty, not a 403 -> 500.
+                    - extraction_pending/*
             - Effect: Allow
               # Task 20 (content correction reindex chain): after a content
               # edit commits, org-api (in-VPC) writes the per-topic reindex
@@ -2559,6 +2562,14 @@ Resources:
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
+            # Spec 2026-10-07 D6: read the caller's extraction_pending markers and stamp the
+            # Expedite request on one. The marker is the whole interface; the backlog lambda
+            # (not in the VPC) does the notifying.
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/extraction_pending/*
             - Effect: Allow
               Action: s3:GetObject
               Resource:
@@ -5532,7 +5543,15 @@ Resources:
           # would never trip -- the exact "checker stopped" case this exists
           # to catch, defeated by a missing dimension.
           BACKLOG_METRIC_STAGE: !Ref Stage
+          # D6: where "a customer asked to expedite" goes. Absent when the stack creates
+          # no alert topic; the code then skips the notice.
+          ALERT_TOPIC_ARN: !If [ShouldCreateAlerts, !Ref AlertTopic, !Ref "AWS::NoValue"]
       Policies:
+        - !If
+          - ShouldCreateAlerts
+          - SNSPublishMessagePolicy:
+              TopicName: !GetAtt AlertTopic.TopicName
+          - !Ref "AWS::NoValue"
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow

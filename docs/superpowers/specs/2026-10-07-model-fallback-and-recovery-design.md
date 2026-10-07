@@ -60,8 +60,9 @@ Unknown models keep today's behaviour.
 - The Timeline and Today pages show a banner per pending session:
   > Your recording ({time range}) was uploaded safely and won't be lost. Our AI model is temporarily unavailable — we're reconnecting automatically and will show your notes as soon as it recovers.
 - The banner carries an **"Expedite"** button that calls `POST /sessions/{sid}/expedite`:
-  - org-api writes `expedite_requests/{sid}.json` (S3 only; org-api has no outbound route beyond S3).
-  - The S3 event invokes the backlog lambda, which re-drives at once and publishes to the alert topic: "Customer {name} ({company}) asked to expedite session {sid} ({date} {time})".
+  - org-api checks the caller owns the session (marker `userFolder` == caller's `folder_name`; anything else, a missing marker or a `promised_only` one is 404) and stamps the marker itself: `expedite: true`, `expedite_requested_at`, `expedite_by`, `expedite_by_name`, `expedite_by_company`, `next_attempt_at` = now (conditional on the ETag where the SDK supports `If-Match`, else last-writer-wins). A second request within 10 minutes is 429 with `retry_after_s`. No `expedite_requests/` object and no new S3 notification.
+  - The backlog lambda's 5-minute `PendingRedrive` run notices `expedite_requested_at` without `expedite_notified_at`, publishes to the alert topic ("Customer {name} ({company}) asked to expedite their recording {sid} ({date} {time range}). Attempts so far: {n}. Last error: {error}."), stamps `expedite_notified_at`, and re-drives at once as for any due marker. No topic on the stack: no notice. A failed publish stamps nothing and is retried next run.
+  - `GET /sessions/pending` returns `time_range` ("HH:MM–HH:MM" NZ) from the marker, which extract-session fills from the transcript key names (null when unknown), and `expedited_at`.
   - The button shows "We've been notified and are on it" and is disabled for that session for 10 minutes.
 
 ## Out of scope

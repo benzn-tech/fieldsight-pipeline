@@ -8,7 +8,11 @@ extract-session when a final pass succeeds. Spec 2026-10-07 D4/D5.
 Fields: userFolder, date, sessionBase, request_key (the S3 key whose notification
 triggered the failed pass -- re-putting it fires the same trigger), attempts (re-drives
 done so far), first_failed_at, last_failed_at, last_error, next_attempt_at, expedite
-(set by the web's Expedite button, D6), error_email_sent_at (set once the "your notes
+(set by the web's Expedite button, D6; the re-driver clears it once it has re-driven),
+started_at / ended_at / time_range (NZ wall clock of the session, from the transcript
+names), expedite_requested_at / expedite_by / expedite_by_name / expedite_by_company /
+expedite_notified_at (D6: org-api writes the first four, the backlog lambda stamps the
+last after telling the alert topic), error_email_sent_at (set once the "your notes
 are delayed" email went out; its presence is what makes the later success send the
 notes email once).
 
@@ -17,6 +21,7 @@ shares one definition of the key, the backoff and the timestamp format.
 """
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
@@ -72,8 +77,43 @@ def write(s3, bucket, marker):
                   ContentType="application/json")
 
 
+_STAMP_RE = re.compile(r"(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})")
+_SPAN_RE = re.compile(r"_off(\d+(?:\.\d+)?)_to(\d+(?:\.\d+)?)")
+
+
+def time_range_from_keys(keys):
+    """(started_at, ended_at, "HH:MM–HH:MM") from the transcript keys of one session,
+    or (None, None, None). The names carry `YYYY-MM-DD_HH-MM-SS` (the device's wall clock,
+    NZ); a `_off{a}_to{b}` span adds seconds to it. The end is the latest span end when
+    the names carry one, else the latest start. A session that starts and ends in the
+    same minute reads "HH:MM"."""
+    starts, ends = [], []
+    for key in keys or []:
+        name = str(key).rsplit("/", 1)[-1]
+        m = _STAMP_RE.search(name)
+        if not m:
+            continue
+        try:
+            base = datetime.strptime(f"{m.group(1)}_{m.group(2)}", "%Y-%m-%d_%H-%M-%S")
+        except ValueError:
+            continue
+        span = _SPAN_RE.search(name)
+        if span:
+            starts.append(base + timedelta(seconds=float(span.group(1))))
+            ends.append(base + timedelta(seconds=float(span.group(2))))
+        else:
+            starts.append(base)
+            ends.append(base)
+    if not starts:
+        return None, None, None
+    first, last = min(starts), max(ends)
+    a, b = first.strftime("%H:%M"), last.strftime("%H:%M")
+    return (first.strftime("%Y-%m-%dT%H:%M:%S"), last.strftime("%Y-%m-%dT%H:%M:%S"),
+            a if a == b else f"{a}–{b}")
+
+
 def record_failure(s3, bucket, *, user_folder, date, session_base, request_key, error,
-                   now=None):
+                   now=None, segment_keys=None):
     """Create the marker, or on a repeat failure only refresh last_error/last_failed_at:
     the schedule (attempts, next_attempt_at) belongs to the re-driver, and a failure that
     IS a re-drive's outcome must not push its own next attempt back to the first rung."""
@@ -100,6 +140,10 @@ def record_failure(s3, bucket, *, user_folder, date, session_base, request_key, 
                   "expedite": False}
         if promised_at:
             marker["error_email_sent_at"] = promised_at
+    if not marker.get("time_range"):
+        started, ended, label = time_range_from_keys(segment_keys)
+        if label:
+            marker.update(started_at=started, ended_at=ended, time_range=label)
     marker["last_failed_at"] = iso(now)
     marker["last_error"] = str(error)[:500]
     write(s3, bucket, marker)
