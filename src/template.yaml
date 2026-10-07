@@ -2719,6 +2719,7 @@ Resources:
                 - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
                 # The close-driven final-pass request written by FinalizeSweepFunction.
                 - !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/extraction_pending/*
                 # Its own previous output — read to apply the re-extraction
                 # throttle and the tier/coverage supersede check BEFORE doing
                 # any expensive work.
@@ -2739,6 +2740,13 @@ Resources:
                 # dropped and the session keeps fast-tier topics forever — the
                 # exact silent-degradation shape a missing grant caused before.
                 - !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
+                # extraction_pending/{sessionBase}.json: a failed FINAL pass is recorded
+                # here for the backlog lambda to re-drive (spec D4). Not a trigger prefix.
+                - !Sub arn:aws:s3:::${IngestBucketName}/extraction_pending/*
+            # Success deletes the marker (and nothing else this role may delete).
+            - Effect: Allow
+              Action: s3:DeleteObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/extraction_pending/*
             # pipeline_trace: what this step did with a recording (traces/, 180 days).
             - Effect: Allow
               Action: s3:PutObject
@@ -2760,6 +2768,10 @@ Resources:
                   s3:prefix:
                     - transcripts/*
                     - extractions/*
+                    # The marker is read before it is written, and on success deleted;
+                    # a first failure reads a key that does not exist, which is a 403
+                    # without ListBucket (the same trap as extractions/* above).
+                    - extraction_pending/*
                     # The agent-answer sidecars. ListBucket is not optional here: without it S3
                     # answers 403 for a key that simply does not exist, which the reader cannot
                     # tell from a real denial -- and a reader that silently sees "no sidecar"
@@ -3365,6 +3377,17 @@ Resources:
                     # `_read_brief` would log it as a loud permissions failure on
                     # every single poll of every single session.
                     - session_brief/*
+                    # The extraction_pending marker: a missing one is the ORDINARY case
+                    # (extraction did not fail), and without ListBucket S3 answers 403
+                    # for it -- which the reader would have to treat as "unknown".
+                    - extraction_pending/*
+            - Effect: Allow
+              # Read the marker to tell "extraction failed" from "nothing was said",
+              # and write error_email_sent_at back into it (spec D5).
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/extraction_pending/*
             - Effect: Allow
               Action:
                 - ses:SendEmail
@@ -5501,9 +5524,19 @@ Resources:
                     - extraction_requests/*
                     - extractions/*
                     - transcripts/*
+                    - extraction_pending/*
             - Effect: Allow
               Action: s3:GetObject
-              Resource: !Sub arn:aws:s3:::${DataBucketName}/extraction_requests/*
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/extraction_requests/*
+                - !Sub arn:aws:s3:::${DataBucketName}/extraction_pending/*
+            # The re-drive (spec D4): re-put the original request, which fires the
+            # extract-session notification, and reschedule the marker.
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/extraction_requests/*
+                - !Sub arn:aws:s3:::${DataBucketName}/extraction_pending/*
             # PutMetricData takes no resource ARN. Scoped by namespace instead,
             # so this role cannot overwrite any other namespace's series.
             - Effect: Allow
@@ -5518,6 +5551,16 @@ Resources:
           Properties:
             Schedule: rate(1 hour)
             Description: Sessions transcribed but never extracted.
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
+        # The re-drive needs to run on the backoff's 5-minute grain; the full scan
+        # above does not (it lists three prefixes), so this event asks for the re-drive
+        # alone.
+        PendingRedrive:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Input: '{"task": "redrive"}'
+            Description: Re-drive final extractions that failed on every model.
             State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
 
   ExtractionBacklogAlarm:
@@ -5551,6 +5594,33 @@ Resources:
       # that is always red is an alarm nobody reads -- the exact failure this
       # whole probe was written to avoid, reintroduced by its own alarm.
       TreatMissingData: !If [ShouldEnableSchedules, breaching, notBreaching]
+      AlarmActions:
+        - !Ref AlertTopic
+
+  ExtractionPendingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldCreateAlerts
+    Properties:
+      AlarmName: !Sub ["${P}-extraction-pending", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      AlarmDescription: >-
+        A recording's final extraction has been failing on every model for over
+        30 minutes. It is being re-driven (5, 15, 30, 60 min, then hourly,
+        forever) and the recorder has been told it is delayed; this is the
+        page to a human to look at the model vendor.
+      Namespace: FieldSight/Pipeline
+      MetricName: ExtractionPending
+      Dimensions:
+        - Name: Stage
+          Value: !Ref Stage
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # notBreaching, unlike ExtractionBacklogAlarm: this metric is an EMF line the
+      # re-drive emits on every run, so a stopped re-driver is already caught by the
+      # backlog alarm's own `breaching` on its hourly run. Here silence must not page.
+      TreatMissingData: notBreaching
       AlarmActions:
         - !Ref AlertTopic
 

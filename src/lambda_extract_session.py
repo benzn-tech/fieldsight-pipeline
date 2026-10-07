@@ -50,6 +50,7 @@ import agent_turn_filter
 import pipeline_trace
 from output_language import OUTPUT_LANGUAGE_RULE
 import evidence_match
+import extraction_pending
 import item_continuity
 import llm_utils
 import batch_stitch
@@ -534,6 +535,13 @@ TIER_FINAL = 'final'
 # when transcripts stop, with FINAL_RERUN_MAX_GENERATIONS as the backstop for
 # the case where that assumption is wrong.
 FINAL_REQUESTS_PREFIX = 'extraction_requests/'
+
+
+class ModelCallFailed(RuntimeError):
+    """The model call failed on every model in the chain. A RuntimeError, so the S3
+    async retry and the Lambda Errors alarm see exactly what they always did; the type
+    only lets lambda_handler tell this failure (retry it, forever -- extraction_pending)
+    from a parse or data failure, which a re-drive would repeat unchanged."""
 # How many times a final pass may ask for a fresher final pass. Reached only if
 # transcripts keep arriving for longer than N thinking calls (~170s each), which
 # on the evidence does not happen -- or if something is rewriting keys in a loop,
@@ -2297,7 +2305,7 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
         prompt, max_tokens=max_tokens, force_json=True, enable_thinking=final,
         caller="extract_session_final" if final else "extract_session_live")
     if raw_response is None:
-        raise RuntimeError(f"Claude call failed for session {session_base}: {error}")
+        raise ModelCallFailed(f"Claude call failed for session {session_base}: {error}")
 
     parsed = llm_utils.extract_json(raw_response)
     if parsed is None:
@@ -2487,6 +2495,11 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
         # the same rule `location_markers.replace_for_day` follows on the writer side.
         'self_introductions': _find_self_introductions(turns) if final else [],
     }
+    if final and _recovering_after_error_email(bucket, session_base):
+        # Read as late as possible (just before the write) so an error email that went
+        # out while this pass was thinking is still seen. item-writer turns the flag
+        # into the one follow-up notes email.
+        extraction['recovered_after_error'] = True
     # Additive, and only when the flag is on -- a flag-off artifact must have no `continuity`
     # key at all, not a null one, so every existing reader that only checks `if 'continuity' in
     # extraction` keeps seeing today's shape.
@@ -2509,6 +2522,41 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
         _rerun_if_the_session_grew(bucket, user_folder, date, session_base,
                                    keys, generation)
     return extraction
+
+
+def _recovering_after_error_email(bucket, session_base):
+    """Did the recorder already get the "your notes are delayed" email for this session?
+    Unreadable counts as no: a missed follow-up is recoverable by hand, a wrong one is a
+    stray email."""
+    try:
+        marker = extraction_pending.read(s3(), bucket, session_base)
+    except Exception:
+        logger.exception("%s: cannot read the extraction_pending marker", session_base)
+        return False
+    return bool(marker and marker.get('error_email_sent_at'))
+
+
+def _record_pending(bucket, key, user_folder, date, session_base, error):
+    """A FINAL pass failed on the model: leave a marker the backlog lambda re-drives.
+    Best-effort -- the caller re-raises regardless, so the failure still counts in the
+    Lambda Errors metric and the alarm built on it -- but never silent."""
+    try:
+        extraction_pending.record_failure(
+            s3(), bucket, user_folder=user_folder, date=date, session_base=session_base,
+            request_key=key, error=error)
+        logger.error("EXTRACTION_PENDING %s: final extraction failed on every model; "
+                     "will be re-driven until it succeeds", session_base)
+    except Exception:
+        logger.exception("%s: could not write the extraction_pending marker", session_base)
+
+
+def _clear_pending(bucket, session_base):
+    try:
+        extraction_pending.clear(s3(), bucket, session_base)
+    except Exception:
+        # A marker that outlives its success is re-driven once more at worst: the
+        # re-driven pass finds nothing newer to do and clears it then.
+        logger.exception("%s: could not delete the extraction_pending marker", session_base)
 
 
 def _request_final_rerun(bucket, user_folder, date, session_base, generation=0,
@@ -2721,9 +2769,17 @@ def lambda_handler(event, context):
             if parsed is None:
                 continue          # already logged; a raise would retry-storm a dead artifact
             user_folder, date, session_base, generation, speaker_names = parsed
-            results.append(extract_session(S3_BUCKET, user_folder, date, session_base,
-                                           final=True, generation=generation,
-                                           speaker_names=speaker_names))
+            # Only a FINAL pass leaves a marker. A live pass that fails is superseded by
+            # the final one the close always requests, and a marker per live failure
+            # would re-drive passes that no longer matter.
+            try:
+                results.append(extract_session(S3_BUCKET, user_folder, date, session_base,
+                                               final=True, generation=generation,
+                                               speaker_names=speaker_names))
+            except ModelCallFailed as e:
+                _record_pending(S3_BUCKET, key, user_folder, date, session_base, e)
+                raise                 # still an Error: metrics, alarms and S3 retries unchanged
+            _clear_pending(S3_BUCKET, session_base)
             continue
         parsed = session_base_from_key(key)
         if parsed is None:

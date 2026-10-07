@@ -35,6 +35,8 @@ from datetime import datetime, timedelta, timezone
 
 import boto3
 
+import extraction_pending
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -275,8 +277,84 @@ def scan(client, now=None):
     return recent, everything, skipped
 
 
+def redrive(client, now=None):
+    """Re-put the original request of every extraction_pending marker that is due.
+
+    Re-putting the request object is the trigger: the extract-session notification is
+    ObjectCreated:* on extraction_requests/, so a put fires the same final pass the
+    first request did. The marker is rescheduled BEFORE the put, so a put that fails
+    leaves a marker that is merely late, and a pass that fails again finds the next
+    attempt already pushed out. An `expedite` marker is due at once.
+
+    Backoff 5, 15, 30, 60 min and then every 60 min with no limit: a recording the
+    model cannot read today must still be read when the model comes back.
+
+    Returns (redriven, stale) -- the session bases re-put, and the number of markers older
+    than ALARM_AGE_MINUTES (the ExtractionPending metric)."""
+    now = now or datetime.now(timezone.utc)
+    redriven, stale = [], 0
+    for m in extraction_pending.list_markers(client, S3_BUCKET):
+        base = m["sessionBase"]
+        first = extraction_pending.parse_iso(m.get("first_failed_at"))
+        if first and now - first >= timedelta(minutes=extraction_pending.ALARM_AGE_MINUTES):
+            stale += 1
+        due = extraction_pending.parse_iso(m.get("next_attempt_at"))
+        if not (m.get("expedite") or due is None or due <= now):
+            continue
+        request_key = m.get("request_key")
+        if not request_key:
+            logger.warning("backlog: marker for %s has no request_key -- cannot re-drive", base)
+            continue
+        try:
+            body = client.get_object(Bucket=S3_BUCKET, Key=request_key)["Body"].read()
+        except Exception:
+            logger.exception("backlog: cannot read request %s for %s", request_key, base)
+            continue
+        attempts = int(m.get("attempts") or 0) + 1
+        m["attempts"] = attempts
+        m["expedite"] = False
+        m["next_attempt_at"] = extraction_pending.iso(
+            now + timedelta(minutes=extraction_pending.backoff_minutes(attempts)))
+        try:
+            extraction_pending.write(client, S3_BUCKET, m)
+            client.put_object(Bucket=S3_BUCKET, Key=request_key, Body=body,
+                              ContentType="application/json")
+        except Exception:
+            logger.exception("backlog: re-drive of %s failed", base)
+            continue
+        logger.info("backlog: re-drove %s (attempt %d, next at %s)",
+                    base, attempts, m["next_attempt_at"])
+        redriven.append(base)
+    return redriven, stale
+
+
+def emit_pending_metric(stale):
+    """ExtractionPending as an EMF log line: CloudWatch extracts the metric from the
+    function's own log output, which needs no PutMetricData grant and no log metric
+    filter (the deploy role can create neither)."""
+    print(json.dumps({
+        "_aws": {"Timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+                 "CloudWatchMetrics": [{"Namespace": METRIC_NAMESPACE,
+                                        "Dimensions": [["Stage"]],
+                                        "Metrics": [{"Name": "ExtractionPending",
+                                                     "Unit": "Count"}]}]},
+        "Stage": METRIC_STAGE or "unknown",
+        "ExtractionPending": stale}))
+
+
 def lambda_handler(event, context):
     client = _s3()
+    # Fast schedule: only the re-drive. The hourly schedule does it too, then the scan.
+    try:
+        redriven, stale = redrive(client)
+        emit_pending_metric(stale)
+    except Exception:
+        # Never let the re-drive take the backlog probe down with it; the metric is
+        # simply not emitted (notBreaching), and the log says why.
+        logger.exception("backlog: extraction_pending re-drive failed")
+        redriven, stale = [], 0
+    if (event or {}).get("task") == "redrive":
+        return {"redriven": redriven, "pending_stale": stale}
     recent, everything, skipped = scan(client)
 
     for item in everything:
@@ -298,4 +376,5 @@ def lambda_handler(event, context):
     logger.info("backlog: recent=%d total=%d window_days=%d grace_min=%d",
                 len(recent), len(everything), WINDOW_DAYS, GRACE_MINUTES)
     return {"recent": len(recent), "total": len(everything),
-            "skipped": skipped, "items": recent}
+            "skipped": skipped, "items": recent,
+            "redriven": redriven, "pending_stale": stale}

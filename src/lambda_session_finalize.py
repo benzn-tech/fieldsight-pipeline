@@ -23,6 +23,8 @@ import re
 import time
 from urllib.parse import unquote_plus
 
+import extraction_pending
+
 logger = logging.getLogger()
 # INFO, set HERE. The Lambda runtime leaves the root logger at WARNING, and this
 # module's decisions are all logged at INFO -- including which source a final
@@ -345,6 +347,23 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
     body_html = "\n".join(parts)
 
     return subject, body_text, body_html
+
+
+def build_model_error_email(*, date=None, time_range=None, site_name=None):
+    """(subject, body_text, body_html) for a recording whose notes could not be made
+    because the model failed (spec 2026-10-07 D5). The wording is the owner's, verbatim.
+    Pure -- no I/O. This is the ONLY thing that may be sent for such a recording: "Nothing
+    was captured" is a claim about the audio, and here the audio was never read."""
+    stamp = " ".join(p for p in (date, time_range) if p)
+    subject = "FieldSight — your recording is safe; notes are delayed" + (
+        f" ({stamp})" if stamp else "")
+    where = site_name or "your site"
+    when = f" on {stamp}" if stamp else ""
+    text = (f"Your recording from {where}{when} reached us safely. Our AI processing hit "
+            "a temporary model error, so your notes aren't ready yet. Please contact "
+            "FieldSight if you need them urgently — we'll email your notes as soon as "
+            "processing completes.")
+    return subject, text + "\n", f"<p>{_html.escape(text)}</p>"
 
 
 # ============================================================
@@ -713,8 +732,32 @@ def _process_brief_request(artifact, *, complete_summary=None):
     return {"status": "ok", "sessionId": session_id}
 
 
+def _read_pending(session_id):
+    """The extraction_pending marker for this session, or None. An unreadable marker
+    answers None and is logged: the email then falls back to today's behaviour rather
+    than not being sent at all."""
+    import boto3
+    try:
+        return extraction_pending.read(boto3.client("s3"), S3_BUCKET, f"sid{session_id}")
+    except Exception:
+        logger.exception("finalize: cannot read the extraction_pending marker for %s", session_id)
+        return None
+
+
+def _mark_error_email_sent(session_id):
+    import boto3
+    try:
+        extraction_pending.mark_error_email_sent(boto3.client("s3"), S3_BUCKET,
+                                                 f"sid{session_id}")
+    except Exception:
+        logger.exception("finalize: sent the model-error email for %s but could not record "
+                         "it on the marker -- the follow-up notes email will not be sent",
+                         session_id)
+
+
 def process_finalize_request(artifact, *, send=None, write_result=None, complete_summary=None,
-                             already_sent=None, poll_brief=None):
+                             already_sent=None, poll_brief=None, read_pending=None,
+                             mark_error_email_sent=None):
     """Build + SES-send the recorder's confirmation email from one enqueued finalize
     request (the in-VPC claim step wrote it), then record the outcome to
     session_finalize_results/{sid}.json — the in-VPC sweep's reconcile pass reads it
@@ -780,7 +823,11 @@ def process_finalize_request(artifact, *, send=None, write_result=None, complete
     # LLM call. Keyed exactly as the result is WRITTEN below (the `-updated`
     # suffix included), or a member's group email would be checked against the
     # solo key and vice versa.
-    result_id = f"{artifact.get('sessionId')}-updated" if is_updated else artifact.get("sessionId")
+    # A follow-up notes email (item-writer: a final extraction that recovered after the
+    # recorder was told it was delayed) has its own key for the same reason.
+    is_follow_up = bool(artifact.get("followUp"))
+    suffix = "-updated" if is_updated else "-notes" if is_follow_up else ""
+    result_id = f"{artifact.get('sessionId')}{suffix}"
     if (already_sent if already_sent is not None else _already_sent)(result_id):
         logger.info("finalize: %s was already sent -- not sending again", result_id)
         return {"status": "skipped", "reason": "already sent", "sessionId": session_id}
@@ -798,10 +845,21 @@ def process_finalize_request(artifact, *, send=None, write_result=None, complete
             summary, todos = fresh.get("summary", summary), fresh.get("open_todos", todos)
     elif artifact.get("kind") == "final":
         todos = _rows_from_brief_or_request(artifact, todos, poll_brief=poll_brief)
-    subject, text, html = build_confirmation_email(
-        date=artifact.get("date"), time_range=artifact.get("timeRange"),
-        site_name=artifact.get("siteName"), summary=summary, open_todos=todos,
-        checks=artifact.get("checks"))
+    pending = None
+    if artifact.get("kind") == "rolling":
+        # The backstop fires because the final extraction did not arrive. If that is
+        # because it FAILED (a marker says so), the recorder is told that -- not that
+        # nothing was captured, which would be a claim about audio nobody has read.
+        pending = (read_pending if read_pending is not None else _read_pending)(session_id)
+    if pending:
+        subject, text, html = build_model_error_email(
+            date=artifact.get("date"), time_range=artifact.get("timeRange"),
+            site_name=artifact.get("siteName"))
+    else:
+        subject, text, html = build_confirmation_email(
+            date=artifact.get("date"), time_range=artifact.get("timeRange"),
+            site_name=artifact.get("siteName"), summary=summary, open_todos=todos,
+            checks=artifact.get("checks"))
     if is_updated:
         # A second email with a different body must not read as a duplicate of
         # the first. The recipient already had one for this meeting.
@@ -812,6 +870,10 @@ def process_finalize_request(artifact, *, send=None, write_result=None, complete
         # so an updated result on the solo key could move that session to `sent`
         # on the wrong evidence.
         session_id = f"{session_id}-updated"
+    elif is_follow_up:
+        # Same reason as `-updated`: reconcile already settled {sid}.json from the
+        # model-error email, and this result must not be mistaken for it.
+        session_id = f"{session_id}-notes"
     if send is None:
         from email_sender import get_sender
         send = get_sender().send
@@ -826,8 +888,17 @@ def process_finalize_request(artifact, *, send=None, write_result=None, complete
         logger.error("finalize: send failed for session %s: %s", session_id, e)
         write_result(session_id, {"status": "error", "sessionId": session_id, "error": str(e)})
         return {"status": "error", "recipient": recipient, "sessionId": session_id}
-    write_result(session_id, {"status": "sent", "sessionId": session_id, "recipient": recipient})
-    return {"status": "sent", "recipient": recipient, "sessionId": session_id}
+    # `sent`, because that is what lets reconcile settle the session. `kind` is what lets
+    # _already_sent tell this from a notes email (it never matters for the `-notes` key).
+    result = {"status": "sent", "sessionId": session_id, "recipient": recipient}
+    if pending:
+        result["kind"] = "model_error"
+    write_result(session_id, result)
+    if pending:
+        (mark_error_email_sent if mark_error_email_sent is not None
+         else _mark_error_email_sent)(artifact.get("sessionId"))
+    return {"status": "sent", "recipient": recipient, "sessionId": session_id,
+            **({"kind": "model_error"} if pending else {})}
 
 
 def lambda_handler(event, context):
