@@ -151,3 +151,14 @@ def test_a_real_answer_still_comes_back(monkeypatch):
     text, err = mod.call_llm("hi", max_tokens=900)
     assert err is None
     assert text == '{"items":[]}'
+
+
+import pytest as _pytest_fb
+
+
+@_pytest_fb.fixture(autouse=True)
+def _single_model_chain(monkeypatch):
+    # These tests pin ONE model's request; the fallback chain (a second request
+    # on failure, one attempt on the primary) has its own file,
+    # test_model_fallback_chain.py.
+    monkeypatch.setenv("LLM_FALLBACK_MODELS", "")

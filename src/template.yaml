@@ -381,6 +381,15 @@ Parameters:
     Description: Qwen model for structured-JSON tasks (report/meeting/extract/matcher)
     Default: qwen3.8-flash
 
+  LlmFallbackModels:
+    Type: String
+    Default: 'openai/gpt-6-luna-pro,xiaomi/mimo-v2.6-pro'
+    Description: >-
+      Comma list of OpenRouter models tried, in order, after QWEN_MODEL fails
+      with a 5xx, 429, timeout or empty answer. An empty value disables the
+      fallback. Read by llm_utils.fallback_models(); it has a Default, so the
+      deploy workflows do not pass it.
+
   QwenModelFast:
     Type: String
     Description: Qwen model for the latency-bound ask path
@@ -1433,6 +1442,9 @@ Globals:
       - x86_64
     Timeout: 300
     MemorySize: 256
+    Environment:
+      Variables:
+        LLM_FALLBACK_MODELS: !Ref LlmFallbackModels
 
 # ============================================================
 # Resources
