@@ -1227,7 +1227,8 @@ def write_extraction_items(date, user_folder, extraction_key):
         # of a FINAL extraction that matched a checklist template goes to the
         # report worker now, after the topics and their photos exist, so the
         # filled checklist is waiting when he is back at the office. Never fatal.
-        if extraction.get("tier") == "final" and stored_inspections:
+        if (extraction.get("tier") == "final" and stored_inspections
+                and not extraction.get("incomplete")):
             try:
                 made = checklist_reports.auto_generate(
                     conn, company["id"], user_folder, date,
@@ -1269,7 +1270,12 @@ def write_extraction_items(date, user_folder, extraction_key):
         # later, for a session that was sent long ago -- each would mail the
         # recorder about an old meeting. The session must be WAITING for it.
         final_email_ctx = None
-        if extraction.get("tier") == "final":
+        if extraction.get("tier") == "final" and extraction.get("incomplete"):
+            # A fuller final is on its way (lambda_extract_session._known_short):
+            # the email waits for it rather than describing part of the recording.
+            logger.info("%s: final record is known to be short -- the email waits for "
+                        "the re-run", extraction_key)
+        elif extraction.get("tier") == "final":
             final_email_ctx = _final_email_context(conn, session_base, extraction, date)
 
         if ENABLE_GROUP_MERGE and extraction.get("tier") == "group" and topics_n:
