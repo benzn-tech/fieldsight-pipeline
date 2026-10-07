@@ -141,7 +141,9 @@ def header_section(title, artifact, facts, span=None):
     rows.append(["Recorded by", facts.get("recordedBy") or artifact.get("folder") or ""])
     frm, to = span or (window.get("from") or "00:00", window.get("to") or "23:59")
     rows.append(["Recording window", "%s - %s" % (frm, to)])
-    return _section(title, _table(rows))
+    # A key-value table: the renderer shades the labels instead of treating
+    # "Project | <name>" as a header row (report_style).
+    return dict(_section(title, _table(rows)), facts=True)
 
 
 def _stored(s3, bucket, site_id, date, today_iso):
