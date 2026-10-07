@@ -33,7 +33,9 @@ logger = logging.getLogger(__name__)
 
 
 def _title(template_name, check_name, start_at):
-    return "%s -- %s (%s)" % (template_name, check_name, (start_at or "")[:5])
+    """The checklist's own name: the check and its time are in the report's
+    details and header already, and on the title they made a two-line heading."""
+    return template_name
 
 
 def already_made(conn, session, template_id, start_at, end_at=None, segments=None):

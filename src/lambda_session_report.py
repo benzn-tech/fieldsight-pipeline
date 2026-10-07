@@ -716,6 +716,16 @@ def _model_budget_seconds(context):
     return remaining - RENDER_AND_WRITE_RESERVE_SECONDS
 
 
+def _project_names(artifact):
+    facts = artifact.get("reportFacts") or {}
+    names = [x["name"] for x in facts.get("sites") or [] if x.get("name")]
+    if not names:
+        content = artifact.get("content") or {}
+        names = list(content.get("siteNames") or []) or (
+            [content["siteName"]] if content.get("siteName") else [])
+    return ", ".join(names)
+
+
 def _segment_gaps(date, segments):
     """[(gap_start, gap_end)] between consecutive stretches of a window, or []."""
     if not isinstance(segments, list) or len(segments) < 2:
@@ -1072,10 +1082,12 @@ def _generate_document(artifact, context=None):
         # The date only (owner, 2026-10-01): the window asked for is mostly
         # "everything", 00:00 - 23:59, which says nothing; when there is a
         # Report Details section it carries what was actually recorded.
-        date,
+        report_facts._long_date(date) or date,
         prose,
         _action_items_for_prompt(content, topic_offer),
-        closing=note)
+        closing=note,
+        # The running header's left side: the project(s) this report is about.
+        header_left=_project_names(artifact) or None)
     # WHICH TEMPLATE THIS WAS comes from the REQUEST, not from the template's
     # own text. The files in report_templates/ carry `template_id` and
     # `version` inside them; a template written in the Library does not -- its
