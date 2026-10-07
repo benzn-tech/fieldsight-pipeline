@@ -20,9 +20,7 @@ def _call(monkeypatch, caplog, *, sub="sub-1", headers=None, path="/api/timeline
           params=None):
     monkeypatch.setattr(fapi, "get_caller_identity",
                         lambda event: {"sub": sub, "role": "gm", "email": "", "name": "",
-                                       "display_name": "", "device_id": "", "sites": [],
-                                       "managed_sites": [], "company_id": ""})
-    monkeypatch.setattr(fapi, "get_timeline", lambda p, c: fapi.ok({}))
+                                       "display_name": ""})
     monkeypatch.setattr(fapi, "health_check", lambda p: fapi.ok({}))
     event = {"httpMethod": "GET", "path": path, "queryStringParameters": params,
              "headers": headers}
@@ -71,6 +69,19 @@ def test_no_param_values_in_any_log_record(monkeypatch, caplog):
     assert "Secret_Folder" not in text and "2026-01-01" not in text
 
 
+def test_a_closed_route_is_logged_by_name_and_answers_410(monkeypatch, caplog):
+    # KNOWN_ROUTES keeps the closed routes so their 410s stay visible in the logs.
+    lines = _call(monkeypatch, caplog, path="/api/users")
+    assert len(lines) == 1 and _parse(lines[0])["route"] == "/api/users"
+
+
+def test_role_comes_from_the_claim_or_is_empty():
+    claim = {"requestContext": {"authorizer": {"claims": {"sub": "s", "custom:role": "gm"}}}}
+    assert fapi.get_caller_identity(claim)["role"] == "gm"
+    bare = {"requestContext": {"authorizer": {"claims": {"sub": "s"}}}}
+    assert fapi.get_caller_identity(bare)["role"] == ""
+
+
 def test_health_logs_nothing(monkeypatch, caplog):
     assert _call(monkeypatch, caplog, path="/api/health") == []
 
@@ -96,10 +107,10 @@ def test_post_body_values_never_logged(monkeypatch, caplog):
 def test_raising_handler_still_logs_exactly_once(monkeypatch, caplog):
     monkeypatch.setattr(fapi, "get_caller_identity", lambda e: {"sub": "s", "role": "gm"})
 
-    def boom(p, c):
+    def boom(b, c):
         raise RuntimeError("boom")
-    monkeypatch.setattr(fapi, "get_timeline", boom)
+    monkeypatch.setattr(fapi, "ask_question", boom)
     with caplog.at_level(logging.INFO):
-        res = fapi.lambda_handler({"httpMethod": "GET", "path": "/api/timeline"}, None)
+        res = fapi.lambda_handler({"httpMethod": "POST", "path": "/api/ask"}, None)
     assert res["statusCode"] == 500
     assert len([r for r in caplog.records if "LEGACY_CALL" in r.getMessage()]) == 1
