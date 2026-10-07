@@ -83,12 +83,23 @@ def record_failure(s3, bucket, *, user_folder, date, session_base, request_key, 
     except Exception:
         logger.exception("extraction_pending: cannot read existing marker for %s", session_base)
         marker = None
+    if marker is not None and marker.get("promised_only"):
+        # The recorder was told "notes are on the way" before any extraction had failed
+        # (finalize's backstop, no marker). The extraction has now failed for real: this
+        # becomes a full marker -- keeping error_email_sent_at, so the recovery still
+        # sends the follow-up -- and the re-driver takes it from here.
+        promised_at = marker.get("error_email_sent_at")
+        marker = None
+    else:
+        promised_at = None
     if marker is None:
         marker = {"userFolder": user_folder, "date": date, "sessionBase": session_base,
                   "request_key": request_key, "attempts": 0,
                   "first_failed_at": iso(now),
                   "next_attempt_at": iso(now + timedelta(minutes=backoff_minutes(0))),
                   "expedite": False}
+        if promised_at:
+            marker["error_email_sent_at"] = promised_at
     marker["last_failed_at"] = iso(now)
     marker["last_error"] = str(error)[:500]
     write(s3, bucket, marker)
@@ -108,6 +119,22 @@ def mark_error_email_sent(s3, bucket, session_base, now=None):
     marker["error_email_sent_at"] = iso(now or datetime.now(timezone.utc))
     write(s3, bucket, marker)
     return True
+
+
+def promise_notes(s3, bucket, session_base, now=None):
+    """The recorder was told their notes are on the way, and no failed extraction explains
+    why (the rolling backstop fired with nothing to show). Stamp the marker key so the final
+    extraction's success sends the follow-up notes email: an existing marker is simply
+    stamped; otherwise a `promised_only` marker is created. It has no request_key, so the
+    re-driver never touches it, and record_failure upgrades it if the extraction fails."""
+    now = now or datetime.now(timezone.utc)
+    marker = read(s3, bucket, session_base)
+    if marker is None:
+        marker = {"sessionBase": session_base, "promised_only": True,
+                  "first_failed_at": iso(now)}
+    marker["error_email_sent_at"] = iso(now)
+    write(s3, bucket, marker)
+    return marker
 
 
 def list_markers(s3, bucket):

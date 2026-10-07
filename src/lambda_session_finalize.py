@@ -366,6 +366,18 @@ def build_model_error_email(*, date=None, time_range=None, site_name=None):
     return subject, text + "\n", f"<p>{_html.escape(text)}</p>"
 
 
+def build_notes_on_the_way_email(*, date=None, time_range=None, site_name=None):
+    """(subject, body_text, body_html) for a recording whose notes are not ready and nothing
+    has FAILED -- the backstop fired with no extraction and no marker. Says only what is
+    true: the recording arrived and is being processed. Pure -- no I/O."""
+    stamp = " ".join(p for p in (date, time_range) if p)
+    subject = "FieldSight — your recording is safe; notes are on the way" + (
+        f" ({stamp})" if stamp else "")
+    text = ("Your recording reached us safely; your notes are still being processed — "
+            "we'll email them as soon as they're ready.")
+    return subject, text + "\n", f"<p>{_html.escape(text)}</p>"
+
+
 # ============================================================
 # Non-VPC send worker — S3-triggered on session_finalize_requests/
 # ============================================================
@@ -755,9 +767,62 @@ def _mark_error_email_sent(session_id):
                          session_id)
 
 
+def _promise_notes(session_id):
+    """Stamp the marker key so the final extraction's success sends the follow-up."""
+    import boto3
+    try:
+        extraction_pending.promise_notes(boto3.client("s3"), S3_BUCKET, f"sid{session_id}")
+    except Exception:
+        logger.exception("finalize: sent the notes-on-the-way email for %s but could not "
+                         "record the promise -- the follow-up notes email will not be sent",
+                         session_id)
+
+
+def _recheck_final_extraction(artifact):
+    """Close the race after the error / promise email was stamped.
+
+    extract-session reads the marker's error_email_sent_at just BEFORE it writes the
+    extraction, and clears the marker after. A final that landed between our email and
+    our stamp therefore went through without the follow-up flag. If its extraction is
+    already there, set `recovered_after_error` on it and put it back: that put re-fires
+    item-writer, which enqueues the follow-up under its write-once `-notes` key (so a
+    follow-up that was already sent is not sent again). A `promised_only` marker left
+    behind by a final that already cleared is deleted. Best-effort and logged."""
+    import boto3
+    sid = artifact.get("sessionId")
+    folder, date = artifact.get("folder"), artifact.get("date")
+    if not (sid and folder and date):
+        return False
+    s3 = boto3.client("s3")
+    base = f"sid{sid}"
+    key = f"extractions/{folder}/{date}/{base}.json"
+    try:
+        body = json.loads(s3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read().decode("utf-8"))
+    except Exception as e:  # noqa: BLE001
+        if getattr(e, "response", {}).get("Error", {}).get("Code", "") not in ("NoSuchKey", "404"):
+            logger.exception("finalize: cannot read %s to re-check the race", key)
+        return False
+    if body.get("tier") != "final":
+        return False
+    if not body.get("recovered_after_error"):
+        body["recovered_after_error"] = True
+        s3.put_object(Bucket=S3_BUCKET, Key=key, Body=json.dumps(body, ensure_ascii=False),
+                      ContentType="application/json")
+        logger.info("finalize: %s's final extraction beat the error email -- re-fired the "
+                    "follow-up", sid)
+    try:
+        marker = extraction_pending.read(s3, S3_BUCKET, base)
+        if marker and marker.get("promised_only"):
+            extraction_pending.clear(s3, S3_BUCKET, base)
+    except Exception:
+        logger.exception("finalize: could not tidy the promised_only marker for %s", sid)
+    return True
+
+
 def process_finalize_request(artifact, *, send=None, write_result=None, complete_summary=None,
                              already_sent=None, poll_brief=None, read_pending=None,
-                             mark_error_email_sent=None):
+                             mark_error_email_sent=None, promise_notes=None,
+                             recheck_final=None):
     """Build + SES-send the recorder's confirmation email from one enqueued finalize
     request (the in-VPC claim step wrote it), then record the outcome to
     session_finalize_results/{sid}.json — the in-VPC sweep's reconcile pass reads it
@@ -846,13 +911,22 @@ def process_finalize_request(artifact, *, send=None, write_result=None, complete
     elif artifact.get("kind") == "final":
         todos = _rows_from_brief_or_request(artifact, todos, poll_brief=poll_brief)
     pending = None
+    promised_only = False
     if artifact.get("kind") == "rolling":
         # The backstop fires because the final extraction did not arrive. If that is
         # because it FAILED (a marker says so), the recorder is told that -- not that
         # nothing was captured, which would be a claim about audio nobody has read.
         pending = (read_pending if read_pending is not None else _read_pending)(session_id)
+        # No marker and no rows: the confirmation would say "Nothing was captured",
+        # which is true only of a final extraction that SUCCEEDED and found nothing.
+        # Here nobody has read the audio yet, so say what is true instead.
+        promised_only = not pending and not _clean_todos(todos)
     if pending:
         subject, text, html = build_model_error_email(
+            date=artifact.get("date"), time_range=artifact.get("timeRange"),
+            site_name=artifact.get("siteName"))
+    elif promised_only:
+        subject, text, html = build_notes_on_the_way_email(
             date=artifact.get("date"), time_range=artifact.get("timeRange"),
             site_name=artifact.get("siteName"))
     else:
@@ -893,12 +967,23 @@ def process_finalize_request(artifact, *, send=None, write_result=None, complete
     result = {"status": "sent", "sessionId": session_id, "recipient": recipient}
     if pending:
         result["kind"] = "model_error"
+    elif promised_only:
+        result["kind"] = "notes_promised"
     write_result(session_id, result)
     if pending:
         (mark_error_email_sent if mark_error_email_sent is not None
          else _mark_error_email_sent)(artifact.get("sessionId"))
+    elif promised_only:
+        (promise_notes if promise_notes is not None else _promise_notes)(
+            artifact.get("sessionId"))
+    if pending or promised_only:
+        try:
+            (recheck_final if recheck_final is not None else _recheck_final_extraction)(artifact)
+        except Exception:
+            logger.exception("finalize: post-stamp re-check failed for %s", session_id)
     return {"status": "sent", "recipient": recipient, "sessionId": session_id,
-            **({"kind": "model_error"} if pending else {})}
+            **({"kind": "model_error"} if pending else
+               {"kind": "notes_promised"} if promised_only else {})}
 
 
 def lambda_handler(event, context):

@@ -73,3 +73,26 @@ def test_the_alarm_watches_the_series_the_backlog_emits():
 def test_no_log_metric_filter_was_added():
     """The deploy role cannot create one; the metric is EMF."""
     assert "AWS::Logs::MetricFilter" not in open(TEMPLATE, encoding="utf-8").read()
+
+
+def test_the_finalize_worker_can_run_the_race_re_check():
+    body = _resource("SessionFinalizeFunction")
+    assert _statement(body, "s3:GetObject", "/extractions/*")
+    assert _statement(body, "s3:PutObject", "/extractions/*")
+    assert _statement(body, "s3:DeleteObject", "/extraction_pending/*")
+    # absent extraction is the ordinary case: ListBucket, or S3 answers 403 for it
+    assert re.search(r"s3:prefix:[\s\S]*?- extractions/\*", body)
+
+
+CHAIN_BUDGET_FUNCTIONS = ("ExtractSessionFunction", "ReportGeneratorFunction",
+                          "MeetingMinutesFunction", "SessionReportFunction",
+                          "SessionFinalizeFunction", "RollingSummaryFunction",
+                          "MatcherFunction")
+
+
+def test_every_model_calling_function_has_a_chain_budget_a_minute_under_its_timeout():
+    for name in CHAIN_BUDGET_FUNCTIONS:
+        body = _resource(name)
+        timeout = int(re.search(r"^\s+Timeout:\s*(\d+)", body, re.M).group(1))
+        budget = int(re.search(r"LLM_CHAIN_BUDGET_SECONDS:\s*'(\d+)'", body).group(1))
+        assert budget == timeout - 60, name

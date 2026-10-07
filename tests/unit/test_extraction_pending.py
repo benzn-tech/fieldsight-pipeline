@@ -311,9 +311,144 @@ def test_nothing_captured_only_when_extraction_succeeded_and_found_nothing():
                                 read_pending=lambda sid: pytest.fail("no lookup"),
                                 poll_brief=lambda *a, **k: None)
     assert "Nothing was captured for this recording." in sent[0][2] and marked == []
-    # a rolling backstop with no marker: unchanged behaviour
-    _o, sent, _r, marked = _run(_rolling(), read_pending=lambda sid: None)
-    assert "Nothing was captured" in sent[0][2] and marked == []
+    # a rolling backstop with no marker and nothing to show must NOT say it: nobody has
+    # read the audio, so "nothing was captured" would be a claim about audio unread
+    promised = []
+    _o, sent, results, marked = _run(_rolling(), read_pending=lambda sid: None,
+                                     promise_notes=lambda sid: promised.append(sid),
+                                     recheck_final=lambda a: False)
+    _to, subject, text, html = sent[0]
+    assert "Nothing was captured" not in text + html
+    assert "notes are on the way" in subject and f"2026-10-07 {RANGE}" in subject
+    assert text == ("Your recording reached us safely; your notes are still being processed "
+                    "\u2014 we'll email them as soon as they're ready.\n")
+    assert results[0][1]["kind"] == "notes_promised"
+    assert promised == [SID] and marked == []
+
+
+def test_a_rolling_backstop_with_real_rows_is_still_the_confirmation():
+    rows = [{"text": "Pour the slab", "responsible": "Ben", "due": None}]
+    _o, sent, _r, _m = _run(_rolling(openTodos=rows), read_pending=lambda sid: None,
+                            promise_notes=lambda sid: pytest.fail("nothing was promised"))
+    assert "Pour the slab" in sent[0][2] and "on the way" not in sent[0][1]
+
+
+def test_a_failed_promise_send_stamps_nothing():
+    promised = []
+
+    def boom(*a):
+        raise RuntimeError("ses down")
+    out = fin.process_finalize_request(
+        _rolling(), send=boom, write_result=lambda *a: None, already_sent=lambda r: False,
+        read_pending=lambda sid: None, promise_notes=lambda sid: promised.append(sid))
+    assert out["status"] == "error" and promised == []
+
+
+# ---- the promise is a marker the final's success reads -----------------------
+
+def test_promise_notes_creates_a_promised_only_marker_the_recovery_path_sees(monkeypatch):
+    s3 = FakeS3()
+    ep.promise_notes(s3, BUCKET, BASE, now=NOW)
+    m = s3.marker()
+    assert m["promised_only"] is True and m["error_email_sent_at"]
+    assert "request_key" not in m
+    # extract-session's recovery check reads exactly this stamp
+    monkeypatch.setattr(les, "s3", lambda: s3)
+    assert les._recovering_after_error_email(BUCKET, BASE) is True
+
+
+def test_promise_notes_on_an_existing_marker_only_stamps_it():
+    s3 = FakeS3()
+    ep.record_failure(s3, BUCKET, user_folder=FOLDER, date=DATE, session_base=BASE,
+                      request_key=REQ_KEY, error="x", now=NOW)
+    ep.promise_notes(s3, BUCKET, BASE, now=NOW)
+    m = s3.marker()
+    assert m["error_email_sent_at"] and m["request_key"] == REQ_KEY and "promised_only" not in m
+
+
+def test_the_re_driver_skips_a_promised_only_marker_but_counts_it_once_stale(bk=None):
+    s3 = FakeS3()
+    ep.promise_notes(s3, BUCKET, BASE, now=NOW - timedelta(minutes=45))
+    assert bl.redrive(s3, now=NOW) == ([], 1)
+    assert s3.puts == [ep.marker_key(BASE)]           # nothing re-put, nothing rescheduled
+
+
+def test_a_real_failure_upgrades_a_promised_only_marker_and_keeps_the_promise():
+    s3 = FakeS3()
+    ep.promise_notes(s3, BUCKET, BASE, now=NOW)
+    ep.record_failure(s3, BUCKET, user_folder=FOLDER, date=DATE, session_base=BASE,
+                      request_key=REQ_KEY, error="502", now=NOW)
+    m = s3.marker()
+    assert "promised_only" not in m and m["request_key"] == REQ_KEY
+    assert m["error_email_sent_at"] and m["next_attempt_at"]
+
+
+# ---- race: the final landed before the email was stamped ---------------------
+
+def _extraction_key():
+    return f"extractions/{FOLDER}/{DATE}/{BASE}.json"
+
+
+def _world(monkeypatch, objects):
+    s3 = FakeS3(objects)
+    import boto3
+    monkeypatch.setattr(boto3, "client", lambda *a, **k: s3)
+    monkeypatch.setattr(fin, "S3_BUCKET", BUCKET)
+    return s3
+
+
+def test_a_final_that_beat_the_email_gets_the_follow_up_re_fired(monkeypatch):
+    s3 = _world(monkeypatch, {_extraction_key(): json.dumps({"tier": "final", "topics": []})})
+    assert fin._recheck_final_extraction(_rolling(folder=FOLDER)) is True
+    body = json.loads(s3.objects[_extraction_key()])
+    assert body["recovered_after_error"] is True and body["tier"] == "final"
+    assert _extraction_key() in s3.puts               # the put is what re-fires item-writer
+
+
+def test_no_extraction_yet_means_nothing_to_re_fire(monkeypatch):
+    s3 = _world(monkeypatch, {})
+    assert fin._recheck_final_extraction(_rolling(folder=FOLDER)) is False
+    assert s3.puts == []
+
+
+def test_an_already_flagged_extraction_is_not_re_put(monkeypatch):
+    s3 = _world(monkeypatch, {_extraction_key(): json.dumps(
+        {"tier": "final", "recovered_after_error": True})})
+    assert fin._recheck_final_extraction(_rolling(folder=FOLDER)) is True
+    assert s3.puts == []
+
+
+def test_a_live_extraction_is_not_a_final(monkeypatch):
+    s3 = _world(monkeypatch, {_extraction_key(): json.dumps({"tier": "live"})})
+    assert fin._recheck_final_extraction(_rolling(folder=FOLDER)) is False
+    assert s3.puts == []
+
+
+def test_the_race_tidies_a_promised_only_marker_the_final_already_cleared(monkeypatch):
+    s3 = _world(monkeypatch, {_extraction_key(): json.dumps({"tier": "final"})})
+    ep.promise_notes(s3, BUCKET, BASE, now=NOW)
+    fin._recheck_final_extraction(_rolling(folder=FOLDER))
+    assert s3.marker() is None
+
+
+def test_the_race_keeps_a_real_marker(monkeypatch):
+    s3 = _world(monkeypatch, {_extraction_key(): json.dumps({"tier": "final"})})
+    ep.record_failure(s3, BUCKET, user_folder=FOLDER, date=DATE, session_base=BASE,
+                      request_key=REQ_KEY, error="x", now=NOW)
+    fin._recheck_final_extraction(_rolling(folder=FOLDER))
+    assert s3.marker() is not None
+
+
+def test_the_error_and_promise_paths_both_run_the_re_check():
+    for pend in ({"sessionBase": BASE}, None):
+        calls = []
+        _run(_rolling(), read_pending=lambda sid, p=pend: p,
+             promise_notes=lambda sid: None, recheck_final=lambda a: calls.append(a))
+        assert len(calls) == 1
+    calls = []                                         # a final / real-rows email: no re-check
+    _run(_rolling(kind="final"), read_pending=lambda sid: None,
+         poll_brief=lambda *a, **k: None, recheck_final=lambda a: calls.append(a))
+    assert calls == []
 
 
 def test_the_error_email_goes_out_once():

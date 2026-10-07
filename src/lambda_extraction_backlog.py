@@ -298,6 +298,11 @@ def redrive(client, now=None):
         first = extraction_pending.parse_iso(m.get("first_failed_at"))
         if first and now - first >= timedelta(minutes=extraction_pending.ALARM_AGE_MINUTES):
             stale += 1
+        if m.get("promised_only"):
+            # The recorder was promised notes and no extraction has failed or arrived:
+            # nothing to re-drive, but still counted above once it is stale -- a promise
+            # that outlives ALARM_AGE_MINUTES is exactly what the alarm is for.
+            continue
         due = extraction_pending.parse_iso(m.get("next_attempt_at"))
         if not (m.get("expedite") or due is None or due <= now):
             continue
