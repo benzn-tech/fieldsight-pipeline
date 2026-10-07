@@ -318,13 +318,39 @@ def notify_expedite(m):
 
 def _stamp(client, m):
     """Persist `expedite_notified_at` when the marker is not being rewritten by a re-drive."""
+    stamp = m.get("expedite_notified_at")
     try:
-        extraction_pending.write(client, S3_BUCKET, m)
+        extraction_pending.update(client, S3_BUCKET, m["sessionBase"],
+                                  lambda fresh: fresh.update(expedite_notified_at=stamp))
     except Exception:
         logger.exception("backlog: could not stamp expedite_notified_at on %s", m.get("sessionBase"))
 
 
-def redrive(client, now=None):
+#: Stop re-driving when the Lambda has less than this left: the marker writes and puts of
+#: the next one would be cut off mid-way.
+MIN_REMAINING_MS = 20_000
+
+
+def _expire_promise(client, m, now):
+    """A `promised_only` marker older than PROMISED_ONLY_TTL_HOURS: delete it, loudly.
+    True when deleted. Counted in the metric by the caller until it is."""
+    since = (extraction_pending.parse_iso(m.get("error_email_sent_at"))
+             or extraction_pending.parse_iso(m.get("first_failed_at")))
+    if not since or now - since < timedelta(hours=extraction_pending.PROMISED_ONLY_TTL_HOURS):
+        return False
+    try:
+        extraction_pending.clear(client, S3_BUCKET, m["sessionBase"])
+    except Exception:
+        logger.exception("backlog: cannot delete the expired promised_only marker for %s",
+                         m["sessionBase"])
+        return False
+    logger.error("EXTRACTION_PROMISE_EXPIRED %s: the recorder was told notes were on the "
+                 "way %s, and no extraction or failure ever arrived; marker deleted",
+                 m["sessionBase"], extraction_pending.iso(since))
+    return True
+
+
+def redrive(client, now=None, rng=None, time_left_ms=None):
     """Re-put the original request of every extraction_pending marker that is due.
 
     Re-putting the request object is the trigger: the extract-session notification is
@@ -333,35 +359,80 @@ def redrive(client, now=None):
     leaves a marker that is merely late, and a pass that fails again finds the next
     attempt already pushed out. An `expedite` marker is due at once.
 
-    Backoff 5, 15, 30, 60 min and then every 60 min with no limit: a recording the
-    model cannot read today must still be read when the model comes back.
+    Backoff 5, 15, 30, 60 min, then hourly, then every 6 h once the marker has been
+    failing for 24 h; every new `next_attempt_at` carries 0-120 s of jitter. A model-kind
+    marker is never given up on (a recording the model cannot read today must still be
+    read when the model comes back); a parse-kind marker is re-driven at most 6 times and
+    then marked `gave_up_at` (still counted, still listed for the web, Expedite allows one
+    more). One tick re-drives at most REDRIVE_PER_TICK markers, expedited first and then
+    oldest first, and stops early when `time_left_ms()` falls under MIN_REMAINING_MS.
 
     Returns (redriven, stale) -- the session bases re-put, and the number of markers older
     than ALARM_AGE_MINUTES (the ExtractionPending metric)."""
     now = now or datetime.now(timezone.utc)
     redriven, stale = [], 0
+    candidates = []
+    alarm_age = timedelta(minutes=extraction_pending.ALARM_AGE_MINUTES)
     for m in extraction_pending.list_markers(client, S3_BUCKET):
-        base = m["sessionBase"]
         first = extraction_pending.parse_iso(m.get("first_failed_at"))
-        if first and now - first >= timedelta(minutes=extraction_pending.ALARM_AGE_MINUTES):
-            stale += 1
+        is_stale = bool(first and now - first >= alarm_age)
         if m.get("promised_only"):
             # The recorder was promised notes and no extraction has failed or arrived:
-            # nothing to re-drive, but still counted above once it is stale -- a promise
-            # that outlives ALARM_AGE_MINUTES is exactly what the alarm is for.
+            # nothing to re-drive. Counted once stale -- a promise that outlives
+            # ALARM_AGE_MINUTES is what the alarm is for -- until the TTL deletes it.
+            if is_stale and not _expire_promise(client, m, now):
+                stale += 1
             continue
+        if is_stale:
+            stale += 1
         notified = notify_expedite(m)
         due = extraction_pending.parse_iso(m.get("next_attempt_at"))
         if not (m.get("expedite") or due is None or due <= now):
             if notified:
                 _stamp(client, m)
             continue
-        request_key = m.get("request_key")
-        if not request_key:
-            logger.warning("backlog: marker for %s has no request_key -- cannot re-drive", base)
+        if not m.get("request_key"):
+            logger.warning("backlog: marker for %s has no request_key -- cannot re-drive",
+                           m["sessionBase"])
             if notified:
                 _stamp(client, m)
             continue
+        if (m.get("failure_kind") == extraction_pending.KIND_PARSE and not m.get("expedite")
+                and int(m.get("attempts") or 0) >= extraction_pending.PARSE_REDRIVE_MAX):
+            # A model that answers unusably six times in a row is not going to get better
+            # on the seventh. Stop paying for it; leave the marker (alarm, banner).
+            if not m.get("gave_up_at"):
+                stamp_gave_up = extraction_pending.iso(now)
+                logger.error("EXTRACTION_PARSE_GAVE_UP %s: %d re-drives all ended in an "
+                             "unusable answer; no more automatic re-drives",
+                             m["sessionBase"], int(m.get("attempts") or 0))
+                try:
+                    extraction_pending.update(
+                        client, S3_BUCKET, m["sessionBase"],
+                        lambda fresh: fresh.update(gave_up_at=stamp_gave_up))
+                except Exception:
+                    logger.exception("backlog: cannot record gave_up_at on %s", m["sessionBase"])
+            elif notified:
+                _stamp(client, m)
+            continue
+        candidates.append((m, notified))
+
+    # Expedited first, then the oldest failure first.
+    candidates.sort(key=lambda c: (not c[0].get("expedite"),
+                                   c[0].get("first_failed_at") or ""))
+    for n, (m, notified) in enumerate(candidates):
+        base = m["sessionBase"]
+        out_of_time = time_left_ms is not None and time_left_ms() < MIN_REMAINING_MS
+        if n >= extraction_pending.REDRIVE_PER_TICK or out_of_time:
+            # The rest wait for the next tick; their expedite notice is still recorded.
+            for rest, rest_notified in candidates[n:]:
+                if rest_notified:
+                    _stamp(client, rest)
+            logger.info("backlog: re-drive stopped after %d (%s); %d marker(s) wait",
+                        len(redriven), "time" if out_of_time else "per-tick cap",
+                        len(candidates) - n)
+            break
+        request_key = m["request_key"]
         try:
             body = client.get_object(Bucket=S3_BUCKET, Key=request_key)["Body"].read()
         except Exception:
@@ -369,20 +440,38 @@ def redrive(client, now=None):
             if notified:
                 _stamp(client, m)
             continue
-        attempts = int(m.get("attempts") or 0) + 1
-        m["attempts"] = attempts
-        m["expedite"] = False
-        m["next_attempt_at"] = extraction_pending.iso(
-            now + timedelta(minutes=extraction_pending.backoff_minutes(attempts)))
+        written = {}
+
+        def reschedule(fresh, m=m, written=written):
+            # The marker as it is NOW: a success that cleared it in the meantime is not
+            # resurrected (update() returns None for a gone marker), and one that someone
+            # else already re-drove is left alone.
+            fdue = extraction_pending.parse_iso(fresh.get("next_attempt_at"))
+            if not (fresh.get("expedite") or fdue is None or fdue <= now):
+                return False
+            attempts = int(fresh.get("attempts") or 0) + 1
+            fresh["attempts"] = attempts
+            fresh["expedite"] = False
+            fresh["next_attempt_at"] = extraction_pending.iso(extraction_pending.jittered(
+                now + timedelta(minutes=extraction_pending.next_delay_minutes(
+                    fresh, attempts, now)), rng))
+            if m.get("expedite_notified_at"):
+                fresh["expedite_notified_at"] = m["expedite_notified_at"]
+            written.update(fresh)
+            return True
+
         try:
-            extraction_pending.write(client, S3_BUCKET, m)
+            if extraction_pending.update(client, S3_BUCKET, base, reschedule) is None:
+                logger.info("backlog: %s was cleared or re-driven meanwhile -- not re-putting",
+                            base)
+                continue
             client.put_object(Bucket=S3_BUCKET, Key=request_key, Body=body,
                               ContentType="application/json")
         except Exception:
             logger.exception("backlog: re-drive of %s failed", base)
             continue
         logger.info("backlog: re-drove %s (attempt %d, next at %s)",
-                    base, attempts, m["next_attempt_at"])
+                    base, written["attempts"], written["next_attempt_at"])
         redriven.append(base)
     return redriven, stale
 
@@ -405,7 +494,8 @@ def lambda_handler(event, context):
     client = _s3()
     # Fast schedule: only the re-drive. The hourly schedule does it too, then the scan.
     try:
-        redriven, stale = redrive(client)
+        left = getattr(context, "get_remaining_time_in_millis", None)
+        redriven, stale = redrive(client, time_left_ms=left)
         emit_pending_metric(stale)
     except Exception:
         # Never let the re-drive take the backlog probe down with it; the metric is

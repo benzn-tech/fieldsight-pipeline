@@ -632,17 +632,24 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
             if LLM_TEMPERATURE is not None:
                 p["temperature"] = LLM_TEMPERATURE
             _openrouter_fields(p, max_tokens, force_json, enable_thinking, thinking)
-        # One attempt per model while there is somewhere else to go: a model
-        # that is down stays down for minutes, and the ladder's backoff is the
-        # reader's wait. The LAST model keeps the full ladder, bounded by what
-        # is left of the budget. A non-last model also gets only a third of the
-        # budget per request, so a HUNG model cannot starve the ones behind it.
-        cap = None
-        if budget_total is not None and not last:
-            cap = budget_total / 3.0
-        text, err, movable = _qwen_attempt(p, thinking, remaining, caller,
-                                           attempts=None if last else 1,
-                                           timeout_cap=cap)
+        # How hard each model is tried, when something bounds the call (the chain budget
+        # or the caller's deadline; with neither, the primary keeps today's full ladder
+        # and timeout, and later models get one attempt each):
+        #   primary  up to 2 attempts (a 429/5xx/timeout blip is absorbed here, so a
+        #            healthy day does not spill into luna), each at most 0.6 x the time
+        #            the chain has -- a hung primary still leaves the others a share, and
+        #            the function's own LLM_HTTP_TIMEOUT stays the ceiling;
+        #   middle   one attempt, at most 0.6 x what is left;
+        #   last     the full ladder, bounded only by what is left.
+        attempts, cap = None, None
+        if not last:
+            attempts = 2 if (i == 0 and remaining is not None) else (None if i == 0 else 1)
+            if remaining is not None:
+                cap = 0.6 * remaining
+        # The 0.6 share is also this model's whole-ladder deadline: a primary that hangs
+        # on attempt 1 must not be retried into the time luna and mimo need.
+        text, err, movable = _qwen_attempt(p, thinking, cap if cap is not None else remaining,
+                                           caller, attempts=attempts, timeout_cap=cap)
         if err is None:
             return text, None
         failures.append(f"{name} {str(err)[:120]}")

@@ -38,19 +38,31 @@ Unknown models keep today's behaviour.
 **D3. What moves to the next model.**
 - **Moves on:** HTTP 5xx, 429, OpenRouter's "Provider returned error" (whatever status it arrives with, including 404), a timeout/connection error, a 200 with empty content, and `finish_reason=length` with empty content.
 - **Does not move on:** any other 4xx, which is our bug and must surface.
-- Every model except the last gets exactly one attempt, with no same-model retry, because a down model stays down for minutes. The LAST model in the chain keeps the full existing retry ladder, so a deploy with no fallback behaves exactly as before.
+- How hard each model is tried (final-review ruling 3; applies whenever the chain budget `LLM_CHAIN_BUDGET_SECONDS` or a caller deadline bounds the call):
+  - **Primary:** up to 2 attempts on 429/5xx/timeout (the existing short backoff), so one blip on a healthy muse does not spill into luna. Each attempt's timeout is `min(LLM_HTTP_TIMEOUT, 0.6 x budget)`; that 0.6 share is also the primary's whole-ladder deadline, so a hung primary is not retried into the time luna and mimo need.
+  - **Luna:** one attempt, `min(LLM_HTTP_TIMEOUT, 0.6 x what is left)`.
+  - **Mimo (the last):** the full existing ladder, bounded by what is left.
+  - With no budget and no deadline the primary keeps today's full ladder and timeout; later models get one attempt each.
 - A caller-supplied deadline (Ask) is respected: no next model is tried if the time left cannot cover a call.
 - Every switch logs `LLM_FALLBACK {"caller", "from", "to", "reason"}`. `LLM_USAGE` already names the served model.
 
 **D4. A session whose extraction fails on every model is recorded and retried until it succeeds.**
 - extract-session writes `extraction_pending/{sessionBase}.json` with:
-  `{userFolder, date, sessionBase, request_key, attempts, first_failed_at, last_error, next_attempt_at, expedite: false}`.
-- It deletes the marker on success.
-- The scheduled extraction-backlog lambda also **re-drives**. For each marker whose `next_attempt_at` has passed, it re-puts the original request object (the existing S3 trigger). The backoff is 5, 15, 30 and 60 min, then every 60 min, **forever** until success.
+  `{userFolder, date, sessionBase, request_key, attempts, first_failed_at, last_error, next_attempt_at, expedite: false, failure_kind}`.
+- `failure_kind` is `"model"` when the call failed on every model (an outage), and `"parse"` when a model ANSWERED but the JSON was unparseable, truncated or malformed (final-review ruling 1). Both write a marker and still raise (Errors metric, S3 retries unchanged).
+- It deletes the marker only when a final pass WROTE an extraction (ruling 2 / finding 8); a pass that returns nothing never clears one.
+- The scheduled extraction-backlog lambda also **re-drives**. For each marker whose `next_attempt_at` has passed, it re-puts the original request object (the existing S3 trigger), through the full chain. The backoff is 5, 15, 30 and 60 min, then every 60 min; **after 24 h of failures, every 6 h** (rulings 4/5).
+  - `model` markers are re-driven **forever** until success.
+  - `parse` markers are re-driven at most **6** times, then `gave_up_at` is set and the re-driver stops. The marker stays: it is still counted in `ExtractionPending` (the alarm stays on) and still returned by `GET /sessions/pending` (the banner stays). Expedite allows exactly one more re-drive.
+  - Per tick: at most **20** re-drives, expedited first, then oldest failure first; every new `next_attempt_at` gets 0-120 s of jitter; the loop stops early when the Lambda has under 20 s left (`context.get_remaining_time_in_millis`).
+  - The marker re-write is an S3 conditional write (`If-Match` on the ETag read), one re-read on a lost race, and a marker cleared in between is not resurrected. An SDK without `If-Match` falls back to a plain put (T3's fallback).
+- **No speech (ruling 2):** when a FINAL pass finds zero usable transcript turns, extract-session writes `extraction_empty/{sessionBase}.json` (`reason: "no_usable_speech"`) and clears any marker. That is a success-empty answer. A missing API key on a final is NOT that: it raises (alarm), writes no marker and clears none.
+- **`promised_only` markers** (the backstop promised notes and nothing failed) expire after 24 h: the backlog deletes them and logs an ERROR (`EXTRACTION_PROMISE_EXPIRED`); they count in `ExtractionPending` until deleted.
 - `ExtractionPending` is an EMF metric (count of markers older than 30 min, dimension Stage) with an alarm on the existing alert topic.
 
 **D5. Email tells the truth.**
-- "Nothing was captured for this recording." may be sent only when extraction **succeeded** and produced no items.
+- "Nothing was captured for this recording." may be sent only when extraction **succeeded** and produced no items, which includes a final pass that recorded `extraction_empty/` for the session (no speech). A rolling backstop with no marker, no rows and no empty record says "notes are on the way" instead.
+- finalize's race re-check (`recovered_after_error` on the final extraction) reads and writes the extraction with `If-Match`, one re-read on a lost race.
 - If finalize gives up waiting and an `extraction_pending` marker exists (or the final extraction failed), the email says:
   > Your recording from {site} on {date} {time range} reached us safely. Our AI processing hit a temporary model error, so your notes aren't ready yet. Please contact FieldSight if you need them urgently — we'll email your notes as soon as processing completes.
 - When a re-drive later succeeds for a session that got that email, the normal notes email is sent then, once.
@@ -64,6 +76,13 @@ Unknown models keep today's behaviour.
   - The backlog lambda's 5-minute `PendingRedrive` run notices `expedite_requested_at` without `expedite_notified_at`, publishes to the alert topic ("Customer {name} ({company}) asked to expedite their recording {sid} ({date} {time range}). Attempts so far: {n}. Last error: {error}."), stamps `expedite_notified_at`, and re-drives at once as for any due marker. No topic on the stack: no notice. A failed publish stamps nothing and is retried next run.
   - `GET /sessions/pending` returns `time_range` ("HH:MM–HH:MM" NZ) from the marker, which extract-session fills from the transcript key names (null when unknown), and `expedited_at`.
   - The button shows "We've been notified and are on it" and is disabled for that session for 10 minutes.
+
+## Final-review notes (2026-10-08)
+
+- **Ruling 6 (validation):** TEST schedules are off (`EnableSchedules=false`), so `PendingRedrive` does not run there and no EMF metric is emitted. Validation invokes the backlog manually: `aws lambda invoke --payload '{"task":"redrive"}'`.
+- **Ruling 9 (left as is):** `GET /sessions/pending` lists the whole `extraction_pending/` prefix (cap 500 GETs) per call. Accepted for now; revisit with date-keyed markers if the prefix grows.
+- Not changed: ExtractSession's async `MaximumRetryAttempts` (review finding 4's second half) stays at the default; the re-driver now also has the 6 h rung and the per-tick cap.
+- Known narrow gap: if the rolling backstop promised "notes on the way" a moment before extract-session concluded there was no speech, that recorder gets no follow-up (the `promised_only` marker is cleared by the empty record).
 
 ## Out of scope
 Qwen as a fallback (0/4 measured). Changing the primary model.

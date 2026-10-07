@@ -2758,6 +2758,10 @@ Resources:
                 # extraction_pending/{sessionBase}.json: a failed FINAL pass is recorded
                 # here for the backlog lambda to re-drive (spec D4). Not a trigger prefix.
                 - !Sub arn:aws:s3:::${IngestBucketName}/extraction_pending/*
+                # extraction_empty/{sessionBase}.json: a FINAL pass that found no usable
+                # speech. A success-empty record, which finalize reads to say "Nothing was
+                # captured" truthfully. Not a trigger prefix.
+                - !Sub arn:aws:s3:::${IngestBucketName}/extraction_empty/*
             # Success deletes the marker (and nothing else this role may delete).
             - Effect: Allow
               Action: s3:DeleteObject
@@ -3398,6 +3402,9 @@ Resources:
                     # (extraction did not fail), and without ListBucket S3 answers 403
                     # for it -- which the reader would have to treat as "unknown".
                     - extraction_pending/*
+                    # The no-speech record: absent is the ordinary case for every
+                    # recording that had speech, and without ListBucket that is a 403.
+                    - extraction_empty/*
                     # The race re-check reads the session's final extraction; absent is
                     # the ordinary case, and without ListBucket that is a 403.
                     - extractions/*
@@ -3410,6 +3417,9 @@ Resources:
                 - s3:PutObject
                 - s3:DeleteObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/extraction_pending/*
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/extraction_empty/*
             - Effect: Allow
               # Race re-check (D5): a final extraction that landed just before the
               # error email was stamped gets `recovered_after_error` set and is put
@@ -5576,6 +5586,10 @@ Resources:
               Resource:
                 - !Sub arn:aws:s3:::${DataBucketName}/extraction_requests/*
                 - !Sub arn:aws:s3:::${DataBucketName}/extraction_pending/*
+            # An expired promised_only marker is deleted (spec: 24 h TTL, logged at ERROR).
+            - Effect: Allow
+              Action: s3:DeleteObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/extraction_pending/*
             # PutMetricData takes no resource ARN. Scoped by namespace instead,
             # so this role cannot overwrite any other namespace's series.
             - Effect: Allow

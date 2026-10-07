@@ -909,7 +909,10 @@ def test_the_wait_is_bounded(monkeypatch):
     slept = []
     out = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE,
                               final=True, sleep=slept.append)
-    assert out is None and fake_s3.put_calls == []
+    # The only write is the success-empty record finalize reads (final review 2).
+    assert out is None
+    assert [c["Key"] for c in fake_s3.put_calls] == [
+        f"extraction_empty/{SESSION_BASE}.json"]
     assert len(slept) == les.FINAL_EMPTY_RETRY_ATTEMPTS
 
 

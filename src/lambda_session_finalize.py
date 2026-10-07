@@ -756,6 +756,22 @@ def _read_pending(session_id):
         return None
 
 
+def _read_empty(session_id):
+    """True when extract-session recorded that this session's final pass found no usable
+    speech (extraction_empty/). Unreadable answers False: the email then says the safe
+    "notes are on the way" rather than the claim about the audio."""
+    import boto3
+    try:
+        boto3.client("s3").get_object(
+            Bucket=S3_BUCKET, Key=extraction_pending.empty_key(f"sid{session_id}"))
+        return True
+    except Exception as e:  # noqa: BLE001
+        if getattr(e, "response", {}).get("Error", {}).get("Code", "") not in ("NoSuchKey", "404"):
+            logger.exception("finalize: cannot read the extraction_empty record for %s",
+                             session_id)
+        return False
+
+
 def _mark_error_email_sent(session_id):
     import boto3
     try:
@@ -796,20 +812,45 @@ def _recheck_final_extraction(artifact):
     s3 = boto3.client("s3")
     base = f"sid{sid}"
     key = f"extractions/{folder}/{date}/{base}.json"
-    try:
-        body = json.loads(s3.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read().decode("utf-8"))
-    except Exception as e:  # noqa: BLE001
-        if getattr(e, "response", {}).get("Error", {}).get("Code", "") not in ("NoSuchKey", "404"):
-            logger.exception("finalize: cannot read %s to re-check the race", key)
-        return False
-    if body.get("tier") != "final":
-        return False
-    if not body.get("recovered_after_error"):
+    # GET-modify-PUT of an artifact extract-session may rewrite at any moment: the PUT is
+    # conditional on the ETag just read (If-Match), re-read once on a lost race (a newer
+    # final is then what we flag, or already flagged). An SDK without If-Match falls back
+    # to a plain put, as before.
+    for attempt in range(2):
+        try:
+            obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+            body = json.loads(obj["Body"].read().decode("utf-8"))
+        except Exception as e:  # noqa: BLE001
+            if getattr(e, "response", {}).get("Error", {}).get("Code", "") not in (
+                    "NoSuchKey", "404"):
+                logger.exception("finalize: cannot read %s to re-check the race", key)
+            return False
+        if body.get("tier") != "final":
+            return False
+        if body.get("recovered_after_error"):
+            break
         body["recovered_after_error"] = True
-        s3.put_object(Bucket=S3_BUCKET, Key=key, Body=json.dumps(body, ensure_ascii=False),
-                      ContentType="application/json")
+        data = json.dumps(body, ensure_ascii=False)
+        etag = obj.get("ETag")
+        try:
+            s3.put_object(Bucket=S3_BUCKET, Key=key, Body=data,
+                          ContentType="application/json",
+                          **({"IfMatch": etag} if etag else {}))
+        except Exception as e:  # noqa: BLE001
+            code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+            if code in ("PreconditionFailed", "ConditionalRequestConflict"):
+                if attempt == 0:
+                    continue
+                logger.error("finalize: %s changed twice while flagging it -- the follow-up "
+                             "for %s may be missing", key, sid)
+                return True
+            if type(e).__name__ != "ParamValidationError":
+                raise
+            s3.put_object(Bucket=S3_BUCKET, Key=key, Body=data,
+                          ContentType="application/json")
         logger.info("finalize: %s's final extraction beat the error email -- re-fired the "
                     "follow-up", sid)
+        break
     try:
         marker = extraction_pending.read(s3, S3_BUCKET, base)
         if marker and marker.get("promised_only"):
@@ -822,7 +863,7 @@ def _recheck_final_extraction(artifact):
 def process_finalize_request(artifact, *, send=None, write_result=None, complete_summary=None,
                              already_sent=None, poll_brief=None, read_pending=None,
                              mark_error_email_sent=None, promise_notes=None,
-                             recheck_final=None):
+                             recheck_final=None, read_empty=None):
     """Build + SES-send the recorder's confirmation email from one enqueued finalize
     request (the in-VPC claim step wrote it), then record the outcome to
     session_finalize_results/{sid}.json — the in-VPC sweep's reconcile pass reads it
@@ -920,7 +961,12 @@ def process_finalize_request(artifact, *, send=None, write_result=None, complete
         # No marker and no rows: the confirmation would say "Nothing was captured",
         # which is true only of a final extraction that SUCCEEDED and found nothing.
         # Here nobody has read the audio yet, so say what is true instead.
-        promised_only = not pending and not _clean_todos(todos)
+        # A final pass that found NO SPEECH is a success-empty answer (extraction_empty/),
+        # and for it "Nothing was captured" is the truth.
+        empty = False
+        if not pending and not _clean_todos(todos):
+            empty = bool((read_empty if read_empty is not None else _read_empty)(session_id))
+        promised_only = not pending and not _clean_todos(todos) and not empty
     if pending:
         subject, text, html = build_model_error_email(
             date=artifact.get("date"), time_range=artifact.get("timeRange"),

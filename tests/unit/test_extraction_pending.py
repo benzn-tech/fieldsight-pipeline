@@ -147,12 +147,13 @@ def test_a_live_pass_failure_leaves_no_marker(lam, monkeypatch):
     assert lam.marker() is None
 
 
-def test_a_parse_failure_is_not_marked(lam, monkeypatch):
-    """A re-drive would repeat it unchanged (and pay for it hourly forever)."""
+def test_a_parse_failure_is_marked_as_kind_parse(lam, monkeypatch):
+    """Final review 1: a model that ANSWERED unusably used to leave no marker, and the
+    recording was lost. It is marked now, as a different kind (bounded re-drives)."""
     monkeypatch.setattr(llm_utils, "call_llm", lambda *a, **k: ("not json at all", None))
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="Failed to parse"):
         les.lambda_handler(_event(), None)
-    assert lam.marker() is None
+    assert lam.marker()["failure_kind"] == "parse"
 
 
 def test_a_recovered_pass_after_the_error_email_is_flagged_for_the_follow_up(lam, monkeypatch):
@@ -178,6 +179,15 @@ def test_the_backoff_is_5_15_30_60_then_hourly_forever():
     assert [ep.backoff_minutes(n) for n in range(0, 12)] == [5, 15, 30, 60] + [60] * 8
 
 
+class _NoJitter:
+    @staticmethod
+    def uniform(a, b):
+        return 0
+
+
+NOJITTER = _NoJitter()
+
+
 def _marker(attempts=0, due_in_min=-1, **over):
     m = {"userFolder": FOLDER, "date": DATE, "sessionBase": BASE, "request_key": REQ_KEY,
          "attempts": attempts, "first_failed_at": ep.iso(NOW - timedelta(minutes=10)),
@@ -195,7 +205,7 @@ def bk(monkeypatch):
 def test_a_due_marker_re_puts_the_original_request_and_reschedules(bk):
     bk.objects[ep.marker_key(BASE)] = json.dumps(_marker(attempts=0)).encode()
     original = bk.objects[REQ_KEY]
-    redriven, _ = bl.redrive(bk, now=NOW)
+    redriven, _ = bl.redrive(bk, now=NOW, rng=NOJITTER)
     assert redriven == [BASE] and REQ_KEY in bk.puts       # the put IS the trigger
     assert bk.objects[REQ_KEY] == original
     m = bk.marker()
@@ -211,7 +221,7 @@ def test_a_marker_that_is_not_due_is_left_alone(bk):
 
 def test_it_never_gives_up_attempt_ten_still_schedules(bk):
     bk.objects[ep.marker_key(BASE)] = json.dumps(_marker(attempts=9)).encode()
-    redriven, _ = bl.redrive(bk, now=NOW)
+    redriven, _ = bl.redrive(bk, now=NOW, rng=NOJITTER)
     assert redriven == [BASE]
     m = bk.marker()
     assert m["attempts"] == 10 and m["next_attempt_at"] == ep.iso(NOW + timedelta(minutes=60))
@@ -221,7 +231,7 @@ def test_the_ladder_walks_15_30_60_60_60(bk):
     bk.objects[ep.marker_key(BASE)] = json.dumps(_marker(attempts=0)).encode()
     gaps, t = [], NOW
     for _ in range(5):
-        bl.redrive(bk, now=t)
+        bl.redrive(bk, now=t, rng=NOJITTER)
         due = ep.parse_iso(bk.marker()["next_attempt_at"])
         gaps.append(int((due - t).total_seconds() // 60))
         t = due
@@ -284,6 +294,7 @@ def _rolling(**over):
 
 def _run(artifact, **kw):
     sent, results, marked = [], [], []
+    kw.setdefault("read_empty", lambda sid: False)
     out = fin.process_finalize_request(
         artifact, send=lambda *a: sent.append(a),
         write_result=lambda sid, p: results.append((sid, p)),
