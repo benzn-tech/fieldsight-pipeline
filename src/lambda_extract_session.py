@@ -2539,6 +2539,15 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
     # extraction` keeps seeing today's shape.
     if continuity is not None:
         extraction['continuity'] = continuity
+    if final and _known_short(bucket, user_folder, date, session_base, keys, generation):
+        # THIS RECORD IS KNOWN TO BE SHORT, and a fuller one follows: transcripts
+        # landed while the model was thinking, and _rerun_if_the_session_grew
+        # (after the write) asks for it. item-writer still stores this one, but
+        # sends no email and makes no checklist report from it -- on TEST
+        # (2026-10-08, Ben_Lin_test2 11:36) the email went out from the first
+        # 90 seconds of a five-minute pre-pour check, 40 seconds before the full
+        # record, and only one email is sent per recording.
+        extraction['incomplete'] = True
 
     s3().put_object(
         Bucket=bucket, Key=out_key,
@@ -2654,6 +2663,20 @@ def _request_final_rerun(bucket, user_folder, date, session_base, generation=0,
                     "(generation %d)", session_base, reason, generation)
     except Exception:
         logger.exception("%s: could not request a final re-run", session_base)
+
+
+def _known_short(bucket, user_folder, date, session_base, gathered_keys, generation):
+    """True when transcripts this pass did not read have landed AND a re-run
+    will follow (the generation cap is not reached). Never raises: unknown
+    reads as complete, which is what every record was before this."""
+    if generation + 1 >= FINAL_RERUN_MAX_GENERATIONS:
+        return False
+    try:
+        fresh = gather_session_segments(bucket, user_folder, date, session_base)
+    except Exception:
+        logger.warning("%s: could not re-list before writing", session_base, exc_info=True)
+        return False
+    return set(fresh) > set(gathered_keys)
 
 
 def _rerun_if_the_session_grew(bucket, user_folder, date, session_base,

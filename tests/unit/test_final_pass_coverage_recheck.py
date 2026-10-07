@@ -250,7 +250,9 @@ def test_the_relist_happens_after_the_write(monkeypatch):
 
     kinds = [k for k, _ in order]
     write_at = order.index(("put", CHUNK_OUT_KEY))
-    assert kinds.count("list") == 2, "one listing at entry, one after the write"
+    # Entry, just before the write (lambda_extract_session._known_short: is this
+    # record already short?), and after the write (the re-run trigger).
+    assert kinds.count("list") == 3, "at entry, before the write, after the write"
     last_list = len(order) - 1 - kinds[::-1].index("list")
     assert last_list > write_at, "the re-list must come after the extraction is written"
 

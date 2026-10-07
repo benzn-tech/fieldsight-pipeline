@@ -94,7 +94,8 @@ def test_item_writer_makes_them_on_a_final_pass_after_the_photos():
     rebind = src.index("photo_rebind.rebind_day_photos(")
     auto = src.index("checklist_reports.auto_generate(")
     assert rebind < auto
-    assert 'if extraction.get("tier") == "final" and stored_inspections:' in src[rebind:auto + 10]
+    assert 'if (extraction.get("tier") == "final" and stored_inspections' in src[rebind:auto + 10]
+    assert 'and not extraction.get("incomplete")):' in src[rebind:auto + 10]
 
 
 def test_the_endpoints_list_reports_with_status_and_unmatched_checks(monkeypatch):
