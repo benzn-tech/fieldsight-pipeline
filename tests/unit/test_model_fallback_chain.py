@@ -92,7 +92,11 @@ def test_all_fail_surfaces_the_original_error(monkeypatch):
     sent = _stub(monkeypatch, [_err(503, "primary down"), _err(429, "luna busy")]
                  + [_err(500, "mimo down")] * 4)
     text, err = lu.call_llm("p", max_tokens=100)
-    assert text is None and err == "primary down"
+    assert text is None
+    # every model's failure is named, the primary's first
+    assert err.startswith("all models failed: ")
+    assert err.index(MURE) < err.index(LUNA) < err.index(MIMO)
+    assert "primary down" in err and "luna busy" in err and "mimo down" in err
     assert [b["model"] for b in sent][:3] == [MURE, LUNA, MIMO]
 
 
@@ -204,3 +208,174 @@ def test_provider_returned_error_on_any_status_falls_back(monkeypatch):
     sent = _stub(monkeypatch, [_err(400, "Provider returned error"), _ok("ok")])
     assert lu.call_llm("p") == ("ok", None)
     assert len(sent) == 2
+
+
+# ---- T1 fix round: findings 1, 2, 4, 5, 9 --------------------------------------
+
+
+class _Html:
+    """A gateway's error page: not JSON."""
+    def __init__(self, status, body=b"<html><body>Bad Gateway</body></html>"):
+        self.status = status
+        self.data = body
+
+
+@pytest.mark.parametrize("status", [502, 503, 504])
+def test_html_5xx_body_moves_on_instead_of_raising(monkeypatch, status):
+    sent = _stub(monkeypatch, [_Html(status), _ok("from-luna")])
+    assert lu.call_llm("p") == ("from-luna", None)
+    assert len(sent) == 2
+
+
+def test_html_5xx_everywhere_returns_an_error_never_raises(monkeypatch):
+    _stub(monkeypatch, [_Html(502), _Html(502)] + [_Html(502)] * 4)
+    text, err = lu.call_llm("p")
+    assert text is None and err.startswith("all models failed: ")
+    assert f"{MIMO} HTTP 502" in err
+
+
+def test_html_400_surfaces_and_does_not_move(monkeypatch):
+    sent = _stub(monkeypatch, [_Html(400), _ok("never")])
+    text, err = lu.call_llm("p")
+    assert text is None and err == "HTTP 400" and len(sent) == 1
+
+
+def test_unparseable_200_is_a_vendor_failure(monkeypatch):
+    sent = _stub(monkeypatch, [_Html(200, b"<html>oops"), _ok("from-luna")])
+    assert lu.call_llm("p") == ("from-luna", None)
+    assert len(sent) == 2
+
+
+def test_200_with_error_and_no_choices_moves_on(monkeypatch):
+    sent = _stub(monkeypatch, [_R(200, {"error": {"message": "upstream died"}}),
+                               _ok("from-luna")])
+    assert lu.call_llm("p") == ("from-luna", None)
+    assert len(sent) == 2
+
+
+def test_200_with_empty_choices_moves_on(monkeypatch):
+    sent = _stub(monkeypatch, [_R(200, {"choices": []}), _ok("from-luna")])
+    assert lu.call_llm("p") == ("from-luna", None)
+
+
+def test_408_moves_on(monkeypatch):
+    sent = _stub(monkeypatch, [_err(408, "upstream timeout"), _ok("from-luna")])
+    assert lu.call_llm("p") == ("from-luna", None)
+
+
+def test_all_models_empty_names_each(monkeypatch):
+    empty = lambda: _R(200, {"choices": [{"message": {"content": ""},
+                                          "finish_reason": "length"}]})
+    _stub(monkeypatch, [empty(), empty()] + [empty()] * 4)
+    text, err = lu.call_llm("p")
+    assert text is None
+    assert "empty answer" in err and "finish_reason=length" in err
+    assert err.startswith("all models failed: ")
+
+
+def test_primary_payload_is_byte_identical_with_the_chain_on_and_off(monkeypatch):
+    monkeypatch.setenv("LLM_FALLBACK_MODELS", "")
+    off = _stub(monkeypatch, [_ok("a")])
+    lu.call_llm("p", max_tokens=1000, force_json=True)
+    monkeypatch.delenv("LLM_FALLBACK_MODELS")
+    on = _stub(monkeypatch, [_ok("a")])
+    lu.call_llm("p", max_tokens=1000, force_json=True)
+    assert json.dumps(on[0]) == json.dumps(off[0])
+
+
+def test_llm_usage_names_the_model_that_served(monkeypatch, caplog):
+    _stub(monkeypatch, [_err(503), _err(503), _ok("from-mimo", model=MIMO)])
+    with caplog.at_level(logging.INFO):
+        assert lu.call_llm("p", caller="t") == ("from-mimo", None)
+    usage = [r.getMessage() for r in caplog.records if "LLM_USAGE" in r.getMessage()]
+    assert len(usage) == 1 and f"model={MIMO}" in usage[0]
+
+
+def test_llm_usage_names_luna_when_luna_serves(monkeypatch, caplog):
+    _stub(monkeypatch, [_err(503), _ok("from-luna", model=LUNA)])
+    with caplog.at_level(logging.INFO):
+        lu.call_llm("p", caller="t")
+    usage = [r.getMessage() for r in caplog.records if "LLM_USAGE" in r.getMessage()]
+    assert len(usage) == 1 and f"model={LUNA}" in usage[0]
+
+
+# ---- the chain-wide time budget (finding 2) -------------------------------------
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def _hang_world(monkeypatch, behaviours, budget="840", http_timeout=540.0):
+    """Fake clock + fake http. `behaviours` maps model -> "hang" (consume the
+    request timeout then raise) or a response. Returns (calls, clock)."""
+    clock = _Clock()
+    monkeypatch.setattr(lu.time, "monotonic", clock)
+    monkeypatch.setattr(lu.time, "sleep", lambda s: setattr(clock, "now", clock.now + s))
+    monkeypatch.setattr(lu, "HTTP_TIMEOUT", http_timeout)
+    if budget is None:
+        monkeypatch.delenv("LLM_CHAIN_BUDGET_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("LLM_CHAIN_BUDGET_SECONDS", budget)
+    calls = []
+
+    def fake(self, method, url, body=None, headers=None, timeout=None):
+        model = json.loads(body)["model"]
+        calls.append((model, timeout, clock.now))
+        b = behaviours[model]
+        if b == "hang":
+            clock.now += timeout
+            raise TimeoutError("read timed out")
+        return b
+
+    monkeypatch.setattr(lu.urllib3.PoolManager, "request", fake)
+    return calls, clock
+
+
+def test_hung_primary_and_hung_luna_still_leave_mimo_time(monkeypatch):
+    calls, clock = _hang_world(monkeypatch, {MURE: "hang", LUNA: "hang",
+                                             MIMO: _ok("from-mimo")})
+    t0 = clock.now
+    assert lu.call_llm("p") == ("from-mimo", None)
+    assert [c[0] for c in calls] == [MURE, LUNA, MIMO]
+    # non-last models: min(540, 840/3) = 280 each
+    assert calls[0][1] == pytest.approx(280.0) and calls[1][1] == pytest.approx(280.0)
+    assert clock.now - t0 <= 840.0
+
+
+def test_total_never_exceeds_the_budget_when_everything_hangs(monkeypatch):
+    calls, clock = _hang_world(monkeypatch, {MURE: "hang", LUNA: "hang", MIMO: "hang"})
+    t0 = clock.now
+    text, err = lu.call_llm("p")
+    assert text is None and err.startswith("all models failed")
+    assert clock.now - t0 <= 840.0
+    # the last model's per-attempt timeout is what remains, never more
+    assert all(c[1] <= 840.0 - (c[2] - t0) + 1e-6 for c in calls)
+    assert calls[-1][0] == MIMO
+
+
+def test_last_model_ladder_stops_when_the_budget_cannot_cover_another_attempt(monkeypatch):
+    calls, clock = _hang_world(monkeypatch, {MURE: _err(503), LUNA: _err(503),
+                                             MIMO: "hang"}, budget="100",
+                               http_timeout=60.0)
+    t0 = clock.now
+    lu.call_llm("p")
+    assert clock.now - t0 <= 100.0
+    assert [c[0] for c in calls].count(MIMO) <= 2
+
+
+def test_caller_deadline_still_wins_when_earlier(monkeypatch):
+    calls, clock = _hang_world(monkeypatch, {MURE: "hang", LUNA: "hang", MIMO: "hang"})
+    t0 = clock.now
+    lu.call_llm("p", deadline=50.0)
+    assert clock.now - t0 <= 50.0
+
+
+def test_no_budget_env_keeps_todays_per_attempt_timeout(monkeypatch):
+    calls, clock = _hang_world(monkeypatch, {MURE: "hang", LUNA: _ok("l")}, budget=None)
+    assert lu.call_llm("p") == ("l", None)
+    assert calls[0][1] == 540.0

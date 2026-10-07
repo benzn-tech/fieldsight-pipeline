@@ -1701,6 +1701,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           QWEN_ENABLE_THINKING: 'true'
@@ -1841,6 +1842,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           QWEN_ENABLE_THINKING: 'true'
@@ -1895,6 +1897,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           QWEN_ENABLE_THINKING: 'true'
@@ -2676,6 +2679,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           LLM_HTTP_TIMEOUT: '540'
@@ -2824,6 +2828,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           # Thinking OFF — the mid-meeting summary should be fast; summarisation
@@ -3291,6 +3296,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           # Applies to the rolling summariser only. session_brief passes
@@ -3381,13 +3387,26 @@ Resources:
                     # (extraction did not fail), and without ListBucket S3 answers 403
                     # for it -- which the reader would have to treat as "unknown".
                     - extraction_pending/*
+                    # The race re-check reads the session's final extraction; absent is
+                    # the ordinary case, and without ListBucket that is a 403.
+                    - extractions/*
             - Effect: Allow
               # Read the marker to tell "extraction failed" from "nothing was said",
-              # and write error_email_sent_at back into it (spec D5).
+              # and write error_email_sent_at back into it (spec D5). Delete: a
+              # promised_only marker whose final already cleared is tidied away.
               Action:
                 - s3:GetObject
                 - s3:PutObject
+                - s3:DeleteObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/extraction_pending/*
+            - Effect: Allow
+              # Race re-check (D5): a final extraction that landed just before the
+              # error email was stamped gets `recovered_after_error` set and is put
+              # back, which re-fires item-writer's follow-up under its write-once key.
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/extractions/*
             - Effect: Allow
               Action:
                 - ses:SendEmail
@@ -4142,6 +4161,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
       Policies:

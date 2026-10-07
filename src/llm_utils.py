@@ -313,8 +313,8 @@ def _may_sleep(remaining, attempt, base=None):
     return True
 
 
-def _post_with_retry(url, body, headers, deadline=None, clock=time.monotonic,
-                     attempts=None):
+def _post_with_retry(url, body, headers, deadline=None, clock=None,
+                     attempts=None, timeout_cap=None):
     """Single POST with exponential backoff on 429/5xx. Returns (resp, error).
 
     `deadline` is SECONDS FROM NOW, and it is opt-in. Eight of this module's
@@ -340,9 +340,14 @@ def _post_with_retry(url, body, headers, deadline=None, clock=time.monotonic,
       DOWNWARD. HTTP_TIMEOUT exists to lose the race against the Lambda's own
       timeout, so a generous deadline must not be allowed to extend it.
     """
+    if clock is None:
+        clock = time.monotonic  # resolved per call so a test can substitute it
     http = urllib3.PoolManager()
     last_error = None
     started = clock()
+    # A non-last model in the fallback chain gets a shorter per-request cap so
+    # a hung model cannot eat the time the next one needs.
+    per_try = HTTP_TIMEOUT if timeout_cap is None else min(HTTP_TIMEOUT, timeout_cap)
     # `attempts` lets a caller that has somewhere else to go (the model fallback
     # chain) spend one attempt here instead of the whole ladder.
     max_attempts = MAX_ATTEMPTS if attempts is None else attempts
@@ -359,9 +364,9 @@ def _post_with_retry(url, body, headers, deadline=None, clock=time.monotonic,
                 # wrong one sends the reader at the vendor.
                 return None, (last_error + "; deadline exceeded" if last_error
                               else "deadline exceeded")
-            timeout = min(HTTP_TIMEOUT, remaining)
+            timeout = min(per_try, remaining)
         else:
-            timeout = HTTP_TIMEOUT
+            timeout = per_try
         try:
             resp = http.request(
                 "POST", url, body=body, headers=headers, timeout=timeout
@@ -540,6 +545,18 @@ def _openrouter_fields(payload, max_tokens, force_json, enable_thinking, thinkin
         payload["response_format"] = {"type": "json_object"}
 
 
+def _chain_budget():
+    """Seconds the whole model chain may spend, from LLM_CHAIN_BUDGET_SECONDS
+    (template.yaml sets it to each function's Lambda Timeout minus 60). Unset,
+    empty or unparseable means no chain cap -- today's behaviour. Read per call."""
+    raw = os.environ.get("LLM_CHAIN_BUDGET_SECONDS", "").strip()
+    try:
+        v = float(raw) if raw else None
+    except ValueError:
+        return None
+    return v if v and v > 0 else None
+
+
 def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
                deadline=None, caller="unknown"):
     if not QWEN_API_KEY:
@@ -584,45 +601,69 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
         chain = model_chain(payload["model"])
     if len(chain) == 1:
         # No fallback configured (or DashScope): exactly the old single call.
+        cb = _chain_budget()
+        if cb is not None:
+            deadline = cb if deadline is None else min(deadline, cb)
         text, err, _ = _qwen_attempt(payload, thinking, deadline, caller)
         return text, err
 
     started = time.monotonic()
-    first_error = None
+    budget_total = _chain_budget()
+    failures = []  # "<model> <why>" per model, primary first
+
+    def remaining_total():
+        """Seconds the whole chain may still spend: the tighter of the caller's
+        deadline and the chain budget, or None when neither is set."""
+        left = [x - (time.monotonic() - started)
+                for x in (deadline, budget_total) if x is not None]
+        return min(left) if left else None
+
     for i, name in enumerate(chain):
+        last = i == len(chain) - 1
+        remaining = remaining_total()
+        if i > 0 and remaining is not None and remaining < MIN_USEFUL_SECONDS:
+            logger.warning("LLM_FALLBACK skipped: time exhausted before %s", name)
+            failures.append(f"{name} skipped (time budget exhausted)")
+            break
         if i == 0:
             p = payload
-            budget = deadline
         else:
-            budget = None
-            if deadline is not None:
-                budget = deadline - (time.monotonic() - started)
-                if budget < MIN_USEFUL_SECONDS:
-                    logger.warning("LLM_FALLBACK skipped: deadline exhausted before %s", name)
-                    break
             p = {"model": name, "messages": payload["messages"]}
             if LLM_TEMPERATURE is not None:
                 p["temperature"] = LLM_TEMPERATURE
             _openrouter_fields(p, max_tokens, force_json, enable_thinking, thinking)
         # One attempt per model while there is somewhere else to go: a model
         # that is down stays down for minutes, and the ladder's backoff is the
-        # reader's wait. The LAST model keeps the full ladder.
-        last = i == len(chain) - 1
-        text, err, movable = _qwen_attempt(p, thinking, budget, caller,
-                                           attempts=None if last else 1)
+        # reader's wait. The LAST model keeps the full ladder, bounded by what
+        # is left of the budget. A non-last model also gets only a third of the
+        # budget per request, so a HUNG model cannot starve the ones behind it.
+        cap = None
+        if budget_total is not None and not last:
+            cap = budget_total / 3.0
+        text, err, movable = _qwen_attempt(p, thinking, remaining, caller,
+                                           attempts=None if last else 1,
+                                           timeout_cap=cap)
         if err is None:
             return text, None
-        if first_error is None:
-            first_error = err
+        failures.append(f"{name} {str(err)[:120]}")
+        if i == 0 and not movable:
+            # Our request is wrong, not the vendor's: surface it unchanged.
+            return None, err
         if not movable or last:
             break
         logger.info("LLM_FALLBACK %s", json.dumps(
             {"caller": caller, "from": name, "to": chain[i + 1],
              "reason": str(err)[:200]}))
-    return None, first_error
+    return None, "all models failed: " + "; ".join(failures)
 
 
-def _qwen_attempt(payload, thinking, deadline, caller, attempts=None):
+def _status_movable(status):
+    """5xx, 429 and 408 (OpenRouter's upstream timeout) are the vendor's."""
+    return status >= 500 or status in (429, 408)
+
+
+def _qwen_attempt(payload, thinking, deadline, caller, attempts=None,
+                  timeout_cap=None):
     """One model, one request ladder. Returns (text, error, movable): `movable`
     says the failure is the model's, so the next model in the chain may try."""
     # One line per call, on the way OUT, naming what actually goes on the wire.
@@ -645,6 +686,8 @@ def _qwen_attempt(payload, thinking, deadline, caller, attempts=None):
     _bound = {"deadline": deadline} if deadline is not None else {}
     if attempts is not None:
         _bound["attempts"] = attempts
+    if timeout_cap is not None:
+        _bound["timeout_cap"] = timeout_cap
     resp, err = _post_with_retry(
         f"{QWEN_BASE_URL}/chat/completions",
         json.dumps(payload),
@@ -655,14 +698,31 @@ def _qwen_attempt(payload, thinking, deadline, caller, attempts=None):
     if resp is None:
         logger.error(f"Qwen API call failed: {err}")
         return None, err, True
-    data = json.loads(resp.data.decode("utf-8"))
+    # Status BEFORE body: a gateway's 502/503/504 is an HTML page, and parsing
+    # it first raised out of call_llm and skipped every later model.
+    try:
+        data = json.loads(resp.data.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("body is not an object")
+    except (ValueError, UnicodeDecodeError):
+        logger.error("Qwen API returned an unparseable body: status=%s body=%.200r",
+                     resp.status, resp.data)
+        if resp.status == 200:
+            return None, "HTTP 200 with an unparseable body", True
+        return None, f"HTTP {resp.status}", _status_movable(resp.status) or _provider_error(resp)
     if resp.status == 200:
         try:
             choice = data["choices"][0]
             content = choice["message"]["content"]
-        except (KeyError, IndexError):
+        except (KeyError, IndexError, TypeError):
             logger.error(f"Qwen unexpected response shape: {str(data)[:500]}")
-            return None, "unexpected Qwen response shape", False
+            # OpenRouter answers 200 with {"error": {...}} and no choices when
+            # the upstream provider fails mid-request: the vendor's failure.
+            e = data.get("error")
+            if isinstance(e, dict):
+                e = e.get("message")
+            return None, (f"HTTP 200 with error: {str(e)[:100]}" if e
+                          else "unexpected Qwen response shape"), True
         usage = data.get("usage") or {}
         detail = usage.get("completion_tokens_details") or {}
         # HTTP 200 WITH NO ANSWER IS A FAILURE, and on a reasoning model it is
@@ -720,7 +780,7 @@ def _qwen_attempt(payload, thinking, deadline, caller, attempts=None):
         except Exception:  # noqa: BLE001 - telemetry must never break the call
             logger.warning("LLM_USAGE logging failed (qwen)", exc_info=True)
         return content, None, False
-    err_obj = data.get("error") or {}
+    err_obj = data.get("error") if isinstance(data.get("error"), dict) else {}
     msg = err_obj.get("message", f"HTTP {resp.status}")
     # The CODE, not just the message. These read almost identically in a log
     # line -- "Requests rate limit exceeded" vs "Free allocated quota
@@ -736,8 +796,7 @@ def _qwen_attempt(payload, thinking, deadline, caller, attempts=None):
     # saturated (5xx, 429, OpenRouter's "Provider returned error" 404). Any
     # other 4xx is OUR request being wrong and must surface, not be hidden by a
     # second model that happens to accept it.
-    movable = (resp.status >= 500 or resp.status == 429
-               or _provider_error(resp))
+    movable = _status_movable(resp.status) or _provider_error(resp)
     return None, msg, movable
 
 
