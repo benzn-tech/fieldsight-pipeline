@@ -15,6 +15,8 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   PATCH /api/org/members/{sub}/role       → explicit global role set (admin)
   PATCH /api/org/members/{sub}/folder     → set recording-folder identity (admin)
   POST  /api/org/members/enroll-backfill  → bulk-enroll folder_name for unenrolled company logins (admin)
+  GET   /api/org/sessions/pending?date=   → caller's recordings whose notes are delayed (D6)
+  POST  /api/org/sessions/{id}/expedite   → ask for a delayed recording to be re-driven now (D6)
   POST  /api/org/upload-url               → presigned PUT for avatar / site icon
   GET   /api/org/asset-url?key=…          → presigned GET for an org asset
   PATCH /api/org/sites/{id}               → update site fields / swap icon (admin/gm)
@@ -123,13 +125,14 @@ from datetime import date as _date
 from datetime import datetime, timedelta, timezone
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ParamValidationError
 from psycopg.errors import UniqueViolation
 
 import chunk_stitch
 import content_hash
 import device_heartbeat
 import device_status
+import extraction_pending
 import folder_key as folder_key_mod
 import nz_time
 import pipeline_trace
@@ -881,6 +884,11 @@ def dispatch(conn, event, method, route):
     m_sbr = re.match(r"^/sessions/([^/]+)/brief$", route)
     if m_sbr and method == "GET":
         return session_brief_read(conn, caller, m_sbr.group(1), event)
+    if route == "/sessions/pending" and method == "GET":
+        return sessions_pending(conn, caller, event)
+    m_sx = re.match(r"^/sessions/([^/]+)/expedite$", route)
+    if m_sx and method == "POST":
+        return session_expedite(conn, caller, m_sx.group(1))
 
     if route == "/voice/upload-url" and method == "POST":
         return create_voice_upload_url(conn, caller, parse_body(event))
@@ -3869,6 +3877,129 @@ def session_rolling(conn, caller, session_id, event):
         "openTodos": data.get("open_todos", []),
         "updatedAt": data.get("updated_at"),
     })
+
+
+# Spec 2026-10-07 D6: what the web shows when a final extraction could not run, and the
+# Expedite button. State lives in the extraction_pending/ marker (written by extract-session,
+# re-driven by the backlog lambda); org-api only reads it and stamps the expedite request.
+# org-api is in-VPC with S3 as its only outward door, so the notice to the alert topic is
+# the backlog lambda's job (its 5-minute run sees the stamp).
+EXPEDITE_COOLDOWN = timedelta(minutes=10)
+PENDING_LIST_CAP = 50
+PENDING_SCAN_CAP = 500
+
+
+def _pending_base(session_id):
+    sid = (session_id or "").strip()
+    if not re.match(r"^[A-Za-z0-9_-]{1,100}$", sid):
+        return None
+    return sid if sid.startswith("sid") else f"sid{sid}"
+
+
+def sessions_pending(conn, caller, event):
+    """GET /api/org/sessions/pending?date=YYYY-MM-DD -- the caller's OWN recordings of that
+    day whose final extraction is still failing. `promised_only` markers are not failures
+    (nothing has gone wrong yet) and are left out. time_range is null when the marker has
+    none; the UI shows the session without a range."""
+    date = ((event.get("queryStringParameters") or {}).get("date") or "").strip()
+    try:
+        if not REPORT_DATE_RE.match(date):
+            raise ValueError(date)
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        return error("date required (YYYY-MM-DD)", 400)
+    folder = (caller.get("folder_name") or "").strip()
+    if not folder:
+        return ok({"sessions": []})
+    out, scanned = [], 0
+    token = None
+    while len(out) < PENDING_LIST_CAP and scanned < PENDING_SCAN_CAP:
+        kw = {"Bucket": LAKE_BUCKET, "Prefix": extraction_pending.PENDING_PREFIX}
+        if token:
+            kw["ContinuationToken"] = token
+        page = s3().list_objects_v2(**kw)
+        for obj in page.get("Contents") or []:
+            scanned += 1
+            try:
+                m = json.loads(s3().get_object(Bucket=LAKE_BUCKET, Key=obj["Key"])["Body"]
+                               .read().decode("utf-8"))
+            except Exception:
+                logger.warning("pending: unreadable marker %s", obj["Key"], exc_info=True)
+                continue
+            if (not isinstance(m, dict) or m.get("promised_only")
+                    or m.get("userFolder") != folder or m.get("date") != date):
+                continue
+            out.append({"session_id": m.get("sessionBase"), "date": m.get("date"),
+                        "time_range": m.get("time_range"),
+                        "first_failed_at": m.get("first_failed_at"),
+                        "attempts": int(m.get("attempts") or 0),
+                        "expedited_at": m.get("expedite_requested_at")})
+            if len(out) >= PENDING_LIST_CAP or scanned >= PENDING_SCAN_CAP:
+                break
+        if not page.get("IsTruncated"):
+            break
+        token = page.get("NextContinuationToken")
+    out.sort(key=lambda r: r.get("first_failed_at") or "")
+    return ok({"sessions": out})
+
+
+def session_expedite(conn, caller, session_id):
+    """POST /api/org/sessions/{session_id}/expedite -- ask for the failed extraction to be
+    re-driven now. Only the recording's owner: a marker that is someone else's, absent or
+    `promised_only` all answer 404, so the route does not reveal which sessions exist.
+    Within 10 minutes of the last request: 429 with retry_after_s.
+
+    Concurrency: the marker write is conditional on the ETag just read (S3 If-Match), one
+    re-read on a lost race. If the SDK in the runtime predates If-Match the write is plain
+    last-writer-wins -- the backlog lambda can overwrite a field it read a moment earlier, which costs
+    at worst a repeated notice or a request that must be made again."""
+    base = _pending_base(session_id)
+    folder = (caller.get("folder_name") or "").strip()
+    if not base or not folder:
+        return error("not found", 404)
+    key = extraction_pending.marker_key(base)
+    now = datetime.now(timezone.utc)
+    for _ in range(2):
+        try:
+            obj = s3().get_object(Bucket=LAKE_BUCKET, Key=key)
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+                return error("not found", 404)
+            raise
+        etag = obj.get("ETag")
+        m = json.loads(obj["Body"].read().decode("utf-8"))
+        if m.get("promised_only") or m.get("userFolder") != folder:
+            return error("not found", 404)
+        last = extraction_pending.parse_iso(m.get("expedite_requested_at"))
+        if last and now - last < EXPEDITE_COOLDOWN:
+            wait = int((EXPEDITE_COOLDOWN - (now - last)).total_seconds())
+            return error("already expedited", 429, {"retry_after_s": max(wait, 1)})
+        stamp = extraction_pending.iso(now)
+        name = " ".join(p for p in (caller.get("first_name"), caller.get("last_name")) if p)
+        company = (companies.get_company_by_id(conn, caller["company_id"])
+                   if caller.get("company_id") else None) or {}
+        m.update(expedite=True, expedite_requested_at=stamp,
+                 expedite_by=caller.get("cognito_sub"),
+                 expedite_by_name=name or caller.get("email") or "",
+                 expedite_by_company=company.get("name") or "",
+                 next_attempt_at=stamp)
+        m.pop("expedite_notified_at", None)
+        body = json.dumps(m, ensure_ascii=False)
+        try:
+            kw = {"IfMatch": etag} if etag else {}
+            s3().put_object(Bucket=LAKE_BUCKET, Key=key, Body=body,
+                            ContentType="application/json", **kw)
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") in (
+                    "PreconditionFailed", "ConditionalRequestConflict"):
+                continue                      # someone else wrote it: re-read once
+            raise
+        except ParamValidationError:
+            # boto3 older than conditional writes: last-writer-wins.
+            s3().put_object(Bucket=LAKE_BUCKET, Key=key, Body=body,
+                            ContentType="application/json")
+        return ok({"ok": True, "expedited_at": stamp})
+    return error("marker changed while expediting, try again", 409)
 
 
 # Shape kept stable for a client reading a brief written before a field existed.

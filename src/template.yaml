@@ -381,6 +381,15 @@ Parameters:
     Description: Qwen model for structured-JSON tasks (report/meeting/extract/matcher)
     Default: qwen3.8-flash
 
+  LlmFallbackModels:
+    Type: String
+    Default: 'openai/gpt-6-luna-pro,xiaomi/mimo-v2.6-pro'
+    Description: >-
+      Comma list of OpenRouter models tried, in order, after QWEN_MODEL fails
+      with a 5xx, 429, timeout or empty answer. An empty value disables the
+      fallback. Read by llm_utils.fallback_models(); it has a Default, so the
+      deploy workflows do not pass it.
+
   QwenModelFast:
     Type: String
     Description: Qwen model for the latency-bound ask path
@@ -1424,6 +1433,9 @@ Globals:
       - x86_64
     Timeout: 300
     MemorySize: 256
+    Environment:
+      Variables:
+        LLM_FALLBACK_MODELS: !Ref LlmFallbackModels
 
 # ============================================================
 # Resources
@@ -1680,6 +1692,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           QWEN_ENABLE_THINKING: 'true'
@@ -1820,6 +1833,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           QWEN_ENABLE_THINKING: 'true'
@@ -1874,6 +1888,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           QWEN_ENABLE_THINKING: 'true'
@@ -2459,6 +2474,9 @@ Resources:
                     # worker has not written the result. Every poll before the
                     # document exists answered 500 instead of `pending`.
                     - session_report_results/*
+                    # GET /sessions/pending and POST /sessions/{id}/expedite: most sessions
+                    # have no marker, and that must read as 404/empty, not a 403 -> 500.
+                    - extraction_pending/*
             - Effect: Allow
               # Task 20 (content correction reindex chain): after a content
               # edit commits, org-api (in-VPC) writes the per-topic reindex
@@ -2517,6 +2535,14 @@ Resources:
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
+            # Spec 2026-10-07 D6: read the caller's extraction_pending markers and stamp the
+            # Expedite request on one. The marker is the whole interface; the backlog lambda
+            # (not in the VPC) does the notifying.
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/extraction_pending/*
             - Effect: Allow
               Action: s3:GetObject
               Resource:
@@ -2636,6 +2662,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           LLM_HTTP_TIMEOUT: '540'
@@ -2679,6 +2706,7 @@ Resources:
                 - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
                 # The close-driven final-pass request written by FinalizeSweepFunction.
                 - !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/extraction_pending/*
                 # Its own previous output — read to apply the re-extraction
                 # throttle and the tier/coverage supersede check BEFORE doing
                 # any expensive work.
@@ -2699,6 +2727,17 @@ Resources:
                 # dropped and the session keeps fast-tier topics forever — the
                 # exact silent-degradation shape a missing grant caused before.
                 - !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
+                # extraction_pending/{sessionBase}.json: a failed FINAL pass is recorded
+                # here for the backlog lambda to re-drive (spec D4). Not a trigger prefix.
+                - !Sub arn:aws:s3:::${IngestBucketName}/extraction_pending/*
+                # extraction_empty/{sessionBase}.json: a FINAL pass that found no usable
+                # speech. A success-empty record, which finalize reads to say "Nothing was
+                # captured" truthfully. Not a trigger prefix.
+                - !Sub arn:aws:s3:::${IngestBucketName}/extraction_empty/*
+            # Success deletes the marker (and nothing else this role may delete).
+            - Effect: Allow
+              Action: s3:DeleteObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/extraction_pending/*
             # pipeline_trace: what this step did with a recording (traces/, 180 days).
             - Effect: Allow
               Action: s3:PutObject
@@ -2720,6 +2759,10 @@ Resources:
                   s3:prefix:
                     - transcripts/*
                     - extractions/*
+                    # The marker is read before it is written, and on success deleted;
+                    # a first failure reads a key that does not exist, which is a 403
+                    # without ListBucket (the same trap as extractions/* above).
+                    - extraction_pending/*
                     # The agent-answer sidecars. ListBucket is not optional here: without it S3
                     # answers 403 for a key that simply does not exist, which the reader cannot
                     # tell from a real denial -- and a reader that silently sees "no sidecar"
@@ -2772,6 +2815,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           # Thinking OFF — the mid-meeting summary should be fast; summarisation
@@ -3239,6 +3283,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           # Applies to the rolling summariser only. session_brief passes
@@ -3325,6 +3370,36 @@ Resources:
                     # `_read_brief` would log it as a loud permissions failure on
                     # every single poll of every single session.
                     - session_brief/*
+                    # The extraction_pending marker: a missing one is the ORDINARY case
+                    # (extraction did not fail), and without ListBucket S3 answers 403
+                    # for it -- which the reader would have to treat as "unknown".
+                    - extraction_pending/*
+                    # The no-speech record: absent is the ordinary case for every
+                    # recording that had speech, and without ListBucket that is a 403.
+                    - extraction_empty/*
+                    # The race re-check reads the session's final extraction; absent is
+                    # the ordinary case, and without ListBucket that is a 403.
+                    - extractions/*
+            - Effect: Allow
+              # Read the marker to tell "extraction failed" from "nothing was said",
+              # and write error_email_sent_at back into it (spec D5). Delete: a
+              # promised_only marker whose final already cleared is tidied away.
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/extraction_pending/*
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/extraction_empty/*
+            - Effect: Allow
+              # Race re-check (D5): a final extraction that landed just before the
+              # error email was stamped gets `recovered_after_error` set and is put
+              # back, which re-fires item-writer's follow-up under its write-once key.
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/extractions/*
             - Effect: Allow
               Action:
                 - ses:SendEmail
@@ -4059,6 +4134,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
       Policies:
@@ -5429,7 +5505,15 @@ Resources:
           # would never trip -- the exact "checker stopped" case this exists
           # to catch, defeated by a missing dimension.
           BACKLOG_METRIC_STAGE: !Ref Stage
+          # D6: where "a customer asked to expedite" goes. Absent when the stack creates
+          # no alert topic; the code then skips the notice.
+          ALERT_TOPIC_ARN: !If [ShouldCreateAlerts, !Ref AlertTopic, !Ref "AWS::NoValue"]
       Policies:
+        - !If
+          - ShouldCreateAlerts
+          - SNSPublishMessagePolicy:
+              TopicName: !GetAtt AlertTopic.TopicName
+          - !Ref "AWS::NoValue"
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
@@ -5441,9 +5525,23 @@ Resources:
                     - extraction_requests/*
                     - extractions/*
                     - transcripts/*
+                    - extraction_pending/*
             - Effect: Allow
               Action: s3:GetObject
-              Resource: !Sub arn:aws:s3:::${DataBucketName}/extraction_requests/*
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/extraction_requests/*
+                - !Sub arn:aws:s3:::${DataBucketName}/extraction_pending/*
+            # The re-drive (spec D4): re-put the original request, which fires the
+            # extract-session notification, and reschedule the marker.
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/extraction_requests/*
+                - !Sub arn:aws:s3:::${DataBucketName}/extraction_pending/*
+            # An expired promised_only marker is deleted (spec: 24 h TTL, logged at ERROR).
+            - Effect: Allow
+              Action: s3:DeleteObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/extraction_pending/*
             # PutMetricData takes no resource ARN. Scoped by namespace instead,
             # so this role cannot overwrite any other namespace's series.
             - Effect: Allow
@@ -5458,6 +5556,16 @@ Resources:
           Properties:
             Schedule: rate(1 hour)
             Description: Sessions transcribed but never extracted.
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
+        # The re-drive needs to run on the backoff's 5-minute grain; the full scan
+        # above does not (it lists three prefixes), so this event asks for the re-drive
+        # alone.
+        PendingRedrive:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Input: '{"task": "redrive"}'
+            Description: Re-drive final extractions that failed on every model.
             State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
 
   ExtractionBacklogAlarm:
@@ -5491,6 +5599,33 @@ Resources:
       # that is always red is an alarm nobody reads -- the exact failure this
       # whole probe was written to avoid, reintroduced by its own alarm.
       TreatMissingData: !If [ShouldEnableSchedules, breaching, notBreaching]
+      AlarmActions:
+        - !Ref AlertTopic
+
+  ExtractionPendingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldCreateAlerts
+    Properties:
+      AlarmName: !Sub ["${P}-extraction-pending", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      AlarmDescription: >-
+        A recording's final extraction has been failing on every model for over
+        30 minutes. It is being re-driven (5, 15, 30, 60 min, then hourly,
+        forever) and the recorder has been told it is delayed; this is the
+        page to a human to look at the model vendor.
+      Namespace: FieldSight/Pipeline
+      MetricName: ExtractionPending
+      Dimensions:
+        - Name: Stage
+          Value: !Ref Stage
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # notBreaching, unlike ExtractionBacklogAlarm: this metric is an EMF line the
+      # re-drive emits on every run, so a stopped re-driver is already caught by the
+      # backlog alarm's own `breaching` on its hourly run. Here silence must not page.
+      TreatMissingData: notBreaching
       AlarmActions:
         - !Ref AlertTopic
 
