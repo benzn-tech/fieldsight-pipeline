@@ -2038,10 +2038,7 @@ Resources:
           ASK_CONVERSATION_MEMORY: !Ref AskConversationMemory
           ASK_REWRITE_BUDGET: !Ref AskRewriteBudget
           ASK_DISTANCE_GATE: !Ref AskDistanceGate
-          S3_BUCKET: !Ref DataBucketName
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
-          HAIKU_MODEL: claude-haiku-4-5-20251001
-          REPORT_PREFIX: reports/
           RAG_SEARCH_FUNCTION: !Ref RagSearchFunction
           DASHSCOPE_API_KEY: !Ref DashScopeApiKey
           # Voice STT provider and its OWN key. Both belong here: a provider
@@ -2099,8 +2096,6 @@ Resources:
       Layers:
         - !Ref DashScopeLayer
       Policies:
-        - S3ReadPolicy:
-            BucketName: !Ref DataBucketName
         - LambdaInvokePolicy:
             FunctionName: !Ref RagSearchFunction
         - LambdaInvokePolicy:
@@ -4708,7 +4703,7 @@ Resources:
       StageName: prod
       # Access logging (2026-07-23). Until now this stage had
       # accessLogSettings=null and the Lambda logged only "METHOD /path"
-      # (lambda_fieldsight_api.py:1063) with no caller, so an ACL incident
+      # (lambda_fieldsight_api.py) with no caller, so an ACL incident
       # could not be attributed after the fact — exactly the gap hit when
       # investigating the get_report_history leak. The format below records
       # the Cognito subject, the resource path and the query string so a
@@ -4767,12 +4762,6 @@ Resources:
       Environment:
         Variables:
           S3_BUCKET: !Ref DataBucketName
-          REPORT_PREFIX: reports/
-          ITEMS_TABLE: !Ref ItemsTableName
-          REPORTS_TABLE: !Ref ReportsTableName
-          AUDIT_TABLE: !Ref AuditTableName
-          USERS_TABLE: !Ref UsersTableName
-          REPORT_FUNCTION: !Ref ReportGeneratorFunction
           ASK_AGENT_FUNCTION: !Ref AskAgentFunction
           # How long this function waits for the Ask Agent. Below its own
           # Timeout (above) so the invoke fails here, in code that can name
@@ -4781,21 +4770,9 @@ Resources:
           # correctly. Literal, not a Parameter -- see AskAgentFunction's
           # ASK_DEADLINE_SECONDS for why.
           ASK_INVOKE_TIMEOUT: '26'
+      # Retired data routes answer 410 without touching storage; what remains
+      # is the proxy into the Ask Agent, so that is the only grant.
       Policies:
-        - S3ReadPolicy:
-            BucketName: !Ref DataBucketName
-        - S3WritePolicy:
-            BucketName: !Ref DataBucketName
-        - DynamoDBCrudPolicy:
-            TableName: !Ref ItemsTableName
-        - DynamoDBCrudPolicy:
-            TableName: !Ref ReportsTableName
-        - DynamoDBCrudPolicy:
-            TableName: !Ref AuditTableName
-        - DynamoDBCrudPolicy:
-            TableName: !Ref UsersTableName
-        - LambdaInvokePolicy:
-            FunctionName: !Ref ReportGeneratorFunction
         - LambdaInvokePolicy:
             FunctionName: !Ref AskAgentFunction
       Events:
