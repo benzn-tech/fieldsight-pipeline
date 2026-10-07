@@ -70,8 +70,8 @@ MISSING_KEY_IS_NORMAL = [
     # and inert (at the time, on SessionReportFunction too -- see below).
     #
     # Swept against the live prod roles on 2026-08-31 rather than read off this file.
-    ("AskAgentFunction", "redactions/*",
-     "_deleted_sessions gates the stored report and the RAG chunks"),
+    # AskAgentFunction left this list 2026-10: its S3 reader (_deleted_sessions)
+    # was removed with the company-blind path; RAG chunks are filtered in SQL.
     ("ReportGeneratorFunction", "redactions/*",
      "the nightly rebuild must not re-ingest a removed session"),
     ("SessionFinalizeFunction", "redactions/*",
