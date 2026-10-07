@@ -96,6 +96,8 @@ REPORT_PREFIX = os.environ.get('REPORT_PREFIX', 'reports/')  # compat output pat
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 CLAUDE_MODEL = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-4-6')
 
+import report_style
+
 # Check python-docx availability once at import time
 DOCX_AVAILABLE = False
 try:
@@ -778,7 +780,7 @@ def _set_cell_text(cell, text):
     _add_rich_text(cell.paragraphs[0], text)
 
 
-def _add_markdown_table(doc, rows, row_photos=None):
+def _add_markdown_table(doc, rows, row_photos=None, facts=False):
     """Render the pipe rows the model was asked for as an actual table.
 
     A section whose `kind` is "table" now tells the model to write a markdown
@@ -834,6 +836,8 @@ def _add_markdown_table(doc, rows, row_photos=None):
     _add_photo_strip(doc, photos[0])
     for run in table.rows[0].cells[0].paragraphs[0].runs or []:
         run.bold = True
+    if facts:
+        report_style.style_table(table, facts=True)
 
 
 def _add_prose_section(doc, section):
@@ -862,7 +866,8 @@ def _add_prose_section(doc, section):
             # Each row's photographs go in that row's Photos cell (see
             # _add_markdown_table), not in a heap under the table.
             _add_markdown_table(doc, [r.strip() for r in paragraphs[i:i + n]],
-                                [after.get(k) for k in range(i, i + n)])
+                                [after.get(k) for k in range(i, i + n)],
+                                facts=bool(section.get("facts")))
             i += n
             continue
         if text.startswith("- ") or text.startswith("* "):
@@ -893,7 +898,8 @@ def _add_actions_table(doc, actions):
         row[2].text = (a.get("deadline") or "").strip() or "no date"
 
 
-def generate_prose_document(title, subtitle, sections, actions, closing=None):
+def generate_prose_document(title, subtitle, sections, actions, closing=None,
+                            header_left=None):
     """A record whose headings come from its template, not from this function.
 
     `generate_word_document` below renders the fixed meeting-minutes layout and is
@@ -905,10 +911,9 @@ def generate_prose_document(title, subtitle, sections, actions, closing=None):
         return None
 
     doc = Document()
-    doc.add_heading(title, level=0)
-    if subtitle:
-        p = doc.add_paragraph(subtitle)
-        p.runs[0].italic = True
+    # THE HOUSE STYLE (report_style), the same on every report we write.
+    report_style.setup(doc, title, header_left=header_left)
+    report_style.title_block(doc, title, subtitle)
 
     # THE ACTIONS ARE WRITTEN ONCE, BY US, WHERE THE PLAN PUT THEM. They are
     # data on record, so the table comes from that record. It used to be added
@@ -934,6 +939,7 @@ def generate_prose_document(title, subtitle, sections, actions, closing=None):
 
     if closing:
         _add_prose_section(doc, closing)
+    report_style.style_all(doc)
 
     buf = BytesIO()
     doc.save(buf)
@@ -947,13 +953,8 @@ def generate_word_document(minutes_data, title):
         return None
 
     doc = Document()
-    style = doc.styles['Normal']
-    style.font.name = 'Calibri'
-    style.font.size = Pt(10)
-
-    # Title
-    heading = doc.add_heading(title, 0)
-    heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    report_style.setup(doc, title)
+    report_style.title_block(doc, title, minutes_data.get('meeting_date') or None)
 
     # Meeting info
     meeting_date = minutes_data.get('meeting_date', '')
@@ -1107,6 +1108,7 @@ def generate_word_document(minutes_data, title):
         )
         run.font.size = Pt(7)
         run.font.color.rgb = RGBColor(150, 150, 150)
+    report_style.style_all(doc)
 
     buffer = BytesIO()
     doc.save(buffer)

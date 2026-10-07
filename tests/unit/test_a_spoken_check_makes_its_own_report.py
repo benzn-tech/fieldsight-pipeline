@@ -53,7 +53,7 @@ def test_THE_a_matched_check_is_sent_to_the_worker_once_as_the_recorder(wired):
     assert body["templateId"] == "t-1" and body["templateVersion"] == 3
     assert (body["from"], body["to"], body["segments"]) == ("11:02:03", "11:03:21", SEGS)
     assert body["deliver"] == "download"
-    assert body["title"].startswith("Concrete Pre-pour Inspection Checklist -- level 2 pre-pour")
+    assert body["title"] == "Concrete Pre-pour Inspection Checklist"
     assert wired["recorded"][0][3:] == ("r1", "session_report_results/Ben_Lin_test2/2026-10-06/day/r1.json")
     # re-extracted: the same check is not made again
     assert cr.auto_generate(None, "c-1", "Ben_Lin_test2", "2026-10-06", "sidA", WINDOWS,
