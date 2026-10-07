@@ -1050,6 +1050,12 @@ def _web_answer_enabled():
     return web_answer.enabled()
 
 
+def _ask_budget_left(started):
+    """Seconds of the Ask budget still unspent, floored at 1s so the client
+    reports "deadline exceeded" rather than being handed a zero or negative."""
+    return max(1.0, ASK_DEADLINE_SECONDS - (time.monotonic() - started))
+
+
 def _classify_for_route(web_answer, asked, chunks, gated, started, route):
     """The classification that decides the route. Never raises.
 
@@ -2013,6 +2019,10 @@ def _rag_answer(body):
             answer, err = _grounded
         else:
             _t_synthesis = time.monotonic()
+            # What is left of the Ask budget. With a model chain behind call_llm
+            # a hung primary must not leave luna a request that cannot finish:
+            # given a deadline, no attempt starts that cannot fit inside it.
+            _ask_left = _ask_budget_left(_started)
             # caller="ask_answer" on both branches below -- voice-model and
             # screen-model are the same logical call (the RAG synthesis) reached
             # by two different models, not two different call SHAPES. The retry a
@@ -2021,10 +2031,12 @@ def _rag_answer(body):
             if voice and voice_model:
                 answer, err = llm_utils.call_llm(
                     prompt, max_tokens=MAX_ANSWER_TOKENS, force_json=False,
-                    enable_thinking=False, model=voice_model, caller="ask_answer")
+                    enable_thinking=False, model=voice_model, caller="ask_answer",
+                    deadline=_ask_left)
             else:
                 answer, err = llm_utils.call_llm(prompt, max_tokens=MAX_ANSWER_TOKENS,
-                                                 force_json=False, caller="ask_answer")
+                                                 force_json=False, caller="ask_answer",
+                                                 deadline=_ask_left)
             # The primary synthesis call only -- the language-leak retry a few
             # lines below is a distinct, rare cost and would otherwise inflate
             # this stage's usual number for the one turn in ~13 that needs it.
@@ -2064,7 +2076,8 @@ def _rag_answer(body):
                                             today=today, basis=basis,
                                             insist_language=True, pinned_topic=pinned_topic)
             retried, retry_err = llm_utils.call_llm(retry_prompt, max_tokens=MAX_ANSWER_TOKENS,
-                                                    force_json=False, caller="ask_answer_retry")
+                                                    force_json=False, caller="ask_answer_retry",
+                                                    deadline=_ask_budget_left(_started))
             if not retry_err and retried and not answer_language.violates(retried):
                 logger.info("  Ask answer language recovered on retry")
                 answer = retried

@@ -146,6 +146,31 @@ PROVIDER_ERROR_WAIT_SECONDS = float(os.environ.get("LLM_PROVIDER_ERROR_WAIT", "2
 # not 180s like extract_session/matcher/ask-agent.
 HTTP_TIMEOUT = float(os.environ.get("LLM_HTTP_TIMEOUT", "150"))
 
+# The models tried, in order, when the deploy's model cannot answer (OpenRouter
+# path only). Read per call, not at import, so a test or an emergency env edit
+# takes effect without a reload. Unset means this default; an explicitly EMPTY
+# value means "no fallback" -- the two are different and os.environ.get keeps
+# them apart. Measured 2026-10-07 (docs/superpowers/specs/2026-10-07-model-
+# fallback-and-recovery-design.md): luna 4/4 parsed; mimo 2/2 parsed with
+# reasoning off, 0/4 with it on; qwen3.8-flash 0/4, so it is not on the list.
+DEFAULT_FALLBACK_MODELS = "openai/gpt-6-luna-pro,xiaomi/mimo-v2.6-pro"
+
+
+def fallback_models():
+    raw = os.environ.get("LLM_FALLBACK_MODELS")
+    if raw is None:
+        raw = DEFAULT_FALLBACK_MODELS
+    return [m.strip() for m in raw.split(",") if m.strip()]
+
+
+def model_chain(primary):
+    """primary, then each fallback once, never the primary again."""
+    chain = [primary]
+    for m in fallback_models():
+        if m not in chain:
+            chain.append(m)
+    return chain
+
 
 def qwen_model_for(thinking):
     """Which qwen model a call in this mode actually reaches.
@@ -288,7 +313,8 @@ def _may_sleep(remaining, attempt, base=None):
     return True
 
 
-def _post_with_retry(url, body, headers, deadline=None, clock=time.monotonic):
+def _post_with_retry(url, body, headers, deadline=None, clock=None,
+                     attempts=None, timeout_cap=None):
     """Single POST with exponential backoff on 429/5xx. Returns (resp, error).
 
     `deadline` is SECONDS FROM NOW, and it is opt-in. Eight of this module's
@@ -314,14 +340,22 @@ def _post_with_retry(url, body, headers, deadline=None, clock=time.monotonic):
       DOWNWARD. HTTP_TIMEOUT exists to lose the race against the Lambda's own
       timeout, so a generous deadline must not be allowed to extend it.
     """
+    if clock is None:
+        clock = time.monotonic  # resolved per call so a test can substitute it
     http = urllib3.PoolManager()
     last_error = None
     started = clock()
+    # A non-last model in the fallback chain gets a shorter per-request cap so
+    # a hung model cannot eat the time the next one needs.
+    per_try = HTTP_TIMEOUT if timeout_cap is None else min(HTTP_TIMEOUT, timeout_cap)
+    # `attempts` lets a caller that has somewhere else to go (the model fallback
+    # chain) spend one attempt here instead of the whole ladder.
+    max_attempts = MAX_ATTEMPTS if attempts is None else attempts
 
     def left():
         return None if deadline is None else deadline - (clock() - started)
 
-    for attempt in range(MAX_ATTEMPTS):
+    for attempt in range(max_attempts):
         remaining = left()
         if remaining is not None:
             if remaining < MIN_USEFUL_SECONDS:
@@ -330,27 +364,27 @@ def _post_with_retry(url, body, headers, deadline=None, clock=time.monotonic):
                 # wrong one sends the reader at the vendor.
                 return None, (last_error + "; deadline exceeded" if last_error
                               else "deadline exceeded")
-            timeout = min(HTTP_TIMEOUT, remaining)
+            timeout = min(per_try, remaining)
         else:
-            timeout = HTTP_TIMEOUT
+            timeout = per_try
         try:
             resp = http.request(
                 "POST", url, body=body, headers=headers, timeout=timeout
             )
         except Exception as e:  # noqa: BLE001 - network errors are retryable
             last_error = str(e)
-            if attempt < MAX_ATTEMPTS - 1 and _may_sleep(left(), attempt):
+            if attempt < max_attempts - 1 and _may_sleep(left(), attempt):
                 continue
             return None, _why_stopped(last_error, left())
-        if resp.status in RETRYABLE_STATUSES and attempt < MAX_ATTEMPTS - 1:
+        if resp.status in RETRYABLE_STATUSES and attempt < max_attempts - 1:
             last_error = f"HTTP {resp.status}"
             if _may_sleep(left(), attempt):
                 continue
             return None, _why_stopped(last_error, left())
-        if resp.status == 404 and attempt < MAX_ATTEMPTS - 1 and _provider_error(resp):
+        if resp.status == 404 and attempt < max_attempts - 1 and _provider_error(resp):
             last_error = "HTTP 404 (Provider returned error)"
             logger.warning("LLM vendor returned 404 Provider returned error -- retrying "
-                           "(attempt %d of %d)", attempt + 1, MAX_ATTEMPTS)
+                           "(attempt %d of %d)", attempt + 1, max_attempts)
             if _may_sleep(left(), attempt, base=PROVIDER_ERROR_WAIT_SECONDS):
                 continue
             return None, _why_stopped(last_error, left())
@@ -435,6 +469,94 @@ def _is_dashscope(base_url):
     return "aliyuncs.com" in (base_url or "")
 
 
+def _is_mimo(model):
+    return (model or "").startswith("xiaomi/mimo")
+
+
+def _openrouter_fields(payload, max_tokens, force_json, enable_thinking, thinking):
+    """The reasoning / max_tokens / response_format part of an OpenRouter request.
+
+    The reasoning parameter belongs to the MODEL, not to the caller, so the
+    model decides the profile (prefix match). Anything unknown gets today's
+    payload, byte for byte.
+    """
+    if _is_mimo(payload["model"]):
+        # Measured 2026-10-07: with thinking ON, `reasoning.max_tokens` is
+        # ignored (MiMo has no thinking budget) and reasoning ate the whole
+        # completion budget -- 0/4 parsed. With it off, 2/2 parsed. Nothing is
+        # spent thinking, so no headroom: the caller's number is the answer's.
+        payload["reasoning"] = {"enabled": False}
+        payload["max_tokens"] = max_tokens
+        if force_json:
+            payload["response_format"] = {"type": "json_object"}
+        return
+    # OpenAI-compatible vendors (OpenRouter today). Reasoning is expressed
+    # with `reasoning`; `enable_thinking` must never be sent.
+    #
+    # The DashScope branch below also DROPS max_tokens and skips
+    # response_format whenever thinking is on. That coupling is a DashScope
+    # workaround -- thinking + json_object there risks non-strict JSON --
+    # and it is deliberately NOT ported: an unbounded completion on a
+    # per-token vendor is a cost incident waiting to happen, and structured
+    # outputs are supported here.
+    # `effort` when the deploy states one, the boolean otherwise. A value this
+    # vendor does not know would be worse than saying nothing, so anything
+    # outside the known set falls back rather than travelling.
+    #
+    # A caller that passed enable_thinking=False asked for the FAST path for
+    # THIS call, and that beats the deploy-wide effort. It has to: one Lambda
+    # can need both modes, which is the entire reason the parameter exists.
+    # lambda_extract_session runs a live pass on every 30-second chunk and a
+    # thinking pass when the session closes -- one env value cannot serve both,
+    # and until this branch existed the env silently won. Measured on the
+    # deployed live pass with LLM_REASONING_EFFORT=high: 119.1s and 8,753
+    # reasoning tokens, on a path throttled to run every 90s. The "fast" pass
+    # had become slower than its own trigger interval (BUG-43's shape) while
+    # its log line still read thinking=False.
+    #
+    # enable_thinking=True does NOT override: the caller is saying THINK, and
+    # how hard is the deploy's call, so the env effort still names the level.
+    if enable_thinking is False:
+        payload["reasoning"] = {"effort": "low"}
+    elif LLM_REASONING_EFFORT in VALID_EFFORTS:
+        payload["reasoning"] = {"effort": LLM_REASONING_EFFORT}
+    else:
+        if LLM_REASONING_EFFORT:
+            logger.warning("ignoring unknown LLM_REASONING_EFFORT=%r (want one of %s)",
+                           LLM_REASONING_EFFORT, ", ".join(VALID_EFFORTS))
+        # The boolean mapped onto the vendor's vocabulary, NOT
+        # `{"enabled": False}`. Measured against
+        # meta/muse-spark-1.3-contributor: that field is a hard 400 --
+        # "Reasoning is mandatory for this endpoint and cannot be disabled"
+        # -- so a deploy that merely forgot to set an effort would fail
+        # every call rather than fall back. `low` is the closest thing the
+        # endpoint offers to off, and it is measurably cheaper and faster
+        # than the default (516 reasoning tokens / 6.8s vs 606 / 8.0s on the
+        # same prompt).
+        payload["reasoning"] = {"effort": "high" if thinking else "low"}
+    # Reasoning tokens are COMPLETION tokens: they come out of max_tokens
+    # before the answer does. A caller asking for 4096 "for the answer" gets
+    # an empty answer if the model spends 4096 thinking -- measured, at
+    # max_tokens=1200 this model produced 1197 reasoning tokens and
+    # content=''. So the caller's number stays the ANSWER budget and the
+    # thinking budget is added on top.
+    payload["max_tokens"] = max_tokens + REASONING_HEADROOM_TOKENS
+    if force_json:
+        payload["response_format"] = {"type": "json_object"}
+
+
+def _chain_budget():
+    """Seconds the whole model chain may spend, from LLM_CHAIN_BUDGET_SECONDS
+    (template.yaml sets it to each function's Lambda Timeout minus 60). Unset,
+    empty or unparseable means no chain cap -- today's behaviour. Read per call."""
+    raw = os.environ.get("LLM_CHAIN_BUDGET_SECONDS", "").strip()
+    try:
+        v = float(raw) if raw else None
+    except ValueError:
+        return None
+    return v if v and v > 0 else None
+
+
 def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
                deadline=None, caller="unknown"):
     if not QWEN_API_KEY:
@@ -453,59 +575,7 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
         payload["temperature"] = LLM_TEMPERATURE
 
     if not _is_dashscope(QWEN_BASE_URL):
-        # OpenAI-compatible vendors (OpenRouter today). Reasoning is expressed
-        # with `reasoning`; `enable_thinking` must never be sent.
-        #
-        # The DashScope branch below also DROPS max_tokens and skips
-        # response_format whenever thinking is on. That coupling is a DashScope
-        # workaround -- thinking + json_object there risks non-strict JSON --
-        # and it is deliberately NOT ported: an unbounded completion on a
-        # per-token vendor is a cost incident waiting to happen, and structured
-        # outputs are supported here.
-        # `effort` when the deploy states one, the boolean otherwise. A value this
-        # vendor does not know would be worse than saying nothing, so anything
-        # outside the known set falls back rather than travelling.
-        #
-        # A caller that passed enable_thinking=False asked for the FAST path for
-        # THIS call, and that beats the deploy-wide effort. It has to: one Lambda
-        # can need both modes, which is the entire reason the parameter exists.
-        # lambda_extract_session runs a live pass on every 30-second chunk and a
-        # thinking pass when the session closes -- one env value cannot serve both,
-        # and until this branch existed the env silently won. Measured on the
-        # deployed live pass with LLM_REASONING_EFFORT=high: 119.1s and 8,753
-        # reasoning tokens, on a path throttled to run every 90s. The "fast" pass
-        # had become slower than its own trigger interval (BUG-43's shape) while
-        # its log line still read thinking=False.
-        #
-        # enable_thinking=True does NOT override: the caller is saying THINK, and
-        # how hard is the deploy's call, so the env effort still names the level.
-        if enable_thinking is False:
-            payload["reasoning"] = {"effort": "low"}
-        elif LLM_REASONING_EFFORT in VALID_EFFORTS:
-            payload["reasoning"] = {"effort": LLM_REASONING_EFFORT}
-        else:
-            if LLM_REASONING_EFFORT:
-                logger.warning("ignoring unknown LLM_REASONING_EFFORT=%r (want one of %s)",
-                               LLM_REASONING_EFFORT, ", ".join(VALID_EFFORTS))
-            # The boolean mapped onto the vendor's vocabulary, NOT
-            # `{"enabled": False}`. Measured against
-            # meta/muse-spark-1.3-contributor: that field is a hard 400 --
-            # "Reasoning is mandatory for this endpoint and cannot be disabled"
-            # -- so a deploy that merely forgot to set an effort would fail
-            # every call rather than fall back. `low` is the closest thing the
-            # endpoint offers to off, and it is measurably cheaper and faster
-            # than the default (516 reasoning tokens / 6.8s vs 606 / 8.0s on the
-            # same prompt).
-            payload["reasoning"] = {"effort": "high" if thinking else "low"}
-        # Reasoning tokens are COMPLETION tokens: they come out of max_tokens
-        # before the answer does. A caller asking for 4096 "for the answer" gets
-        # an empty answer if the model spends 4096 thinking -- measured, at
-        # max_tokens=1200 this model produced 1197 reasoning tokens and
-        # content=''. So the caller's number stays the ANSWER budget and the
-        # thinking budget is added on top.
-        payload["max_tokens"] = max_tokens + REASONING_HEADROOM_TOKENS
-        if force_json:
-            payload["response_format"] = {"type": "json_object"}
+        _openrouter_fields(payload, max_tokens, force_json, enable_thinking, thinking)
     elif thinking:
         # Thinking mode: highest quality for batch tasks. Do NOT force
         # response_format even when force_json (thinking + json_object risks
@@ -526,6 +596,83 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
         else:
             payload["max_tokens"] = max_tokens
 
+    chain = [payload["model"]]
+    if not _is_dashscope(QWEN_BASE_URL):
+        chain = model_chain(payload["model"])
+    if len(chain) == 1:
+        # No fallback configured (or DashScope): exactly the old single call.
+        cb = _chain_budget()
+        if cb is not None:
+            deadline = cb if deadline is None else min(deadline, cb)
+        text, err, _ = _qwen_attempt(payload, thinking, deadline, caller)
+        return text, err
+
+    started = time.monotonic()
+    budget_total = _chain_budget()
+    failures = []  # "<model> <why>" per model, primary first
+
+    def remaining_total():
+        """Seconds the whole chain may still spend: the tighter of the caller's
+        deadline and the chain budget, or None when neither is set."""
+        left = [x - (time.monotonic() - started)
+                for x in (deadline, budget_total) if x is not None]
+        return min(left) if left else None
+
+    for i, name in enumerate(chain):
+        last = i == len(chain) - 1
+        remaining = remaining_total()
+        if i > 0 and remaining is not None and remaining < MIN_USEFUL_SECONDS:
+            logger.warning("LLM_FALLBACK skipped: time exhausted before %s", name)
+            failures.append(f"{name} skipped (time budget exhausted)")
+            break
+        if i == 0:
+            p = payload
+        else:
+            p = {"model": name, "messages": payload["messages"]}
+            if LLM_TEMPERATURE is not None:
+                p["temperature"] = LLM_TEMPERATURE
+            _openrouter_fields(p, max_tokens, force_json, enable_thinking, thinking)
+        # How hard each model is tried, when something bounds the call (the chain budget
+        # or the caller's deadline; with neither, the primary keeps today's full ladder
+        # and timeout, and later models get one attempt each):
+        #   primary  up to 2 attempts (a 429/5xx/timeout blip is absorbed here, so a
+        #            healthy day does not spill into luna), each at most 0.6 x the time
+        #            the chain has -- a hung primary still leaves the others a share, and
+        #            the function's own LLM_HTTP_TIMEOUT stays the ceiling;
+        #   middle   one attempt, at most 0.6 x what is left;
+        #   last     the full ladder, bounded only by what is left.
+        attempts, cap = None, None
+        if not last:
+            attempts = 2 if (i == 0 and remaining is not None) else (None if i == 0 else 1)
+            if remaining is not None:
+                cap = 0.6 * remaining
+        # The 0.6 share is also this model's whole-ladder deadline: a primary that hangs
+        # on attempt 1 must not be retried into the time luna and mimo need.
+        text, err, movable = _qwen_attempt(p, thinking, cap if cap is not None else remaining,
+                                           caller, attempts=attempts, timeout_cap=cap)
+        if err is None:
+            return text, None
+        failures.append(f"{name} {str(err)[:120]}")
+        if i == 0 and not movable:
+            # Our request is wrong, not the vendor's: surface it unchanged.
+            return None, err
+        if not movable or last:
+            break
+        logger.info("LLM_FALLBACK %s", json.dumps(
+            {"caller": caller, "from": name, "to": chain[i + 1],
+             "reason": str(err)[:200]}))
+    return None, "all models failed: " + "; ".join(failures)
+
+
+def _status_movable(status):
+    """5xx, 429 and 408 (OpenRouter's upstream timeout) are the vendor's."""
+    return status >= 500 or status in (429, 408)
+
+
+def _qwen_attempt(payload, thinking, deadline, caller, attempts=None,
+                  timeout_cap=None):
+    """One model, one request ladder. Returns (text, error, movable): `movable`
+    says the failure is the model's, so the next model in the chain may try."""
     # One line per call, on the way OUT, naming what actually goes on the wire.
     #
     # Which model served a call was unanswerable from anywhere: the env says
@@ -544,6 +691,10 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
                 "response_format" in payload)
     started = time.monotonic()
     _bound = {"deadline": deadline} if deadline is not None else {}
+    if attempts is not None:
+        _bound["attempts"] = attempts
+    if timeout_cap is not None:
+        _bound["timeout_cap"] = timeout_cap
     resp, err = _post_with_retry(
         f"{QWEN_BASE_URL}/chat/completions",
         json.dumps(payload),
@@ -553,15 +704,32 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
     elapsed = time.monotonic() - started
     if resp is None:
         logger.error(f"Qwen API call failed: {err}")
-        return None, err
-    data = json.loads(resp.data.decode("utf-8"))
+        return None, err, True
+    # Status BEFORE body: a gateway's 502/503/504 is an HTML page, and parsing
+    # it first raised out of call_llm and skipped every later model.
+    try:
+        data = json.loads(resp.data.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("body is not an object")
+    except (ValueError, UnicodeDecodeError):
+        logger.error("Qwen API returned an unparseable body: status=%s body=%.200r",
+                     resp.status, resp.data)
+        if resp.status == 200:
+            return None, "HTTP 200 with an unparseable body", True
+        return None, f"HTTP {resp.status}", _status_movable(resp.status) or _provider_error(resp)
     if resp.status == 200:
         try:
             choice = data["choices"][0]
             content = choice["message"]["content"]
-        except (KeyError, IndexError):
+        except (KeyError, IndexError, TypeError):
             logger.error(f"Qwen unexpected response shape: {str(data)[:500]}")
-            return None, "unexpected Qwen response shape"
+            # OpenRouter answers 200 with {"error": {...}} and no choices when
+            # the upstream provider fails mid-request: the vendor's failure.
+            e = data.get("error")
+            if isinstance(e, dict):
+                e = e.get("message")
+            return None, (f"HTTP 200 with error: {str(e)[:100]}" if e
+                          else "unexpected Qwen response shape"), True
         usage = data.get("usage") or {}
         detail = usage.get("completion_tokens_details") or {}
         # HTTP 200 WITH NO ANSWER IS A FAILURE, and on a reasoning model it is
@@ -585,7 +753,7 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
                 reason, usage.get("completion_tokens"),
                 detail.get("reasoning_tokens"), payload.get("max_tokens"),
                 data.get("model"))
-            return None, f"empty answer from model (finish_reason={reason})"
+            return None, f"empty answer from model (finish_reason={reason})", True
         # Throughput is a deploy decision -- muse, gemini and qwen differ by
         # multiples on the same prompt -- and it was not answerable from any
         # log: duration lived in the Lambda REPORT line, which counts S3 and
@@ -618,8 +786,8 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
             )
         except Exception:  # noqa: BLE001 - telemetry must never break the call
             logger.warning("LLM_USAGE logging failed (qwen)", exc_info=True)
-        return content, None
-    err_obj = data.get("error") or {}
+        return content, None, False
+    err_obj = data.get("error") if isinstance(data.get("error"), dict) else {}
     msg = err_obj.get("message", f"HTTP {resp.status}")
     # The CODE, not just the message. These read almost identically in a log
     # line -- "Requests rate limit exceeded" vs "Free allocated quota
@@ -631,7 +799,12 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
     code = err_obj.get("code")
     logger.error("Qwen API error: status=%s code=%s message=%s",
                  resp.status, code or "-", msg)
-    return None, msg
+    # What may move on to the next model: the model or its vendor is down or
+    # saturated (5xx, 429, OpenRouter's "Provider returned error" 404). Any
+    # other 4xx is OUR request being wrong and must surface, not be hidden by a
+    # second model that happens to accept it.
+    movable = _status_movable(resp.status) or _provider_error(resp)
+    return None, msg, movable
 
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
