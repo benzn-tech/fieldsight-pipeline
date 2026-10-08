@@ -40,9 +40,6 @@ Environment Variables:
                   S3_BUCKET to the same value, so reusing lambda_ingest's
                   _load_turns "just works" without any cross-module state
                   syncing)
-    CONFIG_KEY  - config/user_mapping.json (unused here -- kept only for env
-                  footprint parity with lambda_ingest; no identity bridge
-                  runs in this lambda)
     DASHSCOPE_*  - see dashscope_utils.py
 """
 import hashlib
@@ -64,7 +61,6 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
-CONFIG_KEY = os.environ.get("CONFIG_KEY", "config/user_mapping.json")
 
 REPORT_KEY_RE = re.compile(r"^reports/([^/]+)/([^/]+)/daily_report\.json$")
 

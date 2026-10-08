@@ -24,7 +24,7 @@ Entry points (event shapes):
 Identity bridge (never invents a site -- real 2026-03-20 case: report['site']
 == 'BD Opportunity Brainstorm', not a real site). DB-driven since the Phase 1
 identity-directory consolidation (migration 0007 + org-seed enrollment) --
-no more folder/display-name-matching heuristics against user_mapping.json:
+no more folder/display-name-matching heuristics (user_mapping.json is not read here at all):
   1. report['site'] (display name) -> sites.get_company_site_by_name.
   2. miss -> resolve the REPORTING USER via users.get_by_folder_name(
      company_id, user_folder) -> their first accessible site via
@@ -82,7 +82,6 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
-CONFIG_KEY = os.environ.get("CONFIG_KEY", "config/user_mapping.json")
 # Authority flip (spec §6, Task 7 of the authority-flip plan): when on AND
 # extraction topics already exist for (user_folder, date), nightly report
 # ingest defers to them instead of overwriting -- see ingest_report below.
@@ -196,7 +195,6 @@ EMBEDDINGS_KEY_RE = re.compile(r"^embeddings/([^/]+)/([^/]+)/vectors\.json$")
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 _s3_client = None
-_mapping_cache = None
 
 
 def s3():
@@ -213,16 +211,6 @@ def _list_report_pictures(user_folder, date):
     client-parameterized precisely so both paths can share it)."""
     return photo_binding.list_pictures(s3(), S3_BUCKET,
                                        f"users/{user_folder}/pictures/{date}/")
-
-
-def load_mapping() -> dict:
-    """Load + cache config/user_mapping.json for the module's lifetime
-    (warm Lambda container) -- the retired lambda_org_seed's loader did the same."""
-    global _mapping_cache
-    if _mapping_cache is None:
-        obj = s3().get_object(Bucket=S3_BUCKET, Key=CONFIG_KEY)
-        _mapping_cache = json.loads(obj["Body"].read().decode("utf-8"))
-    return _mapping_cache
 
 
 # ----------------------------------------------------------
@@ -694,7 +682,7 @@ def ingest_report(date, user_folder, report_key):
         # Site attribution: the app's in-app project pick (recordings.site_id,
         # G5b) is authoritative -- lambda_item_writer already prefers it, and
         # trusting report['site'] instead let the report generator's SITE_NAME
-        # env fallback mis-stamp every user missing from user_mapping.json.
+        # env fallback mis-stamp every user missing from the directory.
         site = (recordings.site_for_day(conn, company["id"], user_folder, date)
                 or resolve_site(conn, company["id"], report, user_folder))
         if site is None:
