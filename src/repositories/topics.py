@@ -577,7 +577,8 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
     topic_rows = conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_TOPIC_COLS_JOINED}, "
         f"s.name AS site_name, "
-        f"NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '') AS user_name "
+        f"NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '') AS user_name, "
+        f"u.folder_name AS user_folder "
         f"FROM topics t "
         f"LEFT JOIN sites s ON s.id = t.site_id "
         f"LEFT JOIN users u ON u.id = t.user_id "
@@ -828,7 +829,8 @@ def list_topics_for_source_prefix(conn, source_prefix, *, merged_keys=None) -> l
     topic_rows = conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_TOPIC_COLS_JOINED}, "
         f"s.name AS site_name, "
-        f"NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '') AS user_name "
+        f"NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '') AS user_name, "
+        f"u.folder_name AS user_folder "
         f"FROM topics t "
         f"LEFT JOIN sites s ON s.id = t.site_id "
         f"LEFT JOIN users u ON u.id = t.user_id "
@@ -924,7 +926,8 @@ def get_topic_full(conn, topic_id) -> dict | None:
     rows = conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_TOPIC_COLS_JOINED}, "
         f"s.name AS site_name, "
-        f"NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '') AS user_name "
+        f"NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '') AS user_name, "
+        f"u.folder_name AS user_folder "
         f"FROM topics t "
         f"LEFT JOIN sites s ON s.id = t.site_id "
         f"LEFT JOIN users u ON u.id = t.user_id "
