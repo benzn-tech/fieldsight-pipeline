@@ -158,3 +158,30 @@ Sam Yu		sæm juː	Sam Yu
 Ben Lin		bɛn lɪn	Ben Lin
 Provista		prəviːstə	Provista
 Provista Balustrades		prəviːstə bæləstreɪdz	Provista Balustrades
+# --- Pre-pour walk terms. Added 2026-10-08 from the owner reading one script twice
+# --- (TEST 10-06, 10-08); each term below came back wrong at least once:
+# --- formworkers->'Four workers', steel fixers->'Still fixing', tie wire->'tide weeds',
+# --- pre-pour->'the purple', vibrators->'Fabricators', Hirepool->'Hiab'/'hair pool',
+# --- washout->'Watch out', edge form->'H form', edge cover->'each cover', stair core->
+# --- 'steel core', construction joints->'construction drawings', reo->'Rails'/'Real'.
+# --- 'skip' is DELIBERATELY left out (a common verb; see the People note above).
+pre-pour	pree-pore		pre-pour
+pre-pour check	pree-pore-check		pre-pour check
+formworkers	form-work-ers		formworkers
+formwork crew	form-work-crew		formwork crew
+steel fixers	steel-fix-ers		steel fixers
+tie wire	tie-wire		tie wire
+release agent	ree-lease-agent		release agent
+edge form	edge-form		edge form
+edge cover	edge-cover		edge cover
+edge protection	edge-pro-tec-shun		edge protection
+set-down	set-down		set-down
+bathroom pods	bath-room-pods		bathroom pods
+stair core	stair-core		stair core
+construction joint	con-struc-shun-joint		construction joint
+construction joints	con-struc-shun-joints		construction joints
+reo	ree-oh		reo
+vibrator	vy-bray-ter		vibrator
+vibrators	vy-bray-ters		vibrators
+washout	wash-out		washout
+Hirepool	hire-pool		Hirepool
