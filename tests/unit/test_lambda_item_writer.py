@@ -1230,6 +1230,8 @@ def test_chunk_session_attributes_via_meeting_session_site(wired):
                   lambda conn, sid: (got.setdefault("sid", sid), {"site_id": "site-OPEN"})[1])
     wired.setattr(iw.sites, "get_site",
                   lambda conn, sid: {"id": "site-OPEN", "company_id": "co-1"})
+    wired.setattr(iw.memberships, "site_usable_by_user",
+                  lambda conn, uid, sid: {"id": sid, "company_id": "co-1"})
     seen = _capture_topic_site(wired)
     result = iw.write_extraction_items("2026-07-28", "Ben_UCPK", CHUNK_EXTRACTION_KEY)
     assert not result.get("skipped")
@@ -1549,8 +1551,8 @@ def _run_with(monkeypatch, *, speaker_count, responsible="Speaker"):
     if speaker_count is not None:
         extraction["speaker_count"] = speaker_count
     monkeypatch.setattr(iw, "_s3_client", FakeS3({EXTRACTION_KEY: json.dumps(extraction)}))
-    monkeypatch.setattr(iw.users_repo, "get_by_folder_name",
-                        lambda conn, cid, folder: {"first_name": "Ben", "last_name": "Lin"})
+    monkeypatch.setattr(iw.users_repo, "get_by_folder_name_global",
+                        lambda conn, folder: {"first_name": "Ben", "last_name": "Lin"})
     seen = {}
     # Capture what item-writer hands to the mapper, and return the MAPPED
     # shape (empty is fine) so the rest of the write path is unaffected.

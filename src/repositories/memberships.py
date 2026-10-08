@@ -3,7 +3,7 @@ from repositories.acl import resolve_scope  # re-export
 
 __all__ = ["resolve_scope", "add_membership", "accessible_site_ids", "ensure_membership", "list_company_memberships",
           "members_for_site", "caller_site_roles", "get_membership", "add_external_membership", "worker_user_ids_for_sites",
-          "user_ids_for_sites", "archive_membership"]
+          "user_ids_for_sites", "archive_membership", "site_usable_by_user"]
 
 
 def add_membership(conn, user_id, site_id, role) -> dict:
@@ -207,3 +207,21 @@ def worker_user_ids_for_sites(conn, site_ids) -> set:
         (list(site_ids),),
     ).fetchall()
     return {str(r[0]) for r in rows}
+
+
+def site_usable_by_user(conn, user_id, site_id) -> dict | None:
+    """The site row (id, company_id) when `user_id` may record onto it, else None.
+    Project-owned tenancy P2: a site is usable when the user holds a LIVE
+    membership on it (any company -- an external member's home company differs),
+    or when it belongs to the user's own company (keeps admin/gm, who carry no
+    memberships, working as before). Never a site of a company the user has no
+    relation to. One query so every capture/ingest rung applies the same rule."""
+    if not user_id or not site_id:
+        return None
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT s.id, s.company_id FROM sites s JOIN users u ON u.id = %s "
+        "WHERE s.id = %s AND (s.company_id = u.company_id OR EXISTS ("
+        "  SELECT 1 FROM memberships m WHERE m.user_id = u.id AND m.site_id = s.id "
+        "  AND m.archived_at IS NULL))",
+        (user_id, site_id),
+    ).fetchone()

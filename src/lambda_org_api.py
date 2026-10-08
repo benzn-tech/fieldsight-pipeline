@@ -964,6 +964,29 @@ def _recording_s3_key(display_name, kind, started_at, file_name):
     return f"users/{_safe_seg(display_name)}/{folder}/{date_str}/{_safe_seg(file_name)}"
 
 
+def _capture_site(conn, caller, site_id):
+    """(site, error_response) for a capture call that names `siteId`.
+
+    Project-owned tenancy P2: a caller may record onto a site of their own
+    company (as before -- this is also how admin/gm, who hold no memberships,
+    record) OR onto any site they hold a LIVE membership on, whatever its
+    company. Anything else is refused as 'site not accessible'. The row's
+    company is then the SITE's, not the caller's (see `_capture_company_id`)."""
+    site = sites.get_site(conn, site_id)
+    if site is None:
+        return None, error("site not accessible", 403)
+    if str(site["company_id"]) != str(caller["company_id"]):
+        m = memberships.get_membership(conn, caller["id"], site_id)
+        if m is None or m.get("archived_at") is not None:
+            return None, error("site not accessible", 403)
+    return site, None
+
+
+def _capture_company_id(caller, site):
+    """The company a captured row belongs to: the site's, else the recorder's home."""
+    return site["company_id"] if site else caller["company_id"]
+
+
 def create_recording_upload_url(conn, caller, body, device_ident=None):
     if body is None:
         return error("malformed JSON body", 400)
@@ -978,10 +1001,11 @@ def create_recording_upload_url(conn, caller, body, device_ident=None):
         return error("clientUuid, fileName, contentType, startedAt are required", 400)
 
     site_id = body.get("siteId")
+    site = None
     if site_id:
-        site = sites.get_site(conn, site_id)
-        if site is None or site["company_id"] != caller["company_id"]:
-            return error("site not accessible", 403)
+        site, err = _capture_site(conn, caller, site_id)
+        if err is not None:
+            return err
 
     # Idempotent on the device-side capture id: a resend (retry) reuses the
     # existing row and just re-signs a fresh URL, never creating a duplicate.
@@ -1012,7 +1036,7 @@ def create_recording_upload_url(conn, caller, body, device_ident=None):
             recording_device_id = device_heartbeat.device_id(conn, device_ident)
             with conn.transaction():          # savepoint: on failure, roll back to here so conn stays usable
                 row = recordings.insert_pending(
-                    conn, company_id=caller["company_id"], user_id=caller["id"], site_id=site_id,
+                    conn, company_id=_capture_company_id(caller, site), user_id=caller["id"], site_id=site_id,
                     kind=kind, s3_key=key, client_uuid=client_uuid, started_at=started_at,
                     ended_at=body.get("endedAt"), duration_s=body.get("durationS"),
                     resolution=body.get("resolution"), codec=body.get("codec"),
@@ -1029,7 +1053,8 @@ def create_recording_upload_url(conn, caller, body, device_ident=None):
             else:
                 return error("a recording with this s3 key already exists", 409)
 
-    _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id)
+    _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id,
+                             _capture_company_id(caller, site))
 
     url = s3().generate_presigned_url(
         "put_object",
@@ -1060,7 +1085,7 @@ def _ensure_group_state(conn, company_id, group_id):
         logger.exception("could not register group state for %s", group_id)
 
 
-def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id):
+def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id, company_id=None):
     """Record the meeting group carried by an upload, if there is one.
 
     Why this exists: `/sessions/{id}/open` is best-effort and fire-and-forget,
@@ -1081,6 +1106,7 @@ def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id):
     group_id = (body or {}).get("groupId")
     if not group_id:
         return
+    company_id = company_id or caller["company_id"]
     try:
         if not _SID_RE.match(str(group_id)):
             logger.warning("upload-url: ignoring malformed groupId %r", group_id)
@@ -1096,7 +1122,7 @@ def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id):
         # Skipped rather than refused — failing the upload over the group would
         # cost the recording itself, and /open already answers 403 for this.
         lead = meeting_session.get(conn, group_id)
-        if lead is not None and str(lead["company_id"]) != str(caller["company_id"]):
+        if lead is not None and str(lead["company_id"]) != str(company_id):
             logger.warning("upload-url: refusing cross-company group %s", group_id)
             return
         # Same door as /open: a finished meeting takes no new members, or a
@@ -1114,13 +1140,13 @@ def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id):
         # the same place for the same reason. None is fine: it leaves the field
         # for whoever does know.
         meeting_session.ensure_open(
-            conn, m.group(1), caller["company_id"], caller["id"], site_id, kind,
+            conn, m.group(1), company_id, caller["id"], site_id, kind,
             extract_base_time_from_filename(file_name), group_id=group_id,
         )
         # Beside ensure_open, not instead of it: this is the OFFLINE join, the
         # one whose /open never landed, so it is the only chance this group has
         # to become visible to the merge scan.
-        _ensure_group_state(conn, caller["company_id"], group_id)
+        _ensure_group_state(conn, company_id, group_id)
         # A live session now exists, so the finalize sweep must connect until it
         # closes (Aurora scale-to-zero, spec 2026-08-11).
         sweep_state.mark_pending(_STAGE)
@@ -1289,10 +1315,12 @@ def session_open(conn, caller, session_id, body):
     if kind is not None and kind not in ("audio", "video"):
         return error("kind must be 'audio' or 'video'", 400)
     site_id = body.get("siteId")
+    site = None
     if site_id:
-        site = sites.get_site(conn, site_id)
-        if site is None or site["company_id"] != caller["company_id"]:
-            return error("site not accessible", 403)
+        site, err = _capture_site(conn, caller, site_id)
+        if err is not None:
+            return err
+    session_company_id = _capture_company_id(caller, site)
     # Multi-device merge (spec 2026-08-04): the group's id IS the lead device's
     # session_id, carried here by the joiner after scanning the lead's QR.
     group_id = body.get("groupId")
@@ -1307,7 +1335,7 @@ def session_open(conn, caller, session_id, body):
         # a client's say-so.
         lead = meeting_session.get(conn, group_id)
         if lead is not None:
-            if str(lead["company_id"]) != str(caller["company_id"]):
+            if str(lead["company_id"]) != str(session_company_id):
                 return error("group not accessible", 403)
             # Staleness. A device that kept a group overnight, or across a
             # reinstall, will happily present it again — nothing on the device
@@ -1330,12 +1358,12 @@ def session_open(conn, caller, session_id, body):
     # Idempotent: whichever of the record-start signal or the first uploaded
     # chunk arrives first opens the session; a later call never regresses it.
     row = meeting_session.ensure_open(
-        conn, session_id, caller["company_id"], caller["id"], site_id, kind,
+        conn, session_id, session_company_id, caller["id"], site_id, kind,
         body.get("startedAt"), group_id=group_id,
     )
     # After ensure_open, so a group is only registered once the join itself has
     # passed every guard above (tenant, staleness, meeting-already-ended).
-    _ensure_group_state(conn, caller["company_id"], group_id)
+    _ensure_group_state(conn, session_company_id, group_id)
     # There is now something for the finalize sweep to act on, so let it know it
     # must connect (Aurora scale-to-zero, spec 2026-08-11). Best-effort: a failed
     # flag write is recovered by the sweep's hourly unconditional pass and must
@@ -2386,7 +2414,13 @@ def _site_for_session(conn, company_id, user_folder, date, session_base):
     job here is done by returning None — an unresolved site means no narrowing, which is the
     behaviour before this feature and the safe direction.
     """
-    site = recordings.site_for_media(conn, company_id, user_folder, date, session_base)
+    # Project-owned tenancy P2: the rungs are scoped to the RECORDER (a live
+    # membership on the site, or the site is their own company's), not to the
+    # caller's company -- an external member's recording sits on another
+    # company's site.
+    recorder = users.get_by_folder_name_global(conn, user_folder)
+    recorder_id = recorder["id"] if recorder else None
+    site = recordings.site_for_media(conn, recorder_id, user_folder, date, session_base)
     if site:
         return site
     sid = turn_name_overlay.session_base(session_base)
@@ -2394,11 +2428,11 @@ def _site_for_session(conn, company_id, user_folder, date, session_base):
         row = meeting_session.get(conn, sid[3:] if sid.startswith("sid") else sid)
         if row and row.get("site_id"):
             found = sites.get_site(conn, row["site_id"])
-            # Re-checked, because a site from another tenant would narrow this company's
-            # pool against a roster that is not theirs.
-            if found and str(found.get("company_id")) == str(company_id):
+            # Re-checked, because a site the recorder has no relation to would narrow
+            # the pool against a roster that is not theirs.
+            if found and memberships.site_usable_by_user(conn, recorder_id, found["id"]):
                 return found
-    return recordings.site_for_day(conn, company_id, user_folder, date)
+    return recordings.site_for_day(conn, recorder_id, user_folder, date)
 
 
 def _label_map(turns):

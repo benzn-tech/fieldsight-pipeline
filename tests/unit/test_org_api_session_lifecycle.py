@@ -47,6 +47,7 @@ def test_open_rejects_bad_kind(monkeypatch):
 
 def test_open_rejects_inaccessible_site(monkeypatch):
     monkeypatch.setattr(org.sites, "get_site", lambda conn, sid: {"company_id": "other-co"})
+    monkeypatch.setattr(org.memberships, "get_membership", lambda conn, uid, sid: None)
     res = org.session_open(CONN, CALLER, SID, {"siteId": "s-1"})
     assert res["statusCode"] == 403
 

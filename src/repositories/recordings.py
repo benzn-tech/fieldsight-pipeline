@@ -582,33 +582,48 @@ def photo_keys_in_span(conn, company_id, user_folder, date, lo, hi) -> list:
 
 
 
-def site_for_media(conn, company_id, user_folder, date, session_base) -> dict | None:
+# A recording's site is usable by its recorder when the recorder holds a LIVE
+# membership on it (any company) or the site belongs to the recorder's own
+# company. This replaces the old `recordings.company_id = sites.company_id =
+# <home company>` pin (project-owned tenancy P2): an external member's recording
+# carries the SITE's company, so pinning on the home company would never find it.
+# It also never lets a rung pick a site of a company the recorder has no relation to.
+_SITE_USABLE_BY_USER_SQL = (
+    "JOIN users u ON u.id = %s "
+    "WHERE r.site_id IS NOT NULL "
+    "AND (s.company_id = u.company_id OR EXISTS ("
+    "SELECT 1 FROM memberships m WHERE m.user_id = u.id AND m.site_id = s.id "
+    "AND m.archived_at IS NULL)) "
+)
+
+
+def site_for_media(conn, user_id, user_folder, date, session_base) -> dict | None:
     """The app-tagged site (recordings.site_id) for the recording whose media
     file this extraction session came from, or None. Matches recordings.s3_key
     by session_base within users/{folder}/.../{date}/ (LIKE, wildcard-escaped),
-    scoped to company_id, and only returns a site that is itself in-company
-    (multi-tenant invariant — never attribute across tenants). Newest matching
-    recording wins. Returns a sites.get_site()-shaped row so it drops in where
-    resolve_site's return is used (lambda_item_writer)."""
+    and only returns a site the recorder (`user_id`) may use: a live membership
+    on it, or a site of the recorder's own company (never attribute to a company
+    the recorder has no relation to). Newest matching recording wins. Returns a
+    sites.get_site()-shaped row so it drops in where resolve_site's return is
+    used (lambda_item_writer)."""
     pattern = f"users/{_escape_like(user_folder)}/%/{date}/{_escape_like(session_base)}.%"
     row = conn.cursor(row_factory=dict_row).execute(
         "SELECT r.site_id FROM recordings r JOIN sites s ON s.id = r.site_id "
-        "WHERE r.company_id = %s AND s.company_id = %s AND r.site_id IS NOT NULL "
+        + _SITE_USABLE_BY_USER_SQL +
         "AND r.s3_key LIKE %s ESCAPE '\\' "
         "ORDER BY r.created_at DESC LIMIT 1",
-        (company_id, company_id, pattern),
+        (user_id, pattern),
     ).fetchone()
     if row is None:
         return None
     return sites.get_site(conn, row["site_id"])
 
 
-def site_for_day(conn, company_id, user_folder, date) -> dict | None:
+def site_for_day(conn, user_id, user_folder, date) -> dict | None:
     """The app-tagged site (recordings.site_id) for a user's WHOLE day, or
     None. Report-level sibling of site_for_media above: same LIKE match on
-    users/{folder}/.../{date}/ (wildcard-escaped), same company double-scope
-    via the sites join (multi-tenant invariant -- never attribute across
-    tenants), same r.site_id IS NOT NULL filter, same sites.get_site()-shaped
+    users/{folder}/.../{date}/ (wildcard-escaped), same usable-by-recorder
+    check, same r.site_id IS NOT NULL filter, same sites.get_site()-shaped
     return so it drops into the same slot as resolve_site.
 
     Unlike site_for_media there is no session_base to pin a single
@@ -621,11 +636,11 @@ def site_for_day(conn, company_id, user_folder, date) -> dict | None:
     row = conn.cursor(row_factory=dict_row).execute(
         "SELECT r.site_id, COUNT(*) AS cnt, MAX(r.created_at) AS latest "
         "FROM recordings r JOIN sites s ON s.id = r.site_id "
-        "WHERE r.company_id = %s AND s.company_id = %s AND r.site_id IS NOT NULL "
+        + _SITE_USABLE_BY_USER_SQL +
         "AND r.s3_key LIKE %s ESCAPE '\\' "
         "GROUP BY r.site_id "
         "ORDER BY cnt DESC, latest DESC LIMIT 1",
-        (company_id, company_id, pattern),
+        (user_id, pattern),
     ).fetchone()
     if row is None:
         return None

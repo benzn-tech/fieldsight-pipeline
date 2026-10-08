@@ -261,14 +261,26 @@ def resolve_site(conn, company_id, report, user_folder):
     """report['site'] direct match -> the reporting user's own site
     membership (folder_name -> user row -> their first accessible site, all
     DB lookups, no user_mapping.json name heuristic) -> None (caller skips;
-    never creates a site)."""
+    never creates a site).
+
+    `company_id` is the recorder's HOME company (project-owned tenancy P2: the
+    site, not this id, decides the company a report is filed under). The named
+    site is matched in the home company first, then among sites the recorder
+    holds a live membership on -- an external member's project belongs to
+    another company, and a name match there is only ever against sites the
+    recorder was explicitly put on. The recorder is looked up globally."""
     name = (report.get("site") or "").strip()   # tolerate stray whitespace (Fable minor 7)
+    user = users.get_by_folder_name_global(conn, user_folder)
     if name:
         site = sites.get_company_site_by_name(conn, company_id, name)
         if site:
             return site
+        if user and memberships.resolve_scope(user["global_role"]) != "ALL":
+            for sid in memberships.accessible_site_ids(conn, user["id"], user["global_role"]):
+                cand = sites.get_site(conn, sid)
+                if cand and (cand.get("name") or "").strip() == name:
+                    return cand
 
-    user = users.get_by_folder_name(conn, company_id, user_folder)
     if user and memberships.resolve_scope(user["global_role"]) != "ALL":
         # F4 (Fable review): only use this fallback for non-ALL scope
         # (field_only/worker/site_manager) users. accessible_site_ids
@@ -283,9 +295,12 @@ def resolve_site(conn, company_id, report, user_folder):
 
 
 def resolve_user(conn, company_id, user_folder):
-    """Direct company+folder_name lookup against the identity directory.
+    """Global folder_name lookup against the identity directory (0012 makes the
+    folder globally unique). `company_id` is accepted for call-site
+    compatibility and ignored: a recorder from another company recording onto a
+    project they were added to is still that person (project-owned tenancy P2).
     Miss -> None (nullable column; does not skip the report)."""
-    row = users.get_by_folder_name(conn, company_id, user_folder)
+    row = users.get_by_folder_name_global(conn, user_folder)
     return row["id"] if row else None
 
 
@@ -683,7 +698,8 @@ def ingest_report(date, user_folder, report_key):
         # G5b) is authoritative -- lambda_item_writer already prefers it, and
         # trusting report['site'] instead let the report generator's SITE_NAME
         # env fallback mis-stamp every user missing from the directory.
-        site = (recordings.site_for_day(conn, company["id"], user_folder, date)
+        user_id = resolve_user(conn, company["id"], user_folder)
+        site = (recordings.site_for_day(conn, user_id, user_folder, date)
                 or resolve_site(conn, company["id"], report, user_folder))
         if site is None:
             reason = (f"identity bridge miss: report.site={report.get('site')!r}, "
@@ -691,7 +707,10 @@ def ingest_report(date, user_folder, report_key):
             logger.warning("%s: %s", report_key, reason)
             return {"skipped": True, "reason": reason}
 
-        user_id = resolve_user(conn, company["id"], user_folder)
+        # Project-owned tenancy P2: the SITE decides the company. `company` above
+        # is the recorder's home company (the no-site fallback); what is written
+        # below belongs to the site's company.
+        owner_company_id = site.get("company_id") or company["id"]
 
         # Track B Task 3: identifies THIS ingest pass to repositories.topics.
         # supersede_topics_for_source[_prefix] (stamped onto the retired row's
@@ -831,7 +850,7 @@ def ingest_report(date, user_folder, report_key):
             # every photo regardless of binding.
             try:
                 photo_rebind.rebind_day_photos(
-                    conn, company["id"], user_folder, date, report_photo_objects)
+                    conn, owner_company_id, user_folder, date, report_photo_objects)
             except Exception:  # noqa: BLE001 -- see above
                 logger.exception("day photo rebind failed for %s/%s", user_folder, date)
 

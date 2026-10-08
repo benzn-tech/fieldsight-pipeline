@@ -123,11 +123,11 @@ def wired(monkeypatch):
     monkeypatch.setattr(ing.sites, "get_company_site_by_name",
                         lambda conn, cid, name: {"id": "site-1", "name": name}
                         if name == "Test Site" else None)
-    monkeypatch.setattr(ing.users, "get_by_folder_name", lambda conn, cid, folder_name: None)
+    monkeypatch.setattr(ing.users, "get_by_folder_name_global", lambda conn, folder_name: None)
     # No app-tagged recording by default -- existing tests exercise the
     # legacy resolve_site path unchanged; tests that care about the app pick
     # override this explicitly.
-    monkeypatch.setattr(ing.recordings, "site_for_day", lambda conn, cid, user_folder, date: None)
+    monkeypatch.setattr(ing.recordings, "site_for_day", lambda conn, uid, user_folder, date: None)
     monkeypatch.setattr(ing.chunks, "delete_chunks_for_source", lambda *a, **k: 0)
     monkeypatch.setattr(ing.topics, "supersede_topics_for_source", lambda *a, **k: [])
     monkeypatch.setattr(ing.topics, "supersede_topics_for_source_prefix", lambda *a, **k: [])
@@ -204,6 +204,7 @@ def test_resolve_site_name_primary_path(monkeypatch):
         lambda conn, cid, name: {"id": "site-1", "name": name}
         if name == "SB1108 Ellesmere College" else None,
     )
+    monkeypatch.setattr(ing.users, "get_by_folder_name_global", lambda conn, f: None)
     report = {"site": "SB1108 Ellesmere College", "topics": []}
 
     site = ing.resolve_site(None, "co-1", report, "Jarley_Trainor")
@@ -219,8 +220,8 @@ def test_resolve_site_fallback_via_slug_or_membership(monkeypatch):
     monkeypatch.setattr(ing.sites, "get_company_site_by_name",
                         lambda conn, cid, name: None)
     monkeypatch.setattr(
-        ing.users, "get_by_folder_name",
-        lambda conn, cid, folder_name: {"id": "u-9", "global_role": "worker"}
+        ing.users, "get_by_folder_name_global",
+        lambda conn, folder_name: {"id": "u-9", "global_role": "worker"}
         if folder_name == "Jarley_Trainor" else None,
     )
     monkeypatch.setattr(
@@ -248,8 +249,8 @@ def test_resolve_site_fallback_skips_for_all_scope(monkeypatch):
     monkeypatch.setattr(ing.sites, "get_company_site_by_name",
                         lambda conn, cid, name: None)
     monkeypatch.setattr(
-        ing.users, "get_by_folder_name",
-        lambda conn, cid, folder_name: {"id": "u-admin", "global_role": "admin"}
+        ing.users, "get_by_folder_name_global",
+        lambda conn, folder_name: {"id": "u-admin", "global_role": "admin"}
         if folder_name == "Ben_Lin" else None,
     )
     called = []
@@ -271,8 +272,8 @@ def test_resolve_site_double_miss_skips(monkeypatch):
     # (caller skips, never invents a site).
     monkeypatch.setattr(ing.sites, "get_company_site_by_name",
                         lambda conn, cid, name: None)
-    monkeypatch.setattr(ing.users, "get_by_folder_name",
-                        lambda conn, cid, folder_name: None)
+    monkeypatch.setattr(ing.users, "get_by_folder_name_global",
+                        lambda conn, folder_name: None)
     report = {"site": "BD Opportunity Brainstorm", "topics": []}
 
     site = ing.resolve_site(None, "co-1", report, "Jarley_Trainor")
@@ -300,7 +301,7 @@ def test_ingest_falls_back_to_resolve_site_when_no_app_pick(wired):
     # No app-tagged recording for that (user_folder, date) -- existing
     # legacy-resolver behaviour is preserved unchanged.
     wired.setattr(ing.recordings, "site_for_day",
-                  lambda conn, cid, user_folder, date: None)
+                  lambda conn, uid, user_folder, date: None)
     calls = []
     real_resolve_site = ing.resolve_site
     wired.setattr(ing, "resolve_site",
@@ -600,8 +601,8 @@ def test_backfill_still_lists_reports(monkeypatch):
 
 def test_resolve_user_by_folder_name(monkeypatch):
     monkeypatch.setattr(
-        ing.users, "get_by_folder_name",
-        lambda conn, cid, folder_name: {"id": "u-42", "folder_name": folder_name}
+        ing.users, "get_by_folder_name_global",
+        lambda conn, folder_name: {"id": "u-42", "folder_name": folder_name}
         if folder_name == "Jarley_Trainor" else None,
     )
 
@@ -611,8 +612,8 @@ def test_resolve_user_by_folder_name(monkeypatch):
 
 
 def test_resolve_user_miss_none(monkeypatch):
-    monkeypatch.setattr(ing.users, "get_by_folder_name",
-                        lambda conn, cid, folder_name: None)
+    monkeypatch.setattr(ing.users, "get_by_folder_name_global",
+                        lambda conn, folder_name: None)
 
     assert ing.resolve_user(None, "co-1", "Unknown_Person") is None
 
@@ -623,8 +624,8 @@ def test_resolve_user_field_only_folder_hits(monkeypatch):
     # must resolve exactly like a login user, straight off folder_name (no
     # name-join heuristic).
     monkeypatch.setattr(
-        ing.users, "get_by_folder_name",
-        lambda conn, cid, folder_name: {"id": "u-field-1", "kind": "field_only"}
+        ing.users, "get_by_folder_name_global",
+        lambda conn, folder_name: {"id": "u-field-1", "kind": "field_only"}
         if folder_name == "MPI1" else None,
     )
 
@@ -634,8 +635,8 @@ def test_resolve_user_field_only_folder_hits(monkeypatch):
 
 
 def test_user_bridge_null_on_miss(wired):
-    wired.setattr(ing.users, "get_by_folder_name",
-                  lambda conn, cid, folder_name: None)
+    wired.setattr(ing.users, "get_by_folder_name_global",
+                  lambda conn, folder_name: None)
 
     user_id = ing.resolve_user(None, "co-1", "Jarley_Trainor")
     assert user_id is None

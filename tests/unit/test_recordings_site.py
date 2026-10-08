@@ -41,17 +41,19 @@ def test_site_for_media_escapes_like_wildcards_in_pattern(monkeypatch):
                         lambda c, sid: {"id": sid, "company_id": "co-1"})
 
     site = recordings.site_for_media(
-        conn, "co-1", "Ben_Lin", "2026-07-16", "Ben_Lin_2026-07-16_09-50-00")
+        conn, "u-1", "Ben_Lin", "2026-07-16", "Ben_Lin_2026-07-16_09-50-00")
 
     assert site == {"id": "site-1", "company_id": "co-1"}
     sql, params = conn.calls[0]["sql"], conn.calls[0]["params"]
     assert "LIKE %s ESCAPE '\\'" in sql
     assert "ORDER BY r.created_at DESC" in sql and "LIMIT 1" in sql
-    assert "r.company_id = %s" in sql and "s.company_id = %s" in sql
+    # P2: no company pin -- the recorder (user id) decides which sites are usable
+    assert "r.company_id" not in sql
+    assert "m.user_id = u.id" in sql and "s.company_id = u.company_id" in sql
     assert "r.site_id IS NOT NULL" in sql
     # underscores in folder AND session_base escaped; date is a fixed literal
     assert params == (
-        "co-1", "co-1",
+        "u-1",
         r"users/Ben\_Lin/%/2026-07-16/Ben\_Lin\_2026-07-16\_09-50-00.%",
     )
 
@@ -79,15 +81,16 @@ def test_site_for_day_escapes_like_wildcards_and_scopes_by_company(monkeypatch):
     monkeypatch.setattr(recordings.sites, "get_site",
                         lambda c, sid: {"id": sid, "company_id": "co-1"})
 
-    site = recordings.site_for_day(conn, "co-1", "Ben_Lin", "2026-07-16")
+    site = recordings.site_for_day(conn, "u-1", "Ben_Lin", "2026-07-16")
 
     assert site == {"id": "site-1", "company_id": "co-1"}
     sql, params = conn.calls[0]["sql"], conn.calls[0]["params"]
     assert "LIKE %s ESCAPE '\\'" in sql
     assert "LIMIT 1" in sql
-    assert "r.company_id = %s" in sql and "s.company_id = %s" in sql
+    assert "r.company_id" not in sql
+    assert "m.user_id = u.id" in sql and "s.company_id = u.company_id" in sql
     assert "r.site_id IS NOT NULL" in sql
-    assert params == ("co-1", "co-1", r"users/Ben\_Lin/%/2026-07-16/%")
+    assert params == ("u-1", r"users/Ben\_Lin/%/2026-07-16/%")
 
 
 def test_site_for_day_no_match_returns_none_and_skips_get_site(monkeypatch):
