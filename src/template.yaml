@@ -2514,9 +2514,21 @@ Resources:
                 - s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/report_photo_selection/*
             # pipeline_trace: what this step did with a recording (traces/, 180 days).
+            # Read too: GET /trace/day and /trace/funnel (trace_views), and
+            # ListBucket below -- without it a day with no traces reads as
+            # AccessDenied instead of an empty list.
             - Effect: Allow
-              Action: s3:PutObject
+              Action:
+                - s3:PutObject
+                - s3:GetObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/traces/*
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - traces/*
             # A speaker correction, handed OUTWARD across the VPC boundary the same way.
             # Write only, and no grant on voiceprint_results/: those go to the in-VPC
             # writer by direct invoke from the embedder, and a read grant here would be an
