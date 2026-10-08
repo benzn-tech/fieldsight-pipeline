@@ -240,8 +240,14 @@ def _check_lines(checks):
             out.append(f"Checklist: {c['template']} for “{c['check']}”{when} is being "
                        "filled in — it will be ready in FieldSight in a few minutes.")
         else:
-            out.append(f"Heard “{c['check']}”{when} — no checklist in your Library "
-                       "matches it, so no checklist report was made.")
+            line = (f"Heard “{c['check']}”{when} — no checklist in your Library "
+                    "matches it, so no checklist report was made.")
+            # Without this a reader takes "no report" for "lost" (owner,
+            # 2026-10-09). Said only when item-writer found the topic.
+            if c.get("topic"):
+                line += (f" What you said is kept under “{c['topic']}” on your Timeline "
+                         "and in the daily report.")
+            out.append(line)
     return out
 
 
@@ -316,7 +322,7 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
     # someone to pick the task up; "N/A" says there is no task here.
     na = "N/A"
 
-    lines = ["Here's what we captured from your recording — reply or open FieldSight "
+    lines = ["Here's what we captured from your recording — open FieldSight "
              "to correct anything before you leave site.", ""]
     if site_name:
         lines.append(f"Site: {site_name}")
@@ -364,7 +370,7 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
         + (f'<div style="font-size:13px;color:{_MUTED};padding-top:2px">{esc(site_name)}</div>'
            if site_name else "")
         + f'<div style="font-size:14px;color:{_INK};padding-top:12px">Here\'s what we captured from your '
-        "recording — reply or open FieldSight to correct anything before you leave site.</div>"
+        "recording — open FieldSight to correct anything before you leave site.</div>"
         "</td></tr>",
     ]
     heard = [c for c in checks or [] if isinstance(c, dict) and c.get("check")]
@@ -413,7 +419,7 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
             "Open in FieldSight</a></td></tr></table></td></tr>")
     parts += [
         f'<tr><td style="padding:16px 20px 18px;{_FONT};font-size:12px;color:{_MUTED}">'
-        "Prepared with FieldSight · reply to this email to correct anything.</td></tr>",
+        "Prepared with FieldSight.</td></tr>",
         "</table></td></tr></table>",
     ]
     body_html = "\n".join(parts)

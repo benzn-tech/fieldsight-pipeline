@@ -76,3 +76,10 @@ def test_an_iso_due_date_reads_as_a_day_in_the_card_only():
 def test_a_check_inside_one_minute_shows_the_minute_once():
     lines = fin._check_lines([{"check": "steel", "from": "11:39", "to": "11:39"}])
     assert "(11:39)" in lines[0] and "11:39–11:39" not in lines[0]
+
+
+def test_the_email_does_not_ask_for_a_reply():
+    """Owner, 2026-10-09: a reply reaches nobody who can act on it."""
+    _, text, html = _email()
+    assert "reply" not in text.lower() and "reply" not in html.lower()
+    assert "open FieldSight to correct anything before you leave site" in text
