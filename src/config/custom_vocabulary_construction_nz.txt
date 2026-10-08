@@ -165,11 +165,12 @@ Provista Balustrades		prəviːstə bæləstreɪdz	Provista Balustrades
 # --- washout->'Watch out', edge form->'H form', edge cover->'each cover', stair core->
 # --- 'steel core', construction joints->'construction drawings', reo->'Rails'/'Real'.
 # --- 'skip' is DELIBERATELY left out (a common verb; see the People note above).
+# --- 'steel fixers' (two words) was tried and REMOVED 2026-10-09: beside the existing
+# --- 'steelfixer(s)' it turned 3/3 'steelfixer' into 3/3 'Still fixing' on the 10-08 audio.
 pre-pour	pree-pore		pre-pour
 pre-pour check	pree-pore-check		pre-pour check
 formworkers	form-work-ers		formworkers
 formwork crew	form-work-crew		formwork crew
-steel fixers	steel-fix-ers		steel fixers
 tie wire	tie-wire		tie wire
 release agent	ree-lease-agent		release agent
 edge form	edge-form		edge form
