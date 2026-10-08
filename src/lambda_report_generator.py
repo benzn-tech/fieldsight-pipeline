@@ -68,6 +68,7 @@ import urllib3
 import agent_turn_filter
 from output_language import OUTPUT_LANGUAGE_RULE
 import weather
+import report_style
 import weather_advice
 import site_weather
 import report_photos
@@ -1171,15 +1172,13 @@ def generate_word_document(report_data, title):
         return None
 
     doc = Document()
-    style = doc.styles['Normal']
-    style.font.name = 'Calibri'
-    style.font.size = Pt(10)
-
-    heading = doc.add_heading(title, 0)
-    heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    session = report_data.get('recording_session', {})
+    # THE HOUSE STYLE (report_style): page, type, running header and footer,
+    # the same as every other report FieldSight writes.
+    report_style.setup(doc, title, header_left=(session or {}).get('site') or None)
+    report_style.title_block(doc, title, (session or {}).get('date') or None)
 
     # Recording Session Info
-    session = report_data.get('recording_session', {})
     if session:
         table = doc.add_table(rows=0, cols=2)
         table.style = 'Light List'
@@ -1206,6 +1205,7 @@ def generate_word_document(report_data, title):
                 for paragraph in row.cells[0].paragraphs:
                     for run in paragraph.runs:
                         run.bold = True
+        report_style.style_table(table, facts=True)
         doc.add_paragraph('')
 
     render_weather_into(doc, report_data)
@@ -1373,6 +1373,7 @@ def _finish_document(doc, report_data):
         )
         run.font.size = Pt(7)
         run.font.color.rgb = RGBColor(150, 150, 150)
+    report_style.style_all(doc)
 
     buffer = BytesIO()
     doc.save(buffer)

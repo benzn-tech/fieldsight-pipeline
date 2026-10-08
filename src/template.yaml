@@ -1893,8 +1893,14 @@ Resources:
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           QWEN_ENABLE_THINKING: 'true'
           # One attempt must fit inside Timeout: 900 with room for the docx render.
-          LLM_HTTP_TIMEOUT: '300'
+          # 480s: a report may now use 32,000 completion tokens (below), ~420s at
+          # the ~76 tokens/s measured on TEST; 300s would cut a long one off.
+          LLM_HTTP_TIMEOUT: '480'
           GENERATION_BUDGET_SECONDS: '600'
+          # Room to think: the report asks for an 8,000-token answer and gets
+          # this on top for reasoning -- 32,000 in all (owner, 2026-10-06, after
+          # a spoken 40-item checklist spent 15,997 of 16,000 thinking at high).
+          LLM_REASONING_HEADROOM: '24000'
           # Pre-check on transcript objects in one window (transcript_window.py).
           MAX_TRANSCRIPT_OBJECTS: '2000'
       Policies:
@@ -3656,6 +3662,11 @@ Resources:
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
+          # A spoken check's report is queued with org-api's own code
+          # (checklist_reports -> lambda_org_api.day_report_generate), which
+          # reads these two exactly as org-api does.
+          LAKE_BUCKET: !Ref IngestBucketName
+          GRADED_ROLES: !Ref GradedRoles
           CONFIG_KEY: config/user_mapping.json
           # video-keyframe plan: emit keyframe_requests/ post-commit only when
           # this stage flag is on (ships inert otherwise).
@@ -3712,6 +3723,11 @@ Resources:
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/traces/*
+            # A spoken check's report request for the report worker
+            # (checklist_reports), the same object org-api writes for Generate.
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_report_requests/*
             - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}

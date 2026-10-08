@@ -979,7 +979,20 @@ def time_location_markers(markers, turns):
     A quote that cannot be found (paraphrased, or said outside the window) is
     not guessed at: the marker keeps its minute, which is what it had before.
     """
-    stream = []                      # (token, second of day), in time order
+    stream = _word_stream(turns)
+    if not stream:
+        return markers
+    out = []
+    for m in markers:
+        timed = _time_one_marker(m, stream)
+        out.append(timed if timed is not None else m)
+    return out
+
+
+def _word_stream(turns):
+    """[(token, second of day)] for every word of the session, in time order --
+    through the batch map where a turn has one (word_abs)."""
+    stream = []
     for t in turns or []:
         start = t.get('abs_start')
         words = t.get('words') or []
@@ -996,13 +1009,126 @@ def time_location_markers(markers, turns):
             for tok in _marker_tokens(word):
                 stream.append((tok, when))
     stream.sort(key=lambda x: x[1])
-    if not stream:
-        return markers
+    return stream
+
+
+def _hms(sec):
+    sec = int(sec)
+    return '%02d:%02d:%02d' % (sec // 3600, sec % 3600 // 60, sec % 60)
+
+
+def clean_inspections(raw):
+    """The model's inspections, or [] -- the same all-or-nothing rule as
+    clean_location_markers: a check with no name or no start cannot open a
+    window, so it is dropped, never repaired."""
     out = []
-    for m in markers:
-        timed = _time_one_marker(m, stream)
-        out.append(timed if timed is not None else m)
+    for m in (raw or []):
+        if not isinstance(m, dict):
+            continue
+        name, start = m.get('name'), m.get('start_at')
+        if not name or not start:
+            continue
+        end = m.get('end_at')
+        resumed = [{'at': str(r['at'])[:5], 'quote': str(r.get('quote') or '')[:300]}
+                   for r in (m.get('resumed') or [])
+                   if isinstance(r, dict) and r.get('at')][:20]
+        out.append({'name': str(name)[:120],
+                    'kind': str(m.get('kind') or '')[:80],
+                    'start_at': str(start)[:5],
+                    'start_quote': str(m.get('start_quote') or '')[:300],
+                    'end_at': str(end)[:5] if end else None,
+                    'end_quote': str(m.get('end_quote') or '')[:300] if end else None,
+                    'resumed': resumed})
     return out
+
+
+def time_inspections(items, turns):
+    """Each check's window, to the second (voice-triggered checklists, owner
+    2026-09-30), as one or more SEGMENTS.
+
+    A segment opens where he started the check -- or came back to it -- and
+    closes at the first of: where he said it was finished, where he started
+    or came back to ANOTHER check, or where the recording stopped. The last
+    segment's reason is `end_source` ("said" | "next_check" |
+    "recording_stop"); `start_at`/`end_at` span them all.
+
+    "Another check ends it" is ours, not the owner's wording: on prod
+    (Ben_Lin_Test 2026-10-05) he never said a check was finished, and without
+    it the Level 1 pre-pour window ran on through the Level 2 steel inspection.
+    Segments are the owner's answer to what that costs (2026-10-05: "how do the
+    interrupted parts join up?"): "back to the level one pre-pour" after the
+    steel check opens a second segment of the SAME check, and the report covers
+    both stretches and not the steel check between them.
+
+    A quote that cannot be found keeps the model's minute, as markers do."""
+    stream = _word_stream(turns)
+    ends = [t.get('abs_end') or t.get('abs_start') for t in turns or []
+            if (t.get('abs_end') or t.get('abs_start')) is not None]
+    stop = _clock_s(_hms(_second_of_day(max(ends)))) if ends else None
+
+    def timed(at, quote):
+        hit = _time_one_marker({'at': at, 'quote': quote}, stream) if stream else None
+        return hit['at_s'] if hit else None
+
+    checks = []
+    for m in items:
+        m = dict(m)
+        m['start_at_s'] = timed(m['start_at'], m.get('start_quote'))
+        said = None
+        if m.get('end_at'):
+            m['end_at_s'] = timed(m['end_at'], m.get('end_quote'))
+            said = _clock_s(m['end_at_s'] or m['end_at'])
+        m['resumed'] = [dict(r, at_s=timed(r['at'], r.get('quote'))) for r in m.get('resumed') or []]
+        opens = [_clock_s(m['start_at_s'] or m['start_at'])] + \
+            [_clock_s(r['at_s'] or r['at']) for r in m['resumed']]
+        checks.append((m, said, sorted({o for o in opens if o is not None})))
+
+    out = []
+    for i, (m, said, opens) in enumerate(checks):
+        others = sorted(o for j, (_, _, os) in enumerate(checks) if j != i for o in os)
+        segments = []
+        for at in opens:
+            reasons = [(o, 'next_check') for o in others if o > at]
+            if said is not None and said > at:
+                reasons.append((said, 'said'))
+            if stop is not None and stop > at:
+                reasons.append((stop, 'recording_stop'))
+            close, why = min(reasons) if reasons else (None, 'recording_stop')
+            if segments and segments[-1][1] is not None and at <= segments[-1][1]:
+                if close is None or close > segments[-1][1]:
+                    segments[-1] = [segments[-1][0], close, why]      # one stretch
+                continue
+            segments.append([at, close, why])
+        if segments:
+            m['segments'] = [{'from': _hms(a), 'to': _hms(b) if b is not None else None}
+                             for a, b, _ in segments]
+            last = segments[-1]
+            m['end_at_s'] = _hms(last[1]) if last[1] is not None else m.get('end_at_s')
+            m['end_at'] = m['end_at_s'][:5] if m.get('end_at_s') else m.get('end_at')
+            m['end_source'] = last[2]
+        else:
+            m['segments'] = []
+            m['end_source'] = 'said' if said is not None else 'recording_stop'
+        out.append(m)
+    return out
+
+
+def _clock_s(hms):
+    try:
+        parts = [int(x) for x in str(hms).split(':')]
+        return parts[0] * 3600 + parts[1] * 60 + (parts[2] if len(parts) > 2 else 0)
+    except (ValueError, IndexError, TypeError):
+        return None
+
+
+def _timed_inspections(raw, turns):
+    items = clean_inspections(raw)
+    try:
+        return time_inspections(items, turns)
+    except Exception:
+        logger.warning("inspections: could not time the windows; keeping the model's "
+                       "minutes", exc_info=True)
+        return items
 
 
 def _time_one_marker(marker, stream):
@@ -1033,9 +1159,7 @@ def _time_one_marker(marker, stream):
             best = (key, when)
     if best is None:
         return None
-    sec = int(best[1])
-    at_s = '%02d:%02d:%02d' % (sec // 3600, sec % 3600 // 60, sec % 60)
-    return dict(marker, at_s=at_s)
+    return dict(marker, at_s=_hms(best[1]))
 
 
 
@@ -1061,6 +1185,20 @@ EXTRACTION_SCHEMA = """{
       "at": "HH:MM  (the timestamp of the utterance itself)",
       "location": "the place named, e.g. Room 101 / Level 5 east",
       "quote": "the words that established it, verbatim"
+    }
+  ],
+  "inspections": [
+    {
+      "name": "the check as he named it, e.g. Level 1 pre-pour inspection",
+      "kind": "the TYPE of check without the place, e.g. pre-pour / steel / fire stopping",
+      "start_at": "HH:MM  (when he said he was starting it)",
+      "start_quote": "those words, verbatim",
+      "end_at": "HH:MM when he said it was finished, or null",
+      "end_quote": "those words, verbatim, or null",
+      "resumed": [
+        {"at": "HH:MM  (when he came BACK to this check after another one)",
+         "quote": "those words, verbatim"}
+      ]
     }
   ],
   "topics": [
@@ -1177,6 +1315,19 @@ def _instructions_block():
      marker can be diagnosed instead of guessed at.
    - Most meeting recordings contain NONE of these. An empty array is the normal answer and is
      strongly preferred over a marker you are unsure about.
+0b. INSPECTIONS. Note every check or inspection the speaker says he is STARTING now -- "starting
+   the pre-pour concrete check", "doing the level two steel inspection", "here is the Te Kaha
+   room inspection" -- and, if he says so, where it FINISHED -- "pre-pour check done", "that's the
+   steel inspection finished". These open the checklist for that check, for exactly that stretch
+   of the recording.
+   - One entry per check he performs. Going away and coming back to it ("back to the level one
+     pre-pour") is the SAME entry, not a new one: put the moment he comes back in `resumed`.
+   - `kind` is the type of check with the place left out ("pre-pour", "steel", "fire stopping");
+     `name` is what he called it, place included.
+   - end_at is null when he never says it ended -- do not guess an end.
+   - Do NOT record a check only discussed, planned or described ("we need the fire stopping
+     inspection next week", "this is how an inspection works"). An empty array is the normal
+     answer for a meeting.
 1. Split the transcript into topics BY SUBJECT -- one topic per distinct subject or work item.
    - Start a NEW topic whenever the conversation moves to a genuinely DIFFERENT subject (a
      different work item, trade, location, or concern) -- even if only a minute passes, even if the
@@ -2008,7 +2159,13 @@ def _trace_extraction(out, final, seconds):
         "pass": "final" if final else "live", "generation": out.get("generation"),
         "topics": len(out.get("topics") or []), "location_markers": len(markers),
         "markers_timed": sum(1 for m in markers if m.get("at_s")),
+        "inspections": len(out.get("inspections") or []),
         "declared_site": bool(out.get("declared_site"))})
+    for i in out.get("inspections") or []:
+        pipeline_trace.event("inspection", i.get("end_source") or "ok", detail={
+            "name": i.get("name"), "kind": i.get("kind"), "start": i.get("start_at_s")
+            or i.get("start_at"), "end": i.get("end_at_s") or i.get("end_at")},
+            evidence=i.get("start_quote"))
     for m in markers:
         pipeline_trace.event("location_marker", "timed" if m.get("at_s") else "minute_only",
                              detail={"location": m.get("location"), "at": m.get("at"),
@@ -2204,6 +2361,10 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
         # `at` and a `location` is dropped, which makes "no markers" and
         # "markers the shape of nonsense" the same, safe answer.
         'location_markers': _timed_markers(parsed.get('location_markers'), turns),
+        # Checks he said he was starting / had finished, each a window to the
+        # second (voice-triggered checklists). item-writer matches each to the
+        # company's checklist templates.
+        'inspections': _timed_inspections(parsed.get('inspections'), turns),
         'topics': parsed_topics,
         # Where each speaker label was heard, for the anonymous re-bind. Carried HERE, on the
         # final pass only, because of who can do what: this function has the turns and no
@@ -2245,6 +2406,15 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
         # out while this pass was thinking is still seen. item-writer turns the flag
         # into the one follow-up notes email.
         extraction['recovered_after_error'] = True
+    if final and _known_short(bucket, user_folder, date, session_base, keys, generation):
+        # THIS RECORD IS KNOWN TO BE SHORT, and a fuller one follows: transcripts
+        # landed while the model was thinking, and _rerun_if_the_session_grew
+        # (after the write) asks for it. item-writer still stores this one, but
+        # sends no email and makes no checklist report from it -- on TEST
+        # (2026-10-08, Ben_Lin_test2 11:36) the email went out from the first
+        # 90 seconds of a five-minute pre-pour check, 40 seconds before the full
+        # record, and only one email is sent per recording.
+        extraction['incomplete'] = True
 
     s3().put_object(
         Bucket=bucket, Key=out_key,
@@ -2356,6 +2526,20 @@ def _request_final_rerun(bucket, user_folder, date, session_base, generation=0,
                     "(generation %d)", session_base, reason, generation)
     except Exception:
         logger.exception("%s: could not request a final re-run", session_base)
+
+
+def _known_short(bucket, user_folder, date, session_base, gathered_keys, generation):
+    """True when transcripts this pass did not read have landed AND a re-run
+    will follow (the generation cap is not reached). Never raises: unknown
+    reads as complete, which is what every record was before this."""
+    if generation + 1 >= FINAL_RERUN_MAX_GENERATIONS:
+        return False
+    try:
+        fresh = gather_session_segments(bucket, user_folder, date, session_base)
+    except Exception:
+        logger.warning("%s: could not re-list before writing", session_base, exc_info=True)
+        return False
+    return set(fresh) > set(gathered_keys)
 
 
 def _rerun_if_the_session_grew(bucket, user_folder, date, session_base,

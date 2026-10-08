@@ -67,10 +67,12 @@ from photo_binding import PHOTOS_PER_TOPIC_CAP  # noqa: F401  (re-export)
 from photo_binding import list_pictures as _pb_list_pictures
 from repositories import users as users_repo
 from photo_binding import photos_for_topics as _photos_for_topics  # noqa: F401  (re-export)
+import checklist_reports
+import inspection_match
 import photo_rebind
 import pipeline_trace
 import thread_match
-from repositories import location_markers
+from repositories import inspection_windows, location_markers
 from repositories import (companies, findings, meeting_session, recordings,
                           redactions,
                           session_group, sites, threads, topics)
@@ -400,6 +402,15 @@ def _final_email_context(conn, session_base, extraction, date, follow_up=False):
             # Withholding would send them down the backstop, which quotes the
             # OTHER summariser -- the disagreement this whole change removes.
             "openTodos": _final_email_rows(extraction, date) + _topic_rows(extraction)}
+
+
+def email_checks(stored):
+    """[{check, template, from, to}] for the confirmation email: each spoken
+    check, with the checklist whose report is being written, or None when no
+    checklist matched."""
+    return [{"check": w.get("name"), "template": w.get("template_name"),
+             "from": (w.get("start_at") or "")[:5], "to": (w.get("end_at") or "")[:5]}
+            for w in stored or []]
 
 
 def _enqueue_final_email(ctx, put=None):
@@ -1053,6 +1064,17 @@ def write_extraction_items(date, user_folder, extraction_key):
         except Exception:  # noqa: BLE001 -- see above
             logger.exception("location markers not stored for %s/%s", user_folder, date)
 
+        # The checks he said he was doing (voice-triggered checklists), each
+        # matched to the company's checklist template by what kind of check it
+        # is (inspection_match). Never fatal, for the same reason as the markers.
+        stored_inspections = []
+        try:
+            stored_inspections = _store_inspections(conn, company["id"], user_id, user_folder, date,
+                               _parse_extraction_key(extraction_key)[2],
+                               extraction.get("inspections") or [])
+        except Exception:  # noqa: BLE001 -- see above
+            logger.exception("inspection windows not stored for %s/%s", user_folder, date)
+
         # Self-introduction suggestions ("Hi, this is Petros from Cassidy"), INSIDE the
         # connection block, deliberately -- `_request_rebind`/`_request_match` below are
         # called AFTER `with get_connection() as conn:` has closed (psycopg3's `with conn:`
@@ -1207,6 +1229,21 @@ def write_extraction_items(date, user_folder, extraction_key):
         except Exception:  # noqa: BLE001 -- see above
             logger.exception("day photo rebind failed for %s/%s", user_folder, date)
 
+        # A SPOKEN CHECK'S REPORT, MADE ON ITS OWN (owner, 2026-10-06): each check
+        # of a FINAL extraction that matched a checklist template goes to the
+        # report worker now, after the topics and their photos exist, so the
+        # filled checklist is waiting when he is back at the office. Never fatal.
+        if (extraction.get("tier") == "final" and stored_inspections
+                and not extraction.get("incomplete")):
+            try:
+                made = checklist_reports.auto_generate(
+                    conn, company["id"], user_folder, date,
+                    _parse_extraction_key(extraction_key)[2], stored_inspections)
+                if made:
+                    logger.info("checklist reports for %s: %s", extraction_key, made)
+            except Exception:  # noqa: BLE001 -- see above
+                logger.exception("checklist reports not queued for %s", extraction_key)
+
         if collected_topics:
             if SUGGEST_THREADS:
                 _suggest_threads(conn, site["id"], date, collected_topics)
@@ -1239,7 +1276,12 @@ def write_extraction_items(date, user_folder, extraction_key):
         # later, for a session that was sent long ago -- each would mail the
         # recorder about an old meeting. The session must be WAITING for it.
         final_email_ctx = None
-        if extraction.get("tier") == "final":
+        if extraction.get("tier") == "final" and extraction.get("incomplete"):
+            # A fuller final is on its way (lambda_extract_session._known_short):
+            # the email waits for it rather than describing part of the recording.
+            logger.info("%s: final record is known to be short -- the email waits for "
+                        "the re-run", extraction_key)
+        elif extraction.get("tier") == "final":
             final_email_ctx = _final_email_context(
                 conn, session_base, extraction, date,
                 follow_up=bool(extraction.get("recovered_after_error")))
@@ -1261,6 +1303,11 @@ def write_extraction_items(date, user_folder, extraction_key):
     # the merged record, and only the step that LANDS the result knows it
     # landed. This lambda is in-VPC and cannot invoke another (BUG-36), so the
     # request rides the same S3 channel as everything else crossing that line.
+    if final_email_ctx and stored_inspections:
+        # The checks heard in this recording, for one line in the email (owner,
+        # 2026-10-06): the email goes out before a check's report is written, and
+        # without this the recorder learns about it only from the web or the bell.
+        final_email_ctx["checks"] = email_checks(stored_inspections)
     if final_email_ctx:
         try:
             _enqueue_final_email(final_email_ctx)
@@ -1370,6 +1417,29 @@ def _source_is_deleted(conn, source_s3_key) -> bool:
         return False
     logger.info("deleted-source check: key=%s deleted=%s", source_s3_key, hit)
     return bool(hit)
+
+
+def _store_inspections(conn, company_id, user_id, user_folder, date, session, spoken):
+    """Match each spoken check to a checklist template and keep the windows.
+    On the trace either way: a check that matched nothing is the case the
+    owner most needs to see (a template named differently from how people
+    say it)."""
+    templates = inspection_windows.checklist_templates(conn, company_id, user_id) if spoken else []
+    rows = []
+    for w in spoken:
+        tpl, score = inspection_match.match(w, templates)
+        rows.append(dict(w, start_at=w.get("start_at_s") or (w["start_at"] + ":00"),
+                         end_at=w.get("end_at_s") or ((w["end_at"] + ":00") if w.get("end_at") else None),
+                         template_id=tpl["id"] if tpl else None,
+                         template_name=tpl["name"] if tpl else None,
+                         match_score=round(score, 2)))
+        pipeline_trace.event("checklist_match", "matched" if tpl else "no_match", detail={
+            "check": w.get("name"), "kind": w.get("kind"),
+            "template": tpl["name"] if tpl else None, "score": round(score, 2),
+            "candidates": sum(1 for t in templates if inspection_match.is_checklist(t.get("body")))},
+            evidence=w.get("start_quote"))
+    inspection_windows.replace_for_session(conn, company_id, user_folder, date, session, rows)
+    return rows
 
 
 def lambda_handler(event, context):
