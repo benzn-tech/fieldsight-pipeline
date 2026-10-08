@@ -24,6 +24,7 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   GET   /api/org/sites/{id}/contributors  → folders with topics attributed to
                                             (site,date); members∪this = the
                                             aggregated-timeline fan-out set
+  POST  /api/org/sites/{id}/external-members -> add an existing user of ANOTHER company to this site (admin / platform_admin)
   GET   /api/org/sites/{id}/members       → site's members from memberships (ACL,
                                              fixes legacy USERS ON SITE empty for Aurora-only sites)
   POST  /api/org/members/{sub}/(un)archive→ soft-delete / restore member (admin/gm, never self)
@@ -569,6 +570,9 @@ def dispatch(conn, event, method, route):
     m_sa = re.match(r"^/sites/([^/]+)/(archive|unarchive)$", route)
     if m_sa and method == "POST":
         return _directory_after(conn, archive_site_endpoint(conn, caller, m_sa.group(1), m_sa.group(2)))
+    m_sx = re.match(r"^/sites/([^/]+)/external-members$", route)
+    if m_sx and method == "POST":
+        return _directory_after(conn, add_external_member(conn, caller, m_sx.group(1), parse_body(event)))
     m_sm = re.match(r"^/sites/([^/]+)/members$", route)
     if m_sm and method == "GET":
         return list_site_members(conn, caller, m_sm.group(1))
@@ -5363,9 +5367,93 @@ def _resolve_staffing(conn, caller, target_sub, site_id, require_open_site):
     if require_open_site and site.get("archived_at"):
         return None, error("site is archived — unarchive it first", 409)
     target = users.get_user_by_sub(conn, target_sub)
-    if target is None or str(target.get("company_id")) != str(company_id):
+    if target is None:
         return None, error("member not found in your company", 404)
+    if str(target.get("company_id")) != str(company_id):
+        # An EXTERNAL member (added from another company by
+        # POST /sites/{id}/external-members) is on this roster by membership,
+        # not by employment: the site's company may re-role or remove them,
+        # and ONLY them -- a stranger with no external row here stays a 404.
+        mem = memberships.get_membership(conn, target["id"], site_id)
+        if not (mem and mem.get("external")):
+            return None, error("member not found in your company", 404)
     return (site, target), None
+
+
+def _notify_external_member(email, site_name, inviter_company_name):
+    """Tell a person from another company they were added to a project. Best
+    effort by contract: the membership is already written, so a failed or
+    unconfigured channel is logged and never fails the request.
+
+    org-api runs in the VPC and has no route to SES unless the stage provides one,
+    so the client is bounded (3s connect, no retries) rather than left to the
+    boto3 defaults, which would hold the request for the full 30s Lambda timeout.
+    EMAIL_SENDER defaults to 'stub' on this function (logs only) until the stage
+    is given a sender identity and a network path."""
+    try:
+        import email_sender
+        sender = email_sender.get_sender()
+        if isinstance(sender, email_sender.SesEmailSender) and sender._client is None:
+            import boto3
+            from botocore.config import Config
+            sender._client = boto3.client(
+                "ses", region_name=sender._region,
+                config=Config(connect_timeout=3, read_timeout=5, retries={"max_attempts": 1}))
+        subject = f"You've been added to {site_name} on FieldSight"
+        _NL = "\n"
+        text = (f"{inviter_company_name} has added you to the project \"{site_name}\" "
+                "on FieldSight." + _NL * 2 +
+                "Sign in with your usual FieldSight login: "
+                "the project now appears in your site list. Your own company and "
+                "your other projects are unchanged." + _NL)
+        sender.send(email, subject, text)
+    except Exception:  # noqa: BLE001 - see docstring
+        logger.exception("external member notice to %s failed (membership kept)", email)
+
+
+def add_external_member(conn, caller, site_id, body):
+    """Add an EXISTING FieldSight user from ANOTHER company to one of this
+    company's sites (project-owned tenancy P1). Admin of the site's company or
+    platform_admin only; gm / pm / site_manager / worker are refused.
+
+    The person keeps their home company and gets exactly this site, via a
+    membership marked external=true. A person created inside a project is still
+    that company's employee (create_member, unchanged) -- this route is the only
+    way an external row comes to exist."""
+    if caller["global_role"] not in ("admin", "platform_admin"):
+        return error("admin role required", 403)
+    site = sites.get_site(conn, site_id)
+    if site is None or (not is_cross_company(caller["global_role"])
+                        and str(site["company_id"]) != str(caller["company_id"])):
+        return error("site not found in your company", 404)
+    if body is None:
+        return error("malformed JSON body", 400)
+    email = body.get("email")
+    email = email.strip() if isinstance(email, str) else ""
+    if not email or "@" not in email:
+        return error("valid email is required", 400)
+    role = body.get("role")
+    if not isinstance(role, str) or role not in ALLOWED_MEMBERSHIP_ROLES:
+        return error(f"role must be one of {sorted(ALLOWED_MEMBERSHIP_ROLES)}", 400)
+    if site.get("archived_at"):
+        return error("site is archived — unarchive it first", 409)
+    target = users.get_user_by_email_global(conn, email)
+    if target is None:
+        return error("no FieldSight user with that email", 404)
+    if str(target.get("company_id")) == str(site["company_id"]):
+        return error("that person already works for this company — use the normal add member", 400)
+    existing = memberships.get_membership(conn, target["id"], site_id)
+    if existing is not None and existing.get("archived_at") is None:
+        return error("user is already a member of this site", 409)
+    row = memberships.add_external_membership(conn, target["id"], site_id, role)
+    site_company = companies.get_company_by_id(conn, site["company_id"]) or {}
+    _notify_external_member(target.get("email") or email, site.get("name") or "a project",
+                            site_company.get("name") or "A company")
+    return ok({"membership": {
+        **row,
+        "user_name": " ".join(p for p in (target.get("first_name"), target.get("last_name")) if p),
+        "home_company_name": target.get("company_name"),
+    }}, 201)
 
 
 def put_member_membership(conn, caller, target_sub, site_id, body):

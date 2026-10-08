@@ -2,7 +2,7 @@ from psycopg.rows import dict_row
 from repositories.acl import resolve_scope  # re-export
 
 __all__ = ["resolve_scope", "add_membership", "accessible_site_ids", "ensure_membership", "list_company_memberships",
-          "members_for_site", "caller_site_roles", "worker_user_ids_for_sites",
+          "members_for_site", "caller_site_roles", "get_membership", "add_external_membership", "worker_user_ids_for_sites",
           "user_ids_for_sites", "archive_membership"]
 
 
@@ -10,6 +10,29 @@ def add_membership(conn, user_id, site_id, role) -> dict:
     return conn.cursor(row_factory=dict_row).execute(
         "INSERT INTO memberships (user_id, site_id, role) VALUES (%s, %s, %s) "
         "RETURNING id, user_id, site_id, role, created_at",
+        (user_id, site_id, role),
+    ).fetchone()
+
+
+def get_membership(conn, user_id, site_id) -> dict | None:
+    """The (user, site) membership INCLUDING an archived one, so the caller can
+    tell 'already a member' (409) from 'was one, revive it'."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, user_id, site_id, role, external, created_at, archived_at "
+        "FROM memberships WHERE user_id=%s AND site_id=%s",
+        (user_id, site_id),
+    ).fetchone()
+
+
+def add_external_membership(conn, user_id, site_id, role) -> dict:
+    """Put a person from ANOTHER company on one site (project-owned tenancy P1).
+    Upsert on (user_id, site_id): an archived row is revived with the new role
+    and marked external. The caller has already refused a live membership, so
+    this never silently flips a live employee row to external."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "INSERT INTO memberships (user_id, site_id, role, external) VALUES (%s, %s, %s, true) "
+        "ON CONFLICT (user_id, site_id) DO UPDATE SET role=EXCLUDED.role, external=true, archived_at=NULL "
+        "RETURNING id, user_id, site_id, role, external, created_at",
         (user_id, site_id, role),
     ).fetchone()
 
@@ -66,11 +89,13 @@ def archive_membership(conn, user_id, site_id) -> dict | None:
 
 def list_company_memberships(conn, company_id) -> list[dict]:
     return conn.cursor(row_factory=dict_row).execute(
-        "SELECT m.user_id, u.cognito_sub, m.site_id, m.role "
+        "SELECT m.user_id, u.cognito_sub, m.site_id, m.role, m.external, "
+        "hc.name AS home_company_name "
         "FROM memberships m "
         "JOIN users u ON u.id = m.user_id "
         "JOIN sites s ON s.id = m.site_id "
-        "WHERE s.company_id = %s AND u.company_id = s.company_id AND m.archived_at IS NULL "
+        "LEFT JOIN companies hc ON hc.id = u.company_id "
+        "WHERE s.company_id = %s AND (u.company_id = s.company_id OR m.external) AND m.archived_at IS NULL "
         "ORDER BY u.created_at, m.created_at",
         (company_id,),
     ).fetchall()
@@ -79,8 +104,10 @@ def list_company_memberships(conn, company_id) -> list[dict]:
 def count_by_site(conn, site_ids) -> dict:
     """Active-member count per site, for the Sites-page card KPIs. Returns
     {site_id(str): count}; sites with no members are absent (caller defaults
-    to 0). In-company invariant enforced via the users<->sites join, so it is
-    correct for every caller including the cross-company platform_admin."""
+    to 0). Counts everyone holding a live membership, external members from
+    other companies included (an UNflagged cross-company row is bad data and
+    still dropped) (project-owned tenancy: the site's roster, not the
+    site company's payroll)."""
     if not site_ids:
         return {}
     rows = conn.cursor(row_factory=dict_row).execute(
@@ -88,7 +115,7 @@ def count_by_site(conn, site_ids) -> dict:
         "FROM memberships m "
         "JOIN users u ON u.id = m.user_id "
         "JOIN sites s ON s.id = m.site_id "
-        "WHERE m.site_id = ANY(%s) AND u.company_id = s.company_id "
+        "WHERE m.site_id = ANY(%s) AND (u.company_id = s.company_id OR m.external) "
         "AND m.archived_at IS NULL AND u.archived_at IS NULL "
         "GROUP BY m.site_id",
         (list(site_ids),),
@@ -101,11 +128,13 @@ def list_all_memberships(conn) -> list[dict]:
     list_company_memberships without the company pin; the in-company invariant
     (u.company_id = s.company_id) is still enforced so mis-tenanted rows drop."""
     return conn.cursor(row_factory=dict_row).execute(
-        "SELECT m.user_id, u.cognito_sub, m.site_id, m.role "
+        "SELECT m.user_id, u.cognito_sub, m.site_id, m.role, m.external, "
+        "hc.name AS home_company_name "
         "FROM memberships m "
         "JOIN users u ON u.id = m.user_id "
         "JOIN sites s ON s.id = m.site_id "
-        "WHERE u.company_id = s.company_id AND m.archived_at IS NULL "
+        "LEFT JOIN companies hc ON hc.id = u.company_id "
+        "WHERE (u.company_id = s.company_id OR m.external) AND m.archived_at IS NULL "
         "ORDER BY u.created_at, m.created_at",
     ).fetchall()
 
@@ -115,19 +144,22 @@ def members_for_site(conn, company_id, site_id) -> list[dict]:
     /api/org/sites/{id}/members -- the Aurora replacement for legacy
     /site-users, which read config/user_mapping.json and so returned []
     for Aurora-only sites (visibility spec §1.1 'USERS ON SITE empty').
-    Company-pinned on BOTH sides of the join (multi-tenant invariant) and
-    excludes archived members/memberships. Returns each user's display
-    columns plus the per-site membership role (site_role)."""
+    Pinned to the SITE's company; the members themselves may belong to
+    another company (external=true, project-owned tenancy P1) and carry
+    home_company_name. Excludes archived members/memberships. Returns each
+    user's display columns plus the per-site membership role (site_role)."""
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT u.id, u.cognito_sub, u.first_name, u.last_name, u.folder_name, "
-        "u.avatar_s3_key, u.global_role, m.role AS site_role "
+        "u.avatar_s3_key, u.global_role, m.role AS site_role, m.external, "
+        "hc.name AS home_company_name "
         "FROM memberships m "
         "JOIN users u ON u.id = m.user_id "
         "JOIN sites s ON s.id = m.site_id "
-        "WHERE m.site_id = %s::uuid AND s.company_id = %s AND u.company_id = %s "
+        "LEFT JOIN companies hc ON hc.id = u.company_id "
+        "WHERE m.site_id = %s::uuid AND s.company_id = %s AND (u.company_id = s.company_id OR m.external) "
         "AND m.archived_at IS NULL AND u.archived_at IS NULL "
         "ORDER BY u.first_name, u.last_name",
-        (site_id, company_id, company_id),
+        (site_id, company_id),
     ).fetchall()
 
 

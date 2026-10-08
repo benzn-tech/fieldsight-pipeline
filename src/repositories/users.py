@@ -33,6 +33,20 @@ def upsert_user(conn, cognito_sub, email, company_id=None, first_name=None,
     ).fetchone()
 
 
+def get_user_by_email_global(conn, email) -> dict | None:
+    """A LIVE user by exact login email (case-insensitive), across ALL companies,
+    with their home company's name. Used only to add an existing person from
+    another company to a project (project-owned tenancy P1) -- never to search.
+    Archived users are not found. Emails are unique per login in practice; if
+    two rows ever shared one, the oldest wins, deterministically."""
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT users.{', users.'.join(_COLS.split(', '))}, c.name AS company_name "
+        f"FROM users LEFT JOIN companies c ON c.id = users.company_id "
+        f"WHERE lower(users.email) = lower(%s) AND users.archived_at IS NULL "
+        f"ORDER BY users.created_at LIMIT 1", (email,)
+    ).fetchone()
+
+
 def get_user_by_sub(conn, cognito_sub) -> dict | None:
     """The caller, with their company's voiceprint basis carried alongside.
 
