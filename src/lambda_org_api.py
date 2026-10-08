@@ -396,7 +396,7 @@ def lambda_handler(event, context):
             return republish_all_site_coords(conn)
     if isinstance(event, dict) and event.get("task") == REPUBLISH_DIRECTORY_TASK:
         with get_connection() as conn:
-            return republish_directory(conn)
+            return republish_directory(conn, dry_run=event.get("dry_run") is True)
     # OPERATOR TASK, invoked by hand with `aws lambda invoke` (IAM decides who
     # may). The same envelope rule as above keeps it out of reach of the API.
     # A dry run unless "apply" is exactly true: a typo must not write.
@@ -4922,14 +4922,25 @@ def _build_directory(conn):
     return directory.build(
         directory_repo.live_users(conn), directory_repo.live_memberships(conn),
         directory_repo.live_sites(conn),
-        datetime.now(timezone.utc).isoformat(timespec="seconds"))
+        datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        activity=directory_repo.recent_activity(conn, directory.PRIMARY_SITE_WINDOW_DAYS))
 
 
 def _write_directory_if_changed(conn):
     """Build from Aurora, compare with what is published, write if different.
     Returns (changed, doc). Raises on failure; callers decide how loudly."""
-    doc = _build_directory(conn)
-    current = _get_lake_json(directory.KEY)
+    # A SAVEPOINT. The request runs in one transaction that `with conn:` commits
+    # on a clean exit; a failing SELECT in here would otherwise abort it, the
+    # commit would become a rollback, and the caller would be told "saved" for a
+    # save that was thrown away.
+    with conn.transaction():
+        doc = _build_directory(conn)
+    try:
+        current = _get_lake_json(directory.KEY)
+    except ValueError:
+        # A corrupt object must not be unfixable: treat it as changed.
+        logger.error("directory: %s is not valid JSON; overwriting", directory.KEY)
+        current = None
     if directory.same_content(doc, current):
         return False, doc
     s3().put_object(
@@ -4962,11 +4973,17 @@ def _publish_directory(conn):
         logger.exception("directory: publish failed")
 
 
-def republish_directory(conn):
+def republish_directory(conn, dry_run=False):
     """The daily safety net (04:35 NZ, after site coordinates, before the 05:00
     reports): publishes from Aurora whether or not anyone saved anything, so a
     path that changes the directory without a hook still lands within a day,
     and a stage that has never published gets its first object."""
+    if dry_run:
+        # Read-only: what WOULD be published, to compare with the file the
+        # pipeline reads today before the first real publish.
+        with conn.transaction():
+            doc = _build_directory(conn)
+        return {"dry_run": True, "document": doc}
     changed, doc = _write_directory_if_changed(conn)
     logger.info("directory: republish %s (%d people, %d sites)",
                 "wrote" if changed else "found nothing to change",

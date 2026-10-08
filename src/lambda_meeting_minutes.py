@@ -371,7 +371,7 @@ def collect_transcripts(bucket, target_date, user_filter=None, custom_prefix=Non
         # and the folder the recording was filed under already says who it is.
         # An unknown folder leaves the device-derived name untouched.
         folder_of_key, _d = _user_and_date_from_key(key)
-        if normalized and folder_of_key in user_mapping:
+        if normalized and (user_mapping.get(folder_of_key) or '').strip():
             normalized['speaker_name'] = user_mapping[folder_of_key]
         if normalized and normalized.get('full_text'):
             normalized['key'] = key

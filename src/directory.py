@@ -15,12 +15,18 @@ single place that reads it. Same shape of solution as `site_coords.py`.
 
 SHAPE (keyed by identity -- the recording folder -- not by display name)::
 
-    {"version": 1, "published_at": ISO,
+    {"version": 2, "published_at": ISO,
      "people": {"<folder_name>": {"name", "role", "company_id",
-                                  "primary_site": "<slug>|null",
-                                  "sites": ["<slug>", ...]}},
-     "sites":  {"<slug>": {"name", "location", "client", "company_id",
-                           "site_id"}}}
+                                  "primary_site": "<site id>|null",
+                                  "sites": ["<site id>", ...]}},
+     "sites":  {"<site id>": {"slug", "name", "location", "client",
+                              "company_id"}}}
+
+SITES ARE KEYED BY ID, NOT SLUG. A slug is unique per company only
+(`idx_sites_company_slug`), so a slug-keyed document lets two tenants'
+`main-site` overwrite one another and stamps one company's name and weather on
+the other's reports. Readers that need the slug string (report paths, which
+must not change) take it from the entry.
 
 TRANSITION FALLBACK. If `config/directory.json` is absent, the old
 `config/user_mapping.json` is read and adapted to the same shape, with one
@@ -38,7 +44,11 @@ logger = logging.getLogger(__name__)
 
 KEY = "config/directory.json"
 LEGACY_KEY = "config/user_mapping.json"
-VERSION = 1
+VERSION = 2
+LEGACY_PREFIX = "legacy:"
+
+# primary_site looks at this much recent activity when a person has several sites.
+PRIMARY_SITE_WINDOW_DAYS = 30
 
 # Codes that mean "no such object" for a caller that holds GetObject but not
 # ListBucket on the key: S3 answers 403, not 404, for a missing key then.
@@ -63,7 +73,7 @@ def display_name(first, last):
     return " ".join(p.strip() for p in (first, last) if p and p.strip())
 
 
-def build(user_rows, membership_rows, site_rows, published_at):
+def build(user_rows, membership_rows, site_rows, published_at, activity=None):
     """Rows from Aurora -> the document.
 
     `user_rows`: live users (archived already excluded) with folder_name,
@@ -71,45 +81,64 @@ def build(user_rows, membership_rows, site_rows, published_at):
     `membership_rows`: live memberships on live sites, user_id + site_id.
     `site_rows`: live sites. Archived users and sites are simply absent, and a
     user without a folder has nothing the pipeline could key them by.
+    `activity`: [{user_id, site_id, n, latest}] -- topics by that user on that
+    site in the last PRIMARY_SITE_WINDOW_DAYS days, used to choose a primary
+    site among several.
     """
     sites = {}
-    slug_by_id = {}
     for s in site_rows:
-        slug = site_coords.slug_for_site(s)
-        if not slug:
-            continue
-        slug_by_id[str(s["id"])] = slug
-        sites[slug] = {
+        sid = str(s["id"])
+        sites[sid] = {
+            "slug": site_coords.slug_for_site(s),
             "name": s.get("name") or "",
             "location": s.get("location"),
             "client": s.get("client"),
             "company_id": str(s["company_id"]) if s.get("company_id") else None,
-            "site_id": str(s["id"]),
         }
     by_user = {}
     for m in membership_rows:
-        slug = slug_by_id.get(str(m["site_id"]))
-        if slug:
+        sid = str(m["site_id"])
+        if sid in sites:
             mine = by_user.setdefault(str(m["user_id"]), [])
-            if slug not in mine:
-                mine.append(slug)
+            if sid not in mine:
+                mine.append(sid)
+    act = {}
+    for a in (activity or []):
+        act[(str(a["user_id"]), str(a["site_id"]))] = (a.get("n") or 0, a.get("latest"))
     people = {}
     for u in user_rows:
         folder = u.get("folder_name")
         if not folder:
             continue
-        mine = sorted(by_user.get(str(u["id"]), []))
+        uid = str(u["id"])
+        mine = sorted(by_user.get(uid, []))
         people[folder] = {
             "name": display_name(u.get("first_name"), u.get("last_name")) or folder,
             "role": u.get("global_role") or "",
             "company_id": str(u["company_id"]) if u.get("company_id") else None,
-            # Exactly one open site is unambiguous; with several, naming one
-            # would be a guess that gets stamped on a report.
-            "primary_site": mine[0] if len(mine) == 1 else None,
+            "primary_site": primary_site(uid, mine, act),
             "sites": mine,
         }
     return {"version": VERSION, "published_at": published_at,
             "people": dict(sorted(people.items())), "sites": dict(sorted(sites.items()))}
+
+
+def primary_site(user_id, site_ids, act):
+    """Exactly one live membership: that site. Several: the one where this
+    person had the most topics in the last 30 days, ties to the one with the
+    latest topic; no recent topics on any of them: null (naming one would be a
+    guess that gets stamped on a report)."""
+    if len(site_ids) == 1:
+        return site_ids[0]
+    best = None
+    for sid in site_ids:
+        n, latest = act.get((user_id, sid), (0, None))
+        if n <= 0:
+            continue
+        key = (n, str(latest or ""))
+        if best is None or key > best[0]:
+            best = (key, sid)
+    return best[1] if best else None
 
 
 def same_content(a, b):
@@ -127,10 +156,14 @@ def adapt_legacy(data):
     """user_mapping.json -> the directory shape. People are keyed by the
     underscored display name, which is the folder convention (`Ben_Lin`); the
     device ids in `mapping` are dropped because nothing downstream is keyed by
-    them any more."""
+    them any more. The slug-keyed `sites` block becomes id-keyed with
+    `legacy:<slug>` ids (the old file has no ids)."""
     out = empty()
     if not isinstance(data, dict):
         return out
+    for slug, info in (data.get("sites") or {}).items():
+        if isinstance(info, dict):
+            out["sites"][LEGACY_PREFIX + slug] = {**info, "slug": slug}
     for _device, value in (data.get("mapping") or {}).items():
         if not isinstance(value, dict):
             continue
@@ -141,10 +174,8 @@ def adapt_legacy(data):
         sites = list(value.get("sites") or ([primary] if primary else []))
         out["people"][name.replace(" ", "_")] = {
             "name": name, "role": value.get("role") or "", "company_id": None,
-            "primary_site": primary, "sites": sites}
-    for slug, info in (data.get("sites") or {}).items():
-        if isinstance(info, dict):
-            out["sites"][slug] = dict(info)
+            "primary_site": LEGACY_PREFIX + primary if primary else None,
+            "sites": [LEGACY_PREFIX + x for x in sites]}
     return out
 
 
@@ -192,8 +223,18 @@ def load(s3_client, bucket):
 
 
 def person(doc, folder):
-    return ((doc or {}).get("people") or {}).get(folder) or {}
+    """The person for a folder. A name with spaces (`Ben Lin`) also finds
+    `Ben_Lin`: old reports recorded the display name as the user."""
+    people = (doc or {}).get("people") or {}
+    if folder in people:
+        return people[folder] or {}
+    if isinstance(folder, str):
+        return people.get(folder.replace(" ", "_")) or {}
+    return {}
 
 
 def names_by_folder(doc):
-    return {f: p.get("name") or f for f, p in ((doc or {}).get("people") or {}).items()}
+    """{folder: display name}, people with no name left out (the folder itself
+    is not a name)."""
+    return {f: p["name"] for f, p in ((doc or {}).get("people") or {}).items()
+            if isinstance(p, dict) and (p.get("name") or "").strip()}

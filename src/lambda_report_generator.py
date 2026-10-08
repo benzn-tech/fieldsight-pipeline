@@ -346,12 +346,24 @@ def download_json_from_s3(bucket, key):
 MANAGER_ROLES = ('site_manager', 'pm', 'regional_manager', 'gm', 'admin')
 
 def get_user_site_mapping(bucket):
+    """(primary_site, all_sites, roles, sites_info), keyed by recording folder
+    for the people maps and by SITE ID for the sites. Slugs are unique per
+    company only, so nothing here is keyed by slug; each sites_info entry
+    carries its `slug`, which is what report paths use."""
     doc = directory.load(s3_client, bucket)
-    # Coordinates are published separately (site_coords.py) and laid over the
-    # directory's sites. Absent or unreadable, this is a no-op.
-    sites_info = site_coords.overlay_sites_info(
-        doc.get('sites', {}),
-        download_json_from_s3(bucket, site_coords.KEY) or {})
+    # Coordinates are published separately (site_coords.py, slug-keyed) and laid
+    # over each site. Absent or unreadable, this is a no-op.
+    coords = download_json_from_s3(bucket, site_coords.KEY) or {}
+    sites_info = {}
+    for sid, entry in (doc.get('sites') or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        slug = entry.get('slug') or sid
+        merged = site_coords.overlay_sites_info({slug: entry}, coords).get(slug, dict(entry))
+        merged['slug'] = slug
+        if not sid.startswith(directory.LEGACY_PREFIX):
+            merged.setdefault('site_uuid', sid)
+        sites_info[sid] = merged
     user_primary_site = {}
     user_all_sites = {}
     user_roles = {}
@@ -368,7 +380,20 @@ def get_user_site_mapping(bucket):
             user_all_sites[folder] = [primary]
         if p.get('role'):
             user_roles[folder] = p['role']
-    return user_primary_site, user_all_sites, user_roles, sites_info
+    return (_SpacedKeys(user_primary_site), _SpacedKeys(user_all_sites),
+            _SpacedKeys(user_roles), sites_info)
+
+
+class _SpacedKeys(dict):
+    """A lookup by folder that also finds it by the spaced display name: old
+    daily reports recorded `Ben Lin` as the user where current ones say
+    `Ben_Lin`."""
+    def get(self, key, default=None):
+        if key in self:
+            return self[key]
+        if isinstance(key, str) and key.replace(' ', '_') in self:
+            return self[key.replace(' ', '_')]
+        return default
 
 
 # ============================================================
@@ -1642,6 +1667,7 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
         user_role = user_roles.get(user_name, '')
         user_site_id = user_primary_site.get(user_name, '')
         user_site_info = sites_info.get(user_site_id, {})
+        user_site_slug = user_site_info.get('slug') or user_site_id
         user_site_name = site_name_for(user_site_info)
 
         today_iso = get_nzdt_now().strftime('%Y-%m-%d')
@@ -1649,13 +1675,13 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
         weather_findings = build_weather_findings(
             user_site_info, target_date, today_iso,
             programme=programme_for_site(user_site_info))
-        record_site = weather_record_site(user_site_info, user_site_id)
+        record_site = weather_record_site(user_site_info, user_site_slug)
         if weather_findings and record_site:
             try:
                 s3_client.put_object(
                     Bucket=S3_BUCKET,
                     Key=weather_record_key(record_site, target_date, weather_findings["actual"]),
-                    Body=json.dumps({"site_id": record_site, "site_slug": user_site_id,
+                    Body=json.dumps({"site_id": record_site, "site_slug": user_site_slug,
                                      "date": target_date,
                                      "daily": weather_block, **weather_findings},
                                     default=str).encode("utf-8"),
@@ -1814,7 +1840,7 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
         except Exception as e:
             logger.error(f"Word generation failed for {user_name}: {e}")
 
-        site_id = user_site_id or site_name.lower().replace(' ', '-')
+        site_id = user_site_slug or site_name.lower().replace(' ', '-')
         write_items_to_dynamodb(site_id, target_date, topics, user_name, device)
         write_report_to_dynamodb(site_id, target_date, 'daily', json_key, user_name,
             visible_count=len(topics),
@@ -2009,6 +2035,7 @@ def generate_periodic_report(report_type, start_date, end_date, user=None, trigg
         logger.info(f"  Generating {report_type} report for user: {user_name} ({len(user_reports)} daily reports)")
         user_site_id = user_primary_site.get(user_name, '')
         user_site_info = sites_info.get(user_site_id, {})
+        user_site_slug = user_site_info.get('slug') or user_site_id
         user_site_name = site_name_for(user_site_info)
         user_role = user_roles.get(user_name, '')
 
@@ -2031,7 +2058,7 @@ def generate_periodic_report(report_type, start_date, end_date, user=None, trigg
             'report_date': end_date, 'report_type': report_type,
             'period': {'start': start_date, 'end': end_date},
             'user_name': user_name, 'role': user_role,
-            'site': user_site_name, 'site_id': user_site_id,
+            'site': user_site_name, 'site_id': user_site_slug,
             **claude_output,
             '_report_metadata': {
                 'version': 'v3.5', 'generated_at': now_iso, 'generated_by': triggered_by,
@@ -2083,8 +2110,16 @@ def generate_periodic_report(report_type, start_date, end_date, user=None, trigg
             reports_by_site.setdefault(sid, []).extend(user_reports)
 
     per_site_results = {}
-    for site_id, site_reports in reports_by_site.items():
-        site_info = sites_info.get(site_id, {})
+    used_slugs = set()
+    for site_key, site_reports in reports_by_site.items():
+        site_info = sites_info.get(site_key, {})
+        # The report path and site_id stay the slug string, as they always were.
+        # Two sites sharing a slug (different companies) must not write one path:
+        # the second falls back to its id.
+        site_id = site_info.get('slug') or site_key
+        if site_id in used_slugs:
+            site_id = site_key
+        used_slugs.add(site_id)
         site_display_name = site_info.get('name', site_name)
         site_location = site_info.get('location', '')
         site_client = site_info.get('client', '')

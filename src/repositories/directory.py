@@ -26,3 +26,15 @@ def live_memberships(conn):
         "JOIN users u ON u.id = m.user_id JOIN sites s ON s.id = m.site_id "
         "WHERE m.archived_at IS NULL AND u.archived_at IS NULL "
         "AND s.archived_at IS NULL AND u.company_id = s.company_id").fetchall()
+
+
+def recent_activity(conn, days):
+    """Topics per (user, site) over the last `days` days: how a person with
+    several sites is told to have a primary one. Deleted/hidden topics are not
+    distinguished -- this only ranks sites against each other."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT user_id, site_id, count(*) AS n, "
+        "max(coalesce(occurred_at, report_date::timestamptz)) AS latest "
+        "FROM topics WHERE user_id IS NOT NULL "
+        "AND report_date >= current_date - %s::int GROUP BY user_id, site_id",
+        (int(days),)).fetchall()

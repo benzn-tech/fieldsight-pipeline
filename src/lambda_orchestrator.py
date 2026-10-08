@@ -175,12 +175,11 @@ def load_user_mapping(bucket):
     raw_mapping = data.get('mapping', {}) if isinstance(data, dict) else {}
     normalized = {}
     for device, value in raw_mapping.items():
-        if isinstance(value, str):
-            normalized[device] = value
-        elif isinstance(value, dict):
-            normalized[device] = value.get('name', device)
-        else:
-            normalized[device] = str(value)
+        # An entry with no name is NOT mapped: the device id is not a person.
+        name = value if isinstance(value, str) else (
+            value.get('name') if isinstance(value, dict) else str(value))
+        if isinstance(name, str) and name.strip():
+            normalized[device] = name.strip()
     if not normalized:
         logger.error("User mapping names nobody, refusing to file media")
         raise MappingUnavailable("config/user_mapping.json has no mapping entries")
@@ -847,12 +846,18 @@ def lambda_handler(event, context):
     logger.info(f"S3 Bucket: {config['s3_bucket']}")
     logger.info(f"Time difference: {config['time_difference_ms']}ms")
 
+    # Pre-load user mapping. Unavailable means nothing can be filed: say so
+    # once and stop, without raising (an error per sweep would alarm for as
+    # long as the schedule runs, and nothing would be filed either way).
+    try:
+        load_user_mapping(config['s3_bucket'])
+    except MappingUnavailable:
+        logger.error("Orchestrator sweep skipped: device mapping unavailable")
+        return {'skipped': 'mapping unavailable'}
+
     # Login via realptt.com
     http = create_http_client()
     session_id = login(http, config['account'], config['password'])
-
-    # Pre-load user mapping
-    load_user_mapping(config['s3_bucket'])
 
     # Statistics
     stats = {
@@ -913,6 +918,7 @@ def lambda_handler(event, context):
     logger.info(f"  Already exists:  {stats['already_exists']}")
     logger.info(f"  Downloads fired: {stats['triggered']}")
     logger.info(f"  In progress:     {stats['in_progress']}")
+    logger.info(f"  Unmapped device: {stats['unmapped_device']}")
     logger.info(f"  By type: {stats['by_type']}")
     logger.info(f"  By user:")
     for user, count in stats['by_user'].items():

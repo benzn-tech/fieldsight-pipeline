@@ -72,3 +72,13 @@ remaining reader, so this waits on M3.
 - report-generator: a daily report for `Deandre__Alberts` gets his role and site from the directory, not from a name match.
 - meeting-minutes: the speaker name comes from the folder.
 - The orchestrator refuses to file under a device folder.
+
+## Final review notes (2026-10-08)
+
+Shape change from review: `sites` is keyed by site **id** (slugs are unique per company only); each entry carries `slug`, and people's `primary_site`/`sites` hold ids. Legacy fallback uses `legacy:<slug>` ids. `primary_site`: one live membership, else the site with most topics by that person in 30 days (tie: latest), else null. `{"task": "republish_directory", "dry_run": true}` returns the built document without writing.
+
+Accepted, not fixed:
+- F7: publish runs before commit, so a failed commit or a concurrent request can leave the object briefly ahead of or behind the database; the daily republish repairs it. No S3 timeout is configured on the shared client (same as site coordinates).
+- F9: weekly/monthly runs now make one LLM call per site that has members (previously unplaced people collapsed into one default bucket). Count `reports_by_site` after the first publish and watch the 900 s ceiling.
+- F10: the role vocabulary change is intended (gm/admin/regional_manager now reach the prompt). `AccessDenied` on `directory.json` reads as absent and falls back with a WARNING; the "zero fallback WARNINGs for a week" gate is the backstop. A WARNING right after first deploy, before the first publish, is expected.
+- Two sites sharing a slug across companies still share the slug-keyed `site-coords.json`, and a weekly site report whose slug was already written in the same run falls back to the site id for its path.

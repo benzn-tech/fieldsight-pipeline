@@ -26,14 +26,14 @@ DIRECTORY_DOC = {
     "version": 1, "published_at": "2026-10-08T00:00:00+00:00",
     "people": {
         "Deandre__Alberts": {"name": "Deandre Alberts", "role": "gm", "company_id": "co-1",
-                             "primary_site": "alpha-school", "sites": ["alpha-school"]},
+                             "primary_site": "id-a", "sites": ["id-a"]},
         "Ben_Lin": {"name": "Ben Lin", "role": "pm", "company_id": "co-2",
-                    "primary_site": None, "sites": ["a", "b"]},
+                    "primary_site": None, "sites": ["id-a", "id-b"]},
     },
     "sites": {
-        "alpha-school": {"name": "Alpha School", "location": "Chch", "client": "MoE",
-                         "company_id": "co-1", "site_id": "uuid-a"},
-        "other-tenant": {"name": "Alpha Schooling", "company_id": "co-2"},
+        "id-a": {"slug": "main-site", "name": "Alpha School", "location": "Chch",
+                 "client": "MoE", "company_id": "co-1"},
+        "id-b": {"slug": "main-site", "name": "Alpha Schooling", "company_id": "co-2"},
     },
 }
 LEGACY_DOC = {
@@ -91,8 +91,9 @@ def test_load_adapts_the_old_file_and_warns_once(caplog):
         directory.load(s3, "b")      # cached: no second read, no second warning
     ben = doc["people"]["Ben_Lin"]
     assert ben["name"] == "Ben Lin" and ben["role"] == "site_manager"
-    assert ben["primary_site"] == "uc-pk" and ben["sites"] == ["uc-pk"]
-    assert doc["sites"]["uc-pk"]["name"] == "UC PK"
+    assert ben["primary_site"] == "legacy:uc-pk" and ben["sites"] == ["legacy:uc-pk"]
+    assert doc["sites"]["legacy:uc-pk"]["name"] == "UC PK"
+    assert doc["sites"]["legacy:uc-pk"]["slug"] == "uc-pk"
     assert "Benl1" not in doc["people"]          # device ids are not carried over
     warnings = [r for r in caplog.records if "falling back to user_mapping.json" in r.getMessage()]
     assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
@@ -131,10 +132,23 @@ def test_THE_a_daily_report_for_deandre_gets_role_and_site_from_the_directory(mo
                         lambda bucket, key: json.loads(s3.objects[key]) if key in s3.objects else None)
     primary, allsites, roles, sites_info = rg.get_user_site_mapping("b")
     assert roles["Deandre__Alberts"] == "gm"
-    assert primary["Deandre__Alberts"] == "alpha-school"
-    assert allsites["Ben_Lin"] == ["a", "b"] and "Ben_Lin" not in primary
-    assert sites_info["alpha-school"]["name"] == "Alpha School"
-    assert rg.site_name_for(sites_info["alpha-school"]) == "Alpha School"
+    assert primary["Deandre__Alberts"] == "id-a"
+    assert allsites["Ben_Lin"] == ["id-a", "id-b"] and "Ben_Lin" not in primary
+    # Two companies share the slug `main-site`: neither overwrites the other.
+    assert sites_info["id-a"]["name"] == "Alpha School"
+    assert sites_info["id-b"]["name"] == "Alpha Schooling"
+    assert sites_info["id-a"]["slug"] == sites_info["id-b"]["slug"] == "main-site"
+    assert rg.site_name_for(sites_info["id-a"]) == "Alpha School"
+
+
+def test_the_spaced_display_name_finds_the_folder(monkeypatch):
+    s3 = FakeS3({directory.KEY: DIRECTORY_DOC})
+    monkeypatch.setattr(rg, "s3_client", s3)
+    monkeypatch.setattr(rg, "download_json_from_s3",
+                        lambda bucket, key: json.loads(s3.objects[key]) if key in s3.objects else None)
+    _p, allsites, roles, _s = rg.get_user_site_mapping("b")
+    assert roles.get("Ben Lin") == "pm" and allsites.get("Ben Lin") == ["id-a", "id-b"]
+    assert roles.get("Nobody Here", "") == ""
 
 
 def test_the_weekly_prompt_accepts_the_global_role_vocabulary():
@@ -186,6 +200,12 @@ def test_an_unknown_folder_keeps_the_device_name_unchanged(monkeypatch):
     assert got and got[0]["speaker_name"] == got[0]["device"]
 
 
+def test_a_nameless_person_does_not_override_the_device_name(monkeypatch):
+    got = _collect(monkeypatch, "Ben_UCPK_", {})
+    assert got and got[0]["speaker_name"] == got[0]["device"]
+    assert directory.names_by_folder({"people": {"X": {"name": " "}, "Y": {"name": "Y Y"}}}) == {"Y": "Y Y"}
+
+
 def test_minutes_names_come_from_the_directory(monkeypatch):
     s3 = FakeS3({directory.KEY: DIRECTORY_DOC})
     monkeypatch.setattr(mm, "s3_client", s3)
@@ -206,7 +226,15 @@ def test_the_site_match_reads_the_directory_and_is_scoped_to_the_speakers_compan
     assert es._fuzzy_match_site("Alpha Schooling", "Ben_Lin") == "Alpha Schooling"
     assert es._fuzzy_match_site("Alpha School", "Ben_Lin") == "Alpha Schooling"
     # An unknown speaker: every site, as before.
-    assert es._fuzzy_match_site("Alpha Schooling", "nobody") == "Alpha Schooling"
+    # An unknown speaker while the directory carries company ids: NO match.
+    assert es._fuzzy_match_site("Alpha Schooling", "nobody") is None
+    assert es._fuzzy_match_site("Alpha School", None) is None
+
+
+def test_the_legacy_directory_with_no_company_ids_still_matches_unscoped(monkeypatch):
+    monkeypatch.setattr(es, "s3", lambda: FakeS3({directory.LEGACY_KEY: LEGACY_DOC}))
+    monkeypatch.setattr(es, "_sites_cache", None)
+    assert es._fuzzy_match_site("UC PK", "anybody") == "UC PK"
 
 
 # ---- orchestrator -----------------------------------------------------------------
@@ -237,6 +265,24 @@ def test_an_empty_mapping_is_unavailable_too(orch_s3):
     orch_s3({"config/user_mapping.json": {"mapping": {}}})
     with pytest.raises(orch.MappingUnavailable):
         orch.load_user_mapping("b")
+
+
+def test_THE_a_missing_mapping_skips_the_sweep_without_raising(orch_s3, monkeypatch):
+    orch_s3({})
+    monkeypatch.setattr(orch, "get_config", lambda: {
+        "s3_bucket": "b", "start_days_ago": 1, "time_difference_ms": 0, "account": "a",
+        "password": "p", "download_audio": True, "download_video": True,
+        "download_files": True}, raising=False)
+    monkeypatch.setattr(orch, "login", lambda *a, **k: pytest.fail("must not log in"))
+    out = orch.lambda_handler({}, None)
+    assert out == {"skipped": "mapping unavailable"}
+
+
+def test_a_mapping_entry_with_no_name_is_unmapped(orch_s3):
+    orch_s3({"config/user_mapping.json": {"mapping": {"Benl1": {"role": "x"}, "Benl2": "Ann Lee"}}})
+    assert orch.load_user_mapping("b") == {"Benl2": "Ann Lee"}
+    with pytest.raises(orch.UnmappedDevice):
+        orch.get_display_name("Benl1", "b")
 
 
 def test_a_device_nobody_owns_is_skipped_not_filed_under_its_id(orch_s3):
@@ -304,9 +350,9 @@ def test_the_directory_task_is_scheduled_not_routed(monkeypatch):
         def __exit__(self, *a): return False
 
     monkeypatch.setattr(api, "get_connection", lambda: Conn())
-    monkeypatch.setattr(api, "republish_directory", lambda conn: called.append(1) or {"ok": 1})
+    monkeypatch.setattr(api, "republish_directory", lambda conn, dry_run=False: called.append(dry_run) or {"ok": 1})
     monkeypatch.setattr(api, "dispatch", lambda conn, event, method, route: {"statusCode": 404})
     assert api.lambda_handler({"task": "republish_directory"}, None) == {"ok": 1}
     api.lambda_handler({"httpMethod": "POST", "path": "/api/org/sites",
                         "body": json.dumps({"task": "republish_directory"})}, None)
-    assert called == [1]
+    assert called == [False]
