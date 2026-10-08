@@ -232,13 +232,16 @@ def test_item_writer_writes_the_external_recorders_topics_on_site_b(monkeypatch,
     _wire_iw(monkeypatch, iw, migrated_db_url, key)
     seen = {}
     monkeypatch.setattr(iw, "_request_match",
-                        lambda company_id, *a, **k: seen.setdefault("match_company", company_id))
+                        lambda company_id, *a, **k: seen.update(
+                            match_company=company_id, **k))
     result = iw.write_extraction_items(DATE, folder, key)
     assert result == {"skipped": False, "topics": 1}, result
     row = seed.execute("SELECT site_id FROM topics WHERE source_s3_key=%s", (key,)).fetchone()
     assert str(row[0]) == str(site_b["id"])
-    # Voiceprint requests still carry the recorder's HOME company (Task 4 changes that).
-    assert str(seen["match_company"]) == str(co_a["id"])
+    # P5: the voiceprint request is made in the SITE's company and names the home company.
+    assert str(seen["match_company"]) == str(co_b["id"])
+    assert str(seen["home_company_id"]) == str(co_a["id"])
+    assert seen["recorder_user_id"] is not None
 
 
 def test_item_writer_skips_a_session_site_the_recorder_has_no_membership_on(monkeypatch, migrated_db_url):

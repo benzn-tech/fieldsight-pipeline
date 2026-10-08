@@ -65,7 +65,7 @@ def split_for_budget(turns, seconds_per_run: float = DEFAULT_SECONDS_PER_RUN,
 
 
 def build(company_id, session_base, user_folder, date, turns, mode, source,
-          site_id=None, requested_by=None,
+          site_id=None, requested_by=None, home_company_id=None, recorder_user_id=None,
           seconds_per_run: float = DEFAULT_SECONDS_PER_RUN,
           turns_per_run: int = DEFAULT_TURNS_PER_RUN) -> list[dict]:
     """Every artifact needed to match this session. Empty list when there is nothing to ask.
@@ -127,4 +127,12 @@ def build(company_id, session_base, user_folder, date, turns, mode, source,
             "site_id": str(site_id) if site_id else None,
             "label_map": whole_map,
         })
+        # Project-owned tenancy P5. `company_id` above is the company that OWNS the site.
+        # When the recorder belongs to another company, say so: the matcher then uses the
+        # site company's prints plus the recorder's own and nobody else from the home
+        # company. Left off entirely for a home-site recording, so those artifacts are
+        # byte-identical to before.
+        if home_company_id and str(home_company_id) != str(company_id):
+            out[-1]["home_company_id"] = str(home_company_id)
+            out[-1]["recorder_user_id"] = str(recorder_user_id) if recorder_user_id else None
     return out

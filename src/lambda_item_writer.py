@@ -671,7 +671,8 @@ def _request_rebind(company_id, session_base, artifact, put=None):
     return True
 
 
-def _request_match(company_id, session_base, artifact, site_id=None, put=None):
+def _request_match(company_id, session_base, artifact, site_id=None, put=None,
+                   home_company_id=None, recorder_user_id=None):
     """Ask the embedder to name this session from the profiles the company already holds.
 
     **The gap this closes.** Until 2026-09-23 the ONLY producer of a match request was
@@ -715,6 +716,8 @@ def _request_match(company_id, session_base, artifact, site_id=None, put=None):
             turns=turns,
             mode=SPEAKER_IDENTITY_MODE,
             site_id=site_id,
+            home_company_id=home_company_id,
+            recorder_user_id=recorder_user_id,
             # Who asked. No user id here by construction — nobody asked, the session ended
             # — and saying `finalize` is what lets an operator tell an automatic name apart
             # from one a person requested when a wrong one turns up.
@@ -1160,9 +1163,9 @@ def write_extraction_items(date, user_folder, extraction_key):
             logger.warning("%s: %s", extraction_key, reason)
             return {"skipped": True, "reason": reason}
 
-        # `company` is the recorder's HOME company (kept for the voiceprint
-        # requests -- Task 4 of project-owned tenancy changes those). Everything
-        # else written below is owned by the SITE's company.
+        # `company` is the recorder's HOME company (it rides on the voiceprint match
+        # request as `home_company_id`). Everything else written below, voiceprint
+        # requests included, is owned by the SITE's company.
         owner_company_id = site.get("company_id") or company["id"]
 
         # Only when the ASR heard exactly one voice. Absent (older artifacts) is
@@ -1628,7 +1631,8 @@ def write_extraction_items(date, user_folder, extraction_key):
     # one — which matters because the groups would outlive the deletion in a table the
     # tombstone does not reach.
     if REBIND_SPEAKERS:
-        _request_rebind(company["id"], session_base, extraction)
+        # Anonymous label groups are session data: they belong to the SITE's company.
+        _request_rebind(owner_company_id, session_base, extraction)
 
     # Naming, which is the other half and gated separately. Same placement and the same
     # reasons: post-commit, and after the deleted-source gate, so a session the customer
@@ -1638,8 +1642,13 @@ def write_extraction_items(date, user_folder, extraction_key):
     # `site` narrows the candidate pool to the people who were on that site, which is what
     # keeps the margin meaningful as a company accumulates profiles. It is already resolved
     # above by the ladder BUG-41 settled, and None is a valid answer meaning "no narrowing".
-    _request_match(company["id"], session_base, extraction,
-                   site_id=(site or {}).get("id"))
+    #
+    # P5: the request is made in the SITE's company (`owner_company_id`); when the recorder
+    # is another company's employee it also names their home company and user id, so the
+    # matcher can add the recorder's own print and nothing else from that company.
+    _request_match(owner_company_id, session_base, extraction,
+                   site_id=(site or {}).get("id"),
+                   home_company_id=company["id"], recorder_user_id=user_id)
 
     return {"skipped": False, "topics": topics_n}
 
