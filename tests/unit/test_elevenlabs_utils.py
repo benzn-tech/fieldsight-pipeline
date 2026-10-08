@@ -254,7 +254,7 @@ def test_the_pre_pour_walk_terms_are_listed_and_skip_is_not():
     back as 'the purple', 'Still fixing', 'hair pool', 'Watch out'. 'skip' is
     the common verb, so it stays out for the reason the names note gives."""
     terms = {t.lower() for t in eu.load_keyterms(_VOCAB)}
-    for w in ("pre-pour", "steel fixers", "formworkers", "tie wire", "hirepool", "washout",
+    for w in ("pre-pour", "steelfixers", "formworkers", "tie wire", "hirepool", "washout",
               "vibrator", "stair core", "edge cover", "reo"):
         assert w in terms, w
-    assert "skip" not in terms
+    assert "skip" not in terms and "steel fixers" not in terms, "see the vocab note"
