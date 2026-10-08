@@ -18,9 +18,8 @@ Site resolution note: the extraction JSON has no 'site' field (unlike a
 daily_report.json, which may carry report['site']) -- declared_site is only
 ever stored for record in the extraction JSON, it is NOT consumed for site
 attribution here. resolve_site is always called with an empty report dict,
-which falls straight through to the user_mapping.json primary_site slug
-bridge. A double miss (report has no site AND the mapping bridge also
-misses) skips the extraction, zero writes -- exactly like lambda_ingest's
+which falls straight through to the membership-based bridge. A double miss
+(report has no site AND the bridge also misses) skips the extraction, zero writes -- exactly like lambda_ingest's
 report-level site-bridge miss.
 
 G5b: recordings.site_for_media (the app-tagged site, keyed on the
@@ -42,8 +41,6 @@ Entry point (event shape):
 
 Environment Variables:
     S3_BUCKET     - S3 bucket name (the data lake -- IngestBucketName)
-    CONFIG_KEY    - S3 key for user/site mapping (default: config/user_mapping.json,
-                    read indirectly via lambda_ingest.load_mapping's own env var)
     PG*/DATABASE_URL - read by db.connection.get_connection()
 """
 import json
@@ -88,7 +85,6 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
-CONFIG_KEY = os.environ.get("CONFIG_KEY", "config/user_mapping.json")
 
 # video-keyframe plan: ship the pipeline change inert -- only when
 # EnableKeyframes flips this env true does item-writer emit keyframe_requests/.
