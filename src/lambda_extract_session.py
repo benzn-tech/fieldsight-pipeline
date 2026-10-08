@@ -1229,7 +1229,7 @@ EXTRACTION_SCHEMA = """{
       "action_items": [
         {
           "action": "What needs to be done",
-          "responsible": "Person name",
+          "responsible": "Who will do it: a person, a crew or a trade, Speaker for the speaker, or null",
           "deadline": "When, or null if not mentioned",
           "priority": "high | medium | low"
         }
@@ -1393,6 +1393,11 @@ def _instructions_block():
    - Bad:  "Identify and complete the unspecified outstanding task"  (vague)
    - Bad:  "Target market strategy -- focus high-hourly professionals"  (a direction; nothing to tick)
    - Bad:  "Product strategy -- evaluate fixed sensors vs wearables"  (a direction; leave it in the summary)
+   `responsible` is WHO the transcript says will do it, in the words it uses: a person ("Tom"), or a
+   crew or trade when that is who is named ("the scaffolders", "plumbers", "chippies"). Someone
+   spoken TO with the instruction owns it ("Tom, get the lads to sweep the deck" -> "Tom"). When the
+   SPEAKER says they will do it themselves ("I'll call the pump company", "I'll sort that") write
+   "Speaker". Nobody named, addressed, or volunteering -> null; never borrow a name from another item.
 2b. work_class: classify each topic as "work" (site operations: inspections,
     progress, safety, coordination) or "non_work" (personal/off-work talk:
     meals, family, weekend, banter). When UNSURE, choose "work" -- a
