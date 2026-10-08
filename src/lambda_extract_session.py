@@ -40,7 +40,7 @@ import logging
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import unquote_plus
 
 import boto3
@@ -49,6 +49,7 @@ import agent_turn_filter
 import pipeline_trace
 from output_language import OUTPUT_LANGUAGE_RULE
 import evidence_match
+import extraction_pending
 import llm_utils
 import batch_stitch
 import chunk_stitch
@@ -529,6 +530,37 @@ TIER_FINAL = 'final'
 # when transcripts stop, with FINAL_RERUN_MAX_GENERATIONS as the backstop for
 # the case where that assumption is wrong.
 FINAL_REQUESTS_PREFIX = 'extraction_requests/'
+
+
+class ModelCallFailed(RuntimeError):
+    """The model call failed on every model in the chain. A RuntimeError, so the S3
+    async retry and the Lambda Errors alarm see exactly what they always did; the type
+    only lets lambda_handler tell this failure (re-drive it, forever -- extraction_pending
+    kind "model") from the others."""
+    failure_kind = extraction_pending.KIND_MODEL
+
+
+class ModelAnswerUnusable(RuntimeError):
+    """A model ANSWERED, but with JSON that does not parse (truncated, fenced, prose).
+    The chain only moves on transport failures, so this reaches here after one model's
+    answer. Marked (kind "parse") and re-driven through the full chain a bounded number
+    of times -- a retry can land on a better answer, a seventh will not."""
+    failure_kind = extraction_pending.KIND_PARSE
+
+
+class ModelAnswerMalformed(ValueError):
+    """Parsed JSON whose `topics` is not a list of objects (spec M-9). Same handling as
+    ModelAnswerUnusable; still a ValueError for every existing caller."""
+    failure_kind = extraction_pending.KIND_PARSE
+
+
+class ConfigMissing(RuntimeError):
+    """A FINAL pass with no API key. Our configuration bug: raised so the Errors alarm
+    sees it, with NO marker and NO clearing of an existing one (a misconfigured deploy
+    must not wipe the queue of real failures)."""
+
+
+FINAL_FAILURES = (ModelCallFailed, ModelAnswerUnusable, ModelAnswerMalformed)
 # How many times a final pass may ask for a fresher final pass. Reached only if
 # transcripts keep arriving for longer than N thinking calls (~170s each), which
 # on the evidence does not happen -- or if something is rewriting keys in a loop,
@@ -2150,6 +2182,12 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
     # quietly instead of reaching llm_utils.call_llm's own check only
     # after doing all that work and then raising.
     if not llm_utils.api_key_configured():
+        if final:
+            # The final pass is the one a recorder is waiting on: a deploy missing its
+            # key must be an Error (alarm), not a quiet skip. Not a ModelCallFailed, so
+            # no marker, and the handler leaves any existing marker alone.
+            raise ConfigMissing(f"API key not configured -- cannot extract session "
+                                f"{session_base}")
         logger.warning(
             f"ANTHROPIC_API_KEY not configured -- skipping session {session_base} "
             "without retry"
@@ -2199,6 +2237,10 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
     if not turns:
         logger.warning(f"No usable speaker turns for session {session_base} -- skipping"
                        + (f" after waiting {waited} time(s)" if waited else ""))
+        if final:
+            # A SUCCESS that found nothing: say so where finalize can read it ("Nothing
+            # was captured"), and clear any marker -- there is nothing left to retry.
+            _record_empty(bucket, user_folder, date, session_base, waited)
         return None
 
     n_segments = len(source_filenames)
@@ -2217,7 +2259,7 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
         prompt, max_tokens=max_tokens, force_json=True, enable_thinking=final,
         caller="extract_session_final" if final else "extract_session_live")
     if raw_response is None:
-        raise RuntimeError(f"Claude call failed for session {session_base}: {error}")
+        raise ModelCallFailed(f"Claude call failed for session {session_base}: {error}")
 
     parsed = llm_utils.extract_json(raw_response)
     if parsed is None:
@@ -2229,14 +2271,14 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
             logger.error("%s: output hit the token ceiling (%d chars, "
                          "max_tokens=%d, thinking=%s) -- retrying will hit it again",
                          session_base, len(raw_response), max_tokens, final)
-        raise RuntimeError(f"Failed to parse Claude JSON for session {session_base}")
+        raise ModelAnswerUnusable(f"Failed to parse Claude JSON for session {session_base}")
 
     # M-9: never write a malformed contract. Stay on the S3-retry side
     # (raise) rather than writing a `topics` shape downstream consumers
     # (lambda_item_writer) don't expect.
     parsed_topics = parsed.get('topics', [])
     if not isinstance(parsed_topics, list) or not all(isinstance(t, dict) for t in parsed_topics):
-        raise ValueError(
+        raise ModelAnswerMalformed(
             f"Malformed 'topics' in Claude JSON for session {session_base}: "
             "expected a list of objects"
         )
@@ -2359,6 +2401,11 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
         # the same rule `location_markers.replace_for_day` follows on the writer side.
         'self_introductions': _find_self_introductions(turns) if final else [],
     }
+    if final and _recovering_after_error_email(bucket, session_base):
+        # Read as late as possible (just before the write) so an error email that went
+        # out while this pass was thinking is still seen. item-writer turns the flag
+        # into the one follow-up notes email.
+        extraction['recovered_after_error'] = True
     if final and _known_short(bucket, user_folder, date, session_base, keys, generation):
         # THIS RECORD IS KNOWN TO BE SHORT, and a fuller one follows: transcripts
         # landed while the model was thinking, and _rerun_if_the_session_grew
@@ -2381,6 +2428,68 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
         _rerun_if_the_session_grew(bucket, user_folder, date, session_base,
                                    keys, generation)
     return extraction
+
+
+def _recovering_after_error_email(bucket, session_base):
+    """Did the recorder already get the "your notes are delayed" email for this session?
+    Unreadable counts as no: a missed follow-up is recoverable by hand, a wrong one is a
+    stray email."""
+    try:
+        marker = extraction_pending.read(s3(), bucket, session_base)
+    except Exception:
+        logger.exception("%s: cannot read the extraction_pending marker", session_base)
+        return False
+    return bool(marker and marker.get('error_email_sent_at'))
+
+
+def _record_empty(bucket, user_folder, date, session_base, waited):
+    """extraction_empty/{sessionBase}.json: the final pass ran and the recording has no
+    usable speech. Best-effort and logged; then the marker (if any) is cleared, because
+    "nothing to extract" is a finished answer, not a failure to retry."""
+    try:
+        s3().put_object(
+            Bucket=bucket, Key=extraction_pending.empty_key(session_base),
+            Body=json.dumps({"userFolder": user_folder, "date": date,
+                             "sessionBase": session_base, "reason": "no_usable_speech",
+                             "waited_attempts": waited,
+                             "recorded_at": extraction_pending.iso(
+                                 datetime.now(timezone.utc))}),
+            ContentType='application/json')
+    except Exception:
+        logger.exception("%s: could not write the extraction_empty record", session_base)
+        return
+    _clear_pending(bucket, session_base)
+
+
+def _record_pending(bucket, key, user_folder, date, session_base, error,
+                    kind=extraction_pending.KIND_MODEL):
+    """A FINAL pass failed on the model: leave a marker the backlog lambda re-drives.
+    Best-effort -- the caller re-raises regardless, so the failure still counts in the
+    Lambda Errors metric and the alarm built on it -- but never silent."""
+    try:
+        try:
+            segment_keys = gather_session_segments(bucket, user_folder, date, session_base)
+        except Exception:
+            # The time range is a nicety for the web banner; never worth losing the marker.
+            logger.warning("%s: cannot list segments for the pending marker's time range",
+                           session_base, exc_info=True)
+            segment_keys = None
+        extraction_pending.record_failure(
+            s3(), bucket, user_folder=user_folder, date=date, session_base=session_base,
+            request_key=key, error=error, segment_keys=segment_keys, kind=kind)
+        logger.error("EXTRACTION_PENDING %s: final extraction failed (%s); "
+                     "will be re-driven", session_base, kind)
+    except Exception:
+        logger.exception("%s: could not write the extraction_pending marker", session_base)
+
+
+def _clear_pending(bucket, session_base):
+    try:
+        extraction_pending.clear(s3(), bucket, session_base)
+    except Exception:
+        # A marker that outlives its success is re-driven once more at worst: the
+        # re-driven pass finds nothing newer to do and clears it then.
+        logger.exception("%s: could not delete the extraction_pending marker", session_base)
 
 
 def _request_final_rerun(bucket, user_folder, date, session_base, generation=0,
@@ -2607,9 +2716,21 @@ def lambda_handler(event, context):
             if parsed is None:
                 continue          # already logged; a raise would retry-storm a dead artifact
             user_folder, date, session_base, generation, speaker_names = parsed
-            results.append(extract_session(S3_BUCKET, user_folder, date, session_base,
-                                           final=True, generation=generation,
-                                           speaker_names=speaker_names))
+            # Only a FINAL pass leaves a marker. A live pass that fails is superseded by
+            # the final one the close always requests, and a marker per live failure
+            # would re-drive passes that no longer matter.
+            try:
+                results.append(extract_session(S3_BUCKET, user_folder, date, session_base,
+                                               final=True, generation=generation,
+                                               speaker_names=speaker_names))
+            except FINAL_FAILURES as e:
+                _record_pending(S3_BUCKET, key, user_folder, date, session_base, e,
+                                kind=e.failure_kind)
+                raise                 # still an Error: metrics, alarms and S3 retries unchanged
+            # Clear only on a WRITTEN extraction. A None is "nothing usable" (the empty
+            # record clears for itself) or a skip -- never a reason to wipe a real failure.
+            if isinstance(results[-1], dict):
+                _clear_pending(S3_BUCKET, session_base)
             continue
         parsed = session_base_from_key(key)
         if parsed is None:

@@ -157,3 +157,14 @@ def test_the_live_extraction_pass_asks_for_the_fast_path():
     src = (ROOT / "src" / "lambda_extract_session.py").read_text(encoding="utf-8")
     assert "enable_thinking=final" in src, (
         "the live/final pass distinction is how one Lambda runs both modes")
+
+
+import pytest as _pytest_fb
+
+
+@_pytest_fb.fixture(autouse=True)
+def _single_model_chain(monkeypatch):
+    # These tests pin ONE model's request; the fallback chain (a second request
+    # on failure, one attempt on the primary) has its own file,
+    # test_model_fallback_chain.py.
+    monkeypatch.setenv("LLM_FALLBACK_MODELS", "")

@@ -362,7 +362,7 @@ def _enqueue_updated_emails(artifact, contexts, put=None):
              "openTodos": todos})
 
 
-def _final_email_context(conn, session_base, extraction, date):
+def _final_email_context(conn, session_base, extraction, date, follow_up=False):
     """What the recorder's confirmation email needs, or None if it must not be
     sent from here.
 
@@ -374,7 +374,11 @@ def _final_email_context(conn, session_base, extraction, date):
         return None                      # a whole-file base, not a device session
     row = meeting_session.get(conn, sid)
     status = (row or {}).get("status")
-    if status != "finalizing":
+    # A FOLLOW-UP is the notes email owed to a recorder who was told (extraction_pending,
+    # spec D5) that their notes were delayed. By then the session is settled, so the
+    # "must be waiting" test is exactly wrong for it -- the one-shot guard is the
+    # `-notes` key instead.
+    if status != "finalizing" and not (follow_up and row):
         logger.info("session %s: final extraction written, status is %s -- no email "
                     "from here", sid, status or "unknown")
         return None
@@ -385,6 +389,7 @@ def _final_email_context(conn, session_base, extraction, date):
         # email is missing; repeating it here would only double the noise.
         return None
     return {"kind": "final", "sessionId": sid,
+            **({"followUp": True} if follow_up else {}),
             "recipient": ctx["recipient"], "date": ctx.get("date") or date,
             "timeRange": ctx.get("timeRange"), "siteName": ctx.get("siteName"),
             # handoff-sync plan §2.2: the worker needs the folder to poll
@@ -411,7 +416,8 @@ def email_checks(stored):
 def _enqueue_final_email(ctx, put=None):
     """One confirmation email per session, whoever gets there first."""
     put = put or _put_finalize_request
-    return put(f"session_finalize_requests/{ctx['sessionId']}.json", ctx,
+    suffix = "-notes" if ctx.get("followUp") else ""
+    return put(f"session_finalize_requests/{ctx['sessionId']}{suffix}.json", ctx,
                only_if_absent=True)
 
 
@@ -1276,7 +1282,9 @@ def write_extraction_items(date, user_folder, extraction_key):
             logger.info("%s: final record is known to be short -- the email waits for "
                         "the re-run", extraction_key)
         elif extraction.get("tier") == "final":
-            final_email_ctx = _final_email_context(conn, session_base, extraction, date)
+            final_email_ctx = _final_email_context(
+                conn, session_base, extraction, date,
+                follow_up=bool(extraction.get("recovered_after_error")))
 
         if ENABLE_GROUP_MERGE and extraction.get("tier") == "group" and topics_n:
             session_group.mark_result(conn, extraction["groupId"], "merged")
