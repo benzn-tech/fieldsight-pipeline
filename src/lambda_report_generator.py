@@ -72,6 +72,7 @@ import report_style
 import weather_advice
 import site_weather
 import report_photos
+import directory
 import site_coords
 import llm_utils
 import report_sections
@@ -332,78 +333,41 @@ def download_json_from_s3(bucket, key):
 # User Mapping
 # ============================================================
 
-_user_mapping_cache = None
+# The directory is published by org-api from Aurora (see directory.py). It is
+# keyed by recording folder, which is exactly what `transcripts/<folder>/` and
+# `reports/<date>/<folder>/` carry as the user name here -- so a person is found
+# by identity, not by matching a display name against a hand-edited file.
 
-def load_user_mapping(bucket):
-    global _user_mapping_cache
-    if _user_mapping_cache is not None:
-        return _user_mapping_cache
-    try:
-        data = download_json_from_s3(bucket, 'config/user_mapping.json')
-        if data:
-            raw_mapping = data.get('mapping', {})
-            normalized = {}
-            for device, value in raw_mapping.items():
-                if isinstance(value, str):
-                    normalized[device] = value
-                elif isinstance(value, dict):
-                    normalized[device] = value.get('name', device)
-                else:
-                    normalized[device] = str(value)
-            _user_mapping_cache = normalized
-            logger.info(f"Loaded user mapping: {len(normalized)} entries "
-                        f"(format: {'v2' if any(isinstance(v, dict) for v in raw_mapping.values()) else 'v1'})")
-            return _user_mapping_cache
-    except Exception as e:
-        logger.warning(f"Failed to load user mapping: {e}")
-    _user_mapping_cache = {}
-    return _user_mapping_cache
-
-def load_user_mapping_full(bucket):
-    try:
-        data = download_json_from_s3(bucket, 'config/user_mapping.json')
-        if data:
-            return {'mapping': data.get('mapping', {}), 'sites': data.get('sites', {})}
-    except:
-        pass
-    return {'mapping': {}, 'sites': {}}
+# Roles whose weekly report gets the supervisory emphasis. `global_role`
+# vocabulary: site_manager, pm, regional_manager, gm, admin, worker (and
+# platform_admin, the operator, who writes no reports). The prompt used to test
+# for ('site_manager', 'pm') only, which silently left a gm or a regional
+# manager out of it.
+MANAGER_ROLES = ('site_manager', 'pm', 'regional_manager', 'gm', 'admin')
 
 def get_user_site_mapping(bucket):
-    full = load_user_mapping_full(bucket)
-    raw_mapping = full.get('mapping', {})
-    # WHERE THE COORDINATES ACTUALLY COME FROM.
-    #
-    # The `sites` block of user_mapping.json has null lat/lng for every site
-    # and always has, so `build_weather_block_for_site` returned None every
-    # time and not one report in production carries a weather block -- while
-    # the coordinates people enter in the web UI sit in the Aurora `sites`
-    # table, which this Lambda cannot reach (no VpcConfig, by design: it needs
-    # egress for the model and the weather API).
-    #
-    # org-api publishes them to a small machine-owned object instead. Absent or
-    # unreadable, this is a no-op and the old behaviour stands.
+    doc = directory.load(s3_client, bucket)
+    # Coordinates are published separately (site_coords.py) and laid over the
+    # directory's sites. Absent or unreadable, this is a no-op.
     sites_info = site_coords.overlay_sites_info(
-        full.get('sites', {}),
+        doc.get('sites', {}),
         download_json_from_s3(bucket, site_coords.KEY) or {})
     user_primary_site = {}
     user_all_sites = {}
     user_roles = {}
-    for device, value in raw_mapping.items():
-        if isinstance(value, dict):
-            name = value.get('name', device)
-            primary = value.get('primary_site', '')
-            all_sites = value.get('sites', [])
-            role = value.get('role', '')
-            name_variants = {name, name.replace(' ', '_'), name.replace('_', ' ')}
-            for n in name_variants:
-                if primary:
-                    user_primary_site[n] = primary
-                if all_sites:
-                    user_all_sites[n] = all_sites
-                elif primary:
-                    user_all_sites[n] = [primary]
-                if role:
-                    user_roles[n] = role
+    for folder, p in (doc.get('people') or {}).items():
+        if not isinstance(p, dict):
+            continue
+        primary = p.get('primary_site') or ''
+        all_sites = p.get('sites') or []
+        if primary:
+            user_primary_site[folder] = primary
+        if all_sites:
+            user_all_sites[folder] = all_sites
+        elif primary:
+            user_all_sites[folder] = [primary]
+        if p.get('role'):
+            user_roles[folder] = p['role']
     return user_primary_site, user_all_sites, user_roles, sites_info
 
 
@@ -608,7 +572,7 @@ def run_weather_forecasts(date=None, fetch=weather_advice.hourly_forecast,
 
 
 def build_daily_prompt(transcripts_with_photos, user_name, site_name, target_date,
-                       role=None, total_duration=0.0, num_photos=0, name_mapping=None):
+                       role=None, total_duration=0.0, num_photos=0):
     """Build the Claude prompt for daily structured report."""
     transcript_lines = []
     for t in transcripts_with_photos:
@@ -654,17 +618,10 @@ def build_daily_prompt(transcripts_with_photos, user_name, site_name, target_dat
         meta_lines.append(f"- Photos: {num_photos}")
     metadata_block = "\n".join(meta_lines)
 
+    # No "Name Reference" block: it translated device accounts (Benl1, ...) to
+    # people, but today's transcripts carry speaker labels and folder-named
+    # recorders, so it had nothing left to translate.
     name_ref_block = ""
-    if name_mapping:
-        devices_used = set(t.get('device', '') for t in transcripts_with_photos)
-        ref_lines = []
-        for dev in sorted(devices_used):
-            display = name_mapping.get(dev, dev)
-            if display != dev:
-                ref_lines.append(f"- {dev} = {display}")
-        if ref_lines:
-            name_ref_block = "\n## Name Reference (device account \u2192 person name)\n" + "\n".join(ref_lines)
-            name_ref_block += "\nIMPORTANT: Always use the person's real name in participants, who_raised, who_mentioned, and responsible fields. Never use device account names (Benl1, Benl2, etc.)."
 
     template = get_template('daily_report', 'prompt')
     system_ctx = get_template('daily_report', 'system_context') or \
@@ -761,7 +718,7 @@ def build_weekly_prompt(daily_reports, site_name, start_date, end_date,
             "\n6. Focus on this individual's activities, responsibilities, and action items."
             "\n7. Highlight their personal safety observations and quality contributions."
         )
-        if user_role in ('site_manager', 'pm'):
+        if user_role in MANAGER_ROLES:
             extra_instructions += scope_intros.get('user_manager_extra',
                 "\n8. As a manager/PM, emphasize supervisory decisions, team coordination, "
                 "and items requiring their follow-up or escalation."
@@ -1619,7 +1576,7 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
         logger.info(f"=== Generating DAILY report for {target_date} ===")
 
     load_prompt_templates(S3_BUCKET)
-    user_mapping = load_user_mapping(S3_BUCKET)
+    directory.reset_cache()
     site_name = os.environ.get('SITE_NAME', 'Construction Site')
 
     users = set()
@@ -1709,7 +1666,7 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
         prompt = build_daily_prompt(
             correlated, user_name, user_site_name, target_date,
             role=user_role, total_duration=user_data['total_duration'],
-            num_photos=len(user_data['photos']), name_mapping=user_mapping,
+            num_photos=len(user_data['photos']),
         )
         # NO WEATHER IN THE PROMPT. The model used to be told the day's totals
         # and asked to judge the impact; that judgement is weather_findings
@@ -1888,7 +1845,7 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
                 prompt = build_daily_prompt(
                     correlated_all, "All Workers", site_name, target_date,
                     total_duration=combined_duration,
-                    num_photos=len(combined_photos), name_mapping=user_mapping,
+                    num_photos=len(combined_photos),
                 )
                 max_tokens = min(8192 + len(combined_transcripts) * 700, llm_utils.ANSWER_TOKEN_CEILING)
                 raw_response, error = call_claude_structured(prompt, max_tokens=max_tokens)
@@ -2324,8 +2281,7 @@ def lambda_handler(event, context):
     if not S3_BUCKET:
         return {'statusCode': 400, 'body': 'Missing S3_BUCKET'}
 
-    global _user_mapping_cache
-    _user_mapping_cache = None
+    directory.reset_cache()
     global _prompt_templates_cache
     _prompt_templates_cache = None
 
