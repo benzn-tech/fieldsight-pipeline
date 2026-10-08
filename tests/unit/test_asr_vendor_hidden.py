@@ -37,8 +37,7 @@ handed back a link straight to the raw S3 object -- the ONE way the vendor's
 shape could reach a customer's browser byte for byte, bypassing every
 allowlist below. See test_lambda_org_api.py::
 test_media_presign_transcripts_prefix_denied and
-test_lambda_fieldsight_api_acl.py::
-test_presign_transcripts_prefix_denied_even_for_own_recording.
+the legacy gateway's presigner (now closed, HTTP 410).
 """
 import io
 import json
@@ -46,10 +45,9 @@ import json
 import pytest
 
 org = pytest.importorskip("lambda_org_api", reason="requires psycopg (installed in CI)")
-fapi = pytest.importorskip("lambda_fieldsight_api", reason="requires boto3 (installed in CI)")
 
 # Self-contained fixtures/helpers below (not imported from test_lambda_org_api.py
-# / test_lambda_fieldsight_api_acl.py: pytest's per-file import isolation in
+# / the legacy ACL tests: pytest's per-file import isolation in
 # this repo does not make one test module importable from another).
 
 CALLER = {
@@ -57,13 +55,6 @@ CALLER = {
     "email": "a@x.nz", "first_name": "Ada", "last_name": "L",
     "avatar_s3_key": None, "global_role": "admin", "created_at": "2026-07-04",
 }
-
-WORKER_CALLER = {
-    "sub": "sub-worker-1", "email": "w@x.nz", "name": "Ben Test",
-    "role": "worker", "display_name": "Ben Test", "device_id": "Benl1",
-    "sites": ["s-1"], "managed_sites": [], "company_id": "c-1",
-}
-
 
 def make_event(method, path, sub="sub-1", body=None, params=None):
     return {
@@ -129,37 +120,6 @@ class FakeOrgS3:
         return "https://s3.example/" + Params["Key"]
 
 
-class FakeLegacyS3:
-    """Minimal double for lambda_fieldsight_api.s3_client."""
-
-    def __init__(self):
-        self.keys = []
-        self.objects = {}
-
-    def get_paginator(self, op):
-        keys = self.keys
-
-        class _P:
-            def paginate(self, **kwargs):
-                prefix = kwargs.get("Prefix", "")
-                yield {"Contents": [{"Key": k} for k in keys if k.startswith(prefix)]}
-        return _P()
-
-    def list_objects_v2(self, Bucket=None, Prefix=""):
-        return {"Contents": [{"Key": k} for k in self.keys if k.startswith(Prefix)]}
-
-    def get_object(self, Bucket=None, Key=None):
-        if Key not in self.objects:
-            raise KeyError(Key)
-        return {"Body": io.BytesIO(self.objects[Key])}
-
-    def generate_presigned_url(self, op, Params=None, ExpiresIn=0):
-        return "https://s3.example/" + Params["Key"]
-
-    def head_object(self, Bucket=None, Key=None):
-        raise KeyError(Key)
-
-
 def _wire_org(monkeypatch):
     monkeypatch.setattr(org, "get_connection", lambda *a, **k: FakeConn())
     monkeypatch.setattr(org.users, "get_user_by_sub",
@@ -171,15 +131,6 @@ def _wire_org(monkeypatch):
     monkeypatch.setattr(org, "_s3_client", fake)
     return fake
 
-
-def _wire_legacy(monkeypatch):
-    fake = FakeLegacyS3()
-    monkeypatch.setattr(fapi, "s3_client", fake)
-    monkeypatch.setattr(fapi, "load_user_mapping", lambda: {
-        "mapping": {"Benl1": {"name": "Ben Test", "role": "worker", "sites": ["s-1"]}},
-        "sites": {"s-1": {"name": "Site One"}},
-    })
-    return fake
 
 # The real 355-byte AWS Transcribe artifact shape (mirrors
 # test_empty_vs_unreadable_transcript.py's REAL_EMPTY fixture), with content
@@ -241,32 +192,6 @@ def test_org_transcripts_response_carries_no_asr_vendor_tell(monkeypatch):
     for field in ("speakers", "count", "speaker_count", "total_speaker_segments"):
         assert field in body, "transcript-list.js reads %r" % field
 
-
-def test_legacy_transcripts_response_carries_no_asr_vendor_tell(monkeypatch):
-    fake = _wire_legacy(monkeypatch)
-    key = "transcripts/Ben_Test/2026-09-20/Ben_Test_2026-09-20_08-00-00.json"
-    fake.keys = [key]
-    fake.objects = {key: json.dumps(_AWS_SHAPED_TRANSCRIPT).encode()}
-    res = fapi.get_transcripts(
-        {"date": "2026-09-20", "user": "Ben Test"}, WORKER_CALLER)
-    assert res["statusCode"] == 200
-    body = body_of(res)
-    assert body["speaker_segments"], "the fixture must actually produce turns"
-    _assert_no_vendor_tells(body)
-    seg = body["speaker_segments"][0]
-    for field in ("speaker", "text", "time_label", "start", "end"):
-        assert field in seg, "transcript-list.js reads %r" % field
-    for field in ("speakers", "count", "speaker_count", "total_speaker_segments"):
-        assert field in body, "transcript-list.js reads %r" % field
-
-
-# ---------------------------------------------------- audio/video: field contract
-#
-# These endpoints never touched the raw provider payload (they derive
-# everything from filenames + wav/mp4 bytes), so there is no vendor-tell
-# fixture to build -- the risk here is purely "did the allowlist stay
-# complete", i.e. the frontend contract from audio-playlist.js /
-# video-player.js.
 
 def test_org_audio_segments_field_contract(monkeypatch):
     fake = _wire_org(monkeypatch)
