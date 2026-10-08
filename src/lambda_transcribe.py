@@ -140,6 +140,9 @@ BATCH_SEAL_DEADLINE_SEC = int(os.environ.get('BATCH_SEAL_DEADLINE_SEC', '150'))
 # one of them as "the chunk" would silently drop the rest.
 TRANSCRIBE_WHOLE_CHUNK = os.environ.get('TRANSCRIBE_WHOLE_CHUNK', 'false').lower() == 'true'
 KEYTERMS_PATH = os.environ.get('KEYTERMS_PATH', 'config/custom_vocabulary_construction_nz.txt')
+# The keyterm table (asr_vocabulary): the file above merged with its active rows,
+# minus its retired ones. Unset -> the file alone.
+ASR_VOCAB_TABLE = os.environ.get('ASR_VOCAB_TABLE', '')
 
 s3 = boto3.client('s3')
 
@@ -528,7 +531,8 @@ def lambda_handler(event, context):
                 import elevenlabs_utils
                 obj = s3.get_object(Bucket=bucket, Key=key)
                 audio_bytes = obj['Body'].read()
-                keyterms = elevenlabs_utils.load_keyterms(KEYTERMS_PATH)
+                import asr_vocabulary
+                keyterms = asr_vocabulary.keyterms(KEYTERMS_PATH, ASR_VOCAB_TABLE)
                 transcript_json = elevenlabs_utils.transcribe_segment(
                     audio_bytes,
                     os.path.basename(key),
