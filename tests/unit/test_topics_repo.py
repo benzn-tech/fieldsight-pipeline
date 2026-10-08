@@ -489,24 +489,28 @@ def test_list_for_source_prefix_safety_slot_prefers_findings_over_legacy():
 # disambiguation multi-tenant guard)
 # ---------------------------------------------------------------------------
 
-def test_list_extraction_folder_names_for_date_scopes_by_company():
+def test_list_extraction_folder_names_for_date_scopes_by_site():
+    """Project-owned tenancy: the tenant guard is the row's SITE, not the author's
+    company -- an external member's topics on the site must show, a home-company
+    author's topics on another company's site must not."""
     conn = FakeConn(results=[[{"folder_name": "Jarley_Trainor"}, {"folder_name": "Ada_L"}]])
 
-    folders = topics.list_extraction_folder_names_for_date(conn, "co-1", "2026-07-14")
+    folders = topics.list_extraction_folder_names_for_date(conn, {"site-1"}, "2026-07-14")
 
     assert folders == ["Jarley_Trainor", "Ada_L"]
     assert len(conn.calls) == 1
     sql, params = conn.calls[0]["sql"], conn.calls[0]["params"]
-    assert "u.company_id=%s" in sql
+    assert "t.site_id = ANY(%s::uuid[])" in sql
+    assert "u.company_id" not in sql                # never pinned to the author's company
     assert "JOIN users u ON u.id = t.user_id" in sql
     assert "extractions/%%" in sql  # '%%' escapes the literal '%' for psycopg's %s paramstyle
-    assert params == ("2026-07-14", "co-1")
+    assert params == ("2026-07-14", ["site-1"])
 
 
 def test_list_extraction_folder_names_for_date_empty():
     conn = FakeConn(results=[[]])
 
-    assert topics.list_extraction_folder_names_for_date(conn, "co-1", "2026-07-14") == []
+    assert topics.list_extraction_folder_names_for_date(conn, {"site-1"}, "2026-07-14") == []
 
 
 def test_list_report_dates_builds_distinct_since_query():

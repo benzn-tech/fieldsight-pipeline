@@ -148,10 +148,13 @@ def day_stats(conn, company_id, user_folder, date) -> dict:
         "  substring(s3_key from '_(sid[0-9a-f]{32})_c[0-9]+\\.'), s3_key"
         ")) AS sessions, "
         "COALESCE(SUM(duration_s), 0) AS duration_s "
-        "FROM recordings "
-        "WHERE company_id = %s AND kind IN ('audio','video') "
+        "FROM recordings WHERE "
+        # company_id=None = no company restriction (a person reading their OWN whole
+        # day: it spans every company whose site they recorded on).
+        + ("company_id = %s AND " if company_id else "") +
+        "kind IN ('audio','video') "
         "AND s3_key LIKE %s ESCAPE '\\'",
-        (company_id, f"users/{_escape_like(user_folder)}/%/{date}/%"),
+        ((company_id,) if company_id else ()) + (f"users/{_escape_like(user_folder)}/%/{date}/%",),
     ).fetchone()
     if row is None:
         return {"sessions": 0, "duration_s": 0}
@@ -688,3 +691,37 @@ def locate_session(conn, company_id, session_base):
     if row and row.get("user_folder") and row.get("session_date"):
         return row["user_folder"], str(row["session_date"])
     return None
+
+
+def author_footprint_in_sites(conn, user_id, site_ids) -> bool:
+    """Whether `user_id` authored any topic or recording on one of `site_ids`.
+    The reach test for reading a person whose directory row is in ANOTHER
+    company: a site's company may open that person's folder only because they
+    worked on its sites."""
+    if not site_ids or not user_id:
+        return False
+    ids = [str(s) for s in site_ids]
+    row = conn.execute(
+        "SELECT EXISTS (SELECT 1 FROM topics WHERE user_id=%s AND site_id = ANY(%s::uuid[])) "
+        "OR EXISTS (SELECT 1 FROM recordings WHERE user_id=%s AND site_id = ANY(%s::uuid[])) "
+        "OR EXISTS (SELECT 1 FROM memberships WHERE user_id=%s AND site_id = ANY(%s::uuid[]) "
+        "AND archived_at IS NULL)",
+        (user_id, ids, user_id, ids, user_id, ids),
+    ).fetchone()
+    return bool(row and row[0])
+
+
+def author_day_has_rows_outside_sites(conn, user_id, date, site_ids) -> bool:
+    """Whether `user_id` has topics or recordings on `date` on a site NOT in
+    `site_ids`. Gates the verbatim S3 daily_report.json, which is a whole-day
+    document with no site on it: it may only be served to someone who can see
+    everything that day holds."""
+    ids = [str(s) for s in (site_ids or [])]
+    row = conn.execute(
+        "SELECT EXISTS (SELECT 1 FROM topics WHERE user_id=%s AND report_date=%s "
+        "  AND site_id IS NOT NULL AND NOT (site_id = ANY(%s::uuid[]))) "
+        "OR EXISTS (SELECT 1 FROM recordings WHERE user_id=%s "
+        "  AND s3_key LIKE %s AND site_id IS NOT NULL AND NOT (site_id = ANY(%s::uuid[])))",
+        (user_id, date, ids, user_id, f"%/{date}/%", ids),
+    ).fetchone()
+    return bool(row and row[0])

@@ -2,7 +2,7 @@ from psycopg.rows import dict_row
 from repositories.acl import resolve_scope  # re-export
 
 __all__ = ["resolve_scope", "add_membership", "accessible_site_ids", "ensure_membership", "list_company_memberships",
-          "members_for_site", "caller_site_roles", "get_membership", "add_external_membership", "worker_user_ids_for_sites",
+          "members_for_site", "caller_site_roles", "has_live_external", "get_membership", "add_external_membership", "worker_user_ids_for_sites",
           "user_ids_for_sites", "archive_membership", "site_usable_by_user"]
 
 
@@ -225,3 +225,14 @@ def site_usable_by_user(conn, user_id, site_id) -> dict | None:
         "  AND m.archived_at IS NULL))",
         (user_id, site_id),
     ).fetchone()
+
+
+def has_live_external(conn, user_id) -> bool:
+    """Whether the user holds a live membership on another company's project.
+    Such a caller's reach includes sites whose rows carry a company other than
+    their own, so a bare `company_id = <home company>` pin on a site-scoped read
+    would hide exactly those rows (project-owned tenancy P3)."""
+    row = conn.execute(
+        "SELECT EXISTS (SELECT 1 FROM memberships WHERE user_id=%s AND external "
+        "AND archived_at IS NULL)", (user_id,)).fetchone()
+    return bool(row and row[0])

@@ -8,8 +8,16 @@ _COLS = ("id, company_id, kind, site_slug, report_date, author_sub, author_name,
          # directory by cognito_sub. author_name is a display name and must never
          # be turned back into a folder. NULL when the author has no directory row.
          "(SELECT u.folder_name FROM users u "
+         # observations.company_id is the SITE's company; an external member's
+         # directory row stays in their HOME company (project-owned tenancy), so the
+         # author counts when they are of this company OR hold a live external
+         # membership on one of its projects. A stranger of a third company is still
+         # not leaked.
          "WHERE u.cognito_sub = observations.author_sub "
-         "AND u.company_id = observations.company_id) AS author_folder")
+         "AND (u.company_id = observations.company_id OR EXISTS ("
+         "  SELECT 1 FROM memberships m JOIN sites s ON s.id = m.site_id "
+         "  WHERE m.user_id = u.id AND m.external AND m.archived_at IS NULL "
+         "  AND s.company_id = observations.company_id))) AS author_folder")
 
 
 def create_observation(conn, company_id, kind, site_slug, author_sub, author_name,

@@ -91,7 +91,7 @@ def test_every_topic_read_is_valid_sql(db):
     topics.list_report_dates(db, sids, DATE)
     topics.report_date_counts(db, sids, DATE)
     topics.list_topics_for_source_prefix(db, f"extractions/Folder/{DATE}/")
-    topics.list_extraction_folder_names_for_date(db, _co["id"], DATE)
+    topics.list_extraction_folder_names_for_date(db, sids, DATE)
     topics.get_topic_full(db, t["id"])
     # The two probes that must NOT filter (a tombstoned topic still has to count, or
     # lambda_ingest's prefix cleanup fires on an interim-deleted day) — run for validity.

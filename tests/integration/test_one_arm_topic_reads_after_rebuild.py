@@ -111,7 +111,7 @@ def test_which_one_arm_reads_still_return_it(db):
     check("list_contributor_folders_for_site_date",
           bool(topics.list_contributor_folders_for_site_date(db, sid, DAY)))
     check("list_extraction_folder_names_for_date",
-          bool(topics.list_extraction_folder_names_for_date(db, cid, DAY)))
+          bool(topics.list_extraction_folder_names_for_date(db, [sid], DAY)))
     check("folders_for_session_base",
           bool(topics.folders_for_session_base(db, cid, base)))
     check("list_topics_for_source_prefix",

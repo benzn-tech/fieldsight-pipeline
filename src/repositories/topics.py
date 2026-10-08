@@ -219,11 +219,14 @@ def folders_for_session_base(conn, company_id, session_base) -> list[str]:
     else — `DELETE /sessions/{ref}/speaker-names` has no folder in it, and the ownership
     arm of the speaker-correction gate needs one.
 
-    **Unlike `list_extraction_folder_names_for_date`, this DOES gate a write**, so two
-    things matter more here than there. The users JOIN + company_id filter is the whole
-    tenant guard — `source_s3_key` is folder-keyed and carries no company of its own — and
-    the caller must treat a result of length != 1 as "could not establish", never as
-    permission. An empty list is the ordinary answer for a session whose extraction has not
+    **Unlike `list_extraction_folder_names_for_date`, this DOES gate a write**, so
+    things matter more here than there. `company_id` is accepted for call-site
+    compatibility and no longer filters (project-owned tenancy: a topic on another
+    company's project is authored by someone whose directory row stays in their HOME
+    company, so an author-company pin silently dropped exactly that recorder). The
+    guard is the caller's comparison of the one returned folder with their OWN
+    folder, and the caller must treat a result of length != 1 as "could not
+    establish", never as permission. An empty list is the ordinary answer for a session whose extraction has not
     landed yet.
 
     The folder is read out of the key rather than from `user_id`, matching
@@ -241,11 +244,11 @@ def folders_for_session_base(conn, company_id, session_base) -> list[str]:
     like = f"extractions/%%/{_escape_like(session_base)}.json"
     rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT DISTINCT split_part(t.source_s3_key, '/', 2) AS folder "
-        "FROM topics t JOIN users u ON u.id = t.user_id "
-        "WHERE u.company_id=%s AND t.source_s3_key LIKE %s "
+        "FROM topics t "
+        "WHERE t.source_s3_key LIKE %s "
         "AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' "
         "AND r.target_id = t.id AND r.scope = 'deleted' AND r.reverted_at IS NULL)",
-        (company_id, like),
+        (like,),
     ).fetchall()
     return sorted({r["folder"] for r in rows if r["folder"]})
 
@@ -1030,29 +1033,28 @@ def list_topics_for_source_prefix(conn, source_prefix, *, merged_keys=None,
     return topic_rows
 
 
-def list_extraction_folder_names_for_date(conn, company_id, report_date) -> list[str]:
-    """Distinct extraction-sourced folder_name values for one company/date --
-    org-api timeline admin-disambiguation (authority-flip Task 4, RETARGET
-    override 5's multi-tenant guard). source_s3_key has no company scoping
-    of its own (S3 lake paths are folder_name-keyed only, not per-company);
-    the users JOIN + company_id filter is what makes this candidate list
-    tenant-safe. Read-only -- used only to build the admin
-    "available_users" list, never to gate a write. Same LIKE-wildcard
-    posture as has_topics_for_source_prefix, but the prefix here is a fixed
-    literal ('extractions/'), not caller input, so no _escape_like() call is
-    needed -- the '%%' is escaped inline for psycopg's %s paramstyle."""
+def list_extraction_folder_names_for_date(conn, site_ids, report_date) -> list[str]:
+    """Distinct extraction-sourced folder_name values for one day over the
+    given SITES -- org-api timeline admin-disambiguation. Project-owned
+    tenancy: the tenant guard is "the row's site is in the caller's scope", not
+    "the author belongs to the caller's company" -- an external member's topics
+    on a site must show for that site's company, and a home-company author's
+    topics on another company's site must not. Read-only -- used only to build
+    the admin "available_users" list, never to gate a write. `site_ids` None
+    means every site (cross-company caller); an empty collection matches
+    nothing. The prefix is a fixed literal; '%%' is escaped inline for
+    psycopg's %s paramstyle."""
+    where_site = "" if site_ids is None else "AND t.site_id = ANY(%s::uuid[]) "
+    params = [report_date] + ([] if site_ids is None else [[str(s) for s in site_ids]])
     rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT DISTINCT u.folder_name FROM topics t JOIN users u ON u.id = t.user_id "
         # Both arms, for the same reason as the contributor list: this builds the
         # meeting picker's "available_users", so a folder that survives here is a
-        # person's name offered for a day whose content was deleted. The endpoint
-        # above already refuses the lake-wide summary_report.json for such a day
-        # (`_day_has_deleted_sources`) -- the candidate list was the half that
-        # did not ask.
-        f"WHERE t.report_date=%s AND u.company_id=%s "
+        # person's name offered for a day whose content was deleted.
+        f"WHERE t.report_date=%s {where_site}"
         f"AND {visible_topics_predicate('t')} "
         "AND t.source_s3_key LIKE 'extractions/%%' AND u.folder_name IS NOT NULL",
-        (report_date, company_id),
+        tuple(params),
     ).fetchall()
     return [r["folder_name"] for r in rows]
 

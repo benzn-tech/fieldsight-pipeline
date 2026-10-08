@@ -289,8 +289,16 @@ def resolve_site(conn, company_id, report, user_folder):
         # admin/gm has no single "home" site to attribute a report to, so
         # skip (None/caller-skips) rather than guess.
         site_ids = memberships.accessible_site_ids(conn, user["id"], user["global_role"])
-        if site_ids:
-            return sites.get_site(conn, site_ids[0])
+        cands = [c for c in (sites.get_site(conn, sid) for sid in site_ids) if c]
+        # A guess must not move a person's home-company work into another
+        # company (project-owned tenancy P3): a site of ANOTHER company (an
+        # external membership) is only a last resort, used when the recorder
+        # has no home-company site at all.
+        home = [c for c in cands if str(c.get("company_id") or company_id) == str(company_id)]
+        if home:
+            return home[0]
+        if cands:
+            return cands[0]
     return None
 
 
