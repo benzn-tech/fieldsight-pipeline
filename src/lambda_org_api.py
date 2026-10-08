@@ -112,6 +112,7 @@ Secrets Manager call from a NAT-less VPC). Cognito calls need the
 cognito-idp VPC interface endpoint (db stack).
 """
 import json
+import directory
 import site_coords
 import logging
 import os
@@ -152,6 +153,7 @@ from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
 import programme_reconcile
 from repositories import day_recording_segments, location_markers
+from repositories import directory as directory_repo
 from repositories import inspection_windows
 from repositories import (action_items, aliases, chunks, classification_feedback, companies,
                           decision_records, findings, speaker_label_groups,
@@ -377,6 +379,7 @@ def parse_body(event):
 
 
 REPUBLISH_SITE_COORDS_TASK = "republish_site_coords"
+REPUBLISH_DIRECTORY_TASK = "republish_directory"
 COLLAPSE_PHOTOS_TASK = "collapse_multibound_photos"
 REBIND_DAY_TASK = "rebind_day_photos"
 RESTORE_MARKERS_TASK = "restore_day_markers"
@@ -391,6 +394,9 @@ def lambda_handler(event, context):
     if isinstance(event, dict) and event.get("task") == REPUBLISH_SITE_COORDS_TASK:
         with get_connection() as conn:
             return republish_all_site_coords(conn)
+    if isinstance(event, dict) and event.get("task") == REPUBLISH_DIRECTORY_TASK:
+        with get_connection() as conn:
+            return republish_directory(conn)
     # OPERATOR TASK, invoked by hand with `aws lambda invoke` (IAM decides who
     # may). The same envelope rule as above keeps it out of reach of the API.
     # A dry run unless "apply" is exactly true: a typo must not write.
@@ -520,13 +526,13 @@ def dispatch(conn, event, method, route):
         if method == "GET":
             return get_me(conn, caller)
         if method == "PATCH":
-            return patch_me(conn, caller, parse_body(event))
+            return _directory_after(conn, patch_me(conn, caller, parse_body(event)))
 
     if route == "/sites":
         if method == "GET":
             return list_org_sites(conn, caller, event)
         if method == "POST":
-            return create_org_site(conn, caller, parse_body(event))
+            return _directory_after(conn, create_org_site(conn, caller, parse_body(event)))
 
     if route == "/companies":
         if method == "GET":
@@ -542,27 +548,27 @@ def dispatch(conn, event, method, route):
         if method == "GET":
             return list_members(conn, caller, event)
         if method == "POST":
-            return create_member(conn, caller, parse_body(event))
+            return _directory_after(conn, create_member(conn, caller, parse_body(event)))
     if route == "/members/enroll-backfill" and method == "POST":
-        return backfill_member_folders(conn, caller, parse_body(event))
+        return _directory_after(conn, backfill_member_folders(conn, caller, parse_body(event)))
     m = re.match(r"^/members/([^/]+)/role$", route)
     if m and method == "PATCH":
-        return patch_member_role(conn, caller, m.group(1), parse_body(event))
+        return _directory_after(conn, patch_member_role(conn, caller, m.group(1), parse_body(event)))
     m_mf = re.match(r"^/members/([^/]+)/folder$", route)
     if m_mf and method == "PATCH":
-        return patch_member_folder(conn, caller, m_mf.group(1), parse_body(event))
+        return _directory_after(conn, patch_member_folder(conn, caller, m_mf.group(1), parse_body(event)))
     m_mm = re.match(r"^/members/([^/]+)/memberships/([^/]+)$", route)
     if m_mm and method == "PUT":
-        return put_member_membership(conn, caller, m_mm.group(1), m_mm.group(2),
-                                     parse_body(event))
+        return _directory_after(conn, put_member_membership(
+            conn, caller, m_mm.group(1), m_mm.group(2), parse_body(event)))
     if m_mm and method == "DELETE":
-        return delete_member_membership(conn, caller, m_mm.group(1), m_mm.group(2))
+        return _directory_after(conn, delete_member_membership(conn, caller, m_mm.group(1), m_mm.group(2)))
     m_sp = re.match(r"^/sites/([^/]+)$", route)
     if m_sp and method == "PATCH":
-        return patch_org_site(conn, caller, m_sp.group(1), parse_body(event))
+        return _directory_after(conn, patch_org_site(conn, caller, m_sp.group(1), parse_body(event)))
     m_sa = re.match(r"^/sites/([^/]+)/(archive|unarchive)$", route)
     if m_sa and method == "POST":
-        return archive_site_endpoint(conn, caller, m_sa.group(1), m_sa.group(2))
+        return _directory_after(conn, archive_site_endpoint(conn, caller, m_sa.group(1), m_sa.group(2)))
     m_sm = re.match(r"^/sites/([^/]+)/members$", route)
     if m_sm and method == "GET":
         return list_site_members(conn, caller, m_sm.group(1))
@@ -571,7 +577,7 @@ def dispatch(conn, event, method, route):
         return list_site_contributors(conn, caller, m_sc.group(1), event)
     m_ma = re.match(r"^/members/([^/]+)/(archive|unarchive)$", route)
     if m_ma and method == "POST":
-        return archive_member_endpoint(conn, caller, m_ma.group(1), m_ma.group(2))
+        return _directory_after(conn, archive_member_endpoint(conn, caller, m_ma.group(1), m_ma.group(2)))
 
     if route == "/upload-url" and method == "POST":
         return create_upload_url(conn, caller, parse_body(event))
@@ -4900,6 +4906,74 @@ def _publish_site_coords(row):
         logger.exception("site-coords: publish failed for %s", (row or {}).get("id"))
 
 
+def _directory_after(conn, resp):
+    """Republish the directory after a handler that changed who exists, what
+    they are called, what role they hold or which sites they are on -- but
+    only when the handler succeeded. `resp` is returned untouched."""
+    try:
+        if isinstance(resp, dict) and int(resp.get("statusCode", 500)) < 300:
+            _publish_directory(conn)
+    except Exception:  # noqa: BLE001 - _publish_directory never raises; belt and braces
+        logger.exception("directory: publish hook failed")
+    return resp
+
+
+def _build_directory(conn):
+    return directory.build(
+        directory_repo.live_users(conn), directory_repo.live_memberships(conn),
+        directory_repo.live_sites(conn),
+        datetime.now(timezone.utc).isoformat(timespec="seconds"))
+
+
+def _write_directory_if_changed(conn):
+    """Build from Aurora, compare with what is published, write if different.
+    Returns (changed, doc). Raises on failure; callers decide how loudly."""
+    doc = _build_directory(conn)
+    current = _get_lake_json(directory.KEY)
+    if directory.same_content(doc, current):
+        return False, doc
+    s3().put_object(
+        Bucket=LAKE_BUCKET, Key=directory.KEY,
+        Body=json.dumps(doc, indent=2, default=str).encode("utf-8"),
+        ContentType="application/json")
+    return True, doc
+
+
+def _publish_directory(conn):
+    """Put the people-and-sites directory where the non-VPC pipeline lambdas
+    can read it (config/directory.json; see directory.py for why and for the
+    shape). The whole document is rebuilt from Aurora each time -- it is small
+    and a rebuild cannot carry a stale entry the way a merge can.
+
+    Runs INSIDE the request's transaction (the connection sees its own
+    uncommitted writes). If the commit then fails the object is ahead of the
+    database until the daily republish corrects it; the alternative, publishing
+    after commit, would need a hook the request wrapper does not have.
+
+    NEVER RAISES, for the same reason as _publish_site_coords: saving a member
+    must not fail because a config object could not be refreshed. Logged at
+    exception level so a failure is visible."""
+    try:
+        changed, doc = _write_directory_if_changed(conn)
+        if changed:
+            logger.info("directory: published %d person(s), %d site(s)",
+                        len(doc["people"]), len(doc["sites"]))
+    except Exception:  # noqa: BLE001 - see docstring
+        logger.exception("directory: publish failed")
+
+
+def republish_directory(conn):
+    """The daily safety net (04:35 NZ, after site coordinates, before the 05:00
+    reports): publishes from Aurora whether or not anyone saved anything, so a
+    path that changes the directory without a hook still lands within a day,
+    and a stage that has never published gets its first object."""
+    changed, doc = _write_directory_if_changed(conn)
+    logger.info("directory: republish %s (%d people, %d sites)",
+                "wrote" if changed else "found nothing to change",
+                len(doc["people"]), len(doc["sites"]))
+    return {"changed": changed, "people": len(doc["people"]), "sites": len(doc["sites"])}
+
+
 def republish_all_site_coords(conn):
     """Publish EVERY site's coordinate, once a day, before the daily reports.
 
@@ -5197,6 +5271,7 @@ def _enrol_folder_on_upload(conn, caller):
         try:
             with conn.transaction():
                 users.set_folder_name(conn, caller["cognito_sub"], folder)
+            _publish_directory(conn)
             logger.warning("upload-url: user %s had no folder_name -- enrolled as %r",
                            caller.get("id"), folder)
             return folder

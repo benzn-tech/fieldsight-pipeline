@@ -2303,6 +2303,17 @@ Resources:
                 - s3:GetObject
               Resource: !Sub arn:aws:s3:::${DataBucketName}/config/site-coords.json
             - Effect: Allow
+              # The people-and-sites directory (config/directory.json), the
+              # same single-key shape as the site coordinates above and for
+              # the same reason: the (non-VPC) report generator, meeting
+              # minutes and extraction lambdas cannot reach Aurora, so org-api
+              # publishes what they need. Rebuilt whole on each publish, so it
+              # reads the object first to skip an unchanged write.
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/config/directory.json
+            - Effect: Allow
               # Recordings upload: the org API issues presigned PUTs into
               # users/{name}/{video|audio|pictures}/{date}/ for the mobile app
               # (GrandTime). Presigning is offline, but the role must be able to
@@ -2414,6 +2425,10 @@ Resources:
                     # one key, not config/*: nothing here should learn what else
                     # lives in config/.
                     - config/site-coords.json
+                    # The directory, same reason: publishing reads it first, and a
+                    # stage that has never published must read as "absent" (404),
+                    # not as a 403 that makes the first write impossible.
+                    - config/directory.json
                     # GET /weather reads a day that may not have been written yet
                     # (no coordinate, or before 05:30): that must read as null,
                     # not as a 403 dressed as a 500.
@@ -2618,6 +2633,18 @@ Resources:
             Description: Republish site coordinates before the daily reports
             State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
             Input: '{"task": "republish_site_coords"}'
+        # The people-and-sites directory for the same non-VPC readers, five
+        # minutes after the coordinates and still ahead of the 05:00 reports.
+        # Saves publish it as they happen; this places a stage that never has
+        # and catches any path that changes people without a hook.
+        # See lambda_org_api.republish_directory.
+        DirectoryRepublish:
+          Type: Schedule
+          Properties:
+            Schedule: cron(35 15 * * ? *)
+            Description: Republish the people-and-sites directory before the daily reports
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
+            Input: '{"task": "republish_directory"}'
 
   # ----------------------------------------------------------
   # QR passwordless login (2026-07-30, v2 2026-07-31) — code table only.
@@ -2677,7 +2704,6 @@ Resources:
           EVIDENCE_FLOOR_TOKENS: !Ref EvidenceFloorTokens
           ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           S3_BUCKET: !Ref IngestBucketName
-          CONFIG_KEY: config/user_mapping.json
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
@@ -2727,6 +2753,7 @@ Resources:
                 # wherever transcripts are, because the code that reads one reads the other.
                 - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
+                - !Sub arn:aws:s3:::${IngestBucketName}/config/directory.json
                 # The close-driven final-pass request written by FinalizeSweepFunction.
                 - !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/extraction_pending/*
@@ -2830,7 +2857,6 @@ Resources:
           # functions here had it inverted, all by leaving it at that default.
           LLM_HTTP_TIMEOUT: '240'
           S3_BUCKET: !Ref IngestBucketName
-          CONFIG_KEY: config/user_mapping.json
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
@@ -2917,7 +2943,6 @@ Resources:
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
-          CONFIG_KEY: config/user_mapping.json
           # Sets the sweep's pending flag (Aurora scale-to-zero, spec 2026-08-11).
           # This is the path that matters most: a device that dies without
           # /close is finalized only by idle-close inference, so an `open` from
@@ -3298,7 +3323,6 @@ Resources:
           # complete summary; the rolling one can be stale/partial). Thinking OFF:
           # summarisation needs no extended reasoning and thinking dominated latency
           # (qwen3.7-max + thinking took ~54 s, blowing the <=2-min finalize budget).
-          CONFIG_KEY: config/user_mapping.json
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
@@ -3469,7 +3493,6 @@ Resources:
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
-          CONFIG_KEY: config/user_mapping.json
           AUTHORITY_FLIP: !Ref AuthorityFlip
           # Ruling R22: carry_forward_apply.py's OrphanedHumanEdits EMF line reads this
           # (os.environ.get("STAGE", "unknown")) — without it every emission lands under
@@ -3489,7 +3512,6 @@ Resources:
                 # wherever transcripts are, because the code that reads one reads the other.
                 - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/embeddings/*
-                - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
                 # The deletion mirror, read by lambda_ingest.py:510 through
                 # deletion_mirror.deleted_sessions so the nightly rebuild does not put a
                 # deleted recording's turns back into the search index. Without this grant
@@ -3589,7 +3611,6 @@ Resources:
         Variables:
           ENABLE_TODO_COLLAPSE: !Ref EnableTodoCollapse
           S3_BUCKET: !Ref IngestBucketName
-          CONFIG_KEY: config/user_mapping.json
           DASHSCOPE_API_KEY: !Ref DashScopeApiKey
           DASHSCOPE_BASE_URL: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
           DASHSCOPE_EMBED_MODEL: text-embedding-v4
@@ -3605,7 +3626,6 @@ Resources:
                 # Agent-answer sidecars, read by the shared agent_turn_filter. Granted
                 # wherever transcripts are, because the code that reads one reads the other.
                 - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
-                - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/embeddings/*
@@ -3677,7 +3697,6 @@ Resources:
           # reads these two exactly as org-api does.
           LAKE_BUCKET: !Ref IngestBucketName
           GRADED_ROLES: !Ref GradedRoles
-          CONFIG_KEY: config/user_mapping.json
           # video-keyframe plan: emit keyframe_requests/ post-commit only when
           # this stage flag is on (ships inert otherwise).
           EMIT_KEYFRAME_REQUESTS: !Ref EnableKeyframes
@@ -3703,7 +3722,6 @@ Resources:
               Action: s3:GetObject
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/extractions/*
-                - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
             - Effect: Allow
               # Task 4: after committing an extraction's topics, item-writer
               # emits a match_requests/ artifact (match_request.emit) for the
