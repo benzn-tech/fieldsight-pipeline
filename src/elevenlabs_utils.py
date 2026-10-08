@@ -87,7 +87,10 @@ def load_keyterms(vocab_path):
                 if not line or line.startswith("#"):
                     continue
                 phrase = line.split("\t")[0].strip()
-                if phrase:
+                # The file's column header ("Phrase\tSoundsLike\tIPA\tDisplayAs",
+                # the AWS Transcribe table format it began as) is not a term; it
+                # was sent to scribe_v2 as the keyterm "Phrase" on every request.
+                if phrase and line.split("\t")[:2] != ["Phrase", "SoundsLike"]:
                     terms.append(phrase[:MAX_KEYTERM_LEN])
     except OSError:
         logger.warning(f"keyterms vocab not found: {vocab_path}")
@@ -196,7 +199,7 @@ def transcribe_segment(audio_bytes, filename, num_speakers=5, keyterms=None):
                 )
                 continue
         raise RuntimeError(f"ElevenLabs STT error HTTP {resp.status}: {resp.data[:300]}")
-    raise RuntimeError(f"ElevenLabs STT failed after {MAX_ATTEMPTS} attempts: {last_error}")
+    raise RuntimeError(f"ElevenLabs STT failed after {MAX_ATTEMPTS} attempts: {last_error}")
 
 
 # --- Short-clip STT for the voice Ask path ---------------------------------
@@ -283,7 +286,7 @@ def stt_short(audio_bytes, filename="clip.wav"):
             last = "HTTP %d" % resp.status
         if attempt == 1:
             time.sleep(1.0)
-    raise RuntimeError("ElevenLabs STT failed after 2 attempts: %s" % last)
+    raise RuntimeError("ElevenLabs STT failed after 2 attempts: %s" % last)
 
 
 # --- TTS for the voice Ask path --------------------------------------------

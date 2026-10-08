@@ -241,3 +241,20 @@ def test_common_english_words_are_not_listed_as_names():
     terms = {t.lower() for t in eu.load_keyterms(_VOCAB)}
     for w in ("ben", "mark", "jack", "brown", "lamb"):
         assert w not in terms, f"{w!r} as a bare keyterm biases the common word"
+
+
+def test_the_column_header_is_not_sent_as_a_keyterm():
+    terms = eu.load_keyterms(_VOCAB)
+    assert "Phrase" not in terms
+    assert terms[0] == "GIB"
+
+
+def test_the_pre_pour_walk_terms_are_listed_and_skip_is_not():
+    """TEST 2026-10-08: the owner read one pre-pour script twice; these came
+    back as 'the purple', 'Still fixing', 'hair pool', 'Watch out'. 'skip' is
+    the common verb, so it stays out for the reason the names note gives."""
+    terms = {t.lower() for t in eu.load_keyterms(_VOCAB)}
+    for w in ("pre-pour", "steel fixers", "formworkers", "tie wire", "hirepool", "washout",
+              "vibrator", "stair core", "edge cover", "reo"):
+        assert w in terms, w
+    assert "skip" not in terms
