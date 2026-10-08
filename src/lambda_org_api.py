@@ -5415,35 +5415,32 @@ def _resolve_staffing(conn, caller, target_sub, site_id, require_open_site):
     return (site, target), None
 
 
-def _notify_external_member(email, site_name, inviter_company_name):
-    """Tell a person from another company they were added to a project. Best
-    effort by contract: the membership is already written, so a failed or
-    unconfigured channel is logged and never fails the request.
+EXTERNAL_MEMBER_NOTICE_PREFIX = "notices/external_member/"
 
-    org-api runs in the VPC and has no route to SES unless the stage provides one,
-    so the client is bounded (3s connect, no retries) rather than left to the
-    boto3 defaults, which would hold the request for the full 30s Lambda timeout.
-    EMAIL_SENDER defaults to 'stub' on this function (logs only) until the stage
-    is given a sender identity and a network path."""
+
+def _write_external_member_notice(membership_id, to_email, to_name, site_name,
+                                  inviting_company, role):
+    """Leave a notice for the non-VPC backlog lambda to email. Best effort by
+    contract: the membership is already written, so a failed put is logged and
+    never fails the request.
+
+    org-api runs in the VPC with no route to SES (and EMAIL_SENDER unset), so it
+    cannot send. It reaches S3 over the gateway endpoint, so it writes the notice
+    there -- one object per membership -- and
+    lambda_extraction_backlog's 5-minute run sends it exactly once."""
     try:
-        import email_sender
-        sender = email_sender.get_sender()
-        if isinstance(sender, email_sender.SesEmailSender) and sender._client is None:
-            import boto3
-            from botocore.config import Config
-            sender._client = boto3.client(
-                "ses", region_name=sender._region,
-                config=Config(connect_timeout=3, read_timeout=5, retries={"max_attempts": 1}))
-        subject = f"You've been added to {site_name} on FieldSight"
-        _NL = "\n"
-        text = (f"{inviter_company_name} has added you to the project \"{site_name}\" "
-                "on FieldSight." + _NL * 2 +
-                "Sign in with your usual FieldSight login: "
-                "the project now appears in your site list. Your own company and "
-                "your other projects are unchanged." + _NL)
-        sender.send(email, subject, text)
+        s3().put_object(
+            Bucket=LAKE_BUCKET,
+            Key=f"{EXTERNAL_MEMBER_NOTICE_PREFIX}{membership_id}.json",
+            Body=json.dumps({
+                "to_email": to_email, "to_name": to_name, "site_name": site_name,
+                "inviting_company": inviting_company, "role": role,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }).encode("utf-8"),
+            ContentType="application/json")
     except Exception:  # noqa: BLE001 - see docstring
-        logger.exception("external member notice to %s failed (membership kept)", email)
+        logger.exception("external member notice for membership %s not written "
+                         "(membership kept)", membership_id)
 
 
 def add_external_member(conn, caller, site_id, body):
@@ -5482,11 +5479,13 @@ def add_external_member(conn, caller, site_id, body):
         return error("user is already a member of this site", 409)
     row = memberships.add_external_membership(conn, target["id"], site_id, role)
     site_company = companies.get_company_by_id(conn, site["company_id"]) or {}
-    _notify_external_member(target.get("email") or email, site.get("name") or "a project",
-                            site_company.get("name") or "A company")
+    user_name = " ".join(p for p in (target.get("first_name"), target.get("last_name")) if p)
+    _write_external_member_notice(
+        row.get("id"), target.get("email") or email, user_name,
+        site.get("name") or "a project", site_company.get("name") or "A company", role)
     return ok({"membership": {
         **row,
-        "user_name": " ".join(p for p in (target.get("first_name"), target.get("last_name")) if p),
+        "user_name": user_name,
         "home_company_name": target.get("company_name"),
     }}, 201)
 

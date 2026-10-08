@@ -2596,6 +2596,12 @@ Resources:
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
+            # Project-owned tenancy: "you were added to a project" notice. org-api has no route
+            # to SES, so it leaves the notice here and ExtractionBacklogFunction emails it.
+            # PutObject only -- a doorbell, not state to read back.
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/notices/external_member/*
             # Spec 2026-10-07 D6: read the caller's extraction_pending markers and stamp the
             # Expedite request on one. The marker is the whole interface; the backlog lambda
             # (not in the VPC) does the notifying.
@@ -5574,6 +5580,10 @@ Resources:
           # would never trip -- the exact "checker stopped" case this exists
           # to catch, defeated by a missing dimension.
           BACKLOG_METRIC_STAGE: !Ref Stage
+          # Same sender settings as SessionFinalizeFunction: the external-member notices
+          # left by org-api (in the VPC, no SES) go out through email_sender.
+          EMAIL_SENDER: !Ref EmailSender
+          SENDER_EMAIL: !Ref SenderEmail
           # D6: where "a customer asked to expedite" goes. Absent when the stack creates
           # no alert topic; the code then skips the notice.
           ALERT_TOPIC_ARN: !If [ShouldCreateAlerts, !Ref AlertTopic, !Ref "AWS::NoValue"]
@@ -5595,11 +5605,27 @@ Resources:
                     - extractions/*
                     - transcripts/*
                     - extraction_pending/*
+                    - notices/external_member/*
             - Effect: Allow
               Action: s3:GetObject
               Resource:
                 - !Sub arn:aws:s3:::${DataBucketName}/extraction_requests/*
                 - !Sub arn:aws:s3:::${DataBucketName}/extraction_pending/*
+                - !Sub arn:aws:s3:::${DataBucketName}/notices/external_member/*
+            # External-member notices: sent -> copied to notices/sent/, original deleted;
+            # unsent after 24 h -> deleted.
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/notices/external_member/*
+                - !Sub arn:aws:s3:::${DataBucketName}/notices/sent/*
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: '*'
             # The re-drive (spec D4): re-put the original request, which fires the
             # extract-session notification, and reschedule the marker.
             - Effect: Allow

@@ -476,6 +476,78 @@ def redrive(client, now=None, rng=None, time_left_ms=None):
     return redriven, stale
 
 
+NOTICE_PREFIX = "notices/external_member/"
+NOTICE_SENT_PREFIX = "notices/sent/external_member/"
+#: A notice older than this is dropped (ERROR log): the SES sandbox rejects an
+#: unverified recipient forever, and a stale "you were added" mail is worse than none.
+NOTICE_EXPIRY = timedelta(hours=24)
+
+
+def _notice_mail(n):
+    site = n.get("site_name") or "a project"
+    company = n.get("inviting_company") or "A company"
+    role = n.get("role") or "member"
+    name = (n.get("to_name") or "").strip()
+    subject = f"You've been added to {site} on FieldSight"
+    text = (f"Hi {name}," if name else "Hi,") + "\n\n" + (
+        f"{company} has added you to the project \"{site}\" on FieldSight "
+        f"as {role}.\n\n"
+        "Sign in with the same FieldSight account you already use: the project "
+        "now appears in your site list. Your own company and your other "
+        "projects are unchanged.\n")
+    return subject, text
+
+
+def send_external_member_notices(client, now=None, sender=None):
+    """Email each notice org-api left under notices/external_member/, exactly once.
+
+    org-api is in the VPC with no route to SES, so it only writes the notice. Success
+    moves it to notices/sent/ (copy, then delete: a crash between the two re-sends at
+    worst once rather than losing it). Failure -- including an SES-sandbox rejection of
+    an unverified recipient -- leaves it for the next tick; after NOTICE_EXPIRY it is
+    deleted and logged at ERROR. A stub sender sends nothing, so it never marks a
+    notice sent. Returns (sent, failed, expired) counts."""
+    now = now or datetime.now(timezone.utc)
+    sent_n = failed = expired = 0
+    objs = list(_objects(client, NOTICE_PREFIX))
+    if not objs:
+        return 0, 0, 0
+    if sender is None:
+        import email_sender
+        sender = email_sender.get_sender()
+        if isinstance(sender, email_sender.StubEmailSender):
+            logger.warning("backlog: %d external-member notice(s) waiting but "
+                           "EMAIL_SENDER is not 'ses'; nothing sent", len(objs))
+            sender = None
+    for o in objs:
+        key = o["Key"]
+        try:
+            modified = o.get("LastModified")
+            if modified and now - modified >= NOTICE_EXPIRY:
+                client.delete_object(Bucket=S3_BUCKET, Key=key)
+                expired += 1
+                logger.error("backlog: external-member notice %s expired unsent "
+                             "after %s; deleted", key, NOTICE_EXPIRY)
+                continue
+            if sender is None:
+                failed += 1
+                continue
+            n = json.loads(client.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read())
+            subject, text = _notice_mail(n)
+            sender.send(n["to_email"], subject, text)
+            dest = NOTICE_SENT_PREFIX + key[len(NOTICE_PREFIX):]
+            client.copy_object(Bucket=S3_BUCKET, Key=dest,
+                               CopySource={"Bucket": S3_BUCKET, "Key": key})
+            client.delete_object(Bucket=S3_BUCKET, Key=key)
+            sent_n += 1
+            logger.info("backlog: sent external-member notice %s", key)
+        except Exception:                              # noqa: BLE001
+            failed += 1
+            logger.exception("backlog: external-member notice %s not sent; "
+                             "will retry", key)
+    return sent_n, failed, expired
+
+
 def emit_pending_metric(stale):
     """ExtractionPending as an EMF log line: CloudWatch extracts the metric from the
     function's own log output, which needs no PutMetricData grant and no log metric
@@ -502,6 +574,10 @@ def lambda_handler(event, context):
         # simply not emitted (notBreaching), and the log says why.
         logger.exception("backlog: extraction_pending re-drive failed")
         redriven, stale = [], 0
+    try:
+        send_external_member_notices(client)
+    except Exception:
+        logger.exception("backlog: external-member notices failed")
     if (event or {}).get("task") == "redrive":
         return {"redriven": redriven, "pending_stale": stale}
     recent, everything, skipped = scan(client)

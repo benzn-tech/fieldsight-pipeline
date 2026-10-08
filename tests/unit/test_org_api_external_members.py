@@ -54,6 +54,14 @@ def caller(role, company=SITE_CO):
             "avatar_s3_key": None, "created_at": "2026-07-04"}
 
 
+class Puts:
+    def __init__(self, sink):
+        self.sink = sink
+
+    def put_object(self, **kw):
+        self.sink.append(kw)
+
+
 @pytest.fixture
 def env(monkeypatch):
     st = {"caller": caller("admin"), "site": dict(SITE), "target": dict(EXTERNAL),
@@ -70,7 +78,8 @@ def env(monkeypatch):
         st["added"].append((u, s, r))
         return {"id": "m-1", "user_id": u, "site_id": s, "role": r, "external": True}
     monkeypatch.setattr(org.memberships, "add_external_membership", _add)
-    monkeypatch.setattr(org, "_notify_external_member", lambda *a: st["mails"].append(a))
+    monkeypatch.setattr(org, "s3", lambda: Puts(st["mails"]))
+    monkeypatch.setattr(org, "LAKE_BUCKET", "lake")
     return st
 
 
@@ -87,7 +96,15 @@ def test_admin_adds_external_member(env):
     assert m["external"] is True and m["role"] == "pm"
     assert m["user_name"] == "Eve Xu" and m["home_company_name"] == "Home Ltd"
     assert env["added"] == [("u-ext", "s-9", "pm")]
-    assert env["mails"] == [("ext@home.nz", "Tower A", "Site Co")]
+    # org-api cannot send (VPC, no SES): it only writes the notice object.
+    assert len(env["mails"]) == 1
+    put = env["mails"][0]
+    assert put["Bucket"] == "lake" and put["Key"] == "notices/external_member/m-1.json"
+    n = json.loads(put["Body"])
+    assert {k: n[k] for k in ("to_email", "to_name", "site_name", "inviting_company", "role")} == {
+        "to_email": "ext@home.nz", "to_name": "Eve Xu", "site_name": "Tower A",
+        "inviting_company": "Site Co", "role": "pm"}
+    assert n["created_at"]
 
 
 def test_platform_admin_adds_to_any_company(env):
@@ -150,29 +167,19 @@ def test_archived_site_is_409(env):
     assert post()["statusCode"] == 409
 
 
-def test_email_failure_does_not_fail_the_request(monkeypatch):
-    """The notice itself: a sender that raises is logged, never propagated."""
+def test_notice_write_failure_does_not_fail_the_request(env, monkeypatch):
+    class Boom:
+        def put_object(self, **kw):
+            raise RuntimeError("s3 down")
+    monkeypatch.setattr(org, "s3", lambda: Boom())
+    assert post()["statusCode"] == 201
+
+
+def test_org_api_never_calls_the_email_sender(env, monkeypatch):
     import email_sender
-
-    class Boom(email_sender.EmailSender):
-        def send(self, *a, **k):
-            raise RuntimeError("ses down")
-    monkeypatch.setattr(email_sender, "get_sender", lambda: Boom())
-    org._notify_external_member("a@b.nz", "Tower A", "Site Co")  # must not raise
-
-
-def test_notice_names_site_and_company(monkeypatch):
-    import email_sender
-    sent = []
-
-    class Rec(email_sender.EmailSender):
-        def send(self, to, subject, body_text, body_html=None):
-            sent.append((to, subject, body_text))
-    monkeypatch.setattr(email_sender, "get_sender", lambda: Rec())
-    org._notify_external_member("a@b.nz", "Tower A", "Site Co")
-    to, subject, text = sent[0]
-    assert subject == "You've been added to Tower A on FieldSight"
-    assert "Site Co" in text and "Tower A" in text
+    monkeypatch.setattr(email_sender, "get_sender",
+                        lambda: (_ for _ in ()).throw(AssertionError("org-api must not send")))
+    assert post()["statusCode"] == 201
 
 
 # ---- staffing routes reach external members, and only them
