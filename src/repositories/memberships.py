@@ -2,7 +2,7 @@ from psycopg.rows import dict_row
 from repositories.acl import resolve_scope  # re-export
 
 __all__ = ["resolve_scope", "add_membership", "accessible_site_ids", "ensure_membership", "list_company_memberships",
-          "members_for_site", "caller_site_roles", "has_live_external", "external_site_roles", "get_membership", "add_external_membership", "worker_user_ids_for_sites",
+          "members_for_site", "caller_site_roles", "has_live_external", "external_site_roles", "external_site_companies", "record_audit", "get_membership", "add_external_membership", "worker_user_ids_for_sites",
           "user_ids_for_sites", "archive_membership", "site_usable_by_user"]
 
 
@@ -245,3 +245,30 @@ def has_live_external(conn, user_id) -> bool:
         "SELECT EXISTS (SELECT 1 FROM memberships WHERE user_id=%s AND external "
         "AND archived_at IS NULL)", (user_id,)).fetchone()
     return bool(row and row[0])
+
+
+def external_site_companies(conn, user_id, within_site_ids=None) -> dict:
+    """{site_id_str: company_id_str} for the user's LIVE external memberships
+    (optionally only those in `within_site_ids`). The sites whose rows carry a company
+    other than the user's own, so a home-company pin has to be waived for exactly
+    these site ids -- and only these (final review F4)."""
+    rows = conn.execute(
+        "SELECT m.site_id, s.company_id FROM memberships m JOIN sites s ON s.id = m.site_id "
+        "WHERE m.user_id=%s AND m.external AND m.archived_at IS NULL", (user_id,)).fetchall()
+    out = {str(r[0]): str(r[1]) for r in rows}
+    if within_site_ids is not None:
+        keep = {str(x) for x in within_site_ids}
+        out = {k: v for k, v in out.items() if k in keep}
+    return out
+
+
+def record_audit(conn, action, actor, target_user_id, site, role, membership_id=None) -> None:
+    """One membership_audit row (migration 0086): who (`actor` is the caller dict), did what
+    (`action`: external_add / external_revive / external_role / external_archive), to whom,
+    on which site (`site` is the site row), at which role. Runs on the request's connection,
+    so it commits or rolls back with the membership change itself."""
+    conn.execute(
+        "INSERT INTO membership_audit (action, actor_user_id, actor_role, target_user_id, "
+        "site_id, site_company_id, role, membership_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+        (action, actor.get("id"), actor.get("global_role"), target_user_id,
+         site["id"], site.get("company_id"), role, membership_id))

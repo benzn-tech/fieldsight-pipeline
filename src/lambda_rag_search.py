@@ -146,18 +146,21 @@ def _metric(event):
     # matches nothing -- a platform_admin reaching five sites that recorded all
     # day was told nothing was recorded. Every other caller keeps the pin, which
     # is belt-and-braces over a site set that is already theirs.
-    # A caller with a live external membership reaches sites whose rows carry the
-    # SITE's company; the site set is the authority there, so no company pin.
-    company = (None if sc.get("cross_company")
-               or memberships.has_live_external(conn, caller["id"])
-               else caller["company_id"])
+    # A caller with an external membership reaches sites whose rows carry the SITE's
+    # company. `company=None` stays platform_admin only (final review F4: None also
+    # unpins the NULL-site arm and the tombstones, i.e. every tenant's site-less
+    # recordings); instead the home pin is waived for exactly those external site ids.
+    company = None if sc.get("cross_company") else caller["company_id"]
+    ext = ({} if sc.get("cross_company")
+           else memberships.external_site_companies(conn, caller["id"], site_ids))
 
     notes = {}
     if metric.startswith("count_findings_"):
         domain = metric.rsplit("_", 1)[1]
         got = findings.count_by_domain(conn, company, domain,
                                        date_from, date_to,
-                                       site_ids=site_ids, author_ids=author_ids)
+                                       site_ids=site_ids, author_ids=author_ids,
+                                       **({"external_site_ids": list(ext)} if ext else {}))
         value = got["count"]
         for k in ("unlabelled", "null_author", "from_fallback"):
             if got[k]:
@@ -173,11 +176,13 @@ def _metric(event):
         # to and which the mirror is a copy OF. rag-search is in the VPC with no
         # egress, so an S3 read here would not fail -- it would black-hole until
         # the function timed out (BUG-36) and look like a slow query.
-        deleted = redactions.deleted_session_bases(conn, company,
-                                                   date_from, date_to)
+        deleted = redactions.deleted_session_bases(
+            conn, company, date_from, date_to,
+            **({"also_companies": sorted(set(ext.values()))} if ext else {}))
         got = recordings.range_stats(conn, company, date_from, date_to,
                                      site_ids, author_ids=author_ids,
-                                     deleted_bases=deleted)
+                                     deleted_bases=deleted,
+                                     **({"external_site_ids": list(ext)} if ext else {}))
         value = {"duration": got["duration_s"],
                  "count_sessions": got["sessions"],
                  "count_photos": got["photos"]}[metric]

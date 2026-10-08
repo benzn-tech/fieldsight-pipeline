@@ -88,7 +88,8 @@ def test_site_for_day_escapes_like_wildcards_and_scopes_by_company(monkeypatch):
     assert "LIKE %s ESCAPE '\\'" in sql
     assert "LIMIT 1" in sql
     assert "r.company_id" not in sql
-    assert "m.user_id = u.id" in sql and "s.company_id = u.company_id" in sql
+    # the day-level guess stays inside the recorder's HOME company (final review F6)
+    assert "m.user_id = u.id" not in sql and "s.company_id = u.company_id" in sql
     assert "r.site_id IS NOT NULL" in sql
     assert params == ("u-1", r"users/Ben\_Lin/%/2026-07-16/%")
 

@@ -20,14 +20,15 @@ def live_sites(conn):
 def live_memberships(conn):
     # The company invariant (user and site in the same company) is enforced
     # here as everywhere else: a mis-tenanted row must not put a person on
-    # another company's project in a file every report reads. The one
-    # exception is a row deliberately flagged external (project-owned tenancy
-    # P1): the person's home company differs from the site's by design.
+    # another company's project in a file every report reads. External
+    # memberships (project-owned tenancy P1) are deliberately NOT published
+    # here: the pipeline's people/site maps are home-company only, or the
+    # weekly/monthly rollups would mix companies (final review F2).
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT m.user_id, m.site_id FROM memberships m "
         "JOIN users u ON u.id = m.user_id JOIN sites s ON s.id = m.site_id "
         "WHERE m.archived_at IS NULL AND u.archived_at IS NULL "
-        "AND s.archived_at IS NULL AND (u.company_id = s.company_id OR m.external)").fetchall()
+        "AND s.archived_at IS NULL AND u.company_id = s.company_id AND NOT m.external").fetchall()
 
 
 def recent_activity(conn, days):

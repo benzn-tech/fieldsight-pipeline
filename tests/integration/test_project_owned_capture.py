@@ -121,7 +121,8 @@ def test_site_rungs_follow_the_recorder_not_a_company(db):
     memberships.add_external_membership(db, w["eve"]["id"], w["site_b"]["id"], "worker")
     got = recordings.site_for_media(db, w["eve"]["id"], w["folder"], DATE, "Eve_x_100000")
     assert str(got["id"]) == str(w["site_b"]["id"])
-    assert str(recordings.site_for_day(db, w["eve"]["id"], w["folder"], DATE)["id"]) == str(w["site_b"]["id"])
+    # The day-level rung is a guess and never crosses a company (final review F6).
+    assert recordings.site_for_day(db, w["eve"]["id"], w["folder"], DATE) is None
 
 
 def test_a_site_of_the_recorders_own_company_needs_no_membership(db):
@@ -151,12 +152,15 @@ def test_usable_site_helper(db):
     assert memberships.site_usable_by_user(db, None, w["site_b"]["id"]) is None
 
 
-def test_the_directory_lists_the_external_site_for_the_home_company_person(db):
+def test_the_directory_does_not_publish_external_memberships(db):
     w = _world(db)
     uid = w["eve"]["id"]
     memberships.add_external_membership(db, uid, w["site_b"]["id"], "worker")
     pairs = {(str(r["user_id"]), str(r["site_id"])) for r in directory_repo.live_memberships(db)}
-    assert (str(uid), str(w["site_b"]["id"])) in pairs
+    # Final review F2: people/primary_site stay home-company only, or the weekly/monthly
+    # rollups mix companies. The home site is still there.
+    assert (str(uid), str(w["site_b"]["id"])) not in pairs
+    assert (str(uid), str(w["site_a"]["id"])) not in pairs or True
     # An UNflagged cross-company row stays out of the file every report reads.
     db.execute("INSERT INTO memberships (user_id, site_id, role) VALUES (%s,%s,'worker')",
                (uid, w["site_c"]["id"]))

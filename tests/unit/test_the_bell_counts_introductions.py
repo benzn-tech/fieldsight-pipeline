@@ -63,7 +63,7 @@ def wired(monkeypatch):
     monkeypatch.setattr(org.speaker_intro_suggestions, "pending",
                         lambda conn, co, limit=20: [dict(SUGGESTION_ROW)])
 
-    def turns(conn, folder, date, sb, with_text=False):
+    def turns(conn, folder, date, sb, with_text=False, **k):
         reads.append((folder, date, sb))
         return []
 

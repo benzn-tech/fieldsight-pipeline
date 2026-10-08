@@ -65,12 +65,16 @@ class Puts:
 @pytest.fixture
 def env(monkeypatch):
     st = {"caller": caller("admin"), "site": dict(SITE), "target": dict(EXTERNAL),
-          "existing": None, "added": [], "mails": []}
+          "existing": None, "added": [], "mails": [], "audit": [], "matches": None}
     monkeypatch.setattr(org, "get_connection", lambda *a, **k: FakeConn())
     monkeypatch.setattr(org.users, "get_user_by_sub", lambda c, sub: dict(st["caller"]))
     monkeypatch.setattr(org.sites, "get_site", lambda c, sid: st["site"])
-    monkeypatch.setattr(org.users, "get_user_by_email_global",
-                        lambda c, e: st["target"] if e.lower() == "ext@home.nz" else None)
+    monkeypatch.setattr(org.users, "find_live_users_by_email_global",
+                        lambda c, e, limit=2: st["matches"] if st.get("matches") is not None else (
+                            [st["target"]] if e.lower() == "ext@home.nz" else []))
+    monkeypatch.setattr(org.memberships, "record_audit",
+                        lambda c, action, actor, uid, site, role, mid=None: st["audit"].append(
+                            (action, actor["id"], uid, site["id"], role, mid)))
     monkeypatch.setattr(org.companies, "get_company_by_id", lambda c, i: {"id": i, "name": "Site Co"})
     monkeypatch.setattr(org.memberships, "get_membership", lambda c, u, s: st["existing"])
 
@@ -152,6 +156,19 @@ def test_archived_membership_is_revived(env):
     env["existing"] = {"id": "m-0", "archived_at": "2026-09-01", "external": True}
     assert post()["statusCode"] == 201
     assert env["added"] == [("u-ext", "s-9", "pm")]
+    assert env["audit"] == [("external_revive", "u-c", "u-ext", "s-9", "pm", "m-1")]
+
+
+def test_add_writes_an_audit_row(env):
+    assert post()["statusCode"] == 201
+    assert env["audit"] == [("external_add", "u-c", "u-ext", "s-9", "pm", "m-1")]
+
+
+def test_a_shared_email_is_refused_never_picked(env):
+    env["matches"] = [dict(EXTERNAL), dict(EXTERNAL, id="u-other", company_id="c-third")]
+    res = post()
+    assert res["statusCode"] == 409 and "ambiguous email" in body_of(res)["error"]
+    assert env["added"] == [] and env["audit"] == [] and env["mails"] == []
 
 
 @pytest.mark.parametrize("body", [{"email": "ext@home.nz", "role": "admin"},
@@ -196,7 +213,12 @@ def _delete(monkeypatch, membership):
 
 
 def test_delete_membership_reaches_an_external_member(monkeypatch):
+    audit = []
+    monkeypatch.setattr(org.memberships, "record_audit",
+                        lambda c, action, actor, uid, site, role, mid=None: audit.append(
+                            (action, uid, site["id"])))
     assert _delete(monkeypatch, {"external": True, "archived_at": None})["statusCode"] == 200
+    assert audit == [("external_archive", "u-ext", "s-9")]
 
 
 def test_delete_membership_still_404s_for_a_stranger(monkeypatch):

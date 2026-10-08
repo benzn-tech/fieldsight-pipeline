@@ -76,7 +76,7 @@ def wired(monkeypatch):
     # Text only when asked for, as the real `_session_turns` does. This fake used to return
     # it unconditionally, and so passed while the real dialog showed "No words to show" for
     # every passage (TEST 2026-09-27).
-    def turns(conn, folder, date, sb, with_text=False):
+    def turns(conn, folder, date, sb, with_text=False, **k):
         reads.append((folder, date, sb))
         rows = [
             {"source_filename": SRC, "speaker_label": "spk_0",

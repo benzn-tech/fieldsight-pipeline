@@ -162,8 +162,20 @@ def day_stats(conn, company_id, user_folder, date) -> dict:
             "duration_s": int(row["duration_s"] or 0)}
 
 
+def _external_site_pin_exemption(external_site_ids):
+    """(sql_fragment, params) that exempts rows on the caller's EXTERNAL sites from the
+    home-company pin. Rows captured on another company's project carry the SITE's
+    company, so `company_id = <home>` would hide exactly them. The exemption is by
+    SITE ID only: the NULL-site arm keeps the home-company pin (company=None stays
+    platform_admin only -- final review F4). Empty -> no fragment, SQL unchanged."""
+    ids = [str(s) for s in (external_site_ids or ())]
+    if not ids:
+        return "", {}
+    return " OR site_id = ANY(%(ext_sites)s::uuid[])", {"ext_sites": ids}
+
+
 def range_stats(conn, company_id, date_from, date_to,
-                site_ids, author_ids=None, deleted_bases=()) -> dict:
+                site_ids, author_ids=None, deleted_bases=(), external_site_ids=()) -> dict:
     """Sessions, seconds and photos over a date RANGE, in the ACL's own currency.
 
     Scoped by `site_ids` and `author_ids` -- the two sets `scope.visible_scope`
@@ -232,6 +244,7 @@ def range_stats(conn, company_id, date_from, date_to,
     bases = {b for b in (deleted_bases or ()) if b}
     bases |= {b[3:] for b in list(bases) if b.startswith("sid")}
     bases |= {"sid" + b for b in list(bases) if not b.startswith("sid")}
+    ext_clause, ext_params = _external_site_pin_exemption(external_site_ids)
 
     row = conn.cursor(row_factory=dict_row).execute(
         "WITH windowed AS ("
@@ -259,7 +272,7 @@ def range_stats(conn, company_id, date_from, date_to,
         "         OR (site_id IS NULL"
         "             AND (%(company)s::uuid IS NULL"
         "                  OR company_id = %(company)s)))"
-        "    AND (%(company)s::uuid IS NULL OR company_id = %(company)s)"
+        "    AND (%(company)s::uuid IS NULL OR company_id = %(company)s" + ext_clause + ")"
         "    AND substring(s3_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/')"
         "        BETWEEN %(from)s AND %(to)s"
         "    AND (%(authors)s::uuid[] IS NULL OR user_id = ANY(%(authors)s::uuid[]))"
@@ -312,7 +325,7 @@ def range_stats(conn, company_id, date_from, date_to,
         {"company": company_id, "from": date_from, "to": date_to,
          "sites": [str(s) for s in site_ids],
          "authors": [str(a) for a in author_ids] if author_ids is not None else None,
-         "deleted": list(bases)},
+         "deleted": list(bases), **ext_params},
     ).fetchone()
     if row is None:
         return {"sessions": 0, "duration_s": 0, "unmeasured": 0,
@@ -324,7 +337,7 @@ def range_stats(conn, company_id, date_from, date_to,
 
 
 def upload_date_counts(conn, company_id, site_ids, since_date, *,
-                       author_ids=None, deleted_bases=()) -> list[dict]:
+                       author_ids=None, deleted_bases=(), external_site_ids=()) -> list[dict]:
     """Per-date {date, sessions, photos} from `recordings` ALONE — no topics,
     no extraction, no LLM.
 
@@ -369,6 +382,7 @@ def upload_date_counts(conn, company_id, site_ids, since_date, *,
     bases = {b for b in (deleted_bases or ()) if b}
     bases |= {b[3:] for b in list(bases) if b.startswith("sid")}
     bases |= {"sid" + b for b in list(bases) if not b.startswith("sid")}
+    ext_clause, ext_params = _external_site_pin_exemption(external_site_ids)
     rows = conn.cursor(row_factory=dict_row).execute(
         "WITH windowed AS ("
         "  SELECT kind, site_id,"
@@ -379,7 +393,7 @@ def upload_date_counts(conn, company_id, site_ids, since_date, *,
         "         OR (site_id IS NULL"
         "             AND (%(company)s::uuid IS NULL"
         "                  OR company_id = %(company)s)))"
-        "    AND (%(company)s::uuid IS NULL OR company_id = %(company)s)"
+        "    AND (%(company)s::uuid IS NULL OR company_id = %(company)s" + ext_clause + ")"
         "    AND substring(s3_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/') >= %(since)s"
         "    AND (%(authors)s::uuid[] IS NULL OR user_id = ANY(%(authors)s::uuid[]))"
         "), sess AS ("
@@ -401,7 +415,7 @@ def upload_date_counts(conn, company_id, site_ids, since_date, *,
          "sites": [str(s) for s in site_ids],
          "since": str(since_date),
          "authors": [str(a) for a in author_ids] if author_ids is not None else None,
-         "deleted": list(bases)},
+         "deleted": list(bases), **ext_params},
     ).fetchall()
     return [{"date": r["date"], "sessions": int(r["sessions"] or 0),
              "photos": int(r["photos"] or 0)} for r in rows]
@@ -600,6 +614,17 @@ _SITE_USABLE_BY_USER_SQL = (
 )
 
 
+# The day-level rung is a GUESS ("most-used site that day"), so unlike an explicit tag it may
+# only land on a site of the recorder's HOME company. A day on which the recorder also worked
+# on another company's project must not pull their untagged home-company session onto that
+# project (final review F6): a foreign site is reached only through an explicit tag -- the
+# recording's own site_id, the meeting session's site, or the group lead's.
+_SITE_OF_RECORDERS_HOME_COMPANY_SQL = (
+    "JOIN users u ON u.id = %s "
+    "WHERE r.site_id IS NOT NULL AND s.company_id = u.company_id "
+)
+
+
 def site_for_media(conn, user_id, user_folder, date, session_base) -> dict | None:
     """The app-tagged site (recordings.site_id) for the recording whose media
     file this extraction session came from, or None. Matches recordings.s3_key
@@ -625,8 +650,9 @@ def site_for_media(conn, user_id, user_folder, date, session_base) -> dict | Non
 def site_for_day(conn, user_id, user_folder, date) -> dict | None:
     """The app-tagged site (recordings.site_id) for a user's WHOLE day, or
     None. Report-level sibling of site_for_media above: same LIKE match on
-    users/{folder}/.../{date}/ (wildcard-escaped), same usable-by-recorder
-    check, same r.site_id IS NOT NULL filter, same sites.get_site()-shaped
+    users/{folder}/.../{date}/ (wildcard-escaped), same r.site_id IS NOT NULL
+    filter, but ONLY sites of the recorder's home company (a guess never crosses
+    a company boundary; see _SITE_OF_RECORDERS_HOME_COMPANY_SQL), same sites.get_site()-shaped
     return so it drops into the same slot as resolve_site.
 
     Unlike site_for_media there is no session_base to pin a single
@@ -639,7 +665,7 @@ def site_for_day(conn, user_id, user_folder, date) -> dict | None:
     row = conn.cursor(row_factory=dict_row).execute(
         "SELECT r.site_id, COUNT(*) AS cnt, MAX(r.created_at) AS latest "
         "FROM recordings r JOIN sites s ON s.id = r.site_id "
-        + _SITE_USABLE_BY_USER_SQL +
+        + _SITE_OF_RECORDERS_HOME_COMPANY_SQL +
         "AND r.s3_key LIKE %s ESCAPE '\\' "
         "GROUP BY r.site_id "
         "ORDER BY cnt DESC, latest DESC LIMIT 1",
@@ -711,20 +737,51 @@ def author_footprint_in_sites(conn, user_id, site_ids) -> bool:
     return bool(row and row[0])
 
 
-def author_day_has_rows_outside_sites(conn, user_id, date, site_ids) -> bool:
-    """Whether `user_id` has topics or recordings on `date` on a site NOT in
-    `site_ids`. Gates the verbatim S3 daily_report.json, which is a whole-day
-    document with no site on it: it may only be served to someone who can see
-    everything that day holds."""
+def author_range_not_within_sites(conn, user_id, date_from, date_to, site_ids, *,
+                                  siteless_outside=False) -> bool:
+    """Whether `user_id`'s work in [date_from, date_to] is NOT wholly inside `site_ids`.
+
+    True when ANY topic or recording of the person in the range lies on a site
+    outside `site_ids`. With `siteless_outside=True` (the caller may not see the
+    person's HOME-company work: final review F1 whitelist) a row with NO site also
+    counts as outside, and so does a range with nothing at all on the caller's
+    sites -- a document that cannot be tied to the caller's sites is not served.
+
+    Gates every artefact that is a synthesis of a person's day(s) and carries no
+    site of its own: the verbatim daily_report.json, the per-user weekly/monthly
+    documents (range-aware: one foreign day hides the whole document)."""
     ids = [str(s) for s in (site_ids or [])]
+    dfrom, dto = str(date_from), str(date_to)
     row = conn.execute(
-        "SELECT EXISTS (SELECT 1 FROM topics WHERE user_id=%s AND report_date=%s "
-        "  AND site_id IS NOT NULL AND NOT (site_id = ANY(%s::uuid[]))) "
-        "OR EXISTS (SELECT 1 FROM recordings WHERE user_id=%s "
-        "  AND s3_key LIKE %s AND site_id IS NOT NULL AND NOT (site_id = ANY(%s::uuid[])))",
-        (user_id, date, ids, user_id, f"%/{date}/%", ids),
+        "SELECT "
+        "(EXISTS (SELECT 1 FROM topics WHERE user_id=%(u)s AND report_date BETWEEN %(f)s::date AND %(t)s::date "
+        "   AND ((site_id IS NOT NULL AND NOT (site_id = ANY(%(s)s::uuid[]))) "
+        "        OR (site_id IS NULL AND %(sl)s))) "
+        " OR EXISTS (SELECT 1 FROM recordings WHERE user_id=%(u)s "
+        "   AND substring(s3_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/') BETWEEN %(f)s::text AND %(t)s::text "
+        "   AND ((site_id IS NOT NULL AND NOT (site_id = ANY(%(s)s::uuid[]))) "
+        "        OR (site_id IS NULL AND %(sl)s)))) AS outside, "
+        "(EXISTS (SELECT 1 FROM topics WHERE user_id=%(u)s AND report_date BETWEEN %(f)s::date AND %(t)s::date "
+        "   AND site_id = ANY(%(s)s::uuid[])) "
+        " OR EXISTS (SELECT 1 FROM recordings WHERE user_id=%(u)s "
+        "   AND substring(s3_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/') BETWEEN %(f)s::text AND %(t)s::text "
+        "   AND site_id = ANY(%(s)s::uuid[]))) AS inside",
+        {"u": user_id, "f": dfrom, "t": dto, "s": ids, "sl": bool(siteless_outside)},
     ).fetchone()
-    return bool(row and row[0])
+    if not row:
+        return bool(siteless_outside)
+    outside, inside = row[0], row[1]
+    return bool(outside) or (bool(siteless_outside) and not inside)
+
+
+def author_day_has_rows_outside_sites(conn, user_id, date, site_ids, *,
+                                      siteless_outside=False) -> bool:
+    """One-day form of `author_range_not_within_sites` (see there). The name is the
+    one the verbatim daily_report.json guard has always used; with the default
+    `siteless_outside=False` it keeps its original meaning (a row on a site NOT in
+    `site_ids`)."""
+    return author_range_not_within_sites(conn, user_id, date, date, site_ids,
+                                         siteless_outside=siteless_outside)
 
 
 def session_site_companies(conn, folder, date, session_base) -> list:

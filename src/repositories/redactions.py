@@ -234,7 +234,7 @@ def deleted_source_prefixes(conn, folder=None, date=None) -> list:
     return [r["target_key"] for r in rows]
 
 
-def deleted_session_bases(conn, company_id, date_from, date_to) -> set:
+def deleted_session_bases(conn, company_id, date_from, date_to, also_companies=()) -> set:
     """The `sid{hex}` bases tombstoned in this company over a date range.
 
     FROM AURORA, NOT FROM THE S3 MIRROR, and the mirror's own docstring says
@@ -248,6 +248,10 @@ def deleted_session_bases(conn, company_id, date_from, date_to) -> set:
     `redactions/{folder}/{date}/deleted_sessions.json`, so a seven-day range
     across a caller's folders is one GET per folder per day, while this is one
     query for the range.
+
+    `also_companies` adds other companies' tombstones to a company-pinned read: a
+    caller added to another company's project (external member) reaches sessions whose
+    deletion that company stamped. It never widens the NULL company to "all".
 
     `company_id=None` means EVERY COMPANY, and it must be reachable for the same
     reason `range_stats` accepts it: a cross-company caller counts rows across
@@ -265,11 +269,14 @@ def deleted_session_bases(conn, company_id, date_from, date_to) -> set:
     rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT DISTINCT substring(target_key from '(sid[0-9a-f]{32})$') AS base "
         "FROM redactions "
-        "WHERE (%s::uuid IS NULL OR company_id = %s) ""AND target_type = 'recording' AND scope = 'deleted' "
+        "WHERE (%s::uuid IS NULL OR company_id = %s" + (
+            " OR company_id = ANY(%s::uuid[])" if also_companies else "") +
+        ") AND target_type = 'recording' AND scope = 'deleted' "
         "AND reverted_at IS NULL AND target_key IS NOT NULL "
         "AND substring(target_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/') "
         "    BETWEEN %s AND %s",
-        (company_id, company_id, date_from, date_to),
+        (company_id, company_id) + (([str(x) for x in also_companies],) if also_companies else ())
+        + (date_from, date_to),
     ).fetchall()
     return {r["base"] for r in rows if r["base"]}
 

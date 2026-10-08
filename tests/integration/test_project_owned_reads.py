@@ -143,9 +143,11 @@ def test_foreign_sessions_are_hidden_from_the_media_listings(db):
                                   site_id=site["id"], kind="audio",
                                   s3_key=f"users/{w['folder']}/audio/{DATE}/x_sid{sid}_c0000.wav",
                                   client_uuid=uuid.uuid4().hex, started_at=f"{DATE}T10:00:00Z")
-    assert api._foreign_session_ids(db, w["admin_a"], w["folder"], DATE) == {"sid" + "b" * 32}
-    assert api._foreign_session_ids(db, w["admin_b"], w["folder"], DATE) == {"sid" + "a" * 32}
-    assert api._foreign_session_ids(db, w["eve"], w["folder"], DATE) == set()
+    ha = api._session_hider(db, w["admin_a"], w["folder"], DATE)
+    hb = api._session_hider(db, w["admin_b"], w["folder"], DATE)
+    assert (ha.hides("sid" + "a" * 32), ha.hides("sid" + "b" * 32)) == (False, True)
+    assert (hb.hides("sid" + "a" * 32), hb.hides("sid" + "b" * 32)) == (True, False)
+    assert api._session_hider(db, w["eve"], w["folder"], DATE) is None
 
 
 def test_observation_author_folder_is_found_for_an_external_author(db):

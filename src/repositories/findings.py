@@ -169,7 +169,7 @@ def carry_identity(conn, new_id, old_row) -> None:
 
 
 def count_by_domain(conn, company_id, domain, date_from, date_to,
-                    site_ids=None, author_ids=None) -> dict:
+                    site_ids=None, author_ids=None, external_site_ids=()) -> dict:
     """How many safety- or quality-domain items in a date range.
 
     FINDINGS FIRST, `safety_observations` SECOND, PER TOPIC -- the same rule the
@@ -227,7 +227,8 @@ def count_by_domain(conn, company_id, domain, date_from, date_to,
         # ANDing the caller's own company onto a cross-company site set matched
         # nothing, and `has_topics_in_range` scopes by site alone, so the two
         # disagreed and a platform_admin was told there were notes and no items.
-        "  WHERE (%(company)s::uuid IS NULL OR s.company_id = %(company)s)"
+        "  WHERE (%(company)s::uuid IS NULL OR s.company_id = %(company)s"
+        + (" OR t.site_id = ANY(%(ext_sites)s::uuid[])" if external_site_ids else "") + ")"
         "    AND t.report_date BETWEEN %(from)s AND %(to)s"
         "    AND (%(site_ids)s::uuid[] IS NULL OR t.site_id = ANY(%(site_ids)s::uuid[]))"
         "    AND " + visible_topics_predicate("t") +
@@ -258,7 +259,8 @@ def count_by_domain(conn, company_id, domain, date_from, date_to,
         " FROM counted",
         {"company": company_id, "domain": domain, "from": date_from, "to": date_to,
          "site_ids": list(site_ids) if site_ids is not None else None,
-         "authors": list(author_ids) if author_ids is not None else None},
+         "authors": list(author_ids) if author_ids is not None else None,
+         **({"ext_sites": [str(x) for x in external_site_ids]} if external_site_ids else {})},
     ).fetchone()
     # SUM() over bigint returns numeric, which psycopg hands back as Decimal, and
     # json.dumps has no encoder for Decimal. These numbers go straight into an

@@ -98,3 +98,43 @@ company's sites:
 - A's admin `?user=<A user>` sees only A-site rows. B's admin sees the B-site rows. The person sees both.
 - The voiceprint candidate set on a B site excludes A colleagues and includes the recorder.
 - Group merge with members from two home companies on one B site is allowed.
+
+## Final review rulings
+
+Binding outcomes of the final security review (findings F1-F8) and where each landed.
+
+- **R1 (F1) whitelist, not blacklist.** A site-less session/row/recording belongs to the
+  recorder's HOME company. For anyone other than the person (and platform_admin) a session
+  or row is visible only if (a) it is on a site in the caller's reach, or (b) it is site-less
+  and the caller is of the recorder's home company. Row-less and unidentifiable sessions are
+  site-less. Applied to transcripts / audio / video listings, media presign, the verbatim
+  `daily_report.json` guard, the report-history guard, the timeline prose
+  (`_SessionHider`, `recordings.author_range_not_within_sites(siteless_outside=...)`).
+  Implementation note: (b) is "same company as the recorder" for any tier that can already
+  open the folder (a home pm still sees a home worker's site-less sessions, as before); an
+  external company's admin/gm/pm never satisfies it.
+- **R2 (F2).** `config/directory.json` carries home-company memberships only (external
+  memberships are not published), so the weekly/monthly rollups never mix companies.
+  Per-user weekly/monthly documents are served to a non-self caller only if no day of the
+  period (weekly = 7 days, monthly = up to 31, from the key's end date) holds the person's
+  rows outside the caller's reach.
+- **R3 (F3).** The author tier is per site. Home sites: global role + home memberships only.
+  External sites: that membership's role only. An external site joins the single
+  (site_ids, author_ids) pair only when both tiers say the same thing about authors (SITE
+  with SITE, SELF with SELF); any other mix adds no reach (fail closed; the person's own
+  work there is read through the own-folder paths). Known gap: a home SELF/SELF+WORKERS
+  caller who is an external pm gets no pair-model reach on that site until author sets can
+  be expressed per site.
+- **R4 (F4).** The NULL-site arm keeps the home-company pin everywhere; `company=None` is
+  platform_admin only. Rows on a caller's external sites are exempted by site id
+  (`external_site_ids`), and other companies' tombstones are added by `also_companies`.
+- **R5 (F5).** Speaker corrections, speaker match, name proposals/suggestions and regenerate
+  require the session's SITE company to be the caller's (platform_admin exempt); the
+  recorder may regenerate their own session but never enrol a voiceprint from a foreign-site
+  session. `caller` is passed into the transcript read on those paths.
+- **R6 (F6).** `site_for_day` ("most-used site that day") only considers sites of the
+  recorder's home company; a foreign site is reached only through an explicit tag.
+- **R7 (F7).** Session brief / rolling / report-status objects apply the R1 whitelist.
+- **R8 (F8).** Every external-member add / revive / role change / archive writes a
+  `membership_audit` row (migration 0086) in the same transaction. An email shared by more
+  than one live user is refused with 409 "ambiguous email, contact support".

@@ -106,7 +106,7 @@ def wired(monkeypatch):
                         lambda conn, co, folder: {"id": "u-9", "folder_name": folder})
     monkeypatch.setattr(org.voiceprints, "get_profile",
                         lambda conn, co, vid: {"id": VP, "display_name": "Ben Lin"})
-    monkeypatch.setattr(org, "_session_turns", lambda conn, f, d, sb: [
+    monkeypatch.setattr(org, "_session_turns", lambda conn, f, d, sb, **k: [
         {"source_filename": SRC, "speaker_label": "spk_0", "start_sec": 0.0, "end_sec": 4.0},
         {"source_filename": SRC, "speaker_label": "spk_0", "start_sec": 9.0, "end_sec": 31.0},
         {"source_filename": SRC, "speaker_label": "spk_1", "start_sec": 40.0, "end_sec": 55.0},
