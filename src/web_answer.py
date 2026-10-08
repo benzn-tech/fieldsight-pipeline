@@ -102,10 +102,16 @@ kind:
   data, methods -- the kind of thing a reference book would answer.
 - "mixed": needs both (e.g. whether what the site did meets a standard).
 
-records_answer: true only if a reader would get what they asked for, for the
-project part of the question, from these excerpts alone. Excerpts merely about
-the same site or the same day are not an answer. For a "general" question, true
-only if the excerpts hold a related discussion worth showing alongside.
+records_answer depends on kind:
+- "project": true only if a reader would get what they asked for from these
+  excerpts alone. Excerpts merely about the same site or the same day are not
+  an answer.
+- "mixed": true if the excerpts state the PROJECT side of the question -- what
+  this site said, planned, measured or did about the subject asked (e.g. the
+  spacing or the cure time the site used). They need not say anything about
+  the standard; the standard is looked up separately.
+- "general": true only if the excerpts hold a related site discussion worth
+  showing alongside the general answer.
 
 Return only JSON, no prose:
 {{"kind": "project"|"general"|"mixed", "records_answer": true|false}}
