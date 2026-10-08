@@ -234,19 +234,69 @@ def _check_lines(checks):
     for c in checks or []:
         if not isinstance(c, dict) or not c.get("check"):
             continue
-        span = "–".join(x for x in (c.get("from"), c.get("to")) if x)
+        span = "–".join(dict.fromkeys(x for x in (c.get("from"), c.get("to")) if x))
         when = f" ({span})" if span else ""
         if c.get("template"):
             out.append(f"Checklist: {c['template']} for “{c['check']}”{when} is being "
                        "filled in — it will be ready in FieldSight in a few minutes.")
         else:
-            out.append(f"Heard “{c['check']}”{when} — no checklist in your Library "
-                       "matches it, so no checklist report was made.")
+            line = (f"Heard “{c['check']}”{when} — no checklist in your Library "
+                    "matches it, so no checklist report was made.")
+            # Without this a reader takes "no report" for "lost" (owner,
+            # 2026-10-09). Said only when item-writer found the topic.
+            if c.get("topic"):
+                line += (f" What you said is kept under “{c['topic']}” on your Timeline "
+                         "and in the daily report.")
+            out.append(line)
     return out
 
 
+# The house colours of the DOCX reports (report_style.NAVY / ACCENT), so the
+# email and the report it announces look like one product. report_style itself
+# is not imported: it pulls python-docx, which this function does not ship.
+_NAVY, _ACCENT, _INK, _MUTED, _RULE, _ZEBRA = (
+    "#1F3A5F", "#F2B705", "#1F2933", "#6B7785", "#E3E8EF", "#F5F7FA")
+_FONT = "font-family:Segoe UI,Helvetica,Arial,sans-serif"
+
+
+def _long_date(iso):
+    """"2026-10-08" -> "Thursday 8 October 2026"; anything else unchanged."""
+    import datetime as dt
+    try:
+        d = dt.date.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return iso or ""
+    return "%s %d %s" % (d.strftime("%A"), d.day, d.strftime("%B %Y"))
+
+
+def _short_date(value):
+    """A due date the model normalised to ISO reads "Wed 14 Oct" in the card;
+    anything else ("Friday", "end of week") is shown as it came."""
+    import datetime as dt
+    try:
+        d = dt.date.fromisoformat(value)
+    except (TypeError, ValueError):
+        return value
+    return "%s %d %s" % (d.strftime("%a"), d.day, d.strftime("%b"))
+
+
+def open_link(date):
+    """Where "Open in FieldSight" goes: the recorder's Timeline for that day.
+
+    ONE function owns the link so the day a phone app claims FieldSight links,
+    only this changes: an app link matches a URL PATH, and the web app routes on
+    the hash today, so the phone version will want a path like /d/<date> that
+    the web serves too. APP_URL is per stage (template.yaml); unset -> no button,
+    never a link to the wrong environment."""
+    base = (os.environ.get("APP_URL") or "").rstrip("/")
+    if not base or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date or ""):
+        return None
+    return f"{base}/#/timeline?date={date}"
+
+
 def build_confirmation_email(*, date=None, time_range=None, site_name=None,
-                             summary=None, open_todos=None, checks=None):
+                             summary=None, open_todos=None, checks=None,
+                             open_url=None):
     """(subject, body_text, body_html) for the recorder's confirmation email, built
     from the session's still-open to-dos. Pure — no I/O. To-dos with no text are
     dropped; all HTML content is escaped so transcript text can't inject markup. The
@@ -272,7 +322,7 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
     # someone to pick the task up; "N/A" says there is no task here.
     na = "N/A"
 
-    lines = ["Here's what we captured from your recording — reply or open FieldSight "
+    lines = ["Here's what we captured from your recording — open FieldSight "
              "to correct anything before you leave site.", ""]
     if site_name:
         lines.append(f"Site: {site_name}")
@@ -296,54 +346,82 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
             lines.append(_pipe_row((t["text"], who, due)))
     else:
         lines += ["", no_todos_note]
+    if open_url:
+        lines += ["", f"Open in FieldSight: {open_url}"]
     body_text = "\n".join(lines).rstrip() + "\n"
 
     esc = _html.escape
-    parts = ["<p>Here's what we captured from your recording — reply or open FieldSight "
-             "to correct anything before you leave site.</p>"]
-    meta = []
-    if site_name:
-        meta.append(f"<strong>Site:</strong> {esc(site_name)}")
-    if stamp:
-        meta.append(f"<strong>Date:</strong> {esc(stamp)}")
-    if meta:
-        parts.append("<p>" + "<br>".join(meta) + "</p>")
-    if check_lines:
-        parts.append("<p>" + "<br>".join(esc(x) for x in check_lines) + "</p>")
+    td = (f"padding:10px 12px;border-bottom:1px solid {_RULE};vertical-align:top;{_FONT};"
+          "font-size:14px;line-height:1.4")
+    th = (f"padding:9px 12px;background:{_NAVY};color:#FFFFFF;{_FONT};font-size:11px;"
+          "font-weight:600;letter-spacing:.06em;text-align:left;white-space:nowrap")
+    when_line = " · ".join(esc(x) for x in (_long_date(date), time_range) if x)
+    parts = [
+        # Fluid up to 600px: a phone shows the same card, only narrower.
+        '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" '
+        'style="background:#F4F6F9;border-collapse:collapse"><tr><td align="center" style="padding:16px 8px">',
+        '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" '
+        f'style="max-width:600px;background:#FFFFFF;border-collapse:collapse;border:1px solid {_RULE}">',
+        f'<tr><td style="background:{_NAVY};padding:14px 20px;border-bottom:4px solid {_ACCENT};'
+        f'{_FONT};font-size:16px;font-weight:700;color:#FFFFFF;letter-spacing:.02em">FieldSight</td></tr>',
+        f'<tr><td style="padding:20px 20px 4px;{_FONT}">'
+        f'<div style="font-size:20px;font-weight:700;color:{_NAVY}">Your site notes</div>'
+        + (f'<div style="font-size:14px;color:{_INK};padding-top:4px">{when_line}</div>' if when_line else "")
+        + (f'<div style="font-size:13px;color:{_MUTED};padding-top:2px">{esc(site_name)}</div>'
+           if site_name else "")
+        + f'<div style="font-size:14px;color:{_INK};padding-top:12px">Here\'s what we captured from your '
+        "recording — open FieldSight to correct anything before you leave site.</div>"
+        "</td></tr>",
+    ]
+    heard = [c for c in checks or [] if isinstance(c, dict) and c.get("check")]
+    for c, line in zip(heard, check_lines):
+        ready = bool(c.get("template"))
+        parts.append(
+            f'<tr><td style="padding:10px 20px 0"><div style="border-left:4px solid '
+            f'{_ACCENT if ready else _RULE};background:{_ZEBRA};padding:10px 12px;{_FONT};'
+            f'font-size:13px;line-height:1.45;color:{_INK if ready else _MUTED}">{esc(line)}</div></td></tr>')
     if todos:
-        def _row(t):
+        def _row(i, t):
             topic = t["kind"] == "topic"
             who = na if topic else (esc(t["responsible"]) if t["responsible"] else "—")
-            when = na if topic else (esc(t["due"]) if t["due"] else "—")
+            when = na if topic else (esc(_short_date(t["due"])) if t["due"] else "—")
             # Greyed, so a reader scanning for what they owe can stop at the last
-            # black row; the context is still there for a reader who wants it. No
-            # per-item line under the title: `why` stopped being carried (#864).
-            tone = ';color:#666' if topic else ''
-            return ("<tr>"
-                    f'<td style="padding:6px;border-bottom:1px solid #eee{tone}">'
-                    f'{esc(t["text"])}</td>'
-                    f'<td style="padding:6px;border-bottom:1px solid #eee;'
-                    f'vertical-align:top{tone}">{who}</td>'
-                    f'<td style="padding:6px;border-bottom:1px solid #eee;'
-                    f'vertical-align:top{tone}">{when}</td>'
-                    "</tr>")
+            # dark row. No per-item line under the title: `why` stopped being
+            # carried (#864).
+            ink = _MUTED if topic else _INK
+            bg = f";background:{_ZEBRA}" if i % 2 else ""
+            return (f'<tr><td style="{td};color:{ink}{bg}">{esc(t["text"])}</td>'
+                    f'<td style="{td};color:{ink if (t["responsible"] or topic) else _MUTED}{bg}">{who}</td>'
+                    f'<td style="{td};color:{ink if (t["due"] or topic) else _MUTED};white-space:nowrap{bg}">'
+                    f"{when}</td></tr>")
 
-        rows = "".join(_row(t) for t in todos)
-        # No <h3>Items</h3>: the header row below carries the table's title now
-        # (plan §2.4) -- one heading, not two.
+        rows = "".join(_row(i, t) for i, t in enumerate(todos))
+        # Literal header text (plan §0/§1.1/§2.4): "AGENDA ITEM / ASSIGNED /
+        # DUE DATE" on BOTH surfaces -- the email and the frontend's Preview &
+        # copy render the same three words. Navy with WHITE text (owner,
+        # 2026-10-08), as on every DOCX report.
         parts.append(
-            '<table role="presentation" cellspacing="0" cellpadding="0" '
-            'style="border-collapse:collapse;width:100%;font-size:14px">'
-            '<thead><tr style="text-align:left;border-bottom:2px solid #ccc">'
-            # Literal header text (plan §0/§1.1/§2.4): "AGENDA ITEM / ASSIGNED /
-            # DUE DATE" on BOTH surfaces -- the email and the frontend's Preview
-            # & copy render the same three words, or the two surfaces the plan
-            # exists to sync would drift on the very first thing a reader sees.
-            '<th style="padding:6px">AGENDA ITEM</th><th style="padding:6px">ASSIGNED</th>'
-            '<th style="padding:6px">DUE DATE</th></tr></thead>'
-            f"<tbody>{rows}</tbody></table>")
+            '<tr><td style="padding:16px 20px 4px">'
+            '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" '
+            'style="border-collapse:collapse;width:100%">'
+            f'<thead><tr><th style="{th};width:60%">AGENDA ITEM</th>'
+            f'<th style="{th}">ASSIGNED</th><th style="{th}">DUE DATE</th></tr></thead>'
+            f"<tbody>{rows}</tbody></table></td></tr>")
     else:
-        parts.append(f"<p>{esc(no_todos_note)}</p>")
+        parts.append(f'<tr><td style="padding:16px 20px 4px;{_FONT};font-size:14px;color:{_INK}">'
+                     f"{esc(no_todos_note)}</td></tr>")
+    if open_url:
+        parts.append(
+            '<tr><td style="padding:18px 20px 4px"><table role="presentation" cellspacing="0" '
+            f'cellpadding="0"><tr><td style="background:{_NAVY};border-radius:4px">'
+            f'<a href="{esc(open_url, quote=True)}" style="display:inline-block;padding:11px 20px;'
+            f'{_FONT};font-size:14px;font-weight:600;color:#FFFFFF;text-decoration:none">'
+            "Open in FieldSight</a></td></tr></table></td></tr>")
+    parts += [
+        f'<tr><td style="padding:16px 20px 18px;{_FONT};font-size:12px;color:{_MUTED}">'
+        "Prepared with FieldSight.</td></tr>",
+        "</table></td></tr></table>",
+    ]
     body_html = "\n".join(parts)
 
     return subject, body_text, body_html
@@ -979,7 +1057,7 @@ def process_finalize_request(artifact, *, send=None, write_result=None, complete
         subject, text, html = build_confirmation_email(
             date=artifact.get("date"), time_range=artifact.get("timeRange"),
             site_name=artifact.get("siteName"), summary=summary, open_todos=todos,
-            checks=artifact.get("checks"))
+            checks=artifact.get("checks"), open_url=open_link(artifact.get("date")))
     if is_updated:
         # A second email with a different body must not read as a duplicate of
         # the first. The recipient already had one for this meeting.

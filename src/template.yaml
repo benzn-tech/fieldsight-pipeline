@@ -3309,6 +3309,8 @@ Resources:
           ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           S3_BUCKET: !Ref IngestBucketName
           EMAIL_SENDER: !Ref EmailSender
+          # Where the email's "Open in FieldSight" goes (lambda_session_finalize.open_link).
+          APP_URL: !If [IsProd, 'https://main.d2fssznicvuckr.amplifyapp.com', 'https://dev.d2fssznicvuckr.amplifyapp.com']
           SENDER_EMAIL: !Ref SenderEmail
           # UNDER the Lambda Timeout, which is the whole point of the setting and was
           # inverted here. `llm_utils` defaults it to 150 s and says why: "so the HTTP

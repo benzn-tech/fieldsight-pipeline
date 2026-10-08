@@ -423,13 +423,44 @@ def _final_email_context(conn, session_base, extraction, date, follow_up=False):
             "openTodos": _final_email_rows(extraction, date) + _topic_rows(extraction)}
 
 
-def email_checks(stored):
-    """[{check, template, from, to}] for the confirmation email: each spoken
-    check, with the checklist whose report is being written, or None when no
-    checklist matched."""
-    return [{"check": w.get("name"), "template": w.get("template_name"),
-             "from": (w.get("start_at") or "")[:5], "to": (w.get("end_at") or "")[:5]}
-            for w in stored or []]
+def email_checks(stored, topics=None):
+    """[{check, template, from, to[, topic]}] for the confirmation email: each
+    spoken check, with the checklist whose report is being written, or None when
+    no checklist matched -- and then the topic its words were kept under, so
+    "no report" is not read as "lost" (owner, 2026-10-09)."""
+    stored = list(stored or [])
+    out = []
+    for w in stored:
+        row = {"check": w.get("name"), "template": w.get("template_name"),
+               "from": (w.get("start_at") or "")[:5], "to": (w.get("end_at") or "")[:5]}
+        if not w.get("template_name"):
+            kept = _kept_under(w, [o for o in stored if o is not w], topics or [])
+            if kept:
+                row["topic"] = kept
+        out.append(row)
+    return out
+
+
+def _kept_under(check, others, topics):
+    """The extraction topic that holds an unmatched check's words, or None.
+
+    A title naming the check's kind first: topic times are minute stamps, and on
+    TEST (2026-10-06) the stair-core steel check at 17:15:26 was stamped "17:14"
+    while "Slab Rebar and Cover" spanned 17:14-17:16 -- by time alone the email
+    would have pointed at the wrong topic. Then checklist_reports.check_topics'
+    rule (touches a stretch, not another check's). None rather than a guess."""
+    titled = [{"id": i, "title": t.get("topic_title") or t.get("title") or "",
+               "time_range": t.get("time_range")} for i, t in enumerate(topics)
+              if isinstance(t, dict)]
+    mine = set(inspection_match.words(check.get("kind"))
+               or inspection_match.words(check.get("name")))
+    named = [t for t in titled if mine & set(inspection_match.words(t["title"]))]
+    if len(named) == 1:
+        return named[0]["title"]
+    pool = named or titled
+    ids = set(checklist_reports.check_topics(check, others, pool)) if pool else set()
+    near = [t for t in pool if str(t["id"]) in ids]
+    return near[0]["title"] if len(near) == 1 else None
 
 
 def _enqueue_final_email(ctx, put=None):
@@ -1546,7 +1577,7 @@ def write_extraction_items(date, user_folder, extraction_key):
         # The checks heard in this recording, for one line in the email (owner,
         # 2026-10-06): the email goes out before a check's report is written, and
         # without this the recorder learns about it only from the web or the bell.
-        final_email_ctx["checks"] = email_checks(stored_inspections)
+        final_email_ctx["checks"] = email_checks(stored_inspections, extraction.get("topics"))
     if final_email_ctx:
         try:
             _enqueue_final_email(final_email_ctx)

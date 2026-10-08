@@ -36,7 +36,7 @@ def test_no_action_items_table_when_none_open():
     _s, text, html = fin.build_confirmation_email(date="2026-07-25", summary="All done.",
                                                   open_todos=[])
     assert "Action items" not in text       # the heading -- the explanatory note reads differently
-    assert "<table" not in html
+    assert "AGENDA ITEM" not in html        # the card is a layout table; no item table in it
 
 
 def test_a_summary_is_never_echoed_into_the_body_even_when_present():
@@ -165,7 +165,7 @@ def test_date_line_carries_the_meeting_time_range():
     _s, text, html = fin.build_confirmation_email(
         date="2026-07-25", time_range="14:11–14:14", summary="x")
     assert "Date: 2026-07-25 14:11–14:14" in text
-    assert "2026-07-25 14:11–14:14" in html
+    assert "Saturday 25 July 2026 · 14:11–14:14" in html   # the card reads the date in words
 
 
 def test_date_line_without_a_time_range_is_just_the_date():
