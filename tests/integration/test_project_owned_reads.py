@@ -217,3 +217,93 @@ def test_the_persons_own_day_kpi_counts_every_companys_recordings(db):
     assert recordings.day_stats(db, None, w["folder"], DATE)["sessions"] == 2
     assert recordings.day_stats(db, w["co_a"]["id"], w["folder"], DATE)["sessions"] == 1
     assert recordings.day_stats(db, w["co_b"]["id"], w["folder"], DATE)["sessions"] == 1
+
+
+# ---- fix round: whole-day artefacts, external pm reach, delete authority ----
+
+def test_report_history_hides_a_day_that_spans_companies(db):
+    w = _world(db)
+    _two_site_day(db, w)
+    key = f"reports/{DATE}/{w['folder']}/daily_report.json"
+    quiet = f"reports/2026-10-07/{w['folder']}/daily_report.json"
+    _topic_on(db, w, w["site_a"], "Yard A only", "d" * 32, "2026-10-07")
+    for admin in (w["admin_a"], w["admin_b"]):
+        keep = api._report_entry_guard(db, admin)
+        assert keep(key) is False                      # the day spans both companies
+    assert api._report_entry_guard(db, w["admin_a"])(quiet) is True
+    assert api._report_entry_guard(db, w["admin_b"])(quiet) is False   # A-only day, not B's
+    assert api._report_entry_guard(db, w["eve"])(key) is True         # the person: always
+
+
+def _topic_on(db, w, site, title, sid, date):
+    key = f"extractions/{w['folder']}/{date}/sid{sid}.json"
+    return topics.upsert_topic(db, site["id"], date, title, user_id=w["eve"]["id"],
+                               source_s3_key=key, time_range="09:00 - 09:30")
+
+
+def test_an_external_pm_gets_that_one_site_at_the_pm_tier(db):
+    w = _world(db)
+    site_b2 = sites.create_site(db, w["co_b"]["id"], "Tower B2")
+    memberships.add_external_membership(db, w["eve"]["id"], site_b2["id"], "worker")
+    memberships.add_external_membership(db, w["admin_a"]["id"], w["site_b"]["id"], "pm")
+    _topic(db, w, w["site_a"], "Yard A pour", "a" * 32)
+    _topic(db, w, w["site_b"], "Tower B steel", "b" * 32)
+    _topic_on(db, w, site_b2, "Tower B2 hidden", "c" * 32, DATE)
+    sc = api.scope.visible_scope(db, w["admin_a"])
+    assert str(w["site_b"]["id"]) in sc["site_ids"] and str(site_b2["id"]) not in sc["site_ids"]
+    assert sc["user_scope"] == "ALL"                      # home-company reach unchanged
+    code, body = _timeline(db, w["admin_a"], w["folder"])
+    assert code == 200 and _titles(body) == ["Tower B steel", "Yard A pour"]   # not B2
+    assert "WHOLE DAY PROSE" not in json.dumps(body)
+
+
+def test_an_external_worker_role_adds_no_site_reach_for_an_admin(db):
+    w = _world(db)
+    memberships.add_external_membership(db, w["admin_a"]["id"], w["site_b"]["id"], "worker")
+    sc = api.scope.visible_scope(db, w["admin_a"])
+    assert str(w["site_b"]["id"]) not in sc["site_ids"]
+
+
+def test_an_external_pm_has_pm_authority_on_that_site_but_not_admin_authority(db):
+    w = _world(db)
+    site_b2 = sites.create_site(db, w["co_b"]["id"], "Tower B2")
+    memberships.add_external_membership(db, w["admin_a"]["id"], w["site_b"]["id"], "pm")
+    t_ok = _topic(db, w, w["site_b"], "Tower B steel", "b" * 32)
+    t_no = _topic_on(db, w, site_b2, "Tower B2", "c" * 32, DATE)
+    row, err = api._topic_authority(db, w["admin_a"], t_ok["id"])
+    assert err is None and row is not None
+    _row, err = api._topic_authority(db, w["admin_a"], t_no["id"])
+    assert err is not None                                 # B's other site: not theirs
+
+
+def test_delete_authority_follows_the_site_owner(db):
+    w = _world(db)
+    _topic(db, w, w["site_a"], "Yard A pour", "a" * 32)
+    _topic(db, w, w["site_b"], "Tower B steel", "b" * 32)
+    rec_a = {"folder": w["folder"], "date": DATE, "sessionBase": "sid" + "a" * 32}
+    rec_b = {"folder": w["folder"], "date": DATE, "sessionBase": "sid" + "b" * 32}
+    can = lambda who, rec: api._can_delete_folder(db, who, w["folder"], rec=rec)
+    # the site company's admin may erase the external recorder's session; stamped with ITS company
+    ok, stamp = can(w["admin_b"], rec_b)
+    assert ok and str(stamp) == str(w["co_b"]["id"])
+    # the home company's admin may not erase the employee's work on another company's site ...
+    assert can(w["admin_a"], rec_b)[0] is False
+    # ... but may on their own company's site
+    ok, stamp = can(w["admin_a"], rec_a)
+    assert ok and str(stamp) == str(w["co_a"]["id"])
+    # the site company's admin has no say over the person's session on the home site
+    assert can(w["admin_b"], rec_a)[0] is False
+    # the recorder keeps their own rights; a session on B is stamped B
+    ok, stamp = can(w["eve"], rec_b)
+    assert ok and str(stamp) == str(w["co_b"]["id"])
+    # an external pm of the site is not an admin of it
+    memberships.add_external_membership(db, w["admin_a"]["id"], w["site_b"]["id"], "pm")
+    fresh = dict(w["admin_a"])
+    assert api._can_delete_folder(db, fresh, w["folder"], rec=rec_b)[0] is False
+
+
+def test_company_admin_authority_never_reaches_another_companys_rows(db):
+    w = _world(db)
+    assert api._is_company_admin_of(w["admin_a"], w["co_a"]["id"], False) is True
+    assert api._is_company_admin_of(w["admin_a"], w["co_b"]["id"], False) is False
+    assert api._is_company_admin_of(w["eve"], w["co_a"]["id"], False) is False

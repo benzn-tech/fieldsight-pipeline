@@ -725,3 +725,20 @@ def author_day_has_rows_outside_sites(conn, user_id, date, site_ids) -> bool:
         (user_id, date, ids, user_id, f"%/{date}/%", ids),
     ).fetchone()
     return bool(row and row[0])
+
+
+def session_site_companies(conn, folder, date, session_base) -> list:
+    """[(site_id, company_id)] of the sites one recording session lies on, from its
+    extraction topics and its recording rows. Empty when the session carries no site.
+    Decides who may delete it: the company that owns the SITE, not the recorder's
+    home company (project-owned tenancy)."""
+    like_topic = f"extractions/{_escape_like(folder)}/{date}/{_escape_like(session_base)}%"
+    like_rec = f"users/{_escape_like(folder)}/%/{date}/%{_escape_like(session_base)}%"
+    rows = conn.execute(
+        "SELECT DISTINCT s.id, s.company_id FROM topics t JOIN sites s ON s.id = t.site_id "
+        "WHERE t.source_s3_key LIKE %s "
+        "UNION "
+        "SELECT DISTINCT s.id, s.company_id FROM recordings r JOIN sites s ON s.id = r.site_id "
+        "WHERE r.s3_key LIKE %s",
+        (like_topic, like_rec)).fetchall()
+    return [(str(x[0]), str(x[1])) for x in rows]

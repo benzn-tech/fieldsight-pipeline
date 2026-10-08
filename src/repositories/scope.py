@@ -42,6 +42,7 @@ def visible_scope(conn, caller) -> dict:
     global_role = caller["global_role"]
     cross_company = acl.is_cross_company(global_role)
     self_user_id = str(caller["id"])
+    external_pm = set()
 
     if cross_company:
         # D6: the SOLE branch NOT pinned to caller.company_id. Zero membership
@@ -52,6 +53,16 @@ def visible_scope(conn, caller) -> dict:
         # admin/gm: company-wide reach, zero membership queries.
         site_ids = {str(s["id"]) for s in sites.list_company_sites(conn, caller["company_id"])}
         site_roles = {}
+        # An admin/gm added to ANOTHER company's project: the MEMBERSHIP role governs
+        # reach on that one site (project-owned tenancy). A pm there sees every author
+        # on that site, exactly what that site's own pm sees, and nothing on the
+        # company's other sites. Home-company ALL reach is unchanged. The lower tiers
+        # (site_manager/worker) are per-author restricted and cannot be expressed next
+        # to an unfiltered home reach, so they add no site reach here: the person's
+        # own work is read through the own-folder paths.
+        external_pm = {sid for sid, role in memberships.external_site_roles(
+            conn, caller["id"]).items() if role == "pm"}
+        site_ids |= external_pm
     else:
         # regional_manager / pm / site_manager / worker: ONE membership query
         # gives both site_ids (the map's keys) and the per-site roles that
@@ -77,6 +88,7 @@ def visible_scope(conn, caller) -> dict:
         "self_user_id": self_user_id,
         "company_id": caller["company_id"],
         "cross_company": cross_company,
+        "external_pm_site_ids": external_pm,   # ALL-tier caller's pm sites of other companies
     }
     caller["_visible_scope"] = result
     return result

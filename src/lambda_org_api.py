@@ -5993,13 +5993,14 @@ def patch_action_item(conn, caller, action_item_id, body):
     # platform_admin (is_cross_company) edits across every tenant; company roles
     # stay pinned to their own company (mirrors the Team/sites fix in #96).
     cross = is_cross_company(caller["global_role"])
-    if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
+    if row is None or (not cross and not _row_company_ok(
+            conn, caller, row["company_id"], row["site_id"])):
         return error("action item not found", 404)            # incl. cross-company
     site_id = str(row["site_id"])
     if site_id not in _allowed_site_ids(conn, caller):
         return error("access denied to this task's site", 403)  # reach gate
     site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
-    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
+    is_admin = _is_company_admin_of(caller, row["company_id"], cross)
     is_site_authority = site_role in ("pm", "site_manager")
     is_assignee = _is_assignee(row, caller)
     if not (is_admin or is_site_authority or is_assignee):
@@ -6119,14 +6120,15 @@ def patch_question(conn, caller, stable_id, body):
 
     row = topic_questions.get_live_by_stable_id(conn, stable_id)
     cross = is_cross_company(caller["global_role"])
-    if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
+    if row is None or (not cross and not _row_company_ok(
+            conn, caller, row["company_id"], row["site_id"])):
         return error("question not found", 404)             # incl. cross-company
     site_id = str(row["site_id"])
     if site_id not in _allowed_site_ids(conn, caller):
         # Same reach gate as patch_action_item's, but 404 rather than 403 -- see docstring.
         return error("question not found", 404)
     site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
-    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
+    is_admin = _is_company_admin_of(caller, row["company_id"], cross)
     is_site_authority = site_role in ("pm", "site_manager")
     if not (is_admin or is_site_authority):
         # Same site-authority gate as patch_action_item's, but 404 rather than 403 -- see
@@ -6283,7 +6285,8 @@ def patch_compliance_resolution(conn, caller, body):
     # Site-authority tier (no assignee branch, unlike patch_action_item).
     cross = is_cross_company(caller["global_role"])
     site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
-    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
+    is_admin = (resolve_scope(caller["global_role"]) == "ALL"
+                and str(site_id) not in _ext_pm_sites(conn, caller)) or cross
     is_site_authority = site_role in ("pm", "site_manager")
     if not (is_admin or is_site_authority):
         return error("admin/gm or this site's pm/site_manager only", 403)
@@ -6366,13 +6369,14 @@ def patch_content(conn, caller, table, row_id, body):
 
     row = content.get_content_row(conn, table, row_id)
     cross = is_cross_company(caller["global_role"])
-    if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
+    if row is None or (not cross and not _row_company_ok(
+            conn, caller, row["company_id"], row["site_id"])):
         return error("content row not found", 404)      # incl. cross-company
     site_id = str(row["site_id"])
     if site_id not in _allowed_site_ids(conn, caller):
         return error("access denied to this content's site", 403)
     site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
-    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
+    is_admin = _is_company_admin_of(caller, row["company_id"], cross)
     is_site_authority = site_role in ("pm", "site_manager")
     is_author = row.get("author_user_id") is not None and \
         str(row["author_user_id"]) == str(caller["id"])
@@ -6604,13 +6608,14 @@ def _topic_authority(conn, caller, topic_id):
     (None, error_response)."""
     row = content.get_content_row(conn, "topics", topic_id)
     cross = is_cross_company(caller["global_role"])
-    if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
+    if row is None or (not cross and not _row_company_ok(
+            conn, caller, row["company_id"], row["site_id"])):
         return None, error("topic not found", 404)
     site_id = str(row["site_id"])
     if site_id not in _allowed_site_ids(conn, caller):
         return None, error("access denied to this topic's site", 403)
     site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
-    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
+    is_admin = _is_company_admin_of(caller, row["company_id"], cross)
     is_site_authority = site_role in ("pm", "site_manager")
     is_author = row.get("author_user_id") is not None and \
         str(row["author_user_id"]) == str(caller["id"])
@@ -6831,7 +6836,7 @@ def _source_prefixes_for(rec):
     return [f"extractions/{folder}/{date}/{base}"]
 
 
-def _can_delete_folder(conn, caller, folder):
+def _can_delete_folder(conn, caller, folder, rec=None, batch=False):
     """May `caller` delete `folder`'s recordings? Plan §0.9.
 
     Deleting is strictly stronger than viewing, so this is `_can_view_folder` AND an
@@ -6846,14 +6851,37 @@ def _can_delete_folder(conn, caller, folder):
     if not folder:
         return False, None
     sc = scope.visible_scope(conn, caller)
+    # Project-owned tenancy: a recording lies on a SITE, and the company that owns the
+    # site decides who may erase it. `rec` (folder, date, sessionBase) names the session;
+    # the tombstone is stamped with the site's company so that company's readers (and its
+    # undelete) see it. The recorder keeps their own rights over their own folder; a
+    # home-company admin has none over work done on another company's project.
+    site_cos = set()
+    if rec and rec.get("date") and (rec.get("sessionBase") or "").strip():
+        site_cos = {c for _s, c in recordings.session_site_companies(
+            conn, folder, rec["date"], rec["sessionBase"].strip())}
+    stamp = next(iter(site_cos)) if len(site_cos) == 1 else None
     if folder == sc.get("self_folder"):
-        return True, caller["company_id"]
-    if not _can_view_folder(conn, caller, folder):
-        return False, None
+        return True, stamp or caller["company_id"]
     if not (sc.get("user_scope") == "ALL" or sc.get("cross_company")):
         return False, None
-    target = (users.get_by_folder_name_global(conn, folder) if sc.get("cross_company")
-              else users.get_by_folder_name(conn, caller["company_id"], folder))
+    if sc.get("cross_company"):
+        target = users.get_by_folder_name_global(conn, folder)
+        if target is None:
+            return False, None
+        return True, stamp or target["company_id"]
+    if not _can_view_folder(conn, caller, folder):
+        return False, None
+    if batch:
+        # Undelete: revert_batch is itself company-guarded (only the company that stamped
+        # the batch can revert it), so the folder-level gate is enough here.
+        return True, caller["company_id"]
+    if site_cos:
+        # Only a session lying wholly on this company's own sites.
+        if site_cos == {str(caller["company_id"])}:
+            return True, caller["company_id"]
+        return False, None
+    target = users.get_by_folder_name(conn, caller["company_id"], folder)
     if target is None:
         return False, None
     return True, target["company_id"]
@@ -6896,7 +6924,7 @@ def delete_recordings_endpoint(conn, caller, body):
             results.append({"recording": rec, "topics_hidden": 0,
                             "error": "folder, date and sessionBase are all required"})
             continue
-        allowed, target_company = _can_delete_folder(conn, caller, rec.get("folder"))
+        allowed, target_company = _can_delete_folder(conn, caller, rec.get("folder"), rec=rec)
         if not allowed:
             results.append({"recording": rec, "topics_hidden": 0,
                             "error": "not permitted to delete this user's recordings"})
@@ -7035,18 +7063,32 @@ def undelete_recordings_endpoint(conn, caller, body):
     cross = is_cross_company(caller["global_role"])
     existing = redactions.list_batch(
         conn, batch_id, caller["company_id"], cross_company=cross) or []
+
+    def _folders_of(rows_):
+        return {(r.get("target_key") or "").split("/")[1]
+                for r in rows_ if r.get("target_type") == "recording"
+                and (r.get("target_key") or "").startswith("extractions/")}
+
+    revert_cross = cross
+    if not existing and not cross:
+        # A recorder deleting their own work on ANOTHER company's project: the batch is
+        # stamped with the site's company, not theirs. Theirs to undo only if every
+        # recording in it is their own folder's.
+        anyrows = redactions.list_batch(conn, batch_id, caller["company_id"],
+                                        cross_company=True) or []
+        mine = _folders_of(anyrows)
+        if anyrows and mine and mine == {caller.get("folder_name")}:
+            existing, revert_cross = anyrows, True
     if not existing:
         return error("batch not found", 404)
-    folders = {(r.get("target_key") or "").split("/")[1]
-               for r in existing if r.get("target_type") == "recording"
-               and (r.get("target_key") or "").startswith("extractions/")}
+    folders = _folders_of(existing)
     for folder in sorted(folders):
-        allowed, _ = _can_delete_folder(conn, caller, folder)
+        allowed, _ = _can_delete_folder(conn, caller, folder, batch=True)
         if not allowed:
             return error("not permitted to restore this batch", 403)
 
     rows = redactions.revert_batch(
-        conn, batch_id, caller["company_id"], cross_company=cross) or []
+        conn, batch_id, caller["company_id"], cross_company=revert_cross) or []
     # The search index comes back too, out of the archive and keyed on the same batch, so
     # one undelete restores exactly what one delete removed. Logged including zero: a batch
     # created before the archive shipped legitimately has none, and that has to be
@@ -9696,6 +9738,27 @@ def _resolve_target_user(conn, company_id, folder):
             or users.get_by_folder_name_global(conn, folder))
 
 
+def _ext_pm_sites(conn, caller):
+    """Sites of ANOTHER company on which this ALL-tier caller is an external pm."""
+    if is_cross_company(caller["global_role"]):
+        return set()
+    return scope.visible_scope(conn, caller).get("external_pm_site_ids") or set()
+
+
+def _row_company_ok(conn, caller, row_company, site_id):
+    """The company pin of the row-level write gates: the caller's own company, or a
+    site on which they are an external pm (membership governs reach there)."""
+    return (str(row_company) == str(caller["company_id"])
+            or str(site_id) in _ext_pm_sites(conn, caller))
+
+
+def _is_company_admin_of(caller, row_company, cross):
+    """admin/gm authority applies to the caller's OWN company's rows only -- never to
+    a project of another company they merely hold a membership on."""
+    return (resolve_scope(caller["global_role"]) == "ALL"
+            and str(row_company) == str(caller["company_id"])) or cross
+
+
 def _read_company(caller, folder):
     """The company pin for a per-person read of (folder, date).
 
@@ -9725,8 +9788,8 @@ def _all_tier_may_open(conn, caller, folder):
         return False
     if str(target.get("company_id", caller["company_id"])) == str(caller["company_id"]):
         return True
-    site_ids = {str(x["id"]) for x in sites.list_company_sites(conn, caller["company_id"])}
-    return recordings.author_footprint_in_sites(conn, target["id"], site_ids)
+    return recordings.author_footprint_in_sites(
+        conn, target["id"], scope.visible_scope(conn, caller)["site_ids"])
 
 
 def get_timeline_compat(conn, caller, event):
@@ -10789,7 +10852,7 @@ def _company_folder_names(conn, company_id):
             if u.get("folder_name")}
 
 
-def _read_org_report_history(folder_scope, limit):
+def _read_org_report_history(folder_scope, limit, keep=None):
     """List the lake's report index, filtered by an ALREADY-RESOLVED folder
     scope. `folder_scope is None` means unrestricted; callers MUST have
     short-circuited the deny-all (empty set) case before getting here.
@@ -10835,6 +10898,8 @@ def _read_org_report_history(folder_scope, limit):
                     owner = _report_key_owner_folder(key)
                     if owner is None or owner not in folder_scope:
                         continue
+                if keep is not None and not keep(key):
+                    continue
                 rtype = ("weekly" if "weekly" in key
                          else "monthly" if "monthly" in key else "daily")
                 dm = REPORT_DATE_IN_KEY_RE.search(key)
@@ -10889,7 +10954,36 @@ def get_org_report_history(conn, caller, event):
         # DENY ALL -- return early rather than fall into a filter loop whose
         # predicate an empty container would silently satisfy.
         return ok({"reports": []})
-    return ok(_read_org_report_history(folder_scope, limit))
+    return ok(_read_org_report_history(
+        folder_scope, limit, keep=_report_entry_guard(conn, caller)))
+
+
+def _report_entry_guard(conn, caller):
+    """Predicate for the report-history listing: a whole-day report document is a
+    synthesis of that person's day and carries no site, so for anyone other than the
+    person (and other than platform_admin) an entry is hidden when that day holds the
+    person's rows or recordings outside the caller's sites. No whole-day artefact
+    crosses companies. Entries without an owner/date, or whose owner is the caller,
+    are unaffected."""
+    if is_cross_company(caller["global_role"]):
+        return None
+    me = caller.get("folder_name") or None
+    sites_ = _allowed_site_ids(conn, caller)
+    owners = {}
+
+    def keep(key):
+        owner = _report_key_owner_folder(key)
+        dm = REPORT_DATE_IN_KEY_RE.search(key)
+        if not owner or owner == me or not dm:
+            return True
+        if owner not in owners:
+            tgt = users.get_by_folder_name_global(conn, owner)
+            owners[owner] = tgt["id"] if tgt else None
+        if owners[owner] is None:
+            return True
+        return not recordings.author_day_has_rows_outside_sites(
+            conn, owners[owner], dm.group(1), sites_)
+    return keep
 
 
 def _apply_speaker_groups(conn, caller, payload):

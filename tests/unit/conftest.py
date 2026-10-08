@@ -19,8 +19,10 @@ def _single_company_world_defaults():
     from repositories import memberships, recordings, sites, users
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(memberships, "has_live_external", lambda conn, user_id: False)
+        mp.setattr(memberships, "external_site_roles", lambda conn, user_id: {})
         mp.setattr(recordings, "author_day_has_rows_outside_sites",
                    lambda conn, user_id, date, site_ids: False)
+        mp.setattr(recordings, "session_site_companies", lambda conn, folder, date, base: [])
         mp.setattr(users, "get_by_folder_name_global", lambda conn, folder: None)
         mp.setattr(sites, "list_company_sites",
                    lambda conn, company_id, include_archived=False: [])

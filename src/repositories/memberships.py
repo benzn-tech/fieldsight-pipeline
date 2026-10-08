@@ -2,7 +2,7 @@ from psycopg.rows import dict_row
 from repositories.acl import resolve_scope  # re-export
 
 __all__ = ["resolve_scope", "add_membership", "accessible_site_ids", "ensure_membership", "list_company_memberships",
-          "members_for_site", "caller_site_roles", "has_live_external", "get_membership", "add_external_membership", "worker_user_ids_for_sites",
+          "members_for_site", "caller_site_roles", "has_live_external", "external_site_roles", "get_membership", "add_external_membership", "worker_user_ids_for_sites",
           "user_ids_for_sites", "archive_membership", "site_usable_by_user"]
 
 
@@ -225,6 +225,15 @@ def site_usable_by_user(conn, user_id, site_id) -> dict | None:
         "  AND m.archived_at IS NULL))",
         (user_id, site_id),
     ).fetchone()
+
+
+def external_site_roles(conn, user_id) -> dict:
+    """{site_id_str: membership.role} for the user's LIVE external memberships
+    (projects of another company they were added to)."""
+    rows = conn.execute(
+        "SELECT site_id, role FROM memberships WHERE user_id=%s AND external "
+        "AND archived_at IS NULL", (user_id,)).fetchall()
+    return {str(r[0]): r[1] for r in rows}
 
 
 def has_live_external(conn, user_id) -> bool:
