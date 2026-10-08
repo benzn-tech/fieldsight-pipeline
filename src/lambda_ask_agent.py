@@ -17,7 +17,6 @@ import json
 import logging
 import time
 import boto3
-import urllib3
 import urllib.parse as _urlparse
 from concurrent.futures import ThreadPoolExecutor
 
@@ -83,8 +82,8 @@ ASK_REWRITE_BUDGET = float(os.environ.get('ASK_REWRITE_BUDGET', '4.0'))
 # from the Cognito token -- see docs/superpowers/plans/2026-07-07-phase-5-rag-ask.md).
 # This path answers from chunks retrieved ACROSS the caller's accessible
 # sites via semantic search, instead of one S3 report+transcript pair for
-# one date/user. The S3-file path above is left completely unchanged and
-# remains the fallback for direct invokes without a caller_sub.
+# one date/user. There is no other path: without a caller_sub the request is
+# refused (401), and without RAG_SEARCH_FUNCTION it is a 503 (2026-10-08).
 
 RAG_SYSTEM_CONTEXT = """You are an AI assistant for FieldSight, a construction site monitoring platform used in New Zealand.
 Answer the user's question using ONLY the numbered excerpts retrieved from site reports below (across sites the user can access).
