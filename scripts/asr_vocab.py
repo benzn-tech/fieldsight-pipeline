@@ -7,6 +7,11 @@ boto3, so it can be uploaded to AWS CloudShell and run against prod as is.
     python asr_vocab.py --stage test add Hirepool --heard "Hiab" --heard "hair pool" \
         --date 2026-10-08 --folder Ben_Lin_test2 --session sid5cc1... [--status candidate]
     python asr_vocab.py --stage test retire Hiab --note "pulled Hirepool to Hiab"
+    python asr_vocab.py promote --from test --to prod        # shows the plan, asks first
+
+`promote` copies what TEST proved -- active and retired rows -- into the other
+table, with what each word was heard as and where. Candidates stay behind (they
+are notes, not decisions); a row only the target has is never touched or deleted.
 
 `add` on an existing term keeps its status unless --status is given, and appends
 what it was heard as and where. Every write stamps added_by/updated_at.
@@ -95,9 +100,95 @@ def add(table, term, *, status=None, heard=(), evidence=None, note=None, categor
     return item
 
 
+PROMOTED = ("active", "retired")
+
+
+def _scan(table):
+    rows, kw = [], {}
+    while True:
+        page = table.scan(**kw)
+        rows += page.get("Items") or []
+        if "LastEvaluatedKey" not in page:
+            return rows
+        kw["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+
+
+def _union(a, b):
+    out = list(a or [])
+    for x in b or []:
+        if x not in out:
+            out.append(x)
+    return out
+
+
+def plan_promotion(src_rows, dst_rows):
+    """[(action, merged_row)] to make the target agree with the source.
+
+    action is "add" (not in the target), "status" (the target says otherwise:
+    a retire travels too), or "notes" (same status, new heard-as or evidence).
+    Rows already in agreement produce nothing, so a second run is empty."""
+    dst = {r["term"]: r for r in dst_rows or []}
+    plan = []
+    for src in sorted(src_rows or [], key=lambda r: r["term"].lower()):
+        if src.get("status") not in PROMOTED:
+            continue
+        cur = dst.get(src["term"])
+        row = dict(cur) if cur else {k: v for k, v in src.items()
+                                     if k not in ("updated_at", "updated_by")}
+        row["status"] = src["status"]
+        row["misheard_as"] = _union((cur or {}).get("misheard_as"), src.get("misheard_as"))
+        row["evidence"] = _union((cur or {}).get("evidence"), src.get("evidence"))
+        for k in ("category", "note"):
+            if src.get(k) and not row.get(k):
+                row[k] = src[k]
+        if cur is None:
+            action = "add"
+        elif cur.get("status") != src["status"]:
+            action = "status"
+        elif (row["misheard_as"] != list(cur.get("misheard_as") or [])
+              or row["evidence"] != list(cur.get("evidence") or [])):
+            action = "notes"
+        else:
+            continue
+        plan.append((action, row))
+    return plan
+
+
+def apply_promotion(table, plan, source, by=None, now=None):
+    for _action, row in plan:
+        item = dict(row, promoted_from=source, updated_by=by or _who(), updated_at=now or _now())
+        item.setdefault("added_by", by or _who())
+        item.setdefault("added_at", now or _now())
+        table.put_item(Item=item)
+    return len(plan)
+
+
+def promote(src_table, dst_table, source, *, yes=False, ask=input, show=print):
+    """Show the plan, ask, write. Returns how many rows were written."""
+    plan = plan_promotion(_scan(src_table), _scan(dst_table))
+    if not plan:
+        show("nothing to promote: the target already agrees")
+        return 0
+    for action, row in plan:
+        heard = ", ".join(row.get("misheard_as") or [])
+        show("  %-6s %-8s %-32s %s" % (action, row["status"], row["term"],
+                                      ("heard as: " + heard) if heard else ""))
+    counts = {}
+    for action, _ in plan:
+        counts[action] = counts.get(action, 0) + 1
+    show("%d row(s): %s" % (len(plan), ", ".join("%d %s" % (n, a) for a, n in sorted(counts.items()))))
+    if not yes and ask("apply? [y/N] ").strip().lower() not in ("y", "yes"):
+        show("not applied")
+        return 0
+    n = apply_promotion(dst_table, plan, source)
+    show("applied %d row(s)" % n)
+    return n
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--stage", choices=("test", "prod"), required=True)
+    ap.add_argument("--stage", choices=("test", "prod"),
+                    help="the table to work on (every command but promote)")
     ap.add_argument("--profile", default=None, help="AWS profile (omit in CloudShell)")
     ap.add_argument("--region", default="ap-southeast-2")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -116,21 +207,26 @@ def main(argv=None):
     rt = sub.add_parser("retire")
     rt.add_argument("term")
     rt.add_argument("--note")
+    pr = sub.add_parser("promote")
+    pr.add_argument("--from", dest="source", choices=("test", "prod"), default="test")
+    pr.add_argument("--to", dest="target", choices=("test", "prod"), default="prod")
+    pr.add_argument("--yes", action="store_true", help="apply without asking")
     a = ap.parse_args(argv)
+    if a.cmd != "promote" and not a.stage:
+        ap.error("--stage is required for %s" % a.cmd)
+    if a.cmd == "promote" and a.source == a.target:
+        ap.error("--from and --to are the same table")
 
     import boto3
     session = boto3.Session(profile_name=a.profile, region_name=a.region)
-    table = session.resource("dynamodb").Table(table_name(a.stage))
+    db = session.resource("dynamodb")
+    if a.cmd == "promote":
+        promote(db.Table(table_name(a.source)), db.Table(table_name(a.target)), a.source, yes=a.yes)
+        return
+    table = db.Table(table_name(a.stage))
 
     if a.cmd == "list":
-        rows, kw = [], {}
-        while True:
-            page = table.scan(**kw)
-            rows += page.get("Items") or []
-            if "LastEvaluatedKey" not in page:
-                break
-            kw["ExclusiveStartKey"] = page["LastEvaluatedKey"]
-        rows = [r for r in rows if not a.status or r.get("status") == a.status]
+        rows = [r for r in _scan(table) if not a.status or r.get("status") == a.status]
         for r in sorted(rows, key=lambda r: (r.get("status", ""), r["term"].lower())):
             heard = ", ".join(r.get("misheard_as") or [])
             print("%-9s %-32s %s" % (r.get("status"), r["term"], ("heard as: " + heard) if heard else ""))
