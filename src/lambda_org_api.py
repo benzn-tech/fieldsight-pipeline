@@ -4649,6 +4649,13 @@ def get_me(conn, caller):
     else:
         site_ids = memberships.accessible_site_ids(
             conn, caller["id"], caller["global_role"])
+    # A project the caller was added to as an EXTERNAL member is somewhere they can
+    # record (capture accepts any live membership, project-owned tenancy P2) even when
+    # their read reach does not include it -- an admin/gm's reach is their own company's
+    # sites. Pickers read this list, so without the union an external member could not
+    # choose the project at all (TEST 2026-10-09). Reads stay clipped server-side.
+    site_ids = sorted({str(x) for x in site_ids} | set(
+        memberships.caller_site_roles(conn, caller["id"]).keys()))
     # Strip the request-scoped visible_scope memo (MINOR-1) before echoing the
     # caller profile -- it's an internal cache, not part of the /me contract.
     profile = {k: v for k, v in caller.items() if k != "_visible_scope"}
