@@ -345,6 +345,34 @@ def download_json_from_s3(bucket, key):
 # manager out of it.
 MANAGER_ROLES = ('site_manager', 'pm', 'regional_manager', 'gm', 'admin')
 
+def external_folders(bucket):
+    """Folders of people who hold a live membership on ANOTHER company's project
+    (`has_external` in the directory). Their whole-day documents span companies, so they
+    stay out of every site rollup and out of the SITE# DynamoDB stamping."""
+    doc = directory.load(s3_client, bucket)
+    return {f for f, p in (doc.get('people') or {}).items()
+            if isinstance(p, dict) and p.get('has_external')}
+
+
+def group_reports_by_site(reports_by_user, user_all_sites, ext_folders, site_id_default):
+    """{site: [daily reports]} for the weekly/monthly site rollups. A person with a live
+    external membership (`ext_folders`) is left out entirely: their whole-day document
+    covers other companies' projects too. One INFO line per exclusion (folder only)."""
+    reports_by_site = {}
+    for user_name, user_reports in reports_by_user.items():
+        if user_name == '_summary':
+            continue
+        if user_name in ext_folders:
+            logger.info(f"  {user_name}: has_external -- excluded from site rollups")
+            continue
+        user_site_list = user_all_sites.get(user_name, [])
+        if not user_site_list:
+            user_site_list = [site_id_default]
+        for sid in user_site_list:
+            reports_by_site.setdefault(sid, []).extend(user_reports)
+    return reports_by_site
+
+
 def get_user_site_mapping(bucket):
     """(primary_site, all_sites, roles, sites_info), keyed by recording folder
     for the people maps and by SITE ID for the sites. Slugs are unique per
@@ -1841,6 +1869,11 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
             logger.error(f"Word generation failed for {user_name}: {e}")
 
         site_id = user_site_slug or site_name.lower().replace(' ', '-')
+        if user_name in external_folders(S3_BUCKET):
+            # The day spans companies (a live external membership): stamping it on one
+            # site's SITE# items would show another company's content there.
+            logger.info(f"  {user_name}: has_external -- not stamped on SITE# items")
+            continue
         write_items_to_dynamodb(site_id, target_date, topics, user_name, device)
         write_report_to_dynamodb(site_id, target_date, 'daily', json_key, user_name,
             visible_count=len(topics),
@@ -2099,15 +2132,8 @@ def generate_periodic_report(report_type, start_date, end_date, user=None, trigg
         }
 
     # Per-site reports
-    reports_by_site = {}
-    for user_name, user_reports in reports_by_user.items():
-        if user_name == '_summary':
-            continue
-        user_site_list = user_all_sites.get(user_name, [])
-        if not user_site_list:
-            user_site_list = [site_id_default]
-        for sid in user_site_list:
-            reports_by_site.setdefault(sid, []).extend(user_reports)
+    reports_by_site = group_reports_by_site(
+        reports_by_user, user_all_sites, external_folders(S3_BUCKET), site_id_default)
 
     per_site_results = {}
     used_slugs = set()

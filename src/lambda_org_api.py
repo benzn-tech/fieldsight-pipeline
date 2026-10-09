@@ -4033,6 +4033,25 @@ def put_photo_selection(conn, caller, date, event):
     return ok(_photo_selection_body(conn, caller, folder, date, set(excluded)))
 
 
+def _day_sessions_out_of_reach(conn, caller, folders, date, session_ids):
+    """Whether a day report names a session the caller may not see (R1 whitelist, F7).
+
+    Each session id is judged by the hiders of the folders the report covers: it is out of
+    reach when ANY folder's hider has it on a site outside the caller's reach, or when NO
+    folder's hider lets it through (site-less and the caller is not of the recorder's home
+    company)."""
+    all_h = [_session_hider(conn, caller, f, date) for f in folders]
+    hiders = [h for h in all_h if h is not None]
+    free = len(hiders) < len(all_h)   # one folder is the caller's own / platform_admin's
+    for s in session_ids:
+        sid = turn_name_overlay.session_base(s) or s
+        if any(sid in h.outside for h in hiders):
+            return True
+        if not free and all(h.hides(sid) for h in hiders):
+            return True
+    return False
+
+
 def day_report_status(conn, caller, date, event):
     """GET /api/org/days/{date}/report/status?user=&requestId= — poll a day report.
 
@@ -4068,6 +4087,9 @@ def day_report_status(conn, caller, date, event):
         if _any_session_removed(session_ids, folders, date):
             logger.info("day report %s: a session in it was deleted -- not served", request_id)
             return ok({"status": "removed"})
+        if _day_sessions_out_of_reach(conn, caller, folders, date, session_ids):
+            logger.info("day report %s: names a session outside the caller's reach", request_id)
+            return error("not found", 404)
         url = _presign_report_doc(result["docKey"], folder, date, result)
         return ok({"status": "done", "docUrl": url, "emailed": bool(result.get("emailed")),
                    **_generation_provenance(result)})
@@ -5013,7 +5035,8 @@ def _build_directory(conn):
         directory_repo.live_users(conn), directory_repo.live_memberships(conn),
         directory_repo.live_sites(conn),
         datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        activity=directory_repo.recent_activity(conn, directory.PRIMARY_SITE_WINDOW_DAYS))
+        activity=directory_repo.recent_activity(conn, directory.PRIMARY_SITE_WINDOW_DAYS),
+        external_user_ids=directory_repo.external_user_ids(conn))
 
 
 def _write_directory_if_changed(conn):
@@ -5533,7 +5556,14 @@ def add_external_member(conn, caller, site_id, body):
     existing = memberships.get_membership(conn, target["id"], site_id)
     if existing is not None and existing.get("archived_at") is None:
         return error("user is already a member of this site", 409)
-    row = memberships.add_external_membership(conn, target["id"], site_id, role)
+    try:
+        with conn.transaction():
+            row = memberships.add_external_membership(conn, target["id"], site_id, role)
+    except Exception as exc:  # noqa: BLE001
+        if not memberships._is_missing_schema(exc):
+            raise
+        logger.warning("external member add refused: migration 0085 not applied yet")
+        return error("external members are not available yet, retry in a minute", 503)
     memberships.record_audit(
         conn, "external_revive" if existing is not None else "external_add", caller,
         target["id"], site, role, row.get("id"))

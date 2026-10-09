@@ -1,9 +1,72 @@
 from psycopg.rows import dict_row
 from repositories.acl import resolve_scope  # re-export
+import logging
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["resolve_scope", "add_membership", "accessible_site_ids", "ensure_membership", "list_company_memberships",
           "members_for_site", "caller_site_roles", "has_live_external", "external_site_roles", "external_site_companies", "record_audit", "get_membership", "add_external_membership", "worker_user_ids_for_sites",
           "user_ids_for_sites", "archive_membership", "site_usable_by_user"]
+
+
+# DEPLOY TOLERANCE. The deploy workflows apply migrations AFTER `sam deploy`, so for about a
+# minute the new code runs against a schema without memberships.external (0085) and without
+# membership_audit (0086). Reads that touch the column fall back to the pre-0085 SQL (no
+# external members exist yet, so the answer is identical) and log a WARNING; they never 500.
+_LEGACY_SUBS = (
+    ("m.external, ", "false AS external, "),
+    (" OR m.external)", ")"),
+    (" AND NOT m.external", ""),
+    ("role, external, created_at", "role, false AS external, created_at"),
+)
+
+
+def _legacy_sql(sql):
+    out = sql
+    for a, b in _LEGACY_SUBS:
+        out = out.replace(a, b)
+    return out
+
+
+def _is_missing_schema(exc):
+    import psycopg.errors as pe
+    return isinstance(exc, (pe.UndefinedColumn, pe.UndefinedTable))
+
+
+def _exec(conn, sql, params=()):
+    """conn.cursor(dict_row).execute(sql, params), falling back to the pre-0085 SQL when the
+    external column does not exist yet (see DEPLOY TOLERANCE)."""
+    def go(q):
+        return conn.cursor(row_factory=dict_row).execute(q, params)
+    tx = getattr(conn, "transaction", None)
+    try:
+        if tx is None:
+            return go(sql)
+        with tx():
+            return go(sql)
+    except Exception as exc:  # noqa: BLE001
+        legacy = _legacy_sql(sql)
+        if not _is_missing_schema(exc) or legacy == sql:
+            raise
+        logger.warning("memberships.external missing (migration 0085 not applied yet); "
+                       "using the pre-external query")
+        return go(legacy)
+
+
+def _external_or(conn, sql, params, default):
+    """Rows of an external-only read, or `default` while 0085 is not applied."""
+    tx = getattr(conn, "transaction", None)
+    try:
+        if tx is None:
+            return conn.execute(sql, params).fetchall()
+        with tx():
+            return conn.execute(sql, params).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        if not _is_missing_schema(exc):
+            raise
+        logger.warning("memberships.external missing (migration 0085 not applied yet); "
+                       "treating the caller as having no external memberships")
+        return default
 
 
 def add_membership(conn, user_id, site_id, role) -> dict:
@@ -17,7 +80,7 @@ def add_membership(conn, user_id, site_id, role) -> dict:
 def get_membership(conn, user_id, site_id) -> dict | None:
     """The (user, site) membership INCLUDING an archived one, so the caller can
     tell 'already a member' (409) from 'was one, revive it'."""
-    return conn.cursor(row_factory=dict_row).execute(
+    return _exec(conn, 
         "SELECT id, user_id, site_id, role, external, created_at, archived_at "
         "FROM memberships WHERE user_id=%s AND site_id=%s",
         (user_id, site_id),
@@ -88,7 +151,7 @@ def archive_membership(conn, user_id, site_id) -> dict | None:
 
 
 def list_company_memberships(conn, company_id) -> list[dict]:
-    return conn.cursor(row_factory=dict_row).execute(
+    return _exec(conn, 
         "SELECT m.user_id, u.cognito_sub, m.site_id, m.role, m.external, "
         "hc.name AS home_company_name "
         "FROM memberships m "
@@ -110,7 +173,7 @@ def count_by_site(conn, site_ids) -> dict:
     site company's payroll)."""
     if not site_ids:
         return {}
-    rows = conn.cursor(row_factory=dict_row).execute(
+    rows = _exec(conn, 
         "SELECT m.site_id, COUNT(*) AS n "
         "FROM memberships m "
         "JOIN users u ON u.id = m.user_id "
@@ -127,7 +190,7 @@ def list_all_memberships(conn) -> list[dict]:
     """Cross-company membership list -- platform_admin only. Mirrors
     list_company_memberships without the company pin; the in-company invariant
     (u.company_id = s.company_id) is still enforced so mis-tenanted rows drop."""
-    return conn.cursor(row_factory=dict_row).execute(
+    return _exec(conn, 
         "SELECT m.user_id, u.cognito_sub, m.site_id, m.role, m.external, "
         "hc.name AS home_company_name "
         "FROM memberships m "
@@ -148,7 +211,7 @@ def members_for_site(conn, company_id, site_id) -> list[dict]:
     another company (external=true, project-owned tenancy P1) and carry
     home_company_name. Excludes archived members/memberships. Returns each
     user's display columns plus the per-site membership role (site_role)."""
-    return conn.cursor(row_factory=dict_row).execute(
+    return _exec(conn, 
         "SELECT u.id, u.cognito_sub, u.first_name, u.last_name, u.folder_name, "
         "u.avatar_s3_key, u.global_role, m.role AS site_role, m.external, "
         "hc.name AS home_company_name "
@@ -230,9 +293,9 @@ def site_usable_by_user(conn, user_id, site_id) -> dict | None:
 def external_site_roles(conn, user_id) -> dict:
     """{site_id_str: membership.role} for the user's LIVE external memberships
     (projects of another company they were added to)."""
-    rows = conn.execute(
-        "SELECT site_id, role FROM memberships WHERE user_id=%s AND external "
-        "AND archived_at IS NULL", (user_id,)).fetchall()
+    rows = _external_or(
+        conn, "SELECT site_id, role FROM memberships WHERE user_id=%s AND external "
+        "AND archived_at IS NULL", (user_id,), [])
     return {str(r[0]): r[1] for r in rows}
 
 
@@ -241,10 +304,10 @@ def has_live_external(conn, user_id) -> bool:
     Such a caller's reach includes sites whose rows carry a company other than
     their own, so a bare `company_id = <home company>` pin on a site-scoped read
     would hide exactly those rows (project-owned tenancy P3)."""
-    row = conn.execute(
-        "SELECT EXISTS (SELECT 1 FROM memberships WHERE user_id=%s AND external "
-        "AND archived_at IS NULL)", (user_id,)).fetchone()
-    return bool(row and row[0])
+    rows = _external_or(
+        conn, "SELECT EXISTS (SELECT 1 FROM memberships WHERE user_id=%s AND external "
+        "AND archived_at IS NULL)", (user_id,), [])
+    return bool(rows and rows[0][0])
 
 
 def external_site_companies(conn, user_id, within_site_ids=None) -> dict:
@@ -252,9 +315,9 @@ def external_site_companies(conn, user_id, within_site_ids=None) -> dict:
     (optionally only those in `within_site_ids`). The sites whose rows carry a company
     other than the user's own, so a home-company pin has to be waived for exactly
     these site ids -- and only these (final review F4)."""
-    rows = conn.execute(
-        "SELECT m.site_id, s.company_id FROM memberships m JOIN sites s ON s.id = m.site_id "
-        "WHERE m.user_id=%s AND m.external AND m.archived_at IS NULL", (user_id,)).fetchall()
+    rows = _external_or(
+        conn, "SELECT m.site_id, s.company_id FROM memberships m JOIN sites s ON s.id = m.site_id "
+        "WHERE m.user_id=%s AND m.external AND m.archived_at IS NULL", (user_id,), [])
     out = {str(r[0]): str(r[1]) for r in rows}
     if within_site_ids is not None:
         keep = {str(x) for x in within_site_ids}
@@ -267,8 +330,23 @@ def record_audit(conn, action, actor, target_user_id, site, role, membership_id=
     (`action`: external_add / external_revive / external_role / external_archive), to whom,
     on which site (`site` is the site row), at which role. Runs on the request's connection,
     so it commits or rolls back with the membership change itself."""
-    conn.execute(
+    _audit_insert(conn,
         "INSERT INTO membership_audit (action, actor_user_id, actor_role, target_user_id, "
         "site_id, site_company_id, role, membership_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
         (action, actor.get("id"), actor.get("global_role"), target_user_id,
          site["id"], site.get("company_id"), role, membership_id))
+
+
+def _audit_insert(conn, sql, params):
+    tx = getattr(conn, "transaction", None)
+    try:
+        if tx is None:
+            conn.execute(sql, params)
+        else:
+            with tx():
+                conn.execute(sql, params)
+    except Exception as exc:  # noqa: BLE001
+        if not _is_missing_schema(exc):
+            raise
+        logger.warning("membership_audit missing (migration 0086 not applied yet); "
+                       "audit row NOT written for %s", params[0])

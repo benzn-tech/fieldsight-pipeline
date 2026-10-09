@@ -138,3 +138,24 @@ Binding outcomes of the final security review (findings F1-F8) and where each la
 - **R8 (F8).** Every external-member add / revive / role change / archive writes a
   `membership_audit` row (migration 0086) in the same transaction. An email shared by more
   than one live user is refused with 409 "ambiguous email, contact support".
+
+### Controller follow-ups (accepted readings and second fix round)
+
+- **R1 (b), accepted reading:** site-less work is visible to anyone of the recorder's home
+  company who can already open the folder (any tier), never to another company.
+- **R3, known limitation (accepted, fail closed):** a home SELF / SELF+WORKERS caller who is an
+  external pm gets no dashboard / Ask reach on that site, because the shared
+  (site_ids, author_ids) pair cannot express two author tiers. Extension path: an
+  "open sites" parameter through the SQL readers.
+- **Rollups:** the directory person entry carries `has_external` (true when the person holds
+  any live external membership; the external sites are still NOT listed). The report generator
+  leaves such a person's daily documents out of every weekly/monthly SITE rollup and out of
+  DynamoDB `SITE#` stamping (one INFO line per exclusion, folder only). Their own per-user
+  documents are unchanged and remain guarded for non-self readers.
+- **`day_report_status`** applies the R1 whitelist to the sessions the result names (404 when
+  any is outside the caller's reach).
+- **Deploy order:** `sam deploy` runs BEFORE the migrate invoke in `deploy.yml` and
+  `deploy-prod.yml`, so the code is tolerant of a schema without migrations 0085 / 0086 for
+  that minute: reads of `memberships.external` fall back to the pre-0085 SQL (no externals
+  exist yet) and the audit insert is skipped, each with a WARNING; the add-external route
+  answers 503.

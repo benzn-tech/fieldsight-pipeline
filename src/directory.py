@@ -73,7 +73,8 @@ def display_name(first, last):
     return " ".join(p.strip() for p in (first, last) if p and p.strip())
 
 
-def build(user_rows, membership_rows, site_rows, published_at, activity=None):
+def build(user_rows, membership_rows, site_rows, published_at, activity=None,
+          external_user_ids=()):
     """Rows from Aurora -> the document.
 
     `user_rows`: live users (archived already excluded) with folder_name,
@@ -84,7 +85,10 @@ def build(user_rows, membership_rows, site_rows, published_at, activity=None):
     `activity`: [{user_id, site_id, n, latest}] -- topics by that user on that
     site in the last PRIMARY_SITE_WINDOW_DAYS days, used to choose a primary
     site among several.
+    `external_user_ids`: users holding a live external membership. Each person gets
+    `has_external` true/false; the external sites themselves are NOT listed.
     """
+    ext = {str(x) for x in (external_user_ids or ())}
     sites = {}
     for s in site_rows:
         sid = str(s["id"])
@@ -118,6 +122,7 @@ def build(user_rows, membership_rows, site_rows, published_at, activity=None):
             "company_id": str(u["company_id"]) if u.get("company_id") else None,
             "primary_site": primary_site(uid, mine, act),
             "sites": mine,
+            "has_external": uid in ext,
         }
     return {"version": VERSION, "published_at": published_at,
             "people": dict(sorted(people.items())), "sites": dict(sorted(sites.items()))}

@@ -453,3 +453,55 @@ def test_a_report_with_no_rows_behind_it_is_not_served_to_the_site_company(db):
     daily = f"reports/{DATE}/{w['folder']}/daily_report.json"
     assert api._user_report_hidden(db, w["admin_b"], daily) is True     # nothing ties it to B
     assert api._user_report_hidden(db, w["admin_a"], daily) is False    # home company
+
+
+def test_day_report_status_follows_the_whitelist(db, monkeypatch):
+    w = _world(db)
+    _rec(db, w, None, SID_HOME)
+    _rec(db, w, w["site_b"], SID_B)
+    monkeypatch.setattr(api, "_any_session_removed", lambda *a, **k: False)
+    monkeypatch.setattr(api, "_presign_report_doc", lambda *a, **k: "https://doc")
+    rid = "f" * 32
+
+    def serve(sids):
+        objs = {f"session_report_results/{w['folder']}/{DATE}/day/{rid}.json": {
+            "status": "done", "docKey": "k", "sessionIds": sids}}
+        monkeypatch.setattr(api, "s3", lambda: _S3(objs))
+        ev = {"queryStringParameters": {"user": w["folder"], "requestId": rid}}
+        return lambda caller: api.day_report_status(db, caller, DATE, ev)["statusCode"]
+    both = serve(["sid" + SID_HOME, "sid" + SID_B])
+    assert both(w["admin_b"]) == 404                  # names a site-less home session
+    assert both(w["admin_a"]) == 404                  # names a session on B's site
+    assert both(w["eve"]) == 200 and both(w["plat"]) == 200
+    only_b = serve(["sid" + SID_B])
+    assert only_b(w["admin_b"]) == 200 and only_b(w["admin_a"]) == 404
+    only_home = serve(["sid" + SID_HOME])
+    assert only_home(w["admin_a"]) == 200 and only_home(w["admin_b"]) == 404
+
+
+# ---------------------------------------------------------------- deploy tolerance
+
+def test_code_that_lands_before_the_migrations_behaves_as_no_external_members(db, caplog):
+    """The deploy workflows apply migrations AFTER sam deploy: for a minute the new code
+    runs against a schema without memberships.external (0085) or membership_audit (0086)."""
+    from repositories import directory as directory_repo
+    w = _world(db)
+    db.execute("ALTER TABLE memberships DROP COLUMN external")        # rolled back with the test
+    db.execute("DROP TABLE membership_audit")
+    with caplog.at_level("WARNING"):
+        assert memberships.external_site_roles(db, w["eve"]["id"]) == {}
+        assert memberships.has_live_external(db, w["eve"]["id"]) is False
+        assert memberships.external_site_companies(db, w["eve"]["id"]) == {}
+        assert memberships.get_membership(db, w["eve"]["id"], w["site_a"]["id"])["external"] is False
+        assert memberships.count_by_site(db, [w["site_a"]["id"]]) == {str(w["site_a"]["id"]): 1}
+        rows = memberships.members_for_site(db, w["co_a"]["id"], w["site_a"]["id"])
+        assert [r["external"] for r in rows] == [False]
+        assert memberships.list_company_memberships(db, w["co_a"]["id"])
+        assert memberships.list_all_memberships(db)
+        assert directory_repo.live_memberships(db)
+        assert directory_repo.external_user_ids(db) == set()
+        sc = scope.visible_scope(db, dict(w["eve"]))
+        assert sc["site_ids"] == {str(w["site_a"]["id"])} | {str(w["site_b"]["id"])}  # legacy reach
+        memberships.record_audit(db, "external_add", dict(w["admin_b"]), w["eve"]["id"],
+                                 w["site_b"], "worker")            # logs, does not raise
+    assert "migration 0085" in caplog.text and "migration 0086" in caplog.text
