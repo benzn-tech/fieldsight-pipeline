@@ -64,7 +64,7 @@ def _wired(monkeypatch):
     monkeypatch.setattr(org, "_may_correct_speakers", lambda conn, caller, folder: True)
     monkeypatch.setattr(org, "_same_company_as_folder",
                         lambda conn, caller, folder, what: None)
-    monkeypatch.setattr(org, "_session_turns", lambda conn, f, d, s: [])
+    monkeypatch.setattr(org, "_session_turns", lambda conn, f, d, s, **k: [])
     class _S3:
         def put_object(self, **kw):
             return {}

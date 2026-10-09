@@ -24,6 +24,7 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   GET   /api/org/sites/{id}/contributors  → folders with topics attributed to
                                             (site,date); members∪this = the
                                             aggregated-timeline fan-out set
+  POST  /api/org/sites/{id}/external-members -> add an existing user of ANOTHER company to this site (admin / platform_admin)
   GET   /api/org/sites/{id}/members       → site's members from memberships (ACL,
                                              fixes legacy USERS ON SITE empty for Aurora-only sites)
   POST  /api/org/members/{sub}/(un)archive→ soft-delete / restore member (admin/gm, never self)
@@ -569,6 +570,9 @@ def dispatch(conn, event, method, route):
     m_sa = re.match(r"^/sites/([^/]+)/(archive|unarchive)$", route)
     if m_sa and method == "POST":
         return _directory_after(conn, archive_site_endpoint(conn, caller, m_sa.group(1), m_sa.group(2)))
+    m_sx = re.match(r"^/sites/([^/]+)/external-members$", route)
+    if m_sx and method == "POST":
+        return _directory_after(conn, add_external_member(conn, caller, m_sx.group(1), parse_body(event)))
     m_sm = re.match(r"^/sites/([^/]+)/members$", route)
     if m_sm and method == "GET":
         return list_site_members(conn, caller, m_sm.group(1))
@@ -960,6 +964,29 @@ def _recording_s3_key(display_name, kind, started_at, file_name):
     return f"users/{_safe_seg(display_name)}/{folder}/{date_str}/{_safe_seg(file_name)}"
 
 
+def _capture_site(conn, caller, site_id):
+    """(site, error_response) for a capture call that names `siteId`.
+
+    Project-owned tenancy P2: a caller may record onto a site of their own
+    company (as before -- this is also how admin/gm, who hold no memberships,
+    record) OR onto any site they hold a LIVE membership on, whatever its
+    company. Anything else is refused as 'site not accessible'. The row's
+    company is then the SITE's, not the caller's (see `_capture_company_id`)."""
+    site = sites.get_site(conn, site_id)
+    if site is None:
+        return None, error("site not accessible", 403)
+    if str(site["company_id"]) != str(caller["company_id"]):
+        m = memberships.get_membership(conn, caller["id"], site_id)
+        if m is None or m.get("archived_at") is not None:
+            return None, error("site not accessible", 403)
+    return site, None
+
+
+def _capture_company_id(caller, site):
+    """The company a captured row belongs to: the site's, else the recorder's home."""
+    return site["company_id"] if site else caller["company_id"]
+
+
 def create_recording_upload_url(conn, caller, body, device_ident=None):
     if body is None:
         return error("malformed JSON body", 400)
@@ -974,10 +1001,11 @@ def create_recording_upload_url(conn, caller, body, device_ident=None):
         return error("clientUuid, fileName, contentType, startedAt are required", 400)
 
     site_id = body.get("siteId")
+    site = None
     if site_id:
-        site = sites.get_site(conn, site_id)
-        if site is None or site["company_id"] != caller["company_id"]:
-            return error("site not accessible", 403)
+        site, err = _capture_site(conn, caller, site_id)
+        if err is not None:
+            return err
 
     # Idempotent on the device-side capture id: a resend (retry) reuses the
     # existing row and just re-signs a fresh URL, never creating a duplicate.
@@ -1008,7 +1036,7 @@ def create_recording_upload_url(conn, caller, body, device_ident=None):
             recording_device_id = device_heartbeat.device_id(conn, device_ident)
             with conn.transaction():          # savepoint: on failure, roll back to here so conn stays usable
                 row = recordings.insert_pending(
-                    conn, company_id=caller["company_id"], user_id=caller["id"], site_id=site_id,
+                    conn, company_id=_capture_company_id(caller, site), user_id=caller["id"], site_id=site_id,
                     kind=kind, s3_key=key, client_uuid=client_uuid, started_at=started_at,
                     ended_at=body.get("endedAt"), duration_s=body.get("durationS"),
                     resolution=body.get("resolution"), codec=body.get("codec"),
@@ -1025,7 +1053,8 @@ def create_recording_upload_url(conn, caller, body, device_ident=None):
             else:
                 return error("a recording with this s3 key already exists", 409)
 
-    _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id)
+    _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id,
+                             _capture_company_id(caller, site))
 
     url = s3().generate_presigned_url(
         "put_object",
@@ -1056,7 +1085,7 @@ def _ensure_group_state(conn, company_id, group_id):
         logger.exception("could not register group state for %s", group_id)
 
 
-def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id):
+def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id, company_id=None):
     """Record the meeting group carried by an upload, if there is one.
 
     Why this exists: `/sessions/{id}/open` is best-effort and fire-and-forget,
@@ -1077,6 +1106,7 @@ def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id):
     group_id = (body or {}).get("groupId")
     if not group_id:
         return
+    company_id = company_id or caller["company_id"]
     try:
         if not _SID_RE.match(str(group_id)):
             logger.warning("upload-url: ignoring malformed groupId %r", group_id)
@@ -1092,7 +1122,7 @@ def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id):
         # Skipped rather than refused — failing the upload over the group would
         # cost the recording itself, and /open already answers 403 for this.
         lead = meeting_session.get(conn, group_id)
-        if lead is not None and str(lead["company_id"]) != str(caller["company_id"]):
+        if lead is not None and str(lead["company_id"]) != str(company_id):
             logger.warning("upload-url: refusing cross-company group %s", group_id)
             return
         # Same door as /open: a finished meeting takes no new members, or a
@@ -1110,13 +1140,13 @@ def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id):
         # the same place for the same reason. None is fine: it leaves the field
         # for whoever does know.
         meeting_session.ensure_open(
-            conn, m.group(1), caller["company_id"], caller["id"], site_id, kind,
+            conn, m.group(1), company_id, caller["id"], site_id, kind,
             extract_base_time_from_filename(file_name), group_id=group_id,
         )
         # Beside ensure_open, not instead of it: this is the OFFLINE join, the
         # one whose /open never landed, so it is the only chance this group has
         # to become visible to the merge scan.
-        _ensure_group_state(conn, caller["company_id"], group_id)
+        _ensure_group_state(conn, company_id, group_id)
         # A live session now exists, so the finalize sweep must connect until it
         # closes (Aurora scale-to-zero, spec 2026-08-11).
         sweep_state.mark_pending(_STAGE)
@@ -1285,10 +1315,12 @@ def session_open(conn, caller, session_id, body):
     if kind is not None and kind not in ("audio", "video"):
         return error("kind must be 'audio' or 'video'", 400)
     site_id = body.get("siteId")
+    site = None
     if site_id:
-        site = sites.get_site(conn, site_id)
-        if site is None or site["company_id"] != caller["company_id"]:
-            return error("site not accessible", 403)
+        site, err = _capture_site(conn, caller, site_id)
+        if err is not None:
+            return err
+    session_company_id = _capture_company_id(caller, site)
     # Multi-device merge (spec 2026-08-04): the group's id IS the lead device's
     # session_id, carried here by the joiner after scanning the lead's QR.
     group_id = body.get("groupId")
@@ -1303,7 +1335,7 @@ def session_open(conn, caller, session_id, body):
         # a client's say-so.
         lead = meeting_session.get(conn, group_id)
         if lead is not None:
-            if str(lead["company_id"]) != str(caller["company_id"]):
+            if str(lead["company_id"]) != str(session_company_id):
                 return error("group not accessible", 403)
             # Staleness. A device that kept a group overnight, or across a
             # reinstall, will happily present it again — nothing on the device
@@ -1326,12 +1358,12 @@ def session_open(conn, caller, session_id, body):
     # Idempotent: whichever of the record-start signal or the first uploaded
     # chunk arrives first opens the session; a later call never regresses it.
     row = meeting_session.ensure_open(
-        conn, session_id, caller["company_id"], caller["id"], site_id, kind,
+        conn, session_id, session_company_id, caller["id"], site_id, kind,
         body.get("startedAt"), group_id=group_id,
     )
     # After ensure_open, so a group is only registered once the join itself has
     # passed every guard above (tenant, staleness, meeting-already-ended).
-    _ensure_group_state(conn, caller["company_id"], group_id)
+    _ensure_group_state(conn, session_company_id, group_id)
     # There is now something for the finalize sweep to act on, so let it know it
     # must connect (Aurora scale-to-zero, spec 2026-08-11). Best-effort: a failed
     # flag write is recovered by the sweep's hourly unconditional pass and must
@@ -1863,7 +1895,8 @@ def _report_facts(conn, company_id, folder, site_ids, date=None):
             continue
         out.append({"id": sid, "name": row.get("name"), "client": row.get("client"),
                     "latitude": num(row.get("latitude")), "longitude": num(row.get("longitude"))})
-    user = users.get_by_folder_name(conn, company_id, folder) or {}
+    # Global: `company_id` is the SITE's company; an external recorder's row is in their home one.
+    user = _resolve_target_user(conn, company_id, folder) or {}
     name = " ".join((p or "").strip() for p in (user.get("first_name"), user.get("last_name"))
                     if (p or "").strip())
     facts = {"sites": out, "recordedBy": name or None}
@@ -2128,7 +2161,7 @@ def _may_correct_speakers(conn, caller, folder):
     return folder == scope.visible_scope(conn, caller).get("self_folder")
 
 
-def _session_turns(conn, folder, date, session_base, with_text=False):
+def _session_turns(conn, folder, date, session_base, with_text=False, caller=None):
     """Every turn of one session, as (file, offset) pairs the embedder can cut audio with.
 
     Reads the same transcripts the viewer does and keeps only this session — a day can hold
@@ -2144,7 +2177,7 @@ def _session_turns(conn, folder, date, session_base, with_text=False):
     and the omission is invisible because the result is a slightly longer list.
     """
     try:
-        payload = _read_org_transcripts(date, folder, "", "", conn=conn)
+        payload = _read_org_transcripts(date, folder, "", "", conn=conn, caller=caller)
     except Exception:
         # `except Exception -> []` turns a read failure into "this session has no turns",
         # and the caller cannot tell those apart: the artifact ships with `turns: []`, the
@@ -2382,7 +2415,13 @@ def _site_for_session(conn, company_id, user_folder, date, session_base):
     job here is done by returning None — an unresolved site means no narrowing, which is the
     behaviour before this feature and the safe direction.
     """
-    site = recordings.site_for_media(conn, company_id, user_folder, date, session_base)
+    # Project-owned tenancy P2: the rungs are scoped to the RECORDER (a live
+    # membership on the site, or the site is their own company's), not to the
+    # caller's company -- an external member's recording sits on another
+    # company's site.
+    recorder = users.get_by_folder_name_global(conn, user_folder)
+    recorder_id = recorder["id"] if recorder else None
+    site = recordings.site_for_media(conn, recorder_id, user_folder, date, session_base)
     if site:
         return site
     sid = turn_name_overlay.session_base(session_base)
@@ -2390,11 +2429,11 @@ def _site_for_session(conn, company_id, user_folder, date, session_base):
         row = meeting_session.get(conn, sid[3:] if sid.startswith("sid") else sid)
         if row and row.get("site_id"):
             found = sites.get_site(conn, row["site_id"])
-            # Re-checked, because a site from another tenant would narrow this company's
-            # pool against a roster that is not theirs.
-            if found and str(found.get("company_id")) == str(company_id):
+            # Re-checked, because a site the recorder has no relation to would narrow
+            # the pool against a roster that is not theirs.
+            if found and memberships.site_usable_by_user(conn, recorder_id, found["id"]):
                 return found
-    return recordings.site_for_day(conn, company_id, user_folder, date)
+    return recordings.site_for_day(conn, recorder_id, user_folder, date)
 
 
 def _label_map(turns):
@@ -2446,6 +2485,31 @@ def _same_company_as_folder(conn, caller, folder, what):
     return None
 
 
+def _session_site_company_guard(conn, caller, folder, date, session_key, what,
+                                allow_recorder=False):
+    """None, or a 403, unless the session lies on the CALLER's company's sites.
+
+    Final review F5. `_same_company_as_folder` compares the recorder's HOME company with
+    the caller's, but a session can lie on another company's project (an external member
+    recorded it there): naming its speakers would file a voiceprint under the caller's
+    company from audio of the SITE company's people, and a regenerate would re-drive
+    extraction of someone else's project. So the company that owns the session's SITE must be
+    the caller's. platform_admin is exempt; a session on no site is the recorder's home
+    company's and passes. `allow_recorder` lets the recorder act on their own session (a
+    regenerate of their own report) -- never a voiceprint enrolment."""
+    if is_cross_company(caller["global_role"]):
+        return None
+    if allow_recorder and folder and folder == (caller.get("folder_name") or None):
+        return None
+    foreign = {c for _s, c in recordings.session_site_companies(conn, folder, date, session_key)
+               if str(c) != str(caller["company_id"])}
+    if foreign:
+        return error(
+            f"this session was recorded on another company's project, so {what} on it "
+            f"belongs to that company.", 403)
+    return None
+
+
 def speaker_match(conn, caller, session_base, event):
     """POST /api/org/sessions/{session}/speaker-match — name a session from stored profiles.
 
@@ -2484,7 +2548,11 @@ def speaker_match(conn, caller, session_base, event):
     if not session_key:
         return error("session id must carry its sid (…_sid<32 hex>)", 400)
 
-    turns = _session_turns(conn, folder, date_m.group(1), session_base)
+    err = _session_site_company_guard(conn, caller, folder, date_m.group(1), session_key,
+                                      "speaker match")
+    if err is not None:
+        return err
+    turns = _session_turns(conn, folder, date_m.group(1), session_base, caller=caller)
     if not turns:
         # A 202 here would promise work that cannot happen. The usual cause is a session
         # whose transcripts are not written yet, which is a wait, not a failure.
@@ -2898,7 +2966,8 @@ def list_name_proposals(conn, caller, event):
         sid = (r["session_base"], r["user_folder"], str(r["session_date"]))
         if sid not in cache:
             try:
-                cache[sid] = _session_turns(conn, sid[1], sid[2], sid[0], with_text=True)
+                cache[sid] = _session_turns(conn, sid[1], sid[2], sid[0], with_text=True,
+                                            caller=caller)
             except Exception:
                 logger.exception("proposal %s: could not read its transcript", r["id"])
                 cache[sid] = []
@@ -3016,7 +3085,7 @@ def _apply_confirmed_proposal(conn, caller, company_id, row, event):
     # because it carries the most evidence for the enrolment the correction may also
     # trigger -- the homogeneity guard refuses thin windows, and picking the first turn
     # would hand it whichever passage happened to be transcribed first.
-    turns = [t for t in _session_turns(conn, folder, date, row["session_base"])
+    turns = [t for t in _session_turns(conn, folder, date, row["session_base"], caller=caller)
              if t.get("source_filename") == row["source_filename"]
              and t.get("speaker_label") == row["speaker_label"]]
     if not turns:
@@ -3153,7 +3222,7 @@ def _apply_confirmed_suggestion(conn, caller, company_id, row, display_name, eve
     # (spec correction 5): the introduction itself is often under the ~10 s the homogeneity
     # guard needs to judge, and picking the intro's own turn would hand the enrolment less
     # evidence than the meeting actually gives it.
-    turns = [t for t in _session_turns(conn, folder, date, row["session_base"])
+    turns = [t for t in _session_turns(conn, folder, date, row["session_base"], caller=caller)
              if t.get("source_filename") == row["source_filename"]
              and t.get("speaker_label") == row["speaker_label"]]
     if turns:
@@ -3368,6 +3437,10 @@ def speaker_corrections(conn, caller, session_base, event):
     session_key = turn_name_overlay.session_base(session_base)
     if not session_key:
         return error("session id must carry its sid (…_sid<32 hex>)", 400)
+    err = _session_site_company_guard(conn, caller, folder, date_m.group(1), session_key,
+                                      "naming a speaker")
+    if err is not None:
+        return err
 
     # Enrolment is the OTHER half, and it is opt-in because it is the half that stores
     # biometric data. Propagating a name inside one meeting compares audio the company
@@ -3469,7 +3542,7 @@ def speaker_corrections(conn, caller, session_base, event):
         if profile_row and profile_row.get("display_name"):
             name = profile_row["display_name"]
 
-    session_turns = _session_turns(conn, folder, date_m.group(1), session_base)
+    session_turns = _session_turns(conn, folder, date_m.group(1), session_base, caller=caller)
     request_id = uuid.uuid4().hex
     artifact = {
         "request_id": request_id,
@@ -3637,6 +3710,17 @@ def _generation_provenance(result):
             if k in result}
 
 
+def _session_out_of_reach(conn, caller, folder, date, session_id):
+    """Whether a folder+sid keyed lake object (brief, rolling summary, report result)
+    belongs to a session the caller may not see: the whitelist of `_SessionHider` applied
+    to one session (final review F7). The person themself and platform_admin are never
+    restricted."""
+    hider = _session_hider(conn, caller, folder, date)
+    if hider is None:
+        return False
+    return hider.hides(turn_name_overlay.session_base(session_id or ""))
+
+
 def session_report_status(conn, caller, session_id, event):
     """GET /api/org/sessions/{session_id}/report/status?date=&user=&requestId=
     — Tier-2 T3 poll. The worker (lambda_session_report) writes its result to
@@ -3664,6 +3748,8 @@ def session_report_status(conn, caller, session_id, event):
     if _session_was_removed(session_id, folder, date):
         logger.info("report status: %s was deleted -- not served", session_id)
         return ok({"status": "removed"})
+    if _session_out_of_reach(conn, caller, folder, date, session_id):
+        return error("not found", 404)
 
     result_key = f"session_report_results/{folder}/{date}/{session_id}/{request_id}.json"
     try:
@@ -3713,7 +3799,7 @@ def get_day_inspections(conn, caller, date, event):
     folder, err = _resolve_org_media_folder(conn, caller, user, what="inspections")
     if err is not None:
         return err
-    company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
+    company = _read_company(caller, folder)
     rows = inspection_windows.for_day(conn, company, folder, date)
     return ok({"date": date, "folder": folder, "inspections": [
         dict(r, id=str(r["id"]),
@@ -3799,7 +3885,7 @@ def get_day_checklist_reports(conn, caller, date, event):
     folder, err = _resolve_org_media_folder(conn, caller, user, what="checklist reports")
     if err is not None:
         return err
-    company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
+    company = _read_company(caller, folder)
     rows = checklist_reports.for_day(conn, company, folder, date)
     checks = inspection_windows.for_day(conn, company, folder, date)
     return ok({"date": date, "folder": folder,
@@ -3849,7 +3935,7 @@ def _photo_selection_body(conn, caller, folder, date, excluded):
     try:
         with conn.transaction():
             markers = location_markers.for_day(
-                conn, None if is_cross_company(caller["global_role"]) else caller["company_id"],
+                conn, _read_company(caller, folder),
                 folder, date)
     except Exception:
         logger.warning("photo selection: markers unreadable for %s/%s", folder, date, exc_info=True)
@@ -3947,6 +4033,25 @@ def put_photo_selection(conn, caller, date, event):
     return ok(_photo_selection_body(conn, caller, folder, date, set(excluded)))
 
 
+def _day_sessions_out_of_reach(conn, caller, folders, date, session_ids):
+    """Whether a day report names a session the caller may not see (R1 whitelist, F7).
+
+    Each session id is judged by the hiders of the folders the report covers: it is out of
+    reach when ANY folder's hider has it on a site outside the caller's reach, or when NO
+    folder's hider lets it through (site-less and the caller is not of the recorder's home
+    company)."""
+    all_h = [_session_hider(conn, caller, f, date) for f in folders]
+    hiders = [h for h in all_h if h is not None]
+    free = len(hiders) < len(all_h)   # one folder is the caller's own / platform_admin's
+    for s in session_ids:
+        sid = turn_name_overlay.session_base(s) or s
+        if any(sid in h.outside for h in hiders):
+            return True
+        if not free and all(h.hides(sid) for h in hiders):
+            return True
+    return False
+
+
 def day_report_status(conn, caller, date, event):
     """GET /api/org/days/{date}/report/status?user=&requestId= — poll a day report.
 
@@ -3982,6 +4087,9 @@ def day_report_status(conn, caller, date, event):
         if _any_session_removed(session_ids, folders, date):
             logger.info("day report %s: a session in it was deleted -- not served", request_id)
             return ok({"status": "removed"})
+        if _day_sessions_out_of_reach(conn, caller, folders, date, session_ids):
+            logger.info("day report %s: names a session outside the caller's reach", request_id)
+            return error("not found", 404)
         url = _presign_report_doc(result["docKey"], folder, date, result)
         return ok({"status": "done", "docUrl": url, "emailed": bool(result.get("emailed")),
                    **_generation_provenance(result)})
@@ -4015,6 +4123,8 @@ def session_rolling(conn, caller, session_id, event):
     if _session_was_removed(session_id, folder, date):
         logger.info("rolling: %s was deleted -- not served", session_id)
         return ok({"status": "removed"})
+    if _session_out_of_reach(conn, caller, folder, date, session_id):
+        return error("not found", 404)
 
     key = f"session_rolling/{folder}/{date}/{session_id}/latest.json"
     try:
@@ -4207,6 +4317,8 @@ def session_brief_read(conn, caller, session_id, event):
     if _session_was_removed(sid, folder, date):
         logger.info("brief: %s was deleted -- not served", sid)
         return ok({"status": "removed"})
+    if _session_out_of_reach(conn, caller, folder, date, sid):
+        return error("not found", 404)
 
     key = f"session_brief/{folder}/{date}/{sid}/latest.json"
     try:
@@ -4923,7 +5035,8 @@ def _build_directory(conn):
         directory_repo.live_users(conn), directory_repo.live_memberships(conn),
         directory_repo.live_sites(conn),
         datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        activity=directory_repo.recent_activity(conn, directory.PRIMARY_SITE_WINDOW_DAYS))
+        activity=directory_repo.recent_activity(conn, directory.PRIMARY_SITE_WINDOW_DAYS),
+        external_user_ids=directory_repo.external_user_ids(conn))
 
 
 def _write_directory_if_changed(conn):
@@ -5363,9 +5476,107 @@ def _resolve_staffing(conn, caller, target_sub, site_id, require_open_site):
     if require_open_site and site.get("archived_at"):
         return None, error("site is archived — unarchive it first", 409)
     target = users.get_user_by_sub(conn, target_sub)
-    if target is None or str(target.get("company_id")) != str(company_id):
+    if target is None:
         return None, error("member not found in your company", 404)
+    if str(target.get("company_id")) != str(company_id):
+        # An EXTERNAL member (added from another company by
+        # POST /sites/{id}/external-members) is on this roster by membership,
+        # not by employment: the site's company may re-role or remove them,
+        # and ONLY them -- a stranger with no external row here stays a 404.
+        mem = memberships.get_membership(conn, target["id"], site_id)
+        if not (mem and mem.get("external")):
+            return None, error("member not found in your company", 404)
     return (site, target), None
+
+
+EXTERNAL_MEMBER_NOTICE_PREFIX = "notices/external_member/"
+
+
+def _write_external_member_notice(membership_id, to_email, to_name, site_name,
+                                  inviting_company, role):
+    """Leave a notice for the non-VPC backlog lambda to email. Best effort by
+    contract: the membership is already written, so a failed put is logged and
+    never fails the request.
+
+    org-api runs in the VPC with no route to SES (and EMAIL_SENDER unset), so it
+    cannot send. It reaches S3 over the gateway endpoint, so it writes the notice
+    there -- one object per membership -- and
+    lambda_extraction_backlog's 5-minute run sends it exactly once."""
+    try:
+        s3().put_object(
+            Bucket=LAKE_BUCKET,
+            Key=f"{EXTERNAL_MEMBER_NOTICE_PREFIX}{membership_id}.json",
+            Body=json.dumps({
+                "to_email": to_email, "to_name": to_name, "site_name": site_name,
+                "inviting_company": inviting_company, "role": role,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }).encode("utf-8"),
+            ContentType="application/json")
+    except Exception:  # noqa: BLE001 - see docstring
+        logger.exception("external member notice for membership %s not written "
+                         "(membership kept)", membership_id)
+
+
+def add_external_member(conn, caller, site_id, body):
+    """Add an EXISTING FieldSight user from ANOTHER company to one of this
+    company's sites (project-owned tenancy P1). Admin of the site's company or
+    platform_admin only; gm / pm / site_manager / worker are refused.
+
+    The person keeps their home company and gets exactly this site, via a
+    membership marked external=true. A person created inside a project is still
+    that company's employee (create_member, unchanged) -- this route is the only
+    way an external row comes to exist."""
+    if caller["global_role"] not in ("admin", "platform_admin"):
+        return error("admin role required", 403)
+    site = sites.get_site(conn, site_id)
+    if site is None or (not is_cross_company(caller["global_role"])
+                        and str(site["company_id"]) != str(caller["company_id"])):
+        return error("site not found in your company", 404)
+    if body is None:
+        return error("malformed JSON body", 400)
+    email = body.get("email")
+    email = email.strip() if isinstance(email, str) else ""
+    if not email or "@" not in email:
+        return error("valid email is required", 400)
+    role = body.get("role")
+    if not isinstance(role, str) or role not in ALLOWED_MEMBERSHIP_ROLES:
+        return error(f"role must be one of {sorted(ALLOWED_MEMBERSHIP_ROLES)}", 400)
+    if site.get("archived_at"):
+        return error("site is archived — unarchive it first", 409)
+    matches = users.find_live_users_by_email_global(conn, email)
+    if len(matches) > 1:
+        # Two live accounts share this email: attaching the wrong person to a project is a
+        # disclosure, so never pick one (final review F8).
+        return error("ambiguous email, contact support", 409)
+    target = matches[0] if matches else None
+    if target is None:
+        return error("no FieldSight user with that email", 404)
+    if str(target.get("company_id")) == str(site["company_id"]):
+        return error("that person already works for this company — use the normal add member", 400)
+    existing = memberships.get_membership(conn, target["id"], site_id)
+    if existing is not None and existing.get("archived_at") is None:
+        return error("user is already a member of this site", 409)
+    try:
+        with conn.transaction():
+            row = memberships.add_external_membership(conn, target["id"], site_id, role)
+    except Exception as exc:  # noqa: BLE001
+        if not memberships._is_missing_schema(exc):
+            raise
+        logger.warning("external member add refused: migration 0085 not applied yet")
+        return error("external members are not available yet, retry in a minute", 503)
+    memberships.record_audit(
+        conn, "external_revive" if existing is not None else "external_add", caller,
+        target["id"], site, role, row.get("id"))
+    site_company = companies.get_company_by_id(conn, site["company_id"]) or {}
+    user_name = " ".join(p for p in (target.get("first_name"), target.get("last_name")) if p)
+    _write_external_member_notice(
+        row.get("id"), target.get("email") or email, user_name,
+        site.get("name") or "a project", site_company.get("name") or "A company", role)
+    return ok({"membership": {
+        **row,
+        "user_name": user_name,
+        "home_company_name": target.get("company_name"),
+    }}, 201)
 
 
 def put_member_membership(conn, caller, target_sub, site_id, body):
@@ -5394,7 +5605,19 @@ def put_member_membership(conn, caller, target_sub, site_id, body):
     if target.get("archived_at"):
         return error("member is archived — unarchive them first", 409)
     row = memberships.ensure_membership(conn, target["id"], site_id, role)
+    if _is_external_target(conn, _site, target, site_id):
+        memberships.record_audit(conn, "external_role", caller, target["id"], _site, role,
+                                 (row or {}).get("id"))
     return ok({"membership": row})
+
+
+def _is_external_target(conn, site, target, site_id):
+    """Whether `target` sits on `site` as an EXTERNAL member (another company's person).
+    Only such a row is audited (membership_audit)."""
+    if str(target.get("company_id")) == str(site.get("company_id")):
+        return False
+    mem = memberships.get_membership(conn, target["id"], site_id)
+    return bool(mem and mem.get("external"))
 
 
 def delete_member_membership(conn, caller, target_sub, site_id):
@@ -5410,9 +5633,13 @@ def delete_member_membership(conn, caller, target_sub, site_id):
     if err:
         return err
     _site, target = resolved
+    external = _is_external_target(conn, _site, target, site_id)
     row = memberships.archive_membership(conn, target["id"], site_id)
     if row is None:
         return error("no active membership on that site", 404)
+    if external:
+        memberships.record_audit(conn, "external_archive", caller, target["id"], _site,
+                                 row.get("role"), row.get("id"))
     return ok({"membership": row})
 
 
@@ -5870,13 +6097,14 @@ def patch_action_item(conn, caller, action_item_id, body):
     # platform_admin (is_cross_company) edits across every tenant; company roles
     # stay pinned to their own company (mirrors the Team/sites fix in #96).
     cross = is_cross_company(caller["global_role"])
-    if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
+    if row is None or (not cross and not _row_company_ok(
+            conn, caller, row["company_id"], row["site_id"])):
         return error("action item not found", 404)            # incl. cross-company
     site_id = str(row["site_id"])
     if site_id not in _allowed_site_ids(conn, caller):
         return error("access denied to this task's site", 403)  # reach gate
     site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
-    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
+    is_admin = _is_company_admin_of(caller, row["company_id"], cross)
     is_site_authority = site_role in ("pm", "site_manager")
     is_assignee = _is_assignee(row, caller)
     if not (is_admin or is_site_authority or is_assignee):
@@ -5996,14 +6224,15 @@ def patch_question(conn, caller, stable_id, body):
 
     row = topic_questions.get_live_by_stable_id(conn, stable_id)
     cross = is_cross_company(caller["global_role"])
-    if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
+    if row is None or (not cross and not _row_company_ok(
+            conn, caller, row["company_id"], row["site_id"])):
         return error("question not found", 404)             # incl. cross-company
     site_id = str(row["site_id"])
     if site_id not in _allowed_site_ids(conn, caller):
         # Same reach gate as patch_action_item's, but 404 rather than 403 -- see docstring.
         return error("question not found", 404)
     site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
-    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
+    is_admin = _is_company_admin_of(caller, row["company_id"], cross)
     is_site_authority = site_role in ("pm", "site_manager")
     if not (is_admin or is_site_authority):
         # Same site-authority gate as patch_action_item's, but 404 rather than 403 -- see
@@ -6160,7 +6389,8 @@ def patch_compliance_resolution(conn, caller, body):
     # Site-authority tier (no assignee branch, unlike patch_action_item).
     cross = is_cross_company(caller["global_role"])
     site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
-    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
+    is_admin = (resolve_scope(caller["global_role"]) == "ALL"
+                and str(site_id) not in _ext_pm_sites(conn, caller)) or cross
     is_site_authority = site_role in ("pm", "site_manager")
     if not (is_admin or is_site_authority):
         return error("admin/gm or this site's pm/site_manager only", 403)
@@ -6243,13 +6473,14 @@ def patch_content(conn, caller, table, row_id, body):
 
     row = content.get_content_row(conn, table, row_id)
     cross = is_cross_company(caller["global_role"])
-    if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
+    if row is None or (not cross and not _row_company_ok(
+            conn, caller, row["company_id"], row["site_id"])):
         return error("content row not found", 404)      # incl. cross-company
     site_id = str(row["site_id"])
     if site_id not in _allowed_site_ids(conn, caller):
         return error("access denied to this content's site", 403)
     site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
-    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
+    is_admin = _is_company_admin_of(caller, row["company_id"], cross)
     is_site_authority = site_role in ("pm", "site_manager")
     is_author = row.get("author_user_id") is not None and \
         str(row["author_user_id"]) == str(caller["id"])
@@ -6481,13 +6712,14 @@ def _topic_authority(conn, caller, topic_id):
     (None, error_response)."""
     row = content.get_content_row(conn, "topics", topic_id)
     cross = is_cross_company(caller["global_role"])
-    if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
+    if row is None or (not cross and not _row_company_ok(
+            conn, caller, row["company_id"], row["site_id"])):
         return None, error("topic not found", 404)
     site_id = str(row["site_id"])
     if site_id not in _allowed_site_ids(conn, caller):
         return None, error("access denied to this topic's site", 403)
     site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
-    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
+    is_admin = _is_company_admin_of(caller, row["company_id"], cross)
     is_site_authority = site_role in ("pm", "site_manager")
     is_author = row.get("author_user_id") is not None and \
         str(row["author_user_id"]) == str(caller["id"])
@@ -6708,7 +6940,7 @@ def _source_prefixes_for(rec):
     return [f"extractions/{folder}/{date}/{base}"]
 
 
-def _can_delete_folder(conn, caller, folder):
+def _can_delete_folder(conn, caller, folder, rec=None, batch=False):
     """May `caller` delete `folder`'s recordings? Plan §0.9.
 
     Deleting is strictly stronger than viewing, so this is `_can_view_folder` AND an
@@ -6723,14 +6955,37 @@ def _can_delete_folder(conn, caller, folder):
     if not folder:
         return False, None
     sc = scope.visible_scope(conn, caller)
+    # Project-owned tenancy: a recording lies on a SITE, and the company that owns the
+    # site decides who may erase it. `rec` (folder, date, sessionBase) names the session;
+    # the tombstone is stamped with the site's company so that company's readers (and its
+    # undelete) see it. The recorder keeps their own rights over their own folder; a
+    # home-company admin has none over work done on another company's project.
+    site_cos = set()
+    if rec and rec.get("date") and (rec.get("sessionBase") or "").strip():
+        site_cos = {c for _s, c in recordings.session_site_companies(
+            conn, folder, rec["date"], rec["sessionBase"].strip())}
+    stamp = next(iter(site_cos)) if len(site_cos) == 1 else None
     if folder == sc.get("self_folder"):
-        return True, caller["company_id"]
-    if not _can_view_folder(conn, caller, folder):
-        return False, None
+        return True, stamp or caller["company_id"]
     if not (sc.get("user_scope") == "ALL" or sc.get("cross_company")):
         return False, None
-    target = (users.get_by_folder_name_global(conn, folder) if sc.get("cross_company")
-              else users.get_by_folder_name(conn, caller["company_id"], folder))
+    if sc.get("cross_company"):
+        target = users.get_by_folder_name_global(conn, folder)
+        if target is None:
+            return False, None
+        return True, stamp or target["company_id"]
+    if not _can_view_folder(conn, caller, folder):
+        return False, None
+    if batch:
+        # Undelete: revert_batch is itself company-guarded (only the company that stamped
+        # the batch can revert it), so the folder-level gate is enough here.
+        return True, caller["company_id"]
+    if site_cos:
+        # Only a session lying wholly on this company's own sites.
+        if site_cos == {str(caller["company_id"])}:
+            return True, caller["company_id"]
+        return False, None
+    target = users.get_by_folder_name(conn, caller["company_id"], folder)
     if target is None:
         return False, None
     return True, target["company_id"]
@@ -6773,7 +7028,7 @@ def delete_recordings_endpoint(conn, caller, body):
             results.append({"recording": rec, "topics_hidden": 0,
                             "error": "folder, date and sessionBase are all required"})
             continue
-        allowed, target_company = _can_delete_folder(conn, caller, rec.get("folder"))
+        allowed, target_company = _can_delete_folder(conn, caller, rec.get("folder"), rec=rec)
         if not allowed:
             results.append({"recording": rec, "topics_hidden": 0,
                             "error": "not permitted to delete this user's recordings"})
@@ -6912,18 +7167,32 @@ def undelete_recordings_endpoint(conn, caller, body):
     cross = is_cross_company(caller["global_role"])
     existing = redactions.list_batch(
         conn, batch_id, caller["company_id"], cross_company=cross) or []
+
+    def _folders_of(rows_):
+        return {(r.get("target_key") or "").split("/")[1]
+                for r in rows_ if r.get("target_type") == "recording"
+                and (r.get("target_key") or "").startswith("extractions/")}
+
+    revert_cross = cross
+    if not existing and not cross:
+        # A recorder deleting their own work on ANOTHER company's project: the batch is
+        # stamped with the site's company, not theirs. Theirs to undo only if every
+        # recording in it is their own folder's.
+        anyrows = redactions.list_batch(conn, batch_id, caller["company_id"],
+                                        cross_company=True) or []
+        mine = _folders_of(anyrows)
+        if anyrows and mine and mine == {caller.get("folder_name")}:
+            existing, revert_cross = anyrows, True
     if not existing:
         return error("batch not found", 404)
-    folders = {(r.get("target_key") or "").split("/")[1]
-               for r in existing if r.get("target_type") == "recording"
-               and (r.get("target_key") or "").startswith("extractions/")}
+    folders = _folders_of(existing)
     for folder in sorted(folders):
-        allowed, _ = _can_delete_folder(conn, caller, folder)
+        allowed, _ = _can_delete_folder(conn, caller, folder, batch=True)
         if not allowed:
             return error("not permitted to restore this batch", 403)
 
     rows = redactions.revert_batch(
-        conn, batch_id, caller["company_id"], cross_company=cross) or []
+        conn, batch_id, caller["company_id"], cross_company=revert_cross) or []
     # The search index comes back too, out of the archive and keyed on the same batch, so
     # one undelete restores exactly what one delete removed. Logged including zero: a batch
     # created before the archive shipped legitimately has none, and that has to be
@@ -7455,7 +7724,12 @@ def get_org_dates(conn, caller, event):
     # page most likely to be looked at first. So the default response stays
     # BYTE-IDENTICAL and a client asks for the wider index once it can draw it.
     if (p.get("uploads") or "").strip() == "1":
+        # `None` (no company restriction) is platform_admin's alone -- it also unpins the
+        # NULL-site arm and the tombstones (final review F4). A caller on another
+        # company's project keeps the home pin; the pin is waived only for those site ids.
         company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
+        ext = ({} if company is None
+               else memberships.external_site_companies(conn, caller["id"], site_ids))
         # ISO STRINGS, NOT date OBJECTS. deleted_session_bases compares
         # `substring(target_key from '...') BETWEEN $3 AND $4`, and the left
         # side is text -- Postgres has no `text >= date` operator, so passing
@@ -7465,10 +7739,12 @@ def get_org_dates(conn, caller, event):
         # patch this function out, and a fake connection records SQL without
         # executing it, so the types never meet.
         deleted = redactions.deleted_session_bases(
-            conn, company, since.isoformat(), _dates_today().isoformat())
+            conn, company, since.isoformat(), _dates_today().isoformat(),
+            **({"also_companies": sorted(set(ext.values()))} if ext else {}))
         for u in recordings.upload_date_counts(
                 conn, company, site_ids, since,
-                author_ids=author_ids, deleted_bases=deleted):
+                author_ids=author_ids, deleted_bases=deleted,
+                **({"external_site_ids": list(ext)} if ext else {})):
             entry = out.setdefault(u["date"], {"hasReport": False, "topics": 0, "safety": 0})
             entry["hasUploads"] = True
             entry["sessions"] = u["sessions"]
@@ -8814,7 +9090,8 @@ def _normalize_prose(value, alias_pairs):
     return value
 
 
-def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
+def render_report_shape(rows, doc, date, folder, conn=None, company_id=None,
+                        all_companies=False):
     """Pure function: render Aurora extraction topics INTO the
     daily_report.json shape, optionally merging the doc's own prose fields
     (executive_summary etc.) when a same-day S3 doc also exists (e.g. an
@@ -8992,7 +9269,9 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
             prose = {k: _normalize_prose(v, alias_pairs) for k, v in prose.items()}
     meta = {"source": "live_extraction", "version": "flip-v1"}
     if conn is not None and company_id is not None:
-        stats = recordings.day_stats(conn, company_id, folder, date)
+        # all_companies: the person reading their OWN day -- the KPI covers every
+        # company's sites they recorded on, not just their home company's.
+        stats = recordings.day_stats(conn, None if all_companies else company_id, folder, date)
         # A zero is NOT "nothing was recorded". We only get here because this
         # (user, date) has extraction topics, and topics exist only because
         # something was recorded and transcribed — so no recordings rows means
@@ -9074,14 +9353,15 @@ def _timeline_target_id(conn, caller, user):
     try:
         if not user or user == (caller.get("folder_name") or ""):
             return caller["id"]
-        row = users.get_by_folder_name(conn, caller["company_id"], user)
+        row = _resolve_target_user(conn, caller["company_id"], user)
         return (row or {}).get("id") or caller["id"]
     except Exception:
         logger.exception("could not resolve timeline target for %s", user)
         return caller["id"]
 
 
-def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
+def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False,
+                              clip_foreign=False):
     """The single-(user, date) D1 read: Aurora override when extraction
     topics exist AND at least one survives the site ACL filter, else S3
     verbatim, else the 404 body. Callers (get_timeline_compat's explicit-
@@ -9101,7 +9381,18 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
     (doc forced to None) and the verbatim S3 fallback is never served -- when no
     in-scope Aurora topics exist there is nothing safe to show (404). Own-
     timeline and ALL-scope (admin/gm/platform_admin) callers pass
-    cross_user_clip=False and are UNCHANGED."""
+    cross_user_clip=False and are UNCHANGED.
+
+    clip_foreign (project-owned tenancy P3/P4): set for an ALL-tier caller
+    (admin/gm) reading SOMEONE ELSE's day. The ordinary case -- every row of the
+    day is on one of the caller's own sites -- is rendered exactly as before
+    (full prose, photo list, verbatim fallback). The moment ANY row of that
+    person's day sits on a site outside the caller's reach (they also worked on
+    another company's project), the view turns into the cross_user_clip one:
+    only in-scope rows, no whole-day prose, no photo list, and the verbatim S3
+    daily_report.json is never served (it has no site on it). A day with only
+    out-of-scope rows is a 404. The person themself and platform_admin never
+    set it."""
     # Multi-device merge: the meeting's ONE topic set is owned by the lead's
     # session key and every member's own topics were PHYSICALLY deleted, so a
     # joiner has nothing under their own prefix. Resolved on its own line and
@@ -9113,6 +9404,27 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
     # to be the target -- asking about the caller would answer a question nobody
     # posed and return the caller's own unrelated meetings.
     merged_keys = _merged_keys_for(conn, _timeline_target_id(conn, caller, user), date)
+    saw_foreign = []
+    day_cache = []
+
+    def _day_not_within():
+        """Whether this person's day holds work the caller may not see: rows on sites
+        outside the reach, and -- unless the caller may see the recorder's home
+        company's work -- site-less ones, or nothing on the caller's sites at all
+        (final review F1 whitelist). Looks at recordings as well as topics, because
+        the whole-day prose in daily_report.json covers recordings that produced no
+        topic. Fails closed."""
+        if not day_cache:
+            try:
+                tgt = _resolve_target_user(conn, caller["company_id"], user)
+                day_cache.append(tgt is None or recordings.author_day_has_rows_outside_sites(
+                    conn, tgt.get("id"), date, _allowed_site_ids(conn, caller),
+                    siteless_outside=str(tgt.get("company_id", caller["company_id"]))
+                    != str(caller["company_id"])))
+            except Exception:
+                logger.exception("foreign-row check failed for %s/%s; withholding", user, date)
+                day_cache.append(True)
+        return day_cache[0]
 
     def _aurora_shape(prefix, merged=()):
         """Return the id-carrying rendered shape for `prefix` if it has
@@ -9123,6 +9435,12 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
         if not (topics.has_topics_for_source_prefix(conn, prefix) or merged):
             return None
         allowed = _allowed_site_ids(conn, caller)
+        if user == (caller.get("folder_name") or None) and \
+                memberships.has_live_external(conn, caller["id"]):
+            # Their own day: every site they hold a live membership on counts,
+            # including a project of another company they were added to (an ALL-tier
+            # caller's reach is their own company's sites only).
+            allowed = set(allowed) | set(memberships.caller_site_roles(conn, caller["id"]))
         # The kwarg is passed ONLY when there is something to union. A day with
         # no group must reach this repository exactly as it did before -- same
         # call, same SQL, same params -- so the change cannot alter the ordinary
@@ -9131,7 +9449,13 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
                                                     merged_keys=list(merged))
                 if merged else
                 topics.list_topics_for_source_prefix(conn, prefix))
-        if not cross_user_clip:
+        clip = cross_user_clip
+        if clip_foreign and not clip:
+            foreign = [r for r in rows if str(r["site_id"]) not in allowed]
+            if foreign or _day_not_within():
+                clip = True
+                saw_foreign.append(True)
+        if not clip:
             # Own day (and ALL-scope). The caller was in that meeting, so the
             # merged record is theirs: it bypasses the site clip exactly as it
             # does on `/live-items`, and for the same three reasons -- the rows
@@ -9158,10 +9482,13 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
             return None
         # CRITICAL-1: cross-user graded view never merges the target's whole-day
         # prose (not site-clipped). Topic rows are already site-clipped above.
-        doc = None if cross_user_clip else \
+        doc = None if clip else \
             _get_lake_json(f"reports/{date}/{user}/daily_report.json")
         shape = render_report_shape(rows, doc, date, user, conn=conn,
-                                    company_id=caller.get("company_id"))
+                                    company_id=caller.get("company_id"),
+                                    **({"all_companies": True}
+                                       if _read_company(caller, user) is None
+                                       and not is_cross_company(caller["global_role"]) else {}))
         # The day's photos, as a property of the DAY rather than of a topic.
         #
         # Measured on prod the morning this was written: 71 of 90 photos on days
@@ -9184,7 +9511,7 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
         # date and a time. Handing it over says "the target was somewhere at
         # 14:32" about sites they cannot see, which is exactly what CRITICAL-1
         # withholds one line above.
-        if cross_user_clip:
+        if clip:
             # THE GATE COVERS PHOTOS, NOT ONE FIELD CARRYING THEM.
             #
             # Withholding `photo_filenames` while `topics[].related_photos`
@@ -9240,7 +9567,13 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
             # 404 envelopes carry. `user_name` is a display name here, not a folder.
             shape["user"] = user
             return ok(shape)
-    if cross_user_clip:
+    if clip_foreign and not cross_user_clip and not saw_foreign:
+        # Nothing rendered and no foreign row was seen in the loop (a prefix with no
+        # topics at all): the verbatim doc below is whole-day and site-less, so it
+        # is served only if NOTHING that day sits outside this caller's reach.
+        if _day_not_within():
+            saw_foreign.append(True)
+    if cross_user_clip or saw_foreign:
         # CRITICAL-1: no in-scope Aurora topics for this (target, date). The
         # verbatim S3 daily_report.json is NOT site-clipped, so serving it would
         # leak the target's out-of-scope content. Nothing safe to show -> 404.
@@ -9301,7 +9634,7 @@ def _day_photo_block(conn, caller, user, date):
     be told from one that never ran.
     """
     try:
-        company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
+        company = _read_company(caller, user)
         photos = recordings.photo_list_for_day(conn, company, user, date)
         hidden = redactions.deleted_photo_keys(
             conn, company, keys=[p["s3_key"] for p in photos])
@@ -9330,7 +9663,7 @@ def _photo_groups(conn, caller, user, date, photos):
     Never raises: the flat list is the answer, this is an improvement on it.
     """
     try:
-        company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
+        company = _read_company(caller, user)
         markers = location_markers.for_day(conn, company, user, date)
         if not markers:
             return None
@@ -9383,14 +9716,24 @@ def _day_upload_facts(conn, caller, user, date):
     # speaks when someone is watching is indistinguishable from one that
     # never ran.
     try:
-        company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
+        company = _read_company(caller, user)
         site_ids = _allowed_site_ids(conn, caller)
         if not site_ids:
             return None
-        deleted = redactions.deleted_session_bases(conn, company, date, date)
-        stats = recordings.range_stats(conn, company, date, date, site_ids,
+        # range_stats is NOT folder-scoped (site + author scoped), so its company pin is
+        # the caller's home company whoever's day this is: `None` would also count every
+        # tenant's site-less recordings (final review F4). Their own external sites are
+        # exempted by site id.
+        stats_company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
+        ext = ({} if stats_company is None
+               else memberships.external_site_companies(conn, caller["id"], site_ids))
+        deleted = redactions.deleted_session_bases(
+            conn, stats_company, date, date,
+            **({"also_companies": sorted(set(ext.values()))} if ext else {}))
+        stats = recordings.range_stats(conn, stats_company, date, date, site_ids,
                                        author_ids=_author_filter(conn, caller),
-                                       deleted_bases=deleted)
+                                       deleted_bases=deleted,
+                                       **({"external_site_ids": list(ext)} if ext else {}))
         # Transcription does not go through the LLM provider, so on a day the
         # extraction failed the transcripts are usually sitting there, readable,
         # through a route (/transcripts) that needs no topics. Counting them is
@@ -9449,9 +9792,16 @@ def admin_disambiguation(conn, caller, date):
             return ok(doc)
     candidates = set()
     for folder in _list_report_folders(date):
-        if users.get_by_folder_name(conn, caller["company_id"], folder) is not None:
+        if _all_tier_may_open(conn, caller, folder):
             candidates.add(folder)
-    candidates.update(topics.list_extraction_folder_names_for_date(conn, caller["company_id"], date))
+    # By SITE, not by author company: an external member's topics on this company's
+    # sites belong here, and a home-company author's topics on another company's
+    # site do not (project-owned tenancy P3).
+    candidates.update(topics.list_extraction_folder_names_for_date(
+        conn,
+        ({str(x["id"]) for x in sites.list_company_sites(conn, caller["company_id"])}
+         if is_cross_company(caller["global_role"]) else _allowed_site_ids(conn, caller)),
+        date))
     # And the folders that captured something but produced no report. Without
     # this the calendar's upload-only days open onto a bare 404 for an admin:
     # neither source above knows a folder whose extraction never ran, so there
@@ -9485,23 +9835,94 @@ def _can_view_folder(conn, caller, target_folder):
     """GRADED /timeline authority (spec §3.2): may caller read target_folder's
     (folder, date) timeline? Own folder always; SITE (pm/regional) any user on
     an in-scope site; SELF+WORKERS (site_manager) own + workers on in-scope
-    sites; SELF (worker) own only. Company-pinned: the target is resolved
-    within caller.company_id first (unless caller is cross-company)."""
+    sites; SELF (worker) own only.
+
+    The target is resolved GLOBALLY (project-owned tenancy P3): a person's
+    directory row is in their HOME company, but they may have worked on this
+    caller's company's sites. What the caller may then SEE of that person is
+    decided row by row, by site, where the data is read -- this gate only says
+    the folder may be opened at all. For the ALL tier (admin/gm) a target of
+    the caller's own company always opens; a target of another company opens
+    only when they have a footprint (a membership, topic or recording) on one
+    of the caller's in-scope sites. platform_admin keeps cross-company reach."""
     sc = scope.visible_scope(conn, caller)
     if target_folder and target_folder == sc["self_folder"]:
         return True
-    if sc["cross_company"]:
-        target = users.get_by_folder_name_global(conn, target_folder)
-    else:
-        target = users.get_by_folder_name(conn, caller["company_id"], target_folder)
+    target = _resolve_target_user(conn, caller["company_id"], target_folder)
     if target is None:
-        return False                                          # not in caller's company / unknown
+        return False                                          # unknown
     if sc["user_scope"] == "ALL":
-        return True
+        if sc["cross_company"] or str(target["company_id"]) == str(caller["company_id"]):
+            return True
+        return recordings.author_footprint_in_sites(conn, target["id"], sc["site_ids"])
     if sc["user_scope"] == "SITE":
         target_sites = memberships.caller_site_roles(conn, target["id"])
         return any(sid in sc["site_ids"] for sid in target_sites)   # target is on an in-scope site
     return str(target["id"]) in (sc["author_ids"] or set())   # SELF / SELF+WORKERS
+
+
+def _resolve_target_user(conn, company_id, folder):
+    """The directory row for a `?user=` folder: the caller's own company first (the
+    ordinary case, one indexed lookup as before), then the global directory -- a
+    person of ANOTHER company who worked on this company's sites (project-owned
+    tenancy P3). Whether the caller may see anything of them is decided by the
+    callers of this, by site."""
+    return (users.get_by_folder_name(conn, company_id, folder)
+            or users.get_by_folder_name_global(conn, folder))
+
+
+def _ext_pm_sites(conn, caller):
+    """Sites of ANOTHER company on which this ALL-tier caller is an external pm."""
+    if is_cross_company(caller["global_role"]):
+        return set()
+    return scope.visible_scope(conn, caller).get("external_pm_site_ids") or set()
+
+
+def _row_company_ok(conn, caller, row_company, site_id):
+    """The company pin of the row-level write gates: the caller's own company, or a
+    site on which they are an external pm (membership governs reach there)."""
+    return (str(row_company) == str(caller["company_id"])
+            or str(site_id) in _ext_pm_sites(conn, caller))
+
+
+def _is_company_admin_of(caller, row_company, cross):
+    """admin/gm authority applies to the caller's OWN company's rows only -- never to
+    a project of another company they merely hold a membership on."""
+    return (resolve_scope(caller["global_role"]) == "ALL"
+            and str(row_company) == str(caller["company_id"])) or cross
+
+
+def _read_company(caller, folder):
+    """The company pin for a per-person read of (folder, date).
+
+    None = unrestricted: a cross-company caller, or a person reading THEIR OWN
+    folder -- their day spans every company whose sites they recorded on, and
+    rows carry the SITE's company, so pinning their home company would hide
+    their own work on someone else's project. Everyone else is pinned to their
+    own company, which with site-owned rows means "the part of this person's
+    day captured on my company's sites"."""
+    if is_cross_company(caller["global_role"]):
+        return None
+    if folder and folder == (caller.get("folder_name") or None):
+        return None
+    return caller["company_id"]
+
+
+def _all_tier_may_open(conn, caller, folder):
+    """ALL-tier (admin/gm/platform_admin) gate for an explicit `?user=` folder:
+    the caller's own folder, a person of their company, a person with a footprint
+    on their sites, or (platform_admin) anyone. Unknown folder -> False."""
+    if folder and folder == (caller.get("folder_name") or None):
+        return True
+    if is_cross_company(caller["global_role"]):
+        return users.get_by_folder_name_global(conn, folder) is not None
+    target = _resolve_target_user(conn, caller["company_id"], folder)
+    if target is None:
+        return False
+    if str(target.get("company_id", caller["company_id"])) == str(caller["company_id"]):
+        return True
+    return recordings.author_footprint_in_sites(
+        conn, target["id"], scope.visible_scope(conn, caller)["site_ids"])
 
 
 def get_timeline_compat(conn, caller, event):
@@ -9514,10 +9935,16 @@ def get_timeline_compat(conn, caller, event):
         if sc["user_scope"] == "ALL":                         # admin/gm/platform_admin
             if not user:
                 return admin_disambiguation(conn, caller, date)
-            if not sc["cross_company"] and \
-                    users.get_by_folder_name(conn, caller["company_id"], user) is None:
+            # Project-owned tenancy P3/P4: the folder is resolved globally and
+            # EVERY tier is clipped to the caller's in-scope sites. The ALL tier no
+            # longer renders a person's whole day unclipped: whatever part of it
+            # sits on sites outside this caller's reach is withheld. The person
+            # themself, and platform_admin, still see all of it.
+            if not sc["cross_company"] and not _all_tier_may_open(conn, caller, user):
                 return error("user not found in your company", 404)
-            return _render_timeline_for_user(conn, caller, date, user)
+            return _render_timeline_for_user(
+                conn, caller, date, user,
+                clip_foreign=(not sc["cross_company"] and user != sc["self_folder"]))
         # graded non-ALL: default self, but pm/regional/site_manager may view
         # in-scope users (spec §3.2 -- no longer hard-forced to self).
         if not user:
@@ -9550,11 +9977,14 @@ def get_timeline_compat(conn, caller, event):
         user = own                                  # D10: forced self, no ACL lookup needed
     if not user:                                    # admin/gm, no user
         return admin_disambiguation(conn, caller, date)
-    if is_all and users.get_by_folder_name(conn, caller["company_id"], user) is None:
+    if is_all and not _all_tier_may_open(conn, caller, user):
         # RETARGET override 5: an explicit ?user= from an ALL-scope caller
-        # must resolve to a folder in THIS company before any lake read.
+        # must resolve to a person with work on THIS company's sites.
         return error("user not found in your company", 404)
-    return _render_timeline_for_user(conn, caller, date, user)
+    return _render_timeline_for_user(
+        conn, caller, date, user,
+        clip_foreign=(is_all and not is_cross_company(caller["global_role"])
+                      and user != (caller.get("folder_name") or None)))
 
 
 # ----------------------------------------------------------
@@ -10101,6 +10531,93 @@ def _list_media_objects(prefix, what):
         raise
 
 
+def _may_see_siteless_of(conn, caller, folder):
+    """Whether `caller` may see the part of `folder`'s work that sits on NO site.
+
+    A site-less recording/row belongs to the recorder's HOME company (project-owned
+    tenancy P2), so only that company -- and platform_admin, and the person --
+    may see it (final review F1, R1 whitelist). An external member's home work is
+    never visible to the company whose project they were added to, whatever role
+    that company's people hold. Unknown folder -> False (fail closed)."""
+    if is_cross_company(caller["global_role"]):
+        return True
+    if folder and folder == (caller.get("folder_name") or None):
+        return True
+    tgt = users.get_by_folder_name_global(conn, folder)
+    return bool(tgt) and str(tgt["company_id"]) == str(caller["company_id"])
+
+
+class _SessionHider:
+    """The WHITELIST for one (folder, date) as read by someone other than the person.
+
+    A session is shown only when (a) a recording or extraction row ties it to a site
+    in the caller's reach, or (b) it sits on no site and the caller may see the
+    recorder's home-company work. A session with ANY row on a site outside the reach
+    is hidden whatever else it carries. Everything else -- site-less, row-less,
+    unidentifiable -- is hidden unless (b)."""
+
+    def __init__(self, conn, allowed, siteless_ok, inside, outside):
+        self._conn, self._allowed = conn, allowed
+        self.siteless_ok, self.inside, self.outside = siteless_ok, inside, outside
+
+    def hides(self, sid):
+        if sid and sid in self.outside:
+            return True
+        if sid and sid in self.inside:
+            return False
+        return not self.siteless_ok
+
+    def hides_key(self, key):
+        """For one object key: its session id decides; a key with none (a photo)
+        is decided by the site of its own recordings row."""
+        sid = _session_of(key)
+        if sid:
+            return self.hides(sid)
+        row = self._conn.execute(
+            "SELECT site_id IS NULL, COALESCE(site_id = ANY(%s::uuid[]), false) "
+            "FROM recordings WHERE s3_key = %s LIMIT 1", (self._allowed, key)).fetchone()
+        if row and not row[0]:
+            return not row[1]            # on a site: in reach -> shown, else hidden
+        return not self.siteless_ok
+
+
+def _session_hider(conn, caller, folder, date):
+    """A `_SessionHider` for one (folder, date), or None when nothing is restricted
+    (no caller, the person themself, platform_admin).
+
+    NOT fail-open, unlike the tombstone lookup: a failure here would hand one
+    company another company's recording, so it propagates."""
+    if conn is None or caller is None or not folder:
+        return None
+    if is_cross_company(caller["global_role"]) or folder == (caller.get("folder_name") or None):
+        return None
+    allowed = [str(x) for x in _allowed_site_ids(conn, caller)]
+    inside, outside = set(), set()
+    like = recordings._escape_like(folder)
+    date = date or "%"        # a key with no date segment: judge by the whole folder
+    for sql, pat in (
+            ("SELECT s3_key, site_id IS NULL, COALESCE(site_id = ANY(%s::uuid[]), false) "
+             "FROM recordings WHERE s3_key LIKE %s", f"users/{like}/%/{date}/%"),
+            ("SELECT source_s3_key, site_id IS NULL, COALESCE(site_id = ANY(%s::uuid[]), false) "
+             "FROM topics WHERE source_s3_key LIKE %s", f"extractions/{like}/{date}/%")):
+        for key, no_site, in_reach in conn.execute(sql, (allowed, pat)).fetchall():
+            sid = _session_of(key)
+            if not sid or no_site:
+                continue
+            (inside if in_reach else outside).add(sid)
+    return _SessionHider(conn, allowed, _may_see_siteless_of(conn, caller, folder),
+                         inside, outside)
+
+
+def _drop_hidden_media(items, hider, keyfn, what):
+    """Whitelist filter for a media listing (see `_SessionHider`)."""
+    if hider is None:
+        return items
+    kept = [it for it in items if not hider.hides_key(keyfn(it))]
+    logger.info("media %s: not-in-reach dropped=%d of %d", what, len(items) - len(kept), len(items))
+    return kept
+
+
 def _deleted_sessions_for_day(conn, folder, date):
     """Tombstoned source prefixes for one (folder, date), or an empty set.
 
@@ -10150,7 +10667,7 @@ def _session_of(key):
     return turn_name_overlay.session_base(key)
 
 
-def _read_org_transcripts(date, folder, start_time, end_time, conn=None):
+def _read_org_transcripts(date, folder, start_time, end_time, conn=None, caller=None):
     """S3 read + normalize for one (folder, date) window -- mirrors
     lambda_fieldsight_api.get_transcripts's locate/parse/response-shape
     verbatim (same per-file `segments[]` and speaker-turn `speaker_
@@ -10181,6 +10698,11 @@ def _read_org_transcripts(date, folder, start_time, end_time, conn=None):
     else:
         logger.info("media transcripts: tombstoned=0 dropped=0 of %d",
                     len(transcript_files))
+    # Whitelist (final review F1): only sessions on a site in the caller's reach, or
+    # site-less ones the caller may see because they are the recorder's home company's.
+    transcript_files = _drop_hidden_media(
+        transcript_files, _session_hider(conn, caller, folder, date), lambda k: k,
+        "transcripts")
 
     if not transcript_files:
         return {"text": "", "segments": [], "speaker_segments": [], "message": "No transcripts found"}
@@ -10338,8 +10860,7 @@ def _resolve_org_media_folder(conn, caller, user, what="media"):
                 user = sc["self_folder"] or ""
             if not user:
                 return None, error("user required", 400)
-            if not sc["cross_company"] and \
-                    users.get_by_folder_name(conn, caller["company_id"], user) is None:
+            if not sc["cross_company"] and not _all_tier_may_open(conn, caller, user):
                 return None, error("user not found in your company", 404)
             return user, None
         if not user:
@@ -10362,7 +10883,7 @@ def _resolve_org_media_folder(conn, caller, user, what="media"):
         user = caller.get("folder_name") or ""
     if not user:
         return None, error("user required", 400)
-    if users.get_by_folder_name(conn, caller["company_id"], user) is None:
+    if not _all_tier_may_open(conn, caller, user):
         return None, error("user not found in your company", 404)
     return user, None
 
@@ -10514,7 +11035,7 @@ def _company_folder_names(conn, company_id):
             if u.get("folder_name")}
 
 
-def _read_org_report_history(folder_scope, limit):
+def _read_org_report_history(folder_scope, limit, keep=None):
     """List the lake's report index, filtered by an ALREADY-RESOLVED folder
     scope. `folder_scope is None` means unrestricted; callers MUST have
     short-circuited the deny-all (empty set) case before getting here.
@@ -10560,6 +11081,8 @@ def _read_org_report_history(folder_scope, limit):
                     owner = _report_key_owner_folder(key)
                     if owner is None or owner not in folder_scope:
                         continue
+                if keep is not None and not keep(key):
+                    continue
                 rtype = ("weekly" if "weekly" in key
                          else "monthly" if "monthly" in key else "daily")
                 dm = REPORT_DATE_IN_KEY_RE.search(key)
@@ -10614,7 +11137,70 @@ def get_org_report_history(conn, caller, event):
         # DENY ALL -- return early rather than fall into a filter loop whose
         # predicate an empty container would silently satisfy.
         return ok({"reports": []})
-    return ok(_read_org_report_history(folder_scope, limit))
+    return ok(_read_org_report_history(
+        folder_scope, limit, keep=_report_entry_guard(conn, caller)))
+
+
+def _report_key_period(key):
+    """(date_from, date_to) ISO strings a per-user report object covers, from its key,
+    or None when the key carries no date.
+
+    reports/{end}/{folder}/daily_report.json   -> the day
+    reports/{end}/{folder}/weekly_report.json  -> the 7 days ending {end}
+    reports/{end}/{folder}/monthly_report.json -> up to 31 days ending {end}
+    A per-user weekly/monthly document synthesises every day of its period (all of
+    that person's sites), so any guard on it must look at the whole range -- the
+    date in the key is only the END."""
+    dm = REPORT_DATE_IN_KEY_RE.search(key)
+    if not dm:
+        return None
+    try:
+        end = datetime.strptime(dm.group(1), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    base = key.rsplit("/", 1)[-1].lower()
+    back = 31 if "monthly" in base else 6 if "weekly" in base else 0
+    return (end - timedelta(days=back)).isoformat(), end.isoformat()
+
+
+def _user_report_hidden(conn, caller, key, owners=None):
+    """Whether a per-user report object must be withheld from `caller`.
+
+    No whole-person artefact crosses companies: for anyone other than the person
+    (and platform_admin) the object is hidden when ANY day of its period holds the
+    person's rows or recordings outside the caller's reach -- and, unless the
+    caller may see the recorder's home-company work (final review F1 whitelist),
+    when it holds site-less work or nothing on the caller's sites at all.
+    Keys with no owner or no date are not judged here."""
+    if is_cross_company(caller["global_role"]):
+        return False
+    owner = _report_key_owner_folder(key)
+    period = _report_key_period(key)
+    if not owner or not period or owner == (caller.get("folder_name") or None):
+        return False
+    owners = owners if owners is not None else {}
+    if owner not in owners:
+        owners[owner] = users.get_by_folder_name_global(conn, owner)
+    tgt = owners[owner]
+    if tgt is None:
+        return False
+    return recordings.author_range_not_within_sites(
+        conn, tgt["id"], period[0], period[1], _allowed_site_ids(conn, caller),
+        siteless_outside=str(tgt["company_id"]) != str(caller["company_id"]))
+
+
+def _report_entry_guard(conn, caller):
+    """Predicate for the report-history listing: a per-user report document is a
+    synthesis of that person's day(s) and carries no site, so it is hidden from
+    anyone other than the person (and platform_admin) when its period holds work
+    outside the caller's reach (`_user_report_hidden`, range-aware)."""
+    if is_cross_company(caller["global_role"]):
+        return None
+    owners = {}
+
+    def keep(key):
+        return not _user_report_hidden(conn, caller, key, owners)
+    return keep
 
 
 def _apply_speaker_groups(conn, caller, payload):
@@ -10768,7 +11354,16 @@ def regenerate_session(conn, caller, session_base, event):
 
     # Read the session the same way the transcript viewer does, so the names sent
     # are the names shown. A second path here is a second thing to keep in step.
-    out = _read_org_transcripts(date, folder, "", "", conn=conn)
+    err = _session_site_company_guard(conn, caller, folder, date, session_base,
+                                      "re-extraction", allow_recorder=True)
+    if err is not None:
+        return err
+    # A site-less session is the recorder's home company's: only the recorder, that company's
+    # people, or platform_admin may re-drive it (R1(b)); anyone else gets a plain 404.
+    if (not recordings.session_site_companies(conn, folder, date, session_base)
+            and not _may_see_siteless_of(conn, caller, folder)):
+        return error("not found", 404)
+    out = _read_org_transcripts(date, folder, "", "", conn=conn, caller=caller)
     out = _apply_speaker_names(conn, caller, out)
     segs = out.get("speaker_segments") or []
 
@@ -10836,7 +11431,7 @@ def get_org_transcripts(conn, caller, event):
     if err is not None:
         return err
     out = _read_org_transcripts(date, folder, p.get("start") or "", p.get("end") or "",
-                                conn=conn)
+                                conn=conn, caller=caller)
     # Groups FIRST and unconditionally: the anonymous re-bind does not depend on the
     # naming switch, and putting it after would make the order look like a preference
     # rather than the independence it is.
@@ -10849,7 +11444,7 @@ def get_org_transcripts(conn, caller, event):
 # media reads (P1, 2026-07-23 prod-media-binding plan)
 # ----------------------------------------------------------
 
-def _read_org_audio_segments(date, folder, start_time, end_time, conn=None):
+def _read_org_audio_segments(date, folder, start_time, end_time, conn=None, caller=None):
     """S3 list + presign for one (folder, date) window -- mirrors
     lambda_fieldsight_api.get_audio_segments verbatim: same BUG-01-anchored
     regexes, same response fields. Only the folder_name
@@ -10908,6 +11503,8 @@ def _read_org_audio_segments(date, folder, start_time, end_time, conn=None):
     segments.sort(key=lambda seg: seg["absolute_start"])
     segments = _drop_deleted_media(segments, _deleted_sessions_for_day(conn, folder, date),
                                    lambda it: it.get("key") or it.get("url") or "", "audio")
+    segments = _drop_hidden_media(segments, _session_hider(conn, caller, folder, date),
+                                  lambda it: it.get("key") or it.get("url") or "", "audio")
     return {"segments": segments, "count": len(segments)}
 
 
@@ -10925,10 +11522,10 @@ def get_org_audio_segments(conn, caller, event):
     if err is not None:
         return err
     return ok(_read_org_audio_segments(date, folder, p.get("start") or "",
-                                       p.get("end") or "", conn=conn))
+                                       p.get("end") or "", conn=conn, caller=caller))
 
 
-def _read_org_video_segments(date, folder, start_time, end_time, conn=None):
+def _read_org_video_segments(date, folder, start_time, end_time, conn=None, caller=None):
     """Mirrors lambda_fieldsight_api.get_video_segments: web_video/ H264
     previews first, users/{folder}/video/ originals second, an original
     suppressed when a preview shares its base_name, ~10-min assumed file
@@ -10975,6 +11572,8 @@ def _read_org_video_segments(date, folder, start_time, end_time, conn=None):
     videos.sort(key=lambda v: v["video_start_sec"])
     videos = _drop_deleted_media(videos, _deleted_sessions_for_day(conn, folder, date),
                                  lambda it: it.get("key") or it.get("url") or "", "video")
+    videos = _drop_hidden_media(videos, _session_hider(conn, caller, folder, date),
+                                lambda it: it.get("key") or it.get("url") or "", "video")
     return {"videos": videos, "count": len(videos)}
 
 
@@ -10989,7 +11588,7 @@ def get_org_video_segments(conn, caller, event):
     if err is not None:
         return err
     return ok(_read_org_video_segments(date, folder, p.get("start") or "",
-                                       p.get("end") or "", conn=conn))
+                                       p.get("end") or "", conn=conn, caller=caller))
 
 
 # 2026-09-20: 'transcripts/' deliberately removed -- see the matching note in
@@ -11163,6 +11762,20 @@ def get_org_media_presigned_url(conn, caller, event):
     if _presign_target_is_deleted(conn, key):
         logger.info("media presign refused: %s belongs to a deleted session", key)
         return error("not found", 404)
+    # Project-owned tenancy: a link to a session on a site outside the caller's reach is
+    # the same "not found" as a deleted one (whitelist, final review F1); a per-user report
+    # document is withheld when any day of its period sits outside it (range-aware, F2).
+    if target:
+        if parts[0] == "reports":
+            if _user_report_hidden(conn, caller, key):
+                logger.info("media presign refused: %s spans work outside the caller's reach", key)
+                return error("not found", 404)
+        else:
+            dm = re.search(r"(\d{4}-\d{2}-\d{2})", key)
+            hider = _session_hider(conn, caller, target, dm.group(1) if dm else None)
+            if hider is not None and hider.hides_key(key):
+                logger.info("media presign refused: %s is not on a site in the caller's reach", key)
+                return error("not found", 404)
     url = s3().generate_presigned_url(
         "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
         ExpiresIn=PRESIGNED_URL_EXPIRY)

@@ -169,6 +169,7 @@ def test_site_from_other_company_rejected(wired):
     mp, fake = wired
     mp.setattr(org.recordings, "get_by_client_uuid", lambda c, u, cu: None)
     mp.setattr(org.sites, "get_site", lambda c, sid: {"id": sid, "company_id": "OTHER"})
+    mp.setattr(org.memberships, "get_membership", lambda c, uid, sid: None)
     res = org.lambda_handler(make_event("POST", "/api/org/recordings/upload-url", body={
         "kind": "video", "clientUuid": "cap-9", "siteId": "s-x",
         "fileName": "a.mp4", "contentType": "video/mp4", "startedAt": "2026-07-13T16:01:58Z"}), None)

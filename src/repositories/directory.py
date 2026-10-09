@@ -3,6 +3,8 @@ users and sites, and memberships archived or sitting on an archived site, are
 excluded here, so the document never has to know about archiving."""
 from psycopg.rows import dict_row
 
+from repositories import memberships as _memberships
+
 
 def live_users(conn):
     return conn.cursor(row_factory=dict_row).execute(
@@ -20,12 +22,15 @@ def live_sites(conn):
 def live_memberships(conn):
     # The company invariant (user and site in the same company) is enforced
     # here as everywhere else: a mis-tenanted row must not put a person on
-    # another company's project in a file every report reads.
-    return conn.cursor(row_factory=dict_row).execute(
+    # another company's project in a file every report reads. External
+    # memberships (project-owned tenancy P1) are deliberately NOT published
+    # here: the pipeline's people/site maps are home-company only, or the
+    # weekly/monthly rollups would mix companies (final review F2).
+    return _memberships._exec(conn,
         "SELECT m.user_id, m.site_id FROM memberships m "
         "JOIN users u ON u.id = m.user_id JOIN sites s ON s.id = m.site_id "
         "WHERE m.archived_at IS NULL AND u.archived_at IS NULL "
-        "AND s.archived_at IS NULL AND u.company_id = s.company_id").fetchall()
+        "AND s.archived_at IS NULL AND u.company_id = s.company_id AND NOT m.external").fetchall()
 
 
 def recent_activity(conn, days):
@@ -38,3 +43,14 @@ def recent_activity(conn, days):
         "FROM topics WHERE user_id IS NOT NULL "
         "AND report_date >= current_date - %s::int GROUP BY user_id, site_id",
         (int(days),)).fetchall()
+
+
+def external_user_ids(conn):
+    """ids of live users holding any live external membership on a live site. Published as
+    `has_external` on the person (never the sites): the report generator uses it to keep
+    that person's whole-day documents out of every site rollup."""
+    rows = _memberships._external_or(
+        conn, "SELECT DISTINCT m.user_id FROM memberships m JOIN sites s ON s.id = m.site_id "
+        "JOIN users u ON u.id = m.user_id WHERE m.external AND m.archived_at IS NULL "
+        "AND s.archived_at IS NULL AND u.archived_at IS NULL", (), [])
+    return {str(r[0]) for r in rows}

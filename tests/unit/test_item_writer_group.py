@@ -49,17 +49,20 @@ def test_a_grp_base_resolves_its_site_from_the_lead_session(monkeypatch):
                         lambda conn, sid: {"site_id": "site-1"} if sid == GID else None)
     monkeypatch.setattr(iw.sites, "get_site",
                         lambda conn, sid: {"id": "site-1", "company_id": "co-1"})
-    site = iw._site_from_group_lead(object(), "co-1", "grp" + GID)
+    monkeypatch.setattr(iw.memberships, "site_usable_by_user",
+                        lambda conn, uid, sid: {"id": sid, "company_id": "co-1"})
+    site = iw._site_from_group_lead(object(), "u-1", "grp" + GID)
     assert site["id"] == "site-1"
 
 
 def test_a_grp_site_from_another_company_is_refused(monkeypatch):
-    # Same tenant re-check _site_from_meeting_session does: a stale or rogue row
-    # must never attribute across tenants.
+    # Same recorder re-check _site_from_meeting_session does: a stale or rogue row
+    # must never attribute to a company the recorder has no relation to.
     monkeypatch.setattr(iw.meeting_session, "get", lambda conn, sid: {"site_id": "site-1"})
     monkeypatch.setattr(iw.sites, "get_site",
                         lambda conn, sid: {"id": "site-1", "company_id": "OTHER"})
-    assert iw._site_from_group_lead(object(), "co-1", "grp" + GID) is None
+    monkeypatch.setattr(iw.memberships, "site_usable_by_user", lambda conn, uid, sid: None)
+    assert iw._site_from_group_lead(object(), "u-1", "grp" + GID) is None
 
 
 def test_every_member_key_is_superseded(monkeypatch):

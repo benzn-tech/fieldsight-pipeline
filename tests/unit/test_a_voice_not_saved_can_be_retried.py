@@ -82,7 +82,7 @@ def wired(monkeypatch):
         st["locates"].append(sb)
         return st["located"]
 
-    def turns(conn, folder, date, sb, with_text=False):
+    def turns(conn, folder, date, sb, with_text=False, **k):
         st["turn_reads"].append((folder, date, sb))
         return [{"source_filename": SRC, "speaker_label": "spk_0",
                  "start_sec": 0.0, "end_sec": 4.0},
@@ -139,7 +139,7 @@ def test_retry_is_null_when_the_session_cannot_be_located(wired):
 
 
 def test_retry_is_null_when_no_turn_matches(wired, monkeypatch):
-    monkeypatch.setattr(org, "_session_turns", lambda conn, f, d, sb, with_text=False: [
+    monkeypatch.setattr(org, "_session_turns", lambda conn, f, d, sb, with_text=False, **k: [
         {"source_filename": SRC, "start_sec": 50.0, "end_sec": 60.0}])
     rows = _rows(org.lambda_handler(_event("GET", "/voiceprints"), None))
     assert rows[VP]["retry"] is None

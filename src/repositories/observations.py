@@ -1,6 +1,15 @@
 import psycopg
 from psycopg.rows import dict_row
 
+from repositories import memberships as _memberships
+
+# The external-member arm reads memberships.external (migration 0085). Between `sam deploy`
+# and the migrate step the column does not exist: `_run` retries without this arm.
+_EXT_ARM = (" OR EXISTS ("
+            "  SELECT 1 FROM memberships m JOIN sites s ON s.id = m.site_id "
+            "  WHERE m.user_id = u.id AND m.external AND m.archived_at IS NULL "
+            "  AND s.company_id = observations.company_id)")
+
 _COLS = ("id, company_id, kind, site_slug, report_date, author_sub, author_name, "
          "observation, risk_level, recommended_action, status, archived_at, "
          "created_at, updated_at, "
@@ -8,8 +17,13 @@ _COLS = ("id, company_id, kind, site_slug, report_date, author_sub, author_name,
          # directory by cognito_sub. author_name is a display name and must never
          # be turned back into a folder. NULL when the author has no directory row.
          "(SELECT u.folder_name FROM users u "
+         # observations.company_id is the SITE's company; an external member's
+         # directory row stays in their HOME company (project-owned tenancy), so the
+         # author counts when they are of this company OR hold a live external
+         # membership on one of its projects. A stranger of a third company is still
+         # not leaked.
          "WHERE u.cognito_sub = observations.author_sub "
-         "AND u.company_id = observations.company_id) AS author_folder")
+         "AND (u.company_id = observations.company_id" + _EXT_ARM + ")) AS author_folder")
 
 
 def create_observation(conn, company_id, kind, site_slug, author_sub, author_name,
@@ -23,7 +37,7 @@ def create_observation(conn, company_id, kind, site_slug, author_sub, author_nam
     and passes it explicitly; the repository stays dumb and never invents a
     date. Passing None inserts NULL and fails the NOT NULL constraint.
     """
-    return conn.cursor(row_factory=dict_row).execute(
+    return _run(conn, 
         f"INSERT INTO observations (company_id, kind, site_slug, report_date, "
         f"author_sub, author_name, observation, risk_level, recommended_action) "
         f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING {_COLS}",
@@ -62,7 +76,7 @@ def list_observations(conn, company_id, kind=None, date_from=None, date_to=None,
     if not include_archived:
         conditions.append("archived_at IS NULL")
     where = " AND ".join(conditions)
-    return conn.cursor(row_factory=dict_row).execute(
+    return _run(conn, 
         f"SELECT {_COLS} FROM observations WHERE {where} "
         f"ORDER BY report_date DESC, created_at DESC",
         params,
@@ -75,7 +89,7 @@ def get_observation(conn, company_id, obs_id) -> dict | None:
     same as a missing one (404 semantics), so callers don't need to
     pre-validate the id format themselves."""
     try:
-        return conn.cursor(row_factory=dict_row).execute(
+        return _run(conn, 
             f"SELECT {_COLS} FROM observations WHERE id=%s AND company_id=%s",
             (obs_id, company_id),
         ).fetchone()
@@ -88,7 +102,7 @@ def set_status(conn, company_id, obs_id, status) -> dict | None:
     """Company-guarded status transition. Returns None if not found, wrong
     company, or obs_id is not a valid UUID (see get_observation)."""
     try:
-        return conn.cursor(row_factory=dict_row).execute(
+        return _run(conn, 
             f"UPDATE observations SET status=%s, updated_at=now() "
             f"WHERE id=%s AND company_id=%s RETURNING {_COLS}",
             (status, obs_id, company_id),
@@ -108,7 +122,7 @@ def set_archived(conn, company_id, obs_id, archived) -> dict | None:
     guard = "archived_at IS NULL" if archived else "archived_at IS NOT NULL"
     set_clause = "archived_at=now()" if archived else "archived_at=NULL"
     try:
-        return conn.cursor(row_factory=dict_row).execute(
+        return _run(conn, 
             f"UPDATE observations SET {set_clause} "
             f"WHERE id=%s AND company_id=%s AND {guard} RETURNING {_COLS}",
             (obs_id, company_id),
@@ -116,3 +130,7 @@ def set_archived(conn, company_id, obs_id, archived) -> dict | None:
     except psycopg.Error:
         conn.rollback()
         return None
+
+
+def _run(conn, sql, params=()):
+    return _memberships._exec(conn, sql, params, legacy=sql.replace(_EXT_ARM, ""))

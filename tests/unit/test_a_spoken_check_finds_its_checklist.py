@@ -81,7 +81,7 @@ def test_item_writer_calls_it_after_the_markers():
     lam = pytest.importorskip("lambda_item_writer")
     src = open(lam.__file__, encoding="utf-8").read()
     marks = src.index("location_markers.replace_for_session(")
-    insp = src.index("_store_inspections(conn, company[\"id\"], user_id, user_folder, date,")
+    insp = src.index("_store_inspections(conn, owner_company_id, user_id, user_folder, date,")
     assert marks < insp
 
 

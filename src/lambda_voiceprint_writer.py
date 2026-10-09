@@ -48,10 +48,11 @@ import os
 from db.connection import get_connection
 from repositories import (label_group_candidates, site_attendance,
                           speaker_label_groups, speaker_name_proposals)
-from repositories.companies import list_companies
+from repositories.companies import list_companies, voiceprint_consent_basis
 from repositories.voiceprints import (EnrolmentAfterWithdrawal,
                                       EnrolmentBelongsToSomebodyElse, add_sample,
                                       company_floor, live_turn_names,
+                                      own_profiles_for_matching,
                                       profiles_for_matching, record_attempt,
                                       record_turn_name, recompute_company_floor,
                                       rejected_names)
@@ -417,8 +418,28 @@ def _profiles(event):
     """
     company_id = _require(event, "company_id")
     site_id, date = event.get("site_id"), event.get("date")
+    home_id, recorder_id = event.get("home_company_id"), event.get("recorder_user_id")
+    # Project-owned tenancy P5. `company_id` is the SITE's company. A request that names a
+    # DIFFERENT home company is an external recorder on this site: candidates are the site
+    # company's enrolled prints plus the recorder's own, read from their home company. A
+    # request without the fields (older producers) or with home == site is the home-site
+    # case and runs exactly as before.
+    external = bool(home_id) and str(home_id) != str(company_id)
     with get_connection() as conn:
+        own_rows = []
+        if external:
+            # The SITE company's consent gates matching on its site; the recorder's own
+            # print additionally needs their HOME company's consent. A NULL basis is
+            # "no consent recorded" -- the same strict reading enrolment applies.
+            if not voiceprint_consent_basis(conn, company_id):
+                logger.info("profiles: site company %s has no voiceprint consent basis; "
+                            "no matching on its site", company_id)
+                return {"profiles": [], "company_floor": None}
+            if voiceprint_consent_basis(conn, home_id):
+                own_rows = own_profiles_for_matching(conn, home_id, recorder_id)
         rows = profiles_for_matching(conn, company_id, site_id=site_id)
+        own_ids = {str(r["id"]) for r in own_rows}
+        rows = rows + own_rows
         # Read once per invocation, not once per turn: the floor is derived/materialized
         # state (recomputed on a schedule, spec S1.3) and must not move mid-decision
         # because one turn happened to land during a recompute.
@@ -450,7 +471,8 @@ def _profiles(event):
     reply = {"profiles": profiles, "company_floor": floor}
     if on_roster_ids is not None:
         for p, r in zip(profiles, rows):
-            p["on_roster"] = str(r["id"]) in on_roster_ids
+            # The recorder is on this site by construction, whatever the roster says.
+            p["on_roster"] = str(r["id"]) in on_roster_ids or str(r["id"]) in own_ids
         reply["roster_size"] = len(on_roster_ids)
     return reply
 

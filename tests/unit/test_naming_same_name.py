@@ -206,7 +206,7 @@ def post(monkeypatch):
                         lambda conn, caller, user, what="media": (user or "Ben", None))
     monkeypatch.setattr(org, "_may_correct_speakers", lambda conn, caller, folder: True)
     monkeypatch.setattr(org, "_same_company_as_folder", lambda conn, c, f, w: None)
-    monkeypatch.setattr(org, "_session_turns", lambda conn, f, d, s: [])
+    monkeypatch.setattr(org, "_session_turns", lambda conn, f, d, s, **k: [])
     monkeypatch.setattr(org, "s3", lambda: S3())
     monkeypatch.setattr(org.users, "resolve_display_name",
                         lambda conn, co, name: (st["person"], "full_name")
@@ -314,7 +314,7 @@ def test_the_proposal_accept_passes_the_known_profile(monkeypatch):
     forwarded = []
     monkeypatch.setattr(org.voiceprints, "get_profile",
                         lambda conn, co, vid: {"id": vid, "display_name": "Ben Lin"})
-    monkeypatch.setattr(org, "_session_turns", lambda conn, f, d, sb: [
+    monkeypatch.setattr(org, "_session_turns", lambda conn, f, d, sb, **k: [
         {"source_filename": SRC, "speaker_label": "spk_0", "start_sec": 9.0, "end_sec": 31.0}])
     monkeypatch.setattr(org, "speaker_corrections",
                         lambda conn, caller, sid, event: forwarded.append(

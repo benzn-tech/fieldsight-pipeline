@@ -33,6 +33,28 @@ def upsert_user(conn, cognito_sub, email, company_id=None, first_name=None,
     ).fetchone()
 
 
+def find_live_users_by_email_global(conn, email, limit=2) -> list:
+    """LIVE users by exact login email (case-insensitive), across ALL companies, each with
+    their home company's name, oldest first, at most `limit` (default 2: the caller only
+    needs to know whether the email is unique). Used only to add an existing person from
+    another company to a project (project-owned tenancy P1) -- never to search. Archived
+    users are not found. More than one row means the email is ambiguous: the caller
+    refuses rather than picking one (final review F8)."""
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT users.{', users.'.join(_COLS.split(', '))}, c.name AS company_name "
+        f"FROM users LEFT JOIN companies c ON c.id = users.company_id "
+        f"WHERE lower(users.email) = lower(%s) AND users.archived_at IS NULL "
+        f"ORDER BY users.created_at LIMIT %s", (email, limit)
+    ).fetchall()
+
+
+def get_user_by_email_global(conn, email) -> dict | None:
+    """The one live user with this email, or None -- also None when TWO OR MORE share it
+    (never pick one: see `find_live_users_by_email_global`)."""
+    rows = find_live_users_by_email_global(conn, email)
+    return rows[0] if len(rows) == 1 else None
+
+
 def get_user_by_sub(conn, cognito_sub) -> dict | None:
     """The caller, with their company's voiceprint basis carried alongside.
 
