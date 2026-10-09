@@ -46,3 +46,17 @@ def visible_user_scope(global_role: str, membership_roles) -> str:
     if global_role == "site_manager" or "site_manager" in roles:
         return "SELF+WORKERS"
     return "SELF"
+
+
+def external_user_scope(membership_role: str) -> str:
+    """The author tier on a site reached through an EXTERNAL membership (a project
+    of another company the person was added to). The membership role is the whole
+    story there: the person's global role and their home-company memberships are
+    facts about their own company and never raise (or lower) what they may see on
+    someone else's project (final review F3).
+      pm -> SITE, site_manager -> SELF+WORKERS, anything else -> SELF."""
+    if membership_role == "pm":
+        return "SITE"
+    if membership_role == "site_manager":
+        return "SELF+WORKERS"
+    return "SELF"

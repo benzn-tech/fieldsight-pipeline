@@ -90,7 +90,7 @@ def wired(monkeypatch):
                         lambda conn, co, sid, state, decided_by=None: dict(_row(), state=state))
     monkeypatch.setattr(org.users, "get_by_folder_name",
                         lambda conn, co, folder: {"id": "u-9", "folder_name": folder})
-    monkeypatch.setattr(org, "_session_turns", lambda conn, f, d, sb: [
+    monkeypatch.setattr(org, "_session_turns", lambda conn, f, d, sb, **k: [
         {"source_filename": SRC, "speaker_label": "spk_0", "start_sec": 0.0, "end_sec": 4.0},
         {"source_filename": SRC, "speaker_label": "spk_0", "start_sec": 9.0, "end_sec": 40.0},
         {"source_filename": SRC, "speaker_label": "spk_1", "start_sec": 50.0, "end_sec": 55.0},
@@ -123,7 +123,7 @@ def test_the_longest_turn_of_the_cluster_is_marked_not_the_intro_itself(wired):
 def test_falls_back_to_the_suggestions_own_window_when_the_cluster_is_gone(wired, monkeypatch):
     """When `_session_turns` no longer has the cluster, the intro is at least 3 s --
     propagation still works from the suggestion's own start/end."""
-    monkeypatch.setattr(org, "_session_turns", lambda conn, f, d, sb: [])
+    monkeypatch.setattr(org, "_session_turns", lambda conn, f, d, sb, **k: [])
     org.lambda_handler(_event("confirmed"), None)
     c = wired[0]["correction"]
     assert (c["start_sec"], c["end_sec"]) == (0.0, 6.0)

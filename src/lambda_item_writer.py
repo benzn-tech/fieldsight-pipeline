@@ -70,6 +70,7 @@ import photo_rebind
 import pipeline_trace
 import thread_match
 from repositories import inspection_windows, location_markers
+from repositories import memberships
 from repositories import (companies, findings, meeting_session, recordings,
                           redactions,
                           session_group, sites, threads, topics)
@@ -129,17 +130,18 @@ def s3():
     return _s3_client
 
 
-def _site_from_meeting_session(conn, company_id, session_base):
+def _site_from_meeting_session(conn, user_id, session_base):
     """The site the recorder picked when OPENING a chunk session
     (meeting_session.site_id, set by POST /sessions/{id}/open), as a
     sites.get_site()-shaped row -- else None. This is how a chunk session
     attributes to a site: it uploads its ~1-min chunks straight to the raw-media
     prefix (no `recordings` row, so recordings.site_for_media misses), and its
     only explicit site tag lives on meeting_session. Returns None for a legacy
-    whole-file base (no device session). Company-scoped: session_open already
-    rejected a cross-tenant site, and we re-check the resolved site's company here
-    so a stale/rogue row can never attribute across tenants (multi-tenant
-    invariant, mirrors recordings.site_for_media)."""
+    whole-file base (no device session). Recorder-scoped (project-owned
+    tenancy P2): session_open already refused a site the recorder has no relation
+    to, and we re-check here that the recorder (`user_id`) holds a live membership
+    on it or it is their own company's, so a stale/rogue row can never attribute
+    to a company the recorder is not part of (mirrors recordings.site_for_media)."""
     device_sid = _device_session_id(session_base)
     if not device_sid:
         return None
@@ -147,7 +149,7 @@ def _site_from_meeting_session(conn, company_id, session_base):
     if not row or not row.get("site_id"):
         return None
     site = sites.get_site(conn, row["site_id"])
-    if site is None or site["company_id"] != company_id:
+    if site is None or memberships.site_usable_by_user(conn, user_id, site["id"]) is None:
         return None
     return site
 
@@ -159,7 +161,7 @@ def _group_id_from_base(session_base):
     return session_base[3:] or None
 
 
-def _site_from_group_lead(conn, company_id, session_base):
+def _site_from_group_lead(conn, user_id, session_base):
     """A merged artifact's site, taken from the LEAD's session row.
 
     Needed because the merged key deliberately is NOT a `sid` base (that one
@@ -170,8 +172,8 @@ def _site_from_group_lead(conn, company_id, session_base):
     Without this rung a merge ends in "identity bridge miss ... zero writes" --
     silently discarded AFTER the members' topics were deleted.
 
-    Company-scoped exactly as _site_from_meeting_session is, so a stale or rogue
-    row can never attribute across tenants."""
+    Recorder-scoped exactly as _site_from_meeting_session is, so a stale or rogue
+    row can never attribute to a company the recorder has no relation to."""
     gid = _group_id_from_base(session_base)
     if not gid:
         return None
@@ -179,7 +181,7 @@ def _site_from_group_lead(conn, company_id, session_base):
     if not row or not row.get("site_id"):
         return None
     site = sites.get_site(conn, row["site_id"])
-    if site is None or str(site["company_id"]) != str(company_id):
+    if site is None or memberships.site_usable_by_user(conn, user_id, site["id"]) is None:
         return None
     return site
 
@@ -615,7 +617,8 @@ def _request_rebind(company_id, session_base, artifact, put=None):
     return True
 
 
-def _request_match(company_id, session_base, artifact, site_id=None, put=None):
+def _request_match(company_id, session_base, artifact, site_id=None, put=None,
+                   home_company_id=None, recorder_user_id=None):
     """Ask the embedder to name this session from the profiles the company already holds.
 
     **The gap this closes.** Until 2026-09-23 the ONLY producer of a match request was
@@ -659,6 +662,8 @@ def _request_match(company_id, session_base, artifact, site_id=None, put=None):
             turns=turns,
             mode=SPEAKER_IDENTITY_MODE,
             site_id=site_id,
+            home_company_id=home_company_id,
+            recorder_user_id=recorder_user_id,
             # Who asked. No user id here by construction — nobody asked, the session ended
             # — and saying `finalize` is what lets an operator tell an automatic name apart
             # from one a person requested when a wrong one turns up.
@@ -942,7 +947,8 @@ def write_extraction_items(date, user_folder, extraction_key):
         #      site), which is why an offline gm recording used to fall all the way
         #      through to "identity bridge miss ... zero writes" and never reach
         #      the web timeline even though every upload had succeeded.
-        # All three explicit tags are company-scoped; fall through only on no match.
+        # All explicit tags are recorder-scoped (membership on the site, or the
+        # recorder's own company's site); fall through only on no match.
         session_base = _parse_extraction_key(extraction_key)[2]
 
         # A member whose group has already merged must not re-publish its own
@@ -953,10 +959,14 @@ def write_extraction_items(date, user_folder, extraction_key):
                 conn, session_base, extraction) == "suppress":
             return {"skipped": True, "reason": "superseded by the group merge"}
 
-        site = recordings.site_for_media(conn, company["id"], user_folder, date, session_base) \
-            or _site_from_meeting_session(conn, company["id"], session_base) \
-            or _site_from_group_lead(conn, company["id"], session_base) \
-            or recordings.site_for_day(conn, company["id"], user_folder, date) \
+        # Project-owned tenancy P2: the ladder runs WITHOUT a company pin. Each
+        # rung requires the recorder to hold a live membership on the site (or the
+        # site to be their home company's), and the site then decides the company.
+        user_id = lambda_ingest.resolve_user(conn, company["id"], user_folder)
+        site = recordings.site_for_media(conn, user_id, user_folder, date, session_base) \
+            or _site_from_meeting_session(conn, user_id, session_base) \
+            or _site_from_group_lead(conn, user_id, session_base) \
+            or recordings.site_for_day(conn, user_id, user_folder, date) \
             or lambda_ingest.resolve_site(conn, company["id"], {}, user_folder)
         if site is None:
             reason = (f"identity bridge miss: user_folder={user_folder!r} -- "
@@ -964,14 +974,17 @@ def write_extraction_items(date, user_folder, extraction_key):
             logger.warning("%s: %s", extraction_key, reason)
             return {"skipped": True, "reason": reason}
 
-        user_id = lambda_ingest.resolve_user(conn, company["id"], user_folder)
+        # `company` is the recorder's HOME company (it rides on the voiceprint match
+        # request as `home_company_id`). Everything else written below, voiceprint
+        # requests included, is owned by the SITE's company.
+        owner_company_id = site.get("company_id") or company["id"]
 
         # Only when the ASR heard exactly one voice. Absent (older artifacts) is
         # treated as "unknown", not as one -- an unknown count must not license
         # putting a name on someone else's words.
         if extraction.get("speaker_count") == 1:
             recorder = _display_name(
-                users_repo.get_by_folder_name(conn, company["id"], user_folder), user_folder)
+                users_repo.get_by_folder_name_global(conn, user_folder), user_folder)
             resolved = sum(_resolve_self_responsible(t.get("action_items"), recorder)
                            for t in extraction.get("topics", []))
             if resolved:
@@ -1054,7 +1067,7 @@ def write_extraction_items(date, user_folder, extraction_key):
         # savepoint, so a failure here cannot abort the extraction's own write.)
         try:
             location_markers.replace_for_session(
-                conn, company["id"], user_folder, date,
+                conn, owner_company_id, user_folder, date,
                 _parse_extraction_key(extraction_key)[2],
                 extraction.get("location_markers") or [])
         except Exception:  # noqa: BLE001 -- see above
@@ -1065,7 +1078,7 @@ def write_extraction_items(date, user_folder, extraction_key):
         # is (inspection_match). Never fatal, for the same reason as the markers.
         stored_inspections = []
         try:
-            stored_inspections = _store_inspections(conn, company["id"], user_id, user_folder, date,
+            stored_inspections = _store_inspections(conn, owner_company_id, user_id, user_folder, date,
                                _parse_extraction_key(extraction_key)[2],
                                extraction.get("inspections") or [])
         except Exception:  # noqa: BLE001 -- see above
@@ -1094,7 +1107,7 @@ def write_extraction_items(date, user_folder, extraction_key):
         if extraction.get("tier") == "final" and extraction.get("self_introductions"):
             try:
                 counts = speaker_intro_suggestions.store(
-                    conn, company["id"], session_base, user_folder, date,
+                    conn, owner_company_id, session_base, user_folder, date,
                     extraction["self_introductions"])
                 logger.info(
                     "intro suggestions: inserted=%d skipped_named=%d skipped_no_sid=%d",
@@ -1221,7 +1234,7 @@ def write_extraction_items(date, user_folder, extraction_key):
         # lists every photo regardless of binding.
         try:
             photo_rebind.rebind_day_photos(
-                conn, company["id"], user_folder, date, photo_objects)
+                conn, owner_company_id, user_folder, date, photo_objects)
         except Exception:  # noqa: BLE001 -- see above
             logger.exception("day photo rebind failed for %s/%s", user_folder, date)
 
@@ -1233,7 +1246,7 @@ def write_extraction_items(date, user_folder, extraction_key):
                 and not extraction.get("incomplete")):
             try:
                 made = checklist_reports.auto_generate(
-                    conn, company["id"], user_folder, date,
+                    conn, owner_company_id, user_folder, date,
                     _parse_extraction_key(extraction_key)[2], stored_inspections)
                 if made:
                     logger.info("checklist reports for %s: %s", extraction_key, made)
@@ -1344,7 +1357,8 @@ def write_extraction_items(date, user_folder, extraction_key):
     # one — which matters because the groups would outlive the deletion in a table the
     # tombstone does not reach.
     if REBIND_SPEAKERS:
-        _request_rebind(company["id"], session_base, extraction)
+        # Anonymous label groups are session data: they belong to the SITE's company.
+        _request_rebind(owner_company_id, session_base, extraction)
 
     # Naming, which is the other half and gated separately. Same placement and the same
     # reasons: post-commit, and after the deleted-source gate, so a session the customer
@@ -1354,8 +1368,13 @@ def write_extraction_items(date, user_folder, extraction_key):
     # `site` narrows the candidate pool to the people who were on that site, which is what
     # keeps the margin meaningful as a company accumulates profiles. It is already resolved
     # above by the ladder BUG-41 settled, and None is a valid answer meaning "no narrowing".
-    _request_match(company["id"], session_base, extraction,
-                   site_id=(site or {}).get("id"))
+    #
+    # P5: the request is made in the SITE's company (`owner_company_id`); when the recorder
+    # is another company's employee it also names their home company and user id, so the
+    # matcher can add the recorder's own print and nothing else from that company.
+    _request_match(owner_company_id, session_base, extraction,
+                   site_id=(site or {}).get("id"),
+                   home_company_id=company["id"], recorder_user_id=user_id)
 
     return {"skipped": False, "topics": topics_n}
 

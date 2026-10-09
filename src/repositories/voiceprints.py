@@ -830,6 +830,31 @@ def profiles_for_matching(conn, company_id, site_id=None) -> list[dict]:
     ).fetchall())
 
 
+def own_profiles_for_matching(conn, home_company_id, user_id) -> list[dict]:
+    """The RECORDER'S OWN matchable profiles, read from their HOME company.
+
+    Project-owned tenancy P5. On another company's site the candidate set is that company's
+    enrolled voiceprints plus the recorder's own -- and nobody else from the recorder's home
+    company. Enrolment and consent stay with the home company, so the rows are read there:
+    same consent and withdrawal filters as `profiles_for_matching`, plus `user_id` pinned to
+    the recorder. No user id is an empty answer, never "every profile of the company".
+    """
+    _require_company(home_company_id)
+    if not user_id:
+        return []
+    return _decode(conn.cursor(row_factory=dict_row).execute(
+        "SELECT p.id, p.display_name, p.status, p.user_id, s.id AS sample_id, "
+        "       s.embedding "
+        "FROM speaker_voiceprints p "
+        "JOIN speaker_voiceprint_samples s ON s.voiceprint_id = p.id "
+        "                                 AND s.quarantined_at IS NULL "
+        "WHERE p.company_id = %s AND p.user_id = %s "
+        "  AND p.consent_at IS NOT NULL "
+        "  AND p.status <> 'withdrawn' "
+        "ORDER BY p.created_at",
+        (home_company_id, user_id)).fetchall())
+
+
 def withdraw(conn, company_id, voiceprint_id) -> list:
     """Honour a withdrawal: the vectors go, the audit stays.
 
@@ -865,13 +890,15 @@ def withdraw(conn, company_id, voiceprint_id) -> list:
     # removed, and a deleted row cannot say a name was ever shown.
     cur.execute(
         "UPDATE speaker_turn_names SET superseded_at = now() "
-        "WHERE company_id = %s AND superseded_at IS NULL "
+        "WHERE superseded_at IS NULL "
+        # By profile id with NO company predicate: a recorder's print also names turns on
+        # another company's site (tenancy P5), and those rows carry that company's id.
         "  AND (voiceprint_id = %s"
-        "       OR correction_ref IN ("
+        "       OR (company_id = %s AND correction_ref IN ("
         "            SELECT correction_ref FROM speaker_voiceprint_samples "
         "             WHERE company_id = %s AND voiceprint_id = %s "
-        "               AND correction_ref IS NOT NULL))",
-        (company_id, voiceprint_id, company_id, voiceprint_id))
+        "               AND correction_ref IS NOT NULL)))",
+        (voiceprint_id, company_id, company_id, voiceprint_id))
     cur.execute(
         "DELETE FROM speaker_voiceprint_samples "
         "WHERE company_id = %s AND voiceprint_id = %s",
@@ -1560,8 +1587,9 @@ def rename_profile(conn, company_id, voiceprint_id, display_name) -> bool:
         return False
     cur.execute(
         "UPDATE speaker_turn_names SET display_name = %s "
-        "WHERE company_id = %s AND voiceprint_id = %s",
-        (display_name, company_id, voiceprint_id))
+        # No company predicate: the profile id is the identity (see `withdraw`).
+        "WHERE voiceprint_id = %s",
+        (display_name, voiceprint_id))
     return True
 
 

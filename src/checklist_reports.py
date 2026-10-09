@@ -141,7 +141,9 @@ def auto_generate(conn, company_id, folder, date, session, windows, generate=Non
         return out
     session_topics = [t for t in topics_repo.list_day_topics_for_binding(conn, folder, date)
                       if session in (t.get("source_s3_key") or "")]
-    user = users.get_by_folder_name(conn, company_id, folder) or {}
+    # Global: `company_id` is the SITE's company; the recorder's row stays in their home company.
+    user = (users.get_by_folder_name(conn, company_id, folder)
+            or users.get_by_folder_name_global(conn, folder) or {})
     caller = users.get_user_by_sub(conn, user["cognito_sub"]) if user.get("cognito_sub") else None
     for w in matched:
         try:

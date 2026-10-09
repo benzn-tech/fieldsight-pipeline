@@ -68,7 +68,7 @@ def aurora(monkeypatch):
     monkeypatch.setattr(org, "_get_lake_json", lambda key: None)
     # user_name is a DISPLAY name, exactly as the real shape builds it.
     monkeypatch.setattr(org, "render_report_shape",
-                        lambda rows, doc, date, user, conn=None, company_id=None:
+                        lambda rows, doc, date, user, conn=None, company_id=None, **kw:
                         {"report_date": date, "user_name": "Ben Lin",
                          "topics": [], "_report_metadata": {}})
     return monkeypatch

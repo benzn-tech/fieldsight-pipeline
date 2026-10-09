@@ -42,8 +42,8 @@ import logging
 
 from db.connection import close_cached_connection, get_cached_connection
 from lexical_terms import or_query, query_terms
-from repositories import (aliases, chunks, findings, recordings, redactions, scope,
-                         sites, topics, users)
+from repositories import (aliases, chunks, findings, memberships, recordings, redactions,
+                          scope, sites, topics, users)
 import text_normalize
 
 logger = logging.getLogger()
@@ -146,14 +146,21 @@ def _metric(event):
     # matches nothing -- a platform_admin reaching five sites that recorded all
     # day was told nothing was recorded. Every other caller keeps the pin, which
     # is belt-and-braces over a site set that is already theirs.
+    # A caller with an external membership reaches sites whose rows carry the SITE's
+    # company. `company=None` stays platform_admin only (final review F4: None also
+    # unpins the NULL-site arm and the tombstones, i.e. every tenant's site-less
+    # recordings); instead the home pin is waived for exactly those external site ids.
     company = None if sc.get("cross_company") else caller["company_id"]
+    ext = ({} if sc.get("cross_company")
+           else memberships.external_site_companies(conn, caller["id"], site_ids))
 
     notes = {}
     if metric.startswith("count_findings_"):
         domain = metric.rsplit("_", 1)[1]
         got = findings.count_by_domain(conn, company, domain,
                                        date_from, date_to,
-                                       site_ids=site_ids, author_ids=author_ids)
+                                       site_ids=site_ids, author_ids=author_ids,
+                                       **({"external_site_ids": list(ext)} if ext else {}))
         value = got["count"]
         for k in ("unlabelled", "null_author", "from_fallback"):
             if got[k]:
@@ -169,11 +176,13 @@ def _metric(event):
         # to and which the mirror is a copy OF. rag-search is in the VPC with no
         # egress, so an S3 read here would not fail -- it would black-hole until
         # the function timed out (BUG-36) and look like a slow query.
-        deleted = redactions.deleted_session_bases(conn, company,
-                                                   date_from, date_to)
+        deleted = redactions.deleted_session_bases(
+            conn, company, date_from, date_to,
+            **({"also_companies": sorted(set(ext.values()))} if ext else {}))
         got = recordings.range_stats(conn, company, date_from, date_to,
                                      site_ids, author_ids=author_ids,
-                                     deleted_bases=deleted)
+                                     deleted_bases=deleted,
+                                     **({"external_site_ids": list(ext)} if ext else {}))
         value = {"duration": got["duration_s"],
                  "count_sessions": got["sessions"],
                  "count_photos": got["photos"]}[metric]
@@ -365,10 +374,14 @@ def _search(event, context):
     # unnarrowed set: unresolved, or outside author_ids, means no rows. Company-
     # pinned lookup unless the caller is cross-company (users.py:69-82).
     if author_filter:
+        # Global lookup (project-owned tenancy P3): an external author's directory row
+        # is in their HOME company. Visibility is NOT decided here -- it is the site set
+        # (search_chunks is site-scoped) and `author_ids` below.
         if sc.get("cross_company"):
             target = users.get_by_folder_name_global(conn, author_filter)
         else:
-            target = users.get_by_folder_name(conn, caller["company_id"], author_filter)
+            target = (users.get_by_folder_name(conn, caller["company_id"], author_filter)
+                      or users.get_by_folder_name_global(conn, author_filter))
         target_id = str(target["id"]) if target else None
         if target_id and (author_ids is None or target_id in author_ids):
             author_ids = [target_id]
