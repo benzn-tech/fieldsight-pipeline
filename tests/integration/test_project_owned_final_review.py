@@ -505,3 +505,43 @@ def test_code_that_lands_before_the_migrations_behaves_as_no_external_members(db
         memberships.record_audit(db, "external_add", dict(w["admin_b"]), w["eve"]["id"],
                                  w["site_b"], "worker")            # logs, does not raise
     assert "migration 0085" in caplog.text and "migration 0086" in caplog.text
+
+
+# ---------------------------------------------------------------- third round
+
+def test_regenerate_of_a_site_less_session_is_the_home_companys_alone(db, monkeypatch):
+    w = _world(db)
+    _rec(db, w, None, SID_HOME)
+    monkeypatch.setattr(api, "S3_BUCKET", "lake")
+    monkeypatch.setattr(api.boto3, "client", lambda *a, **k: _S3())
+    monkeypatch.setattr(api, "_list_media_objects", lambda prefix, what: [])
+    ev = {"body": json.dumps({"user": w["folder"], "date": DATE})}
+    assert api.regenerate_session(db, w["admin_b"], "sid" + SID_HOME, ev)["statusCode"] == 404
+    assert api.regenerate_session(db, w["admin_a"], "sid" + SID_HOME, ev)["statusCode"] == 202
+    assert api.regenerate_session(db, w["plat"], "sid" + SID_HOME, ev)["statusCode"] == 202
+
+
+def test_a_mixed_session_is_hidden_whole_from_others_and_visible_to_the_person(db):
+    w = _world(db)
+    sid = "9" * 32
+    _rec(db, w, w["site_b"], sid)                            # rows on B's site ...
+    _topic(db, w, w["site_a"], "Yard A pour", sid)           # ... and a topic on A's site
+    for caller in (w["admin_a"], w["admin_b"]):              # each sees one half only
+        h = api._session_hider(db, caller, w["folder"], DATE)
+        assert h.hides("sid" + sid) is True
+    key = f"users/{w['folder']}/audio/{DATE}/x_sid{sid}_c0000.wav"
+    assert _presign(db, w["admin_a"], key)["statusCode"] == 404
+    assert _presign(db, w["admin_b"], key)["statusCode"] == 404
+    assert _presign(db, w["eve"], key)["statusCode"] == 200
+    assert api._session_hider(db, w["eve"], w["folder"], DATE) is None
+
+
+def test_the_observations_reads_survive_the_missing_external_column(db):
+    from repositories import observations
+    w = _world(db)
+    db.execute("ALTER TABLE memberships DROP COLUMN external")
+    obs = observations.create_observation(
+        db, w["co_a"]["id"], "safety", "yard-a", w["eve"]["cognito_sub"], "Eve",
+        "Loose edge", report_date=DATE)
+    assert obs["author_folder"] == w["folder"]
+    assert [o["id"] for o in observations.list_observations(db, w["co_a"]["id"])] == [obs["id"]]

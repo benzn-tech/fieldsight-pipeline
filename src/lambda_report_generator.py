@@ -350,8 +350,29 @@ def external_folders(bucket):
     (`has_external` in the directory). Their whole-day documents span companies, so they
     stay out of every site rollup and out of the SITE# DynamoDB stamping."""
     doc = directory.load(s3_client, bucket)
-    return {f for f, p in (doc.get('people') or {}).items()
-            if isinstance(p, dict) and p.get('has_external')}
+    people = (doc or {}).get('people') or {}
+    if not people:
+        # An empty/unreadable directory cannot say who is external: FAIL CLOSED. Callers get
+        # None and must skip site rollups / SITE# stamping rather than include everyone.
+        logger.error("directory unreadable or empty: cannot tell who has external memberships; "
+                     "site rollups and SITE# stamping are skipped")
+        return None
+    return {f for f, p in people.items() if isinstance(p, dict) and p.get('has_external')}
+
+
+def usable_weeklies(weekly_reports, ext_folders):
+    """The weekly documents a monthly site/combined rollup may ingest. A person with an
+    external membership has a weekly that spans companies; with the directory unreadable
+    (`ext_folders` None) nothing can be vouched for, so none are used."""
+    if ext_folders is None:
+        return []
+    kept = []
+    for wr in weekly_reports:
+        if wr.get('user_name') in ext_folders:
+            logger.info(f"  weekly of {wr.get('user_name')}: has_external -- not used in monthly rollups")
+            continue
+        kept.append(wr)
+    return kept
 
 
 def group_reports_by_site(reports_by_user, user_all_sites, ext_folders, site_id_default):
@@ -359,6 +380,8 @@ def group_reports_by_site(reports_by_user, user_all_sites, ext_folders, site_id_
     external membership (`ext_folders`) is left out entirely: their whole-day document
     covers other companies' projects too. One INFO line per exclusion (folder only)."""
     reports_by_site = {}
+    if ext_folders is None:
+        return reports_by_site                  # fail closed (see external_folders)
     for user_name, user_reports in reports_by_user.items():
         if user_name == '_summary':
             continue
@@ -1869,10 +1892,11 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
             logger.error(f"Word generation failed for {user_name}: {e}")
 
         site_id = user_site_slug or site_name.lower().replace(' ', '-')
-        if user_name in external_folders(S3_BUCKET):
+        _ext = external_folders(S3_BUCKET)
+        if _ext is None or user_name in _ext:
             # The day spans companies (a live external membership): stamping it on one
             # site's SITE# items would show another company's content there.
-            logger.info(f"  {user_name}: has_external -- not stamped on SITE# items")
+            logger.info(f"  {user_name}: has_external (or directory unreadable) -- not stamped on SITE# items")
             continue
         write_items_to_dynamodb(site_id, target_date, topics, user_name, device)
         write_report_to_dynamodb(site_id, target_date, 'daily', json_key, user_name,
@@ -2058,6 +2082,7 @@ def generate_periodic_report(report_type, start_date, end_date, user=None, trigg
                 wr = download_json_from_s3(S3_BUCKET, obj['key'])
                 if wr:
                     weekly_reports.append(wr)
+        weekly_reports = usable_weeklies(weekly_reports, external_folders(S3_BUCKET))
 
     now_iso = datetime.utcnow().isoformat() + 'Z'
     per_user_results = {}

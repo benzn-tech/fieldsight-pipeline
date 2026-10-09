@@ -33,7 +33,7 @@ def _is_missing_schema(exc):
     return isinstance(exc, (pe.UndefinedColumn, pe.UndefinedTable))
 
 
-def _exec(conn, sql, params=()):
+def _exec(conn, sql, params=(), legacy=None):
     """conn.cursor(dict_row).execute(sql, params), falling back to the pre-0085 SQL when the
     external column does not exist yet (see DEPLOY TOLERANCE)."""
     def go(q):
@@ -45,7 +45,7 @@ def _exec(conn, sql, params=()):
         with tx():
             return go(sql)
     except Exception as exc:  # noqa: BLE001
-        legacy = _legacy_sql(sql)
+        legacy = legacy if legacy is not None else _legacy_sql(sql)
         if not _is_missing_schema(exc) or legacy == sql:
             raise
         logger.warning("memberships.external missing (migration 0085 not applied yet); "

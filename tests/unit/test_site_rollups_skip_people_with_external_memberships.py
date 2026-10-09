@@ -47,3 +47,18 @@ def test_the_site_rollup_never_ingests_a_person_with_an_external_membership(capl
 def test_external_folders_reads_the_directory_flag(monkeypatch):
     monkeypatch.setattr(rg.directory, "load", lambda s3, bucket: DOC)
     assert rg.external_folders("b") == {"Eve_Ext"}
+
+
+def test_an_unreadable_directory_fails_closed(monkeypatch, caplog):
+    monkeypatch.setattr(rg.directory, "load", lambda s3, bucket: {"people": {}, "sites": {}})
+    with caplog.at_level(logging.ERROR):
+        assert rg.external_folders("b") is None
+    assert any(r.levelno == logging.ERROR for r in caplog.records)
+    by_user = {"Ann_Home": [{"user_name": "Ann_Home"}]}
+    assert rg.group_reports_by_site(by_user, {"Ann_Home": ["id-a"]}, None, "d") == {}
+    assert rg.usable_weeklies([{"user_name": "Ann_Home"}], None) == []
+
+
+def test_monthly_rollups_do_not_ingest_the_weekly_of_a_person_with_external_memberships():
+    weeklies = [{"user_name": "Ann_Home"}, {"user_name": "Eve_Ext"}]
+    assert rg.usable_weeklies(weeklies, {"Eve_Ext"}) == [{"user_name": "Ann_Home"}]

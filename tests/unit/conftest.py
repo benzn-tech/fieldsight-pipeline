@@ -35,4 +35,5 @@ def _single_company_world_defaults():
             # The session whitelist (final review F1) asks the database which sessions lie
             # on which sites; a connection double cannot answer, so: nothing restricted.
             mp.setattr(org, "_session_hider", lambda conn, caller, folder, date: None)
+            mp.setattr(org, "_may_see_siteless_of", lambda conn, caller, folder: True)
         yield

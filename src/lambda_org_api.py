@@ -11358,6 +11358,11 @@ def regenerate_session(conn, caller, session_base, event):
                                       "re-extraction", allow_recorder=True)
     if err is not None:
         return err
+    # A site-less session is the recorder's home company's: only the recorder, that company's
+    # people, or platform_admin may re-drive it (R1(b)); anyone else gets a plain 404.
+    if (not recordings.session_site_companies(conn, folder, date, session_base)
+            and not _may_see_siteless_of(conn, caller, folder)):
+        return error("not found", 404)
     out = _read_org_transcripts(date, folder, "", "", conn=conn, caller=caller)
     out = _apply_speaker_names(conn, caller, out)
     segs = out.get("speaker_segments") or []
