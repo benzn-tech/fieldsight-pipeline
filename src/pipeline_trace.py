@@ -39,6 +39,8 @@ import logging
 import os
 import uuid
 
+from lake_put import lake_put
+
 logger = logging.getLogger(__name__)
 
 VERSION = 1
@@ -140,8 +142,10 @@ def flush(s3, bucket):
     try:
         if not hasattr(s3, "put_object") and callable(s3):
             s3 = s3()
-        s3.put_object(Bucket=bucket, Key=key, Body=lines(st).encode("utf-8"),
-                      ContentType="application/x-ndjson")
+        lake_put(bucket, key, lines(st).encode("utf-8"), client=s3,
+                 owner_hint={"company_id": st.get("company_id"),
+                             "folder": st.get("user_folder")},
+                 ContentType="application/x-ndjson")
         return key
     except Exception:
         logger.warning("trace: could not write %s (%d events)", key, len(st["events"]),

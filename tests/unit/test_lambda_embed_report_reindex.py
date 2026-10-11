@@ -48,6 +48,8 @@ def test_enqueue_delete_only_for_non_work(monkeypatch):
 
     class S3:
         def put_object(self, Bucket, Key, Body, ContentType):
+            if Key.startswith("lake_manifest/"):
+                return           # lake_put's manifest line is not the request write
             import json as _j
             puts["key"] = Key; puts["body"] = _j.loads(Body)
 
