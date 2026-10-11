@@ -1,37 +1,21 @@
 """
-Lambda: sitesync-api v2.0 — Backend API for SiteSync Frontend
+Lambda: sitesync-api -- the LEGACY gateway (fieldsight-prod-api, /api/{proxy+}).
 
-Changes from v1.0:
-- ADD: Permission filtering — users only see their own data (admin sees all)
-- ADD: GET /api/transcripts — raw Transcribe text for a topic time range
-- ADD: GET /api/audio-segments — presigned URLs for VAD audio segments
-- ADD: POST /api/actions/toggle — persist action item check/uncheck to DynamoDB
-- ADD: GET /api/actions — load persisted action states
-- CHANGE: /api/timeline auto-resolves user from JWT if not specified
+Retired data routes (closed 2026-10, retire-the-legacy-gateway phase B). Each
+answers HTTP 410 {"error": "gone", "use": "<replacement>"} for every role and
+method, before any storage access. The web moved to org-api on 2026-10-07; the
+last data-route call from a browser was 2026-10-07 16:18 NZ.
 
-Routes:
-  GET  /api/health                                    → health check (no auth)
-  GET  /api/timeline?date=YYYY-MM-DD&user=Name        → daily report JSON
-  GET  /api/dates?months=2                             → dates with data
-  GET  /api/media/presigned-url?key=xxx                → S3 presigned URL
-  GET  /api/reports/history?limit=20                   → report generation history
-  POST /api/reports/generate                           → trigger report generation
-  GET  /api/users                                      → list all mapped users
-  GET  /api/transcripts?date=YYYY-MM-DD&user=Name&start=HH:MM:SS&end=HH:MM:SS
-  GET  /api/audio-segments?date=YYYY-MM-DD&user=Name&start=HH:MM:SS&end=HH:MM:SS
-  POST /api/actions/toggle                             → { date, topic_id, action_index, checked }
-  GET  /api/actions?date=YYYY-MM-DD                    → persisted action states
+Still served (proxies into ask-agent; ACL is enforced downstream by rag-search
+via caller_sub, and every proxy refuses an empty sub with 401):
+  GET  /api/health
+  POST /api/ask  /api/ask/voice  /api/ask/corroborate  /api/search
 
 Environment Variables:
-    S3_BUCKET           fieldsight-data-509194952652
-    REPORT_PREFIX       reports/
-    ITEMS_TABLE         fieldsight-items
-    REPORTS_TABLE       fieldsight-reports
-    AUDIT_TABLE         fieldsight-audit
-    USERS_TABLE         fieldsight-users
-    REPORT_FUNCTION     fieldsight-report-generator
+    S3_BUCKET           reported by /api/health only
+    ASK_AGENT_FUNCTION  fieldsight-ask-agent
+    ASK_INVOKE_TIMEOUT  seconds (default 26)
 """
-
 import os
 import json
 import logging
@@ -39,12 +23,8 @@ import re
 import boto3
 import botocore.exceptions
 from botocore.config import Config
-from datetime import datetime, timedelta
-from urllib.parse import unquote_plus
+from datetime import datetime
 
-import deletion_mirror
-import batch_cover
-import nz_time
 # Pure module, no boto3 -- safe to import eagerly. Moved out of this file
 # (2026-09-17, ask-conversation-memory Task 3) so lambda_ask_agent can share
 # the same cleaner without importing this whole handler module. Re-exported
@@ -57,7 +37,8 @@ from ask_history import (
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-s3_client = boto3.client('s3')
+# No S3 client and no DynamoDB resource: this gateway no longer touches either.
+
 lambda_client = boto3.client('lambda')
 # Task 8 review fix: this Config was originally applied to the SHARED
 # module-level `lambda_client` above, which regressed every other route that
@@ -79,20 +60,9 @@ ask_lambda_client = boto3.client('lambda', config=Config(
     connect_timeout=5,
     retries={"max_attempts": 0},
 ))
-dynamodb = boto3.resource('dynamodb')
 
 S3_BUCKET = os.environ.get('S3_BUCKET', 'fieldsight-data-509194952652')
-REPORT_PREFIX = os.environ.get('REPORT_PREFIX', 'reports/')
-ITEMS_TABLE = os.environ.get('ITEMS_TABLE', 'fieldsight-items')
-REPORTS_TABLE = os.environ.get('REPORTS_TABLE', 'fieldsight-reports')
-AUDIT_TABLE = os.environ.get('AUDIT_TABLE', 'fieldsight-audit')
-USERS_TABLE = os.environ.get('USERS_TABLE', 'fieldsight-users')
-REPORT_FUNCTION = os.environ.get('REPORT_FUNCTION', 'fieldsight-report-generator')
 ASK_AGENT_FUNCTION = os.environ.get('ASK_AGENT_FUNCTION', 'fieldsight-ask-agent')
-PRESIGNED_URL_EXPIRY = 900
-
-_user_mapping_cache = None
-_user_mapping_ts = 0
 
 
 def ok(body, status=200):
@@ -111,1178 +81,24 @@ def error(message, status=400):
     return ok({'error': message}, status)
 
 
-def _without_vendor_metadata(doc):
-    """A copy of a report/minutes JSON with `_report_metadata['model']`
-    removed, if present.
-
-    This legacy gateway serves `daily_report.json` to the customer-facing
-    site byte-for-byte (see get_timeline, find_any_report). It never serves
-    `summary_report.json` (see get_timeline). `_report_metadata.model` is an internal provenance
-    field -- it belongs in the S3 object and the debug record beside it, so
-    a bad answer can still be traced to the model that wrote it -- but it
-    must never reach a customer's browser. Strip just that one key on the
-    way out; the stored S3 object is untouched."""
-    if not isinstance(doc, dict):
-        return doc
-    meta = doc.get('_report_metadata')
-    if not isinstance(meta, dict) or 'model' not in meta:
-        return doc
-    doc = dict(doc)
-    meta = dict(meta)
-    meta.pop('model', None)
-    doc['_report_metadata'] = meta
-    return doc
-
 
 def get_caller_identity(event):
-    claims = event.get('requestContext', {}).get('authorizer', {}).get('claims', {})
+    """Who is calling, from the authorizer's claims only. No directory lookup:
+    the DynamoDB `fieldsight-users` profile and the frozen user_mapping are gone
+    with the data routes. `role` is the claim's custom:role (or '') and is used
+    for the LEGACY_CALL log line only -- nothing here grants access."""
+    claims = event.get('requestContext', {}).get('authorizer', {}).get('claims', {}) or {}
     email = claims.get('email', '')
-    name = claims.get('name', email)
-    sub = claims.get('sub', '')
-    user_info = {'sub': sub, 'email': email, 'name': name,
-                 'role': 'viewer', 'display_name': '', 'device_id': '',
-                 'sites': [], 'managed_sites': [], 'company_id': ''}
-    if sub:
-        try:
-            table = dynamodb.Table(USERS_TABLE)
-            resp = table.get_item(Key={'PK': f'USER#{sub}', 'SK': 'PROFILE'})
-            if 'Item' in resp:
-                item = resp['Item']
-                user_info['role'] = item.get('role', 'viewer')
-                user_info['display_name'] = item.get('display_name', name)
-                user_info['device_id'] = item.get('device_id', '')
-                user_info['sites'] = item.get('sites', [])
-                user_info['managed_sites'] = item.get('managed_sites', [])
-                user_info['company_id'] = item.get('company_id', '')
-        except Exception as e:
-            logger.warning(f"User lookup failed for {sub}: {e}")
-    if not user_info['display_name']:
-        mapping = load_user_mapping()
-        for dev_id, info in mapping.get('mapping', {}).items():
-            if info.get('name', '').lower() == name.lower():
-                user_info['display_name'] = info['name']
-                user_info['device_id'] = dev_id
-                user_info['role'] = info.get('role', 'worker')
-                user_info['sites'] = info.get('sites', [])
-                break
-    return user_info
+    return {'sub': claims.get('sub', ''), 'email': email,
+            'name': claims.get('name', email),
+            'role': claims.get('custom:role', '') or '',
+            'display_name': ''}
 
-def load_user_mapping():
-    global _user_mapping_cache, _user_mapping_ts
-    now = datetime.utcnow().timestamp()
-    if _user_mapping_cache and (now - _user_mapping_ts) < 300:
-        return _user_mapping_cache
-    try:
-        obj = s3_client.get_object(Bucket=S3_BUCKET, Key='config/user_mapping.json')
-        _user_mapping_cache = json.loads(obj['Body'].read().decode('utf-8'))
-        _user_mapping_ts = now
-    except Exception:
-        _user_mapping_cache = {'mapping': {}, 'sites': {}}
-    return _user_mapping_cache
 
 def resolve_user_display_name(caller):
     if caller['display_name']:
         return caller['display_name'].replace(' ', '_')
     return ''
-
-# Role hierarchy: admin/gm > pm > site_manager > worker
-MANAGEMENT_ROLES = ('admin', 'gm', 'pm', 'site_manager')
-
-def get_accessible_sites(caller):
-    """Return list of site IDs this caller can access."""
-    role = caller['role']
-    if role in ('admin', 'gm'):
-        mapping = load_user_mapping()
-        return list(mapping.get('sites', {}).keys())
-    if role == 'pm':
-        return list(caller.get('managed_sites', []))
-    if role == 'site_manager':
-        return list(caller.get('managed_sites', []) or caller.get('sites', []))
-    # worker: own sites only
-    return list(caller.get('sites', []))
-
-def get_accessible_users(caller, site_filter=None):
-    """
-    Return list of {name, device_id, role, sites} this caller can view.
-    Optionally filtered to a specific site.
-    """
-    role = caller['role']
-    mapping = load_user_mapping()
-    all_users = []
-    for dev_id, info in mapping.get('mapping', {}).items():
-        all_users.append({
-            'device_id': dev_id,
-            'name': info.get('name', dev_id),
-            'folder_name': info.get('name', dev_id).replace(' ', '_'),
-            'role': info.get('role', 'worker'),
-            'sites': info.get('sites', []),
-            'primary_site': info.get('primary_site', ''),
-        })
-
-    accessible_sites = get_accessible_sites(caller)
-
-    if role in ('admin', 'gm'):
-        result = all_users
-    elif role == 'pm':
-        result = [u for u in all_users if any(s in accessible_sites for s in u['sites'])]
-    elif role == 'site_manager':
-        # Self + workers on same site (NOT other site_managers)
-        own_name = caller.get('display_name', '')
-        result = [u for u in all_users
-                  if (u['name'] == own_name) or
-                     (u['role'] == 'worker' and any(s in accessible_sites for s in u['sites']))]
-    else:
-        # worker: self only
-        own_name = caller.get('display_name', '')
-        result = [u for u in all_users if u['name'] == own_name]
-
-    if site_filter:
-        result = [u for u in result if site_filter in u.get('sites', [])]
-
-    return result
-
-def can_access_user_data(caller, target_user_name):
-    """Check if caller can view target user's data."""
-    if caller['role'] in ('admin', 'gm'):
-        return True
-    accessible = get_accessible_users(caller)
-    target_clean = target_user_name.replace('_', ' ')
-    return any(u['name'] == target_clean or u['folder_name'] == target_user_name for u in accessible)
-
-
-def accessible_folder_scope(caller):
-    """Folder-name scope for a caller, as a THREE-STATE value.
-
-        None      -> unrestricted (admin/gm only). Apply no filter.
-        set()     -> DENY ALL. The caller can see nothing.
-        {"A","B"} -> exactly these folders.
-
-    SECURITY (2026-07-23, live prod leak): the previous idiom used an
-    empty LIST for both "unrestricted" and "nothing accessible", and every
-    consumer tested it with `if allowed_folders:` -- falsy for both, so a
-    caller with NO access took the "no filter" branch and received the
-    whole bucket. Proven live: a UC PK site_manager (Aurora-provisioned,
-    therefore absent from the DynamoDB users table -> role='viewer',
-    display_name='' -> get_accessible_users -> []) pulled 88 report keys
-    spanning every user folder in the lake.
-
-    `None` and `set()` are different values and neither is a list, so a
-    bare truthiness test on the result is an obviously wrong construct
-    that review will catch. Callers MUST branch with `is None` and handle
-    the empty set explicitly.
-
-    Note get_accessible_users' own posture is unchanged -- this is a
-    thin, honest wrapper around it, not a new policy."""
-    if caller.get('role') in ('admin', 'gm'):
-        return None
-    return {u['folder_name'] for u in get_accessible_users(caller)}
-
-
-def parse_time_to_seconds(time_str):
-    parts = time_str.replace(' ', '').split(':')
-    try:
-        h = int(parts[0])
-        m = int(parts[1]) if len(parts) > 1 else 0
-        s = int(parts[2]) if len(parts) > 2 else 0
-        return h * 3600 + m * 60 + s
-    except (ValueError, IndexError):
-        return 0
-
-# Every media read MUST widen a topic window by the same amount, or the
-# Transcript / Audio / Video tabs of ONE topic describe different moments
-# (2026-08-09 prod, via the lambda_org_api copy of these readers: topic
-# "12:07 - 12:07" read as the 12:07:15 chunk but played the 12:06:47 one).
-#
-# The buffer is not cosmetic. Aurora stores topic.time_range at MINUTE
-# precision and timeline.js parseTimeRange expands "12:07 - 12:07" to
-# start="12:07:00", end="12:07:00" -- so a topic contained in one minute
-# arrives as a ZERO-WIDTH window, and an overlap test against it admits only
-# whatever straddles that one instant. For a recorder emitting 30s chunks
-# every 28s that is reliably the PRECEDING chunk, never the topic's own.
-MEDIA_WINDOW_BUFFER_SEC = 60
-
-# Assumed span for a media file whose name carries no length. Chunk-session
-# files DO carry one (..._off{A}_to{B}_...) and are ~30s, so applying this
-# 10-minute guess to them turns a window prefilter into a no-op.
-LEGACY_MEDIA_SPAN_SEC = 600
-
-def media_window(start_time, end_time):
-    """(start_sec, end_sec) for a topic window, buffered. Absent bound -> whole day."""
-    start_sec = (parse_time_to_seconds(start_time) - MEDIA_WINDOW_BUFFER_SEC
-                 if start_time else 0)
-    end_sec = (parse_time_to_seconds(end_time) + MEDIA_WINDOW_BUFFER_SEC
-               if end_time else 86400)
-    return max(0, start_sec), end_sec
-
-def transcript_file_end_sec(filename, file_time_sec):
-    """Absolute end of one transcript file, for the per-file window prefilter."""
-    m = re.search(r'_off([\d.]+)_to([\d.]+)', filename)
-    if m:
-        return file_time_sec + (float(m.group(2)) - float(m.group(1)))
-    return file_time_sec + LEGACY_MEDIA_SPAN_SEC
-
-def extract_time_seconds_from_filename(filename):
-    # Match time part after YYYY-MM-DD_ pattern: Benl1_2026-02-09_09-56-40_off...
-    off_match = re.search(r'_off([\d.]+)_to', filename)
-    base_match = re.search(r'\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})', filename)
-    if off_match and base_match:
-        h, m, s = int(base_match.group(1)), int(base_match.group(2)), int(base_match.group(3))
-        return h * 3600 + m * 60 + s + int(float(off_match.group(1)))
-    if base_match:
-        return int(base_match.group(1)) * 3600 + int(base_match.group(2)) * 60 + int(base_match.group(3))
-    return None
-
-
-# ── GET /api/timeline ────────────────────────────────────────
-
-# ── Deleted recordings ───────────────────────────────────────
-#
-# This gateway is the LEGACY one and it is still live -- 44 invocations in the 24h before
-# this was written. Every content endpoint below lists S3 objects directly and none of them
-# knew anything about the customer-facing delete, so a recording the customer removed was
-# still readable here: its transcripts, its audio, its video, a presigned URL for any of
-# them, and the pre-deletion daily_report served byte for byte.
-#
-# Nothing had CALLED those endpoints recently -- the live traffic is /api/actions, which
-# returns only check-off state and no content -- so this was reachable rather than actively
-# leaking. Reachable is enough: the promise made to the customer was that it is gone.
-#
-# The mirror, not the database: this lambda has no Aurora connection, exactly like the
-# report generator and the ask agent, and `redactions/{folder}/{date}/deleted_sessions.json`
-# is the copy of the answer written for readers in that position.
-#
-# `search`/`ask` need nothing here -- they PROXY to the ask agent and rag-search, which
-# filter on their own side.
-
-def _deleted_bases(user_folder, date):
-    """Deleted session ids for one (folder, date), or an empty set."""
-    if not user_folder or not date:
-        return set()
-    try:
-        return deletion_mirror.deleted_sessions(s3_client, S3_BUCKET, user_folder, date)
-    except Exception:
-        # Fails OPEN and LOUD, like every guard on this path: an unreadable mirror must not
-        # take the timeline down for everyone. It must not pass silently either -- "nothing
-        # was deleted" and "could not check" are indistinguishable afterwards.
-        logger.exception("deletion mirror unreadable for %s/%s -- serving unfiltered",
-                         user_folder, date)
-        return set()
-
-
-def _drop_deleted_keys(keys, bases):
-    """The subset of `keys` not belonging to a deleted session.
-
-    Substring match, because the session id sits INSIDE the filename
-    (`..._sid{32hex}_c0001.json`) rather than being a path component -- the same rule as
-    deletion_mirror.drop_deleted, deliberately."""
-    if not bases:
-        return list(keys)
-    return [k for k in keys if not any(b in k for b in bases)]
-
-
-def _presign_key_is_deleted(s3_key):
-    """Does this exact object belong to a recording the customer deleted?
-
-    The (folder, date) has to come out of the key itself, because presign takes only a key.
-    Four shapes carry both, and `reports/` puts them the other way round -- getting that
-    order wrong reads the DATE as the folder and every lookup silently misses.
-
-    Unparseable shapes return False: this endpoint already fails closed on ownership just
-    above, so an unknown shape is refused there rather than here, and guessing would only
-    add a second wrong answer.
-    """
-    parts = (s3_key or "").split("/")
-    # reports/{date}/summary_report.json is only THREE segments, so the length check below
-    # skipped it. get_presigned_url now refuses that key outright, before this runs; the
-    # branch stays as defence in depth for any other three-segment reports/{date}/x key.
-    if len(parts) == 3 and parts[0] == "reports" and re.match(r"^\d{4}-\d{2}-\d{2}$",
-                                                              parts[1] or ""):
-        return _any_folder_deleted_on(parts[1])
-    if len(parts) < 4:
-        return False
-    top = parts[0]
-    if top in ("users", "audio_segments", "transcripts", "web_video"):
-        folder, date = parts[1], parts[2]
-        if top == "users":                       # users/{folder}/{kind}/{date}/...
-            if len(parts) < 5:
-                return False
-            folder, date = parts[1], parts[3]
-    elif top == "reports":                       # reports/{date}/{folder}/...
-        date, folder = parts[1], parts[2]
-    else:
-        return False
-    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date or ""):
-        return False
-    bases = _deleted_bases(folder, date)
-    if top == "reports":
-        # A day report is a SYNTHESIS of the day, so its key carries no session base and the
-        # `base in key` test below can never fire for it -- the check above caught the
-        # cross-folder `summary_report.json` and signed the per-folder `daily_report.json`
-        # that actually holds the words. Measured on prod 2026-08-31:
-        # reports/2026-08-14/Ben_UCPK2/daily_report.json still names the session deleted on
-        # 2026-08-16 and still presigns, seventeen days later. The object's LastModified is
-        # unchanged since it was written, so the nightly rebuild does not revisit past days
-        # and the exposure is permanent rather than the one-night window it looks like.
-        #
-        # ANY deletion that day hides the whole document, which is what `lambda_ask_agent`
-        # already does with the same objects ("has deleted recordings -- not serving a
-        # stored report"). There is no per-session granularity inside a day report to filter
-        # on, and the alternative to refusing it is serving it.
-        return bool(bases)
-    return bool(bases) and any(b in s3_key for b in bases)
-
-
-
-def _any_folder_deleted_on(date):
-    """Does ANY folder have a deletion on this date?
-
-    `summary_report.json` is built across every folder at once, so one person's deleted
-    session is inside a document everyone else's admin can read. There is no per-folder
-    granularity to filter, so the aggregate is simply not served on such a day and the
-    caller takes the per-folder path instead.
-
-    Listing `redactions/` is the cheapest possible question -- the prefix exists only for
-    days that HAVE a deletion, so on a normal day this is one empty list call.
-    """
-    try:
-        paginator = s3_client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix="redactions/"):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if f"/{date}/" not in key:
-                    continue
-                # The KEY existing is not the question -- undelete rewrites the document
-                # with the remaining sessions and writes an EMPTY one when none are left,
-                # rather than removing the object. Answering on key presence alone would
-                # make a fully-reverted day look deleted forever, and the lake-wide
-                # aggregate would never be served again. Ask what is inside.
-                folder = key.split("/")[1] if len(key.split("/")) > 2 else None
-                if folder and deletion_mirror.deleted_sessions(
-                        s3_client, S3_BUCKET, folder, date):
-                    return True
-    except Exception:
-        logger.exception("could not list redactions/ for %s -- serving unfiltered", date)
-    return False
-
-
-
-def get_timeline(params, caller):
-    date = params.get('date', '')
-    user = params.get('user', '')
-    if not date:
-        # Yesterday in NZ. The offset is +12 for half the year, so the +13
-        # literal that was here answered with the wrong day for an hour every
-        # day between April and late September.
-        date = (nz_time.nz_now() - timedelta(days=1)).strftime('%Y-%m-%d')
-    if not re.match(r'^\d{4}-\d{2}-\d{2}$', date):
-        return error('Invalid date')
-
-    role = caller['role']
-
-    # Worker: forced to own data
-    if role == 'worker':
-        user = resolve_user_display_name(caller)
-        if not user:
-            return error('No device mapping for your account', 403)
-    # Management roles: if user specified, check permission
-    elif user:
-        if not can_access_user_data(caller, user):
-            return error('Access denied to this user', 403)
-    # Management with no user: first available report
-    elif not user:
-        if role in ('admin', 'gm'):
-            # NEVER read reports/{date}/summary_report.json here. It is built across EVERY
-            # tenant's daily reports, and this gateway has no company concept (roles come
-            # from DynamoDB, max admin/gm), so it cannot scope that document to the caller's
-            # company or tell a customer's admin from the operator. org-api serves it to
-            # platform_admin only. Per-folder reports go through find_any_report instead.
-            return find_any_report(date, caller)
-        else:
-            # PM/site_manager with no user → own data first
-            user = resolve_user_display_name(caller)
-            if not user:
-                return find_any_report(date, caller)
-
-    user_folder = user.replace(' ', '_')
-    # A day whose sources were DELETED must not fall through to the pre-rendered doc.
-    # `daily_report.json` was written BEFORE the delete and carries the removed session's
-    # words byte for byte -- filtering the database and then serving the artifact rendered
-    # from it is not a deletion. Same rule, and the same 404, as org-api's timeline.
-    if _deleted_bases(user_folder, date) or _deleted_bases(user, date):
-        logger.info("timeline: %s/%s has deleted recordings -- not serving the stored "
-                    "report", user_folder, date)
-        return ok({'message': f'No report for {user} on {date}', 'date': date}, 404)
-    for name_variant in [user_folder, user]:
-        key = f"{REPORT_PREFIX}{date}/{name_variant}/daily_report.json"
-        try:
-            obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
-            return ok(_without_vendor_metadata(json.loads(obj['Body'].read().decode('utf-8'))))
-        except s3_client.exceptions.NoSuchKey:
-            continue
-    return ok({'message': f'No report for {user} on {date}', 'date': date}, 404)
-
-def find_any_report(date, caller=None):
-    prefix = f"{REPORT_PREFIX}{date}/"
-    reports = []
-    # SECURITY: same three-state scope as get_report_history. `None` here
-    # means BOTH "no caller supplied" (dead today -- both call sites in
-    # get_timeline pass one) and "admin/gm"; an empty set is deny-all and
-    # short-circuits below. Previously `if accessible:` conflated deny-all
-    # with unrestricted, and unlike get_report_history this function can
-    # return a full report BODY when exactly one key survives the filter.
-    folder_scope = accessible_folder_scope(caller) if caller else None
-    if caller and folder_scope is None:
-        # NO SILENT WIDENING. accessible_folder_scope returns None
-        # ("unrestricted") for admin/gm, but the code this replaced ran
-        # `accessible = get_accessible_users(caller)` for EVERY role --
-        # and for an admin that returns the whole config/user_mapping.json
-        # roster, a NON-empty list, so `if accessible:` was true and the
-        # filter DID run: a folder absent from the mapping (e.g. an
-        # Aurora-provisioned Ben_UCPK) was dropped and the caller got the
-        # 404 envelope. Handing admin/gm a bare None here would widen that
-        # to a 200 carrying the full report BODY -- unacceptable in a PR
-        # whose entire purpose is to narrow. Admin/gm therefore keep the
-        # mapping-derived allowlist, exactly as before.
-        #
-        # Deliberately LOCAL to find_any_report: get_report_history and
-        # get_presigned_url already treated admin/gm as unrestricted
-        # before this branch and must stay byte-identical.
-        mapped = {u['folder_name'] for u in get_accessible_users(caller)}
-        # Empty-mapping edge: load_user_mapping falls back to
-        # {'mapping': {}} whenever the S3 read of config/user_mapping.json
-        # fails, so an admin's derived set can be empty for reasons that
-        # have nothing to do with authorisation. Failing that closed would
-        # be a brand-new availability regression triggered by an unrelated
-        # S3 hiccup, and it is not what the old code did either (an empty
-        # list is falsy -> no filter ran). Fall back to None: identical to
-        # the pre-branch behaviour, and not a fail-open, because admin/gm
-        # are unrestricted in every sibling reader here anyway. Scoped
-        # callers are untouched -- for them an empty set stays deny-all.
-        folder_scope = mapped or None
-    if folder_scope is not None and not folder_scope:
-        return ok({'message': f'No reports for {date}', 'date': date}, 404)
-    try:
-        resp = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
-        for obj in resp.get('Contents', []):
-            key = obj['Key']
-            if key.endswith('/daily_report.json') and '_debug' not in key:
-                parts = key.replace(prefix, '').split('/')
-                if len(parts) >= 2:
-                    user_name = parts[0]
-                    # A day whose sources were deleted must not fall through to the
-                    # pre-rendered doc. `daily_report.json` was written BEFORE the delete
-                    # and holds the removed session's words byte for byte -- filtering
-                    # elsewhere and serving the artifact rendered from it is not a
-                    # deletion. Same rule, and the same 404, as the org-api path.
-                    if _deleted_bases(user_name, date):
-                        logger.info("timeline: %s/%s has deleted recordings -- not serving "
-                                    "the stored report", user_name, date)
-                        continue
-                    # Filter by permission. Deliberate narrowing: the old
-                    # predicate also matched the SPACED display name
-                    # (u['name']) against what is always an S3 path
-                    # segment, i.e. the folder form -- that could only
-                    # ever match for a single-word name, where both forms
-                    # are identical. No real caller loses access.
-                    if folder_scope is not None and user_name not in folder_scope:
-                        continue
-                    reports.append({'user': user_name, 'key': key})
-    except Exception:
-        pass
-    if not reports:
-        return ok({'message': f'No reports for {date}', 'date': date}, 404)
-    if len(reports) == 1:
-        try:
-            obj = s3_client.get_object(Bucket=S3_BUCKET, Key=reports[0]['key'])
-            return ok(_without_vendor_metadata(json.loads(obj['Body'].read().decode('utf-8'))))
-        except Exception:
-            pass
-    return ok({'date': date, 'available_users': [r['user'] for r in reports]})
-
-
-# ── GET /api/dates ───────────────────────────────────────────
-
-def get_dates(params, caller):
-    months = int(params.get('months', '2'))
-    site = params.get('site', '')
-    start_date = nz_time.nz_now() - timedelta(days=months * 30)
-    
-    role = caller['role']
-    user_param = params.get('user', '')
-    # SECURITY: three-state scope, same discipline as
-    # get_report_history/find_any_report/accessible_folder_scope. None =
-    # unrestricted (admin/gm with no ?site and no ?user); a list is an
-    # allowlist. Previously the admin/gm "no filter" case used
-    # `user_folders = []`, and `?site=` with no accessible users on that
-    # site ALSO produced `[]` -- `if user_folders:` (below) is falsy for
-    # both, so a scoped caller with nobody accessible on ?site= took the
-    # "no filter" branch: every date was marked hasReport=True and
-    # enriched from the UNSCOPED summary_report.json, leaking
-    # company-wide topic/safety counts per day.
-    if user_param and can_access_user_data(caller, user_param):
-        # Explicit ?user= wins: the timeline date-picker asks for one user's
-        # dates so its dots match the per-user report fetch. Without this the
-        # admin path below marks a dot whenever ANY user has a report that
-        # day — dotted dates with no content for the selected user.
-        user_folders = [user_param]
-    elif role == 'worker':
-        user_folders = [resolve_user_display_name(caller)]
-    elif site:
-        # Filter to specific site's users
-        users = get_accessible_users(caller, site_filter=site)
-        user_folders = [u['folder_name'] for u in users]
-    elif role in ('admin', 'gm'):
-        user_folders = None  # unrestricted -- no filter
-    else:
-        user_folders = [resolve_user_display_name(caller)]
-
-    # Deny-all: an empty list, OR a list of only-blank folder names (the
-    # unmapped-caller shape -- resolve_user_display_name returns '' when
-    # display_name is blank, and [''] is TRUTHY, which is why the old code
-    # failed closed here only by accident rather than by design). Made
-    # explicit so a future edit can't silently turn this back into a leak.
-    if user_folders is not None and not any(user_folders):
-        return ok({'dates': {}})
-
-    dates = {}
-    try:
-        paginator = s3_client.get_paginator('list_objects_v2')
-        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=REPORT_PREFIX, Delimiter='/'):
-            for cp in page.get('CommonPrefixes', []):
-                ds = cp['Prefix'].replace(REPORT_PREFIX, '').strip('/')
-                if re.match(r'^\d{4}-\d{2}-\d{2}$', ds):
-                    try:
-                        d = datetime.strptime(ds, '%Y-%m-%d')
-                        if d >= start_date:
-                            if user_folders is not None:
-                                # Check if any accessible user has a report
-                                for uf in user_folders:
-                                    try:
-                                        s3_client.head_object(Bucket=S3_BUCKET, Key=f"{REPORT_PREFIX}{ds}/{uf}/daily_report.json")
-                                        dates[ds] = {'hasReport': True, 'topics': 0, 'safety': 0}
-                                        break
-                                    except:
-                                        pass
-                            else:
-                                dates[ds] = {'hasReport': True, 'topics': 0, 'safety': 0}
-                    except ValueError:
-                        pass
-    except Exception as e:
-        logger.error(f"Error scanning dates: {e}")
-    # Enrich with topic counts from the accessible users' own daily reports
-    for ds in list(dates.keys()):
-        try:
-            loaded = False
-            if user_folders is not None:
-                for uf in user_folders:
-                    # Same rule as the timeline: `daily_report.json` was written BEFORE the
-                    # delete, so the topic and safety COUNTS derived from it still count the
-                    # removed session. The date picker would show a dot with a nonzero
-                    # count for a day the timeline now 404s -- an inconsistency, and a
-                    # small aggregate leak of content the customer removed.
-                    if _deleted_bases(uf, ds):
-                        continue
-                    try:
-                        obj = s3_client.get_object(Bucket=S3_BUCKET, Key=f"{REPORT_PREFIX}{ds}/{uf}/daily_report.json")
-                        report = json.loads(obj['Body'].read().decode('utf-8'))
-                        topics = report.get('topics', [])
-                        if isinstance(topics, list):
-                            dates[ds]['topics'] = max(dates[ds].get('topics', 0), len(topics))
-                            dates[ds]['safety'] = max(dates[ds].get('safety', 0),
-                                sum(1 for t in topics if t.get('category','').lower()=='safety' or t.get('safety_flags',[])))
-                        loaded = True
-                    except:
-                        pass
-            # No fallback to reports/{date}/summary_report.json when nothing was loaded:
-            # it is built across every tenant and this gateway cannot scope it by company
-            # (org-api serves it to platform_admin only). Such a date keeps its existing counts.
-        except Exception:
-            pass
-    return ok({'dates': dates})
-
-
-# ── GET /api/media/presigned-url ─────────────────────────────
-
-def get_presigned_url(params, caller=None):
-    s3_key = unquote_plus(params.get('key', ''))
-    if not s3_key:
-        return error('Missing key')
-    # 2026-09-20: 'transcripts/' deliberately removed. The raw JSON at that
-    # prefix is the ASR vendor's own output shape -- for AWS Transcribe it is
-    # literally {"jobName", "accountId" (our real AWS account number),
-    # "status", "results": {...}}, and ElevenLabs' adapted shape omits those
-    # keys entirely, so which fields are present names the vendor even with
-    # no vendor string anywhere in the bytes. Nothing customer-facing ever
-    # requested this prefix (scripts/api/media.js's comment listed it, but no
-    # caller built a transcripts/ key) -- the reshaped GET /api/transcripts
-    # already serves everything the transcript viewer reads. Closing the
-    # door here rather than trying to redact a presigned URL, which points
-    # straight at S3 and cannot be selectively rewritten.
-    allowed = ['users/', 'audio_segments/', 'reports/', 'web_video/']
-    if not any(s3_key.startswith(p) for p in allowed):
-        return error('Access denied', 403)
-
-    # Permission check: derive the owning user folder from the key and
-    # verify the caller can reach it.
-    #
-    # SECURITY (2026-07-23): this block used to leave target_user = None
-    # for any key shape it could not parse -- and `if target_user and not
-    # can_access_user_data(...)` then short-circuited, issuing a presigned
-    # URL with NO check at all. reports/{date}/summary_report.json (length
-    # 3, so the old `len(key_parts) > 3` guard was False) and
-    # reports/{date}/sites/... ('sites' explicitly excluded) both took that
-    # path: 36 real objects on prod, each a full report body. An
-    # undeterminable owner is now a DENY for every non-admin/gm caller.
-    #
-    # The `not caller` leg closes the second half of the same shape: the
-    # guard used to read `if caller and ...`, so an ABSENT identity skipped
-    # the whole block and was served a signed URL unchecked -- "no identity
-    # == unrestricted", precisely what this branch exists to abolish.
-    # Unreachable from lambda_handler today (it always passes a dict), but
-    # the default `caller=None` in the signature keeps the door ajar.
-    # reports/{date}/summary_report.* is built across EVERY tenant's reports and this
-    # gateway cannot scope it by company, so it is never signed -- for any role, admin/gm
-    # included (org-api serves it to platform_admin only). Before the role branch on purpose.
-    # Every variant, not just .json: the generator writes summary_report.docx beside it with
-    # the same content (get_report_history lists it as `docx_key`), and
-    # summary_report_debug.json -- no per-user filename starts with `summary_report`.
-    _segs = s3_key.split('/')
-    if _segs[0] == 'reports' and _segs[-1].startswith('summary_report'):
-        logger.info("presign denied: lake-wide summary key=%s", s3_key)
-        return error('Access denied', 403)
-
-    if not caller or caller.get('role') not in ('admin', 'gm'):
-        # Extract user folder name from common path patterns:
-        #   users/{name}/...  audio_segments/{name}/...  transcripts/{name}/...
-        #   reports/{date}/{name}/...  web_video/{name}/...
-        key_parts = s3_key.split('/')
-        target_user = None
-        if len(key_parts) >= 2 and key_parts[0] in ('users', 'audio_segments', 'transcripts', 'web_video'):
-            target_user = key_parts[1] or None
-        elif key_parts[0] == 'reports' and len(key_parts) > 3:
-            # reports/{date}/{user}/... — 'sites' is a rollup namespace,
-            # not a user folder; 'summary_report.json' can't appear at this
-            # position today (it lives at length 3) but is kept in the
-            # guard so a future reports/{date}/summary_report.json/... shape
-            # can't sneak through as an owner name.
-            candidate = key_parts[2]
-            if candidate and candidate not in ('summary_report.json', 'sites'):
-                target_user = candidate
-
-        if target_user is None:
-            # FAIL CLOSED. Company/site-level rollups have no owner folder
-            # to check, so a scoped caller cannot be authorised for them by
-            # this endpoint. Serving them to genuine site/company members is
-            # desirable but needs a real membership check this legacy lambda
-            # cannot perform (no Aurora connection; its identity store is the
-            # same DynamoDB table that does not contain these users at all).
-            # That belongs on org-api.
-            logger.info("presign denied: no derivable owner for key=%s role=%s",
-                        s3_key, caller.get('role') if caller else None)
-            return error('Access denied to this media', 403)
-        # `not caller` first: with no identity there is nothing to
-        # authorise against, and can_access_user_data would dereference
-        # caller['role'] and raise.
-        if not caller or not can_access_user_data(caller, target_user):
-            return error('Access denied to this user\'s media', 403)
-    # A deleted recording's media must not be re-signed, for ANY caller -- including the
-    # admin/gm branch above, which skips the ownership check entirely. 404, not 403: an
-    # access-denied confirms the object exists, and the same choice was made on org-api.
-    if _presign_key_is_deleted(s3_key):
-        logger.info("presign refused: %s belongs to a deleted recording", s3_key)
-        return error('Not found', 404)
-    try:
-        url = s3_client.generate_presigned_url('get_object', Params={'Bucket': S3_BUCKET, 'Key': s3_key}, ExpiresIn=PRESIGNED_URL_EXPIRY)
-        return ok({'url': url, 'expires_in': PRESIGNED_URL_EXPIRY})
-    except Exception as e:
-        return error(f'Failed: {e}', 500)
-
-
-# ── GET /api/transcripts ────────────────────────────────────
-
-def get_transcripts(params, caller):
-    date = params.get('date', '')
-    user = params.get('user', '')
-    start_time = params.get('start', '')
-    end_time = params.get('end', '')
-    if not date:
-        return error('Missing date')
-    if caller['role'] == 'worker':
-        user = resolve_user_display_name(caller)
-    elif user and not can_access_user_data(caller, user):
-        return error('Access denied', 403)
-    elif not user:
-        user = resolve_user_display_name(caller)
-    if not user:
-        return error('Missing user')
-    user_folder = user.replace(' ', '_')
-    start_sec, end_sec = media_window(start_time, end_time)
-    # Both folder spellings, because the prefixes below try both and filtering only one
-    # would hide the recording for some users and not others -- indistinguishable from
-    # working.
-    deleted = _deleted_bases(user_folder, date) | _deleted_bases(user, date)
-
-    transcript_files = []
-    # Try date subfolder first, then flat folder filtered by date
-    search_prefixes = [
-        (f"transcripts/{user_folder}/{date}/", False),
-        (f"transcripts/{user}/{date}/", False),
-        (f"transcripts/{user_folder}/", True),   # flat folder, filter by date
-        (f"transcripts/{user}/", True),
-    ]
-    for prefix, needs_date_filter in search_prefixes:
-        try:
-            paginator = s3_client.get_paginator('list_objects_v2')
-            for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
-                for obj in page.get('Contents', []):
-                    key = obj['Key']
-                    if not key.endswith('.json'):
-                        continue
-                    if deleted and any(b in key for b in deleted):
-                        continue          # a recording the customer deleted
-                    # Skip if this is inside a subfolder and we're searching flat
-                    parts = key.replace(prefix, '').split('/')
-                    if needs_date_filter and len(parts) > 1:
-                        continue  # this is in a date subfolder, skip
-                    if needs_date_filter:
-                        # Only include files matching target date in filename
-                        if date not in key:
-                            continue
-                    transcript_files.append(key)
-        except Exception:
-            pass
-        if transcript_files:
-            break
-
-    if not transcript_files:
-        return ok({'text': '', 'segments': [], 'speaker_segments': [], 'message': 'No transcripts found'})
-
-    all_speaker_segs = []
-    segments = []
-    for key in sorted(transcript_files):
-        filename = key.split('/')[-1]
-        file_time_sec = extract_time_seconds_from_filename(filename)
-        if file_time_sec is None:
-            continue
-        file_end_sec = transcript_file_end_sec(filename, file_time_sec)
-        if file_end_sec < start_sec or file_time_sec > end_sec:
-            continue
-        try:
-            obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
-            data = json.loads(obj['Body'].read().decode('utf-8'))
-            results = data.get('results', {})
-            full_text = results.get('transcripts', [{}])[0].get('transcript', '')
-            
-            # Speaker-segmented audio_segments from Transcribe
-            audio_segs = results.get('audio_segments', [])
-            for aseg in audio_segs:
-                seg_start = float(aseg.get('start_time', 0))
-                seg_end = float(aseg.get('end_time', 0))
-                abs_start = file_time_sec + seg_start
-                abs_end = file_time_sec + seg_end
-                
-                # Filter to topic time range
-                if abs_end < start_sec or abs_start > end_sec:
-                    continue
-                
-                speaker = aseg.get('speaker_label', 'spk_0')
-                text = aseg.get('transcript', '')
-                if not text.strip():
-                    continue
-                
-                ah, am, asec_v = int(abs_start)//3600, (int(abs_start)%3600)//60, int(abs_start)%60
-                all_speaker_segs.append({
-                    'speaker': speaker,
-                    'text': text,
-                    'start': round(abs_start, 1),
-                    'end': round(abs_end, 1),
-                    'time_label': f"{ah:02d}:{am:02d}:{asec_v:02d}",
-                    'duration': round(seg_end - seg_start, 1),
-                })
-            
-            # Word-level filtered text
-            items = results.get('items', [])
-            in_range_words = []
-            total_words = 0
-            for item in items:
-                if item.get('type') != 'pronunciation':
-                    continue
-                total_words += 1
-                word_start = float(item.get('start_time', 0))
-                abs_ws = file_time_sec + word_start
-                if start_sec <= abs_ws <= end_sec:
-                    in_range_words.append(item.get('alternatives', [{}])[0].get('content', ''))
-            
-            h, m, s = file_time_sec // 3600, (file_time_sec % 3600) // 60, file_time_sec % 60
-            segments.append({
-                'time': f"{h:02d}:{m:02d}:{s:02d}",
-                'time_seconds': file_time_sec,
-                'text': full_text,
-                'filtered_text': ' '.join(in_range_words),
-                'filename': filename,
-                'word_count': total_words,
-                'in_range_count': len(in_range_words),
-                'speaker_segment_count': len([s for s in all_speaker_segs if s.get('start', 0) >= file_time_sec]),
-            })
-        except Exception as e:
-            logger.warning(f"Failed to load {key}: {e}")
-
-    all_speaker_segs.sort(key=lambda s: s['start'])
-    filtered_full = ' '.join(s['text'] for s in all_speaker_segs)
-    
-    # Count unique speakers
-    speakers = list(set(s['speaker'] for s in all_speaker_segs))
-    speakers.sort()
-    
-    return ok({
-        'text': filtered_full,
-        'filtered_text': filtered_full,
-        'segments': segments,
-        'speaker_segments': all_speaker_segs,
-        'speakers': speakers,
-        'count': len(segments),
-        'speaker_count': len(speakers),
-        'total_speaker_segments': len(all_speaker_segs),
-    })
-
-
-# ── GET /api/audio-segments ──────────────────────────────────
-
-def get_audio_segments(params, caller):
-    date = params.get('date', '')
-    user = params.get('user', '')
-    topic_start = params.get('start', '')
-    topic_end = params.get('end', '')
-    if not date:
-        return error('Missing date')
-    if caller['role'] == 'worker':
-        user = resolve_user_display_name(caller)
-    elif user and not can_access_user_data(caller, user):
-        return error('Access denied', 403)
-    elif not user:
-        user = resolve_user_display_name(caller)
-    if not user:
-        return error('Missing user')
-    user_folder = user.replace(' ', '_')
-    start_sec, end_sec = media_window(topic_start, topic_end)
-
-    prefix = f"audio_segments/{user_folder}/{date}/"
-    deleted = _deleted_bases(user_folder, date)
-    kept = []
-    try:
-        resp = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
-        for obj in resp.get('Contents', []):
-            key = obj['Key']
-            if not key.endswith('.wav'):
-                continue
-            if deleted and any(b in key for b in deleted):
-                continue              # a recording the customer deleted
-            filename = key.split('/')[-1]
-            # Base time then offset, matched SEPARATELY -- a chunk-session segment
-            # keeps sid/chunk tokens BETWEEN them (..._HH-MM-SS_sid{hex}_c{NNNN}_off...),
-            # so anchoring the time on a trailing "_off" (the old whole-file shape)
-            # skipped every chunk segment and left the Audio tab empty.
-            base_match = re.search(r'\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})', filename)
-            off_match = re.search(r'_off([\d.]+)_to([\d.]+)', filename)
-            if not base_match or not off_match:
-                continue
-            h, m, s = int(base_match.group(1)), int(base_match.group(2)), int(base_match.group(3))
-            base_sec = h * 3600 + m * 60 + s
-            abs_start = base_sec + float(off_match.group(1))
-            abs_end = base_sec + float(off_match.group(2))
-            if abs_end < start_sec or abs_start > end_sec:
-                continue
-            kept.append((key, filename, abs_start, abs_end))
-    except Exception as e:
-        logger.error(f"Error listing audio segments: {e}")
-    segments = []
-    try:
-        # Same rule as org-api's _read_org_audio_segments: a chunk named in the map of a
-        # batch in this result is the same speech as that batch -- drop it. Members come
-        # from the map, never the filename; an unreadable map hides nothing.
-        covered = batch_cover.covered_chunk_keys(
-            lambda k: s3_client.get_object(Bucket=S3_BUCKET, Key=k)['Body'].read(),
-            [k for k, _f, _s, _e in kept])
-        for key, filename, abs_start, abs_end in kept:
-            if key in covered:
-                continue
-            url = s3_client.generate_presigned_url('get_object', Params={'Bucket': S3_BUCKET, 'Key': key}, ExpiresIn=PRESIGNED_URL_EXPIRY)
-            ah, am, asec = int(abs_start)//3600, (int(abs_start)%3600)//60, int(abs_start)%60
-            segments.append({
-                'url': url, 'filename': filename,
-                'absolute_start': abs_start, 'absolute_end': abs_end,
-                'duration': round(abs_end - abs_start, 1),
-                'time_label': f"{ah:02d}:{am:02d}:{asec:02d}",
-            })
-    except Exception as e:
-        logger.error(f"Error listing audio segments: {e}")
-    segments.sort(key=lambda s: s['absolute_start'])
-    return ok({'segments': segments, 'count': len(segments)})
-
-
-# ── POST /api/actions/toggle + GET /api/actions ──────────────
-
-def toggle_action(body, caller):
-    date = body.get('date', '')
-    topic_id = body.get('topic_id', 0)
-    action_index = body.get('action_index', 0)
-    is_checked = body.get('checked', True)
-    action_text = body.get('action_text', '')
-    if not date:
-        return error('Missing date')
-    user_name = caller.get('display_name') or caller.get('name') or caller.get('email')
-    now = datetime.utcnow().isoformat() + 'Z'
-    table = dynamodb.Table(AUDIT_TABLE)
-    
-    # Current state key
-    pk = f"ACTIONS#{date}"
-    sk = f"TOPIC#{topic_id}#ACTION#{action_index}"
-    
-    # Audit log entry (append-only, never deleted)
-    audit_pk = f"AUDIT#{date}"
-    audit_sk = f"{now}#ACTION#{topic_id}#{action_index}"
-    
-    try:
-        # Write/update current state
-        if is_checked:
-            table.put_item(Item={'PK': pk, 'SK': sk, 'action_text': action_text,
-                                  'checked': True, 'checked_by': user_name, 'checked_at': now})
-        else:
-            table.put_item(Item={'PK': pk, 'SK': sk, 'action_text': action_text,
-                                  'checked': False, 'unchecked_by': user_name, 'unchecked_at': now})
-        
-        # Append audit log (immutable history)
-        table.put_item(Item={
-            'PK': audit_pk, 'SK': audit_sk,
-            'action': 'check' if is_checked else 'uncheck',
-            'topic_id': topic_id, 'action_index': action_index,
-            'action_text': action_text,
-            'user': user_name, 'timestamp': now,
-        })
-        
-        return ok({'message': 'Updated', 'checked': is_checked})
-    except Exception as e:
-        return error(f'Failed: {e}', 500)
-
-def get_actions(params, caller):
-    date = params.get('date', '')
-    if not date:
-        return error('Missing date')
-    table = dynamodb.Table(AUDIT_TABLE)
-    try:
-        resp = table.query(KeyConditionExpression='PK = :pk', ExpressionAttributeValues={':pk': f"ACTIONS#{date}"})
-        actions = {}
-        for item in resp.get('Items', []):
-            parts = item.get('SK', '').split('#')
-            if len(parts) >= 4:
-                actions[f"{parts[1]}_{parts[3]}"] = {
-                    'checked': item.get('checked', False),
-                    'checked_by': str(item.get('checked_by', '')),
-                    'checked_at': str(item.get('checked_at', '')),
-                }
-        return ok({'actions': actions, 'date': date})
-    except Exception as e:
-        return error(f'Failed: {e}', 500)
-
-
-# ── GET /api/video-segments ──────────────────────────────────
-
-def get_video_segments(params, caller):
-    """Find video files covering a time range, prefer H264 web preview."""
-    date = params.get('date', '')
-    user = params.get('user', '')
-    topic_start = params.get('start', '')
-    topic_end = params.get('end', '')
-    if not date:
-        return error('Missing date')
-    if caller['role'] == 'worker':
-        user = resolve_user_display_name(caller)
-    elif user and not can_access_user_data(caller, user):
-        return error('Access denied', 403)
-    elif not user:
-        user = resolve_user_display_name(caller)
-    if not user:
-        return error('Missing user')
-    user_folder = user.replace(' ', '_')
-    start_sec, end_sec = media_window(topic_start, topic_end)
-    # offset_sec is a SEEK HINT, not a filter -- it must land on the topic
-    # itself, so it is measured from the unbuffered start.
-    seek_from_sec = parse_time_to_seconds(topic_start) if topic_start else 0
-
-    deleted = _deleted_bases(user_folder, date) | _deleted_bases(user, date)
-    videos = []
-    for name_variant in [user_folder, user]:
-        # First check web_video/ (H264 preview)
-        for prefix_template in [f"web_video/{name_variant}/{date}/", f"users/{name_variant}/video/{date}/"]:
-            is_preview = prefix_template.startswith('web_video/')
-            try:
-                resp = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix_template)
-                for obj in resp.get('Contents', []):
-                    key = obj['Key']
-                    if not any(key.lower().endswith(e) for e in ['.mp4','.webm','.mov']):
-                        continue
-                    if deleted and any(b in key for b in deleted):
-                        continue          # a recording the customer deleted
-                    filename = key.split('/')[-1]
-                    time_match = re.search(r'\d{4}-\d{2}-\d{2}_(\d{2})-(\d{2})-(\d{2})', filename)
-                    if not time_match:
-                        continue
-                    h, m, s = int(time_match.group(1)), int(time_match.group(2)), int(time_match.group(3))
-                    vid_start = h * 3600 + m * 60 + s
-                    vid_end = vid_start + LEGACY_MEDIA_SPAN_SEC
-                    if vid_end < start_sec or vid_start > end_sec:
-                        continue
-                    # Skip if we already have a preview version of this file
-                    base_name = re.sub(r'\.\w+$', '', filename)
-                    if not is_preview and any(v.get('base_name') == base_name for v in videos):
-                        continue
-                    offset = max(0, seek_from_sec - vid_start)
-                    url = s3_client.generate_presigned_url('get_object',
-                        Params={'Bucket': S3_BUCKET, 'Key': key}, ExpiresIn=PRESIGNED_URL_EXPIRY)
-                    vh, vm, vs = vid_start//3600, (vid_start%3600)//60, vid_start%60
-                    videos.append({
-                        'url': url, 'key': key, 'filename': filename,
-                        'base_name': base_name,
-                        'video_start_sec': vid_start,
-                        'time_label': f"{vh:02d}:{vm:02d}:{vs:02d}",
-                        'offset_sec': round(offset, 1),
-                        'size_mb': round(obj['Size']/(1024*1024), 1),
-                        'is_preview': is_preview,
-                        'codec': 'h264' if is_preview else 'unknown',
-                    })
-            except Exception:
-                pass
-        if videos:
-            break
-    videos.sort(key=lambda v: v['video_start_sec'])
-    return ok({'videos': videos, 'count': len(videos)})
-
-
-# ── GET /api/recording-stats ─────────────────────────────────
-
-def get_recording_stats(params, caller):
-    """Count original video+audio files and total duration."""
-    date = params.get('date', '')
-    user = params.get('user', '')
-    if not date:
-        return error('Missing date')
-    if caller['role'] == 'worker':
-        user = resolve_user_display_name(caller)
-    elif user and not can_access_user_data(caller, user):
-        return error('Access denied', 403)
-    elif not user:
-        user = resolve_user_display_name(caller)
-    if not user:
-        return error('Missing user')
-    user_folder = user.replace(' ', '_')
-    # Counts, sizes and durations are DERIVED FACTS about a recording: that it existed,
-    # roughly how long it was, how big. A customer told their recording is gone should not
-    # be able to read its shadow off a statistics endpoint.
-    deleted = _deleted_bases(user_folder, date) | _deleted_bases(user, date)
-    stats = {'video_count': 0, 'audio_count': 0, 'total_files': 0,
-             'total_size_mb': 0, 'estimated_duration_min': 0}
-    for media_type in ['video', 'audio']:
-        for name_variant in [user_folder, user]:
-            prefix = f"users/{name_variant}/{media_type}/{date}/"
-            try:
-                resp = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
-                for obj in resp.get('Contents', []):
-                    key = obj['Key'].lower()
-                    if deleted and any(b.lower() in key for b in deleted):
-                        continue          # a recording the customer deleted
-                    if any(key.endswith(e) for e in ['.mp4','.webm','.mov','.wav','.mp3','.m4a']):
-                        if media_type == 'video':
-                            stats['video_count'] += 1
-                        else:
-                            stats['audio_count'] += 1
-                        stats['total_size_mb'] += obj['Size']/(1024*1024)
-                        stats['estimated_duration_min'] += 10
-            except Exception:
-                pass
-    stats['total_files'] = stats['video_count'] + stats['audio_count']
-    stats['total_size_mb'] = round(stats['total_size_mb'], 1)
-    return ok(stats)
-
-
-# ── GET /api/reports/history ─────────────────────────────────
-
-def get_report_history(params, caller):
-    limit = int(params.get('limit', '20'))
-    # SECURITY: three-state scope -- None = unrestricted (admin/gm), an
-    # empty set = deny-all (explicit early return below), otherwise an
-    # allowlist. See accessible_folder_scope for the leak this replaces.
-    # The old dedicated `worker` branch is gone: accessible_folder_scope
-    # routes a worker through get_accessible_users' self-only arm, which
-    # yields the SAME folder_name string resolve_user_display_name did
-    # (display_name with spaces -> underscores). Behaviour equivalence,
-    # not a widening -- pinned by test_history_worker_sees_only_own_folder.
-    folder_scope = accessible_folder_scope(caller)
-    if folder_scope is not None and not folder_scope:
-        # DENY ALL -- return early rather than fall into a filter loop
-        # whose predicate an empty container would silently satisfy.
-        return ok({'reports': []})
-    
-    reports = []
-    # THE WORD FILE IS ALREADY IN THIS LISTING, so carrying it costs nothing.
-    # The generator writes daily_report.docx beside daily_report.json and has
-    # done since the python-docx layer landed -- 183 of them in production --
-    # but this endpoint only ever returned the .json key. The UI's button is
-    # labelled "Download .docx" and presigns whatever `key` it was given, so
-    # every one of those downloads has handed the user raw JSON.
-    #
-    # Collected in the same pass rather than probed per report: a HeadObject
-    # per row would be one round trip each to learn something this listing
-    # already contains, and a missing .docx presigns happily and 404s in the
-    # browser (this bucket answers 403 for keys that do not exist, so the
-    # failure would not even read as "not found").
-    docx_sizes = {}
-    try:
-        paginator = s3_client.get_paginator('list_objects_v2')
-        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=REPORT_PREFIX):
-            for obj in page.get('Contents', []):
-                key = obj['Key']
-                if key.endswith('_report.docx'):
-                    docx_sizes[key] = obj['Size']
-                    continue
-                if not key.endswith('_report.json') or '_debug' in key:
-                    continue
-                if folder_scope is not None:
-                    if not any(f'/{uf}/' in key for uf in folder_scope):
-                        continue
-                rtype = 'weekly' if 'weekly' in key else 'monthly' if 'monthly' in key else 'daily'
-                dm = re.search(r'(\d{4}-\d{2}-\d{2})', key)
-                reports.append({'key': key, 'type': rtype, 'date': dm.group(1) if dm else '',
-                                'generated_at': obj['LastModified'].isoformat(), 'size': obj['Size']})
-    except Exception as e:
-        logger.error(f"Error: {e}")
-
-    # ABSENT, NOT EMPTY, when there is no Word file. Word generation is
-    # disabled when the python-docx layer is missing or incompatible (the
-    # startup log says which), and one production day has a .json with no
-    # .docx beside it. A client that gets no `docx_key` must be able to tell
-    # "this report has no Word file" from "this backend never sends one".
-    for r in reports:
-        cand = r['key'][:-len('.json')] + '.docx'
-        if cand in docx_sizes:
-            r['docx_key'] = cand
-            r['docx_size'] = docx_sizes[cand]
-
-    reports.sort(key=lambda r: r['date'], reverse=True)
-    return ok({'reports': reports[:limit]})
-
-
-# ── POST /api/reports/generate ───────────────────────────────
-
-def trigger_report_generation(body, caller):
-    # CLOSED 2026-09-15. Its only caller was the frontend. It regenerated a whole day
-    # for every user -- the worker-only filter was sent as `users_filter`, a key the
-    # generator never reads, in a "First Last" form that matches no folder -- plus a
-    # seven-day backfill, and on 2026-09-14 one click rewrote four prod reports across
-    # two people. Owner rule: each person regenerates only their own reports, which is
-    # POST /api/org/reports/regenerate. The nightly schedule invokes the generator
-    # directly and never came through here.
-    return error('Gone: use POST /api/org/reports/regenerate, which regenerates '
-                 'only your own report', 410)
 
 
 # ── POST /api/ask ───────────────────────────────────────────
@@ -1581,61 +397,11 @@ def search_topics(body, caller):
         return error(f'Search error: {e}', 500)
 
 
-def get_users(params):
-    try:
-        mapping = load_user_mapping()
-        return ok({'users': [{'device_id': k, 'name': v.get('name', k), 'role': v.get('role', 'worker'), 'sites': v.get('sites', [])}
-                             for k, v in mapping.get('mapping', {}).items()]})
-    except Exception as e:
-        return error(f'Failed: {e}', 500)
-
-
-def get_sites(params, caller):
-    """Return sites this caller can access, with metadata."""
-    mapping = load_user_mapping()
-    all_sites = mapping.get('sites', {})
-    accessible = get_accessible_sites(caller)
-    
-    sites = []
-    for site_id in accessible:
-        site_info = all_sites.get(site_id, {})
-        # Count users on this site
-        users_on_site = get_accessible_users(caller, site_filter=site_id)
-        sites.append({
-            'site_id': site_id,
-            'name': site_info.get('name', site_id),
-            'location': site_info.get('location', ''),
-            'client': site_info.get('client', ''),
-            'user_count': len(users_on_site),
-        })
-    
-    return ok({
-        'sites': sites,
-        'role': caller['role'],
-        'display_name': caller.get('display_name', caller.get('name', '')),
-    })
-
-
-def get_site_users(params, caller):
-    """Return users on a specific site that this caller can access."""
-    site = params.get('site', '')
-    if not site:
-        return error('Missing site parameter')
-    
-    # Verify caller has access to this site
-    accessible_sites = get_accessible_sites(caller)
-    if site not in accessible_sites:
-        return error('Access denied to this site', 403)
-    
-    users = get_accessible_users(caller, site_filter=site)
-    return ok({'users': users, 'site': site})
 
 def health_check(params):
     return ok({'status': 'ok', 'service': 'sitesync-api', 'version': '2.0',
                'bucket': S3_BUCKET, 'timestamp': datetime.utcnow().isoformat() + 'Z'})
 
-
-# ── Router ───────────────────────────────────────────────────
 
 def _ua_family(headers):
     """Coarse client family from the User-Agent header; never the raw string."""
@@ -1656,14 +422,36 @@ def _ua_family(headers):
     return 'other'
 
 
-# Literal routes the dispatcher below serves. LEGACY_CALL logs only these; any
-# other path is client-controlled (a 404) and is logged as 'other'.
-KNOWN_ROUTES = frozenset({
-    '/api/timeline', '/api/dates', '/api/media/presigned-url', '/api/reports/history',
-    '/api/reports/generate', '/api/users', '/api/sites', '/api/site-users',
-    '/api/transcripts', '/api/audio-segments', '/api/video-segments',
-    '/api/recording-stats', '/api/actions/toggle', '/api/actions', '/api/ask',
-    '/api/ask/voice', '/api/ask/corroborate', '/api/search',
+
+# Closed data routes -> the org-api route that replaced each ("none" = no
+# replacement). Every method, every role, answered before any storage access.
+CLOSED_ROUTES = {
+    '/api/timeline': '/api/org/timeline',
+    '/api/dates': '/api/org/dates',
+    '/api/media/presigned-url': '/api/org/media/presigned-url',
+    '/api/reports/history': '/api/org/reports/history',
+    '/api/reports/generate': 'POST /api/org/reports/regenerate',
+    '/api/users': '/api/org/members',
+    '/api/sites': '/api/org/sites',
+    '/api/site-users': '/api/org/sites/{id}/members',
+    '/api/transcripts': '/api/org/transcripts',
+    '/api/audio-segments': '/api/org/audio-segments',
+    '/api/video-segments': '/api/org/video-segments',
+    '/api/recording-stats': 'none',
+    '/api/actions': 'none',
+    '/api/actions/toggle': 'PATCH /api/org/action-items/{id}',
+}
+
+
+def gone(path):
+    return ok({'error': 'gone', 'use': CLOSED_ROUTES[path]}, 410)
+
+
+# Literal routes this dispatcher knows. LEGACY_CALL logs only these; any other
+# path is client-controlled (a 404) and is logged as 'other'. The closed routes
+# stay here so their 410s remain visible in the logs.
+KNOWN_ROUTES = frozenset(CLOSED_ROUTES) | frozenset({
+    '/api/ask', '/api/ask/voice', '/api/ask/corroborate', '/api/search',
 })
 
 
@@ -1671,15 +459,10 @@ def lambda_handler(event, context):
     logger.info(f"Request: {event.get('httpMethod','GET')} {event.get('path','/')}")
     method = event.get('httpMethod', 'GET').upper()
     path = event.get('path', '/')
-    params = event.get('queryStringParameters') or {}
     if method == 'OPTIONS':
         return ok({'message': 'CORS OK'})
-    body = {}
-    if method in ('POST','PATCH','PUT') and event.get('body'):
-        try: body = json.loads(event['body'])
-        except: body = {}
     if path == '/api/health':
-        return health_check(params)
+        return health_check({})
     caller = get_caller_identity(event)
     # Who still calls this gateway? Route/method/role/client family only --
     # no query-param or body values (tenant content).
@@ -1688,26 +471,19 @@ def lambda_handler(event, context):
         'has_sub': bool(caller.get('sub')),
         'ua': _ua_family(event.get('headers')),
     }, sort_keys=True))
+    if path in CLOSED_ROUTES:
+        return gone(path)
+    body = {}
+    if method in ('POST', 'PATCH', 'PUT') and event.get('body'):
+        try: body = json.loads(event['body'])
+        except Exception: body = {}
     try:
-        if path == '/api/timeline': return get_timeline(params, caller)
-        elif path == '/api/dates': return get_dates(params, caller)
-        elif path == '/api/media/presigned-url': return get_presigned_url(params, caller)
-        elif path == '/api/reports/history': return get_report_history(params, caller)
-        elif path == '/api/reports/generate' and method == 'POST': return trigger_report_generation(body, caller)
-        elif path == '/api/users': return get_users(params)
-        elif path == '/api/sites': return get_sites(params, caller)
-        elif path == '/api/site-users': return get_site_users(params, caller)
-        elif path == '/api/transcripts': return get_transcripts(params, caller)
-        elif path == '/api/audio-segments': return get_audio_segments(params, caller)
-        elif path == '/api/video-segments': return get_video_segments(params, caller)
-        elif path == '/api/recording-stats': return get_recording_stats(params, caller)
-        elif path == '/api/actions/toggle' and method == 'POST': return toggle_action(body, caller)
-        elif path == '/api/actions': return get_actions(params, caller)
-        elif path == '/api/ask' and method == 'POST': return ask_question(body, caller)
+        if path == '/api/ask' and method == 'POST': return ask_question(body, caller)
         elif path == '/api/ask/voice' and method == 'POST': return ask_voice(body, caller)
         elif path == '/api/ask/corroborate' and method == 'POST': return corroborate_answer(body, caller)
         elif path == '/api/search' and method == 'POST': return search_topics(body, caller)
         else: return error(f'Not found: {method} {path}', 404)
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
+
         return error(f'Internal error: {e}', 500)

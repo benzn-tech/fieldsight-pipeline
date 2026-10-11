@@ -279,6 +279,18 @@ def test_claude_error_graceful(monkeypatch):
     assert result["citations"] == []
 
 
+def _no_s3(monkeypatch):
+    """Any attempt to build an S3 client (or touch the module's old one) fails."""
+    real = laa.boto3.client
+
+    def guarded(service, *a, **k):
+        if service == "s3":
+            raise AssertionError("the ask agent must not touch S3")
+        return real(service, *a, **k)
+
+    monkeypatch.setattr(laa.boto3, "client", guarded)
+
+
 def test_non_rag_event_is_refused_without_reading_s3(monkeypatch):
     """No caller_sub used to fall through to a company-blind S3 read; it is now
     refused (sign-in required) before any of the S3 loaders run."""
@@ -286,8 +298,7 @@ def test_non_rag_event_is_refused_without_reading_s3(monkeypatch):
         raise AssertionError("neither the RAG path nor the S3 path may run without a caller_sub")
 
     monkeypatch.setattr(dashscope_utils, "embed", fail_if_called)
-    monkeypatch.setattr(laa, "load_report", fail_if_called)
-    monkeypatch.setattr(laa, "load_transcripts", fail_if_called)
+    _no_s3(monkeypatch)
 
     event = {"date": "2026-02-09", "user": "Jarley_Trainor", "question": "What happened?", "scope": "both"}
     resp = laa.lambda_handler(event, None)
@@ -300,10 +311,11 @@ def test_non_rag_event_is_refused_without_reading_s3(monkeypatch):
 # C2 (Critical): prod-safe guard + lazy import
 # ============================================================
 
-def test_caller_sub_without_rag_search_function_falls_back_to_legacy(monkeypatch):
-    """This is exactly PROD's shape once ApiFunction forwards caller_sub
-    everywhere: no RAG_SEARCH_FUNCTION env var configured. The RAG branch
-    must NOT fire -- it must fall through to the legacy S3 path."""
+def test_caller_sub_without_rag_search_function_is_503_and_never_reads_s3(monkeypatch):
+    """A deploy with no rag-search function used to fall through to the
+    company-blind S3 path (load_report/load_transcripts by a named user). That path
+    is gone: with a caller_sub and nothing to retrieve from, the answer is 503, and
+    no S3 client is ever created."""
     monkeypatch.delenv("RAG_SEARCH_FUNCTION", raising=False)
 
     def fail_if_called(*a, **k):
@@ -311,20 +323,22 @@ def test_caller_sub_without_rag_search_function_falls_back_to_legacy(monkeypatch
 
     monkeypatch.setattr(dashscope_utils, "embed", fail_if_called)
     monkeypatch.setattr(laa, "_get_lambda_client", fail_if_called)
-    monkeypatch.setattr(laa, "load_report",
-                         lambda bucket, date, user: ({"site": "TestSite", "executive_summary": "All good"}, "daily"))
-    monkeypatch.setattr(laa, "load_transcripts", lambda bucket, date, user, topic_time_range=None: [])
-    monkeypatch.setattr(laa, "call_claude", lambda prompt, max_tokens=2048: ("Legacy answer", None))
+    _no_s3(monkeypatch)
 
     event = {
         "date": "2026-02-09", "user": "Jarley_Trainor", "question": "What happened?",
         "scope": "both", "caller_sub": "sub-1",
     }
-    result = invoke(event)
+    resp = laa.lambda_handler(event, None)
 
-    assert result["answer"] == "Legacy answer"
-    assert result["grounded"] is True
-    assert "citations" not in result  # legacy envelope shape, not the RAG one
+    assert resp["statusCode"] == 503
+    assert json.loads(resp["body"]) == {"error": "search not configured"}
+
+
+def test_the_company_blind_s3_path_no_longer_exists():
+    for name in ("load_report", "load_transcripts", "s3_client", "download_json_from_s3",
+                 "load_user_mapping", "format_report_for_prompt", "build_prompt"):
+        assert not hasattr(laa, name), name + " is the removed S3 path"
 
 
 def test_claude_and_dashscope_are_not_top_level_imports():

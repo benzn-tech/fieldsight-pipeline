@@ -179,7 +179,10 @@ def test_the_legacy_generate_route_is_closed(monkeypatch):
             invoked.append(kw)
 
     monkeypatch.setattr(api, "lambda_client", _Lambda())
-    resp = api.trigger_report_generation({"report_type": "daily", "date": "2026-09-03", "force": True},
-                                         {"role": "admin", "company_id": "c"})
+    resp = api.lambda_handler(
+        {"httpMethod": "POST", "path": "/api/reports/generate",
+         "body": json.dumps({"report_type": "daily", "date": "2026-09-03", "force": True}),
+         "requestContext": {"authorizer": {"claims": {"sub": "s", "custom:role": "admin"}}}}, None)
     assert resp["statusCode"] == 410
+    assert json.loads(resp["body"])["use"] == "POST /api/org/reports/regenerate"
     assert invoked == [], "a closed route must not invoke the generator"
