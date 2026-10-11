@@ -192,7 +192,8 @@ def test_an_author_outside_the_callers_company_matches_nothing(wired):
         return None
 
     wired.setattr(rag.users, "get_by_folder_name", lookup)
-    wired.setattr(rag.users, "get_by_folder_name_global", boom)
+    # Unknown in the caller's company AND in the global directory: nothing to narrow to.
+    wired.setattr(rag.users, "get_by_folder_name_global", lambda conn, folder: None)
     wired.setattr(rag.chunks, "search_chunks", boom)            # never the full set
 
     out = rag.lambda_handler(event(author="Other_Co_Worker"), None)

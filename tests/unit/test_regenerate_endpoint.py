@@ -55,7 +55,7 @@ def wired(monkeypatch):
 
 def _call(monkeypatch, wired, segs, session=SESSION, role="pm", body=None):
     monkeypatch.setattr(api, "_read_org_transcripts",
-                        lambda date, folder, a, b, conn=None: {"speaker_segments": segs})
+                        lambda date, folder, a, b, conn=None, **k: {"speaker_segments": segs})
     monkeypatch.setattr(api, "_apply_speaker_names", lambda conn, caller, out: out)
     caller = {"global_role": role, "id": "u1", "company_id": "c1"}
     # `body if body is not None`, not `body or` -- an empty dict is a REAL case

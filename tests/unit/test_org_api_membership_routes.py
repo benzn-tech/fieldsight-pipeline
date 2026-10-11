@@ -95,6 +95,8 @@ def mem_wired(wired):
         calls["archive"].append((uid, sid))
         return {"user_id": uid, "site_id": sid, "archived_at": "2026-09-08"}
 
+    # No external membership on file: a target outside the company is a stranger.
+    wired.setattr(org.memberships, "get_membership", lambda conn, uid, sid: None)
     wired.setattr(org.memberships, "ensure_membership", _ensure)
     wired.setattr(org.memberships, "archive_membership", _archive, raising=False)
     return wired, calls

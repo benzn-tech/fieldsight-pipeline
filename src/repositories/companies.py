@@ -41,6 +41,14 @@ def get_company_by_id(conn, company_id) -> dict | None:
     ).fetchone()
 
 
+def voiceprint_consent_basis(conn, company_id):
+    """The company's voiceprint consent basis (notice/attestation/confirmed) or None."""
+    row = conn.cursor(row_factory=dict_row).execute(
+        "SELECT voiceprint_consent_basis FROM companies WHERE id=%s",
+        (str(company_id),)).fetchone()
+    return (row or {}).get("voiceprint_consent_basis") or None
+
+
 def list_companies(conn) -> list[dict]:
     """Every tenant company -- platform_admin cross-company views (Team,
     Sites) use this to label each user/site with its company name."""

@@ -287,7 +287,7 @@ def test_the_connection_reaches_the_reader_that_filters_deleted_sessions(monkeyp
     """
     seen = {}
 
-    def _reader(date, folder, a, b, conn=None):
+    def _reader(date, folder, a, b, conn=None, **k):
         seen["conn"] = conn
         return {"segments": []}
 

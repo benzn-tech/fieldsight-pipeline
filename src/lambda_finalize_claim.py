@@ -454,6 +454,12 @@ def sweep_groups(conn, *, list_due, claim, mark_result, span_ok, members_of,
         # never wired. A wrong merge mixes two meetings into one report and
         # sends it to both sets of people — contamination plus disclosure, and
         # hard to notice after the fact, which is why the bias is under-merge.
+        # One *site company* (project-owned tenancy P2): a session's company_id is
+        # the company of the SITE it was opened on (session_open writes it that
+        # way), so two people from different home companies on one shared site
+        # carry the same value here and merge, while members on sites of two
+        # different companies still reject. A member with no site keeps its home
+        # company, so mixing it with a foreign-site member under-merges (rejects).
         companies = {str(m.get("company_id")) for m in members if m.get("company_id")}
         stale = not span_ok(conn, gid)
         if stale or len(companies) > 1:

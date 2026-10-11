@@ -106,7 +106,7 @@ class _Conn:
 
 
 def _allow_all(monkeypatch, company="c-1"):
-    monkeypatch.setattr(org, "_can_delete_folder", lambda conn, caller, f: (True, company))
+    monkeypatch.setattr(org, "_can_delete_folder", lambda conn, caller, f, **kw: (True, company))
 
 
 def _stub_writes(monkeypatch, topics_found=()):
@@ -136,7 +136,7 @@ def test_authz_a_stranger_cannot_delete_another_folder(monkeypatch):
     undone by them because `revert_batch` is company-guarded."""
     monkeypatch.setattr(org, "ENABLE_USER_DELETION", True)
     monkeypatch.setattr(org, "_s3_client", _S3())
-    monkeypatch.setattr(org, "_can_delete_folder", lambda conn, caller, f: (False, None))
+    monkeypatch.setattr(org, "_can_delete_folder", lambda conn, caller, f, **kw: (False, None))
     calls = []
     monkeypatch.setattr(org.redactions, "create_recording_tombstone",
                         lambda *a, **k: calls.append(a))
@@ -154,7 +154,7 @@ def test_authz_is_per_recording_not_per_request(monkeypatch):
     monkeypatch.setattr(org, "ENABLE_USER_DELETION", True)
     monkeypatch.setattr(org, "_s3_client", _S3())
     monkeypatch.setattr(org, "_can_delete_folder",
-                        lambda conn, caller, f: (f == "Ben", "c-1"))
+                        lambda conn, caller, f, **kw: (f == "Ben", "c-1"))
     _stub_writes(monkeypatch, [{"id": "t-1"}])
 
     res = org.delete_recordings_endpoint(_Conn(), CALLER, {"recordings": [
@@ -295,7 +295,7 @@ def _undelete_stubs(monkeypatch, rows=None, still=()):
     monkeypatch.setattr(org.redactions, "list_batch",
                         lambda conn, b, c, **kw: list(rows if rows is not None
                                                       else BATCH_ROWS))
-    monkeypatch.setattr(org, "_can_delete_folder", lambda conn, caller, f: (True, "c-1"))
+    monkeypatch.setattr(org, "_can_delete_folder", lambda conn, caller, f, **kw: (True, "c-1"))
     monkeypatch.setattr(org.redactions, "active_batches_for_day",
                         lambda conn, f, d, **kw: list(still))
     monkeypatch.setattr(org.topics, "list_topics_for_source_prefix", lambda *a, **k: [])
@@ -328,7 +328,7 @@ def test_undelete_refuses_a_batch_the_caller_could_not_have_deleted(monkeypatch)
     recordings."""
     monkeypatch.setattr(org, "_s3_client", _S3())
     _undelete_stubs(monkeypatch)
-    monkeypatch.setattr(org, "_can_delete_folder", lambda conn, caller, f: (False, None))
+    monkeypatch.setattr(org, "_can_delete_folder", lambda conn, caller, f, **kw: (False, None))
     called = []
     monkeypatch.setattr(org.redactions, "revert_batch",
                         lambda *a, **k: called.append(a))

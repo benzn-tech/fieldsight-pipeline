@@ -1285,8 +1285,15 @@ def _from_match_artifact(bucket, key):
             f"match artifact {key} is missing company_id/user_folder/date/session_base; the "
             f"producer has all four and guessing any of them reads a key that cannot exist")
 
-    profiles_reply = invoke_writer({"op": "profiles", "company_id": company_id,
-                                    "site_id": req.get("site_id"), "date": date})
+    profiles_request = {"op": "profiles", "company_id": company_id,
+                        "site_id": req.get("site_id"), "date": date}
+    # Project-owned tenancy P5: an external recorder on this company's site. The writer
+    # builds candidates = this company's enrolled prints + the recorder's own. Absent on
+    # home-site and older requests, which are then sent exactly as before.
+    if req.get("home_company_id"):
+        profiles_request["home_company_id"] = req.get("home_company_id")
+        profiles_request["recorder_user_id"] = req.get("recorder_user_id")
+    profiles_reply = invoke_writer(profiles_request)
     profiles = profiles_reply.get("profiles") or []
     # The company's calibrated rejection floor, read once here (not per turn) and passed
     # to `_match` below -- dropping it on this hop would leave a calibrated floor sitting
