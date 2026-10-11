@@ -63,7 +63,7 @@ def test_trace_flush_adds_exactly_one_manifest_line_per_invocation():
     assert len(s3.data_puts()) == 1
     (line,) = s3.manifest_lines()
     assert line["key"] == key
-    assert line["hint"] == {"company_id": "c-1", "folder": "Ben_Lin"}
+    assert line["hint"] == {"folder": "Ben_Lin"}  # never the caller-set company
     assert s3.data_puts()[0]["ContentType"] == "application/x-ndjson"
 
 

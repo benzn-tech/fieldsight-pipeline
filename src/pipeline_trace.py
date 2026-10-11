@@ -55,6 +55,10 @@ def enabled():
     return os.environ.get("TRACE_EVENTS", "on").lower() not in ("off", "0", "false")
 
 
+def _owner_folder(folder):
+    return folder if folder and not str(folder).startswith("_") else None
+
+
 def begin(lambda_name, user_folder=None, date=None, session=None, company_id=None):
     """Start collecting for this invocation. Calling it again (a lambda that
     handles several records) flushes nothing -- call flush() per record."""
@@ -143,8 +147,10 @@ def flush(s3, bucket):
         if not hasattr(s3, "put_object") and callable(s3):
             s3 = s3()
         lake_put(bucket, key, lines(st).encode("utf-8"), client=s3,
-                 owner_hint={"company_id": st.get("company_id"),
-                             "folder": st.get("user_folder")},
+                 # No company in the hint: a trace's company is whatever the caller set
+                 # (e.g. a whole day's), not the site's; the resolver decides. Synthetic
+                 # folders ("_glossary") name nobody.
+                 owner_hint={"folder": _owner_folder(st.get("user_folder"))},
                  ContentType="application/x-ndjson")
         return key
     except Exception:

@@ -199,3 +199,18 @@ def test_a_parser_crash_never_fails_the_writer(monkeypatch):
     assert lp.lake_put("b", "transcripts/Ada_L/2026-10-01/x.json", b"{}", client=_S3()) == {"ETag": "e"}
     assert calls[0] == "transcripts/Ada_L/2026-10-01/x.json"
     assert len(calls) == 2 and calls[1].startswith("lake_manifest/")
+
+
+def test_a_trace_hints_only_a_real_folder_and_no_company(monkeypatch):
+    """A trace's company_id is whatever its caller set (photo_rebind: a whole day's), not
+    the site's, so it is never offered as an owner; "_glossary" is not a person."""
+    import pipeline_trace
+    seen = []
+    monkeypatch.setattr(pipeline_trace, "lake_put",
+                        lambda b, k, body, **kw: seen.append(kw["owner_hint"]))
+    monkeypatch.setattr(pipeline_trace, "enabled", lambda: True)
+    for folder in ("_glossary", "Ada_L"):
+        pipeline_trace.begin("t", user_folder=folder, date="2026-10-01", company_id="c-home")
+        pipeline_trace.event("step")
+        pipeline_trace.flush(object(), "b")
+    assert seen == [{"folder": None}, {"folder": "Ada_L"}], seen

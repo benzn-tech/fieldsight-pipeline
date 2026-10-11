@@ -878,7 +878,7 @@ def _put_document(artifact, buf):
     and returns its key -- mirrors the inline put in `process_request` below."""
     doc_key = _doc_key(artifact)
     lake_put(S3_BUCKET, doc_key, buf.getvalue(), client=s3(),
-             owner_hint={"folder": artifact["folder"]},
+             owner_hint={"folder": artifact.get("folder")},
              ContentType=DOCX_CONTENT_TYPE)
     return doc_key
 
@@ -1225,7 +1225,7 @@ def process_request(artifact, context=None):
             return
         doc_key = _doc_key(artifact)
         lake_put(S3_BUCKET, doc_key, buf.getvalue(), client=s3(),
-                 owner_hint={"folder": artifact["folder"]},
+                 owner_hint={"folder": artifact.get("folder")},
                  ContentType=DOCX_CONTENT_TYPE)
         emailed = False
         if artifact.get("deliver") == "email":
