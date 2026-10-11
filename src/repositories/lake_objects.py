@@ -39,7 +39,11 @@ _UPSERT = (
     "WHERE lake_objects.deleted_at IS NOT NULL "
     + "".join(f"OR (EXCLUDED.{c} IS NOT NULL AND EXCLUDED.{c} IS DISTINCT FROM lake_objects.{c}) "
               for c in ("company_id", "site_id", "user_id", "size_bytes", "kind", "folder", "day",
-                        "session_base", "source", "reason")))
+                        "session_base", "source"))
+    # reason: a write that supplies a company_id owns the reason too (NULL clears a stale one);
+    # without a company_id only a non-NULL reason counts.
+    + "OR ((EXCLUDED.company_id IS NOT NULL OR EXCLUDED.reason IS NOT NULL) "
+      "AND EXCLUDED.reason IS DISTINCT FROM lake_objects.reason)")
 
 _REASSIGN = ("UPDATE lake_objects SET company_id=%s, reason=NULL, updated_at=now() "
              "WHERE site_id=%s AND company_id IS DISTINCT FROM %s")
@@ -84,7 +88,9 @@ def upsert(conn, key, *, company_id, site_id=None, user_id=None, kind, folder=No
 
 
 def upsert_many(conn, rows) -> int:
-    """rows: dicts with the keyword names of upsert(), s3 key under `key`. Returns rows written."""
+    """rows: dicts with the keyword names of upsert(), s3 key under `key`. Returns the number of
+    rows actually written (inserted or changed); unchanged rows are skipped by the guard and
+    not counted."""
     params = [_params(r["key"], r.get("company_id"), r.get("site_id"), r.get("user_id"),
                       r["kind"], r.get("folder"), r.get("day"), r.get("session_base"),
                       r.get("size_bytes"), r["source"], r.get("reason")) for r in rows]
@@ -94,7 +100,7 @@ def upsert_many(conn, rows) -> int:
     def go():
         with conn.cursor() as cur:
             cur.executemany(_UPSERT, params)
-        return len(params)
+            return cur.rowcount
     return _run(conn, go, 0)
 
 

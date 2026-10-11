@@ -229,3 +229,26 @@ def test_reassign_site_clears_reason_and_moves_soft_deleted_rows(db):
     assert lake_objects.reassign_site(db, s1["id"], b["id"]) == 2
     assert _row(db, "x1")[0] == b["id"] and _row(db, "x1")[2] is None
     assert _row(db, "x2")[0] == b["id"] and _row(db, "x2")[3] is not None  # still soft-deleted, moved
+
+
+# ---- fix round 2 ----
+
+def test_same_company_write_clears_a_stale_reason(db):
+    a, _, _, _ = _world(db)
+    _put(db, "r", a["id"], kind="report")
+    db.execute("UPDATE lake_objects SET reason='split_day' WHERE s3_key='r'")
+    _put(db, "r", a["id"], kind="report")  # same company, reason NULL: must clear
+    assert _row(db, "r")[2] is None
+    db.execute("UPDATE lake_objects SET reason='split_day' WHERE s3_key='r'")
+    _put(db, "r", None, kind="report")  # no company supplied: reason kept
+    assert _row(db, "r")[2] == "split_day"
+
+
+def test_upsert_many_returns_rows_actually_written(db):
+    a, _, _, _ = _world(db)
+    lake_objects.upsert(db, "same", company_id=a["id"], kind="media", source="upload")
+    n = lake_objects.upsert_many(db, [
+        {"key": "same", "company_id": a["id"], "kind": "media", "source": "upload"},   # unchanged
+        {"key": "new", "company_id": a["id"], "kind": "media", "source": "upload"},
+    ])
+    assert n == 1

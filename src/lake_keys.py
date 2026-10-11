@@ -17,13 +17,14 @@ _TENANT = [
     ("report",       rf"^reports/{_DATE}/{_FOLDER}/[^/]+$"),
     ("embedding",    rf"^embeddings/{_DATE}/{_FOLDER}/[^/]+$"),
     ("reindex",      rf"^reindex_(?:requests|vectors)/{_DATE}/{_FOLDER}/[^/]+$"),
-    ("session_report", rf"^session_report(?:s|_requests|_results)/{_FOLDER}/{_DATE}/.+$"),
-    ("session_aux",  rf"^session_(?:rolling|brief)/{_FOLDER}/{_DATE}/.+$"),
+    # .../{sid|day}/{request id}.ext : the directory segment is the session, the file is a request id
+    ("session_report", rf"^session_report(?:s|_requests|_results)/{_FOLDER}/{_DATE}/(?P<sidseg>[^/]+)/(?P<rid>[^/]+)$"),
+    ("session_aux",  rf"^session_(?:rolling|brief)/{_FOLDER}/{_DATE}/(?P<sidseg>[^/]+)/.+$"),
     ("redaction",    rf"^redactions/{_FOLDER}/{_DATE}/[^/]+$"),
     ("voice_ask",    rf"^voice_ask/{_FOLDER}/{_DATE}/[^/]+$"),
     ("trace",        rf"^traces/{_DATE}/{_FOLDER}/[^/]+$"),
     ("keyframe_req", rf"^keyframe_requests/{_FOLDER}/{_DATE}/[^/]+$"),
-    ("report_request", rf"^report_requests/{_FOLDER}/[^/]+$"),
+    ("report_request", rf"^report_requests/{_FOLDER}/(?P<rid>[^/]+)$"),
     ("photo_selection", rf"^report_photo_selection/{_FOLDER}/{_DATE}\.json$"),
 ]
 _SESSION = [  # folder only in the payload; the session id is the only handle
@@ -52,22 +53,26 @@ _LAKE_WIDE_RE = [re.compile(p) for p in _LAKE_WIDE]
 
 def _result(scope, kind, **kw):
     out = {"scope": scope, "kind": kind, "folder": None, "day": None, "session_base": None,
-           "sid": None, "site_id": None, "site_slug": None, "company_id": None, "group_id": None}
+           "sid": None, "site_id": None, "site_slug": None, "company_id": None, "group_id": None,
+           "request_id": None}
     out.update(kw)
     return out
 
 
-def _find_sid(key):
-    """The 32-hex session id anywhere in a key: `sid{hex}` in a file or directory name, or a
-    bare `{hex}[-updated|-notes]` path segment (extension ignored)."""
-    m = SID_RE.search(key)
-    if m:
-        return m.group("sid")
-    for seg in key.split("/"):
-        m = _SID_SEGMENT_RE.match(seg.rsplit(".", 1)[0] if "." in seg else seg)
-        if m:
-            return m.group("sid")
-    return None
+_SID_DIR_RE = re.compile(r"^(?:sid)?(?P<sid>[0-9a-f]{32})$")
+
+
+def _sid_from_name(name):
+    """`sid{32 hex}` inside a file name. The literal `sid` prefix makes it unambiguous: request
+    ids are uuid4 hex and can never contain it."""
+    m = SID_RE.search(name)
+    return m.group("sid") if m else None
+
+
+def _sid_from_dir(seg):
+    """The directory segment of a session_* key: `{sid}`, `sid{sid}` or the word `day`."""
+    m = _SID_DIR_RE.match(seg)
+    return m.group("sid") if m else None
 
 
 def _stem(name):
@@ -101,8 +106,14 @@ def parse(key):
                     extra["group_id"] = stem[3:]  # merged group extraction, not one session
                 else:
                     extra["session_base"] = stem
+            if "sidseg" in g:  # sid comes from the directory segment only, never the file name
+                sid = _sid_from_dir(g["sidseg"])
+            else:
+                sid = _sid_from_name(last)
+            if g.get("rid") is not None:  # the file name of a request/result is a request id
+                extra["request_id"] = _stem(g["rid"])
             return _result("tenant", kind, folder=g.get("folder"), day=g.get("day"),
-                           sid=_find_sid(key), **extra)
+                           sid=sid, **extra)
     for kind, rx in _SESSION_RE:
         m = rx.match(key)
         if m:
@@ -112,7 +123,7 @@ def parse(key):
             sm = _SID_SEGMENT_RE.match(base)
             if sm:  # session_finalize_requests/{sid}-updated: the session is {sid}
                 return _result("tenant", kind, session_base=sm.group("sid"), sid=sm.group("sid"))
-            return _result("tenant", kind, session_base=base, sid=_find_sid(key))
+            return _result("tenant", kind, session_base=base, sid=_sid_from_name(base))
     for kind, rx in _SITE_RE:
         m = rx.match(key)
         if m:

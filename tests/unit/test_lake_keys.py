@@ -1,3 +1,4 @@
+import uuid
 import pytest
 import lake_keys
 
@@ -116,3 +117,25 @@ def test_lake_wide_report_never_yields_a_folder():
 def test_every_result_has_the_same_shape():
     shapes = {frozenset(lake_keys.parse(k)) for k, _ in CASES}
     assert len(shapes) == 1
+
+
+RID = uuid.uuid4().hex
+
+
+@pytest.mark.parametrize("key,sid,request_id", [
+    ("report_requests/Ada_L/%s.json" % RID, None, RID),
+    ("session_report_requests/Ada_L/%s/day/%s.json" % (D, RID), None, RID),
+    ("session_report_results/Ada_L/%s/day/%s.json" % (D, RID), None, RID),
+    ("session_reports/Ada_L/%s/day/%s.docx" % (D, RID), None, RID),
+    ("session_report_requests/Ada_L/%s/%s/%s.json" % (D, SID, RID), SID, RID),
+    ("session_reports/Ada_L/%s/%s/%s.docx" % (D, SID, RID), SID, RID),
+])
+def test_request_id_is_never_a_sid(key, sid, request_id):
+    got = lake_keys.parse(key)
+    assert got["sid"] == sid and got["request_id"] == request_id, got
+
+
+def test_no_bare_hex_search_outside_known_positions():
+    # a 32-hex path segment in a family with no sid position must not become a sid
+    assert lake_keys.parse("transcripts/Ada_L/%s/%s.json" % (D, RID))["sid"] is None
+    assert lake_keys.parse("keyframe_requests/Ada_L/%s/%s.json" % (D, RID))["sid"] is None
