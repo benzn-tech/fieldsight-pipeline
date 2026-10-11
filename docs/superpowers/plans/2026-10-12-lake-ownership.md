@@ -29,7 +29,7 @@
 2. **No other company's object in an export, including after a site move.** -> Tasks 6, 9.
 3. **The resolver never guesses.** Unresolvable -> `company_id` NULL, counted, listed; a second backfill run changes nothing. -> Tasks 5, 7.
 4. **Request paths stop enumerating the lake, but not before the index is complete.** `LAKE_INDEX_READS` is off until backfill + a drain have run. -> Tasks 8, 11.
-5. **New IAM is the widest grant in the plan** (bucket-wide read for backfill/export on `LakeOpsFunction` only; `s3:PutObjectTagging` on every `lake_put` caller). -> Task 12.
+5. **New IAM is the widest grant in the plan** (bucket-wide read for backfill/export on `LakeOpsFunction` only; `s3:PutObjectTagging` on every `lake_put` caller). -> Task 11.
 6. **Deploy tolerance:** every new repository/handler path survives the table missing for a minute. -> Tasks 1, 2, 5, 6.
 
 ## Task map and boundaries
