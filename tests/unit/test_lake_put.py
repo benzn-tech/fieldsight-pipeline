@@ -178,3 +178,24 @@ def test_manifest_key_matches_no_s3_notification_or_eventbridge_filter():
     assert not key.startswith("transcripts/")
     # No filter prefix is a prefix of the manifest key at all (stricter than the pairs above).
     assert not any(key.startswith(p) for p, _ in filters)
+
+
+def test_a_parser_crash_never_fails_the_writer(monkeypatch):
+    """The object is already stored when the key is classified; a parser bug must not
+    surface to the writer as a failed put."""
+    import lake_put as lp
+    calls = []
+
+    class _S3:
+        def put_object(self, **kw):
+            calls.append(kw["Key"])
+            return {"ETag": "e"}
+
+    def boom(key):
+        raise ValueError("parser bug")
+
+    monkeypatch.setattr(lp.lake_keys, "parse", boom)
+    monkeypatch.setenv("LAKE_MANIFEST", "on")
+    assert lp.lake_put("b", "transcripts/Ada_L/2026-10-01/x.json", b"{}", client=_S3()) == {"ETag": "e"}
+    assert calls[0] == "transcripts/Ada_L/2026-10-01/x.json"
+    assert len(calls) == 2 and calls[1].startswith("lake_manifest/")

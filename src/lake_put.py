@@ -50,7 +50,11 @@ def _manifest_enabled():
 
 
 def _wants_manifest(key):
-    p = lake_keys.parse(key)
+    try:
+        p = lake_keys.parse(key)
+    except Exception:  # noqa: BLE001 - the object is already stored; never fail the writer
+        logger.warning("lake_put: key parse failed for %s; recording it anyway", key, exc_info=True)
+        return True
     # Unknown shapes (None) ARE recorded: the drain reports them.
     return p is None or p["scope"] != "global"
 
