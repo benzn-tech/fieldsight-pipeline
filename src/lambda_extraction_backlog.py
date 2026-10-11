@@ -34,6 +34,7 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import boto3
+from lake_put import lake_put
 
 import extraction_pending
 
@@ -465,8 +466,9 @@ def redrive(client, now=None, rng=None, time_left_ms=None):
                 logger.info("backlog: %s was cleared or re-driven meanwhile -- not re-putting",
                             base)
                 continue
-            client.put_object(Bucket=S3_BUCKET, Key=request_key, Body=body,
-                              ContentType="application/json")
+            lake_put(S3_BUCKET, request_key, body, client=client,
+                     owner_hint={"folder": m.get("userFolder"), "session_base": base},
+                     ContentType="application/json")
         except Exception:
             logger.exception("backlog: re-drive of %s failed", base)
             continue

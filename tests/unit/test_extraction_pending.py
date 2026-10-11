@@ -50,7 +50,8 @@ class FakeS3:
         return {"Body": io.BytesIO(self.objects[Key])}
 
     def put_object(self, Bucket, Key, Body, **kw):
-        self.puts.append(Key)
+        if not Key.startswith("lake_manifest/"):    # lake_put's manifest line is not a marker write
+            self.puts.append(Key)
         self.objects[Key] = Body if isinstance(Body, bytes) else Body.encode()
         return {}
 

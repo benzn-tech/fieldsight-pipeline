@@ -56,6 +56,7 @@ import json
 import time
 import logging
 import boto3
+from lake_put import lake_put
 from urllib.parse import unquote_plus
 
 import batch_ledger
@@ -540,10 +541,12 @@ def lambda_handler(event, context):
                     keyterms=keyterms,
                 )
                 transcript_json = _embed_batch_map(bucket, key, transcript_json)
-                s3.put_object(
-                    Bucket=bucket,
-                    Key=output_key,
-                    Body=json.dumps(transcript_json),
+                lake_put(
+                    bucket,
+                    output_key,
+                    json.dumps(transcript_json),
+                    client=s3,
+                    owner_hint={"folder": display_name},
                     ContentType='application/json',
                 )
                 # Deliberately NOT writing the ledger here: write_ledger_record

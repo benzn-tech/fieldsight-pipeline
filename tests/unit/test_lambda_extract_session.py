@@ -60,6 +60,8 @@ class FakeS3:
         return _FakePaginator(self.objects)
 
     def put_object(self, **kwargs):
+        if kwargs["Key"].startswith("lake_manifest/"):
+            return {}            # lake_put's manifest line is not a pipeline write
         self.put_calls.append(kwargs)
         self.objects[kwargs["Key"]] = kwargs["Body"]
         return {}

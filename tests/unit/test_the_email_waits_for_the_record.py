@@ -151,6 +151,8 @@ class _S3:
         self.error, self.calls = error, []
 
     def put_object(self, **kw):
+        if kw["Key"].startswith("lake_manifest/"):
+            return
         self.calls.append(kw)
         if self.error:
             raise self.error
@@ -213,6 +215,8 @@ def test_a_brief_request_already_enqueued_is_not_an_error(monkeypatch):
 
     class _MixedS3:
         def put_object(self, **kw):
+            if kw["Key"].startswith("lake_manifest/"):
+                return
             calls.append(kw)
             if kw["Key"].startswith("session_finalize_requests/brief-"):
                 raise _client_error("PreconditionFailed", 412)
