@@ -50,6 +50,46 @@
 
 (Total: 11 numbered tasks; 4, 8 and 9 each split into sub-commits, 15 commits in all.)
 
+## Controller rulings (binding; override any task text below that disagrees)
+
+- **C1 (replaces A6). An external member's work never enters a home-company summary.**
+  P3 forbids the home company from seeing work on another company's site, so the
+  per-company summary leaves out every folder whose directory entry has
+  `has_external: true` (the same rule the weekly/monthly site rollups already apply) and
+  logs one INFO line per exclusion, with the folder only. Task 10 tests it: an external
+  member's daily is absent from both companies' summaries.
+- **C2. A split day's whole-day documents belong to nobody.** Resolver rule 4: when the
+  (folder, day) has recordings on sites of **more than one company**, the folder-level
+  derived documents of that day (`reports/{date}/{folder}/*`, `audio_segments/{folder}/{date}/`
+  roll-ups, and any other key with no session) resolve to `company_id NULL`,
+  `reason="split_day"`. They are counted and sampled like `unresolved`, and they are never
+  exported (P4: no whole-day document crosses companies). Session-keyed and recording-keyed
+  objects of that day still resolve through rules 1-3. When the day has **one** site
+  company but several sites, the company is that company and the site is NULL.
+  Tests go in Tasks 5 and 9a.
+- **C3 (replaces A1 for `count_transcripts_for_date`). No `lake_index/days/` document.**
+  Transcript keys are `transcripts/{folder}/{date}/...`. `count_transcripts_for_date`
+  lists `transcripts/{folder}/{date}/` once per folder in `config/directory.json` people
+  (already read by the generator through `directory.py`). When the directory is absent it
+  falls back to the old listing with a WARNING. No new published document, no new IAM.
+  The meeting-minutes part of Task 8b stands.
+- **C4. `lake_put` never sets tags on the object put.** Passing `Tagging=` to `put_object`
+  requires `s3:PutObjectTagging`. A writer missing that grant would see its **data put**
+  fail with AccessDenied, which would turn an index feature into an outage. Tags are applied
+  only by `LakeOpsFunction` (backfill/drain, `put_object_tagging`, behind the flag). So
+  writers need only `s3:PutObject` on `lake_manifest/*`, and Task 11 grants no
+  `PutObjectTagging` to any function except LakeOps.
+- **C5. No `AWS::IAM::ManagedPolicy`.** The template has never created one, and the deploy
+  role is known to lack some IAM/logs/SNS actions. Each `lake_put` caller gets an inline
+  statement (`s3:PutObject` on `lake_manifest/*`) in its own `Policies`, the same way
+  existing prefix grants are written. Task 11's test asserts the statement on each function
+  in the map.
+- **C6. Task 4 adopts `lake_put` only in writers of tenant objects** (`lake_keys.parse`
+  scope `tenant`). Writers of global prefixes keep `put_object`. Every adopted call site
+  keeps its exact `put_object` kwargs (ContentType, metadata, conditional headers such as
+  `IfMatch`/`IfNoneMatch`). The task's tests pin that a conditional put still sends its
+  condition.
+
 ## Ambiguities in the spec resolved here (flag to the owner if any is wrong)
 
 - **A1. `count_transcripts_for_date` is not a request path and cannot reach Aurora.** It lives in the nightly, non-VPC `lambda_report_generator.py:1552`. The spec lists it as a whole-prefix listing to replace. Resolution: org-api publishes a small day-index document `lake_index/days/{date}.json` (counts per kind and per company) from the index; the generator reads it and falls back to the old listing, with a WARNING, only when the document is absent. Same for meeting-minutes' folder discovery (`lambda_meeting_minutes.py:405-417`), which reads folders from `config/directory.json` instead (already read by that lambda).
