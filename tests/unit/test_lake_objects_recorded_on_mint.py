@@ -190,28 +190,63 @@ def test_an_unparseable_key_still_records_with_its_prefix_as_kind(monkeypatch):
 
 # ---- the owner helpers ----------------------------------------------------------------
 
-def test_the_site_helper_prefers_the_sites_company_and_falls_back(monkeypatch):
+def test_the_site_helper_is_certain_or_none_never_the_callers_company(monkeypatch):
+    sites_db = {SITE: COMPANY_B, "s2": COMPANY_B, "s3": COMPANY_A}
     monkeypatch.setattr(org.sites, "get_site",
-                        lambda conn, sid: {"id": sid, "company_id": COMPANY_B})
-    assert org._lake_company_for_sites(FakeConn(), CALLER, [SITE]) == COMPANY_B
-    assert org._lake_company_for_sites(FakeConn(), CALLER, []) == COMPANY_A
-    assert org._lake_company_for_sites(FakeConn(), CALLER, [SITE, "other"]) == COMPANY_A
+                        lambda conn, sid: ({"id": sid, "company_id": sites_db[sid]}
+                                           if sid in sites_db else None))
+    assert org._lake_company_for_sites(FakeConn(), [SITE]) == COMPANY_B
+    assert org._lake_company_for_sites(FakeConn(), [SITE, "s2"]) == COMPANY_B   # one company
+    assert org._lake_company_for_sites(FakeConn(), []) is None
+    assert org._lake_company_for_sites(FakeConn(), [SITE, "s3"]) is None        # two companies
+    assert org._lake_company_for_sites(FakeConn(), ["unknown"]) is None
 
     def boom(conn, sid):
         raise RuntimeError("x")
     monkeypatch.setattr(org.sites, "get_site", boom)
-    assert org._lake_company_for_sites(FakeConn(), CALLER, [SITE]) == COMPANY_A
+    assert org._lake_company_for_sites(FakeConn(), [SITE]) is None
 
 
 def test_the_session_helper_needs_exactly_one_site_company(monkeypatch):
+    look = lambda rows: monkeypatch.setattr(org.recordings, "session_site_companies",
+                                            lambda conn, f, d, s: rows)
+    look([("s1", COMPANY_B)])
+    assert org._lake_company_for_session(FakeConn(), "F", "2026-10-12", "sid") == COMPANY_B
+    look([("s1", COMPANY_B), ("s1", COMPANY_B)])
+    assert org._lake_company_for_session(FakeConn(), "F", "2026-10-12", "sid") == COMPANY_B
+    look([("s1", COMPANY_B), ("s2", COMPANY_A)])
+    assert org._lake_company_for_session(FakeConn(), "F", "2026-10-12", "sid") is None
+    look([])
+    assert org._lake_company_for_session(FakeConn(), "F", "2026-10-12", "sid") is None
+
+    def boom(conn, f, d, s):
+        raise RuntimeError("x")
+    monkeypatch.setattr(org.recordings, "session_site_companies", boom)
+    assert org._lake_company_for_session(FakeConn(), "F", "2026-10-12", "sid") is None
+
+
+def test_an_external_members_session_records_the_sites_company_or_none_never_home(
+        monkeypatch, recorder, post):
+    """Home company A, the session sits on a site of company B (the recorder is an external
+    member there). Every session-level minter records B when the lookup is certain, and
+    None when it is not. The caller's company A is never written (ruling R2a)."""
+    caller_co = t_name.CO
+    monkeypatch.setattr(t_name.FakeConn, "transaction", lambda self: _Savepoint(), raising=False)
+    # The ACL guard also reads session_site_companies; it is not under test here.
+    monkeypatch.setattr(org, "_session_site_company_guard", lambda *a, **k: None)
+    other = "dddddddd-dddd-dddd-dddd-dddddddddddd"
     monkeypatch.setattr(org.recordings, "session_site_companies",
-                        lambda conn, f, d, s: [("s1", COMPANY_B)])
-    assert org._lake_company_for_session(FakeConn(), CALLER, "F", "2026-10-12", "sid") == COMPANY_B
-    monkeypatch.setattr(org.recordings, "session_site_companies",
-                        lambda conn, f, d, s: [("s1", COMPANY_B), ("s2", COMPANY_A)])
-    assert org._lake_company_for_session(FakeConn(), CALLER, "F", "2026-10-12", "sid") == COMPANY_A
+                        lambda conn, f, d, s: [("s1", other)])
+    assert t_name._correct()["statusCode"] == 202
+    assert recorder[-1]["company_id"] == other != caller_co
     monkeypatch.setattr(org.recordings, "session_site_companies", lambda conn, f, d, s: [])
-    assert org._lake_company_for_session(FakeConn(), CALLER, "F", "2026-10-12", "sid") == COMPANY_A
+    assert t_name._correct()["statusCode"] == 202
+    assert recorder[-1]["company_id"] is None
+    monkeypatch.setattr(org.recordings, "session_site_companies",
+                        lambda conn, f, d, s: [("s1", other), ("s2", caller_co)])
+    assert t_name._correct()["statusCode"] == 202
+    assert recorder[-1]["company_id"] is None
+    assert all(c["company_id"] != caller_co for c in recorder)
 
 
 # ---- the other minters: the recorder saw the key that was put / signed -----------------
@@ -222,11 +257,13 @@ def test_regenerate_own_report_records_its_request_key(regen_own_s3, recorder):
     put = regen_own_s3["puts"][0]
     assert [c["key"] for c in recorder] == [put["Key"]]
     assert put["Key"].startswith("report_requests/Ada_L/")
+    assert recorder[0]["company_id"] is None, "a folder/day/range request can span companies"
 
 
 def test_session_expedite_records_the_marker_key(web, recorder):
     assert org.session_expedite(None, t_exp.CALLER, t_exp.BASE)["statusCode"] == 200
     assert [c["key"] for c in recorder] == [web.puts[-1][0]]
+    assert recorder[0]["company_id"] is None, "no session lookup answer -> no company"
 
 
 def test_regenerate_session_records_the_extraction_request_key(monkeypatch, recorder):
@@ -235,11 +272,16 @@ def test_regenerate_session_records_the_extraction_request_key(monkeypatch, reco
     monkeypatch.setattr(org.boto3, "client", lambda name, **kw: s3)
     monkeypatch.setattr(org, "_resolve_org_media_folder",
                         lambda conn, caller, user, what: ("Ben_UCPK2", None))
-    monkeypatch.setattr(org, "_lake_company_for_session", lambda *a: COMPANY_B)
+    monkeypatch.setattr(org, "_session_site_company_guard", lambda *a, **k: None)
+    monkeypatch.setattr(org, "_may_see_siteless_of", lambda *a, **k: True)
+    asked = []
+    monkeypatch.setattr(org, "_lake_company_for_session",
+                        lambda conn, f, d, s: asked.append((f, d, s)) or COMPANY_B)
     res = t_regen._call(monkeypatch, s3, [])
     assert res["statusCode"] == 202
     assert [c["key"] for c in recorder] == [s3.puts[0]["Key"]]
     assert recorder[0]["company_id"] == COMPANY_B
+    assert asked == [("Ben_UCPK2", "2026-08-27", t_regen.SESSION)]
 
 
 def test_voice_upload_records_the_site_company(monkeypatch, recorder):
@@ -260,6 +302,7 @@ def test_photo_selection_records_the_selection_key(photo_api, recorder):
     code, _ = call("PUT", {"excluded": []})
     assert code == 200
     assert [c["key"] for c in recorder] == list(store.objects)
+    assert recorder[0]["company_id"] is None
 
 
 def test_speaker_corrections_records_the_request_key(post, recorder):
@@ -267,13 +310,19 @@ def test_speaker_corrections_records_the_request_key(post, recorder):
     assert res["statusCode"] == 202
     assert len(recorder) == 1
     assert recorder[0]["key"].startswith(f"voiceprint_requests/{t_name.CO}/{t_name.SESSION}/")
-    assert recorder[0]["company_id"] == t_name.CO
+    assert recorder[0]["company_id"] is None, "unknown session -> no company, not the caller's"
 
 
 def test_day_and_session_report_requests_record_request_and_result_keys(day, recorder):
-    _mp, puts = day
+    mp, puts = day
+    mp.setattr(org.recordings, "session_site_companies",
+               lambda conn, f, d, s: [("s1", COMPANY_B)])
+    mp.setattr(org.sites, "get_site", lambda conn, sid: {"id": sid, "company_id": COMPANY_B})
+    mp.setattr(FakeConn, "transaction", lambda self: _Savepoint(), raising=False)
+    mp.setattr(t_gen.FakeConn, "transaction", lambda self: _Savepoint(), raising=False)
     res, _ = t_gen._generate_raw(day, {"deliver": "download"})
     assert res["statusCode"] == 202
+    assert {c["company_id"] for c in recorder} == {COMPANY_B}   # exactly one site company
     keys = [c["key"] for c in recorder]
     assert len(keys) == 2 and puts[0]["Key"] in keys
     assert json.loads(res["body"])["resultKey"] in keys
@@ -281,6 +330,7 @@ def test_day_and_session_report_requests_record_request_and_result_keys(day, rec
     puts.clear()
     res, _ = t_gen._session_generate_raw(day, t_gen.S1300, {"deliver": "download"})
     assert res["statusCode"] == 202
+    assert {c["company_id"] for c in recorder} == {COMPANY_B}   # the session lookup
     keys = [c["key"] for c in recorder]
     assert len(keys) == 2 and puts[0]["Key"] in keys
     assert json.loads(res["body"])["resultKey"] in keys
@@ -303,4 +353,12 @@ def test_speaker_match_records_each_run_key(monkeypatch, recorder):
                             {"body": json.dumps({"user": "Ben_UCPK2"})})
     assert res["statusCode"] == 202, res
     assert [c["key"] for c in recorder] == [p["Key"] for p in s3.puts]
-    assert recorder[0]["site_id"] == SITE and recorder[0]["company_id"] == COMPANY_A
+    assert recorder[0]["site_id"] is None and recorder[0]["company_id"] is None, (
+        "no session lookup answer -> neither company nor site is guessed")
+    recorder.clear()
+    s3.puts.clear()
+    monkeypatch.setattr(org.recordings, "session_site_companies",
+                        lambda conn, f, d, s: [("s1", COMPANY_B)])
+    assert org.speaker_match(FakeConn(), caller, session,
+                             {"body": json.dumps({"user": "Ben_UCPK2"})})["statusCode"] == 202
+    assert recorder[0]["company_id"] == COMPANY_B and recorder[0]["site_id"] == SITE
