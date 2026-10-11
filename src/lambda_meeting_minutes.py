@@ -63,6 +63,7 @@ import llm_utils
 from datetime import datetime, timedelta
 from io import BytesIO
 import batch_stitch
+import directory
 from output_language import OUTPUT_LANGUAGE_RULE
 from transcript_utils import (
     normalize_transcript, format_turns_for_prompt, get_time_bounds,
@@ -252,38 +253,13 @@ def download_json_from_s3(bucket, key):
 # User / Attendee Mapping
 # ============================================================
 
-_user_mapping_cache = None
-
-
 def load_user_mapping(bucket):
-    """
-    Load user mapping from S3 config/user_mapping.json.
-    Returns: {"device_id": "Display Name", ...}
-    """
-    global _user_mapping_cache
-    if _user_mapping_cache is not None:
-        return _user_mapping_cache
-
-    try:
-        data = download_json_from_s3(bucket, 'config/user_mapping.json')
-        if data:
-            raw_mapping = data.get('mapping', {})
-            normalized = {}
-            for device, value in raw_mapping.items():
-                if isinstance(value, str):
-                    normalized[device] = value
-                elif isinstance(value, dict):
-                    normalized[device] = value.get('name', device)
-                else:
-                    normalized[device] = str(value)
-            _user_mapping_cache = normalized
-            logger.info(f"Loaded user mapping: {len(normalized)} entries")
-            return _user_mapping_cache
-    except Exception as e:
-        logger.warning(f"Failed to load user mapping: {e}")
-
-    _user_mapping_cache = {}
-    return _user_mapping_cache
+    """{recording folder: display name}, from the published directory
+    (config/directory.json, built from Aurora by org-api). Keyed by the folder
+    the transcript was filed under (`transcripts/<folder>/...`), not by the
+    device id in the filename: device ids are not translated, and one that is
+    not a known folder passes through as it always did."""
+    return directory.names_by_folder(directory.load(s3_client, bucket))
 
 
 # ============================================================
@@ -389,7 +365,14 @@ def collect_transcripts(bucket, target_date, user_filter=None, custom_prefix=Non
         # sample, not from anything in its filename. The map rides inside the object;
         # a per-chunk transcript has no map and this is a no-op.
         normalized = batch_stitch.rebase_turns_from_embedded_map(
-            normalize_transcript(data, filename, user_mapping=user_mapping), data)
+            normalize_transcript(data, filename), data)
+        # THE SPEAKER NAME COMES FROM THE FOLDER. normalize_transcript looks a
+        # device id up in a {device: name} map; nothing publishes one any more,
+        # and the folder the recording was filed under already says who it is.
+        # An unknown folder leaves the device-derived name untouched.
+        folder_of_key, _d = _user_and_date_from_key(key)
+        if normalized and (user_mapping.get(folder_of_key) or '').strip():
+            normalized['speaker_name'] = user_mapping[folder_of_key]
         if normalized and normalized.get('full_text'):
             normalized['key'] = key
             # The Ask agent's own answer, played aloud into the meeting it is minuting. Same
@@ -1563,8 +1546,7 @@ def lambda_handler(event, context):
         return {'statusCode': 400, 'body': 'Missing S3_BUCKET'}
 
     # Reset cache
-    global _user_mapping_cache
-    _user_mapping_cache = None
+    directory.reset_cache()
 
     # Build meeting config from event
     meeting_config = {
