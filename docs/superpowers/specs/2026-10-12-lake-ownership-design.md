@@ -1,9 +1,8 @@
 # Sub-project 4 — who owns a lake object (design, 2026-10-12)
 
-Status: **draft for owner review.** Roadmap decision **D3**. Master:
-`2026-10-05-tenancy-roadmap-design.md`. This draft **recommends changing D3's mechanism**
-(no company segment in the key path) while keeping its three goals. Nothing here is built
-until the owner chooses.
+Status: **owner-approved 2026-10-12: option B, export only (no `delete_company`).**
+Roadmap decision **D3**. Master: `2026-10-05-tenancy-roadmap-design.md`. This changes D3's
+mechanism (no company segment in the key path) and keeps its three goals.
 
 ## D3's goals
 
@@ -77,9 +76,9 @@ until the owner chooses.
 
 Nightly batch jobs keep their listings for now, because they are not request paths.
 
-**L5. Per-tenant export and delete.**
-- A platform-admin task `{"task": "export_company", "company_id": …}` writes a manifest plus a zip to `exports/{company_id}/`.
-- `delete_company` is two-step: a dry-run count, then an owner-confirmed delete. It uses the index and the existing redaction or tombstone path, and it is irreversible.
+**L5. Per-tenant export.** A platform-admin task `{"task": "export_company", "company_id": …}`
+writes a manifest and a zip to `exports/{company_id}/`. **No delete** (owner, 2026-10-12):
+a per-company delete is irreversible and is left for a later design.
 
 **L6. Retire the lake-wide summary.** `reports/{date}/summary_report.json` aggregates every tenant. Today only platform_admin is served it.
 - Replace it with one summary per company: `reports/{date}/companies/{company_id}/summary_report.json`. This is a new key, so there is no parser conflict.
@@ -93,6 +92,7 @@ Nightly batch jobs keep their listings for now, because they are not request pat
 - Moving objects.
 - Per-tenant KMS.
 - Option C.
+- Deleting a company's data (owner, 2026-10-12).
 
 ## Tests that must go red without the change
 
@@ -103,8 +103,3 @@ Nightly batch jobs keep their listings for now, because they are not request pat
 - `count_transcripts_for_date` and report history make no whole-prefix listing.
 - `export_company(A)` contains no B object, including on a site that moved from B to A.
 - The per-company summary for A contains no B folder.
-
-## Owner decision needed
-
-1. **B (recommended) or A (as the roadmap wrote it).**
-2. Whether L5's `delete_company` is wanted now or later. Export alone is non-destructive.
