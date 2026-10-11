@@ -350,3 +350,28 @@ def test_r5g_external_member_with_no_recordings_that_day_is_null():
 def test_r5g_does_not_touch_days_that_have_recordings():
     f = world(externals={USER_ADA}, fdays={("Ada_L", DAY): day({SITE_A: CO_A})})
     assert resolve(f, T_KEY)["company_id"] == CO_A
+
+
+# ---- review fixes F1 / F2 ---------------------------------------------------------------------
+def test_f1_voice_key_with_a_missing_site_ignores_a_company_hint():
+    key = f"voice/{CO_A}/{uuid.uuid4()}/clip.wav"
+    o = resolve(world(), key, {"company_id": CO_A})
+    assert o["company_id"] is None and o["reason"] == "unresolved"
+
+
+AMBIG = {"tower": [{"id": SITE_A, "company_id": CO_A}, {"id": SITE_B, "company_id": CO_B}]}
+
+
+def test_f2_ambiguous_slug_accepts_a_hint_company_that_is_a_candidate_and_sets_its_site():
+    o = resolve(world(slugs=AMBIG), SR_KEY, {"company_id": CO_B})
+    assert (o["company_id"], o["site_id"], o["reason"]) == (CO_B, SITE_B, "hint")
+
+
+def test_f2_ambiguous_slug_rejects_a_hint_company_that_is_not_a_candidate():
+    o = resolve(world(slugs=AMBIG), SR_KEY, {"company_id": CO_C})
+    assert o["company_id"] is None and o["site_id"] is None
+
+
+def test_f2_ambiguous_slug_rejects_a_hint_site_that_is_not_a_candidate():
+    o = resolve(world(slugs=AMBIG), SR_KEY, {"site_id": SITE_A2})
+    assert o["company_id"] is None

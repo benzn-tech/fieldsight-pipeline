@@ -5290,14 +5290,18 @@ def drain_lake_manifest(conn, s3_client, *, dry_run=False, max_objects=500, buck
         out["malformed"] += bad
         objects.append({"bucket": bucket, "key": mkey, "lines": lines, "bad": bad})
 
-    merged = {}  # one resolution per key; a later line's hint and size win
+    merged = {}  # one resolution per key from its NEWEST line (by "t", else manifest order)
     for ob in objects:
         for ln in ob["lines"]:
-            cur = merged.setdefault(ln["key"], {"hint": {}, "size": None})
-            if isinstance(ln.get("hint"), dict):
-                cur["hint"] = {**cur["hint"], **ln["hint"]}
-            if isinstance(ln.get("size"), int) and not isinstance(ln["size"], bool):
-                cur["size"] = ln["size"]
+            cur = merged.get(ln["key"])
+            t = ln.get("t") if isinstance(ln.get("t"), str) else None
+            if cur is not None and t is not None and cur["t"] is not None and t < cur["t"]:
+                continue  # an older line never overrides a newer one
+            size = ln.get("size")
+            merged[ln["key"]] = {
+                "hint": ln["hint"] if isinstance(ln.get("hint"), dict) else {},
+                "size": size if isinstance(size, int) and not isinstance(size, bool) else None,
+                "t": t}
     owners = lake_owner.Resolver(conn).resolve_many(
         [(k, v["hint"]) for k, v in merged.items()])
 

@@ -325,7 +325,7 @@ def test_a_site_report_with_an_ambiguous_slug_takes_the_company_hint_only_withou
     _put(s3, key, {"company_id": str(w["a"]["id"])})
     _drain(db, s3)
     r = _row(db, key)
-    assert r[0] == w["a"]["id"] and r[1] is None
+    assert r[0] == w["a"]["id"] and r[1] == w["sa"]["id"]   # F2: the candidate site too
     # and a stale hint never overrides the DB: a unique slug is the site's company
     sites.archive_site(db, w["sb"]["id"], w["b"]["id"])
     s3b = FakeS3()
@@ -342,3 +342,32 @@ def test_voiceprint_company_in_the_key_is_stored(db):
     _put(s3, key)
     _drain(db, s3)
     assert _row(db, key)[0] == w["b"]["id"]
+
+
+def test_f3_the_newest_line_of_a_key_supplies_the_whole_hint(db):
+    """Two lines for one key: the hint is the newest line's, not a key-by-key merge, whatever
+    order the objects are listed in."""
+    w = _world(db)
+    s3 = FakeS3()
+    key = f"reports/{DAY}/sites/nosuch-{w['tag']}/site_report.json"
+
+    def line(t, hint, size):
+        return (json.dumps({"v": 1, "bucket": BUCKET, "key": key, "size": size, "t": t,
+                            "hint": hint}) + "\n").encode()
+    # listing order puts the NEWER object first, the older one second
+    s3.put_object(BUCKET, "lake_manifest/2026/10/01/a.jsonl",
+                  line("2026-10-01T10:00:00+00:00", {"company_id": str(w["b"]["id"])}, 20))
+    s3.put_object(BUCKET, "lake_manifest/2026/10/01/b.jsonl",
+                  line("2026-10-01T09:00:00+00:00", {"company_id": str(w["a"]["id"])}, 10))
+    _drain(db, s3)
+    r = _row(db, key)
+    assert r[0] == w["b"]["id"] and r[7] == 20
+    # a newer line with an EMPTY hint does not inherit the older line's company
+    key2 = key + "2"
+    s3.put_object(BUCKET, "lake_manifest/2026/10/01/c.jsonl",
+                  line("2026-10-01T09:00:00+00:00", {"company_id": str(w["a"]["id"])}, 1)
+                  .replace(key.encode(), key2.encode()))
+    s3.put_object(BUCKET, "lake_manifest/2026/10/01/d.jsonl",
+                  line("2026-10-01T10:00:00+00:00", {}, 2).replace(key.encode(), key2.encode()))
+    _drain(db, s3)
+    assert _row(db, key2)[0] is None

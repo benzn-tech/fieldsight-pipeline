@@ -282,13 +282,27 @@ class Resolver:
         hint_site = _uuid(hint.get("site_id"))
         hint_site_company = _s(self._c["site"].get(hint_site)) if hint_site else None
         carries = bool(p and (p["folder"] or p["sid"] or p["session_base"] or p["group_id"]))
+        cands = (self._c["slug"].get(p["site_slug"]) or []) if p and p["site_slug"] else []
         if o["company_id"] is None:
+            hc = _uuid(hint.get("company_id"))
             if o["reason"] == "split_day" or carries:
                 pass  # a hint never decides ownership of a folder/session/group key
+            elif p and p["kind"] == "voice":
+                pass  # A8: the company in a voice/ key is the caller's; a hint is no better
+            elif len(cands) > 1:
+                # F2: an ambiguous slug may only be settled by a hint naming one of the
+                # candidate sites (or their companies); anything else stays NULL.
+                by_id = {_s(c["id"]): _s(c["company_id"]) for c in cands}
+                if hint_site in by_id:
+                    o.update(company_id=by_id[hint_site], site_id=hint_site, reason="hint")
+                elif hc and hc in set(by_id.values()):
+                    mine = [i for i, c in by_id.items() if c == hc]
+                    o.update(company_id=hc, site_id=mine[0] if len(mine) == 1 else None,
+                             reason="hint")
             elif hint_site_company:
                 o.update(company_id=hint_site_company, site_id=hint_site, reason="hint")
-            elif _uuid(hint.get("company_id")):
-                o.update(company_id=_uuid(hint.get("company_id")), reason="hint")
+            elif hc:
+                o.update(company_id=hc, reason="hint")
         else:
             if (o["site_id"] is None and hint_site_company
                     and hint_site_company == o["company_id"]):
