@@ -137,3 +137,29 @@ def update_site(conn, site_id, company_id, name=None, location=None,
          "client": client, "ind": industry, "addr": address,
          "lat": latitude, "lng": longitude},
     ).fetchone()
+
+
+def companies_for_ids(conn, site_ids) -> dict:
+    """{site_id: company_id} for the sites that exist (archived ones included: an archived
+    site still owns its history)."""
+    ids = sorted({str(i) for i in (site_ids or []) if i})
+    if not ids:
+        return {}
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, company_id FROM sites WHERE id = ANY(%s::uuid[])", (ids,)).fetchall()
+    return {str(r["id"]): r["company_id"] for r in rows}
+
+
+def live_by_slugs(conn, slugs) -> dict:
+    """{slug: [{id, company_id}]} over live (not archived) sites. Slugs are unique per company
+    only, so the caller must treat more than one entry as ambiguous."""
+    slugs = sorted({s for s in (slugs or []) if s})
+    if not slugs:
+        return {}
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT slug, id, company_id FROM sites WHERE slug = ANY(%s) AND archived_at IS NULL",
+        (slugs,)).fetchall()
+    out = {}
+    for r in rows:
+        out.setdefault(r["slug"], []).append({"id": r["id"], "company_id": r["company_id"]})
+    return out

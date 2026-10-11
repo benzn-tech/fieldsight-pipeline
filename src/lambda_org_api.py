@@ -169,6 +169,7 @@ from repositories import (action_items, aliases, chunks, classification_feedback
                           voice_messages,
                           voiceprints)
 from repositories import lake_objects
+import lake_owner
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import (diff_candidates, first_match_span, learned_pairs, normalize,
                             occurrences)
@@ -386,6 +387,7 @@ COLLAPSE_PHOTOS_TASK = "collapse_multibound_photos"
 REBIND_DAY_TASK = "rebind_day_photos"
 RESTORE_MARKERS_TASK = "restore_day_markers"
 BACKFILL_LEGACY_TICKS_TASK = "backfill_legacy_ticks"
+DRAIN_LAKE_MANIFEST_TASK = "drain_lake_manifest"
 
 
 def lambda_handler(event, context):
@@ -399,6 +401,15 @@ def lambda_handler(event, context):
     if isinstance(event, dict) and event.get("task") == REPUBLISH_DIRECTORY_TASK:
         with get_connection() as conn:
             return republish_directory(conn, dry_run=event.get("dry_run") is True)
+    # OPERATOR TASK (lake ownership): turns lake_manifest/ lines into lake_objects rows.
+    # Same envelope rule as above: no API caller can reach it. Unlike the other operator
+    # tasks it runs for real by default: it is idempotent and deletes a manifest object only
+    # after its rows are committed. {"dry_run": true} writes and deletes nothing.
+    if isinstance(event, dict) and event.get("task") == DRAIN_LAKE_MANIFEST_TASK:
+        with get_connection() as conn:
+            return drain_lake_manifest(conn, s3(), dry_run=event.get("dry_run") is True,
+                                       max_objects=int(event.get("max_objects") or 500),
+                                       buckets=event.get("buckets"))
     # OPERATOR TASK, invoked by hand with `aws lambda invoke` (IAM decides who
     # may). The same envelope rule as above keeps it out of reach of the API.
     # A dry run unless "apply" is exactly true: a typo must not write.
@@ -5192,6 +5203,170 @@ def republish_directory(conn, dry_run=False):
                 "wrote" if changed else "found nothing to change",
                 len(doc["people"]), len(doc["sites"]))
     return {"changed": changed, "people": len(doc["people"]), "sites": len(doc["sites"])}
+
+
+_MANIFEST_PREFIX = "lake_manifest/"
+
+
+def _parse_manifest_object(body):
+    """(lines, malformed) from one manifest object. A line is kept only when it is a JSON
+    object of version 1 with a non-empty string key; anything else is malformed."""
+    lines, malformed = [], 0
+    try:
+        text = body.decode("utf-8")
+    except (UnicodeDecodeError, AttributeError):
+        return [], 1
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        try:
+            line = json.loads(raw)
+        except ValueError:
+            malformed += 1
+            continue
+        if (not isinstance(line, dict) or line.get("v") != 1
+                or not isinstance(line.get("key"), str) or not line["key"]):
+            malformed += 1
+            continue
+        lines.append(line)
+    return lines, malformed
+
+
+def _list_manifest_objects(s3_client, bucket, limit):
+    """Up to `limit` (bucket, key) pairs under lake_manifest/, paginated."""
+    out, token = [], None
+    while len(out) < limit:
+        kw = {"Bucket": bucket, "Prefix": _MANIFEST_PREFIX, "MaxKeys": min(1000, limit - len(out))}
+        if token:
+            kw["ContinuationToken"] = token
+        resp = s3_client.list_objects_v2(**kw)
+        out.extend((bucket, o["Key"]) for o in resp.get("Contents") or []
+                   if o["Key"] != _MANIFEST_PREFIX)
+        token = resp.get("NextContinuationToken")
+        if not resp.get("IsTruncated") or not token:
+            break
+    return out[:limit]
+
+
+def drain_lake_manifest(conn, s3_client, *, dry_run=False, max_objects=500, buckets=None):
+    """Read lake_manifest/ lines (written by lake_put) and upsert them into lake_objects.
+
+    Safety contract (Review Focus 1): a manifest object is deleted ONLY after every one of its
+    lines was upserted (or deliberately skipped) AND `conn.commit()` returned. It is kept when
+    a line is malformed, its upsert failed, the table is missing, or the delete itself failed.
+    Idempotent: a re-run upserts the same rows (the repository guard counts none as changed).
+    Lines of global / lake-wide keys are counted in `skipped` and never get a row (R5b);
+    keys of an unknown shape get a NULL-company row (`unknown_shape`, R5f). unresolved,
+    unknown_shape and split_day count unique keys; `lines` counts valid lines.
+    dry_run resolves and counts but writes and deletes nothing; `upserted` is then the number
+    of rows that WOULD be written (not net of unchanged rows)."""
+    out = {"manifests": 0, "lines": 0, "upserted": 0, "unresolved": 0, "unknown_shape": 0,
+           "split_day": 0, "skipped": 0, "malformed": 0, "deleted_manifests": 0, "kept": 0,
+           "table_missing": False, "dry_run": bool(dry_run), "unresolved_sample": []}
+    names = buckets if buckets is not None else [S3_BUCKET, LAKE_BUCKET]
+    names = list(dict.fromkeys(b for b in names if b))
+    budget = max(1, int(max_objects))
+    found = []
+    for b in names:
+        if len(found) >= budget:
+            break
+        try:
+            found.extend(_list_manifest_objects(s3_client, b, budget - len(found)))
+        except Exception:  # noqa: BLE001 - one unreadable bucket must not stop the other
+            logger.warning("lake drain: cannot list %s", b, exc_info=True)
+
+    objects = []  # {bucket, key, lines, bad}; an object that cannot be read is only counted
+    unread = 0
+    for bucket, mkey in found:
+        out["manifests"] += 1
+        try:
+            body = s3_client.get_object(Bucket=bucket, Key=mkey)["Body"].read()
+        except Exception:  # noqa: BLE001
+            logger.warning("lake drain: cannot read %s", mkey, exc_info=True)
+            unread += 1
+            continue
+        lines, bad = _parse_manifest_object(body)
+        out["lines"] += len(lines)
+        out["malformed"] += bad
+        objects.append({"bucket": bucket, "key": mkey, "lines": lines, "bad": bad})
+
+    merged = {}  # one resolution per key; a later line's hint and size win
+    for ob in objects:
+        for ln in ob["lines"]:
+            cur = merged.setdefault(ln["key"], {"hint": {}, "size": None})
+            if isinstance(ln.get("hint"), dict):
+                cur["hint"] = {**cur["hint"], **ln["hint"]}
+            if isinstance(ln.get("size"), int) and not isinstance(ln["size"], bool):
+                cur["size"] = ln["size"]
+    owners = lake_owner.Resolver(conn).resolve_many(
+        [(k, v["hint"]) for k, v in merged.items()])
+
+    rows = {}
+    for k, o in owners.items():
+        if o["scope"] in ("global", "lake_wide"):
+            out["skipped"] += 1
+            continue
+        if o["scope"] == "unknown":
+            out["unknown_shape"] += 1
+        elif o["company_id"] is None:
+            out["split_day" if o["reason"] == "split_day" else "unresolved"] += 1
+        if o["company_id"] is None and len(out["unresolved_sample"]) < 20:
+            out["unresolved_sample"].append({"key": k, "reason": o["reason"]})
+        rows[k] = {"key": k, "company_id": o["company_id"], "site_id": o["site_id"],
+                   "user_id": o["user_id"], "kind": o["kind"], "folder": o["folder"],
+                   "day": o["day"], "session_base": o["session_base"],
+                   "size_bytes": merged[k]["size"], "source": "manifest",
+                   "reason": None if o["company_id"] else o["reason"]}
+
+    if dry_run:
+        out["upserted"] = len(rows)
+        out["kept"] = unread + len(objects)
+        return out
+
+    deletable = []
+    kept = unread
+    for ob in objects:
+        mine = [rows[ln["key"]] for ln in ob["lines"] if ln["key"] in rows]
+        n = 0
+        if mine:
+            try:
+                with conn.transaction():
+                    n = lake_objects.upsert_many(conn, mine, on_missing=None)
+            except Exception:  # noqa: BLE001 - this object stays; the others carry on
+                logger.warning("lake drain: upsert failed for %s", ob["key"], exc_info=True)
+                kept += 1
+                continue
+            if n is None:
+                out["table_missing"] = True
+                break
+        out["upserted"] += n or 0
+        if ob["bad"]:
+            kept += 1
+        else:
+            deletable.append(ob)
+    if out["table_missing"]:
+        out["kept"] = unread + len(objects)  # nothing is deleted without the table
+        return out
+    conn.commit()  # rows are durable BEFORE any manifest object is deleted
+
+    by_bucket = {}
+    for ob in deletable:
+        by_bucket.setdefault(ob["bucket"], []).append(ob["key"])
+    for bucket, keys in by_bucket.items():
+        for i in range(0, len(keys), 1000):
+            chunk = keys[i:i + 1000]
+            try:
+                resp = s3_client.delete_objects(
+                    Bucket=bucket, Delete={"Objects": [{"Key": k} for k in chunk], "Quiet": True})
+                failed = len((resp or {}).get("Errors") or [])
+            except Exception:  # noqa: BLE001 - rows are committed; the next run re-upserts
+                logger.warning("lake drain: delete failed for %d object(s)", len(chunk),
+                               exc_info=True)
+                failed = len(chunk)
+            out["deleted_manifests"] += len(chunk) - failed
+            kept += failed
+    out["kept"] = kept
+    return out
 
 
 def republish_all_site_coords(conn):

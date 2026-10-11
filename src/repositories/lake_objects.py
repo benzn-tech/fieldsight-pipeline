@@ -34,7 +34,10 @@ _UPSERT = (
     "day = COALESCE(EXCLUDED.day, lake_objects.day), "
     "session_base = COALESCE(EXCLUDED.session_base, lake_objects.session_base), "
     "source = COALESCE(EXCLUDED.source, lake_objects.source), "
+    # A row that already has a company never takes a "why it has none" reason from a write
+    # that did not supply a company (the COALESCE kept the company, so the reason would lie).
     "reason = CASE WHEN EXCLUDED.company_id IS NOT NULL THEN EXCLUDED.reason "
+    "WHEN lake_objects.company_id IS NOT NULL THEN lake_objects.reason "
     "ELSE COALESCE(EXCLUDED.reason, lake_objects.reason) END, "
     "deleted_at = NULL, updated_at = now() "
     # Skip the write (and the updated_at bump) when nothing would change.
@@ -44,7 +47,8 @@ _UPSERT = (
                         "session_base", "source"))
     # reason: a write that supplies a company_id owns the reason too (NULL clears a stale one);
     # without a company_id only a non-NULL reason counts.
-    + "OR ((EXCLUDED.company_id IS NOT NULL OR EXCLUDED.reason IS NOT NULL) "
+    + "OR ((EXCLUDED.company_id IS NOT NULL "
+      "OR (EXCLUDED.reason IS NOT NULL AND lake_objects.company_id IS NULL)) "
       "AND EXCLUDED.reason IS DISTINCT FROM lake_objects.reason)")
 
 _REASSIGN = ("UPDATE lake_objects SET company_id=%s, reason=NULL, updated_at=now() "
@@ -114,10 +118,12 @@ def record_best_effort(conn, key, *, company_id, site_id=None, user_id=None, sou
         return False
 
 
-def upsert_many(conn, rows) -> int:
+def upsert_many(conn, rows, *, on_missing=0):
     """rows: dicts with the keyword names of upsert(), s3 key under `key`. Returns the number of
     rows actually written (inserted or changed); unchanged rows are skipped by the guard and
-    not counted."""
+    not counted. `on_missing` is what a missing table returns: the default 0 is
+    indistinguishable from "nothing changed", so the drain passes None and must not delete a
+    manifest object on it."""
     params = [_params(r["key"], r.get("company_id"), r.get("site_id"), r.get("user_id"),
                       r["kind"], r.get("folder"), r.get("day"), r.get("session_base"),
                       r.get("size_bytes"), r["source"], r.get("reason")) for r in rows]
@@ -128,7 +134,7 @@ def upsert_many(conn, rows) -> int:
         with conn.cursor() as cur:
             cur.executemany(_UPSERT, params)
             return cur.rowcount
-    return _run(conn, go, 0)
+    return _run(conn, go, on_missing)
 
 
 def reassign_site(conn, site_id, company_id) -> int:
