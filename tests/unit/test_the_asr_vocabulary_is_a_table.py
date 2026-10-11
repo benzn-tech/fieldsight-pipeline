@@ -106,6 +106,9 @@ class FakeTable:
     def __init__(self, rows=()):
         self.rows = {r["term"]: dict(r) for r in rows}
 
+    def scan(self, **kw):
+        return {"Items": [dict(r) for r in self.rows.values()]}
+
     def get_item(self, Key):
         r = self.rows.get(Key["term"])
         return {"Item": dict(r)} if r else {}
@@ -141,3 +144,50 @@ def test_add_records_what_it_was_heard_as_and_where():
     assert t.rows["Hiab"]["status"] == "retired"
     with pytest.raises(ValueError):
         s.add(t, "x", status="maybe")
+
+
+# ---- promote: TEST's decisions to prod -------------------------------------------
+
+
+def _promote(src, dst, answer="y"):
+    said = []
+    n = _script().promote(src, dst, "test", ask=lambda q: answer, show=said.append)
+    return n, said
+
+
+def test_THE_promote_carries_adds_and_retires_and_leaves_candidates_and_prod_only_rows():
+    src = FakeTable([{"term": "Hirepool", "status": "active", "misheard_as": ["Hiab"],
+                      "evidence": [{"date": "2026-10-08"}]},
+                     {"term": "Hiab", "status": "retired"},
+                     {"term": "washdown", "status": "candidate"}])
+    dst = FakeTable([{"term": "Hiab", "status": "active"},
+                     {"term": "Provista", "status": "active"}])
+    n, said = _promote(src, dst)
+    assert n == 2
+    assert dst.rows["Hirepool"]["status"] == "active" and dst.rows["Hirepool"]["misheard_as"] == ["Hiab"]
+    assert dst.rows["Hiab"]["status"] == "retired" and dst.rows["Hiab"]["promoted_from"] == "test"
+    assert "washdown" not in dst.rows, "a candidate is a note, not a decision"
+    assert dst.rows["Provista"]["status"] == "active", "a prod-only row is never touched"
+    assert any("1 add, 1 status" in line for line in said)
+
+
+def test_a_second_promote_has_nothing_to_do():
+    src = FakeTable([{"term": "Hirepool", "status": "active", "misheard_as": ["Hiab"]}])
+    dst = FakeTable()
+    _promote(src, dst)
+    n, said = _promote(src, dst)
+    assert n == 0 and said == ["nothing to promote: the target already agrees"]
+
+
+def test_new_heard_as_travels_and_merges_with_what_prod_already_knew():
+    src = FakeTable([{"term": "Hirepool", "status": "active", "misheard_as": ["hair pool"]}])
+    dst = FakeTable([{"term": "Hirepool", "status": "active", "misheard_as": ["Hiab"]}])
+    n, _ = _promote(src, dst)
+    assert n == 1 and dst.rows["Hirepool"]["misheard_as"] == ["Hiab", "hair pool"]
+
+
+def test_nothing_is_written_without_a_yes():
+    src = FakeTable([{"term": "Hirepool", "status": "active"}])
+    dst = FakeTable()
+    n, said = _promote(src, dst, answer="")
+    assert n == 0 and dst.rows == {} and said[-1] == "not applied"
