@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import boto3
+from lake_put import lake_put
 
 from db.connection import get_connection
 from repositories import users, voice_ask_log
@@ -51,9 +52,11 @@ def _write_sidecar(folder_name, answer):
     date_local = now_utc.astimezone(DEVICE_TZ).date().isoformat()
     key = (f"{VOICE_ASK_PREFIX}{folder_name}/{date_local}/"
            f"{now_utc.strftime('%H%M%S')}-{uuid.uuid4().hex[:8]}.json")
-    boto3.client("s3").put_object(
-        Bucket=S3_BUCKET, Key=key, ContentType="application/json",
-        Body=json.dumps({"at_utc": now_utc.isoformat(), "answer": answer}).encode("utf-8"),
+    lake_put(
+        S3_BUCKET, key,
+        json.dumps({"at_utc": now_utc.isoformat(), "answer": answer}).encode("utf-8"),
+        client=boto3.client("s3"), owner_hint={"folder": folder_name},
+        ContentType="application/json",
     )
     return key
 

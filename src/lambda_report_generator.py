@@ -64,6 +64,7 @@ import logging
 import re
 from urllib.parse import unquote_plus
 import boto3
+from lake_put import lake_put
 import urllib3
 import agent_turn_filter
 from output_language import OUTPUT_LANGUAGE_RULE
@@ -534,9 +535,11 @@ def save_debug_record(bucket, target_date, user_name, prompt, raw_response,
             'raw_response_length': len(raw_response) if raw_response else 0,
             'parsed_json': parsed_json,
         }
-        s3_client.put_object(
-            Bucket=bucket, Key=debug_key,
-            Body=json.dumps(debug_record, ensure_ascii=False, indent=2, default=str),
+        lake_put(
+            bucket, debug_key,
+            json.dumps(debug_record, ensure_ascii=False, indent=2, default=str),
+            client=s3_client,
+            owner_hint=None if user_name == '_summary' else {"folder": user_name},
             ContentType='application/json'
         )
         logger.info(f"  Saved debug: {debug_key}")
@@ -632,14 +635,15 @@ def run_weather_forecasts(date=None, fetch=weather_advice.hourly_forecast,
             continue
         daily = (build_weather_block_for_site(info, date, date) if fetch_daily is None
                  else build_weather_block_for_site(info, date, date, fetch=fetch_daily))
-        s3_client.put_object(
-            Bucket=S3_BUCKET,
-            Key=weather_record_key(entry["site_id"], date, False),
-            Body=json.dumps({"site_id": entry["site_id"], "site_slug": slug, "date": date,
-                             "generated_at": get_nzdt_now().isoformat(),
-                             "daily": daily, "summary": weather.summary_lines(daily),
-                             **findings},
-                            default=str).encode("utf-8"),
+        lake_put(
+            S3_BUCKET,
+            weather_record_key(entry["site_id"], date, False),
+            json.dumps({"site_id": entry["site_id"], "site_slug": slug, "date": date,
+                        "generated_at": get_nzdt_now().isoformat(),
+                        "daily": daily, "summary": weather.summary_lines(daily),
+                        **findings},
+                       default=str).encode("utf-8"),
+            client=s3_client,
             ContentType="application/json")
         written.append(slug)
     logger.info(f"weather forecasts for {date}: {len(written)} written, "
@@ -1729,13 +1733,14 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
         record_site = weather_record_site(user_site_info, user_site_slug)
         if weather_findings and record_site:
             try:
-                s3_client.put_object(
-                    Bucket=S3_BUCKET,
-                    Key=weather_record_key(record_site, target_date, weather_findings["actual"]),
-                    Body=json.dumps({"site_id": record_site, "site_slug": user_site_slug,
-                                     "date": target_date,
-                                     "daily": weather_block, **weather_findings},
-                                    default=str).encode("utf-8"),
+                lake_put(
+                    S3_BUCKET,
+                    weather_record_key(record_site, target_date, weather_findings["actual"]),
+                    json.dumps({"site_id": record_site, "site_slug": user_site_slug,
+                                "date": target_date,
+                                "daily": weather_block, **weather_findings},
+                               default=str).encode("utf-8"),
+                    client=s3_client,
                     ContentType="application/json")
             except Exception as e:
                 logger.warning(f"could not keep the weather record for {user_site_id}/{target_date}: {e}")
@@ -1871,9 +1876,10 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
             report['sections'] = []
 
         json_key = f"{REPORT_PREFIX}{target_date}/{user_name}/daily_report.json"
-        s3_client.put_object(
-            Bucket=S3_BUCKET, Key=json_key,
-            Body=json.dumps(report, ensure_ascii=False, indent=2, default=str),
+        lake_put(
+            S3_BUCKET, json_key,
+            json.dumps(report, ensure_ascii=False, indent=2, default=str),
+            client=s3_client, owner_hint={"folder": user_name},
             ContentType='application/json'
         )
         logger.info(f"Saved: {json_key}")
@@ -1882,9 +1888,10 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
             word_buffer = generate_word_document(report, f"Daily Report \u2014 {user_name} \u2014 {target_date}")
             if word_buffer:
                 word_key = f"{REPORT_PREFIX}{target_date}/{user_name}/daily_report.docx"
-                s3_client.put_object(
-                    Bucket=S3_BUCKET, Key=word_key,
-                    Body=word_buffer.getvalue(),
+                lake_put(
+                    S3_BUCKET, word_key,
+                    word_buffer.getvalue(),
+                    client=s3_client, owner_hint={"folder": user_name},
                     ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
                 )
                 logger.info(f"Saved: {word_key}")
@@ -1980,9 +1987,10 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
                         }
 
                         json_key = f"{REPORT_PREFIX}{target_date}/summary_report.json"
-                        s3_client.put_object(
-                            Bucket=S3_BUCKET, Key=json_key,
-                            Body=json.dumps(combined_report, ensure_ascii=False, indent=2, default=str),
+                        lake_put(
+                            S3_BUCKET, json_key,
+                            json.dumps(combined_report, ensure_ascii=False, indent=2, default=str),
+                            client=s3_client,
                             ContentType='application/json'
                         )
                         logger.info(f"Saved: {json_key}")
@@ -1991,9 +1999,10 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
                             word_buffer = generate_word_document(combined_report, f"Daily Summary \u2014 {target_date}")
                             if word_buffer:
                                 word_key = f"{REPORT_PREFIX}{target_date}/summary_report.docx"
-                                s3_client.put_object(
-                                    Bucket=S3_BUCKET, Key=word_key,
-                                    Body=word_buffer.getvalue(),
+                                lake_put(
+                                    S3_BUCKET, word_key,
+                                    word_buffer.getvalue(),
+                                    client=s3_client,
                                     ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
                                 )
                                 logger.info(f"Saved: {word_key}")
@@ -2125,8 +2134,9 @@ def generate_periodic_report(report_type, start_date, end_date, user=None, trigg
 
         safe_user = user_name.replace(' ', '_')
         json_key = f"{REPORT_PREFIX}{end_date}/{safe_user}/{report_type}_report.json"
-        s3_client.put_object(Bucket=S3_BUCKET, Key=json_key,
-            Body=json.dumps(user_report, ensure_ascii=False, indent=2, default=str),
+        lake_put(S3_BUCKET, json_key,
+            json.dumps(user_report, ensure_ascii=False, indent=2, default=str),
+            client=s3_client, owner_hint={"folder": safe_user},
             ContentType='application/json')
         logger.info(f"  Saved: {json_key}")
 
@@ -2135,8 +2145,9 @@ def generate_periodic_report(report_type, start_date, end_date, user=None, trigg
             word_buffer = generate_word_document(user_report, title)
             if word_buffer:
                 word_key = f"{REPORT_PREFIX}{end_date}/{safe_user}/{report_type}_report.docx"
-                s3_client.put_object(Bucket=S3_BUCKET, Key=word_key,
-                    Body=word_buffer.getvalue(),
+                lake_put(S3_BUCKET, word_key,
+                    word_buffer.getvalue(),
+                    client=s3_client, owner_hint={"folder": safe_user},
                     ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
                 logger.info(f"  Saved: {word_key}")
         except Exception as e:
@@ -2210,8 +2221,9 @@ def generate_periodic_report(report_type, start_date, end_date, user=None, trigg
         }
 
         json_key = f"{REPORT_PREFIX}{end_date}/sites/{site_id}/{report_type}_report.json"
-        s3_client.put_object(Bucket=S3_BUCKET, Key=json_key,
-            Body=json.dumps(site_report, ensure_ascii=False, indent=2, default=str),
+        lake_put(S3_BUCKET, json_key,
+            json.dumps(site_report, ensure_ascii=False, indent=2, default=str),
+            client=s3_client,
             ContentType='application/json')
         logger.info(f"  Saved: {json_key}")
 
@@ -2220,8 +2232,9 @@ def generate_periodic_report(report_type, start_date, end_date, user=None, trigg
             word_buffer = generate_word_document(site_report, title)
             if word_buffer:
                 word_key = f"{REPORT_PREFIX}{end_date}/sites/{site_id}/{report_type}_report.docx"
-                s3_client.put_object(Bucket=S3_BUCKET, Key=word_key,
-                    Body=word_buffer.getvalue(),
+                lake_put(S3_BUCKET, word_key,
+                    word_buffer.getvalue(),
+                    client=s3_client,
                     ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
                 logger.info(f"  Saved: {word_key}")
         except Exception as e:
@@ -2258,8 +2271,9 @@ def generate_periodic_report(report_type, start_date, end_date, user=None, trigg
                     }
                 }
                 json_key = f"{REPORT_PREFIX}{end_date}/{report_type}_report.json"
-                s3_client.put_object(Bucket=S3_BUCKET, Key=json_key,
-                    Body=json.dumps(combined_report, ensure_ascii=False, indent=2, default=str),
+                lake_put(S3_BUCKET, json_key,
+                    json.dumps(combined_report, ensure_ascii=False, indent=2, default=str),
+                    client=s3_client,
                     ContentType='application/json')
                 logger.info(f"  Saved: {json_key}")
                 try:
@@ -2267,8 +2281,9 @@ def generate_periodic_report(report_type, start_date, end_date, user=None, trigg
                     word_buffer = generate_word_document(combined_report, title)
                     if word_buffer:
                         word_key = f"{REPORT_PREFIX}{end_date}/{report_type}_report.docx"
-                        s3_client.put_object(Bucket=S3_BUCKET, Key=word_key,
-                            Body=word_buffer.getvalue(),
+                        lake_put(S3_BUCKET, word_key,
+                            word_buffer.getvalue(),
+                            client=s3_client,
                             ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
                         logger.info(f"  Saved: {word_key}")
                 except Exception as e:

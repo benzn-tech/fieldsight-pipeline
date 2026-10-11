@@ -41,6 +41,8 @@ class _CapturingS3:
         self.puts = []
 
     def put_object(self, **kw):
+        if kw["Key"].startswith("lake_manifest/"):
+            return {}            # lake_put's manifest line is not a report write
         self.puts.append(kw["Key"])
         return {}
 

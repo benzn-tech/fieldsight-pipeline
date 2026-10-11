@@ -22,6 +22,7 @@ from urllib.parse import unquote_plus
 
 import boto3
 
+from lake_put import lake_put
 import checklist
 import chunking
 import lambda_meeting_minutes
@@ -611,8 +612,8 @@ def _content_to_minutes(artifact):
 
 
 def _write_result(result_key, payload):
-    s3().put_object(Bucket=S3_BUCKET, Key=result_key,
-                    Body=json.dumps(payload), ContentType="application/json")
+    lake_put(S3_BUCKET, result_key, json.dumps(payload), client=s3(),
+             ContentType="application/json")
 
 
 def _send_email(artifact):
@@ -876,8 +877,9 @@ def _put_document(artifact, buf):
     """Puts a generated docx at the same address a topics-assembled one would use,
     and returns its key -- mirrors the inline put in `process_request` below."""
     doc_key = _doc_key(artifact)
-    s3().put_object(Bucket=S3_BUCKET, Key=doc_key,
-                    Body=buf.getvalue(), ContentType=DOCX_CONTENT_TYPE)
+    lake_put(S3_BUCKET, doc_key, buf.getvalue(), client=s3(),
+             owner_hint={"folder": artifact["folder"]},
+             ContentType=DOCX_CONTENT_TYPE)
     return doc_key
 
 
@@ -1222,8 +1224,9 @@ def process_request(artifact, context=None):
                                        "error": "document generation unavailable", **scope_fields})
             return
         doc_key = _doc_key(artifact)
-        s3().put_object(Bucket=S3_BUCKET, Key=doc_key,
-                        Body=buf.getvalue(), ContentType=DOCX_CONTENT_TYPE)
+        lake_put(S3_BUCKET, doc_key, buf.getvalue(), client=s3(),
+                 owner_hint={"folder": artifact["folder"]},
+                 ContentType=DOCX_CONTENT_TYPE)
         emailed = False
         if artifact.get("deliver") == "email":
             _send_email(artifact)

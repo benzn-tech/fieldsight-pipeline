@@ -40,7 +40,9 @@ def _run(monkeypatch, artifact, deleted_by_folder=None):
     monkeypatch.setattr(rep, "_content_to_minutes", lambda a: ({}, "A day"))
     monkeypatch.setattr(rep, "generate_word_document", lambda m, t: io.BytesIO(b"x"))
     monkeypatch.setattr(rep, "s3", lambda: type("S", (), {
-        "put_object": staticmethod(lambda **kw: put.append(kw["Key"]))})())
+        "put_object": staticmethod(
+            lambda **kw: None if kw["Key"].startswith("lake_manifest/")  # lake_put's manifest line
+            else put.append(kw["Key"]))})())
     rep.process_request(artifact)
     return sent, written, put, asked
 

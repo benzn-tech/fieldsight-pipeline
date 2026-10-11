@@ -24,6 +24,7 @@ import time
 from urllib.parse import unquote_plus
 
 import extraction_pending
+from lake_put import lake_put
 
 logger = logging.getLogger()
 # INFO, set HERE. The Lambda runtime leaves the root logger at WARNING, and this
@@ -496,9 +497,10 @@ def _already_sent(result_id):
 def _default_write_result(session_id, payload):
     """Record the send outcome the in-VPC sweep's reconcile pass reads."""
     import boto3
-    boto3.client("s3").put_object(
-        Bucket=S3_BUCKET, Key=f"{FINALIZE_RESULTS_PREFIX}{session_id}.json",
-        Body=json.dumps(payload), ContentType="application/json")
+    lake_put(
+        S3_BUCKET, f"{FINALIZE_RESULTS_PREFIX}{session_id}.json",
+        json.dumps(payload), client=boto3.client("s3"),
+        ContentType="application/json")
 
 
 def _complete_summary(artifact, summarize=None):
@@ -548,9 +550,11 @@ def _store_brief(folder, date, session_id, brief):
     try:
         import boto3
         key = f"{BRIEF_PREFIX}{folder}/{date}/sid{session_id}/latest.json"
-        boto3.client("s3").put_object(
-            Bucket=S3_BUCKET, Key=key,
-            Body=json.dumps(brief, ensure_ascii=False).encode("utf-8"),
+        lake_put(
+            S3_BUCKET, key,
+            json.dumps(brief, ensure_ascii=False).encode("utf-8"),
+            client=boto3.client("s3"),
+            owner_hint={"folder": folder, "session_base": f"sid{session_id}"},
             ContentType="application/json")
         logger.info("session brief stored at %s", key)
     except Exception:
@@ -911,9 +915,9 @@ def _recheck_final_extraction(artifact):
         data = json.dumps(body, ensure_ascii=False)
         etag = obj.get("ETag")
         try:
-            s3.put_object(Bucket=S3_BUCKET, Key=key, Body=data,
-                          ContentType="application/json",
-                          **({"IfMatch": etag} if etag else {}))
+            lake_put(S3_BUCKET, key, data, client=s3,
+                     ContentType="application/json",
+                     **({"IfMatch": etag} if etag else {}))
         except Exception as e:  # noqa: BLE001
             code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
             if code in ("PreconditionFailed", "ConditionalRequestConflict"):
@@ -924,8 +928,8 @@ def _recheck_final_extraction(artifact):
                 return True
             if type(e).__name__ != "ParamValidationError":
                 raise
-            s3.put_object(Bucket=S3_BUCKET, Key=key, Body=data,
-                          ContentType="application/json")
+            lake_put(S3_BUCKET, key, data, client=s3,
+                     ContentType="application/json")
         logger.info("finalize: %s's final extraction beat the error email -- re-fired the "
                     "follow-up", sid)
         break
