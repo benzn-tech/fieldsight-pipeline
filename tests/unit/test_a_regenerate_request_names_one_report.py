@@ -228,3 +228,28 @@ def test_a_personal_monthly_does_not_list_every_weekly_in_the_bucket(periodic):
                                 user="Ben_UCPK2", triggered_by="x@y.z")
     assert listed == []
     assert s3.puts == ["reports/2026-09-30/Ben_UCPK2/monthly_report.json"], s3.puts
+
+
+# ---- the scheduled run reads everyone, every day, and reaches the site reports ----
+
+def test_the_scheduled_weekly_reads_every_person_on_every_day(periodic, monkeypatch):
+    """The read loop once reused the `user` parameter as its loop variable: after the
+    first daily it found, the run turned into one person's report -- later days read
+    only that person, and the site reports were never written."""
+    s3, reads, listed, dailies = periodic
+    for day in ("2026-09-01", "2026-09-02"):
+        for name in ("Ben_UCPK2", "Neil_Blunden"):
+            dailies[f"reports/{day}/{name}/daily_report.json"] = {"user_name": name, "report_date": day}
+    monkeypatch.setattr(rg, "list_s3_objects", lambda b, prefix: [
+        {"key": k} for k in dailies if k.startswith(prefix)])
+    monkeypatch.setattr(rg, "external_folders", lambda b: set())
+    monkeypatch.setattr(rg, "get_user_site_mapping", lambda b: (
+        {"Ben_UCPK2": "site-1", "Neil_Blunden": "site-1"},
+        {"Ben_UCPK2": ["site-1"], "Neil_Blunden": ["site-1"]},
+        {"Ben_UCPK2": "site_manager", "Neil_Blunden": "site_manager"},
+        {"site-1": {"name": "UC PK", "slug": "uc-pk"}}))
+    result = rg.generate_periodic_report("weekly", "2026-08-31", "2026-09-06")
+    assert result["per_user"]["Ben_UCPK2"]["daily_reports"] == 2, result
+    assert result["per_user"]["Neil_Blunden"]["daily_reports"] == 2, result
+    assert result.get("scope") != "user"
+    assert any("/sites/" in k or "uc-pk" in k for k in s3.puts), s3.puts
