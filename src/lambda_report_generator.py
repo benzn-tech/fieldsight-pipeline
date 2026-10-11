@@ -2051,15 +2051,14 @@ def generate_periodic_report(report_type, start_date, end_date, user=None, trigg
                 data = download_json_from_s3(S3_BUCKET, key)
                 if data and data.get('user_name'):
                     all_daily_reports.append(data)
-                    user = data['user_name']
-                    reports_by_user.setdefault(user, []).append(data)
+                    reports_by_user.setdefault(data['user_name'], []).append(data)
                     found_per_user = True
             elif '/by_user/' in key and key.endswith('.json') and '_debug' not in key:
                 data = download_json_from_s3(S3_BUCKET, key)
                 if data:
-                    user = data.get('user_name', data.get('user', 'Unknown'))
+                    author = data.get('user_name', data.get('user', 'Unknown'))
                     all_daily_reports.append(data)
-                    reports_by_user.setdefault(user, []).append(data)
+                    reports_by_user.setdefault(author, []).append(data)
                     found_per_user = True
         if not found_per_user:
             summary_key = f"{REPORT_PREFIX}{date_str}/summary_report.json"
