@@ -3,7 +3,13 @@ from psycopg.rows import dict_row
 
 _COLS = ("id, company_id, kind, site_slug, report_date, author_sub, author_name, "
          "observation, risk_level, recommended_action, status, archived_at, "
-         "created_at, updated_at")
+         "created_at, updated_at, "
+         # The author's recording folder (an identity key), looked up from the
+         # directory by cognito_sub. author_name is a display name and must never
+         # be turned back into a folder. NULL when the author has no directory row.
+         "(SELECT u.folder_name FROM users u "
+         "WHERE u.cognito_sub = observations.author_sub "
+         "AND u.company_id = observations.company_id) AS author_folder")
 
 
 def create_observation(conn, company_id, kind, site_slug, author_sub, author_name,
