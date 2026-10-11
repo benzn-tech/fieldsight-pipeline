@@ -27,9 +27,19 @@ _UPSERT = (
     "site_id = COALESCE(EXCLUDED.site_id, lake_objects.site_id), "
     "user_id = COALESCE(EXCLUDED.user_id, lake_objects.user_id), "
     "size_bytes = COALESCE(EXCLUDED.size_bytes, lake_objects.size_bytes), "
+    "kind = COALESCE(EXCLUDED.kind, lake_objects.kind), "
+    "folder = COALESCE(EXCLUDED.folder, lake_objects.folder), "
+    "day = COALESCE(EXCLUDED.day, lake_objects.day), "
+    "session_base = COALESCE(EXCLUDED.session_base, lake_objects.session_base), "
+    "source = COALESCE(EXCLUDED.source, lake_objects.source), "
     "reason = CASE WHEN EXCLUDED.company_id IS NOT NULL THEN EXCLUDED.reason "
     "ELSE COALESCE(EXCLUDED.reason, lake_objects.reason) END, "
-    "deleted_at = NULL, updated_at = now()")
+    "deleted_at = NULL, updated_at = now() "
+    # Skip the write (and the updated_at bump) when nothing would change.
+    "WHERE lake_objects.deleted_at IS NOT NULL "
+    + "".join(f"OR (EXCLUDED.{c} IS NOT NULL AND EXCLUDED.{c} IS DISTINCT FROM lake_objects.{c}) "
+              for c in ("company_id", "site_id", "user_id", "size_bytes", "kind", "folder", "day",
+                        "session_base", "source", "reason")))
 
 _REASSIGN = ("UPDATE lake_objects SET company_id=%s, reason=NULL, updated_at=now() "
              "WHERE site_id=%s AND company_id IS DISTINCT FROM %s")

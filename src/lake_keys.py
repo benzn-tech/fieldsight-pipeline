@@ -5,7 +5,8 @@ _DATE = r"(?P<day>\d{4}-\d{2}-\d{2})"
 _FOLDER = r"(?P<folder>[^/]+)"
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 SID_RE = re.compile(r"sid(?P<sid>[0-9a-f]{32})")
-_BARE_SID_RE = re.compile(r"^[0-9a-f]{32}$")
+_SID_SEGMENT_RE = re.compile(r"^(?P<sid>[0-9a-f]{32})(?:-(?:updated|notes))?$")
+_UUID_RE = re.compile(rf"^{_UUID}$")
 
 _TENANT = [
     ("media",        rf"^users/{_FOLDER}/(?:video|audio|pictures)/{_DATE}/[^/]+$"),
@@ -31,10 +32,11 @@ _SESSION = [  # folder only in the payload; the session id is the only handle
 ]
 _SITE_OR_COMPANY = [
     ("voice",       rf"^voice/(?P<company_id>{_UUID})/(?P<site_id>{_UUID})/[^/]+$"),
-    ("voiceprint",  rf"^voiceprint_requests/(?P<company_id>{_UUID})/[^/]+/[^/]+$"),
+    ("voiceprint",  rf"^voiceprint_requests/(?P<company_id>{_UUID})/(?P<base>[^/]+)/[^/]+$"),
     ("match",       rf"^match_requests/(?P<site_id>{_UUID})/{_DATE}/[^/]+$"),
-    ("weather",     rf"^weather/(?P<site_id>{_UUID})/{_DATE}/[^/]+$"),
-    ("programme",   rf"^programmes/(?P<site_id>{_UUID})/[^/]+$"),
+    # weather/ and programmes/ carry a site uuid, or the site slug as a fallback
+    ("weather",     rf"^weather/(?P<site_ref>[^/]+)/{_DATE}/[^/]+$"),
+    ("programme",   r"^programmes/(?P<site_ref>[^/]+)/[^/]+$"),
 ]
 _LAKE_WIDE = [rf"^reports/{_DATE}/[^/]+_report\.[a-z]+$", rf"^reports/{_DATE}/summary_report[^/]*$"]
 _MEETING_MINUTES = re.compile(r"^meeting_minutes/.+$")
@@ -50,16 +52,26 @@ _LAKE_WIDE_RE = [re.compile(p) for p in _LAKE_WIDE]
 
 def _result(scope, kind, **kw):
     out = {"scope": scope, "kind": kind, "folder": None, "day": None, "session_base": None,
-           "sid": None, "site_id": None, "company_id": None}
+           "sid": None, "site_id": None, "site_slug": None, "company_id": None, "group_id": None}
     out.update(kw)
     return out
 
 
-def _sid_of(name):
-    m = SID_RE.search(name)
+def _find_sid(key):
+    """The 32-hex session id anywhere in a key: `sid{hex}` in a file or directory name, or a
+    bare `{hex}[-updated|-notes]` path segment (extension ignored)."""
+    m = SID_RE.search(key)
     if m:
         return m.group("sid")
-    return name if _BARE_SID_RE.match(name) else None
+    for seg in key.split("/"):
+        m = _SID_SEGMENT_RE.match(seg.rsplit(".", 1)[0] if "." in seg else seg)
+        if m:
+            return m.group("sid")
+    return None
+
+
+def _stem(name):
+    return name.rsplit(".", 1)[0] if "." in name else name
 
 
 def parse(key):
@@ -77,21 +89,41 @@ def parse(key):
     m = _SITE_REPORT.match(key)
     if m:
         return _result("tenant", "site_report", day=m.group("day"), site_slug=m.group("site_slug"))
+    last = key.rsplit("/", 1)[-1]
     for kind, rx in _TENANT_RE:
         m = rx.match(key)
         if m:
             g = m.groupdict()
+            extra = {}
+            if kind in ("extraction", "transcript"):
+                stem = _stem(last)
+                if kind == "extraction" and stem.startswith("grp"):
+                    extra["group_id"] = stem[3:]  # merged group extraction, not one session
+                else:
+                    extra["session_base"] = stem
             return _result("tenant", kind, folder=g.get("folder"), day=g.get("day"),
-                           sid=_sid_of(key.rsplit("/", 1)[-1]))
+                           sid=_find_sid(key), **extra)
     for kind, rx in _SESSION_RE:
         m = rx.match(key)
         if m:
             base = m.group("base")
-            return _result("tenant", kind, session_base=base, sid=_sid_of(base))
+            if base.startswith("group-"):
+                return _result("tenant", kind, group_id=base[len("group-"):])
+            sm = _SID_SEGMENT_RE.match(base)
+            if sm:  # session_finalize_requests/{sid}-updated: the session is {sid}
+                return _result("tenant", kind, session_base=sm.group("sid"), sid=sm.group("sid"))
+            return _result("tenant", kind, session_base=base, sid=_find_sid(key))
     for kind, rx in _SITE_RE:
         m = rx.match(key)
         if m:
             g = m.groupdict()
-            return _result("tenant", kind, day=g.get("day"), site_id=g.get("site_id"),
-                           company_id=g.get("company_id"))
+            site_id = g.get("site_id")
+            site_slug = None
+            if "site_ref" in g:
+                if _UUID_RE.match(g["site_ref"]):
+                    site_id = g["site_ref"]
+                else:
+                    site_slug = g["site_ref"]
+            return _result("tenant", kind, day=g.get("day"), site_id=site_id, site_slug=site_slug,
+                           company_id=g.get("company_id"), session_base=g.get("base"))
     return None

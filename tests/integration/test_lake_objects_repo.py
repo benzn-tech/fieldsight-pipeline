@@ -121,3 +121,111 @@ def test_source_check_constraint(db):
     with pytest.raises(pe.CheckViolation):
         with db.transaction():
             lake_objects.upsert(db, "bad", company_id=None, kind="media", source="nonsense")
+
+
+# ---- fix round 1 ----
+
+def _full(db, key):
+    return db.execute("SELECT user_id, size_bytes, kind, folder, day, session_base, source, updated_at "
+                      "FROM lake_objects WHERE s3_key=%s", (key,)).fetchone()
+
+
+def test_missing_table_leaves_the_callers_transaction_usable(db):
+    """The real savepoint: UndefinedTable inside an open transaction must not abort it."""
+    db.execute("DROP TABLE lake_objects")  # rolled back with the test transaction
+    assert lake_objects.upsert(db, "k", company_id=None, kind="media", source="upload") is False
+    assert lake_objects.count(db) == 0
+    assert lake_objects.owners_for_company(db, "11111111-1111-1111-1111-111111111111") == []
+    assert db.execute("SELECT 1").fetchone()[0] == 1
+
+
+def test_upsert_coalesces_user_and_size(db):
+    a, _, _, _ = _world(db)
+    uid = "33333333-3333-3333-3333-333333333333"
+    lake_objects.upsert(db, "k", company_id=a["id"], user_id=uid, size_bytes=42, kind="media", source="upload")
+    lake_objects.upsert(db, "k", company_id=None, kind="media", source="upload")
+    row = _full(db, "k")
+    assert str(row[0]) == uid and row[1] == 42
+    lake_objects.upsert(db, "k", company_id=None, size_bytes=99, kind="media", source="upload")
+    assert _full(db, "k")[1] == 99
+
+
+def test_upsert_refreshes_descriptive_fields_without_erasing(db):
+    a, _, _, _ = _world(db)
+    lake_objects.upsert(db, "k", company_id=a["id"], kind="media", source="upload")
+    lake_objects.upsert(db, "k", company_id=None, kind="transcript", folder="Ada_L", day="2026-10-01",
+                        session_base="sb", source="backfill")
+    row = _full(db, "k")
+    assert row[2:7] == ("transcript", "Ada_L", __import__("datetime").date(2026, 10, 1), "sb", "backfill")
+    lake_objects.upsert(db, "k", company_id=None, kind="transcript", source="backfill")
+    assert _full(db, "k")[3] == "Ada_L"
+
+
+def test_unchanged_upsert_does_not_bump_updated_at(db):
+    a, _, _, _ = _world(db)
+    kw = dict(company_id=a["id"], kind="media", folder="Ada_L", source="upload")
+    lake_objects.upsert(db, "k", **kw)
+    first = _full(db, "k")[7]
+    db.execute("SELECT pg_sleep(0.05)")
+    lake_objects.upsert(db, "k", **kw)
+    assert _full(db, "k")[7] == first  # now() is the transaction start; guard keeps it untouched
+    db.execute("UPDATE lake_objects SET updated_at = updated_at - interval '1 hour' WHERE s3_key='k'")
+    old = _full(db, "k")[7]
+    lake_objects.upsert(db, "k", **kw)
+    assert _full(db, "k")[7] == old
+    lake_objects.upsert(db, "k", **dict(kw, size_bytes=5))
+    assert _full(db, "k")[7] > old
+
+
+def test_upsert_many_conflict_path(db):
+    a, b, _, _ = _world(db)
+    lake_objects.upsert(db, "m1", company_id=a["id"], user_id=None, size_bytes=7, kind="media", source="upload")
+    lake_objects.upsert(db, "m2", company_id=None, kind="report", source="backfill", reason="split_day")
+    n = lake_objects.upsert_many(db, [
+        {"key": "m1", "kind": "media", "source": "backfill", "folder": "Ada_L"},          # optional keys absent
+        {"key": "m2", "company_id": b["id"], "kind": "report", "source": "backfill"},      # resolves + clears reason
+        {"key": "m3", "kind": "media", "source": "manifest"},
+    ])
+    assert n == 3
+    r1 = db.execute("SELECT company_id, size_bytes, folder FROM lake_objects WHERE s3_key='m1'").fetchone()
+    assert r1 == (a["id"], 7, "Ada_L")
+    r2 = _row(db, "m2")
+    assert r2[0] == b["id"] and r2[2] is None
+    assert lake_objects.count(db) == 3
+
+
+def test_soft_deleted_rows_are_excluded_from_every_listing(db):
+    a, _, _, _ = _world(db)
+    for k in ("live", "dead"):
+        lake_objects.upsert(db, "r/" + k, company_id=a["id"], kind="report", folder="F_" + k, day="2026-10-01",
+                            source="upload")
+        lake_objects.upsert(db, "u/" + k, company_id=None, kind="media", source="upload")
+    db.execute("UPDATE lake_objects SET deleted_at=now() WHERE s3_key IN ('r/dead','u/dead')")
+    assert [r["s3_key"] for r in lake_objects.owners_for_company(db, a["id"])] == ["r/live"]
+    assert [r["s3_key"] for r in lake_objects.unresolved(db)] == ["u/live"]
+    assert [r["s3_key"] for r in lake_objects.list_reports(db)] == ["r/live"]
+    assert lake_objects.report_folders_for_day(db, "2026-10-01") == ["F_live"]
+
+
+def test_list_reports_limit_combined_filters_and_null_day_last(db):
+    a, b, _, _ = _world(db)
+    rows = [("r1", a, "F1", "2026-10-01"), ("r2", a, "F2", "2026-10-03"), ("r3", a, "F1", "2026-10-02"),
+            ("r4", b, "F1", "2026-10-04"), ("r5", a, "F1", None)]
+    for k, c, f, d in rows:
+        lake_objects.upsert(db, k, company_id=c["id"], kind="report", folder=f, day=d, source="upload")
+    assert [r["s3_key"] for r in lake_objects.list_reports(db)] == ["r4", "r2", "r3", "r1", "r5"]
+    assert [r["s3_key"] for r in lake_objects.list_reports(db, limit=2)] == ["r4", "r2"]
+    assert [r["s3_key"] for r in lake_objects.list_reports(db, company_ids=[a["id"]], folders=["F1"])] \
+        == ["r3", "r1", "r5"]
+    assert lake_objects.list_reports(db, company_ids=[b["id"]], folders=["F2"]) == []
+
+
+def test_reassign_site_clears_reason_and_moves_soft_deleted_rows(db):
+    a, b, s1, _ = _world(db)
+    lake_objects.upsert(db, "x1", company_id=a["id"], site_id=s1["id"], kind="media", source="upload")
+    lake_objects.upsert(db, "x2", company_id=a["id"], site_id=s1["id"], kind="media", source="upload")
+    db.execute("UPDATE lake_objects SET reason='split_day' WHERE s3_key='x1'")
+    db.execute("UPDATE lake_objects SET deleted_at=now() WHERE s3_key='x2'")
+    assert lake_objects.reassign_site(db, s1["id"], b["id"]) == 2
+    assert _row(db, "x1")[0] == b["id"] and _row(db, "x1")[2] is None
+    assert _row(db, "x2")[0] == b["id"] and _row(db, "x2")[3] is not None  # still soft-deleted, moved
