@@ -23,13 +23,20 @@ Rule order (see Resolver._one):
                                                                                "folder_day_site"
        on sites of MORE than one company (a siteless recording counts as the recorder's home
        company)                       -> company NULL, user kept            "split_day" (ruling C2)
-       no recordings that day, or no day in the key -> the recorder's home company "folder_home"
+       no recordings that day, or no day in the key -> the recorder's home company "folder_home",
+       EXCEPT for a user who has ever been an external member (R5g; any memberships row with
+       external = true, archived included) (a key with no day and no session, or a day with no recordings) -> company NULL,
+       reason "external_member_uncertain" 
        unknown folder                 -> NULL                                 "unresolved"
   5. the manifest hint, last and only for fields still NULL (R5a). A company hint is never
      trusted over the DB and is used only when the key carries no folder, no session and no
      group; a site hint is accepted only when that site exists (its company then comes from
      the DB). Everything else about a hint (folder, session_base) is descriptive.   "hint"
   6. otherwise company NULL, reason "unresolved".
+
+Notes: a company hint (rule 5) only ever fills keys that carry no folder/session/group (site_report,
+voice, match, weather, programme with an unresolvable site); and a dry run reports the rows that
+WOULD be written, not net of unchanged ones.
 
 Keys of an unknown shape (lake_keys.parse -> None) are never resolved by 2-5: only rule 1 can
 own them; otherwise NULL with scope "unknown" and kind = the first path segment (R5f).
@@ -42,7 +49,7 @@ import lake_keys
 logger = logging.getLogger(__name__)
 
 REASONS = ("recording", "session", "folder_day_site", "folder_home", "key", "hint",
-           "unresolved", "split_day", "global", "lake_wide")
+           "unresolved", "split_day", "external_member_uncertain", "global", "lake_wide")
 
 
 def _s(v):
@@ -100,6 +107,10 @@ class DbLookups:
         from repositories import recordings
         return recordings.site_companies_for_folder_days(self.conn, pairs)
 
+    def externals(self, user_ids):
+        from repositories import memberships
+        return memberships.ever_external_user_ids(self.conn, user_ids)
+
     def site_companies(self, site_ids):
         from repositories import sites
         return sites.companies_for_ids(self.conn, site_ids)
@@ -119,7 +130,7 @@ class Resolver:
     def __init__(self, conn, lookups=None):
         self.lookups = lookups or DbLookups(conn)
         self._c = {name: {} for name in
-                   ("rec", "sid", "grp", "home", "fday", "site", "slug")}
+                   ("rec", "sid", "grp", "home", "fday", "site", "slug", "ext")}
 
     # ---- batched, cached lookups -------------------------------------------------------
     def _fetch(self, name, wanted, fn):
@@ -141,6 +152,11 @@ class Resolver:
                     self.lookups.homes)
         self._fetch("fday", sorted({(p["folder"], p["day"]) for _k, _h, p in live
                                     if p and p["folder"] and p["day"]}), self.lookups.folder_days)
+        # R5g: who has ever been an external member (batched; only users whose home company
+        # could be used as a fallback matter, and those are exactly the resolved folders)
+        uids = sorted({str(self._c["home"][p["folder"]]["id"]) for _k, _h, p in live
+                       if p and p["folder"] and self._c["home"].get(p["folder"])})
+        self._fetch("ext", uids, lambda ids: {i: True for i in self.lookups.externals(ids)})
         site_ids = set()
         for _k, h, p in live:
             if p and p["site_id"]:
@@ -235,9 +251,18 @@ class Resolver:
         if not day or (not day["sites"] and not day["siteless"]):
             if home_company is None:
                 return False
+            if self._c["ext"].get(_s(home["id"])) and (
+                    p["day"] or not (p["sid"] or p["session_base"])):
+                # R5g: the home company is a certain fallback only for a user who has NEVER
+                # held an external membership; this key says nothing about which company's
+                # site the work was on.
+                o["reason"] = "external_member_uncertain"
+                return True
             o.update(company_id=home_company, reason="folder_home")
             return True
         companies = {_s(c) for c in day["sites"].values()}
+        # R1: a siteless recording belongs to the recorder's home company, so a day mixing it
+        # with another company's site is a split day and its whole-day documents stay NULL.
         if day["siteless"]:
             companies.add(home_company)
         if None in companies or len(companies) != 1:

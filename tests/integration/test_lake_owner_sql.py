@@ -5,7 +5,8 @@ import uuid
 import pytest
 
 import lake_owner
-from repositories import (companies, lake_objects, meeting_session, recordings, sites, users)
+from repositories import (companies, lake_objects, meeting_session, memberships, recordings,
+                          sites, users)
 
 pytestmark = pytest.mark.integration
 
@@ -218,3 +219,34 @@ def test_upsert_many_on_missing_none_is_distinguishable_from_zero_changed(db):
     db.execute("DROP TABLE lake_objects")
     assert lake_objects.upsert_many(db, [row], on_missing=None) is None    # missing
     assert lake_objects.upsert_many(db, [row]) == 0
+
+
+# ---- R5g: memberships.ever_external_user_ids ----------------------------------------------------------
+def test_ever_external_includes_archived_and_ignores_internal_members(db):
+    w = _world(db)
+    other = _user(db, w["b"], f"Eve_{w['tag']}")
+    memberships.add_membership(db, other["id"], w["sb"]["id"], "worker")        # internal only
+    memberships.add_external_membership(db, w["ada"]["id"], w["sb"]["id"], "worker")
+    got = memberships.ever_external_user_ids(db, [w["ada"]["id"], other["id"]])
+    assert got == {str(w["ada"]["id"])}
+    memberships.archive_membership(db, w["ada"]["id"], w["sb"]["id"])
+    assert memberships.ever_external_user_ids(db, [w["ada"]["id"]]) == {str(w["ada"]["id"])}
+    assert memberships.ever_external_user_ids(db, []) == set()
+
+
+def test_ever_external_tolerates_the_missing_0085_column(db):
+    w = _world(db)
+    db.execute("ALTER TABLE memberships DROP COLUMN external")
+    assert memberships.ever_external_user_ids(db, [w["ada"]["id"]]) == set()
+    db.execute("SELECT 1")  # the caller's transaction is not poisoned
+
+
+def test_r5g_through_real_rows_external_member_request_is_null_home_member_is_home(db):
+    w = _world(db)
+    eve = _user(db, w["b"], f"Eve_{w['tag']}")
+    memberships.add_external_membership(db, w["ada"]["id"], w["sb"]["id"], "worker")
+    r = lake_owner.Resolver(db)
+    o = r.resolve(f"report_requests/{w['folder']}/r1.json")
+    assert o["company_id"] is None and o["reason"] == "external_member_uncertain"
+    o = r.resolve(f"report_requests/{eve['folder_name']}/r1.json")
+    assert o["company_id"] == str(w["b"]["id"]) and o["reason"] == "folder_home"

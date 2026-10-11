@@ -22,9 +22,10 @@ class Fake:
     """Dict-backed lookups; counts calls so the cache can be pinned."""
 
     def __init__(self, recs=None, sessions=None, groups=None, homes=None, fdays=None,
-                 sites=None, slugs=None):
+                 sites=None, slugs=None, externals=()):
         self.d = dict(rec=recs or {}, sid=sessions or {}, grp=groups or {}, home=homes or {},
                       fday=fdays or {}, site=sites or {}, slug=slugs or {})
+        self.ext = set(externals)
         self.calls = []
 
     def _get(self, name, wanted):
@@ -38,6 +39,7 @@ class Fake:
     def folder_days(self, pairs): return self._get("fday", pairs)
     def site_companies(self, ids): return self._get("site", ids)
     def slugs(self, slugs): return self._get("slug", slugs)
+    def externals(self, ids): return {i for i in ids if i in self.ext}
 
 
 def world(**kw):
@@ -324,3 +326,27 @@ def test_resolve_many_batches_and_caches_each_lookup():
     n = len(f.calls)
     r.resolve(T_KEY)
     assert [c for c in f.calls[n:] if c[0] in ("home", "fday", "sid", "site")] == []
+
+
+# ---- R5g: the home-company fallback is certain only for a never-external user ------------------
+def test_r5g_external_members_dayless_request_is_null_not_home():
+    f = world(externals={USER_ADA})
+    o = resolve(f, "report_requests/Ada_L/req1.json", {"company_id": CO_A})
+    assert o["company_id"] is None and o["reason"] == "external_member_uncertain"
+    assert o["user_id"] == USER_ADA
+
+
+def test_r5g_never_external_users_request_resolves_to_home():
+    f = world(externals={USER_EVE})  # somebody else is external
+    o = resolve(f, "report_requests/Ada_L/req1.json")
+    assert (o["company_id"], o["reason"]) == (CO_A, "folder_home")
+
+
+def test_r5g_external_member_with_no_recordings_that_day_is_null():
+    o = resolve(world(externals={USER_ADA}), T_KEY)
+    assert o["company_id"] is None and o["reason"] == "external_member_uncertain"
+
+
+def test_r5g_does_not_touch_days_that_have_recordings():
+    f = world(externals={USER_ADA}, fdays={("Ada_L", DAY): day({SITE_A: CO_A})})
+    assert resolve(f, T_KEY)["company_id"] == CO_A
