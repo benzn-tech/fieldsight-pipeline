@@ -5070,6 +5070,19 @@ def patch_org_site(conn, caller, site_id, body):
             # coordinate edit is committed.
             conn.rollback()
             return error("site not found in your company", 404)
+        # Lake ownership: the site's objects follow it, in THIS transaction and with no S3
+        # call (reassign_site runs in its own savepoint and swallows only a missing table, so
+        # a deploy that is a minute ahead of migration 0087 still moves the site). Any other
+        # failure must not commit the move: company A would keep seeing company B's data.
+        try:
+            moved = lake_objects.reassign_site(conn, site_id, move_to)
+        except Exception:  # noqa: BLE001 -- roll the whole move back, then say so
+            logger.exception("site %s move to company %s: lake object re-own failed; "
+                             "move rolled back", site_id, move_to)
+            conn.rollback()
+            return error("could not move the site's data; nothing was changed", 500)
+        logger.info("site %s moved to company %s: %d lake object(s) re-owned",
+                    site_id, move_to, moved)
     if final_icon is not None:
         old_icon = row.get("icon_s3_key")
         row = sites.set_site_icon(conn, site_id, final_icon)
