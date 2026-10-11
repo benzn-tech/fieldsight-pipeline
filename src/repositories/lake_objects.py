@@ -9,9 +9,11 @@ import logging
 
 from psycopg.rows import dict_row
 
+import lake_keys
+
 logger = logging.getLogger(__name__)
 
-__all__ = ["upsert", "upsert_many", "reassign_site", "owners_for_company", "count",
+__all__ = ["upsert", "record_best_effort", "upsert_many", "reassign_site", "owners_for_company", "count",
            "unresolved", "list_reports", "report_folders_for_day"]
 
 _COLS = ("s3_key, company_id, site_id, user_id, session_base, folder, day, kind, size_bytes, "
@@ -85,6 +87,31 @@ def upsert(conn, key, *, company_id, site_id=None, user_id=None, kind, folder=No
         conn.execute(_UPSERT, p)
         return True
     return _run(conn, go, False)
+
+
+def record_best_effort(conn, key, *, company_id, site_id=None, user_id=None, source="upload",
+                       **fields) -> bool:
+    """Record the owner of a key a request path just minted or wrote. NEVER raises and never
+    touches the caller's transaction: the upload routes are synchronous with no retry (BUG-43),
+    so a failed index write must not fail or slow the request. Runs in its own savepoint; any
+    exception (not only a missing table) is logged at WARNING and reported as False. The
+    drain/backfill is the safety net for a row that was not recorded.
+
+    kind/folder/day/session_base come from lake_keys.parse(key); `fields` may override them
+    (or add size_bytes/reason)."""
+    try:
+        parsed = lake_keys.parse(key) or {}
+        kw = {"kind": parsed.get("kind") or key.split("/", 1)[0],
+              "folder": parsed.get("folder"), "day": parsed.get("day"),
+              "session_base": parsed.get("session_base")}
+        kw.update(fields)
+        with conn.transaction():
+            return bool(upsert(conn, key, company_id=company_id,
+                               site_id=site_id or parsed.get("site_id"),
+                               user_id=user_id, source=source, **kw))
+    except Exception:  # noqa: BLE001 -- the contract is "never raises"
+        logger.warning("lake_objects: could not record %s (continuing)", key, exc_info=True)
+        return False
 
 
 def upsert_many(conn, rows) -> int:

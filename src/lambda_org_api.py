@@ -168,6 +168,7 @@ from repositories import (action_items, aliases, chunks, classification_feedback
                           sites, threads, topic_questions, topics, users,
                           voice_messages,
                           voiceprints)
+from repositories import lake_objects
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import (diff_candidates, first_match_span, learned_pairs, normalize,
                             occurrences)
@@ -987,6 +988,37 @@ def _capture_company_id(caller, site):
     return site["company_id"] if site else caller["company_id"]
 
 
+def _lake_company_for_sites(conn, caller, site_ids):
+    """Owner company for a lake row whose request names site(s): the site's company when they
+    all resolve to ONE site, else the caller's home company (sub-project 3 rule). Best effort:
+    a failed lookup runs in a savepoint and falls back, so it can never abort the request."""
+    ids = {str(x) for x in (site_ids or []) if x}
+    if len(ids) != 1:
+        return caller["company_id"]
+    try:
+        with conn.transaction():
+            site = sites.get_site(conn, next(iter(ids)))
+    except Exception:  # noqa: BLE001
+        logger.warning("lake_objects: site lookup failed; using the caller's company",
+                       exc_info=True)
+        return caller["company_id"]
+    return site["company_id"] if site else caller["company_id"]
+
+
+def _lake_company_for_session(conn, caller, folder, date, session_base):
+    """Owner company of a session-level lake row: the company of the one site the session lies
+    on, else the caller's home company. Best effort, savepointed like the site lookup."""
+    try:
+        with conn.transaction():
+            companies_seen = {c for _s, c in recordings.session_site_companies(
+                conn, folder, date, session_base)}
+    except Exception:  # noqa: BLE001
+        logger.warning("lake_objects: session site lookup failed; using the caller's company",
+                       exc_info=True)
+        return caller["company_id"]
+    return next(iter(companies_seen)) if len(companies_seen) == 1 else caller["company_id"]
+
+
 def create_recording_upload_url(conn, caller, body, device_ident=None):
     if body is None:
         return error("malformed JSON body", 400)
@@ -1055,6 +1087,13 @@ def create_recording_upload_url(conn, caller, body, device_ident=None):
 
     _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id,
                              _capture_company_id(caller, site))
+
+    # Index who owns this key. Best effort in a savepoint: the route is synchronous with no
+    # retry (BUG-43), so this can neither fail nor abort the upload. A resend re-records the
+    # same key (an idempotent upsert).
+    lake_objects.record_best_effort(
+        conn, key, company_id=_capture_company_id(caller, site),
+        site_id=site_id or None, user_id=caller["id"], source="upload")
 
     url = s3().generate_presigned_url(
         "put_object",
@@ -1722,6 +1761,8 @@ def regenerate_own_report(conn, caller, body):
     s3().put_object(Bucket=LAKE_BUCKET, Key=request_key,
                     Body=json.dumps(artifact, default=str),
                     ContentType="application/json")
+    lake_objects.record_best_effort(conn, request_key, company_id=caller["company_id"],
+                                    user_id=caller["id"], source="upload")
     return ok({"status": "queued", "requestId": request_id,
                "report_type": report_type, "folder": folder}, 202)
 
@@ -1814,6 +1855,11 @@ def session_report_generate(conn, caller, session_id, event):
     s3().put_object(Bucket=LAKE_BUCKET, Key=request_key,
                     Body=json.dumps(artifact, default=str),
                     ContentType="application/json")
+    owner = _lake_company_for_sites(conn, caller, [content.get("siteId")])
+    for lake_key in (request_key, result_key):
+        lake_objects.record_best_effort(conn, lake_key, company_id=owner,
+                                        site_id=content.get("siteId"),
+                                        user_id=caller["id"], source="upload")
     return ok({"status": "queued", "sessionId": session_id,
                "requestId": request_id, "resultKey": result_key}, 202)
 
@@ -2127,6 +2173,12 @@ def day_report_generate(conn, caller, date, event):
     s3().put_object(Bucket=LAKE_BUCKET, Key=request_key,
                     Body=json.dumps(artifact, default=str),
                     ContentType="application/json")
+    day_sites = content.get("siteIds") or []
+    owner = _lake_company_for_sites(conn, caller, day_sites)
+    one_site = str(day_sites[0]) if len({str(x) for x in day_sites}) == 1 else None
+    for lake_key in (request_key, result_key):
+        lake_objects.record_best_effort(conn, lake_key, company_id=owner, site_id=one_site,
+                                        user_id=caller["id"], source="upload")
     return ok({"status": "queued", "scope": "day", "date": date,
                "requestId": request_id, "resultKey": result_key}, 202)
 
@@ -2565,9 +2617,10 @@ def speaker_match(conn, caller, session_base, event):
     for i, group in enumerate(runs):
         request_id = uuid.uuid4().hex
         request_ids.append(request_id)
+        match_key = f"voiceprint_requests/{company_id}/{session_base}/match-{request_id}.json"
         s3().put_object(
             Bucket=LAKE_BUCKET,
-            Key=f"voiceprint_requests/{company_id}/{session_base}/match-{request_id}.json",
+            Key=match_key,
             Body=json.dumps({"op": "match", "request_id": request_id,
                              "session_base": session_key, "company_id": company_id,
                              "user_folder": folder, "date": date_m.group(1),
@@ -2587,6 +2640,9 @@ def speaker_match(conn, caller, session_base, event):
                              # removes the dependence on where the split fell.
                              "label_map": label_map}, default=str),
             ContentType="application/json")
+        lake_objects.record_best_effort(
+            conn, match_key, company_id=company_id,
+            site_id=str(site["id"]) if site else None, user_id=caller["id"], source="upload")
     logger.info("speaker match queued: session=%s mode=%s turns=%d runs=%d",
                 session_key, SPEAKER_IDENTITY_MODE, len(turns), len(runs))
     return ok({"requestIds": request_ids, "sessionBase": session_key,
@@ -3562,10 +3618,13 @@ def speaker_corrections(conn, caller, session_base, event):
         "label_map": _label_map(session_turns),
         "enrol": enrol,
     }
+    correction_key = f"voiceprint_requests/{company_id}/{session_base}/{request_id}.json"
     s3().put_object(Bucket=LAKE_BUCKET,
-                    Key=f"voiceprint_requests/{company_id}/{session_base}/{request_id}.json",
+                    Key=correction_key,
                     Body=json.dumps(artifact, default=str),
                     ContentType="application/json")
+    lake_objects.record_best_effort(conn, correction_key, company_id=company_id,
+                                    user_id=caller["id"], source="upload")
     logger.info("speaker correction queued: session=%s mode=%s turns=%d",
                 session_base, SPEAKER_IDENTITY_MODE, len(artifact["turns"]))
     return ok({
@@ -4030,6 +4089,9 @@ def put_photo_selection(conn, caller, date, event):
                     Body=json.dumps({"excluded": excluded, "updatedBy": str(caller["id"]),
                                      "updatedAt": nz_time.nz_now().isoformat()}).encode(),
                     ContentType="application/json")
+    lake_objects.record_best_effort(
+        conn, report_photos.selection_key(folder, date), company_id=caller["company_id"],
+        user_id=caller["id"], source="upload")
     return ok(_photo_selection_body(conn, caller, folder, date, set(excluded)))
 
 
@@ -4261,6 +4323,8 @@ def session_expedite(conn, caller, session_id):
             # boto3 older than conditional writes: last-writer-wins.
             s3().put_object(Bucket=LAKE_BUCKET, Key=key, Body=body,
                             ContentType="application/json")
+        lake_objects.record_best_effort(conn, key, company_id=caller["company_id"],
+                                        user_id=caller["id"], source="upload")
         return ok({"ok": True, "expedited_at": stamp})
     return error("marker changed while expediting, try again", 409)
 
@@ -4382,6 +4446,10 @@ def create_voice_upload_url(conn, caller, body):
     if str(site_id) not in _allowed_site_ids(conn, caller):
         return error("site not accessible", 403)
     key = _voice_s3_key(caller["company_id"], site_id, caller["id"], ext)
+    # A8: a voice clip belongs to the SITE's company (the key prefix keeps the caller's).
+    lake_objects.record_best_effort(
+        conn, key, company_id=_lake_company_for_sites(conn, caller, [site_id]),
+        site_id=site_id, user_id=caller["id"], source="upload")
     # NOTE: no voice_messages insert here — sendVoice (Task 6) is the sole writer
     # of the row (created when the clip is actually sent). An abandoned recording
     # thus leaves at most an orphan S3 object, reaped by the 30-day voice/ lifecycle.
@@ -11397,14 +11465,19 @@ def regenerate_session(conn, caller, session_base, event):
     request = {"userFolder": folder, "date": date, "sessionBase": session_base}
     if rows:
         request["speakerNames"] = rows
+    regen_key = f"extraction_requests/{session_base[3:]}.json"
     boto3.client("s3").put_object(
         Bucket=S3_BUCKET,
         # Same key the finalize sweep writes, so this rides the trigger that
         # already exists rather than needing a second S3 notification -- and every
         # notification on this bucket is hand-wired outside the template (BUG-33).
-        Key=f"extraction_requests/{session_base[3:]}.json",
+        Key=regen_key,
         Body=json.dumps(request).encode("utf-8"),
         ContentType="application/json")
+    lake_objects.record_best_effort(
+        conn, regen_key,
+        company_id=_lake_company_for_session(conn, caller, folder, date, session_base),
+        user_id=caller["id"], source="upload")
     logger.info("regenerate requested for %s by %s with %d confirmed name(s)",
                 session_base, caller["id"], len(rows))
     return ok({"sessionBase": session_base, "namedTurns": len(rows),
