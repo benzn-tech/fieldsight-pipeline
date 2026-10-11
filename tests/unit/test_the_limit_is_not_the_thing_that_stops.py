@@ -10,7 +10,7 @@ whenever `force_json` was set) so nobody had to think about it, and the move to
 OpenRouter -- which always sends it -- turned four stale numbers into four
 places an answer can be cut off mid-sentence.
 
-Three properties are pinned.
+Two properties are pinned.
 
 1. **One ceiling, not four.** `ANSWER_TOKEN_CEILING` lives in `llm_utils`
    because that is the module that puts it on the wire. Three lambdas each had
@@ -21,10 +21,8 @@ Three properties are pinned.
    `gemini-3.8-flash` -- 65,536 output cap, the smallest of the three models on
    the table -- that sum has to clear.
 
-3. **Truncation, when it still happens, keeps the head AND the tail.** Two bare
-   `[:N]` slices survived in the ask path long after the same defect was fixed
-   in extraction, the rolling summary and the minutes. A session's decisions are
-   at its END.
+(A third property -- the ask prompt formatters keep the head AND the tail --
+went with the formatters themselves when the ask agent's S3 path was removed.)
 
 What is deliberately NOT pinned: the specific limits. They are env-overridable
 by design, and a test asserting `== 300000` would just be a fifth copy of a
@@ -90,61 +88,6 @@ def test_every_caller_shares_the_one_ceiling():
     # ...and a small one must not be pinned to the ceiling, or the scaling rule
     # is decorative.
     assert les.max_tokens_for(n_segments=1) < llm_utils.ANSWER_TOKEN_CEILING
-
-
-# ------------------------------------------------------------------
-# Head and tail, everywhere a limit still bites
-# ------------------------------------------------------------------
-
-def _long_turns(n):
-    return ["[09:%02d:%02d] spk_0: line number %d about the scaffold" % (i // 60, i % 60, i)
-            for i in range(n)]
-
-
-def test_the_ask_transcript_keeps_the_end_of_the_session(monkeypatch):
-    """`format_transcripts_for_prompt` returned `result[:MAX_TRANSCRIPT_CHARS]`.
-
-    Ask is the one path where a person is waiting for the answer, and "what did
-    we agree at the end" is the question it is most often asked. A head slice
-    answers it from the part of the day that does not contain the answer, and
-    reports nothing.
-    """
-    import lambda_ask_agent as aa
-    lines = _long_turns(4000)
-    monkeypatch.setattr(aa, "format_turns_for_prompt", lambda norm, **kw: lines)
-    monkeypatch.setattr(aa, "MAX_TRANSCRIPT_CHARS", 5_000)
-
-    out = aa.format_transcripts_for_prompt([{"any": "shape"}])
-
-    assert lines[0] in out, "the opening is gone"
-    assert lines[-1] in out, "the ending is gone -- this is the defect"
-    assert "omitted" in out, "the model was not told anything was dropped"
-
-
-def test_the_ask_report_summary_keeps_its_tail(monkeypatch):
-    """Same slice, same fix, different function: next steps and quality items are
-    rendered last, so a head slice drops exactly the actionable half."""
-    import lambda_ask_agent as aa
-    monkeypatch.setattr(aa, "MAX_REPORT_CHARS", 400)
-    report = {
-        "executive_summary": "x" * 600,
-        "quality_and_compliance": [
-            {"status": "concern", "item": "UNIQUE_TAIL_ITEM", "details": "d"}],
-    }
-
-    out = aa.format_report_for_prompt(report, "daily")
-
-    assert "UNIQUE_TAIL_ITEM" in out, "the tail of the report is gone"
-
-
-def test_an_ask_transcript_under_the_limit_is_untouched(monkeypatch):
-    """Elision must not announce itself on a session that fits."""
-    import lambda_ask_agent as aa
-    lines = _long_turns(3)
-    monkeypatch.setattr(aa, "format_turns_for_prompt", lambda norm, **kw: lines)
-    out = aa.format_transcripts_for_prompt([{"any": "shape"}])
-    assert out == "\n".join(lines)
-    assert "omitted" not in out
 
 
 # ------------------------------------------------------------------

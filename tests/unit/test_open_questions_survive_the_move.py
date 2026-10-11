@@ -9,8 +9,7 @@ the reading and, on its own, deleted them from three places at once:
     actions and safety flags. Not a new key. So the RAG chunk that used to
     contain "Open questions: What are the port three requirements?" stopped
     containing it, and on the next embed the vector was simply gone.
-  * `format_report_for_prompt` builds Ask's context from the same fields. Ask
-    could no longer answer "what was still unknown about port three".
+  * (Ask once built its context from the stored report too; that S3 path is gone.)
   * The frontend renders `topic.summary`.
 
 Nothing failed. Search returned nothing and that looks exactly like a day where
@@ -19,7 +18,6 @@ prose; it was never meant to stop CARRYING them — "追溯的时候再去 query
 path the whole change is justified by.
 """
 import chunking
-import lambda_ask_agent as ask
 
 
 QUESTION = "What are the Ten Peaks port three requirements?"
@@ -56,11 +54,6 @@ def test_the_rag_chunk_still_contains_the_question():
         "the question is not in any chunk: " + repr([c["chunk_text"][:80] for c in chunks]))
 
 
-def test_asks_context_still_contains_the_question():
-    text = ask.format_report_for_prompt(_report(), "daily")
-    assert QUESTION in text
-
-
 def test_the_extraction_spelling_is_carried_too():
     """The meeting path writes `open_questions`; the extraction schema says
     `questions`, as a list of {question}. Both are the same thing to a reader."""
@@ -68,7 +61,6 @@ def test_the_extraction_spelling_is_carried_too():
     report["topics"][0]["open_questions"] = []
     report["topics"][0]["questions"] = [{"question": QUESTION}]
     assert any(QUESTION in c["chunk_text"] for c in chunking.chunk_report(report))
-    assert QUESTION in ask.format_report_for_prompt(report, "daily")
 
 
 def test_a_topic_with_no_questions_is_unchanged():

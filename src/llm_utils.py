@@ -131,6 +131,14 @@ ANSWER_TOKEN_CEILING = int(os.environ.get("LLM_ANSWER_TOKEN_CEILING", "32000"))
 MAX_ATTEMPTS = 4
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 BACKOFF_BASE_SECONDS = 1.0
+# OpenRouter answers 404 "Provider returned error" when the vendor behind it
+# fails a request it would normally serve. On TEST (2026-10-06) every report
+# call from the Lambda got it for about fifteen minutes while the same request
+# from elsewhere went through, then it cleared. A 404 that says so is a
+# vendor fault, not a wrong model name, and is retried -- with a longer wait
+# than the 1-2-4s ladder, because it is an outage, not a blip. A plain 404 (no
+# such model) is still final.
+PROVIDER_ERROR_WAIT_SECONDS = float(os.environ.get("LLM_PROVIDER_ERROR_WAIT", "20"))
 # 150s so the HTTP client loses the race against the Lambda's own Timeout and
 # we get a catchable urllib3 error instead of a runtime hard-kill.
 # ReportGeneratorFunction and MeetingMinutesFunction override this to 180 via
@@ -297,9 +305,9 @@ def _provider_error(resp):
         return False
 
 
-def _may_sleep(remaining, attempt):
+def _may_sleep(remaining, attempt, base=None):
     """Back off, unless that would spend a budget the caller still owns."""
-    wait = BACKOFF_BASE_SECONDS * (2 ** attempt)
+    wait = (BACKOFF_BASE_SECONDS if base is None else base) * (2 ** attempt)
     if remaining is not None and wait >= remaining:
         return False
     time.sleep(wait)
@@ -372,6 +380,13 @@ def _post_with_retry(url, body, headers, deadline=None, clock=None,
         if resp.status in RETRYABLE_STATUSES and attempt < max_attempts - 1:
             last_error = f"HTTP {resp.status}"
             if _may_sleep(left(), attempt):
+                continue
+            return None, _why_stopped(last_error, left())
+        if resp.status == 404 and attempt < MAX_ATTEMPTS - 1 and _provider_error(resp):
+            last_error = "HTTP 404 (Provider returned error)"
+            logger.warning("LLM vendor returned 404 Provider returned error -- retrying "
+                           "(attempt %d of %d)", attempt + 1, MAX_ATTEMPTS)
+            if _may_sleep(left(), attempt, base=PROVIDER_ERROR_WAIT_SECONDS):
                 continue
             return None, _why_stopped(last_error, left())
         return resp, None

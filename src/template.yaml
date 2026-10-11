@@ -1893,8 +1893,14 @@ Resources:
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           QWEN_ENABLE_THINKING: 'true'
           # One attempt must fit inside Timeout: 900 with room for the docx render.
-          LLM_HTTP_TIMEOUT: '300'
+          # 480s: a report may now use 32,000 completion tokens (below), ~420s at
+          # the ~76 tokens/s measured on TEST; 300s would cut a long one off.
+          LLM_HTTP_TIMEOUT: '480'
           GENERATION_BUDGET_SECONDS: '600'
+          # Room to think: the report asks for an 8,000-token answer and gets
+          # this on top for reasoning -- 32,000 in all (owner, 2026-10-06, after
+          # a spoken 40-item checklist spent 15,997 of 16,000 thinking at high).
+          LLM_REASONING_HEADROOM: '24000'
           # Pre-check on transcript objects in one window (transcript_window.py).
           MAX_TRANSCRIPT_OBJECTS: '2000'
       Policies:
@@ -2023,10 +2029,7 @@ Resources:
           ASK_CONVERSATION_MEMORY: !Ref AskConversationMemory
           ASK_REWRITE_BUDGET: !Ref AskRewriteBudget
           ASK_DISTANCE_GATE: !Ref AskDistanceGate
-          S3_BUCKET: !Ref DataBucketName
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
-          HAIKU_MODEL: claude-haiku-4-5-20251001
-          REPORT_PREFIX: reports/
           RAG_SEARCH_FUNCTION: !Ref RagSearchFunction
           DASHSCOPE_API_KEY: !Ref DashScopeApiKey
           # Voice STT provider and its OWN key. Both belong here: a provider
@@ -2084,8 +2087,6 @@ Resources:
       Layers:
         - !Ref DashScopeLayer
       Policies:
-        - S3ReadPolicy:
-            BucketName: !Ref DataBucketName
         - LambdaInvokePolicy:
             FunctionName: !Ref RagSearchFunction
         - LambdaInvokePolicy:
@@ -2529,9 +2530,21 @@ Resources:
                 - s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/report_photo_selection/*
             # pipeline_trace: what this step did with a recording (traces/, 180 days).
+            # Read too: GET /trace/day and /trace/funnel (trace_views), and
+            # ListBucket below -- without it a day with no traces reads as
+            # AccessDenied instead of an empty list.
             - Effect: Allow
-              Action: s3:PutObject
+              Action:
+                - s3:PutObject
+                - s3:GetObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/traces/*
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - traces/*
             # A speaker correction, handed OUTWARD across the VPC boundary the same way.
             # Write only, and no grant on voiceprint_results/: those go to the in-VPC
             # writer by direct invoke from the embedder, and a read grant here would be an
@@ -3664,6 +3677,11 @@ Resources:
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
+          # A spoken check's report is queued with org-api's own code
+          # (checklist_reports -> lambda_org_api.day_report_generate), which
+          # reads these two exactly as org-api does.
+          LAKE_BUCKET: !Ref IngestBucketName
+          GRADED_ROLES: !Ref GradedRoles
           # video-keyframe plan: emit keyframe_requests/ post-commit only when
           # this stage flag is on (ships inert otherwise).
           EMIT_KEYFRAME_REQUESTS: !Ref EnableKeyframes
@@ -3718,6 +3736,11 @@ Resources:
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/traces/*
+            # A spoken check's report request for the report worker
+            # (checklist_reports), the same object org-api writes for Generate.
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_report_requests/*
             - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
@@ -4678,7 +4701,7 @@ Resources:
       StageName: prod
       # Access logging (2026-07-23). Until now this stage had
       # accessLogSettings=null and the Lambda logged only "METHOD /path"
-      # (lambda_fieldsight_api.py:1063) with no caller, so an ACL incident
+      # (lambda_fieldsight_api.py) with no caller, so an ACL incident
       # could not be attributed after the fact — exactly the gap hit when
       # investigating the get_report_history leak. The format below records
       # the Cognito subject, the resource path and the query string so a
@@ -4737,12 +4760,6 @@ Resources:
       Environment:
         Variables:
           S3_BUCKET: !Ref DataBucketName
-          REPORT_PREFIX: reports/
-          ITEMS_TABLE: !Ref ItemsTableName
-          REPORTS_TABLE: !Ref ReportsTableName
-          AUDIT_TABLE: !Ref AuditTableName
-          USERS_TABLE: !Ref UsersTableName
-          REPORT_FUNCTION: !Ref ReportGeneratorFunction
           ASK_AGENT_FUNCTION: !Ref AskAgentFunction
           # How long this function waits for the Ask Agent. Below its own
           # Timeout (above) so the invoke fails here, in code that can name
@@ -4751,21 +4768,9 @@ Resources:
           # correctly. Literal, not a Parameter -- see AskAgentFunction's
           # ASK_DEADLINE_SECONDS for why.
           ASK_INVOKE_TIMEOUT: '26'
+      # Retired data routes answer 410 without touching storage; what remains
+      # is the proxy into the Ask Agent, so that is the only grant.
       Policies:
-        - S3ReadPolicy:
-            BucketName: !Ref DataBucketName
-        - S3WritePolicy:
-            BucketName: !Ref DataBucketName
-        - DynamoDBCrudPolicy:
-            TableName: !Ref ItemsTableName
-        - DynamoDBCrudPolicy:
-            TableName: !Ref ReportsTableName
-        - DynamoDBCrudPolicy:
-            TableName: !Ref AuditTableName
-        - DynamoDBCrudPolicy:
-            TableName: !Ref UsersTableName
-        - LambdaInvokePolicy:
-            FunctionName: !Ref ReportGeneratorFunction
         - LambdaInvokePolicy:
             FunctionName: !Ref AskAgentFunction
       Events:

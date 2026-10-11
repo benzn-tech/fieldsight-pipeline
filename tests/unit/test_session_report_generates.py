@@ -120,7 +120,9 @@ def test_an_excluded_topic_wholly_outside_the_window_does_not_abort_and_clips_no
     sr.process_request(art)
     assert written[0]["status"] == "done"
     assert "roofing" in calls["prompt"]
-    assert "unrelated afternoon remark" in calls["prompt"]
+    # Outside the 09:00-11:30 window: since 2026-10-06 the worker reads only the
+    # speech inside the window (a picked file's other turns no longer come along).
+    assert "unrelated afternoon remark" not in calls["prompt"]
 
 
 # ----------------------------------------------------------
@@ -185,3 +187,30 @@ def test_a_request_without_generate_still_assembles_exactly_as_before(wired, mon
     assert written[0]["status"] == "done"
     assert "generated" not in written[0]
     assert seen["data"]["topics"], "the old path still renders from topics"
+
+
+def test_a_model_that_spent_the_budget_thinking_is_asked_once_more_on_the_fast_path(wired, monkeypatch):
+    """TEST 2026-10-06: 15,997 of 16,000 tokens went to reasoning on the owner's
+    spoken pre-pour checklist, and the report failed with nothing written."""
+    calls, written = wired
+    seen = []
+
+    def fake(prompt, **kw):
+        seen.append(kw)
+        if len(seen) == 1:
+            return None, "Qwen returned an empty answer: finish_reason=length completion_tokens=16000"
+        return "### What this was\nRoofing. [t0]", None
+    monkeypatch.setattr(sr.llm_utils, "call_llm", fake)
+    sr.process_request(ARTIFACT)
+    assert written[0]["status"] == "done"
+    assert len(seen) == 2 and seen[1].get("enable_thinking") is False
+    assert seen[1]["max_tokens"] > seen[0]["max_tokens"]
+
+
+def test_any_other_failure_is_not_retried(wired, monkeypatch):
+    calls, written = wired
+    seen = []
+    monkeypatch.setattr(sr.llm_utils, "call_llm",
+                        lambda prompt, **kw: seen.append(kw) or (None, "HTTP 500"))
+    sr.process_request(ARTIFACT)
+    assert written[0]["status"] == "error" and len(seen) == 1

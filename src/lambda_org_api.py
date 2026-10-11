@@ -136,7 +136,9 @@ import device_status
 import extraction_pending
 import folder_key as folder_key_mod
 import nz_time
+import checklist_reports
 import pipeline_trace
+import trace_views
 import reindex
 import recording_blocks
 import report_download_name
@@ -152,6 +154,7 @@ from psycopg.rows import dict_row as RealDictRow
 import programme_reconcile
 from repositories import day_recording_segments, location_markers
 from repositories import directory as directory_repo
+from repositories import inspection_windows
 from repositories import (action_items, aliases, chunks, classification_feedback, companies,
                           findings, speaker_label_groups,
                           compliance_resolutions, content, content_edits, keyframes,
@@ -624,6 +627,11 @@ def dispatch(conn, event, method, route):
     if m_pa and method == "POST":
         return apply_topic_correction(conn, caller, m_pa.group(1), parse_body(event))
 
+    if route == "/trace/day" and method == "GET":
+        return trace_day_endpoint(conn, caller, event)
+    if route == "/trace/funnel" and method == "GET":
+        return trace_funnel_endpoint(conn, caller, event)
+
     if route == "/aliases" and method == "GET":
         return list_aliases_endpoint(conn, caller)
     m_al = re.match(r"^/aliases/([^/]+)$", route)
@@ -828,6 +836,14 @@ def dispatch(conn, event, method, route):
         return day_report_status(conn, caller, m_drs.group(1), event)
     if route == "/photos/notice" and method == "GET":
         return get_photo_notice(conn, caller, event)
+    m_dcr = re.match(r"^/days/([^/]+)/checklist-reports$", route)
+    if m_dcr and method == "GET":
+        return get_day_checklist_reports(conn, caller, m_dcr.group(1), event)
+    if route == "/checklist-reports/recent" and method == "GET":
+        return get_recent_checklist_reports(conn, caller, event)
+    m_din = re.match(r"^/days/([^/]+)/inspections$", route)
+    if m_din and method == "GET":
+        return get_day_inspections(conn, caller, m_din.group(1), event)
     m_dps = re.match(r"^/days/([^/]+)/photos/selection$", route)
     if m_dps and method == "GET":
         return get_photo_selection(conn, caller, m_dps.group(1), event)
@@ -1740,7 +1756,7 @@ def session_report_generate(conn, caller, session_id, event):
         "content": content,
         "resultKey": result_key,
         **({"generate": generate,
-            "window": {"from": (body.get("from") or "00:00"), "to": (body.get("to") or "23:59")},
+            "window": _report_window(body),
             "excludedTopics": _excluded_topics_for(
                 conn, caller, folder, date, session_id=session_id),
             "reportFacts": _report_facts(conn, caller["company_id"], folder,
@@ -2063,7 +2079,7 @@ def day_report_generate(conn, caller, date, event):
         "content": content,
         "resultKey": result_key,
         **({"generate": generate,
-            "window": {"from": (body.get("from") or "00:00"), "to": (body.get("to") or "23:59")},
+            "window": _report_window(body),
             "excludedTopics": _excluded_topics_for(conn, caller, folder, date),
             "reportFacts": _report_facts(conn, caller["company_id"], folder,
                                          content.get("siteIds"), date)} if generate else {}),
@@ -3677,6 +3693,130 @@ def _any_session_removed(session_ids, folders, date):
 # paths read it -- the nightly generator runs outside the VPC.
 
 _SELECTION_WRITE_ROLES = ("admin", "gm", "platform_admin")
+
+
+def get_day_inspections(conn, caller, date, event):
+    """GET /api/org/days/{date}/inspections?user= -- the checks spoken that day
+    (voice-triggered checklists): each with its window to the second and the
+    checklist template it matched, for the report dialog to offer in one
+    click. Read like the day's media: whoever may see that person's day."""
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    user = ((event.get("queryStringParameters") or {}).get("user") or "").strip()
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="inspections")
+    if err is not None:
+        return err
+    company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
+    rows = inspection_windows.for_day(conn, company, folder, date)
+    return ok({"date": date, "folder": folder, "inspections": [
+        dict(r, id=str(r["id"]),
+             template_id=str(r["template_id"]) if r.get("template_id") else None)
+        for r in rows]})
+
+
+_WINDOW_CLOCK_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$")
+
+
+def _report_window(body):
+    """The report's time window: 'HH:MM' or 'HH:MM:SS' each end (a spoken
+    check is timed to the second), else the whole day. A malformed end is the
+    whole day too, never a crash in the worker that parses it."""
+    frm, to = body.get("from") or "00:00", body.get("to") or "23:59"
+    if not _WINDOW_CLOCK_RE.match(str(frm)):
+        frm = "00:00"
+    if not _WINDOW_CLOCK_RE.match(str(to)):
+        to = "23:59"
+    window = {"from": frm, "to": to}
+    # An interrupted check is several stretches (owner, 2026-10-05): the report
+    # covers each and not the gaps. All-or-nothing: one bad stretch and the
+    # window is the plain from-to above.
+    segs = body.get("segments")
+    if isinstance(segs, list) and 1 < len(segs) <= 20:
+        clean = []
+        for sg in segs:
+            if not isinstance(sg, dict):
+                break
+            a, b = str(sg.get("from") or ""), str(sg.get("to") or "")
+            if not (_WINDOW_CLOCK_RE.match(a) and _WINDOW_CLOCK_RE.match(b)) or                     _hms_len(a) >= _hms_len(b) or (clean and _hms_len(a) < _hms_len(clean[-1]["to"])):
+                break
+            clean.append({"from": a, "to": b})
+        else:
+            window = {"from": clean[0]["from"], "to": clean[-1]["to"], "segments": clean}
+    return window
+
+
+def _hms_len(clock):
+    """'HH:MM[:SS]' -> seconds of the day (validated by _WINDOW_CLOCK_RE first)."""
+    parts = [int(x) for x in clock.split(":")]
+    return parts[0] * 3600 + parts[1] * 60 + (parts[2] if len(parts) > 2 else 0)
+
+
+def _checklist_report_status(result_key):
+    """pending | done | error | removed-free status of one auto report, read off
+    the worker's result (no presign here -- the download goes through
+    /days/{date}/report/status, which re-checks deletions first)."""
+    try:
+        obj = s3().get_object(Bucket=LAKE_BUCKET, Key=result_key)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in _LAKE_NOT_FOUND_CODES:
+            return "pending", None
+        raise
+    result = json.loads(obj["Body"].read().decode("utf-8"))
+    return result.get("status") or "pending", result.get("error")
+
+
+def _checklist_report_payload(r):
+    status, err = _checklist_report_status(r["result_key"])
+    return {"id": str(r["id"]), "date": str(r.get("report_date") or ""),
+            "checkName": r["check_name"], "templateName": r["template_name"],
+            "templateId": str(r["template_id"]) if r.get("template_id") else None,
+            "startAt": r["start_at"], "endAt": r.get("end_at"),
+            "segments": r.get("segments"), "requestId": r["request_id"],
+            "status": status, "error": err}
+
+
+def _unmatched_checks(rows):
+    return [{"checkName": r["name"], "startAt": r["start_at"], "endAt": r.get("end_at"),
+             "kind": r.get("kind")} for r in rows if not r.get("template_id")]
+
+
+def get_day_checklist_reports(conn, caller, date, event):
+    """GET /api/org/days/{date}/checklist-reports?user= -- the checklist
+    reports made on their own from that day's spoken checks (checklist_reports),
+    each with its status, and the checks no checklist template matched (owner,
+    2026-10-06: those are a notice, never a report on the wrong form). Read
+    like the day's media."""
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    user = ((event.get("queryStringParameters") or {}).get("user") or "").strip()
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="checklist reports")
+    if err is not None:
+        return err
+    company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
+    rows = checklist_reports.for_day(conn, company, folder, date)
+    checks = inspection_windows.for_day(conn, company, folder, date)
+    return ok({"date": date, "folder": folder,
+               "reports": [_checklist_report_payload(r) for r in rows],
+               "unmatched": _unmatched_checks(checks)})
+
+
+def get_recent_checklist_reports(conn, caller, event):
+    """GET /api/org/checklist-reports/recent -- for the bell: the CALLER's own
+    checklist reports of today and yesterday, and their unmatched checks. Own
+    folder only, like the photo notice."""
+    folder = scope.visible_scope(conn, caller).get("self_folder")
+    if not folder:
+        return ok({"reports": [], "unmatched": []})
+    today = nz_time.nz_today()
+    since = (today - timedelta(days=1)).isoformat()
+    rows = checklist_reports.recent_for_folder(conn, caller["company_id"], folder, since)
+    unmatched = []
+    for day in (today - timedelta(days=1), today):
+        for c in _unmatched_checks(inspection_windows.for_day(
+                conn, caller["company_id"], folder, day.isoformat())):
+            unmatched.append(dict(c, date=day.isoformat()))
+    return ok({"folder": folder, "reports": [_checklist_report_payload(r) for r in rows],
+               "unmatched": unmatched})
 
 
 def _photo_selection_folder(conn, caller, date, event, write=False):
@@ -6066,6 +6206,58 @@ def _trace_glossary_learned(company_id, caller, table, learned):
             "wrong_term": a["wrong_term"], "right_term": a["right_term"], "table": table,
             "by": str(caller.get("id"))})
     pipeline_trace.flush(s3, LAKE_BUCKET)
+
+
+def _company_names(conn, ids):
+    names = {}
+    for cid in {i for i in ids if i}:
+        try:
+            row = companies.get_company_by_id(conn, cid)
+        except Exception:
+            row = None
+        names[cid] = row["name"] if row else None
+    return names
+
+
+def trace_day_endpoint(conn, caller, event):
+    """GET /api/org/trace/day?date=YYYY-MM-DD[&folder=<user folder>] -- what
+    the pipeline did that day (trace_views.day). platform_admin only: traces
+    span every customer (owner, 2026-10-05)."""
+    if caller["global_role"] != "platform_admin":
+        return error("platform_admin role required", 403)
+    params = event.get("queryStringParameters") or {}
+    date = params.get("date") or nz_time.nz_now().strftime("%Y-%m-%d")
+    if not REPORT_DATE_RE.match(date):
+        return error("date must be YYYY-MM-DD", 400)
+    folder = params.get("folder") or None
+    out = trace_views.day(trace_views.s3_day_reader(s3(), LAKE_BUCKET, folder), date, folder)
+    if folder is None:
+        names = _company_names(conn, [f["company_id"] for f in out["folders"]])
+        for f in out["folders"]:
+            f["company_name"] = names.get(f["company_id"])
+    return ok(out)
+
+
+def trace_funnel_endpoint(conn, caller, event):
+    """GET /api/org/trace/funnel?from=YYYY-MM-DD&to=YYYY-MM-DD -- per folder,
+    how far recordings got (trace_views.funnel). Defaults to the last 7 days."""
+    if caller["global_role"] != "platform_admin":
+        return error("platform_admin role required", 403)
+    params = event.get("queryStringParameters") or {}
+    today = nz_time.nz_now().date()
+    date_to = params.get("to") or today.isoformat()
+    date_from = params.get("from") or (today - timedelta(days=6)).isoformat()
+    if not (REPORT_DATE_RE.match(date_from) and REPORT_DATE_RE.match(date_to)):
+        return error("from and to must be YYYY-MM-DD", 400)
+    try:
+        out = trace_views.funnel(trace_views.s3_day_reader(s3(), LAKE_BUCKET),
+                                 date_from, date_to)
+    except ValueError as exc:
+        return error(str(exc), 400)
+    names = _company_names(conn, [f["company_id"] for f in out["folders"]])
+    for f in out["folders"]:
+        f["company_name"] = names.get(f["company_id"])
+    return ok(out)
 
 
 _GLOSSARY_ADMIN_ROLES = ("admin", "gm", "platform_admin")

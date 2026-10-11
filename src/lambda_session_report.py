@@ -161,6 +161,29 @@ def _fetch_photos(folder, date, filenames, budget, names_out=None, edge=None):
     return streams
 
 
+def _precise(window):
+    """A window given to the second -- a spoken check's (inspection_windows),
+    never one a person typed into the dialog's HH:MM picker."""
+    return any(str((window or {}).get(k) or "").count(":") == 2 for k in ("from", "to"))
+
+
+def _mostly_in(topic, date, win_from, win_to):
+    """True when most of a topic's minutes fall inside [win_from, win_to).
+
+    Topic times are whole minutes; a check's window is to the second. The
+    Level 2 steel topic ("11:02 - 11:03") shares 14 of its 120 seconds with a
+    pre-pour check that ended at 11:02:14 -- overlap alone put it, and its
+    PPE action, in the pre-pour checklist."""
+    parsed = chunking.parse_time_range(topic.get("time_range"))
+    if not parsed:
+        return False
+    day = datetime.datetime.strptime(date, "%Y-%m-%d")
+    start = day + datetime.timedelta(seconds=parsed[0])
+    end = day + datetime.timedelta(seconds=parsed[1] + 60)       # the last minute, whole
+    inside = (min(end, win_to) - max(start, win_from)).total_seconds()
+    return inside > 0 and inside >= 0.5 * (end - start).total_seconds()
+
+
 def _in_window(topic, date, win_from, win_to):
     """True when a topic's time_range overlaps [win_from, win_to).
 
@@ -181,7 +204,7 @@ def _in_window(topic, date, win_from, win_to):
     return (start < win_to and end > win_from) or (start == end and win_from <= start < win_to)
 
 
-def _offered_topics(artifact, budget, win_from, win_to):
+def _offered_topics(artifact, budget, win_from, win_to, stretches=None, precise=False):
     """(offer, streams_by_ref) for the topics of this report inside the window.
 
     `offer` is what the prompt shows the model: a stable ref, the time range,
@@ -213,8 +236,18 @@ def _offered_topics(artifact, budget, win_from, win_to):
     folder = artifact.get("folder")
     content = artifact.get("content") or {}
     date = artifact.get("date") or content.get("date")
+    # An interrupted check's report offers the topics of its stretches, not of
+    # the other check between them (topic times are whole minutes, so one that
+    # shares a minute with a stretch is still offered).
+    # A report whose topics were CHOSEN (the dialog's ticks, or a spoken
+    # check's own, checklist_reports.check_topics) takes them as chosen: their
+    # minute stamps are not where their words were, and judging them again by
+    # the window dropped the very topics the check was about.
+    chosen = bool(artifact.get("requestedTopicRowIds"))
+    test = (lambda *a: True) if chosen else (_mostly_in if precise else _in_window)
     in_window = [(i, t) for i, t in enumerate(content.get("topics") or [])
-                 if _in_window(t, date, win_from, win_to)]
+                 if (any(test(t, date, a, b) for a, b in stretches) if stretches
+                     else test(t, date, win_from, win_to))]
     # THE WHOLE REPORT IS PLANNED BEFORE ANYTHING IS FETCHED (report_photos):
     # the person's own exclusions for the day, one copy of each photograph,
     # the size the count calls for, and -- past MAX_LIMIT -- a fair share per
@@ -683,17 +716,53 @@ def _model_budget_seconds(context):
     return remaining - RENDER_AND_WRITE_RESERVE_SECONDS
 
 
+def _project_names(artifact):
+    facts = artifact.get("reportFacts") or {}
+    names = [x["name"] for x in facts.get("sites") or [] if x.get("name")]
+    if not names:
+        content = artifact.get("content") or {}
+        names = list(content.get("siteNames") or []) or (
+            [content["siteName"]] if content.get("siteName") else [])
+    return ", ".join(names)
+
+
+def _segment_gaps(date, segments):
+    """[(gap_start, gap_end)] between consecutive stretches of a window, or []."""
+    if not isinstance(segments, list) or len(segments) < 2:
+        return []
+    out = []
+    for a, b in zip(segments, segments[1:]):
+        start, end = _clock(date, a["to"]), _clock(date, b["from"])
+        if end > start:
+            out.append((start, end))
+    return out
+
+
 def _clock(date, hhmm):
     """A wall-clock time on the report's own date. No timezone conversion happens
-    anywhere on this path (spec 2026-09-15 global constraints)."""
-    return datetime.datetime.strptime("%s %s" % (date, hhmm), "%Y-%m-%d %H:%M")
+    anywhere on this path (spec 2026-09-15 global constraints).
+
+    'HH:MM' or 'HH:MM:SS': a spoken check's window is to the second
+    (inspection_windows) -- "back to the level one" at 11:02:05 and the next
+    check at 11:02:14 are in one minute."""
+    fmt = "%Y-%m-%d %H:%M:%S" if str(hhmm).count(":") == 2 else "%Y-%m-%d %H:%M"
+    return datetime.datetime.strptime("%s %s" % (date, hhmm), fmt)
 
 
-def _action_items_for_prompt(content):
+def _action_items_for_prompt(content, offer=None):
     """The actions the model is given: extraction's, not its own reading of the
-    transcript. Owner and date are already recorded against them."""
+    transcript. Owner and date are already recorded against them.
+
+    `offer` (the topics in this report's window, _offered_topics) limits them
+    to those topics' actions. Without it every action of the day came along: on
+    TEST (2026-10-06) a pre-pour checklist for 10:59-11:02 listed the Level 2
+    PPE action from 11:03."""
+    keep = None if offer is None else {int(t["ref"][1:]) for t in offer
+                                       if str(t.get("ref", "")).startswith("t")}
     out = []
-    for topic in (content.get("topics") or []):
+    for i, topic in enumerate(content.get("topics") or []):
+        if keep is not None and i not in keep:
+            continue
         for a in (topic.get("action_items") or []):
             out.append({"action": a.get("action") or a.get("text"),
                         "owner": a.get("owner") or a.get("responsible"),
@@ -749,13 +818,27 @@ def _covers_refs(line):
     return out
 
 
-def _prose_sections(text):
+_TITLE_DECOR_RE = re.compile(r"^[\s#*_]+|[\s*_:]+$")
+
+
+def _prose_sections(text, titles=None):
     """Split the model's markdown back into {title, paragraphs}. Anything before the
-    first heading is kept under an empty title rather than dropped."""
+    first heading is kept under an empty title rather than dropped.
+
+    `titles` are the template's own section titles: a line that is exactly one
+    of them -- bare, bold, or with a colon -- is that section's heading even
+    without the `#`. On TEST (2026-10-06) muse-spark wrote "Pour Details" and
+    "A. Documents & Approvals" as plain lines; no section was recognised, the
+    checklists were rebuilt blank at the end, the model's own tables were
+    printed raw, and the code-written sections fell to the bottom."""
+    known = {" ".join(str(t).split()).lower() for t in titles or [] if t}
     sections, current = [], {"title": "", "paragraphs": [], "level": 1,
                              "covers": [], "line_refs": []}
     for raw in (text or "").splitlines():
         line = raw.rstrip()
+        bare = " ".join(_TITLE_DECOR_RE.sub("", line).split())
+        if known and not line.startswith("#") and bare.lower() in known and "|" not in line:
+            line = "## " + bare
         # A table whose first column is "#" (`# | Action | Owner`) is a header
         # row, not a heading: read as one it split the table off its section.
         if line.startswith("#") and not line.lstrip("#").strip().startswith("|"):
@@ -844,6 +927,10 @@ def _generate_document(artifact, context=None):
     # unparseable case (that one still raises, window or no window).
     spans = transcript_window.excluded_spans(date, artifact.get("excludedTopics") or [],
                                              win_from, win_to)
+    # An interrupted check (window.segments): the gaps between its stretches
+    # are left out exactly like an excluded topic's span -- the other check
+    # done in between is not this one.
+    gaps = _segment_gaps(date, window.get("segments"))
 
     read_budget = _model_budget_seconds(context)
     if read_budget <= llm_utils.MIN_USEFUL_SECONDS:
@@ -858,6 +945,13 @@ def _generate_document(artifact, context=None):
                                            win_from, win_to)
     turns = transcript_window.drop_spans(
         transcript_window.assemble(client, S3_BUCKET, picked, deadline=read_deadline), spans)
+    # Only the speech INSIDE the window, and outside the gaps between an
+    # interrupted check's stretches -- to the word (transcript_window.
+    # clip_to_window). select_keys picks whole audio files that overlap it, and
+    # every turn of a file used to come along: on TEST (2026-10-06) a pre-pour
+    # check ending 11:02:14 was filled from the Level 2 steel check later in the
+    # same 2-minute file ("No -- glasses and gloves").
+    turns = transcript_window.clip_to_window(turns, win_from, win_to, gaps)
     if not turns:
         raise RuntimeError("no recorded speech in this window after exclusions")
     if glossary:
@@ -870,7 +964,10 @@ def _generate_document(artifact, context=None):
     # prompt tells the model how many each topic has, and that number has to
     # have bytes behind it.
     photo_budget = [MAX_PHOTO_BYTES_TOTAL, MAX_PHOTOS_PER_REPORT]
-    topic_offer, photo_streams = _offered_topics(artifact, photo_budget, win_from, win_to)
+    topic_offer, photo_streams = _offered_topics(
+        artifact, photo_budget, win_from, win_to, precise=_precise(window),
+        stretches=[(_clock(date, sg["from"]), _clock(date, sg["to"]))
+                   for sg in window.get("segments") or []] if gaps else None)
 
     # REPORT DETAILS AND WEATHER ARE OURS. Those sections leave the plan the
     # model sees and are written from the facts we hold (report_facts.py);
@@ -887,7 +984,7 @@ def _generate_document(artifact, context=None):
         {"folder": artifact["folder"], "date": date,
          "from": window.get("from") or "00:00", "to": window.get("to") or "23:59",
          "recordings": len(picked)},
-        _action_items_for_prompt(content),
+        _action_items_for_prompt(content, topic_offer),
         "\n".join(t["line"] for t in turns),
         source=source,
         topics=topic_offer)
@@ -901,12 +998,29 @@ def _generate_document(artifact, context=None):
             "generation budget exhausted before the model call: %.1fs left "
             "after reserving %.1fs for the render and result write"
             % (model_budget, RENDER_AND_WRITE_RESERVE_SECONDS))
+    started = time.time()
     text, err = llm_utils.call_llm(prompt, max_tokens=8000, deadline=model_budget,
                                    caller="session_report")
+    if (err or not (text or "").strip()) and "finish_reason=length" in (err or ""):
+        # THE MODEL SPENT THE WHOLE BUDGET THINKING and wrote nothing. Measured on
+        # TEST (2026-10-06): the owner's spoken pre-pour check against a 40-item
+        # checklist took 15,997 of 16,000 tokens in reasoning; the same template on
+        # a quieter recording took 3,671. One retry on the fast path (effort low)
+        # with room for the answer, inside what is left of the budget -- a report
+        # that comes back is worth more than one that thought harder.
+        left = model_budget - (time.time() - started)
+        if left > llm_utils.MIN_USEFUL_SECONDS:
+            logger.warning("report: the model ran out of tokens thinking -- retrying "
+                           "once on the fast path (%.0fs left)", left)
+            text, err = llm_utils.call_llm(prompt, max_tokens=12000, deadline=left,
+                                           enable_thinking=False,
+                                           caller="session_report_retry")
     if err or not (text or "").strip():
         raise RuntimeError(err or "empty answer from model")
 
-    prose = _prose_sections(text)
+    prose = _prose_sections(text, titles=[s.get("title") for s in
+                                           (template.get("sections") or [])]
+                            + [(template.get("catch_all") or {}).get("title")])
     # CHECKLISTS ARE REBUILT HERE, before anything counts the answer: only rows
     # whose evidence is in the transcript survive, in the customer's order and
     # wording, and every item nobody addressed stays blank (checklist.py).
@@ -968,10 +1082,12 @@ def _generate_document(artifact, context=None):
         # The date only (owner, 2026-10-01): the window asked for is mostly
         # "everything", 00:00 - 23:59, which says nothing; when there is a
         # Report Details section it carries what was actually recorded.
-        date,
+        report_facts._long_date(date) or date,
         prose,
-        _action_items_for_prompt(content),
-        closing=note)
+        _action_items_for_prompt(content, topic_offer),
+        closing=note,
+        # The running header's left side: the project(s) this report is about.
+        header_left=_project_names(artifact) or None)
     # WHICH TEMPLATE THIS WAS comes from the REQUEST, not from the template's
     # own text. The files in report_templates/ carry `template_id` and
     # `version` inside them; a template written in the Library does not -- its
