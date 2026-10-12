@@ -142,6 +142,29 @@ def test_the_rebind_binds_by_location_through_the_real_markers_table(db):
     assert len(_photos(db, walk)) == 3 and _photos(db, chat) == []
 
 
+def test_the_rebind_reads_the_quotes_seconds_from_the_stored_evidence(db):
+    """The first words after a photo (owner, 2026-10-12) reach the rebind only
+    through `topics.evidence` as item-writer stores it -- the column has to be
+    selected, and the quotes read out of their {"status", "quotes"} object."""
+    import photo_rebind
+    from repositories import location_markers
+    cid, _, sid = _seed(db)
+    src = f"extractions/{FOLDER}/{DATE}/s1.json"
+
+    def topic(title, time_range, at_s):
+        return topics.upsert_topic(db, sid, DATE, title, source_s3_key=src, time_range=time_range,
+                                   evidence={"status": "verified", "quotes": [
+                                       {"at": at_s, "at_s": at_s, "quote": title}]})["id"]
+    booking = topic("pour booking", "10:51 - 10:52", "10:51:58")
+    formwork = topic("formwork", "10:53 - 10:54", "10:53:19")
+    location_markers.replace_for_day(db, cid, FOLDER, DATE, [
+        {"at": "10:51", "at_s": "10:51:58", "location": "level two slab"}])
+    shot = {"key": f"users/{FOLDER}/pictures/{DATE}/p.jpg", "filename": "p.jpg",
+            "hhmm": "10:53", "hhmmss": "10:53:10"}
+    assert photo_rebind.rebind_day_photos(db, cid, FOLDER, DATE, [shot]) == 1
+    assert _photos(db, formwork) == [(shot["key"], "binding")] and _photos(db, booking) == []
+
+
 def test_report_facts_read_the_days_markers_for_real(db):
     """org-api's _report_facts reads day_location_markers in a savepoint."""
     import lambda_org_api as org
