@@ -51,6 +51,14 @@ def body_of(res):
     return json.loads(res["body"])
 
 
+@pytest.fixture(autouse=True)
+def _no_company_summary(monkeypatch):
+    """admin_disambiguation first offers a non-platform caller their own company's summary
+    document (Task 10); none exists in these tests, so the candidate path under test runs."""
+    monkeypatch.setattr(org, "_get_lake_json", lambda key: None)
+    monkeypatch.setattr(org, "_day_has_deleted_sources", lambda conn, u, d: False)
+
+
 @pytest.fixture
 def wired(monkeypatch):
     """No Aurora topics, no lake doc, nothing deleted -> the plain 404 path."""
