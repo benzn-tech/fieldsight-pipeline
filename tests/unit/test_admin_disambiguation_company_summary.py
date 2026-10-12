@@ -4,6 +4,9 @@ platform_admin keeps the lake-wide document. Everyone else who reaches the branc
 reports/{date}/companies/{caller company}/summary_report.json -- the key is built from the
 caller row, never from the request -- behind the unchanged _day_has_deleted_sources guard. With no
 company document the code falls through to the folder-union path exactly as before.
+
+Serving is behind COMPANY_SUMMARY_SERVE (default off): it replaces the person picker an
+admin/gm sees today, which is the owner's product decision.
 """
 import io
 import json
@@ -61,6 +64,8 @@ class FakeS3:
 
 @pytest.fixture
 def lake(monkeypatch):
+    monkeypatch.setenv("COMPANY_SUMMARY_SERVE", "on")
+
     def _make(objects=None, deleted=False):
         s3 = FakeS3(DOCS if objects is None else objects)
         monkeypatch.setattr(org, "_s3_client", s3)
@@ -124,3 +129,11 @@ def test_a_caller_without_a_company_gets_no_company_document(lake):
     s3 = lake()
     org.admin_disambiguation(FakeConn(), _caller("gm", None), DATE)
     assert s3.get_object_calls == []
+
+
+def test_by_default_a_company_officer_still_gets_the_picker_not_a_summary(lake, monkeypatch):
+    s3 = lake()
+    monkeypatch.delenv("COMPANY_SUMMARY_SERVE", raising=False)
+    res = org.admin_disambiguation(FakeConn(), _caller("gm", CO_A), DATE)
+    assert company_key(CO_A) not in s3.get_object_calls
+    assert json.loads(res["body"]) != {"who": "A"}

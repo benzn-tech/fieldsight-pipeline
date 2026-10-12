@@ -10474,8 +10474,9 @@ def admin_disambiguation(conn, caller, date):
                else _get_lake_json(f"reports/{date}/summary_report.json"))
         if doc is not None:
             return ok(doc)
-    elif caller.get("company_id"):
-        # Task 10 (R10b): every other caller gets ONLY their own company's summary, built by
+    elif caller.get("company_id") and os.environ.get("COMPANY_SUMMARY_SERVE") == "on":
+        # Off by default: serving it replaces the person picker an admin/gm sees today with
+        # an AI summary, which is the owner's product decision. Task 10 (R10b): every other caller gets ONLY their own company's summary, built by
         # the generator from that company's folders (external members already left out).
         # The key comes from the caller row, never from the request. The guard stays the
         # lake-wide _day_has_deleted_sources (folder=None): conservative, it over-blocks a
