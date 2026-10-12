@@ -38,6 +38,7 @@ still what gets displayed.
 """
 
 import due_dates
+import due_display
 
 #: The Library's section vocabulary (scripts/api/template-store.js). A kind
 #: outside this set has no renderer on the other side.
@@ -214,6 +215,8 @@ def _actions(topics, report_date=None):
     for row in rows:
         row.pop("_seq", None)
         row.pop("_days", None)
+        # Ranked on the words, shown as the day they name (owner, 2026-10-12).
+        row["due"] = due_display.display(row["due"], report_date) or row["due"]
     return {
         "title": "Actions",
         "kind": "table",

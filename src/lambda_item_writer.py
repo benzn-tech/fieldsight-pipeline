@@ -525,7 +525,10 @@ def _final_email_rows(artifact, date):
             if text:
                 out.append({"text": text,
                             "responsible": item.get("responsible") or None,
-                            "due": item.get("deadline") or item.get("deadline_text") or None})
+                            # The words, not the resolved column: the column
+                            # is a day and has already lost "morning". The email
+                            # shows the day AND the part (due_display).
+                            "due": item.get("deadline_text") or item.get("deadline") or None})
     return todo_collapse.collapse_if_enabled(out)
 
 

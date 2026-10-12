@@ -167,7 +167,7 @@ def test_the_action_table_names_its_columns():
     assert sec["kind"] == "table"
     assert sec["fields"] == ["action", "owner", "due", "priority", "status"]
     assert sec["rows"][0]["owner"] == "Ben"
-    assert sec["rows"][0]["due"] == "2026-09-12"
+    assert sec["rows"][0]["due"] == "Sat 12 Sep 2026"   # the day, as every surface shows it
 
 
 def test_an_action_with_no_text_is_dropped_not_rendered_blank():
