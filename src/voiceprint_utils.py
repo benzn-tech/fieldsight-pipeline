@@ -169,6 +169,17 @@ def effective_margin(pool_size: int, base_margin: float = DEFAULT_MIN_MARGIN,
 #: this is a starting point, not a fitted cut, and a name above it is still only a lean.
 DEFAULT_ABSENT_FLOOR = 0.35
 
+#: With ONE enrolled person there is no runner-up, so the margin cannot speak and only the
+#: absolute score can. This is how high it must be before that one person is offered -- as
+#: a lean (`tentative`, shown with "?"), never as `confirmed`. Measured 2026-10-13 on TEST
+#: against the owner's 7-sample clean core (the profile after its 4 stray samples were set
+#: aside): his own samples scored 0.46-0.64 leave-one-out and his 10-12 turns 0.46-0.60; the
+#: voice labelled "Ivy" by hand scored 0.008, the stray samples from another voice <= 0.09,
+#: and the 2026-09-28 strangers <= 0.274. 0.45 sits ~0.18 above the highest known stranger
+#: and just below his lowest own score. n is small; a company that enrols a second person
+#: leaves this branch for the margin rule, which is the better test.
+DEFAULT_SINGLE_CANDIDATE_FLOOR = 0.45
+
 
 def decide_name(scores, duration_s: float,
                 min_turn_s: float = DEFAULT_MIN_TURN_S,
@@ -221,10 +232,20 @@ def decide_name(scores, duration_s: float,
                         score=best)
     if len(ranked) == 1:
         # Nothing to be better than. Confirming here would be confirming on an absolute
-        # score, which is exactly what the overlapping distributions forbid.
+        # score, which is exactly what the overlapping distributions forbid -- so the most
+        # this branch ever gives is a lean, and only above its own, higher floor. Without
+        # that floor every voice in the room was offered as the one enrolled person; with no
+        # name at all (the previous behaviour downstream) a one-person company was never
+        # recognised, which on TEST meant two weeks of "named 0 of N turns".
+        if best < DEFAULT_SINGLE_CANDIDATE_FLOOR:
+            return Decision("unknown", None, None,
+                            f"only one enrolled profile and {best_name} scores {best:.3f}, "
+                            f"below the {DEFAULT_SINGLE_CANDIDATE_FLOOR:.2f} a single "
+                            f"candidate needs with no runner-up to beat", score=best)
         return Decision("tentative", best_name, None,
-                        "only one enrolled profile, so there is no runner-up to beat",
-                        score=best)
+                        f"only one enrolled profile, so there is no runner-up to beat; "
+                        f"{best:.3f} clears the {DEFAULT_SINGLE_CANDIDATE_FLOOR:.2f} "
+                        f"single-candidate floor, offered as a lean", score=best)
 
     required_margin = min_margin if min_margin is not None else effective_margin(len(scores))
     margin = best - ranked[1][1]
