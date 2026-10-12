@@ -1121,6 +1121,32 @@ def time_inspections(items, turns):
     return out
 
 
+def time_evidence(result, turns):
+    """Each topic's cited quotes timed to the second they start (`at_s`), where
+    the words can be found -- the same matcher as the location markers.
+
+    A quote's `at` is the line it starts in, and a line can run for minutes: on
+    TEST (Ben_Lin_test2 2026-10-12) the formwork walk, the release agent and
+    "Oh, hey, Dave" about the scaffolding were all quoted at 10:53:19. Only the
+    words say which came first after a photograph, and photo_binding reads the
+    first words after the shutter as what it shows (owner, 2026-10-12).
+
+    Unfound quotes are left without `at_s`; nothing is guessed."""
+    stream = _word_stream(turns)
+    if not stream:
+        return 0
+    timed = 0
+    for topic in result.get('topics') or []:
+        for ev in topic.get('evidence') or []:
+            if not isinstance(ev, dict):
+                continue
+            hit = _time_one_marker({'at': ev.get('at'), 'quote': ev.get('quote')}, stream)
+            if hit:
+                ev['at_s'] = hit['at_s']
+                timed += 1
+    return timed
+
+
 def _clock_s(hms):
     try:
         parts = [int(x) for x in str(hms).split(':')]
@@ -2432,6 +2458,13 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
         except Exception:
             logger.exception("evidence: verification pass failed entirely -- "
                              "the extraction is unaffected")
+        # Same turns, same reason: the words are only here. A refinement for
+        # photo binding, so it fails open.
+        try:
+            time_evidence(parsed, turns)
+        except Exception:
+            logger.warning("evidence: could not time quotes to the second",
+                           exc_info=True)
 
     # I-2 (replaces the old raise-on-growth guard -- see _supersedes): re-read
     # the extraction that exists NOW, not the one we read before the LLM call,
