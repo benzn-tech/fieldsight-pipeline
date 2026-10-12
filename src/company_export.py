@@ -22,6 +22,22 @@ so far. A call stops when `time_budget_s` is spent and returns `done: False, nex
 calling again with the same `export_id` continues from the DURABLE state (the passed cursor is
 only a hint, so a retried or stale invocation cannot duplicate or skip an entry).
 
+Time budget and orphans: the budget is checked before each object using the row's
+`size_bytes` at a deliberately conservative COPY_RATE_BPS (5 MiB/s, well under the expected
+S3->Lambda->S3 rate): an object that could not finish in the remaining budget closes the part
+and returns the cursor instead of risking a hard Lambda timeout. A hard timeout would still
+leave an incomplete multipart upload (billed storage), so PROD NEEDS an
+`AbortIncompleteMultipartUpload` lifecycle rule (1 day) on the `exports/` prefix. Prod bucket
+lifecycle is hand-managed (the owner adds it); template.yaml deliberately does not.
+
+Tombstones are reloaded at the start of every part (a delete made mid-export is honoured from
+the next part on). `state.json` is written conditionally (If-None-Match on the first write,
+If-Match on the ETag read at start / returned by the previous write); on a lost race the
+call stops without writing and returns `lost_race: True` (a duplicate delivery of one chain
+step cannot clobber the other's progress). Part keys are still deterministic, so a crash
+between completing part N and saving state makes the resume rewrite part N: same bytes,
+same key, inside the export prefix.
+
 Every key withheld because of a tombstone is listed in the manifest under
 `excluded_tombstoned` ({s3_key, reason}) so the operator can see what was withheld.
 Runtime note: developed on Python 3.14; the Lambda runtime is 3.11. The unseekable-stream
@@ -47,6 +63,24 @@ PAGE_SIZE = 1000
 
 _EXTRACTION_PREFIX_RE = re.compile(r"^extractions/([^/]+)/(\d{4}-\d{2}-\d{2})/(.+)$")
 _MISSING_CODES = {"NoSuchKey", "404", "NotFound"}
+_PRECONDITION_CODES = {"PreconditionFailed", "412", "ConditionalRequestConflict"}
+COPY_RATE_BPS = 5 * 1024 * 1024     # conservative bytes/second used for the budget guard
+_HEX32 = re.compile(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])")
+_SID_ONLY = re.compile(r"^(?:sid)?([0-9a-f]{32})(?:-(?:updated|notes))?$")
+
+
+class ExportError(RuntimeError):
+    """The export cannot run (e.g. lake_objects missing); reported as an error result."""
+
+
+class _LostRace(Exception):
+    pass
+
+
+def _bare_sid(value):
+    """Bare lowercase 32-hex of a sid / sid-prefixed / marker name, else None."""
+    m = _SID_ONLY.match(str(value or "").lower())
+    return m.group(1) if m else None
 
 
 def export_prefix(company_id, export_id) -> str:
@@ -87,30 +121,56 @@ class Tombstones:
 
     def __init__(self, prefixes=()):
         self.prefixes = tuple(p for p in prefixes if isinstance(p, str) and p)
-        self.sids = {"sid" + s for p in self.prefixes for s in lake_keys.SID_RE.findall(p)}
-        self.by_day = {}          # (folder, day) -> {session bases}
+        # bare lowercase hex of every tombstoned session
+        self.sids = {s.lower() for p in self.prefixes for s in lake_keys.SID_RE.findall(p.lower())}
+        self.by_day = {}          # (folder.casefold(), day) -> {session bases}
+        self.by_folder = {}       # folder.casefold() -> {session bases} across ALL days
         for p in self.prefixes:
             m = _EXTRACTION_PREFIX_RE.match(p)
             if m:
-                self.by_day.setdefault((m.group(1), m.group(2)), set()).add(m.group(3))
-        self.bases = {b for bs in self.by_day.values() for b in bs}
+                f = m.group(1).casefold()
+                self.by_day.setdefault((f, m.group(2)), set()).add(m.group(3))
+                self.by_folder.setdefault(f, set()).add(m.group(3))
+                b = _bare_sid(m.group(3))
+                if b:
+                    self.sids.add(b)
+        self.bases = {b for bs in self.by_folder.values() for b in bs}
 
     @classmethod
     def load(cls, conn):
         return cls(redactions.deleted_source_prefixes(conn) or [])
 
+    def _session_hit(self, key, parsed):
+        """True when the key names a tombstoned session by any spelling: the literal
+        `sid{hex}` token, a bare 32-hex path token (directory or file name), the parsed sid, or
+        the parsed session_base (any of which may be bare hex or sid-prefixed)."""
+        if not self.sids:
+            return False
+        low = key.lower()
+        cands = set(lake_keys.SID_RE.findall(low)) | set(_HEX32.findall(low))
+        for v in (parsed.get("sid"), parsed.get("session_base")):
+            b = _bare_sid(v)
+            if b:
+                cands.add(b)
+        return bool(cands & self.sids)
+
     def _key_reason(self, key):
         if self.prefixes and key.startswith(self.prefixes):
             return "recording_prefix"
-        if self.sids and any("sid" + s in self.sids for s in lake_keys.SID_RE.findall(key)):
+        parsed = lake_keys.parse(key) or {}
+        if self._session_hit(key, parsed):
             return "recording_sid"
-        if self.by_day:
-            parsed = lake_keys.parse(key) or {}
-            folder, day = parsed.get("folder"), parsed.get("day")
-            if folder and day and (folder, day) in self.by_day:
-                name = key.rsplit("/", 1)[-1]
-                if any(b in name for b in self.by_day[(folder, day)]):
-                    return "recording_base"
+        if not self.by_day:
+            return None
+        folder, day = parsed.get("folder"), parsed.get("day")
+        name = key.rsplit("/", 1)[-1]
+        if folder:
+            f = folder.casefold()
+            # legacy (non-sid) bases: matched on the file name across ALL days of the folder
+            # (a session's chunks can land on the next day), folder compared case-insensitively
+            if any(b in name for b in self.by_folder.get(f, ())):
+                return "recording_base"
+            if day and (f, day) in self.by_day:
                 if parsed.get("kind") == "report":
                     return "day_report"
                 # R9g (fail closed): a folder/day with an active tombstone withholds every
@@ -118,8 +178,11 @@ class Tombstones:
                 # ...). Session-keyed objects are judged by their own session above.
                 if not parsed.get("sid") and not parsed.get("session_base"):
                     return "day_level_no_session"
+        else:
             sb = parsed.get("session_base")
-            if sb and not folder and any(sb == b or sb.startswith(b) for b in self.bases):
+            if sb and any(sb == b or sb.startswith(b) for b in self.bases):
+                return "recording_base"
+            if any(b in name for b in self.bases):
                 return "recording_base"
         return None
 
@@ -227,13 +290,14 @@ def _is_missing(exc) -> bool:
 
 
 def _read_state(s3, bucket, key):
+    """(state doc, etag) or (None, None)."""
     try:
-        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        resp = s3.get_object(Bucket=bucket, Key=key)
     except Exception as exc:  # noqa: BLE001
         if _is_missing(exc):
-            return None
+            return None, None
         raise
-    return json.loads(body)
+    return json.loads(resp["Body"].read()), resp.get("ETag")
 
 
 def _put_json(s3, bucket, key, doc):
@@ -242,7 +306,14 @@ def _put_json(s3, bucket, key, doc):
 
 
 def _unsafe_name(name) -> bool:
-    return name.startswith("/") or any(seg == ".." for seg in name.split("/"))
+    segs = name.split("/")
+    return (name.startswith("/") or "\\" in name or any(ord(c) < 32 for c in name)
+            or any(seg in ("", "..") for seg in segs))
+
+
+def _table_exists(conn) -> bool:
+    row = conn.execute("SELECT to_regclass('lake_objects') IS NOT NULL").fetchone()
+    return bool(row["?column?"] if isinstance(row, dict) else row[0])
 
 
 def run(conn, s3, company_id, *, bucket_for, export_id=None, cursor=None,
@@ -266,7 +337,8 @@ def run(conn, s3, company_id, *, bucket_for, export_id=None, cursor=None,
     dest = dest_bucket or bucket_for("exports")
     state_key = prefix + "state.json"
 
-    state = _read_state(s3, dest, state_key)
+    state, state_etag = _read_state(s3, dest, state_key)
+    state_existed = state is not None
     if state is None and cursor is not None:
         raise ValueError("cursor given but this export has no saved state")
     if state is None:
@@ -289,8 +361,10 @@ def run(conn, s3, company_id, *, bucket_for, export_id=None, cursor=None,
         return result(True)
 
     tombs = tombstones if tombstones is not None else Tombstones.load(conn)
+    reload_each_part = tombstones is None
     started = clock()
     processed = 0
+    copied = 0                  # objects actually copied by THIS call
     pos = state["cursor"]
     sink = zf = None
     new_entries = []            # entries since the last durable state
@@ -317,6 +391,7 @@ def run(conn, s3, company_id, *, bucket_for, export_id=None, cursor=None,
         cur_objects = cur_bytes = 0
 
     def save(done=False):
+        nonlocal state_etag, state_existed
         state["parts"] = state["parts"] + new_parts
         new_parts.clear()
         state["entries"] = state["entries"] + new_entries
@@ -328,38 +403,62 @@ def run(conn, s3, company_id, *, bucket_for, export_id=None, cursor=None,
         state["excluded_tombstoned"] = state.get("excluded_tombstoned", []) + tomb_listed
         tomb_listed.clear()
         state["done"] = done
-        _put_json(s3, dest, state_key, state)
+        kw = ({"IfMatch": state_etag} if state_etag else {} if state_existed
+              else {"IfNoneMatch": "*"})
+        try:
+            resp = s3.put_object(Bucket=dest, Key=state_key,
+                                 Body=json.dumps(state, default=str).encode("utf-8"),
+                                 ContentType="application/json", **kw)
+        except Exception as exc:  # noqa: BLE001
+            code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
+            if code in _PRECONDITION_CODES:
+                raise _LostRace() from None
+            raise
+        state_etag = (resp or {}).get("ETag")
+        state_existed = True
 
     added_box = [0]
+
+    def classify(rows):
+        """{key: reason} for rows that must not be exported (re-run after a tombstone reload)."""
+        drop = {}
+        keys = []
+        for row in rows:
+            k = row["s3_key"]
+            parsed = lake_keys.parse(k)
+            if str(row.get("company_id")) != company_id:
+                drop[k] = "foreign_company"
+            elif parsed is not None and parsed["scope"] in ("global", "lake_wide"):
+                drop[k] = "not_tenant"
+            elif parsed is not None and parsed["kind"] == "redaction":
+                drop[k] = "internal"
+            else:
+                keys.append(k)
+        tomb = tombs.excluded(conn, keys)
+        tomb_keys.update(tomb)
+        drop.update(tomb)
+        return drop
+
+    def stop_for_budget():
+        close_part()
+        save()
+        return result(False)
+
     try:
         finished = False
         while not finished:
             page = lake_objects.owners_for_company(conn, company_id, after_key=pos,
                                                    limit=page_size)
             if not page:
+                if processed == 0 and state["cursor"] is None and not state["entries"] \
+                        and not _table_exists(conn):
+                    raise ExportError("lake_objects missing")
                 finished = True
                 break
-            drop = {}
-            keys = []
-            for row in page:
-                k = row["s3_key"]
-                parsed = lake_keys.parse(k)
-                if str(row.get("company_id")) != company_id:
-                    drop[k] = "foreign_company"
-                elif parsed is not None and parsed["scope"] in ("global", "lake_wide"):
-                    drop[k] = "not_tenant"
-                elif parsed is not None and parsed["kind"] == "redaction":
-                    drop[k] = "internal"
-                else:
-                    keys.append(k)
-            tomb = tombs.excluded(conn, keys)
-            tomb_keys.update(tomb)
-            drop.update(tomb)
-            for row in page:
+            drop = classify(page)
+            for idx, row in enumerate(page):
                 if processed and clock() - started >= time_budget_s:
-                    close_part()
-                    save()
-                    return result(False)
+                    return stop_for_budget()
                 k = row["s3_key"]
                 processed += 1
                 reason = drop.get(k)
@@ -379,6 +478,23 @@ def run(conn, s3, company_id, *, bucket_for, export_id=None, cursor=None,
                     new_entries.append(entry)
                     pos = k
                     continue
+                size = row.get("size_bytes")
+                if (copied and isinstance(size, int) and size > 0
+                        and size / COPY_RATE_BPS > time_budget_s - (clock() - started)):
+                    processed -= 1          # not handled: the next call starts at this key
+                    return stop_for_budget()
+                if zf is None and reload_each_part and copied:
+                    # a delete made since the last part is honoured from this part on,
+                    # including for the rest of this page
+                    tombs = Tombstones.load(conn)
+                    drop = classify(page[idx:])
+                    reason = drop.get(k)
+                    if reason:
+                        bump(reason)
+                        if k in tomb_keys:
+                            tomb_listed.append({"s3_key": k, "reason": reason})
+                        pos = k
+                        continue
                 try:
                     body = s3.get_object(Bucket=bucket_for(kind), Key=k)["Body"]
                 except Exception as exc:  # noqa: BLE001
@@ -401,6 +517,7 @@ def run(conn, s3, company_id, *, bucket_for, export_id=None, cursor=None,
                         n += len(chunk)
                 if hasattr(body, "close"):
                     body.close()
+                copied += 1
                 entry["part"] = part_no
                 entry["size"] = n
                 new_entries.append(entry)
@@ -423,6 +540,13 @@ def run(conn, s3, company_id, *, bucket_for, export_id=None, cursor=None,
         _put_json(s3, dest, prefix + "manifest.json", manifest)
         save(done=True)
         return result(True)
+    except _LostRace:
+        if sink is not None:
+            sink.abort()
+        logger.warning("export %s: lost the state.json race; stopping without writing", export_id)
+        out = result(False)
+        out.update(next_cursor=None, lost_race=True)
+        return out
     except BaseException:
         if sink is not None:
             sink.abort()

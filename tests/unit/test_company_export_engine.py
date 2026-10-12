@@ -60,6 +60,11 @@ def setup(monkeypatch, rows, payload=None, filter_company=True):
     return s3
 
 
+@pytest.fixture(autouse=True)
+def _table_present(monkeypatch):
+    monkeypatch.setattr(ce, "_table_exists", lambda conn: True)
+
+
 def run(s3, **kw):
     kw.setdefault("bucket_for", bucket_for)
     kw.setdefault("export_id", EXPORT)
@@ -281,3 +286,120 @@ def test_tombstone_db_sources_are_photo_and_keyframe(monkeypatch):
     ks = ["users/A/pictures/2026-10-01/IMG1.jpg", "users/A/pictures/2026-10-01/IMG2.jpg",
           "keyframes/A/kf1.jpg"]
     assert t.excluded(None, ks) == {ks[0]: "photo_tombstone", ks[2]: "keyframe_tombstone"}
+
+
+# --- fix round 2 ---------------------------------------------------------------------------
+HEX = "ab" * 16
+TOMB = f"extractions/Ada/2026-10-01/sid{HEX}"
+
+
+@pytest.mark.parametrize("key", [
+    f"session_reports/Ada/2026-10-01/{HEX}/r.json",                 # session_report(s)
+    f"session_report_results/Ada/2026-10-01/{HEX}/r.json",          # ... results
+    f"session_report_requests/Ada/2026-10-01/{HEX}/r.json",         # ... requests
+    f"session_rolling/Ada/2026-10-01/{HEX}/roll.json",
+    f"session_brief/Ada/2026-10-01/sid{HEX}/brief.json",
+    f"session_finalize_requests/{HEX}-updated.json",
+    f"session_finalize_requests/{HEX}-notes.json",
+    f"session_finalize_results/sid{HEX}.json",
+    f"somethingnew/Ada/2026-10-01/{HEX}/x.json",                    # sid only as a directory
+    f"transcripts/Ada/2026-10-01/UPPER_{HEX.upper()}.json",         # case differs
+])
+def test_every_spelling_of_a_tombstoned_session_is_withheld(key):
+    t = ce.Tombstones([TOMB])
+    assert t._key_reason(key) == "recording_sid", key
+    other = key.replace(HEX, "cd" * 16).replace(HEX.upper(), ("cd" * 16).upper())
+    assert t._key_reason(other) in (None, "day_level_no_session")   # another session: not a sid hit
+
+
+def test_tombstone_stored_bare_hex_and_uppercase_normalise():
+    t = ce.Tombstones([f"extractions/Ada/2026-10-01/{HEX.upper()}"])
+    assert t._key_reason(f"session_rolling/Ada/2026-10-01/{HEX}/x.json") == "recording_sid"
+
+
+def test_legacy_base_matches_across_days_and_folder_case():
+    base = "20261002_083000"
+    t = ce.Tombstones([f"extractions/Ada/2026-10-02/{base}"])
+    assert t._key_reason(f"transcripts/Ada/2026-10-03/{base}_c0.json") == "recording_base"   # next day
+    assert t._key_reason(f"transcripts/ada/2026-10-02/{base}_c0.json") == "recording_base"   # case
+    assert t._key_reason(f"users/ADA/audio/2026-10-04/{base}.wav") == "recording_base"
+    assert t._key_reason("transcripts/Ada/2026-10-03/20261003_090000_c0.json") is None
+    assert t._key_reason(f"transcripts/Bob/2026-10-03/{base}_c0.json") is None            # other folder
+
+
+@pytest.mark.parametrize("name", ["transcript/a\\..\\x.json", "transcript/a//b.json",
+                                  "transcript/a/b\x01.json", "transcript/../x", "/abs"])
+def test_unsafe_member_names(name):
+    assert ce._unsafe_name(name)
+    assert not ce._unsafe_name("transcript/transcripts/Ada/2026-10-01/a.json")
+
+
+def test_budget_guard_uses_row_size_and_resumes(monkeypatch):
+    big = 100 * 1024 * 1024
+    rows = [row(key(0), size=10), row(key(1), size=big), row(key(2), size=10)]
+    s3 = setup(monkeypatch, rows)
+    out1 = run(s3, time_budget_s=19, clock=lambda: 0)     # 100 MiB at 5 MiB/s = 20 s > 19 s left
+    assert out1["done"] is False and out1["next_cursor"] == key(0)
+    assert (LAKE, key(1)) not in s3.get_calls and not s3.uploads
+    out2 = run(s3, cursor=out1["next_cursor"], time_budget_s=10 ** 6, clock=lambda: 0)
+    assert out2["done"]
+    assert [o["s3_key"] for o in manifest(s3)["objects"]] == [key(0), key(1), key(2)]
+
+
+def test_budget_guard_always_makes_progress(monkeypatch):
+    s3 = setup(monkeypatch, [row(key(0), size=10 ** 12)])
+    out = run(s3, time_budget_s=1, clock=lambda: 0)
+    assert out["done"] and out["objects"] == 1
+
+
+def test_tombstones_are_reloaded_at_each_part(monkeypatch):
+    s3 = setup(monkeypatch, [row(key(i)) for i in range(4)])
+    loads = []
+
+    class T:
+        def __init__(self, dead):
+            self.dead = dead
+
+        def excluded(self, conn, keys):
+            return {k: "recording_sid" for k in keys if k in self.dead}
+
+    def load(conn):
+        loads.append(1)
+        return T({key(2)} if len(loads) > 1 else set())
+    monkeypatch.setattr(ce.Tombstones, "load", staticmethod(load))
+    out = ce.run(object(), s3, CO, bucket_for=bucket_for, export_id=EXPORT, now=NOW,
+                 part_bytes=1, sink_part_bytes=4096)         # one object per part
+    keys = [o["s3_key"] for o in manifest(s3)["objects"]]
+    assert out["done"] and len(loads) >= 3
+    assert key(2) not in keys and key(3) in keys and key(0) in keys
+
+
+def test_lost_state_race_stops_without_writing(monkeypatch):
+    s3 = setup(monkeypatch, [row(key(i)) for i in range(3)])
+    t = iter(range(0, 1000))
+    run(s3, time_budget_s=2, clock=lambda: next(t))          # state.json now exists
+    state_key = (LAKE, PREFIX + "state.json")
+    before = s3.objects[state_key]
+    s3.race_on_put = lambda b, k: s3._stamp(b, k) if k.endswith("state.json") else None
+    out = run(s3, time_budget_s=10 ** 6)
+    assert out.get("lost_race") is True and out["done"] is False and out["next_cursor"] is None
+    assert s3.objects[state_key] == before                   # the loser wrote nothing
+    assert not s3.uploads
+
+
+def test_first_state_write_is_if_none_match(monkeypatch):
+    s3 = setup(monkeypatch, [row(key(0))])
+    seen = []
+    orig = s3.put_object
+    s3.put_object = lambda **kw: (seen.append(dict(kw)), orig(**kw))[1]
+    run(s3)
+    st = [kw for kw in seen if kw["Key"].endswith("state.json")]
+    assert st and st[0].get("IfNoneMatch") == "*"
+
+
+def test_missing_table_is_an_error_not_an_empty_done_export(monkeypatch):
+    s3 = setup(monkeypatch, [])
+    monkeypatch.setattr(ce, "_table_exists", lambda conn: False)
+    with pytest.raises(ce.ExportError, match="lake_objects missing"):
+        run(s3)
+    assert (LAKE, PREFIX + "manifest.json") not in s3.objects

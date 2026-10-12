@@ -98,3 +98,22 @@ def test_an_api_gateway_event_cannot_reach_the_task(monkeypatch):
     except Exception:  # noqa: BLE001 - whatever the router does, it must not export
         pass
     assert seen["runs"] == []
+
+
+def test_a_lost_race_does_not_chain(monkeypatch):
+    monkeypatch.setenv("LAKE_OPS_FUNCTION", "fs-lakeops")
+    out = _out(False, None)
+    out["lost_race"] = True
+    _, lam = _patch(monkeypatch, [out])
+    api.lambda_handler({"task": "export_company", "company_id": CO, "export_id": "e1"}, None)
+    assert lam.calls == []
+
+
+def test_export_error_is_an_error_value(monkeypatch):
+    _patch(monkeypatch, [])
+
+    def boom(*a, **k):
+        raise api.company_export.ExportError("lake_objects missing")
+    monkeypatch.setattr(api.company_export, "run", boom)
+    out = api.lambda_handler({"task": "export_company", "company_id": CO}, None)
+    assert out == {"error": "lake_objects missing"}

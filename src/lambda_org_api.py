@@ -5554,6 +5554,8 @@ def company_export_status(conn, caller, company_id, export_id):
             ExpiresIn=PRESIGNED_URL_EXPIRY)
 
     manifest = _read_export_doc(prefix + "manifest.json")
+    if manifest is not None and manifest.get("company_id") != cid:
+        return error("export not found (or not started yet)", 404)
     if manifest is not None:
         parts = []
         for p in manifest.get("parts") or []:
@@ -5568,6 +5570,8 @@ def company_export_status(conn, caller, company_id, export_id):
                                 "url": presign(prefix + "manifest.json")},
                    "expiresIn": PRESIGNED_URL_EXPIRY})
     state = _read_export_doc(prefix + "state.json")
+    if state is not None and state.get("company_id") != cid:
+        return error("export not found (or not started yet)", 404)
     if state is not None:
         return ok({"exportId": eid, "companyId": cid, "status": "running", "done": False,
                    "partsWritten": len(state.get("parts") or []),
@@ -5613,9 +5617,9 @@ def export_company_task(event, context=None):
                 export_id=event.get("export_id"), cursor=event.get("cursor"),
                 time_budget_s=budget, part_bytes=part_bytes,
                 dest_bucket=_export_bucket_for("exports"))
-    except ValueError as exc:
+    except (ValueError, company_export.ExportError) as exc:
         return {"error": str(exc)}
-    if not out["done"]:
+    if not out["done"] and out.get("next_cursor") and not out.get("lost_race"):
         target = os.environ.get("LAKE_OPS_FUNCTION") or getattr(context, "function_name", None)
         if target:
             lambda_client().invoke(

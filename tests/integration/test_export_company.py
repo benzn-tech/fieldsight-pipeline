@@ -196,3 +196,11 @@ def test_a_deleted_session_withholds_the_days_session_less_keys_but_not_the_live
                       day_emb: "day_level_no_session"}
     for kk in (dead_tr, day_trace, day_emb):
         assert (LAKE, kk) not in s3.get_calls
+
+
+def test_a_missing_lake_objects_table_is_an_error_not_an_empty_export(db):
+    s3 = FakeS3({}, min_part=1)
+    db.execute("DROP TABLE lake_objects CASCADE")      # rolled back with the test transaction
+    with pytest.raises(ce.ExportError, match="lake_objects missing"):
+        export(db, s3, str(uuid.uuid4()))
+    assert not any(k.endswith("manifest.json") for _, k in s3.objects)

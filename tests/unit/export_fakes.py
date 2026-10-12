@@ -40,6 +40,9 @@ class FakeS3:
         self.fail_get = {}                      # key -> exception
         self.fail_upload_part = None            # exception raised on the Nth upload_part (1-based) -> (n, exc)
         self._n = 0
+        self.etags = {}                         # (bucket, key) -> current etag
+        self._etag_n = 0
+        self.race_on_put = None                 # callable(bucket, key) run just before a put
 
     # reads
     def get_object(self, Bucket, Key):
@@ -48,12 +51,25 @@ class FakeS3:
             raise self.fail_get[Key]
         if (Bucket, Key) not in self.objects:
             raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "x"}}, "GetObject")
-        return {"Body": Body(self.objects[(Bucket, Key)])}
+        return {"Body": Body(self.objects[(Bucket, Key)]),
+                "ETag": self.etags.get((Bucket, Key), '"e0"')}
+
+    def _stamp(self, Bucket, Key):
+        self._etag_n += 1
+        self.etags[(Bucket, Key)] = f'"v{self._etag_n}"'
+        return self.etags[(Bucket, Key)]
 
     def put_object(self, Bucket, Key, Body, **kw):
+        if self.race_on_put:
+            self.race_on_put(Bucket, Key)
+        exists = (Bucket, Key) in self.objects
+        if kw.get("IfNoneMatch") == "*" and exists:
+            raise ClientError({"Error": {"Code": "PreconditionFailed", "Message": "x"}}, "PutObject")
+        if "IfMatch" in kw and (not exists or self.etags.get((Bucket, Key), '"e0"') != kw["IfMatch"]):
+            raise ClientError({"Error": {"Code": "PreconditionFailed", "Message": "x"}}, "PutObject")
         self.objects[(Bucket, Key)] = Body if isinstance(Body, bytes) else Body.encode()
         self.written.append((Bucket, Key))
-        return {}
+        return {"ETag": self._stamp(Bucket, Key)}
 
     # multipart
     def create_multipart_upload(self, Bucket, Key, **kw):

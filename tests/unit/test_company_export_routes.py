@@ -146,7 +146,7 @@ def test_function_level_traversal_is_400(wired):
 
 def test_done_export_presigns_only_keys_under_its_prefix_for_15_minutes(wired):
     wired["s3"].docs[PREFIX + "manifest.json"] = {
-        "parts": [{"key": PREFIX + "part-0001.zip", "objects": 3, "bytes": 30},
+        "company_id": CO, "parts": [{"key": PREFIX + "part-0001.zip", "objects": 3, "bytes": 30},
                   {"key": PREFIX + "part-0002.zip", "objects": 1, "bytes": 10},
                   # a manifest naming anything outside the prefix must not be presigned
                   {"key": f"exports/{OTHER_CO}/{EID}/part-0001.zip", "objects": 1, "bytes": 1},
@@ -166,10 +166,22 @@ def test_done_export_presigns_only_keys_under_its_prefix_for_15_minutes(wired):
 
 
 def test_running_and_unknown_exports(wired):
-    wired["s3"].docs[PREFIX + "state.json"] = {"parts": [{"key": PREFIX + "part-0001.zip"}],
+    wired["s3"].docs[PREFIX + "state.json"] = {"company_id": CO,
+                                               "parts": [{"key": PREFIX + "part-0001.zip"}],
                                                "entries": [{}, {}]}
     out = body(call("GET", f"/companies/{CO}/export/{EID}"))
     assert out["status"] == "running" and out["done"] is False and out["partsWritten"] == 1
     assert wired["s3"].presigned == []                       # nothing downloadable until done
     other = str(uuid.uuid4())
     assert call("GET", f"/companies/{CO}/export/{other}")["statusCode"] == 404
+
+
+def test_a_doc_for_another_company_is_404(wired):
+    """M3: the stored company_id must match the path company, for manifest and state alike."""
+    wired["s3"].docs[PREFIX + "manifest.json"] = {"company_id": OTHER_CO, "parts": [
+        {"key": PREFIX + "part-0001.zip"}]}
+    assert call("GET", f"/companies/{CO}/export/{EID}")["statusCode"] == 404
+    del wired["s3"].docs[PREFIX + "manifest.json"]
+    wired["s3"].docs[PREFIX + "state.json"] = {"company_id": OTHER_CO, "parts": [], "entries": []}
+    assert call("GET", f"/companies/{CO}/export/{EID}")["statusCode"] == 404
+    assert wired["s3"].presigned == []
