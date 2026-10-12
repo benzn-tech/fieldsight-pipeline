@@ -89,9 +89,36 @@ def test_site_uuid_of_an_unknown_site_is_not_guessed():
     assert o["company_id"] is None and o["reason"] == "unresolved"
 
 
-def test_voiceprint_company_in_the_key():
+def test_voiceprint_company_in_the_key_is_never_the_owner():
+    """I1: the company segment is the CALLER's (an external member's home, or the operator
+    acting on a tenant). No session -> NULL, whatever the key says."""
     o = resolve(world(), f"voiceprint_requests/{CO_C}/base1/req.json")
-    assert (o["company_id"], o["site_id"], o["reason"]) == (CO_C, None, "key")
+    assert o["company_id"] is None and o["reason"] == "unresolved"
+    base = f"ada_2026-10-01_09-00-00_sid{SID}"
+    o = resolve(world(), f"voiceprint_requests/{CO_C}/{base}/req.json",
+                {"company_id": CO_C})  # not even a hint rescues it
+    assert o["company_id"] is None
+
+
+def test_voiceprint_request_of_an_external_member_belongs_to_the_sessions_site_company():
+    """Home B, session on a site of A: the key carries B; the owner is A."""
+    base = f"eve_2026-10-01_09-00-00_sid{SID}"
+    f = world(sessions={SID: {"company_id": CO_A, "site_id": SITE_A, "user_id": USER_EVE}})
+    for key in (f"voiceprint_requests/{CO_B}/{base}/req.json",
+                f"voiceprint_requests/{CO_B}/{base}/match-abc.json"):
+        o = resolve(f, key)
+        assert (o["company_id"], o["reason"]) == (CO_A, "session")
+
+
+def test_voiceprint_request_of_a_platform_admin_acting_on_a_tenant():
+    operator = str(uuid.uuid4())
+    base = f"ada_2026-10-01_09-00-00_sid{SID}"
+    f = world(sessions={SID: {"company_id": CO_B, "site_id": SITE_B, "user_id": USER_EVE}})
+    o = resolve(f, f"voiceprint_requests/{operator}/{base}/req.json")
+    assert o["company_id"] == CO_B
+    # a session the database does not know is NULL, never the operator's company
+    o = resolve(world(), f"voiceprint_requests/{operator}/{base}/req.json")
+    assert o["company_id"] is None
 
 
 def test_voice_key_takes_the_sites_company_not_the_callers_in_the_key():

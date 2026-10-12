@@ -150,3 +150,24 @@ def test_the_cadence_exemption_is_backed_by_the_s3_first_gate():
     src = inspect.getsource(api.export_tick)
     assert src.index("list_objects_v2") < src.index("get_connection()")
     assert src.index('if not keys:') < src.index("get_connection()")
+
+
+class Ctx:
+    def __init__(self, ms):
+        self.ms = ms
+
+    def get_remaining_time_in_millis(self):
+        return self.ms
+
+
+def test_the_tick_budget_never_outlives_the_ten_minute_rate(monkeypatch):
+    """I3: min(480 s, remaining - 30 s). A full 900 s Lambda gets 480, so the next tick (10
+    minutes later) never starts while this one is still copying."""
+    s3, conns, calls = _wire(monkeypatch, {KEY: _request()}, [_out(False)] * 3)
+    api.lambda_handler({"task": "export_tick"}, Ctx(900_000))
+    assert calls[-1][1]["time_budget_s"] == 480
+    api.lambda_handler({"task": "export_tick"}, Ctx(200_000))      # little time left
+    assert calls[-1][1]["time_budget_s"] == 170
+    api.lambda_handler({"task": "export_tick"}, None)             # no context: the cap
+    assert calls[-1][1]["time_budget_s"] == 480
+    assert api.EXPORT_TICK_BUDGET_S < 600 - 60

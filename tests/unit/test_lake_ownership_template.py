@@ -129,31 +129,22 @@ def test_lake_ops_iam_is_exactly_what_the_three_tasks_need():
         assert "s3:prefix" not in s
 
 
-def test_lake_ops_runs_the_drain_daily_before_the_directory_republish():
-    res = _resources()
-    ops = res["LakeOpsFunction"]
+def test_lake_ops_runs_the_drain_hourly_and_gated_on_s3():
+    """I2: a daily 500-object drain cannot keep up, so it runs hourly; each run lists S3 first
+    and opens no connection when idle (pinned in test_drain_lake_manifest_dispatch), so the
+    cadence does not keep Aurora awake."""
+    ops = _resources()["LakeOpsFunction"]
     m = re.search(r"DrainLakeManifest:\n(?:          .*\n|            .*\n)+", ops + "\n")
     assert m, "no DrainLakeManifest event on LakeOpsFunction"
     ev = m.group(0)
     assert "Type: Schedule" in ev
+    assert "Schedule: rate(1 hour)" in ev
     assert "Input: '{\"task\": \"drain_lake_manifest\"}'" in ev
     assert "State: !If [ShouldEnableSchedules, ENABLED, DISABLED]" in ev
-
-    def cron(text):
-        c = re.search(r"Schedule: cron\((\d+) (\d+) \* \* \? \*\)", text)
-        assert c, text
-        return int(c.group(2)) * 60 + int(c.group(1))
-
-    drain = cron(ev)
-    rep = re.search(r"DirectoryRepublish:\n(?:          .*\n|            .*\n)+", res["OrgApiFunction"] + "\n")
-    assert rep and "republish_directory" in rep.group(0)
-    # Both are fixed UTC crons, so "earlier in UTC" is "earlier" in NZST and in NZDT alike.
-    assert drain < cron(rep.group(0))
-    # And it ends before the first of the morning republishes starts: start + the 900 s
-    # timeout must be at or before the 15:30 UTC site-coords run.
-    coords = re.search(r"SiteCoordsRepublish:\n(?:          .*\n|            .*\n)+",
-                       res["OrgApiFunction"] + "\n")
-    assert coords and drain + 15 <= cron(coords.group(0))
+    # one run (780 s budget) fits inside the Lambda timeout and well inside the hour
+    code = (SRC / "lambda_org_api.py").read_text(encoding="utf-8")
+    assert "DRAIN_TIME_BUDGET_S = 780" in code
+    assert 780 < int(re.search(r"Timeout: (\d+)", ops).group(1)) < 3600
 
 
 def test_export_tick_is_scheduled_every_ten_minutes_and_gated():

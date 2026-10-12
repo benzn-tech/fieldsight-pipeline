@@ -46,7 +46,7 @@ _COMPANY_SUMMARY = re.compile(
     rf"^reports/{_DATE}/companies/(?P<company_id>{_UUID})/summary_report\.[a-z]+$")
 _SITE_REPORT = re.compile(rf"^reports/{_DATE}/sites/(?P<site_slug>[^/]+)/.+$")
 _GLOBAL = re.compile(r"^(?:config|models|app-releases|scripts|pending_downloads|download_claims|other|"
-                     r"org-assets|notices|lake_manifest|lake_index|exports)/")
+                     r"org-assets|notices|lake_manifest|exports|export_requests)/")
 
 _TENANT_RE = [(k, re.compile(p)) for k, p in _TENANT]
 _SESSION_RE = [(k, re.compile(p)) for k, p in _SESSION]
@@ -142,6 +142,10 @@ def parse(key):
                     site_id = g["site_ref"]
                 else:
                     site_slug = g["site_ref"]
+            sid = None
+            if kind == "voiceprint":  # the session this request is about (the key's company is not its owner)
+                base = g.get("base") or ""
+                sid = _sid_from_name(base) or _sid_from_dir(base)
             return _result("tenant", kind, day=g.get("day"), site_id=site_id, site_slug=site_slug,
-                           company_id=g.get("company_id"), session_base=g.get("base"))
+                           company_id=g.get("company_id"), session_base=g.get("base"), sid=sid)
     return None

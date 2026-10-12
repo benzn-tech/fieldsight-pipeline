@@ -335,13 +335,21 @@ def test_a_site_report_with_an_ambiguous_slug_takes_the_company_hint_only_withou
     assert _row(db, key2)[0] == w["a"]["id"]
 
 
-def test_voiceprint_company_in_the_key_is_stored(db):
+def test_voiceprint_request_is_owned_by_its_session_not_the_company_in_its_key(db):
+    """I1: the key's company is the caller's. Ada (home A) recorded on B's site; a request
+    minted under A's prefix belongs to B. A session nobody knows leaves it NULL."""
     w = _world(db)
     s3 = FakeS3()
-    key = f"voiceprint_requests/{w['b']['id']}/base1/req.json"
-    _put(s3, key)
+    sid = uuid.uuid4().hex
+    meeting_session.ensure_open(db, sid, w["a"]["id"], w["ada"]["id"], w["sb"]["id"], "audio",
+                                "2026-10-01T01:00:00Z")
+    key = f"voiceprint_requests/{w['a']['id']}/ada_{DAY}_09-00-00_sid{sid}/req.json"
+    unknown = f"voiceprint_requests/{w['a']['id']}/ada_{DAY}_09-00-00_sid{uuid.uuid4().hex}/req.json"
+    _put(s3, key, {"company_id": str(w["a"]["id"])})
+    _put(s3, unknown, {"company_id": str(w["a"]["id"])})
     _drain(db, s3)
     assert _row(db, key)[0] == w["b"]["id"]
+    assert _row(db, unknown)[0] is None
 
 
 def test_f3_the_newest_line_of_a_key_supplies_the_whole_hint(db):

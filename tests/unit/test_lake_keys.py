@@ -91,6 +91,9 @@ CASES = [
     ("download_claims/x", dict(scope="global")),
     ("other/unknown_1", dict(scope="global")),
     ("lake_manifest/2026/x.json", dict(scope="global")),
+    ("export_requests/abc.json", dict(scope="global")),
+    ("exports/c1/x/part-1.zip", dict(scope="global")),
+    # M1: lake_index/ no longer exists as a family
 ]
 
 
@@ -150,3 +153,15 @@ def test_company_summary_key_carries_its_company():
     # the lake-wide document stays lake-wide, and a bad company segment is not a guess
     assert lake_keys.parse("reports/%s/summary_report.json" % D)["scope"] == "lake_wide"
     assert lake_keys.parse("reports/%s/companies/not-a-uuid/summary_report.json" % D) is None
+
+
+def test_lake_index_is_no_longer_a_global_prefix_and_export_requests_is():
+    assert lake_keys.parse("lake_index/days/x.json") is None
+    assert lake_keys.parse("export_requests/r1.json")["scope"] == "global"
+
+
+def test_a_voiceprint_request_names_its_session():
+    sid = "c" * 32
+    got = lake_keys.parse("voiceprint_requests/%s/ada_2026-10-01_09-00-00_sid%s/m.json" % (U, sid))
+    assert got["sid"] == sid
+    assert lake_keys.parse("voiceprint_requests/%s/base1/r.json" % U)["sid"] is None

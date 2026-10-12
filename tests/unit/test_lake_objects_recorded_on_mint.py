@@ -362,3 +362,76 @@ def test_speaker_match_records_each_run_key(monkeypatch, recorder):
     assert org.speaker_match(FakeConn(), caller, session,
                              {"body": json.dumps({"user": "Ben_UCPK2"})})["statusCode"] == 202
     assert recorder[0]["company_id"] == COMPANY_B and recorder[0]["site_id"] == SITE
+
+
+# ---- M5: the recorded user is the folder owner, never the caller -----------------------
+
+OWNER_ID = "u-owner"
+
+
+def test_the_folder_owner_helper_is_the_owner_or_none(monkeypatch):
+    monkeypatch.setattr(org.users, "get_by_folder_name_global",
+                        lambda conn, f: {"id": OWNER_ID} if f == "Ada_L" else None)
+    assert org._lake_user_for_folder(FakeConn(), "Ada_L") == OWNER_ID
+    assert org._lake_user_for_folder(FakeConn(), "Nobody") is None
+    assert org._lake_user_for_folder(FakeConn(), None) is None
+
+    def boom(conn, f):
+        raise RuntimeError("x")
+    monkeypatch.setattr(org.users, "get_by_folder_name_global", boom)
+    assert org._lake_user_for_folder(FakeConn(), "Ada_L") is None
+
+
+def test_a_request_made_for_another_persons_folder_records_that_person_not_the_caller(
+        monkeypatch, recorder, post):
+    caller_id = t_name.CALLER["id"] if hasattr(t_name, "CALLER") else None
+    monkeypatch.setattr(t_name.FakeConn, "transaction", lambda self: _Savepoint(), raising=False)
+    monkeypatch.setattr(org, "_session_site_company_guard", lambda *a, **k: None)
+    monkeypatch.setattr(org.users, "get_by_folder_name_global",
+                        lambda conn, f: {"id": OWNER_ID})
+    assert t_name._correct()["statusCode"] == 202
+    assert recorder[-1]["user_id"] == OWNER_ID
+    if caller_id:
+        assert recorder[-1]["user_id"] != caller_id
+    # an unknown folder owner is NULL, not the caller
+    monkeypatch.setattr(org.users, "get_by_folder_name_global", lambda conn, f: None)
+    assert t_name._correct()["statusCode"] == 202
+    assert recorder[-1]["user_id"] is None
+
+
+def test_report_and_match_requests_never_record_the_caller_as_user(monkeypatch, recorder):
+    monkeypatch.setattr(org.users, "get_by_folder_name_global",
+                        lambda conn, f: {"id": OWNER_ID})
+    s3 = FakeS3()
+    monkeypatch.setattr(org, "s3", lambda: s3)
+    monkeypatch.setattr(org, "SPEAKER_IDENTITY_MODE", "shadow")
+    monkeypatch.setattr(org, "_resolve_org_media_folder",
+                        lambda conn, caller, user, what="media": ("Ben_UCPK2", None))
+    monkeypatch.setattr(org, "_same_company_as_folder", lambda conn, c, f, w: None)
+    monkeypatch.setattr(org, "_session_site_company_guard", lambda *a, **k: None)
+    monkeypatch.setattr(org, "_session_turns", lambda *a, **k: [
+        {"source_filename": "f.json", "start_sec": 1.0, "end_sec": 2.0,
+         "speaker_label": "spk_0", "text": "hi"}])
+    monkeypatch.setattr(org, "_site_for_session", lambda *a: {"id": SITE})
+    session = "ben_2026-08-12_16-50-28_sid" + "b" * 32
+    assert org.speaker_match(FakeConn(), dict(CALLER, global_role="platform_admin"), session,
+                             {"body": json.dumps({"user": "Ben_UCPK2"})})["statusCode"] == 202
+    assert {c["user_id"] for c in recorder} == {OWNER_ID}
+
+
+# ---- I1: a voiceprint request never records the caller's company ------------------------
+
+def test_an_external_member_and_a_platform_admin_never_mint_a_voiceprint_row_for_their_own_company(
+        monkeypatch, recorder, post):
+    """The key prefix keeps the caller's company (the writers read it), but the row's owner is
+    the session's site company or NULL. Home A / operator, session on B's site."""
+    other = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+    monkeypatch.setattr(t_name.FakeConn, "transaction", lambda self: _Savepoint(), raising=False)
+    monkeypatch.setattr(org, "_session_site_company_guard", lambda *a, **k: None)
+    for rows, want in (([("s1", other)], other), ([], None)):
+        monkeypatch.setattr(org.recordings, "session_site_companies",
+                            lambda conn, f, d, s, rows=rows: rows)
+        assert t_name._correct()["statusCode"] == 202
+        last = recorder[-1]
+        assert last["key"].startswith(f"voiceprint_requests/{t_name.CO}/")
+        assert last["company_id"] == want and last["company_id"] != t_name.CO

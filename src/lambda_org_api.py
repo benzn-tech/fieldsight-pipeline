@@ -412,17 +412,17 @@ def lambda_handler(event, context):
     # OPERATOR TASK (lake ownership): turns lake_manifest/ lines into lake_objects rows.
     # Same envelope rule as above: no API caller can reach it. Unlike the other operator
     # tasks it runs for real by default: it is idempotent and deletes a manifest object only
-    # after its rows are committed. {"dry_run": true} writes and deletes nothing.
+    # after its rows are committed. {"dry_run": true} writes and deletes nothing. It lists
+    # lake_manifest/ in S3 FIRST and opens no database connection when there is nothing to
+    # drain (so an hourly schedule lets Aurora auto-pause); otherwise it loops until its time
+    # budget is spent and reports `more`.
     if isinstance(event, dict) and event.get("task") == DRAIN_LAKE_MANIFEST_TASK:
-        with get_connection() as conn:
-            return drain_lake_manifest(conn, s3(), dry_run=event.get("dry_run") is True,
-                                       max_objects=int(event.get("max_objects") or 500),
-                                       buckets=event.get("buckets"))
+        return drain_lake_manifest_run(event, context)
     # OPERATOR TASK (lake ownership): walks the bucket once and records an owner for every
     # object. A DRY RUN unless "apply" is exactly true or "dry_run" is exactly false (a typo
     # or a string must not write; if the two disagree, the dry run wins). Tagging needs
     # "tag": true AND a write. Returns next_start_after: re-invoke with it to resume.
-    # Runs on this handler for now; Task 11 moves it to LakeOps (longer timeout).
+    # Also runs on LakeOps (longer timeout) by a direct invoke.
     if isinstance(event, dict) and event.get("task") == BACKFILL_LAKE_OBJECTS_TASK:
         write = ((event.get("apply") is True or event.get("dry_run") is False)
                  and event.get("dry_run") is not True)
@@ -1060,6 +1060,22 @@ def _lake_company_for_sites(conn, site_ids):
         return None
     owners = {str(f["company_id"]) for f in found}
     return next(iter(owners)) if len(owners) == 1 else None
+
+
+def _lake_user_for_folder(conn, folder):
+    """The user who owns `folder` (the person a request is made FOR), or None when unknown.
+    A lake row's user_id is the folder owner, never the caller who clicked (M5). Savepointed:
+    a failed lookup yields None."""
+    if not folder:
+        return None
+    try:
+        with conn.transaction():
+            row = users.get_by_folder_name_global(conn, folder)
+    except Exception:  # noqa: BLE001
+        logger.warning("lake_objects: folder owner lookup failed; recording no user",
+                       exc_info=True)
+        return None
+    return row["id"] if row else None
 
 
 def _lake_company_for_session(conn, folder, date, session_base):
@@ -1821,7 +1837,7 @@ def regenerate_own_report(conn, caller, body):
                     ContentType="application/json")
     # A folder/day/range request can span sites of several companies: owner unknown here (R2a).
     lake_objects.record_best_effort(conn, request_key, company_id=None,
-                                    user_id=caller["id"], source="upload")
+                                    user_id=_lake_user_for_folder(conn, folder), source="upload")
     return ok({"status": "queued", "requestId": request_id,
                "report_type": report_type, "folder": folder}, 202)
 
@@ -1919,7 +1935,7 @@ def session_report_generate(conn, caller, session_id, event):
         lake_objects.record_best_effort(
             conn, lake_key, company_id=owner,
             site_id=(content.get("siteId") if owner else None),
-            user_id=caller["id"], source="upload")
+            user_id=_lake_user_for_folder(conn, folder), source="upload")
     return ok({"status": "queued", "sessionId": session_id,
                "requestId": request_id, "resultKey": result_key}, 202)
 
@@ -2239,7 +2255,7 @@ def day_report_generate(conn, caller, date, event):
                 else None)
     for lake_key in (request_key, result_key):
         lake_objects.record_best_effort(conn, lake_key, company_id=owner, site_id=one_site,
-                                        user_id=caller["id"], source="upload")
+                                        user_id=_lake_user_for_folder(conn, folder), source="upload")
     return ok({"status": "queued", "scope": "day", "date": date,
                "requestId": request_id, "resultKey": result_key}, 202)
 
@@ -2707,7 +2723,7 @@ def speaker_match(conn, caller, session_base, event):
         lake_objects.record_best_effort(
             conn, match_key, company_id=match_owner,
             site_id=str(site["id"]) if (site and match_owner) else None,
-            user_id=caller["id"], source="upload")
+            user_id=_lake_user_for_folder(conn, folder), source="upload")
     logger.info("speaker match queued: session=%s mode=%s turns=%d runs=%d",
                 session_key, SPEAKER_IDENTITY_MODE, len(turns), len(runs))
     return ok({"requestIds": request_ids, "sessionBase": session_key,
@@ -3691,7 +3707,7 @@ def speaker_corrections(conn, caller, session_base, event):
     lake_objects.record_best_effort(
         conn, correction_key,
         company_id=_lake_company_for_session(conn, folder, date_m.group(1), session_key),
-        user_id=caller["id"], source="upload")
+        user_id=_lake_user_for_folder(conn, folder), source="upload")
     logger.info("speaker correction queued: session=%s mode=%s turns=%d",
                 session_base, SPEAKER_IDENTITY_MODE, len(artifact["turns"]))
     return ok({
@@ -4159,7 +4175,7 @@ def put_photo_selection(conn, caller, date, event):
     # Day-level document of one folder: the day may span companies, so unknown (R2a).
     lake_objects.record_best_effort(
         conn, report_photos.selection_key(folder, date), company_id=None,
-        user_id=caller["id"], source="upload")
+        user_id=_lake_user_for_folder(conn, folder), source="upload")
     return ok(_photo_selection_body(conn, caller, folder, date, set(excluded)))
 
 
@@ -4394,7 +4410,7 @@ def session_expedite(conn, caller, session_id):
         lake_objects.record_best_effort(
             conn, key,
             company_id=_lake_company_for_session(conn, folder, m.get("date"), base),
-            user_id=caller["id"], source="upload")
+            user_id=_lake_user_for_folder(conn, folder), source="upload")
         return ok({"ok": True, "expedited_at": stamp})
     return error("marker changed while expediting, try again", 409)
 
@@ -5305,6 +5321,74 @@ def _list_manifest_objects(s3_client, bucket, limit):
     return out[:limit]
 
 
+DRAIN_TIME_BUDGET_S = 780          # LakeOps has a 900 s timeout
+DRAIN_BATCH_OBJECTS = 500
+EXPORT_TICK_BUDGET_S = 480         # under the 10-minute rate: no tick outlives its successor
+_DRAIN_LISTS = ("conflict_sample", "unresolved_sample")
+
+
+def drain_lake_manifest_run(event, context=None):
+    """The scheduled/operator entry for the drain: S3 first, then passes until the time budget.
+
+    Lists lake_manifest/ before anything else and returns with NO database connection when it
+    is empty (the same pattern as export_tick), so an hourly schedule does not keep Aurora
+    awake. Otherwise one connection runs drain_lake_manifest passes of `max_objects` (default
+    500) until no manifest is left or the budget is spent. The budget is event.time_budget_s
+    (default 780), cut to the Lambda's remaining time minus a 90 s margin when the context says.
+    A pass that deleted nothing ends the loop (what is left is kept for a reason; spinning
+    would not change it). `more` is True when manifests may remain."""
+    dry_run = event.get("dry_run") is True
+    batch = max(1, int(event.get("max_objects") or DRAIN_BATCH_OBJECTS))
+    budget = event.get("time_budget_s")
+    if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0:
+        budget = DRAIN_TIME_BUDGET_S
+    remaining = getattr(context, "get_remaining_time_in_millis", None)
+    if callable(remaining):
+        budget = max(1, min(budget, int(remaining() / 1000) - 90))
+    started = time.monotonic()
+    s3_client = s3()
+    names = event.get("buckets")
+    names = names if names is not None else [S3_BUCKET, LAKE_BUCKET]
+    names = list(dict.fromkeys(b for b in names if b))
+    found = False
+    for b in names:
+        try:
+            if _list_manifest_objects(s3_client, b, 1):
+                found = True
+                break
+        except Exception:  # noqa: BLE001 - one unreadable bucket must not stop the other
+            logger.warning("lake drain: cannot list %s", b, exc_info=True)
+    if not found:
+        return {"manifests": 0, "lines": 0, "upserted": 0, "deleted_manifests": 0,
+                "dry_run": dry_run, "more": False, "passes": 0}
+    total, passes, longest, more = {}, 0, 0.0, False
+    with get_connection() as conn:
+        while True:
+            t0 = time.monotonic()
+            out = drain_lake_manifest(conn, s3_client, dry_run=dry_run, max_objects=batch,
+                                      buckets=event.get("buckets"))
+            longest = max(longest, time.monotonic() - t0)
+            passes += 1
+            for k, v in out.items():
+                if isinstance(v, bool):
+                    total[k] = bool(total.get(k)) or v
+                elif isinstance(v, int):
+                    total[k] = total.get(k, 0) + v
+                elif k in _DRAIN_LISTS:
+                    total[k] = (total.get(k, []) + list(v))[:50]
+            full = out.get("manifests", 0) >= batch
+            if dry_run or out.get("table_missing") or not full or not out.get("deleted_manifests"):
+                more = full and not dry_run and not out.get("table_missing")
+                break
+            if (time.monotonic() - started) + 1.5 * longest >= budget:
+                more = True
+                break
+    total.setdefault("dry_run", dry_run)
+    total["more"] = more
+    total["passes"] = passes
+    return total
+
+
 def drain_lake_manifest(conn, s3_client, *, dry_run=False, max_objects=500, buckets=None):
     """Read lake_manifest/ lines (written by lake_put) and upsert them into lake_objects.
 
@@ -5642,10 +5726,13 @@ def export_tick(event, context=None):
     keys = sorted(k for k in keys if k.endswith(".json"))
     if not keys:
         return {"requests": 0, "ran": None}
-    budget = company_export.DEFAULT_TIME_BUDGET_S
+    # min(480 s, remaining - 30 s): the run may overshoot its budget by one part, and no tick
+    # may still be running when the next one starts (rate 10 minutes), or two ticks copy the
+    # same part and one loses the state.json race.
+    budget = EXPORT_TICK_BUDGET_S
     remaining = getattr(context, "get_remaining_time_in_millis", None)
     if callable(remaining):
-        budget = max(30, min(budget, int(remaining() / 1000) - 90))
+        budget = max(1, min(budget, int(remaining() / 1000) - 30))
     skipped, finished = 0, 0
     for key in keys:
         parts = key[len(EXPORT_REQUEST_PREFIX):-len(".json")].split("/")
@@ -12218,7 +12305,7 @@ def regenerate_session(conn, caller, session_base, event):
     lake_objects.record_best_effort(
         conn, regen_key,
         company_id=_lake_company_for_session(conn, folder, date, session_base),
-        user_id=caller["id"], source="upload")
+        user_id=_lake_user_for_folder(conn, folder), source="upload")
     logger.info("regenerate requested for %s by %s with %d confirmed name(s)",
                 session_base, caller["id"], len(rows))
     return ok({"sessionBase": session_base, "namedTurns": len(rows),

@@ -10,8 +10,8 @@ Rule order (see Resolver._one):
   1. recordings.s3_key == key             -> that row's user/site, the SITE's current company
                                              (else the row's company)                 "recording"
   2. the key names a site or a company     -> site_id: that site's company; site_slug: the one
-     live site with that slug (R5c, else NULL); voiceprint_requests: the company in the key
-                                                                                       "key"
+     live site with that slug (R5c, else NULL). voiceprint_requests are NOT here: the company
+     in their key is the CALLER's, so they are owned by their session (rule 3) or NULL    "key"
   3. a session id (`sid`) in the key       -> meeting_session: the site's company, else the
                                              recorder's company                       "session"
   3b. a group id                           -> the group's site company when EVERY member has a
@@ -209,11 +209,11 @@ class Resolver:
             found = self._c["slug"].get(p["site_slug"]) or []
             if len(found) == 1:  # R5c: slugs are unique per company only
                 site, company = _s(found[0]["id"]), found[0]["company_id"]
-        elif p["kind"] in ("voiceprint", "company_summary") and p["company_id"]:
+        elif p["kind"] == "company_summary" and p["company_id"]:
             company = _uuid(p["company_id"])
         if company is None:
             return False
-        o.update(company_id=_s(company), site_id=site if site and p["kind"] != "voiceprint" else None,
+        o.update(company_id=_s(company), site_id=site,
                  reason="key")
         return True
 

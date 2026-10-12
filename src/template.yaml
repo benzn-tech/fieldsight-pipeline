@@ -2805,7 +2805,7 @@ Resources:
   # Lake ownership (spec 2026-10-12): the operator tasks that outlive org-api's 30 s.
   # Same code, VPC, layer and database access as OrgApiFunction, run through the same
   # handler as a direct invoke with {"task": ...}:
-  #   drain_lake_manifest   -- fold lake_manifest/ lines into lake_objects (daily, below)
+  #   drain_lake_manifest   -- fold lake_manifest/ lines into lake_objects (hourly, below)
   #   backfill_lake_objects -- one-off walk of the bucket(s), dry-run by default
   #   export_company        -- one company's lake data as zip parts under exports/
   #   export_tick           -- every 10 minutes: advance one pending export_requests/ item
@@ -2898,16 +2898,16 @@ Resources:
               Action: s3:DeleteObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/export_requests/*
       Events:
-        # Daily, ahead of the 04:30 NZ site-coords and 04:35 NZ directory republish
-        # (cron 15:30 / 15:35 UTC). UTC is fixed, so 15:05 UTC is before both in NZST
-        # (UTC+12, 03:05) and in NZDT (UTC+13, 04:05), and the 15-minute ceiling ends it by
-        # 15:20 UTC, before the 15:30 run starts. On demand:
+        # Hourly. Each run lists lake_manifest/ in S3 first and opens no database connection
+        # when it is empty (so Aurora can still auto-pause), otherwise it drains in passes
+        # for up to 780 s (cut to the Lambda's remaining time) and reports `more`. A run that
+        # started inside the 900 s ceiling is over long before the next hour. On demand:
         #   aws lambda invoke --function-name <prefix>-lake-ops --payload '{"task":"drain_lake_manifest"}'
         DrainLakeManifest:
           Type: Schedule
           Properties:
-            Schedule: cron(5 15 * * ? *)
-            Description: Fold the lake manifest into lake_objects before the morning republish
+            Schedule: rate(1 hour)
+            Description: Fold the lake manifest into lake_objects (S3 only when idle)
             State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
             Input: '{"task": "drain_lake_manifest"}'
         # Advances one pending company export. Lists export_requests/ in S3 first and opens no
