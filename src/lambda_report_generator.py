@@ -1553,25 +1553,29 @@ def process_user_data(bucket, user_name, target_date, exclude_keys=None):
 # Stale Report Detection
 # ============================================================
 
+def _transcript_folders(bucket):
+    """Folder names under transcripts/ (one delimiter listing: one entry per folder, not per
+    object). The directory is not used: legacy folders (Ben_Lin, Ben_UCPK_) still hold
+    transcripts and are in no directory entry."""
+    folders = []
+    for page in s3_client.get_paginator('list_objects_v2').paginate(
+            Bucket=bucket, Prefix='transcripts/', Delimiter='/'):
+        for cp in page.get('CommonPrefixes', []):
+            folder = cp['Prefix'][len('transcripts/'):].rstrip('/')
+            if folder:
+                folders.append(folder)
+    return folders
+
+
 def count_transcripts_for_date(bucket, target_date):
-    """Transcript .json objects for a date. Lists transcripts/{folder}/{date}/ once per
-    folder in the published directory (config/directory.json) instead of walking the whole
-    transcripts/ prefix; only an absent/empty directory falls back to the old whole-prefix
-    listing, with a WARNING (ruling C3)."""
-    folders = sorted(f for f in ((directory.load(s3_client, bucket) or {}).get("people") or {}) if f)
-    if folders:
-        count = 0
-        for folder in folders:
-            for obj in list_s3_objects(bucket, f'transcripts/{folder}/{target_date}/'):
-                if obj['key'].endswith('.json'):
-                    count += 1
-        return count
-    logger.warning("count_transcripts_for_date: directory absent or empty; listing the whole "
-                   "transcripts/ prefix")
+    """Transcript .json objects for a date. Lists transcripts/{folder}/{date}/ once per folder
+    found under transcripts/ instead of walking every object of every day (ruling C3,
+    revised: folders come from S3, not the directory, so no folder is missed)."""
     count = 0
-    for obj in list_s3_objects(bucket, 'transcripts/'):
-        if obj['key'].endswith('.json') and target_date in obj['key']:
-            count += 1
+    for folder in _transcript_folders(bucket):
+        for obj in list_s3_objects(bucket, f'transcripts/{folder}/{target_date}/'):
+            if obj['key'].endswith('.json'):
+                count += 1
     return count
 
 def get_report_transcript_count(bucket, target_date):

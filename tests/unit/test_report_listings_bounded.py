@@ -81,11 +81,14 @@ def test_report_history_from_the_index_touches_no_s3_listing(idx):
     assert kw["folders"] == ["Ada_L"] and kw["company_ids"] == [A] and kw["own_folder"] == "Ada_L"
 
 
-def test_platform_admin_history_passes_no_company_restriction(idx):
+def test_platform_admin_history_keeps_the_s3_listing(idx, monkeypatch):
+    """platform_admin is unrestricted and is the only caller shown the lake-wide summaries and
+    site rollups, which the index does not record as reports (A7): it keeps the S3 path."""
     calls, st = idx
-    org._read_org_report_history(None, 20, conn=object(), caller=PLATFORM)
-    kw = calls[0][1]
-    assert kw["folders"] is None and kw["company_ids"] is None and kw["own_folder"] is None
+    fake = _S3WithOneReport()
+    monkeypatch.setattr(org, "s3", lambda: fake)
+    res = org._read_org_report_history(None, 20, conn=object(), caller=PLATFORM)
+    assert len(res["reports"]) == 1 and fake.prefixes and calls == []
 
 
 def test_empty_index_result_is_empty_and_does_not_fall_back(idx):
@@ -126,7 +129,7 @@ def test_table_missing_runs_the_old_path_with_a_warning(monkeypatch, caplog):
     monkeypatch.setattr(org.lake_objects, "report_folders_for_day", lambda *a, **kw: None)
     monkeypatch.setenv("LAKE_INDEX_READS", "true")
     with caplog.at_level(logging.WARNING):
-        hist = org._read_org_report_history(None, 20, conn=object(), caller=PLATFORM)
+        hist = org._read_org_report_history({"Old_F"}, 20, conn=object(), caller=ADMIN)
         folders = org._list_report_folders("2026-09-02", object(), PLATFORM)
     assert [r["key"] for r in hist["reports"]] == ["reports/2026-09-02/Old_F/daily_report.json"]
     assert folders == ["Old_F"]

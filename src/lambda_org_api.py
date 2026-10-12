@@ -11615,7 +11615,10 @@ def _read_org_report_history(folder_scope, limit, keep=None, conn=None, caller=N
     each would be a round trip to learn something this listing already carries,
     and a presigned URL for a key that does not exist answers 403 here rather
     than 404, so the failure would not even read as "missing"."""
-    if conn is not None and caller is not None and _lake_index_reads():
+    # platform_admin keeps the S3 listing: it is unrestricted, and the index does not record
+    # the lake-wide summaries and site rollups as reports (A7), which it alone is shown.
+    if (conn is not None and caller is not None and _lake_index_reads()
+            and not is_cross_company(caller.get("global_role"))):
         # Empty is an answer ("no reports"); only the missing-table sentinel falls back.
         out = _report_history_from_index(conn, caller, folder_scope, limit, keep)
         if out is not None:
