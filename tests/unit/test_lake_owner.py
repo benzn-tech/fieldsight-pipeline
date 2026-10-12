@@ -375,3 +375,9 @@ def test_f2_ambiguous_slug_rejects_a_hint_company_that_is_not_a_candidate():
 def test_f2_ambiguous_slug_rejects_a_hint_site_that_is_not_a_candidate():
     o = resolve(world(slugs=AMBIG), SR_KEY, {"site_id": SITE_A2})
     assert o["company_id"] is None
+
+
+def test_company_summary_resolves_to_the_company_in_its_key_without_a_hint():
+    key = f"reports/{DAY}/companies/{CO_A}/summary_report.json"
+    o = resolve(world(), key)
+    assert (o["company_id"], o["site_id"], o["user_id"], o["reason"]) == (CO_A, None, None, "key")

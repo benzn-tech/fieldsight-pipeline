@@ -41,6 +41,9 @@ _SITE_OR_COMPANY = [
 ]
 _LAKE_WIDE = [rf"^reports/{_DATE}/[^/]+_report\.[a-z]+$", rf"^reports/{_DATE}/summary_report[^/]*$"]
 _MEETING_MINUTES = re.compile(r"^meeting_minutes/.+$")
+# A company's own daily summary: the company is carried by the key (Task 10).
+_COMPANY_SUMMARY = re.compile(
+    rf"^reports/{_DATE}/companies/(?P<company_id>{_UUID})/summary_report\.[a-z]+$")
 _SITE_REPORT = re.compile(rf"^reports/{_DATE}/sites/(?P<site_slug>[^/]+)/.+$")
 _GLOBAL = re.compile(r"^(?:config|models|app-releases|scripts|pending_downloads|download_claims|other|"
                      r"org-assets|notices|lake_manifest|lake_index|exports)/")
@@ -91,6 +94,10 @@ def parse(key):
     for rx in _LAKE_WIDE_RE:
         if rx.match(key):
             return _result("lake_wide", "lake_wide")
+    m = _COMPANY_SUMMARY.match(key)
+    if m:
+        return _result("tenant", "company_summary", day=m.group("day"),
+                       company_id=m.group("company_id"))
     m = _SITE_REPORT.match(key)
     if m:
         return _result("tenant", "site_report", day=m.group("day"), site_slug=m.group("site_slug"))

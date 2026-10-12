@@ -139,3 +139,14 @@ def test_no_bare_hex_search_outside_known_positions():
     # a 32-hex path segment in a family with no sid position must not become a sid
     assert lake_keys.parse("transcripts/Ada_L/%s/%s.json" % (D, RID))["sid"] is None
     assert lake_keys.parse("keyframe_requests/Ada_L/%s/%s.json" % (D, RID))["sid"] is None
+
+
+def test_company_summary_key_carries_its_company():
+    key = "reports/%s/companies/%s/summary_report.json" % (D, U)
+    p = lake_keys.parse(key)
+    assert (p["scope"], p["kind"], p["company_id"], p["day"]) == ("tenant", "company_summary", U, D)
+    assert p["folder"] is None and p["site_id"] is None
+    assert lake_keys.parse(key[:-4] + "docx")["kind"] == "company_summary"
+    # the lake-wide document stays lake-wide, and a bad company segment is not a guess
+    assert lake_keys.parse("reports/%s/summary_report.json" % D)["scope"] == "lake_wide"
+    assert lake_keys.parse("reports/%s/companies/not-a-uuid/summary_report.json" % D) is None
