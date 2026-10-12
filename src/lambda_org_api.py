@@ -171,6 +171,7 @@ from repositories import (action_items, aliases, chunks, classification_feedback
 from repositories import lake_objects
 import lake_keys
 import lake_owner
+import company_export
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import (diff_candidates, first_match_span, learned_pairs, normalize,
                             occurrences)
@@ -390,6 +391,7 @@ RESTORE_MARKERS_TASK = "restore_day_markers"
 BACKFILL_LEGACY_TICKS_TASK = "backfill_legacy_ticks"
 DRAIN_LAKE_MANIFEST_TASK = "drain_lake_manifest"
 BACKFILL_LAKE_OBJECTS_TASK = "backfill_lake_objects"
+EXPORT_COMPANY_TASK = "export_company"
 
 
 def lambda_handler(event, context):
@@ -430,6 +432,12 @@ def lambda_handler(event, context):
                 buckets=[bucket] if bucket else event.get("buckets"),
                 prefixes=event.get("prefixes"), start_bucket=event.get("start_bucket"),
                 start_after=event.get("start_after"), time_budget_s=budget)
+    # OPERATOR TASK (lake ownership): streams one company's lake objects into ZIP parts under
+    # exports/{company_id}/{export_id}/. Same envelope rule as above (no API caller reaches
+    # it). Meant for LakeOpsFunction (long timeout); it re-invokes itself with the cursor until
+    # done. The platform_admin route only starts it (start_company_export).
+    if isinstance(event, dict) and event.get("task") == EXPORT_COMPANY_TASK:
+        return export_company_task(event, context)
     # OPERATOR TASK, invoked by hand with `aws lambda invoke` (IAM decides who
     # may). The same envelope rule as above keeps it out of reach of the API.
     # A dry run unless "apply" is exactly true: a typo must not write.
@@ -5454,6 +5462,58 @@ def _backfill_pages(s3_client, bucket, prefixes, start_after, page_size):
             token = resp.get("NextContinuationToken")
             if not resp.get("IsTruncated") or not token:
                 break
+
+
+def _export_bucket_for(kind):
+    """Which bucket holds objects of this kind. The lake bucket, except the deletion mirror
+    (written to S3_BUCKET by delete_recordings_endpoint). `exports` is where results go."""
+    if kind == "redaction":
+        return S3_BUCKET or LAKE_BUCKET
+    return LAKE_BUCKET or S3_BUCKET
+
+
+_lambda_client = None
+
+
+def lambda_client():
+    global _lambda_client
+    if _lambda_client is None:
+        _lambda_client = boto3.client("lambda")
+    return _lambda_client
+
+
+def export_company_task(event, context=None):
+    """Run (part of) export_company, then chain to itself with the cursor until done.
+
+    Event: {"task", "company_id", "export_id"?, "cursor"?, "time_budget_s"?, "part_bytes"?}.
+    The chain target is env LAKE_OPS_FUNCTION, else this function. Without either (a hand
+    invoke on a stack that has no LakeOps) the caller gets next_cursor and re-invokes.
+    """
+    budget = event.get("time_budget_s")
+    if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0:
+        budget = company_export.DEFAULT_TIME_BUDGET_S
+    part_bytes = event.get("part_bytes")
+    if isinstance(part_bytes, bool) or not isinstance(part_bytes, int) or part_bytes <= 0:
+        part_bytes = company_export.DEFAULT_PART_BYTES
+    try:
+        with get_connection() as conn:
+            out = company_export.run(
+                conn, s3(), event.get("company_id"), bucket_for=_export_bucket_for,
+                export_id=event.get("export_id"), cursor=event.get("cursor"),
+                time_budget_s=budget, part_bytes=part_bytes,
+                dest_bucket=_export_bucket_for("exports"))
+    except ValueError as exc:
+        return {"error": str(exc)}
+    if not out["done"]:
+        target = os.environ.get("LAKE_OPS_FUNCTION") or getattr(context, "function_name", None)
+        if target:
+            lambda_client().invoke(
+                FunctionName=target, InvocationType="Event",
+                Payload=json.dumps({"task": EXPORT_COMPANY_TASK, "company_id": out["company_id"],
+                                    "export_id": out["export_id"], "cursor": out["next_cursor"],
+                                    "time_budget_s": budget, "part_bytes": part_bytes}).encode())
+            out["chained"] = True
+    return out
 
 
 def backfill_lake_objects(conn, s3_client, *, apply=False, buckets=None, prefixes=None,
