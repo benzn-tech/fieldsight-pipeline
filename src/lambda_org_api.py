@@ -8,6 +8,8 @@ so the UI's raw idToken works unchanged.
 Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-org-api.md):
   GET   /api/org/me                       → caller profile + accessible site ids
   PATCH /api/org/me                       → update first/last name, avatar key
+  POST  /api/org/companies/{id}/export    → platform_admin: start a company data export (async, LakeOps; 202 exportId)
+  GET   /api/org/companies/{id}/export/{export_id} → platform_admin: export status + 15-minute presigned part URLs
   GET   /api/org/sites                    → sites visible to caller (ACL)
   POST  /api/org/sites                    → create site (admin/gm)
   GET   /api/org/members                  → company members + memberships (admin/gm)
@@ -584,6 +586,13 @@ def dispatch(conn, event, method, route):
     m_co = re.match(r"^/companies/([^/]+)$", route)
     if m_co and method == "PATCH":
         return patch_org_company(conn, caller, m_co.group(1), parse_body(event))
+
+    m_cx = re.match(r"^/companies/([^/]+)/export$", route)
+    if m_cx and method == "POST":
+        return start_company_export(conn, caller, m_cx.group(1))
+    m_cxs = re.match(r"^/companies/([^/]+)/export/([^/]+)$", route)
+    if m_cxs and method == "GET":
+        return company_export_status(conn, caller, m_cxs.group(1), m_cxs.group(2))
 
     if route == "/members":
         if method == "GET":
@@ -5462,6 +5471,108 @@ def _backfill_pages(s3_client, bucket, prefixes, start_after, page_size):
             token = resp.get("NextContinuationToken")
             if not resp.get("IsTruncated") or not token:
                 break
+
+
+def _canon_uuid_or_none(value):
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _export_company_or_error(conn, caller, company_id):
+    """Shared gate of the export routes. (canonical company id, None) or (None, error response).
+
+    platform_admin ONLY: an export is a whole company's data and crosses the caller's-company
+    boundary every other route enforces, so admin and gm get 403 as well. An id that is not a
+    UUID or names no company is 404 (never a database error)."""
+    if caller.get("global_role") != "platform_admin":
+        return None, error("platform_admin role required", 403)
+    cid = _canon_uuid_or_none(company_id)
+    if cid is None or companies.get_company_by_id(conn, cid) is None:
+        return None, error("company not found", 404)
+    return cid, None
+
+
+def start_company_export(conn, caller, company_id):
+    """POST /companies/{id}/export -- start an asynchronous export of one company's lake data.
+
+    Runs on LakeOpsFunction (env LAKE_OPS_FUNCTION), never inline: org-api's timeout is 30 s.
+    Without that env the route answers 503 rather than doing the work here. The export id is
+    minted here (a uuid), so the caller can poll before the first part exists."""
+    cid, err = _export_company_or_error(conn, caller, company_id)
+    if err:
+        return err
+    target = os.environ.get("LAKE_OPS_FUNCTION")
+    if not target:
+        return error("export not configured", 503)
+    export_id = str(uuid.uuid4())
+    try:
+        lambda_client().invoke(
+            FunctionName=target, InvocationType="Event",
+            Payload=json.dumps({"task": EXPORT_COMPANY_TASK, "company_id": cid,
+                                "export_id": export_id}).encode())
+    except Exception:
+        logger.exception("company export: could not invoke %s for company %s", target, cid)
+        return error("could not start the export", 502)
+    logger.info("company export started: company=%s export=%s by user=%s",
+                cid, export_id, caller.get("id"))
+    return ok({"exportId": export_id, "companyId": cid}, 202)
+
+
+def _read_export_doc(key):
+    """The JSON object at an export key, or None when absent. Other errors raise."""
+    try:
+        body = s3().get_object(Bucket=_export_bucket_for("exports"), Key=key)["Body"].read()
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in ("NoSuchKey", "404", "NotFound"):
+            return None
+        raise
+    return json.loads(body)
+
+
+def company_export_status(conn, caller, company_id, export_id):
+    """GET /companies/{id}/export/{export_id} -- progress, and once done presigned GET URLs
+    (15 minutes) for each part and the manifest.
+
+    export_id must be a uuid (else 400) and is re-rendered from the parsed value, so nothing
+    that can escape exports/{company_id}/{export_id}/ ever reaches a key. Only keys under
+    that prefix are presigned; a manifest naming anything else is ignored."""
+    cid, err = _export_company_or_error(conn, caller, company_id)
+    if err:
+        return err
+    eid = _canon_uuid_or_none(export_id)
+    if eid is None:
+        return error("export id must be a uuid", 400)
+    prefix = company_export.export_prefix(cid, eid)
+
+    def presign(key):
+        if not key.startswith(prefix) or ".." in key[len(prefix):] or "/" in key[len(prefix):]:
+            return None
+        return s3().generate_presigned_url(
+            "get_object", Params={"Bucket": _export_bucket_for("exports"), "Key": key},
+            ExpiresIn=PRESIGNED_URL_EXPIRY)
+
+    manifest = _read_export_doc(prefix + "manifest.json")
+    if manifest is not None:
+        parts = []
+        for p in manifest.get("parts") or []:
+            url = presign(str(p.get("key", "")))
+            if url:
+                parts.append({"key": p["key"], "objects": p.get("objects"),
+                              "bytes": p.get("bytes"), "url": url})
+        return ok({"exportId": eid, "companyId": cid, "status": "done", "done": True,
+                   "parts": parts, "objects": len(manifest.get("objects") or []),
+                   "excluded": manifest.get("excluded") or {},
+                   "manifest": {"key": prefix + "manifest.json",
+                                "url": presign(prefix + "manifest.json")},
+                   "expiresIn": PRESIGNED_URL_EXPIRY})
+    state = _read_export_doc(prefix + "state.json")
+    if state is not None:
+        return ok({"exportId": eid, "companyId": cid, "status": "running", "done": False,
+                   "partsWritten": len(state.get("parts") or []),
+                   "objects": len(state.get("entries") or [])})
+    return error("export not found (or not started yet)", 404)
 
 
 def _export_bucket_for(kind):
