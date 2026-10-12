@@ -10457,7 +10457,8 @@ def admin_disambiguation(conn, caller, date):
     """D1(iv): admin/gm asked for a date with no ?user=.
     Serve the day's aggregate summary_report.json verbatim first -- but ONLY
     to is_cross_company (platform_admin): the report generator builds it
-    from every tenant's folders. It used to be gated on "the caller's company
+    from every tenant's folders. Everyone else is offered their own company's
+    reports/{date}/companies/{company_id}/summary_report.json (Task 10). It used to be gated on "the caller's company
     is the operator company", which would have handed it to that company's gm;
     the name lookup behind that gate returned None, so the leak was closed only
     by accident (spec 2026-10-03). Otherwise union S3-listed
@@ -10471,6 +10472,18 @@ def admin_disambiguation(conn, caller, date):
         # so a deleted session's words sit inside it whatever the SQL filters say.
         doc = (None if _day_has_deleted_sources(conn, None, date)
                else _get_lake_json(f"reports/{date}/summary_report.json"))
+        if doc is not None:
+            return ok(doc)
+    elif caller.get("company_id"):
+        # Task 10 (R10b): every other caller gets ONLY their own company's summary, built by
+        # the generator from that company's folders (external members already left out).
+        # The key comes from the caller row, never from the request. The guard stays the
+        # lake-wide _day_has_deleted_sources (folder=None): conservative, it over-blocks a
+        # company whose day is clean when another company deleted a source that day. Absent
+        # document -> the folder-union path below, exactly as before.
+        doc = (None if _day_has_deleted_sources(conn, None, date)
+               else _get_lake_json(
+                   f"reports/{date}/companies/{caller['company_id']}/summary_report.json"))
         if doc is not None:
             return ok(doc)
     candidates = set()

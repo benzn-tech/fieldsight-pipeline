@@ -238,6 +238,16 @@ def person(doc, folder):
     return {}
 
 
+def company_of_folder(doc, folder):
+    """The home company id of a recording folder, or None when the folder has no directory
+    entry or the entry carries no company (legacy folders such as Ben_Lin). Unlike
+    `person`, a name with spaces is NOT folded to underscores: a guess here would put a
+    person into the wrong company's summary."""
+    p = ((doc or {}).get("people") or {}).get(folder)
+    cid = p.get("company_id") if isinstance(p, dict) else None
+    return str(cid) if cid else None
+
+
 def names_by_folder(doc):
     """{folder: display name}, people with no name left out (the folder itself
     is not a name)."""
