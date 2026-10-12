@@ -1343,18 +1343,18 @@ def _from_match_artifact(bucket, key):
     for r in out["results"]:
         if r.get("status") not in ("confirmed", "tentative") or not r.get("name"):
             continue
-        if r.get("margin") is None:
-            # No runner-up: `decide_name` returns a name with a null margin when the pool
-            # holds ONE profile, meaning "the closest of the only person I know". Written to
-            # a transcript that reads as an identification, and it would land on every turn
-            # in the meeting including the other speakers' — the one enrolled name spread
-            # over everybody, which is worse than no name at all.
-            #
-            # Matching needs at least two profiles before it can say anything. That is not a
-            # tuning choice: with overlapping score distributions and no usable absolute
-            # threshold, one candidate cannot be told from a stranger.
+        if r.get("margin") is None and r.get("status") != "tentative":
+            # No runner-up (one enrolled person) and yet not a lean: nothing in
+            # `decide_name` produces that, so refuse it rather than write a confident name
+            # nobody can have earned.
             skipped_no_runner_up += 1
             continue
+        # A null margin WITH `tentative` is the one-person case, and it is written. It used
+        # to be dropped here unconditionally, because then `decide_name` offered the single
+        # enrolled person for every turn above 0.35 -- the other speakers' too. It now does
+        # so only above `DEFAULT_SINGLE_CANDIDATE_FLOOR` (measured), and only as a lean, so
+        # dropping it meant a one-person company was never recognised at all: TEST logged
+        # "named 0 of N turns" on every session for two weeks.
         turn = r["turn"]
         named.append({
             "turn_ref": turn_name_overlay.turn_ref(turn["source_filename"],
@@ -1375,8 +1375,8 @@ def _from_match_artifact(bucket, key):
         # Loud, because the symptom is indistinguishable from "the matcher did nothing".
         logger.warning(
             "match: %d turn(s) had a nearest profile but no runner-up to beat — the company "
-            "has %d matchable profile(s) and discrimination needs at least 2",
-            skipped_no_runner_up, len(profiles))
+            "has %d matchable person(s) and no lean was produced",
+            skipped_no_runner_up, len(by_key))
 
     mode = (req.get("mode") or "").lower()
     if mode != "on":
@@ -1413,10 +1413,12 @@ def _from_match_artifact(bucket, key):
         # would make a session where the voiceprints did nothing and inheritance did
         # everything read as a successful match.
         written, inherited = reply.get("written", 0), reply.get("inherited", 0)
-    logger.info("match%s: session=%s named %d of %d turns against %d profiles "
-                "(+%d inherited)",
-                _part_of(req), session, written, len(out["results"]), len(profiles),
-                inherited)
+    # People, then samples: `profiles` holds one row per SAMPLE, and "against 11 profiles"
+    # for a company that has enrolled one person sent a whole investigation the wrong way.
+    logger.info("match%s: session=%s named %d of %d turns against %d person(s) "
+                "(%d samples) (+%d inherited)",
+                _part_of(req), session, written, len(out["results"]), len(by_key),
+                len(profiles), inherited)
     return {"session": session, "matched": written, "inherited": inherited,
             "profiles": len(profiles), "mode": mode,
             "part": req.get("part"), "of": req.get("of")}

@@ -55,7 +55,7 @@ from repositories.voiceprints import (EnrolmentAfterWithdrawal,
                                       own_profiles_for_matching,
                                       profiles_for_matching, record_attempt,
                                       record_turn_name, recompute_company_floor,
-                                      rejected_names)
+                                      rejected_names, requarantine_profile)
 from turn_name_overlay import _SOURCE_RANK
 
 logger = logging.getLogger()
@@ -290,6 +290,9 @@ def _propagation(event):
         # person's samples, so running it between the two would score every cluster against
         # a one-sample profile and then never revisit it.
         if enrol and not enrol_refusal:
+            # Before the proposals: they score candidates against this profile's MEAN, and
+            # a stranger's sample still in that mean drags every score toward nobody.
+            _requarantine(conn, company_id, enrol["voiceprint_id"])
             _propose_where_else_this_voice_was_heard(
                 conn, company_id, enrol["voiceprint_id"])
 
@@ -349,6 +352,32 @@ def _enrol(event):
                     "own": exc.own, "bestOther": exc.best_other,
                     "nearestOtherId": str(exc.nearest_other_id)}
     return {"stored": 1}
+
+
+def _requarantine(conn, company_id, voiceprint_id) -> dict | None:
+    """Re-judge this profile's samples against each other after one was added. Never raises.
+
+    `requarantine_profile` was written and tested in #912 and then called from nowhere, so a
+    profile kept every sample it was ever given. On TEST (2026-10-13) the one Ben Lin profile
+    held 11 samples of which 4 did not sound like him at all: three from another voice in the
+    10-01 13:2x session (0.71 with each other, ~0 with Ben) and one 10-09 window equidistant
+    from everybody. Matching scores against the MEAN of the samples, so those four pulled
+    every one of Ben's turns from ~0.55 down to ~0.30 -- below every floor -- and the matcher
+    named nobody for two weeks while each run logged a normal-looking line.
+
+    In a SAVEPOINT, because the enrolment is the act the user performed: a failure here must
+    not roll back the sample, the names, or the attempt record written beside it.
+    """
+    try:
+        with conn.transaction():
+            out = requarantine_profile(conn, company_id, voiceprint_id)
+        if out.get("quarantined"):
+            logger.info("quarantine after store: %s", out)
+        return out
+    except Exception:
+        logger.exception("quarantine after store failed for %s; the sample stands",
+                         voiceprint_id)
+        return None
 
 
 def _propose_where_else_this_voice_was_heard(conn, company_id, voiceprint_id) -> int:

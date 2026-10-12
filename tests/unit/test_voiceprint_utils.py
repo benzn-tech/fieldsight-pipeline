@@ -686,3 +686,28 @@ def test_absent_floor_still_applies_under_a_roster():
     d = vp.decide_with_roster({"A": 0.20, "B": 0.05}, on_roster={"A"}, duration_s=8.0,
                               floor=None)
     assert d.status == "unknown"
+
+
+# ---- one enrolled person: a lean above its own floor, nothing below ------
+
+
+def test_one_enrolled_person_is_a_lean_above_the_single_candidate_floor():
+    d = vp.decide_name({"ben": vp.DEFAULT_SINGLE_CANDIDATE_FLOOR + 0.05}, duration_s=10.0)
+    assert d.status == "tentative" and d.name == "ben" and d.margin is None
+
+
+def test_one_enrolled_person_below_the_single_candidate_floor_is_nobody():
+    """Between the absent floor and the single-candidate floor sits every stranger the
+    2026-09-28 and 2026-10-13 measurements saw (<= 0.274) and nothing of the owner's own
+    (>= 0.46). Offering a name there spreads the one enrolled person over the room."""
+    d = vp.decide_name({"ben": vp.DEFAULT_SINGLE_CANDIDATE_FLOOR - 0.05}, duration_s=10.0)
+    assert d.status == "unknown" and d.name is None
+
+
+def test_one_enrolled_person_is_never_confirmed_even_with_a_calibrated_floor():
+    d = vp.decide_name({"ben": 0.95}, duration_s=10.0, floor=0.30)
+    assert d.status == "tentative"
+
+
+def test_the_single_candidate_floor_sits_above_the_absent_floor():
+    assert vp.DEFAULT_SINGLE_CANDIDATE_FLOOR > vp.DEFAULT_ABSENT_FLOOR

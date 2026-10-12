@@ -901,3 +901,50 @@ def test_the_names_still_land_when_the_enrolment_was_refused(calls):
     half that stores biometric data was refused."""
     vw.lambda_handler(_refused_event(), None)
     assert len(calls["turns"]) == 1
+
+
+# ---- a stored sample re-judges its profile --------------------------------
+#
+# `requarantine_profile` was written and unit-tested in #912 and then called from nowhere,
+# so a profile kept every sample it was ever given. On TEST (2026-10-13) four of the one
+# Ben Lin profile's eleven samples were another voice or noise, the mean dragged his own
+# turns from ~0.55 to ~0.30, and the matcher named nobody for two weeks. These pin the call.
+
+
+def _enrolling_propagation():
+    return {"op": "propagation", "company_id": CO, "session_base": "s1",
+            "correction_ref": "corr-1",
+            "results": [{"turn_ref": "f.wav@1.0", "state": "confirmed", "cluster_ref": None,
+                         "display_name": "Ben L", "asserted": True}],
+            "enrol": {"voiceprint_id": "vp-1", "embedding": [0.1] * 192,
+                      "s3_key": "users/u/audio/d/x.wav", "window": [0.0, 5.0]}}
+
+
+def test_a_stored_sample_re_judges_its_profile(calls, monkeypatch):
+    order = []
+    monkeypatch.setattr(vw, "add_sample",
+                        lambda conn, co, vp, *a, **kw: order.append(("sample", vp)) or {"id": "s"})
+    monkeypatch.setattr(vw, "requarantine_profile",
+                        lambda conn, co, vp: order.append(("requarantine", co, vp))
+                        or {"checked": 3, "quarantined": 0})
+    vw.lambda_handler(_enrolling_propagation(), None)
+    assert ("requarantine", CO, "vp-1") in order, "the profile was never re-judged"
+    assert order.index(("sample", "vp-1")) < order.index(("requarantine", CO, "vp-1"))
+
+
+def test_a_failing_re_judgement_does_not_undo_the_enrolment(calls, monkeypatch):
+    def boom(conn, co, vp):
+        raise RuntimeError("clustering failed")
+    monkeypatch.setattr(vw, "requarantine_profile", boom)
+    out = vw.lambda_handler(_enrolling_propagation(), None)
+    assert out["enrolled"] is True
+    assert len(calls["samples"]) == 1
+
+
+def test_a_refused_enrolment_re_judges_nothing(calls, monkeypatch):
+    _refuse(monkeypatch)
+    seen = []
+    monkeypatch.setattr(vw, "requarantine_profile",
+                        lambda conn, co, vp: seen.append(vp) or {})
+    vw.lambda_handler(_correction_event(), None)
+    assert seen == []
