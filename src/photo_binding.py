@@ -61,6 +61,12 @@ PHOTOS_PER_TOPIC_CAP = int(os.environ.get("PHOTOS_PER_TOPIC_CAP", "60"))
 # inspection case, and the bound is what separates it from the unbounded
 # nearest-wins rule that was deliberately removed in 2026-07-24.
 PHOTO_CARRY_FORWARD_MIN = int(os.environ.get("PHOTO_CARRY_FORWARD_MIN", "30"))
+# How soon after a photograph the next words must start to say what it shows.
+# Measured on TEST, Ben_Lin_test2: on 2026-10-12 the formwork photos were taken
+# 9 s and 5 s before "Formwork's set up fine"; on 2026-10-01 nothing was said
+# within 19 s of any Level 1 photo, and the first words after one were a chat
+# with members of the public -- which the location rule exists to see past.
+PHOTO_FIRST_WORDS_S = 15
 PHOTO_TOLERANCE_MIN = 2     # hard cap: a photo overreaching a topic window's
                             # edge by more than this many minutes does not
                             # qualify for that topic at all (enforced in
@@ -247,6 +253,62 @@ def _location_owner(p_seconds, stays, windows, all_windows=None, topic_sessions=
     return _stay_owner(current[4], windows)
 
 
+def _quotes(topic):
+    """A topic's cited quotes: the extraction's list, or the {"status", "quotes"}
+    object Aurora stores (lambda_item_writer._evidence_payload)."""
+    ev = topic.get("evidence")
+    if isinstance(ev, dict):
+        ev = ev.get("quotes")
+    return [q for q in ev or [] if isinstance(q, dict)]
+
+
+def _first_words_owner(p_seconds, topics, windows, stays, owner):
+    """The topic whose words come first after a photograph, when they say what
+    it shows; else None, and the place decides.
+
+    THE FIRST THING SAID AFTER A PHOTO SAYS WHAT IT SHOWS (owner, 2026-10-12).
+    Inside one long stay the place cannot tell the walk's next item from the
+    item it was announced in: on TEST (Ben_Lin_test2 2026-10-12) the whole
+    pre-pour walk was "level two slab", so the formwork photographs went to
+    "Concrete pour booking", the topic under way when the slab was named --
+    and "Formwork's set up fine" was said 5 s after the second of them. The
+    clock could not fix it: every clock variant broke the 2026-10-01
+    interruption case.
+
+    Three conditions, each from a replayed day that broke without it:
+
+      * the words start within PHOTO_FIRST_WORDS_S of the shutter (TEST
+        2026-10-01: nothing within 19 s of the Level 1 photos, then a chat
+        with members of the public);
+      * the place's own topic had ENDED by the photo's minute. While it is
+        still under way, what comes next is an interruption more often than
+        the next item: prod 2026-10-05, a Level 1 photo at 10:59:47 and "How
+        was your HVAC installation, level three?" 6 s later; prod 2026-09-23,
+        the meeting-room photos and an onboarding schedule;
+      * the words are said in the SAME place. "Moving up to level two" 6 s
+        after a Level 1 photo (prod 2026-10-05 11:02:08) names where he went
+        next, not what he photographed.
+
+    Read from the topics' cited quotes timed to the second (`at_s`, set by
+    lambda_extract_session.time_evidence), so it exists only where the
+    extraction cites (EMIT_EVIDENCE). Only words AFTER the shutter count: what
+    came before is usually the place being named or the item just finished.
+    """
+    if windows[owner][1] >= p_seconds // 60:
+        return None
+    best = None
+    for i in windows:
+        for q in _quotes(topics[i]):
+            said = _clock_seconds(q.get("at_s")) if q.get("at_s") else None
+            if said is None or not p_seconds <= said <= p_seconds + PHOTO_FIRST_WORDS_S:
+                continue
+            if best is None or (said, i) < best:
+                best = (said, i)
+    if best is None or _current_stay(best[0], stays) != _current_stay(p_seconds, stays):
+        return None
+    return best[1]
+
+
 def parse_time_range(time_range):
     """'HH:MM – HH:MM' -> (start_minutes, end_minutes), or None if
     time_range is missing/unparseable (never raises -- callers treat 'no
@@ -342,7 +404,8 @@ def photos_for_topics(photo_objects, topics, *, topic_sessions=None,
     topic that stay belongs to, before any clock rule -- see _location_owner.
 
     `explain`, when a dict, is filled with why each photo went where it did:
-    {photo key: "location" | "clock" | "carried" | "capped" | "unbound"} -- for
+    {photo key: "words" | "location" | "clock" | "carried" | "capped" |
+    "unbound"} -- for
     the recording's trace (pipeline_trace), so "why is this photo here" has an
     answer after the fact.
 
@@ -364,6 +427,7 @@ def photos_for_topics(photo_objects, topics, *, topic_sessions=None,
     carried_count = 0
     excluded_by_session = 0
     by_location = 0
+    by_words = 0
     stays = _stays(markers)
     for p in photo_objects:
         hhmm = p.get("hhmm")
@@ -380,9 +444,19 @@ def photos_for_topics(photo_objects, topics, *, topic_sessions=None,
         # WHERE before WHEN: a photo taken during a location stay goes to the
         # topic that stay belongs to, if that topic may have it (same session,
         # under the cap). Otherwise the clock rules below decide, unchanged.
-        owner = (_location_owner(_photo_seconds(p_minutes, p.get("hhmmss")), stays,
-                                 eligible, windows, topic_sessions)
+        p_seconds = _photo_seconds(p_minutes, p.get("hhmmss"))
+        owner = (_location_owner(p_seconds, stays, eligible, windows, topic_sessions)
                  if stays else None)
+        # Within the place, the first words after the shutter name the item
+        # (a photo known only to the minute has no "after" to read).
+        said = (_first_words_owner(p_seconds, topics, eligible, stays, owner)
+                if owner is not None and p.get("hhmmss") else None)
+        if said is not None and said != owner and len(result[said]) < PHOTOS_PER_TOPIC_CAP:
+            result[said].append(p)
+            by_words += 1
+            if explain is not None:
+                explain[p.get("key")] = "words"
+            continue
         if owner is not None and len(result[owner]) < PHOTOS_PER_TOPIC_CAP:
             result[owner].append(p)
             by_location += 1
@@ -461,6 +535,10 @@ def photos_for_topics(photo_objects, topics, *, topic_sessions=None,
         # this is the number that moves.
         logger.info("photo binding: %d photo(s) bound by location (where the "
                     "topic's place had been announced)", by_location)
+    if by_words:
+        logger.info("photo binding: %d photo(s) bound by the first words said "
+                    "after them (within %d s, inside their place)",
+                    by_words, PHOTO_FIRST_WORDS_S)
     if carried_count:
         # Counted separately from the ordinary binds, because these are the
         # weaker claim: they say "nothing was being said, so we attributed this
