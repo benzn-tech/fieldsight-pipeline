@@ -21,7 +21,7 @@ class FakeS3:
     def __init__(self, keys=(), allow_tags=False):
         self.keys = sorted(keys)
         self.allow_tags = allow_tags
-        self.tags = {}
+        self.tags = {}              # key -> {tag: value}; also seeds existing tags
         self.attempts = []          # every tagging call, even a forbidden one that gets swallowed
 
     def list_objects_v2(self, Bucket, Prefix="", MaxKeys=1000, ContinuationToken=None,
@@ -39,7 +39,10 @@ class FakeS3:
         self.attempts.append(Key)
         if not self.allow_tags:
             raise AssertionError("put_object_tagging without tag + apply")
-        self.tags[Key] = {t["Key"]: t["Value"] for t in Tagging["TagSet"]}
+        self.tags[Key] = {t["Key"]: t["Value"] for t in Tagging["TagSet"]}   # REPLACES, as S3 does
+
+    def get_object_tagging(self, Bucket, Key):
+        return {"TagSet": [{"Key": k, "Value": v} for k, v in self.tags.get(Key, {}).items()]}
 
     def __getattr__(self, name):
         if name.startswith(("put_object", "delete_", "copy_", "upload_")):
@@ -200,7 +203,8 @@ def test_a_budgeted_walk_resumes_without_duplicating_work(db):
 
     changed, seen, cursor, runs = 0, 0, None, 0
     while True:
-        res = _run(db, FakeS3(keys), apply=True, page_size=3, time_budget_s=0, start_after=cursor)
+        res = _run(db, FakeS3(keys), apply=True, page_size=3, time_budget_s=0, start_after=cursor,
+                   start_bucket=BUCKET if cursor else None)
         runs += 1
         changed += res["rows_changed"]
         seen += res["walked"]
@@ -222,7 +226,8 @@ def test_prefixes_and_cursor_stay_monotone(db):
     assert one["walked"] == 5            # marker, tr, home, orphan under transcripts/ + the clip
     seen, cursor = 0, None
     for _ in range(20):                                    # bounded: a broken cursor must fail
-        res = _run(db, FakeS3(keys), prefixes=pre, page_size=2, time_budget_s=0, start_after=cursor)
+        res = _run(db, FakeS3(keys), prefixes=pre, page_size=2, time_budget_s=0, start_after=cursor,
+                   start_bucket=BUCKET if cursor else None)
         seen += res["walked"]
         cursor = res["next_start_after"]
         if cursor is None:
@@ -251,3 +256,76 @@ def test_a_missing_table_is_reported_and_the_walk_stops_at_the_cursor(db):
     assert res["table_missing"] is True and res["rows_changed"] == 0
     assert res["walked"] < 11                                  # stopped part-way
     assert res["next_start_after"] is not None                 # resume point = the failed page
+
+
+# ---- review fix round 1 ---------------------------------------------------------------------------
+def test_tagging_keeps_the_objects_other_tags(db):
+    w = _world(db)
+    k = w["keys"]
+    s3 = FakeS3(k.values(), allow_tags=True)
+    s3.tags[k["rec"]] = {"lifecycle": "expire-90", "company": "stale"}
+    full = {f"t{i}": "v" for i in range(10)}
+    s3.tags[k["tr"]] = full                                  # 10 tags already: no room for ours
+    res = _run(db, s3, apply=True, tag=True)
+    assert s3.tags[k["rec"]] == {"lifecycle": "expire-90", "company": str(w["b"]["id"]),
+                                 "site": str(w["sb"]["id"])}
+    assert s3.tags[k["tr"]] == full and res["tag_skipped"] == 1
+    assert res["tagged"] == 3
+
+
+def _put_company(db, key, company_id, kind="transcript"):
+    db.execute("INSERT INTO lake_objects (s3_key, company_id, kind, source) VALUES (%s,%s,%s,'upload')",
+               (key, company_id, kind))
+
+
+def test_a_stored_company_is_never_replaced_by_a_different_one(db):
+    w = _world(db)
+    k = w["keys"]
+    _put_company(db, k["rec"], w["a"]["id"], "recording")     # resolver says B
+    before = _snapshot(db, [k["rec"]])
+    res = _run(db, FakeS3(k.values()), apply=True)
+    assert _row(db, k["rec"])[0] == w["a"]["id"]              # kept
+    assert _snapshot(db, [k["rec"]]) == before                # not even touched
+    assert res["conflict"] == 1
+    assert res["conflict_sample"] == [{"key": k["rec"], "existing": str(w["a"]["id"]),
+                                       "resolved": str(w["b"]["id"]), "reason": "recording"}]
+    again = _run(db, FakeS3(k.values()), apply=True)
+    assert again["conflict"] == 1 and again["rows_changed"] == 0   # still idempotent
+
+
+def test_a_null_company_is_filled_and_a_same_company_write_proceeds(db):
+    w = _world(db)
+    k = w["keys"]
+    db.execute("INSERT INTO lake_objects (s3_key, company_id, kind, source, reason) "
+               "VALUES (%s, NULL, 'transcript', 'upload', 'unresolved')", (k["tr"],))
+    _put_company(db, k["home"], w["a"]["id"])                  # same company as the resolver
+    res = _run(db, FakeS3(k.values()), apply=True)
+    assert _row(db, k["tr"])[0] == w["b"]["id"] and _row(db, k["tr"])[3] is None
+    assert _row(db, k["home"])[0] == w["a"]["id"] and _row(db, k["home"])[5] == "backfill"
+    assert res["conflict"] == 0
+
+
+def test_a_site_move_is_still_the_path_that_changes_a_stored_company(db):
+    from repositories import lake_objects
+    w = _world(db)
+    key = "session_reports/x/1.json"
+    lake_objects.upsert(db, key, company_id=w["b"]["id"], site_id=w["sb"]["id"], kind="x",
+                        source="upload")
+    lake_objects.upsert(db, key, company_id=w["a"]["id"], site_id=w["sb"]["id"], kind="x",
+                        source="manifest")                     # a different company: refused
+    assert _row(db, key)[0] == w["b"]["id"]
+    assert lake_objects.reassign_site(db, w["sb"]["id"], w["a"]["id"]) >= 1
+    assert _row(db, key)[0] == w["a"]["id"]
+
+
+def test_start_after_without_start_bucket_is_refused_and_nothing_runs(db):
+    s3 = FakeS3(["weird/a.bin"])
+    res = api.backfill_lake_objects(Conn(db), s3, buckets=["b1", "b2"], apply=True,
+                                    start_after="weird/a.bin")
+    assert "error" in res and res["walked"] == 0 and _count(db) == 0
+
+
+def test_overlapping_prefixes_are_listed_once(db):
+    keys = ["weird/a/1.bin", "weird/a/b/2.bin", "weird/c.bin"]
+    res = _run(db, FakeS3(keys), prefixes=["weird/a/", "weird/a/b/", "weird/"])
+    assert res["walked"] == 3

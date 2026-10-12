@@ -371,3 +371,16 @@ def test_f3_the_newest_line_of_a_key_supplies_the_whole_hint(db):
                   line("2026-10-01T10:00:00+00:00", {}, 2).replace(key.encode(), key2.encode()))
     _drain(db, s3)
     assert _row(db, key2)[0] is None
+
+
+def test_a_drained_line_never_replaces_a_stored_different_company(db):
+    w = _world(db)
+    s3 = FakeS3()
+    key = f"transcripts/{w['folder']}/{DAY}/x.json"           # resolver: A (home, no recordings...)
+    db.execute("INSERT INTO lake_objects (s3_key, company_id, kind, source) VALUES (%s,%s,'transcript','upload')",
+               (key, w["b"]["id"]))
+    _put(s3, key, {"folder": w["folder"]})
+    res, _ = _drain(db, s3)
+    assert _row(db, key)[0] == w["b"]["id"]
+    assert res["conflict"] == 1 and res["conflict_sample"][0]["key"] == key
+    assert res["conflict_sample"][0]["existing"] == str(w["b"]["id"])

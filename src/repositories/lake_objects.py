@@ -41,7 +41,7 @@ _UPSERT = (
     "ELSE COALESCE(EXCLUDED.reason, lake_objects.reason) END, "
     "deleted_at = NULL, updated_at = now() "
     # Skip the write (and the updated_at bump) when nothing would change.
-    "WHERE lake_objects.deleted_at IS NOT NULL "
+    "WHERE (lake_objects.deleted_at IS NOT NULL "
     + "".join(f"OR (EXCLUDED.{c} IS NOT NULL AND EXCLUDED.{c} IS DISTINCT FROM lake_objects.{c}) "
               for c in ("company_id", "site_id", "user_id", "size_bytes", "kind", "folder", "day",
                         "session_base", "source"))
@@ -49,7 +49,11 @@ _UPSERT = (
     # without a company_id only a non-NULL reason counts.
     + "OR ((EXCLUDED.company_id IS NOT NULL "
       "OR (EXCLUDED.reason IS NOT NULL AND lake_objects.company_id IS NULL)) "
-      "AND EXCLUDED.reason IS DISTINCT FROM lake_objects.reason)")
+      "AND EXCLUDED.reason IS DISTINCT FROM lake_objects.reason)) "
+    # R7e: a write never replaces a non-NULL company with a DIFFERENT non-NULL one; the whole
+    # write is skipped (reassign_site, on a site move, is the only path that changes it).
+    "AND (EXCLUDED.company_id IS NULL OR lake_objects.company_id IS NULL "
+    "OR EXCLUDED.company_id = lake_objects.company_id)")
 
 _REASSIGN = ("UPDATE lake_objects SET company_id=%s, reason=NULL, updated_at=now() "
              "WHERE site_id=%s AND company_id IS DISTINCT FROM %s")
@@ -143,6 +147,28 @@ def reassign_site(conn, site_id, company_id) -> int:
         cur = conn.execute(_REASSIGN, (company_id, site_id, company_id))
         return cur.rowcount
     return _run(conn, go, 0)
+
+
+def conflicts(conn, rows) -> list:
+    """R7e: of `rows` (as for upsert_many), those that carry a company different from the
+    non-NULL one already stored. The upsert skips them; this reports them. Each item:
+    {key, existing, resolved, reason} where reason is the row's optional `why` (the resolver's
+    rule) when given. Call before upsert_many."""
+    want = {r["key"]: r for r in rows if r.get("company_id")}
+    if not want:
+        return []
+
+    def go():
+        cur = conn.execute("SELECT s3_key, company_id FROM lake_objects "
+                           "WHERE s3_key = ANY(%s) AND company_id IS NOT NULL", (list(want),))
+        out = []
+        for row in cur.fetchall():
+            k, existing = (row["s3_key"], row["company_id"]) if isinstance(row, dict) else row
+            if str(existing) != str(want[k]["company_id"]):
+                out.append({"key": k, "existing": str(existing),
+                            "resolved": str(want[k]["company_id"]), "reason": want[k].get("why")})
+        return out
+    return _run(conn, go, [])
 
 
 def owners_for_company(conn, company_id, *, after_key=None, limit=1000) -> list:

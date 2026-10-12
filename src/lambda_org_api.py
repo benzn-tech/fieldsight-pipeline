@@ -5294,7 +5294,7 @@ def drain_lake_manifest(conn, s3_client, *, dry_run=False, max_objects=500, buck
     dry_run resolves and counts but writes and deletes nothing; `upserted` is then the number
     of rows that WOULD be written (not net of unchanged rows)."""
     out = {"manifests": 0, "lines": 0, "upserted": 0, "unresolved": 0, "unknown_shape": 0,
-           "split_day": 0, "skipped": 0, "malformed": 0, "deleted_manifests": 0, "kept": 0,
+           "split_day": 0, "conflict": 0, "conflict_sample": [], "skipped": 0, "malformed": 0, "deleted_manifests": 0, "kept": 0,
            "table_missing": False, "dry_run": bool(dry_run), "unresolved_sample": []}
     names = buckets if buckets is not None else [S3_BUCKET, LAKE_BUCKET]
     names = list(dict.fromkeys(b for b in names if b))
@@ -5352,7 +5352,7 @@ def drain_lake_manifest(conn, s3_client, *, dry_run=False, max_objects=500, buck
         rows[k] = {"key": k, "company_id": o["company_id"], "site_id": o["site_id"],
                    "user_id": o["user_id"], "kind": o["kind"], "folder": o["folder"],
                    "day": o["day"], "session_base": o["session_base"],
-                   "size_bytes": merged[k]["size"], "source": "manifest",
+                   "size_bytes": merged[k]["size"], "source": "manifest", "why": o["reason"],
                    "reason": None if o["company_id"] else o["reason"]}
 
     if dry_run:
@@ -5361,6 +5361,7 @@ def drain_lake_manifest(conn, s3_client, *, dry_run=False, max_objects=500, buck
         return out
 
     deletable = []
+    seen_conflicts = set()
     kept = unread
     for ob in objects:
         mine = [rows[ln["key"]] for ln in ob["lines"] if ln["key"] in rows]
@@ -5368,6 +5369,7 @@ def drain_lake_manifest(conn, s3_client, *, dry_run=False, max_objects=500, buck
         if mine:
             try:
                 with conn.transaction():
+                    clash = lake_objects.conflicts(conn, mine)   # R7e: skipped by the upsert
                     n = lake_objects.upsert_many(conn, mine, on_missing=None)
             except Exception:  # noqa: BLE001 - this object stays; the others carry on
                 logger.warning("lake drain: upsert failed for %s", ob["key"], exc_info=True)
@@ -5376,6 +5378,12 @@ def drain_lake_manifest(conn, s3_client, *, dry_run=False, max_objects=500, buck
             if n is None:
                 out["table_missing"] = True
                 break
+        for c in clash if mine else ():
+            if c["key"] not in seen_conflicts:
+                seen_conflicts.add(c["key"])
+                out["conflict"] += 1
+                if len(out["conflict_sample"]) < 50:
+                    out["conflict_sample"].append(c)
         out["upserted"] += n or 0
         if ob["bad"]:
             kept += 1
@@ -5410,7 +5418,11 @@ def _backfill_pages(s3_client, bucket, prefixes, start_after, page_size):
     """Yield pages of (key, size) of one bucket in global key order. `start_after` is a key in
     this bucket (None = from the beginning). With prefixes (sorted), a prefix whose whole range
     lies before the cursor is skipped, so the cursor stays one monotone key."""
-    for prefix in (sorted(set(prefixes)) if prefixes else [""]):
+    kept = []                           # overlapping prefixes (a/ and a/b/) would list twice
+    for pf in sorted(set(prefixes or [""])):
+        if not any(pf.startswith(q) for q in kept):
+            kept.append(pf)
+    for prefix in kept:
         sa = start_after
         if sa is not None and sa > prefix and not sa.startswith(prefix):
             continue                    # this prefix is entirely behind the cursor
@@ -5453,10 +5465,14 @@ def backfill_lake_objects(conn, s3_client, *, apply=False, buckets=None, prefixe
     reports `rows_changed == 0` and leaves updated_at alone."""
     out = {"dry_run": not apply, "walked": 0, "tenant": 0, "global_skipped": 0, "lake_wide": 0,
            "unknown_shape": 0, "resolved": 0, "unresolved": 0, "mismatch_voice_company": 0,
-           "tagged": 0, "rows_changed": 0, "reasons": {}, "table_missing": False,
+           "tagged": 0, "tag_skipped": 0, "conflict": 0, "conflict_sample": [],
+           "rows_changed": 0, "reasons": {}, "table_missing": False,
            "next_start_bucket": None, "next_start_after": None, "unresolved_sample": []}
     names = buckets if buckets is not None else [S3_BUCKET, LAKE_BUCKET]
     names = list(dict.fromkeys(b for b in names if b))
+    if start_after is not None and start_bucket is None:
+        out["error"] = "start_after requires start_bucket (the cursor is per bucket)"
+        return out
     if start_bucket is not None:
         if start_bucket not in names:
             out["error"] = f"start_bucket {start_bucket} is not one of the buckets"
@@ -5506,10 +5522,13 @@ def backfill_lake_objects(conn, s3_client, *, apply=False, buckets=None, prefixe
                              "user_id": o["user_id"], "kind": o["kind"], "folder": o["folder"],
                              "day": o["day"], "session_base": o["session_base"],
                              "size_bytes": sz if isinstance(sz, int) else None,
-                             "source": "backfill",
+                             "source": "backfill", "why": o["reason"],
                              "reason": None if o["company_id"] else o["reason"]})
             if apply and rows:
                 try:
+                    # R7e: a stored company is never replaced by a different one here; the
+                    # upsert skips such rows, and they are reported.
+                    clash = lake_objects.conflicts(conn, rows)
                     n = lake_objects.upsert_many(conn, rows, on_missing=None)
                 except Exception:  # noqa: BLE001 - earlier pages are committed; say where to resume
                     logger.exception("lake backfill: upsert failed after %s", last_key)
@@ -5521,16 +5540,31 @@ def backfill_lake_objects(conn, s3_client, *, apply=False, buckets=None, prefixe
                     out["next_start_bucket"], out["next_start_after"] = bucket, last_key
                     return out
                 out["rows_changed"] += n
+                out["conflict"] += len(clash)
+                room = 50 - len(out["conflict_sample"])
+                out["conflict_sample"].extend(clash[:max(room, 0)])
+                clashed = {c["key"] for c in clash}
                 if tag:
                     for r in rows:
-                        if r["company_id"] is None:
+                        if r["company_id"] is None or r["key"] in clashed:
                             continue
-                        tags = [{"Key": "company", "Value": str(r["company_id"])}]
-                        if r["site_id"]:
-                            tags.append({"Key": "site", "Value": str(r["site_id"])})
                         try:
-                            s3_client.put_object_tagging(Bucket=bucket, Key=r["key"],
-                                                         Tagging={"TagSet": tags})
+                            # put_object_tagging REPLACES the whole set: read, change only
+                            # company/site, keep every other tag (e.g. lifecycle tags).
+                            have = s3_client.get_object_tagging(Bucket=bucket, Key=r["key"])
+                            merged = {t["Key"]: t["Value"] for t in have.get("TagSet") or []}
+                            merged["company"] = str(r["company_id"])
+                            if r["site_id"]:
+                                merged["site"] = str(r["site_id"])
+                            else:
+                                merged.pop("site", None)
+                            if len(merged) > 10:             # S3 allows 10 tags per object
+                                out["tag_skipped"] += 1
+                                continue
+                            s3_client.put_object_tagging(
+                                Bucket=bucket, Key=r["key"],
+                                Tagging={"TagSet": [{"Key": a, "Value": b}
+                                                    for a, b in merged.items()]})
                             out["tagged"] += 1
                         except Exception:  # noqa: BLE001 - tags are advisory; the row is the record
                             logger.warning("lake backfill: could not tag %s", r["key"],
