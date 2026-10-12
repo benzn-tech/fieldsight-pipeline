@@ -384,3 +384,18 @@ def test_a_drained_line_never_replaces_a_stored_different_company(db):
     assert _row(db, key)[0] == w["b"]["id"]
     assert res["conflict"] == 1 and res["conflict_sample"][0]["key"] == key
     assert res["conflict_sample"][0]["existing"] == str(w["b"]["id"])
+
+
+def test_the_manifest_lines_t_becomes_object_modified_at_and_a_newer_one_updates_it(db):
+    w = _world(db)
+    f = w["folder"]
+    key = f"reports/{DAY}/{f}/daily_report.json"
+    s3 = FakeS3()
+    _put(s3, key, {"folder": f}, body=b"{}")
+    _drain(db, s3)
+    first = db.execute("SELECT object_modified_at FROM lake_objects WHERE s3_key=%s", (key,)).fetchone()[0]
+    assert first is not None
+    _put(s3, key, {"folder": f}, body=b"{}")            # regenerated: same size, newer t
+    _drain(db, s3)
+    second = db.execute("SELECT object_modified_at FROM lake_objects WHERE s3_key=%s", (key,)).fetchone()[0]
+    assert second > first

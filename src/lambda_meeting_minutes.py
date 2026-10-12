@@ -239,6 +239,18 @@ def list_s3_objects(bucket, prefix):
     return objects
 
 
+def _transcript_folders(bucket):
+    """Folder names under transcripts/ from one delimiter listing."""
+    folders = []
+    for page in s3_client.get_paginator('list_objects_v2').paginate(
+            Bucket=bucket, Prefix='transcripts/', Delimiter='/'):
+        for cp in page.get('CommonPrefixes', []):
+            folder = cp['Prefix'][len('transcripts/'):].rstrip('/')
+            if folder:
+                folders.append(folder)
+    return folders
+
+
 def download_json_from_s3(bucket, key):
     """Download and parse JSON file from S3"""
     try:
@@ -403,13 +415,14 @@ def collect_transcripts(bucket, target_date, user_filter=None, custom_prefix=Non
         if user_filter:
             users.add(user_filter)
         else:
-            # Folders come from the published directory (already read by this lambda), not
-            # from walking transcripts/. Only an absent/empty directory scans the prefix.
-            people = (directory.load(s3_client, bucket) or {}).get("people") or {}
-            users.update(f for f in people if f)
-            if not users:
-                logger.warning("meeting minutes: directory absent or empty; discovering "
-                               "folders by listing the whole transcripts/ prefix")
+            # One delimiter listing of transcripts/ (one entry per folder, not per object).
+            # The directory is not used: legacy folders still hold transcripts and are in no
+            # directory entry. Only a listing failure scans the whole prefix, with a WARNING.
+            try:
+                users.update(_transcript_folders(bucket))
+            except Exception:  # noqa: BLE001
+                logger.warning("meeting minutes: folder listing failed; discovering folders "
+                               "by listing the whole transcripts/ prefix", exc_info=True)
                 for obj in list_s3_objects(bucket, 'transcripts/'):
                     parts = obj['key'].split('/')
                     if len(parts) >= 2 and parts[1]:

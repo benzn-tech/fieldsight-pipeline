@@ -18,6 +18,10 @@ CREATE TABLE IF NOT EXISTS lake_objects (
   size_bytes   bigint,
   source       text NOT NULL CHECK (source IN ('upload','manifest','backfill')),
   reason       text,
+  -- When the S3 object was last written (backfill: S3 LastModified; drain: the manifest line's
+  -- t). NULL for rows minted at upload time. Report history shows this, not updated_at (the
+  -- time the index learned of the object).
+  object_modified_at timestamptz,
   created_at   timestamptz NOT NULL DEFAULT now(),
   updated_at   timestamptz NOT NULL DEFAULT now(),
   deleted_at   timestamptz

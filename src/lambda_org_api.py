@@ -5353,6 +5353,7 @@ def drain_lake_manifest(conn, s3_client, *, dry_run=False, max_objects=500, buck
                    "user_id": o["user_id"], "kind": o["kind"], "folder": o["folder"],
                    "day": o["day"], "session_base": o["session_base"],
                    "size_bytes": merged[k]["size"], "source": "manifest", "why": o["reason"],
+                   "object_modified_at": _parse_iso(merged[k]["t"]),
                    "reason": None if o["company_id"] else o["reason"]}
 
     if dry_run:
@@ -5414,8 +5415,19 @@ def drain_lake_manifest(conn, s3_client, *, dry_run=False, max_objects=500, buck
     return out
 
 
+def _parse_iso(t):
+    """A manifest line's `t` as an aware datetime, or None when absent/unparseable."""
+    if not isinstance(t, str):
+        return None
+    try:
+        d = datetime.fromisoformat(t.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
 def _backfill_pages(s3_client, bucket, prefixes, start_after, page_size):
-    """Yield pages of (key, size) of one bucket in global key order. `start_after` is a key in
+    """Yield pages of (key, size, last_modified) of one bucket in global key order. `start_after` is a key in
     this bucket (None = from the beginning). With prefixes (sorted), a prefix whose whole range
     lies before the cursor is skipped, so the cursor stays one monotone key."""
     kept = []                           # overlapping prefixes (a/ and a/b/) would list twice
@@ -5436,7 +5448,7 @@ def _backfill_pages(s3_client, bucket, prefixes, start_after, page_size):
             elif sa:
                 kw["StartAfter"] = sa
             resp = s3_client.list_objects_v2(**kw)
-            page = [(o["Key"], o.get("Size")) for o in resp.get("Contents") or []]
+            page = [(o["Key"], o.get("Size"), o.get("LastModified")) for o in resp.get("Contents") or []]
             if page:
                 yield page
             token = resp.get("NextContinuationToken")
@@ -5493,11 +5505,11 @@ def backfill_lake_objects(conn, s3_client, *, apply=False, buckets=None, prefixe
                 out["next_start_bucket"], out["next_start_after"] = bucket, last_key
                 return out
             t0 = time.monotonic()
-            keys = [(k, sz) for k, sz in page if not k.endswith("/")]
+            keys = [(k, sz, lm) for k, sz, lm in page if not k.endswith("/")]
             out["walked"] += len(page)                   # "folder" placeholder keys: walked only
-            owners = resolver.resolve_many([(k, {}) for k, _sz in keys])
+            owners = resolver.resolve_many([(k, {}) for k, _sz, _lm in keys])
             rows = []
-            for k, sz in keys:
+            for k, sz, lm in keys:
                 o = owners[k]
                 if o["scope"] == "global":
                     out["global_skipped"] += 1
@@ -5522,6 +5534,7 @@ def backfill_lake_objects(conn, s3_client, *, apply=False, buckets=None, prefixe
                              "user_id": o["user_id"], "kind": o["kind"], "folder": o["folder"],
                              "day": o["day"], "session_base": o["session_base"],
                              "size_bytes": sz if isinstance(sz, int) else None,
+                             "object_modified_at": lm if isinstance(lm, datetime) else None,
                              "source": "backfill", "why": o["reason"],
                              "reason": None if o["company_id"] else o["reason"]})
             if apply and rows:
@@ -11576,13 +11589,13 @@ def _report_history_from_index(conn, caller, folder_scope, limit, keep):
         row = {"key": key,
                "type": ("weekly" if "weekly" in key else "monthly" if "monthly" in key else "daily"),
                "date": dm.group(1) if dm else "",
-               "generated_at": r["updated_at"].isoformat(),
+               "generated_at": (r.get("object_modified_at") or r["updated_at"]).isoformat(),
                "size": r.get("size_bytes") or 0}
         d = docx.get(key[:-len(".json")] + ".docx")
         if d is not None:
             row["docx_key"] = d["s3_key"]
             row["docx_size"] = d.get("size_bytes") or 0
-            row["docx_generated_at"] = d["updated_at"].isoformat()
+            row["docx_generated_at"] = (d.get("object_modified_at") or d["updated_at"]).isoformat()
         out.append(row)
     return {"reports": out}
 

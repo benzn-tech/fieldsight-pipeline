@@ -17,13 +17,14 @@ __all__ = ["upsert", "record_best_effort", "upsert_many", "reassign_site", "owne
            "unresolved", "list_reports", "report_folders_for_day"]
 
 _COLS = ("s3_key, company_id, site_id, user_id, session_base, folder, day, kind, size_bytes, "
-         "source, reason, created_at, updated_at, deleted_at")
+         "source, reason, object_modified_at, created_at, updated_at, deleted_at")
 
 # A later write with NULL never erases what an earlier one knew. reason follows company_id:
 # a write that supplies a company clears a stale reason, one that does not keeps it.
 _UPSERT = (
     "INSERT INTO lake_objects (s3_key, company_id, site_id, user_id, session_base, folder, day, "
-    "kind, size_bytes, source, reason) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+    "kind, size_bytes, source, reason, object_modified_at) "
+    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
     "ON CONFLICT (s3_key) DO UPDATE SET "
     "company_id = COALESCE(EXCLUDED.company_id, lake_objects.company_id), "
     "site_id = COALESCE(EXCLUDED.site_id, lake_objects.site_id), "
@@ -34,6 +35,7 @@ _UPSERT = (
     "day = COALESCE(EXCLUDED.day, lake_objects.day), "
     "session_base = COALESCE(EXCLUDED.session_base, lake_objects.session_base), "
     "source = COALESCE(EXCLUDED.source, lake_objects.source), "
+    "object_modified_at = GREATEST(EXCLUDED.object_modified_at, lake_objects.object_modified_at), "
     # A row that already has a company never takes a "why it has none" reason from a write
     # that did not supply a company (the COALESCE kept the company, so the reason would lie).
     "reason = CASE WHEN EXCLUDED.company_id IS NOT NULL THEN EXCLUDED.reason "
@@ -44,7 +46,7 @@ _UPSERT = (
     "WHERE (lake_objects.deleted_at IS NOT NULL "
     + "".join(f"OR (EXCLUDED.{c} IS NOT NULL AND EXCLUDED.{c} IS DISTINCT FROM lake_objects.{c}) "
               for c in ("company_id", "site_id", "user_id", "size_bytes", "kind", "folder", "day",
-                        "session_base", "source"))
+                        "session_base", "source", "object_modified_at"))
     # reason: a write that supplies a company_id owns the reason too (NULL clears a stale one);
     # without a company_id only a non-NULL reason counts.
     + "OR ((EXCLUDED.company_id IS NOT NULL "
@@ -78,18 +80,19 @@ def _run(conn, fn, empty):
 
 
 def _params(key, company_id, site_id, user_id, kind, folder, day, session_base, size_bytes,
-            source, reason):
+            source, reason, object_modified_at=None):
     return (key, company_id, site_id, user_id, session_base, folder, day, kind, size_bytes,
-            source, reason)
+            source, reason, object_modified_at)
 
 
 def upsert(conn, key, *, company_id, site_id=None, user_id=None, kind, folder=None, day=None,
-           session_base=None, size_bytes=None, source, reason=None) -> bool:
+           session_base=None, size_bytes=None, source, reason=None,
+           object_modified_at=None) -> bool:
     """Record one object. NULL arguments never erase an already-known owner. False when the
     table is missing (the caller keeps going; the drain/backfill is the safety net).
     `reason` (e.g. "split_day", ruling C2) explains a deliberate company_id NULL."""
     p = _params(key, company_id, site_id, user_id, kind, folder, day, session_base, size_bytes,
-                source, reason)
+                source, reason, object_modified_at)
 
     def go():
         conn.execute(_UPSERT, p)
@@ -130,7 +133,8 @@ def upsert_many(conn, rows, *, on_missing=0):
     manifest object on it."""
     params = [_params(r["key"], r.get("company_id"), r.get("site_id"), r.get("user_id"),
                       r["kind"], r.get("folder"), r.get("day"), r.get("session_base"),
-                      r.get("size_bytes"), r["source"], r.get("reason")) for r in rows]
+                      r.get("size_bytes"), r["source"], r.get("reason"),
+                      r.get("object_modified_at")) for r in rows]
     if not params:
         return 0
 
