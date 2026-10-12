@@ -91,6 +91,8 @@ def wired(monkeypatch):
             raise RuntimeError("db down")
         return {"samplesMoved": 4, "samplesDropped": 1}
     monkeypatch.setattr(org.voiceprints, "merge_profiles", merge)
+    monkeypatch.setattr(org.voiceprints, "requarantine_profile",
+                        lambda c, co, vid: {"quarantined": 0})
 
     def rename(c, co, vid, name):
         calls["rename"].append((co, vid, name))
@@ -164,9 +166,12 @@ def test_merge_runs_in_one_transaction_as_the_caller(wired):
     conn, calls, _, _ = wired
     res = org.lambda_handler(_ev("POST", f"/voiceprints/{SRC}/merge", {"into": TGT}), None)
     assert res["statusCode"] == 200
-    assert _b(res) == {"mergedInto": TGT, "samplesMoved": 4, "samplesDropped": 1}
+    assert _b(res) == {"mergedInto": TGT, "samplesMoved": 4, "samplesDropped": 1,
+                       "samplesSetAside": 0}
     assert calls["merge"] == [("c-1", SRC, TGT, "u-1")]
-    assert conn.tx == [None]
+    # The merge is ONE transaction; the re-judgement of the combined profile runs in a
+    # second one AFTER it committed, so its failure can never undo the merge.
+    assert conn.tx == [None, None]
 
 
 def test_different_without_confirm_is_409_and_changes_nothing(wired):
@@ -393,3 +398,26 @@ def test_list_profiles_sql_has_the_identity_columns_in_one_statement():
                  "COALESCE(p.asserted_by, p.consented_by)", "lu.email AS linked_email",
                  "p.merged_into", "merged_into_name", "p.employer_name"):
         assert frag in sql, frag
+
+
+def test_a_merge_re_judges_the_combined_profile(wired, monkeypatch):
+    """A merge is allowed against a "these sound different" warning, and it is the one act
+    that moves a whole profile's samples in at once. The combined set is re-judged so a
+    wrong merge sets the stranger's samples aside instead of dragging the mean to nobody."""
+    seen = []
+    monkeypatch.setattr(org.voiceprints, "requarantine_profile",
+                        lambda c, co, vid: seen.append((co, vid)) or {"quarantined": 2})
+    res = org.lambda_handler(
+        _ev("POST", f"/voiceprints/{SRC}/merge", {"into": TGT, "confirm": True}), None)
+    assert res["statusCode"] == 200
+    assert seen == [(CALLER["company_id"], TGT)]
+    assert _b(res)["samplesSetAside"] == 2
+
+
+def test_a_failing_re_judgement_does_not_fail_the_merge(wired, monkeypatch):
+    def boom(c, co, vid):
+        raise RuntimeError("clustering failed")
+    monkeypatch.setattr(org.voiceprints, "requarantine_profile", boom)
+    res = org.lambda_handler(
+        _ev("POST", f"/voiceprints/{SRC}/merge", {"into": TGT, "confirm": True}), None)
+    assert res["statusCode"] == 200 and len(wired[1]["merge"]) == 1

@@ -1246,25 +1246,38 @@ def test_one_invocation_never_serves_another_its_audio(stub_embedder, monkeypatc
     assert s3.gets.count(key) == 2, "the second invocation reused the first one's audio"
 
 
-def test_one_enrolled_profile_names_nobody(stub_embedder, monkeypatch):
-    """`decide_name` returns a name with a NULL margin when the pool holds one profile —
-    "the closest of the only person I know". Written to a transcript it reads as an
-    identification, and it lands on every turn including the other speakers': one enrolled
-    name spread over everybody, which is worse than no name at all.
-
-    Discrimination needs two profiles. That is not a tuning choice — with overlapping score
-    distributions and no usable absolute threshold, one candidate cannot be told from a
-    stranger."""
+def test_one_enrolled_profile_is_offered_as_a_lean_above_its_floor(stub_embedder, monkeypatch):
+    """A company that has enrolled ONE person must still be recognised (TEST 2026-10-13:
+    two weeks of "named 0 of N turns" because every one-person result was dropped). With no
+    runner-up the name is a lean -- `tentative`, never `confirmed` -- and only above
+    `DEFAULT_SINGLE_CANDIDATE_FLOOR`."""
     key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
     art = "voiceprint_requests/co-1/s/match-1.json"
     monkeypatch.setattr(se, "s3", lambda: FakeS3({art: _match_artifact(mode="on"),
                                                   key: _wav_bytes()}))
     seen = []
-    _writer(monkeypatch, [_profile()], seen)
+    _writer(monkeypatch, [_profile("vp-1", "Ben L", vec=[1.0] * 192)], seen)
+    out = se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
+                                                 "object": {"key": art}}}]}, None)
+    assert out["matched"] >= 1
+    named = next(p for p in seen if p["op"] == "match_names")["results"]
+    assert named and all(r["status"] == "tentative" for r in named)
+    assert named[0]["display_name"] == "Ben L"
+
+
+def test_one_enrolled_profile_below_its_floor_names_nobody(stub_embedder, monkeypatch):
+    """The other half: the single enrolled person is NOT spread over every voice in the
+    room. A turn that does not clear the single-candidate floor stays unnamed."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    art = "voiceprint_requests/co-1/s/match-1.json"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({art: _match_artifact(mode="on"),
+                                                  key: _wav_bytes()}))
+    seen = []
+    _writer(monkeypatch, [_profile("vp-1", "Ben L", vec=[1.0] + [-1.0] * 191)], seen)
     out = se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
                                                  "object": {"key": art}}}]}, None)
     assert out["matched"] == 0
-    assert not any(p["op"] == "match_names" for p in seen)
+    assert not any(p["op"] == "match_names" and p["results"] for p in seen)
 
 
 def test_two_profiles_can_produce_a_name(stub_embedder, monkeypatch):
