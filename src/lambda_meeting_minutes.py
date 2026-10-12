@@ -403,10 +403,17 @@ def collect_transcripts(bucket, target_date, user_filter=None, custom_prefix=Non
         if user_filter:
             users.add(user_filter)
         else:
-            for obj in list_s3_objects(bucket, 'transcripts/'):
-                parts = obj['key'].split('/')
-                if len(parts) >= 2 and parts[1]:
-                    users.add(parts[1])
+            # Folders come from the published directory (already read by this lambda), not
+            # from walking transcripts/. Only an absent/empty directory scans the prefix.
+            people = (directory.load(s3_client, bucket) or {}).get("people") or {}
+            users.update(f for f in people if f)
+            if not users:
+                logger.warning("meeting minutes: directory absent or empty; discovering "
+                               "folders by listing the whole transcripts/ prefix")
+                for obj in list_s3_objects(bucket, 'transcripts/'):
+                    parts = obj['key'].split('/')
+                    if len(parts) >= 2 and parts[1]:
+                        users.add(parts[1])
 
         for user_name in sorted(users):
             # Date subfolder first
