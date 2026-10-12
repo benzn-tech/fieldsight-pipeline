@@ -76,10 +76,10 @@ def test_the_text_table_escapes_pipes_and_collapses_newlines():
     3237e56, finding 2) -- that file is the other half of this contract."""
     _subject, text, _html = _email(
         [{"text": "Cut 2400 | 1200 sheet\nsecond line", "responsible": "Sam\nSmith",
-         "due": "Mon\nTue"}])
+         "due": "when the\ncrane arrives"}])   # names no day, so shown as said
     row = next(ln for ln in text.splitlines() if "Cut 2400" in ln)
     assert "\n" not in row
-    assert row == r"| Cut 2400 \| 1200 sheet second line | Sam Smith | Mon Tue |"
+    assert row == r"| Cut 2400 \| 1200 sheet second line | Sam Smith | when the crane arrives |"
 
 
 def test_the_text_table_header_and_separator_match_the_frontend_exactly():
