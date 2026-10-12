@@ -169,6 +169,7 @@ from repositories import (action_items, aliases, chunks, classification_feedback
                           voice_messages,
                           voiceprints)
 from repositories import lake_objects
+import lake_keys
 import lake_owner
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import (diff_candidates, first_match_span, learned_pairs, normalize,
@@ -388,6 +389,7 @@ REBIND_DAY_TASK = "rebind_day_photos"
 RESTORE_MARKERS_TASK = "restore_day_markers"
 BACKFILL_LEGACY_TICKS_TASK = "backfill_legacy_ticks"
 DRAIN_LAKE_MANIFEST_TASK = "drain_lake_manifest"
+BACKFILL_LAKE_OBJECTS_TASK = "backfill_lake_objects"
 
 
 def lambda_handler(event, context):
@@ -410,6 +412,24 @@ def lambda_handler(event, context):
             return drain_lake_manifest(conn, s3(), dry_run=event.get("dry_run") is True,
                                        max_objects=int(event.get("max_objects") or 500),
                                        buckets=event.get("buckets"))
+    # OPERATOR TASK (lake ownership): walks the bucket once and records an owner for every
+    # object. A DRY RUN unless "apply" is exactly true or "dry_run" is exactly false (a typo
+    # or a string must not write; if the two disagree, the dry run wins). Tagging needs
+    # "tag": true AND a write. Returns next_start_after: re-invoke with it to resume.
+    # Runs on this handler for now; Task 11 moves it to LakeOps (longer timeout).
+    if isinstance(event, dict) and event.get("task") == BACKFILL_LAKE_OBJECTS_TASK:
+        write = ((event.get("apply") is True or event.get("dry_run") is False)
+                 and event.get("dry_run") is not True)
+        budget = event.get("time_budget_s")
+        if isinstance(budget, bool) or not isinstance(budget, (int, float)):
+            budget = 780
+        bucket = event.get("bucket")
+        with get_connection() as conn:
+            return backfill_lake_objects(
+                conn, s3(), apply=write, tag=event.get("tag") is True,
+                buckets=[bucket] if bucket else event.get("buckets"),
+                prefixes=event.get("prefixes"), start_bucket=event.get("start_bucket"),
+                start_after=event.get("start_after"), time_budget_s=budget)
     # OPERATOR TASK, invoked by hand with `aws lambda invoke` (IAM decides who
     # may). The same envelope rule as above keeps it out of reach of the API.
     # A dry run unless "apply" is exactly true: a typo must not write.
@@ -5383,6 +5403,145 @@ def drain_lake_manifest(conn, s3_client, *, dry_run=False, max_objects=500, buck
             out["deleted_manifests"] += len(chunk) - failed
             kept += failed
     out["kept"] = kept
+    return out
+
+
+def _backfill_pages(s3_client, bucket, prefixes, start_after, page_size):
+    """Yield pages of (key, size) of one bucket in global key order. `start_after` is a key in
+    this bucket (None = from the beginning). With prefixes (sorted), a prefix whose whole range
+    lies before the cursor is skipped, so the cursor stays one monotone key."""
+    for prefix in (sorted(set(prefixes)) if prefixes else [""]):
+        sa = start_after
+        if sa is not None and sa > prefix and not sa.startswith(prefix):
+            continue                    # this prefix is entirely behind the cursor
+        if sa is not None and sa < prefix:
+            sa = None                   # the cursor is before this prefix: start at its head
+        token = None
+        while True:
+            kw = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": page_size}
+            if token:
+                kw["ContinuationToken"] = token
+            elif sa:
+                kw["StartAfter"] = sa
+            resp = s3_client.list_objects_v2(**kw)
+            page = [(o["Key"], o.get("Size")) for o in resp.get("Contents") or []]
+            if page:
+                yield page
+            token = resp.get("NextContinuationToken")
+            if not resp.get("IsTruncated") or not token:
+                break
+
+
+def backfill_lake_objects(conn, s3_client, *, apply=False, buckets=None, prefixes=None,
+                          start_bucket=None, start_after=None, time_budget_s=780, tag=False,
+                          page_size=1000):
+    """Walk the bucket(s) once and record who owns every object in lake_objects.
+
+    ONE resolution path: lake_owner.Resolver (the drain's), so the backfill and the drain can
+    never disagree. Global and lake-wide keys are counted and skipped (no row); an unknown
+    shape and an unresolvable key are upserted with company NULL and their reason, and listed
+    in `unresolved_sample` (first 50). Nothing is guessed.
+
+    A DRY RUN is the default (`apply` must be exactly True): it lists and resolves, writes no
+    row and makes no S3 mutation. Tagging (put_object_tagging, no data copy, one call per
+    resolved object) happens only with `tag` AND `apply`; it is the only S3 mutation here.
+
+    Resumable and idempotent: each page is committed before the next is read; the walk stops
+    once `time_budget_s` is spent (at least one page is always done, so a resume moves) and
+    returns `next_start_bucket`/`next_start_after`, the last key it finished, or None when the
+    walk is complete. The repository upsert skips an unchanged row, so a second full run
+    reports `rows_changed == 0` and leaves updated_at alone."""
+    out = {"dry_run": not apply, "walked": 0, "tenant": 0, "global_skipped": 0, "lake_wide": 0,
+           "unknown_shape": 0, "resolved": 0, "unresolved": 0, "mismatch_voice_company": 0,
+           "tagged": 0, "rows_changed": 0, "reasons": {}, "table_missing": False,
+           "next_start_bucket": None, "next_start_after": None, "unresolved_sample": []}
+    names = buckets if buckets is not None else [S3_BUCKET, LAKE_BUCKET]
+    names = list(dict.fromkeys(b for b in names if b))
+    if start_bucket is not None:
+        if start_bucket not in names:
+            out["error"] = f"start_bucket {start_bucket} is not one of the buckets"
+            return out
+        names = names[names.index(start_bucket):]
+    started = time.monotonic()
+    resolver = lake_owner.Resolver(conn)
+    pages_done, last_page_s = 0, 0.0
+
+    def budget_spent():
+        """True once another page like the last would overrun; never before the first page."""
+        return pages_done >= 1 and (time.monotonic() - started) + last_page_s >= time_budget_s
+
+    for bi, bucket in enumerate(names):
+        last_key = start_after if bi == 0 else None
+        for page in _backfill_pages(s3_client, bucket, prefixes, last_key, page_size):
+            if budget_spent():
+                out["next_start_bucket"], out["next_start_after"] = bucket, last_key
+                return out
+            t0 = time.monotonic()
+            keys = [(k, sz) for k, sz in page if not k.endswith("/")]
+            out["walked"] += len(page)                   # "folder" placeholder keys: walked only
+            owners = resolver.resolve_many([(k, {}) for k, _sz in keys])
+            rows = []
+            for k, sz in keys:
+                o = owners[k]
+                if o["scope"] == "global":
+                    out["global_skipped"] += 1
+                    continue
+                if o["scope"] == "lake_wide":
+                    out["lake_wide"] += 1
+                    continue
+                out["unknown_shape" if o["scope"] == "unknown" else "tenant"] += 1
+                why = o["reason"] or "none"
+                out["reasons"][why] = out["reasons"].get(why, 0) + 1
+                if o["company_id"] is None:
+                    out["unresolved"] += 1
+                    if len(out["unresolved_sample"]) < 50:
+                        out["unresolved_sample"].append({"key": k, "reason": o["reason"]})
+                else:
+                    out["resolved"] += 1
+                parsed = lake_keys.parse(k) or {}
+                if (parsed.get("kind") == "voice" and parsed.get("company_id")
+                        and o["company_id"] and parsed["company_id"] != o["company_id"]):
+                    out["mismatch_voice_company"] += 1
+                rows.append({"key": k, "company_id": o["company_id"], "site_id": o["site_id"],
+                             "user_id": o["user_id"], "kind": o["kind"], "folder": o["folder"],
+                             "day": o["day"], "session_base": o["session_base"],
+                             "size_bytes": sz if isinstance(sz, int) else None,
+                             "source": "backfill",
+                             "reason": None if o["company_id"] else o["reason"]})
+            if apply and rows:
+                try:
+                    n = lake_objects.upsert_many(conn, rows, on_missing=None)
+                except Exception:  # noqa: BLE001 - earlier pages are committed; say where to resume
+                    logger.exception("lake backfill: upsert failed after %s", last_key)
+                    out["error"] = "upsert failed"
+                    out["next_start_bucket"], out["next_start_after"] = bucket, last_key
+                    return out
+                if n is None:
+                    out["table_missing"] = True
+                    out["next_start_bucket"], out["next_start_after"] = bucket, last_key
+                    return out
+                out["rows_changed"] += n
+                if tag:
+                    for r in rows:
+                        if r["company_id"] is None:
+                            continue
+                        tags = [{"Key": "company", "Value": str(r["company_id"])}]
+                        if r["site_id"]:
+                            tags.append({"Key": "site", "Value": str(r["site_id"])})
+                        try:
+                            s3_client.put_object_tagging(Bucket=bucket, Key=r["key"],
+                                                         Tagging={"TagSet": tags})
+                            out["tagged"] += 1
+                        except Exception:  # noqa: BLE001 - tags are advisory; the row is the record
+                            logger.warning("lake backfill: could not tag %s", r["key"],
+                                           exc_info=True)
+                conn.commit()                              # progress is durable page by page
+            last_key = page[-1][0]
+            pages_done += 1
+            last_page_s = time.monotonic() - t0
+        if bi + 1 < len(names) and budget_spent():       # bucket done; resume at the next one
+            out["next_start_bucket"], out["next_start_after"] = names[bi + 1], None
+            return out
     return out
 
 
