@@ -207,28 +207,45 @@ def _ids(company_ids):
     return None if company_ids is None else [str(c) for c in company_ids]
 
 
-def list_reports(conn, *, company_ids=None, folders=None, limit=200) -> list:
-    """Report objects (kind='report'), newest day first, optionally limited to companies/folders."""
+def list_reports(conn, *, company_ids=None, folders=None, own_folder=None, key_suffix=None,
+                 exclude_debug=False, keys=None, limit=200, offset=0, on_missing=()) -> list:
+    """Report objects (kind='report'), newest day first, optionally limited to companies/folders.
+
+    Tenancy (R8b): when `company_ids` is given a row qualifies if its company is in the list;
+    NULL-company rows (split_day, unresolved) never qualify, EXCEPT every row of `own_folder`,
+    which the person always sees (their own work, whatever company the site belongs to).
+    `folders` narrows further (AND). `key_suffix`/`exclude_debug` select the document kind;
+    `keys` fetches exactly those objects (the docx siblings of a page of json rows).
+    `on_missing` is what a missing table returns: callers on a request path pass None so
+    "table missing" is distinguishable from "no reports"."""
     def go():
         cur = conn.cursor(row_factory=dict_row)
         ids = _ids(company_ids)
         return cur.execute(
             f"SELECT {_COLS} FROM lake_objects WHERE kind='report' AND deleted_at IS NULL "
-            "AND (%s::uuid[] IS NULL OR company_id = ANY(%s::uuid[])) "
+            "AND (%s::uuid[] IS NULL OR company_id = ANY(%s::uuid[]) "
+            "     OR (%s::text IS NOT NULL AND folder = %s::text)) "
             "AND (%s::text[] IS NULL OR folder = ANY(%s::text[])) "
-            "ORDER BY day DESC NULLS LAST, s3_key LIMIT %s",
-            (ids, ids, folders, folders, limit)).fetchall()
-    return _run(conn, go, [])
+            "AND (%s::text IS NULL OR right(s3_key, length(%s::text)) = %s::text) "
+            "AND (NOT %s OR position('_debug' in s3_key) = 0) "
+            "AND (%s::text[] IS NULL OR s3_key = ANY(%s::text[])) "
+            "ORDER BY day DESC NULLS LAST, s3_key LIMIT %s OFFSET %s",
+            (ids, ids, own_folder, own_folder, folders, folders, key_suffix, key_suffix,
+             key_suffix, bool(exclude_debug), keys, keys, limit, offset)).fetchall()
+    return _run(conn, go, on_missing if on_missing != () else [])
 
 
-def report_folders_for_day(conn, day, company_ids=None) -> list:
-    """Distinct folders that have a report object on `day`."""
+def report_folders_for_day(conn, day, company_ids=None, *, key_suffix=None, on_missing=()) -> list:
+    """Distinct folders that have a report object on `day` (NULL-company rows qualify only
+    when `company_ids` is None). `on_missing`: see list_reports."""
     def go():
         ids = _ids(company_ids)
         rows = conn.execute(
             "SELECT DISTINCT folder FROM lake_objects WHERE kind='report' AND day=%s "
             "AND deleted_at IS NULL AND folder IS NOT NULL "
-            "AND (%s::uuid[] IS NULL OR company_id = ANY(%s::uuid[])) ORDER BY folder",
-            (day, ids, ids)).fetchall()
+            "AND (%s::uuid[] IS NULL OR company_id = ANY(%s::uuid[])) "
+            "AND (%s::text IS NULL OR right(s3_key, length(%s::text)) = %s::text) "
+            "AND position('_debug' in s3_key) = 0 ORDER BY folder",
+            (day, ids, ids, key_suffix, key_suffix, key_suffix)).fetchall()
         return [r["folder"] if isinstance(r, dict) else r[0] for r in rows]
-    return _run(conn, go, [])
+    return _run(conn, go, on_missing if on_missing != () else [])

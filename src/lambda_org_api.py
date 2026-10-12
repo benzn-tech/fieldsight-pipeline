@@ -9497,7 +9497,13 @@ def _get_lake_json(key):
     return json.loads(obj["Body"].read().decode("utf-8"))
 
 
-def _list_report_folders(date):
+def _lake_index_reads():
+    """LAKE_INDEX_READS, read at call time (R8d): request paths read the lake_objects index
+    instead of listing S3 prefixes only once the backfill has populated it."""
+    return os.environ.get("LAKE_INDEX_READS") == "true"
+
+
+def _list_report_folders(date, conn=None, caller=None):
     """S3 folder discovery for admin_disambiguation — mirrors
     lambda_fieldsight_api.py's find_any_report (lines 264-291): list every
     reports/{date}/*/daily_report.json object and take the folder segment,
@@ -9510,6 +9516,20 @@ def _list_report_folders(date):
     from available_users — mirrors the paginator pattern used elsewhere in
     this repo (lambda_ingest.py, lambda_item_writer.py, lambda_fieldsight_
     api.py's get_dates)."""
+    if conn is not None and caller is not None and _lake_index_reads():
+        # R8a: from the index, never more than the S3 path shows. A company admin/gm gets
+        # only folders whose rows carry THEIR company (NULL rows -- split_day, unresolved --
+        # are excluded); platform_admin is unrestricted. Every per-folder guard after the
+        # listing stays in place. None = table missing -> the S3 listing below, with a
+        # WARNING; an empty list is a real answer and does not fall back.
+        found = lake_objects.report_folders_for_day(
+            conn, date,
+            company_ids=None if is_cross_company(caller["global_role"]) else [caller["company_id"]],
+            key_suffix="/daily_report.json", on_missing=None)
+        if found is not None:
+            return list(found)
+        logger.warning("LAKE_INDEX_READS is on but lake_objects is missing; listing S3 for "
+                       "reports/%s/", date)
     prefix = f"reports/{date}/"
     folders = []
     try:
@@ -10266,7 +10286,7 @@ def admin_disambiguation(conn, caller, date):
         if doc is not None:
             return ok(doc)
     candidates = set()
-    for folder in _list_report_folders(date):
+    for folder in _list_report_folders(date, conn, caller):
         if _all_tier_may_open(conn, caller, folder):
             candidates.add(folder)
     # By SITE, not by author company: an external member's topics on this company's
@@ -11510,7 +11530,64 @@ def _company_folder_names(conn, company_id):
             if u.get("folder_name")}
 
 
-def _read_org_report_history(folder_scope, limit, keep=None):
+_REPORT_INDEX_PAGE = 100
+
+
+def _report_history_from_index(conn, caller, folder_scope, limit, keep):
+    """Report history from lake_objects. Returns the response dict, or None when the table is
+    missing (the caller then runs the S3 listing). Same row shape as the S3 path.
+
+    R8b: filtered by folder scope AND company. A folder that is not the caller's own only
+    yields rows of the caller's company (platform_admin: any); NULL-company rows are never
+    shown to others. The caller's OWN folder yields every row, NULL included."""
+    cross = is_cross_company(caller["global_role"])
+    kw = dict(folders=None if folder_scope is None else sorted(folder_scope),
+              company_ids=None if cross else [caller["company_id"]],
+              own_folder=None if cross else (caller.get("folder_name") or None),
+              key_suffix="_report.json", exclude_debug=True, on_missing=None)
+    reports = []
+    page_size = max(limit * 2, _REPORT_INDEX_PAGE)
+    offset = 0
+    while len(reports) < limit:
+        rows = lake_objects.list_reports(conn, limit=page_size, offset=offset, **kw)
+        if rows is None:
+            return None
+        for r in rows:
+            if keep is not None and not keep(r["s3_key"]):
+                continue
+            reports.append(r)
+            if len(reports) >= limit:
+                break
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    docx = {}
+    if reports:
+        cands = [r["s3_key"][:-len(".json")] + ".docx" for r in reports]
+        drows = lake_objects.list_reports(conn, keys=cands, limit=len(cands),
+                                          on_missing=None)
+        if drows is None:
+            return None
+        docx = {d["s3_key"]: d for d in drows}
+    out = []
+    for r in reports:
+        key = r["s3_key"]
+        dm = REPORT_DATE_IN_KEY_RE.search(key)
+        row = {"key": key,
+               "type": ("weekly" if "weekly" in key else "monthly" if "monthly" in key else "daily"),
+               "date": dm.group(1) if dm else "",
+               "generated_at": r["updated_at"].isoformat(),
+               "size": r.get("size_bytes") or 0}
+        d = docx.get(key[:-len(".json")] + ".docx")
+        if d is not None:
+            row["docx_key"] = d["s3_key"]
+            row["docx_size"] = d.get("size_bytes") or 0
+            row["docx_generated_at"] = d["updated_at"].isoformat()
+        out.append(row)
+    return {"reports": out}
+
+
+def _read_org_report_history(folder_scope, limit, keep=None, conn=None, caller=None):
     """List the lake's report index, filtered by an ALREADY-RESOLVED folder
     scope. `folder_scope is None` means unrestricted; callers MUST have
     short-circuited the deny-all (empty set) case before getting here.
@@ -11538,6 +11615,13 @@ def _read_org_report_history(folder_scope, limit, keep=None):
     each would be a round trip to learn something this listing already carries,
     and a presigned URL for a key that does not exist answers 403 here rather
     than 404, so the failure would not even read as "missing"."""
+    if conn is not None and caller is not None and _lake_index_reads():
+        # Empty is an answer ("no reports"); only the missing-table sentinel falls back.
+        out = _report_history_from_index(conn, caller, folder_scope, limit, keep)
+        if out is not None:
+            return out
+        logger.warning("LAKE_INDEX_READS is on but lake_objects is missing; listing the "
+                       "whole reports/ prefix")
     reports = []
     docx_sizes = {}
     docx_times = {}
@@ -11613,7 +11697,7 @@ def get_org_report_history(conn, caller, event):
         # predicate an empty container would silently satisfy.
         return ok({"reports": []})
     return ok(_read_org_report_history(
-        folder_scope, limit, keep=_report_entry_guard(conn, caller)))
+        folder_scope, limit, keep=_report_entry_guard(conn, caller), conn=conn, caller=caller))
 
 
 def _report_key_period(key):
