@@ -350,3 +350,24 @@ def _audit_insert(conn, sql, params):
             raise
         logger.warning("membership_audit missing (migration 0086 not applied yet); "
                        "audit row NOT written for %s", params[0])
+
+
+def ever_external_user_ids(conn, user_ids) -> set:
+    """Users with at least one memberships row where external = true, in ANY status (archived
+    included): people who have ever worked on another company's site. Missing 0085 column
+    (deploy window): nobody is external, WARNING, and the caller's transaction is untouched."""
+    ids = sorted({str(u) for u in (user_ids or []) if u})
+    if not ids:
+        return set()
+    try:
+        with conn.transaction():
+            rows = conn.cursor(row_factory=dict_row).execute(
+                "SELECT DISTINCT user_id FROM memberships WHERE external = true "
+                "AND user_id = ANY(%s::uuid[])", (ids,)).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        if not _is_missing_schema(exc):
+            raise
+        logger.warning("memberships.external missing (migration 0085 not applied); "
+                       "treating nobody as external")
+        return set()
+    return {str(r["user_id"]) for r in rows}

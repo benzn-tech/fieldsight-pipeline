@@ -799,3 +799,46 @@ def session_site_companies(conn, folder, date, session_base) -> list:
         "WHERE r.s3_key LIKE %s",
         (like_topic, like_rec)).fetchall()
     return [(str(x[0]), str(x[1])) for x in rows]
+
+
+def owners_for_keys(conn, keys) -> dict:
+    """{s3_key: {company_id, site_id, user_id}} for keys that are recordings rows (one query).
+    The company is the SITE's current company when the recording has a site (a moved site
+    must not leave the object with the old company), else the recording's own company."""
+    keys = sorted({k for k in (keys or []) if k})
+    if not keys:
+        return {}
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT r.s3_key, COALESCE(s.company_id, r.company_id) AS company_id, r.site_id, r.user_id "
+        "FROM recordings r LEFT JOIN sites s ON s.id = r.site_id WHERE r.s3_key = ANY(%s)",
+        (keys,)).fetchall()
+    return {r["s3_key"]: {"company_id": r["company_id"], "site_id": r["site_id"],
+                          "user_id": r["user_id"]} for r in rows}
+
+
+def site_companies_for_folder_days(conn, pairs) -> dict:
+    """{(folder, day): {"sites": {site_id: company_id}, "siteless": bool}} for each (folder,
+    'YYYY-MM-DD') that has at least one recording, read through users.folder_name (globally
+    unique). `company_id` is the site's CURRENT company. `siteless` is true when the day also
+    has a recording with no site (it belongs to the recorder's home company). A pair with no
+    recording is absent. The day is taken from the key the same way the other recording
+    queries do (the first /YYYY-MM-DD/ segment)."""
+    pairs = sorted({(f, d) for f, d in (pairs or []) if f and d})
+    if not pairs:
+        return {}
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT DISTINCT p.folder, p.day, r.site_id, s.company_id "
+        "FROM unnest(%s::text[], %s::text[]) AS p(folder, day) "
+        "JOIN users u ON u.folder_name = p.folder "
+        "JOIN recordings r ON r.user_id = u.id "
+        " AND substring(r.s3_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/') = p.day "
+        "LEFT JOIN sites s ON s.id = r.site_id",
+        ([f for f, _ in pairs], [d for _, d in pairs])).fetchall()
+    out = {}
+    for r in rows:
+        e = out.setdefault((r["folder"], r["day"]), {"sites": {}, "siteless": False})
+        if r["site_id"] is None:
+            e["siteless"] = True
+        else:
+            e["sites"][r["site_id"]] = r["company_id"]
+    return out

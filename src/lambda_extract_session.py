@@ -44,6 +44,7 @@ from datetime import datetime, timezone
 from urllib.parse import unquote_plus
 
 import boto3
+from lake_put import lake_put
 
 import agent_turn_filter
 import directory
@@ -2069,9 +2070,9 @@ def extract_group(bucket, artifact):
                               for t in s['turns'] if t.get('speaker')}),
         'extracted_at': datetime.utcnow().isoformat() + 'Z',
     })
-    s3().put_object(Bucket=bucket, Key=artifact['mergedKey'],
-                    Body=json.dumps(merged, ensure_ascii=False),
-                    ContentType='application/json')
+    lake_put(bucket, artifact['mergedKey'],
+             json.dumps(merged, ensure_ascii=False), client=s3(),
+             ContentType='application/json')
     logger.info("group %s: merged %d devices into %s (%d topics)",
                 artifact['groupId'], len(sources), artifact['mergedKey'], len(topics))
     return artifact['mergedKey']
@@ -2571,9 +2572,11 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
         # record, and only one email is sent per recording.
         extraction['incomplete'] = True
 
-    s3().put_object(
-        Bucket=bucket, Key=out_key,
-        Body=json.dumps(extraction, ensure_ascii=False, indent=2),
+    lake_put(
+        bucket, out_key,
+        json.dumps(extraction, ensure_ascii=False, indent=2),
+        client=s3(),
+        owner_hint={"folder": user_folder, "session_base": session_base},
         ContentType='application/json',
     )
     if continuity is not None:
@@ -2606,13 +2609,15 @@ def _record_empty(bucket, user_folder, date, session_base, waited):
     usable speech. Best-effort and logged; then the marker (if any) is cleared, because
     "nothing to extract" is a finished answer, not a failure to retry."""
     try:
-        s3().put_object(
-            Bucket=bucket, Key=extraction_pending.empty_key(session_base),
-            Body=json.dumps({"userFolder": user_folder, "date": date,
-                             "sessionBase": session_base, "reason": "no_usable_speech",
-                             "waited_attempts": waited,
-                             "recorded_at": extraction_pending.iso(
-                                 datetime.now(timezone.utc))}),
+        lake_put(
+            bucket, extraction_pending.empty_key(session_base),
+            json.dumps({"userFolder": user_folder, "date": date,
+                        "sessionBase": session_base, "reason": "no_usable_speech",
+                        "waited_attempts": waited,
+                        "recorded_at": extraction_pending.iso(
+                            datetime.now(timezone.utc))}),
+            client=s3(),
+            owner_hint={"folder": user_folder, "session_base": session_base},
             ContentType='application/json')
     except Exception:
         logger.exception("%s: could not write the extraction_empty record", session_base)
@@ -2673,12 +2678,14 @@ def _request_final_rerun(bucket, user_folder, date, session_base, generation=0,
     if not device_sid:
         return                            # legacy whole-file base: no final pass exists
     try:
-        s3().put_object(
-            Bucket=bucket,
-            Key=f"{FINAL_REQUESTS_PREFIX}{device_sid}.json",
-            Body=json.dumps({"userFolder": user_folder, "date": date,
-                             "sessionBase": session_base,
-                             "generation": generation}),
+        lake_put(
+            bucket,
+            f"{FINAL_REQUESTS_PREFIX}{device_sid}.json",
+            json.dumps({"userFolder": user_folder, "date": date,
+                        "sessionBase": session_base,
+                        "generation": generation}),
+            client=s3(),
+            owner_hint={"folder": user_folder, "session_base": session_base},
             ContentType='application/json',
         )
         logger.info("%s: %s -- requested a re-run over the fuller transcript set "

@@ -52,6 +52,9 @@
 
 ## Controller rulings (binding; override any task text below that disagrees)
 
+Task text below that conflicts with the ledger rulings is superseded.
+Final review I1 supersedes A8 and the "company in key" rows for voiceprint_requests: they are owned by the session they name (NULL when there is none), never by the company in the key.
+
 - **C1 (replaces A6). An external member's work never enters a home-company summary.**
   P3 forbids the home company from seeing work on another company's site, so the
   per-company summary leaves out every folder whose directory entry has

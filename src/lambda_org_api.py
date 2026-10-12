@@ -8,6 +8,8 @@ so the UI's raw idToken works unchanged.
 Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-org-api.md):
   GET   /api/org/me                       → caller profile + accessible site ids
   PATCH /api/org/me                       → update first/last name, avatar key
+  POST  /api/org/companies/{id}/export    → platform_admin: start a company data export (async, LakeOps; 202 exportId)
+  GET   /api/org/companies/{id}/export/{export_id} → platform_admin: export status + 15-minute presigned part URLs
   GET   /api/org/sites                    → sites visible to caller (ACL)
   POST  /api/org/sites                    → create site (admin/gm)
   GET   /api/org/members                  → company members + memberships (admin/gm)
@@ -168,6 +170,10 @@ from repositories import (action_items, aliases, chunks, classification_feedback
                           sites, threads, topic_questions, topics, users,
                           voice_messages,
                           voiceprints)
+from repositories import lake_objects
+import lake_keys
+import lake_owner
+import company_export
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import (diff_candidates, first_match_span, learned_pairs, normalize,
                             occurrences)
@@ -385,6 +391,11 @@ COLLAPSE_PHOTOS_TASK = "collapse_multibound_photos"
 REBIND_DAY_TASK = "rebind_day_photos"
 RESTORE_MARKERS_TASK = "restore_day_markers"
 BACKFILL_LEGACY_TICKS_TASK = "backfill_legacy_ticks"
+DRAIN_LAKE_MANIFEST_TASK = "drain_lake_manifest"
+BACKFILL_LAKE_OBJECTS_TASK = "backfill_lake_objects"
+EXPORT_COMPANY_TASK = "export_company"
+EXPORT_TICK_TASK = "export_tick"
+EXPORT_REQUEST_PREFIX = "export_requests/"
 
 
 def lambda_handler(event, context):
@@ -398,6 +409,44 @@ def lambda_handler(event, context):
     if isinstance(event, dict) and event.get("task") == REPUBLISH_DIRECTORY_TASK:
         with get_connection() as conn:
             return republish_directory(conn, dry_run=event.get("dry_run") is True)
+    # OPERATOR TASK (lake ownership): turns lake_manifest/ lines into lake_objects rows.
+    # Same envelope rule as above: no API caller can reach it. Unlike the other operator
+    # tasks it runs for real by default: it is idempotent and deletes a manifest object only
+    # after its rows are committed. {"dry_run": true} writes and deletes nothing. It lists
+    # lake_manifest/ in S3 FIRST and opens no database connection when there is nothing to
+    # drain (so an hourly schedule lets Aurora auto-pause); otherwise it loops until its time
+    # budget is spent and reports `more`.
+    if isinstance(event, dict) and event.get("task") == DRAIN_LAKE_MANIFEST_TASK:
+        return drain_lake_manifest_run(event, context)
+    # OPERATOR TASK (lake ownership): walks the bucket once and records an owner for every
+    # object. A DRY RUN unless "apply" is exactly true or "dry_run" is exactly false (a typo
+    # or a string must not write; if the two disagree, the dry run wins). Tagging needs
+    # "tag": true AND a write. Returns next_start_after: re-invoke with it to resume.
+    # Also runs on LakeOps (longer timeout) by a direct invoke.
+    if isinstance(event, dict) and event.get("task") == BACKFILL_LAKE_OBJECTS_TASK:
+        write = ((event.get("apply") is True or event.get("dry_run") is False)
+                 and event.get("dry_run") is not True)
+        budget = event.get("time_budget_s")
+        if isinstance(budget, bool) or not isinstance(budget, (int, float)):
+            budget = 780
+        bucket = event.get("bucket")
+        with get_connection() as conn:
+            return backfill_lake_objects(
+                conn, s3(), apply=write, tag=event.get("tag") is True,
+                buckets=[bucket] if bucket else event.get("buckets"),
+                prefixes=event.get("prefixes"), start_bucket=event.get("start_bucket"),
+                start_after=event.get("start_after"), time_budget_s=budget)
+    # OPERATOR TASK (lake ownership): streams one company's lake objects into ZIP parts under
+    # exports/{company_id}/{export_id}/. Same envelope rule as above (no API caller reaches
+    # it). Meant for LakeOpsFunction (long timeout). One call runs one time budget and returns
+    # next_cursor; the scheduled export_tick below is what resumes exports in production.
+    if isinstance(event, dict) and event.get("task") == EXPORT_COMPANY_TASK:
+        return export_company_task(event, context)
+    # SCHEDULED (LakeOps, rate(10 minutes)): picks up export_requests/ left by the route. It
+    # lists S3 FIRST and opens no database connection unless there is work, so an idle tick
+    # lets Aurora auto-pause. Deliberately dispatched before any get_connection().
+    if isinstance(event, dict) and event.get("task") == EXPORT_TICK_TASK:
+        return export_tick(event, context)
     # OPERATOR TASK, invoked by hand with `aws lambda invoke` (IAM decides who
     # may). The same envelope rule as above keeps it out of reach of the API.
     # A dry run unless "apply" is exactly true: a typo must not write.
@@ -544,6 +593,13 @@ def dispatch(conn, event, method, route):
     m_co = re.match(r"^/companies/([^/]+)$", route)
     if m_co and method == "PATCH":
         return patch_org_company(conn, caller, m_co.group(1), parse_body(event))
+
+    m_cx = re.match(r"^/companies/([^/]+)/export$", route)
+    if m_cx and method == "POST":
+        return start_company_export(conn, caller, m_cx.group(1))
+    m_cxs = re.match(r"^/companies/([^/]+)/export/([^/]+)$", route)
+    if m_cxs and method == "GET":
+        return company_export_status(conn, caller, m_cxs.group(1), m_cxs.group(2))
 
     if route == "/members":
         if method == "GET":
@@ -987,6 +1043,56 @@ def _capture_company_id(caller, site):
     return site["company_id"] if site else caller["company_id"]
 
 
+def _lake_company_for_sites(conn, site_ids):
+    """Owner company for a lake row whose request names site(s), or None when uncertain
+    (ruling R2a: never the caller's company as a guess). Certain = every named site resolves
+    and they all belong to ONE company. Savepointed: a failed lookup yields None."""
+    ids = {str(x) for x in (site_ids or []) if x}
+    if not ids:
+        return None
+    try:
+        with conn.transaction():
+            found = [sites.get_site(conn, i) for i in sorted(ids)]
+    except Exception:  # noqa: BLE001
+        logger.warning("lake_objects: site lookup failed; recording no company", exc_info=True)
+        return None
+    if any(f is None for f in found):
+        return None
+    owners = {str(f["company_id"]) for f in found}
+    return next(iter(owners)) if len(owners) == 1 else None
+
+
+def _lake_user_for_folder(conn, folder):
+    """The user who owns `folder` (the person a request is made FOR), or None when unknown.
+    A lake row's user_id is the folder owner, never the caller who clicked (M5). Savepointed:
+    a failed lookup yields None."""
+    if not folder:
+        return None
+    try:
+        with conn.transaction():
+            row = users.get_by_folder_name_global(conn, folder)
+    except Exception:  # noqa: BLE001
+        logger.warning("lake_objects: folder owner lookup failed; recording no user",
+                       exc_info=True)
+        return None
+    return row["id"] if row else None
+
+
+def _lake_company_for_session(conn, folder, date, session_base):
+    """Owner company of a session-level lake row: the company of the one site the session
+    lies on, else None (no site, several companies, unknown session or a failed lookup).
+    Never the caller's company (R2a). Savepointed."""
+    try:
+        with conn.transaction():
+            owners = {str(c) for _s, c in recordings.session_site_companies(
+                conn, folder, date, session_base)}
+    except Exception:  # noqa: BLE001
+        logger.warning("lake_objects: session site lookup failed; recording no company",
+                       exc_info=True)
+        return None
+    return next(iter(owners)) if len(owners) == 1 else None
+
+
 def create_recording_upload_url(conn, caller, body, device_ident=None):
     if body is None:
         return error("malformed JSON body", 400)
@@ -1055,6 +1161,13 @@ def create_recording_upload_url(conn, caller, body, device_ident=None):
 
     _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id,
                              _capture_company_id(caller, site))
+
+    # Index who owns this key. Best effort in a savepoint: the route is synchronous with no
+    # retry (BUG-43), so this can neither fail nor abort the upload. A resend re-records the
+    # same key (an idempotent upsert).
+    lake_objects.record_best_effort(
+        conn, key, company_id=_capture_company_id(caller, site),
+        site_id=site_id or None, user_id=caller["id"], source="upload")
 
     url = s3().generate_presigned_url(
         "put_object",
@@ -1722,6 +1835,9 @@ def regenerate_own_report(conn, caller, body):
     s3().put_object(Bucket=LAKE_BUCKET, Key=request_key,
                     Body=json.dumps(artifact, default=str),
                     ContentType="application/json")
+    # A folder/day/range request can span sites of several companies: owner unknown here (R2a).
+    lake_objects.record_best_effort(conn, request_key, company_id=None,
+                                    user_id=_lake_user_for_folder(conn, folder), source="upload")
     return ok({"status": "queued", "requestId": request_id,
                "report_type": report_type, "folder": folder}, 202)
 
@@ -1814,6 +1930,12 @@ def session_report_generate(conn, caller, session_id, event):
     s3().put_object(Bucket=LAKE_BUCKET, Key=request_key,
                     Body=json.dumps(artifact, default=str),
                     ContentType="application/json")
+    owner = _lake_company_for_session(conn, folder, date, session_id)
+    for lake_key in (request_key, result_key):
+        lake_objects.record_best_effort(
+            conn, lake_key, company_id=owner,
+            site_id=(content.get("siteId") if owner else None),
+            user_id=_lake_user_for_folder(conn, folder), source="upload")
     return ok({"status": "queued", "sessionId": session_id,
                "requestId": request_id, "resultKey": result_key}, 202)
 
@@ -2127,6 +2249,13 @@ def day_report_generate(conn, caller, date, event):
     s3().put_object(Bucket=LAKE_BUCKET, Key=request_key,
                     Body=json.dumps(artifact, default=str),
                     ContentType="application/json")
+    day_sites = content.get("siteIds") or []
+    owner = _lake_company_for_sites(conn, day_sites)
+    one_site = (str(day_sites[0]) if owner and len({str(x) for x in day_sites}) == 1
+                else None)
+    for lake_key in (request_key, result_key):
+        lake_objects.record_best_effort(conn, lake_key, company_id=owner, site_id=one_site,
+                                        user_id=_lake_user_for_folder(conn, folder), source="upload")
     return ok({"status": "queued", "scope": "day", "date": date,
                "requestId": request_id, "resultKey": result_key}, 202)
 
@@ -2561,13 +2690,17 @@ def speaker_match(conn, caller, session_base, event):
     label_map = _label_map(turns)
     site = _site_for_session(conn, company_id, folder, date_m.group(1), session_base)
     runs = _split_for_budget(turns)
+    # The key prefix keeps the caller's company; the lake row records the session's site
+    # company, or none when that is not certain (R2a).
+    match_owner = _lake_company_for_session(conn, folder, date_m.group(1), session_key)
     request_ids = []
     for i, group in enumerate(runs):
         request_id = uuid.uuid4().hex
         request_ids.append(request_id)
+        match_key = f"voiceprint_requests/{company_id}/{session_base}/match-{request_id}.json"
         s3().put_object(
             Bucket=LAKE_BUCKET,
-            Key=f"voiceprint_requests/{company_id}/{session_base}/match-{request_id}.json",
+            Key=match_key,
             Body=json.dumps({"op": "match", "request_id": request_id,
                              "session_base": session_key, "company_id": company_id,
                              "user_folder": folder, "date": date_m.group(1),
@@ -2587,6 +2720,10 @@ def speaker_match(conn, caller, session_base, event):
                              # removes the dependence on where the split fell.
                              "label_map": label_map}, default=str),
             ContentType="application/json")
+        lake_objects.record_best_effort(
+            conn, match_key, company_id=match_owner,
+            site_id=str(site["id"]) if (site and match_owner) else None,
+            user_id=_lake_user_for_folder(conn, folder), source="upload")
     logger.info("speaker match queued: session=%s mode=%s turns=%d runs=%d",
                 session_key, SPEAKER_IDENTITY_MODE, len(turns), len(runs))
     return ok({"requestIds": request_ids, "sessionBase": session_key,
@@ -3562,10 +3699,15 @@ def speaker_corrections(conn, caller, session_base, event):
         "label_map": _label_map(session_turns),
         "enrol": enrol,
     }
+    correction_key = f"voiceprint_requests/{company_id}/{session_base}/{request_id}.json"
     s3().put_object(Bucket=LAKE_BUCKET,
-                    Key=f"voiceprint_requests/{company_id}/{session_base}/{request_id}.json",
+                    Key=correction_key,
                     Body=json.dumps(artifact, default=str),
                     ContentType="application/json")
+    lake_objects.record_best_effort(
+        conn, correction_key,
+        company_id=_lake_company_for_session(conn, folder, date_m.group(1), session_key),
+        user_id=_lake_user_for_folder(conn, folder), source="upload")
     logger.info("speaker correction queued: session=%s mode=%s turns=%d",
                 session_base, SPEAKER_IDENTITY_MODE, len(artifact["turns"]))
     return ok({
@@ -4030,6 +4172,10 @@ def put_photo_selection(conn, caller, date, event):
                     Body=json.dumps({"excluded": excluded, "updatedBy": str(caller["id"]),
                                      "updatedAt": nz_time.nz_now().isoformat()}).encode(),
                     ContentType="application/json")
+    # Day-level document of one folder: the day may span companies, so unknown (R2a).
+    lake_objects.record_best_effort(
+        conn, report_photos.selection_key(folder, date), company_id=None,
+        user_id=_lake_user_for_folder(conn, folder), source="upload")
     return ok(_photo_selection_body(conn, caller, folder, date, set(excluded)))
 
 
@@ -4261,6 +4407,10 @@ def session_expedite(conn, caller, session_id):
             # boto3 older than conditional writes: last-writer-wins.
             s3().put_object(Bucket=LAKE_BUCKET, Key=key, Body=body,
                             ContentType="application/json")
+        lake_objects.record_best_effort(
+            conn, key,
+            company_id=_lake_company_for_session(conn, folder, m.get("date"), base),
+            user_id=_lake_user_for_folder(conn, folder), source="upload")
         return ok({"ok": True, "expedited_at": stamp})
     return error("marker changed while expediting, try again", 409)
 
@@ -4382,6 +4532,10 @@ def create_voice_upload_url(conn, caller, body):
     if str(site_id) not in _allowed_site_ids(conn, caller):
         return error("site not accessible", 403)
     key = _voice_s3_key(caller["company_id"], site_id, caller["id"], ext)
+    # A8: a voice clip belongs to the SITE's company (the key prefix keeps the caller's).
+    lake_objects.record_best_effort(
+        conn, key, company_id=_lake_company_for_sites(conn, [site_id]),
+        site_id=site_id, user_id=caller["id"], source="upload")
     # NOTE: no voice_messages insert here — sendVoice (Task 6) is the sole writer
     # of the row (created when the clip is actually sent). An abandoned recording
     # thus leaves at most an orphan S3 object, reaped by the 30-day voice/ lifecycle.
@@ -4976,6 +5130,19 @@ def patch_org_site(conn, caller, site_id, body):
             # coordinate edit is committed.
             conn.rollback()
             return error("site not found in your company", 404)
+        # Lake ownership: the site's objects follow it, in THIS transaction and with no S3
+        # call (reassign_site runs in its own savepoint and swallows only a missing table, so
+        # a deploy that is a minute ahead of migration 0087 still moves the site). Any other
+        # failure must not commit the move: company A would keep seeing company B's data.
+        try:
+            moved = lake_objects.reassign_site(conn, site_id, move_to)
+        except Exception:  # noqa: BLE001 -- roll the whole move back, then say so
+            logger.exception("site %s move to company %s: lake object re-own failed; "
+                             "move rolled back", site_id, move_to)
+            conn.rollback()
+            return error("could not move the site's data; nothing was changed", 500)
+        logger.info("site %s moved to company %s: %d lake object(s) re-owned",
+                    site_id, move_to, moved)
     if final_icon is not None:
         old_icon = row.get("icon_s3_key")
         row = sites.set_site_icon(conn, site_id, final_icon)
@@ -5109,6 +5276,645 @@ def republish_directory(conn, dry_run=False):
                 "wrote" if changed else "found nothing to change",
                 len(doc["people"]), len(doc["sites"]))
     return {"changed": changed, "people": len(doc["people"]), "sites": len(doc["sites"])}
+
+
+_MANIFEST_PREFIX = "lake_manifest/"
+
+
+def _parse_manifest_object(body):
+    """(lines, malformed) from one manifest object. A line is kept only when it is a JSON
+    object of version 1 with a non-empty string key; anything else is malformed."""
+    lines, malformed = [], 0
+    try:
+        text = body.decode("utf-8")
+    except (UnicodeDecodeError, AttributeError):
+        return [], 1
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        try:
+            line = json.loads(raw)
+        except ValueError:
+            malformed += 1
+            continue
+        if (not isinstance(line, dict) or line.get("v") != 1
+                or not isinstance(line.get("key"), str) or not line["key"]):
+            malformed += 1
+            continue
+        lines.append(line)
+    return lines, malformed
+
+
+def _list_manifest_objects(s3_client, bucket, limit):
+    """Up to `limit` (bucket, key) pairs under lake_manifest/, paginated."""
+    out, token = [], None
+    while len(out) < limit:
+        kw = {"Bucket": bucket, "Prefix": _MANIFEST_PREFIX, "MaxKeys": min(1000, limit - len(out))}
+        if token:
+            kw["ContinuationToken"] = token
+        resp = s3_client.list_objects_v2(**kw)
+        out.extend((bucket, o["Key"]) for o in resp.get("Contents") or []
+                   if o["Key"] != _MANIFEST_PREFIX)
+        token = resp.get("NextContinuationToken")
+        if not resp.get("IsTruncated") or not token:
+            break
+    return out[:limit]
+
+
+DRAIN_TIME_BUDGET_S = 780          # LakeOps has a 900 s timeout
+DRAIN_BATCH_OBJECTS = 500
+EXPORT_TICK_BUDGET_S = 480         # under the 10-minute rate: no tick outlives its successor
+_DRAIN_LISTS = ("conflict_sample", "unresolved_sample")
+
+
+def drain_lake_manifest_run(event, context=None):
+    """The scheduled/operator entry for the drain: S3 first, then passes until the time budget.
+
+    Lists lake_manifest/ before anything else and returns with NO database connection when it
+    is empty (the same pattern as export_tick), so an hourly schedule does not keep Aurora
+    awake. Otherwise one connection runs drain_lake_manifest passes of `max_objects` (default
+    500) until no manifest is left or the budget is spent. The budget is event.time_budget_s
+    (default 780), cut to the Lambda's remaining time minus a 90 s margin when the context says.
+    A pass that deleted nothing ends the loop (what is left is kept for a reason; spinning
+    would not change it). `more` is True when manifests may remain."""
+    dry_run = event.get("dry_run") is True
+    batch = max(1, int(event.get("max_objects") or DRAIN_BATCH_OBJECTS))
+    budget = event.get("time_budget_s")
+    if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0:
+        budget = DRAIN_TIME_BUDGET_S
+    remaining = getattr(context, "get_remaining_time_in_millis", None)
+    if callable(remaining):
+        budget = max(1, min(budget, int(remaining() / 1000) - 90))
+    started = time.monotonic()
+    s3_client = s3()
+    names = event.get("buckets")
+    names = names if names is not None else [S3_BUCKET, LAKE_BUCKET]
+    names = list(dict.fromkeys(b for b in names if b))
+    found = False
+    for b in names:
+        try:
+            if _list_manifest_objects(s3_client, b, 1):
+                found = True
+                break
+        except Exception:  # noqa: BLE001 - one unreadable bucket must not stop the other
+            logger.warning("lake drain: cannot list %s", b, exc_info=True)
+    if not found:
+        return {"manifests": 0, "lines": 0, "upserted": 0, "deleted_manifests": 0,
+                "dry_run": dry_run, "more": False, "passes": 0}
+    total, passes, longest, more = {}, 0, 0.0, False
+    with get_connection() as conn:
+        while True:
+            t0 = time.monotonic()
+            out = drain_lake_manifest(conn, s3_client, dry_run=dry_run, max_objects=batch,
+                                      buckets=event.get("buckets"))
+            longest = max(longest, time.monotonic() - t0)
+            passes += 1
+            for k, v in out.items():
+                if isinstance(v, bool):
+                    total[k] = bool(total.get(k)) or v
+                elif isinstance(v, int):
+                    total[k] = total.get(k, 0) + v
+                elif k in _DRAIN_LISTS:
+                    total[k] = (total.get(k, []) + list(v))[:50]
+            full = out.get("manifests", 0) >= batch
+            if dry_run or out.get("table_missing") or not full or not out.get("deleted_manifests"):
+                more = full and not dry_run and not out.get("table_missing")
+                break
+            if (time.monotonic() - started) + 1.5 * longest >= budget:
+                more = True
+                break
+    total.setdefault("dry_run", dry_run)
+    total["more"] = more
+    total["passes"] = passes
+    return total
+
+
+def drain_lake_manifest(conn, s3_client, *, dry_run=False, max_objects=500, buckets=None):
+    """Read lake_manifest/ lines (written by lake_put) and upsert them into lake_objects.
+
+    Safety contract (Review Focus 1): a manifest object is deleted ONLY after every one of its
+    lines was upserted (or deliberately skipped) AND `conn.commit()` returned. It is kept when
+    a line is malformed, its upsert failed, the table is missing, or the delete itself failed.
+    Idempotent: a re-run upserts the same rows (the repository guard counts none as changed).
+    Lines of global / lake-wide keys are counted in `skipped` and never get a row (R5b);
+    keys of an unknown shape get a NULL-company row (`unknown_shape`, R5f). unresolved,
+    unknown_shape and split_day count unique keys; `lines` counts valid lines.
+    dry_run resolves and counts but writes and deletes nothing; `upserted` is then the number
+    of rows that WOULD be written (not net of unchanged rows)."""
+    out = {"manifests": 0, "lines": 0, "upserted": 0, "unresolved": 0, "unknown_shape": 0,
+           "split_day": 0, "conflict": 0, "conflict_sample": [], "skipped": 0, "malformed": 0, "deleted_manifests": 0, "kept": 0,
+           "table_missing": False, "dry_run": bool(dry_run), "unresolved_sample": []}
+    names = buckets if buckets is not None else [S3_BUCKET, LAKE_BUCKET]
+    names = list(dict.fromkeys(b for b in names if b))
+    budget = max(1, int(max_objects))
+    found = []
+    for b in names:
+        if len(found) >= budget:
+            break
+        try:
+            found.extend(_list_manifest_objects(s3_client, b, budget - len(found)))
+        except Exception:  # noqa: BLE001 - one unreadable bucket must not stop the other
+            logger.warning("lake drain: cannot list %s", b, exc_info=True)
+
+    objects = []  # {bucket, key, lines, bad}; an object that cannot be read is only counted
+    unread = 0
+    for bucket, mkey in found:
+        out["manifests"] += 1
+        try:
+            body = s3_client.get_object(Bucket=bucket, Key=mkey)["Body"].read()
+        except Exception:  # noqa: BLE001
+            logger.warning("lake drain: cannot read %s", mkey, exc_info=True)
+            unread += 1
+            continue
+        lines, bad = _parse_manifest_object(body)
+        out["lines"] += len(lines)
+        out["malformed"] += bad
+        objects.append({"bucket": bucket, "key": mkey, "lines": lines, "bad": bad})
+
+    merged = {}  # one resolution per key from its NEWEST line (by "t", else manifest order)
+    for ob in objects:
+        for ln in ob["lines"]:
+            cur = merged.get(ln["key"])
+            t = ln.get("t") if isinstance(ln.get("t"), str) else None
+            if cur is not None and t is not None and cur["t"] is not None and t < cur["t"]:
+                continue  # an older line never overrides a newer one
+            size = ln.get("size")
+            merged[ln["key"]] = {
+                "hint": ln["hint"] if isinstance(ln.get("hint"), dict) else {},
+                "size": size if isinstance(size, int) and not isinstance(size, bool) else None,
+                "t": t}
+    owners = lake_owner.Resolver(conn).resolve_many(
+        [(k, v["hint"]) for k, v in merged.items()])
+
+    rows = {}
+    for k, o in owners.items():
+        if o["scope"] in ("global", "lake_wide"):
+            out["skipped"] += 1
+            continue
+        if o["scope"] == "unknown":
+            out["unknown_shape"] += 1
+        elif o["company_id"] is None:
+            out["split_day" if o["reason"] == "split_day" else "unresolved"] += 1
+        if o["company_id"] is None and len(out["unresolved_sample"]) < 20:
+            out["unresolved_sample"].append({"key": k, "reason": o["reason"]})
+        rows[k] = {"key": k, "company_id": o["company_id"], "site_id": o["site_id"],
+                   "user_id": o["user_id"], "kind": o["kind"], "folder": o["folder"],
+                   "day": o["day"], "session_base": o["session_base"],
+                   "size_bytes": merged[k]["size"], "source": "manifest", "why": o["reason"],
+                   "object_modified_at": _parse_iso(merged[k]["t"]),
+                   "reason": None if o["company_id"] else o["reason"]}
+
+    if dry_run:
+        out["upserted"] = len(rows)
+        out["kept"] = unread + len(objects)
+        return out
+
+    deletable = []
+    seen_conflicts = set()
+    kept = unread
+    for ob in objects:
+        mine = [rows[ln["key"]] for ln in ob["lines"] if ln["key"] in rows]
+        n = 0
+        if mine:
+            try:
+                with conn.transaction():
+                    clash = lake_objects.conflicts(conn, mine)   # R7e: skipped by the upsert
+                    n = lake_objects.upsert_many(conn, mine, on_missing=None)
+            except Exception:  # noqa: BLE001 - this object stays; the others carry on
+                logger.warning("lake drain: upsert failed for %s", ob["key"], exc_info=True)
+                kept += 1
+                continue
+            if n is None:
+                out["table_missing"] = True
+                break
+        for c in clash if mine else ():
+            if c["key"] not in seen_conflicts:
+                seen_conflicts.add(c["key"])
+                out["conflict"] += 1
+                if len(out["conflict_sample"]) < 50:
+                    out["conflict_sample"].append(c)
+        out["upserted"] += n or 0
+        if ob["bad"]:
+            kept += 1
+        else:
+            deletable.append(ob)
+    if out["table_missing"]:
+        out["kept"] = unread + len(objects)  # nothing is deleted without the table
+        return out
+    conn.commit()  # rows are durable BEFORE any manifest object is deleted
+
+    by_bucket = {}
+    for ob in deletable:
+        by_bucket.setdefault(ob["bucket"], []).append(ob["key"])
+    for bucket, keys in by_bucket.items():
+        for i in range(0, len(keys), 1000):
+            chunk = keys[i:i + 1000]
+            try:
+                resp = s3_client.delete_objects(
+                    Bucket=bucket, Delete={"Objects": [{"Key": k} for k in chunk], "Quiet": True})
+                failed = len((resp or {}).get("Errors") or [])
+            except Exception:  # noqa: BLE001 - rows are committed; the next run re-upserts
+                logger.warning("lake drain: delete failed for %d object(s)", len(chunk),
+                               exc_info=True)
+                failed = len(chunk)
+            out["deleted_manifests"] += len(chunk) - failed
+            kept += failed
+    out["kept"] = kept
+    return out
+
+
+def _parse_iso(t):
+    """A manifest line's `t` as an aware datetime, or None when absent/unparseable."""
+    if not isinstance(t, str):
+        return None
+    try:
+        d = datetime.fromisoformat(t.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def _backfill_pages(s3_client, bucket, prefixes, start_after, page_size):
+    """Yield pages of (key, size, last_modified) of one bucket in global key order. `start_after` is a key in
+    this bucket (None = from the beginning). With prefixes (sorted), a prefix whose whole range
+    lies before the cursor is skipped, so the cursor stays one monotone key."""
+    kept = []                           # overlapping prefixes (a/ and a/b/) would list twice
+    for pf in sorted(set(prefixes or [""])):
+        if not any(pf.startswith(q) for q in kept):
+            kept.append(pf)
+    for prefix in kept:
+        sa = start_after
+        if sa is not None and sa > prefix and not sa.startswith(prefix):
+            continue                    # this prefix is entirely behind the cursor
+        if sa is not None and sa < prefix:
+            sa = None                   # the cursor is before this prefix: start at its head
+        token = None
+        while True:
+            kw = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": page_size}
+            if token:
+                kw["ContinuationToken"] = token
+            elif sa:
+                kw["StartAfter"] = sa
+            resp = s3_client.list_objects_v2(**kw)
+            page = [(o["Key"], o.get("Size"), o.get("LastModified")) for o in resp.get("Contents") or []]
+            if page:
+                yield page
+            token = resp.get("NextContinuationToken")
+            if not resp.get("IsTruncated") or not token:
+                break
+
+
+def _canon_uuid_or_none(value):
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _export_company_or_error(conn, caller, company_id):
+    """Shared gate of the export routes. (canonical company id, None) or (None, error response).
+
+    platform_admin ONLY: an export is a whole company's data and crosses the caller's-company
+    boundary every other route enforces, so admin and gm get 403 as well. An id that is not a
+    UUID or names no company is 404 (never a database error)."""
+    if caller.get("global_role") != "platform_admin":
+        return None, error("platform_admin role required", 403)
+    cid = _canon_uuid_or_none(company_id)
+    if cid is None or companies.get_company_by_id(conn, cid) is None:
+        return None, error("company not found", 404)
+    return cid, None
+
+
+def start_company_export(conn, caller, company_id):
+    """POST /companies/{id}/export -- ask for an asynchronous export of one company's lake data.
+
+    Writes export_requests/{company_id}/{export_id}.json through the S3 gateway endpoint and
+    returns 202. It invokes nothing: in-VPC org-api has no route to the Lambda API (no NAT, no
+    endpoint). LakeOps picks the request up on its next export_tick. The export id is minted
+    here (a uuid), so the caller can poll before the first part exists."""
+    cid, err = _export_company_or_error(conn, caller, company_id)
+    if err:
+        return err
+    export_id = str(uuid.uuid4())
+    request = {"company_id": cid, "export_id": export_id, "requested_by": caller.get("id"),
+               "requested_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        s3().put_object(Bucket=_export_bucket_for("exports"),
+                        Key=f"{EXPORT_REQUEST_PREFIX}{cid}/{export_id}.json",
+                        Body=json.dumps(request).encode("utf-8"),
+                        ContentType="application/json")
+    except Exception:
+        logger.exception("company export: could not write the request for company %s", cid)
+        return error("could not start the export", 502)
+    logger.info("company export started: company=%s export=%s by user=%s",
+                cid, export_id, caller.get("id"))
+    return ok({"exportId": export_id, "companyId": cid}, 202)
+
+
+def _read_export_doc(key):
+    """The JSON object at an export key, or None when absent. Other errors raise."""
+    try:
+        body = s3().get_object(Bucket=_export_bucket_for("exports"), Key=key)["Body"].read()
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in ("NoSuchKey", "404", "NotFound"):
+            return None
+        raise
+    return json.loads(body)
+
+
+def company_export_status(conn, caller, company_id, export_id):
+    """GET /companies/{id}/export/{export_id} -- progress, and once done presigned GET URLs
+    (15 minutes) for each part and the manifest.
+
+    export_id must be a uuid (else 400) and is re-rendered from the parsed value, so nothing
+    that can escape exports/{company_id}/{export_id}/ ever reaches a key. Only keys under
+    that prefix are presigned; a manifest naming anything else is ignored."""
+    cid, err = _export_company_or_error(conn, caller, company_id)
+    if err:
+        return err
+    eid = _canon_uuid_or_none(export_id)
+    if eid is None:
+        return error("export id must be a uuid", 400)
+    prefix = company_export.export_prefix(cid, eid)
+
+    def presign(key):
+        if not key.startswith(prefix) or ".." in key[len(prefix):] or "/" in key[len(prefix):]:
+            return None
+        return s3().generate_presigned_url(
+            "get_object", Params={"Bucket": _export_bucket_for("exports"), "Key": key},
+            ExpiresIn=PRESIGNED_URL_EXPIRY)
+
+    manifest = _read_export_doc(prefix + "manifest.json")
+    if manifest is not None and manifest.get("company_id") != cid:
+        return error("export not found (or not started yet)", 404)
+    if manifest is not None:
+        parts = []
+        for p in manifest.get("parts") or []:
+            url = presign(str(p.get("key", "")))
+            if url:
+                parts.append({"key": p["key"], "objects": p.get("objects"),
+                              "bytes": p.get("bytes"), "url": url})
+        return ok({"exportId": eid, "companyId": cid, "status": "done", "done": True,
+                   "parts": parts, "objects": len(manifest.get("objects") or []),
+                   "excluded": manifest.get("excluded") or {},
+                   "manifest": {"key": prefix + "manifest.json",
+                                "url": presign(prefix + "manifest.json")},
+                   "expiresIn": PRESIGNED_URL_EXPIRY})
+    state = _read_export_doc(prefix + "state.json")
+    if state is not None and state.get("company_id") != cid:
+        return error("export not found (or not started yet)", 404)
+    if state is not None:
+        return ok({"exportId": eid, "companyId": cid, "status": "running", "done": False,
+                   "partsWritten": len(state.get("parts") or []),
+                   "objects": len(state.get("entries") or [])})
+    return error("export not found (or not started yet)", 404)
+
+
+def _export_bucket_for(kind):
+    """Which bucket holds objects of this kind. The lake bucket, except the deletion mirror
+    (written to S3_BUCKET by delete_recordings_endpoint). `exports` is where results go."""
+    if kind == "redaction":
+        return S3_BUCKET or LAKE_BUCKET
+    return LAKE_BUCKET or S3_BUCKET
+
+
+def _export_alt_bucket_for(kind):
+    """The other configured bucket, to try once when a key is NoSuchKey in the chosen one (on
+    TEST the pipeline writes to DataBucketName and org-api to the ingest bucket; prod is one
+    bucket and this is None there). Never returns the chosen bucket."""
+    chosen = _export_bucket_for(kind)
+    for b in (LAKE_BUCKET, S3_BUCKET):
+        if b and b != chosen:
+            return b
+    return None
+
+
+def export_company_task(event, context=None):
+    """Run one time budget of export_company and return the result (next_cursor if not done).
+
+    Event: {"task", "company_id", "export_id"?, "cursor"?, "time_budget_s"?, "part_bytes"?}.
+    No self-chaining: the scheduled export_tick resumes unfinished exports from their saved state.
+    """
+    budget = event.get("time_budget_s")
+    if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0:
+        budget = company_export.DEFAULT_TIME_BUDGET_S
+    part_bytes = event.get("part_bytes")
+    if isinstance(part_bytes, bool) or not isinstance(part_bytes, int) or part_bytes <= 0:
+        part_bytes = company_export.DEFAULT_PART_BYTES
+    try:
+        with get_connection() as conn:
+            return company_export.run(
+                conn, s3(), event.get("company_id"), bucket_for=_export_bucket_for, alt_bucket_for=_export_alt_bucket_for,
+                export_id=event.get("export_id"), cursor=event.get("cursor"),
+                time_budget_s=budget, part_bytes=part_bytes,
+                dest_bucket=_export_bucket_for("exports"))
+    except (ValueError, company_export.ExportError) as exc:
+        return {"error": str(exc)}
+
+
+def _delete_export_request(s3_client, bucket, key):
+    try:
+        s3_client.delete_object(Bucket=bucket, Key=key)
+    except Exception:  # noqa: BLE001 - it is retried, harmlessly, on the next tick
+        logger.exception("export_tick: could not delete %s", key)
+
+
+def export_tick(event, context=None):
+    """Advance ONE pending company export by one time budget.
+
+    S3 only until there is work: list export_requests/ first and return with no database
+    connection when it is empty (an idle tick must not keep Aurora awake). Per request: the key
+    path is the authority, so a body whose company_id/export_id disagree with it is logged and
+    skipped (nothing deleted). A request whose state.json says done is deleted without running.
+    The first unfinished one runs with the remaining Lambda time; the request is deleted only
+    once the run reports done. One export per tick."""
+    s3_client = s3()
+    bucket = _export_bucket_for("exports")
+    keys = []
+    for page in s3_client.get_paginator("list_objects_v2").paginate(
+            Bucket=bucket, Prefix=EXPORT_REQUEST_PREFIX):
+        keys.extend(o["Key"] for o in page.get("Contents") or [])
+    keys = sorted(k for k in keys if k.endswith(".json"))
+    if not keys:
+        return {"requests": 0, "ran": None}
+    # min(480 s, remaining - 30 s): the run may overshoot its budget by one part, and no tick
+    # may still be running when the next one starts (rate 10 minutes), or two ticks copy the
+    # same part and one loses the state.json race.
+    budget = EXPORT_TICK_BUDGET_S
+    remaining = getattr(context, "get_remaining_time_in_millis", None)
+    if callable(remaining):
+        budget = max(1, min(budget, int(remaining() / 1000) - 30))
+    skipped, finished = 0, 0
+    for key in keys:
+        parts = key[len(EXPORT_REQUEST_PREFIX):-len(".json")].split("/")
+        try:
+            if len(parts) != 2:
+                raise ValueError("unexpected key shape")
+            cid = company_export._canon_uuid(parts[0], "company_id")
+            eid = company_export._canon_uuid(parts[1], "export_id")
+            doc = json.loads(s3_client.get_object(Bucket=bucket, Key=key)["Body"].read())
+            if doc.get("company_id") != cid or doc.get("export_id") != eid:
+                raise ValueError("request body does not match its key")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("export_tick: skipping %s: %s", key, exc)
+            skipped += 1
+            continue
+        state, _ = company_export._read_state(
+            s3_client, bucket, company_export.export_prefix(cid, eid) + "state.json")
+        if state is not None and state.get("done"):
+            _delete_export_request(s3_client, bucket, key)
+            finished += 1
+            continue
+        try:
+            with get_connection() as conn:
+                out = company_export.run(
+                    conn, s3_client, cid, bucket_for=_export_bucket_for, alt_bucket_for=_export_alt_bucket_for, export_id=eid,
+                    time_budget_s=budget, dest_bucket=bucket)
+        except (ValueError, company_export.ExportError) as exc:
+            logger.warning("export_tick: export %s failed: %s", key, exc)
+            return {"requests": len(keys), "ran": key, "error": str(exc)}
+        if out.get("done"):
+            _delete_export_request(s3_client, bucket, key)
+        return {"requests": len(keys), "ran": key, "done": bool(out.get("done")),
+                "skipped": skipped, "finished_without_running": finished}
+    return {"requests": len(keys), "ran": None, "skipped": skipped,
+            "finished_without_running": finished}
+
+
+def backfill_lake_objects(conn, s3_client, *, apply=False, buckets=None, prefixes=None,
+                          start_bucket=None, start_after=None, time_budget_s=780, tag=False,
+                          page_size=1000):
+    """Walk the bucket(s) once and record who owns every object in lake_objects.
+
+    ONE resolution path: lake_owner.Resolver (the drain's), so the backfill and the drain can
+    never disagree. Global and lake-wide keys are counted and skipped (no row); an unknown
+    shape and an unresolvable key are upserted with company NULL and their reason, and listed
+    in `unresolved_sample` (first 50). Nothing is guessed.
+
+    A DRY RUN is the default (`apply` must be exactly True): it lists and resolves, writes no
+    row and makes no S3 mutation. Tagging (put_object_tagging, no data copy, one call per
+    resolved object) happens only with `tag` AND `apply`; it is the only S3 mutation here.
+
+    Resumable and idempotent: each page is committed before the next is read; the walk stops
+    once `time_budget_s` is spent (at least one page is always done, so a resume moves) and
+    returns `next_start_bucket`/`next_start_after`, the last key it finished, or None when the
+    walk is complete. The repository upsert skips an unchanged row, so a second full run
+    reports `rows_changed == 0` and leaves updated_at alone."""
+    out = {"dry_run": not apply, "walked": 0, "tenant": 0, "global_skipped": 0, "lake_wide": 0,
+           "unknown_shape": 0, "resolved": 0, "unresolved": 0, "mismatch_voice_company": 0,
+           "tagged": 0, "tag_skipped": 0, "conflict": 0, "conflict_sample": [],
+           "rows_changed": 0, "reasons": {}, "table_missing": False,
+           "next_start_bucket": None, "next_start_after": None, "unresolved_sample": []}
+    names = buckets if buckets is not None else [S3_BUCKET, LAKE_BUCKET]
+    names = list(dict.fromkeys(b for b in names if b))
+    if start_after is not None and start_bucket is None:
+        out["error"] = "start_after requires start_bucket (the cursor is per bucket)"
+        return out
+    if start_bucket is not None:
+        if start_bucket not in names:
+            out["error"] = f"start_bucket {start_bucket} is not one of the buckets"
+            return out
+        names = names[names.index(start_bucket):]
+    started = time.monotonic()
+    resolver = lake_owner.Resolver(conn)
+    pages_done, last_page_s = 0, 0.0
+
+    def budget_spent():
+        """True once another page like the last would overrun; never before the first page."""
+        return pages_done >= 1 and (time.monotonic() - started) + last_page_s >= time_budget_s
+
+    for bi, bucket in enumerate(names):
+        last_key = start_after if bi == 0 else None
+        for page in _backfill_pages(s3_client, bucket, prefixes, last_key, page_size):
+            if budget_spent():
+                out["next_start_bucket"], out["next_start_after"] = bucket, last_key
+                return out
+            t0 = time.monotonic()
+            keys = [(k, sz, lm) for k, sz, lm in page if not k.endswith("/")]
+            out["walked"] += len(page)                   # "folder" placeholder keys: walked only
+            owners = resolver.resolve_many([(k, {}) for k, _sz, _lm in keys])
+            rows = []
+            for k, sz, lm in keys:
+                o = owners[k]
+                if o["scope"] == "global":
+                    out["global_skipped"] += 1
+                    continue
+                if o["scope"] == "lake_wide":
+                    out["lake_wide"] += 1
+                    continue
+                out["unknown_shape" if o["scope"] == "unknown" else "tenant"] += 1
+                why = o["reason"] or "none"
+                out["reasons"][why] = out["reasons"].get(why, 0) + 1
+                if o["company_id"] is None:
+                    out["unresolved"] += 1
+                    if len(out["unresolved_sample"]) < 50:
+                        out["unresolved_sample"].append({"key": k, "reason": o["reason"]})
+                else:
+                    out["resolved"] += 1
+                parsed = lake_keys.parse(k) or {}
+                if (parsed.get("kind") == "voice" and parsed.get("company_id")
+                        and o["company_id"] and parsed["company_id"] != o["company_id"]):
+                    out["mismatch_voice_company"] += 1
+                rows.append({"key": k, "company_id": o["company_id"], "site_id": o["site_id"],
+                             "user_id": o["user_id"], "kind": o["kind"], "folder": o["folder"],
+                             "day": o["day"], "session_base": o["session_base"],
+                             "size_bytes": sz if isinstance(sz, int) else None,
+                             "object_modified_at": lm if isinstance(lm, datetime) else None,
+                             "source": "backfill", "why": o["reason"],
+                             "reason": None if o["company_id"] else o["reason"]})
+            if apply and rows:
+                try:
+                    # R7e: a stored company is never replaced by a different one here; the
+                    # upsert skips such rows, and they are reported.
+                    clash = lake_objects.conflicts(conn, rows)
+                    n = lake_objects.upsert_many(conn, rows, on_missing=None)
+                except Exception:  # noqa: BLE001 - earlier pages are committed; say where to resume
+                    logger.exception("lake backfill: upsert failed after %s", last_key)
+                    out["error"] = "upsert failed"
+                    out["next_start_bucket"], out["next_start_after"] = bucket, last_key
+                    return out
+                if n is None:
+                    out["table_missing"] = True
+                    out["next_start_bucket"], out["next_start_after"] = bucket, last_key
+                    return out
+                out["rows_changed"] += n
+                out["conflict"] += len(clash)
+                room = 50 - len(out["conflict_sample"])
+                out["conflict_sample"].extend(clash[:max(room, 0)])
+                clashed = {c["key"] for c in clash}
+                if tag:
+                    for r in rows:
+                        if r["company_id"] is None or r["key"] in clashed:
+                            continue
+                        try:
+                            # put_object_tagging REPLACES the whole set: read, change only
+                            # company/site, keep every other tag (e.g. lifecycle tags).
+                            have = s3_client.get_object_tagging(Bucket=bucket, Key=r["key"])
+                            merged = {t["Key"]: t["Value"] for t in have.get("TagSet") or []}
+                            merged["company"] = str(r["company_id"])
+                            if r["site_id"]:
+                                merged["site"] = str(r["site_id"])
+                            else:
+                                merged.pop("site", None)
+                            if len(merged) > 10:             # S3 allows 10 tags per object
+                                out["tag_skipped"] += 1
+                                continue
+                            s3_client.put_object_tagging(
+                                Bucket=bucket, Key=r["key"],
+                                Tagging={"TagSet": [{"Key": a, "Value": b}
+                                                    for a, b in merged.items()]})
+                            out["tagged"] += 1
+                        except Exception:  # noqa: BLE001 - tags are advisory; the row is the record
+                            logger.warning("lake backfill: could not tag %s", r["key"],
+                                           exc_info=True)
+                conn.commit()                              # progress is durable page by page
+            last_key = page[-1][0]
+            pages_done += 1
+            last_page_s = time.monotonic() - t0
+        if bi + 1 < len(names) and budget_spent():       # bucket done; resume at the next one
+            out["next_start_bucket"], out["next_start_after"] = names[bi + 1], None
+            return out
+    return out
 
 
 def republish_all_site_coords(conn):
@@ -9029,7 +9835,13 @@ def _get_lake_json(key):
     return json.loads(obj["Body"].read().decode("utf-8"))
 
 
-def _list_report_folders(date):
+def _lake_index_reads():
+    """LAKE_INDEX_READS, read at call time (R8d): request paths read the lake_objects index
+    instead of listing S3 prefixes only once the backfill has populated it."""
+    return os.environ.get("LAKE_INDEX_READS") == "true"
+
+
+def _list_report_folders(date, conn=None, caller=None):
     """S3 folder discovery for admin_disambiguation — mirrors
     lambda_fieldsight_api.py's find_any_report (lines 264-291): list every
     reports/{date}/*/daily_report.json object and take the folder segment,
@@ -9042,6 +9854,20 @@ def _list_report_folders(date):
     from available_users — mirrors the paginator pattern used elsewhere in
     this repo (lambda_ingest.py, lambda_item_writer.py, lambda_fieldsight_
     api.py's get_dates)."""
+    if conn is not None and caller is not None and _lake_index_reads():
+        # R8a: from the index, never more than the S3 path shows. A company admin/gm gets
+        # only folders whose rows carry THEIR company (NULL rows -- split_day, unresolved --
+        # are excluded); platform_admin is unrestricted. Every per-folder guard after the
+        # listing stays in place. None = table missing -> the S3 listing below, with a
+        # WARNING; an empty list is a real answer and does not fall back.
+        found = lake_objects.report_folders_for_day(
+            conn, date,
+            company_ids=None if is_cross_company(caller["global_role"]) else [caller["company_id"]],
+            key_suffix="/daily_report.json", on_missing=None)
+        if found is not None:
+            return list(found)
+        logger.warning("LAKE_INDEX_READS is on but lake_objects is missing; listing S3 for "
+                       "reports/%s/", date)
     prefix = f"reports/{date}/"
     folders = []
     try:
@@ -9798,7 +10624,8 @@ def admin_disambiguation(conn, caller, date):
     """D1(iv): admin/gm asked for a date with no ?user=.
     Serve the day's aggregate summary_report.json verbatim first -- but ONLY
     to is_cross_company (platform_admin): the report generator builds it
-    from every tenant's folders. It used to be gated on "the caller's company
+    from every tenant's folders. Everyone else is offered their own company's
+    reports/{date}/companies/{company_id}/summary_report.json (Task 10). It used to be gated on "the caller's company
     is the operator company", which would have handed it to that company's gm;
     the name lookup behind that gate returned None, so the leak was closed only
     by accident (spec 2026-10-03). Otherwise union S3-listed
@@ -9814,8 +10641,21 @@ def admin_disambiguation(conn, caller, date):
                else _get_lake_json(f"reports/{date}/summary_report.json"))
         if doc is not None:
             return ok(doc)
+    elif caller.get("company_id") and os.environ.get("COMPANY_SUMMARY_SERVE") == "on":
+        # Off by default: serving it replaces the person picker an admin/gm sees today with
+        # an AI summary, which is the owner's product decision. Task 10 (R10b): every other caller gets ONLY their own company's summary, built by
+        # the generator from that company's folders (external members already left out).
+        # The key comes from the caller row, never from the request. The guard stays the
+        # lake-wide _day_has_deleted_sources (folder=None): conservative, it over-blocks a
+        # company whose day is clean when another company deleted a source that day. Absent
+        # document -> the folder-union path below, exactly as before.
+        doc = (None if _day_has_deleted_sources(conn, None, date)
+               else _get_lake_json(
+                   f"reports/{date}/companies/{caller['company_id']}/summary_report.json"))
+        if doc is not None:
+            return ok(doc)
     candidates = set()
-    for folder in _list_report_folders(date):
+    for folder in _list_report_folders(date, conn, caller):
         if _all_tier_may_open(conn, caller, folder):
             candidates.add(folder)
     # By SITE, not by author company: an external member's topics on this company's
@@ -11059,7 +11899,64 @@ def _company_folder_names(conn, company_id):
             if u.get("folder_name")}
 
 
-def _read_org_report_history(folder_scope, limit, keep=None):
+_REPORT_INDEX_PAGE = 100
+
+
+def _report_history_from_index(conn, caller, folder_scope, limit, keep):
+    """Report history from lake_objects. Returns the response dict, or None when the table is
+    missing (the caller then runs the S3 listing). Same row shape as the S3 path.
+
+    R8b: filtered by folder scope AND company. A folder that is not the caller's own only
+    yields rows of the caller's company (platform_admin: any); NULL-company rows are never
+    shown to others. The caller's OWN folder yields every row, NULL included."""
+    cross = is_cross_company(caller["global_role"])
+    kw = dict(folders=None if folder_scope is None else sorted(folder_scope),
+              company_ids=None if cross else [caller["company_id"]],
+              own_folder=None if cross else (caller.get("folder_name") or None),
+              key_suffix="_report.json", exclude_debug=True, on_missing=None)
+    reports = []
+    page_size = max(limit * 2, _REPORT_INDEX_PAGE)
+    offset = 0
+    while len(reports) < limit:
+        rows = lake_objects.list_reports(conn, limit=page_size, offset=offset, **kw)
+        if rows is None:
+            return None
+        for r in rows:
+            if keep is not None and not keep(r["s3_key"]):
+                continue
+            reports.append(r)
+            if len(reports) >= limit:
+                break
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    docx = {}
+    if reports:
+        cands = [r["s3_key"][:-len(".json")] + ".docx" for r in reports]
+        drows = lake_objects.list_reports(conn, keys=cands, limit=len(cands),
+                                          on_missing=None)
+        if drows is None:
+            return None
+        docx = {d["s3_key"]: d for d in drows}
+    out = []
+    for r in reports:
+        key = r["s3_key"]
+        dm = REPORT_DATE_IN_KEY_RE.search(key)
+        row = {"key": key,
+               "type": ("weekly" if "weekly" in key else "monthly" if "monthly" in key else "daily"),
+               "date": dm.group(1) if dm else "",
+               "generated_at": (r.get("object_modified_at") or r["updated_at"]).isoformat(),
+               "size": r.get("size_bytes") or 0}
+        d = docx.get(key[:-len(".json")] + ".docx")
+        if d is not None:
+            row["docx_key"] = d["s3_key"]
+            row["docx_size"] = d.get("size_bytes") or 0
+            row["docx_generated_at"] = (d.get("object_modified_at") or d["updated_at"]).isoformat()
+        out.append(row)
+    return {"reports": out}
+
+
+def _read_org_report_history(folder_scope, limit, keep=None, conn=None, caller=None):
     """List the lake's report index, filtered by an ALREADY-RESOLVED folder
     scope. `folder_scope is None` means unrestricted; callers MUST have
     short-circuited the deny-all (empty set) case before getting here.
@@ -11087,6 +11984,16 @@ def _read_org_report_history(folder_scope, limit, keep=None):
     each would be a round trip to learn something this listing already carries,
     and a presigned URL for a key that does not exist answers 403 here rather
     than 404, so the failure would not even read as "missing"."""
+    # platform_admin keeps the S3 listing: it is unrestricted, and the index does not record
+    # the lake-wide summaries and site rollups as reports (A7), which it alone is shown.
+    if (conn is not None and caller is not None and _lake_index_reads()
+            and not is_cross_company(caller.get("global_role"))):
+        # Empty is an answer ("no reports"); only the missing-table sentinel falls back.
+        out = _report_history_from_index(conn, caller, folder_scope, limit, keep)
+        if out is not None:
+            return out
+        logger.warning("LAKE_INDEX_READS is on but lake_objects is missing; listing the "
+                       "whole reports/ prefix")
     reports = []
     docx_sizes = {}
     docx_times = {}
@@ -11162,7 +12069,7 @@ def get_org_report_history(conn, caller, event):
         # predicate an empty container would silently satisfy.
         return ok({"reports": []})
     return ok(_read_org_report_history(
-        folder_scope, limit, keep=_report_entry_guard(conn, caller)))
+        folder_scope, limit, keep=_report_entry_guard(conn, caller), conn=conn, caller=caller))
 
 
 def _report_key_period(key):
@@ -11414,14 +12321,19 @@ def regenerate_session(conn, caller, session_base, event):
     request = {"userFolder": folder, "date": date, "sessionBase": session_base}
     if rows:
         request["speakerNames"] = rows
+    regen_key = f"extraction_requests/{session_base[3:]}.json"
     boto3.client("s3").put_object(
         Bucket=S3_BUCKET,
         # Same key the finalize sweep writes, so this rides the trigger that
         # already exists rather than needing a second S3 notification -- and every
         # notification on this bucket is hand-wired outside the template (BUG-33).
-        Key=f"extraction_requests/{session_base[3:]}.json",
+        Key=regen_key,
         Body=json.dumps(request).encode("utf-8"),
         ContentType="application/json")
+    lake_objects.record_best_effort(
+        conn, regen_key,
+        company_id=_lake_company_for_session(conn, folder, date, session_base),
+        user_id=_lake_user_for_folder(conn, folder), source="upload")
     logger.info("regenerate requested for %s by %s with %d confirmed name(s)",
                 session_base, caller["id"], len(rows))
     return ok({"sessionBase": session_base, "namedTurns": len(rows),

@@ -52,6 +52,8 @@ class FakeS3:
         return {"Body": io.BytesIO(raw)}
 
     def put_object(self, **kwargs):
+        if kwargs["Key"].startswith("lake_manifest/"):
+            return {}            # lake_put's manifest line is not a vectors write
         self.put_calls.append(kwargs)
         self.objects[kwargs["Key"]] = kwargs["Body"]
         return {}

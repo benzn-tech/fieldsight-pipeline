@@ -1284,6 +1284,9 @@ def move_wired(wired):
                                      or ({"id": cid} if cid in (C_OLD, C_NEW) else None)))
     wired.setattr(org.sites, "get_company_site_by_slug",
                   lambda conn, cid, slug: (calls["slug_lookup"].append((cid, slug)) or None))
+    # FakeConn runs no SQL; the real re-own is covered in
+    # tests/integration/test_site_move_moves_lake_objects.py.
+    wired.setattr(org.lake_objects, "reassign_site", lambda conn, sid, cid: 0)
     return wired, calls
 
 

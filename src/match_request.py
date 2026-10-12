@@ -19,6 +19,8 @@ source-key idempotency Phase 4a/4b topics/chunks already rely on.
 import hashlib
 import json
 
+from lake_put import lake_put
+
 
 def emit(s3, bucket, site_id, report_date, source_s3_key, topics):
     """Write a match_requests/ artifact for a batch of freshly-written
@@ -36,10 +38,12 @@ def emit(s3, bucket, site_id, report_date, source_s3_key, topics):
         "source_s3_key": source_s3_key,
         "topics": topics,
     }
-    s3.put_object(
-        Bucket=bucket,
-        Key=key,
-        Body=json.dumps(body),
+    lake_put(
+        bucket,
+        key,
+        json.dumps(body),
+        client=s3,
+        owner_hint={"site_id": str(site_id)},
         ContentType="application/json",
     )
     return key

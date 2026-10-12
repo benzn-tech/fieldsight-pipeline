@@ -57,6 +57,7 @@ import nz_time
 import logging
 import re
 import boto3
+from lake_put import lake_put
 import urllib3
 import agent_turn_filter
 import llm_utils
@@ -238,6 +239,18 @@ def list_s3_objects(bucket, prefix):
     return objects
 
 
+def _transcript_folders(bucket):
+    """Folder names under transcripts/ from one delimiter listing."""
+    folders = []
+    for page in s3_client.get_paginator('list_objects_v2').paginate(
+            Bucket=bucket, Prefix='transcripts/', Delimiter='/'):
+        for cp in page.get('CommonPrefixes', []):
+            folder = cp['Prefix'][len('transcripts/'):].rstrip('/')
+            if folder:
+                folders.append(folder)
+    return folders
+
+
 def download_json_from_s3(bucket, key):
     """Download and parse JSON file from S3"""
     try:
@@ -402,10 +415,18 @@ def collect_transcripts(bucket, target_date, user_filter=None, custom_prefix=Non
         if user_filter:
             users.add(user_filter)
         else:
-            for obj in list_s3_objects(bucket, 'transcripts/'):
-                parts = obj['key'].split('/')
-                if len(parts) >= 2 and parts[1]:
-                    users.add(parts[1])
+            # One delimiter listing of transcripts/ (one entry per folder, not per object).
+            # The directory is not used: legacy folders still hold transcripts and are in no
+            # directory entry. Only a listing failure scans the whole prefix, with a WARNING.
+            try:
+                users.update(_transcript_folders(bucket))
+            except Exception:  # noqa: BLE001
+                logger.warning("meeting minutes: folder listing failed; discovering folders "
+                               "by listing the whole transcripts/ prefix", exc_info=True)
+                for obj in list_s3_objects(bucket, 'transcripts/'):
+                    parts = obj['key'].split('/')
+                    if len(parts) >= 2 and parts[1]:
+                        users.add(parts[1])
 
         for user_name in sorted(users):
             # Date subfolder first
@@ -628,9 +649,10 @@ def save_debug_record(bucket, target_date, meeting_title, prompt, raw_response,
             'parsed_json': parsed_json,
         }
 
-        s3_client.put_object(
-            Bucket=bucket, Key=debug_key,
-            Body=json.dumps(debug_record, ensure_ascii=False, indent=2, default=str),
+        lake_put(
+            bucket, debug_key,
+            json.dumps(debug_record, ensure_ascii=False, indent=2, default=str),
+            client=s3_client,
             ContentType='application/json'
         )
         logger.info(f"  Saved debug: {debug_key}")
@@ -1401,9 +1423,10 @@ def generate_meeting_minutes(meeting_config):
 
     # Save JSON to S3 — archive copy in meeting_minutes/ prefix
     json_key = f"{MINUTES_PREFIX}{target_date}/{safe_title}.json"
-    s3_client.put_object(
-        Bucket=S3_BUCKET, Key=json_key,
-        Body=json.dumps(minutes, ensure_ascii=False, indent=2, default=str),
+    lake_put(
+        S3_BUCKET, json_key,
+        json.dumps(minutes, ensure_ascii=False, indent=2, default=str),
+        client=s3_client,
         ContentType='application/json'
     )
     logger.info(f"Saved: {json_key}")
@@ -1438,9 +1461,10 @@ def generate_meeting_minutes(meeting_config):
     report_json_key = None
     if not session_scoped:
         report_json_key = f"{REPORT_PREFIX}{target_date}/{user_for_path}/meeting_minutes.json"
-        s3_client.put_object(
-            Bucket=S3_BUCKET, Key=report_json_key,
-            Body=json.dumps(minutes, ensure_ascii=False, indent=2, default=str),
+        lake_put(
+            S3_BUCKET, report_json_key,
+            json.dumps(minutes, ensure_ascii=False, indent=2, default=str),
+            client=s3_client, owner_hint={"folder": meeting_config.get('user')},
             ContentType='application/json'
         )
         logger.info(f"Saved: {report_json_key}")
@@ -1453,18 +1477,20 @@ def generate_meeting_minutes(meeting_config):
         if word_buffer:
             # Archive copy
             word_key = f"{MINUTES_PREFIX}{target_date}/{safe_title}.docx"
-            s3_client.put_object(
-                Bucket=S3_BUCKET, Key=word_key,
-                Body=word_buffer.getvalue(),
+            lake_put(
+                S3_BUCKET, word_key,
+                word_buffer.getvalue(),
+                client=s3_client,
                 ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
             )
             # Reports/ path copy -- a day-level object, see session_scoped above
             if not session_scoped:
                 word_buffer.seek(0)
                 report_word_key = f"{REPORT_PREFIX}{target_date}/{user_for_path}/meeting_minutes.docx"
-                s3_client.put_object(
-                    Bucket=S3_BUCKET, Key=report_word_key,
-                    Body=word_buffer.getvalue(),
+                lake_put(
+                    S3_BUCKET, report_word_key,
+                    word_buffer.getvalue(),
+                    client=s3_client, owner_hint={"folder": meeting_config.get('user')},
                     ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
                 )
                 logger.info(f"Saved: {report_word_key}")
@@ -1479,9 +1505,10 @@ def generate_meeting_minutes(meeting_config):
                 minutes, meeting_config, transcripts
             )
             compat_key = f"{REPORT_PREFIX}{target_date}/{user_for_path}/daily_report.json"
-            s3_client.put_object(
-                Bucket=S3_BUCKET, Key=compat_key,
-                Body=json.dumps(compat_report, ensure_ascii=False, indent=2, default=str),
+            lake_put(
+                S3_BUCKET, compat_key,
+                json.dumps(compat_report, ensure_ascii=False, indent=2, default=str),
+                client=s3_client, owner_hint={"folder": meeting_config.get('user')},
                 ContentType='application/json'
             )
             logger.info(f"Saved compat report: {compat_key}")

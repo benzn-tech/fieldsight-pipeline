@@ -130,6 +130,8 @@ class _FakeS3:
         return {"Body": io.BytesIO(json.dumps(self._existing).encode("utf-8"))}
 
     def put_object(self, **kw):
+        if kw["Key"].startswith("lake_manifest/"):
+            return               # lake_put's manifest line is not a summary write
         self.puts.append(kw)
 
 

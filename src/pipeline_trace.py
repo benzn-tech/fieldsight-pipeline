@@ -39,6 +39,8 @@ import logging
 import os
 import uuid
 
+from lake_put import lake_put
+
 logger = logging.getLogger(__name__)
 
 VERSION = 1
@@ -51,6 +53,10 @@ _state = contextvars.ContextVar("fieldsight_trace", default=None)
 
 def enabled():
     return os.environ.get("TRACE_EVENTS", "on").lower() not in ("off", "0", "false")
+
+
+def _owner_folder(folder):
+    return folder if folder and not str(folder).startswith("_") else None
 
 
 def begin(lambda_name, user_folder=None, date=None, session=None, company_id=None):
@@ -140,8 +146,12 @@ def flush(s3, bucket):
     try:
         if not hasattr(s3, "put_object") and callable(s3):
             s3 = s3()
-        s3.put_object(Bucket=bucket, Key=key, Body=lines(st).encode("utf-8"),
-                      ContentType="application/x-ndjson")
+        lake_put(bucket, key, lines(st).encode("utf-8"), client=s3,
+                 # No company in the hint: a trace's company is whatever the caller set
+                 # (e.g. a whole day's), not the site's; the resolver decides. Synthetic
+                 # folders ("_glossary") name nobody.
+                 owner_hint={"folder": _owner_folder(st.get("user_folder"))},
+                 ContentType="application/x-ndjson")
         return key
     except Exception:
         logger.warning("trace: could not write %s (%d events)", key, len(st["events"]),

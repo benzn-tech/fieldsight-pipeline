@@ -25,6 +25,8 @@ from __future__ import annotations
 import json
 import logging
 
+from lake_put import lake_put
+
 logger = logging.getLogger()
 
 PREFIX = "redactions/"
@@ -45,9 +47,8 @@ def mirror_key(folder: str, date: str) -> str:
 def write_mirror(s3, bucket: str, folder: str, date: str, session_ids) -> str:
     """Publish the deleted-session set for one day. Returns the key written."""
     key = mirror_key(folder, date)
-    s3.put_object(Bucket=bucket, Key=key,
-                  Body=json.dumps({"sessions": sorted(set(session_ids))}),
-                  ContentType="application/json")
+    lake_put(bucket, key, json.dumps({"sessions": sorted(set(session_ids))}), client=s3,
+             owner_hint={"folder": folder}, ContentType="application/json")
     logger.info("deletion mirror: wrote %s with %d session(s)", key, len(set(session_ids)))
     return key
 

@@ -111,6 +111,18 @@ def test_admin_adds_external_member(env):
     assert n["created_at"]
 
 
+def test_adding_an_external_member_republishes_the_directory(env, monkeypatch):
+    """I4: has_external is published in the directory; the add must republish it (and a
+    refused add must not)."""
+    published = []
+    monkeypatch.setattr(org, "_publish_directory", lambda conn: published.append(1))
+    assert post()["statusCode"] == 201
+    assert published == [1]
+    env["caller"] = caller("worker")
+    assert post()["statusCode"] == 403
+    assert published == [1]
+
+
 def test_platform_admin_adds_to_any_company(env):
     env["caller"] = caller("platform_admin", company="c-operator")
     assert post()["statusCode"] == 201

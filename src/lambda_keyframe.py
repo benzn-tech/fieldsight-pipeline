@@ -34,6 +34,7 @@ from collections import Counter
 from urllib.parse import unquote_plus
 
 import boto3
+from lake_put import lake_upload_file
 
 from psycopg.rows import dict_row
 
@@ -216,7 +217,11 @@ def process_request(req):
                             logger.warning("keyframe download failed for %s (topic %s): %s",
                                            source_key, topic_id, e)
                             continue
-                        if not _extract_and_upload(local, seek, key):
+                        if not _extract_and_upload(
+                                local, seek, key,
+                                owner_hint={"folder": user_folder,
+                                            "company_id": trow.get("company_id"),
+                                            "site_id": trow.get("site_id")}):
                             continue               # ffmpeg failed: log-and-skip, never raise
                         # A NEW JPEG was produced THIS run -> append-only
                         # 'generated' event. NOT on the _object_exists fast path
@@ -319,7 +324,7 @@ def _evict_original(cache, source_key):
             pass
 
 
-def _extract_and_upload(local_input, seek, dest_key):
+def _extract_and_upload(local_input, seek, dest_key, owner_hint=None):
     """Grab ONE frame from an already-downloaded original and upload it. Never
     raises: an ffmpeg non-zero exit / missing output warns and returns False so
     the caller skips just this frame. The output name is unique per call (the
@@ -331,7 +336,8 @@ def _extract_and_upload(local_input, seek, dest_key):
         if r.returncode != 0 or not os.path.exists(out):
             logger.warning("ffmpeg frame grab failed for %s: %s", local_input, (r.stderr or "")[:300])
             return False
-        s3().upload_file(out, S3_BUCKET, dest_key, ExtraArgs={"ContentType": "image/jpeg"})
+        lake_upload_file(S3_BUCKET, dest_key, out, client=s3(), owner_hint=owner_hint,
+                         ExtraArgs={"ContentType": "image/jpeg"})
         return True
     except Exception as e:
         logger.warning("keyframe extract error for %s: %s", local_input, e)

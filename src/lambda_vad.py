@@ -61,6 +61,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 
 import boto3
+from lake_put import lake_put, lake_upload_file
 from urllib.parse import unquote_plus
 
 # Configure logging
@@ -904,8 +905,9 @@ def process_single_file(bucket, key, source_info, tmp_dir):
                 logger.info(f"  Generating H264 720p preview (source is {codec_info.get('video_codec','unknown')})...")
                 result = generate_web_preview(input_path, preview_path, timeout=150)
                 if result and os.path.exists(preview_path):
-                    s3_client.upload_file(
-                        preview_path, bucket, preview_s3_key,
+                    lake_upload_file(
+                        bucket, preview_s3_key, preview_path, client=s3_client,
+                        owner_hint={"folder": source_info['user_name']},
                         ExtraArgs={'ContentType': 'video/mp4'}
                     )
                     preview_key = preview_s3_key
@@ -1000,8 +1002,9 @@ def process_single_file(bucket, key, source_info, tmp_dir):
             seg_s3_key = build_segment_s3_key(source_info, seg_filename)
 
             # Upload the full WAV — the normalised one, same as the segment path
-            s3_client.upload_file(
-                export_wav_path, bucket, seg_s3_key,
+            lake_upload_file(
+                bucket, seg_s3_key, export_wav_path, client=s3_client,
+                owner_hint={"folder": source_info['user_name']},
                 ExtraArgs={'ContentType': 'audio/wav'}
             )
             logger.info(f"  Fallback segment uploaded: {seg_s3_key}")
@@ -1040,7 +1043,9 @@ def process_single_file(bucket, key, source_info, tmp_dir):
             'segments': segments_meta,
         }
         meta_key = f"{OUTPUT_PREFIX}{source_info['user_name']}/{source_info['date']}/{source_info['basename_no_ext']}_vad_metadata.json"
-        s3_client.put_object(Bucket=bucket, Key=meta_key, Body=json.dumps(metadata, indent=2), ContentType='application/json')
+        lake_put(bucket, meta_key, json.dumps(metadata, indent=2), client=s3_client,
+                 owner_hint={"folder": source_info['user_name']},
+                 ContentType='application/json')
         
         return {
             'key': key,
@@ -1080,8 +1085,9 @@ def process_single_file(bucket, key, source_info, tmp_dir):
         write_wav_segment(segment_samples, sr, seg_local_path)
 
         # Upload to S3
-        s3_client.upload_file(
-            seg_local_path, bucket, seg_s3_key,
+        lake_upload_file(
+            bucket, seg_s3_key, seg_local_path, client=s3_client,
+            owner_hint={"folder": source_info['user_name']},
             ExtraArgs={'ContentType': 'audio/wav'}
         )
 
@@ -1145,9 +1151,11 @@ def process_single_file(bucket, key, source_info, tmp_dir):
         f"{OUTPUT_PREFIX}{source_info['user_name']}/{source_info['date']}/"
         f"{source_info['basename_no_ext']}_vad_metadata.json"
     )
-    s3_client.put_object(
-        Bucket=bucket, Key=meta_key,
-        Body=json.dumps(metadata, indent=2),
+    lake_put(
+        bucket, meta_key,
+        json.dumps(metadata, indent=2),
+        client=s3_client,
+        owner_hint={"folder": source_info['user_name']},
         ContentType='application/json'
     )
     logger.info(f"  Metadata saved: {meta_key}")

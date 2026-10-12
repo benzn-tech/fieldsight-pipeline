@@ -18,6 +18,7 @@ from psycopg.rows import dict_row
 
 from repositories import aliases, chunks, redactions, topics
 from chunking import chunk_report
+from lake_put import lake_put
 
 REQUEST_PREFIX = "reindex_requests/"
 # Vectors go under a SEPARATE top-level prefix (not reindex_requests/*.vectors
@@ -72,8 +73,9 @@ def enqueue_topic_reindex(s3_client, bucket, conn, topic_id, folder, date):
             or redactions.is_topic_redacted(conn, topic_id)
             or redactions.is_source_deleted(conn, t.get("source_s3_key"))):
         key = request_key(date, folder, topic_id)
-        s3_client.put_object(Bucket=bucket, Key=key, ContentType="application/json",
-            Body=json.dumps({
+        lake_put(bucket, key, client=s3_client, ContentType="application/json",
+            owner_hint={"site_id": str(t["site_id"]), "folder": folder},
+            body=json.dumps({
                 "topic_id": str(topic_id), "site_id": str(t["site_id"]),
                 "user_id": str(t["user_id"]) if t.get("user_id") is not None else None,
                 "report_date": str(t["report_date"]),
@@ -109,8 +111,9 @@ def enqueue_topic_reindex(s3_client, bucket, conn, topic_id, folder, date):
                           "metadata": c["metadata"]} for c in topic_chunks],
     }
     key = request_key(date, folder, topic_id)
-    s3_client.put_object(Bucket=bucket, Key=key,
-                         Body=json.dumps(request), ContentType="application/json")
+    lake_put(bucket, key, json.dumps(request), client=s3_client,
+             owner_hint={"company_id": company_id, "site_id": site_id, "folder": folder},
+             ContentType="application/json")
     return key
 
 
