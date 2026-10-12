@@ -132,14 +132,14 @@ def test_user_deleted_content_is_not_exported(db):
     a, b, moved, stay_b, own_a = world(db)
     A = str(a["id"])
     keep = {"tr": f"transcripts/Ada/{DAY}/keep_{SID3}_c0.json",
-            "photo2": f"users/Ada/pictures/{DAY}/IMG2.jpg",
+            "photo2": "users/Ada/pictures/2026-10-05/IMG2.jpg",
             "reverted": f"transcripts/Ada/{DAY}/rev_{SID2}_c0.json"}
     gone = {"tr_sid": f"transcripts/Ada/{DAY}/x_{SID1}_c0.json",
             "audio": f"users/Ada/audio/{DAY}/x_{SID1}.wav",
             "extraction": f"extractions/Ada/{DAY}/{SID1}.json",
             "day_report": f"reports/{DAY}/Ada/daily_report.json",
-            "photo1": f"users/Ada/pictures/{DAY}/IMG1.jpg",
-            "keyframe": f"users/Ada/pictures/{DAY}/kf-1.jpg"}
+            "photo1": "users/Ada/pictures/2026-10-05/IMG1.jpg",
+            "keyframe": "users/Ada/pictures/2026-10-05/kf-1.jpg"}
     for kk in (*keep.values(), *gone.values()):
         put(db, kk, a["id"])
     # source 1+2: recording tombstone (prefix, sid, day report); source 3: photo; source 4: keyframe
@@ -159,7 +159,7 @@ def test_user_deleted_content_is_not_exported(db):
     assert {n.split("/", 1)[1] for n in members(s3, out)} == set(keep.values())
     for kk in gone.values():
         assert (LAKE, kk) not in s3.get_calls
-        assert kk not in json.dumps(m)
+    assert {e["s3_key"] for e in m["excluded_tombstoned"]} == set(gone.values())
     assert sum(m["excluded"].values()) == len(gone)
 
 
@@ -169,3 +169,30 @@ def test_a_missing_object_is_recorded_not_fatal_on_real_rows(db):
     out = export(db, s3, A)
     st = {o["s3_key"]: o.get("status") for o in manifest(s3, out)["objects"]}
     assert st[k["a_site"]] == "missing" and st[k["a_tr"]] is None
+
+
+def test_a_deleted_session_withholds_the_days_session_less_keys_but_not_the_live_session(db):
+    """R9g: one deleted and one live session on the same folder/day."""
+    a = companies.create_company(db, f"ExG-{uuid.uuid4().hex[:6]}")
+    live_tr = f"transcripts/Ada/{DAY}/live_{SID3}_c0.json"
+    live_ex = f"extractions/Ada/{DAY}/{SID3}.json"
+    dead_tr = f"transcripts/Ada/{DAY}/dead_{SID1}_c0.json"
+    day_trace = f"traces/{DAY}/Ada/trace.json"
+    day_emb = f"embeddings/{DAY}/Ada/e.json"
+    other_day_trace = f"traces/2026-10-09/Ada/trace.json"
+    other_folder_trace = f"traces/{DAY}/Bob/trace.json"
+    allk = [live_tr, live_ex, dead_tr, day_trace, day_emb, other_day_trace, other_folder_trace]
+    for kk in allk:
+        put(db, kk, a["id"])
+    redactions.create_recording_tombstone(db, a["id"], f"extractions/Ada/{DAY}/{SID1}",
+                                          "user delete", None, "worker")
+    s3 = FakeS3({(LAKE, kk): b"x" for kk in allk}, min_part=1)
+    out = export(db, s3, str(a["id"]))
+    m = manifest(s3, out)
+    assert {o["s3_key"] for o in m["objects"]} == {live_tr, live_ex, other_day_trace,
+                                                   other_folder_trace}
+    listed = {e["s3_key"]: e["reason"] for e in m["excluded_tombstoned"]}
+    assert listed == {dead_tr: "recording_sid", day_trace: "day_level_no_session",
+                      day_emb: "day_level_no_session"}
+    for kk in (dead_tr, day_trace, day_emb):
+        assert (LAKE, kk) not in s3.get_calls

@@ -21,6 +21,11 @@ Resumable: after each closed part `state.json` records the cursor, parts and man
 so far. A call stops when `time_budget_s` is spent and returns `done: False, next_cursor`;
 calling again with the same `export_id` continues from the DURABLE state (the passed cursor is
 only a hint, so a retried or stale invocation cannot duplicate or skip an entry).
+
+Every key withheld because of a tombstone is listed in the manifest under
+`excluded_tombstoned` ({s3_key, reason}) so the operator can see what was withheld.
+Runtime note: developed on Python 3.14; the Lambda runtime is 3.11. The unseekable-stream
+zipfile behaviour used here (data descriptors, zip64) is stable since 3.6.
 """
 import json
 import logging
@@ -108,6 +113,11 @@ class Tombstones:
                     return "recording_base"
                 if parsed.get("kind") == "report":
                     return "day_report"
+                # R9g (fail closed): a folder/day with an active tombstone withholds every
+                # key of that folder/day that names no session (traces, embeddings, roll-ups,
+                # ...). Session-keyed objects are judged by their own session above.
+                if not parsed.get("sid") and not parsed.get("session_base"):
+                    return "day_level_no_session"
             sb = parsed.get("session_base")
             if sb and not folder and any(sb == b or sb.startswith(b) for b in self.bases):
                 return "recording_base"
@@ -261,7 +271,8 @@ def run(conn, s3, company_id, *, bucket_for, export_id=None, cursor=None,
         raise ValueError("cursor given but this export has no saved state")
     if state is None:
         state = {"export_id": export_id, "company_id": company_id, "cursor": None, "parts": [],
-                 "entries": [], "bytes": 0, "excluded": {}, "done": False}
+                 "entries": [], "bytes": 0, "excluded": {}, "excluded_tombstoned": [],
+                 "done": False}
     elif state.get("export_id") != export_id or state.get("company_id") != company_id:
         raise ValueError("saved state belongs to a different export")
     if cursor is not None and cursor != state.get("cursor"):
@@ -285,6 +296,8 @@ def run(conn, s3, company_id, *, bucket_for, export_id=None, cursor=None,
     new_entries = []            # entries since the last durable state
     cur_objects = cur_bytes = 0
     excluded = dict(state["excluded"])
+    tomb_listed = []            # tombstoned keys withheld since the last durable state
+    tomb_keys = set()
     part_no = len(state["parts"]) + 1
     new_parts = []
 
@@ -312,6 +325,8 @@ def run(conn, s3, company_id, *, bucket_for, export_id=None, cursor=None,
         state["bytes"] += added_box[0]
         added_box[0] = 0
         state["excluded"] = dict(excluded)
+        state["excluded_tombstoned"] = state.get("excluded_tombstoned", []) + tomb_listed
+        tomb_listed.clear()
         state["done"] = done
         _put_json(s3, dest, state_key, state)
 
@@ -337,7 +352,9 @@ def run(conn, s3, company_id, *, bucket_for, export_id=None, cursor=None,
                     drop[k] = "internal"
                 else:
                     keys.append(k)
-            drop.update(tombs.excluded(conn, keys))
+            tomb = tombs.excluded(conn, keys)
+            tomb_keys.update(tomb)
+            drop.update(tomb)
             for row in page:
                 if processed and clock() - started >= time_budget_s:
                     close_part()
@@ -348,6 +365,8 @@ def run(conn, s3, company_id, *, bucket_for, export_id=None, cursor=None,
                 reason = drop.get(k)
                 if reason:
                     bump(reason)
+                    if k in tomb_keys:
+                        tomb_listed.append({"s3_key": k, "reason": reason})
                     pos = k
                     continue
                 kind = row.get("kind") or "other"
@@ -399,7 +418,8 @@ def run(conn, s3, company_id, *, bucket_for, export_id=None, cursor=None,
                     "generated_at": now.isoformat(),
                     "parts": state["parts"] + new_parts,
                     "objects": state["entries"] + new_entries,
-                    "excluded": dict(excluded)}
+                    "excluded": dict(excluded),
+                    "excluded_tombstoned": state.get("excluded_tombstoned", []) + tomb_listed}
         _put_json(s3, dest, prefix + "manifest.json", manifest)
         save(done=True)
         return result(True)

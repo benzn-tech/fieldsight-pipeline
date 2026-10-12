@@ -209,7 +209,7 @@ def test_tombstoned_keys_are_not_read_or_exported_or_listed(monkeypatch):
     m = manifest(s3)
     assert [o["s3_key"] for o in m["objects"]] == [key(0), key(2)]
     assert m["excluded"] == {"recording_sid": 1}
-    assert key(1) not in json.dumps(m)                           # a deleted key is not even named
+    assert m["excluded_tombstoned"] == [{"s3_key": key(1), "reason": "recording_sid"}]
     assert (LAKE, key(1)) not in s3.get_calls
 
 
@@ -264,6 +264,12 @@ def test_tombstones_match_sid_prefix_legacy_base_and_day_report():
     assert r("transcripts/Ada/2026-10-01/other-session.json") is None            # kept session
     assert r("extraction_requests/dev9_2026-10-02_10-00-00.json") == "recording_base"
     assert r("transcripts/Carol/2026-10-01/x.json") is None
+    # R9g: a tombstoned folder/day withholds every session-less key of it, in any family
+    assert r("traces/2026-10-01/Ada/trace.json") == "day_level_no_session"
+    assert r("embeddings/2026-10-01/Ada/e.json") == "day_level_no_session"
+    assert r("audio_segments/Ada/2026-10-01/batch_map.json") == "day_level_no_session"
+    assert r("traces/2026-10-04/Ada/trace.json") is None                         # other day
+    assert r("traces/2026-10-01/Carol/trace.json") is None                       # other folder
 
 
 def test_tombstone_db_sources_are_photo_and_keyframe(monkeypatch):
