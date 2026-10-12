@@ -2908,8 +2908,22 @@ def merge_voiceprint(conn, caller, voiceprint_id, event):
     except _MergeFailed as exc:
         return exc.response
     logger.info("voiceprint merged: %s -> %s (%s)", voiceprint_id, into, result)
+    # A merge is the one gesture that moves a whole other profile's samples in at once, and
+    # merging is allowed against a "these sound different" warning. Re-judge the combined
+    # set so a wrong merge degrades into a few set-aside samples instead of a profile whose
+    # mean matches nobody. Its own transaction, after the merge committed: a failure here
+    # must not undo what the person asked for.
+    set_aside = None
+    try:
+        with conn.transaction():
+            q = voiceprints.requarantine_profile(conn, company_id, into)
+        set_aside = q.get("quarantined", 0)
+        if set_aside:
+            logger.info("quarantine after merge into %s: %s", into, q)
+    except Exception:
+        logger.exception("quarantine after merge into %s failed; the merge stands", into)
     return ok({"mergedInto": into, "samplesMoved": result["samplesMoved"],
-               "samplesDropped": result["samplesDropped"]})
+               "samplesDropped": result["samplesDropped"], "samplesSetAside": set_aside})
 
 
 def rename_voiceprint(conn, caller, voiceprint_id, event):
