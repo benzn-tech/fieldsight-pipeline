@@ -46,11 +46,13 @@ def recent_activity(conn, days):
 
 
 def external_user_ids(conn):
-    """ids of live users holding any live external membership on a live site. Published as
-    `has_external` on the person (never the sites): the report generator uses it to keep
-    that person's whole-day documents out of every site rollup."""
+    """ids of users who have EVER held an external membership (archived memberships, archived
+    sites and archived users included). Published as `has_external` on the person (never the
+    sites): the report generator keeps that person's whole-day documents out of every site
+    rollup and every per-company summary. "Ever" matches the lake resolver's R5g
+    (memberships.ever_external_user_ids): a user whose external membership was archived still
+    has days that were split between companies, and a summary built from a stale answer would
+    put another company's site work into their home company's file."""
     rows = _memberships._external_or(
-        conn, "SELECT DISTINCT m.user_id FROM memberships m JOIN sites s ON s.id = m.site_id "
-        "JOIN users u ON u.id = m.user_id WHERE m.external AND m.archived_at IS NULL "
-        "AND s.archived_at IS NULL AND u.archived_at IS NULL", (), [])
+        conn, "SELECT DISTINCT m.user_id FROM memberships m WHERE m.external", (), [])
     return {str(r[0]) for r in rows}

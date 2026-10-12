@@ -85,7 +85,7 @@ def build(user_rows, membership_rows, site_rows, published_at, activity=None,
     `activity`: [{user_id, site_id, n, latest}] -- topics by that user on that
     site in the last PRIMARY_SITE_WINDOW_DAYS days, used to choose a primary
     site among several.
-    `external_user_ids`: users holding a live external membership. Each person gets
+    `external_user_ids`: users who have EVER held an external membership (archived included). Each person gets
     `has_external` true/false; the external sites themselves are NOT listed.
     """
     ext = {str(x) for x in (external_user_ids or ())}
@@ -236,6 +236,16 @@ def person(doc, folder):
     if isinstance(folder, str):
         return people.get(folder.replace(" ", "_")) or {}
     return {}
+
+
+def company_of_folder(doc, folder):
+    """The home company id of a recording folder, or None when the folder has no directory
+    entry or the entry carries no company (legacy folders such as Ben_Lin). Unlike
+    `person`, a name with spaces is NOT folded to underscores: a guess here would put a
+    person into the wrong company's summary."""
+    p = ((doc or {}).get("people") or {}).get(folder)
+    cid = p.get("company_id") if isinstance(p, dict) else None
+    return str(cid) if cid else None
 
 
 def names_by_folder(doc):

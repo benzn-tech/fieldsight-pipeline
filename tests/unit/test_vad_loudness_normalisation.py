@@ -194,7 +194,8 @@ def test_both_upload_paths_ship_the_normalised_audio():
     applied to only one of them is the shape of half this repo's bug list."""
     body = _source()
     assert "upload_file(\n                export_wav_path" in body or \
-           "export_wav_path, bucket, seg_s3_key" in body, \
+           "export_wav_path, bucket, seg_s3_key" in body or \
+           "bucket, seg_s3_key, export_wav_path" in body, \
            "the whole-audio fallback must upload the normalised file"
     assert "write_wav_segment(segment_samples" in body
 

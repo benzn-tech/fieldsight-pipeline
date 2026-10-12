@@ -44,8 +44,11 @@ def test_all_pgdatabase_values_are_guarded_by_the_condition():
     # FinalizeSweepFunction; 13 before the video-keyframe KeyframeFunction). Each new
     # one's PGDATABASE is correctly !If-guarded like the rest.
     #
+    # 20 with LakeOpsFunction (lake ownership): org-api's code and database, so its PGDATABASE is
+    # the same !If-guarded form as OrgApiFunction's.
+    #
     # The count is the point: a new in-VPC function is meant to make this test fail, so
     # that whoever adds one has to look at whether they guarded PGDATABASE rather than
     # discovering months later that test writes went to the prod database.
-    assert guarded == 19, f"expected 19 guarded PGDATABASE, found {guarded}"
+    assert guarded == 20, f"expected 20 guarded PGDATABASE, found {guarded}"
     assert bare == 0, f"found {bare} un-switched bare PGDATABASE !ImportValue"

@@ -50,6 +50,7 @@ import re
 from urllib.parse import unquote_plus
 
 import boto3
+from lake_put import lake_put
 
 import dashscope_utils
 import lambda_ingest
@@ -112,10 +113,11 @@ def embed_report(date, user_folder, report_key):
 
     vectors = dict(zip(hashes, embeddings))
 
-    s3().put_object(
-        Bucket=S3_BUCKET,
-        Key=_sidecar_key(date, user_folder),
-        Body=json.dumps(vectors),
+    lake_put(
+        S3_BUCKET,
+        _sidecar_key(date, user_folder),
+        json.dumps(vectors),
+        client=s3(), owner_hint={"folder": user_folder},
         ContentType="application/json",
     )
 
@@ -165,8 +167,9 @@ def embed_reindex_request(key):
                 "source_s3_key": req.get("source_s3_key"), "chunks": [],
             }
             vkey = reindex.vectors_key(req["date"], req["folder"], req["topic_id"])
-            s3().put_object(Bucket=S3_BUCKET, Key=vkey,
-                            Body=json.dumps(result), ContentType="application/json")
+            lake_put(S3_BUCKET, vkey, json.dumps(result), client=s3(),
+                     owner_hint={"folder": req["folder"]},
+                     ContentType="application/json")
             logger.info("reindex %s: delete-only -- wrote empty vectors artifact", key)
             return {"reindex": key, "chunks": 0, "deleted": True}
         logger.info("reindex %s: no chunks -- skipping", key)
@@ -182,8 +185,9 @@ def embed_reindex_request(key):
         "source_s3_key": req.get("source_s3_key"), "chunks": chunks_out,
     }
     vkey = reindex.vectors_key(req["date"], req["folder"], req["topic_id"])
-    s3().put_object(Bucket=S3_BUCKET, Key=vkey,
-                    Body=json.dumps(result), ContentType="application/json")
+    lake_put(S3_BUCKET, vkey, json.dumps(result), client=s3(),
+             owner_hint={"folder": req["folder"]},
+             ContentType="application/json")
     logger.info("reindex embedded %s chunks=%d", key, len(chunks_out))
     return {"reindex": key, "chunks": len(chunks_out)}
 

@@ -33,6 +33,8 @@ import os
 import re
 from datetime import datetime, timedelta
 
+from lake_put import lake_put
+
 logger = logging.getLogger(__name__)
 
 
@@ -529,9 +531,10 @@ def write_meeting_manifest(s3_client, bucket, report_prefix, target_date,
         'meeting_title': meeting_title,
         'generated_at': datetime.utcnow().isoformat() + 'Z',
     }
-    s3_client.put_object(
-        Bucket=bucket, Key=manifest_key,
-        Body=_json.dumps(manifest, ensure_ascii=False, indent=2),
+    lake_put(
+        bucket, manifest_key,
+        _json.dumps(manifest, ensure_ascii=False, indent=2),
+        client=s3_client, owner_hint={"folder": user_path},
         ContentType='application/json'
     )
     return manifest_key

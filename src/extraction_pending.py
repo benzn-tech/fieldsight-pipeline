@@ -25,6 +25,8 @@ import random
 import re
 from datetime import datetime, timedelta, timezone
 
+from lake_put import lake_put
+
 logger = logging.getLogger(__name__)
 
 PENDING_PREFIX = "extraction_pending/"
@@ -115,9 +117,11 @@ def read(s3, bucket, session_base):
 
 
 def write(s3, bucket, marker):
-    s3.put_object(Bucket=bucket, Key=marker_key(marker["sessionBase"]),
-                  Body=json.dumps(marker, ensure_ascii=False),
-                  ContentType="application/json")
+    lake_put(bucket, marker_key(marker["sessionBase"]),
+             json.dumps(marker, ensure_ascii=False), client=s3,
+             owner_hint={"folder": marker.get("userFolder"),
+                         "session_base": marker["sessionBase"]},
+             ContentType="application/json")
 
 
 def _code(e):
@@ -148,14 +152,18 @@ def update(s3, bucket, session_base, mutate):
         body = json.dumps(marker, ensure_ascii=False)
         try:
             kw = {"IfMatch": etag} if etag else {}
-            s3.put_object(Bucket=bucket, Key=key, Body=body,
-                          ContentType="application/json", **kw)
+            lake_put(bucket, key, body, client=s3,
+                     owner_hint={"folder": marker.get("userFolder"),
+                                 "session_base": session_base},
+                     ContentType="application/json", **kw)
         except Exception as e:
             if _code(e) in ("PreconditionFailed", "ConditionalRequestConflict"):
                 continue
             if type(e).__name__ == "ParamValidationError":
-                s3.put_object(Bucket=bucket, Key=key, Body=body,
-                              ContentType="application/json")
+                lake_put(bucket, key, body, client=s3,
+                         owner_hint={"folder": marker.get("userFolder"),
+                                     "session_base": session_base},
+                         ContentType="application/json")
             else:
                 raise
         return marker

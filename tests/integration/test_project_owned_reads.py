@@ -130,7 +130,7 @@ def test_a_company_cannot_open_a_person_with_no_footprint_on_its_sites(db):
 def test_the_candidate_list_is_by_site_not_by_author_company(db, monkeypatch):
     w = _world(db)
     _two_site_day(db, w)
-    monkeypatch.setattr(api, "_list_report_folders", lambda date: [])
+    monkeypatch.setattr(api, "_list_report_folders", lambda date, *a: [])
     code, body = _timeline(db, w["admin_b"])          # no ?user=
     # one candidate (the A person) -> straight into the clipped single-user view
     assert code == 200 and body["user"] == w["folder"] and _titles(body) == ["Tower B steel"]

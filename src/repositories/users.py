@@ -367,3 +367,14 @@ def first_officer_or_member(conn, company_id):
             "LIMIT 1",
             (company_id,)).fetchall()
     return rows[0] if rows else None
+
+
+def homes_for_folders(conn, folders) -> dict:
+    """{folder_name: {id, company_id}} (one query; folder_name is globally unique)."""
+    folders = sorted({f for f in (folders or []) if f})
+    if not folders:
+        return {}
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT folder_name, id, company_id FROM users WHERE folder_name = ANY(%s)",
+        (folders,)).fetchall()
+    return {r["folder_name"]: {"id": r["id"], "company_id": r["company_id"]} for r in rows}

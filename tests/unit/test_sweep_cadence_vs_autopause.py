@@ -32,7 +32,11 @@ SWEEP_SRC = os.path.join(HERE, "..", "..", "src", "lambda_finalize_claim.py")
 # Allowed to run faster than the threshold *because* it gates internally.
 # RecordingSegmentsFunction: its rate(5 minutes) trailing pass reads its own sweep_state
 # flag before connecting, with an hourly safety window (design 2026-09-15 §5.4, F4).
-GATED_EXCEPTIONS = {"FinalizeSweepFunction", "RecordingSegmentsFunction"}
+# LakeOpsFunction: its rate(10 minutes) export_tick lists export_requests/ in S3 first and
+# opens no connection when empty (tests/unit/test_export_tick.py pins zero connections); its
+# hourly drain lists lake_manifest/ first and does the same
+# (tests/unit/test_drain_lake_manifest_dispatch.py).
+GATED_EXCEPTIONS = {"FinalizeSweepFunction", "RecordingSegmentsFunction", "LakeOpsFunction"}
 
 # AWS's own default when MinCapacity is 0 and the field is omitted.
 AWS_DEFAULT_SECONDS_UNTIL_AUTO_PAUSE = 300
@@ -173,3 +177,16 @@ def test_safety_pass_is_hourly_not_equal_to_the_threshold():
     assert 3600 >= threshold * 2, (
         f"SecondsUntilAutoPause={threshold}s leaves the hourly safety pass "
         f"(3600s) too close to the threshold; the cluster will rarely pause.")
+
+
+def test_the_lake_ops_exception_gates_both_of_its_connections():
+    """LakeOpsFunction is exempt because export_tick and the drain list S3 before they ever
+    call get_connection(). If either gate goes, the exemption is a lie."""
+    src = _read(os.path.join(HERE, "..", "..", "src", "lambda_org_api.py"))
+    for fn in ("def export_tick(", "def drain_lake_manifest_run("):
+        body = src[src.index(fn):]
+        body = body[:body.index("\ndef ", 10)]
+        assert "get_connection()" in body
+        first = min(i for i in (body.find("list_objects_v2"), body.find("_list_manifest_objects"))
+                    if i >= 0)
+        assert first < body.index("get_connection()"), fn
