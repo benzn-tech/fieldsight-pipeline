@@ -9923,6 +9923,17 @@ def _normalize_prose(value, alias_pairs):
     return value
 
 
+def _deadline_fields(a, date):
+    """{deadline_display, deadline_by} for one action-item row, anchored on the
+    day it was recorded. A user-set date (PATCH writes it to both columns) reads
+    the same way as a spoken one."""
+    import due_display
+    said = a.get("deadline_text") or (str(a["deadline"]) if a.get("deadline") else None)
+    d = due_display.describe(said, date)
+    return {"deadline_display": d["display"] if d else None,
+            "deadline_by": d["by"] if d else None}
+
+
 def render_report_shape(rows, doc, date, folder, conn=None, company_id=None,
                         all_companies=False):
     """Pure function: render Aurora extraction topics INTO the
@@ -10049,6 +10060,12 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None,
             # has to be added here too.
             "action_items": [{"id": str(a["id"]), "action": a["text"], "responsible": a["responsible"],
                               "deadline": a["deadline_text"] or (str(a["deadline"]) if a["deadline"] else None),
+                              # The day it names, said once here for every page
+                              # (owner, 2026-10-12): "Tue 13 Oct 2026, morning",
+                              # and `deadline_by`, the local moment it is overdue
+                              # after. Readers show these instead of parsing
+                              # `deadline` again; the words stay in `deadline`.
+                              **_deadline_fields(a, date),
                               "priority": a["priority"], "status": a["status"],
                               "mention_count": a.get("mention_count", 1),
                               "collapsed_ids": [str(x) for x in (a.get("collapsed_ids") or [])],

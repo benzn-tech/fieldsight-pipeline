@@ -165,9 +165,13 @@ def _display_name(folder):
     return " ".join(folder.replace("_", " ").split()) or None if folder else None
 
 
-def _clean_todos(open_todos):
+def _clean_todos(open_todos, date=None):
     """Keep only to-dos with real text; normalise responsible + due to a value or
     None. Each item carries {text, responsible, due, at} for the structured render.
+
+    `due` is shown as the day it names, anchored on the recording's `date`:
+    "tomorrow morning" said on 12 Oct reads "Tue 13 Oct 2026, morning"
+    (due_display; owner, 2026-10-12). Words no day can be read from stay as said.
 
     `why` is dropped here even when the caller's dict still carries one (2026-09-17,
     "the code stops carrying `why` and `basis`"): the confirmation email no longer
@@ -180,13 +184,14 @@ def _clean_todos(open_todos):
     # "—" for the same row. One filter, reused, so the two cannot drift:
     # fieldsight-ui email-preview-modal.js `isSpeakerLabel` mirrors this pattern.
     import session_brief
+    import due_display
     out = []
     for t in (open_todos or []):
         text = (t.get("text") or "").strip()
         if text:
             out.append({"text": text,
                         "responsible": session_brief._real_name(t.get("responsible")),
-                        "due": (t.get("due") or None),
+                        "due": due_display.display(t.get("due"), date),
                         "at": (t.get("at") or None),
                         # "action" (someone owes something) or "topic" (something
                         # was discussed and nobody promised anything). Dropping it
@@ -270,17 +275,6 @@ def _long_date(iso):
     return "%s %d %s" % (d.strftime("%A"), d.day, d.strftime("%B %Y"))
 
 
-def _short_date(value):
-    """A due date the model normalised to ISO reads "Wed 14 Oct" in the card;
-    anything else ("Friday", "end of week") is shown as it came."""
-    import datetime as dt
-    try:
-        d = dt.date.fromisoformat(value)
-    except (TypeError, ValueError):
-        return value
-    return "%s %d %s" % (d.strftime("%a"), d.day, d.strftime("%b"))
-
-
 def open_link(date):
     """Where "Open in FieldSight" goes: the recorder's Timeline for that day.
 
@@ -315,7 +309,7 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
     nothing else, which reads as a broken send."""
     stamp = " ".join(p for p in (date, time_range) if p)
     subject = "FieldSight — your site notes" + (f" ({stamp})" if stamp else "")
-    todos = _ordered_rows(_clean_todos(open_todos))
+    todos = _ordered_rows(_clean_todos(open_todos, date))
     no_todos_note = "Nothing was captured for this recording."
     # A topic row is not a task: nobody owes it, so its owner and due date are
     # N/A rather than the em dash an UNASSIGNED action carries. The two mean
@@ -385,7 +379,7 @@ def build_confirmation_email(*, date=None, time_range=None, site_name=None,
         def _row(i, t):
             topic = t["kind"] == "topic"
             who = na if topic else (esc(t["responsible"]) if t["responsible"] else "—")
-            when = na if topic else (esc(_short_date(t["due"])) if t["due"] else "—")
+            when = na if topic else (esc(t["due"]) if t["due"] else "—")
             # Greyed, so a reader scanning for what they owe can stop at the last
             # dark row. No per-item line under the title: `why` stopped being
             # carried (#864).

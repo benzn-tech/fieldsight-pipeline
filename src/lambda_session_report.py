@@ -25,6 +25,7 @@ import boto3
 from lake_put import lake_put
 import checklist
 import chunking
+import due_display
 import lambda_meeting_minutes
 import llm_utils
 import nz_time
@@ -750,9 +751,13 @@ def _clock(date, hhmm):
     return datetime.datetime.strptime("%s %s" % (date, hhmm), fmt)
 
 
-def _action_items_for_prompt(content, offer=None):
+def _action_items_for_prompt(content, offer=None, date=None):
     """The actions the model is given: extraction's, not its own reading of the
     transcript. Owner and date are already recorded against them.
+
+    The deadline goes out as the day it names, anchored on the report's `date`
+    ("before Wed 14 Oct 2026", not "before Wednesday"): the same rows become the
+    document's Actions table, read days later (due_display; owner, 2026-10-12).
 
     `offer` (the topics in this report's window, _offered_topics) limits them
     to those topics' actions. Without it every action of the day came along: on
@@ -767,7 +772,7 @@ def _action_items_for_prompt(content, offer=None):
         for a in (topic.get("action_items") or []):
             out.append({"action": a.get("action") or a.get("text"),
                         "owner": a.get("owner") or a.get("responsible"),
-                        "deadline": a.get("deadline")})
+                        "deadline": due_display.display(a.get("deadline"), date)})
     return out
 
 
@@ -986,7 +991,7 @@ def _generate_document(artifact, context=None):
         {"folder": artifact["folder"], "date": date,
          "from": window.get("from") or "00:00", "to": window.get("to") or "23:59",
          "recordings": len(picked)},
-        _action_items_for_prompt(content, topic_offer),
+        _action_items_for_prompt(content, topic_offer, date),
         "\n".join(t["line"] for t in turns),
         source=source,
         topics=topic_offer)
@@ -1027,7 +1032,7 @@ def _generate_document(artifact, context=None):
     # whose evidence is in the transcript survive, in the customer's order and
     # wording, and every item nobody addressed stays blank (checklist.py).
     checklist_reports = checklist.apply(
-        prose, template, "\n".join(t["line"] for t in turns))
+        prose, template, "\n".join(t["line"] for t in turns), report_date=date)
     model_copies = report_facts.drop_model_copies(prose, code_placements)
     unanchored = _unanchored(prose, skip_titles=list(checklist_reports))
     if unanchored:
@@ -1086,7 +1091,7 @@ def _generate_document(artifact, context=None):
         # Report Details section it carries what was actually recorded.
         report_facts._long_date(date) or date,
         prose,
-        _action_items_for_prompt(content, topic_offer),
+        _action_items_for_prompt(content, topic_offer, date),
         closing=note,
         # The running header's left side: the project(s) this report is about.
         header_left=_project_names(artifact) or None)

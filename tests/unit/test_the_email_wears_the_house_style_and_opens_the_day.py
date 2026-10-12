@@ -64,13 +64,17 @@ def test_the_template_gives_each_stage_its_own_app():
            "'https://dev.d2fssznicvuckr.amplifyapp.com']" in fn
 
 
-def test_an_iso_due_date_reads_as_a_day_in_the_card_only():
+def test_a_due_date_reads_as_the_day_it_names_in_both_tables():
+    """Owner, 2026-10-12: every surface shows the day itself, "Wed 14 Oct 2026",
+    anchored on the recording's date -- "Friday" said on Thu 8 Oct is the 9th."""
     _, text, html = fin.build_confirmation_email(
         date="2026-10-08", open_todos=[{"text": "Blow out the deck", "responsible": "Mike",
                                         "due": "2026-10-14"},
-                                       {"text": "Book the pump", "due": "Friday"}])
-    assert ">Wed 14 Oct</td>" in html and ">Friday</td>" in html
-    assert "| Blow out the deck | Mike | 2026-10-14 |" in text, "the text table is the frontend's contract"
+                                       {"text": "Book the pump", "due": "Friday"},
+                                       {"text": "Ring Hirepool", "due": "this arvo"}])
+    assert ">Wed 14 Oct 2026</td>" in html and ">Fri 9 Oct 2026</td>" in html
+    assert ">Thu 8 Oct 2026, afternoon</td>" in html
+    assert "| Blow out the deck | Mike | Wed 14 Oct 2026 |" in text
 
 
 def test_a_check_inside_one_minute_shows_the_minute_once():

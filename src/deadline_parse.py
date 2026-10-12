@@ -28,7 +28,17 @@ _ISO_ANYWHERE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 _YEAR = re.compile(r"\b(20\d{2})\b")
 _DAY_MONTH = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\b")
 _MONTH_DAY = re.compile(r"\b([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?\b")
-_WITHIN = re.compile(r"\b(?:within|in)\s+(\d+)\s*(day|week)s?\b")
+_WITHIN = re.compile(r"\b(?:within|in)\s+(\d+|an?|one|two|three|four|five|six|seven|"
+                     r"eight|nine|ten|(?:a\s+)?couple\s+of)\s*(day|week|fortnight)s?\b")
+#: Spoken numbers, because a deadline is said before it is typed: "in two days"
+#: was NULL while "in 2 days" resolved (measured 2026-10-12).
+_NUMBER_WORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4,
+                 "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+_UNIT_DAYS = {"day": 1, "week": 7, "fortnight": 14}
+#: "End of next week" is that week's Friday. It used to match "next week" and
+#: land on the Monday, four days early -- early is the wrong direction: it
+#: reports as overdue something that is not yet owed.
+_END_OF_NEXT_WEEK = re.compile(r"\b(?:end\s+of|by\s+the\s+end\s+of)\s+next\s+week\b")
 # "Within one hour" is real prod text. At this column's DAY granularity that
 # is the report's own date -- not a guess, just the honest rounding. Worded
 # numbers are included because that is how people say it out loud.
@@ -84,6 +94,11 @@ _PLACEHOLDERS = {"null", "none", "n/a", "na", "tbc", "tbd", "-", "--"}
 _TODAY_WORDS = (
     "end of day", "close of business", "eod", "cob",
     "tonight", "this morning", "this afternoon", "this evening",
+    # Site words for the same thing (2026-10-12: "I'll ring Hirepool this
+    # arvo" had no date). Weak words only speak when no named day did, so
+    # "Wednesday arvo" is still Wednesday.
+    "this arvo", "this avo", "arvo", "lunchtime", "lunch", "midday", "noon",
+    "knock off", "knock-off", "knockoff",
 )
 _END_OF_WEEK_WORDS = ("end of week", "eow", "end of the week", "this week",
                       "by the end of the week")
@@ -108,7 +123,7 @@ _NEXT_MONTH_WORDS = ("next month",)
 #: or "3" or "1.5" resolved to the anchor and was overdue the next morning.
 #: A number on its own does not name a time.
 _BARE_TIME = re.compile(
-    r"^\s*(?:\d{1,2}[:.]\d{2}\s*(?:am|pm)?|\d{1,2}\s*(?:am|pm))\s*$",
+    r"^\s*(?:by|before|at)?\s*(?:\d{1,2}[:.]\d{2}\s*(?:am|pm)?|\d{1,2}\s*(?:am|pm))\s*$",
     re.IGNORECASE)
 #: 2026-9-5 as readily as 2026-09-05.
 _ISO_LOOSE = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
@@ -287,14 +302,17 @@ def resolve_deadline(free_text, report_date_iso):
             delta = 7        # strictly after the conversation, never same-day
         return (anchor + timedelta(days=delta)).isoformat()
 
+    if _END_OF_NEXT_WEEK.search(lower):
+        return (anchor + timedelta(days=7 - anchor.weekday() + 4)).isoformat()
+
     if re.search(r"\bnext\s+week\b", lower):
         return (anchor + timedelta(days=7)).isoformat()
 
     w = _WITHIN.search(lower)
     if w:
-        n = int(w.group(1))
-        days = n * 7 if w.group(2) == "week" else n
-        return (anchor + timedelta(days=days)).isoformat()
+        n = w.group(1)
+        n = int(n) if n.isdigit() else _NUMBER_WORDS.get(n, 2)   # "couple of" is 2
+        return (anchor + timedelta(days=n * _UNIT_DAYS[w.group(2)])).isoformat()
 
     spelled = _parse_spelled(text, anchor)
     if spelled:
