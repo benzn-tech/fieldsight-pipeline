@@ -85,7 +85,7 @@ def build(user_rows, membership_rows, site_rows, published_at, activity=None,
     `activity`: [{user_id, site_id, n, latest}] -- topics by that user on that
     site in the last PRIMARY_SITE_WINDOW_DAYS days, used to choose a primary
     site among several.
-    `external_user_ids`: users holding a live external membership. Each person gets
+    `external_user_ids`: users who have EVER held an external membership (archived included). Each person gets
     `has_external` true/false; the external sites themselves are NOT listed.
     """
     ext = {str(x) for x in (external_user_ids or ())}

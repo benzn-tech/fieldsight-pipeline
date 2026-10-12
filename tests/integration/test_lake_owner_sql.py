@@ -250,3 +250,16 @@ def test_r5g_through_real_rows_external_member_request_is_null_home_member_is_ho
     assert o["company_id"] is None and o["reason"] == "external_member_uncertain"
     o = r.resolve(f"report_requests/{eve['folder_name']}/r1.json")
     assert o["company_id"] == str(w["b"]["id"]) and o["reason"] == "folder_home"
+
+
+# ---- I4: the directory's has_external is "ever external", like the resolver ---------------
+def test_directory_external_user_ids_keeps_an_archived_external_member(db):
+    from repositories import directory as directory_repo
+    w = _world(db)
+    memberships.add_external_membership(db, w["ada"]["id"], w["sb"]["id"], "worker")
+    assert str(w["ada"]["id"]) in directory_repo.external_user_ids(db)
+    memberships.archive_membership(db, w["ada"]["id"], w["sb"]["id"])
+    assert str(w["ada"]["id"]) in directory_repo.external_user_ids(db)
+    # and agrees with the resolver's answer for the same user
+    assert memberships.ever_external_user_ids(db, [w["ada"]["id"]]) <= \
+        directory_repo.external_user_ids(db)
