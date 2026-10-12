@@ -233,6 +233,8 @@ jobs:
               "TranscriptTableName=fieldsight-test-transcripts" \
               "AuthorityFlip=${{ vars.TEST_AUTHORITY_FLIP || 'false' }}" \
               "GradedRoles=${{ vars.TEST_GRADED_ROLES || 'false' }}" \
+              "LakeIndexReads=${{ vars.TEST_LAKE_INDEX_READS || 'false' }}" \
+              "CompanySummaryServe=${{ vars.TEST_COMPANY_SUMMARY_SERVE || 'off' }}" \
               "EnableUserDeletion=${{ vars.TEST_ENABLE_USER_DELETION || 'false' }}" \
               "EnableExternalCorroboration=${{ vars.TEST_ENABLE_EXTERNAL_CORROBORATION || 'false' }}" \
               "CorroborationApiKey=${{ secrets.OPENROUTER_API_KEY }}" \
