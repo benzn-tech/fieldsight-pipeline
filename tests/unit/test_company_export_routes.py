@@ -1,4 +1,4 @@
-"""POST/GET /companies/{id}/export: platform_admin only, async via LakeOps, presigned downloads
+"""POST/GET /companies/{id}/export: platform_admin only, async via an export_requests/ object, presigned downloads
 confined to exports/{company_id}/{export_id}/ with a 15-minute expiry."""
 import io
 import json
@@ -45,6 +45,12 @@ class S3:
         self.docs = docs or {}
         self.presigned = []
 
+    def put_object(self, **kw):
+        if getattr(self, "put_fails", False):
+            raise RuntimeError("s3 down")
+        self.puts = getattr(self, "puts", []) + [kw]
+        return {}
+
     def get_object(self, Bucket, Key):
         if Key not in self.docs:
             raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "x"}}, "GetObject")
@@ -63,7 +69,7 @@ def caller(role):
 def wired(monkeypatch):
     state = {"role": "platform_admin", "company": {"id": CO, "name": "Co"}, "lam": Lam(),
              "s3": S3(), "lookups": []}
-    monkeypatch.setenv("LAKE_OPS_FUNCTION", "fs-lakeops")
+    monkeypatch.setenv("LAKE_BUCKET", "lake-b")
     monkeypatch.setattr(org, "get_connection", lambda: FakeConn())
     monkeypatch.setattr(org.device_heartbeat, "record", lambda *a, **k: None)
     monkeypatch.setattr(org.users, "get_user_by_sub", lambda conn, sub: caller(state["role"]))
@@ -72,7 +78,6 @@ def wired(monkeypatch):
         state["lookups"].append(cid)
         return state["company"]
     monkeypatch.setattr(org.companies, "get_company_by_id", get_company)
-    monkeypatch.setattr(org, "lambda_client", lambda: state["lam"])
     monkeypatch.setattr(org, "s3", lambda: state["s3"])
     return state
 
@@ -106,28 +111,22 @@ def test_unknown_company_is_404_and_a_non_uuid_company_is_404(wired):
     assert wired["lam"].calls == []
 
 
-def test_post_invokes_lake_ops_once_asynchronously(wired):
+def test_post_writes_the_request_and_invokes_nothing(wired):
     resp = call("POST", f"/companies/{CO}/export")
     assert resp["statusCode"] == 202
-    (c,) = wired["lam"].calls
-    assert c["FunctionName"] == "fs-lakeops" and c["InvocationType"] == "Event"
-    payload = json.loads(c["Payload"])
-    assert payload["task"] == "export_company" and payload["company_id"] == CO
-    assert str(uuid.UUID(payload["export_id"])) == payload["export_id"]
-    assert body(resp)["exportId"] == payload["export_id"]
+    (put,) = wired["s3"].puts
+    eid = body(resp)["exportId"]
+    assert str(uuid.UUID(eid)) == eid
+    assert put["Key"] == f"export_requests/{CO}/{eid}.json"
+    doc = json.loads(put["Body"])
+    assert doc["company_id"] == CO and doc["export_id"] == eid
+    assert doc["requested_by"] == "u1" and doc["requested_at"]
+    assert wired["lam"].calls == []
+    assert not hasattr(org, "lambda_client")
 
 
-def test_unconfigured_is_503_and_nothing_runs_inline(wired, monkeypatch):
-    monkeypatch.delenv("LAKE_OPS_FUNCTION")
-    ran = []
-    monkeypatch.setattr(org.company_export, "run", lambda *a, **k: ran.append(1))
-    resp = call("POST", f"/companies/{CO}/export")
-    assert resp["statusCode"] == 503 and "export not configured" in body(resp)["error"]
-    assert wired["lam"].calls == [] and ran == []
-
-
-def test_an_invoke_failure_is_a_502_not_a_crash(wired):
-    wired["lam"] = Lam(fail=True)
+def test_a_request_write_failure_is_a_502_not_a_crash(wired):
+    wired["s3"].put_fails = True
     assert call("POST", f"/companies/{CO}/export")["statusCode"] == 502
 
 

@@ -394,6 +394,8 @@ BACKFILL_LEGACY_TICKS_TASK = "backfill_legacy_ticks"
 DRAIN_LAKE_MANIFEST_TASK = "drain_lake_manifest"
 BACKFILL_LAKE_OBJECTS_TASK = "backfill_lake_objects"
 EXPORT_COMPANY_TASK = "export_company"
+EXPORT_TICK_TASK = "export_tick"
+EXPORT_REQUEST_PREFIX = "export_requests/"
 
 
 def lambda_handler(event, context):
@@ -436,10 +438,15 @@ def lambda_handler(event, context):
                 start_after=event.get("start_after"), time_budget_s=budget)
     # OPERATOR TASK (lake ownership): streams one company's lake objects into ZIP parts under
     # exports/{company_id}/{export_id}/. Same envelope rule as above (no API caller reaches
-    # it). Meant for LakeOpsFunction (long timeout); it re-invokes itself with the cursor until
-    # done. The platform_admin route only starts it (start_company_export).
+    # it). Meant for LakeOpsFunction (long timeout). One call runs one time budget and returns
+    # next_cursor; the scheduled export_tick below is what resumes exports in production.
     if isinstance(event, dict) and event.get("task") == EXPORT_COMPANY_TASK:
         return export_company_task(event, context)
+    # SCHEDULED (LakeOps, rate(10 minutes)): picks up export_requests/ left by the route. It
+    # lists S3 FIRST and opens no database connection unless there is work, so an idle tick
+    # lets Aurora auto-pause. Deliberately dispatched before any get_connection().
+    if isinstance(event, dict) and event.get("task") == EXPORT_TICK_TASK:
+        return export_tick(event, context)
     # OPERATOR TASK, invoked by hand with `aws lambda invoke` (IAM decides who
     # may). The same envelope rule as above keeps it out of reach of the API.
     # A dry run unless "apply" is exactly true: a typo must not write.
@@ -5495,25 +5502,25 @@ def _export_company_or_error(conn, caller, company_id):
 
 
 def start_company_export(conn, caller, company_id):
-    """POST /companies/{id}/export -- start an asynchronous export of one company's lake data.
+    """POST /companies/{id}/export -- ask for an asynchronous export of one company's lake data.
 
-    Runs on LakeOpsFunction (env LAKE_OPS_FUNCTION), never inline: org-api's timeout is 30 s.
-    Without that env the route answers 503 rather than doing the work here. The export id is
-    minted here (a uuid), so the caller can poll before the first part exists."""
+    Writes export_requests/{company_id}/{export_id}.json through the S3 gateway endpoint and
+    returns 202. It invokes nothing: in-VPC org-api has no route to the Lambda API (no NAT, no
+    endpoint). LakeOps picks the request up on its next export_tick. The export id is minted
+    here (a uuid), so the caller can poll before the first part exists."""
     cid, err = _export_company_or_error(conn, caller, company_id)
     if err:
         return err
-    target = os.environ.get("LAKE_OPS_FUNCTION")
-    if not target:
-        return error("export not configured", 503)
     export_id = str(uuid.uuid4())
+    request = {"company_id": cid, "export_id": export_id, "requested_by": caller.get("id"),
+               "requested_at": datetime.now(timezone.utc).isoformat()}
     try:
-        lambda_client().invoke(
-            FunctionName=target, InvocationType="Event",
-            Payload=json.dumps({"task": EXPORT_COMPANY_TASK, "company_id": cid,
-                                "export_id": export_id}).encode())
+        s3().put_object(Bucket=_export_bucket_for("exports"),
+                        Key=f"{EXPORT_REQUEST_PREFIX}{cid}/{export_id}.json",
+                        Body=json.dumps(request).encode("utf-8"),
+                        ContentType="application/json")
     except Exception:
-        logger.exception("company export: could not invoke %s for company %s", target, cid)
+        logger.exception("company export: could not write the request for company %s", cid)
         return error("could not start the export", 502)
     logger.info("company export started: company=%s export=%s by user=%s",
                 cid, export_id, caller.get("id"))
@@ -5587,22 +5594,11 @@ def _export_bucket_for(kind):
     return LAKE_BUCKET or S3_BUCKET
 
 
-_lambda_client = None
-
-
-def lambda_client():
-    global _lambda_client
-    if _lambda_client is None:
-        _lambda_client = boto3.client("lambda")
-    return _lambda_client
-
-
 def export_company_task(event, context=None):
-    """Run (part of) export_company, then chain to itself with the cursor until done.
+    """Run one time budget of export_company and return the result (next_cursor if not done).
 
     Event: {"task", "company_id", "export_id"?, "cursor"?, "time_budget_s"?, "part_bytes"?}.
-    The chain target is env LAKE_OPS_FUNCTION, else this function. Without either (a hand
-    invoke on a stack that has no LakeOps) the caller gets next_cursor and re-invokes.
+    No self-chaining: the scheduled export_tick resumes unfinished exports from their saved state.
     """
     budget = event.get("time_budget_s")
     if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0:
@@ -5612,23 +5608,79 @@ def export_company_task(event, context=None):
         part_bytes = company_export.DEFAULT_PART_BYTES
     try:
         with get_connection() as conn:
-            out = company_export.run(
+            return company_export.run(
                 conn, s3(), event.get("company_id"), bucket_for=_export_bucket_for,
                 export_id=event.get("export_id"), cursor=event.get("cursor"),
                 time_budget_s=budget, part_bytes=part_bytes,
                 dest_bucket=_export_bucket_for("exports"))
     except (ValueError, company_export.ExportError) as exc:
         return {"error": str(exc)}
-    if not out["done"] and out.get("next_cursor") and not out.get("lost_race"):
-        target = os.environ.get("LAKE_OPS_FUNCTION") or getattr(context, "function_name", None)
-        if target:
-            lambda_client().invoke(
-                FunctionName=target, InvocationType="Event",
-                Payload=json.dumps({"task": EXPORT_COMPANY_TASK, "company_id": out["company_id"],
-                                    "export_id": out["export_id"], "cursor": out["next_cursor"],
-                                    "time_budget_s": budget, "part_bytes": part_bytes}).encode())
-            out["chained"] = True
-    return out
+
+
+def _delete_export_request(s3_client, bucket, key):
+    try:
+        s3_client.delete_object(Bucket=bucket, Key=key)
+    except Exception:  # noqa: BLE001 - it is retried, harmlessly, on the next tick
+        logger.exception("export_tick: could not delete %s", key)
+
+
+def export_tick(event, context=None):
+    """Advance ONE pending company export by one time budget.
+
+    S3 only until there is work: list export_requests/ first and return with no database
+    connection when it is empty (an idle tick must not keep Aurora awake). Per request: the key
+    path is the authority, so a body whose company_id/export_id disagree with it is logged and
+    skipped (nothing deleted). A request whose state.json says done is deleted without running.
+    The first unfinished one runs with the remaining Lambda time; the request is deleted only
+    once the run reports done. One export per tick."""
+    s3_client = s3()
+    bucket = _export_bucket_for("exports")
+    keys = []
+    for page in s3_client.get_paginator("list_objects_v2").paginate(
+            Bucket=bucket, Prefix=EXPORT_REQUEST_PREFIX):
+        keys.extend(o["Key"] for o in page.get("Contents") or [])
+    keys = sorted(k for k in keys if k.endswith(".json"))
+    if not keys:
+        return {"requests": 0, "ran": None}
+    budget = company_export.DEFAULT_TIME_BUDGET_S
+    remaining = getattr(context, "get_remaining_time_in_millis", None)
+    if callable(remaining):
+        budget = max(30, min(budget, int(remaining() / 1000) - 90))
+    skipped, finished = 0, 0
+    for key in keys:
+        parts = key[len(EXPORT_REQUEST_PREFIX):-len(".json")].split("/")
+        try:
+            if len(parts) != 2:
+                raise ValueError("unexpected key shape")
+            cid = company_export._canon_uuid(parts[0], "company_id")
+            eid = company_export._canon_uuid(parts[1], "export_id")
+            doc = json.loads(s3_client.get_object(Bucket=bucket, Key=key)["Body"].read())
+            if doc.get("company_id") != cid or doc.get("export_id") != eid:
+                raise ValueError("request body does not match its key")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("export_tick: skipping %s: %s", key, exc)
+            skipped += 1
+            continue
+        state, _ = company_export._read_state(
+            s3_client, bucket, company_export.export_prefix(cid, eid) + "state.json")
+        if state is not None and state.get("done"):
+            _delete_export_request(s3_client, bucket, key)
+            finished += 1
+            continue
+        try:
+            with get_connection() as conn:
+                out = company_export.run(
+                    conn, s3_client, cid, bucket_for=_export_bucket_for, export_id=eid,
+                    time_budget_s=budget, dest_bucket=bucket)
+        except (ValueError, company_export.ExportError) as exc:
+            logger.warning("export_tick: export %s failed: %s", key, exc)
+            return {"requests": len(keys), "ran": key, "error": str(exc)}
+        if out.get("done"):
+            _delete_export_request(s3_client, bucket, key)
+        return {"requests": len(keys), "ran": key, "done": bool(out.get("done")),
+                "skipped": skipped, "finished_without_running": finished}
+    return {"requests": len(keys), "ran": None, "skipped": skipped,
+            "finished_without_running": finished}
 
 
 def backfill_lake_objects(conn, s3_client, *, apply=False, buckets=None, prefixes=None,

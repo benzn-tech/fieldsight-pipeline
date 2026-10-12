@@ -1,5 +1,5 @@
 """export_company is an operator task: reachable only by a direct invoke carrying `task`
-(never through an API Gateway proxy event), and it chains itself with the cursor until done."""
+(never through an API Gateway proxy event). It does not chain: export_tick resumes it."""
 import contextlib
 import json
 import uuid
@@ -27,7 +27,6 @@ def _patch(monkeypatch, outs):
         yield "CONN"
     monkeypatch.setattr(api, "get_connection", fake_conn)
     monkeypatch.setattr(api, "s3", lambda: "S3")
-    monkeypatch.setattr(api, "lambda_client", lambda: lam)
 
     def fake_run(conn, s3_client, company_id, **kw):
         seen["runs"].append((conn, s3_client, company_id, kw))
@@ -61,20 +60,7 @@ def test_defaults_and_junk_values(monkeypatch):
     assert kw["time_budget_s"] == 780 and kw["part_bytes"] == 536870912
 
 
-def test_not_done_chains_to_lake_ops_with_the_cursor(monkeypatch):
-    monkeypatch.setenv("LAKE_OPS_FUNCTION", "fs-lakeops")
-    _, lam = _patch(monkeypatch, [_out(False, "cur-1")])
-    out = api.lambda_handler({"task": "export_company", "company_id": CO, "export_id": "e1"}, None)
-    assert out["chained"] is True
-    (call,) = lam.calls
-    assert call["FunctionName"] == "fs-lakeops" and call["InvocationType"] == "Event"
-    payload = json.loads(call["Payload"])
-    assert payload["task"] == "export_company" and payload["cursor"] == "cur-1"
-    assert payload["company_id"] == CO and payload["export_id"] == "e1"
-
-
-def test_not_done_without_a_target_returns_the_cursor_for_a_hand_re_invoke(monkeypatch):
-    monkeypatch.delenv("LAKE_OPS_FUNCTION", raising=False)
+def test_not_done_returns_the_cursor_and_invokes_nothing(monkeypatch):
     _, lam = _patch(monkeypatch, [_out(False, "cur-1")])
     out = api.lambda_handler({"task": "export_company", "company_id": CO}, None)
     assert out["next_cursor"] == "cur-1" and lam.calls == [] and "chained" not in out
@@ -98,15 +84,6 @@ def test_an_api_gateway_event_cannot_reach_the_task(monkeypatch):
     except Exception:  # noqa: BLE001 - whatever the router does, it must not export
         pass
     assert seen["runs"] == []
-
-
-def test_a_lost_race_does_not_chain(monkeypatch):
-    monkeypatch.setenv("LAKE_OPS_FUNCTION", "fs-lakeops")
-    out = _out(False, None)
-    out["lost_race"] = True
-    _, lam = _patch(monkeypatch, [out])
-    api.lambda_handler({"task": "export_company", "company_id": CO, "export_id": "e1"}, None)
-    assert lam.calls == []
 
 
 def test_export_error_is_an_error_value(monkeypatch):

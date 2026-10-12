@@ -2383,9 +2383,6 @@ Resources:
           # open, and the sweep's hourly pass recovers it.
           SWEEP_STATE_TABLE: !Ref ItemsTableName
           STAGE: !Ref Stage
-          # Lake ownership: the function that runs the long operator tasks (company
-          # export). Built from the name pattern, the same way LakeOpsFunction names itself.
-          LAKE_OPS_FUNCTION: !Sub ["${P}-lake-ops", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
           # flip only after backfill + a drain (see the LakeIndexReads parameter)
           LAKE_INDEX_READS: !Ref LakeIndexReads
           # owner product decision (see the CompanySummaryServe parameter)
@@ -2753,16 +2750,15 @@ Resources:
                 Action: [dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:GetItem]
                 Resource: !GetAtt QrLoginCodesTable.Arn
               - !Ref AWS::NoValue
-        # Lake ownership: POST /companies/{id}/export hands the long work to LakeOps, and the
-        # status route presigns what LakeOps wrote. GetObject only on exports/ (presigning
-        # needs it); org-api never writes there.
+        # Lake ownership: POST /companies/{id}/export leaves a request object for LakeOps's
+        # scheduled export_tick (this function is in the VPC and cannot call the Lambda API),
+        # and the status route presigns what LakeOps wrote. Write on export_requests/ only;
+        # GetObject only on exports/ (presigning needs it), where org-api never writes.
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
-              Action: lambda:InvokeFunction
-              Resource: !Sub
-                - "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${P}-lake-ops"
-                - P: !FindInMap [StageConfig, !Ref Stage, Prefix]
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/export_requests/*
             - Effect: Allow
               Action: s3:GetObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/exports/*
@@ -2812,11 +2808,12 @@ Resources:
   #   drain_lake_manifest   -- fold lake_manifest/ lines into lake_objects (daily, below)
   #   backfill_lake_objects -- one-off walk of the bucket(s), dry-run by default
   #   export_company        -- one company's lake data as zip parts under exports/
-  # export_company chains itself (Event invoke) until done, hence the self-invoke grant.
+  #   export_tick           -- every 10 minutes: advance one pending export_requests/ item
+  # No function invokes another here: the VPC has no route to the Lambda API, so the export
+  # route leaves a request object in S3 and export_tick (S3 first, no DB when idle) resumes it.
   #
   # NO ReservedConcurrentExecutions and NO API events: the mobile upload path must never
-  # share a pool with a 15-minute export. The function names itself in env by pattern,
-  # never !Ref/!GetAtt (a function referring to itself is a circular dependency).
+  # share a pool with a 15-minute export.
   # ----------------------------------------------------------
   LakeOpsFunction:
     Type: AWS::Serverless::Function
@@ -2848,8 +2845,6 @@ Resources:
           S3_BUCKET: !Ref DataBucketName
           LAKE_BUCKET: !Ref IngestBucketName
           STAGE: !Ref Stage
-          # Its own name, for the export's self-chaining. A pattern, not !Ref/!GetAtt.
-          LAKE_OPS_FUNCTION: !Sub ["${P}-lake-ops", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       Policies:
         # lake_put (lake ownership): LakeOps runs lambda_org_api, which imports the helpers
         # that call lake_put. PutObject on the manifest prefix only (see OrgApiFunction).
@@ -2899,23 +2894,31 @@ Resources:
                 - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
             - Effect: Allow
-              # export_company chains itself with an Event invoke until it is done.
-              Action: lambda:InvokeFunction
-              Resource: !Sub
-                - "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${P}-lake-ops"
-                - P: !FindInMap [StageConfig, !Ref Stage, Prefix]
+              # export_tick deletes a request object once its export is done.
+              Action: s3:DeleteObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/export_requests/*
       Events:
         # Daily, ahead of the 04:30 NZ site-coords and 04:35 NZ directory republish
-        # (cron 15:30 / 15:35 UTC). UTC is fixed, so 15:25 UTC is before both in NZST
-        # (UTC+12, 03:25) and in NZDT (UTC+13, 04:25). On demand:
+        # (cron 15:30 / 15:35 UTC). UTC is fixed, so 15:05 UTC is before both in NZST
+        # (UTC+12, 03:05) and in NZDT (UTC+13, 04:05), and the 15-minute ceiling ends it by
+        # 15:20 UTC, before the 15:30 run starts. On demand:
         #   aws lambda invoke --function-name <prefix>-lake-ops --payload '{"task":"drain_lake_manifest"}'
         DrainLakeManifest:
           Type: Schedule
           Properties:
-            Schedule: cron(25 15 * * ? *)
+            Schedule: cron(5 15 * * ? *)
             Description: Fold the lake manifest into lake_objects before the morning republish
             State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
             Input: '{"task": "drain_lake_manifest"}'
+        # Advances one pending company export. Lists export_requests/ in S3 first and opens no
+        # database connection when there is nothing to do, so this does not keep Aurora awake.
+        ExportTick:
+          Type: Schedule
+          Properties:
+            Schedule: rate(10 minutes)
+            Description: Advance one pending company export (S3 only when idle)
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
+            Input: '{"task": "export_tick"}'
 
   # ----------------------------------------------------------
   # QR passwordless login (2026-07-30, v2 2026-07-31) — code table only.

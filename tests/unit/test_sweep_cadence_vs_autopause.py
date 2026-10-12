@@ -32,7 +32,9 @@ SWEEP_SRC = os.path.join(HERE, "..", "..", "src", "lambda_finalize_claim.py")
 # Allowed to run faster than the threshold *because* it gates internally.
 # RecordingSegmentsFunction: its rate(5 minutes) trailing pass reads its own sweep_state
 # flag before connecting, with an hourly safety window (design 2026-09-15 §5.4, F4).
-GATED_EXCEPTIONS = {"FinalizeSweepFunction", "RecordingSegmentsFunction"}
+# LakeOpsFunction: its rate(10 minutes) export_tick lists export_requests/ in S3 first and
+# opens no connection when empty (tests/unit/test_export_tick.py pins zero connections).
+GATED_EXCEPTIONS = {"FinalizeSweepFunction", "RecordingSegmentsFunction", "LakeOpsFunction"}
 
 # AWS's own default when MinCapacity is 0 and the field is omitted.
 AWS_DEFAULT_SECONDS_UNTIL_AUTO_PAUSE = 300

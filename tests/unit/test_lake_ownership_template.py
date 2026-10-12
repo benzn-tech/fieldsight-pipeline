@@ -87,14 +87,14 @@ def test_lake_ops_function_has_a_long_timeout_and_its_own_pool():
     assert re.search(r"^    Condition: HasOrgApi$", block, re.M)
 
 
-def test_lake_ops_names_itself_without_a_circular_reference():
-    block = _resources()["LakeOpsFunction"]
-    env = _env_block(block)
-    m = re.search(r"LAKE_OPS_FUNCTION: (.*)", env)
-    assert m, "LakeOps has no LAKE_OPS_FUNCTION env (export_company cannot chain itself)"
-    assert "-lake-ops" in m.group(1)
-    assert "!Ref LakeOpsFunction" not in block and "LakeOpsFunction.Arn" not in block, \
-        "a function must not !Ref/!GetAtt itself (circular dependency)"
+def test_nothing_in_the_vpc_calls_the_lambda_api():
+    """R11a: the VPC has no NAT and no Lambda interface endpoint, so org-api and LakeOps must
+    not invoke anything. The export is requested through an S3 object instead."""
+    res = _resources()
+    for name in ("OrgApiFunction", "LakeOpsFunction"):
+        assert "lambda:InvokeFunction" not in res[name], name
+        assert "LAKE_OPS_FUNCTION" not in res[name], name
+    assert "LAKE_OPS_FUNCTION" not in _text().replace("\n#", "\n")  # no live env anywhere
 
 
 def test_lake_ops_database_access_is_copied_from_org_api():
@@ -118,15 +118,12 @@ def test_lake_ops_iam_is_exactly_what_the_three_tasks_need():
             by_action.setdefault(a, []).append(s)
     for a in ("s3:GetObject", "s3:ListBucket", "s3:PutObject", "s3:AbortMultipartUpload",
               "s3:ListMultipartUploadParts", "s3:DeleteObject", "s3:GetObjectTagging",
-              "s3:PutObjectTagging", "lambda:InvokeFunction"):
+              "s3:PutObjectTagging"):
         assert a in by_action, f"LakeOps lacks {a}"
     # Puts: the export output and the manifest line of the helpers it imports. Nothing else.
     for s in by_action["s3:PutObject"]:
         targets = re.findall(r"arn:aws:s3:::\$\{\w+\}/(\S+)", s)
         assert targets and all(t in ("exports/*", "lake_manifest/*") for t in targets), s
-    # Self-invoke targets its own name, not a wildcard.
-    for s in by_action["lambda:InvokeFunction"]:
-        assert "-lake-ops" in s and "Resource: '*'" not in s
     # ListBucket has no prefix condition: backfill walks the whole bucket.
     for s in by_action["s3:ListBucket"]:
         assert "s3:prefix" not in s
@@ -152,6 +149,23 @@ def test_lake_ops_runs_the_drain_daily_before_the_directory_republish():
     assert rep and "republish_directory" in rep.group(0)
     # Both are fixed UTC crons, so "earlier in UTC" is "earlier" in NZST and in NZDT alike.
     assert drain < cron(rep.group(0))
+    # And it ends before the first of the morning republishes starts: start + the 900 s
+    # timeout must be at or before the 15:30 UTC site-coords run.
+    coords = re.search(r"SiteCoordsRepublish:\n(?:          .*\n|            .*\n)+",
+                       res["OrgApiFunction"] + "\n")
+    assert coords and drain + 15 <= cron(coords.group(0))
+
+
+def test_export_tick_is_scheduled_every_ten_minutes_and_gated():
+    ops = _resources()["LakeOpsFunction"]
+    m = re.search(r"ExportTick:\n(?:          .*\n|            .*\n)+", ops + "\n")
+    assert m, "no ExportTick event on LakeOpsFunction"
+    ev = m.group(0)
+    assert "Schedule: rate(10 minutes)" in ev
+    assert "Input: '{\"task\": \"export_tick\"}'" in ev
+    assert "State: !If [ShouldEnableSchedules, ENABLED, DISABLED]" in ev
+    code = (SRC / "lambda_org_api.py").read_text(encoding="utf-8")
+    assert 'EXPORT_TICK_TASK = "export_tick"' in code
 
 
 # --------------------------------------------------------------------------------------
@@ -189,22 +203,18 @@ def test_summary_lake_wide_reaches_the_generator():
     assert re.search(r"os\.environ\.get\('SUMMARY_LAKE_WIDE'", code)
 
 
-def test_org_api_reaches_lake_ops_and_its_exports():
+def test_org_api_requests_exports_through_s3_and_reads_the_results():
     org = _resources()["OrgApiFunction"]
-    env = _env_block(org)
-    m = re.search(r"LAKE_OPS_FUNCTION: (.*)", env)
-    assert m and "-lake-ops" in m.group(1)
-    code = (SRC / "lambda_org_api.py").read_text(encoding="utf-8")
-    assert 'os.environ.get("LAKE_OPS_FUNCTION")' in code
     stmts = _statements(org)
-    assert any(_has_action(s, "lambda:InvokeFunction") and "-lake-ops" in s for s in stmts)
+    assert any(_has_action(s, "s3:PutObject") and "${IngestBucketName}/export_requests/*" in s
+               for s in stmts)
     assert any(_has_action(s, "s3:GetObject") and "/exports/*" in s for s in stmts)
-    # The status route polls for a state.json that does not exist yet: without ListBucket
+    # The status poll reads a state.json that does not exist yet: without ListBucket
     # on exports/ that is a 403, not a 404.
     lister = [s for s in stmts if _has_action(s, "s3:ListBucket") and "IngestBucketName" in s
               and "reports/*" in s]
     assert lister and "- exports/*" in lister[0]
-    # org-api reads the exports; it never writes them.
+    # org-api reads the exports; it never writes them, and never reads the requests back.
     assert not any("/exports/*" in s and _has_action(s, "s3:PutObject") for s in stmts)
 
 
@@ -225,7 +235,9 @@ def test_delete_is_confined_to_the_manifest_for_lake_ops_and_added_nowhere_else(
     for s in _statements(res["LakeOpsFunction"]):
         if _has_action(s, "s3:DeleteObject"):
             resources = re.findall(r"arn:aws:s3:::\$\{\w+\}[^\s]*", s)
-            assert resources and all(r.endswith("/lake_manifest/*") for r in resources), s
+            assert resources and all(
+                r.endswith("/lake_manifest/*") or r.endswith("/export_requests/*")
+                for r in resources), s
     deleters = {name for name, block in res.items()
                 if any(_has_action(s, "s3:DeleteObject") for s in _statements(block))}
     assert deleters - {"LakeOpsFunction"} <= PRE_EXISTING_DELETERS, \
@@ -384,11 +396,12 @@ def test_lake_manifest_and_exports_match_no_s3_trigger():
     prefixes = re.findall(r'"Name":"prefix","Value":"([^"]*)"', script)
     assert prefixes, "no prefixes parsed from wire-s3-events.sh"
     for key in ("lake_manifest/2026/10/12/x.jsonl", "exports/c/e/manifest.json",
-                "exports/c/e/part-0001.zip"):
+                "exports/c/e/part-0001.zip", "export_requests/c/e.json"):
         assert not any(key.startswith(p) for p in prefixes), key
     # Every filter in the script is prefixed, so no suffix-only rule can catch these either.
     assert len(re.findall(r'"Name":"suffix"', script)) <= len(prefixes)
-    for key in ("lake_manifest/2026/10/12/x.jsonl", "exports/c/e/manifest.json"):
+    for key in ("lake_manifest/2026/10/12/x.jsonl", "exports/c/e/manifest.json",
+                "export_requests/c/e.json"):
         for rule in _eventbridge_key_rules():
             kind, value = rule
             assert not (key.startswith(value) if kind == "prefix" else key.endswith(value)), (key, rule)
