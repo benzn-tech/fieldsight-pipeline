@@ -5678,6 +5678,17 @@ def _export_bucket_for(kind):
     return LAKE_BUCKET or S3_BUCKET
 
 
+def _export_alt_bucket_for(kind):
+    """The other configured bucket, to try once when a key is NoSuchKey in the chosen one (on
+    TEST the pipeline writes to DataBucketName and org-api to the ingest bucket; prod is one
+    bucket and this is None there). Never returns the chosen bucket."""
+    chosen = _export_bucket_for(kind)
+    for b in (LAKE_BUCKET, S3_BUCKET):
+        if b and b != chosen:
+            return b
+    return None
+
+
 def export_company_task(event, context=None):
     """Run one time budget of export_company and return the result (next_cursor if not done).
 
@@ -5693,7 +5704,7 @@ def export_company_task(event, context=None):
     try:
         with get_connection() as conn:
             return company_export.run(
-                conn, s3(), event.get("company_id"), bucket_for=_export_bucket_for,
+                conn, s3(), event.get("company_id"), bucket_for=_export_bucket_for, alt_bucket_for=_export_alt_bucket_for,
                 export_id=event.get("export_id"), cursor=event.get("cursor"),
                 time_budget_s=budget, part_bytes=part_bytes,
                 dest_bucket=_export_bucket_for("exports"))
@@ -5757,7 +5768,7 @@ def export_tick(event, context=None):
         try:
             with get_connection() as conn:
                 out = company_export.run(
-                    conn, s3_client, cid, bucket_for=_export_bucket_for, export_id=eid,
+                    conn, s3_client, cid, bucket_for=_export_bucket_for, alt_bucket_for=_export_alt_bucket_for, export_id=eid,
                     time_budget_s=budget, dest_bucket=bucket)
         except (ValueError, company_export.ExportError) as exc:
             logger.warning("export_tick: export %s failed: %s", key, exc)

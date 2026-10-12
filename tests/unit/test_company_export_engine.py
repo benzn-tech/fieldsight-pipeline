@@ -403,3 +403,41 @@ def test_missing_table_is_an_error_not_an_empty_done_export(monkeypatch):
     with pytest.raises(ce.ExportError, match="lake_objects missing"):
         run(s3)
     assert (LAKE, PREFIX + "manifest.json") not in s3.objects
+
+
+# ---- M2: a key missing from the chosen bucket is tried once in the other bucket ----------
+
+OTHER = "other-bucket"
+
+
+def test_a_source_missing_from_the_chosen_bucket_is_read_from_the_other_one(monkeypatch):
+    s3 = setup(monkeypatch, [row(key(i)) for i in range(3)])
+    s3.objects[(OTHER, key(1))] = s3.objects.pop((LAKE, key(1)))      # the pipeline wrote it here
+    out = run(s3, alt_bucket_for=lambda kind: OTHER)
+    assert out["done"]
+    st = {o["s3_key"]: o.get("status") for o in manifest(s3)["objects"]}
+    assert st == {key(0): None, key(1): None, key(2): None}
+    assert (LAKE, key(1)) in s3.get_calls and (OTHER, key(1)) in s3.get_calls
+    assert sorted(zip_members(s3, out["parts"][0])) == [f"transcript/{key(i)}" for i in range(3)]
+
+
+def test_missing_from_both_buckets_is_still_recorded_missing(monkeypatch):
+    s3 = setup(monkeypatch, [row(key(i)) for i in range(2)])
+    del s3.objects[(LAKE, key(0))]
+    run(s3, alt_bucket_for=lambda kind: OTHER)
+    st = {o["s3_key"]: o.get("status") for o in manifest(s3)["objects"]}
+    assert st == {key(0): "missing", key(1): None}
+    assert s3.get_calls.count((OTHER, key(0))) == 1                  # tried exactly once
+
+
+def test_the_same_bucket_is_not_asked_twice_and_a_transient_error_is_not_retried_elsewhere(
+        monkeypatch):
+    s3 = setup(monkeypatch, [row(key(0))])
+    del s3.objects[(LAKE, key(0))]
+    run(s3, alt_bucket_for=lambda kind: LAKE)
+    assert s3.get_calls.count((LAKE, key(0))) == 1
+    s3 = setup(monkeypatch, [row(key(0))])
+    s3.fail_get[key(0)] = ClientError({"Error": {"Code": "SlowDown", "Message": "x"}}, "GetObject")
+    with pytest.raises(ClientError):
+        run(s3, alt_bucket_for=lambda kind: OTHER)
+    assert (OTHER, key(0)) not in s3.get_calls

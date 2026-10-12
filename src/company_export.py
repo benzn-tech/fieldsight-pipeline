@@ -289,6 +289,18 @@ def _is_missing(exc) -> bool:
     return code in _MISSING_CODES
 
 
+def _get_body(s3, bucket, key, alt_bucket=None):
+    """The object's body from `bucket`; on NoSuchKey, once from `alt_bucket` when it differs.
+    Any other error, from either bucket, propagates. The NoSuchKey of the last bucket tried
+    is what the caller sees."""
+    try:
+        return s3.get_object(Bucket=bucket, Key=key)["Body"]
+    except Exception as exc:  # noqa: BLE001
+        if not _is_missing(exc) or not alt_bucket or alt_bucket == bucket:
+            raise
+    return s3.get_object(Bucket=alt_bucket, Key=key)["Body"]
+
+
 def _read_state(s3, bucket, key):
     """(state doc, etag) or (None, None)."""
     try:
@@ -319,8 +331,12 @@ def _table_exists(conn) -> bool:
 def run(conn, s3, company_id, *, bucket_for, export_id=None, cursor=None,
         time_budget_s=DEFAULT_TIME_BUDGET_S, part_bytes=DEFAULT_PART_BYTES, now=None,
         dest_bucket=None, tombstones=None, clock=time.monotonic, chunk_size=COPY_CHUNK,
-        sink_part_bytes=SINK_PART_BYTES, page_size=PAGE_SIZE) -> dict:
+        sink_part_bytes=SINK_PART_BYTES, page_size=PAGE_SIZE, alt_bucket_for=None) -> dict:
     """Export (part of) one company. See the module docstring.
+
+    `alt_bucket_for(kind)`, when given, names the OTHER configured bucket (or None): a source
+    that is NoSuchKey in the chosen bucket is tried there once before it is recorded `missing`
+    (on TEST the pipeline writes to one bucket and org-api to another).
 
     Returns {company_id, export_id, done, next_cursor, parts: [keys], objects, bytes, ...}.
     """
@@ -496,7 +512,8 @@ def run(conn, s3, company_id, *, bucket_for, export_id=None, cursor=None,
                         pos = k
                         continue
                 try:
-                    body = s3.get_object(Bucket=bucket_for(kind), Key=k)["Body"]
+                    body = _get_body(s3, bucket_for(kind), k,
+                                     alt_bucket_for(kind) if alt_bucket_for else None)
                 except Exception as exc:  # noqa: BLE001
                     if not _is_missing(exc):
                         raise            # a transient error must not become a silent gap

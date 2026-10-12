@@ -79,7 +79,11 @@ def _write_manifest(c, bucket, key, size, hint):
 
 
 def lake_put(bucket, key, body, *, owner_hint=None, client=None, manifest=True, **put_kwargs):
-    """put_object, then (tenant keys only) one manifest line. Returns put_object's response."""
+    """put_object, then (tenant keys only) one manifest line. Returns put_object's response.
+
+    Kill switch: LAKE_MANIFEST=off (read at call time) stops the manifest lines. It is NOT a
+    template Parameter or environment entry, so a value set by hand in the Lambda console is
+    temporary: the next `sam deploy` erases it. To make it stick, wire it like LakeIndexReads."""
     c = _client(client)
     resp = c.put_object(Bucket=bucket, Key=key, Body=body, **put_kwargs)  # raises exactly as before
     if manifest and _manifest_enabled() and _wants_manifest(key):

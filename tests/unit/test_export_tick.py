@@ -171,3 +171,15 @@ def test_the_tick_budget_never_outlives_the_ten_minute_rate(monkeypatch):
     api.lambda_handler({"task": "export_tick"}, None)             # no context: the cap
     assert calls[-1][1]["time_budget_s"] == 480
     assert api.EXPORT_TICK_BUDGET_S < 600 - 60
+
+
+def test_the_alt_bucket_is_the_other_configured_bucket(monkeypatch):
+    monkeypatch.setattr(api, "LAKE_BUCKET", "lake-b", raising=False)
+    monkeypatch.setattr(api, "S3_BUCKET", "data-b", raising=False)
+    assert api._export_alt_bucket_for("transcript") == "data-b"
+    assert api._export_alt_bucket_for("redaction") == "lake-b"
+    monkeypatch.setattr(api, "S3_BUCKET", "lake-b", raising=False)    # prod: one bucket
+    assert api._export_alt_bucket_for("transcript") is None
+    s3, conns, calls = _wire(monkeypatch, {KEY: _request()}, [_out(True)])
+    api.lambda_handler({"task": "export_tick"}, None)
+    assert calls[-1][1]["alt_bucket_for"] is api._export_alt_bucket_for
