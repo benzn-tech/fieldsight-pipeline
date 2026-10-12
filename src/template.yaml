@@ -1184,6 +1184,31 @@ Parameters:
       spec §3). False (default) is the pre-Phase-3 binary resolve_scope
       behavior, unchanged in every path, mirroring AuthorityFlip's rollout.
 
+  # Lake ownership (spec 2026-10-12). Wired in three pieces, all pinned by
+  # tests/unit/test_lake_ownership_template.py: this Parameter -> OrgApiFunction env
+  # LAKE_INDEX_READS -> lambda_org_api._lake_index_reads().
+  LakeIndexReads:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    # flip only after backfill + a drain
+    Description: >-
+      When true, org-api bounds its report-history and folder-discovery listings with the
+      lake_objects index instead of listing the whole prefix. The index is not trusted
+      until backfill_lake_objects has been applied and drain_lake_manifest has run, so
+      flip this ONLY after backfill + a drain. False (default) is the S3 listing,
+      unchanged in every path.
+
+  # An owner product decision, not an engineering rollout: it changes what a company
+  # admin sees on the summary route, so it ships off and is flipped by the owner.
+  CompanySummaryServe:
+    Type: String
+    Default: 'off'
+    AllowedValues: ['on', 'off']
+    Description: >-
+      on = org-api serves a company caller its own per-company daily summary. off
+      (default) = the summary route behaves as before. Owner product decision.
+
   VoiceprintMaxFrameSpread:
     Type: String
     Default: 'default'
@@ -1536,6 +1561,17 @@ Resources:
       EphemeralStorage:
         Size: 1024
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - S3WritePolicy:
             BucketName: !Ref DataBucketName
         - Version: '2012-10-17'
@@ -1591,6 +1627,17 @@ Resources:
           # assuming a code default.
           TRANSCRIBE_WHOLE_CHUNK: !Ref TranscribeWholeChunk
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - S3ReadPolicy:
             BucketName: !Ref DataBucketName
         - S3WritePolicy:
@@ -1677,6 +1724,17 @@ Resources:
           TRANSCRIBE_WHOLE_CHUNK: !Ref TranscribeWholeChunk
           WEB_VIDEO_PREFIX: web_video/
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - S3CrudPolicy:
             BucketName: !Ref DataBucketName
 
@@ -1734,6 +1792,9 @@ Resources:
           # rather than arriving late.
           LLM_HTTP_TIMEOUT: '540'
           REPORT_PREFIX: reports/
+          # Lake ownership: one release of the old lake-wide summary alongside the
+          # per-company ones. 'off' stops the lake-wide write (see the rollout notes).
+          SUMMARY_LAKE_WIDE: 'on'
           SITE_NAME: !Ref SiteName
           ITEMS_TABLE: !Ref ItemsTableName
           REPORTS_TABLE: !Ref ReportsTableName
@@ -1748,6 +1809,17 @@ Resources:
           # three tables. Hardcoded 'true' was a write dead-end contradicting the
           # docs ("DynamoDB OFF in production"); removing it aligns both.
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - S3ReadPolicy:
             BucketName: !Ref DataBucketName
         - S3WritePolicy:
@@ -1867,6 +1939,17 @@ Resources:
           MINUTES_PREFIX: meeting_minutes/
           REPORT_PREFIX: reports/
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - S3ReadPolicy:
             BucketName: !Ref DataBucketName
         - S3WritePolicy:
@@ -1928,6 +2011,17 @@ Resources:
           # Pre-check on transcript objects in one window (transcript_window.py).
           MAX_TRANSCRIPT_OBJECTS: '2000'
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
@@ -2280,7 +2374,22 @@ Resources:
           # open, and the sweep's hourly pass recovers it.
           SWEEP_STATE_TABLE: !Ref ItemsTableName
           STAGE: !Ref Stage
+          # flip only after backfill + a drain (see the LakeIndexReads parameter)
+          LAKE_INDEX_READS: !Ref LakeIndexReads
+          # owner product decision (see the CompanySummaryServe parameter)
+          COMPANY_SUMMARY_SERVE: !Ref CompanySummaryServe
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - VPCAccessPolicy: {}
         # DynamoDB reached through the existing gateway endpoint from in-VPC
         # (vpce-01233d5b756ffefcb) -- the same route that carries QR login.
@@ -2517,6 +2626,10 @@ Resources:
                     # GET /sessions/pending and POST /sessions/{id}/expedite: most sessions
                     # have no marker, and that must read as 404/empty, not a 403 -> 500.
                     - extraction_pending/*
+                    # GET /companies/{id}/export/{export_id} reads manifest.json and then
+                    # state.json, and a running export has no manifest yet. Without this a
+                    # missing key answers 403, not 404, and the status poll would 500.
+                    - exports/*
             - Effect: Allow
               # Task 20 (content correction reindex chain): after a content
               # edit commits, org-api (in-VPC) writes the per-topic reindex
@@ -2628,6 +2741,18 @@ Resources:
                 Action: [dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:GetItem]
                 Resource: !GetAtt QrLoginCodesTable.Arn
               - !Ref AWS::NoValue
+        # Lake ownership: POST /companies/{id}/export leaves a request object for LakeOps's
+        # scheduled export_tick (this function is in the VPC and cannot call the Lambda API),
+        # and the status route presigns what LakeOps wrote. Write on export_requests/ only;
+        # GetObject only on exports/ (presigning needs it), where org-api never writes.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/export_requests/*
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/exports/*
       Events:
         OrgProxy:
           Type: Api
@@ -2666,6 +2791,125 @@ Resources:
             Description: Republish the people-and-sites directory before the daily reports
             State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
             Input: '{"task": "republish_directory"}'
+
+  # ----------------------------------------------------------
+  # Lake ownership (spec 2026-10-12): the operator tasks that outlive org-api's 30 s.
+  # Same code, VPC, layer and database access as OrgApiFunction, run through the same
+  # handler as a direct invoke with {"task": ...}:
+  #   drain_lake_manifest   -- fold lake_manifest/ lines into lake_objects (hourly, below)
+  #   backfill_lake_objects -- one-off walk of the bucket(s), dry-run by default
+  #   export_company        -- one company's lake data as zip parts under exports/
+  #   export_tick           -- every 10 minutes: advance one pending export_requests/ item
+  # No function invokes another here: the VPC has no route to the Lambda API, so the export
+  # route leaves a request object in S3 and export_tick (S3 first, no DB when idle) resumes it.
+  #
+  # NO ReservedConcurrentExecutions and NO API events: the mobile upload path must never
+  # share a pool with a 15-minute export.
+  # ----------------------------------------------------------
+  LakeOpsFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasOrgApi
+    Properties:
+      FunctionName: !Sub ["${P}-lake-ops", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_org_api.lambda_handler
+      Timeout: 900
+      MemorySize: 1024
+      EphemeralStorage:
+        Size: 1024
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          # Deploy-time credential injection -- same as OrgApiFunction.
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+          COGNITO_USER_POOL_ID: !Ref OrgUserPoolId
+          S3_BUCKET: !Ref DataBucketName
+          LAKE_BUCKET: !Ref IngestBucketName
+          STAGE: !Ref Stage
+      Policies:
+        # lake_put (lake ownership): LakeOps runs lambda_org_api, which imports the helpers
+        # that call lake_put. PutObject on the manifest prefix only (see OrgApiFunction).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
+        - VPCAccessPolicy: {}
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              # Backfill walks the bucket and export walks the database, so reads are
+              # bucket-wide on purpose. This is the one function with that breadth.
+              Action:
+                - s3:GetObject
+                - s3:GetObjectTagging
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/*
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}
+                - !Sub arn:aws:s3:::${IngestBucketName}
+            - Effect: Allow
+              # backfill_lake_objects tag=true merges the company/site tags onto existing
+              # objects. The ONLY function granted this: writers never tag (lake_put).
+              Action: s3:PutObjectTagging
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/*
+            - Effect: Allow
+              # The export's output, as multipart zip parts. Nothing else is writable.
+              Action:
+                - s3:PutObject
+                - s3:AbortMultipartUpload
+                - s3:ListMultipartUploadParts
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/exports/*
+            - Effect: Allow
+              # The drain deletes a manifest object only after its rows are committed.
+              # This is the ONLY delete in the lake-ownership work, and only here.
+              Action: s3:DeleteObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
+            - Effect: Allow
+              # export_tick deletes a request object once its export is done.
+              Action: s3:DeleteObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/export_requests/*
+      Events:
+        # Hourly. Each run lists lake_manifest/ in S3 first and opens no database connection
+        # when it is empty (so Aurora can still auto-pause), otherwise it drains in passes
+        # for up to 780 s (cut to the Lambda's remaining time) and reports `more`. A run that
+        # started inside the 900 s ceiling is over long before the next hour. On demand:
+        #   aws lambda invoke --function-name <prefix>-lake-ops --payload '{"task":"drain_lake_manifest"}'
+        DrainLakeManifest:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+            Description: Fold the lake manifest into lake_objects (S3 only when idle)
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
+            Input: '{"task": "drain_lake_manifest"}'
+        # Advances one pending company export. Lists export_requests/ in S3 first and opens no
+        # database connection when there is nothing to do, so this does not keep Aurora awake.
+        ExportTick:
+          Type: Schedule
+          Properties:
+            Schedule: rate(10 minutes)
+            Description: Advance one pending company export (S3 only when idle)
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
+            Input: '{"task": "export_tick"}'
 
   # ----------------------------------------------------------
   # QR passwordless login (2026-07-30, v2 2026-07-31) — code table only.
@@ -2763,6 +3007,17 @@ Resources:
           # provider, not to us, so the OFF switch has to outlive a deploy.
           FILTER_AUDIO_EVENT_TAGS: !Ref FilterAudioEventTags
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
@@ -2891,6 +3146,17 @@ Resources:
           # needs no extended reasoning (same reason as the finalize worker).
           QWEN_ENABLE_THINKING: 'false'
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
@@ -3152,6 +3418,17 @@ Resources:
           NONWORK_EXPIRY_HOURS: !Ref NonWorkExpiryHours
           NONWORK_EXPIRY_SINCE: !Ref NonWorkExpirySince
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
           Statement:
@@ -3234,6 +3511,17 @@ Resources:
           # together. OFF on prod (finalize disabled) until deliberately enabled.
           INFER_IDLE_CLOSE: !If [ShouldEnableFinalize, 'true', 'false']
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - VPCAccessPolicy: {}
         # Reads/clears the sweep pending flag. Reuses the existing items table
         # deliberately: the deploy role has no dynamodb:CreateTable (verified
@@ -3370,6 +3658,17 @@ Resources:
           # session_brief/ for the reader surfaces to pick up.
           SESSION_BRIEF: !Ref EnableSessionBrief
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
@@ -3517,6 +3816,17 @@ Resources:
           S3_BUCKET: !Ref IngestBucketName
           AUTHORITY_FLIP: !Ref AuthorityFlip
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
           Statement:
@@ -3633,6 +3943,17 @@ Resources:
           DASHSCOPE_EMBED_MODEL: text-embedding-v4
           DASHSCOPE_EMBED_DIM: '1024'
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
@@ -3727,6 +4048,17 @@ Resources:
           # topic restates. Writes suggestions only; never links.
           SUGGEST_THREADS: !Ref EnableThreadSuggestions
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
           Statement:
@@ -3835,6 +4167,17 @@ Resources:
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
           Statement:
@@ -4319,6 +4662,17 @@ Resources:
           # existing gateway endpoint.
           S3_BUCKET: !Ref IngestBucketName
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - VPCAccessPolicy: {}
         - Statement:
             - Effect: Allow
@@ -5568,6 +5922,17 @@ Resources:
           # no alert topic; the code then skips the notice.
           ALERT_TOPIC_ARN: !If [ShouldCreateAlerts, !Ref AlertTopic, !Ref "AWS::NoValue"]
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - !If
           - ShouldCreateAlerts
           - SNSPublishMessagePolicy:

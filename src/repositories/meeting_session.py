@@ -420,3 +420,36 @@ def group_ended_at(conn, group_id):
         (group_id, group_id),
     ).fetchone()
     return (row or {}).get("ended_at")
+
+
+def owners_for_sids(conn, sids) -> dict:
+    """{session_id: {company_id, site_id, user_id}} (one query). The company is the SITE's
+    current company when the session has a site, else the recorder's company on the row."""
+    sids = sorted({s for s in (sids or []) if s})
+    if not sids:
+        return {}
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT ms.session_id, COALESCE(s.company_id, ms.company_id) AS company_id, "
+        "ms.site_id, ms.user_id FROM meeting_session ms "
+        "LEFT JOIN sites s ON s.id = ms.site_id WHERE ms.session_id = ANY(%s)", (sids,)).fetchall()
+    return {r["session_id"]: {"company_id": r["company_id"], "site_id": r["site_id"],
+                              "user_id": r["user_id"]} for r in rows}
+
+
+def members_for_groups(conn, group_ids) -> dict:
+    """{group_id: [{site_id, site_company_id}]} one entry per member session, the lead included
+    (the lead carries no group_id of its own, so membership is group_id = X OR session_id = X).
+    site_company_id is the site's current company, None when the member has no site."""
+    gids = sorted({g for g in (group_ids or []) if g})
+    if not gids:
+        return {}
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT g.gid, ms.site_id, s.company_id AS site_company_id "
+        "FROM unnest(%s::text[]) AS g(gid) "
+        "JOIN meeting_session ms ON (ms.group_id = g.gid OR ms.session_id = g.gid) "
+        "LEFT JOIN sites s ON s.id = ms.site_id", (gids,)).fetchall()
+    out = {}
+    for r in rows:
+        out.setdefault(r["gid"], []).append(
+            {"site_id": r["site_id"], "site_company_id": r["site_company_id"]})
+    return out

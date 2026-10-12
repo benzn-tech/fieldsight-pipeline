@@ -18,6 +18,7 @@ import wave
 
 import batch_ledger
 import batch_stitch
+from lake_put import lake_put
 import transcript_utils
 
 logger = logging.getLogger()
@@ -214,11 +215,11 @@ def _seal_claimed(s3, bucket, session_id, run, by_index, now, table, sealed_by,
     batch_key = f"{prefix}/{batch_name}"
     doc = batch_stitch.build_map(session_id, members, sealed_by=sealed_by)
 
-    s3.put_object(Bucket=bucket,
-                  Key=batch_stitch.map_key_for_audio(f"{prefix}/{batch_name}"),
-                  Body=json.dumps(doc), ContentType='application/json')
-    s3.put_object(Bucket=bucket, Key=batch_key, Body=_wav_bytes(audio, rate),
-                  ContentType='audio/wav')
+    lake_put(bucket,
+             batch_stitch.map_key_for_audio(f"{prefix}/{batch_name}"),
+             json.dumps(doc), client=s3, ContentType='application/json')
+    lake_put(bucket, batch_key, _wav_bytes(audio, rate), client=s3,
+             ContentType='audio/wav')
     # AFTER both artifacts, BEFORE mark_sealed. This call was missing until the review, and
     # its absence made the whole consumed-member mechanism decorative on the multi-member
     # path -- the planner kept re-proposing sealed windows, with two live consequences: a

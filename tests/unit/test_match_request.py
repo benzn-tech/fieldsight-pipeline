@@ -20,6 +20,8 @@ class FakeS3:
         self.put_calls = []
 
     def put_object(self, **kwargs):
+        if kwargs["Key"].startswith("lake_manifest/"):
+            return           # lake_put's manifest line is not a match-request write
         self.put_calls.append(kwargs)
 
 

@@ -36,6 +36,8 @@ class Puts:
         self.puts = []
 
     def put_object(self, **kw):
+        if kw["Key"].startswith("lake_manifest/"):
+            return {}            # lake_put's manifest line is not a trace write
         self.puts.append(kw)
         return {}
 

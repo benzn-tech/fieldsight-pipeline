@@ -26,6 +26,7 @@ import time
 
 import nz_time
 import sweep_state
+from lake_put import lake_put
 from repositories import meeting_session, users, sites
 import session_scope
 from session_scope import SESSION_GAP_MINUTES
@@ -339,9 +340,10 @@ def _enqueue(artifact):
     from botocore.exceptions import ClientError
     key = f"{FINALIZE_REQUESTS_PREFIX}{artifact['sessionId']}.json"
     try:
-        boto3.client("s3").put_object(
-            Bucket=S3_BUCKET, Key=key,
-            Body=json.dumps(artifact, ensure_ascii=False),
+        lake_put(
+            S3_BUCKET, key,
+            json.dumps(artifact, ensure_ascii=False),
+            client=boto3.client("s3"),
             ContentType="application/json", IfNoneMatch="*")
         return True
     except ClientError as e:
@@ -370,11 +372,13 @@ def _request_extraction(session_id, folder, date):
     extraction rather than after it, so the email is not delayed by a
     serial LLM call waiting on another one."""
     import boto3
-    boto3.client("s3").put_object(
-        Bucket=S3_BUCKET,
-        Key=f"{EXTRACTION_REQUESTS_PREFIX}{session_id}.json",
-        Body=json.dumps({"userFolder": folder, "date": date,
-                         "sessionBase": f"sid{session_id}"}),
+    lake_put(
+        S3_BUCKET,
+        f"{EXTRACTION_REQUESTS_PREFIX}{session_id}.json",
+        json.dumps({"userFolder": folder, "date": date,
+                    "sessionBase": f"sid{session_id}"}),
+        client=boto3.client("s3"),
+        owner_hint={"folder": folder, "session_base": f"sid{session_id}"},
         ContentType="application/json")
     _enqueue_brief_request(session_id, folder, date)
 
@@ -393,10 +397,12 @@ def _enqueue_brief_request(session_id, folder, date):
     from botocore.exceptions import ClientError
     key = f"{FINALIZE_REQUESTS_PREFIX}brief-{session_id}.json"
     try:
-        boto3.client("s3").put_object(
-            Bucket=S3_BUCKET, Key=key,
-            Body=json.dumps({"kind": "brief", "sessionId": session_id,
-                             "folder": folder, "date": date}, ensure_ascii=False),
+        lake_put(
+            S3_BUCKET, key,
+            json.dumps({"kind": "brief", "sessionId": session_id,
+                        "folder": folder, "date": date}, ensure_ascii=False),
+            client=boto3.client("s3"),
+            owner_hint={"folder": folder, "session_base": f"sid{session_id}"},
             ContentType="application/json", IfNoneMatch="*")
     except ClientError as e:
         status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
@@ -678,10 +684,11 @@ def _enqueue_group(artifact):
     timeout), but it can write to S3 through the gateway endpoint. The `group-`
     prefix is what routes it away from the solo final-pass path."""
     import boto3
-    boto3.client("s3").put_object(
-        Bucket=S3_BUCKET,
-        Key=f"{EXTRACTION_REQUESTS_PREFIX}group-{artifact['groupId']}.json",
-        Body=json.dumps(artifact, ensure_ascii=False),
+    lake_put(
+        S3_BUCKET,
+        f"{EXTRACTION_REQUESTS_PREFIX}group-{artifact['groupId']}.json",
+        json.dumps(artifact, ensure_ascii=False),
+        client=boto3.client("s3"),
         ContentType="application/json")
 
 

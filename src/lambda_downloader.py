@@ -32,6 +32,7 @@ import json
 import logging
 import boto3
 import urllib3
+from lake_put import lake_put
 from urllib.parse import urlparse, parse_qs, unquote
 
 # Disable SSL warnings
@@ -147,16 +148,11 @@ def upload_to_s3(bucket, key, data, content_type=None):
     Returns: (success: bool, error: str)
     """
     try:
-        params = {
-            'Bucket': bucket,
-            'Key': key,
-            'Body': data
-        }
-        
+        params = {}
         if content_type:
             params['ContentType'] = content_type
-        
-        s3_client.put_object(**params)
+
+        lake_put(bucket, key, data, client=s3_client, **params)
         logger.info(f"Uploaded to s3://{bucket}/{key}")
         return True, None
         

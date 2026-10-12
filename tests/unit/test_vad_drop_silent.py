@@ -60,7 +60,7 @@ def test_a_dropped_chunk_still_writes_its_sidecar():
     """A drop that leaves no trace is indistinguishable from a lost chunk, and
     the difference is the whole of the next investigation."""
     block = _no_speech_block()
-    assert "meta_key" in block and "put_object" in block
+    assert "meta_key" in block and ("put_object" in block or "lake_put(" in block)
 
 
 def test_a_dropped_chunk_is_named_as_dropped():

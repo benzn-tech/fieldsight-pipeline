@@ -50,6 +50,7 @@ import os
 from urllib.parse import unquote_plus
 
 import boto3
+from lake_put import lake_put
 
 import lambda_ingest
 import keyframe_request
@@ -737,9 +738,10 @@ def _put_finalize_request(key, body, only_if_absent=False):
     from botocore.exceptions import ClientError
     extra = {"IfNoneMatch": "*"} if only_if_absent else {}
     try:
-        boto3.client("s3").put_object(
-            Bucket=S3_BUCKET, Key=key,
-            Body=json.dumps(body, ensure_ascii=False),
+        lake_put(
+            S3_BUCKET, key,
+            json.dumps(body, ensure_ascii=False),
+            client=boto3.client("s3"),
             ContentType="application/json", **extra)
         return True
     except ClientError as e:

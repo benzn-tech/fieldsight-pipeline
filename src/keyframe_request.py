@@ -10,6 +10,8 @@ trigger.
 import hashlib
 import json
 
+from lake_put import lake_put
+
 
 def emit(s3, bucket, user_folder, date, session_base, extraction_key, topics):
     """topics: [{'topic_id': str, 'time_range': str}] -- already gate-filtered
@@ -19,15 +21,17 @@ def emit(s3, bucket, user_folder, date, session_base, extraction_key, topics):
         return None
     key = (f"keyframe_requests/{user_folder}/{date}/"
            f"{hashlib.sha256(extraction_key.encode('utf-8')).hexdigest()[:16]}.json")
-    s3.put_object(
-        Bucket=bucket, Key=key,
-        Body=json.dumps({
+    lake_put(
+        bucket, key,
+        json.dumps({
             "user_folder": user_folder,
             "date": date,
             "session_base": session_base,
             "extraction_key": extraction_key,
             "topics": topics,
         }),
+        client=s3,
+        owner_hint={"folder": user_folder, "session_base": session_base},
         ContentType="application/json",
     )
     return key

@@ -35,6 +35,11 @@ OVERLAP_ACCEPTED = {
     # account concurrency; raising it breaks the auto-pause cadence invariant
     # (tests/unit/test_sweep_cadence_vs_autopause.py).
     "FinalizeSweepFunction": 120,
+    # rate(10 minutes) export_tick, one export per tick with a 780 s budget, so a long export
+    # can outlive the interval by design (15-minute Timeout). A second tick that overlaps it
+    # loses the state.json IfMatch race (company_export lost_race) and does nothing; an idle
+    # tick is S3-only and opens no connection (test_export_tick.py).
+    "LakeOpsFunction": 900,
 }
 
 # (caller, callee) pairs invoked with InvocationType=RequestResponse -- the caller

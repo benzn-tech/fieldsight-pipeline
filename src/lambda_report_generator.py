@@ -64,6 +64,7 @@ import logging
 import re
 from urllib.parse import unquote_plus
 import boto3
+from lake_put import lake_put
 import urllib3
 import agent_turn_filter
 from output_language import OUTPUT_LANGUAGE_RULE
@@ -534,9 +535,11 @@ def save_debug_record(bucket, target_date, user_name, prompt, raw_response,
             'raw_response_length': len(raw_response) if raw_response else 0,
             'parsed_json': parsed_json,
         }
-        s3_client.put_object(
-            Bucket=bucket, Key=debug_key,
-            Body=json.dumps(debug_record, ensure_ascii=False, indent=2, default=str),
+        lake_put(
+            bucket, debug_key,
+            json.dumps(debug_record, ensure_ascii=False, indent=2, default=str),
+            client=s3_client,
+            owner_hint=None if user_name == '_summary' else {"folder": user_name},
             ContentType='application/json'
         )
         logger.info(f"  Saved debug: {debug_key}")
@@ -632,14 +635,15 @@ def run_weather_forecasts(date=None, fetch=weather_advice.hourly_forecast,
             continue
         daily = (build_weather_block_for_site(info, date, date) if fetch_daily is None
                  else build_weather_block_for_site(info, date, date, fetch=fetch_daily))
-        s3_client.put_object(
-            Bucket=S3_BUCKET,
-            Key=weather_record_key(entry["site_id"], date, False),
-            Body=json.dumps({"site_id": entry["site_id"], "site_slug": slug, "date": date,
-                             "generated_at": get_nzdt_now().isoformat(),
-                             "daily": daily, "summary": weather.summary_lines(daily),
-                             **findings},
-                            default=str).encode("utf-8"),
+        lake_put(
+            S3_BUCKET,
+            weather_record_key(entry["site_id"], date, False),
+            json.dumps({"site_id": entry["site_id"], "site_slug": slug, "date": date,
+                        "generated_at": get_nzdt_now().isoformat(),
+                        "daily": daily, "summary": weather.summary_lines(daily),
+                        **findings},
+                       default=str).encode("utf-8"),
+            client=s3_client,
             ContentType="application/json")
         written.append(slug)
     logger.info(f"weather forecasts for {date}: {len(written)} written, "
@@ -1549,11 +1553,29 @@ def process_user_data(bucket, user_name, target_date, exclude_keys=None):
 # Stale Report Detection
 # ============================================================
 
+def _transcript_folders(bucket):
+    """Folder names under transcripts/ (one delimiter listing: one entry per folder, not per
+    object). The directory is not used: legacy folders (Ben_Lin, Ben_UCPK_) still hold
+    transcripts and are in no directory entry."""
+    folders = []
+    for page in s3_client.get_paginator('list_objects_v2').paginate(
+            Bucket=bucket, Prefix='transcripts/', Delimiter='/'):
+        for cp in page.get('CommonPrefixes', []):
+            folder = cp['Prefix'][len('transcripts/'):].rstrip('/')
+            if folder:
+                folders.append(folder)
+    return folders
+
+
 def count_transcripts_for_date(bucket, target_date):
+    """Transcript .json objects for a date. Lists transcripts/{folder}/{date}/ once per folder
+    found under transcripts/ instead of walking every object of every day (ruling C3,
+    revised: folders come from S3, not the directory, so no folder is missed)."""
     count = 0
-    for obj in list_s3_objects(bucket, 'transcripts/'):
-        if obj['key'].endswith('.json') and target_date in obj['key']:
-            count += 1
+    for folder in _transcript_folders(bucket):
+        for obj in list_s3_objects(bucket, f'transcripts/{folder}/{target_date}/'):
+            if obj['key'].endswith('.json'):
+                count += 1
     return count
 
 def get_report_transcript_count(bucket, target_date):
@@ -1622,8 +1644,8 @@ def check_report_freshness(bucket, target_date, user_name, current_transcript_co
         logger.warning(f"  Freshness check failed for {user_name}: {e}")
         return False, 0
 
-def check_summary_freshness(bucket, target_date, current_transcript_count):
-    json_key = f"{REPORT_PREFIX}{target_date}/summary_report.json"
+def check_summary_freshness(bucket, target_date, current_transcript_count, key=None):
+    json_key = key or f"{REPORT_PREFIX}{target_date}/summary_report.json"
     try:
         obj = s3_client.get_object(Bucket=bucket, Key=json_key)
         existing = json.loads(obj['Body'].read().decode('utf-8'))
@@ -1638,6 +1660,163 @@ def check_summary_freshness(bucket, target_date, current_transcript_count):
     except Exception as e:
         logger.warning(f"  Summary freshness check failed: {e}")
         return False, 0
+
+
+def _lake_wide_summary_on():
+    """Read at call time (never at import): "off" skips the lake-wide summary. Default on
+    for one release while readers move to the per-company documents."""
+    return os.environ.get('SUMMARY_LAKE_WIDE', 'on').strip().lower() != 'off'
+
+
+def _build_summary(users_data, target_date, site_name, triggered_by, *,
+                   scope_label="All Workers", company_id=None, save_debug=True):
+    """One combined-summary model call over `users_data` ({folder: user_data}). Returns the
+    report dict, or None when the model failed or returned nothing usable."""
+    transcripts = [t for d in users_data.values() for t in d['transcripts']]
+    photos = [ph for d in users_data.values() for ph in d['photos']]
+    transcripts.sort(key=lambda x: x['timestamp'] or datetime.min)
+    correlated_all = correlate_photos_with_transcripts(transcripts, photos)
+    duration = sum(d['total_duration'] for d in users_data.values())
+    words = sum(d['total_words'] for d in users_data.values())
+    prompt = build_daily_prompt(
+        correlated_all, scope_label, site_name, target_date,
+        total_duration=duration, num_photos=len(photos),
+    )
+    max_tokens = min(8192 + len(transcripts) * 700, llm_utils.ANSWER_TOKEN_CEILING)
+    raw_response, error = call_claude_structured(prompt, max_tokens=max_tokens)
+    if error:
+        return None
+    claude_output = extract_json_from_response(raw_response)
+    if save_debug:
+        save_debug_record(
+            S3_BUCKET, target_date, '_summary', prompt, raw_response, claude_output,
+            parse_success=claude_output is not None,
+            input_stats={
+                'transcripts_count': len(transcripts), 'total_words': words,
+                'total_duration': duration, 'photos_count': len(photos),
+                'users': list(users_data.keys()),
+            }
+        )
+    if not claude_output:
+        return None
+    meta = {
+        'version': 'v3.5',
+        'generated_at': datetime.utcnow().isoformat() + 'Z',
+        'generated_by': triggered_by,
+        'recordings_processed': len(transcripts),
+        'total_words': words,
+        'total_duration_seconds': round(duration, 1),
+        'model': llm_utils.active_model(),
+    }
+    if company_id:
+        meta.update(scope='company', company_id=company_id)
+    return {
+        'report_date': target_date, 'report_type': 'daily',
+        'user_name': None, 'site': site_name,
+        'users': list(users_data.keys()),
+        'recording_session': {
+            'date': target_date, 'site': site_name,
+            'workers': list(users_data.keys()),
+            'recordings': len(transcripts),
+            'total_duration_seconds': round(duration, 1),
+            'total_duration_display': f"{int(duration // 60)}m {int(duration % 60)}s",
+            'total_words': words,
+            'photos': len(photos),
+        },
+        'executive_summary': claude_output.get('executive_summary', ''),
+        'quality_and_compliance': claude_output.get('quality_and_compliance', []),
+        'safety_observations': claude_output.get('safety_observations', []),
+        'critical_dates_and_deadlines': claude_output.get('critical_dates_and_deadlines', []),
+        'topics': claude_output.get('topics', []),
+        '_report_metadata': meta,
+    }
+
+
+def _publish_summary(report, json_key, word_key, target_date, owner_hint=None):
+    lake_put(
+        S3_BUCKET, json_key,
+        json.dumps(report, ensure_ascii=False, indent=2, default=str),
+        client=s3_client, owner_hint=owner_hint,
+        ContentType='application/json'
+    )
+    logger.info(f"Saved: {json_key}")
+    try:
+        word_buffer = generate_word_document(report, f"Daily Summary — {target_date}")
+        if word_buffer:
+            lake_put(
+                S3_BUCKET, word_key,
+                word_buffer.getvalue(),
+                client=s3_client, owner_hint=owner_hint,
+                ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            )
+            logger.info(f"Saved: {word_key}")
+    except Exception as e:
+        logger.error(f"Summary Word failed ({word_key}): {e}")
+
+
+def _group_by_company(all_users_data):
+    """{company_id: {folder: user_data}} by each folder's HOME company in the directory.
+    Left out of EVERY company's summary (rulings C1, R10a): a folder with has_external (its
+    day may span companies; one INFO line each, folder only) and a folder with no directory
+    entry or no company (counted). Fails closed: an unreadable directory yields {}."""
+    ext = external_folders(S3_BUCKET)
+    if ext is None:
+        logger.error("  Per-company summaries skipped: directory unreadable")
+        return {}
+    doc = directory.load(s3_client, S3_BUCKET)
+    groups, no_company = {}, 0
+    for folder, data in all_users_data.items():
+        if folder in ext:
+            logger.info(f"  {folder}: has_external -- left out of every per-company summary")
+            continue
+        cid = directory.company_of_folder(doc, folder)
+        if not cid:
+            no_company += 1
+            continue
+        groups.setdefault(cid, {})[folder] = data
+    if no_company:
+        logger.info(f"  {no_company} folder(s) with no directory company: in no per-company summary")
+    return groups
+
+
+def _write_company_summaries(all_users_data, target_date, site_name, triggered_by, force):
+    """One summary per company that has at least one included folder. Returns the number
+    of model calls made (a company with nothing included costs nothing)."""
+    calls = 0
+    for cid, udata in sorted(_group_by_company(all_users_data).items()):
+        n = sum(len(d['transcripts']) for d in udata.values())
+        if not n:
+            continue
+        json_key = f"{REPORT_PREFIX}{target_date}/companies/{cid}/summary_report.json"
+        if not force:
+            is_fresh, existing = check_summary_freshness(S3_BUCKET, target_date, n, key=json_key)
+            if is_fresh:
+                logger.info(f"  Company {cid} summary: SKIP — up-to-date ({existing} transcripts)")
+                continue
+        calls += 1
+        report = _build_summary(udata, target_date, site_name, triggered_by,
+                                company_id=cid, save_debug=False)
+        if report is None:
+            logger.error(f"  Company {cid} summary: model gave nothing usable")
+            continue
+        _publish_summary(report, json_key, json_key[:-len('json')] + 'docx', target_date,
+                         owner_hint={"company_id": cid})
+    return calls
+
+
+def _write_lake_wide_summary(all_users_data, combined_transcripts, combined_photos,
+                             target_date, site_name, triggered_by, force):
+    if not force:
+        is_fresh, existing_count = check_summary_freshness(
+            S3_BUCKET, target_date, len(combined_transcripts))
+        if is_fresh:
+            logger.info(f"  Combined summary: SKIP — up-to-date ({existing_count} transcripts)")
+            return
+    report = _build_summary(all_users_data, target_date, site_name, triggered_by)
+    if report is None:
+        return
+    _publish_summary(report, f"{REPORT_PREFIX}{target_date}/summary_report.json",
+                     f"{REPORT_PREFIX}{target_date}/summary_report.docx", target_date)
 
 
 # ============================================================
@@ -1729,13 +1908,14 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
         record_site = weather_record_site(user_site_info, user_site_slug)
         if weather_findings and record_site:
             try:
-                s3_client.put_object(
-                    Bucket=S3_BUCKET,
-                    Key=weather_record_key(record_site, target_date, weather_findings["actual"]),
-                    Body=json.dumps({"site_id": record_site, "site_slug": user_site_slug,
-                                     "date": target_date,
-                                     "daily": weather_block, **weather_findings},
-                                    default=str).encode("utf-8"),
+                lake_put(
+                    S3_BUCKET,
+                    weather_record_key(record_site, target_date, weather_findings["actual"]),
+                    json.dumps({"site_id": record_site, "site_slug": user_site_slug,
+                                "date": target_date,
+                                "daily": weather_block, **weather_findings},
+                               default=str).encode("utf-8"),
+                    client=s3_client,
                     ContentType="application/json")
             except Exception as e:
                 logger.warning(f"could not keep the weather record for {user_site_id}/{target_date}: {e}")
@@ -1871,9 +2051,10 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
             report['sections'] = []
 
         json_key = f"{REPORT_PREFIX}{target_date}/{user_name}/daily_report.json"
-        s3_client.put_object(
-            Bucket=S3_BUCKET, Key=json_key,
-            Body=json.dumps(report, ensure_ascii=False, indent=2, default=str),
+        lake_put(
+            S3_BUCKET, json_key,
+            json.dumps(report, ensure_ascii=False, indent=2, default=str),
+            client=s3_client, owner_hint={"folder": user_name},
             ContentType='application/json'
         )
         logger.info(f"Saved: {json_key}")
@@ -1882,9 +2063,10 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
             word_buffer = generate_word_document(report, f"Daily Report \u2014 {user_name} \u2014 {target_date}")
             if word_buffer:
                 word_key = f"{REPORT_PREFIX}{target_date}/{user_name}/daily_report.docx"
-                s3_client.put_object(
-                    Bucket=S3_BUCKET, Key=word_key,
-                    Body=word_buffer.getvalue(),
+                lake_put(
+                    S3_BUCKET, word_key,
+                    word_buffer.getvalue(),
+                    client=s3_client, owner_hint={"folder": user_name},
                     ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
                 )
                 logger.info(f"Saved: {word_key}")
@@ -1907,98 +2089,19 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
             f"{n_transcripts} recordings, triggered_by={triggered_by}",
             user=triggered_by)
 
-    # --- Combined summary report ---
+    # --- Combined summary reports: one per company, plus the lake-wide one (flag) ---
     if combined_transcripts and not users_filter:
         if len(skipped_users) == len(all_users_data) and not force:
-            logger.info(f"  Combined summary: SKIP \u2014 all {len(skipped_users)} users up-to-date")
+            logger.info(f"  Combined summary: SKIP — all {len(skipped_users)} users up-to-date")
         else:
-            total_transcript_count = len(combined_transcripts)
-            skip_summary = False
-            if not force:
-                is_fresh, existing_count = check_summary_freshness(
-                    S3_BUCKET, target_date, total_transcript_count)
-                if is_fresh:
-                    logger.info(f"  Combined summary: SKIP \u2014 up-to-date ({existing_count} transcripts)")
-                    skip_summary = True
-
-            if not skip_summary:
-                combined_transcripts.sort(key=lambda x: x['timestamp'] or datetime.min)
-                correlated_all = correlate_photos_with_transcripts(combined_transcripts, combined_photos)
-                combined_duration = sum(d['total_duration'] for d in all_users_data.values())
-                prompt = build_daily_prompt(
-                    correlated_all, "All Workers", site_name, target_date,
-                    total_duration=combined_duration,
-                    num_photos=len(combined_photos),
-                )
-                max_tokens = min(8192 + len(combined_transcripts) * 700, llm_utils.ANSWER_TOKEN_CEILING)
-                raw_response, error = call_claude_structured(prompt, max_tokens=max_tokens)
-
-                if not error:
-                    claude_output = extract_json_from_response(raw_response)
-                    save_debug_record(
-                        S3_BUCKET, target_date, '_summary', prompt, raw_response, claude_output,
-                        parse_success=claude_output is not None,
-                        input_stats={
-                            'transcripts_count': len(combined_transcripts),
-                            'total_words': sum(d['total_words'] for d in all_users_data.values()),
-                            'total_duration': combined_duration,
-                            'photos_count': len(combined_photos),
-                            'users': list(all_users_data.keys()),
-                        }
-                    )
-
-                    if claude_output:
-                        comb_dur_min = int(combined_duration // 60)
-                        comb_dur_sec = int(combined_duration % 60)
-                        combined_report = {
-                            'report_date': target_date, 'report_type': 'daily',
-                            'user_name': None, 'site': site_name,
-                            'users': list(all_users_data.keys()),
-                            'recording_session': {
-                                'date': target_date, 'site': site_name,
-                                'workers': list(all_users_data.keys()),
-                                'recordings': len(combined_transcripts),
-                                'total_duration_seconds': round(combined_duration, 1),
-                                'total_duration_display': f"{comb_dur_min}m {comb_dur_sec}s",
-                                'total_words': sum(d['total_words'] for d in all_users_data.values()),
-                                'photos': len(combined_photos),
-                            },
-                            'executive_summary': claude_output.get('executive_summary', ''),
-                            'quality_and_compliance': claude_output.get('quality_and_compliance', []),
-                            'safety_observations': claude_output.get('safety_observations', []),
-                            'critical_dates_and_deadlines': claude_output.get('critical_dates_and_deadlines', []),
-                            'topics': claude_output.get('topics', []),
-                            '_report_metadata': {
-                                'version': 'v3.5',
-                                'generated_at': datetime.utcnow().isoformat() + 'Z',
-                                'generated_by': triggered_by,
-                                'recordings_processed': len(combined_transcripts),
-                                'total_words': sum(d['total_words'] for d in all_users_data.values()),
-                                'total_duration_seconds': round(combined_duration, 1),
-                                'model': llm_utils.active_model(),
-                            }
-                        }
-
-                        json_key = f"{REPORT_PREFIX}{target_date}/summary_report.json"
-                        s3_client.put_object(
-                            Bucket=S3_BUCKET, Key=json_key,
-                            Body=json.dumps(combined_report, ensure_ascii=False, indent=2, default=str),
-                            ContentType='application/json'
-                        )
-                        logger.info(f"Saved: {json_key}")
-
-                        try:
-                            word_buffer = generate_word_document(combined_report, f"Daily Summary \u2014 {target_date}")
-                            if word_buffer:
-                                word_key = f"{REPORT_PREFIX}{target_date}/summary_report.docx"
-                                s3_client.put_object(
-                                    Bucket=S3_BUCKET, Key=word_key,
-                                    Body=word_buffer.getvalue(),
-                                    ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-                                )
-                                logger.info(f"Saved: {word_key}")
-                        except Exception as e:
-                            logger.error(f"Combined Word failed: {e}")
+            company_calls = _write_company_summaries(
+                all_users_data, target_date, site_name, triggered_by, force)
+            logger.info(f"  Per-company summaries: {company_calls} model call(s)")
+            if _lake_wide_summary_on():
+                _write_lake_wide_summary(all_users_data, combined_transcripts, combined_photos,
+                                         target_date, site_name, triggered_by, force)
+            else:
+                logger.info("  Lake-wide summary: OFF (SUMMARY_LAKE_WIDE=off)")
 
     return {
         'report_type': 'daily', 'date': target_date,
@@ -2125,8 +2228,9 @@ def generate_periodic_report(report_type, start_date, end_date, user=None, trigg
 
         safe_user = user_name.replace(' ', '_')
         json_key = f"{REPORT_PREFIX}{end_date}/{safe_user}/{report_type}_report.json"
-        s3_client.put_object(Bucket=S3_BUCKET, Key=json_key,
-            Body=json.dumps(user_report, ensure_ascii=False, indent=2, default=str),
+        lake_put(S3_BUCKET, json_key,
+            json.dumps(user_report, ensure_ascii=False, indent=2, default=str),
+            client=s3_client, owner_hint={"folder": safe_user},
             ContentType='application/json')
         logger.info(f"  Saved: {json_key}")
 
@@ -2135,8 +2239,9 @@ def generate_periodic_report(report_type, start_date, end_date, user=None, trigg
             word_buffer = generate_word_document(user_report, title)
             if word_buffer:
                 word_key = f"{REPORT_PREFIX}{end_date}/{safe_user}/{report_type}_report.docx"
-                s3_client.put_object(Bucket=S3_BUCKET, Key=word_key,
-                    Body=word_buffer.getvalue(),
+                lake_put(S3_BUCKET, word_key,
+                    word_buffer.getvalue(),
+                    client=s3_client, owner_hint={"folder": safe_user},
                     ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
                 logger.info(f"  Saved: {word_key}")
         except Exception as e:
@@ -2210,8 +2315,9 @@ def generate_periodic_report(report_type, start_date, end_date, user=None, trigg
         }
 
         json_key = f"{REPORT_PREFIX}{end_date}/sites/{site_id}/{report_type}_report.json"
-        s3_client.put_object(Bucket=S3_BUCKET, Key=json_key,
-            Body=json.dumps(site_report, ensure_ascii=False, indent=2, default=str),
+        lake_put(S3_BUCKET, json_key,
+            json.dumps(site_report, ensure_ascii=False, indent=2, default=str),
+            client=s3_client,
             ContentType='application/json')
         logger.info(f"  Saved: {json_key}")
 
@@ -2220,8 +2326,9 @@ def generate_periodic_report(report_type, start_date, end_date, user=None, trigg
             word_buffer = generate_word_document(site_report, title)
             if word_buffer:
                 word_key = f"{REPORT_PREFIX}{end_date}/sites/{site_id}/{report_type}_report.docx"
-                s3_client.put_object(Bucket=S3_BUCKET, Key=word_key,
-                    Body=word_buffer.getvalue(),
+                lake_put(S3_BUCKET, word_key,
+                    word_buffer.getvalue(),
+                    client=s3_client,
                     ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
                 logger.info(f"  Saved: {word_key}")
         except Exception as e:
@@ -2258,8 +2365,9 @@ def generate_periodic_report(report_type, start_date, end_date, user=None, trigg
                     }
                 }
                 json_key = f"{REPORT_PREFIX}{end_date}/{report_type}_report.json"
-                s3_client.put_object(Bucket=S3_BUCKET, Key=json_key,
-                    Body=json.dumps(combined_report, ensure_ascii=False, indent=2, default=str),
+                lake_put(S3_BUCKET, json_key,
+                    json.dumps(combined_report, ensure_ascii=False, indent=2, default=str),
+                    client=s3_client,
                     ContentType='application/json')
                 logger.info(f"  Saved: {json_key}")
                 try:
@@ -2267,8 +2375,9 @@ def generate_periodic_report(report_type, start_date, end_date, user=None, trigg
                     word_buffer = generate_word_document(combined_report, title)
                     if word_buffer:
                         word_key = f"{REPORT_PREFIX}{end_date}/{report_type}_report.docx"
-                        s3_client.put_object(Bucket=S3_BUCKET, Key=word_key,
-                            Body=word_buffer.getvalue(),
+                        lake_put(S3_BUCKET, word_key,
+                            word_buffer.getvalue(),
+                            client=s3_client,
                             ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
                         logger.info(f"  Saved: {word_key}")
                 except Exception as e:
