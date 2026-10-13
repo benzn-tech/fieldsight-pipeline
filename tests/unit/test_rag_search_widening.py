@@ -56,7 +56,7 @@ def wire_search(monkeypatch, results):
     """`results` is a list, one entry per expected call. Records the kwargs."""
     calls = []
 
-    def fake_search(conn, qv, site_ids, k=5, author_ids=None, date_from=None, date_to=None, query_text=None):
+    def fake_search(conn, qv, site_ids, k=5, author_ids=None, date_from=None, date_to=None, query_text=None, source_family=None):
         calls.append({"date_from": date_from, "date_to": date_to})
         return results[len(calls) - 1] if len(calls) <= len(results) else []
 
@@ -67,7 +67,7 @@ def wire_search(monkeypatch, results):
 def wire_latest(monkeypatch, value):
     seen = {}
 
-    def fake_latest(conn, site_ids, *, author_ids=None, on_or_before=None):
+    def fake_latest(conn, site_ids, *, author_ids=None, on_or_before=None, source_family=None):
         seen["on_or_before"] = on_or_before
         return value
 

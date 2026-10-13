@@ -249,6 +249,8 @@ jobs:
               "AuthorityFlip=${{ vars.TEST_AUTHORITY_FLIP || 'false' }}" \
               "GradedRoles=${{ vars.TEST_GRADED_ROLES || 'false' }}" \
               "LakeIndexReads=${{ vars.TEST_LAKE_INDEX_READS || 'false' }}" \
+              "SearchIndexWrite=${{ vars.TEST_SEARCH_INDEX_WRITE || 'false' }}" \
+              "SearchIndexRead=${{ vars.TEST_SEARCH_INDEX_READ || 'report' }}" \
               "CompanySummaryServe=${{ vars.TEST_COMPANY_SUMMARY_SERVE || 'off' }}" \
               "EnableUserDeletion=${{ vars.TEST_ENABLE_USER_DELETION || 'false' }}" \
               "EnableExternalCorroboration=${{ vars.TEST_ENABLE_EXTERNAL_CORROBORATION || 'false' }}" \

@@ -35,6 +35,9 @@ def _folder_from_source(src):
         return parts[2]
     if len(parts) >= 3 and parts[0] == "transcripts":
         return parts[1]
+    # Session index: extractions/<folder>/<date>/<session>.json
+    if len(parts) >= 4 and parts[0] == "extractions":
+        return parts[1]
     return ""
 
 
@@ -404,7 +407,26 @@ def _derived_title(c):
             or (c.get("chunk_text") or "")[:60])
 
 
-def _aggregate_topics(chunks, question="", browse=False):
+def _session_row_kind(c):
+    """'block' for an unassigned session-index transcript window (carries
+    metadata.block), 'digest' for a session_digest chunk, else None."""
+    ctype = c.get("chunk_type")
+    md = c.get("metadata") if isinstance(c.get("metadata"), dict) else {}
+    block = md.get("block")
+    if ctype == "transcript_window" and not c.get("topic_id") and isinstance(block, dict)             and block.get("from"):
+        return "block"
+    if ctype == "session_digest":
+        return "digest"
+    return None
+
+
+def _digest_span(c):
+    """'09:00–17:30' from a digest's first line 'Session 09:00–17:30', or ''."""
+    first = (c.get("chunk_text") or "").split("\n", 1)[0]
+    return first[len("Session"):].strip() if first.startswith("Session") else ""
+
+
+def _aggregate_topics(chunks, question="", browse=False, family="report"):
     """Collapse retrieved chunks into distinct topic rows for the Search list.
     chunk_type=='topic' chunks are kept even when topic_id is NULL
     (authority-flip data), grouped/deep-linked by title; raw transcript-window
@@ -423,19 +445,27 @@ def _aggregate_topics(chunks, question="", browse=False):
     browse=True (a question that is only a resolved time phrase, see
     search_browse): there is nothing to rank by, so neither the distance
     cut-off nor the lexical-first ordering applies; rows run newest day first,
-    then by the topic's start time (rows without one last)."""
+    then by the topic's start time (rows without one last).
+
+    family="session" (the session index, see session_index.py): unassigned
+    transcript windows collapse to one "Recording <from>-<to>" row per
+    (source, block start), and each session_digest becomes a "Session <span>"
+    row. Both keep topic_id empty and their route opens the day (no
+    topicTitle: the synthetic title would match no topic). family="report"
+    is exactly the behaviour above."""
     terms = _lexical_terms(question)
     groups = {}
     starts = {}  # group key -> start seconds of the winning row's time_range (browse only)
     for c in chunks:
         topic_id = c.get("topic_id")
         ctype = c.get("chunk_type")
+        kind = _session_row_kind(c) if family == "session" else None
         # user pref 2026-07-10: raw transcript-window chunks with no topic are
         # noise in a "topics" list -> dropped. BUT authority-flip (2026-07-17+)
         # leaves chunk_type='topic' rows with topic_id=None (ingest can't link a
         # deferred report topic) -- those ARE formal topics and MUST survive,
         # grouped/deeplinked by title (BUG-39 / WS1).
-        if not topic_id and ctype != "topic":
+        if not topic_id and ctype != "topic" and kind is None:
             continue
         # Title: report_chunks JOINs topics for topic_title; a NULL topic_id
         # yields NULL topic_title, so fall back to metadata.title then chunk_text.
@@ -444,6 +474,10 @@ def _aggregate_topics(chunks, question="", browse=False):
         site_id = str(c.get("site_id", "") or "")
         # Group key: UUID when present, else the derived title (defer-day rows).
         group_id = str(topic_id) if topic_id else ("title:" + derived_title)
+        if kind == "block":
+            group_id = "block:%s|%s" % (c.get("source_s3_key") or "", c["metadata"]["block"]["from"])
+        elif kind == "digest":
+            group_id = "digest:" + (c.get("source_s3_key") or "")
         key = (date, site_id, group_id)
         dist = c.get("distance")
         dist = float(dist) if dist is not None else 1.0
@@ -481,6 +515,12 @@ def _aggregate_topics(chunks, question="", browse=False):
         prior_lexical = cur["lexical"] if cur is not None else False
         folder = _folder_from_source(c.get("source_s3_key"))
         title = derived_title
+        if kind == "block":
+            blk = c["metadata"]["block"]
+            title = "Recording %s–%s" % (blk["from"], blk.get("to") or blk["from"])
+        elif kind == "digest":
+            span = _digest_span(c)
+            title = "Session " + span if span else "Session"
         route = "/timeline?date=" + _q(date)
         if folder:
             route += "&user=" + _q(folder)
@@ -489,7 +529,7 @@ def _aggregate_topics(chunks, question="", browse=False):
         # which Aurora doesn't store. The report topic title is in both places,
         # so the Timeline resolves title -> the report topic to open + flash it.
         # (derived_title also covers the no-UUID authority-flip case.)
-        if derived_title:
+        if derived_title and kind is None:
             route += "&topicTitle=" + _q(derived_title)
         # &site carries the project SLUG (the top-bar selector's identifier, NOT
         # the site UUID) so clicking a cross-project result syncs the selector
@@ -511,7 +551,13 @@ def _aggregate_topics(chunks, question="", browse=False):
         if browse:
             import search_browse
             md = c.get("metadata") if isinstance(c.get("metadata"), dict) else {}
-            starts[key] = search_browse.start_seconds(md.get("time_range"))
+            if kind == "block":
+                start = md["block"]["from"]
+            elif kind == "digest":
+                start = _digest_span(c)  # span start; start_seconds reads up to the dash
+            else:
+                start = md.get("time_range")
+            starts[key] = search_browse.start_seconds(start)
     if browse:
         keys = sorted(groups, key=lambda k: (
             starts.get(k) is None, starts.get(k) or 0))              # time of day, none last
@@ -590,7 +636,10 @@ def _rag_search_list(body):
         if result.get("error"):
             logger.warning(f"  search rag-search error: {result['error']}")
             return {"results": [], "error": result["error"], "count": 0}
-        rows = _aggregate_topics(result.get("chunks") or [], question, browse=browse)
+        # rag-search echoes index_family only on success; a missing value is the report index.
+        family = result.get("index_family") or "report"
+        rows = _aggregate_topics(result.get("chunks") or [], question, browse=browse,
+                                 family=family)
         out = {"results": rows, "count": len(rows), "grounded": True}
         if date_range:
             out["date_range"] = date_range  # computed here, never by a model

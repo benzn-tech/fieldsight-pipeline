@@ -17,6 +17,7 @@ _TENANT = [
     ("report",       rf"^reports/{_DATE}/{_FOLDER}/[^/]+$"),
     ("embedding",    rf"^embeddings/{_DATE}/{_FOLDER}/[^/]+$"),
     ("reindex",      rf"^reindex_(?:requests|vectors)/{_DATE}/{_FOLDER}/[^/]+$"),
+    ("search_index", rf"^index_(?:requests|vectors)/{_DATE}/{_FOLDER}/[^/]+$"),
     # .../{sid|day}/{request id}.ext : the directory segment is the session, the file is a request id
     ("session_report", rf"^session_report(?:s|_requests|_results)/{_FOLDER}/{_DATE}/(?P<sidseg>[^/]+)/(?P<rid>[^/]+)$"),
     ("session_aux",  rf"^session_(?:rolling|brief)/{_FOLDER}/{_DATE}/(?P<sidseg>[^/]+)/.+$"),

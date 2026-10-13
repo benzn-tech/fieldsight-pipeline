@@ -28,7 +28,7 @@ def test_vectors_event_applies_reindex(monkeypatch):
               "source_s3_key": "reports/2026-07-16/Ada_L/daily_report.json",
               "chunks": [{"chunk_type": "topic", "chunk_text": "x",
                           "metadata": {}, "embedding": [0.1] * 1024}]}
-    vkey = "reindex_requests/2026-07-16/Ada_L/t-1.vectors.json"
+    vkey = "reindex_vectors/2026-07-16/Ada_L/t-1.json"
     s3 = FakeS3({vkey: json.dumps(result).encode("utf-8")})
     monkeypatch.setattr(mod, "s3", lambda: s3)
     monkeypatch.setattr(mod, "get_connection", lambda: FakeConn())

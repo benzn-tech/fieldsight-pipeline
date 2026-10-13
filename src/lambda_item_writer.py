@@ -63,6 +63,7 @@ import boto3
 from lake_put import lake_put
 
 import carry_forward_apply
+import index_request
 import continuity_records
 import item_continuity
 import lambda_ingest
@@ -112,6 +113,10 @@ EMIT_KEYFRAME_REQUESTS = os.environ.get("EMIT_KEYFRAME_REQUESTS", "false").lower
 #: other switch in this feature: it costs ~100 s of ONNX on a shared concurrency slot, and a
 #: session with no groups reads exactly as it read before this existed.
 REBIND_SPEAKERS = os.environ.get("REBIND_SPEAKERS", "false").lower() == "true"
+
+#: Write an index_requests/ artifact after each extraction commits, so the session search
+#: index is built from the extraction write path. Off by default: ships inert.
+SEARCH_INDEX_WRITE = os.environ.get("SEARCH_INDEX_WRITE", "false").lower() == "true"
 
 # Whether a finalized session is matched against the company's stored voiceprints without
 # anyone asking. False is the deployed default and the rollback.
@@ -1623,6 +1628,15 @@ def write_extraction_items(date, user_folder, extraction_key):
     if collected_topics:
         match_request.emit(s3(), S3_BUCKET, site["id"], date, extraction_key, collected_topics)
 
+    # Search index request: post-commit like the matcher artifact above, for the same reason
+    # (the topic ids it names must be durable). Emitted even when topics_n == 0 -- a session
+    # of windows only must still index its turns, and a re-extraction that now yields no
+    # topics must clear the chunks the previous pass left.
+    if SEARCH_INDEX_WRITE:
+        _emit_index_request(extraction, extraction_key, site=site, user_id=user_id,
+                            owner_company_id=owner_company_id, date=date,
+                            user_folder=user_folder, session_base=session_base)
+
     # video-keyframe plan (Task 2): post-commit, like match_request above --
     # the KeyframeFunction reads these durable topic ids. Env-gated so the
     # pipeline change ships inert. Video availability is resolved by the
@@ -1656,6 +1670,34 @@ def write_extraction_items(date, user_folder, extraction_key):
                    home_company_id=company["id"], recorder_user_id=user_id)
 
     return {"skipped": False, "topics": topics_n}
+
+
+def _emit_index_request(extraction, extraction_key, *, site, user_id, owner_company_id,
+                        date, user_folder, session_base):
+    """Build and write this session's index request. Never raises: the topics are already
+    committed, and a missing request is recoverable by the backfill while a raised error
+    would make S3 re-deliver an extraction that wrote fine."""
+    try:
+        tier = extraction.get("tier")
+        # A group pass replaces its members' own extractions: the keys item-writer
+        # supersedes, so the embedder can clear their requests' chunks.
+        # ...but only when the pass wrote topics: item-writer supersedes the members only then
+        # (the `extraction.get("topics")` gate above), so a topic-less group must not tell the
+        # embedder to clear members that are still live.
+        merged = list(extraction.get("mergedMembers") or []) if tier == "group" else []
+        replaces = merged if extraction.get("topics") else []
+        member_bases = [m[2] for m in map(_parse_extraction_key, merged) if m]
+        with get_connection() as conn:
+            request = index_request.build(
+                conn, extraction_key, site_id=site["id"], user_id=user_id,
+                owner_company_id=owner_company_id, report_date=date,
+                user_folder=user_folder, session_base=session_base, tier=tier,
+                extracted_at=extraction.get("extracted_at"),
+                member_bases=member_bases, replaces=replaces)
+        index_request.emit(s3(), S3_BUCKET, request)
+    except Exception:
+        logger.exception("%s: search index request could not be written", extraction_key)
+        index_request.emit_failed_metric(extraction_key)
 
 
 # ----------------------------------------------------------

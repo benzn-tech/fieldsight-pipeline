@@ -11,6 +11,8 @@
 #   Ingest      ← embeddings/**vectors.json     (embed-report output, in-VPC Aurora insert)
 #   EmbedReport ← reindex_requests/**.json      (content-edit reindex REQUEST, org-api output, non-VPC DashScope embed)
 #   Ingest      ← reindex_requests/**.vectors.json (embed-report reindex VECTORS output, in-VPC Aurora apply)
+#   EmbedReport ← index_requests/**.json        (session search index REQUEST: item-writer/org-api/backfill output)
+#   Ingest      ← index_vectors/**.json         (embed-report session-index VECTORS output, in-VPC Aurora apply)
 #
 # SAFETY:
 #   * MERGE, not clobber: we read the existing notification config and
@@ -99,7 +101,9 @@ if fn_exists "${PREFIX}-embed-report"; then
     {"Id":"fs-embed-report","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
      "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"reports/"},{"Name":"suffix","Value":"daily_report.json"}]}}},
     {"Id":"fs-embed-reindex","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
-     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"reindex_requests/"},{"Name":"suffix","Value":".json"}]}}}
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"reindex_requests/"},{"Name":"suffix","Value":".json"}]}}},
+    {"Id":"fs-embed-index","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"index_requests/"},{"Name":"suffix","Value":".json"}]}}}
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-embed-report not deployed — skipping embed-report trigger"
@@ -117,13 +121,19 @@ fi
 # that separate prefix. lambda_ingest.lambda_handler routes it to
 # apply_reindex_vectors (delete_chunks_for_topic + insert_chunk), which writes
 # to Aurora only, not back to S3 — no BUG-13 loop.
+# NOTE(session search index): the same two-hop shape again on index_requests/ (embed)
+# and index_vectors/ (ingest). "index_requests/" is NOT a prefix of "reindex_requests/"
+# (S3 compares literal prefixes from the first character), and no rule has an empty or
+# bare "index" prefix; tests/unit/test_search_index_wiring.py pins that disjointness.
 if fn_exists "${PREFIX}-ingest"; then
   WIRE_FNS+=("${PREFIX}-ingest")
   DESIRED=$(jq -c --arg arn "$INGEST_ARN" '. + [
     {"Id":"fs-ingest-report","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
      "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"embeddings/"},{"Name":"suffix","Value":"vectors.json"}]}}},
     {"Id":"fs-ingest-reindex","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
-     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"reindex_vectors/"},{"Name":"suffix","Value":".json"}]}}}
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"reindex_vectors/"},{"Name":"suffix","Value":".json"}]}}},
+    {"Id":"fs-ingest-index","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"index_vectors/"},{"Name":"suffix","Value":".json"}]}}}
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-ingest not deployed — skipping ingest trigger"
