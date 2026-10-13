@@ -404,7 +404,7 @@ def score_question(searcher, item, today):
     vec, embed_ms = searcher.embed(q)
     sql_ms = 0.0
     fetched = {}
-    for k in (ASK_K, LIST_K, 32, 50):
+    for k in sorted({ASK_K, LIST_K} | set(LIST_RERANK_SYSTEMS.values())):
         fetched[k], ms = searcher.run(q, vec, k, today)
         sql_ms += ms
     as_text = lambda rs: [(r.get("chunk_text"), str(r.get("report_date") or "")) for r in rs]
@@ -419,6 +419,26 @@ def score_question(searcher, item, today):
 
     systems = {"prod": {"ask": ask_prod, "list": list_prod, "list_rows": n_prod},
                "link-rollup": {"ask": ask_prod, "list": list_roll, "list_rows": n_roll}}
+    # Diagnostics for the Ask drop. prod-no-admit: the k=5 search's own order, without
+    # _admit_one_lexical_hit. vector-only@5: the vector arm alone (the first 5
+    # non-keyword rows of the k=30 search, which is the vec CTE's own cosine order).
+    vec30 = [r for r in list_rows if not r.get("lexical_hit")]
+    vec5 = vec30[:ASK_K]
+    no_admit = fetched[ASK_K][:ASK_K]
+    systems["prod-no-admit"] = {"ask": first_hit(as_text(no_admit), item), "list": list_prod, "list_rows": n_prod}
+    systems["vector-only@5"] = {"ask": first_hit(as_text(vec5), item), "list": list_prod, "list_rows": n_prod}
+    pats = patterns(item)
+    carries = lambda r: str(r.get("report_date") or "") == item["date"] and any(
+        p.search(r.get("chunk_text") or "") for p in pats)
+    brief = lambda r: {"chunk_type": r.get("chunk_type"), "lexical_hit": bool(r.get("lexical_hit")),
+                       "distance": r.get("distance"), "text80": (r.get("chunk_text") or "")[:80],
+                       "evidence": carries(r)}
+    ev_vec_rank = next((i for i, r in enumerate(vec30, 1) if carries(r)), None)
+    diag = {"ask_prod_rows": [brief(r) for r in lambda_ask_agent._admit_one_lexical_hit(fetched[ASK_K], ASK_K)],
+            "no_admit_rows": [brief(r) for r in no_admit],
+            "vector_arm_evidence_rank_in_30": ev_vec_rank,
+            "k5_search_rows": len(fetched[ASK_K]),
+            "k5_keyword_rows": sum(bool(r.get("lexical_hit")) for r in fetched[ASK_K])}
     rerank_ms, rerank_ok, rerank_cands = {}, {}, {}
     for name, k in LIST_RERANK_SYSTEMS.items():
         ordered, ms, ok = rerank_all(q, fetched[k])
@@ -431,7 +451,7 @@ def score_question(searcher, item, today):
     return {"id": item["id"], "lang": item.get("lang"), "expect": item.get("expect"),
             "category": item.get("category"), "style": item.get("style"),
             "raw": raw, "systems": systems, "rerank_ms": rerank_ms, "rerank_ok": rerank_ok,
-            "rerank_rows": rerank_cands,
+            "rerank_rows": rerank_cands, "diag": diag,
             "keyword_rows_k30": sum(bool(r.get("lexical_hit")) for r in list_rows),
             "best_distance": min((r["distance"] for r in list_rows if r["distance"] is not None),
                                  default=None),
@@ -486,7 +506,7 @@ def signature(run):
 
 
 def main():
-    global DATABASE
+    global DATABASE, SYSTEMS
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gold", required=True)
     ap.add_argument("--label", required=True, help="short name for this configuration")
@@ -495,9 +515,14 @@ def main():
     ap.add_argument("--author", default="f531eb99-d79c-4e6c-bac1-ff944b802349")
     ap.add_argument("--today", default=datetime.now(timezone.utc).date().isoformat())
     ap.add_argument("--out", default=str(HERE / "results"))
+    ap.add_argument("--diagnose", action="store_true",
+                    help="Ask-drop diagnosis: no reranker calls; systems prod, prod-no-admit, vector-only@5")
     ap.add_argument("--database", default=DATABASE, help="`fieldsight` = prod, `fieldsight_test` = TEST")
     args = ap.parse_args()
     DATABASE = args.database
+    if args.diagnose:
+        LIST_RERANK_SYSTEMS.clear()
+        SYSTEMS = ["prod", "prod-no-admit", "vector-only@5"]
 
     gold_text = Path(args.gold).read_text(encoding="utf-8")
     items = [json.loads(line) for line in gold_text.splitlines() if line.strip()]
