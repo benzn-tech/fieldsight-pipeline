@@ -56,7 +56,7 @@ Tenancy sub-projects 1-4 are all on prod. What was deliberately left is recorded
   per-company data delete; SES still in sandbox.
 - **Scheduled:** lake-wide summary off (~2026-10-16); frozen `user_mapping` fallback
   removal, sub-project 2 M5 (~2026-10-18); legacy gateway phase B finish, delete
-  `khfj3p1fkb` and the legacy lambdas (~2026-10-20).
+  `khfj3p1fkb` and the legacy lambdas; remove the disabled prod orchestrator (~2026-10-20).
 
 ---
 

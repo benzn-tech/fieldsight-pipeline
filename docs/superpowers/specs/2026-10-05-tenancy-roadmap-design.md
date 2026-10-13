@@ -128,12 +128,15 @@ is, why it is parked, what would trigger picking it up, and the known approach.
    - Approach: record the owner when the minutes are written (an `owner_hint` carrying the
      site/company from the session at write time), then include that kind in the export.
 2. **External project manager from a home company gets no dashboard or Ask reach.**
-   - What: a home-company worker added as an external project manager on another
-     company's site sees nothing of that site in the dashboard or Ask.
-   - Why parked: it fails closed (no leak), and no real external PM needs it yet.
-   - Trigger: a real external PM needs it.
-   - Approach: extend the visibility scope (`visible_scope` / `accessible_site_ids`) to
-     read external memberships for that role; not designed yet.
+   - What: a caller whose home tier is SELF or SELF+WORKERS and who is an external project
+     manager on another company's site gets no dashboard / Ask reach on that site. Their
+     own work there is still read through the own-folder paths.
+   - Why parked: it fails closed (no leak). The shared (site_ids, author_ids) pair the SQL
+     readers take cannot express two author tiers at once (spec
+     `2026-10-09-project-owned-tenancy-design.md`, R3).
+   - Trigger: a real external project manager needs it.
+   - Approach: pass an "open sites" parameter (sites where every author is visible)
+     through the SQL readers, alongside the existing pair.
 3. **576 lake objects stay unowned (`company_id` NULL) after the 2026-10-12 prod backfill.**
    - What: `ab-test/` scratch files and the earliest 2026-04-07 test recordings under
      `Ben_Lin`.
@@ -165,7 +168,7 @@ is, why it is parked, what would trigger picking it up, and the known approach.
 |---|---|---|
 | ~2026-10-16 | Turn off the lake-wide summary. `SUMMARY_LAKE_WIDE` is hard-coded `'on'` in `src/template.yaml`, so this needs a code change. | per-company summaries have run on prod for a few days |
 | ~2026-10-18 | Sub-project 2 M5: remove the frozen `user_mapping` fallback. | a week with zero fallback warnings |
-| ~2026-10-20 | Legacy gateway phase B finish: delete API Gateway `khfj3p1fkb` and the legacy lambdas `fieldsight-api`, `fieldsight-ask-agent`, `fieldsight-orchestrator`. They were disabled on 2026-10-13: stage throttle 0, reserved concurrency 0, both orchestrator EventBridge rules disabled. | a quiet week |
+| ~2026-10-20 | Legacy gateway phase B finish: delete API Gateway `khfj3p1fkb` and the legacy lambdas `fieldsight-api` and `fieldsight-ask-agent` (disabled 2026-10-13: stage throttle 0, reserved concurrency 0). The prod stack's two orchestrator EventBridge rules were disabled the same day; removing `OrchestratorFunction` itself is a `src/template.yaml` change. | a quiet week |
 
 ## Non-goals
 
