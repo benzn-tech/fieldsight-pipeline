@@ -33,3 +33,38 @@ test("an empty key refuses everything", () => {
 test("inside the 30 s skew allowance still verifies", () => {
   assert.equal(verifyVoiceSession(f.token, f.key, f.expires_at + 29), f.sub);
 });
+
+const sign = (p) => b64(createHmac("sha256", f.key).update(p).digest());
+
+test("non-ASCII payload char is refused (no low-byte truncation)", () => {
+  const [p, s] = f.token.split(".");
+  const bad = String.fromCharCode(p.charCodeAt(0) + 256) + p.slice(1);
+  assert.equal(verifyVoiceSession(bad + "." + s, f.key, f.now), null);
+});
+
+test("a non-finite clock refuses", () => {
+  assert.equal(verifyVoiceSession(f.token, f.key, undefined), null);
+  assert.equal(verifyVoiceSession(f.token, f.key, NaN), null);
+});
+
+test("a non-string key refuses", () => {
+  assert.equal(verifyVoiceSession(f.token, 123, f.now), null);
+});
+
+test("malformed inputs refuse", () => {
+  const [p, s] = f.token.split(".");
+  const notJson = b64("not json");
+  const noExp = b64(JSON.stringify({ sub: f.sub, aud: "voice-llm" }));
+  for (const [label, tok] of [
+    ["empty p", "." + s],
+    ["empty s", p + "."],
+    ["empty", ""],
+    ["non-string", 42],
+    ["non-json", notJson + "." + sign(notJson)],
+    ["no exp", noExp + "." + sign(noExp)],
+  ]) assert.equal(verifyVoiceSession(tok, f.key, f.now), null, label);
+});
+
+test("exact boundary now = exp + 30 is refused", () => {
+  assert.equal(verifyVoiceSession(f.token, f.key, f.expires_at + 30), null);
+});
