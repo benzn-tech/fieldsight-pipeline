@@ -52,7 +52,7 @@ test("a short result gets the filler phrase; still short means the opener", () =
   assert.ok(base.length < 141, String(base.length));
   const b = assessRestatement(q, m);
   assert.deepEqual(b, { reason: null,
-    text: `Got it, ${m}, let me check your site records and pull up what was said on site this will only take a moment... ` });
+    text: `Got it, ${m}, let me check your site records and pull up what was said on site, and this will only take a moment... ` });
   assert.ok(b.text.length >= 141);
   assert.deepEqual(assessRestatement("about the pour", "you're asking about the pour"), { text: null, reason: "too_short" });
 });

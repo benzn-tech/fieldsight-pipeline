@@ -9,7 +9,7 @@ export const DEADLINE_MS = 1800;
 const MIN_CHARS = 141;     // under ~120 chars ElevenLabs' TTS holds the text back (measured 2026-10-14)
 const MAX_WORDS = 25;
 const TAIL = ", let me check your site records and pull up what was said on site";
-const FILLER = " this will only take a moment";
+const FILLER = ", and this will only take a moment";
 
 export const RESTATE_SYSTEM = [
   "Restate the user's question as a short spoken phrase that starts with \"you're asking\".",
