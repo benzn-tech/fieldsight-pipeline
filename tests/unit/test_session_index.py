@@ -178,3 +178,19 @@ def test_source_files_topic_digest_vs_window():
     assert by["topic"]["metadata"]["source_files"] == ["sidaaaa", "sidbbbb"]
     assert by["session_digest"]["metadata"]["source_files"] == ["sidaaaa", "sidbbbb"]
     assert by["transcript_window"]["metadata"]["source_files"] == ["seg_c0001.json"]
+
+
+def test_huge_header_terminates_and_every_part_fits():
+    # A header that alone exceeds a part used to leave `room` <= 0 and loop forever.
+    import threading
+    req = make_req(topics=[dict(REQ["topics"][0], title="T" * 5000, summary="s" * 6000)])
+    out = {}
+    th = threading.Thread(target=lambda: out.update(c=si.build_chunks(req, [])), daemon=True)
+    th.start()
+    th.join(10)
+    assert not th.is_alive(), "_split_topic_text did not terminate"
+    parts = [x for x in out["c"] if x["chunk_type"] == "topic"]
+    assert len(parts) >= 2
+    for part in parts:
+        assert len(part["chunk_text"]) <= si.TOPIC_SPLIT_CHARS
+        assert len(part["chunk_text"].splitlines()[0]) <= si.HEADER_MAX_CHARS

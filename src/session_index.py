@@ -23,6 +23,8 @@ from chunking import (
 )
 
 INDEX = "session"
+# The header repeats on every part, so it must leave room for body text.
+HEADER_MAX_CHARS = 300
 
 
 def _turn_sec(turn):
@@ -66,6 +68,7 @@ def _topic_lines(t):
 def _split_topic_text(header, body):
     """Texts for one topic: a single text when it fits, else parts that each
     repeat the header line. A line longer than a part is cut by characters."""
+    header = header[:HEADER_MAX_CHARS]
     text = "\n".join([header] + body)
     if len(text) <= TOPIC_SPLIT_CHARS:
         return [text]
