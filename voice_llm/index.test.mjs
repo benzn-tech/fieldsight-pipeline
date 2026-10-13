@@ -90,10 +90,11 @@ test("a malformed body is a 400, not a crash", async () => {
 });
 
 test("probes are parsed from the last user message only", () => {
-  assert.deepEqual(mod.parseProbe("hold 20"), { kind: "hold", seconds: 20 });
-  assert.deepEqual(mod.parseProbe("please Delay 5 thanks"), { kind: "delay", seconds: 5 });
-  assert.deepEqual(mod.parseProbe("hold 999"), { kind: "hold", seconds: 60 }, "capped");
-  assert.deepEqual(mod.parseProbe("what is the backfill date"), { kind: "normal", seconds: 0 });
+  assert.deepEqual(mod.parseProbe("hold 20"), { kind: "hold", seconds: 20, flags: [] });
+  assert.deepEqual(mod.parseProbe("please Delay 5 thanks"), { kind: "delay", seconds: 5, flags: [] });
+  assert.deepEqual(mod.parseProbe("hold 999"), { kind: "hold", seconds: 60, flags: [] }, "capped");
+  assert.deepEqual(mod.parseProbe("what is the backfill date"), { kind: "normal", seconds: 0, flags: [] });
+  assert.deepEqual(mod.parseProbe("delay 8 ka p"), { kind: "delay", seconds: 8, flags: ["ka", "p"] });
 
   const body = { messages: [
     { role: "user", content: "hold 30" },
