@@ -148,6 +148,7 @@ GRANTS = {
     "NonWorkExpiryFunction": {("s3:PutObject", "index_requests/*")},
     "EmbedReportFunction": {("s3:GetObject", "index_requests/*"),
                             ("s3:GetObject", "index_vectors/*"),
+                            ("s3:GetObject", "extractions/*"),
                             ("s3:PutObject", "index_vectors/*")},
     "IngestFunction": {("s3:GetObject", "index_vectors/*"),
                        ("s3:PutObject", "index_requests/*")},

@@ -52,7 +52,7 @@ separately); HNSW tuning; a "live layer" UI.
 | D2 | **Every tier is indexed** (live and final). The latest extraction for a key replaces the previous chunks atomically. | Same-day search within minutes. Both tiers write the same key, so replace-by-key handles it. Unchanged text reuses vectors (D6), so re-embedding cost stays small. |
 | D3 | Chunk `source_s3_key` = the **extraction key** (`extractions/{folder}/{date}/{base}.json`). | The existing recording-tombstone arm of `visible_chunks_predicate` (prefix match on `extractions/{folder}/{date}/sid…` / `grp…`) then hides deleted recordings directly. Today it never matches, because chunks carry `reports/…`. |
 | D4 | Same two-hop shape as today: in-VPC writes a request, non-VPC embeds, in-VPC applies. | BUG-36: in-VPC Lambdas have no internet. `lambda_embed_report` and `lambda_ingest` already own those roles, so no new functions are needed. New S3 grants are required and listed in §4.1. |
-| D5 | **Currency is decided in Aurora, at apply time, under the key's advisory lock.** The apply step reads K's live topics, `SELECT id FROM topics t WHERE t.source_s3_key = K AND <visible topic predicate>`. That predicate has two arms on main and three on develop (adds `superseded_at IS NULL`); the repo function reuses whichever `deleted_predicates` the branch carries. **Empty live set** → archive K's chunks and insert nothing. This covers a tombstoned source, a member superseded by a group merge, and S3 being ahead of Aurora. **Live set disjoint from `request.topics[].id`** → stale, skip. **Overlap** → apply, and set `topic_id` to NULL for any chunk whose topic is not in the live set. `extracted_at` is only a tiebreak, used when the request and Aurora both hold zero topics (a windows-only session). | Fable review C2. An S3 `extracted_at` comparison both re-inserts a member's chunks after a group merge (the member's object is unchanged) and skips forever when item-writer exits before writing (tombstone, identity miss, group suppress). Aurora is what the screen shows, so it is the authority. The rule is schema-agnostic: prod deletes and re-inserts topics, develop supersedes them. Ingest therefore never needs `GetObject extractions/*`. |
+| D5 | **Currency is decided in Aurora, at apply time, under the key's advisory lock.** The apply step reads K's live topics, `SELECT id FROM topics t WHERE t.source_s3_key = K AND <visible topic predicate>`. That predicate has two arms on main and three on develop (adds `superseded_at IS NULL`); the repo function reuses whichever `deleted_predicates` the branch carries. **Empty live set** → archive K's chunks and insert nothing. This covers a tombstoned source, a member superseded by a group merge, and S3 being ahead of Aurora. **Live set disjoint from `request.topics[].id`** → stale, skip. **Overlap** → apply, and drop any chunk whose `topic_id` is set but not in the live set (a newer request rebuilds it; NULLing it would leave deleted or redacted content visible, ruling R5). Chunks with no `topic_id` (blocks, digest) are unaffected. `extracted_at` is only a tiebreak, used when the request and Aurora both hold zero topics (a windows-only session). | Fable review C2. An S3 `extracted_at` comparison both re-inserts a member's chunks after a group merge (the member's object is unchanged) and skips forever when item-writer exits before writing (tombstone, identity miss, group suppress). Aurora is what the screen shows, so it is the authority. The rule is schema-agnostic: prod deletes and re-inserts topics, develop supersedes them. Ingest therefore never needs `GetObject extractions/*`. |
 | D6 | The embedder reuses vectors by text hash from the key's previous vectors artifact. | Live passes re-run every ≥90 s during long sessions, and most chunk texts are unchanged between them. |
 | D7 | Non-work topics produce no topic chunk, and transcript turns inside a non-work topic's span produce no window. | Same rule as `chunk_report` today, extended to windows (life-conversation separation). |
 | D8 | Rollout is two switches: `SEARCH_INDEX_WRITE` (session index on/off) and `SEARCH_INDEX_READ` (`report` / `session`). Each is wired in three parts: a template Parameter, Environment on the functions that read it, and `--parameter-overrides` from `TEST_*`/`PROD_*` repo variables in both workflows (the same pattern as `AuthorityFlip`). WRITE goes on item-writer, org-api (edits) and ingest (backfill). READ goes on rag-search only, and rag-search echoes the family in its response so ask-agent renders from it rather than from a second env copy. Families: **session** = `source_s3_key LIKE 'extractions/%'`; **report** = everything else, including NULL. **No migration is needed.** | The two row families coexist in one table with no duplicate hits. The flip and the rollback are a repo-variable change plus a redeploy. |
@@ -85,7 +85,7 @@ ingest (in-VPC)                            new handler: apply_index_vectors
    live empty            → archive K's chunks (archive_chunks_for_session batch), insert nothing
    live ∩ request = ∅    → skip (stale)
    otherwise             → DELETE chunks WHERE source_s3_key IN (K, *replaces) AND company scope
-                           INSERT chunks; topic_id := NULL where topic not in live
+                           INSERT chunks; chunks of non-live topics are dropped
    COMMIT
 ```
 
@@ -95,7 +95,7 @@ ingest (in-VPC)                            new handler: apply_index_vectors
 |---|---|
 | item-writer | `s3:PutObject` on `index_requests/*` |
 | org-api (edit path) | `s3:PutObject` on `index_requests/*` |
-| embed-report | `s3:GetObject` on `index_requests/*`, `s3:GetObject` + `s3:PutObject` on `index_vectors/*` (D6 reads the previous artifact). Its existing ListBucket condition (`transcripts/*`) already covers `gather_session_segments`. |
+| embed-report | `s3:GetObject` on `index_requests/*`, `s3:GetObject` + `s3:PutObject` on `index_vectors/*` (D6 reads the previous artifact), `s3:GetObject` on `extractions/*` (resolves a group request's `mergedMembers` when the request carries no members, ruling R6). Its existing ListBucket condition (`transcripts/*`) already covers `gather_session_segments`. |
 | ingest | `s3:GetObject` on `index_vectors/*`; `s3:PutObject` on `index_requests/*` (backfill) |
 
 Each grant is checked with `simulate-principal-policy` against the deployed TEST role before
@@ -211,7 +211,7 @@ backfill is about 300 sessions, under $0.10.
   `source_files` stamping; the 4,500-char split.
 - Unit (FakeConn): apply. Cases: live set disjoint from the request → skipped; empty live set
   (tombstone, group-superseded member, S3 ahead of Aurora) → archived, nothing inserted;
-  overlap → topics outside the live set get `topic_id NULL`; `replaces` deletes members;
+  overlap → chunks of topics outside the live set are dropped; `replaces` deletes members;
   deletes carry the company scope; everything runs under the advisory lock. The group-merge
   race (member request applied after the group's) is a named test.
 - Unit: the embedder reads only the session's own segments (a second session on the same day

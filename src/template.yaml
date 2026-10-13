@@ -4108,10 +4108,12 @@ Resources:
               # Session search index (spec 2026-10-13 4.1): reads the request written by
               # item-writer / org-api / ingest backfill, and reads (D6: unchanged chunks are
               # not re-embedded) then writes its vectors under the separate index_vectors/.
+              # extractions/* is read only to resolve a group request's mergedMembers.
               Action: s3:GetObject
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/index_requests/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/index_vectors/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/extractions/*
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/index_vectors/*
