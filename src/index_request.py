@@ -103,13 +103,18 @@ def _members(user_folder, report_date, session_base, replaces):
     """One entry per session whose turns feed this request. A group request reads the
     turns of every merged member (named by the member extraction keys it replaces);
     a solo request reads its own."""
-    if replaces:
+    if session_base.startswith("grp"):
+        # A group key is never a session of its own: its turns live in its members. With no
+        # parseable members the embedder resolves them from the extraction itself.
         out = []
         for key in replaces:
             parsed = parse_extraction_key(key)
             if parsed:
                 folder, date, base = parsed
                 out.append({"user_folder": folder, "date": date, "session_base": base})
+        if not out:
+            logger.warning("group %s has no parseable members (replaces=%r); "
+                           "the embedder must resolve them", session_base, list(replaces))
         return out
     return [{"user_folder": user_folder, "date": report_date, "session_base": session_base}]
 

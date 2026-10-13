@@ -88,3 +88,20 @@ def test_group_tier_carries_replaces_and_member_bases(wired):
     assert kw["tier"] == "group"
     assert kw["replaces"] == members
     assert kw["member_bases"] == ["A_2026-07-06_10-00-00", "B_2026-07-06_10-00-30"]
+
+
+def test_group_without_topics_replaces_nothing(wired):
+    # item-writer only supersedes the members when the group wrote topics, so a topic-less
+    # group request must not tell the embedder to clear them.
+    built, emitted = _spy(wired)
+    wired.setattr(iw, "SEARCH_INDEX_WRITE", True)
+    members = ["extractions/Ben_X/2026-07-06/A_2026-07-06_10-00-00.json"]
+    wired.setattr(iw, "_s3_client", FakeS3({EXTRACTION_KEY: json.dumps(make_extraction(
+        tier="group", groupId="G1", mergedMembers=members, topics=[]))}))
+    wired.setattr(iw, "ENABLE_GROUP_MERGE", False)
+
+    iw.write_extraction_items("2026-07-06", "Jarley_Trainor", EXTRACTION_KEY)
+
+    _, kw = built[0]
+    assert kw["replaces"] == []
+    assert kw["member_bases"] == ["A_2026-07-06_10-00-00"]

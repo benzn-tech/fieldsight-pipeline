@@ -1681,8 +1681,12 @@ def _emit_index_request(extraction, extraction_key, *, site, user_id, owner_comp
         tier = extraction.get("tier")
         # A group pass replaces its members' own extractions: the keys item-writer
         # supersedes, so the embedder can clear their requests' chunks.
-        replaces = list(extraction.get("mergedMembers") or []) if tier == "group" else []
-        member_bases = [m[2] for m in map(_parse_extraction_key, replaces) if m]
+        # ...but only when the pass wrote topics: item-writer supersedes the members only then
+        # (the `extraction.get("topics")` gate above), so a topic-less group must not tell the
+        # embedder to clear members that are still live.
+        merged = list(extraction.get("mergedMembers") or []) if tier == "group" else []
+        replaces = merged if extraction.get("topics") else []
+        member_bases = [m[2] for m in map(_parse_extraction_key, merged) if m]
         with get_connection() as conn:
             request = index_request.build(
                 conn, extraction_key, site_id=site["id"], user_id=user_id,

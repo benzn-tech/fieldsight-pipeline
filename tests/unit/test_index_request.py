@@ -163,3 +163,13 @@ def test_a_redacted_topics_span_and_chunk_reach_no_index_chunk(monkeypatch):
     assert "KEEPME" in text
     assert "HIDEME" not in text and "Secret t2" not in text
     assert not [c for c in chunks if c.get("topic_id") == "t2"]
+
+
+def test_group_key_without_parseable_members_has_no_members(monkeypatch, caplog):
+    monkeypatch.setattr(ir.topics_repo, "get_topic_full", lambda conn, tid: dict(FULL, id=tid))
+    with caplog.at_level("WARNING"):
+        req = ir.build(FakeConn(["t1"]), "extractions/Ben_X/2026-07-06/grpG.json",
+                       **{**KW, "tier": "group", "session_base": "grpG"},
+                       replaces=["not-an-extraction-key"])
+    assert req["members"] == []
+    assert "grpG" in caplog.text
