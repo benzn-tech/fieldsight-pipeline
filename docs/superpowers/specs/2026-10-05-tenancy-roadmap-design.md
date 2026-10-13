@@ -1,6 +1,7 @@
 # Tenancy roadmap — one company boundary, enforced everywhere, built for scale (design, 2026-10-05)
 
-Status: **master design, approved direction 2026-10-05.** Four sub-projects, each with its
+Status: **master design, approved direction 2026-10-05. All four sub-projects are on prod
+as of 2026-10-13** (see "Delivery status" below). Four sub-projects, each with its
 own spec → plan → implementation. This document holds the decisions that bind all four,
 the order, and the scale-up risks they are designed against. Sub-project 1 is specified
 in `2026-10-05-retire-the-legacy-gateway-design.md`.
@@ -100,6 +101,74 @@ orphan rule) but its `{company}` becomes **the owning site's company**, not the 
 
 S1 and S2 are recorded here so they are not lost; neither is part of the four
 sub-projects, and each gets its own decision when its trigger approaches.
+
+## Delivery status (2026-10-13)
+
+| # | sub-project | on prod | PRs |
+|---|---|---|---|
+| 1 | Retire the legacy gateway's data routes | phase A and B on prod (data routes return 410). Phase C cleanup is scheduled below | #1037 (A), #1071 / release #1073 (B) |
+| 2 | Retire the frozen mapping | org-api publishes the directory; the frozen-mapping fallback is still in code until M5 (scheduled below) | #1078 / release #1079 |
+| 3 | Project-owned data + cross-company memberships | on prod | #1083 / release #1085 |
+| 4 | Lake ownership index (company/owner as data in `lake_objects`, not in the key path) | on prod; prod backfill applied 2026-10-12 | #1092 / release #1094 |
+
+Sub-project 4 shipped as an ownership **index** (ownership is data, not a path segment),
+not as a company segment in every key; D3's structural guarantee is delivered by the
+index plus per-company export, not by key layout. See `2026-10-12-lake-ownership-design.md`.
+
+## Parked follow-ups (2026-10-13)
+
+Work that was deliberately not done, so it can be picked up later. Each item says what it
+is, why it is parked, what would trigger picking it up, and the known approach.
+
+1. **Meeting minutes are not in the per-company export.**
+   - What: `export_company` (`src/company_export.py`) does not include meeting minutes.
+     Their keys are title-keyed, so no owner can be resolved from the key.
+   - Why parked: no customer has asked for a full data export yet.
+   - Trigger: a customer asks for a full data export.
+   - Approach: record the owner when the minutes are written (an `owner_hint` carrying the
+     site/company from the session at write time), then include that kind in the export.
+2. **External project manager from a home company gets no dashboard or Ask reach.**
+   - What: a caller whose home tier is SELF or SELF+WORKERS and who is an external project
+     manager on another company's site gets no dashboard / Ask reach on that site. Their
+     own work there is still read through the own-folder paths.
+   - Why parked: it fails closed (no leak). The shared (site_ids, author_ids) pair the SQL
+     readers take cannot express two author tiers at once (spec
+     `2026-10-09-project-owned-tenancy-design.md`, R3).
+   - Trigger: a real external project manager needs it.
+   - Approach: pass an "open sites" parameter (sites where every author is visible)
+     through the SQL readers, alongside the existing pair.
+3. **576 lake objects stay unowned (`company_id` NULL) after the 2026-10-12 prod backfill.**
+   - What: `ab-test/` scratch files and the earliest 2026-04-07 test recordings under
+     `Ben_Lin`.
+   - Why parked: by rule nothing guesses an owner; they are excluded from exports.
+   - Trigger: none unless they must be exported or deleted.
+   - Approach: if needed, assign an owner by an explicit operator decision, or delete them.
+4. **Database credentials.**
+   - What: org-api connects to Aurora as the superuser with a plaintext password in the
+     Lambda environment.
+   - Why parked: recorded, not scheduled; no incident forces it.
+   - Trigger: before onboarding many more tenants, or any credential exposure.
+   - Approach: first a least-privilege role per function, then IAM database
+     authentication. Secrets Manager is the worst fit for the in-VPC topology (it needs a
+     paid VPC endpoint and the password still exists).
+5. **Per-company data delete.**
+   - What: deleting one company's data (offboarding).
+   - Why parked: deferred by the owner on 2026-10-12; export only for now.
+   - Trigger: the first customer who leaves and asks for deletion.
+   - Approach: needs its own design, because it is irreversible.
+6. **SES is still in sandbox.**
+   - What: notice emails cannot reach customers.
+   - Why parked: owner decision, deferred.
+   - Trigger: the owner decides to request production access.
+   - Approach: request SES production access, then enable the notice emails.
+
+## Scheduled cleanups
+
+| when | cleanup | gate |
+|---|---|---|
+| ~2026-10-16 | Turn off the lake-wide summary. `SUMMARY_LAKE_WIDE` is hard-coded `'on'` in `src/template.yaml`, so this needs a code change. | per-company summaries have run on prod for a few days |
+| ~2026-10-18 | Sub-project 2 M5: remove the frozen `user_mapping` fallback. | a week with zero fallback warnings |
+| ~2026-10-20 | Legacy gateway phase B finish: delete API Gateway `khfj3p1fkb` and the legacy lambdas `fieldsight-api` and `fieldsight-ask-agent` (disabled 2026-10-13: stage throttle 0, reserved concurrency 0). The prod stack's two orchestrator EventBridge rules were disabled the same day; removing `OrchestratorFunction` itself is a `src/template.yaml` change. | a quiet week |
 
 ## Non-goals
 
