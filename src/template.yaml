@@ -470,6 +470,28 @@ Parameters:
       How many chunks Ask fetches for the reranker to reorder (RERANK_CANDIDATE_K).
       rag-search clamps each arm to 32, so a larger value buys nothing today.
 
+  # Session search index (spec 2026-10-13). Two independent switches, each wired in three
+  # pieces pinned by tests/unit/test_search_index_wiring.py: this Parameter -> the
+  # function env -> the workflow --parameter-overrides line.
+  SearchIndexWrite:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      When true, item-writer, org-api's edit path and nonwork-expiry emit index_requests/
+      artifacts so the session search index is built from the extraction write path, and
+      ingest may backfill them. False (default) writes nothing: the report-built chunks
+      are the only index, unchanged in every path.
+
+  SearchIndexRead:
+    Type: String
+    Default: report
+    AllowedValues: [report, session]
+    Description: >-
+      Which chunk family rag-search reads (SEARCH_INDEX_READ). 'report' (default) is the
+      report-built index, unchanged; 'session' reads the extraction-built one. Flip only
+      after the index has been backfilled.
+
   AsrProvider:
     Type: String
     Description: Speech-to-text provider (transcribe|elevenlabs)
@@ -2450,6 +2472,8 @@ Resources:
           STAGE: !Ref Stage
           # flip only after backfill + a drain (see the LakeIndexReads parameter)
           LAKE_INDEX_READS: !Ref LakeIndexReads
+          # org-api's edit path emits index_requests/ through reindex.py
+          SEARCH_INDEX_WRITE: !Ref SearchIndexWrite
           # owner product decision (see the CompanySummaryServe parameter)
           COMPANY_SUMMARY_SERVE: !Ref CompanySummaryServe
       Policies:
@@ -2714,6 +2738,11 @@ Resources:
               # writes the VECTORS artifact back into the same prefix.
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/reindex_requests/*
+            - Effect: Allow
+              # Session search index (spec 2026-10-13 4.1): the edit path also writes
+              # an index_requests/ artifact for the non-VPC EmbedReportFunction.
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/index_requests/*
             - Effect: Allow
               # Delivery-C session report (Tier-2 T3): POST /sessions/{id}/report
               # writes a request artifact to the lake's session_report_requests/
@@ -3492,6 +3521,8 @@ Resources:
           NONWORK_EXPIRY_ENABLED: !Ref EnableNonWorkExpiry
           NONWORK_EXPIRY_HOURS: !Ref NonWorkExpiryHours
           NONWORK_EXPIRY_SINCE: !Ref NonWorkExpirySince
+          # reindex.enqueue_topic_reindex also emits index_requests/ when this is on
+          SEARCH_INDEX_WRITE: !Ref SearchIndexWrite
       Policies:
         # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
         # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
@@ -3514,6 +3545,9 @@ Resources:
               Action: s3:PutObject
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/reindex_requests/*
+                # reindex.enqueue_topic_reindex also emits the session-index request
+                # (SEARCH_INDEX_WRITE). Same silent-miss shape as the grant above.
+                - !Sub arn:aws:s3:::${IngestBucketName}/index_requests/*
       Events:
         ExpirySweep:
           Type: Schedule
@@ -3890,6 +3924,7 @@ Resources:
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
           AUTHORITY_FLIP: !Ref AuthorityFlip
+          SEARCH_INDEX_WRITE: !Ref SearchIndexWrite
           # Ruling R22: carry_forward_apply.py's OrphanedHumanEdits EMF line reads this
           # (os.environ.get("STAGE", "unknown")) — without it every emission lands under
           # Stage=unknown instead of test/prod, and Task 8's live TEST check saw exactly
@@ -3949,6 +3984,16 @@ Resources:
               # + insert_chunk).
               Action: s3:GetObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/reindex_vectors/*
+            - Effect: Allow
+              # Session search index (spec 2026-10-13 4.1): apply_index_vectors reads the
+              # vectors the non-VPC EmbedReportFunction wrote under index_vectors/ (its own
+              # prefix, so the embed rule on index_requests/ is never ambiguous).
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/index_vectors/*
+            - Effect: Allow
+              # ...and the backfill emits index_requests/ for extractions that predate the switch.
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/index_requests/*
             - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
@@ -4060,6 +4105,17 @@ Resources:
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/reindex_vectors/*
             - Effect: Allow
+              # Session search index (spec 2026-10-13 4.1): reads the request written by
+              # item-writer / org-api / ingest backfill, and reads (D6: unchanged chunks are
+              # not re-embedded) then writes its vectors under the separate index_vectors/.
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/index_requests/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/index_vectors/*
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/index_vectors/*
+            - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
               Condition:
@@ -4067,6 +4123,10 @@ Resources:
                   s3:prefix:
                     - transcripts/*
                     - voice_ask/*
+                    # The first run for a session has no previous vectors artifact; with
+                    # ListBucket a missing key is a 404 (a clean "embed everything"), without
+                    # it S3 answers 403 and every first run logs a false read failure.
+                    - index_vectors/*
 
   # ----------------------------------------------------------
   # Lambda 14: Item Writer (Phase 4b) — S3 event on extractions/,
@@ -4103,6 +4163,8 @@ Resources:
           # ever given to IngestFunction, so the late-extraction rule in
           # write_extraction_items could never see the flag on a deployed stack.
           AUTHORITY_FLIP: !Ref AuthorityFlip
+          # Post-commit index_requests/ emission (lambda_item_writer.SEARCH_INDEX_WRITE).
+          SEARCH_INDEX_WRITE: !Ref SearchIndexWrite
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
@@ -4158,6 +4220,11 @@ Resources:
               # EmbedReportFunction's embeddings/* PutObject grant.
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/match_requests/*
+            - Effect: Allow
+              # Session search index (spec 2026-10-13 4.1): post-commit index_requests/
+              # artifact for the non-VPC EmbedReportFunction (in-VPC, so S3 not invoke, BUG-36).
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/index_requests/*
             - Effect: Allow
               # video-keyframe plan: post-commit request artifact for the
               # S3-triggered KeyframeFunction (item-writer is in-VPC, BUG-36 —
@@ -4708,6 +4775,8 @@ Resources:
           PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+          # report (default) | session: which chunk family Ask/Search read.
+          SEARCH_INDEX_READ: !Ref SearchIndexRead
       Policies:
         - VPCAccessPolicy: {}
 
