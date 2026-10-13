@@ -7,7 +7,8 @@ from repositories.search_sql import build_latest_date_sql, build_search_sql  # r
 __all__ = ["build_search_sql", "build_latest_date_sql", "insert_chunk", "search_chunks",
            "latest_visible_date",
            "delete_chunks_for_source", "delete_chunks_for_sources", "delete_chunks_for_topic",
-           "archive_chunks_for_session", "restore_chunks_for_batch",
+           "archive_chunks_for_session", "archive_chunks_for_sources",
+           "restore_chunks_for_batch",
            "SESSION_CHUNK_PREDICATE"]
 
 # Which chunks belong to one recording.
@@ -194,6 +195,32 @@ def archive_chunks_for_session(conn, session_base, topic_ids, batch_id, *,
         f"WHERE {SESSION_CHUNK_PREDICATE}{COMPANY_SCOPE}", params)
     cur = conn.execute(
         f"DELETE FROM report_chunks WHERE {SESSION_CHUNK_PREDICATE}{COMPANY_SCOPE}", params)
+    return cur.rowcount
+
+
+def archive_chunks_for_sources(conn, keys, batch_id, *, company_id) -> int:
+    """Move the SESSION-family chunks of these extraction keys into `report_chunks_archive`.
+    Returns the row count.
+
+    Selects by `source_s3_key` only -- the session index stamps its chunks with the
+    extraction key, whereas report-family rows carry `reports/...`. Unlike
+    `archive_chunks_for_session` this never reaches a report-family row (prod reads that
+    family during rollout) nor another session's chunks that merely list this session's
+    base in `metadata.source_files` (a group's chunks list its members). The
+    `extractions/` guard keeps a malformed key from ever naming a report row.
+    Company-scoped like every delete on this shared table."""
+    keys = [k for k in (keys or []) if k]
+    if not keys:
+        raise ValueError("keys is required: an empty list selects nothing and hides a bug")
+    if not company_id:
+        raise ValueError("company_id is required: report_chunks is shared by every tenant")
+    pred = ("source_s3_key = ANY(%(keys)s) AND source_s3_key LIKE 'extractions/%%'"
+            + COMPANY_SCOPE)
+    params = {"keys": keys, "batch_id": batch_id, "company_id": company_id}
+    conn.execute(
+        f"INSERT INTO report_chunks_archive "
+        f"SELECT *, %(batch_id)s::uuid, now() FROM report_chunks WHERE {pred}", params)
+    cur = conn.execute(f"DELETE FROM report_chunks WHERE {pred}", params)
     return cur.rowcount
 
 

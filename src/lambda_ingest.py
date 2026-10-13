@@ -1052,17 +1052,24 @@ def _apply_index_result(conn, result):
         # Windows-only request: no topic ids to compare, so the live set cannot say whether
         # the session is still wanted. The one thing it can still be is deleted.
         if _source_is_tombstoned(conn, key):
-            return "cleared", chunks.archive_chunks_for_session(
-                conn, base, [], uuid.uuid4(), company_id=cid)
+            return "cleared", chunks.archive_chunks_for_sources(
+                conn, [key], uuid.uuid4(), company_id=cid)
     elif not live:
         # Topics were requested but none is live any more: deleted, or taken over by a
-        # group pass. Nothing this request carries may stay searchable.
-        return "cleared", chunks.archive_chunks_for_session(
-            conn, base, [], uuid.uuid4(), company_id=cid)
-    elif req_ids and not (live & req_ids):
+        # group pass. Archive K's own session rows -- by source key, so neither the report
+        # family nor a group's chunks (which list this base in source_files) are touched.
+        return "cleared", chunks.archive_chunks_for_sources(
+            conn, [key], uuid.uuid4(), company_id=cid)
+    elif not req_ids or not (live & req_ids):
+        # Stale: the extraction has live topics this request does not describe (including a
+        # windows-only request that predates a topic-bearing re-extraction).
         return "stale", 0
 
-    chunks.delete_chunks_for_sources(conn, [key, *(result.get("replaces") or [])], cid)
+    replaces = [k for k in (result.get("replaces") or []) if k.startswith("extractions/")]
+    dropped = [k for k in (result.get("replaces") or []) if not k.startswith("extractions/")]
+    if dropped:
+        logger.warning("index apply %s: ignoring non-extraction replaces %s", key, dropped)
+    chunks.delete_chunks_for_sources(conn, [key, *replaces], cid)
     n = 0
     for c in result.get("chunks") or []:
         tid = c.get("topic_id")

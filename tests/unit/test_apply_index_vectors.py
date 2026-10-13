@@ -122,19 +122,34 @@ def test_stale_request_writes_nothing(run):
     assert conn.writes() == []
 
 
-def test_cleared_when_no_topic_is_live_archives_by_session(run):
+def test_cleared_when_no_topic_is_live_archives_by_source_key(run):
     conn = FakeConn(live=[])
     out = run(conn, result())
     assert out["outcome"] == "cleared"
     archive = [(s, p) for s, p in conn.writes() if "report_chunks_archive" in s]
     assert len(archive) == 1
-    # What the archive selects: chunks of the request's company whose metadata.source_files
-    # contains the session_base (topic_ids is empty, so there is no topic arm).
-    p = archive[0][1]
-    assert p["topic_ids"] == [] and p["company_id"] == CID
-    assert p["session_base"] == "Benl1\\_2026-07-06\\_10-00-00"
-    assert "source_files" in archive[0][0]
+    # What the archive selects: the request company's rows whose source_s3_key IS K and is an
+    # extraction key. Nothing is selected via metadata.source_files, so report-family rows and
+    # a group's chunks (which list member bases there) are out of reach.
+    sql, p = archive[0]
+    assert p["keys"] == [KEY] and p["company_id"] == CID
+    assert "source_files" not in sql and "LIKE 'extractions/" in sql
     assert conn.chunk_inserts() == []
+
+
+def test_windows_only_request_over_live_topics_is_stale(run):
+    conn = FakeConn(live=["t1"])
+    out = run(conn, result(topic_ids=(), chunk_topics=(None,)))
+    assert out["outcome"] == "stale"
+    assert conn.writes() == []
+
+
+def test_non_extraction_replaces_are_not_deleted(run):
+    conn = FakeConn(live=["t1"])
+    run(conn, result(replaces=["reports/2026-07-06/Ben_X/daily_report.json",
+                               "extractions/Ben_X/2026-07-06/m1.json"]))
+    delete = next(p for s, p in conn.writes() if s.startswith("DELETE"))
+    assert delete["keys"] == [KEY, "extractions/Ben_X/2026-07-06/m1.json"]
 
 
 def test_group_race_member_request_after_group_apply_is_cleared(run):
@@ -157,7 +172,8 @@ def test_windows_only_tombstoned_archives_instead(run):
     conn = FakeConn(live=[], tombstoned=True)
     out = run(conn, result(topic_ids=(), chunk_topics=(None,)))
     assert out["outcome"] == "cleared"
-    assert any("report_chunks_archive" in s for s, _ in conn.writes())
+    arch = [p for s, p in conn.writes() if "report_chunks_archive" in s]
+    assert arch and arch[0]["keys"] == [KEY]
     assert conn.chunk_inserts() == []
 
 
