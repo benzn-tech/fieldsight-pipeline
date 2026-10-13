@@ -404,7 +404,7 @@ def _derived_title(c):
             or (c.get("chunk_text") or "")[:60])
 
 
-def _aggregate_topics(chunks, question=""):
+def _aggregate_topics(chunks, question="", browse=False):
     """Collapse retrieved chunks into distinct topic rows for the Search list.
     chunk_type=='topic' chunks are kept even when topic_id is NULL
     (authority-flip data), grouped/deep-linked by title; raw transcript-window
@@ -418,9 +418,15 @@ def _aggregate_topics(chunks, question=""):
     query term rank ABOVE purely-semantic matches; non-lexical topics past
     _NO_LEX_MAX_DIST cosine distance are dropped, so a query with no genuine
     match returns nothing (the always-on Ask row takes over) instead of a list
-    of unrelated topics."""
+    of unrelated topics.
+
+    browse=True (a question that is only a resolved time phrase, see
+    search_browse): there is nothing to rank by, so neither the distance
+    cut-off nor the lexical-first ordering applies; rows run newest day first,
+    then by the topic's start time (rows without one last)."""
     terms = _lexical_terms(question)
     groups = {}
+    starts = {}  # group key -> start seconds of the winning row's time_range (browse only)
     for c in chunks:
         topic_id = c.get("topic_id")
         ctype = c.get("chunk_type")
@@ -502,6 +508,15 @@ def _aggregate_topics(chunks, question=""):
             "score": dist,
             "lexical": row_lexical or prior_lexical,
         }
+        if browse:
+            import search_browse
+            md = c.get("metadata") if isinstance(c.get("metadata"), dict) else {}
+            starts[key] = search_browse.start_seconds(md.get("time_range"))
+    if browse:
+        keys = sorted(groups, key=lambda k: (
+            starts.get(k) is None, starts.get(k) or 0))              # time of day, none last
+        keys.sort(key=lambda k: groups[k]["report_date"], reverse=True)  # stable: newest day first
+        return [groups[k] for k in keys]
     rows = list(groups.values())
     # threshold: drop non-lexical topics whose semantic distance is poor, so a
     # query with no genuine match returns nothing (-> the always-on Ask row)
@@ -527,6 +542,30 @@ def _rag_search_list(body):
     date_to = body.get("date_to") or None
     site = body.get("site") or None  # project-scoped search (Search only; Ask omits)
 
+    # A time phrase in the question ("yesterday", "last week") becomes a date
+    # range, the same way Ask resolves it -- but only when the client sent no
+    # dates of its own, which always win. Search never widens an empty range
+    # (that is Ask-only): an empty day stays empty. Imported here for the same
+    # reason as in the Ask path: the legacy hand-built zip does not carry
+    # query_slots, and a top-level import would kill that deploy's S3 path.
+    date_range = None
+    browse = False
+    if date_from or date_to:
+        date_range = {"from": date_from, "to": date_to, "source": "client"}
+    else:
+        import query_slots
+        import search_browse
+        today = query_slots.resolve_today(body.get("tz"), now=_parse_now(body.get("now")))
+        q_from, q_to = query_slots.time_range(question, today)
+        if q_from or q_to:
+            date_from, date_to = q_from, q_to
+            date_range = {"from": q_from, "to": q_to, "source": "question"}
+            # Only a time phrase and generic "what happened" words: nothing to
+            # rank by, so list what happened in the range instead.
+            browse = search_browse.is_content_free(question)
+            if browse:
+                k = 32  # rag-search's maximum
+
     try:
         query_vec = dashscope_utils.embed([question])[0]
         payload = {"sub": caller_sub, "query_embedding": query_vec, "question": question, "k": k}
@@ -551,8 +590,13 @@ def _rag_search_list(body):
         if result.get("error"):
             logger.warning(f"  search rag-search error: {result['error']}")
             return {"results": [], "error": result["error"], "count": 0}
-        rows = _aggregate_topics(result.get("chunks") or [], question)
-        return {"results": rows, "count": len(rows), "grounded": True}
+        rows = _aggregate_topics(result.get("chunks") or [], question, browse=browse)
+        out = {"results": rows, "count": len(rows), "grounded": True}
+        if date_range:
+            out["date_range"] = date_range  # computed here, never by a model
+        if browse:
+            out["browse"] = True
+        return out
     except Exception as e:
         logger.error(f"  RAG search-list failed: {e}")
         return {"results": [], "error": str(e), "count": 0}
