@@ -1108,7 +1108,17 @@ def _rag_answer(body):
             # floor makes `standalone_question` skip the call and fall back
             # to `question` -- an existing, tested path -- so the rewrite
             # can never be the thing that blows the budget.
-            deadline_left = ASK_DEADLINE_SECONDS - (time.monotonic() - _started)
+            # prompt_only callers (the voice endpoint) carry their own, shorter
+            # budget; a missing or unusable one falls back to the default.
+            _base = ASK_DEADLINE_SECONDS
+            if body.get("prompt_only"):
+                try:
+                    _ds = float(body.get("deadline_s"))
+                    if _ds > 0 and _ds == _ds and _ds != float("inf"):
+                        _base = _ds
+                except (TypeError, ValueError):
+                    pass
+            deadline_left = _base - (time.monotonic() - _started)
             _t_rewrite = time.monotonic()
             asked, rewritten = ask_rewrite.standalone_question(
                 question, history,
@@ -1380,6 +1390,28 @@ def _rag_answer(body):
         prompt = build_rag_prompt(asked if rewritten else question, chunks,
                                   mode=body.get("mode"),
                                   today=today, basis=basis, pinned_topic=pinned_topic)
+
+        if body.get("prompt_only"):
+            # Voice agent (spec 2026-10-14 phase 2 section 4): every rule above
+            # has run; Node streams the synthesis with exactly the request this
+            # path would have sent. Nothing below (web check, synthesis,
+            # language retry) runs for this caller. Resolved the same way as
+            # the synthesis call further down: the voice model applies to
+            # mode=voice only, and travels with enable_thinking=False.
+            _vm = os.environ.get("ASK_VOICE_MODEL", "").strip()
+            _vm = None if _vm.lower() in ("", "none") else _vm
+            if body.get("mode") != "voice":
+                _vm = None
+            _req = llm_utils.build_qwen_payload(
+                prompt, MAX_ANSWER_TOKENS, False,
+                enable_thinking=(False if _vm else None), model=_vm)
+            return {
+                "kind": "prompt", "prompt": prompt,
+                "asked": asked, "rewritten": bool(rewritten),
+                "chunk_ids": [str(c.get("id")) for c in chunks if c.get("id") is not None],
+                "basis": basis, "history_turns": history_turns,
+                "llm": {k: _req.get(k) for k in ("model", "reasoning", "max_tokens", "temperature")},
+            }
 
         # With no chunks this can only be a pinned topic, which is the reader's
         # own record; asking the web whether records answer it would judge an
@@ -2111,7 +2143,14 @@ def lambda_handler(event, context):
     if body.get('caller_sub') and os.environ.get('RAG_SEARCH_FUNCTION'):
         if body.get('mode') == 'search':
             return ok(_rag_search_list(body))
-        return ok(_rag_answer(body))
+        result = _rag_answer(body)
+        if body.get("prompt_only") and "kind" not in result:
+            # The early returns (metric route, rag-search error, empty
+            # retrieval) and the outer except carry a finished answer, not a
+            # prompt. Node speaks it verbatim; an empty one becomes the
+            # fallback line on the Node side.
+            result = {"kind": "answer", **result}
+        return ok(result)
 
     # The company-blind S3 path (load_report/load_transcripts by a named user) was
     # removed 2026-10: a deploy without a rag-search function has nothing safe to

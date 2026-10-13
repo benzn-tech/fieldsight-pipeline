@@ -557,11 +557,12 @@ def _chain_budget():
     return v if v and v > 0 else None
 
 
-def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
-               deadline=None, caller="unknown"):
-    if not QWEN_API_KEY:
-        logger.error("QWEN_API_KEY / DASHSCOPE_API_KEY not set")
-        return None, "QWEN_API_KEY not configured"
+def build_qwen_payload(prompt, max_tokens, force_json, enable_thinking=None, model=None):
+    """The exact request body `_call_qwen` posts, before any model-chain swap.
+
+    One builder on purpose: the voice endpoint (Node) streams with the request
+    the Ask path resolves here, so a second copy of this logic would let the
+    two drift silently (spec 2026-10-14 phase 2, section 4)."""
     # Per-call override wins; None falls back to the function's env default.
     thinking = QWEN_ENABLE_THINKING if enable_thinking is None else bool(enable_thinking)
     # Resolved BEFORE the model, because the model depends on it.
@@ -595,6 +596,17 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
             payload["response_format"] = {"type": "json_object"}
         else:
             payload["max_tokens"] = max_tokens
+    return payload
+
+
+def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
+               deadline=None, caller="unknown"):
+    if not QWEN_API_KEY:
+        logger.error("QWEN_API_KEY / DASHSCOPE_API_KEY not set")
+        return None, "QWEN_API_KEY not configured"
+    # Per-call override wins; None falls back to the function's env default.
+    thinking = QWEN_ENABLE_THINKING if enable_thinking is None else bool(enable_thinking)
+    payload = build_qwen_payload(prompt, max_tokens, force_json, enable_thinking, model)
 
     chain = [payload["model"]]
     if not _is_dashscope(QWEN_BASE_URL):

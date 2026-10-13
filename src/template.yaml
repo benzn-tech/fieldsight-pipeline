@@ -607,6 +607,15 @@ Parameters:
       (spec 2026-10-13). Empty = the endpoint is not created at all, which is
       how prod stays without it until the shell phase has been measured.
 
+  VoiceSessionSigningKey:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: >-
+      HMAC key that org-api signs the short-lived voice-agent session token
+      with and VoiceLlmFunction verifies it against. Passed on TEST only, next
+      to VoiceLlmBearer; empty on prod, where the endpoint does not exist.
+
   ElevenLabsTtsApiKey:
     Type: String
     Description: >-
@@ -1545,6 +1554,17 @@ Resources:
         Variables:
           VOICE_LLM_BEARER: !Ref VoiceLlmBearer
           DEFAULT_ANSWER_DELAY_MS: '1500'
+          VOICE_SESSION_SIGNING_KEY: !Ref VoiceSessionSigningKey
+          ASK_AGENT_FUNCTION: !Ref AskAgentFunction
+          # Same vendor Python resolved the request for (AskAgentFunction's
+          # QWEN_API_KEY / QWEN_BASE_URL), so Node hits the same endpoint.
+          OPENROUTER_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
+          OPENROUTER_BASE_URL: !Ref QwenBaseUrl
+          VOICE_LLM_PROBES: 'false'
+          VOICE_RESTATE_ENABLED: 'false'
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AskAgentFunction
       FunctionUrlConfig:
         AuthType: NONE
         InvokeMode: RESPONSE_STREAM
@@ -2428,6 +2448,7 @@ Resources:
       Environment:
         Variables:
           ENABLE_TODO_COLLAPSE: !Ref EnableTodoCollapse
+          VOICE_SESSION_SIGNING_KEY: !If [HasVoiceLlm, !Ref VoiceSessionSigningKey, !Ref AWS::NoValue]
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
