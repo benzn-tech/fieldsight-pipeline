@@ -102,3 +102,31 @@ test("probes are parsed from the last user message only", () => {
   ] };
   assert.equal(mod.lastUserText(body), "normal question");
 });
+
+test("the custom key header is accepted, in any case, because ElevenLabs reserves Authorization", async () => {
+  for (const name of ["x-voice-llm-key", "X-Voice-Llm-Key"]) {
+    const s = new FakeStream();
+    const ev = event({ auth: "" });
+    ev.headers = { [name]: "test-bearer" };
+    await mod.handler(ev, s);
+    assert.equal(s.meta.statusCode, 200, name);
+  }
+  const s = new FakeStream();
+  const ev = event({ auth: "" });
+  ev.headers = { "x-voice-llm-key": "wrong" };
+  await mod.handler(ev, s);
+  assert.equal(s.meta.statusCode, 401);
+});
+
+test("a refusal logs which headers arrived but never their values", async () => {
+  const lines = []; const orig = console.log; console.log = (l) => lines.push(l);
+  try {
+    const s = new FakeStream();
+    const ev = event({ auth: "Bearer secret-value-that-must-not-leak" });
+    await mod.handler(ev, s);
+  } finally { console.log = orig; }
+  const refused = lines.find((l) => String(l).includes("voice_llm_refused"));
+  assert.ok(refused, "the refusal must be logged");
+  assert.ok(JSON.parse(refused).header_names.includes("authorization"));
+  assert.ok(!refused.includes("secret-value-that-must-not-leak"), "a credential reached the log");
+});

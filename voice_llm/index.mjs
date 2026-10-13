@@ -67,11 +67,24 @@ export function chunk(id, created, content, { first = false, finish = null } = {
   })}\n\n`;
 }
 
+// Two ways in, one secret. ElevenLabs reserves Authorization for its own
+// custom_llm.api_key field: an Authorization set through request_headers did
+// NOT arrive (2026-10-14, three calls from ElevenLabs refused at this check).
+// X-Voice-Llm-Key is a header ElevenLabs has no reason to touch. Lambda
+// Function URLs lower-case header names, so both are read lower-cased.
+export const KEY_HEADER = "x-voice-llm-key";
+
 export function authorised(headers) {
   if (!BEARER) return false;  // an unconfigured shell refuses everyone
-  const h = headers || {};
-  const got = h.authorization || h.Authorization || "";
-  return got === `Bearer ${BEARER}`;
+  const h = lowerKeys(headers);
+  if ((h.authorization || "") === `Bearer ${BEARER}`) return true;
+  return (h[KEY_HEADER] || "") === BEARER;
+}
+
+function lowerKeys(headers) {
+  const out = {};
+  for (const [k, v] of Object.entries(headers || {})) out[k.toLowerCase()] = v;
+  return out;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -103,7 +116,11 @@ async function handle(event, responseStream) {
     return plainResponse(responseStream, 404, { error: "not found" });
   }
   if (!authorised(event.headers)) {
-    console.log(JSON.stringify({ evt: "voice_llm_refused", path }));
+    // Header NAMES only, never values: enough to see what a caller actually
+    // sent (which is how the ElevenLabs Authorization problem was found) without
+    // writing a credential into a log group.
+    console.log(JSON.stringify({ evt: "voice_llm_refused", path,
+      header_names: Object.keys(event.headers || {}).map((k) => k.toLowerCase()).sort() }));
     return plainResponse(responseStream, 401, { error: "unauthorised" });
   }
   const body = decodeBody(event);
