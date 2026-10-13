@@ -560,6 +560,15 @@ Parameters:
     AllowedValues: [dashscope, elevenlabs]
     Default: dashscope
 
+  VoiceLlmBearer:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: >-
+      Bearer token ElevenLabs presents to the voice-agent Custom LLM endpoint
+      (spec 2026-10-13). Empty = the endpoint is not created at all, which is
+      how prod stays without it until the shell phase has been measured.
+
   ElevenLabsTtsApiKey:
     Type: String
     Description: >-
@@ -1422,6 +1431,7 @@ Conditions:
   HasKeyframeFfmpegLayer: !Not [!Equals [!Ref KeyframeFfmpegLayerArn, '']]
   HasDocxLayer: !Not [!Equals [!Ref DocxLayerArn, '']]
   HasDb: !Not [!Equals [!Ref DbStackName, '']]
+  HasVoiceLlm: !Not [!Equals [!Ref VoiceLlmBearer, '']]
   HasOrgPool: !Not [!Equals [!Ref OrgUserPoolId, '']]
   HasPgDatabaseOverride: !Not [!Equals [!Ref PgDatabase, ""]]
   HasOrgApi: !And [!Condition HasDb, !Condition HasOrgPool]
@@ -1475,6 +1485,43 @@ Globals:
 # Resources
 # ============================================================
 Resources:
+  # ---------------------------------------------------------------------------
+  # Voice agent: Custom LLM endpoint for ElevenLabs (spec 2026-10-13), SHELL.
+  # Node.js because Lambda response streaming is native only there; Python
+  # would need the Web Adapter layer, which the deploy role may not read.
+  # Outside the VPC on purpose: Function URLs do not stream inside a VPC, and
+  # the retrieval it will front is invoked VPC-out -> VPC-in, the direction
+  # AskAgentFunction already uses for RagSearchFunction.
+  # ---------------------------------------------------------------------------
+  VoiceLlmFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasVoiceLlm
+    Properties:
+      FunctionName: !Sub fieldsight-${Stage}-voice-llm
+      CodeUri: voice_llm/
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Timeout: 90
+      MemorySize: 256
+      Environment:
+        Variables:
+          VOICE_LLM_BEARER: !Ref VoiceLlmBearer
+          DEFAULT_ANSWER_DELAY_MS: '1500'
+      FunctionUrlConfig:
+        AuthType: NONE
+        InvokeMode: RESPONSE_STREAM
+
+  # A public Function URL needs BOTH permissions since October 2025: SAM adds
+  # lambda:InvokeFunctionUrl, and without this one every call is a 403.
+  VoiceLlmUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasVoiceLlm
+    Properties:
+      FunctionName: !Ref VoiceLlmFunction
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
+
 
   # ----------------------------------------------------------
   # S3 Bucket Policy (bucket itself is managed outside this stack)
@@ -6095,6 +6142,11 @@ Resources:
 # Outputs
 # ============================================================
 Outputs:
+  VoiceLlmUrl:
+    Condition: HasVoiceLlm
+    Description: ElevenLabs Custom LLM server URL (append /v1 in the agent config)
+    Value: !GetAtt VoiceLlmFunctionUrl.FunctionUrl
+
   BucketName:
     Description: S3 bucket name
     Value: !Ref DataBucketName
