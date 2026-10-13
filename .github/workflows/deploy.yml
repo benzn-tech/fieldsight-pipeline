@@ -319,8 +319,8 @@ jobs:
               "AskSttProvider=${{ vars.TEST_ASK_STT_PROVIDER || 'dashscope' }}" \
               "AskTtsProvider=${{ vars.TEST_ASK_TTS_PROVIDER || 'dashscope' }}" \
               "ElevenLabsTtsVoice=QlZn2MPaf2jDn0461bnj" \
-              "ElevenLabsTtsSpeed=1.10" \
-              "ElevenLabsTtsModel=eleven_multilingual_v2" \
+              "ElevenLabsTtsSpeed=1.20" \
+              "ElevenLabsTtsModel=eleven_v4_turbo" \
               $EL_TTS_KEY_PARAM \
               $VOICE_LLM_PARAM \
               $VOICE_SESSION_PARAM \

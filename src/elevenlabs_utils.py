@@ -321,13 +321,13 @@ ELEVENLABS_TTS_VOICE = os.environ.get(
 # but this is a voice a person on a site listens to, and one second is already
 # well inside the wait the rest of the chain imposes.
 ELEVENLABS_TTS_MODEL = os.environ.get(
-    "ELEVENLABS_TTS_MODEL", "eleven_multilingual_v2")
+    "ELEVENLABS_TTS_MODEL", "eleven_v4_turbo")
 # 1.2 = 20% faster than written, at the owner's request. Verified to take
 # effect rather than be silently accepted: the same sentence rendered 5.36s at
 # default and 5.20s at 1.2 on v3-conversational, 4.64 -> 3.81 on flash. A
 # vendor that ignores an unknown field returns 200 either way, so the audio
 # length is the only proof.
-ELEVENLABS_TTS_SPEED = float(os.environ.get("ELEVENLABS_TTS_SPEED", "1.10"))
+ELEVENLABS_TTS_SPEED = float(os.environ.get("ELEVENLABS_TTS_SPEED", "1.20"))
 ELEVENLABS_TTS_TIMEOUT_SECONDS = float(
     os.environ.get("ELEVENLABS_TTS_TIMEOUT_SECONDS", "10"))
 

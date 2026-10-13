@@ -206,7 +206,15 @@ def test_speed_one_is_still_sent(monkeypatch):
 
 
 def test_the_steady_model_is_the_default():
-    """This test used to pin eleven_v3_conversational, chosen purely on speed
+    """2026-10-14: the pinned default moved from eleven_multilingual_v2 to
+    eleven_v4_turbo, at speed 1.20, on an owner decision. A/B of 105 renders
+    on James: v4_turbo first audio 0.79-0.92s against multilingual_v2's
+    1.76-2.74s, pronunciation 40/40, and the owner blind-listened to 12 clips
+    and judged every accent a steady New Zealand accent. The accent-drift risk
+    below is non-deterministic and 4 v4_turbo clips is a small sample, so TEST
+    ships first and prod follows only after the owner listens on TEST.
+
+    History: this test used to pin eleven_v3_conversational, chosen purely on speed
     (1.01s against eleven_v3's 2.83s and DashScope's 2.07s, measured
     2026-09-09).
 
@@ -225,5 +233,6 @@ def test_the_steady_model_is_the_default():
     Why it matters only here: a bundled device prompt is a FILE, approved
     once and shipped byte for byte, so it cannot drift. A spoken answer is
     rendered per question, so the model is the only place to decide it."""
-    assert el.ELEVENLABS_TTS_MODEL == "eleven_multilingual_v2"
+    assert el.ELEVENLABS_TTS_MODEL == "eleven_v4_turbo"
+    assert el.ELEVENLABS_TTS_SPEED == 1.2
     assert el.ELEVENLABS_TTS_VOICE == "QlZn2MPaf2jDn0461bnj"
