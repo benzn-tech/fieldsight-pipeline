@@ -14,7 +14,7 @@
 
 - TEST only. Every new resource/env sits behind `Condition: HasVoiceLlm`; `deploy-prod.yml` passes no new parameter. A guard test already fails if it does (`tests/unit/test_voice_llm_shell.py`).
 - Token: `P = base64url_nopad(utf8(json))`, json `{"sub","aud":"voice-llm","exp":<int epoch s>}`; `S = base64url_nopad(HMAC-SHA256(key, ascii(P)))`; token `P + "." + S`. Verify over the **received** `P` bytes, `timingSafeEqual`, `aud == "voice-llm"`, `exp > now - 30`. TTL 300 s. Empty key → refuse (Node) / 503 (mint). No `jti`.
-- Opener (exact, ≥141 chars): `Got it, let me check your site records for that now. I'm pulling up what was said and recorded on site, and this will only take a moment... `
+- Opener (exact, ≥141 chars): `Got it, let me check your site records for that now. I'm pulling up what was said and recorded on site today, and this will only take a moment... `
 - Fallback line (exact): `Sorry, I couldn't reach your site records just now. Please try again.`
 - Keep-alive: one-space `delta.content` whenever no content has been written for 1000 ms, from authorisation until `[DONE]`. SSE comments do NOT count (E3).
 - Logs carry no question or answer text. `sub_hash` = first 12 hex of HMAC-SHA256(signing key, sub).
@@ -23,6 +23,14 @@
 - Deadlines: `prompt_only` invoke abort 9000 ms (Python told `deadline_s: 8`); answer first token 6000 ms; whole turn 30000 ms.
 - No npm dependencies in `voice_llm/` (package.json must keep `name` + `version`).
 - Windows checkout: files may be CRLF; edit with exact single-line anchors; never `git add -A`; never `git stash`.
+
+## Amendments after plan review (override the task text where they conflict)
+
+- **A1 (Task 1):** the equality test alone is tautological once `_call_qwen` calls the builder. Step 0, BEFORE editing `llm_utils.py`: capture the body `_call_qwen` posts today for three inputs (OpenRouter base URL; force_json True/False; enable_thinking True/False/None, model None and a fixed id) and paste those dicts as **literals** into `test_llm_request_builder.py`. The refactor must leave them green. The diff of `_call_qwen` must be a pure move (`git diff --color-moved`) — move the existing lines, do not retype the plan's reconstruction of the dashscope branch.
+- **A2 (Task 2):** history seam: add a test sending `history: [{"question":"q1","answer":"a1"}]` (Node's exact shape; `ask_history._clean_voice_history` reads `question`/`answer`) and assert `history_turns == 1`. Deadline: only the rewrite budget reads the base before the prompt is built (`_ask_budget_left` callers at ~1622/1677 are after it and never run under `prompt_only`). The rag-search invoke has no client timeout of its own; Node's 9 s abort is the bound and is logged as `invoke_abandoned` — do not add a boto Config in this task.
+- **A3 (Task 8):** `@aws-sdk/client-lambda` exists in the Lambda runtime but not locally or in CI. Load it with `await import("@aws-sdk/client-lambda")` **inside** the default `invokeAsk` only — never a top-level import (it would break every `node --test` file at load). Wrap the whole turn in try/catch/finally: any throw → `turn.fail(FALLBACK)`. Coerce `String(result.answer ?? "").trim()` (the outer-except body may lack `answer`). The 30 s turn guard must also abort the OpenRouter fetch (pass an `AbortSignal` into `streamAnswer`; add `signal` to its options) so the Lambda does not run on after the stream closed.
+- **A4 (Task 5/8):** add a Node test `OPENER.length >= 141` (the opener is 146 chars; 141 is the shortest measured voiced length, spec §0 E6). The spec's opener string gained the word "today" for this reason.
+- **A5 (all):** `git fetch origin && git merge origin/develop` was done by the controller before Task 1. Implementers: never `git stash`, never `git add -A`, never push.
 
 ## Review Focus
 
@@ -559,7 +567,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { toHistory } from "./history.mjs";
 
-const OPENER = "Got it, let me check your site records for that now. I'm pulling up what was said and recorded on site, and this will only take a moment... ";
+const OPENER = "Got it, let me check your site records for that now. I'm pulling up what was said and recorded on site today, and this will only take a moment... ";
 
 test("pairs prior turns and strips our opener and keep-alive spaces", () => {
   const r = toHistory([

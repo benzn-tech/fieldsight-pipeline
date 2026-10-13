@@ -100,7 +100,7 @@ The first real text is the restatement, built to be **voiced immediately** (E4):
   that does not start in the asked-about form → discarded for the fallback opener.
 - **Deadline 1.8 s** from request arrival. Miss, leak or correction ("No," / "I meant")
   → fixed opener, ≥141 characters:
-  `"Got it, let me check your site records for that now. I'm pulling up what was said and recorded on site, and this will only take a moment... "`
+  `"Got it, let me check your site records for that now. I'm pulling up what was said and recorded on site today, and this will only take a moment... "`
   The plan measures this exact string's first-audio time before relying on it.
   (voiced at ~1.0 s per E4).
 
