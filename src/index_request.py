@@ -155,9 +155,10 @@ def emit(s3_client, bucket, request):
     return key
 
 
-def emit_failed_metric(extraction_key):
-    """One EMF line for a request that could not be built or written. Printed, not
-    logged (EMF needs bare JSON). Never raises."""
+def emit_failed_metric(extraction_key, metric="SearchIndexRequestFailed"):
+    """One EMF line for a request that could not be built or written (or, with `metric`,
+    a vectors object that could not be applied). Printed, not logged (EMF needs bare
+    JSON). Never raises."""
     try:
         print(json.dumps({
             "_aws": {
@@ -165,12 +166,12 @@ def emit_failed_metric(extraction_key):
                 "CloudWatchMetrics": [{
                     "Namespace": "FieldSight",
                     "Dimensions": [["Stage"]],
-                    "Metrics": [{"Name": "SearchIndexRequestFailed", "Unit": "Count"}],
+                    "Metrics": [{"Name": metric, "Unit": "Count"}],
                 }],
             },
             "Stage": os.environ.get("STAGE", "unknown"),
-            "SearchIndexRequestFailed": 1,
+            metric: 1,
             "extraction_key": extraction_key,
         }))
     except Exception:
-        logger.warning("could not emit the SearchIndexRequestFailed metric for %s", extraction_key)
+        logger.warning("could not emit the %s metric for %s", metric, extraction_key)

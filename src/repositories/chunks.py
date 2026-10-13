@@ -6,7 +6,7 @@ from repositories.search_sql import build_latest_date_sql, build_search_sql  # r
 
 __all__ = ["build_search_sql", "build_latest_date_sql", "insert_chunk", "search_chunks",
            "latest_visible_date",
-           "delete_chunks_for_source", "delete_chunks_for_topic",
+           "delete_chunks_for_source", "delete_chunks_for_sources", "delete_chunks_for_topic",
            "archive_chunks_for_session", "restore_chunks_for_batch",
            "SESSION_CHUNK_PREDICATE"]
 
@@ -127,6 +127,21 @@ def delete_chunks_for_source(conn, source_s3_key) -> int:
         "DELETE FROM report_chunks WHERE source_s3_key=%s",
         (source_s3_key,),
     )
+    return cur.rowcount
+
+
+def delete_chunks_for_sources(conn, keys, company_id) -> int:
+    """Delete report_chunks rows produced from any of these source keys, inside one company.
+
+    The search-index apply replaces a session's chunks (and the chunks of the member
+    sessions a group pass supersedes) by their `source_s3_key`. `report_chunks` is shared
+    by every tenant and the keys arrive in an S3 object, so the delete is company-scoped
+    like the archive: a request can only ever remove its own company's rows."""
+    if not company_id:
+        raise ValueError("company_id is required: report_chunks is shared by every tenant")
+    cur = conn.execute(
+        f"DELETE FROM report_chunks WHERE source_s3_key = ANY(%(keys)s){COMPANY_SCOPE}",
+        {"keys": list(keys), "company_id": company_id})
     return cur.rowcount
 
 
