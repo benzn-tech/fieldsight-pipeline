@@ -83,14 +83,16 @@ test("a mid-stream error after speech keeps what was spoken and stops reading", 
     fetchImpl: async () => sse([d("Part"), `data: ${JSON.stringify({ error: { message: "x" } })}\n\n`, d("never")]),
     onText: (t) => got.push(t) });
   assert.deepEqual(got, ["Part"]); assert.equal(r.ok, true); assert.equal(r.chars, 4);
+  assert.equal(r.truncated, true); assert.equal(r.error, "stream_error");
 });
 
-test("a caller abort stops the stream, resolves aborted, and speaks no more", async () => {
+test("a caller abort after speech stops the stream, keeps ok:true truncated, and speaks no more", async () => {
   const ac = new AbortController(); const got = [];
   const r = await streamAnswer({ ...base, signal: ac.signal,
     fetchImpl: async () => sse([d("one"), d("two"), d("three")], 40),
     onText: (t) => { got.push(t); if (got.length === 1) ac.abort(); } });
-  assert.equal(r.ok, false); assert.equal(r.error, "aborted"); assert.deepEqual(got, ["one"]);
+  assert.equal(r.ok, true); assert.equal(r.truncated, true); assert.equal(r.error, "aborted");
+  assert.equal(r.chars, 3); assert.deepEqual(got, ["one"]);
 });
 
 test("a caller signal already aborted never calls fetch", async () => {
@@ -107,4 +109,34 @@ test("a caller abort during the fetch is reported as aborted, not a first-token 
     fetchImpl: async (u, init) => new Promise((_, rej) => init.signal.addEventListener("abort", () => rej(new Error("x")))),
     onText: () => {} });
   assert.equal(r.error, "aborted");
+});
+
+test("a transport error after one delta is ok:true, truncated, with the transport message", async () => {
+  const got = [];
+  const r = await streamAnswer({ ...base,
+    fetchImpl: async () => new Response(new ReadableStream({
+      async start(c) { c.enqueue(new TextEncoder().encode(d("Part"))); await new Promise((r) => setTimeout(r, 20)); c.error(new Error("socket reset")); } }), { status: 200 }),
+    onText: (t) => got.push(t) });
+  assert.deepEqual(got, ["Part"]); assert.equal(r.ok, true); assert.equal(r.chars, 4);
+  assert.equal(r.truncated, true); assert.equal(r.error, "socket reset");
+});
+
+test("a transport error before any text is ok:false without truncated", async () => {
+  const r = await streamAnswer({ ...base,
+    fetchImpl: async () => new Response(new ReadableStream({ start(c) { c.error(new Error("socket reset")); } }), { status: 200 }),
+    onText: () => {} });
+  assert.equal(r.ok, false); assert.equal(r.error, "socket reset"); assert.notEqual(r.truncated, true);
+});
+
+test("a clean finish is not marked truncated", async () => {
+  const r = await streamAnswer({ ...base, fetchImpl: async () => sse([d("a"), "data: [DONE]\n\n"]), onText: () => {} });
+  assert.equal(r.ok, true); assert.equal(r.truncated, undefined); assert.equal(r.error, undefined);
+});
+
+test("a final complete data event without a terminating blank line is flushed", async () => {
+  const got = [];
+  const r = await streamAnswer({ ...base,
+    fetchImpl: async () => sse([d("a"), `data: ${JSON.stringify({ choices: [{ delta: { content: "tail" } }] })}`]),
+    onText: (t) => got.push(t) });
+  assert.deepEqual(got, ["a", "tail"]); assert.equal(r.ok, true);
 });

@@ -12,6 +12,8 @@ function eventData(block) {
   return out.join("\n");
 }
 
+// No idle timeout after the first token: callers must pass `signal` (the whole-turn guard).
+// ok === (chars > 0) in every outcome; a stream that ended abnormally after speech adds truncated:true + error.
 export async function streamAnswer({ prompt, llm, baseUrl, apiKey, fetchImpl = fetch, firstTokenMs = 6000, onText, signal }) {
   const body = { model: llm.model, messages: [{ role: "user", content: prompt }], stream: true };
   if (llm.reasoning) body.reasoning = llm.reasoning;
@@ -25,6 +27,12 @@ export async function streamAnswer({ prompt, llm, baseUrl, apiKey, fetchImpl = f
     signal.addEventListener("abort", onCallerAbort, { once: true });
   }
   const t0 = Date.now();
+  const finish = (error, abnormal) => {
+    const r = { ok: chars > 0, chars, firstTokenMs: first };
+    if (error) r.error = error;
+    if (chars > 0 && abnormal) r.truncated = true;
+    return r;
+  };
   const guard = setTimeout(() => { if (first === null) { timedOut = true; ac.abort(); } }, firstTokenMs);
   try {
     const res = await fetchImpl(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
@@ -33,6 +41,18 @@ export async function streamAnswer({ prompt, llm, baseUrl, apiKey, fetchImpl = f
       body: JSON.stringify(body) });
     if (!res.ok) return { ok: false, chars: 0, firstTokenMs: null, error: `http_${res.status}` };
     const dec = new TextDecoder(); let buf = "", streamError = null, done = false;
+    const handle = (block) => {
+      const data = eventData(block);
+      if (!data) return;
+      if (data.trim() === "[DONE]") { done = true; return; }
+      let msg; try { msg = JSON.parse(data); } catch { return; }
+      if (msg?.error) { streamError = "stream_error"; done = true; return; }
+      const delta = msg.choices?.[0]?.delta?.content;
+      if (!delta) return;
+      if (callerAborted) { done = true; return; }
+      if (first === null) first = Date.now() - t0;
+      chars += delta.length; onText(delta);
+    };
     for await (const part of res.body) {
       if (callerAborted) break;
       buf += dec.decode(part, { stream: true });
@@ -42,25 +62,18 @@ export async function streamAnswer({ prompt, llm, baseUrl, apiKey, fetchImpl = f
       let i;
       while (!done && (i = buf.indexOf("\n\n")) >= 0) {
         const block = buf.slice(0, i); buf = buf.slice(i + 2);
-        const data = eventData(block);
-        if (!data) continue;
-        if (data.trim() === "[DONE]") { done = true; break; }
-        let msg; try { msg = JSON.parse(data); } catch { continue; }
-        if (msg?.error) { streamError = "stream_error"; done = true; break; }
-        const delta = msg.choices?.[0]?.delta?.content;
-        if (!delta) continue;
-        if (callerAborted) { done = true; break; }
-        if (first === null) first = Date.now() - t0;
-        chars += delta.length; onText(delta);
+        handle(block);
       }
       if (done) break;
     }
-    if (callerAborted) return { ok: false, chars, firstTokenMs: first, error: "aborted" };
-    if (chars > 0) return { ok: true, chars, firstTokenMs: first };
-    return { ok: false, chars, firstTokenMs: first, error: streamError || "empty" };
+    // Body ended: flush a final complete event that had no terminating blank line.
+    if (!done && !callerAborted) handle((buf + dec.decode()).replace(/\r\n?/g, "\n").replace(/\n+$/, ""));
+    if (callerAborted) return finish("aborted", true);
+    if (streamError) return finish(streamError, true);
+    return finish(chars > 0 ? undefined : "empty", false);
   } catch (e) {
     const error = callerAborted ? "aborted" : timedOut && first === null ? "first_token_timeout" : String(e?.message || e);
-    return { ok: false, chars, firstTokenMs: first, error };
+    return finish(error, true);
   } finally {
     clearTimeout(guard);
     if (signal) signal.removeEventListener("abort", onCallerAbort);
