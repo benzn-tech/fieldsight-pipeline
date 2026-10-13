@@ -1320,3 +1320,33 @@ def test_the_proposal_window_is_wired_end_to_end_not_just_declared():
         assert "ProposalWindowHours" in _overrides(path), (
             f"{env} never overrides ProposalWindowHours, so that environment is pinned to "
             f"the template default whatever its repo variable says")
+
+
+# ---- the rerank tunables ------------------------------------------------
+#
+# Code-only defaults until 2026-10-14. The ruler measured rerank's latency from
+# NZ at p50 3.4-3.8 s against a 3 s timeout, so the deployed value decides
+# whether rerank ever runs -- and a value set by hand on the Lambda is erased by
+# the next reconcile.
+
+_RERANK_TUNABLES = {
+    "DASHSCOPE_RERANK_TIMEOUT_SECONDS": ("RerankTimeoutSeconds", ("AskAgentFunction",)),
+    "RERANK_CANDIDATE_K":               ("RerankCandidateK", ("AskAgentFunction",)),
+}
+
+
+def test_the_rerank_tunables_are_parameters_given_to_ask():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for env, (param, fns) in _RERANK_TUNABLES.items():
+        assert re.search(rf"\n  {param}:\n", text), f"{env} has no {param} Parameter"
+        for fn in fns:
+            assert f"{env}: !Ref {param}" in _function_block(text, fn), \
+                f"{fn} reads {env} but is not given it"
+
+
+def test_both_workflows_pass_the_rerank_tunables():
+    for env_name in ("prod", "test"):
+        wf = open(WORKFLOWS[env_name], encoding="utf-8").read()
+        for _, (param, _) in _RERANK_TUNABLES.items():
+            assert f"{param}=" in wf, \
+                f"{env_name} does not pass {param}; the Parameter holds its default forever"
