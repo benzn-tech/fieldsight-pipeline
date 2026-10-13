@@ -2,6 +2,14 @@
 from deleted_predicates import visible_chunks_predicate
 
 
+def family_predicate(alias: str = "c") -> str:
+    # NULL family = no filter (callers that predate the switch stay byte-identical).
+    return (f"(%(source_family)s::text IS NULL "
+            f"OR (%(source_family)s::text = 'session' AND {alias}.source_s3_key LIKE 'extractions/%%') "
+            f"OR (%(source_family)s::text = 'report' AND ({alias}.source_s3_key IS NULL "
+            f"OR {alias}.source_s3_key NOT LIKE 'extractions/%%')))")
+
+
 def _scope_predicate(alias: str = "c") -> str:
     """The WHERE clause every read of report_chunks must carry: deny-by-default
     site ACL, optional per-author narrowing, optional inclusive date range, and
@@ -19,7 +27,8 @@ def _scope_predicate(alias: str = "c") -> str:
         f"AND (%(author_ids)s::uuid[] IS NULL OR {alias}.user_id = ANY(%(author_ids)s::uuid[])) "
         f"AND (%(date_from)s::date IS NULL OR {alias}.report_date >= %(date_from)s::date) "
         f"AND (%(date_to)s::date IS NULL OR {alias}.report_date <= %(date_to)s::date) "
-        f"AND " + visible_chunks_predicate(alias)
+        f"AND " + visible_chunks_predicate(alias) + " "
+        f"AND " + family_predicate(alias)
     )
 
 
@@ -183,5 +192,6 @@ def build_latest_date_sql() -> str:
         "WHERE c.site_id = ANY(%(site_ids)s) "
         "AND (%(author_ids)s::uuid[] IS NULL OR c.user_id = ANY(%(author_ids)s::uuid[])) "
         "AND (%(on_or_before)s::date IS NULL OR c.report_date <= %(on_or_before)s::date) "
-        "AND " + visible_chunks_predicate("c")
+        "AND " + visible_chunks_predicate("c") + " "
+        "AND " + family_predicate("c")
     )

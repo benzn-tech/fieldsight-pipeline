@@ -62,7 +62,8 @@ def insert_chunk(conn, site_id, report_date, chunk_type, chunk_text, embedding, 
 
 
 def search_chunks(conn, query_embedding, accessible_site_ids, k=5,
-                  date_from=None, date_to=None, author_ids=None, query_text="") -> list[dict]:
+                  date_from=None, date_to=None, author_ids=None, query_text="",
+                  source_family=None) -> list[dict]:
     """Vector + keyword search, unioned (Task 3, 2026-09-20 spec: "a literal
     token is findable"). Every returned row now carries `lexical_hit: bool` --
     True for a row the keyword arm found (its `distance` is NULL, never a
@@ -87,11 +88,13 @@ def search_chunks(conn, query_embedding, accessible_site_ids, k=5,
         build_search_sql(),
         {"q": query_embedding, "q_text": query_text, "site_ids": list(accessible_site_ids), "k": k,
          "date_from": date_from, "date_to": date_to,
-         "author_ids": list(author_ids) if author_ids is not None else None},
+         "author_ids": list(author_ids) if author_ids is not None else None,
+         "source_family": source_family},
     ).fetchall()
 
 
-def latest_visible_date(conn, accessible_site_ids, *, author_ids=None, on_or_before=None):
+def latest_visible_date(conn, accessible_site_ids, *, author_ids=None, on_or_before=None,
+                        source_family=None):
     """The most recent report_date this caller can see, or None.
 
     Used only by Ask's widening step, so that "nothing yesterday" becomes "the
@@ -103,7 +106,8 @@ def latest_visible_date(conn, accessible_site_ids, *, author_ids=None, on_or_bef
         build_latest_date_sql(),
         {"site_ids": list(accessible_site_ids),
          "author_ids": list(author_ids) if author_ids is not None else None,
-         "on_or_before": on_or_before},
+         "on_or_before": on_or_before,
+         "source_family": source_family},
     ).fetchone()
     latest = (row or {}).get("latest")
     return latest.isoformat() if latest is not None else None
