@@ -1000,8 +1000,7 @@ def run_backfill():
     return {"processed": processed, "skipped": skipped, "failed": failed}
 
 
-REINDEX_VECTORS_RE = re.compile(
-    r"^reindex_requests/[^/]+/[^/]+/[^/]+\.vectors\.json$")
+REINDEX_VECTORS_RE = re.compile(r"^reindex_vectors/[^/]+/[^/]+/[^/]+\.json$")
 
 
 def apply_reindex_vectors(key):
