@@ -18,16 +18,18 @@ Where the voiceprint work goes next. Ordered by value, not by ease. Items marked
 - **Enrol at site sign-in.** 15–20 s of natural speech (name, company, trade, today's
   task), not a read-out script; the embedder keeps the cleanest 10 s. Consent is taken
   in the same act.
-- **Self-introduction → name proposal.** "Hi, this is Petros from Cassidy" proposes
-  that voice as Petros via the bell.
+- ~~**Self-introduction → name proposal.** "Hi, this is Petros from Cassidy" proposes
+  that voice as Petros via the bell.~~ Done in #967 (`src/self_introduction.py`,
+  org-api introduction-suggestion routes).
 - **Voice sign-in on shared devices.** Replaces or backs up QR login; devices rotate
   monthly.
 
 ### A better library
 - **Condition-aware profiles.** Samples clustered by condition (wind, indoor, vehicle,
   phone, language); a turn is scored against each person's nearest condition centroid.
-- **Bell asks the most informative passages first** (scores near the threshold), so a
-  company reaches the 20 corrections that calibrate its floor sooner.
+- ~~**Bell asks the most informative passages first** (scores near the threshold), so a
+  company reaches the 20 corrections that calibrate its floor sooner.~~ Done in #964
+  (commit 56dcb034, candidates ordered by closeness to the company's boundary).
 
 ### Using the identity
 - **Who said it ≠ who owns it.** A task records the speaker (resolved by voiceprint or
@@ -62,7 +64,8 @@ Tenancy sub-projects 1-4 are all on prod. What was deliberately left is recorded
 
 **Goal:** Users can ask questions about any report/meeting minutes and get answers grounded in transcript + report data.
 
-**Status:** ⬜ Not started
+**Status:** ✅ Done — `lambda_ask_agent.py` (e7e0f376), cross-date RAG Ask with citations
+(#23), scoped Ask (#848).
 
 **Model choice:** Use cheaper model (Haiku 4.5 or equivalent) — this is retrieval + summarization, not complex reasoning. Reserve Sonnet for report generation.
 
@@ -78,7 +81,7 @@ Frontend chat input → API Gateway → lambda_ask_agent.py
 ```
 
 **Key decisions needed:**
-- [ ] Scope: per-report only, or cross-date search?
+- [x] Scope: per-report only, or cross-date search? — decided: both; cross-date RAG shipped in #23, scoped Ask in #848
 - [ ] Frontend: inline chat panel in report view, or separate page?
 - [ ] Rate limiting: per-user query cap?
 
@@ -92,7 +95,9 @@ Frontend chat input → API Gateway → lambda_ask_agent.py
 
 **Goal:** Global search across all reports — find any topic, action item, safety flag, decision by keyword across all dates and users.
 
-**Status:** ⬜ Not started
+**Status:** 🟡 In progress — Phases 2 and 3 were delivered on Aurora/pgvector instead of
+DynamoDB (search API #31, `src/lambda_rag_search.py`; hybrid keyword + semantic). Phase 1
+(DynamoDB) was not done: `ENABLE_DYNAMODB` is still unset in `src/template.yaml`.
 
 **Current state of DynamoDB:**
 - ⚠️ `ENABLE_DYNAMODB` = **false** (default in code, not set in src/template.yaml)
@@ -105,7 +110,7 @@ Frontend chat input → API Gateway → lambda_ask_agent.py
 - [ ] Run backfill: invoke report generator with `{"report_type": "daily", "force": true}` for past 30 days
 - [ ] Verify items appear in DynamoDB console
 
-**Phase 2 — Search API:**
+**Phase 2 — Search API:** (done in #31 as GET/POST /api/search over Aurora, semantic, no LLM; not a DynamoDB scan)
 ```
 GET /api/search?q=concrete+pour&from=2026-01&to=2026-03
 → lambda_search.py
@@ -113,7 +118,7 @@ GET /api/search?q=concrete+pour&from=2026-01&to=2026-03
 → Return matching topics with report links
 ```
 
-**Phase 3 — Flat Knowledge Base (长期):**
+**Phase 3 — Flat Knowledge Base (长期):** (done: PostgreSQL pgvector semantic search, #23 and #31, feeding RAG Ask)
 - OpenSearch or PostgreSQL full-text search for cross-date, cross-site retrieval
 - Embedding-based semantic search if keyword matching isn't enough
 - Feed into Ask Agent for grounded cross-report Q&A
@@ -128,7 +133,8 @@ GET /api/search?q=concrete+pour&from=2026-01&to=2026-03
 
 **Goal:** Improve transcription accuracy for NZ/AU construction terminology.
 
-**Status:** ⬜ Not started
+**Status:** 🟡 In progress — vocabulary built and wired into `lambda_transcribe.py` (e7e0f376);
+ASR is now ElevenLabs, which reads the same file as keyterms (#1072, #1081, #1082).
 
 **How it works:**
 - AWS Transcribe supports [Custom Vocabulary](https://docs.aws.amazon.com/transcribe/latest/dg/custom-vocabulary.html)
@@ -137,11 +143,11 @@ GET /api/search?q=concrete+pour&from=2026-01&to=2026-03
 - Zero code change beyond one parameter addition
 
 **TODO:**
-- [ ] Research NZ/AU construction terminology (BRANZ, NZS standards, trade terms)
-- [ ] Build vocabulary TSV: columns = Phrase, SoundsLike, IPA, DisplayAs
-- [ ] Terms needed: GIB, BRANZ, dwang, nog, purlin, soffit, fascia, sarking, DPM, H1/H3/H5, NZBC, CCC, PS1/PS4, LBP, PIR, PIMs, RFI, EOT, PC Sum, Provisional Sum, variations, defects liability, practical completion, weathertightness, E2/AS1, Roskill, Hiab, Acrow props, boxing, falsework
+- [x] Research NZ/AU construction terminology (e7e0f376: 129 terms) (BRANZ, NZS standards, trade terms)
+- [x] Build vocabulary TSV (`config/custom_vocabulary_construction_nz.txt`, e7e0f376): columns = Phrase, SoundsLike, IPA, DisplayAs
+- [x] Terms needed (present in the file, spot-checked): GIB, BRANZ, dwang, nog, purlin, soffit, fascia, sarking, DPM, H1/H3/H5, NZBC, CCC, PS1/PS4, LBP, PIR, PIMs, RFI, EOT, PC Sum, Provisional Sum, variations, defects liability, practical completion, weathertightness, E2/AS1, Roskill, Hiab, Acrow props, boxing, falsework
 - [ ] Upload to S3: `config/custom_vocabulary_construction_nz.txt`
-- [ ] Add to transcribe params: `VocabularyName` in `lambda_transcribe.py`
+- [x] Add to transcribe params: `VocabularyName` in `lambda_transcribe.py` (e7e0f376; `lambda_transcribe.py:274,287`)
 - [ ] Test on 5 diverse recordings, compare before/after
 
 **Estimated effort:** Research: 2 hours | Implementation: 30 min | Validation: 1 hour
@@ -250,4 +256,4 @@ Earpiece (mouth) → TTS feedback → "注意: Block C scaffold inspection overd
 | Transcribe callback | ⚠️ Partial | Step 5 function name mismatch |
 | Face blurring pipeline | ⬜ Designed | Fargate-based, not built |
 | Batch H264 conversion | ⬜ Script ready | `batch_convert_h264.py` |
-| Audio normalization | ⬜ Designed | EBU R128, needs validation |
+| Audio normalization | ✅ Implemented (#281) | `loudnorm` + compression in `lambda_vad.py`, gated per stage by `*_NORMALISE_AUDIO` |
