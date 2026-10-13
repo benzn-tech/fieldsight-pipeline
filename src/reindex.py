@@ -13,6 +13,7 @@ The request/vectors handoff mirrors the existing embed->ingest sidecar
 contract, just triggered by an edit instead of the nightly report and sourced
 from corrected Aurora rows instead of daily_report.json."""
 import json
+import logging
 import os
 
 from psycopg.rows import dict_row
@@ -22,6 +23,8 @@ from repositories import aliases, chunks, redactions, topics
 from chunking import chunk_report
 from lake_put import lake_put
 from session_scope import parse_extraction_key
+
+logger = logging.getLogger()
 
 REQUEST_PREFIX = "reindex_requests/"
 # Vectors go under a SEPARATE top-level prefix (not reindex_requests/*.vectors
@@ -64,10 +67,14 @@ def _enqueue_session_index(s3_client, bucket, conn, t):
     and digest without transcript windows."""
     parsed = parse_extraction_key(t["source_s3_key"])
     if not parsed:
+        logger.warning("search index edit: unparseable extraction key %s -- "
+                       "falling back to the per-topic reindex", t["source_s3_key"])
         return None
     folder, date, base = parsed
     company_id = _company_id_for_site(conn, t["site_id"])
     if not company_id:
+        logger.warning("search index edit: site %s has no company -- "
+                       "falling back to the per-topic reindex", t["site_id"])
         return None
     request = index_request.build(
         conn, t["source_s3_key"], site_id=t["site_id"], user_id=t.get("user_id"),

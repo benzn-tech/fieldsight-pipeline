@@ -101,9 +101,9 @@ def test_group_key_is_emitted_without_members(monkeypatch):
 def test_site_without_a_company_falls_back_to_the_per_topic_chain(monkeypatch):
     _wire(monkeypatch, EXTRACTION, "true", company=None)
     s3 = FakeS3()
-    reindex.enqueue_topic_reindex(s3, "bkt", object(), "t-1", "Ada_L", "2026-07-16")
+    key = reindex.enqueue_topic_reindex(s3, "bkt", object(), "t-1", "Ada_L", "2026-07-16")
     idx, rei = _kinds(s3)
-    assert idx == []  # no company: nothing to attribute the request to
+    assert idx == [] and rei == [key] == ["reindex_requests/2026-07-16/Ada_L/t-1.json"]
 
 
 def test_reindex_vectors_regex_matches_the_key_the_embedder_writes():
@@ -125,3 +125,28 @@ def test_vectors_keys_route_to_their_own_apply(monkeypatch):
 
     assert route("reindex_vectors/2026-10-12/Ben/T1.json") == "reindex"
     assert route("index_vectors/2026-10-12/Ben/S1.json") == "index"
+
+
+def test_redacted_extraction_topic_edit_emits_a_request_that_indexes_nothing_of_it(monkeypatch):
+    """is_topic_redacted True on an extraction topic: the edit path must not re-embed it."""
+    from datetime import datetime
+    from session_index import build_chunks
+    _wire(monkeypatch, EXTRACTION, "true")
+    monkeypatch.undo()          # real index_request.build below; re-wire the rest by hand
+    monkeypatch.setenv("SEARCH_INDEX_WRITE", "true")
+    monkeypatch.setattr(reindex, "_company_id_for_site", lambda conn, sid: "co-1")
+    monkeypatch.setattr(reindex.topics, "get_topic_full", lambda conn, tid: _row(EXTRACTION))
+    monkeypatch.setattr(reindex.redactions, "is_topic_redacted", lambda conn, tid: True)
+    ir = reindex.index_request
+    full = dict(_row(EXTRACTION), id="t-1", time_range="09:00 - 09:30", title="Hidden slab",
+                decisions=[], open_questions=[])
+    monkeypatch.setattr(ir, "live_topic_ids", lambda conn, key: ["t-1"])
+    monkeypatch.setattr(ir.topics_repo, "get_topic_full", lambda conn, tid: full)
+    monkeypatch.setattr(ir.redactions_repo, "list_active_for_topics",
+                        lambda conn, ids: {"t-1": {"scope": "analysis"}})
+    s3 = FakeS3()
+    key = reindex.enqueue_topic_reindex(s3, "bkt", object(), "t-1", "Ada_L", "2026-07-16")
+    req = s3.puts[key]
+    turn = {"speaker": "spk_0", "text": "HIDEME words", "abs_start": datetime(2026, 7, 16, 9, 5),
+            "abs_start_str": "09:05:00", "abs_end_str": "09:05:30", "source_filename": "a"}
+    assert build_chunks(req, [turn]) == []

@@ -18,12 +18,15 @@ class _Cur:
         return self
 
     def fetchall(self):
+        if "WHERE target_type='topic'" in self.conn.sql[-1][0]:
+            return [{"target_id": i} for i in self.conn.redacted]
         return [{"id": i} for i in self.conn.ids]
 
 
 class FakeConn:
-    def __init__(self, ids=()):
+    def __init__(self, ids=(), redacted=()):
         self.ids = list(ids)
+        self.redacted = list(redacted)
         self.sql = []
 
     def cursor(self, row_factory=None):
@@ -129,3 +132,34 @@ def test_emit_writes_request_key_with_owner_hint():
     put = s3.puts[0]
     assert put["Key"] == key and put["Bucket"] == "bkt"
     assert json.loads(put["Body"]) == req
+
+
+def test_build_marks_an_actively_redacted_topic_non_work(monkeypatch):
+    """Redactions with scope 'analysis' / 'all' survive visible_topics_predicate; the
+    request must still carry them as non_work so nothing of them is embedded."""
+    monkeypatch.setattr(ir.topics_repo, "get_topic_full", lambda conn, tid: dict(FULL, id=tid))
+    conn = FakeConn(["t1", "t2"], redacted=["t2"])
+    req = ir.build(conn, KEY, **KW)
+    assert {t["id"]: t["work_class"] for t in req["topics"]} == {"t1": "work", "t2": "non_work"}
+    redaction_queries = [s for s in conn.sql if "WHERE target_type='topic'" in s[0]]
+    assert len(redaction_queries) == 1                      # one batched query
+    assert "reverted_at IS NULL" in redaction_queries[0][0]
+
+
+def test_a_redacted_topics_span_and_chunk_reach_no_index_chunk(monkeypatch):
+    from datetime import datetime
+    full = lambda conn, tid: dict(FULL, id=tid, title="Secret " + tid,
+                                  time_range="10:00 - 10:05" if tid == "t1" else "11:00 - 11:05")
+    monkeypatch.setattr(ir.topics_repo, "get_topic_full", full)
+    req = ir.build(FakeConn(["t1", "t2"], redacted=["t2"]), KEY, **KW)
+
+    def turn(h, text):
+        return {"speaker": "spk_0", "text": text, "abs_start": datetime(2026, 7, 6, h, 2, 0),
+                "abs_start_str": f"{h:02d}:02:00", "abs_end_str": f"{h:02d}:02:30",
+                "source_filename": "a"}
+
+    chunks = build_chunks(req, [turn(10, "KEEPME words"), turn(11, "HIDEME words")])
+    text = "\n".join(c["chunk_text"] for c in chunks)
+    assert "KEEPME" in text
+    assert "HIDEME" not in text and "Secret t2" not in text
+    assert not [c for c in chunks if c.get("topic_id") == "t2"]

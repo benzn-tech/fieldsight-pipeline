@@ -26,6 +26,7 @@ from psycopg.rows import dict_row
 
 from deleted_predicates import visible_topics_predicate
 from lake_put import lake_put
+from repositories import redactions as redactions_repo
 from repositories import topics as topics_repo
 from session_scope import parse_extraction_key
 
@@ -116,10 +117,18 @@ def _members(user_folder, report_date, session_base, replaces):
 def build(conn, extraction_key, *, site_id, user_id, owner_company_id, report_date,
           user_folder, session_base, tier, extracted_at, member_bases=(), replaces=()):
     topics = []
-    for tid in live_topic_ids(conn, extraction_key):
+    ids = live_topic_ids(conn, extraction_key)
+    # visible_topics_predicate drops only scope='deleted' redactions. A topic with ANY
+    # other active redaction (scope 'analysis' / 'all') is still live here, so ship it as
+    # non_work: session_index then drops its topic chunk and its span from every window.
+    redacted = set(map(str, redactions_repo.list_active_for_topics(conn, ids))) if ids else set()
+    for tid in ids:
         full = topics_repo.get_topic_full(conn, tid)
         if full is not None:
-            topics.append(_topic(full))
+            t = _topic(full)
+            if str(tid) in redacted:
+                t["work_class"] = "non_work"
+            topics.append(t)
     return {
         "extraction_key": extraction_key,
         "site_id": str(site_id),

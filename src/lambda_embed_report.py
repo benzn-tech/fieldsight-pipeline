@@ -198,8 +198,9 @@ INDEX_REQUEST_RE = re.compile(r"^index_requests/[^/]+/[^/]+/[^/]+\.json$")
 
 
 def _previous_embeddings(vkey):
-    """chunk-text hash -> embedding from the vectors artifact written last time, so an
-    unchanged chunk is not embedded again. Absent (NoSuchKey / 404) is the normal first
+    """(chunk-text hash -> embedding, members) from the vectors artifact written last
+    time: the embeddings so an unchanged chunk is not embedded again, the members so an
+    edit that cannot name its own (a group-key edit) can reuse them. Absent (NoSuchKey / 404) is the normal first
     run. Any other failure (a 403 reads like "absent" and has been mistaken for it
     before) is logged and treated as empty: everything is embedded, nothing is lost."""
     try:
@@ -210,12 +211,12 @@ def _previous_embeddings(vkey):
         if code not in ("NoSuchKey", "404"):
             logger.warning("index vectors reuse read failed for %s (%s: %s) -- embedding all chunks",
                            vkey, code or type(e).__name__, e)
-        return {}
+        return {}, []
     out = {}
     for c in prev.get("chunks") or []:
         if c.get("embedding") and c.get("chunk_text"):
             out[_chunk_hash(c["chunk_text"])] = c["embedding"]
-    return out
+    return out, list(prev.get("members") or [])
 
 
 def _session_turns(request):
@@ -248,12 +249,17 @@ def embed_index_request(key):
     embedded last time, and writes the vectors artifact the in-VPC apply step reads:
     {**request, "chunks": [{**chunk, "embedding": [...]}]}."""
     request = json.loads(s3().get_object(Bucket=S3_BUCKET, Key=key)["Body"].read().decode("utf-8"))
-    turns = _session_turns(request)
-    chunks = session_index.build_chunks(request, turns)
-
     vkey = index_request.vectors_key(
         request["report_date"], request["user_folder"], request["session_base"])
-    known = _previous_embeddings(vkey)
+    known, prev_members = _previous_embeddings(vkey)
+    if not request.get("members") and prev_members:
+        # An edit that could not name its members (group key, built in-VPC without an S3
+        # read): keep the previous ones, in the request too so the next edit inherits them.
+        logger.info("index request %s: members empty, falling back to the %d previous members",
+                    key, len(prev_members))
+        request["members"] = prev_members
+    turns = _session_turns(request)
+    chunks = session_index.build_chunks(request, turns)
 
     misses = {}
     for c in chunks:

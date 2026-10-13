@@ -201,3 +201,24 @@ def test_router_sends_index_requests_and_ignores_vectors(env, monkeypatch):
     run("index_vectors/2026-10-12/Ben/sidaaaa.json")
     run("reindex_requests/2026-07-16/Ada_L/t-1.json.vectors.json")
     assert hit == [key]
+
+
+def test_empty_members_fall_back_to_the_previous_artifacts_members(env, monkeypatch, caplog):
+    install, calls = env
+    prev_members = [{"user_folder": "Ben", "date": "2026-10-12", "session_base": "sid1"},
+                    {"user_folder": "Sam", "date": "2026-10-12", "session_base": "sid2"}]
+    prev = {"members": prev_members, "chunks": []}
+    key, s3 = install(make_req(session_base="grp1", members=[], topics=[]),
+                      {index_request.vectors_key("2026-10-12", "Ben", "grp1"): json.dumps(prev).encode()})
+    loaded = []
+    monkeypatch.setattr(les, "gather_session_segments",
+                        lambda b, f, d, base: loaded.append(base) or [f"k-{base}"])
+    monkeypatch.setattr(les, "assemble_session_turns",
+                        lambda b, k: ([turn("10:00:00", "FROM-" + k[0], "x")], [], {}))
+    with caplog.at_level("INFO"):
+        run(key)
+    assert loaded == ["sid1", "sid2"]
+    out = s3.puts[index_request.vectors_key("2026-10-12", "Ben", "grp1")]
+    assert out["members"] == prev_members            # the next edit inherits them too
+    assert any("FROM-k-sid1" in c["chunk_text"] for c in out["chunks"])
+    assert any("falling back" in r.getMessage() for r in caplog.records)
