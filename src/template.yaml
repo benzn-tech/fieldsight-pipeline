@@ -1575,6 +1575,7 @@ Resources:
           OPENROUTER_BASE_URL: !Ref QwenBaseUrl
           VOICE_LLM_PROBES: 'false'
           VOICE_RESTATE_ENABLED: 'false'
+          VOICE_RESTATE_MODEL: 'meta-llama/llama-3.1-8b-instruct'
       Policies:
         - LambdaInvokePolicy:
             FunctionName: !Ref AskAgentFunction

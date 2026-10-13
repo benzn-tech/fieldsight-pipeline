@@ -477,3 +477,167 @@ test("end to end through the real streamAnswer: HTTP 503 then a good stream is a
   assert.equal(r.log.answer_attempts, 2);
   assert.equal(r.log.first_attempt_error, "http_503");
 });
+
+// ---- Task 11: model restatement behind VOICE_RESTATE_ENABLED -------------------
+const RQ = "when does the Unit 11 backfill have to be finished and who is doing the trench work";
+const RGOOD = "you're asking when the Unit 11 backfill has to be finished and who is doing the trench work";
+const RGOOD_TEXT = `Got it, ${RGOOD}, let me check your site records and pull up what was said on site... `;
+async function withRestate(fn, env = {}) {
+  const saved = { ...process.env };
+  process.env.VOICE_RESTATE_ENABLED = "true";
+  Object.assign(process.env, env);
+  try { return await fn(); } finally {
+    for (const k of ["VOICE_RESTATE_ENABLED", "VOICE_RESTATE_MODEL"]) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+  }
+}
+function restateDeps(middle, over = {}) {
+  const rcalls = [];
+  const d = deps({ invokeAsk: async () => askReply({ kind: "answer", answer: "Friday." }),
+    restate: async (a) => { rcalls.push(a); return typeof middle === "function" ? middle(a) : { middle }; }, ...over });
+  d.rcalls = rcalls;
+  return d;
+}
+const rturn = (q = RQ, extra = {}) => turnEvent({ messages: [{ role: "user", content: q }], ...extra });
+
+test("restate flag off: the opener is written synchronously and the model is never called", async () => {
+  const d = restateDeps(RGOOD);
+  const s = new FakeStream();
+  const lines = []; const orig = console.log; console.log = (l) => lines.push(l);
+  let p;
+  try {
+    p = mod.handle(rturn(), s, d);
+    assert.ok(s.text().includes(OPENER), "opener written before the first await");
+    await p;
+  } finally { console.log = orig; }
+  assert.equal(d.rcalls.length, 0);
+  const log = lines.map((l) => { try { return JSON.parse(l); } catch { return {}; } }).find((l) => l.evt === "voice_llm_turn");
+  assert.deepEqual([log.restate_used, log.restate_reject], [false, "disabled"]);
+});
+
+test("restate on, good result: a keep-alive space, then the assembled restatement, then the answer", async () => {
+  await withRestate(async () => {
+    const d = restateDeps(RGOOD);
+    const r = await run(rturn(), d);
+    assert.deepEqual(r.content.filter(Boolean), [" ", RGOOD_TEXT, "Friday."]);
+    assert.equal(r.events.at(-1), "[DONE]");
+    assert.equal(r.log.restate_used, true);
+    assert.equal(r.log.restate_reject, null);
+    assert.equal(typeof r.log.restate_ms, "number");
+    assert.ok(!JSON.stringify(r.log).includes("backfill"), "no question text in the log");
+    assert.equal(d.rcalls.length, 1);
+    assert.equal(d.rcalls[0].question, RQ);
+    assert.equal(d.rcalls[0].prevQuestion, undefined);
+  });
+});
+
+test("restate gets the previous question, never an answer", async () => {
+  await withRestate(async () => {
+    const d = restateDeps(RGOOD);
+    await run(rturn(RQ, { messages: [{ role: "user", content: "who is on site" }, { role: "assistant", content: OPENER + "Three crews." }, { role: "user", content: RQ }] }), d);
+    assert.equal(d.rcalls[0].prevQuestion, "who is on site");
+    assert.ok(!JSON.stringify(d.rcalls[0]).includes("Three crews"));
+  });
+});
+
+test("a number the caller said is accepted; a number the model invented gives the opener", async () => {
+  await withRestate(async () => {
+    const ok = await run(rturn(), restateDeps(RGOOD));
+    assert.equal(ok.content[1], RGOOD_TEXT);
+    const bad = await run(rturn(), restateDeps(RGOOD.replace("Unit 11", "Unit 12")));
+    assert.equal(bad.content[1], OPENER);
+    assert.equal(bad.log.restate_used, false);
+    assert.equal(bad.log.restate_reject, "guard_number");
+  });
+});
+
+test("an invented capitalised name, a short result and a wrong lead all give the opener", async () => {
+  await withRestate(async () => {
+    const name = await run(rturn(), restateDeps(RGOOD.replace("trench work", "Hanlon trench work")));
+    assert.deepEqual([name.content[1], name.log.restate_reject], [OPENER, "guard_name"]);
+    const short = await run(rturn("about the pour"), restateDeps("you're asking about the pour"));
+    assert.deepEqual([short.content[1], short.log.restate_reject], [OPENER, "too_short"]);
+    const lead = await run(rturn(), restateDeps("the question is when the backfill is due"));
+    assert.deepEqual([lead.content[1], lead.log.restate_reject], [OPENER, "guard_prefix"]);
+  });
+});
+
+test("restate past the 1800 ms deadline gives the opener and aborts the model call", async () => {
+  await withRestate(async () => {
+    mock.timers.enable({ apis: ["setTimeout"] });
+    try {
+      let aborted = false;
+      const d = restateDeps((a) => new Promise(() => { a.signal.addEventListener("abort", () => { aborted = true; }); }));
+      const p = run(rturn(), d);
+      for (let i = 0; i < 6; i++) { await Promise.resolve(); mock.timers.tick(500); await Promise.resolve(); }
+      const r = await p;
+      assert.equal(r.content.filter(Boolean)[0], " ");
+      assert.ok(r.content.includes(OPENER), "opener after the deadline");
+      assert.equal(aborted, true);
+      assert.deepEqual([r.log.restate_used, r.log.restate_reject], [false, "deadline"]);
+      assert.ok(r.events.at(-1) === "[DONE]");
+    } finally { mock.timers.reset(); }
+  });
+});
+
+test("a restate that fails (http or thrown) gives the opener", async () => {
+  await withRestate(async () => {
+    const h = await run(rturn(), restateDeps(() => ({ error: "http" })));
+    assert.deepEqual([h.content[1], h.log.restate_reject], [OPENER, "http"]);
+    const t = await run(rturn(), restateDeps(() => { throw new Error("boom"); }));
+    assert.deepEqual([t.content[1], t.log.restate_reject], [OPENER, "error"]);
+  });
+});
+
+test("a bad token under the restate flag keeps today's behaviour and never calls the model", async () => {
+  await withRestate(async () => {
+    const d = restateDeps(RGOOD);
+    const r = await run(rturn(RQ, { token: "garbage" }), d);
+    assert.equal(r.content[0], OPENER);
+    assert.equal(r.spoken.trim(), (OPENER + FALLBACK).trim());
+    assert.equal(r.log.outcome, "bad_token");
+    assert.equal(d.rcalls.length, 0);
+  });
+});
+
+test("correction turns and reasoning models skip the model call", async () => {
+  await withRestate(async () => {
+    const d = restateDeps(RGOOD);
+    const c = await run(rturn("No, I meant the level three pour"), d);
+    assert.deepEqual([c.content[0], c.log.restate_reject], [OPENER, "correction"]);
+    assert.equal(d.rcalls.length, 0);
+  });
+  await withRestate(async () => {
+    const d = restateDeps(RGOOD);
+    const r = await run(rturn(), d);
+    assert.deepEqual([r.content[0], r.log.restate_reject], [OPENER, "reasoning_model"]);
+    assert.equal(d.rcalls.length, 0);
+  }, { VOICE_RESTATE_MODEL: "deepseek/deepseek-r1" });
+});
+
+test("a failing Ask still waits for the restatement so the fallback never precedes it", async () => {
+  await withRestate(async () => {
+    const d = restateDeps(RGOOD, { invokeAsk: async () => { throw new Error("down"); } });
+    const r = await run(rturn(), d);
+    assert.deepEqual(r.content.filter(Boolean), [" ", RGOOD_TEXT, FALLBACK]);
+  });
+});
+
+test("the default restate model call uses VOICE_RESTATE_MODEL and the OpenRouter settings", async () => {
+  await withRestate(async () => {
+    const seen = [];
+    const d = deps({ invokeAsk: async () => askReply({ kind: "answer", answer: "Friday." }),
+      fetchImpl: async (url, init) => { seen.push({ url, body: JSON.parse(init.body) });
+        return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: RGOOD } }] }) }; } });
+    const r = await run(rturn(), d);
+    assert.equal(r.content[1], RGOOD_TEXT);
+    assert.equal(seen[0].url, "http://openrouter.test/v1/chat/completions");
+    assert.equal(seen[0].body.model, "meta-llama/llama-3.1-8b-instruct");
+  });
+  await withRestate(async () => {
+    const seen = [];
+    const d = deps({ invokeAsk: async () => askReply({ kind: "answer", answer: "Friday." }),
+      fetchImpl: async (url, init) => { seen.push(JSON.parse(init.body)); return { ok: false, status: 500 }; } });
+    await run(rturn(), d);
+    assert.equal(seen[0].model, "acme/small");
+  }, { VOICE_RESTATE_MODEL: "acme/small" });
+});
