@@ -48,10 +48,29 @@ export function lastUserText(body) {
 
 // Numbers may arrive as digits ("delay 20", typed) or words ("delay twenty",
 // spoken and transcribed); only digits are honoured -- probes are typed.
+// Flags after the number, any order (2026-10-14, after "delay 8" made
+// ElevenLabs repeat the restatement three times and never speak the answer):
+//   ka -> an SSE comment line every second of the gap (bytes, no content)
+//   sp -> a single-space content delta every second of the gap
+//   p  -> the restatement as a full sentence ending ". " instead of "... "
+export const PERIOD_RESTATEMENT = "Got it. Let me check that. ";
+
 export function parseProbe(text) {
-  const m = /\b(delay|hold)\s+(\d{1,3})\b/i.exec(text || "");
-  if (!m) return { kind: "normal", seconds: 0 };
-  return { kind: m[1].toLowerCase(), seconds: Math.min(Number(m[2]), MAX_PROBE_SECONDS) };
+  const m = /\b(delay|hold)\s+(\d{1,3})((?:\s+(?:ka|sp|p)\b)*)/i.exec(text || "");
+  if (!m) return { kind: "normal", seconds: 0, flags: [] };
+  const flags = (m[3] || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+  return { kind: m[1].toLowerCase(), seconds: Math.min(Number(m[2]), MAX_PROBE_SECONDS), flags };
+}
+
+// Sleep for the gap, emitting the chosen keep-alive once a second.
+async function gap(out, id, created, ms, flags) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    await sleep(Math.min(1000, end - Date.now()));
+    if (Date.now() >= end) break;
+    if (flags.includes("ka")) out.write(": keep-alive\n\n");
+    if (flags.includes("sp")) out.write(chunk(id, created, " "));
+  }
 }
 
 export function chunk(id, created, content, { first = false, finish = null } = {}) {
@@ -138,10 +157,11 @@ async function handle(event, responseStream) {
 
   const marks = {};
   if (probe.kind === "hold") await sleep(probe.seconds * 1000);
-  out.write(chunk(id, created, RESTATEMENT, { first: true }));
+  const restatement = probe.flags.includes("p") ? PERIOD_RESTATEMENT : RESTATEMENT;
+  out.write(chunk(id, created, restatement, { first: true }));
   marks.restatement_ms = Date.now() - tArrive;
 
-  if (probe.kind === "delay") await sleep(probe.seconds * 1000);
+  if (probe.kind === "delay") await gap(out, id, created, probe.seconds * 1000, probe.flags);
   else if (probe.kind === "normal") await sleep(DEFAULT_ANSWER_DELAY_MS);
 
   for (const part of ANSWER.split(/(?<=\. )/)) {
