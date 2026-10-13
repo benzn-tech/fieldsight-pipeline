@@ -42,6 +42,22 @@ Where the voiceprint work goes next. Ordered by value, not by ease. Items marked
 - **Self-serve consent page — parked.** The person named gets a link to see, hear and
   withdraw their own voiceprint.
 
+## Parked follow-ups and scheduled cleanups (2026-10-13)
+
+Tenancy sub-projects 1-4 are all on prod. What was deliberately left is recorded in
+`docs/superpowers/specs/2026-10-05-tenancy-roadmap-design.md` ("Parked follow-ups" and
+"Scheduled cleanups"). In short:
+
+- **Parked** (each with trigger and approach in that spec): meeting minutes missing from
+  the per-company export; external project manager reach on another company's site;
+  576 unowned lake objects; database credentials (superuser + plaintext password);
+  per-company data delete; SES still in sandbox.
+- **Scheduled:** lake-wide summary off (~2026-10-16); frozen `user_mapping` fallback
+  removal, sub-project 2 M5 (~2026-10-18); legacy gateway phase B finish, delete
+  `khfj3p1fkb` and the legacy lambdas (~2026-10-20).
+
+---
+
 ## P0 — Ask Agent (对纪要追问)
 
 **Goal:** Users can ask questions about any report/meeting minutes and get answers grounded in transcript + report data.
