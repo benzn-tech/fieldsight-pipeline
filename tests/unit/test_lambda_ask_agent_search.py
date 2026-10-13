@@ -389,3 +389,78 @@ def test_short_english_words_are_still_not_terms(monkeypatch):
     ])
     out = run(ev(question="we are on it"))
     assert out["count"] == 0
+
+
+# ============================================================
+# Time phrases in the search box (2026-10-13): "What did we do yesterday?"
+# returned nothing because search never resolved the phrase, and because a
+# question that is only a time phrase embeds far from every chunk.
+# ============================================================
+NOW = "2026-10-13T02:00:00+00:00"   # 15:00 on 2026-10-13 in Pacific/Auckland
+
+
+def test_time_phrase_sends_range_and_browses(monkeypatch):
+    far = chunk("t-1", "2026-10-12", 0.8, "Slab pour")   # past _NO_LEX_MAX_DIST
+    fc = wire(monkeypatch, [far])
+    out = run(ev(question="What did we do yesterday?", tz="Pacific/Auckland", now=NOW))
+    p = fc.calls[0]["Payload"]
+    assert p["date_from"] == p["date_to"] == "2026-10-12"
+    assert p["k"] == 32
+    assert out["browse"] is True
+    assert out["date_range"] == {"from": "2026-10-12", "to": "2026-10-12", "source": "question"}
+    assert out["count"] == 1, "browse must not apply the distance cut-off"
+
+
+def test_browse_orders_by_date_desc_then_start_time(monkeypatch):
+    def at(tid, date, tr, title):
+        c = chunk(tid, date, 0.9, title)
+        c["metadata"] = {"time_range": tr} if tr is not None else {}
+        return c
+    wire(monkeypatch, [
+        at("t-1", "2026-10-11", "08:00 - 09:00", "Old day"),
+        at("t-2", "2026-10-12", "13:00 - 14:00", "Afternoon"),
+        at("t-3", "2026-10-12", None, "No time"),
+        at("t-4", "2026-10-12", "07:30 - 08:00", "Morning"),
+    ])
+    out = run(ev(question="what happened last week", tz="Pacific/Auckland", now=NOW))
+    assert out["browse"] is True
+    assert [r["title"] for r in out["results"]] == ["Morning", "Afternoon", "No time", "Old day"]
+
+
+def test_time_phrase_with_content_resolves_range_but_does_not_browse(monkeypatch):
+    far = chunk("t-1", "2026-10-07", 0.8, "Slab pour")
+    fc = wire(monkeypatch, [far])
+    out = run(ev(question="What did we do for Level two inspection last week?",
+                 tz="Pacific/Auckland", now=NOW))
+    p = fc.calls[0]["Payload"]
+    assert p["date_from"] == "2026-10-05" and p["date_to"] == "2026-10-11"
+    assert p["k"] == 30
+    assert "browse" not in out
+    assert out["date_range"]["source"] == "question"
+    assert out["count"] == 0, "the 0.55 cut-off still applies when content terms remain"
+
+
+def test_client_dates_win_over_time_phrase(monkeypatch):
+    fc = wire(monkeypatch, [chunk("t-1", "2026-02-09", 0.1, "Door")])
+    out = run(ev(question="What did we do yesterday?", tz="Pacific/Auckland", now=NOW,
+                 date_from="2026-02-01", date_to="2026-02-28"))
+    p = fc.calls[0]["Payload"]
+    assert (p["date_from"], p["date_to"]) == ("2026-02-01", "2026-02-28")
+    assert out["date_range"] == {"from": "2026-02-01", "to": "2026-02-28", "source": "client"}
+    assert "browse" not in out
+
+
+def test_no_tz_means_no_range(monkeypatch):
+    fc = wire(monkeypatch, [chunk("t-1", "2026-02-09", 0.8, "Door")])
+    out = run(ev(question="What did we do yesterday?"))
+    p = fc.calls[0]["Payload"]
+    assert "date_from" not in p and "date_to" not in p
+    assert "date_range" not in out and "browse" not in out
+    assert out["count"] == 0
+
+
+def test_chinese_time_phrase_browses(monkeypatch):
+    fc = wire(monkeypatch, [chunk("t-1", "2026-10-12", 0.9, "钢筋验收")])
+    out = run(ev(question="昨天我们做了什么", tz="Pacific/Auckland", now=NOW))
+    assert fc.calls[0]["Payload"]["date_from"] == "2026-10-12"
+    assert out["browse"] is True and out["count"] == 1
