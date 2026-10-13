@@ -378,6 +378,13 @@ def search_topics(body, caller):
         payload['date_to'] = date_to
     if body.get('site'):
         payload['site'] = body['site']  # project-scoped search (Ask omits site)
+    # The caller's IANA zone, so the ask-agent can resolve "yesterday" / "last
+    # week" in the question to a date range. Dropped, never an error, when it is
+    # not a plausible zone string: the ask-agent treats an unusable zone as "no
+    # anchor" and searches unfiltered. `now` is deliberately NOT forwarded.
+    tz = body.get('tz')
+    if isinstance(tz, str) and tz.strip() and len(tz) <= 64:
+        payload['tz'] = tz
 
     try:
         resp = lambda_client.invoke(

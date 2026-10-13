@@ -289,3 +289,26 @@ def test_lex_cte_orders_by_ts_rank_before_its_own_limit():
     # in particular the outer ORDER BY (lexical_hit ASC, distance ASC NULLS
     # LAST) that preserves the pre-existing vector-arm arrival order.
     assert "ORDER BY lexical_hit ASC, distance ASC NULLS LAST" in sql
+
+
+def test_the_vector_arm_cannot_use_the_hnsw_index():
+    """The vector arm must sort exactly, never through the HNSW index.
+
+    Measured on prod 2026-10-14 (pgvector 0.7.3, hnsw.ef_search=40): at LIMIT 5
+    the planner chose `Index Scan using idx_report_chunks_embedding` for the real
+    query and applied the site/author/visibility conditions as a Filter AFTER the
+    index had produced its 40 global candidates. A question's nearest row for
+    this tenant (distance 0.6025) was not among them, so Ask never saw it; at
+    LIMIT 30 the same query took the exact bitmap+sort path and returned it at
+    rank 1. pgvector 0.7.3 has no iterative scan to backfill filtered rows.
+
+    `+ 0` keeps the ordering identical while making the sort key an expression
+    no index can serve, so the plan is the per-tenant bitmap scan plus an exact
+    sort at every k. Per-tenant row counts are hundreds, so this costs
+    milliseconds.
+    """
+    from repositories.search_sql import build_search_sql
+    sql = build_search_sql()
+    vec = sql.split("lex AS (")[0]
+    assert "ORDER BY (c.embedding <=> %(q)s::vector) + 0" in vec
+    assert "ORDER BY c.embedding <=> %(q)s::vector " not in vec
