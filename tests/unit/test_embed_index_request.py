@@ -1,4 +1,5 @@
 # tests/unit/test_embed_index_request.py
+import hashlib
 import json
 from datetime import datetime
 
@@ -47,7 +48,14 @@ class FakeS3:
             err = Exception("nope")
             err.response = {"Error": {"Code": "NoSuchKey"}}
             raise err
-        return {"Body": type("B", (), {"read": lambda s, v=self.objects[Key]: v})()}
+        return {"Body": type("B", (), {"read": lambda s, v=self.objects[Key]: v})(),
+                "ETag": self._etag(Key)}
+
+    def _etag(self, Key):
+        return '"%s"' % hashlib.md5(self.objects[Key]).hexdigest()
+
+    def head_object(self, Bucket, Key):
+        return {"ETag": self._etag(Key)}
 
     def put_object(self, Bucket, Key, Body, ContentType=None, **kw):
         if Key.startswith("lake_manifest/"):
@@ -222,3 +230,65 @@ def test_empty_members_fall_back_to_the_previous_artifacts_members(env, monkeypa
     assert out["members"] == prev_members            # the next edit inherits them too
     assert any("FROM-k-sid1" in c["chunk_text"] for c in out["chunks"])
     assert any("falling back" in r.getMessage() for r in caplog.records)
+
+
+def test_older_run_does_not_overwrite_when_a_newer_request_landed(env, monkeypatch):
+    install, calls = env
+    key, s3 = install(make_req())
+    monkeypatch.setattr(les, "gather_session_segments", lambda *a: A_KEYS)
+    monkeypatch.setattr(les, "assemble_session_turns",
+                        lambda b, k: ([turn("11:51:00", "hello slab", "a")], [], {}))
+    newer = json.dumps(make_req(extracted_at="t2")).encode()
+
+    def slow_embed(texts):
+        s3.objects[key] = newer             # the newer request lands while this run embeds
+        return [[0.1] * 4 for _ in texts]
+
+    monkeypatch.setattr(mod.dashscope_utils, "embed", slow_embed)
+    out = run(key)
+    assert out["results"] == [{"skipped": "superseded"}]
+    assert vkey() not in s3.puts
+
+
+def test_group_members_come_from_the_extractions_merged_members(env, monkeypatch):
+    install, calls = env
+    merged = ["extractions/Ben/2026-10-12/sid1.json", "extractions/Sam/2026-10-12/sid2.json"]
+    ext_key = "extractions/Ben/2026-10-12/grp1.json"
+    prev = {"members": [{"user_folder": "Old", "date": "2026-10-12", "session_base": "old"}],
+            "chunks": []}
+    key, s3 = install(
+        make_req(extraction_key=ext_key, session_base="grp1", members=[], topics=[]),
+        {ext_key: json.dumps({"tier": "group", "mergedMembers": merged}).encode(),
+         index_request.vectors_key("2026-10-12", "Ben", "grp1"): json.dumps(prev).encode()})
+    loaded = []
+    monkeypatch.setattr(les, "gather_session_segments",
+                        lambda b, f, d, base: loaded.append((f, base)) or [f"k-{base}"])
+    monkeypatch.setattr(les, "assemble_session_turns",
+                        lambda b, k: ([turn("10:00:00", "FROM-" + k[0], "x")], [], {}))
+    run(key)
+    assert loaded == [("Ben", "sid1"), ("Sam", "sid2")]      # not the previous artifact's
+    out = s3.puts[index_request.vectors_key("2026-10-12", "Ben", "grp1")]
+    assert [m["session_base"] for m in out["members"]] == ["sid1", "sid2"]
+
+
+def test_short_embed_result_is_a_clear_error(env, monkeypatch):
+    install, calls = env
+    key, s3 = install(make_req())
+    monkeypatch.setattr(les, "gather_session_segments", lambda *a: A_KEYS)
+    monkeypatch.setattr(les, "assemble_session_turns",
+                        lambda b, k: ([turn("11:51:00", "hello slab", "a")], [], {}))
+    monkeypatch.setattr(mod.dashscope_utils, "embed", lambda texts: [[0.1] * 4])
+    with pytest.raises(RuntimeError, match="vectors for"):
+        run(key)
+    assert vkey() not in s3.puts
+
+
+def test_oversize_text_is_cut_for_embedding_but_stored_whole(env, monkeypatch):
+    install, calls = env
+    key, s3 = install(make_req())
+    monkeypatch.setattr(les, "gather_session_segments", lambda *a: A_KEYS)
+    monkeypatch.setattr(les, "assemble_session_turns",
+                        lambda b, k: ([turn("11:51:00", "x" * 20000, "a")], [], {}))
+    run(key)
+    assert calls and all(len(t) <= 8000 for t in calls[0])
+    assert any(len(c["chunk_text"]) > 8000 for c in s3.puts[vkey()]["chunks"])

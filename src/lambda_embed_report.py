@@ -194,6 +194,7 @@ def embed_reindex_request(key):
     return {"reindex": key, "chunks": len(chunks_out)}
 
 
+EMBED_TEXT_CHARS = 8000       # same cut as _chunk_hash
 INDEX_REQUEST_RE = re.compile(r"^index_requests/[^/]+/[^/]+/[^/]+\.json$")
 
 
@@ -243,15 +244,55 @@ def _session_turns(request):
     return turns
 
 
+def _request_superseded(key, etag_at_read):
+    """True when the request object changed since this run read it. Fails open (False)
+    when either ETag is unavailable: the backfill repairs a stale write, nothing repairs
+    a skipped one."""
+    if not etag_at_read:
+        return False
+    try:
+        now = s3().head_object(Bucket=S3_BUCKET, Key=key).get("ETag")
+    except Exception as e:
+        logger.warning("index request %s: could not re-check for a newer request (%s: %s)",
+                       key, type(e).__name__, e)
+        return False
+    return bool(now) and now != etag_at_read
+
+
+def _group_members(request):
+    """Members of a group request, from the `mergedMembers` of its extraction object.
+    Empty (logged) when the object cannot be read or names none."""
+    try:
+        art = json.loads(s3().get_object(
+            Bucket=S3_BUCKET, Key=request["extraction_key"])["Body"].read().decode("utf-8"))
+    except Exception as e:
+        logger.warning("index request: group extraction %s unreadable (%s: %s)",
+                       request.get("extraction_key"), type(e).__name__, e)
+        return []
+    out = []
+    for mk in art.get("mergedMembers") or []:
+        parsed = index_request.parse_extraction_key(mk)
+        if parsed:
+            folder, date, base = parsed
+            out.append({"user_folder": folder, "date": date, "session_base": base})
+    return out
+
+
 def embed_index_request(key):
     """Non-VPC worker for the session search index. Builds the chunks from the request's
     topics plus the session's transcript turns, embeds only chunks whose text was not
     embedded last time, and writes the vectors artifact the in-VPC apply step reads:
     {**request, "chunks": [{**chunk, "embedding": [...]}]}."""
-    request = json.loads(s3().get_object(Bucket=S3_BUCKET, Key=key)["Body"].read().decode("utf-8"))
+    got = s3().get_object(Bucket=S3_BUCKET, Key=key)
+    request_etag = got.get("ETag")
+    request = json.loads(got["Body"].read().decode("utf-8"))
     vkey = index_request.vectors_key(
         request["report_date"], request["user_folder"], request["session_base"])
     known, prev_members = _previous_embeddings(vkey)
+    if not request.get("members") and request["session_base"].startswith("grp"):
+        # Groups are first-class: the request cannot name its members (built in-VPC without
+        # an S3 read), so read them from the extraction the request points at.
+        request["members"] = _group_members(request)
     if not request.get("members") and prev_members:
         # An edit that could not name its members (group key, built in-VPC without an S3
         # read): keep the previous ones, in the request too so the next edit inherits them.
@@ -268,10 +309,21 @@ def embed_index_request(key):
             misses.setdefault(h, c["chunk_text"])
     if misses:
         hashes = list(misses)
-        known = dict(known, **dict(zip(hashes, dashscope_utils.embed([misses[h] for h in hashes]))))
+        # The hash covers only the first EMBED_TEXT_CHARS, so that is all the vector is for;
+        # one oversize turn must not fail the whole session's embed call.
+        vecs = dashscope_utils.embed([misses[h][:EMBED_TEXT_CHARS] for h in hashes])
+        if len(vecs) != len(hashes):
+            raise RuntimeError(
+                f"embed returned {len(vecs)} vectors for {len(hashes)} texts ({key})")
+        known = dict(known, **dict(zip(hashes, vecs)))
 
     result = {**request, "chunks": [
         {**c, "embedding": known[_chunk_hash(c["chunk_text"])]} for c in chunks]}
+    if _request_superseded(key, request_etag):
+        # A newer request for this session fired its own event; writing now would put the
+        # older chunk set over the newer one.
+        logger.info("index request %s: superseded while embedding -- not writing", key)
+        return {"skipped": "superseded"}
     lake_put(
         S3_BUCKET, vkey, json.dumps(result), client=s3(),
         owner_hint={
