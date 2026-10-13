@@ -5,6 +5,10 @@
 // and calls THIS endpoint as an OpenAI-compatible Chat Completions server. It
 // streams a restatement first, then the answer, in one SSE stream.
 //
+// UPDATE (phase 2): normal turns now run the real flow in handle() below --
+// verify the voice-session token, speak the opener at once, ask AskAgentFunction
+// for the prompt, stream the answer, fall back to a fixed line on any failure.
+// The fixed-text shell survives only as the hold/delay probes (VOICE_LLM_PROBES).
 // This shell returns FIXED text. It exists to measure three things nobody has
 // published: how long ElevenLabs waits for our first token, the end-to-end
 // latency from end-of-turn to hearing the restatement, and the round trip
@@ -17,14 +21,19 @@
 // (simulate-principal-policy, 2026-10-13). This file stays a thin streaming
 // facade; the logic it will front stays in Python.
 //
-// Probes, read from the last user message so they can be typed into a test
-// conversation:
+// Probes (VOICE_LLM_PROBES=true only), read from the last user message so they
+// can be typed into a test conversation:
 //   "delay N"  -> restatement immediately, answer after N seconds
 //   "hold N"   -> NOTHING for N seconds, then everything. Finds ElevenLabs'
 //                 first-token wait limit, which its docs do not state.
 
+import { createHash, createHmac } from "node:crypto";
+import { verifyVoiceSession } from "./token.mjs";
+import { createTurnStream, OPENER, FALLBACK } from "./stream.mjs";
+import { toHistory } from "./history.mjs";
+import { streamAnswer } from "./answer.mjs";
+
 const BEARER = process.env.VOICE_LLM_BEARER || "";
-const DEFAULT_ANSWER_DELAY_MS = Number(process.env.DEFAULT_ANSWER_DELAY_MS || "1500");
 const MAX_PROBE_SECONDS = 60;
 
 // ElevenLabs' documented buffer-words form: an ellipsis AND a trailing space.
@@ -130,8 +139,69 @@ function plainResponse(stream, statusCode, obj) {
   out.end();
 }
 
-async function handle(event, responseStream) {
-  const tArrive = Date.now();
+// Out wrapper: a destroyed client stream must never turn a keep-alive timer
+// tick into an uncaught exception.
+function safeOut(out) {
+  return {
+    write(s) { try { out.write(s); } catch { /* client gone */ } },
+    end() { try { out.end(); } catch { /* client gone */ } },
+  };
+}
+
+// AskAgentFunction answers with an API-Gateway-style {statusCode, body}. Only a
+// 200 whose body carries `kind` is usable; everything else is invoke_failed.
+export function parseAskResult(payload) {
+  if (!payload || typeof payload !== "object" || payload.statusCode !== 200) return null;
+  let b = payload.body;
+  if (typeof b === "string") { try { b = JSON.parse(b); } catch { return null; } }
+  return b && typeof b === "object" && typeof b.kind === "string" ? b : null;
+}
+
+// Real Ask invoke. The SDK ships with the Node runtime but not locally or in
+// CI, so it is loaded here, never at the top of the module.
+async function defaultInvokeAsk(payload, { signal } = {}) {
+  const { LambdaClient, InvokeCommand } = await import("@aws-sdk/client-lambda");
+  const res = await new LambdaClient({}).send(new InvokeCommand({
+    FunctionName: process.env.ASK_AGENT_FUNCTION,
+    InvocationType: "RequestResponse",
+    Payload: Buffer.from(JSON.stringify(payload)),
+  }), { abortSignal: signal });
+  if (res.FunctionError) throw new Error("function_error");
+  return JSON.parse(Buffer.from(res.Payload).toString("utf8"));
+}
+
+class InvokeTimeout extends Error {}
+
+async function invokeWithTimeout(invokeAsk, payload, ms) {
+  const ac = new AbortController();
+  let t;
+  const timeout = new Promise((_, rej) => { t = setTimeout(() => { ac.abort(); rej(new InvokeTimeout("invoke_timeout")); }, ms); });
+  const call = Promise.resolve().then(() => invokeAsk(payload, { signal: ac.signal }));
+  call.catch(() => {});  // a late rejection after the race is lost must not be unhandled
+  try { return await Promise.race([call, timeout]); } finally { clearTimeout(t); }
+}
+
+// retry_suspected: ElevenLabs silently re-sends a dropped turn. Same last user
+// text and same message count within 10 s = the same turn again.
+const recentTurns = new Map();
+function retrySuspected(text, count, nowMs) {
+  const k = createHash("sha256").update(`${text}\u0000${count}`).digest("hex");
+  const prev = recentTurns.get(k);
+  for (const [key, at] of recentTurns) if (nowMs - at > 60000) recentTurns.delete(key);
+  recentTurns.set(k, nowMs);
+  return prev !== undefined && nowMs - prev < 10000;
+}
+
+const INVOKE_TIMEOUT_MS = 9000;
+const TURN_GUARD_MS = 30000;
+const DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
+
+export async function handle(event, responseStream, deps = {}) {
+  const invokeAsk = deps.invokeAsk || defaultInvokeAsk;
+  const fetchImpl = deps.fetchImpl || fetch;
+  const nowSeconds = deps.now || (() => Math.floor(Date.now() / 1000));
+  const nowMs = deps.nowMs || Date.now;
+  const tArrive = nowMs();
   const method = event?.requestContext?.http?.method || "";
   const path = event?.rawPath || "";
 
@@ -153,10 +223,94 @@ async function handle(event, responseStream) {
   if (body === null) return plainResponse(responseStream, 400, { error: "malformed JSON" });
 
   const text = lastUserText(body);
-  const probe = parseProbe(text);
+  const probe = process.env.VOICE_LLM_PROBES === "true" ? parseProbe(text) : { kind: "normal", seconds: 0, flags: [] };
+  if (probe.kind !== "normal") return probeTurn(responseStream, body, probe, tArrive);
+
+  const key = process.env.VOICE_SESSION_SIGNING_KEY || "";
+  const apiKey = process.env.OPENROUTER_API_KEY || "";
+  const missing = [["VOICE_SESSION_SIGNING_KEY", key], ["ASK_AGENT_FUNCTION", process.env.ASK_AGENT_FUNCTION],
+    ["OPENROUTER_API_KEY", apiKey]].filter(([, v]) => !v).map(([n]) => n);
+  if (missing.length) {
+    console.log(JSON.stringify({ evt: "voice_llm_misconfigured", missing }));
+    return plainResponse(responseStream, 503, { error: "voice endpoint not configured" });
+  }
+
+  const out = safeOut(globalThis.awslambda.HttpResponseStream.from(responseStream, {
+    statusCode: 200,
+    headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
+  }));
+  const turn = createTurnStream(out, { id: `chatcmpl-${tArrive}`, created: Math.floor(tArrive / 1000) });
+  turn.text(OPENER);  // before any await: ElevenLabs drops a turn after ~4 s of silence
+
+  const extra = body.elevenlabs_extra_body || {};
+  const { question, history } = toHistory(body.messages);
+  const log = { evt: "voice_llm_turn", sub_hash: null, outcome: "error", invoke_ms: null,
+    first_answer_token_ms: null, answer_chars: 0, chunk_ids: [], rewritten: null,
+    history_turns: history.length, kind: null,
+    retry_suspected: retrySuspected(text, Array.isArray(body.messages) ? body.messages.length : 0, tArrive) };
+  const turnAbort = new AbortController();
+  const guard = setTimeout(() => { log.outcome = "turn_guard"; turnAbort.abort(); turn.finish(); }, TURN_GUARD_MS);
+  try {
+    const sub = verifyVoiceSession(extra.voice_session, key, nowSeconds());
+    if (!sub) { log.outcome = "bad_token"; return turn.fail(FALLBACK); }
+    log.sub_hash = createHmac("sha256", key).update(sub).digest("hex").slice(0, 12);
+
+    const tInvoke = nowMs();
+    let result;
+    try {
+      result = parseAskResult(await invokeWithTimeout(invokeAsk,
+        { question, history, caller_sub: sub, mode: "voice", prompt_only: true, deadline_s: 8, tz: extra.tz },
+        INVOKE_TIMEOUT_MS));
+    } catch (e) {
+      log.invoke_ms = nowMs() - tInvoke;
+      log.outcome = "invoke_failed";
+      if (e instanceof InvokeTimeout) log.invoke_abandoned = true;
+      return turn.fail(FALLBACK);
+    }
+    log.invoke_ms = nowMs() - tInvoke;
+    if (!result) { log.outcome = "invoke_failed"; return turn.fail(FALLBACK); }
+    log.kind = result.kind;
+    log.rewritten = result.rewritten ?? null;
+    log.chunk_ids = Array.isArray(result.chunk_ids) ? result.chunk_ids : [];
+
+    if (result.kind === "answer") {
+      const answer = String(result.answer ?? "").trim();
+      log.outcome = answer ? "answered" : "empty_answer";
+      log.answer_chars = answer.length;
+      turn.text(answer || FALLBACK);
+      return turn.finish();
+    }
+    if (result.kind === "prompt" && typeof result.prompt === "string" && result.prompt && result.llm) {
+      const r = await streamAnswer({ prompt: result.prompt, llm: result.llm, apiKey, fetchImpl,
+        baseUrl: process.env.OPENROUTER_BASE_URL || DEFAULT_BASE_URL,
+        signal: turnAbort.signal, onText: (t) => turn.text(t) });
+      log.answer_chars = r.chars;
+      log.first_answer_token_ms = r.firstTokenMs;
+      if (r.chars > 0) {
+        if (log.outcome !== "turn_guard") log.outcome = r.truncated ? "answered_truncated" : "answered";
+        return turn.finish();
+      }
+      if (log.outcome !== "turn_guard") log.outcome = "answer_failed";
+      log.error = r.error || null;
+      return turn.fail(FALLBACK);
+    }
+    log.outcome = "invoke_failed";
+    return turn.fail(FALLBACK);
+  } catch {
+    log.outcome = "error";
+    turn.fail(FALLBACK);
+  } finally {
+    clearTimeout(guard);
+    turn.finish();
+    log.total_ms = nowMs() - tArrive;
+    console.log(JSON.stringify(log));  // no question or answer text, ever
+  }
+}
+
+// Shell-phase timing probes (hold/delay), reachable only with VOICE_LLM_PROBES=true.
+async function probeTurn(responseStream, body, probe, tArrive) {
   const id = `chatcmpl-shell-${tArrive}`;
   const created = Math.floor(tArrive / 1000);
-
   const out = globalThis.awslambda.HttpResponseStream.from(responseStream, {
     statusCode: 200,
     headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
@@ -174,7 +328,6 @@ async function handle(event, responseStream) {
   marks.restatement_ms = Date.now() - tArrive;
 
   if (probe.kind === "delay") await gap(out, id, created, probe.seconds * 1000, probe.flags);
-  else if (probe.kind === "normal") await sleep(DEFAULT_ANSWER_DELAY_MS);
 
   for (const part of ANSWER.split(/(?<=\. )/)) {
     out.write(chunk(id, created, part));
@@ -185,11 +338,9 @@ async function handle(event, responseStream) {
   out.write("data: [DONE]\n\n");
   out.end();
 
-  // One line per turn: everything the measurement needs, nothing it does not.
   console.log(JSON.stringify({
     evt: "voice_llm_turn",
     probe,
-    user_text: text,
     turns: Array.isArray(body.messages) ? body.messages.length : 0,
     stream: body.stream === true,
     model_requested: body.model || null,
@@ -200,6 +351,8 @@ async function handle(event, responseStream) {
 
 // `awslambda` exists only inside the Lambda runtime; under a local test the
 // handler is exported unwrapped so it can be driven with a fake stream.
+// Lambda passes its context as a third argument, so the wrapper drops it:
+// `deps` is for tests only.
 export const handler = globalThis.awslambda?.streamifyResponse
-  ? globalThis.awslambda.streamifyResponse(handle)
+  ? globalThis.awslambda.streamifyResponse((event, stream) => handle(event, stream))
   : handle;
