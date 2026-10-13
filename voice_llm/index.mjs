@@ -63,7 +63,7 @@ export const LONG_RESTATEMENT =
   "Got it, you're asking when the Unit 11 backfill has to be finished and who is doing the trench work for the Hanlon plumbing, let me check... ";
 
 export function parseProbe(text) {
-  const m = /\b(delay|hold)\s+(\d{1,3})((?:\s+(?:ka|sp|p|l|n)\b)*)/i.exec(text || "");
+  const m = /\b(delay|hold)\s+(\d{1,3})((?:\s+(?:ka|sp|p|l|n|w)\b)*)/i.exec(text || "");
   if (!m) return { kind: "normal", seconds: 0, flags: [] };
   const flags = (m[3] || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
   return { kind: m[1].toLowerCase(), seconds: Math.min(Number(m[2]), MAX_PROBE_SECONDS), flags };
@@ -167,6 +167,9 @@ async function handle(event, responseStream) {
   let restatement = probe.flags.includes("l") ? LONG_RESTATEMENT
     : probe.flags.includes("p") ? PERIOD_RESTATEMENT : RESTATEMENT;
   if (probe.flags.includes("n")) restatement += "\n";
+  // w: "Got it, " padded with spaces past the ~120-character threshold the `l`
+  // probe found (141 chars spoken at 1.1 s; 27 chars held until the answer).
+  if (probe.flags.includes("w")) restatement = "Got it, " + " ".repeat(130);
   out.write(chunk(id, created, restatement, { first: true }));
   marks.restatement_ms = Date.now() - tArrive;
 
