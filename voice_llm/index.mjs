@@ -204,11 +204,18 @@ function retrySuspected(text, count, nowMs) {
 
 const INVOKE_TIMEOUT_MS = 9000;
 const TURN_GUARD_MS = 30000;
+// First-token waits. OpenRouter's normal first token is ~2 s but it has tail
+// spikes of 10-15 s; the keep-alive holds the ElevenLabs turn open, so one
+// longer retry beats a spoken fallback.
+const FIRST_TOKEN_MS = 5000;
+const RETRY_FIRST_TOKEN_MS = 8000;
+const retryable = (e) => e === "first_token_timeout" || /^http_5\d\d$/.test(e || "");
 const DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
 
 export async function handle(event, responseStream, deps = {}) {
   const invokeAsk = deps.invokeAsk || defaultInvokeAsk;
   const fetchImpl = deps.fetchImpl || fetch;
+  const answerStream = deps.streamAnswer || streamAnswer;
   const nowSeconds = deps.now || (() => Math.floor(Date.now() / 1000));
   const nowMs = deps.nowMs || Date.now;
   const tArrive = nowMs();
@@ -293,9 +300,18 @@ export async function handle(event, responseStream, deps = {}) {
       return turn.finish();
     }
     if (result.kind === "prompt" && typeof result.prompt === "string" && result.prompt && result.llm) {
-      const r = await streamAnswer({ prompt: result.prompt, llm: result.llm, apiKey, fetchImpl,
-        baseUrl: process.env.OPENROUTER_BASE_URL || DEFAULT_BASE_URL,
+      const attempt = (firstTokenMs) => answerStream({ prompt: result.prompt, llm: result.llm, apiKey, fetchImpl,
+        baseUrl: process.env.OPENROUTER_BASE_URL || DEFAULT_BASE_URL, firstTokenMs,
         signal: turnAbort.signal, onText: (t) => turn.text(t) });
+      let r = await attempt(FIRST_TOKEN_MS);
+      log.answer_attempts = 1;
+      // Retry only when nothing was spoken, the failure is a stall or a 5xx
+      // (never 4xx or an abort), and the turn guard has not fired.
+      if (r.chars === 0 && retryable(r.error) && !turnAbort.signal.aborted) {
+        log.first_attempt_error = r.error;
+        r = await attempt(RETRY_FIRST_TOKEN_MS);
+        log.answer_attempts = 2;
+      }
       log.answer_chars = r.chars;
       log.first_answer_token_ms = r.firstTokenMs;
       if (r.chars > 0) {

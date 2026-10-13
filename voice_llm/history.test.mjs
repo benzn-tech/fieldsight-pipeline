@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { toHistory } from "./history.mjs";
-import { OPENER } from "./stream.mjs";
+import { OPENER, FALLBACK } from "./stream.mjs";
 
 test("pairs prior turns and strips our opener and keep-alive spaces", () => {
   const r = toHistory([
@@ -65,4 +65,13 @@ test("splits at whichever ellipsis comes first", () => {
     { role: "user", content: "q2" },
   ]);
   assert.deepEqual(r.history, [{ question: "q1", answer: "Friday... maybe." }]);
+});
+
+test("an assistant turn that was only the FALLBACK line is dropped with its question", () => {
+  const r = toHistory([
+    { role: "user", content: "q1" }, { role: "assistant", content: OPENER + "   " + FALLBACK },
+    { role: "user", content: "q2" }, { role: "assistant", content: OPENER + "Friday." },
+    { role: "user", content: "q3" },
+  ]);
+  assert.deepEqual(r.history, [{ question: "q2", answer: "Friday." }]);
 });

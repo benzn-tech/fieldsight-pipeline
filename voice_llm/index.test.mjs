@@ -387,3 +387,93 @@ test("a throw while preparing the turn (after the opener) still ends in FALLBACK
   assert.ok(r.spoken.includes(FALLBACK));
   assert.equal(r.log.outcome, "error");
 });
+
+// First-token retry. streamAnswer is injected (deps.streamAnswer) so each outcome
+// is scripted exactly; the calls it records show what each attempt was given.
+function scripted(results) {
+  const calls = [];
+  const fn = async (opts) => {
+    calls.push({ firstTokenMs: opts.firstTokenMs, prompt: opts.prompt, llm: opts.llm, signal: opts.signal });
+    const r = results[calls.length - 1];
+    if (r.speak) opts.onText(r.speak);
+    const { speak, ...res } = r;
+    return res;
+  };
+  return { fn, calls };
+}
+const TIMEOUT = { ok: false, chars: 0, firstTokenMs: null, error: "first_token_timeout" };
+const SPOKE = { speak: "Friday.", ok: true, chars: 7, firstTokenMs: 2100 };
+
+test("a first-token timeout is retried once with the same request and a longer wait", async () => {
+  const s = scripted([TIMEOUT, SPOKE]);
+  const r = await run(turnEvent(), deps({ invokeAsk: async () => askReply(PROMPT), streamAnswer: s.fn }));
+  assert.deepEqual(r.content.filter(Boolean), [OPENER, "Friday."]);
+  assert.equal(r.spoken.includes(FALLBACK), false);
+  assert.equal(r.log.outcome, "answered");
+  assert.equal(r.log.answer_attempts, 2);
+  assert.equal(r.log.first_attempt_error, "first_token_timeout");
+  assert.deepEqual(s.calls.map((c) => c.firstTokenMs), [5000, 8000]);
+  assert.equal(s.calls[1].prompt, s.calls[0].prompt);
+  assert.deepEqual(s.calls[1].llm, s.calls[0].llm);
+  assert.equal(s.calls[1].signal, s.calls[0].signal, "both attempts share the turn abort signal");
+});
+
+test("an http_5xx on the first attempt is retried; a success needs no retry", async () => {
+  const s = scripted([{ ok: false, chars: 0, firstTokenMs: null, error: "http_503" }, SPOKE]);
+  const r = await run(turnEvent(), deps({ invokeAsk: async () => askReply(PROMPT), streamAnswer: s.fn }));
+  assert.equal(r.log.outcome, "answered");
+  assert.equal(r.log.answer_attempts, 2);
+  assert.equal(r.log.first_attempt_error, "http_503");
+
+  const ok = scripted([SPOKE]);
+  const r1 = await run(turnEvent(), deps({ invokeAsk: async () => askReply(PROMPT), streamAnswer: ok.fn }));
+  assert.equal(r1.log.answer_attempts, 1);
+  assert.equal(r1.log.first_attempt_error ?? null, null);
+  assert.deepEqual(ok.calls.map((c) => c.firstTokenMs), [5000]);
+});
+
+test("two first-token timeouts end in the fallback after exactly two attempts", async () => {
+  const s = scripted([TIMEOUT, TIMEOUT]);
+  const r = await run(turnEvent(), deps({ invokeAsk: async () => askReply(PROMPT), streamAnswer: s.fn }));
+  assert.deepEqual(r.content.filter(Boolean), [OPENER, FALLBACK]);
+  assert.equal(r.log.outcome, "answer_failed");
+  assert.equal(r.log.answer_attempts, 2);
+  assert.equal(r.log.first_attempt_error, "first_token_timeout");
+  assert.equal(r.log.error, "first_token_timeout");
+  assert.equal(s.calls.length, 2);
+});
+
+test("text followed by an error is never retried", async () => {
+  const s = scripted([{ speak: "Half an", ok: true, chars: 7, firstTokenMs: 900, error: "socket reset", truncated: true }, SPOKE]);
+  const r = await run(turnEvent(), deps({ invokeAsk: async () => askReply(PROMPT), streamAnswer: s.fn }));
+  assert.deepEqual(r.content.filter(Boolean), [OPENER, "Half an"]);
+  assert.equal(r.log.outcome, "answered_truncated");
+  assert.equal(r.log.answer_attempts, 1);
+  assert.equal(s.calls.length, 1);
+});
+
+test("a 4xx is not retried and gives the fallback", async () => {
+  const s = scripted([{ ok: false, chars: 0, firstTokenMs: null, error: "http_401" }, SPOKE]);
+  const r = await run(turnEvent(), deps({ invokeAsk: async () => askReply(PROMPT), streamAnswer: s.fn }));
+  assert.deepEqual(r.content.filter(Boolean), [OPENER, FALLBACK]);
+  assert.equal(r.log.answer_attempts, 1);
+  assert.equal(s.calls.length, 1);
+});
+
+test("an aborted attempt is not retried", async () => {
+  const s = scripted([{ ok: false, chars: 0, firstTokenMs: null, error: "aborted" }, SPOKE]);
+  const r = await run(turnEvent(), deps({ invokeAsk: async () => askReply(PROMPT), streamAnswer: s.fn }));
+  assert.equal(r.log.answer_attempts, 1);
+  assert.equal(s.calls.length, 1);
+  assert.equal(r.spoken.includes("Friday."), false);
+});
+
+test("end to end through the real streamAnswer: HTTP 503 then a good stream is answered", async () => {
+  let n = 0;
+  const good = fakeFetch(["Back on ", "Friday."]);
+  const flaky = async (...a) => (++n === 1 ? { ok: false, status: 503 } : good(...a));
+  const r = await run(turnEvent(), deps({ invokeAsk: async () => askReply(PROMPT), fetchImpl: flaky }));
+  assert.deepEqual(r.content.filter(Boolean), [OPENER, "Back on ", "Friday."]);
+  assert.equal(r.log.answer_attempts, 2);
+  assert.equal(r.log.first_attempt_error, "http_503");
+});
