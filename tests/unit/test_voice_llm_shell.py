@@ -65,3 +65,19 @@ def test_the_node_suite_passes():
     r = subprocess.run(["node", "--test"], cwd=os.path.join(ROOT, "voice_llm"),
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+
+
+def test_the_package_is_one_npm_will_pack():
+    """sam build packs a Node function with `npm pack`, which refuses a
+    package.json without BOTH name and version ("Invalid package, must have
+    name and version"). The first deploy of this endpoint (2026-10-13, run
+    38385150559) failed at SAM build for exactly that -- and because it
+    failed in the build step, every later merge to develop would have failed
+    the TEST deploy the same way, for every session, until fixed. The Node
+    tests could not see it: node --test never packs.
+    """
+    import json
+    with open(os.path.join(ROOT, "voice_llm", "package.json"), encoding="utf-8") as fh:
+        pkg = json.load(fh)
+    assert pkg.get("name"), "npm pack needs a name"
+    assert pkg.get("version"), "npm pack needs a version"
