@@ -1,0 +1,9 @@
+{
+  "name": "fieldsight-voice-llm",
+  "private": true,
+  "type": "module",
+  "description": "Custom LLM endpoint for the ElevenLabs voice agent (shell phase). No dependencies by design: Node's runtime ships everything a streaming SSE facade needs.",
+  "scripts": {
+    "test": "node --test"
+  }
+}
