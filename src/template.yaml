@@ -454,6 +454,22 @@ Parameters:
       Every failure path inside falls back to the cosine order, so turning it
       on cannot make a question unanswerable; it can only make it slower.
 
+  RerankTimeoutSeconds:
+    Type: String
+    Default: '3'
+    Description: >-
+      Per-call timeout for qwen3-rerank in Ask (DASHSCOPE_RERANK_TIMEOUT_SECONDS).
+      Measured 2026-10-13 from NZ: p50 3.4-3.8 s, so the 3 s default falls back
+      to cosine order on most calls. A stack parameter rather than a code
+      default so a measured value can actually be deployed.
+
+  RerankCandidateK:
+    Type: String
+    Default: '32'
+    Description: >-
+      How many chunks Ask fetches for the reranker to reorder (RERANK_CANDIDATE_K).
+      rag-search clamps each arm to 32, so a larger value buys nothing today.
+
   AsrProvider:
     Type: String
     Description: Speech-to-text provider (transcribe|elevenlabs)
@@ -2225,6 +2241,8 @@ Resources:
           # Ask only. rag-search is in-VPC with no egress and could not make
           # this call at all -- it would hang to the socket timeout.
           ENABLE_RERANK: !Ref EnableRerank
+          DASHSCOPE_RERANK_TIMEOUT_SECONDS: !Ref RerankTimeoutSeconds
+          RERANK_CANDIDATE_K: !Ref RerankCandidateK
           # SP-Ask: async audit hop (in-VPC). Same cross-condition Ref shape as
           # RAG_SEARCH_FUNCTION above (VoiceAuditFunction is HasDb, this fn is
           # unconditional) — safe in practice on the test stack; see the W1001

@@ -112,3 +112,23 @@ def test_search_forwards_site(monkeypatch):
     fc = wire(monkeypatch)
     fapi.search_topics({"question": "door damage", "site": "s-xyz"}, ADMIN_CALLER)
     assert fc.calls[0]["Payload"]["site"] == "s-xyz"
+
+
+def test_forwards_valid_tz(monkeypatch):
+    fc = wire(monkeypatch)
+    fapi.search_topics({"question": "door", "tz": "Pacific/Auckland"}, ADMIN_CALLER)
+    assert fc.calls[0]["Payload"]["tz"] == "Pacific/Auckland"
+
+
+@pytest.mark.parametrize("tz", ["x" * 65, 123, ["Pacific/Auckland"], "", "   ", None])
+def test_drops_invalid_tz_without_error(monkeypatch, tz):
+    fc = wire(monkeypatch)
+    res = fapi.search_topics({"question": "door", "tz": tz}, ADMIN_CALLER)
+    assert res["statusCode"] == 200
+    assert "tz" not in fc.calls[0]["Payload"]
+
+
+def test_accepts_64_char_tz(monkeypatch):
+    fc = wire(monkeypatch)
+    fapi.search_topics({"question": "door", "tz": "x" * 64}, ADMIN_CALLER)
+    assert fc.calls[0]["Payload"]["tz"] == "x" * 64

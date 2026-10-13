@@ -125,7 +125,7 @@ def build_search_sql() -> str:
         "  LEFT JOIN topics t ON t.id = c.topic_id "
         "  LEFT JOIN sites s ON s.id = c.site_id "
         "  WHERE " + scope + " "
-        "  ORDER BY c.embedding <=> %(q)s::vector "
+        "  ORDER BY (c.embedding <=> %(q)s::vector) + 0 "  # exact; see test_the_vector_arm_cannot_use_the_hnsw_index
         "  LIMIT %(k)s"
         "), "
         "lex AS ("

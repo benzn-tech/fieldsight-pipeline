@@ -90,10 +90,11 @@ test("a malformed body is a 400, not a crash", async () => {
 });
 
 test("probes are parsed from the last user message only", () => {
-  assert.deepEqual(mod.parseProbe("hold 20"), { kind: "hold", seconds: 20 });
-  assert.deepEqual(mod.parseProbe("please Delay 5 thanks"), { kind: "delay", seconds: 5 });
-  assert.deepEqual(mod.parseProbe("hold 999"), { kind: "hold", seconds: 60 }, "capped");
-  assert.deepEqual(mod.parseProbe("what is the backfill date"), { kind: "normal", seconds: 0 });
+  assert.deepEqual(mod.parseProbe("hold 20"), { kind: "hold", seconds: 20, flags: [] });
+  assert.deepEqual(mod.parseProbe("please Delay 5 thanks"), { kind: "delay", seconds: 5, flags: [] });
+  assert.deepEqual(mod.parseProbe("hold 999"), { kind: "hold", seconds: 60, flags: [] }, "capped");
+  assert.deepEqual(mod.parseProbe("what is the backfill date"), { kind: "normal", seconds: 0, flags: [] });
+  assert.deepEqual(mod.parseProbe("delay 8 ka p"), { kind: "delay", seconds: 8, flags: ["ka", "p"] });
 
   const body = { messages: [
     { role: "user", content: "hold 30" },
@@ -101,4 +102,32 @@ test("probes are parsed from the last user message only", () => {
     { role: "user", content: "normal question" },
   ] };
   assert.equal(mod.lastUserText(body), "normal question");
+});
+
+test("the custom key header is accepted, in any case, because ElevenLabs reserves Authorization", async () => {
+  for (const name of ["x-voice-llm-key", "X-Voice-Llm-Key"]) {
+    const s = new FakeStream();
+    const ev = event({ auth: "" });
+    ev.headers = { [name]: "test-bearer" };
+    await mod.handler(ev, s);
+    assert.equal(s.meta.statusCode, 200, name);
+  }
+  const s = new FakeStream();
+  const ev = event({ auth: "" });
+  ev.headers = { "x-voice-llm-key": "wrong" };
+  await mod.handler(ev, s);
+  assert.equal(s.meta.statusCode, 401);
+});
+
+test("a refusal logs which headers arrived but never their values", async () => {
+  const lines = []; const orig = console.log; console.log = (l) => lines.push(l);
+  try {
+    const s = new FakeStream();
+    const ev = event({ auth: "Bearer secret-value-that-must-not-leak" });
+    await mod.handler(ev, s);
+  } finally { console.log = orig; }
+  const refused = lines.find((l) => String(l).includes("voice_llm_refused"));
+  assert.ok(refused, "the refusal must be logged");
+  assert.ok(JSON.parse(refused).header_names.includes("authorization"));
+  assert.ok(!refused.includes("secret-value-that-must-not-leak"), "a credential reached the log");
 });
