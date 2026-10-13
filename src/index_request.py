@@ -112,7 +112,7 @@ def _members(user_folder, report_date, session_base, replaces):
             if parsed:
                 folder, date, base = parsed
                 out.append({"user_folder": folder, "date": date, "session_base": base})
-        if not out:
+        if not out and replaces:
             logger.warning("group %s has no parseable members (replaces=%r); "
                            "the embedder must resolve them", session_base, list(replaces))
         return out

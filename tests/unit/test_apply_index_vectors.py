@@ -102,17 +102,25 @@ def test_lock_is_the_first_statement_and_matches_item_writer(run):
     assert sql == "SELECT pg_advisory_xact_lock(hashtext(%s))" and params == (KEY,)
 
 
-def test_overlap_applies_nulls_topic_not_live_and_scopes_deletes(run):
+def test_overlap_applies_drops_chunks_of_topics_not_live_and_scopes_deletes(run):
     conn = FakeConn(live=["t1"])
     member = "extractions/Ben_X/2026-07-06/m1.json"
     out = run(conn, result(replaces=[member]))
-    assert out == {"index_applied": VKEY, "outcome": "applied", "chunks": 2}
+    assert out == {"index_applied": VKEY, "outcome": "applied", "chunks": 1}
     delete = next((s, p) for s, p in conn.writes() if s.startswith("DELETE"))
     assert "company_id" in delete[0]
     assert delete[1]["company_id"] == CID
     assert delete[1]["keys"] == [KEY, member]
-    # (site, user, source_s3_key, topic_id, ...): t1 is live and kept, t2 is not and is NULLed
-    assert [(p[2], p[3]) for p in conn.chunk_inserts()] == [(KEY, "t1"), (KEY, None)]
+    # (site, user, source_s3_key, topic_id, ...): t1 is live and kept; t2 is not live, so its
+    # chunk is dropped (R5) -- never inserted unattached
+    assert [(p[2], p[3]) for p in conn.chunk_inserts()] == [(KEY, "t1")]
+
+
+def test_chunks_without_a_topic_are_not_dropped(run):
+    conn = FakeConn(live=["t1"])
+    out = run(conn, result(chunk_topics=("t1", None)))
+    assert out["chunks"] == 2
+    assert [p[3] for p in conn.chunk_inserts()] == ["t1", None]
 
 
 def test_stale_request_writes_nothing(run):

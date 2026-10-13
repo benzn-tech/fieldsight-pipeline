@@ -1068,14 +1068,35 @@ def _apply_index_result(conn, result):
     dropped = [k for k in (result.get("replaces") or []) if not k.startswith("extractions/")]
     if dropped:
         logger.warning("index apply %s: ignoring non-extraction replaces %s", key, dropped)
+    # A member the customer deleted must not be heard through the group: its speech is in
+    # the group's windows and its topic titles in the digest. The tombstone names the
+    # member's own extraction key, which no group row carries, so ask here.
+    dead = []
+    for m in result.get("members") or []:
+        member_key = f"extractions/{m['user_folder']}/{m['date']}/{m['session_base']}.json"
+        if _source_is_tombstoned(conn, member_key):
+            dead.append(m["session_base"])
+    if dead:
+        logger.info("index apply %s: members %s are deleted -- dropping their windows and the digest",
+                    key, dead)
+
     chunks.delete_chunks_for_sources(conn, [key, *replaces], cid)
     n = 0
     for c in result.get("chunks") or []:
         tid = c.get("topic_id")
+        if tid is not None and tid not in live:
+            # Its topic is gone (deleted, redacted, superseded). A newer request rebuilds it;
+            # inserting it unattached would leave that content searchable.
+            continue
+        if dead and (c["chunk_type"] == "session_digest" or (
+                c["chunk_type"] == "transcript_window" and any(
+                    b in f for f in (c.get("metadata") or {}).get("source_files") or []
+                    for b in dead))):
+            continue
         chunks.insert_chunk(
             conn, result["site_id"], result["report_date"], c["chunk_type"], c["chunk_text"],
             c["embedding"], user_id=result.get("user_id"), source_s3_key=key,
-            topic_id=tid if tid in live else None, metadata=c.get("metadata"))
+            topic_id=tid, metadata=c.get("metadata"))
         n += 1
     return "applied", n
 
@@ -1101,9 +1122,9 @@ def apply_index_vectors(key):
 
 def run_index_backfill(spec):
     """Emit index requests for extraction keys that already have visible topics. Defaults to
-    a dry run that only counts. Group (`grp...`) keys are skipped: their member keys live in
-    the extraction object, which this lambda has no read grant for, and a request without
-    them would embed nothing."""
+    a dry run that only counts. Group (`grp...`) keys go out with no members: their member
+    keys live in the extraction object, which this lambda has no read grant for, so the
+    embedder resolves them. A key that fails is logged, listed under `failed` and skipped."""
     spec = spec if isinstance(spec, dict) else {}
     limit = max(1, min(int(spec.get("limit") or BACKFILL_LIMIT_CAP), BACKFILL_LIMIT_CAP))
     dry_run = spec.get("dry_run", True) is not False
@@ -1115,7 +1136,7 @@ def run_index_backfill(spec):
         where.append("t.report_date >= %s")
         params.append(spec["date_from"])
     extra = "".join(f" AND {w}" for w in where)
-    emitted, skipped_groups = 0, 0
+    emitted, failed = 0, []
     with get_connection() as conn:
         rows = conn.cursor(row_factory=dict_row).execute(
             "SELECT DISTINCT t.source_s3_key, t.site_id, t.user_id, t.report_date "
@@ -1128,24 +1149,24 @@ def run_index_backfill(spec):
             if not parsed:
                 continue
             folder, date, base = parsed
-            if base.startswith("grp"):
-                skipped_groups += 1
-                continue
             if dry_run:
                 continue
-            company = conn.cursor(row_factory=dict_row).execute(
-                "SELECT company_id FROM sites WHERE id = %s", (r["site_id"],)).fetchone()
-            if not company or not company["company_id"]:
-                logger.warning("index backfill: no company for site %s", r["site_id"])
-                continue
-            request = index_request.build(
-                conn, r["source_s3_key"], site_id=r["site_id"], user_id=r["user_id"],
-                owner_company_id=company["company_id"], report_date=str(r["report_date"]),
-                user_folder=folder, session_base=base, tier=None, extracted_at=None)
-            index_request.emit(s3(), S3_BUCKET, request)
-            emitted += 1
-    return {"keys": len(rows), "emitted": emitted, "dry_run": dry_run,
-            "skipped_groups": skipped_groups}
+            try:
+                company = conn.cursor(row_factory=dict_row).execute(
+                    "SELECT company_id FROM sites WHERE id = %s", (r["site_id"],)).fetchone()
+                if not company or not company["company_id"]:
+                    logger.warning("index backfill: no company for site %s", r["site_id"])
+                    continue
+                request = index_request.build(
+                    conn, r["source_s3_key"], site_id=r["site_id"], user_id=r["user_id"],
+                    owner_company_id=company["company_id"], report_date=str(r["report_date"]),
+                    user_folder=folder, session_base=base, tier=None, extracted_at=None)
+                index_request.emit(s3(), S3_BUCKET, request)
+                emitted += 1
+            except Exception:
+                logger.exception("index backfill: %s failed -- continuing", r["source_s3_key"])
+                failed.append(r["source_s3_key"])
+    return {"keys": len(rows), "emitted": emitted, "dry_run": dry_run, "failed": failed}
 
 
 # ----------------------------------------------------------

@@ -60,9 +60,29 @@ def test_dry_run_is_default_and_emits_nothing(wired):
 def test_real_run_emits_per_solo_key_with_company_from_site(wired):
     conn, emitted = wired
     out = mod.lambda_handler({"index_backfill": {"dry_run": False}}, None)
-    assert out["emitted"] == 1 and out["skipped_groups"] == 1
+    assert out["emitted"] == 2 and out["failed"] == []
     assert emitted[0]["owner_company_id"] == "c1"
     assert emitted[0]["session_base"] == "Benl1_2026-07-06_10-00-00"
+    assert emitted[1]["session_base"] == "grpabc"       # groups go out; the embedder resolves members
+
+
+def test_one_failing_key_is_logged_listed_and_does_not_stop_the_rest(wired, monkeypatch, caplog):
+    conn, emitted = wired
+
+    def build(c, key, **kw):
+        if "grpabc" in key:
+            raise RuntimeError("boom")
+        return {"extraction_key": key, **kw}
+
+    monkeypatch.setattr(mod.index_request, "build", build)
+    monkeypatch.setattr(mod, "get_connection", lambda: conn)
+    rows_first_bad = list(reversed(ROWS))
+    monkeypatch.setitem(globals(), "ROWS", rows_first_bad)
+    with caplog.at_level("ERROR"):
+        out = mod.lambda_handler({"index_backfill": {"dry_run": False}}, None)
+    assert out["failed"] == ["extractions/Ben_X/2026-07-06/grpabc.json"]
+    assert out["emitted"] == 1 and len(emitted) == 1
+    assert "grpabc" in caplog.text
 
 
 def test_limit_is_capped_and_filters_bind(wired):
