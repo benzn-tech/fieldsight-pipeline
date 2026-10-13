@@ -1,6 +1,8 @@
 // voice_llm/history.mjs -- ElevenLabs messages -> the Ask history shape.
 // Our opener/restatement is a PREFIX of each assistant turn ending in "...";
 // keep-alive spaces pad it. Both are ours, not answers (spec §4, review #10).
+// A failed turn's FALLBACK line is ours too and is dropped the same way.
+import { FALLBACK } from "./stream.mjs";
 const text = (c) => typeof c === "string" ? c
   : Array.isArray(c) ? c.map((p) => typeof p === "string" ? p : p?.text || "").join(" ") : "";
 const stripOurs = (s) => {
@@ -20,7 +22,7 @@ export function toHistory(messages) {
     if (m.role === "user") pending = text(m.content).trim();
     else if (pending !== null) {
       const answer = stripOurs(text(m.content));
-      if (answer) history.push({ question: pending, answer });
+      if (answer && answer !== FALLBACK) history.push({ question: pending, answer });
       pending = null;
     }
   }
