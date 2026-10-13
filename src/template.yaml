@@ -1538,7 +1538,7 @@ Resources:
           # QWEN_API_KEY / QWEN_BASE_URL), so Node hits the same endpoint.
           OPENROUTER_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           OPENROUTER_BASE_URL: !Ref QwenBaseUrl
-          VOICE_LLM_PROBES: 'true'
+          VOICE_LLM_PROBES: 'false'
           VOICE_RESTATE_ENABLED: 'false'
       Policies:
         - LambdaInvokePolicy:
@@ -2426,7 +2426,7 @@ Resources:
       Environment:
         Variables:
           ENABLE_TODO_COLLAPSE: !Ref EnableTodoCollapse
-          VOICE_SESSION_SIGNING_KEY: !If [HasVoiceLlm, !Ref VoiceSessionSigningKey, '']
+          VOICE_SESSION_SIGNING_KEY: !If [HasVoiceLlm, !Ref VoiceSessionSigningKey, !Ref AWS::NoValue]
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"

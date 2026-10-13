@@ -4,8 +4,8 @@
 const text = (c) => typeof c === "string" ? c
   : Array.isArray(c) ? c.map((p) => typeof p === "string" ? p : p?.text || "").join(" ") : "";
 const stripOurs = (s) => {
-  const i = s.indexOf("...");
-  return (i >= 0 ? s.slice(i + 3) : s).replace(/\s+/g, " ").trim();
+  const m = /\.\.\.|…/.exec(s);
+  return (m ? s.slice(m.index + m[0].length) : s).replace(/\s+/g, " ").trim();
 };
 
 export function toHistory(messages) {

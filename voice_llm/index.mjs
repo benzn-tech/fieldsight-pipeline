@@ -27,13 +27,12 @@
 //   "hold N"   -> NOTHING for N seconds, then everything. Finds ElevenLabs'
 //                 first-token wait limit, which its docs do not state.
 
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { verifyVoiceSession } from "./token.mjs";
 import { createTurnStream, OPENER, FALLBACK } from "./stream.mjs";
 import { toHistory } from "./history.mjs";
 import { streamAnswer } from "./answer.mjs";
 
-const BEARER = process.env.VOICE_LLM_BEARER || "";
 const MAX_PROBE_SECONDS = 60;
 
 // ElevenLabs' documented buffer-words form: an ellipsis AND a trailing space.
@@ -72,7 +71,7 @@ export const LONG_RESTATEMENT =
   "Got it, you're asking when the Unit 11 backfill has to be finished and who is doing the trench work for the Hanlon plumbing, let me check... ";
 
 export function parseProbe(text) {
-  const m = /\b(delay|hold)\s+(\d{1,3})((?:\s+(?:ka|sp|p|l|n|w)\b)*)/i.exec(text || "");
+  const m = /^\s*(delay|hold)\s+(\d{1,3})((?:\s+(?:ka|sp|p|l|n|w))*)\s*$/i.exec(text || "");
   if (!m) return { kind: "normal", seconds: 0, flags: [] };
   const flags = (m[3] || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
   return { kind: m[1].toLowerCase(), seconds: Math.min(Number(m[2]), MAX_PROBE_SECONDS), flags };
@@ -109,11 +108,20 @@ export function chunk(id, created, content, { first = false, finish = null } = {
 // Function URLs lower-case header names, so both are read lower-cased.
 export const KEY_HEADER = "x-voice-llm-key";
 
+// Length-checked timingSafeEqual (same approach as token.mjs); it throws on
+// unequal lengths, so those are rejected first.
+function safeEqual(a, b) {
+  const x = Buffer.from(String(a)), y = Buffer.from(String(b));
+  return x.length === y.length && timingSafeEqual(x, y);
+}
+
 export function authorised(headers) {
-  if (!BEARER) return false;  // an unconfigured shell refuses everyone
+  const bearer = process.env.VOICE_LLM_BEARER || "";
+  if (!bearer) return false;  // an unconfigured shell refuses everyone
   const h = lowerKeys(headers);
-  if ((h.authorization || "") === `Bearer ${BEARER}`) return true;
-  return (h[KEY_HEADER] || "") === BEARER;
+  const viaAuth = safeEqual(h.authorization || "", `Bearer ${bearer}`);
+  const viaKey = safeEqual(h[KEY_HEADER] || "", bearer);
+  return viaAuth || viaKey;
 }
 
 function lowerKeys(headers) {
@@ -159,9 +167,11 @@ export function parseAskResult(payload) {
 
 // Real Ask invoke. The SDK ships with the Node runtime but not locally or in
 // CI, so it is loaded here, never at the top of the module.
+let lambdaClient = null;
 async function defaultInvokeAsk(payload, { signal } = {}) {
   const { LambdaClient, InvokeCommand } = await import("@aws-sdk/client-lambda");
-  const res = await new LambdaClient({}).send(new InvokeCommand({
+  lambdaClient ||= new LambdaClient({});
+  const res = await lambdaClient.send(new InvokeCommand({
     FunctionName: process.env.ASK_AGENT_FUNCTION,
     InvocationType: "RequestResponse",
     Payload: Buffer.from(JSON.stringify(payload)),
@@ -243,14 +253,16 @@ export async function handle(event, responseStream, deps = {}) {
   turn.text(OPENER);  // before any await: ElevenLabs drops a turn after ~4 s of silence
 
   const extra = body.elevenlabs_extra_body || {};
-  const { question, history } = toHistory(body.messages);
   const log = { evt: "voice_llm_turn", sub_hash: null, outcome: "error", invoke_ms: null,
     first_answer_token_ms: null, answer_chars: 0, chunk_ids: [], rewritten: null,
-    history_turns: history.length, kind: null,
-    retry_suspected: retrySuspected(text, Array.isArray(body.messages) ? body.messages.length : 0, tArrive) };
+    history_turns: null, kind: null, retry_suspected: null };
   const turnAbort = new AbortController();
   const guard = setTimeout(() => { log.outcome = "turn_guard"; turnAbort.abort(); turn.finish(); }, TURN_GUARD_MS);
   try {
+    // Inside the try: a throw here must still give FALLBACK and [DONE].
+    const { question, history } = toHistory(body.messages);
+    log.history_turns = history.length;
+    log.retry_suspected = retrySuspected(text, Array.isArray(body.messages) ? body.messages.length : 0, tArrive);
     const sub = verifyVoiceSession(extra.voice_session, key, nowSeconds());
     if (!sub) { log.outcome = "bad_token"; return turn.fail(FALLBACK); }
     log.sub_hash = createHmac("sha256", key).update(sub).digest("hex").slice(0, 12);

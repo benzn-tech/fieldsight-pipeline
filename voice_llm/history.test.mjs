@@ -48,3 +48,21 @@ test("an assistant turn with no ellipsis keeps its whole text", () => {
   ]);
   assert.deepEqual(r.history, [{ question: "q1", answer: "Friday." }]);
 });
+
+test("recognises the Unicode ellipsis as the end of our prefix", () => {
+  const r = toHistory([
+    { role: "user", content: "q1" },
+    { role: "assistant", content: "Got it, let me check that\u2026 Friday." },
+    { role: "user", content: "q2" },
+  ]);
+  assert.deepEqual(r.history, [{ question: "q1", answer: "Friday." }]);
+});
+
+test("splits at whichever ellipsis comes first", () => {
+  const r = toHistory([
+    { role: "user", content: "q1" },
+    { role: "assistant", content: "Checking\u2026 Friday... maybe." },
+    { role: "user", content: "q2" },
+  ]);
+  assert.deepEqual(r.history, [{ question: "q1", answer: "Friday... maybe." }]);
+});

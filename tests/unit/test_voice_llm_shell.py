@@ -109,14 +109,14 @@ def test_the_voice_function_reaches_ask_and_the_model_vendor():
     assert ("OPENROUTER_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, "
             "!Ref DashScopeApiKey]") in block
     assert "OPENROUTER_BASE_URL: !Ref QwenBaseUrl" in block
-    assert "VOICE_LLM_PROBES: 'true'" in block
+    assert "VOICE_LLM_PROBES: 'false'" in block
     assert "VOICE_RESTATE_ENABLED: 'false'" in block
     assert re.search(r"LambdaInvokePolicy:\s*\n\s*FunctionName: !Ref AskAgentFunction", block)
 
 
 def test_org_api_gets_the_signing_key_only_where_the_endpoint_exists():
     block = _block("OrgApiFunction")
-    assert "VOICE_SESSION_SIGNING_KEY: !If [HasVoiceLlm, !Ref VoiceSessionSigningKey, '']" in block
+    assert "VOICE_SESSION_SIGNING_KEY: !If [HasVoiceLlm, !Ref VoiceSessionSigningKey, !Ref AWS::NoValue]" in block
 
 
 def test_test_passes_the_signing_key_from_its_own_secret():

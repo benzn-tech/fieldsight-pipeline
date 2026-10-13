@@ -271,7 +271,8 @@ test("a malformed body is a 400, not a crash", async () => {
 
 test("probes are parsed from the last user message only", () => {
   assert.deepEqual(mod.parseProbe("hold 20"), { kind: "hold", seconds: 20, flags: [] });
-  assert.deepEqual(mod.parseProbe("please Delay 5 thanks"), { kind: "delay", seconds: 5, flags: [] });
+  assert.deepEqual(mod.parseProbe("please Delay 5 thanks"), { kind: "normal", seconds: 0, flags: [] }, "anchored to the whole message");
+  assert.deepEqual(mod.parseProbe("Delay 5"), { kind: "delay", seconds: 5, flags: [] });
   assert.deepEqual(mod.parseProbe("hold 999"), { kind: "hold", seconds: 60, flags: [] }, "capped");
   assert.deepEqual(mod.parseProbe("what is the backfill date"), { kind: "normal", seconds: 0, flags: [] });
   assert.deepEqual(mod.parseProbe("delay 8 ka p"), { kind: "delay", seconds: 8, flags: ["ka", "p"] });
@@ -332,4 +333,57 @@ test("the 30 s turn guard ends the stream and aborts the OpenRouter fetch", asyn
     assert.equal(r.log.outcome, "turn_guard");
     assert.equal(r.spoken.replace(/ +/g, " ").trim(), (OPENER + "Start").replace(/ +/g, " ").trim(), "no fallback appended after speech");
   } finally { mock.timers.reset(); }
+});
+
+test("a natural sentence containing a probe phrase is a question, not a probe", () => {
+  for (const s of ["what was the delay 3 days on the pour?", "did we hold 4 crews on level two", "delay 3 days"]) {
+    assert.equal(mod.parseProbe(s).kind, "normal", s);
+  }
+  assert.deepEqual(mod.parseProbe("hold 4"), { kind: "hold", seconds: 4, flags: [] });
+  assert.deepEqual(mod.parseProbe("  Delay 2 KA  "), { kind: "delay", seconds: 2, flags: ["ka"] });
+});
+
+test("a real question containing 'delay 3 days' still runs the real flow with probes on", async () => {
+  process.env.VOICE_LLM_PROBES = "true";
+  try {
+    const d = deps({ invokeAsk: async () => askReply({ kind: "answer", answer: "Two days." }) });
+    const r = await run(turnEvent({ messages: [{ role: "user", content: "what was the delay 3 days on the pour?" }] }), d);
+    assert.equal(r.log.outcome, "answered");
+    assert.equal(r.log.probe, undefined);
+  } finally { delete process.env.VOICE_LLM_PROBES; }
+});
+
+test("authorised: same-length wrong, wrong-length, right, for both headers; empty bearer refuses all", () => {
+  const ok = (h) => mod.authorised(h);
+  assert.equal(ok({ authorization: "Bearer test-bearer" }), true);
+  assert.equal(ok({ Authorization: "Bearer test-bearer" }), true);
+  assert.equal(ok({ "x-voice-llm-key": "test-bearer" }), true);
+  assert.equal(ok({ authorization: "Bearer test-bearex" }), false, "same length, wrong value");
+  assert.equal(ok({ "x-voice-llm-key": "test-bearex" }), false, "same length, wrong value");
+  assert.equal(ok({ authorization: "Bearer test-bearer-longer" }), false);
+  assert.equal(ok({ "x-voice-llm-key": "test" }), false);
+  assert.equal(ok({ authorization: "test-bearer" }), false, "no Bearer prefix");
+  assert.equal(ok({}), false);
+  assert.equal(ok(undefined), false);
+  const saved = process.env.VOICE_LLM_BEARER;
+  process.env.VOICE_LLM_BEARER = "";
+  try {
+    assert.equal(ok({ authorization: "Bearer " }), false);
+    assert.equal(ok({ "x-voice-llm-key": "" }), false);
+    assert.equal(ok({}), false);
+  } finally { process.env.VOICE_LLM_BEARER = saved; }
+});
+
+test("a throw while preparing the turn (after the opener) still ends in FALLBACK and [DONE]", async () => {
+  // retrySuspected keys its Map by a sha256 hex digest; make that write throw.
+  const realSet = Map.prototype.set;
+  Map.prototype.set = function (k, v) {
+    if (typeof k === "string" && /^[0-9a-f]{64}$/.test(k)) throw new Error("boom");
+    return realSet.call(this, k, v);
+  };
+  let r;
+  try { r = await run(turnEvent(), deps()); } finally { Map.prototype.set = realSet; }
+  assert.equal(r.events.at(-1), "[DONE]");
+  assert.ok(r.spoken.includes(FALLBACK));
+  assert.equal(r.log.outcome, "error");
 });
