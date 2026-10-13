@@ -4,8 +4,9 @@ from repositories.search_sql import build_latest_date_sql, build_search_sql  # r
 
 __all__ = ["build_search_sql", "build_latest_date_sql", "insert_chunk", "search_chunks",
            "latest_visible_date",
-           "delete_chunks_for_source", "delete_chunks_for_topic",
-           "archive_chunks_for_session", "restore_chunks_for_batch",
+           "delete_chunks_for_source", "delete_chunks_for_sources", "delete_chunks_for_topic",
+           "archive_chunks_for_session", "archive_chunks_for_sources",
+           "restore_chunks_for_batch",
            "SESSION_CHUNK_PREDICATE"]
 
 # Which chunks belong to one recording.
@@ -60,7 +61,8 @@ def insert_chunk(conn, site_id, report_date, chunk_type, chunk_text, embedding, 
 
 
 def search_chunks(conn, query_embedding, accessible_site_ids, k=5,
-                  date_from=None, date_to=None, author_ids=None, query_text="") -> list[dict]:
+                  date_from=None, date_to=None, author_ids=None, query_text="",
+                  source_family=None) -> list[dict]:
     """Vector + keyword search, unioned (Task 3, 2026-09-20 spec: "a literal
     token is findable"). Every returned row now carries `lexical_hit: bool` --
     True for a row the keyword arm found (its `distance` is NULL, never a
@@ -85,11 +87,13 @@ def search_chunks(conn, query_embedding, accessible_site_ids, k=5,
         build_search_sql(),
         {"q": query_embedding, "q_text": query_text, "site_ids": list(accessible_site_ids), "k": k,
          "date_from": date_from, "date_to": date_to,
-         "author_ids": list(author_ids) if author_ids is not None else None},
+         "author_ids": list(author_ids) if author_ids is not None else None,
+         "source_family": source_family},
     ).fetchall()
 
 
-def latest_visible_date(conn, accessible_site_ids, *, author_ids=None, on_or_before=None):
+def latest_visible_date(conn, accessible_site_ids, *, author_ids=None, on_or_before=None,
+                        source_family=None):
     """The most recent report_date this caller can see, or None.
 
     Used only by Ask's widening step, so that "nothing yesterday" becomes "the
@@ -101,7 +105,8 @@ def latest_visible_date(conn, accessible_site_ids, *, author_ids=None, on_or_bef
         build_latest_date_sql(),
         {"site_ids": list(accessible_site_ids),
          "author_ids": list(author_ids) if author_ids is not None else None,
-         "on_or_before": on_or_before},
+         "on_or_before": on_or_before,
+         "source_family": source_family},
     ).fetchone()
     latest = (row or {}).get("latest")
     return latest.isoformat() if latest is not None else None
@@ -121,6 +126,21 @@ def delete_chunks_for_source(conn, source_s3_key) -> int:
         "DELETE FROM report_chunks WHERE source_s3_key=%s",
         (source_s3_key,),
     )
+    return cur.rowcount
+
+
+def delete_chunks_for_sources(conn, keys, company_id) -> int:
+    """Delete report_chunks rows produced from any of these source keys, inside one company.
+
+    The search-index apply replaces a session's chunks (and the chunks of the member
+    sessions a group pass supersedes) by their `source_s3_key`. `report_chunks` is shared
+    by every tenant and the keys arrive in an S3 object, so the delete is company-scoped
+    like the archive: a request can only ever remove its own company's rows."""
+    if not company_id:
+        raise ValueError("company_id is required: report_chunks is shared by every tenant")
+    cur = conn.execute(
+        f"DELETE FROM report_chunks WHERE source_s3_key = ANY(%(keys)s){COMPANY_SCOPE}",
+        {"keys": list(keys), "company_id": company_id})
     return cur.rowcount
 
 
@@ -173,6 +193,32 @@ def archive_chunks_for_session(conn, session_base, topic_ids, batch_id, *,
         f"WHERE {SESSION_CHUNK_PREDICATE}{COMPANY_SCOPE}", params)
     cur = conn.execute(
         f"DELETE FROM report_chunks WHERE {SESSION_CHUNK_PREDICATE}{COMPANY_SCOPE}", params)
+    return cur.rowcount
+
+
+def archive_chunks_for_sources(conn, keys, batch_id, *, company_id) -> int:
+    """Move the SESSION-family chunks of these extraction keys into `report_chunks_archive`.
+    Returns the row count.
+
+    Selects by `source_s3_key` only -- the session index stamps its chunks with the
+    extraction key, whereas report-family rows carry `reports/...`. Unlike
+    `archive_chunks_for_session` this never reaches a report-family row (prod reads that
+    family during rollout) nor another session's chunks that merely list this session's
+    base in `metadata.source_files` (a group's chunks list its members). The
+    `extractions/` guard keeps a malformed key from ever naming a report row.
+    Company-scoped like every delete on this shared table."""
+    keys = [k for k in (keys or []) if k]
+    if not keys:
+        raise ValueError("keys is required: an empty list selects nothing and hides a bug")
+    if not company_id:
+        raise ValueError("company_id is required: report_chunks is shared by every tenant")
+    pred = ("source_s3_key = ANY(%(keys)s) AND source_s3_key LIKE 'extractions/%%'"
+            + COMPANY_SCOPE)
+    params = {"keys": keys, "batch_id": batch_id, "company_id": company_id}
+    conn.execute(
+        f"INSERT INTO report_chunks_archive "
+        f"SELECT *, %(batch_id)s::uuid, now() FROM report_chunks WHERE {pred}", params)
+    cur = conn.execute(f"DELETE FROM report_chunks WHERE {pred}", params)
     return cur.rowcount
 
 
