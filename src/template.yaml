@@ -561,11 +561,20 @@ Parameters:
       1.58-1.72s against v3-conversational's 0.98-1.20s), which is inside the
       voice path's budget and buys a voice the customer recognises every time.
 
+      2026-10-14, owner decision: the default is now eleven_v4_turbo. TTS A/B,
+      105 renders, James voice: v4_turbo first audio 0.79-0.92s against
+      multilingual_v2's 1.76-2.74s (flash_v2_5 0.79s); pronunciation 40/40 on
+      v4_turbo. The owner blind-listened to 12 clips (4 per model, 2 renders
+      each) and judged every accent a steady New Zealand accent and the "..."
+      pause natural. The accent-drift risk that chose multilingual_v2 above is
+      non-deterministic and 4 v4_turbo clips is a small sample, so TEST ships
+      first and prod follows only after the owner listens on TEST.
+
       This matters ONLY for live renders. A bundled device prompt is a file:
       it is recorded once, listened to, and shipped byte for byte, so it
       cannot drift. A spoken answer is rendered on every question, so the
       model is the only place its steadiness can be decided.
-    Default: eleven_multilingual_v2
+    Default: eleven_v4_turbo
 
   ElevenLabsTtsSpeed:
     Type: String
@@ -578,13 +587,17 @@ Parameters:
       1.10 is the speed the owner auditioned and approved on James
       (2026-09-22), replacing 1.2.
 
+      2026-10-14, owner decision: 1.20, the ElevenLabs maximum, after the
+      owner listened to v4_turbo (see ElevenLabsTtsModel). This reverses the
+      2026-09-22 change from 1.2 to 1.10 at the owner's request.
+
       This number now ALWAYS reaches the vendor, including at 1.0.
       elevenlabs_utils used to omit voice_settings entirely at 1.0, which does
       not mean "the API default" -- it means "whatever this voice has saved in
       the ElevenLabs workspace", a web console no deploy can see. Measured the
       same day on James: no voice_settings gave 1.90s and 2.04s of audio,
       explicit 1.0 gave 2.18s and 2.23s.
-    Default: '1.10' 
+    Default: '1.20' 
 
   AskTtsProvider:
     Type: String
