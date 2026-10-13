@@ -110,7 +110,8 @@ def test_the_voice_function_reaches_ask_and_the_model_vendor():
             "!Ref DashScopeApiKey]") in block
     assert "OPENROUTER_BASE_URL: !Ref QwenBaseUrl" in block
     assert "VOICE_LLM_PROBES: 'false'" in block
-    assert "VOICE_RESTATE_ENABLED: 'false'" in block
+    assert "VOICE_RESTATE_ENABLED: 'true'" in block
+    assert "VOICE_RESTATE_MODEL: 'meta-llama/llama-3.1-8b-instruct'" in block
     assert re.search(r"LambdaInvokePolicy:\s*\n\s*FunctionName: !Ref AskAgentFunction", block)
 
 

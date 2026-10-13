@@ -32,6 +32,8 @@ import { verifyVoiceSession } from "./token.mjs";
 import { createTurnStream, OPENER, FALLBACK } from "./stream.mjs";
 import { toHistory } from "./history.mjs";
 import { streamAnswer } from "./answer.mjs";
+import { DEFAULT_MODEL as RESTATE_DEFAULT_MODEL, DEADLINE_MS as RESTATE_DEADLINE_MS, isCorrection, modelRejected,
+  assessRestatement, restateViaModel } from "./restate.mjs";
 
 const MAX_PROBE_SECONDS = 60;
 
@@ -211,11 +213,13 @@ const FIRST_TOKEN_MS = 5000;
 const RETRY_FIRST_TOKEN_MS = 8000;
 const retryable = (e) => e === "first_token_timeout" || /^http_5\d\d$/.test(e || "");
 const DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
+let reasoningModelLogged = false;
 
 export async function handle(event, responseStream, deps = {}) {
   const invokeAsk = deps.invokeAsk || defaultInvokeAsk;
   const fetchImpl = deps.fetchImpl || fetch;
   const answerStream = deps.streamAnswer || streamAnswer;
+  const restateCall = deps.restate || ((a) => restateViaModel({ ...a, fetchImpl }));
   const nowSeconds = deps.now || (() => Math.floor(Date.now() / 1000));
   const nowMs = deps.nowMs || Date.now;
   const tArrive = nowMs();
@@ -257,12 +261,64 @@ export async function handle(event, responseStream, deps = {}) {
     headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
   }));
   const turn = createTurnStream(out, { id: `chatcmpl-${tArrive}`, created: Math.floor(tArrive / 1000) });
-  turn.text(OPENER);  // before any await: ElevenLabs drops a turn after ~4 s of silence
-
   const extra = body.elevenlabs_extra_body || {};
+
+  // Restatement (VOICE_RESTATE_ENABLED=true): only for a turn whose token already
+  // verifies (synchronous), so an unauthenticated caller never costs a model call.
+  // Everything else, and the flag off, speaks OPENER before any await.
+  const restateOn = process.env.VOICE_RESTATE_ENABLED === "true";
+  const restateModel = process.env.VOICE_RESTATE_MODEL || RESTATE_DEFAULT_MODEL;
+  let restateReject = restateOn ? null : "disabled";
+  let restatePlan = null;
+  if (restateOn) {
+    if (modelRejected(restateModel)) {
+      restateReject = "reasoning_model";
+      if (!reasoningModelLogged) {
+        reasoningModelLogged = true;
+        console.log(JSON.stringify({ evt: "voice_llm_restate_model_rejected", model: restateModel }));
+      }
+    } else {
+      try {
+        const pre = toHistory(body.messages);
+        if (verifyVoiceSession(extra.voice_session, key, nowSeconds())) {
+          if (isCorrection(pre.question)) restateReject = "correction";
+          else if (!pre.question) restateReject = "error";
+          else restatePlan = { question: pre.question, prevQuestion: pre.history.at(-1)?.question };
+        }
+      } catch { restateReject = "error"; }
+    }
+  }
   const log = { evt: "voice_llm_turn", sub_hash: null, outcome: "error", invoke_ms: null,
     first_answer_token_ms: null, answer_chars: 0, chunk_ids: [], rewritten: null,
-    history_turns: null, kind: null, retry_suspected: null };
+    history_turns: null, kind: null, retry_suspected: null,
+    restate_used: false, restate_ms: null, restate_reject: restateReject };
+  // Resolves once the first real text (restatement or OPENER) is written; never rejects.
+  let opened = Promise.resolve();
+  if (restatePlan) {
+    turn.text(" ");  // starts the keep-alive while the model works; before any await
+    opened = (async () => {
+      const t0 = nowMs();
+      const ac = new AbortController();
+      let timer;
+      const deadline = new Promise((res) => {
+        timer = setTimeout(() => { ac.abort(); res({ error: "deadline" }); },
+          Math.max(0, RESTATE_DEADLINE_MS - (t0 - tArrive)));
+      });
+      const call = Promise.resolve().then(() => restateCall({ ...restatePlan, model: restateModel, apiKey,
+        baseUrl: process.env.OPENROUTER_BASE_URL || DEFAULT_BASE_URL, signal: ac.signal })).catch(() => ({ error: "error" }));
+      const r = await Promise.race([call, deadline]);
+      clearTimeout(timer);
+      log.restate_ms = nowMs() - t0;
+      const a = r && typeof r.middle === "string" ? assessRestatement(restatePlan.question, r.middle)
+        : { text: null, reason: r?.error || "error" };
+      log.restate_used = a.text !== null;
+      log.restate_reject = a.reason;
+      turn.text(a.text || OPENER);
+    })();
+  } else {
+    turn.text(OPENER);  // before any await: ElevenLabs drops a turn after ~4 s of silence
+  }
+
   const turnAbort = new AbortController();
   const guard = setTimeout(() => { log.outcome = "turn_guard"; turnAbort.abort(); turn.finish(); }, TURN_GUARD_MS);
   try {
@@ -284,9 +340,11 @@ export async function handle(event, responseStream, deps = {}) {
       log.invoke_ms = nowMs() - tInvoke;
       log.outcome = "invoke_failed";
       if (e instanceof InvokeTimeout) log.invoke_abandoned = true;
+      await opened;  // the fallback must follow the restatement, not precede it
       return turn.fail(FALLBACK);
     }
     log.invoke_ms = nowMs() - tInvoke;
+    await opened;  // answer text only after the opener or restatement is out
     if (!result) { log.outcome = "invoke_failed"; return turn.fail(FALLBACK); }
     log.kind = result.kind;
     log.rewritten = result.rewritten ?? null;
@@ -326,6 +384,7 @@ export async function handle(event, responseStream, deps = {}) {
     return turn.fail(FALLBACK);
   } catch {
     log.outcome = "error";
+    await opened;
     turn.fail(FALLBACK);
   } finally {
     clearTimeout(guard);
