@@ -329,6 +329,8 @@ jobs:
               "LlmReasoningEffortPlus=${{ vars.PROD_LLM_EFFORT_PLUS || 'high' }}" \
               "LlmReasoningEffortFast=${{ vars.PROD_LLM_EFFORT_FAST || 'low' }}" \
               "EnableRerank=${{ vars.PROD_ENABLE_RERANK || 'false' }}" \
+              "RerankTimeoutSeconds=${{ vars.PROD_RERANK_TIMEOUT_SECONDS || '3' }}" \
+              "RerankCandidateK=${{ vars.PROD_RERANK_CANDIDATE_K || '32' }}" \
               $QWEN_CHAT_KEY_PARAM \
               "EnableNonWorkExpiry=${{ vars.PROD_NONWORK_EXPIRY_ENABLED || 'false' }}" \
               "NonWorkExpiryHours=${{ vars.PROD_NONWORK_EXPIRY_HOURS || '24' }}" \
