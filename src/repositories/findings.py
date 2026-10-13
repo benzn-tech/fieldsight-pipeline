@@ -24,7 +24,7 @@ from deleted_predicates import visible_topics_predicate
 _COLS = ("id, topic_id, site_id, observation, domain, severity, entity_name, "
          "entity_trade, recommended_action, programme_task_id, impact_severity, "
          "impact_note, impact_task_name, impact_evidence, impact_matched_at, "
-         "status, created_at")
+         "status, created_at, item_id")
 
 _VALID_DOMAINS = {"safety", "quality", "progress"}
 _VALID_SEVERITIES = {"none", "minor", "major"}
@@ -53,7 +53,11 @@ def insert_findings(conn, topic_id, site_id, findings: list[dict]) -> list[dict]
 
     Impact columns (programme_task_id, impact_*) are left NULL here --
     they're filled later by apply_impact, downstream of the matcher/writer
-    hop (D2 of the plan). Empty findings -> [] with no query executed."""
+    hop (D2 of the plan). Empty findings -> [] with no query executed.
+
+    item_id (migration 0076) is the extractor's own lineage id, already cleaned to
+    NULL for anything malformed or duplicated (item_continuity.clean_item_ids, called
+    by the writer before this function runs) -- passed straight through here."""
     if not findings:
         return []
     cur = conn.cursor(row_factory=dict_row)
@@ -64,12 +68,13 @@ def insert_findings(conn, topic_id, site_id, findings: list[dict]) -> list[dict]
             entity = {}
         rows.append(cur.execute(
             f"INSERT INTO findings (topic_id, site_id, observation, domain, severity, "
-            f"entity_name, entity_trade, recommended_action) "
-            f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING {_COLS}",
+            f"entity_name, entity_trade, recommended_action, item_id) "
+            f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING {_COLS}",
             (topic_id, site_id, f.get("observation"),
              _clean_enum(f.get("domain"), _VALID_DOMAINS),
              _clean_enum(f.get("severity"), _VALID_SEVERITIES),
-             entity.get("name"), entity.get("trade"), f.get("recommended_action")),
+             entity.get("name"), entity.get("trade"), f.get("recommended_action"),
+             f.get("item_id")),
         ).fetchone())
     return rows
 
@@ -92,6 +97,22 @@ def apply_impact(conn, finding_id, *, task_id, impact_severity, impact_note,
     ).fetchone()
 
 
+def get_stable_id(conn, finding_id):
+    """The stable_id of one finding row (Track B Task 6a). The matcher
+    (src/lambda_programme_matcher.py) only ever carries the ROW id --
+    `findings.id`, via the match_requests/ artifact's `finding_id` field
+    (lambda_item_writer's `collected_topics` never puts `stable_id` in it)
+    -- because it is deliberately non-VPC (BUG-36, no Aurora egress) and
+    cannot resolve id -> stable_id itself. This in-VPC writer resolves it
+    here, in SQL, before writing a programme_impact decision record.
+
+    None when the finding row no longer exists -- nightly supersession or
+    a re-extraction racing in between the matcher's read and this write
+    (same posture as `apply_impact`), or a malformed id."""
+    row = conn.execute("SELECT stable_id FROM findings WHERE id=%s", (finding_id,)).fetchone()
+    return row[0] if row else None
+
+
 def list_for_topics(conn, topic_ids) -> list[dict]:
     """Batched read of findings for a set of topic ids -- mirrors
     topics.list_topics_for_date's action_items/safety_observations children
@@ -103,8 +124,52 @@ def list_for_topics(conn, topic_ids) -> list[dict]:
     ).fetchall()
 
 
+def list_for_carry_forward(conn, topic_ids, site_id) -> list[dict]:
+    """Findings on a set of topics -- new OR retired -- shaped for Track B Task 4's
+    carry_forward.match: `id`, `text` (the finding's `observation`), `stable_id` plus a
+    computed `human_touched`. Batched with ANY(%s); scoped to `site_id` (Ruling R9) so a
+    stray topic id can never pull another tenant's -- or another site's -- rows into the
+    match pool. Named `list_for_carry_forward` rather than reusing `list_for_topics` above:
+    that function already has callers reading a different column set for a different job
+    (rendering a topic's children), and this one's `human_touched`/`text` shape is specific
+    to the matcher.
+
+    human_touched = status <> 'open' -- findings carry no updated_by column (unlike action
+    items), so a status flip is the only footprint a person's decision leaves on the row.
+    For a freshly-inserted row (the "new" pool) this is always False.
+    """
+    if not topic_ids:
+        return []
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, topic_id, observation AS text, stable_id, status, audience, item_id, "
+        "(status <> 'open') AS human_touched "
+        "FROM findings WHERE topic_id = ANY(%s) AND site_id = %s",
+        (list(topic_ids), site_id),
+    ).fetchall()
+
+
+def carry_identity(conn, new_id, old_row) -> None:
+    """Carry `old_row`'s stable identity onto the new finding `new_id` that replaced it
+    (Track B Task 4). Always moves stable_id/carried_from; when the old row was
+    human-touched, also moves status/audience -- the only two columns a human can set on a
+    finding. `kind`/`payload` always come from the fresh extraction and the impact_* columns
+    are re-derived downstream by the programme matcher -- neither is ever copied here."""
+    if old_row.get("human_touched"):
+        conn.execute(
+            "UPDATE findings SET stable_id=%s, carried_from=%s, status=%s, audience=%s "
+            "WHERE id=%s",
+            (old_row["stable_id"], old_row["id"], old_row["status"], old_row["audience"],
+             new_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE findings SET stable_id=%s, carried_from=%s WHERE id=%s",
+            (old_row["stable_id"], old_row["id"], new_id),
+        )
+
+
 def count_by_domain(conn, company_id, domain, date_from, date_to,
-                    site_ids=None, author_ids=None) -> dict:
+                    site_ids=None, author_ids=None, external_site_ids=()) -> dict:
     """How many safety- or quality-domain items in a date range.
 
     FINDINGS FIRST, `safety_observations` SECOND, PER TOPIC -- the same rule the
@@ -162,7 +227,8 @@ def count_by_domain(conn, company_id, domain, date_from, date_to,
         # ANDing the caller's own company onto a cross-company site set matched
         # nothing, and `has_topics_in_range` scopes by site alone, so the two
         # disagreed and a platform_admin was told there were notes and no items.
-        "  WHERE (%(company)s::uuid IS NULL OR s.company_id = %(company)s)"
+        "  WHERE (%(company)s::uuid IS NULL OR s.company_id = %(company)s"
+        + (" OR t.site_id = ANY(%(ext_sites)s::uuid[])" if external_site_ids else "") + ")"
         "    AND t.report_date BETWEEN %(from)s AND %(to)s"
         "    AND (%(site_ids)s::uuid[] IS NULL OR t.site_id = ANY(%(site_ids)s::uuid[]))"
         "    AND " + visible_topics_predicate("t") +
@@ -193,7 +259,8 @@ def count_by_domain(conn, company_id, domain, date_from, date_to,
         " FROM counted",
         {"company": company_id, "domain": domain, "from": date_from, "to": date_to,
          "site_ids": list(site_ids) if site_ids is not None else None,
-         "authors": list(author_ids) if author_ids is not None else None},
+         "authors": list(author_ids) if author_ids is not None else None,
+         **({"ext_sites": [str(x) for x in external_site_ids]} if external_site_ids else {})},
     ).fetchone()
     # SUM() over bigint returns numeric, which psycopg hands back as Decimal, and
     # json.dumps has no encoder for Decimal. These numbers go straight into an

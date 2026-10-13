@@ -501,6 +501,55 @@ def _frames(audio, sr):
     return [f for _, f in _frames_at(audio, sr)]
 
 
+# How long one frame is when measuring recording conditions -- deliberately NOT
+# FRAME_SECONDS (the homogeneity guard's 5 s frame): a homogeneity frame answers "does this
+# much audio sound like one voice", a condition frame answers "how loud is the quietest
+# stretch inside this window", and 50 ms is short enough that a quiet word gap inside an
+# otherwise loud window gets its own frame rather than being averaged into the speech
+# around it.
+CONDITION_FRAME_SECONDS = 0.05
+
+# The percentile of frame loudness treated as "the noise floor" rather than "the quietest
+# instant" -- one frame of silence between two words is not a measurement of the room.
+NOISE_PERCENTILE = 10
+
+
+def _recording_conditions(clip, sr):
+    """level_dbfs, noise_dbfs and snr_db for the EXACT window this function is handed.
+
+    Design 2026-09-30 (step 1 of 3, "condition-aware profiles"). Measured on the 42
+    owner-labelled clips: signal-to-noise ratio vs match score has Spearman rho +0.76 for
+    Ben Lin's genuine clips (+0.63 after removing the effect of clip length); background
+    noise alone is rho -0.70. Without these numbers on the sample row, step 2 ("does a
+    profile need a sample per condition") and step 3 ("condition-matched comparison") cannot
+    be measured on live data.
+
+    Computed HERE, on the embedder side, because this module already imports numpy and the
+    in-VPC writer deliberately does not (test_writer_needs_no_numpy.py) -- giving the writer
+    a numpy dependency for three scalars would repeat the mistake `_agreement` made once
+    already, when it imported `voiceprint_utils` for one dot product and died with
+    `ModuleNotFoundError` on every invocation.
+
+    `level_dbfs` is the whole window's RMS in dBFS. `noise_dbfs` is the NOISE_PERCENTILE-th
+    percentile of CONDITION_FRAME_SECONDS frame RMS, also in dBFS -- computed directly on
+    the per-frame dBFS values `_dbfs` already knows how to produce (percentile commutes
+    with the monotonic dB transform, so there is no second RMS-then-dBFS conversion to keep
+    in sync with the first). A window shorter than one condition frame is judged on itself
+    as a single frame, so `noise_dbfs` equals `level_dbfs` and `snr_db` is 0 -- the correct
+    answer for a window this function cannot subdivide, not a special case to guard against.
+    """
+    clip = np.asarray(clip, dtype=np.float32)
+    level_dbfs = _dbfs(clip)
+    step = max(1, int(CONDITION_FRAME_SECONDS * sr))
+    frames = [clip[i:i + step] for i in range(0, len(clip), step)]
+    frames = [f for f in frames if len(f)] or [clip]
+    frame_dbfs = [_dbfs(f) for f in frames]
+    noise_dbfs = float(np.percentile(frame_dbfs, NOISE_PERCENTILE))
+    return {"level_dbfs": round(level_dbfs, 2),
+            "noise_dbfs": round(noise_dbfs, 2),
+            "snr_db": round(level_dbfs - noise_dbfs, 2)}
+
+
 def _tightest_pair(frames, embs, sr):
     """The two ADJACENT frames that disagree least, as `(start_sample, end_sample)`.
 
@@ -527,8 +576,14 @@ def _tightest_pair(frames, embs, sr):
     step = int(FRAME_SECONDS * sr)
     best, best_spread = None, None
     for i in range(len(frames) - 1):
-        if frames[i + 1][0] != frames[i][0] + step:
-            continue                      # a silent frame was dropped between them
+        # A GAP means a silent frame was dropped between them, and joining them would store
+        # a splice. An OVERLAP is not a gap: `_frames_at` aligns its last frame to the end
+        # of the clip, so the final pair usually overlaps by a second or two, and it is
+        # continuous audio. Requiring exact spacing threw that pair away -- on prod
+        # 2026-10-01 a 13.7 s self-introduction was refused at 0.434 while its tail pair
+        # agreed at 0.274.
+        if frames[i + 1][0] > frames[i][0] + step:
+            continue
         spread = vp.frame_spread([embs[i], embs[i + 1]])
         if spread is None:
             continue
@@ -606,7 +661,8 @@ def _enrol(event):
             "s3_key": key, "window": [start, end],
             "created_by": event.get("created_by"),
             "correction_ref": event.get("correction_ref"),
-            "admitted_max_spread": _admitted_limit()}
+            "admitted_max_spread": _admitted_limit(),
+            **_recording_conditions(clip, sr)}
 
 
 def _match(event):
@@ -615,9 +671,20 @@ def _match(event):
     # withdrawn profile that still matches is not a withdrawal. Duplicating that filter
     # here would be a second place for it to be forgotten.
     profiles = event.get("profiles") or []
+    # This company's calibrated rejection floor, or None if it has not crossed the
+    # minimum source='correction' sample count yet (repositories.voiceprints.
+    # company_floor). It travels on the event rather than being read here because this
+    # function is non-VPC and cannot reach Aurora -- the writer's `_profiles` reads it
+    # once per invocation and hands it across with the vectors.
+    floor = event.get("company_floor")
     by_key = {}
     for p in profiles:
         by_key.setdefault(p["person_key"], p)
+    # Who is on site today (on-site-roster plan, Task 4). Built from whatever the profiles
+    # actually carry -- absent on every profile, or True on none of them, both collapse to
+    # an empty set, and `decide_with_roster` treats an empty set as "no roster to narrow
+    # with": exactly today's behaviour (spec consumer 1, "narrows, never blocks").
+    on_roster = {p["person_key"] for p in profiles if p.get("on_roster") is True}
 
     results = []
     for turn in event.get("turns") or []:
@@ -635,7 +702,8 @@ def _match(event):
         v = embed_audio(clip, sr)
         rows = [{"person_key": p["person_key"],
                  "score": vp.cosine(v, p["embedding"])} for p in profiles]
-        d = vp.decide_name(vp.aggregate_scores(rows), duration_s=duration)
+        d = vp.decide_with_roster(vp.aggregate_scores(rows), on_roster,
+                                  duration_s=duration, floor=floor)
         status = d.status
         if status == "confirmed" and by_key.get(d.name, {}).get("status") == "tentative":
             # (see below) a profile that has not earned confirmation cannot hand one out —
@@ -644,6 +712,11 @@ def _match(event):
             # A profile that has not earned confirmation cannot hand one out.
             status = "tentative"
         results.append({"turn": turn, "status": status, "name": d.name,
+                        # The winner's own similarity. The writer has always asked for it
+                        # (`score=r.get("score")`); until now nothing put it here, so
+                        # `speaker_turn_names.score` was NULL on every row and the floor
+                        # this score calibrates could never be computed from it.
+                        "score": d.score,
                         "margin": d.margin, "reason": d.reason})
     return {"session": event.get("session"), "results": results}
 
@@ -870,7 +943,8 @@ def _admit_harvest(folder, date, candidates):
         # internally consistent.
         admitted.append({"embedding": [float(x) for x in embed_audio(clip, sr)],
                          "s3_key": key, "window": [start, end],
-                         "admitted_max_spread": _admitted_limit()})
+                         "admitted_max_spread": _admitted_limit(),
+                         **_recording_conditions(clip, sr)})
         # The budget counts what is STORED, not what was offered. Charging a 60 s allowance
         # the full turn length would spend it in one member and call the rest a cap.
         seconds += end - start
@@ -975,6 +1049,16 @@ def _rebind(req):
     rows = [{"source_filename": keys[i][0], "speaker_label": keys[i][1],
              "group_label": chr(ord("A") + assignment[i]),
              "spread": spreads[i],
+             # The vector this grouping was decided on, kept rather than discarded (0065).
+             # It is the only stored summary of what a PASSAGE sounds like, and without it
+             # "which past passages sound like this person" costs a re-read and a re-embed
+             # of the audio -- about 4s per cluster, growing with how busy the customer is.
+             # `tolist()` because it crosses a JSON hop to the in-VPC writer.
+             "centroid": centroids[i].tolist(),
+             # Where and when, kept for the same reason as the centroid (0068): the
+             # correction path addresses a session as (folder, date, session_base), and
+             # without these a cluster cannot be turned into a proposal anybody can answer.
+             "user_folder": folder, "session_date": date,
              "turns": evidence[i][0], "seconds": evidence[i][1]}
             for i in range(len(keys))]
     logger.info("rebind: %d (call,label) pairs -> %d groups at similarity %.2f",
@@ -1055,6 +1139,7 @@ def _from_request_artifact(bucket, key):
     # window is one person; storing that same vector as somebody's profile would be
     # disbelieving it in one direction and acting on it in the other.
     enrol = req.get("enrol")
+    conditions = {}
     if enrol:
         # Through the SAME helper as `op=enrol`. A correction names a turn, and under
         # batching a turn is a whole chunk — so this is the site where a 109 s window
@@ -1105,6 +1190,9 @@ def _from_request_artifact(bucket, key):
             logger.info("enrolment accepted (frames=%d spread=%s limit=%.2f)%s", len(frames),
                         "n/a" if spread is None else "%.3f" % spread, MAX_FRAME_SPREAD,
                         _limit_note())
+            # Measured on the window that was actually accepted -- post-narrowing, the same
+            # `clip` the vector above was re-embedded from. Design 2026-09-30 step 1.
+            conditions = _recording_conditions(clip, sr)
     # AFTER the anchor's own checks, never before. `_propagate` runs first, so without this
     # ordering six samples would be stored for a profile whose own corrected window had just
     # been judged to hold two voices — the exact condition one sample is refused for.
@@ -1131,7 +1219,8 @@ def _from_request_artifact(bucket, key):
                     "embedding": [float(x) for x in v],
                     "s3_key": s3_key, "window": [start, end],
                     "created_by": req.get("requested_by"),
-                    "admitted_max_spread": _admitted_limit()} if enrol else None)),
+                    "admitted_max_spread": _admitted_limit(),
+                    **conditions} if enrol else None)),
         # A LIST, and a separate key. Not the same act as the anchor: the anchor is what a
         # person vouched for, these are what the clustering suggested, and the two
         # populations must stay separable forever — for audit, for measurement, and so a bad
@@ -1196,8 +1285,21 @@ def _from_match_artifact(bucket, key):
             f"match artifact {key} is missing company_id/user_folder/date/session_base; the "
             f"producer has all four and guessing any of them reads a key that cannot exist")
 
-    profiles = invoke_writer({"op": "profiles", "company_id": company_id,
-                              "site_id": req.get("site_id")}).get("profiles") or []
+    profiles_request = {"op": "profiles", "company_id": company_id,
+                        "site_id": req.get("site_id"), "date": date}
+    # Project-owned tenancy P5: an external recorder on this company's site. The writer
+    # builds candidates = this company's enrolled prints + the recorder's own. Absent on
+    # home-site and older requests, which are then sent exactly as before.
+    if req.get("home_company_id"):
+        profiles_request["home_company_id"] = req.get("home_company_id")
+        profiles_request["recorder_user_id"] = req.get("recorder_user_id")
+    profiles_reply = invoke_writer(profiles_request)
+    profiles = profiles_reply.get("profiles") or []
+    # The company's calibrated rejection floor, read once here (not per turn) and passed
+    # to `_match` below -- dropping it on this hop would leave a calibrated floor sitting
+    # in the database doing nothing, since this S3-triggered path is the one production
+    # actually runs the matcher through.
+    company_floor_value = profiles_reply.get("company_floor")
     if not profiles:
         # Not an error, and worth a line rather than a silent zero: "nobody was recognised"
         # and "there was nobody to recognise" look identical downstream, and on TEST the
@@ -1232,7 +1334,8 @@ def _from_match_artifact(bucket, key):
         return {"session": session, "matched": 0, "profiles": 0, "mode": req.get("mode")}
 
     out = _match({"session": session, "user_folder": folder, "date": date,
-                  "profiles": profiles, "turns": req.get("turns") or []})
+                  "profiles": profiles, "turns": req.get("turns") or [],
+                  "company_floor": company_floor_value})
 
     by_key = {p["person_key"]: p for p in profiles}
     named = []
@@ -1240,18 +1343,18 @@ def _from_match_artifact(bucket, key):
     for r in out["results"]:
         if r.get("status") not in ("confirmed", "tentative") or not r.get("name"):
             continue
-        if r.get("margin") is None:
-            # No runner-up: `decide_name` returns a name with a null margin when the pool
-            # holds ONE profile, meaning "the closest of the only person I know". Written to
-            # a transcript that reads as an identification, and it would land on every turn
-            # in the meeting including the other speakers' — the one enrolled name spread
-            # over everybody, which is worse than no name at all.
-            #
-            # Matching needs at least two profiles before it can say anything. That is not a
-            # tuning choice: with overlapping score distributions and no usable absolute
-            # threshold, one candidate cannot be told from a stranger.
+        if r.get("margin") is None and r.get("status") != "tentative":
+            # No runner-up (one enrolled person) and yet not a lean: nothing in
+            # `decide_name` produces that, so refuse it rather than write a confident name
+            # nobody can have earned.
             skipped_no_runner_up += 1
             continue
+        # A null margin WITH `tentative` is the one-person case, and it is written. It used
+        # to be dropped here unconditionally, because then `decide_name` offered the single
+        # enrolled person for every turn above 0.35 -- the other speakers' too. It now does
+        # so only above `DEFAULT_SINGLE_CANDIDATE_FLOOR` (measured), and only as a lean, so
+        # dropping it meant a one-person company was never recognised at all: TEST logged
+        # "named 0 of N turns" on every session for two weeks.
         turn = r["turn"]
         named.append({
             "turn_ref": turn_name_overlay.turn_ref(turn["source_filename"],
@@ -1262,14 +1365,18 @@ def _from_match_artifact(bucket, key):
             # reader sees has to come from the profile, or the transcript shows a uuid.
             "display_name": (by_key.get(r["name"]) or {}).get("display_name"),
             "margin": r.get("margin"),
+            # Rebuilt row, so a field added to `_match`'s result does NOT arrive here by
+            # itself -- which is how `score` went missing for 604 rows while the writer
+            # was already asking for it. The seam test is what catches the omission.
+            "score": r.get("score"),
         })
 
     if skipped_no_runner_up:
         # Loud, because the symptom is indistinguishable from "the matcher did nothing".
         logger.warning(
             "match: %d turn(s) had a nearest profile but no runner-up to beat — the company "
-            "has %d matchable profile(s) and discrimination needs at least 2",
-            skipped_no_runner_up, len(profiles))
+            "has %d matchable person(s) and no lean was produced",
+            skipped_no_runner_up, len(by_key))
 
     mode = (req.get("mode") or "").lower()
     if mode != "on":
@@ -1306,10 +1413,12 @@ def _from_match_artifact(bucket, key):
         # would make a session where the voiceprints did nothing and inheritance did
         # everything read as a successful match.
         written, inherited = reply.get("written", 0), reply.get("inherited", 0)
-    logger.info("match%s: session=%s named %d of %d turns against %d profiles "
-                "(+%d inherited)",
-                _part_of(req), session, written, len(out["results"]), len(profiles),
-                inherited)
+    # People, then samples: `profiles` holds one row per SAMPLE, and "against 11 profiles"
+    # for a company that has enrolled one person sent a whole investigation the wrong way.
+    logger.info("match%s: session=%s named %d of %d turns against %d person(s) "
+                "(%d samples) (+%d inherited)",
+                _part_of(req), session, written, len(out["results"]), len(by_key),
+                len(profiles), inherited)
     return {"session": session, "matched": written, "inherited": inherited,
             "profiles": len(profiles), "mode": mode,
             "part": req.get("part"), "of": req.get("of")}

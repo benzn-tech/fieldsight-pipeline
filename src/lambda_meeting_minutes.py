@@ -57,12 +57,14 @@ import nz_time
 import logging
 import re
 import boto3
+from lake_put import lake_put
 import urllib3
 import agent_turn_filter
 import llm_utils
 from datetime import datetime, timedelta
 from io import BytesIO
 import batch_stitch
+import directory
 from output_language import OUTPUT_LANGUAGE_RULE
 from transcript_utils import (
     normalize_transcript, format_turns_for_prompt, get_time_bounds,
@@ -95,6 +97,8 @@ MINUTES_PREFIX = os.environ.get('MINUTES_PREFIX', 'meeting_minutes/')
 REPORT_PREFIX = os.environ.get('REPORT_PREFIX', 'reports/')  # compat output path
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 CLAUDE_MODEL = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-4-6')
+
+import report_style
 
 # Check python-docx availability once at import time
 DOCX_AVAILABLE = False
@@ -235,6 +239,18 @@ def list_s3_objects(bucket, prefix):
     return objects
 
 
+def _transcript_folders(bucket):
+    """Folder names under transcripts/ from one delimiter listing."""
+    folders = []
+    for page in s3_client.get_paginator('list_objects_v2').paginate(
+            Bucket=bucket, Prefix='transcripts/', Delimiter='/'):
+        for cp in page.get('CommonPrefixes', []):
+            folder = cp['Prefix'][len('transcripts/'):].rstrip('/')
+            if folder:
+                folders.append(folder)
+    return folders
+
+
 def download_json_from_s3(bucket, key):
     """Download and parse JSON file from S3"""
     try:
@@ -250,38 +266,13 @@ def download_json_from_s3(bucket, key):
 # User / Attendee Mapping
 # ============================================================
 
-_user_mapping_cache = None
-
-
 def load_user_mapping(bucket):
-    """
-    Load user mapping from S3 config/user_mapping.json.
-    Returns: {"device_id": "Display Name", ...}
-    """
-    global _user_mapping_cache
-    if _user_mapping_cache is not None:
-        return _user_mapping_cache
-
-    try:
-        data = download_json_from_s3(bucket, 'config/user_mapping.json')
-        if data:
-            raw_mapping = data.get('mapping', {})
-            normalized = {}
-            for device, value in raw_mapping.items():
-                if isinstance(value, str):
-                    normalized[device] = value
-                elif isinstance(value, dict):
-                    normalized[device] = value.get('name', device)
-                else:
-                    normalized[device] = str(value)
-            _user_mapping_cache = normalized
-            logger.info(f"Loaded user mapping: {len(normalized)} entries")
-            return _user_mapping_cache
-    except Exception as e:
-        logger.warning(f"Failed to load user mapping: {e}")
-
-    _user_mapping_cache = {}
-    return _user_mapping_cache
+    """{recording folder: display name}, from the published directory
+    (config/directory.json, built from Aurora by org-api). Keyed by the folder
+    the transcript was filed under (`transcripts/<folder>/...`), not by the
+    device id in the filename: device ids are not translated, and one that is
+    not a known folder passes through as it always did."""
+    return directory.names_by_folder(directory.load(s3_client, bucket))
 
 
 # ============================================================
@@ -387,7 +378,14 @@ def collect_transcripts(bucket, target_date, user_filter=None, custom_prefix=Non
         # sample, not from anything in its filename. The map rides inside the object;
         # a per-chunk transcript has no map and this is a no-op.
         normalized = batch_stitch.rebase_turns_from_embedded_map(
-            normalize_transcript(data, filename, user_mapping=user_mapping), data)
+            normalize_transcript(data, filename), data)
+        # THE SPEAKER NAME COMES FROM THE FOLDER. normalize_transcript looks a
+        # device id up in a {device: name} map; nothing publishes one any more,
+        # and the folder the recording was filed under already says who it is.
+        # An unknown folder leaves the device-derived name untouched.
+        folder_of_key, _d = _user_and_date_from_key(key)
+        if normalized and (user_mapping.get(folder_of_key) or '').strip():
+            normalized['speaker_name'] = user_mapping[folder_of_key]
         if normalized and normalized.get('full_text'):
             normalized['key'] = key
             # The Ask agent's own answer, played aloud into the meeting it is minuting. Same
@@ -417,10 +415,18 @@ def collect_transcripts(bucket, target_date, user_filter=None, custom_prefix=Non
         if user_filter:
             users.add(user_filter)
         else:
-            for obj in list_s3_objects(bucket, 'transcripts/'):
-                parts = obj['key'].split('/')
-                if len(parts) >= 2 and parts[1]:
-                    users.add(parts[1])
+            # One delimiter listing of transcripts/ (one entry per folder, not per object).
+            # The directory is not used: legacy folders still hold transcripts and are in no
+            # directory entry. Only a listing failure scans the whole prefix, with a WARNING.
+            try:
+                users.update(_transcript_folders(bucket))
+            except Exception:  # noqa: BLE001
+                logger.warning("meeting minutes: folder listing failed; discovering folders "
+                               "by listing the whole transcripts/ prefix", exc_info=True)
+                for obj in list_s3_objects(bucket, 'transcripts/'):
+                    parts = obj['key'].split('/')
+                    if len(parts) >= 2 and parts[1]:
+                        users.add(parts[1])
 
         for user_name in sorted(users):
             # Date subfolder first
@@ -602,7 +608,8 @@ Rules:
 
 def call_claude_structured(prompt, max_tokens=4096):
     """Delegates to llm_utils (provider-dispatched). force_json: structured task."""
-    return llm_utils.call_llm(prompt, max_tokens=max_tokens, force_json=True)
+    return llm_utils.call_llm(prompt, max_tokens=max_tokens, force_json=True,
+                              caller="meeting_minutes")
 
 
 def extract_json_from_response(raw_text):
@@ -642,9 +649,10 @@ def save_debug_record(bucket, target_date, meeting_title, prompt, raw_response,
             'parsed_json': parsed_json,
         }
 
-        s3_client.put_object(
-            Bucket=bucket, Key=debug_key,
-            Body=json.dumps(debug_record, ensure_ascii=False, indent=2, default=str),
+        lake_put(
+            bucket, debug_key,
+            json.dumps(debug_record, ensure_ascii=False, indent=2, default=str),
+            client=s3_client,
             ContentType='application/json'
         )
         logger.info(f"  Saved debug: {debug_key}")
@@ -657,19 +665,301 @@ def save_debug_record(bucket, target_date, meeting_title, prompt, raw_response,
 # Word Document Generation
 # ============================================================
 
+def _add_photo_strip(doc, streams):
+    """A row of pictures, or nothing. Never raises: the prose is the
+    deliverable and the pictures support it, so one unreadable file costs
+    itself and not the report."""
+    streams = [s for s in (streams or []) if s is not None]
+    if not streams:
+        return
+    strip = doc.add_paragraph()
+    for stream in streams:
+        try:
+            strip.add_run().add_picture(stream, width=Inches(2.4))
+        except Exception:
+            # exc_info, not a bare message (BUG-40): the first writing of this
+            # handler hid a corrupt fixture behind "could not place".
+            logger.warning("skipping a photo python-docx could not place",
+                           exc_info=True)
+
+
+_TABLE_RULE_RE = re.compile(r"^[\s|:-]+$")
+
+
+def _is_table_row(text):
+    return text.startswith("|") and text.count("|") >= 2
+
+
+# A GFM delimiter row: `---|---`, `| :--- | ---: |`, with or without the outer
+# pipes. It must contain at least one pipe -- a bare `---` is a horizontal rule
+# or a setext underline, not a table.
+_DELIMITER_RE = re.compile(r"^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?$")
+
+
+def _is_delimiter_row(text):
+    return "|" in text and bool(_DELIMITER_RE.match(text.strip()))
+
+
+def _table_at(paragraphs, i):
+    """How many lines starting at `i` form a markdown table, or 0.
+
+    THE OUTER PIPES ARE OPTIONAL in GitHub-flavoured markdown, and the model
+    uses both forms. The first version of this only recognised rows that
+    started with `|`, so a table written as
+
+        Item | Assigned | Due
+        ---|---|---
+        Pour | Sam | Friday
+
+    was rendered line by line as paragraphs -- pipe characters and the dashed
+    rule printed into the Word document, which is precisely what teaching the
+    renderer about tables was meant to stop. It was found in a report generated
+    from the ordinary browser flow, a day after the fix that introduced it
+    shipped; the reports that had been checked all happened to use outer pipes.
+
+    So the reliable signal is the DELIMITER ROW, which GFM requires and which a
+    sentence that merely contains a `|` never has. A header line followed by a
+    delimiter row starts a table; lines containing a pipe continue it. Rows that
+    start with `|` are still accepted without a delimiter, because that is the
+    form the model used before and the renderer already handled it.
+    """
+    line = paragraphs[i].strip()
+    if (i + 1 < len(paragraphs) and "|" in line
+            and not _is_delimiter_row(line)
+            and _is_delimiter_row(paragraphs[i + 1].strip())):
+        j = i + 2
+        while j < len(paragraphs) and "|" in paragraphs[j] and paragraphs[j].strip():
+            j += 1
+        return j - i
+    if _is_table_row(line):
+        j = i
+        while j < len(paragraphs) and _is_table_row(paragraphs[j].strip()):
+            j += 1
+        return j - i
+    return 0
+
+
+def _split_table_row(text):
+    return [c.strip() for c in text.strip().strip("|").split("|")]
+
+
+PHOTO_CELL_WIDTH = Inches(1.3) if DOCX_AVAILABLE else None
+
+
+def _add_photos_to_cell(cell, streams):
+    """Pictures inside one table cell. Never raises, like the strip: one
+    unreadable file costs itself, not the row."""
+    para = cell.paragraphs[0]
+    for stream in streams:
+        try:
+            para.add_run().add_picture(stream, width=PHOTO_CELL_WIDTH)
+        except Exception:
+            logger.warning("skipping a photo python-docx could not place in a cell",
+                           exc_info=True)
+
+
+_EMPHASIS_RE = re.compile(r"\*\*(.+?)\*\*|(?<![*\w])\*(?!\s)([^*]+?)(?<!\s)\*(?![*\w])")
+
+
+def _add_rich_text(paragraph, text):
+    """`**bold**` and `*italic*` as formatting, not as asterisks. The model
+    writes markdown emphasis (our own prompt asked for it), and every report
+    printed the asterisks: "**no owner recorded**" in a customer's table."""
+    at = 0
+    for m in _EMPHASIS_RE.finditer(text):
+        if m.start() > at:
+            paragraph.add_run(text[at:m.start()])
+        run = paragraph.add_run(m.group(1) if m.group(1) is not None else m.group(2))
+        if m.group(1) is not None:
+            run.bold = True
+        else:
+            run.italic = True
+        at = m.end()
+    if at < len(text):
+        paragraph.add_run(text[at:])
+    return paragraph
+
+
+def _set_cell_text(cell, text):
+    cell.text = ""
+    _add_rich_text(cell.paragraphs[0], text)
+
+
+def _add_markdown_table(doc, rows, row_photos=None, facts=False):
+    """Render the pipe rows the model was asked for as an actual table.
+
+    A section whose `kind` is "table" now tells the model to write a markdown
+    table, and this is the half that makes that request honest: without it the
+    document carries the pipe characters themselves, which is what a reader
+    would have got from choosing "Table" in the editor -- a control that could
+    be set, stored and previewed, and whose only effect on the output was to
+    make it worse.
+
+    ONE ROW, ONE TOPIC, ITS PHOTOGRAPHS IN THE ROW (owner, 2026-09-30). The
+    photographs of a row's topic used to be gathered under the whole table,
+    which separated each picture from the line it evidences. `row_photos` is
+    aligned with `rows` (one stream list per line, from the row's [tN] tag);
+    when any row has photographs, a "Photos" column is added -- by us, not
+    asked of the model -- and each row's pictures go in its own cell.
+    """
+    row_photos = row_photos or [None] * len(rows)
+    kept = [(_split_table_row(r), row_photos[k] or [])
+            for k, r in enumerate(rows) if not _TABLE_RULE_RE.match(r)]
+    kept = [(c, p) for c, p in kept if any(x for x in c)]
+    cells = [c for c, _ in kept]
+    photos = [p for _, p in kept]
+    if not cells:
+        return
+    width = max(len(c) for c in cells)
+    if width < 2:
+        # A ONE-COLUMN TABLE IS NOT A TABLE, and this is not a hypothetical: a
+        # section that said "table" and named no columns got exactly this from
+        # the model -- a single column headed with the section's own title,
+        # holding lines that had read perfectly well as sentences the day
+        # before. The prompt now names the columns, so this should not arrive;
+        # when it does anyway, the lines are worth more as lines than as a
+        # column of boxes.
+        for row, pics in zip(cells, photos):
+            text = (row[0] if row else "").strip()
+            if text:
+                _add_rich_text(doc.add_paragraph(style="List Bullet"), text)
+                _add_photo_strip(doc, pics)
+        return
+    with_photos = any(photos[1:])
+    table = doc.add_table(rows=len(cells), cols=width + (1 if with_photos else 0))
+    table.style = "Table Grid"
+    for r, row in enumerate(cells):
+        for c in range(width):
+            _set_cell_text(table.cell(r, c), row[c] if c < len(row) else "")
+        if with_photos:
+            if r == 0:
+                table.cell(0, width).text = "Photos"
+            elif photos[r]:
+                _add_photos_to_cell(table.cell(r, width), photos[r])
+    # A tag on the header row has no row of its own to sit in; its pictures
+    # go under the table rather than nowhere.
+    _add_photo_strip(doc, photos[0])
+    for run in table.rows[0].cells[0].paragraphs[0].runs or []:
+        run.bold = True
+    if facts:
+        report_style.style_table(table, facts=True)
+
+
+def _add_prose_section(doc, section):
+    """One section of a template-shaped record: its heading, its lines, and the
+    photographs placed under them."""
+    section_title = section.get("title") or ""
+    # `level` defaults to 1, so every existing caller is unchanged; a
+    # section that came back nested asks for 2. Heading 2 is in python-docx's
+    # default template -- checked before the prompt was taught to ask for
+    # `####`, because asking for something the renderer flattens is how a
+    # wired control still produces nothing.
+    doc.add_heading(section_title, level=int(section.get("level") or 1))
+    # Indices into the section's own paragraph list, so the blanks are NOT
+    # filtered out here -- the splitter already drops empty lines, and
+    # re-filtering would shift every index the photo placement recorded.
+    paragraphs = list(section.get("paragraphs") or [])
+    after = section.get("photos_after") or {}
+    i = 0
+    while i < len(paragraphs):
+        text = (paragraphs[i] or "").strip()
+        if not text:
+            i += 1
+            continue
+        n = _table_at(paragraphs, i)
+        if n:
+            # Each row's photographs go in that row's Photos cell (see
+            # _add_markdown_table), not in a heap under the table.
+            _add_markdown_table(doc, [r.strip() for r in paragraphs[i:i + n]],
+                                [after.get(k) for k in range(i, i + n)],
+                                facts=bool(section.get("facts")))
+            i += n
+            continue
+        if text.startswith("- ") or text.startswith("* "):
+            _add_rich_text(doc.add_paragraph(style="List Bullet"), text[2:].strip())
+        else:
+            _add_rich_text(doc.add_paragraph(), text)
+        # THE PHOTOGRAPH OF WHAT THIS LINE SAID, directly under it.
+        _add_photo_strip(doc, after.get(i))
+        i += 1
+
+    # THE PHOTOGRAPHS OF WHAT THIS SECTION IS ABOUT, under it rather than
+    # in a heap at the end. The strip is the same one the assembled report
+    # has always drawn per topic -- same width, same tolerance for a file
+    # python-docx cannot place -- because a reader should not be able to
+    # tell which path wrote the document.
+    _add_photo_strip(doc, section.get("photo_streams"))
+
+
+def _add_actions_table(doc, actions):
+    table = doc.add_table(rows=1, cols=3)
+    table.style = "Table Grid"
+    for cell, head in zip(table.rows[0].cells, ("Action", "Owner", "When")):
+        cell.text = head
+    for a in actions:
+        row = table.add_row().cells
+        row[0].text = (a.get("action") or "").strip()
+        row[1].text = (a.get("owner") or "").strip() or "no owner recorded"
+        row[2].text = (a.get("deadline") or "").strip() or "no date"
+
+
+def generate_prose_document(title, subtitle, sections, actions, closing=None,
+                            header_left=None):
+    """A record whose headings come from its template, not from this function.
+
+    `generate_word_document` below renders the fixed meeting-minutes layout and is
+    unchanged: a template-shaped record has its own sections, so it gets its own
+    renderer rather than another branch inside that one.
+    """
+    if not DOCX_AVAILABLE:
+        logger.warning("prose document requested but python-docx is unavailable")
+        return None
+
+    doc = Document()
+    # THE HOUSE STYLE (report_style), the same on every report we write.
+    report_style.setup(doc, title, header_left=header_left)
+    report_style.title_block(doc, title, subtitle)
+
+    # THE ACTIONS ARE WRITTEN ONCE, BY US, WHERE THE PLAN PUT THEM. They are
+    # data on record, so the table comes from that record. It used to be added
+    # after every section -- stranded below the catch-all -- while the model
+    # also wrote the same actions into the plan's Actions section: every
+    # generated report carried them twice (TEST, 2026-09-23 "daily report"
+    # v10). The model's copy under that heading is dropped; the table sits
+    # there instead. Without an Actions section in the plan, the table goes
+    # at the end under its own heading, as before.
+    placed = False
+    for section in sections or []:
+        if actions and not placed and \
+                (section.get("title") or "").strip().lower() == "actions":
+            _add_prose_section(doc, dict(section, paragraphs=[], photos_after={}))
+            _add_actions_table(doc, actions)
+            placed = True
+            continue
+        _add_prose_section(doc, section)
+
+    if actions and not placed:
+        doc.add_heading("Actions", level=1)
+        _add_actions_table(doc, actions)
+
+    if closing:
+        _add_prose_section(doc, closing)
+    report_style.style_all(doc)
+
+    buf = BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
+
+
 def generate_word_document(minutes_data, title):
     """Generate Word document from structured meeting minutes."""
     if not DOCX_AVAILABLE:
         return None
 
     doc = Document()
-    style = doc.styles['Normal']
-    style.font.name = 'Calibri'
-    style.font.size = Pt(10)
-
-    # Title
-    heading = doc.add_heading(title, 0)
-    heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    report_style.setup(doc, title)
+    report_style.title_block(doc, title, minutes_data.get('meeting_date') or None)
 
     # Meeting info
     meeting_date = minutes_data.get('meeting_date', '')
@@ -805,19 +1095,25 @@ def generate_word_document(minutes_data, title):
         for item in parking:
             doc.add_paragraph(f"• {item}")
 
-    # Metadata footer
+    # Metadata footer. The model that wrote this document is deliberately NOT
+    # named here -- a customer-facing Word export must not name which LLM
+    # vendor/model produced it. `_report_metadata['model']` (and the debug
+    # record beside it in S3) still carry the name, so a bad answer can still
+    # be traced; it just never leaves the building on this document. This is
+    # the second copy of the footer lambda_report_generator._finish_document
+    # writes -- the same change has to land in both or one of them drifts.
     meta = minutes_data.get('_report_metadata', {})
     if meta:
         doc.add_paragraph('')
         p = doc.add_paragraph()
         run = p.add_run(
             f"Generated: {meta.get('generated_at', '?')} | "
-            f"Model: {meta.get('model', '?')} | "
             f"Recordings: {meta.get('recordings_processed', '?')} | "
             f"Version: {meta.get('version', '?')}"
         )
         run.font.size = Pt(7)
         run.font.color.rgb = RGBColor(150, 150, 150)
+    report_style.style_all(doc)
 
     buffer = BytesIO()
     doc.save(buffer)
@@ -1127,9 +1423,10 @@ def generate_meeting_minutes(meeting_config):
 
     # Save JSON to S3 — archive copy in meeting_minutes/ prefix
     json_key = f"{MINUTES_PREFIX}{target_date}/{safe_title}.json"
-    s3_client.put_object(
-        Bucket=S3_BUCKET, Key=json_key,
-        Body=json.dumps(minutes, ensure_ascii=False, indent=2, default=str),
+    lake_put(
+        S3_BUCKET, json_key,
+        json.dumps(minutes, ensure_ascii=False, indent=2, default=str),
+        client=s3_client,
         ContentType='application/json'
     )
     logger.info(f"Saved: {json_key}")
@@ -1164,9 +1461,10 @@ def generate_meeting_minutes(meeting_config):
     report_json_key = None
     if not session_scoped:
         report_json_key = f"{REPORT_PREFIX}{target_date}/{user_for_path}/meeting_minutes.json"
-        s3_client.put_object(
-            Bucket=S3_BUCKET, Key=report_json_key,
-            Body=json.dumps(minutes, ensure_ascii=False, indent=2, default=str),
+        lake_put(
+            S3_BUCKET, report_json_key,
+            json.dumps(minutes, ensure_ascii=False, indent=2, default=str),
+            client=s3_client, owner_hint={"folder": meeting_config.get('user')},
             ContentType='application/json'
         )
         logger.info(f"Saved: {report_json_key}")
@@ -1179,18 +1477,20 @@ def generate_meeting_minutes(meeting_config):
         if word_buffer:
             # Archive copy
             word_key = f"{MINUTES_PREFIX}{target_date}/{safe_title}.docx"
-            s3_client.put_object(
-                Bucket=S3_BUCKET, Key=word_key,
-                Body=word_buffer.getvalue(),
+            lake_put(
+                S3_BUCKET, word_key,
+                word_buffer.getvalue(),
+                client=s3_client,
                 ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
             )
             # Reports/ path copy -- a day-level object, see session_scoped above
             if not session_scoped:
                 word_buffer.seek(0)
                 report_word_key = f"{REPORT_PREFIX}{target_date}/{user_for_path}/meeting_minutes.docx"
-                s3_client.put_object(
-                    Bucket=S3_BUCKET, Key=report_word_key,
-                    Body=word_buffer.getvalue(),
+                lake_put(
+                    S3_BUCKET, report_word_key,
+                    word_buffer.getvalue(),
+                    client=s3_client, owner_hint={"folder": meeting_config.get('user')},
                     ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
                 )
                 logger.info(f"Saved: {report_word_key}")
@@ -1205,9 +1505,10 @@ def generate_meeting_minutes(meeting_config):
                 minutes, meeting_config, transcripts
             )
             compat_key = f"{REPORT_PREFIX}{target_date}/{user_for_path}/daily_report.json"
-            s3_client.put_object(
-                Bucket=S3_BUCKET, Key=compat_key,
-                Body=json.dumps(compat_report, ensure_ascii=False, indent=2, default=str),
+            lake_put(
+                S3_BUCKET, compat_key,
+                json.dumps(compat_report, ensure_ascii=False, indent=2, default=str),
+                client=s3_client, owner_hint={"folder": meeting_config.get('user')},
                 ContentType='application/json'
             )
             logger.info(f"Saved compat report: {compat_key}")
@@ -1272,8 +1573,7 @@ def lambda_handler(event, context):
         return {'statusCode': 400, 'body': 'Missing S3_BUCKET'}
 
     # Reset cache
-    global _user_mapping_cache
-    _user_mapping_cache = None
+    directory.reset_cache()
 
     # Build meeting config from event
     meeting_config = {

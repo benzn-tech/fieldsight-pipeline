@@ -32,7 +32,7 @@ def rag(monkeypatch):
     calls = []
 
     def _fake_call_llm(prompt, max_tokens=None, force_json=False,
-                       enable_thinking=None, model=None):
+                       enable_thinking=None, model=None, **kw):
         calls.append({"enable_thinking": enable_thinking, "model": model})
         return "Level three is on programme.", None
 

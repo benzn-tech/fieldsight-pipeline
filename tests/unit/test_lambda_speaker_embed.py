@@ -161,6 +161,10 @@ def test_two_samples_of_one_person_are_one_candidate(stub_embedder, monkeypatch)
     v_ben, v_other = np.ones(192), np.concatenate([np.ones(96), -np.ones(96)])
     out = se.lambda_handler({"op": "match", "session": "s", "user_folder": "u",
                              "date": "2026-08-11",
+                             # Present because a company WITHOUT one is now capped at
+                             # `tentative` -- this test is about aggregation, not about
+                             # the missing-standard cap, so it supplies the standard.
+                             "company_floor": 0.5,
                              "profiles": [
                                  {"person_key": "ben", "display_name": "Ben",
                                   "status": "confirmed", "embedding": v_ben * 0.9},
@@ -236,6 +240,20 @@ def test_a_homogeneous_window_is_stored_with_its_provenance(stub_embedder, monke
     assert out["s3_key"] == key
     assert out["correction_ref"] == "corr-7"
     assert out["window"] == [0.0, 15.0]
+
+
+def test_a_stored_enrolment_carries_its_recording_conditions(stub_embedder, monkeypatch):
+    """Design 2026-09-30 step 1: the three condition numbers travel on the standalone
+    `op=enrol` result too, computed on the window AFTER narrowing -- not the wide one the
+    request asked for, since that is the audio actually embedded."""
+    key = "users/u/audio/2026-08-11/x_c0000.wav"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes(seconds=15.0)}))
+    out = se.lambda_handler({"op": "enrol", "voiceprint_id": "vp1", "user_folder": "u",
+                             "date": "2026-08-11", "source_filename": "x_c0000.wav",
+                             "start_sec": 0.0, "end_sec": 15.0}, None)
+    assert out["status"] == "embedded"
+    for field in ("level_dbfs", "noise_dbfs", "snr_db"):
+        assert isinstance(out.get(field), float), f"{field} missing from the enrolment result"
 
 
 def test_an_unknown_op_is_rejected_rather_than_silently_doing_nothing(monkeypatch):
@@ -394,6 +412,32 @@ def test_a_match_scores_against_the_profiles_in_the_payload(stub_embedder, monke
                              "turns": [{"source_filename": "x_c0000.wav",
                                         "start_sec": 0.0, "end_sec": 5.0}]}, None)
     assert out["results"][0]["name"] == "ben"
+
+
+def test_match_passes_the_companys_floor_into_decide_name(stub_embedder, monkeypatch):
+    """The floor arrives on the event (from the writer's _profiles response) and must
+    reach decide_name, or a calibrated floor sits in the database doing nothing."""
+    captured = {}
+    real_decide_name = vp.decide_name
+
+    def spy(scores, duration_s, **kwargs):
+        captured["floor"] = kwargs.get("floor")
+        return real_decide_name(scores, duration_s, **kwargs)
+
+    monkeypatch.setattr(se.vp, "decide_name", spy)
+    key = "users/u/audio/2026-08-13/x_c0000.wav"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes()}))
+    se.lambda_handler({"op": "match", "session": "s", "user_folder": "u",
+                       "date": "2026-08-13", "company_floor": 0.42,
+                       "profiles": [
+                           {"person_key": "ben", "status": "confirmed",
+                            "embedding": list(np.ones(192))},
+                           {"person_key": "zoe", "status": "confirmed",
+                            "embedding": list(np.concatenate([np.ones(96),
+                                                              -np.ones(96)]))}],
+                       "turns": [{"source_filename": "x_c0000.wav",
+                                  "start_sec": 0.0, "end_sec": 5.0}]}, None)
+    assert captured["floor"] == 0.42
 
 
 def test_an_enrolment_returns_the_vector_instead_of_storing_it(stub_embedder, monkeypatch):
@@ -1202,25 +1246,38 @@ def test_one_invocation_never_serves_another_its_audio(stub_embedder, monkeypatc
     assert s3.gets.count(key) == 2, "the second invocation reused the first one's audio"
 
 
-def test_one_enrolled_profile_names_nobody(stub_embedder, monkeypatch):
-    """`decide_name` returns a name with a NULL margin when the pool holds one profile —
-    "the closest of the only person I know". Written to a transcript it reads as an
-    identification, and it lands on every turn including the other speakers': one enrolled
-    name spread over everybody, which is worse than no name at all.
-
-    Discrimination needs two profiles. That is not a tuning choice — with overlapping score
-    distributions and no usable absolute threshold, one candidate cannot be told from a
-    stranger."""
+def test_one_enrolled_profile_is_offered_as_a_lean_above_its_floor(stub_embedder, monkeypatch):
+    """A company that has enrolled ONE person must still be recognised (TEST 2026-10-13:
+    two weeks of "named 0 of N turns" because every one-person result was dropped). With no
+    runner-up the name is a lean -- `tentative`, never `confirmed` -- and only above
+    `DEFAULT_SINGLE_CANDIDATE_FLOOR`."""
     key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
     art = "voiceprint_requests/co-1/s/match-1.json"
     monkeypatch.setattr(se, "s3", lambda: FakeS3({art: _match_artifact(mode="on"),
                                                   key: _wav_bytes()}))
     seen = []
-    _writer(monkeypatch, [_profile()], seen)
+    _writer(monkeypatch, [_profile("vp-1", "Ben L", vec=[1.0] * 192)], seen)
+    out = se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
+                                                 "object": {"key": art}}}]}, None)
+    assert out["matched"] >= 1
+    named = next(p for p in seen if p["op"] == "match_names")["results"]
+    assert named and all(r["status"] == "tentative" for r in named)
+    assert named[0]["display_name"] == "Ben L"
+
+
+def test_one_enrolled_profile_below_its_floor_names_nobody(stub_embedder, monkeypatch):
+    """The other half: the single enrolled person is NOT spread over every voice in the
+    room. A turn that does not clear the single-candidate floor stays unnamed."""
+    key = "users/Ben_UCPK2/audio/2026-08-11/x_sid" + "c" * 32 + "_c0000.wav"
+    art = "voiceprint_requests/co-1/s/match-1.json"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({art: _match_artifact(mode="on"),
+                                                  key: _wav_bytes()}))
+    seen = []
+    _writer(monkeypatch, [_profile("vp-1", "Ben L", vec=[1.0] + [-1.0] * 191)], seen)
     out = se.lambda_handler({"Records": [{"s3": {"bucket": {"name": "b"},
                                                  "object": {"key": art}}}]}, None)
     assert out["matched"] == 0
-    assert not any(p["op"] == "match_names" for p in seen)
+    assert not any(p["op"] == "match_names" and p["results"] for p in seen)
 
 
 def test_two_profiles_can_produce_a_name(stub_embedder, monkeypatch):
@@ -1544,6 +1601,53 @@ def test_the_tail_frame_is_still_gated_on_speech():
     assert all(se._dbfs(f) >= se.FRAME_MIN_DBFS for f in frames)
 
 
+# ---- recording conditions (design 2026-09-30, step 1 of 3) ----------------
+#
+# Measured on the 42 owner-labelled clips: SNR vs match score has Spearman rho +0.76, so the
+# pure helper below is what makes that measurable on live data going forward.
+
+
+def test_recording_conditions_measures_level_noise_and_snr():
+    """Known sine + known noise gives the expected level/noise/snr.
+
+    Both segments are exact multiples of the 50 ms condition frame (2.0 s at 16 kHz = 40
+    frames of 800 samples), so no frame straddles a segment boundary and the noise segments'
+    per-frame RMS is uniform -- the 10th percentile lands squarely inside them rather than on
+    an interpolated boundary value.
+    """
+    sr = 16000
+    loud = _tone(2.0, sr, amp=0.5)
+    quiet = _tone(2.0, sr, amp=0.05)
+    audio = np.concatenate([loud, quiet, loud, quiet, loud])
+
+    out = se._recording_conditions(audio, sr)
+
+    expected_level = 20.0 * float(np.log10(np.sqrt(np.mean(audio.astype(np.float64) ** 2))))
+    expected_noise = 20.0 * float(np.log10(0.05 / np.sqrt(2)))
+    assert out["level_dbfs"] == pytest.approx(expected_level, abs=0.05)
+    assert out["noise_dbfs"] == pytest.approx(expected_noise, abs=0.1)
+    assert out["snr_db"] == pytest.approx(out["level_dbfs"] - out["noise_dbfs"], abs=1e-6)
+
+
+def test_a_uniform_window_has_near_zero_snr():
+    """No quiet part at all: level and noise coincide. Guards against a version that picks
+    the loudest frame's percentile instead of the quietest -- that would also read as ~0 here
+    but would invert the moment a real quiet segment existed."""
+    sr = 16000
+    audio = _tone(3.0, sr, amp=0.3)
+    out = se._recording_conditions(audio, sr)
+    assert out["snr_db"] == pytest.approx(0.0, abs=0.2)
+
+
+def test_a_window_shorter_than_one_condition_frame_is_judged_on_itself():
+    """A window this short cannot be subdivided; noise equals level and snr is 0 rather than
+    raising on an empty frame list."""
+    sr = 16000
+    out = se._recording_conditions(_tone(0.01, sr, amp=0.4), sr)
+    assert out["snr_db"] == pytest.approx(0.0, abs=1e-6)
+    assert out["noise_dbfs"] == out["level_dbfs"]
+
+
 # ---- the one function every other test stubs ------------------------------
 
 
@@ -1678,3 +1782,68 @@ def test_a_denial_is_still_raised_and_still_named(monkeypatch):
         se._get("some/key.json")
     assert "AccessDenied" in exc.value.response["Error"]["Message"]
     assert "some/key.json" in exc.value.response["Error"]["Message"]
+
+
+# ---- roster narrowing (on-site-roster plan, Task 4) ------------------------------------
+
+
+def _turn():
+    return {"source_filename": "x_c0000.wav", "start_sec": 0.0, "end_sec": 5.0}
+
+
+def test_an_off_roster_winner_is_capped_at_tentative(stub_embedder, monkeypatch):
+    key = "users/u/audio/2026-08-13/x_c0000.wav"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes()}))
+    out = se.lambda_handler({"op": "match", "session": "s", "user_folder": "u",
+                             "date": "2026-08-13", "company_floor": 0.01,
+                             "profiles": [
+                                 {"person_key": "ben", "status": "confirmed",
+                                  "on_roster": False,
+                                  "embedding": list(np.ones(192))},
+                                 {"person_key": "zoe", "status": "confirmed",
+                                  "on_roster": True,
+                                  "embedding": list(np.concatenate([np.ones(96),
+                                                                    -np.ones(96)]))}],
+                             "turns": [_turn()]}, None)
+    r = out["results"][0]
+    assert r["name"] == "ben", "capped, never renamed to the on-roster runner-up"
+    assert r["status"] == "tentative"
+
+
+def test_without_on_roster_keys_the_same_pool_confirms(stub_embedder, monkeypatch):
+    """The identical pool and floor, with no roster info on the profiles at all, must
+    confirm -- proving the cap above is the roster's doing, not the floor's."""
+    key = "users/u/audio/2026-08-13/x_c0000.wav"
+    monkeypatch.setattr(se, "s3", lambda: FakeS3({key: _wav_bytes()}))
+    out = se.lambda_handler({"op": "match", "session": "s", "user_folder": "u",
+                             "date": "2026-08-13", "company_floor": 0.01,
+                             "profiles": [
+                                 {"person_key": "ben", "status": "confirmed",
+                                  "embedding": list(np.ones(192))},
+                                 {"person_key": "zoe", "status": "confirmed",
+                                  "embedding": list(np.concatenate([np.ones(96),
+                                                                    -np.ones(96)]))}],
+                             "turns": [_turn()]}, None)
+    r = out["results"][0]
+    assert r["name"] == "ben" and r["status"] == "confirmed"
+
+
+def test_date_reaches_the_writer_on_the_profiles_invoke(monkeypatch):
+    """`_from_match_artifact` is the only producer of the `profiles` invoke; the roster
+    lookup needs one extra key (`date`) on it (plan correction 1) -- nothing else has to
+    be plumbed, since site_id already travels."""
+    sent = {}
+
+    def fake_invoke(payload):
+        if payload.get("op") == "profiles":
+            sent.update(payload)
+            return {"profiles": [], "company_floor": None}
+        return {"written": 0}
+
+    monkeypatch.setattr(se, "invoke_writer", fake_invoke)
+    req = {"request_id": "r1", "session_base": "sid" + "d" * 32, "company_id": "co-1",
+          "user_folder": "u", "date": "2026-09-30", "site_id": "site-1",
+          "turns": [], "label_map": []}
+    monkeypatch.setattr(se, "_get", lambda key: json.dumps(req).encode())
+    se._from_match_artifact("bucket", "voiceprint_requests/co-1/sid/r1.json")
+    assert sent.get("date") == "2026-09-30"

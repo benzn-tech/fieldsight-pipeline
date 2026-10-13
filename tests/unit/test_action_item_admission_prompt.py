@@ -11,9 +11,14 @@ Measured on session sid15770a… (2026-08-13, a 71-minute strategy discussion):
     AI pattern analysis -- feed notes to AI
 
 — and the model was not over-reaching. The prompt's own first positive example
-is "Go-to-market strategy -- consult Xiao Han & Benny", so it had been taught
-that shape. What distinguishes the good one is its VERB: you can finish
-consulting two named people; you can never finish "focusing".
+was "Go-to-market strategy -- consult Xiao Han & Benny", so it had been taught
+that shape. What distinguishes a good one is its VERB: you can finish consulting
+two named people; you can never finish "focusing".
+
+2026-09-17 (plan task B4): that example is retired along with the rest of the
+telegraphic register — the `action` is now one sentence. The admission bar above
+it is UNCHANGED, and these tests are what say so: the register changed, the
+criterion for whether an item exists at all did not.
 
 `may be empty arrays` was already in the output rules and did not prevent any
 of this, which is the point of these tests: permission is not a criterion.
@@ -82,9 +87,16 @@ def test_the_measured_failures_appear_as_bad_examples(prompt):
 
 
 def test_the_surviving_good_example_still_shows_a_tickable_verb(prompt):
-    # Kept deliberately: it is the contrast case. Removing it would leave the
-    # rule with nothing to point at.
-    assert "Go-to-market strategy -- consult Xiao Han & Benny" in prompt
+    # Kept deliberately: a Good example is the contrast case for the Bad ones
+    # below, and removing it would leave the rule with nothing to point at. B4
+    # re-registered the example ("send details to Ignite" instead of "consult
+    # Xiao Han & Benny") but NOT the property under test — the verb still names
+    # something a person can finish and tick off.
+    good = "Modular drop ceiling 100mm to send details to Ignite."
+    assert good in prompt
+    # and it is marked Good, not sitting loose where it reads as a warning
+    i = prompt.index(good)
+    assert prompt.rindex("Good:", 0, i) > prompt.rindex("Bad:", 0, i)
 
 
 def test_formatting_guidance_is_not_lost(prompt):

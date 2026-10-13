@@ -2,32 +2,162 @@
 from deleted_predicates import visible_chunks_predicate
 
 
+def _scope_predicate(alias: str = "c") -> str:
+    """The WHERE clause every read of report_chunks must carry: deny-by-default
+    site ACL, optional per-author narrowing, optional inclusive date range, and
+    both tombstone arms. Used verbatim by the vector arm of build_search_sql()
+    today; Task 3 of this plan wires the same string into the keyword arm it
+    adds, so the two arms cannot drift apart.
+
+    A recording the customer deleted must not come back through the search box or
+    through Ask -- both run this predicate. This was missing when the delete endpoint
+    was first written, which meant every other surface hid the content and the two
+    the customer is most likely to try still returned it verbatim.
+    """
+    return (
+        f"{alias}.site_id = ANY(%(site_ids)s) "
+        f"AND (%(author_ids)s::uuid[] IS NULL OR {alias}.user_id = ANY(%(author_ids)s::uuid[])) "
+        f"AND (%(date_from)s::date IS NULL OR {alias}.report_date >= %(date_from)s::date) "
+        f"AND (%(date_to)s::date IS NULL OR {alias}.report_date <= %(date_to)s::date) "
+        f"AND " + visible_chunks_predicate(alias)
+    )
+
+
 def build_search_sql() -> str:
     # Deny-by-default: ALWAYS filter by the caller's accessible site ids.
     # small-to-big: parent topic title/summary via LEFT JOIN. Citations need
     # report_date/site_id/site_name. Optional inclusive report_date range
     # (both NULL => no date filtering, so the Ask path stays byte-identical
     # when it passes no dates).
+    #
+    # TWO arms, unioned before the final LIMIT (2026-09-20 spec: "a literal
+    # token is findable"). A rare identifier like "PS4" or an RFI number
+    # carries almost no embedding signal and systematically loses the top-k
+    # cosine race against topically-similar prose -- the chunk that contains
+    # the exact string a user typed can lose to forty unrelated chunks.
+    #
+    # 2026-09-22 fix ("the keyword arm can actually fire"): the FIRST shipped
+    # version of this arm (PR #886) bound the caller's whole question as one
+    # websearch_to_tsquery input, which ANDs every non-stopword term together
+    # -- a natural-language question essentially never satisfies that -- and
+    # matched only on 'english', which hands one lexeme per whitespace run,
+    # so an identifier touching punctuation ("PS4/light") never matched a bare
+    # "PS4" query either. Both are fixed now:
+    #   * the CALLER (lambda_rag_search.py, fed by lambda_ask_agent.py's
+    #     _lexical_terms via the shared lexical_terms module) is responsible
+    #     for turning the question into an OR query BEFORE it reaches here --
+    #     this function still just binds whatever %(q_text)s it is given
+    #     verbatim; it does not know or care whether that text is one term,
+    #     an "a or b or c" OR list, or (for a caller that wants literal
+    #     AND/phrase behavior) an unmodified sentence. An empty %(q_text)s
+    #     yields an empty tsquery that matches NOTHING, never everything.
+    #   * the EXPRESSION below now matches BOTH the stemmed 'english' vector
+    #     (today's behavior) and a 'simple' (non-stemming) vector over the
+    #     same text with every run of non-alnum characters collapsed to a
+    #     space -- so "PS4/light" contributes 'ps4' and 'light' as separate
+    #     literal simple-config lexemes, restoring the word boundary the raw
+    #     punctuation destroyed. The query side uses websearch_to_tsquery
+    #     with the 'simple' config to match that half of the vector (see
+    #     migration 0061's own header for the six measured cases this fixes).
+    # The expression here MUST match idx_report_chunks_tsv_multi_config's
+    # definition (0061 migration) character for character or Postgres
+    # silently falls back to a sequential scan --
+    # test_keyword_arm_expression_matches_the_index_exactly pins this.
+    #
+    # The keyword arm's rows carry NO meaningful cosine distance (never scored
+    # against the query embedding) -- NULL, not a fabricated "good" number, so
+    # a keyword hit cannot silently outrank a true semantic top-1. lexical_hit
+    # distinguishes the two arms; downstream ranking (_aggregate_topics in
+    # lambda_ask_agent.py) must admit a lexical_hit=True row past its distance
+    # gate rather than dropping it one hop downstream of this fix.
+    #
+    # DISTINCT ON (id): a row found by BOTH arms is one row. Its own
+    # ORDER BY id, lexical_hit ASC, distance ASC NULLS LAST keeps that row's
+    # vector-arm copy (lexical_hit=false, with a real distance) over the
+    # keyword copy's NULL when both exist -- unchanged tiebreak.
+    #
+    # This SQL has TWO consumers, not one, and they need different things:
+    #   - the search box goes through _aggregate_topics, which re-sorts by
+    #     (lexical-first, then distance) itself, so row order arriving from
+    #     here was never load-bearing for it;
+    #   - Ask (_rag_answer -> _rerank_chunks, lambda_ask_agent.py) does NOT
+    #     re-sort while reranking is off, and it is off. ENABLE_RERANK IS
+    #     wired (src/template.yaml:434 declares the EnableRerank parameter,
+    #     :1923 passes it through, and both deploy workflows set it from a
+    #     repo variable defaulting to 'false'), but no PROD_ENABLE_RERANK or
+    #     TEST_ENABLE_RERANK variable is set, so it resolves to 'false' in
+    #     both environments and _rerank_chunks's first line returns
+    #     chunks[:keep] in the order it received them. If reranking is ever
+    #     turned on, _rerank_chunks reorders explicitly and stops depending
+    #     on arrival order -- the ordering below is correct either way. Before this branch, that order was
+    #     the vec CTE's cosine order, because there was only one arm. Now
+    #     that DISTINCT ON forces an ORDER BY id first, the dedup subquery's
+    #     row order is by UUID -- arrival order at the caller becomes
+    #     effectively random with respect to relevance -- unless something
+    #     outside the DISTINCT ON re-imposes it.
+    #
+    # So the outer SELECT re-sorts the deduped rows by lexical_hit ASC,
+    # distance ASC NULLS LAST. Since lexical_hit=false sorts before true and
+    # the vec CTE is unchanged, this reproduces the pre-this-branch vec-only
+    # order EXACTLY for the vector rows, then appends keyword-only rows
+    # after all of them (never interleaved). It does not decide how a
+    # keyword-only row should rank against a semantic one -- that ranking
+    # policy is deliberately left to the caller (Task 4's job), not smuggled
+    # in here.
+    scope = _scope_predicate("c")
     return (
-        "SELECT c.id, c.chunk_text, c.chunk_type, c.topic_id, c.source_s3_key, "
-        "       c.metadata, c.report_date, c.site_id, s.name AS site_name, "
-        "       s.slug AS site_slug, "
-        "       t.title AS topic_title, t.summary AS topic_summary, "
-        "       c.embedding <=> %(q)s::vector AS distance "
-        "FROM report_chunks c "
-        "LEFT JOIN topics t ON t.id = c.topic_id "
-        "LEFT JOIN sites s ON s.id = c.site_id "
-        "WHERE c.site_id = ANY(%(site_ids)s) "
-        "AND (%(author_ids)s::uuid[] IS NULL OR c.user_id = ANY(%(author_ids)s::uuid[])) "
-        "AND (%(date_from)s::date IS NULL OR c.report_date >= %(date_from)s::date) "
-        "AND (%(date_to)s::date IS NULL OR c.report_date <= %(date_to)s::date) "
-        # A recording the customer deleted must not come back through the search box or
-        # through Ask -- both run this one query. This was missing when the delete endpoint
-        # was first written, which meant every other surface hid the content and the two
-        # the customer is most likely to try still returned it verbatim.
-        "AND " + visible_chunks_predicate("c") + " "
-        "ORDER BY c.embedding <=> %(q)s::vector "
-        "LIMIT %(k)s"
+        "WITH vec AS ("
+        "  SELECT c.id, c.chunk_text, c.chunk_type, c.topic_id, c.source_s3_key, "
+        "         c.metadata, c.report_date, c.site_id, s.name AS site_name, "
+        "         s.slug AS site_slug, "
+        "         t.title AS topic_title, t.summary AS topic_summary, "
+        "         c.embedding <=> %(q)s::vector AS distance, false AS lexical_hit "
+        "  FROM report_chunks c "
+        "  LEFT JOIN topics t ON t.id = c.topic_id "
+        "  LEFT JOIN sites s ON s.id = c.site_id "
+        "  WHERE " + scope + " "
+        "  ORDER BY c.embedding <=> %(q)s::vector "
+        "  LIMIT %(k)s"
+        "), "
+        "lex AS ("
+        "  SELECT c.id, c.chunk_text, c.chunk_type, c.topic_id, c.source_s3_key, "
+        "         c.metadata, c.report_date, c.site_id, s.name AS site_name, "
+        "         s.slug AS site_slug, "
+        "         t.title AS topic_title, t.summary AS topic_summary, "
+        "         NULL::float8 AS distance, true AS lexical_hit "
+        "  FROM report_chunks c "
+        "  LEFT JOIN topics t ON t.id = c.topic_id "
+        "  LEFT JOIN sites s ON s.id = c.site_id "
+        "  WHERE " + scope + " "
+        "  AND (to_tsvector('english', c.chunk_text) || to_tsvector('simple', regexp_replace(c.chunk_text, '[^a-zA-Z0-9]+', ' ', 'g'))) "
+        "  @@ websearch_to_tsquery('simple', %(q_text)s) "
+        # 2026-09-22 round-2 fix ("the keyword arm can actually fire"): this
+        # LIMIT used to have NO ORDER BY, which was fine when the arm's query
+        # was an AND of every word (Cause A) -- matches were rare, so
+        # whichever plan-dependent k rows Postgres happened to return were
+        # usually ALL of the matches anyway. Cause A's fix turned the query
+        # into an OR, which makes matches common, so an un-ordered LIMIT now
+        # returns an arbitrary k out of however many rows matched -- not the
+        # arm's best k. ORDER BY ts_rank DESC over the SAME indexed
+        # expression (character-for-character, so the planner can still use
+        # it for the scan) before the LIMIT makes the k rows this arm
+        # contributes its best k by relevance, not whichever k the planner
+        # happened to visit first.
+        "  ORDER BY ts_rank(to_tsvector('english', c.chunk_text) || to_tsvector('simple', regexp_replace(c.chunk_text, '[^a-zA-Z0-9]+', ' ', 'g')), websearch_to_tsquery('simple', %(q_text)s)) DESC "
+        "  LIMIT %(k)s"
+        ") "
+        "SELECT id, chunk_text, chunk_type, topic_id, source_s3_key, "
+        "       metadata, report_date, site_id, site_name, site_slug, "
+        "       topic_title, topic_summary, distance, lexical_hit "
+        "FROM ("
+        "  SELECT DISTINCT ON (id) id, chunk_text, chunk_type, topic_id, source_s3_key, "
+        "         metadata, report_date, site_id, site_name, site_slug, "
+        "         topic_title, topic_summary, distance, lexical_hit "
+        "  FROM (SELECT * FROM vec UNION ALL SELECT * FROM lex) u "
+        "  ORDER BY id, lexical_hit ASC, distance ASC NULLS LAST"
+        ") deduped "
+        "ORDER BY lexical_hit ASC, distance ASC NULLS LAST "
+        "LIMIT %(k)s * 2"
     )
 
 

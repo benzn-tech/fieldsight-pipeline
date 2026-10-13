@@ -6,9 +6,10 @@ the POLL from serving a removed session, but this worker is S3-triggered: if the
 recording is deleted between org-api's enqueue and the worker running -- or on an
 S3 event redelivery hours later -- the DOCX is written and the email goes out.
 
-Same posture as finalize and for the same reason: LENIENT. An unreadable mirror
-must not cost a requester the report they asked for, and this worker records
-errors rather than retrying them.
+Owner decision (2026-09-16): a mirror-read failure on THIS path now fails
+closed rather than proceeding as if nothing was deleted -- a permission fault
+here must not risk mailing a removed recording. `lambda_session_finalize`
+keeps its lenient posture; this decision was scoped to the report worker.
 """
 import pytest
 
@@ -76,9 +77,51 @@ def test_no_deletions_renders_as_before(monkeypatch):
     assert written[0]["status"] == "done"
 
 
-def test_an_unreadable_mirror_still_renders(monkeypatch):
-    """LENIENT, like finalize. A failed check must not cost a requester the
-    report they asked for, and this worker records errors instead of retrying."""
-    sent, written, _ = _run(monkeypatch, deleted=set(), raises=True)
-    assert len(sent) == 1
-    assert written[0]["status"] == "done"
+def test_an_unreadable_mirror_fails_closed(monkeypatch):
+    """STRICT (owner decision 2026-09-16). The old lenient posture let an
+    unreadable mirror still render and mail -- risking a removed recording
+    reaching a document and an inbox. It must now abort: no doc, no email,
+    and a `status: error` result the requester's poll can see and retry."""
+    sent, written, put = _run(monkeypatch, deleted=set(), raises=True)
+    assert sent == [], "an unreadable mirror still sent the email"
+    assert put == [], "an unreadable mirror still wrote a DOCX"
+    assert written and written[0]["status"] == "error"
+
+
+def test_a_generate_request_also_fails_closed_on_an_unreadable_mirror(monkeypatch):
+    """Pins the rebase trap: on the OLD develop the deletion check ran BEFORE the
+    single `try:` block, so `_generate_document` was the only other path in
+    `process_request`. On the NEW develop (PR #859), `if artifact.get("generate")`
+    is a SECOND path with its own try/except, sitting between the deletion check
+    and the old assemble-and-render try. A naive conflict resolution that moves
+    the deletion check back inside the OLD try leaves this second path with no
+    deletion check at all -- a deleted recording could be generated into a
+    document and mailed, exactly the gap this branch exists to close.
+
+    A `generate` artifact whose mirror read raises must therefore still end as
+    `status: "error"`, with `_generate_document` and `_put_document` never
+    reached, and no document written or emailed."""
+    generated, put_doc = [], []
+    monkeypatch.setattr(rep, "_generate_document",
+                        lambda *a, **k: generated.append(1) or (None, None))
+    monkeypatch.setattr(rep, "_put_document",
+                        lambda *a, **k: put_doc.append(1) or "session_reports/x.docx")
+
+    def fake_deleted(s3, bucket, folder, date, strict=False):
+        raise RuntimeError("mirror unreadable")
+    monkeypatch.setattr(deletion_mirror, "deleted_sessions", fake_deleted)
+
+    sent, written, put = [], [], []
+    monkeypatch.setattr(rep, "_send_email", lambda a: sent.append(a))
+    monkeypatch.setattr(rep, "_write_result", lambda k, p: written.append(p))
+    monkeypatch.setattr(rep, "s3", lambda: type("S", (), {
+        "put_object": staticmethod(lambda **kw: put.append(kw["Key"]))})())
+
+    art = dict(ARTIFACT, generate={"templateId": "personal-meeting", "templateVersion": 1})
+    rep.process_request(art)
+
+    assert generated == [], "the generate path ran despite an unreadable mirror"
+    assert put_doc == [], "a generated document was put to S3"
+    assert sent == [], "an unreadable mirror still sent the email"
+    assert put == [], "an unreadable mirror still wrote a DOCX"
+    assert written and written[0]["status"] == "error"

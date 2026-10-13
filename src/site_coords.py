@@ -130,6 +130,11 @@ def overlay_sites_info(sites_info, doc):
                 merged["latitude"] = lat
                 merged["longitude"] = lng
                 merged["coord_source"] = "site-coords"
+        # The site's UUID rides along: the programme and the weather records
+        # are keyed by it (programmes/<uuid>/, weather/<uuid>/), not by slug.
+        entry = (doc or {}).get(slug)
+        if isinstance(entry, dict) and entry.get("site_id"):
+            merged.setdefault("site_uuid", entry["site_id"])
         out[slug] = merged
 
     # A site that exists in Aurora but not in user_mapping.json still needs to
@@ -148,4 +153,6 @@ def overlay_sites_info(sites_info, doc):
             continue
         out[slug] = {"name": entry.get("name") or "", "latitude": lat,
                      "longitude": lng, "coord_source": "site-coords"}
+        if entry.get("site_id"):
+            out[slug]["site_uuid"] = entry["site_id"]
     return out

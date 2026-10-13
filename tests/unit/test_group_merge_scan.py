@@ -173,6 +173,7 @@ def test_the_handler_actually_calls_the_scan(monkeypatch):
     called = []
     monkeypatch.setattr(fc, "_sweep_groups_contained",
                         lambda conn: called.append(1) or [])
+    monkeypatch.setattr(fc, "backstop", lambda conn, **kw: [])
 
     class _Conn:
         def __enter__(self): return object()
@@ -193,6 +194,7 @@ def test_the_scan_runs_after_reconcile(monkeypatch):
                         lambda conn, r: order.append("reconcile") or [])
     monkeypatch.setattr(fc, "_sweep_groups_contained",
                         lambda conn: order.append("groups") or [])
+    monkeypatch.setattr(fc, "backstop", lambda conn, **kw: [])
 
     class _Conn:
         def __enter__(self): return object()
@@ -477,3 +479,14 @@ def test_rearm_is_still_guarded_on_having_been_claimed():
     import inspect
     from repositories import session_group as sg
     assert "merged_at IS NOT NULL" in inspect.getsource(sg.rearm)
+
+
+def test_two_people_from_different_home_companies_on_one_site_company_merge():
+    # Project-owned tenancy P2: a session's company_id is its SITE's company, so
+    # an external member's session and the site company's own employee's carry
+    # the same value -- the "one company" rule is one *site company*.
+    sent = []
+    members = [{"session_id": GID, "user_id": "u-site-employee", "company_id": "co-site"},
+               {"session_id": JOINER, "user_id": "u-external-from-co-home", "company_id": "co-site"}]
+    out = _run(members_of=lambda conn, gid: members, enqueue=sent.append)
+    assert len(sent) == 1 and out[0]["status"] == "claimed"

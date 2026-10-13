@@ -298,6 +298,30 @@ Parameters:
     Description: DashScope OpenAI-compatible base URL for Qwen chat completions
     Default: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
 
+  AskConversationMemory:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Rewrite a follow-up question into one that stands on its own, using the
+      previous turns. Off by default on every stack. The conversation reaches
+      the rewrite only and never the answering prompt, so a recording deleted
+      between turns cannot be quoted or cited -- see the design's 2.1.
+
+  AskRewriteBudget:
+    Type: String
+    Default: '4.0'
+    Description: >-
+      Seconds the follow-up rewrite (AskConversationMemory) may spend before
+      the agent gives up and answers the raw question instead.
+
+  AskDistanceGate:
+    Type: String
+    Default: '0.55'
+    Description: >-
+      Vector-distance cutoff for retrieved chunks used by Ask's retrieval
+      step. A Parameter so the gate can be recalibrated without a code change.
+
   EnableWebAnswer:
     Type: String
     Default: 'false'
@@ -356,6 +380,15 @@ Parameters:
     Type: String
     Description: Qwen model for structured-JSON tasks (report/meeting/extract/matcher)
     Default: qwen3.8-flash
+
+  LlmFallbackModels:
+    Type: String
+    Default: 'openai/gpt-6-luna-pro,xiaomi/mimo-v2.6-pro'
+    Description: >-
+      Comma list of OpenRouter models tried, in order, after QWEN_MODEL fails
+      with a 5xx, 429, timeout or empty answer. An empty value disables the
+      fallback. Read by llm_utils.fallback_models(); it has a Default, so the
+      deploy workflows do not pass it.
 
   QwenModelFast:
     Type: String
@@ -446,29 +479,74 @@ Parameters:
 
   ElevenLabsTtsVoice:
     Type: String
-    Description: ElevenLabs voice id for the spoken Ask answer.
-    Default: bPkjmCb0W1xUBvyH2Afs
+    Description: >-
+      ElevenLabs voice id for the spoken Ask answer. James - Friendly, Warm,
+      Kiwi.
+
+      It matches the device, and that is the whole requirement: every bundled
+      prompt the F2SP already speaks ("Ready. Go ahead.", "Audio recording
+      started", "Recording stopped. Has the meeting ended?") is this voice,
+      so an answer in any other one sounds like a second person joined the
+      conversation. The previous default was bPkjmCb0W1xUBvyH2Afs (Belinda -
+      Calm & Soothing Kiwi), chosen before the spoken answer had to sit next
+      to those prompts.
+
+      Measured through /v1/text-to-speech/{id}/stream on
+      eleven_v3_conversational at speed 1.2, one sentence, 2026-09-21:
+      James 1.66s / 71098 bytes against Belinda 1.35s / 85308 bytes. Both are
+      far inside the voice path's budget, so this is a product choice, not a
+      latency one.
+
+      Not wired as a per-environment override: TEST and prod deliberately
+      speak with the same voice, because TEST is where the voice gets judged.
+    Default: QlZn2MPaf2jDn0461bnj
 
   ElevenLabsTtsModel:
     Type: String
     Description: >-
-      Measured on the plain HTTP /stream endpoint 2026-09-09, one two-sentence
-      answer: DashScope 2.07s, eleven_v3_conversational 1.01s, eleven_v3 2.83s,
-      eleven_flash_v2_5 0.51s. v3-conversational is twice as fast as the
-      incumbent AND the expressive model; the vendor documents it on the
-      Text-to-Dialogue WebSocket, but the plain endpoint accepts it (verified,
-      200 with real audio). Flash remains the fallback if expressiveness stops
-      being worth half a second.
-    Default: eleven_v3_conversational
+      Chosen for a STEADY accent, not for speed.
+
+      Speed was the original criterion, measured on the plain HTTP /stream
+      endpoint 2026-09-09, one two-sentence answer: DashScope 2.07s,
+      eleven_v3_conversational 1.01s, eleven_v3 2.83s, eleven_flash_v2_5
+      0.51s. On that basis v3-conversational was the default.
+
+      What that comparison never asked was whether the voice stays the same
+      voice. It does not. ElevenLabs renders are not deterministic -- the same
+      request, four times, 2026-09-22: 32645, 34735, 33481, 33899 bytes, four
+      different hashes -- and on v3-conversational the accent drifts with it.
+      The owner heard a New Zealand voice come back American on a take
+      generated from exactly the parameters they had just approved.
+
+      eleven_multilingual_v2 holds the accent. It costs about half a second
+      per answer (measured the same day, one sentence, James, speed 1.10:
+      1.58-1.72s against v3-conversational's 0.98-1.20s), which is inside the
+      voice path's budget and buys a voice the customer recognises every time.
+
+      This matters ONLY for live renders. A bundled device prompt is a file:
+      it is recorded once, listened to, and shipped byte for byte, so it
+      cannot drift. A spoken answer is rendered on every question, so the
+      model is the only place its steadiness can be decided.
+    Default: eleven_multilingual_v2
 
   ElevenLabsTtsSpeed:
     Type: String
     Description: >-
-      Playback speed multiplier, 1.2 = 20% faster than written. Verified to take
-      effect rather than be silently accepted -- the same sentence rendered 5.36s
-      at default and 5.20s at 1.2 -- because a vendor that ignores an unknown
-      field returns 200 either way and audio length is the only proof.
-    Default: '1.2' 
+      Playback speed multiplier, 1.10 = 10% faster than written. Verified to
+      take effect rather than be silently accepted -- the same sentence rendered
+      5.36s at default and 5.20s at 1.2 -- because a vendor that ignores an
+      unknown field returns 200 either way and audio length is the only proof.
+
+      1.10 is the speed the owner auditioned and approved on James
+      (2026-09-22), replacing 1.2.
+
+      This number now ALWAYS reaches the vendor, including at 1.0.
+      elevenlabs_utils used to omit voice_settings entirely at 1.0, which does
+      not mean "the API default" -- it means "whatever this voice has saved in
+      the ElevenLabs workspace", a web console no deploy can see. Measured the
+      same day on James: no voice_settings gave 1.90s and 2.04s of audio,
+      explicit 1.0 gave 2.18s and 2.23s.
+    Default: '1.10' 
 
   AskTtsProvider:
     Type: String
@@ -481,6 +559,15 @@ Parameters:
       providers return the same WAV container to the device.
     AllowedValues: [dashscope, elevenlabs]
     Default: dashscope
+
+  VoiceLlmBearer:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: >-
+      Bearer token ElevenLabs presents to the voice-agent Custom LLM endpoint
+      (spec 2026-10-13). Empty = the endpoint is not created at all, which is
+      how prod stays without it until the shell phase has been measured.
 
   ElevenLabsTtsApiKey:
     Type: String
@@ -958,6 +1045,15 @@ Parameters:
       switching it back off leaves the merged record and does not restore what
       was deleted. Flip it on a day when a two-device recording can be watched.
 
+  DeclareContinuity:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Spec 2026-09-30: the extraction call is shown the published items and states which new item
+      continues which; code verifies each claim. Off = today's prompt byte-for-byte. Switch on only
+      after the pre-registered measurement passes.
+
   EmitEvidence:
     Type: String
     Default: 'false'
@@ -1040,6 +1136,37 @@ Parameters:
       script (CJK at ~2 chars per token) so a fully specific Chinese quote is
       not capped at `weak` for having no spaces in it.
 
+  EnableRecordingBlocks:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Whether RecordingSegmentsFunction keeps day_recording_segments current: its
+      transcripts/ Object Created rule and its rate(5 minutes) trailing pass both
+      take their State from this. Off means both rules are DISABLED, no row is
+      ever written, and GET /api/org/sessions carries no recording_blocks key, so
+      the picker renders sessions exactly as before. Never on the finalize/email
+      path (design D5): the only coupling to email latency is account
+      concurrency, which the function caps at 2.
+
+  ReportBlockGapSeconds:
+    Type: String
+    Default: '600'
+    Description: >-
+      Silence, in seconds, that splits a day's recorded segments into separate
+      recording blocks in the report picker (design D2). Read by org-api only,
+      per request, against the raw segments stored per day, so a change reaches
+      every day including finished ones (review finding F9). Separate from
+      session_scope.SESSION_GAP_MINUTES, which this does not touch (D4).
+
+  ReportLongBlockSeconds:
+    Type: String
+    Default: '5400'
+    Description: >-
+      A recording block longer than this many seconds is not selectable as a
+      whole; its topics are the unit instead (design D1/D2, 90 minutes). Read by
+      org-api only, for the same single-reader reason as ReportBlockGapSeconds.
+
   DeviceAnnouncementPatterns:
     Type: String
     Default: ''
@@ -1052,20 +1179,6 @@ Parameters:
       met in the field must be addable by setting a repo variable and
       redeploying, with no code change. Setting it on the live function instead
       is erased by the next CloudFormation reconcile.
-
-  MultiTenantResolution:
-    Type: String
-    Default: 'false'
-    AllowedValues: ['true', 'false']
-    Description: >-
-      When true, ingest/item-writer resolve the owning company per user folder
-      via the identity directory (users.folder_name, globally unique). When
-      false, all pipeline writes are pinned to COMPANY_NAME's company.
-      Prod is true; TEST is now true too (set in deploy.yml). The original pin
-      protected PROD rows when TEST shared prod's DB, but since the fieldsight_test
-      DB-isolation cutover (PR #114) TEST writes reach only the test DB — which
-      holds multi-company seed data (e.g. Southbase / UC PK), so a per-folder
-      resolve is required for a recorder's session to attribute to its real site.
 
   AuthorityFlip:
     Type: String
@@ -1088,6 +1201,31 @@ Parameters:
       authority, the /live-items per-user filter -- Phase 3 graded-roles
       spec §3). False (default) is the pre-Phase-3 binary resolve_scope
       behavior, unchanged in every path, mirroring AuthorityFlip's rollout.
+
+  # Lake ownership (spec 2026-10-12). Wired in three pieces, all pinned by
+  # tests/unit/test_lake_ownership_template.py: this Parameter -> OrgApiFunction env
+  # LAKE_INDEX_READS -> lambda_org_api._lake_index_reads().
+  LakeIndexReads:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    # flip only after backfill + a drain
+    Description: >-
+      When true, org-api bounds its report-history and folder-discovery listings with the
+      lake_objects index instead of listing the whole prefix. The index is not trusted
+      until backfill_lake_objects has been applied and drain_lake_manifest has run, so
+      flip this ONLY after backfill + a drain. False (default) is the S3 listing,
+      unchanged in every path.
+
+  # An owner product decision, not an engineering rollout: it changes what a company
+  # admin sees on the summary route, so it ships off and is flipped by the owner.
+  CompanySummaryServe:
+    Type: String
+    Default: 'off'
+    AllowedValues: ['on', 'off']
+    Description: >-
+      on = org-api serves a company caller its own per-company daily summary. off
+      (default) = the summary route behaves as before. Owner product decision.
 
   VoiceprintMaxFrameSpread:
     Type: String
@@ -1143,6 +1281,58 @@ Parameters:
       do not have one. True records the correction as consent_basis='attestation' with
       asserted_by naming who made the claim. It records a claim and does not verify one;
       the basis is stored on every row so a later decision can find exactly that population.
+
+  ProposalWindowHours:
+    Type: String
+    Default: '72'
+    Description: >-
+      How far back to look for other passages that sound like a newly enrolled person.
+      A parameter and not a constant because the value is expected to move: crew
+      composition follows a site over days, and nobody has measured the right span.
+      Only affects which candidates are OFFERED to a human -- it decides nothing about
+      whether a candidate is a match.
+
+  RosterDerived:
+    Type: String
+    Default: 'on'
+    AllowedValues: ['on', 'off']
+    Description: >-
+      Whether the on-site roster (site_attendance.on_roster_profile_ids) is the union of
+      explicit rows plus two derived arms -- people who recorded at this site today, and
+      people a human named at this site recently -- or explicit rows only. 'off' is the
+      rollback: it runs the exact statement #969 shipped, byte-for-byte, so a company can
+      go back to a roster that only ever has what somebody typed in. Not a boolean
+      Parameter (AllowedValues here is on/off, not true/false) because the generic wiring
+      sweep in test_template_workflow_parameter_wiring.py only recognises the latter --
+      this switch is pinned by its own explicit test instead.
+
+  RosterLookbackDays:
+    Type: String
+    Default: '14'
+    Description: >-
+      How many NZ days back a human correction at a site still counts as "recently
+      confirmed here" for the derived roster's third arm. Anchored on the roster day being
+      queried, never on today, so re-running an old session stays reproducible.
+
+  MatchOnFinalize:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Whether a finalized session is matched against the company's stored voiceprints
+      without anyone asking. False is the deployed default and the rollback.
+
+      Until 2026-09-23 the only producer of a match request was org-api's speaker-match
+      endpoint, which no frontend has ever called -- so naming a speaker propagated the name
+      inside that one meeting and the next meeting started at spk_0 again. This is what
+      makes recognition continuous.
+
+      Separate from RebindSpeakers, which is anonymous (it groups spk_0/spk_1 inside one
+      session and names nobody), and separate from SpeakerIdentityMode because this is a
+      COST change as well: every finalized session pays for ONNX over its turns. Folding it
+      into the mode would make "stop paying for this" and "turn naming off for everyone"
+      the same action. SpeakerIdentityMode=off still refuses it -- that switch is the
+      feature's rollback and a producer that ignored it would leave it meaning nothing.
 
   SpeakerIdentityMode:
     Type: String
@@ -1215,6 +1405,7 @@ Conditions:
   HasVoiceprintSpreadOverride: !Not [!Equals [!Ref VoiceprintMaxFrameSpread, 'default']]
   ShouldEnableSchedules: !Equals [!Ref EnableSchedules, 'true']
   ShouldEnableFinalize: !Equals [!Ref EnableFinalize, 'true']
+  ShouldEnableRecordingBlocks: !Equals [!Ref EnableRecordingBlocks, 'true']
   ShouldEnableSweepPendingGate: !Equals [!Ref EnableSweepPendingGate, 'true']
   ShouldEnableNonWorkExpiry: !Equals [!Ref EnableNonWorkExpiry, 'true']
   ShouldEnableTranscribe: !Equals [!Ref EnableTranscribe, 'true']
@@ -1231,11 +1422,16 @@ Conditions:
   ShouldAlarmItemWriter: !And
     - !Condition ShouldCreateAlerts
     - !Condition HasDb
+  # Same reason as ShouldAlarmItemWriter: RecordingSegmentsFunction is behind HasDb.
+  ShouldAlarmRecordingSegments: !And
+    - !Condition ShouldCreateAlerts
+    - !Condition HasDb
   HasTranscribeReserve: !Not [!Equals [!Ref TranscribeReservedConcurrency, '0']]
   HasVadLayer: !Not [!Equals [!Ref VadLayerArn, '']]
   HasKeyframeFfmpegLayer: !Not [!Equals [!Ref KeyframeFfmpegLayerArn, '']]
   HasDocxLayer: !Not [!Equals [!Ref DocxLayerArn, '']]
   HasDb: !Not [!Equals [!Ref DbStackName, '']]
+  HasVoiceLlm: !Not [!Equals [!Ref VoiceLlmBearer, '']]
   HasOrgPool: !Not [!Equals [!Ref OrgUserPoolId, '']]
   HasPgDatabaseOverride: !Not [!Equals [!Ref PgDatabase, ""]]
   HasOrgApi: !And [!Condition HasDb, !Condition HasOrgPool]
@@ -1281,11 +1477,51 @@ Globals:
       - x86_64
     Timeout: 300
     MemorySize: 256
+    Environment:
+      Variables:
+        LLM_FALLBACK_MODELS: !Ref LlmFallbackModels
 
 # ============================================================
 # Resources
 # ============================================================
 Resources:
+  # ---------------------------------------------------------------------------
+  # Voice agent: Custom LLM endpoint for ElevenLabs (spec 2026-10-13), SHELL.
+  # Node.js because Lambda response streaming is native only there; Python
+  # would need the Web Adapter layer, which the deploy role may not read.
+  # Outside the VPC on purpose: Function URLs do not stream inside a VPC, and
+  # the retrieval it will front is invoked VPC-out -> VPC-in, the direction
+  # AskAgentFunction already uses for RagSearchFunction.
+  # ---------------------------------------------------------------------------
+  VoiceLlmFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasVoiceLlm
+    Properties:
+      FunctionName: !Sub fieldsight-${Stage}-voice-llm
+      CodeUri: voice_llm/
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Timeout: 90
+      MemorySize: 256
+      Environment:
+        Variables:
+          VOICE_LLM_BEARER: !Ref VoiceLlmBearer
+          DEFAULT_ANSWER_DELAY_MS: '1500'
+      FunctionUrlConfig:
+        AuthType: NONE
+        InvokeMode: RESPONSE_STREAM
+
+  # A public Function URL needs BOTH permissions since October 2025: SAM adds
+  # lambda:InvokeFunctionUrl, and without this one every call is a 403.
+  VoiceLlmUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasVoiceLlm
+    Properties:
+      FunctionName: !Ref VoiceLlmFunction
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
+
 
   # ----------------------------------------------------------
   # S3 Bucket Policy (bucket itself is managed outside this stack)
@@ -1381,6 +1617,17 @@ Resources:
       EphemeralStorage:
         Size: 1024
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - S3WritePolicy:
             BucketName: !Ref DataBucketName
         - Version: '2012-10-17'
@@ -1409,7 +1656,7 @@ Resources:
         - HasTranscribeReserve
         - !Ref TranscribeReservedConcurrency
         - !Ref AWS::NoValue
-      Timeout: 300
+      Timeout: 900
       MemorySize: 128
       Environment:
         Variables:
@@ -1423,6 +1670,7 @@ Resources:
           ELEVENLABS_STT_MODEL: !Ref ElevenLabsSttModel
           ELEVENLABS_LANGUAGE: !Ref ElevenLabsLanguage
           KEYTERMS_PATH: config/custom_vocabulary_construction_nz.txt
+          ASR_VOCAB_TABLE: !Ref AsrVocabularyTable
           # Batched transcription (spec 2026-08-11). Default false: deploys inert.
           BATCH_TRANSCRIPTION: !Ref BatchTranscription
           BATCH_WINDOW_SEC: !Ref BatchWindowSec
@@ -1435,12 +1683,25 @@ Resources:
           # assuming a code default.
           TRANSCRIBE_WHOLE_CHUNK: !Ref TranscribeWholeChunk
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - S3ReadPolicy:
             BucketName: !Ref DataBucketName
         - S3WritePolicy:
             BucketName: !Ref DataBucketName
         - DynamoDBCrudPolicy:
             TableName: !Ref TranscriptTableName
+        - DynamoDBReadPolicy:
+            TableName: !Ref AsrVocabularyTable
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
@@ -1448,6 +1709,27 @@ Resources:
                 - transcribe:StartTranscriptionJob
                 - transcribe:GetTranscriptionJob
               Resource: '*'
+
+  # ----------------------------------------------------------
+  # The platform's ASR keyterms as data (src/asr_vocabulary.py): one row per
+  # term, active / candidate / retired, with what it was heard as and where.
+  # Edited by hand (AWS console or scripts/asr_vocab.py), so it is RETAINED:
+  # a stack change must never take the curated list with it. No point-in-time
+  # recovery: the deploy role lacks dynamodb:UpdateContinuousBackups (simulated
+  # 2026-10-09), and the file it was seeded from is in git.
+  # ----------------------------------------------------------
+  AsrVocabularyTable:
+    Type: AWS::DynamoDB::Table
+    Condition: ShouldEnableTranscribe
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub ["${P}-asr-vocabulary", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: term, AttributeType: S }
+      KeySchema:
+        - { AttributeName: term, KeyType: HASH }
 
   # ----------------------------------------------------------
   # Lambda 2.5: VAD Speech Segmentation
@@ -1498,6 +1780,17 @@ Resources:
           TRANSCRIBE_WHOLE_CHUNK: !Ref TranscribeWholeChunk
           WEB_VIDEO_PREFIX: web_video/
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - S3CrudPolicy:
             BucketName: !Ref DataBucketName
 
@@ -1537,6 +1830,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           QWEN_ENABLE_THINKING: 'true'
@@ -1554,6 +1848,9 @@ Resources:
           # rather than arriving late.
           LLM_HTTP_TIMEOUT: '540'
           REPORT_PREFIX: reports/
+          # Lake ownership: one release of the old lake-wide summary alongside the
+          # per-company ones. 'off' stops the lake-wide write (see the rollout notes).
+          SUMMARY_LAKE_WIDE: 'on'
           SITE_NAME: !Ref SiteName
           ITEMS_TABLE: !Ref ItemsTableName
           REPORTS_TABLE: !Ref ReportsTableName
@@ -1568,6 +1865,17 @@ Resources:
           # three tables. Hardcoded 'true' was a write dead-end contradicting the
           # docs ("DynamoDB OFF in production"); removing it aligns both.
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - S3ReadPolicy:
             BucketName: !Ref DataBucketName
         - S3WritePolicy:
@@ -1586,6 +1894,16 @@ Resources:
             Description: Daily report generation (5 AM NZDT)
             State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
             Input: '{"report_type": "daily"}'
+        # Today's forecast per site, judged against today's programme, for the
+        # Morning Brief. After the 04:30 coordinate republish (org-api) and the
+        # 05:00 reports, before anyone opens Today.
+        WeatherForecastSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(30 16 * * ? *)
+            Description: Morning weather forecast per site (5:30 AM NZDT)
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
+            Input: '{"report_type": "weather_forecast"}'
         WeeklyReportSchedule:
           Type: Schedule
           Properties:
@@ -1611,7 +1929,7 @@ Resources:
       FunctionName: !Sub ["${P}-transcribe-callback", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_transcribe_callback.lambda_handler
-      Timeout: 60
+      Timeout: 120
       MemorySize: 128
       Environment:
         Variables:
@@ -1650,7 +1968,7 @@ Resources:
       FunctionName: !Sub ["${P}-meeting-minutes", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_meeting_minutes.lambda_handler
-      Timeout: 600  # must exceed LLM_HTTP_TIMEOUT below, or the runtime kills this before urllib3 raises
+      Timeout: 900  # must exceed LLM_HTTP_TIMEOUT below, or the runtime kills this before urllib3 raises
       MemorySize: 512
       Runtime: python3.12  # python-docx-layer is built for cp312 (BUG-24) — on 3.11 Word generation silently disables
       Layers: !If
@@ -1667,6 +1985,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           QWEN_ENABLE_THINKING: 'true'
@@ -1676,6 +1995,17 @@ Resources:
           MINUTES_PREFIX: meeting_minutes/
           REPORT_PREFIX: reports/
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - S3ReadPolicy:
             BucketName: !Ref DataBucketName
         - S3WritePolicy:
@@ -1697,7 +2027,7 @@ Resources:
       FunctionName: !Sub ["${P}-session-report", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_session_report.lambda_handler
-      Timeout: 300
+      Timeout: 900
       MemorySize: 512
       Runtime: python3.12  # python-docx-layer is built for cp312 (BUG-24)
       Layers: !If
@@ -1711,7 +2041,43 @@ Resources:
           # part of the DNS/SES work; flip to 'ses' + set SENDER_EMAIL then.
           EMAIL_SENDER: stub
           SENDER_EMAIL: ''
+          # Same keys ReportGeneratorFunction already carries, verbatim (its parameter
+          # names, not invented ones) — this worker now makes the one model call a
+          # `generate` request needs.
+          ANTHROPIC_API_KEY: !Ref ClaudeApiKey
+          CLAUDE_MODEL: claude-sonnet-4-6
+          LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
+          QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
+          QWEN_BASE_URL: !Ref QwenBaseUrl
+          QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
+          LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
+          QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
+          QWEN_ENABLE_THINKING: 'true'
+          # One attempt must fit inside Timeout: 900 with room for the docx render.
+          # 480s: a report may now use 32,000 completion tokens (below), ~420s at
+          # the ~76 tokens/s measured on TEST; 300s would cut a long one off.
+          LLM_HTTP_TIMEOUT: '480'
+          GENERATION_BUDGET_SECONDS: '600'
+          # Room to think: the report asks for an 8,000-token answer and gets
+          # this on top for reasoning -- 32,000 in all (owner, 2026-10-06, after
+          # a spoken 40-item checklist spent 15,997 of 16,000 thinking at high).
+          LLM_REASONING_HEADROOM: '24000'
+          # Pre-check on transcript objects in one window (transcript_window.py).
+          MAX_TRANSCRIPT_OBJECTS: '2000'
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
@@ -1725,29 +2091,57 @@ Resources:
                 - !Sub arn:aws:s3:::${IngestBucketName}/users/*/pictures/*
                 # The deletion mirror. `_session_was_deleted` reads it so a session
                 # removed between the enqueue and this run is neither rendered nor
-                # mailed. The read is LENIENT, so a missing grant does not fail --
-                # it answers "nothing was deleted" behind one WARNING line, which
-                # is a guard shipping dead. implicitDeny on both stages before
+                # mailed. Owner decision (2026-09-16): the read now FAILS CLOSED --
+                # a missing grant is no longer a silent dead guard behind one
+                # WARNING line, it raises, and `process_request` records the
+                # request as `status: "error"`, so every report for that day fails
+                # until the grant is restored. implicitDeny on both stages before
                 # this line existed.
                 - !Sub arn:aws:s3:::${IngestBucketName}/redactions/*
+                # The transcript objects a `generate` request reads to build its
+                # prompt (transcript_window.select_keys/assemble). This worker had
+                # no read of transcripts/ at all before generation existed.
+                - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
+                # A template's Weather section (report_facts.py): the nightly
+                # record for the site and day, and -- with no record -- the
+                # site's programme, so the weather is judged against the day's
+                # tasks the same way the daily report judges it.
+                - !Sub arn:aws:s3:::${IngestBucketName}/weather/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/programmes/*
+                # The person's choice of photographs to leave out of the day's
+                # reports (report_photos.read_excluded).
+                - !Sub arn:aws:s3:::${IngestBucketName}/report_photo_selection/*
             - Effect: Allow
               Action: s3:PutObject
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_reports/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_report_results/*
+            # pipeline_trace: what this step did with a recording (traces/, 180 days).
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/traces/*
             - Effect: Allow
               # This function had no ListBucket statement at all. GetObject alone
               # is not enough for the mirror: without ListBucket on the prefix S3
               # answers AccessDenied rather than NoSuchKey for a key that was
               # never written -- and a day with NO deletions has no mirror, which
-              # is the common case. The lenient reader would then log an exception
-              # on every report generated, forever (#627's family).
+              # is the common case. Without this, the now-strict reader would
+              # raise and fail every report request, forever (#627's family).
+              # transcripts/* is listed here too: select_keys() lists the day's
+              # transcript prefix before reading any key under it.
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
               Condition:
                 StringLike:
                   s3:prefix:
                     - redactions/*
+                    - transcripts/*
+                    # Most days have no weather record and most sites no
+                    # programme: without these a missing key reads as
+                    # AccessDenied, not NoSuchKey.
+                    - weather/*
+                    - programmes/*
+                    - report_photo_selection/*
             - Effect: Allow
               # SES send for the 'email' delivery option — harmless while
               # EMAIL_SENDER=stub (the stub never calls SES). Verified-identity
@@ -1774,7 +2168,19 @@ Resources:
       FunctionName: !Sub ["${P}-ask-agent", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_ask_agent.lambda_handler
-      Timeout: 60
+      # Hard kill. At or below ApiFunction's Timeout (28, below), which is
+      # itself below API Gateway's fixed 29s integration timeout -- so the
+      # Lambda runtime is what stops an overrun, not a 504 with the model call
+      # still running and still billing. See test_the_ask_timeouts_descend.
+      #
+      # 28, not 27: two IN-CODE hard stops run INSIDE this function --
+      # corroboration.HARD_STOP_SECONDS and web_answer.HARD_STOP_SECONDS,
+      # both measured and deliberately sized to 27s (see those modules). At
+      # Timeout=27 the runtime kills the function at the exact moment those
+      # stops fire, leaving no time to return the shaped `timed_out` body
+      # they exist to produce -- found reviewing a later task, both features
+      # ON on TEST. See test_no_in_code_hard_stop_reaches_the_runtime_kill.
+      Timeout: 28
       MemorySize: 256
       Environment:
         Variables:
@@ -1782,11 +2188,22 @@ Resources:
           # before urllib3 raises and the `except` that exists for a slow LLM never
           # runs. `llm_utils` defaults it to 150 s and explains the ordering; three
           # functions here had it inverted, all by leaving it at that default.
-          LLM_HTTP_TIMEOUT: '45'
-          S3_BUCKET: !Ref DataBucketName
+          # One model call inside a request whose whole budget is
+          # ASK_DEADLINE_SECONDS below -- strictly less, or a single call can
+          # spend the entire request and leave nothing for retrieval, the
+          # rewrite or synthesis.
+          LLM_HTTP_TIMEOUT: '21'
+          # Voluntary deadline: the agent's whole-request budget. A ladder
+          # constant, not a switch -- kept a literal (not a Parameter) so one
+          # reader (_env_value) works for every number in the ladder; see
+          # ASK_INVOKE_TIMEOUT on ApiFunction for the rest of it.
+          ASK_DEADLINE_SECONDS: '24'
+          # Task 9: the three Ask flags, wired in three places each (Parameter,
+          # here, both workflows).
+          ASK_CONVERSATION_MEMORY: !Ref AskConversationMemory
+          ASK_REWRITE_BUDGET: !Ref AskRewriteBudget
+          ASK_DISTANCE_GATE: !Ref AskDistanceGate
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
-          HAIKU_MODEL: claude-haiku-4-5-20251001
-          REPORT_PREFIX: reports/
           RAG_SEARCH_FUNCTION: !Ref RagSearchFunction
           DASHSCOPE_API_KEY: !Ref DashScopeApiKey
           # Voice STT provider and its OWN key. Both belong here: a provider
@@ -1844,8 +2261,6 @@ Resources:
       Layers:
         - !Ref DashScopeLayer
       Policies:
-        - S3ReadPolicy:
-            BucketName: !Ref DataBucketName
         - LambdaInvokePolicy:
             FunctionName: !Ref RagSearchFunction
         - LambdaInvokePolicy:
@@ -1992,6 +2407,10 @@ Resources:
           # AUTHORITY_FLIP (IngestFunction, above): Parameter default 'false',
           # driven per-environment by a repo variable in the deploy workflows.
           GRADED_ROLES: !Ref GradedRoles
+          # Recording-block thresholds (design 2026-09-15 §5.5 as amended by F9). org-api
+          # is the ONLY function given these: it merges stored segments at read time.
+          REPORT_BLOCK_GAP_SECONDS: !Ref ReportBlockGapSeconds
+          REPORT_LONG_BLOCK_SECONDS: !Ref ReportLongBlockSeconds
           # Does `complete` verify the bytes arrived before stamping
           # uploaded_at? See the UploadVerifyMode parameter.
           ENABLE_USER_DELETION: !Ref EnableUserDeletion
@@ -2011,7 +2430,22 @@ Resources:
           # open, and the sweep's hourly pass recovers it.
           SWEEP_STATE_TABLE: !Ref ItemsTableName
           STAGE: !Ref Stage
+          # flip only after backfill + a drain (see the LakeIndexReads parameter)
+          LAKE_INDEX_READS: !Ref LakeIndexReads
+          # owner product decision (see the CompanySummaryServe parameter)
+          COMPANY_SUMMARY_SERVE: !Ref CompanySummaryServe
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - VPCAccessPolicy: {}
         # DynamoDB reached through the existing gateway endpoint from in-VPC
         # (vpce-01233d5b756ffefcb) -- the same route that carries QR login.
@@ -2048,6 +2482,17 @@ Resources:
                 - s3:PutObject
                 - s3:GetObject
               Resource: !Sub arn:aws:s3:::${DataBucketName}/config/site-coords.json
+            - Effect: Allow
+              # The people-and-sites directory (config/directory.json), the
+              # same single-key shape as the site coordinates above and for
+              # the same reason: the (non-VPC) report generator, meeting
+              # minutes and extraction lambdas cannot reach Aurora, so org-api
+              # publishes what they need. Rebuilt whole on each publish, so it
+              # reads the object first to skip an unchanged write.
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/config/directory.json
             - Effect: Allow
               # Recordings upload: the org API issues presigned PUTs into
               # users/{name}/{video|audio|pictures}/{date}/ for the mobile app
@@ -2114,6 +2559,9 @@ Resources:
               Resource:
                 - !Sub arn:aws:s3:::${DataBucketName}/audio_segments/*
                 - !Sub arn:aws:s3:::${DataBucketName}/web_video/*
+                # GET /weather: the per-site-day forecast and actual records the
+                # report generator writes (weather_advice). Read-only here.
+                - !Sub arn:aws:s3:::${DataBucketName}/weather/*
             - Effect: Allow
               # Without ListBucket, S3 returns AccessDenied/403 (not
               # NoSuchKey/404) for a missing object under a prefix this
@@ -2150,6 +2598,35 @@ Resources:
                     # delete. The DB half commits regardless, which is why deleting has
                     # always LOOKED like it worked.
                     - redactions/*
+                    # The site coordinate file, the same shape again: publishing
+                    # READS it first to merge, a missing object answered 403, and
+                    # so its first write could never happen -- on either stage, and
+                    # every production daily report went out without weather. The
+                    # one key, not config/*: nothing here should learn what else
+                    # lives in config/.
+                    - config/site-coords.json
+                    # The directory, same reason: publishing reads it first, and a
+                    # stage that has never published must read as "absent" (404),
+                    # not as a 403 that makes the first write impossible.
+                    - config/directory.json
+                    # GET /weather reads a day that may not have been written yet
+                    # (no coordinate, or before 05:30): that must read as null,
+                    # not as a 403 dressed as a 500.
+                    - weather/*
+                    # In-app updates (GET /api/org/app/latest). Without this a stage with no
+                    # release yet answers AccessDenied instead of NoSuchKey, and the route
+                    # reports it -- correctly -- as 503 rather than "no update".
+                    - "app-releases/*"
+                    # Most days have no photo selection: reading one must be a
+                    # 404 (nothing left out), not a 403.
+                    - report_photo_selection/*
+            - Effect: Allow
+              # In-app updates: the release manifest (app-releases/latest.json) and the APKs it
+              # names, which GET /api/org/app/latest presigns for signed-in devices. Read only;
+              # releases are published by the release script with the deployer role, never by
+              # this function.
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/app-releases/*
             - Effect: Allow
               # authority-flip Task 4 — /timeline reads daily_report.json
               # (and summary_report.json) verbatim from the lake bucket.
@@ -2202,6 +2679,13 @@ Resources:
                     # worker has not written the result. Every poll before the
                     # document exists answered 500 instead of `pending`.
                     - session_report_results/*
+                    # GET /sessions/pending and POST /sessions/{id}/expedite: most sessions
+                    # have no marker, and that must read as 404/empty, not a 403 -> 500.
+                    - extraction_pending/*
+                    # GET /companies/{id}/export/{export_id} reads manifest.json and then
+                    # state.json, and a running export has no manifest yet. Without this a
+                    # missing key answers 403, not 404, and the status poll would 500.
+                    - exports/*
             - Effect: Allow
               # Task 20 (content correction reindex chain): after a content
               # edit commits, org-api (in-VPC) writes the per-topic reindex
@@ -2223,6 +2707,37 @@ Resources:
               # valid if the role can GetObject the key).
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_report_requests/*
+            - Effect: Allow
+              # POST /api/org/reports/regenerate: the caller's own report, handed to
+              # the non-VPC ReportGeneratorFunction as report_requests/<folder>/<rid>.json
+              # (BUG-36), wired by hand in scripts/wire-s3-events.sh (BUG-33). Write
+              # only: the generator reads the request, org-api never does.
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/report_requests/*
+            - Effect: Allow
+              # GET/PUT /api/org/days/{date}/photos/selection: the person's choice
+              # of photographs to leave out of the day's reports (report_photos),
+              # read back by both report paths.
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/report_photo_selection/*
+            # pipeline_trace: what this step did with a recording (traces/, 180 days).
+            # Read too: GET /trace/day and /trace/funnel (trace_views), and
+            # ListBucket below -- without it a day with no traces reads as
+            # AccessDenied instead of an empty list.
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/traces/*
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - traces/*
             # A speaker correction, handed OUTWARD across the VPC boundary the same way.
             # Write only, and no grant on voiceprint_results/: those go to the in-VPC
             # writer by direct invoke from the embedder, and a read grant here would be an
@@ -2241,6 +2756,20 @@ Resources:
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
+            # Project-owned tenancy: "you were added to a project" notice. org-api has no route
+            # to SES, so it leaves the notice here and ExtractionBacklogFunction emails it.
+            # PutObject only -- a doorbell, not state to read back.
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/notices/external_member/*
+            # Spec 2026-10-07 D6: read the caller's extraction_pending markers and stamp the
+            # Expedite request on one. The marker is the whole interface; the backlog lambda
+            # (not in the VPC) does the notifying.
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/extraction_pending/*
             - Effect: Allow
               Action: s3:GetObject
               Resource:
@@ -2268,6 +2797,18 @@ Resources:
                 Action: [dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:GetItem]
                 Resource: !GetAtt QrLoginCodesTable.Arn
               - !Ref AWS::NoValue
+        # Lake ownership: POST /companies/{id}/export leaves a request object for LakeOps's
+        # scheduled export_tick (this function is in the VPC and cannot call the Lambda API),
+        # and the status route presigns what LakeOps wrote. Write on export_requests/ only;
+        # GetObject only on exports/ (presigning needs it), where org-api never writes.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/export_requests/*
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/exports/*
       Events:
         OrgProxy:
           Type: Api
@@ -2283,21 +2824,55 @@ Resources:
             Method: post
             Auth:
               Authorizer: NONE
+        # Publishes every site's coordinate for the (non-VPC) report generator,
+        # half an hour before the 05:00 NZDT daily reports. Saving a site
+        # publishes only that site; this is what places the ones nobody edits.
+        # See lambda_org_api.republish_all_site_coords.
+        SiteCoordsRepublish:
+          Type: Schedule
+          Properties:
+            Schedule: cron(30 15 * * ? *)
+            Description: Republish site coordinates before the daily reports
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
+            Input: '{"task": "republish_site_coords"}'
+        # The people-and-sites directory for the same non-VPC readers, five
+        # minutes after the coordinates and still ahead of the 05:00 reports.
+        # Saves publish it as they happen; this places a stage that never has
+        # and catches any path that changes people without a hook.
+        # See lambda_org_api.republish_directory.
+        DirectoryRepublish:
+          Type: Schedule
+          Properties:
+            Schedule: cron(35 15 * * ? *)
+            Description: Republish the people-and-sites directory before the daily reports
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
+            Input: '{"task": "republish_directory"}'
 
   # ----------------------------------------------------------
-  # Lambda 11: Org Seed (Phase 3) — one-shot idempotent backfill of
-  # company/users/sites/memberships from Cognito + config/user_mapping.json.
-  # Manual invoke only (no Events).
+  # Lake ownership (spec 2026-10-12): the operator tasks that outlive org-api's 30 s.
+  # Same code, VPC, layer and database access as OrgApiFunction, run through the same
+  # handler as a direct invoke with {"task": ...}:
+  #   drain_lake_manifest   -- fold lake_manifest/ lines into lake_objects (hourly, below)
+  #   backfill_lake_objects -- one-off walk of the bucket(s), dry-run by default
+  #   export_company        -- one company's lake data as zip parts under exports/
+  #   export_tick           -- every 10 minutes: advance one pending export_requests/ item
+  # No function invokes another here: the VPC has no route to the Lambda API, so the export
+  # route leaves a request object in S3 and export_tick (S3 first, no DB when idle) resumes it.
+  #
+  # NO ReservedConcurrentExecutions and NO API events: the mobile upload path must never
+  # share a pool with a 15-minute export.
   # ----------------------------------------------------------
-  OrgSeedFunction:
+  LakeOpsFunction:
     Type: AWS::Serverless::Function
     Condition: HasOrgApi
     Properties:
-      FunctionName: !Sub ["${P}-org-seed", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      FunctionName: !Sub ["${P}-lake-ops", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
-      Handler: lambda_org_seed.lambda_handler
-      Timeout: 120
-      MemorySize: 256
+      Handler: lambda_org_api.lambda_handler
+      Timeout: 900
+      MemorySize: 1024
+      EphemeralStorage:
+        Size: 1024
       Layers:
         - !Ref PsycopgLayer
       VpcConfig:
@@ -2307,6 +2882,7 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          # Deploy-time credential injection -- same as OrgApiFunction.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
           PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
@@ -2314,17 +2890,82 @@ Resources:
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           COGNITO_USER_POOL_ID: !Ref OrgUserPoolId
           S3_BUCKET: !Ref DataBucketName
-          CONFIG_KEY: config/user_mapping.json
+          LAKE_BUCKET: !Ref IngestBucketName
+          STAGE: !Ref Stage
       Policies:
+        # lake_put (lake ownership): LakeOps runs lambda_org_api, which imports the helpers
+        # that call lake_put. PutObject on the manifest prefix only (see OrgApiFunction).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
-              Action: cognito-idp:ListUsers
-              Resource: !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${OrgUserPoolId}
+              # Backfill walks the bucket and export walks the database, so reads are
+              # bucket-wide on purpose. This is the one function with that breadth.
+              Action:
+                - s3:GetObject
+                - s3:GetObjectTagging
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/*
             - Effect: Allow
-              Action: s3:GetObject
-              Resource: !Sub arn:aws:s3:::${DataBucketName}/config/user_mapping.json
+              Action: s3:ListBucket
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}
+                - !Sub arn:aws:s3:::${IngestBucketName}
+            - Effect: Allow
+              # backfill_lake_objects tag=true merges the company/site tags onto existing
+              # objects. The ONLY function granted this: writers never tag (lake_put).
+              Action: s3:PutObjectTagging
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/*
+            - Effect: Allow
+              # The export's output, as multipart zip parts. Nothing else is writable.
+              Action:
+                - s3:PutObject
+                - s3:AbortMultipartUpload
+                - s3:ListMultipartUploadParts
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/exports/*
+            - Effect: Allow
+              # The drain deletes a manifest object only after its rows are committed.
+              # This is the ONLY delete in the lake-ownership work, and only here.
+              Action: s3:DeleteObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
+            - Effect: Allow
+              # export_tick deletes a request object once its export is done.
+              Action: s3:DeleteObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/export_requests/*
+      Events:
+        # Hourly. Each run lists lake_manifest/ in S3 first and opens no database connection
+        # when it is empty (so Aurora can still auto-pause), otherwise it drains in passes
+        # for up to 780 s (cut to the Lambda's remaining time) and reports `more`. A run that
+        # started inside the 900 s ceiling is over long before the next hour. On demand:
+        #   aws lambda invoke --function-name <prefix>-lake-ops --payload '{"task":"drain_lake_manifest"}'
+        DrainLakeManifest:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+            Description: Fold the lake manifest into lake_objects (S3 only when idle)
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
+            Input: '{"task": "drain_lake_manifest"}'
+        # Advances one pending company export. Lists export_requests/ in S3 first and opens no
+        # database connection when there is nothing to do, so this does not keep Aurora awake.
+        ExportTick:
+          Type: Schedule
+          Properties:
+            Schedule: rate(10 minutes)
+            Description: Advance one pending company export (S3 only when idle)
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
+            Input: '{"task": "export_tick"}'
 
   # ----------------------------------------------------------
   # QR passwordless login (2026-07-30, v2 2026-07-31) — code table only.
@@ -2366,24 +3007,24 @@ Resources:
       FunctionName: !Sub ["${P}-extract-session", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_extract_session.lambda_handler
-      # 600s (was 180s): the FINAL pass runs the model in thinking mode, which
+      # 900s (was 180s): the FINAL pass runs the model in thinking mode, which
       # measured ~170s in prod on 2026-08-03 and therefore lost the race against
       # llm_utils.HTTP_TIMEOUT (150s) -> urllib3 timeout -> retry -> hard-killed
       # at the old 180s ceiling. 664 invocations died exactly this way in one
       # afternoon. LLM_HTTP_TIMEOUT below stays under the Lambda Timeout so a slow
       # call surfaces as a catchable error instead of a runtime kill.
       # The LIVE pass is unaffected: it runs thinking OFF and returns in seconds.
-      Timeout: 600
+      Timeout: 900
       MemorySize: 256
       Environment:
         Variables:
+          DECLARE_CONTINUITY: !Ref DeclareContinuity
           EMIT_EVIDENCE: !Ref EmitEvidence
           EVIDENCE_WINDOW_SEC: !Ref EvidenceWindowSec
           EVIDENCE_FUZZY_THRESHOLD: !Ref EvidenceFuzzyThreshold
           EVIDENCE_FLOOR_TOKENS: !Ref EvidenceFloorTokens
           ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           S3_BUCKET: !Ref IngestBucketName
-          CONFIG_KEY: config/user_mapping.json
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
@@ -2391,6 +3032,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           LLM_HTTP_TIMEOUT: '540'
@@ -2422,6 +3064,17 @@ Resources:
           # provider, not to us, so the OFF switch has to outlive a deploy.
           FILTER_AUDIO_EVENT_TAGS: !Ref FilterAudioEventTags
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
@@ -2432,8 +3085,10 @@ Resources:
                 # wherever transcripts are, because the code that reads one reads the other.
                 - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
+                - !Sub arn:aws:s3:::${IngestBucketName}/config/directory.json
                 # The close-driven final-pass request written by FinalizeSweepFunction.
                 - !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/extraction_pending/*
                 # Its own previous output — read to apply the re-extraction
                 # throttle and the tier/coverage supersede check BEFORE doing
                 # any expensive work.
@@ -2454,6 +3109,21 @@ Resources:
                 # dropped and the session keeps fast-tier topics forever — the
                 # exact silent-degradation shape a missing grant caused before.
                 - !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
+                # extraction_pending/{sessionBase}.json: a failed FINAL pass is recorded
+                # here for the backlog lambda to re-drive (spec D4). Not a trigger prefix.
+                - !Sub arn:aws:s3:::${IngestBucketName}/extraction_pending/*
+                # extraction_empty/{sessionBase}.json: a FINAL pass that found no usable
+                # speech. A success-empty record, which finalize reads to say "Nothing was
+                # captured" truthfully. Not a trigger prefix.
+                - !Sub arn:aws:s3:::${IngestBucketName}/extraction_empty/*
+            # Success deletes the marker (and nothing else this role may delete).
+            - Effect: Allow
+              Action: s3:DeleteObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/extraction_pending/*
+            # pipeline_trace: what this step did with a recording (traces/, 180 days).
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/traces/*
             # gather_session_segments paginates transcripts/. extractions/ is
             # here for a different reason: S3 only answers 404 NoSuchKey for a
             # missing object to a caller holding ListBucket for that key —
@@ -2471,6 +3141,10 @@ Resources:
                   s3:prefix:
                     - transcripts/*
                     - extractions/*
+                    # The marker is read before it is written, and on success deleted;
+                    # a first failure reads a key that does not exist, which is a 403
+                    # without ListBucket (the same trap as extractions/* above).
+                    - extraction_pending/*
                     # The agent-answer sidecars. ListBucket is not optional here: without it S3
                     # answers 403 for a key that simply does not exist, which the reader cannot
                     # tell from a real denial -- and a reader that silently sees "no sidecar"
@@ -2505,7 +3179,7 @@ Resources:
       # effort): 37.3 s in the model, 47.3 s in the function. That fits inside
       # 120 -- but a day twice that size does not, and long days are exactly the
       # ones whose summary matters. The headroom is cheap; the cliff is not.
-      Timeout: 300
+      Timeout: 900
       MemorySize: 256
       Environment:
         Variables:
@@ -2515,7 +3189,6 @@ Resources:
           # functions here had it inverted, all by leaving it at that default.
           LLM_HTTP_TIMEOUT: '240'
           S3_BUCKET: !Ref IngestBucketName
-          CONFIG_KEY: config/user_mapping.json
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
@@ -2523,12 +3196,24 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           # Thinking OFF — the mid-meeting summary should be fast; summarisation
           # needs no extended reasoning (same reason as the finalize worker).
           QWEN_ENABLE_THINKING: 'false'
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
@@ -2575,7 +3260,7 @@ Resources:
   # the object, so no S3 read grant is needed). Same transcripts/ EventBridge
   # trigger as the rolling summary, but gated ENABLED only with finalize, so it
   # ships INERT on prod (mirrors the sweep's ShouldEnableFinalize gate). Resolution
-  # env mirrors IngestFunction so resolve_company routes per folder (MULTI_TENANT).
+  # env mirrors IngestFunction so resolve_company routes per folder.
   # ----------------------------------------------------------
   SessionActivityFunction:
     Type: AWS::Serverless::Function
@@ -2584,7 +3269,7 @@ Resources:
       FunctionName: !Sub ["${P}-session-activity", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: session_activity.lambda_handler
-      Timeout: 60
+      Timeout: 120
       MemorySize: 256
       Layers:
         - !Ref PsycopgLayer
@@ -2601,8 +3286,6 @@ Resources:
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
-          CONFIG_KEY: config/user_mapping.json
-          MULTI_TENANT_RESOLUTION: !Ref MultiTenantResolution
           # Sets the sweep's pending flag (Aurora scale-to-zero, spec 2026-08-11).
           # This is the path that matters most: a device that dies without
           # /close is finalized only by idle-close inference, so an `open` from
@@ -2658,6 +3341,97 @@ Resources:
                     - suffix: _vad_metadata.json
 
   # ----------------------------------------------------------
+  # Recording blocks (design 2026-09-15 §5.4, review F1/F4/F8/F9). Keeps
+  # day_recording_segments current from the transcript stream so the report
+  # picker can offer "10:55-11:35" as one stretch. In-VPC for Aurora; its other
+  # calls are S3 ListObjectsV2 and one DynamoDB flag, both through the VPC's
+  # existing gateway endpoints (BUG-36: nothing else is reachable from here).
+  # Deliberately NOT folded into SessionActivityFunction above: that function
+  # feeds finalize, and this one must never sit on the email path (D5).
+  # ----------------------------------------------------------
+  RecordingSegmentsFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-recording-segments", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_recording_segments.lambda_handler
+      Timeout: 120
+      MemorySize: 256
+      # Every transcript landing invokes this, and account concurrency is shared with
+      # finalize. 2 bounds what a burst can take. A throttled async invocation is queued
+      # and retried by Lambda and logs NOTHING while it waits -- the Throttles metric is
+      # the only signal. The rate(5 minutes) pass below heals any day left dirty.
+      ReservedConcurrentExecutions: 2
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+          S3_BUCKET: !Ref IngestBucketName
+          # The trailing pass's "any dirty day?" flag -- its own item in the items table
+          # (sweep_state key RECORDING_BLOCKS#{stage}), so an idle tick skips Aurora and
+          # the cluster can still auto-pause (test_sweep_cadence_vs_autopause).
+          SWEEP_STATE_TABLE: !Ref ItemsTableName
+          STAGE: !Ref Stage
+          # No REPORT_BLOCK_* here, on purpose: this function stores raw segments and
+          # org-api is the single reader of both thresholds (F9).
+      Policies:
+        - VPCAccessPolicy: {}
+        # In-VPC, but DynamoDB is reachable through the existing gateway endpoint
+        # (vpce-01233d5b756ffefcb) -- no NAT, no new paid endpoint. The same grant
+        # SessionActivityFunction carries for the finalize flag.
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ItemsTableName
+        # Names only. Without ListBucket a missing key answers 403, not 404; this function
+        # never GETs, so it is granted nothing else under transcripts/.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - transcripts/*
+      Events:
+        # Template-declared EventBridge rule, the SessionActivityFunction pattern -- not
+        # a bucket notification (BUG-33: SAM cannot attach S3 events to an external bucket).
+        TranscriptLanded:
+          Type: EventBridgeRule
+          Properties:
+            State: !If [ShouldEnableRecordingBlocks, ENABLED, DISABLED]
+            Pattern:
+              source:
+                - aws.s3
+              detail-type:
+                - Object Created
+              detail:
+                bucket:
+                  name:
+                    - !Ref IngestBucketName
+                object:
+                  key:
+                    - prefix: transcripts/
+        # The trailing pass (F4): recomputes every day the debounce marked dirty. Connects
+        # to Aurora only when its flag is set, plus one hourly safety tick.
+        DirtyDaySweep:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Description: Recording blocks trailing pass - recomputes days the debounce marked dirty.
+            State: !If [ShouldEnableRecordingBlocks, ENABLED, DISABLED]
+
+  # ----------------------------------------------------------
   # Tier-0 finalize — grace SWEEP (in-VPC) + send WORKER (non-VPC).
   # session_close records pending_close + version + close_intent (in-VPC, Aurora)
   # but can't reach the EventBridge Scheduler API to arm a one-shot (BUG-36), so a
@@ -2678,7 +3452,7 @@ Resources:
       FunctionName: !Sub ["${P}-nonwork-expiry", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_nonwork_expiry.lambda_handler
-      Timeout: 300
+      Timeout: 900
       MemorySize: 512
       Layers:
         - !Ref PsycopgLayer
@@ -2701,6 +3475,17 @@ Resources:
           NONWORK_EXPIRY_HOURS: !Ref NonWorkExpiryHours
           NONWORK_EXPIRY_SINCE: !Ref NonWorkExpirySince
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
           Statement:
@@ -2783,6 +3568,17 @@ Resources:
           # together. OFF on prod (finalize disabled) until deliberately enabled.
           INFER_IDLE_CLOSE: !If [ShouldEnableFinalize, 'true', 'false']
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - VPCAccessPolicy: {}
         # Reads/clears the sweep pending flag. Reuses the existing items table
         # deliberately: the deploy role has no dynamodb:CreateTable (verified
@@ -2863,21 +3659,23 @@ Resources:
       FunctionName: !Sub ["${P}-session-finalize", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_session_finalize.lambda_handler
-      # 300, not 120. This function re-summarises the FULL transcript at finalize, and 120
+      # 900, not 120. This function re-summarises the FULL transcript at finalize, and 120
       # was sized for the rolling summariser it used to call -- whose input is already
       # compressed. Measured on a real 26-minute session (316 turns, 17 K chars rendered):
       # the invocation was hard-killed at exactly 120000 ms, three times, with no email sent.
       #
       # Sizing is against the OTHER full-transcript LLM caller rather than a guess:
-      # ExtractSessionFunction gets 600 s for the same class of work. 300 leaves the HTTP
+      # ExtractSessionFunction gets 900 s for the same class of work. 900 leaves the HTTP
       # timeout below room to lose its race (see LLM_HTTP_TIMEOUT), which 120 did not.
-      Timeout: 300
+      Timeout: 900
       MemorySize: 256
       Environment:
         Variables:
           ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           S3_BUCKET: !Ref IngestBucketName
           EMAIL_SENDER: !Ref EmailSender
+          # Where the email's "Open in FieldSight" goes (lambda_session_finalize.open_link).
+          APP_URL: !If [IsProd, 'https://main.d2fssznicvuckr.amplifyapp.com', 'https://dev.d2fssznicvuckr.amplifyapp.com']
           SENDER_EMAIL: !Ref SenderEmail
           # UNDER the Lambda Timeout, which is the whole point of the setting and was
           # inverted here. `llm_utils` defaults it to 150 s and says why: "so the HTTP
@@ -2892,7 +3690,6 @@ Resources:
           # complete summary; the rolling one can be stale/partial). Thinking OFF:
           # summarisation needs no extended reasoning and thinking dominated latency
           # (qwen3.7-max + thinking took ~54 s, blowing the <=2-min finalize budget).
-          CONFIG_KEY: config/user_mapping.json
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-4-6
           LLM_PROVIDER: !Ref LlmProvider
@@ -2900,6 +3697,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
           # Applies to the rolling summariser only. session_brief passes
@@ -2917,6 +3715,17 @@ Resources:
           # session_brief/ for the reader surfaces to pick up.
           SESSION_BRIEF: !Ref EnableSessionBrief
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
@@ -2935,6 +3744,14 @@ Resources:
                 # simulate-principal-policy returned implicitDeny on BOTH stages
                 # before this line existed.
                 - !Sub arn:aws:s3:::${IngestBucketName}/redactions/*
+                # handoff-sync plan §2.3: this function could PutObject here
+                # (below) but not read it back. The final email (kind == "final")
+                # polls this exact prefix for the brief lambda_finalize_claim
+                # asked for concurrently (§2.2) -- without GetObject the read is
+                # AccessDenied, which a lenient reader turns into "not ready yet",
+                # and every email would silently fall back to extraction rows
+                # while every test stayed green.
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_brief/*
             - Effect: Allow
               Action: s3:PutObject
               Resource:
@@ -2944,6 +3761,13 @@ Resources:
                 # (CLAUDE.md: a guard that catches is not a feature that works).
                 - !Sub arn:aws:s3:::${IngestBucketName}/session_brief/*
             - Effect: Allow
+              # Its OWN results, read back: `_already_sent` asks whether this
+              # session's email has gone out before sending another. The
+              # function could write this prefix and not read it.
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/session_finalize_results/*
+            - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
               Condition:
@@ -2951,12 +3775,56 @@ Resources:
                   s3:prefix:
                     - transcripts/*
                     - voice_ask/*
+                    # GetObject alone is not enough here either: the ORDINARY
+                    # case is a session that has not been sent yet, i.e. a key
+                    # that was never written, and without ListBucket S3 answers
+                    # AccessDenied instead of NoSuchKey. The lenient reader
+                    # would then log a warning on every single finalize.
+                    - session_finalize_results/*
                     # GetObject alone is not enough: without ListBucket on this
                     # prefix S3 answers AccessDenied rather than NoSuchKey for a
                     # key that was never written, and a day with NO deletions has
                     # no mirror -- which is the common case. The lenient reader
                     # would then log an exception on every finalize forever.
                     - redactions/*
+                    # Same reason, same trap: the final email's brief poll (§2.2)
+                    # almost always hits this BEFORE the concurrent brief request
+                    # (§2.1) has written it -- that is the ordinary "not ready
+                    # yet" case on every attempt but the last. Without
+                    # ListBucket that read is AccessDenied, not NoSuchKey, and
+                    # `_read_brief` would log it as a loud permissions failure on
+                    # every single poll of every single session.
+                    - session_brief/*
+                    # The extraction_pending marker: a missing one is the ORDINARY case
+                    # (extraction did not fail), and without ListBucket S3 answers 403
+                    # for it -- which the reader would have to treat as "unknown".
+                    - extraction_pending/*
+                    # The no-speech record: absent is the ordinary case for every
+                    # recording that had speech, and without ListBucket that is a 403.
+                    - extraction_empty/*
+                    # The race re-check reads the session's final extraction; absent is
+                    # the ordinary case, and without ListBucket that is a 403.
+                    - extractions/*
+            - Effect: Allow
+              # Read the marker to tell "extraction failed" from "nothing was said",
+              # and write error_email_sent_at back into it (spec D5). Delete: a
+              # promised_only marker whose final already cleared is tidied away.
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/extraction_pending/*
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/extraction_empty/*
+            - Effect: Allow
+              # Race re-check (D5): a final extraction that landed just before the
+              # error email was stamped gets `recovered_after_error` set and is put
+              # back, which re-fires item-writer's follow-up under its write-once key.
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/extractions/*
             - Effect: Allow
               Action:
                 - ses:SendEmail
@@ -3003,10 +3871,24 @@ Resources:
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
-          CONFIG_KEY: config/user_mapping.json
-          MULTI_TENANT_RESOLUTION: !Ref MultiTenantResolution
           AUTHORITY_FLIP: !Ref AuthorityFlip
+          # Ruling R22: carry_forward_apply.py's OrphanedHumanEdits EMF line reads this
+          # (os.environ.get("STAGE", "unknown")) — without it every emission lands under
+          # Stage=unknown instead of test/prod, and Task 8's live TEST check saw exactly
+          # that (0 emitted, but tagged unknown).
+          STAGE: !Ref Stage
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
           Statement:
@@ -3019,7 +3901,6 @@ Resources:
                 # wherever transcripts are, because the code that reads one reads the other.
                 - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/embeddings/*
-                - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
                 # The deletion mirror, read by lambda_ingest.py:510 through
                 # deletion_mirror.deleted_sessions so the nightly rebuild does not put a
                 # deleted recording's turns back into the search index. Without this grant
@@ -3111,7 +3992,7 @@ Resources:
       FunctionName: !Sub ["${P}-embed-report", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_embed_report.lambda_handler
-      Timeout: 300
+      Timeout: 900
       MemorySize: 512
       Layers:
         - !Ref PsycopgLayer
@@ -3119,12 +4000,22 @@ Resources:
         Variables:
           ENABLE_TODO_COLLAPSE: !Ref EnableTodoCollapse
           S3_BUCKET: !Ref IngestBucketName
-          CONFIG_KEY: config/user_mapping.json
           DASHSCOPE_API_KEY: !Ref DashScopeApiKey
           DASHSCOPE_BASE_URL: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
           DASHSCOPE_EMBED_MODEL: text-embedding-v4
           DASHSCOPE_EMBED_DIM: '1024'
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
@@ -3135,7 +4026,6 @@ Resources:
                 # Agent-answer sidecars, read by the shared agent_turn_filter. Granted
                 # wherever transcripts are, because the code that reads one reads the other.
                 - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
-                - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/embeddings/*
@@ -3191,6 +4081,10 @@ Resources:
           ENABLE_TODO_COLLAPSE: !Ref EnableTodoCollapse
           ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           GROUP_MERGE_CAP: !Ref GroupMergeCap
+          # item-writer reads this through lambda_ingest.AUTHORITY_FLIP. It was only
+          # ever given to IngestFunction, so the late-extraction rule in
+          # write_extraction_items could never see the flag on a deployed stack.
+          AUTHORITY_FLIP: !Ref AuthorityFlip
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
@@ -3198,16 +4092,40 @@ Resources:
           PGUSER: postgres
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
-          CONFIG_KEY: config/user_mapping.json
-          MULTI_TENANT_RESOLUTION: !Ref MultiTenantResolution
+          # A spoken check's report is queued with org-api's own code
+          # (checklist_reports -> lambda_org_api.day_report_generate), which
+          # reads these two exactly as org-api does.
+          LAKE_BUCKET: !Ref IngestBucketName
+          GRADED_ROLES: !Ref GradedRoles
           # video-keyframe plan: emit keyframe_requests/ post-commit only when
           # this stage flag is on (ships inert otherwise).
           EMIT_KEYFRAME_REQUESTS: !Ref EnableKeyframes
           REBIND_SPEAKERS: !Ref RebindSpeakers
+          # The NAMED half, gated separately from the anonymous re-bind above.
+          MATCH_ON_FINALIZE: !Ref MatchOnFinalize
+          # Read only to refuse when naming is switched off entirely. This function does no
+          # naming itself; it queues the request the embedder acts on.
+          SPEAKER_IDENTITY_MODE: !Ref SpeakerIdentityMode
           # recurring-item threading: propose which earlier subject a new
           # topic restates. Writes suggestions only; never links.
           SUGGEST_THREADS: !Ref EnableThreadSuggestions
+          # Ruling R22: carry_forward_apply.py's OrphanedHumanEdits EMF line reads this
+          # (os.environ.get("STAGE", "unknown")) — without it every emission lands under
+          # Stage=unknown instead of test/prod, and Task 8's live TEST check saw exactly
+          # that (0 emitted, but tagged unknown).
+          STAGE: !Ref Stage
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
           Statement:
@@ -3215,7 +4133,6 @@ Resources:
               Action: s3:GetObject
               Resource:
                 - !Sub arn:aws:s3:::${IngestBucketName}/extractions/*
-                - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
             - Effect: Allow
               # Task 4: after committing an extraction's topics, item-writer
               # emits a match_requests/ artifact (match_request.emit) for the
@@ -3246,6 +4163,15 @@ Resources:
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/voiceprint_requests/*
+            # pipeline_trace: what this step did with a recording (traces/, 180 days).
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/traces/*
+            # A spoken check's report request for the report worker
+            # (checklist_reports), the same object org-api writes for Generate.
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_report_requests/*
             - Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${IngestBucketName}
@@ -3284,7 +4210,7 @@ Resources:
       # N times) the decode+upload work won't fit 120s, and a mid-run timeout
       # commits zero DB bindings while leaving S3 uploads. Give generous
       # headroom (still well under the 900s Lambda ceiling).
-      Timeout: 600
+      Timeout: 900
       MemorySize: 1024
       # No Runtime override: inherits the python3.11 Global. The ffmpeg layer is
       # 3.11-compatible and PsycopgLayer is cp311-only, so both load on 3.11.
@@ -3308,6 +4234,17 @@ Resources:
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           S3_BUCKET: !Ref IngestBucketName
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - VPCAccessPolicy: {}
         - Version: '2012-10-17'
           Statement:
@@ -3386,11 +4323,11 @@ Resources:
       CodeUri: src/
       Handler: lambda_speaker_embed.lambda_handler
       Runtime: python3.12
-      # 600, not 120: this path is asynchronous (S3-triggered), so no API Gateway ceiling
+      # 900, not 120: this path is asynchronous (S3-triggered), so no API Gateway ceiling
       # applies, and propagation now embeds every turn of a session rather than one window.
       # Capping COVERAGE to fit a timeout would trade a visible promise for a number that
       # costs nothing to raise.
-      Timeout: 600
+      Timeout: 900
       MemorySize: 1769
       ReservedConcurrentExecutions: 5
       Layers:
@@ -3489,6 +4426,9 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          PROPOSAL_WINDOW_HOURS: !Ref ProposalWindowHours
+          ROSTER_DERIVED: !Ref RosterDerived
+          ROSTER_LOOKBACK_DAYS: !Ref RosterLookbackDays
           # Deploy-time credential injection — see MigrateFunction notes (BUG-36: in-VPC with
           # no NAT, so a Secrets Manager call at runtime black-holes with zero log output).
           PGHOST: !ImportValue
@@ -3498,6 +4438,88 @@ Resources:
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
       Policies:
         - VPCAccessPolicy: {}
+
+  # ------------------------------------------------------------------
+  # Per-company voiceprint rejection floor -- scheduled recompute
+  # (docs/superpowers/specs/2026-09-20-a-voice-the-library-does-not-know.md S1.3)
+  #
+  # decide_name's margin check alone confirms whoever is least wrong among the enrolled
+  # profiles even when nobody enrolled was in the room (measured 2026-09-10: a stranger
+  # confirmed at best=0.445, margin 0.268). The floor is a second, company-calibrated
+  # check on top, and it must be recomputed on a schedule rather than at match time --
+  # matching the existing "derived/materialized state, recomputed by a job" pattern
+  # `_write_snapshot` uses for programmes/{site_id}/programme.json.
+  #
+  # Shares VoiceprintWriterFunction's handler and DB wiring verbatim (same in-VPC half,
+  # same PsycopgLayer, same deploy-time credential injection -- BUG-36: in-VPC with no
+  # NAT, so a runtime Secrets Manager call black-holes with zero log output) rather than
+  # a second copy of the connection plumbing. `Input` on the Schedule event supplies the
+  # op key the handler dispatches on, since an EventBridge Schedule invokes with a fixed
+  # event and this dispatcher is op-keyed -- an S3 event once reached this same handler
+  # with no `op` at all and died in 3ms with "unknown op None" (see
+  # test_an_s3_event_is_understood_rather_than_rejected in the embedder's tests, the same
+  # class of mistake one layer over).
+  #
+  # Cadence: rate(6 hours), not ExtractionBacklogFunction's hourly. The floor only moves
+  # when new source='correction' rows accumulate, and corrections are rare by construction
+  # (spec S1.5: a company can accumulate plenty of matched turns and still have too few
+  # corrected ones to calibrate). Hourly would recompute against unchanged data on most
+  # runs -- all cost, no freshness gained -- for a check whose worst-case staleness is "a
+  # demotion-only safety net is a few hours behind", not a user-facing outage.
+  # VoiceReaperFunction's rate(6 hours) is the closer precedent by cadence even though
+  # ExtractionBacklogFunction is the closer precedent by shape (a single sweep, no
+  # per-item fan-out, no reserved concurrency); this copies the shape from one and the
+  # cadence reasoning from the other rather than picking one silently.
+  #
+  # Timeout: 120s, same as VoiceprintWriterFunction and ExtractionBacklogFunction, well
+  # under the rate(6 hours)=21600s interval enforced by
+  # test_template_timeout_invariants.py::test_a_scheduled_function_is_shorter_than_its_interval.
+  # No ReservedConcurrentExecutions cap: unlike RecordingSegmentsFunction's 5-minute dirty-
+  # day sweep, a 6-hour cadence with a 120s timeout cannot overlap itself under any
+  # realistic company count, so FinalizeSweepFunction's OVERLAP_ACCEPTED reason does not
+  # apply here and this function is not added to that dict.
+  #
+  # The handler loops over every company in one invocation (repositories.companies.
+  # list_companies) rather than fanning out one invocation per company: the Schedule
+  # trigger has no natural payload to drive a per-company fan-out with, and
+  # ExtractionBacklogFunction's own shape (a single sweep, not one invocation per backlog
+  # item) is the direct precedent for not inventing one.
+  # ------------------------------------------------------------------
+  FloorRecomputeFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-floor-recompute", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_voiceprint_writer.lambda_handler
+      Timeout: 120
+      MemorySize: 256
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          # Deploy-time credential injection — see MigrateFunction notes (BUG-36: in-VPC with
+          # no NAT, so a Secrets Manager call at runtime black-holes with zero log output).
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+      Policies:
+        - VPCAccessPolicy: {}
+      Events:
+        FloorSweep:
+          Type: Schedule
+          Properties:
+            Schedule: rate(6 hours)
+            Description: Recompute every company's speaker-voiceprint rejection floor from its own human corrections.
+            Input: '{"op": "recompute_floors"}'
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
 
   SuggestionWriterFunction:
     Type: AWS::Serverless::Function
@@ -3554,14 +4576,14 @@ Resources:
       FunctionName: !Sub ["${P}-programme-matcher", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_programme_matcher.lambda_handler
-      # 600s (bumped from 300 by the 2026-07-13 plan's Task 4): the impact
+      # 900s (bumped from 300 by the 2026-07-13 plan's Task 4): the impact
       # phase adds a SECOND `claude_utils.call_claude` per topic (each up to
       # claude_utils' 150s HTTP timeout), so a multi-topic artifact can now
       # need up to ~2x the sequential Claude time it used to. 300s left
       # headroom for one slow call per topic (Fable review IMPORTANT #4);
       # doubling that per-topic cost while keeping room for several topics
       # per invocation needs the doubled budget too.
-      Timeout: 600
+      Timeout: 900
       MemorySize: 256
       Environment:
         Variables:
@@ -3595,6 +4617,7 @@ Resources:
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
           QWEN_BASE_URL: !Ref QwenBaseUrl
           QWEN_MODEL: !Ref QwenModelPlus
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60: the model chain stops starting attempts before the runtime kills us
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortPlus
           QWEN_MODEL_NONTHINKING: !Ref QwenModelPlusNonThinking
       Policies:
@@ -3646,7 +4669,11 @@ Resources:
       FunctionName: !Sub ["${P}-rag-search", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_rag_search.lambda_handler
-      Timeout: 30
+      # Invoked synchronously by AskAgentFunction, so must give up before
+      # AskAgentFunction's Timeout (28) and before that function's
+      # ASK_DEADLINE_SECONDS (24) -- otherwise this callee can outlive
+      # the request it serves.
+      Timeout: 23
       MemorySize: 512
       Layers:
         - !Ref PsycopgLayer
@@ -3680,7 +4707,7 @@ Resources:
       FunctionName: !Sub ["${P}-voice-audit", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_voice_audit.lambda_handler
-      Timeout: 30
+      Timeout: 120
       MemorySize: 256
       Layers:
         - !Ref PsycopgLayer
@@ -3702,6 +4729,17 @@ Resources:
           # existing gateway endpoint.
           S3_BUCKET: !Ref IngestBucketName
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
         - VPCAccessPolicy: {}
         - Statement:
             - Effect: Allow
@@ -3721,7 +4759,7 @@ Resources:
       FunctionName: !Sub ["${P}-voice-reaper", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_voice_reaper.lambda_handler
-      Timeout: 60
+      Timeout: 120
       MemorySize: 256
       Layers:
         - !Ref PsycopgLayer
@@ -4116,7 +5154,7 @@ Resources:
       StageName: prod
       # Access logging (2026-07-23). Until now this stage had
       # accessLogSettings=null and the Lambda logged only "METHOD /path"
-      # (lambda_fieldsight_api.py:1063) with no caller, so an ACL incident
+      # (lambda_fieldsight_api.py) with no caller, so an ACL incident
       # could not be attributed after the fact — exactly the gap hit when
       # investigating the get_report_history leak. The format below records
       # the Cognito subject, the resource path and the query string so a
@@ -4166,33 +5204,26 @@ Resources:
       FunctionName: !Sub ["${P}-api", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_fieldsight_api.lambda_handler
-      Timeout: 30
+      # Hard kill. Must die before API Gateway's fixed 29s integration
+      # timeout, so this Lambda's own runtime is what reports the overrun --
+      # not a gateway 504 with AskAgentFunction still running and still
+      # billing. See test_the_ask_timeouts_descend.
+      Timeout: 28
       MemorySize: 256
       Environment:
         Variables:
           S3_BUCKET: !Ref DataBucketName
-          REPORT_PREFIX: reports/
-          ITEMS_TABLE: !Ref ItemsTableName
-          REPORTS_TABLE: !Ref ReportsTableName
-          AUDIT_TABLE: !Ref AuditTableName
-          USERS_TABLE: !Ref UsersTableName
-          REPORT_FUNCTION: !Ref ReportGeneratorFunction
           ASK_AGENT_FUNCTION: !Ref AskAgentFunction
+          # How long this function waits for the Ask Agent. Below its own
+          # Timeout (above) so the invoke fails here, in code that can name
+          # it -- and above AskAgentFunction's ASK_DEADLINE_SECONDS (24), so
+          # this caller never abandons a callee that is still working
+          # correctly. Literal, not a Parameter -- see AskAgentFunction's
+          # ASK_DEADLINE_SECONDS for why.
+          ASK_INVOKE_TIMEOUT: '26'
+      # Retired data routes answer 410 without touching storage; what remains
+      # is the proxy into the Ask Agent, so that is the only grant.
       Policies:
-        - S3ReadPolicy:
-            BucketName: !Ref DataBucketName
-        - S3WritePolicy:
-            BucketName: !Ref DataBucketName
-        - DynamoDBCrudPolicy:
-            TableName: !Ref ItemsTableName
-        - DynamoDBCrudPolicy:
-            TableName: !Ref ReportsTableName
-        - DynamoDBCrudPolicy:
-            TableName: !Ref AuditTableName
-        - DynamoDBCrudPolicy:
-            TableName: !Ref UsersTableName
-        - LambdaInvokePolicy:
-            FunctionName: !Ref ReportGeneratorFunction
         - LambdaInvokePolicy:
             FunctionName: !Ref AskAgentFunction
       Events:
@@ -4487,13 +5518,6 @@ Resources:
       LogGroupName: !Sub /aws/lambda/${OrgApiFunction}
       RetentionInDays: 14
 
-  OrgSeedLogGroup:
-    Type: AWS::Logs::LogGroup
-    Condition: HasOrgApi
-    Properties:
-      LogGroupName: !Sub /aws/lambda/${OrgSeedFunction}
-      RetentionInDays: 14
-
   VoiceWsAuthorizerLogGroup:
     Type: AWS::Logs::LogGroup
     Condition: HasSiteVoice
@@ -4563,6 +5587,13 @@ Resources:
     Condition: ShouldCreateAlerts
     Properties:
       TopicName: !Sub ["${P}-pipeline-alerts", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      # Inline, as before. A standalone subscription resource was tried on 2026-10-05
+      # and the TEST deploy failed: the GitHub deploy role may not call
+      # SNS:ListSubscriptionsByTopic, which CloudFormation needs once this property
+      # changes. CloudFormation never repairs the subscription either way: an
+      # unconfirmed email subscription expires and is deleted (prod had ZERO on
+      # 2026-10-05, so every alarm notified nobody). Check it with
+      # `aws sns list-subscriptions-by-topic` and re-subscribe by hand if empty.
       Subscription:
         - Protocol: email
           Endpoint: !Ref AlertEmail
@@ -4641,6 +5672,41 @@ Resources:
       Dimensions:
         - Name: FunctionName
           Value: !Ref TranscribeFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # Recording blocks (design 2026-09-15 §7). RecordingSegmentsFunction runs with
+  # ReservedConcurrentExecutions 2, and a throttled ASYNC invocation writes no log line at
+  # all: Lambda retries it and, past MaximumEventAge, discards it silently, so a day's
+  # blocks stop updating with nothing in the logs. This metric is the only signal.
+  #
+  # TreatMissingData: notBreaching, unconditionally -- deliberately NOT tied to
+  # ShouldEnableRecordingBlocks the way ExtractionBacklogAlarm ties its policy to its sweep.
+  # That pattern is for a series the function publishes on EVERY run, where absence means
+  # the publisher died. Throttles has no datapoint in a period with no throttle, on every
+  # stack and with the switch on or off, so absence is never a fault here; a real throttle
+  # is a datapoint >= 1, which notBreaching cannot hide. `breaching` would page every quiet
+  # period.
+  RecordingSegmentsThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldAlarmRecordingSegments
+    Properties:
+      AlarmName: !Sub ["${P}-recording-segments-throttles", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      AlarmDescription: >-
+        RecordingSegmentsFunction invocations are being throttled (reserved concurrency 2).
+        Throttled events write no log and are discarded past MaximumEventAge, so report-picker
+        recording blocks can go stale silently. Check dirty rows in day_recording_segments.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RecordingSegmentsFunction
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1
@@ -4746,6 +5812,31 @@ Resources:
       Dimensions:
         - Name: FunctionName
           Value: !Ref ItemWriterFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # Counted by an EMF line from lambda_ingest.unknown_folder_error (shared with the
+  # item-writer): `logs:PutMetricFilter` is denied to the deploy role, EMF needs none.
+  RecordingStrandedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldAlarmItemWriter
+    Properties:
+      AlarmName: !Sub ["${P}-recording-stranded", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      AlarmDescription: >-
+        A recording's folder has no directory row: its audio and extraction are in
+        S3 but never reach Aurora. Fix the folder, then replay with
+        scripts/replay_extractions.py.
+      Namespace: FieldSight
+      MetricName: StrandedRecording
+      Dimensions:
+        - Name: Stage
+          Value: !Ref Stage
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1
@@ -4890,7 +5981,30 @@ Resources:
           # would never trip -- the exact "checker stopped" case this exists
           # to catch, defeated by a missing dimension.
           BACKLOG_METRIC_STAGE: !Ref Stage
+          # Same sender settings as SessionFinalizeFunction: the external-member notices
+          # left by org-api (in the VPC, no SES) go out through email_sender.
+          EMAIL_SENDER: !Ref EmailSender
+          SENDER_EMAIL: !Ref SenderEmail
+          # D6: where "a customer asked to expedite" goes. Absent when the stack creates
+          # no alert topic; the code then skips the notice.
+          ALERT_TOPIC_ARN: !If [ShouldCreateAlerts, !Ref AlertTopic, !Ref "AWS::NoValue"]
       Policies:
+        # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
+        # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
+        # no read, no delete (the drain, on LakeOpsFunction, owns those). A missing grant
+        # costs the manifest line, never the data put (lake_put swallows it).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
+        - !If
+          - ShouldCreateAlerts
+          - SNSPublishMessagePolicy:
+              TopicName: !GetAtt AlertTopic.TopicName
+          - !Ref "AWS::NoValue"
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
@@ -4902,9 +6016,39 @@ Resources:
                     - extraction_requests/*
                     - extractions/*
                     - transcripts/*
+                    - extraction_pending/*
+                    - notices/external_member/*
             - Effect: Allow
               Action: s3:GetObject
-              Resource: !Sub arn:aws:s3:::${DataBucketName}/extraction_requests/*
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/extraction_requests/*
+                - !Sub arn:aws:s3:::${DataBucketName}/extraction_pending/*
+                - !Sub arn:aws:s3:::${DataBucketName}/notices/external_member/*
+            # External-member notices: sent -> copied to notices/sent/, original deleted;
+            # unsent after 24 h -> deleted.
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/notices/external_member/*
+                - !Sub arn:aws:s3:::${DataBucketName}/notices/sent/*
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: '*'
+            # The re-drive (spec D4): re-put the original request, which fires the
+            # extract-session notification, and reschedule the marker.
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/extraction_requests/*
+                - !Sub arn:aws:s3:::${DataBucketName}/extraction_pending/*
+            # An expired promised_only marker is deleted (spec: 24 h TTL, logged at ERROR).
+            - Effect: Allow
+              Action: s3:DeleteObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/extraction_pending/*
             # PutMetricData takes no resource ARN. Scoped by namespace instead,
             # so this role cannot overwrite any other namespace's series.
             - Effect: Allow
@@ -4919,6 +6063,16 @@ Resources:
           Properties:
             Schedule: rate(1 hour)
             Description: Sessions transcribed but never extracted.
+            State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
+        # The re-drive needs to run on the backoff's 5-minute grain; the full scan
+        # above does not (it lists three prefixes), so this event asks for the re-drive
+        # alone.
+        PendingRedrive:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Input: '{"task": "redrive"}'
+            Description: Re-drive final extractions that failed on every model.
             State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
 
   ExtractionBacklogAlarm:
@@ -4955,12 +6109,44 @@ Resources:
       AlarmActions:
         - !Ref AlertTopic
 
+  ExtractionPendingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ShouldCreateAlerts
+    Properties:
+      AlarmName: !Sub ["${P}-extraction-pending", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      AlarmDescription: >-
+        A recording's final extraction has been failing on every model for over
+        30 minutes. It is being re-driven (5, 15, 30, 60 min, then hourly,
+        forever) and the recorder has been told it is delayed; this is the
+        page to a human to look at the model vendor.
+      Namespace: FieldSight/Pipeline
+      MetricName: ExtractionPending
+      Dimensions:
+        - Name: Stage
+          Value: !Ref Stage
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      # notBreaching, unlike ExtractionBacklogAlarm: this metric is an EMF line the
+      # re-drive emits on every run, so a stopped re-driver is already caught by the
+      # backlog alarm's own `breaching` on its hourly run. Here silence must not page.
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
 
 
 # ============================================================
 # Outputs
 # ============================================================
 Outputs:
+  VoiceLlmUrl:
+    Condition: HasVoiceLlm
+    Description: ElevenLabs Custom LLM server URL (append /v1 in the agent config)
+    Value: !GetAtt VoiceLlmFunctionUrl.FunctionUrl
+
   BucketName:
     Description: S3 bucket name
     Value: !Ref DataBucketName

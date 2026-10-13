@@ -302,12 +302,14 @@ def test_a_metric_question_never_reaches_the_model(ask, monkeypatch):
 
 def test_the_answer_carries_no_citations_and_names_no_model(ask, monkeypatch):
     """`model` naming a model that was never asked is a false claim in the
-    response body, and the one the UI would print under the answer."""
+    response body. As of 2026-09-20 the response must carry no "model" key
+    at all -- a customer-facing surface must not name a vendor/model even
+    when one legitimately did not run."""
     monkeypatch.setattr(laa, "_get_lambda_client", lambda: _client(DUR))
     out = laa._rag_answer({"question": "how long did I record yesterday",
                            "caller_sub": "s", "tz": "Pacific/Auckland"})
     assert out["citations"] == []
-    assert out["model"] is None
+    assert "model" not in out
     assert out["computed"] is True
     assert out["grounded"] is True
 

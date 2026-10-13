@@ -29,9 +29,23 @@ EXEMPT = {
                                  "to re-extract; hiding deleted rows here would make it "
                                  "re-extract them and resurrect the content",
     "has_topics_for_source_prefix": "the same existence probe in prefix form; filtering it would make the pipeline re-extract and resurrect the content",
+    "replace_day_photo_bindings": "the topics SELECT is a DELETE's reach, not a read — it "
+                                 "must still cover a tombstoned topic, or that topic keeps "
+                                 "its stale binding rows forever, which is the opposite of "
+                                 "what the exclusion is for. No topic content is read.",
     "list_expired_non_work": "the retention sweep, which must still SEE deleted topics — "
                              "hiding them here would leave their vectors alive forever, "
                              "the opposite of what a deletion is for",
+    "get_topic_full": "the per-topic reindex builder's read (R3, Track B Task 2): its "
+                      "top-level topic row and its action_items/safety_observations/"
+                      "findings children carry no deletion predicate by design (see "
+                      "get_topic_visible's own comment: 'NOT get_topic_full: that one is "
+                      "WHERE t.id=%s with no visibility, company, redaction or non_work "
+                      "exclusion'). Only its photos child carries one, via "
+                      "CHILD_OF_UNDELETED_TOPIC.format(...) -- a deletion-only predicate "
+                      "that, unlike CHILD_OF_VISIBLE_TOPIC, this scan's third check does "
+                      "not recognise by name, so this is a deliberate exemption rather "
+                      "than an accidental pass.",
 }
 
 

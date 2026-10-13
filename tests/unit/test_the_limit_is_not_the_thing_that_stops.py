@@ -10,7 +10,7 @@ whenever `force_json` was set) so nobody had to think about it, and the move to
 OpenRouter -- which always sends it -- turned four stale numbers into four
 places an answer can be cut off mid-sentence.
 
-Three properties are pinned.
+Two properties are pinned.
 
 1. **One ceiling, not four.** `ANSWER_TOKEN_CEILING` lives in `llm_utils`
    because that is the module that puts it on the wire. Three lambdas each had
@@ -21,10 +21,8 @@ Three properties are pinned.
    `gemini-3.8-flash` -- 65,536 output cap, the smallest of the three models on
    the table -- that sum has to clear.
 
-3. **Truncation, when it still happens, keeps the head AND the tail.** Two bare
-   `[:N]` slices survived in the ask path long after the same defect was fixed
-   in extraction, the rolling summary and the minutes. A session's decisions are
-   at its END.
+(A third property -- the ask prompt formatters keep the head AND the tail --
+went with the formatters themselves when the ask agent's S3 path was removed.)
 
 What is deliberately NOT pinned: the specific limits. They are env-overridable
 by design, and a test asserting `== 300000` would just be a fifth copy of a
@@ -93,55 +91,122 @@ def test_every_caller_shares_the_one_ceiling():
 
 
 # ------------------------------------------------------------------
-# Head and tail, everywhere a limit still bites
+# The timeout ladder descends (Task 7). Measured 2026-09-17 on prod: APIGW
+# 29s < ApiFunction 30s < AskAgentFunction 60s < LLM_HTTP_TIMEOUT 45s --
+# nothing enforced the budget the whole design is written against, so an
+# overrun surfaced as a gateway 504 with the model call still running and
+# still billing.
 # ------------------------------------------------------------------
 
-def _long_turns(n):
-    return ["[09:%02d:%02d] spk_0: line number %d about the scaffold" % (i // 60, i % 60, i)
-            for i in range(n)]
+import io as _io
+import os as _os
+import re as _re
+
+import pytest as _pytest
+
+_yaml = _pytest.importorskip("yaml")
+
+_REPO = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+_TEMPLATE_PATH = _os.path.join(_REPO, "src", "template.yaml")
 
 
-def test_the_ask_transcript_keeps_the_end_of_the_session(monkeypatch):
-    """`format_transcripts_for_prompt` returned `result[:MAX_TRANSCRIPT_CHARS]`.
+class _AskLoader(_yaml.SafeLoader):
+    pass
 
-    Ask is the one path where a person is waiting for the answer, and "what did
-    we agree at the end" is the question it is most often asked. A head slice
-    answers it from the part of the day that does not contain the answer, and
-    reports nothing.
+
+for _tag in ("!Sub", "!Ref", "!If", "!Not", "!Equals", "!GetAtt", "!FindInMap",
+             "!Join", "!Condition", "!Select", "!Split", "!ImportValue", "!And", "!Or"):
+    _AskLoader.add_constructor(_tag, lambda loader, node: getattr(node, "value", None))
+
+
+def _template():
+    return _yaml.load(_io.open(_TEMPLATE_PATH, encoding="utf-8").read(), Loader=_AskLoader)
+
+
+def _workflow(name):
+    path = _os.path.join(_REPO, ".github", "workflows", name)
+    return _io.open(path, encoding="utf-8").read()
+
+
+def _env_text(fn):
+    """The raw YAML of one function's Environment block, as written -- because
+    `!Ref X` is a YAML tag a plain loader will not resolve to a string, and
+    matching for `!Ref AskConversationMemory` needs the literal text."""
+    text = _io.open(_TEMPLATE_PATH, encoding="utf-8").read()
+    start = text.index(f"\n  {fn}:\n")
+    nxt = _re.search(r"\n  [A-Za-z]\w*:\n", text[start + 1:])
+    block = text[start:start + 1 + nxt.start()] if nxt else text[start:]
+    env_start = block.index("\n      Environment:\n")
+    rest = block[env_start + 1:]
+    m = _re.search(r"\n      [A-Za-z]\w*:\n", rest)
+    return rest[:m.start()] if m else rest
+
+
+def _env_value(fn, key):
+    """One literal env value, as a string -- reads from the parsed template so
+    it never sees the `!Ref` tag itself, only a plain scalar."""
+    t = _template()
+    return t["Resources"][fn]["Properties"]["Environment"]["Variables"][key]
+
+
+def _timeout(fn):
+    return _template()["Resources"][fn]["Properties"]["Timeout"]
+
+
+def test_the_ask_timeouts_descend():
+    """Each layer must give up before the one waiting on it."""
+    t = _template()
+    api = t["Resources"]["ApiFunction"]["Properties"]["Timeout"]
+    agent = t["Resources"]["AskAgentFunction"]["Properties"]["Timeout"]
+    http = int(t["Resources"]["AskAgentFunction"]["Properties"]
+                ["Environment"]["Variables"]["LLM_HTTP_TIMEOUT"])
+    assert api < 29, "API Gateway gives up at 29s; the Lambda must go first"
+    # <=, not <: AskAgentFunction's own Timeout is pinned to 28 -- equal to
+    # ApiFunction's -- because two IN-CODE hard stops run inside it
+    # (corroboration.HARD_STOP_SECONDS, web_answer.HARD_STOP_SECONDS, both
+    # 27s) and need room to return their shaped body before the runtime
+    # kills the function. See test_no_in_code_hard_stop_reaches_the_runtime_kill.
+    assert agent <= api
+    assert http < agent
+
+
+def test_the_ask_deadlines_descend():
+    """The OTHER ladder (Task 9). All three are LITERALS in the env blocks --
+    deliberately, so one reader works for all of them: a !Ref would hide the
+    number in a parameter Default and need a second way to read it. They live in
+    two functions and two tasks, so nothing else notices when one is raised.
+
+    A waiter's budget must EXCEED the budget of what it waits on, or it abandons
+    a callee that is still working correctly."""
+    invoke   = int(_env_value("ApiFunction", "ASK_INVOKE_TIMEOUT"))
+    deadline = int(_env_value("AskAgentFunction", "ASK_DEADLINE_SECONDS"))
+    one_call = int(_env_value("AskAgentFunction", "LLM_HTTP_TIMEOUT"))
+    assert one_call < deadline, "one model call may not spend the whole request"
+    assert deadline < invoke, "the agent must finish before its caller stops waiting"
+    assert invoke < _timeout("ApiFunction"), "and the invoke before the runtime kills us"
+
+
+def test_no_in_code_hard_stop_reaches_the_runtime_kill():
+    """The defect this guards: AskAgentFunction's Timeout was set to 27, equal
+    to TWO in-code hard stops that run inside that same function --
+    corroboration.py and web_answer.py each default their own
+    HARD_STOP_SECONDS to 27 (measured, stage budgets deliberately fill it).
+    At Timeout=27 the runtime kills the function at the exact instant those
+    stops are designed to fire, leaving no time to return the shaped
+    `timed_out` body -- silently, because the template-only tests above
+    check numbers, not what runs inside the function they bound.
+
+    Both features are ON on TEST, so this is not a hypothetical ladder rung.
     """
-    import lambda_ask_agent as aa
-    lines = _long_turns(4000)
-    monkeypatch.setattr(aa, "format_turns_for_prompt", lambda norm, **kw: lines)
-    monkeypatch.setattr(aa, "MAX_TRANSCRIPT_CHARS", 5_000)
+    import corroboration
+    import web_answer
 
-    out = aa.format_transcripts_for_prompt([{"any": "shape"}])
-
-    assert lines[0] in out, "the opening is gone"
-    assert lines[-1] in out, "the ending is gone -- this is the defect"
-    assert "omitted" in out, "the model was not told anything was dropped"
-
-
-def test_the_ask_report_summary_keeps_its_tail(monkeypatch):
-    """Same slice, same fix, different function: next steps and quality items are
-    rendered last, so a head slice drops exactly the actionable half."""
-    import lambda_ask_agent as aa
-    monkeypatch.setattr(aa, "MAX_REPORT_CHARS", 400)
-    report = {
-        "executive_summary": "x" * 600,
-        "quality_and_compliance": [
-            {"status": "concern", "item": "UNIQUE_TAIL_ITEM", "details": "d"}],
-    }
-
-    out = aa.format_report_for_prompt(report, "daily")
-
-    assert "UNIQUE_TAIL_ITEM" in out, "the tail of the report is gone"
-
-
-def test_an_ask_transcript_under_the_limit_is_untouched(monkeypatch):
-    """Elision must not announce itself on a session that fits."""
-    import lambda_ask_agent as aa
-    lines = _long_turns(3)
-    monkeypatch.setattr(aa, "format_turns_for_prompt", lambda norm, **kw: lines)
-    out = aa.format_transcripts_for_prompt([{"any": "shape"}])
-    assert out == "\n".join(lines)
-    assert "omitted" not in out
+    agent_timeout = _timeout("AskAgentFunction")
+    assert corroboration.HARD_STOP_SECONDS < agent_timeout, (
+        f"corroboration.HARD_STOP_SECONDS ({corroboration.HARD_STOP_SECONDS}) must be "
+        f"strictly below AskAgentFunction's Timeout ({agent_timeout}), or the runtime "
+        f"kills the function before its own hard stop can return a shaped body")
+    assert web_answer.HARD_STOP_SECONDS < agent_timeout, (
+        f"web_answer.HARD_STOP_SECONDS ({web_answer.HARD_STOP_SECONDS}) must be "
+        f"strictly below AskAgentFunction's Timeout ({agent_timeout}), or the runtime "
+        f"kills the function before its own hard stop can return a shaped body")

@@ -114,7 +114,7 @@ def _clean_match_setup(monkeypatch, confidence=0.9, suggested_progress=100,
     monkeypatch.setattr(lpm.dashscope_utils, "embed", lambda texts: [[1.0, 0.0]] * len(texts))
     monkeypatch.setattr(
         llm_utils, "call_llm",
-        lambda prompt, max_tokens=512, force_json=False: (
+        lambda prompt, max_tokens=512, force_json=False, **kw: (
             json.dumps({
                 "task_id": "T-1", "confidence": confidence,
                 "suggested_status": "completed", "suggested_progress": suggested_progress,
@@ -354,7 +354,7 @@ def test_handler_invalid_progress_coerced_and_no_status_drops_suggestion(monkeyp
     req_key, fake_lambda = _clean_match_setup(monkeypatch)
     monkeypatch.setattr(
         llm_utils, "call_llm",
-        lambda prompt, max_tokens=512, force_json=False: (
+        lambda prompt, max_tokens=512, force_json=False, **kw: (
             json.dumps({
                 "task_id": "T-1", "confidence": 0.9,
                 "suggested_status": None, "suggested_progress": 105,
@@ -365,7 +365,13 @@ def test_handler_invalid_progress_coerced_and_no_status_drops_suggestion(monkeyp
     )
     result = lpm.lambda_handler(_match_request_event(req_key), None)
     assert result["suggestions"] == []
-    assert fake_lambda.invoke_calls == []
+    # Track B Task 6a: the double gate still ACCEPTED this verdict (T-1 is a
+    # survivor, confidence 0.9 >= CONF_MIN) -- only the real-change filter
+    # dropped the suggestion, so a decision record is still written (and the
+    # writer is still invoked to carry it) even though `suggestions` is empty.
+    assert len(result["verdicts"]) == 1
+    assert result["verdicts"][0]["auto_outcome"] == "accepted"
+    assert len(fake_lambda.invoke_calls) == 1
 
 
 def test_handler_invalid_progress_coerced_valid_status_still_suggests(monkeypatch):
@@ -375,7 +381,7 @@ def test_handler_invalid_progress_coerced_valid_status_still_suggests(monkeypatc
     req_key, fake_lambda = _clean_match_setup(monkeypatch)
     monkeypatch.setattr(
         llm_utils, "call_llm",
-        lambda prompt, max_tokens=512, force_json=False: (
+        lambda prompt, max_tokens=512, force_json=False, **kw: (
             json.dumps({
                 "task_id": "T-1", "confidence": 0.9,
                 "suggested_status": "completed", "suggested_progress": 105,
@@ -466,7 +472,8 @@ def test_handler_clean_match_produces_one_suggestion(monkeypatch):
 
     assert len(fake_lambda.invoke_calls) == 1
     sent = json.loads(fake_lambda.invoke_calls[0]["Payload"])
-    assert sent == {"suggestions": result["suggestions"], "impacts": result["impacts"]}
+    assert sent == {"suggestions": result["suggestions"], "impacts": result["impacts"],
+                    "verdicts": result["verdicts"]}
 
 
 def test_handler_below_threshold_produces_zero(monkeypatch):
@@ -475,7 +482,12 @@ def test_handler_below_threshold_produces_zero(monkeypatch):
     result = lpm.lambda_handler(_match_request_event(req_key), None)
 
     assert result["suggestions"] == []
-    assert fake_lambda.invoke_calls == []
+    # Track B Task 6a: a below-threshold verdict is now a decision record
+    # (auto_outcome='rejected'), not a silent drop -- so the writer IS
+    # invoked, just with no suggestion in the payload.
+    assert len(result["verdicts"]) == 1
+    assert result["verdicts"][0]["auto_outcome"] == "rejected"
+    assert len(fake_lambda.invoke_calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -570,7 +582,7 @@ def test_handler_progress_decrease_not_real_change(monkeypatch):
     # Override the Claude stub to also propose the SAME status as current.
     monkeypatch.setattr(
         llm_utils, "call_llm",
-        lambda prompt, max_tokens=512, force_json=False: (
+        lambda prompt, max_tokens=512, force_json=False, **kw: (
             json.dumps({
                 "task_id": "T-1", "confidence": 0.9,
                 "suggested_status": "in_progress", "suggested_progress": 30,
@@ -583,7 +595,12 @@ def test_handler_progress_decrease_not_real_change(monkeypatch):
     result = lpm.lambda_handler(_match_request_event(req_key), None)
 
     assert result["suggestions"] == []
-    assert fake_lambda.invoke_calls == []
+    # Track B Task 6a: the double gate ACCEPTED this verdict; only the
+    # real-change filter dropped the suggestion, so a decision record is
+    # still written and the writer is still invoked to carry it.
+    assert len(result["verdicts"]) == 1
+    assert result["verdicts"][0]["auto_outcome"] == "accepted"
+    assert len(fake_lambda.invoke_calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -697,7 +714,7 @@ def _dispatch_claude(impact_response):
     """A call_llm stub that distinguishes the suggestion-phase prompt
     from the impact-phase prompt by content: build_impact_prompt's finding
     lines always contain "finding_id=", never present in build_prompt."""
-    def _dispatch(prompt, max_tokens=512, force_json=False):
+    def _dispatch(prompt, max_tokens=512, force_json=False, **kw):
         if "finding_id=" in prompt:
             return json.dumps(impact_response), None
         return json.dumps({
@@ -734,10 +751,11 @@ def test_handler_collects_impacts_and_invokes_writer_once(monkeypatch):
     assert impact["impact_evidence"]["llm_confidence"] == 0.9
     assert impact["impact_evidence"]["programme_updated_at"] == "2026-07-10T00:00:00Z"
 
-    # ONE writer invoke carrying BOTH keys, after everything is processed.
+    # ONE writer invoke carrying every key, after everything is processed.
     assert len(fake_lambda.invoke_calls) == 1
     sent = json.loads(fake_lambda.invoke_calls[0]["Payload"])
-    assert sent == {"suggestions": result["suggestions"], "impacts": result["impacts"]}
+    assert sent == {"suggestions": result["suggestions"], "impacts": result["impacts"],
+                    "verdicts": result["verdicts"]}
 
 
 def test_report_artifact_without_findings_skips_impact_phase(monkeypatch):
@@ -746,7 +764,7 @@ def test_report_artifact_without_findings_skips_impact_phase(monkeypatch):
     req_key, fake_lambda = _clean_match_setup(monkeypatch)
     call_count = {"n": 0}
 
-    def counting_claude(prompt, max_tokens=512, force_json=False):
+    def counting_claude(prompt, max_tokens=512, force_json=False, **kw):
         call_count["n"] += 1
         return json.dumps({
             "task_id": "T-1", "confidence": 0.9,
@@ -785,7 +803,7 @@ def test_zero_survivor_finding_excluded_from_claude_call(monkeypatch):
 
     captured_prompts = []
 
-    def dispatch_and_capture(prompt, max_tokens=512, force_json=False):
+    def dispatch_and_capture(prompt, max_tokens=512, force_json=False, **kw):
         captured_prompts.append(prompt)
         if "finding_id=" in prompt:
             return json.dumps({"impacts": [

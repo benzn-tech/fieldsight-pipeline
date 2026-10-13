@@ -155,6 +155,23 @@ def session_id_from_source_key(source_s3_key):
 # session. This regex tells them apart on the read side.
 _CHUNK_SESSION_BASE_RE = re.compile(r"^sid([0-9a-f]{32})$")
 
+# Every spelling a session is addressed by in the /sessions/{id}/… routes:
+#   sid{32hex}                           a chunk session (extract_session's base)
+#   {32hex}                              the same session, bare (brief/rolling/status accept it)
+#   grp{32hex}                           a multi-device merged meeting (lambda_finalize_claim)
+#   {device}_{YYYY-MM-DD}_{HH-MM-SS}     a legacy whole-file base
+# Anything else is not a session, and a route that builds an S3 key from it can be
+# pointed at a key that is not a session's -- `day/` being the one that matters.
+SESSION_BASE_RE = re.compile(
+    r"^(?:(?:sid|grp)?[0-9a-f]{32}"
+    r"|[A-Za-z0-9][A-Za-z0-9._-]*_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})$"
+)
+
+
+def is_session_base(value):
+    """True when `value` is one of the spellings a session is addressed by."""
+    return bool(value) and bool(SESSION_BASE_RE.match(value))
+
 
 def device_session_id(session_base):
     """The 32-hex device session id for a chunk session's base (`sid{32hex}`),

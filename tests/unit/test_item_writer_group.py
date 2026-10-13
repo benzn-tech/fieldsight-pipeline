@@ -8,9 +8,9 @@ Four failures, every one of them silent in production:
     recordings row. The result is "identity bridge miss ... zero writes": the
     merge discarded, AFTER the members' topics were deleted.
 
-  * The member deletes are keyed on source_s3_key and
-    delete_topics_for_source returns a rowcount rather than raising. A key that
-    differs by one character removes nothing and leaves the duplicate the merge
+  * The member supersedes are keyed on source_s3_key and
+    supersede_topics_for_source returns the retired rows rather than raising. A key
+    that differs by one character retires nothing and leaves the duplicate the merge
     exists to eliminate, with no error anywhere.
 
   * Suppression must compare COVERAGE, not timing. "Anything written after the
@@ -49,35 +49,74 @@ def test_a_grp_base_resolves_its_site_from_the_lead_session(monkeypatch):
                         lambda conn, sid: {"site_id": "site-1"} if sid == GID else None)
     monkeypatch.setattr(iw.sites, "get_site",
                         lambda conn, sid: {"id": "site-1", "company_id": "co-1"})
-    site = iw._site_from_group_lead(object(), "co-1", "grp" + GID)
+    monkeypatch.setattr(iw.memberships, "site_usable_by_user",
+                        lambda conn, uid, sid: {"id": sid, "company_id": "co-1"})
+    site = iw._site_from_group_lead(object(), "u-1", "grp" + GID)
     assert site["id"] == "site-1"
 
 
 def test_a_grp_site_from_another_company_is_refused(monkeypatch):
-    # Same tenant re-check _site_from_meeting_session does: a stale or rogue row
-    # must never attribute across tenants.
+    # Same recorder re-check _site_from_meeting_session does: a stale or rogue row
+    # must never attribute to a company the recorder has no relation to.
     monkeypatch.setattr(iw.meeting_session, "get", lambda conn, sid: {"site_id": "site-1"})
     monkeypatch.setattr(iw.sites, "get_site",
                         lambda conn, sid: {"id": "site-1", "company_id": "OTHER"})
-    assert iw._site_from_group_lead(object(), "co-1", "grp" + GID) is None
+    monkeypatch.setattr(iw.memberships, "site_usable_by_user", lambda conn, uid, sid: None)
+    assert iw._site_from_group_lead(object(), "u-1", "grp" + GID) is None
 
 
-def test_every_member_key_is_deleted(monkeypatch):
-    deleted = []
+def test_every_member_key_is_superseded(monkeypatch):
+    superseded = []
     art = {"tier": "group", "groupId": GID,
            "mergedMembers": [f"extractions/A/2026-08-07/sid{GID}.json",
                              f"extractions/B/2026-08-08/sid{JOINER}.json"]}
-    iw._delete_member_topics(object(), art, delete=lambda conn, k: deleted.append(k) or 3)
-    assert deleted == art["mergedMembers"]
+    iw._supersede_member_topics(
+        object(), art, "run-1",
+        supersede=lambda conn, k, run: superseded.append(k) or [{"id": "t-1"}])
+    assert superseded == art["mergedMembers"]
 
 
-def test_a_delete_that_removed_nothing_is_logged_loudly(monkeypatch, caplog):
+def test_retired_rows_across_members_are_flattened_and_returned():
+    """Task 4 needs a member's retired rows the same way it needs the idempotent-clear's --
+    the accumulator in write_extraction_items is documented as covering every supersede call,
+    and this is one of them. Two members, each retiring a DIFFERENT row, so a bug that only
+    kept the LAST member's rows (or dropped the return value entirely) would be caught."""
+    art = {"tier": "group", "groupId": GID,
+           "mergedMembers": [f"extractions/A/2026-08-07/sid{GID}.json",
+                             f"extractions/B/2026-08-08/sid{JOINER}.json"]}
+    by_key = {
+        art["mergedMembers"][0]: [{"id": "t-a1"}, {"id": "t-a2"}],
+        art["mergedMembers"][1]: [{"id": "t-b1"}],
+    }
+
+    retired = iw._supersede_member_topics(
+        object(), art, "run-1", supersede=lambda conn, k, run: by_key[k])
+
+    assert retired == [{"id": "t-a1"}, {"id": "t-a2"}, {"id": "t-b1"}]
+
+
+def test_write_extraction_items_extends_retired_topics_with_the_group_supersede():
+    """Source-position check (retired_topics is a local variable in write_extraction_items,
+    not part of its return value, so this is the seam Task 4 actually has to read from):
+    the group branch's call must be wrapped in `retired_topics.extend(...)`, not a bare call
+    whose return value is thrown away."""
+    import inspect
+    import lambda_item_writer as iw_mod
+    src = inspect.getsource(iw_mod.write_extraction_items)
+    line = next(l for l in src.splitlines() if "_supersede_member_topics(conn" in l)
+    assert line.strip().startswith("retired_topics.extend("), (
+        "the group supersede's retired rows must feed the same accumulator the "
+        "idempotent-clear and authority-flip supersedes do, or Task 4 only ever sees "
+        "two of the three sources -- got: " + line.strip())
+
+
+def test_a_supersede_that_retired_nothing_is_logged_loudly(monkeypatch, caplog):
     art = {"tier": "group", "groupId": GID,
            "mergedMembers": [f"extractions/A/2026-08-07/sid{GID}.json"]}
     with caplog.at_level("WARNING"):
-        iw._delete_member_topics(object(), art, delete=lambda conn, k: 0)
-    assert "removed 0" in caplog.text, \
-        "a delete that matched nothing must be loud — the duplicate survives silently"
+        iw._supersede_member_topics(object(), art, "run-1", supersede=lambda conn, k, run: [])
+    assert "superseded 0" in caplog.text, \
+        "a supersede that matched nothing must be loud — the duplicate survives silently"
 
 
 def test_a_solo_extraction_already_covered_by_the_merge_brings_nothing_new():
@@ -295,7 +334,7 @@ def test_an_empty_merge_does_not_delete_the_members_records():
     import inspect
     import lambda_item_writer as iw
     src = inspect.getsource(iw.write_extraction_items)
-    line = next(l for l in src.splitlines() if "_delete_member_topics(conn" in l)
+    line = next(l for l in src.splitlines() if "_supersede_member_topics(conn" in l)
     guard = src[:src.index(line)].splitlines()[-1]
     assert 'extraction.get("topics")' in guard, \
-        "the member delete must be conditional on the merge having produced topics"
+        "the member supersede must be conditional on the merge having produced topics"

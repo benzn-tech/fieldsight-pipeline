@@ -291,8 +291,13 @@ both invisible from the guard's side: `lambda_voiceprint_writer` could not impor
 PR #595), and enrolment was handed the whole 109-second turn because that is what the
 propagation half needs to match on (PRs #601–#603 narrow it to the tightest contiguous 10 s).
 The first real sample landed at spread **0.231** against the **unchanged** 0.35 limit.
-**Do not loosen that number**; it was measured on 78 prod windows and has been re-litigated
-three times. See the correction block inside the findings doc.
+**Do not loosen that number on argument alone**; it was measured on 78 prod windows and has
+been re-litigated three times. See the correction block inside the findings doc.
+**It was moved once, on evidence: 0.35 → 0.40 on 2026-09-28**, after the first measurement
+WITH two-voice negatives (owner-labelled clips + a two-person same-room meeting; nearest
+two-voice pair 0.417, nearest real speaker-change boundary 0.483). The reasoning and numbers
+live beside `DEFAULT_MAX_FRAME_SPREAD`; the scripts are `scripts/labelling/guard_study.py`
+and `room_study.py`. Any further move needs the same kind of measurement.
 
 **Method rules that generalise:** always run the same config twice before reading any
 difference — 93.5 % of the word-level change attributed to keyterms turned out to be

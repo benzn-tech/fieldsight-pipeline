@@ -249,3 +249,14 @@ def test_both_workflows_read_the_same_chat_credential():
         assert m, f"{name}: no chat credential wired"
         names[name] = m.group(1)
     assert len(set(names.values())) == 1, f"workflows read different secrets: {names}"
+
+
+import pytest as _pytest_fb
+
+
+@_pytest_fb.fixture(autouse=True)
+def _single_model_chain(monkeypatch):
+    # These tests pin ONE model's request; the fallback chain (a second request
+    # on failure, one attempt on the primary) has its own file,
+    # test_model_fallback_chain.py.
+    monkeypatch.setenv("LLM_FALLBACK_MODELS", "")

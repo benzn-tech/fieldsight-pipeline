@@ -24,12 +24,31 @@ ing = pytest.importorskip("lambda_ingest", reason="requires psycopg (installed i
 _real_embed_from_sidecar = ing.embed_from_sidecar
 
 
+class _FakeCursor:
+    def fetchone(self):
+        return None
+
+    def fetchall(self):
+        return []
+
+
 class FakeConn:
+    def __init__(self):
+        #: Every statement the production code issued, so a test can assert on
+        #: one that has no other observable effect. The day-wide advisory lock
+        #: the photo rebind takes is exactly that: an unlocked rebind and a
+        #: locked one behave identically until two of them interleave.
+        self.executed = []
+
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb):
         return False
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        return _FakeCursor()
 
 
 class _FakeS3Exceptions:
@@ -99,21 +118,28 @@ def wired(monkeypatch):
     and inert repo writes. Individual tests override as needed."""
     monkeypatch.setattr(ing, "get_connection", lambda *a, **k: FakeConn())
     monkeypatch.setattr(ing, "_s3_client", FakeS3({REPORT_KEY: json.dumps(make_report())}))
-    monkeypatch.setattr(ing.companies, "get_company_by_name",
-                        lambda conn, name: {"id": "co-1", "name": name})
+    monkeypatch.setattr(ing, "resolve_company",
+                        lambda conn, folder: {"id": "co-1", "name": "Co"})
     monkeypatch.setattr(ing.sites, "get_company_site_by_name",
                         lambda conn, cid, name: {"id": "site-1", "name": name}
                         if name == "Test Site" else None)
-    monkeypatch.setattr(ing.users, "get_by_folder_name", lambda conn, cid, folder_name: None)
+    monkeypatch.setattr(ing.users, "get_by_folder_name_global", lambda conn, folder_name: None)
     # No app-tagged recording by default -- existing tests exercise the
     # legacy resolve_site path unchanged; tests that care about the app pick
     # override this explicitly.
-    monkeypatch.setattr(ing.recordings, "site_for_day", lambda conn, cid, user_folder, date: None)
+    monkeypatch.setattr(ing.recordings, "site_for_day", lambda conn, uid, user_folder, date: None)
     monkeypatch.setattr(ing.chunks, "delete_chunks_for_source", lambda *a, **k: 0)
-    monkeypatch.setattr(ing.topics, "delete_topics_for_source", lambda *a, **k: 0)
-    monkeypatch.setattr(ing.topics, "delete_topics_for_source_prefix", lambda *a, **k: 0)
+    monkeypatch.setattr(ing.topics, "supersede_topics_for_source", lambda *a, **k: [])
+    monkeypatch.setattr(ing.topics, "supersede_topics_for_source_prefix", lambda *a, **k: [])
     monkeypatch.setattr(ing.topics, "upsert_topic",
                         lambda *a, **k: {"id": "topic-uuid-0"})
+    # Track B final wave (Ruling R19): topic_decisions.insert_decisions /
+    # topic_questions.insert_questions hit conn.cursor(...), which FakeConn does not model
+    # (it only implements .execute()) -- stubbed inert by default here, same reasoning
+    # test_lambda_item_writer.py's own `wired` fixture gives for findings/decision_records.
+    # Tests that care about a specific dual-written row override this.
+    monkeypatch.setattr(ing.topic_decisions, "insert_decisions", lambda *a, **k: [])
+    monkeypatch.setattr(ing.topic_questions, "insert_questions", lambda *a, **k: [])
     monkeypatch.setattr(ing.chunks, "insert_chunk", lambda *a, **k: {"id": "chunk-x"})
     monkeypatch.setattr(ing, "_load_vectors", lambda bucket, sidecar_key: {})
     monkeypatch.setattr(ing, "embed_from_sidecar",
@@ -178,6 +204,7 @@ def test_resolve_site_name_primary_path(monkeypatch):
         lambda conn, cid, name: {"id": "site-1", "name": name}
         if name == "SB1108 Ellesmere College" else None,
     )
+    monkeypatch.setattr(ing.users, "get_by_folder_name_global", lambda conn, f: None)
     report = {"site": "SB1108 Ellesmere College", "topics": []}
 
     site = ing.resolve_site(None, "co-1", report, "Jarley_Trainor")
@@ -193,8 +220,8 @@ def test_resolve_site_fallback_via_slug_or_membership(monkeypatch):
     monkeypatch.setattr(ing.sites, "get_company_site_by_name",
                         lambda conn, cid, name: None)
     monkeypatch.setattr(
-        ing.users, "get_by_folder_name",
-        lambda conn, cid, folder_name: {"id": "u-9", "global_role": "worker"}
+        ing.users, "get_by_folder_name_global",
+        lambda conn, folder_name: {"id": "u-9", "global_role": "worker"}
         if folder_name == "Jarley_Trainor" else None,
     )
     monkeypatch.setattr(
@@ -222,8 +249,8 @@ def test_resolve_site_fallback_skips_for_all_scope(monkeypatch):
     monkeypatch.setattr(ing.sites, "get_company_site_by_name",
                         lambda conn, cid, name: None)
     monkeypatch.setattr(
-        ing.users, "get_by_folder_name",
-        lambda conn, cid, folder_name: {"id": "u-admin", "global_role": "admin"}
+        ing.users, "get_by_folder_name_global",
+        lambda conn, folder_name: {"id": "u-admin", "global_role": "admin"}
         if folder_name == "Ben_Lin" else None,
     )
     called = []
@@ -245,8 +272,8 @@ def test_resolve_site_double_miss_skips(monkeypatch):
     # (caller skips, never invents a site).
     monkeypatch.setattr(ing.sites, "get_company_site_by_name",
                         lambda conn, cid, name: None)
-    monkeypatch.setattr(ing.users, "get_by_folder_name",
-                        lambda conn, cid, folder_name: None)
+    monkeypatch.setattr(ing.users, "get_by_folder_name_global",
+                        lambda conn, folder_name: None)
     report = {"site": "BD Opportunity Brainstorm", "topics": []}
 
     site = ing.resolve_site(None, "co-1", report, "Jarley_Trainor")
@@ -274,7 +301,7 @@ def test_ingest_falls_back_to_resolve_site_when_no_app_pick(wired):
     # No app-tagged recording for that (user_folder, date) -- existing
     # legacy-resolver behaviour is preserved unchanged.
     wired.setattr(ing.recordings, "site_for_day",
-                  lambda conn, cid, user_folder, date: None)
+                  lambda conn, uid, user_folder, date: None)
     calls = []
     real_resolve_site = ing.resolve_site
     wired.setattr(ing, "resolve_site",
@@ -316,8 +343,8 @@ def test_site_bridge_miss_skips(wired):
     write_calls = []
     wired.setattr(ing.chunks, "delete_chunks_for_source",
                   lambda *a, **k: write_calls.append("delete_chunks"))
-    wired.setattr(ing.topics, "delete_topics_for_source",
-                  lambda *a, **k: write_calls.append("delete_topics"))
+    wired.setattr(ing.topics, "supersede_topics_for_source",
+                  lambda *a, **k: write_calls.append("supersede_topics") or [])
     wired.setattr(ing.topics, "upsert_topic",
                   lambda *a, **k: write_calls.append("upsert_topic") or {"id": "x"})
     wired.setattr(ing.chunks, "insert_chunk",
@@ -334,12 +361,12 @@ def test_site_bridge_miss_skips(wired):
 # Idempotency — source-key delete before insert
 # ---------------------------------------------------------------------------
 
-def test_idempotent_source_delete_before_insert(wired):
+def test_idempotent_source_supersede_before_insert(wired):
     order = []
     wired.setattr(ing.chunks, "delete_chunks_for_source",
                   lambda *a, **k: order.append("delete_chunks"))
-    wired.setattr(ing.topics, "delete_topics_for_source",
-                  lambda *a, **k: order.append("delete_topics"))
+    wired.setattr(ing.topics, "supersede_topics_for_source",
+                  lambda *a, **k: order.append("supersede_topics") or [])
     wired.setattr(ing.topics, "upsert_topic",
                   lambda *a, **k: order.append("upsert_topic") or {"id": "topic-uuid-0"})
     wired.setattr(ing.chunks, "insert_chunk",
@@ -348,7 +375,7 @@ def test_idempotent_source_delete_before_insert(wired):
     ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
 
     assert order.index("delete_chunks") < order.index("upsert_topic")
-    assert order.index("delete_topics") < order.index("upsert_topic")
+    assert order.index("supersede_topics") < order.index("upsert_topic")
     assert order.index("upsert_topic") < order.index("insert_chunk")
 
 
@@ -395,9 +422,9 @@ def test_map_action_items_carries_raw_deadline_text_alongside_date_filter():
 
     assert mapped == [
         {"text": "Order more hard hats", "responsible": "Bob", "deadline": None,
-         "deadline_text": "Friday", "priority": "high"},
+         "deadline_text": "Friday", "priority": "high", "item_id": None},
         {"text": "Submit permit", "responsible": "Alice", "deadline": "2026-07-06",
-         "deadline_text": "2026-07-06", "priority": None},
+         "deadline_text": "2026-07-06", "priority": None, "item_id": None},
     ]
 
 
@@ -574,8 +601,8 @@ def test_backfill_still_lists_reports(monkeypatch):
 
 def test_resolve_user_by_folder_name(monkeypatch):
     monkeypatch.setattr(
-        ing.users, "get_by_folder_name",
-        lambda conn, cid, folder_name: {"id": "u-42", "folder_name": folder_name}
+        ing.users, "get_by_folder_name_global",
+        lambda conn, folder_name: {"id": "u-42", "folder_name": folder_name}
         if folder_name == "Jarley_Trainor" else None,
     )
 
@@ -585,8 +612,8 @@ def test_resolve_user_by_folder_name(monkeypatch):
 
 
 def test_resolve_user_miss_none(monkeypatch):
-    monkeypatch.setattr(ing.users, "get_by_folder_name",
-                        lambda conn, cid, folder_name: None)
+    monkeypatch.setattr(ing.users, "get_by_folder_name_global",
+                        lambda conn, folder_name: None)
 
     assert ing.resolve_user(None, "co-1", "Unknown_Person") is None
 
@@ -597,8 +624,8 @@ def test_resolve_user_field_only_folder_hits(monkeypatch):
     # must resolve exactly like a login user, straight off folder_name (no
     # name-join heuristic).
     monkeypatch.setattr(
-        ing.users, "get_by_folder_name",
-        lambda conn, cid, folder_name: {"id": "u-field-1", "kind": "field_only"}
+        ing.users, "get_by_folder_name_global",
+        lambda conn, folder_name: {"id": "u-field-1", "kind": "field_only"}
         if folder_name == "MPI1" else None,
     )
 
@@ -608,8 +635,8 @@ def test_resolve_user_field_only_folder_hits(monkeypatch):
 
 
 def test_user_bridge_null_on_miss(wired):
-    wired.setattr(ing.users, "get_by_folder_name",
-                  lambda conn, cid, folder_name: None)
+    wired.setattr(ing.users, "get_by_folder_name_global",
+                  lambda conn, folder_name: None)
 
     user_id = ing.resolve_user(None, "co-1", "Jarley_Trainor")
     assert user_id is None
@@ -637,8 +664,8 @@ def test_user_bridge_null_on_miss(wired):
 
 def test_ingest_supersedes_session_items(wired):
     calls = []
-    wired.setattr(ing.topics, "delete_topics_for_source_prefix",
-                  lambda conn, prefix: calls.append(prefix) or 0)
+    wired.setattr(ing.topics, "supersede_topics_for_source_prefix",
+                  lambda conn, prefix, run: calls.append(prefix) or [])
 
     ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
 
@@ -650,16 +677,16 @@ def test_ingest_supersedes_session_items(wired):
 # flag is on AND extraction topics already exist for (user_folder, date),
 # the nightly report ingest stops overwriting them: no extraction-prefix
 # wipe, no report topics written, no match_request emitted. Chunks still
-# flow (RAG) with topic_id=None. The report-key deletes (delete_chunks_for_
-# source / delete_topics_for_source) run ALWAYS regardless of the flag —
-# stale pre-flip report rows must still clear on re-ingest.
+# flow (RAG) with topic_id=None. The report-key clears (delete_chunks_for_
+# source / supersede_topics_for_source, Track B Task 3) run ALWAYS regardless
+# of the flag — stale pre-flip report rows must still clear on re-ingest.
 # ---------------------------------------------------------------------------
 
 def test_flip_off_behavior_unchanged(wired):
     wired.setattr(ing, "AUTHORITY_FLIP", False)
     prefix_deletes = []
-    wired.setattr(ing.topics, "delete_topics_for_source_prefix",
-                  lambda conn, prefix: prefix_deletes.append(prefix) or 0)
+    wired.setattr(ing.topics, "supersede_topics_for_source_prefix",
+                  lambda conn, prefix, run: prefix_deletes.append(prefix) or [])
     upserts = []
     wired.setattr(ing.topics, "upsert_topic",
                   lambda *a, **k: upserts.append(1) or {"id": "topic-uuid-0"})
@@ -685,11 +712,11 @@ def test_flip_on_with_extractions_defers(wired):
     report_deletes = []
     wired.setattr(ing.chunks, "delete_chunks_for_source",
                   lambda conn, key: report_deletes.append(("chunks", key)) or 0)
-    wired.setattr(ing.topics, "delete_topics_for_source",
-                  lambda conn, key: report_deletes.append(("topics", key)) or 0)
+    wired.setattr(ing.topics, "supersede_topics_for_source",
+                  lambda conn, key, run: report_deletes.append(("topics", key)) or [])
     prefix_deletes = []
-    wired.setattr(ing.topics, "delete_topics_for_source_prefix",
-                  lambda conn, prefix: prefix_deletes.append(prefix) or 0)
+    wired.setattr(ing.topics, "supersede_topics_for_source_prefix",
+                  lambda conn, prefix, run: prefix_deletes.append(prefix) or [])
     upserts = []
     wired.setattr(ing.topics, "upsert_topic",
                   lambda *a, **k: upserts.append(1) or {"id": "topic-uuid-0"})
@@ -722,8 +749,8 @@ def test_flip_on_without_extractions_falls_back_to_legacy(wired):
     wired.setattr(ing, "AUTHORITY_FLIP", True)
     wired.setattr(ing.topics, "has_topics_for_source_prefix", lambda conn, prefix: False)
     prefix_deletes = []
-    wired.setattr(ing.topics, "delete_topics_for_source_prefix",
-                  lambda conn, prefix: prefix_deletes.append(prefix) or 0)
+    wired.setattr(ing.topics, "supersede_topics_for_source_prefix",
+                  lambda conn, prefix, run: prefix_deletes.append(prefix) or [])
     upserts = []
     wired.setattr(ing.topics, "upsert_topic",
                   lambda *a, **k: upserts.append(1) or {"id": "topic-uuid-0"})
@@ -765,23 +792,33 @@ def test_defer_day_links_chunks_to_extraction_topic_by_time(wired):
     # match on time overlap alone.
     wired.setattr(ing, "AUTHORITY_FLIP", True)
     wired.setattr(ing.topics, "has_topics_for_source_prefix", lambda conn, prefix: True)
+    ext_key = "extractions/Jarley_Trainor/2026-03-02/sidEXT1234567890.json"
     wired.setattr(
         ing.topics, "list_extraction_topics_for_day",
         lambda conn, site_id, user_id, report_date: [
-            {"id": "ext-a", "title": "Unrelated title", "occurred_at": "09:02:00"},
+            {"id": "ext-a", "title": "Unrelated title", "occurred_at": "09:02:00",
+             "source_s3_key": ext_key},
         ],
     )
-    captured_topic_ids = []
+    captured = []
     wired.setattr(
         ing.chunks, "insert_chunk",
         lambda conn, site_id, report_date, chunk_type, chunk_text, embedding, **kw:
-            captured_topic_ids.append(kw["topic_id"]) or {"id": "chunk-x"},
+            captured.append(kw) or {"id": "chunk-x"},
     )
 
     ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
 
+    captured_topic_ids = [kw["topic_id"] for kw in captured]
     assert captured_topic_ids
     assert captured_topic_ids[0] == "ext-a"
+
+    # PR #972 review #1: the matched extraction topic's own source_s3_key must land on
+    # the topic-type (chunk_report) chunk's metadata.source_files -- the only thing that
+    # lets archive_chunks_for_session's session_base arm still find this chunk once R21
+    # unbinds its topic_id on a later supersede of "ext-a". `_load_turns` is stubbed to
+    # [] by `wired`, so chunk_transcripts produces no windows and this is the only chunk.
+    assert captured[0]["metadata"]["source_files"] == [ext_key]
 
 
 def test_defer_day_unmatched_report_topic_stays_none(wired):
@@ -866,10 +903,10 @@ def test_defer_day_two_report_topics_do_not_collide_on_one_extraction(monkeypatc
         {"topic_id": 1, "time_range": "09:01 – 09:04", "topic_title": "Toolbox Talk"},
     ]
 
-    seq_to_id = ing._match_report_topics_to_extraction(
+    seq_to_ext = ing._match_report_topics_to_extraction(
         None, "site-1", "user-1", "2026-03-02", report_topics)
 
-    topic_ids = [seq_to_id.get(0), seq_to_id.get(1)]
+    topic_ids = [seq_to_ext.get(0, {}).get("id"), seq_to_ext.get(1, {}).get("id")]
     assert topic_ids[0] != topic_ids[1]
     non_none = [v for v in topic_ids if v is not None]
     assert len(non_none) == 1
@@ -893,8 +930,8 @@ def test_null_user_reports_do_not_collide(wired, monkeypatch):
     deleted_keys = []
     wired.setattr(ing.chunks, "delete_chunks_for_source",
                   lambda conn, key: deleted_keys.append(("chunks", key)) or 0)
-    wired.setattr(ing.topics, "delete_topics_for_source",
-                  lambda conn, key: deleted_keys.append(("topics", key)) or 0)
+    wired.setattr(ing.topics, "supersede_topics_for_source",
+                  lambda conn, key, run: deleted_keys.append(("topics", key)) or [])
     wired.setattr(ing.topics, "upsert_topic", lambda *a, **k: {"id": "t-uuid"})
     wired.setattr(ing.chunks, "insert_chunk", lambda *a, **k: {"id": "c-uuid"})
     # user bridge misses for both (wired fixture's get_by_folder_name returns None)
@@ -979,31 +1016,16 @@ def test_match_request_not_emitted_on_identity_skip(wired):
 
 
 class TestResolveCompany:
-    """Task 2 (prod-isolation): resolve_company routes a lake object to its
-    owning company. Pinned (test stack) vs global-folder (prod stack)."""
+    """resolve_company routes a lake object to its owning company through the
+    identity directory (globally-unique folder_name). The old COMPANY_NAME pin
+    and name fallback are gone; see test_company_resolution_is_directory_only."""
 
-    def test_pinned_when_multi_tenant_off(self, monkeypatch):
-        monkeypatch.setattr(ing, "MULTI_TENANT", False)
-        monkeypatch.setattr(ing.users, "get_by_folder_name_global",
-                            lambda conn, f: (_ for _ in ()).throw(AssertionError("must not be called")))
-        monkeypatch.setattr(ing.companies, "get_company_by_name",
-                            lambda conn, name: {"id": "internal-co", "name": name})
-        assert ing.resolve_company(FakeConn(), "Cust_User")["id"] == "internal-co"
-
-    def test_global_folder_lookup_when_on(self, monkeypatch):
-        monkeypatch.setattr(ing, "MULTI_TENANT", True)
+    def test_global_folder_lookup(self, monkeypatch):
         monkeypatch.setattr(ing.users, "get_by_folder_name_global",
                             lambda conn, f: {"id": "u1", "company_id": "cust-co", "folder_name": f})
         monkeypatch.setattr(ing.companies, "get_company_by_id",
                             lambda conn, cid: {"id": cid, "name": "Pilot Co"})
         assert ing.resolve_company(FakeConn(), "Cust_User")["id"] == "cust-co"
-
-    def test_falls_back_to_pin_on_unknown_folder(self, monkeypatch):
-        monkeypatch.setattr(ing, "MULTI_TENANT", True)
-        monkeypatch.setattr(ing.users, "get_by_folder_name_global", lambda conn, f: None)
-        monkeypatch.setattr(ing.companies, "get_company_by_name",
-                            lambda conn, name: {"id": "internal-co", "name": name})
-        assert ing.resolve_company(FakeConn(), "Legacy_Device")["id"] == "internal-co"
 
 
 # ---------------------------------------------------------------------------
@@ -1019,6 +1041,30 @@ PICTURES_PREFIX = "users/Jarley_Trainor/pictures/2026-03-02/"
 PHOTO_KEY = PICTURES_PREFIX + "Benl1_2026-03-02_09-02-00.jpg"
 
 
+def _ingest_day_rebind(wired, day_topics):
+    """Wire the day-wide photo rebind and return the rows it writes.
+
+    These two tests used to assert on `upsert_topic(photos=...)`. That writer
+    is gone from BOTH paths: it matched the whole day's photos against one
+    artifact's topics, so on a mid-flip day where a report and extractions both
+    exist the two writers could bind the same photo once each -- the
+    report-path half of the defect that put 22 prod photos under more than one
+    topic. topic_photos has one writer now (photo_rebind.rebind_day_photos),
+    after the loop, over every topic the day has.
+    """
+    wired.setattr(ing.topics, "list_day_topics_for_binding",
+                  lambda conn, folder, date: day_topics)
+    wired.setattr(ing.recordings, "session_local_span", lambda *a, **k: None)
+    written = []
+    wired.setattr(ing.topics, "replace_day_photo_bindings",
+                  lambda conn, folder, date, rows: written.append(list(rows)))
+    return written
+
+
+_INGEST_ONE_TOPIC_DAY = [{"id": "topic-uuid-0", "time_range": "09:00 - 09:05",
+                          "source_s3_key": REPORT_KEY}]
+
+
 def test_ingest_binds_photos_to_report_topics(wired):
     # make_report()'s one topic has time_range "09:00 - 09:05"; the photo's
     # filename encodes 09:02 (BUG-01-safe extraction), inside that window.
@@ -1026,23 +1072,36 @@ def test_ingest_binds_photos_to_report_topics(wired):
         REPORT_KEY: json.dumps(make_report()),
         PHOTO_KEY: b"",
     }))
-    captured = []
-    wired.setattr(
-        ing.topics, "upsert_topic",
-        lambda conn, site_id, report_date, title, **kw:
-            captured.append(kw) or {"id": "topic-uuid-0"},
-    )
+    written = _ingest_day_rebind(wired, _INGEST_ONE_TOPIC_DAY)
 
     result = ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
 
     assert result["topics"] == 1
-    assert len(captured) == 1
-    assert captured[0]["photos"] == [{"s3_key": PHOTO_KEY, "caption_text": None}]
+    assert written == [[{"topic_id": "topic-uuid-0", "s3_key": PHOTO_KEY,
+                         "caption_text": None}]]
 
 
 def test_ingest_missing_pictures_prefix_is_noop(wired):
     # wired's default FakeS3 only has REPORT_KEY -- the pictures listing
-    # returns zero Contents (empty prefix -> photos=[], not a crash).
+    # returns zero Contents.
+    #
+    # The rebind still RUNS and writes nothing, which is how a day whose photos
+    # were all deleted gets cleared. "Wrote no rows" and "never ran" must stay
+    # distinguishable.
+    written = _ingest_day_rebind(wired, _INGEST_ONE_TOPIC_DAY)
+
+    ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
+
+    assert written == [[]], "the rebind must run and write nothing, not be skipped"
+
+
+def test_ingest_upsert_topic_is_no_longer_a_photo_writer(wired):
+    """Pinned separately: the kwarg going unread looks identical to it going
+    unpassed, and would leave two writers racing over one table."""
+    wired.setattr(ing, "_s3_client", FakeS3({
+        REPORT_KEY: json.dumps(make_report()), PHOTO_KEY: b"",
+    }))
+    _ingest_day_rebind(wired, _INGEST_ONE_TOPIC_DAY)
     captured = []
     wired.setattr(
         ing.topics, "upsert_topic",
@@ -1053,7 +1112,7 @@ def test_ingest_missing_pictures_prefix_is_noop(wired):
     ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
 
     assert len(captured) == 1
-    assert captured[0]["photos"] == []
+    assert "photos" not in captured[0], captured[0].get("photos")
 
 
 def test_ingest_defer_day_lists_no_pictures(wired):

@@ -55,28 +55,29 @@ def test_a_turn_below_the_floor_gets_no_name_however_good_the_scores():
 
 
 def test_a_turn_at_the_floor_is_allowed():
-    d = vp.decide_name({"Ben": 0.90, "Zoe": 0.10}, duration_s=3.0)
+    d = vp.decide_name({"Ben": 0.90, "Zoe": 0.10}, duration_s=3.0, floor=0.5)
     assert d.status == "confirmed" and d.name == "Ben"
 
 
 # ---- nearest profile plus a margin, never an absolute cut ----
 
 def test_a_clear_winner_is_confirmed():
-    d = vp.decide_name({"Ben": 0.48, "Zoe": 0.08, "Mike": 0.07}, duration_s=6.0)
+    d = vp.decide_name({"Ben": 0.48, "Zoe": 0.08, "Mike": 0.07}, duration_s=6.0, floor=0.4)
     assert d.status == "confirmed" and d.name == "Ben"
     assert d.margin == pytest.approx(0.40)
 
 
 def test_two_close_scores_are_tentative_rather_than_a_coin_flip():
-    """This is the shape of the Phase 0 miss: 0.111 against 0.104. Naming the winner there
-    is a wrong confident name, which v2 §1 prices above a missing one."""
-    d = vp.decide_name({"Ben": 0.111, "Zoe": 0.104}, duration_s=6.0)
+    """The shape of the Phase 0 miss (0.111 against 0.104), lifted above the absence floor
+    so the margin rule is what is tested. Naming the winner of a near-tie is a wrong
+    confident name, which v2 §1 prices above a missing one."""
+    d = vp.decide_name({"Ben": 0.411, "Zoe": 0.404}, duration_s=6.0)
     assert d.status == "tentative" and d.name == "Ben"
 
 
 def test_a_tentative_name_still_says_who_it_leans_towards():
     """Viewer-only, per v2 §1 — the guess is shown as a guess, not withheld entirely."""
-    d = vp.decide_name({"Ben": 0.30, "Zoe": 0.26}, duration_s=8.0)
+    d = vp.decide_name({"Ben": 0.50, "Zoe": 0.46}, duration_s=8.0)
     assert d.name == "Ben" and d.status == "tentative"
 
 
@@ -104,6 +105,162 @@ def test_the_margin_is_configurable_but_its_default_is_not_the_fitted_cut():
     assert vp.DEFAULT_MIN_MARGIN != pytest.approx(0.262)
     d = vp.decide_name({"Ben": 0.5, "Zoe": 0.2}, duration_s=6.0, min_margin=0.9)
     assert d.status == "tentative"
+
+
+# ----------------------------------------------------------
+# The rejection floor (2026-09-20 spec S1). A NEW, FINAL check, after the margin, before
+# returning confirmed. It can only ever demote confirmed -> tentative, never produce
+# unknown by itself (duration and "no profiles" already own that path) and never promote.
+# Absent (floor=None, today's default) it is a no-op -- every existing test above this
+# block must keep passing unchanged.
+# ----------------------------------------------------------
+
+
+def test_a_would_be_confirmation_below_the_floor_is_downgraded_to_tentative():
+    """The 09-10 shape: a clear margin, but the winning score itself is not plausible for
+    this company's own corrected history."""
+    d = vp.decide_name({"Mike": 0.445, "Leo": 0.177}, duration_s=6.0, floor=0.50)
+    assert d.status == "tentative"
+    assert d.name == "Mike", "the lean is still shown -- a demotion is not a withholding"
+    assert "floor" in d.reason.lower()
+
+
+def test_a_would_be_confirmation_above_the_floor_stays_confirmed():
+    d = vp.decide_name({"Ben": 0.65, "Zoe": 0.20}, duration_s=6.0, floor=0.50)
+    assert d.status == "confirmed" and d.name == "Ben"
+
+
+def test_a_company_without_a_calibrated_floor_never_gets_a_confirmation():
+    """This replaces `test_no_floor_is_a_no_op_exactly_as_today`, whose contract was that
+    floor=None reproduced margin-only behaviour. That contract is what confirmed an
+    unenrolled stranger at best=0.445 / margin=0.268 on 2026-09-10 -- the exact case the
+    floor was later added to catch. A company with no floor is not a company where the
+    plausibility check passes; it is one where the check has not run, and a confident name
+    on the strength of a check that did not run is the failure this system prices highest.
+
+    The name is still offered. `tentative` is the claim the evidence supports."""
+    d = vp.decide_name({"Ben": 0.48, "Zoe": 0.08, "Mike": 0.07}, duration_s=6.0)
+    assert d.status == "tentative" and d.name == "Ben"
+    assert "no calibrated floor" in d.reason
+
+
+def test_the_same_scores_are_confirmed_once_the_company_has_a_floor():
+    """The cap is not a new refusal of these scores -- it is a refusal to judge them
+    without a standard. Same turn, same margin, floor present: confirmed."""
+    d = vp.decide_name({"Ben": 0.48, "Zoe": 0.08, "Mike": 0.07}, duration_s=6.0, floor=0.4)
+    assert d.status == "confirmed" and d.name == "Ben"
+
+
+def test_the_2026_09_10_stranger_is_no_longer_confirmed():
+    """The measured case, with its measured numbers: a speaker who was not enrolled at all
+    still produces a winner -- the least-dissimilar profile present -- and a wide margin
+    over weak candidates confirmed it. Pinned here so the regression has a name."""
+    d = vp.decide_name({"nearest": 0.445, "next": 0.177}, duration_s=6.0)
+    assert d.margin == pytest.approx(0.268)
+    assert d.status == "tentative", (
+        "0.445 with a 0.268 margin is the exact shape that was confirmed on 2026-09-10; "
+        "margin alone cannot tell a plausible match from the least implausible stranger")
+
+
+def test_the_decision_carries_the_winners_score():
+    """`speaker_turn_names.score` was NULL on all 604 rows ever written because nothing
+    produced this value, so `recompute_company_floor` could never reach its minimum sample
+    count and no company ever got a floor -- which is why the cap above exists at all."""
+    assert vp.decide_name({"Ben": 0.48, "Zoe": 0.08}, duration_s=6.0).score == pytest.approx(0.48)
+    assert vp.decide_name({"Ben": 0.48}, duration_s=6.0).score == pytest.approx(0.48)
+    assert vp.decide_name({"Ben": 0.9}, duration_s=1.0).score is None, "nothing was scored"
+    assert vp.decide_name({}, duration_s=6.0).score is None, "nothing to score against"
+
+
+def test_the_floor_never_turns_a_tentative_result_into_a_confirmation():
+    """The floor is a final, demotion-only check. It has nothing to promote from a
+    tentative margin outcome, and this pins that it never tries."""
+    d = vp.decide_name({"Ben": 0.30, "Zoe": 0.26}, duration_s=8.0, floor=0.0)
+    assert d.status == "tentative", (
+        "a floor of 0.0 (trivially cleared) must not rescue a result the margin already "
+        "downgraded")
+
+
+def test_the_floor_never_fires_on_a_single_profile_result():
+    """Single-profile decisions are already tentative (no runner-up to beat) and stay
+    tentative -- the floor has nothing to demote and must not raise or change the reason
+    in a way that hides the real one."""
+    d = vp.decide_name({"Ben": 0.9}, duration_s=10.0, floor=0.99)
+    assert d.status == "tentative" and d.name == "Ben"
+    assert "runner-up" in d.reason.lower()
+
+
+def test_the_floor_never_produces_unknown():
+    """Failing the floor is a lean, not a refusal -- unknown stays owned by duration and
+    'no profiles', per S1.4."""
+    d = vp.decide_name({"Mike": 0.10, "Leo": -0.05}, duration_s=6.0, floor=0.9)
+    assert d.status != "unknown"
+
+
+# ----------------------------------------------------------
+# Margin scaling with the candidate pool (2026-09-20 spec S4). profiles_for_matching
+# returns every consented profile for a company, unlimited -- decide_name's runner-up is
+# drawn from a POOL whose size, not the number of people actually in the room, is what the
+# margin has to survive. A fixed margin comfortable at 6 profiles becomes a harder bar at
+# 60 for reasons that have nothing to do with matching getting worse.
+#
+# No curve is fit here -- six enrolled voices across four dates cannot support one without
+# repeating the +0.262 overfitting mistake this module's own docstring already warns
+# against. What ships is the SHAPE: a pool-size-aware lookup, with today's fixed margin as
+# the fallback below a size threshold, exactly as the floor falls back to "no floor" below
+# its own minimum (S1.5) -- the same shape, twice, for the same reason.
+# ----------------------------------------------------------
+
+
+def test_below_the_scale_threshold_the_margin_is_unchanged():
+    """The pool sizes every existing test in this file was written against (2-3 profiles)
+    must reproduce today's DEFAULT_MIN_MARGIN exactly -- this task must not silently
+    change any decision already pinned above."""
+    assert vp.effective_margin(pool_size=3) == vp.DEFAULT_MIN_MARGIN
+    assert vp.effective_margin(pool_size=vp.DEFAULT_MARGIN_SCALE_THRESHOLD) == vp.DEFAULT_MIN_MARGIN
+
+
+def test_an_explicit_min_margin_override_is_never_replaced_by_the_scaled_value():
+    """Existing callers pass min_margin explicitly (e.g. the fitted-cut test). An explicit
+    override is a caller's deliberate choice and the scaling mechanism must not second-guess
+    it -- only the DEFAULT is pool-size-aware."""
+    d = vp.decide_name({"Ben": 0.5, "Zoe": 0.2}, duration_s=6.0, min_margin=0.9)
+    assert d.status == "tentative"
+
+
+def test_decide_name_still_defaults_correctly_at_small_pool_sizes():
+    """Every pre-existing decide_name test above this block used 1-3 profiles and no
+    min_margin override -- this pins that Task 3 did not move their outcomes."""
+    d = vp.decide_name({"Ben": 0.48, "Zoe": 0.08, "Mike": 0.07}, duration_s=6.0, floor=0.4)
+    assert d.status == "confirmed" and d.name == "Ben"
+
+
+def test_a_large_pool_uses_a_wider_effective_margin_by_default():
+    """The mechanism, not a fitted number: a pool past the threshold must not silently keep
+    using the same constant a 6-profile company gets, or DEFAULT_MIN_MARGIN would already be
+    "the curve" in disguise."""
+    small_margin = vp.effective_margin(pool_size=3)
+    large_margin = vp.effective_margin(pool_size=vp.DEFAULT_MARGIN_SCALE_THRESHOLD * 5)
+    assert large_margin >= small_margin
+    assert large_margin > vp.DEFAULT_MIN_MARGIN, (
+        "a pool well past the threshold that still gets exactly today's constant means "
+        "nothing about scale actually changed the bar")
+
+
+def test_decide_name_uses_pool_size_for_its_default_margin():
+    """A margin that would confirm at a small pool size may no longer clear at a large one,
+    with nothing else about the scores changed -- the mechanism reaching decide_name, not
+    just existing as a standalone function."""
+    scores_small_pool = {"Ben": 0.40, "Zoe": 0.24}   # margin 0.16, clears 0.15
+    d_small = vp.decide_name(scores_small_pool, duration_s=6.0, floor=0.3)
+    assert d_small.status == "confirmed"
+
+    huge_pool = {"Ben": 0.40, "Zoe": 0.24}
+    huge_pool.update({f"stranger_{i}": 0.10 for i in range(vp.DEFAULT_MARGIN_SCALE_THRESHOLD * 5)})
+    d_large = vp.decide_name(huge_pool, duration_s=6.0, floor=0.3)
+    assert d_large.status == "tentative", (
+        "the same 0.16 margin over the SAME runner-up must be judged against a wider "
+        "effective margin once the pool is large, or pool size never actually mattered")
 
 
 # ---- the enrolment contamination guard (v2 §6) ----
@@ -143,17 +300,8 @@ def test_no_frames_at_all_is_not_a_pass():
 # ----------------------------------------------------------
 
 
-def test_two_samples_of_one_person_collapse_to_their_best():
-    rows = [
-        {"person_key": "ben", "score": 0.31},
-        {"person_key": "ben", "score": 0.43},
-        {"person_key": "zoe", "score": 0.08},
-    ]
-    assert vp.aggregate_scores(rows) == {"ben": 0.43, "zoe": 0.08}
-
-
 def test_a_person_with_two_profiles_no_longer_beats_himself():
-    """The Phase 0 case, with its measured numbers rather than invented ones.
+    """The Phase 0 case, restated with its measured numbers.
 
     Ben's own two profiles sit ~0.08 apart and the nearest other voice is far below both.
     Ungrouped they are each other's runner-up and the margin never clears 0.15."""
@@ -166,9 +314,60 @@ def test_a_person_with_two_profiles_no_longer_beats_himself():
         {"person_key": "ben", "score": 0.505},
         {"person_key": "zoe", "score": 0.078},
     ]
-    decision = vp.decide_name(vp.aggregate_scores(rows), duration_s=5.0)
+    decision = vp.decide_name(vp.aggregate_scores(rows), duration_s=5.0, floor=0.4)
     assert decision.status == "confirmed"
     assert decision.name == "ben"
+
+
+# ----------------------------------------------------------
+# Mean, not max (2026-09-20). A profile pooled across recording conditions (a clean
+# read-aloud sample plus a site-condition sample) spikes under max whenever one sample's
+# ACOUSTIC CONDITIONS match a stranger's turn, not because the person is present -- measured
+# on 09-10, where a pooled-MAX profile put a person who was never in the room top of the
+# list at +0.054/+0.055. Mean absorbs that spike into an average across conditions.
+# ----------------------------------------------------------
+
+
+def test_two_samples_of_one_person_collapse_to_their_mean_not_their_max():
+    rows = [
+        {"person_key": "ben", "score": 0.31},
+        {"person_key": "ben", "score": 0.43},
+        {"person_key": "zoe", "score": 0.08},
+    ]
+    assert vp.aggregate_scores(rows) == pytest.approx({"ben": 0.37, "zoe": 0.08})
+
+
+def test_a_stray_high_sample_no_longer_wins_on_its_own():
+    """The exact failure mode mean pooling exists to remove: one sample scoring high for
+    reasons that have nothing to do with the turn's speaker (matching acoustic conditions,
+    not matching voice) used to carry the whole profile under max. Under mean it is pulled
+    back toward the profile's other, more representative samples."""
+    rows = [
+        {"person_key": "ben", "score": 0.05},
+        {"person_key": "ben", "score": 0.06},
+        {"person_key": "ben", "score": 0.62},  # a site-condition spike, not a real match
+        {"person_key": "mike", "score": 0.10},
+    ]
+    scores = vp.aggregate_scores(rows)
+    assert scores["ben"] == pytest.approx((0.05 + 0.06 + 0.62) / 3)
+    assert scores["ben"] < 0.62, (
+        "max pooling would have reported 0.62 here -- the whole point of this change is "
+        "that a single spiking sample no longer speaks for the profile")
+
+
+def test_a_person_with_two_profiles_no_longer_beats_himself_under_mean():
+    """The Phase 0 case restated under mean pooling. Aggregation still has to happen before
+    the margin means anything -- mean pooling does not remove the need for `person_key`
+    grouping, it only changes what happens once rows are grouped."""
+    rows = [
+        {"person_key": "ben", "score": 0.425},
+        {"person_key": "ben", "score": 0.505},
+        {"person_key": "zoe", "score": 0.078},
+    ]
+    decision = vp.decide_name(vp.aggregate_scores(rows), duration_s=5.0, floor=0.4)
+    assert decision.status == "confirmed"
+    assert decision.name == "ben"
+    assert decision.margin == pytest.approx((0.425 + 0.505) / 2 - 0.078)
 
 
 def test_profiles_without_a_user_do_not_collide():
@@ -389,3 +588,126 @@ def test_every_candidate_but_the_cluster_count_grows_with_frame_count():
     large = vp.frame_statistics(pool)
     assert large["pair_max"] >= small["pair_max"]
     assert large["frames"] > small["frames"]
+
+
+# ---- the absence floor (owner-labelled clips, 2026-09-28) ------------------------------
+
+
+def test_with_no_calibrated_floor_a_weak_best_names_nobody():
+    """Across 42 labelled clips the highest score of someone who was NOT that person was
+    0.274. The Phase 0 pair (0.111 / 0.104) sits among strangers, not among Ben's clips."""
+    d = vp.decide_name({"Ben": 0.111, "Zoe": 0.104}, duration_s=6.0)
+    assert d.status == "unknown" and d.name is None
+
+
+def test_one_profile_is_one_to_one_not_a_name_for_everyone():
+    """A company with one enrolled person used to get that name, with a question mark, on
+    every voice in the room -- there was no runner-up to lose to."""
+    assert vp.decide_name({"Petros": 0.22}, duration_s=8.0).status == "unknown"
+    d = vp.decide_name({"Petros": 0.61}, duration_s=8.0)
+    assert d.status == "tentative" and d.name == "Petros"
+
+
+def test_a_calibrated_floor_replaces_the_default():
+    """The default is for companies with no evidence of their own; it must not overrule a
+    floor fitted to theirs."""
+    d = vp.decide_name({"Ben": 0.30, "Zoe": 0.05}, duration_s=8.0, floor=0.25)
+    assert d.status == "confirmed" and d.name == "Ben"
+
+
+# ---- roster narrowing (on-site-roster plan, Task 4, correction 3) ----------------------
+#
+# The plan's spec-correction 3 is the authoritative rule (the design doc's own "Review
+# outcome" section, and the plan says the code contradicting the spec wins): score every
+# profile first, take the full-pool winner; an OFF-roster winner is capped at tentative
+# (never renamed to the on-roster runner-up -- that would be the exact wrong-confident-name
+# a naive "margin computed against the subset only" would produce, which the plan calls
+# unsafe and explicitly rejects); an ON-roster winner is re-decided over the on-roster
+# subset alone, which is where the real benefit lives: an absent colleague who used to be
+# the runner-up no longer counts against the margin.
+
+
+def test_no_roster_is_byte_for_byte_todays_decide_name():
+    """Absent/empty roster: decide_with_roster must return the SAME Decision fields as
+    calling decide_name directly, not merely the same status."""
+    scores = {"A": 0.60, "B": 0.58}
+    direct = vp.decide_name(scores, duration_s=8.0, floor=0.1)
+    via_roster = vp.decide_with_roster(scores, on_roster=set(), duration_s=8.0, floor=0.1)
+    assert via_roster == direct
+    via_roster_none = vp.decide_with_roster(scores, on_roster=None, duration_s=8.0, floor=0.1)
+    assert via_roster_none == direct
+
+
+def test_an_off_roster_winner_is_capped_at_tentative_not_renamed():
+    """A off-roster wins by a wide margin with the floor satisfied: without a roster this
+    confirms A; with one, A is still named (the roster narrows, never blocks) but capped at
+    tentative -- and NEVER silently swapped for the on-roster runner-up B."""
+    scores = {"A": 0.80, "B": 0.20}
+    without = vp.decide_name(scores, duration_s=8.0, floor=0.1)
+    assert without.status == "confirmed" and without.name == "A"
+    with_roster = vp.decide_with_roster(scores, on_roster={"B"}, duration_s=8.0, floor=0.1)
+    assert with_roster.status == "tentative"
+    assert with_roster.name == "A", "capped, never renamed to the on-roster runner-up"
+    assert "roster" in with_roster.reason.lower()
+
+
+def test_an_on_roster_winner_is_redecided_over_the_subset():
+    """A (on-roster) beats B (off-roster, an absent colleague) by only 0.02 -- below the
+    margin -- so the full pool alone gives only a tentative lean. C is also on-roster, far
+    behind. Narrowing to the on-roster subset {A, C} drops B, the absent colleague, and the
+    margin against C easily clears the bar -- the roster's whole point."""
+    scores = {"A": 0.60, "B": 0.58, "C": 0.10}
+    without = vp.decide_name(scores, duration_s=8.0, floor=0.1)
+    assert without.status == "tentative" and without.name == "A"
+    with_roster = vp.decide_with_roster(scores, on_roster={"A", "C"}, duration_s=8.0,
+                                        floor=0.1)
+    assert with_roster.status == "confirmed" and with_roster.name == "A"
+
+
+def test_a_single_on_roster_profile_falls_back_to_the_full_pool_result():
+    """A one-person roster narrows nothing (plan correction 3): decide_name over a subset
+    of one profile has no runner-up (margin=None), which downstream would be read as "no
+    runner-up" and the turn dropped -- so this falls back to the full-pool decision,
+    runner-up and all."""
+    scores = {"A": 0.60, "B": 0.58}
+    without = vp.decide_name(scores, duration_s=8.0, floor=0.1)
+    with_roster = vp.decide_with_roster(scores, on_roster={"A"}, duration_s=8.0, floor=0.1)
+    assert with_roster == without
+
+
+def test_duration_floor_still_applies_under_a_roster():
+    d = vp.decide_with_roster({"A": 0.9, "B": 0.1}, on_roster={"A"}, duration_s=2.0)
+    assert d.status == "unknown"
+
+
+def test_absent_floor_still_applies_under_a_roster():
+    """best=0.20 with no company floor is below DEFAULT_ABSENT_FLOOR regardless of the
+    roster -- the roster narrows candidates, it does not lower the plausibility bar."""
+    d = vp.decide_with_roster({"A": 0.20, "B": 0.05}, on_roster={"A"}, duration_s=8.0,
+                              floor=None)
+    assert d.status == "unknown"
+
+
+# ---- one enrolled person: a lean above its own floor, nothing below ------
+
+
+def test_one_enrolled_person_is_a_lean_above_the_single_candidate_floor():
+    d = vp.decide_name({"ben": vp.DEFAULT_SINGLE_CANDIDATE_FLOOR + 0.05}, duration_s=10.0)
+    assert d.status == "tentative" and d.name == "ben" and d.margin is None
+
+
+def test_one_enrolled_person_below_the_single_candidate_floor_is_nobody():
+    """Between the absent floor and the single-candidate floor sits every stranger the
+    2026-09-28 and 2026-10-13 measurements saw (<= 0.274) and nothing of the owner's own
+    (>= 0.46). Offering a name there spreads the one enrolled person over the room."""
+    d = vp.decide_name({"ben": vp.DEFAULT_SINGLE_CANDIDATE_FLOOR - 0.05}, duration_s=10.0)
+    assert d.status == "unknown" and d.name is None
+
+
+def test_one_enrolled_person_is_never_confirmed_even_with_a_calibrated_floor():
+    d = vp.decide_name({"ben": 0.95}, duration_s=10.0, floor=0.30)
+    assert d.status == "tentative"
+
+
+def test_the_single_candidate_floor_sits_above_the_absent_floor():
+    assert vp.DEFAULT_SINGLE_CANDIDATE_FLOOR > vp.DEFAULT_ABSENT_FLOOR

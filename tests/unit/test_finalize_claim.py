@@ -1,9 +1,16 @@
 """Tier-0 finalize CLAIM step (in-VPC grace-timer target). CAS-claims the session
 at the scheduled version (the idempotency guard — a mis-touch stop->resume bumps
-version, so a stale one-shot no-ops), then gathers recipient/folder/date/site + the
-rolling summary and enqueues a request for the non-VPC send worker. Collaborators are
-injected; this tests the ORCHESTRATION, not the SQL (claim_finalize itself lives in
-repositories.meeting_session). Importing the module pulls repositories (psycopg)."""
+version, so a stale one-shot no-ops), then asks for the session's final extraction.
+
+It no longer enqueues the confirmation email: that went out before the final
+extraction existed, so the email's rows came from a second summariser run made
+only for it. item-writer enqueues once those rows are durable in Aurora, and the
+sweep's `backstop` covers a final that never arrives — both are tested in
+test_the_email_waits_for_the_record.py.
+
+Collaborators are injected; this tests the ORCHESTRATION, not the SQL
+(claim_finalize itself lives in repositories.meeting_session). Importing the
+module pulls repositories (psycopg)."""
 import os
 
 os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
@@ -16,31 +23,27 @@ import lambda_finalize_claim as fc
 def test_noop_when_version_superseded(monkeypatch):
     # claim_finalize returns None -> a resume bumped version (or it already moved on)
     monkeypatch.setattr(fc.meeting_session, "claim_finalize", lambda c, s, v: None)
-    enq = []
     out = fc.finalize_claim("CONN", "abc", 3,
                             resolve_context=lambda c, r: {"recipient": "x@y.com"},
-                            read_rolling=lambda *a: {}, enqueue=enq.append)
-    assert out["status"] == "noop" and enq == []
+                            read_rolling=lambda *a: {})
+    assert out["status"] == "noop"
 
 
-def test_enqueues_full_artifact_when_claimed(monkeypatch):
+def test_claims_and_then_waits_for_the_record(monkeypatch):
     monkeypatch.setattr(fc.meeting_session, "claim_finalize",
                         lambda c, s, v: {"session_id": s, "user_id": "u1", "version": v})
-    enq = []
     out = fc.finalize_claim(
         "CONN", "abc", 5,
         resolve_context=lambda c, row: {"recipient": "bob@site.com", "folder": "Ada_L",
                                         "date": "2026-07-25", "siteName": "UC PK"},
         read_rolling=lambda folder, date, sid: {"summary": "Poured slab.",
-                                                "open_todos": [{"text": "fix rebar", "responsible": "Neil"}]},
-        enqueue=enq.append)
-    assert out["status"] == "enqueued" and out["recipient"] == "bob@site.com"
-    assert len(enq) == 1
-    art = enq[0]
-    assert art["sessionId"] == "abc" and art["version"] == 5
-    assert art["folder"] == "Ada_L" and art["date"] == "2026-07-25" and art["siteName"] == "UC PK"
-    assert art["summary"] == "Poured slab."
-    assert art["openTodos"] == [{"text": "fix rebar", "responsible": "Neil"}]
+                                                "open_todos": [{"text": "fix rebar", "responsible": "Neil"}]})
+    # The claim no longer enqueues the email. It went out before the session's
+    # final extraction existed, so its rows came from a second summariser run
+    # only for the email; item-writer enqueues it once those rows are durable,
+    # and the sweep's backstop covers a final that never arrives. The artifact
+    # itself is asserted in test_the_email_waits_for_the_record.py.
+    assert out["status"] == "waiting" and out["recipient"] == "bob@site.com"
 
 
 def test_marks_failed_and_skips_when_no_recipient(monkeypatch, caplog):
@@ -48,12 +51,11 @@ def test_marks_failed_and_skips_when_no_recipient(monkeypatch, caplog):
                         lambda c, s, v: {"session_id": s, "user_id": "u1"})
     failed = []
     monkeypatch.setattr(fc.meeting_session, "mark_failed", lambda c, s: failed.append(s))
-    enq = []
     with caplog.at_level("WARNING"):
         out = fc.finalize_claim("CONN", "abc", 5,
                                 resolve_context=lambda c, r: {"recipient": None, "folder": "MPI2"},
-                                read_rolling=lambda *a: {"summary": "S"}, enqueue=enq.append)
-    assert out["status"] == "no_recipient" and enq == [] and failed == ["abc"]
+                                read_rolling=lambda *a: {"summary": "S"})
+    assert out["status"] == "no_recipient" and failed == ["abc"]
     # named so prod ops can see WHICH recorder had no email (not a silent count)
     assert "abc" in caplog.text and "MPI2" in caplog.text
 
@@ -81,7 +83,7 @@ def test_requests_final_extraction_with_the_sid_grouping_key(monkeypatch):
         "CONN", "622a0e7fc93e4befafeda1d0442fdf35", 1,
         resolve_context=lambda c, row: {"recipient": "b@s.com", "folder": "Sam_Yu",
                                         "date": "2026-08-03"},
-        read_rolling=lambda *a: {}, enqueue=lambda a: None,
+        read_rolling=lambda *a: {},
         request_extraction=lambda sid, folder, date: reqs.append((sid, folder, date)))
     assert reqs == [("622a0e7fc93e4befafeda1d0442fdf35", "Sam_Yu", "2026-08-03")]
 
@@ -96,7 +98,7 @@ def test_requests_final_extraction_even_with_no_recipient(monkeypatch):
         "CONN", "abc", 5,
         resolve_context=lambda c, r: {"recipient": None, "folder": "MPI2",
                                       "date": "2026-08-03"},
-        read_rolling=lambda *a: {}, enqueue=lambda a: None,
+        read_rolling=lambda *a: {},
         request_extraction=lambda *a: reqs.append(a))
     assert out["status"] == "no_recipient"
     assert len(reqs) == 1
@@ -109,14 +111,15 @@ def test_extraction_request_failure_never_blocks_finalize(monkeypatch, caplog):
     def _boom(*a):
         raise RuntimeError("s3 down")
 
-    enq = []
     with caplog.at_level("ERROR"):
         out = fc.finalize_claim(
             "CONN", "abc", 5,
             resolve_context=lambda c, r: {"recipient": "b@s.com", "folder": "F",
                                           "date": "2026-08-03"},
-            read_rolling=lambda *a: {}, enqueue=enq.append, request_extraction=_boom)
-    assert out["status"] == "enqueued" and len(enq) == 1
+            read_rolling=lambda *a: {}, request_extraction=_boom)
+    # `waiting`, not `enqueued`: the email is enqueued by item-writer once the
+    # final extraction's rows are durable, or by the sweep's backstop.
+    assert out["status"] == "waiting"
     assert "abc" in caplog.text
 
 
@@ -129,7 +132,7 @@ def test_no_extraction_request_without_folder_or_date(monkeypatch):
         "CONN", "abc", 5,
         resolve_context=lambda c, r: {"recipient": "b@s.com", "folder": None,
                                       "date": "2026-08-03"},
-        read_rolling=lambda *a: {}, enqueue=lambda a: None,
+        read_rolling=lambda *a: {},
         request_extraction=lambda *a: reqs.append(a))
     assert reqs == []
 

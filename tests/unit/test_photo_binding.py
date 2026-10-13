@@ -224,7 +224,7 @@ def test_list_pictures_derives_hhmm_and_skips_untimed_names():
     photos = pb.list_pictures(fake, "bucket", prefix)
 
     assert photos == [{"key": timed, "filename": "Benl1_2026-07-23_10-40-00.jpg",
-                       "hhmm": "10:40"}]
+                       "hhmm": "10:40", "hhmmss": "10:40:00"}]
 
 
 def test_list_pictures_empty_prefix_is_noop():

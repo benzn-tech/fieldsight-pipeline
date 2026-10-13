@@ -13,8 +13,16 @@ CRITICAL: this lambda NEVER embeds text and NEVER calls Claude/DashScope.
 It runs in-VPC with no NAT / no internet egress (BUG-36) — it only accepts
 an already-computed query_embedding and searches Aurora/pgvector with it.
 
-Event:  {"sub": "<cognito sub>", "query_embedding": [1024 floats], "k": 8}
-Result: {"chunks": [...], "site_count": N}
+Event:  {"sub": "<cognito sub>", "query_embedding": [1024 floats], "k": 8,
+         optional "question" (raw text; this function extracts its literal
+         terms via lexical_terms.query_terms and OR-joins them for the
+         keyword arm -- Task 3 of the 2026-09-20 "a literal token is
+         findable" plan, fixed for real 2026-09-22 -- absent or with no
+         literal terms, the keyword arm matches nothing, never everything),
+         "date_from"/"date_to", "widen_when_empty", "site",
+         "author" (folder name), "topic_row_id"}
+Result: {"chunks": [...], "site_count": N, "basis": {...}, "applied": {...},
+         "pinned_topic": {...} only when topic_row_id was visible}
         or, on a soft failure, {"chunks": [], "error": "..."} — this
         function never raises so ask-agent can degrade gracefully instead
         of surfacing a 500 to the UI.
@@ -33,8 +41,9 @@ import json
 import logging
 
 from db.connection import close_cached_connection, get_cached_connection
-from repositories import (aliases, chunks, findings, recordings, redactions, scope,
-                         sites, topics, users)
+from lexical_terms import or_query, query_terms
+from repositories import (aliases, chunks, findings, memberships, recordings, redactions,
+                          scope, sites, topics, users)
 import text_normalize
 
 logger = logging.getLogger()
@@ -137,14 +146,21 @@ def _metric(event):
     # matches nothing -- a platform_admin reaching five sites that recorded all
     # day was told nothing was recorded. Every other caller keeps the pin, which
     # is belt-and-braces over a site set that is already theirs.
+    # A caller with an external membership reaches sites whose rows carry the SITE's
+    # company. `company=None` stays platform_admin only (final review F4: None also
+    # unpins the NULL-site arm and the tombstones, i.e. every tenant's site-less
+    # recordings); instead the home pin is waived for exactly those external site ids.
     company = None if sc.get("cross_company") else caller["company_id"]
+    ext = ({} if sc.get("cross_company")
+           else memberships.external_site_companies(conn, caller["id"], site_ids))
 
     notes = {}
     if metric.startswith("count_findings_"):
         domain = metric.rsplit("_", 1)[1]
         got = findings.count_by_domain(conn, company, domain,
                                        date_from, date_to,
-                                       site_ids=site_ids, author_ids=author_ids)
+                                       site_ids=site_ids, author_ids=author_ids,
+                                       **({"external_site_ids": list(ext)} if ext else {}))
         value = got["count"]
         for k in ("unlabelled", "null_author", "from_fallback"):
             if got[k]:
@@ -160,11 +176,13 @@ def _metric(event):
         # to and which the mirror is a copy OF. rag-search is in the VPC with no
         # egress, so an S3 read here would not fail -- it would black-hole until
         # the function timed out (BUG-36) and look like a slow query.
-        deleted = redactions.deleted_session_bases(conn, company,
-                                                   date_from, date_to)
+        deleted = redactions.deleted_session_bases(
+            conn, company, date_from, date_to,
+            **({"also_companies": sorted(set(ext.values()))} if ext else {}))
         got = recordings.range_stats(conn, company, date_from, date_to,
                                      site_ids, author_ids=author_ids,
-                                     deleted_bases=deleted)
+                                     deleted_bases=deleted,
+                                     **({"external_site_ids": list(ext)} if ext else {}))
         value = {"duration": got["duration_s"],
                  "count_sessions": got["sessions"],
                  "count_photos": got["photos"]}[metric]
@@ -220,6 +238,40 @@ def _search(event, context):
         k = 8
     k = max(1, min(k, 32))
     qv = event.get("query_embedding")
+    # The keyword arm (Task 3, 2026-09-20 spec) needs the caller's raw text,
+    # not just its embedding. ask-agent sends the question (or its rewrite,
+    # "asked") alongside query_embedding.
+    #
+    # 2026-09-22 fix ("the keyword arm can actually fire", Cause A): binding
+    # the WHOLE question as build_search_sql's %(q_text)s made
+    # websearch_to_tsquery AND every non-stopword term together, which a
+    # natural-language question essentially never satisfies -- the arm only
+    # ever fired when a user happened to type bare terms that all appeared
+    # verbatim in the same chunk. `or_query` joins the extracted terms with
+    # the literal word "or", which `websearch_to_tsquery` parses as an OR,
+    # not an AND -- measured: `websearch_to_tsquery('simple', 'ps4 or light
+    # or pole')` -> `'ps4' | 'light' | 'pole'`.
+    #
+    # 2026-09-22 SECOND fix, round 2: the terms fed to `or_query` come from
+    # `query_terms`, NOT `_aggregate_topics`' own `lexical_terms` -- the
+    # controller ran the owner's real question through the real path and
+    # measured `lexical_terms` alone letting 'when'/'did'/'and'/'why' through
+    # (all >=3 characters, none identifier-shaped, so lexical_terms's floor
+    # does not stop them). OR'd into the tsquery, ONE surviving stopword
+    # matches nearly every chunk in the corpus, which made this arm go from
+    # "never fires" to "always fires and matches noise" -- worse than before
+    # this feature shipped. `query_terms` is `lexical_terms` with English
+    # stopwords dropped (see lexical_terms.py's QUERY_STOPWORDS for why this
+    # is a second function rather than a change to the shared one -- it also
+    # drives `_aggregate_topics`' title ranking, English AND Chinese, and
+    # that ranking's tests pin today's un-filtered behavior).
+    #
+    # A question with no literal, non-stopword terms (e.g. "what safety
+    # issues came up this week") yields `or_query([])` == "" ->
+    # `websearch_to_tsquery('simple', '')` is an empty tsquery that matches
+    # NOTHING -- the arm goes inert, never match-all, exactly as the ""
+    # default always meant.
+    query_text = or_query(query_terms(event.get("question") or ""))
     date_from = event.get("date_from") or None
     date_to = event.get("date_to") or None
     site_filter = event.get("site") or None  # scope search to ONE project (within ACL)
@@ -227,6 +279,14 @@ def _search(event, context):
     # sends the dates a person picked in the UI and wants exactly those days --
     # widening a filtered LIST would show rows outside the filter they set.
     widen = bool(event.get("widen_when_empty"))
+
+    # Scoped Ask (spec 2026-09-15 §4.3). Requests, never grants: each one only
+    # narrows inside the ACL resolved below, and `applied` reports what was
+    # enforced. `dropped` lists what was requested and not enforced.
+    requested_topic = event.get("topic_row_id") or None
+    author_filter = event.get("author") or None
+    applied = {"dropped": []}
+    pinned = None
 
     # What the answer will be based on. Carried on EVERY return below, empty
     # search included: a caller reading `result.get("basis")` and finding None
@@ -240,7 +300,8 @@ def _search(event, context):
     basis = {"from": date_from, "to": date_to, "widened": False}
 
     if not sub or not qv:
-        return {"chunks": [], "error": "missing sub or query_embedding", "basis": basis}
+        return {"chunks": [], "error": "missing sub or query_embedding", "basis": basis,
+                "applied": applied}
 
     # Reuse a module-level connection across warm invokes — reconnecting to
     # Aurora cost ~1-2s per call and dominated search latency. Read-only path,
@@ -249,7 +310,8 @@ def _search(event, context):
     caller = users.get_user_by_sub(conn, sub)
     if caller is None:
         logger.info("rag-search: caller not provisioned for sub=%s", sub)
-        return {"chunks": [], "error": "caller not provisioned", "basis": basis}
+        return {"chunks": [], "error": "caller not provisioned", "basis": basis,
+                "applied": applied}
 
     # Fail-safe: ALWAYS scope through the dashboard's ACL primitive (per-author
     # graded visibility). No GRADED_ROLES gate here — rag-search is a new
@@ -259,6 +321,33 @@ def _search(event, context):
     site_ids = [str(s) for s in sc["site_ids"]]
     author_ids = ([str(a) for a in sc["author_ids"]]
                   if sc["author_ids"] is not None else None)
+
+    # A pinned topic defines the site, the day and (when known) the author. It
+    # is read through the caller's ACL; anything it cannot see is the same None.
+    # A requested `site`/`author` alongside a visible topic is not applied --
+    # the topic defines them -- and each is reported dropped (controller
+    # ruling, spec §4.3.1, commit 1e21006).
+    if requested_topic:
+        pinned = topics.get_topic_visible(conn, requested_topic, site_ids, author_ids)
+        if pinned:
+            if site_filter:
+                applied["dropped"].append({"field": "site_id", "reason": "overridden_by_topic"})
+            if author_filter:
+                applied["dropped"].append({"field": "author_folder", "reason": "overridden_by_topic"})
+            site_ids = [str(pinned["site_id"])]
+            # A NULL author must not become ANY(ARRAY[NULL]), which matches nothing.
+            if pinned.get("user_id") is not None:
+                author_ids = [str(pinned["user_id"])]
+            date_from = date_to = str(pinned["report_date"])
+            widen = False              # the topic's day, never a neighbour of it
+            site_filter = None         # the topic defines the site ...
+            author_filter = None       # ... and the author
+            basis = {"from": date_from, "to": date_to, "widened": False}
+            applied.update({"topic_row_id": pinned["id"], "topic_title": pinned.get("title"),
+                            "site_id": site_ids[0], "date": date_from})
+        else:
+            applied["dropped"].append({"field": "topic_row_id", "reason": "not_visible"})
+            logger.info("rag-search: topic_row_id not visible to caller")
 
     # Project-scoped search: `site_filter` is normally the site UUID (what the
     # UI's top-bar selector actually sends), so check it against the caller's
@@ -276,11 +365,37 @@ def _search(event, context):
             matched_id = matched["id"] if matched else None
             site_ids = [s for s in site_ids if str(s) == str(matched_id)]
 
+        if site_ids:
+            applied["site_id"] = str(site_ids[0])
+        else:
+            applied["dropped"].append({"field": "site_id", "reason": "not_visible"})
+
+    # A named author narrows INSIDE the ACL and never falls back to the
+    # unnarrowed set: unresolved, or outside author_ids, means no rows. Company-
+    # pinned lookup unless the caller is cross-company (users.py:69-82).
+    if author_filter:
+        # Global lookup (project-owned tenancy P3): an external author's directory row
+        # is in their HOME company. Visibility is NOT decided here -- it is the site set
+        # (search_chunks is site-scoped) and `author_ids` below.
+        if sc.get("cross_company"):
+            target = users.get_by_folder_name_global(conn, author_filter)
+        else:
+            target = (users.get_by_folder_name(conn, caller["company_id"], author_filter)
+                      or users.get_by_folder_name_global(conn, author_filter))
+        target_id = str(target["id"]) if target else None
+        if target_id and (author_ids is None or target_id in author_ids):
+            author_ids = [target_id]
+            applied["author_folder"] = author_filter
+        else:
+            applied["dropped"].append({"field": "author_folder", "reason": "not_visible"})
+            return {"chunks": [], "site_count": len(site_ids), "basis": basis,
+                    "applied": applied}
+
     if not site_ids:
-        return {"chunks": [], "site_count": 0, "basis": basis}
+        return {"chunks": [], "site_count": 0, "basis": basis, "applied": applied}
 
     rows = chunks.search_chunks(conn, qv, site_ids, k=k, author_ids=author_ids,
-                                date_from=date_from, date_to=date_to)
+                                date_from=date_from, date_to=date_to, query_text=query_text)
 
     # "Nothing yesterday" must not become an empty answer. Retry on the nearest
     # day this caller can actually see, at or BEFORE the range they asked
@@ -300,7 +415,8 @@ def _search(event, context):
         if latest:
             widened_rows = chunks.search_chunks(conn, qv, site_ids, k=k,
                                                 author_ids=author_ids,
-                                                date_from=latest, date_to=latest)
+                                                date_from=latest, date_to=latest,
+                                                query_text=query_text)
             # Claimed ONLY if the retry actually returned something. Setting it
             # unconditionally reports "based on 2026-07-18" over zero excerpts --
             # a statement about a day nothing was read from. It cannot happen
@@ -326,4 +442,7 @@ def _search(event, context):
     # and report_date is datetime.date -- Lambda's JSON marshaller can't
     # serialize either. Coerce to plain strings before returning.
     rows = json.loads(json.dumps(rows, default=str))
-    return {"chunks": rows, "site_count": len(site_ids), "basis": basis}
+    out = {"chunks": rows, "site_count": len(site_ids), "basis": basis, "applied": applied}
+    if pinned:
+        out["pinned_topic"] = pinned
+    return out

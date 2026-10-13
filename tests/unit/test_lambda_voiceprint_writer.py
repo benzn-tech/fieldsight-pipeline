@@ -24,6 +24,7 @@ CO = "11111111-1111-1111-1111-111111111111"
 class FakeConn:
     def __init__(self):
         self.committed = False
+        self.savepoints = 0
 
     def __enter__(self):
         return self
@@ -31,6 +32,24 @@ class FakeConn:
     def __exit__(self, *a):
         self.committed = a[0] is None
         return False
+
+    def transaction(self):
+        """Just enough psycopg surface for `with conn.transaction():` -- a real
+        savepoint, in production, rolls back only the block it wraps and leaves the
+        connection usable; here there is nothing to actually roll back, so the fake
+        only has to let an exception propagate out (so the caller's try/except sees
+        it) without swallowing it or aborting anything else."""
+        outer = self
+
+        class _Tx:
+            def __enter__(self):
+                outer.savepoints += 1
+                return outer
+
+            def __exit__(self, *exc):
+                return False
+
+        return _Tx()
 
 
 @pytest.fixture
@@ -345,8 +364,290 @@ def test_fetching_profiles_is_company_scoped(monkeypatch):
     monkeypatch.setattr(vw, "profiles_for_matching",
                         lambda conn, company_id, site_id=None:
                         seen.update({"co": company_id}) or [])
+    monkeypatch.setattr(vw, "company_floor", lambda conn, company_id: None)
     vw.lambda_handler({"op": "profiles", "company_id": CO}, None)
     assert seen["co"] == CO, "one company's voice would be matched against another's"
+
+
+def test_fetching_profiles_hands_the_companys_floor_to_the_embedder(monkeypatch):
+    """A calibrated floor sits in speaker_voiceprint_company_floors doing nothing unless
+    it travels with the vectors to the non-VPC embedder, which cannot read it itself."""
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "profiles_for_matching",
+                        lambda conn, company_id, site_id=None: [])
+    monkeypatch.setattr(vw, "company_floor", lambda conn, company_id: 0.42)
+    out = vw.lambda_handler({"op": "profiles", "company_id": CO}, None)
+    assert out["company_floor"] == 0.42
+
+
+# ---- roster narrowing (on-site-roster plan, Task 3) ------------------------
+#
+# `_profiles` is the only place that can read the roster: it has a connection, and the
+# embedder does not (module docstring). Absent `site_id`/`date`, `on_roster` must not
+# appear at all -- not `False` -- because "the roster was checked and found nobody on
+# it" and "no roster was asked for" are different facts the embedder's roster rule
+# (voiceprint_utils.decide_with_roster) treats completely differently: the first
+# narrows to nothing, the second leaves matching exactly as it is today.
+
+VP_A = "aaaaaaaa-1111-1111-1111-111111111111"
+VP_B = "bbbbbbbb-2222-2222-2222-222222222222"
+SITE = "cccccccc-3333-3333-3333-333333333333"
+
+
+def _two_profiles():
+    return [{"id": VP_A, "display_name": "A", "status": "confirmed", "embedding": [0.1] * 192},
+            {"id": VP_B, "display_name": "B", "status": "confirmed", "embedding": [0.2] * 192}]
+
+
+def test_profiles_carries_on_roster_when_site_and_date_are_given(monkeypatch):
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "profiles_for_matching",
+                        lambda conn, company_id, site_id=None: _two_profiles())
+    monkeypatch.setattr(vw, "company_floor", lambda conn, company_id: None)
+    monkeypatch.setattr(vw.site_attendance, "on_roster_profile_ids",
+                        lambda conn, company_id, site_id, attend_date, **kw: {VP_A})
+    out = vw.lambda_handler({"op": "profiles", "company_id": CO, "site_id": SITE,
+                             "date": "2026-09-30"}, None)
+    by_key = {p["person_key"]: p for p in out["profiles"]}
+    assert by_key[VP_A]["on_roster"] is True
+    assert by_key[VP_B]["on_roster"] is False
+    assert out["roster_size"] == 1
+
+
+def test_on_roster_is_absent_without_site_id_or_date(monkeypatch):
+    """No `site_id` or no `date` -- the roster read must not even be attempted, and
+    `on_roster` must be MISSING from every profile, not `False`."""
+    called = []
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "profiles_for_matching",
+                        lambda conn, company_id, site_id=None: _two_profiles())
+    monkeypatch.setattr(vw, "company_floor", lambda conn, company_id: None)
+    monkeypatch.setattr(vw.site_attendance, "on_roster_profile_ids",
+                        lambda conn, company_id, site_id, attend_date, **kw:
+                        called.append(1) or {VP_A})
+
+    out = vw.lambda_handler({"op": "profiles", "company_id": CO}, None)
+    assert not called, "no site_id/date: the roster must never be read"
+    for p in out["profiles"]:
+        assert "on_roster" not in p
+    assert "roster_size" not in out
+
+    out2 = vw.lambda_handler({"op": "profiles", "company_id": CO, "site_id": SITE}, None)
+    assert not called, "date missing: the roster must never be read"
+    for p in out2["profiles"]:
+        assert "on_roster" not in p
+
+
+def test_a_roster_read_failure_narrows_nothing_and_does_not_raise(monkeypatch):
+    """The spec's own rule: an absent/broken integration must never make recognition
+    worse. A roster outage degrades to today's no-roster shape, logged, not raised."""
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "profiles_for_matching",
+                        lambda conn, company_id, site_id=None: _two_profiles())
+    monkeypatch.setattr(vw, "company_floor", lambda conn, company_id: None)
+
+    def _boom(conn, company_id, site_id, attend_date, **kw):
+        raise RuntimeError("roster table unreachable")
+
+    monkeypatch.setattr(vw.site_attendance, "on_roster_profile_ids", _boom)
+    out = vw.lambda_handler({"op": "profiles", "company_id": CO, "site_id": SITE,
+                             "date": "2026-09-30"}, None)
+    for p in out["profiles"]:
+        assert "on_roster" not in p
+    assert "roster_size" not in out
+
+
+# ---- the derived-roster switch (2026-09-30 plan, Task 4) --------------------
+#
+# `_profiles` has to hand the switch through on every call: the writer reads env at import,
+# so the repository takes `derived`/`lookback_days` as plain arguments and never touches the
+# environment itself (plan correction 7) -- which means the only place the switch can leak
+# from the writer's module constants into the actual roster read is this call.
+
+
+def test_profiles_passes_the_derived_switch_and_lookback(monkeypatch):
+    captured = {}
+
+    def _capture(conn, company_id, site_id, attend_date, derived=None, lookback_days=None):
+        captured["derived"] = derived
+        captured["lookback_days"] = lookback_days
+        return {VP_A}
+
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "profiles_for_matching",
+                        lambda conn, company_id, site_id=None: _two_profiles())
+    monkeypatch.setattr(vw, "company_floor", lambda conn, company_id: None)
+    monkeypatch.setattr(vw.site_attendance, "on_roster_profile_ids", _capture)
+    monkeypatch.setattr(vw, "ROSTER_DERIVED", True)
+    monkeypatch.setattr(vw, "ROSTER_LOOKBACK_DAYS", 9)
+
+    vw.lambda_handler({"op": "profiles", "company_id": CO, "site_id": SITE,
+                       "date": "2026-09-30"}, None)
+    assert captured == {"derived": True, "lookback_days": 9}
+
+
+def test_profiles_off_passes_derived_false(monkeypatch):
+    captured = {}
+
+    def _capture(conn, company_id, site_id, attend_date, derived=None, lookback_days=None):
+        captured["derived"] = derived
+        return {VP_A}
+
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "profiles_for_matching",
+                        lambda conn, company_id, site_id=None: _two_profiles())
+    monkeypatch.setattr(vw, "company_floor", lambda conn, company_id: None)
+    monkeypatch.setattr(vw.site_attendance, "on_roster_profile_ids", _capture)
+    monkeypatch.setattr(vw, "ROSTER_DERIVED", False)
+
+    vw.lambda_handler({"op": "profiles", "company_id": CO, "site_id": SITE,
+                       "date": "2026-09-30"}, None)
+    assert captured["derived"] is False
+
+
+def test_the_code_defaults():
+    """The clean-environment default, checked through the parsing helper rather than a
+    module reload -- a reload here would leave `vw` in whatever state the LAST reload left
+    it, which every other test in this file relies on being the normal, env-driven one."""
+    assert vw.ROSTER_DERIVED is True
+    assert vw.ROSTER_LOOKBACK_DAYS == 14
+    assert vw._derived_from_env(None) is True
+    assert vw._derived_from_env("on") is True
+    assert vw._derived_from_env("ON") is True
+    assert vw._derived_from_env("off") is False
+    assert vw._derived_from_env("OFF") is False
+
+
+# ---- the scheduled floor recompute ----------------------------------------
+#
+# rate(6 hours), not triggered by a match or a correction (spec S1.3): the floor must not
+# move mid-decision because one turn happened to land during recomputation. The
+# EventBridge Schedule event carries no company_id -- it invokes with a fixed event, not
+# one per company -- so the handler loops over every company itself, matching
+# ExtractionBacklogFunction's single-sweep shape rather than an external per-company
+# fan-out this stack has no mechanism to drive.
+
+
+def test_recompute_floors_sweeps_every_company(monkeypatch):
+    companies = [{"id": "co-1"}, {"id": "co-2"}, {"id": "co-3"}]
+    seen = []
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "list_companies", lambda conn: companies)
+    monkeypatch.setattr(vw, "recompute_company_floor",
+                        lambda conn, company_id, **kw:
+                        seen.append(company_id) or {"company_id": company_id,
+                                                    "floor": 0.3, "sample_count": 20})
+    out = vw.lambda_handler({"op": "recompute_floors"}, None)
+    assert seen == ["co-1", "co-2", "co-3"], (
+        "the schedule's event carries no company_id, so every company must be swept in "
+        "one invocation")
+    assert out["companies"] == 3 and out["floors_written"] == 3
+
+
+def test_recompute_floors_reports_companies_still_below_the_minimum(monkeypatch):
+    """`recompute_company_floor` returns None below the minimum sample count -- that must
+    show up as a company swept but not written, not vanish from the count."""
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "list_companies", lambda conn: [{"id": "co-1"}])
+    monkeypatch.setattr(vw, "recompute_company_floor",
+                        lambda conn, company_id, **kw: None)
+    out = vw.lambda_handler({"op": "recompute_floors"}, None)
+    assert out["companies"] == 1 and out["floors_written"] == 0
+
+
+def test_the_sweeps_response_survives_the_lambda_runtime_json_marshal(monkeypatch):
+    """The fakes in this file hand `list_companies` string ids; a real psycopg connection
+    hands back `uuid.UUID` for a uuid column. The Lambda runtime marshals the handler's
+    return value with json.dumps, which cannot serialise a UUID -- so every test here
+    passed while the deployed TEST function raised
+
+        Runtime.MarshalError: Object of type UUID is not JSON serializable
+
+    on its first real invocation, AFTER the sweep had already committed and logged
+    "floor recompute: 0/4 companies now have a floor (0 failed)". The work succeeded and
+    the invocation was still recorded as a failure.
+
+    This test uses real UUID objects for that reason. json.dumps IS the assertion.
+    """
+    import json
+    import uuid
+    cid = uuid.uuid4()
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "list_companies", lambda conn: [{"id": cid}])
+    monkeypatch.setattr(vw, "recompute_company_floor",
+                        lambda conn, company_id, **kw: {"company_id": company_id,
+                                                        "floor": 0.3, "sample_count": 20})
+    out = vw.lambda_handler({"op": "recompute_floors"}, None)
+    json.dumps(out)
+    assert out["results"][0]["company_id"] == str(cid)
+
+
+def test_a_failing_companys_row_is_also_json_safe(monkeypatch):
+    """The error path builds its own row from c["id"] rather than from the repository's
+    return, so it needs the same treatment -- and it is the path most likely to run
+    unattended for weeks before anyone looks."""
+    import json
+    import uuid
+    cid = uuid.uuid4()
+
+    def boom(conn, company_id, **kw):
+        raise RuntimeError("no")
+
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "list_companies", lambda conn: [{"id": cid}])
+    monkeypatch.setattr(vw, "recompute_company_floor", boom)
+    out = vw.lambda_handler({"op": "recompute_floors"}, None)
+    json.dumps(out)
+    assert out["failed"] == 1 and out["results"][0]["company_id"] == str(cid)
+
+
+def test_recompute_floors_can_target_one_company_on_demand(monkeypatch):
+    """Honoured when present (an operator or a test recomputing one company right after a
+    batch of corrections), but the schedule itself never sets this key."""
+    seen = []
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "list_companies",
+                        lambda conn: (_ for _ in ()).throw(
+                            AssertionError("list_companies must not run when a single "
+                                          "company_id was given")))
+    monkeypatch.setattr(vw, "recompute_company_floor",
+                        lambda conn, company_id, **kw: seen.append(company_id) or
+                        {"company_id": company_id, "floor": 0.3, "sample_count": 20})
+    out = vw.lambda_handler({"op": "recompute_floors", "company_id": CO}, None)
+    assert seen == [CO]
+    assert out["companies"] == 1
+
+
+def test_one_companys_failure_does_not_cost_the_others_their_floor(monkeypatch):
+    """The whole sweep runs inside ONE get_connection() block, which rolls back the
+    ENTIRE connection on an uncaught exception (db/connection.py). Without a per-company
+    savepoint, company 2 raising would silently discard company 1's already-computed
+    floor too, not just skip company 2 and the ones after it -- and it would do so every
+    6 hours, indefinitely, with nothing to show for it but a floor that never moves."""
+    companies = [{"id": "co-1"}, {"id": "co-2"}, {"id": "co-3"}]
+    seen = []
+
+    def recompute(conn, company_id, **kw):
+        seen.append(company_id)
+        if company_id == "co-2":
+            raise ValueError("malformed score data")
+        return {"company_id": company_id, "floor": 0.3, "sample_count": 20}
+
+    monkeypatch.setattr(vw, "get_connection", lambda: FakeConn())
+    monkeypatch.setattr(vw, "list_companies", lambda conn: companies)
+    monkeypatch.setattr(vw, "recompute_company_floor", recompute)
+    out = vw.lambda_handler({"op": "recompute_floors"}, None)
+    assert seen == ["co-1", "co-2", "co-3"], (
+        "co-2 raising must not stop co-3 from being attempted")
+    assert out["companies"] == 3
+    assert out["failed"] == 1
+    assert out["floors_written"] == 2, (
+        "co-1 and co-3 succeeded and must both be counted -- co-2's failure must not "
+        "silently zero out the whole sweep's result")
+    by_company = {r["company_id"]: r for r in out["results"]}
+    assert by_company["co-1"]["floor"] == 0.3
+    assert by_company["co-3"]["floor"] == 0.3
+    assert by_company["co-2"]["floor"] is None and by_company["co-2"].get("error")
 
 
 # ---- a declined write is not a write --------------------------------------
@@ -600,3 +901,50 @@ def test_the_names_still_land_when_the_enrolment_was_refused(calls):
     half that stores biometric data was refused."""
     vw.lambda_handler(_refused_event(), None)
     assert len(calls["turns"]) == 1
+
+
+# ---- a stored sample re-judges its profile --------------------------------
+#
+# `requarantine_profile` was written and unit-tested in #912 and then called from nowhere,
+# so a profile kept every sample it was ever given. On TEST (2026-10-13) four of the one
+# Ben Lin profile's eleven samples were another voice or noise, the mean dragged his own
+# turns from ~0.55 to ~0.30, and the matcher named nobody for two weeks. These pin the call.
+
+
+def _enrolling_propagation():
+    return {"op": "propagation", "company_id": CO, "session_base": "s1",
+            "correction_ref": "corr-1",
+            "results": [{"turn_ref": "f.wav@1.0", "state": "confirmed", "cluster_ref": None,
+                         "display_name": "Ben L", "asserted": True}],
+            "enrol": {"voiceprint_id": "vp-1", "embedding": [0.1] * 192,
+                      "s3_key": "users/u/audio/d/x.wav", "window": [0.0, 5.0]}}
+
+
+def test_a_stored_sample_re_judges_its_profile(calls, monkeypatch):
+    order = []
+    monkeypatch.setattr(vw, "add_sample",
+                        lambda conn, co, vp, *a, **kw: order.append(("sample", vp)) or {"id": "s"})
+    monkeypatch.setattr(vw, "requarantine_profile",
+                        lambda conn, co, vp: order.append(("requarantine", co, vp))
+                        or {"checked": 3, "quarantined": 0})
+    vw.lambda_handler(_enrolling_propagation(), None)
+    assert ("requarantine", CO, "vp-1") in order, "the profile was never re-judged"
+    assert order.index(("sample", "vp-1")) < order.index(("requarantine", CO, "vp-1"))
+
+
+def test_a_failing_re_judgement_does_not_undo_the_enrolment(calls, monkeypatch):
+    def boom(conn, co, vp):
+        raise RuntimeError("clustering failed")
+    monkeypatch.setattr(vw, "requarantine_profile", boom)
+    out = vw.lambda_handler(_enrolling_propagation(), None)
+    assert out["enrolled"] is True
+    assert len(calls["samples"]) == 1
+
+
+def test_a_refused_enrolment_re_judges_nothing(calls, monkeypatch):
+    _refuse(monkeypatch)
+    seen = []
+    monkeypatch.setattr(vw, "requarantine_profile",
+                        lambda conn, co, vp: seen.append(vp) or {})
+    vw.lambda_handler(_correction_event(), None)
+    assert seen == []

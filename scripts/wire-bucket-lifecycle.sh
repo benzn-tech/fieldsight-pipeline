@@ -5,6 +5,8 @@
 # an abandoned upload), and expire download_claims/ markers after 1 day
 # (Phase 4b: a claim marker's job is done once the downloader releases it or
 # a later sweep takes it over -- anything still there a day later is orphaned).
+# traces/ (pipeline_trace: what the pipeline did with each recording) is kept
+# 180 days (owner, 2026-10-05).
 # put-bucket-lifecycle-configuration REPLACES the whole config — abort if
 # the bucket already has OTHER rules so we never clobber them.
 set -euo pipefail
@@ -12,7 +14,7 @@ BUCKET="${1:?usage: wire-bucket-lifecycle.sh BUCKET [REGION]}"
 REGION="${2:-ap-southeast-2}"
 
 EXISTING="$(aws s3api get-bucket-lifecycle-configuration --bucket "$BUCKET" \
-  --region "$REGION" --query 'Rules[?ID!=`org-assets-pending-expiry` && ID!=`download-claims-expiry` && ID!=`voice-clips-expiry` && ID!=`voiceprint-requests-expiry`].ID' \
+  --region "$REGION" --query 'Rules[?ID!=`org-assets-pending-expiry` && ID!=`download-claims-expiry` && ID!=`voice-clips-expiry` && ID!=`voiceprint-requests-expiry` && ID!=`traces-expiry`].ID' \
   --output text 2>/dev/null || true)"
 if [ -n "$EXISTING" ]; then
   # Refusing is right — this script REPLACES the whole configuration, and prod's rules
@@ -59,6 +61,12 @@ aws s3api put-bucket-lifecycle-configuration --bucket "$BUCKET" --region "$REGIO
         "Status": "Enabled",
         "Filter": { "Prefix": "voice/" },
         "Expiration": { "Days": 30 }
+      }
+      ,{
+        "ID": "traces-expiry",
+        "Status": "Enabled",
+        "Filter": { "Prefix": "traces/" },
+        "Expiration": { "Days": 180 }
       }
     ]
   }'

@@ -1,0 +1,43 @@
+{
+  "sections": [
+    {
+      "title": "What this was",
+      "kind": "narrative",
+      "fields": [],
+      "always_present": false,
+      "columns": [],
+      "key": "what-this-was",
+      "purpose": "Whose meeting it was and what it covered."
+    },
+    {
+      "title": "Safety",
+      "kind": "list",
+      "fields": [
+        "hazard"
+      ],
+      "always_present": false,
+      "columns": [],
+      "key": "safety",
+      "purpose": "Only hazards raised by name, and whether a control was agreed."
+    },
+    {
+      "title": "Actions",
+      "kind": "table",
+      "fields": [
+        "action",
+        "owner"
+      ],
+      "always_present": false,
+      "columns": [],
+      "key": "actions",
+      "purpose": "One line per action."
+    }
+  ],
+  "catch_all": {
+    "key": "other",
+    "title": "Anything else",
+    "purpose": "Only what will still matter next week and fits nowhere above. One sentence each. If there is nothing, write \"Nothing here.\""
+  },
+  "excluded_subjects": [],
+  "style": []
+}

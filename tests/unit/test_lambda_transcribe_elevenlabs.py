@@ -22,6 +22,8 @@ class _FakeS3:
         return {"Body": _FakeBody(self._obj)}
 
     def put_object(self, Bucket, Key, Body, **kw):
+        if Key.startswith("lake_manifest/"):
+            return               # lake_put's manifest line is not a transcript write
         self.put_calls.append({"Bucket": Bucket, "Key": Key, "Body": Body})
 
 

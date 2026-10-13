@@ -121,12 +121,12 @@ def test_insert_flattens_entity_and_nulls_bad_enum():
     assert "RETURNING" in sql1
     assert params1 == ("topic-1", "site-1", "Missing guardrail on level 3",
                        "safety", "major", "ABC Scaffolding", "scaffolder",
-                       "Install guardrail")
+                       "Install guardrail", None)
 
     # invalid enum values pass through as NULL, never raise
     params2 = conn.calls[1]["params"]
     assert params2 == ("topic-1", "site-1", "Bad enum test", None, None,
-                       None, None, None)
+                       None, None, None, None)
 
 
 def test_insert_findings_missing_entity_key_defaults_to_null():

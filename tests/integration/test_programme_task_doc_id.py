@@ -25,7 +25,7 @@ pytestmark = pytest.mark.integration
 
 def _seed(db):
     cid = db.execute(
-        "INSERT INTO companies (name) VALUES ('C') RETURNING id").fetchone()[0]
+        "INSERT INTO companies (name) VALUES ('C ' || gen_random_uuid()::text) RETURNING id").fetchone()[0]
     sid = db.execute(
         "INSERT INTO sites (company_id, name) VALUES (%s,'S') RETURNING id",
         (cid,)).fetchone()[0]

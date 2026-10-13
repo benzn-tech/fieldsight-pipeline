@@ -87,7 +87,10 @@ def load_keyterms(vocab_path):
                 if not line or line.startswith("#"):
                     continue
                 phrase = line.split("\t")[0].strip()
-                if phrase:
+                # The file's column header ("Phrase\tSoundsLike\tIPA\tDisplayAs",
+                # the AWS Transcribe table format it began as) is not a term; it
+                # was sent to scribe_v2 as the keyterm "Phrase" on every request.
+                if phrase and line.split("\t")[:2] != ["Phrase", "SoundsLike"]:
                     terms.append(phrase[:MAX_KEYTERM_LEN])
     except OSError:
         logger.warning(f"keyterms vocab not found: {vocab_path}")
@@ -196,7 +199,7 @@ def transcribe_segment(audio_bytes, filename, num_speakers=5, keyterms=None):
                 )
                 continue
         raise RuntimeError(f"ElevenLabs STT error HTTP {resp.status}: {resp.data[:300]}")
-    raise RuntimeError(f"ElevenLabs STT failed after {MAX_ATTEMPTS} attempts: {last_error}")
+    raise RuntimeError(f"ElevenLabs STT failed after {MAX_ATTEMPTS} attempts: {last_error}")
 
 
 # --- Short-clip STT for the voice Ask path ---------------------------------
@@ -283,7 +286,7 @@ def stt_short(audio_bytes, filename="clip.wav"):
             last = "HTTP %d" % resp.status
         if attempt == 1:
             time.sleep(1.0)
-    raise RuntimeError("ElevenLabs STT failed after 2 attempts: %s" % last)
+    raise RuntimeError("ElevenLabs STT failed after 2 attempts: %s" % last)
 
 
 # --- TTS for the voice Ask path --------------------------------------------
@@ -296,8 +299,13 @@ def stt_short(audio_bytes, filename="clip.wav"):
 ELEVENLABS_TTS_API_KEY = os.environ.get("ELEVENLABS_API_KEY_TTS", "")
 ELEVENLABS_TTS_URL = os.environ.get(
     "ELEVENLABS_TTS_URL", "https://api.elevenlabs.io/v1/text-to-speech")
+# James - Friendly, Warm, Kiwi: the voice the device itself already speaks in
+# ("Ready. Go ahead." before a question, "Audio recording started"). An answer
+# in any other voice reads as a second person joining the conversation. Kept in
+# step with template.yaml's ElevenLabsTtsVoice default ON PURPOSE -- two
+# defaults that disagree is one of them being wrong somewhere nobody looks.
 ELEVENLABS_TTS_VOICE = os.environ.get(
-    "ELEVENLABS_TTS_VOICE", "bPkjmCb0W1xUBvyH2Afs")
+    "ELEVENLABS_TTS_VOICE", "QlZn2MPaf2jDn0461bnj")
 # v3 conversational, chosen on measurement rather than the docs. Measured
 # 2026-09-09 on this endpoint, one two-sentence answer:
 #
@@ -313,13 +321,13 @@ ELEVENLABS_TTS_VOICE = os.environ.get(
 # but this is a voice a person on a site listens to, and one second is already
 # well inside the wait the rest of the chain imposes.
 ELEVENLABS_TTS_MODEL = os.environ.get(
-    "ELEVENLABS_TTS_MODEL", "eleven_v3_conversational")
+    "ELEVENLABS_TTS_MODEL", "eleven_multilingual_v2")
 # 1.2 = 20% faster than written, at the owner's request. Verified to take
 # effect rather than be silently accepted: the same sentence rendered 5.36s at
 # default and 5.20s at 1.2 on v3-conversational, 4.64 -> 3.81 on flash. A
 # vendor that ignores an unknown field returns 200 either way, so the audio
 # length is the only proof.
-ELEVENLABS_TTS_SPEED = float(os.environ.get("ELEVENLABS_TTS_SPEED", "1.2"))
+ELEVENLABS_TTS_SPEED = float(os.environ.get("ELEVENLABS_TTS_SPEED", "1.10"))
 ELEVENLABS_TTS_TIMEOUT_SECONDS = float(
     os.environ.get("ELEVENLABS_TTS_TIMEOUT_SECONDS", "10"))
 
@@ -350,8 +358,17 @@ def tts(text):
     url = "%s/%s/stream?output_format=pcm_24000" % (
         ELEVENLABS_TTS_URL.rstrip("/"), ELEVENLABS_TTS_VOICE)
     payload = {"text": text, "model_id": ELEVENLABS_TTS_MODEL}
-    if ELEVENLABS_TTS_SPEED and ELEVENLABS_TTS_SPEED != 1.0:
-        payload["voice_settings"] = {"speed": ELEVENLABS_TTS_SPEED}
+    # ALWAYS sent, including at 1.0. Omitting it does not mean "1.0" -- it
+    # means "use whatever this voice has saved in the ElevenLabs workspace",
+    # which is a dashboard anyone can edit and no deploy can see. Measured
+    # 2026-09-22 on James, the same sentence through this endpoint: no
+    # voice_settings rendered 1.90s and 2.04s of audio, explicit speed 1.0
+    # rendered 2.18s and 2.23s. Same request, different length, because the
+    # saved settings are not the API's defaults. So the omission was not a
+    # neutral shortcut -- it handed the product's voice to a web console.
+    # (n=2 per config against ~6% run-to-run jitter: the DIRECTION is the
+    # finding, the numbers are not a measurement of the gap.)
+    payload["voice_settings"] = {"speed": ELEVENLABS_TTS_SPEED}
     body = json.dumps(payload).encode()
     headers = {"xi-api-key": ELEVENLABS_TTS_API_KEY,
                "Content-Type": "application/json",

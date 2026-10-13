@@ -62,11 +62,18 @@ import json
 import nz_time
 import logging
 import re
+from urllib.parse import unquote_plus
 import boto3
+from lake_put import lake_put
 import urllib3
 import agent_turn_filter
 from output_language import OUTPUT_LANGUAGE_RULE
 import weather
+import report_style
+import weather_advice
+import site_weather
+import report_photos
+import directory
 import site_coords
 import llm_utils
 import report_sections
@@ -327,79 +334,118 @@ def download_json_from_s3(bucket, key):
 # User Mapping
 # ============================================================
 
-_user_mapping_cache = None
+# The directory is published by org-api from Aurora (see directory.py). It is
+# keyed by recording folder, which is exactly what `transcripts/<folder>/` and
+# `reports/<date>/<folder>/` carry as the user name here -- so a person is found
+# by identity, not by matching a display name against a hand-edited file.
 
-def load_user_mapping(bucket):
-    global _user_mapping_cache
-    if _user_mapping_cache is not None:
-        return _user_mapping_cache
-    try:
-        data = download_json_from_s3(bucket, 'config/user_mapping.json')
-        if data:
-            raw_mapping = data.get('mapping', {})
-            normalized = {}
-            for device, value in raw_mapping.items():
-                if isinstance(value, str):
-                    normalized[device] = value
-                elif isinstance(value, dict):
-                    normalized[device] = value.get('name', device)
-                else:
-                    normalized[device] = str(value)
-            _user_mapping_cache = normalized
-            logger.info(f"Loaded user mapping: {len(normalized)} entries "
-                        f"(format: {'v2' if any(isinstance(v, dict) for v in raw_mapping.values()) else 'v1'})")
-            return _user_mapping_cache
-    except Exception as e:
-        logger.warning(f"Failed to load user mapping: {e}")
-    _user_mapping_cache = {}
-    return _user_mapping_cache
+# Roles whose weekly report gets the supervisory emphasis. `global_role`
+# vocabulary: site_manager, pm, regional_manager, gm, admin, worker (and
+# platform_admin, the operator, who writes no reports). The prompt used to test
+# for ('site_manager', 'pm') only, which silently left a gm or a regional
+# manager out of it.
+MANAGER_ROLES = ('site_manager', 'pm', 'regional_manager', 'gm', 'admin')
 
-def load_user_mapping_full(bucket):
-    try:
-        data = download_json_from_s3(bucket, 'config/user_mapping.json')
-        if data:
-            return {'mapping': data.get('mapping', {}), 'sites': data.get('sites', {})}
-    except:
-        pass
-    return {'mapping': {}, 'sites': {}}
+def external_folders(bucket):
+    """Folders of people who hold a live membership on ANOTHER company's project
+    (`has_external` in the directory). Their whole-day documents span companies, so they
+    stay out of every site rollup and out of the SITE# DynamoDB stamping."""
+    doc = directory.load(s3_client, bucket)
+    people = (doc or {}).get('people') or {}
+    if not people:
+        # An empty/unreadable directory cannot say who is external: FAIL CLOSED. Callers get
+        # None and must skip site rollups / SITE# stamping rather than include everyone.
+        logger.error("directory unreadable or empty: cannot tell who has external memberships; "
+                     "site rollups and SITE# stamping are skipped")
+        return None
+    return {f for f, p in people.items() if isinstance(p, dict) and p.get('has_external')}
+
+
+def usable_weeklies(weekly_reports, ext_folders):
+    """The weekly documents a monthly site/combined rollup may ingest. A person with an
+    external membership has a weekly that spans companies; with the directory unreadable
+    (`ext_folders` None) nothing can be vouched for, so none are used."""
+    if ext_folders is None:
+        return []
+    kept = []
+    for wr in weekly_reports:
+        if wr.get('user_name') in ext_folders:
+            logger.info(f"  weekly of {wr.get('user_name')}: has_external -- not used in monthly rollups")
+            continue
+        kept.append(wr)
+    return kept
+
+
+def group_reports_by_site(reports_by_user, user_all_sites, ext_folders, site_id_default):
+    """{site: [daily reports]} for the weekly/monthly site rollups. A person with a live
+    external membership (`ext_folders`) is left out entirely: their whole-day document
+    covers other companies' projects too. One INFO line per exclusion (folder only)."""
+    reports_by_site = {}
+    if ext_folders is None:
+        return reports_by_site                  # fail closed (see external_folders)
+    for user_name, user_reports in reports_by_user.items():
+        if user_name == '_summary':
+            continue
+        if user_name in ext_folders:
+            logger.info(f"  {user_name}: has_external -- excluded from site rollups")
+            continue
+        user_site_list = user_all_sites.get(user_name, [])
+        if not user_site_list:
+            user_site_list = [site_id_default]
+        for sid in user_site_list:
+            reports_by_site.setdefault(sid, []).extend(user_reports)
+    return reports_by_site
+
 
 def get_user_site_mapping(bucket):
-    full = load_user_mapping_full(bucket)
-    raw_mapping = full.get('mapping', {})
-    # WHERE THE COORDINATES ACTUALLY COME FROM.
-    #
-    # The `sites` block of user_mapping.json has null lat/lng for every site
-    # and always has, so `build_weather_block_for_site` returned None every
-    # time and not one report in production carries a weather block -- while
-    # the coordinates people enter in the web UI sit in the Aurora `sites`
-    # table, which this Lambda cannot reach (no VpcConfig, by design: it needs
-    # egress for the model and the weather API).
-    #
-    # org-api publishes them to a small machine-owned object instead. Absent or
-    # unreadable, this is a no-op and the old behaviour stands.
-    sites_info = site_coords.overlay_sites_info(
-        full.get('sites', {}),
-        download_json_from_s3(bucket, site_coords.KEY) or {})
+    """(primary_site, all_sites, roles, sites_info), keyed by recording folder
+    for the people maps and by SITE ID for the sites. Slugs are unique per
+    company only, so nothing here is keyed by slug; each sites_info entry
+    carries its `slug`, which is what report paths use."""
+    doc = directory.load(s3_client, bucket)
+    # Coordinates are published separately (site_coords.py, slug-keyed) and laid
+    # over each site. Absent or unreadable, this is a no-op.
+    coords = download_json_from_s3(bucket, site_coords.KEY) or {}
+    sites_info = {}
+    for sid, entry in (doc.get('sites') or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        slug = entry.get('slug') or sid
+        merged = site_coords.overlay_sites_info({slug: entry}, coords).get(slug, dict(entry))
+        merged['slug'] = slug
+        if not sid.startswith(directory.LEGACY_PREFIX):
+            merged.setdefault('site_uuid', sid)
+        sites_info[sid] = merged
     user_primary_site = {}
     user_all_sites = {}
     user_roles = {}
-    for device, value in raw_mapping.items():
-        if isinstance(value, dict):
-            name = value.get('name', device)
-            primary = value.get('primary_site', '')
-            all_sites = value.get('sites', [])
-            role = value.get('role', '')
-            name_variants = {name, name.replace(' ', '_'), name.replace('_', ' ')}
-            for n in name_variants:
-                if primary:
-                    user_primary_site[n] = primary
-                if all_sites:
-                    user_all_sites[n] = all_sites
-                elif primary:
-                    user_all_sites[n] = [primary]
-                if role:
-                    user_roles[n] = role
-    return user_primary_site, user_all_sites, user_roles, sites_info
+    for folder, p in (doc.get('people') or {}).items():
+        if not isinstance(p, dict):
+            continue
+        primary = p.get('primary_site') or ''
+        all_sites = p.get('sites') or []
+        if primary:
+            user_primary_site[folder] = primary
+        if all_sites:
+            user_all_sites[folder] = all_sites
+        elif primary:
+            user_all_sites[folder] = [primary]
+        if p.get('role'):
+            user_roles[folder] = p['role']
+    return (_SpacedKeys(user_primary_site), _SpacedKeys(user_all_sites),
+            _SpacedKeys(user_roles), sites_info)
+
+
+class _SpacedKeys(dict):
+    """A lookup by folder that also finds it by the spaced display name: old
+    daily reports recorded `Ben Lin` as the user where current ones say
+    `Ben_Lin`."""
+    def get(self, key, default=None):
+        if key in self:
+            return self[key]
+        if isinstance(key, str) and key.replace(' ', '_') in self:
+            return self[key.replace(' ', '_')]
+        return default
 
 
 # ============================================================
@@ -456,7 +502,8 @@ def correlate_photos_with_transcripts(transcripts, photos):
 
 def call_claude_structured(prompt, max_tokens=4096):
     """Delegates to llm_utils (provider-dispatched). force_json: structured task."""
-    return llm_utils.call_llm(prompt, max_tokens=max_tokens, force_json=True)
+    return llm_utils.call_llm(prompt, max_tokens=max_tokens, force_json=True,
+                              caller="report_generator")
 
 def extract_json_from_response(raw_text):
     """Delegates to llm_utils.extract_json (identical three-tier ladder)."""
@@ -488,9 +535,11 @@ def save_debug_record(bucket, target_date, user_name, prompt, raw_response,
             'raw_response_length': len(raw_response) if raw_response else 0,
             'parsed_json': parsed_json,
         }
-        s3_client.put_object(
-            Bucket=bucket, Key=debug_key,
-            Body=json.dumps(debug_record, ensure_ascii=False, indent=2, default=str),
+        lake_put(
+            bucket, debug_key,
+            json.dumps(debug_record, ensure_ascii=False, indent=2, default=str),
+            client=s3_client,
+            owner_hint=None if user_name == '_summary' else {"folder": user_name},
             ContentType='application/json'
         )
         logger.info(f"  Saved debug: {debug_key}")
@@ -523,25 +572,87 @@ def summary_text(report):
     return text or 'No summary available'
 
 
-def build_weather_block_for_site(site_info, target_date, today_iso,
-                                 fetch=weather.fetch_weather):
-    """Fetch the normalized (site, date) weather block, or None when the site
-    has no coordinate (un-backfilled) or the fetch fails. Non-VPC: this runs in
-    ReportGeneratorFunction, which has egress. Coordinate comes from the
-    config/user_mapping.json `sites` block (D-COORD option a)."""
-    lat = site_info.get("latitude")
-    lng = site_info.get("longitude")
-    if lat is None or lng is None:
+# Kept under these names: the nightly run and its tests call them from here.
+build_weather_block_for_site = site_weather.build_weather_block_for_site
+build_weather_findings = site_weather.build_weather_findings
+
+
+def programme_for_site(site_info, bucket=None):
+    """The site's programme snapshot (programmes/<uuid>/programme.json), or
+    None when the site has no UUID known here or no programme uploaded."""
+    uuid = (site_info or {}).get("site_uuid")
+    if not uuid:
         return None
-    try:
-        return fetch(lat, lng, target_date, today_iso)
-    except Exception as e:
-        logger.warning(f"weather fetch failed for {target_date}: {e}")
-        return None
+    return download_json_from_s3(bucket or S3_BUCKET, f"programmes/{uuid}/programme.json")
+
+
+def weather_record_site(site_info, fallback_slug):
+    """The id weather records are kept under: the site's UUID, which is what
+    org-api and the Today page know a site by; the slug only when no UUID is
+    known, so a record is never dropped for want of one."""
+    return (site_info or {}).get("site_uuid") or fallback_slug
+
+
+def weather_record_key(site_id, target_date, actual):
+    """Where one site's weather for one day is kept: the finding the reports
+    read, and what a later count of weather days (for extension-of-time claims)
+    adds up."""
+    return f"weather/{site_id}/{target_date}/{'actual' if actual else 'forecast'}.json"
+
+
+def run_weather_forecasts(date=None, fetch=weather_advice.hourly_forecast,
+                          fetch_daily=None):
+    """The morning's weather, for every placed site, before anyone is on site.
+
+    For the Morning Brief on Today (owner, 2026-09-29). Scheduled at 05:30
+    NZDT: every site in config/site-coords.json gets today's hourly forecast
+    judged against today's programme, kept at weather/<uuid>/<date>/forecast.json
+    for org-api to hand to the page. The same judgement the daily report makes
+    the next night on the actuals -- one set of rules, two moments.
+
+    A site with no UUID in the file is skipped rather than keyed by slug: the
+    page asks by UUID, so a slug-keyed forecast would be written and never read.
+
+    The record carries the day's numbers too (`daily`, and `summary` -- the
+    facts as lines, weather.summary_lines). Until 2026-10-05 it carried only
+    what they meant, so on a day with no impact Today read "no impact on site
+    work expected" and nothing else, and a same-day report that found this
+    record printed the same single line.
+    """
+    date = date or get_nzdt_now().strftime('%Y-%m-%d')
+    doc = download_json_from_s3(S3_BUCKET, site_coords.KEY) or {}
+    written, skipped = [], []
+    for slug, entry in (doc.items() if isinstance(doc, dict) else []):
+        if not isinstance(entry, dict) or not entry.get("site_id"):
+            skipped.append(slug)
+            continue
+        info = {"latitude": entry.get("latitude"), "longitude": entry.get("longitude"),
+                "site_uuid": entry["site_id"]}
+        findings = build_weather_findings(info, date, date, fetch=fetch,
+                                          programme=programme_for_site(info))
+        if not findings:
+            skipped.append(slug)
+            continue
+        daily = (build_weather_block_for_site(info, date, date) if fetch_daily is None
+                 else build_weather_block_for_site(info, date, date, fetch=fetch_daily))
+        lake_put(
+            S3_BUCKET,
+            weather_record_key(entry["site_id"], date, False),
+            json.dumps({"site_id": entry["site_id"], "site_slug": slug, "date": date,
+                        "generated_at": get_nzdt_now().isoformat(),
+                        "daily": daily, "summary": weather.summary_lines(daily),
+                        **findings},
+                       default=str).encode("utf-8"),
+            client=s3_client,
+            ContentType="application/json")
+        written.append(slug)
+    logger.info(f"weather forecasts for {date}: {len(written)} written, "
+                f"{len(skipped)} skipped ({', '.join(skipped) or 'none'})")
+    return {"date": date, "written": written, "skipped": skipped}
 
 
 def build_daily_prompt(transcripts_with_photos, user_name, site_name, target_date,
-                       role=None, total_duration=0.0, num_photos=0, name_mapping=None):
+                       role=None, total_duration=0.0, num_photos=0):
     """Build the Claude prompt for daily structured report."""
     transcript_lines = []
     for t in transcripts_with_photos:
@@ -587,17 +698,10 @@ def build_daily_prompt(transcripts_with_photos, user_name, site_name, target_dat
         meta_lines.append(f"- Photos: {num_photos}")
     metadata_block = "\n".join(meta_lines)
 
+    # No "Name Reference" block: it translated device accounts (Benl1, ...) to
+    # people, but today's transcripts carry speaker labels and folder-named
+    # recorders, so it had nothing left to translate.
     name_ref_block = ""
-    if name_mapping:
-        devices_used = set(t.get('device', '') for t in transcripts_with_photos)
-        ref_lines = []
-        for dev in sorted(devices_used):
-            display = name_mapping.get(dev, dev)
-            if display != dev:
-                ref_lines.append(f"- {dev} = {display}")
-        if ref_lines:
-            name_ref_block = "\n## Name Reference (device account \u2192 person name)\n" + "\n".join(ref_lines)
-            name_ref_block += "\nIMPORTANT: Always use the person's real name in participants, who_raised, who_mentioned, and responsible fields. Never use device account names (Benl1, Benl2, etc.)."
 
     template = get_template('daily_report', 'prompt')
     system_ctx = get_template('daily_report', 'system_context') or \
@@ -694,7 +798,7 @@ def build_weekly_prompt(daily_reports, site_name, start_date, end_date,
             "\n6. Focus on this individual's activities, responsibilities, and action items."
             "\n7. Highlight their personal safety observations and quality contributions."
         )
-        if user_role in ('site_manager', 'pm'):
+        if user_role in MANAGER_ROLES:
             extra_instructions += scope_intros.get('user_manager_extra',
                 "\n8. As a manager/PM, emphasize supervisory decisions, team coordination, "
                 "and items requiring their follow-up or escalation."
@@ -906,6 +1010,87 @@ def site_name_for(user_site_info):
     return user_site_info.get('name') or ''
 
 
+_PHOTO_KEY_RE = re.compile(r"^users/([^/]+)/pictures/(\d{4}-\d{2}-\d{2})/")
+
+
+def _add_photos_to_document(doc, items, max_photos=None):
+    """The photographs themselves, not a list of their filenames.
+
+    This wrote `', '.join(filenames)` -- a comma-separated run of
+    `ben_ucpk2_20260903_101500.jpg` in a customer's report, which tells a
+    reader that a photograph exists and nothing else. Asked why photos are not
+    in the report, that was the answer.
+
+    WHICH, HOW MANY, AT WHAT SIZE follow report_photos -- the same rules as
+    the template report, so one day's two documents carry the same pictures
+    (owner, 2026-10-01): the person's exclusions for the day come off first;
+    up to 60 at page size, up to 120 shrunk automatically; past that, a fair
+    selection and one line saying how many more were taken -- not their
+    filenames.
+
+    Every failure here degrades to the filename rather than losing the entry:
+    a missing object, a permission the role does not have, an image python-docx
+    cannot decode. A report with one photo it could not fetch is still a
+    report; an exception inside document generation is no report at all, and
+    Word generation already disables itself silently often enough (BUG-24).
+
+    `max_photos` clips further (a caller's ceiling); each embedded image is held
+    in memory while the document is assembled (BUG-04), which is why every one
+    is shrunk before it is held.
+    """
+    entries = []
+    for item in items:
+        if isinstance(item, dict):
+            name = str(item.get('name') or '').strip()
+            key = str(item.get('key') or '').strip()
+        else:
+            name, key = str(item).strip(), ''
+        if name or key:
+            entries.append((name or key.rsplit('/', 1)[-1], key))
+
+    folder = date = None
+    for _, key in entries:
+        m = _PHOTO_KEY_RE.match(key)
+        if m:
+            folder, date = m.group(1), m.group(2)
+            break
+    excluded = (report_photos.read_excluded(s3_client, S3_BUCKET, folder, date)
+                if folder and S3_BUCKET else set())
+    chosen, edge, left_out = report_photos.plan(
+        [("day", [n for n, k in entries if k])], excluded)
+    keep = list(chosen.get("day") or [])
+    if max_photos is not None:
+        left_out += max(0, len(keep) - max_photos)
+        keep = keep[:max_photos]
+    keep = set(keep)
+
+    shown = 0
+    for name, key in entries:
+        if name in excluded:
+            continue                                  # the person left it out
+        if not key:
+            doc.add_paragraph(name, style='List Bullet')
+            continue
+        if name not in keep:
+            continue                                  # counted in the closing line
+        try:
+            obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
+            stream = BytesIO(report_photos.shrink(obj['Body'].read(), edge))
+            doc.add_picture(stream, width=Inches(5.5))
+            caption = doc.add_paragraph(name)
+            caption.style = doc.styles['Caption'] if 'Caption' in [
+                st.name for st in doc.styles] else caption.style
+            shown += 1
+        except Exception as exc:                      # noqa: BLE001 - see above
+            logger.warning("photo not embedded, listing name instead: %s (%s)",
+                           key, exc)
+            doc.add_paragraph(name, style='List Bullet')
+
+    if left_out:
+        doc.add_paragraph("Photographs: %d taken this day; %d included in this report."
+                          % (shown + left_out, shown))
+
+
 def render_sections_into(doc, sections):
     """Write the reader's sections into a Word document.
 
@@ -938,12 +1123,33 @@ def render_sections_into(doc, sections):
             doc.add_heading(title, level=1)
             for item in items:
                 doc.add_paragraph(str(item), style='List Bullet')
+        elif kind == 'entries':
+            # A thing, its state, and one line about it. Not a table: four
+            # columns of prose read as a spreadsheet of paragraphs, and the
+            # columns do not line up anyway because `note` is a sentence and
+            # `status` is a word.
+            items = [i for i in (sec.get('items') or []) if isinstance(i, dict)]
+            if not items:
+                continue
+            doc.add_heading(title, level=1)
+            for item in items:
+                head = str(item.get('title') or '').strip()
+                if not head:
+                    continue
+                para = doc.add_paragraph()
+                para.add_run(head).bold = True
+                state = str(item.get('status') or '').strip()
+                if state:
+                    para.add_run('   ' + state.replace('_', ' '))
+                note = str(item.get('note') or '').strip()
+                if note:
+                    doc.add_paragraph(note)
         elif kind == 'photos':
             items = sec.get('items') or []
             if not items:
                 continue
             doc.add_heading(title, level=1)
-            doc.add_paragraph(', '.join(str(i) for i in items))
+            _add_photos_to_document(doc, items)
         elif kind == 'table':
             rows = sec.get('rows') or []
             if not rows:
@@ -965,20 +1171,51 @@ def render_sections_into(doc, sections):
                     cells[i].text = '' if value is None else str(value)
 
 
+def render_weather_into(doc, report_data):
+    """The Weather section of the Word report: the day's totals, then what they
+    meant for the work, as weather_advice decided it. A per-person daily report
+    without a weather record says "Not recorded" -- on a compliance record a
+    missing section reads as a fine day."""
+    findings = report_data.get("weather_findings")
+    daily = report_data.get("weather")
+    if findings is None and daily is None:
+        if report_data.get("recording_session", {}).get("worker"):
+            doc.add_heading("Weather", level=1)
+            doc.add_paragraph("Not recorded for this report.")
+        return
+    doc.add_heading("Weather", level=1)
+    if daily:
+        doc.add_paragraph(weather_totals_line(daily))
+    for line in (findings or {}).get("lines") or []:
+        doc.add_paragraph(line, style="List Bullet")
+
+
+def weather_totals_line(w):
+    """The day's measured totals in one line, as the web viewer shows them."""
+    bits = []
+    if w.get("condition_label"):
+        bits.append(w["condition_label"])
+    if w.get("temp_min_c") is not None and w.get("temp_max_c") is not None:
+        bits.append(f"{w['temp_min_c']}–{w['temp_max_c']}°C")
+    if w.get("precip_mm") is not None:
+        bits.append(f"{w['precip_mm']} mm rain")
+    if w.get("windspeed_kmh") is not None:
+        bits.append(f"wind to {w['windspeed_kmh']} km/h")
+    return " · ".join(bits)
+
+
 def generate_word_document(report_data, title):
     if not DOCX_AVAILABLE:
         return None
 
     doc = Document()
-    style = doc.styles['Normal']
-    style.font.name = 'Calibri'
-    style.font.size = Pt(10)
-
-    heading = doc.add_heading(title, 0)
-    heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    session = report_data.get('recording_session', {})
+    # THE HOUSE STYLE (report_style): page, type, running header and footer,
+    # the same as every other report FieldSight writes.
+    report_style.setup(doc, title, header_left=(session or {}).get('site') or None)
+    report_style.title_block(doc, title, (session or {}).get('date') or None)
 
     # Recording Session Info
-    session = report_data.get('recording_session', {})
     if session:
         table = doc.add_table(rows=0, cols=2)
         table.style = 'Light List'
@@ -1005,7 +1242,10 @@ def generate_word_document(report_data, title):
                 for paragraph in row.cells[0].paragraphs:
                     for run in paragraph.runs:
                         run.bold = True
+        report_style.style_table(table, facts=True)
         doc.add_paragraph('')
+
+    render_weather_into(doc, report_data)
 
     # One definition of what this report is. Where sections exist -- the daily
     # report and the meeting compat report -- they are what both artifacts show.
@@ -1151,19 +1391,26 @@ def generate_word_document(report_data, title):
 
 def _finish_document(doc, report_data):
     """The provenance footer and the bytes. Shared by both renderings, because
-    two copies of a footer is how one of them loses the model name."""
+    two copies of a footer is how one of them drifts from the other.
+
+    The model that wrote this document is deliberately NOT in this footer --
+    a customer-facing Word export must not name which LLM vendor/model
+    produced it. The name still lives in `_report_metadata['model']` on the
+    JSON this footer is built from, and in the debug record beside it in S3,
+    so a bad answer can still be traced to the model that wrote it; it just
+    never leaves the building on the document a customer opens."""
     meta = report_data.get('_report_metadata', {})
     if meta:
         doc.add_paragraph('')
         p = doc.add_paragraph()
         run = p.add_run(
             f"Generated: {meta.get('generated_at', '?')} | "
-            f"Model: {meta.get('model', '?')} | "
             f"Recordings: {meta.get('recordings_processed', '?')} | "
             f"Version: {meta.get('version', '?')}"
         )
         run.font.size = Pt(7)
         run.font.color.rgb = RGBColor(150, 150, 150)
+    report_style.style_all(doc)
 
     buffer = BytesIO()
     doc.save(buffer)
@@ -1306,11 +1553,29 @@ def process_user_data(bucket, user_name, target_date, exclude_keys=None):
 # Stale Report Detection
 # ============================================================
 
+def _transcript_folders(bucket):
+    """Folder names under transcripts/ (one delimiter listing: one entry per folder, not per
+    object). The directory is not used: legacy folders (Ben_Lin, Ben_UCPK_) still hold
+    transcripts and are in no directory entry."""
+    folders = []
+    for page in s3_client.get_paginator('list_objects_v2').paginate(
+            Bucket=bucket, Prefix='transcripts/', Delimiter='/'):
+        for cp in page.get('CommonPrefixes', []):
+            folder = cp['Prefix'][len('transcripts/'):].rstrip('/')
+            if folder:
+                folders.append(folder)
+    return folders
+
+
 def count_transcripts_for_date(bucket, target_date):
+    """Transcript .json objects for a date. Lists transcripts/{folder}/{date}/ once per folder
+    found under transcripts/ instead of walking every object of every day (ruling C3,
+    revised: folders come from S3, not the directory, so no folder is missed)."""
     count = 0
-    for obj in list_s3_objects(bucket, 'transcripts/'):
-        if obj['key'].endswith('.json') and target_date in obj['key']:
-            count += 1
+    for folder in _transcript_folders(bucket):
+        for obj in list_s3_objects(bucket, f'transcripts/{folder}/{target_date}/'):
+            if obj['key'].endswith('.json'):
+                count += 1
     return count
 
 def get_report_transcript_count(bucket, target_date):
@@ -1379,8 +1644,8 @@ def check_report_freshness(bucket, target_date, user_name, current_transcript_co
         logger.warning(f"  Freshness check failed for {user_name}: {e}")
         return False, 0
 
-def check_summary_freshness(bucket, target_date, current_transcript_count):
-    json_key = f"{REPORT_PREFIX}{target_date}/summary_report.json"
+def check_summary_freshness(bucket, target_date, current_transcript_count, key=None):
+    json_key = key or f"{REPORT_PREFIX}{target_date}/summary_report.json"
     try:
         obj = s3_client.get_object(Bucket=bucket, Key=json_key)
         existing = json.loads(obj['Body'].read().decode('utf-8'))
@@ -1397,6 +1662,163 @@ def check_summary_freshness(bucket, target_date, current_transcript_count):
         return False, 0
 
 
+def _lake_wide_summary_on():
+    """Read at call time (never at import): "off" skips the lake-wide summary. Default on
+    for one release while readers move to the per-company documents."""
+    return os.environ.get('SUMMARY_LAKE_WIDE', 'on').strip().lower() != 'off'
+
+
+def _build_summary(users_data, target_date, site_name, triggered_by, *,
+                   scope_label="All Workers", company_id=None, save_debug=True):
+    """One combined-summary model call over `users_data` ({folder: user_data}). Returns the
+    report dict, or None when the model failed or returned nothing usable."""
+    transcripts = [t for d in users_data.values() for t in d['transcripts']]
+    photos = [ph for d in users_data.values() for ph in d['photos']]
+    transcripts.sort(key=lambda x: x['timestamp'] or datetime.min)
+    correlated_all = correlate_photos_with_transcripts(transcripts, photos)
+    duration = sum(d['total_duration'] for d in users_data.values())
+    words = sum(d['total_words'] for d in users_data.values())
+    prompt = build_daily_prompt(
+        correlated_all, scope_label, site_name, target_date,
+        total_duration=duration, num_photos=len(photos),
+    )
+    max_tokens = min(8192 + len(transcripts) * 700, llm_utils.ANSWER_TOKEN_CEILING)
+    raw_response, error = call_claude_structured(prompt, max_tokens=max_tokens)
+    if error:
+        return None
+    claude_output = extract_json_from_response(raw_response)
+    if save_debug:
+        save_debug_record(
+            S3_BUCKET, target_date, '_summary', prompt, raw_response, claude_output,
+            parse_success=claude_output is not None,
+            input_stats={
+                'transcripts_count': len(transcripts), 'total_words': words,
+                'total_duration': duration, 'photos_count': len(photos),
+                'users': list(users_data.keys()),
+            }
+        )
+    if not claude_output:
+        return None
+    meta = {
+        'version': 'v3.5',
+        'generated_at': datetime.utcnow().isoformat() + 'Z',
+        'generated_by': triggered_by,
+        'recordings_processed': len(transcripts),
+        'total_words': words,
+        'total_duration_seconds': round(duration, 1),
+        'model': llm_utils.active_model(),
+    }
+    if company_id:
+        meta.update(scope='company', company_id=company_id)
+    return {
+        'report_date': target_date, 'report_type': 'daily',
+        'user_name': None, 'site': site_name,
+        'users': list(users_data.keys()),
+        'recording_session': {
+            'date': target_date, 'site': site_name,
+            'workers': list(users_data.keys()),
+            'recordings': len(transcripts),
+            'total_duration_seconds': round(duration, 1),
+            'total_duration_display': f"{int(duration // 60)}m {int(duration % 60)}s",
+            'total_words': words,
+            'photos': len(photos),
+        },
+        'executive_summary': claude_output.get('executive_summary', ''),
+        'quality_and_compliance': claude_output.get('quality_and_compliance', []),
+        'safety_observations': claude_output.get('safety_observations', []),
+        'critical_dates_and_deadlines': claude_output.get('critical_dates_and_deadlines', []),
+        'topics': claude_output.get('topics', []),
+        '_report_metadata': meta,
+    }
+
+
+def _publish_summary(report, json_key, word_key, target_date, owner_hint=None):
+    lake_put(
+        S3_BUCKET, json_key,
+        json.dumps(report, ensure_ascii=False, indent=2, default=str),
+        client=s3_client, owner_hint=owner_hint,
+        ContentType='application/json'
+    )
+    logger.info(f"Saved: {json_key}")
+    try:
+        word_buffer = generate_word_document(report, f"Daily Summary — {target_date}")
+        if word_buffer:
+            lake_put(
+                S3_BUCKET, word_key,
+                word_buffer.getvalue(),
+                client=s3_client, owner_hint=owner_hint,
+                ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            )
+            logger.info(f"Saved: {word_key}")
+    except Exception as e:
+        logger.error(f"Summary Word failed ({word_key}): {e}")
+
+
+def _group_by_company(all_users_data):
+    """{company_id: {folder: user_data}} by each folder's HOME company in the directory.
+    Left out of EVERY company's summary (rulings C1, R10a): a folder with has_external (its
+    day may span companies; one INFO line each, folder only) and a folder with no directory
+    entry or no company (counted). Fails closed: an unreadable directory yields {}."""
+    ext = external_folders(S3_BUCKET)
+    if ext is None:
+        logger.error("  Per-company summaries skipped: directory unreadable")
+        return {}
+    doc = directory.load(s3_client, S3_BUCKET)
+    groups, no_company = {}, 0
+    for folder, data in all_users_data.items():
+        if folder in ext:
+            logger.info(f"  {folder}: has_external -- left out of every per-company summary")
+            continue
+        cid = directory.company_of_folder(doc, folder)
+        if not cid:
+            no_company += 1
+            continue
+        groups.setdefault(cid, {})[folder] = data
+    if no_company:
+        logger.info(f"  {no_company} folder(s) with no directory company: in no per-company summary")
+    return groups
+
+
+def _write_company_summaries(all_users_data, target_date, site_name, triggered_by, force):
+    """One summary per company that has at least one included folder. Returns the number
+    of model calls made (a company with nothing included costs nothing)."""
+    calls = 0
+    for cid, udata in sorted(_group_by_company(all_users_data).items()):
+        n = sum(len(d['transcripts']) for d in udata.values())
+        if not n:
+            continue
+        json_key = f"{REPORT_PREFIX}{target_date}/companies/{cid}/summary_report.json"
+        if not force:
+            is_fresh, existing = check_summary_freshness(S3_BUCKET, target_date, n, key=json_key)
+            if is_fresh:
+                logger.info(f"  Company {cid} summary: SKIP — up-to-date ({existing} transcripts)")
+                continue
+        calls += 1
+        report = _build_summary(udata, target_date, site_name, triggered_by,
+                                company_id=cid, save_debug=False)
+        if report is None:
+            logger.error(f"  Company {cid} summary: model gave nothing usable")
+            continue
+        _publish_summary(report, json_key, json_key[:-len('json')] + 'docx', target_date,
+                         owner_hint={"company_id": cid})
+    return calls
+
+
+def _write_lake_wide_summary(all_users_data, combined_transcripts, combined_photos,
+                             target_date, site_name, triggered_by, force):
+    if not force:
+        is_fresh, existing_count = check_summary_freshness(
+            S3_BUCKET, target_date, len(combined_transcripts))
+        if is_fresh:
+            logger.info(f"  Combined summary: SKIP — up-to-date ({existing_count} transcripts)")
+            return
+    report = _build_summary(all_users_data, target_date, site_name, triggered_by)
+    if report is None:
+        return
+    _publish_summary(report, f"{REPORT_PREFIX}{target_date}/summary_report.json",
+                     f"{REPORT_PREFIX}{target_date}/summary_report.docx", target_date)
+
+
 # ============================================================
 # Generate Daily Report
 # ============================================================
@@ -1409,7 +1831,7 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
         logger.info(f"=== Generating DAILY report for {target_date} ===")
 
     load_prompt_templates(S3_BUCKET)
-    user_mapping = load_user_mapping(S3_BUCKET)
+    directory.reset_cache()
     site_name = os.environ.get('SITE_NAME', 'Construction Site')
 
     users = set()
@@ -1475,19 +1897,39 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
         user_role = user_roles.get(user_name, '')
         user_site_id = user_primary_site.get(user_name, '')
         user_site_info = sites_info.get(user_site_id, {})
+        user_site_slug = user_site_info.get('slug') or user_site_id
         user_site_name = site_name_for(user_site_info)
 
-        weather_block = build_weather_block_for_site(
-            user_site_info, target_date, get_nzdt_now().strftime('%Y-%m-%d'))
+        today_iso = get_nzdt_now().strftime('%Y-%m-%d')
+        weather_block = build_weather_block_for_site(user_site_info, target_date, today_iso)
+        weather_findings = build_weather_findings(
+            user_site_info, target_date, today_iso,
+            programme=programme_for_site(user_site_info))
+        record_site = weather_record_site(user_site_info, user_site_slug)
+        if weather_findings and record_site:
+            try:
+                lake_put(
+                    S3_BUCKET,
+                    weather_record_key(record_site, target_date, weather_findings["actual"]),
+                    json.dumps({"site_id": record_site, "site_slug": user_site_slug,
+                                "date": target_date,
+                                "daily": weather_block, **weather_findings},
+                               default=str).encode("utf-8"),
+                    client=s3_client,
+                    ContentType="application/json")
+            except Exception as e:
+                logger.warning(f"could not keep the weather record for {user_site_id}/{target_date}: {e}")
 
         prompt = build_daily_prompt(
             correlated, user_name, user_site_name, target_date,
             role=user_role, total_duration=user_data['total_duration'],
-            num_photos=len(user_data['photos']), name_mapping=user_mapping,
+            num_photos=len(user_data['photos']),
         )
-        if weather_block:
-            prompt += ("\n\n## Site Weather (for AI correlation)\n"
-                       + weather.weather_prompt_block(weather_block))
+        # NO WEATHER IN THE PROMPT. The model used to be told the day's totals
+        # and asked to judge the impact; that judgement is weather_findings
+        # now, made by code and rendered as it is (owner, 2026-09-29: the code
+        # decides, the model words). The transcript can still mention the
+        # weather -- that is what was said, and stays.
 
         max_tokens = min(8192 + n_transcripts * 700, llm_utils.ANSWER_TOKEN_CEILING)
         logger.info(f"  {user_name}: {n_transcripts} transcripts \u2192 max_tokens={max_tokens}")
@@ -1569,6 +2011,7 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
                 'per_recording': recording_durations,
             },
             'weather': weather_block,
+            'weather_findings': weather_findings,
             'executive_summary': claude_output.get('executive_summary', ''),
             'quality_and_compliance': claude_output.get('quality_and_compliance', []),
             'safety_observations': claude_output.get('safety_observations', []),
@@ -1608,9 +2051,10 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
             report['sections'] = []
 
         json_key = f"{REPORT_PREFIX}{target_date}/{user_name}/daily_report.json"
-        s3_client.put_object(
-            Bucket=S3_BUCKET, Key=json_key,
-            Body=json.dumps(report, ensure_ascii=False, indent=2, default=str),
+        lake_put(
+            S3_BUCKET, json_key,
+            json.dumps(report, ensure_ascii=False, indent=2, default=str),
+            client=s3_client, owner_hint={"folder": user_name},
             ContentType='application/json'
         )
         logger.info(f"Saved: {json_key}")
@@ -1619,16 +2063,23 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
             word_buffer = generate_word_document(report, f"Daily Report \u2014 {user_name} \u2014 {target_date}")
             if word_buffer:
                 word_key = f"{REPORT_PREFIX}{target_date}/{user_name}/daily_report.docx"
-                s3_client.put_object(
-                    Bucket=S3_BUCKET, Key=word_key,
-                    Body=word_buffer.getvalue(),
+                lake_put(
+                    S3_BUCKET, word_key,
+                    word_buffer.getvalue(),
+                    client=s3_client, owner_hint={"folder": user_name},
                     ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
                 )
                 logger.info(f"Saved: {word_key}")
         except Exception as e:
             logger.error(f"Word generation failed for {user_name}: {e}")
 
-        site_id = user_site_id or site_name.lower().replace(' ', '-')
+        site_id = user_site_slug or site_name.lower().replace(' ', '-')
+        _ext = external_folders(S3_BUCKET)
+        if _ext is None or user_name in _ext:
+            # The day spans companies (a live external membership): stamping it on one
+            # site's SITE# items would show another company's content there.
+            logger.info(f"  {user_name}: has_external (or directory unreadable) -- not stamped on SITE# items")
+            continue
         write_items_to_dynamodb(site_id, target_date, topics, user_name, device)
         write_report_to_dynamodb(site_id, target_date, 'daily', json_key, user_name,
             visible_count=len(topics),
@@ -1638,98 +2089,19 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
             f"{n_transcripts} recordings, triggered_by={triggered_by}",
             user=triggered_by)
 
-    # --- Combined summary report ---
+    # --- Combined summary reports: one per company, plus the lake-wide one (flag) ---
     if combined_transcripts and not users_filter:
         if len(skipped_users) == len(all_users_data) and not force:
-            logger.info(f"  Combined summary: SKIP \u2014 all {len(skipped_users)} users up-to-date")
+            logger.info(f"  Combined summary: SKIP — all {len(skipped_users)} users up-to-date")
         else:
-            total_transcript_count = len(combined_transcripts)
-            skip_summary = False
-            if not force:
-                is_fresh, existing_count = check_summary_freshness(
-                    S3_BUCKET, target_date, total_transcript_count)
-                if is_fresh:
-                    logger.info(f"  Combined summary: SKIP \u2014 up-to-date ({existing_count} transcripts)")
-                    skip_summary = True
-
-            if not skip_summary:
-                combined_transcripts.sort(key=lambda x: x['timestamp'] or datetime.min)
-                correlated_all = correlate_photos_with_transcripts(combined_transcripts, combined_photos)
-                combined_duration = sum(d['total_duration'] for d in all_users_data.values())
-                prompt = build_daily_prompt(
-                    correlated_all, "All Workers", site_name, target_date,
-                    total_duration=combined_duration,
-                    num_photos=len(combined_photos), name_mapping=user_mapping,
-                )
-                max_tokens = min(8192 + len(combined_transcripts) * 700, llm_utils.ANSWER_TOKEN_CEILING)
-                raw_response, error = call_claude_structured(prompt, max_tokens=max_tokens)
-
-                if not error:
-                    claude_output = extract_json_from_response(raw_response)
-                    save_debug_record(
-                        S3_BUCKET, target_date, '_summary', prompt, raw_response, claude_output,
-                        parse_success=claude_output is not None,
-                        input_stats={
-                            'transcripts_count': len(combined_transcripts),
-                            'total_words': sum(d['total_words'] for d in all_users_data.values()),
-                            'total_duration': combined_duration,
-                            'photos_count': len(combined_photos),
-                            'users': list(all_users_data.keys()),
-                        }
-                    )
-
-                    if claude_output:
-                        comb_dur_min = int(combined_duration // 60)
-                        comb_dur_sec = int(combined_duration % 60)
-                        combined_report = {
-                            'report_date': target_date, 'report_type': 'daily',
-                            'user_name': None, 'site': site_name,
-                            'users': list(all_users_data.keys()),
-                            'recording_session': {
-                                'date': target_date, 'site': site_name,
-                                'workers': list(all_users_data.keys()),
-                                'recordings': len(combined_transcripts),
-                                'total_duration_seconds': round(combined_duration, 1),
-                                'total_duration_display': f"{comb_dur_min}m {comb_dur_sec}s",
-                                'total_words': sum(d['total_words'] for d in all_users_data.values()),
-                                'photos': len(combined_photos),
-                            },
-                            'executive_summary': claude_output.get('executive_summary', ''),
-                            'quality_and_compliance': claude_output.get('quality_and_compliance', []),
-                            'safety_observations': claude_output.get('safety_observations', []),
-                            'critical_dates_and_deadlines': claude_output.get('critical_dates_and_deadlines', []),
-                            'topics': claude_output.get('topics', []),
-                            '_report_metadata': {
-                                'version': 'v3.5',
-                                'generated_at': datetime.utcnow().isoformat() + 'Z',
-                                'generated_by': triggered_by,
-                                'recordings_processed': len(combined_transcripts),
-                                'total_words': sum(d['total_words'] for d in all_users_data.values()),
-                                'total_duration_seconds': round(combined_duration, 1),
-                                'model': llm_utils.active_model(),
-                            }
-                        }
-
-                        json_key = f"{REPORT_PREFIX}{target_date}/summary_report.json"
-                        s3_client.put_object(
-                            Bucket=S3_BUCKET, Key=json_key,
-                            Body=json.dumps(combined_report, ensure_ascii=False, indent=2, default=str),
-                            ContentType='application/json'
-                        )
-                        logger.info(f"Saved: {json_key}")
-
-                        try:
-                            word_buffer = generate_word_document(combined_report, f"Daily Summary \u2014 {target_date}")
-                            if word_buffer:
-                                word_key = f"{REPORT_PREFIX}{target_date}/summary_report.docx"
-                                s3_client.put_object(
-                                    Bucket=S3_BUCKET, Key=word_key,
-                                    Body=word_buffer.getvalue(),
-                                    ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-                                )
-                                logger.info(f"Saved: {word_key}")
-                        except Exception as e:
-                            logger.error(f"Combined Word failed: {e}")
+            company_calls = _write_company_summaries(
+                all_users_data, target_date, site_name, triggered_by, force)
+            logger.info(f"  Per-company summaries: {company_calls} model call(s)")
+            if _lake_wide_summary_on():
+                _write_lake_wide_summary(all_users_data, combined_transcripts, combined_photos,
+                                         target_date, site_name, triggered_by, force)
+            else:
+                logger.info("  Lake-wide summary: OFF (SUMMARY_LAKE_WIDE=off)")
 
     return {
         'report_type': 'daily', 'date': target_date,
@@ -1746,8 +2118,17 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
 # Generate Weekly / Monthly Report
 # ============================================================
 
-def generate_periodic_report(report_type, start_date, end_date):
-    logger.info(f"=== Generating {report_type.upper()} report: {start_date} to {end_date} ===")
+def generate_periodic_report(report_type, start_date, end_date, user=None, triggered_by='system'):
+    """`user` set = ONE person's own report, built only from that person's own dailies.
+
+    A regenerate request names exactly one folder (owner rule: each person regenerates
+    only their own reports). So with `user` set this never lists other people's
+    reports, never borrows the company-wide day summary for a day the person has no
+    daily -- that would put other people's content into "their own" report -- and
+    returns before the site and combined reports, which are not anyone's to regenerate.
+    """
+    logger.info(f"=== Generating {report_type.upper()} report: {start_date} to {end_date}"
+                f"{' -- user ' + user if user else ''} ===")
     load_prompt_templates(S3_BUCKET)
     site_name = os.environ.get('SITE_NAME', 'Construction Site')
     site_id_default = site_name.lower().replace(' ', '-')
@@ -1759,6 +2140,12 @@ def generate_periodic_report(report_type, start_date, end_date):
     reports_by_user = {}
 
     for date_str in dates_in_range(start_date, end_date):
+        if user is not None:
+            own = download_json_from_s3(S3_BUCKET, f"{REPORT_PREFIX}{date_str}/{user}/daily_report.json")
+            if own:
+                all_daily_reports.append(own)
+                reports_by_user.setdefault(user, []).append(own)
+            continue
         prefix = f"{REPORT_PREFIX}{date_str}/"
         found_per_user = False
         for obj in list_s3_objects(S3_BUCKET, prefix):
@@ -1767,15 +2154,14 @@ def generate_periodic_report(report_type, start_date, end_date):
                 data = download_json_from_s3(S3_BUCKET, key)
                 if data and data.get('user_name'):
                     all_daily_reports.append(data)
-                    user = data['user_name']
-                    reports_by_user.setdefault(user, []).append(data)
+                    reports_by_user.setdefault(data['user_name'], []).append(data)
                     found_per_user = True
             elif '/by_user/' in key and key.endswith('.json') and '_debug' not in key:
                 data = download_json_from_s3(S3_BUCKET, key)
                 if data:
-                    user = data.get('user_name', data.get('user', 'Unknown'))
+                    author = data.get('user_name', data.get('user', 'Unknown'))
                     all_daily_reports.append(data)
-                    reports_by_user.setdefault(user, []).append(data)
+                    reports_by_user.setdefault(author, []).append(data)
                     found_per_user = True
         if not found_per_user:
             summary_key = f"{REPORT_PREFIX}{date_str}/summary_report.json"
@@ -1792,12 +2178,13 @@ def generate_periodic_report(report_type, start_date, end_date):
         return {'report_type': report_type, 'status': 'no_data'}
 
     weekly_reports = []
-    if report_type == 'monthly':
+    if report_type == 'monthly' and user is None:
         for obj in list_s3_objects(S3_BUCKET, REPORT_PREFIX):
             if 'weekly_report.json' in obj['key']:
                 wr = download_json_from_s3(S3_BUCKET, obj['key'])
                 if wr:
                     weekly_reports.append(wr)
+        weekly_reports = usable_weeklies(weekly_reports, external_folders(S3_BUCKET))
 
     now_iso = datetime.utcnow().isoformat() + 'Z'
     per_user_results = {}
@@ -1808,6 +2195,7 @@ def generate_periodic_report(report_type, start_date, end_date):
         logger.info(f"  Generating {report_type} report for user: {user_name} ({len(user_reports)} daily reports)")
         user_site_id = user_primary_site.get(user_name, '')
         user_site_info = sites_info.get(user_site_id, {})
+        user_site_slug = user_site_info.get('slug') or user_site_id
         user_site_name = site_name_for(user_site_info)
         user_role = user_roles.get(user_name, '')
 
@@ -1830,18 +2218,19 @@ def generate_periodic_report(report_type, start_date, end_date):
             'report_date': end_date, 'report_type': report_type,
             'period': {'start': start_date, 'end': end_date},
             'user_name': user_name, 'role': user_role,
-            'site': user_site_name, 'site_id': user_site_id,
+            'site': user_site_name, 'site_id': user_site_slug,
             **claude_output,
             '_report_metadata': {
-                'version': 'v3.5', 'generated_at': now_iso, 'generated_by': 'system',
+                'version': 'v3.5', 'generated_at': now_iso, 'generated_by': triggered_by,
                 'scope': 'user', 'daily_reports_used': len(user_reports), 'model': llm_utils.active_model(),
             }
         }
 
         safe_user = user_name.replace(' ', '_')
         json_key = f"{REPORT_PREFIX}{end_date}/{safe_user}/{report_type}_report.json"
-        s3_client.put_object(Bucket=S3_BUCKET, Key=json_key,
-            Body=json.dumps(user_report, ensure_ascii=False, indent=2, default=str),
+        lake_put(S3_BUCKET, json_key,
+            json.dumps(user_report, ensure_ascii=False, indent=2, default=str),
+            client=s3_client, owner_hint={"folder": safe_user},
             ContentType='application/json')
         logger.info(f"  Saved: {json_key}")
 
@@ -1850,8 +2239,9 @@ def generate_periodic_report(report_type, start_date, end_date):
             word_buffer = generate_word_document(user_report, title)
             if word_buffer:
                 word_key = f"{REPORT_PREFIX}{end_date}/{safe_user}/{report_type}_report.docx"
-                s3_client.put_object(Bucket=S3_BUCKET, Key=word_key,
-                    Body=word_buffer.getvalue(),
+                lake_put(S3_BUCKET, word_key,
+                    word_buffer.getvalue(),
+                    client=s3_client, owner_hint={"folder": safe_user},
                     ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
                 logger.info(f"  Saved: {word_key}")
         except Exception as e:
@@ -1859,20 +2249,32 @@ def generate_periodic_report(report_type, start_date, end_date):
 
         per_user_results[user_name] = {'status': 'success', 'daily_reports': len(user_reports)}
 
+    if user is not None:
+        return {
+            'report_type': report_type,
+            'period': {'start': start_date, 'end': end_date},
+            'daily_reports_used': len(all_daily_reports),
+            'per_user': per_user_results,
+            'per_site': {},
+            'scope': 'user',
+            'status': 'success',
+        }
+
     # Per-site reports
-    reports_by_site = {}
-    for user_name, user_reports in reports_by_user.items():
-        if user_name == '_summary':
-            continue
-        user_site_list = user_all_sites.get(user_name, [])
-        if not user_site_list:
-            user_site_list = [site_id_default]
-        for sid in user_site_list:
-            reports_by_site.setdefault(sid, []).extend(user_reports)
+    reports_by_site = group_reports_by_site(
+        reports_by_user, user_all_sites, external_folders(S3_BUCKET), site_id_default)
 
     per_site_results = {}
-    for site_id, site_reports in reports_by_site.items():
-        site_info = sites_info.get(site_id, {})
+    used_slugs = set()
+    for site_key, site_reports in reports_by_site.items():
+        site_info = sites_info.get(site_key, {})
+        # The report path and site_id stay the slug string, as they always were.
+        # Two sites sharing a slug (different companies) must not write one path:
+        # the second falls back to its id.
+        site_id = site_info.get('slug') or site_key
+        if site_id in used_slugs:
+            site_id = site_key
+        used_slugs.add(site_id)
         site_display_name = site_info.get('name', site_name)
         site_location = site_info.get('location', '')
         site_client = site_info.get('client', '')
@@ -1913,8 +2315,9 @@ def generate_periodic_report(report_type, start_date, end_date):
         }
 
         json_key = f"{REPORT_PREFIX}{end_date}/sites/{site_id}/{report_type}_report.json"
-        s3_client.put_object(Bucket=S3_BUCKET, Key=json_key,
-            Body=json.dumps(site_report, ensure_ascii=False, indent=2, default=str),
+        lake_put(S3_BUCKET, json_key,
+            json.dumps(site_report, ensure_ascii=False, indent=2, default=str),
+            client=s3_client,
             ContentType='application/json')
         logger.info(f"  Saved: {json_key}")
 
@@ -1923,8 +2326,9 @@ def generate_periodic_report(report_type, start_date, end_date):
             word_buffer = generate_word_document(site_report, title)
             if word_buffer:
                 word_key = f"{REPORT_PREFIX}{end_date}/sites/{site_id}/{report_type}_report.docx"
-                s3_client.put_object(Bucket=S3_BUCKET, Key=word_key,
-                    Body=word_buffer.getvalue(),
+                lake_put(S3_BUCKET, word_key,
+                    word_buffer.getvalue(),
+                    client=s3_client,
                     ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
                 logger.info(f"  Saved: {word_key}")
         except Exception as e:
@@ -1961,8 +2365,9 @@ def generate_periodic_report(report_type, start_date, end_date):
                     }
                 }
                 json_key = f"{REPORT_PREFIX}{end_date}/{report_type}_report.json"
-                s3_client.put_object(Bucket=S3_BUCKET, Key=json_key,
-                    Body=json.dumps(combined_report, ensure_ascii=False, indent=2, default=str),
+                lake_put(S3_BUCKET, json_key,
+                    json.dumps(combined_report, ensure_ascii=False, indent=2, default=str),
+                    client=s3_client,
                     ContentType='application/json')
                 logger.info(f"  Saved: {json_key}")
                 try:
@@ -1970,8 +2375,9 @@ def generate_periodic_report(report_type, start_date, end_date):
                     word_buffer = generate_word_document(combined_report, title)
                     if word_buffer:
                         word_key = f"{REPORT_PREFIX}{end_date}/{report_type}_report.docx"
-                        s3_client.put_object(Bucket=S3_BUCKET, Key=word_key,
-                            Body=word_buffer.getvalue(),
+                        lake_put(S3_BUCKET, word_key,
+                            word_buffer.getvalue(),
+                            client=s3_client,
                             ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
                         logger.info(f"  Saved: {word_key}")
                 except Exception as e:
@@ -1985,6 +2391,59 @@ def generate_periodic_report(report_type, start_date, end_date):
         'per_site': per_site_results,
         'status': 'success',
     }
+
+
+# ============================================================
+# Regenerate requests (report_requests/<folder>/<rid>.json)
+# ============================================================
+
+REGENERATE_REQUEST_KEY_RE = re.compile(r"^report_requests/([^/]+)/([^/]+)\.json$")
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def handle_regenerate_request(key):
+    """Regenerate exactly the report one request names, or nothing at all.
+
+    Owner rule: each person regenerates only their own reports. The request is
+    written by org-api, which takes the folder from the caller's identity, never
+    from a body. This side trusts nothing: anything unexpected is REJECTED and
+    generates nothing. It must never fall through to the schedule defaults below
+    (yesterday, every user, plus the seven-day backfill) -- on 2026-09-14 that
+    shape turned one click on one report into four rewritten reports.
+    """
+    m = REGENERATE_REQUEST_KEY_RE.match(key or "")
+    if not m:
+        return {'key': key, 'status': 'rejected', 'reason': 'not a regenerate request key'}
+    key_folder = m.group(1)
+    req = download_json_from_s3(S3_BUCKET, key)
+    if not isinstance(req, dict):
+        return {'key': key, 'status': 'rejected', 'reason': 'request unreadable'}
+
+    user = req.get('user')
+    if not isinstance(user, str) or not user.strip() or '/' in user or user != key_folder:
+        return {'key': key, 'status': 'rejected',
+                'reason': 'user must be one folder, equal to the request key folder'}
+    triggered_by = req.get('triggered_by') if isinstance(req.get('triggered_by'), str) else 'request'
+    report_type = req.get('report_type')
+
+    if report_type == 'daily':
+        date = req.get('date')
+        if not isinstance(date, str) or not _ISO_DATE_RE.match(date):
+            return {'key': key, 'status': 'rejected', 'reason': 'daily needs date YYYY-MM-DD'}
+        logger.info(f"Regenerate request {key}: daily {date} for {user}")
+        result = generate_daily_report(date, None, triggered_by,
+                                       users_filter=[user], force=True)
+        return {'key': key, 'status': 'done', 'result': result}
+
+    if report_type in ('weekly', 'monthly'):
+        start, end = req.get('start_date'), req.get('end_date')
+        if not all(isinstance(d, str) and _ISO_DATE_RE.match(d) for d in (start, end)) or start > end:
+            return {'key': key, 'status': 'rejected', 'reason': f'{report_type} needs start_date and end_date'}
+        logger.info(f"Regenerate request {key}: {report_type} {start}..{end} for {user}")
+        result = generate_periodic_report(report_type, start, end, user=user, triggered_by=triggered_by)
+        return {'key': key, 'status': 'done', 'result': result}
+
+    return {'key': key, 'status': 'rejected', 'reason': f'not regenerable: {report_type!r}'}
 
 
 # ============================================================
@@ -2016,12 +2475,23 @@ def lambda_handler(event, context):
     if not S3_BUCKET:
         return {'statusCode': 400, 'body': 'Missing S3_BUCKET'}
 
-    global _user_mapping_cache
-    _user_mapping_cache = None
+    directory.reset_cache()
     global _prompt_templates_cache
     _prompt_templates_cache = None
 
+    if 'Records' in event:
+        # A regenerate request. Handled here and returned here, so no request --
+        # however malformed -- can reach the schedule defaults below.
+        outcomes = [handle_regenerate_request(unquote_plus(r.get('s3', {}).get('object', {}).get('key', '')))
+                    for r in (event.get('Records') or [])]
+        logger.info(f"Regenerate requests: {json.dumps(outcomes, default=str)[:2000]}")
+        return {'statusCode': 200, 'body': json.dumps(outcomes, default=str)}
+
     report_type = event.get('report_type', 'daily')
+
+    if report_type == 'weather_forecast':
+        return {'statusCode': 200,
+                'body': json.dumps(run_weather_forecasts(event.get('date')), default=str)}
 
     if report_type == 'daily':
         target_date = event.get('date', get_yesterday_date())

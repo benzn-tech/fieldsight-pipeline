@@ -51,6 +51,14 @@ def body_of(res):
     return json.loads(res["body"])
 
 
+@pytest.fixture(autouse=True)
+def _no_company_summary(monkeypatch):
+    """admin_disambiguation first offers a non-platform caller their own company's summary
+    document (Task 10); none exists in these tests, so the candidate path under test runs."""
+    monkeypatch.setattr(org, "_get_lake_json", lambda key: None)
+    monkeypatch.setattr(org, "_day_has_deleted_sources", lambda conn, u, d: False)
+
+
 @pytest.fixture
 def wired(monkeypatch):
     """No Aurora topics, no lake doc, nothing deleted -> the plain 404 path."""
@@ -317,10 +325,9 @@ def test_an_admin_day_with_only_uploads_offers_a_picker(monkeypatch):
     that opens onto nothing is the failure this feature exists to end, wearing
     a different hat.
     """
-    monkeypatch.setattr(org, "_list_report_folders", lambda date: [])
+    monkeypatch.setattr(org, "_list_report_folders", lambda date, *a: [])
     monkeypatch.setattr(org.topics, "list_extraction_folder_names_for_date",
                         lambda conn, cid, date: set())
-    monkeypatch.setattr(org.companies, "get_company_by_name", lambda conn, name: None)
     monkeypatch.setattr(org.recordings, "folders_with_uploads_for_date",
                         lambda conn, cid, date: {"Neil_Blunden", "Sam_Yu"})
     res = org.admin_disambiguation(FakeConn(), dict(CALLER), DATE)
@@ -331,10 +338,9 @@ def test_an_admin_day_with_only_uploads_offers_a_picker(monkeypatch):
 def test_a_single_upload_only_folder_goes_straight_to_that_day(monkeypatch):
     """One candidate recurses into the single-user path, same as a report day.
     The admin should land on the photos, not on a picker with one entry."""
-    monkeypatch.setattr(org, "_list_report_folders", lambda date: [])
+    monkeypatch.setattr(org, "_list_report_folders", lambda date, *a: [])
     monkeypatch.setattr(org.topics, "list_extraction_folder_names_for_date",
                         lambda conn, cid, date: set())
-    monkeypatch.setattr(org.companies, "get_company_by_name", lambda conn, name: None)
     monkeypatch.setattr(org.recordings, "folders_with_uploads_for_date",
                         lambda conn, cid, date: {USER})
     seen = {}
@@ -348,10 +354,9 @@ def test_a_single_upload_only_folder_goes_straight_to_that_day(monkeypatch):
 def test_a_truly_empty_day_still_404s_for_an_admin(monkeypatch):
     """Nothing captured, nothing extracted, nothing reported. The picker must
     not appear for a day with no content at all."""
-    monkeypatch.setattr(org, "_list_report_folders", lambda date: [])
+    monkeypatch.setattr(org, "_list_report_folders", lambda date, *a: [])
     monkeypatch.setattr(org.topics, "list_extraction_folder_names_for_date",
                         lambda conn, cid, date: set())
-    monkeypatch.setattr(org.companies, "get_company_by_name", lambda conn, name: None)
     monkeypatch.setattr(org.recordings, "folders_with_uploads_for_date",
                         lambda conn, cid, date: set())
     res = org.admin_disambiguation(FakeConn(), dict(CALLER), DATE)
@@ -366,10 +371,13 @@ def test_a_cross_company_admin_is_not_pinned_to_its_own_company(monkeypatch):
     already fixed for once.
     """
     seen = {}
-    monkeypatch.setattr(org, "_list_report_folders", lambda date: [])
+    monkeypatch.setattr(org, "_list_report_folders", lambda date, *a: [])
     monkeypatch.setattr(org.topics, "list_extraction_folder_names_for_date",
                         lambda conn, cid, date: set())
-    monkeypatch.setattr(org.companies, "get_company_by_name", lambda conn, name: None)
+    # platform_admin reaches the lake-wide summary branch first; no summary for
+    # this day, so the call falls through to the candidate sources under test.
+    monkeypatch.setattr(org, "_day_has_deleted_sources", lambda conn, folder, date: False)
+    monkeypatch.setattr(org, "_get_lake_json", lambda key: None)
     monkeypatch.setattr(org.recordings, "folders_with_uploads_for_date",
                         lambda conn, cid, date: seen.update(company=cid) or set())
     org.admin_disambiguation(FakeConn(), dict(CALLER, global_role="platform_admin"), DATE)
@@ -378,10 +386,9 @@ def test_a_cross_company_admin_is_not_pinned_to_its_own_company(monkeypatch):
 
 def test_an_ordinary_admin_keeps_the_company_pin(monkeypatch):
     seen = {}
-    monkeypatch.setattr(org, "_list_report_folders", lambda date: [])
+    monkeypatch.setattr(org, "_list_report_folders", lambda date, *a: [])
     monkeypatch.setattr(org.topics, "list_extraction_folder_names_for_date",
                         lambda conn, cid, date: set())
-    monkeypatch.setattr(org.companies, "get_company_by_name", lambda conn, name: None)
     monkeypatch.setattr(org.recordings, "folders_with_uploads_for_date",
                         lambda conn, cid, date: seen.update(company=cid) or set())
     org.admin_disambiguation(FakeConn(), dict(CALLER), DATE)

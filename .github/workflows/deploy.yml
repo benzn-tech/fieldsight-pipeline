@@ -2,7 +2,6 @@ name: Deploy FieldSight TEST (SAM)
 
 # ============================================================
 # develop → TEST stack (fieldsight-test) via full SAM deploy.
-#
 # PROD is NOT deployed by SAM: the prod backend was hand-assembled
 # (shared IAM role, EventBridge Scheduler crons, manual API Gateway —
 # no CloudFormation stack), so `sam deploy` would collide with it.
@@ -18,7 +17,6 @@ name: Deploy FieldSight TEST (SAM)
 # for a reason that has nothing to do with the change being deployed — which is
 # how a perfectly good deploy gets diagnosed as broken code. Merging a few PRs
 # in quick succession, or two people merging at once, is enough to trigger it.
-#
 # cancel-in-progress is deliberately FALSE: queueing is the point. Cancelling a
 # run mid-CloudFormation-update would leave the stack half-applied, which is
 # strictly worse than waiting.
@@ -91,6 +89,7 @@ jobs:
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY_TEST }}
           ELEVENLABS_ASK_API_KEY: ${{ secrets.ELEVENLABS_ASK_API_KEY_TEST }}
           ELEVENLABS_API_KEY_TTS: ${{ secrets.ELEVENLABS_API_KEY_TTS }}
+          VOICE_LLM_BEARER: ${{ secrets.VOICE_LLM_BEARER_TEST }}
           FARGATE_SUBNET_IDS: ${{ secrets.FARGATE_SUBNET_IDS }}
           FARGATE_VPC_ID: ${{ secrets.FARGATE_VPC_ID }}
         run: |
@@ -136,6 +135,13 @@ jobs:
           if [ -n "$ELEVENLABS_API_KEY_TTS" ]; then
             EL_TTS_KEY_PARAM="ElevenLabsTtsApiKey=$ELEVENLABS_API_KEY_TTS"
           fi
+          # Voice agent shell (ElevenLabs Custom LLM, spec 2026-10-13). TEST only:
+          # deploy-prod.yml never passes it, so prod creates no VoiceLlmFunction
+          # (Condition HasVoiceLlm). Same bare-"Key=" guard as the keys above.
+          VOICE_LLM_PARAM=""
+          if [ -n "$VOICE_LLM_BEARER" ]; then
+            VOICE_LLM_PARAM="VoiceLlmBearer=$VOICE_LLM_BEARER"
+          fi
           EL_ASK_KEY_PARAM=""
           if [ -n "$ELEVENLABS_ASK_API_KEY" ]; then
             EL_ASK_KEY_PARAM="ElevenLabsAskApiKey=$ELEVENLABS_ASK_API_KEY"
@@ -168,7 +174,6 @@ jobs:
           # prod, defaulted off so today's behaviour is unchanged. Prod runs it
           # true, so anything test proves about topic authority only transfers
           # once this is on as well.
-          #
           # Explanations live HERE, above the command. A comment between two
           # backslash-continued lines ENDS the command: everything from the #
           # onward is comment, the remaining argument lines are then parsed as
@@ -190,6 +195,20 @@ jobs:
           # never passed here, so both stacks ran template defaults and the
           # "just flip a variable" rollback did not exist. Unset vars keep those
           # same defaults, so adding them changes nothing until someone sets one.
+          # ElevenLabsTtsVoice / ElevenLabsTtsSpeed are passed EXPLICITLY below,
+          # because a template Default does not reach a stack that already exists.
+          # sam deploy sends only the parameters named in --parameter-overrides;
+          # CloudFormation carries its PREVIOUS value forward for every one it does
+          # not see, so a Default governs a brand-new stack and nothing else.
+          # Measured 2026-09-22: the Default was changed to James, TEST deployed
+          # 02:16Z, prod deployed 02:34Z, and BOTH stacks still reported
+          # ElevenLabsTtsVoice=bPkjmCb0W1xUBvyH2Afs. Green CI, two successful
+          # deploys, the old voice, no error anywhere.
+          #
+          # Literals rather than repo variables: one voice and one speed for both
+          # environments is the product decision (TEST is where the voice gets
+          # judged). The three copies -- both workflows and the template Default --
+          # are pinned equal by test_the_voice_and_speed_are_wired_not_just_defaulted.
           sam deploy --config-env test \
             --no-confirm-changeset --no-fail-on-empty-changeset \
             --parameter-overrides \
@@ -206,7 +225,7 @@ jobs:
               "EnableSweepPendingGate=${{ vars.TEST_ENABLE_SWEEP_PENDING_GATE || 'false' }}" \
               "EmailSender=${{ vars.TEST_EMAIL_SENDER || 'stub' }}" \
               "EnableSiteVoice=true" \
-              "DocxLayerArn=arn:aws:lambda:ap-southeast-2:509194952652:layer:python-docx-layer:2" \
+              "DocxLayerArn=arn:aws:lambda:ap-southeast-2:509194952652:layer:python-docx-layer:3" \
               "EnableNonWorkExpiry=${{ vars.TEST_NONWORK_EXPIRY_ENABLED || 'false' }}" \
               "NonWorkExpiryHours=${{ vars.TEST_NONWORK_EXPIRY_HOURS || '24' }}" \
               $NONWORK_SINCE_PARAM \
@@ -222,18 +241,26 @@ jobs:
               "TranscriptTableName=fieldsight-test-transcripts" \
               "AuthorityFlip=${{ vars.TEST_AUTHORITY_FLIP || 'false' }}" \
               "GradedRoles=${{ vars.TEST_GRADED_ROLES || 'false' }}" \
+              "LakeIndexReads=${{ vars.TEST_LAKE_INDEX_READS || 'false' }}" \
+              "CompanySummaryServe=${{ vars.TEST_COMPANY_SUMMARY_SERVE || 'off' }}" \
               "EnableUserDeletion=${{ vars.TEST_ENABLE_USER_DELETION || 'false' }}" \
               "EnableExternalCorroboration=${{ vars.TEST_ENABLE_EXTERNAL_CORROBORATION || 'false' }}" \
               "CorroborationApiKey=${{ secrets.OPENROUTER_API_KEY }}" \
               "EnableWebAnswer=${{ vars.TEST_ENABLE_WEB_ANSWER || 'false' }}" \
+              "AskConversationMemory=${{ vars.TEST_ASK_CONVERSATION_MEMORY || 'false' }}" \
+              "AskRewriteBudget=${{ vars.TEST_ASK_REWRITE_BUDGET || '4.0' }}" \
+              "AskDistanceGate=${{ vars.TEST_ASK_DISTANCE_GATE || '0.55' }}" \
               "UploadVerifyMode=${{ vars.TEST_UPLOAD_VERIFY_MODE || 'observe' }}" \
               "SpeakerIdentityMode=${{ vars.TEST_SPEAKER_IDENTITY_MODE || 'off' }}" \
+              "MatchOnFinalize=${{ vars.TEST_MATCH_ON_FINALIZE || 'false' }}" \
+              "ProposalWindowHours=${{ vars.TEST_PROPOSAL_WINDOW_HOURS || '72' }}" \
+              "RosterDerived=${{ vars.TEST_ROSTER_DERIVED || 'on' }}" \
+              "RosterLookbackDays=${{ vars.TEST_ROSTER_LOOKBACK_DAYS || '14' }}" \
               "EnrolOnCorrection=${{ vars.TEST_ENROL_ON_CORRECTION || 'false' }}" \
               "VoiceprintMaxFrameSpread=${{ vars.TEST_VOICEPRINT_MAX_FRAME_SPREAD || 'default' }}" \
               "AlertEmail=${{ vars.TEST_ALERT_EMAIL || 'none' }}" \
               "ServerBuild=${{ github.sha }}" \
               "DeviceAnnouncementPatterns=${{ vars.TEST_DEVICE_ANNOUNCEMENT_PATTERNS || '[]' }}" \
-              "MultiTenantResolution=${{ vars.TEST_MULTI_TENANT_RESOLUTION || 'true' }}" \
               "VadThreshold=${{ vars.TEST_VAD_THRESHOLD || '0.2' }}" \
               "DropSilentChunks=${{ vars.TEST_DROP_SILENT_CHUNKS || 'true' }}" \
               "NormaliseAudio=${{ vars.TEST_NORMALISE_AUDIO || 'true' }}" \
@@ -249,10 +276,14 @@ jobs:
               "GroupMergeCap=${{ vars.TEST_GROUP_MERGE_CAP || '2' }}" \
               "StuckMergeSeconds=${{ vars.TEST_STUCK_MERGE_SECONDS || '1800' }}" \
               "GroupMaxSpanSeconds=${{ vars.TEST_GROUP_MAX_SPAN_SECONDS || '43200' }}" \
+              "DeclareContinuity=${{ vars.TEST_DECLARE_CONTINUITY || 'false' }}" \
               "EmitEvidence=${{ vars.TEST_EMIT_EVIDENCE || 'true' }}" \
               "EvidenceWindowSec=${{ vars.TEST_EVIDENCE_WINDOW_SEC || '60' }}" \
               "EvidenceFuzzyThreshold=${{ vars.TEST_EVIDENCE_FUZZY_THRESHOLD || '0.80' }}" \
               "EvidenceFloorTokens=${{ vars.TEST_EVIDENCE_FLOOR_TOKENS || '5' }}" \
+              "EnableRecordingBlocks=${{ vars.TEST_ENABLE_RECORDING_BLOCKS || 'true' }}" \
+              "ReportBlockGapSeconds=${{ vars.TEST_REPORT_BLOCK_GAP_SECONDS || '600' }}" \
+              "ReportLongBlockSeconds=${{ vars.TEST_REPORT_LONG_BLOCK_SECONDS || '5400' }}" \
               "LlmTemperature=${{ vars.TEST_LLM_TEMPERATURE || '0' }}" \
               "RealPTTAccount=$REALPTT_ACCOUNT" \
               "RealPTTPassword=$REALPTT_PASSWORD" \
@@ -276,7 +307,11 @@ jobs:
               $QWEN_CHAT_KEY_PARAM \
               "AskSttProvider=${{ vars.TEST_ASK_STT_PROVIDER || 'dashscope' }}" \
               "AskTtsProvider=${{ vars.TEST_ASK_TTS_PROVIDER || 'dashscope' }}" \
+              "ElevenLabsTtsVoice=QlZn2MPaf2jDn0461bnj" \
+              "ElevenLabsTtsSpeed=1.10" \
+              "ElevenLabsTtsModel=eleven_multilingual_v2" \
               $EL_TTS_KEY_PARAM \
+              $VOICE_LLM_PARAM \
               "AskVoiceModel=${{ vars.TEST_ASK_VOICE_MODEL || 'none' }}" \
               $EL_ASK_KEY_PARAM \
               "ElevenLabsApiKey=$ELEVENLABS_API_KEY" \

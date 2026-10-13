@@ -1,3 +1,4 @@
+import re
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -147,10 +148,13 @@ def day_stats(conn, company_id, user_folder, date) -> dict:
         "  substring(s3_key from '_(sid[0-9a-f]{32})_c[0-9]+\\.'), s3_key"
         ")) AS sessions, "
         "COALESCE(SUM(duration_s), 0) AS duration_s "
-        "FROM recordings "
-        "WHERE company_id = %s AND kind IN ('audio','video') "
+        "FROM recordings WHERE "
+        # company_id=None = no company restriction (a person reading their OWN whole
+        # day: it spans every company whose site they recorded on).
+        + ("company_id = %s AND " if company_id else "") +
+        "kind IN ('audio','video') "
         "AND s3_key LIKE %s ESCAPE '\\'",
-        (company_id, f"users/{_escape_like(user_folder)}/%/{date}/%"),
+        ((company_id,) if company_id else ()) + (f"users/{_escape_like(user_folder)}/%/{date}/%",),
     ).fetchone()
     if row is None:
         return {"sessions": 0, "duration_s": 0}
@@ -158,8 +162,20 @@ def day_stats(conn, company_id, user_folder, date) -> dict:
             "duration_s": int(row["duration_s"] or 0)}
 
 
+def _external_site_pin_exemption(external_site_ids):
+    """(sql_fragment, params) that exempts rows on the caller's EXTERNAL sites from the
+    home-company pin. Rows captured on another company's project carry the SITE's
+    company, so `company_id = <home>` would hide exactly them. The exemption is by
+    SITE ID only: the NULL-site arm keeps the home-company pin (company=None stays
+    platform_admin only -- final review F4). Empty -> no fragment, SQL unchanged."""
+    ids = [str(s) for s in (external_site_ids or ())]
+    if not ids:
+        return "", {}
+    return " OR site_id = ANY(%(ext_sites)s::uuid[])", {"ext_sites": ids}
+
+
 def range_stats(conn, company_id, date_from, date_to,
-                site_ids, author_ids=None, deleted_bases=()) -> dict:
+                site_ids, author_ids=None, deleted_bases=(), external_site_ids=()) -> dict:
     """Sessions, seconds and photos over a date RANGE, in the ACL's own currency.
 
     Scoped by `site_ids` and `author_ids` -- the two sets `scope.visible_scope`
@@ -228,6 +244,7 @@ def range_stats(conn, company_id, date_from, date_to,
     bases = {b for b in (deleted_bases or ()) if b}
     bases |= {b[3:] for b in list(bases) if b.startswith("sid")}
     bases |= {"sid" + b for b in list(bases) if not b.startswith("sid")}
+    ext_clause, ext_params = _external_site_pin_exemption(external_site_ids)
 
     row = conn.cursor(row_factory=dict_row).execute(
         "WITH windowed AS ("
@@ -255,7 +272,7 @@ def range_stats(conn, company_id, date_from, date_to,
         "         OR (site_id IS NULL"
         "             AND (%(company)s::uuid IS NULL"
         "                  OR company_id = %(company)s)))"
-        "    AND (%(company)s::uuid IS NULL OR company_id = %(company)s)"
+        "    AND (%(company)s::uuid IS NULL OR company_id = %(company)s" + ext_clause + ")"
         "    AND substring(s3_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/')"
         "        BETWEEN %(from)s AND %(to)s"
         "    AND (%(authors)s::uuid[] IS NULL OR user_id = ANY(%(authors)s::uuid[]))"
@@ -308,7 +325,7 @@ def range_stats(conn, company_id, date_from, date_to,
         {"company": company_id, "from": date_from, "to": date_to,
          "sites": [str(s) for s in site_ids],
          "authors": [str(a) for a in author_ids] if author_ids is not None else None,
-         "deleted": list(bases)},
+         "deleted": list(bases), **ext_params},
     ).fetchone()
     if row is None:
         return {"sessions": 0, "duration_s": 0, "unmeasured": 0,
@@ -320,7 +337,7 @@ def range_stats(conn, company_id, date_from, date_to,
 
 
 def upload_date_counts(conn, company_id, site_ids, since_date, *,
-                       author_ids=None, deleted_bases=()) -> list[dict]:
+                       author_ids=None, deleted_bases=(), external_site_ids=()) -> list[dict]:
     """Per-date {date, sessions, photos} from `recordings` ALONE — no topics,
     no extraction, no LLM.
 
@@ -365,6 +382,7 @@ def upload_date_counts(conn, company_id, site_ids, since_date, *,
     bases = {b for b in (deleted_bases or ()) if b}
     bases |= {b[3:] for b in list(bases) if b.startswith("sid")}
     bases |= {"sid" + b for b in list(bases) if not b.startswith("sid")}
+    ext_clause, ext_params = _external_site_pin_exemption(external_site_ids)
     rows = conn.cursor(row_factory=dict_row).execute(
         "WITH windowed AS ("
         "  SELECT kind, site_id,"
@@ -375,7 +393,7 @@ def upload_date_counts(conn, company_id, site_ids, since_date, *,
         "         OR (site_id IS NULL"
         "             AND (%(company)s::uuid IS NULL"
         "                  OR company_id = %(company)s)))"
-        "    AND (%(company)s::uuid IS NULL OR company_id = %(company)s)"
+        "    AND (%(company)s::uuid IS NULL OR company_id = %(company)s" + ext_clause + ")"
         "    AND substring(s3_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/') >= %(since)s"
         "    AND (%(authors)s::uuid[] IS NULL OR user_id = ANY(%(authors)s::uuid[]))"
         "), sess AS ("
@@ -397,7 +415,7 @@ def upload_date_counts(conn, company_id, site_ids, since_date, *,
          "sites": [str(s) for s in site_ids],
          "since": str(since_date),
          "authors": [str(a) for a in author_ids] if author_ids is not None else None,
-         "deleted": list(bases)},
+         "deleted": list(bases), **ext_params},
     ).fetchall()
     return [{"date": r["date"], "sessions": int(r["sessions"] or 0),
              "photos": int(r["photos"] or 0)} for r in rows]
@@ -506,6 +524,56 @@ def session_span(conn, company_id, user_folder, date, session_base):
     return row["lo"], row["hi"]
 
 
+def session_local_span(conn, company_id, user_folder, date, session_base):
+    """(start_minute, end_minute) of one session IN THE DEVICE'S LOCAL CLOCK,
+    or None when it cannot be known.
+
+    A SECOND SPAN FUNCTION, and the reason is the clock, not the query.
+    `session_span` above answers in `timestamptz`, which is right for the
+    deletion tombstone it feeds because that compares against other
+    timestamptz values. Photo binding does not: a photo's time comes from its
+    FILENAME (`..._2026-09-22_15-22-34.jpg`, parsed by transcript_utils), which
+    is the device's local wall clock with no zone on it. Comparing the two
+    would be the BUG-19/BUG-37 family -- the one this repo has produced every
+    time a UTC value met a local one -- and it would be SILENT: a span off by
+    twelve or thirteen hours does not raise, it simply stops covering anything,
+    and a rule that never fires looks exactly like a rule that is satisfied.
+
+    So the bounds are read from the same place the photo's is: the s3_key
+    filename for the start, plus `duration_s` (a scalar, and therefore
+    zone-free) for the end. A row whose filename carries no parseable time
+    contributes nothing; a row with a NULL duration contributes its start only,
+    mirroring session_span's COALESCE(ended_at, started_at).
+
+    None is a real answer -- see session_span. Callers must fail OPEN on it: a
+    session we cannot place must not stop competing for the day's photos.
+    """
+    from transcript_utils import extract_base_time_from_filename
+
+    sid = session_base[3:] if session_base.startswith("sid") else session_base
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT s3_key, duration_s FROM recordings "
+        "WHERE company_id = %s AND kind IN ('audio','video') "
+        "AND s3_key LIKE %s ESCAPE '\\' AND s3_key LIKE %s ESCAPE '\\'",
+        (company_id,
+         f"users/{_escape_like(user_folder)}/%/{date}/%",
+         f"%{_escape_like(sid)}%"),
+    ).fetchall()
+
+    lo = hi = None
+    for r in rows:
+        base = extract_base_time_from_filename(r["s3_key"].rsplit("/", 1)[-1])
+        if base is None:
+            continue
+        start = base.hour * 60 + base.minute
+        end = start + int((r["duration_s"] or 0) // 60)
+        lo = start if lo is None else min(lo, start)
+        hi = end if hi is None else max(hi, end)
+    if lo is None:
+        return None
+    return lo, hi
+
+
 def photo_keys_in_span(conn, company_id, user_folder, date, lo, hi) -> list:
     """Photo keys captured inside a session's span, for that folder and day.
 
@@ -531,33 +599,60 @@ def photo_keys_in_span(conn, company_id, user_folder, date, lo, hi) -> list:
 
 
 
-def site_for_media(conn, company_id, user_folder, date, session_base) -> dict | None:
+# A recording's site is usable by its recorder when the recorder holds a LIVE
+# membership on it (any company) or the site belongs to the recorder's own
+# company. This replaces the old `recordings.company_id = sites.company_id =
+# <home company>` pin (project-owned tenancy P2): an external member's recording
+# carries the SITE's company, so pinning on the home company would never find it.
+# It also never lets a rung pick a site of a company the recorder has no relation to.
+_SITE_USABLE_BY_USER_SQL = (
+    "JOIN users u ON u.id = %s "
+    "WHERE r.site_id IS NOT NULL "
+    "AND (s.company_id = u.company_id OR EXISTS ("
+    "SELECT 1 FROM memberships m WHERE m.user_id = u.id AND m.site_id = s.id "
+    "AND m.archived_at IS NULL)) "
+)
+
+
+# The day-level rung is a GUESS ("most-used site that day"), so unlike an explicit tag it may
+# only land on a site of the recorder's HOME company. A day on which the recorder also worked
+# on another company's project must not pull their untagged home-company session onto that
+# project (final review F6): a foreign site is reached only through an explicit tag -- the
+# recording's own site_id, the meeting session's site, or the group lead's.
+_SITE_OF_RECORDERS_HOME_COMPANY_SQL = (
+    "JOIN users u ON u.id = %s "
+    "WHERE r.site_id IS NOT NULL AND s.company_id = u.company_id "
+)
+
+
+def site_for_media(conn, user_id, user_folder, date, session_base) -> dict | None:
     """The app-tagged site (recordings.site_id) for the recording whose media
     file this extraction session came from, or None. Matches recordings.s3_key
     by session_base within users/{folder}/.../{date}/ (LIKE, wildcard-escaped),
-    scoped to company_id, and only returns a site that is itself in-company
-    (multi-tenant invariant — never attribute across tenants). Newest matching
-    recording wins. Returns a sites.get_site()-shaped row so it drops in where
-    resolve_site's return is used (lambda_item_writer)."""
+    and only returns a site the recorder (`user_id`) may use: a live membership
+    on it, or a site of the recorder's own company (never attribute to a company
+    the recorder has no relation to). Newest matching recording wins. Returns a
+    sites.get_site()-shaped row so it drops in where resolve_site's return is
+    used (lambda_item_writer)."""
     pattern = f"users/{_escape_like(user_folder)}/%/{date}/{_escape_like(session_base)}.%"
     row = conn.cursor(row_factory=dict_row).execute(
         "SELECT r.site_id FROM recordings r JOIN sites s ON s.id = r.site_id "
-        "WHERE r.company_id = %s AND s.company_id = %s AND r.site_id IS NOT NULL "
+        + _SITE_USABLE_BY_USER_SQL +
         "AND r.s3_key LIKE %s ESCAPE '\\' "
         "ORDER BY r.created_at DESC LIMIT 1",
-        (company_id, company_id, pattern),
+        (user_id, pattern),
     ).fetchone()
     if row is None:
         return None
     return sites.get_site(conn, row["site_id"])
 
 
-def site_for_day(conn, company_id, user_folder, date) -> dict | None:
+def site_for_day(conn, user_id, user_folder, date) -> dict | None:
     """The app-tagged site (recordings.site_id) for a user's WHOLE day, or
     None. Report-level sibling of site_for_media above: same LIKE match on
-    users/{folder}/.../{date}/ (wildcard-escaped), same company double-scope
-    via the sites join (multi-tenant invariant -- never attribute across
-    tenants), same r.site_id IS NOT NULL filter, same sites.get_site()-shaped
+    users/{folder}/.../{date}/ (wildcard-escaped), same r.site_id IS NOT NULL
+    filter, but ONLY sites of the recorder's home company (a guess never crosses
+    a company boundary; see _SITE_OF_RECORDERS_HOME_COMPANY_SQL), same sites.get_site()-shaped
     return so it drops into the same slot as resolve_site.
 
     Unlike site_for_media there is no session_base to pin a single
@@ -570,12 +665,180 @@ def site_for_day(conn, company_id, user_folder, date) -> dict | None:
     row = conn.cursor(row_factory=dict_row).execute(
         "SELECT r.site_id, COUNT(*) AS cnt, MAX(r.created_at) AS latest "
         "FROM recordings r JOIN sites s ON s.id = r.site_id "
-        "WHERE r.company_id = %s AND s.company_id = %s AND r.site_id IS NOT NULL "
+        + _SITE_OF_RECORDERS_HOME_COMPANY_SQL +
         "AND r.s3_key LIKE %s ESCAPE '\\' "
         "GROUP BY r.site_id "
         "ORDER BY cnt DESC, latest DESC LIMIT 1",
-        (company_id, company_id, pattern),
+        (user_id, pattern),
     ).fetchone()
     if row is None:
         return None
     return sites.get_site(conn, row["site_id"])
+
+
+_SID_RE = re.compile(r"^sid[0-9a-f]{32}$")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def locate_session(conn, company_id, session_base):
+    """`(user_folder, date)` for a session, or None when nothing can say.
+
+    A turn_ref's filename stem begins with the DEVICE name, which is not the user's folder,
+    so neither can be read off it. Two sources, in order of authority:
+
+    1. `recordings.s3_key` -- `users/{folder}/{kind}/{date}/{filename}` -- for any recording
+       of this session (newest wins; every chunk of one session shares folder and date).
+    2. the proposal / introduction rows, which carry both on the row.
+
+    `session_base` is interpolated into a LIKE pattern, so only the canonical
+    `sid<32 hex>` is accepted; anything else is None rather than a wildcard.
+    """
+    if not company_id or not _SID_RE.match(str(session_base or "")):
+        return None
+    cur = conn.cursor(row_factory=dict_row)
+    row = cur.execute(
+        "SELECT s3_key FROM recordings "
+        "WHERE company_id = %s AND s3_key LIKE %s ESCAPE '\\' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (company_id, f"users/%/%/%/%{session_base}%")).fetchone()
+    if row:
+        parts = str(row["s3_key"]).split("/")
+        if len(parts) >= 5 and parts[0] == "users" and _DATE_RE.match(parts[3]):
+            return parts[1], parts[3]
+    row = cur.execute(
+        "SELECT user_folder, session_date FROM ("
+        "  SELECT user_folder, session_date, created_at FROM speaker_name_proposals "
+        "  WHERE company_id = %s AND session_base = %s "
+        "  UNION ALL "
+        "  SELECT user_folder, session_date, created_at FROM speaker_intro_suggestions "
+        "  WHERE company_id = %s AND session_base = %s"
+        ") t ORDER BY created_at DESC LIMIT 1",
+        (company_id, session_base, company_id, session_base)).fetchone()
+    if row and row.get("user_folder") and row.get("session_date"):
+        return row["user_folder"], str(row["session_date"])
+    return None
+
+
+def author_footprint_in_sites(conn, user_id, site_ids) -> bool:
+    """Whether `user_id` authored any topic or recording on one of `site_ids`.
+    The reach test for reading a person whose directory row is in ANOTHER
+    company: a site's company may open that person's folder only because they
+    worked on its sites."""
+    if not site_ids or not user_id:
+        return False
+    ids = [str(s) for s in site_ids]
+    row = conn.execute(
+        "SELECT EXISTS (SELECT 1 FROM topics WHERE user_id=%s AND site_id = ANY(%s::uuid[])) "
+        "OR EXISTS (SELECT 1 FROM recordings WHERE user_id=%s AND site_id = ANY(%s::uuid[])) "
+        "OR EXISTS (SELECT 1 FROM memberships WHERE user_id=%s AND site_id = ANY(%s::uuid[]) "
+        "AND archived_at IS NULL)",
+        (user_id, ids, user_id, ids, user_id, ids),
+    ).fetchone()
+    return bool(row and row[0])
+
+
+def author_range_not_within_sites(conn, user_id, date_from, date_to, site_ids, *,
+                                  siteless_outside=False) -> bool:
+    """Whether `user_id`'s work in [date_from, date_to] is NOT wholly inside `site_ids`.
+
+    True when ANY topic or recording of the person in the range lies on a site
+    outside `site_ids`. With `siteless_outside=True` (the caller may not see the
+    person's HOME-company work: final review F1 whitelist) a row with NO site also
+    counts as outside, and so does a range with nothing at all on the caller's
+    sites -- a document that cannot be tied to the caller's sites is not served.
+
+    Gates every artefact that is a synthesis of a person's day(s) and carries no
+    site of its own: the verbatim daily_report.json, the per-user weekly/monthly
+    documents (range-aware: one foreign day hides the whole document)."""
+    ids = [str(s) for s in (site_ids or [])]
+    dfrom, dto = str(date_from), str(date_to)
+    row = conn.execute(
+        "SELECT "
+        "(EXISTS (SELECT 1 FROM topics WHERE user_id=%(u)s AND report_date BETWEEN %(f)s::date AND %(t)s::date "
+        "   AND ((site_id IS NOT NULL AND NOT (site_id = ANY(%(s)s::uuid[]))) "
+        "        OR (site_id IS NULL AND %(sl)s))) "
+        " OR EXISTS (SELECT 1 FROM recordings WHERE user_id=%(u)s "
+        "   AND substring(s3_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/') BETWEEN %(f)s::text AND %(t)s::text "
+        "   AND ((site_id IS NOT NULL AND NOT (site_id = ANY(%(s)s::uuid[]))) "
+        "        OR (site_id IS NULL AND %(sl)s)))) AS outside, "
+        "(EXISTS (SELECT 1 FROM topics WHERE user_id=%(u)s AND report_date BETWEEN %(f)s::date AND %(t)s::date "
+        "   AND site_id = ANY(%(s)s::uuid[])) "
+        " OR EXISTS (SELECT 1 FROM recordings WHERE user_id=%(u)s "
+        "   AND substring(s3_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/') BETWEEN %(f)s::text AND %(t)s::text "
+        "   AND site_id = ANY(%(s)s::uuid[]))) AS inside",
+        {"u": user_id, "f": dfrom, "t": dto, "s": ids, "sl": bool(siteless_outside)},
+    ).fetchone()
+    if not row:
+        return bool(siteless_outside)
+    outside, inside = row[0], row[1]
+    return bool(outside) or (bool(siteless_outside) and not inside)
+
+
+def author_day_has_rows_outside_sites(conn, user_id, date, site_ids, *,
+                                      siteless_outside=False) -> bool:
+    """One-day form of `author_range_not_within_sites` (see there). The name is the
+    one the verbatim daily_report.json guard has always used; with the default
+    `siteless_outside=False` it keeps its original meaning (a row on a site NOT in
+    `site_ids`)."""
+    return author_range_not_within_sites(conn, user_id, date, date, site_ids,
+                                         siteless_outside=siteless_outside)
+
+
+def session_site_companies(conn, folder, date, session_base) -> list:
+    """[(site_id, company_id)] of the sites one recording session lies on, from its
+    extraction topics and its recording rows. Empty when the session carries no site.
+    Decides who may delete it: the company that owns the SITE, not the recorder's
+    home company (project-owned tenancy)."""
+    like_topic = f"extractions/{_escape_like(folder)}/{date}/{_escape_like(session_base)}%"
+    like_rec = f"users/{_escape_like(folder)}/%/{date}/%{_escape_like(session_base)}%"
+    rows = conn.execute(
+        "SELECT DISTINCT s.id, s.company_id FROM topics t JOIN sites s ON s.id = t.site_id "
+        "WHERE t.source_s3_key LIKE %s "
+        "UNION "
+        "SELECT DISTINCT s.id, s.company_id FROM recordings r JOIN sites s ON s.id = r.site_id "
+        "WHERE r.s3_key LIKE %s",
+        (like_topic, like_rec)).fetchall()
+    return [(str(x[0]), str(x[1])) for x in rows]
+
+
+def owners_for_keys(conn, keys) -> dict:
+    """{s3_key: {company_id, site_id, user_id}} for keys that are recordings rows (one query).
+    The company is the SITE's current company when the recording has a site (a moved site
+    must not leave the object with the old company), else the recording's own company."""
+    keys = sorted({k for k in (keys or []) if k})
+    if not keys:
+        return {}
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT r.s3_key, COALESCE(s.company_id, r.company_id) AS company_id, r.site_id, r.user_id "
+        "FROM recordings r LEFT JOIN sites s ON s.id = r.site_id WHERE r.s3_key = ANY(%s)",
+        (keys,)).fetchall()
+    return {r["s3_key"]: {"company_id": r["company_id"], "site_id": r["site_id"],
+                          "user_id": r["user_id"]} for r in rows}
+
+
+def site_companies_for_folder_days(conn, pairs) -> dict:
+    """{(folder, day): {"sites": {site_id: company_id}, "siteless": bool}} for each (folder,
+    'YYYY-MM-DD') that has at least one recording, read through users.folder_name (globally
+    unique). `company_id` is the site's CURRENT company. `siteless` is true when the day also
+    has a recording with no site (it belongs to the recorder's home company). A pair with no
+    recording is absent. The day is taken from the key the same way the other recording
+    queries do (the first /YYYY-MM-DD/ segment)."""
+    pairs = sorted({(f, d) for f, d in (pairs or []) if f and d})
+    if not pairs:
+        return {}
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT DISTINCT p.folder, p.day, r.site_id, s.company_id "
+        "FROM unnest(%s::text[], %s::text[]) AS p(folder, day) "
+        "JOIN users u ON u.folder_name = p.folder "
+        "JOIN recordings r ON r.user_id = u.id "
+        " AND substring(r.s3_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/') = p.day "
+        "LEFT JOIN sites s ON s.id = r.site_id",
+        ([f for f, _ in pairs], [d for _, d in pairs])).fetchall()
+    out = {}
+    for r in rows:
+        e = out.setdefault((r["folder"], r["day"]), {"sites": {}, "siteless": False})
+        if r["site_id"] is None:
+            e["siteless"] = True
+        else:
+            e["sites"][r["site_id"]] = r["company_id"]
+    return out

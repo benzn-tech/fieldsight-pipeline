@@ -1,0 +1,40 @@
+{
+  "template_id": "personal-meeting",
+  "version": 3,
+  "name": "Personal Meeting Notes (tight, complete action list)",
+  "sections": [
+    {
+      "key": "what",
+      "title": "What this was",
+      "purpose": "Two or three sentences: whose meeting it was, who was in it, and what it covered. Nothing else."
+    },
+    {
+      "key": "decided",
+      "title": "Decided",
+      "purpose": "Decisions that were actually made. One sentence each, carrying the number, date or name that makes the decision real."
+    },
+    {
+      "key": "open",
+      "title": "Still open",
+      "purpose": "Things raised and left unsettled. One sentence each, ending with who or what it now waits on, in brackets."
+    },
+    {
+      "key": "actions",
+      "title": "Actions",
+      "purpose": "One line per action, written exactly as: **Owner** - what they will do - *when*. EVERY action the recording leaves with someone appears here, including the ones owed to the recorder by other people. Use the name the recording used; write **Me** for the person who recorded this. Put the timing only if it was spoken, otherwise write *no date*. Never invent an owner or a date. One line per distinct piece of work -- if two people share one job, that is still one line naming both."
+    }
+  ],
+  "catch_all": {
+    "key": "other",
+    "title": "Anything else",
+    "purpose": "Only what will still matter next week and fits nowhere above. One sentence each. If there is nothing, write \"Nothing here.\""
+  },
+  "excluded_subjects": [],
+  "style": [
+    "Keep the prose sections under roughly 350 words in total. They are read on a phone, standing up.",
+    "One sentence per item. If an item needs two, the second is usually the part nobody will act on -- cut it.",
+    "The Actions list is the exception: it is complete, however long that makes it.",
+    "Never say the same thing twice, in one section or across two.",
+    "Keep every figure, date and company name that was actually spoken; those are the parts a reader cannot reconstruct."
+  ]
+}

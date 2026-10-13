@@ -26,8 +26,11 @@ Two properties are pinned here:
    `UNWIRED_BY_DESIGN` below, which exists so the exceptions are a visible,
    deliberate list rather than an unexamined silence.
 """
+import io
 import os
 import re
+
+import pytest
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TEMPLATE = os.path.join(REPO, "src", "template.yaml")
@@ -35,6 +38,39 @@ WORKFLOWS = {
     "prod": os.path.join(REPO, ".github", "workflows", "deploy-prod.yml"),
     "test": os.path.join(REPO, ".github", "workflows", "deploy.yml"),
 }
+
+_yaml = pytest.importorskip("yaml")
+
+
+class _WiringLoader(_yaml.SafeLoader):
+    pass
+
+
+for _tag in ("!Sub", "!Ref", "!If", "!Not", "!Equals", "!GetAtt", "!FindInMap",
+             "!Join", "!Condition", "!Select", "!Split", "!ImportValue", "!And", "!Or"):
+    _WiringLoader.add_constructor(_tag, lambda loader, node: getattr(node, "value", None))
+
+
+def _template():
+    return _yaml.load(io.open(TEMPLATE, encoding="utf-8").read(), Loader=_WiringLoader)
+
+
+def _workflow(name):
+    return io.open(os.path.join(REPO, ".github", "workflows", name), encoding="utf-8").read()
+
+
+def _env_text(fn):
+    """The raw YAML of one function's Environment block, as written -- `!Ref X`
+    is a YAML tag a plain loader will not resolve to a string, and matching for
+    `!Ref AskConversationMemory` needs the literal text."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    start = text.index(f"\n  {fn}:\n")
+    nxt = re.search(r"\n  [A-Za-z]\w*:\n", text[start + 1:])
+    block = text[start:start + 1 + nxt.start()] if nxt else text[start:]
+    env_start = block.index("\n      Environment:\n")
+    rest = block[env_start + 1:]
+    m = re.search(r"\n      [A-Za-z]\w*:\n", rest)
+    return rest[:m.start()] if m else rest
 
 # Boolean Parameters deliberately not passed by a workflow, with the reason.
 # Adding to this list should be a decision, not a reflex: a toggle in here can
@@ -243,6 +279,92 @@ def test_the_test_key_does_not_silently_fall_back_to_prods():
             if re.match(r"\s*ELEVENLABS_API_KEY:", ln)]
     assert len(line) == 1, f"expected one binding, found {len(line)}"
     assert "||" not in line[0], "no silent fallback to prod's key"
+
+
+# ---- a Default is not a deployed value -----------------------------------
+
+_WIRED_LITERALS = {
+    "ElevenLabsTtsVoice": "QlZn2MPaf2jDn0461bnj",
+    "ElevenLabsTtsSpeed": "1.10",
+    "ElevenLabsTtsModel": "eleven_multilingual_v2",
+}
+
+
+def _override_literal(env, parameter):
+    """The literal a workflow passes for one --parameter-overrides entry."""
+    text = open(WORKFLOWS[env], encoding="utf-8").read()
+    m = re.search(r'"%s=([^"]*)"' % parameter, text)
+    return m.group(1) if m else None
+
+
+def _template_default(parameter):
+    text = open("src/template.yaml", encoding="utf-8").read()
+    block = text[text.index("\n  %s:\n" % parameter):]
+    m = re.search(r"^\s*Default:\s*'?([^'\s]+)'?\s*$", block, re.MULTILINE)
+    assert m, "%s declares no Default" % parameter
+    return m.group(1)
+
+
+@pytest.mark.parametrize("parameter,expected", sorted(_WIRED_LITERALS.items()))
+def test_the_voice_and_speed_are_wired_not_just_defaulted(parameter, expected):
+    """A template Default does not reach a stack that already exists.
+
+    sam deploy sends only the parameters it is given; CloudFormation carries
+    its PREVIOUS value forward for every parameter it does not see. So a
+    Default governs a brand-new stack and nothing else.
+
+    Measured 2026-09-22, which is the only reason this test exists:
+    ElevenLabsTtsVoice's Default was changed to James, TEST deployed at
+    02:16Z, prod deployed at 02:34Z, and BOTH stacks still reported
+    ElevenLabsTtsVoice=bPkjmCb0W1xUBvyH2Afs. Green CI, two successful
+    deploys, the old voice, and no error anywhere to notice.
+
+    So both workflows pass these explicitly, and all three copies -- the two
+    workflow literals and the template Default -- must agree, because three
+    places holding one value is three places to drift.
+    """
+    for env in ("test", "prod"):
+        assert _override_literal(env, parameter) == expected, (
+            "%s does not pass %s=%s; a Default alone changes nothing on a "
+            "stack that already exists" % (WORKFLOWS[env], parameter, expected))
+    assert _template_default(parameter) == expected, (
+        "%s: the template Default disagrees with what the workflows pass"
+        % parameter)
+
+
+# ---- the Ask voice keys are per environment too --------------------------
+
+_ASK_VOICE_KEYS = ("ELEVENLABS_ASK_API_KEY", "ELEVENLABS_API_KEY_TTS")
+
+
+def test_the_ask_voice_keys_are_not_shared_between_the_stacks():
+    """Same lesson as the transcription key above, learned twice.
+
+    Measured 2026-09-21 on the deployed functions: both ask-agents carried the
+    SAME TTS key, because both workflows read `secrets.ELEVENLABS_API_KEY_TTS`
+    -- so a spoken answer tried on test spent prod's allowance, and exhaustion
+    would present as Ask simply going quiet.
+    """
+    for var in _ASK_VOICE_KEYS:
+        prod = _secret_bound_to("prod", var)
+        test = _secret_bound_to("test", var)
+        assert prod and test, f"{var}: no binding (prod={prod}, test={test})"
+        assert prod != test, (
+            f"{var}: both workflows read secrets.{prod} -- test Ask voice "
+            "would spend prod's ElevenLabs allowance")
+
+
+def test_prods_ask_voice_keys_name_a_secret_that_exists():
+    """`ELEVENLABS_ASK_API_KEY` was never a repo secret, and a secret that does
+    not exist resolves to the empty string rather than failing. The guard in
+    the workflow then drops the parameter, the stack deploys green, and the
+    key is simply absent from the deployed function -- which is invisible
+    until the provider is switched to elevenlabs and every spoken question is
+    refused. Pin the name so the binding cannot drift back to a ghost.
+    """
+    for var in _ASK_VOICE_KEYS:
+        assert _secret_bound_to("prod", var) == "ELEVENLABS_ASK_API_KEY_PROD", (
+            f"{var} on prod must read the prod-only Ask voice secret")
 
 
 # ---- the group-merge tunables ------------------------------------------
@@ -835,7 +957,7 @@ def test_the_voiceprint_writer_has_the_layer_the_embedder_cannot_have():
     raising ModuleNotFoundError on every invocation behind a green deploy.
     """
     t = open(TEMPLATE, encoding="utf-8").read()
-    block = t[t.index("  VoiceprintWriterFunction:"):t.index("  SuggestionWriterFunction:")]
+    block = _top_level_block(t, "  VoiceprintWriterFunction:")
     assert "!Ref PsycopgLayer" in block, "the writer cannot reach Aurora without psycopg"
     assert "VadLayerArn" not in block, (
         "the writer took the cp312 layer as well; the two are mutually exclusive")
@@ -849,7 +971,7 @@ def test_the_embedder_may_invoke_the_writer_and_nothing_else():
     missing grant here fails at runtime with an AccessDenied nobody sees until a real
     correction is made."""
     t = open(TEMPLATE, encoding="utf-8").read()
-    block = t[t.index("  SpeakerEmbedFunction:"):t.index("  VoiceprintWriterFunction:")]
+    block = _top_level_block(t, "  SpeakerEmbedFunction:")
     assert "lambda:InvokeFunction" in block
     assert "voiceprint-writer" in block
     assert "Resource: '*'" not in block and 'Resource: "*"' not in block
@@ -890,6 +1012,78 @@ def test_every_function_that_reads_the_speaker_mode_is_given_it():
         block = _top_level_block(t, "  " + fn)
         assert "SPEAKER_IDENTITY_MODE: !Ref SpeakerIdentityMode" in block, (
             f"{fn} reads the mode but the template never gives it")
+
+
+def test_the_derived_roster_switch_is_wired_in_both_environments():
+    """Not a boolean (`on`/`off`, plus a number), so the generic sweep in this file cannot
+    see either Parameter. Miss the workflow line and the Parameter can only ever hold its
+    template default (2026-09-30 plan, correction 7)."""
+    for env, path in WORKFLOWS.items():
+        overrides = _overrides(path)
+        assert "RosterDerived" in overrides, (
+            f"{env} does not pass RosterDerived; the derived roster cannot be switched off")
+        assert "RosterLookbackDays" in overrides, (
+            f"{env} does not pass RosterLookbackDays; the lookback cannot be changed "
+            f"without a code change")
+
+
+def test_the_derived_roster_defaults_to_on_everywhere():
+    """Merging this must change nothing until somebody sets a repo variable off. Both the
+    template default and both workflow fallbacks have to say `on`/`14`, or 'the merge is
+    inert' is a claim rather than a fact."""
+    t = open(TEMPLATE, encoding="utf-8").read()
+    block = _top_level_block(t, "  RosterDerived:")
+    assert "Default: 'on'" in block, "the template default is not on"
+    assert "AllowedValues: ['on', 'off']" in block, "the switch is not constrained to on/off"
+
+    lookback_block = _top_level_block(t, "  RosterLookbackDays:")
+    assert "Default: '14'" in lookback_block, "the lookback default is not 14"
+
+    for env, path in WORKFLOWS.items():
+        lines = open(path, encoding="utf-8").read().splitlines()
+        derived_line = [ln for ln in lines if "RosterDerived=" in ln][0]
+        assert "|| 'on'" in derived_line, f"{env}'s RosterDerived fallback is not on"
+        lookback_line = [ln for ln in lines if "RosterLookbackDays=" in ln][0]
+        assert "|| '14'" in lookback_line, f"{env}'s RosterLookbackDays fallback is not 14"
+
+
+def test_the_writer_is_given_the_roster_switch():
+    """The middle-to-last segment. The repository is only ever called from the writer
+    (`_profiles`), so no other function's environment should mention either variable —
+    a stray `!Ref` elsewhere would be a function reading a switch it cannot possibly act on."""
+    writer_env = _env_text("VoiceprintWriterFunction")
+    assert "ROSTER_DERIVED: !Ref RosterDerived" in writer_env
+    assert "ROSTER_LOOKBACK_DAYS: !Ref RosterLookbackDays" in writer_env
+
+    t = open(TEMPLATE, encoding="utf-8").read()
+    fn_names = re.findall(r"\n  (\w+Function):\n", t)
+    for fn in fn_names:
+        if fn == "VoiceprintWriterFunction":
+            continue
+        try:
+            env = _env_text(fn)
+        except ValueError:
+            continue  # no Environment block on this function -- nothing to check
+        assert "RosterDerived" not in env, f"{fn} reads RosterDerived but is not the writer"
+        assert "RosterLookbackDays" not in env, (
+            f"{fn} reads RosterLookbackDays but is not the writer")
+
+
+def test_the_code_defaults_match_the_template_defaults_for_the_roster_lookback():
+    """Same rule as `test_the_code_defaults_match_the_template_defaults` above, applied to
+    the writer's own module -- the writer uses double-quoted `os.environ.get(...)` calls,
+    unlike lambda_extract_session.py's single-quoted ones, so the regex accepts either."""
+    tpl = open(TEMPLATE, encoding="utf-8").read()
+    src = open(os.path.join(REPO, "src", "lambda_voiceprint_writer.py"),
+              encoding="utf-8").read()
+    pairs = [("RosterLookbackDays", "ROSTER_LOOKBACK_DAYS")]
+    for param, env in pairs:
+        block = re.search(rf"\n  {param}:\n(.*?)(?=\n  \w+:\n)", tpl, re.S).group(1)
+        tpl_default = re.search(r"Default:\s*'([^']+)'", block).group(1)
+        code_default = re.search(
+            rf"os\.environ\.get\([\"']{env}[\"'],\s*[\"']([^\"']+)[\"']\)", src).group(1)
+        assert float(tpl_default) == float(code_default), (
+            f"{env}: template default {tpl_default!r} != code default {code_default!r}")
 
 
 def _top_level_block(text, header):
@@ -1018,3 +1212,111 @@ def test_todo_collapse_reaches_every_function_that_reads_action_items():
         assert "'false'" in line[0], (
             f"{wf} must fall back to false, or a missing repo variable turns the "
             "collapse ON for that stage")
+
+
+# ---- the recording-block thresholds ------------------------------------
+#
+# Design 2026-09-15 §5.5 as amended by review finding F9: the compute function
+# stores raw segments and org-api merges them at read time, so org-api is the
+# ONLY reader. A second reader is the GROUP_MERGE_CAP hazard above one step
+# worse -- two functions drawing different blocks would log nothing at all.
+
+_BLOCK_TUNABLES = {
+    # env var                   : (template Parameter, functions that read it)
+    "REPORT_BLOCK_GAP_SECONDS":  ("ReportBlockGapSeconds", ("OrgApiFunction",)),
+    "REPORT_LONG_BLOCK_SECONDS": ("ReportLongBlockSeconds", ("OrgApiFunction",)),
+}
+
+
+def test_the_block_tunables_exist_as_template_parameters():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for env, (param, _) in _BLOCK_TUNABLES.items():
+        assert re.search(rf"\n  {param}:\n", text), \
+            f"{env} has no {param} Parameter — it can only ever hold its code default"
+
+
+def test_every_function_that_reads_a_block_tunable_is_given_it():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for env, (param, fns) in _BLOCK_TUNABLES.items():
+        for fn in fns:
+            assert f"{env}: !Ref {param}" in _function_block(text, fn), \
+                f"{fn} reads {env} but is not given it"
+
+
+def test_both_workflows_pass_the_block_tunables():
+    for env_name in ("prod", "test"):
+        for _, (param, _) in _BLOCK_TUNABLES.items():
+            assert param in _overrides(WORKFLOWS[env_name]), \
+                (f"{env_name} does not pass {param}; the Parameter holds its "
+                 f"default forever and a re-tuned threshold cannot be applied")
+
+
+def test_org_api_is_the_only_function_given_a_block_tunable():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for env, (param, _) in _BLOCK_TUNABLES.items():
+        assert text.count(f"{env}: !Ref {param}") == 1, (
+            f"{env} is given to more than one function; org-api must be the single reader")
+
+
+def test_recording_blocks_default_off_on_prod_and_on_on_test():
+    for env_name, fallback in (("prod", "'false'"), ("test", "'true'")):
+        text = open(WORKFLOWS[env_name], encoding="utf-8").read()
+        line = [ln for ln in text.splitlines() if "EnableRecordingBlocks=" in ln]
+        assert len(line) == 1, f"{env_name}: expected one line, found {len(line)}"
+        assert fallback in line[0], (
+            f"{env_name} must fall back to {fallback} for EnableRecordingBlocks")
+
+
+def test_the_block_code_defaults_match_the_template_defaults():
+    """When they disagree the environment wins silently, and the number in the source
+    reads like the one in force -- the same hazard as the evidence tunables above."""
+    tpl = open(TEMPLATE, encoding="utf-8").read()
+    src = open(os.path.join(REPO, "src", "lambda_org_api.py"), encoding="utf-8").read()
+    for env, (param, _) in _BLOCK_TUNABLES.items():
+        block = re.search(rf"\n  {param}:\n(.*?)(?=\n  \w+:\n)", tpl, re.S).group(1)
+        tpl_default = re.search(r"Default:\s*'([^']+)'", block).group(1)
+        code_default = re.search(
+            rf"os\.environ\.get\([\"']{env}[\"'],\s*[\"']([^\"']+)[\"']\)", src).group(1)
+        assert float(tpl_default) == float(code_default), (
+            f"{env}: template default {tpl_default!r} != code default {code_default!r}")
+
+
+# ----------------------------------------------------------
+# Task 9: the three Ask flags, wired in three places each.
+# ----------------------------------------------------------
+
+@pytest.mark.parametrize("param", ["AskConversationMemory", "AskRewriteBudget",
+                                   "AskDistanceGate"])
+def test_the_flag_is_wired_in_all_three_places(param):
+    """A flag wired in two of three reads as its default and nothing fails."""
+    assert param in _template()["Parameters"]
+    assert f"!Ref {param}" in _env_text("AskAgentFunction")
+    for wf in ("deploy.yml", "deploy-prod.yml"):
+        assert f"{param}=" in _workflow(wf)
+
+
+def test_the_proposal_window_is_wired_end_to_end_not_just_declared():
+    """All three segments, or it is a switch nobody can turn.
+
+    This repository has shipped a documented rollback that was never wired, twice, and the
+    shape is always the same: the code reads an env var, nothing ever sets it, and the
+    default serves forever while a repo variable sits there looking authoritative. Nothing
+    fails -- the feature simply behaves as though the switch does not exist.
+
+    Checking one segment catches none of it, which is why this checks all three: the
+    Parameter, the function's environment, and BOTH workflow overrides.
+    """
+    text = open(TEMPLATE, encoding="utf-8").read()
+    assert "\n  ProposalWindowHours:" in text, "no Parameter in the template"
+
+    # On the WRITER specifically. The proposals are built there, and an env var on some
+    # other function is the same as no env var at all.
+    writer = text.split("  VoiceprintWriterFunction:")[1][:6000]
+    assert "PROPOSAL_WINDOW_HOURS: !Ref ProposalWindowHours" in writer, (
+        "ProposalWindowHours does not reach VoiceprintWriterFunction's environment, so "
+        "the os.environ.get default in the code is what runs whatever anyone configures")
+
+    for env, path in WORKFLOWS.items():
+        assert "ProposalWindowHours" in _overrides(path), (
+            f"{env} never overrides ProposalWindowHours, so that environment is pinned to "
+            f"the template default whatever its repo variable says")

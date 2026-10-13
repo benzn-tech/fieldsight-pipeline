@@ -31,6 +31,13 @@ class FakeConn:
         # manager, so the block either runs whole or propagates, like the real one.
         return self
 
+    def rollback(self):
+        # The real connection has this and handlers now use it: `with conn:`
+        # commits on a CLEAN exit, and `error(...)` is a return, so a handler
+        # that has already written must roll back explicitly before answering
+        # with an error. Recorded rather than ignored so a test can assert it.
+        self.rolled_back = True
+
     def execute(self, *a, **k):
         # /me now reads the caller's per-site membership roles: it used to report
         # `global_role` alone, so a person promoted to site_manager ON A SITE showed as
@@ -81,6 +88,15 @@ def wired(monkeypatch):
     # body omits slug; default "no collision" so existing create-site tests
     # (which don't stub this) don't hit FakeConn's missing .cursor().
     monkeypatch.setattr(org.sites, "get_company_site_by_slug", lambda conn, cid, slug: None)
+    # create_member now gives the company its starter templates on every
+    # invitation. Both calls go through a real cursor, which FakeConn does not
+    # have -- the same way the old org-seed tests broke when that lambda learned to
+    # seed (retired 2026-10-03). Stubbed here, and the behaviour itself is pinned in
+    # test_an_invited_company_gets_its_templates.py.
+    monkeypatch.setattr(org.users, "first_officer_or_member",
+                        lambda conn, cid: {"id": "u-officer"})
+    monkeypatch.setattr(org.report_templates, "seed_starters",
+                        lambda conn, cid, author: 0)
     return monkeypatch
 
 
@@ -624,7 +640,30 @@ def test_backfill_enrolls_unenrolled_login(wired):
     assert seen == {"sub": "sub-2", "folder_name": "Neil_Blunden"}
 
 
-def test_backfill_skips_collision(wired):
+def test_backfill_takes_the_next_free_name_when_the_first_is_taken(wired):
+    """A namesake used to be SKIPPED here and left with no folder at all, which
+    is how one prod login ended up writing into another person's folder for four
+    days. The next free name is a folder of their own instead."""
+    wired.setattr(org.users, "list_company_logins_unenrolled",
+                  lambda conn, cid: [
+                      {"id": "u-2", "cognito_sub": "sub-2", "first_name": "Neil", "last_name": "Blunden"}])
+    wired.setattr(org.users, "get_by_folder_name_global",
+                  lambda conn, folder: ({**CALLER, "cognito_sub": "sub-other", "folder_name": folder}
+                                        if folder == "Neil_Blunden" else None))
+    seen = {}
+    wired.setattr(org.users, "set_folder_name",
+                  lambda conn, sub, folder_name: seen.update(sub=sub, folder_name=folder_name))
+    res = org.lambda_handler(make_event("POST", "/api/org/members/enroll-backfill"), None)
+    assert res["statusCode"] == 200
+    b = body_of(res)
+    assert b["enrolled"] == [{"sub": "sub-2", "folder_name": "Neil_Blunden_2"}]
+    assert b["skipped"] == []
+    assert seen == {"sub": "sub-2", "folder_name": "Neil_Blunden_2"}
+
+
+def test_backfill_skips_when_no_name_is_free(wired):
+    """Every candidate taken: skipped with a reason, never a 500 on the unique
+    index and never another user's folder."""
     wired.setattr(org.users, "list_company_logins_unenrolled",
                   lambda conn, cid: [
                       {"id": "u-2", "cognito_sub": "sub-2", "first_name": "Neil", "last_name": "Blunden"}])
@@ -637,8 +676,8 @@ def test_backfill_skips_collision(wired):
     assert res["statusCode"] == 200
     b = body_of(res)
     assert b["enrolled"] == []
-    assert b["skipped"] == [{"sub": "sub-2", "reason": "folder taken by another user"}]
-    assert seen == {}  # collision -> set_folder_name never called, no 500
+    assert b["skipped"] == [{"sub": "sub-2", "reason": "no free folder name"}]
+    assert seen == {}
 
 
 def test_backfill_non_admin_403(wired):
@@ -1037,13 +1076,6 @@ class FakeS3:
 def presign_wired(wired):
     fake = FakeS3()
     wired.setattr(org, "_s3_client", fake)
-    # Fix wave 1 review finding 1: admin_disambiguation now resolves the
-    # lake-owner company before serving summary_report.json verbatim.
-    # Default it to the CALLER's own company (c-uuid-1) so every existing
-    # admin/gm test keeps its prior behavior unchanged; tests exercising the
-    # gate itself override this per-test.
-    wired.setattr(org.companies, "get_company_by_name",
-                  lambda conn, name: {"id": "c-uuid-1", "name": name})
     # 2026-09-07: admin_disambiguation also unions the folders that captured
     # something but produced no report, so an upload-only day opens onto a
     # picker instead of a bare 404. Defaulted to empty here so every test
@@ -1223,6 +1255,148 @@ def test_patch_site_platform_admin_edits_cross_company(wired):
                                         body={"name": "Renamed"}), None)
     assert res["statusCode"] == 200
     assert seen["cid"] == "c-customer"  # scoped by site's company, not caller's
+
+
+# ---- patch_org_site: moving a site to another company (tenant boundary) ----
+C_PLATFORM = "6a23c57c-5fa3-4ef4-a93c-88e9543272fc"
+C_OLD = C_PLATFORM
+C_NEW = "7a495d8a-c88a-43ea-bf5b-a6d1c89beb92"
+
+
+@pytest.fixture
+def move_wired(wired):
+    """platform_admin in the operator company, one site filed under C_OLD, and
+    recorders on every write that could change tenancy."""
+    calls = {"update": [], "move": [], "company_lookup": [], "slug_lookup": []}
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "company_id": C_PLATFORM,
+                                     "global_role": "platform_admin"})
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": C_OLD, "slug": "sb1151"})
+    wired.setattr(org.sites, "update_site",
+                  lambda conn, sid, cid, **kw: (calls["update"].append((sid, cid, kw))
+                                                or {"id": sid, "company_id": cid, "icon_s3_key": None}))
+    wired.setattr(org.sites, "move_site_company",
+                  lambda conn, sid, frm, to: (calls["move"].append((sid, frm, to))
+                                              or {"id": sid, "company_id": to, "icon_s3_key": None}))
+    wired.setattr(org.companies, "get_company_by_id",
+                  lambda conn, cid: (calls["company_lookup"].append(cid)
+                                     or ({"id": cid} if cid in (C_OLD, C_NEW) else None)))
+    wired.setattr(org.sites, "get_company_site_by_slug",
+                  lambda conn, cid, slug: (calls["slug_lookup"].append((cid, slug)) or None))
+    # FakeConn runs no SQL; the real re-own is covered in
+    # tests/integration/test_site_move_moves_lake_objects.py.
+    wired.setattr(org.lake_objects, "reassign_site", lambda conn, sid, cid: 0)
+    return wired, calls
+
+
+def _patch(body, sid="s-1"):
+    return org.lambda_handler(make_event("PATCH", f"/api/org/sites/{sid}", body=body), None)
+
+
+def test_patch_site_cross_company_caller_moves_site(move_wired):
+    wired, calls = move_wired
+    res = _patch({"target_company_id": C_NEW})
+    assert res["statusCode"] == 200
+    assert calls["move"] == [("s-1", C_OLD, C_NEW)]       # from the SITE's company
+    assert json.loads(res["body"])["company_id"] == C_NEW
+
+
+def test_patch_site_non_cross_caller_cannot_move(wired):
+    wired.setattr(org.sites, "update_site", lambda *a, **k: pytest.fail("must not write"))
+    moved = []
+    wired.setattr(org.sites, "move_site_company", lambda *a: moved.append(a))
+    res = _patch({"target_company_id": C_NEW})            # CALLER is a plain admin
+    assert res["statusCode"] == 403
+    assert "only platform_admin" in json.loads(res["body"])["error"]
+    assert moved == []
+
+
+def test_patch_site_non_cross_caller_own_company_id_is_ignored_not_refused(wired):
+    # Mirrors create_org_site: a target equal to the caller's own company is the
+    # default, so it is accepted as a no-op and moves nothing.
+    moved = []
+    wired.setattr(org.sites, "move_site_company", lambda *a: moved.append(a))
+    wired.setattr(org.sites, "update_site",
+                  lambda conn, sid, cid, **kw: {"id": sid, "company_id": cid, "icon_s3_key": None})
+    res = _patch({"target_company_id": CALLER["company_id"], "name": "N"})
+    assert res["statusCode"] == 200 and moved == []
+
+
+def test_patch_site_move_to_unknown_company_refused(move_wired):
+    wired, calls = move_wired
+    res = _patch({"target_company_id": "11111111-1111-1111-1111-111111111111"})
+    assert res["statusCode"] == 404
+    assert calls["move"] == [] and calls["update"] == []
+
+
+def test_patch_site_move_with_malformed_company_id_is_400(move_wired):
+    wired, calls = move_wired
+    assert _patch({"target_company_id": "not-a-uuid"})["statusCode"] == 400
+    assert calls["move"] == []
+
+
+def test_patch_site_cross_company_can_move_into_its_own_company(move_wired):
+    # For a cross-company caller the own company is not "unchanged": the site
+    # lives elsewhere, so this is a real move.
+    wired, calls = move_wired
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": C_NEW, "slug": "x"})
+    assert _patch({"target_company_id": C_PLATFORM})["statusCode"] == 200
+    assert calls["move"] == [("s-1", C_NEW, C_PLATFORM)]
+
+
+def test_patch_site_move_to_current_company_is_a_noop(move_wired):
+    wired, calls = move_wired
+    assert _patch({"target_company_id": C_OLD})["statusCode"] == 200
+    assert calls["move"] == []
+
+
+def test_patch_site_move_refused_on_slug_collision(move_wired):
+    wired, calls = move_wired
+    wired.setattr(org.sites, "get_company_site_by_slug",
+                  lambda conn, cid, slug: {"id": "other"} if (cid, slug) == (C_NEW, "sb1151") else None)
+    res = _patch({"target_company_id": C_NEW})
+    assert res["statusCode"] == 409
+    assert calls["move"] == [] and calls["update"] == []   # nothing written
+
+
+def test_patch_site_move_checks_slug_in_the_target_company(move_wired):
+    wired, calls = move_wired
+    assert _patch({"target_company_id": C_NEW})["statusCode"] == 200
+    assert calls["slug_lookup"] == [(C_NEW, "sb1151")]
+
+
+def test_patch_site_move_does_not_bypass_site_reach(move_wired):
+    # The scoped update runs first and gates the move: a site the scoped update
+    # cannot reach (archived / vanished) is never moved.
+    wired, calls = move_wired
+    wired.setattr(org.sites, "update_site", lambda conn, sid, cid, **kw: None)
+    assert _patch({"target_company_id": C_NEW})["statusCode"] == 404
+    assert calls["move"] == []
+
+
+def test_patch_site_move_unknown_site_404_for_cross_company(move_wired):
+    wired, calls = move_wired
+    wired.setattr(org.sites, "get_site", lambda conn, sid: None)
+    assert _patch({"target_company_id": C_NEW}, sid="nope")["statusCode"] == 404
+    assert calls["move"] == []
+
+
+def test_patch_site_without_company_field_is_unchanged(move_wired):
+    # The regression that matters: no target_company_id -> no company lookup, no
+    # slug lookup, no move, and update_site gets exactly the old arguments.
+    wired, calls = move_wired
+    res = _patch({"name": "Renamed"})
+    assert res["statusCode"] == 200
+    assert calls["move"] == [] and calls["company_lookup"] == [] and calls["slug_lookup"] == []
+    assert calls["update"] == [("s-1", C_OLD, dict(
+        name="Renamed", location=None, client=None, industry=None,
+        address=None, latitude=None, longitude=None))]
+    # empty-string / null company field counts as absent, as in create_org_site
+    assert _patch({"name": "R", "target_company_id": ""})["statusCode"] == 200
+    assert _patch({"name": "R", "target_company_id": None})["statusCode"] == 200
+    assert calls["move"] == []
 
 
 def test_patch_site_swaps_icon_and_deletes_old(presign_wired):
@@ -1678,6 +1852,11 @@ def programme_wired(wired):
     wired.setattr(org.programme_import, "record_version",
                   lambda conn, pid, **kw: store.record_version(conn, pid, **kw))
     fake.programme_store = store
+    # confirm_suggestion's Track B Task 3 check (a suggestion whose topic is superseded is
+    # treated like topic_id IS NULL) calls this for every suggestion whose topic_id is set --
+    # default it to "still live" so every OTHER confirm test here, which does not care about
+    # this check, is unaffected; a test that DOES care overrides it to return None.
+    wired.setattr(org.topics, "get_topic", lambda conn, topic_id: {"id": topic_id})
     return wired, fake
 
 
@@ -2570,6 +2749,146 @@ def test_reject_already_decided_409(programme_wired):
     assert res["statusCode"] == 409
 
 
+# ---------------------------------------------------------------------------
+# Track B Task 6b — decision_records.set_human_outcome wired onto confirm/
+# reject. The seam this closes: set_human_outcome only stamps the RIGHT row
+# if the endpoint passes exactly the (kind, subject_type, subject_stable_id,
+# object_ref) 6a's writer stored for a programme_match verdict -- see
+# task-6a-report.md note #3: subject_stable_id is the suggestion's OWN
+# topic_id (no resolution step, unlike programme_impact's finding case) and
+# object_ref is the suggestion's OWN task_id.
+# ---------------------------------------------------------------------------
+
+def test_confirm_stamps_decision_record_confirmed(programme_wired):
+    wired, fake = programme_wired
+    row = _suggestion_row()  # suggested_status=completed, suggested_progress=100
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    fake.programme_store.seed_tasks(
+        [{"doc_id": "t-1", "status": "in_progress", "progress_pct": 40}])
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda conn, sid, state, decided_by, applied_status=None, applied_progress=None:
+                      {**row, "state": state})
+    wired.setattr(org.programme, "write_programme",
+                  lambda s3c, bucket, site_id, doc_, updated_at: doc_)
+    stamped = {}
+    wired.setattr(org.decision_records, "set_human_outcome",
+                  lambda conn, **kw: (stamped.update(kw) or 1))
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
+    assert res["statusCode"] == 200
+    assert stamped == {"kind": "programme_match", "subject_type": "topic",
+                       "subject_stable_id": "topic-1", "object_ref": "t-1",
+                       "outcome": "confirmed", "actor": "u-uuid-1"}
+
+
+def test_confirm_with_reviewer_override_stamps_edited(programme_wired):
+    """The auto-suggestion said completed/100; the reviewer typed in_progress/75
+    -- that is 'edited', not 'confirmed', regardless that decide() still succeeded."""
+    wired, fake = programme_wired
+    row = _suggestion_row()
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    fake.programme_store.seed_tasks(
+        [{"doc_id": "t-1", "status": "in_progress", "progress_pct": 40}])
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda conn, sid, state, decided_by, applied_status=None, applied_progress=None:
+                      {**row, "state": state})
+    wired.setattr(org.programme, "write_programme",
+                  lambda s3c, bucket, site_id, doc_, updated_at: doc_)
+    stamped = {}
+    wired.setattr(org.decision_records, "set_human_outcome",
+                  lambda conn, **kw: (stamped.update(kw) or 1))
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm",
+        body={"status": "in_progress", "progress_pct": 75}), None)
+    assert res["statusCode"] == 200
+    assert stamped["outcome"] == "edited"
+
+
+def test_confirm_silent_progress_coercion_also_counts_as_edited(programme_wired):
+    """The never-lower-progress guard can silently raise applied_progress above
+    what the model suggested (test_confirm_never_lowers_progress_on_auto_value
+    below covers the guard itself) -- when it does, the FINAL applied value still
+    differs from what was suggested, so this is 'edited' even though the reviewer
+    sent no explicit override."""
+    wired, fake = programme_wired
+    row = _suggestion_row(suggested_status="in_progress", suggested_progress=60,
+                          task_status_before="in_progress", task_progress_before=80)
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    fake.programme_store.seed_tasks(
+        [{"doc_id": "t-1", "status": "in_progress", "progress_pct": 80}])
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda conn, sid, state, decided_by, applied_status=None, applied_progress=None:
+                      {**row, "state": state})
+    wired.setattr(org.programme, "write_programme",
+                  lambda s3c, bucket, site_id, doc_, updated_at: doc_)
+    stamped = {}
+    wired.setattr(org.decision_records, "set_human_outcome",
+                  lambda conn, **kw: (stamped.update(kw) or 1))
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["applied_progress"] == 80          # never lowered
+    assert stamped["outcome"] == "edited"
+
+
+def test_confirm_decision_record_failure_does_not_fail_the_confirm(programme_wired):
+    """R10/R14 posture: a decision_records failure must never turn the human's
+    successful confirm into an error response."""
+    wired, fake = programme_wired
+    row = _suggestion_row()
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    fake.programme_store.seed_tasks(
+        [{"doc_id": "t-1", "status": "in_progress", "progress_pct": 40}])
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda conn, sid, state, decided_by, applied_status=None, applied_progress=None:
+                      {**row, "state": state})
+    wired.setattr(org.programme, "write_programme",
+                  lambda s3c, bucket, site_id, doc_, updated_at: doc_)
+
+    def boom(conn, **kw):
+        raise RuntimeError("decision_records is down")
+    wired.setattr(org.decision_records, "set_human_outcome", boom)
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["confirmed"] is True
+
+
+def test_reject_stamps_decision_record_rejected(programme_wired):
+    wired, fake = programme_wired
+    row = _suggestion_row()
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda conn, sid, state, decided_by, applied_status=None, applied_progress=None:
+                      {**row, "state": state})
+    stamped = {}
+    wired.setattr(org.decision_records, "set_human_outcome",
+                  lambda conn, **kw: (stamped.update(kw) or 1))
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/reject"), None)
+    assert res["statusCode"] == 200
+    assert stamped == {"kind": "programme_match", "subject_type": "topic",
+                       "subject_stable_id": "topic-1", "object_ref": "t-1",
+                       "outcome": "rejected", "actor": "u-uuid-1"}
+
+
+def test_reject_decision_record_failure_does_not_fail_the_reject(programme_wired):
+    wired, fake = programme_wired
+    row = _suggestion_row()
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda conn, sid, state, decided_by, applied_status=None, applied_progress=None:
+                      {**row, "state": state})
+
+    def boom(conn, **kw):
+        raise RuntimeError("decision_records is down")
+    wired.setattr(org.decision_records, "set_human_outcome", boom)
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/reject"), None)
+    assert res["statusCode"] == 200
+    assert body_of(res) == {"rejected": True}
+
+
 def test_confirm_never_lowers_progress_on_auto_value(programme_wired):
     # suggested_progress (60) is below the task's current progress_pct (80)
     # and the reviewer did NOT explicitly send progress_pct -> keep 80.
@@ -2673,6 +2992,45 @@ def test_confirm_retracted_topic_marks_stale_409(programme_wired):
     assert decide_calls["n"] == 0
 
 
+def test_confirm_superseded_topic_marks_stale_409(programme_wired):
+    """Track B Task 3, fix round 1: re-extraction now SUPERSEDES a topic instead of
+    deleting it, so `topic_id` stays set (this is the common case a re-extraction produces
+    -- unlike test_confirm_retracted_topic_marks_stale_409's topic_id=None, which is what an
+    actual physical delete still looks like). confirm must treat "topic_id set, but
+    topics.get_topic (a superseded row is invisible to it) returns None" exactly like the
+    NULL case: mark_stale, 409, and -- the part a naive fix could get wrong -- never reach
+    the programme task lookup/write."""
+    wired, fake = programme_wired
+    row = _suggestion_row(topic_id="topic-1")
+    wired.setattr(org.programme_suggestions, "get", lambda conn, sid: row)
+    # The superseded topic itself: get_topic (visible_topics_predicate underneath) must
+    # return None for it, same as for a topic that no longer exists at all.
+    wired.setattr(org.topics, "get_topic", lambda conn, topic_id: None)
+    staled = {}
+    wired.setattr(org.programme_suggestions, "mark_stale",
+                  lambda conn, sid: (staled.update(sid=sid) or {**row, "state": "stale"}))
+    task_lookups = {"n": 0}
+    wired.setattr(org.programme_tasks, "get_task_by_doc_id",
+                  lambda *a, **k: task_lookups.update(n=task_lookups["n"] + 1))
+    write_calls = {"n": 0}
+    wired.setattr(org.programme, "write_programme",
+                  lambda *a, **k: write_calls.update(n=write_calls["n"] + 1))
+    decide_calls = {"n": 0}
+    wired.setattr(org.programme_suggestions, "decide",
+                  lambda *a, **k: decide_calls.update(n=decide_calls["n"] + 1))
+
+    res = org.lambda_handler(make_event(
+        "POST", "/api/org/programme/suggestions/sugg-1/confirm", body={}), None)
+
+    assert res["statusCode"] == 409
+    assert "superseded" in body_of(res).get("error", "").lower()
+    assert staled == {"sid": "sugg-1"}
+    assert task_lookups["n"] == 0, (
+        "must never reach the programme task lookup once the source topic is gone")
+    assert write_calls["n"] == 0
+    assert decide_calls["n"] == 0
+
+
 # ----------------------------------------------------------
 # Fable #9 — reviewer overrides in the confirm body must be validated
 # before they can reach programme.json (a bad status/progress used to
@@ -2771,7 +3129,11 @@ def test_timeline_shim_serves_s3_verbatim_when_no_extraction_topics(presign_wire
     res = org.lambda_handler(make_event("GET", "/api/org/timeline",
                                         params={"date": "2026-07-07", "user": "Ada_L"}), None)
     assert res["statusCode"] == 200
-    assert body_of(res) == verbatim_doc  # EXACT passthrough -- nothing added/dropped/renamed
+    # The document passes through untouched EXCEPT for one added key: `user`, the
+    # folder this response was served for. Equality (not a subset check) is the
+    # point -- a second stray key would fail here, which is what makes this a
+    # guard on the response contract rather than a smoke test.
+    assert body_of(res) == {**verbatim_doc, "user": "Ada_L"}
 
 
 def test_timeline_shim_renders_override_when_extraction_topics_exist(presign_wired):
@@ -2985,7 +3347,7 @@ def test_non_all_scope_user_equals_own_folder_200(presign_wired):
     res = org.lambda_handler(make_event("GET", "/api/org/timeline",
                                         params={"date": "2026-07-14", "user": "Ada_L"}), None)
     assert res["statusCode"] == 200
-    assert body_of(res) == doc
+    assert body_of(res) == {**doc, "user": "Ada_L"}
 
 
 def test_non_all_scope_absent_user_self_serves_200(presign_wired):
@@ -3004,7 +3366,7 @@ def test_non_all_scope_absent_user_self_serves_200(presign_wired):
     # order) before falling back to verbatim S3.
     assert seen == ["extractions/Ada_L/2026-07-14/", "reports/2026-07-14/Ada_L/"]
     assert res["statusCode"] == 200
-    assert body_of(res) == doc
+    assert body_of(res) == {**doc, "user": "Ada_L"}
 
 
 def test_non_all_scope_without_folder_name_403(presign_wired):
@@ -3037,10 +3399,13 @@ def test_admin_no_user_unions_extraction_folders(presign_wired):
 
 
 def test_admin_summary_report_verbatim(presign_wired):
-    # presign_wired's default companies.get_company_by_name pins the "internal"
-    # company to c-uuid-1 -- the same id as CALLER -- so this caller IS the
-    # lake owner and still gets the summary doc verbatim (Fix wave 1 finding 1).
+    # The lake-wide summary is for platform_admin (is_cross_company) only.
     wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "platform_admin"})
+    wired.setattr(org, "GRADED_ROLES", True)
+    wired.setattr(org, "_day_has_deleted_sources", lambda conn, folder, date: False)
+    wired.setattr(org.sites, "list_all_sites", lambda conn: [])
     summary_doc = {"date": "2026-07-14", "company_summary": "All sites green.", "extra": 1}
     fake.objects["reports/2026-07-14/summary_report.json"] = json.dumps(summary_doc).encode()
     res = org.lambda_handler(make_event(
@@ -3049,15 +3414,13 @@ def test_admin_summary_report_verbatim(presign_wired):
     assert body_of(res) == summary_doc
 
 
-def test_admin_summary_report_gated_for_non_owner_company(presign_wired):
+def test_admin_summary_report_refused_to_a_company_admin(presign_wired):
     # Fix wave 1 review finding 1 (CRITICAL cross-tenant leak): the summary
     # doc is a lake-wide aggregate across EVERY company's folders. A caller
-    # whose company isn't the lake owner must never see it verbatim, even
+    # who is not platform_admin must never see it verbatim, even
     # though the doc exists in S3 -- must fall through to the (company-
     # scoped) disambiguation union instead, and must never even GetObject it.
     wired, fake = presign_wired
-    wired.setattr(org.companies, "get_company_by_name",
-                  lambda conn, name: {"id": "OTHER-owner-co", "name": name})
     summary_doc = {"date": "2026-07-14", "company_summary": "All sites green.", "extra": 1}
     fake.objects["reports/2026-07-14/summary_report.json"] = json.dumps(summary_doc).encode()
     # Two candidates -- forces the union envelope response (not the
@@ -3068,23 +3431,6 @@ def test_admin_summary_report_gated_for_non_owner_company(presign_wired):
         "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
     assert res["statusCode"] == 200
     assert body_of(res) == {"date": "2026-07-14", "available_users": ["Ada_L", "Sam_Trainor"]}
-    assert "reports/2026-07-14/summary_report.json" not in fake.get_object_calls
-
-
-def test_admin_summary_report_skipped_when_owner_unresolved(presign_wired):
-    # Fail-closed proof: if the lake-owner company can't be resolved at all
-    # (e.g. COMPANY_NAME points at a company row that doesn't exist), the
-    # summary branch is skipped for EVERYONE, not just non-owners -- it
-    # never falls back to "no gate" behavior.
-    wired, fake = presign_wired
-    wired.setattr(org.companies, "get_company_by_name", lambda conn, name: None)
-    summary_doc = {"date": "2026-07-14", "company_summary": "All sites green.", "extra": 1}
-    fake.objects["reports/2026-07-14/summary_report.json"] = json.dumps(summary_doc).encode()
-    wired.setattr(org.topics, "list_extraction_folder_names_for_date",
-                  lambda conn, cid, date: [])
-    res = org.lambda_handler(make_event(
-        "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
-    assert res["statusCode"] == 404  # no candidates either -- proves it never touched the summary doc
     assert "reports/2026-07-14/summary_report.json" not in fake.get_object_calls
 
 
@@ -3129,7 +3475,7 @@ def test_admin_one_candidate_recurses_to_single_user(presign_wired):
     res = org.lambda_handler(make_event(
         "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
     assert res["statusCode"] == 200
-    assert body_of(res) == verbatim_doc
+    assert body_of(res) == {**verbatim_doc, "user": "Ada_L"}
 
 
 def test_site_acl_filters_override_rows(presign_wired):
@@ -3505,7 +3851,7 @@ def test_timeline_worker_defaults_to_self(presign_wired):
     res = org.lambda_handler(make_event(
         "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
     assert res["statusCode"] == 200
-    assert body_of(res) == doc
+    assert body_of(res) == {**doc, "user": "Ada_L"}
 
 
 def test_timeline_site_manager_may_view_worker_on_site(presign_wired):
@@ -3756,7 +4102,7 @@ def test_timeline_pm_own_timeline_unaffected_by_clip(presign_wired):
     res = org.lambda_handler(make_event(
         "GET", "/api/org/timeline", params={"date": "2026-07-14", "user": "PM_Folder"}), None)
     assert res["statusCode"] == 200
-    assert body_of(res) == own_doc                       # own timeline served verbatim, prose intact
+    assert body_of(res) == {**own_doc, "user": "PM_Folder"}                       # own timeline served verbatim, prose intact
 
 
 def test_timeline_admin_all_scope_sees_full_target_content(presign_wired):
@@ -3780,7 +4126,7 @@ def test_timeline_admin_all_scope_sees_full_target_content(presign_wired):
     res = org.lambda_handler(make_event(
         "GET", "/api/org/timeline", params={"date": "2026-07-14", "user": "W_Folder"}), None)
     assert res["statusCode"] == 200
-    assert body_of(res) == full_doc                      # admin (ALL scope) still sees everything
+    assert body_of(res) == {**full_doc, "user": "W_Folder"}                      # admin (ALL scope) still sees everything
 
 
 # ----------------------------------------------------------
@@ -4053,6 +4399,90 @@ def test_audio_segments_matches_chunk_session_key(presign_wired):
     assert seg["absolute_start"] == 51238.9
     assert seg["absolute_end"] == 51258.4
     assert seg["time_label"] == "14:13:58"
+
+
+# ----------------------------------------------------------
+# A batch wav is written beside the chunk wavs it was stitched from. Listing both
+# plays every stretch of speech twice. A chunk is dropped only when a batch in THIS
+# result names it in its map -- never by duration, never by filename arithmetic.
+# ----------------------------------------------------------
+
+_DEDUP_SID = "449c1bb3473c405985351aaa189049e6"
+
+
+def _dedup_chunk(i, clock):
+    return (f"ben_lin_2026-09-17_{clock}_sid{_DEDUP_SID}_c{i:04d}"
+            f"_off0.0_to30.0_srcwav.wav")
+
+
+def _dedup_batch(first, count, to):
+    return (f"ben_lin_2026-09-17_13-05-18_sid{_DEDUP_SID}_c{first:04d}_bn{count}"
+            f"_off0.0_to{to}_srcwav.wav")
+
+
+def _wire_listing(fake, folder, date, filenames, maps=None):
+    prefix = f"audio_segments/{folder}/{date}/"
+    fake.list_objects_response = {"Contents": [{"Key": prefix + f} for f in filenames]}
+    for f in filenames:
+        fake.objects[prefix + f] = b""
+    for batch_name, member_names in (maps or {}).items():
+        map_key = prefix + batch_name[: -len(".wav")] + "_batch_map.json"
+        fake.objects[map_key] = json.dumps({"schema": 1, "members": [
+            {"chunk_index": n, "chunk_key": prefix + m}
+            for n, m in enumerate(member_names)]}).encode()
+
+
+def _dedup_get(wired, date="2026-09-17"):
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "site_manager",
+                                     "folder_name": "Ben_Lin_test2"})
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/audio-segments",
+        params={"date": date, "start": "13:00:00", "end": "13:30:00"}), None)
+    assert res["statusCode"] == 200
+    return body_of(res)
+
+
+def test_audio_segments_hide_chunks_a_listed_batch_covers(presign_wired):
+    wired, fake = presign_wired
+    b = _dedup_batch(0, 2, "58.0")
+    c0, c1, c2 = (_dedup_chunk(0, "13-05-18"), _dedup_chunk(1, "13-05-50"),
+                  _dedup_chunk(2, "13-06-18"))
+    _wire_listing(fake, "Ben_Lin_test2", "2026-09-17", [b, c0, c1, c2], maps={b: [c0, c1]})
+    out = _dedup_get(wired)
+    assert sorted(s["filename"] for s in out["segments"]) == sorted([b, c2])
+    assert out["count"] == 2
+
+
+def test_audio_segments_members_come_from_the_map_not_the_filename(presign_wired):
+    # prod 2026-09-10 shape: c0035_bn4 holds 35, 36, 37, 39 -- 38 was VAD-rejected (no wav).
+    wired, fake = presign_wired
+    b = _dedup_batch(35, 4, "116.0")
+    members = [_dedup_chunk(35, "13-05-18"), _dedup_chunk(36, "13-05-48"),
+               _dedup_chunk(37, "13-06-16"), _dedup_chunk(39, "13-07-12")]
+    after = _dedup_chunk(40, "13-07-40")
+    _wire_listing(fake, "Ben_Lin_test2", "2026-09-17", [b] + members + [after],
+                  maps={b: members})
+    out = _dedup_get(wired)
+    assert sorted(s["filename"] for s in out["segments"]) == sorted([b, after])
+
+
+def test_audio_segments_a_day_without_batches_is_unchanged(presign_wired):
+    wired, fake = presign_wired
+    chunks = [_dedup_chunk(0, "13-05-18"), _dedup_chunk(1, "13-05-50"),
+              _dedup_chunk(2, "13-06-18")]
+    _wire_listing(fake, "Ben_Lin_test2", "2026-09-17", chunks)
+    out = _dedup_get(wired)
+    assert out["count"] == 3
+
+
+def test_audio_segments_a_batch_without_a_readable_map_hides_nothing(presign_wired):
+    wired, fake = presign_wired
+    b = _dedup_batch(0, 2, "58.0")
+    c0, c1 = _dedup_chunk(0, "13-05-18"), _dedup_chunk(1, "13-05-50")
+    _wire_listing(fake, "Ben_Lin_test2", "2026-09-17", [b, c0, c1])   # no map written
+    out = _dedup_get(wired)
+    assert out["count"] == 3
 
 
 def test_chunk_session_start_falls_back_to_meeting_session_opened_at_in_nz(monkeypatch):
@@ -4390,6 +4820,26 @@ def test_media_presign_disallowed_prefix_403(presign_wired):
 def test_media_presign_missing_key_400(wired):
     res = org.lambda_handler(make_event("GET", "/api/org/media/presigned-url"), None)
     assert res["statusCode"] == 400
+
+
+def test_media_presign_transcripts_prefix_denied(presign_wired):
+    """2026-09-20: 'transcripts/' was removed from _ORG_MEDIA_PRESIGN_PREFIXES.
+    The raw stored JSON at that prefix is the ASR vendor's own output shape
+    (AWS Transcribe: top-level jobName/accountId/status; ElevenLabs' adapted
+    shape has none of those keys), so a presigned URL straight to the object
+    would let a customer download the vendor's fingerprint even though no
+    field anywhere says "AWS" or "ElevenLabs". Nothing customer-facing ever
+    needed this: GET /api/org/transcripts already serves every field
+    scripts/composites/transcript-list.js reads."""
+    wired, fake = presign_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "global_role": "worker", "folder_name": "Ben_UCPK"})
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/media/presigned-url",
+        params={"key": "transcripts/Ben_UCPK/2026-09-20/Ben_UCPK_2026-09-20_08-00-00.json"}),
+        None)
+    assert res["statusCode"] == 403
+    assert not hasattr(fake, "last")     # never even reached the signer
 
 
 def test_media_presign_reports_key_owner_extraction(presign_wired):
@@ -4816,6 +5266,105 @@ def test_create_member_platform_admin_targets_other_company(member_wired):
     }), None)
     assert res["statusCode"] == 201
     assert seen["company_id"] == "c-uuid-B"
+
+
+# ---- an invited company gets its starter templates -------------------------
+#
+# The invitation is how a company actually gets its people, and it was the one
+# path that did not seed. The migration seeds the companies that existed when it
+# ran; the one-shot seed backfill (retired 2026-10-03) is gone. Briv, on prod, was created
+# empty and has 0 templates -- and the first person invited into it would have
+# found an empty Library, the symptom the owner reported on Southbase.
+#
+# What these tests can and cannot show: they pin that create_member CALLS the
+# seeding with the right company and author. That the SQL function is idempotent
+# (a second invitation adds nothing, an archived starter is not put back) lives
+# in the function, and FakeConn never executes SQL -- so it is not proven here.
+
+def _seed_recorder(wired):
+    calls = {"seed": [], "author_for": []}
+    wired.setattr(org.users, "first_officer_or_member",
+                  lambda conn, cid: (calls["author_for"].append(cid) or {"id": "u-officer-" + str(cid)}))
+    wired.setattr(org.report_templates, "seed_starters",
+                  lambda conn, cid, author: (calls["seed"].append((cid, author)) or 4))
+    wired.setattr(org.users, "upsert_user",
+                  lambda conn, sub, email, **kw: {"id": "u-new", "cognito_sub": sub,
+                                                   "email": email, **kw})
+    return calls
+
+
+def test_an_invitation_gives_the_company_its_starter_templates(member_wired):
+    wired, fake = member_wired
+    calls = _seed_recorder(wired)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "first@briv.nz"}), None)
+    assert res["statusCode"] == 201
+    assert len(calls["seed"]) == 1, "the invitation path must seed"
+    assert calls["seed"][0][0] == CALLER["company_id"]
+
+
+def test_the_seeding_happens_after_the_new_person_exists(member_wired):
+    """For a company with nobody in it, the person being invited is the only
+    possible author -- and they exist only after upsert_user. Seeding before it
+    finds no author, seeds nothing, and says nothing: the original defect back,
+    silently. So the order is pinned."""
+    wired, fake = member_wired
+    order = []
+    wired.setattr(org.users, "upsert_user",
+                  lambda conn, sub, email, **kw: (order.append("upsert")
+                                                   or {"id": "u-new", "cognito_sub": sub,
+                                                       "email": email, **kw}))
+    wired.setattr(org.users, "first_officer_or_member",
+                  lambda conn, cid: (order.append("author") or {"id": "u-new"}))
+    wired.setattr(org.report_templates, "seed_starters",
+                  lambda conn, cid, author: (order.append("seed") or 4))
+    org.lambda_handler(make_event("POST", "/api/org/members", body={"email": "a@b.nz"}), None)
+    assert order.index("upsert") < order.index("author") < order.index("seed")
+
+
+def test_every_invitation_asks_and_the_function_decides(member_wired):
+    """Called on the second invitation too. Not 'only when empty' in Python:
+    the function already knows, per company, whether the starters are there
+    or were archived -- a second check here would be a second copy of that
+    rule, and the two would drift."""
+    wired, fake = member_wired
+    calls = _seed_recorder(wired)
+    for email in ("first@x.nz", "second@x.nz"):
+        org.lambda_handler(make_event("POST", "/api/org/members", body={"email": email}), None)
+    assert len(calls["seed"]) == 2
+    assert calls["seed"][0][0] == calls["seed"][1][0]
+
+
+def test_a_platform_admin_inviting_elsewhere_seeds_that_company_with_its_own_author(member_wired):
+    """The inviter may belong to a different company. The templates are the
+    TARGET company's, and so is the person named as their author -- a row in
+    Southbase's library created_by somebody from FieldSight-platform would be
+    a small lie in an audit trail."""
+    wired, fake = member_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: ({**CALLER, "global_role": "platform_admin"}
+                                     if sub == "sub-1" else None))
+    wired.setattr(org.companies, "get_company_by_id",
+                  lambda conn, cid: {"id": cid, "name": "Other Co"})
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": "c-uuid-B"})
+    calls = _seed_recorder(wired)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "new@b.nz", "target_company_id": "c-uuid-B",
+        "memberships": [{"site_id": "s-1", "role": "worker"}]}), None)
+    assert res["statusCode"] == 201
+    assert calls["seed"] == [("c-uuid-B", "u-officer-c-uuid-B")]
+    assert calls["author_for"] == ["c-uuid-B"], "the author is looked up in the target company"
+
+
+def test_no_one_to_name_as_author_seeds_nothing_and_still_invites(member_wired):
+    wired, fake = member_wired
+    calls = _seed_recorder(wired)
+    wired.setattr(org.users, "first_officer_or_member", lambda conn, cid: None)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "x@x.nz"}), None)
+    assert res["statusCode"] == 201
+    assert calls["seed"] == []
 
 
 def test_create_member_non_platform_cannot_target_other_company_403(member_wired):
@@ -5434,6 +5983,42 @@ def test_timeline_no_aurora_topics_stays_verbatim(wired, monkeypatch):
     assert body["topics"][0]["topic_title"] == "verbatim"
 
 
+def test_timeline_verbatim_fallback_strips_the_model_name(wired, monkeypatch):
+    """2026-09-20: this branch is `return ok(doc)` -- the ONE place the report
+    generator's `_report_metadata.model` rides straight through to a
+    customer's browser, because it serves the stored S3 object byte-for-byte
+    on every other field. Everything else must stay byte-identical (that is
+    the whole point of this fallback); only `model` is stripped."""
+    stored = {"_report_metadata": {"source": "nightly",
+                                    "model": "meta/muse-spark-1.3-contributor",
+                                    "recordings_processed": 3},
+              "topics": [{"topic_title": "verbatim"}]}
+    monkeypatch.setattr(org.topics, "has_topics_for_source_prefix",
+                        lambda conn, prefix: False)
+    monkeypatch.setattr(org, "_get_lake_json", lambda key: stored)
+    res = org._render_timeline_for_user(FakeConn(), CALLER, "2026-07-10", "Ada_L")
+    body = body_of(res)
+    assert "model" not in body["_report_metadata"]
+    assert body["_report_metadata"]["source"] == "nightly"
+    assert body["_report_metadata"]["recordings_processed"] == 3
+    assert body["topics"][0]["topic_title"] == "verbatim"
+    # The stored object itself must be untouched -- this is a redaction on
+    # the way OUT, not a scrub of the internal record.
+    assert stored["_report_metadata"]["model"] == "meta/muse-spark-1.3-contributor"
+
+
+def test_without_vendor_metadata_leaves_docs_with_no_model_alone():
+    """A doc with no `_report_metadata`, or one with no `model` key, is
+    returned as the SAME object (not a needless copy) -- this is the common
+    case (live-extraction's own `_report_metadata` never has a `model` key)
+    and must cost nothing."""
+    no_meta = {"topics": []}
+    assert org._without_vendor_metadata(no_meta) is no_meta
+
+    no_model = {"_report_metadata": {"source": "live_extraction"}}
+    assert org._without_vendor_metadata(no_model) is no_model
+
+
 def _wire_content(monkeypatch, row, *, cross=False):
     monkeypatch.setattr(org.content, "get_content_row", lambda conn, tbl, rid: dict(row))
     monkeypatch.setattr(org, "_allowed_site_ids", lambda conn, caller: {"s-1"})
@@ -5973,6 +6558,59 @@ def test_classification_feedback_bad_classifier_verdict_400(wired):
                                         body={"topic_id": "t-9", "human_verdict": "confirm_non_work",
                                               "classifier_verdict": "maybe"}), None)
     assert res["statusCode"] == 400 and called == []
+
+
+# ---------------------------------------------------------------------------
+# Track B Task 6b — decision_records.set_human_outcome wired onto
+# /classification-feedback. kind='work_class', subject_type='topic',
+# subject_stable_id=topic_id, object_ref=None (matches 6a's
+# `_record_work_class_decision`); confirm_non_work -> confirmed,
+# reject_is_work / missed_personal -> rejected (the human is overturning
+# the classifier's call in both of the latter two, non_work and work
+# respectively).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("verdict,expected_outcome", [
+    ("confirm_non_work", "confirmed"),
+    ("reject_is_work", "rejected"),
+    ("missed_personal", "rejected"),
+])
+def test_classification_feedback_stamps_decision_record(wired, verdict, expected_outcome):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.content, "get_content_row",
+                  lambda conn, table, rid: {"company_id": "c-uuid-1", "site_id": SITE_ID,
+                                            "author_user_id": "u-uuid-1"})
+    wired.setattr(org.memberships, "caller_site_roles", lambda conn, uid: {SITE_ID: "site_manager"})
+    wired.setattr(org.classification_feedback, "append_feedback",
+                  lambda conn, cid, tid, v, **k: {"id": "f-1"})
+    wired.setattr(org.topics, "set_work_class", lambda conn, tid, wc: {"id": tid, "work_class": wc})
+    wired.setattr(org, "_enqueue_content_reindex", lambda conn, table, rid: None)
+    stamped = {}
+    wired.setattr(org.decision_records, "set_human_outcome",
+                  lambda conn, **kw: (stamped.update(kw) or 1))
+    res = org.lambda_handler(make_event("POST", "/api/org/classification-feedback",
+                                        body={"topic_id": "t-9", "human_verdict": verdict}), None)
+    assert res["statusCode"] == 201
+    assert stamped == {"kind": "work_class", "subject_type": "topic",
+                       "subject_stable_id": "t-9", "object_ref": None,
+                       "outcome": expected_outcome, "actor": "u-uuid-1"}
+
+
+def test_classification_feedback_decision_record_failure_does_not_fail_the_request(wired):
+    wired.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
+    wired.setattr(org.content, "get_content_row",
+                  lambda conn, table, rid: {"company_id": "c-uuid-1", "site_id": SITE_ID,
+                                            "author_user_id": "u-uuid-1"})
+    wired.setattr(org.memberships, "caller_site_roles", lambda conn, uid: {SITE_ID: "site_manager"})
+    wired.setattr(org.classification_feedback, "append_feedback",
+                  lambda conn, cid, tid, v, **k: {"id": "f-1"})
+
+    def boom(conn, **kw):
+        raise RuntimeError("decision_records is down")
+    wired.setattr(org.decision_records, "set_human_outcome", boom)
+    res = org.lambda_handler(make_event("POST", "/api/org/classification-feedback",
+                                        body={"topic_id": "t-9", "human_verdict": "confirm_non_work"}), None)
+    assert res["statusCode"] == 201
 
 
 # ---- Task 9 review follow-up: revert endpoint + feedback deny coverage ----
@@ -6863,6 +7501,79 @@ def test_the_queue_never_widens_past_the_callers_sites(threads_wired):
 
 
 # ---------------------------------------------------------------------------
+# Track B Task 6b — decision_records.set_human_outcome wired onto thread
+# confirm/reject. The seam: `topic_thread_suggestions` carries `thread_id
+# XOR parent_topic_id` (migration 0032's CHECK), but 6a's writer
+# (`lambda_item_writer._suggest_threads_inner`) always stamped object_ref as
+# the earlier TOPIC's id, never a thread id -- so the parent_topic_id branch
+# reads it straight off the row, and the thread_id branch has to ask
+# decision_records for the object_ref its own writer already recorded
+# (`_thread_decision_object_ref`).
+# ---------------------------------------------------------------------------
+
+def test_confirm_anchoring_stamps_the_parent_topic_id_as_object_ref(threads_wired):
+    """_thread_sugg()'s default shape: parent_topic_id='tp-old', thread_id=None."""
+    stamped = {}
+    threads_wired.setattr(org.decision_records, "set_human_outcome",
+                          lambda conn, **kw: (stamped.update(kw) or 1))
+    obj_ref_calls = []
+    threads_wired.setattr(org.decision_records, "object_ref_for_accepted",
+                          lambda conn, kind, subject_type, subject_stable_id:
+                              obj_ref_calls.append((kind, subject_type, subject_stable_id)))
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/threads/suggestions/sg-1/confirm"), None)
+    assert res["statusCode"] == 200
+    assert stamped == {"kind": "thread", "subject_type": "topic",
+                       "subject_stable_id": "tp-new", "object_ref": "tp-old",
+                       "outcome": "confirmed", "actor": "u-uuid-1"}
+    # The parent_topic_id branch never needs to ask decision_records for it.
+    assert obj_ref_calls == []
+
+
+def test_confirm_into_existing_thread_resolves_object_ref_from_decision_records(threads_wired):
+    """thread_id branch: the row carries only the thread's id, so object_ref
+    must come from the accepted decision record the writer already wrote."""
+    threads_wired.setattr(org.threads, "get_suggestion",
+                          lambda conn, sid: _thread_sugg(thread_id="th-9", parent_topic_id=None))
+    obj_ref_calls = []
+    threads_wired.setattr(org.decision_records, "object_ref_for_accepted",
+                          lambda conn, kind, subject_type, subject_stable_id:
+                              (obj_ref_calls.append((kind, subject_type, subject_stable_id))
+                               or "tp-earlier-candidate"))
+    stamped = {}
+    threads_wired.setattr(org.decision_records, "set_human_outcome",
+                          lambda conn, **kw: (stamped.update(kw) or 1))
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/threads/suggestions/sg-1/confirm"), None)
+    assert res["statusCode"] == 200
+    assert obj_ref_calls == [("thread", "topic", "tp-new")]
+    assert stamped["object_ref"] == "tp-earlier-candidate"
+    assert stamped["subject_stable_id"] == "tp-new"
+
+
+def test_reject_thread_stamps_decision_record_rejected(threads_wired):
+    stamped = {}
+    threads_wired.setattr(org.decision_records, "set_human_outcome",
+                          lambda conn, **kw: (stamped.update(kw) or 1))
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/threads/suggestions/sg-1/reject"), None)
+    assert res["statusCode"] == 200
+    assert stamped == {"kind": "thread", "subject_type": "topic",
+                       "subject_stable_id": "tp-new", "object_ref": "tp-old",
+                       "outcome": "rejected", "actor": "u-uuid-1"}
+
+
+def test_thread_confirm_decision_record_failure_does_not_break_the_confirm(threads_wired):
+    def boom(conn, **kw):
+        raise RuntimeError("decision_records is down")
+    threads_wired.setattr(org.decision_records, "set_human_outcome", boom)
+    res = org.lambda_handler(
+        make_event("POST", "/api/org/threads/suggestions/sg-1/confirm"), None)
+    assert res["statusCode"] == 200
+    assert body_of(res)["confirmed"] is True
+
+
+# ---------------------------------------------------------------------------
 # Thread facts on the rendered topic (recurring-item threading, increment 2).
 #
 # FACTS only -- how many days a subject was raised on, when last, how much is
@@ -7222,7 +7933,7 @@ def test_the_verbatim_timeline_fallback_is_refused_when_the_day_has_deleted_sour
 
 def test_the_admin_summary_verbatim_serve_is_refused_for_a_date_with_deleted_sources(monkeypatch):
     """Same shape, the aggregate door. `summary_report.json` is lake-wide and served
-    byte-verbatim to the owner company -- a deleted session's content sits inside it."""
+    byte-verbatim to platform_admin -- a deleted session's content sits inside it."""
     import repositories.redactions as red
 
     monkeypatch.setattr(org, "_get_lake_json",
@@ -7230,10 +7941,8 @@ def test_the_admin_summary_verbatim_serve_is_refused_for_a_date_with_deleted_sou
     monkeypatch.setattr(red, "deleted_source_prefixes",
                         lambda conn, folder=None, date=None: ["extractions/Ada_L/2026-07-14/"])
 
-    # The owner-company check runs before the verbatim serve; make the caller the owner so
-    # the branch is actually reached, which is the branch under test.
-    monkeypatch.setattr(org.companies, "get_company_by_name",
-                        lambda conn, name: {"id": CALLER["company_id"]})
+    # Only platform_admin reaches the verbatim branch; an admin caller would pass this
+    # test without the deleted-sources guard ever being consulted.
     # Everything after the verbatim branch is irrelevant to this test: if the guard works,
     # the doc is never fetched. Assert on the FETCH, not on the response shape, so the
     # test cannot pass because some later step happened to fail.
@@ -7242,7 +7951,8 @@ def test_the_admin_summary_verbatim_serve_is_refused_for_a_date_with_deleted_sou
                         lambda key: fetched.append(key) or
                         {"summary": "everything, including the deleted"})
     try:
-        org.admin_disambiguation(object(), CALLER, "2026-07-14")
+        org.admin_disambiguation(object(), {**CALLER, "global_role": "platform_admin"},
+                                 "2026-07-14")
     except Exception:
         pass                       # the later candidate-listing needs a real conn
     assert not any("summary_report.json" in k for k in fetched),         f"the pre-deletion aggregate was fetched: {fetched}"
@@ -7299,3 +8009,134 @@ def test_an_uncollapsed_row_still_says_it_was_mentioned_once():
     item = org.render_report_shape([row], None, "2026-09-01", "Ada_L")["topics"][0]["action_items"][0]
     assert item["mention_count"] == 1
     assert item["collapsed_ids"] == []
+
+
+def test_render_shape_carries_the_action_item_version():
+    """version = 1 + edit_count (todo-card spec 3.4). This serializer is a fixed
+    allowlist that has already dropped two repository fields on the way out
+    (mention_count, collapsed_ids) with every repository test green, so the
+    count is asserted HERE, on what the browser receives."""
+    row = _topic_row(action_items=[
+        {"id": "a-1", "text": "Order timber", "responsible": None,
+         "deadline": None, "deadline_text": None, "priority": None,
+         "status": "open", "edit_count": 3},
+        {"id": "a-2", "text": "Book pump", "responsible": None,
+         "deadline": None, "deadline_text": None, "priority": None,
+         "status": "open", "edit_count": 0},
+    ])
+    items = org.render_report_shape([row], None, "2026-09-01", "Ada_L")["topics"][0]["action_items"]
+    assert [i["version"] for i in items] == [4, 1]
+
+
+def test_a_row_that_was_never_counted_is_version_one():
+    """get_topic_full (reindex) does not count. Absent is v1, never missing."""
+    row = _topic_row(action_items=[
+        {"id": "a-1", "text": "Order timber", "responsible": None,
+         "deadline": None, "deadline_text": None, "priority": None,
+         "status": "open"},
+    ])
+    item = org.render_report_shape([row], None, "2026-09-01", "Ada_L")["topics"][0]["action_items"][0]
+    assert item["version"] == 1
+
+
+# ---- patch_org_site: the review round on the move (partial writes, id forms) ----
+# Every test below pins a defect found reviewing the move, not the move itself.
+
+
+def test_patch_site_uppercased_own_company_is_not_read_as_a_move(move_wired):
+    """The SAME company in a different case must not look like another one.
+
+    `target_company_id` was compared as a raw string, so `ABC-...` and `abc-...`
+    -- the same uuid -- read as a real move. The move then looked the site's own
+    slug up in its own company, found the site ITSELF, and answered
+    409 "target company already has a site with slug 'sb1151'": a rename refused
+    on a collision with itself.
+    """
+    wired, calls = move_wired
+    wired.setattr(org.sites, "get_company_site_by_slug",
+                  lambda conn, cid, slug: {"id": "some-other-site"})   # would 409
+    res = _patch({"target_company_id": C_OLD.upper(), "name": "Renamed"})
+    assert res["statusCode"] == 200, res["body"]
+    assert calls["move"] == []                       # no move: same company
+    assert calls["slug_lookup"] == []                # and the slug never consulted
+
+
+def test_patch_site_braced_company_id_reaches_the_db_canonical(move_wired):
+    """uuid.UUID accepts `{...}` and unhyphenated forms; psycopg does not. The
+    braced form was passed through unchanged, so the company lookup and the
+    UPDATE both received a string the database cannot cast."""
+    wired, calls = move_wired
+    res = _patch({"target_company_id": "{" + C_NEW + "}"})
+    assert res["statusCode"] == 200, res["body"]
+    assert calls["company_lookup"] == [C_NEW]        # canonical, not braced
+    assert calls["move"] == [("s-1", C_OLD, C_NEW)]
+
+
+def test_patch_site_non_uuid_own_company_id_is_still_a_noop(move_wired):
+    """Normalising must never be STRICTER than create_org_site's plain compare.
+    A value that is not a uuid at all still matches itself, so a caller echoing
+    back their own company id is a no-op rather than a refusal."""
+    wired, calls = move_wired
+    wired.setattr(org.users, "get_user_by_sub",
+                  lambda conn, sub: {**CALLER, "company_id": "not-a-uuid",
+                                     "global_role": "admin"})
+    res = _patch({"target_company_id": "not-a-uuid", "name": "N"})
+    assert res["statusCode"] == 200, res["body"]
+    assert calls["move"] == []
+
+
+def test_patch_site_empty_slug_is_still_checked_for_collision(move_wired):
+    """'' is an INDEXABLE value -- only NULL is distinct under a unique index --
+    so `if slug and ...` skipped the check for an empty slug and let the move hit
+    idx_sites_company_slug as a 500 instead of a 409."""
+    wired, calls = move_wired
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": C_OLD, "slug": ""})
+    wired.setattr(org.sites, "get_company_site_by_slug",
+                  lambda conn, cid, slug: (calls["slug_lookup"].append((cid, slug))
+                                           or {"id": "incumbent"}))
+    res = _patch({"target_company_id": C_NEW})
+    assert res["statusCode"] == 409, res["body"]
+    assert calls["slug_lookup"] == [(C_NEW, "")]
+    assert calls["move"] == []
+
+
+def test_patch_site_a_null_slug_skips_the_check(move_wired):
+    """The other half: NULL really is distinct under the index, so a site
+    without a slug cannot collide and must not be refused."""
+    wired, calls = move_wired
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": C_OLD, "slug": None})
+    res = _patch({"target_company_id": C_NEW})
+    assert res["statusCode"] == 200, res["body"]
+    assert calls["slug_lookup"] == []
+    assert calls["move"] == [("s-1", C_OLD, C_NEW)]
+
+
+def test_patch_site_a_failed_move_rolls_back_the_update(move_wired):
+    """`with conn:` COMMITS on a clean exit and `error(...)` is a RETURN, not a
+    raise. update_site has already written by the time the move can fail (a
+    concurrent archive), so without an explicit rollback the caller is told 404
+    while their rename is committed."""
+    wired, calls = move_wired
+    wired.setattr(org.sites, "move_site_company", lambda conn, sid, frm, to: None)
+    conn = FakeConn()
+    wired.setattr(org, "get_connection", lambda *a, **k: conn)
+    res = _patch({"target_company_id": C_NEW, "name": "Renamed"})
+    assert res["statusCode"] == 404, res["body"]
+    assert calls["update"], "update_site must have run -- otherwise this proves nothing"
+    assert getattr(conn, "rolled_back", False), "the committed rename is the bug"
+
+
+def test_patch_site_a_failed_icon_upload_writes_nothing(move_wired):
+    """The icon relocate ran AFTER update_site and after the move, and its
+    failure path returns 400 -- a clean exit, which commits. So 'please
+    re-upload the image' was returned with the site already moved to another
+    company. The relocate now happens before any DB write."""
+    wired, calls = move_wired
+    wired.setattr(org, "_relocate_asset", lambda src, dst: False)
+    res = _patch({"target_company_id": C_NEW,
+                  "icon_s3_key": f"{org.ORG_ASSETS_PREFIX}pending/sub-1/i.png"})
+    assert res["statusCode"] == 400, res["body"]
+    assert calls["update"] == [], "no row may be written before the upload is secured"
+    assert calls["move"] == [], "the site must not have changed tenant"

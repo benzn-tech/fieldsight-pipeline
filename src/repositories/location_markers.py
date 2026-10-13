@@ -33,6 +33,36 @@ def replace_for_day(conn, company_id, user_folder, date, markers):
     )
 
 
+def replace_for_session(conn, company_id, user_folder, date, session, markers):
+    """Write ONE session's markers into the day, keeping every other session's.
+
+    `replace_for_day` was called with one extraction's markers, and an
+    extraction is a SESSION, not a day: the last session to finish replaced the
+    whole day with its own -- usually none. On prod (Ben_Lin_Test 2026-10-02)
+    the 12:24 "level two" marker was wiped by a later session that announced no
+    place, and every location rule downstream went dark for the day.
+
+    Each marker now carries its `session`; a re-driven session replaces exactly
+    its own. Markers written before this (no `session`) are kept unless this
+    session re-states the same place at the same minute. Serialised per day
+    with an advisory lock: two sessions of one day finishing together would
+    otherwise both read, both merge, and the second write would drop the first.
+    """
+    mine = [dict(m, session=session) for m in (markers or [])
+            if isinstance(m, dict) and m.get("at") and m.get("location")]
+    seen = {(str(m["at"]), str(m["location"]).strip().lower()) for m in mine}
+    with conn.transaction():
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                     ("markers:%s:%s" % (user_folder, date),))
+        keep = [m for m in for_day(conn, company_id, user_folder, date)
+                if m.get("session") != session
+                and not (m.get("session") is None
+                         and (str(m["at"]), str(m["location"]).strip().lower()) in seen)]
+        merged = sorted(keep + mine, key=lambda m: str(m.get("at")))
+        replace_for_day(conn, company_id, user_folder, date, merged)
+    return merged
+
+
 def for_day(conn, company_id, user_folder, date):
     """The day's markers, oldest first, or [] when there are none.
 
@@ -67,24 +97,46 @@ def _minutes(hhmm):
         return None
 
 
-def locate(markers, hhmm):
-    """Where the speaker was at `hhmm`, or None.
+def _seconds(when, unknown_seconds):
+    """'HH:MM:SS' or 'HH:MM' -> seconds of the day, or None."""
+    parts = str(when or "").split(":")
+    if len(parts) not in (2, 3):
+        return None
+    try:
+        return (int(parts[0]) * 3600 + int(parts[1]) * 60
+                + (int(parts[2]) if len(parts) == 3 else unknown_seconds))
+    except ValueError:
+        return None
+
+
+def locate(markers, when):
+    """Where the speaker was at `when` ('HH:MM:SS', or 'HH:MM'), or None.
 
     None is a real answer and must stay distinguishable from a location: before
     the first announcement of the day nobody has said where they are, and
     CARRY_MINUTES after the last one he may be anywhere. Returning the nearest
     marker in either of those cases would be the unbounded-nearest rule that was
     deliberately removed from photo binding in 2026-07-24, rebuilt one layer up.
+
+    Compared in SECONDS where they are known -- a marker's `at_s` (timed from
+    its quote) and a photo's filename time. Two places can be named in one
+    minute (prod, Ben_Lin_Test 2026-10-05: Level 1 at 11:02:05, Level 2 at
+    11:02:14), and to the minute the 11:02:08 photograph was grouped under
+    Level 2 while photo binding (photo_binding._stays) had it under Level 1.
+    A time known only to the minute sits at the end of it, so minute-only data
+    groups exactly as before.
     """
-    t = _minutes(hhmm)
+    t = _seconds(when, 59)
     if t is None:
         return None
     best = None
     for m in markers:
-        at = _minutes(m.get("at"))
+        at = _seconds(m.get("at_s"), 0) if m.get("at_s") else None
+        if at is None:
+            at = _seconds(str(m.get("at") or "")[:5], 0)
         if at is None or at > t:
             continue                      # not yet said
-        if t - at > CARRY_MINUTES:
+        if t // 60 - at // 60 > CARRY_MINUTES:
             continue                      # too long ago to still be true
         if best is None or at >= best[0]:
             best = (at, m.get("location"))

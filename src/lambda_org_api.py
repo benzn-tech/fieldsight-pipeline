@@ -8,6 +8,8 @@ so the UI's raw idToken works unchanged.
 Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-org-api.md):
   GET   /api/org/me                       → caller profile + accessible site ids
   PATCH /api/org/me                       → update first/last name, avatar key
+  POST  /api/org/companies/{id}/export    → platform_admin: start a company data export (async, LakeOps; 202 exportId)
+  GET   /api/org/companies/{id}/export/{export_id} → platform_admin: export status + 15-minute presigned part URLs
   GET   /api/org/sites                    → sites visible to caller (ACL)
   POST  /api/org/sites                    → create site (admin/gm)
   GET   /api/org/members                  → company members + memberships (admin/gm)
@@ -15,6 +17,8 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   PATCH /api/org/members/{sub}/role       → explicit global role set (admin)
   PATCH /api/org/members/{sub}/folder     → set recording-folder identity (admin)
   POST  /api/org/members/enroll-backfill  → bulk-enroll folder_name for unenrolled company logins (admin)
+  GET   /api/org/sessions/pending?date=   → caller's recordings whose notes are delayed (D6)
+  POST  /api/org/sessions/{id}/expedite   → ask for a delayed recording to be re-driven now (D6)
   POST  /api/org/upload-url               → presigned PUT for avatar / site icon
   GET   /api/org/asset-url?key=…          → presigned GET for an org asset
   PATCH /api/org/sites/{id}               → update site fields / swap icon (admin/gm)
@@ -22,6 +26,7 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   GET   /api/org/sites/{id}/contributors  → folders with topics attributed to
                                             (site,date); members∪this = the
                                             aggregated-timeline fan-out set
+  POST  /api/org/sites/{id}/external-members -> add an existing user of ANOTHER company to this site (admin / platform_admin)
   GET   /api/org/sites/{id}/members       → site's members from memberships (ACL,
                                              fixes legacy USERS ON SITE empty for Aurora-only sites)
   POST  /api/org/members/{sub}/(un)archive→ soft-delete / restore member (admin/gm, never self)
@@ -110,6 +115,7 @@ Secrets Manager call from a NAT-less VPC). Cognito calls need the
 cognito-idp VPC interface endpoint (db stack).
 """
 import json
+import directory
 import site_coords
 import logging
 import os
@@ -123,41 +129,64 @@ from datetime import date as _date
 from datetime import datetime, timedelta, timezone
 
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ParamValidationError
 from psycopg.errors import UniqueViolation
 
 import chunk_stitch
 import content_hash
 import device_heartbeat
 import device_status
+import extraction_pending
+import folder_key as folder_key_mod
 import nz_time
+import checklist_reports
+import pipeline_trace
+import trace_views
 import reindex
+import recording_blocks
+import report_download_name
 import report_sections
+import report_template
+import report_modules
+import report_photos
+import photo_binding
 import session_scope
 import sweep_state
 from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
 import programme_reconcile
-from repositories import location_markers
+from repositories import day_recording_segments, location_markers
+from repositories import directory as directory_repo
+from repositories import inspection_windows
 from repositories import (action_items, aliases, chunks, classification_feedback, companies,
-                          findings, speaker_label_groups,
+                          decision_records, findings, speaker_label_groups,
                           compliance_resolutions, content, content_edits, keyframes,
                           meeting_session, memberships, observations, programme,
                           programme_delay_flags, programme_import,
                           programme_snapshot,
                           programme_suggestions, programme_tasks, programme_window,
-                          recordings, redactions, rollup, scope,
-                          session_group,
-                          sites, threads, topics, users, voice_messages,
+                          recordings, redactions, report_templates, rollup, scope,
+                          session_group, site_attendance,
+                          sites, threads, topic_questions, topics, users,
+                          voice_messages,
                           voiceprints)
+from repositories import lake_objects
+import lake_keys
+import lake_owner
+import company_export
 from repositories.acl import is_cross_company, resolve_scope
-from text_normalize import diff_candidates, first_match_span, normalize, occurrences
+from text_normalize import (diff_candidates, first_match_span, learned_pairs, normalize,
+                            occurrences)
 # Keyframe Q7 telemetry derivation (all AWS-free, pure helpers): the deleted
 # frame's structural signal is reconstructed from the still-live topic row.
 from keyframe_selection import keyframe_seconds
 from photo_binding import parse_time_range
+import batch_cover
 import batch_stitch
 import deletion_mirror
+import speaker_match_request
+from repositories import speaker_name_proposals
+from repositories import speaker_intro_suggestions
 import turn_name_overlay
 from transcript_utils import extract_base_time_from_filename, speaker_turns_from_items
 
@@ -171,14 +200,6 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "")
 # module-level s3() client (boto3 clients aren't bucket-bound; Bucket is a
 # per-call param) — no second client needed.
 LAKE_BUCKET = os.environ.get("LAKE_BUCKET", "")
-# Fix wave 1 (review finding 1): the lake-owner/internal company name —
-# reuses the SAME marker lambda_ingest.py/lambda_item_writer.py already
-# introduced for MultiTenantResolution's company pin (resolve_company /
-# COMPANY_NAME), rather than inventing a second one. Resolved to a company
-# row via companies.get_company_by_name at call time (no template.yaml
-# wiring needed here either — those two functions don't wire it as an env
-# var, they rely on this same in-code default).
-COMPANY_NAME = os.environ.get("COMPANY_NAME", "FieldSight")
 ORG_ASSETS_PREFIX = os.environ.get("ORG_ASSETS_PREFIX", "org-assets/")
 COGNITO_USER_POOL_ID = os.environ.get("COGNITO_USER_POOL_ID", "")
 PRESIGNED_URL_EXPIRY = 900
@@ -221,6 +242,13 @@ UPLOAD_VERIFY_MODE = os.environ.get("UPLOAD_VERIFY_MODE", "off").lower()
 # exist -- this repo has shipped a documented rollback that was never wired, twice).
 SPEAKER_IDENTITY_MODE = os.environ.get("SPEAKER_IDENTITY_MODE", "off").lower()
 
+# How many of a person's pending candidates the dialog asks about at once. A SCREEN-SIZE
+# choice: it decides how long the list is, never whether a candidate is a match.
+PROPOSAL_PAGE = int(os.environ.get("PROPOSAL_PAGE", "5"))
+#: How many pending self-introductions `GET /name-suggestions` lists at once -- a
+#: screen-size choice like PROPOSAL_PAGE, not an admission threshold (owner decision 4).
+SUGGESTION_PAGE = int(os.environ.get("SUGGESTION_PAGE", "20"))
+
 # Whether naming a speaker is itself taken as the claim that they agreed to a voiceprint.
 #
 # Off, the endpoint keeps the pre-existing rule: enrolment happens only when the caller sends
@@ -228,8 +256,11 @@ SPEAKER_IDENTITY_MODE = os.environ.get("SPEAKER_IDENTITY_MODE", "off").lower()
 # a single profile — the subject needs an account, and on a site the people most often named
 # do not have one.
 #
-# On, a correction also creates the profile, recorded as `consent_basis='attestation'` with
-# `asserted_by` naming who made the claim. It records a claim; it does not verify one, and
+# On, a correction also creates the profile, recorded with the COMPANY's own
+# `voiceprint_consent_basis` -- whichever of notice / attestation / confirmed the company
+# declared -- and `asserted_by` naming who applied it. (This comment used to say every such
+# row was recorded as 'attestation'. The code has always written the company's value; a
+# comment that misstates which legal basis a biometric record carries is worse than none.) It records a claim; it does not verify one, and
 # nothing here can. The basis is on every row so a later decision — a stricter standard, a
 # purge, an opt-out register — can find exactly this population in one query.
 ENROL_ON_CORRECTION = os.environ.get("ENROL_ON_CORRECTION", "false").lower() == "true"
@@ -354,7 +385,116 @@ def parse_body(event):
     return parsed if isinstance(parsed, dict) else None
 
 
+REPUBLISH_SITE_COORDS_TASK = "republish_site_coords"
+REPUBLISH_DIRECTORY_TASK = "republish_directory"
+COLLAPSE_PHOTOS_TASK = "collapse_multibound_photos"
+REBIND_DAY_TASK = "rebind_day_photos"
+RESTORE_MARKERS_TASK = "restore_day_markers"
+BACKFILL_LEGACY_TICKS_TASK = "backfill_legacy_ticks"
+DRAIN_LAKE_MANIFEST_TASK = "drain_lake_manifest"
+BACKFILL_LAKE_OBJECTS_TASK = "backfill_lake_objects"
+EXPORT_COMPANY_TASK = "export_company"
+EXPORT_TICK_TASK = "export_tick"
+EXPORT_REQUEST_PREFIX = "export_requests/"
+
+
 def lambda_handler(event, context):
+    # SCHEDULED, not routed. EventBridge invokes this with a constant input
+    # carrying `task`; an API Gateway event is a proxy envelope whose top-level
+    # keys come from API Gateway, never from the request, so no caller can
+    # reach this branch through the API.
+    if isinstance(event, dict) and event.get("task") == REPUBLISH_SITE_COORDS_TASK:
+        with get_connection() as conn:
+            return republish_all_site_coords(conn)
+    if isinstance(event, dict) and event.get("task") == REPUBLISH_DIRECTORY_TASK:
+        with get_connection() as conn:
+            return republish_directory(conn, dry_run=event.get("dry_run") is True)
+    # OPERATOR TASK (lake ownership): turns lake_manifest/ lines into lake_objects rows.
+    # Same envelope rule as above: no API caller can reach it. Unlike the other operator
+    # tasks it runs for real by default: it is idempotent and deletes a manifest object only
+    # after its rows are committed. {"dry_run": true} writes and deletes nothing. It lists
+    # lake_manifest/ in S3 FIRST and opens no database connection when there is nothing to
+    # drain (so an hourly schedule lets Aurora auto-pause); otherwise it loops until its time
+    # budget is spent and reports `more`.
+    if isinstance(event, dict) and event.get("task") == DRAIN_LAKE_MANIFEST_TASK:
+        return drain_lake_manifest_run(event, context)
+    # OPERATOR TASK (lake ownership): walks the bucket once and records an owner for every
+    # object. A DRY RUN unless "apply" is exactly true or "dry_run" is exactly false (a typo
+    # or a string must not write; if the two disagree, the dry run wins). Tagging needs
+    # "tag": true AND a write. Returns next_start_after: re-invoke with it to resume.
+    # Also runs on LakeOps (longer timeout) by a direct invoke.
+    if isinstance(event, dict) and event.get("task") == BACKFILL_LAKE_OBJECTS_TASK:
+        write = ((event.get("apply") is True or event.get("dry_run") is False)
+                 and event.get("dry_run") is not True)
+        budget = event.get("time_budget_s")
+        if isinstance(budget, bool) or not isinstance(budget, (int, float)):
+            budget = 780
+        bucket = event.get("bucket")
+        with get_connection() as conn:
+            return backfill_lake_objects(
+                conn, s3(), apply=write, tag=event.get("tag") is True,
+                buckets=[bucket] if bucket else event.get("buckets"),
+                prefixes=event.get("prefixes"), start_bucket=event.get("start_bucket"),
+                start_after=event.get("start_after"), time_budget_s=budget)
+    # OPERATOR TASK (lake ownership): streams one company's lake objects into ZIP parts under
+    # exports/{company_id}/{export_id}/. Same envelope rule as above (no API caller reaches
+    # it). Meant for LakeOpsFunction (long timeout). One call runs one time budget and returns
+    # next_cursor; the scheduled export_tick below is what resumes exports in production.
+    if isinstance(event, dict) and event.get("task") == EXPORT_COMPANY_TASK:
+        return export_company_task(event, context)
+    # SCHEDULED (LakeOps, rate(10 minutes)): picks up export_requests/ left by the route. It
+    # lists S3 FIRST and opens no database connection unless there is work, so an idle tick
+    # lets Aurora auto-pause. Deliberately dispatched before any get_connection().
+    if isinstance(event, dict) and event.get("task") == EXPORT_TICK_TASK:
+        return export_tick(event, context)
+    # OPERATOR TASK, invoked by hand with `aws lambda invoke` (IAM decides who
+    # may). The same envelope rule as above keeps it out of reach of the API.
+    # A dry run unless "apply" is exactly true: a typo must not write.
+    # Same envelope rule, same dry-run default. Restores a day's location markers
+    # from its sessions' extractions ({"sessions": {session_base: [markers]}}),
+    # merged per session -- for days a later session erased before markers were
+    # kept per session (prod, Ben_Lin_Test 2026-10-02). The operator reads the
+    # extractions; org-api has no grant on them and needs none for this.
+    if isinstance(event, dict) and event.get("task") == RESTORE_MARKERS_TASK:
+        import photo_collapse
+        folder, date, sessions = event.get("folder"), event.get("date"), event.get("sessions")
+        if not folder or not date or not isinstance(sessions, dict):
+            return {"error": "folder, date and sessions are required"}
+        with get_connection() as conn:
+            company = photo_collapse.company_of(conn, folder)
+            with conn.transaction(force_rollback=event.get("apply") is not True):
+                merged = []
+                for session, marks in sessions.items():
+                    merged = location_markers.replace_for_session(
+                        conn, company, folder, date, session, marks or [])
+                return {"applied": event.get("apply") is True, "folder": folder, "date": date,
+                        "markers": [{"at": m["at"], "location": m["location"],
+                                     "session": m.get("session")} for m in merged]}
+    # Same envelope rule, same dry-run default. One day, under today's binding
+    # rules -- for after a rule change (photo_collapse.rebind_one_day).
+    if isinstance(event, dict) and event.get("task") == REBIND_DAY_TASK:
+        import photo_collapse
+        if not event.get("folder") or not event.get("date"):
+            return {"error": "folder and date are required"}
+        with get_connection() as conn:
+            return photo_collapse.rebind_one_day(conn, s3(), LAKE_BUCKET, event["folder"],
+                                                 event["date"], apply=event.get("apply") is True)
+    # Same envelope rule, same dry-run default. Copies the unambiguous legacy
+    # DynamoDB tick-offs ({"rows": [...]}, exported by scripts/export_legacy_ticks.py)
+    # into action_items.status; org-api has no grant on the audit table.
+    if isinstance(event, dict) and event.get("task") == BACKFILL_LEGACY_TICKS_TASK:
+        import legacy_ticks_backfill
+        rows = event.get("rows")
+        if not isinstance(rows, list):
+            return {"error": "rows (a list) is required"}
+        with get_connection() as conn:
+            return legacy_ticks_backfill.run(conn, rows, apply=event.get("apply") is True)
+    if isinstance(event, dict) and event.get("task") == COLLAPSE_PHOTOS_TASK:
+        import photo_collapse
+        with get_connection() as conn:
+            return photo_collapse.run(conn, s3(), LAKE_BUCKET,
+                                      apply=event.get("apply") is True,
+                                      folder=event.get("folder"), date=event.get("date"))
     method = event.get("httpMethod", "")
     path = event.get("path", "")
     m = re.match(r"^/api/org(/.*)?$", path)
@@ -373,6 +513,36 @@ def lambda_handler(event, context):
     except Exception:
         logger.exception("org api unhandled error")
         return error("internal error", 500)
+
+
+def get_app_latest():
+    """GET /api/org/app/latest -- the newest published app build for this stage (in-app updates).
+
+    Signed-in, provisioned callers only: dispatched after the caller guard, by the owner's choice
+    that a download link is never handed to a device nobody has signed in on.
+
+    No manifest yet is an ordinary answer, `{available: false}`. Any OTHER failure to read it --
+    AccessDenied included -- is a 503 and an ERROR log, never "no update": swallowed, it would tell
+    every device it is up to date, silently and indefinitely. This repo has shipped that exact shape
+    before (`except ClientError: pass` turning a 403 into an empty 200).
+    """
+    import app_release
+    try:
+        raw = s3().get_object(Bucket=S3_BUCKET, Key=app_release.MANIFEST_KEY)["Body"].read()
+    except ClientError as e:
+        code = (e.response.get("Error") or {}).get("Code", "")
+        if code in ("NoSuchKey", "404"):
+            return ok({"available": False})
+        logger.error("app-release manifest unreadable (%s) at s3://%s/%s: %s",
+                     code, S3_BUCKET, app_release.MANIFEST_KEY, e)
+        return error("update manifest unreadable", 503)
+    manifest = app_release.parse_manifest(raw)
+    return ok(app_release.response_for(
+        manifest,
+        lambda key: s3().generate_presigned_url(
+            "get_object", Params={"Bucket": S3_BUCKET, "Key": key}, ExpiresIn=PRESIGNED_URL_EXPIRY),
+        PRESIGNED_URL_EXPIRY,
+    ))
 
 
 def dispatch(conn, event, method, route):
@@ -398,43 +568,67 @@ def dispatch(conn, event, method, route):
     if caller.get("archived_at") is not None and not (route == "/me" and method == "GET"):
         return error("account archived", 403)
 
+    # In-app updates. After the caller guard on purpose -- signed-in, provisioned devices only.
+    if route == "/app/latest" and method == "GET":
+        return get_app_latest()
+
     if route == "/me":
         if method == "GET":
             return get_me(conn, caller)
         if method == "PATCH":
-            return patch_me(conn, caller, parse_body(event))
+            return _directory_after(conn, patch_me(conn, caller, parse_body(event)))
 
     if route == "/sites":
         if method == "GET":
             return list_org_sites(conn, caller, event)
         if method == "POST":
-            return create_org_site(conn, caller, parse_body(event))
+            return _directory_after(conn, create_org_site(conn, caller, parse_body(event)))
+
+    if route == "/companies":
+        if method == "GET":
+            return list_org_companies(conn, caller)
+        if method == "POST":
+            return create_org_company(conn, caller, parse_body(event))
+
+    m_co = re.match(r"^/companies/([^/]+)$", route)
+    if m_co and method == "PATCH":
+        return patch_org_company(conn, caller, m_co.group(1), parse_body(event))
+
+    m_cx = re.match(r"^/companies/([^/]+)/export$", route)
+    if m_cx and method == "POST":
+        return start_company_export(conn, caller, m_cx.group(1))
+    m_cxs = re.match(r"^/companies/([^/]+)/export/([^/]+)$", route)
+    if m_cxs and method == "GET":
+        return company_export_status(conn, caller, m_cxs.group(1), m_cxs.group(2))
 
     if route == "/members":
         if method == "GET":
             return list_members(conn, caller, event)
         if method == "POST":
-            return create_member(conn, caller, parse_body(event))
+            return _directory_after(conn, create_member(conn, caller, parse_body(event)))
     if route == "/members/enroll-backfill" and method == "POST":
-        return backfill_member_folders(conn, caller, parse_body(event))
+        return _directory_after(conn, backfill_member_folders(conn, caller, parse_body(event)))
     m = re.match(r"^/members/([^/]+)/role$", route)
     if m and method == "PATCH":
-        return patch_member_role(conn, caller, m.group(1), parse_body(event))
+        return _directory_after(conn, patch_member_role(conn, caller, m.group(1), parse_body(event)))
     m_mf = re.match(r"^/members/([^/]+)/folder$", route)
     if m_mf and method == "PATCH":
-        return patch_member_folder(conn, caller, m_mf.group(1), parse_body(event))
+        return _directory_after(conn, patch_member_folder(conn, caller, m_mf.group(1), parse_body(event)))
     m_mm = re.match(r"^/members/([^/]+)/memberships/([^/]+)$", route)
     if m_mm and method == "PUT":
-        return put_member_membership(conn, caller, m_mm.group(1), m_mm.group(2),
-                                     parse_body(event))
+        return _directory_after(conn, put_member_membership(
+            conn, caller, m_mm.group(1), m_mm.group(2), parse_body(event)))
     if m_mm and method == "DELETE":
-        return delete_member_membership(conn, caller, m_mm.group(1), m_mm.group(2))
+        return _directory_after(conn, delete_member_membership(conn, caller, m_mm.group(1), m_mm.group(2)))
     m_sp = re.match(r"^/sites/([^/]+)$", route)
     if m_sp and method == "PATCH":
-        return patch_org_site(conn, caller, m_sp.group(1), parse_body(event))
+        return _directory_after(conn, patch_org_site(conn, caller, m_sp.group(1), parse_body(event)))
     m_sa = re.match(r"^/sites/([^/]+)/(archive|unarchive)$", route)
     if m_sa and method == "POST":
-        return archive_site_endpoint(conn, caller, m_sa.group(1), m_sa.group(2))
+        return _directory_after(conn, archive_site_endpoint(conn, caller, m_sa.group(1), m_sa.group(2)))
+    m_sx = re.match(r"^/sites/([^/]+)/external-members$", route)
+    if m_sx and method == "POST":
+        return _directory_after(conn, add_external_member(conn, caller, m_sx.group(1), parse_body(event)))
     m_sm = re.match(r"^/sites/([^/]+)/members$", route)
     if m_sm and method == "GET":
         return list_site_members(conn, caller, m_sm.group(1))
@@ -443,7 +637,7 @@ def dispatch(conn, event, method, route):
         return list_site_contributors(conn, caller, m_sc.group(1), event)
     m_ma = re.match(r"^/members/([^/]+)/(archive|unarchive)$", route)
     if m_ma and method == "POST":
-        return archive_member_endpoint(conn, caller, m_ma.group(1), m_ma.group(2))
+        return _directory_after(conn, archive_member_endpoint(conn, caller, m_ma.group(1), m_ma.group(2)))
 
     if route == "/upload-url" and method == "POST":
         return create_upload_url(conn, caller, parse_body(event))
@@ -470,6 +664,12 @@ def dispatch(conn, event, method, route):
     if m_ai and method == "PATCH":
         return patch_action_item(conn, caller, m_ai.group(1), parse_body(event))
 
+    # Track B Task 5 Step 2 -- addressed by topic_questions.stable_id, not .id (see
+    # patch_question's docstring for why that differs from action-items above).
+    m_q = re.match(r"^/questions/([^/]+)$", route)
+    if m_q and method == "PATCH":
+        return patch_question(conn, caller, m_q.group(1), parse_body(event))
+
     # Durable safety/quality resolved-state (spec 2026-07-26). Literal routes,
     # no id in the path (the row is addressed by its natural key in the body /
     # query), so no greedy regex can shadow them. Singular PATCH = set/flip one;
@@ -494,6 +694,16 @@ def dispatch(conn, event, method, route):
     if m_pa and method == "POST":
         return apply_topic_correction(conn, caller, m_pa.group(1), parse_body(event))
 
+    if route == "/trace/day" and method == "GET":
+        return trace_day_endpoint(conn, caller, event)
+    if route == "/trace/funnel" and method == "GET":
+        return trace_funnel_endpoint(conn, caller, event)
+
+    if route == "/aliases" and method == "GET":
+        return list_aliases_endpoint(conn, caller)
+    m_al = re.match(r"^/aliases/([^/]+)$", route)
+    if m_al and method == "DELETE":
+        return retire_alias_endpoint(conn, caller, m_al.group(1))
     if route == "/aliases" and method == "POST":
         return create_alias_endpoint(conn, caller, parse_body(event), event)
 
@@ -537,11 +747,51 @@ def dispatch(conn, event, method, route):
         return get_org_media_presigned_url(conn, caller, event)
     if route == "/media/keyframe" and method == "DELETE":
         return delete_keyframe_endpoint(conn, caller, parse_body(event))
+    # --- Report templates (migration 0062) -------------------------------
+    # ORDER MATTERS HERE. "/templates/bindings" must be matched before the
+    # "/templates/{id}" pattern below, or "bindings" is read as a template id
+    # and the bindings endpoints answer 404 for everyone -- a failure that
+    # looks like a permissions problem and is not one.
+    if route == "/templates" and method == "GET":
+        return list_report_templates(conn, caller, event)
+    if route == "/templates" and method == "POST":
+        return create_report_template(conn, caller, event)
+    if route == "/templates/modules" and method == "GET":
+        return list_report_modules(conn, caller, event)
+    if route == "/templates/bindings" and method == "GET":
+        return list_report_template_bindings(conn, caller, event)
+    m_tb = re.match(r"^/templates/bindings/([^/]+)$", route)
+    if m_tb and method == "PUT":
+        return set_report_template_binding(conn, caller, m_tb.group(1), event)
+    m_tvr = re.match(r"^/templates/([^/]+)/versions/([^/]+)/restore$", route)
+    if m_tvr and method == "POST":
+        return restore_report_template_version(conn, caller, m_tvr.group(1), m_tvr.group(2))
+    m_tv = re.match(r"^/templates/([^/]+)/versions$", route)
+    if m_tv and method == "GET":
+        return list_report_template_versions(conn, caller, m_tv.group(1))
+    if m_tv and method == "POST":
+        return add_report_template_version(conn, caller, m_tv.group(1), event)
+    m_tc = re.match(r"^/templates/([^/]+)/copy$", route)
+    if m_tc and method == "POST":
+        return copy_report_template(conn, caller, m_tc.group(1), event)
+    m_t = re.match(r"^/templates/([^/]+)$", route)
+    if m_t and method == "GET":
+        return get_report_template(conn, caller, m_t.group(1), event)
+    if m_t and method == "PATCH":
+        return update_report_template(conn, caller, m_t.group(1), event)
+    if m_t and method == "DELETE":
+        return archive_report_template(conn, caller, m_t.group(1))
+
     if route == "/reports/history" and method == "GET":
         return get_org_report_history(conn, caller, event)
+    if route == "/reports/regenerate" and method == "POST":
+        return regenerate_own_report(conn, caller, parse_body(event))
 
     if route == "/rollup/portfolio" and method == "GET":
         return list_portfolio_rollup(conn, caller, event)
+
+    if route == "/weather" and method == "GET":
+        return get_site_weather(conn, caller, event)
 
     if route == "/programme":
         if method == "GET":
@@ -627,6 +877,11 @@ def dispatch(conn, event, method, route):
     m_scl = re.match(r"^/sessions/([^/]+)/close$", route)
     if m_scl and method == "POST":
         return session_close(conn, caller, m_scl.group(1), parse_body(event))
+    # F2: an id that is not a session never reaches a handler that builds a key from it.
+    m_sk = _SESSION_KEYED_ROUTE_RE.match(route)
+    if m_sk and not session_scope.is_session_base(m_sk.group(1)):
+        return error("not a session id", 400)
+
     m_srp = re.match(r"^/sessions/([^/]+)/report/preview$", route)
     if m_srp and method == "POST":
         return session_report_preview(conn, caller, m_srp.group(1), event)
@@ -636,6 +891,32 @@ def dispatch(conn, event, method, route):
     m_srs = re.match(r"^/sessions/([^/]+)/report/status$", route)
     if m_srs and method == "GET":
         return session_report_status(conn, caller, m_srs.group(1), event)
+
+    m_drp = re.match(r"^/days/([^/]+)/report/preview$", route)
+    if m_drp and method == "POST":
+        return day_report_preview(conn, caller, m_drp.group(1), event)
+    m_drg = re.match(r"^/days/([^/]+)/report$", route)
+    if m_drg and method == "POST":
+        return day_report_generate(conn, caller, m_drg.group(1), event)
+    m_drs = re.match(r"^/days/([^/]+)/report/status$", route)
+    if m_drs and method == "GET":
+        return day_report_status(conn, caller, m_drs.group(1), event)
+    if route == "/photos/notice" and method == "GET":
+        return get_photo_notice(conn, caller, event)
+    m_dcr = re.match(r"^/days/([^/]+)/checklist-reports$", route)
+    if m_dcr and method == "GET":
+        return get_day_checklist_reports(conn, caller, m_dcr.group(1), event)
+    if route == "/checklist-reports/recent" and method == "GET":
+        return get_recent_checklist_reports(conn, caller, event)
+    m_din = re.match(r"^/days/([^/]+)/inspections$", route)
+    if m_din and method == "GET":
+        return get_day_inspections(conn, caller, m_din.group(1), event)
+    m_dps = re.match(r"^/days/([^/]+)/photos/selection$", route)
+    if m_dps and method == "GET":
+        return get_photo_selection(conn, caller, m_dps.group(1), event)
+    if m_dps and method == "PUT":
+        return put_photo_selection(conn, caller, m_dps.group(1), event)
+
     m_sm = re.match(r"^/sessions/([^/]+)/speaker-match$", route)
     if m_sm and method == "POST":
         return speaker_match(conn, caller, m_sm.group(1), event)
@@ -648,12 +929,41 @@ def dispatch(conn, event, method, route):
         return speaker_known(conn, caller, event)
     if route == "/voiceprints" and method == "GET":
         return list_voiceprints(conn, caller)
+    # A literal segment, so it must not fall to a `{id}` pattern; kept above them.
+    if route == "/voiceprints/same-name" and method == "GET":
+        return same_name_voiceprints(conn, caller, event)
+    # Before `/voiceprints/{id}`: that pattern cannot match a path with a suffix, but the
+    # order is the cheap insurance if somebody loosens it -- the sibling route withdraws a
+    # biometric.
+    m_vr = re.match(r"^/voiceprints/([^/]+)/retry$", route)
+    if m_vr and method == "POST":
+        return retry_voiceprint(conn, caller, m_vr.group(1), event)
+    # Merge routes carry a suffix and so cannot match the bare `{id}` pattern below; they sit
+    # above it anyway for the same reason as the retry route.
+    m_vmc = re.match(r"^/voiceprints/([^/]+)/merge-check$", route)
+    if m_vmc and method == "GET":
+        return merge_check_voiceprint(conn, caller, m_vmc.group(1), event)
+    m_vm = re.match(r"^/voiceprints/([^/]+)/merge$", route)
+    if m_vm and method == "POST":
+        return merge_voiceprint(conn, caller, m_vm.group(1), event)
     m_vw = re.match(r"^/voiceprints/([^/]+)$", route)
     if m_vw and method == "DELETE":
         return withdraw_voiceprint(conn, caller, m_vw.group(1))
+    if m_vw and method == "PATCH":
+        return rename_voiceprint(conn, caller, m_vw.group(1), event)
     m_rg = re.match(r"^/sessions/([^/]+)/regenerate$", route)
     if m_rg and method == "POST":
         return regenerate_session(conn, caller, m_rg.group(1), event)
+    if route == "/name-proposals" and method == "GET":
+        return list_name_proposals(conn, caller, event)
+    m_np = re.match(r"^/name-proposals/([^/]+)$", route)
+    if m_np and method == "POST":
+        return decide_name_proposal(conn, caller, m_np.group(1), event)
+    if route == "/name-suggestions" and method == "GET":
+        return list_name_suggestions(conn, caller, event)
+    m_ns = re.match(r"^/name-suggestions/([^/]+)$", route)
+    if m_ns and method == "POST":
+        return decide_name_suggestion(conn, caller, m_ns.group(1), event)
     m_sc = re.match(r"^/sessions/([^/]+)/speaker-corrections$", route)
     if m_sc and method == "POST":
         return speaker_corrections(conn, caller, m_sc.group(1), event)
@@ -663,6 +973,11 @@ def dispatch(conn, event, method, route):
     m_sbr = re.match(r"^/sessions/([^/]+)/brief$", route)
     if m_sbr and method == "GET":
         return session_brief_read(conn, caller, m_sbr.group(1), event)
+    if route == "/sessions/pending" and method == "GET":
+        return sessions_pending(conn, caller, event)
+    m_sx = re.match(r"^/sessions/([^/]+)/expedite$", route)
+    if m_sx and method == "POST":
+        return session_expedite(conn, caller, m_sx.group(1))
 
     if route == "/voice/upload-url" and method == "POST":
         return create_voice_upload_url(conn, caller, parse_body(event))
@@ -671,6 +986,15 @@ def dispatch(conn, event, method, route):
     m_sv = re.match(r"^/sites/([^/]+)/voice$", route)
     if m_sv and method == "GET":
         return list_site_voice(conn, caller, m_sv.group(1), event)
+
+    m_sat = re.match(r"^/sites/([^/]+)/attendance$", route)
+    if m_sat and method == "GET":
+        return list_site_attendance(conn, caller, m_sat.group(1), event)
+    if m_sat and method == "POST":
+        return create_site_attendance(conn, caller, m_sat.group(1), event)
+    m_satr = re.match(r"^/sites/([^/]+)/attendance/([^/]+)$", route)
+    if m_satr and method == "DELETE":
+        return delete_site_attendance(conn, caller, m_satr.group(1), m_satr.group(2), event)
 
     if route == "/auth/qr/create" and method == "POST":
         return create_qr_login_code(conn, caller, event)
@@ -696,6 +1020,79 @@ def _recording_s3_key(display_name, kind, started_at, file_name):
     return f"users/{_safe_seg(display_name)}/{folder}/{date_str}/{_safe_seg(file_name)}"
 
 
+def _capture_site(conn, caller, site_id):
+    """(site, error_response) for a capture call that names `siteId`.
+
+    Project-owned tenancy P2: a caller may record onto a site of their own
+    company (as before -- this is also how admin/gm, who hold no memberships,
+    record) OR onto any site they hold a LIVE membership on, whatever its
+    company. Anything else is refused as 'site not accessible'. The row's
+    company is then the SITE's, not the caller's (see `_capture_company_id`)."""
+    site = sites.get_site(conn, site_id)
+    if site is None:
+        return None, error("site not accessible", 403)
+    if str(site["company_id"]) != str(caller["company_id"]):
+        m = memberships.get_membership(conn, caller["id"], site_id)
+        if m is None or m.get("archived_at") is not None:
+            return None, error("site not accessible", 403)
+    return site, None
+
+
+def _capture_company_id(caller, site):
+    """The company a captured row belongs to: the site's, else the recorder's home."""
+    return site["company_id"] if site else caller["company_id"]
+
+
+def _lake_company_for_sites(conn, site_ids):
+    """Owner company for a lake row whose request names site(s), or None when uncertain
+    (ruling R2a: never the caller's company as a guess). Certain = every named site resolves
+    and they all belong to ONE company. Savepointed: a failed lookup yields None."""
+    ids = {str(x) for x in (site_ids or []) if x}
+    if not ids:
+        return None
+    try:
+        with conn.transaction():
+            found = [sites.get_site(conn, i) for i in sorted(ids)]
+    except Exception:  # noqa: BLE001
+        logger.warning("lake_objects: site lookup failed; recording no company", exc_info=True)
+        return None
+    if any(f is None for f in found):
+        return None
+    owners = {str(f["company_id"]) for f in found}
+    return next(iter(owners)) if len(owners) == 1 else None
+
+
+def _lake_user_for_folder(conn, folder):
+    """The user who owns `folder` (the person a request is made FOR), or None when unknown.
+    A lake row's user_id is the folder owner, never the caller who clicked (M5). Savepointed:
+    a failed lookup yields None."""
+    if not folder:
+        return None
+    try:
+        with conn.transaction():
+            row = users.get_by_folder_name_global(conn, folder)
+    except Exception:  # noqa: BLE001
+        logger.warning("lake_objects: folder owner lookup failed; recording no user",
+                       exc_info=True)
+        return None
+    return row["id"] if row else None
+
+
+def _lake_company_for_session(conn, folder, date, session_base):
+    """Owner company of a session-level lake row: the company of the one site the session
+    lies on, else None (no site, several companies, unknown session or a failed lookup).
+    Never the caller's company (R2a). Savepointed."""
+    try:
+        with conn.transaction():
+            owners = {str(c) for _s, c in recordings.session_site_companies(
+                conn, folder, date, session_base)}
+    except Exception:  # noqa: BLE001
+        logger.warning("lake_objects: session site lookup failed; recording no company",
+                       exc_info=True)
+        return None
+    return next(iter(owners)) if len(owners) == 1 else None
+
+
 def create_recording_upload_url(conn, caller, body, device_ident=None):
     if body is None:
         return error("malformed JSON body", 400)
@@ -710,10 +1107,11 @@ def create_recording_upload_url(conn, caller, body, device_ident=None):
         return error("clientUuid, fileName, contentType, startedAt are required", 400)
 
     site_id = body.get("siteId")
+    site = None
     if site_id:
-        site = sites.get_site(conn, site_id)
-        if site is None or site["company_id"] != caller["company_id"]:
-            return error("site not accessible", 403)
+        site, err = _capture_site(conn, caller, site_id)
+        if err is not None:
+            return err
 
     # Idempotent on the device-side capture id: a resend (retry) reuses the
     # existing row and just re-signs a fresh URL, never creating a duplicate.
@@ -721,8 +1119,18 @@ def create_recording_upload_url(conn, caller, body, device_ident=None):
     if existing is not None:
         rec_id, key = existing["id"], existing["s3_key"]
     else:
-        display_name = caller.get("folder_name") or \
-            f"{caller.get('first_name', '')}_{caller.get('last_name', '')}"
+        display_name = caller.get("folder_name") or _enrol_folder_on_upload(conn, caller)
+        # The folder is minted once (folder_key) and used verbatim here. Re-cleansing
+        # it in this route is how `Deandre'_Alberts` became `Deandre__Alberts` on S3
+        # while the directory said otherwise (2026-10-05). A stored folder that
+        # _safe_seg would change is refused loudly -- on a retryable route -- rather
+        # than written under a folder no directory row owns. 422, not 409: 409 here
+        # already means "s3 key already exists" (a duplicate a client may drop).
+        if _safe_seg(display_name) != display_name:
+            logger.error("upload-url: user %s has an invalid folder_name %r "
+                         "(not [A-Za-z0-9._-]) -- refusing; recording would be stranded",
+                         caller.get("id"), display_name)
+            return error("recording folder is invalid; ask an admin", 422)
         key = _recording_s3_key(display_name, kind, started_at, file_name)
         try:
             # Resolved BEFORE the transaction opens, not inside it. `device_id`
@@ -734,7 +1142,7 @@ def create_recording_upload_url(conn, caller, body, device_ident=None):
             recording_device_id = device_heartbeat.device_id(conn, device_ident)
             with conn.transaction():          # savepoint: on failure, roll back to here so conn stays usable
                 row = recordings.insert_pending(
-                    conn, company_id=caller["company_id"], user_id=caller["id"], site_id=site_id,
+                    conn, company_id=_capture_company_id(caller, site), user_id=caller["id"], site_id=site_id,
                     kind=kind, s3_key=key, client_uuid=client_uuid, started_at=started_at,
                     ended_at=body.get("endedAt"), duration_s=body.get("durationS"),
                     resolution=body.get("resolution"), codec=body.get("codec"),
@@ -751,7 +1159,15 @@ def create_recording_upload_url(conn, caller, body, device_ident=None):
             else:
                 return error("a recording with this s3 key already exists", 409)
 
-    _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id)
+    _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id,
+                             _capture_company_id(caller, site))
+
+    # Index who owns this key. Best effort in a savepoint: the route is synchronous with no
+    # retry (BUG-43), so this can neither fail nor abort the upload. A resend re-records the
+    # same key (an idempotent upsert).
+    lake_objects.record_best_effort(
+        conn, key, company_id=_capture_company_id(caller, site),
+        site_id=site_id or None, user_id=caller["id"], source="upload")
 
     url = s3().generate_presigned_url(
         "put_object",
@@ -782,7 +1198,7 @@ def _ensure_group_state(conn, company_id, group_id):
         logger.exception("could not register group state for %s", group_id)
 
 
-def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id):
+def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id, company_id=None):
     """Record the meeting group carried by an upload, if there is one.
 
     Why this exists: `/sessions/{id}/open` is best-effort and fire-and-forget,
@@ -803,6 +1219,7 @@ def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id):
     group_id = (body or {}).get("groupId")
     if not group_id:
         return
+    company_id = company_id or caller["company_id"]
     try:
         if not _SID_RE.match(str(group_id)):
             logger.warning("upload-url: ignoring malformed groupId %r", group_id)
@@ -818,7 +1235,7 @@ def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id):
         # Skipped rather than refused — failing the upload over the group would
         # cost the recording itself, and /open already answers 403 for this.
         lead = meeting_session.get(conn, group_id)
-        if lead is not None and str(lead["company_id"]) != str(caller["company_id"]):
+        if lead is not None and str(lead["company_id"]) != str(company_id):
             logger.warning("upload-url: refusing cross-company group %s", group_id)
             return
         # Same door as /open: a finished meeting takes no new members, or a
@@ -836,13 +1253,13 @@ def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id):
         # the same place for the same reason. None is fine: it leaves the field
         # for whoever does know.
         meeting_session.ensure_open(
-            conn, m.group(1), caller["company_id"], caller["id"], site_id, kind,
+            conn, m.group(1), company_id, caller["id"], site_id, kind,
             extract_base_time_from_filename(file_name), group_id=group_id,
         )
         # Beside ensure_open, not instead of it: this is the OFFLINE join, the
         # one whose /open never landed, so it is the only chance this group has
         # to become visible to the merge scan.
-        _ensure_group_state(conn, caller["company_id"], group_id)
+        _ensure_group_state(conn, company_id, group_id)
         # A live session now exists, so the finalize sweep must connect until it
         # closes (Aurora scale-to-zero, spec 2026-08-11).
         sweep_state.mark_pending(_STAGE)
@@ -1011,10 +1428,12 @@ def session_open(conn, caller, session_id, body):
     if kind is not None and kind not in ("audio", "video"):
         return error("kind must be 'audio' or 'video'", 400)
     site_id = body.get("siteId")
+    site = None
     if site_id:
-        site = sites.get_site(conn, site_id)
-        if site is None or site["company_id"] != caller["company_id"]:
-            return error("site not accessible", 403)
+        site, err = _capture_site(conn, caller, site_id)
+        if err is not None:
+            return err
+    session_company_id = _capture_company_id(caller, site)
     # Multi-device merge (spec 2026-08-04): the group's id IS the lead device's
     # session_id, carried here by the joiner after scanning the lead's QR.
     group_id = body.get("groupId")
@@ -1029,7 +1448,7 @@ def session_open(conn, caller, session_id, body):
         # a client's say-so.
         lead = meeting_session.get(conn, group_id)
         if lead is not None:
-            if str(lead["company_id"]) != str(caller["company_id"]):
+            if str(lead["company_id"]) != str(session_company_id):
                 return error("group not accessible", 403)
             # Staleness. A device that kept a group overnight, or across a
             # reinstall, will happily present it again — nothing on the device
@@ -1052,12 +1471,12 @@ def session_open(conn, caller, session_id, body):
     # Idempotent: whichever of the record-start signal or the first uploaded
     # chunk arrives first opens the session; a later call never regresses it.
     row = meeting_session.ensure_open(
-        conn, session_id, caller["company_id"], caller["id"], site_id, kind,
+        conn, session_id, session_company_id, caller["id"], site_id, kind,
         body.get("startedAt"), group_id=group_id,
     )
     # After ensure_open, so a group is only registered once the join itself has
     # passed every guard above (tenant, staleness, meeting-already-ended).
-    _ensure_group_state(conn, caller["company_id"], group_id)
+    _ensure_group_state(conn, session_company_id, group_id)
     # There is now something for the finalize sweep to act on, so let it know it
     # must connect (Aurora scale-to-zero, spec 2026-08-11). Best-effort: a failed
     # flag write is recovered by the sweep's hourly unconditional pass and must
@@ -1200,6 +1619,69 @@ def _day_report_rows(conn, caller, folder, date):
     return [r for r in rows if str(r["site_id"]) in allowed]
 
 
+def _deleted_prefixes_for_rows(conn, rows, date):
+    """Recording tombstones (source arm) for every folder these rows come from.
+
+    Every folder, not only the requester's: a multi-device meeting's rows are written
+    under the LEAD's folder, and so is its tombstone. STRICT -- a failed lookup raises,
+    because this feeds a document; producing one that includes a deleted recording is
+    worse than producing none (the same trade `_session_was_removed` makes)."""
+    folders = sorted({parsed[0] for parsed in
+                      (session_scope.parse_extraction_key(r.get("source_s3_key")) for r in rows)
+                      if parsed})
+    prefixes = set()
+    for folder in folders:
+        for p in redactions.deleted_source_prefixes(conn, folder, date) or []:
+            if isinstance(p, str) and p:
+                prefixes.add(p)
+    return prefixes
+
+
+def _redacted_or_hidden(r, redacted, deleted):
+    """True when `r` must not appear in a report: an active redaction, a
+    non_work classification, or a source key under a deleted (tombstoned)
+    prefix. A "deleted" recording is a reversible mask in this codebase --
+    the audio is still in the bucket -- so this arm matters exactly as much
+    as the other two: without it a soft-deleted topic's speech is neither
+    shown NOR named as cut, and can still reach a generation prompt.
+
+    The one rule both `_report_rows_in_scope` (which drops these rows) and
+    `_excluded_topics_for` (which reports them) apply, so there is a single
+    place that defines "excluded" rather than two copies that can drift."""
+    if r["id"] in redacted or r.get("work_class") == "non_work":
+        return True
+    key = r.get("source_s3_key") or ""
+    return any(key.startswith(p) for p in deleted)
+
+
+def _report_rows_in_scope(conn, caller, folder, date, session_id=None, selected=None):
+    """The topic rows a report may contain, for one session or (session_id=None) the day.
+
+    Scope integrity: rows come from `_day_report_rows` (ACL, site clip, joiners), then
+    lose extraction-less rows, non_work, both deletion arms (topic tombstones AND
+    recording tombstones on the source key -- `deleted_predicates.py`: both arms or
+    neither), and finally intersect with the caller's chosen ids. A selection can only
+    narrow."""
+    rows = _day_report_rows(conn, caller, folder, date)
+    if not rows:
+        return []
+    redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows])
+    deleted = _deleted_prefixes_for_rows(conn, rows, date)
+    kept = []
+    for r in rows:
+        sid, kind = session_scope.session_ref(r.get("source_s3_key"))
+        if kind != session_scope.KIND_EXTRACTION:
+            continue
+        if session_id is not None and sid != session_id:
+            continue
+        if _redacted_or_hidden(r, redacted, deleted):
+            continue
+        kept.append(r)
+    if selected is not None:
+        kept = [r for r in kept if str(r["id"]) in selected]
+    return kept
+
+
 def _assemble_session_report(conn, caller, session_id, event, selected=None):
     """Re-derive ONE session's scope + assemble its reviewed report content,
     server-side from (folder, date, session_id). The shared core of the T2
@@ -1218,22 +1700,8 @@ def _assemble_session_report(conn, caller, session_id, event, selected=None):
     if err is not None:
         return None, err
 
-    rows = _day_report_rows(conn, caller, folder, date)
-    redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows]) if rows else {}
-    srows = []
-    for r in rows:
-        sid, kind = session_scope.session_ref(r.get("source_s3_key"))
-        if kind != session_scope.KIND_EXTRACTION or sid != session_id:
-            continue
-        if r["id"] in redacted or r.get("work_class") == "non_work":
-            continue
-        srows.append(r)
-    if selected is not None:
-        # INTERSECTION, never a lookup. The chosen ids are filtered against rows
-        # that already passed the site ACL, the redaction check and the non_work
-        # exclusion, so a chosen id cannot widen the scope by one row -- naming
-        # somebody else's topic simply matches nothing.
-        srows = [r for r in srows if str(r["id"]) in selected]
+    srows = _report_rows_in_scope(conn, caller, folder, date,
+                                  session_id=session_id, selected=selected)
 
     if not srows:
         # unknown session, all-excluded, wrong folder/date, or a selection that
@@ -1299,6 +1767,92 @@ def session_report_preview(conn, caller, session_id, event):
     })
 
 
+_REGENERABLE_TYPES = ("daily", "weekly", "monthly")
+
+
+def regenerate_own_report(conn, caller, body):
+    """POST /api/org/reports/regenerate {report_type, date} -- queue the CALLER's
+    own report, and only it.
+
+    Owner rule (2026-09-15): each person regenerates only their own reports; no
+    role may regenerate another person's; nobody regenerates a summary by hand.
+    So the folder is caller.folder_name and nothing else. There is no scope field
+    in the body to trust or to reject, and anything that looks like one
+    (user/folder/users_filter) is simply never read.
+
+    org-api is in-VPC and cannot invoke the generator (BUG-36). It writes one
+    request artifact to report_requests/<folder>/<rid>.json; the non-VPC generator
+    is S3-triggered on that prefix and regenerates exactly that report or nothing.
+
+    `date` is the day for a daily and the END of the period for weekly/monthly:
+    history rows carry only the end date, so the period is derived here --
+    weekly = the seven days ending on it, monthly = the month up to it.
+    """
+    if not isinstance(body, dict):
+        return error("malformed JSON body", 400)
+    report_type = body.get("report_type")
+    if not isinstance(report_type, str) or report_type not in _REGENERABLE_TYPES:
+        return error("report_type must be daily, weekly or monthly", 400)
+    date = body.get("date")
+    if not isinstance(date, str) or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    try:
+        end = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        return error("date required (YYYY-MM-DD)", 400)
+
+    folder = (caller.get("folder_name") or "").strip()
+    if not folder:
+        return error("your account has no recording folder, so it has no reports "
+                     "to regenerate -- ask an admin to enrol it", 403)
+
+    if report_type == "daily":
+        # A day with nothing recorded would run the generator, write nothing, and
+        # leave the person waiting on a report that can never arrive.
+        listed = s3().list_objects_v2(Bucket=S3_BUCKET, Prefix=f"transcripts/{folder}/{date}/",
+                                      MaxKeys=1)
+        if not listed.get("KeyCount"):
+            return error("no recordings for that date", 404)
+
+    request_id = uuid.uuid4().hex
+    artifact = {
+        "requestId": request_id,
+        "report_type": report_type,
+        "user": folder,
+        "triggered_by": caller.get("email") or str(caller.get("id")),
+        "requestedBy": str(caller.get("id")),
+    }
+    if report_type == "daily":
+        artifact["date"] = date
+    elif report_type == "weekly":
+        artifact["start_date"] = (end - timedelta(days=6)).isoformat()
+        artifact["end_date"] = date
+    else:
+        artifact["start_date"] = end.replace(day=1).isoformat()
+        artifact["end_date"] = date
+
+    request_key = f"report_requests/{folder}/{request_id}.json"
+    s3().put_object(Bucket=LAKE_BUCKET, Key=request_key,
+                    Body=json.dumps(artifact, default=str),
+                    ContentType="application/json")
+    # A folder/day/range request can span sites of several companies: owner unknown here (R2a).
+    lake_objects.record_best_effort(conn, request_key, company_id=None,
+                                    user_id=_lake_user_for_folder(conn, folder), source="upload")
+    return ok({"status": "queued", "requestId": request_id,
+               "report_type": report_type, "folder": folder}, 202)
+
+
+def _delivery_from_body(body):
+    """(deliver, recipients, None) or (None, None, error) -- shared by both generate routes."""
+    deliver = body.get("deliver", "download")
+    if deliver not in ("download", "email"):
+        return None, None, error("deliver must be 'download' or 'email'", 400)
+    recipients = body.get("recipients") or []
+    if deliver == "email" and not recipients:
+        return None, None, error("recipients required when deliver='email'", 400)
+    return deliver, recipients, None
+
+
 def session_report_generate(conn, caller, session_id, event):
     """POST /api/org/sessions/{session_id}/report — Tier-2 T3
     (session-report-review-export spec §6). ENQUEUES an async generate job.
@@ -1313,12 +1867,9 @@ def session_report_generate(conn, caller, session_id, event):
     body = parse_body(event)
     if body is None:
         return error("malformed JSON body", 400)
-    deliver = body.get("deliver", "download")
-    if deliver not in ("download", "email"):
-        return error("deliver must be 'download' or 'email'", 400)
-    recipients = body.get("recipients") or []
-    if deliver == "email" and not recipients:
-        return error("recipients required when deliver='email'", 400)
+    deliver, recipients, err = _delivery_from_body(body)
+    if err is not None:
+        return err
 
     selected, err = _selected_topic_row_ids(body)
     if err is not None:
@@ -1326,6 +1877,10 @@ def session_report_generate(conn, caller, session_id, event):
     content, err = _assemble_session_report(conn, caller, session_id, event, selected)
     if err is not None:
         return err
+
+    generate, gen_error = _generation_request(body, deliver, conn, caller)
+    if gen_error:
+        return error(gen_error, 400)
 
     request_id = uuid.uuid4().hex
     folder, date = content["folder"], content["date"]
@@ -1355,6 +1910,12 @@ def session_report_generate(conn, caller, session_id, event):
         "recipients": recipients,
         "content": content,
         "resultKey": result_key,
+        **({"generate": generate,
+            "window": _report_window(body),
+            "excludedTopics": _excluded_topics_for(
+                conn, caller, folder, date, session_id=session_id),
+            "reportFacts": _report_facts(conn, caller["company_id"], folder,
+                                         [content.get("siteId")], date)} if generate else {}),
     }
     # Lake bucket (like the reindex_requests/ chain): org-api is in-VPC and hands
     # off to the non-VPC session-report worker via an S3 request artifact (BUG-36).
@@ -1369,7 +1930,333 @@ def session_report_generate(conn, caller, session_id, event):
     s3().put_object(Bucket=LAKE_BUCKET, Key=request_key,
                     Body=json.dumps(artifact, default=str),
                     ContentType="application/json")
+    owner = _lake_company_for_session(conn, folder, date, session_id)
+    for lake_key in (request_key, result_key):
+        lake_objects.record_best_effort(
+            conn, lake_key, company_id=owner,
+            site_id=(content.get("siteId") if owner else None),
+            user_id=_lake_user_for_folder(conn, folder), source="upload")
     return ok({"status": "queued", "sessionId": session_id,
+               "requestId": request_id, "resultKey": result_key}, 202)
+
+
+def _assemble_day_report(conn, caller, date, event, selected=None):
+    """Every reportable topic of one (folder, date), across meetings. (content, None) or
+    (None, error). Scope comes from `_report_rows_in_scope` with no session, so every
+    exclusion a meeting report applies, a day report applies (spec 2026-09-15 §5.2)."""
+    if not date or not REPORT_DATE_RE.match(date):
+        return None, error("date required (YYYY-MM-DD)", 400)
+    p = event.get("queryStringParameters") or {}
+    user = (p.get("user") or "").strip()
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="day report")
+    if err is not None:
+        return None, err
+    rows = _report_rows_in_scope(conn, caller, folder, date, session_id=None, selected=selected)
+    if not rows:
+        return None, error("nothing to report for that day", 404)
+
+    # Meetings in their authoritative start order (build_day_sessions), then topics by the
+    # parsed start of their time_range, unparseable last -- never the lexical sort of the
+    # free text, never created_at (spec §8.4 of the superseded draft).
+    sessions, _excluded = build_day_sessions(conn, caller, folder, date, rows)
+    rank = {}
+    for i, s in enumerate(sessions):
+        for tid in s.get("topic_row_ids") or []:
+            rank.setdefault(tid, i)
+
+    def order(r):
+        rng = parse_time_range(r.get("time_range"))
+        return (rank.get(str(r["id"]), len(sessions)), rng is None, rng[0] if rng else 0, str(r["id"]))
+
+    rows = sorted(rows, key=order)
+    session_ids = []
+    for r in rows:
+        sid = session_scope.session_id_from_source_key(r.get("source_s3_key"))
+        if sid and sid not in session_ids:
+            session_ids.append(sid)
+    mirror_folders = sorted({parsed[0] for parsed in
+                             (session_scope.parse_extraction_key(r.get("source_s3_key")) for r in rows)
+                             if parsed})
+    site_names = sorted({r["site_name"] for r in rows if r.get("site_name")})
+    starts = [s["started_at"] for s in sessions if s.get("started_at")]
+    shaped = render_report_shape(rows, {}, date, folder, conn)
+    position = {str(r["id"]): i for i, r in enumerate(rows)}
+    topics_out = sorted(shaped["topics"],
+                        key=lambda t: position.get(str(t.get("topic_row_id")), len(position)))
+    return {
+        "scope": "day",
+        "date": date,
+        "folder": folder,
+        "title": f"{date} · {', '.join(site_names)}" if site_names else date,
+        "siteNames": site_names,
+        "siteIds": sorted({str(r["site_id"]) for r in rows if r.get("site_id")}),
+        "startedAt": min(starts) if starts else None,
+        "participants": _session_participants(rows),
+        "topics": topics_out,
+        "sessionIds": session_ids,
+        "mirrorFolders": mirror_folders,
+        "topic_row_ids": [str(r["id"]) for r in rows],
+    }, None
+
+
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def _report_facts(conn, company_id, folder, site_ids, date=None):
+    """What a generated report's details and weather sections are written from
+    (report_facts.py in the worker, which cannot reach Aurora): each site's
+    name, client and coordinates, and the recorder's name. A site of another
+    company is left out rather than trusted -- the ids come from topic rows,
+    and a merged meeting can span devices."""
+    def num(v):
+        return float(v) if v is not None else None
+    out = []
+    for sid in sorted({str(s) for s in site_ids or [] if s}):
+        row = sites.get_site(conn, sid)
+        if not row or str(row.get("company_id")) != str(company_id):
+            continue
+        out.append({"id": sid, "name": row.get("name"), "client": row.get("client"),
+                    "latitude": num(row.get("latitude")), "longitude": num(row.get("longitude"))})
+    # Global: `company_id` is the SITE's company; an external recorder's row is in their home one.
+    user = _resolve_target_user(conn, company_id, folder) or {}
+    name = " ".join((p or "").strip() for p in (user.get("first_name"), user.get("last_name"))
+                    if (p or "").strip())
+    facts = {"sites": out, "recordedBy": name or None}
+    # The company's glossary (name_aliases), site-scoped first: the worker
+    # applies it to everything a report is written from, so a corrected name
+    # is the name in the document (owner, 2026-10-02: "Tikaha" was corrected
+    # to TEKAHA and the report still said Tikaha). Fail-open, in a savepoint.
+    try:
+        with conn.transaction():
+            facts["aliases"] = [
+                {"wrong_term": a["wrong_term"], "right_term": a["right_term"]}
+                for a in aliases.list_active(conn, company_id, site_ids=[s["id"] for s in out])]
+    except Exception:
+        logger.warning("report facts: glossary unreadable for %s", folder, exc_info=True)
+    if date:
+        # The day's location markers, so the worker can put each photograph in
+        # the line naming where it was taken (lambda_session_report._place_photos).
+        # Optional: in a savepoint and fail-open, so a report is never refused
+        # for want of them.
+        try:
+            with conn.transaction():
+                marks = location_markers.for_day(conn, company_id, folder, date)
+            # `at_s` (to the second) only where extraction timed the quote.
+            facts["locations"] = [dict({"at": m.get("at"), "location": m.get("location")},
+                                       **({"at_s": m["at_s"]} if m.get("at_s") else {}))
+                                  for m in marks]
+        except Exception:
+            logger.warning("report facts: location markers unreadable for %s/%s",
+                           folder, date, exc_info=True)
+    return facts
+
+
+def _generation_request(body, deliver=None, conn=None, caller=None):
+    """The template a report is written to, resolved and validated here so a bad
+    name fails the request instead of the worker -- the caller is still on the
+    line at this point. Absent template = today's assembled report
+    (spec 2026-09-15 SS5.3).
+
+    TWO KINDS OF TEMPLATE, ONE ANSWER. A slug names a template that ships as a
+    file in this repo; a uuid names one a company wrote in the Library
+    (migration 0062). Both end up as the same body, because report_template's
+    file format IS the Library's body format -- that was the point of choosing
+    it.
+
+    THE BODY TRAVELS WITH THE REQUEST. lambda_session_report is non-VPC and
+    cannot reach Aurora, so a stored template has to be resolved HERE, in the
+    VPC, and written into the artifact. That is not a workaround: it also means
+    the artifact records the exact text the document was written to, so
+    "which template wrote this" stays answerable after the template is edited.
+    The file-backed templates are inlined the same way, so the worker has ONE
+    way of getting a body rather than two.
+
+    `deliver` (optional): the worker's generate branch never emails -- it always
+    writes `emailed: false` -- so a request that names a template AND asks for
+    email delivery is refused HERE, at the door, rather than silently producing
+    a document nobody receives."""
+    template_id = (body or {}).get("templateId")
+    if not template_id:
+        return None, None
+    if deliver == "email":
+        return None, "a generated report can only be downloaded for now"
+
+    if _UUID_RE.match(str(template_id)):
+        if conn is None or caller is None:
+            # Never fall back to the file templates on a uuid: a uuid that
+            # cannot be resolved is a stored template this caller may not see
+            # or that does not exist, and quietly writing the report to some
+            # other template would make the name in the artifact a lie.
+            return None, "no such template: %s" % template_id
+        tpl = report_templates.get_visible(conn, caller["company_id"], caller["id"], template_id)
+        if tpl is None:
+            return None, "no such template: %s" % template_id
+        raw_version = (body or {}).get("templateVersion")
+        if raw_version is None:
+            version = tpl["current_version"]
+        else:
+            try:
+                version = int(raw_version)
+            except (TypeError, ValueError):
+                return None, "templateVersion must be a number"
+        if version < 1:
+            return None, "that template has no content yet"
+        stored = report_templates.get_version(conn, template_id, version)
+        if stored is None:
+            return None, "no such template: %s v%s" % (template_id, version)
+        # WHICH KIND OF TEMPLATE THIS IS travels with the request. The worker
+        # cannot work it out for itself: a Library body and a file body are the
+        # same shape by the time they are inlined, and any marker put INSIDE the
+        # body could be typed by the customer who wrote it. Only the branch taken
+        # here knows, so only here can say.
+        return {"templateId": str(template_id), "templateVersion": version,
+                "templateName": tpl["name"], "templateBody": stored["body"],
+                "templateSource": report_template.SOURCE_LIBRARY}, None
+
+    try:
+        version = int((body or {}).get("templateVersion"))
+    except (TypeError, ValueError):
+        return None, "templateVersion must be a number"
+    try:
+        loaded = report_template.load_template(template_id, version)
+    except report_template.TemplateNotFound:
+        return None, "no such template: %s v%s" % (template_id, version)
+    return {"templateId": template_id, "templateVersion": version,
+            "templateName": loaded.get("name") or template_id,
+            "templateBody": loaded,
+            "templateSource": report_template.SOURCE_BUILTIN}, None
+
+
+def _excluded_topics_for(conn, caller, folder, date, session_id=None):
+    """The topics the report scope refuses to show -- redacted, non-work, or
+    under a deleted (tombstoned) source prefix -- with the time_range the
+    worker needs to cut them out of the transcript. Only the id and the
+    range travel: the text of a hidden topic never leaves the database, and
+    `time_range` travels as-is (fail closed: an empty/unparseable one is
+    still reported, never silently dropped).
+
+    Reads the day's topics via `_day_report_rows` (this file's existing "every
+    topic for one folder/date" call, wrapping `topics.list_topics_for_source_prefix`)
+    and applies `_redacted_or_hidden` -- the SAME rule `_report_rows_in_scope`
+    uses to drop a row, not a second hand-rolled copy of it, so the two can
+    never drift apart on what "excluded" means.
+
+    `session_id`, when given, restricts the set to that one session's topics
+    (mirroring `_report_rows_in_scope`'s own session_id filter) so a session
+    report's `excludedTopics` cannot name a topic from a different session."""
+    rows = _day_report_rows(conn, caller, folder, date)
+    if not rows:
+        return []
+    redacted = redactions.list_active_for_topics(conn, [r["id"] for r in rows])
+    deleted = _deleted_prefixes_for_rows(conn, rows, date)
+    out = []
+    for r in rows:
+        # Same first cut `_report_rows_in_scope` makes: a row that is not a
+        # recorded-speech extraction (KIND_EXTRACTION) can never correspond to
+        # anything on the transcript timeline, so it must never reach the
+        # worker's exclusion list -- an unparseable time_range on one of these
+        # would abort a request over a topic that could not have appeared in
+        # the transcript regardless.
+        sid, kind = session_scope.session_ref(r.get("source_s3_key"))
+        if kind != session_scope.KIND_EXTRACTION:
+            continue
+        if session_id is not None and sid != session_id:
+            continue
+        if _redacted_or_hidden(r, redacted, deleted):
+            out.append({"id": str(r["id"]), "time_range": r.get("time_range")})
+    return out
+
+
+def day_report_preview(conn, caller, date, event):
+    """POST /api/org/days/{date}/report/preview?user= — a whole day, read-only."""
+    selected, err = _selected_topic_row_ids(parse_body(event) or {})
+    if err is not None:
+        return err
+    content, err = _assemble_day_report(conn, caller, date, event, selected)
+    if err is not None:
+        return err
+    return ok({
+        "scope": "day",
+        "date": content["date"],
+        "title": content["title"],
+        "siteNames": content["siteNames"],
+        "startedAt": content["startedAt"],
+        "participants": content["participants"],
+        "topics": content["topics"],
+        "sessionIds": content["sessionIds"],
+        "fieldDefaults": {
+            "title": content["title"],
+            "attendees": content["participants"],
+            "date": content["date"],
+            "site": ", ".join(content["siteNames"]),
+        },
+    })
+
+
+def day_report_generate(conn, caller, date, event):
+    """POST /api/org/days/{date}/report?user= — enqueue a day report for the worker.
+
+    Same hand-off as the meeting report (in-VPC org-api writes an S3 request artifact,
+    the non-VPC worker renders it), under a `day/` key segment. The artifact names every
+    session and every folder in scope so the worker can check each against its deletion
+    mirror (Task 2)."""
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    deliver, recipients, err = _delivery_from_body(body)
+    if err is not None:
+        return err
+    selected, err = _selected_topic_row_ids(body)
+    if err is not None:
+        return err
+    content, err = _assemble_day_report(conn, caller, date, event, selected)
+    if err is not None:
+        return err
+
+    generate, gen_error = _generation_request(body, deliver, conn, caller)
+    if gen_error:
+        return error(gen_error, 400)
+
+    request_id = uuid.uuid4().hex
+    folder = content["folder"]
+    result_key = f"session_report_results/{folder}/{date}/day/{request_id}.json"
+    request_key = f"session_report_requests/{folder}/{date}/day/{request_id}.json"
+    artifact = {
+        "scope": "day",
+        "requestId": request_id,
+        "date": date,
+        "folder": folder,
+        "companyId": str(caller["company_id"]),
+        "requestedBy": str(caller["id"]),
+        "templateId": body.get("templateId"),
+        "requestedTopicRowIds": (sorted(selected) if selected else None),
+        "selectedTopicRowIds": content["topic_row_ids"],
+        "sessionIds": content["sessionIds"],
+        "mirrorFolders": content["mirrorFolders"],
+        "title": body.get("title") or content["title"],
+        "attendees": body.get("attendees") or content["participants"],
+        "fields": body.get("fields") or {},
+        "deliver": deliver,
+        "recipients": recipients,
+        "content": content,
+        "resultKey": result_key,
+        **({"generate": generate,
+            "window": _report_window(body),
+            "excludedTopics": _excluded_topics_for(conn, caller, folder, date),
+            "reportFacts": _report_facts(conn, caller["company_id"], folder,
+                                         content.get("siteIds"), date)} if generate else {}),
+    }
+    s3().put_object(Bucket=LAKE_BUCKET, Key=request_key,
+                    Body=json.dumps(artifact, default=str),
+                    ContentType="application/json")
+    day_sites = content.get("siteIds") or []
+    owner = _lake_company_for_sites(conn, day_sites)
+    one_site = (str(day_sites[0]) if owner and len({str(x) for x in day_sites}) == 1
+                else None)
+    for lake_key in (request_key, result_key):
+        lake_objects.record_best_effort(conn, lake_key, company_id=owner, site_id=one_site,
+                                        user_id=_lake_user_for_folder(conn, folder), source="upload")
+    return ok({"status": "queued", "scope": "day", "date": date,
                "requestId": request_id, "resultKey": result_key}, 202)
 
 
@@ -1403,7 +2290,7 @@ def _may_correct_speakers(conn, caller, folder):
     return folder == scope.visible_scope(conn, caller).get("self_folder")
 
 
-def _session_turns(conn, folder, date, session_base):
+def _session_turns(conn, folder, date, session_base, with_text=False, caller=None):
     """Every turn of one session, as (file, offset) pairs the embedder can cut audio with.
 
     Reads the same transcripts the viewer does and keeps only this session — a day can hold
@@ -1419,7 +2306,7 @@ def _session_turns(conn, folder, date, session_base):
     and the omission is invisible because the result is a slightly longer list.
     """
     try:
-        payload = _read_org_transcripts(date, folder, "", "", conn=conn)
+        payload = _read_org_transcripts(date, folder, "", "", conn=conn, caller=caller)
     except Exception:
         # `except Exception -> []` turns a read failure into "this session has no turns",
         # and the caller cannot tell those apart: the artifact ships with `turns: []`, the
@@ -1449,6 +2336,11 @@ def _session_turns(conn, folder, date, session_base):
                     # about turns too short for any acoustic judgement, and until now that
                     # statement never reached the layer that declines to judge them.
                     "speaker_label": seg.get("speaker_label")})
+        # Only for a reader that shows words. The embedder artifacts carry turns by the
+        # hundred and never read the text; the name-proposal dialog shows it and had
+        # nothing to show -- every passage read "No words to show" on TEST 2026-09-27.
+        if with_text:
+            out[-1]["text"] = seg.get("text")
     # WHY it is empty, when it is. An empty turn list is a legitimate outcome — a session
     # with nothing transcribed yet — and it is also what a session-id mismatch, a missing
     # `chunk_start` and an empty read all look like. Four investigations into one enrolment
@@ -1470,24 +2362,33 @@ def _session_turns(conn, folder, date, session_base):
 # A three-hour meeting exceeds it, and the failure would be a timeout at the very end with
 # nothing written, so the work is split instead. The splits are independent: each fetches its
 # own profiles and names its own turns, and no turn's answer depends on another's.
-MATCH_SECONDS_PER_RUN = float(os.environ.get("MATCH_SECONDS_PER_RUN", "3600"))
-MATCH_TURNS_PER_RUN = int(os.environ.get("MATCH_TURNS_PER_RUN", "400"))
+MATCH_SECONDS_PER_RUN = float(os.environ.get(
+    "MATCH_SECONDS_PER_RUN", str(speaker_match_request.DEFAULT_SECONDS_PER_RUN)))
+MATCH_TURNS_PER_RUN = int(os.environ.get(
+    "MATCH_TURNS_PER_RUN", str(speaker_match_request.DEFAULT_TURNS_PER_RUN)))
 
 
 def _split_for_budget(turns):
-    """Group turns into runs that fit one invocation. Never splits a turn."""
-    runs, current, seconds = [], [], 0.0
-    for t in turns:
-        dur = max(0.0, float(t.get("end_sec", 0)) - float(t.get("start_sec", 0)))
-        if current and (seconds + dur > MATCH_SECONDS_PER_RUN
-                        or len(current) >= MATCH_TURNS_PER_RUN):
-            runs.append(current)
-            current, seconds = [], 0.0
-        current.append(t)
-        seconds += dur
-    if current:
-        runs.append(current)
-    return runs
+    """Group turns into runs that fit one invocation. Never splits a turn.
+
+    The env overrides stay here -- this half is the one an operator tunes -- while the
+    arithmetic lives in `speaker_match_request` so the finalize producer splits identically.
+    """
+    return speaker_match_request.split_for_budget(
+        turns, MATCH_SECONDS_PER_RUN, MATCH_TURNS_PER_RUN)
+
+
+def _identity_fields(r):
+    """The fields that tell two same-named profiles apart, from a `list_profiles` /
+    `same_name_profiles` row. One shape for the Voices page and the naming chooser."""
+    return {
+        "linkedAccount": ({"name": r.get("linked_name"), "email": r.get("linked_email")}
+                          if r.get("user_id") else None),
+        "heardOn": list(r.get("heard_on") or [])[:3],
+        "firstNamed": {"at": _iso_day(r.get("first_named_at") or r.get("created_at")),
+                       "by": r.get("first_named_by")},
+        "employer": r.get("employer_name"),
+    }
 
 
 def list_voiceprints(conn, caller):
@@ -1510,7 +2411,8 @@ def list_voiceprints(conn, caller):
         return error("not found", 404)
     if caller["global_role"] not in _CORRECTION_ROLES:
         return error("admin, gm, pm, site_manager or platform_admin role required", 403)
-    rows = voiceprints.list_profiles(conn, str(caller["company_id"]))
+    company_id = str(caller["company_id"])
+    rows = voiceprints.list_profiles(conn, company_id)
     return ok({"voiceprints": [{
         "id": str(r["id"]),
         "displayName": r.get("display_name"),
@@ -1523,7 +2425,108 @@ def list_voiceprints(conn, caller):
         "lastAttemptAt": r.get("last_attempt_at"),
         "lastAttemptOutcome": r.get("last_attempt_outcome"),
         "lastAttemptDetail": r.get("last_attempt_detail"),
+        # Identity (spec 2026-10-01): what lets a person tell two "Ben Lin"s apart. Plain
+        # values only -- no similarity score ever reaches a customer.
+        **_identity_fields(r),
+        "mergedInto": ({"id": str(r["merged_into"]),
+                        "displayName": r.get("merged_into_name")}
+                       if r.get("merged_into") else None),
+        # Only a refused row pays for the lookup (a transcript read). Everything else is
+        # null: there is nothing to try again.
+        "retry": (_retry_passage(conn, company_id, r)
+                  if r.get("last_attempt_outcome") == "refused" else None),
     } for r in rows]})
+
+
+def _iso_day(value):
+    """A timestamp as an ISO date string, or None. Tolerates a string (test doubles)."""
+    if not value:
+        return None
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+
+def _retry_passage(conn, company_id, profile):
+    """The passage a refused profile's last human correction named, or None.
+
+    `{date, userFolder, sessionBase, sourceFilename, startSec, endSec}`. None means "cannot
+    be retried from here", never "retry something else": every step that fails to resolve
+    returns None rather than a guess, because the retry would name a person from audio
+    nobody chose.
+
+    The folder and date come from `recordings` (or the proposal rows), NOT from the turn_ref:
+    its stem starts with the device name, which is not the user's folder. The end of the
+    passage comes from the transcript turn at that offset.
+    """
+    corr = voiceprints.latest_human_correction(
+        conn, company_id, str(profile["id"]), profile.get("display_name"))
+    if not corr or "@" not in str(corr.get("turn_ref") or ""):
+        return None
+    stem, _, tail = str(corr["turn_ref"]).rpartition("@")
+    try:
+        offset = float(tail)
+    except ValueError:
+        return None
+    sid = corr.get("session_base")
+    where = recordings.locate_session(conn, company_id, sid)
+    if not where:
+        return None
+    folder, date = where
+    try:
+        turns = _session_turns(conn, folder, date, sid)
+    except Exception:
+        logger.exception("voiceprint %s: transcript unreadable for retry", profile.get("id"))
+        return None
+    want = turn_name_overlay._stem(stem)
+    # Half a second: re-extraction shifts offsets slightly (see `turn_name_overlay`), and the
+    # overlay's own join tolerates the same.
+    near = [t for t in turns
+            if turn_name_overlay._stem(t.get("source_filename")) == want
+            and abs(float(t.get("start_sec", 0)) - offset) <= 0.5]
+    if not near:
+        return None
+    t = min(near, key=lambda x: abs(float(x["start_sec"]) - offset))
+    return {"date": str(date), "userFolder": folder, "sessionBase": sid,
+            "sourceFilename": t["source_filename"], "startSec": float(t["start_sec"]),
+            "endSec": float(t["end_sec"])}
+
+
+def retry_voiceprint(conn, caller, voiceprint_id, event):
+    """POST /api/org/voiceprints/{id}/retry — store a refused voice again.
+
+    Recomputes the passage of the profile's last human correction and hands it to
+    `speaker_corrections`, exactly as `_apply_confirmed_proposal` does, so the retry is the
+    same act as the original rename (same artifact, same `source='correction'`). Nothing is
+    written here.
+
+    The company comes from the caller; a profile id from another tenant is a 404.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    company_id = str(caller["company_id"])
+    person = voiceprints.get_profile(conn, company_id, voiceprint_id)
+    if person is None or person.get("status") == "withdrawn":
+        return error("not found", 404)
+    nothing = error("There is nothing to store again for this voice: its last attempt was "
+                    "not refused, or the passage you named can no longer be found. Rename "
+                    "the speaker in a recording to try with a new passage.", 409)
+    if person.get("last_attempt_outcome") != "refused" or not person.get("display_name"):
+        return nothing
+    passage = _retry_passage(conn, company_id, person)
+    if passage is None:
+        return nothing
+    return speaker_corrections(
+        conn, caller, passage["sourceFilename"], dict(event, body=json.dumps({
+            "user": passage["userFolder"],
+            "source_filename": passage["sourceFilename"],
+            "start_sec": passage["startSec"],
+            "end_sec": passage["endSec"],
+            "display_name": person["display_name"],
+            # THIS profile, not whichever same-named one the lookup would pick: a retry
+            # concerns one known row and must never land on (or create) another.
+            "voiceprint_id": str(person["id"]),
+        })))
 
 
 def _site_for_session(conn, company_id, user_folder, date, session_base):
@@ -1541,7 +2544,13 @@ def _site_for_session(conn, company_id, user_folder, date, session_base):
     job here is done by returning None — an unresolved site means no narrowing, which is the
     behaviour before this feature and the safe direction.
     """
-    site = recordings.site_for_media(conn, company_id, user_folder, date, session_base)
+    # Project-owned tenancy P2: the rungs are scoped to the RECORDER (a live
+    # membership on the site, or the site is their own company's), not to the
+    # caller's company -- an external member's recording sits on another
+    # company's site.
+    recorder = users.get_by_folder_name_global(conn, user_folder)
+    recorder_id = recorder["id"] if recorder else None
+    site = recordings.site_for_media(conn, recorder_id, user_folder, date, session_base)
     if site:
         return site
     sid = turn_name_overlay.session_base(session_base)
@@ -1549,26 +2558,23 @@ def _site_for_session(conn, company_id, user_folder, date, session_base):
         row = meeting_session.get(conn, sid[3:] if sid.startswith("sid") else sid)
         if row and row.get("site_id"):
             found = sites.get_site(conn, row["site_id"])
-            # Re-checked, because a site from another tenant would narrow this company's
-            # pool against a roster that is not theirs.
-            if found and str(found.get("company_id")) == str(company_id):
+            # Re-checked, because a site the recorder has no relation to would narrow
+            # the pool against a roster that is not theirs.
+            if found and memberships.site_usable_by_user(conn, recorder_id, found["id"]):
                 return found
-    return recordings.site_for_day(conn, company_id, user_folder, date)
+    return recordings.site_for_day(conn, recorder_id, user_folder, date)
 
 
 def _label_map(turns):
-    """(turn_ref, source_filename, speaker_label) for every turn — no audio, no vectors.
+    """Delegates to `speaker_match_request.label_map`.
 
-    The transcriber's own grouping, in the one form the writer can act on. Sent whole rather
-    than per run because inheritance is the single thing in this chain whose answer for one
-    turn depends on ANOTHER turn — which is exactly the invariant `_split_for_budget` relies
-    on ("no turn's answer depends on another's").
+    Kept as a name because the call sites read better with it, but NOT as a second
+    implementation: `lambda_item_writer` builds the same artifact at finalize, and a map two
+    producers compute separately is a map that drifts. The hop between these two halves has
+    already dropped this exact key once, and label inheritance was then unreachable code
+    that reported success.
     """
-    return [{"turn_ref": turn_name_overlay.turn_ref(t["source_filename"],
-                                                    float(t["start_sec"])),
-             "source_filename": t["source_filename"],
-             "speaker_label": t.get("speaker_label")}
-            for t in turns or []]
+    return speaker_match_request.label_map(turns)
 
 
 def _same_company_as_folder(conn, caller, folder, what):
@@ -1605,6 +2611,31 @@ def _same_company_as_folder(conn, caller, folder, what):
             "this recording belongs to another company. Naming a speaker here would store "
             "a voiceprint under your company for a voice captured under theirs, on grounds "
             "only they can establish.", 403)
+    return None
+
+
+def _session_site_company_guard(conn, caller, folder, date, session_key, what,
+                                allow_recorder=False):
+    """None, or a 403, unless the session lies on the CALLER's company's sites.
+
+    Final review F5. `_same_company_as_folder` compares the recorder's HOME company with
+    the caller's, but a session can lie on another company's project (an external member
+    recorded it there): naming its speakers would file a voiceprint under the caller's
+    company from audio of the SITE company's people, and a regenerate would re-drive
+    extraction of someone else's project. So the company that owns the session's SITE must be
+    the caller's. platform_admin is exempt; a session on no site is the recorder's home
+    company's and passes. `allow_recorder` lets the recorder act on their own session (a
+    regenerate of their own report) -- never a voiceprint enrolment."""
+    if is_cross_company(caller["global_role"]):
+        return None
+    if allow_recorder and folder and folder == (caller.get("folder_name") or None):
+        return None
+    foreign = {c for _s, c in recordings.session_site_companies(conn, folder, date, session_key)
+               if str(c) != str(caller["company_id"])}
+    if foreign:
+        return error(
+            f"this session was recorded on another company's project, so {what} on it "
+            f"belongs to that company.", 403)
     return None
 
 
@@ -1646,7 +2677,11 @@ def speaker_match(conn, caller, session_base, event):
     if not session_key:
         return error("session id must carry its sid (…_sid<32 hex>)", 400)
 
-    turns = _session_turns(conn, folder, date_m.group(1), session_base)
+    err = _session_site_company_guard(conn, caller, folder, date_m.group(1), session_key,
+                                      "speaker match")
+    if err is not None:
+        return err
+    turns = _session_turns(conn, folder, date_m.group(1), session_base, caller=caller)
     if not turns:
         # A 202 here would promise work that cannot happen. The usual cause is a session
         # whose transcripts are not written yet, which is a wait, not a failure.
@@ -1655,13 +2690,17 @@ def speaker_match(conn, caller, session_base, event):
     label_map = _label_map(turns)
     site = _site_for_session(conn, company_id, folder, date_m.group(1), session_base)
     runs = _split_for_budget(turns)
+    # The key prefix keeps the caller's company; the lake row records the session's site
+    # company, or none when that is not certain (R2a).
+    match_owner = _lake_company_for_session(conn, folder, date_m.group(1), session_key)
     request_ids = []
     for i, group in enumerate(runs):
         request_id = uuid.uuid4().hex
         request_ids.append(request_id)
+        match_key = f"voiceprint_requests/{company_id}/{session_base}/match-{request_id}.json"
         s3().put_object(
             Bucket=LAKE_BUCKET,
-            Key=f"voiceprint_requests/{company_id}/{session_base}/match-{request_id}.json",
+            Key=match_key,
             Body=json.dumps({"op": "match", "request_id": request_id,
                              "session_base": session_key, "company_id": company_id,
                              "user_folder": folder, "date": date_m.group(1),
@@ -1681,6 +2720,10 @@ def speaker_match(conn, caller, session_base, event):
                              # removes the dependence on where the split fell.
                              "label_map": label_map}, default=str),
             ContentType="application/json")
+        lake_objects.record_best_effort(
+            conn, match_key, company_id=match_owner,
+            site_id=str(site["id"]) if (site and match_owner) else None,
+            user_id=_lake_user_for_folder(conn, folder), source="upload")
     logger.info("speaker match queued: session=%s mode=%s turns=%d runs=%d",
                 session_key, SPEAKER_IDENTITY_MODE, len(turns), len(runs))
     return ok({"requestIds": request_ids, "sessionBase": session_key,
@@ -1762,6 +2805,152 @@ def withdraw_voiceprint(conn, caller, voiceprint_id):
     removed = voiceprints.withdraw(conn, str(caller["company_id"]), voiceprint_id)
     logger.info("voiceprint withdrawn: %s (%d samples)", voiceprint_id, len(removed))
     return ok({"voiceprintId": voiceprint_id, "samplesRemoved": len(removed)})
+
+
+# Customer-facing, plain words, no numbers (spec 2026-10-01).
+_MERGE_MESSAGES = {
+    "alike": "These sound like the same person.",
+    "unsure": ("These may be the same person \u2014 recordings from different devices "
+               "can sound different."),
+}
+
+
+def _merge_message(verdict, target_name):
+    if verdict == "different":
+        return (f"These two voices sound different. Merging them could make "
+                f"{target_name or 'this person'} harder to recognise. Only merge if you are "
+                f"sure it is the same person.")
+    return _MERGE_MESSAGES[verdict]
+
+
+class _MergeFailed(Exception):
+    """Unwinds the merge transaction; carries the response to return afterwards."""
+
+    def __init__(self, response):
+        super().__init__(response.get("statusCode"))
+        self.response = response
+
+
+def _merge_pair(conn, caller, source_id, target_id):
+    """Shared gate for merge-check and merge: mode, role, shapes, both live in the caller's
+    company. Returns `(company_id, source, target, None)` or `(None, None, None, response)`.
+
+    A profile from another tenant and one that does not exist are both 404 -- telling them
+    apart would confirm the existence of another company's row.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return None, None, None, error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return None, None, None, error(
+            "admin, gm, pm, site_manager or platform_admin role required", 403)
+    if not _UUID_RE.match(str(source_id or "")):
+        return None, None, None, error("not found", 404)
+    if not _UUID_RE.match(str(target_id or "")):
+        return None, None, None, error("into must be a voiceprint id", 400)
+    if str(source_id).lower() == str(target_id).lower():
+        return None, None, None, error("a voice cannot be merged into itself", 400)
+    company_id = str(caller["company_id"])
+    source = voiceprints.get_profile(conn, company_id, source_id)
+    target = voiceprints.get_profile(conn, company_id, target_id)
+    if (source is None or source.get("status") == "withdrawn"
+            or target is None or target.get("status") == "withdrawn"):
+        return None, None, None, error("not found", 404)
+    return company_id, source, target, None
+
+
+def merge_check_voiceprint(conn, caller, voiceprint_id, event):
+    """GET /api/org/voiceprints/{id}/merge-check?into={target} — do these sound alike?
+
+    Advice for a person who is about to decide, in plain words. The similarity behind it is
+    deliberately not in the response: a number invites a threshold of the reader's own, and
+    the labelled set it was calibrated on is small. Writes nothing.
+    """
+    into = ((event.get("queryStringParameters") or {}).get("into") or "").strip()
+    company_id, source, target, bad = _merge_pair(conn, caller, voiceprint_id, into)
+    if bad:
+        return bad
+    check = voiceprints.merge_check(conn, company_id, voiceprint_id, into)
+    return ok({"verdict": check["verdict"],
+               "message": _merge_message(check["verdict"], target.get("display_name"))})
+
+
+def merge_voiceprint(conn, caller, voiceprint_id, event):
+    """POST /api/org/voiceprints/{id}/merge {into, confirm} — fold this profile into another.
+
+    Two voices that sound different are refused with a 409 unless `confirm` is exactly true:
+    merging them would make the target harder to recognise for everyone, and it is the one
+    step here that cannot be cleanly undone (the samples move).
+
+    ONE transaction. `lambda_handler` opens the connection with `with get_connection() as
+    conn`, which COMMITS on a clean exit -- so a `return error()` from inside the block would
+    commit whatever ran before it. Failure therefore raises out of `conn.transaction()` (a
+    savepoint) to roll it back, and the response is built after the unwind.
+    """
+    body = parse_body(event)
+    if body is None:
+        return error("invalid JSON body", 400)
+    into = str(body.get("into") or "").strip()
+    company_id, source, target, bad = _merge_pair(conn, caller, voiceprint_id, into)
+    if bad:
+        return bad
+    try:
+        with conn.transaction():
+            check = voiceprints.merge_check(conn, company_id, voiceprint_id, into)
+            if check["verdict"] == "different" and body.get("confirm") is not True:
+                raise _MergeFailed(error(
+                    _merge_message("different", target.get("display_name")), 409,
+                    {"verdict": "different"}))
+            try:
+                result = voiceprints.merge_profiles(
+                    conn, company_id, voiceprint_id, into, caller["id"])
+            except voiceprints.MergeRefused:
+                raise _MergeFailed(error("not found", 404))
+    except _MergeFailed as exc:
+        return exc.response
+    logger.info("voiceprint merged: %s -> %s (%s)", voiceprint_id, into, result)
+    # A merge is the one gesture that moves a whole other profile's samples in at once, and
+    # merging is allowed against a "these sound different" warning. Re-judge the combined
+    # set so a wrong merge degrades into a few set-aside samples instead of a profile whose
+    # mean matches nobody. Its own transaction, after the merge committed: a failure here
+    # must not undo what the person asked for.
+    set_aside = None
+    try:
+        with conn.transaction():
+            q = voiceprints.requarantine_profile(conn, company_id, into)
+        set_aside = q.get("quarantined", 0)
+        if set_aside:
+            logger.info("quarantine after merge into %s: %s", into, q)
+    except Exception:
+        logger.exception("quarantine after merge into %s failed; the merge stands", into)
+    return ok({"mergedInto": into, "samplesMoved": result["samplesMoved"],
+               "samplesDropped": result["samplesDropped"], "samplesSetAside": set_aside})
+
+
+def rename_voiceprint(conn, caller, voiceprint_id, event):
+    """PATCH /api/org/voiceprints/{id} {displayName} — so two real Ben Lins can be told apart.
+
+    Updates the profile and the name on the turns it justified, by `voiceprint_id` only, in
+    one transaction. Trimmed, 1-80 characters.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    if not _UUID_RE.match(str(voiceprint_id or "")):
+        return error("not found", 404)
+    body = parse_body(event)
+    if body is None:
+        return error("invalid JSON body", 400)
+    name = body.get("displayName")
+    name = name.strip() if isinstance(name, str) else ""
+    if not 1 <= len(name) <= 80:
+        return error("displayName must be 1 to 80 characters", 400)
+    company_id = str(caller["company_id"])
+    with conn.transaction():
+        found = voiceprints.rename_profile(conn, company_id, voiceprint_id, name)
+    if not found:
+        return error("not found", 404)
+    return ok({"voiceprintId": voiceprint_id, "displayName": name})
 
 
 def company_voiceprint_basis(conn, caller, event):
@@ -1876,6 +3065,398 @@ def _employer_result(name, source, profile):
             "source": profile.get("employer_source")}
 
 
+def list_name_proposals(conn, caller, event):
+    """GET /api/org/name-proposals — whose voices are waiting to be confirmed.
+
+    Two shapes from one route, because the bell and the dialog want different things and
+    making the bell pay for the dialog's work would put a transcript read on every page load.
+
+    Without `?voiceprint=`: a count per person. Cheap -- one grouped query, no transcript
+    touched -- which is what a badge polled from every page has to be.
+
+    With `?voiceprint=<id>`: that person's top candidates WITH the words, which means reading
+    the session transcripts. Only on opening the dialog, and only for the handful shown.
+
+    The passage text is the point of the second shape. A row that says
+    `spk_1 @ 2026-09-22 / 41.2s` is an identifier, not a question -- nobody can answer it
+    without listening first, and most people will not. The transcriber's words are wrong
+    often enough to be useless as an answer and right often enough to place the passage,
+    which is exactly what is needed to decide whether it is worth playing.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    company_id = str(caller["company_id"])
+    qs = event.get("queryStringParameters") or {}
+    vp = (qs.get("voiceprint") or "").strip()
+
+    if not vp:
+        people = speaker_name_proposals.pending_by_person(conn, company_id)
+        return ok({"people": [{"voiceprintId": r["voiceprint_id"],
+                               "displayName": r["display_name"],
+                               "pending": int(r["pending"]),
+                               "newest": r["newest"]} for r in people],
+                   "total": sum(int(r["pending"]) for r in people),
+                   # A count, same query shape as `people` above -- no transcript
+                   # touched. Added here rather than folded into `total` because the
+                   # frontend's badge component already reads `total` and a client-side
+                   # arithmetic change is exactly the kind of edit that silently drops a
+                   # field (memory: "ui-api-layer-whitelists-request-body").
+                   "introductions": speaker_intro_suggestions.pending_count(conn, company_id),
+                   # Voices whose last save was refused this week -- one grouped count,
+                   # no transcript. Same reason as `introductions` for being its own key.
+                   "notSaved": voiceprints.refused_recently_count(conn, company_id)})
+
+    rows = speaker_name_proposals.pending_for_person(
+        conn, company_id, vp, limit=PROPOSAL_PAGE)
+    # Transcripts are read per SESSION, not per candidate: several candidates routinely come
+    # from one session, and a naive loop would fetch the same transcript five times.
+    cache, out = {}, []
+    for r in rows:
+        sid = (r["session_base"], r["user_folder"], str(r["session_date"]))
+        if sid not in cache:
+            try:
+                cache[sid] = _session_turns(conn, sid[1], sid[2], sid[0], with_text=True,
+                                            caller=caller)
+            except Exception:
+                logger.exception("proposal %s: could not read its transcript", r["id"])
+                cache[sid] = []
+        # The LONGEST turn of that cluster, the same one a confirmation would mark -- so the
+        # words shown are the words of the passage the decision actually lands on.
+        turns = [t for t in cache[sid]
+                 if t.get("source_filename") == r["source_filename"]
+                 and t.get("speaker_label") == r["speaker_label"]]
+        best = max(turns, key=lambda t: float(t.get("end_sec", 0)) - float(t.get("start_sec", 0)),
+                   default=None)
+        out.append({
+            "id": r["id"], "sessionBase": r["session_base"], "date": str(r["session_date"]),
+            # The folder is what turns this passage into a playable key
+            # (`audio_segments/{folder}/{date}/{stem}.wav`). Without it the dialog can show
+            # the words and never the voice -- and the voice is what is being judged.
+            "userFolder": r["user_folder"],
+            "sourceFilename": r["source_filename"], "speakerLabel": r["speaker_label"],
+            "score": None if r.get("score") is None else round(float(r["score"]), 3),
+            # Absent rather than empty when the transcript could not be read: "no words" and
+            # "we could not look" are different, and only one of them is worth retrying.
+            "text": (best or {}).get("text"),
+            "startSec": (best or {}).get("start_sec"),
+            "endSec": (best or {}).get("end_sec"),
+        })
+    return ok({"voiceprintId": vp, "proposals": out})
+
+
+def decide_name_proposal(conn, caller, proposal_id, event):
+    """POST /api/org/name-proposals/{id} — a human answers one proposed name.
+
+    Body: `{"decision": "confirmed" | "rejected"}`.
+
+    **`confirmed` does not write a name here. It delegates to `speaker_corrections`**, and
+    that delegation is the single most load-bearing line in this feature.
+
+    The reason is a string. `lambda_voiceprint_writer` stores
+    `source="correction" if asserted else "correction_propagation"`, and
+    `recompute_company_floor` counts ONLY `source='correction'` -- deliberately, because a
+    floor calibrated from the system's own guesses would lower its own bar every time it
+    was wrong. Twenty of those rows is what a company needs before `decide_name` can return
+    `confirmed` at all. So this queue's entire purpose is to produce them.
+
+    A confirmation written straight to the database here would name the person correctly,
+    render correctly, satisfy the user, and contribute **nothing** -- and every test would
+    be green, because nothing about the outcome would look wrong. Going through the
+    correction endpoint is what makes a confirmation the same act as a rename, which is the
+    act the calibration counts. It is pinned by a seam test for exactly that reason.
+
+    `rejected` records the judgement and writes no name. A rejection is information: it
+    says "this is not that person", which stays true however many times the cluster is
+    recomputed, and it is why the candidate never comes back.
+
+    **There is no third value.** Closing the popup is not a decision and must not reach
+    this route -- the row stays `pending` and the bell carries it. A dismissal that
+    consumed the candidate would burn, silently and five at a time, the human decisions the
+    company's floor is built from.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    body = parse_body(event) or {}
+    decision = (body.get("decision") or "").strip().lower()
+    if decision not in ("confirmed", "rejected"):
+        return error("decision must be 'confirmed' or 'rejected'; closing the dialog is "
+                     "not a decision and leaves the proposal pending", 400)
+
+    company_id = str(caller["company_id"])
+    # Company from the caller, never the path -- a valid uuid from another tenant would
+    # otherwise be a button that names people in their recordings.
+    # ONE transaction for the decision and the correction it delegates to. `decide` flips
+    # the row out of `pending`; if the correction is then refused, a committed flip leaves a
+    # proposal that says `confirmed` while nothing was named -- and, no longer pending, it
+    # can never be answered again. That is what the 400 above did on TEST 2026-09-27.
+    try:
+        with conn.transaction():
+            row = speaker_name_proposals.decide(conn, company_id, proposal_id, decision,
+                                                decided_by=caller["id"])
+            if row is None:
+                # Already answered, or not this company's. Both are "there is nothing here
+                # for you to decide", and telling them apart would confirm the existence of
+                # another tenant's row.
+                return error("no pending proposal with that id", 404)
+            if decision == "rejected":
+                return ok({"proposalId": row["id"], "decision": "rejected"})
+            resp = _apply_confirmed_proposal(conn, caller, company_id, row, event)
+            if int(resp.get("statusCode", 500)) >= 300:
+                raise _ConfirmationNotApplied(resp)
+            return resp
+    except _ConfirmationNotApplied as exc:
+        return exc.response
+
+
+class _ConfirmationNotApplied(Exception):
+    """The delegated correction was refused -- undo the proposal's decision with it."""
+
+    def __init__(self, response):
+        super().__init__(response.get("statusCode"))
+        self.response = response
+
+
+def _apply_confirmed_proposal(conn, caller, company_id, row, event):
+    """Turn a confirmed proposal into the correction a rename would have made."""
+    person = voiceprints.get_profile(conn, company_id, row["voiceprint_id"])
+    if person is None or not person.get("display_name"):
+        return error("the proposed profile has no name to apply", 409)
+
+    # Off the ROW, not re-derived. `speaker_label_groups` carries neither, and resolving
+    # them at decision time would make answering an old proposal depend on data that may
+    # have moved since it was offered.
+    folder, date = row["user_folder"], str(row["session_date"])
+
+    # WHICH passage to mark. A cluster is many turns; the correction endpoint marks one
+    # window and lets propagation spread it over the voice. The LONGEST turn is chosen
+    # because it carries the most evidence for the enrolment the correction may also
+    # trigger -- the homogeneity guard refuses thin windows, and picking the first turn
+    # would hand it whichever passage happened to be transcribed first.
+    turns = [t for t in _session_turns(conn, folder, date, row["session_base"], caller=caller)
+             if t.get("source_filename") == row["source_filename"]
+             and t.get("speaker_label") == row["speaker_label"]]
+    if not turns:
+        return error("that proposal's passage is no longer in the transcript", 409)
+    best = max(turns, key=lambda t: float(t.get("end_sec", 0)) - float(t.get("start_sec", 0)))
+
+    # The delegation. Same handler, same artifact, same `source='correction'` on the row
+    # that lands -- see `decide_name_proposal`'s docstring for why nothing may shortcut it.
+    # The SESSION ID is the passage's own filename, not `row["session_base"]`. The row
+    # stores the canonical key (`sid<32 hex>`), which carries no date, and
+    # `speaker_corrections` refuses a session id without one. Measured on TEST
+    # 2026-09-27: "Yes, it's them" returned 400 and named nobody. The filename carries
+    # both the date and the sid, and it is what the transcript viewer's own rename sends.
+    return speaker_corrections(conn, caller, row["source_filename"], dict(event, body=json.dumps({
+        "user": folder,
+        "source_filename": row["source_filename"],
+        "start_sec": best["start_sec"],
+        "end_sec": best["end_sec"],
+        "display_name": person["display_name"],
+        # The proposal is about ONE known profile; pass it so the name cannot attach to a
+        # different same-named one (spec 2026-10-01).
+        "voiceprint_id": str(row["voiceprint_id"]),
+    })))
+
+
+def list_name_suggestions(conn, caller, event):
+    """GET /api/org/name-suggestions — pending self-introductions, straight off the rows.
+
+    One shape only, unlike `/name-proposals`: every field the dialog needs (`heard_name`,
+    `quote`, the ingredients of the audio key) is already ON the row --
+    `speaker_intro_suggestions` carries the words `speaker_name_proposals` does not,
+    because there is no enrolled voice yet to look the words up against. No transcript
+    read, same reason as the proposals badge: this is polled/opened often enough that an
+    S3 round trip per row would be a real cost, and there is nothing here it would buy.
+
+    Plain words only, no scores -- the customer rule the design doc states up front. This
+    body has no place a score could even go.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    company_id = str(caller["company_id"])
+    rows = speaker_intro_suggestions.pending(conn, company_id, limit=SUGGESTION_PAGE)
+
+    def _roster_names(r):
+        # Consumer 3 (plan correction 5): the intro dialog prefers roster names for the
+        # prefill ("Petrus Pang" heard -> "Petros Pan", who signed in today). No fuzzy
+        # matching here -- that is a UI choice -- just the day's names for this
+        # suggestion's session's site, or [] when the site cannot be resolved (the same
+        # safe absence `_site_for_session`'s own docstring documents).
+        site = _site_for_session(conn, company_id, r["user_folder"], str(r["session_date"]),
+                                 r["session_base"])
+        if not site:
+            return []
+        return [row["display_name"] for row in
+                site_attendance.for_day(conn, company_id, str(site["id"]),
+                                        str(r["session_date"]))]
+
+    return ok({"suggestions": [{
+        "id": r["id"], "heardName": r["heard_name"], "companyName": r.get("company_name"),
+        "quote": r["quote"], "date": str(r["session_date"]), "userFolder": r["user_folder"],
+        "sessionBase": r["session_base"], "sourceFilename": r["source_filename"],
+        "speakerLabel": r["speaker_label"], "startSec": r["start_sec"],
+        "endSec": r["end_sec"], "createdAt": r["created_at"],
+        "rosterNames": _roster_names(r),
+    } for r in rows]})
+
+
+def decide_name_suggestion(conn, caller, suggestion_id, event):
+    """POST /api/org/name-suggestions/{id} — a human says "yes, that's a name" or "no".
+
+    Body: `{"decision": "confirmed" | "rejected", "display_name"?: string}`.
+
+    **Same delegation as `decide_name_proposal`, for the same reason.** `confirmed` does
+    not write a name here -- it builds a `speaker_corrections` call, because
+    `recompute_company_floor` counts only `source='correction'` rows, and a confirmation
+    written any other way would name the person correctly, satisfy the user and calibrate
+    nothing.
+
+    `display_name` lets a person fix what the transcriber misheard ("Petros Pan" ->
+    "Petrus Pang", the design doc's own example) before it reaches a biometric store --
+    absent, the row's own `heard_name` is used. Present but blank after `.strip()` is
+    refused: silently falling back to `heard_name` there would name someone the caller
+    just tried to clear.
+
+    `rejected` records the judgement and writes no name -- the introduction is not
+    re-offered, same as a rejected proposal. There is no third value: closing the dialog
+    must leave the row `pending` for the bell.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    body = parse_body(event) or {}
+    decision = (body.get("decision") or "").strip().lower()
+    if decision not in ("confirmed", "rejected"):
+        return error("decision must be 'confirmed' or 'rejected'; closing the dialog is "
+                     "not a decision and leaves the suggestion pending", 400)
+
+    raw_name = body.get("display_name")
+    if raw_name is not None and not raw_name.strip():
+        return error("display_name must not be empty", 400)
+
+    company_id = str(caller["company_id"])
+    # ONE transaction for the decision and the correction it delegates to, same reason as
+    # `decide_name_proposal`: a committed 'confirmed' flip whose correction is then
+    # refused would leave a row that claims a decision was made and named nobody, and --
+    # no longer pending -- could never be answered again.
+    try:
+        with conn.transaction():
+            row = speaker_intro_suggestions.decide(conn, company_id, suggestion_id, decision,
+                                                   decided_by=caller["id"])
+            if row is None:
+                return error("no pending suggestion with that id", 404)
+            if decision == "rejected":
+                return ok({"suggestionId": row["id"], "decision": "rejected"})
+            resp = _apply_confirmed_suggestion(
+                conn, caller, company_id, row,
+                (raw_name.strip() if raw_name is not None else None), event)
+            if int(resp.get("statusCode", 500)) >= 300:
+                raise _ConfirmationNotApplied(resp)
+            return resp
+    except _ConfirmationNotApplied as exc:
+        return exc.response
+
+
+def _apply_confirmed_suggestion(conn, caller, company_id, row, display_name, event):
+    """Turn a confirmed introduction into the correction a rename would have made."""
+    name = display_name or row["heard_name"]
+    folder, date = row["user_folder"], str(row["session_date"])
+
+    # The cluster's LONGEST turn, same rule and same reason as `_apply_confirmed_proposal`
+    # (spec correction 5): the introduction itself is often under the ~10 s the homogeneity
+    # guard needs to judge, and picking the intro's own turn would hand the enrolment less
+    # evidence than the meeting actually gives it.
+    turns = [t for t in _session_turns(conn, folder, date, row["session_base"], caller=caller)
+             if t.get("source_filename") == row["source_filename"]
+             and t.get("speaker_label") == row["speaker_label"]]
+    if turns:
+        best = max(turns, key=lambda t: float(t.get("end_sec", 0)) - float(t.get("start_sec", 0)))
+        start_sec, end_sec = best["start_sec"], best["end_sec"]
+    else:
+        # Unlike a name proposal, this is not an error: the suggestion's own detected
+        # window is at least 3 s (self_introduction.find's floor) -- short of the
+        # homogeneity guard's enrolment floor, but still enough for propagation to run.
+        start_sec, end_sec = row["start_sec"], row["end_sec"]
+
+    # The delegation, and the same session-id rule `_apply_confirmed_proposal` states:
+    # the passage's own filename, which carries the date and the sid, not
+    # `row["session_base"]` (the canonical key, which carries neither).
+    return speaker_corrections(conn, caller, row["source_filename"], dict(event, body=json.dumps({
+        "user": folder,
+        "source_filename": row["source_filename"],
+        "start_sec": start_sec,
+        "end_sec": end_sec,
+        "display_name": name,
+    })))
+
+
+def same_name_voiceprints(conn, caller, event):
+    """GET /api/org/voiceprints/same-name?name=&user= -- would naming this person be ambiguous?
+
+    Spec 2026-10-01. Before a correction is sent the naming panel asks this; when `ask` is
+    true it shows the profiles and lets the namer say which one it is, or "someone else".
+    Writes nothing.
+
+    Authorised exactly as `speaker_corrections` authorises: the folder resolve, then a
+    correction role or the caller's own recording, then the same-company check -- whoever may
+    name a speaker may ask who the name could mean.
+
+    `wouldUse` is what the correction would attach to if sent as it is now: the SAME lookup
+    (`voiceprints.find_existing_profile`), with the caller as asserter and the directory
+    resolution of the name as the user. `ask` is false only when the answer is already
+    certain: no profile of that name (a new one is made), or exactly one and it is the one
+    the lookup would use. Two or more, or one the lookup would NOT use (a duplicate is about
+    to be made), is a question.
+    """
+    if SPEAKER_IDENTITY_MODE == "off":
+        return error("not found", 404)
+    qs = event.get("queryStringParameters") or {}
+    # Collapsed exactly as `speaker_corrections` collapses it. Trimming alone left "ben   LIN"
+    # unresolvable to Ben's account here while the save resolved it, so the check asked a
+    # question the save would never have needed (seen on TEST 2026-10-01).
+    name = voiceprints.collapse_name(qs.get("name"))
+    if not name:
+        return error("name is required", 400)
+    folder, err = _resolve_org_media_folder(conn, caller, (qs.get("user") or "").strip(),
+                                            what="same-name check")
+    if err is not None:
+        return err
+    if not _may_correct_speakers(conn, caller, folder):
+        return error("naming a speaker needs an admin, gm, pm, site_manager or "
+                     "platform_admin role, or your own recording", 403)
+    err = _same_company_as_folder(conn, caller, folder, "same-name check")
+    if err is not None:
+        return err
+    company_id = str(caller["company_id"])
+    rows = voiceprints.same_name_profiles(conn, company_id, name)
+    person, _matched_on = users.resolve_display_name(conn, company_id, name)
+    found = voiceprints.find_existing_profile(
+        conn, company_id, name, str(person["id"]) if person else None, str(caller["id"]))
+    would_use = str(found["id"]) if found else None
+    ids = [str(r["id"]) for r in rows]
+    ask = len(rows) >= 2 or (len(rows) == 1 and would_use != ids[0])
+
+    def _card(r):
+        return {"id": str(r["id"]), "displayName": r.get("display_name"),
+                **_identity_fields(r), "lastHeard": _iso_day(r.get("last_heard"))}
+
+    # Near spellings ("Sam Wu" for "Sam Yu"): suggested, never merged (spec 2026-10-01 s3).
+    similar = voiceprints.similar_name_profiles(conn, company_id, name, exclude_ids=ids)
+    return ok({
+        "profiles": [_card(r) for r in rows],
+        "similar": [_card(r) for r in similar],
+        "wouldUse": would_use,
+        "ask": ask,
+    })
+
+
 def speaker_corrections(conn, caller, session_base, event):
     """POST /api/org/sessions/{session_base}/speaker-corrections
 
@@ -1943,7 +3524,25 @@ def speaker_corrections(conn, caller, session_base, event):
         return error("employer_ref is not accepted yet: it is the sign-in register's key and "
                      "nothing reads it until that adapter ships", 400)
 
-    name = (body.get("display_name") or "").strip()
+    # The two answers to "which same-name person?" (spec 2026-10-01); at most one. They only
+    # matter inside the enrol branch below -- with enrolment off no profile is touched, so
+    # there is nothing to choose between and they are ignored rather than refused (the
+    # propagation half works on audio alone and is the same either way).
+    chosen_id = body.get("voiceprint_id") or None
+    new_person = body.get("new_person") is True
+    if chosen_id is not None and body.get("new_person") not in (None, False):
+        return error("voiceprint_id and new_person are mutually exclusive: it is either "
+                     "this person or someone else with the same name", 400)
+    if chosen_id is not None:
+        try:
+            chosen_id = str(uuid.UUID(str(chosen_id)))
+        except ValueError:
+            return error("voiceprint_id must be a profile id", 400)
+
+    # Trimmed AND internal whitespace collapsed: "ben  lin" is typed spacing, never part of
+    # the name. Case is left alone here -- when the name lands on an existing profile the
+    # profile's own spelling replaces this below (spec 2026-10-01 s2).
+    name = voiceprints.collapse_name(body.get("display_name"))
     if not name:
         return error("display_name is required", 400)
     src = (body.get("source_filename") or "").strip()
@@ -1989,6 +3588,10 @@ def speaker_corrections(conn, caller, session_base, event):
     session_key = turn_name_overlay.session_base(session_base)
     if not session_key:
         return error("session id must carry its sid (…_sid<32 hex>)", 400)
+    err = _session_site_company_guard(conn, caller, folder, date_m.group(1), session_key,
+                                      "naming a speaker")
+    if err is not None:
+        return err
 
     # Enrolment is the OTHER half, and it is opt-in because it is the half that stores
     # biometric data. Propagating a name inside one meeting compares audio the company
@@ -2034,25 +3637,46 @@ def speaker_corrections(conn, caller, session_base, event):
             # a string cannot be narrowed by site, and two people sharing a name land on one
             # profile — an identity is the stabler key.
             person, matched_on = users.resolve_display_name(conn, company_id, name)
-            profile = voiceprints.upsert_profile(
-                conn, company_id, display_name=name,
-                consent_given=not attest,
-                consented_by=body.get("consented_by"),
-                # The claim and who made it, kept apart from the subject. `asserted_by` is
-                # the caller; `consented_by` stays empty on this path because nobody has
-                # said the subject agreed — putting the caller there would make every row
-                # in the table ambiguous about which of the two it records.
-                consent_basis=company_basis if attest else "confirmed",
-                # WHO invoked the company's basis on this occasion. Under `notice` the basis
-                # itself is the induction, not this person's word — but the row still records
-                # which account acted, because "the company had a policy" and "somebody
-                # applied it to this recording" are different facts and an audit needs both.
-                asserted_by=str(caller["id"]) if attest else None,
-                user_id=str(person["id"]) if person else None,
-                linked_by=str(caller["id"]) if person else None,
-                linked_on=matched_on if person else None,
-                employer_name=employer_name, employer_source=employer_source,
-                employer_set_by=str(caller["id"]) if employer_name else None)
+            if chosen_id is not None:
+                # "It is this one": no lookup. It must be a live, consented profile of THIS
+                # company -- never another tenant's, never a withdrawn one, never an
+                # unconsented shell. No account link: the profile keeps whatever link it
+                # has, because two profiles linked to one user is worse than none.
+                profile = voiceprints.get_consented_live_profile(conn, company_id, chosen_id)
+                if profile is None:
+                    return error("voiceprint_id is not a live, consented profile of this "
+                                 "company", 400)
+                if employer_name is not None:
+                    voiceprints.set_employer(conn, company_id, chosen_id, employer_name,
+                                             employer_source, str(caller["id"]))
+                person, matched_on = None, "profile-chosen"
+            else:
+                # "Someone else with this name" always inserts. The directory user is linked
+                # only when they have no live profile yet -- a second profile on one account
+                # is the duplicate the chooser exists to prevent.
+                if new_person and person and voiceprints.user_has_live_profile(
+                        conn, company_id, str(person["id"])):
+                    person, matched_on = None, "has-profile"
+                profile = voiceprints.upsert_profile(
+                    conn, company_id, display_name=name,
+                    force_new=new_person,
+                    consent_given=not attest,
+                    consented_by=body.get("consented_by"),
+                    # The claim and who made it, kept apart from the subject. `asserted_by` is
+                    # the caller; `consented_by` stays empty on this path because nobody has
+                    # said the subject agreed — putting the caller there would make every row
+                    # in the table ambiguous about which of the two it records.
+                    consent_basis=company_basis if attest else "confirmed",
+                    # WHO invoked the company's basis on this occasion. Under `notice` the basis
+                    # itself is the induction, not this person's word — but the row still records
+                    # which account acted, because "the company had a policy" and "somebody
+                    # applied it to this recording" are different facts and an audit needs both.
+                    asserted_by=str(caller["id"]) if attest else None,
+                    user_id=str(person["id"]) if person else None,
+                    linked_by=str(caller["id"]) if person else None,
+                    linked_on=matched_on if person else None,
+                    employer_name=employer_name, employer_source=employer_source,
+                    employer_set_by=str(caller["id"]) if employer_name else None)
         except ValueError as exc:
             return error(str(exc), 400)
         _linked_person, _linked_on = person, matched_on
@@ -2061,8 +3685,15 @@ def speaker_corrections(conn, caller, session_base, event):
         # when there was one, and the employer update runs after that row was fetched — so
         # the object in hand carries the previous employer, not the one just stored.
         profile_row = voiceprints.get_profile(conn, company_id, str(profile["id"]))
+        # One spelling per person: when the profile is an existing one (lookup hit or chosen
+        # `voiceprint_id`) its display name travels to the embedder and back, not the typed
+        # string. A new profile was just inserted with the typed (collapsed) name, so this
+        # is a no-op for it. Only the stored/propagated name changes -- the directory
+        # resolution above already ran on what was typed.
+        if profile_row and profile_row.get("display_name"):
+            name = profile_row["display_name"]
 
-    session_turns = _session_turns(conn, folder, date_m.group(1), session_base)
+    session_turns = _session_turns(conn, folder, date_m.group(1), session_base, caller=caller)
     request_id = uuid.uuid4().hex
     artifact = {
         "request_id": request_id,
@@ -2082,14 +3713,22 @@ def speaker_corrections(conn, caller, session_base, event):
         "label_map": _label_map(session_turns),
         "enrol": enrol,
     }
+    correction_key = f"voiceprint_requests/{company_id}/{session_base}/{request_id}.json"
     s3().put_object(Bucket=LAKE_BUCKET,
-                    Key=f"voiceprint_requests/{company_id}/{session_base}/{request_id}.json",
+                    Key=correction_key,
                     Body=json.dumps(artifact, default=str),
                     ContentType="application/json")
+    lake_objects.record_best_effort(
+        conn, correction_key,
+        company_id=_lake_company_for_session(conn, folder, date_m.group(1), session_key),
+        user_id=_lake_user_for_folder(conn, folder), source="upload")
     logger.info("speaker correction queued: session=%s mode=%s turns=%d",
                 session_base, SPEAKER_IDENTITY_MODE, len(artifact["turns"]))
     return ok({
         "requestId": request_id,
+        # The name that was stored and sent to the embedder: the profile's own when the
+        # correction landed on an existing one, else the typed name.
+        "displayName": name,
         # Named separately because they carry different consent obligations, and because a
         # user who was told "done" deserves to know which of the two they got.
         "propagation": "queued",
@@ -2117,6 +3756,12 @@ def speaker_corrections(conn, caller, session_base, event):
         "employer": _employer_result(employer_name, employer_source, profile_row),
         "linkReason": None if _linked_person else _linked_on,
     }, 202)
+
+
+def _is_removed_spelling(session_id, removed):
+    """Both spellings: the mirror holds whatever base the delete endpoint had."""
+    bare = session_id[3:] if session_id.startswith("sid") else session_id
+    return session_id in removed or bare in removed or ("sid" + bare) in removed
 
 
 def _session_was_removed(session_id, folder, date) -> bool:
@@ -2153,8 +3798,83 @@ def _session_was_removed(session_id, folder, date) -> bool:
     `pending`, #627). Loud, and nothing served, is both safe and visible.
     """
     removed = deletion_mirror.deleted_sessions_strict(s3(), S3_BUCKET, folder, date)
-    bare = session_id[3:] if session_id.startswith("sid") else session_id
-    return session_id in removed or bare in removed or ("sid" + bare) in removed
+    return _is_removed_spelling(session_id, removed)
+
+
+def _without_vendor_metadata(doc):
+    """A copy of `doc` with `_report_metadata['model']` removed, if present.
+
+    Used only at the point a report/minutes JSON is about to leave the
+    building verbatim (the `/timeline` byte-identical S3 fallback). The
+    stored S3 object -- and the debug record beside it -- keep the model
+    name; only the copy handed to the HTTP response loses it."""
+    meta = doc.get("_report_metadata")
+    if not isinstance(meta, dict) or "model" not in meta:
+        return doc
+    doc = dict(doc)
+    meta = dict(meta)
+    meta.pop("model", None)
+    doc["_report_metadata"] = meta
+    return doc
+
+
+def _presign_report_doc(doc_key, folder, date, result):
+    """Presign the generated document, served under a name a person can read.
+
+    The browser names a download after the last segment of the URL, and these
+    keys end in the requestId -- so every report ever downloaded arrived as a
+    uuid. `ResponseContentDisposition` overrides that at serve time. The KEY IS
+    UNCHANGED: nothing about the storage layout, the deletion mirror or any
+    object already written moves, because this is a header the object is served
+    with, not a property of the object.
+
+    Non-Latin folder names survive intact (report_download_name carries the
+    real name on RFC 6266's `filename*`); the ASCII fallback beside it is built
+    by replacement, never by stripping. Building the name must never be the
+    reason a finished report cannot be handed over, so a failure here falls
+    back to the bare presign -- a uuid filename, which is what this endpoint
+    did for its whole life -- and says so loudly enough to be found.
+    """
+    params = {"Bucket": LAKE_BUCKET, "Key": doc_key}
+    try:
+        params["ResponseContentDisposition"] = report_download_name.content_disposition(
+            report_download_name.display_name(
+                folder, result.get("templateId"), result.get("templateVersion"), date,
+                template_name=result.get("templateName")))
+    except Exception:
+        logger.exception("could not build a download name for %s; serving it unnamed", doc_key)
+    return s3().generate_presigned_url(
+        "get_object", Params=params, ExpiresIn=PRESIGNED_URL_EXPIRY)
+
+
+def _generation_provenance(result):
+    """Echo the worker's generation provenance -- which template wrote the
+    document -- when the result carries it. `promptChars` is internal noise,
+    not provenance, and is deliberately left out. So is `model`: the worker's
+    result JSON (an internal record, same as the report/minutes debug record)
+    carries which LLM wrote the document, but this endpoint is a customer-
+    facing API response, and a customer-facing surface must not name the
+    vendor or model. The template fields stay -- they are ours, not a
+    vendor's.
+
+    The assembled path (no template named in the request) never sets `generated`,
+    so this returns {} and the caller's response gains no new keys -- today's
+    three-key shape for that path is unchanged."""
+    if not result.get("generated"):
+        return {}
+    return {k: result[k] for k in ("generated", "templateId", "templateVersion")
+            if k in result}
+
+
+def _session_out_of_reach(conn, caller, folder, date, session_id):
+    """Whether a folder+sid keyed lake object (brief, rolling summary, report result)
+    belongs to a session the caller may not see: the whitelist of `_SessionHider` applied
+    to one session (final review F7). The person themself and platform_admin are never
+    restricted."""
+    hider = _session_hider(conn, caller, folder, date)
+    if hider is None:
+        return False
+    return hider.hides(turn_name_overlay.session_base(session_id or ""))
 
 
 def session_report_status(conn, caller, session_id, event):
@@ -2184,6 +3904,8 @@ def session_report_status(conn, caller, session_id, event):
     if _session_was_removed(session_id, folder, date):
         logger.info("report status: %s was deleted -- not served", session_id)
         return ok({"status": "removed"})
+    if _session_out_of_reach(conn, caller, folder, date, session_id):
+        return error("not found", 404)
 
     result_key = f"session_report_results/{folder}/{date}/{session_id}/{request_id}.json"
     try:
@@ -2195,10 +3917,342 @@ def session_report_status(conn, caller, session_id, event):
     result = json.loads(obj["Body"].read().decode("utf-8"))
     status = result.get("status")
     if status == "done" and result.get("docKey"):
-        url = s3().generate_presigned_url(
-            "get_object", Params={"Bucket": LAKE_BUCKET, "Key": result["docKey"]},
-            ExpiresIn=PRESIGNED_URL_EXPIRY)
-        return ok({"status": "done", "docUrl": url, "emailed": bool(result.get("emailed"))})
+        url = _presign_report_doc(result["docKey"], folder, date, result)
+        return ok({"status": "done", "docUrl": url, "emailed": bool(result.get("emailed")),
+                   **_generation_provenance(result)})
+    if status == "error":
+        return ok({"status": "error", "error": result.get("error")})
+    return ok({"status": status or "pending"})
+
+
+def _any_session_removed(session_ids, folders, date):
+    """STRICT, like `_session_was_removed`: an unreadable mirror raises."""
+    for folder in folders:
+        removed = deletion_mirror.deleted_sessions_strict(s3(), S3_BUCKET, folder, date)
+        if any(_is_removed_spelling(sid, removed) for sid in session_ids):
+            return True
+    return False
+
+
+# ---- the day's report photographs: which to leave out ----------------------------
+#
+# Owner, 2026-10-01: up to 60 photographs go into a report at page size, up to
+# 120 shrunk automatically; past 120 the person chooses what to leave out
+# (report_photos). The choice is kept for the day in S3, where both report
+# paths read it -- the nightly generator runs outside the VPC.
+
+_SELECTION_WRITE_ROLES = ("admin", "gm", "platform_admin")
+
+
+def get_day_inspections(conn, caller, date, event):
+    """GET /api/org/days/{date}/inspections?user= -- the checks spoken that day
+    (voice-triggered checklists): each with its window to the second and the
+    checklist template it matched, for the report dialog to offer in one
+    click. Read like the day's media: whoever may see that person's day."""
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    user = ((event.get("queryStringParameters") or {}).get("user") or "").strip()
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="inspections")
+    if err is not None:
+        return err
+    company = _read_company(caller, folder)
+    rows = inspection_windows.for_day(conn, company, folder, date)
+    return ok({"date": date, "folder": folder, "inspections": [
+        dict(r, id=str(r["id"]),
+             template_id=str(r["template_id"]) if r.get("template_id") else None)
+        for r in rows]})
+
+
+_WINDOW_CLOCK_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$")
+
+
+def _report_window(body):
+    """The report's time window: 'HH:MM' or 'HH:MM:SS' each end (a spoken
+    check is timed to the second), else the whole day. A malformed end is the
+    whole day too, never a crash in the worker that parses it."""
+    frm, to = body.get("from") or "00:00", body.get("to") or "23:59"
+    if not _WINDOW_CLOCK_RE.match(str(frm)):
+        frm = "00:00"
+    if not _WINDOW_CLOCK_RE.match(str(to)):
+        to = "23:59"
+    window = {"from": frm, "to": to}
+    # An interrupted check is several stretches (owner, 2026-10-05): the report
+    # covers each and not the gaps. All-or-nothing: one bad stretch and the
+    # window is the plain from-to above.
+    segs = body.get("segments")
+    if isinstance(segs, list) and 1 < len(segs) <= 20:
+        clean = []
+        for sg in segs:
+            if not isinstance(sg, dict):
+                break
+            a, b = str(sg.get("from") or ""), str(sg.get("to") or "")
+            if not (_WINDOW_CLOCK_RE.match(a) and _WINDOW_CLOCK_RE.match(b)) or                     _hms_len(a) >= _hms_len(b) or (clean and _hms_len(a) < _hms_len(clean[-1]["to"])):
+                break
+            clean.append({"from": a, "to": b})
+        else:
+            window = {"from": clean[0]["from"], "to": clean[-1]["to"], "segments": clean}
+    return window
+
+
+def _hms_len(clock):
+    """'HH:MM[:SS]' -> seconds of the day (validated by _WINDOW_CLOCK_RE first)."""
+    parts = [int(x) for x in clock.split(":")]
+    return parts[0] * 3600 + parts[1] * 60 + (parts[2] if len(parts) > 2 else 0)
+
+
+def _checklist_report_status(result_key):
+    """pending | done | error | removed-free status of one auto report, read off
+    the worker's result (no presign here -- the download goes through
+    /days/{date}/report/status, which re-checks deletions first)."""
+    try:
+        obj = s3().get_object(Bucket=LAKE_BUCKET, Key=result_key)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in _LAKE_NOT_FOUND_CODES:
+            return "pending", None
+        raise
+    result = json.loads(obj["Body"].read().decode("utf-8"))
+    return result.get("status") or "pending", result.get("error")
+
+
+def _checklist_report_payload(r):
+    status, err = _checklist_report_status(r["result_key"])
+    return {"id": str(r["id"]), "date": str(r.get("report_date") or ""),
+            "checkName": r["check_name"], "templateName": r["template_name"],
+            "templateId": str(r["template_id"]) if r.get("template_id") else None,
+            "startAt": r["start_at"], "endAt": r.get("end_at"),
+            "segments": r.get("segments"), "requestId": r["request_id"],
+            "status": status, "error": err}
+
+
+def _unmatched_checks(rows):
+    return [{"checkName": r["name"], "startAt": r["start_at"], "endAt": r.get("end_at"),
+             "kind": r.get("kind")} for r in rows if not r.get("template_id")]
+
+
+def get_day_checklist_reports(conn, caller, date, event):
+    """GET /api/org/days/{date}/checklist-reports?user= -- the checklist
+    reports made on their own from that day's spoken checks (checklist_reports),
+    each with its status, and the checks no checklist template matched (owner,
+    2026-10-06: those are a notice, never a report on the wrong form). Read
+    like the day's media."""
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    user = ((event.get("queryStringParameters") or {}).get("user") or "").strip()
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="checklist reports")
+    if err is not None:
+        return err
+    company = _read_company(caller, folder)
+    rows = checklist_reports.for_day(conn, company, folder, date)
+    checks = inspection_windows.for_day(conn, company, folder, date)
+    return ok({"date": date, "folder": folder,
+               "reports": [_checklist_report_payload(r) for r in rows],
+               "unmatched": _unmatched_checks(checks)})
+
+
+def get_recent_checklist_reports(conn, caller, event):
+    """GET /api/org/checklist-reports/recent -- for the bell: the CALLER's own
+    checklist reports of today and yesterday, and their unmatched checks. Own
+    folder only, like the photo notice."""
+    folder = scope.visible_scope(conn, caller).get("self_folder")
+    if not folder:
+        return ok({"reports": [], "unmatched": []})
+    today = nz_time.nz_today()
+    since = (today - timedelta(days=1)).isoformat()
+    rows = checklist_reports.recent_for_folder(conn, caller["company_id"], folder, since)
+    unmatched = []
+    for day in (today - timedelta(days=1), today):
+        for c in _unmatched_checks(inspection_windows.for_day(
+                conn, caller["company_id"], folder, day.isoformat())):
+            unmatched.append(dict(c, date=day.isoformat()))
+    return ok({"folder": folder, "reports": [_checklist_report_payload(r) for r in rows],
+               "unmatched": unmatched})
+
+
+def _photo_selection_folder(conn, caller, date, event, write=False):
+    """(folder, None) or (None, error). Reading follows the media rule; choosing
+    is for the person who took them, or a company admin -- the photographs are
+    withheld from site-scoped callers on someone else's day (CRITICAL-1), so
+    they cannot be the ones to choose among them."""
+    if not date or not REPORT_DATE_RE.match(date):
+        return None, error("date required (YYYY-MM-DD)", 400)
+    user = ((event.get("queryStringParameters") or {}).get("user") or "").strip()
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="photos")
+    if err is not None:
+        return None, err
+    own = folder == scope.visible_scope(conn, caller).get("self_folder")
+    if not own and caller.get("global_role") not in _SELECTION_WRITE_ROLES:
+        return None, error("only the person who took the photographs, or an admin, "
+                           "can choose which go into the day's reports", 403)
+    return folder, None
+
+
+def _photo_selection_body(conn, caller, folder, date, excluded):
+    photos = _day_photo_block(conn, caller, folder, date) or []
+    try:
+        with conn.transaction():
+            markers = location_markers.for_day(
+                conn, _read_company(caller, folder),
+                folder, date)
+    except Exception:
+        logger.warning("photo selection: markers unreadable for %s/%s", folder, date, exc_info=True)
+        markers = []
+    items = []
+    for p in photos:
+        name = p["s3_key"].rsplit("/", 1)[-1]
+        hhmm = photo_binding.photo_hhmm(name)
+        items.append({"filename": name, "time": hhmm,
+                      "place": photo_binding.place_at(markers, photo_binding.photo_time(name)),
+                      "excluded": name in excluded,
+                      "url": s3().generate_presigned_url(
+                          "get_object", Params={"Bucket": LAKE_BUCKET, "Key": p["s3_key"]},
+                          ExpiresIn=PRESIGNED_URL_EXPIRY)})
+    included = sum(1 for i in items if not i["excluded"])
+    return {"date": date, "folder": folder, "photos": items,
+            "limits": {"pageSize": report_photos.STANDARD_LIMIT, "max": report_photos.MAX_LIMIT},
+            "included": included,
+            "shrunk": included > report_photos.STANDARD_LIMIT,
+            "mustChoose": included > report_photos.MAX_LIMIT}
+
+
+def get_photo_selection(conn, caller, date, event):
+    """GET /api/org/days/{date}/photos/selection?user= -- the day's photographs,
+    which are left out of its reports, and whether a choice is needed."""
+    folder, err = _photo_selection_folder(conn, caller, date, event)
+    if err is not None:
+        return err
+    excluded = report_photos.read_excluded(s3(), LAKE_BUCKET, folder, date)
+    return ok(_photo_selection_body(conn, caller, folder, date, excluded))
+
+
+# A heads-up before the size changes, then a call to choose (owner, 2026-10-01).
+PHOTO_NOTICE_AT = 50
+
+
+def get_photo_notice(conn, caller, event):
+    """GET /api/org/photos/notice -- for the bell: whether the CALLER's own
+    photographs today (or yesterday, before its nightly report) cross a line.
+
+    Only the person who took them is told (owner, 2026-10-01), so this reads
+    the caller's own folder and nothing else -- no `user` parameter. Levels:
+      approaching  50-60 today: past 60 they go in smaller
+      smaller      61-120 today: they go in smaller, all of them fit
+      choose       past 120 (today or yesterday): choose which to leave out
+    """
+    folder = scope.visible_scope(conn, caller).get("self_folder")
+    if not folder:
+        return ok({"notices": []})
+    today = nz_time.nz_today()
+    notices = []
+    for day, choose_only in ((today, False), (today - timedelta(days=1), True)):
+        date = day.isoformat()
+        photos = _day_photo_block(conn, caller, folder, date) or []
+        if len(photos) < PHOTO_NOTICE_AT and not choose_only:
+            continue
+        if not photos:
+            continue
+        excluded = report_photos.read_excluded(s3(), LAKE_BUCKET, folder, date)
+        included = sum(1 for p in photos if p["s3_key"].rsplit("/", 1)[-1] not in excluded)
+        if included > report_photos.MAX_LIMIT:
+            level = "choose"
+        elif choose_only:
+            continue
+        elif included > report_photos.STANDARD_LIMIT:
+            level = "smaller"
+        else:
+            level = "approaching"
+        notices.append({"date": date, "folder": folder, "count": len(photos),
+                        "included": included, "level": level})
+    return ok({"notices": notices,
+               "limits": {"pageSize": report_photos.STANDARD_LIMIT,
+                          "max": report_photos.MAX_LIMIT}})
+
+
+def put_photo_selection(conn, caller, date, event):
+    """PUT /api/org/days/{date}/photos/selection?user= {"excluded": [filename]} --
+    replaces the day's choice. Every name must be one of the day's photographs."""
+    folder, err = _photo_selection_folder(conn, caller, date, event, write=True)
+    if err is not None:
+        return err
+    body = parse_body(event)
+    if body is None or not isinstance(body.get("excluded"), list) or \
+            not all(isinstance(n, str) for n in body["excluded"]):
+        return error("excluded must be a list of filenames", 400)
+    day = {p["s3_key"].rsplit("/", 1)[-1] for p in (_day_photo_block(conn, caller, folder, date) or [])}
+    unknown = sorted(set(body["excluded"]) - day)
+    if unknown:
+        return error("not a photograph of this day: %s" % ", ".join(unknown[:5]), 400)
+    excluded = sorted(set(body["excluded"]))
+    s3().put_object(Bucket=LAKE_BUCKET, Key=report_photos.selection_key(folder, date),
+                    Body=json.dumps({"excluded": excluded, "updatedBy": str(caller["id"]),
+                                     "updatedAt": nz_time.nz_now().isoformat()}).encode(),
+                    ContentType="application/json")
+    # Day-level document of one folder: the day may span companies, so unknown (R2a).
+    lake_objects.record_best_effort(
+        conn, report_photos.selection_key(folder, date), company_id=None,
+        user_id=_lake_user_for_folder(conn, folder), source="upload")
+    return ok(_photo_selection_body(conn, caller, folder, date, set(excluded)))
+
+
+def _day_sessions_out_of_reach(conn, caller, folders, date, session_ids):
+    """Whether a day report names a session the caller may not see (R1 whitelist, F7).
+
+    Each session id is judged by the hiders of the folders the report covers: it is out of
+    reach when ANY folder's hider has it on a site outside the caller's reach, or when NO
+    folder's hider lets it through (site-less and the caller is not of the recorder's home
+    company)."""
+    all_h = [_session_hider(conn, caller, f, date) for f in folders]
+    hiders = [h for h in all_h if h is not None]
+    free = len(hiders) < len(all_h)   # one folder is the caller's own / platform_admin's
+    for s in session_ids:
+        sid = turn_name_overlay.session_base(s) or s
+        if any(sid in h.outside for h in hiders):
+            return True
+        if not free and all(h.hides(sid) for h in hiders):
+            return True
+    return False
+
+
+def day_report_status(conn, caller, date, event):
+    """GET /api/org/days/{date}/report/status?user=&requestId= — poll a day report.
+
+    The result names every session and folder in scope (Task 2). Each is re-checked
+    against the deletion mirrors before a URL is presigned, because a presign outlives
+    the check that produced it."""
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date required (YYYY-MM-DD)", 400)
+    p = event.get("queryStringParameters") or {}
+    user = (p.get("user") or "").strip()
+    request_id = (p.get("requestId") or "").strip()
+    if not _REQUEST_ID_RE.match(request_id):
+        return error("requestId required", 400)
+    folder, err = _resolve_org_media_folder(conn, caller, user, what="day report status")
+    if err is not None:
+        return err
+
+    result_key = f"session_report_results/{folder}/{date}/day/{request_id}.json"
+    try:
+        obj = s3().get_object(Bucket=LAKE_BUCKET, Key=result_key)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+            return ok({"status": "pending"})
+        raise
+    result = json.loads(obj["Body"].read().decode("utf-8"))
+    status = result.get("status")
+    if status == "done" and result.get("docKey"):
+        session_ids = [s for s in (result.get("sessionIds") or []) if s]
+        folders = [f for f in (result.get("mirrorFolders") or []) if f] or [folder]
+        if not session_ids:
+            logger.error("day report %s: result names no sessions -- not served", request_id)
+            return ok({"status": "error", "error": "report result is incomplete"})
+        if _any_session_removed(session_ids, folders, date):
+            logger.info("day report %s: a session in it was deleted -- not served", request_id)
+            return ok({"status": "removed"})
+        if _day_sessions_out_of_reach(conn, caller, folders, date, session_ids):
+            logger.info("day report %s: names a session outside the caller's reach", request_id)
+            return error("not found", 404)
+        url = _presign_report_doc(result["docKey"], folder, date, result)
+        return ok({"status": "done", "docUrl": url, "emailed": bool(result.get("emailed")),
+                   **_generation_provenance(result)})
     if status == "error":
         return ok({"status": "error", "error": result.get("error")})
     return ok({"status": status or "pending"})
@@ -2229,6 +4283,8 @@ def session_rolling(conn, caller, session_id, event):
     if _session_was_removed(session_id, folder, date):
         logger.info("rolling: %s was deleted -- not served", session_id)
         return ok({"status": "removed"})
+    if _session_out_of_reach(conn, caller, folder, date, session_id):
+        return error("not found", 404)
 
     key = f"session_rolling/{folder}/{date}/{session_id}/latest.json"
     try:
@@ -2244,6 +4300,133 @@ def session_rolling(conn, caller, session_id, event):
         "openTodos": data.get("open_todos", []),
         "updatedAt": data.get("updated_at"),
     })
+
+
+# Spec 2026-10-07 D6: what the web shows when a final extraction could not run, and the
+# Expedite button. State lives in the extraction_pending/ marker (written by extract-session,
+# re-driven by the backlog lambda); org-api only reads it and stamps the expedite request.
+# org-api is in-VPC with S3 as its only outward door, so the notice to the alert topic is
+# the backlog lambda's job (its 5-minute run sees the stamp).
+EXPEDITE_COOLDOWN = timedelta(minutes=10)
+PENDING_LIST_CAP = 50
+PENDING_SCAN_CAP = 500
+
+
+def _pending_base(session_id):
+    sid = (session_id or "").strip()
+    if not re.match(r"^[A-Za-z0-9_-]{1,100}$", sid):
+        return None
+    return sid if sid.startswith("sid") else f"sid{sid}"
+
+
+def sessions_pending(conn, caller, event):
+    """GET /api/org/sessions/pending?date=YYYY-MM-DD -- the caller's OWN recordings of that
+    day whose final extraction is still failing. `promised_only` markers are not failures
+    (nothing has gone wrong yet) and are left out. time_range is null when the marker has
+    none; the UI shows the session without a range."""
+    date = ((event.get("queryStringParameters") or {}).get("date") or "").strip()
+    try:
+        if not REPORT_DATE_RE.match(date):
+            raise ValueError(date)
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        return error("date required (YYYY-MM-DD)", 400)
+    folder = (caller.get("folder_name") or "").strip()
+    if not folder:
+        return ok({"sessions": []})
+    out, scanned = [], 0
+    token = None
+    while len(out) < PENDING_LIST_CAP and scanned < PENDING_SCAN_CAP:
+        kw = {"Bucket": LAKE_BUCKET, "Prefix": extraction_pending.PENDING_PREFIX}
+        if token:
+            kw["ContinuationToken"] = token
+        page = s3().list_objects_v2(**kw)
+        for obj in page.get("Contents") or []:
+            scanned += 1
+            try:
+                m = json.loads(s3().get_object(Bucket=LAKE_BUCKET, Key=obj["Key"])["Body"]
+                               .read().decode("utf-8"))
+            except Exception:
+                logger.warning("pending: unreadable marker %s", obj["Key"], exc_info=True)
+                continue
+            if (not isinstance(m, dict) or m.get("promised_only")
+                    or m.get("userFolder") != folder or m.get("date") != date):
+                continue
+            out.append({"session_id": m.get("sessionBase"), "date": m.get("date"),
+                        "time_range": m.get("time_range"),
+                        "first_failed_at": m.get("first_failed_at"),
+                        "attempts": int(m.get("attempts") or 0),
+                        "expedited_at": m.get("expedite_requested_at")})
+            if len(out) >= PENDING_LIST_CAP or scanned >= PENDING_SCAN_CAP:
+                break
+        if not page.get("IsTruncated"):
+            break
+        token = page.get("NextContinuationToken")
+    out.sort(key=lambda r: r.get("first_failed_at") or "")
+    return ok({"sessions": out})
+
+
+def session_expedite(conn, caller, session_id):
+    """POST /api/org/sessions/{session_id}/expedite -- ask for the failed extraction to be
+    re-driven now. Only the recording's owner: a marker that is someone else's, absent or
+    `promised_only` all answer 404, so the route does not reveal which sessions exist.
+    Within 10 minutes of the last request: 429 with retry_after_s.
+
+    Concurrency: the marker write is conditional on the ETag just read (S3 If-Match), one
+    re-read on a lost race. If the SDK in the runtime predates If-Match the write is plain
+    last-writer-wins -- the backlog lambda can overwrite a field it read a moment earlier, which costs
+    at worst a repeated notice or a request that must be made again."""
+    base = _pending_base(session_id)
+    folder = (caller.get("folder_name") or "").strip()
+    if not base or not folder:
+        return error("not found", 404)
+    key = extraction_pending.marker_key(base)
+    now = datetime.now(timezone.utc)
+    for _ in range(2):
+        try:
+            obj = s3().get_object(Bucket=LAKE_BUCKET, Key=key)
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404"):
+                return error("not found", 404)
+            raise
+        etag = obj.get("ETag")
+        m = json.loads(obj["Body"].read().decode("utf-8"))
+        if m.get("promised_only") or m.get("userFolder") != folder:
+            return error("not found", 404)
+        last = extraction_pending.parse_iso(m.get("expedite_requested_at"))
+        if last and now - last < EXPEDITE_COOLDOWN:
+            wait = int((EXPEDITE_COOLDOWN - (now - last)).total_seconds())
+            return error("already expedited", 429, {"retry_after_s": max(wait, 1)})
+        stamp = extraction_pending.iso(now)
+        name = " ".join(p for p in (caller.get("first_name"), caller.get("last_name")) if p)
+        company = (companies.get_company_by_id(conn, caller["company_id"])
+                   if caller.get("company_id") else None) or {}
+        m.update(expedite=True, expedite_requested_at=stamp,
+                 expedite_by=caller.get("cognito_sub"),
+                 expedite_by_name=name or caller.get("email") or "",
+                 expedite_by_company=company.get("name") or "",
+                 next_attempt_at=stamp)
+        m.pop("expedite_notified_at", None)
+        body = json.dumps(m, ensure_ascii=False)
+        try:
+            kw = {"IfMatch": etag} if etag else {}
+            s3().put_object(Bucket=LAKE_BUCKET, Key=key, Body=body,
+                            ContentType="application/json", **kw)
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") in (
+                    "PreconditionFailed", "ConditionalRequestConflict"):
+                continue                      # someone else wrote it: re-read once
+            raise
+        except ParamValidationError:
+            # boto3 older than conditional writes: last-writer-wins.
+            s3().put_object(Bucket=LAKE_BUCKET, Key=key, Body=body,
+                            ContentType="application/json")
+        lake_objects.record_best_effort(
+            conn, key,
+            company_id=_lake_company_for_session(conn, folder, m.get("date"), base),
+            user_id=_lake_user_for_folder(conn, folder), source="upload")
+        return ok({"ok": True, "expedited_at": stamp})
+    return error("marker changed while expediting, try again", 409)
 
 
 # Shape kept stable for a client reading a brief written before a field existed.
@@ -2270,9 +4453,18 @@ def session_brief_read(conn, caller, session_id, event):
     and neither is an error.
 
     Returned whole rather than filtered. Every field in it was produced for a reader — the
-    quote is what makes a bullet checkable, `at` is what makes it findable in the transcript,
-    and `why` is the field the to-do list was missing. Trimming here would repeat the mistake
-    that made this endpoint necessary.
+    quote is what makes a bullet checkable, `at` is what makes it findable in the transcript.
+    As of 2026-09-17 a task is `{text, at, assignee, due}` and nothing else. `why` is GONE --
+    not moved, not kept for direct readers -- and `basis` with it: the per-item context line
+    was dropped by decision in favour of a `text` that carries its own context, and the basis
+    now only decides that sentence's verb (spec §3.1/§3.3, commits B1/B3).
+
+    An earlier version of this paragraph said `why` "still lives on this same artifact's raw
+    `tasks[]`". That was true for exactly one commit, between B1 and B3, and false afterwards.
+    It cost real work: it is the most authoritative-looking sentence in this file, and a client
+    author read it and built a fixture around a field the writer had stopped producing -- which
+    is invisible until the mock is switched off. A docstring that describes a shape is a
+    promise about the writer, so it is wrong the moment the writer changes.
     """
     p = event.get("queryStringParameters") or {}
     date, user = p.get("date"), (p.get("user") or "").strip()
@@ -2289,6 +4481,8 @@ def session_brief_read(conn, caller, session_id, event):
     if _session_was_removed(sid, folder, date):
         logger.info("brief: %s was deleted -- not served", sid)
         return ok({"status": "removed"})
+    if _session_out_of_reach(conn, caller, folder, date, sid):
+        return error("not found", 404)
 
     key = f"session_brief/{folder}/{date}/{sid}/latest.json"
     try:
@@ -2352,6 +4546,10 @@ def create_voice_upload_url(conn, caller, body):
     if str(site_id) not in _allowed_site_ids(conn, caller):
         return error("site not accessible", 403)
     key = _voice_s3_key(caller["company_id"], site_id, caller["id"], ext)
+    # A8: a voice clip belongs to the SITE's company (the key prefix keeps the caller's).
+    lake_objects.record_best_effort(
+        conn, key, company_id=_lake_company_for_sites(conn, [site_id]),
+        site_id=site_id, user_id=caller["id"], source="upload")
     # NOTE: no voice_messages insert here — sendVoice (Task 6) is the sole writer
     # of the row (created when the clip is actually sent). An abandoned recording
     # thus leaves at most an orphan S3 object, reaped by the 30-day voice/ lifecycle.
@@ -2390,6 +4588,113 @@ def list_site_voice(conn, caller, site_id, event):
               "createdAt": r["created_at"].isoformat() if hasattr(r["created_at"], "isoformat") else str(r["created_at"])}
              for r in rows]
     return ok({"items": items, "site": str(site_id)})
+
+
+# ----------------------------------------------------------
+# /sites/{id}/attendance — the `manual` roster source (on-site-roster plan, Task 5)
+# ----------------------------------------------------------
+_ATTENDANCE_NAME_CAP = 50
+
+
+def _serialize_attendance_row(r):
+    return {"id": str(r["id"]), "displayName": r["display_name"],
+           "employerName": r.get("employer_name"), "source": r["source"],
+           "resolved": {"userId": str(r["user_id"]) if r.get("user_id") else None,
+                        "voiceprintId": str(r["voiceprint_id"])
+                        if r.get("voiceprint_id") else None}}
+
+
+def list_site_attendance(conn, caller, site_id, event):
+    """GET /api/org/sites/{id}/attendance?date=YYYY-MM-DD — the day's roster, any source.
+
+    Any member may read (unlike the write side, which needs a correction role): a roster
+    that is visible only to managers cannot do what consumer 3 (the intro dialog's prefill)
+    needs, since it renders for whoever is naming a speaker.
+    """
+    if str(site_id) not in _allowed_site_ids(conn, caller):
+        return error("access denied to this site", 403)
+    params = event.get("queryStringParameters") or {}
+    date = params.get("date")
+    if date is not None and not REPORT_DATE_RE.match(date):
+        return error("date must be YYYY-MM-DD", 400)
+    if not date:
+        # The client's own NZ calendar day, never datetime.now().date() (BUG-37) — a UTC
+        # date would answer for a day that, in NZ, has not started or already ended.
+        date = nz_time.nz_today().isoformat()
+    rows = site_attendance.for_day(conn, caller["company_id"], site_id, date)
+    return ok({"site": str(site_id), "date": date,
+              "rows": [_serialize_attendance_row(r) for r in rows]})
+
+
+def create_site_attendance(conn, caller, site_id, event):
+    """POST /api/org/sites/{id}/attendance — a site manager lists today's people.
+
+    `manual` ships first in the roadmap because it needs no third party (spec: "ships
+    first, proves the consumer") — this is that surface. Role gate mirrors every other
+    correction-adjacent write in this file (`_CORRECTION_ROLES`); the site ACL is the same
+    `_allowed_site_ids` every other site-scoped route uses.
+    """
+    if str(site_id) not in _allowed_site_ids(conn, caller):
+        return error("access denied to this site", 403)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    date = body.get("date") or nz_time.nz_today().isoformat()
+    if not isinstance(date, str) or not REPORT_DATE_RE.match(date):
+        return error("date must be YYYY-MM-DD", 400)
+    names = body.get("names")
+    if not isinstance(names, list) or not names:
+        return error("names must be a non-empty list", 400)
+    if len(names) > _ATTENDANCE_NAME_CAP:
+        return error(f"at most {_ATTENDANCE_NAME_CAP} names per request", 400)
+    rows = []
+    for n in names:
+        if not isinstance(n, dict):
+            return error("each name must be an object", 400)
+        display_name = (n.get("displayName") or "").strip()
+        if not display_name:
+            return error("displayName must not be blank", 400)
+        rows.append({"displayName": display_name, "employerName": n.get("employerName")})
+    with conn.transaction():
+        # Company from the CALLER, never the body -- a body-supplied company id would let
+        # one tenant write another's roster (the same rule every write endpoint in this
+        # file follows for the same reason).
+        result = site_attendance.upsert(conn, caller["company_id"], site_id, date, rows,
+                                        source="manual", created_by=caller["id"])
+    listing = site_attendance.for_day(conn, caller["company_id"], site_id, date)
+    return ok({"inserted": result["inserted"], "updated": result["updated"],
+              "rows": [_serialize_attendance_row(r) for r in listing]})
+
+
+def delete_site_attendance(conn, caller, site_id, row_id, event):
+    """DELETE /api/org/sites/{id}/attendance/{rowId}?date=YYYY-MM-DD — manual rows only.
+
+    A connector row (Phase 2/3) is the source's own to remove or overwrite on its next
+    sync (plan correction 7); deleting one here would be silently undone, with nothing on
+    screen explaining why it came back. 409, not a silent no-op, so the caller can tell
+    "removed" from "refused" — the same reason a `return error(...)` here never looks like
+    success.
+    """
+    if str(site_id) not in _allowed_site_ids(conn, caller):
+        return error("access denied to this site", 403)
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    params = event.get("queryStringParameters") or {}
+    date = params.get("date")
+    if not date or not REPORT_DATE_RE.match(date):
+        return error("date must be YYYY-MM-DD", 400)
+    rows = site_attendance.for_day(conn, caller["company_id"], site_id, date)
+    row = next((r for r in rows if str(r["id"]) == str(row_id)), None)
+    if row is None:
+        return error("not found", 404)
+    if row["source"] != "manual":
+        return error("only a manual row may be removed here; a connector row is the "
+                     "source's own to remove or overwrite on its next sync", 409)
+    with conn.transaction():
+        n = site_attendance.remove(conn, caller["company_id"], site_id, date, row_id)
+    return ok({"removed": n})
 
 
 def create_qr_login_code(conn, caller, event):
@@ -2512,6 +4817,13 @@ def get_me(conn, caller):
     else:
         site_ids = memberships.accessible_site_ids(
             conn, caller["id"], caller["global_role"])
+    # A project the caller was added to as an EXTERNAL member is somewhere they can
+    # record (capture accepts any live membership, project-owned tenancy P2) even when
+    # their read reach does not include it -- an admin/gm's reach is their own company's
+    # sites. Pickers read this list, so without the union an external member could not
+    # choose the project at all (TEST 2026-10-09). Reads stay clipped server-side.
+    site_ids = sorted({str(x) for x in site_ids} | set(
+        memberships.caller_site_roles(conn, caller["id"]).keys()))
     # Strip the request-scoped visible_scope memo (MINOR-1) before echoing the
     # caller profile -- it's an internal cache, not part of the /me contract.
     profile = {k: v for k, v in caller.items() if k != "_visible_scope"}
@@ -2723,10 +5035,24 @@ def patch_org_site(conn, caller, site_id, body):
             return error("name must be a non-empty string", 400)
         name = name.strip()
     icon = body.get("icon_s3_key")
+    final_icon = None
     if icon is not None:
         pending_prefix = f"{ORG_ASSETS_PREFIX}pending/{caller['cognito_sub']}/"
         if not isinstance(icon, str) or not icon.startswith(pending_prefix):
             return error(f"icon_s3_key must be your pending upload ({pending_prefix}…)", 400)
+        # Relocate BEFORE any DB write, the ordering patch_me documents.
+        # This ran AFTER update_site and (once a move was possible) after
+        # move_site_company, and `with conn:` COMMITS on a clean exit --
+        # `error(...)` is a return, not a raise. So a failed relocate
+        # returned 400 while the name edit, and the company move, had
+        # already committed: the caller was told to re-upload and the site
+        # had silently changed tenant. A failure here now costs at most one
+        # unreferenced object in pending/ -- a retry re-uploads -- which is
+        # the tradeoff patch_me already makes for the same reason.
+        final_icon = (f"{ORG_ASSETS_PREFIX}site-icons/{site_id}/"
+                      f"{icon.rsplit('/', 1)[-1]}")
+        if not _relocate_asset(icon, final_icon):
+            return error("upload expired or missing — please re-upload the image", 400)
     lat, lat_err = _coerce_coord(body.get("latitude"), -90.0, 90.0, "latitude")
     if lat_err:
         return lat_err
@@ -2740,11 +5066,66 @@ def patch_org_site(conn, caller, site_id, body):
     # hits 0 rows -> 404 (mirrors the Team/sites cross-company fix in #96 and
     # patch_action_item).
     scope_company_id = caller["company_id"]
+    target = None
     if is_cross_company(caller["global_role"]):
         target = sites.get_site(conn, site_id)
         if target is None:
             return error("site not found", 404)
         scope_company_id = target["company_id"]
+    # Moving a site to another company: the SAME gate as create_org_site's
+    # target_company_id (only is_cross_company roles, target must exist). As in
+    # create_org_site, a value equal to the caller's own company is a no-op for
+    # everyone else (non-cross callers stay pinned to it). A cross-company
+    # caller's own company is NOT special -- moving a site INTO it is a real
+    # move -- so for them "unchanged" means equal to the site's current company.
+    # The scope above is unchanged and still decides which site is reachable;
+    # the move runs only after the scoped update matched, so it cannot widen reach.
+    move_to = None
+    req_company_id = body.get("target_company_id")
+    # NORMALISED before every comparison and before it reaches the DB. A
+    # raw string compare made `ABC-...` a different company from
+    # `abc-...`: the same company in a different case read as a real move,
+    # which then found the site ITSELF in the "target" company and
+    # returned a false 409 -- and gave a non-cross caller a 403 where
+    # create_org_site ignores its own company id. uuid.UUID also accepts
+    # the `{...}`, `urn:` and unhyphenated forms, which were reaching
+    # psycopg unchanged.
+    canon_company_id = None
+    if req_company_id:
+        try:
+            canon_company_id = str(uuid.UUID(str(req_company_id)))
+        except (ValueError, AttributeError, TypeError):
+            canon_company_id = None
+
+    def _names(company_id):
+        """Whether target_company_id refers to `company_id`. Canonical form
+        FIRST, so case and the `{...}`/unhyphenated forms match; raw equality as
+        well, so a value that is not a uuid at all still matches itself exactly
+        rather than being read as some other company -- the weaker check must
+        never be stricter than create_org_site's plain string compare."""
+        return (canon_company_id or str(req_company_id)) == str(company_id) or             str(req_company_id) == str(company_id)
+
+    if req_company_id and not _names(caller["company_id"]):
+        if not is_cross_company(caller["global_role"]):
+            return error("only platform_admin may move a site to another company", 403)
+    if req_company_id and is_cross_company(caller["global_role"]):
+        if canon_company_id is None:
+            return error("target_company_id must be a company id", 400)
+        if companies.get_company_by_id(conn, canon_company_id) is None:
+            return error("target company not found", 404)
+        if not _names(scope_company_id):
+            move_to = canon_company_id
+            # slug is unique per (company_id, slug), not globally. Keep the
+            # slug (deep links and the published site-coords key use it) and
+            # refuse a collision rather than renaming or hitting the index.
+            # `is not None`, not truthiness: '' is an INDEXABLE value --
+            # only NULL is treated as distinct by a unique index -- so an
+            # empty slug skipped the check and hit the index as a 500.
+            slug = (target or {}).get("slug")
+            if slug is not None and sites.get_company_site_by_slug(
+                    conn, move_to, slug) is not None:
+                return error("target company already has a site with slug "
+                             f"'{slug}'", 409)
     row = sites.update_site(
         conn, site_id, scope_company_id,
         name=name, location=body.get("location"),
@@ -2753,12 +5134,31 @@ def patch_org_site(conn, caller, site_id, body):
     )
     if row is None:
         return error("site not found in your company", 404)
-    if icon is not None:
+    if move_to is not None:
+        row = sites.move_site_company(conn, site_id, scope_company_id, move_to)
+        if row is None:
+            # update_site already matched and wrote; only a concurrent
+            # archive or move reaches here. `with conn:` commits on a
+            # clean exit and `error(...)` is a return, so without this
+            # rollback the caller is told 404 while their name and
+            # coordinate edit is committed.
+            conn.rollback()
+            return error("site not found in your company", 404)
+        # Lake ownership: the site's objects follow it, in THIS transaction and with no S3
+        # call (reassign_site runs in its own savepoint and swallows only a missing table, so
+        # a deploy that is a minute ahead of migration 0087 still moves the site). Any other
+        # failure must not commit the move: company A would keep seeing company B's data.
+        try:
+            moved = lake_objects.reassign_site(conn, site_id, move_to)
+        except Exception:  # noqa: BLE001 -- roll the whole move back, then say so
+            logger.exception("site %s move to company %s: lake object re-own failed; "
+                             "move rolled back", site_id, move_to)
+            conn.rollback()
+            return error("could not move the site's data; nothing was changed", 500)
+        logger.info("site %s moved to company %s: %d lake object(s) re-owned",
+                    site_id, move_to, moved)
+    if final_icon is not None:
         old_icon = row.get("icon_s3_key")
-        fname = icon.rsplit("/", 1)[-1]
-        final_icon = f"{ORG_ASSETS_PREFIX}site-icons/{site_id}/{fname}"
-        if not _relocate_asset(icon, final_icon):
-            return error("upload expired or missing — please re-upload the image", 400)
         row = sites.set_site_icon(conn, site_id, final_icon)
         if old_icon and old_icon != final_icon:
             _delete_asset(old_icon)
@@ -2806,6 +5206,763 @@ def _publish_site_coords(row):
         logger.exception("site-coords: publish failed for %s", (row or {}).get("id"))
 
 
+def _directory_after(conn, resp):
+    """Republish the directory after a handler that changed who exists, what
+    they are called, what role they hold or which sites they are on -- but
+    only when the handler succeeded. `resp` is returned untouched."""
+    try:
+        if isinstance(resp, dict) and int(resp.get("statusCode", 500)) < 300:
+            _publish_directory(conn)
+    except Exception:  # noqa: BLE001 - _publish_directory never raises; belt and braces
+        logger.exception("directory: publish hook failed")
+    return resp
+
+
+def _build_directory(conn):
+    return directory.build(
+        directory_repo.live_users(conn), directory_repo.live_memberships(conn),
+        directory_repo.live_sites(conn),
+        datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        activity=directory_repo.recent_activity(conn, directory.PRIMARY_SITE_WINDOW_DAYS),
+        external_user_ids=directory_repo.external_user_ids(conn))
+
+
+def _write_directory_if_changed(conn):
+    """Build from Aurora, compare with what is published, write if different.
+    Returns (changed, doc). Raises on failure; callers decide how loudly."""
+    # A SAVEPOINT. The request runs in one transaction that `with conn:` commits
+    # on a clean exit; a failing SELECT in here would otherwise abort it, the
+    # commit would become a rollback, and the caller would be told "saved" for a
+    # save that was thrown away.
+    with conn.transaction():
+        doc = _build_directory(conn)
+    try:
+        current = _get_lake_json(directory.KEY)
+    except ValueError:
+        # A corrupt object must not be unfixable: treat it as changed.
+        logger.error("directory: %s is not valid JSON; overwriting", directory.KEY)
+        current = None
+    if directory.same_content(doc, current):
+        return False, doc
+    s3().put_object(
+        Bucket=LAKE_BUCKET, Key=directory.KEY,
+        Body=json.dumps(doc, indent=2, default=str).encode("utf-8"),
+        ContentType="application/json")
+    return True, doc
+
+
+def _publish_directory(conn):
+    """Put the people-and-sites directory where the non-VPC pipeline lambdas
+    can read it (config/directory.json; see directory.py for why and for the
+    shape). The whole document is rebuilt from Aurora each time -- it is small
+    and a rebuild cannot carry a stale entry the way a merge can.
+
+    Runs INSIDE the request's transaction (the connection sees its own
+    uncommitted writes). If the commit then fails the object is ahead of the
+    database until the daily republish corrects it; the alternative, publishing
+    after commit, would need a hook the request wrapper does not have.
+
+    NEVER RAISES, for the same reason as _publish_site_coords: saving a member
+    must not fail because a config object could not be refreshed. Logged at
+    exception level so a failure is visible."""
+    try:
+        changed, doc = _write_directory_if_changed(conn)
+        if changed:
+            logger.info("directory: published %d person(s), %d site(s)",
+                        len(doc["people"]), len(doc["sites"]))
+    except Exception:  # noqa: BLE001 - see docstring
+        logger.exception("directory: publish failed")
+
+
+def republish_directory(conn, dry_run=False):
+    """The daily safety net (04:35 NZ, after site coordinates, before the 05:00
+    reports): publishes from Aurora whether or not anyone saved anything, so a
+    path that changes the directory without a hook still lands within a day,
+    and a stage that has never published gets its first object."""
+    if dry_run:
+        # Read-only: what WOULD be published, to compare with the file the
+        # pipeline reads today before the first real publish.
+        with conn.transaction():
+            doc = _build_directory(conn)
+        return {"dry_run": True, "document": doc}
+    changed, doc = _write_directory_if_changed(conn)
+    logger.info("directory: republish %s (%d people, %d sites)",
+                "wrote" if changed else "found nothing to change",
+                len(doc["people"]), len(doc["sites"]))
+    return {"changed": changed, "people": len(doc["people"]), "sites": len(doc["sites"])}
+
+
+_MANIFEST_PREFIX = "lake_manifest/"
+
+
+def _parse_manifest_object(body):
+    """(lines, malformed) from one manifest object. A line is kept only when it is a JSON
+    object of version 1 with a non-empty string key; anything else is malformed."""
+    lines, malformed = [], 0
+    try:
+        text = body.decode("utf-8")
+    except (UnicodeDecodeError, AttributeError):
+        return [], 1
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        try:
+            line = json.loads(raw)
+        except ValueError:
+            malformed += 1
+            continue
+        if (not isinstance(line, dict) or line.get("v") != 1
+                or not isinstance(line.get("key"), str) or not line["key"]):
+            malformed += 1
+            continue
+        lines.append(line)
+    return lines, malformed
+
+
+def _list_manifest_objects(s3_client, bucket, limit):
+    """Up to `limit` (bucket, key) pairs under lake_manifest/, paginated."""
+    out, token = [], None
+    while len(out) < limit:
+        kw = {"Bucket": bucket, "Prefix": _MANIFEST_PREFIX, "MaxKeys": min(1000, limit - len(out))}
+        if token:
+            kw["ContinuationToken"] = token
+        resp = s3_client.list_objects_v2(**kw)
+        out.extend((bucket, o["Key"]) for o in resp.get("Contents") or []
+                   if o["Key"] != _MANIFEST_PREFIX)
+        token = resp.get("NextContinuationToken")
+        if not resp.get("IsTruncated") or not token:
+            break
+    return out[:limit]
+
+
+DRAIN_TIME_BUDGET_S = 780          # LakeOps has a 900 s timeout
+DRAIN_BATCH_OBJECTS = 500
+EXPORT_TICK_BUDGET_S = 480         # under the 10-minute rate: no tick outlives its successor
+_DRAIN_LISTS = ("conflict_sample", "unresolved_sample")
+
+
+def drain_lake_manifest_run(event, context=None):
+    """The scheduled/operator entry for the drain: S3 first, then passes until the time budget.
+
+    Lists lake_manifest/ before anything else and returns with NO database connection when it
+    is empty (the same pattern as export_tick), so an hourly schedule does not keep Aurora
+    awake. Otherwise one connection runs drain_lake_manifest passes of `max_objects` (default
+    500) until no manifest is left or the budget is spent. The budget is event.time_budget_s
+    (default 780), cut to the Lambda's remaining time minus a 90 s margin when the context says.
+    A pass that deleted nothing ends the loop (what is left is kept for a reason; spinning
+    would not change it). `more` is True when manifests may remain."""
+    dry_run = event.get("dry_run") is True
+    batch = max(1, int(event.get("max_objects") or DRAIN_BATCH_OBJECTS))
+    budget = event.get("time_budget_s")
+    if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0:
+        budget = DRAIN_TIME_BUDGET_S
+    remaining = getattr(context, "get_remaining_time_in_millis", None)
+    if callable(remaining):
+        budget = max(1, min(budget, int(remaining() / 1000) - 90))
+    started = time.monotonic()
+    s3_client = s3()
+    names = event.get("buckets")
+    names = names if names is not None else [S3_BUCKET, LAKE_BUCKET]
+    names = list(dict.fromkeys(b for b in names if b))
+    found = False
+    for b in names:
+        try:
+            if _list_manifest_objects(s3_client, b, 1):
+                found = True
+                break
+        except Exception:  # noqa: BLE001 - one unreadable bucket must not stop the other
+            logger.warning("lake drain: cannot list %s", b, exc_info=True)
+    if not found:
+        return {"manifests": 0, "lines": 0, "upserted": 0, "deleted_manifests": 0,
+                "dry_run": dry_run, "more": False, "passes": 0}
+    total, passes, longest, more = {}, 0, 0.0, False
+    with get_connection() as conn:
+        while True:
+            t0 = time.monotonic()
+            out = drain_lake_manifest(conn, s3_client, dry_run=dry_run, max_objects=batch,
+                                      buckets=event.get("buckets"))
+            longest = max(longest, time.monotonic() - t0)
+            passes += 1
+            for k, v in out.items():
+                if isinstance(v, bool):
+                    total[k] = bool(total.get(k)) or v
+                elif isinstance(v, int):
+                    total[k] = total.get(k, 0) + v
+                elif k in _DRAIN_LISTS:
+                    total[k] = (total.get(k, []) + list(v))[:50]
+            full = out.get("manifests", 0) >= batch
+            if dry_run or out.get("table_missing") or not full or not out.get("deleted_manifests"):
+                more = full and not dry_run and not out.get("table_missing")
+                break
+            if (time.monotonic() - started) + 1.5 * longest >= budget:
+                more = True
+                break
+    total.setdefault("dry_run", dry_run)
+    total["more"] = more
+    total["passes"] = passes
+    return total
+
+
+def drain_lake_manifest(conn, s3_client, *, dry_run=False, max_objects=500, buckets=None):
+    """Read lake_manifest/ lines (written by lake_put) and upsert them into lake_objects.
+
+    Safety contract (Review Focus 1): a manifest object is deleted ONLY after every one of its
+    lines was upserted (or deliberately skipped) AND `conn.commit()` returned. It is kept when
+    a line is malformed, its upsert failed, the table is missing, or the delete itself failed.
+    Idempotent: a re-run upserts the same rows (the repository guard counts none as changed).
+    Lines of global / lake-wide keys are counted in `skipped` and never get a row (R5b);
+    keys of an unknown shape get a NULL-company row (`unknown_shape`, R5f). unresolved,
+    unknown_shape and split_day count unique keys; `lines` counts valid lines.
+    dry_run resolves and counts but writes and deletes nothing; `upserted` is then the number
+    of rows that WOULD be written (not net of unchanged rows)."""
+    out = {"manifests": 0, "lines": 0, "upserted": 0, "unresolved": 0, "unknown_shape": 0,
+           "split_day": 0, "conflict": 0, "conflict_sample": [], "skipped": 0, "malformed": 0, "deleted_manifests": 0, "kept": 0,
+           "table_missing": False, "dry_run": bool(dry_run), "unresolved_sample": []}
+    names = buckets if buckets is not None else [S3_BUCKET, LAKE_BUCKET]
+    names = list(dict.fromkeys(b for b in names if b))
+    budget = max(1, int(max_objects))
+    found = []
+    for b in names:
+        if len(found) >= budget:
+            break
+        try:
+            found.extend(_list_manifest_objects(s3_client, b, budget - len(found)))
+        except Exception:  # noqa: BLE001 - one unreadable bucket must not stop the other
+            logger.warning("lake drain: cannot list %s", b, exc_info=True)
+
+    objects = []  # {bucket, key, lines, bad}; an object that cannot be read is only counted
+    unread = 0
+    for bucket, mkey in found:
+        out["manifests"] += 1
+        try:
+            body = s3_client.get_object(Bucket=bucket, Key=mkey)["Body"].read()
+        except Exception:  # noqa: BLE001
+            logger.warning("lake drain: cannot read %s", mkey, exc_info=True)
+            unread += 1
+            continue
+        lines, bad = _parse_manifest_object(body)
+        out["lines"] += len(lines)
+        out["malformed"] += bad
+        objects.append({"bucket": bucket, "key": mkey, "lines": lines, "bad": bad})
+
+    merged = {}  # one resolution per key from its NEWEST line (by "t", else manifest order)
+    for ob in objects:
+        for ln in ob["lines"]:
+            cur = merged.get(ln["key"])
+            t = ln.get("t") if isinstance(ln.get("t"), str) else None
+            if cur is not None and t is not None and cur["t"] is not None and t < cur["t"]:
+                continue  # an older line never overrides a newer one
+            size = ln.get("size")
+            merged[ln["key"]] = {
+                "hint": ln["hint"] if isinstance(ln.get("hint"), dict) else {},
+                "size": size if isinstance(size, int) and not isinstance(size, bool) else None,
+                "t": t}
+    owners = lake_owner.Resolver(conn).resolve_many(
+        [(k, v["hint"]) for k, v in merged.items()])
+
+    rows = {}
+    for k, o in owners.items():
+        if o["scope"] in ("global", "lake_wide"):
+            out["skipped"] += 1
+            continue
+        if o["scope"] == "unknown":
+            out["unknown_shape"] += 1
+        elif o["company_id"] is None:
+            out["split_day" if o["reason"] == "split_day" else "unresolved"] += 1
+        if o["company_id"] is None and len(out["unresolved_sample"]) < 20:
+            out["unresolved_sample"].append({"key": k, "reason": o["reason"]})
+        rows[k] = {"key": k, "company_id": o["company_id"], "site_id": o["site_id"],
+                   "user_id": o["user_id"], "kind": o["kind"], "folder": o["folder"],
+                   "day": o["day"], "session_base": o["session_base"],
+                   "size_bytes": merged[k]["size"], "source": "manifest", "why": o["reason"],
+                   "object_modified_at": _parse_iso(merged[k]["t"]),
+                   "reason": None if o["company_id"] else o["reason"]}
+
+    if dry_run:
+        out["upserted"] = len(rows)
+        out["kept"] = unread + len(objects)
+        return out
+
+    deletable = []
+    seen_conflicts = set()
+    kept = unread
+    for ob in objects:
+        mine = [rows[ln["key"]] for ln in ob["lines"] if ln["key"] in rows]
+        n = 0
+        if mine:
+            try:
+                with conn.transaction():
+                    clash = lake_objects.conflicts(conn, mine)   # R7e: skipped by the upsert
+                    n = lake_objects.upsert_many(conn, mine, on_missing=None)
+            except Exception:  # noqa: BLE001 - this object stays; the others carry on
+                logger.warning("lake drain: upsert failed for %s", ob["key"], exc_info=True)
+                kept += 1
+                continue
+            if n is None:
+                out["table_missing"] = True
+                break
+        for c in clash if mine else ():
+            if c["key"] not in seen_conflicts:
+                seen_conflicts.add(c["key"])
+                out["conflict"] += 1
+                if len(out["conflict_sample"]) < 50:
+                    out["conflict_sample"].append(c)
+        out["upserted"] += n or 0
+        if ob["bad"]:
+            kept += 1
+        else:
+            deletable.append(ob)
+    if out["table_missing"]:
+        out["kept"] = unread + len(objects)  # nothing is deleted without the table
+        return out
+    conn.commit()  # rows are durable BEFORE any manifest object is deleted
+
+    by_bucket = {}
+    for ob in deletable:
+        by_bucket.setdefault(ob["bucket"], []).append(ob["key"])
+    for bucket, keys in by_bucket.items():
+        for i in range(0, len(keys), 1000):
+            chunk = keys[i:i + 1000]
+            try:
+                resp = s3_client.delete_objects(
+                    Bucket=bucket, Delete={"Objects": [{"Key": k} for k in chunk], "Quiet": True})
+                failed = len((resp or {}).get("Errors") or [])
+            except Exception:  # noqa: BLE001 - rows are committed; the next run re-upserts
+                logger.warning("lake drain: delete failed for %d object(s)", len(chunk),
+                               exc_info=True)
+                failed = len(chunk)
+            out["deleted_manifests"] += len(chunk) - failed
+            kept += failed
+    out["kept"] = kept
+    return out
+
+
+def _parse_iso(t):
+    """A manifest line's `t` as an aware datetime, or None when absent/unparseable."""
+    if not isinstance(t, str):
+        return None
+    try:
+        d = datetime.fromisoformat(t.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def _backfill_pages(s3_client, bucket, prefixes, start_after, page_size):
+    """Yield pages of (key, size, last_modified) of one bucket in global key order. `start_after` is a key in
+    this bucket (None = from the beginning). With prefixes (sorted), a prefix whose whole range
+    lies before the cursor is skipped, so the cursor stays one monotone key."""
+    kept = []                           # overlapping prefixes (a/ and a/b/) would list twice
+    for pf in sorted(set(prefixes or [""])):
+        if not any(pf.startswith(q) for q in kept):
+            kept.append(pf)
+    for prefix in kept:
+        sa = start_after
+        if sa is not None and sa > prefix and not sa.startswith(prefix):
+            continue                    # this prefix is entirely behind the cursor
+        if sa is not None and sa < prefix:
+            sa = None                   # the cursor is before this prefix: start at its head
+        token = None
+        while True:
+            kw = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": page_size}
+            if token:
+                kw["ContinuationToken"] = token
+            elif sa:
+                kw["StartAfter"] = sa
+            resp = s3_client.list_objects_v2(**kw)
+            page = [(o["Key"], o.get("Size"), o.get("LastModified")) for o in resp.get("Contents") or []]
+            if page:
+                yield page
+            token = resp.get("NextContinuationToken")
+            if not resp.get("IsTruncated") or not token:
+                break
+
+
+def _canon_uuid_or_none(value):
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _export_company_or_error(conn, caller, company_id):
+    """Shared gate of the export routes. (canonical company id, None) or (None, error response).
+
+    platform_admin ONLY: an export is a whole company's data and crosses the caller's-company
+    boundary every other route enforces, so admin and gm get 403 as well. An id that is not a
+    UUID or names no company is 404 (never a database error)."""
+    if caller.get("global_role") != "platform_admin":
+        return None, error("platform_admin role required", 403)
+    cid = _canon_uuid_or_none(company_id)
+    if cid is None or companies.get_company_by_id(conn, cid) is None:
+        return None, error("company not found", 404)
+    return cid, None
+
+
+def start_company_export(conn, caller, company_id):
+    """POST /companies/{id}/export -- ask for an asynchronous export of one company's lake data.
+
+    Writes export_requests/{company_id}/{export_id}.json through the S3 gateway endpoint and
+    returns 202. It invokes nothing: in-VPC org-api has no route to the Lambda API (no NAT, no
+    endpoint). LakeOps picks the request up on its next export_tick. The export id is minted
+    here (a uuid), so the caller can poll before the first part exists."""
+    cid, err = _export_company_or_error(conn, caller, company_id)
+    if err:
+        return err
+    export_id = str(uuid.uuid4())
+    request = {"company_id": cid, "export_id": export_id, "requested_by": caller.get("id"),
+               "requested_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        s3().put_object(Bucket=_export_bucket_for("exports"),
+                        Key=f"{EXPORT_REQUEST_PREFIX}{cid}/{export_id}.json",
+                        Body=json.dumps(request).encode("utf-8"),
+                        ContentType="application/json")
+    except Exception:
+        logger.exception("company export: could not write the request for company %s", cid)
+        return error("could not start the export", 502)
+    logger.info("company export started: company=%s export=%s by user=%s",
+                cid, export_id, caller.get("id"))
+    return ok({"exportId": export_id, "companyId": cid}, 202)
+
+
+def _read_export_doc(key):
+    """The JSON object at an export key, or None when absent. Other errors raise."""
+    try:
+        body = s3().get_object(Bucket=_export_bucket_for("exports"), Key=key)["Body"].read()
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in ("NoSuchKey", "404", "NotFound"):
+            return None
+        raise
+    return json.loads(body)
+
+
+def company_export_status(conn, caller, company_id, export_id):
+    """GET /companies/{id}/export/{export_id} -- progress, and once done presigned GET URLs
+    (15 minutes) for each part and the manifest.
+
+    export_id must be a uuid (else 400) and is re-rendered from the parsed value, so nothing
+    that can escape exports/{company_id}/{export_id}/ ever reaches a key. Only keys under
+    that prefix are presigned; a manifest naming anything else is ignored."""
+    cid, err = _export_company_or_error(conn, caller, company_id)
+    if err:
+        return err
+    eid = _canon_uuid_or_none(export_id)
+    if eid is None:
+        return error("export id must be a uuid", 400)
+    prefix = company_export.export_prefix(cid, eid)
+
+    def presign(key):
+        if not key.startswith(prefix) or ".." in key[len(prefix):] or "/" in key[len(prefix):]:
+            return None
+        return s3().generate_presigned_url(
+            "get_object", Params={"Bucket": _export_bucket_for("exports"), "Key": key},
+            ExpiresIn=PRESIGNED_URL_EXPIRY)
+
+    manifest = _read_export_doc(prefix + "manifest.json")
+    if manifest is not None and manifest.get("company_id") != cid:
+        return error("export not found (or not started yet)", 404)
+    if manifest is not None:
+        parts = []
+        for p in manifest.get("parts") or []:
+            url = presign(str(p.get("key", "")))
+            if url:
+                parts.append({"key": p["key"], "objects": p.get("objects"),
+                              "bytes": p.get("bytes"), "url": url})
+        return ok({"exportId": eid, "companyId": cid, "status": "done", "done": True,
+                   "parts": parts, "objects": len(manifest.get("objects") or []),
+                   "excluded": manifest.get("excluded") or {},
+                   "manifest": {"key": prefix + "manifest.json",
+                                "url": presign(prefix + "manifest.json")},
+                   "expiresIn": PRESIGNED_URL_EXPIRY})
+    state = _read_export_doc(prefix + "state.json")
+    if state is not None and state.get("company_id") != cid:
+        return error("export not found (or not started yet)", 404)
+    if state is not None:
+        return ok({"exportId": eid, "companyId": cid, "status": "running", "done": False,
+                   "partsWritten": len(state.get("parts") or []),
+                   "objects": len(state.get("entries") or [])})
+    return error("export not found (or not started yet)", 404)
+
+
+def _export_bucket_for(kind):
+    """Which bucket holds objects of this kind. The lake bucket, except the deletion mirror
+    (written to S3_BUCKET by delete_recordings_endpoint). `exports` is where results go."""
+    if kind == "redaction":
+        return S3_BUCKET or LAKE_BUCKET
+    return LAKE_BUCKET or S3_BUCKET
+
+
+def _export_alt_bucket_for(kind):
+    """The other configured bucket, to try once when a key is NoSuchKey in the chosen one (on
+    TEST the pipeline writes to DataBucketName and org-api to the ingest bucket; prod is one
+    bucket and this is None there). Never returns the chosen bucket."""
+    chosen = _export_bucket_for(kind)
+    for b in (LAKE_BUCKET, S3_BUCKET):
+        if b and b != chosen:
+            return b
+    return None
+
+
+def export_company_task(event, context=None):
+    """Run one time budget of export_company and return the result (next_cursor if not done).
+
+    Event: {"task", "company_id", "export_id"?, "cursor"?, "time_budget_s"?, "part_bytes"?}.
+    No self-chaining: the scheduled export_tick resumes unfinished exports from their saved state.
+    """
+    budget = event.get("time_budget_s")
+    if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0:
+        budget = company_export.DEFAULT_TIME_BUDGET_S
+    part_bytes = event.get("part_bytes")
+    if isinstance(part_bytes, bool) or not isinstance(part_bytes, int) or part_bytes <= 0:
+        part_bytes = company_export.DEFAULT_PART_BYTES
+    try:
+        with get_connection() as conn:
+            return company_export.run(
+                conn, s3(), event.get("company_id"), bucket_for=_export_bucket_for, alt_bucket_for=_export_alt_bucket_for,
+                export_id=event.get("export_id"), cursor=event.get("cursor"),
+                time_budget_s=budget, part_bytes=part_bytes,
+                dest_bucket=_export_bucket_for("exports"))
+    except (ValueError, company_export.ExportError) as exc:
+        return {"error": str(exc)}
+
+
+def _delete_export_request(s3_client, bucket, key):
+    try:
+        s3_client.delete_object(Bucket=bucket, Key=key)
+    except Exception:  # noqa: BLE001 - it is retried, harmlessly, on the next tick
+        logger.exception("export_tick: could not delete %s", key)
+
+
+def export_tick(event, context=None):
+    """Advance ONE pending company export by one time budget.
+
+    S3 only until there is work: list export_requests/ first and return with no database
+    connection when it is empty (an idle tick must not keep Aurora awake). Per request: the key
+    path is the authority, so a body whose company_id/export_id disagree with it is logged and
+    skipped (nothing deleted). A request whose state.json says done is deleted without running.
+    The first unfinished one runs with the remaining Lambda time; the request is deleted only
+    once the run reports done. One export per tick."""
+    s3_client = s3()
+    bucket = _export_bucket_for("exports")
+    keys = []
+    for page in s3_client.get_paginator("list_objects_v2").paginate(
+            Bucket=bucket, Prefix=EXPORT_REQUEST_PREFIX):
+        keys.extend(o["Key"] for o in page.get("Contents") or [])
+    keys = sorted(k for k in keys if k.endswith(".json"))
+    if not keys:
+        return {"requests": 0, "ran": None}
+    # min(480 s, remaining - 30 s): the run may overshoot its budget by one part, and no tick
+    # may still be running when the next one starts (rate 10 minutes), or two ticks copy the
+    # same part and one loses the state.json race.
+    budget = EXPORT_TICK_BUDGET_S
+    remaining = getattr(context, "get_remaining_time_in_millis", None)
+    if callable(remaining):
+        budget = max(1, min(budget, int(remaining() / 1000) - 30))
+    skipped, finished = 0, 0
+    for key in keys:
+        parts = key[len(EXPORT_REQUEST_PREFIX):-len(".json")].split("/")
+        try:
+            if len(parts) != 2:
+                raise ValueError("unexpected key shape")
+            cid = company_export._canon_uuid(parts[0], "company_id")
+            eid = company_export._canon_uuid(parts[1], "export_id")
+            doc = json.loads(s3_client.get_object(Bucket=bucket, Key=key)["Body"].read())
+            if doc.get("company_id") != cid or doc.get("export_id") != eid:
+                raise ValueError("request body does not match its key")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("export_tick: skipping %s: %s", key, exc)
+            skipped += 1
+            continue
+        state, _ = company_export._read_state(
+            s3_client, bucket, company_export.export_prefix(cid, eid) + "state.json")
+        if state is not None and state.get("done"):
+            _delete_export_request(s3_client, bucket, key)
+            finished += 1
+            continue
+        try:
+            with get_connection() as conn:
+                out = company_export.run(
+                    conn, s3_client, cid, bucket_for=_export_bucket_for, alt_bucket_for=_export_alt_bucket_for, export_id=eid,
+                    time_budget_s=budget, dest_bucket=bucket)
+        except (ValueError, company_export.ExportError) as exc:
+            logger.warning("export_tick: export %s failed: %s", key, exc)
+            return {"requests": len(keys), "ran": key, "error": str(exc)}
+        if out.get("done"):
+            _delete_export_request(s3_client, bucket, key)
+        return {"requests": len(keys), "ran": key, "done": bool(out.get("done")),
+                "skipped": skipped, "finished_without_running": finished}
+    return {"requests": len(keys), "ran": None, "skipped": skipped,
+            "finished_without_running": finished}
+
+
+def backfill_lake_objects(conn, s3_client, *, apply=False, buckets=None, prefixes=None,
+                          start_bucket=None, start_after=None, time_budget_s=780, tag=False,
+                          page_size=1000):
+    """Walk the bucket(s) once and record who owns every object in lake_objects.
+
+    ONE resolution path: lake_owner.Resolver (the drain's), so the backfill and the drain can
+    never disagree. Global and lake-wide keys are counted and skipped (no row); an unknown
+    shape and an unresolvable key are upserted with company NULL and their reason, and listed
+    in `unresolved_sample` (first 50). Nothing is guessed.
+
+    A DRY RUN is the default (`apply` must be exactly True): it lists and resolves, writes no
+    row and makes no S3 mutation. Tagging (put_object_tagging, no data copy, one call per
+    resolved object) happens only with `tag` AND `apply`; it is the only S3 mutation here.
+
+    Resumable and idempotent: each page is committed before the next is read; the walk stops
+    once `time_budget_s` is spent (at least one page is always done, so a resume moves) and
+    returns `next_start_bucket`/`next_start_after`, the last key it finished, or None when the
+    walk is complete. The repository upsert skips an unchanged row, so a second full run
+    reports `rows_changed == 0` and leaves updated_at alone."""
+    out = {"dry_run": not apply, "walked": 0, "tenant": 0, "global_skipped": 0, "lake_wide": 0,
+           "unknown_shape": 0, "resolved": 0, "unresolved": 0, "mismatch_voice_company": 0,
+           "tagged": 0, "tag_skipped": 0, "conflict": 0, "conflict_sample": [],
+           "rows_changed": 0, "reasons": {}, "table_missing": False,
+           "next_start_bucket": None, "next_start_after": None, "unresolved_sample": []}
+    names = buckets if buckets is not None else [S3_BUCKET, LAKE_BUCKET]
+    names = list(dict.fromkeys(b for b in names if b))
+    if start_after is not None and start_bucket is None:
+        out["error"] = "start_after requires start_bucket (the cursor is per bucket)"
+        return out
+    if start_bucket is not None:
+        if start_bucket not in names:
+            out["error"] = f"start_bucket {start_bucket} is not one of the buckets"
+            return out
+        names = names[names.index(start_bucket):]
+    started = time.monotonic()
+    resolver = lake_owner.Resolver(conn)
+    pages_done, last_page_s = 0, 0.0
+
+    def budget_spent():
+        """True once another page like the last would overrun; never before the first page."""
+        return pages_done >= 1 and (time.monotonic() - started) + last_page_s >= time_budget_s
+
+    for bi, bucket in enumerate(names):
+        last_key = start_after if bi == 0 else None
+        for page in _backfill_pages(s3_client, bucket, prefixes, last_key, page_size):
+            if budget_spent():
+                out["next_start_bucket"], out["next_start_after"] = bucket, last_key
+                return out
+            t0 = time.monotonic()
+            keys = [(k, sz, lm) for k, sz, lm in page if not k.endswith("/")]
+            out["walked"] += len(page)                   # "folder" placeholder keys: walked only
+            owners = resolver.resolve_many([(k, {}) for k, _sz, _lm in keys])
+            rows = []
+            for k, sz, lm in keys:
+                o = owners[k]
+                if o["scope"] == "global":
+                    out["global_skipped"] += 1
+                    continue
+                if o["scope"] == "lake_wide":
+                    out["lake_wide"] += 1
+                    continue
+                out["unknown_shape" if o["scope"] == "unknown" else "tenant"] += 1
+                why = o["reason"] or "none"
+                out["reasons"][why] = out["reasons"].get(why, 0) + 1
+                if o["company_id"] is None:
+                    out["unresolved"] += 1
+                    if len(out["unresolved_sample"]) < 50:
+                        out["unresolved_sample"].append({"key": k, "reason": o["reason"]})
+                else:
+                    out["resolved"] += 1
+                parsed = lake_keys.parse(k) or {}
+                if (parsed.get("kind") == "voice" and parsed.get("company_id")
+                        and o["company_id"] and parsed["company_id"] != o["company_id"]):
+                    out["mismatch_voice_company"] += 1
+                rows.append({"key": k, "company_id": o["company_id"], "site_id": o["site_id"],
+                             "user_id": o["user_id"], "kind": o["kind"], "folder": o["folder"],
+                             "day": o["day"], "session_base": o["session_base"],
+                             "size_bytes": sz if isinstance(sz, int) else None,
+                             "object_modified_at": lm if isinstance(lm, datetime) else None,
+                             "source": "backfill", "why": o["reason"],
+                             "reason": None if o["company_id"] else o["reason"]})
+            if apply and rows:
+                try:
+                    # R7e: a stored company is never replaced by a different one here; the
+                    # upsert skips such rows, and they are reported.
+                    clash = lake_objects.conflicts(conn, rows)
+                    n = lake_objects.upsert_many(conn, rows, on_missing=None)
+                except Exception:  # noqa: BLE001 - earlier pages are committed; say where to resume
+                    logger.exception("lake backfill: upsert failed after %s", last_key)
+                    out["error"] = "upsert failed"
+                    out["next_start_bucket"], out["next_start_after"] = bucket, last_key
+                    return out
+                if n is None:
+                    out["table_missing"] = True
+                    out["next_start_bucket"], out["next_start_after"] = bucket, last_key
+                    return out
+                out["rows_changed"] += n
+                out["conflict"] += len(clash)
+                room = 50 - len(out["conflict_sample"])
+                out["conflict_sample"].extend(clash[:max(room, 0)])
+                clashed = {c["key"] for c in clash}
+                if tag:
+                    for r in rows:
+                        if r["company_id"] is None or r["key"] in clashed:
+                            continue
+                        try:
+                            # put_object_tagging REPLACES the whole set: read, change only
+                            # company/site, keep every other tag (e.g. lifecycle tags).
+                            have = s3_client.get_object_tagging(Bucket=bucket, Key=r["key"])
+                            merged = {t["Key"]: t["Value"] for t in have.get("TagSet") or []}
+                            merged["company"] = str(r["company_id"])
+                            if r["site_id"]:
+                                merged["site"] = str(r["site_id"])
+                            else:
+                                merged.pop("site", None)
+                            if len(merged) > 10:             # S3 allows 10 tags per object
+                                out["tag_skipped"] += 1
+                                continue
+                            s3_client.put_object_tagging(
+                                Bucket=bucket, Key=r["key"],
+                                Tagging={"TagSet": [{"Key": a, "Value": b}
+                                                    for a, b in merged.items()]})
+                            out["tagged"] += 1
+                        except Exception:  # noqa: BLE001 - tags are advisory; the row is the record
+                            logger.warning("lake backfill: could not tag %s", r["key"],
+                                           exc_info=True)
+                conn.commit()                              # progress is durable page by page
+            last_key = page[-1][0]
+            pages_done += 1
+            last_page_s = time.monotonic() - t0
+        if bi + 1 < len(names) and budget_spent():       # bucket done; resume at the next one
+            out["next_start_bucket"], out["next_start_after"] = names[bi + 1], None
+            return out
+    return out
+
+
+def republish_all_site_coords(conn):
+    """Publish EVERY site's coordinate, once a day, before the daily reports.
+
+    _publish_site_coords runs when a site is saved, and only then. Found on
+    2026-09-29: config/site-coords.json had never been written on prod -- no
+    site had been saved with a coordinate since the publish shipped -- so every
+    production daily report still went out with no weather, the defect the
+    publish existed to fix. A write that happens only on edit leaves every
+    site nobody edits unplaced, silently.
+
+    So the whole set is published from Aurora on a schedule (04:30 NZ, ahead
+    of the 05:00 reports). One read, one merge, and no write when nothing
+    changed. Archived sites are left as they are: an archived site writes no
+    reports, and removing its entry would only churn the object.
+    """
+    rows = sites.list_all_sites(conn, include_archived=False)
+    doc = _get_lake_json(site_coords.KEY) or {}
+    merged = dict(doc)
+    for row in rows:
+        merged = site_coords.merge_site(merged, row)
+    placed = sum(1 for r in rows if site_coords.entry_for_site(r))
+    if merged == doc:
+        logger.info("site-coords: republish found nothing to change (%d placed)", len(merged))
+        return {"changed": False, "sites": len(rows), "placed": placed}
+    s3().put_object(
+        Bucket=LAKE_BUCKET, Key=site_coords.KEY,
+        Body=json.dumps(merged, indent=2, default=str).encode("utf-8"),
+        ContentType="application/json")
+    logger.info("site-coords: republished %d site(s), %d placed", len(rows), placed)
+    return {"changed": True, "sites": len(rows), "placed": placed}
+
+
 def list_site_members(conn, caller, site_id):
     """Members of one site, from memberships (NOT user_mapping) -- the Aurora
     replacement for legacy /site-users. ACL mirrors /live-items: the site id
@@ -2841,6 +5998,140 @@ def list_site_contributors(conn, caller, site_id, event):
         return error("date required (YYYY-MM-DD)", 400)
     folders = topics.list_contributor_folders_for_site_date(conn, site_id, date)
     return ok({"folders": folders, "site": str(site_id), "date": date})
+
+
+# ----------------------------------------------------------
+# /companies
+# ----------------------------------------------------------
+def list_org_companies(conn, caller):
+    """GET /companies -- {id, name} of every tenant, for the site-create company picker.
+
+    WHO: platform_admin only, and the gate is is_cross_company -- the same predicate
+    that alone lets create_org_site / patch_org_site honour target_company_id. This
+    list exists to feed that parameter, so whoever may not send target_company_id has
+    no use for it. A company admin/gm passes resolve_scope()==ALL but that is a
+    SAME-company scope (list_members gates its company branch on it); it must not buy
+    a directory of other tenants, so resolve_scope is deliberately NOT consulted here.
+    Every other role is refused. The list is every tenant's name: default is refusal.
+
+    WHAT: id and name only. companies.list_companies also selects industry and
+    created_at, and the row may grow; the projection is explicit so a widened repo
+    query cannot leak a new column through this route.
+    """
+    if not is_cross_company(caller["global_role"]):
+        return error("platform_admin role required", 403)
+    return ok({"companies": [
+        {"id": str(c["id"]), "name": c["name"]} for c in companies.list_companies(conn)
+    ]})
+
+
+def _company_name_taken(clash):
+    """409 for a company name another tenant holds. Carries that company as
+    data, because the caller who retried after a timeout wants the company
+    that exists, not an error message to parse."""
+    if clash is None:   # raced, and the winner is not visible to this read
+        return error("a company with that name already exists", 409)
+    return error(f"a company named '{clash['name']}' already exists", 409,
+                 {"existing": {"id": str(clash["id"]), "name": clash["name"]}})
+
+
+def create_org_company(conn, caller, body):
+    """POST /companies -- a new tenant. platform_admin only.
+
+    WHO: the same gate as the GET above, for a stronger reason. Creating a tenant
+    is not something a customer does inside their own company; it is a platform
+    operation, and is_cross_company (platform_admin alone, acl.py) is the only
+    predicate that already means that. resolve_scope()==ALL would let any company
+    admin mint tenants, so it is deliberately not consulted.
+
+    WHY THE DUPLICATE CHECK IS THE POINT: companies.name has NO unique constraint
+    (0002_core_relational.sql). Two tenants with one name are indistinguishable in
+    every list the product shows, their sites and users scatter between two uuids,
+    and nothing can safely merge them afterwards. A double-clicked button or a
+    retried request is enough to cause it. So a name already taken -- ignoring
+    case and surrounding space -- is refused 409, and the refusal CARRIES THE
+    EXISTING ID, because a caller who retried wants the company that exists
+    rather than an error.
+
+    This endpoint does NOT seed the starter report templates, and cannot: they
+    are authored by a user, and a company created here has no members yet.
+    create_member seeds on the first invitation for exactly this case -- the fix
+    for Briv, which was created empty on prod and kept an empty Library until
+    invitation-time seeding shipped.
+    """
+    if not is_cross_company(caller["global_role"]):
+        return error("platform_admin role required", 403)
+    if body is None:
+        return error("malformed JSON body", 400)
+    name = body.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return error("name must be a non-empty string", 400)
+    name = name.strip()
+    industry = body.get("industry")
+    if industry is not None and not isinstance(industry, str):
+        return error("industry must be a string", 400)
+    if industry is not None:
+        industry = industry.strip() or None
+    clash = companies.find_company_by_name_ci(conn, name)
+    if clash is not None:
+        return _company_name_taken(clash)
+    try:
+        row = companies.create_company(conn, name, industry)
+    except UniqueViolation:
+        # idx_companies_name_ci: a concurrent create took the name after the
+        # check above. The transaction is aborted -- roll back before reading.
+        conn.rollback()
+        return _company_name_taken(companies.find_company_by_name_ci(conn, name))
+    logger.info("company created: %s (%s) by %s", row["name"], row["id"],
+                caller.get("cognito_sub"))
+    return ok({"company": {"id": str(row["id"]), "name": row["name"]}}, 201)
+
+
+def patch_org_company(conn, caller, company_id, body):
+    """PATCH /companies/{id} -- rename a tenant (and/or set its industry).
+    platform_admin only, the same gate as create: a company admin renaming
+    their own tenant would have to be told a name is taken without being told
+    by whom, and that alone discloses that the tenant exists.
+
+    Safe because no code finds a company by its name any more. The duplicate
+    guard EXCLUDES this company, so changing only the case of its own name
+    ("frequency" -> "Frequency") is allowed."""
+    if not is_cross_company(caller["global_role"]):
+        return error("platform_admin role required", 403)
+    if body is None:
+        return error("malformed JSON body", 400)
+    try:
+        company_id = str(uuid.UUID(str(company_id)))
+    except (ValueError, AttributeError, TypeError):
+        return error("company id must be a uuid", 400)
+    changes = {}
+    if "name" in body:
+        name = body.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return error("name must be a non-empty string", 400)
+        changes["name"] = name.strip()
+    if "industry" in body:
+        industry = body.get("industry")
+        if industry is not None and not isinstance(industry, str):
+            return error("industry must be a string", 400)
+        changes["industry"] = (industry or "").strip() or None
+    if not changes:
+        return error("nothing to change: send name and/or industry", 400)
+    if companies.get_company_by_id(conn, company_id) is None:
+        return error("company not found", 404)
+    if "name" in changes:
+        clash = companies.find_company_by_name_ci(conn, changes["name"])
+        if clash is not None and str(clash["id"]) != company_id:
+            return _company_name_taken(clash)
+    try:
+        row = companies.update_company(conn, company_id, **changes)
+    except UniqueViolation:
+        conn.rollback()
+        return _company_name_taken(
+            companies.find_company_by_name_ci(conn, changes.get("name", "")))
+    logger.info("company updated: %s -> %s by %s", company_id, sorted(changes),
+                caller.get("cognito_sub"))
+    return ok({"company": {"id": str(row["id"]), "name": row["name"]}})
 
 
 # ----------------------------------------------------------
@@ -2895,6 +6186,63 @@ def patch_member_role(conn, caller, target_sub, body):
     return ok(row)
 
 
+def _free_folder_name(conn, name, sub, user_id=None):
+    """A recording folder for `name` that no OTHER user holds, or None.
+
+    folder_name is globally unique (0012), and two people with the same first
+    and last name in one company -- different logins, different emails -- are an
+    ordinary thing. The first keeps `Ben_Lin`; the second used to be left with
+    NO folder_name at all, and the upload route then derived `Ben_Lin` from the
+    name and wrote the second person's recordings into the first person's
+    folder. Their own timeline and reports were empty, their clips showed as
+    the other person's, and finalize and recording-blocks skipped them silently
+    for want of a folder (prod, 2026-09-11..15, 18 sessions).
+
+    So a clash picks the next free name instead: `_2` .. `_9`, then the user id
+    prefix, which cannot clash with anyone. The base comes from folder_key.folder_key
+    (the one minting rule, shared with patch_member_folder); a name with no usable
+    characters (CJK) gets `u_<user_id[:8]>` instead."""
+    base = folder_key_mod.folder_key(name) or folder_key_mod.fallback_key(user_id)
+    if not base:
+        return None
+    candidates = [base] + [f"{base}_{n}" for n in range(2, 10)]
+    if user_id:
+        candidates.append(f"{base}_{str(user_id)[:8]}")
+    for folder in candidates:
+        clash = users.get_by_folder_name_global(conn, folder)
+        if clash is None or clash.get("cognito_sub") == sub:
+            return folder
+    return None
+
+
+def _enrol_folder_on_upload(conn, caller):
+    """The folder an upload from a login WITHOUT folder_name is written under.
+
+    Enrols one on the spot rather than refusing: this is the synchronous,
+    no-retry upload route, where an error strands the recording (BUG-43). And
+    never the bare name-derived folder, which may belong to someone else. A
+    failed enrolment still yields a folder unique to this user, and says so."""
+    name = f"{caller.get('first_name') or ''}_{caller.get('last_name') or ''}"
+    folder = _free_folder_name(conn, name, caller.get("cognito_sub"), caller.get("id"))
+    if folder:
+        try:
+            with conn.transaction():
+                users.set_folder_name(conn, caller["cognito_sub"], folder)
+            _publish_directory(conn)
+            logger.warning("upload-url: user %s had no folder_name -- enrolled as %r",
+                           caller.get("id"), folder)
+            return folder
+        except Exception:
+            logger.exception("upload-url: could not enrol folder %r for user %s",
+                             folder, caller.get("id"))
+    minted = folder_key_mod.folder_key(name)
+    fallback = (f"{minted}_{str(caller.get('id') or 'unknown')[:8]}" if minted
+                else folder_key_mod.fallback_key(caller.get("id")) or "u_unknown")
+    logger.warning("upload-url: user %s has no folder_name -- writing under %r, "
+                   "which no user owns until an admin enrols it", caller.get("id"), fallback)
+    return fallback
+
+
 def patch_member_folder(conn, caller, target_sub, body):
     """Admin-only enrollment step: links a member's login (cognito_sub) to
     the recording-folder identity (folder_name) the orchestrator/app write
@@ -2912,7 +6260,10 @@ def patch_member_folder(conn, caller, target_sub, body):
     raw = body.get("folder_name")
     if not isinstance(raw, str) or not raw.strip():
         return error("folder_name is required", 400)
-    folder = re.sub(r'[<>:"/\\|?*\s]', '_', raw.strip())
+    folder = folder_key_mod.folder_key(raw)
+    if folder is None:
+        return error("folder_name must contain at least one letter or digit "
+                     "(A-Z, a-z, 0-9) once accents and punctuation are removed", 400)
     # A platform_admin reaches across tenants by design (D6); every other role
     # stays pinned to its own company. Without the widening the operator account
     # could see a customer's people but not enrol the one field -- folder_name --
@@ -2952,9 +6303,107 @@ def _resolve_staffing(conn, caller, target_sub, site_id, require_open_site):
     if require_open_site and site.get("archived_at"):
         return None, error("site is archived — unarchive it first", 409)
     target = users.get_user_by_sub(conn, target_sub)
-    if target is None or str(target.get("company_id")) != str(company_id):
+    if target is None:
         return None, error("member not found in your company", 404)
+    if str(target.get("company_id")) != str(company_id):
+        # An EXTERNAL member (added from another company by
+        # POST /sites/{id}/external-members) is on this roster by membership,
+        # not by employment: the site's company may re-role or remove them,
+        # and ONLY them -- a stranger with no external row here stays a 404.
+        mem = memberships.get_membership(conn, target["id"], site_id)
+        if not (mem and mem.get("external")):
+            return None, error("member not found in your company", 404)
     return (site, target), None
+
+
+EXTERNAL_MEMBER_NOTICE_PREFIX = "notices/external_member/"
+
+
+def _write_external_member_notice(membership_id, to_email, to_name, site_name,
+                                  inviting_company, role):
+    """Leave a notice for the non-VPC backlog lambda to email. Best effort by
+    contract: the membership is already written, so a failed put is logged and
+    never fails the request.
+
+    org-api runs in the VPC with no route to SES (and EMAIL_SENDER unset), so it
+    cannot send. It reaches S3 over the gateway endpoint, so it writes the notice
+    there -- one object per membership -- and
+    lambda_extraction_backlog's 5-minute run sends it exactly once."""
+    try:
+        s3().put_object(
+            Bucket=LAKE_BUCKET,
+            Key=f"{EXTERNAL_MEMBER_NOTICE_PREFIX}{membership_id}.json",
+            Body=json.dumps({
+                "to_email": to_email, "to_name": to_name, "site_name": site_name,
+                "inviting_company": inviting_company, "role": role,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }).encode("utf-8"),
+            ContentType="application/json")
+    except Exception:  # noqa: BLE001 - see docstring
+        logger.exception("external member notice for membership %s not written "
+                         "(membership kept)", membership_id)
+
+
+def add_external_member(conn, caller, site_id, body):
+    """Add an EXISTING FieldSight user from ANOTHER company to one of this
+    company's sites (project-owned tenancy P1). Admin of the site's company or
+    platform_admin only; gm / pm / site_manager / worker are refused.
+
+    The person keeps their home company and gets exactly this site, via a
+    membership marked external=true. A person created inside a project is still
+    that company's employee (create_member, unchanged) -- this route is the only
+    way an external row comes to exist."""
+    if caller["global_role"] not in ("admin", "platform_admin"):
+        return error("admin role required", 403)
+    site = sites.get_site(conn, site_id)
+    if site is None or (not is_cross_company(caller["global_role"])
+                        and str(site["company_id"]) != str(caller["company_id"])):
+        return error("site not found in your company", 404)
+    if body is None:
+        return error("malformed JSON body", 400)
+    email = body.get("email")
+    email = email.strip() if isinstance(email, str) else ""
+    if not email or "@" not in email:
+        return error("valid email is required", 400)
+    role = body.get("role")
+    if not isinstance(role, str) or role not in ALLOWED_MEMBERSHIP_ROLES:
+        return error(f"role must be one of {sorted(ALLOWED_MEMBERSHIP_ROLES)}", 400)
+    if site.get("archived_at"):
+        return error("site is archived — unarchive it first", 409)
+    matches = users.find_live_users_by_email_global(conn, email)
+    if len(matches) > 1:
+        # Two live accounts share this email: attaching the wrong person to a project is a
+        # disclosure, so never pick one (final review F8).
+        return error("ambiguous email, contact support", 409)
+    target = matches[0] if matches else None
+    if target is None:
+        return error("no FieldSight user with that email", 404)
+    if str(target.get("company_id")) == str(site["company_id"]):
+        return error("that person already works for this company — use the normal add member", 400)
+    existing = memberships.get_membership(conn, target["id"], site_id)
+    if existing is not None and existing.get("archived_at") is None:
+        return error("user is already a member of this site", 409)
+    try:
+        with conn.transaction():
+            row = memberships.add_external_membership(conn, target["id"], site_id, role)
+    except Exception as exc:  # noqa: BLE001
+        if not memberships._is_missing_schema(exc):
+            raise
+        logger.warning("external member add refused: migration 0085 not applied yet")
+        return error("external members are not available yet, retry in a minute", 503)
+    memberships.record_audit(
+        conn, "external_revive" if existing is not None else "external_add", caller,
+        target["id"], site, role, row.get("id"))
+    site_company = companies.get_company_by_id(conn, site["company_id"]) or {}
+    user_name = " ".join(p for p in (target.get("first_name"), target.get("last_name")) if p)
+    _write_external_member_notice(
+        row.get("id"), target.get("email") or email, user_name,
+        site.get("name") or "a project", site_company.get("name") or "A company", role)
+    return ok({"membership": {
+        **row,
+        "user_name": user_name,
+        "home_company_name": target.get("company_name"),
+    }}, 201)
 
 
 def put_member_membership(conn, caller, target_sub, site_id, body):
@@ -2983,7 +6432,19 @@ def put_member_membership(conn, caller, target_sub, site_id, body):
     if target.get("archived_at"):
         return error("member is archived — unarchive them first", 409)
     row = memberships.ensure_membership(conn, target["id"], site_id, role)
+    if _is_external_target(conn, _site, target, site_id):
+        memberships.record_audit(conn, "external_role", caller, target["id"], _site, role,
+                                 (row or {}).get("id"))
     return ok({"membership": row})
+
+
+def _is_external_target(conn, site, target, site_id):
+    """Whether `target` sits on `site` as an EXTERNAL member (another company's person).
+    Only such a row is audited (membership_audit)."""
+    if str(target.get("company_id")) == str(site.get("company_id")):
+        return False
+    mem = memberships.get_membership(conn, target["id"], site_id)
+    return bool(mem and mem.get("external"))
 
 
 def delete_member_membership(conn, caller, target_sub, site_id):
@@ -2999,9 +6460,13 @@ def delete_member_membership(conn, caller, target_sub, site_id):
     if err:
         return err
     _site, target = resolved
+    external = _is_external_target(conn, _site, target, site_id)
     row = memberships.archive_membership(conn, target["id"], site_id)
     if row is None:
         return error("no active membership on that site", 404)
+    if external:
+        memberships.record_audit(conn, "external_archive", caller, target["id"], _site,
+                                 row.get("role"), row.get("id"))
     return ok({"membership": row})
 
 
@@ -3034,13 +6499,12 @@ def backfill_member_folders(conn, caller, body=None):
     for row in rows:
         sub = row["cognito_sub"]
         name = " ".join(p for p in (row.get("first_name"), row.get("last_name")) if p)
-        fn = re.sub(r'[<>:"/\\|?*\s]', '_', name.strip())
-        if not fn:
+        if not name.strip():
             skipped.append({"sub": sub, "reason": "no name"})
             continue
-        clash = users.get_by_folder_name_global(conn, fn)
-        if clash and clash["cognito_sub"] != sub:
-            skipped.append({"sub": sub, "reason": "folder taken by another user"})
+        fn = _free_folder_name(conn, name, sub, row.get("id"))
+        if not fn:
+            skipped.append({"sub": sub, "reason": "no free folder name"})
             continue
         users.set_folder_name(conn, sub, fn)
         enrolled.append({"sub": sub, "folder_name": fn})
@@ -3147,15 +6611,33 @@ def create_member(conn, caller, body):
     # and patch_member_folder). Skip on collision — the global unique index (0012)
     # would otherwise 500; folder can still be set later via PATCH /members/{sub}/folder.
     if not user.get("folder_name"):
-        fn = re.sub(r'[<>:"/\\|?*\s]', '_', display_name.strip())
+        fn = _free_folder_name(conn, display_name, sub, user.get("id"))
         if fn:
-            clash = users.get_by_folder_name_global(conn, fn)
-            if clash is None or clash["cognito_sub"] == sub:
-                user = users.set_folder_name(conn, sub, fn) or user
-            else:
-                logger.info("create_member: folder_name %r taken, left unset for %s", fn, sub)
+            users.set_folder_name(conn, sub, fn)
+            user = {**user, "folder_name": fn}
+        else:
+            logger.warning("create_member: no free folder_name for %s -- left unset", sub)
     created = [memberships.ensure_membership(conn, user["id"], mem["site_id"],
                                              mem["role"]) for mem in wanted]
+
+    # THE COMPANY'S STARTER TEMPLATES, if it does not have them yet. This is
+    # the path a company actually gets its people through -- the invitation --
+    # and it was the one path that did not seed. The migration seeds the
+    # companies that existed when it ran; the retired one-shot
+    # seed backfill (2026-10-03) is gone. A company that was created empty and then got its first person
+    # by invitation (Briv, on prod) kept an empty Library forever, which is the
+    # exact symptom the owner reported on Southbase: "I can't see any template".
+    #
+    # Safe on every invitation, not just the first: the function is idempotent
+    # per company, returns 0 for a company that has them, and does not put back
+    # one the company has archived -- that was their decision about their own
+    # library. The author is the company's first officer (or member), the same
+    # rule the other two callers use, rather than the inviter -- who may be a
+    # platform_admin from a different company.
+    author = users.first_officer_or_member(conn, target_company_id)
+    if author is not None:
+        report_templates.seed_starters(conn, target_company_id, author["id"])
+
     return ok({"user": user, "memberships": created}, 201)
 
 
@@ -3270,6 +6752,13 @@ def get_asset_url(event):
 REPORT_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # The same date, matched ANYWHERE in an S3 key (report-history rows).
 REPORT_DATE_IN_KEY_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+# The worker's request ids are uuid4().hex.
+_REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+# The /sessions/{id}/… routes that build an S3 key or a scope from {id}.
+_SESSION_KEYED_ROUTE_RE = re.compile(
+    r"^/sessions/([^/]+)/(?:report/preview|report|report/status|rolling|brief)$")
 
 
 def list_org_observations(conn, caller, event):
@@ -3435,13 +6924,14 @@ def patch_action_item(conn, caller, action_item_id, body):
     # platform_admin (is_cross_company) edits across every tenant; company roles
     # stay pinned to their own company (mirrors the Team/sites fix in #96).
     cross = is_cross_company(caller["global_role"])
-    if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
+    if row is None or (not cross and not _row_company_ok(
+            conn, caller, row["company_id"], row["site_id"])):
         return error("action item not found", 404)            # incl. cross-company
     site_id = str(row["site_id"])
     if site_id not in _allowed_site_ids(conn, caller):
         return error("access denied to this task's site", 403)  # reach gate
     site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
-    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
+    is_admin = _is_company_admin_of(caller, row["company_id"], cross)
     is_site_authority = site_role in ("pm", "site_manager")
     is_assignee = _is_assignee(row, caller)
     if not (is_admin or is_site_authority or is_assignee):
@@ -3498,6 +6988,103 @@ def patch_action_item(conn, caller, action_item_id, body):
                     col, before, after, caller["id"], caller["global_role"])
     except _ActionItemVanished:
         return error("action item not found", 404)
+    return ok(updated)
+
+
+class _QuestionVanished(Exception):
+    """The row disappeared between the ACL read and the UPDATE -- abort the
+    whole transaction rather than commit an audit row for a question that isn't
+    there any more (mirrors _ActionItemVanished)."""
+
+
+_QUESTION_STATUSES = ("open", "answered", "dropped")
+
+
+def patch_question(conn, caller, stable_id, body):
+    """Answer, drop or reopen one topic question (Track B Task 5 Step 2). Addressed by
+    `topic_questions.stable_id`, never `.id` -- a question's row is replaced wholesale on
+    every re-extraction (Task 4's carry_forward assigns the successor a NEW id and only
+    copies `stable_id` across), so the id the client saw when it opened the panel may
+    already be gone by the time this PATCH lands, while the stable_id is not.
+
+    ACL is the SAME THREE checks patch_action_item makes -- company scope via
+    `is_cross_company`, the caller's site reach via `_allowed_site_ids`, and per-site role
+    authority (`is_admin` = resolve_scope==ALL or cross; `is_site_authority` = the caller's
+    OWN membership.role at THIS site is pm/site_manager, via
+    `memberships.caller_site_roles` -- reused, not re-derived, so the two endpoints can never
+    drift on what "site authority" means) -- minus patch_action_item's fourth tier
+    (assignee), which does not apply: a question has no responsible party. A caller whose
+    GLOBAL role happens to be pm/site_manager but who is only a `worker` MEMBER at this
+    question's site fails `is_site_authority` exactly like they would on an action item at
+    that site.
+
+    ONE deliberate difference from patch_action_item in the OUTCOME, not the checks:
+    patch_action_item fetches its row by a fixed id first and can therefore tell "exists,
+    wrong company" (404) apart from "exists, right company, wrong site or role" (403) as two
+    different facts about a real row it already has in hand. Here the row is reached ONLY by
+    `stable_id` through `topic_questions.get_live_by_stable_id` (itself scoped to the live
+    topic via `visible_topics_predicate`), so a caller who fails ANY of the three checks was
+    never holding a reference to anything they can prove exists -- there is nothing left to
+    leak by collapsing every refusal to 404, and the task brief calls for exactly that: same
+    checks, every refusal 404 (never the 403 patch_action_item uses for its site-reach and
+    site-authority tiers).
+
+    Role-gated to `_CORRECTION_ROLES` first (no assignee carve-out -- a question has no
+    assignee, unlike an action item's responsible party).
+
+    `status` is the only writable field. Re-sending the status the row already has is a
+    no-op -- returned as-is, same "must not litter the History panel" posture
+    patch_action_item's per-field changed-check takes, just applied to this endpoint's one
+    field. Otherwise: 'answered'/'dropped' stamp `answered_by` (the caller's users.id) and
+    `answered_at` (the database's `now()`, in topic_questions.set_status); reopening to
+    'open' clears both. One `content_edits` row (table_name='topic_questions',
+    field='status') records the transition, and the UPDATE + that audit row share ONE
+    transaction -- CLAUDE.md: a `return error(...)` after a partial write does not roll it
+    back, so both must commit or neither does (same posture as patch_action_item)."""
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    if body is None:
+        return error("malformed JSON body", 400)
+    status = body.get("status")
+    if status not in _QUESTION_STATUSES:
+        return error(f"status must be one of {sorted(_QUESTION_STATUSES)}", 400)
+
+    row = topic_questions.get_live_by_stable_id(conn, stable_id)
+    cross = is_cross_company(caller["global_role"])
+    if row is None or (not cross and not _row_company_ok(
+            conn, caller, row["company_id"], row["site_id"])):
+        return error("question not found", 404)             # incl. cross-company
+    site_id = str(row["site_id"])
+    if site_id not in _allowed_site_ids(conn, caller):
+        # Same reach gate as patch_action_item's, but 404 rather than 403 -- see docstring.
+        return error("question not found", 404)
+    site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
+    is_admin = _is_company_admin_of(caller, row["company_id"], cross)
+    is_site_authority = site_role in ("pm", "site_manager")
+    if not (is_admin or is_site_authority):
+        # Same site-authority gate as patch_action_item's, but 404 rather than 403 -- see
+        # docstring: this endpoint never confirms a row exists to leak *which* check failed.
+        return error("question not found", 404)
+
+    before = row["status"]
+    if status == before:
+        # No-op: the row is returned unchanged -- neither the UPDATE nor the content_edits
+        # audit row runs (patch_action_item's own "must not litter the History panel" rule,
+        # applied to this endpoint's one field). `row` carries an extra `company_id` key
+        # `set_status`'s RETURNING does not (topic_questions._COLS), so the response shape
+        # matches the write path exactly.
+        return ok({k: v for k, v in row.items() if k != "company_id"})
+    answered_by = caller["id"] if status != "open" else None
+    try:
+        with conn.transaction():           # UPDATE + audit row commit together
+            updated = topic_questions.set_status(conn, row["id"], status, answered_by)
+            if updated is None:
+                raise _QuestionVanished(stable_id)
+            content_edits.append_content_edit(
+                conn, row["company_id"], "topic_questions", row["id"], "status",
+                before, status, caller["id"], caller["global_role"])
+    except _QuestionVanished:
+        return error("question not found", 404)
     return ok(updated)
 
 
@@ -3629,7 +7216,8 @@ def patch_compliance_resolution(conn, caller, body):
     # Site-authority tier (no assignee branch, unlike patch_action_item).
     cross = is_cross_company(caller["global_role"])
     site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
-    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
+    is_admin = (resolve_scope(caller["global_role"]) == "ALL"
+                and str(site_id) not in _ext_pm_sites(conn, caller)) or cross
     is_site_authority = site_role in ("pm", "site_manager")
     if not (is_admin or is_site_authority):
         return error("admin/gm or this site's pm/site_manager only", 403)
@@ -3712,13 +7300,14 @@ def patch_content(conn, caller, table, row_id, body):
 
     row = content.get_content_row(conn, table, row_id)
     cross = is_cross_company(caller["global_role"])
-    if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
+    if row is None or (not cross and not _row_company_ok(
+            conn, caller, row["company_id"], row["site_id"])):
         return error("content row not found", 404)      # incl. cross-company
     site_id = str(row["site_id"])
     if site_id not in _allowed_site_ids(conn, caller):
         return error("access denied to this content's site", 403)
     site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
-    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
+    is_admin = _is_company_admin_of(caller, row["company_id"], cross)
     is_site_authority = site_role in ("pm", "site_manager")
     is_author = row.get("author_user_id") is not None and \
         str(row["author_user_id"]) == str(caller["id"])
@@ -3746,7 +7335,115 @@ def patch_content(conn, caller, table, row_id, body):
                           table, row_id)
 
     candidates = diff_candidates(before or "", value)
-    return ok({"row": updated, "candidates": candidates})
+    # THE GLOSSARY LEARNS FROM THE CORRECTION ITSELF (owner, 2026-10-02): a
+    # misheard name fixed by hand -- one word for a name spelled like it -- is
+    # kept for the row's site, so reports and the next edits use it without
+    # anyone confirming a prompt. Visible and undoable (GET/DELETE /aliases).
+    # In a savepoint, and never fails the edit.
+    learned = []
+    try:
+        with conn.transaction():
+            for wrong, right in learned_pairs(before or "", value):
+                row_a = aliases.learn_alias(conn, row["company_id"], site_id, wrong, right,
+                                            caller["id"])
+                if row_a:
+                    learned.append({"id": str(row_a["id"]), "wrong_term": wrong,
+                                    "right_term": right})
+    except Exception:
+        logger.exception("content edit %s/%s: glossary not learned (edit kept)", table, row_id)
+    _trace_glossary_learned(row["company_id"], caller, table, learned)
+    return ok({"row": updated, "candidates": candidates, "learned": learned})
+
+
+def _trace_glossary_learned(company_id, caller, table, learned):
+    """A hand correction that taught the glossary, on the trace (company-level:
+    an edit belongs to no single recording). Nothing when nothing was learned."""
+    if not learned:
+        return
+    pipeline_trace.begin("org-api", user_folder="_glossary",
+                         date=nz_time.nz_now().strftime("%Y-%m-%d"), company_id=company_id)
+    for a in learned:
+        pipeline_trace.event("glossary_learned", "ok", detail={
+            "wrong_term": a["wrong_term"], "right_term": a["right_term"], "table": table,
+            "by": str(caller.get("id"))})
+    pipeline_trace.flush(s3, LAKE_BUCKET)
+
+
+def _company_names(conn, ids):
+    names = {}
+    for cid in {i for i in ids if i}:
+        try:
+            row = companies.get_company_by_id(conn, cid)
+        except Exception:
+            row = None
+        names[cid] = row["name"] if row else None
+    return names
+
+
+def trace_day_endpoint(conn, caller, event):
+    """GET /api/org/trace/day?date=YYYY-MM-DD[&folder=<user folder>] -- what
+    the pipeline did that day (trace_views.day). platform_admin only: traces
+    span every customer (owner, 2026-10-05)."""
+    if caller["global_role"] != "platform_admin":
+        return error("platform_admin role required", 403)
+    params = event.get("queryStringParameters") or {}
+    date = params.get("date") or nz_time.nz_now().strftime("%Y-%m-%d")
+    if not REPORT_DATE_RE.match(date):
+        return error("date must be YYYY-MM-DD", 400)
+    folder = params.get("folder") or None
+    out = trace_views.day(trace_views.s3_day_reader(s3(), LAKE_BUCKET, folder), date, folder)
+    if folder is None:
+        names = _company_names(conn, [f["company_id"] for f in out["folders"]])
+        for f in out["folders"]:
+            f["company_name"] = names.get(f["company_id"])
+    return ok(out)
+
+
+def trace_funnel_endpoint(conn, caller, event):
+    """GET /api/org/trace/funnel?from=YYYY-MM-DD&to=YYYY-MM-DD -- per folder,
+    how far recordings got (trace_views.funnel). Defaults to the last 7 days."""
+    if caller["global_role"] != "platform_admin":
+        return error("platform_admin role required", 403)
+    params = event.get("queryStringParameters") or {}
+    today = nz_time.nz_now().date()
+    date_to = params.get("to") or today.isoformat()
+    date_from = params.get("from") or (today - timedelta(days=6)).isoformat()
+    if not (REPORT_DATE_RE.match(date_from) and REPORT_DATE_RE.match(date_to)):
+        return error("from and to must be YYYY-MM-DD", 400)
+    try:
+        out = trace_views.funnel(trace_views.s3_day_reader(s3(), LAKE_BUCKET),
+                                 date_from, date_to)
+    except ValueError as exc:
+        return error(str(exc), 400)
+    names = _company_names(conn, [f["company_id"] for f in out["folders"]])
+    for f in out["folders"]:
+        f["company_name"] = names.get(f["company_id"])
+    return ok(out)
+
+
+_GLOSSARY_ADMIN_ROLES = ("admin", "gm", "platform_admin")
+
+
+def list_aliases_endpoint(conn, caller):
+    """GET /api/org/aliases -- the company's glossary, for the admin list."""
+    if caller["global_role"] not in _GLOSSARY_ADMIN_ROLES:
+        return error("admin or gm required to view the glossary", 403)
+    rows = aliases.list_for_company(conn, caller["company_id"])
+    return ok({"aliases": [dict(r, id=str(r["id"]),
+                                site_id=str(r["site_id"]) if r["site_id"] else None,
+                                created_at=r["created_at"].isoformat() if r["created_at"] else None)
+                           for r in rows]})
+
+
+def retire_alias_endpoint(conn, caller, alias_id):
+    """DELETE /api/org/aliases/{id} -- undo one glossary entry."""
+    if caller["global_role"] not in _GLOSSARY_ADMIN_ROLES:
+        return error("admin or gm required to change the glossary", 403)
+    if not _UUID_RE.match(alias_id or ""):
+        return error("glossary entry not found", 404)
+    if not aliases.retire(conn, caller["company_id"], alias_id):
+        return error("glossary entry not found", 404)
+    return ok({"retired": alias_id})
 
 
 def _enqueue_content_reindex(conn, table, row_id):
@@ -3842,13 +7539,14 @@ def _topic_authority(conn, caller, topic_id):
     (None, error_response)."""
     row = content.get_content_row(conn, "topics", topic_id)
     cross = is_cross_company(caller["global_role"])
-    if row is None or (not cross and str(row["company_id"]) != str(caller["company_id"])):
+    if row is None or (not cross and not _row_company_ok(
+            conn, caller, row["company_id"], row["site_id"])):
         return None, error("topic not found", 404)
     site_id = str(row["site_id"])
     if site_id not in _allowed_site_ids(conn, caller):
         return None, error("access denied to this topic's site", 403)
     site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
-    is_admin = resolve_scope(caller["global_role"]) == "ALL" or cross
+    is_admin = _is_company_admin_of(caller, row["company_id"], cross)
     is_site_authority = site_role in ("pm", "site_manager")
     is_author = row.get("author_user_id") is not None and \
         str(row["author_user_id"]) == str(caller["id"])
@@ -4052,17 +7750,24 @@ def _source_prefixes_for(rec):
     folder, date = rec.get("folder"), rec.get("date")
     base = (rec.get("sessionBase") or "").strip()
     # A session id is a filename stem: `%`, `/` and `\` cannot appear in one. `_` CAN and
-    # does — legacy bases are `{device}_{date}_{time}` — which is why the repository escapes
-    # its bind rather than rejecting the character. Defence in depth, and the two guards
-    # fail differently: this one refuses the request, that one narrows the pattern.
+    # does — legacy bases are `{device}_{date}_{time}` — so it is allowed through. The
+    # repository's LIKE does NOT escape it: `_` matches any one character there, which
+    # over-matches and so withholds more than needed — the safe direction.
     if any(c in base for c in "%/\\"):
         return []
     if not folder or not date or not base:
         return []
+    # The date segment is what `deleted_source_prefixes(conn, None, date)` matches with
+    # `%/{date}/%` before the lake-wide summary is served. A key stored with any other
+    # date shape ("2026-8-14", a timestamp, a `/`) would be invisible to that guard, and
+    # the summary would go out WITH the deleted session in it. Every read route validates
+    # the date; this write route did not, so refuse here rather than trust the client.
+    if not isinstance(date, str) or not REPORT_DATE_RE.match(date):
+        return []
     return [f"extractions/{folder}/{date}/{base}"]
 
 
-def _can_delete_folder(conn, caller, folder):
+def _can_delete_folder(conn, caller, folder, rec=None, batch=False):
     """May `caller` delete `folder`'s recordings? Plan §0.9.
 
     Deleting is strictly stronger than viewing, so this is `_can_view_folder` AND an
@@ -4077,14 +7782,37 @@ def _can_delete_folder(conn, caller, folder):
     if not folder:
         return False, None
     sc = scope.visible_scope(conn, caller)
+    # Project-owned tenancy: a recording lies on a SITE, and the company that owns the
+    # site decides who may erase it. `rec` (folder, date, sessionBase) names the session;
+    # the tombstone is stamped with the site's company so that company's readers (and its
+    # undelete) see it. The recorder keeps their own rights over their own folder; a
+    # home-company admin has none over work done on another company's project.
+    site_cos = set()
+    if rec and rec.get("date") and (rec.get("sessionBase") or "").strip():
+        site_cos = {c for _s, c in recordings.session_site_companies(
+            conn, folder, rec["date"], rec["sessionBase"].strip())}
+    stamp = next(iter(site_cos)) if len(site_cos) == 1 else None
     if folder == sc.get("self_folder"):
-        return True, caller["company_id"]
-    if not _can_view_folder(conn, caller, folder):
-        return False, None
+        return True, stamp or caller["company_id"]
     if not (sc.get("user_scope") == "ALL" or sc.get("cross_company")):
         return False, None
-    target = (users.get_by_folder_name_global(conn, folder) if sc.get("cross_company")
-              else users.get_by_folder_name(conn, caller["company_id"], folder))
+    if sc.get("cross_company"):
+        target = users.get_by_folder_name_global(conn, folder)
+        if target is None:
+            return False, None
+        return True, stamp or target["company_id"]
+    if not _can_view_folder(conn, caller, folder):
+        return False, None
+    if batch:
+        # Undelete: revert_batch is itself company-guarded (only the company that stamped
+        # the batch can revert it), so the folder-level gate is enough here.
+        return True, caller["company_id"]
+    if site_cos:
+        # Only a session lying wholly on this company's own sites.
+        if site_cos == {str(caller["company_id"])}:
+            return True, caller["company_id"]
+        return False, None
+    target = users.get_by_folder_name(conn, caller["company_id"], folder)
     if target is None:
         return False, None
     return True, target["company_id"]
@@ -4127,7 +7855,7 @@ def delete_recordings_endpoint(conn, caller, body):
             results.append({"recording": rec, "topics_hidden": 0,
                             "error": "folder, date and sessionBase are all required"})
             continue
-        allowed, target_company = _can_delete_folder(conn, caller, rec.get("folder"))
+        allowed, target_company = _can_delete_folder(conn, caller, rec.get("folder"), rec=rec)
         if not allowed:
             results.append({"recording": rec, "topics_hidden": 0,
                             "error": "not permitted to delete this user's recordings"})
@@ -4138,7 +7866,11 @@ def delete_recordings_endpoint(conn, caller, body):
             redactions.create_recording_tombstone(
                 conn, target_company, prefix, reason,
                 caller.get("id"), caller.get("global_role"), batch_id=batch_id)
-            for row in topics.list_topics_for_source_prefix(conn, prefix) or []:
+            # include_superseded=True: this enumeration must tombstone EVERY row under the
+            # deleted prefix, superseded or not -- an untouched superseded copy would sit
+            # outside every batch and never come back with the undelete (Track B Task 2).
+            for row in topics.list_topics_for_source_prefix(
+                    conn, prefix, include_superseded=True) or []:
                 topic_ids.append(row["id"])
                 if redactions.create_redaction(
                         conn, target_company, row["id"], reason,
@@ -4152,7 +7884,8 @@ def delete_recordings_endpoint(conn, caller, body):
         # regenerates the report WITHOUT the deleted session and re-inserts clean topics
         # under new uuids, and a prefix tombstone would keep hiding those forever.
         for row in topics.list_topics_for_source_prefix(
-                conn, f"reports/{rec['date']}/{rec['folder']}/") or []:
+                conn, f"reports/{rec['date']}/{rec['folder']}/",
+                include_superseded=True) or []:
             if redactions.create_redaction(
                     conn, target_company, row["id"], reason,
                     caller.get("id"), caller.get("global_role"),
@@ -4261,18 +7994,32 @@ def undelete_recordings_endpoint(conn, caller, body):
     cross = is_cross_company(caller["global_role"])
     existing = redactions.list_batch(
         conn, batch_id, caller["company_id"], cross_company=cross) or []
+
+    def _folders_of(rows_):
+        return {(r.get("target_key") or "").split("/")[1]
+                for r in rows_ if r.get("target_type") == "recording"
+                and (r.get("target_key") or "").startswith("extractions/")}
+
+    revert_cross = cross
+    if not existing and not cross:
+        # A recorder deleting their own work on ANOTHER company's project: the batch is
+        # stamped with the site's company, not theirs. Theirs to undo only if every
+        # recording in it is their own folder's.
+        anyrows = redactions.list_batch(conn, batch_id, caller["company_id"],
+                                        cross_company=True) or []
+        mine = _folders_of(anyrows)
+        if anyrows and mine and mine == {caller.get("folder_name")}:
+            existing, revert_cross = anyrows, True
     if not existing:
         return error("batch not found", 404)
-    folders = {(r.get("target_key") or "").split("/")[1]
-               for r in existing if r.get("target_type") == "recording"
-               and (r.get("target_key") or "").startswith("extractions/")}
+    folders = _folders_of(existing)
     for folder in sorted(folders):
-        allowed, _ = _can_delete_folder(conn, caller, folder)
+        allowed, _ = _can_delete_folder(conn, caller, folder, batch=True)
         if not allowed:
             return error("not permitted to restore this batch", 403)
 
     rows = redactions.revert_batch(
-        conn, batch_id, caller["company_id"], cross_company=cross) or []
+        conn, batch_id, caller["company_id"], cross_company=revert_cross) or []
     # The search index comes back too, out of the archive and keyed on the same batch, so
     # one undelete restores exactly what one delete removed. Logged including zero: a batch
     # created before the archive shipped legitimately has none, and that has to be
@@ -4303,8 +8050,10 @@ def undelete_recordings_endpoint(conn, caller, body):
         if not still:
             continue
         company = next((r["company_id"] for r in existing), caller["company_id"])
+        # include_superseded=True: same reason as the delete side -- this re-hide must reach
+        # a superseded report topic too, or it stays outside every batch once freed.
         for row in topics.list_topics_for_source_prefix(
-                conn, f"reports/{date}/{folder}/") or []:
+                conn, f"reports/{date}/{folder}/", include_superseded=True) or []:
             redactions.create_redaction(
                 conn, company, row["id"], reason, caller.get("id"),
                 caller.get("global_role"), target_type="topic", scope="deleted",
@@ -4410,6 +8159,16 @@ def create_classification_feedback_endpoint(conn, caller, body):
         conn, row["company_id"], topic_id, verdict,
         classifier_verdict=cv, classifier_confidence=conf,
         topic_category=tc, actor_user_id=caller["id"])
+    # Track B Task 6b. object_ref=None -- a work_class verdict has no "other side"
+    # (unlike a programme_match's task or a thread's earlier topic). 'missed_personal'
+    # maps to 'rejected' like 'reject_is_work': both are the human overturning what the
+    # classifier decided (non_work in the first case, work in the second), never a
+    # confirmation of it.
+    _stamp_decision(
+        conn, kind="work_class", subject_type="topic", subject_stable_id=topic_id,
+        object_ref=None,
+        outcome=("confirmed" if verdict == "confirm_non_work" else "rejected"),
+        actor=caller["id"])
     if verdict == "reject_is_work":                           # Fable review C3
         topics.set_work_class(conn, topic_id, "work")
         try:
@@ -4792,7 +8551,12 @@ def get_org_dates(conn, caller, event):
     # page most likely to be looked at first. So the default response stays
     # BYTE-IDENTICAL and a client asks for the wider index once it can draw it.
     if (p.get("uploads") or "").strip() == "1":
+        # `None` (no company restriction) is platform_admin's alone -- it also unpins the
+        # NULL-site arm and the tombstones (final review F4). A caller on another
+        # company's project keeps the home pin; the pin is waived only for those site ids.
         company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
+        ext = ({} if company is None
+               else memberships.external_site_companies(conn, caller["id"], site_ids))
         # ISO STRINGS, NOT date OBJECTS. deleted_session_bases compares
         # `substring(target_key from '...') BETWEEN $3 AND $4`, and the left
         # side is text -- Postgres has no `text >= date` operator, so passing
@@ -4802,10 +8566,12 @@ def get_org_dates(conn, caller, event):
         # patch this function out, and a fake connection records SQL without
         # executing it, so the types never meet.
         deleted = redactions.deleted_session_bases(
-            conn, company, since.isoformat(), _dates_today().isoformat())
+            conn, company, since.isoformat(), _dates_today().isoformat(),
+            **({"also_companies": sorted(set(ext.values()))} if ext else {}))
         for u in recordings.upload_date_counts(
                 conn, company, site_ids, since,
-                author_ids=author_ids, deleted_bases=deleted):
+                author_ids=author_ids, deleted_bases=deleted,
+                **({"external_site_ids": list(ext)} if ext else {})):
             entry = out.setdefault(u["date"], {"hasReport": False, "topics": 0, "safety": 0})
             entry["hasUploads"] = True
             entry["sessions"] = u["sessions"]
@@ -4888,6 +8654,33 @@ def _allowed_site_ids(conn, caller):
 
 _SITE_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
+
+def get_site_weather(conn, caller, event):
+    """GET /api/org/weather?site=<uuid|slug>&date=YYYY-MM-DD -- one site's day.
+
+    Returns {forecast, actual}: the morning forecast the report generator
+    wrote at 05:30 (weather/<uuid>/<date>/forecast.json) and, once the day has
+    been reported, the actuals (actual.json). Each is null when not written --
+    a site with no coordinate, or a day before either job ran. What the
+    weather MEANT is already in `lines`, decided by weather_advice; the page
+    shows them as they are and decides nothing.
+
+    Same ACL as the programme: the site must be one the caller can reach.
+    """
+    params = event.get("queryStringParameters") or {}
+    site_id, err = _resolve_site_param(conn, caller, params.get("site"))
+    if err is not None:
+        return err
+    date = params.get("date") or nz_time.nz_now().strftime("%Y-%m-%d")
+    if not REPORT_DATE_RE.match(date):
+        return error("date must be YYYY-MM-DD", 400)
+    return ok({
+        "site": site_id,
+        "date": date,
+        "forecast": _get_lake_json(f"weather/{site_id}/{date}/forecast.json"),
+        "actual": _get_lake_json(f"weather/{site_id}/{date}/actual.json"),
+    })
 
 
 def _resolve_site_param(conn, caller, site_param):
@@ -5621,6 +9414,38 @@ _ALLOWED_CONFIRM_STATUSES = ("in_progress", "completed", "blocked", "delayed")
 _SUGGESTION_MANAGER_ROLES = ("admin", "gm", "pm")
 
 
+def _stamp_decision(conn, *, kind, subject_type, subject_stable_id, object_ref, outcome, actor):
+    """Track B Task 6b: best-effort `decision_records.set_human_outcome` call, shared by
+    every endpoint that answers a gated verdict (confirm/reject suggestion, confirm/reject
+    thread suggestion, classification-feedback).
+
+    Runs inside its own SAVEPOINT (`conn.transaction()`) with a WARNING on failure -- same
+    posture as `lambda_suggestion_writer._record_verdict` / `lambda_item_writer`'s
+    `_record_work_class_decision` (Ruling R10/R14). A missing or failed decision record
+    must never fail the human's confirm/reject: every one of this function's callers has
+    already committed (or is about to commit, in the same outer transaction) the REAL
+    effect of the human's decision -- a task write, a thread attach, a work_class flip --
+    and a decision_records row is provenance for that, not a precondition of it.
+
+    0 rows updated is the ordinary case for anything confirmed/rejected before this change
+    landed (no decision_records row exists yet for it) -- not logged, so routine confirms
+    do not spam WARNING. Only a genuine exception (a bad enum value, a DB error) is a
+    WARNING; it still never raises past this function."""
+    try:
+        with conn.transaction():
+            n = decision_records.set_human_outcome(
+                conn, kind=kind, subject_type=subject_type,
+                subject_stable_id=subject_stable_id, object_ref=object_ref,
+                outcome=outcome, actor=actor)
+            if n == 0:
+                logger.debug("decision record stamp matched no row: kind=%s subject=%s object=%s",
+                            kind, subject_stable_id, object_ref)
+    except Exception:
+        logger.warning("decision record stamp failed for kind=%s subject=%s object=%s -- "
+                       "the human decision itself is unaffected",
+                       kind, subject_stable_id, object_ref)
+
+
 class _SuggestionAlreadyDecided(Exception):
     """Another request decided this suggestion first — unwind rather than
     commit a second decision."""
@@ -5672,12 +9497,17 @@ def confirm_suggestion(conn, caller, suggestion_id, body):
         return error("already decided", 409)
     if str(row["site_id"]) not in _allowed_site_ids(conn, caller):
         return error("access denied to this site", 403)
-    if row["topic_id"] is None:
-        # Fable review IMPORTANT #5: the source topic was deleted/superseded
-        # (ON DELETE SET NULL — topics.py delete_topics_for_source[_prefix])
-        # before anyone reviewed this suggestion. Caught here, at confirm
-        # time, rather than proactively when the topic is superseded (see
-        # programme_suggestions.mark_stale docstring for why).
+    # Fable review IMPORTANT #5, extended for Track B Task 3: the source topic is gone from
+    # this suggestion's point of view either way -- `topic_id IS NULL` (ON DELETE SET NULL,
+    # a genuine physical delete via topics.delete_topics_for_source[_prefix]) or the id is
+    # still there but the row it names is superseded (Task 3: re-extraction marks a row
+    # instead of removing it, so `topic_id` stops going NULL for the common case -- the
+    # re-extraction that made THIS suggestion stale). `topics.get_topic` is the named lookup
+    # (deleted_predicates.visible_topics_predicate under it) rather than an inlined
+    # `superseded_at` check here, so this and every other topic-by-id lookup drift together
+    # or not at all. Caught here, at confirm time, rather than proactively when the topic is
+    # superseded (see programme_suggestions.mark_stale docstring for why).
+    if row["topic_id"] is None or topics.get_topic(conn, row["topic_id"]) is None:
         programme_suggestions.mark_stale(conn, suggestion_id)
         return error("source topic was superseded; re-review", 409)
 
@@ -5767,6 +9597,23 @@ def confirm_suggestion(conn, caller, suggestion_id, body):
                 # other programme write does. The old code wrote the derived
                 # document directly and never touched the table.
                 _write_snapshot(conn, str(row["site_id"]), prog["id"])
+
+            # Track B Task 6b: stamp the matcher's verdict with the human's answer.
+            # `new_status`/`new_progress` (computed above, BEFORE this block) are what
+            # was actually applied -- comparing THEM against the suggestion's own
+            # `suggested_status`/`suggested_progress` is 'edited' vs 'confirmed'
+            # regardless of whether the reviewer typed an explicit override or the
+            # never-lower-progress guard silently raised it; either way the outcome
+            # differs from what the model proposed. Inside this same SAVEPOINT so it
+            # commits with the confirm or not at all, but a decision-record failure
+            # alone (see _stamp_decision) can never turn this 200 into a 500.
+            _stamp_decision(
+                conn, kind="programme_match", subject_type="topic",
+                subject_stable_id=row["topic_id"], object_ref=row["task_id"],
+                outcome=("edited" if (new_status != row["suggested_status"]
+                                      or new_progress != row["suggested_progress"])
+                         else "confirmed"),
+                actor=caller["id"])
     except _SuggestionAlreadyDecided:
         return error("already decided", 409)
     except _SuggestionTaskMoved:
@@ -5787,6 +9634,10 @@ def reject_suggestion(conn, caller, suggestion_id):
     if str(row["site_id"]) not in _allowed_site_ids(conn, caller):
         return error("access denied to this site", 403)
     programme_suggestions.decide(conn, suggestion_id, "rejected", decided_by=caller["id"])
+    # Track B Task 6b.
+    _stamp_decision(conn, kind="programme_match", subject_type="topic",
+                    subject_stable_id=row["topic_id"], object_ref=row["task_id"],
+                    outcome="rejected", actor=caller["id"])
     return ok({"rejected": True})
 
 
@@ -5854,6 +9705,34 @@ def list_thread_suggestions(conn, caller, event):
     } for r in rows]})
 
 
+def _thread_decision_object_ref(conn, row):
+    """The `object_ref` `lambda_item_writer._suggest_threads_inner` used for THIS
+    suggestion's decision_records row -- always "the earlier topic id", never the
+    thread id (Track B Task 6b; see `decision_records.object_ref_for_accepted`'s
+    docstring for the full seam this closes).
+
+    `topic_thread_suggestions` carries `thread_id XOR parent_topic_id` (migration
+    0032's CHECK): when the winning candidate anchored a NEW thread, `parent_topic_id`
+    IS the earlier topic id directly -- cast to text for the object_ref column, same
+    as the writer's own `str(c["id"])`. When it joined an EXISTING thread, only
+    `thread_id` survived onto this row, and the specific candidate topic scored
+    against it is not recoverable from the row alone -- resolved instead by asking
+    decision_records for the object_ref its own writer already stamped.
+
+    Never raises (R10/R14 posture, same as `_stamp_decision` below): a lookup
+    failure here must not turn a successful confirm/reject into a 500. Returns None
+    on failure, which `_stamp_decision`/`set_human_outcome` already treat as a safe
+    no-op (no thread record has a NULL object_ref, so it simply matches nothing)."""
+    if row["parent_topic_id"] is not None:
+        return str(row["parent_topic_id"])
+    try:
+        return decision_records.object_ref_for_accepted(conn, "thread", "topic", row["topic_id"])
+    except Exception:
+        logger.warning("decision record object_ref lookup failed for thread topic=%s",
+                       row["topic_id"])
+        return None
+
+
 def confirm_thread_suggestion(conn, caller, suggestion_id):
     """Link the topic to the subject it restates.
 
@@ -5890,6 +9769,11 @@ def confirm_thread_suggestion(conn, caller, suggestion_id):
 
     threads.attach_topic(conn, row["topic_id"], thread_id, row["topic_date"])
     facts = threads.thread_facts(conn, thread_id)
+    # Track B Task 6b.
+    _stamp_decision(conn, kind="thread", subject_type="topic",
+                    subject_stable_id=row["topic_id"],
+                    object_ref=_thread_decision_object_ref(conn, row),
+                    outcome="confirmed", actor=caller["id"])
     return ok({
         "confirmed": True,
         "threadId": str(thread_id),
@@ -5902,12 +9786,17 @@ def reject_thread_suggestion(conn, caller, suggestion_id):
     """Turn a proposal down. The row is kept, not deleted: the repository
     refuses to propose the same link again, and re-asking a question someone
     already answered is the fastest way to train them to ignore the queue."""
-    _row, err = _thread_suggestion_or_error(conn, caller, suggestion_id)
+    row, err = _thread_suggestion_or_error(conn, caller, suggestion_id)
     if err is not None:
         return err
     if threads.resolve_suggestion(conn, suggestion_id, "rejected",
                                   str(caller["id"])) is None:
         return error("already decided", 409)
+    # Track B Task 6b.
+    _stamp_decision(conn, kind="thread", subject_type="topic",
+                    subject_stable_id=row["topic_id"],
+                    object_ref=_thread_decision_object_ref(conn, row),
+                    outcome="rejected", actor=caller["id"])
     return ok({"rejected": True})
 
 
@@ -5937,11 +9826,9 @@ def reject_thread_suggestion(conn, caller, suggestion_id):
 # summary_report.json (admin_disambiguation's first branch) is a day-level
 # aggregate built LAKE-WIDE across every company's folders by the report
 # generator — it has no per-folder identity to ACL-check, so instead the
-# whole branch is gated on the CALLER's company (Fix wave 1 review finding
-# 1): only the lake-owner/internal company (COMPANY_NAME, see above) may
-# see it verbatim; every other company's admin/gm skips straight to the
-# company-scoped disambiguation union below. Fail-closed: if the owner
-# company can't be resolved, the branch is skipped for everyone.
+# whole branch is gated on is_cross_company (platform_admin) -- the only role
+# allowed across tenants (spec 2026-10-03); every other admin/gm skips
+# straight to the company-scoped disambiguation union below.
 # ----------------------------------------------------------
 _LAKE_NOT_FOUND_CODES = ("NoSuchKey", "404")
 
@@ -5962,7 +9849,13 @@ def _get_lake_json(key):
     return json.loads(obj["Body"].read().decode("utf-8"))
 
 
-def _list_report_folders(date):
+def _lake_index_reads():
+    """LAKE_INDEX_READS, read at call time (R8d): request paths read the lake_objects index
+    instead of listing S3 prefixes only once the backfill has populated it."""
+    return os.environ.get("LAKE_INDEX_READS") == "true"
+
+
+def _list_report_folders(date, conn=None, caller=None):
     """S3 folder discovery for admin_disambiguation — mirrors
     lambda_fieldsight_api.py's find_any_report (lines 264-291): list every
     reports/{date}/*/daily_report.json object and take the folder segment,
@@ -5975,6 +9868,20 @@ def _list_report_folders(date):
     from available_users — mirrors the paginator pattern used elsewhere in
     this repo (lambda_ingest.py, lambda_item_writer.py, lambda_fieldsight_
     api.py's get_dates)."""
+    if conn is not None and caller is not None and _lake_index_reads():
+        # R8a: from the index, never more than the S3 path shows. A company admin/gm gets
+        # only folders whose rows carry THEIR company (NULL rows -- split_day, unresolved --
+        # are excluded); platform_admin is unrestricted. Every per-folder guard after the
+        # listing stays in place. None = table missing -> the S3 listing below, with a
+        # WARNING; an empty list is a real answer and does not fall back.
+        found = lake_objects.report_folders_for_day(
+            conn, date,
+            company_ids=None if is_cross_company(caller["global_role"]) else [caller["company_id"]],
+            key_suffix="/daily_report.json", on_missing=None)
+        if found is not None:
+            return list(found)
+        logger.warning("LAKE_INDEX_READS is on but lake_objects is missing; listing S3 for "
+                       "reports/%s/", date)
     prefix = f"reports/{date}/"
     folders = []
     try:
@@ -6030,7 +9937,19 @@ def _normalize_prose(value, alias_pairs):
     return value
 
 
-def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
+def _deadline_fields(a, date):
+    """{deadline_display, deadline_by} for one action-item row, anchored on the
+    day it was recorded. A user-set date (PATCH writes it to both columns) reads
+    the same way as a spoken one."""
+    import due_display
+    said = a.get("deadline_text") or (str(a["deadline"]) if a.get("deadline") else None)
+    d = due_display.describe(said, date)
+    return {"deadline_display": d["display"] if d else None,
+            "deadline_by": d["by"] if d else None}
+
+
+def render_report_shape(rows, doc, date, folder, conn=None, company_id=None,
+                        all_companies=False):
     """Pure function: render Aurora extraction topics INTO the
     daily_report.json shape, optionally merging the doc's own prose fields
     (executive_summary etc.) when a same-day S3 doc also exists (e.g. an
@@ -6109,7 +10028,27 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
             "category": t["category"],
             "participants": t["participants"] or [],
             "summary": t["summary"],
-            "key_decisions": [],                    # D3: v1, decisions table deferred
+            # Decisions made in this topic (migration 0058). Stored as the
+            # extractor's {decision, rationale, decided_by} objects; served as
+            # plain strings, and this is the only place that narrowing happens.
+            # topic-card.js:283-287 maps each entry straight into an <li> as a
+            # React child -- an object raises "Objects are not valid as a React
+            # child" and the whole card stops rendering. Both other producers of
+            # this key (lambda_meeting_minutes, lambda_report_generator.py:182)
+            # emit strings, so strings is the contract, not a simplification.
+            # Until 0058 this was a hardcoded [] -- and report_sections,
+            # chunking and lambda_ask_agent were all already reading it.
+            #
+            # Track B Task 5: `topics.decisions`/`topics.open_questions` (this jsonb, both
+            # keys below) is now a MIRROR of `topic_decisions`/`topic_questions` -- the two
+            # tables migration 0073 added, dual-written by lambda_item_writer alongside this
+            # same jsonb. This narrowing still reads the jsonb; switching readers over to the
+            # row tables (so a client sees an answered question's status, a decision's
+            # stable_id, etc.) is a separate, later change (Ruling R6) -- payload shape here
+            # is untouched by Task 5.
+            "key_decisions": [d if isinstance(d, str) else d.get("decision")
+                              for d in (t.get("decisions") or [])
+                              if (d.get("decision") if isinstance(d, dict) else d)],
             # Questions raised and left unanswered (migration 0055). This
             # serializer is a fixed allowlist -- the same one that silently
             # dropped `mention_count` on the way out -- so a column that is not
@@ -6131,12 +10070,25 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
             # This serializer is a fixed allowlist, so it dropped both fields on
             # the way out while every repository-level test stayed green. Found
             # only by invoking the deployed function and reading the JSON. Any
-            # future field the collapse adds has to be added here too.
+            # future field the collapse or the day reads add (edit_count -> version)
+            # has to be added here too.
             "action_items": [{"id": str(a["id"]), "action": a["text"], "responsible": a["responsible"],
                               "deadline": a["deadline_text"] or (str(a["deadline"]) if a["deadline"] else None),
+                              # The day it names, said once here for every page
+                              # (owner, 2026-10-12): "Tue 13 Oct 2026, morning",
+                              # and `deadline_by`, the local moment it is overdue
+                              # after. Readers show these instead of parsing
+                              # `deadline` again; the words stay in `deadline`.
+                              **_deadline_fields(a, date),
                               "priority": a["priority"], "status": a["status"],
                               "mention_count": a.get("mention_count", 1),
                               "collapsed_ids": [str(x) for x in (a.get("collapsed_ids") or [])],
+                              # 1 + content_edits rows for this item (todo-card spec 3.4).
+                              # edit_count is stamped by the two day reads in
+                              # repositories/topics.py; get_topic_full (reindex) does not
+                              # count, so its rows are v1. The session-report preview reads
+                              # through list_topics_for_source_prefix and carries the count.
+                              "version": 1 + int(a.get("edit_count") or 0),
                               } for a in t["action_items"]],
             # The subject this topic belongs to, when a human has confirmed
             # one. FACTS ONLY -- how many days it was raised on, when last,
@@ -6181,7 +10133,9 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None):
             prose = {k: _normalize_prose(v, alias_pairs) for k, v in prose.items()}
     meta = {"source": "live_extraction", "version": "flip-v1"}
     if conn is not None and company_id is not None:
-        stats = recordings.day_stats(conn, company_id, folder, date)
+        # all_companies: the person reading their OWN day -- the KPI covers every
+        # company's sites they recorded on, not just their home company's.
+        stats = recordings.day_stats(conn, None if all_companies else company_id, folder, date)
         # A zero is NOT "nothing was recorded". We only get here because this
         # (user, date) has extraction topics, and topics exist only because
         # something was recorded and transcribed — so no recordings rows means
@@ -6263,14 +10217,15 @@ def _timeline_target_id(conn, caller, user):
     try:
         if not user or user == (caller.get("folder_name") or ""):
             return caller["id"]
-        row = users.get_by_folder_name(conn, caller["company_id"], user)
+        row = _resolve_target_user(conn, caller["company_id"], user)
         return (row or {}).get("id") or caller["id"]
     except Exception:
         logger.exception("could not resolve timeline target for %s", user)
         return caller["id"]
 
 
-def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
+def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False,
+                              clip_foreign=False):
     """The single-(user, date) D1 read: Aurora override when extraction
     topics exist AND at least one survives the site ACL filter, else S3
     verbatim, else the 404 body. Callers (get_timeline_compat's explicit-
@@ -6290,7 +10245,18 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
     (doc forced to None) and the verbatim S3 fallback is never served -- when no
     in-scope Aurora topics exist there is nothing safe to show (404). Own-
     timeline and ALL-scope (admin/gm/platform_admin) callers pass
-    cross_user_clip=False and are UNCHANGED."""
+    cross_user_clip=False and are UNCHANGED.
+
+    clip_foreign (project-owned tenancy P3/P4): set for an ALL-tier caller
+    (admin/gm) reading SOMEONE ELSE's day. The ordinary case -- every row of the
+    day is on one of the caller's own sites -- is rendered exactly as before
+    (full prose, photo list, verbatim fallback). The moment ANY row of that
+    person's day sits on a site outside the caller's reach (they also worked on
+    another company's project), the view turns into the cross_user_clip one:
+    only in-scope rows, no whole-day prose, no photo list, and the verbatim S3
+    daily_report.json is never served (it has no site on it). A day with only
+    out-of-scope rows is a 404. The person themself and platform_admin never
+    set it."""
     # Multi-device merge: the meeting's ONE topic set is owned by the lead's
     # session key and every member's own topics were PHYSICALLY deleted, so a
     # joiner has nothing under their own prefix. Resolved on its own line and
@@ -6302,6 +10268,27 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
     # to be the target -- asking about the caller would answer a question nobody
     # posed and return the caller's own unrelated meetings.
     merged_keys = _merged_keys_for(conn, _timeline_target_id(conn, caller, user), date)
+    saw_foreign = []
+    day_cache = []
+
+    def _day_not_within():
+        """Whether this person's day holds work the caller may not see: rows on sites
+        outside the reach, and -- unless the caller may see the recorder's home
+        company's work -- site-less ones, or nothing on the caller's sites at all
+        (final review F1 whitelist). Looks at recordings as well as topics, because
+        the whole-day prose in daily_report.json covers recordings that produced no
+        topic. Fails closed."""
+        if not day_cache:
+            try:
+                tgt = _resolve_target_user(conn, caller["company_id"], user)
+                day_cache.append(tgt is None or recordings.author_day_has_rows_outside_sites(
+                    conn, tgt.get("id"), date, _allowed_site_ids(conn, caller),
+                    siteless_outside=str(tgt.get("company_id", caller["company_id"]))
+                    != str(caller["company_id"])))
+            except Exception:
+                logger.exception("foreign-row check failed for %s/%s; withholding", user, date)
+                day_cache.append(True)
+        return day_cache[0]
 
     def _aurora_shape(prefix, merged=()):
         """Return the id-carrying rendered shape for `prefix` if it has
@@ -6312,6 +10299,12 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
         if not (topics.has_topics_for_source_prefix(conn, prefix) or merged):
             return None
         allowed = _allowed_site_ids(conn, caller)
+        if user == (caller.get("folder_name") or None) and \
+                memberships.has_live_external(conn, caller["id"]):
+            # Their own day: every site they hold a live membership on counts,
+            # including a project of another company they were added to (an ALL-tier
+            # caller's reach is their own company's sites only).
+            allowed = set(allowed) | set(memberships.caller_site_roles(conn, caller["id"]))
         # The kwarg is passed ONLY when there is something to union. A day with
         # no group must reach this repository exactly as it did before -- same
         # call, same SQL, same params -- so the change cannot alter the ordinary
@@ -6320,7 +10313,13 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
                                                     merged_keys=list(merged))
                 if merged else
                 topics.list_topics_for_source_prefix(conn, prefix))
-        if not cross_user_clip:
+        clip = cross_user_clip
+        if clip_foreign and not clip:
+            foreign = [r for r in rows if str(r["site_id"]) not in allowed]
+            if foreign or _day_not_within():
+                clip = True
+                saw_foreign.append(True)
+        if not clip:
             # Own day (and ALL-scope). The caller was in that meeting, so the
             # merged record is theirs: it bypasses the site clip exactly as it
             # does on `/live-items`, and for the same three reasons -- the rows
@@ -6347,10 +10346,13 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
             return None
         # CRITICAL-1: cross-user graded view never merges the target's whole-day
         # prose (not site-clipped). Topic rows are already site-clipped above.
-        doc = None if cross_user_clip else \
+        doc = None if clip else \
             _get_lake_json(f"reports/{date}/{user}/daily_report.json")
         shape = render_report_shape(rows, doc, date, user, conn=conn,
-                                    company_id=caller.get("company_id"))
+                                    company_id=caller.get("company_id"),
+                                    **({"all_companies": True}
+                                       if _read_company(caller, user) is None
+                                       and not is_cross_company(caller["global_role"]) else {}))
         # The day's photos, as a property of the DAY rather than of a topic.
         #
         # Measured on prod the morning this was written: 71 of 90 photos on days
@@ -6373,7 +10375,7 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
         # date and a time. Handing it over says "the target was somewhere at
         # 14:32" about sites they cannot see, which is exactly what CRITICAL-1
         # withholds one line above.
-        if cross_user_clip:
+        if clip:
             # THE GATE COVERS PHOTOS, NOT ONE FIELD CARRYING THEM.
             #
             # Withholding `photo_filenames` while `topics[].related_photos`
@@ -6425,8 +10427,17 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
         # return the same rows twice under a different provenance.
         shape = _aurora_shape(prefix, merged)
         if shape is not None:
+            # `user` = the folder this read actually served, the same key the
+            # 404 envelopes carry. `user_name` is a display name here, not a folder.
+            shape["user"] = user
             return ok(shape)
-    if cross_user_clip:
+    if clip_foreign and not cross_user_clip and not saw_foreign:
+        # Nothing rendered and no foreign row was seen in the loop (a prefix with no
+        # topics at all): the verbatim doc below is whole-day and site-less, so it
+        # is served only if NOTHING that day sits outside this caller's reach.
+        if _day_not_within():
+            saw_foreign.append(True)
+    if cross_user_clip or saw_foreign:
         # CRITICAL-1: no in-scope Aurora topics for this (target, date). The
         # verbatim S3 daily_report.json is NOT site-clipped, so serving it would
         # leak the target's out-of-scope content. Nothing safe to show -> 404.
@@ -6444,7 +10455,14 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False):
                    "date": date, "user": user}, 404)
     doc = _get_lake_json(f"reports/{date}/{user}/daily_report.json")
     if doc is not None:
-        return ok(doc)                              # VERBATIM (byte-identical history)
+        # VERBATIM (byte-identical history) -- EXCEPT the model name. This is
+        # the one place the report generator's own `_report_metadata.model`
+        # (an internal provenance field, never meant to leave the building)
+        # would otherwise ride straight through to a customer's browser,
+        # because this branch serves the S3 object byte-for-byte. Strip just
+        # that one key on the way out; the stored S3 object is untouched.
+        # Same `user` key as the Aurora path and the 404s: the served folder.
+        return ok({**_without_vendor_metadata(doc), "user": user})
     # `user` is the folder as a FIELD. It was only ever in the human-readable
     # message, and the client needs it to build the photo key -- leaving it
     # there would have made a UI parse an English sentence for an identifier.
@@ -6480,7 +10498,7 @@ def _day_photo_block(conn, caller, user, date):
     be told from one that never ran.
     """
     try:
-        company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
+        company = _read_company(caller, user)
         photos = recordings.photo_list_for_day(conn, company, user, date)
         hidden = redactions.deleted_photo_keys(
             conn, company, keys=[p["s3_key"] for p in photos])
@@ -6509,7 +10527,7 @@ def _photo_groups(conn, caller, user, date, photos):
     Never raises: the flat list is the answer, this is an improvement on it.
     """
     try:
-        company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
+        company = _read_company(caller, user)
         markers = location_markers.for_day(conn, company, user, date)
         if not markers:
             return None
@@ -6518,7 +10536,7 @@ def _photo_groups(conn, caller, user, date, photos):
             name = ph["s3_key"].rsplit("/", 1)[-1]
             taken = extract_base_time_from_filename(name)
             where = location_markers.locate(
-                markers, taken.strftime("%H:%M") if taken else None)
+                markers, taken.strftime("%H:%M:%S") if taken else None)
             if where not in groups:
                 groups[where] = []
                 order.append(where)
@@ -6562,14 +10580,24 @@ def _day_upload_facts(conn, caller, user, date):
     # speaks when someone is watching is indistinguishable from one that
     # never ran.
     try:
-        company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
+        company = _read_company(caller, user)
         site_ids = _allowed_site_ids(conn, caller)
         if not site_ids:
             return None
-        deleted = redactions.deleted_session_bases(conn, company, date, date)
-        stats = recordings.range_stats(conn, company, date, date, site_ids,
+        # range_stats is NOT folder-scoped (site + author scoped), so its company pin is
+        # the caller's home company whoever's day this is: `None` would also count every
+        # tenant's site-less recordings (final review F4). Their own external sites are
+        # exempted by site id.
+        stats_company = None if is_cross_company(caller["global_role"]) else caller["company_id"]
+        ext = ({} if stats_company is None
+               else memberships.external_site_companies(conn, caller["id"], site_ids))
+        deleted = redactions.deleted_session_bases(
+            conn, stats_company, date, date,
+            **({"also_companies": sorted(set(ext.values()))} if ext else {}))
+        stats = recordings.range_stats(conn, stats_company, date, date, site_ids,
                                        author_ids=_author_filter(conn, caller),
-                                       deleted_bases=deleted)
+                                       deleted_bases=deleted,
+                                       **({"external_site_ids": list(ext)} if ext else {}))
         # Transcription does not go through the LLM provider, so on a day the
         # extraction failed the transcripts are usually sitting there, readable,
         # through a route (/transcripts) that needs no topics. Counting them is
@@ -6607,31 +10635,51 @@ def _day_upload_facts(conn, caller, user, date):
 
 
 def admin_disambiguation(conn, caller, date):
-    """D1(iv): admin/gm asked for a date with no ?user=. Try the day's
-    aggregate summary_report.json verbatim first — but ONLY for the
-    lake-owner/internal company (Fix wave 1 review finding 1): this doc is
-    built LAKE-WIDE across every company's folders by the report generator,
-    so serving it to a customer-company admin was a cross-tenant leak.
-    Fail-closed: if the owner company can't be resolved, the branch is
-    skipped for everyone, not just non-owners. Otherwise union S3-listed
+    """D1(iv): admin/gm asked for a date with no ?user=.
+    Serve the day's aggregate summary_report.json verbatim first -- but ONLY
+    to is_cross_company (platform_admin): the report generator builds it
+    from every tenant's folders. Everyone else is offered their own company's
+    reports/{date}/companies/{company_id}/summary_report.json (Task 10). It used to be gated on "the caller's company
+    is the operator company", which would have handed it to that company's gm;
+    the name lookup behind that gate returned None, so the leak was closed only
+    by accident (spec 2026-10-03). Otherwise union S3-listed
     report folders (company-filtered via users.get_by_folder_name —
     RETARGET override 5) with Aurora's extraction-sourced folder names
     (already company-scoped by the repository query itself). One candidate
     recurses into the single-user path; several return the disambiguation
     envelope the UI's meeting-picker expects; none is a 404."""
-    owner = companies.get_company_by_name(conn, COMPANY_NAME)
-    if owner is not None and str(caller["company_id"]) == str(owner["id"]):
+    if is_cross_company(caller["global_role"]):
         # Same door, aggregate form: summary_report.json is lake-wide and byte-verbatim,
         # so a deleted session's words sit inside it whatever the SQL filters say.
         doc = (None if _day_has_deleted_sources(conn, None, date)
                else _get_lake_json(f"reports/{date}/summary_report.json"))
         if doc is not None:
             return ok(doc)
+    elif caller.get("company_id") and os.environ.get("COMPANY_SUMMARY_SERVE") == "on":
+        # Off by default: serving it replaces the person picker an admin/gm sees today with
+        # an AI summary, which is the owner's product decision. Task 10 (R10b): every other caller gets ONLY their own company's summary, built by
+        # the generator from that company's folders (external members already left out).
+        # The key comes from the caller row, never from the request. The guard stays the
+        # lake-wide _day_has_deleted_sources (folder=None): conservative, it over-blocks a
+        # company whose day is clean when another company deleted a source that day. Absent
+        # document -> the folder-union path below, exactly as before.
+        doc = (None if _day_has_deleted_sources(conn, None, date)
+               else _get_lake_json(
+                   f"reports/{date}/companies/{caller['company_id']}/summary_report.json"))
+        if doc is not None:
+            return ok(doc)
     candidates = set()
-    for folder in _list_report_folders(date):
-        if users.get_by_folder_name(conn, caller["company_id"], folder) is not None:
+    for folder in _list_report_folders(date, conn, caller):
+        if _all_tier_may_open(conn, caller, folder):
             candidates.add(folder)
-    candidates.update(topics.list_extraction_folder_names_for_date(conn, caller["company_id"], date))
+    # By SITE, not by author company: an external member's topics on this company's
+    # sites belong here, and a home-company author's topics on another company's
+    # site do not (project-owned tenancy P3).
+    candidates.update(topics.list_extraction_folder_names_for_date(
+        conn,
+        ({str(x["id"]) for x in sites.list_company_sites(conn, caller["company_id"])}
+         if is_cross_company(caller["global_role"]) else _allowed_site_ids(conn, caller)),
+        date))
     # And the folders that captured something but produced no report. Without
     # this the calendar's upload-only days open onto a bare 404 for an admin:
     # neither source above knows a folder whose extraction never ran, so there
@@ -6665,23 +10713,94 @@ def _can_view_folder(conn, caller, target_folder):
     """GRADED /timeline authority (spec §3.2): may caller read target_folder's
     (folder, date) timeline? Own folder always; SITE (pm/regional) any user on
     an in-scope site; SELF+WORKERS (site_manager) own + workers on in-scope
-    sites; SELF (worker) own only. Company-pinned: the target is resolved
-    within caller.company_id first (unless caller is cross-company)."""
+    sites; SELF (worker) own only.
+
+    The target is resolved GLOBALLY (project-owned tenancy P3): a person's
+    directory row is in their HOME company, but they may have worked on this
+    caller's company's sites. What the caller may then SEE of that person is
+    decided row by row, by site, where the data is read -- this gate only says
+    the folder may be opened at all. For the ALL tier (admin/gm) a target of
+    the caller's own company always opens; a target of another company opens
+    only when they have a footprint (a membership, topic or recording) on one
+    of the caller's in-scope sites. platform_admin keeps cross-company reach."""
     sc = scope.visible_scope(conn, caller)
     if target_folder and target_folder == sc["self_folder"]:
         return True
-    if sc["cross_company"]:
-        target = users.get_by_folder_name_global(conn, target_folder)
-    else:
-        target = users.get_by_folder_name(conn, caller["company_id"], target_folder)
+    target = _resolve_target_user(conn, caller["company_id"], target_folder)
     if target is None:
-        return False                                          # not in caller's company / unknown
+        return False                                          # unknown
     if sc["user_scope"] == "ALL":
-        return True
+        if sc["cross_company"] or str(target["company_id"]) == str(caller["company_id"]):
+            return True
+        return recordings.author_footprint_in_sites(conn, target["id"], sc["site_ids"])
     if sc["user_scope"] == "SITE":
         target_sites = memberships.caller_site_roles(conn, target["id"])
         return any(sid in sc["site_ids"] for sid in target_sites)   # target is on an in-scope site
     return str(target["id"]) in (sc["author_ids"] or set())   # SELF / SELF+WORKERS
+
+
+def _resolve_target_user(conn, company_id, folder):
+    """The directory row for a `?user=` folder: the caller's own company first (the
+    ordinary case, one indexed lookup as before), then the global directory -- a
+    person of ANOTHER company who worked on this company's sites (project-owned
+    tenancy P3). Whether the caller may see anything of them is decided by the
+    callers of this, by site."""
+    return (users.get_by_folder_name(conn, company_id, folder)
+            or users.get_by_folder_name_global(conn, folder))
+
+
+def _ext_pm_sites(conn, caller):
+    """Sites of ANOTHER company on which this ALL-tier caller is an external pm."""
+    if is_cross_company(caller["global_role"]):
+        return set()
+    return scope.visible_scope(conn, caller).get("external_pm_site_ids") or set()
+
+
+def _row_company_ok(conn, caller, row_company, site_id):
+    """The company pin of the row-level write gates: the caller's own company, or a
+    site on which they are an external pm (membership governs reach there)."""
+    return (str(row_company) == str(caller["company_id"])
+            or str(site_id) in _ext_pm_sites(conn, caller))
+
+
+def _is_company_admin_of(caller, row_company, cross):
+    """admin/gm authority applies to the caller's OWN company's rows only -- never to
+    a project of another company they merely hold a membership on."""
+    return (resolve_scope(caller["global_role"]) == "ALL"
+            and str(row_company) == str(caller["company_id"])) or cross
+
+
+def _read_company(caller, folder):
+    """The company pin for a per-person read of (folder, date).
+
+    None = unrestricted: a cross-company caller, or a person reading THEIR OWN
+    folder -- their day spans every company whose sites they recorded on, and
+    rows carry the SITE's company, so pinning their home company would hide
+    their own work on someone else's project. Everyone else is pinned to their
+    own company, which with site-owned rows means "the part of this person's
+    day captured on my company's sites"."""
+    if is_cross_company(caller["global_role"]):
+        return None
+    if folder and folder == (caller.get("folder_name") or None):
+        return None
+    return caller["company_id"]
+
+
+def _all_tier_may_open(conn, caller, folder):
+    """ALL-tier (admin/gm/platform_admin) gate for an explicit `?user=` folder:
+    the caller's own folder, a person of their company, a person with a footprint
+    on their sites, or (platform_admin) anyone. Unknown folder -> False."""
+    if folder and folder == (caller.get("folder_name") or None):
+        return True
+    if is_cross_company(caller["global_role"]):
+        return users.get_by_folder_name_global(conn, folder) is not None
+    target = _resolve_target_user(conn, caller["company_id"], folder)
+    if target is None:
+        return False
+    if str(target.get("company_id", caller["company_id"])) == str(caller["company_id"]):
+        return True
+    return recordings.author_footprint_in_sites(
+        conn, target["id"], scope.visible_scope(conn, caller)["site_ids"])
 
 
 def get_timeline_compat(conn, caller, event):
@@ -6694,10 +10813,16 @@ def get_timeline_compat(conn, caller, event):
         if sc["user_scope"] == "ALL":                         # admin/gm/platform_admin
             if not user:
                 return admin_disambiguation(conn, caller, date)
-            if not sc["cross_company"] and \
-                    users.get_by_folder_name(conn, caller["company_id"], user) is None:
+            # Project-owned tenancy P3/P4: the folder is resolved globally and
+            # EVERY tier is clipped to the caller's in-scope sites. The ALL tier no
+            # longer renders a person's whole day unclipped: whatever part of it
+            # sits on sites outside this caller's reach is withheld. The person
+            # themself, and platform_admin, still see all of it.
+            if not sc["cross_company"] and not _all_tier_may_open(conn, caller, user):
                 return error("user not found in your company", 404)
-            return _render_timeline_for_user(conn, caller, date, user)
+            return _render_timeline_for_user(
+                conn, caller, date, user,
+                clip_foreign=(not sc["cross_company"] and user != sc["self_folder"]))
         # graded non-ALL: default self, but pm/regional/site_manager may view
         # in-scope users (spec §3.2 -- no longer hard-forced to self).
         if not user:
@@ -6730,11 +10855,14 @@ def get_timeline_compat(conn, caller, event):
         user = own                                  # D10: forced self, no ACL lookup needed
     if not user:                                    # admin/gm, no user
         return admin_disambiguation(conn, caller, date)
-    if is_all and users.get_by_folder_name(conn, caller["company_id"], user) is None:
+    if is_all and not _all_tier_may_open(conn, caller, user):
         # RETARGET override 5: an explicit ?user= from an ALL-scope caller
-        # must resolve to a folder in THIS company before any lake read.
+        # must resolve to a person with work on THIS company's sites.
         return error("user not found in your company", 404)
-    return _render_timeline_for_user(conn, caller, date, user)
+    return _render_timeline_for_user(
+        conn, caller, date, user,
+        clip_foreign=(is_all and not is_cross_company(caller["global_role"])
+                      and user != (caller.get("folder_name") or None)))
 
 
 # ----------------------------------------------------------
@@ -6978,6 +11106,116 @@ def build_day_sessions(conn, caller, folder, date, rows):
     return sessions, excluded
 
 
+def _block_thresholds():
+    """(gap_seconds, long_block_seconds) for recording blocks.
+
+    Read per request rather than at import: org-api is the single reader of both
+    (design 2026-09-15 §5.5 as amended by F9). The defaults must equal the template's,
+    which test_template_workflow_parameter_wiring pins.
+    """
+    return (float(os.environ.get("REPORT_BLOCK_GAP_SECONDS", "600")),
+            float(os.environ.get("REPORT_LONG_BLOCK_SECONDS", "5400")))
+
+
+def _recording_blocks_entry(conn, folder, date, rows, sessions):
+    """{"recording_blocks": [...]} for the sessions envelope, or {} when there is no answer.
+
+    {} -- so the key is ABSENT, not empty -- when the folder has no users row or the day
+    has never been computed. The UI renders sessions then and never waits.
+
+    The owner is resolved with users.get_by_folder_name_global, the same lookup the
+    writer (lambda_recording_segments) keys the row with, so the two always agree. The
+    folder is already authorised by _resolve_org_media_folder before this runs.
+    _timeline_target_id is NOT used: it falls back to the CALLER on a miss, which here
+    would serve the caller's own blocks under someone else's day.
+
+    F1, applied at read time on the stored segments:
+      * a session that has topic rows but none survived build_day_sessions (all
+        redacted or non_work) is not advertised. A session with audio and no topic rows
+        at all -- extraction pending, or nothing extracted -- is kept: that untopic'd
+        audio is what a whole-block window exists to cover (design §4.1);
+      * a recording tombstoned by source prefix is not advertised;
+      * every device session of a deleted MERGED meeting is not advertised. That delete
+        writes one tombstone, `extractions/{lead_folder}/{date}/grp{lead_sid}`, which names
+        none of the device sids stored here and, for a member, not even this folder, so
+        the folder-narrowed prefix arm can never see it. It is expanded to the member
+        sessions it covers (day_recording_segments.deleted_group_session_ids).
+
+    F1 fix round 1 (I1): the exclusion set above is computed on RAW session bases
+    (session_scope.session_ref), not on session_scope.device_session_id -- that helper
+    only matches a chunk session's `sid{32hex}` base and maps a `grp{lead_sid}` base OR
+    a legacy whole-file base to None, which used to make both un-excludable (they landed
+    in both "has topics" and "listed", cancelling out). Excluded bases are now
+    reclassified:
+      * `sid{32hex}`     -> the 32-hex id, added straight to the excluded session ids;
+      * `grp{lead_sid}`  -> the lead id is expanded via
+        day_recording_segments.group_member_session_ids to the lead AND every member
+        device session, all added to the excluded ids (mirrors the deleted-meeting
+        expansion above, but for exclusion rather than deletion);
+      * anything else (a legacy whole-file base) -> `extractions/{folder}/{date}/{base}`
+        is added to the prefixes passed to recording_blocks.filter_segments; a
+        session_id-less legacy segment's own tombstone candidates already include that
+        exact key (recording_blocks._tombstone_candidates), so the prefix arm alone
+        hides it without any change to recording_blocks.py.
+    topic_row_ids only name topics that survived build_day_sessions.
+
+    M1: blocks are NOT clipped to _allowed_site_ids -- stored segments carry no site_id
+    at all, only session/topic identity, so there is nothing here to clip against. This
+    is the same folder-gated (not site-gated) exposure /audio-segments already has for a
+    single recording; a later export task must not treat a block's `session_ids` as
+    site-authorised on its own.
+
+    Any failure logs and returns {}: blocks are an enhancement to a picker that works
+    without them, and must never 500 the sessions read.
+    """
+    try:
+        owner = users.get_by_folder_name_global(conn, folder)
+        if owner is None:
+            return {}
+        stored = day_recording_segments.get(conn, owner["id"], date)
+        if stored is None:
+            return {}
+        listed_bases = {s["session_id"] for s in sessions}
+        with_topic_bases = set()
+        for r in rows:
+            base, kind = session_scope.session_ref(r.get("source_s3_key"))
+            if kind == session_scope.KIND_EXTRACTION:
+                with_topic_bases.add(base)
+        excluded_bases = (with_topic_bases - listed_bases) - {None}
+
+        excluded_ids = set()
+        excluded_lead_sids = []
+        extra_prefixes = []
+        for base in excluded_bases:
+            hexid = session_scope.device_session_id(base)
+            grp_match = re.match(r"^grp([0-9a-f]{32})$", base) if hexid is None else None
+            if hexid is not None:
+                excluded_ids.add(hexid)
+            elif grp_match is not None:
+                excluded_lead_sids.append(grp_match.group(1))
+            else:
+                extra_prefixes.append(f"extractions/{folder}/{date}/{base}")
+        if excluded_lead_sids:
+            excluded_ids |= day_recording_segments.group_member_session_ids(
+                conn, excluded_lead_sids)
+
+        excluded_ids |= day_recording_segments.deleted_group_session_ids(
+            conn, [s.get("session_id") for s in stored["segments"]])
+        prefixes = redactions.deleted_source_prefixes(conn, folder, date) + extra_prefixes
+        kept = recording_blocks.filter_segments(stored["segments"], excluded_ids, prefixes)
+        gap_seconds, long_block_seconds = _block_thresholds()
+        visible_ids = {tid for s in sessions for tid in s["topic_row_ids"]}
+        topic_rows = [r for r in rows if str(r["id"]) in visible_ids]
+        blocks = recording_blocks.merge_segments(kept, gap_seconds, long_block_seconds)
+        for block in blocks:
+            block["topic_row_ids"] = recording_blocks.topic_ids_in_block(block, topic_rows)
+        return {"recording_blocks": blocks}
+    except Exception:
+        logger.exception("recording blocks unavailable for %s %s; serving sessions without them",
+                         folder, date)
+        return {}
+
+
 def get_org_sessions(conn, caller, event):
     """GET /api/org/sessions?date=YYYY-MM-DD[&user={folder}]
 
@@ -7017,6 +11255,7 @@ def get_org_sessions(conn, caller, event):
         "gap_minutes": session_scope.SESSION_GAP_MINUTES,
         "sessions": sessions,
         "excluded": excluded,
+        **_recording_blocks_entry(conn, folder, date, rows, sessions),
     })
 
 
@@ -7170,6 +11409,93 @@ def _list_media_objects(prefix, what):
         raise
 
 
+def _may_see_siteless_of(conn, caller, folder):
+    """Whether `caller` may see the part of `folder`'s work that sits on NO site.
+
+    A site-less recording/row belongs to the recorder's HOME company (project-owned
+    tenancy P2), so only that company -- and platform_admin, and the person --
+    may see it (final review F1, R1 whitelist). An external member's home work is
+    never visible to the company whose project they were added to, whatever role
+    that company's people hold. Unknown folder -> False (fail closed)."""
+    if is_cross_company(caller["global_role"]):
+        return True
+    if folder and folder == (caller.get("folder_name") or None):
+        return True
+    tgt = users.get_by_folder_name_global(conn, folder)
+    return bool(tgt) and str(tgt["company_id"]) == str(caller["company_id"])
+
+
+class _SessionHider:
+    """The WHITELIST for one (folder, date) as read by someone other than the person.
+
+    A session is shown only when (a) a recording or extraction row ties it to a site
+    in the caller's reach, or (b) it sits on no site and the caller may see the
+    recorder's home-company work. A session with ANY row on a site outside the reach
+    is hidden whatever else it carries. Everything else -- site-less, row-less,
+    unidentifiable -- is hidden unless (b)."""
+
+    def __init__(self, conn, allowed, siteless_ok, inside, outside):
+        self._conn, self._allowed = conn, allowed
+        self.siteless_ok, self.inside, self.outside = siteless_ok, inside, outside
+
+    def hides(self, sid):
+        if sid and sid in self.outside:
+            return True
+        if sid and sid in self.inside:
+            return False
+        return not self.siteless_ok
+
+    def hides_key(self, key):
+        """For one object key: its session id decides; a key with none (a photo)
+        is decided by the site of its own recordings row."""
+        sid = _session_of(key)
+        if sid:
+            return self.hides(sid)
+        row = self._conn.execute(
+            "SELECT site_id IS NULL, COALESCE(site_id = ANY(%s::uuid[]), false) "
+            "FROM recordings WHERE s3_key = %s LIMIT 1", (self._allowed, key)).fetchone()
+        if row and not row[0]:
+            return not row[1]            # on a site: in reach -> shown, else hidden
+        return not self.siteless_ok
+
+
+def _session_hider(conn, caller, folder, date):
+    """A `_SessionHider` for one (folder, date), or None when nothing is restricted
+    (no caller, the person themself, platform_admin).
+
+    NOT fail-open, unlike the tombstone lookup: a failure here would hand one
+    company another company's recording, so it propagates."""
+    if conn is None or caller is None or not folder:
+        return None
+    if is_cross_company(caller["global_role"]) or folder == (caller.get("folder_name") or None):
+        return None
+    allowed = [str(x) for x in _allowed_site_ids(conn, caller)]
+    inside, outside = set(), set()
+    like = recordings._escape_like(folder)
+    date = date or "%"        # a key with no date segment: judge by the whole folder
+    for sql, pat in (
+            ("SELECT s3_key, site_id IS NULL, COALESCE(site_id = ANY(%s::uuid[]), false) "
+             "FROM recordings WHERE s3_key LIKE %s", f"users/{like}/%/{date}/%"),
+            ("SELECT source_s3_key, site_id IS NULL, COALESCE(site_id = ANY(%s::uuid[]), false) "
+             "FROM topics WHERE source_s3_key LIKE %s", f"extractions/{like}/{date}/%")):
+        for key, no_site, in_reach in conn.execute(sql, (allowed, pat)).fetchall():
+            sid = _session_of(key)
+            if not sid or no_site:
+                continue
+            (inside if in_reach else outside).add(sid)
+    return _SessionHider(conn, allowed, _may_see_siteless_of(conn, caller, folder),
+                         inside, outside)
+
+
+def _drop_hidden_media(items, hider, keyfn, what):
+    """Whitelist filter for a media listing (see `_SessionHider`)."""
+    if hider is None:
+        return items
+    kept = [it for it in items if not hider.hides_key(keyfn(it))]
+    logger.info("media %s: not-in-reach dropped=%d of %d", what, len(items) - len(kept), len(items))
+    return kept
+
+
 def _deleted_sessions_for_day(conn, folder, date):
     """Tombstoned source prefixes for one (folder, date), or an empty set.
 
@@ -7219,7 +11545,7 @@ def _session_of(key):
     return turn_name_overlay.session_base(key)
 
 
-def _read_org_transcripts(date, folder, start_time, end_time, conn=None):
+def _read_org_transcripts(date, folder, start_time, end_time, conn=None, caller=None):
     """S3 read + normalize for one (folder, date) window -- mirrors
     lambda_fieldsight_api.get_transcripts's locate/parse/response-shape
     verbatim (same per-file `segments[]` and speaker-turn `speaker_
@@ -7250,6 +11576,11 @@ def _read_org_transcripts(date, folder, start_time, end_time, conn=None):
     else:
         logger.info("media transcripts: tombstoned=0 dropped=0 of %d",
                     len(transcript_files))
+    # Whitelist (final review F1): only sessions on a site in the caller's reach, or
+    # site-less ones the caller may see because they are the recorder's home company's.
+    transcript_files = _drop_hidden_media(
+        transcript_files, _session_hider(conn, caller, folder, date), lambda k: k,
+        "transcripts")
 
     if not transcript_files:
         return {"text": "", "segments": [], "speaker_segments": [], "message": "No transcripts found"}
@@ -7407,8 +11738,7 @@ def _resolve_org_media_folder(conn, caller, user, what="media"):
                 user = sc["self_folder"] or ""
             if not user:
                 return None, error("user required", 400)
-            if not sc["cross_company"] and \
-                    users.get_by_folder_name(conn, caller["company_id"], user) is None:
+            if not sc["cross_company"] and not _all_tier_may_open(conn, caller, user):
                 return None, error("user not found in your company", 404)
             return user, None
         if not user:
@@ -7431,7 +11761,7 @@ def _resolve_org_media_folder(conn, caller, user, what="media"):
         user = caller.get("folder_name") or ""
     if not user:
         return None, error("user required", 400)
-    if users.get_by_folder_name(conn, caller["company_id"], user) is None:
+    if not _all_tier_may_open(conn, caller, user):
         return None, error("user not found in your company", 404)
     return user, None
 
@@ -7583,7 +11913,64 @@ def _company_folder_names(conn, company_id):
             if u.get("folder_name")}
 
 
-def _read_org_report_history(folder_scope, limit):
+_REPORT_INDEX_PAGE = 100
+
+
+def _report_history_from_index(conn, caller, folder_scope, limit, keep):
+    """Report history from lake_objects. Returns the response dict, or None when the table is
+    missing (the caller then runs the S3 listing). Same row shape as the S3 path.
+
+    R8b: filtered by folder scope AND company. A folder that is not the caller's own only
+    yields rows of the caller's company (platform_admin: any); NULL-company rows are never
+    shown to others. The caller's OWN folder yields every row, NULL included."""
+    cross = is_cross_company(caller["global_role"])
+    kw = dict(folders=None if folder_scope is None else sorted(folder_scope),
+              company_ids=None if cross else [caller["company_id"]],
+              own_folder=None if cross else (caller.get("folder_name") or None),
+              key_suffix="_report.json", exclude_debug=True, on_missing=None)
+    reports = []
+    page_size = max(limit * 2, _REPORT_INDEX_PAGE)
+    offset = 0
+    while len(reports) < limit:
+        rows = lake_objects.list_reports(conn, limit=page_size, offset=offset, **kw)
+        if rows is None:
+            return None
+        for r in rows:
+            if keep is not None and not keep(r["s3_key"]):
+                continue
+            reports.append(r)
+            if len(reports) >= limit:
+                break
+        if len(rows) < page_size:
+            break
+        offset += page_size
+    docx = {}
+    if reports:
+        cands = [r["s3_key"][:-len(".json")] + ".docx" for r in reports]
+        drows = lake_objects.list_reports(conn, keys=cands, limit=len(cands),
+                                          on_missing=None)
+        if drows is None:
+            return None
+        docx = {d["s3_key"]: d for d in drows}
+    out = []
+    for r in reports:
+        key = r["s3_key"]
+        dm = REPORT_DATE_IN_KEY_RE.search(key)
+        row = {"key": key,
+               "type": ("weekly" if "weekly" in key else "monthly" if "monthly" in key else "daily"),
+               "date": dm.group(1) if dm else "",
+               "generated_at": (r.get("object_modified_at") or r["updated_at"]).isoformat(),
+               "size": r.get("size_bytes") or 0}
+        d = docx.get(key[:-len(".json")] + ".docx")
+        if d is not None:
+            row["docx_key"] = d["s3_key"]
+            row["docx_size"] = d.get("size_bytes") or 0
+            row["docx_generated_at"] = (d.get("object_modified_at") or d["updated_at"]).isoformat()
+        out.append(row)
+    return {"reports": out}
+
+
+def _read_org_report_history(folder_scope, limit, keep=None, conn=None, caller=None):
     """List the lake's report index, filtered by an ALREADY-RESOLVED folder
     scope. `folder_scope is None` means unrestricted; callers MUST have
     short-circuited the deny-all (empty set) case before getting here.
@@ -7611,8 +11998,19 @@ def _read_org_report_history(folder_scope, limit):
     each would be a round trip to learn something this listing already carries,
     and a presigned URL for a key that does not exist answers 403 here rather
     than 404, so the failure would not even read as "missing"."""
+    # platform_admin keeps the S3 listing: it is unrestricted, and the index does not record
+    # the lake-wide summaries and site rollups as reports (A7), which it alone is shown.
+    if (conn is not None and caller is not None and _lake_index_reads()
+            and not is_cross_company(caller.get("global_role"))):
+        # Empty is an answer ("no reports"); only the missing-table sentinel falls back.
+        out = _report_history_from_index(conn, caller, folder_scope, limit, keep)
+        if out is not None:
+            return out
+        logger.warning("LAKE_INDEX_READS is on but lake_objects is missing; listing the "
+                       "whole reports/ prefix")
     reports = []
     docx_sizes = {}
+    docx_times = {}
     try:
         paginator = s3().get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=LAKE_BUCKET, Prefix=REPORT_LAKE_PREFIX):
@@ -7620,6 +12018,7 @@ def _read_org_report_history(folder_scope, limit):
                 key = obj["Key"]
                 if key.endswith("_report.docx"):
                     docx_sizes[key] = obj["Size"]
+                    docx_times[key] = obj["LastModified"].isoformat()
                     continue
                 if not key.endswith("_report.json") or "_debug" in key:
                     continue
@@ -7627,6 +12026,8 @@ def _read_org_report_history(folder_scope, limit):
                     owner = _report_key_owner_folder(key)
                     if owner is None or owner not in folder_scope:
                         continue
+                if keep is not None and not keep(key):
+                    continue
                 rtype = ("weekly" if "weekly" in key
                          else "monthly" if "monthly" in key else "daily")
                 dm = REPORT_DATE_IN_KEY_RE.search(key)
@@ -7652,6 +12053,12 @@ def _read_org_report_history(folder_scope, limit):
         if cand in docx_sizes:
             r["docx_key"] = cand
             r["docx_size"] = docx_sizes[cand]
+            # When the Word file itself was written. The generator saves the JSON
+            # first and the .docx after it, so a client following a regenerate
+            # that looks only at generated_at can stop between the two and show
+            # a new report beside the previous Word file. Same listing pass, no
+            # extra request.
+            r["docx_generated_at"] = docx_times[cand]
 
     reports.sort(key=lambda r: r["date"], reverse=True)
     return {"reports": reports[:limit]}
@@ -7675,7 +12082,70 @@ def get_org_report_history(conn, caller, event):
         # DENY ALL -- return early rather than fall into a filter loop whose
         # predicate an empty container would silently satisfy.
         return ok({"reports": []})
-    return ok(_read_org_report_history(folder_scope, limit))
+    return ok(_read_org_report_history(
+        folder_scope, limit, keep=_report_entry_guard(conn, caller), conn=conn, caller=caller))
+
+
+def _report_key_period(key):
+    """(date_from, date_to) ISO strings a per-user report object covers, from its key,
+    or None when the key carries no date.
+
+    reports/{end}/{folder}/daily_report.json   -> the day
+    reports/{end}/{folder}/weekly_report.json  -> the 7 days ending {end}
+    reports/{end}/{folder}/monthly_report.json -> up to 31 days ending {end}
+    A per-user weekly/monthly document synthesises every day of its period (all of
+    that person's sites), so any guard on it must look at the whole range -- the
+    date in the key is only the END."""
+    dm = REPORT_DATE_IN_KEY_RE.search(key)
+    if not dm:
+        return None
+    try:
+        end = datetime.strptime(dm.group(1), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    base = key.rsplit("/", 1)[-1].lower()
+    back = 31 if "monthly" in base else 6 if "weekly" in base else 0
+    return (end - timedelta(days=back)).isoformat(), end.isoformat()
+
+
+def _user_report_hidden(conn, caller, key, owners=None):
+    """Whether a per-user report object must be withheld from `caller`.
+
+    No whole-person artefact crosses companies: for anyone other than the person
+    (and platform_admin) the object is hidden when ANY day of its period holds the
+    person's rows or recordings outside the caller's reach -- and, unless the
+    caller may see the recorder's home-company work (final review F1 whitelist),
+    when it holds site-less work or nothing on the caller's sites at all.
+    Keys with no owner or no date are not judged here."""
+    if is_cross_company(caller["global_role"]):
+        return False
+    owner = _report_key_owner_folder(key)
+    period = _report_key_period(key)
+    if not owner or not period or owner == (caller.get("folder_name") or None):
+        return False
+    owners = owners if owners is not None else {}
+    if owner not in owners:
+        owners[owner] = users.get_by_folder_name_global(conn, owner)
+    tgt = owners[owner]
+    if tgt is None:
+        return False
+    return recordings.author_range_not_within_sites(
+        conn, tgt["id"], period[0], period[1], _allowed_site_ids(conn, caller),
+        siteless_outside=str(tgt["company_id"]) != str(caller["company_id"]))
+
+
+def _report_entry_guard(conn, caller):
+    """Predicate for the report-history listing: a per-user report document is a
+    synthesis of that person's day(s) and carries no site, so it is hidden from
+    anyone other than the person (and platform_admin) when its period holds work
+    outside the caller's reach (`_user_report_hidden`, range-aware)."""
+    if is_cross_company(caller["global_role"]):
+        return None
+    owners = {}
+
+    def keep(key):
+        return not _user_report_hidden(conn, caller, key, owners)
+    return keep
 
 
 def _apply_speaker_groups(conn, caller, payload):
@@ -7829,7 +12299,16 @@ def regenerate_session(conn, caller, session_base, event):
 
     # Read the session the same way the transcript viewer does, so the names sent
     # are the names shown. A second path here is a second thing to keep in step.
-    out = _read_org_transcripts(date, folder, "", "", conn=conn)
+    err = _session_site_company_guard(conn, caller, folder, date, session_base,
+                                      "re-extraction", allow_recorder=True)
+    if err is not None:
+        return err
+    # A site-less session is the recorder's home company's: only the recorder, that company's
+    # people, or platform_admin may re-drive it (R1(b)); anyone else gets a plain 404.
+    if (not recordings.session_site_companies(conn, folder, date, session_base)
+            and not _may_see_siteless_of(conn, caller, folder)):
+        return error("not found", 404)
+    out = _read_org_transcripts(date, folder, "", "", conn=conn, caller=caller)
     out = _apply_speaker_names(conn, caller, out)
     segs = out.get("speaker_segments") or []
 
@@ -7856,14 +12335,19 @@ def regenerate_session(conn, caller, session_base, event):
     request = {"userFolder": folder, "date": date, "sessionBase": session_base}
     if rows:
         request["speakerNames"] = rows
+    regen_key = f"extraction_requests/{session_base[3:]}.json"
     boto3.client("s3").put_object(
         Bucket=S3_BUCKET,
         # Same key the finalize sweep writes, so this rides the trigger that
         # already exists rather than needing a second S3 notification -- and every
         # notification on this bucket is hand-wired outside the template (BUG-33).
-        Key=f"extraction_requests/{session_base[3:]}.json",
+        Key=regen_key,
         Body=json.dumps(request).encode("utf-8"),
         ContentType="application/json")
+    lake_objects.record_best_effort(
+        conn, regen_key,
+        company_id=_lake_company_for_session(conn, folder, date, session_base),
+        user_id=_lake_user_for_folder(conn, folder), source="upload")
     logger.info("regenerate requested for %s by %s with %d confirmed name(s)",
                 session_base, caller["id"], len(rows))
     return ok({"sessionBase": session_base, "namedTurns": len(rows),
@@ -7897,7 +12381,7 @@ def get_org_transcripts(conn, caller, event):
     if err is not None:
         return err
     out = _read_org_transcripts(date, folder, p.get("start") or "", p.get("end") or "",
-                                conn=conn)
+                                conn=conn, caller=caller)
     # Groups FIRST and unconditionally: the anonymous re-bind does not depend on the
     # naming switch, and putting it after would make the order look like a preference
     # rather than the independence it is.
@@ -7910,7 +12394,7 @@ def get_org_transcripts(conn, caller, event):
 # media reads (P1, 2026-07-23 prod-media-binding plan)
 # ----------------------------------------------------------
 
-def _read_org_audio_segments(date, folder, start_time, end_time, conn=None):
+def _read_org_audio_segments(date, folder, start_time, end_time, conn=None, caller=None):
     """S3 list + presign for one (folder, date) window -- mirrors
     lambda_fieldsight_api.get_audio_segments verbatim: same BUG-01-anchored
     regexes, same response fields. Only the folder_name
@@ -7918,7 +12402,7 @@ def _read_org_audio_segments(date, folder, start_time, end_time, conn=None):
     _read_org_transcripts: the modern frontend never hands a spaced name)."""
     start_sec, end_sec = _org_media_window(start_time, end_time)
     prefix = f"audio_segments/{folder}/{date}/"
-    segments = []
+    kept = []
     for obj in _list_media_objects(prefix, "audio-segments"):
         key = obj["Key"]
         if not key.endswith(".wav"):
@@ -7940,7 +12424,22 @@ def _read_org_audio_segments(date, folder, start_time, end_time, conn=None):
         abs_end = base_sec + float(off_match.group(2))
         if abs_end < start_sec or abs_start > end_sec:
             continue
-        url = s3().generate_presigned_url(
+        kept.append((key, filename, abs_start, abs_end))
+    client = s3()
+    # A batch wav is the same speech as the chunk wavs it was stitched from, written
+    # beside them -- listing both plays every stretch twice. Drop a chunk only when a
+    # batch IN THIS RESULT names it in its map: never by duration (a day before
+    # batching is all 30 s chunks) and never by filename arithmetic (a VAD-rejected
+    # chunk is bridged, so c1035_bn4 holds 1035, 1036, 1037, 1039). An unreadable map
+    # hides nothing.
+    covered = batch_cover.covered_chunk_keys(
+        lambda k: client.get_object(Bucket=S3_BUCKET, Key=k)["Body"].read(),
+        [k for k, _f, _s, _e in kept])
+    segments = []
+    for key, filename, abs_start, abs_end in kept:
+        if key in covered:
+            continue
+        url = client.generate_presigned_url(
             "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
             ExpiresIn=PRESIGNED_URL_EXPIRY)
         ah, am, asec = (int(abs_start) // 3600, (int(abs_start) % 3600) // 60,
@@ -7954,6 +12453,8 @@ def _read_org_audio_segments(date, folder, start_time, end_time, conn=None):
     segments.sort(key=lambda seg: seg["absolute_start"])
     segments = _drop_deleted_media(segments, _deleted_sessions_for_day(conn, folder, date),
                                    lambda it: it.get("key") or it.get("url") or "", "audio")
+    segments = _drop_hidden_media(segments, _session_hider(conn, caller, folder, date),
+                                  lambda it: it.get("key") or it.get("url") or "", "audio")
     return {"segments": segments, "count": len(segments)}
 
 
@@ -7971,10 +12472,10 @@ def get_org_audio_segments(conn, caller, event):
     if err is not None:
         return err
     return ok(_read_org_audio_segments(date, folder, p.get("start") or "",
-                                       p.get("end") or "", conn=conn))
+                                       p.get("end") or "", conn=conn, caller=caller))
 
 
-def _read_org_video_segments(date, folder, start_time, end_time, conn=None):
+def _read_org_video_segments(date, folder, start_time, end_time, conn=None, caller=None):
     """Mirrors lambda_fieldsight_api.get_video_segments: web_video/ H264
     previews first, users/{folder}/video/ originals second, an original
     suppressed when a preview shares its base_name, ~10-min assumed file
@@ -8021,6 +12522,8 @@ def _read_org_video_segments(date, folder, start_time, end_time, conn=None):
     videos.sort(key=lambda v: v["video_start_sec"])
     videos = _drop_deleted_media(videos, _deleted_sessions_for_day(conn, folder, date),
                                  lambda it: it.get("key") or it.get("url") or "", "video")
+    videos = _drop_hidden_media(videos, _session_hider(conn, caller, folder, date),
+                                lambda it: it.get("key") or it.get("url") or "", "video")
     return {"videos": videos, "count": len(videos)}
 
 
@@ -8035,10 +12538,17 @@ def get_org_video_segments(conn, caller, event):
     if err is not None:
         return err
     return ok(_read_org_video_segments(date, folder, p.get("start") or "",
-                                       p.get("end") or "", conn=conn))
+                                       p.get("end") or "", conn=conn, caller=caller))
 
 
-_ORG_MEDIA_PRESIGN_PREFIXES = ("users/", "audio_segments/", "transcripts/",
+# 2026-09-20: 'transcripts/' deliberately removed -- see the matching note in
+# lambda_fieldsight_api.get_presigned_url. The raw ASR transcript JSON's own
+# shape (AWS Transcribe: {"jobName", "accountId", "status", "results"};
+# ElevenLabs' adapted shape: none of those keys) names the vendor by which
+# fields exist, and for the AWS path also leaks our real AWS account id.
+# Nothing customer-facing presigns this prefix -- GET /api/org/transcripts
+# already serves every field the transcript viewer reads.
+_ORG_MEDIA_PRESIGN_PREFIXES = ("users/", "audio_segments/",
                                "reports/", "web_video/")
 
 
@@ -8202,7 +12712,504 @@ def get_org_media_presigned_url(conn, caller, event):
     if _presign_target_is_deleted(conn, key):
         logger.info("media presign refused: %s belongs to a deleted session", key)
         return error("not found", 404)
+    # Project-owned tenancy: a link to a session on a site outside the caller's reach is
+    # the same "not found" as a deleted one (whitelist, final review F1); a per-user report
+    # document is withheld when any day of its period sits outside it (range-aware, F2).
+    if target:
+        if parts[0] == "reports":
+            if _user_report_hidden(conn, caller, key):
+                logger.info("media presign refused: %s spans work outside the caller's reach", key)
+                return error("not found", 404)
+        else:
+            dm = re.search(r"(\d{4}-\d{2}-\d{2})", key)
+            hider = _session_hider(conn, caller, target, dm.group(1) if dm else None)
+            if hider is not None and hider.hides_key(key):
+                logger.info("media presign refused: %s is not on a site in the caller's reach", key)
+                return error("not found", 404)
     url = s3().generate_presigned_url(
         "get_object", Params={"Bucket": S3_BUCKET, "Key": key},
         ExpiresIn=PRESIGNED_URL_EXPIRY)
     return ok({"url": url, "expires_in": PRESIGNED_URL_EXPIRY})
+
+
+# =====================================================================
+# Report templates (migration 0062)
+#
+# The Library has shipped in the UI since Sprint 10 against localStorage: a
+# template lived as long as the tab that made it and was invisible to everyone
+# else in the company. These routes are that feature becoming real.
+#
+# WHO MAY DO WHAT, in one place so it can be read as a whole:
+#
+#   read org templates        anyone signed in, in their own company
+#   read own personal ones    the owner, and nobody else -- gm/admin included
+#   write own personal ones   the owner
+#   write org templates       gm / admin (platform_admin across companies)
+#   bind a scheduled report   gm / admin only -- the nightly reports go out to
+#                             customers under the company's name, so which
+#                             template writes them is not an individual choice
+#
+# `platform_admin` reach is granted PER ENDPOINT below, never inherited from a
+# shared helper: this repo has a standing trap where a missing cross-company
+# branch turns into a 200 with an empty list rather than a 403, and a role that
+# silently sees nothing is indistinguishable from a company that owns nothing.
+# =====================================================================
+
+_TEMPLATE_WRITE_ROLES = ("admin", "gm", "platform_admin")
+_REPORT_TYPES = ("daily", "weekly", "monthly", "session", "day", "custom")
+_BINDABLE_TYPES = ("daily", "weekly", "monthly")
+_MAX_TEMPLATE_NAME = 120
+
+
+def _template_company(conn, caller, event):
+    """Which company's templates this request is about.
+
+    A platform_admin sits in its own operator company, so defaulting to
+    `caller["company_id"]` would show it an empty Library and say nothing about
+    why. It may name a company; everybody else is pinned to their own whatever
+    they send, so there is no parameter a normal caller can set to reach
+    another tenant.
+    """
+    p = event.get("queryStringParameters") or {}
+    requested = p.get("company_id")
+    if requested and str(requested) != str(caller["company_id"]):
+        if not is_cross_company(caller["global_role"]):
+            return None, error("only platform_admin may act in another company", 403)
+        if companies.get_company_by_id(conn, requested) is None:
+            return None, error("company not found", 404)
+        return str(requested), None
+    return str(caller["company_id"]), None
+
+
+def _may_write_template(caller, template):
+    """None when this caller may change `template`, else an error response.
+
+    Ownership first, role second. A worker owns their personal templates
+    outright; a gm owns none of anybody's. The org arm is the only one where
+    the role decides anything.
+    """
+    if template["scope"] == "personal":
+        if str(template["owner_user_id"]) != str(caller["id"]):
+            # Same wording as the read side's miss, deliberately: confirming
+            # that somebody else's template exists is exactly the disclosure
+            # personal scope promises not to make.
+            return error("template not found", 404)
+        return None
+    if caller["global_role"] not in _TEMPLATE_WRITE_ROLES:
+        return error("admin, gm or platform_admin role required to change an "
+                     "organisation template", 403)
+    if str(template["company_id"]) != str(caller["company_id"]) \
+            and not is_cross_company(caller["global_role"]):
+        return error("template not found", 404)
+    return None
+
+
+def _template_payload(row, versions=None):
+    """One template as a client sees it.
+
+    `versions` USED TO BE OPTIONAL AND ALMOST NOBODY PASSED IT. Only `create`
+    did, so a template read back through list or get arrived with no versions
+    at all -- and the Library takes its section list from exactly there. The
+    template was intact in the database and the page said "No schema available
+    yet", which is a sentence about the template rather than about the request
+    that dropped half of it.
+
+    It is still optional, because list deliberately does not carry every
+    version of every template, but list now sends `section_count` so a row can
+    say how big a template is without being handed its whole body, and get
+    sends the current version because that is the one thing the page cannot
+    render without.
+    """
+    out = {
+        "id": str(row["id"]),
+        "company_id": str(row["company_id"]),
+        "scope": row["scope"],
+        "owner_user_id": str(row["owner_user_id"]) if row.get("owner_user_id") else None,
+        "slug": row["slug"],
+        "name": row["name"],
+        "description": row["description"],
+        "report_type": row["report_type"],
+        "current_version": row["current_version"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+    # Absent rather than 0 when the query did not compute it: 0 sections and
+    # "this query did not ask" are different facts, and a client cannot tell
+    # them apart from a number alone.
+    if row.get("section_count") is not None:
+        out["section_count"] = row["section_count"]
+    if versions is not None:
+        out["versions"] = versions
+    return out
+
+
+def _version_payload(row):
+    return {
+        "id": str(row["id"]),
+        "template_id": str(row["template_id"]),
+        "version": row["version"],
+        "body": row["body"],
+        "change_note": row["change_note"],
+        "created_by": str(row["created_by"]),
+        "created_at": row["created_at"],
+    }
+
+
+def _validated_template_body(body):
+    """(template body, error). Shared by create, new-version and restore so the
+    three cannot drift on what a valid template is."""
+    if body is None:
+        return None, error("malformed JSON body", 400)
+    tpl = body.get("body")
+    why = report_template.validate_body(tpl)
+    if why:
+        return None, error(why, 400)
+    return tpl, None
+
+
+def _template_name(body, fallback=None):
+    """(name, error). Empty is refused rather than defaulted: a template nobody
+    named is one nobody will find again."""
+    raw = body.get("name")
+    if raw is None and fallback is not None:
+        return fallback, None
+    if not isinstance(raw, str) or not raw.strip():
+        return None, error("name is required", 400)
+    name = raw.strip()
+    if len(name) > _MAX_TEMPLATE_NAME:
+        return None, error("name must be %d characters or fewer" % _MAX_TEMPLATE_NAME, 400)
+    return name, None
+
+
+def list_report_templates(conn, caller, event):
+    """GET /api/org/templates?scope=org|personal|all"""
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    p = event.get("queryStringParameters") or {}
+    scope = (p.get("scope") or "all").strip()
+    if scope not in ("org", "personal", "all"):
+        return error("scope must be org, personal or all", 400)
+    rows = report_templates.list_visible(
+        conn, company_id, caller["id"], None if scope == "all" else scope)
+    return ok({"templates": [_template_payload(r) for r in rows]})
+
+
+def get_report_template(conn, caller, template_id, event):
+    """GET /api/org/templates/{id}"""
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    row = report_templates.get_visible(conn, company_id, caller["id"], template_id)
+    if row is None:
+        return error("template not found", 404)
+    # The current version travels with it. Opening a template is exactly the
+    # moment its sections are needed, and a caller that had to ask twice would
+    # render an empty template in between -- which is what it used to do.
+    current = (report_templates.get_version(conn, template_id, None)
+               if row["current_version"] else None)
+    return ok(_template_payload(row, versions=[_version_payload(current)] if current else []))
+
+
+def create_report_template(conn, caller, event):
+    """POST /api/org/templates
+
+    A template is created WITH its first body. The two-statement split lives in
+    the repository (the row must exist before a version can reference it), but
+    a caller has no use for a template that says nothing, and allowing one
+    would put `current_version = 0` in front of the Library for real.
+    """
+    body = parse_body(event)
+    tpl, err = _validated_template_body(body)
+    if err is not None:
+        return err
+
+    scope = (body.get("scope") or "personal").strip()
+    if scope not in ("org", "personal"):
+        return error("scope must be org or personal", 400)
+    if scope == "org" and caller["global_role"] not in _TEMPLATE_WRITE_ROLES:
+        return error("admin, gm or platform_admin role required to create an "
+                     "organisation template", 403)
+
+    report_type = (body.get("report_type") or "custom").strip()
+    if report_type not in _REPORT_TYPES:
+        return error("report_type must be one of: %s" % ", ".join(_REPORT_TYPES), 400)
+
+    name, err = _template_name(body)
+    if err is not None:
+        return err
+    description = body.get("description")
+    if description is not None and not isinstance(description, str):
+        return error("description must be a string", 400)
+
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    tpl, why = report_modules.pin_modules(conn, company_id, tpl)
+    if why:
+        return error(why, 400)
+    owner = None if scope == "org" else caller["id"]
+    slug = report_template.slugify(name, "tpl-" + uuid.uuid4().hex[:8])
+    try:
+        row = report_templates.create(conn, company_id, scope, owner, slug, name,
+                                      description or "", report_type, caller["id"])
+    except UniqueViolation:
+        # The slug is derived from the name, so a collision here is a duplicate
+        # NAME, which is what the message has to say -- "slug" is a word this
+        # product never shows anybody.
+        return error("a template called that already exists here", 409)
+    version = report_templates.add_version(conn, row["id"], tpl,
+                                           body.get("change_note") or "Created",
+                                           caller["id"])
+    fresh = report_templates.get_any(conn, row["id"])
+    return ok(_template_payload(fresh, versions=[_version_payload(version)]), 201)
+
+
+def update_report_template(conn, caller, template_id, event):
+    """PATCH /api/org/templates/{id} -- name and description only.
+
+    The body is deliberately not settable here: changing what a template SAYS
+    creates a version, and a route that could do both would let an edit land
+    with no version behind it, which is the one thing the history exists to
+    rule out.
+    """
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    if "body" in body:
+        return error("use POST /templates/{id}/versions to change what a "
+                     "template says, so the change gets a version", 400)
+    row = report_templates.get_visible(conn, caller["company_id"], caller["id"], template_id)
+    if row is None:
+        return error("template not found", 404)
+    err = _may_write_template(caller, row)
+    if err is not None:
+        return err
+
+    name = None
+    if body.get("name") is not None:
+        name, err = _template_name(body)
+        if err is not None:
+            return err
+    description = body.get("description")
+    if description is not None and not isinstance(description, str):
+        return error("description must be a string", 400)
+    updated = report_templates.update_meta(conn, template_id, name, description)
+    # Renaming does not change the body, but the client replaces its selected
+    # template with this response -- so a payload without sections empties the
+    # panel the person is looking at. Same reason as `get`.
+    current = (report_templates.get_version(conn, template_id, None)
+               if updated["current_version"] else None)
+    return ok(_template_payload(updated, versions=[_version_payload(current)] if current else []))
+
+
+def list_report_template_versions(conn, caller, template_id):
+    """GET /api/org/templates/{id}/versions"""
+    row = report_templates.get_visible(conn, caller["company_id"], caller["id"], template_id)
+    if row is None:
+        return error("template not found", 404)
+    return ok({"versions": [_version_payload(v)
+                            for v in report_templates.list_versions(conn, template_id)]})
+
+
+def list_report_modules(conn, caller, event):
+    """GET /api/org/templates/modules -- the modules this company can pick.
+
+    Each is {key, title, kind, columns?, purpose, hash, source}: the company's
+    own version where we have written one ("company"), else ours ("standard").
+    The editor pins {key, hash} into a section; the save re-checks the pair
+    (report_modules.pin_modules), so this list is a menu, not an authority.
+    """
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    report_modules.sync_standard(conn)
+    return ok({"modules": report_modules.resolve_all(conn, company_id),
+               "note_max_chars": report_modules.MAX_NOTE_CHARS})
+
+
+def add_report_template_version(conn, caller, template_id, event):
+    """POST /api/org/templates/{id}/versions -- the only way content changes."""
+    body = parse_body(event)
+    tpl, err = _validated_template_body(body)
+    if err is not None:
+        return err
+    row = report_templates.get_visible(conn, caller["company_id"], caller["id"], template_id)
+    if row is None:
+        return error("template not found", 404)
+    err = _may_write_template(caller, row)
+    if err is not None:
+        return err
+    # Module sections get their published text, by the TEMPLATE's company --
+    # a platform_admin editing another company's template must be checked
+    # against that company's modules, not the operator's own.
+    tpl, why = report_modules.pin_modules(conn, row["company_id"], tpl)
+    if why:
+        return error(why, 400)
+    note = body.get("change_note")
+    if note is not None and not isinstance(note, str):
+        return error("change_note must be a string", 400)
+    try:
+        version = report_templates.add_version(conn, template_id, tpl, note, caller["id"])
+    except UniqueViolation:
+        # Somebody else saved between this caller's read and this write. 409,
+        # not 500: their edit is intact, it simply is not the one that landed,
+        # and the only correct next step is theirs to take.
+        return error("someone else saved a change to this template just now -- "
+                     "reload it and re-apply your edit", 409)
+    return ok(_version_payload(version), 201)
+
+
+def restore_report_template_version(conn, caller, template_id, version):
+    """POST /api/org/templates/{id}/versions/{version}/restore
+
+    Writes the old body as a NEW version. Nothing moves backwards: a report
+    that recorded (template, v2) must keep naming a body that still exists
+    exactly as it was.
+    """
+    row = report_templates.get_visible(conn, caller["company_id"], caller["id"], template_id)
+    if row is None:
+        return error("template not found", 404)
+    err = _may_write_template(caller, row)
+    if err is not None:
+        return err
+    try:
+        wanted = int(version)
+    except (TypeError, ValueError):
+        return error("version must be a number", 400)
+    old = report_templates.get_version(conn, template_id, wanted)
+    if old is None:
+        return error("no such version", 404)
+    try:
+        version_row = report_templates.add_version(
+            conn, template_id, old["body"], "Restored from v%d" % wanted, caller["id"])
+    except UniqueViolation:
+        return error("someone else saved a change to this template just now -- "
+                     "reload it and try again", 409)
+    return ok(_version_payload(version_row), 201)
+
+
+def copy_report_template(conn, caller, template_id, event):
+    """POST /api/org/templates/{id}/copy -- into the caller's own library.
+
+    Open to every role on purpose. Copying is how somebody who may not change
+    the company's template gets one they can change; taking it away would make
+    "org templates are read-only for most people" mean "most people cannot
+    have a template at all".
+    """
+    body = parse_body(event) or {}
+    src = report_templates.get_visible(conn, caller["company_id"], caller["id"], template_id)
+    if src is None:
+        return error("template not found", 404)
+    name, err = _template_name(body, fallback="%s (my copy)" % src["name"])
+    if err is not None:
+        return err
+    slug = report_template.slugify(name, "tpl-" + uuid.uuid4().hex[:8])
+    try:
+        copied = report_templates.copy_to_personal(conn, template_id, caller["id"],
+                                                   slug, name, caller["id"])
+    except UniqueViolation:
+        return error("you already have a template called that", 409)
+    if copied is None:
+        return error("that template has no content to copy yet", 409)
+    # A copy is opened immediately after it is made. copy_to_personal only
+    # returns when there WAS a body to copy, so there is always one here.
+    current = report_templates.get_version(conn, copied["id"], None)
+    return ok(_template_payload(copied, versions=[_version_payload(current)] if current else []),
+              201)
+
+
+def archive_report_template(conn, caller, template_id):
+    """DELETE /api/org/templates/{id} -- soft delete; versions are kept.
+
+    Refuses while a schedule still points at it. The foreign key is ON DELETE
+    RESTRICT, but archiving is an UPDATE and no constraint can catch it: an
+    archived-but-bound template leaves the nightly run pointing at something
+    the Library no longer shows, and the report quietly comes out in the
+    default format -- which nobody would notice until a customer did.
+    """
+    row = report_templates.get_visible(conn, caller["company_id"], caller["id"], template_id)
+    if row is None:
+        return error("template not found", 404)
+    err = _may_write_template(caller, row)
+    if err is not None:
+        return err
+    bound = report_templates.bound_report_types(conn, template_id)
+    if bound:
+        # NAMES THE SCHEDULE. "A scheduled report" leaves the person to go and
+        # find which of three it is, and this is the only place that knows.
+        which = " and ".join(", ".join(bound).rsplit(", ", 1))
+        return error("this template is still writing the %s report -- point "
+                     "that schedule at another template first" % which, 409)
+    report_templates.archive(conn, template_id)
+    return ok({"ok": True, "archived": str(template_id)})
+
+
+def list_report_template_bindings(conn, caller, event):
+    """GET /api/org/templates/bindings -- readable by anyone in the company.
+
+    Only gm/admin may set these, but a worker is entitled to know what format
+    the report going out under their name is written to.
+    """
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    rows = report_templates.list_bindings(conn, company_id)
+    return ok({"bindings": [{
+        "report_type": r["report_type"],
+        "template_id": str(r["template_id"]),
+        "template_name": r["template_name"],
+        "template_slug": r["template_slug"],
+        "pinned_version": r["pinned_version"],
+        "effective_version": r["pinned_version"] or r["current_version"],
+        "set_by": str(r["set_by"]),
+        "set_at": r["set_at"],
+    } for r in rows]})
+
+
+def set_report_template_binding(conn, caller, report_type, event):
+    """PUT /api/org/templates/bindings/{report_type} -- gm/admin only."""
+    if caller["global_role"] not in _TEMPLATE_WRITE_ROLES:
+        return error("admin, gm or platform_admin role required to choose the "
+                     "template a scheduled report uses", 403)
+    if report_type not in _BINDABLE_TYPES:
+        return error("report_type must be one of: %s" % ", ".join(_BINDABLE_TYPES), 400)
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    template_id = body.get("template_id")
+    if not template_id:
+        return error("template_id is required", 400)
+
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    target = report_templates.get_visible(conn, company_id, caller["id"], template_id)
+    if target is None:
+        return error("template not found", 404)
+    # A personal template cannot write the company's nightly report: nobody
+    # else can see it, so nobody else could say what the report even is.
+    if target["scope"] != "org":
+        return error("only an organisation template can be used for a scheduled "
+                     "report", 400)
+    if target["current_version"] < 1:
+        return error("that template has no content yet", 400)
+
+    pinned = body.get("pinned_version")
+    if pinned is not None:
+        try:
+            pinned = int(pinned)
+        except (TypeError, ValueError):
+            return error("pinned_version must be a number", 400)
+        if report_templates.get_version(conn, template_id, pinned) is None:
+            return error("no such version", 404)
+    row = report_templates.set_binding(conn, company_id, report_type, template_id,
+                                       pinned, caller["id"])
+    return ok({
+        "report_type": row["report_type"],
+        "template_id": str(row["template_id"]),
+        "pinned_version": row["pinned_version"],
+        "effective_version": row["pinned_version"] or target["current_version"],
+        "set_by": str(row["set_by"]),
+        "set_at": row["set_at"],
+    })

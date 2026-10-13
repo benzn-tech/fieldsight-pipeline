@@ -274,3 +274,153 @@ def test_a_thinking_call_also_carries_it(monkeypatch):
                         lambda url, body, headers: (sent.update(body=json.loads(body)), (None, "stop"))[1])
     lu._call_qwen("p", 100, True, enable_thinking=True)
     assert sent["body"]["temperature"] == 0.0
+
+
+# ---- usage telemetry -----------------------------------------------------
+#
+# We have exactly one cost data point in this whole repo -- a hand-run bench
+# in a code comment above `call_llm` -- and no production evidence for the
+# model/caching decisions we are about to make. This log line is the fix, and
+# it has to (a) actually appear at the level the Lambda runtime runs at
+# (proven separately, see test_llm_usage_line_survives_the_lambda_runtime_
+# default below), (b) never log prompt/completion text, and (c) never turn a
+# vendor usage-shape surprise into a failed call.
+
+import logging
+
+
+def _usage_lines(caplog):
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("LLM_USAGE")]
+
+
+def test_anthropic_usage_is_logged(monkeypatch, caplog):
+    monkeypatch.setattr(lu, "LLM_PROVIDER", "anthropic")
+    monkeypatch.setattr(lu, "ANTHROPIC_API_KEY", "sk-ant-x")
+    monkeypatch.setattr(lu, "CLAUDE_MODEL", "claude-sonnet-4-6")
+    _patch_request(monkeypatch, [
+        _FakeResponse(200, {
+            "model": "claude-sonnet-4-6",
+            "content": [{"type": "text", "text": "hello"}],
+            "usage": {
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "cache_read_input_tokens": 100,
+                "cache_creation_input_tokens": 5,
+            },
+        }),
+    ])
+    with caplog.at_level(logging.INFO):
+        text, err = lu.call_llm("hi", max_tokens=100, caller="extraction")
+    assert (text, err) == ("hello", None)
+    lines = _usage_lines(caplog)
+    assert len(lines) == 1, lines
+    line = lines[0]
+    assert "provider=anthropic" in line
+    assert "model=claude-sonnet-4-6" in line
+    assert "caller=extraction" in line
+    assert "prompt_tokens=120" in line
+    assert "completion_tokens=30" in line
+    assert "cache_read_tokens=100" in line
+    assert "cache_write_tokens=5" in line
+    # Never the prompt or the completion text.
+    assert "hello" not in line
+    assert "hi" not in line
+
+
+def test_anthropic_missing_usage_fails_open(monkeypatch, caplog):
+    """The vendor omitting `usage` entirely must not cost the caller its
+    already-successful answer -- a telemetry bug must never become an outage."""
+    monkeypatch.setattr(lu, "LLM_PROVIDER", "anthropic")
+    monkeypatch.setattr(lu, "ANTHROPIC_API_KEY", "sk-ant-x")
+    monkeypatch.setattr(lu, "CLAUDE_MODEL", "claude-sonnet-4-6")
+    _patch_request(monkeypatch, [
+        _FakeResponse(200, {"content": [{"type": "text", "text": "hello"}]}),  # no "usage" key
+    ])
+    with caplog.at_level(logging.INFO):
+        text, err = lu.call_llm("hi", max_tokens=100)
+    assert (text, err) == ("hello", None)
+    lines = _usage_lines(caplog)
+    assert len(lines) == 1
+    assert "prompt_tokens=-" in lines[0]
+    assert "completion_tokens=-" in lines[0]
+
+
+def test_qwen_usage_is_logged_with_reasoning_and_caller(monkeypatch, caplog):
+    monkeypatch.setattr(lu, "LLM_PROVIDER", "qwen")
+    monkeypatch.setattr(lu, "QWEN_API_KEY", "sk-w")
+    monkeypatch.setattr(lu, "QWEN_MODEL", "qwen-flash")
+    _patch_request(monkeypatch, [
+        _FakeResponse(200, {
+            "model": "qwen-flash",
+            "choices": [{"message": {"content": "answer"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 500,
+                "completion_tokens": 80,
+                "completion_tokens_details": {"reasoning_tokens": 40},
+                "prompt_tokens_details": {"cached_tokens": 200},
+            },
+        }),
+    ])
+    with caplog.at_level(logging.INFO):
+        text, err = lu.call_llm("hi", max_tokens=200, caller="verdict")
+    assert (text, err) == ("answer", None)
+    lines = _usage_lines(caplog)
+    assert len(lines) == 1, lines
+    line = lines[0]
+    assert "provider=qwen" in line
+    assert "model=qwen-flash" in line
+    assert "caller=verdict" in line
+    assert "prompt_tokens=500" in line
+    assert "completion_tokens=80" in line
+    assert "reasoning_tokens=40" in line
+    assert "cache_read_tokens=200" in line
+    assert "answer" not in line
+
+
+def test_qwen_usage_without_reasoning_field_logs_a_dash(monkeypatch, caplog):
+    """A vendor that does not report reasoning tokens (or a call that never
+    reasoned) must not raise, and must not fabricate a number."""
+    monkeypatch.setattr(lu, "LLM_PROVIDER", "qwen")
+    monkeypatch.setattr(lu, "QWEN_API_KEY", "sk-w")
+    _patch_request(monkeypatch, [
+        _FakeResponse(200, {
+            "choices": [{"message": {"content": "answer"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }),
+    ])
+    with caplog.at_level(logging.INFO):
+        lu.call_llm("hi", max_tokens=200)
+    lines = _usage_lines(caplog)
+    assert len(lines) == 1
+    assert "reasoning_tokens=-" in lines[0]
+    assert "cache_read_tokens=-" in lines[0]
+
+
+def test_qwen_missing_usage_key_fails_open(monkeypatch, caplog):
+    monkeypatch.setattr(lu, "LLM_PROVIDER", "qwen")
+    monkeypatch.setattr(lu, "QWEN_API_KEY", "sk-w")
+    _patch_request(monkeypatch, [
+        _FakeResponse(200, {"choices": [{"message": {"content": "answer"},
+                                        "finish_reason": "stop"}]}),  # no "usage" key
+    ])
+    with caplog.at_level(logging.INFO):
+        text, err = lu.call_llm("hi", max_tokens=200)
+    assert (text, err) == ("answer", None)
+    lines = _usage_lines(caplog)
+    assert len(lines) == 1
+    assert "prompt_tokens=-" in lines[0]
+
+
+def test_caller_defaults_to_unknown_when_not_passed(monkeypatch, caplog):
+    """Every pre-existing call site is unmodified and must keep working, now
+    tagged 'unknown' rather than silently missing from cost attribution."""
+    monkeypatch.setattr(lu, "LLM_PROVIDER", "qwen")
+    monkeypatch.setattr(lu, "QWEN_API_KEY", "sk-w")
+    _patch_request(monkeypatch, [
+        _FakeResponse(200, {"choices": [{"message": {"content": "answer"},
+                                        "finish_reason": "stop"}]}),
+    ])
+    with caplog.at_level(logging.INFO):
+        lu.call_llm("hi", max_tokens=200)
+    lines = _usage_lines(caplog)
+    assert "caller=unknown" in lines[0]

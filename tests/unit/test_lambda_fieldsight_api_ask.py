@@ -69,8 +69,12 @@ class FakeLambdaClient:
 
 
 def wire(monkeypatch, **kwargs):
+    """Wires the ASK route's own client (`ask_lambda_client`), not the shared
+    `lambda_client` corroborate_answer/ask_voice/search_topics still use --
+    see test_the_ask_route_does_not_share_its_client_with_corroborate below,
+    which pins the split this helper relies on."""
     fake_client = FakeLambdaClient(**kwargs)
-    monkeypatch.setattr(fapi, "lambda_client", fake_client)
+    monkeypatch.setattr(fapi, "ask_lambda_client", fake_client)
     return fake_client
 
 
@@ -180,6 +184,136 @@ def test_ask_global_no_user_not_400(monkeypatch):
 
     assert res["statusCode"] != 400
     assert fake_client.calls[0]["Payload"]["caller_sub"] == "sub-ucpk"
+
+
+def test_history_is_forwarded_cleaned(monkeypatch):
+    """Task 4: the screen proxy now forwards a cleaned `history`, exactly as
+    the voice proxy already does (same cleaner, same caps, same key names)."""
+    fake_client = wire(monkeypatch)
+
+    fapi.ask_question({"question": "q", "history": [
+        {"question": "a?", "answer": "b"}]}, ADMIN_CALLER)
+
+    assert fake_client.calls[0]["Payload"]["history"] == [
+        {"question": "a?", "answer": "b"}]
+
+
+def test_the_wrong_key_names_are_dropped_per_turn_and_the_ask_still_answers(monkeypatch, caplog):
+    fake_client = wire(monkeypatch)
+
+    with caplog.at_level("WARNING"):
+        res = fapi.ask_question({"question": "q", "history": [
+            {"q": "a?", "a": "b"}, {"question": "real?", "answer": "yes"}]},
+            ADMIN_CALLER)
+
+    assert res["statusCode"] == 200
+    assert fake_client.calls[0]["Payload"]["history"] == [
+        {"question": "real?", "answer": "yes"}]
+    assert "dropped 1 of 2" in caplog.text
+    assert "ask:" in caplog.text
+
+
+def test_no_usable_history_sends_no_key(monkeypatch):
+    """Absent is not `[]` -- see ask_voice, and the agent's history_turns
+    count, which would otherwise mean two things."""
+    fake_client = wire(monkeypatch)
+
+    fapi.ask_question({"question": "q", "history": []}, ADMIN_CALLER)
+
+    assert "history" not in fake_client.calls[0]["Payload"]
+
+
+def test_no_history_key_at_all_sends_no_key(monkeypatch):
+    fake_client = wire(monkeypatch)
+
+    fapi.ask_question({"question": "q"}, ADMIN_CALLER)
+
+    assert "history" not in fake_client.calls[0]["Payload"]
+
+
+def test_history_not_a_list_warns(monkeypatch, caplog):
+    fake_client = wire(monkeypatch)
+
+    with caplog.at_level("WARNING"):
+        res = fapi.ask_question({"question": "q", "history": "oops"}, ADMIN_CALLER)
+
+    assert res["statusCode"] == 200
+    assert "history" not in fake_client.calls[0]["Payload"]
+    assert "history was str, not a list" in caplog.text
+    assert "ask:" in caplog.text
+
+
+def test_a_hung_agent_is_described_rather_than_killed(monkeypatch, caplog):
+    """Task 8 (spec SS4.8): today the runtime kills ApiFunction (no Config on
+    lambda_client -> botocore's default read timeout outlives ApiFunction's
+    own Timeout) BEFORE this except runs, so the only trace in prod would be a
+    bare `Task timed out`. Force the botocore timeout directly and assert the
+    invoke fails inside our own code, where it can be named and turned into a
+    504 -- not a 500/502, so the client and any alerting can tell a hung
+    agent apart from every other invoke failure."""
+    import botocore.exceptions
+
+    def _boom(**kw):
+        raise botocore.exceptions.ReadTimeoutError(endpoint_url="lambda")
+    monkeypatch.setattr(fapi.ask_lambda_client, "invoke", _boom)
+
+    with caplog.at_level("ERROR"):
+        res = fapi.ask_question({"question": "q"}, ADMIN_CALLER)
+
+    assert res["statusCode"] == 504
+    assert "ask agent read timeout" in caplog.text.lower()
+
+
+def test_a_non_timeout_invoke_exception_is_502(monkeypatch, caplog):
+    """Any OTHER invoke exception (throttle, network error, etc.) is a
+    different failure class from a hung agent and must not be confused with
+    it in the log or the status code."""
+    def _boom(**kw):
+        raise RuntimeError("some other invoke failure")
+    monkeypatch.setattr(fapi.ask_lambda_client, "invoke", _boom)
+
+    with caplog.at_level("ERROR"):
+        res = fapi.ask_question({"question": "q"}, ADMIN_CALLER)
+
+    assert res["statusCode"] == 502
+    assert "ask agent invocation failed" in caplog.text.lower()
+
+
+def test_the_ask_route_does_not_share_its_client_with_corroborate(monkeypatch):
+    """Task 8 review fix / controller ruling: the read_timeout=26s Config must
+    apply ONLY to ask_question's own client, not to the shared `lambda_client`
+    corroborate_answer/ask_voice/search_topics use. Pins two things:
+
+    (1) the two client objects are distinct, with different configured read
+        timeouts -- `ask_lambda_client` is the 26s one, the shared
+        `lambda_client` is not;
+    (2) corroborate_answer actually calls the SHARED client. If it were ever
+        pointed at `ask_lambda_client` instead, this assertion is what would
+        catch it -- see the revert-and-red proof in the task report, which
+        points corroborate_answer at `ask_lambda_client` alone and confirms
+        this exact test goes red.
+    """
+    assert fapi.lambda_client is not fapi.ask_lambda_client
+    assert fapi.ask_lambda_client.meta.config.read_timeout == fapi._LAMBDA_INVOKE_TIMEOUT
+    assert fapi.lambda_client.meta.config.read_timeout != fapi._LAMBDA_INVOKE_TIMEOUT
+
+    fake_shared = FakeLambdaClient()
+    monkeypatch.setattr(fapi, "lambda_client", fake_shared)
+
+    def _must_not_be_called(**kw):
+        raise AssertionError(
+            "corroborate_answer must not invoke ask_lambda_client -- that "
+            "client's 26s read_timeout is sized for ask_question, not for "
+            "corroboration.py's own 27s HARD_STOP_SECONDS budget")
+    fake_ask_only = FakeLambdaClient()
+    monkeypatch.setattr(fake_ask_only, "invoke", _must_not_be_called)
+    monkeypatch.setattr(fapi, "ask_lambda_client", fake_ask_only)
+
+    res = fapi.corroborate_answer({"question": "q", "answer": "a"}, ADMIN_CALLER)
+
+    assert res["statusCode"] == 200
+    assert len(fake_shared.calls) == 1
+    assert fake_shared.calls[0]["Payload"]["mode"] == "corroborate"
 
 
 def test_function_error_returns_500_without_stack_trace_leak(monkeypatch):

@@ -60,6 +60,8 @@ class FakeS3:
         return _FakePaginator(self.objects)
 
     def put_object(self, **kwargs):
+        if kwargs["Key"].startswith("lake_manifest/"):
+            return {}            # lake_put's manifest line is not a pipeline write
         self.put_calls.append(kwargs)
         self.objects[kwargs["Key"]] = kwargs["Body"]
         return {}
@@ -119,7 +121,7 @@ OUT_KEY = f"extractions/Benl1/2026-07-06/{SESSION_BASE}.json"
 
 
 def _fake_call_llm_returning(payload):
-    def _fake(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
+    def _fake(prompt, max_tokens=4096, force_json=False, enable_thinking=None, **kw):
         return json.dumps(payload), None
     return _fake
 
@@ -189,7 +191,7 @@ def test_prompt_contains_all_segment_turns(monkeypatch):
 
     captured = {}
 
-    def fake_call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
+    def fake_call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None, **kw):
         captured["prompt"] = prompt
         captured["max_tokens"] = max_tokens
         return json.dumps({"topics": [], "declared_site": None}), None
@@ -217,7 +219,7 @@ def test_extract_session_requests_force_json(monkeypatch):
 
     captured = {}
 
-    def _cap(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
+    def _cap(prompt, max_tokens=4096, force_json=False, enable_thinking=None, **kw):
         captured["force_json"] = force_json
         return json.dumps({"topics": [], "declared_site": None}), None
 
@@ -267,6 +269,62 @@ def test_writes_extraction_contract(monkeypatch):
 
     written = json.loads(fake_s3.objects[OUT_KEY])
     assert written == extraction
+
+
+# ---------------------------------------------------------------------------
+# Ruling R15 (Track B Task 6a fix round 1) -- llm_provider/llm_model, the
+# ACTUAL provider+model that wrote this pass's `topics`, additive on the
+# extraction contract.
+# ---------------------------------------------------------------------------
+
+def test_writes_llm_provider_and_model(monkeypatch):
+    fake_s3 = FakeS3({SEG1_KEY: json.dumps(make_transcribe_json("hello world"))})
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(llm_utils, "LLM_PROVIDER", "anthropic")
+    monkeypatch.setattr(llm_utils, "CLAUDE_MODEL", "claude-sonnet-4-6")
+    monkeypatch.setattr(
+        llm_utils, "call_llm",
+        _fake_call_llm_returning({"topics": [], "declared_site": None}),
+    )
+
+    extraction = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+
+    assert extraction["llm_provider"] == "anthropic"
+    assert extraction["llm_model"] == "claude-sonnet-4-6"
+    # Written to S3 too -- lambda_item_writer reads the PUBLISHED artifact,
+    # not the return value.
+    written = json.loads(fake_s3.objects[OUT_KEY])
+    assert written["llm_provider"] == "anthropic"
+    assert written["llm_model"] == "claude-sonnet-4-6"
+
+
+def test_llm_model_reflects_the_qwen_thinking_split_live_vs_final(monkeypatch):
+    """The live pass and the final pass can genuinely run DIFFERENT qwen
+    models (llm_utils.QWEN_MODEL_NONTHINKING) -- `llm_model` must name the
+    one THIS pass actually used, matching the `enable_thinking=final`
+    argument the extraction call itself passes, not just QWEN_MODEL's
+    default."""
+    fake_s3 = _s3_with_one_segment()
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(llm_utils, "LLM_PROVIDER", "qwen")
+    # api_key_configured() checks QWEN_API_KEY when LLM_PROVIDER='qwen' --
+    # unset in this test file's env (only ANTHROPIC_API_KEY is dummied at
+    # module scope), so extract_session would fail-fast without this.
+    monkeypatch.setattr(llm_utils, "QWEN_API_KEY", "dashscope-test-dummy-key")
+    monkeypatch.setattr(llm_utils, "QWEN_MODEL", "qwen3.8-flash")
+    monkeypatch.setattr(llm_utils, "QWEN_MODEL_NONTHINKING", "qwen3.6-flash")
+    monkeypatch.setattr(
+        llm_utils, "call_llm",
+        _fake_call_llm_returning({"topics": [], "declared_site": None}),
+    )
+
+    live = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
+    final = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE, final=True)
+
+    assert live["llm_provider"] == "qwen"
+    assert live["llm_model"] == "qwen3.6-flash"   # live -> enable_thinking=False
+    assert final["llm_provider"] == "qwen"
+    assert final["llm_model"] == "qwen3.8-flash"  # final -> enable_thinking=True
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +426,7 @@ def test_claude_failure_raises(monkeypatch):
     # call_llm itself fails
     monkeypatch.setattr(
         llm_utils, "call_llm",
-        lambda prompt, max_tokens=4096, force_json=False, enable_thinking=None: (None, "boom"),
+        lambda prompt, max_tokens=4096, force_json=False, enable_thinking=None, **kw: (None, "boom"),
     )
     with pytest.raises(RuntimeError):
         les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
@@ -377,7 +435,7 @@ def test_claude_failure_raises(monkeypatch):
     # call_llm succeeds but returns unparseable JSON
     monkeypatch.setattr(
         llm_utils, "call_llm",
-        lambda prompt, max_tokens=4096, force_json=False, enable_thinking=None: ("not json at all {{{", None),
+        lambda prompt, max_tokens=4096, force_json=False, enable_thinking=None, **kw: ("not json at all {{{", None),
     )
     with pytest.raises(RuntimeError):
         les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE)
@@ -462,7 +520,7 @@ def test_live_pass_is_throttled_within_the_interval(monkeypatch):
     monkeypatch.setattr(les, "s3", lambda: fake_s3)
     calls = []
 
-    def _counting(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
+    def _counting(prompt, max_tokens=4096, force_json=False, enable_thinking=None, **kw):
         calls.append(enable_thinking)
         return json.dumps({"topics": [], "declared_site": None}), None
 
@@ -482,7 +540,7 @@ def test_final_pass_ignores_the_throttle_and_uses_thinking(monkeypatch):
     monkeypatch.setattr(les, "s3", lambda: fake_s3)
     calls = []
 
-    def _counting(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
+    def _counting(prompt, max_tokens=4096, force_json=False, enable_thinking=None, **kw):
         calls.append(enable_thinking)
         return json.dumps({"topics": [], "declared_site": None}), None
 
@@ -646,7 +704,7 @@ def test_final_request_artifact_routes_to_a_final_pass(monkeypatch):
     monkeypatch.setattr(les, "S3_BUCKET", BUCKET)
     calls = []
 
-    def _counting(prompt, max_tokens=4096, force_json=False, enable_thinking=None):
+    def _counting(prompt, max_tokens=4096, force_json=False, enable_thinking=None, **kw):
         calls.append(enable_thinking)
         return json.dumps({"topics": [], "declared_site": None}), None
 
@@ -815,3 +873,68 @@ def test_prompt_asks_to_split_by_subject_and_write_scannable_titles():
     # action_items: subject-first, glanceable, survive truncation, no generic openers
     assert "AT A GLANCE" in prompt and "SURVIVE TRUNCATION" in prompt
     assert "SUBJECT/OUTCOME" in prompt and "generic word" in prompt
+
+
+# ---------------------------------------------------------------------------
+# A final pass that outruns the transcripts waits for them (prod 2026-09-17:
+# the final ran at 01:08:39, the transcripts landed at 01:08:42, and the
+# session never got a final at all).
+# ---------------------------------------------------------------------------
+
+def test_a_final_pass_that_finds_nothing_yet_waits_and_extracts(monkeypatch):
+    fake_s3 = FakeS3({})
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(llm_utils, "call_llm",
+                        _fake_call_llm_returning({"topics": [], "declared_site": None}))
+    slept = []
+
+    def _sleep(seconds):
+        slept.append(seconds)
+        # The transcript lands while the pass is waiting.
+        fake_s3.objects[SEG1_KEY] = json.dumps(make_transcribe_json("hello world"))
+
+    out = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE,
+                              final=True, sleep=_sleep)
+    assert slept == [les.FINAL_EMPTY_RETRY_DELAY_S]
+    assert out is not None and out["tier"] == les.TIER_FINAL
+    assert [c["Key"] for c in fake_s3.put_calls] == [OUT_KEY]
+
+
+def test_the_wait_is_bounded(monkeypatch):
+    fake_s3 = FakeS3({})
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+
+    def fail_if_called(*a, **k):
+        raise AssertionError("no transcripts ever arrived; nothing to extract")
+
+    monkeypatch.setattr(llm_utils, "call_llm", fail_if_called)
+    slept = []
+    out = les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE,
+                              final=True, sleep=slept.append)
+    # The only write is the success-empty record finalize reads (final review 2).
+    assert out is None
+    assert [c["Key"] for c in fake_s3.put_calls] == [
+        f"extraction_empty/{SESSION_BASE}.json"]
+    assert len(slept) == les.FINAL_EMPTY_RETRY_ATTEMPTS
+
+
+def test_a_live_pass_never_waits(monkeypatch):
+    """Live passes are triggered BY a transcript landing; waiting there would
+    only hold a concurrency slot."""
+    fake_s3 = FakeS3({})
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    slept = []
+    assert les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE,
+                               sleep=slept.append) is None
+    assert slept == []
+
+
+def test_a_final_pass_with_transcripts_does_not_wait(monkeypatch):
+    fake_s3 = _s3_with_one_segment()
+    monkeypatch.setattr(les, "s3", lambda: fake_s3)
+    monkeypatch.setattr(llm_utils, "call_llm",
+                        _fake_call_llm_returning({"topics": [], "declared_site": None}))
+    slept = []
+    les.extract_session(BUCKET, "Benl1", "2026-07-06", SESSION_BASE,
+                        final=True, sleep=slept.append)
+    assert slept == []

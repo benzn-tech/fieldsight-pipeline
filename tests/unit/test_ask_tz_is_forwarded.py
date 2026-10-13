@@ -42,7 +42,9 @@ class Recorder:
 
 def test_gateway_forwards_the_zone_to_ask(monkeypatch):
     rec = Recorder()
-    monkeypatch.setattr(fsapi, "lambda_client", rec)
+    # ask_question uses its own client (Task 8 review fix) -- the shared
+    # `lambda_client` below is for corroborate_answer/ask_voice/search_topics.
+    monkeypatch.setattr(fsapi, "ask_lambda_client", rec)
 
     fsapi.ask_question({"question": "昨天发生了什么", "tz": "Pacific/Auckland"}, CALLER)
 
@@ -54,7 +56,7 @@ def test_gateway_omits_the_zone_when_the_client_sent_none(monkeypatch):
     is a value the slot reader would have to special-case, and every place that
     has to special-case a blank is a place one of them will forget to."""
     rec = Recorder()
-    monkeypatch.setattr(fsapi, "lambda_client", rec)
+    monkeypatch.setattr(fsapi, "ask_lambda_client", rec)
 
     fsapi.ask_question({"question": "昨天发生了什么"}, CALLER)
 

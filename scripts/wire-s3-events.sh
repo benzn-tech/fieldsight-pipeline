@@ -45,6 +45,7 @@ ITEM_WRITER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-item-
 MATCHER_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-programme-matcher"
 KEYFRAME_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-keyframe"
 SESSION_REPORT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-session-report"
+REPORT_GENERATOR_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-report-generator"
 SESSION_FINALIZE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-session-finalize"
 SPEAKER_EMBED_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-speaker-embed"
 
@@ -200,6 +201,21 @@ if fn_exists "${PREFIX}-session-report"; then
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-session-report not deployed — skipping session-report trigger"
+fi
+# NOTE(regenerate-own-report): the non-VPC report generator triggers on
+# report_requests/*.json -- org-api's request for ONE person's own report. The
+# generator's outputs (reports/*) match EmbedReport's rule, not this one, so there is
+# no trigger loop; report_requests/ is disjoint from every other wired prefix
+# (reports/ is a different string, and S3 rules match by literal prefix). The
+# generator returns without generating for any request it cannot validate.
+if fn_exists "${PREFIX}-report-generator"; then
+  WIRE_FNS+=("${PREFIX}-report-generator")
+  DESIRED=$(jq -c --arg arn "$REPORT_GENERATOR_ARN" '. + [
+    {"Id":"fs-report-requests","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"report_requests/"},{"Name":"suffix","Value":".json"}]}}}
+  ]' <<<"$DESIRED")
+else
+  echo "NOTE: ${PREFIX}-report-generator not deployed — skipping report-requests trigger"
 fi
 # NOTE(Tier-0 finalize): the non-VPC send worker triggers on
 # session_finalize_requests/*.json (the in-VPC grace sweep's enqueue output). Its

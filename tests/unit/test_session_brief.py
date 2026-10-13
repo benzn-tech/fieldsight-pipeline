@@ -117,6 +117,19 @@ def test_a_task_without_a_quote_is_anchored_by_its_rarest_words():
     assert brief["tasks"][0]["at"] == "09:40:00"
 
 
+def test_a_task_is_anchored_from_its_own_sentence():
+    # `why` must not participate in anchoring: a task whose rare words live only
+    # in `why` (never in `text`) must NOT be findable. If it were, that would mean
+    # `_snap_to_terms` is still being fed `why` -- the exact narrowing this repo's
+    # own `f"{task['text']} {task['why']}"` used to do at session_brief.py:292.
+    turns = [T("The sparkies need to isolate that distribution board first.", "09:40:00")]
+    brief = {"tasks": [{"text": "", "why": "isolate distribution board sparkies",
+                        "at": "08:00:00"}]}
+    stats = sb.reanchor(brief, turns)
+    assert brief["tasks"][0]["at"] == "08:00:00"   # unmoved -- an empty text anchors nothing
+    assert stats["unmatched"] == 1
+
+
 # --- drop-in compatibility --------------------------------------------------
 
 _BRIEF_JSON = """{"headline": "Procurement blocks the device; package it as a phone.",
@@ -145,8 +158,20 @@ def test_it_returns_the_two_keys_the_email_reads():
     out = sb.brief_from_turns(_turns(), call_llm=_llm(_BRIEF_JSON))
     assert out["summary"] == "Procurement blocks the device; package it as a phone."
     assert out["open_todos"] == [{"text": "Price the device as a company phone",
-                                  "why": "procurement", "at": "13:40:56",
-                                  "responsible": "Sam", "due": "Friday"}]
+                                  "at": "13:40:56",
+                                  "responsible": "Sam", "due": "Friday",
+                                  "section": None}]
+
+
+def test_a_todo_carries_only_text_responsible_due_at_and_section():
+    # `to_session_summary` stops reading `why`: the code side of retiring the field
+    # (the prompt still asks for it -- that is a later task). A `why` key anywhere
+    # in a to-do means the old behaviour survived. `section` joined the shape
+    # 2026-09-18 (the-brief-says-where-a-task-came-from).
+    out = sb.brief_from_turns(_turns(), call_llm=_llm(_BRIEF_JSON))
+    assert out["open_todos"]
+    for todo in out["open_todos"]:
+        assert set(todo.keys()) == {"text", "responsible", "due", "at", "section"}
 
 
 def test_it_also_returns_the_brief_itself():
@@ -244,3 +269,108 @@ def test_the_prompt_tells_the_model_the_same_thing():
     prompt = sb.build_brief_prompt([{"abs_start_str": "11:00:00", "speaker": "spk_0",
                                      "text": "hello"}])
     assert "spk_0" in prompt and "NOT names" in prompt
+
+
+# --- task sections (2026-09-18, "the brief says where a task came from") ----
+# Validation lives in CODE: a `section` that is not one of THIS brief's own
+# section titles, character for character, is rewritten to null. This is what
+# makes the linkage checkable -- the model can still attach a task to the
+# WRONG section (that is a human-judgement failure, not a code one, per the
+# spec's §5 "Risks") but it cannot make up a section that does not exist.
+
+def test_a_section_matching_a_real_title_exactly_is_kept():
+    brief = {"sections": [{"title": "Procurement"}, {"title": "Site walk"}],
+             "tasks": [{"text": "t", "section": "Procurement"}]}
+    valid = sb.validate_task_sections(brief)
+    assert valid == 1
+    assert brief["tasks"][0]["section"] == "Procurement"
+
+
+def test_a_hallucinated_section_title_becomes_null():
+    brief = {"sections": [{"title": "Procurement"}],
+             "tasks": [{"text": "t", "section": "A section that was never written"}]}
+    valid = sb.validate_task_sections(brief)
+    assert valid == 0
+    assert brief["tasks"][0]["section"] is None
+
+
+def test_a_paraphrased_or_truncated_title_is_not_an_exact_match():
+    # "exactly" -- not a fuzzy or substring match. A model that shortens or
+    # rewords the title must not get credit for it: the whole point is that
+    # the title is COPIED, not recognised.
+    brief = {"sections": [{"title": "Procurement blocks the device"}],
+             "tasks": [{"text": "t", "section": "Procurement"}]}
+    assert sb.validate_task_sections(brief) == 0
+    assert brief["tasks"][0]["section"] is None
+
+
+def test_a_task_with_no_section_stays_null_and_is_not_counted_invalid():
+    # A genuine orphan -- the model correctly said this task belongs to no
+    # section -- is not the same failure as a hallucinated title, and must not
+    # be double-counted as one.
+    brief = {"sections": [{"title": "Procurement"}],
+             "tasks": [{"text": "t", "section": None}, {"text": "u"}]}
+    assert sb.validate_task_sections(brief) == 0
+    assert brief["tasks"][0]["section"] is None
+    assert brief["tasks"][1]["section"] is None
+
+
+def test_a_non_string_section_is_rejected_without_crashing():
+    brief = {"sections": [{"title": "Procurement"}],
+             "tasks": [{"text": "t", "section": {"title": "Procurement"}}]}
+    assert sb.validate_task_sections(brief) == 0
+    assert brief["tasks"][0]["section"] is None
+
+
+def test_no_sections_at_all_means_every_section_is_invalid():
+    brief = {"tasks": [{"text": "t", "section": "Procurement"}]}
+    assert sb.validate_task_sections(brief) == 0
+    assert brief["tasks"][0]["section"] is None
+
+
+_SECTIONED_BRIEF_JSON = """{"headline": "h",
+ "sections": [{"title": "Procurement", "bullets": [
+   {"text": "A $100/month Claude licence needs a business case.", "at": "00:00:00",
+    "quote": "I need a hundred dollar license Claude"}]}],
+ "entities": [],
+ "tasks": [{"text": "Price the device as a company phone",
+            "at": "00:00:00", "assignee": "Sam", "due": "Friday",
+            "section": "Procurement"},
+           {"text": "A task with a made-up section",
+            "at": "00:00:00", "assignee": null, "due": null,
+            "section": "This section does not exist"}]}"""
+
+
+def test_the_valid_section_count_reaches_stats_and_open_todos():
+    out = sb.brief_from_turns(_turns(), call_llm=_llm(_SECTIONED_BRIEF_JSON))
+    assert out["stats"]["tasks_with_valid_section"] == 1
+    by_text = {t["text"]: t["section"] for t in out["open_todos"]}
+    assert by_text["Price the device as a company phone"] == "Procurement"
+    assert by_text["A task with a made-up section"] is None
+
+
+def test_a_valid_section_count_of_zero_is_still_logged(caplog):
+    j = _BRIEF_JSON  # no `section` on its one task at all
+    with caplog.at_level("INFO"):
+        sb.brief_from_turns(_turns(), call_llm=_llm(j))
+    assert any("task(s) carried a section that exists" in r.message
+               for r in caplog.records)
+
+
+# --- B2: the owner's display name reaches the prompt --------------------------
+# Plumbing only (2026-09-17 plan, task B2): `build_brief_prompt` gains an
+# `owner_name` keyword-only parameter so the recording owner's name can reach
+# the model. What the prompt DOES with the name (the attribution rule) is
+# task B3 -- these only pin that the name is conveyed when known, and that
+# nothing about an owner leaks into the prompt when it is not.
+
+def test_the_prompt_names_the_owner_when_one_is_known():
+    prompt = sb.build_brief_prompt(_turns(), owner_name="Ben Lin")
+    assert "Ben Lin" in prompt
+
+
+def test_the_prompt_says_nothing_about_an_owner_when_none_is_known():
+    prompt = sb.build_brief_prompt(_turns(), owner_name=None)
+    assert "owner" not in prompt.lower()
+    assert "None" not in prompt
+    assert "{owner" not in prompt

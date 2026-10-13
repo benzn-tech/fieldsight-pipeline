@@ -24,6 +24,7 @@ from datetime import datetime
 from urllib.parse import unquote_plus
 
 import transcript_utils
+from lake_put import lake_put
 
 logger = logging.getLogger()
 
@@ -108,7 +109,8 @@ def summarize_turns(turns, call_llm=None, max_tokens=4000):
     if call_llm is None:
         import llm_utils
         call_llm = llm_utils.call_llm
-    raw, _err = call_llm(build_rolling_prompt(turns), max_tokens=max_tokens, force_json=True)
+    raw, _err = call_llm(build_rolling_prompt(turns), max_tokens=max_tokens, force_json=True,
+                         caller="rolling_summary")
     if not raw:
         return None
     return parse_rolling_summary(raw)
@@ -189,9 +191,11 @@ def process_transcript_key(key, s3_client=None, call_llm=None, now=None,
         "open_todos": summary["open_todos"],
         "updated_at": now.isoformat() + "Z",
     }
-    s3_client.put_object(
-        Bucket=bucket, Key=out_key,
-        Body=json.dumps(body, ensure_ascii=False, indent=2),
+    lake_put(
+        bucket, out_key,
+        json.dumps(body, ensure_ascii=False, indent=2),
+        client=s3_client,
+        owner_hint={"folder": user_folder, "session_base": session_base},
         ContentType="application/json",
     )
     logger.info("rolling summary written: %s (%d turns)", out_key, len(turns))

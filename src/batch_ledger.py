@@ -73,6 +73,28 @@ def register_chunk(table, session_id: str, index: int, chunk_key: str, now: int)
         )
     except Exception as e:
         if _is_conditional_failure(e):
+            # SAY SO. The condition cannot tell a duplicate S3 delivery (harmless,
+            # the point of the guard) from the same session's chunks arriving under
+            # a different folder, which is a legitimate re-run and is refused here
+            # in exactly the same silence.
+            #
+            # Measured 2026-09-11: 116 chunks of session d22615c6… were copied from
+            # users/Ben_UCPK2/ to users/Ben_Lin/ to seed a test project. The ledger
+            # is keyed BATCH#{session_id} with no tenant dimension, so every chunk
+            # was already present from the original run, every registration was a
+            # no-op, the seal planner found nothing to do and retired the session.
+            # Result: 232 VAD segments, 116 transcribe invocations, ZERO
+            # transcripts, zero errors, zero alarms — and the only way to find it
+            # was to read a summary whose four counters were all 0.
+            #
+            # This line does not change the decision, which is right. It makes the
+            # decision visible, which is the whole difference between a guard that
+            # is working and a guard that is indistinguishable from a dead path.
+            logging.getLogger().warning(
+                "batch: chunk %s of session %s is already in the ledger under %s — "
+                "not registering %s. A duplicate delivery is expected here; the same "
+                "session re-uploaded under another folder is NOT, and looks identical.",
+                index, session_id, _existing_chunk_key(table, session_id, index), chunk_key)
             _mark_active(table, session_id)
             return "already_present"
         raise
@@ -153,6 +175,20 @@ def list_members(table, session_id: str) -> list[dict]:
 # `pending_windows`. It grouped consecutive indices, so it could not see a window that
 # bridges a VAD-dropped chunk — and it planned over consumed members, which is how a late
 # earlier chunk could get a sealed window transcribed and billed twice.
+
+
+def _existing_chunk_key(table, session_id: str, index: int) -> str:
+    """The key the ledger already holds for this chunk, for the warning above.
+
+    NEVER RAISES and never blocks the caller: this exists to make a refusal
+    legible, and a diagnostic that can turn a working no-op into an exception
+    would be worse than the silence it is replacing.
+    """
+    try:
+        got = table.get_item(Key={"PK": _pk(session_id), "SK": _member_sk(index)})
+        return (got.get("Item") or {}).get("chunk_key") or "(key unavailable)"
+    except Exception:  # noqa: BLE001 - see above
+        return "(key unavailable)"
 
 
 def consumed_indices(rows) -> set:

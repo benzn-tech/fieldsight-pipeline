@@ -1,5 +1,7 @@
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
+
+from deleted_predicates import LIVE_TOPIC_PREDICATE
 from repositories.search_sql import build_latest_date_sql, build_search_sql  # re-export
 
 __all__ = ["build_search_sql", "build_latest_date_sql", "insert_chunk", "search_chunks",
@@ -60,10 +62,30 @@ def insert_chunk(conn, site_id, report_date, chunk_type, chunk_text, embedding, 
 
 
 def search_chunks(conn, query_embedding, accessible_site_ids, k=5,
-                  date_from=None, date_to=None, author_ids=None) -> list[dict]:
+                  date_from=None, date_to=None, author_ids=None, query_text="") -> list[dict]:
+    """Vector + keyword search, unioned (Task 3, 2026-09-20 spec: "a literal
+    token is findable"). Every returned row now carries `lexical_hit: bool` --
+    True for a row the keyword arm found (its `distance` is NULL, never a
+    fabricated real-looking number), False for a row the vector arm found (a
+    real cosine distance). A row found by both arms is returned once, keeping
+    the vector arm's real distance (build_search_sql's DISTINCT ON).
+
+    `query_text` defaults to "" so every existing caller that does not pass it
+    keeps working: `websearch_to_tsquery('simple', '')` returns an empty
+    tsquery that matches nothing, which is correct for "no text was given to
+    search on" (never matches everything).
+
+    `query_text` is bound VERBATIM into build_search_sql()'s keyword arm as a
+    parameter -- this function does no term extraction or OR-joining of its
+    own. A caller that wants OR semantics over a natural-language question
+    (2026-09-22 fix, "the keyword arm can actually fire") must build that
+    string itself, e.g. `lexical_terms.or_query(lexical_terms.lexical_terms(q))`
+    -- see lambda_rag_search.py's `_search`, the only production caller that
+    receives a raw question rather than an already-literal term.
+    """
     return conn.cursor(row_factory=dict_row).execute(
         build_search_sql(),
-        {"q": query_embedding, "site_ids": list(accessible_site_ids), "k": k,
+        {"q": query_embedding, "q_text": query_text, "site_ids": list(accessible_site_ids), "k": k,
          "date_from": date_from, "date_to": date_to,
          "author_ids": list(author_ids) if author_ids is not None else None},
     ).fetchall()
@@ -172,17 +194,34 @@ def restore_chunks_for_batch(conn, batch_id) -> int:
             "chunk_type, chunk_text, embedding, metadata, created_at")
     # `topic_id` is resolved through `topics` instead of copied, and the reason is a clock:
     # `report_chunks.topic_id` is `REFERENCES topics(id) ON DELETE SET NULL`, but the
-    # archive is `LIKE report_chunks`, which copies no foreign keys. While a chunk waits in
-    # the archive the nightly ingest hard-deletes and rebuilds that day's topics
-    # (`delete_topics_for_source`, whose own comment says "always"), and nothing nulls the
-    # archived copy. Re-inserting it then violates the FK and fails the whole undelete —
-    # `revert_batch` with it. Delete works tonight; restore would break one nightly run
-    # later, which is the worst possible schedule for a promise of reversibility.
+    # archive is `LIKE report_chunks`, which copies no foreign keys. Before Track B Task 3,
+    # while a chunk waited in the archive the nightly ingest could hard-delete and rebuild
+    # that day's topics (`delete_topics_for_source`, whose own comment said "always"), and
+    # nothing nulled the archived copy. Re-inserting it then violated the FK and failed the
+    # whole undelete — `revert_batch` with it. Delete worked tonight; restore would break one
+    # nightly run later, which is the worst possible schedule for a promise of reversibility.
     #
-    # The scalar subquery yields NULL for a topic that is gone: not a workaround, but
-    # exactly what ON DELETE SET NULL would have done had the row never left the table.
+    # Task 3 retargeted the nightly ingest's report-key clear to
+    # `supersede_topics_for_source`, which marks a row instead of removing it, so the topic a
+    # chunk was archived against normally still exists (superseded, not gone) by the time a
+    # restore runs. This resolution stays regardless — belt-and-suspenders for whatever
+    # DOES still physically remove a topics row (`delete_topics_for_source[_prefix]` remain
+    # in this repo for a caller that means an actual, irreversible delete), so a restore
+    # never fails the whole undelete transaction on a dangling FK.
+    #
+    # The scalar subquery yields NULL for a topic that is gone OR superseded (fix round 1,
+    # PR #972 review): "exists" is not enough any more. A chunk can be archived while its
+    # topic is live and restored after that SAME topic was later superseded by an unrelated
+    # re-extraction (the topic row still exists — Task 3 stopped deleting it) — binding the
+    # restored chunk to it would put it right back under `visible_chunks_predicate`'s
+    # superseded-topic arm, hidden, exactly the state R21 exists to repair for a supersede's
+    # own chunks. `LIVE_TOPIC_PREDICATE` (deleted_predicates — one definition, not an inlined
+    # `superseded_at` check that could drift from Task 2's) makes this the same "does the
+    # parent still count" test every other live read uses, so a restored chunk with a
+    # since-superseded topic comes back unbound rather than invisible.
     select_cols = ("a.id, a.site_id, a.user_id, a.source_s3_key, "
-                   "(SELECT t.id FROM topics t WHERE t.id = a.topic_id), "
+                   f"(SELECT t.id FROM topics t WHERE t.id = a.topic_id "
+                   f"AND {LIVE_TOPIC_PREDICATE.format(alias='t')}), "
                    "a.report_date, a.chunk_type, a.chunk_text, a.embedding, "
                    "a.metadata, a.created_at")
     conn.execute(

@@ -1,5 +1,6 @@
 import re
 
+import folder_key
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -30,6 +31,28 @@ def upsert_user(conn, cognito_sub, email, company_id=None, first_name=None,
         f"RETURNING {_COLS}",
         params,
     ).fetchone()
+
+
+def find_live_users_by_email_global(conn, email, limit=2) -> list:
+    """LIVE users by exact login email (case-insensitive), across ALL companies, each with
+    their home company's name, oldest first, at most `limit` (default 2: the caller only
+    needs to know whether the email is unique). Used only to add an existing person from
+    another company to a project (project-owned tenancy P1) -- never to search. Archived
+    users are not found. More than one row means the email is ambiguous: the caller
+    refuses rather than picking one (final review F8)."""
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT users.{', users.'.join(_COLS.split(', '))}, c.name AS company_name "
+        f"FROM users LEFT JOIN companies c ON c.id = users.company_id "
+        f"WHERE lower(users.email) = lower(%s) AND users.archived_at IS NULL "
+        f"ORDER BY users.created_at LIMIT %s", (email, limit)
+    ).fetchall()
+
+
+def get_user_by_email_global(conn, email) -> dict | None:
+    """The one live user with this email, or None -- also None when TWO OR MORE share it
+    (never pick one: see `find_live_users_by_email_global`)."""
+    rows = find_live_users_by_email_global(conn, email)
+    return rows[0] if len(rows) == 1 else None
 
 
 def get_user_by_sub(conn, cognito_sub) -> dict | None:
@@ -89,7 +112,14 @@ def upsert_field_only_user(conn, company_id, folder_name, first_name,
     cognito_sub is NULL (NULL never collides in a UNIQUE index, so this
     can't reuse upsert_user's ON CONFLICT (cognito_sub) path); conflicts are
     keyed on (company_id, folder_name) instead. email has a NOT NULL
-    constraint -- field_only rows get ''."""
+    constraint -- field_only rows get ''.
+
+    `folder_name` must already be a folder key (folder_key.folder_key); the
+    database CHECK (0081) would refuse anything else, so refuse it here first
+    with a message that says why."""
+    if not folder_key.KEY_RE.fullmatch(folder_name or ""):
+        raise ValueError(f"folder_name {folder_name!r} is not a folder key "
+                         "(mint it with folder_key.folder_key)")
     params = {
         "company_id": company_id, "folder_name": folder_name,
         "first": first_name, "last": last_name, "role": global_role,
@@ -314,3 +344,37 @@ def resolve_display_name(conn, company_id, name):
         return None, "ambiguous"
     return None, "not-in-directory"
 
+
+def first_officer_or_member(conn, company_id):
+    """The person to record as author for something the company owns, or None.
+
+    Anything written on a company's behalf still needs a real person on it:
+    report_templates.created_by is NOT NULL and references users(id). An
+    officer is preferred because the things seeded this way are org-scoped, and
+    org-scoped things are the officers' to manage -- but any live member is
+    better than failing, and a company with nobody in it returns None rather
+    than raising, because there is also nobody there to see the result.
+
+    ORDER BY on a boolean, not a role list in Python: the tie-break has to be
+    deterministic or re-running a seed names a different author each time, and
+    an author that moves is an audit trail that says nothing.
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        rows = cur.execute(
+            f"SELECT {_COLS} FROM users "
+            "WHERE company_id = %s AND archived_at IS NULL "
+            "ORDER BY (global_role IN ('gm', 'admin')) DESC, created_at ASC, id ASC "
+            "LIMIT 1",
+            (company_id,)).fetchall()
+    return rows[0] if rows else None
+
+
+def homes_for_folders(conn, folders) -> dict:
+    """{folder_name: {id, company_id}} (one query; folder_name is globally unique)."""
+    folders = sorted({f for f in (folders or []) if f})
+    if not folders:
+        return {}
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT folder_name, id, company_id FROM users WHERE folder_name = ANY(%s)",
+        (folders,)).fetchall()
+    return {r["folder_name"]: {"id": r["id"], "company_id": r["company_id"]} for r in rows}

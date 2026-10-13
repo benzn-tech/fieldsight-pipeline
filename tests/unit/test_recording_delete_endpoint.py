@@ -106,7 +106,7 @@ class _Conn:
 
 
 def _allow_all(monkeypatch, company="c-1"):
-    monkeypatch.setattr(org, "_can_delete_folder", lambda conn, caller, f: (True, company))
+    monkeypatch.setattr(org, "_can_delete_folder", lambda conn, caller, f, **kw: (True, company))
 
 
 def _stub_writes(monkeypatch, topics_found=()):
@@ -136,7 +136,7 @@ def test_authz_a_stranger_cannot_delete_another_folder(monkeypatch):
     undone by them because `revert_batch` is company-guarded."""
     monkeypatch.setattr(org, "ENABLE_USER_DELETION", True)
     monkeypatch.setattr(org, "_s3_client", _S3())
-    monkeypatch.setattr(org, "_can_delete_folder", lambda conn, caller, f: (False, None))
+    monkeypatch.setattr(org, "_can_delete_folder", lambda conn, caller, f, **kw: (False, None))
     calls = []
     monkeypatch.setattr(org.redactions, "create_recording_tombstone",
                         lambda *a, **k: calls.append(a))
@@ -154,7 +154,7 @@ def test_authz_is_per_recording_not_per_request(monkeypatch):
     monkeypatch.setattr(org, "ENABLE_USER_DELETION", True)
     monkeypatch.setattr(org, "_s3_client", _S3())
     monkeypatch.setattr(org, "_can_delete_folder",
-                        lambda conn, caller, f: (f == "Ben", "c-1"))
+                        lambda conn, caller, f, **kw: (f == "Ben", "c-1"))
     _stub_writes(monkeypatch, [{"id": "t-1"}])
 
     res = org.delete_recordings_endpoint(_Conn(), CALLER, {"recordings": [
@@ -295,7 +295,7 @@ def _undelete_stubs(monkeypatch, rows=None, still=()):
     monkeypatch.setattr(org.redactions, "list_batch",
                         lambda conn, b, c, **kw: list(rows if rows is not None
                                                       else BATCH_ROWS))
-    monkeypatch.setattr(org, "_can_delete_folder", lambda conn, caller, f: (True, "c-1"))
+    monkeypatch.setattr(org, "_can_delete_folder", lambda conn, caller, f, **kw: (True, "c-1"))
     monkeypatch.setattr(org.redactions, "active_batches_for_day",
                         lambda conn, f, d, **kw: list(still))
     monkeypatch.setattr(org.topics, "list_topics_for_source_prefix", lambda *a, **k: [])
@@ -328,7 +328,7 @@ def test_undelete_refuses_a_batch_the_caller_could_not_have_deleted(monkeypatch)
     recordings."""
     monkeypatch.setattr(org, "_s3_client", _S3())
     _undelete_stubs(monkeypatch)
-    monkeypatch.setattr(org, "_can_delete_folder", lambda conn, caller, f: (False, None))
+    monkeypatch.setattr(org, "_can_delete_folder", lambda conn, caller, f, **kw: (False, None))
     called = []
     monkeypatch.setattr(org.redactions, "revert_batch",
                         lambda *a, **k: called.append(a))
@@ -365,7 +365,7 @@ def test_undelete_keeps_the_day_hidden_while_another_batch_still_holds_it(monkey
     monkeypatch.setattr(org, "_s3_client", _S3())
     _undelete_stubs(monkeypatch, still=["b-2"])
     monkeypatch.setattr(org.topics, "list_topics_for_source_prefix",
-                        lambda conn, p: [{"id": "t-report"}] if p.startswith("reports/") else [])
+                        lambda conn, p, **kw: [{"id": "t-report"}] if p.startswith("reports/") else [])
     monkeypatch.setattr(org.redactions, "revert_batch", lambda conn, b, c, **kw: BATCH_ROWS)
     rehidden = []
     monkeypatch.setattr(org.redactions, "create_redaction",
@@ -381,7 +381,7 @@ def test_undelete_does_not_rehide_when_nothing_else_holds_the_day(monkeypatch):
     monkeypatch.setattr(org, "_s3_client", _S3())
     _undelete_stubs(monkeypatch, still=[])
     monkeypatch.setattr(org.topics, "list_topics_for_source_prefix",
-                        lambda conn, p: [{"id": "t-report"}])
+                        lambda conn, p, **kw: [{"id": "t-report"}])
     monkeypatch.setattr(org.redactions, "revert_batch", lambda conn, b, c, **kw: BATCH_ROWS)
     rehidden = []
     monkeypatch.setattr(org.redactions, "create_redaction",
@@ -581,3 +581,20 @@ def test_the_success_path_logs_its_zero_too(monkeypatch, caplog):
     with caplog.at_level(logging.INFO):
         org.delete_recordings_endpoint(_Conn(), CALLER, {"recordings": [REC]})
     assert any("hid 0 photo(s) in span" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("bad_date", ["2026-8-14", "2026-08-14T00:00", "14/08/2026",
+                                      "2026-08-14/x", "", "  ", "2026_08_14"])
+def test_a_date_that_is_not_yyyy_mm_dd_writes_no_tombstone(bad_date):
+    """The tombstone key's date segment is what `deleted_source_prefixes(conn, None, date)`
+    matches with `%/{date}/%` before the lake-wide summary is served. A key stored with any
+    other date shape is invisible to that guard, so the summary would be served WITH the
+    deleted session inside it. Refused here, where the key is built, rather than trusted to
+    every client: the read routes all validate the date, this write route did not."""
+    rec = {"folder": "Ben", "date": bad_date, "sessionBase": "sid0123abcd"}
+    assert org._source_prefixes_for(rec) == []
+
+
+def test_a_well_formed_date_still_builds_the_key():
+    rec = {"folder": "Ben", "date": "2026-08-14", "sessionBase": "sid0123abcd"}
+    assert org._source_prefixes_for(rec) == ["extractions/Ben/2026-08-14/sid0123abcd"]

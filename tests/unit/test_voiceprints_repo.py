@@ -20,12 +20,38 @@ VP = "22222222-2222-2222-2222-222222222222"
 
 
 class FakeCursor:
+    """⚠️ RESULTS ARE SERVED POSITIONALLY, in the order a test queued them.
+
+    So **adding any query near the front of a function under test shifts every queued
+    result after it**, and the tests that break are the ones with nothing to do with your
+    change. That has happened once: the withdrawal-in-flight guard put a liveness check at
+    the top of `add_sample` and nine unrelated tests went red, all raising the guard's own
+    exception -- which reads as "this guard refuses everything" when what it refuses is a
+    profile this double never said existed.
+
+    Nine tests failing at once with one exception is a symptom of the DOUBLE, not of the
+    code. Check here before changing the thing under test to suit it.
+    """
+
     def __init__(self, conn):
         self.conn = conn
         self._rows = []
 
+    #: The liveness check `add_sample` makes before anything else (the withdrawal-in-flight
+    #: guard). Answered here rather than queued, for two reasons: every test in this file
+    #: is about a LIVE profile, and this double serves results POSITIONALLY -- so a new
+    #: query at the front of the function would shift every queued result by one and break
+    #: nine tests that have nothing to do with withdrawal. Queue a `[{"status":
+    #: "withdrawn"}]` explicitly to exercise the refusal; `test_withdrawal_beats_an_
+    #: enrolment_in_flight.py` is where that is done.
+    _LIVENESS = "SELECT status FROM speaker_voiceprints"
+
     def execute(self, sql, params=None):
-        self.conn.calls.append({"sql": " ".join(sql.split()), "params": params})
+        flat = " ".join(sql.split())
+        self.conn.calls.append({"sql": flat, "params": params})
+        if flat.startswith(self._LIVENESS) and not self.conn.answer_liveness_from_queue:
+            self._rows = [{"status": "tentative"}]
+            return self
         self._rows = self.conn._pop_result()
         return self
 
@@ -37,6 +63,9 @@ class FakeCursor:
 
 
 class FakeConn:
+    #: Let a test take over the liveness answer when the withdrawal guard is the subject.
+    answer_liveness_from_queue = False
+
     def __init__(self, results=None):
         self.calls = []
         self._results = list(results or [])
@@ -307,6 +336,134 @@ def test_the_live_overlay_excludes_superseded_rows():
     sql = conn.calls[0]["sql"]
     assert "superseded_at IS NULL" in sql
     assert "company_id = %s" in sql
+
+
+# ----------------------------------------------------------
+# The per-company rejection floor (2026-09-20 spec). Calibrated ONLY from
+# source='correction' rows -- a human clicking a name onto a turn, never the system's own
+# output. The alternative (calibrate from confirmed matches) is circular: on 2026-09-10 the
+# existing chain CONFIRMED a stranger at best=0.445, and a distribution containing 0.445
+# has a low percentile at or below 0.445, so the floor could never reject the very error it
+# exists to catch. This is the guard against that, and it is the point of the whole task.
+# ----------------------------------------------------------
+
+
+def test_recompute_reads_only_source_correction_scores():
+    """The circularity guard. A voiceprint_match row, a correction_propagation row and a
+    label_inheritance row must all be invisible to the query that builds the floor -- only
+    a human-asserted correction may set the bar a machine guess is later held to.
+
+    `recompute_company_floor` issues TWO statements: calls[0] is the `count(*)` gate that
+    decides whether to write anything at all; calls[1] is the `SELECT score` whose ROWS
+    actually become the percentile -- the one that is the real calibration set. Checking
+    only calls[0] would let calls[1] drift (e.g. "optimised" to also pull propagated
+    names) while this test stayed green, because the two clauses happen to be identical
+    today. So both are asserted, with calls[1] -- the score query -- checked explicitly
+    rather than only incidentally, so nobody has to infer this was deliberate from the
+    count query passing alone."""
+    conn = FakeConn([[{"n": 1}], [{"score": 0.30}]])
+    voiceprints.recompute_company_floor(conn, CO, min_samples=1)
+    count_sql = conn.calls[0]["sql"]
+    score_sql = conn.calls[1]["sql"]
+    assert "source = 'correction'" in count_sql
+    assert "source = 'correction'" in score_sql, (
+        "the SCORE query -- the one whose rows become the floor -- must itself exclude "
+        "everything but human corrections; the count query alone proves nothing about "
+        "what the floor is actually built from")
+    for sql in (count_sql, score_sql):
+        assert "voiceprint_match" not in sql
+        assert "correction_propagation" not in sql
+        assert "label_inheritance" not in sql
+
+
+def test_recompute_excludes_corrections_from_before_the_mean_pooling_cutover():
+    """Spec S7: a correction's stored `best` score was computed under whichever pooling was
+    live when it was written. Mixing pre-cutover (max-pooled) and post-cutover (mean-pooled)
+    scores in one calibration set describes neither distribution -- discard and rebuild from
+    post-cutover corrections only."""
+    conn = FakeConn([[{"n": 1}], [{"score": 0.30}]])
+    voiceprints.recompute_company_floor(conn, CO, min_samples=1)
+    count_sql = conn.calls[0]["sql"]
+    score_sql = conn.calls[1]["sql"]
+    assert "created_at >=" in count_sql or "created_at > " in count_sql, (
+        "the calibration query must exclude rows written before the mean-pooling cutover")
+    # The count query alone proves nothing about what the floor is actually built from
+    # (test_recompute_reads_only_source_correction_scores makes exactly this point about the
+    # source='correction' filter) -- so the cutover filter is checked on the SCORE query too.
+    assert "created_at >=" in score_sql or "created_at > " in score_sql, (
+        "the SCORE query -- the one whose rows become the floor -- must itself exclude "
+        "pre-cutover rows, not just the count query used for the min-samples gate")
+    # And the pre-existing correction-only filter must still compose with this one: the
+    # cutover exclusion must not have replaced it.
+    assert "source = 'correction'" in score_sql
+
+
+def test_the_cutover_can_be_overridden_for_a_future_pooling_change():
+    """The next arithmetic change to aggregate_scores will need the same discard-and-rebuild
+    -- `since` must be a parameter, not a hardcoded date, or this becomes a one-time hack
+    that has to be reinvented."""
+    import datetime
+    custom = datetime.datetime(2027, 1, 1, tzinfo=datetime.timezone.utc)
+    conn = FakeConn([[{"n": 1}], [{"score": 0.30}]])
+    voiceprints.recompute_company_floor(conn, CO, min_samples=1, since=custom)
+    assert custom in conn.calls[0]["params"]
+
+
+def test_a_voiceprint_match_row_cannot_enter_the_calibration_set():
+    """Direct proof, not just an SQL-text assertion: a company whose ONLY qualifying rows
+    are voiceprint_match scores has TOO FEW source='correction' rows and gets no floor at
+    all -- never a floor built from the matches. The count query itself is scoped to
+    source = 'correction', so a company with five voiceprint_match rows and zero
+    corrections reports a count of zero."""
+    conn = FakeConn([[{"n": 0}]])
+    result = voiceprints.recompute_company_floor(conn, CO, min_samples=1)
+    assert result is None
+    count_sql = conn.calls[0]["sql"]
+    assert "source = 'correction'" in count_sql
+
+
+def test_below_the_minimum_sample_count_no_floor_is_written():
+    """Spec 1.5: a young company, or a company whose steady state is mostly matches and few
+    corrections, gets no floor rather than a global fallback or a refusal to confirm
+    anything -- both worse per the spec's own reasoning."""
+    conn = FakeConn([[{"n": 3}]])
+    result = voiceprints.recompute_company_floor(conn, CO, min_samples=10)
+    assert result is None
+    assert not any(c["sql"].startswith("INSERT") or "UPSERT" in c["sql"].upper()
+                   for c in conn.calls), "no row should be written below the minimum"
+
+
+def test_the_floor_is_a_low_percentile_not_the_minimum_or_the_mean():
+    """A single low outlier in the corrected history must not veto the company's future
+    matches -- that is what the minimum ('own minimum') alternative was rejected for."""
+    scores = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65]
+    conn = FakeConn([[{"n": len(scores)}], [{"score": s} for s in scores]])
+    result = voiceprints.recompute_company_floor(conn, CO, min_samples=1, percentile=5)
+    assert result is not None
+    assert result["floor"] < min(scores) + 0.05, "sanity: low percentile sits near the low end"
+    assert result["floor"] > min(scores) - 1e-9 or len(scores) < 20, (
+        "with fewer than 20 points a 5th percentile interpolates near the minimum -- this "
+        "assertion documents that rather than asserting an exact numpy percentile formula")
+
+
+def test_company_floor_reads_the_stored_value():
+    conn = FakeConn([[{"floor": 0.31, "sample_count": 12}]])
+    assert voiceprints.company_floor(conn, CO) == pytest.approx(0.31)
+
+
+def test_company_floor_is_none_when_no_row_exists():
+    conn = FakeConn([[]])
+    assert voiceprints.company_floor(conn, CO) is None
+
+
+def test_recompute_requires_company_id():
+    with pytest.raises(ValueError):
+        voiceprints.recompute_company_floor(FakeConn(), None)
+
+
+def test_company_floor_requires_company_id():
+    with pytest.raises(ValueError):
+        voiceprints.company_floor(FakeConn(), None)
 
 
 # ---- creating the profile a name attaches to ----------------------------
@@ -904,12 +1061,26 @@ def test_no_parameter_in_the_attempt_update_is_untyped_in_a_null_test():
 
 def test_the_listing_counts_human_samples_separately_from_harvested_ones():
     """The distinction the whole harvest design rests on: a profile built only from
-    inference must not read as one somebody vouched for."""
+    inference must not read as one somebody vouched for.
+
+    Both counts became quarantine-aware in 0064, and the assertion follows the MEANING
+    rather than the old literal: `samples` is what still matches, so a set-aside vector must
+    not inflate it. A listing that counted quarantined rows as samples would say a profile
+    holds twelve when four of them match nobody — which is precisely the state this listing
+    exists to make visible.
+    """
     conn = FakeConn([[{"id": "vp-1"}]])
     voiceprints.list_profiles(conn, CO)
     sql = " ".join(conn.calls[0]["sql"].split())
-    assert "count(s.id) AS samples" in sql
-    assert "FILTER (WHERE s.source = 'correction')" in sql
+    assert "AS samples" in sql
+    assert "s.source = 'correction'" in sql
+    assert "AS human_samples" in sql
+    # Both counts exclude the set-aside rows, and the set-aside count is reported beside
+    # them rather than folded in: "4 samples" and "4 samples, 2 set aside" are different
+    # facts about a profile.
+    assert sql.count("s.quarantined_at IS NULL") >= 2, (
+        "a quarantined vector still counts towards `samples` or `human_samples`")
+    assert "AS quarantined" in sql
 
 
 def test_the_listing_is_a_left_join_so_an_empty_profile_still_appears():

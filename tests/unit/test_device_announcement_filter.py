@@ -115,6 +115,61 @@ def test_punctuation_and_case_do_not_matter():
 
 
 # ------------------------------------------------------------------
+# The 0.7.12 recorded set (GrandTime feat/notification-sounds)
+# ------------------------------------------------------------------
+
+# Verbatim as supplied with the clips on 2026-09-15. Every one of these walked
+# straight through the filter before the patterns were extended: the match is a
+# whole sentence, and "video"/"audio" in front of "recording" was enough to miss.
+RECORDED_SET_2026_09 = [
+    "Video recording started.",
+    "Video recording paused.",
+    "Video recording stopped.",
+    "Audio recording started.",
+    "Audio recording paused.",
+    "Audio recording stopped.",
+    "Photo captured",
+    "Low battery, recording will stop soon.",
+    "Ready, go ahead.",
+]
+
+
+@pytest.mark.parametrize("text", RECORDED_SET_2026_09)
+def test_every_recorded_cue_is_filtered(text):
+    assert les.is_device_announcement(text), text
+
+
+@pytest.mark.parametrize("text", [
+    "Low battery. Recording will stop soon.",
+    "Recording will stop soon.",
+    "video recording paused",
+    "The audio recording has paused.",
+])
+def test_recorded_cues_are_caught_in_other_renderings(text):
+    """A transcriber may break the battery line at the comma, or drop the
+    punctuation; each rendering has to be recognised."""
+    assert les.is_device_announcement(text), text
+
+
+@pytest.mark.parametrize("text", [
+    # Split at the comma, the Ask cue is two of the most common things said on
+    # a site. Neither half may be a pattern or a companion.
+    "Ready.",
+    "Go ahead.",
+    "Ready. Go ahead.",
+    "Ready, go ahead and pour the east bay.",
+    # "Low battery" is a companion of the battery line, never a line by itself.
+    "Low battery.",
+    "Low battery on the laser level, grab the spare.",
+    "The video recording paused halfway, can you check the footage?",
+    "I captured a photo of the crack in the slab.",
+    "Photo captured the rebar spacing nicely.",
+])
+def test_people_saying_similar_things_are_kept(text):
+    assert not les.is_device_announcement(text), text
+
+
+# ------------------------------------------------------------------
 # What must NOT be removed — the expensive direction to get wrong
 # ------------------------------------------------------------------
 

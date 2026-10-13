@@ -8,7 +8,12 @@ from repositories.redactions import DELETED_TOPIC_PREDICATE
 import psycopg
 from psycopg.rows import dict_row
 
-from deleted_predicates import visible_topics_predicate
+from deleted_predicates import (
+    CHILD_OF_UNDELETED_TOPIC,
+    CHILD_OF_VISIBLE_TOPIC,
+    LIVE_TOPIC_PREDICATE,
+    visible_topics_predicate,
+)
 from psycopg.types.json import Jsonb
 
 from repositories import findings
@@ -17,7 +22,8 @@ logger = logging.getLogger(__name__)
 
 _TOPIC_COLS = ("id, site_id, user_id, source_s3_key, report_date, occurred_at, "
                "category, title, summary, time_range, participants, source, created_at, "
-               "work_class, work_confidence, is_mixed, thread_id, evidence, open_questions")
+               "work_class, work_confidence, is_mixed, thread_id, evidence, open_questions, "
+               "decisions")
 
 # Phase F (D8 retirement, spec §8): severity -> risk_level, for reshaping
 # safety-domain findings into the legacy safety_observations row shape.
@@ -61,7 +67,7 @@ def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_k
                  action_items=None, safety=None, photos=None,
                  time_range=None, participants=None,
                  work_class=None, work_confidence=None, is_mixed=False,
-                 evidence=None, open_questions=None) -> dict:
+                 evidence=None, open_questions=None, decisions=None) -> dict:
     """Insert a topic with its children. NOTE: currently insert-only —
     no ON CONFLICT dedup. Dedup is instead handled by callers running
     delete_topics_for_scope() first to clear the (site_id, report_date, user_id)
@@ -87,28 +93,37 @@ def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_k
     stopped doing that, this table was where they were lost, because it had a
     column for everything a topic produces except a question. Same NULL-vs-[]
     distinction as evidence: absent means never captured, empty means asked and
-    there were none."""
+    there were none.
+
+    decisions (migration 0058) are the decisions a topic recorded, stored as the
+    extractor's own {decision, rationale, decided_by} objects. The report path
+    passes plain strings and both are accepted -- one column holds both shapes,
+    and the narrowing to strings happens in lambda_org_api, at the payload
+    boundary, because that is the only place the shape is forced. Same
+    NULL-vs-[] distinction again."""
     cur = conn.cursor(row_factory=dict_row)
     topic = cur.execute(
         f"INSERT INTO topics (site_id, user_id, source_s3_key, report_date, occurred_at, "
         f"category, title, summary, time_range, participants, "
-        f"work_class, work_confidence, is_mixed, evidence, open_questions) "
-        f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING {_TOPIC_COLS}",
+        f"work_class, work_confidence, is_mixed, evidence, open_questions, decisions) "
+        f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING {_TOPIC_COLS}",
         (site_id, user_id, source_s3_key, report_date, occurred_at, category, title, summary,
          time_range, Jsonb(participants) if participants is not None else None,
          work_class, work_confidence, is_mixed,
          # NULL, not '[]', when there is nothing: absent means "never measured",
          # an empty array would mean "measured and cited nothing".
          Jsonb(evidence) if evidence is not None else None,
-         Jsonb(open_questions) if open_questions is not None else None),
+         Jsonb(open_questions) if open_questions is not None else None,
+         Jsonb(decisions) if decisions is not None else None),
     ).fetchone()
     tid = topic["id"]
     for a in (action_items or []):
         conn.execute(
             "INSERT INTO action_items (topic_id, site_id, text, responsible, deadline, "
-            "deadline_text, priority, status) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+            "deadline_text, priority, status, item_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (tid, site_id, a["text"], a.get("responsible"), a.get("deadline"),
-             a.get("deadline_text"), a.get("priority"), a.get("status", "open")),
+             a.get("deadline_text"), a.get("priority"), a.get("status", "open"),
+             a.get("item_id")),
         )
     for o in (safety or []):
         conn.execute(
@@ -125,20 +140,11 @@ def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_k
     return topic
 
 
-# A CHILD table's exclusion correlates on the child's OWN `topic_id`, never on a `topics`
-# alias -- `FROM action_items` and `FROM topic_photos` have no such alias in scope, and
-# Postgres resolves that at analysis time: `missing FROM-clause entry for table "t"`, every
-# call, not a weak filter but a crash. Two inlined copies said `t.id` and both were live
-# (`/live-items` and the reindex) until a real database was finally asked.
-#
-# Parameterised on the alias for the same reason `deleted_predicates` exists at all: the
-# eleven inlined copies in this file are what the unused `_visible()` helper was written to
-# prevent, and a copy that names the wrong table is exactly how one drifts.
-CHILD_OF_VISIBLE_TOPIC = (
-    "NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' "
-    "AND r.target_id = {alias}.topic_id AND r.scope = 'deleted' "
-    "AND r.reverted_at IS NULL)"
-)
+# CHILD_OF_VISIBLE_TOPIC now lives in deleted_predicates (Track B Task 2): it grew a
+# supersession arm alongside its deletion arm, and every other shared predicate already
+# lives there so the two do not drift apart. Kept importable from this module under its
+# original name -- tests/unit/test_get_topic_visible_sql.py and the AST scan below both
+# reference `topics.CHILD_OF_VISIBLE_TOPIC`.
 
 
 def _visible(sql: str, alias: str = "topics") -> str:
@@ -167,6 +173,9 @@ def _visible(sql: str, alias: str = "topics") -> str:
 def list_site_topics(conn, site_id, report_date) -> list[dict]:
     return conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_TOPIC_COLS} FROM topics WHERE site_id=%s AND report_date=%s  AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = topics.id AND r.scope = 'deleted' AND r.reverted_at IS NULL)"
+        # Live arm (Track B Task 2): a superseded pass of the same source key must not show
+        # beside the pass that replaced it.
+        f" AND {LIVE_TOPIC_PREDICATE.format(alias='topics')} "
         f"ORDER BY occurred_at NULLS LAST, created_at",
         (site_id, report_date),
     ).fetchall()
@@ -210,11 +219,14 @@ def folders_for_session_base(conn, company_id, session_base) -> list[str]:
     else — `DELETE /sessions/{ref}/speaker-names` has no folder in it, and the ownership
     arm of the speaker-correction gate needs one.
 
-    **Unlike `list_extraction_folder_names_for_date`, this DOES gate a write**, so two
-    things matter more here than there. The users JOIN + company_id filter is the whole
-    tenant guard — `source_s3_key` is folder-keyed and carries no company of its own — and
-    the caller must treat a result of length != 1 as "could not establish", never as
-    permission. An empty list is the ordinary answer for a session whose extraction has not
+    **Unlike `list_extraction_folder_names_for_date`, this DOES gate a write**, so
+    things matter more here than there. `company_id` is accepted for call-site
+    compatibility and no longer filters (project-owned tenancy: a topic on another
+    company's project is authored by someone whose directory row stays in their HOME
+    company, so an author-company pin silently dropped exactly that recorder). The
+    guard is the caller's comparison of the one returned folder with their OWN
+    folder, and the caller must treat a result of length != 1 as "could not
+    establish", never as permission. An empty list is the ordinary answer for a session whose extraction has not
     landed yet.
 
     The folder is read out of the key rather than from `user_id`, matching
@@ -232,11 +244,11 @@ def folders_for_session_base(conn, company_id, session_base) -> list[str]:
     like = f"extractions/%%/{_escape_like(session_base)}.json"
     rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT DISTINCT split_part(t.source_s3_key, '/', 2) AS folder "
-        "FROM topics t JOIN users u ON u.id = t.user_id "
-        "WHERE u.company_id=%s AND t.source_s3_key LIKE %s "
+        "FROM topics t "
+        "WHERE t.source_s3_key LIKE %s "
         "AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' "
         "AND r.target_id = t.id AND r.scope = 'deleted' AND r.reverted_at IS NULL)",
-        (company_id, like),
+        (like,),
     ).fetchall()
     return sorted({r["folder"] for r in rows if r["folder"]})
 
@@ -260,6 +272,20 @@ def get_topic(conn, topic_id):
         (topic_id,)).fetchone()
 
 
+# Shared by supersede_topics_for_source and supersede_topics_for_source_prefix (Ruling
+# R21, fix round 1 minor #4): appended to a `WITH retired AS (UPDATE topics ... RETURNING
+# id, title, summary)` CTE so both a source-key and a prefix supersede unbind the same way,
+# from one definition rather than two copies that could drift on the next edit.
+_UNBIND_RETIRED_CHUNKS_CTE = (
+    "), unbound AS ("
+    "  UPDATE report_chunks SET topic_id = NULL "
+    "  WHERE topic_id IN (SELECT id FROM retired) "
+    "  RETURNING 1"
+    ") "
+    "SELECT id, title, summary FROM retired"
+)
+
+
 def delete_topics_for_source(conn, source_s3_key) -> int:
     """Delete topics rows produced from one source report.
 
@@ -268,12 +294,154 @@ def delete_topics_for_source(conn, source_s3_key) -> int:
     modes a (site, date, user_id) scope key had — Fable review C1/I1).
     Children (action_items, safety_observations, topic_photos) are removed
     automatically via ON DELETE CASCADE FKs to topics
-    (see 0003_dashboard_readmodel.sql) — no separate child deletes needed."""
+    (see 0003_dashboard_readmodel.sql) — no separate child deletes needed.
+
+    Track B Task 3: the re-extraction paths (lambda_item_writer,
+    lambda_ingest) no longer call this — they call supersede_topics_for_source
+    below, which marks a row instead of removing it, so a re-extraction no
+    longer destroys the check-offs and findings a person made against the
+    pass it replaces. This function stays for a caller that means an actual,
+    irreversible delete."""
     cur = conn.execute(
         "DELETE FROM topics WHERE source_s3_key=%s",
         (source_s3_key,),
     )
     return cur.rowcount
+
+
+def supersede_topics_for_source(conn, source_s3_key, run) -> list[dict]:
+    """Retire this source key's LIVE topics instead of deleting them (Track B Task 3).
+
+    The non-destructive sibling of delete_topics_for_source, and the one the re-extraction
+    paths use: an UPDATE that stamps `superseded_at=now()`, `superseded_by_run=run` rather
+    than a DELETE, so the row and its children (action_items, findings, topic_photos, ...)
+    survive in the table instead of being lost to the topics -> action_items CASCADE. Task
+    2's read predicates (deleted_predicates.LIVE_TOPIC_PREDICATE) already hide a superseded
+    row from every display path, so a reader sees the same thing it saw when this was a
+    DELETE; what changed is that nothing is gone underneath.
+
+    `run` is the caller's own identifier for the pass doing the retiring (lambda_item_writer
+    uses f"{tier}:{extracted_at}"; lambda_ingest uses a "report:..." form) — stamped onto
+    `superseded_by_run` so a later reader can tell which pass replaced a given row. It is
+    opaque here: this function does not parse or validate it.
+
+    `WHERE superseded_at IS NULL` makes a second call with the same key a no-op (matches
+    delete_topics_for_source's rowcount going to zero on a second DELETE) — a row already
+    retired by an earlier call, here or via supersede_topics_for_source_prefix, is left alone
+    rather than having its superseded_by_run overwritten.
+
+    Also unbinds `report_chunks.topic_id` for every topic this call retires (Ruling R21,
+    Task 8 live check on TEST). Before Track B, `delete_topics_for_source`'s DELETE let
+    `report_chunks.topic_id REFERENCES topics(id) ON DELETE SET NULL` do this for free, so a
+    superseded day's chunks fell back to the `topic_id IS NULL` (unassigned) bucket, which
+    `visible_chunks_predicate` always shows, and the next nightly re-ingest of that source
+    key deleted them by `delete_chunks_for_source` (no duplicates). Once this UPDATE stopped
+    deleting the row, that SET NULL never fired: a retired topic's chunks stayed bound to it,
+    `visible_chunks_predicate`'s third arm hid them (correctly, by construction), and the new
+    live topic has no chunks of its own until that day's report is re-ingested — which for an
+    older day may never happen, so the session silently drops out of search/Ask. This UPDATE,
+    in the same statement via a CTE, restores the old SET NULL outcome directly.
+
+    Returns the RETURNING rows (id, title, summary) of every row this call retired. Task 4
+    reads them to carry stable ids and human edits from a retired row to its replacement.
+    Row order is whatever Postgres returns for an UPDATE ... RETURNING (unspecified) — a
+    caller that needs a stable order must sort."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "WITH retired AS ("
+        "  UPDATE topics SET superseded_at=now(), superseded_by_run=%s "
+        "  WHERE source_s3_key=%s AND superseded_at IS NULL "
+        "  RETURNING id, title, summary"
+        + _UNBIND_RETIRED_CHUNKS_CTE,
+        (run, source_s3_key),
+    ).fetchall()
+
+
+def list_day_topics_for_binding(conn, user_folder, report_date) -> list[dict]:
+    """Every topic of one (folder, day) that a photo could belong to.
+
+    THE SCOPE IS FOLDER + DATE, matching the photo prefix exactly
+    (`users/{folder}/pictures/{date}/`). It is deliberately NOT (site_id,
+    user_id): both are resolved per extraction through the identity bridge and
+    both can come back None or differ between two sessions of one day, and a
+    rebind that saw a narrower set than the photo list would leave the topics
+    it could not see holding stale rows -- which is the defect it exists to
+    fix, one layer in.
+
+    Both source shapes a day can have are covered, and they must both be:
+
+      extractions/{folder}/{date}/{session}.json   (lambda_item_writer)
+      reports/{date}/{folder}/daily_report.json    (lambda_ingest)
+
+    A day under the authority flip has only the first; a zero-extraction
+    fallback day has only the second; a day mid-flip can briefly have both,
+    and on that day a photo must not be bound once by each.
+
+    Deleted topics are excluded, and with BOTH arms. The first draft carried
+    only `DELETED_TOPIC_PREDICATE` and tests/unit/test_deleted_read_paths.py
+    caught it: the source arm is the load-bearing one here, because a day whose
+    recording was deleted gets re-extracted and its topics come back with NEW
+    uuids that no topic-keyed tombstone names -- while still carrying the
+    tombstoned `source_s3_key`. Binding the day's photos onto those would put
+    a deleted recording's evidence back on screen.
+
+    Ordered by (time_range, id) so a rebind is deterministic: the matcher
+    breaks ties by index, and an unordered SELECT would make which topic wins
+    a tie depend on the physical row order.
+    """
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, title, time_range, source_s3_key, evidence FROM topics "
+        "WHERE (source_s3_key LIKE %s ESCAPE '\\' OR source_s3_key = %s) "
+        f"AND {visible_topics_predicate('topics')} "
+        "ORDER BY time_range NULLS LAST, id",
+        (f"extractions/{_escape_like(user_folder)}/{_escape_like(report_date)}/%",
+         f"reports/{report_date}/{user_folder}/daily_report.json"),
+    ).fetchall()
+
+
+def replace_day_photo_bindings(conn, user_folder, report_date, rows) -> int:
+    """Replace one (folder, day)'s MACHINE photo bindings with `rows`.
+
+    `rows` is [{topic_id, s3_key, caption_text}] -- the output of one day-wide
+    `photo_binding.photos_for_topics` pass, in which a photo appears at most
+    once by construction.
+
+    DELETE-THEN-INSERT over the whole day, not an upsert per row, because the
+    thing being repaired is a row that should no longer exist. An insert-only
+    writer is exactly what produced 22 multi-bound photos on prod: each session
+    added its own and nothing was ever responsible for removing another's.
+
+    `source='binding'` bounds the delete, and the bound is the point:
+
+      * 'keyframe' rows have no time window to be re-derived from -- the file
+        IS the evidence -- so sweeping them would delete the only record that
+        frame belongs to that topic;
+      * 'human' rows are somebody's decision. A machine that overwrites those
+        is worse than one that binds nothing.
+
+    Scoped through `topics` rather than by s3_key prefix: `topic_photos` has no
+    folder or date of its own, and matching on the key's text would also catch
+    a keyframe whose synthetic filename lives under the same prefix.
+
+    The inner SELECT DELIBERATELY DOES NOT exclude deleted topics, which is why
+    this function is in test_deleted_read_paths.EXEMPT. Filtering them would
+    leave a tombstoned topic holding its stale binding rows forever -- the
+    opposite of what the exclusion is for. Nothing here reads a topic's
+    content; the scope is a delete's reach.
+    """
+    deleted = conn.execute(
+        "DELETE FROM topic_photos WHERE source = 'binding' AND topic_id IN ("
+        "  SELECT id FROM topics WHERE source_s3_key LIKE %s ESCAPE '\\' "
+        "     OR source_s3_key = %s)",
+        (f"extractions/{_escape_like(user_folder)}/{_escape_like(report_date)}/%",
+         f"reports/{report_date}/{user_folder}/daily_report.json"),
+    ).rowcount
+    for r in rows:
+        conn.execute(
+            "INSERT INTO topic_photos (topic_id, s3_key, caption_text, source) "
+            "VALUES (%s,%s,%s,'binding')",
+            (r["topic_id"], r["s3_key"], r.get("caption_text")),
+        )
+    return deleted
 
 
 def delete_topics_for_source_prefix(conn, source_prefix) -> int:
@@ -295,7 +463,10 @@ def delete_topics_for_source_prefix(conn, source_prefix) -> int:
     (e.g. 'extractions/JarleyXTrainor/...'). ESCAPE '\\' designates '\\' as
     the escape character, so '\\_'/'\\%' in the pattern are literal; only
     the trailing '%' appended here (unescaped) is a real wildcard.
-    """
+
+    Track B Task 3: lambda_ingest's nightly-report supersession now calls
+    supersede_topics_for_source_prefix below instead — kept for a caller that
+    means an actual, irreversible delete (see delete_topics_for_source)."""
     escaped = _escape_like(source_prefix)
     cur = conn.execute(
         "DELETE FROM topics WHERE source_s3_key LIKE %s ESCAPE '\\'",
@@ -304,31 +475,69 @@ def delete_topics_for_source_prefix(conn, source_prefix) -> int:
     return cur.rowcount
 
 
-def has_topics_for_source(conn, source_s3_key) -> bool:
-    """Does this exact source key have any topics?
+def supersede_topics_for_source_prefix(conn, source_prefix, run) -> list[dict]:
+    """Prefix form of supersede_topics_for_source (Track B Task 3) — the non-destructive
+    sibling of delete_topics_for_source_prefix, for lambda_ingest's nightly-report
+    supersession of that day's session-sourced (live extraction) topics. Same LIKE-wildcard
+    escaping as delete_topics_for_source_prefix (S3 user folders contain literal
+    underscores — see _escape_like's docstring) and the same `run` / return contract as
+    supersede_topics_for_source, including the report_chunks unbind (Ruling R21) — see that
+    function's docstring for why: this UPDATE stopped triggering
+    `report_chunks.topic_id ... ON DELETE SET NULL` the same way, for the same reason."""
+    escaped = _escape_like(source_prefix)
+    return conn.cursor(row_factory=dict_row).execute(
+        "WITH retired AS ("
+        "  UPDATE topics SET superseded_at=now(), superseded_by_run=%s "
+        "  WHERE source_s3_key LIKE %s ESCAPE '\\' AND superseded_at IS NULL "
+        "  RETURNING id, title, summary"
+        + _UNBIND_RETIRED_CHUNKS_CTE,
+        (run, escaped + '%'),
+    ).fetchall()
+
+
+def has_topics_for_source(conn, source_s3_key, *, include_superseded=False) -> bool:
+    """Does this exact source key have any (live, by default) topics?
 
     The single-key sibling of has_topics_for_source_prefix, for the multi-device
     merge: a joiner's own extraction prefix is empty after the merge deletes it,
     so the nightly defer test has to ask about the MERGED artifact's key
     instead, and that is one key rather than a prefix. Exact equality, so no
-    LIKE escaping is involved."""
+    LIKE escaping is involved.
+
+    `include_superseded=False` (Track B Task 2) is the right default for every caller today:
+    the pipeline (`_should_defer`, `_merge_already_landed`) asks this to decide whether
+    authoritative work already exists, and a superseded pass is exactly the kind of work
+    that is no longer authoritative -- the live pass, if any, is what should answer that
+    question. `include_superseded=True` is for a caller that means "ever, regardless of
+    which pass" (none does today; the kwarg exists so that caller does not have to inline
+    the predicate itself)."""
+    sql = "SELECT 1 FROM topics WHERE source_s3_key = %s"
+    if not include_superseded:
+        sql += f" AND {LIVE_TOPIC_PREDICATE.format(alias='topics')}"
     row = conn.cursor(row_factory=dict_row).execute(
-        "SELECT 1 FROM topics WHERE source_s3_key = %s LIMIT 1",
-        (source_s3_key,),
+        sql + " LIMIT 1", (source_s3_key,),
     ).fetchone()
     return row is not None
 
 
-def has_topics_for_source_prefix(conn, source_prefix) -> bool:
+def has_topics_for_source_prefix(conn, source_prefix, *, include_superseded=False) -> bool:
     """Existence check for the org-api timeline shim (authority-flip Task 4):
-    does ANY topic already exist for this (user, date) extraction prefix?
-    Used to decide report-verbatim vs. Aurora-rendered per day. Same
+    does ANY (live, by default) topic already exist for this (user, date) extraction
+    prefix? Used to decide report-verbatim vs. Aurora-rendered per day. Same
     LIKE-wildcard escaping as delete_topics_for_source_prefix (S3 user
-    folders contain literal underscores)."""
+    folders contain literal underscores).
+
+    `include_superseded=False` is the default for the same reason as
+    `has_topics_for_source`'s (Track B Task 2): after Task 3, a key with a superseded pass
+    and a live pass must still answer True here on the live pass alone -- and a day whose
+    ONLY topics under this prefix are superseded must answer False, the same as a day with
+    none, so the caller falls back correctly rather than rendering a hidden pass."""
     escaped = _escape_like(source_prefix)
+    sql = "SELECT 1 FROM topics WHERE source_s3_key LIKE %s ESCAPE '\\'"
+    if not include_superseded:
+        sql += f" AND {LIVE_TOPIC_PREDICATE.format(alias='topics')}"
     row = conn.cursor(row_factory=dict_row).execute(
-        "SELECT 1 FROM topics WHERE source_s3_key LIKE %s ESCAPE '\\' LIMIT 1",
-        (escaped + '%',),
+        sql + " LIMIT 1", (escaped + '%',),
     ).fetchone()
     return row is not None
 
@@ -340,11 +549,19 @@ def list_extraction_topics_for_day(conn, site_id, user_id, report_date) -> list[
     (Task 7, WS1 root fix), so defer-day chunks carry a real extraction
     topic UUID instead of topic_id=None. source_s3_key prefix here is the
     fixed literal 'extractions/' (not caller input), so no _escape_like()
-    call is needed -- same posture as list_extraction_folder_names_for_date."""
+    call is needed -- same posture as list_extraction_folder_names_for_date.
+
+    `source_s3_key` (fix round 1, PR #972 review #1) rides along so
+    `_match_report_topics_to_extraction` can stamp it into the matched chunk's
+    `metadata.source_files` -- see that function's docstring for why a topic-type
+    report chunk needs one at all."""
     return conn.cursor(row_factory=dict_row).execute(
-        "SELECT id, title, occurred_at FROM topics "
+        "SELECT id, title, occurred_at, source_s3_key FROM topics "
         "WHERE site_id=%s AND user_id=%s AND report_date=%s "
-        "AND source_s3_key LIKE 'extractions/%%' AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = topics.id AND r.scope = 'deleted' AND r.reverted_at IS NULL) ORDER BY occurred_at",
+        "AND source_s3_key LIKE 'extractions/%%' AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = topics.id AND r.scope = 'deleted' AND r.reverted_at IS NULL) "
+        # Live arm (Track B Task 2): these ids become a defer-day chunk's topic_id, so a
+        # superseded candidate here would permanently attach new chunks to a hidden topic.
+        f"AND {LIVE_TOPIC_PREDICATE.format(alias='topics')} ORDER BY occurred_at",
         (site_id, user_id, report_date),
     ).fetchall()
 
@@ -352,8 +569,35 @@ def list_extraction_topics_for_day(conn, site_id, user_id, report_date) -> list[
 _TOPIC_COLS_JOINED = (
     "t.id, t.site_id, t.user_id, t.source_s3_key, t.report_date, t.occurred_at, "
     "t.category, t.title, t.summary, t.time_range, t.participants, t.source, t.created_at, "
-    "t.work_class, t.work_confidence, t.is_mixed, t.thread_id, t.open_questions"
+    "t.work_class, t.work_confidence, t.is_mixed, t.thread_id, t.open_questions, "
+    "t.decisions"
 )
+
+
+# One count per day read, over the action items that survived the collapse.
+# `version = 1 + edit_count` is what Today's to-do chip shows (todo-card spec
+# §3.4), and it has to agree with GET /content/action_items/{id}/history, which
+# lists content_edits by row_id -- so collapsed_ids are NOT counted, and there is
+# no company predicate: every writer stamps the row's own company and history
+# filters on the row's company, so the unscoped count is the same number.
+# `::uuid[]` is required: the ids are passed as str, and uuid = text has no
+# operator. Served by idx_content_edits_row (migration 0019).
+_EDIT_COUNT_SQL = (
+    "SELECT row_id, count(*) AS n FROM content_edits "
+    "WHERE table_name = 'action_items' AND row_id = ANY(%s::uuid[]) "
+    "GROUP BY row_id"
+)
+
+
+def _stamp_edit_counts(conn, items):
+    if not items:
+        return items
+    ids = [str(a["id"]) for a in items]
+    counts = {str(r["row_id"]): int(r["n"]) for r in conn.cursor(row_factory=dict_row)
+              .execute(_EDIT_COUNT_SQL, (ids,)).fetchall()}
+    for a in items:
+        a["edit_count"] = counts.get(str(a["id"]), 0)
+    return items
 
 
 def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
@@ -453,7 +697,8 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
     topic_rows = conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_TOPIC_COLS_JOINED}, "
         f"s.name AS site_name, "
-        f"NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '') AS user_name "
+        f"NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '') AS user_name, "
+        f"u.folder_name AS user_folder "
         f"FROM topics t "
         f"LEFT JOIN sites s ON s.id = t.site_id "
         f"LEFT JOIN users u ON u.id = t.user_id "
@@ -482,7 +727,7 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
     # implementation a first reading reaches for. The survivor keeps its own
     # topic_id and lands on its own topic; the rows it stands for simply do not
     # appear. Off unless ENABLE_TODO_COLLAPSE says otherwise.
-    for a in todo_collapse.collapse_if_enabled(_all_items):
+    for a in _stamp_edit_counts(conn, todo_collapse.collapse_if_enabled(_all_items)):
         action_items_by_topic.setdefault(a["topic_id"], []).append(a)
 
     safety_by_topic = {}
@@ -528,7 +773,10 @@ def list_report_dates(conn, site_ids, since_date, *, author_ids=None) -> list:
     Empty site_ids -> [] without a round-trip (mirrors list_topics_for_date)."""
     if not site_ids:
         return []
-    where = "WHERE site_id = ANY(%s::uuid[]) AND report_date >= %s AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = topics.id AND r.scope = 'deleted' AND r.reverted_at IS NULL)"
+    where = ("WHERE site_id = ANY(%s::uuid[]) AND report_date >= %s AND NOT EXISTS (SELECT 1 FROM redactions r WHERE r.target_type = 'topic' AND r.target_id = topics.id AND r.scope = 'deleted' AND r.reverted_at IS NULL)"
+             # Live arm (Track B Task 2): a date whose only topics are superseded must not
+             # keep offering a calendar dot / date-picker entry for the pass that was replaced.
+             f" AND {LIVE_TOPIC_PREDICATE.format(alias='topics')}")
     params = [list(site_ids), since_date]
     if author_ids is not None:
         where += " AND user_id = ANY(%s::uuid[])"
@@ -651,15 +899,21 @@ def report_date_counts(conn, site_ids, since_date, *, author_ids=None) -> list[d
 def _prefix_or_merged(merged_keys):
     """The prefix condition, widened by exact merged keys when there are any.
 
-    UNION ONLY. No deletion predicate is added here, and that is deliberate
+    UNION ONLY. No DELETION predicate is added here, and that is deliberate
     rather than an oversight: this function has never carried one -- the
     NOT EXISTS (... redactions ...) text lives in its DOCSTRING, not its SQL --
     and its callers drop deleted topics in Python afterwards.
 
-    Adding the predicate here would break the delete endpoint. delete_recordings
+    Adding the DELETION predicate here would break the delete endpoint. delete_recordings
     and undelete enumerate topics THROUGH this function in order to tombstone or
     re-hide them; a predicate makes a second delete batch enumerate nothing and
     hands the re-hide logic an empty list.
+
+    The LIVE (supersession) arm is a separate question (Track B Task 2) and is NOT added
+    here either -- it is added by `list_topics_for_source_prefix`, the caller, gated behind
+    `include_superseded`, so the SAME enumeration/display split applies to it: the
+    delete/undelete callers pass `include_superseded=True` and must still see a superseded
+    row to re-tombstone it, while a display caller must not.
 
     A merged record's rows are reached by EXACT key, never by the lead's
     identity: a graded member has author_ids active and the merged rows carry
@@ -673,7 +927,8 @@ def _prefix_or_merged(merged_keys):
     return cond
 
 
-def list_topics_for_source_prefix(conn, source_prefix, *, merged_keys=None) -> list[dict]:
+def list_topics_for_source_prefix(conn, source_prefix, *, merged_keys=None,
+                                  include_superseded=False) -> list[dict]:
     """org-api timeline shim read (authority-flip Task 4): all topics whose
     source_s3_key starts with source_prefix (typically
     f"extractions/{user_folder}/{date}/"), so the shim can render the
@@ -699,16 +954,30 @@ def list_topics_for_source_prefix(conn, source_prefix, *, merged_keys=None) -> l
     this fix makes that layering redundant-but-harmless rather than
     load-bearing (NOTE: get_topic_full, below, is a separate single-topic
     read used only by the reindex builder and is intentionally NOT changed
-    here -- out of this task's scoped call sites)."""
+    here -- out of this task's scoped call sites).
+
+    `include_superseded=False` (Track B Task 2) adds the LIVE arm on top of
+    `_prefix_or_merged`'s (still deliberately deletion-predicate-free) condition -- see that
+    function's docstring for why the two arms are split across caller/callee. The display
+    callers (org-api's timeline shim, both cross-user and own-day) keep the default: a
+    superseded pass must not render beside the pass that replaced it. The delete/undelete
+    enumeration callers pass `include_superseded=True` so a deleted recording's superseded
+    topics are tombstoned/re-hidden along with its live ones -- the enumeration must see
+    every row `superseded_at` or not, or a delete leaves a superseded copy behind that no
+    batch ever covers."""
     escaped = _escape_like(source_prefix)
+    where = f"WHERE ({_prefix_or_merged(merged_keys)})"
+    if not include_superseded:
+        where += f" AND {LIVE_TOPIC_PREDICATE.format(alias='t')}"
     topic_rows = conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_TOPIC_COLS_JOINED}, "
         f"s.name AS site_name, "
-        f"NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '') AS user_name "
+        f"NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '') AS user_name, "
+        f"u.folder_name AS user_folder "
         f"FROM topics t "
         f"LEFT JOIN sites s ON s.id = t.site_id "
         f"LEFT JOIN users u ON u.id = t.user_id "
-        f"WHERE ({_prefix_or_merged(merged_keys)}) "
+        f"{where} "
         f"ORDER BY t.time_range NULLS LAST, t.created_at, t.id",
         tuple([escaped + '%'] + ([list(merged_keys)] if merged_keys else [])),
     ).fetchall()
@@ -729,7 +998,7 @@ def list_topics_for_source_prefix(conn, source_prefix, *, merged_keys=None) -> l
     # Same collapse as list_topics_for_date, and for the same reason: this is
     # the authority-flip timeline shim, i.e. the read path a prod customer's
     # Today and Timeline actually go through.
-    for a in todo_collapse.collapse_if_enabled(_all_items):
+    for a in _stamp_edit_counts(conn, todo_collapse.collapse_if_enabled(_all_items)):
         action_items_by_topic.setdefault(a["topic_id"], []).append(a)
 
     safety_by_topic = {}
@@ -764,29 +1033,28 @@ def list_topics_for_source_prefix(conn, source_prefix, *, merged_keys=None) -> l
     return topic_rows
 
 
-def list_extraction_folder_names_for_date(conn, company_id, report_date) -> list[str]:
-    """Distinct extraction-sourced folder_name values for one company/date --
-    org-api timeline admin-disambiguation (authority-flip Task 4, RETARGET
-    override 5's multi-tenant guard). source_s3_key has no company scoping
-    of its own (S3 lake paths are folder_name-keyed only, not per-company);
-    the users JOIN + company_id filter is what makes this candidate list
-    tenant-safe. Read-only -- used only to build the admin
-    "available_users" list, never to gate a write. Same LIKE-wildcard
-    posture as has_topics_for_source_prefix, but the prefix here is a fixed
-    literal ('extractions/'), not caller input, so no _escape_like() call is
-    needed -- the '%%' is escaped inline for psycopg's %s paramstyle."""
+def list_extraction_folder_names_for_date(conn, site_ids, report_date) -> list[str]:
+    """Distinct extraction-sourced folder_name values for one day over the
+    given SITES -- org-api timeline admin-disambiguation. Project-owned
+    tenancy: the tenant guard is "the row's site is in the caller's scope", not
+    "the author belongs to the caller's company" -- an external member's topics
+    on a site must show for that site's company, and a home-company author's
+    topics on another company's site must not. Read-only -- used only to build
+    the admin "available_users" list, never to gate a write. `site_ids` None
+    means every site (cross-company caller); an empty collection matches
+    nothing. The prefix is a fixed literal; '%%' is escaped inline for
+    psycopg's %s paramstyle."""
+    where_site = "" if site_ids is None else "AND t.site_id = ANY(%s::uuid[]) "
+    params = [report_date] + ([] if site_ids is None else [[str(s) for s in site_ids]])
     rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT DISTINCT u.folder_name FROM topics t JOIN users u ON u.id = t.user_id "
         # Both arms, for the same reason as the contributor list: this builds the
         # meeting picker's "available_users", so a folder that survives here is a
-        # person's name offered for a day whose content was deleted. The endpoint
-        # above already refuses the lake-wide summary_report.json for such a day
-        # (`_day_has_deleted_sources`) -- the candidate list was the half that
-        # did not ask.
-        f"WHERE t.report_date=%s AND u.company_id=%s "
+        # person's name offered for a day whose content was deleted.
+        f"WHERE t.report_date=%s {where_site}"
         f"AND {visible_topics_predicate('t')} "
         "AND t.source_s3_key LIKE 'extractions/%%' AND u.folder_name IS NOT NULL",
-        (report_date, company_id),
+        tuple(params),
     ).fetchall()
     return [r["folder_name"] for r in rows]
 
@@ -796,11 +1064,19 @@ def get_topic_full(conn, topic_id) -> dict | None:
     safety_observations / findings / photos children, shaped EXACTLY like a
     list_topics_for_source_prefix element so render_report_shape can consume
     [row]. Used by the per-topic reindex builder (reindex.enqueue_topic_
-    reindex). Returns None if the id is missing/malformed."""
+    reindex). Returns None if the id is missing/malformed.
+
+    UNFILTERED for supersession throughout (R3, Track B Task 2): the reindex builder must be
+    able to re-embed a topic's corrected content even mid-supersession. The photos child uses
+    `CHILD_OF_UNDELETED_TOPIC`, not `CHILD_OF_VISIBLE_TOPIC` -- the latter now also carries
+    the live arm, and photos is the one child here that predates this task with a deletion
+    filter already on it; giving it the combined constant would have silently dropped a
+    superseded topic's photos from this read, which nothing else on this function does."""
     rows = conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_TOPIC_COLS_JOINED}, "
         f"s.name AS site_name, "
-        f"NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '') AS user_name "
+        f"NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '') AS user_name, "
+        f"u.folder_name AS user_folder "
         f"FROM topics t "
         f"LEFT JOIN sites s ON s.id = t.site_id "
         f"LEFT JOIN users u ON u.id = t.user_id "
@@ -828,9 +1104,86 @@ def get_topic_full(conn, topic_id) -> dict | None:
     t["photos"] = conn.cursor(row_factory=dict_row).execute(
         "SELECT id, topic_id, s3_key, caption_text FROM topic_photos "
         "WHERE topic_id = ANY(%s) AND "
-        + CHILD_OF_VISIBLE_TOPIC.format(alias="topic_photos")
+        + CHILD_OF_UNDELETED_TOPIC.format(alias="topic_photos")
         + " ORDER BY created_at", (tids,)).fetchall()
     return t
+
+
+# The pinned-topic read for scoped Ask (spec 2026-09-15 §4.3). NOT get_topic_full:
+# that one is `WHERE t.id=%s` with no visibility, company, redaction or non_work
+# exclusion, and reindex.py depends on it staying exactly that.
+#
+# One statement, so "unknown", "hidden" and "out of reach" are the same None.
+# Casts are explicit because Postgres cannot infer a type for `%s IS NULL`
+# (a CASE WHEN %s IS NULL once returned 500 in production with every test green).
+_TOPIC_VISIBLE_SQL = (
+    "SELECT t.id, t.title, t.summary, t.report_date, t.site_id, "
+    "       s.name AS site_name, t.user_id, t.time_range "
+    "FROM topics t LEFT JOIN sites s ON s.id = t.site_id "
+    "WHERE t.id = %(id)s::uuid "
+    "AND t.site_id = ANY(%(site_ids)s::uuid[]) "
+    "AND (%(author_ids)s::uuid[] IS NULL OR t.user_id = ANY(%(author_ids)s::uuid[])) "
+    f"AND {visible_topics_predicate('t')} "
+    "AND t.work_class IS DISTINCT FROM 'non_work' "
+    # Same rule as redactions.company_excluded_topic_ids: ANY active redaction,
+    # whatever its scope. The pinned block is stricter than retrieval on purpose
+    # (spec §4.4 records the asymmetry).
+    "AND NOT EXISTS (SELECT 1 FROM redactions ra WHERE ra.target_type = 'topic' "
+    "AND ra.target_id = t.id AND ra.reverted_at IS NULL)"
+)
+
+_TOPIC_VISIBLE_ACTION_ITEMS_SQL = (
+    "SELECT text, responsible, deadline, deadline_text, status FROM action_items "
+    "WHERE topic_id = %s AND "
+    + CHILD_OF_VISIBLE_TOPIC.format(alias="action_items")
+    + " ORDER BY created_at"
+)
+
+
+def get_topic_visible(conn, topic_id, site_ids, author_ids) -> dict | None:
+    """One topic the caller may see, shaped for the Ask prompt, or None.
+
+    `site_ids` / `author_ids` are the caller's ALREADY-RESOLVED ACL
+    (scope.visible_scope); `author_ids=None` means no author restriction. None is
+    returned for a malformed id, an unknown id, a topic outside the site or author
+    set, a non_work topic, an actively redacted topic and a deleted recording's
+    topic -- indistinguishable by design. Every value is JSON-safe (rag-search
+    returns this dict through the Lambda marshaller).
+    """
+    import uuid as _uuid
+    try:
+        tid = str(_uuid.UUID(str(topic_id)))
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if topic_id is None or not site_ids:
+        return None
+    row = conn.cursor(row_factory=dict_row).execute(
+        _TOPIC_VISIBLE_SQL,
+        {"id": tid,
+         "site_ids": [str(s) for s in site_ids],
+         "author_ids": None if author_ids is None else [str(a) for a in author_ids]},
+    ).fetchone()
+    if not row:
+        return None
+    items = conn.cursor(row_factory=dict_row).execute(
+        _TOPIC_VISIBLE_ACTION_ITEMS_SQL, (tid,)).fetchall()
+    return {
+        "id": str(row["id"]),
+        "title": row["title"],
+        "summary": row["summary"],
+        "report_date": str(row["report_date"]),
+        "site_id": str(row["site_id"]),
+        "site_name": row["site_name"],
+        "user_id": str(row["user_id"]) if row["user_id"] is not None else None,
+        "time_range": str(row["time_range"]) if row["time_range"] is not None else None,
+        "action_items": [
+            {"text": a["text"], "responsible": a["responsible"],
+             "deadline": (str(a["deadline"]) if a["deadline"] is not None
+                          else a.get("deadline_text")),
+             "status": a["status"]}
+            for a in items
+        ],
+    }
 
 
 def add_topic_photo_if_absent(conn, topic_id, s3_key, caption_text):
@@ -846,13 +1199,20 @@ def add_topic_photo_if_absent(conn, topic_id, s3_key, caption_text):
     per-row inside a SAVEPOINT (conn.transaction()) so the aborted statement
     rolls back to the savepoint and the caller's outer transaction stays usable:
     one racing topic is skipped, the whole keyframe request is NOT lost. Does
-    not raise for that race."""
+    not raise for that race.
+
+    `source='keyframe'` is written explicitly. Left to the column default it
+    would read 'binding', and the next day-wide rebind -- which deletes exactly
+    the 'binding' rows -- would sweep the keyframe away with nothing to
+    re-derive it from. Keyframes are gated off on both stacks today; this is
+    what keeps that from being the only thing standing between a keyframe and
+    the rebind."""
     try:
         with conn.transaction():
             row = conn.execute(
                 """
-                INSERT INTO topic_photos (topic_id, s3_key, caption_text)
-                SELECT %(tid)s, %(key)s, %(cap)s
+                INSERT INTO topic_photos (topic_id, s3_key, caption_text, source)
+                SELECT %(tid)s, %(key)s, %(cap)s, 'keyframe'
                 WHERE NOT EXISTS (
                     SELECT 1 FROM topic_photos WHERE topic_id = %(tid)s AND s3_key = %(key)s
                 )

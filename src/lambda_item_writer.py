@@ -18,9 +18,8 @@ Site resolution note: the extraction JSON has no 'site' field (unlike a
 daily_report.json, which may carry report['site']) -- declared_site is only
 ever stored for record in the extraction JSON, it is NOT consumed for site
 attribution here. resolve_site is always called with an empty report dict,
-which falls straight through to the user_mapping.json primary_site slug
-bridge. A double miss (report has no site AND the mapping bridge also
-misses) skips the extraction, zero writes -- exactly like lambda_ingest's
+which falls straight through to the membership-based bridge. A double miss
+(report has no site AND the bridge also misses) skips the extraction, zero writes -- exactly like lambda_ingest's
 report-level site-bridge miss.
 
 G5b: recordings.site_for_media (the app-tagged site, keyed on the
@@ -40,11 +39,18 @@ Entry point (event shape):
     S3 event notifications encode spaces as '+' and other special chars as
     %XX -- the key is ALWAYS unquote_plus'd before use.
 
+Row growth (Track B Task 3): re-extraction no longer DELETEs a source key's prior topics --
+it marks them `superseded_at` and leaves them in the table (see repositories.topics.
+supersede_topics_for_source). A session typically gets 2-4 passes (live, one or more
+mid-session live updates, final -- occasionally a group merge on top), so its topics rows
+now persist at roughly 3x the row count a single-pass session used to leave behind. At
+today's volume (hundreds of topics per site-month) that is nothing; migration 0073's
+`idx_topics_live_source` partial index (`WHERE superseded_at IS NULL`) keeps every live read
+this task touched at its pre-Task-3 cost regardless of how many superseded passes pile up
+underneath.
+
 Environment Variables:
     S3_BUCKET     - S3 bucket name (the data lake -- IngestBucketName)
-    CONFIG_KEY    - S3 key for user/site mapping (default: config/user_mapping.json,
-                    read indirectly via lambda_ingest.load_mapping's own env var)
-    COMPANY_NAME  - default: FieldSight (mirrors lambda_ingest's default)
     PG*/DATABASE_URL - read by db.connection.get_connection()
 """
 import json
@@ -54,21 +60,36 @@ import os
 from urllib.parse import unquote_plus
 
 import boto3
+from lake_put import lake_put
 
+import carry_forward_apply
+import continuity_records
+import item_continuity
 import lambda_ingest
 import keyframe_request
 import match_request
+# NOT `match_request` above, which is the PROGRAMME matcher's request builder. Two unrelated
+# matchers, and the names are one word apart — spelled out here because importing the wrong
+# one would type-check, run, and write an artifact nothing consumes.
+import speaker_match_request
 from db.connection import get_connection
 from keyframe_selection import keyframe_seconds
 from photo_binding import PHOTOS_PER_TOPIC_CAP  # noqa: F401  (re-export)
 from photo_binding import list_pictures as _pb_list_pictures
 from repositories import users as users_repo
-from photo_binding import photos_for_topics as _photos_for_topics
+from photo_binding import photos_for_topics as _photos_for_topics  # noqa: F401  (re-export)
+import checklist_reports
+import inspection_match
+import photo_rebind
+import pipeline_trace
 import thread_match
-from repositories import location_markers
-from repositories import (companies, findings, meeting_session, recordings,
-                          redactions,
-                          session_group, sites, threads, topics)
+from repositories import inspection_windows, location_markers
+from repositories import memberships
+from repositories import (companies, decision_records, findings, meeting_session,
+                          recordings, redactions,
+                          session_group, sites, threads, topic_decisions, topic_questions,
+                          topics)
+from repositories import speaker_intro_suggestions
 # The extraction-key shape lives in session_scope now (the read side needs the
 # SAME parse to derive session_id from topics.source_s3_key -- see that
 # module). Re-exported under the historical private names so existing callers
@@ -82,8 +103,6 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
-CONFIG_KEY = os.environ.get("CONFIG_KEY", "config/user_mapping.json")
-COMPANY_NAME = os.environ.get("COMPANY_NAME", "FieldSight")
 
 # video-keyframe plan: ship the pipeline change inert -- only when
 # EnableKeyframes flips this env true does item-writer emit keyframe_requests/.
@@ -93,6 +112,22 @@ EMIT_KEYFRAME_REQUESTS = os.environ.get("EMIT_KEYFRAME_REQUESTS", "false").lower
 #: other switch in this feature: it costs ~100 s of ONNX on a shared concurrency slot, and a
 #: session with no groups reads exactly as it read before this existed.
 REBIND_SPEAKERS = os.environ.get("REBIND_SPEAKERS", "false").lower() == "true"
+
+# Whether a finalized session is matched against the company's stored voiceprints without
+# anyone asking. False is the deployed default and the rollback.
+#
+# Separate from REBIND_SPEAKERS because the two do different things: the re-bind is
+# anonymous (it groups spk_0/spk_1 within one session and names nobody) and this one puts a
+# person's name on a passage. Separate from SPEAKER_IDENTITY_MODE because it is a COST
+# change as well — every finalized session pays for ONNX over its turns — and folding it
+# into the mode would make "stop paying for this" and "turn naming off for everyone" the
+# same action.
+MATCH_ON_FINALIZE = os.environ.get("MATCH_ON_FINALIZE", "false").lower() == "true"
+
+# Read here only to refuse when naming is switched off entirely; this lambda does no naming
+# itself. `off` is the feature's rollback, and a producer that kept queueing work under it
+# would leave that switch meaning nothing.
+SPEAKER_IDENTITY_MODE = os.environ.get("SPEAKER_IDENTITY_MODE", "off").lower()
 # Propose which earlier subject a new topic is a restatement of. Off by
 # default so the write path ships inert: this only ever writes rows to
 # topic_thread_suggestions, which nothing reads yet.
@@ -110,17 +145,18 @@ def s3():
     return _s3_client
 
 
-def _site_from_meeting_session(conn, company_id, session_base):
+def _site_from_meeting_session(conn, user_id, session_base):
     """The site the recorder picked when OPENING a chunk session
     (meeting_session.site_id, set by POST /sessions/{id}/open), as a
     sites.get_site()-shaped row -- else None. This is how a chunk session
     attributes to a site: it uploads its ~1-min chunks straight to the raw-media
     prefix (no `recordings` row, so recordings.site_for_media misses), and its
     only explicit site tag lives on meeting_session. Returns None for a legacy
-    whole-file base (no device session). Company-scoped: session_open already
-    rejected a cross-tenant site, and we re-check the resolved site's company here
-    so a stale/rogue row can never attribute across tenants (multi-tenant
-    invariant, mirrors recordings.site_for_media)."""
+    whole-file base (no device session). Recorder-scoped (project-owned
+    tenancy P2): session_open already refused a site the recorder has no relation
+    to, and we re-check here that the recorder (`user_id`) holds a live membership
+    on it or it is their own company's, so a stale/rogue row can never attribute
+    to a company the recorder is not part of (mirrors recordings.site_for_media)."""
     device_sid = _device_session_id(session_base)
     if not device_sid:
         return None
@@ -128,7 +164,7 @@ def _site_from_meeting_session(conn, company_id, session_base):
     if not row or not row.get("site_id"):
         return None
     site = sites.get_site(conn, row["site_id"])
-    if site is None or site["company_id"] != company_id:
+    if site is None or memberships.site_usable_by_user(conn, user_id, site["id"]) is None:
         return None
     return site
 
@@ -140,7 +176,7 @@ def _group_id_from_base(session_base):
     return session_base[3:] or None
 
 
-def _site_from_group_lead(conn, company_id, session_base):
+def _site_from_group_lead(conn, user_id, session_base):
     """A merged artifact's site, taken from the LEAD's session row.
 
     Needed because the merged key deliberately is NOT a `sid` base (that one
@@ -151,8 +187,8 @@ def _site_from_group_lead(conn, company_id, session_base):
     Without this rung a merge ends in "identity bridge miss ... zero writes" --
     silently discarded AFTER the members' topics were deleted.
 
-    Company-scoped exactly as _site_from_meeting_session is, so a stale or rogue
-    row can never attribute across tenants."""
+    Recorder-scoped exactly as _site_from_meeting_session is, so a stale or rogue
+    row can never attribute to a company the recorder has no relation to."""
     gid = _group_id_from_base(session_base)
     if not gid:
         return None
@@ -160,7 +196,7 @@ def _site_from_group_lead(conn, company_id, session_base):
     if not row or not row.get("site_id"):
         return None
     site = sites.get_site(conn, row["site_id"])
-    if site is None or str(site["company_id"]) != str(company_id):
+    if site is None or memberships.site_usable_by_user(conn, user_id, site["id"]) is None:
         return None
     return site
 
@@ -232,21 +268,30 @@ def _group_supersedes_solo(conn, session_base, extraction):
     return "suppress"
 
 
-def _delete_member_topics(conn, artifact, delete=None):
-    """Remove each member's solo topics so the merged set is the only record.
+def _supersede_member_topics(conn, artifact, run, supersede=None) -> list[dict]:
+    """Retire each member's solo topics (Track B Task 3: supersede, not delete) so the
+    merged set is the only LIVE record.
 
-    A zero rowcount is logged loudly. The delete is keyed on source_s3_key and
-    delete_topics_for_source returns a count rather than raising, so a key that
-    differs by one character (a date derived in UTC instead of NZ, say) removes
-    nothing and leaves exactly the duplicate this whole feature exists to
-    eliminate -- with no error anywhere to notice."""
-    delete = delete or topics.delete_topics_for_source
+    A zero-row supersede is logged loudly. The call is keyed on source_s3_key and
+    supersede_topics_for_source returns the rows it retired rather than raising, so a key
+    that differs by one character (a date derived in UTC instead of NZ, say) retires nothing
+    and leaves exactly the duplicate this whole feature exists to eliminate -- with no error
+    anywhere to notice.
+
+    Returns every retired row across every member, flattened -- write_extraction_items'
+    `retired_topics` accumulator is documented as covering "every supersede call below", and
+    this is one of them; Task 4 needs a member's retired rows the same way it needs the
+    idempotent-clear's."""
+    supersede = supersede or topics.supersede_topics_for_source
+    all_retired = []
     for key in artifact.get("mergedMembers") or []:
-        n = delete(conn, key)
-        if not n:
+        retired = supersede(conn, key, run)
+        all_retired.extend(retired)
+        if not retired:
             logger.warning(
-                "group %s: %s removed 0 topics -- that member's solo items will "
+                "group %s: %s superseded 0 topics -- that member's solo items will "
                 "now duplicate the merged record", artifact.get("groupId"), key)
+    return all_retired
 
 
 def _brings_new_content(solo, merged):
@@ -339,6 +384,96 @@ def _enqueue_updated_emails(artifact, contexts, put=None):
              "openTodos": todos})
 
 
+def _final_email_context(conn, session_base, extraction, date, follow_up=False):
+    """What the recorder's confirmation email needs, or None if it must not be
+    sent from here.
+
+    None means the sweep's backstop owns this session -- which is the honest
+    answer for every case below, and each says which one it was, because a
+    silent skip here is indistinguishable from a trigger that never fired."""
+    sid = _device_session_id(session_base)
+    if not sid:
+        return None                      # a whole-file base, not a device session
+    row = meeting_session.get(conn, sid)
+    status = (row or {}).get("status")
+    # A FOLLOW-UP is the notes email owed to a recorder who was told (extraction_pending,
+    # spec D5) that their notes were delayed. By then the session is settled, so the
+    # "must be waiting" test is exactly wrong for it -- the one-shot guard is the
+    # `-notes` key instead.
+    if status != "finalizing" and not (follow_up and row):
+        logger.info("session %s: final extraction written, status is %s -- no email "
+                    "from here", sid, status or "unknown")
+        return None
+    from lambda_finalize_claim import _resolve_context
+    ctx = _resolve_context(conn, row) or {}
+    if not (ctx.get("recipient") or "").strip():
+        # The claim step already marked this session failed and said whose
+        # email is missing; repeating it here would only double the noise.
+        return None
+    return {"kind": "final", "sessionId": sid,
+            **({"followUp": True} if follow_up else {}),
+            "recipient": ctx["recipient"], "date": ctx.get("date") or date,
+            "timeRange": ctx.get("timeRange"), "siteName": ctx.get("siteName"),
+            # handoff-sync plan §2.2: the worker needs the folder to poll
+            # session_brief/<folder>/<date>/sid<sessionId>/latest.json. Not
+            # carried before this -- the only recipient of `ctx["folder"]` used
+            # to be the email itself, which never needed it.
+            "folder": ctx.get("folder"),
+            # Zero rows is a real answer, not a reason to withhold the email:
+            # most sessions produce none, and the renderer says so explicitly.
+            # Withholding would send them down the backstop, which quotes the
+            # OTHER summariser -- the disagreement this whole change removes.
+            "openTodos": _final_email_rows(extraction, date) + _topic_rows(extraction)}
+
+
+def email_checks(stored, topics=None):
+    """[{check, template, from, to[, topic]}] for the confirmation email: each
+    spoken check, with the checklist whose report is being written, or None when
+    no checklist matched -- and then the topic its words were kept under, so
+    "no report" is not read as "lost" (owner, 2026-10-09)."""
+    stored = list(stored or [])
+    out = []
+    for w in stored:
+        row = {"check": w.get("name"), "template": w.get("template_name"),
+               "from": (w.get("start_at") or "")[:5], "to": (w.get("end_at") or "")[:5]}
+        if not w.get("template_name"):
+            kept = _kept_under(w, [o for o in stored if o is not w], topics or [])
+            if kept:
+                row["topic"] = kept
+        out.append(row)
+    return out
+
+
+def _kept_under(check, others, topics):
+    """The extraction topic that holds an unmatched check's words, or None.
+
+    A title naming the check's kind first: topic times are minute stamps, and on
+    TEST (2026-10-06) the stair-core steel check at 17:15:26 was stamped "17:14"
+    while "Slab Rebar and Cover" spanned 17:14-17:16 -- by time alone the email
+    would have pointed at the wrong topic. Then checklist_reports.check_topics'
+    rule (touches a stretch, not another check's). None rather than a guess."""
+    titled = [{"id": i, "title": t.get("topic_title") or t.get("title") or "",
+               "time_range": t.get("time_range")} for i, t in enumerate(topics)
+              if isinstance(t, dict)]
+    mine = set(inspection_match.words(check.get("kind"))
+               or inspection_match.words(check.get("name")))
+    named = [t for t in titled if mine & set(inspection_match.words(t["title"]))]
+    if len(named) == 1:
+        return named[0]["title"]
+    pool = named or titled
+    ids = set(checklist_reports.check_topics(check, others, pool)) if pool else set()
+    near = [t for t in pool if str(t["id"]) in ids]
+    return near[0]["title"] if len(near) == 1 else None
+
+
+def _enqueue_final_email(ctx, put=None):
+    """One confirmation email per session, whoever gets there first."""
+    put = put or _put_finalize_request
+    suffix = "-notes" if ctx.get("followUp") else ""
+    return put(f"session_finalize_requests/{ctx['sessionId']}{suffix}.json", ctx,
+               only_if_absent=True)
+
+
 def _evidence_payload(topic):
     """The citations plus the topic's rolled-up status, as one jsonb object.
 
@@ -387,6 +522,80 @@ def _summary_from_topics(artifact):
         elif title or body:
             parts.append(title or body)
     return "\n".join(parts)
+
+
+def _final_email_rows(artifact, date):
+    """The session's action items in the shape the email renderer wants, with
+    the due date RESOLVED.
+
+    `_todos_from_topics` sends the spoken text ("Tomorrow 08:00"); Aurora stores
+    the date `lambda_ingest._map_action_items` resolves from it. The email and
+    the record would disagree on the one cell a reader acts on, so this reuses
+    that same mapping -- the spoken text remains, as the fallback for a deadline
+    nothing could resolve.
+
+    No longer carries a `topic_range` (handoff-sync plan §8 originally added
+    it, §7.1 as first written): that field existed only so
+    `lambda_session_finalize` could decide, by TIME, whether a brief task
+    already covered a row's topic. §7.1 is now decided by TEXT instead (see
+    `lambda_session_finalize._is_represented`), which reads a row's own
+    `text` -- already present here -- so nothing downstream reads this field
+    any more."""
+    out = []
+    for topic in artifact.get("topics") or []:
+        for item in lambda_ingest._map_action_items(topic.get("action_items"), date):
+            text = (item.get("text") or "").strip()
+            if text:
+                out.append({"text": text,
+                            "responsible": item.get("responsible") or None,
+                            # The words, not the resolved column: the column
+                            # is a day and has already lost "morning". The email
+                            # shows the day AND the part (due_display).
+                            "due": item.get("deadline_text") or item.get("deadline") or None})
+    return todo_collapse.collapse_if_enabled(out)
+
+
+#: How much of a topic's own summary rides in its row. Long enough for the
+#: point, short enough that the table still scans -- the row is context, not the
+#: report, and the report is one click away.
+TOPIC_ROW_MAX_CHARS = 180
+
+
+def _topic_rows(artifact):
+    """Topics that produced NO action item, as rows of their own.
+
+    A session where nobody promised anything is the ordinary case (11 of 16
+    measured on prod), and such a session used to be emailed as a header and one
+    line saying nothing was captured -- while the recording plainly had content.
+    The topic says what was discussed; the owner and due date are N/A because
+    there is no task here, which the renderer shows differently from an action
+    nobody has picked up yet.
+
+    Only topics with no action items: one that produced tasks is already in the
+    table through them, and listing it twice would pad the very table this is
+    trying to make worth reading.
+
+    No longer carries a `topic_range` -- same reason as `_final_email_rows`
+    above: `lambda_session_finalize` now decides §7.1 (does the brief already
+    cover this topic) from this row's own `text`, not from a time window."""
+    out = []
+    for topic in artifact.get("topics") or []:
+        if topic.get("action_items"):
+            continue
+        title = (topic.get("topic_title") or topic.get("title") or "").strip()
+        summary = " ".join((topic.get("summary") or "").split())
+        # The first sentence, not the whole summary: the rest repeats it at
+        # length, which is what pushed the old prose below the fold.
+        first = summary.split(". ")[0].strip()
+        if first and first != summary and not first.endswith("."):
+            first += "."
+        text = " — ".join(part for part in (title, first) if part)
+        if len(text) > TOPIC_ROW_MAX_CHARS:
+            text = text[:TOPIC_ROW_MAX_CHARS - 1].rstrip() + "…"
+        if text:
+            out.append({"text": text, "responsible": None, "due": None,
+                        "kind": "topic"})
+    return out
 
 
 def _todos_from_topics(artifact):
@@ -466,12 +675,108 @@ def _request_rebind(company_id, session_base, artifact, put=None):
     return True
 
 
-def _put_finalize_request(key, body):
+def _request_match(company_id, session_base, artifact, site_id=None, put=None,
+                   home_company_id=None, recorder_user_id=None):
+    """Ask the embedder to name this session from the profiles the company already holds.
+
+    **The gap this closes.** Until 2026-09-23 the ONLY producer of a match request was
+    `lambda_org_api.speaker_match`, an endpoint no frontend has ever called — verified by
+    grep, twice. So naming a speaker propagated the name inside that one meeting and the
+    next meeting started at `spk_0` again. "The system recognises Ben" was true of a code
+    path nothing reached.
+
+    Anonymous re-binding beside this does run automatically and always has; it groups
+    `spk_0`/`spk_1` within one session and carries no name. The two are independent on
+    purpose and stay independent here: `_request_rebind` is gated on `REBIND_SPEAKERS` and
+    this is gated on `MATCH_ON_FINALIZE`, so either can be turned off without the other.
+
+    **A separate switch, not `SPEAKER_IDENTITY_MODE != off`.** Automatic matching is a cost
+    change as much as a behaviour change — every finalized session now pays for ONNX over
+    its turns — and folding it into the mode would mean the only way to stop paying is to
+    turn naming off entirely for everyone. It also means the rollback is a variable, not a
+    deploy.
+
+    Best effort, like the re-bind. A match that does not happen leaves the transcript
+    reading exactly as it reads today; a match that takes the item write down with it trades
+    a working feature for a cosmetic one.
+    """
+    if not MATCH_ON_FINALIZE:
+        return False
+    if SPEAKER_IDENTITY_MODE == "off":
+        # The one gate that is NOT independent: `off` is this feature's rollback, and a
+        # producer that kept writing requests under it would leave the switch meaning
+        # nothing. The embedder would refuse them anyway; paying for the invocation to find
+        # that out is the part worth skipping.
+        logger.info("match: not requested for %s — speaker identity is off", session_base)
+        return False
+    turns = artifact.get("speaker_turns") or []
+    put = put or _put_finalize_request
+    try:
+        requests = speaker_match_request.build(
+            company_id=company_id,
+            session_base=session_base,
+            user_folder=artifact.get("userFolder") or artifact.get("user_folder"),
+            date=artifact.get("date"),
+            turns=turns,
+            mode=SPEAKER_IDENTITY_MODE,
+            site_id=site_id,
+            home_company_id=home_company_id,
+            recorder_user_id=recorder_user_id,
+            # Who asked. No user id here by construction — nobody asked, the session ended
+            # — and saying `finalize` is what lets an operator tell an automatic name apart
+            # from one a person requested when a wrong one turns up.
+            source="finalize")
+    except ValueError:
+        # A session with no `sid`, or missing folder/date. Legacy recordings are the
+        # ordinary case and are not an error; they simply cannot be grouped into a session.
+        logger.info("match: not requested for %s — not a session-shaped recording",
+                    session_base)
+        return False
+    if not requests:
+        logger.info("match: not requested for %s — no transcribed turns", session_base)
+        return False
+    try:
+        for req in requests:
+            put(f"voiceprint_requests/{company_id}/{session_base}/match-{req['request_id']}.json",
+                req)
+    except Exception:
+        logger.exception("match: could not enqueue for %s", session_base)
+        return False
+    logger.info("match: requested for %s (%d turns across %d run(s), mode=%s)",
+                session_base, len(turns), len(requests), SPEAKER_IDENTITY_MODE)
+    return True
+
+
+def _put_finalize_request(key, body, only_if_absent=False):
+    """Write one finalize request.
+
+    `only_if_absent` makes the key a SINGLE-WRITER key: `IfNoneMatch="*"` fails
+    with 412 if anything is already there, and the loser simply stops. Two
+    producers can write this key -- this lambda, once the record is durable, and
+    the sweep's backstop when no final extraction arrived -- and S3 notifies on
+    every put INCLUDING an overwrite, so without this the recorder gets two
+    emails. Checking first is not the fix: this role cannot read the prefix, and
+    AccessDenied reads as "absent" (403 != 404, eight recurrences), so both
+    writers would pass the check. Same idiom as lambda_orchestrator's claim.
+
+    Returns True when this caller wrote it."""
     import boto3
-    boto3.client("s3").put_object(
-        Bucket=S3_BUCKET, Key=key,
-        Body=json.dumps(body, ensure_ascii=False),
-        ContentType="application/json")
+    from botocore.exceptions import ClientError
+    extra = {"IfNoneMatch": "*"} if only_if_absent else {}
+    try:
+        lake_put(
+            S3_BUCKET, key,
+            json.dumps(body, ensure_ascii=False),
+            client=boto3.client("s3"),
+            ContentType="application/json", **extra)
+        return True
+    except ClientError as e:
+        status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        code = e.response.get("Error", {}).get("Code", "")
+        if only_if_absent and (status == 412 or code in ("PreconditionFailed", "412")):
+            logger.info("finalize request %s already enqueued by someone else", key)
+            return False
+        raise
 
 
 # ----------------------------------------------------------
@@ -500,7 +805,19 @@ def _list_pictures(prefix):
 # ----------------------------------------------------------
 # Per-extraction write (commit-per-extraction: one `with get_connection()` here)
 # ----------------------------------------------------------
-def _suggest_threads(conn, site_id, date, written):
+
+# Track B Task 6a: the floor a candidate must clear to be worth a
+# decision_records row at all -- deliberately LOWER than
+# thread_match.MIN_SCORE (the real accept bar the suggestion itself uses).
+# The point of Task 6 is that a REJECTED verdict is recorded too, so a
+# candidate the matcher genuinely considered and turned down (0.10-0.25)
+# gets a row with auto_outcome='rejected'; below 0.10 the pair barely
+# shares vocabulary at all and recording it would just be noise on every
+# site's corpus.
+_THREAD_RECORD_FLOOR = 0.10
+
+
+def _suggest_threads(conn, company_id, site_id, date, written):
     """Propose, for each topic just written, which earlier subject it is a
     restatement of.
 
@@ -519,16 +836,18 @@ def _suggest_threads(conn, site_id, date, written):
     are lost. A bare try/except here would have silently traded the day's
     real content for an optional suggestion. `conn.transaction()` nested
     inside the caller's transaction issues a SAVEPOINT, so a failure unwinds
-    only this pass."""
+    only this pass -- this is also the SAVEPOINT Track B Task 6a's
+    per-candidate decision_records writes below ride inside; they need no
+    savepoint of their own."""
     try:
         with conn.transaction():
-            return _suggest_threads_inner(conn, site_id, date, written)
+            return _suggest_threads_inner(conn, company_id, site_id, date, written)
     except Exception:
         logger.exception("thread suggestion pass failed; topics were written")
         return 0
 
 
-def _suggest_threads_inner(conn, site_id, date, written):
+def _suggest_threads_inner(conn, company_id, site_id, date, written):
     corpus = threads.candidate_corpus(conn, site_id, date,
                                       thread_match.MAX_GAP_DAYS)
     if not corpus:
@@ -552,23 +871,69 @@ def _suggest_threads_inner(conn, site_id, date, written):
         # should account for the document being scored, and on a small
         # site's corpus leaving it out visibly skews the rarity of its
         # own vocabulary. find_candidates skips it as a candidate.
-        hits = thread_match.find_candidates(new_topic, list(corpus) + [new_topic])
-        if not hits:
+        #
+        # Track B Task 6a: scored at _THREAD_RECORD_FLOOR (0.10), not the
+        # real accept bar thread_match.MIN_SCORE (0.25) -- `scored` is a
+        # strict superset of what a plain find_candidates() call would
+        # have returned (same corpus/IDF, only the floor differs, and the
+        # sort order/scores are identical), so filtering it back down to
+        # `hits` below reproduces the pre-Task-6a suggestion logic exactly.
+        scored = thread_match.find_candidates(
+            new_topic, list(corpus) + [new_topic], min_score=_THREAD_RECORD_FLOOR)
+        if not scored:
             continue
-        best = hits[0]
-        # Join the parent's thread if it has one; otherwise anchor a new
-        # thread on the parent itself. Exactly one of these, which the
-        # table's CHECK enforces.
-        if best.get("thread_id"):
-            row = threads.upsert_suggestion(
-                conn, t["topic_id"], thread_id=best["thread_id"],
-                score=best["match_score"], gap_days=best["gap_days"])
-        else:
-            row = threads.upsert_suggestion(
-                conn, t["topic_id"], parent_topic_id=best["id"],
-                score=best["match_score"], gap_days=best["gap_days"])
-        if row is not None:
-            made += 1
+        hits = [c for c in scored if c["match_score"] >= thread_match.MIN_SCORE]
+        winner = hits[0] if hits else None
+        winner_row = None
+        if winner is not None:
+            # Join the parent's thread if it has one; otherwise anchor a new
+            # thread on the parent itself. Exactly one of these, which the
+            # table's CHECK enforces.
+            if winner.get("thread_id"):
+                winner_row = threads.upsert_suggestion(
+                    conn, t["topic_id"], thread_id=winner["thread_id"],
+                    score=winner["match_score"], gap_days=winner["gap_days"])
+            else:
+                winner_row = threads.upsert_suggestion(
+                    conn, t["topic_id"], parent_topic_id=winner["id"],
+                    score=winner["match_score"], gap_days=winner["gap_days"])
+            if winner_row is not None:
+                made += 1
+        # A candidate is 'accepted' only when it is the ONE that actually
+        # became a live suggestion this pass -- `winner_row is None` means
+        # `already_resolved` (a human already answered this exact proposal;
+        # threads.upsert_suggestion docstring), so nothing new was proposed
+        # and every scored candidate here is 'rejected', winner included.
+        became_suggestion_id = winner["id"] if winner_row is not None else None
+        for c in scored:
+            # `output` carries only ids/numbers -- match_score, gap_days,
+            # the earlier topic's OWN thread_id (a uuid, not text) -- never
+            # `c`'s title/summary, which are extraction-derived text (plan
+            # Global Constraint: decision_records never carries transcript
+            # text).
+            #
+            # Track B Task 6b: `c["thread_id"]` comes straight off
+            # `candidate_corpus`'s SQL (`t.thread_id`) as a `uuid.UUID`
+            # object, not text -- `Jsonb()`'s `json.dumps` cannot serialize
+            # that and raises, which `_suggest_threads`'s SAVEPOINT then
+            # swallows as "thread suggestion pass failed", silently losing
+            # EVERY thread suggestion for every topic in this pass, not just
+            # the one candidate that triggered it. Every candidate scored
+            # against this task before Task 6b only ever had `thread_id`
+            # None (the parent_topic_id branch), so this never fired until
+            # a real candidate that already belongs to a thread was scored.
+            # str() before Jsonb() the same way object_ref is str()'d two
+            # lines above -- `None` stays `None` (json-serializable as-is).
+            decision_records.insert(
+                conn, company_id=company_id, site_id=site_id, kind="thread",
+                subject_type="topic", subject_stable_id=t["topic_id"],
+                object_ref=str(c["id"]), provider="lexical", model=None,
+                model_version=None, question_set=None, input_key=None, input_hash=None,
+                output={"match_score": c["match_score"], "gap_days": c["gap_days"],
+                        "thread_id": str(c["thread_id"]) if c.get("thread_id") else None},
+                score=c["match_score"], threshold=thread_match.MIN_SCORE,
+                auto_outcome=("accepted" if c["id"] == became_suggestion_id else "rejected"),
+            )
     logger.info("thread suggestions: %d proposed over %d candidates",
                 made, len(corpus))
     return made
@@ -621,9 +986,83 @@ def _resolve_self_responsible(action_items, name):
     return resolved
 
 
+# Both extraction writers (extract_session, extract_group) stamp
+# llm_provider/llm_model via lambda_extract_session's shared
+# _llm_identity() helper into every extraction artifact. This function
+# still calls no LLM itself -- the values ride in on the JSON it already
+# reads, so no LLM_PROVIDER/LLM_TEMPERATURE env pairing is needed on
+# ItemWriterFunction (test_the_temperature_knob_reaches_every_function_
+# that_calls_an_llm stays green because this function carries neither).
+# The fallback below covers an extraction artifact written before this
+# change was deployed, which has neither key -- 'unknown', never a
+# guessed vendor name; model stays None either way.
+_WORK_CLASS_PROVIDER_FALLBACK = "unknown"
+
+
+def _record_work_class_decision(conn, company_id, site_id, topic_id,
+                                work_class, work_confidence, is_mixed,
+                                llm_provider, llm_model):
+    """Track B Task 6a: one decision_records row for a topic's work_class
+    classification, ONLY when the topic actually has one -- `work_class`
+    here is the ALREADY-sanitized value (the caller's `_wc`: NULL for
+    anything outside the CHECK enum), so a bad/missing LLM value produces
+    no record rather than a bogus one. There is no accept/reject gate on a
+    classification like there is on a programme match -- it always exists
+    or it doesn't -- so `auto_outcome` is always 'accepted' and
+    `threshold` is always None.
+
+    `llm_provider`/`llm_model` are the extraction's OWN `llm_provider`/
+    `llm_model` fields (Ruling R15) -- already defaulted by the caller
+    (`llm_provider` to `_WORK_CLASS_PROVIDER_FALLBACK`, `llm_model` to None)
+    for an extraction written before those fields existed.
+
+    Wrapped in its OWN SAVEPOINT with a WARNING on failure, same posture as
+    Ruling R10/_suggest_threads: this write must never be able to abort the
+    topic/finding/action-item write it rides alongside."""
+    if work_class is None:
+        return
+    try:
+        with conn.transaction():
+            decision_records.insert(
+                conn, company_id=company_id, site_id=site_id, kind="work_class",
+                subject_type="topic", subject_stable_id=topic_id, object_ref=None,
+                provider=llm_provider, model=llm_model, model_version=None,
+                question_set=None, input_key=None, input_hash=None,
+                output={"work_class": work_class, "work_confidence": work_confidence,
+                        "is_mixed": is_mixed},
+                score=work_confidence, threshold=None, auto_outcome="accepted",
+            )
+    except Exception:
+        logger.warning("work_class decision record not stored for topic=%s", topic_id)
+
+
 def write_extraction_items(date, user_folder, extraction_key):
     raw = s3().get_object(Bucket=S3_BUCKET, Key=extraction_key)["Body"].read()
     extraction = json.loads(raw.decode("utf-8"))
+
+    # One extraction pass, one LLM call -- read ONCE here and reused for
+    # every topic's work_class record below. Both extraction writers
+    # (extract_session, extract_group) stamp these via _llm_identity(), so
+    # the fallback covers only an extraction artifact written before this
+    # change was deployed -- 'unknown', never a guessed vendor name.
+    # `llm_model` is already None-safe on its own (a missing key and an
+    # extraction that genuinely couldn't name its model both read the same
+    # way).
+    extraction_llm_provider = extraction.get("llm_provider") or _WORK_CLASS_PROVIDER_FALLBACK
+    extraction_llm_model = extraction.get("llm_model")
+
+    # Track B Task 3: identifies THIS pass to repositories.topics.supersede_topics_for_source
+    # (stamped onto the retired row's superseded_by_run) -- tier + extracted_at is unique per
+    # pass of a given extraction key (live/final tiers of the same key share out_key but never
+    # extracted_at; a group pass carries its own).
+    run = f"{extraction.get('tier')}:{extraction.get('extracted_at')}"
+
+    # Rows this invocation retires, across every supersede call below -- the authority-flip
+    # branch (report_source_key), this key's own idempotent clear, and (group tier) each
+    # member's own supersede via _supersede_member_topics all write into it. Not consumed
+    # here; Task 4 reads it to carry stable ids and human edits from a retired row to the
+    # row that replaced it.
+    retired_topics = []
 
     with get_connection() as conn:
         # I-3: serialize concurrent writers on this extraction key. Delete-
@@ -649,18 +1088,26 @@ def write_extraction_items(date, user_folder, extraction_key):
             (report_source_key,),
         ).fetchone()
         if report_already_ingested is not None:
-            reason = "nightly report already ingested — late session extraction superseded"
-            logger.info("%s: %s", extraction_key, reason)
-            return {"skipped": True, "reason": reason}
+            if not lambda_ingest.AUTHORITY_FLIP:
+                reason = "nightly report already ingested — late session extraction superseded"
+                logger.info("%s: %s", extraction_key, reason)
+                return {"skipped": True, "reason": reason}
+            # Under the flip the extraction IS the item store, and a day that has one
+            # is by definition not a "zero-extraction fallback day" -- the only kind
+            # the comment above says report topics may exist for. Skipping here
+            # deadlocked with ingest, which defers only once extraction topics
+            # already exist: each waited for the other, and the day could never
+            # become session-scoped again. So the extraction wins. Only this
+            # (date, user)'s report rows go; its chunks survive (topic_id is ON
+            # DELETE SET NULL) and the next ingest of that report re-links them.
+            retired_report = topics.supersede_topics_for_source(conn, report_source_key, run)
+            retired_topics.extend(retired_report)
+            logger.info("%s: authority flip -- superseded %s report topic(s) from %s",
+                        extraction_key, len(retired_report), report_source_key)
 
         company = lambda_ingest.resolve_company(conn, user_folder)
         if company is None:
-            # Same guard + message as lambda_ingest.ingest_report (Fable
-            # minor 6): an unseeded org DB would otherwise surface as an
-            # opaque 'NoneType' subscript error on every extraction.
-            raise RuntimeError(
-                f"org company {COMPANY_NAME!r} not found — run the org seed "
-                "(fieldsight-*-org-seed) before ingesting")
+            raise lambda_ingest.unknown_folder_error(user_folder)
 
         # Site attribution, in priority order:
         #   1. recordings.site_for_media -- G5b: the app stamps the in-app project
@@ -694,7 +1141,8 @@ def write_extraction_items(date, user_folder, extraction_key):
         #      site), which is why an offline gm recording used to fall all the way
         #      through to "identity bridge miss ... zero writes" and never reach
         #      the web timeline even though every upload had succeeded.
-        # All three explicit tags are company-scoped; fall through only on no match.
+        # All explicit tags are recorder-scoped (membership on the site, or the
+        # recorder's own company's site); fall through only on no match.
         session_base = _parse_extraction_key(extraction_key)[2]
 
         # A member whose group has already merged must not re-publish its own
@@ -705,10 +1153,14 @@ def write_extraction_items(date, user_folder, extraction_key):
                 conn, session_base, extraction) == "suppress":
             return {"skipped": True, "reason": "superseded by the group merge"}
 
-        site = recordings.site_for_media(conn, company["id"], user_folder, date, session_base) \
-            or _site_from_meeting_session(conn, company["id"], session_base) \
-            or _site_from_group_lead(conn, company["id"], session_base) \
-            or recordings.site_for_day(conn, company["id"], user_folder, date) \
+        # Project-owned tenancy P2: the ladder runs WITHOUT a company pin. Each
+        # rung requires the recorder to hold a live membership on the site (or the
+        # site to be their home company's), and the site then decides the company.
+        user_id = lambda_ingest.resolve_user(conn, company["id"], user_folder)
+        site = recordings.site_for_media(conn, user_id, user_folder, date, session_base) \
+            or _site_from_meeting_session(conn, user_id, session_base) \
+            or _site_from_group_lead(conn, user_id, session_base) \
+            or recordings.site_for_day(conn, user_id, user_folder, date) \
             or lambda_ingest.resolve_site(conn, company["id"], {}, user_folder)
         if site is None:
             reason = (f"identity bridge miss: user_folder={user_folder!r} -- "
@@ -716,14 +1168,17 @@ def write_extraction_items(date, user_folder, extraction_key):
             logger.warning("%s: %s", extraction_key, reason)
             return {"skipped": True, "reason": reason}
 
-        user_id = lambda_ingest.resolve_user(conn, company["id"], user_folder)
+        # `company` is the recorder's HOME company (it rides on the voiceprint match
+        # request as `home_company_id`). Everything else written below, voiceprint
+        # requests included, is owned by the SITE's company.
+        owner_company_id = site.get("company_id") or company["id"]
 
         # Only when the ASR heard exactly one voice. Absent (older artifacts) is
         # treated as "unknown", not as one -- an unknown count must not license
         # putting a name on someone else's words.
         if extraction.get("speaker_count") == 1:
             recorder = _display_name(
-                users_repo.get_by_folder_name(conn, company["id"], user_folder), user_folder)
+                users_repo.get_by_folder_name_global(conn, user_folder), user_folder)
             resolved = sum(_resolve_self_responsible(t.get("action_items"), recorder)
                            for t in extraction.get("topics", []))
             if resolved:
@@ -739,22 +1194,29 @@ def write_extraction_items(date, user_folder, extraction_key):
             logger.info("%s: source is deleted — writing no topics", extraction_key)
             return {"skipped": "source_deleted", "key": extraction_key}
 
-        # Source-key idempotency (Phase 4a pattern): clear this extraction's
-        # prior rows before re-inserting.
+        # Source-key idempotency (Phase 4a pattern): supersede this extraction's prior rows
+        # (Track B Task 3) before re-inserting -- an UPDATE that stamps superseded_at /
+        # superseded_by_run, not a DELETE, so the row and its children (action_items,
+        # findings, ...) survive in the table. Task 2's read predicates already hide a
+        # superseded row from every display path, so a reader sees exactly what it saw when
+        # this was delete-then-insert; what changed is that nothing underneath is gone.
         #
-        # This CASCADEs `action_items`, and the check-off is `action_items.status` -- a
-        # column on the cascaded row. The live and final tiers write to the SAME key
-        # (`extract_session.out_key` is computed once; the tier rides inside the artifact),
-        # so every final pass destroys whatever a person ticked while the meeting was still
-        # running. Nothing carries it across, and re-matching by text is the wrong fix: the
+        # The check-off IS `action_items.status` -- a column on the now-superseded row. The
+        # live and final tiers write to the SAME key (`extract_session.out_key` is computed
+        # once; the tier rides inside the artifact), so every final pass retires whatever a
+        # person ticked while the meeting was still running. It is not lost -- it sits on the
+        # hidden row until Task 4 carries it forward to its replacement by stable_id -- but
+        # nothing carries it forward YET, so until Task 4 lands it is exactly as unreachable to
+        # a reader as a deleted row was. Re-matching by text is the wrong fix regardless: the
         # model rewords, merges and splits, and a confident wrong match puts a supervisor's
-        # tick on a DIFFERENT action item where nobody would ever see it.
+        # tick on a DIFFERENT action item where nobody would ever see it -- matching by
+        # stable_id (Task 4) is the only safe rule.
         #
-        # So this does not try to save it. It makes the loss VISIBLE, which is the part that
-        # was missing: a silent permanent loss and "nothing was ticked" produced identical
-        # output, and nobody can look for a problem that leaves no trace.
-        _warn_if_discarding_checkoffs(conn, extraction_key)
-        topics.delete_topics_for_source(conn, extraction_key)
+        # What used to be discarded here is now carried forward by _carry_forward_children,
+        # below the topic-insert loop (Track B Task 4) -- the count an operator needs to see
+        # is now measured AFTER matching (an actual orphan), not before (every closed item
+        # about to be superseded, most of which will find their successor).
+        retired_topics.extend(topics.supersede_topics_for_source(conn, extraction_key, run))
 
         # A MERGED artifact additionally supersedes each member's own topics.
         # BEFORE the writes below, never after: this key's own rows were just
@@ -767,15 +1229,31 @@ def write_extraction_items(date, user_folder, extraction_key):
         # know to look -- merge_result stays NULL (it is gated on topics_n
         # below), so the group reads as still-in-flight rather than as damage.
         if extraction.get("tier") == "group" and extraction.get("topics"):
-            _delete_member_topics(conn, extraction)
+            retired_topics.extend(_supersede_member_topics(conn, extraction, run))
 
         # Task 3 (authority-flip plan) -- list the pictures prefix ONCE per
-        # invocation (paginator, outside the per-topic loop below), then
-        # pure-match photos to topics by time_range before the loop uses it.
+        # invocation (paginator, outside the per-topic loop below).
+        #
+        # THE LIST IS DAY-WIDE AND ALWAYS HAS BEEN. Until 2026-09-23 it was
+        # matched against THIS EXTRACTION's topics only, which is the whole
+        # defect: idempotency is keyed on source_s3_key, so session B's run
+        # never cleared session A's bindings and both kept the same photo.
+        # Ben_UCPK2 produced seven artifacts for one afternoon; prod held 22
+        # multi-bound photos out of 161, the worst under six topics spanning
+        # seven minutes. The binding now happens once for the whole day, after
+        # this extraction's own topics are in -- see photo_rebind.py.
         pictures_prefix = f"users/{user_folder}/pictures/{date}/"
         photo_objects = _list_pictures(pictures_prefix)
         extraction_topics = extraction.get("topics", [])
-        photos_by_topic = _photos_for_topics(photo_objects, extraction_topics)
+
+        # spec 2026-09-30 S5: an item_id the extractor emitted malformed, or reused on
+        # more than one child, is stored as NULL on EVERY copy that wore it -- carry-forward
+        # falls back to matching that row by text instead (Task 4's existing path), rather
+        # than trusting an id that cannot be resolved to exactly one row.
+        cleaned = item_continuity.clean_item_ids(extraction_topics)
+        if cleaned:
+            logger.warning("item_id: %d malformed or duplicated ids stored as NULL (key=%s)",
+                           cleaned, extraction_key)
 
         # The day's location markers, written where the READER can reach them.
         #
@@ -787,26 +1265,76 @@ def write_extraction_items(date, user_folder, extraction_key):
         # meant two new grants of exactly the shape that has silently 403'd
         # eight times in this repo.
         #
-        # Replace, never append: a session is re-driven routinely (finalize,
-        # the backlog probe's repairs, a manual invoke) and each run produces
-        # the day's complete set.
+        # Replace THIS SESSION's markers, keep the day's others. A session is
+        # re-driven routinely (finalize, the backlog probe's repairs, a manual
+        # invoke) and each run produces that SESSION's complete set -- not the
+        # day's: replacing the day let the last session to finish erase every
+        # other session's places (prod, Ben_Lin_Test 2026-10-02).
         #
         # Never fatal. The markers are an addition to a day that already works
         # without them; a write that can turn a good extraction into a failed
-        # one would be a worse bug than ungrouped photos.
+        # one would be a worse bug than ungrouped photos. (The merge runs in a
+        # savepoint, so a failure here cannot abort the extraction's own write.)
         try:
-            location_markers.replace_for_day(
-                conn, company["id"], user_folder, date,
+            location_markers.replace_for_session(
+                conn, owner_company_id, user_folder, date,
+                _parse_extraction_key(extraction_key)[2],
                 extraction.get("location_markers") or [])
         except Exception:  # noqa: BLE001 -- see above
             logger.exception("location markers not stored for %s/%s", user_folder, date)
 
+        # The checks he said he was doing (voice-triggered checklists), each
+        # matched to the company's checklist template by what kind of check it
+        # is (inspection_match). Never fatal, for the same reason as the markers.
+        stored_inspections = []
+        try:
+            stored_inspections = _store_inspections(conn, owner_company_id, user_id, user_folder, date,
+                               _parse_extraction_key(extraction_key)[2],
+                               extraction.get("inspections") or [])
+        except Exception:  # noqa: BLE001 -- see above
+            logger.exception("inspection windows not stored for %s/%s", user_folder, date)
+
+        # Self-introduction suggestions ("Hi, this is Petros from Cassidy"), INSIDE the
+        # connection block, deliberately -- `_request_rebind`/`_request_match` below are
+        # called AFTER `with get_connection() as conn:` has closed (psycopg3's `with conn:`
+        # closes it on exit), and a DB write placed there raises on every single run. See
+        # the comment beside the group-merge email a few lines down for the incident that
+        # placement caused once already.
+        #
+        # Gated on tier=='final' as belt and braces: `lambda_extract_session` already
+        # writes `[]` for a live artifact (Task 2), so this should be a no-op for every
+        # live pass, but the writer does not trust the producer alone for a DB write --
+        # the same reasoning `report_already_ingested`'s guard above applies.
+        #
+        # NOT gated on SPEAKER_IDENTITY_MODE (owner decision, spec "Review outcome"
+        # decision 1): a company's queue should already be full of correctly-detected
+        # introductions on the day identity gets switched on, and these rows hold no
+        # biometric data -- only text and offsets. The confirm path is what is gated, in
+        # org-api.
+        #
+        # Never fatal, same rule as `location_markers` just above: a store failure must
+        # not turn a good extraction into a failed one.
+        if extraction.get("tier") == "final" and extraction.get("self_introductions"):
+            try:
+                counts = speaker_intro_suggestions.store(
+                    conn, owner_company_id, session_base, user_folder, date,
+                    extraction["self_introductions"])
+                logger.info(
+                    "intro suggestions: inserted=%d skipped_named=%d skipped_no_sid=%d",
+                    counts["inserted"], counts["skipped_named"], counts["skipped_no_sid"])
+            except Exception:  # noqa: BLE001 -- see above
+                logger.exception("self-introduction suggestions not stored for %s/%s",
+                                 user_folder, date)
+
         topics_n = 0
         collected_topics = []
+        # Track B Task 4: the durable ids of THIS pass's own topics (uuid.UUID objects, not
+        # the str(...) collected_topics uses for the match_request artifact) -- the "new"
+        # side of carry_forward's site-scoped pool, gathered once the loop below is done.
+        new_topic_ids = []
         keyframe_topics = []  # video-keyframe plan: {topic_id, time_range} of gate-passers
         for i, t in enumerate(extraction_topics):
             mapped_action_items = lambda_ingest._map_action_items(t.get("action_items"), date)
-            matched_photos = photos_by_topic.get(i, [])
             # Sanitize work_class/work_confidence before the upsert (Fable
             # review #7): the columns carry CHECK constraints (work_class IN
             # ('work','non_work'); work_confidence is real) so a raw bad LLM
@@ -850,16 +1378,33 @@ def write_extraction_items(date, user_folder, extraction_key):
                 open_questions=[q.get("question") if isinstance(q, dict) else q
                                 for q in (t.get("questions") or [])
                                 if (q.get("question") if isinstance(q, dict) else q)] or None,
+                # Kept whole, unlike `questions` above. The extraction schema's
+                # decision carries `rationale` and `decided_by` alongside the
+                # sentence, and v1 not SENDING them is not a reason to discard
+                # them on the way in -- a superseded session's transcript window
+                # may be gone by the time anyone wants them. The narrowing to
+                # plain strings happens in lambda_org_api, at the payload
+                # boundary, where React forces it. Blank-only entries are still
+                # dropped: they render as a bullet with nothing in it.
+                decisions=[d for d in (t.get("decisions") or [])
+                           if (d.get("decision") if isinstance(d, dict) else d)] or None,
                 work_class=_wc, work_confidence=_wconf, is_mixed=(t.get("is_mixed") is True),
                 evidence=_evidence_payload(t),
-                # video-keyframe plan (Task 4): re-bound synthetic keyframes
-                # (filename carries the '_kf_' marker) keep an "Auto keyframe"
-                # caption so the UI can still distinguish them after an
-                # item-writer re-run; real photos stay caption-less (None).
-                photos=[{"s3_key": p["key"],
-                         "caption_text": "Auto keyframe" if "_kf_" in p["filename"] else None}
-                        for p in matched_photos],
+                # NO `photos=` ANY MORE. Two writers for one table is how the
+                # rows diverged: this one inserted its own session's binds and
+                # nothing was ever responsible for removing another session's.
+                # `photo_rebind.rebind_day_photos` owns topic_photos for the whole
+                # day, and it runs after this loop because it needs these rows
+                # to exist before it can bind to them.
             )
+            new_topic_ids.append(row["id"])
+            # Track B Task 6a: one work_class decision_records row per topic
+            # that actually carries one (see `_record_work_class_decision`
+            # for what "actually carries one" means and why this must not
+            # be able to abort the write below it).
+            _record_work_class_decision(
+                conn, owner_company_id, site["id"], row["id"], _wc, _wconf,
+                t.get("is_mixed") is True, extraction_llm_provider, extraction_llm_model)
             # Task 2 (programme-impact-link plan) -- persist this topic's
             # rich extraction findings in the SAME transaction as the topic
             # upsert (inherits the I-3 advisory lock + I-4 supersession
@@ -869,6 +1414,20 @@ def write_extraction_items(date, user_folder, extraction_key):
             # [] -> insert_findings returns [] -> zero rows, zero crash.
             finding_rows = findings.insert_findings(
                 conn, row["id"], site["id"], t.get("findings") or [])
+
+            # Track B Task 5 -- decisions/open_questions become their OWN rows, dual-written
+            # in the SAME transaction right after findings above, alongside (not instead of)
+            # the jsonb upsert_topic already wrote a few lines up (decisions=/open_questions=
+            # kwargs). Each insert does its own blank-dropping identical to those kwargs
+            # (see topic_decisions.insert_decisions / topic_questions.insert_questions
+            # docstrings) so the row table and the jsonb mirror never disagree about which
+            # entries exist. A stable_id here is what lets Task 4's carry_forward (below)
+            # keep a decision or an answered question attached to the same commitment
+            # across a re-extraction that reworded it.
+            topic_decisions.insert_decisions(
+                conn, row["id"], site["id"], t.get("decisions") or [])
+            topic_questions.insert_questions(
+                conn, row["id"], site["id"], t.get("questions") or [])
 
             # Snapshot for the match_requests/ artifact (Task 4) -- the
             # non-VPC MatcherFunction reads this, never Aurora directly, so
@@ -905,9 +1464,77 @@ def write_extraction_items(date, user_folder, extraction_key):
                                         "time_range": t.get("time_range")})
             topics_n += 1
 
+        # Track B Task 4 -- carry a human's tick, status, reassignment or deadline edit from
+        # a row this pass just superseded to the row that replaced it. Same transaction,
+        # after the new topics/children above are inserted (their ids are only known now)
+        # and after every supersede call this invocation made (retired_topics is complete by
+        # here: the idempotent clear, the group-member supersede, and the authority-flip
+        # branch all ran above, before this loop). A pass that retired nothing has no "old"
+        # pool and nothing to report -- the common case, and the whole reason retired_topics
+        # is checked here rather than always calling into an empty match.
+        #
+        # _carry_forward_children (carry_forward_apply.py -- final wave, Ruling R19: shared
+        # with lambda_ingest's report path) runs its own work inside a SAVEPOINT, not a bare
+        # try/except (Ruling R10): a bug there must DEGRADE (the topics/findings/action-items
+        # already inserted above still commit) rather than ABORT the whole pass -- and only a
+        # real SAVEPOINT undoes that, since Postgres aborts the enclosing transaction on any
+        # SQL error and a Python try/except cannot un-abort it. See that function's own
+        # docstring for the full reasoning (same shape as _suggest_threads above it).
+        if retired_topics:
+            carry_forward_apply._carry_forward_children(
+                conn, [t["id"] for t in retired_topics], new_topic_ids, site["id"],
+                extraction_key)
+
+        # Task 7 (spec D6): every continuity claim the extractor made (item_continuity.resolve,
+        # carried in the artifact's `continuity.claims`) becomes its own decision_records row --
+        # Track B's "every gated AI verdict is recorded" rule, extended to this gate. Runs AFTER
+        # carry-forward just above: an accepted claim's subject_stable_id is looked up on the
+        # RETIRED row via old_topic_ids, which only exist because retired_topics was populated
+        # by the supersede calls earlier in this pass; a rejected or unresolvable claim falls
+        # back to the new row via new_topic_ids, unaffected by carry-forward's own outcome.
+        #
+        # Its own SAVEPOINT, not a bare try/except (same posture as _record_work_class_decision
+        # and _carry_forward_children above it, Ruling R10): a records bug must DEGRADE, never
+        # ABORT the topics/findings/action-items already inserted this pass.
+        try:
+            with conn.transaction():
+                claim_stats = continuity_records.record_claims(
+                    conn, extraction, extraction_key, owner_company_id, site["id"],
+                    [t["id"] for t in retired_topics], new_topic_ids)
+            if claim_stats["unresolved"] > 0:
+                logger.warning("continuity claims: %s key=%s", claim_stats, extraction_key)
+        except Exception:
+            logger.warning("continuity decision records not stored for %s", extraction_key,
+                            exc_info=True)
+
+        # THE DAY'S PHOTOS, BOUND ONCE, AFTER THIS EXTRACTION'S TOPICS EXIST.
+        # Never fatal: a rebind that turned a good extraction into a failed one
+        # would be a worse bug than a misplaced thumbnail, and the day view
+        # lists every photo regardless of binding.
+        try:
+            photo_rebind.rebind_day_photos(
+                conn, owner_company_id, user_folder, date, photo_objects)
+        except Exception:  # noqa: BLE001 -- see above
+            logger.exception("day photo rebind failed for %s/%s", user_folder, date)
+
+        # A SPOKEN CHECK'S REPORT, MADE ON ITS OWN (owner, 2026-10-06): each check
+        # of a FINAL extraction that matched a checklist template goes to the
+        # report worker now, after the topics and their photos exist, so the
+        # filled checklist is waiting when he is back at the office. Never fatal.
+        if (extraction.get("tier") == "final" and stored_inspections
+                and not extraction.get("incomplete")):
+            try:
+                made = checklist_reports.auto_generate(
+                    conn, owner_company_id, user_folder, date,
+                    _parse_extraction_key(extraction_key)[2], stored_inspections)
+                if made:
+                    logger.info("checklist reports for %s: %s", extraction_key, made)
+            except Exception:  # noqa: BLE001 -- see above
+                logger.exception("checklist reports not queued for %s", extraction_key)
+
         if collected_topics:
             if SUGGEST_THREADS:
-                _suggest_threads(conn, site["id"], date, collected_topics)
+                _suggest_threads(conn, owner_company_id, site["id"], date, collected_topics)
             else:
                 # Say that it is off. An env-gated feature that logs nothing
                 # when disabled is indistinguishable from one that is broken,
@@ -921,6 +1548,32 @@ def write_extraction_items(date, user_folder, extraction_key):
         # stayed NULL with merged_at set, which is exactly the signature the
         # stuck-group recovery looks for: every successful merge would have been
         # re-merged and re-emailed.
+        # The recorder's own confirmation email. Resolved HERE (the connection
+        # dies with this block) and enqueued AFTER it, for the same reason the
+        # merged email is: the rows must be durable before anyone is told to
+        # look at them.
+        #
+        # Enqueued by this step rather than at the sweep's claim, because the
+        # email should show the record -- and only the step that LANDS the
+        # record knows it landed. The sweep enqueued at claim time, so the email
+        # routinely went out before the final extraction existed and had to be
+        # built from a second summariser.
+        #
+        # tier alone is not enough. A final is written again by the re-run chain
+        # (up to FINAL_RERUN_MAX_GENERATIONS) and by org-api's regenerate, months
+        # later, for a session that was sent long ago -- each would mail the
+        # recorder about an old meeting. The session must be WAITING for it.
+        final_email_ctx = None
+        if extraction.get("tier") == "final" and extraction.get("incomplete"):
+            # A fuller final is on its way (lambda_extract_session._known_short):
+            # the email waits for it rather than describing part of the recording.
+            logger.info("%s: final record is known to be short -- the email waits for "
+                        "the re-run", extraction_key)
+        elif extraction.get("tier") == "final":
+            final_email_ctx = _final_email_context(
+                conn, session_base, extraction, date,
+                follow_up=bool(extraction.get("recovered_after_error")))
+
         if ENABLE_GROUP_MERGE and extraction.get("tier") == "group" and topics_n:
             session_group.mark_result(conn, extraction["groupId"], "merged")
             # Resolved HERE because the connection dies with the block below,
@@ -938,6 +1591,20 @@ def write_extraction_items(date, user_folder, extraction_key):
     # the merged record, and only the step that LANDS the result knows it
     # landed. This lambda is in-VPC and cannot invoke another (BUG-36), so the
     # request rides the same S3 channel as everything else crossing that line.
+    if final_email_ctx and stored_inspections:
+        # The checks heard in this recording, for one line in the email (owner,
+        # 2026-10-06): the email goes out before a check's report is written, and
+        # without this the recorder learns about it only from the web or the bell.
+        final_email_ctx["checks"] = email_checks(stored_inspections, extraction.get("topics"))
+    if final_email_ctx:
+        try:
+            _enqueue_final_email(final_email_ctx)
+        except Exception:
+            # The rows are already durable; failing to announce them must not
+            # undo them. The sweep's backstop still mails this session.
+            logger.exception("session %s: topics written but the confirmation "
+                             "email could not be enqueued", final_email_ctx.get("sessionId"))
+
     if ENABLE_GROUP_MERGE and extraction.get("tier") == "group" and topics_n:
         try:
             _enqueue_updated_emails(extraction, member_contexts)
@@ -969,7 +1636,24 @@ def write_extraction_items(date, user_folder, extraction_key):
     # one — which matters because the groups would outlive the deletion in a table the
     # tombstone does not reach.
     if REBIND_SPEAKERS:
-        _request_rebind(company["id"], session_base, extraction)
+        # Anonymous label groups are session data: they belong to the SITE's company.
+        _request_rebind(owner_company_id, session_base, extraction)
+
+    # Naming, which is the other half and gated separately. Same placement and the same
+    # reasons: post-commit, and after the deleted-source gate, so a session the customer
+    # deleted is never matched — the names would outlive the deletion in a table the
+    # tombstone does not reach.
+    #
+    # `site` narrows the candidate pool to the people who were on that site, which is what
+    # keeps the margin meaningful as a company accumulates profiles. It is already resolved
+    # above by the ladder BUG-41 settled, and None is a valid answer meaning "no narrowing".
+    #
+    # P5: the request is made in the SITE's company (`owner_company_id`); when the recorder
+    # is another company's employee it also names their home company and user id, so the
+    # matcher can add the recorder's own print and nothing else from that company.
+    _request_match(owner_company_id, session_base, extraction,
+                   site_id=(site or {}).get("id"),
+                   home_company_id=company["id"], recorder_user_id=user_id)
 
     return {"skipped": False, "topics": topics_n}
 
@@ -977,30 +1661,6 @@ def write_extraction_items(date, user_folder, extraction_key):
 # ----------------------------------------------------------
 # Entry point — S3 event
 # ----------------------------------------------------------
-def _warn_if_discarding_checkoffs(conn, extraction_key):
-    """Log when this supersession is about to CASCADE away a ticked action item.
-
-    Counted, not prevented. Preventing it needs a rule for carrying human decisions across
-    a re-extraction, and the only safe rule is to ask a person -- which is a feature, not a
-    line in a writer. What this buys is a number that can be alarmed on and a log line that
-    names the key, so the next person to ask "did we lose ticks?" has an answer.
-
-    Never raises. A count that fails must not stop an extraction from landing.
-    """
-    try:
-        row = conn.execute(
-            "SELECT count(*) FROM action_items a JOIN topics t ON t.id = a.topic_id "
-            "WHERE t.source_s3_key = %s AND a.status <> 'open'",
-            (extraction_key,)).fetchone()
-        n = (row or [0])[0] or 0
-        if n:
-            logger.warning(
-                "supersession discards %d closed action item(s) for %s -- the live tier's "
-                "check-offs are CASCADEd by the final tier writing the same key",
-                n, extraction_key)
-    except Exception:
-        logger.exception("could not count closed action items for %s", extraction_key)
-
 def _source_is_deleted(conn, source_s3_key) -> bool:
     """Whether this extraction's source has been deleted by its owner.
 
@@ -1029,6 +1689,29 @@ def _source_is_deleted(conn, source_s3_key) -> bool:
     return bool(hit)
 
 
+def _store_inspections(conn, company_id, user_id, user_folder, date, session, spoken):
+    """Match each spoken check to a checklist template and keep the windows.
+    On the trace either way: a check that matched nothing is the case the
+    owner most needs to see (a template named differently from how people
+    say it)."""
+    templates = inspection_windows.checklist_templates(conn, company_id, user_id) if spoken else []
+    rows = []
+    for w in spoken:
+        tpl, score = inspection_match.match(w, templates)
+        rows.append(dict(w, start_at=w.get("start_at_s") or (w["start_at"] + ":00"),
+                         end_at=w.get("end_at_s") or ((w["end_at"] + ":00") if w.get("end_at") else None),
+                         template_id=tpl["id"] if tpl else None,
+                         template_name=tpl["name"] if tpl else None,
+                         match_score=round(score, 2)))
+        pipeline_trace.event("checklist_match", "matched" if tpl else "no_match", detail={
+            "check": w.get("name"), "kind": w.get("kind"),
+            "template": tpl["name"] if tpl else None, "score": round(score, 2),
+            "candidates": sum(1 for t in templates if inspection_match.is_checklist(t.get("body")))},
+            evidence=w.get("start_quote"))
+    inspection_windows.replace_for_session(conn, company_id, user_folder, date, session, rows)
+    return rows
+
+
 def lambda_handler(event, context):
     event = event or {}
     results = []
@@ -1038,6 +1721,11 @@ def lambda_handler(event, context):
         if parsed is None:
             logger.warning("skipping non-extraction S3 key: %s", key)
             continue
-        user_folder, date, _session_base = parsed
-        results.append(write_extraction_items(date, user_folder, key))
+        user_folder, date, session_base = parsed
+        pipeline_trace.begin("item-writer", user_folder=user_folder, date=date,
+                             session=session_base)
+        try:
+            results.append(write_extraction_items(date, user_folder, key))
+        finally:
+            pipeline_trace.flush(s3, S3_BUCKET)
     return {"results": results}

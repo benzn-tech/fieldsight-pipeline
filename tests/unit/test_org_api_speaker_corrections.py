@@ -298,7 +298,7 @@ def test_the_artifact_carries_this_session_s_turns_and_no_others(wired, monkeypa
     starting at the same offset. Mistaking one for the other cost two rounds of debugging."""
     mine = ("ben_2026-08-13_11-49-00_sid" + "0" * 32 + "_c0000_bn4_off0.0_to114.0_srcwav.json")
     other = ("ben_2026-08-13_18-10-00_sid" + "1" * 32 + "_c0000_bn4_off0.0_to114.0_srcwav.json")
-    monkeypatch.setattr(org, "_read_org_transcripts", lambda d, f, a, b, conn=None: {
+    monkeypatch.setattr(org, "_read_org_transcripts", lambda d, f, a, b, conn=None, **k: {
         "speaker_segments": [
             {"source_filename": mine, "chunk_start": 4.88, "duration": 4.0},
             {"source_filename": mine, "chunk_start": 26.5, "duration": 6.0},
@@ -906,6 +906,7 @@ def test_the_session_exact_site_beats_the_days_majority(monkeypatch):
     """`lambda_item_writer` settled this order after BUG-41. Starting at the day-majority
     rung gives somebody who recorded at two sites in one day the wrong site — the pool
     narrows to the wrong roster and the right person is dropped."""
+    monkeypatch.setattr(org.users, "get_by_folder_name_global", lambda c, f: {"id": "u-1"})
     monkeypatch.setattr(org.recordings, "site_for_media",
                         lambda *a, **k: {"id": "exact"})
     called = []
@@ -917,7 +918,10 @@ def test_the_session_exact_site_beats_the_days_majority(monkeypatch):
 
 
 def test_a_site_from_another_tenant_is_refused(monkeypatch):
-    """It would narrow this company's pool against a roster that is not theirs."""
+    """A site the recorder has no membership on (and is not their company's) would
+    narrow the pool against a roster that is not theirs."""
+    monkeypatch.setattr(org.users, "get_by_folder_name_global", lambda c, f: {"id": "u-1"})
+    monkeypatch.setattr(org.memberships, "site_usable_by_user", lambda c, uid, sid: None)
     monkeypatch.setattr(org.recordings, "site_for_media", lambda *a, **k: None)
     monkeypatch.setattr(org.meeting_session, "get", lambda conn, sid: {"site_id": "st-9"})
     monkeypatch.setattr(org.sites, "get_site",

@@ -69,13 +69,24 @@ def is_topic_redacted(conn, topic_id) -> bool:
 
 def company_excluded_topic_ids(conn, site_ids) -> set:
     """Topic ids a COMPANY-tier read excludes across site_ids: any topic
-    classified non_work (auto-held) OR carrying an active redaction. The
-    site/self tier does NOT use this. Empty site_ids -> empty set (no query)."""
+    classified non_work (auto-held), carrying an active redaction, OR
+    superseded by a later pass of the same source key. The site/self tier
+    does NOT use this. Empty site_ids -> empty set (no query).
+
+    `rollup.portfolio_counts` is this set's only caller (its four aggregate
+    queries subtract it with `!= ALL(...)` rather than each carrying its own
+    predicate), which is why the superseded arm belongs here rather than
+    inlined four times: one exclusion list, computed once, upstream of every
+    count -- the same choke-point reasoning `deleted_predicates` exists for.
+    Routed through `SUPERSEDED_TOPIC_PREDICATE` (not an inlined
+    `superseded_at IS NOT NULL`) so this stays the one place that string is
+    spelled."""
     if not site_ids:
         return set()
     rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT id FROM topics WHERE site_id = ANY(%s) AND ("
         "  work_class='non_work' "
+        f"  OR {SUPERSEDED_TOPIC_PREDICATE.format(alias='topics')} "
         "  OR id IN (SELECT target_id FROM redactions "
         "            WHERE target_type='topic' AND reverted_at IS NULL))",
         (list(site_ids),)).fetchall()
@@ -116,6 +127,9 @@ from deleted_predicates import (  # noqa: E402,F401
     DELETED_TOPIC_PREDICATE,
     DELETED_SOURCE_PREDICATE,
     DELETED_CHUNK_TOPIC_PREDICATE,
+    LIVE_TOPIC_PREDICATE,
+    SUPERSEDED_TOPIC_PREDICATE,
+    CHILD_OF_VISIBLE_TOPIC,
     visible_topics_predicate,
     visible_chunks_predicate,
 )
@@ -208,11 +222,19 @@ def deleted_source_prefixes(conn, folder=None, date=None) -> list:
     if folder and date:
         sql += " AND target_key LIKE %s"
         params.append(f"%/{folder}/{date}/%")
+    elif date:
+        # Every folder, ONE date -- what admin_disambiguation asks before serving the
+        # lake-wide summary. This branch was missing: with folder=None the date was
+        # ignored, the call meant "was anything, anywhere, ever deleted?", and the
+        # summary was withheld on every date once one recording had been
+        # (43179ad8, 2026-08-14).
+        sql += " AND target_key LIKE %s"
+        params.append(f"%/{date}/%")
     rows = conn.cursor(row_factory=dict_row).execute(sql, tuple(params)).fetchall()
     return [r["target_key"] for r in rows]
 
 
-def deleted_session_bases(conn, company_id, date_from, date_to) -> set:
+def deleted_session_bases(conn, company_id, date_from, date_to, also_companies=()) -> set:
     """The `sid{hex}` bases tombstoned in this company over a date range.
 
     FROM AURORA, NOT FROM THE S3 MIRROR, and the mirror's own docstring says
@@ -226,6 +248,10 @@ def deleted_session_bases(conn, company_id, date_from, date_to) -> set:
     `redactions/{folder}/{date}/deleted_sessions.json`, so a seven-day range
     across a caller's folders is one GET per folder per day, while this is one
     query for the range.
+
+    `also_companies` adds other companies' tombstones to a company-pinned read: a
+    caller added to another company's project (external member) reaches sessions whose
+    deletion that company stamped. It never widens the NULL company to "all".
 
     `company_id=None` means EVERY COMPANY, and it must be reachable for the same
     reason `range_stats` accepts it: a cross-company caller counts rows across
@@ -243,11 +269,14 @@ def deleted_session_bases(conn, company_id, date_from, date_to) -> set:
     rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT DISTINCT substring(target_key from '(sid[0-9a-f]{32})$') AS base "
         "FROM redactions "
-        "WHERE (%s::uuid IS NULL OR company_id = %s) ""AND target_type = 'recording' AND scope = 'deleted' "
+        "WHERE (%s::uuid IS NULL OR company_id = %s" + (
+            " OR company_id = ANY(%s::uuid[])" if also_companies else "") +
+        ") AND target_type = 'recording' AND scope = 'deleted' "
         "AND reverted_at IS NULL AND target_key IS NOT NULL "
         "AND substring(target_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/') "
         "    BETWEEN %s AND %s",
-        (company_id, company_id, date_from, date_to),
+        (company_id, company_id) + (([str(x) for x in also_companies],) if also_companies else ())
+        + (date_from, date_to),
     ).fetchall()
     return {r["base"] for r in rows if r["base"]}
 

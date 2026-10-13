@@ -166,3 +166,14 @@ def test_the_url_actually_used_is_the_configured_one(monkeypatch):
     sent = _capture(mod, monkeypatch)
     mod.call_llm("hi", max_tokens=10)
     assert sent["url"] == OPENROUTER + "/chat/completions"
+
+
+import pytest as _pytest_fb
+
+
+@_pytest_fb.fixture(autouse=True)
+def _single_model_chain(monkeypatch):
+    # These tests pin ONE model's request; the fallback chain (a second request
+    # on failure, one attempt on the primary) has its own file,
+    # test_model_fallback_chain.py.
+    monkeypatch.setenv("LLM_FALLBACK_MODELS", "")

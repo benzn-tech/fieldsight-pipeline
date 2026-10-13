@@ -16,7 +16,6 @@ name: Deploy FieldSight PROD (SAM)
 # for a reason that has nothing to do with the change being deployed — which is
 # how a perfectly good deploy gets diagnosed as broken code. Merging a few PRs
 # in quick succession, or two people merging at once, is enough to trigger it.
-#
 # cancel-in-progress is deliberately FALSE: queueing is the point. Cancelling a
 # run mid-CloudFormation-update would leave the stack half-applied, which is
 # strictly worse than waiting.
@@ -83,7 +82,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m pip install --upgrade pip
-      - run: pip install "psycopg[binary]>=3.1" "pgvector>=0.3" "PyJWT[crypto]>=2.8" boto3 numpy "python-docx>=1.1" pytest pytest-cov
+      - run: pip install -r requirements-test.txt
       - run: python -m pytest -v
 
   deploy-prod:
@@ -138,8 +137,22 @@ jobs:
           # falls back to DashScope with no error anywhere.
           QWEN_CHAT_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
-          ELEVENLABS_ASK_API_KEY: ${{ secrets.ELEVENLABS_ASK_API_KEY }}
-          ELEVENLABS_API_KEY_TTS: ${{ secrets.ELEVENLABS_API_KEY_TTS }}
+          # Both prod Ask voice keys come from ONE prod-only secret, and
+          # deliberately not from the two that were here before:
+          #   * ELEVENLABS_ASK_API_KEY has never existed as a secret, so prod's
+          #     STT key resolved to empty, the guard below dropped the override,
+          #     and prod shipped with no Ask STT key at all -- invisible until
+          #     somebody set the provider to elevenlabs and it refused.
+          #   * ELEVENLABS_API_KEY_TTS is the secret TEST also reads, so prod
+          #     and test were drawing Ask speech from one credit pool. Measured
+          #     2026-09-21: identical key on both ask-agents. That is the same
+          #     shape as the shared transcription key of 2026-08-08 -- a test
+          #     run spending prod's quota, presenting as "the feature stopped".
+          # Per-environment, not per-purpose: prod TTS and prod STT share this
+          # pool, so exhausting it takes both down together. Accepted by the
+          # owner 2026-09-22; split it if Ask voice ever carries real load.
+          ELEVENLABS_ASK_API_KEY: ${{ secrets.ELEVENLABS_ASK_API_KEY_PROD }}
+          ELEVENLABS_API_KEY_TTS: ${{ secrets.ELEVENLABS_ASK_API_KEY_PROD }}
           FARGATE_SUBNET_IDS: ${{ secrets.FARGATE_SUBNET_IDS }}
           FARGATE_VPC_ID: ${{ secrets.FARGATE_VPC_ID }}
         run: |
@@ -216,6 +229,20 @@ jobs:
           # never passed here, so both stacks ran template defaults and the
           # "just flip a variable" rollback did not exist. Unset vars keep those
           # same defaults, so adding them changes nothing until someone sets one.
+          # ElevenLabsTtsVoice / ElevenLabsTtsSpeed are passed EXPLICITLY below,
+          # because a template Default does not reach a stack that already exists.
+          # sam deploy sends only the parameters named in --parameter-overrides;
+          # CloudFormation carries its PREVIOUS value forward for every one it does
+          # not see, so a Default governs a brand-new stack and nothing else.
+          # Measured 2026-09-22: the Default was changed to James, TEST deployed
+          # 02:16Z, prod deployed 02:34Z, and BOTH stacks still reported
+          # ElevenLabsTtsVoice=bPkjmCb0W1xUBvyH2Afs. Green CI, two successful
+          # deploys, the old voice, no error anywhere.
+          #
+          # Literals rather than repo variables: one voice and one speed for both
+          # environments is the product decision (TEST is where the voice gets
+          # judged). The three copies -- both workflows and the template Default --
+          # are pinned equal by test_the_voice_and_speed_are_wired_not_just_defaulted.
           sam deploy --config-env prod \
             --no-confirm-changeset --no-fail-on-empty-changeset \
             --parameter-overrides \
@@ -230,7 +257,6 @@ jobs:
               "ReportsTableName=fieldsight-reports" \
               "AuditTableName=fieldsight-audit" \
               "DeviceAnnouncementPatterns=${{ vars.PROD_DEVICE_ANNOUNCEMENT_PATTERNS || '[]' }}" \
-              "MultiTenantResolution=true" \
               "VadThreshold=${{ vars.PROD_VAD_THRESHOLD || '0.5' }}" \
               "DropSilentChunks=${{ vars.PROD_DROP_SILENT_CHUNKS || 'true' }}" \
               "NormaliseAudio=${{ vars.PROD_NORMALISE_AUDIO || 'false' }}" \
@@ -246,19 +272,32 @@ jobs:
               "GroupMergeCap=${{ vars.PROD_GROUP_MERGE_CAP || '2' }}" \
               "StuckMergeSeconds=${{ vars.PROD_STUCK_MERGE_SECONDS || '1800' }}" \
               "GroupMaxSpanSeconds=${{ vars.PROD_GROUP_MAX_SPAN_SECONDS || '43200' }}" \
+              "DeclareContinuity=${{ vars.PROD_DECLARE_CONTINUITY || 'false' }}" \
               "EmitEvidence=${{ vars.PROD_EMIT_EVIDENCE || 'false' }}" \
               "EvidenceWindowSec=${{ vars.PROD_EVIDENCE_WINDOW_SEC || '60' }}" \
               "EvidenceFuzzyThreshold=${{ vars.PROD_EVIDENCE_FUZZY_THRESHOLD || '0.80' }}" \
               "EvidenceFloorTokens=${{ vars.PROD_EVIDENCE_FLOOR_TOKENS || '5' }}" \
+              "EnableRecordingBlocks=${{ vars.PROD_ENABLE_RECORDING_BLOCKS || 'false' }}" \
+              "ReportBlockGapSeconds=${{ vars.PROD_REPORT_BLOCK_GAP_SECONDS || '600' }}" \
+              "ReportLongBlockSeconds=${{ vars.PROD_REPORT_LONG_BLOCK_SECONDS || '5400' }}" \
               $LLM_TEMP_PARAM \
               "AuthorityFlip=${{ vars.PROD_AUTHORITY_FLIP || 'false' }}" \
               "GradedRoles=${{ vars.PROD_GRADED_ROLES || 'false' }}" \
+              "LakeIndexReads=${{ vars.PROD_LAKE_INDEX_READS || 'false' }}" \
+              "CompanySummaryServe=${{ vars.PROD_COMPANY_SUMMARY_SERVE || 'off' }}" \
               "EnableUserDeletion=${{ vars.PROD_ENABLE_USER_DELETION || 'false' }}" \
               "EnableExternalCorroboration=${{ vars.PROD_ENABLE_EXTERNAL_CORROBORATION || 'false' }}" \
               "CorroborationApiKey=${{ secrets.OPENROUTER_API_KEY }}" \
               "EnableWebAnswer=${{ vars.PROD_ENABLE_WEB_ANSWER || 'false' }}" \
+              "AskConversationMemory=${{ vars.PROD_ASK_CONVERSATION_MEMORY || 'false' }}" \
+              "AskRewriteBudget=${{ vars.PROD_ASK_REWRITE_BUDGET || '4.0' }}" \
+              "AskDistanceGate=${{ vars.PROD_ASK_DISTANCE_GATE || '0.55' }}" \
               "UploadVerifyMode=${{ vars.PROD_UPLOAD_VERIFY_MODE || 'observe' }}" \
               "SpeakerIdentityMode=${{ vars.PROD_SPEAKER_IDENTITY_MODE || 'off' }}" \
+              "MatchOnFinalize=${{ vars.PROD_MATCH_ON_FINALIZE || 'false' }}" \
+              "ProposalWindowHours=${{ vars.PROD_PROPOSAL_WINDOW_HOURS || '72' }}" \
+              "RosterDerived=${{ vars.PROD_ROSTER_DERIVED || 'on' }}" \
+              "RosterLookbackDays=${{ vars.PROD_ROSTER_LOOKBACK_DAYS || '14' }}" \
               "EnrolOnCorrection=${{ vars.PROD_ENROL_ON_CORRECTION || 'false' }}" \
               "VoiceprintMaxFrameSpread=${{ vars.PROD_VOICEPRINT_MAX_FRAME_SPREAD || 'default' }}" \
               "AlertEmail=${{ vars.PROD_ALERT_EMAIL || 'none' }}" \
@@ -296,6 +335,9 @@ jobs:
               $NONWORK_SINCE_PARAM \
               "AskSttProvider=${{ vars.PROD_ASK_STT_PROVIDER || 'dashscope' }}" \
               "AskTtsProvider=${{ vars.PROD_ASK_TTS_PROVIDER || 'dashscope' }}" \
+              "ElevenLabsTtsVoice=QlZn2MPaf2jDn0461bnj" \
+              "ElevenLabsTtsSpeed=1.10" \
+              "ElevenLabsTtsModel=eleven_multilingual_v2" \
               $EL_TTS_KEY_PARAM \
               "AskVoiceModel=${{ vars.PROD_ASK_VOICE_MODEL || 'none' }}" \
               $EL_ASK_KEY_PARAM \

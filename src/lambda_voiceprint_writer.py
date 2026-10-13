@@ -43,17 +43,55 @@ Spec: docs/superpowers/specs/2026-08-13-speaker-correction-propagation.md
 Plan: docs/superpowers/plans/2026-08-13-correction-propagation-implementation.md (P4)
 """
 import logging
+import os
 
 from db.connection import get_connection
-from repositories import speaker_label_groups
-from repositories.voiceprints import (EnrolmentBelongsToSomebodyElse, add_sample,
-                                      live_turn_names, profiles_for_matching,
-                                      record_attempt, record_turn_name,
-                                      rejected_names)
+from repositories import (label_group_candidates, site_attendance,
+                          speaker_label_groups, speaker_name_proposals)
+from repositories.companies import list_companies, voiceprint_consent_basis
+from repositories.voiceprints import (EnrolmentAfterWithdrawal,
+                                      EnrolmentBelongsToSomebodyElse, add_sample,
+                                      company_floor, live_turn_names,
+                                      own_profiles_for_matching,
+                                      profiles_for_matching, record_attempt,
+                                      record_turn_name, recompute_company_floor,
+                                      rejected_names, requarantine_profile)
 from turn_name_overlay import _SOURCE_RANK
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+# How far back to look for other passages that sound like a newly enrolled person.
+#
+# A knob, not a constant, because the owner said the value will move -- and a switch that
+# only exists in code is one nobody can turn. All three segments (repo variable, workflow
+# override, template Parameter) or it silently serves this default forever.
+PROPOSAL_WINDOW_HOURS = int(os.environ.get("PROPOSAL_WINDOW_HOURS", "72"))
+
+# How many questions to ask at once. A SCREEN-SIZE choice and explicitly not a threshold:
+# nothing here decides whether a candidate IS a match, only how many of the best-ranked
+# ones a person is shown. An admission cut arriving as a "limit" would be the absolute
+# threshold this system has refused to invent, wearing a different name.
+PROPOSAL_LIMIT = int(os.environ.get("PROPOSAL_LIMIT", "5"))
+
+
+def _derived_from_env(value):
+    """`on`/`off`, case-insensitive, absent -> on. Not a boolean Parameter (plan correction
+    7): the generic wiring sweep only recognises `AllowedValues: ['true','false']`, so this
+    switch needs its own explicit wiring test rather than relying on that sweep."""
+    return (value or "on").strip().lower() != "off"
+
+
+# Whether `_profiles` derives roster membership from recordings and recent corrections
+# (design: docs/superpowers/specs/2026-09-30-derived-roster-design.md) or serves only the
+# explicit `site_attendance` rows (#969's own behaviour, byte-for-byte, when `off`). All
+# three segments (repo variable, workflow override, template Parameter) or this silently
+# serves its default forever -- the same rule PROPOSAL_WINDOW_HOURS is here.
+ROSTER_DERIVED = _derived_from_env(os.environ.get("ROSTER_DERIVED"))
+
+# How many NZ days back a human correction at this site still counts as "recently confirmed
+# here" (design arm 3). Same three-segment rule.
+ROSTER_LOOKBACK_DAYS = int(os.environ.get("ROSTER_LOOKBACK_DAYS", "14"))
 
 
 def _require(event, key):
@@ -67,7 +105,10 @@ def _require(event, key):
 def _rebind(event):
     """Store one session's anonymous speaker groups, replacing whatever was there.
 
-    Letters, not names: nothing here identifies anybody and no vector is stored. It lives on
+    Letters, not names: nothing here identifies anybody. It DOES now store a vector -- the
+    centroid the grouping was decided on (0065) -- which the previous wording explicitly
+    denied, so read the column comment before treating this as anonymous in a privacy
+    answer: a voice summary is not a name, but it is not nothing either. It lives on
     this side of the boundary for the ordinary reason — the embedder is non-VPC and cannot
     reach Aurora, so the same invoke the enrolment path already uses carries the result across.
 
@@ -188,7 +229,17 @@ def _propagation(event):
                            window=(window[0], window[1]),
                            created_by=enrol.get("created_by"),
                            correction_ref=correction_ref,
-                           admitted_max_spread=enrol.get("admitted_max_spread"))
+                           admitted_max_spread=enrol.get("admitted_max_spread"),
+                           level_dbfs=enrol.get("level_dbfs"),
+                           noise_dbfs=enrol.get("noise_dbfs"),
+                           snr_db=enrol.get("snr_db"))
+            except EnrolmentAfterWithdrawal as exc:
+                # Same treatment as the refusal below, for the same reason: the names
+                # describe THIS meeting. A withdrawal that landed mid-flight is not a reason
+                # to roll them back — `withdraw` un-names what the PROFILE justified, and
+                # these were justified by a person's assertion in this meeting.
+                logger.warning("enrol refused: %s", exc)
+                enrol_refusal = {"reason": "profile-withdrawn"}
             except EnrolmentBelongsToSomebodyElse as exc:
                 # Caught, not propagated: the names describe THIS meeting and were earned by
                 # the user's own assertion. Letting a refused enrolment roll them back would
@@ -219,13 +270,31 @@ def _propagation(event):
                            source="correction_propagation", s3_key=h.get("s3_key"),
                            window=(w[0], w[1]), created_by=h.get("created_by"),
                            correction_ref=correction_ref,
-                           admitted_max_spread=h.get("admitted_max_spread"))
+                           admitted_max_spread=h.get("admitted_max_spread"),
+                           level_dbfs=h.get("level_dbfs"),
+                           noise_dbfs=h.get("noise_dbfs"),
+                           snr_db=h.get("snr_db"))
                 harvested += 1
-            except EnrolmentBelongsToSomebodyElse as exc:
+            except (EnrolmentAfterWithdrawal, EnrolmentBelongsToSomebodyElse) as exc:
                 # PER SAMPLE. One refusal must not discard the rest: they are independent
                 # windows and only the refused one is suspect.
+                #
+                # A withdrawal joins the same arm rather than breaking the loop. It will
+                # refuse every remaining member too — the profile is gone for all of them —
+                # and counting each refusal separately keeps `harvest_refused` meaning "how
+                # many windows did not become samples", which is what the number is read as.
                 logger.warning("harvest sample refused: %s", exc)
                 harvest_refused += 1
+
+        # After the harvest, not after the anchor: a candidate's score is the MEAN over this
+        # person's samples, so running it between the two would score every cluster against
+        # a one-sample profile and then never revisit it.
+        if enrol and not enrol_refusal:
+            # Before the proposals: they score candidates against this profile's MEAN, and
+            # a stranger's sample still in that mean drags every score toward nobody.
+            _requarantine(conn, company_id, enrol["voiceprint_id"])
+            _propose_where_else_this_voice_was_heard(
+                conn, company_id, enrol["voiceprint_id"])
 
         inherited = _inherit_labels(conn, company_id, session_base,
                                     event.get("label_map"))
@@ -267,7 +336,13 @@ def _enrol(event):
                        window=(window[0], window[1]),
                        created_by=event.get("created_by"),
                        correction_ref=event.get("correction_ref"),
-                       admitted_max_spread=event.get("admitted_max_spread"))
+                       admitted_max_spread=event.get("admitted_max_spread"),
+                       level_dbfs=event.get("level_dbfs"),
+                       noise_dbfs=event.get("noise_dbfs"),
+                       snr_db=event.get("snr_db"))
+        except EnrolmentAfterWithdrawal as exc:
+            logger.warning("enrol refused: %s", exc)
+            return {"stored": 0, "reason": "profile-withdrawn"}
         except EnrolmentBelongsToSomebodyElse as exc:
             # Same refusal as the propagation path, and it has to be spelled out twice
             # because the two paths report different shapes. What must NOT differ is the
@@ -277,6 +352,83 @@ def _enrol(event):
                     "own": exc.own, "bestOther": exc.best_other,
                     "nearestOtherId": str(exc.nearest_other_id)}
     return {"stored": 1}
+
+
+def _requarantine(conn, company_id, voiceprint_id) -> dict | None:
+    """Re-judge this profile's samples against each other after one was added. Never raises.
+
+    `requarantine_profile` was written and tested in #912 and then called from nowhere, so a
+    profile kept every sample it was ever given. On TEST (2026-10-13) the one Ben Lin profile
+    held 11 samples of which 4 did not sound like him at all: three from another voice in the
+    10-01 13:2x session (0.71 with each other, ~0 with Ben) and one 10-09 window equidistant
+    from everybody. Matching scores against the MEAN of the samples, so those four pulled
+    every one of Ben's turns from ~0.55 down to ~0.30 -- below every floor -- and the matcher
+    named nobody for two weeks while each run logged a normal-looking line.
+
+    In a SAVEPOINT, because the enrolment is the act the user performed: a failure here must
+    not roll back the sample, the names, or the attempt record written beside it.
+    """
+    try:
+        with conn.transaction():
+            out = requarantine_profile(conn, company_id, voiceprint_id)
+        if out.get("quarantined"):
+            logger.info("quarantine after store: %s", out)
+        return out
+    except Exception:
+        logger.exception("quarantine after store failed for %s; the sample stands",
+                         voiceprint_id)
+        return None
+
+
+def _propose_where_else_this_voice_was_heard(conn, company_id, voiceprint_id) -> int:
+    """This person now has a vector. Ask where else that voice appears. Never raises.
+
+    CALLED FROM `_propagation`, NOT from `_enrol`. That is not a style choice: **nothing in
+    this repository sends `op="enrol"`.** Its only mentions are two doc comments, and the
+    real enrolment happens inside the propagation payload's `enrol` sub-object. Wiring this
+    into `_enrol` -- the obvious place, and where it was written first -- puts it in a
+    function production never calls, so it would have shipped completely inert with every
+    test green. The seam census caught it by refusing a new unread return key.
+
+    And not at the moment of the rename either, because at that moment there is nothing to
+    compare with: `speaker_corrections` creates the profile and queues the audio, and the
+    vector does not exist until this function's caller has just stored it. A candidate
+    search run any earlier scores against an empty sample set and finds nothing, which is
+    indistinguishable from "this voice appears nowhere else".
+
+    WHY IT MATTERS MORE THAN IT LOOKS. A company cannot get a calibrated rejection floor --
+    and therefore cannot get a confirmed name out of the matcher at all -- until twenty
+    rows of `source='correction'` exist, and one rename produces exactly one. Everything it
+    propagates to is `correction_propagation`, which the calibration excludes. So the only
+    way a company reaches twenty in less than months is by being ASKED, five at a time.
+    This function is where the asking starts.
+
+    **It swallows everything.** The enrolment is the act the user performed and it has
+    already succeeded by the time we get here; a failure to think of follow-up questions
+    must not be reported as a failure to store their voice. The log line is the record.
+    """
+    try:
+        # Questions cluster around this company's own floor once it has one, and around
+        # the default until then -- the same boundary `decide_name` names against.
+        found = label_group_candidates.candidates_for_person(
+            conn, company_id, voiceprint_id,
+            since_hours=PROPOSAL_WINDOW_HOURS, limit=PROPOSAL_LIMIT,
+            boundary=company_floor(conn, company_id))
+        rows = found.get("candidates") or []
+        n = speaker_name_proposals.propose(conn, company_id, voiceprint_id, rows)
+        # Three numbers, because they answer three different questions and collapsing them
+        # hides the one that matters. `uncached` is how many clusters in the window could
+        # not be scored at all for want of a stored centroid -- rows written before 0065.
+        # Without it, "this voice appears nowhere else" and "most of the window has never
+        # been summarised" read identically, and only the second is somebody's to fix.
+        logger.info("proposals for %s: %d candidate(s) -> %d new question(s), "
+                    "%d cluster(s) in the window had no centroid to score",
+                    voiceprint_id, len(rows), n, found.get("uncached", 0))
+        return n
+    except Exception:
+        logger.exception("proposals for %s could not be built; the enrolment itself stands",
+                         voiceprint_id)
+        return 0
 
 
 def _profiles(event):
@@ -294,12 +446,64 @@ def _profiles(event):
     exactly one home.
     """
     company_id = _require(event, "company_id")
+    site_id, date = event.get("site_id"), event.get("date")
+    home_id, recorder_id = event.get("home_company_id"), event.get("recorder_user_id")
+    # Project-owned tenancy P5. `company_id` is the SITE's company. A request that names a
+    # DIFFERENT home company is an external recorder on this site: candidates are the site
+    # company's enrolled prints plus the recorder's own, read from their home company. A
+    # request without the fields (older producers) or with home == site is the home-site
+    # case and runs exactly as before.
+    external = bool(home_id) and str(home_id) != str(company_id)
     with get_connection() as conn:
-        rows = profiles_for_matching(conn, company_id, site_id=event.get("site_id"))
-    return {"profiles": [{"person_key": str(r["id"]),
-                          "display_name": r["display_name"],
-                          "status": r["status"],
-                          "embedding": r["embedding"]} for r in rows]}
+        own_rows = []
+        if external:
+            # The SITE company's consent gates matching on its site; the recorder's own
+            # print additionally needs their HOME company's consent. A NULL basis is
+            # "no consent recorded" -- the same strict reading enrolment applies.
+            if not voiceprint_consent_basis(conn, company_id):
+                logger.info("profiles: site company %s has no voiceprint consent basis; "
+                            "no matching on its site", company_id)
+                return {"profiles": [], "company_floor": None}
+            if voiceprint_consent_basis(conn, home_id):
+                own_rows = own_profiles_for_matching(conn, home_id, recorder_id)
+        rows = profiles_for_matching(conn, company_id, site_id=site_id)
+        own_ids = {str(r["id"]) for r in own_rows}
+        rows = rows + own_rows
+        # Read once per invocation, not once per turn: the floor is derived/materialized
+        # state (recomputed on a schedule, spec S1.3) and must not move mid-decision
+        # because one turn happened to land during a recompute.
+        floor = company_floor(conn, company_id)
+        # The roster (plan Task 3). Both `site_id` and `date` are required, or `on_roster`
+        # is left off every profile entirely -- not `False` -- because "checked, nobody on
+        # it" and "not asked for" are different facts the embedder's roster rule treats
+        # differently (voiceprint_utils.decide_with_roster: an empty/absent roster narrows
+        # nothing, exactly today's behaviour). `None` here rather than `set()` is what
+        # carries "not asked" through to the loop below.
+        on_roster_ids = None
+        if site_id and date:
+            try:
+                on_roster_ids = site_attendance.on_roster_profile_ids(
+                    conn, company_id, site_id, date,
+                    derived=ROSTER_DERIVED, lookback_days=ROSTER_LOOKBACK_DAYS)
+                logger.info("roster for site %s on %s: %d profile(s) (derived=%s)",
+                           site_id, date, len(on_roster_ids), ROSTER_DERIVED)
+            except Exception:
+                # Narrows, never blocks (spec consumer 1): a broken roster read must not
+                # stop matching, and the safe degradation is exactly the no-roster shape.
+                logger.exception("roster read failed for company %s site %s date %s; "
+                                 "matching proceeds unnarrowed", company_id, site_id, date)
+                on_roster_ids = None
+    profiles = [{"person_key": str(r["id"]),
+                "display_name": r["display_name"],
+                "status": r["status"],
+                "embedding": r["embedding"]} for r in rows]
+    reply = {"profiles": profiles, "company_floor": floor}
+    if on_roster_ids is not None:
+        for p, r in zip(profiles, rows):
+            # The recorder is on this site by construction, whatever the roster says.
+            p["on_roster"] = str(r["id"]) in on_roster_ids or str(r["id"]) in own_ids
+        reply["roster_size"] = len(on_roster_ids)
+    return reply
 
 
 def _match_names(event):
@@ -344,6 +548,73 @@ def _match_names(event):
     logger.info("match: %d names for %s (%d declined to a stronger source)",
                 written, session_base, declined)
     return {"written": written, "declined": declined, "inherited": inherited}
+
+
+def _recompute_floors(event):
+    """Rebuild every company's rejection floor from its own human-asserted corrections.
+
+    Scheduled, not triggered by a match or a correction -- the floor must not move
+    mid-decision because one turn happened to land during recomputation (spec S1.3).
+
+    **One invocation, an internal loop over every company** -- the shape ExtractionBacklog
+    Function uses (a single sweep over the whole dataset on its own schedule, with no
+    per-item fan-out), not an external loop invoking this once per company. The choice is
+    forced by the trigger: an EventBridge Schedule invokes with a fixed event (no payload
+    naming a company), so a per-company `company_id` on `event` would need something else
+    to produce one invocation per company, which nothing in this stack does and which this
+    task does not invent. `event.get("company_id")` is still honoured when present -- an
+    operator or a test recomputing a single company on demand, e.g. right after a batch
+    of corrections -- but the schedule always calls this with neither key set, so it
+    always takes the all-companies path.
+
+    **Every company's recompute is isolated in its own SAVEPOINT.** The whole loop runs
+    inside ONE `get_connection()` block, which commits on clean exit and rolls back the
+    ENTIRE connection on an uncaught exception (db/connection.py's own docstring: "a bare
+    get_connection() + close() ROLLS BACK writes"). Without a per-company savepoint, one
+    company with malformed score data raising out of `recompute_company_floor` would
+    silently discard every OTHER company's already-computed floor in the same invocation
+    too -- not just the tail of the loop -- because the exception would propagate past the
+    `with get_connection()` block and roll back the whole thing. `with conn.transaction():`
+    around each call opens a SAVEPOINT (the same pattern already used in
+    `repositories/topics.py::add_topic_photo_if_absent` and `lambda_finalize_claim.py`'s
+    group sweep): an exception there rolls back only that company's writes and leaves the
+    connection itself usable for the next iteration, so the outer `with get_connection()`
+    still exits cleanly and commits everyone else's floor.
+    """
+    single = event.get("company_id")
+    with get_connection() as conn:
+        companies = [{"id": single}] if single else list_companies(conn)
+        results = []
+        failed = 0
+        for c in companies:
+            try:
+                with conn.transaction():
+                    result = recompute_company_floor(conn, c["id"])
+            except Exception:
+                failed += 1
+                # Not re-raised: one poisoned company must not cost every other
+                # company's floor. Loud rather than silent -- a company stuck failing
+                # every 6 hours is otherwise indistinguishable from one that simply
+                # never crossed the minimum sample count, and both currently produce
+                # the same "no floor" result with no alarm attached to either.
+                logger.exception(
+                    "floor recompute failed for company %s -- its floor is left "
+                    "unchanged and the sweep continues with the next company", c["id"])
+                results.append({"company_id": str(c["id"]), "floor": None, "error": True})
+                continue
+            # str() the id before it enters the response: psycopg hands back
+            # uuid.UUID for a uuid column, and the Lambda runtime marshals this
+            # return value with json.dumps, which cannot serialise one. The unit
+            # fakes pass string ids, so the whole suite stayed green while the
+            # deployed function raised Runtime.MarshalError on every real run.
+            row = result or {"company_id": c["id"], "floor": None}
+            row["company_id"] = str(row["company_id"])
+            results.append(row)
+    written = sum(1 for r in results if r.get("floor") is not None)
+    logger.info("floor recompute: %d/%d compan%s now have a floor (%d failed)",
+                written, len(results), "y" if len(results) == 1 else "ies", failed)
+    return {"companies": len(results), "floors_written": written, "failed": failed,
+            "results": results}
 
 
 def _inherit_labels(conn, company_id, session_base, label_map):
@@ -430,5 +701,7 @@ def lambda_handler(event, context):
         return _profiles(event)
     if op == "match_names":
         return _match_names(event)
-    raise ValueError(f"unknown op {op!r} — expected 'propagation', 'enrol', 'profiles' or "
-                     f"'match_names'")
+    if op == "recompute_floors":
+        return _recompute_floors(event)
+    raise ValueError(f"unknown op {op!r} — expected 'propagation', 'enrol', 'profiles', "
+                     f"'match_names' or 'recompute_floors'")

@@ -1,0 +1,100 @@
+-- 0059's index (idx_report_chunks_tsv, to_tsvector('english', chunk_text)) is
+-- REPLACED here, not extended, because two independent causes made the
+-- keyword arm it backs almost never fire, both MEASURED by the controller on
+-- a real PostgreSQL 16.2 (2026-09-22, "the keyword arm can actually fire"):
+--
+-- Cause A (fixed in build_search_sql()/lambda_rag_search.py, not here): the
+-- keyword arm bound the caller's WHOLE QUESTION as one websearch_to_tsquery
+-- input, which turns it into an AND of every non-stopword term --
+--   websearch_to_tsquery('english', 'when was the PS4 requested? and why?')
+--     -> 'ps4' & 'request'
+-- -- so a natural-language question essentially never matched.
+--
+-- Cause B (fixed by THIS migration): 'english' hands one lexeme per
+-- whitespace-delimited word, and an identifier touching punctuation is one
+-- word --
+--   to_tsvector('english', 'pricing and PS4/light pole issues')
+--     -> 'issu' 'pole' 'price' 'ps4/light'
+-- -- so even a bare, correctly-OR'd `PS4` query does NOT match it. The
+-- owner's real data has exactly this shape ("PS4/light pole issues"), so the
+-- motivating case failed on Cause B even after Cause A is fixed.
+--
+-- THE FIX: index the 'english' vector (today's behavior, unchanged) OR'd
+-- with a 'simple' vector over the SAME text with every run of non-alnum
+-- characters collapsed to a single space --
+--   to_tsvector('english', chunk_text)
+--     || to_tsvector('simple', regexp_replace(chunk_text, '[^a-zA-Z0-9]+', ' ', 'g'))
+-- -- 'simple' does not stem, so identifiers stay literal, and the
+-- regexp_replace breaks 'PS4/light' into 'PS4' and 'light' as two separate
+-- simple-config lexemes, restoring the word boundary punctuation destroyed.
+--
+-- Measured against this exact expression, query side
+-- websearch_to_tsquery('simple', <term>) (see build_search_sql() and
+-- test_literal_token_search_sql.py for the executed proof, not just this
+-- comment):
+--   PS4    finds  "pricing and PS4/light pole issues"     -> TRUE
+--   PS4    vs a PS40 document                             -> FALSE
+--   PS40   vs a PS4 document                               -> FALSE
+--   1042   finds  "RFI-1042 raised today"                  -> TRUE
+--   1042   vs "RFI-1043 raised today"                      -> FALSE
+--   RFI-1042 (exact) still finds "RFI-1042 raised today"   -> TRUE
+--
+-- COST, in real terms, not a guessed number: the combined vector carries BOTH
+-- the stemmed/stopword-stripped 'english' lexemes and the literal, stopword-
+-- KEPT 'simple' ones, so every distinct word roughly doubles its posting
+-- count. Measured on the "pricing and PS4/light pole issues" fixture:
+--   to_tsvector('english', chunk_text) alone -> 4 distinct lexemes
+--     ('issu' 'pole' 'price' 'ps4/light')
+--   the combined expression -> 9 distinct lexemes
+--     ('and' 'issu' 'issues' 'light' 'pole' 'price' 'pricing' 'ps4' 'ps4/light')
+-- more than double on this fixture, because 'simple' also keeps stopwords
+-- ('and') that 'english' discards -- so the GIN index's entry count, and its
+-- on-disk size, should be expected to more than double, not just double.
+-- Not yet measured against report_chunks' real prod row count -- there is no
+-- read-only path in this repo to size that table before shipping (the same
+-- limitation 0059's own header documents).
+--
+-- CREATE INDEX (no CONCURRENTLY), same reasoning as 0059: this repo's
+-- migration runner (src/db/migrate.py:46, apply_migrations) wraps every file
+-- in conn.transaction(), and CREATE INDEX CONCURRENTLY cannot run inside a
+-- transaction block, migration-runner or otherwise. A plain CREATE INDEX
+-- takes a SHARE lock (blocks writes, not reads) while it builds -- given the
+-- index is now roughly twice the lexeme volume of 0059's, this build is
+-- correspondingly more expensive to run inline. If that lock proves too
+-- costly on prod's real table size, build the index CONCURRENTLY manually
+-- first (outside this runner, in autocommit mode, exactly as a normal
+-- non-migration psql session): once a same-named index already exists,
+-- IF NOT EXISTS below makes this file's own CREATE INDEX a no-op against it,
+-- and schema_migrations still records 0061 as applied.
+--
+-- New name (idx_report_chunks_tsv_multi_config), not a redefinition of
+-- idx_report_chunks_tsv: Postgres has no ALTER INDEX ... SET EXPRESSION, so
+-- changing an expression index means create-the-new / drop-the-old, and
+-- giving it a new name makes that visible in \d report_chunks and in any
+-- EXPLAIN plan rather than silently swapping what an unchanged-looking name
+-- points at.
+--
+-- build_search_sql() (repositories/search_sql.py) MUST repeat this exact
+-- expression, character for character (modulo the "c." alias), for the
+-- planner to use this index rather than a sequential scan --
+-- test_keyword_arm_expression_matches_the_index_exactly (unit) and
+-- test_the_gin_expression_index_is_actually_used_by_the_planner (integration,
+-- against a real Postgres) both pin this, reading this file's own text so a
+-- future edit to either side that breaks the match fails a test immediately.
+-- The parenthesized expression below is kept on ONE line deliberately: the
+-- expression-match tests extract it verbatim (modulo the "c." alias) from
+-- this file's raw text and assert it appears character-for-character inside
+-- build_search_sql()'s generated SQL. A line break here would still be
+-- logically the same expression but would fail that literal substring check
+-- against the single-line SQL string build_search_sql() produces.
+CREATE INDEX IF NOT EXISTS idx_report_chunks_tsv_multi_config
+  ON report_chunks USING gin ((to_tsvector('english', chunk_text) || to_tsvector('simple', regexp_replace(chunk_text, '[^a-zA-Z0-9]+', ' ', 'g'))));
+
+-- Dead weight: idx_report_chunks_tsv's own expression, to_tsvector('english',
+-- chunk_text) alone, no longer appears anywhere in build_search_sql()'s
+-- output after this migration's companion code change, so the planner would
+-- never choose it again -- it would only keep costing writes to maintain.
+-- IF EXISTS because prod has never applied 0059 (main is only at 0058 as of
+-- this migration; project memory), so this DROP is a no-op there and only
+-- does real work on TEST, where 0059 did apply.
+DROP INDEX IF EXISTS idx_report_chunks_tsv;

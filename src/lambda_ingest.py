@@ -24,7 +24,7 @@ Entry points (event shapes):
 Identity bridge (never invents a site -- real 2026-03-20 case: report['site']
 == 'BD Opportunity Brainstorm', not a real site). DB-driven since the Phase 1
 identity-directory consolidation (migration 0007 + org-seed enrollment) --
-no more folder/display-name-matching heuristics against user_mapping.json:
+no more folder/display-name-matching heuristics (user_mapping.json is not read here at all):
   1. report['site'] (display name) -> sites.get_company_site_by_name.
   2. miss -> resolve the REPORTING USER via users.get_by_folder_name(
      company_id, user_folder) -> their first accessible site via
@@ -63,15 +63,17 @@ from urllib.parse import unquote_plus
 
 import boto3
 
+import carry_forward_apply
 import deadline_parse
 import match_request
 import photo_binding
+import photo_rebind
 import reindex
 import agent_turn_filter
 from chunking import chunk_report, chunk_transcripts
 from db.connection import get_connection
 from repositories import (chunks, companies, memberships, recordings, redactions,
-                          sites, topics, users)
+                          sites, topic_decisions, topic_questions, topics, users)
 import batch_stitch
 import deletion_mirror
 from transcript_utils import normalize_transcript
@@ -80,9 +82,6 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
-CONFIG_KEY = os.environ.get("CONFIG_KEY", "config/user_mapping.json")
-COMPANY_NAME = os.environ.get("COMPANY_NAME", "FieldSight")
-MULTI_TENANT = os.environ.get("MULTI_TENANT_RESOLUTION", "false") == "true"
 # Authority flip (spec §6, Task 7 of the authority-flip plan): when on AND
 # extraction topics already exist for (user_folder, date), nightly report
 # ingest defers to them instead of overwriting -- see ingest_report below.
@@ -135,17 +134,59 @@ def _should_defer(conn, user_id, user_folder, date):
 
 
 def resolve_company(conn, user_folder):
-    """Owning company for a lake object. MULTI_TENANT (prod stack): the
-    identity directory routes by globally-unique folder_name; unknown folders
-    fall back to the COMPANY_NAME pin (internal). Pinned (test stack):
-    develop-code runs can never write another company's rows."""
-    if MULTI_TENANT:
-        row = users.get_by_folder_name_global(conn, user_folder)
-        if row and row["company_id"]:
-            company = companies.get_company_by_id(conn, row["company_id"])
-            if company is not None:
-                return company
-    return companies.get_company_by_name(conn, COMPANY_NAME)
+    """Owning company for a lake object, read from the identity directory:
+    the globally-unique users.folder_name -> users.company_id.
+
+    A folder no directory row claims has NO company, and None is returned
+    rather than a guess. There used to be a fallback to a company found by a
+    configured name, and a stack switch that pinned every write to it -- but
+    the name defaulted to "FieldSight", which exists in neither database, so
+    both had returned None for as long as anyone could tell. No code may find
+    a company by its name: names are renamed (spec 2026-10-03)."""
+    row = users.get_by_folder_name_global(conn, user_folder)
+    if row and row.get("company_id"):
+        return companies.get_company_by_id(conn, row["company_id"])
+    return None
+
+
+def _emit_stranded_metric(user_folder):
+    """One EMF line counting a recording stranded by an unknown folder. Printed, not
+    logged (EMF needs bare JSON). Never raises."""
+    try:
+        import time as _t
+
+        print(json.dumps({
+            "_aws": {
+                "Timestamp": int(_t.time() * 1000),
+                "CloudWatchMetrics": [{
+                    "Namespace": "FieldSight",
+                    "Dimensions": [["Stage"]],
+                    "Metrics": [{"Name": "StrandedRecording", "Unit": "Count"}],
+                }],
+            },
+            "Stage": os.environ.get("STAGE", "unknown"),
+            "StrandedRecording": 1,
+            "folder": user_folder,
+        }))
+    except Exception:
+        logger.warning("could not emit the stranded-recording metric for %s", user_folder)
+
+
+def unknown_folder_error(user_folder):
+    """The error for a lake object whose folder no directory row claims.
+    Shared with lambda_item_writer, which reuses this module by import.
+
+    It used to say "run the org seed". The seed does not fix this -- and
+    running it moved every person of every tenant into one company.
+
+    Also emits the StrandedRecording metric (alarm `${P}-recording-stranded`): the
+    recording is in S3 and will never reach Aurora until someone fixes the folder.
+    Embedded Metric Format, like lambda_transcribe._emit_failure_metric --
+    `logs:PutMetricFilter` is denied to the deploy role, EMF needs no permission."""
+    _emit_stranded_metric(user_folder)
+    return RuntimeError(
+        f"folder {user_folder!r} has no directory row; not ingesting rather "
+        "than guessing a tenant")
 
 
 REPORTS_PREFIX = "reports/"
@@ -154,7 +195,6 @@ EMBEDDINGS_KEY_RE = re.compile(r"^embeddings/([^/]+)/([^/]+)/vectors\.json$")
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 _s3_client = None
-_mapping_cache = None
 
 
 def s3():
@@ -171,16 +211,6 @@ def _list_report_pictures(user_folder, date):
     client-parameterized precisely so both paths can share it)."""
     return photo_binding.list_pictures(s3(), S3_BUCKET,
                                        f"users/{user_folder}/pictures/{date}/")
-
-
-def load_mapping() -> dict:
-    """Load + cache config/user_mapping.json for the module's lifetime
-    (warm Lambda container) -- mirrors lambda_org_seed.load_mapping."""
-    global _mapping_cache
-    if _mapping_cache is None:
-        obj = s3().get_object(Bucket=S3_BUCKET, Key=CONFIG_KEY)
-        _mapping_cache = json.loads(obj["Body"].read().decode("utf-8"))
-    return _mapping_cache
 
 
 # ----------------------------------------------------------
@@ -231,14 +261,26 @@ def resolve_site(conn, company_id, report, user_folder):
     """report['site'] direct match -> the reporting user's own site
     membership (folder_name -> user row -> their first accessible site, all
     DB lookups, no user_mapping.json name heuristic) -> None (caller skips;
-    never creates a site)."""
+    never creates a site).
+
+    `company_id` is the recorder's HOME company (project-owned tenancy P2: the
+    site, not this id, decides the company a report is filed under). The named
+    site is matched in the home company first, then among sites the recorder
+    holds a live membership on -- an external member's project belongs to
+    another company, and a name match there is only ever against sites the
+    recorder was explicitly put on. The recorder is looked up globally."""
     name = (report.get("site") or "").strip()   # tolerate stray whitespace (Fable minor 7)
+    user = users.get_by_folder_name_global(conn, user_folder)
     if name:
         site = sites.get_company_site_by_name(conn, company_id, name)
         if site:
             return site
+        if user and memberships.resolve_scope(user["global_role"]) != "ALL":
+            for sid in memberships.accessible_site_ids(conn, user["id"], user["global_role"]):
+                cand = sites.get_site(conn, sid)
+                if cand and (cand.get("name") or "").strip() == name:
+                    return cand
 
-    user = users.get_by_folder_name(conn, company_id, user_folder)
     if user and memberships.resolve_scope(user["global_role"]) != "ALL":
         # F4 (Fable review): only use this fallback for non-ALL scope
         # (field_only/worker/site_manager) users. accessible_site_ids
@@ -247,15 +289,26 @@ def resolve_site(conn, company_id, report, user_folder):
         # admin/gm has no single "home" site to attribute a report to, so
         # skip (None/caller-skips) rather than guess.
         site_ids = memberships.accessible_site_ids(conn, user["id"], user["global_role"])
-        if site_ids:
-            return sites.get_site(conn, site_ids[0])
+        cands = [c for c in (sites.get_site(conn, sid) for sid in site_ids) if c]
+        # A guess must not move a person's home-company work into another
+        # company (project-owned tenancy P3): a site of ANOTHER company (an
+        # external membership) is only a last resort, used when the recorder
+        # has no home-company site at all.
+        home = [c for c in cands if str(c.get("company_id") or company_id) == str(company_id)]
+        if home:
+            return home[0]
+        if cands:
+            return cands[0]
     return None
 
 
 def resolve_user(conn, company_id, user_folder):
-    """Direct company+folder_name lookup against the identity directory.
+    """Global folder_name lookup against the identity directory (0012 makes the
+    folder globally unique). `company_id` is accepted for call-site
+    compatibility and ignored: a recorder from another company recording onto a
+    project they were added to is still that person (project-owned tenancy P2).
     Miss -> None (nullable column; does not skip the report)."""
-    row = users.get_by_folder_name(conn, company_id, user_folder)
+    row = users.get_by_folder_name_global(conn, user_folder)
     return row["id"] if row else None
 
 
@@ -358,7 +411,7 @@ def _overlap_or_title_score(report_topic, ext_topic):
 
 
 def _match_report_topics_to_extraction(conn, site_id, user_id, date, report_topics):
-    """Best-effort seq -> extraction-topic-uuid map for one report's topics,
+    """Best-effort seq -> {"id", "source_s3_key"} map for one report's topics,
     used only on an authority-flip defer day (ingest_report below). Loads
     that day's extraction-sourced topics once, scores every (report topic,
     extraction topic) pair with a real seq (topic_id is not None) via
@@ -375,10 +428,25 @@ def _match_report_topics_to_extraction(conn, site_id, user_id, date, report_topi
     absent from the returned dict -- ingest_report's
     topic_seq_to_id.get(seq) then falls through to None, the correct/safe
     outcome (Task 1's title-search hotfix covers it), never a forced
-    second-best collision."""
+    second-best collision.
+
+    Each value carries the matched extraction topic's own `source_s3_key`
+    alongside its id (PR #972 review #1): `ingest_report` stamps it into the
+    matched report topic's `chunk_report` (chunk_type='topic') chunk as
+    `metadata.source_files`, the same shape `chunk_transcripts`'s
+    `transcript_window` chunks already carry. Without it, a topic-type chunk on a
+    defer day has NO source_files at all -- `SESSION_CHUNK_PREDICATE`'s second
+    arm can never match it, so once R21 unbinds its `topic_id` on a later
+    supersede of the matched extraction topic, `archive_chunks_for_session`
+    (the recording-delete path) can no longer find it by EITHER arm, and a
+    deleted recording's report-topic summary stays searchable -- a privacy leak.
+    The extraction topic's `source_s3_key` (`extractions/{folder}/{date}/{session
+    base}.json`) contains that exact session base as a substring, which is all
+    `SESSION_CHUNK_PREDICATE`'s `LIKE '%' || session_base || '%'` needs."""
     ext_topics = topics.list_extraction_topics_for_day(conn, site_id, user_id, date)
     if not ext_topics:
         return {}
+    ext_by_id = {str(e["id"]): e for e in ext_topics}
 
     candidates = []
     for t in report_topics:
@@ -391,14 +459,15 @@ def _match_report_topics_to_extraction(conn, site_id, user_id, date, report_topi
                 candidates.append((score, seq, str(e["id"])))
     candidates.sort(key=lambda c: c[0], reverse=True)
 
-    seq_to_id = {}
+    seq_to_ext = {}
     claimed_ext_ids = set()
     for score, seq, ext_id in candidates:
-        if seq in seq_to_id or ext_id in claimed_ext_ids:
+        if seq in seq_to_ext or ext_id in claimed_ext_ids:
             continue
-        seq_to_id[seq] = ext_id
+        seq_to_ext[seq] = {"id": ext_id,
+                           "source_s3_key": ext_by_id[ext_id].get("source_s3_key")}
         claimed_ext_ids.add(ext_id)
-    return seq_to_id
+    return seq_to_ext
 
 
 # ----------------------------------------------------------
@@ -421,7 +490,13 @@ def _map_action_items(items, report_date=None):
     `report_date` anchors the relative phrasing ("Tomorrow", "Friday"). It is
     optional so existing callers keep working, but WITHOUT it only absolute
     dates resolve -- deadline_parse refuses to fall back to the server's
-    today, which would make a recording's deadlines drift on reprocessing."""
+    today, which would make a recording's deadlines drift on reprocessing.
+
+    This dict literal is a closed key set, so `item_id` (the extractor's own
+    lineage id, spec 2026-09-30) must be listed here explicitly or it is
+    silently dropped on the way to the row insert -- the report path (no
+    item_id in its input) and the email-context path (never reads this key)
+    both pass an extra None through harmlessly."""
     out = []
     for a in items or []:
         deadline = deadline_parse.resolve_deadline(a.get("deadline"), report_date)
@@ -431,6 +506,7 @@ def _map_action_items(items, report_date=None):
             "deadline": deadline,
             "deadline_text": a.get("deadline"),
             "priority": a.get("priority"),
+            "item_id": a.get("item_id"),
         })
     return out
 
@@ -625,16 +701,13 @@ def ingest_report(date, user_folder, report_key):
     with get_connection() as conn:
         company = resolve_company(conn, user_folder)
         if company is None:
-            # Unseeded org DB would otherwise surface as an opaque
-            # 'NoneType' subscript error on every report (Fable minor 6).
-            raise RuntimeError(
-                f"org company {COMPANY_NAME!r} not found — run the org seed "
-                "(fieldsight-*-org-seed) before ingesting")
+            raise unknown_folder_error(user_folder)
         # Site attribution: the app's in-app project pick (recordings.site_id,
         # G5b) is authoritative -- lambda_item_writer already prefers it, and
         # trusting report['site'] instead let the report generator's SITE_NAME
-        # env fallback mis-stamp every user missing from user_mapping.json.
-        site = (recordings.site_for_day(conn, company["id"], user_folder, date)
+        # env fallback mis-stamp every user missing from the directory.
+        user_id = resolve_user(conn, company["id"], user_folder)
+        site = (recordings.site_for_day(conn, user_id, user_folder, date)
                 or resolve_site(conn, company["id"], report, user_folder))
         if site is None:
             reason = (f"identity bridge miss: report.site={report.get('site')!r}, "
@@ -642,19 +715,42 @@ def ingest_report(date, user_folder, report_key):
             logger.warning("%s: %s", report_key, reason)
             return {"skipped": True, "reason": reason}
 
-        user_id = resolve_user(conn, company["id"], user_folder)
+        # Project-owned tenancy P2: the SITE decides the company. `company` above
+        # is the recorder's home company (the no-site fallback); what is written
+        # below belongs to the site's company.
+        owner_company_id = site.get("company_id") or company["id"]
 
-        # Source-key idempotency: clear everything THIS report produced
-        # before re-inserting. Keyed on source_s3_key, not (site, date,
-        # user_id) — a NULL-user scope key let two same-site/same-date
-        # reports (MPI1 + MPI2, both unresolved users) delete each other,
-        # and identity fixes + rerun would duplicate (Fable review C1/I1).
+        # Track B Task 3: identifies THIS ingest pass to repositories.topics.
+        # supersede_topics_for_source[_prefix] (stamped onto the retired row's
+        # superseded_by_run). The report JSON carries its own generation timestamp
+        # (lambda_report_generator writes it to `_report_metadata.generated_at`) --
+        # that is preferred over utcnow() here because it identifies the REPORT
+        # (the artifact whose ingest is retiring these rows), which is stable across
+        # a re-ingest of the same S3 object, where an ingest-time now() would not
+        # be. Falls back to the report key itself for an older report with no
+        # metadata block.
+        run = "report:" + str(
+            (report.get("_report_metadata") or {}).get("generated_at") or report_key)
+
+        # Source-key idempotency: supersede everything THIS report produced
+        # before re-inserting (Track B Task 3 -- see lambda_item_writer's own
+        # idempotent clear for the non-destructive rationale). Keyed on
+        # source_s3_key, not (site, date, user_id) — a NULL-user scope key let
+        # two same-site/same-date reports (MPI1 + MPI2, both unresolved users)
+        # collide, and identity fixes + rerun would duplicate (Fable review C1/I1).
         extraction_prefix = f"extractions/{user_folder}/{date}/"
         defer_to_extraction = AUTHORITY_FLIP and _should_defer(
             conn, user_id, user_folder, date)
 
         chunks.delete_chunks_for_source(conn, report_key)
-        topics.delete_topics_for_source(conn, report_key)  # always: clears stale pre-flip report rows
+        # always: supersedes stale pre-flip report rows
+        #
+        # Track B final wave (Ruling R19): every supersede call below writes into
+        # `retired_topics` -- the source-key call always runs, the prefix call only off the
+        # non-flip branch -- so a tick on either kind of retired row is carried forward once,
+        # after the topic-write loop below. Same accumulator shape as
+        # lambda_item_writer.write_extraction_items' own `retired_topics`.
+        retired_topics = list(topics.supersede_topics_for_source(conn, report_key, run))
         if defer_to_extraction:
             # Authority flip (spec §6): the day's extraction topics ARE the
             # item store; the report is a document artifact only. No
@@ -667,26 +763,56 @@ def ingest_report(date, user_folder, report_key):
         else:
             # Nightly report supersedes that day's session-sourced (live
             # extraction) items — Phase 4b.
-            topics.delete_topics_for_source_prefix(conn, extraction_prefix)
+            retired_topics.extend(
+                topics.supersede_topics_for_source_prefix(conn, extraction_prefix, run))
 
-        topic_seq_to_id = {}
+        # `topic_seq_to_ext` carries the matched extraction topic's own source_s3_key
+        # alongside its id (PR #972 review #1) -- see _match_report_topics_to_extraction's
+        # docstring. `topic_seq_to_id` stays id-only for every OTHER consumer below
+        # (upsert's topic_id binds, _restamp_deleted_topics, chunk_transcripts' windows,
+        # which already carry their own source_files and need nothing from this map).
+        topic_seq_to_ext = {}
         if defer_to_extraction:
-            topic_seq_to_id = _match_report_topics_to_extraction(
+            topic_seq_to_ext = _match_report_topics_to_extraction(
                 conn, site["id"], user_id, date, report.get("topics", []))
+        topic_seq_to_id = {seq: v["id"] for seq, v in topic_seq_to_ext.items()}
 
         collected_topics = []
+        # Track B final wave (Ruling R19): every topic this pass actually WRITES (never
+        # populated on a defer day, which writes none) -- the "new" pool
+        # carry_forward_apply._carry_forward_children matches `retired_topics` against below.
+        new_topic_ids = []
         if not defer_to_extraction:
             # P4 (2026-07-23 prod-media-binding plan): list the pictures
-            # prefix ONCE (paginator, outside the loop) and time-correlate it
-            # against this report's topics with the shared matcher, so
-            # report-sourced topics carry photos exactly like extraction ones.
-            # Only this branch lists -- a defer day writes no report topics
-            # and must not spend the S3 LIST.
+            # prefix ONCE (paginator, outside the loop), so report-sourced
+            # topics carry photos exactly like extraction ones. Only this
+            # branch lists -- a defer day writes no report topics and must not
+            # spend the S3 LIST.
+            #
+            # The MATCHING left this loop on 2026-09-23. It ran here against
+            # THIS report's topics while listing the whole DAY -- the same
+            # shape that let one photo reach a topic in every session of the
+            # day on the extraction path, and on a mid-flip day where both a
+            # report and extractions exist, the two writers could bind the same
+            # photo once each. It happens once now, after the loop, over every
+            # topic the day has (photo_rebind.rebind_day_photos).
             report_topics = report.get("topics", [])
-            photos_by_topic = photo_binding.photos_for_topics(
-                _list_report_pictures(user_folder, date), report_topics)
+            report_photo_objects = _list_report_pictures(user_folder, date)
             for i, t in enumerate(report_topics):
                 mapped_action_items = _map_action_items(t.get("action_items"), date)
+                # Computed once so the jsonb kwargs below and the row-table dual-write right
+                # after them (Track B final wave, Ruling R19) can never disagree about which
+                # decisions/questions this topic carries -- same posture as
+                # lambda_item_writer's own dual-write.
+                #
+                # The report path spells decisions `key_decisions` (plain strings, what
+                # lambda_report_generator emits) and questions `open_questions` (unanswered
+                # questions carried, not folded into summary -- lambda_meeting_minutes
+                # stopped appending them to the summary text when the report gained its own
+                # section for them); the extraction schema spells them `decisions` (objects)
+                # and `questions`. One column (jsonb) and now one row table each hold both.
+                decisions = t.get("key_decisions") or t.get("decisions")
+                open_questions = t.get("open_questions") or t.get("questions")
                 row = topics.upsert_topic(
                     conn, site["id"], date, t.get("topic_title", ""),
                     user_id=user_id, source_s3_key=report_key,
@@ -694,16 +820,22 @@ def ingest_report(date, user_folder, report_key):
                     action_items=mapped_action_items,
                     safety=_map_safety(t.get("safety_flags")),
                     time_range=t.get("time_range"), participants=t.get("participants"),
-                    # Carried, not folded into summary. A meeting's unanswered
-                    # questions reach this table only through this argument now
-                    # -- lambda_meeting_minutes stopped appending them to the
-                    # summary text when the report gained its own section for
-                    # them, and without this line the Timeline loses a day's
-                    # questions entirely.
-                    open_questions=t.get("open_questions") or t.get("questions"),
-                    photos=[{"s3_key": p["key"], "caption_text": None}
-                            for p in photos_by_topic.get(i, [])],
+                    open_questions=open_questions,
+                    decisions=decisions,
+                    # NO `photos=`. topic_photos has one writer now, and it is
+                    # the day-wide rebind after this loop -- see above.
                 )
+                new_topic_ids.append(row["id"])
+                # Track B final wave (Ruling R19): the SAME row-table dual-write
+                # lambda_item_writer.write_extraction_items does right after upsert_topic --
+                # decisions/open_questions become their OWN rows (stable_id,
+                # carry_forward-matchable) alongside, not instead of, the jsonb column just
+                # written above. Both inserts drop blanks/falsy entries themselves (see their
+                # own docstrings), so this is exactly the item-writer's
+                # `t.get("decisions") or []` shape, just fed from the report's own keys.
+                topic_decisions.insert_decisions(conn, row["id"], site["id"], decisions or [])
+                topic_questions.insert_questions(
+                    conn, row["id"], site["id"], open_questions or [])
                 # None keys stay out of the map: a literal "topic_id": null
                 # topic must not adopt the unassigned transcript windows
                 # (Fable minor 1).
@@ -720,6 +852,34 @@ def ingest_report(date, user_folder, report_key):
                     "action_items": [{"text": a["text"]} for a in mapped_action_items],
                 })
 
+            # The day's photos, bound once, after this report's topics exist.
+            # Never fatal: a rebind that turned a good ingest into a failed one
+            # would be worse than a misplaced thumbnail, and the day view lists
+            # every photo regardless of binding.
+            try:
+                photo_rebind.rebind_day_photos(
+                    conn, owner_company_id, user_folder, date, report_photo_objects)
+            except Exception:  # noqa: BLE001 -- see above
+                logger.exception("day photo rebind failed for %s/%s", user_folder, date)
+
+        # Track B final wave (Ruling R19): carry a human's tick/answer/edit on a report-
+        # sourced action item, finding, decision or question across THIS report's own
+        # re-ingest. lambda_item_writer's extraction path has done this since Task 4/5; the
+        # report path superseded topics on every re-ingest (both supersede calls above)
+        # without it, so a tick on a report-sourced item was silently orphaned (final review
+        # Important #1). Same shared function, same SAVEPOINT/degrade posture (Ruling R10)
+        # and same OrphanedHumanEdits report (Ruling R5) as the extraction path --
+        # carry_forward_apply.py.
+        #
+        # Runs even under the authority flip: a defer day writes no report topics
+        # (`new_topic_ids` stays empty), so every human-touched row this pass retired from a
+        # PRIOR non-flip report reports as an orphan -- correct, since the day's authoritative
+        # item store moved to the extraction topics lambda_item_writer already carries
+        # forward on its own pass, not to a report topic this pass never wrote.
+        if retired_topics:
+            carry_forward_apply._carry_forward_children(
+                conn, [t["id"] for t in retired_topics], new_topic_ids, site["id"], report_key)
+
         # Re-hide anything just re-created under a source its owner deleted. IN THE SAME
         # TRANSACTION as the insert, so there is no window in which the resurrected rows
         # are readable.
@@ -730,11 +890,27 @@ def ingest_report(date, user_folder, report_key):
         chunks_n = 0
         for c in chunk_report(report):
             embedding = embed_from_sidecar(c["chunk_text"], vectors)
+            metadata = c["metadata"]
+            # PR #972 review #1: chunk_report's topic-type chunks carry no source_files of
+            # their own (unlike chunk_transcripts' transcript_window chunks -- see
+            # chunking._window_metadata). On a defer day this chunk's topic_id is an
+            # EXTRACTION topic (matched above), not this report_key's own row, so it can
+            # independently outlive this ingest and later be superseded by an unrelated
+            # re-extraction -- R21 then unbinds it, and with no source_files there is
+            # nothing left for archive_chunks_for_session's session_base arm to catch on a
+            # recording delete. Stamping the matched extraction topic's own source_s3_key
+            # here (contains the session base as a substring -- see
+            # _match_report_topics_to_extraction's docstring) closes that gap the same way
+            # transcript_window chunks were already closed for.
+            ext = topic_seq_to_ext.get(c["topic_seq"])
+            if ext and ext.get("source_s3_key"):
+                metadata = dict(metadata)
+                metadata["source_files"] = [ext["source_s3_key"]]
             chunks.insert_chunk(
                 conn, site["id"], date, c["chunk_type"], c["chunk_text"], embedding,
                 user_id=user_id, source_s3_key=report_key,
                 topic_id=topic_seq_to_id.get(c["topic_seq"]),
-                metadata=c["metadata"],
+                metadata=metadata,
             )
             chunks_n += 1
 

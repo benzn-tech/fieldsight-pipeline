@@ -104,6 +104,58 @@ def test_rag_called_with_mode_voice_and_transcript(monkeypatch):
     assert seen["body"]["caller_sub"] == "sub-1"
 
 
+def test_the_voice_body_carries_history_into_rag(monkeypatch):
+    # The gateway (lambda_fieldsight_api.ask_voice) already forwards a cleaned
+    # `history` list to this agent; _rag_answer cleans it again itself
+    # (ask_history._clean_voice_history), so this side only needs to pass it
+    # through unmodified -- not re-clean it.
+    seen = {}
+    monkeypatch.setattr(dashscope_utils, "stt", lambda audio, fmt="m4a": "the question")
+    monkeypatch.setattr(dashscope_utils, "tts", lambda text: b"w")
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: FakeLambdaClient())
+    monkeypatch.setenv("VOICE_AUDIT_FUNCTION", "fn")
+
+    def fake_rag(body):
+        seen["body"] = body
+        return {"answer": "a"}
+    monkeypatch.setattr(laa, "_rag_answer", fake_rag)
+
+    history = [{"question": "q", "answer": "a"}]
+    run(voice_event(history=history))
+    assert seen["body"]["history"] == history
+
+
+def test_history_absent_leaves_the_inner_body_exactly_as_before(monkeypatch):
+    # A device that sends no `history` key must produce the exact same body
+    # _rag_answer received before this task -- absent, not `[]` and not
+    # `None` sitting under a "history" key.
+    seen = {}
+    monkeypatch.setattr(dashscope_utils, "stt", lambda audio, fmt="m4a": "the question")
+    monkeypatch.setattr(dashscope_utils, "tts", lambda text: b"w")
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: FakeLambdaClient())
+    monkeypatch.setenv("VOICE_AUDIT_FUNCTION", "fn")
+
+    def fake_rag(body):
+        seen["body"] = body
+        return {"answer": "a"}
+    monkeypatch.setattr(laa, "_rag_answer", fake_rag)
+
+    run(voice_event())
+    assert "history" not in seen["body"]
+    assert set(seen["body"].keys()) == {"question", "caller_sub", "mode", "k", "tz"}
+
+
+def test_asked_survives_the_hand_built_voice_return(monkeypatch):
+    # _voice_answer's success return is hand-built from the rag result, not
+    # passed through -- so `asked` (the rewritten question, or None) has to
+    # be listed explicitly or it is silently dropped on the way back out.
+    wire(monkeypatch)
+    monkeypatch.setattr(laa, "_rag_answer",
+                        lambda body: {"answer": "a", "asked": "rewritten?"})
+    body = run(voice_event())
+    assert body["asked"] == "rewritten?"
+
+
 def test_empty_transcript_returns_error_no_tts(monkeypatch):
     def fail_tts(text):
         raise AssertionError("tts must not run on empty transcript")

@@ -133,15 +133,35 @@ def get_config():
 # User Mapping
 # ============================================================
 
+class MappingUnavailable(Exception):
+    """The device -> person mapping could not be read, or is empty.
+
+    Raised rather than answered with `{}`. The old behaviour was to fall back
+    to the device id as the person's name, which files every download under
+    `users/<device-id>/...`: a folder no directory row owns, so the media is
+    never reported on and nobody is told. A failed sweep is retried at the next
+    schedule; misfiled media is not found at all."""
+
+
+class UnmappedDevice(Exception):
+    """A device account with no person in the mapping. Its media is skipped
+    (and counted) instead of being filed under the device id."""
+
+
 def load_user_mapping(bucket):
     """
-    Load user mapping from S3: config/user_mapping.json
-    
+    Load the device -> person mapping from S3: config/user_mapping.json
+
+    This is the ONE remaining reader of that file. The published directory
+    (config/directory.json, see directory.py) is keyed by recording folder and
+    has no device ids, so it cannot answer this question.
+
     Supports BOTH formats:
       v2: {"mapping": {"Benl1": "Jarley Trainor"}}
       v3: {"mapping": {"Benl1": {"name": "Jarley Trainor", "role": "site_manager", ...}}}
-    
-    Always returns: {"Benl1": "Jarley Trainor", ...}  (device → display name string)
+
+    Returns {"Benl1": "Jarley Trainor", ...}. Raises MappingUnavailable when the
+    file is missing, unreadable or names nobody.
     """
     global _user_mapping
     if _user_mapping is not None:
@@ -149,36 +169,32 @@ def load_user_mapping(bucket):
     try:
         response = s3_client.get_object(Bucket=bucket, Key='config/user_mapping.json')
         data = json.loads(response['Body'].read().decode('utf-8'))
-        raw_mapping = data.get('mapping', {})
-        
-        # Normalize: extract name string from v3 objects
-        normalized = {}
-        for device, value in raw_mapping.items():
-            if isinstance(value, str):
-                normalized[device] = value
-            elif isinstance(value, dict):
-                normalized[device] = value.get('name', device)
-            else:
-                normalized[device] = str(value)
-        
-        _user_mapping = normalized
-        logger.info(f"Loaded user mapping: {len(normalized)} entries")
-        return _user_mapping
-    except s3_client.exceptions.NoSuchKey:
-        logger.warning("User mapping file not found, using device names as-is")
-        _user_mapping = {}
-        return _user_mapping
     except Exception as e:
-        logger.warning(f"Failed to load user mapping: {e}")
-        _user_mapping = {}
-        return _user_mapping
+        logger.error(f"User mapping unavailable, refusing to file media: {e}")
+        raise MappingUnavailable(str(e)) from e
+    raw_mapping = data.get('mapping', {}) if isinstance(data, dict) else {}
+    normalized = {}
+    for device, value in raw_mapping.items():
+        # An entry with no name is NOT mapped: the device id is not a person.
+        name = value if isinstance(value, str) else (
+            value.get('name') if isinstance(value, dict) else str(value))
+        if isinstance(name, str) and name.strip():
+            normalized[device] = name.strip()
+    if not normalized:
+        logger.error("User mapping names nobody, refusing to file media")
+        raise MappingUnavailable("config/user_mapping.json has no mapping entries")
+    _user_mapping = normalized
+    logger.info(f"Loaded user mapping: {len(normalized)} entries")
+    return _user_mapping
 
 def get_display_name(device_account, bucket):
-    """Get display name for a device account"""
+    """The person a device account belongs to. Never the device id itself."""
     if not device_account:
         return "Unknown"
     mapping = load_user_mapping(bucket)
-    return mapping.get(device_account, device_account)
+    if device_account not in mapping:
+        raise UnmappedDevice(device_account)
+    return mapping[device_account]
 
 
 # ============================================================
@@ -764,11 +780,17 @@ def process_file(file_info, stats, config):
     stats['total_found'] += 1
     ftype = file_info.get('type', 'upload')
 
-    s3_key = generate_s3_key(file_info, config['s3_bucket'])
     device = (file_info.get('sender_account') or
               file_info.get('user_name') or
               file_info.get('src_account') or 'unknown')
-    display_name = get_display_name(device, config['s3_bucket'])
+    try:
+        s3_key = generate_s3_key(file_info, config['s3_bucket'])
+        display_name = get_display_name(device, config['s3_bucket'])
+    except UnmappedDevice:
+        # Not filed under the device id: that folder belongs to nobody.
+        logger.error(f"No person mapped to device {device!r}; skipping its file")
+        stats['unmapped_device'] = stats.get('unmapped_device', 0) + 1
+        return
 
     if check_s3_exists(config['s3_bucket'], s3_key):
         stats['already_exists'] += 1
@@ -824,12 +846,18 @@ def lambda_handler(event, context):
     logger.info(f"S3 Bucket: {config['s3_bucket']}")
     logger.info(f"Time difference: {config['time_difference_ms']}ms")
 
+    # Pre-load user mapping. Unavailable means nothing can be filed: say so
+    # once and stop, without raising (an error per sweep would alarm for as
+    # long as the schedule runs, and nothing would be filed either way).
+    try:
+        load_user_mapping(config['s3_bucket'])
+    except MappingUnavailable:
+        logger.error("Orchestrator sweep skipped: device mapping unavailable")
+        return {'skipped': 'mapping unavailable'}
+
     # Login via realptt.com
     http = create_http_client()
     session_id = login(http, config['account'], config['password'])
-
-    # Pre-load user mapping
-    load_user_mapping(config['s3_bucket'])
 
     # Statistics
     stats = {
@@ -837,6 +865,7 @@ def lambda_handler(event, context):
         'already_exists': 0,
         'triggered': 0,
         'in_progress': 0,
+        'unmapped_device': 0,
         'by_type': {'video': 0, 'audio': 0, 'upload': 0},
         'by_user': {},
     }
@@ -889,6 +918,7 @@ def lambda_handler(event, context):
     logger.info(f"  Already exists:  {stats['already_exists']}")
     logger.info(f"  Downloads fired: {stats['triggered']}")
     logger.info(f"  In progress:     {stats['in_progress']}")
+    logger.info(f"  Unmapped device: {stats['unmapped_device']}")
     logger.info(f"  By type: {stats['by_type']}")
     logger.info(f"  By user:")
     for user, count in stats['by_user'].items():

@@ -56,6 +56,7 @@ import json
 import time
 import logging
 import boto3
+from lake_put import lake_put
 from urllib.parse import unquote_plus
 
 import batch_ledger
@@ -140,6 +141,9 @@ BATCH_SEAL_DEADLINE_SEC = int(os.environ.get('BATCH_SEAL_DEADLINE_SEC', '150'))
 # one of them as "the chunk" would silently drop the rest.
 TRANSCRIBE_WHOLE_CHUNK = os.environ.get('TRANSCRIBE_WHOLE_CHUNK', 'false').lower() == 'true'
 KEYTERMS_PATH = os.environ.get('KEYTERMS_PATH', 'config/custom_vocabulary_construction_nz.txt')
+# The keyterm table (asr_vocabulary): the file above merged with its active rows,
+# minus its retired ones. Unset -> the file alone.
+ASR_VOCAB_TABLE = os.environ.get('ASR_VOCAB_TABLE', '')
 
 s3 = boto3.client('s3')
 
@@ -528,7 +532,8 @@ def lambda_handler(event, context):
                 import elevenlabs_utils
                 obj = s3.get_object(Bucket=bucket, Key=key)
                 audio_bytes = obj['Body'].read()
-                keyterms = elevenlabs_utils.load_keyterms(KEYTERMS_PATH)
+                import asr_vocabulary
+                keyterms = asr_vocabulary.keyterms(KEYTERMS_PATH, ASR_VOCAB_TABLE)
                 transcript_json = elevenlabs_utils.transcribe_segment(
                     audio_bytes,
                     os.path.basename(key),
@@ -536,10 +541,12 @@ def lambda_handler(event, context):
                     keyterms=keyterms,
                 )
                 transcript_json = _embed_batch_map(bucket, key, transcript_json)
-                s3.put_object(
-                    Bucket=bucket,
-                    Key=output_key,
-                    Body=json.dumps(transcript_json),
+                lake_put(
+                    bucket,
+                    output_key,
+                    json.dumps(transcript_json),
+                    client=s3,
+                    owner_hint={"folder": display_name},
                     ContentType='application/json',
                 )
                 # Deliberately NOT writing the ledger here: write_ledger_record
@@ -595,13 +602,30 @@ def lambda_handler(event, context):
                 'error': str(e)
             })
     
-    # Summary statistics
+    # Summary statistics.
+    #
+    # EVERY STATUS A RESULT CAN CARRY HAS TO BE COUNTED HERE. `batched_pending` was
+    # not, and it is the ordinary outcome whenever batching is on — so a healthy
+    # batching run logged `{"total": 1, "started": 0, "skipped": 0, "exists": 0,
+    # "errors": 0}`, four zeros that are indistinguishable from a lambda that
+    # decided nothing at all. On 2026-09-11 that cost an hour of reading logs to
+    # establish that the pipeline was, in fact, working.
+    #
+    # `other` is the backstop and is deliberately not a list of known names: a
+    # status added later and forgotten here surfaces as a non-zero `other` instead
+    # of silently vanishing into the gap between `total` and the rest.
+    counted = ('started', 'skipped', 'exists', 'error', 'batched_pending',
+               'transcribing', 'completed')
     summary = {
         'total': len(results),
         'started': sum(1 for r in results if r.get('status') == 'started'),
         'skipped': sum(1 for r in results if r.get('status') == 'skipped'),
         'exists': sum(1 for r in results if r.get('status') == 'exists'),
         'errors': sum(1 for r in results if r.get('status') == 'error'),
+        'batched_pending': sum(1 for r in results if r.get('status') == 'batched_pending'),
+        'transcribing': sum(1 for r in results if r.get('status') == 'transcribing'),
+        'completed': sum(1 for r in results if r.get('status') == 'completed'),
+        'other': sum(1 for r in results if r.get('status') not in counted),
     }
     
     logger.info(f"Processing complete: {json.dumps(summary)}")

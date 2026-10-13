@@ -44,9 +44,38 @@ DEFAULT_MIN_TURN_S = 3.0
 # much more stable quantity, and it is still provisional until held-out material exists.
 DEFAULT_MIN_MARGIN = 0.15
 
+# How many candidate profiles `profiles_for_matching` can return before the runner-up's
+# expected closeness to the winner starts moving mostly because the pool grew, not because
+# matching got worse. Like DEFAULT_FLOOR_MIN_SAMPLES on the other side of this codebase,
+# this is the SHAPE of a fallback boundary, not a fitted number: six enrolled voices across
+# four dates cannot support fitting a scaling curve (spec S4), so below this threshold the
+# margin is exactly DEFAULT_MIN_MARGIN, unchanged.
+DEFAULT_MARGIN_SCALE_THRESHOLD = 10
+
+# How much wider the margin grows per profile once the pool exceeds the threshold. NOT
+# measured against real multi-company data -- a placeholder shape (linear, small slope)
+# that keeps the margin from becoming impossible at very large pools while explicitly
+# leaving the curve itself for whoever calibrates against live confirmed-match volume
+# across many companies, per spec S4's own refusal to invent one.
+DEFAULT_MARGIN_SCALE_STEP = 0.01
+
 # How far apart two frames of one window may be before the window is treated as holding
 # more than one voice (v2 §6). Cosine distance, i.e. 1 - similarity.
-DEFAULT_MAX_FRAME_SPREAD = 0.35
+#
+# 0.40 since 2026-09-28, from 0.35. 0.35 was measured on read speech and had no negatives
+# behind it; on the owner's real speech it refused most single-speaker windows (Ben's own
+# turns were refused three times running on prod). Measured with the prod model on:
+#   * 42 clips the owner labelled by ear: adjacent 10 s frame pairs of ONE person pass 41%
+#     at 0.35, 55% at 0.40; pairs of TWO people (6,303, across recordings) -- none at 0.40,
+#     nearest 0.417.
+#   * one meeting with two people in one room (08-27, Ben and Benny, frames labelled by
+#     voice): 12,920 cross pairs, nearest 0.448; 36 real speaker-change boundaries,
+#     nearest 0.483; same-person adjacent pairs pass 29% at 0.35, 47% at 0.40.
+# 0.40 keeps a margin under every two-voice pair seen. 0.45 would enrol more (68-72%) but
+# already admits a same-room cross pair at 0.448 -- too close for a biometric store. The
+# samples it lets in are still checked twice more: against other profiles
+# (`EnrolmentBelongsToSomebodyElse`) and against the profile's own core (quarantine).
+DEFAULT_MAX_FRAME_SPREAD = 0.40
 
 
 @dataclass
@@ -58,6 +87,16 @@ class Decision:
     name: str | None
     margin: float | None
     reason: str
+    #: The winner's own similarity -- what `best` was when this decision was made, or None
+    #: when no candidate was scored at all (too short, or nothing enrolled).
+    #:
+    #: It is on the Decision because the decision is the only place that knows which
+    #: candidate won, and because its ABSENCE had a cost: `speaker_turn_names.score` was
+    #: NULL on all 604 rows ever written, so `recompute_company_floor` could never reach
+    #: its minimum sample count and `speaker_voiceprint_company_floors` stayed empty from
+    #: the day it was created. The writer was already asking for this value
+    #: (`lambda_voiceprint_writer.py` `score=r.get("score")`); nothing produced it.
+    score: float | None = None
 
 
 # ONE definition, and it lives in the numpy-free module because the in-VPC writer imports it
@@ -77,30 +116,102 @@ def aggregate_scores(rows) -> dict:
     That is also why Phase 0's 31 of 32 is a NEAREST-PROFILE figure and not what this rule
     confirms. Aggregation has to happen before the margin means anything.
 
-    **Max, not mean.** Max is what "nearest profile" already did implicitly, and a mean
-    would dilute a genuinely matching sample against a weak one — the enrolment that fits
-    this turn is the evidence, and averaging it with an unrelated one throws that away.
+    **Mean, not max (2026-09-20).** Max was what "nearest profile" did implicitly, and it
+    protects a person's one bad enrolment sample from dragging down every future match — but
+    it is exactly the mechanism that turned pooled multi-occasion enrolment into a liability:
+    adding a site-condition sample to a profile gives max a sample most likely to spike
+    against a stranger's turn recorded in the SAME acoustic conditions, not because the
+    person is present. Measured on 2026-09-10 (nobody in the enrolment library attended):
+    pooled max put a stranger's nearest profile top of the list at +0.054/+0.055; pooled
+    mean kept the true negatives negative. The cost mean re-introduces — one bad enrolment
+    sample now always contributes its bad score, rather than only being ignored when a
+    better sample exists — is accepted deliberately: it costs a missed confirmation
+    (`tentative`, not a wrong name), the cheaper of this design's two error directions
+    (module docstring above, "a wrong confident name costs much more than a missing one").
 
     `person_key` is supplied by the caller and must be an identity, never a display name:
     two people share a first name in this data already.
     """
-    out: dict = {}
+    sums: dict = {}
+    counts: dict = {}
     for row in rows or []:
         key = row["person_key"]
         score = float(row["score"])
-        if key not in out or score > out[key]:
-            out[key] = score
-    return out
+        sums[key] = sums.get(key, 0.0) + score
+        counts[key] = counts.get(key, 0) + 1
+    return {key: sums[key] / counts[key] for key in sums}
+
+
+def effective_margin(pool_size: int, base_margin: float = DEFAULT_MIN_MARGIN,
+                     scale_threshold: int = DEFAULT_MARGIN_SCALE_THRESHOLD,
+                     scale_step: float = DEFAULT_MARGIN_SCALE_STEP) -> float:
+    """The margin `decide_name` should require, given how many candidates it was drawn from.
+
+    `profiles_for_matching` returns every consented profile for a company, unlimited — the
+    runner-up decide_name compares against is the maximum over however many rows that is,
+    so the expected gap between winner and runner-up shrinks as the pool grows for reasons
+    that have nothing to do with matching quality (docstring at `profiles_for_matching`,
+    "the size of this result, not the number of people in the room, is what the margin has
+    to survive"). Below `scale_threshold` this returns `base_margin` unchanged — every
+    company today, and every company that narrows its matching by `site_id`, stays exactly
+    where it is.
+    """
+    if pool_size <= scale_threshold:
+        return base_margin
+    return base_margin + scale_step * (pool_size - scale_threshold)
+
+
+#: Below this, no enrolled voice is close enough to offer a name at all -- used only while
+#: a company has no calibrated floor of its own. Measured 2026-09-28 on 42 clips the owner
+#: labelled by ear: across every profile the highest score of somebody who was NOT that
+#: person was 0.274, and 16 of Ben's 19 and 5 of Sam's 6 own clips scored above 0.35 (the
+#: misses were all 5 s or shorter). n is small -- 36 usable clips, 5 true strangers -- so
+#: this is a starting point, not a fitted cut, and a name above it is still only a lean.
+DEFAULT_ABSENT_FLOOR = 0.35
+
+#: With ONE enrolled person there is no runner-up, so the margin cannot speak and only the
+#: absolute score can. This is how high it must be before that one person is offered -- as
+#: a lean (`tentative`, shown with "?"), never as `confirmed`. Measured 2026-10-13 on TEST
+#: against the owner's 7-sample clean core (the profile after its 4 stray samples were set
+#: aside): his own samples scored 0.46-0.64 leave-one-out and his 10-12 turns 0.46-0.60; the
+#: voice labelled "Ivy" by hand scored 0.008, the stray samples from another voice <= 0.09,
+#: and the 2026-09-28 strangers <= 0.274. 0.45 sits ~0.18 above the highest known stranger
+#: and just below his lowest own score. n is small; a company that enrols a second person
+#: leaves this branch for the margin rule, which is the better test.
+DEFAULT_SINGLE_CANDIDATE_FLOOR = 0.45
 
 
 def decide_name(scores, duration_s: float,
                 min_turn_s: float = DEFAULT_MIN_TURN_S,
-                min_margin: float = DEFAULT_MIN_MARGIN) -> Decision:
+                min_margin: float | None = None,
+                floor: float | None = None) -> Decision:
     """Who this turn belongs to, or an honest refusal.
 
     `scores` maps a profile name to its similarity with this turn. The order of the checks
     is the point: duration first, so that no score — however emphatic — can name a turn too
-    short to carry the evidence.
+    short to carry the evidence; margin second, nearest-profile with a required gap; the
+    per-company floor last, and only as a DEMOTION.
+
+    `min_margin`, when given explicitly, overrides the pool-size-aware default entirely —
+    an explicit choice by the caller is never second-guessed by the scaling mechanism.
+    Left as `None` (the default), the margin required is `effective_margin(len(scores))`:
+    unchanged for the small pools every company runs today, wider once a company's
+    consented, non-withdrawn profile count grows past `DEFAULT_MARGIN_SCALE_THRESHOLD`.
+
+    `floor` is this company's own calibrated rejection floor (`repositories.voiceprints.
+    company_floor`), a low percentile of that company's `source='correction'` scores, or
+    `None` when the company has not calibrated one yet (spec S1.5). It never promotes: a
+    turn the margin already sent to `tentative` (or `unknown`) is untouched by this check,
+    because the floor answers "is the winner's score itself plausible", which only matters
+    once something has already tried to be a winner.
+
+    **`None` is no longer a no-op, and that is the change.** It used to mean "skip the
+    plausibility check and confirm on the margin alone", which is the configuration that
+    confirmed an unenrolled stranger at best=0.445 / margin=0.268 on 2026-09-10 — the very
+    case the floor was added to catch. A company without a floor is therefore not a company
+    where the check passes; it is one where the check has not run. `None` now caps the
+    outcome at `tentative`: the name is still offered, as a lean, which is the strongest
+    claim the evidence supports.
     """
     if duration_s is None or duration_s < min_turn_s:
         return Decision("unknown", None, None,
@@ -111,19 +222,128 @@ def decide_name(scores, duration_s: float,
 
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     best_name, best = ranked[0]
+    # Before the margin, and only without a calibrated floor. With one profile (the 1:1
+    # case -- a company that has enrolled one person) there is no runner-up, so without
+    # this every voice in the room was offered as that person with a question mark.
+    if floor is None and best < DEFAULT_ABSENT_FLOOR:
+        return Decision("unknown", None, None,
+                        f"best match {best_name} at {best:.3f} is below "
+                        f"{DEFAULT_ABSENT_FLOOR:.2f}; no enrolled voice is close enough",
+                        score=best)
     if len(ranked) == 1:
         # Nothing to be better than. Confirming here would be confirming on an absolute
-        # score, which is exactly what the overlapping distributions forbid.
+        # score, which is exactly what the overlapping distributions forbid -- so the most
+        # this branch ever gives is a lean, and only above its own, higher floor. Without
+        # that floor every voice in the room was offered as the one enrolled person; with no
+        # name at all (the previous behaviour downstream) a one-person company was never
+        # recognised, which on TEST meant two weeks of "named 0 of N turns".
+        if best < DEFAULT_SINGLE_CANDIDATE_FLOOR:
+            return Decision("unknown", None, None,
+                            f"only one enrolled profile and {best_name} scores {best:.3f}, "
+                            f"below the {DEFAULT_SINGLE_CANDIDATE_FLOOR:.2f} a single "
+                            f"candidate needs with no runner-up to beat", score=best)
         return Decision("tentative", best_name, None,
-                        "only one enrolled profile, so there is no runner-up to beat")
+                        f"only one enrolled profile, so there is no runner-up to beat; "
+                        f"{best:.3f} clears the {DEFAULT_SINGLE_CANDIDATE_FLOOR:.2f} "
+                        f"single-candidate floor, offered as a lean", score=best)
 
+    required_margin = min_margin if min_margin is not None else effective_margin(len(scores))
     margin = best - ranked[1][1]
-    if margin >= min_margin:
-        return Decision("confirmed", best_name, margin,
-                        f"clear of the runner-up by {margin:.3f}")
-    return Decision("tentative", best_name, margin,
-                    f"only {margin:.3f} clear of {ranked[1][0]}; below the {min_margin} "
-                    f"margin this is a lean, not an identification")
+    if margin < required_margin:
+        return Decision("tentative", best_name, margin,
+                        f"only {margin:.3f} clear of {ranked[1][0]}; below the "
+                        f"{required_margin:.3f} margin this is a lean, not an identification",
+                        score=best)
+
+    # The floor: a company-calibrated final check, and a DEMOTION only. A turn with no
+    # enrolled speaker present still produces a winner — the least-dissimilar profile in
+    # the list — and a wide margin over the runner-up does not mean that winner is a
+    # plausible match, only that it is less implausible than the rest (spec S1.1: measured
+    # 2026-09-10, best=0.445, margin=0.268, confirmed by margin alone).
+    if floor is not None and best < floor:
+        return Decision("tentative", best_name, margin,
+                        f"clear of the runner-up by {margin:.3f}, but {best:.3f} is below "
+                        f"this company's calibrated floor of {floor:.3f} — a wide margin "
+                        f"over weak candidates is not the same as a plausible match",
+                        score=best)
+    if floor is None:
+        # No calibrated floor yet, so nothing here can answer "is this score plausible at
+        # all" -- only "is it further from the runner-up than 0.15". Those are different
+        # questions, and the margin alone has a MEASURED failure: on 2026-09-10 a speaker
+        # who was not enrolled at all was confirmed at best=0.445, margin=0.268. The floor
+        # below exists to catch exactly that, and a company without one is a company where
+        # that case is unguarded.
+        #
+        # So the strongest honest answer while the standard is missing is "sounds like
+        # this person", which is what `tentative` means and what the viewer renders with a
+        # question mark. This invents no threshold: it declines to make a confident claim
+        # on the strength of a check that is not running.
+        #
+        # It lifts by itself. `recompute_company_floor` builds the floor from 20 of the
+        # company's OWN human corrections, so a company earns `confirmed` back by being
+        # used -- no number has to be chosen by anybody.
+        return Decision("tentative", best_name, margin,
+                        f"clear of the runner-up by {margin:.3f}, but this company has no "
+                        f"calibrated floor yet, so how plausible {best:.3f} is on its own "
+                        f"has not been checked",
+                        score=best)
+    return Decision("confirmed", best_name, margin,
+                    f"clear of the runner-up by {margin:.3f}", score=best)
+
+
+def decide_with_roster(scores, on_roster, duration_s: float,
+                       min_turn_s: float = DEFAULT_MIN_TURN_S,
+                       min_margin: float | None = None,
+                       floor: float | None = None) -> Decision:
+    """`decide_name`, narrowed by who is on site today (on-site-roster plan, Task 4,
+    spec correction 3 -- the design doc's "Review outcome" section, which supersedes the
+    document's earlier "margin computed against the subset only", explicitly named there
+    as unsafe: run over the on-roster subset ALONE, and an unsigned visitor whose voice
+    merely sits nearest an on-roster profile gets CONFIRMED as that person -- the exact
+    wrong-confident-name this whole layer exists to refuse).
+
+    `on_roster` is a set of the `scores` keys attendance puts on site today (or `None`/
+    empty for "no roster to narrow with" -- an absent or broken integration must never
+    make recognition worse than it is today, spec consumer 1). In that case this returns
+    exactly what `decide_name` alone would, the same `Decision` object fields, not merely
+    the same status -- proven by `test_no_roster_is_byte_for_byte_todays_decide_name`.
+
+    The rule, with a roster:
+
+    1. Score every profile and take the full-pool winner (`decide_name` over `scores`,
+       unchanged -- `effective_margin` still sees `len(scores)`, not the subset size).
+    2. Winner OFF the roster: the full-pool answer stands, but its status is capped at
+       `tentative`. The name is NEVER swapped for the on-roster runner-up -- capping, not
+       re-ranking, is what keeps this safe.
+    3. Winner ON the roster: re-run `decide_name` over the on-roster subset alone. This is
+       where the roster actually helps -- an absent colleague who used to be the runner-up,
+       and used to hold the margin down, is no longer in the comparison. The full turn's
+       duration and absent-floor checks, and the company floor, all run again inside that
+       second call, unchanged.
+    4. A subset of fewer than two profiles (the single-on-roster-profile case) has no
+       runner-up to decide anything from, so the full-pool result is used instead of
+       inventing a 1:1 decision the subset cannot support (`decide_name`'s own 1:1 branch
+       returns `margin=None`, which `lambda_speaker_embed._from_match_artifact` reads as
+       "no runner-up" and drops the turn entirely -- silently losing a turn a roster of one
+       was never meant to narrow away).
+    """
+    full = decide_name(scores, duration_s=duration_s, min_turn_s=min_turn_s,
+                       min_margin=min_margin, floor=floor)
+    if not on_roster:
+        return full
+    if full.name is None or full.name not in on_roster:
+        if full.status == "confirmed":
+            return Decision("tentative", full.name, full.margin,
+                            full.reason + " -- but the winner is off today's site roster",
+                            score=full.score)
+        return full
+    subset = {k: v for k, v in (scores or {}).items() if k in on_roster}
+    if len(subset) < 2:
+        # A one-person roster narrows nothing (plan correction 3): the full-pool result,
+        # runner-up and all, is used instead.
+        return full
+    return decide_name(subset, duration_s=duration_s, min_turn_s=min_turn_s,
+                       min_margin=min_margin, floor=floor)
 
 
 def window_is_homogeneous(frame_embeddings,

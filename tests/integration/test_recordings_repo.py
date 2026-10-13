@@ -95,7 +95,7 @@ def test_site_for_media_returns_in_company_tagged_site(db):
     cid, uid, sid = _seed_company_user_site(db, "A")
     _insert_recording(db, cid, uid, sid,
                       "users/Jo_Bloggs/audio/2026-07-16/Jo_Bloggs_2026-07-16_09-50-00.wav")
-    site = recordings.site_for_media(db, cid, "Jo_Bloggs", "2026-07-16", "Jo_Bloggs_2026-07-16_09-50-00")
+    site = recordings.site_for_media(db, uid, "Jo_Bloggs", "2026-07-16", "Jo_Bloggs_2026-07-16_09-50-00")
     assert site is not None and site["id"] == sid
 
 
@@ -107,12 +107,12 @@ def test_site_for_media_excludes_cross_company_and_null_and_nonmatch(db):
         "INSERT INTO recordings (company_id, user_id, site_id, kind, s3_key, client_uuid, started_at) "
         "VALUES (%s, %s, %s, 'audio', %s, 'cu-x', now())",
         (cid, uid, sidB, "users/X/audio/2026-07-16/X_2026-07-16_10-00-00.wav"))
-    assert recordings.site_for_media(db, cid, "X", "2026-07-16", "X_2026-07-16_10-00-00") is None
+    assert recordings.site_for_media(db, uid, "X", "2026-07-16", "X_2026-07-16_10-00-00") is None
     # (b) null site_id → ignored
     db.execute(
         "INSERT INTO recordings (company_id, user_id, site_id, kind, s3_key, client_uuid, started_at) "
         "VALUES (%s, %s, NULL, 'audio', %s, 'cu-y', now())",
         (cid, uid, "users/Y/audio/2026-07-16/Y_2026-07-16_11-00-00.wav"))
-    assert recordings.site_for_media(db, cid, "Y", "2026-07-16", "Y_2026-07-16_11-00-00") is None
+    assert recordings.site_for_media(db, uid, "Y", "2026-07-16", "Y_2026-07-16_11-00-00") is None
     # (c) no recording matches → None
-    assert recordings.site_for_media(db, cid, "Nobody", "2026-07-16", "Nobody_2026-07-16_12-00-00") is None
+    assert recordings.site_for_media(db, uid, "Nobody", "2026-07-16", "Nobody_2026-07-16_12-00-00") is None

@@ -38,10 +38,22 @@ still what gets displayed.
 """
 
 import due_dates
+import due_display
 
 #: The Library's section vocabulary (scripts/api/template-store.js). A kind
 #: outside this set has no renderer on the other side.
-KINDS = frozenset({"narrative", "kpi", "list", "table", "photos"})
+KINDS = frozenset({"narrative", "kpi", "list", "table", "entries", "photos"})
+
+#: `entries` is a thing, what state it is in, and one line about it:
+#: `{"title": ..., "status": ..., "note": ...}`. It exists because a table was
+#: the wrong shape for the two sections that describe observations. Four
+#: columns of prose read as a spreadsheet of paragraphs -- the report's owner
+#: called it 冗长 -- and the columns do not line up anyway, because `detail` is
+#: a sentence and `status` is a word. An entry puts the word beside the thing
+#: and the sentence under it.
+#:
+#: A table is still right for Actions: five short fields that a reader scans
+#: DOWN, comparing one row's date against another's.
 
 _PRIORITY = {"high": 0, "medium": 1, "low": 2}
 
@@ -70,6 +82,11 @@ _PLACEHOLDERS = frozenset({
 })
 
 
+def _join(*parts):
+    """The non-empty parts, separated by a middot. One line, not four."""
+    return " \u00b7 ".join([p for p in parts if p])
+
+
 def _clean(value):
     """A field's value, or "" when it is a stand-in for one."""
     text = str(value or "").strip()
@@ -92,14 +109,13 @@ def build(report):
 
     sections = [
         _summary(report),
-        _on_site(report),
         _actions(topics, report.get("report_date")),
         _open_questions(topics),
         _decisions(topics),
         _dates(report),
         _issues(report),
         _safety(report),
-        _photos(topics),
+        _photos(topics, report),
     ]
     return [s for s in sections if s]
 
@@ -111,41 +127,33 @@ def build(report):
 def _summary(report):
     """One narrative for the day.
 
-    `executive_summary` arrives as a string from some paths and a list of
-    sentences from others; both become one readable paragraph rather than
-    bullets, because this is the part somebody reads instead of the timeline
-    that used to be underneath it.
+    `executive_summary` arrives as a list of points from the extractor -- the
+    prompt demands it: "executive_summary MUST be an array of bullet strings,
+    NOT a single string" -- and as one string from older reports and the prose
+    paths. Each keeps its own shape.
+
+    A list was being joined with spaces. Measured on the real 2026-09-03 report:
+    seven separate commitments became one 90-word run-on whose only full stops
+    were inside the points, because this model does not end a bullet with
+    punctuation. Joining is not a rendering choice here, it is the loss of the
+    boundaries the model drew, and it fails silently -- the section is present,
+    full, and unreadable. A string is NOT split back into points: a sentence
+    boundary is not a point boundary, and splitting would invent structure.
     """
     value = report.get("executive_summary")
     if isinstance(value, (list, tuple)):
-        body = " ".join(str(v).strip() for v in value if str(v).strip())
-    else:
-        body = str(value or "").strip()
-    return {"title": "Summary", "kind": "narrative", "body": body}
+        items = [str(v).strip() for v in value if str(v).strip()]
+        return {"title": "Summary", "kind": "list", "items": items}
+    return {"title": "Summary", "kind": "narrative",
+            "body": str(value or "").strip()}
 
 
-def _on_site(report):
-    """What was captured. Numbers only.
-
-    `per_recording` is a list of S3 filenames and was being rendered; it is
-    plumbing and belongs nowhere near a customer.
-    """
-    rec = report.get("recording_session")
-    # A meeting's compat report has no recording_session at all, and org-api
-    # spent a whole comment removing exactly this "hard 0 on a real day".
-    if not isinstance(rec, dict) or not rec:
-        return None
-    return {
-        "title": "On Site",
-        "kind": "kpi",
-        "fields": ["recordings", "duration", "photos"],
-        "values": {
-            "recordings": rec.get("recordings", 0),
-            "duration": rec.get("total_duration_display", ""),
-            "photos": rec.get("photos", 0),
-        },
-    }
-
+# `_on_site` is gone. It restated `recording_session` -- recordings, duration,
+# photos -- which the viewer already renders as header facts, so the same three
+# numbers appeared twice on one screen and disagreed about zero. The report's
+# owner then asked for the counts to go entirely: "多少分钟。多少个字啊？多少，
+# 这些都不要了". A day is described by what was decided and what is owed, not by
+# how many files it took to record it.
 
 def _actions(topics, report_date=None):
     """Every action the day produced, once each, most-owed first."""
@@ -207,6 +215,8 @@ def _actions(topics, report_date=None):
     for row in rows:
         row.pop("_seq", None)
         row.pop("_days", None)
+        # Ranked on the words, shown as the day they name (owner, 2026-10-12).
+        row["due"] = due_display.display(row["due"], report_date) or row["due"]
     return {
         "title": "Actions",
         "kind": "table",
@@ -355,14 +365,13 @@ def _issues(report):
         if not item:
             continue
         rows.append({
-            "item": item,
+            "title": item,
             "status": _clean(entry.get("status")),
-            "detail": _clean(entry.get("details")) or _clean(entry.get("detail")),
+            "note": _clean(entry.get("details")) or _clean(entry.get("detail")),
         })
     if not rows:
         return None
-    return {"title": "Issues & Quality", "kind": "table",
-            "fields": ["item", "status", "detail"], "rows": rows}
+    return {"title": "Issues & Quality", "kind": "entries", "items": rows}
 
 
 def _safety(report):
@@ -376,37 +385,62 @@ def _safety(report):
         if isinstance(entry, str):
             text = _clean(entry)
             if text:
-                rows.append({"observation": text, "risk": "",
-                             "location": "", "action": ""})
+                rows.append({"title": text, "status": "", "note": ""})
         elif isinstance(entry, dict):
             what = _clean(entry.get("observation") or entry.get("detail"))
             if not what:
                 continue
+            note = _join(_clean(entry.get("location")),
+                         _clean(entry.get("recommended_action")
+                                or entry.get("recommended")))
             rows.append({
-                "observation": what,
-                "risk": _clean(entry.get("risk_level") or entry.get("severity")),
-                "location": _clean(entry.get("location")),
-                # THE HALF THAT SAYS WHAT TO DO. Kept as a column because it is
-                # content, not a database field: this section listed only the
+                "title": what,
+                # The risk level, in the same slot the quality status uses, so
+                # the two sections read alike -- which is what was asked for.
+                "status": _clean(entry.get("risk_level") or entry.get("severity")),
+                # WHERE IT IS AND WHAT TO DO, on one line. Both are content,
+                # not database fields: this section once listed only the
                 # observation, so a report said a digger was operating inside
-                # the exclusion zone and did not say to stop it. The prompt has
-                # always asked for `recommended_action` and every real entry
-                # carries one.
-                "action": _clean(entry.get("recommended_action")
-                                 or entry.get("recommended")),
+                # the exclusion zone and did not say to stop it.
+                "note": note,
             })
     if not rows:
         return None
-    return {"title": "Safety", "kind": "table",
-            "fields": ["observation", "risk", "location", "action"],
-            "rows": rows}
+    return {"title": "Safety", "kind": "entries", "items": rows}
 
 
-def _photos(topics):
-    items = []
+def _photos(topics, report=None):
+    """The day's photographs, as keys something can actually fetch.
+
+    `related_photos` holds BARE FILENAMES -- `lambda_ingest` and the report
+    generator both store `s3_key.rsplit("/", 1)[-1]`. A filename cannot be
+    presigned, so the viewer could only ever print the name of a photograph it
+    was standing next to, and the Word document wrote a comma-separated list of
+    them. Asked why photos are not in the report, the honest answer was that
+    nothing downstream had been given enough to find one.
+
+    The prefix is not a guess: it is the same one the generator lists to count
+    the day's photos in the first place (`users/{user}/pictures/{date}/`).
+    `name` is kept beside `key` because a reader recognises the filename and a
+    fetch needs the path.
+    """
+    report = report or {}
+    user = str(report.get("user_name") or "").strip()
+    date = str(report.get("report_date") or report.get("date") or "").strip()
+    prefix = "users/%s/pictures/%s/" % (user, date) if user and date else ""
+    items, seen = [], set()
     for topic in topics:
         for p in _as_list(topic.get("related_photos")):
-            _add(items, p if isinstance(p, str) else None)
+            if not isinstance(p, str):
+                continue
+            name = p.strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            # An entry that already carries a path is left alone: a future
+            # writer storing full keys must not get the prefix twice.
+            key = name if "/" in name else (prefix + name if prefix else "")
+            items.append({"name": name, "key": key})
     if not items:
         return None
     return {"title": "Photos", "kind": "photos", "items": items}

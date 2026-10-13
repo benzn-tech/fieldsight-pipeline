@@ -106,7 +106,9 @@ def test_the_default_did_not_move(stub_embedder, monkeypatch):
     """
     stub_embedder["vectors"] = _frames_at_distance(0.5)
     monkeypatch.setattr(se, "MAX_FRAME_SPREAD", vp.DEFAULT_MAX_FRAME_SPREAD)
-    assert vp.DEFAULT_MAX_FRAME_SPREAD == 0.35
+    # Moved once, 0.35 -> 0.40 on 2026-09-28, on measured negatives (see the constant).
+    # Pinned so the next move needs the same kind of evidence, not an edit.
+    assert vp.DEFAULT_MAX_FRAME_SPREAD == 0.40
     assert _enrol(monkeypatch)["status"] == "refused"
 
 

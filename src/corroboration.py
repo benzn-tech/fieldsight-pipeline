@@ -260,7 +260,8 @@ def _extract(question, answer, budget):
     """
     reply = client.call(
         EXTRACT_PROMPT.format(question=question, answer=answer),
-        timeout=budget, model=CHEAP_MODEL, max_tokens=1024, effort="low")
+        timeout=budget, model=CHEAP_MODEL, max_tokens=1024, effort="low",
+        caller="corroboration_extract")
     if not reply.ok:
         return None, reply.error, reply.timed_out
     parsed = _loads(reply.text)
@@ -277,7 +278,7 @@ def _search(allowed, budget):
         for a in allowed)
     return client.call(SEARCH_PROMPT.format(entities=lines),
                        timeout=budget, max_tokens=2048,
-                       web=True, effort="low")
+                       web=True, effort="low", caller="corroboration_search")
 
 
 def _reconcile(allowed, findings, budget):
@@ -286,7 +287,8 @@ def _reconcile(allowed, findings, budget):
         for a in allowed)
     reply = client.call(
         RECONCILE_PROMPT.format(claims=claims, findings=findings or "(nothing found)"),
-        timeout=budget, model=CHEAP_MODEL, max_tokens=1024, effort="low")
+        timeout=budget, model=CHEAP_MODEL, max_tokens=1024, effort="low",
+        caller="corroboration_reconcile")
     if not reply.ok:
         return None, reply.error, reply.timed_out
     parsed = _loads(reply.text)

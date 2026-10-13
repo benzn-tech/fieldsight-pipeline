@@ -15,6 +15,8 @@ It is the exact defect the child strip exists to prevent -- "it would leave an U
 citation in the S3 artifact for a reader to trust" -- on the multi-device path, where meetings
 and their findings matter most.
 """
+import json
+
 import lambda_extract_session as ex
 
 
@@ -80,3 +82,58 @@ def test_a_group_with_no_citations_is_untouched():
               "topics": [{"topic_title": "Quiet", "findings": [{"observation": "x"}]}]}
     ex.verify_evidence(result, turns=[], session_date="2026-08-12")
     assert result["topics"][0]["findings"][0] == {"observation": "x"}
+
+
+def test_a_group_write_ships_no_continues_claim(monkeypatch):
+    """The group prompt never asks for a `continues` claim (spec D7), but it shares the
+    instructions block with the solo prompt, so a model could still volunteer one. extract_group
+    -- the function that actually writes the merged artifact -- must strip it, the same way it
+    already derives safety_flags rather than trusting the model's raw output."""
+    GID = "c" * 32
+
+    class _S3:
+        def __init__(self):
+            self.puts = []
+
+        def put_object(self, Bucket=None, Key=None, Body=None, ContentType=None):
+            self.puts.append((Key, json.loads(Body)))
+
+    s3 = _S3()
+    monkeypatch.setattr(ex, "s3", lambda: s3)
+    monkeypatch.setattr(ex, "gather_session_segments",
+                        lambda b, f, d, sb: [f"transcripts/{f}/{d}/{sb}_c0.json"])
+    monkeypatch.setattr(ex, "assemble_group_turns", lambda b, kbs: (
+        [{"session_id": sb, "turns": [{"speaker": "spk_0", "text": "hello",
+                                       "abs_start_str": "10:00:00"}]}
+         for sb in sorted(kbs)],
+        ["f1.json"]))
+    group_result = {
+        "topics": [
+            {
+                "topic_title": "Concrete pour",
+                "findings": [
+                    {"observation": "Pour scheduled Monday",
+                     "continues": {"id": "F1", "starts": "Pour scheduled"}},
+                ],
+                "action_items": [
+                    {"action": "Confirm the pour",
+                     "continues": {"id": "A1", "starts": "Confirm the"}},
+                ],
+            }
+        ],
+    }
+    monkeypatch.setattr(ex.llm_utils, "call_llm",
+                        lambda *a, **k: (json.dumps(group_result), None))
+    monkeypatch.setattr(ex.llm_utils, "extract_json", lambda r: json.loads(r))
+
+    artifact = {"groupId": GID, "leadSessionId": GID,
+                "members": [{"userFolder": "Ben_UCPK", "date": "2026-08-12",
+                            "sessionBase": "sid" + GID}],
+                "mergedKey": f"extractions/Ben_UCPK/2026-08-12/grp{GID}.json"}
+    out = ex.extract_group("bkt", artifact)
+    assert out is not None
+
+    _, body = s3.puts[0]
+    topic = body["topics"][0]
+    assert "continues" not in topic["findings"][0]
+    assert "continues" not in topic["action_items"][0]
