@@ -53,8 +53,10 @@ import boto3
 from lake_put import lake_put
 
 import dashscope_utils
+import index_request
 import lambda_ingest
 import reindex
+import session_index
 import text_normalize
 from chunking import chunk_report, chunk_transcripts
 
@@ -192,6 +194,91 @@ def embed_reindex_request(key):
     return {"reindex": key, "chunks": len(chunks_out)}
 
 
+INDEX_REQUEST_RE = re.compile(r"^index_requests/[^/]+/[^/]+/[^/]+\.json$")
+
+
+def _previous_embeddings(vkey):
+    """chunk-text hash -> embedding from the vectors artifact written last time, so an
+    unchanged chunk is not embedded again. Absent (NoSuchKey / 404) is the normal first
+    run. Any other failure (a 403 reads like "absent" and has been mistaken for it
+    before) is logged and treated as empty: everything is embedded, nothing is lost."""
+    try:
+        raw = s3().get_object(Bucket=S3_BUCKET, Key=vkey)["Body"].read()
+        prev = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        code = getattr(e, "response", {}).get("Error", {}).get("Code") if hasattr(e, "response") else None
+        if code not in ("NoSuchKey", "404"):
+            logger.warning("index vectors reuse read failed for %s (%s: %s) -- embedding all chunks",
+                           vkey, code or type(e).__name__, e)
+        return {}
+    out = {}
+    for c in prev.get("chunks") or []:
+        if c.get("embedding") and c.get("chunk_text"):
+            out[_chunk_hash(c["chunk_text"])] = c["embedding"]
+    return out
+
+
+def _session_turns(request):
+    """Turns of every session the request covers, on one clock. A member whose
+    transcripts cannot be found is logged and skipped, not fatal."""
+    import lambda_extract_session as les      # heavy, builds clients at import
+    members = request.get("members") or [{
+        "user_folder": request["user_folder"],
+        "date": request["report_date"],
+        "session_base": request["session_base"],
+    }]
+    turns = []
+    for m in members:
+        keys = les.gather_session_segments(
+            S3_BUCKET, m["user_folder"], m["date"], m["session_base"])
+        if not keys:
+            logger.warning("index request %s: no transcript segments for member %s/%s/%s",
+                           request.get("extraction_key"), m["user_folder"], m["date"],
+                           m["session_base"])
+            continue
+        member_turns = les.assemble_session_turns(S3_BUCKET, keys)[0]
+        turns.extend(member_turns)
+    turns.sort(key=lambda t: t["abs_start"])
+    return turns
+
+
+def embed_index_request(key):
+    """Non-VPC worker for the session search index. Builds the chunks from the request's
+    topics plus the session's transcript turns, embeds only chunks whose text was not
+    embedded last time, and writes the vectors artifact the in-VPC apply step reads:
+    {**request, "chunks": [{**chunk, "embedding": [...]}]}."""
+    request = json.loads(s3().get_object(Bucket=S3_BUCKET, Key=key)["Body"].read().decode("utf-8"))
+    turns = _session_turns(request)
+    chunks = session_index.build_chunks(request, turns)
+
+    vkey = index_request.vectors_key(
+        request["report_date"], request["user_folder"], request["session_base"])
+    known = _previous_embeddings(vkey)
+
+    misses = {}
+    for c in chunks:
+        h = _chunk_hash(c["chunk_text"])
+        if h not in known:
+            misses.setdefault(h, c["chunk_text"])
+    if misses:
+        hashes = list(misses)
+        known = dict(known, **dict(zip(hashes, dashscope_utils.embed([misses[h] for h in hashes]))))
+
+    result = {**request, "chunks": [
+        {**c, "embedding": known[_chunk_hash(c["chunk_text"])]} for c in chunks]}
+    lake_put(
+        S3_BUCKET, vkey, json.dumps(result), client=s3(),
+        owner_hint={
+            "folder": request["user_folder"],
+            "session_base": request["session_base"],
+            "company_id": request.get("owner_company_id"),
+        },
+        ContentType="application/json",
+    )
+    logger.info("index request %s: chunks=%d embedded=%d", key, len(chunks), len(misses))
+    return {"index_request": key, "chunks": len(chunks), "embedded": len(misses)}
+
+
 def lambda_handler(event, context):
     event = event or {}
     results = []
@@ -199,6 +286,11 @@ def lambda_handler(event, context):
         key = unquote_plus(record["s3"]["object"]["key"])
         if key.endswith(".vectors.json"):
             continue                                    # apply-side input, not ours
+        if key.startswith(index_request.VECTORS_PREFIX):
+            continue                                    # our own output
+        if INDEX_REQUEST_RE.match(key):
+            results.append(embed_index_request(key))
+            continue
         if REINDEX_REQUEST_RE.match(key):
             results.append(embed_reindex_request(key))
             continue
