@@ -142,6 +142,7 @@ import nz_time
 import checklist_reports
 import pipeline_trace
 import trace_views
+import voice_session
 import reindex
 import recording_blocks
 import report_download_name
@@ -571,6 +572,13 @@ def dispatch(conn, event, method, route):
     # In-app updates. After the caller guard on purpose -- signed-in, provisioned devices only.
     if route == "/app/latest" and method == "GET":
         return get_app_latest()
+
+    # Voice-agent session token: the sub is the authorizer-verified Cognito sub, never a body field.
+    if route == "/voice/session" and method == "POST":
+        key = os.environ.get("VOICE_SESSION_SIGNING_KEY", "")
+        if not key:
+            return error("voice sessions are not configured", 503)
+        return ok(voice_session.mint(sub, key, now=int(time.time())))
 
     if route == "/me":
         if method == "GET":
