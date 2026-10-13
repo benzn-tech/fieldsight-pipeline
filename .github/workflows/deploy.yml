@@ -295,6 +295,8 @@ jobs:
               "LlmReasoningEffortPlus=${{ vars.TEST_LLM_EFFORT_PLUS || 'high' }}" \
               "LlmReasoningEffortFast=${{ vars.TEST_LLM_EFFORT_FAST || 'low' }}" \
               "EnableRerank=${{ vars.TEST_ENABLE_RERANK || 'false' }}" \
+              "RerankTimeoutSeconds=${{ vars.TEST_RERANK_TIMEOUT_SECONDS || '3' }}" \
+              "RerankCandidateK=${{ vars.TEST_RERANK_CANDIDATE_K || '32' }}" \
               $QWEN_CHAT_KEY_PARAM \
               "AskSttProvider=${{ vars.TEST_ASK_STT_PROVIDER || 'dashscope' }}" \
               "AskTtsProvider=${{ vars.TEST_ASK_TTS_PROVIDER || 'dashscope' }}" \
