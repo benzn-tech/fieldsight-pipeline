@@ -1,6 +1,6 @@
 # Voice agent on ElevenLabs — phase 2: identity, retrieval, restatement
 
-2026-10-14 · revision 2 · builds on the owner's "Voice Q&A Agent on ElevenLabs:
+2026-10-14 · revision 3 · builds on the owner's "Voice Q&A Agent on ElevenLabs:
 Integration Spec" (2026-10-13) and the shell measured on TEST (#1098 #1099 #1101
 #1105 #1106 #1107). Revision 1 was reviewed (Fable, "Revise first": three blockers);
 every finding is answered below or in §8, and every behavioural claim about
@@ -76,25 +76,32 @@ whole API for an hour. Instead:
 
 ## 3. Restatement and keep-alive — shaped by E1–E4
 
-From the moment a request is authorised, a **keep-alive loop** sends a one-space
-`delta.content` every 1 s until the answer's first token (E3). This holds the turn open
+From the moment a request is authorised until `[DONE]`, a **keep-alive loop** sends a
+one-space `delta.content` whenever no content has gone out for 1 s (E3) — through the
+answer too, because E2 kills a turn on any mid-stream gap and provider stalls happen. This holds the turn open
 through any retrieval time; it is what makes long retrieval survivable at all.
 
 The first real text is the restatement, built to be **voiced immediately** (E4):
 
-- Started in parallel with retrieval. Model `VOICE_RESTATE_MODEL` (default
+- **Off by default** (`VOICE_RESTATE_ENABLED=false`, review rev-2 #6): llama invented
+  content once in eight calls ("by a certain deadline") and no model-free guard catches
+  that. The fixed opener ships first; the model restatement is switched on only after a
+  fabrication rate is measured at n ≥ 30 **from Lambda** and found acceptable.
+- When enabled: started in parallel with retrieval. Model `VOICE_RESTATE_MODEL` (default
   `meta-llama/llama-3.1-8b-instruct`, lowest latency measured; re-measured from Lambda in
   the plan), `max_tokens` 40, `temperature` 0, **no reasoning field** — and a guard that
   a reasoning model is rejected at startup (the `gemini-3.8-flash` "Got it" failure).
 - The model writes only the middle: "you're asking about …" (≤18 words, owner's rules:
   keep standard/product/quantity words verbatim, never answer, no numbers).
 - Server assembles `"Got it, " + middle + ", let me check your site records and pull up what was said... "`.
-  The fixed tail guarantees ≥ ~120 characters for a typical question so E4 voices it at once.
+  **Length floor 141 characters** (review rev-2 #5): 141 is the shortest length E4 saw
+  voiced; ~120 is interpolated. An assembled restatement under 141 → the fixed opener.
 - **Leak guard** (model-free, review-endorsed): any digit, more than 25 words, or text
   that does not start in the asked-about form → discarded for the fallback opener.
 - **Deadline 1.8 s** from request arrival. Miss, leak or correction ("No," / "I meant")
-  → fixed opener, ≥120 characters:
-  `"Got it, let me check your site records for that. I'm pulling up what was said and recorded on site, this will only take a moment... "`
+  → fixed opener, ≥141 characters:
+  `"Got it, let me check your site records for that now. I'm pulling up what was said and recorded on site, and this will only take a moment... "`
+  The plan measures this exact string's first-audio time before relying on it.
   (voiced at ~1.0 s per E4).
 
 Expected heard time: fixed opener ≈1.0 s; model restatement ≈2–3 s. Neither risks E1,
@@ -109,13 +116,18 @@ returns instead of synthesising. It returns **one of two shapes** (review #6):
 - `{"kind": "prompt", "prompt", "asked", "rewritten", "chunk_ids", "basis", "history_turns", "llm": {"model", "reasoning", "max_tokens", "temperature"}}`
 - `{"kind": "answer", "answer", ...}` — for the three paths that already return a finished
   answer before the prompt is built: the metric route, a rag-search error, and empty
-  retrieval. Node speaks `answer` verbatim. "No records" is therefore said as Ask says it
+  retrieval. Node speaks `answer` verbatim; an **empty** `answer` (the outer `except` returns `""`
+with `error`) is spoken as the fallback line, as `_voice_answer` already does. "No records" is therefore said as Ask says it
   today, not as "couldn't reach your records".
 
 `llm` is the **resolved** request the voice path would send (review #7): resolution of
 `ASK_VOICE_MODEL` (`none` on TEST) through `llm_utils` → model, `reasoning` (e.g.
 `{effort: low}`), `max_tokens` including `REASONING_HEADROOM_TOKENS`, `temperature`.
-Node sends exactly that to OpenRouter with `stream: true`. **The luna/mimo fallback chain
+Node sends exactly that to OpenRouter with `stream: true`, with `messages` = **one
+`user` message carrying the whole prompt** (what `_call_qwen` sends) — never ElevenLabs'
+array, never an added system message. The plan extracts the request builder out of
+`_call_qwen` into one function both use, pinned by a test that the returned `llm` block
+equals what `_call_qwen` would send. **The luna/mimo fallback chain
 is not available on this streamed path**; on a provider error Node speaks the fallback
 line. Recorded as a known gap, not hidden.
 
@@ -129,15 +141,16 @@ Corrections to revision 1:
 - Voice audit: `_invoke_voice_audit` is in `_voice_answer`, not `_rag_answer`; this path
   writes no audit row in phase 2. Phase 3 (device) decides whether to add one.
 
-**Budget** (review #12): `prompt_only` accepts `deadline_s` (default 8 s) and shrinks the
-rewrite budget to fit, so a slow rewrite cannot starve embed + rag-search. Node aborts
+**Budget** (review #12): `prompt_only` accepts `deadline_s` (default 8 s), which **replaces** the
+`ASK_DEADLINE_SECONDS` base that `deadline_left` is computed from (not a third cap beside
+it), so the rewrite budget shrinks to fit so a slow rewrite cannot starve embed + rag-search. Node aborts
 its invoke at 9 s and speaks the fallback; the Python run continues to its own Timeout
 (billed, logged as `invoke_abandoned`). Keep-alive (§3) makes this budget about patience,
 not about E1.
 
 **IAM and wiring** (review #14–#15): VoiceLlmFunction gets `LambdaInvokePolicy` on
 AskAgentFunction and env `ASK_AGENT_FUNCTION`, `OPENROUTER_API_KEY` (from the existing
-`QwenChatApiKey` parameter), `OPENROUTER_BASE_URL`, `VOICE_RESTATE_MODEL`. Missing key →
+`QwenChatApiKey` parameter), `OPENROUTER_BASE_URL` (the same `QwenBaseUrl` parameter AskAgent reads, never a new literal), `VOICE_RESTATE_MODEL`. Missing key →
 the function refuses every request and logs why (fail loud, like the EL keys).
 VoiceLlmFunction becomes the second principal AskAgent trusts for `caller_sub`; it
 **verifies the token before any invoke**, and there is no code path that invokes without
@@ -145,8 +158,10 @@ a verified `sub`.
 
 History (review #10): ElevenLabs `messages` → `[{question, answer}]`. Skip `system`
 messages; drop a leading assistant message with no preceding user turn; strip from each
-assistant turn everything **through the first `"... "`** (the restatement/opener prefix)
-and all keep-alive whitespace; a turn whose answer is then empty is dropped by
+assistant turn everything **through the first `...` followed by optional whitespace**
+(the restatement/opener prefix — ElevenLabs may normalise whitespace in returned
+`messages`, review rev-2 #10) and all keep-alive whitespace; the live test logs one real
+returned assistant turn on TEST to confirm the shape; a turn whose answer is then empty is dropped by
 `_clean_voice_history` together with its question, which is acceptable and stated.
 
 ## 5. Deadlines
@@ -161,9 +176,14 @@ and all keep-alive whitespace; a turn whose answer is then empty is dropped by
 
 Fallback line: `"Sorry, I couldn't reach your site records just now. Please try again."`
 
+User-facing cost: after the opener, up to ~15 s of silence (kept alive by spaces, E3)
+can pass before the answer on a slow retrieval. Survivable, not pleasant; the per-turn
+timings make it visible.
+
 ## 6. Observability
 
-One JSON line per turn: `sub_hash` (salted SHA-256 prefix, never the sub),
+One JSON line per turn: `sub_hash` (HMAC-SHA256 of the sub keyed with the signing key,
+first 12 hex chars — one salt, defined once),
 `restatement_source` (`model`|`fixed`|`correction`), `restatement_ms`, `invoke_ms`,
 `first_answer_token_ms`, `answer_chars`, `chunk_ids`, `rewritten`, `history_turns`,
 `outcome`, `retry_suspected`. **No question or answer text** (review #5): the Ask path
@@ -182,7 +202,8 @@ the only place E1/E2 can be seen in production.
 - Node on virtual time: keep-alive cadence, the 1.8 s restatement deadline, leak guard,
   fallback on invoke/model timeout, `answer`-kind passthrough.
 - Live on TEST through the v3-style agent: the three phase-1 questions, a two-turn "it"
-  follow-up, a forged token, an expired token, an empty-records question. Each with the
+  follow-up, a forged token, an expired token, an empty-records question (whose short
+`kind: answer` text must still be voiced on stream end — not isolated by E1–E7). Each with the
   per-step timings above.
 
 ## 8. Review findings → disposition
@@ -192,3 +213,8 @@ the only place E1/E2 can be seen in production.
 7 resolved `llm` returned · 8 gate struck · 9 leak measured, audit deferred ·
 10 history rules · 11 first-content wording (E1) · 12 `deadline_s` · 13 measured (E2/E3)
 → keep-alive · 14 IAM + verify-before-invoke · 15 env, fail loud · 16 abandonment logged.
+
+Revision 3: re-review ("Ready for plan") text fixes — keep-alive through `[DONE]`,
+141-char floor, model restatement off by default, tolerant history strip, plus the
+plan-level constraints (single request builder, one `user` message, `deadline_s` replaces
+the base, shared base URL, defined `sub_hash` salt).
