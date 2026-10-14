@@ -757,6 +757,7 @@ def _announce_web_start(on_web_start):
         logger.warning("  on_web_start failed: %s", exc)
 
 
+_SENTENCE = re.compile(r"[^.!?]+[.!?]+(?=\s|$)")
 _VOICE_CITATION = re.compile(r"\s*\[\d+(?:\s*[,\-–]\s*\d+)*\]")
 
 
@@ -768,6 +769,12 @@ def _speakable_web_answer(answer, records_answer):
     cleaned = _VOICE_CITATION.sub("", answer or "").strip()
     if voice_web.speakable(cleaned):
         return cleaned
+    # Too long is the common miss (measured on TEST 2026-10-15): the first two
+    # sentences usually carry the answer and its source, so try them before
+    # giving the turn away to the records text.
+    head = " ".join(s.strip() for s in _SENTENCE.findall(cleaned)[:2])
+    if head and voice_web.speakable(head):
+        return head
     fallback = _VOICE_CITATION.sub("", records_answer or "").strip()
     if fallback and voice_web.speakable(fallback):
         return fallback
@@ -1670,6 +1677,15 @@ def _rag_answer(body, on_web_start=None):
                     route["ms"]["compose"] = int((time.monotonic() - _t_compose) * 1000)
                     _answer = _merged["answer"]
                     web["conflicts"] = _merged["conflicts"]
+                    # Voice: a failed compose would otherwise speak only the
+                    # records text, which on TEST was "the reports do not
+                    # contain ..." after the caller asked to search online
+                    # (4 of 26 web turns, 2026-10-15). The web answer is what
+                    # this route exists to give; the guard below still falls
+                    # back to the records text if it cannot be spoken.
+                    if (body.get("mode") == "voice" and not _merged.get("composed")
+                            and web.get("answer")):
+                        _answer = web["answer"]
                 if body.get("mode") == "voice":
                     _answer = _speakable_web_answer(_answer, _grounded[0])
                 return {
