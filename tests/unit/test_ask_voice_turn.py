@@ -125,12 +125,24 @@ def test_store_roundtrip(env):
     assert not avt.is_cancelled(s3, BUCKET, SUB, t)
 
 
-def test_missing_key_403_counts_as_absent(env):
+@pytest.mark.parametrize("code", ["NoSuchKey", "404", "NotFound"])
+def test_missing_key_codes_are_absent(env, code):
+    class Missing(FakeS3):
+        def get_object(self, Bucket, Key):
+            raise ClientError({"Error": {"Code": code, "Message": "x"}}, "GetObject")
+    assert avt.get_state(Missing(), BUCKET, SUB, "d" * 32) is None
+    assert avt.is_cancelled(Missing(), BUCKET, SUB, "d" * 32) is False
+
+
+@pytest.mark.parametrize("code", ["AccessDenied", "403"])
+def test_access_denied_raises(env, code):
     class Denied(FakeS3):
         def get_object(self, Bucket, Key):
-            raise ClientError({"Error": {"Code": "AccessDenied", "Message": "x"}}, "GetObject")
-    assert avt.get_state(Denied(), BUCKET, SUB, "d" * 32) is None
-    assert avt.is_cancelled(Denied(), BUCKET, SUB, "d" * 32) is False
+            raise ClientError({"Error": {"Code": code, "Message": "x"}}, "GetObject")
+    with pytest.raises(ClientError):
+        avt.get_state(Denied(), BUCKET, SUB, "d" * 32)
+    with pytest.raises(ClientError):
+        avt.is_cancelled(Denied(), BUCKET, SUB, "d" * 32)
 
 
 def test_other_s3_errors_propagate(env):
@@ -358,15 +370,19 @@ def test_worker_cancelled_before_rag(wk):
 
 def test_worker_on_web_start_puts_searching_web(wk):
     wk.web_cb = True
-    seen = []
+    seen, searching = [], []
     orig = avt.put_state
 
     def spy(s3, bucket, sub, turn, state):
         seen.append(state["status"])
+        if state["status"] == "searching_web":
+            searching.append(state)
         return orig(s3, bucket, sub, turn, state)
     wk.mp.setattr(avt, "put_state", spy)
+    avt.put_state(wk.s3, BUCKET, SUB, TURN, {"status": "pending", "created_at": 123.5})
     avt.worker_handler(event(), None)
-    assert seen == ["searching_web", "done"]
+    assert seen[1:] == ["searching_web", "done"]
+    assert searching[0]["created_at"] == 123.5
 
 
 def test_worker_cancel_during_rag_skips_tts_done_and_audit(wk):
@@ -427,6 +443,32 @@ def test_worker_rag_error_and_tts_error(wk):
     assert wk.s3.state(SUB, TURN) == {"status": "error", "error": "Speech synthesis failed"}
 
 
+def test_worker_step0_read_failure_writes_nothing(wk):
+    def boom(*a):
+        raise RuntimeError("s3 down")
+    wk.mp.setattr(avt, "get_state", boom)
+    avt.worker_handler(event(), None)
+    assert wk.s3.puts == [] and wk.rag_calls == []
+
+
+def test_restate_exception_gives_null_restatement(env):
+    def boom(q, *, web_intent, timeout_s=1.2):
+        raise RuntimeError("x")
+    env.mp.setattr(voice_restate, "restate", boom)
+    out = avt.start(start_body())
+    assert out["restatement"] is None and out["turn_id"]
+
+
+def test_missing_bucket_fails_fast(wk, caplog):
+    wk.mp.delenv("ASK_TURN_BUCKET")
+    wk.lam.calls.clear()
+    assert avt.start(start_body()) == {"error": "No answer"}
+    assert wk.lam.calls == []
+    avt.worker_handler(event(), None)
+    assert wk.rag_calls == []
+    assert "ASK_TURN_BUCKET" in caplog.text
+
+
 def test_worker_ignores_malformed_event(wk):
     avt.worker_handler({"turn_id": "../x", "caller_sub": SUB}, None)
     avt.worker_handler({"turn_id": TURN}, None)
@@ -439,7 +481,7 @@ START_FIELDS = ["stt=", "restate=", "restate_tts=", "start_total=", "restated=",
                 "web_intent=", "turn=", "sub_hash="]
 ASK_FIELDS = ["stt=", "rag=", "tts=", "total=", "clip_bytes=", "transcript_words=",
               "answer_words=", "answer_chars=", "audio_bytes=", "fmt=", "history_turns=",
-              "turn=", "web="]
+              "turn=", "web=", "sub_hash="]
 
 
 def test_logs_carry_documented_fields_and_no_text(wk, caplog):

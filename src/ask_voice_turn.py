@@ -40,7 +40,7 @@ RESTATE_TTS_TIMEOUT_S = 1.8
 # Voice must never speak citation markers such as [1] or [1, 2].
 _CITATION = re.compile(r"\s*\[\d+(?:\s*,\s*\d+)*\]")
 
-_MISSING_CODES = ("NoSuchKey", "404", "NotFound", "AccessDenied", "403")
+_MISSING_CODES = ("NoSuchKey", "404", "NotFound")
 
 _s3 = None
 _lambda = None
@@ -62,6 +62,16 @@ def _get_lambda():
 
 def _bucket():
     return os.environ.get("ASK_TURN_BUCKET", "")
+
+
+_bucket_logged = False
+
+
+def _bucket_missing():
+    global _bucket_logged
+    if not _bucket_logged:
+        _bucket_logged = True
+        logger.error("voice turn: ASK_TURN_BUCKET is not set")
 
 
 def sub_hash(caller_sub) -> str:
@@ -86,8 +96,8 @@ def cancel_key(caller_sub, turn_id) -> str:
 
 
 def _is_missing(exc) -> bool:
-    """A key that is not there. Without s3:ListBucket on the prefix S3 answers a
-    missing key with 403 AccessDenied rather than 404, so both mean "absent"."""
+    """A key that is not there. The roles hold s3:ListBucket on ask_turns/*, so a
+    missing key is NoSuchKey/404; AccessDenied/403 is a real IAM fault and raises."""
     code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
     return code in _MISSING_CODES
 
@@ -160,8 +170,11 @@ def sweep_old(s3, bucket, caller_sub, now, max_age_s=86400):
 def _restatement(question, web_intent, laa, t0):
     """(restatement dict | None, reason, restate_s, restate_tts_s). Never raises."""
     import voice_restate
-    r = voice_restate.restate(question, web_intent=web_intent,
-                              timeout_s=RESTATE_TIMEOUT_S)
+    try:
+        r = voice_restate.restate(question, web_intent=web_intent,
+                                  timeout_s=RESTATE_TIMEOUT_S)
+    except Exception:  # noqa: BLE001 - the device speaks its filler instead
+        return None, "restate_error", time.perf_counter() - t0, 0.0
     restate_s = time.perf_counter() - t0
     text = r.get("text")
     if not text:
@@ -220,6 +233,9 @@ def start(body) -> dict:
     web_intent, question = voice_web.detect_intent(transcript)
     turn_id = secrets.token_hex(16)
     s3, bucket = _get_s3(), _bucket()
+    if not bucket:
+        _bucket_missing()
+        return {"error": "No answer"}
 
     try:
         sweep_old(s3, bucket, caller_sub, time.time())
@@ -282,11 +298,22 @@ def worker_handler(event, context):
         return None
     s3, bucket = _get_s3(), _bucket()
 
+    if not bucket:
+        _bucket_missing()
+        return None
+
+    # 0. Async invoke is at-least-once: only a pending turn is worked. A failed
+    # read writes nothing -- the turn is not ours until the pending check passes.
     try:
-        # 0. Async invoke is at-least-once: only a pending turn is worked.
         state = get_state(s3, bucket, caller_sub, turn_id)
-        if not state or state.get("status") != "pending":
-            return None
+    except Exception as e:  # noqa: BLE001
+        logger.error("voice worker: state read failed turn=%s err=%s", turn_id, type(e).__name__)
+        return None
+    if not state or state.get("status") != "pending":
+        return None
+    created_at = state.get("created_at")
+
+    try:
         # 1. Cancel check.
         if is_cancelled(s3, bucket, caller_sub, turn_id):
             return None
@@ -302,7 +329,8 @@ def worker_handler(event, context):
 
         def _on_web_start():
             if not is_cancelled(s3, bucket, caller_sub, turn_id):
-                put_state(s3, bucket, caller_sub, turn_id, {"status": "searching_web"})
+                put_state(s3, bucket, caller_sub, turn_id, {"status": "searching_web",
+                                                   "created_at": created_at})
 
         # 3. RAG (+web).
         t_rag = time.perf_counter()
@@ -340,11 +368,11 @@ def worker_handler(event, context):
         logger.info(
             "voice ask: stt=%.2fs rag=%.2fs tts=%.2fs total=%.2fs "
             "clip_bytes=%d transcript_words=%d answer_words=%d answer_chars=%d "
-            "audio_bytes=%d fmt=%s history_turns=%d turn=%s web=%s",
+            "audio_bytes=%d fmt=%s history_turns=%d turn=%s web=%s sub_hash=%s",
             0.0, rag_s, tts_s, time.perf_counter() - t0, 0,
             len(transcript.split()), len(answer_text.split()), len(answer_text),
             len(audio_out), "-", len(h) if isinstance(h, list) else 0,
-            turn_id, web)
+            turn_id, web, sub_hash(caller_sub))
         if not is_cancelled(s3, bucket, caller_sub, turn_id):
             laa._invoke_voice_audit(caller_sub, transcript, answer_text)
     except Exception as e:  # noqa: BLE001
