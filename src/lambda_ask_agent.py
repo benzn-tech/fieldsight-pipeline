@@ -13,6 +13,7 @@ Environment Variables:
 """
 
 import os
+import re
 import json
 import logging
 import time
@@ -732,11 +733,49 @@ def _classify_for_route(web_answer, asked, chunks, gated, started, route):
     return cls
 
 
+def _intent_cls(chunks, skip, route):
+    """Explicit "search online" (`web_intent`): no classify, no distance-gate
+    skip. Same shape `_classify_for_route` returns. `general` when no chunk
+    passed the gate (or there are none), else `mixed` with the records useful."""
+    mixed = bool(chunks) and not skip
+    cls = {"kind": "mixed" if mixed else "general", "records_answer": mixed,
+           "source": "intent"}
+    route["ms"]["classify"] = 0
+    route["kind"] = cls["kind"]
+    route["records_answer"] = cls["records_answer"]
+    route["classify"] = cls["source"]
+    return cls
+
+
+def _announce_web_start(on_web_start):
+    """Tell the caller the slow web lookup is starting. Never raises."""
+    if on_web_start is None:
+        return
+    try:
+        on_web_start()
+    except Exception as exc:                              # noqa: BLE001
+        logger.warning("  on_web_start failed: %s", exc)
+
+
+_VOICE_CITATION = re.compile(r"\s*\[\d+(?:\s*,\s*\d+)*\]")
+
+
+def _speakable_web_answer(answer, records_answer):
+    """Voice only: a web-derived answer is read aloud, so drop [n] markers and
+    fall back to the records answer (else NO_CLEAR_ANSWER) if it is not
+    speakable. Screen mode never calls this."""
+    import voice_web
+    cleaned = _VOICE_CITATION.sub("", answer or "").strip()
+    if voice_web.speakable(cleaned):
+        return cleaned
+    return records_answer or voice_web.NO_CLEAR_ANSWER
+
+
 def _records_useful(cls, chunks):
     return bool(cls["records_answer"]) and bool(chunks)
 
 
-def _general_run(web_answer, question, cls, chunks, started, route):
+def _general_run(web_answer, question, cls, chunks, started, route, voice=False):
     """draft -> verify for a general or mixed question. Runs on a worker thread
     beside the records synthesis; writes only its own keys of `route`. Only the
     asker's own `question` goes out. Mixed (and general with useful records)
@@ -744,7 +783,8 @@ def _general_run(web_answer, question, cls, chunks, started, route):
     reserve = (web_answer.COMPOSE_RESERVE
                if cls["kind"] != "project" and _records_useful(cls, chunks) else 0.0)
     left = web_answer.HARD_STOP_SECONDS - (time.monotonic() - started)
-    gen = web_answer.general_answer(question, left - reserve, kind=cls["kind"])
+    gen = web_answer.general_answer(question, left - reserve, kind=cls["kind"],
+                                    voice=voice)
     trace = gen.pop("_trace", {})
     route["general_status"] = gen["status"]
     route["retried"] = bool(trace.get("retried"))
@@ -991,7 +1031,7 @@ def _metric_answer(caller_sub, question, metric, date_from, date_to, applied_sco
     }
 
 
-def _rag_answer(body):
+def _rag_answer(body, on_web_start=None):
     """RAG path: embed the question, invoke RAG_SEARCH_FUNCTION for grounded
     chunks (ACL-narrowed to caller_sub's accessible sites), then synthesize
     a cited markdown answer via llm_utils.call_llm. Returns a plain
@@ -1320,21 +1360,31 @@ def _rag_answer(body):
             # no-records path (spec 2026-09-15 §4.2 step 7): the web cannot know
             # that site or day, and the UI's "Ask across everything" offer
             # depends on the no-answer result.
-            if body.get("mode") != "voice" and not result.get("error") and not scoped:
+            if ((body.get("mode") != "voice" or body.get("voice_web"))
+                    and not result.get("error")
+                    and (not scoped or body.get("web_intent"))):
                 import web_answer
                 if web_answer.enabled() and question:
                     # Nothing retrieved: no classification is spent (it would
                     # judge an empty list). The general flow runs alone --
                     # "project + no records" falls back to it by design (spec D2).
                     _t_web = time.monotonic()
-                    _cls = _classify_for_route(web_answer, asked, [], False,
-                                               _started, route)
+                    if body.get("web_intent"):
+                        _cls = _intent_cls([], True, route)
+                    else:
+                        _cls = _classify_for_route(web_answer, asked, [], False,
+                                                   _started, route)
+                    _announce_web_start(on_web_start)
                     empty_web = _general_run(web_answer, question, _cls, [],
-                                             _started, route)
+                                             _started, route,
+                                             voice=body.get("mode") == "voice")
                     marks["synthesis"] = time.monotonic() - _t_web
                     if empty_web.get("answer"):
+                        _empty_answer = empty_web["answer"]
+                        if body.get("mode") == "voice":
+                            _empty_answer = _speakable_web_answer(_empty_answer, None)
                         return {
-                            "answer": empty_web["answer"],
+                            "answer": _empty_answer,
                             "citations": [],
                             "grounded": False,
                             "from_web": True,
@@ -1425,7 +1475,8 @@ def _rag_answer(body):
         # Flag off (ENABLE_WEB_ANSWER) skips the whole general flow, classify
         # included: today's records-only behaviour, one synthesis call, below.
         _cls = None
-        if (body.get("mode") != "voice" and chunks and not scoped
+        if ((body.get("mode") != "voice" or body.get("voice_web")) and chunks
+                and (not scoped or body.get("web_intent"))
                 and not pinned_topic and _web_answer_enabled()):
             import web_answer
 
@@ -1520,13 +1571,19 @@ def _rag_answer(body):
             # records synthesis only for a project/mixed question or a general
             # one whose records are useful. A gated or not-useful set pays no
             # synthesis. The records path is ~2.5 s slower for it.
-            _cls = _classify_for_route(web_answer, asked, chunks, _skip, _started, route)
+            if body.get("web_intent"):
+                _cls = _intent_cls(chunks, _skip, route)
+            else:
+                _cls = _classify_for_route(web_answer, asked, chunks, _skip, _started, route)
             _useful = _records_useful(_cls, chunks)
             _run_general = _cls["kind"] != "project" or not _useful
             _t_synthesis = time.monotonic()
+            if _run_general:
+                _announce_web_start(on_web_start)
             with ThreadPoolExecutor(max_workers=2) as _pool:
                 _fut_web = (_pool.submit(_general_run, web_answer, question, _cls,
-                                         chunks, _started, route)
+                                         chunks, _started, route,
+                                         voice=body.get("mode") == "voice")
                             if _run_general else None)
                 # DEADLINE (review F2): llm_utils' ladder is 4 x 150 s, and the
                 # `with` joins this thread, so an unbounded synthesis could hold
@@ -1595,7 +1652,8 @@ def _rag_answer(body):
                         import web_answer
                         _merged = web_answer.compose(
                             _grounded[0], web, question,
-                            web_answer.HARD_STOP_SECONDS - (time.monotonic() - _started))
+                            web_answer.HARD_STOP_SECONDS - (time.monotonic() - _started),
+                            voice=body.get("mode") == "voice")
                     except Exception as _cmp_exc:            # noqa: BLE001
                         logger.error("  Ask compose failed: %s", _cmp_exc)
                         _merged = {"answer": _grounded[0], "conflicts": [],
@@ -1603,6 +1661,8 @@ def _rag_answer(body):
                     route["ms"]["compose"] = int((time.monotonic() - _t_compose) * 1000)
                     _answer = _merged["answer"]
                     web["conflicts"] = _merged["conflicts"]
+                if body.get("mode") == "voice":
+                    _answer = _speakable_web_answer(_answer, _grounded[0])
                 return {
                     "answer": _answer,
                     "citations": _build_citations(chunks),
@@ -1619,12 +1679,15 @@ def _rag_answer(body):
                     "carries the response alone (err=%s)",
                     _grounded[1] if _grounded else "not attempted")
             _answer = web["answer"]
-            if _cls is not None and _cls["kind"] == "project" and not _useful:
+            if (_cls is not None and _cls["kind"] == "project" and not _useful
+                    and body.get("mode") != "voice"):
                 # PROJECT-FALLBACK ROUTE ONLY: a project question the records
                 # could not answer. Said by the CODE, not the model (TEST
                 # 2026-10-06: the model opened with "Project Records:
                 # Confirmed. ..."). `web.answer` stays the general answer alone.
                 _answer = (PROJECT_FALLBACK_LEAD + "\n\n" + _answer)
+            if body.get("mode") == "voice":
+                _answer = _speakable_web_answer(_answer, None)
             return {
                 "answer": _answer,
                 "citations": [],
@@ -2110,6 +2173,11 @@ def lambda_handler(event, context):
     # back out of this branch. (This is separate from the company's CDK-
     # managed production account, which runs a different template entirely
     # and never has RAG_SEARCH_FUNCTION -- see fieldsight-two-accounts.)
+    if body.get('mode') == 'voice_start':
+        # Device Ask two-phase: the turn module is loaded on this path only.
+        import ask_voice_turn
+        return ok(ask_voice_turn.start(body))
+
     if body.get('audio') and os.environ.get('RAG_SEARCH_FUNCTION'):
         # Refuse before STT is spent: _voice_answer needs a caller_sub for the ACL.
         if not body.get('caller_sub'):
