@@ -65,10 +65,12 @@ def search_chunks(conn, query_embedding, accessible_site_ids, k=5,
                   source_family=None) -> list[dict]:
     """Vector + keyword search, unioned (Task 3, 2026-09-20 spec: "a literal
     token is findable"). Every returned row now carries `lexical_hit: bool` --
-    True for a row the keyword arm found (its `distance` is NULL, never a
-    fabricated real-looking number), False for a row the vector arm found (a
-    real cosine distance). A row found by both arms is returned once, keeping
-    the vector arm's real distance (build_search_sql's DISTINCT ON).
+    True for a row only the keyword arm found, False for a row the vector arm
+    found. BOTH carry the real cosine distance to the query embedding (the
+    keyword arm used to emit NULL; a real `<=>` value is not fabricated, and
+    NULL made rankers score such rows 1.0). Use `lexical_hit`, not
+    `distance is None`, to tell the arms apart. A row found by both arms is
+    returned once, as the vector copy (build_search_sql's DISTINCT ON).
 
     `query_text` defaults to "" so every existing caller that does not pass it
     keeps working: `websearch_to_tsquery('simple', '')` returns an empty

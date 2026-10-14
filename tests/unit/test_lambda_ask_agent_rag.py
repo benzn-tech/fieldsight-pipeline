@@ -1068,3 +1068,17 @@ def test_the_verdict_and_the_gate_both_read_the_rewritten_question(monkeypatch):
     # on exactly the turn the rewrite just made answerable. Classify ran at
     # all = the gate stayed open; the project verdict means nothing went out.
     assert "sent" not in seen, "a project question must not reach the general flow"
+
+
+def test_a_far_keyword_only_row_with_a_real_distance_defeats_the_gate(monkeypatch, enable_web_answer):
+    """Keyword-only rows now carry a real (here far) distance. They join _dists,
+    but lexical_hit makes _lexical True, so routing is unchanged: the verdict
+    still runs instead of being gated to the web."""
+    c = _gate_chunk(distance=0.9, topic_title="Door Inspection")
+    c["lexical_hit"] = True
+    wire(monkeypatch, chunks=[c])
+    called = _spy_verdict(monkeypatch)
+
+    laa._rag_answer({"question": "what happened on site", "caller_sub": SUB})
+
+    assert len(called) == 1, "a lexical_hit row must keep the gate open whatever its distance"

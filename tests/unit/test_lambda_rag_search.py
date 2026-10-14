@@ -233,7 +233,7 @@ def test_default_k_is_8(wired):
     assert captured["k"] == 8
 
 
-def test_k_is_clamped_to_1_32(wired):
+def test_k_is_clamped_to_1_64(wired):
     wired.setattr(rag.sites, "list_company_sites", lambda conn, cid: [{"id": "s-1"}])
     captured = {}
 
@@ -244,7 +244,7 @@ def test_k_is_clamped_to_1_32(wired):
     wired.setattr(rag.chunks, "search_chunks", fake_search)
 
     rag.lambda_handler(make_event(k=999), None)
-    assert captured["k"] == 32
+    assert captured["k"] == 64
 
     rag.lambda_handler(make_event(k=-5), None)
     assert captured["k"] == 1

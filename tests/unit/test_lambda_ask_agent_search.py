@@ -144,10 +144,10 @@ def test_search_mode_forwards_date_range_and_k(monkeypatch):
     assert p["k"] == 25
 
 
-def test_search_mode_default_k_is_30(monkeypatch):
+def test_search_mode_default_k_is_64(monkeypatch):
     fc = wire(monkeypatch, [])
     run(ev())
-    assert fc.calls[0]["Payload"]["k"] == 30
+    assert fc.calls[0]["Payload"]["k"] == 64
 
 
 def test_ask_mode_unaffected_still_calls_claude(monkeypatch):
@@ -255,7 +255,7 @@ def test_a_lexical_only_row_survives_a_multi_chunk_topic(monkeypatch):
     one chunk per topic, so neither caught this. `_aggregate_topics` groups
     by (date, site_id, topic_id) and keeps only the best-distance ROW per
     key; if `lexical` were read off that winning row alone, a second chunk
-    of the SAME topic that only the SQL keyword arm matched (distance=None,
+    of the SAME topic that only the SQL keyword arm matched (real distance,
     lexical_hit=True) would lose the distance comparison to any vector row
     (None -> 1.0 always loses) and its lexical signal would be discarded
     with it -- reproducing this plan's own motivating bug one layer up.
@@ -265,7 +265,7 @@ def test_a_lexical_only_row_survives_a_multi_chunk_topic(monkeypatch):
                         text="unrelated site notes")
     lex_row = chunk("t-1", "2026-09-03", None, "Electrical hold-up",
                      text="Provide PS4 for light poles")
-    lex_row["distance"] = None       # placeholder from the lex CTE, not 1.0
+    lex_row["distance"] = 0.85       # real cosine distance from the lex CTE
     lex_row["lexical_hit"] = True    # SQL matched chunk_text, not the title
     wire(monkeypatch, [vector_row, lex_row])
     out = run(ev(question="PS4"))
@@ -405,7 +405,7 @@ def test_time_phrase_sends_range_and_browses(monkeypatch):
     out = run(ev(question="What did we do yesterday?", tz="Pacific/Auckland", now=NOW))
     p = fc.calls[0]["Payload"]
     assert p["date_from"] == p["date_to"] == "2026-10-12"
-    assert p["k"] == 32
+    assert p["k"] == 64
     assert out["browse"] is True
     assert out["date_range"] == {"from": "2026-10-12", "to": "2026-10-12", "source": "question"}
     assert out["count"] == 1, "browse must not apply the distance cut-off"
@@ -434,7 +434,7 @@ def test_time_phrase_with_content_resolves_range_but_does_not_browse(monkeypatch
                  tz="Pacific/Auckland", now=NOW))
     p = fc.calls[0]["Payload"]
     assert p["date_from"] == "2026-10-05" and p["date_to"] == "2026-10-11"
-    assert p["k"] == 30
+    assert p["k"] == 64
     assert "browse" not in out
     assert out["date_range"]["source"] == "question"
     assert out["count"] == 0, "the 0.55 cut-off still applies when content terms remain"
@@ -464,3 +464,27 @@ def test_chinese_time_phrase_browses(monkeypatch):
     out = run(ev(question="昨天我们做了什么", tz="Pacific/Auckland", now=NOW))
     assert fc.calls[0]["Payload"]["date_from"] == "2026-10-12"
     assert out["browse"] is True and out["count"] == 1
+
+
+def test_a_keyword_only_row_is_scored_by_its_real_distance_not_one(monkeypatch):
+    """Keyword-arm rows now carry a real cosine distance, so a close keyword-only
+    row must score by it (0.42), not the 1.0 placeholder that ranked it behind
+    dozens of weak vector rows (TEST 2026-10-14, "Level 2 Pour Booking")."""
+    weak = [chunk("t-%d" % i, "2026-10-01", 0.50, "Duplicated day %d" % i) for i in range(3)]
+    kw = chunk("t-kw", "2026-10-08", 0.42, "Pour Booking", text="Level 2 pour hold point")
+    kw["lexical_hit"] = True
+    wire(monkeypatch, weak + [kw])
+    out = run(ev(question="Level 2 pour"))
+    assert out["results"][0]["title"] == "Pour Booking"
+    assert out["results"][0]["score"] == 0.42
+
+
+def test_a_far_keyword_only_row_is_still_admitted_past_the_distance_cut(monkeypatch):
+    """A real but far distance (0.9 > _NO_LEX_MAX_DIST) must not drop a
+    lexical_hit row: admission keys on lexical_hit, not on distance is None."""
+    kw = chunk("t-kw", "2026-10-08", 0.9, "Unrelated title", text="Provide PS4")
+    kw["lexical_hit"] = True
+    plain = chunk("t-x", "2026-10-08", 0.9, "Other")
+    wire(monkeypatch, [kw, plain])
+    out = run(ev(question="PS4"))
+    assert [r["title"] for r in out["results"]] == ["Unrelated title"]

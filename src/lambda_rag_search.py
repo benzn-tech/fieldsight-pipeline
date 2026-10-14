@@ -241,7 +241,7 @@ def _search(event, context):
         k = int(event.get("k", 8))
     except (TypeError, ValueError):
         k = 8
-    k = max(1, min(k, 32))
+    k = max(1, min(k, 64))
     qv = event.get("query_embedding")
     # The keyword arm (Task 3, 2026-09-20 spec) needs the caller's raw text,
     # not just its embedding. ask-agent sends the question (or its rewrite,

@@ -270,9 +270,9 @@ def build_rag_prompt(question, chunks, mode=None, today=None, basis=None,
 # function and surfaces as "search backend failed". ask-agent is non-VPC and
 # already holds the key.
 RERANK_ENABLED = os.environ.get("ENABLE_RERANK", "false").lower() == "true"
-# Candidates fetched for the reranker to choose from. 32 is rag-search's own
-# clamp, so this needs no change there; the reranker itself measured fine at
-# 100+ and going past 32 means raising that clamp, which is a separate change.
+# Candidates fetched for the reranker to choose from. rag-search's clamp is
+# now 64 (search list only; Ask keeps 32 here), the reranker itself measured
+# fine at 100+.
 RERANK_CANDIDATES = int(os.environ.get("RERANK_CANDIDATE_K", "32"))
 # Adjacent transcript windows overlap by OVERLAP_TURNS=2 and one session's
 # windows are near-identical, so positions 6..32 of a cosine ranking are
@@ -296,7 +296,8 @@ def _diversify(chunks, cap):
 
 def _admit_one_lexical_hit(chunks, keep):
     """Truncate to `keep`, reserving exactly one slot for the strongest
-    keyword-only row (lexical_hit=True, distance=None) that arrival order
+    keyword-only row (lexical_hit=True; its distance is real, only the flag
+    marks it keyword-only) that arrival order
     would otherwise cut. Total over `keep`, including `keep<=0`: never
     returns more than `keep` rows.
 
@@ -492,16 +493,16 @@ def _aggregate_topics(chunks, question="", browse=False, family="report"):
         # above (existing; drives the Search list's own reordering) and
         # lexical_hit from build_search_sql's keyword arm (2026-09-20 spec),
         # which found a literal match in chunk_text that never reached the
-        # title. A row the SQL keyword arm found has no real cosine distance
-        # (it was never scored against the query embedding, hence the `1.0`
-        # placeholder just above) -- it MUST be admitted here via `lexical`,
-        # or _NO_LEX_MAX_DIST drops it one hop downstream of the SQL fix,
-        # reproducing the original bug with extra steps.
+        # title. Keyword-arm rows now carry their real cosine distance (the
+        # `1.0` above only covers a row with no distance at all), but a
+        # keyword hit can still be semantically far, so it MUST be admitted
+        # here via `lexical`, or _NO_LEX_MAX_DIST drops it one hop downstream
+        # of the SQL fix, reproducing the original bug with extra steps.
         row_lexical = bool(c.get("lexical_hit")) or any(t in hay for t in terms)
         # A topic long enough to be chunked more than once has multiple rows
         # sharing this key, and only the best-distance row survives as the
-        # group's representative below. A keyword-only row (distance=None ->
-        # 1.0) almost never wins that comparison against any vector row for
+        # group's representative below. A keyword-only row
+        # almost never wins that comparison against a nearer vector row for
         # the SAME topic, so if `lexical` were read off the winning row alone,
         # the keyword signal a sibling chunk found would be silently thrown
         # away -- reproducing this task's own motivating bug one layer up
@@ -581,9 +582,9 @@ def _rag_search_list(body):
     question = (body.get("question") or "").strip()
     caller_sub = body.get("caller_sub")
     try:
-        k = int(body.get("k", 30))
+        k = int(body.get("k", 64))
     except (TypeError, ValueError):
-        k = 30
+        k = 64
     date_from = body.get("date_from") or None
     date_to = body.get("date_to") or None
     site = body.get("site") or None  # project-scoped search (Search only; Ask omits)
@@ -610,7 +611,7 @@ def _rag_search_list(body):
             # rank by, so list what happened in the range instead.
             browse = search_browse.is_content_free(question)
             if browse:
-                k = 32  # rag-search's maximum
+                k = 64  # rag-search's maximum
 
     try:
         query_vec = dashscope_utils.embed([question])[0]
@@ -1044,7 +1045,7 @@ def _rag_answer(body):
     # k=5 default: fewer chunks -> shorter synthesis prompt -> faster answer.
     # The user-facing ask round-trip is capped by APIGW's 29s ceiling and the
     # e2e came in at ~24s with k=8; 5 keeps headroom without hurting recall
-    # on our corpus. rag-search clamps k to [1,32].
+    # on our corpus. rag-search clamps k to [1,64].
     k = int(body.get("k", 5))
 
     try:
@@ -1405,6 +1406,12 @@ def _rag_answer(body):
             # at call time, not at import, same reason as web_answer.enabled().
             _DISTANCE_GATE = float(os.environ.get("ASK_DISTANCE_GATE", "0.55"))
 
+            # Keyword-only rows now carry a real distance, so they count here
+            # too. Routing is unchanged on purpose: whenever any keyword-only
+            # row exists, `_lexical` below is True (it ORs in lexical_hit) and
+            # `_skip` is False regardless of min(_dists); when none exists,
+            # _dists is exactly what it was. Still filtered on `is not None`
+            # for rows that genuinely have no distance.
             _dists = [c["distance"] for c in chunks if c.get("distance") is not None]
 
             # `lexical` is NOT a field on a chunk -- `_aggregate_topics`
