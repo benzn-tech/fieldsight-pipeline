@@ -211,10 +211,18 @@ def test_a_voice_web_answer_with_a_url_is_replaced(monkeypatch):
     assert out["answer"] == voice_web.NO_CLEAR_ANSWER
 
 
-def test_a_composed_voice_answer_with_a_url_falls_back_to_the_records_answer(monkeypatch):
+def test_a_composed_voice_answer_loses_a_trailing_url_sentence(monkeypatch):
     wire(monkeypatch, kind="mixed", web={"answer": "ok"})
     monkeypatch.setattr(web_answer, "compose", lambda *a, **k: {
         "answer": "Scaffold tagged [1]. See https://x", "conflicts": [], "composed": True})
+    out = ask(mode="voice", voice_web=True)
+    assert out["answer"] == "Scaffold tagged."
+
+
+def test_a_composed_voice_answer_with_a_url_up_front_falls_back_to_the_records_answer(monkeypatch):
+    wire(monkeypatch, kind="mixed", web={"answer": "ok"})
+    monkeypatch.setattr(web_answer, "compose", lambda *a, **k: {
+        "answer": "See https://x. Scaffold tagged [1].", "conflicts": [], "composed": True})
     out = ask(mode="voice", voice_web=True)
     assert out["answer"] == "Grounded answer."
 
@@ -338,3 +346,26 @@ def test_voice_start_reaches_ask_voice_turn_not_the_old_voice_path(monkeypatch):
         {"mode": "voice_start", "audio": "AAAA", "caller_sub": "sub-1"})}, None)
     assert json.loads(resp["body"]) == {"turn_id": "t-1"}
     assert seen["body"]["mode"] == "voice_start"
+
+
+def test_a_long_voice_web_answer_is_trimmed_to_two_sentences(monkeypatch):
+    long = "Use 4 m spacing per NZS 4541. Coverage is 12 square metres. " + "More detail here. " * 30
+    wire(monkeypatch, chunks=(), web={"answer": long})
+    out = ask(mode="voice", voice_web=True)
+    assert out["answer"] == "Use 4 m spacing per NZS 4541. Coverage is 12 square metres."
+
+
+def test_a_failed_compose_in_voice_speaks_the_web_answer(monkeypatch):
+    wire(monkeypatch, kind="mixed", web={"answer": "Per NZS 3604, studs are at 600 centres."})
+    monkeypatch.setattr(web_answer, "compose", lambda *a, **k: {
+        "answer": "Grounded answer.", "conflicts": [], "composed": False})
+    out = ask(mode="voice", voice_web=True)
+    assert out["answer"] == "Per NZS 3604, studs are at 600 centres."
+
+
+def test_a_failed_compose_on_screen_keeps_the_records_answer(monkeypatch):
+    wire(monkeypatch, kind="mixed", web={"answer": "Per NZS 3604, studs are at 600 centres."})
+    monkeypatch.setattr(web_answer, "compose", lambda *a, **k: {
+        "answer": "Grounded answer.", "conflicts": [], "composed": False})
+    out = ask()
+    assert out["answer"] == "Grounded answer."
