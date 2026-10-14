@@ -2361,6 +2361,9 @@ Resources:
           ASK_TURN_BUCKET: !Ref DataBucketName
           ASK_VOICE_RESTATE: !Ref AskVoiceRestate
           VOICE_RESTATE_MODEL: 'meta-llama/llama-3.1-8b-instruct'
+          # Read by /start so the restatement only says "searching online" when
+          # the worker will actually search.
+          VOICE_WEB_ENABLED: !Ref VoiceWebEnabled
       Layers:
         - !Ref DashScopeLayer
       Policies:

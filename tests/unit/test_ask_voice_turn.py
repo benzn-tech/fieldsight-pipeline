@@ -273,6 +273,8 @@ def test_start_invokes_worker_before_restate(env):
 
 
 def test_start_web_intent(env):
+    env.mp.setenv("VOICE_WEB_ENABLED", "true")
+    env.mp.setenv("ENABLE_WEB_ANSWER", "true")
     env.mp.setattr(laa, "_stt", lambda a, f: "what is the NZS 4541 spacing, search online")
     out = avt.start(start_body())
     assert out["web_intent"] is True
@@ -525,3 +527,15 @@ def test_logs_carry_documented_fields_and_no_text(wk, caplog):
     assert "turn=%s" % out["turn_id"] in start_line
     assert "turn=%s" % TURN in ask_line and "web=False" in ask_line
     assert "sub_hash=%s" % avt.sub_hash(SUB) in start_line
+
+
+@pytest.mark.parametrize("voice_web,web_answer", [("false", "true"), ("true", "false"), ("", "")])
+def test_start_does_not_promise_a_search_it_cannot_do(env, voice_web, web_answer):
+    # "Searching online now" is spoken before the worker runs; with either flag
+    # off the worker never searches, so the restatement must not say it will.
+    env.mp.setenv("VOICE_WEB_ENABLED", voice_web)
+    env.mp.setenv("ENABLE_WEB_ANSWER", web_answer)
+    env.mp.setattr(laa, "_stt", lambda a, f: "what is the NZS 4541 spacing, search online")
+    out = avt.start(start_body())
+    assert out["web_intent"] is False
+    assert env.lam.calls[0]["payload"]["web_intent"] is False

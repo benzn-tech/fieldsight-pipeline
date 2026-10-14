@@ -186,6 +186,11 @@ def sweep_old(s3, bucket, caller_sub, now, max_age_s=86400):
 # start (runs inside AskAgent)
 # --------------------------------------------------------------------------
 
+def _voice_web_on() -> bool:
+    return (os.environ.get("VOICE_WEB_ENABLED", "") == "true"
+            and os.environ.get("ENABLE_WEB_ANSWER", "false").lower() == "true")
+
+
 def _restatement(question, web_intent, laa, t0):
     """(restatement dict | None, reason, restate_s, restate_tts_s). Never raises."""
     import voice_restate
@@ -250,6 +255,10 @@ def start(body) -> dict:
         return {"error": "Empty transcript", "transcript": ""}
 
     web_intent, question = voice_web.detect_intent(transcript)
+    # "Searching online now" is a promise; only make it when the worker can keep
+    # it. Both flags gate the web branch (web_answer.enabled() reads the second).
+    if not _voice_web_on():
+        web_intent, question = False, transcript
     turn_id = secrets.token_hex(16)
     s3, bucket = _get_s3(), _bucket()
     if not bucket:
