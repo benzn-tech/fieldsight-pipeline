@@ -47,6 +47,7 @@ OVERLAP_ACCEPTED = {
 # the plan research (lambda-timeout-tiers.md, "Sync callee chains").
 SYNC_CALLEES = [
     ("AskAgentFunction", "RagSearchFunction"),
+    ("AskVoiceWorkerFunction", "RagSearchFunction"),
     ("WsSendVoiceFunction", "VoiceResolveFunction"),
     ("SpeakerEmbedFunction", "VoiceprintWriterFunction"),
     ("MatcherFunction", "SuggestionWriterFunction"),
