@@ -132,3 +132,12 @@ def test_accepts_64_char_tz(monkeypatch):
     fc = wire(monkeypatch)
     fapi.search_topics({"question": "door", "tz": "x" * 64}, ADMIN_CALLER)
     assert fc.calls[0]["Payload"]["tz"] == "x" * 64
+
+
+def test_search_default_k_is_64(monkeypatch):
+    fc = wire(monkeypatch)
+    fapi.search_topics({"question": "door damage"}, ADMIN_CALLER)
+    assert fc.calls[0]["Payload"]["k"] == 64
+    fc = wire(monkeypatch)
+    fapi.search_topics({"question": "door damage", "k": "12"}, ADMIN_CALLER)
+    assert fc.calls[0]["Payload"]["k"] == 12

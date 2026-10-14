@@ -312,3 +312,13 @@ def test_the_vector_arm_cannot_use_the_hnsw_index():
     vec = sql.split("lex AS (")[0]
     assert "ORDER BY (c.embedding <=> %(q)s::vector) + 0" in vec
     assert "ORDER BY c.embedding <=> %(q)s::vector " not in vec
+
+
+def test_keyword_arm_selects_the_real_cosine_distance_not_null():
+    """The lex CTE must score its rows against the query embedding (2026-10-14):
+    a NULL distance made _aggregate_topics rank relevant keyword-only rows 1.0."""
+    sql = build_search_sql()
+    lex = sql.split("lex AS (", 1)[1]
+    lex = lex.split("), ", 1)[0] if "), " in lex else lex
+    assert "c.embedding <=> %(q)s::vector AS distance, true AS lexical_hit" in lex
+    assert "NULL::float8" not in sql
