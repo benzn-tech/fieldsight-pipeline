@@ -88,17 +88,21 @@ def build_search_sql() -> str:
     # silently falls back to a sequential scan --
     # test_keyword_arm_expression_matches_the_index_exactly pins this.
     #
-    # The keyword arm's rows carry NO meaningful cosine distance (never scored
-    # against the query embedding) -- NULL, not a fabricated "good" number, so
-    # a keyword hit cannot silently outrank a true semantic top-1. lexical_hit
-    # distinguishes the two arms; downstream ranking (_aggregate_topics in
-    # lambda_ask_agent.py) must admit a lexical_hit=True row past its distance
-    # gate rather than dropping it one hop downstream of this fix.
+    # The keyword arm's rows carry their REAL cosine distance to the query
+    # embedding (2026-10-14 change; the 2026-09-20 spec used NULL so a keyword
+    # hit could never look like a semantic match). A real `<=>` value is not
+    # fabricated, and NULL made _aggregate_topics score such rows 1.0, ranking
+    # a relevant keyword-only row below dozens of weak vector rows. The cost
+    # is one extra vector distance per matched row (<= the arm's LIMIT).
+    # lexical_hit, NOT `distance IS NULL`, is the only way to tell the arms
+    # apart; downstream ranking (_aggregate_topics in lambda_ask_agent.py)
+    # must still admit a lexical_hit=True row past its distance gate.
     #
     # DISTINCT ON (id): a row found by BOTH arms is one row. Its own
     # ORDER BY id, lexical_hit ASC, distance ASC NULLS LAST keeps that row's
-    # vector-arm copy (lexical_hit=false, with a real distance) over the
-    # keyword copy's NULL when both exist -- unchanged tiebreak.
+    # vector-arm copy (lexical_hit=false) over the keyword copy when both
+    # exist; the two copies carry the same distance, so the tiebreak is
+    # unchanged and decided by lexical_hit alone.
     #
     # This SQL has TWO consumers, not one, and they need different things:
     #   - the search box goes through _aggregate_topics, which re-sorts by
@@ -121,7 +125,8 @@ def build_search_sql() -> str:
     #     outside the DISTINCT ON re-imposes it.
     #
     # So the outer SELECT re-sorts the deduped rows by lexical_hit ASC,
-    # distance ASC NULLS LAST. Since lexical_hit=false sorts before true and
+    # distance ASC NULLS LAST (keyword-only rows now order by real distance
+    # among themselves). Since lexical_hit=false sorts before true and
     # the vec CTE is unchanged, this reproduces the pre-this-branch vec-only
     # order EXACTLY for the vector rows, then appends keyword-only rows
     # after all of them (never interleaved). It does not decide how a
@@ -148,7 +153,7 @@ def build_search_sql() -> str:
         "         c.metadata, c.report_date, c.site_id, s.name AS site_name, "
         "         s.slug AS site_slug, "
         "         t.title AS topic_title, t.summary AS topic_summary, "
-        "         NULL::float8 AS distance, true AS lexical_hit "
+        "         c.embedding <=> %(q)s::vector AS distance, true AS lexical_hit "
         "  FROM report_chunks c "
         "  LEFT JOIN topics t ON t.id = c.topic_id "
         "  LEFT JOIN sites s ON s.id = c.site_id "

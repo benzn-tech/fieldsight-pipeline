@@ -126,14 +126,14 @@ def test_ps4_is_found_even_though_forty_unrelated_chunks_are_closer(db):
         "PS4's chunk must be found by the keyword arm despite losing the vector race"
     hit = next(r for r in rows if str(r["id"]) == str(target["id"]))
     assert hit["lexical_hit"] is True
-    assert hit["distance"] is None, \
-        "a keyword-only hit must carry NULL distance, never a fabricated real-looking number"
+    assert hit["distance"] is not None and hit["distance"] > 0.3, \
+        "a keyword-only hit carries its REAL cosine distance (far from the query here), not NULL"
 
 
 def test_a_row_found_by_both_arms_appears_once_with_its_real_distance(db):
     """DISTINCT ON (id) must collapse the vector-arm and keyword-arm copies of
     the same row into one, keeping the vector arm's real cosine distance (not
-    the keyword arm's NULL) -- spec property 5."""
+    the keyword arm's copy) -- spec property 5."""
     site = _site(db)
     # seed 9 makes this chunk close to its own query embedding (real distance
     # near 0) AND it contains the literal term, so both CTEs find the SAME id.

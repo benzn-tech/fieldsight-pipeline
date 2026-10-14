@@ -140,3 +140,24 @@ def test_report_family_is_unchanged_by_coverage(db, cov):
     _add(db, cov, "2026-10-08", "ses", "a", "extractions/a/2026-10-08/s1.json")
     _add(db, cov, "2026-10-09", "null key", "a", None)
     assert _texts(db, cov["site"], "report") == ["null key", "rep"]
+
+
+def test_keyword_only_rows_carry_the_real_vector_distance(db):
+    """A row only the keyword arm finds must carry a numeric distance equal to
+    the distance the vector arm reports for the same row (it used to be NULL)."""
+    co = companies.create_company(db, "Acme-lexdist")
+    s = sites.create_site(db, co["id"], "S1")
+    far = _vec(5)
+    target = chunks.insert_chunk(db, s["id"], "2026-10-08", "topic",
+                                 "Level 2 Pour Booking and Hold Point", far)
+    for i in range(6):  # nearer unrelated rows fill a k=3 vector arm
+        chunks.insert_chunk(db, s["id"], "2026-10-01", "topic", f"unrelated note {i}", _vec(0))
+    q = _vec(0)
+    # Ground truth: the vector arm's distance for the target, with k large enough to include it.
+    all_rows = chunks.search_chunks(db, q, [s["id"]], k=30, query_text="")
+    expected = next(r["distance"] for r in all_rows if str(r["id"]) == str(target["id"]))
+    rows = chunks.search_chunks(db, q, [s["id"]], k=3, query_text="pour")
+    hit = next(r for r in rows if str(r["id"]) == str(target["id"]))
+    assert hit["lexical_hit"] is True
+    assert hit["distance"] is not None
+    assert hit["distance"] == pytest.approx(expected)
