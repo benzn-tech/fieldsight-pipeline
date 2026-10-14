@@ -27,6 +27,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from datetime import datetime
 
 import boto3
+from botocore.config import Config
 
 logger = logging.getLogger()
 
@@ -49,7 +50,9 @@ _lambda = None
 def _get_s3():
     global _s3
     if _s3 is None:
-        _s3 = boto3.client("s3")
+        # Bounded: a hung S3 call must not eat a long-poll's whole wait.
+        _s3 = boto3.client("s3", config=Config(
+            connect_timeout=1, read_timeout=2, retries={"max_attempts": 1}))
     return _s3
 
 

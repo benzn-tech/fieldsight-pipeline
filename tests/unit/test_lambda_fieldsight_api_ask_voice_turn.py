@@ -153,7 +153,7 @@ def test_result_wait_capped_by_clock(s3):
     r = result({"turn": TURN}, clock=c)
     assert body(r) == {"status": "pending"}
     assert set(c.sleeps) == {0.4}
-    assert 19.5 <= sum(c.sleeps) <= 20.5
+    assert 18.5 <= sum(c.sleeps) <= 19.5  # stops 1 s early
 
 
 def test_result_wait_env(s3, monkeypatch):
@@ -161,7 +161,7 @@ def test_result_wait_env(s3, monkeypatch):
     c = Clock()
     put(s3, {"status": "pending", "created_at": c.t})
     result({"turn": TURN}, clock=c)
-    assert 1.9 <= sum(c.sleeps) <= 2.5
+    assert 0.7 <= sum(c.sleeps) <= 1.5
 
 
 def test_result_done_passes_fields_and_deletes(s3):
@@ -225,6 +225,49 @@ def test_result_access_denied_raises(s3, monkeypatch):
 def test_result_no_bucket_is_503(s3, monkeypatch):
     monkeypatch.delenv("ASK_TURN_BUCKET")
     assert result({"turn": TURN})["statusCode"] == 503
+
+
+def test_result_searching_web_older_than_90s_is_error(s3):
+    c = Clock()
+    put(s3, {"status": "searching_web", "created_at": c.t - 91})
+    assert body(result({"turn": TURN, "since": "searching_web"}, clock=c)) == {
+        "status": "error", "error": "No answer"}
+
+
+def test_result_cancel_marker_without_state_is_404(s3):
+    avt.put_cancel(s3, BUCKET, "sub-1", TURN)
+    assert result({"turn": TURN})["statusCode"] == 404
+
+
+def test_result_s3_time_counts_against_wait(s3):
+    c = Clock()
+    put(s3, {"status": "pending", "created_at": c.t})
+    orig = s3.get_object
+
+    def slow(Bucket, Key):
+        c.t += 0.5
+        return orig(Bucket=Bucket, Key=Key)
+    s3.get_object = slow
+    r = result({"turn": TURN}, clock=c)
+    assert body(r) == {"status": "pending"}
+    assert c.t - 1000.0 <= 20.0  # never overruns the wait cap
+
+
+@pytest.mark.parametrize("raw,expect", [("999", 25.0), ("-5", 0.0), ("nan", 20.0),
+                                        ("abc", 20.0), ("7", 7.0)])
+def test_wait_clamp(monkeypatch, raw, expect):
+    monkeypatch.setenv("RESULT_WAIT_S", raw)
+    assert fapi._result_wait_s() == expect
+
+
+def test_turn_s3_client_is_bounded():
+    avt._s3 = None
+    try:
+        cfg = avt._get_s3().meta.config
+        assert cfg.connect_timeout == 1 and cfg.read_timeout == 2
+        assert cfg.retries["total_max_attempts"] == 2 or cfg.retries["max_attempts"] == 1
+    finally:
+        avt._s3 = None
 
 
 # ---- cancel ----

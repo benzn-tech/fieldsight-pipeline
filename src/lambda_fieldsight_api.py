@@ -20,11 +20,11 @@ import os
 import json
 import logging
 import re
+import time
 import boto3
 import botocore.exceptions
 from botocore.config import Config
 from datetime import datetime
-import time
 
 # Light at import (boto3 + stdlib only; lambda_ask_agent etc. load lazily inside its
 # functions), so it is safe to import eagerly. Device Ask two-phase turn store.
@@ -406,6 +406,17 @@ def _terminal_body(state):
     return {'status': 'cancelled'}
 
 
+def _result_wait_s():
+    """RESULT_WAIT_S clamped to [0, 25]; invalid or nan -> 20."""
+    try:
+        v = float(os.environ.get('RESULT_WAIT_S', '20'))
+    except ValueError:
+        return 20.0
+    if v != v:
+        return 20.0
+    return max(0.0, min(25.0, v))
+
+
 def ask_voice_result(query, caller, clock=time.monotonic, sleep=time.sleep, wall=time.time):
     """GET /api/ask/voice/result?turn=&since=: long-poll the turn store. Returns
     when the status is terminal or differs from `since`, else after RESULT_WAIT_S
@@ -424,10 +435,7 @@ def ask_voice_result(query, caller, clock=time.monotonic, sleep=time.sleep, wall
     if not bucket:
         logger.error('voice result: ASK_TURN_BUCKET is not set')
         return error('Ask turn store not configured', 503)
-    try:
-        wait_s = float(os.environ.get('RESULT_WAIT_S', '20'))
-    except ValueError:
-        wait_s = 20.0
+    wait_s = _result_wait_s()
 
     s3 = _turn_s3()
     deadline = clock() + wait_s
@@ -444,11 +452,13 @@ def ask_voice_result(query, caller, clock=time.monotonic, sleep=time.sleep, wall
                 out = _terminal_body(state)
             else:
                 created = state.get('created_at')
+                # A stale-marked turn may still get an orphan `done` from a slow worker;
+                # the per-user day-old sweep at start cleans it (there is no lifecycle rule).
                 if isinstance(created, (int, float)) and wall() - created > STALE_TURN_S:
                     out = {'status': 'error', 'error': 'No answer'}
                 elif status != since:
                     out = {'status': status}
-                elif clock() >= deadline:
+                elif deadline - clock() < 1.0:  # S3 time counts; leave room to answer
                     out = {'status': status}
                 else:
                     sleep(RESULT_POLL_S)
