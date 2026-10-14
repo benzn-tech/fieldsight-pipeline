@@ -757,7 +757,7 @@ def _announce_web_start(on_web_start):
         logger.warning("  on_web_start failed: %s", exc)
 
 
-_VOICE_CITATION = re.compile(r"\s*\[\d+(?:\s*,\s*\d+)*\]")
+_VOICE_CITATION = re.compile(r"\s*\[\d+(?:\s*[,\-–]\s*\d+)*\]")
 
 
 def _speakable_web_answer(answer, records_answer):
@@ -768,7 +768,10 @@ def _speakable_web_answer(answer, records_answer):
     cleaned = _VOICE_CITATION.sub("", answer or "").strip()
     if voice_web.speakable(cleaned):
         return cleaned
-    return records_answer or voice_web.NO_CLEAR_ANSWER
+    fallback = _VOICE_CITATION.sub("", records_answer or "").strip()
+    if fallback and voice_web.speakable(fallback):
+        return fallback
+    return voice_web.NO_CLEAR_ANSWER
 
 
 def _records_useful(cls, chunks):
@@ -1339,6 +1342,9 @@ def _rag_answer(body, on_web_start=None):
         # once so the empty-retrieval branch and the pre-synthesis check below
         # cannot drift apart.
         scoped = narrowed or plan["body_date_sent"]
+        # "Search online" only counts on a voice turn that opted into web.
+        _wi = (bool(body.get("web_intent")) and body.get("mode") == "voice"
+               and bool(body.get("voice_web")))
 
         if result.get("error"):
             # Distinguish "caller not provisioned" / ACL misses from genuine
@@ -1362,14 +1368,14 @@ def _rag_answer(body, on_web_start=None):
             # depends on the no-answer result.
             if ((body.get("mode") != "voice" or body.get("voice_web"))
                     and not result.get("error")
-                    and (not scoped or body.get("web_intent"))):
+                    and (not scoped or _wi)):
                 import web_answer
                 if web_answer.enabled() and question:
                     # Nothing retrieved: no classification is spent (it would
                     # judge an empty list). The general flow runs alone --
                     # "project + no records" falls back to it by design (spec D2).
                     _t_web = time.monotonic()
-                    if body.get("web_intent"):
+                    if _wi:
                         _cls = _intent_cls([], True, route)
                     else:
                         _cls = _classify_for_route(web_answer, asked, [], False,
@@ -1395,8 +1401,11 @@ def _rag_answer(body, on_web_start=None):
                         }
                     # The draft failed too. The reader is still told what
                     # happened to the outside lookup (D5), never nothing.
+                    _d5 = "No relevant records found for this question."
+                    if body.get("mode") == "voice":
+                        _d5 = _speakable_web_answer(_d5, None)
                     return {
-                        "answer": "No relevant records found for this question.",
+                        "answer": _d5,
                         "citations": [],
                         "grounded": True,
                         "web": empty_web,
@@ -1476,7 +1485,7 @@ def _rag_answer(body, on_web_start=None):
         # included: today's records-only behaviour, one synthesis call, below.
         _cls = None
         if ((body.get("mode") != "voice" or body.get("voice_web")) and chunks
-                and (not scoped or body.get("web_intent"))
+                and (not scoped or _wi)
                 and not pinned_topic and _web_answer_enabled()):
             import web_answer
 
@@ -1571,7 +1580,7 @@ def _rag_answer(body, on_web_start=None):
             # records synthesis only for a project/mixed question or a general
             # one whose records are useful. A gated or not-useful set pays no
             # synthesis. The records path is ~2.5 s slower for it.
-            if body.get("web_intent"):
+            if _wi:
                 _cls = _intent_cls(chunks, _skip, route)
             else:
                 _cls = _classify_for_route(web_answer, asked, chunks, _skip, _started, route)

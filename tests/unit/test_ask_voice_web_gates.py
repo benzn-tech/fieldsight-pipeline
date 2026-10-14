@@ -216,7 +216,7 @@ def test_a_composed_voice_answer_with_a_url_falls_back_to_the_records_answer(mon
     monkeypatch.setattr(web_answer, "compose", lambda *a, **k: {
         "answer": "Scaffold tagged [1]. See https://x", "conflicts": [], "composed": True})
     out = ask(mode="voice", voice_web=True)
-    assert out["answer"] == "Grounded answer [1]."
+    assert out["answer"] == "Grounded answer."
 
 
 def test_voice_web_answers_lose_citation_markers_before_the_guard(monkeypatch):
@@ -246,6 +246,68 @@ def test_project_fallback_lead_is_skipped_in_voice_only(monkeypatch):
     wire(monkeypatch, kind="project", records_answer=False, web=WEB_OK)
     out2 = ask()
     assert out2["answer"].startswith(laa.PROJECT_FALLBACK_LEAD)
+
+
+# ---- fix round 1 -----------------------------------------------------------
+
+def test_web_intent_is_ignored_in_screen_mode_even_when_scoped(monkeypatch):
+    rig = wire(monkeypatch, chunks=(), web={"answer": "From the web."})
+    out = ask(rig.cb(), web_intent=True, voice_web=True, scoped=True, date="2026-09-01")
+    assert "general" not in rig.events
+    assert "from_web" not in out
+
+
+def test_web_intent_without_voice_web_is_ignored_in_voice(monkeypatch):
+    rig = wire(monkeypatch, chunks=(), web={"answer": "From the web."})
+    out = ask(rig.cb(), mode="voice", web_intent=True, scoped=True, date="2026-09-01")
+    assert rig.events == []
+    assert "from_web" not in out
+
+
+def test_web_intent_without_voice_web_keeps_classify_in_the_main_branch(monkeypatch):
+    rig = wire(monkeypatch, kind="project", web=None)
+    ask(rig.cb(), web_intent=True)
+    assert "classify" in rig.events
+
+
+@pytest.mark.parametrize("raw", [
+    "Fine [1-3].", "Fine [1–3].", "Fine [1, 2].", "Fine [1][2].", "Fine [1] [2]."])
+def test_voice_strips_ranges_lists_and_adjacent_markers(monkeypatch, raw):
+    wire(monkeypatch, chunks=(), web={"answer": raw})
+    out = ask(mode="voice", voice_web=True)
+    assert out["answer"] == "Fine."
+
+
+def test_records_fallback_is_stripped_before_it_is_spoken(monkeypatch):
+    wire(monkeypatch, kind="mixed", web={"answer": "ok"}, answer="Scaffold tagged [1][2].")
+    monkeypatch.setattr(web_answer, "compose", lambda *a, **k: {
+        "answer": "See https://x", "conflicts": [], "composed": True})
+    out = ask(mode="voice", voice_web=True)
+    assert out["answer"] == "Scaffold tagged."
+
+
+def test_an_unspeakable_records_fallback_becomes_no_clear_answer(monkeypatch):
+    wire(monkeypatch, kind="mixed", web={"answer": "ok"}, answer="Read https://y [1]")
+    monkeypatch.setattr(web_answer, "compose", lambda *a, **k: {
+        "answer": "See https://x", "conflicts": [], "composed": True})
+    out = ask(mode="voice", voice_web=True)
+    assert out["answer"] == voice_web.NO_CLEAR_ANSWER
+
+
+def test_voice_d5_message_goes_through_the_guard(monkeypatch):
+    wire(monkeypatch, chunks=(), web=None)
+    out = ask(mode="voice", voice_web=True)
+    assert out["answer"] == "No relevant records found for this question."
+    monkeypatch.setattr(voice_web, "speakable", lambda t: False)
+    out = ask(mode="voice", voice_web=True)
+    assert out["answer"] == voice_web.NO_CLEAR_ANSWER
+
+
+def test_screen_d5_message_is_unchanged(monkeypatch):
+    wire(monkeypatch, chunks=(), web=None)
+    monkeypatch.setattr(voice_web, "speakable", lambda t: False)
+    out = ask()
+    assert out["answer"] == "No relevant records found for this question."
 
 
 # ---- screen path unchanged -------------------------------------------------
