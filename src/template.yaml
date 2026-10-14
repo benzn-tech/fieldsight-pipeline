@@ -322,6 +322,25 @@ Parameters:
       Vector-distance cutoff for retrieved chunks used by Ask's retrieval
       step. A Parameter so the gate can be recalibrated without a code change.
 
+  AskVoiceRestate:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Voice Ask two-phase: speak a short restatement of the question while the
+      worker is still answering. TEST-only; prod leaves it unset (false).
+
+  VoiceWebEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Let the voice Ask worker answer from the open web when the excerpts do
+      not answer the question. Separate from EnableWebAnswer (the typed /ask
+      path) so voice can be enabled after its latency is measured. Voice web
+      answers need BOTH this and EnableWebAnswer true: web_answer.enabled()
+      still gates the whole branch. TEST-only; prod leaves it unset (false).
+
   EnableWebAnswer:
     Type: String
     Default: 'false'
@@ -2336,6 +2355,12 @@ Resources:
           # Reads the same credential and the same vendor as corroboration; the
           # separate flag is about the decision, not the plumbing.
           ENABLE_WEB_ANSWER: !Ref EnableWebAnswer
+          # Two-phase voice Ask: /start writes a pending turn and invokes the
+          # worker async; restatement is a cheap model speaking ahead.
+          ASK_VOICE_WORKER_FUNCTION: !Ref AskVoiceWorkerFunction
+          ASK_TURN_BUCKET: !Ref DataBucketName
+          ASK_VOICE_RESTATE: !Ref AskVoiceRestate
+          VOICE_RESTATE_MODEL: 'meta-llama/llama-3.1-8b-instruct'
       Layers:
         - !Ref DashScopeLayer
       Policies:
@@ -2343,6 +2368,156 @@ Resources:
             FunctionName: !Ref RagSearchFunction
         - LambdaInvokePolicy:
             FunctionName: !Ref VoiceAuditFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AskVoiceWorkerFunction
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}/ask_turns/*'
+            # Listing (the 1-day sweep in voice_start) only under the prefix.
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}'
+              Condition:
+                StringLike:
+                  s3:prefix: 'ask_turns/*'
+
+  # ----------------------------------------------------------
+  # Ask Voice Worker (two-phase device Ask)
+  # Why it exists: the synchronous voice path is capped by API Gateway's fixed
+  # 29 s integration timeout, which leaves no room for a web answer. The
+  # device now POSTs /api/ask/voice/start (AskAgent writes a `pending` turn
+  # and fires this function asynchronously) and polls /result. Running async
+  # lifts the 29 s ceiling, so the budgets here differ from AskAgent's:
+  # ASK_DEADLINE_SECONDS / WEB_ANSWER_HARD_STOP 45 and LLM_HTTP_TIMEOUT 40,
+  # plus TTS's fixed 10 s, all under Timeout 60 (see
+  # test_ask_voice_worker_template.py). Env is a copy of AskAgent's except
+  # those, plus the turn store and the voice web flag.
+  # RAG_SEARCH_FUNCTION / VOICE_AUDIT_FUNCTION are HasDb refs from an
+  # unconditional function, same as AskAgent: see the W1001 note in the
+  # top-of-file Metadata block.
+  # Retries are 0: a re-run would double-spend model/TTS calls, and the worker
+  # also guards on state==pending because async delivery is at-least-once.
+  # ----------------------------------------------------------
+  AskVoiceWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ["${P}-ask-voice-worker", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: ask_voice_turn.worker_handler
+      Timeout: 60
+      MemorySize: 256
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+        MaximumEventAgeInSeconds: 120
+      Environment:
+        Variables:
+          # Under the Lambda Timeout above, or the runtime hard-kills this function
+          # before urllib3 raises and the `except` that exists for a slow LLM never
+          # runs. `llm_utils` defaults it to 150 s and explains the ordering; three
+          # functions here had it inverted, all by leaving it at that default.
+          # One model call inside a request whose whole budget is
+          # ASK_DEADLINE_SECONDS below -- strictly less, or a single call can
+          # spend the entire request and leave nothing for retrieval, the
+          # rewrite or synthesis.
+          LLM_HTTP_TIMEOUT: '40'
+          # Caps the whole fallback chain (llm_utils), so muse->luna->mimo at 40 s
+          # each cannot run past ASK_DEADLINE_SECONDS and into the 60 s runtime kill.
+          LLM_CHAIN_BUDGET_SECONDS: '44'
+          # Voluntary deadline: the agent's whole-request budget. A ladder
+          # constant, not a switch -- kept a literal (not a Parameter) so one
+          # reader (_env_value) works for every number in the ladder; see
+          # ASK_INVOKE_TIMEOUT on ApiFunction for the rest of it.
+          ASK_DEADLINE_SECONDS: '45'
+          # Task 9: the three Ask flags, wired in three places each (Parameter,
+          # here, both workflows).
+          ASK_CONVERSATION_MEMORY: !Ref AskConversationMemory
+          ASK_REWRITE_BUDGET: !Ref AskRewriteBudget
+          ASK_DISTANCE_GATE: !Ref AskDistanceGate
+          ANTHROPIC_API_KEY: !Ref ClaudeApiKey
+          RAG_SEARCH_FUNCTION: !Ref RagSearchFunction
+          DASHSCOPE_API_KEY: !Ref DashScopeApiKey
+          # Voice STT provider and its OWN key. Both belong here: a provider
+          # named without a key RAISES rather than falling back, which is the
+          # point -- see ElevenLabsAskApiKey's description.
+          ASK_STT_PROVIDER: !Ref AskSttProvider
+          ASK_TTS_PROVIDER: !Ref AskTtsProvider
+          ELEVENLABS_API_KEY_TTS: !Ref ElevenLabsTtsApiKey
+          ELEVENLABS_TTS_VOICE: !Ref ElevenLabsTtsVoice
+          ELEVENLABS_TTS_MODEL: !Ref ElevenLabsTtsModel
+          ELEVENLABS_TTS_SPEED: !Ref ElevenLabsTtsSpeed
+          ASK_VOICE_MODEL: !Ref AskVoiceModel
+          ELEVENLABS_ASK_API_KEY: !Ref ElevenLabsAskApiKey
+          ELEVENLABS_STT_MODEL: !Ref ElevenLabsSttModel
+          ELEVENLABS_LANGUAGE: !Ref ElevenLabsLanguage
+          DASHSCOPE_BASE_URL: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+          DASHSCOPE_EMBED_MODEL: text-embedding-v4
+          DASHSCOPE_EMBED_DIM: '1024'
+          # Ask only. rag-search is in-VPC with no egress and could not make
+          # this call at all -- it would hang to the socket timeout.
+          ENABLE_RERANK: !Ref EnableRerank
+          DASHSCOPE_RERANK_TIMEOUT_SECONDS: !Ref RerankTimeoutSeconds
+          RERANK_CANDIDATE_K: !Ref RerankCandidateK
+          # SP-Ask: async audit hop (in-VPC). Same cross-condition Ref shape as
+          # RAG_SEARCH_FUNCTION above (VoiceAuditFunction is HasDb, this fn is
+          # unconditional) — safe in practice on the test stack; see the W1001
+          # note in the top-of-file Metadata block.
+          VOICE_AUDIT_FUNCTION: !Ref VoiceAuditFunction
+          # Same value as AskAgentFunction; see the reasoning there.
+          CLAUDE_MODEL: claude-haiku-4-5-20251001
+          LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
+          QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
+          QWEN_BASE_URL: !Ref QwenBaseUrl
+          QWEN_MODEL: !Ref QwenModelFast
+          LLM_REASONING_EFFORT: !Ref LlmReasoningEffortFast
+          # DASHSCOPE_TTS_* below default inside dashscope_utils.py (model
+          # qwen3-tts-flash-realtime, voice Cherry, intl WS url) — no env
+          # override needed here; DashScopeLayer (below) provides the SDK.
+          # External corroboration (/api/ask/corroborate). Off on both stacks
+          # until the pilot contracts are confirmed to permit sending entity
+          # names to a third-party search engine; the code reads this at call
+          # time, so the whole feature returns an empty body while it is false.
+          ENABLE_EXTERNAL_CORROBORATION: !Ref EnableExternalCorroboration
+          # Its own key, NOT QWEN_API_KEY above -- see the CorroborationApiKey
+          # parameter for why borrowing that one sends the wrong vendor's
+          # credential on any DashScope-pointed stack.
+          CORROBORATION_API_KEY: !Ref CorroborationApiKey
+          # Reads the same credential and the same vendor as corroboration; the
+          # separate flag is about the decision, not the plumbing.
+          ENABLE_WEB_ANSWER: !Ref EnableWebAnswer
+          # Worker-only. WEB_ANSWER_HARD_STOP overrides web_answer's in-code
+          # 27 s stop so a web answer can use the worker's longer budget.
+          WEB_ANSWER_HARD_STOP: '45'
+          ASK_TURN_BUCKET: !Ref DataBucketName
+          VOICE_WEB_ENABLED: !Ref VoiceWebEnabled
+      Layers:
+        - !Ref DashScopeLayer
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref RagSearchFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref VoiceAuditFunction
+        # Turn store: prefix-scoped inside the existing data bucket (no new
+        # bucket, no lifecycle rule). Spec section 4.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}/ask_turns/*'
+            # Without ListBucket a missing key answers 403, not 404, and the
+            # turn store could not tell "absent" from a real IAM error.
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}'
+              Condition:
+                StringLike:
+                  s3:prefix: ['ask_turns/*']
 
   # ----------------------------------------------------------
   # Lambda Layer: dashscope SDK (SP-Ask TTS)
@@ -5357,11 +5532,30 @@ Resources:
           # correctly. Literal, not a Parameter -- see AskAgentFunction's
           # ASK_DEADLINE_SECONDS for why.
           ASK_INVOKE_TIMEOUT: '26'
+          ASK_TURN_BUCKET: !Ref DataBucketName
       # Retired data routes answer 410 without touching storage; what remains
-      # is the proxy into the Ask Agent, so that is the only grant.
+      # is the proxy into the Ask Agent, plus the voice-Ask turn store
+      # (/api/ask/voice/result and /cancel read, write and delete turn objects),
+      # scoped to the ask_turns/ prefix. Those are the only grants.
       Policies:
         - LambdaInvokePolicy:
             FunctionName: !Ref AskAgentFunction
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}/ask_turns/*'
+            # Without ListBucket a missing key answers 403, not 404, and the
+            # turn store could not tell "absent" from a real IAM error.
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}'
+              Condition:
+                StringLike:
+                  s3:prefix: ['ask_turns/*']
       Events:
         HealthCheck:
           Type: Api

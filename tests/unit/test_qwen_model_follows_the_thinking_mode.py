@@ -192,11 +192,13 @@ def test_the_ask_path_is_deliberately_left_out():
     time somebody set the variable to protect extract-session's live pass --
     silently, since the answer would still be correct, just slower.
 
-    This pins the ABSENCE, which is the half a reviewer forgets to pin."""
+    This pins the ABSENCE, which is the half a reviewer forgets to pin. The
+    device voice worker runs the same Ask code path asynchronously, so the same
+    rule applies to it."""
     fast = [b for b in _qwen_env_blocks() if b[0] == "QwenModelFast"]
-    assert len(fast) == 1, f"expected exactly one Fast function, found {len(fast)}"
-    assert fast[0][1] is None, (
-        "AskAgentFunction must NOT carry QWEN_MODEL_NONTHINKING -- see the "
+    assert len(fast) == 2, f"expected AskAgent and the voice worker, found {len(fast)}"
+    assert all(b[1] is None for b in fast), (
+        "the Ask path must NOT carry QWEN_MODEL_NONTHINKING -- see the "
         "parameter Description in template.yaml")
 
 

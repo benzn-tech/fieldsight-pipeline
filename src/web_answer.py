@@ -47,6 +47,7 @@ import time
 
 import corroboration_client as client
 import question_admission
+import voice_web
 
 logger = logging.getLogger()
 
@@ -264,7 +265,12 @@ def _verify_ok(reply):
     return reply.ok and reply.searched and bool((reply.text or "").strip())
 
 
-def general_answer(question, budget, *, kind="general", clock=None):
+def _voiced(prompt, voice):
+    """The prompt unchanged unless this answer will be spoken aloud."""
+    return prompt + "\n\n" + voice_web.VOICE_RULES if voice else prompt
+
+
+def general_answer(question, budget, *, kind="general", clock=None, voice=False):
     """Draft from the model's knowledge, verify on the web, never nothing.
 
     `budget` is the seconds this whole chain may take. Returns a `web` block;
@@ -279,6 +285,11 @@ def general_answer(question, budget, *, kind="general", clock=None):
 
     A question over the admission cap is not sent to the web at all; it still
     gets the draft, with status "too_long".
+
+    `voice=True` appends voice_web.VOICE_RULES to the draft AND the verify
+    prompt: either one can become the spoken answer (the draft is returned
+    verbatim when verification fails), and the voice path must never read a URL
+    or a list aloud.
     """
     # Resolved at call time so a test (or a caller) patching time.monotonic is honoured.
     clock = clock or time.monotonic
@@ -294,7 +305,7 @@ def general_answer(question, budget, *, kind="general", clock=None):
 
     t = clock()
     draft_reply = client.call(
-        DRAFT_PROMPT.format(question=question),
+        _voiced(DRAFT_PROMPT.format(question=question), voice),
         timeout=min(DRAFT_BUDGET, left()), max_tokens=1024, effort="low",
         caller="web_draft")
     ms["draft"] = int((clock() - t) * 1000)
@@ -321,7 +332,7 @@ def general_answer(question, budget, *, kind="general", clock=None):
             break
         t = clock()
         last = client.call(
-            VERIFY_PROMPT.format(question=question, draft=draft),
+            _voiced(VERIFY_PROMPT.format(question=question, draft=draft), voice),
             timeout=min(VERIFY_BUDGET, left()), max_tokens=2048, web=True,
             effort="low", caller="web_verify")
         ms["verify" if attempt == 1 else "verify_retry"] = int((clock() - t) * 1000)
@@ -342,7 +353,7 @@ def general_answer(question, budget, *, kind="general", clock=None):
 
 # ------------------------------------------------------------------- compose
 
-def compose(records_answer_text, general_block, question, budget):
+def compose(records_answer_text, general_block, question, budget, voice=False):
     """Merge the records answer and the general block for a mixed question.
 
     Returns `{"answer", "conflicts", "composed"}`. On any failure `composed` is
@@ -363,8 +374,8 @@ def compose(records_answer_text, general_block, question, budget):
     if budget < client.MIN_USEFUL_TIMEOUT:
         return fail
     reply = client.call(
-        COMPOSE_PROMPT.format(question=question, records=records_answer_text,
-                              general=general_text),
+        _voiced(COMPOSE_PROMPT.format(question=question, records=records_answer_text,
+                                      general=general_text), voice),
         timeout=min(COMPOSE_BUDGET, budget), model=CHEAP_MODEL, max_tokens=2048,
         effort="low", caller="web_compose")
     if not reply.ok:

@@ -20,10 +20,15 @@ import os
 import json
 import logging
 import re
+import time
 import boto3
 import botocore.exceptions
 from botocore.config import Config
 from datetime import datetime
+
+# Light at import (boto3 + stdlib only; lambda_ask_agent etc. load lazily inside its
+# functions), so it is safe to import eagerly. Device Ask two-phase turn store.
+import ask_voice_turn
 
 # Pure module, no boto3 -- safe to import eagerly. Moved out of this file
 # (2026-09-17, ask-conversation-memory Task 3) so lambda_ask_agent can share
@@ -79,6 +84,13 @@ def ok(body, status=200):
 
 def error(message, status=400):
     return ok({'error': message}, status)
+
+
+def no_content():
+    """204 with an empty body and the same CORS headers ok() sends."""
+    res = ok(None, 204)
+    res['body'] = ''
+    return res
 
 
 
@@ -276,29 +288,18 @@ def corroborate_answer(body, caller):
 MAX_VOICE_AUDIO_B64 = 1_500_000
 
 
-def ask_voice(body, caller):
-    """Hands-free voice ask (SP-Ask): forward the base64 clip to the Ask Agent,
-    which chains DashScope STT -> RAG (caller_sub ACL, voice prompt, Haiku) ->
-    DashScope TTS and returns {transcript, answerText, audioBase64, audioFormat}.
-
-    Routed here (ApiFunction, non-VPC) and NOT on lambda_org_api: the org API
-    is in-VPC with no NAT and no lambda VPC endpoint (BUG-36), so it can
-    neither reach DashScope nor invoke AskAgentFunction. This function already
-    holds LambdaInvokePolicy on AskAgentFunction and the /api/{proxy+} route.
-    caller identity comes from the Cognito authorizer claims -- never from the
-    client body (mirrors ask_question's caller_sub bridge)."""
-    # Fail closed: without a sub the ask-agent would fall to a company-blind S3 read.
-    if not caller.get('sub'):
-        return error('sign-in required', 401)
-
+def _build_voice_payload(mode, body, caller):
+    """Shared by ask_voice (mode 'voice') and ask_voice_start (mode 'voice_start').
+    Returns (payload, None) or (None, error_response). The caller has already
+    checked the sub."""
     audio_b64 = body.get('audio')
     if not audio_b64 or not isinstance(audio_b64, str):
-        return error('Missing audio (base64 clip required)')
+        return None, error('Missing audio (base64 clip required)')
     if len(audio_b64) > MAX_VOICE_AUDIO_B64:
-        return error('Audio too large', 413)
+        return None, error('Audio too large', 413)
 
     payload = {
-        'mode': 'voice',
+        'mode': mode,
         'audio': audio_b64,
         'format': body.get('format') or 'm4a',
         'caller_sub': caller['sub'],
@@ -324,6 +325,12 @@ def ask_voice(body, caller):
     elif raw_history is not None and not isinstance(raw_history, list):
         logger.warning("voice ask: history was %s, not a list",
                        type(raw_history).__name__)
+    return payload, None
+
+
+def _invoke_voice_agent(payload):
+    """RequestResponse invoke of the Ask Agent; same FunctionError posture for
+    both voice routes."""
     try:
         resp = lambda_client.invoke(
             FunctionName=ASK_AGENT_FUNCTION,
@@ -342,6 +349,151 @@ def ask_voice(body, caller):
     except Exception as e:
         logger.error(f"Voice ask invocation failed: {e}")
         return error(f'Ask agent error: {e}', 500)
+
+
+def ask_voice(body, caller):
+    """Hands-free voice ask (SP-Ask): forward the base64 clip to the Ask Agent,
+    which chains DashScope STT -> RAG (caller_sub ACL, voice prompt, Haiku) ->
+    DashScope TTS and returns {transcript, answerText, audioBase64, audioFormat}.
+
+    Routed here (ApiFunction, non-VPC) and NOT on lambda_org_api: the org API
+    is in-VPC with no NAT and no lambda VPC endpoint (BUG-36), so it can
+    neither reach DashScope nor invoke AskAgentFunction. This function already
+    holds LambdaInvokePolicy on AskAgentFunction and the /api/{proxy+} route.
+    caller identity comes from the Cognito authorizer claims -- never from the
+    client body (mirrors ask_question's caller_sub bridge)."""
+    # Fail closed: without a sub the ask-agent would fall to a company-blind S3 read.
+    if not caller.get('sub'):
+        return error('sign-in required', 401)
+
+    payload, err = _build_voice_payload('voice', body, caller)
+    if err:
+        return err
+    return _invoke_voice_agent(payload)
+
+
+# ── Device Ask two-phase: start / result / cancel ───────────────
+# Spec docs/superpowers/specs/2026-10-15-device-ask-two-phase-design.md 3.1-3.3.
+
+RESULT_POLL_S = 0.4
+STALE_TURN_S = 90
+_TERMINAL = ('done', 'error', 'cancelled')
+_DONE_FIELDS = ('transcript', 'answerText', 'basis', 'audioBase64', 'audioFormat', 'web')
+
+
+def _turn_s3():
+    return ask_voice_turn._get_s3()
+
+
+def ask_voice_start(body, caller):
+    """POST /api/ask/voice/start: same validation and payload as ask_voice, with
+    mode 'voice_start'. The agent's JSON ({turn_id, ...} or {error, ...}) is
+    passed through exactly as ask_voice passes its own."""
+    if not caller.get('sub'):
+        return error('sign-in required', 401)
+    payload, err = _build_voice_payload('voice_start', body, caller)
+    if err:
+        return err
+    return _invoke_voice_agent(payload)
+
+
+def _terminal_body(state):
+    status = state.get('status')
+    if status == 'done':
+        return {'status': 'done', **{k: state.get(k) for k in _DONE_FIELDS if k in state}}
+    if status == 'error':
+        return {'status': 'error', 'error': state.get('error') or 'No answer'}
+    return {'status': 'cancelled'}
+
+
+def _result_wait_s():
+    """RESULT_WAIT_S clamped to [0, 25]; invalid or nan -> 20."""
+    try:
+        v = float(os.environ.get('RESULT_WAIT_S', '20'))
+    except ValueError:
+        return 20.0
+    if v != v:
+        return 20.0
+    return max(0.0, min(25.0, v))
+
+
+def ask_voice_result(query, caller, clock=time.monotonic, sleep=time.sleep, wall=time.time):
+    """GET /api/ask/voice/result?turn=&since=: long-poll the turn store. Returns
+    when the status is terminal or differs from `since`, else after RESULT_WAIT_S
+    (default 20, below the 28 s Timeout). Query values are never logged."""
+    sub = caller.get('sub')
+    if not sub:
+        return error('sign-in required', 401)
+    query = query or {}
+    turn = query.get('turn')
+    if not isinstance(turn, str) or not ask_voice_turn.TURN_RE.match(turn):
+        return error('Invalid turn')
+    since = query.get('since') or 'pending'
+    if since not in ('pending', 'searching_web'):
+        return error('Invalid since')
+    bucket = os.environ.get('ASK_TURN_BUCKET', '')
+    if not bucket:
+        logger.error('voice result: ASK_TURN_BUCKET is not set')
+        return error('Ask turn store not configured', 503)
+    wait_s = _result_wait_s()
+
+    s3 = _turn_s3()
+    deadline = clock() + wait_s
+    stale = False
+    while True:
+        # AccessDenied raises ClientError on purpose: the handler turns it into a 500.
+        state = ask_voice_turn.get_state(s3, bucket, sub, turn)
+        if state is None:
+            return error('Turn not found', 404)
+        if ask_voice_turn.is_cancelled(s3, bucket, sub, turn):
+            out = {'status': 'cancelled'}
+        else:
+            status = state.get('status')
+            if status in _TERMINAL:
+                out = _terminal_body(state)
+            else:
+                created = state.get('created_at')
+                # A stale-marked turn may still get an orphan `done` from a slow worker;
+                # the per-user day-old sweep at start cleans it (there is no lifecycle rule).
+                if isinstance(created, (int, float)) and wall() - created > STALE_TURN_S:
+                    out = {'status': 'error', 'error': 'No answer'}
+                    stale = True
+                elif status != since:
+                    out = {'status': status}
+                elif deadline - clock() < 1.0:  # S3 time counts; leave room to answer
+                    out = {'status': status}
+                else:
+                    sleep(RESULT_POLL_S)
+                    continue
+        if out['status'] in _TERMINAL:
+            try:
+                # Cancelled or given up on: a worker may still be running, and the
+                # marker is what stops it writing `done` and an audit row. Keep it
+                # (writing it for a stale turn) and let the day-old sweep remove it.
+                keep = out['status'] == 'cancelled' or stale
+                if stale:
+                    ask_voice_turn.put_cancel(s3, bucket, sub, turn)
+                ask_voice_turn.delete_turn(s3, bucket, sub, turn, keep_marker=keep)
+            except Exception as e:  # noqa: BLE001 - cleanup is best effort
+                logger.warning('voice result: delete failed: %s', type(e).__name__)
+        return ok(out)
+
+
+def ask_voice_cancel(body, caller):
+    """POST /api/ask/voice/cancel {turn_id}: write the cancel marker, 204. An
+    unknown turn also gets 204 so turn existence cannot be probed."""
+    sub = caller.get('sub')
+    if not sub:
+        return error('sign-in required', 401)
+    turn = body.get('turn_id') if isinstance(body, dict) else None
+    if not isinstance(turn, str) or not ask_voice_turn.TURN_RE.match(turn):
+        return error('Invalid turn_id')
+    bucket = os.environ.get('ASK_TURN_BUCKET', '')
+    if not bucket:
+        logger.error('voice cancel: ASK_TURN_BUCKET is not set')
+        return error('Ask turn store not configured', 503)
+    ask_voice_turn.put_cancel(_turn_s3(), bucket, sub, turn)
+    return no_content()
 
 
 # ── POST /api/search ─────────────────────────────────────────
@@ -458,7 +610,8 @@ def gone(path):
 # path is client-controlled (a 404) and is logged as 'other'. The closed routes
 # stay here so their 410s remain visible in the logs.
 KNOWN_ROUTES = frozenset(CLOSED_ROUTES) | frozenset({
-    '/api/ask', '/api/ask/voice', '/api/ask/corroborate', '/api/search',
+    '/api/ask', '/api/ask/voice', '/api/ask/voice/start', '/api/ask/voice/result',
+    '/api/ask/voice/cancel', '/api/ask/corroborate', '/api/search',
 })
 
 
@@ -487,6 +640,10 @@ def lambda_handler(event, context):
     try:
         if path == '/api/ask' and method == 'POST': return ask_question(body, caller)
         elif path == '/api/ask/voice' and method == 'POST': return ask_voice(body, caller)
+        elif path == '/api/ask/voice/start' and method == 'POST': return ask_voice_start(body, caller)
+        elif path == '/api/ask/voice/result' and method == 'GET':
+            return ask_voice_result(event.get('queryStringParameters') or {}, caller)
+        elif path == '/api/ask/voice/cancel' and method == 'POST': return ask_voice_cancel(body, caller)
         elif path == '/api/ask/corroborate' and method == 'POST': return corroborate_answer(body, caller)
         elif path == '/api/search' and method == 'POST': return search_topics(body, caller)
         else: return error(f'Not found: {method} {path}', 404)

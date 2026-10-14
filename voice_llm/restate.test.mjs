@@ -1,5 +1,6 @@
 // node --test voice_llm/   (no dependencies)
 import { test } from "node:test";
+import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import { OPENER } from "./stream.mjs";
 import { toHistory } from "./history.mjs";
@@ -102,3 +103,16 @@ test("http failures and thrown fetches are reported, not thrown", async () => {
 });
 
 test("OPENER is still the 146-character fixed text", () => assert.equal(OPENER.length, 146));
+
+// The same cases tests/unit/test_voice_restate.py runs against src/voice_restate.py:
+// one rule, one fixture, two implementations.
+test("guardMiddle agrees with the fixture shared with the Python port", () => {
+  const cases = JSON.parse(readFileSync(new URL("../tests/fixtures/restate_guard_cases.json", import.meta.url), "utf8"));
+  assert.ok(cases.length >= 14);
+  for (const c of cases) {
+    const r = guardMiddle(c.question, c.middle);
+    assert.equal(r.ok, c.ok, c.name);
+    if (c.ok) { if ("expected_middle" in c) assert.equal(r.middle, c.expected_middle, c.name); }
+    else assert.equal(r.reason, c.reason, c.name);
+  }
+});
