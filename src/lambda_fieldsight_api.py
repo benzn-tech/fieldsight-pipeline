@@ -439,6 +439,7 @@ def ask_voice_result(query, caller, clock=time.monotonic, sleep=time.sleep, wall
 
     s3 = _turn_s3()
     deadline = clock() + wait_s
+    stale = False
     while True:
         # AccessDenied raises ClientError on purpose: the handler turns it into a 500.
         state = ask_voice_turn.get_state(s3, bucket, sub, turn)
@@ -456,6 +457,7 @@ def ask_voice_result(query, caller, clock=time.monotonic, sleep=time.sleep, wall
                 # the per-user day-old sweep at start cleans it (there is no lifecycle rule).
                 if isinstance(created, (int, float)) and wall() - created > STALE_TURN_S:
                     out = {'status': 'error', 'error': 'No answer'}
+                    stale = True
                 elif status != since:
                     out = {'status': status}
                 elif deadline - clock() < 1.0:  # S3 time counts; leave room to answer
@@ -465,7 +467,13 @@ def ask_voice_result(query, caller, clock=time.monotonic, sleep=time.sleep, wall
                     continue
         if out['status'] in _TERMINAL:
             try:
-                ask_voice_turn.delete_turn(s3, bucket, sub, turn)
+                # Cancelled or given up on: a worker may still be running, and the
+                # marker is what stops it writing `done` and an audit row. Keep it
+                # (writing it for a stale turn) and let the day-old sweep remove it.
+                keep = out['status'] == 'cancelled' or stale
+                if stale:
+                    ask_voice_turn.put_cancel(s3, bucket, sub, turn)
+                ask_voice_turn.delete_turn(s3, bucket, sub, turn, keep_marker=keep)
             except Exception as e:  # noqa: BLE001 - cleanup is best effort
                 logger.warning('voice result: delete failed: %s', type(e).__name__)
         return ok(out)

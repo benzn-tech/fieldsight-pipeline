@@ -135,13 +135,23 @@ def put_cancel(s3, bucket, caller_sub, turn_id):
     s3.put_object(Bucket=bucket, Key=cancel_key(caller_sub, turn_id), Body=b"")
 
 
-def delete_turn(s3, bucket, caller_sub, turn_id):
-    for key in (state_key(caller_sub, turn_id), cancel_key(caller_sub, turn_id)):
+def delete_turn(s3, bucket, caller_sub, turn_id, keep_marker=False):
+    """Delete the turn's state, and its cancel marker unless keep_marker. A turn
+    the device stopped waiting for may still have a worker running; the marker is
+    the only thing that stops it writing `done` and an audit row, so the caller
+    keeps it for those turns and the day-old sweep removes it later."""
+    keys = [state_key(caller_sub, turn_id)]
+    if not keep_marker:
+        keys.append(cancel_key(caller_sub, turn_id))
+    for key in keys:
         s3.delete_object(Bucket=bucket, Key=key)
 
 
 def _epoch(t) -> float:
     return t.timestamp() if isinstance(t, datetime) else float(t)
+
+
+SWEEP_MAX_DELETES = 50
 
 
 def sweep_old(s3, bucket, caller_sub, now, max_age_s=86400):
@@ -159,6 +169,10 @@ def sweep_old(s3, bucket, caller_sub, now, max_age_s=86400):
             if _epoch(obj["LastModified"]) < cutoff:
                 s3.delete_object(Bucket=bucket, Key=obj["Key"])
                 deleted += 1
+                # Bounded: this runs before the worker invoke on the user's
+                # critical path; whatever is left goes on the next ask.
+                if deleted >= SWEEP_MAX_DELETES:
+                    return deleted
         if not resp.get("IsTruncated"):
             return deleted
         token = resp.get("NextContinuationToken")

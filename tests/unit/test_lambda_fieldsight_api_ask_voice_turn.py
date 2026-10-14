@@ -187,7 +187,9 @@ def test_result_cancel_wins_over_done(s3):
     avt.put_cancel(s3, BUCKET, "sub-1", TURN)
     r = result({"turn": TURN})
     assert body(r) == {"status": "cancelled"}
-    assert not s3.objs
+    # The marker outlives the answer to the device: a worker still running must
+    # keep seeing it, or it writes `done` and an audit row for a cancelled turn.
+    assert list(s3.objs) == [(BUCKET, avt.cancel_key("sub-1", TURN))]
 
 
 def test_result_stale_becomes_error(s3):
@@ -195,7 +197,9 @@ def test_result_stale_becomes_error(s3):
     put(s3, {"status": "pending", "created_at": c.t - 91})
     r = result({"turn": TURN}, clock=c)
     assert body(r) == {"status": "error", "error": "No answer"}
-    assert not s3.objs
+    # Given up on: a marker is written so a slow worker stops instead of
+    # writing an orphan `done`.
+    assert list(s3.objs) == [(BUCKET, avt.cancel_key("sub-1", TURN))]
 
 
 def test_result_not_stale_at_60s(s3):

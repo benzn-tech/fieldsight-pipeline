@@ -168,6 +168,24 @@ def test_sweep_deletes_only_this_callers_old_objects(env):
     assert new_mine in s3.objs and old_other in s3.objs
 
 
+def test_sweep_is_capped(env):
+    s3 = env.s3
+    now = datetime.now(timezone.utc)
+    for i in range(avt.SWEEP_MAX_DELETES + 7):
+        k = avt.state_key(SUB, "%032x" % i)
+        s3.objs[k] = (b"{}", now - timedelta(days=2), None)
+    assert avt.sweep_old(s3, BUCKET, SUB, now) == avt.SWEEP_MAX_DELETES
+    assert len(s3.objs) == 7
+
+
+def test_delete_turn_can_keep_the_marker(env):
+    s3 = env.s3
+    for k in (avt.state_key(SUB, "1" * 32), avt.cancel_key(SUB, "1" * 32)):
+        s3.put_object(BUCKET, k, b"{}")
+    avt.delete_turn(s3, BUCKET, SUB, "1" * 32, keep_marker=True)
+    assert list(s3.objs) == [avt.cancel_key(SUB, "1" * 32)]
+
+
 def test_prefix_overlaps_no_notification_prefix():
     # Hard-coded from spec section 4 and the other S3-triggered prefixes in this repo.
     notification = ["users/", "audio_segments/", "reports/", "transcripts/",
