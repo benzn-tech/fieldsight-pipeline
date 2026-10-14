@@ -137,7 +137,9 @@ SECRET = os.environ.get("EVAL_DB_SECRET_ARN",
 DATABASE = os.environ.get("EVAL_DB_NAME", "fieldsight")
 
 ASK_K = 5            # lambda_ask_agent: body.get("k", 5)
-LIST_K = 30          # lambda_ask_agent._rag_search_list: body.get("k", 30)
+# lambda_ask_agent._rag_search_list: body.get("k", 30) before 2026-10-14, 64 after (rag-search clamp
+# raised 32 -> 64 in the same change). EVAL_LIST_K lets the ruler mirror whichever source ref it imports.
+LIST_K = int(os.environ.get("EVAL_LIST_K", "30"))
 PROD_RERANK_BUDGET_MS = 3000
 LIST_RERANK_SYSTEMS = {"rerank@32": 32, "rerank@50": 50}
 SYSTEMS = ["prod", "link-rollup", "rerank@32", "rerank@50"]
@@ -154,8 +156,22 @@ REWRITES = [
 ]
 
 
+OPTIONAL_REWRITES = [
+    ("EXISTS (SELECT 1 FROM topics t WHERE t.id = c.topic_id AND t.superseded_at IS NULL)",
+     "EXISTS (SELECT 1 FROM topics t WHERE t.id = c.topic_id)"),
+    ("%(source_family)s::text", "CAST(NULL AS text)"),
+]
+
+
 def data_api_sql():
     sql = search_sql.build_search_sql()
+    # Schema compatibility for measuring newer source against a database that has
+    # not migrated yet (the `fieldsight` database has no topics.superseded_at), and
+    # for develop's source_family switch, which this ruler leaves off (None = no
+    # filter, as in every call the ruler models). Optional: absent in older source.
+    # Applied to every ref alike, so before/after comparisons stay like for like.
+    for old, new in OPTIONAL_REWRITES:
+        sql = sql.replace(old, new)
     for old, new in REWRITES:
         if old not in sql:
             raise SystemExit("production search SQL no longer contains %r -- "
