@@ -20,6 +20,18 @@ def test_family_predicate_text_is_the_contract():
     assert "c.source_s3_key IS NULL" in p and "NOT LIKE 'extractions/%%'" in p
 
 
+def test_session_arm_falls_back_to_uncovered_report_rows():
+    p = family_predicate("c")
+    assert "NOT EXISTS (SELECT 1 FROM report_chunks s" in p
+    assert "s.site_id = c.site_id" in p and "s.report_date = c.report_date" in p
+    # NULL user_id must match NULL user_id, or an unattributed day is never "covered".
+    assert "s.user_id IS NOT DISTINCT FROM c.user_id" in p
+    assert "s.source_s3_key LIKE 'extractions/%%'" in p
+    # The report arm is untouched: no coverage subquery inside it.
+    report_arm = p.split("= 'report'")[1]
+    assert "NOT EXISTS" not in report_arm
+
+
 def test_search_sql_carries_the_family_predicate_on_both_arms():
     # vec and lex arms share _scope_predicate, so the predicate appears twice.
     assert build_search_sql().count(family_predicate("c")) == 2

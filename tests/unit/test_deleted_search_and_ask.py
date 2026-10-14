@@ -64,7 +64,9 @@ def test_one_definition_of_the_predicate_not_two():
     assert red.DELETED_TOPIC_PREDICATE is dp.DELETED_TOPIC_PREDICATE
     assert red.DELETED_SOURCE_PREDICATE is dp.DELETED_SOURCE_PREDICATE
     src = open(os.path.join(SRC, "repositories", "search_sql.py"), encoding="utf-8").read()
-    assert "NOT EXISTS" not in src, "search_sql must USE the shared predicate, not copy it"
+    # The family coverage fallback legitimately uses NOT EXISTS on report_chunks; what must
+    # never appear here is a copy of the tombstone subquery over `redactions`.
+    assert "FROM redactions" not in src, "search_sql must USE the shared predicate, not copy it"
 
 
 # ---- Ask: the stored-report path is gone ----------------------------------

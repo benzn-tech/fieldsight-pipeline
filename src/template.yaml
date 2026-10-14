@@ -4052,6 +4052,11 @@ Resources:
                 - !Sub arn:aws:s3:::${IngestBucketName}/index_requests/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/index_vectors/*
                 - !Sub arn:aws:s3:::${IngestBucketName}/extractions/*
+                # A batched transcript's time map (audio_segments/{folder}/{date}/*_batch_map.json),
+                # read by the session assembler shared with extract-session. Without it every
+                # batched session logs "batch map ... is unreadable -- keeping filename
+                # arithmetic" and word times can drift ~26 s. Same form as ExtractSessionFunction.
+                - !Sub arn:aws:s3:::${IngestBucketName}/audio_segments/*
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/index_vectors/*
@@ -4067,6 +4072,9 @@ Resources:
                     # ListBucket a missing key is a 404 (a clean "embed everything"), without
                     # it S3 answers 403 and every first run logs a false read failure.
                     - index_vectors/*
+                    # A missing batch map must read as 404 (keep filename arithmetic
+                    # quietly), not 403 -- same as ExtractSessionFunction's ListBucket.
+                    - audio_segments/*
 
   # ----------------------------------------------------------
   # Lambda 14: Item Writer (Phase 4b) — S3 event on extractions/,
