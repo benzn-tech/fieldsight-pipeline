@@ -115,7 +115,7 @@ def restate(question: str, *, web_intent: bool, timeout_s: float = 1.2) -> dict:
     body = json.dumps({
         "model": model,
         "messages": [{"role": "system", "content": RESTATE_SYSTEM},
-                     {"role": "user", "content": question}],
+                     {"role": "user", "content": "Current question: " + question}],
         "max_tokens": 40,
         "temperature": 0,
     }).encode("utf-8")
@@ -137,6 +137,10 @@ def restate(question: str, *, web_intent: bool, timeout_s: float = 1.2) -> dict:
         return _result(None, "error", started)
     if not isinstance(content, str):
         return _result(None, "error", started)
+    # urlopen's timeout bounds each socket read, not the whole call, so a slow
+    # trickle could overrun; a restatement that arrives late is worthless.
+    if time.monotonic() - started > timeout_s:
+        return _result(None, "timeout", started)
     middle = re.sub(r"^[\"'“]+|[\"'”]+$", "", content.strip()).strip()
     g = guard_middle(question, middle)
     if not g["ok"]:

@@ -34,27 +34,35 @@ _PHRASES = (
     r"look\s+(?:it\s+|that\s+)?up\s+online",
     r"google\s+(?:it|that)",
     r"on\s+the\s+internet",
-    r"check\s+online",
+    # Narrower than the spec list: "check online induction status" is ordinary
+    # site speech, so this only counts before a clause word or at the end.
+    r"check\s+online(?=\s+(?:what|whether|if|how|for|that|the|about)\b|[\s.,;:!?]*$)",
 )
-_INTENT = re.compile(r"\b(?:%s)\b" % "|".join(_PHRASES), re.I)
+# (?<![-\w]) / (?![-\w]) rather than \b: "the internet-connected panel" must not match.
+_ALT = r"(?<![-\w])(?:%s)(?![-\w])" % "|".join(_PHRASES)
+_INTENT = re.compile(_ALT, re.I)
 # Commas and spaces before the phrase, any punctuation after it: the phrase
 # usually ends a sentence of its own ("Searching online. Find out ...").
-_STRIP = re.compile(r"[\s,]*\b(?:%s)\b[\s,.;:!?]*" % "|".join(_PHRASES), re.I)
+_STRIP = re.compile(r"[\s,]*" + _ALT + r"[\s,.;:!?]*", re.I)
 _LEADING_CONNECTIVE = re.compile(r"^(?:and\b|[\s,.;:])+", re.I)
+# A remainder ending on one of these is a fragment ("Did the survey say to"),
+# so the whole transcript is the better question.
+_DANGLING = frozenset("to you it is the a about can me us and of for what".split())
 
 
 def detect_intent(transcript: str) -> tuple[bool, str]:
     """(web_intent, question for retrieval and answering).
 
     The device still shows and logs the unstripped transcript. If stripping
-    leaves under two words the phrase WAS the whole utterance ("google that"),
-    so the original goes through unchanged rather than an empty question."""
+    leaves a fragment (under three words, or ending on a stopword) the phrase
+    was most of the utterance, so the original goes through unchanged."""
     text = transcript if isinstance(transcript, str) else ""
     if not _INTENT.search(text):
         return False, text
     stripped = _STRIP.sub(" ", text)
     stripped = _LEADING_CONNECTIVE.sub("", " ".join(stripped.split())).strip()
-    if len(stripped.split()) < 2:
+    words = stripped.split()
+    if len(words) < 3 or words[-1].strip(".,;:!?\"'").lower() in _DANGLING:
         return True, text
     return True, stripped
 
@@ -66,6 +74,7 @@ def speakable(text) -> bool:
     low = text.lower()
     if "http" in low or "www." in low or "](" in text:
         return False
-    if any(line.lstrip().startswith(("-", "*", "•")) for line in text.splitlines()):
+    # A marker needs whitespace after it: "-5 degrees overnight" is a number, not a bullet.
+    if re.search(r"^\s*[-*•]\s", text, re.M):
         return False
     return len(text.split()) <= 60

@@ -154,3 +154,42 @@ def test_compose_voice_true_appends_the_rules(monkeypatch):
     assert voiced.of("web_compose")[0]["prompt"] == (
         plain.of("web_compose")[0]["prompt"] + "\n\n" + voice_web.VOICE_RULES)
     assert out["composed"] is True
+
+
+@pytest.mark.parametrize("said", [
+    "can you google that",
+    "is it on the internet",
+    "Did the survey say to search online",
+])
+def test_a_fragment_left_after_stripping_keeps_the_original(said):
+    assert voice_web.detect_intent(said) == (True, said)
+
+
+def test_a_hyphen_after_the_phrase_is_not_the_phrase():
+    said = "where is the internet-connected panel"
+    assert voice_web.detect_intent(said) == (False, said)
+    said = "the on the internet-facing router"
+    assert voice_web.detect_intent(said)[0] is False
+
+
+@pytest.mark.parametrize("said", [
+    "check online induction",
+    "Check online induction status for Hanlon",
+])
+def test_check_online_needs_a_clause_word_after_it(said):
+    assert voice_web.detect_intent(said) == (False, said)
+
+
+def test_check_online_before_a_clause_word_or_at_the_end_is_intent():
+    assert voice_web.detect_intent("check online whether the span is 1.8 metres") == (
+        True, "whether the span is 1.8 metres")
+    # A remainder ending on a stopword is a fragment, so the original is kept.
+    assert voice_web.detect_intent("check online what the max span is") == (
+        True, "check online what the max span is")
+    assert voice_web.detect_intent("what is the max span, check online")[0] is True
+
+
+def test_a_leading_minus_sign_is_not_a_bullet():
+    assert voice_web.speakable("-5 degrees overnight") is True
+    assert voice_web.speakable("-  a dash bullet") is False
+    assert voice_web.speakable("*bold*") is True

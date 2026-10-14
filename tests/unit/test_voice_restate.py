@@ -122,7 +122,7 @@ def test_success_assembles_and_sends_exactly_the_contract(env, monkeypatch):
     assert body["model"] == "meta-llama/llama-3.1-8b-instruct"
     assert body["max_tokens"] == 40 and body["temperature"] == 0
     assert body["messages"] == [{"role": "system", "content": vr.RESTATE_SYSTEM},
-                                {"role": "user", "content": Q}]
+                                {"role": "user", "content": "Current question: " + Q}]
 
 
 def test_web_intent_changes_only_the_tail(env, monkeypatch):
@@ -195,3 +195,17 @@ def test_missing_key_or_base_url_is_no_key(env, monkeypatch, missing):
     monkeypatch.delenv(missing)
     r = vr.restate(Q, web_intent=False)
     assert r["text"] is None and r["reason"] == "no_key" and "req" not in sent
+
+
+def test_a_slow_read_overruns_the_total_budget(env, monkeypatch):
+    # urlopen's timeout is per socket read; the call as a whole must still be bounded.
+    clock = {"t": 100.0}
+    monkeypatch.setattr(vr.time, "monotonic", lambda: clock["t"])
+
+    def slow(req, timeout=None):
+        clock["t"] += 2.0
+        return FakeResp(completion(GOOD))
+
+    monkeypatch.setattr(vr.urllib.request, "urlopen", slow)
+    r = vr.restate(Q, web_intent=False, timeout_s=1.2)
+    assert r["text"] is None and r["reason"] == "timeout" and r["ms"] == 2000
