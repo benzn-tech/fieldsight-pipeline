@@ -337,8 +337,9 @@ Parameters:
     Description: >-
       Let the voice Ask worker answer from the open web when the excerpts do
       not answer the question. Separate from EnableWebAnswer (the typed /ask
-      path) so voice can be enabled after its latency is measured. TEST-only;
-      prod leaves it unset (false).
+      path) so voice can be enabled after its latency is measured. Voice web
+      answers need BOTH this and EnableWebAnswer true: web_answer.enabled()
+      still gates the whole branch. TEST-only; prod leaves it unset (false).
 
   EnableWebAnswer:
     Type: String
@@ -2423,6 +2424,9 @@ Resources:
           # spend the entire request and leave nothing for retrieval, the
           # rewrite or synthesis.
           LLM_HTTP_TIMEOUT: '40'
+          # Caps the whole fallback chain (llm_utils), so muse->luna->mimo at 40 s
+          # each cannot run past ASK_DEADLINE_SECONDS and into the 60 s runtime kill.
+          LLM_CHAIN_BUDGET_SECONDS: '44'
           # Voluntary deadline: the agent's whole-request budget. A ladder
           # constant, not a switch -- kept a literal (not a Parameter) so one
           # reader (_env_value) works for every number in the ladder; see
@@ -2462,12 +2466,7 @@ Resources:
           # unconditional) — safe in practice on the test stack; see the W1001
           # note in the top-of-file Metadata block.
           VOICE_AUDIT_FUNCTION: !Ref VoiceAuditFunction
-          # I2: haiku, not sonnet. The user-facing ask round-trip is capped by
-          # APIGW's hard 29s integration timeout on ApiFunction (Timeout: 30
-          # above) -- and RAG synthesis adds two extra hops (embed call +
-          # rag-search invoke) on top of the Claude call itself. A 2048-token
-          # sonnet completion risks blowing that budget; haiku is fast and
-          # matches the legacy S3 path's HAIKU_MODEL.
+          # Same value as AskAgentFunction; see the reasoning there.
           CLAUDE_MODEL: claude-haiku-4-5-20251001
           LLM_PROVIDER: !Ref LlmProvider
           LLM_TEMPERATURE: !Ref LlmTemperature
