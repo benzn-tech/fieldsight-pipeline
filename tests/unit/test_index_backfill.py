@@ -1,5 +1,6 @@
 """index_backfill event: count (dry run, the default) or emit index requests."""
 import pytest
+from deleted_predicates import visible_topics_predicate
 
 mod = pytest.importorskip("lambda_ingest", reason="requires psycopg (installed in CI)")
 
@@ -90,6 +91,6 @@ def test_limit_is_capped_and_filters_bind(wired):
     mod.lambda_handler({"index_backfill": {"limit": 10**6, "user_folder": "Ben_X",
                                            "date_from": "2026-07-01"}}, None)
     sql, params = conn.sql[0]
-    assert "superseded_at IS NULL" in sql
+    assert visible_topics_predicate("t") in sql
     assert params[-1] == 2000 and "2026-07-01" in params
     assert any(str(p).startswith("extractions/Ben") for p in params)
