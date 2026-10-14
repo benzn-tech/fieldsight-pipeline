@@ -4,8 +4,23 @@ from deleted_predicates import visible_chunks_predicate
 
 def family_predicate(alias: str = "c") -> str:
     # NULL family = no filter (callers that predate the switch stay byte-identical).
+    #
+    # 'session' reads session-family rows (extractions/ keys) and ALSO falls back to
+    # report-family rows for any (site, user, day) the session index does not cover yet:
+    # a day that only ever had a nightly report (no extraction) has zero session rows, and
+    # a pure family filter would make search/Ask answer "No relevant records" for it.
+    # "Covered" = at least one session row exists for the same (site_id, user_id,
+    # report_date); user_id is compared IS NOT DISTINCT FROM so NULL-user rows match each
+    # other. The coverage test deliberately ignores tombstones/supersession: a deleted
+    # session row must keep its day covered, or deleting a recording would resurface the
+    # report-family copy of the same day. Correlated NOT EXISTS so it rides
+    # idx_report_chunks_site_date. The 'report' arm is unchanged.
     return (f"(%(source_family)s::text IS NULL "
-            f"OR (%(source_family)s::text = 'session' AND {alias}.source_s3_key LIKE 'extractions/%%') "
+            f"OR (%(source_family)s::text = 'session' AND ({alias}.source_s3_key LIKE 'extractions/%%' "
+            f"OR NOT EXISTS (SELECT 1 FROM report_chunks s WHERE s.site_id = {alias}.site_id "
+            f"AND s.report_date = {alias}.report_date "
+            f"AND s.user_id IS NOT DISTINCT FROM {alias}.user_id "
+            f"AND s.source_s3_key LIKE 'extractions/%%'))) "
             f"OR (%(source_family)s::text = 'report' AND ({alias}.source_s3_key IS NULL "
             f"OR {alias}.source_s3_key NOT LIKE 'extractions/%%')))")
 
