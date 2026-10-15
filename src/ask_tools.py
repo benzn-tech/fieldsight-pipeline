@@ -10,10 +10,16 @@ company would let the model widen its own visibility.
 """
 from __future__ import annotations
 
+import json
+import logging
 import re
+import time
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 
 import query_slots
+
+logger = logging.getLogger()
 
 RELATIVE_DATES = ("today", "yesterday", "day_before_yesterday", "this_week",
                   "last_week", "this_month", "last_month")
@@ -175,3 +181,255 @@ def validate_call(call, today):
         return out, None
     except _Bad as bad:
         return None, {"error": "bad_args", "field": bad.field}
+
+
+# --- execution (spec §3.2-§3.4) ---------------------------------------------
+
+# Spec §3.2: <= 2,500 tokens per tool result, measured as json.dumps(items).
+MAX_RESULT_CHARS = 10_000
+MAX_TEXT = 600
+# Spec §3.4: one rag-search batch is at most 4 calls and never plans past 20 s
+# (RagSearchFunction Timeout is 23 s).
+MAX_BATCH = 4
+MAX_DEADLINE_S = 20
+DEFAULT_K = 8
+_SEARCH_SHAPED = ("search_records", "latest_activity")
+# Keys the orchestrator maps onto a citation card (lambda_ask_agent._build_citations).
+# Always present on topic/chunk items, even when None, so a card never needs a
+# re-fetch; every other None-valued key is dropped to save budget.
+_CITATION_KEYS = ("source", "date", "site", "site_slug", "title", "chunk_type",
+                  "text", "time_start")
+
+
+class RefAssigner:
+    """One per Ask turn, shared by the records tools (R#) and the orchestrator's
+    web tool (W#). The same (kind, ident) always gets the same ref; each prefix
+    counts on its own."""
+
+    def __init__(self):
+        self._refs, self._next = {}, {}
+
+    def assign(self, kind, ident, prefix="R"):
+        key = (str(kind), str(ident))
+        if key not in self._refs:
+            n = self._next.get(prefix, 1)
+            self._refs[key] = f"{prefix}{n}"
+            self._next[prefix] = n + 1
+        return self._refs[key]
+
+
+@dataclass
+class ToolContext:
+    caller_sub: str
+    today: object                   # date | None -- the caller's LOCAL today
+    deadline: float                 # absolute time.monotonic() timestamp
+    lambda_client: object
+    function_name: str
+    refs: RefAssigner = field(default_factory=RefAssigner)
+    clock: object = time.monotonic
+
+
+def _embed(texts):
+    import dashscope_utils
+    return dashscope_utils.embed(texts)
+
+
+def _post_search(query, rows, k):
+    """The admit-one-lexical-hit + rerank chain the Ask path runs today
+    (`_rerank_chunks` admits the lexical hit itself when rerank is off).
+    Imported lazily so this module stays importable without the ask-agent."""
+    import lambda_ask_agent as laa
+    return laa._rerank_chunks(query, rows, k)
+
+
+def _time_start(row):
+    try:
+        import lambda_ask_agent as laa
+        return laa._citation_time_start(row)
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+def _metadata(row):
+    md = row.get("metadata")
+    if isinstance(md, str):
+        try:
+            md = json.loads(md)
+        except ValueError:
+            md = None
+    return md if isinstance(md, dict) else {}
+
+
+def _item(name, args, row, call_id):
+    """(kind, dedupe ident, item-without-ref) for one dispatcher row."""
+    if name == "find_people":
+        return "person", row.get("person_ref"), {
+            "kind": "person", "provenance": "records", "who": row.get("name"),
+            "person_ref": row.get("person_ref"), "text": (row.get("name") or "")[:MAX_TEXT]}
+    if name == "count_metric":
+        # Per call: two metrics in one turn are two pieces of evidence.
+        ident = f"{args.get('metric')}:{args.get('date_from')}:{args.get('date_to')}:{call_id}"
+        return "metric", ident, {
+            "kind": "metric", "provenance": "records", "metric": args.get("metric"),
+            "text": json.dumps(row, default=str)[:MAX_TEXT]}
+    if "chunk_text" in row:
+        md = _metadata(row)
+        span = md.get("window_span")
+        return "chunk", row.get("id"), {
+            "kind": "chunk", "provenance": "records",
+            "date": str(row.get("report_date") or ""),
+            "time": span if isinstance(span, str) else None,
+            "site": row.get("site_name"), "site_slug": row.get("site_slug"),
+            "who": row.get("user_name"),
+            "title": row.get("topic_title") or row.get("title"),
+            "text": (row.get("chunk_text") or "")[:MAX_TEXT],
+            "topic_id": row.get("topic_id"), "chunk_id": row.get("id"),
+            "chunk_type": row.get("chunk_type"),
+            "time_start": _time_start(dict(row, metadata=md)),
+            "source": row.get("source_s3_key")}
+    return "topic", row.get("id"), {
+        "kind": "topic", "provenance": "records",
+        "date": str(row.get("report_date") or ""),
+        "time": row.get("time_range"),
+        "site": row.get("site_name"), "site_slug": row.get("site_slug"),
+        "who": row.get("user_name"),
+        "title": row.get("title") or row.get("topic_title"),
+        "text": (row.get("summary") or "")[:MAX_TEXT],
+        "topic_id": row.get("id"),
+        "chunk_type": row.get("chunk_type"), "time_start": None,
+        "source": row.get("source_s3_key")}
+
+
+def _envelope(name, call_id, args, rows, meta, ctx):
+    items, used = [], 2                                 # the list's brackets
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        kind, ident, item = _item(name, args, row, call_id)
+        keep = _CITATION_KEYS if kind in ("topic", "chunk") else ()
+        item = {k: v for k, v in item.items() if v is not None or k in keep}
+        # Measured before a ref is assigned: a dropped item must not consume one.
+        size = len(json.dumps(dict(item, ref="R0000"), default=str)) + (2 if items else 0)
+        if used + size > MAX_RESULT_CHARS:
+            meta["truncated"] = True
+            break
+        items.append({"ref": ctx.refs.assign(kind, ident), **item})
+        used += size
+    meta.setdefault("truncated", False)
+    return {"tool": name, "id": call_id, "items": items, "meta": meta}
+
+
+def _bad(call, call_id, meta):
+    name = call.get("name") if isinstance(call, dict) else None
+    return {"tool": name if isinstance(name, str) else None, "id": call_id,
+            "items": [], "meta": meta}
+
+
+def _invoke(ctx, wire):
+    """{call id: result} from ONE rag-search invoke. Raises on any failure."""
+    left = max(0, min(ctx.deadline - ctx.clock(), MAX_DEADLINE_S))
+    resp = ctx.lambda_client.invoke(
+        FunctionName=ctx.function_name, InvocationType="RequestResponse",
+        Payload=json.dumps({"mode": "tools", "sub": ctx.caller_sub,
+                            "deadline_s": left, "calls": wire}))
+    if resp.get("FunctionError"):
+        raise RuntimeError("rag-search FunctionError")
+    body = json.loads(resp["Payload"].read())
+    return {r["id"]: r for r in body["results"] if isinstance(r, dict)}
+
+
+def execute(calls, ctx):
+    """One envelope per call, in order (spec §3.2). Never raises.
+
+    Validates and normalizes args, injects identity and the caller's today,
+    embeds search-shaped queries, runs every valid call in ONE rag-search
+    invoke, reranks search results, assigns turn-wide refs, enforces the
+    output budget. Logs names, counts and timings only."""
+    try:
+        return _execute(calls, ctx)
+    except Exception as exc:                            # noqa: BLE001 -- last resort
+        logger.warning("ask tools execute failed: %s", type(exc).__name__)
+        calls = calls if isinstance(calls, list) else []
+        return [_bad(c, str(i), {"error": "upstream"}) for i, c in enumerate(calls)]
+
+
+def _execute(calls, ctx):
+    calls = calls if isinstance(calls, list) else []
+    envs = [None] * len(calls)
+    pending = {}                                        # call id -> (name, args, clamped)
+    for i, call in enumerate(calls):
+        cid = str(i)
+        if i >= MAX_BATCH:
+            envs[i] = _bad(call, cid, {"error": "bad_args", "field": "calls"})
+            continue
+        args, err = validate_call(call, ctx.today)
+        if err:
+            envs[i] = _bad(call, cid, dict(err))
+            continue
+        clamped = args.pop("clamped", None)
+        if (call["name"] == "latest_activity" and "on_or_before" not in args
+                and ctx.today is not None):
+            args["on_or_before"] = ctx.today.isoformat()
+        pending[cid] = (call["name"], args, clamped)
+
+    failed = {}                                         # call id -> meta
+    need = [cid for cid, (name, args, _) in pending.items()
+            if name in _SEARCH_SHAPED and args.get("query")]
+    vectors = {}
+    if need:
+        t0 = ctx.clock()
+        try:
+            vecs = _embed([pending[cid][1]["query"] for cid in need])
+            if len(vecs) != len(need):
+                raise ValueError("embedding count mismatch")
+            vectors = dict(zip(need, vecs))
+        except Exception as exc:                        # noqa: BLE001
+            logger.warning("ask tools embed failed: %s n=%d", type(exc).__name__, len(need))
+            failed.update({cid: {"error": "upstream"} for cid in need})
+        logger.info("ask tools embed n=%d ms=%d", len(need), int((ctx.clock() - t0) * 1000))
+
+    wire = []
+    for cid, (name, args, _) in pending.items():
+        if cid in failed:
+            continue
+        w = {"id": cid, "name": name, "args": args}
+        if cid in vectors:
+            w["query_embedding"] = vectors[cid]
+        wire.append(w)
+
+    results = {}
+    if wire:
+        t0 = ctx.clock()
+        try:
+            results = _invoke(ctx, wire)
+        except Exception as exc:                        # noqa: BLE001
+            logger.warning("ask tools batch failed: %s calls=%d", type(exc).__name__, len(wire))
+            failed.update({w["id"]: {"error": "upstream"} for w in wire})
+        logger.info("ask tools batch calls=%d ms=%d", len(wire),
+                    int((ctx.clock() - t0) * 1000))
+
+    for cid, (name, args, clamped) in pending.items():
+        r = None if cid in failed else results.get(cid)
+        if r is None:
+            meta, rows = dict(failed.get(cid) or {"error": "upstream"}), []
+        else:
+            meta = dict(r["meta"]) if isinstance(r.get("meta"), dict) else {}
+            rows = r["rows"] if isinstance(r.get("rows"), list) else []
+        if name in _SEARCH_SHAPED and args.get("query") and rows:
+            k = args.get("k") or DEFAULT_K
+            try:
+                rows = _post_search(args["query"], rows, k)
+            except Exception as exc:                    # noqa: BLE001
+                logger.warning("ask tools post-search failed: %s", type(exc).__name__)
+                rows = rows[:k]
+        if clamped:
+            meta["clamped"] = clamped
+        if args.get("date_from"):
+            meta.setdefault("range", {"from": args["date_from"],
+                                      "to": args.get("date_to") or args["date_from"]})
+        env = _envelope(name, cid, args, rows, meta, ctx)
+        logger.info("ask tool %s items=%d rows=%d empty=%s err=%s truncated=%s",
+                    name, len(env["items"]), len(rows), meta.get("empty_reason"),
+                    meta.get("error"), meta.get("truncated"))
+        envs[int(cid)] = env
+    return envs
