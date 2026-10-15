@@ -15,7 +15,6 @@ argument or row text.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import math
@@ -23,6 +22,7 @@ import os
 import time
 from datetime import date, datetime, timedelta, timezone
 
+import ask_tools_log
 import text_normalize
 from lexical_terms import or_query, query_terms
 from repositories import aliases, chunks, sites, topics, users
@@ -40,9 +40,8 @@ DEFAULT_K = 8
 # matching chunk ranked below k*2 is not lost to the gate filter (_search's own
 # ceiling is 64).
 LATEST_DAY_SEARCH_K = 64
-# Argument NAMES that may appear in logs (never values). Anything else is "?".
-_LOGGABLE_FIELDS = frozenset(("date_from", "date_to", "on_or_before", "site", "person",
-                              "query", "k", "name", "metric"))
+# A search never fetches more than this (rag-search's own list clamp).
+MAX_SEARCH_K = 64
 _TOPIC_TEXT = ("title", "summary")
 # _search already normalizes chunk_text; normalizing it again is not idempotent
 # when a right_term contains its wrong_term ("Jon" -> "Jon Smith").
@@ -194,11 +193,22 @@ def _need_embedding(call, meta):
         raise _NoRows()
 
 
+def _candidate_pool(call, args):
+    """Rows a search hands ask_tools' post-search: k*2, widened to the orchestrator's
+    `candidate_k` (the RERANK_CANDIDATE_K pool `_rag_answer` reranks over), capped
+    at MAX_SEARCH_K. A malformed candidate_k is ignored, never an error."""
+    base = (args.get("k") or DEFAULT_K) * 2
+    ck = call.get("candidate_k")
+    if not isinstance(ck, int):          # bool or <= 0 lose to base below
+        ck = 0
+    return min(MAX_SEARCH_K, max(base, ck))
+
+
 def _run_search(conn, caller, sc, args, call, search_fn, site_id, user_id, meta,
                 search_k=None):
     _need_embedding(call, meta)
     ev = {"sub": caller["sub"], "query_embedding": call.get("query_embedding"),
-          "question": args["query"], "k": search_k or (args.get("k") or DEFAULT_K) * 2}
+          "question": args["query"], "k": search_k or _candidate_pool(call, args)}
     if args.get("date_from"):
         ev["date_from"], ev["date_to"] = args["date_from"], args.get("date_to") or args["date_from"]
     if site_id:
@@ -271,10 +281,10 @@ def _latest_activity(conn, caller, sc, a, meta, call, search_fn, source_family, 
     rows = _run_search(conn, caller, sc, dict(a, date_from=day, date_to=day), call,
                        search_fn, site_id, user_id, meta, search_k=LATEST_DAY_SEARCH_K)
     # The day was chosen by the gate; return only that day's items that pass it,
-    # then as many as an ordinary search returns (k*2) for ask_tools' post-search.
+    # then as many as an ordinary search returns for ask_tools' post-search.
     rows = [r for r in rows if r.get("lexical_hit")
             or (r.get("distance") is not None and r["distance"] <= gate)]
-    rows = rows[:(a.get("k") or DEFAULT_K) * 2]
+    rows = rows[:_candidate_pool(call, a)]
     if not rows:
         meta["empty_reason"] = _no_match(sc)
     return rows
@@ -323,23 +333,9 @@ def _deadline(event):
     return min(v, MAX_DEADLINE_S)
 
 
-def _sub_hash(sub) -> str:
-    """Same as ask_voice_turn.sub_hash (sha256, 12 hex chars), so one caller's lines
-    can be joined across the voice worker, ask-agent and rag-search."""
-    return hashlib.sha256(str(sub).encode("utf-8")).hexdigest()[:12]
-
-
-def _arg_shape(args):
-    """Which fields are set and the range length in days. Never a value."""
-    fields = ",".join(sorted(f if f in _LOGGABLE_FIELDS else "?" for f in args))
-    days = "-"
-    try:
-        if args.get("date_from"):
-            days = str((date.fromisoformat(args.get("date_to") or args["date_from"])
-                        - date.fromisoformat(args["date_from"])).days + 1)
-    except (TypeError, ValueError):
-        days = "?"
-    return fields, days
+# One log-shape helper for both sides of the seam (ask_tools_log, stdlib only).
+_sub_hash = ask_tools_log.sub_hash
+_arg_shape = ask_tools_log.arg_shape
 
 
 def run(conn, caller, sc, event, *, search_fn, metric_fn, clock=time.monotonic,

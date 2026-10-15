@@ -78,6 +78,16 @@ def test_lists_visible_work_topics_once_per_family(db, world):
     assert pour["time_range"] == "09:00 - 09:40" and pour["site_name"] == "S1"
 
 
+def test_rows_carry_the_site_slug_for_citation_cards(db, world):
+    w = world
+    db.execute("UPDATE sites SET slug='s-one' WHERE id=%s", (w["s1"]["id"],))
+    _t(db, w, "s1", "ben", D, "Pour", _ext("Ben", D))
+    _t(db, w, "s2", "ben", D, "Other", _ext("Ben", D, "c"))
+    db.execute("UPDATE sites SET slug=NULL WHERE id=%s", (w["s2"]["id"],))
+    rows = topics.day_overview_rows(db, _ids(w, "s1", "s2"), D, D)
+    assert {r["title"]: r["site_slug"] for r in rows} == {"Pour": "s-one", "Other": None}
+
+
 def test_graded_filter_hides_other_authors_and_null_user(db, world):
     w = world
     _t(db, w, "s1", "mike", D, "Mike's", _ext("Mike", D))

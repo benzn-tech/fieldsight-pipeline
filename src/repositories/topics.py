@@ -1351,7 +1351,7 @@ def day_overview_rows(conn, site_ids, date_from, date_to, *, author_ids=None,
     where, params = _ask_tools_where(site_ids, author_ids=author_ids,
                                      site_id=site_id, user_id=user_id)
     sql = (
-        "SELECT t.id, t.site_id, s.name AS site_name, t.user_id, "
+        "SELECT t.id, t.site_id, s.name AS site_name, s.slug AS site_slug, t.user_id, "
         "NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '') AS user_name, "
         "t.report_date, t.time_range, t.title, t.summary, t.source_s3_key, "
         "(SELECT count(*) FROM action_items a WHERE a.topic_id = t.id) AS n_tasks, "

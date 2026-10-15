@@ -27,6 +27,12 @@ def _echo(rows=(), meta=None):
                         "meta": dict(meta or {})} for c in ev["calls"]]
 
 
+def _size(items):
+    """The budget's unit: the tool result as the orchestrator renders it (unicode, not
+    escaped -- a CJK character is one character, not six)."""
+    return len(json.dumps(items, ensure_ascii=False))
+
+
 def _ctx(fake, today=date(2026, 10, 15), deadline=1030.0, refs=None):
     kw = {} if refs is None else {"refs": refs}
     return ask_tools.ToolContext(caller_sub="sub-1", today=today, deadline=deadline,
@@ -119,7 +125,7 @@ def test_clamped_moves_from_args_to_meta_and_range_is_reported():
 
 
 def test_more_than_four_calls_rejects_the_extras_only():
-    fake = FakeLambda(_echo())
+    fake = FakeLambda(_echo([], {"empty_reason": "nothing_in_range"}))
     calls = [{"name": "day_overview", "args": {"date_from": "today"}}] * 5
     env = ask_tools.execute(calls, _ctx(fake))
     assert len(env) == 5
@@ -270,7 +276,7 @@ def test_output_budget_truncates_and_flags():
                             _ctx(FakeLambda(_echo(big))))
     assert env[0]["meta"]["truncated"] is True
     assert 0 < len(env[0]["items"]) < 40
-    assert len(json.dumps(env[0]["items"])) <= ask_tools.MAX_RESULT_CHARS
+    assert _size(env[0]["items"]) <= ask_tools.MAX_RESULT_CHARS
 
 
 def test_budget_holds_on_the_serialised_list_at_every_item_size():
@@ -280,7 +286,7 @@ def test_budget_holds_on_the_serialised_list_at_every_item_size():
         rows = [{"id": f"t{i}", "summary": "s" * n} for i in range(400)]
         env = ask_tools.execute([{"name": "day_overview", "args": {"date_from": "today"}}],
                                 _ctx(FakeLambda(_echo(rows))))
-        assert len(json.dumps(env[0]["items"])) <= ask_tools.MAX_RESULT_CHARS, n
+        assert _size(env[0]["items"]) <= ask_tools.MAX_RESULT_CHARS, n
         assert env[0]["meta"]["truncated"] is True
 
 
@@ -351,14 +357,6 @@ def test_deadline_passed_down_and_capped_at_20():
     assert fake.events[-1]["deadline_s"] == 7.5
 
 
-def test_deadline_already_passed_sends_zero_and_never_raises():
-    fake = FakeLambda(lambda ev: [{"id": c["id"], "name": c["name"], "rows": [],
-                                   "meta": {"error": "timeout"}} for c in ev["calls"]])
-    env = ask_tools.execute([{"name": "day_overview", "args": {"date_from": "yesterday"}}],
-                            _ctx(fake, deadline=990.0))
-    assert fake.events[-1]["deadline_s"] == 0
-    assert env[0]["meta"]["error"] == "timeout"
-
 
 def test_never_raises_on_garbage_calls():
     env = ask_tools.execute([None, "x", {"name": 3}, {"name": "day_overview", "args": []}],
@@ -371,3 +369,221 @@ def test_missing_result_for_a_call_is_upstream():
     env = ask_tools.execute([{"name": "day_overview", "args": {"date_from": "today"}}],
                             _ctx(fake))
     assert env[0]["meta"]["error"] == "upstream"
+
+
+# --- fix round 1 -----------------------------------------------------------
+
+def test_expired_deadline_times_out_every_call_without_embed_or_invoke(monkeypatch):
+    embedded = []
+    monkeypatch.setattr(ask_tools, "_embed", lambda texts: embedded.append(texts) or [[0.0]])
+
+    class Untouchable:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, **k):
+            self.calls += 1
+            raise AssertionError("invoked on an expired deadline")
+    for deadline in (1000.0, 990.0):
+        client = Untouchable()
+        env = ask_tools.execute([{"name": "search_records", "args": {"query": "pour"}},
+                                 {"name": "day_overview", "args": {"date_from": "today"}},
+                                 {"name": "day_overview", "args": {"sub": "x"}}],
+                                _ctx(client, deadline=deadline))
+        assert client.calls == 0
+        assert [e["meta"].get("error") for e in env] == ["timeout", "timeout", "bad_args"]
+        assert all(e["items"] == [] for e in env)
+    assert embedded == []
+
+
+def test_a_sliver_of_deadline_left_still_invokes():
+    fake = FakeLambda(_echo())
+    ask_tools.execute([{"name": "day_overview", "args": {"date_from": "today"}}],
+                      _ctx(fake, deadline=1000.25))
+    assert fake.events[-1]["deadline_s"] == 0.25
+
+
+ZH = ("今天上午在二号楼三层完成了楼板混凝土浇筑，泵车九点到场，浇筑持续约两个小时。"
+      "现场工程师检查了钢筋保护层厚度和预埋件位置，发现东侧两处保护层不足，已要求整改后再浇。"
+      "下午安排养护覆盖，明天上午复查表面裂缝情况并记录。")
+
+
+def test_chinese_text_is_budgeted_by_characters_not_escapes():
+    rows = [{"id": f"t{i}", "title": f"二号楼三层楼板浇筑 {i}", "summary": ZH * 2,
+             "site_name": "滨江二期", "user_name": "林工", "report_date": "2026-10-14",
+             "time_range": "09:00 - 11:00"} for i in range(20)]
+    env = ask_tools.execute([{"name": "day_overview", "args": {"date_from": "today"}}],
+                            _ctx(FakeLambda(_echo(rows))))
+    items = env[0]["items"]
+    assert len(items) >= 10, len(items)        # an escaped (ascii) budget fits only 2-3
+    assert _size(items) <= ask_tools.MAX_RESULT_CHARS
+    assert items[0]["text"].startswith("今天上午")
+
+
+def test_a_malformed_row_is_coerced_or_skipped_never_the_whole_turn():
+    def results(ev):
+        out = []
+        for c in ev["calls"]:
+            if c["name"] == "day_overview":
+                rows = [{"id": "t1", "title": 7, "summary": 12345},
+                        "not a row", None,
+                        {"id": "t2", "title": "ok", "summary": {"weird": 1}},
+                        {"id": "t3", "title": "fine", "summary": "fine"}]
+            elif c["name"] == "search_records":
+                rows = [{"id": "c1", "chunk_text": 99, "metadata": 5, "report_date": 20261014}]
+            else:
+                rows = [{"person_ref": "p1", "name": ["Ben"]}]
+            out.append({"id": c["id"], "name": c["name"], "rows": rows, "meta": {}})
+        return out
+    env = ask_tools.execute([{"name": "day_overview", "args": {"date_from": "today"}},
+                             {"name": "search_records", "args": {"query": "pour"}},
+                             {"name": "find_people", "args": {"name": "Ben"}}],
+                            _ctx(FakeLambda(results)))
+    assert all("error" not in e["meta"] for e in env)
+    assert env[0]["items"][0]["text"] == "12345"
+    assert [i["topic_id"] for i in env[0]["items"]] == ["t1", "t2", "t3"]
+    assert env[1]["items"][0]["text"] == "99"
+    assert len(env[2]["items"]) == 1
+
+
+def test_a_row_that_breaks_item_building_is_skipped(monkeypatch):
+    real = ask_tools._item
+
+    def flaky(name, args, row, call_id):
+        if row.get("id") == "bad":
+            raise TypeError("boom")
+        return real(name, args, row, call_id)
+    monkeypatch.setattr(ask_tools, "_item", flaky)
+    rows = [{"id": "bad", "title": "x"}, {"id": "good", "title": "y"}]
+    env = ask_tools.execute([{"name": "day_overview", "args": {"date_from": "today"}}],
+                            _ctx(FakeLambda(_echo(rows))))
+    assert [i["topic_id"] for i in env[0]["items"]] == ["good"]
+    assert "error" not in env[0]["meta"]
+
+
+def test_rows_without_an_id_get_their_own_refs():
+    rows = [{"title": "a"}, {"title": "b"}, {"id": None, "title": "c"}]
+    refs = ask_tools.RefAssigner()
+    fake = FakeLambda(_echo(rows))
+    env = ask_tools.execute([{"name": "day_overview", "args": {"date_from": "today"}}],
+                            _ctx(fake, refs=refs))
+    assert [i["ref"] for i in env[0]["items"]] == ["R1", "R2", "R3"]
+    env = ask_tools.execute([{"name": "day_overview", "args": {"date_from": "today"}}],
+                            _ctx(fake, refs=refs))
+    assert [i["ref"] for i in env[0]["items"]] == ["R4", "R5", "R6"]   # never deduped
+    people = FakeLambda(_echo([{"name": "A"}, {"name": "B"}]))
+    env = ask_tools.execute([{"name": "find_people", "args": {"name": "x"}}],
+                            _ctx(people, refs=refs))
+    assert [i["ref"] for i in env[0]["items"]] == ["R7", "R8"]
+
+
+def test_a_duplicate_row_inside_one_envelope_is_emitted_once():
+    rows = [{"id": "t1", "title": "a"}, {"id": "t2", "title": "b"}, {"id": "t1", "title": "a"}]
+    env = ask_tools.execute([{"name": "day_overview", "args": {"date_from": "today"}},
+                             {"name": "day_overview", "args": {"date_from": "yesterday"}}],
+                            _ctx(FakeLambda(_echo(rows))))
+    assert [i["ref"] for i in env[0]["items"]] == ["R1", "R2"]
+    assert [i["ref"] for i in env[1]["items"]] == ["R1", "R2"]   # across calls: first ref kept
+
+
+@pytest.mark.parametrize("result", [
+    {"id": "0"}, {"id": "0", "rows": None, "meta": None}, {"id": "0", "rows": [], "meta": {}},
+    {"id": "0", "rows": "x", "meta": "y"}, {"id": "0", "rows": [], "meta": {"ms": 4}}])
+def test_a_malformed_result_with_no_rows_and_no_meta_is_upstream(result):
+    fake = FakeLambda(lambda ev: [result])
+    env = ask_tools.execute([{"name": "day_overview", "args": {"date_from": "today"}}],
+                            _ctx(fake))
+    assert env[0]["meta"]["error"] == "upstream"
+
+
+def test_an_honest_empty_result_is_not_upstream():
+    env = ask_tools.execute([{"name": "day_overview", "args": {"date_from": "today"}}],
+                            _ctx(FakeLambda(_echo([], {"empty_reason": "nothing_in_range"}))))
+    assert "error" not in env[0]["meta"]
+
+
+def test_time_start_import_failure_is_logged_once(monkeypatch, caplog):
+    import sys
+    monkeypatch.setattr(ask_tools, "_TIME_START_WARNED", False)
+    monkeypatch.setitem(sys.modules, "lambda_ask_agent", None)     # import -> ImportError
+    rows = [{"id": f"c{i}", "chunk_text": "x", "chunk_type": "transcript_window",
+             "metadata": {"window_span": "12:00:00–12:01:00"}} for i in range(3)]
+    with caplog.at_level("WARNING"):
+        env = ask_tools.execute([{"name": "search_records", "args": {"query": "pour"}},
+                                 {"name": "search_records", "args": {"query": "slab"}}],
+                                _ctx(FakeLambda(_echo(rows))))
+    assert env[0]["items"][0]["time_start"] is None
+    lines = [r for r in caplog.records if "time_start" in r.getMessage()]
+    assert len(lines) == 1 and lines[0].levelname == "WARNING"
+    assert lines[0].getMessage().endswith(("ImportError", "ModuleNotFoundError"))
+
+
+def test_logs_carry_arg_shape_and_caller_hash_never_values(caplog):
+    rows = [{"id": "t1", "title": "Secret Title", "summary": "secret summary"}]
+    with caplog.at_level("INFO"):
+        ask_tools.execute([{"name": "search_records",
+                            "args": {"query": "Mike Tane slab", "date_from": "2026-10-10",
+                                     "date_to": "2026-10-14", "person": "Mike"}}],
+                          _ctx(FakeLambda(_echo(rows))))
+    text = caplog.text
+    line = next(r.getMessage() for r in caplog.records
+                if r.getMessage().startswith("ask tool search_records"))
+    assert "fields=date_from,date_to,person,query" in line
+    assert "days=5" in line
+    assert f"caller={ask_tools.sub_hash('sub-1')}" in line
+    for secret in ("Mike", "Tane", "slab", "Secret", "secret", "sub-1"):
+        assert secret not in text, secret
+
+
+def test_dispatcher_and_executor_share_one_log_helper():
+    d = pytest.importorskip("rag_tools_dispatch", reason="requires psycopg (installed in CI)")
+    assert d._sub_hash is ask_tools.sub_hash
+    assert d._arg_shape is ask_tools.arg_shape
+
+
+@pytest.mark.parametrize("row,want", [
+    ({"metric": "duration", "value": 5400, "unit": "seconds"}, "duration=5400 seconds"),
+    ({"metric": "count_photos", "value": 0, "notes": {"zero_kind": "no_rows_for_that_day"}},
+     "count_photos=0 (no_rows_for_that_day)"),
+    ({"value": 3, "unit": "sessions", "notes": {"zero_kind": None}, "extra": "x" * 900},
+     "count_sessions=3 sessions"),
+    ({"value": None}, "count_sessions=unknown"),
+])
+def test_metric_text_is_a_compact_readable_string(row, want):
+    metric = row.get("metric", "count_sessions")
+    env = ask_tools.execute([{"name": "count_metric",
+                              "args": {"metric": metric, "date_from": "today"}}],
+                            _ctx(FakeLambda(_echo([row]))))
+    item = env[0]["items"][0]
+    assert item["text"] == want
+    assert item["metric"] == metric
+
+
+def test_candidate_k_rides_on_search_shaped_calls_when_rerank_is_on(monkeypatch):
+    monkeypatch.setenv("ENABLE_RERANK", "true")
+    monkeypatch.setenv("RERANK_CANDIDATE_K", "40")
+    fake = FakeLambda(_echo())
+    ask_tools.execute([{"name": "search_records", "args": {"query": "pour"}},
+                       {"name": "latest_activity", "args": {"query": "crane"}},
+                       {"name": "latest_activity", "args": {}},
+                       {"name": "day_overview", "args": {"date_from": "today"}}], _ctx(fake))
+    got = [c.get("candidate_k") for c in fake.events[-1]["calls"]]
+    assert got == [40, 40, None, None]
+
+
+def test_candidate_k_default_and_rerank_off_match_rag_answer(monkeypatch):
+    import lambda_ask_agent as laa
+    monkeypatch.setenv("ENABLE_RERANK", "true")
+    monkeypatch.delenv("RERANK_CANDIDATE_K", raising=False)
+    fake = FakeLambda(_echo())
+    ask_tools.execute([{"name": "search_records", "args": {"query": "pour"}}], _ctx(fake))
+    # the same env var and default as lambda_ask_agent.RERANK_CANDIDATES
+    assert fake.events[-1]["calls"][0]["candidate_k"] == 32
+    assert 'os.environ.get("RERANK_CANDIDATE_K", "32")' in open(laa.__file__, encoding="utf-8").read()
+    monkeypatch.setenv("ENABLE_RERANK", "false")
+    ask_tools.execute([{"name": "search_records", "args": {"query": "pour"}}], _ctx(fake))
+    assert "candidate_k" not in fake.events[-1]["calls"][0]
+    monkeypatch.setenv("ENABLE_RERANK", "true")
+    monkeypatch.setenv("RERANK_CANDIDATE_K", "junk")
+    ask_tools.execute([{"name": "search_records", "args": {"query": "pour"}}], _ctx(fake))
+    assert "candidate_k" not in fake.events[-1]["calls"][0]

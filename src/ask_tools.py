@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
+import ask_tools_log
 import query_slots
 
 logger = logging.getLogger()
@@ -185,7 +187,10 @@ def validate_call(call, today):
 
 # --- execution (spec §3.2-§3.4) ---------------------------------------------
 
-# Spec §3.2: <= 2,500 tokens per tool result, measured as json.dumps(items).
+# Spec §3.2: <= 2,500 tokens per tool result, measured as
+# json.dumps(items, ensure_ascii=False). SEAM: the orchestrator must render tool
+# results the same way -- with the default ensure_ascii=True a CJK character costs
+# six characters (\uXXXX), and a Chinese day would fit 2 topics where English fits 15.
 MAX_RESULT_CHARS = 10_000
 MAX_TEXT = 600
 # Spec §3.4: one rag-search batch is at most 4 calls and never plans past 20 s
@@ -199,6 +204,22 @@ _SEARCH_SHAPED = ("search_records", "latest_activity")
 # re-fetch; every other None-valued key is dropped to save budget.
 _CITATION_KEYS = ("source", "date", "site", "site_slug", "title", "chunk_type",
                   "text", "time_start")
+# Log shape: the SAME helpers rag_tools_dispatch logs with (ask_tools_log).
+sub_hash = ask_tools_log.sub_hash
+arg_shape = ask_tools_log.arg_shape
+
+
+def _candidate_k():
+    """The rerank candidate pool `_rag_answer` fetches: RERANK_CANDIDATE_K (default
+    32, as lambda_ask_agent.RERANK_CANDIDATES) when ENABLE_RERANK is on, else None
+    (it fetches plain k then). A malformed value is None, never an error."""
+    if os.environ.get("ENABLE_RERANK", "false").lower() != "true":
+        return None
+    try:
+        v = int(os.environ.get("RERANK_CANDIDATE_K", "32"))
+    except ValueError:
+        return None
+    return v if v > 0 else None
 
 
 class RefAssigner:
@@ -216,6 +237,12 @@ class RefAssigner:
             self._refs[key] = f"{prefix}{n}"
             self._next[prefix] = n + 1
         return self._refs[key]
+
+    def fresh(self, prefix="R"):
+        """A new ref that nothing dedupes onto (an item with no id)."""
+        n = self._next.get(prefix, 1)
+        self._next[prefix] = n + 1
+        return f"{prefix}{n}"
 
 
 @dataclass
@@ -242,12 +269,41 @@ def _post_search(query, rows, k):
     return laa._rerank_chunks(query, rows, k)
 
 
+_TIME_START_WARNED = False
+
+
 def _time_start(row):
+    global _TIME_START_WARNED
     try:
         import lambda_ask_agent as laa
         return laa._citation_time_start(row)
-    except Exception:                                   # noqa: BLE001
+    except Exception as exc:                            # noqa: BLE001
+        # Once per process: a bundle without the ask-agent would otherwise blank
+        # every citation anchor with nothing in the log.
+        if not _TIME_START_WARNED:
+            _TIME_START_WARNED = True
+            logger.warning("ask tools time_start unavailable: %s", type(exc).__name__)
         return None
+
+
+def _text(value):
+    """Item text: a string capped at MAX_TEXT. A non-string value is coerced, so
+    one malformed row can never fail the turn."""
+    if value is None:
+        return ""
+    return (value if isinstance(value, str) else str(value))[:MAX_TEXT]
+
+
+def _metric_text(metric, row):
+    """`duration=5400 seconds`, `count_photos=0 (no_rows_for_that_day)`."""
+    value = row.get("value")
+    out = f"{metric}={'unknown' if value is None else value}"
+    if value is not None and row.get("unit"):
+        out += f" {row['unit']}"
+    notes = row.get("notes") if isinstance(row.get("notes"), dict) else {}
+    if notes.get("zero_kind"):
+        out += f" ({notes['zero_kind']})"
+    return _text(out)
 
 
 def _metadata(row):
@@ -265,13 +321,13 @@ def _item(name, args, row, call_id):
     if name == "find_people":
         return "person", row.get("person_ref"), {
             "kind": "person", "provenance": "records", "who": row.get("name"),
-            "person_ref": row.get("person_ref"), "text": (row.get("name") or "")[:MAX_TEXT]}
+            "person_ref": row.get("person_ref"), "text": _text(row.get("name"))}
     if name == "count_metric":
         # Per call: two metrics in one turn are two pieces of evidence.
         ident = f"{args.get('metric')}:{args.get('date_from')}:{args.get('date_to')}:{call_id}"
         return "metric", ident, {
             "kind": "metric", "provenance": "records", "metric": args.get("metric"),
-            "text": json.dumps(row, default=str)[:MAX_TEXT]}
+            "text": _metric_text(args.get("metric"), row)}
     if "chunk_text" in row:
         md = _metadata(row)
         span = md.get("window_span")
@@ -282,7 +338,7 @@ def _item(name, args, row, call_id):
             "site": row.get("site_name"), "site_slug": row.get("site_slug"),
             "who": row.get("user_name"),
             "title": row.get("topic_title") or row.get("title"),
-            "text": (row.get("chunk_text") or "")[:MAX_TEXT],
+            "text": _text(row.get("chunk_text")),
             "topic_id": row.get("topic_id"), "chunk_id": row.get("id"),
             "chunk_type": row.get("chunk_type"),
             "time_start": _time_start(dict(row, metadata=md)),
@@ -294,28 +350,48 @@ def _item(name, args, row, call_id):
         "site": row.get("site_name"), "site_slug": row.get("site_slug"),
         "who": row.get("user_name"),
         "title": row.get("title") or row.get("topic_title"),
-        "text": (row.get("summary") or "")[:MAX_TEXT],
+        "text": _text(row.get("summary")),
         "topic_id": row.get("id"),
         "chunk_type": row.get("chunk_type"), "time_start": None,
         "source": row.get("source_s3_key")}
 
 
+def _size(obj):
+    """Budget unit: characters of the JSON the model reads (see MAX_RESULT_CHARS)."""
+    return len(json.dumps(obj, default=str, ensure_ascii=False))
+
+
 def _envelope(name, call_id, args, rows, meta, ctx):
-    items, used = [], 2                                 # the list's brackets
+    items, used, seen = [], 2, set()                    # 2: the list's brackets
     for row in rows:
         if not isinstance(row, dict):
             continue
-        kind, ident, item = _item(name, args, row, call_id)
+        try:
+            kind, ident, item = _item(name, args, row, call_id)
+        except Exception as exc:                        # noqa: BLE001 -- one bad row
+            logger.warning("ask tool %s row skipped: %s", name, type(exc).__name__)
+            continue
+        key = None if ident in (None, "") else (kind, str(ident))
+        if key is not None and key in seen:
+            continue                                    # same row twice in one result
         keep = _CITATION_KEYS if kind in ("topic", "chunk") else ()
         item = {k: v for k, v in item.items() if v is not None or k in keep}
         # Measured before a ref is assigned: a dropped item must not consume one.
-        size = len(json.dumps(dict(item, ref="R0000"), default=str)) + (2 if items else 0)
+        size = _size(dict(item, ref="R0000")) + (2 if items else 0)
         if used + size > MAX_RESULT_CHARS:
             meta["truncated"] = True
             break
-        items.append({"ref": ctx.refs.assign(kind, ident), **item})
+        # No id: its own ref, never deduped onto another id-less row.
+        ref = ctx.refs.fresh() if key is None else ctx.refs.assign(*key)
+        if key is not None:
+            seen.add(key)
+        items.append({"ref": ref, **item})
         used += size
     meta.setdefault("truncated", False)
+    if not items and not meta.get("empty_reason") and not meta.get("error"):
+        # §3.3: items [] always comes with a reason. A result that gives none
+        # (malformed, or every row unusable) is a failure, not "nothing there".
+        meta["error"] = "upstream"
     return {"tool": name, "id": call_id, "items": items, "meta": meta}
 
 
@@ -373,9 +449,13 @@ def _execute(calls, ctx):
         pending[cid] = (call["name"], args, clamped)
 
     failed = {}                                         # call id -> meta
+    if pending and ctx.deadline - ctx.clock() <= 0:
+        # No time left: nothing can start (spec §3.4). Not even the embed is paid for.
+        failed.update({cid: {"error": "timeout"} for cid in pending})
     need = [cid for cid, (name, args, _) in pending.items()
-            if name in _SEARCH_SHAPED and args.get("query")]
+            if cid not in failed and name in _SEARCH_SHAPED and args.get("query")]
     vectors = {}
+    candidate_k = _candidate_k()
     if need:
         t0 = ctx.clock()
         try:
@@ -395,6 +475,10 @@ def _execute(calls, ctx):
         w = {"id": cid, "name": name, "args": args}
         if cid in vectors:
             w["query_embedding"] = vectors[cid]
+            if candidate_k:
+                # The same candidate pool _rag_answer reranks over (rag-search
+                # fetches max(k*2, candidate_k), capped).
+                w["candidate_k"] = candidate_k
         wire.append(w)
 
     results = {}
@@ -428,8 +512,11 @@ def _execute(calls, ctx):
             meta.setdefault("range", {"from": args["date_from"],
                                       "to": args.get("date_to") or args["date_from"]})
         env = _envelope(name, cid, args, rows, meta, ctx)
-        logger.info("ask tool %s items=%d rows=%d empty=%s err=%s truncated=%s",
-                    name, len(env["items"]), len(rows), meta.get("empty_reason"),
-                    meta.get("error"), meta.get("truncated"))
+        fields, days = arg_shape(args)
+        logger.info("ask tool %s fields=%s days=%s items=%d rows=%d empty=%s err=%s "
+                    "truncated=%s caller=%s",
+                    name, fields, days, len(env["items"]), len(rows),
+                    meta.get("empty_reason"), meta.get("error"), meta.get("truncated"),
+                    sub_hash(ctx.caller_sub))
         envs[int(cid)] = env
     return envs

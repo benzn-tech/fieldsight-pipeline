@@ -507,3 +507,30 @@ def test_handler_resolves_scope_once_and_passes_sub_and_family(monkeypatch):
                           "cross_company": False}
     assert seen["source_family"] == "extraction"
     assert seen["search_fn"] is rag._search and seen["metric_fn"] is rag._metric
+
+
+# ---- rerank candidate parity (candidate_k) -----------------------------------------
+
+@pytest.mark.parametrize("candidate_k,k,want", [
+    (None, None, 16), (32, None, 32), (32, 5, 32), (32, 12, 32), (10, 12, 24),
+    (200, None, 64), (0, None, 16), ("32", None, 16), (True, None, 16), (-5, None, 16)])
+def test_search_records_fetch_is_max_of_2k_and_candidate_k_capped_64(monkeypatch, candidate_k,
+                                                                      k, want):
+    seen = []
+    call = {"id": "a", "name": "search_records", "query_embedding": [0.1],
+            "args": {"query": "pour", **({"k": k} if k else {})}}
+    if candidate_k is not None:
+        call["candidate_k"] = candidate_k
+    _run([call], monkeypatch, search=lambda ev, c: seen.append(ev) or {"chunks": []})
+    assert seen[0]["k"] == want
+
+
+def test_latest_activity_trims_to_the_candidate_pool(monkeypatch):
+    monkeypatch.setattr(d.chunks, "latest_matching_date", lambda *a, **k: "2026-10-11")
+    seen = []
+    near = [{"id": f"n{i}", "distance": 0.1, "lexical_hit": False} for i in range(50)]
+    res = _run([{"id": "a", "name": "latest_activity", "query_embedding": [0.1],
+                 "candidate_k": 32, "args": {"query": "pour"}}], monkeypatch,
+               search=lambda ev, c: seen.append(ev) or {"chunks": near})
+    assert seen[0]["k"] == d.LATEST_DAY_SEARCH_K
+    assert len(res[0]["rows"]) == 32
