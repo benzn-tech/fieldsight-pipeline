@@ -27,12 +27,15 @@ from datetime import date
 OFFER_ALSO = "Want me to check online as well?"
 OFFER_NO_RECORDS = "Your site records don't cover that. Want me to search online?"
 
-PROJECT_GROUPS = ("project_day", "project_empty_day", "person_or_latest")
+PROJECT_GROUPS = ("project_day", "project_empty_day", "person_or_latest", "spoken_date")
 # Groups that must pass on every repeat (spec §9: "every project and empty-day
 # item passes 3/3"; person_or_latest is a project question too).
-ALL_REPS_GROUPS = PROJECT_GROUPS
-# Groups that must pass on at least two thirds of the repeats.
-TWO_THIRDS_GROUPS = ("general", "mixed")
+ALL_REPS_GROUPS = ("project_day", "project_empty_day", "person_or_latest")
+# Groups that must pass on at least two thirds of the repeats. spoken_date is a
+# project question, but resolving "3 September" is the judge's own reasoning
+# (query_slots #1133 anchors only ISO and "last <weekday>"), so it gets the
+# model-judgement tier rather than 3/3.
+TWO_THIRDS_GROUPS = ("general", "mixed", "spoken_date")
 # Spec §9 names no gate for these; they are reported per item, not gated.
 REPORTED_GROUPS = ("explicit_web", "scoped_general", "web_cap")
 WEB_GROUPS = ("general", "mixed", "explicit_web", "web_cap")
@@ -154,6 +157,15 @@ def score_turn(item, result, route):
         checks.append(_check(why, _cites(result, route) >= 1, "at least one records citation"))
         checks.append(_check(why, not result.get("from_web"), "from_web is falsy"))
         checks.append(_check(why, refs_w == 0, "route.refs_w == 0"))
+    elif group == "spoken_date":
+        want = [str(d) for d in (expect.get("dates") or [])]
+        checks.append(_check(why, "day_overview" in flat_calls(route),
+                             "route.calls includes day_overview (the judge resolved the date)"))
+        in_cards = any(str(c.get("report_date") or "") in want
+                       for c in (result.get("citations") or []))
+        checks.append(_check(why, in_cards or any(mentions_date(answer, d) for d in want),
+                             "a card or the answer is from %s" % ",".join(want)))
+        checks.append(_check(why, not result.get("from_web") and refs_w == 0, "no W"))
     elif group == "project_empty_day":
         lb = expect.get("latest_before")
         checks.append(_check(why, not result.get("from_web") and refs_w == 0, "no W"))

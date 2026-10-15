@@ -20,3 +20,5 @@
 {"id": "ew2", "group": "explicit_web", "question": "Look it up online: what PPE is required for working at height in New Zealand?", "channels": ["screen", "voice"], "expect": {}}
 {"id": "sg1", "group": "scoped_general", "question": "What are the rules for a fire watch after hot works?", "channels": ["screen"], "body": {"site_id": "@visible_site"}, "expect": {"test_site_id": "4326dbc7-14a2-4251-8381-9d0067595a85"}}
 {"id": "wc1", "group": "web_cap", "question": "Search online and compare the concrete cover rules for marine exposure in NZS 3101 with those in AS 3600.", "channels": ["screen", "voice"], "expect": {}}
+{"id": "sd1", "group": "spoken_date", "question": "What did we do on 3 September?", "channels": ["screen", "voice"], "expect": {"dates": ["2026-09-03"]}}
+{"id": "sd2", "group": "spoken_date", "question": "What did we discuss on the 23rd of September?", "channels": ["screen", "voice"], "expect": {"dates": ["2026-09-23"]}}

@@ -331,7 +331,7 @@ def test_gate_reported_groups_are_info_only():
 def test_the_set_has_the_plan_groups_and_fields():
     with open(os.path.join(EVAL_DIR, "set.v1.jsonl"), encoding="utf-8") as f:
         items = [json.loads(ln) for ln in f if ln.strip()]
-    assert len(items) == 22
+    assert len(items) == 24
     counts = {}
     for it in items:
         assert set(it) >= {"id", "group", "question", "channels", "expect"}
@@ -339,10 +339,11 @@ def test_the_set_has_the_plan_groups_and_fields():
         counts[it["group"]] = counts.get(it["group"], 0) + 1
     assert counts == {"project_day": 4, "project_empty_day": 3, "person_or_latest": 3,
                       "general": 5, "mixed": 3, "explicit_web": 2, "scoped_general": 1,
-                      "web_cap": 1}
-    assert len({it["id"] for it in items}) == 22
+                      "web_cap": 1, "spoken_date": 2}
+    assert len({it["id"] for it in items}) == 24
     for it in items:
-        if it["group"] in ("project_day", "project_empty_day", "person_or_latest"):
+        if it["group"] in ("project_day", "project_empty_day", "person_or_latest",
+                           "spoken_date"):
             assert it["expect"].get("dates"), it["id"]
         if it["group"] == "project_empty_day":
             assert it["expect"].get("latest_before"), it["id"]
@@ -352,3 +353,29 @@ def test_the_set_has_the_plan_groups_and_fields():
             # The site id is filled in at run time (org-api or --site-id).
             assert it["channels"] == ["screen"] and it["body"] == {"site_id": "@visible_site"}
     assert any(it["expect"].get("relative") for it in items)
+
+
+# ------------------------------------------------------------- spoken_date
+# Spoken dates are the judge's job (query_slots #1133 anchors only ISO and
+# "last <weekday>"): it must resolve "3 September" itself and call day_overview.
+
+def test_spoken_date_passes_when_the_judge_looked_up_that_day():
+    it = item("spoken_date", dates=["2026-09-03"])
+    rt = route(calls=[["search_records"], ["day_overview"]])
+    assert verdict(it, screen(citations=1), rt) == "pass"
+
+
+def test_spoken_date_fails_without_a_day_overview_call():
+    it = item("spoken_date", dates=["2026-09-03"])
+    assert verdict(it, screen(citations=1), route(calls=[["search_records"]])) == "fail"
+
+
+def test_spoken_date_fails_when_no_card_is_from_that_day():
+    it = item("spoken_date", dates=["2026-09-23"])
+    rt = route(calls=[["search_records"], ["day_overview"]])
+    assert verdict(it, screen(answer="x", citations=1), rt) == "fail"
+
+
+def test_spoken_date_is_gated_at_two_thirds():
+    assert "spoken_date" in score.TWO_THIRDS_GROUPS
+    assert "spoken_date" in score.PROJECT_GROUPS
