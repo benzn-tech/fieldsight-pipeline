@@ -276,8 +276,10 @@ def test_worker_screen_ignores_caller_sub_and_voice_keys_in_request(wk):
     avt.worker_handler(sevent(), None)
     body = wk.rag_calls[0]
     assert body["caller_sub"] == SUB
-    for k in ("mode", "voice_web", "web_intent", "offer_web"):
+    for k in ("mode", "voice_web"):
         assert k not in body
+    # The screen web opt-in passes through (spec 2026-10-16 ask-screen-web-offer §2).
+    assert body["web_intent"] is True and body["offer_web"] is True
 
 
 def test_worker_screen_on_web_start_puts_searching_web(wk):
