@@ -167,6 +167,61 @@ def test_deleting_a_non_current_revision_only_removes_it_from_history(world):
     assert [d["revision"] for d in hist] == [2]
 
 
+def _visible(w):
+    return {h["document_id"] for h in _search(w, [w["s1"]["id"]])}
+
+
+def test_deleting_the_current_revision_skips_an_unreadable_one_to_the_last_good(world):
+    """r1 indexed, r2 unreadable, r3 indexed; delete r3 -> r1 is what search shows."""
+    r1 = _insert(world)
+    project_docs.apply_result(world["db"], _result(r1))
+    r2 = _insert(world, series_id=r1["series_id"])
+    project_docs.apply_result(world["db"], _result(r2, status="unreadable", chunks=[],
+                                                   reason="scanned"))
+    r3 = _insert(world, series_id=r1["series_id"])
+    project_docs.apply_result(world["db"], _result(r3))
+    assert _status(world, r1)["superseded_at"] is not None
+    assert project_docs.soft_delete(world["db"], r3["id"]) is True
+    assert _status(world, r1)["superseded_at"] is None
+    assert _visible(world) == {r1["id"]}
+
+
+def test_a_pending_higher_revision_does_not_block_the_restore(world):
+    """r1, r2 indexed (r1 superseded), r3 pending; delete r2 -> r1 searchable again."""
+    r1 = _insert(world)
+    project_docs.apply_result(world["db"], _result(r1))
+    r2 = _insert(world, series_id=r1["series_id"])
+    project_docs.apply_result(world["db"], _result(r2))
+    _insert(world, series_id=r1["series_id"])            # r3 stays pending
+    assert project_docs.soft_delete(world["db"], r2["id"]) is True
+    assert _status(world, r1)["superseded_at"] is None
+    assert _visible(world) == {r1["id"]}
+
+
+def test_a_current_revision_that_comes_back_error_hands_search_back(world):
+    """r2 indexed then re-applied as error (e.g. a re-run that failed): r1 must not stay
+    hidden behind a revision that is no longer searchable."""
+    r1 = _insert(world)
+    project_docs.apply_result(world["db"], _result(r1))
+    r2 = _insert(world, series_id=r1["series_id"])
+    project_docs.apply_result(world["db"], _result(r2))
+    assert _visible(world) == {r2["id"]}
+    assert project_docs.apply_result(world["db"], _result(
+        r2, status="error", chunks=[], reason="boom")) == "error"
+    assert _status(world, r1)["superseded_at"] is None
+    assert _visible(world) == {r1["id"]}
+
+
+def test_an_invalid_artifact_on_the_current_revision_also_hands_search_back(world):
+    r1 = _insert(world)
+    project_docs.apply_result(world["db"], _result(r1))
+    r2 = _insert(world, series_id=r1["series_id"])
+    project_docs.apply_result(world["db"], _result(r2))
+    bad = [{"ordinal": 0, "chunk_text": "x", "embedding": [1.0]}]
+    assert project_docs.apply_result(world["db"], _result(r2, chunks=bad)) == "invalid"
+    assert _visible(world) == {r1["id"]}
+
+
 def test_an_artifact_for_a_deleted_document_is_ignored(world):
     r1 = _insert(world)
     project_docs.soft_delete(world["db"], r1["id"])
@@ -187,6 +242,24 @@ def test_a_malformed_chunk_marks_the_document_error_not_a_crash(world):
     bad = [{"ordinal": 0, "heading": None, "page_from": None, "page_to": None,
             "chunk_text": "x", "embedding": [1.0, 0.0]}]
     assert project_docs.apply_result(world["db"], _result(r1, chunks=bad)) == "invalid"
+    assert _status(world, r1)["status"] == "error"
+
+
+@pytest.mark.parametrize("patch", [
+    {"embedding": [float("nan")] + [0.0] * 1023},
+    {"embedding": [float("inf")] + [0.0] * 1023},
+    {"embedding": ["1"] + [0.0] * 1023},
+    {"embedding": [True] + [0.0] * 1023},
+    {"page_from": "2"},
+    {"page_to": 2.5},
+    {"ordinal": True},
+], ids=["nan", "inf", "str-element", "bool-element", "str-page", "float-page", "bool-ordinal"])
+def test_malformed_chunk_fields_are_invalid_not_an_exception(world, patch):
+    r1 = _insert(world)
+    chunk = {"ordinal": 0, "heading": None, "page_from": 1, "page_to": 1,
+             "chunk_text": "x", "embedding": vec(1)}
+    chunk.update(patch)
+    assert project_docs.apply_result(world["db"], _result(r1, chunks=[chunk])) == "invalid"
     assert _status(world, r1)["status"] == "error"
 
 
@@ -219,14 +292,39 @@ def test_the_keyword_arm_finds_a_term_in_the_heading(world):
     assert [h["document_id"] for h in hits] == [r1["id"]] and hits[0]["lexical_hit"] is True
 
 
-def test_a_chinese_term_is_found_by_the_keyword_arm(world):
-    """Review Focus 3: 'simple' keeps CJK; 0061's regexp_replace would have erased it."""
+def test_a_space_separated_chinese_term_is_found_by_the_keyword_arm(world):
+    """Review Focus 3: 'simple' keeps CJK; 0061's regexp_replace would have erased it.
+    Covers SPACE-SEPARATED Chinese only -- unsegmented text is the next test."""
     r1 = _insert(world, filename="规范.md")
     chunk = {"ordinal": 0, "heading": "混凝土", "page_from": None, "page_to": None,
              "chunk_text": "保护层 厚度 40 毫米", "embedding": vec(3)}
     project_docs.apply_result(world["db"], _result(r1, chunks=[chunk]))
     hits = _search(world, [world["s1"]["id"]], qv=vec(7), q_text="保护层")
     assert [h["document_id"] for h in hits] == [r1["id"]]
+
+
+def test_unsegmented_chinese_is_one_token_per_run(world):
+    """The limitation, pinned: 'simple' does not segment Chinese, so a keyword matches only
+    a whole run, never a word inside it (the vector arm carries such text)."""
+    r1 = _insert(world, filename="规范.md")
+    chunk = {"ordinal": 0, "heading": None, "page_from": None, "page_to": None,
+             "chunk_text": "保护层厚度40毫米", "embedding": vec(3)}
+    project_docs.apply_result(world["db"], _result(r1, chunks=[chunk]))
+    assert _search(world, [world["s1"]["id"]], qv=vec(7), q_text="保护层") == []
+    hits = _search(world, [world["s1"]["id"]], qv=vec(7), q_text="保护层厚度40毫米")
+    assert [h["document_id"] for h in hits] == [r1["id"]]
+
+
+def test_search_with_no_sites_returns_nothing_without_querying():
+    class NoQuery:
+        def cursor(self, *a, **k):
+            raise AssertionError("queried")
+
+        def execute(self, *a, **k):
+            raise AssertionError("queried")
+
+    assert project_docs.search(NoQuery(), [], vec(1), "formwork") == []
+    assert project_docs.search(NoQuery(), None, vec(1), "formwork") == []
 
 
 def test_list_current_shows_the_latest_live_revision_per_series_newest_first(world):
@@ -250,6 +348,21 @@ def test_rename_and_mark_pending(world):
     assert project_docs.mark_pending(world["db"], r1["id"]) is True
     row = _status(world, r1)
     assert row["title"] == "Structural spec" and row["status"] == "pending" and row["reason"] is None
+
+
+def test_retry_is_refused_for_an_indexed_document(world):
+    r1 = _insert(world)
+    project_docs.apply_result(world["db"], _result(r1))
+    assert project_docs.mark_pending(world["db"], r1["id"]) is False
+    assert _status(world, r1)["status"] == "indexed"
+    assert {h["document_id"] for h in _search(world, [world["s1"]["id"]])} == {r1["id"]}
+
+
+def test_retry_is_allowed_for_unreadable_and_stale_pending(world):
+    r1 = _insert(world)
+    project_docs.apply_result(world["db"], _result(r1, status="unreadable", chunks=[], reason="x"))
+    assert project_docs.mark_pending(world["db"], r1["id"]) is True
+    assert project_docs.mark_pending(world["db"], r1["id"]) is True      # still pending
 
 
 def test_document_chunks_have_no_hnsw_index(world):
