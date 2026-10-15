@@ -9,6 +9,7 @@ import base64
 import logging
 import os
 import re
+import time
 
 import llm_utils
 import report_photos
@@ -31,18 +32,38 @@ Rules:
 DEFAULT_MODEL = "google/gemini-3.8-flash"
 FALLBACK_ENV = "TEMPLATE_DIGITISE_FALLBACK_MODELS"
 IMAGE_EDGE = 2000       # px, long edge: ruling R6
-ANSWER_TOKENS = 16000   # the 115-item form answered in ~2,500
+# max_tokens, overridable by env TEMPLATE_DIGITISE_ANSWER_TOKENS. Gemini reasons even with
+# no `reasoning` field and those tokens count against max_tokens: the 10-page, 115-item
+# Penina form took 5,335 completion tokens, 3,371 of them reasoning (Task 0 gate,
+# 2026-10-16). gemini-3.8-flash caps output at 65,536.
+ANSWER_TOKENS = 32000
+# A second read is only worth starting with this much of the deadline left: the gate's
+# reads took 12-39 s (llm_utils.MIN_USEFUL_SECONDS, 2 s, is sized for "not a sure
+# timeout", not for a whole vision read).
+MIN_RETRY_SECONDS = 30.0
 
 MSG_PDF_REFUSED = "PDF files cannot be read yet — export the pages as images and upload those."
 MSG_TOO_MANY_PAGES = "This form has more than 15 pages — upload the checklist pages only."
 MSG_BAD_ANSWER = "The reader's answer could not be used — try again."
 MSG_UNAVAILABLE = "The reader is not answering right now — try again in a few minutes."
+MSG_TOO_LONG = ("This form is too long to read in one go — upload it in smaller parts "
+                "(fewer pages per upload).")
+MSG_NOT_CONFIGURED = "Reading forms is not configured on this deployment."
 
 _PAGE_OBJ = re.compile(rb"/Type\s*/Page(?![a-zA-Z])")
 
 
 def model():
     return os.environ.get("TEMPLATE_DIGITISE_MODEL", "").strip() or DEFAULT_MODEL
+
+
+def answer_tokens():
+    raw = os.environ.get("TEMPLATE_DIGITISE_ANSWER_TOKENS", "").strip()
+    try:
+        n = int(raw) if raw else 0
+    except ValueError:
+        n = 0
+    return n if n > 0 else ANSWER_TOKENS
 
 
 def pdf_page_count(body):
@@ -92,15 +113,26 @@ def build_parts(pages):
 
 def read(pages, deadline=None):
     """(raw_sections, None) or (None, message for the person). One retry when the answer
-    is not the JSON asked for; a transport failure is not retried here (the chain in
-    llm_utils already has)."""
+    is not the JSON asked for, within what is left of `deadline` (seconds from now); a
+    transport failure is not retried here (the chain in llm_utils already has), and
+    neither is an answer cut off at max_tokens -- the same request would be cut off
+    again."""
     parts = build_parts(pages)
+    started = time.monotonic()
     for attempt in range(2):
+        left = None if deadline is None else deadline - (time.monotonic() - started)
+        if attempt > 0 and left is not None and left < MIN_RETRY_SECONDS:
+            logger.warning("template vision: no retry, %.1fs of the deadline left", left)
+            break
         text, err = llm_utils.call_llm_parts(
-            parts, model=model(), max_tokens=ANSWER_TOKENS, fallback_env=FALLBACK_ENV,
-            deadline=deadline, caller="template_digitise")
+            parts, model=model(), max_tokens=answer_tokens(), fallback_env=FALLBACK_ENV,
+            deadline=left, caller="template_digitise")
         if err is not None:
             logger.error("template vision call failed: %s", err)
+            if err.startswith(llm_utils.PARTS_CUT_OFF):
+                return None, MSG_TOO_LONG
+            if err.startswith(llm_utils.PARTS_NOT_CONFIGURED):
+                return None, MSG_NOT_CONFIGURED
             return None, MSG_UNAVAILABLE
         data = llm_utils.extract_json(text or "")
         if isinstance(data, dict) and isinstance(data.get("sections"), list):

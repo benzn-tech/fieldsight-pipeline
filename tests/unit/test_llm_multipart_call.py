@@ -118,3 +118,34 @@ def test_the_anthropic_provider_cannot_take_parts(monkeypatch):
     sent = _stub(monkeypatch, [])
     text, err = lu.call_llm_parts(PARTS, model=GEM, max_tokens=100, caller="t")
     assert text is None and "OpenRouter" in err and sent == []
+
+
+def _cut(text):
+    return _R(200, {"model": GEM, "choices": [{"message": {"content": text},
+                                               "finish_reason": "length"}],
+                    "usage": {"completion_tokens": 100}})
+
+
+def test_a_truncated_answer_is_an_error_not_text(monkeypatch):
+    monkeypatch.setenv("TEMPLATE_DIGITISE_FALLBACK_MODELS", "vendor/vision-b")
+    sent = _stub(monkeypatch, [_cut('{"sections": [{"ti'), _ok()])
+    text, err = lu.call_llm_parts(PARTS, model=GEM, max_tokens=100,
+                                  fallback_env="TEMPLATE_DIGITISE_FALLBACK_MODELS", caller="t")
+    assert text is None and err.startswith(lu.PARTS_CUT_OFF)
+    assert len(sent) == 1, "a budget cut-off is not the vendor's; the next model is not tried"
+
+
+def test_an_empty_answer_at_the_limit_is_a_cut_off_too(monkeypatch):
+    sent = _stub(monkeypatch, [_cut("")])
+    text, err = lu.call_llm_parts(PARTS, model=GEM, max_tokens=100, caller="t")
+    assert text is None and err.startswith(lu.PARTS_CUT_OFF) and len(sent) == 1
+
+
+def test_config_errors_carry_the_not_configured_prefix(monkeypatch):
+    monkeypatch.setattr(lu, "QWEN_API_KEY", "")
+    assert lu.call_llm_parts(PARTS, model=GEM, max_tokens=1)[1].startswith(
+        lu.PARTS_NOT_CONFIGURED)
+    monkeypatch.setattr(lu, "QWEN_API_KEY", "k")
+    monkeypatch.setattr(lu, "LLM_PROVIDER", "anthropic")
+    assert lu.call_llm_parts(PARTS, model=GEM, max_tokens=1)[1].startswith(
+        lu.PARTS_NOT_CONFIGURED)

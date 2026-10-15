@@ -174,3 +174,95 @@ def test_the_source_shapes():
     assert template_types.source_shape_error(["md"])
     assert template_types.ext_of("Form.PDF") == "pdf"
     assert template_types.ext_of("noext") == ""
+
+
+# --- fix round 1: cut-off answers, the retry's deadline, config errors -----------------
+
+def _finished(text, finish):
+    return _R(200, {"model": "google/gemini-3.8-flash",
+                    "choices": [{"message": {"content": text}, "finish_reason": finish}],
+                    "usage": {"completion_tokens": 32000,
+                              "completion_tokens_details": {"reasoning_tokens": 4000}}})
+
+
+_PAGE = [{"body": b"x", "content_type": "image/png", "name": "p"}]
+
+
+def _stub_timeouts(monkeypatch, responses):
+    """Like _stub, but records the per-request timeout -- where the deadline lands."""
+    sent = []
+    seq = list(responses)
+
+    def fake(self, method, url, body=None, headers=None, timeout=None):
+        sent.append({"body": json.loads(body), "timeout": timeout})
+        return seq.pop(0)
+
+    monkeypatch.setattr(lu.urllib3.PoolManager, "request", fake)
+    return sent
+
+
+def test_an_answer_cut_off_at_max_tokens_is_too_long_and_not_retried(monkeypatch):
+    sent = _stub(monkeypatch, [_finished('{"sections": [{"title": "A", "items": ["x', "length"),
+                               _ok('{"sections": []}')])
+    raw, err = template_vision.read(_PAGE)
+    assert raw is None and err == template_vision.MSG_TOO_LONG
+    assert len(sent) == 1, "the same temperature-0 request would be cut off again"
+
+
+def test_an_empty_answer_because_reasoning_spent_the_budget_is_too_long(monkeypatch):
+    monkeypatch.setenv("TEMPLATE_DIGITISE_FALLBACK_MODELS", "vendor/vision-b")
+    sent = _stub(monkeypatch, [_finished("", "length"), _ok('{"sections": []}')])
+    raw, err = template_vision.read(_PAGE)
+    assert raw is None and err == template_vision.MSG_TOO_LONG
+    assert len(sent) == 1, "not moved to the next model either"
+
+
+def test_the_answer_budget_is_32000_and_env_overridable(monkeypatch):
+    monkeypatch.delenv("TEMPLATE_DIGITISE_ANSWER_TOKENS", raising=False)
+    sent = _stub(monkeypatch, [_ok('{"sections": []}'), _ok('{"sections": []}')])
+    template_vision.read(_PAGE)
+    assert sent[0]["max_tokens"] == 32000
+    monkeypatch.setenv("TEMPLATE_DIGITISE_ANSWER_TOKENS", "48000")
+    template_vision.read(_PAGE)
+    assert sent[1]["max_tokens"] == 48000
+
+
+class _Clock:
+    def __init__(self, *values):
+        self.values = list(values)
+
+    def monotonic(self):
+        return self.values.pop(0) if len(self.values) > 1 else self.values[0]
+
+
+def test_the_retry_gets_only_what_is_left_of_the_deadline(monkeypatch):
+    monkeypatch.setattr(lu, "HTTP_TIMEOUT", 1000.0)
+    # read(): started=0, attempt 1 at 0, attempt 2 at 40 -> 60 s left of 100.
+    monkeypatch.setattr(template_vision, "time", _Clock(0.0, 0.0, 40.0))
+    sent = _stub_timeouts(monkeypatch, [_ok("not json"), _ok('{"sections": []}')])
+    raw, err = template_vision.read(_PAGE, deadline=100.0)
+    assert err is None and raw == []
+    assert len(sent) == 2
+    assert 90 < sent[0]["timeout"] <= 100
+    assert sent[1]["timeout"] <= 60, "the retry was handed the original deadline"
+
+
+def test_no_retry_when_too_little_of_the_deadline_is_left(monkeypatch):
+    monkeypatch.setattr(lu, "HTTP_TIMEOUT", 1000.0)
+    left = template_vision.MIN_RETRY_SECONDS - 1
+    monkeypatch.setattr(template_vision, "time", _Clock(0.0, 0.0, 100.0 - left))
+    sent = _stub_timeouts(monkeypatch, [_ok("not json"), _ok('{"sections": []}')])
+    raw, err = template_vision.read(_PAGE, deadline=100.0)
+    assert raw is None and err == template_vision.MSG_BAD_ANSWER
+    assert len(sent) == 1
+
+
+def test_a_deploy_that_cannot_make_the_call_says_so_not_try_again(monkeypatch):
+    monkeypatch.setattr(lu, "QWEN_API_KEY", "")
+    sent = _stub(monkeypatch, [])
+    raw, err = template_vision.read(_PAGE)
+    assert raw is None and err == template_vision.MSG_NOT_CONFIGURED and sent == []
+    monkeypatch.setattr(lu, "QWEN_API_KEY", "k")
+    monkeypatch.setattr(lu, "LLM_PROVIDER", "anthropic")
+    raw, err = template_vision.read(_PAGE)
+    assert raw is None and err == template_vision.MSG_NOT_CONFIGURED and sent == []
