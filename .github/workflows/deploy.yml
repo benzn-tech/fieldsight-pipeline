@@ -177,6 +177,14 @@ jobs:
           if [ -n "${{ vars.TEST_ASK_JUDGE_MODEL }}" ]; then
             ASK_JUDGE_MODEL_PARAM="AskJudgeModel=${{ vars.TEST_ASK_JUDGE_MODEL }}"
           fi
+          ASK_JUDGE_PROVIDER_PARAM=""
+          if [ -n "${{ vars.TEST_ASK_JUDGE_PROVIDER }}" ]; then
+            ASK_JUDGE_PROVIDER_PARAM="AskJudgeProvider=${{ vars.TEST_ASK_JUDGE_PROVIDER }}"
+          fi
+          ASK_JUDGE_REASONING_PARAM=""
+          if [ -n "${{ vars.TEST_ASK_JUDGE_REASONING }}" ]; then
+            ASK_JUDGE_REASONING_PARAM="AskJudgeReasoning=${{ vars.TEST_ASK_JUDGE_REASONING }}"
+          fi
           # Non-work (personal) topic retention sweep. Two independent gates, both
           # off by default, because this one DELETES: it tombstones the topic and
           # drops its vectors (the transcript and audio are left alone).
@@ -255,6 +263,8 @@ jobs:
               $VAD_LAYER_PARAM \
               $ASK_AGENTIC_PARAM \
               $ASK_JUDGE_MODEL_PARAM \
+              $ASK_JUDGE_PROVIDER_PARAM \
+              $ASK_JUDGE_REASONING_PARAM \
               "ItemsTableName=fieldsight-test-items" \
               "ReportsTableName=fieldsight-test-reports" \
               "AuditTableName=fieldsight-test-audit" \

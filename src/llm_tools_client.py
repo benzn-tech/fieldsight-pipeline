@@ -30,6 +30,10 @@ Rules that shape the code below:
   5xx or a transport failure (timeout included), and only while the deadline
   leaves time for another attempt. A 4xx is our request's fault and another
   model would fail the same way.
+- **Provider pin and reasoning** (`ASK_JUDGE_PROVIDER`, `ASK_JUDGE_REASONING`)
+  ride on the primary judge model only, never on a fallback: a fallback on
+  another vendor would fail under an endpoint pin that names someone else.
+  Unset means no `provider` / `reasoning` key, the payload as before.
 - **Deadline** is an absolute `time.monotonic()` value, the convention the Ask
   agent already uses. Under one second left means no call at all.
 - **Logging** carries caller, model, tool names, token usage and ms. Never
@@ -89,6 +93,32 @@ def _primary_model():
     return (os.environ.get("ASK_JUDGE_MODEL")
             or os.environ.get("CORROBORATION_CHEAP_MODEL")
             or DEFAULT_MODEL)
+
+
+_REASONING_EFFORTS = ("low", "medium", "high")
+
+
+def _provider_pin():
+    """`{"only": [...], "allow_fallbacks": False}` from `ASK_JUDGE_PROVIDER`
+    (comma-separated OpenRouter endpoint tags, e.g. "coreweave/fp8"), or None."""
+    raw = os.environ.get("ASK_JUDGE_PROVIDER") or ""
+    tags = [t.strip() for t in raw.split(",") if t.strip()]
+    return {"only": tags, "allow_fallbacks": False} if tags else None
+
+
+def _reasoning():
+    """OpenRouter `reasoning` from `ASK_JUDGE_REASONING`: off, low, medium or
+    high; anything else (after a warning) and unset mean no key at all."""
+    raw = (os.environ.get("ASK_JUDGE_REASONING") or "").strip().lower()
+    if not raw:
+        return None
+    if raw == "off":
+        return {"enabled": False}
+    if raw in _REASONING_EFFORTS:
+        return {"effort": raw}
+    logger.warning("llm_tools: ASK_JUDGE_REASONING value not recognised "
+                   "(expected off|low|medium|high); sending no reasoning")
+    return None
 
 
 def _model_chain(primary):
@@ -220,7 +250,17 @@ def chat(messages, tools, *, model=None, tool_choice="required",
     if deadline is not None and deadline - _now() < MIN_TIME_LEFT:
         return ChatTurn(error="no time left", timed_out=True)
 
-    chain = _model_chain(model or _primary_model())
+    env_primary = _primary_model()
+    chain = _model_chain(model or env_primary)
+    # Pin and reasoning belong to the configured judge model: never to a
+    # fallback, nor to a model a caller names in its place.
+    primary_extras = {}
+    if chain[0] == env_primary:
+        pin, reasoning = _provider_pin(), _reasoning()
+        if pin:
+            primary_extras["provider"] = pin
+        if reasoning:
+            primary_extras["reasoning"] = reasoning
     headers = {"Content-Type": "application/json",
                "Authorization": "Bearer " + key}
     http = corroboration_client.http_session()
@@ -252,6 +292,8 @@ def chat(messages, tools, *, model=None, tool_choice="required",
             "tool_choice": choice,
             "max_tokens": max_tokens + llm_utils.REASONING_HEADROOM_TOKENS,
         }
+        if idx == 0:
+            payload.update(primary_extras)
         attempt_start = _now()
         try:
             resp = http.request("POST", corroboration_client.API_URL,

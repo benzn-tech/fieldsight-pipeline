@@ -808,3 +808,59 @@ def test_screen_web_intent_counts_only_with_offer_web(monkeypatch, caplog):
     with caplog.at_level(logging.INFO):
         run(body("What does NZS 3101 say?", web_intent=True), ScriptChat(final("B2 [R1].")))
     assert _route(caplog)["policy"] == "auto"
+
+
+# ------------------------------------------------- leaked tool markup (DeepSeek)
+
+LEAKED = ("Use the site spec's figures, not the standard's minimums.</answer> "
+          '<parameter name="basis">mixed')
+
+
+def test_leaked_tool_markup_is_cut_from_the_final_answer():
+    """Verbatim DeepSeek V4.1 Flash final_answer.answer (live probe, 2026-10-16)."""
+    turn = ChatTurn(tool_calls=[{"id": "f", "name": "final_answer",
+                                 "arguments": {"answer": LEAKED, "basis": "bogus"}}])
+    fin = orch._final_of(turn)
+    assert fin["answer"] == "Use the site spec's figures, not the standard's minimums."
+    assert fin["basis"] is None            # never recovered from the leaked fragment
+
+
+def test_leaked_markup_does_not_override_a_valid_basis():
+    turn = ChatTurn(tool_calls=[{"id": "f", "name": "final_answer",
+                                 "arguments": {"answer": LEAKED, "basis": "records"}}])
+    fin = orch._final_of(turn)
+    assert fin["basis"] == "records"
+    assert "<" not in fin["answer"]
+
+
+@pytest.mark.parametrize("marker", [
+    "</answer>", '<parameter name="x">', "</parameter>", '<invoke name="y">',
+    "</invoke>", "<function_calls>", "</function_calls>", "<tool_call>", "</tool_call>",
+])
+def test_every_tool_markup_marker_cuts(marker):
+    assert orch._strip_tool_markup("Answer [R1].  " + marker + " tail") == "Answer [R1]."
+
+
+def test_clean_answer_is_untouched():
+    text = "Poured B2 at 3 < 4 m [R1]. Use <b> nothing."
+    assert orch._strip_tool_markup(text) == text
+
+
+def test_leaked_markup_is_cut_from_a_text_only_reply():
+    fin = orch._final_of(ChatTurn(text=LEAKED))
+    assert fin["answer"] == "Use the site spec's figures, not the standard's minimums."
+
+
+def test_answer_that_is_only_markup_is_a_bad_final():
+    turn = ChatTurn(tool_calls=[{"id": "f", "name": "final_answer",
+                                 "arguments": {"answer": "</answer> junk", "basis": "none"}}])
+    assert orch._final_of(turn) == "bad"
+    assert orch._final_of(ChatTurn(text='<parameter name="basis">mixed')) == "bad"
+
+
+def test_leaked_markup_never_reaches_the_client(monkeypatch):
+    precheck_says(monkeypatch, "no")
+    chat = ScriptChat(final("We poured the B2 slab [R1].</answer> "
+                            '<parameter name="basis">mixed'))
+    out = run(body(), chat)
+    assert out["answer"] == "We poured the B2 slab [1]."

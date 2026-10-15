@@ -362,6 +362,23 @@ Parameters:
       Ask orchestration v2: comma-separated judge fallback models, tried on a
       5xx or a transport failure. Empty means no fallback.
 
+  AskJudgeProvider:
+    Type: String
+    Default: ''
+    Description: >-
+      Ask orchestration v2: comma-separated OpenRouter endpoint tags the
+      primary judge model is pinned to (e.g. coreweave/fp8), no provider
+      fallback. Never applied to AskJudgeFallbacks. Empty means no pin.
+
+  AskJudgeReasoning:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(|off|low|medium|high)$'
+    Description: >-
+      Ask orchestration v2: reasoning control for the primary judge model
+      only. off disables reasoning; low/medium/high set the effort. Empty
+      sends no reasoning setting (the provider default).
+
   VoiceWebEnabled:
     Type: String
     Default: 'false'
@@ -2549,6 +2566,8 @@ Resources:
           ASK_AGENTIC: !Ref AskAgentic
           ASK_JUDGE_MODEL: !Ref AskJudgeModel
           ASK_JUDGE_FALLBACKS: !Ref AskJudgeFallbacks
+          ASK_JUDGE_PROVIDER: !Ref AskJudgeProvider
+          ASK_JUDGE_REASONING: !Ref AskJudgeReasoning
       Layers:
         - !Ref DashScopeLayer
       Policies:
