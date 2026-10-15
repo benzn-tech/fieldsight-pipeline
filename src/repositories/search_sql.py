@@ -37,14 +37,44 @@ def _scope_predicate(alias: str = "c") -> str:
     was first written, which meant every other surface hid the content and the two
     the customer is most likely to try still returned it verbatim.
     """
+    return _visibility_predicate(
+        alias,
+        f"(%(date_from)s::date IS NULL OR {alias}.report_date >= %(date_from)s::date) "
+        f"AND (%(date_to)s::date IS NULL OR {alias}.report_date <= %(date_to)s::date)")
+
+
+def _visibility_predicate(alias: str, date_sql: str) -> str:
+    """The ONE visibility rule for report_chunks: site pin, per-author narrowing,
+    both tombstone arms + supersession (visible_chunks_predicate), and the index
+    family (family_predicate, coverage fallback included). `date_sql` is the
+    caller's own date bound, spliced in where the date clauses have always sat so
+    the search SQL stays byte-identical.
+
+    _scope_predicate (search, and Ask's latest_matching_date), and
+    build_latest_date_sql all build their WHERE through here, so a date that a
+    deleted, superseded, other-author or other-family row would have produced
+    cannot leak through one of them while the others hide it.
+    """
     return (
         f"{alias}.site_id = ANY(%(site_ids)s) "
         f"AND (%(author_ids)s::uuid[] IS NULL OR {alias}.user_id = ANY(%(author_ids)s::uuid[])) "
-        f"AND (%(date_from)s::date IS NULL OR {alias}.report_date >= %(date_from)s::date) "
-        f"AND (%(date_to)s::date IS NULL OR {alias}.report_date <= %(date_to)s::date) "
+        f"AND {date_sql} "
         f"AND " + visible_chunks_predicate(alias) + " "
         f"AND " + family_predicate(alias)
     )
+
+
+def _lexical_vector(alias: str = "c") -> str:
+    # MUST equal idx_report_chunks_tsv_multi_config's expression (0061) character for
+    # character (modulo alias) -- test_keyword_arm_expression_matches_the_index_exactly.
+    return (f"to_tsvector('english', {alias}.chunk_text) || to_tsvector('simple', "
+            f"regexp_replace({alias}.chunk_text, '[^a-zA-Z0-9]+', ' ', 'g'))")
+
+
+# The keyword arm's query side: the caller's %(q_text)s bound verbatim (see
+# build_search_sql's header -- an OR list built by lexical_terms.or_query, or "",
+# which is an empty tsquery that matches nothing).
+_LEXICAL_QUERY = "websearch_to_tsquery('simple', %(q_text)s)"
 
 
 def build_search_sql() -> str:
@@ -158,8 +188,8 @@ def build_search_sql() -> str:
         "  LEFT JOIN topics t ON t.id = c.topic_id "
         "  LEFT JOIN sites s ON s.id = c.site_id "
         "  WHERE " + scope + " "
-        "  AND (to_tsvector('english', c.chunk_text) || to_tsvector('simple', regexp_replace(c.chunk_text, '[^a-zA-Z0-9]+', ' ', 'g'))) "
-        "  @@ websearch_to_tsquery('simple', %(q_text)s) "
+        "  AND (" + _lexical_vector("c") + ") "
+        "  @@ " + _LEXICAL_QUERY + " "
         # 2026-09-22 round-2 fix ("the keyword arm can actually fire"): this
         # LIMIT used to have NO ORDER BY, which was fine when the arm's query
         # was an AND of every word (Cause A) -- matches were rare, so
@@ -172,7 +202,7 @@ def build_search_sql() -> str:
         # it for the scan) before the LIMIT makes the k rows this arm
         # contributes its best k by relevance, not whichever k the planner
         # happened to visit first.
-        "  ORDER BY ts_rank(to_tsvector('english', c.chunk_text) || to_tsvector('simple', regexp_replace(c.chunk_text, '[^a-zA-Z0-9]+', ' ', 'g')), websearch_to_tsquery('simple', %(q_text)s)) DESC "
+        "  ORDER BY ts_rank(" + _lexical_vector("c") + ", " + _LEXICAL_QUERY + ") DESC "
         "  LIMIT %(k)s"
         ") "
         "SELECT id, chunk_text, chunk_type, topic_id, source_s3_key, "
@@ -209,9 +239,28 @@ def build_latest_date_sql() -> str:
     return (
         "SELECT max(c.report_date) AS latest "
         "FROM report_chunks c "
-        "WHERE c.site_id = ANY(%(site_ids)s) "
-        "AND (%(author_ids)s::uuid[] IS NULL OR c.user_id = ANY(%(author_ids)s::uuid[])) "
-        "AND (%(on_or_before)s::date IS NULL OR c.report_date <= %(on_or_before)s::date) "
-        "AND " + visible_chunks_predicate("c") + " "
-        "AND " + family_predicate("c")
+        "WHERE " + _visibility_predicate(
+            "c", "(%(on_or_before)s::date IS NULL OR c.report_date <= %(on_or_before)s::date)")
+    )
+
+
+def build_latest_match_date_sql() -> str:
+    """The most recent day with a visible chunk NEAR a query (Ask tools,
+    spec 2026-10-15 §3.1 item 3, `latest_activity` with a query).
+
+    WHERE = the search's own scope (`_scope_predicate`, with date_from/date_to as
+    the bounded window) AND (vector arm OR keyword arm):
+      * vector: `(c.embedding <=> %(q)s::vector) <= %(gate)s` -- the distance gate
+        owned by the Ask tools (ASK_TOOLS_MATCH_GATE, default 0.55);
+      * keyword: the SAME expression and tsquery as build_search_sql's lex arm,
+        so "a keyword hit counts" means exactly what it means for search.
+    An exact scan over the window: the gate is a threshold, not a top-k, so HNSW
+    cannot serve it -- the window (date_from) is what bounds the cost.
+    """
+    return (
+        "SELECT max(c.report_date) AS latest "
+        "FROM report_chunks c "
+        "WHERE " + _scope_predicate("c") + " "
+        "AND ((c.embedding <=> %(q)s::vector) <= %(gate)s "
+        "OR (" + _lexical_vector("c") + ") @@ " + _LEXICAL_QUERY + ")"
     )

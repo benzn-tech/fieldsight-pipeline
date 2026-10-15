@@ -322,3 +322,16 @@ def test_keyword_arm_selects_the_real_cosine_distance_not_null():
     lex = lex.split("), ", 1)[0] if "), " in lex else lex
     assert "c.embedding <=> %(q)s::vector AS distance, true AS lexical_hit" in lex
     assert "NULL::float8" not in sql
+
+
+def test_latest_match_date_sql_shares_search_scope_and_keyword_expression():
+    """Ask's latest_activity(query) must hide exactly what search hides and treat
+    a keyword hit exactly as search does -- by construction, not by lookalike text."""
+    import repositories.search_sql as search_sql
+    sql = search_sql.build_latest_match_date_sql()
+    assert search_sql._scope_predicate("c") in sql
+    for piece in (search_sql._lexical_vector("c"), search_sql._LEXICAL_QUERY):
+        assert piece in sql and piece in build_search_sql()
+    assert "@@ websearch_to_tsquery('simple', %(q_text)s)" in sql
+    assert "(c.embedding <=> %(q)s::vector) <= %(gate)s" in sql
+    assert "ILIKE" not in sql.upper()
