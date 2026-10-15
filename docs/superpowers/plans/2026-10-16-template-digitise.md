@@ -1879,7 +1879,7 @@ Expected: FAIL with `KeyError: 'TemplateDigitiseFunction'` and missing script en
 
 - [ ] **Step 3: Add the function to `template.yaml`**
 
-Insert directly above the line `  # Lambda 10: Org API (Phase 3) — real write backend for` — i.e. after MigrateFunction's `        - VPCAccessPolicy: {}` and the blank line — this block (keep the dashes comment line that follows it as OrgApi's header):
+Insert after the blank line that follows MigrateFunction's `        - VPCAccessPolicy: {}`, i.e. directly ABOVE the `  # ----------------------------------------------------------` line that opens OrgApi's comment block (`# Lambda 10: Org API (Phase 3) ...`), leaving that whole header intact below the new block:
 
 ```yaml
   # ----------------------------------------------------------
@@ -4289,6 +4289,10 @@ EOF
 ### Task 10: Integration on TEST, and the prod hand-wiring list
 
 **Files:** none created in the repos (the release notes text goes into the backend PR description).
+
+**Shell state does not persist between tool calls.** Every command block below is ONE shell call: re-`export MSYS_NO_PATHCONV=1 AWS_PROFILE=fieldsight-deployer AWS_REGION=ap-southeast-2` and re-derive any `$VAR` (`$ORG_ROLE`, `$WRK_ROLE`, `$SUB`, `$PDF`, `$SIZE`, ...) inside the same block. With the profile missing, an expired default profile can answer empty instead of erroring, which reads as a clean result.
+
+Known and not caused by this work: the modal's `incident` report type is not in the server's `_REPORT_TYPES`, so a plain create with it answers 400 (pre-existing).
 
 - [ ] **Step 1: Re-fetch and compare against the moving base**
 
