@@ -1280,25 +1280,42 @@ def list_expired_non_work(conn, *, older_than, created_since, limit=500) -> list
 
 # ---- Ask tools (spec 2026-10-15-ask-retrieval-tools §3.1) -------------------
 # One WHERE for both functions so day_overview and latest_before can never
-# disagree about what is visible. Rules: deletion/supersession arms, non_work
-# out (NULL counts as work, as the timeline does), graded author filter with
-# NULL user_id hidden, and the timeline's family rule -- per (site,user,day)
-# extraction-sourced topics if any visible one exists, else report-sourced.
-# The family rule's inner EXISTS carries the same visibility arms as the outer
-# row: a deleted, superseded or non_work extraction topic must not suppress the
-# report family, or the day reads as empty.
+# disagree about what is visible.
+#
+# The OUTER row carries every visibility arm (deletion by topic id, deletion by
+# source prefix, supersession), drops non_work (NULL counts as work -- the rule
+# session_index.build_chunks uses; /timeline passes non_work through and the UI
+# hides it), and under a graded author filter hides NULL user_id.
+#
+# The FAMILY rule mirrors /timeline (lambda_org_api._render_timeline_for_user):
+# for each (user, day), the extraction family is shown if ANY extraction topic of
+# that user and day exists on a site the caller can reach (`site_ids`, bound a
+# second time -- never the narrowed `site_id` kwarg, which /timeline applies
+# after the family is chosen); otherwise the report family. Presence checks ONLY
+# supersession, like has_topics_for_source_prefix and lambda_ingest._should_defer:
+# non_work and deleted extraction topics still count, so the report summary
+# (which can paraphrase personal talk or a deleted recording) never stands in for
+# them. NULL-user rows decide presence per (site, day). The report family is
+# `reports/` keys only; any other or NULL key is never shown, as on /timeline.
+#
+# Known v1 limitation: /timeline also folds in merged-meeting keys
+# (_merged_keys_for); a joiner's view of a meeting led by someone else is not
+# mirrored here.
 def _ask_tools_where(site_ids, *, author_ids, site_id, user_id):
+    site_list = [str(s) for s in site_ids]
+    presence = (
+        "EXISTS (SELECT 1 FROM topics x WHERE x.report_date = t.report_date"
+        " AND x.source_s3_key LIKE 'extractions/%%'"
+        " AND " + LIVE_TOPIC_PREDICATE.format(alias="x") +
+        " AND ((t.user_id IS NOT NULL AND x.user_id = t.user_id"
+        " AND x.site_id = ANY(%s::uuid[]))"
+        " OR (t.user_id IS NULL AND x.user_id IS NULL AND x.site_id = t.site_id)))")
     clauses = ["t.site_id = ANY(%s::uuid[])",
                visible_topics_predicate("t"),
                "t.work_class IS DISTINCT FROM 'non_work'",
-               "(t.source_s3_key LIKE 'extractions/%%' OR NOT EXISTS ("
-               " SELECT 1 FROM topics x WHERE x.site_id = t.site_id"
-               " AND x.user_id IS NOT DISTINCT FROM t.user_id"
-               " AND x.report_date = t.report_date"
-               " AND x.source_s3_key LIKE 'extractions/%%'"
-               " AND x.work_class IS DISTINCT FROM 'non_work'"
-               " AND " + visible_topics_predicate("x") + "))"]
-    params = [[str(s) for s in site_ids]]
+               "(t.source_s3_key LIKE 'extractions/%%'"
+               " OR (t.source_s3_key LIKE 'reports/%%' AND NOT " + presence + "))"]
+    params = [site_list, site_list]
     if author_ids is not None:
         # = ANY never matches a NULL user_id, so unattributed topics stay hidden.
         clauses.append("t.user_id = ANY(%s::uuid[])")
@@ -1315,7 +1332,10 @@ def _ask_tools_where(site_ids, *, author_ids, site_id, user_id):
 def day_overview_rows(conn, site_ids, date_from, date_to, *, author_ids=None,
                       site_id=None, user_id=None, limit=60) -> list[dict]:
     """Visible work topics in [date_from, date_to], chronological. Empty site_ids or
-    an empty (not None) author set means nothing is visible -- never 'no filter'."""
+    an empty (not None) author set means nothing is visible -- never 'no filter'.
+
+    Fetches up to `limit + 1` rows on purpose: the caller trims to `limit` and uses
+    the extra row to know the result was truncated (meta.truncated)."""
     if not site_ids or (author_ids is not None and not author_ids):
         return []
     where, params = _ask_tools_where(site_ids, author_ids=author_ids,
@@ -1332,7 +1352,7 @@ def day_overview_rows(conn, site_ids, date_from, date_to, *, author_ids=None,
         "ORDER BY t.report_date, t.occurred_at NULLS LAST, t.time_range NULLS LAST, t.created_at "
         "LIMIT %s")
     return conn.cursor(row_factory=dict_row).execute(
-        sql, params + [date_from, date_to, limit]).fetchall()
+        sql, params + [date_from, date_to, limit + 1]).fetchall()
 
 
 def latest_visible_topic_date(conn, site_ids, before, *, author_ids=None,
