@@ -104,8 +104,8 @@ def wk(monkeypatch):
 def fake_orchestrator(env, states=("searching_records", "searching_web", "writing")):
     mod = types.ModuleType("ask_orchestrator")
 
-    def answer(body, *, channel, on_state, tools=None, chat=None):
-        env.orch_calls.append({"body": body, "channel": channel})
+    def answer(body, *, channel, on_state, tools=None, chat=None, turn_id=None):
+        env.orch_calls.append({"body": body, "channel": channel, "turn_id": turn_id})
         for s in states:
             on_state(s)
         return dict(RAG_RESULT)
@@ -237,6 +237,64 @@ def test_voice_on_passes_todays_rag_body(wk):
                             "voice_web": True, "web_intent": True,
                             "history": [{"question": "q0", "answer": "a0"}],
                             "offer_web": True}
+
+
+# ------------------------------------------------- turn id in ASK_ROUTE (phase 4)
+
+@pytest.mark.parametrize("channel,flag", [("screen", "screen"), ("voice", "voice")])
+def test_worker_passes_the_turn_id_to_the_orchestrator(wk, channel, flag):
+    wk.mp.setenv("ASK_AGENTIC", flag)
+    fake_orchestrator(wk, states=())
+    if channel == "screen":
+        pending(wk, channel="screen")
+        avt.worker_handler(screen_event(), None)
+    else:
+        pending(wk)
+        avt.worker_handler(voice_event(), None)
+    (call,) = wk.orch_calls
+    assert call["turn_id"] == TURN
+
+
+def _route_lines(caplog):
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("ASK_ROUTE ")]
+
+
+def test_ask_route_carries_the_turn_id(monkeypatch, caplog):
+    """The eval harness joins a turn to its route line on `turn`. The id is a
+    random hex string, not user text."""
+    import logging
+    import ask_orchestrator as orch
+    monkeypatch.setattr(orch, "_answer", lambda *a, **k: dict(RAG_RESULT))
+    with caplog.at_level(logging.INFO):
+        orch.answer({"question": "q", "caller_sub": SUB}, channel="screen",
+                    on_state=lambda s: None, turn_id=TURN)
+    (line,) = _route_lines(caplog)
+    assert json.loads(line[len("ASK_ROUTE "):])["turn"] == TURN
+
+
+def test_ask_route_turn_is_null_without_a_turn_id(monkeypatch, caplog):
+    import logging
+    import ask_orchestrator as orch
+    monkeypatch.setattr(orch, "_answer", lambda *a, **k: dict(RAG_RESULT))
+    with caplog.at_level(logging.INFO):
+        orch.answer({"question": "q", "caller_sub": SUB}, channel="voice",
+                    on_state=lambda s: None)
+    (line,) = _route_lines(caplog)
+    assert json.loads(line[len("ASK_ROUTE "):])["turn"] is None
+
+
+@pytest.mark.parametrize("channel", ["screen", "voice"])
+def test_flag_off_rag_answer_gets_no_turn_id(wk, channel):
+    """Flag off, the old `_rag_answer` path is unchanged: the turn id is not
+    added to its body, so its ASK_ROUTE line gains no new key."""
+    if channel == "screen":
+        pending(wk, channel="screen")
+        avt.worker_handler(screen_event(), None)
+    else:
+        pending(wk)
+        avt.worker_handler(voice_event(), None)
+    (body,) = wk.rag_calls
+    assert not any("turn" in k for k in body)
 
 
 def test_on_state_is_silent_once_cancelled(wk):

@@ -1060,13 +1060,16 @@ def _judge_round(t, turn, ctx, tools, states, rnd):
     return batch, all_bad
 
 
-def answer(body, *, channel, on_state, tools=None, chat=None) -> dict:
+def answer(body, *, channel, on_state, tools=None, chat=None, turn_id=None) -> dict:
     """One Ask turn through the orchestrator (spec §6). Same dict shape as
     `lambda_ask_agent._rag_answer`: `answer, citations, grounded, from_web?, web?,
     basis, applied_scope, asked, web_offer?`.
 
     `on_state` receives `searching_records`, `searching_web` and `writing`; the
-    worker decides which of them a channel writes. Never raises."""
+    worker decides which of them a channel writes. Never raises.
+
+    `turn_id` is logged as `ASK_ROUTE.turn` so the routing eval can join a turn
+    to its route line. It is a random hex id, never user text."""
     import lambda_ask_agent as laa
     started = _clock()
     voice = channel == "voice"
@@ -1075,7 +1078,7 @@ def answer(body, *, channel, on_state, tools=None, chat=None) -> dict:
     route = {"orch": "v2", "channel": channel, "policy": None, "precheck": "n/a",
              "rounds": 0, "calls": [], "refs_r": 0, "refs_w": 0, "bad_refs": 0,
              "basis": None, "web_late": False, "fallback": None, "guard": False,
-             "ms": {"judge": []}}
+             "ms": {"judge": []}, "turn": turn_id}
     try:
         import ask_voice_turn
         route["sub_hash"] = ask_voice_turn.sub_hash(caller_sub)
