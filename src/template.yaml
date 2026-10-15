@@ -2655,6 +2655,68 @@ Resources:
         - VPCAccessPolicy: {}
 
   # ----------------------------------------------------------
+  # Template digitise worker (spec 2026-10-16). Reads a checklist form a person
+  # uploaded (template_sources/) into a DRAFT template: a Word file with python-docx,
+  # a PDF or photos with one vision call. Non-VPC: it calls OpenRouter, and org-api
+  # (in-VPC, no outbound) hands it the work through template_digitise_requests/
+  # (BUG-36). NO Events: wired by scripts/wire-s3-events.sh (fs-template-digitise,
+  # BUG-33). Its output prefix template_digitise_results/ matches no trigger.
+  # ----------------------------------------------------------
+  TemplateDigitiseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ["${P}-template-digitise", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_template_digitise.lambda_handler
+      Timeout: 900
+      MemorySize: 1024
+      # No async retry: a failed result write must not re-run the paid vision call.
+      # The source stays, so a person retries with POST /templates/digitise (spec).
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+      Runtime: python3.12  # python-docx-layer is built for cp312 (BUG-24); it also carries Pillow
+      Layers: !If
+        - HasDocxLayer
+        - - !Ref DocxLayerArn
+        - !Ref AWS::NoValue
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref IngestBucketName   # the lake -- where org-api writes requests and sources
+          LLM_PROVIDER: !Ref LlmProvider
+          # Carried because every LLM_PROVIDER carrier must carry it (wiring test); the
+          # vision call sends temperature 0 explicitly whatever this says (ruling R3).
+          LLM_TEMPERATURE: !Ref LlmTemperature
+          QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
+          QWEN_BASE_URL: !Ref QwenBaseUrl
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60
+          # A 115-item form took 27-40 s in the spike; 300 s leaves the chain room to retry.
+          LLM_HTTP_TIMEOUT: '300'
+          # EMPTY on purpose. Globals sets the TEXT models' chain; this function never
+          # calls call_llm, and a text model handed page images would invent items.
+          LLM_FALLBACK_MODELS: ''
+          TEMPLATE_DIGITISE_MODEL: google/gemini-3.8-flash
+          TEMPLATE_DIGITISE_FALLBACK_MODELS: ''
+      Policies:
+        # lake_put: the result write also appends one manifest line in the bucket it wrote to.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/template_digitise_requests/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/template_sources/*
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/template_digitise_results/*
+
+  # ----------------------------------------------------------
   # Lambda 10: Org API (Phase 3) — real write backend for
   # projects/members/roles/profile/images. In-VPC (psycopg → Aurora).
   # Gated by HasOrgApi (DbStackName + OrgUserPoolId both set).
