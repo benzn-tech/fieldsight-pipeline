@@ -1,0 +1,404 @@
+"""The tool-calling chat client for the Ask judge (phase 2).
+
+Spec: docs/superpowers/specs/2026-10-15-ask-orchestration-v2-design.md §5.
+
+Nothing here reaches a network. The HTTP layer is mocked the same way
+`test_corroboration_client.py` mocks it -- the client builds its pool through
+`corroboration_client.http_session()`, which calls `urllib3.PoolManager()` at
+call time, so patching that one attribute covers both clients.
+"""
+import json
+import logging
+
+import pytest
+
+import corroboration_client
+import llm_tools_client as tools_client
+import llm_utils
+
+
+class FakeResponse:
+    def __init__(self, status, payload):
+        self.status = status
+        self.data = (payload if isinstance(payload, bytes)
+                     else json.dumps(payload).encode("utf-8"))
+
+
+class FakePool:
+    def __init__(self, *responses):
+        self.queue = list(responses)
+        self.calls = []
+
+    def request(self, method, url, body=None, headers=None, timeout=None):
+        self.calls.append({"method": method, "url": url, "timeout": timeout,
+                           "headers": headers, "body": json.loads(body)})
+        nxt = self.queue.pop(0)
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
+
+
+@pytest.fixture(autouse=True)
+def _env(monkeypatch):
+    monkeypatch.setenv("CORROBORATION_API_KEY", "test-key")
+    for name in ("ASK_JUDGE_MODEL", "ASK_JUDGE_FALLBACKS",
+                 "CORROBORATION_CHEAP_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _install(monkeypatch, pool):
+    monkeypatch.setattr(corroboration_client.urllib3, "PoolManager",
+                        lambda *a, **k: pool)
+    return pool
+
+
+def _tool_call(cid, name, arguments):
+    return {"id": cid, "type": "function",
+            "function": {"name": name, "arguments": arguments}}
+
+
+def _body(content=None, tool_calls=None, model="google/gemini-3.8-flash",
+          usage=None):
+    message = {"role": "assistant", "content": content}
+    if tool_calls is not None:
+        message["tool_calls"] = tool_calls
+    return {"model": model,
+            "choices": [{"message": message,
+                         "finish_reason": "tool_calls" if tool_calls else "stop"}],
+            "usage": usage or {"prompt_tokens": 120, "completion_tokens": 30}}
+
+
+TOOLS = [
+    {"type": "function",
+     "function": {"name": "search_records",
+                  "description": "Search the site records.",
+                  "parameters": {"type": "object",
+                                 "properties": {"query": {"type": "string"}},
+                                 "required": ["query"]}}},
+    {"type": "function",
+     "function": {"name": "final_answer",
+                  "description": "Answer the reader.",
+                  "parameters": {"type": "object",
+                                 "properties": {"answer": {"type": "string"}},
+                                 "required": ["answer"]}}},
+]
+
+MESSAGES = [{"role": "system", "content": "You are the judge."},
+            {"role": "user", "content": "What did we do yesterday?"}]
+
+
+def _ok_tool_reply():
+    return FakeResponse(200, _body(tool_calls=[
+        _tool_call("call_1", "search_records", '{"query": "yesterday"}')]))
+
+
+# ------------------------------------------------------------------ request body
+
+def test_the_request_carries_messages_tools_and_tool_choice(monkeypatch):
+    pool = _install(monkeypatch, FakePool(_ok_tool_reply()))
+    tools_client.chat(MESSAGES, TOOLS)
+    call = pool.calls[0]
+    assert call["url"] == corroboration_client.API_URL
+    assert call["headers"]["Authorization"] == "Bearer test-key"
+    body = call["body"]
+    assert body["messages"] == MESSAGES
+    assert body["tools"] == TOOLS
+    assert body["tool_choice"] == "required"
+
+
+def test_max_tokens_is_an_answer_budget_plus_reasoning_headroom(monkeypatch):
+    pool = _install(monkeypatch, FakePool(_ok_tool_reply(), _ok_tool_reply()))
+    tools_client.chat(MESSAGES, TOOLS)
+    assert pool.calls[0]["body"]["max_tokens"] == \
+        2048 + llm_utils.REASONING_HEADROOM_TOKENS
+    tools_client.chat(MESSAGES, TOOLS, max_tokens=500)
+    assert pool.calls[1]["body"]["max_tokens"] == \
+        500 + llm_utils.REASONING_HEADROOM_TOKENS
+
+
+def test_no_plugins_field_is_sent(monkeypatch):
+    """Web search is our own tool here, not the provider's plugin."""
+    pool = _install(monkeypatch, FakePool(_ok_tool_reply()))
+    tools_client.chat(MESSAGES, TOOLS)
+    assert "plugins" not in pool.calls[0]["body"]
+
+
+def test_model_comes_from_ask_judge_model(monkeypatch):
+    monkeypatch.setenv("ASK_JUDGE_MODEL", "judge/model-a")
+    monkeypatch.setenv("CORROBORATION_CHEAP_MODEL", "cheap/model-b")
+    pool = _install(monkeypatch, FakePool(_ok_tool_reply()))
+    tools_client.chat(MESSAGES, TOOLS)
+    assert pool.calls[0]["body"]["model"] == "judge/model-a"
+
+
+def test_model_falls_back_to_the_cheap_corroboration_model(monkeypatch):
+    monkeypatch.setenv("CORROBORATION_CHEAP_MODEL", "cheap/model-b")
+    pool = _install(monkeypatch, FakePool(_ok_tool_reply()))
+    tools_client.chat(MESSAGES, TOOLS)
+    assert pool.calls[0]["body"]["model"] == "cheap/model-b"
+
+
+def test_an_explicit_model_wins(monkeypatch):
+    monkeypatch.setenv("ASK_JUDGE_MODEL", "judge/model-a")
+    pool = _install(monkeypatch, FakePool(_ok_tool_reply()))
+    tools_client.chat(MESSAGES, TOOLS, model="explicit/model")
+    assert pool.calls[0]["body"]["model"] == "explicit/model"
+
+
+def test_a_missing_key_is_an_error_and_no_call(monkeypatch):
+    monkeypatch.delenv("CORROBORATION_API_KEY", raising=False)
+    pool = _install(monkeypatch, FakePool(_ok_tool_reply()))
+    turn = tools_client.chat(MESSAGES, TOOLS)
+    assert turn.error and pool.calls == []
+
+
+def test_the_client_does_not_carry_its_own_key_handling():
+    """The key and session come from corroboration_client, by import."""
+    import inspect
+    code = inspect.getsource(tools_client).split('"""', 2)[-1]
+    assert "CORROBORATION_API_KEY" not in code
+    assert "PoolManager" not in code
+    assert "openrouter.ai" not in code
+
+
+# ----------------------------------------------------------------------- parsing
+
+def test_tool_call_arguments_are_parsed_into_dicts(monkeypatch):
+    _install(monkeypatch, FakePool(FakeResponse(200, _body(
+        tool_calls=[_tool_call("call_1", "search_records",
+                               '{"query": "concrete pour"}'),
+                    _tool_call("call_2", "final_answer",
+                               '{"answer": "Poured level 2."}')],
+        usage={"prompt_tokens": 10, "completion_tokens": 5}))))
+    turn = tools_client.chat(MESSAGES, TOOLS)
+    assert turn.tool_calls == [
+        {"id": "call_1", "name": "search_records",
+         "arguments": {"query": "concrete pour"}},
+        {"id": "call_2", "name": "final_answer",
+         "arguments": {"answer": "Poured level 2."}},
+    ]
+    assert turn.bad_args == []
+    assert turn.text == ""
+    assert turn.error is None and turn.timed_out is False
+    assert turn.model == "google/gemini-3.8-flash"
+    assert turn.usage["prompt_tokens"] == 10
+
+
+def test_unparseable_arguments_land_in_bad_args(monkeypatch):
+    _install(monkeypatch, FakePool(FakeResponse(200, _body(tool_calls=[
+        _tool_call("call_ok", "search_records", '{"query": "x"}'),
+        _tool_call("call_bad", "final_answer", '{"answer": "unterminated'),
+        _tool_call("call_list", "final_answer", '["not", "an", "object"]'),
+    ]))))
+    turn = tools_client.chat(MESSAGES, TOOLS)
+    assert [c["id"] for c in turn.tool_calls] == ["call_ok", "call_bad", "call_list"]
+    assert turn.tool_calls[1]["arguments"] == {}
+    assert turn.tool_calls[2]["arguments"] == {}
+    assert turn.bad_args == ["call_bad", "call_list"]
+    assert turn.error is None
+
+
+def test_dict_arguments_are_accepted_as_is(monkeypatch):
+    _install(monkeypatch, FakePool(FakeResponse(200, _body(tool_calls=[
+        _tool_call("call_1", "search_records", {"query": "x"})]))))
+    turn = tools_client.chat(MESSAGES, TOOLS)
+    assert turn.tool_calls[0]["arguments"] == {"query": "x"}
+    assert turn.bad_args == []
+
+
+def test_text_only_content_gives_no_tool_calls(monkeypatch):
+    _install(monkeypatch, FakePool(FakeResponse(200, _body(
+        content="We poured the level 2 slab."))))
+    turn = tools_client.chat(MESSAGES, TOOLS, tool_choice="auto")
+    assert turn.tool_calls == []
+    assert turn.text == "We poured the level 2 slab."
+    assert turn.error is None
+
+
+def test_a_200_with_neither_tool_calls_nor_text_is_an_error(monkeypatch):
+    """Measured shape on this endpoint (corroboration_client docstring): a 200
+    carrying nothing. Passed on as a turn, the loop would read it as an answer."""
+    _install(monkeypatch, FakePool(FakeResponse(200, _body(content=""))))
+    turn = tools_client.chat(MESSAGES, TOOLS)
+    assert turn.error == "empty completion"
+
+
+def test_tool_calls_with_no_text_are_not_an_error(monkeypatch):
+    _install(monkeypatch, FakePool(_ok_tool_reply()))
+    turn = tools_client.chat(MESSAGES, TOOLS)
+    assert turn.error is None and turn.text == ""
+
+
+# --------------------------------------------------------------------- fallbacks
+
+def _http_error(status, message):
+    return FakeResponse(status, {"error": {"message": message}})
+
+
+def test_a_tool_choice_400_retries_once_with_auto(monkeypatch):
+    pool = _install(monkeypatch, FakePool(
+        _http_error(400, "tool_choice 'required' is not supported"),
+        _ok_tool_reply()))
+    turn = tools_client.chat(MESSAGES, TOOLS)
+    assert [c["body"]["tool_choice"] for c in pool.calls] == ["required", "auto"]
+    assert pool.calls[0]["body"]["model"] == pool.calls[1]["body"]["model"]
+    assert turn.error is None and turn.tool_calls
+
+
+def test_the_tool_choice_retry_happens_only_once(monkeypatch):
+    pool = _install(monkeypatch, FakePool(
+        _http_error(400, "tool_choice 'required' is not supported"),
+        _http_error(400, "tool_choice still unhappy"),
+        _ok_tool_reply()))
+    turn = tools_client.chat(MESSAGES, TOOLS)
+    assert len(pool.calls) == 2
+    assert turn.error and "400" in turn.error
+
+
+def test_a_400_not_about_tool_choice_is_not_retried(monkeypatch):
+    pool = _install(monkeypatch, FakePool(
+        _http_error(400, "messages: invalid role"), _ok_tool_reply()))
+    turn = tools_client.chat(MESSAGES, TOOLS)
+    assert len(pool.calls) == 1
+    assert turn.error and "400" in turn.error
+
+
+def test_a_forced_function_choice_is_sent_as_is_and_not_downgraded(monkeypatch):
+    """The forced dict is already the portable form (spec §5): rewriting it to
+    "auto" would defeat the forced last turn."""
+    forced = {"type": "function", "function": {"name": "final_answer"}}
+    pool = _install(monkeypatch, FakePool(
+        _http_error(400, "tool_choice rejected"), _ok_tool_reply()))
+    turn = tools_client.chat(MESSAGES, TOOLS, tool_choice=forced)
+    assert pool.calls[0]["body"]["tool_choice"] == forced
+    assert len(pool.calls) == 1
+    assert turn.error
+
+
+def test_the_fallback_chain_is_tried_in_order_on_5xx(monkeypatch):
+    monkeypatch.setenv("ASK_JUDGE_MODEL", "primary/m")
+    monkeypatch.setenv("ASK_JUDGE_FALLBACKS", "fb/one, fb/two")
+    pool = _install(monkeypatch, FakePool(
+        _http_error(502, "bad gateway"),
+        _http_error(503, "unavailable"),
+        _ok_tool_reply()))
+    turn = tools_client.chat(MESSAGES, TOOLS)
+    assert [c["body"]["model"] for c in pool.calls] == \
+        ["primary/m", "fb/one", "fb/two"]
+    assert turn.error is None and turn.tool_calls
+
+
+def test_the_fallback_chain_is_tried_on_timeout(monkeypatch):
+    import urllib3
+    monkeypatch.setenv("ASK_JUDGE_MODEL", "primary/m")
+    monkeypatch.setenv("ASK_JUDGE_FALLBACKS", "fb/one")
+    pool = _install(monkeypatch, FakePool(
+        urllib3.exceptions.ReadTimeoutError(None, None, "read timed out"),
+        _ok_tool_reply()))
+    turn = tools_client.chat(MESSAGES, TOOLS)
+    assert [c["body"]["model"] for c in pool.calls] == ["primary/m", "fb/one"]
+    assert turn.error is None
+
+
+def test_the_last_timeout_reports_timed_out(monkeypatch):
+    import urllib3
+    pool = _install(monkeypatch, FakePool(
+        urllib3.exceptions.ReadTimeoutError(None, None, "read timed out")))
+    turn = tools_client.chat(MESSAGES, TOOLS)
+    assert len(pool.calls) == 1
+    assert turn.timed_out is True and turn.error
+
+
+def test_no_fallbacks_when_unset(monkeypatch):
+    pool = _install(monkeypatch, FakePool(_http_error(502, "bad gateway"),
+                                          _ok_tool_reply()))
+    turn = tools_client.chat(MESSAGES, TOOLS)
+    assert len(pool.calls) == 1
+    assert turn.error and "502" in turn.error
+
+
+def test_a_4xx_does_not_advance_the_chain(monkeypatch):
+    monkeypatch.setenv("ASK_JUDGE_FALLBACKS", "fb/one")
+    pool = _install(monkeypatch, FakePool(_http_error(401, "no auth"),
+                                          _ok_tool_reply()))
+    turn = tools_client.chat(MESSAGES, TOOLS)
+    assert len(pool.calls) == 1
+    assert turn.error
+
+
+def test_the_fallback_chain_stops_at_the_deadline(monkeypatch):
+    """The chain is tried within the deadline, not past it."""
+    monkeypatch.setenv("ASK_JUDGE_FALLBACKS", "fb/one,fb/two")
+    clock = {"now": 100.0}
+    monkeypatch.setattr(tools_client, "_now", lambda: clock["now"])
+
+    class SlowPool(FakePool):
+        def request(self, *a, **k):
+            clock["now"] += 9.5          # each attempt burns 9.5 s
+            return super().request(*a, **k)
+
+    pool = _install(monkeypatch, SlowPool(_http_error(502, "x"),
+                                          _http_error(502, "y"),
+                                          _ok_tool_reply()))
+    turn = tools_client.chat(MESSAGES, TOOLS, deadline=110.0)
+    assert len(pool.calls) == 1
+    assert turn.timed_out is True and turn.error
+
+
+def test_the_attempt_timeout_never_exceeds_the_time_left(monkeypatch):
+    monkeypatch.setattr(tools_client, "_now", lambda: 100.0)
+    pool = _install(monkeypatch, FakePool(_ok_tool_reply()))
+    tools_client.chat(MESSAGES, TOOLS, deadline=107.0)
+    assert pool.calls[0]["timeout"] == pytest.approx(7.0)
+
+
+# ---------------------------------------------------------------------- deadline
+
+def test_under_one_second_left_returns_timed_out_without_a_call(monkeypatch):
+    monkeypatch.setattr(tools_client, "_now", lambda: 100.0)
+    pool = _install(monkeypatch, FakePool(_ok_tool_reply()))
+    turn = tools_client.chat(MESSAGES, TOOLS, deadline=100.5)
+    assert turn.timed_out is True
+    assert turn.tool_calls == [] and turn.error
+    assert pool.calls == []
+
+
+def test_a_passed_deadline_returns_timed_out_without_a_call(monkeypatch):
+    monkeypatch.setattr(tools_client, "_now", lambda: 100.0)
+    pool = _install(monkeypatch, FakePool(_ok_tool_reply()))
+    turn = tools_client.chat(MESSAGES, TOOLS, deadline=90.0)
+    assert turn.timed_out is True and pool.calls == []
+
+
+# ----------------------------------------------------------------------- logging
+
+SENTINEL = "ZEBRA-SENTINEL-7731"
+
+
+def test_the_log_names_caller_model_tools_usage_and_ms_but_no_text(
+        monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    messages = [{"role": "user", "content": f"question {SENTINEL}"}]
+    _install(monkeypatch, FakePool(FakeResponse(200, _body(
+        content=f"thinking {SENTINEL}",
+        tool_calls=[_tool_call("call_1", "search_records",
+                               json.dumps({"query": SENTINEL}))],
+        usage={"prompt_tokens": 321, "completion_tokens": 45}))))
+    tools_client.chat(messages, TOOLS, caller="ask_judge_test")
+    text = caplog.text
+    assert SENTINEL not in text
+    assert "ask_judge_test" in text
+    assert "google/gemini-3.8-flash" in text
+    assert "search_records" in text
+    assert "321" in text
+    assert "latency_ms=" in text or "ms=" in text
+
+
+def test_failures_do_not_log_message_text(monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    messages = [{"role": "user", "content": f"question {SENTINEL}"}]
+    _install(monkeypatch, FakePool(
+        _http_error(400, "tool_choice nope"),
+        _http_error(500, "boom")))
+    tools_client.chat(messages, TOOLS)
+    assert SENTINEL not in caplog.text

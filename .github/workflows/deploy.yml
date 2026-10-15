@@ -257,6 +257,7 @@ jobs:
               "CorroborationApiKey=${{ secrets.OPENROUTER_API_KEY }}" \
               "EnableWebAnswer=${{ vars.TEST_ENABLE_WEB_ANSWER || 'false' }}" \
               "AskVoiceRestate=${{ vars.TEST_ASK_VOICE_RESTATE || 'false' }}" \
+              "AskVoiceConvo=${{ vars.TEST_ASK_VOICE_CONVO || 'false' }}" \
               "VoiceWebEnabled=${{ vars.TEST_VOICE_WEB_ENABLED || 'false' }}" \
               "AskConversationMemory=${{ vars.TEST_ASK_CONVERSATION_MEMORY || 'false' }}" \
               "AskRewriteBudget=${{ vars.TEST_ASK_REWRITE_BUDGET || '4.0' }}" \

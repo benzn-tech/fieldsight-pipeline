@@ -539,3 +539,418 @@ def test_start_does_not_promise_a_search_it_cannot_do(env, voice_web, web_answer
     out = avt.start(start_body())
     assert out["web_intent"] is False
     assert env.lam.calls[0]["payload"]["web_intent"] is False
+
+
+# ------------------------------------------- conversation memory + web offer ----
+
+import voice_web as vw  # noqa: E402
+
+try:
+    from lambda_fieldsight_api import _DONE_FIELDS
+except Exception:  # noqa: BLE001 - the api module may not import in a bare env
+    _DONE_FIELDS = ('transcript', 'answerText', 'basis', 'audioBase64', 'audioFormat', 'web')
+
+OFFERED = "what is the maximum span for a purlin"
+
+
+def _put_json(s3, key, obj, age_s=0):
+    s3.objs[key] = (json.dumps(obj).encode("utf-8"),
+                    datetime.now(timezone.utc) - timedelta(seconds=age_s), None)
+
+
+def seed_offer(s3, question=OFFERED, age_s=5):
+    _put_json(s3, avt.offer_key(SUB), {"question": question, "at": time.time() - age_s})
+
+
+def seed_convo(s3, ages=(30,)):
+    now = time.time()
+    _put_json(s3, avt.convo_key(SUB), {
+        "updated_at": now,
+        "turns": [{"question": "zq%d" % i, "answer": "za%d" % i, "at": now - a}
+                  for i, a in enumerate(ages)]})
+
+
+@pytest.fixture
+def cv(env):
+    env.mp.setenv("ASK_VOICE_CONVO", "true")
+    env.mp.setenv("VOICE_WEB_ENABLED", "true")
+    env.mp.setenv("ENABLE_WEB_ANSWER", "true")
+    env.restated = []
+    env.tts = []
+
+    def fake_restate(q, *, web_intent, timeout_s=1.2):
+        env.restated.append((q, web_intent))
+        return {"text": "Checking.", "reason": None, "ms": 5}
+    env.mp.setattr(voice_restate, "restate", fake_restate)
+
+    def tts(text):
+        env.tts.append(text)
+        return b"RIFFwav"
+    env.mp.setattr(laa, "_tts", tts)
+
+    def say(text):
+        env.mp.setattr(laa, "_stt", lambda a, f: text)
+    env.say = say
+    return env
+
+
+def test_convo_keys_cannot_be_addressed_as_a_turn():
+    assert avt.convo_key(SUB) == avt.owner_prefix(SUB) + "convo.json"
+    assert avt.offer_key(SUB) == avt.owner_prefix(SUB) + "offer.json"
+    assert not avt.TURN_RE.match("convo") and not avt.TURN_RE.match("offer")
+
+
+def test_sweep_keeps_young_convo_and_offer_and_drops_old(cv):
+    seed_offer(cv.s3)
+    seed_convo(cv.s3)
+    old = avt.owner_prefix(SUB) + "stale.json"
+    cv.s3.objs[old] = (b"{}", datetime.now(timezone.utc) - timedelta(days=2), None)
+    assert avt.sweep_old(cv.s3, BUCKET, SUB, time.time()) == 1
+    assert avt.convo_key(SUB) in cv.s3.objs and avt.offer_key(SUB) in cv.s3.objs
+
+
+def test_yes_to_a_fresh_offer_searches_the_offered_question(cv):
+    seed_offer(cv.s3)
+    seed_convo(cv.s3)
+    cv.say("Yes.")
+    out = avt.start(start_body())
+    p = cv.lam.calls[0]["payload"]
+    assert p["question"] == OFFERED and p["web_intent"] is True
+    assert "history" not in p and p["transcript"] == "Yes."
+    assert out["transcript"] == "Yes." and out["web_intent"] is True
+    assert cv.restated == [(OFFERED, True)]
+    assert avt.offer_key(SUB) not in cv.s3.objs
+
+
+def test_a_bare_search_online_with_a_fresh_offer_is_a_yes(cv):
+    seed_offer(cv.s3)
+    cv.say("Search online.")
+    avt.start(start_body())
+    p = cv.lam.calls[0]["payload"]
+    assert p["question"] == OFFERED and p["web_intent"] is True
+
+
+def test_search_online_with_a_real_question_is_an_ordinary_web_question(cv):
+    seed_offer(cv.s3)
+    cv.say("search online for the slump of 25 MPa concrete")
+    avt.start(start_body())
+    p = cv.lam.calls[0]["payload"]
+    assert "question" not in p and p["web_intent"] is True
+    assert avt.offer_key(SUB) not in cv.s3.objs
+
+
+def test_yes_to_a_stale_offer_is_an_ordinary_question(cv):
+    seed_offer(cv.s3, age_s=avt.OFFER_WINDOW_S + 5)
+    cv.say("yes")
+    avt.start(start_body())
+    p = cv.lam.calls[0]["payload"]
+    assert "question" not in p and p["web_intent"] is False
+    assert avt.offer_key(SUB) not in cv.s3.objs
+
+
+def test_yes_with_the_web_off_is_an_ordinary_question(cv):
+    cv.mp.setenv("VOICE_WEB_ENABLED", "false")
+    seed_offer(cv.s3)
+    cv.say("yes")
+    avt.start(start_body())
+    assert "question" not in cv.lam.calls[0]["payload"]
+
+
+def test_no_to_a_fresh_offer_finishes_at_start(cv):
+    seed_offer(cv.s3)
+    seed_convo(cv.s3)
+    cv.say("no thanks")
+    out = avt.start(start_body())
+    assert cv.lam.calls == [] and cv.tts == [vw.DECLINED]
+    st = cv.s3.state(SUB, out["turn_id"])
+    assert st["status"] == "done"
+    for k in _DONE_FIELDS:
+        assert k in st, k
+    assert st["transcript"] == "no thanks" and st["answerText"] == "Okay."
+    assert st["basis"] is None and st["audioFormat"] == "wav" and st["web"] is False
+    assert base64.b64decode(st["audioBase64"]) == b"RIFFwav"
+    assert isinstance(st["created_at"], float)
+    assert out["web_intent"] is False and out["restatement"] is None
+    assert out["transcript"] == "no thanks"
+    assert avt.offer_key(SUB) not in cv.s3.objs
+
+
+def test_no_with_a_failed_tts_writes_an_error_state(cv):
+    seed_offer(cv.s3)
+    cv.say("no")
+
+    def boom(text):
+        raise RuntimeError("tts down")
+    cv.mp.setattr(laa, "_tts", boom)
+    out = avt.start(start_body())
+    assert cv.s3.state(SUB, out["turn_id"]) == {"status": "error",
+                                                "error": "Speech synthesis failed"}
+    assert cv.lam.calls == []
+
+
+def test_no_without_an_offer_is_an_ordinary_question(cv):
+    cv.say("no")
+    out = avt.start(start_body())
+    assert cv.lam.calls and cv.s3.state(SUB, out["turn_id"])["status"] == "pending"
+
+
+def test_thank_you_after_an_answer_is_a_new_question_with_history(cv):
+    seed_offer(cv.s3)
+    seed_convo(cv.s3)
+    cv.say("thank you")
+    avt.start(start_body())
+    p = cv.lam.calls[0]["payload"]
+    assert "question" not in p and p["history"] == [{"question": "zq0", "answer": "za0"}]
+
+
+def test_history_is_fresh_turns_only_capped_at_three(cv):
+    seed_convo(cv.s3, ages=(500, 170, 100, 60, 10))
+    avt.start(start_body())
+    h = cv.lam.calls[0]["payload"]["history"]
+    assert [t["question"] for t in h] == ["zq2", "zq3", "zq4"]
+    assert all(set(t) == {"question", "answer"} for t in h)
+
+
+def test_a_body_history_still_wins(cv):
+    seed_convo(cv.s3)
+    avt.start(start_body(history=[{"question": "x", "answer": "y"}]))
+    assert cv.lam.calls[0]["payload"]["history"] == [{"question": "x", "answer": "y"}]
+
+
+@pytest.mark.parametrize("body", [None, b"not json"])
+def test_missing_or_garbage_convo_is_the_ordinary_path(cv, body):
+    if body is not None:
+        cv.s3.objs[avt.convo_key(SUB)] = (body, datetime.now(timezone.utc), None)
+    avt.start(start_body())
+    assert "history" not in cv.lam.calls[0]["payload"]
+
+
+@pytest.mark.parametrize("key_of", [avt.convo_key, avt.offer_key])
+def test_a_403_is_logged_as_an_error_not_treated_as_absence(cv, caplog, key_of):
+    class Denied(FakeS3):
+        def get_object(self, Bucket, Key):
+            if Key == key_of(SUB):
+                raise ClientError({"Error": {"Code": "AccessDenied", "Message": "x"}}, "GetObject")
+            return super().get_object(Bucket, Key)
+    s3 = Denied()
+    cv.mp.setattr(avt, "_get_s3", lambda: s3)
+    caplog.set_level(logging.INFO)
+    out = avt.start(start_body())
+    errs = [r for r in caplog.records
+            if r.levelno >= logging.ERROR and "voice convo read denied" in r.getMessage()]
+    assert errs
+    assert out["turn_id"] and "history" not in cv.lam.calls[0]["payload"]
+
+
+def test_offer_web_is_set_unless_the_caller_asked_for_the_web(cv):
+    avt.start(start_body())
+    assert cv.lam.calls[-1]["payload"]["offer_web"] is True
+    cv.say("what is the NZS 4541 spacing, search online")
+    avt.start(start_body())
+    assert cv.lam.calls[-1]["payload"]["offer_web"] is False
+
+
+def test_offer_web_is_false_when_the_web_is_off(cv):
+    cv.mp.setenv("VOICE_WEB_ENABLED", "false")
+    avt.start(start_body())
+    assert cv.lam.calls[0]["payload"]["offer_web"] is False
+
+
+def test_start_log_gains_counts_and_no_text(cv, caplog):
+    seed_offer(cv.s3)
+    seed_convo(cv.s3, ages=(30, 20))
+    cv.say("what about the roof")
+    caplog.set_level(logging.DEBUG)
+    avt.start(start_body())
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    line = next(r.getMessage() for r in caplog.records
+                if r.getMessage().startswith("voice start:"))
+    assert "history_turns=2" in line and "offer=cleared" in line
+    for forbidden in (OFFERED, "zq0", "za1", "roof", SUB):
+        assert forbidden not in text
+
+
+@pytest.mark.parametrize("said,expected", [("yes", "consumed_yes"), ("no", "consumed_no")])
+def test_start_log_names_the_consumed_offer(cv, caplog, said, expected):
+    seed_offer(cv.s3)
+    cv.say(said)
+    caplog.set_level(logging.INFO)
+    avt.start(start_body())
+    line = next(r.getMessage() for r in caplog.records
+                if r.getMessage().startswith("voice start:"))
+    assert "offer=" + expected in line
+
+
+def test_flag_off_makes_no_convo_or_offer_call_and_adds_no_payload_keys(env):
+    env.mp.setenv("VOICE_WEB_ENABLED", "true")
+    env.mp.setenv("ENABLE_WEB_ANSWER", "true")
+    seen = []
+
+    class Spy(FakeS3):
+        def get_object(self, Bucket, Key):
+            seen.append(("get", Key))
+            return super().get_object(Bucket, Key)
+
+        def delete_object(self, Bucket, Key):
+            seen.append(("del", Key))
+            return super().delete_object(Bucket, Key)
+
+        def put_object(self, Bucket, Key, Body, ContentType=None):
+            seen.append(("put", Key))
+            return super().put_object(Bucket, Key, Body, ContentType)
+    s3 = Spy()
+    seed_offer(s3)
+    seed_convo(s3)
+    env.mp.setattr(avt, "_get_s3", lambda: s3)
+    env.mp.setattr(laa, "_stt", lambda a, f: "yes")
+    avt.start(start_body(tz="Pacific/Auckland"))
+    assert not [k for _, k in seen if k.endswith(("convo.json", "offer.json"))]
+    assert set(env.lam.calls[0]["payload"]) == {
+        "turn_id", "caller_sub", "transcript", "web_intent", "tz"}
+
+
+# ---- worker ----
+
+def _flag(wk, on=True):
+    wk.mp.setenv("ASK_VOICE_CONVO", "true" if on else "false")
+
+
+def _convo(wk):
+    k = avt.convo_key(SUB)
+    return json.loads(wk.s3.objs[k][0]) if k in wk.s3.objs else None
+
+
+def _offer(wk):
+    k = avt.offer_key(SUB)
+    return json.loads(wk.s3.objs[k][0]) if k in wk.s3.objs else None
+
+
+def _rag_returning(wk, **extra):
+    def rag(body, on_web_start=None):
+        wk.rag_calls.append(body)
+        return dict({"answer": ANSWER, "basis": {"k": 5}}, **extra)
+    wk.mp.setattr(laa, "_rag_answer", rag)
+
+
+def test_worker_prefers_the_event_question_and_audits_it(wk):
+    _flag(wk)
+    avt.worker_handler(event(transcript="yes", web_intent=True, question=OFFERED,
+                             offer_web=False), None)
+    body = wk.rag_calls[0]
+    assert body["question"] == OFFERED and body["web_intent"] is True
+    assert wk.audits == [(SUB, OFFERED, SPOKEN)]
+    assert wk.s3.state(SUB, TURN)["transcript"] == "yes"
+
+
+def test_worker_passes_offer_web_and_history_through(wk):
+    _flag(wk)
+    h = [{"question": "q", "answer": "a"}]
+    avt.worker_handler(event(offer_web=True, history=h), None)
+    assert wk.rag_calls[0]["offer_web"] is True and wk.rag_calls[0]["history"] == h
+
+
+def test_worker_flag_off_adds_no_rag_keys_and_writes_no_objects(wk):
+    _flag(wk, on=False)
+    avt.worker_handler(event(), None)
+    assert "offer_web" not in wk.rag_calls[0]
+    assert [k for k, _ in wk.s3.puts] == [avt.state_key(SUB, TURN)]
+    assert _convo(wk) is None and _offer(wk) is None
+
+
+def test_worker_done_writes_the_convo_and_the_offer_when_offered(wk):
+    _flag(wk)
+    _rag_returning(wk, web_offer=True, asked="the standalone version")
+    avt.worker_handler(event(), None)
+    c = _convo(wk)
+    assert [t["question"] for t in c["turns"]] == [TRANSCRIPT]
+    assert c["turns"][0]["answer"] == SPOKEN
+    assert _offer(wk)["question"] == "the standalone version"
+
+
+def test_worker_offer_falls_back_to_the_question_asked(wk):
+    _flag(wk)
+    _rag_returning(wk, web_offer=True)
+    avt.worker_handler(event(), None)
+    assert _offer(wk)["question"] == TRANSCRIPT
+
+
+def test_worker_done_without_an_offer_never_deletes(wk):
+    # Start consumes any earlier offer; the worker role has no DeleteObject.
+    _flag(wk)
+    deletes = []
+    real = wk.s3.delete_object
+    wk.s3.delete_object = lambda **kw: (deletes.append(kw["Key"]), real(**kw))
+    avt.worker_handler(event(), None)
+    assert deletes == []
+    assert _offer(wk) is None
+    assert _convo(wk) is not None
+
+
+def test_worker_trims_the_convo_to_three_and_drops_stale_turns(wk):
+    _flag(wk)
+    seed_convo(wk.s3, ages=(500, 100, 60, 40))
+    avt.worker_handler(event(), None)
+    qs = [t["question"] for t in _convo(wk)["turns"]]
+    assert qs == ["zq2", "zq3", TRANSCRIPT]
+
+
+def test_worker_garbage_convo_is_replaced(wk):
+    _flag(wk)
+    wk.s3.objs[avt.convo_key(SUB)] = (b"{{", datetime.now(timezone.utc), None)
+    avt.worker_handler(event(), None)
+    assert len(_convo(wk)["turns"]) == 1
+
+
+def test_worker_cancel_before_the_final_check_writes_neither(wk):
+    _flag(wk)
+    seed_offer(wk.s3)
+
+    def tts(text):
+        avt.put_cancel(wk.s3, BUCKET, SUB, TURN)
+        return b"RIFF"
+    wk.mp.setattr(laa, "_tts", tts)
+    avt.worker_handler(event(), None)
+    assert _convo(wk) is None and _offer(wk) is not None
+
+
+def test_worker_cancel_right_after_done_writes_neither(wk):
+    _flag(wk)
+    orig = avt.put_state
+
+    def spy(s3, bucket, sub, turn, state):
+        orig(s3, bucket, sub, turn, state)
+        if state["status"] == "done":
+            avt.put_cancel(s3, bucket, sub, turn)
+    wk.mp.setattr(avt, "put_state", spy)
+    avt.worker_handler(event(), None)
+    assert _convo(wk) is None and _offer(wk) is None
+
+
+def test_worker_error_writes_neither(wk):
+    _flag(wk)
+    wk.mp.setattr(laa, "_rag_answer", lambda b, on_web_start=None: {"error": "boom"})
+    avt.worker_handler(event(), None)
+    assert wk.s3.state(SUB, TURN)["status"] == "error"
+    assert _convo(wk) is None and _offer(wk) is None
+
+
+def test_worker_convo_write_failure_still_leaves_done(wk, caplog):
+    _flag(wk)
+    orig = wk.s3.put_object
+
+    def put(Bucket, Key, Body, ContentType=None):
+        if Key.endswith(("convo.json", "offer.json")):
+            raise RuntimeError(TRANSCRIPT)
+        return orig(Bucket, Key, Body, ContentType)
+    wk.s3.put_object = put
+    caplog.set_level(logging.INFO)
+    avt.worker_handler(event(), None)
+    assert wk.s3.state(SUB, TURN)["status"] == "done"
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "RuntimeError" in text and "zebra" not in text
+
+
+def test_worker_audits_the_transcript_when_no_question_was_carried(wk):
+    _flag(wk)
+    avt.worker_handler(event(web_intent=True, transcript="what is the span, search online"), None)
+    assert wk.audits == [(SUB, "what is the span, search online", SPOKEN)]

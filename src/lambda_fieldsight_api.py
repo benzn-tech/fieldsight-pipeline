@@ -10,6 +10,7 @@ Still served (proxies into ask-agent; ACL is enforced downstream by rag-search
 via caller_sub, and every proxy refuses an empty sub with 401):
   GET  /api/health
   POST /api/ask  /api/ask/voice  /api/ask/corroborate  /api/search
+  POST /api/ask/start  GET /api/ask/result  POST /api/ask/cancel  (screen turns)
 
 Environment Variables:
     S3_BUCKET           reported by /api/health only
@@ -65,6 +66,15 @@ ask_lambda_client = boto3.client('lambda', config=Config(
     connect_timeout=5,
     retries={"max_attempts": 0},
 ))
+# POST /api/ask/start only. The agent's turn_start does one S3 put and one Event
+# invoke, so 8 s is generous; a hang fails here as a named 504 well inside the
+# gateway's 29 s instead of holding the screen for 26 s. retries=0 for the same
+# reason as ask_lambda_client: a retried start could create a second turn.
+ask_start_client = boto3.client('lambda', config=Config(
+    read_timeout=8,
+    connect_timeout=2,
+    retries={"max_attempts": 0},
+))
 
 S3_BUCKET = os.environ.get('S3_BUCKET', 'fieldsight-data-509194952652')
 ASK_AGENT_FUNCTION = os.environ.get('ASK_AGENT_FUNCTION', 'fieldsight-ask-agent')
@@ -115,13 +125,15 @@ def resolve_user_display_name(caller):
 
 # ── POST /api/ask ───────────────────────────────────────────
 
-def ask_question(body, caller):
-    """Proxy question to Ask Agent Lambda. ACL is enforced downstream by
-    rag-search via caller_sub (BUG-39 WS2) -- this proxy no longer gates."""
-    # Fail closed: without a sub the ask-agent would fall to a company-blind S3 read.
-    if not caller.get('sub'):
-        return error('sign-in required', 401)
+def _build_ask_payload(body, caller):
+    """The Ask Agent payload for a screen question, shared by ask_question and
+    ask_start. Returns (payload, None) or (None, error_response). The caller has
+    already checked the sub.
 
+    This is a WHITELIST: only the fields named below reach the agent, and
+    caller_sub always comes from the authorizer. That is what keeps client
+    fields such as `now`, `prompt_only`, `mode` or a forged `caller_sub` out of
+    the agent call and out of the stored turn request."""
     question = body.get('question', '').strip()
     date = body.get('date', '')
     user = body.get('user', '')
@@ -129,7 +141,7 @@ def ask_question(body, caller):
     topic_id = body.get('topic_id', None)
 
     if not question:
-        return error('Missing question')
+        return None, error('Missing question')
     # `date` is read on the RAG path since scoped Ask (2026-09-15), but ONLY when
     # the body also carries `scoped: true`: with no time word in the question it
     # then narrows retrieval to that day. Without `scoped` the RAG path ignores
@@ -188,6 +200,19 @@ def ask_question(body, caller):
     elif raw_history is not None and not isinstance(raw_history, list):
         logger.warning("ask: history was %s, not a list",
                        type(raw_history).__name__)
+    return payload, None
+
+
+def ask_question(body, caller):
+    """Proxy question to Ask Agent Lambda. ACL is enforced downstream by
+    rag-search via caller_sub (BUG-39 WS2) -- this proxy no longer gates."""
+    # Fail closed: without a sub the ask-agent would fall to a company-blind S3 read.
+    if not caller.get('sub'):
+        return error('sign-in required', 401)
+
+    payload, err = _build_ask_payload(body, caller)
+    if err:
+        return err
 
     try:
         resp = ask_lambda_client.invoke(
@@ -223,6 +248,42 @@ def ask_question(body, caller):
         return error('Ask temporarily unavailable', 504)
     except Exception as e:
         logger.error(f"Ask agent invocation failed: {e}")
+        return error('Ask temporarily unavailable', 502)
+
+
+# ── POST /api/ask/start (screen Ask, async turn) ───────────────
+# Plan 2026-10-16 ask-orchestration-v2 Task 2. The result and cancel routes
+# reuse ask_voice_result / ask_voice_cancel: the turn store is the same, and
+# _terminal_body picks the screen shape from the state's `channel`.
+
+def ask_start(body, caller):
+    """POST /api/ask/start: the same payload ask_question builds, plus
+    mode 'turn_start'. The agent's {turn_id} or {error} is passed through."""
+    if not caller.get('sub'):
+        return error('sign-in required', 401)
+    payload, err = _build_ask_payload(body, caller)
+    if err:
+        return err
+    payload['mode'] = 'turn_start'
+    try:
+        resp = ask_start_client.invoke(
+            FunctionName=ASK_AGENT_FUNCTION,
+            InvocationType='RequestResponse',
+            Payload=json.dumps(payload)
+        )
+        # Same FunctionError posture as ask_question: never leak a stack trace.
+        if resp.get('FunctionError'):
+            logger.error("ask start: agent FunctionError %s", resp.get('FunctionError'))
+            return error('Ask agent error', 500)
+        result = json.loads(resp['Payload'].read().decode('utf-8'))
+        if 'body' in result:
+            return result
+        return ok(result)
+    except botocore.exceptions.ReadTimeoutError:
+        logger.error("ask start: agent read timeout after 8s")
+        return error('Ask temporarily unavailable', 504)
+    except Exception as e:
+        logger.error("ask start: invocation failed: %s", type(e).__name__)
         return error('Ask temporarily unavailable', 502)
 
 
@@ -399,6 +460,10 @@ def ask_voice_start(body, caller):
 
 def _terminal_body(state):
     status = state.get('status')
+    if status == 'done' and state.get('channel') == 'screen':
+        # Screen turn (/api/ask/result): the whole _rag_answer dict, as
+        # /api/ask returns it today. Voice states carry no `channel`.
+        return {'status': 'done', 'result': state.get('result')}
     if status == 'done':
         return {'status': 'done', **{k: state.get(k) for k in _DONE_FIELDS if k in state}}
     if status == 'error':
@@ -420,7 +485,8 @@ def _result_wait_s():
 def ask_voice_result(query, caller, clock=time.monotonic, sleep=time.sleep, wall=time.time):
     """GET /api/ask/voice/result?turn=&since=: long-poll the turn store. Returns
     when the status is terminal or differs from `since`, else after RESULT_WAIT_S
-    (default 20, below the 28 s Timeout). Query values are never logged."""
+    (default 20, below the 28 s Timeout). Query values are never logged.
+    Also serves GET /api/ask/result (screen turns); see _terminal_body."""
     sub = caller.get('sub')
     if not sub:
         return error('sign-in required', 401)
@@ -481,7 +547,8 @@ def ask_voice_result(query, caller, clock=time.monotonic, sleep=time.sleep, wall
 
 def ask_voice_cancel(body, caller):
     """POST /api/ask/voice/cancel {turn_id}: write the cancel marker, 204. An
-    unknown turn also gets 204 so turn existence cannot be probed."""
+    unknown turn also gets 204 so turn existence cannot be probed.
+    Also serves POST /api/ask/cancel (screen turns)."""
     sub = caller.get('sub')
     if not sub:
         return error('sign-in required', 401)
@@ -612,6 +679,7 @@ def gone(path):
 KNOWN_ROUTES = frozenset(CLOSED_ROUTES) | frozenset({
     '/api/ask', '/api/ask/voice', '/api/ask/voice/start', '/api/ask/voice/result',
     '/api/ask/voice/cancel', '/api/ask/corroborate', '/api/search',
+    '/api/ask/start', '/api/ask/result', '/api/ask/cancel',
 })
 
 
@@ -639,6 +707,10 @@ def lambda_handler(event, context):
         except Exception: body = {}
     try:
         if path == '/api/ask' and method == 'POST': return ask_question(body, caller)
+        elif path == '/api/ask/start' and method == 'POST': return ask_start(body, caller)
+        elif path == '/api/ask/result' and method == 'GET':
+            return ask_voice_result(event.get('queryStringParameters') or {}, caller)
+        elif path == '/api/ask/cancel' and method == 'POST': return ask_voice_cancel(body, caller)
         elif path == '/api/ask/voice' and method == 'POST': return ask_voice(body, caller)
         elif path == '/api/ask/voice/start' and method == 'POST': return ask_voice_start(body, caller)
         elif path == '/api/ask/voice/result' and method == 'GET':

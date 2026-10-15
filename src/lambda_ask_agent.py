@@ -1190,6 +1190,7 @@ def _rag_answer(body, on_web_start=None):
         # gain by lying about it.
         import answer_language
         import query_slots
+        import voice_web
         today = query_slots.resolve_today(body.get("tz"), now=_parse_now(body.get("now")))
         # ALWAYS from the ORIGINAL question first -- `asked` is read only as a
         # fallback below, and never to move an anchor the caller already gave.
@@ -1352,6 +1353,21 @@ def _rag_answer(body, on_web_start=None):
         # "Search online" only counts on a voice turn that opted into web.
         _wi = (bool(body.get("web_intent")) and body.get("mode") == "voice"
                and bool(body.get("voice_web")))
+        # Voice two-phase: instead of going online unasked, say the records do not
+        # cover it and offer (spec 2026-10-15 voice offer). An explicit "search
+        # online" (`_wi`) is the caller's answer to that offer, so it wins.
+        _offer = (body.get("mode") == "voice" and bool(body.get("offer_web"))
+                  and not _wi)
+        _append_offer = False
+        # A question that names its own time ("yesterday", "last week") is about
+        # what the team recorded then, on either channel: it never runs the
+        # general/web flow unless the caller said "search online". The web cannot
+        # know the site or the day; the records can say what IS there instead
+        # ("nothing on the 14th, the latest is the 12th"). Owner, TEST 2026-10-15:
+        # the screen answered "What did we do yesterday?" with general guidance.
+        # `q_from`, not `orig_q_from`: a date only the history rewrite supplies
+        # ("and the day before?") closes the web too -- closing is the safe side.
+        _time_anchored = bool(q_from) and not _wi
 
         if result.get("error"):
             # Distinguish "caller not provisioned" / ACL misses from genuine
@@ -1375,8 +1391,21 @@ def _rag_answer(body, on_web_start=None):
             # depends on the no-answer result.
             if ((body.get("mode") != "voice" or body.get("voice_web"))
                     and not result.get("error")
-                    and (not scoped or _wi)):
+                    and (not scoped or _wi)
+                    and not _time_anchored):
                 import web_answer
+                if _offer and not scoped and web_answer.enabled() and question:
+                    # Nothing retrieved and the web is available: offer it, spend
+                    # no web call and no classification.
+                    return {
+                        "answer": voice_web.OFFER_NO_RECORDS,
+                        "web_offer": True,
+                        "grounded": True,
+                        "citations": [],
+                        "basis": basis,
+                        "applied_scope": applied_scope,
+                        "asked": asked if rewritten else None,
+                    }
                 if web_answer.enabled() and question:
                     # Nothing retrieved: no classification is spent (it would
                     # judge an empty list). The general flow runs alone --
@@ -1593,14 +1622,33 @@ def _rag_answer(body, on_web_start=None):
                 _cls = _classify_for_route(web_answer, asked, chunks, _skip, _started, route)
             _useful = _records_useful(_cls, chunks)
             _run_general = _cls["kind"] != "project" or not _useful
-            # Voice: a project question stays on the records, even when they do
-            # not hold the answer. The records synthesis can say what IS there
-            # ("nothing on the 14th, the latest is the 12th"); the web cannot
-            # know the site. On the device "What did we do yesterday?" played
-            # "searching online" and answered from the web (2026-10-15). Only
-            # an explicit "search online" (`_wi`) sends a voice turn out.
-            if body.get("mode") == "voice" and not _wi and _cls["kind"] == "project":
+            # A project question stays on the records, even when they do not
+            # hold the answer, on both channels. The records synthesis can say
+            # what IS there ("nothing on the 14th, the latest is the 12th"); the
+            # web cannot know the site. On the device "What did we do yesterday?"
+            # played "searching online" (2026-10-15, fixed for voice in #1120);
+            # the screen prefixed PROJECT_FALLBACK_LEAD to general guidance.
+            # Only an explicit "search online" (`_wi`) sends a turn out. A
+            # time-anchored question stays too, whatever the label: a distance-
+            # gated set is labelled "general" without a model call.
+            if not _wi and (_cls["kind"] == "project" or _time_anchored):
                 _run_general = False
+            if _offer and _run_general:
+                if not _useful:
+                    # Records cannot answer it (including a distance-gated set):
+                    # no synthesis, no web, just the offer.
+                    return {
+                        "answer": voice_web.OFFER_NO_RECORDS,
+                        "web_offer": True,
+                        "grounded": True,
+                        "citations": [],
+                        "basis": basis,
+                        "applied_scope": applied_scope,
+                        "asked": asked if rewritten else None,
+                    }
+                # Records answer part of it: speak that, then offer the web.
+                _run_general = False
+                _append_offer = True
             _t_synthesis = time.monotonic()
             if _run_general:
                 _announce_web_start(on_web_start)
@@ -1881,6 +1929,9 @@ def _rag_answer(body, on_web_start=None):
         # reorder here without also renumbering the prompt. See _build_citations.
         citations = _build_citations(chunks)
 
+        if _append_offer:
+            answer = (answer or "").rstrip() + " " + voice_web.OFFER_ALSO
+
         return {
             "answer": answer,
             "answer_language": answer_language.policy(),
@@ -1898,6 +1949,7 @@ def _rag_answer(body, on_web_start=None):
             # told what happened to the outside lookup (D5). Absent for a
             # project question, which never ran it.
             **({"web": web} if web is not None else {}),
+            **({"web_offer": True} if _append_offer else {}),
         }
     except Exception as e:
         logger.error(f"  RAG path failed: {e}")
@@ -2210,6 +2262,12 @@ def lambda_handler(event, context):
         # Device Ask two-phase: the turn module is loaded on this path only.
         import ask_voice_turn
         return ok(ask_voice_turn.start(body))
+
+    if body.get('mode') == 'turn_start':
+        # Screen Ask on the async turn store: returns {turn_id} at once and the
+        # AskVoiceWorker answers it (spec 2026-10-15 ask orchestration v2 s4).
+        import ask_voice_turn
+        return ok(ask_voice_turn.start_screen(body))
 
     if body.get('audio') and os.environ.get('RAG_SEARCH_FUNCTION'):
         # Refuse before STT is spent: _voice_answer needs a caller_sub for the ACL.

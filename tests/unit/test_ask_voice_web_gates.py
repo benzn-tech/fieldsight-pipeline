@@ -388,10 +388,191 @@ def test_voice_project_question_with_web_intent_still_goes_online(monkeypatch):
     assert out["from_web"] is True
 
 
-def test_screen_project_question_the_records_miss_still_uses_the_web(monkeypatch):
-    # Screen behaviour is the owner's 2026-10-07 design and is unchanged.
-    rig = wire(monkeypatch, kind="project", records_answer=False, web=WEB_OK)
-    out = ask(question="What did we do yesterday?")
-    assert "general" in rig.events
+def test_screen_project_question_the_records_miss_stays_on_the_records(monkeypatch):
+    # The owner's screen report (2026-10-15): "What did we do yesterday?" with
+    # nothing on the 14th answered "Your project records don't show this.
+    # Related general guidance: ...". A project question stays on the records on
+    # the screen too (spec 2026-10-15 orchestration v2, section 3 change 1).
+    rig = wire(monkeypatch, kind="project", records_answer=False, web=WEB_OK,
+               answer="Nothing yesterday; the latest is the 12th [1].")
+    out = ask(rig.cb(), question="What does the slab inspection cover?")
+    assert "general" not in rig.events and "on_web_start" not in rig.events
+    assert "from_web" not in out
+    assert not out["answer"].startswith(laa.PROJECT_FALLBACK_LEAD)
+    assert len(rig.prompts) == 1
+
+
+def _widened(mp, chunks=(CHUNK,)):
+    # rag-search widened past an empty "yesterday" to the latest recorded day.
+    mp.setattr(laa, "_get_lambda_client", lambda: FakeLambdaClient([
+        {"chunks": list(chunks),
+         "basis": {"from": "2026-08-29", "to": "2026-09-03", "widened": True}}]))
+
+
+@pytest.mark.parametrize("mode", [{}, {"mode": "voice", "voice_web": True}])
+def test_replay_yesterday_widened_project_miss_answers_from_the_records(monkeypatch, mode):
+    # Replay of the defect: widened retrieval, classify project / not useful.
+    rig = wire(monkeypatch, kind="project", records_answer=False, web=WEB_OK,
+               answer="Nothing yesterday; this is for the 3rd [1].")
+    _widened(monkeypatch)
+    out = ask(rig.cb(), question="What did we do yesterday?", **mode)
+    assert "general" not in rig.events and "on_web_start" not in rig.events
+    assert "from_web" not in out
+    assert out["answer"].startswith("Nothing yesterday")
+    assert len(rig.prompts) == 1
+
+
+@pytest.mark.parametrize("kind", ["general", "mixed"])
+@pytest.mark.parametrize("mode", [{}, {"mode": "voice", "voice_web": True}])
+def test_time_anchored_question_never_runs_the_general_flow(monkeypatch, kind, mode):
+    rig = wire(monkeypatch, kind=kind, records_answer=False, web=WEB_OK)
+    out = ask(rig.cb(), question="What did we do yesterday?", **mode)
+    assert "general" not in rig.events and "on_web_start" not in rig.events
+    assert "from_web" not in out
+    assert len(rig.prompts) == 1
+
+
+@pytest.mark.parametrize("mode", [{}, {"mode": "voice", "voice_web": True}])
+def test_time_anchored_distance_gated_answers_from_the_records(monkeypatch, mode):
+    rig = wire(monkeypatch, chunks=(FAR_CHUNK,), web=WEB_OK)
+    out = ask(rig.cb(), question="What did we do yesterday?", **mode)
+    assert "general" not in rig.events
+    assert "from_web" not in out
+    assert len(rig.prompts) == 1
+
+
+@pytest.mark.parametrize("mode", [{}, {"mode": "voice", "voice_web": True},
+                                  {"mode": "voice", "voice_web": True, "offer_web": True}])
+def test_time_anchored_with_no_chunks_gets_the_no_records_answer(monkeypatch, mode):
+    rig = wire(monkeypatch, chunks=(), web=WEB_OK)
+    out = ask(rig.cb(), question="What did we do yesterday?", **mode)
+    assert out["answer"].startswith("No relevant records found")
+    assert "web_offer" not in out and "from_web" not in out
+    assert "general" not in rig.events and "classify" not in rig.events
+
+
+def test_time_anchored_with_web_intent_still_goes_online(monkeypatch):
+    rig = wire(monkeypatch, chunks=(), web=WEB_OK)
+    out = ask(rig.cb(), mode="voice", voice_web=True, web_intent=True,
+              question="What did we do yesterday?")
     assert out["from_web"] is True
-    assert out["answer"].startswith(laa.PROJECT_FALLBACK_LEAD)
+
+
+def test_a_date_only_the_rewrite_supplies_still_closes_the_web(monkeypatch):
+    # "And the day before?" gets its date from the history rewrite (q_from),
+    # never from the original question (orig_q_from).
+    import ask_rewrite
+    rig = wire(monkeypatch, kind="general", records_answer=False, web=WEB_OK)
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")
+    monkeypatch.setattr(ask_rewrite, "standalone_question",
+                        lambda q, h, **kw: ("What did we do the day before yesterday?", True))
+    out = ask(rig.cb(), question="And what about the one before?",
+              history=[{"question": "What did we do yesterday?", "answer": "Pour."}])
+    assert "general" not in rig.events
+    assert "from_web" not in out
+
+
+# ---- offer the web instead of going online (spec 2026-10-15 voice offer) -----
+
+def _no_web_calls(rig):
+    return "general" not in rig.events and "on_web_start" not in rig.events
+
+
+def test_offer_general_question_records_not_useful_offers_instead_of_searching(monkeypatch):
+    rig = wire(monkeypatch, kind="general", records_answer=False, web=WEB_OK)
+    out = ask(rig.cb(), mode="voice", voice_web=True, offer_web=True)
+    assert out["answer"] == voice_web.OFFER_NO_RECORDS
+    assert out["web_offer"] is True
+    assert out["citations"] == []
+    assert _no_web_calls(rig)
+    assert rig.prompts == []          # no synthesis either
+
+
+def test_offer_distance_gated_records_also_offer(monkeypatch):
+    rig = wire(monkeypatch, chunks=(FAR_CHUNK,), kind="general", web=WEB_OK)
+    out = ask(rig.cb(), mode="voice", voice_web=True, offer_web=True)
+    assert out["answer"] == voice_web.OFFER_NO_RECORDS
+    assert out["web_offer"] is True
+    assert _no_web_calls(rig) and rig.prompts == []
+
+
+def test_offer_mixed_question_with_useful_records_appends_the_also_offer(monkeypatch):
+    rig = wire(monkeypatch, kind="mixed", records_answer=True, web=WEB_OK,
+               answer="Grounded answer [1].")
+    out = ask(rig.cb(), mode="voice", voice_web=True, offer_web=True)
+    assert out["answer"] == "Grounded answer [1]. " + voice_web.OFFER_ALSO
+    assert out["web_offer"] is True
+    assert _no_web_calls(rig)
+    assert len(rig.prompts) == 1      # the records synthesis only
+    assert "from_web" not in out
+
+
+def test_offer_project_question_gets_the_records_answer_and_no_offer(monkeypatch):
+    rig = wire(monkeypatch, kind="project", records_answer=False, web=WEB_OK,
+               answer="Nothing yesterday [1].")
+    out = ask(rig.cb(), mode="voice", voice_web=True, offer_web=True,
+              question="What did we do yesterday?")
+    assert out["answer"] == "Nothing yesterday [1]."
+    assert "web_offer" not in out
+    assert _no_web_calls(rig)
+
+
+def test_offer_no_chunks_not_scoped_offers_without_a_web_call(monkeypatch):
+    rig = wire(monkeypatch, chunks=(), web=WEB_OK)
+    out = ask(rig.cb(), mode="voice", voice_web=True, offer_web=True)
+    assert out["answer"] == voice_web.OFFER_NO_RECORDS
+    assert out["web_offer"] is True
+    assert out["grounded"] is True
+    assert _no_web_calls(rig) and "classify" not in rig.events
+
+
+def test_offer_scoped_empty_keeps_the_no_records_answer(monkeypatch):
+    rig = wire(monkeypatch, chunks=(), web=WEB_OK)
+    out = ask(rig.cb(), mode="voice", voice_web=True, offer_web=True,
+              scoped=True, date="2026-09-01")
+    assert out["answer"].startswith("No relevant records found")
+    assert "web_offer" not in out
+    assert _no_web_calls(rig)
+
+
+def test_offer_is_ignored_when_the_caller_said_search_online(monkeypatch):
+    rig = wire(monkeypatch, chunks=(), web=WEB_OK)
+    out = ask(rig.cb(), mode="voice", voice_web=True, web_intent=True, offer_web=True)
+    assert out["from_web"] is True
+    assert "web_offer" not in out
+    assert "general" in rig.events
+
+
+def test_offer_web_is_ignored_on_screen(monkeypatch):
+    rig = wire(monkeypatch, kind="general", records_answer=False, web=WEB_OK)
+    out = ask(rig.cb(), offer_web=True)
+    assert out["from_web"] is True
+    assert "web_offer" not in out
+    assert "general" in rig.events
+
+
+def test_without_offer_web_a_general_question_still_goes_online(monkeypatch):
+    rig = wire(monkeypatch, kind="general", records_answer=False, web=WEB_OK)
+    out = ask(rig.cb(), mode="voice", voice_web=True)
+    assert out["from_web"] is True
+    assert "web_offer" not in out
+
+
+def test_rewrite_runs_only_when_there_is_history(monkeypatch):
+    import ask_rewrite
+    wire(monkeypatch, kind="project", web=WEB_OK)
+    monkeypatch.setenv("ASK_CONVERSATION_MEMORY", "true")
+    calls = []
+
+    def fake_standalone(question, history, call=None, timeout=None):
+        calls.append(len(history))
+        return question, False
+
+    monkeypatch.setattr(ask_rewrite, "standalone_question", fake_standalone)
+    ask(mode="voice", voice_web=True, offer_web=True)
+    assert calls == [] or calls == [0]
+    n0 = len(calls)
+    ask(mode="voice", voice_web=True, offer_web=True,
+        history=[{"question": "What did we do yesterday?", "answer": "Scaffold.",
+                  "at": 1}])
+    assert len(calls) == n0 + 1 and calls[-1] == 1
