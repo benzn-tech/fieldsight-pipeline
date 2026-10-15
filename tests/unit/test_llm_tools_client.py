@@ -46,6 +46,12 @@ def _env(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_auto_only(monkeypatch):
+    # The auto-only memory is per container; no test may inherit another's.
+    monkeypatch.setattr(tools_client, "_AUTO_ONLY", set())
+
+
 def _install(monkeypatch, pool):
     monkeypatch.setattr(corroboration_client.urllib3, "PoolManager",
                         lambda *a, **k: pool)
@@ -263,16 +269,40 @@ def test_a_400_not_about_tool_choice_is_not_retried(monkeypatch):
     assert turn.error and "400" in turn.error
 
 
-def test_a_forced_function_choice_is_sent_as_is_and_not_downgraded(monkeypatch):
-    """The forced dict is already the portable form (spec §5): rewriting it to
-    "auto" would defeat the forced last turn."""
+def test_a_forced_function_choice_is_sent_as_is_first(monkeypatch):
     forced = {"type": "function", "function": {"name": "final_answer"}}
-    pool = _install(monkeypatch, FakePool(
-        _http_error(400, "tool_choice rejected"), _ok_tool_reply()))
-    turn = tools_client.chat(MESSAGES, TOOLS, tool_choice=forced)
+    pool = _install(monkeypatch, FakePool(_ok_tool_reply()))
+    tools_client.chat(MESSAGES, TOOLS, tool_choice=forced)
     assert pool.calls[0]["body"]["tool_choice"] == forced
     assert len(pool.calls) == 1
-    assert turn.error
+
+
+def test_a_rejected_forced_choice_retries_auto_with_only_that_tool(monkeypatch):
+    """muse-spark accepts only "auto" (TEST 2026-10-16). The forced last turn
+    stays forced in effect: the one tool offered is the one it named."""
+    forced = {"type": "function", "function": {"name": "final_answer"}}
+    tools = TOOLS
+    assert len(tools) > 1 and "final_answer" in [t["function"]["name"] for t in tools]
+    pool = _install(monkeypatch, FakePool(
+        _http_error(400, "tool_choice rejected"), _ok_tool_reply()))
+    turn = tools_client.chat(MESSAGES, tools, tool_choice=forced)
+    assert [c["body"]["tool_choice"] for c in pool.calls] == [forced, "auto"]
+    assert [t["function"]["name"] for t in pool.calls[1]["body"]["tools"]] ==         ["final_answer"]
+    assert turn.error is None
+
+
+def test_the_vendor_reason_inside_metadata_raw_counts(monkeypatch):
+    """OpenRouter wraps the provider's 400 as "Provider returned error" and puts
+    the reason in error.metadata.raw (live muse reply, 2026-10-16)."""
+    raw = json.dumps({"error": {"message": "only `\"auto\"` is supported for "
+                                "`tool_choice`.", "param": "tool_choice"}})
+    pool = _install(monkeypatch, FakePool(
+        FakeResponse(400, {"error": {"message": "Provider returned error",
+                                     "code": 400, "metadata": {"raw": raw}}}),
+        _ok_tool_reply()))
+    turn = tools_client.chat(MESSAGES, TOOLS)
+    assert [c["body"]["tool_choice"] for c in pool.calls] == ["required", "auto"]
+    assert turn.error is None
 
 
 def test_the_fallback_chain_is_tried_in_order_on_5xx(monkeypatch):
@@ -402,3 +432,13 @@ def test_failures_do_not_log_message_text(monkeypatch, caplog):
         _http_error(500, "boom")))
     tools_client.chat(messages, TOOLS)
     assert SENTINEL not in caplog.text
+
+
+def test_an_auto_only_model_is_remembered_for_the_next_turn(monkeypatch):
+    monkeypatch.setattr(tools_client, "_AUTO_ONLY", set())
+    pool = _install(monkeypatch, FakePool(
+        _http_error(400, "only auto is supported for tool_choice"),
+        _ok_tool_reply(), _ok_tool_reply()))
+    tools_client.chat(MESSAGES, TOOLS)
+    tools_client.chat(MESSAGES, TOOLS)
+    assert [c["body"]["tool_choice"] for c in pool.calls] == ["required", "auto", "auto"]

@@ -20,11 +20,12 @@ Rules that shape the code below:
   `arguments` is not a JSON object is returned with `arguments={}` and its id in
   `bad_args`, so the loop can feed the failure back to the model (§6.4 ends the
   loop after two in a row).
-- **`tool_choice` portability.** Some endpoints reject `"required"`. A 400 that
-  names `tool_choice` is retried once, same model, with `"auto"`. A forced
-  `{"type": "function", ...}` value is already the portable form for the last
-  turn and is sent as is -- never downgraded, because downgrading it would turn
-  the forced final answer into an optional one.
+- **`tool_choice` portability.** Some endpoints reject `"required"`, and some
+  (muse-spark, TEST 2026-10-16) accept only `"auto"`. A 400 that names
+  `tool_choice` -- in the message or in OpenRouter's `metadata.raw` -- is
+  retried once, same model, with `"auto"`. A forced `{"type": "function", ...}`
+  is sent as is first; when it is rejected the retry offers ONLY the named tool
+  under `"auto"`, so the forced final answer stays the only tool there is.
 - **Fallbacks** (`ASK_JUDGE_FALLBACKS`, comma-separated) are tried in order on a
   5xx or a transport failure (timeout included), and only while the deadline
   leaves time for another attempt. A 4xx is our request's fault and another
@@ -154,7 +155,14 @@ def _error_detail(resp):
         detail = json.loads(resp.data.decode("utf-8"))
         err = detail.get("error") if isinstance(detail, dict) else None
         message = err.get("message") if isinstance(err, dict) else None
-        return message if isinstance(message, str) else ""
+        message = message if isinstance(message, str) else ""
+        # OpenRouter wraps a provider 400 as "Provider returned error" and puts
+        # the provider's own reason in metadata.raw.
+        meta = err.get("metadata") if isinstance(err, dict) else None
+        raw = meta.get("raw") if isinstance(meta, dict) else None
+        if isinstance(raw, str) and raw:
+            message = (message + ": " + raw[:500]) if message else raw[:500]
+        return message
     except Exception:                         # noqa: BLE001 - body may be html
         return ""
 
@@ -179,6 +187,21 @@ def _log(turn, caller, elapsed, n_tools_offered):
                     len(turn.bad_args), len(turn.text), int(elapsed * 1000))
     except Exception:                         # noqa: BLE001
         logger.warning("LLM_TOOLS logging failed", exc_info=True)
+
+
+# Models that rejected a non-"auto" tool_choice in this container. Each round
+# would otherwise pay a ~0.6 s 400 before the retry (muse, TEST 2026-10-16).
+_AUTO_ONLY = set()
+
+
+def _auto_only(choice, tools):
+    """("auto", tools) for an endpoint that takes only "auto": a forced choice
+    keeps only its named tool, so the forced final answer stays forced."""
+    if isinstance(choice, dict):
+        name = (choice.get("function") or {}).get("name")
+        tools = [t for t in tools or []
+                 if (t.get("function") or {}).get("name") == name] or tools
+    return "auto", tools
 
 
 def chat(messages, tools, *, model=None, tool_choice="required",
@@ -219,6 +242,9 @@ def chat(messages, tools, *, model=None, tool_choice="required",
                                 timed_out=True, model=current)
             timeout = min(timeout, left)
 
+        if current in _AUTO_ONLY and choice != "auto":
+            choice, tools = _auto_only(choice, tools)
+            downgraded = True
         payload = {
             "model": current,
             "messages": messages,
@@ -263,9 +289,11 @@ def chat(messages, tools, *, model=None, tool_choice="required",
         logger.warning("llm_tools: HTTP %d caller=%s model=%s after %.2fs",
                        resp.status, caller, current, _now() - attempt_start)
 
-        if (resp.status == 400 and choice == "required" and not downgraded
-                and "tool_choice" in message):
-            choice, downgraded = "auto", True
+        if (resp.status == 400 and not downgraded and "tool_choice" in message
+                and (choice == "required" or isinstance(choice, dict))):
+            _AUTO_ONLY.add(current)
+            choice, tools = _auto_only(choice, tools)
+            downgraded = True
             continue                          # same model, once
         if 500 <= resp.status < 600:
             idx += 1
