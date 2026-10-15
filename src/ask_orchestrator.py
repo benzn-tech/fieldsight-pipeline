@@ -930,7 +930,7 @@ def _judge_round(t, turn, ctx, tools, states, rnd):
         if slot == "web":
             states("searching_web")
             t.route["web_ran"] = True
-            env = web_tool(t.question, max(0.0, t.deadline - FINAL_RESERVE_S - _clock()),
+            env = web_tool(t.web_question, max(0.0, t.deadline - FINAL_RESERVE_S - _clock()),
                            t.voice, ctx.refs)
             env = dict(env, round=rnd)
             t.web_env = env
@@ -1054,12 +1054,15 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
     if pol == "offer" and not body.get("offer_web"):
         pol = "never"
     route["policy"] = pol
+    # The web gets the asker's question with a "search online" phrase removed, as
+    # the voice worker already does before this point (voice_web.detect_intent).
+    web_question = voice_web.detect_intent(question)[1] if (wi and not voice) else question
 
     tools = tools or _real_tools()
     t = _Turn(question=question, asked=asked, rewritten=rewritten, today=today,
               date_from=date_from, date_to=date_to, applied_scope=applied_scope,
               voice=voice, pol=pol, deadline=deadline, route=route, web_env=None,
-              round1b_day=None)
+              round1b_day=None, web_question=web_question)
 
     # ---- round 1 (spec §6.3)
     states("searching_records")
@@ -1067,7 +1070,7 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
                             lambda_client=laa._get_lambda_client(),
                             function_name=laa.RAG_SEARCH_FUNCTION,
                             refs=tools.RefAssigner())
-    req = {"question": question, "asked": asked, "q_from": date_from, "q_to": date_to,
+    req = {"question": web_question, "asked": asked, "q_from": date_from, "q_to": date_to,
            "scope": {"site": scope_req.get("site_id")}, "policy": pol, "channel": channel}
     envs, web_env = run_round1(req, ctx, tools, route=route,
                                on_web_start=lambda: states("searching_web"))
@@ -1098,13 +1101,12 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
         left = deadline - _clock()
         forced = (route["rounds"] >= MAX_ROUNDS or left < MIN_ROUND_LEFT_S
                   or bad_rounds >= MAX_BAD_ROUNDS)
-        if forced:
-            offered = [_fn(FINAL_ANSWER_TOOL)]
-        else:
-            offered = [_fn(x) for x in tools.TOOLS]
-            if pol in ("auto", "required") and not route.get("web_ran"):
-                offered.append(_fn(WEB_SEARCH_TOOL))
-            offered.append(_fn(FINAL_ANSWER_TOOL))
+        # The same list on a forced turn: a provider may 400 on a history that
+        # names a tool no longer offered. Only tool_choice forces final_answer.
+        offered = [_fn(x) for x in tools.TOOLS]
+        if pol in ("auto", "required") and not route.get("web_ran"):
+            offered.append(_fn(WEB_SEARCH_TOOL))
+        offered.append(_fn(FINAL_ANSWER_TOOL))
         msgs = _messages(system, user, batches, forced)
         states("writing")
         t0 = _clock()
@@ -1122,7 +1124,9 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
         if isinstance(fin, dict):
             break
         if forced:
-            return _fallback(t, "judge_no_final", shown)
+            # Asked for tools anyway: nothing is executed or fed back.
+            logger.info("ask orch forced_final_ignored")
+            return _fallback(t, "forced_final_ignored", shown)
         rnd = route["rounds"] + 1
         if fin == "bad":
             batch, all_bad = [_err_env("final_answer", {}, "bad_args", rnd,

@@ -156,7 +156,10 @@ def test_forced_final_on_a_short_deadline(monkeypatch):
     out = run(body(), chat)
     call = chat.calls[0]
     assert call["tool_choice"] == {"type": "function", "function": {"name": "final_answer"}}
-    assert [t["function"]["name"] for t in call["tools"]] == ["final_answer"]
+    # The full list stays offered (a provider may 400 on a history that names a
+    # tool no longer offered); only tool_choice forces the final answer.
+    names = [t["function"]["name"] for t in call["tools"]]
+    assert "final_answer" in names and "day_overview" in names and "search_records" in names
     assert any("answer now" in (m.get("content") or "").lower() for m in call["messages"])
     assert call["deadline"] <= t0 + 12.0 + 0.5
     assert out["answer"] == "B2 [1]."
@@ -473,3 +476,37 @@ def test_on_state_failure_never_breaks_the_turn(monkeypatch):
     out = orch.answer(body(), channel="screen", on_state=bad_state,
                       tools=FakeTools(_rows), chat=ScriptChat(final("x [R1]")))
     assert out["answer"] == "x [1]"
+
+
+def test_forced_final_turn_that_calls_another_tool_falls_back(monkeypatch, caplog):
+    precheck_says(monkeypatch, "no")
+    monkeypatch.setattr(orch, "DEADLINE_S", {"screen": 12.0, "voice": 12.0})
+    monkeypatch.setattr(llm_utils, "call_llm", lambda prompt, **kw: ("Synth [1].", None))
+    chat = ScriptChat(calls(("search_records", {"query": "more"})))
+    tools = FakeTools(_rows)
+    with caplog.at_level(logging.INFO):
+        out = run(body(), chat, tools=tools)
+    assert len(tools.batches) == 1                # the ignored call never ran
+    assert len(chat.calls) == 1                   # nothing fed back
+    assert out["answer"] == "Synth [1]."
+    assert "forced_final_ignored" in caplog.text
+    assert _route(caplog)["fallback"] == "forced_final_ignored"
+
+
+def test_screen_required_web_query_drops_the_search_online_phrase(monkeypatch):
+    seen = []
+    monkeypatch.setattr(web_answer, "general_answer",
+                        lambda q, b, **kw: seen.append(q) or _block())
+    run(body("Search online what concrete cover does a B2 slab need"),
+        ScriptChat(final("40 mm [W1].", basis="web")))
+    assert seen == ["what concrete cover does a B2 slab need"]
+
+
+def test_screen_required_web_query_drops_look_it_up_online(monkeypatch):
+    seen = []
+    monkeypatch.setattr(web_answer, "general_answer",
+                        lambda q, b, **kw: seen.append(q) or _block(answer="", n_sources=0,
+                                                                    failed=True))
+    chat = ScriptChat(final("x [W1]", basis="web"))
+    run(body("look it up online: what cover does NZS 3101 require"), chat)
+    assert seen == ["what cover does NZS 3101 require"]
