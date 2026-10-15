@@ -82,6 +82,20 @@ MIN_USEFUL_TIMEOUT = 2.0
 _RETRYABLE = {429, 500, 502, 503, 504, 529}
 
 
+def api_key():
+    """The OpenRouter key every client on this endpoint uses, read per call.
+
+    One place, so a second client (`llm_tools_client`) imports the key handling
+    instead of carrying its own copy of which env var holds it.
+    """
+    return os.environ.get("CORROBORATION_API_KEY")
+
+
+def http_session():
+    """A fresh HTTP pool, built at call time so a test's patch is honoured."""
+    return urllib3.PoolManager()
+
+
 class SearchResult:
     """One page the search step saw. `url` is what a card cites."""
 
@@ -206,8 +220,8 @@ def call(prompt, *, timeout, model=None, max_tokens=1024, web=False,
     `caller="unknown"`, rather than raising; a guard test is what makes
     "unknown" in production logs impossible rather than this default.
     """
-    api_key = os.environ.get("CORROBORATION_API_KEY")
-    if not api_key:
+    key = api_key()
+    if not key:
         # Not raising: a missing key must cost the reader the corroboration
         # cards, never the answer they asked for.
         logger.error("corroboration: CORROBORATION_API_KEY not set")
@@ -234,10 +248,10 @@ def call(prompt, *, timeout, model=None, max_tokens=1024, web=False,
     body = json.dumps(payload)
     headers = {
         "Content-Type": "application/json",
-        "Authorization": "Bearer " + api_key,
+        "Authorization": "Bearer " + key,
     }
 
-    http = urllib3.PoolManager()
+    http = http_session()
     attempts_left = 2 if (retry_budget or 0) >= timeout + MIN_USEFUL_TIMEOUT else 1
     started = time.time()
     last_error = None
