@@ -874,10 +874,14 @@ def test_worker_offer_falls_back_to_the_question_asked(wk):
     assert _offer(wk)["question"] == TRANSCRIPT
 
 
-def test_worker_done_without_an_offer_deletes_the_old_one(wk):
+def test_worker_done_without_an_offer_never_deletes(wk):
+    # Start consumes any earlier offer; the worker role has no DeleteObject.
     _flag(wk)
-    seed_offer(wk.s3)
+    deletes = []
+    real = wk.s3.delete_object
+    wk.s3.delete_object = lambda **kw: (deletes.append(kw["Key"]), real(**kw))
     avt.worker_handler(event(), None)
+    assert deletes == []
     assert _offer(wk) is None
     assert _convo(wk) is not None
 

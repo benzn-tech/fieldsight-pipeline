@@ -477,13 +477,14 @@ def _remember(s3, bucket, caller_sub, question, answer_text, rag):
         write_convo(s3, bucket, caller_sub, question, answer_text, now)
     except Exception as e:  # noqa: BLE001
         logger.error("voice convo write failed: %s", type(e).__name__)
+    # No delete when there is no offer: start consumed any earlier offer before
+    # this turn began, and the worker holds no s3:DeleteObject on ask_turns/*.
+    if not rag.get("web_offer"):
+        return
     try:
-        if rag.get("web_offer"):
-            # The standalone form when a rewrite ran, so a yes searches the whole
-            # question and not a follow-up fragment.
-            put_offer(s3, bucket, caller_sub, rag.get("asked") or question, now)
-        else:
-            delete_offer(s3, bucket, caller_sub)
+        # The standalone form when a rewrite ran, so a yes searches the whole
+        # question and not a follow-up fragment.
+        put_offer(s3, bucket, caller_sub, rag.get("asked") or question, now)
     except Exception as e:  # noqa: BLE001
         logger.error("voice offer write failed: %s", type(e).__name__)
 
