@@ -1190,6 +1190,7 @@ def _rag_answer(body, on_web_start=None):
         # gain by lying about it.
         import answer_language
         import query_slots
+        import voice_web
         today = query_slots.resolve_today(body.get("tz"), now=_parse_now(body.get("now")))
         # ALWAYS from the ORIGINAL question first -- `asked` is read only as a
         # fallback below, and never to move an anchor the caller already gave.
@@ -1352,6 +1353,12 @@ def _rag_answer(body, on_web_start=None):
         # "Search online" only counts on a voice turn that opted into web.
         _wi = (bool(body.get("web_intent")) and body.get("mode") == "voice"
                and bool(body.get("voice_web")))
+        # Voice two-phase: instead of going online unasked, say the records do not
+        # cover it and offer (spec 2026-10-15 voice offer). An explicit "search
+        # online" (`_wi`) is the caller's answer to that offer, so it wins.
+        _offer = (body.get("mode") == "voice" and bool(body.get("offer_web"))
+                  and not _wi)
+        _append_offer = False
 
         if result.get("error"):
             # Distinguish "caller not provisioned" / ACL misses from genuine
@@ -1377,6 +1384,18 @@ def _rag_answer(body, on_web_start=None):
                     and not result.get("error")
                     and (not scoped or _wi)):
                 import web_answer
+                if _offer and not scoped and web_answer.enabled() and question:
+                    # Nothing retrieved and the web is available: offer it, spend
+                    # no web call and no classification.
+                    return {
+                        "answer": voice_web.OFFER_NO_RECORDS,
+                        "web_offer": True,
+                        "grounded": True,
+                        "citations": [],
+                        "basis": basis,
+                        "applied_scope": applied_scope,
+                        "asked": asked if rewritten else None,
+                    }
                 if web_answer.enabled() and question:
                     # Nothing retrieved: no classification is spent (it would
                     # judge an empty list). The general flow runs alone --
@@ -1601,6 +1620,22 @@ def _rag_answer(body, on_web_start=None):
             # an explicit "search online" (`_wi`) sends a voice turn out.
             if body.get("mode") == "voice" and not _wi and _cls["kind"] == "project":
                 _run_general = False
+            if _offer and _run_general:
+                if not _useful:
+                    # Records cannot answer it (including a distance-gated set):
+                    # no synthesis, no web, just the offer.
+                    return {
+                        "answer": voice_web.OFFER_NO_RECORDS,
+                        "web_offer": True,
+                        "grounded": True,
+                        "citations": [],
+                        "basis": basis,
+                        "applied_scope": applied_scope,
+                        "asked": asked if rewritten else None,
+                    }
+                # Records answer part of it: speak that, then offer the web.
+                _run_general = False
+                _append_offer = True
             _t_synthesis = time.monotonic()
             if _run_general:
                 _announce_web_start(on_web_start)
@@ -1881,6 +1916,9 @@ def _rag_answer(body, on_web_start=None):
         # reorder here without also renumbering the prompt. See _build_citations.
         citations = _build_citations(chunks)
 
+        if _append_offer:
+            answer = (answer or "").rstrip() + " " + voice_web.OFFER_ALSO
+
         return {
             "answer": answer,
             "answer_language": answer_language.policy(),
@@ -1898,6 +1936,7 @@ def _rag_answer(body, on_web_start=None):
             # told what happened to the outside lookup (D5). Absent for a
             # project question, which never ran it.
             **({"web": web} if web is not None else {}),
+            **({"web_offer": True} if _append_offer else {}),
         }
     except Exception as e:
         logger.error(f"  RAG path failed: {e}")
