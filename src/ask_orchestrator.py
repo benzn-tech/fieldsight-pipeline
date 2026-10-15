@@ -420,19 +420,21 @@ def _real_tools():
     return ask_tools
 
 
-def policy(channel, scoped, time_anchored, web_intent) -> str:
+def policy(channel, scoped, time_anchored, web_intent, offer_web=False) -> str:
     """Spec §6.2: "never" | "offer" | "auto" | "required".
 
     `web_intent` is the explicit "search online": the voice `_wi`, or on the
     screen `voice_web.detect_intent` on the question. On the screen a scoped
     question keeps "never" even with the phrase (the scoped-Ask rule); on voice
     `_wi` wins, as in `_rag_answer`. The identity-error row is not decided here:
-    it is only known once the tools have run (Task 3)."""
+    it is only known once the tools have run (Task 3). `offer_web` is the screen
+    client's opt-in to the web offer (spec 2026-10-16 §4): its last row offers
+    instead of searching automatically."""
     if web_intent and (channel == "voice" or not scoped):
         return "required"
     if scoped or time_anchored:
         return "never"
-    return "offer" if channel == "voice" else "auto"
+    return "offer" if (channel == "voice" or offer_web) else "auto"
 
 
 PRECHECK_PROMPT = """Decide whether answering the question below needs a search of the open web.
@@ -834,7 +836,7 @@ def _system_prompt(today, channel, pol):
         today=today.isoformat() if today else "unknown (the request carried no usable time zone)",
         channel_rules=_CHANNEL_RULES["voice" if channel == "voice" else "screen"],
         max_rounds=MAX_ROUNDS,
-        offer_rule=_OFFER_RULE if (channel == "voice" and pol == "offer") else _NO_OFFER_RULE)
+        offer_rule=_OFFER_RULE if pol == "offer" else _NO_OFFER_RULE)
     tail = answer_language.tail_rule()
     return text + ("\n\n" + tail if tail else "")
 
@@ -1164,13 +1166,17 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
     # Web policy (spec §6.2). `_wi` and the web gate: _rag_answer lines
     # ~1352-1370 and the `_web_answer_enabled()` / `voice_web` conditions.
     import web_answer
+    # The screen offer (spec 2026-10-16 §4) exists only when the client opted in.
+    screen_opt = (not voice) and body.get("offer_web") is True
     if voice:
         wi = bool(body.get("web_intent")) and bool(body.get("voice_web"))
     else:
-        wi = voice_web.detect_intent(question)[0]
+        wi = (voice_web.detect_intent(question)[0]
+              or (screen_opt and body.get("web_intent") is True))
     web_on = web_answer.enabled() and (not voice or bool(body.get("voice_web")))
     time_anchored = bool(q_from) and not wi
-    pol = policy(channel, scoped, time_anchored, wi) if web_on else "never"
+    pol = (policy(channel, scoped, time_anchored, wi, offer_web=screen_opt) if web_on
+           else "never")
     if pol == "offer" and not body.get("offer_web"):
         pol = "never"
     route["policy"] = pol
@@ -1292,11 +1298,16 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
             extra["web"] = out["web"]
         if voice:
             text = laa._speakable_web_answer(text, None)
-    if voice and pol == "offer" and fin["offer_web"]:
-        if basis == "none" or not out["refs_r"]:
-            text = voice_web.OFFER_NO_RECORDS
-        else:
-            text = text.rstrip() + " " + voice_web.OFFER_ALSO
+    if pol == "offer" and fin["offer_web"]:
+        if voice:
+            if basis == "none" or not out["refs_r"]:
+                text = voice_web.OFFER_NO_RECORDS
+            else:
+                text = text.rstrip() + " " + voice_web.OFFER_ALSO
+        elif basis == "none" or not out["refs_r"]:
+            # The screen's button is the offer: no question in the text, and
+            # nothing appended to a records answer.
+            text = voice_web.SCREEN_OFFER_NO_RECORDS
         extra["web_offer"] = True
 
     cited_refs = _cited_card_refs(fin["answer"], shown)

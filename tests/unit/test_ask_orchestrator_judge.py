@@ -752,3 +752,48 @@ def test_system_prompt_tells_the_judge_to_resolve_spoken_dates():
     prompt = orch._system_prompt(datetime.date(2026, 10, 16), "screen", "never")
     assert "resolve it to an ISO date" in prompt
     assert "deadlines" in prompt
+
+
+# ------------------------------------------------------------- screen offer
+
+def _count_prechecks(monkeypatch):
+    seen = []
+
+    def precheck(*a, **k):
+        seen.append(1)
+        return corroboration_client.Reply(text=json.dumps({"web": "no"}))
+    monkeypatch.setattr(corroboration_client, "call", precheck)
+    return seen
+
+
+def test_screen_offer_web_uses_the_offer_rule_and_no_precheck(monkeypatch):
+    seen = _count_prechecks(monkeypatch)
+    chat = ScriptChat(final("Nothing recorded.", basis="none", offer_web=True))
+    out = run(body("What is the best rebar brand?", offer_web=True), chat)
+    system = chat.calls[0]["messages"][0]["content"]
+    assert orch._OFFER_RULE in system and orch._NO_OFFER_RULE not in system
+    assert seen == []
+    assert out["answer"] == voice_web.SCREEN_OFFER_NO_RECORDS
+    assert out["web_offer"] is True
+
+
+def test_screen_offer_with_records_leaves_the_answer_unchanged(monkeypatch):
+    seen = _count_prechecks(monkeypatch)
+    chat = ScriptChat(final("We poured B2 [R1].", basis="records", offer_web=True))
+    out = run(body(offer_web=True), chat)
+    assert out["answer"] == "We poured B2 [1]."
+    assert not out["answer"].endswith(" ") and voice_web.OFFER_ALSO not in out["answer"]
+    assert out["web_offer"] is True and seen == []
+
+
+def test_screen_web_intent_counts_only_with_offer_web(monkeypatch, caplog):
+    monkeypatch.setattr(web_answer, "general_answer", lambda q, b, **kw: _block())
+    with caplog.at_level(logging.INFO):
+        run(body("What does NZS 3101 say?", offer_web=True, web_intent=True),
+            ScriptChat(final("x [W1]", basis="web")))
+    assert _route(caplog)["policy"] == "required"
+    caplog.clear()
+    precheck_says(monkeypatch, "no")
+    with caplog.at_level(logging.INFO):
+        run(body("What does NZS 3101 say?", web_intent=True), ScriptChat(final("B2 [R1].")))
+    assert _route(caplog)["policy"] == "auto"
