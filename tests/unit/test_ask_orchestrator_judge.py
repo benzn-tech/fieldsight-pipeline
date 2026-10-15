@@ -786,6 +786,17 @@ def test_screen_offer_with_records_leaves_the_answer_unchanged(monkeypatch):
     assert out["web_offer"] is True and seen == []
 
 
+def test_screen_no_records_offer_ships_no_record_cards(monkeypatch):
+    # basis "none" while still citing R1: the screen shows "records don't cover
+    # that", so the R card must not ship beside it.
+    _count_prechecks(monkeypatch)
+    chat = ScriptChat(final("Nothing on point [R1].", basis="none", offer_web=True))
+    out = run(body(offer_web=True), chat)
+    assert out["answer"] == voice_web.SCREEN_OFFER_NO_RECORDS
+    assert out["citations"] == [] and out["grounded"] is False
+    assert out["web_offer"] is True
+
+
 def test_screen_web_intent_counts_only_with_offer_web(monkeypatch, caplog):
     monkeypatch.setattr(web_answer, "general_answer", lambda q, b, **kw: _block())
     with caplog.at_level(logging.INFO):

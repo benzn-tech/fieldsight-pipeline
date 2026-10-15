@@ -1292,6 +1292,7 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
         return _fallback(t, "empty_answer", shown)
 
     extra = {}
+    no_records_offer = False
     if out["from_web"]:
         extra["from_web"] = True
         if out["web"] is not None:
@@ -1308,8 +1309,13 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
             # The screen's button is the offer: no question in the text, and
             # nothing appended to a records answer.
             text = voice_web.SCREEN_OFFER_NO_RECORDS
+            no_records_offer = True
         extra["web_offer"] = True
 
+    if no_records_offer:
+        # "Records don't cover that" must not ship with record cards beside it
+        # (spec 2026-10-16 section 3: the offer row has no citations).
+        return t.result(text, [], grounded=False, extra=extra, cited=())
     cited_refs = _cited_card_refs(fin["answer"], shown)
     cited = [it for it in _card_items(shown) if it.get("ref") in cited_refs]
     # Spec §6.7: grounded means an R ref was cited.
