@@ -1359,6 +1359,15 @@ def _rag_answer(body, on_web_start=None):
         _offer = (body.get("mode") == "voice" and bool(body.get("offer_web"))
                   and not _wi)
         _append_offer = False
+        # A question that names its own time ("yesterday", "last week") is about
+        # what the team recorded then, on either channel: it never runs the
+        # general/web flow unless the caller said "search online". The web cannot
+        # know the site or the day; the records can say what IS there instead
+        # ("nothing on the 14th, the latest is the 12th"). Owner, TEST 2026-10-15:
+        # the screen answered "What did we do yesterday?" with general guidance.
+        # `q_from`, not `orig_q_from`: a date only the history rewrite supplies
+        # ("and the day before?") closes the web too -- closing is the safe side.
+        _time_anchored = bool(q_from) and not _wi
 
         if result.get("error"):
             # Distinguish "caller not provisioned" / ACL misses from genuine
@@ -1382,7 +1391,8 @@ def _rag_answer(body, on_web_start=None):
             # depends on the no-answer result.
             if ((body.get("mode") != "voice" or body.get("voice_web"))
                     and not result.get("error")
-                    and (not scoped or _wi)):
+                    and (not scoped or _wi)
+                    and not _time_anchored):
                 import web_answer
                 if _offer and not scoped and web_answer.enabled() and question:
                     # Nothing retrieved and the web is available: offer it, spend
@@ -1612,13 +1622,16 @@ def _rag_answer(body, on_web_start=None):
                 _cls = _classify_for_route(web_answer, asked, chunks, _skip, _started, route)
             _useful = _records_useful(_cls, chunks)
             _run_general = _cls["kind"] != "project" or not _useful
-            # Voice: a project question stays on the records, even when they do
-            # not hold the answer. The records synthesis can say what IS there
-            # ("nothing on the 14th, the latest is the 12th"); the web cannot
-            # know the site. On the device "What did we do yesterday?" played
-            # "searching online" and answered from the web (2026-10-15). Only
-            # an explicit "search online" (`_wi`) sends a voice turn out.
-            if body.get("mode") == "voice" and not _wi and _cls["kind"] == "project":
+            # A project question stays on the records, even when they do not
+            # hold the answer, on both channels. The records synthesis can say
+            # what IS there ("nothing on the 14th, the latest is the 12th"); the
+            # web cannot know the site. On the device "What did we do yesterday?"
+            # played "searching online" (2026-10-15, fixed for voice in #1120);
+            # the screen prefixed PROJECT_FALLBACK_LEAD to general guidance.
+            # Only an explicit "search online" (`_wi`) sends a turn out. A
+            # time-anchored question stays too, whatever the label: a distance-
+            # gated set is labelled "general" without a model call.
+            if not _wi and (_cls["kind"] == "project" or _time_anchored):
                 _run_general = False
             if _offer and _run_general:
                 if not _useful:
