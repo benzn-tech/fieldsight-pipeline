@@ -576,3 +576,54 @@ def test_rewrite_runs_only_when_there_is_history(monkeypatch):
         history=[{"question": "What did we do yesterday?", "answer": "Scaffold.",
                   "at": 1}])
     assert len(calls) == n0 + 1 and calls[-1] == 1
+
+
+# ---- spoken weekday anchors reach _rag_answer's routing (query_slots) --------
+# NOW is 2026-08-30 21:00 in Auckland, a Sunday; the Monday before is the 24th.
+
+class RecordingLambdaClient(FakeLambdaClient):
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.payloads = []
+
+    def invoke(self, FunctionName, InvocationType, Payload):
+        self.payloads.append(json.loads(Payload))
+        return super().invoke(FunctionName, InvocationType, Payload)
+
+
+def _recording(mp, responses):
+    client = RecordingLambdaClient(responses)
+    mp.setattr(laa, "_get_lambda_client", lambda: client)
+    return client
+
+
+def test_a_weekday_counting_question_takes_the_metric_route(monkeypatch):
+    rig = wire(monkeypatch)
+    client = _recording(monkeypatch, [{"metric": "duration", "value": 4620, "unit": "seconds",
+                                       "from": "2026-08-24", "to": "2026-08-24"}])
+    out = ask(rig.cb(), question="how long did I record last Monday?")
+    assert [p.get("mode") for p in client.payloads] == ["metric"]
+    assert client.payloads[0]["metric"] == "duration"
+    assert (client.payloads[0]["date_from"], client.payloads[0]["date_to"]) == \
+        ("2026-08-24", "2026-08-24")
+    assert out["computed"] is True
+    assert rig.prompts == []
+
+
+def test_a_weekday_content_question_retrieves_with_that_day(monkeypatch):
+    rig = wire(monkeypatch)
+    client = _recording(monkeypatch, [{"chunks": [CHUNK]}])
+    out = ask(rig.cb(), question="what did we discuss about drainage last Monday?")
+    assert len(client.payloads) == 1
+    p = client.payloads[0]
+    assert "mode" not in p and "query_embedding" in p
+    assert (p["date_from"], p["date_to"]) == ("2026-08-24", "2026-08-24")
+    assert not out.get("computed")
+
+
+@pytest.mark.parametrize("mode", [{}, {"mode": "voice", "voice_web": True}])
+def test_a_weekday_anchored_question_never_runs_the_web_flow(monkeypatch, mode):
+    rig = wire(monkeypatch, kind="general", records_answer=False, web=WEB_OK)
+    out = ask(rig.cb(), question="What does NZS 4541 require, as discussed last Monday?", **mode)
+    assert "general" not in rig.events and "on_web_start" not in rig.events
+    assert "from_web" not in out

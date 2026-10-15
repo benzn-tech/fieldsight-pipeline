@@ -10,6 +10,7 @@ Pure functions only: no boto3, no I/O.
 """
 import re
 
+import query_slots
 from lexical_terms import query_terms
 
 # Words that only say WHEN. Latin terms are compared as-is; the Chinese entries
@@ -45,7 +46,7 @@ _ISO_DATE = re.compile(r"\d{4}-\d{1,2}-\d{1,2}")
 _UNSPACED_RUN = re.compile(r"[㐀-䶿一-鿿぀-ヿ豈-﫿]+")
 
 
-def is_content_free(question):
+def is_content_free(question, today=None):
     """True when the question is only a time phrase plus generic "what
     happened" words, so nothing in it can be matched against a topic.
 
@@ -53,8 +54,19 @@ def is_content_free(question):
     straddling two words ("天我" in 昨天我们做了什么) is in no word list, so the
     sentence would never read as content-free. Each unspaced run has the known
     phrases cut out of it instead, and any character left over is content.
+
+    "last Tue" (query_slots' one spoken-date rule) is non-content ONLY when
+    time_range actually anchored on it for this question and this `today`;
+    query_slots.spoken_anchor gives the exact span. There is deliberately no
+    global list of short weekday forms or month names, so words that did not
+    anchor stay content.
     """
-    q = _ISO_DATE.sub(" ", (question or "").lower())
+    q = question if isinstance(question, str) else ""
+    hit = query_slots.spoken_anchor(q, today)
+    if hit is not None:
+        start, end = hit[1]
+        q = q[:start] + " " + q[end:]
+    q = _ISO_DATE.sub(" ", q.lower())
     latin = [t for t in query_terms(q) if t not in _NON_CONTENT_EN
              and not _UNSPACED_RUN.fullmatch(t)]
     if latin:

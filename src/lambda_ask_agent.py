@@ -610,7 +610,7 @@ def _rag_search_list(body):
             date_range = {"from": q_from, "to": q_to, "source": "question"}
             # Only a time phrase and generic "what happened" words: nothing to
             # rank by, so list what happened in the range instead.
-            browse = search_browse.is_content_free(question)
+            browse = search_browse.is_content_free(question, today)
             if browse:
                 k = 64  # rag-search's maximum
 

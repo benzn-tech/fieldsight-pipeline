@@ -133,3 +133,17 @@ def test_date_to_before_date_from_is_bad_args():
     args, err = ask_tools.validate_call(
         {"name": "day_overview", "args": {"date_from": "2026-10-10", "date_to": "2026-10-09"}}, TODAY)
     assert args is None and err == {"error": "bad_args", "field": "date_to"}
+
+
+SPOKEN_HINT = "Resolve spoken dates (e.g. '3 September', 'last Tuesday') to ISO before calling."
+
+
+def test_the_model_is_told_to_resolve_spoken_dates_itself():
+    """query_slots resolves only 'last <weekday>'; every other spoken date is
+    the Ask judge's job, so the tool schema must say so."""
+    by_name = {t["name"]: t for t in ask_tools.TOOLS}
+    assert SPOKEN_HINT in by_name["day_overview"]["description"]
+    props = by_name["search_records"]["parameters"]["properties"]
+    assert SPOKEN_HINT in props["date_from"]["description"]
+    latest = by_name["latest_activity"]["parameters"]["properties"]
+    assert SPOKEN_HINT in latest["on_or_before"]["description"]
