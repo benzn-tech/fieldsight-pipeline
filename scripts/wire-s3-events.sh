@@ -13,6 +13,7 @@
 #   Ingest      ← reindex_requests/**.vectors.json (embed-report reindex VECTORS output, in-VPC Aurora apply)
 #   EmbedReport ← index_requests/**.json        (session search index REQUEST: item-writer/org-api/backfill output)
 #   Ingest      ← index_vectors/**.json         (embed-report session-index VECTORS output, in-VPC Aurora apply)
+#   TemplateDigitise ← template_digitise_requests/**.json (org-api's request to read an uploaded form)
 #
 # SAFETY:
 #   * MERGE, not clobber: we read the existing notification config and
@@ -50,6 +51,7 @@ SESSION_REPORT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-se
 REPORT_GENERATOR_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-report-generator"
 SESSION_FINALIZE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-session-finalize"
 SPEAKER_EMBED_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-speaker-embed"
+TEMPLATE_DIGITISE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-template-digitise"
 
 echo "Bucket=${BUCKET} Stage=${STAGE} VAD=${PREFIX}-vad Transcribe=${PREFIX}-transcribe EmbedReport=${PREFIX}-embed-report Ingest=${PREFIX}-ingest ExtractSession=${PREFIX}-extract-session ItemWriter=${PREFIX}-item-writer ProgrammeMatcher=${PREFIX}-programme-matcher Keyframe=${PREFIX}-keyframe"
 
@@ -211,6 +213,19 @@ if fn_exists "${PREFIX}-session-report"; then
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-session-report not deployed — skipping session-report trigger"
+fi
+# NOTE(template digitise, spec 2026-10-16): the non-VPC worker triggers on
+# template_digitise_requests/*.json -- org-api's request for one uploaded form. Its own
+# output (template_digitise_results/) and the uploads themselves (template_sources/) match
+# no rule here, so there is no BUG-13 loop; the prefix is disjoint from every other one.
+if fn_exists "${PREFIX}-template-digitise"; then
+  WIRE_FNS+=("${PREFIX}-template-digitise")
+  DESIRED=$(jq -c --arg arn "$TEMPLATE_DIGITISE_ARN" '. + [
+    {"Id":"fs-template-digitise","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"template_digitise_requests/"},{"Name":"suffix","Value":".json"}]}}}
+  ]' <<<"$DESIRED")
+else
+  echo "NOTE: ${PREFIX}-template-digitise not deployed — skipping template-digitise trigger"
 fi
 # NOTE(regenerate-own-report): the non-VPC report generator triggers on
 # report_requests/*.json -- org-api's request for ONE person's own report. The

@@ -676,15 +676,93 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
     return None, "all models failed: " + "; ".join(failures)
 
 
+# Stable prefixes on call_llm_parts errors; callers test with str.startswith.
+PARTS_NOT_CONFIGURED = "not configured: "
+PARTS_CUT_OFF = "answer cut off: "
+
+
+def call_llm_parts(parts, *, model, max_tokens, force_json=True, temperature=0,
+                   fallback_env=None, deadline=None, caller="unknown"):
+    """One user message made of content parts (text + image_url / file) -> (text, None)
+    or (None, error). OpenRouter path only.
+
+    Its OWN model chain: `model`, then each model named in the env var `fallback_env`
+    (unset or empty = none). The deploy's LLM_FALLBACK_MODELS is never read here: it
+    names TEXT models, and a text model handed page images answers from the prompt alone
+    -- it would invent checklist items that no code check can tell from real ones
+    (template digitise spec 2026-10-16, section 3).
+
+    The request is built here and not by `_openrouter_fields`: no `reasoning` field, no
+    reasoning headroom, and an explicit temperature. That is the request the 2026-10-16
+    spike measured; the text path's effort and headroom were never measured on a vision
+    read. Retries, the empty-answer check and the LLM_USAGE line come from
+    `_qwen_attempt`, unchanged.
+
+    Two failures are told apart by a stable prefix on the error, because retrying either
+    one later cannot help:
+      PARTS_NOT_CONFIGURED -- this deploy cannot make the call at all (provider / key);
+      PARTS_CUT_OFF        -- the answer hit max_tokens (finish_reason=length), whether
+                              it came back truncated or empty because reasoning spent the
+                              whole budget. The same request at temperature 0 is cut off
+                              again, and so is the next model's, so the chain stops here.
+    """
+    if LLM_PROVIDER != "qwen" or _is_dashscope(QWEN_BASE_URL):
+        return None, (PARTS_NOT_CONFIGURED + "multi-part (image/file) calls need the "
+                      "OpenRouter endpoint: LLM_PROVIDER=qwen and a non-DashScope "
+                      "QWEN_BASE_URL")
+    if not QWEN_API_KEY:
+        logger.error("QWEN_API_KEY / DASHSCOPE_API_KEY not set")
+        return None, PARTS_NOT_CONFIGURED + "QWEN_API_KEY not configured"
+    chain = [model]
+    if fallback_env:
+        for name in (os.environ.get(fallback_env) or "").split(","):
+            name = name.strip()
+            if name and name not in chain:
+                chain.append(name)
+    budget = _chain_budget()
+    if deadline is not None:
+        budget = deadline if budget is None else min(budget, deadline)
+    started = time.monotonic()
+    failures = []
+    for i, name in enumerate(chain):
+        remaining = None if budget is None else budget - (time.monotonic() - started)
+        if i > 0 and remaining is not None and remaining < MIN_USEFUL_SECONDS:
+            failures.append(f"{name} skipped (time budget exhausted)")
+            break
+        payload = {"model": name, "messages": [{"role": "user", "content": parts}],
+                   "temperature": temperature, "max_tokens": max_tokens}
+        if force_json:
+            payload["response_format"] = {"type": "json_object"}
+        info = {}
+        text, err, movable = _qwen_attempt(payload, False, remaining, caller, info=info)
+        if info.get("finish_reason") == "length":
+            # Truncated JSON (err None) or an empty answer (err set): either way the
+            # budget, not the vendor, is what stopped it.
+            return None, PARTS_CUT_OFF + "finish_reason=length at max_tokens=%d (%s)" % (
+                max_tokens, name)
+        if err is None:
+            return text, None
+        if len(chain) == 1 or not movable:
+            return None, err
+        failures.append(f"{name} {str(err)[:120]}")
+        if i < len(chain) - 1:
+            logger.info("LLM_FALLBACK %s", json.dumps(
+                {"caller": caller, "from": name, "to": chain[i + 1],
+                 "reason": str(err)[:200]}))
+    return None, "all models failed: " + "; ".join(failures)
+
+
 def _status_movable(status):
     """5xx, 429 and 408 (OpenRouter's upstream timeout) are the vendor's."""
     return status >= 500 or status in (429, 408)
 
 
 def _qwen_attempt(payload, thinking, deadline, caller, attempts=None,
-                  timeout_cap=None):
+                  timeout_cap=None, info=None):
     """One model, one request ladder. Returns (text, error, movable): `movable`
-    says the failure is the model's, so the next model in the chain may try."""
+    says the failure is the model's, so the next model in the chain may try.
+    `info`, when a dict is passed, receives `finish_reason` of a 200 answer (empty
+    or not); callers that pass nothing see no change."""
     # One line per call, on the way OUT, naming what actually goes on the wire.
     #
     # Which model served a call was unanswerable from anywhere: the env says
@@ -733,6 +811,8 @@ def _qwen_attempt(payload, thinking, deadline, caller, attempts=None,
         try:
             choice = data["choices"][0]
             content = choice["message"]["content"]
+            if info is not None:
+                info["finish_reason"] = choice.get("finish_reason")
         except (KeyError, IndexError, TypeError):
             logger.error(f"Qwen unexpected response shape: {str(data)[:500]}")
             # OpenRouter answers 200 with {"error": {...}} and no choices when

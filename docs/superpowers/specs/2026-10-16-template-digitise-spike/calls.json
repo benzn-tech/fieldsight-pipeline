@@ -1,0 +1,237 @@
+[
+ {
+  "vendor": "ade",
+  "run": "bicl_digital",
+  "ok": true,
+  "sec": 19.4,
+  "meta": {
+   "credit_usage": 9.0,
+   "duration_ms": 16169,
+   "filename": "bicl.pdf",
+   "job_id": "parse2-01m50hxc5mz5d4meyb947r9qn7",
+   "org_id": "n9ngrdncx0kn",
+   "page_count": 3,
+   "version": "dpt-2-20260903",
+   "failed_pages": []
+  }
+ },
+ {
+  "vendor": "ade",
+  "run": "penina_digital",
+  "ok": true,
+  "sec": 13.1,
+  "meta": {
+   "credit_usage": 30.0,
+   "duration_ms": 8527,
+   "filename": "penina.pdf",
+   "job_id": "parse2-01m50hyaeyk117tey4w3hrt1tw",
+   "org_id": "n9ngrdncx0kn",
+   "page_count": 10,
+   "version": "dpt-2-20260903",
+   "failed_pages": []
+  }
+ },
+ {
+  "vendor": "ade",
+  "run": "bicl_photo",
+  "ok": true,
+  "sec": 11.4,
+  "meta": {
+   "credit_usage": 9.0,
+   "duration_ms": 9158,
+   "filename": "bicl_photo.pdf",
+   "job_id": "parse2-01m50hyp1k5cyzwjecjm2ky3bc",
+   "org_id": "n9ngrdncx0kn",
+   "page_count": 3,
+   "version": "dpt-2-20260903",
+   "failed_pages": []
+  }
+ },
+ {
+  "vendor": "ade",
+  "run": "penina_photo",
+  "ok": true,
+  "sec": 27.9,
+  "meta": {
+   "credit_usage": 30.0,
+   "duration_ms": 21151,
+   "filename": "penina_photo.pdf",
+   "job_id": "parse2-01m50hz5a292y4cxk8jn6j2nse",
+   "org_id": "n9ngrdncx0kn",
+   "page_count": 10,
+   "version": "dpt-2-20260903",
+   "failed_pages": []
+  }
+ },
+ {
+  "vendor": "openrouter",
+  "model": "google/gemini-3.8-flash",
+  "run": "bicl_photo",
+  "ok": true,
+  "sec": 18.4,
+  "pages": 3,
+  "usage": {
+   "prompt_tokens": 3531,
+   "completion_tokens": 2147,
+   "total_tokens": 5678,
+   "cost": 0.0106995,
+   "is_byok": false,
+   "prompt_tokens_details": {
+    "cached_tokens": 0,
+    "cache_write_tokens": 0,
+    "audio_tokens": 0,
+    "video_tokens": 0
+   },
+   "cost_details": {
+    "upstream_inference_cost": 0.0106995,
+    "upstream_inference_prompt_cost": 0.00264825,
+    "upstream_inference_completions_cost": 0.00805125
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 1374,
+    "image_tokens": 0,
+    "audio_tokens": 0
+   }
+  }
+ },
+ {
+  "vendor": "openrouter",
+  "model": "google/gemini-3.8-flash",
+  "run": "penina_photo",
+  "ok": true,
+  "sec": 26.6,
+  "pages": 10,
+  "usage": {
+   "prompt_tokens": 11175,
+   "completion_tokens": 4505,
+   "total_tokens": 15680,
+   "cost": 0.025275,
+   "is_byok": false,
+   "prompt_tokens_details": {
+    "cached_tokens": 0,
+    "cache_write_tokens": 0,
+    "audio_tokens": 0,
+    "video_tokens": 0
+   },
+   "cost_details": {
+    "upstream_inference_cost": 0.025275,
+    "upstream_inference_prompt_cost": 0.00838125,
+    "upstream_inference_completions_cost": 0.01689375
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 2541,
+    "image_tokens": 0,
+    "audio_tokens": 0
+   }
+  }
+ },
+ {
+  "vendor": "openrouter",
+  "model": "google/gemini-3.8-flash",
+  "run": "bicl_clean",
+  "ok": true,
+  "sec": 17.4,
+  "pages": 3,
+  "usage": {
+   "prompt_tokens": 3531,
+   "completion_tokens": 2359,
+   "total_tokens": 5890,
+   "cost": 0.0114945,
+   "is_byok": false,
+   "prompt_tokens_details": {
+    "cached_tokens": 0,
+    "cache_write_tokens": 0,
+    "audio_tokens": 0,
+    "video_tokens": 0
+   },
+   "cost_details": {
+    "upstream_inference_cost": 0.0114945,
+    "upstream_inference_prompt_cost": 0.00264825,
+    "upstream_inference_completions_cost": 0.00884625
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 1586,
+    "image_tokens": 0,
+    "audio_tokens": 0
+   }
+  }
+ },
+ {
+  "vendor": "openrouter",
+  "model": "google/gemini-3.8-flash",
+  "run": "penina_clean",
+  "ok": true,
+  "sec": 34.5,
+  "pages": 10,
+  "usage": {
+   "prompt_tokens": 11175,
+   "completion_tokens": 6216,
+   "total_tokens": 17391,
+   "cost": 0.03169125,
+   "is_byok": false,
+   "prompt_tokens_details": {
+    "cached_tokens": 0,
+    "cache_write_tokens": 0,
+    "audio_tokens": 0,
+    "video_tokens": 0
+   },
+   "cost_details": {
+    "upstream_inference_cost": 0.03169125,
+    "upstream_inference_prompt_cost": 0.00838125,
+    "upstream_inference_completions_cost": 0.02331
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 4252,
+    "image_tokens": 0,
+    "audio_tokens": 0
+   }
+  }
+ },
+ {
+  "vendor": "ade",
+  "run": "penina_harsh",
+  "ok": true,
+  "sec": 23.3,
+  "meta": {
+   "credit_usage": 30.0,
+   "duration_ms": 17697,
+   "filename": "penina_harsh.pdf",
+   "job_id": "parse2-01m50j57yejp6xxj70qecs6hy3",
+   "org_id": "n9ngrdncx0kn",
+   "page_count": 10,
+   "version": "dpt-2-20260903",
+   "failed_pages": []
+  }
+ },
+ {
+  "vendor": "openrouter",
+  "model": "google/gemini-3.8-flash",
+  "run": "penina_harsh",
+  "ok": true,
+  "sec": 39.8,
+  "pages": 10,
+  "usage": {
+   "prompt_tokens": 10895,
+   "completion_tokens": 5610,
+   "total_tokens": 16505,
+   "cost": 0.02920875,
+   "is_byok": false,
+   "prompt_tokens_details": {
+    "cached_tokens": 0,
+    "cache_write_tokens": 0,
+    "audio_tokens": 0,
+    "video_tokens": 0
+   },
+   "cost_details": {
+    "upstream_inference_cost": 0.02920875,
+    "upstream_inference_prompt_cost": 0.00817125,
+    "upstream_inference_completions_cost": 0.0210375
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 3647,
+    "image_tokens": 0,
+    "audio_tokens": 0
+   }
+  }
+ }
+]
