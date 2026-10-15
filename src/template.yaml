@@ -330,6 +330,15 @@ Parameters:
       Voice Ask two-phase: speak a short restatement of the question while the
       worker is still answering. TEST-only; prod leaves it unset (false).
 
+  AskVoiceConvo:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Voice Ask two-phase: remember the last turns for a follow-up and turn a
+      records miss into a spoken offer to search online, honouring a yes or no
+      to it. TEST-only; prod leaves it unset (false).
+
   VoiceWebEnabled:
     Type: String
     Default: 'false'
@@ -2360,6 +2369,7 @@ Resources:
           ASK_VOICE_WORKER_FUNCTION: !Ref AskVoiceWorkerFunction
           ASK_TURN_BUCKET: !Ref DataBucketName
           ASK_VOICE_RESTATE: !Ref AskVoiceRestate
+          ASK_VOICE_CONVO: !Ref AskVoiceConvo
           VOICE_RESTATE_MODEL: 'meta-llama/llama-3.1-8b-instruct'
           # Read by /start so the restatement only says "searching online" when
           # the worker will actually search.
@@ -2377,6 +2387,7 @@ Resources:
           Statement:
             - Effect: Allow
               Action:
+                - s3:GetObject
                 - s3:PutObject
                 - s3:DeleteObject
               Resource: !Sub 'arn:aws:s3:::${DataBucketName}/ask_turns/*'
@@ -2497,6 +2508,7 @@ Resources:
           WEB_ANSWER_HARD_STOP: '45'
           ASK_TURN_BUCKET: !Ref DataBucketName
           VOICE_WEB_ENABLED: !Ref VoiceWebEnabled
+          ASK_VOICE_CONVO: !Ref AskVoiceConvo
       Layers:
         - !Ref DashScopeLayer
       Policies:

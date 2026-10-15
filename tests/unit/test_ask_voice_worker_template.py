@@ -138,7 +138,9 @@ def test_worker_invokes_rag_and_audit(resources):
 
 
 PREFIX_ACTIONS = {
-    "AskAgentFunction": {"s3:PutObject", "s3:DeleteObject"},
+    # GetObject: voice_start reads convo.json / offer.json (spec 2026-10-15
+    # voice offer and memory, 4.5). Without it every read is a 403.
+    "AskAgentFunction": {"s3:GetObject", "s3:PutObject", "s3:DeleteObject"},
     "AskVoiceWorkerFunction": {"s3:GetObject", "s3:PutObject"},
     "ApiFunction": {"s3:GetObject", "s3:PutObject", "s3:DeleteObject"},
 }
@@ -181,7 +183,7 @@ def test_no_bare_bucket_wildcard_and_no_new_bucket(resources):
 def test_flags_are_false_by_default_string_booleans():
     with io.open(TEMPLATE, encoding="utf-8") as f:
         params = _yaml.load(f.read(), Loader=_Loader)["Parameters"]
-    for name in ("AskVoiceRestate", "VoiceWebEnabled"):
+    for name in ("AskVoiceRestate", "VoiceWebEnabled", "AskVoiceConvo"):
         assert params[name]["Type"] == "String"
         assert params[name]["Default"] == "false"
         assert params[name]["AllowedValues"] == ["true", "false"]
@@ -191,6 +193,12 @@ def test_flags_are_false_by_default_string_booleans():
 def test_prod_workflow_passes_neither_flag_and_test_passes_both():
     prod = io.open(PROD_WORKFLOW, encoding="utf-8").read()
     test = io.open(TEST_WORKFLOW, encoding="utf-8").read()
-    for name in ("AskVoiceRestate", "VoiceWebEnabled"):
+    for name in ("AskVoiceRestate", "VoiceWebEnabled", "AskVoiceConvo"):
         assert name not in prod
         assert re.search(r'"%s=\$\{\{ vars\.TEST_\w+ \|\| \'false\' \}\}"' % name, test)
+
+
+def test_the_convo_flag_reaches_both_lambdas_that_use_it(resources):
+    # start runs in AskAgent, the memory writes in the worker: one flag, both env blocks.
+    for fn in ("AskAgentFunction", "AskVoiceWorkerFunction"):
+        assert _env(resources, fn)["ASK_VOICE_CONVO"] == {"Ref": "AskVoiceConvo"}, fn
