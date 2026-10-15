@@ -33,11 +33,14 @@ def _ok(text):
 
 class _S3:
     def __init__(self):
-        self.store, self.puts, self.gets = {}, {}, []
+        self.store, self.puts, self.gets, self.sizes = {}, {}, [], {}
 
     def get_object(self, Bucket, Key):
+        # S3 always answers with ContentLength; `sizes` lets a test claim an object
+        # larger than the bytes it actually stores.
         self.gets.append(Key)
-        return {"Body": BytesIO(self.store[Key])}
+        body = self.store[Key]
+        return {"Body": BytesIO(body), "ContentLength": self.sizes.get(Key, len(body))}
 
     def put_object(self, Bucket, Key, Body, **kw):
         self.puts[Key] = Body
@@ -260,3 +263,44 @@ def test_the_docx_reader_state_is_logged_at_import(caplog):
         importlib.reload(worker)
     assert any(r.getMessage() in ("docx reader: enabled", "docx reader: DISABLED")
                for r in caplog.records)
+
+
+class _Unread(BytesIO):
+    """A body that fails the test if anyone reads it."""
+    def read(self, *a):
+        raise AssertionError("an oversized source was read before its size was checked")
+
+
+@pytest.mark.parametrize("ext,route", [("jpg", "vision"), ("pdf", "vision"), ("docx", "docx")])
+def test_a_source_over_the_limit_is_refused_before_it_is_read(s3, monkeypatch, ext, route):
+    import template_types
+    key = f"template_sources/{COMPANY}/{'e' * 32}.{ext}"
+    s3.store[key] = b"x"
+    s3.sizes[key] = template_types.MAX_BYTES + 1
+    real_get = s3.get_object
+
+    def get_object(Bucket, Key):
+        obj = real_get(Bucket, Key)
+        if Key == key:
+            obj["Body"] = _Unread(b"x")
+        return obj
+
+    monkeypatch.setattr(s3, "get_object", get_object)
+    _request(s3, [key])
+    sent = _http(monkeypatch, [])
+    worker.lambda_handler(_event(), None)
+    res = _result(s3)
+    assert res["status"] == "error"
+    assert res["route"] == route
+    assert res["error"] == "This file is larger than 20 MB — upload a smaller file."
+    assert sent == [], "no model call for a file that was never read"
+
+
+def test_a_source_exactly_at_the_limit_is_still_read(s3, monkeypatch):
+    import template_types
+    key = f"template_sources/{COMPANY}/{'d' * 32}.docx"
+    s3.store[key] = _docx_bytes()
+    s3.sizes[key] = template_types.MAX_BYTES
+    _request(s3, [key])
+    worker.lambda_handler(_event(), None)
+    assert _result(s3)["status"] == "done"

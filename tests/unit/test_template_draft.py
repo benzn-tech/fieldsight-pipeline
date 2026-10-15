@@ -137,3 +137,15 @@ def test_the_ground_truth_passes_through_untouched_and_unflagged(name, n_section
     assert out["flags"] == []
     assert all(s["flags"] == [] for s in out["sections"])
     assert all(i["flags"] == [] for s in out["sections"] for i in s["items"])
+
+
+def test_a_capital_letter_and_bracket_in_an_item_is_kept_and_flagged_like_a_full_stop():
+    out = template_draft.clean([{"title": "D) Sign-off", "items": ["D) Smith signs off"]}])
+    sec = out["sections"][0]
+    assert sec["items"][0] == {"text": "D) Smith signs off", "flags": ["label_kept"]}
+    assert sec["title"] == "Sign-off", "a section title still loses its label"
+
+
+def test_a_lowercase_letter_and_bracket_in_an_item_is_still_stripped():
+    out = template_draft.clean([{"title": "T", "items": ["d) Ladder footed"]}])
+    assert out["sections"][0]["items"][0] == {"text": "Ladder footed", "flags": []}

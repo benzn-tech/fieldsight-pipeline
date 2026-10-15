@@ -40,6 +40,7 @@ MSG_WORD_NO_TABLE = ("No checklist table found in the Word file — upload a PDF
                      "of it instead.")
 MSG_NO_ROWS = "No checklist rows found — is this a checklist form?"
 MSG_FAILED = "Something went wrong reading the form — try again."
+MSG_TOO_LARGE = "This file is larger than 20 MB — upload a smaller file."
 # Leave the runtime this much after the model call for the result write: the deadline
 # handed to template_vision is the invocation's remaining time minus this, so a run that
 # meets a slow model still writes its result instead of being killed with the poll pending.
@@ -70,6 +71,25 @@ def _read(key):
     return s3().get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
 
 
+class _TooLarge(Exception):
+    pass
+
+
+def _read_source(key):
+    """A source's bytes, refused BEFORE they are read when S3 says the object is over
+    template_types.MAX_BYTES. The presigned PUT names a size but S3 does not hold the
+    uploader to it, so the object in the bucket can be any size; reading it first would
+    put the whole thing in this function's memory to find that out."""
+    obj = s3().get_object(Bucket=S3_BUCKET, Key=key)
+    size = obj.get("ContentLength")
+    if size is not None and size > template_types.MAX_BYTES:
+        obj["Body"].close()
+        logger.warning("template digitise: %s is %s bytes, over %s -- not read",
+                       key, size, template_types.MAX_BYTES)
+        raise _TooLarge(key)
+    return obj["Body"].read()
+
+
 def digitise(request, deadline=None):
     """The result JSON for one request (without the id/name/user fields _process adds).
     `deadline` is seconds from this call; the time spent reading the sources comes off it
@@ -88,14 +108,21 @@ def digitise(request, deadline=None):
     if exts == ["docx"]:
         if not template_docx.AVAILABLE:
             return _empty("error", route="docx", error=MSG_WORD_DISABLED)
-        raw = template_docx.read(BytesIO(_read(keys[0])))
+        try:
+            body = _read_source(keys[0])
+        except _TooLarge:
+            return _empty("error", route="docx", error=MSG_TOO_LARGE)
+        raw = template_docx.read(BytesIO(body))
         draft = template_draft.clean(raw)
         if draft["counts"]["items"] == 0:
             return _empty("unreadable", route="docx", reason=MSG_WORD_NO_TABLE)
         return {"status": "done", **draft, "route": "docx", "model": None, "pages": None}
 
-    pages = [{"body": _read(k), "content_type": template_types.EXT_TYPES[e],
-              "name": k.rsplit("/", 1)[-1]} for k, e in zip(keys, exts)]
+    try:
+        pages = [{"body": _read_source(k), "content_type": template_types.EXT_TYPES[e],
+                  "name": k.rsplit("/", 1)[-1]} for k, e in zip(keys, exts)]
+    except _TooLarge:
+        return _empty("error", route="vision", error=MSG_TOO_LARGE)
     why = template_vision.check(pages)
     if why:
         return _empty("unreadable", route="vision", reason=why)

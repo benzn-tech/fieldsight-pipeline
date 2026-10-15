@@ -110,7 +110,12 @@ def test_the_trigger_prefix_collides_with_no_other_rule():
 def test_no_rule_fires_on_the_workers_own_output_or_the_uploads():
     text = open(WIRE, encoding="utf-8").read()
     prefixes = re.findall(r'"Name":"prefix","Value":"([^"]+)"', text)
-    for out in ("template_digitise_results/", "template_sources/"):
+    # lake_put writes a manifest line beside every result it puts, so the worker's output
+    # includes MANIFEST_PREFIX too -- taken from lake_put itself, so a renamed prefix is
+    # checked rather than a stale literal.
+    import lake_put
+    assert lake_put.MANIFEST_PREFIX == "lake_manifest/"
+    for out in ("template_digitise_results/", "template_sources/", lake_put.MANIFEST_PREFIX):
         assert not any(out.startswith(p) or p.startswith(out) for p in prefixes), out
 
 

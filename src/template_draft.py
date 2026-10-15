@@ -21,9 +21,10 @@ NEAR = 0.85
 LABEL_RE = re.compile(
     r"^\s*(?:\d{1,3}(?:\.\d{1,3})*[.)]|[a-z][.)]|[ivx]{1,5}[.)])\s+",
     re.IGNORECASE)
-# A single capital letter + "." heads a section ("A. Documents & Approvals") but in an item
-# it may be an initial ("A. Smith signs off"): items keep it and are flagged for the person.
-_ITEM_INITIAL_RE = re.compile(r"^[A-Z]\.\s+")
+# A single capital letter + "." or ")" heads a section ("A. Documents & Approvals") but in
+# an item it may be an initial ("A. Smith signs off", "D) Smith signs off"): items keep it
+# and are flagged for the person. Section titles still strip it.
+_ITEM_INITIAL_RE = re.compile(r"^[A-Z][.)]\s+")
 # What the save body adds beyond the sections themselves (catch_all, keys, purposes are
 # counted per section below); generous so the flag errs towards warning.
 _BODY_OVERHEAD = 600
