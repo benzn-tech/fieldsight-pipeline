@@ -29,6 +29,8 @@ def _split_long(text, size):
 
 
 def _tail(text):
+    if OVERLAP <= 0:                 # text[-0:] is the WHOLE text, not none of it
+        return ""
     tail = text[-OVERLAP:]
     sp = tail.find(" ")
     return tail[sp + 1:] if 0 <= sp < 50 else tail

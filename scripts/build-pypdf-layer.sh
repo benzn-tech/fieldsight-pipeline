@@ -15,7 +15,7 @@
 set -euo pipefail
 
 REGION="${1:?usage: build-pypdf-layer.sh <region> [--publish]}"
-PYPDF_VERSION="5.1.0"
+PYPDF_VERSION="6.20.1"
 WORK="$(mktemp -d)"
 mkdir -p "$WORK/python"
 ZIP="$WORK/fieldsight-pypdf-${PYPDF_VERSION}.zip"
