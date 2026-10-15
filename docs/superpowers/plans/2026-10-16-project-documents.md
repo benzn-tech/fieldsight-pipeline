@@ -2955,6 +2955,7 @@ def test_reads_are_for_anyone_who_sees_the_project(world, monkeypatch):
     assert set(d) == {"id", "seriesId", "revision", "title", "filename", "contentType",
                       "status", "reason", "pages", "chars", "chunks", "uploadedBy",
                       "uploadedByName", "createdAt", "requestedAt", "indexedAt", "supersededAt"}
+    assert "T" in d["createdAt"] and "T" in d["requestedAt"]   # Safari parses only ISO
 
 
 def test_a_project_out_of_reach_is_404_for_reads_and_writes(world, monkeypatch):
@@ -3137,9 +3138,15 @@ def _doc_public(r):
             "title": r["title"], "filename": r["filename"], "contentType": r["content_type"],
             "status": r["status"], "reason": r["reason"], "pages": r["pages"],
             "chars": r["chars"], "chunks": r["chunks"], "uploadedBy": str(r["uploaded_by"]),
-            "uploadedByName": r.get("uploaded_by_name"), "createdAt": r["created_at"],
-            "requestedAt": r["requested_at"], "indexedAt": r["indexed_at"],
-            "supersededAt": r["superseded_at"]}
+            "uploadedByName": r.get("uploaded_by_name"), "createdAt": _iso(r["created_at"]),
+            "requestedAt": _iso(r["requested_at"]), "indexedAt": _iso(r["indexed_at"]),
+            "supersededAt": _iso(r["superseded_at"])}
+
+
+def _iso(v):
+    """ISO 8601 with a 'T'. ok() would str() a datetime ("2026-10-16 10:00:00+00:00"), which
+    Safari's Date.parse rejects -- and the UI's 20-minute "Retry" depends on parsing it."""
+    return v.isoformat() if v is not None else None
 
 
 def _site_doc(conn, site, doc_id):
@@ -4171,7 +4178,7 @@ def _search_project_documents(conn, caller, sc, a, meta, call, search_fn, **_):
 _FORGED_LEAD = re.compile(r"^\s*(?:\[DATA|[RWD]\d+\s*[|/])\s*")
 ```
 
-2. In `_REF_GROUP` and `_REF_TOKEN`, change every `[RW]` to `[RWD]` (three occurrences: `[RW]\d+` and `[RW]?\d+` in `_REF_GROUP`, `([RW]?)` twice in `_REF_TOKEN`).
+2. In `_REF_GROUP` and `_REF_TOKEN`, change every `[RW]` to `[RWD]` (all four occurrences: `[RW]\d+` and `[RW]?\d+` in `_REF_GROUP`, `([RW]?)` twice in `_REF_TOKEN`).
 
 3. Directly above `def _item_line(item):`, add:
 
@@ -5514,10 +5521,9 @@ Expected: `LAYER_ARN=arn:aws:lambda:ap-southeast-2:509194952652:layer:fieldsight
 
 ```bash
 gh variable set TEST_PDF_LAYER_ARN --body "<LAYER_ARN from step 2>"
-gh variable set TEST_PROJECT_DOCUMENTS --body "true"
 ```
 
-(The flag goes on with this deploy so the TEST check below exercises it; IAM is simulated in step 6 before anyone uses it. If the controller prefers, set `TEST_PROJECT_DOCUMENTS` only after step 6 and redeploy.)
+`TEST_PROJECT_DOCUMENTS` stays unset (off) for the first deploy: R10 requires every action simulated BEFORE the flag goes on (step 6b).
 
 - [ ] **Step 4: Open and merge the backend PR into develop**
 
@@ -5535,7 +5541,7 @@ aws lambda get-function-event-invoke-config --function-name fieldsight-test-proj
 aws s3api get-bucket-notification-configuration --bucket fieldsight-data-test-509194952652 --query "LambdaFunctionConfigurations[?Id=='fs-project-doc-index' || Id=='fs-ingest-project-doc'].[Id,Filter.Key.FilterRules]"
 ```
 
-Expected: the run's `headSha` is the merge commit and succeeded; `SERVER_BUILD` equals it; `PROJECT_DOCUMENTS` is `true` on all three; the worker lists both the python-docx and the fieldsight-pypdf layers; `MaximumRetryAttempts` 0; both notification entries present with the right prefixes. Read the migrate function's log for `0088_project_documents.sql` applied (`aws logs tail /aws/lambda/fieldsight-test-migrate --since 30m`).
+Expected: the run's `headSha` is the merge commit and succeeded; `SERVER_BUILD` equals it; `PROJECT_DOCUMENTS` is `false` on all three (it becomes `true` after step 6b); the worker lists both the python-docx and the fieldsight-pypdf layers; `MaximumRetryAttempts` 0; both notification entries present with the right prefixes. Read the migrate function's log for `0088_project_documents.sql` applied (`aws logs tail /aws/lambda/fieldsight-test-migrate --since 30m`).
 
 - [ ] **Step 6: Simulate every IAM action (R10)**
 
@@ -5562,6 +5568,15 @@ sim "$WRK" "s3:PutObject" "$B/project_doc_sources/c/d.pdf"     # must be implici
 ```
 
 Expected: every line `allowed`, the last `implicitDeny`. Any other result: fix the template, redeploy, re-simulate before going on.
+
+- [ ] **Step 6b: Only now switch the flag on, and redeploy**
+
+```bash
+gh variable set TEST_PROJECT_DOCUMENTS --body "true"
+gh workflow run deploy.yml --ref develop
+```
+
+Wait for that run (match its `headSha`), then re-read `PROJECT_DOCUMENTS` on org-api, rag-search and ask-agent: all three `true`. Also confirm the TEST bucket's CORS allows `PUT` from the dev Amplify origin before the first browser upload (`aws s3api get-bucket-cors --bucket fieldsight-data-test-509194952652`) -- without it the first upload fails as a 403 that reads like IAM.
 
 - [ ] **Step 7: Frontend PR into dev and the deployed UI points at TEST**
 
