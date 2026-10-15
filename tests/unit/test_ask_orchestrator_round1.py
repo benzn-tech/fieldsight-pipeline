@@ -498,3 +498,16 @@ def test_precheck_timeout_clears_the_measured_latency():
     # (43/123 reasoning tokens at effort low); at 3 s one turn timed out and
     # logged precheck=failed, which silently skips the web for a general question.
     assert orch.PRECHECK_TIMEOUT_S >= 6
+
+
+@pytest.mark.parametrize("channel,scoped,anchored,intent,expected", [
+    ("screen", False, False, False, "offer"),      # the screen opted in to the offer
+    ("screen", True, False, True, "never"),        # scoped still never, even with intent
+    ("screen", False, True, True, "required"),     # intent beats the time anchor
+])
+def test_policy_screen_offer_web(channel, scoped, anchored, intent, expected):
+    assert orch.policy(channel, scoped, anchored, intent, offer_web=True) == expected
+
+
+def test_policy_screen_without_offer_web_stays_auto():
+    assert orch.policy("screen", False, False, False) == "auto"

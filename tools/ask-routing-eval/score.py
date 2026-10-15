@@ -189,14 +189,19 @@ def score_turn(item, result, route):
                 pol in ("auto", "required") and bool(result.get("from_web")))
             checks.append(_check(why, ok, "voice: web offered (or web answer under %s)" % pol))
         else:
-            checks.append(_check(why, pol in ("auto", "required"),
-                                 "policy is auto/required (got %s)" % pol))
-            checks.append(_check(why, bool(result.get("from_web")), "from_web is true"))
+            # The screen sends offer_web (spec 2026-10-16 §6): the web is offered,
+            # never run unasked.
+            checks.append(_check(why, pol == "offer", "policy is offer (got %s)" % pol))
+            checks.append(_check(why, bool(result.get("web_offer")), "web_offer is true"))
+            if pol == "offer":
+                checks.append(_check(why, not result.get("from_web"),
+                                     "no web ran unasked (from_web is falsy)"))
         why.append("note: refs_r=%d" % refs_r)
     elif group == "mixed":
         checks.append(_check(why, refs_r >= 1, "route.refs_r >= 1"))
-        if channel == "voice" and pol == "offer":
-            checks.append(_check(why, bool(result.get("web_offer")), "voice: offer appended"))
+        if pol == "offer":
+            label = "voice: offer appended" if channel == "voice" else "web_offer is true"
+            checks.append(_check(why, bool(result.get("web_offer")), label))
         else:
             checks.append(_check(why, refs_w >= 1, "route.refs_w >= 1"))
     elif group == "explicit_web":

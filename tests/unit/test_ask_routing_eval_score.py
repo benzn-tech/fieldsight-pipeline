@@ -153,13 +153,27 @@ def test_person_or_latest_rules():
 
 # ------------------------------------------------------------------- general
 
-def test_general_screen_needs_web_under_auto_or_required():
+def test_general_screen_passes_on_the_offer():
+    # Spec 2026-10-16 §6: the screen sends offer_web, so a general question is
+    # offered the web, not answered from it (this replaced the auto/required rule).
     it = item("general")
-    assert verdict(it, screen(from_web=True, citations=0), route(policy="auto",
-                                                                 refs_r=0)) == "pass"
-    assert verdict(it, screen(from_web=True), route(policy="required")) == "pass"
-    assert verdict(it, screen(from_web=False), route(policy="auto")) == "fail"
-    assert verdict(it, screen(from_web=True), route(policy="never")) == "fail"
+    assert verdict(it, screen(web_offer=True, citations=0), route(policy="offer",
+                                                                  refs_r=0)) == "pass"
+    assert verdict(it, screen(web_offer=False, citations=0), route(policy="offer",
+                                                                   refs_r=0)) == "fail"
+    assert verdict(it, screen(from_web=True), route(policy="auto")) == "fail"
+    assert verdict(it, screen(from_web=True), route(policy="required")) == "fail"
+    assert verdict(it, screen(web_offer=True), route(policy="never")) == "fail"
+
+
+def test_general_screen_fails_when_the_web_ran_unasked():
+    it = item("general")
+    out = score.score_turn(it, screen(from_web=True, web_offer=True, citations=0),
+                           route(policy="offer", refs_r=0))
+    assert out["verdict"] == "fail"
+    assert any(w.startswith("FAIL") and "web ran unasked" in w for w in out["why"])
+    assert verdict(it, screen(from_web=True, citations=0),
+                   route(policy="offer", refs_r=0)) == "fail"
 
 
 def test_general_voice_passes_on_the_offer():
@@ -174,13 +188,22 @@ def test_general_voice_passes_on_the_offer():
 
 def test_mixed_rules():
     it = item("mixed")
+    # Screen under auto (no offer): the web must have been cited.
     assert verdict(it, screen(from_web=True), route(policy="auto", refs_r=1,
                                                     refs_w=1)) == "pass"
     assert verdict(it, screen(), route(policy="auto", refs_r=1, refs_w=0)) == "fail"
     assert verdict(it, screen(), route(policy="auto", refs_r=0, refs_w=1)) == "fail"
+    # Screen under offer (spec 2026-10-16 §6): records cited plus the offer.
+    assert verdict(it, screen(web_offer=True), route(policy="offer", refs_r=1,
+                                                     refs_w=0)) == "pass"
+    assert verdict(it, screen(), route(policy="offer", refs_r=1, refs_w=0)) == "fail"
+    assert verdict(it, screen(web_offer=True), route(policy="offer", refs_r=0)) == "fail"
+    # Voice is unchanged.
     assert verdict(it, voice(answer="We did. " + score.OFFER_ALSO),
                    route(policy="offer", refs_r=1)) == "pass"
     assert verdict(it, voice(answer="We did."), route(policy="offer", refs_r=1)) == "fail"
+    assert verdict(it, voice(answer="We did.", web=True),
+                   route(policy="required", refs_r=1, refs_w=1)) == "pass"
 
 
 # --------------------------------------------- explicit_web / scoped / web_cap
@@ -219,9 +242,9 @@ def passing_run():
     pd = dict(item("project_day", dates=["2026-09-03"]), id="pd1")
     gen = dict(item("general"), id="g1")
     out = [rec(pd, screen(answer="Poured [1]."), route()) for _ in range(3)]
-    gen_route = route(policy="auto", web_ran=True, refs_r=0, refs_w=1,
-                      ms={"judge": [], "total": 12000})
-    out += [rec(gen, screen(from_web=True, citations=0), gen_route) for _ in range(3)]
+    # Screen general under the offer rule (spec 2026-10-16 §6).
+    gen_route = route(policy="offer", refs_r=0, refs_w=0, ms={"judge": [], "total": 12000})
+    out += [rec(gen, screen(web_offer=True, citations=0), gen_route) for _ in range(3)]
     return out
 
 
@@ -247,10 +270,10 @@ def test_gate_project_needs_three_of_three():
 
 def test_gate_general_two_of_three_is_enough_one_is_not():
     run = passing_run()
-    bad = route(policy="auto", ms={"judge": [], "total": 12000})
-    run[3] = rec(run[3]["item"], screen(from_web=False), bad)
+    bad = route(policy="offer", refs_r=0, ms={"judge": [], "total": 12000})
+    run[3] = rec(run[3]["item"], screen(web_offer=False, citations=0), bad)
     assert score.gate(run)["pass"] is True
-    run[4] = rec(run[4]["item"], screen(from_web=False), bad)
+    run[4] = rec(run[4]["item"], screen(web_offer=False, citations=0), bad)
     g = score.gate(run)
     assert g["pass"] is False and _line(g["lines"], "g1/screen").startswith("FAIL")
 
@@ -308,9 +331,8 @@ def test_gate_p50_latency_lines():
     assert g["pass"] is False
     assert _line(g["lines"], "p50 latency project/screen: 9.0 s").startswith("FAIL")
     run = passing_run()
-    slow = route(policy="auto", web_ran=True, refs_r=0, refs_w=1,
-                 ms={"judge": [], "total": 30000})
-    run[3:] = [rec(run[3]["item"], screen(from_web=True, citations=0), slow)
+    slow = route(policy="offer", refs_r=0, refs_w=0, ms={"judge": [], "total": 30000})
+    run[3:] = [rec(run[3]["item"], screen(web_offer=True, citations=0), slow)
                for _ in range(3)]
     g = score.gate(run)
     assert g["pass"] is False

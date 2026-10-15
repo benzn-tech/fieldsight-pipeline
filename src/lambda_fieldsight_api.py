@@ -186,6 +186,12 @@ def _build_ask_payload(body, caller):
     # sent when truthy; the Ask Agent accepts only JSON true.
     if body.get('scoped'):
         payload['scoped'] = body['scoped']
+    # The screen web opt-in (spec 2026-10-16 ask-screen-web-offer §2): the
+    # same names voice uses, forwarded only as JSON true. Any other value is
+    # dropped and absent stays absent; they carry no identity and no scope.
+    for field in ('offer_web', 'web_intent'):
+        if body.get(field) is True:
+            payload[field] = True
 
     # Same cleaner as the voice route: one set of caps, one set of key names.
     # ABSENT, never an empty list -- see ask_voice, and the agent's

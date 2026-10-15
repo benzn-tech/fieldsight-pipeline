@@ -1350,14 +1350,36 @@ def _rag_answer(body, on_web_start=None):
         # once so the empty-retrieval branch and the pre-synthesis check below
         # cannot drift apart.
         scoped = narrowed or plan["body_date_sent"]
-        # "Search online" only counts on a voice turn that opted into web.
-        _wi = (bool(body.get("web_intent")) and body.get("mode") == "voice"
-               and bool(body.get("voice_web")))
+        _voice = body.get("mode") == "voice"
+        # Screen web offer (spec 2026-10-16 section 3): every screen change hangs
+        # on this. JSON true only, as the API forwards it; a screen body without
+        # it (prod UI, old clients) keeps `_wi` False and behaves as it always has.
+        _screen_opt = (not _voice) and body.get("offer_web") is True
+        _wi_typed = False
+        if _voice:
+            # "Search online" only counts on a voice turn that opted into web.
+            _wi = bool(body.get("web_intent")) and bool(body.get("voice_web"))
+        else:
+            # Screen: an accepted offer (`web_intent`) or the phrase typed, never
+            # on a scoped turn -- the web cannot know that site or day.
+            _wi_typed = (_screen_opt and not scoped
+                         and body.get("web_intent") is not True
+                         and voice_web.detect_intent(question)[0])
+            _wi = (_screen_opt and not scoped
+                   and (body.get("web_intent") is True or _wi_typed))
         # Voice two-phase: instead of going online unasked, say the records do not
         # cover it and offer (spec 2026-10-15 voice offer). An explicit "search
-        # online" (`_wi`) is the caller's answer to that offer, so it wins.
-        _offer = (body.get("mode") == "voice" and bool(body.get("offer_web"))
-                  and not _wi)
+        # online" (`_wi`) is the caller's answer to that offer, so it wins. The
+        # screen offers the same way once it opted in.
+        _offer = ((_voice and bool(body.get("offer_web")) and not _wi)
+                  or (_screen_opt and not scoped and not _wi))
+        _offer_text = (voice_web.OFFER_NO_RECORDS if _voice
+                       else voice_web.SCREEN_OFFER_NO_RECORDS)
+        # What the web sees. The voice worker strips the phrase before this
+        # point; a typed screen phrase is stripped here. Retrieval, the rewrite
+        # and the records prompt keep `question` / `asked`.
+        web_question = (voice_web.detect_intent(question)[1] if _wi_typed
+                        else question)
         _append_offer = False
         # A question that names its own time ("yesterday", "last week") is about
         # what the team recorded then, on either channel: it never runs the
@@ -1398,7 +1420,7 @@ def _rag_answer(body, on_web_start=None):
                     # Nothing retrieved and the web is available: offer it, spend
                     # no web call and no classification.
                     return {
-                        "answer": voice_web.OFFER_NO_RECORDS,
+                        "answer": _offer_text,
                         "web_offer": True,
                         "grounded": True,
                         "citations": [],
@@ -1417,7 +1439,7 @@ def _rag_answer(body, on_web_start=None):
                         _cls = _classify_for_route(web_answer, asked, [], False,
                                                    _started, route)
                     _announce_web_start(on_web_start)
-                    empty_web = _general_run(web_answer, question, _cls, [],
+                    empty_web = _general_run(web_answer, web_question, _cls, [],
                                              _started, route,
                                              voice=body.get("mode") == "voice")
                     marks["synthesis"] = time.monotonic() - _t_web
@@ -1638,7 +1660,7 @@ def _rag_answer(body, on_web_start=None):
                     # Records cannot answer it (including a distance-gated set):
                     # no synthesis, no web, just the offer.
                     return {
-                        "answer": voice_web.OFFER_NO_RECORDS,
+                        "answer": _offer_text,
                         "web_offer": True,
                         "grounded": True,
                         "citations": [],
@@ -1653,7 +1675,7 @@ def _rag_answer(body, on_web_start=None):
             if _run_general:
                 _announce_web_start(on_web_start)
             with ThreadPoolExecutor(max_workers=2) as _pool:
-                _fut_web = (_pool.submit(_general_run, web_answer, question, _cls,
+                _fut_web = (_pool.submit(_general_run, web_answer, web_question, _cls,
                                          chunks, _started, route,
                                          voice=body.get("mode") == "voice")
                             if _run_general else None)
@@ -1723,7 +1745,7 @@ def _rag_answer(body, on_web_start=None):
                     try:
                         import web_answer
                         _merged = web_answer.compose(
-                            _grounded[0], web, question,
+                            _grounded[0], web, web_question,
                             web_answer.HARD_STOP_SECONDS - (time.monotonic() - _started),
                             voice=body.get("mode") == "voice")
                     except Exception as _cmp_exc:            # noqa: BLE001
@@ -1929,7 +1951,9 @@ def _rag_answer(body, on_web_start=None):
         # reorder here without also renumbering the prompt. See _build_citations.
         citations = _build_citations(chunks)
 
-        if _append_offer:
+        # Voice speaks the offer; the screen's button is the offer, so the
+        # screen gets the `web_offer` flag below and no appended text.
+        if _append_offer and _voice:
             answer = (answer or "").rstrip() + " " + voice_web.OFFER_ALSO
 
         return {

@@ -543,12 +543,15 @@ def test_offer_is_ignored_when_the_caller_said_search_online(monkeypatch):
     assert "general" in rig.events
 
 
-def test_offer_web_is_ignored_on_screen(monkeypatch):
+def test_offer_web_on_screen_offers_instead_of_searching(monkeypatch):
+    # Was test_offer_web_is_ignored_on_screen (#1122). Since spec 2026-10-16
+    # ask-screen-web-offer the screen honours offer_web too; without it the
+    # screen still goes online (test_ask_screen_web_offer_legacy.py).
     rig = wire(monkeypatch, kind="general", records_answer=False, web=WEB_OK)
     out = ask(rig.cb(), offer_web=True)
-    assert out["from_web"] is True
-    assert "web_offer" not in out
-    assert "general" in rig.events
+    assert out.get("web_offer") is True
+    assert not out.get("from_web")
+    assert "general" not in rig.events
 
 
 def test_without_offer_web_a_general_question_still_goes_online(monkeypatch):

@@ -94,9 +94,12 @@ def selection(items, channel, only):
     return out
 
 
-def turn_cost(group):
+def turn_cost(group, channel):
+    """Model calls one turn may cost. The screen sends `offer_web` (spec
+    2026-10-16 §6), so a screen `general` turn is offered the web instead of
+    running it: no web calls."""
     cost = PRECHECK_CALLS + JUDGE_CALLS
-    if group in WEB_GROUPS:
+    if group in WEB_GROUPS and not (channel == "screen" and group == "general"):
         cost += WEB_CALLS
     if group in MULTI_ROUND_GROUPS:
         cost += MULTI_ROUND_CALLS
@@ -107,7 +110,7 @@ def estimate(sel, repeat):
     """Model calls per channel (rounded up) and in total."""
     per = {}
     for it, ch in sel:
-        per[ch] = per.get(ch, 0) + turn_cost(it["group"]) * repeat
+        per[ch] = per.get(ch, 0) + turn_cost(it["group"], ch) * repeat
     out = {ch: int(math.ceil(v)) for ch, v in per.items()}
     out["total"] = sum(out.values())
     return out
@@ -153,9 +156,15 @@ def visible_site(lam, stack, sub):
 
 def screen_turn(lam, fn, sub, item, site_id, *, clock=time.monotonic, sleep=time.sleep):
     """(turn_id, terminal, wall_s). terminal["status"] is done/error/cancelled,
-    or the harness's own start_error / http_error / timeout."""
+    or the harness's own start_error / http_error / timeout.
+
+    The body opts in to the web offer (`offer_web`, spec 2026-10-16 §6), as the
+    screen client does; an `explicit_web` item also sends `web_intent`, as a
+    click on the offer would."""
     t0 = clock()
-    body = {"question": item["question"], "tz": TZ}
+    body = {"question": item["question"], "tz": TZ, "offer_web": True}
+    if item.get("group") == "explicit_web":
+        body["web_intent"] = True
     if (item.get("body") or {}).get("site_id") == VISIBLE_SITE:
         body["site_id"] = site_id
     code, st = _call(lam, fn, api_event(sub, "POST", "/api/ask/start", body=body))
@@ -352,6 +361,8 @@ def main(argv=None, *, make_clients=None, clock=time.monotonic, sleep=time.sleep
                 rec = {"item": it, "channel": ch, "rep": rep, "turn_id": turn,
                        "terminal": term, "result": score.normalize(ch, term),
                        "wall_s": round(wall, 2)}
+                if ch == "screen":
+                    rec["offer_web"] = True
                 print("  %s/%s rep%d turn=%s status=%s %.1fs"
                       % (it["id"], ch, rep, turn, term.get("status"), wall))
                 batch.append(rec)
