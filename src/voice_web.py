@@ -13,6 +13,12 @@ import re
 
 NO_CLEAR_ANSWER = "I couldn't get a clear answer online for that."
 
+# Spoken when the records cannot answer a general question and the web is offered
+# instead of being used unasked (spec 2026-10-15 voice offer, section 4.1).
+OFFER_NO_RECORDS = "Your site records don't cover that. Want me to search online?"
+OFFER_ALSO = "Want me to check online as well?"
+DECLINED = "Okay."
+
 # Appended to the web_answer prompts when the answer will be read out by a device.
 # The [n] exemption is there because compose() rejects any output that drops the
 # records answer's citation markers, so telling the model to drop symbols would
@@ -78,3 +84,61 @@ def speakable(text) -> bool:
     if re.search(r"^\s*[-*•]\s", text, re.M):
         return False
     return len(text.split()) <= 60
+
+
+# --- Replies to an offer ("Want me to search online?") ---------------------
+# Phrases are matched longest first so "go ahead" counts as one yes, not two
+# filler words. Every word of a reply must be in one of the three sets, so a
+# real question that merely starts with "yes" is never swallowed.
+_YES_PHRASES = (("look", "it", "up"), ("go", "ahead"), ("do", "it"),
+                ("search", "it"), ("search", "online"))
+_NO_PHRASES = (("never", "mind"),)
+_YES_WORDS = frozenset("yes yeah yep yup sure".split())
+_NO_WORDS = frozenset("no nope nah cancel stop don't dont".split())
+_FILLER = frozenset(
+    "please thanks thank you ok okay it that go ahead do search online look up for".split())
+_REPLY_MAX_WORDS = 6
+_REPLY_STRIP = re.compile(r"[^\w\s']")
+
+
+def reply_kind(transcript: str):
+    """'yes' / 'no' for a short reply to the web offer, else None.
+
+    Model-free. Filler alone ("thank you", "okay") is None: right after an
+    answer that is far more likely a new question than a yes or a no."""
+    if not isinstance(transcript, str):
+        return None
+    words = _REPLY_STRIP.sub(" ", transcript.lower()).split()
+    if not words or len(words) > _REPLY_MAX_WORDS:
+        return None
+    yes = no = False
+    i = 0
+    while i < len(words):
+        for phrases, kind in ((_YES_PHRASES, "yes"), (_NO_PHRASES, "no")):
+            hit = next((p for p in phrases if tuple(words[i:i + len(p)]) == p), None)
+            if hit:
+                yes, no = yes or kind == "yes", no or kind == "no"
+                i += len(hit)
+                break
+        else:
+            w = words[i]
+            if w in _YES_WORDS:
+                yes = True
+            elif w in _NO_WORDS:
+                no = True
+            elif w not in _FILLER:
+                return None
+            i += 1
+    if yes == no:
+        return None
+    return "yes" if yes else "no"
+
+
+def is_bare_search_request(transcript: str) -> bool:
+    """True for a "search online" with nothing to search for ("Search online.").
+
+    With an offer live that is a yes on the offered question; with a real
+    remainder it is an ordinary web-intent question."""
+    if not isinstance(transcript, str) or not _INTENT.search(transcript):
+        return False
+    return detect_intent(transcript)[1] == transcript
