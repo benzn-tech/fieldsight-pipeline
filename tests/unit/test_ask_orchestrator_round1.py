@@ -9,6 +9,7 @@ Task 6 contract exactly: `execute(calls, ctx) -> [{"tool","id","items","meta"}]`
 `meta.truncated` always set), `ToolContext` with the companion's seven fields,
 and a `RefAssigner` with the same dedupe and independent R/W counters.
 """
+import json
 import logging
 import threading
 import time
@@ -470,3 +471,23 @@ def test_hung_records_batch_is_bounded_by_the_answer_reserve(no_model):
     assert route["records_late"] is True
     assert [e["meta"]["error"] for e in envs] == ["timeout"]
     assert envs[0]["tool"] == "search_records" and envs[0]["round"] == 1
+
+
+def test_a_late_records_thread_never_writes_the_route(no_model):
+    release = threading.Event()
+
+    def rows(call):
+        if call["name"] == "day_overview" and call["args"]["date_from"] == "2026-10-14":
+            return [], {"latest_before": {"date": "2026-10-12", "from": "topics"}}
+        return [], {}
+    tools = FakeTools(rows, before=lambda calls: release.wait(5))
+    route = {}
+    try:
+        orch.run_round1(_req(q_from="2026-10-14", q_to="2026-10-14"),
+                        _ctx(deadline_in=orch.FINAL_RESERVE_S + 0.3), tools, route=route)
+        snapshot = json.dumps(route, sort_keys=True)
+    finally:
+        release.set()
+    time.sleep(0.3)
+    assert json.dumps(route, sort_keys=True) == snapshot
+    assert route["calls"] == [["day_overview", "search_records"]]

@@ -150,7 +150,7 @@ def test_two_round_tool_request(monkeypatch):
 
 def test_forced_final_on_a_short_deadline(monkeypatch):
     precheck_says(monkeypatch, "no")
-    monkeypatch.setattr(orch, "DEADLINE_S", {"screen": 12.0, "voice": 12.0})
+    monkeypatch.setattr(orch, "DEADLINE_S", {"screen": 16.0, "voice": 16.0})
     chat = ScriptChat(final("B2 [R1]."))
     t0 = orch._clock()
     out = run(body(), chat)
@@ -161,7 +161,8 @@ def test_forced_final_on_a_short_deadline(monkeypatch):
     names = [t["function"]["name"] for t in call["tools"]]
     assert "final_answer" in names and "day_overview" in names and "search_records" in names
     assert any("answer now" in (m.get("content") or "").lower() for m in call["messages"])
-    assert call["deadline"] <= t0 + 12.0 + 0.5
+    # The fallback synthesis keeps its own reserve after a forced final.
+    assert call["deadline"] <= t0 + 16.0 - orch.FALLBACK_RESERVE_S + 0.5
     assert out["answer"] == "B2 [1]."
 
 
@@ -170,7 +171,8 @@ def test_non_final_judge_calls_keep_the_answer_reserve(monkeypatch):
     chat = ScriptChat(final("x [R1]"))
     t0 = orch._clock()
     run(body(), chat)
-    assert chat.calls[0]["deadline"] <= t0 + orch.DEADLINE_S["screen"] - orch.FINAL_RESERVE_S + 0.5
+    assert chat.calls[0]["deadline"] <= (t0 + orch.DEADLINE_S["screen"] - orch.FINAL_RESERVE_S
+                                         - orch.FALLBACK_RESERVE_S + 0.5)
 
 
 def test_four_call_cap(monkeypatch):
@@ -228,7 +230,8 @@ def test_judge_web_search_runs_once_with_the_original_question(monkeypatch):
     out = run(body("What concrete cover for B2?"), chat, states=states)
     assert seen == ["What concrete cover for B2?"]
     assert "searching_web" in states
-    assert "web_search" not in [t["function"]["name"] for t in chat.calls[1]["tools"]]
+    # Still offered after it ran (the history names it); a second call is refused.
+    assert "web_search" in [t["function"]["name"] for t in chat.calls[1]["tools"]]
     assert out["from_web"] is True
     assert [s["url"] for s in out["web"]["sources"]] == ["https://s0.nz/p"]
 
@@ -480,7 +483,7 @@ def test_on_state_failure_never_breaks_the_turn(monkeypatch):
 
 def test_forced_final_turn_that_calls_another_tool_falls_back(monkeypatch, caplog):
     precheck_says(monkeypatch, "no")
-    monkeypatch.setattr(orch, "DEADLINE_S", {"screen": 12.0, "voice": 12.0})
+    monkeypatch.setattr(orch, "DEADLINE_S", {"screen": 16.0, "voice": 16.0})
     monkeypatch.setattr(llm_utils, "call_llm", lambda prompt, **kw: ("Synth [1].", None))
     chat = ScriptChat(calls(("search_records", {"query": "more"})))
     tools = FakeTools(_rows)
@@ -510,3 +513,191 @@ def test_screen_required_web_query_drops_look_it_up_online(monkeypatch):
     chat = ScriptChat(final("x [W1]", basis="web"))
     run(body("look it up online: what cover does NZS 3101 require"), chat)
     assert seen == ["what cover does NZS 3101 require"]
+
+
+# ======================================================== final review fixes
+
+# ---- finding 1: the fallback keeps a reserve, and never says a false "nothing"
+
+def test_no_time_for_a_forced_final_goes_straight_to_the_fallback(monkeypatch, caplog):
+    precheck_says(monkeypatch, "no")
+    monkeypatch.setattr(orch, "DEADLINE_S", {"screen": 10.0, "voice": 10.0})
+    seen = {}
+
+    def fake_llm(prompt, **kw):
+        seen["deadline"] = kw["deadline"]
+        return "Synth [1].", None
+    monkeypatch.setattr(llm_utils, "call_llm", fake_llm)
+    chat = ScriptChat()
+    with caplog.at_level(logging.INFO):
+        out = run(body(), chat)
+    assert chat.calls == []
+    assert out["answer"] == "Synth [1]."
+    assert seen["deadline"] > 5
+    assert _route(caplog)["fallback"] == "no_time_for_final"
+
+
+def test_failed_synthesis_with_records_is_an_error_not_no_records(monkeypatch):
+    precheck_says(monkeypatch, "no")
+    monkeypatch.setattr(llm_utils, "call_llm", lambda prompt, **kw: (None, "deadline"))
+    out = run(body(), ScriptChat(ChatTurn(error="deadline", timed_out=True)))
+    assert out["error"] == "No answer" and out["answer"] == ""
+    assert out["citations"] == []
+
+
+# ---- finding 2 + 7: web_search stays offered; invented names are fixed
+
+def test_web_search_is_offered_on_the_first_judge_call_after_round1_web(monkeypatch):
+    monkeypatch.setattr(web_answer, "general_answer", lambda q, b, **kw: _block())
+    chat = ScriptChat(final("x [W1]", basis="web"))
+    run(body("What does NZS 3101 say? search online"), chat)
+    names = [t["function"]["name"] for t in chat.calls[0]["tools"]]
+    assert "web_search" in names
+    assert "once per turn" in chat.calls[0]["messages"][0]["content"]
+
+
+def test_second_web_search_is_not_allowed_and_counts_as_a_bad_round(monkeypatch):
+    seen = []
+    monkeypatch.setattr(web_answer, "general_answer",
+                        lambda q, b, **kw: seen.append(q) or _block())
+    again = calls(("web_search", {}))
+    chat = ScriptChat(again, again, final("x [W1]", basis="web"))
+    run(body("What does NZS 3101 say? search online"), chat)
+    assert len(seen) == 1
+    tool_msgs = [m["content"] for m in chat.calls[1]["messages"] if m["role"] == "tool"]
+    assert any("error: not_allowed" in c for c in tool_msgs)
+    assert chat.calls[2]["tool_choice"] == orch.FORCE_FINAL
+
+
+def test_invented_tool_name_never_reaches_history_or_log(monkeypatch, caplog):
+    precheck_says(monkeypatch, "no")
+    chat = ScriptChat(calls(("drop_table_users", {"x": 1})), final("x [R1]"))
+    tools = FakeTools(_rows)
+    with caplog.at_level(logging.INFO):
+        run(body(), chat, tools=tools)
+    assert len(tools.batches) == 1
+    msgs = chat.calls[1]["messages"]
+    names = [tc["function"]["name"] for m in msgs if m["role"] == "assistant"
+             for tc in m["tool_calls"]]
+    assert "drop_table_users" not in json.dumps(msgs)
+    assert "unknown_tool" in names
+    assert any("error: bad_args" in m["content"] for m in msgs if m["role"] == "tool")
+    assert "drop_table_users" not in caplog.text
+    assert _route(caplog)["calls"][-1] == ["unknown_tool"]
+
+
+def test_web_search_where_it_is_not_offered_is_an_unknown_tool(monkeypatch):
+    chat = ScriptChat(calls(("web_search", {})), final("B2 [R1]."))
+    run(voice_body(), chat, channel="voice")
+    names = [tc["function"]["name"] for m in chat.calls[1]["messages"]
+             if m["role"] == "assistant" for tc in m["tool_calls"]]
+    assert "web_search" not in names and "unknown_tool" in names
+
+
+# ---- finding 4: late threads cannot write after the turn
+
+def test_on_state_is_closed_once_the_turn_returns(monkeypatch):
+    import threading
+    import time as _time
+    release = threading.Event()
+
+    def slow_precheck(*a, **k):
+        release.wait(5)
+        return corroboration_client.Reply(text='{"web": "yes"}')
+    monkeypatch.setattr(corroboration_client, "call", slow_precheck)
+    monkeypatch.setattr(web_answer, "general_answer", lambda q, b, **kw: _block())
+    monkeypatch.setattr(orch, "WEB_WAIT_S", 0.2)
+    states = []
+    try:
+        run(body(), ScriptChat(final("x [R1]")), states=states)
+        n = len(states)
+    finally:
+        release.set()
+    _time.sleep(0.3)
+    assert "searching_web" not in states and len(states) == n
+
+
+def test_refs_are_assigned_through_a_lock(monkeypatch):
+    precheck_says(monkeypatch, "no")
+    seen = []
+    tools = FakeTools(_rows, before=lambda calls: None)
+    real = tools.execute
+
+    def spy(calls_, ctx):
+        seen.append(ctx.refs)
+        return real(calls_, ctx)
+    tools.execute = spy
+    run(body(), ScriptChat(final("x [R1]")), tools=tools)
+    assert isinstance(seen[0], orch._LockedRefs)
+
+
+# ---- finding 5: the guard also reads what was actually cited
+
+def test_guard_fires_on_cited_web_even_when_basis_says_records(monkeypatch, caplog):
+    monkeypatch.setattr(web_answer, "general_answer",
+                        lambda q, b, **kw: _block(answer="Use 40 mm.", n_sources=1))
+    monkeypatch.setattr(llm_utils, "call_llm", lambda prompt, **kw: ("Records [1].", None))
+    site = "0f8f5c55-1111-4222-8333-944444444444"
+    chat = ScriptChat(final("Use 40 mm [W1].", basis="records"))
+    with caplog.at_level(logging.INFO):
+        out = run(voice_body("How much cover on this site?", web_intent=True, site_id=site),
+                  chat, channel="voice")
+    route = _route(caplog)
+    assert route["guard"] is True and route["basis"] == "records"
+    assert not out.get("from_web")
+
+
+# ---- finding 8: grounded means an R ref was cited (spec §6.7)
+
+def test_grounded_is_false_without_a_cited_r_ref(monkeypatch):
+    precheck_says(monkeypatch, "no")
+    out = run(body(), ScriptChat(final("Nothing recorded about that.", basis="none")))
+    assert out["grounded"] is False
+    out = run(body(), ScriptChat(final("Poured [R1].")))
+    assert out["grounded"] is True
+
+
+# ---- finding 9: bad_args by position when ids are empty or repeated
+
+def test_bad_args_with_empty_ids_marks_only_the_unparsed_call(monkeypatch):
+    precheck_says(monkeypatch, "no")
+    turn = ChatTurn(tool_calls=[{"id": "", "name": "search_records", "arguments": {}},
+                                {"id": "", "name": "search_records",
+                                 "arguments": {"query": "pour"}}],
+                    bad_args=[""])
+    tools = FakeTools(_rows)
+    chat = ScriptChat(turn, final("x [R1]"))
+    run(body(), chat, tools=tools)
+    assert tools.batches[1] == [{"name": "search_records", "args": {"query": "pour"}}]
+
+
+def test_bad_final_answer_with_a_duplicate_id_is_judged_by_its_own_arguments(monkeypatch):
+    precheck_says(monkeypatch, "no")
+    turn = ChatTurn(tool_calls=[{"id": "a", "name": "search_records", "arguments": {}},
+                                {"id": "a", "name": "final_answer",
+                                 "arguments": {"answer": "Poured [R1].", "basis": "records"}}],
+                    bad_args=["a"])
+    out = run(body(), ScriptChat(turn))
+    assert out["answer"] == "Poured [1]."
+
+
+# ---- finding 10: the deadline follows ASK_DEADLINE_SECONDS
+
+def test_deadline_follows_the_env_and_is_capped_per_channel(monkeypatch):
+    precheck_says(monkeypatch, "no")
+    monkeypatch.setenv("ASK_DEADLINE_SECONDS", "18")
+    chat = ScriptChat(final("x [R1]"))
+    t0 = orch._clock()
+    run(body(), chat)
+    assert chat.calls[0]["tool_choice"] == orch.FORCE_FINAL
+    assert chat.calls[0]["deadline"] <= t0 + 18 - orch.FALLBACK_RESERVE_S + 0.5
+
+    monkeypatch.setenv("ASK_DEADLINE_SECONDS", "90")
+    chat = ScriptChat(final("x [R1]"))
+    t0 = orch._clock()
+    run(body(), chat)
+    assert chat.calls[0]["deadline"] <= (t0 + orch.DEADLINE_S["screen"] - orch.FINAL_RESERVE_S
+                                         - orch.FALLBACK_RESERVE_S + 0.5)
+
+    monkeypatch.setenv("ASK_DEADLINE_SECONDS", "junk")
+    assert orch._deadline_s("voice") == orch.DEADLINE_S["voice"]

@@ -403,6 +403,10 @@ def guard_basis(judge_basis, time_anchored, scoped) -> bool:
 # always kept back for the final answer call.
 WEB_WAIT_S = 25.0
 FINAL_RESERVE_S = 8.0
+# Kept back after the final answer turn for the records-only fallback synthesis
+# (spec §6.8): a forced final that times out must still leave it time to run.
+FALLBACK_RESERVE_S = 6.0
+ANSWER_RESERVE_S = FINAL_RESERVE_S + FALLBACK_RESERVE_S
 PRECHECK_TIMEOUT_S = 3
 
 # "last / latest / when did / most recent": the question asks for the most
@@ -563,8 +567,11 @@ def _tag(envs, calls, rnd):
     return out
 
 
-def _records_round1(calls, ctx, tools, scope, route):
+def _records_round1(calls, ctx, tools, scope):
+    """(envelopes, call names, round-1b ran). Writes nothing shared: a late run
+    of this thread must not touch the turn's route after the turn moved on."""
     envs = _tag(tools.execute(calls, ctx), calls, 1)
+    ran_1b = False
     names = [c["name"] for c in calls]
     # Round 1b (spec §6.3): an empty day that knows its latest earlier day gets
     # that day's overview at once, with no model in between. Once only.
@@ -579,24 +586,25 @@ def _records_round1(calls, ctx, tools, scope, route):
                    "args": {"date_from": day, "date_to": day, **_scope_args(scope)}}]
         envs += _tag(tools.execute(follow, ctx), follow, 1)
         names.append("day_overview")
-        route["round1b"] = True
+        ran_1b = True
         break
-    route["calls"] = [names]
-    return envs
+    return envs, names, ran_1b
 
 
 def _web_left(ctx, t0):
     return min(WEB_WAIT_S - (ctx.clock() - t0),
-               ctx.deadline - ctx.clock() - FINAL_RESERVE_S)
+               ctx.deadline - ctx.clock() - ANSWER_RESERVE_S)
 
 
-def _web_round1(question, pol, ctx, voice, t0, route, on_web_start):
+def _web_round1(question, pol, ctx, voice, t0, wstate, on_web_start):
+    """Writes only `wstate`, a dict private to this round; the main thread copies
+    it into the route when (and only if) the result is collected in time."""
     if pol == "auto":
         verdict = precheck(question, _web_left(ctx, t0))
-        route["precheck"] = {True: "yes", False: "no", None: "failed"}[verdict]
+        wstate["precheck"] = {True: "yes", False: "no", None: "failed"}[verdict]
         if not verdict:
             return None
-    route["web_ran"] = True
+    wstate["web_ran"] = True
     if on_web_start is not None:
         try:
             on_web_start()
@@ -629,21 +637,26 @@ def run_round1(req, ctx, tools=None, *, route=None, on_web_start=None):
     calls = round1_calls(asked, req.get("q_from"), req.get("q_to"), req.get("scope"))
     voice = req.get("channel") == "voice"
 
+    wstate = {}
     pool = ThreadPoolExecutor(max_workers=2)
     try:
-        rec = pool.submit(_records_round1, calls, ctx, tools, req.get("scope"), route)
+        rec = pool.submit(_records_round1, calls, ctx, tools, req.get("scope"))
         web = None
         if pol in ("auto", "required"):
-            web = pool.submit(_web_round1, req.get("question"), pol, ctx, voice, t0, route,
+            web = pool.submit(_web_round1, req.get("question"), pol, ctx, voice, t0, wstate,
                               on_web_start)
         # Bounded: the shared boto3 Lambda client has the default 60 s read
         # timeout and retries, so a hung rag-search must not hold the turn past
         # the answer reserve (and into the worker's 60 s kill).
         try:
-            envelopes = rec.result(
-                timeout=max(0.0, ctx.deadline - ctx.clock() - FINAL_RESERVE_S))
+            envelopes, names, ran_1b = rec.result(
+                timeout=max(0.0, ctx.deadline - ctx.clock() - ANSWER_RESERVE_S))
+            route["calls"] = [names]
+            if ran_1b:
+                route["round1b"] = True
         except FuturesTimeout:
             route["records_late"] = True
+            route["calls"] = [[c["name"] for c in calls]]
             logger.warning("ask orch records_late=true")
             envelopes = [{"tool": c["name"], "id": str(i), "items": [],
                           "meta": {"error": "timeout", "truncated": False},
@@ -653,8 +666,14 @@ def run_round1(req, ctx, tools=None, *, route=None, on_web_start=None):
         if web is not None:
             try:
                 web_env = web.result(timeout=max(0.0, _web_left(ctx, t0)))
+                route.update(dict(wstate))
             except FuturesTimeout:
+                route.update(dict(wstate))
                 route["web_late"] = True
+                # It may still start: never allow a second web call this turn.
+                route["web_ran"] = True
+                if pol == "auto" and "precheck" not in wstate:
+                    route["precheck"] = "late"
                 logger.info("ask orch web_late=true")
                 web_env = {"tool": "web_search", "id": "web", "items": [],
                            "meta": {"status": "failed", "error": "timeout"}}
@@ -675,12 +694,40 @@ DEADLINE_S = {"screen": 40.0, "voice": 45.0}
 MAX_ROUNDS = 3                 # round 1 included (spec §6.4)
 MAX_CALLS_PER_ROUND = 4
 MIN_ROUND_LEFT_S = 14.0        # >= 6 s for the tools + the 8 s answer reserve
+# A further round also needs FALLBACK_RESERVE_S on top; a forced final needs
+# ANSWER_RESERVE_S (final + fallback) to start at all, else the fallback runs now.
+UNKNOWN_TOOL = "unknown_tool"
 MAX_BAD_ROUNDS = 2
 FALLBACK_MAX_CHUNKS = 12
 NO_RECORDS = "No relevant records found for this question."
 
 # A test seam for the deadline arithmetic; production is time.monotonic.
 _clock = time.monotonic
+
+
+def _deadline_s(channel):
+    """The turn's budget: the worker's ASK_DEADLINE_SECONDS, capped at the
+    channel's spec value (screen 40, voice 45), which is also the default."""
+    cap = DEADLINE_S["voice" if channel == "voice" else "screen"]
+    try:
+        v = float(os.environ.get("ASK_DEADLINE_SECONDS", ""))
+    except ValueError:
+        return cap
+    if v != v or v <= 0:
+        return cap
+    return min(v, cap)
+
+
+class _LockedRefs:
+    """The turn's RefAssigner behind a lock this module owns: a late round-1
+    thread (records or web) may still assign while a judge round does."""
+
+    def __init__(self, inner):
+        self._inner, self._lock = inner, threading.Lock()
+
+    def assign(self, kind, ident, prefix="R"):
+        with self._lock:
+            return self._inner.assign(kind, ident, prefix)
 
 FINAL_ANSWER_TOOL = {
     "name": "final_answer",
@@ -730,7 +777,7 @@ _SYSTEM = """You are FieldSight's Ask assistant for construction teams in New Ze
 Cite exactly as the DATA lines name them: one ref as [R3], several as [R1, R2], a web ref as [W2]. Cite only refs that appear in the DATA blocks.
 
 ## Finishing
-Call more tools only when evidence you need is missing (at most {max_rounds} rounds of tools in all, round 1 included). Otherwise call final_answer with answer, basis (records, web, mixed or none) and offer_web.{offer_rule}"""
+Call more tools only when evidence you need is missing (at most {max_rounds} rounds of tools in all, round 1 included).{web_rule} Otherwise call final_answer with answer, basis (records, web, mixed or none) and offer_web.{offer_rule}"""
 
 _CHANNEL_RULES = {
     "voice": ("The answer is spoken aloud by a device. One or two short spoken sentences, "
@@ -751,12 +798,15 @@ class _States:
 
     def __init__(self, cb):
         self.cb, self.last, self.lock = cb, None, threading.Lock()
+        # Set once the turn has returned: a late web thread must not write a
+        # progress state after the worker wrote `done`.
+        self.closed = False
 
     def __call__(self, status):
         if self.cb is None:
             return
         with self.lock:
-            if status == self.last:
+            if self.closed or status == self.last:
                 return
             self.last = status
         try:
@@ -772,6 +822,8 @@ def _fn(tool):
 def _system_prompt(today, channel, pol):
     import answer_language
     text = _SYSTEM.format(
+        web_rule=(" web_search can run once per turn." if pol in ("auto", "required")
+                  else ""),
         today=today.isoformat() if today else "unknown (the request carried no usable time zone)",
         channel_rules=_CHANNEL_RULES["voice" if channel == "voice" else "screen"],
         max_rounds=MAX_ROUNDS,
@@ -815,15 +867,37 @@ def _err_env(name, args, error, rnd, field=None):
             "args": dict(args) if isinstance(args, dict) else {}, "round": rnd}
 
 
+def _bad_indices(turn):
+    """Positions of the calls whose arguments did not parse. `bad_args` names
+    call ids; an id that is empty or shared by several calls cannot say which
+    call it was, so there the parsed-to-{} arguments decide."""
+    bad = set(turn.bad_args or [])
+    if not bad:
+        return set()
+    tcs = list(turn.tool_calls or [])
+    ids = [tc.get("id") or "" for tc in tcs]
+    out = set()
+    for i, tc in enumerate(tcs):
+        cid = ids[i]
+        if cid not in bad:
+            continue
+        if cid and ids.count(cid) == 1:
+            out.add(i)
+        elif not tc.get("arguments"):
+            out.add(i)
+    return out
+
+
 def _final_of(turn):
     """The final answer in a judge turn: a dict, "bad" for an unusable
     final_answer call, or None when the turn asks for tools. A text-only reply
     is the final answer (spec §5)."""
-    for tc in turn.tool_calls or []:
+    bad = _bad_indices(turn)
+    for i, tc in enumerate(turn.tool_calls or []):
         if tc.get("name") != "final_answer":
             continue
         args = tc.get("arguments") or {}
-        if (tc.get("id") in (turn.bad_args or []) or not isinstance(args.get("answer"), str)
+        if (i in bad or not isinstance(args.get("answer"), str)
                 or not args["answer"].strip()):
             return "bad"
         basis = args.get("basis")
@@ -914,7 +988,12 @@ def _fallback(t, reason, shown):
             for card, it in zip(cards, items):
                 card["time_start"] = card.get("time_start") or it.get("time_start")
             return t.result(answer, cards, cited=items)
+        # Records exist but could not be written up: saying "no records" would
+        # be false, so the turn ends as an error (the worker writes `error`).
         t.route["fallback"] = reason + "+no_synthesis"
+        return {"answer": "", "error": "No answer", "citations": [],
+                "applied_scope": t.applied_scope,
+                "asked": t.asked if t.rewritten else None}
     text = NO_RECORDS
     day = _latest_before(shown)
     if day:
@@ -925,26 +1004,31 @@ def _fallback(t, reason, shown):
 def _judge_round(t, turn, ctx, tools, states, rnd):
     """Run the tools one judge turn asked for. Returns (batch, all_bad)."""
     names = {tool["name"] for tool in tools.TOOLS}
+    web_offered = t.pol in ("auto", "required")
     slots, records = [], []
     tcs = list(turn.tool_calls or [])
+    bad = _bad_indices(turn)
     for i, tc in enumerate(tcs):
         name, args = tc.get("name"), tc.get("arguments") or {}
-        if i >= MAX_CALLS_PER_ROUND:
+        offered = name in names or (name == "web_search" and web_offered)
+        if not offered:
+            # Invented (or not offered) names never reach the history or the
+            # log verbatim: the call is answered under a fixed name.
+            slots.append(_err_env(UNKNOWN_TOOL, {}, "bad_args", rnd, field="name"))
+        elif i >= MAX_CALLS_PER_ROUND:
             slots.append(_err_env(name, args, "dropped", rnd, field="max_4_calls_per_round"))
-        elif tc.get("id") in (turn.bad_args or []):
+        elif i in bad:
             slots.append(_err_env(name, args, "bad_args", rnd, field="arguments"))
         elif name == "web_search":
-            if t.pol in ("auto", "required") and not t.route.get("web_ran"):
+            if not t.route.get("web_ran"):
                 slots.append("web")
             else:
                 slots.append(_err_env(name, {}, "not_allowed", rnd))
-        elif name not in names:
-            slots.append(_err_env(name, args, "bad_args", rnd, field="name"))
         else:
             slots.append(len(records))
             records.append({"name": name, "args": dict(args)})
 
-    judge_ctx = dataclasses.replace(ctx, deadline=t.deadline - FINAL_RESERVE_S)
+    judge_ctx = dataclasses.replace(ctx, deadline=t.deadline - ANSWER_RESERVE_S)
     rec_envs = []
     if records:
         states("searching_records")
@@ -954,7 +1038,7 @@ def _judge_round(t, turn, ctx, tools, states, rnd):
         if slot == "web":
             states("searching_web")
             t.route["web_ran"] = True
-            env = web_tool(t.web_question, max(0.0, t.deadline - FINAL_RESERVE_S - _clock()),
+            env = web_tool(t.web_question, max(0.0, t.deadline - ANSWER_RESERVE_S - _clock()),
                            t.voice, ctx.refs)
             env = dict(env, round=rnd)
             t.web_env = env
@@ -965,8 +1049,8 @@ def _judge_round(t, turn, ctx, tools, states, rnd):
                                        "upstream", rnd))
         else:
             batch.append(slot)
-    all_bad = bool(batch) and all((e.get("meta") or {}).get("error") == "bad_args"
-                                  for e in batch)
+    all_bad = bool(batch) and all(
+        (e.get("meta") or {}).get("error") in ("bad_args", "not_allowed") for e in batch)
     return batch, all_bad
 
 
@@ -1000,15 +1084,17 @@ def answer(body, *, channel, on_state, tools=None, chat=None) -> dict:
         return {"answer": "", "error": "No answer", "citations": [],
                 "applied_scope": {"dropped": []}, "asked": None}
     finally:
+        states.closed = True
         route["ms"]["total"] = int((_clock() - started) * 1000)
         # A turn handed to `_rag_answer` already logged its own ASK_ROUTE line;
         # one line per request is the contract.
         if route.get("fallback") != "scope_legacy":
-            logger.info("ASK_ROUTE %s", json.dumps(route, sort_keys=True, default=str))
+            snapshot = copy.deepcopy(route)
+            logger.info("ASK_ROUTE %s", json.dumps(snapshot, sort_keys=True, default=str))
 
 
 def _answer(body, channel, voice, caller_sub, states, route, started, tools, chat, laa):
-    deadline = started + DEADLINE_S["voice" if voice else "screen"]
+    deadline = started + _deadline_s(channel)
     question = (body.get("question") or "").strip()
 
     # ---- pre-pass (spec §6.1), mirroring lambda_ask_agent._rag_answer.
@@ -1093,7 +1179,7 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
     ctx = tools.ToolContext(caller_sub=caller_sub, today=today, deadline=deadline,
                             lambda_client=laa._get_lambda_client(),
                             function_name=laa.RAG_SEARCH_FUNCTION,
-                            refs=tools.RefAssigner())
+                            refs=_LockedRefs(tools.RefAssigner()))
     req = {"question": web_question, "asked": asked, "q_from": date_from, "q_to": date_to,
            "scope": {"site": scope_req.get("site_id")}, "policy": pol, "channel": channel}
     envs, web_env = run_round1(req, ctx, tools, route=route,
@@ -1123,12 +1209,20 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
     fin = None
     while True:
         left = deadline - _clock()
-        forced = (route["rounds"] >= MAX_ROUNDS or left < MIN_ROUND_LEFT_S
+        forced = (route["rounds"] >= MAX_ROUNDS
+                  or left < MIN_ROUND_LEFT_S + FALLBACK_RESERVE_S
                   or bad_rounds >= MAX_BAD_ROUNDS)
+        if forced and left < ANSWER_RESERVE_S:
+            # Not enough time for a final turn AND its fallback: fall back now,
+            # while the synthesis can still finish.
+            return _fallback(t, "no_time_for_final", shown)
         # The same list on a forced turn: a provider may 400 on a history that
         # names a tool no longer offered. Only tool_choice forces final_answer.
+        # web_search stays offered for the whole turn when the policy allows
+        # it: round 1 may already name it in the history. A second call is
+        # answered `not_allowed`.
         offered = [_fn(x) for x in tools.TOOLS]
-        if pol in ("auto", "required") and not route.get("web_ran"):
+        if pol in ("auto", "required"):
             offered.append(_fn(WEB_SEARCH_TOOL))
         offered.append(_fn(FINAL_ANSWER_TOOL))
         msgs = _messages(system, user, batches, forced)
@@ -1136,7 +1230,8 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
         t0 = _clock()
         try:
             turn = chat(msgs, offered, tool_choice=FORCE_FINAL if forced else "required",
-                        deadline=deadline if forced else deadline - FINAL_RESERVE_S)
+                        deadline=(deadline - FALLBACK_RESERVE_S if forced
+                                  else deadline - ANSWER_RESERVE_S))
         except Exception as exc:                          # noqa: BLE001
             logger.warning("ask orch judge raised: %s", type(exc).__name__)
             turn = None
@@ -1166,10 +1261,14 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
     # ---- after the final answer (spec §6.5, §6.7)
     web_block = (t.web_env or {}).get("block")
     out = to_client(fin["answer"], shown, web_block, channel)
-    basis = fin["basis"] or _derived_basis(out)
+    derived = _derived_basis(out)
+    basis = fin["basis"] or derived
     route.update(refs_r=out["refs_r"], refs_w=out["refs_w"], bad_refs=out["bad_refs"],
-                 basis=basis)
-    if guard_basis(basis, time_anchored, scoped):
+                 basis=basis, basis_derived=derived)
+    # The guard reads what was cited, not only what the judge declared: any W
+    # ref on a time-anchored or scoped turn is web evidence answering it.
+    if (guard_basis(basis, time_anchored, scoped)
+            or (out["refs_w"] and guard_basis("web", time_anchored, scoped))):
         route["guard"] = True
         return _fallback(t, "guard", shown)
     text = out["answer"]
@@ -1192,7 +1291,8 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
 
     cited_refs = _cited_card_refs(fin["answer"], shown)
     cited = [it for it in _card_items(shown) if it.get("ref") in cited_refs]
-    grounded = bool(out["grounded"]) or not out["from_web"]
+    # Spec §6.7: grounded means an R ref was cited.
+    grounded = bool(out["grounded"])
     return t.result(text, out["citations"], grounded=grounded, extra=extra, cited=cited)
 
 
