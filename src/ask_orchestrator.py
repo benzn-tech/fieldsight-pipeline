@@ -729,6 +729,12 @@ class _LockedRefs:
         with self._lock:
             return self._inner.assign(kind, ident, prefix)
 
+    # The real ask_tools.RefAssigner also has fresh(), which execute() calls for
+    # a row with no id. It shares assign()'s counters, so the same lock.
+    def fresh(self, prefix="R"):
+        with self._lock:
+            return self._inner.fresh(prefix)
+
 FINAL_ANSWER_TOOL = {
     "name": "final_answer",
     "description": "Give the answer to the user. Call this once you have the evidence.",

@@ -701,3 +701,37 @@ def test_deadline_follows_the_env_and_is_capped_per_channel(monkeypatch):
 
     monkeypatch.setenv("ASK_DEADLINE_SECONDS", "junk")
     assert orch._deadline_s("voice") == orch.DEADLINE_S["voice"]
+
+
+# ---- the real RefAssigner also has fresh() (companion ask_tools, 2026-10-16) --
+
+class _AssignerWithFresh:
+    def __init__(self):
+        self.calls = []
+
+    def assign(self, kind, ident, prefix="R"):
+        self.calls.append(("assign", kind, ident, prefix))
+        return prefix + "1"
+
+    def fresh(self, prefix="R"):
+        # execute() calls this for a row with no id; it shares assign's counters.
+        self.calls.append(("fresh", prefix))
+        return prefix + "2"
+
+
+def test_locked_refs_forwards_fresh_under_the_same_lock():
+    inner = _AssignerWithFresh()
+    locked = orch._LockedRefs(inner)
+    assert locked.fresh() == "R2"
+    assert locked.fresh(prefix="W") == "W2"
+    assert locked.assign("chunk", "c-1") == "R1"
+    assert inner.calls == [("fresh", "R"), ("fresh", "W"), ("assign", "chunk", "c-1", "R")]
+
+
+def test_locked_refs_fresh_holds_the_lock():
+    inner = _AssignerWithFresh()
+    locked = orch._LockedRefs(inner)
+    held = []
+    inner.fresh = lambda prefix="R": held.append(locked._lock.locked()) or "R9"
+    locked.fresh()
+    assert held == [True]
