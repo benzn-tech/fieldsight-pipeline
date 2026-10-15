@@ -26,9 +26,37 @@ def test_list_labels_are_stripped_from_titles_and_items():
                                            "1.2 Boards closed", "2 workers present"]}])
     s = out["sections"][0]
     assert s["title"] == "Electrical"
-    assert _texts(s) == ["Leads tagged", "RCDs used", "Cables tidy", "Boards closed",
+    assert _texts(s) == ["Leads tagged", "RCDs used", "Cables tidy", "1.2 Boards closed",
                          "2 workers present"]
     assert all(i["flags"] == [] for i in s["items"])
+
+
+@pytest.mark.parametrize("text", ["1.5 m high barrier", "2.4 metre fence"])
+def test_a_leading_measurement_is_kept_verbatim_and_not_flagged(text):
+    # A bare dotted number has no trailing "." or ")": it is the customer's wording.
+    item = template_draft.clean([{"title": "T", "items": [text]}])["sections"][0]["items"][0]
+    assert item == {"text": text, "flags": []}
+
+
+@pytest.mark.parametrize("raw,text", [("3. Formwork braced", "Formwork braced"),
+                                      ("1.2. Formwork braced", "Formwork braced"),
+                                      ("1.2) Formwork braced", "Formwork braced"),
+                                      ("a) Edge", "Edge"), ("ii) Edge", "Edge")])
+def test_punctuated_labels_are_still_stripped_from_items(raw, text):
+    item = template_draft.clean([{"title": "T", "items": [raw]}])["sections"][0]["items"][0]
+    assert item == {"text": text, "flags": []}
+
+
+def test_a_capital_initial_in_an_item_is_kept_and_flagged_for_the_person():
+    item = template_draft.clean([{"title": "T", "items": ["A. Smith signs off"]}])
+    assert item["sections"][0]["items"][0] == {"text": "A. Smith signs off",
+                                               "flags": ["label_kept"]}
+
+
+def test_a_capital_letter_heading_is_stripped_from_a_section_title():
+    s = template_draft.clean([{"title": "A. Documents & Approvals", "items": ["i"]}])
+    assert s["sections"][0]["title"] == "Documents & Approvals"
+    assert s["sections"][0]["flags"] == []
 
 
 def test_a_label_still_there_after_stripping_is_flagged_not_guessed():

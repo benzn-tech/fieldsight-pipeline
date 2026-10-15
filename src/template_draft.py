@@ -15,10 +15,15 @@ import report_template
 PURPOSE = "Record the inspector's answer to each item from the recording."
 DEFAULT_TITLE = "Checklist"
 NEAR = 0.85
-# "1." "12)" "1.2" "1.2." "a)" "b." "ii)" -- followed by whitespace. "2 workers" is not a label.
+# "1." "12)" "1.2." "1.2)" "a)" "b." "ii)" -- followed by whitespace. A bare "1.5" is NOT a
+# label: "1.5 m high barrier" is a measurement, and stripping it would silently change the
+# customer's wording. "2 workers" is not a label either.
 LABEL_RE = re.compile(
-    r"^\s*(?:\d{1,3}(?:\.\d{1,3})*[.)]|\d{1,3}(?:\.\d{1,3})+|[a-z][.)]|[ivx]{1,5}[.)])\s+",
+    r"^\s*(?:\d{1,3}(?:\.\d{1,3})*[.)]|[a-z][.)]|[ivx]{1,5}[.)])\s+",
     re.IGNORECASE)
+# A single capital letter + "." heads a section ("A. Documents & Approvals") but in an item
+# it may be an initial ("A. Smith signs off"): items keep it and are flagged for the person.
+_ITEM_INITIAL_RE = re.compile(r"^[A-Z]\.\s+")
 # What the save body adds beyond the sections themselves (catch_all, keys, purposes are
 # counted per section below); generous so the flag errs towards warning.
 _BODY_OVERHEAD = 600
@@ -37,7 +42,9 @@ def _ratio(a, b):
 
 
 def _item(raw_text):
-    text = _strip_label(_norm(raw_text))
+    text = _norm(raw_text)
+    if not _ITEM_INITIAL_RE.match(text):
+        text = _strip_label(text)
     if not text:
         return None
     flags = []
