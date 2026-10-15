@@ -247,14 +247,9 @@ def test_a_voice_records_only_answer_is_not_touched(monkeypatch):
     assert out["answer"] == "The slab is done [1] https://x"
 
 
-def test_project_fallback_lead_is_skipped_in_voice_only(monkeypatch):
-    wire(monkeypatch, kind="project", records_answer=False, web=WEB_OK)
-    out = ask(mode="voice", voice_web=True)
-    assert out["answer"] == WEB_OK["answer"]
-    wire(monkeypatch, kind="project", records_answer=False, web=WEB_OK)
-    out2 = ask()
-    assert out2["answer"].startswith(laa.PROJECT_FALLBACK_LEAD)
-
+# Was test_project_fallback_lead_is_skipped_in_voice_only: a voice project
+# question no longer reaches the web at all (see the 2026-10-15 tests at the
+# end of this file); the screen half is test_screen_project_question_...
 
 # ---- fix round 1 -----------------------------------------------------------
 
@@ -369,3 +364,34 @@ def test_a_failed_compose_on_screen_keeps_the_records_answer(monkeypatch):
         "answer": "Grounded answer.", "conflicts": [], "composed": False})
     out = ask()
     assert out["answer"] == "Grounded answer."
+
+
+# ---- project questions stay on the records (device test 2026-10-15) --------
+
+def test_voice_project_question_the_records_miss_stays_on_the_records(monkeypatch):
+    # "What did we do yesterday?" with nothing recorded yesterday: classify says
+    # project, records do not answer. The device must hear the records answer
+    # (what is there instead), never "searching online" and a web answer.
+    rig = wire(monkeypatch, kind="project", records_answer=False,
+               web={"answer": "From the web."}, answer="Nothing yesterday; the latest is the 12th [1].")
+    out = ask(rig.cb(), mode="voice", voice_web=True, question="What did we do yesterday?")
+    assert "general" not in rig.events
+    assert "on_web_start" not in rig.events
+    assert "from_web" not in out
+    assert out["answer"].startswith("Nothing yesterday")
+
+
+def test_voice_project_question_with_web_intent_still_goes_online(monkeypatch):
+    rig = wire(monkeypatch, kind="project", records_answer=False, web=WEB_OK)
+    out = ask(rig.cb(), mode="voice", voice_web=True, web_intent=True)
+    assert "general" in rig.events
+    assert out["from_web"] is True
+
+
+def test_screen_project_question_the_records_miss_still_uses_the_web(monkeypatch):
+    # Screen behaviour is the owner's 2026-10-07 design and is unchanged.
+    rig = wire(monkeypatch, kind="project", records_answer=False, web=WEB_OK)
+    out = ask(question="What did we do yesterday?")
+    assert "general" in rig.events
+    assert out["from_web"] is True
+    assert out["answer"].startswith(laa.PROJECT_FALLBACK_LEAD)

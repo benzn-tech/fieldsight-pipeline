@@ -1593,6 +1593,14 @@ def _rag_answer(body, on_web_start=None):
                 _cls = _classify_for_route(web_answer, asked, chunks, _skip, _started, route)
             _useful = _records_useful(_cls, chunks)
             _run_general = _cls["kind"] != "project" or not _useful
+            # Voice: a project question stays on the records, even when they do
+            # not hold the answer. The records synthesis can say what IS there
+            # ("nothing on the 14th, the latest is the 12th"); the web cannot
+            # know the site. On the device "What did we do yesterday?" played
+            # "searching online" and answered from the web (2026-10-15). Only
+            # an explicit "search online" (`_wi`) sends a voice turn out.
+            if body.get("mode") == "voice" and not _wi and _cls["kind"] == "project":
+                _run_general = False
             _t_synthesis = time.monotonic()
             if _run_general:
                 _announce_web_start(on_web_start)
