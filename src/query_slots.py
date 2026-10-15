@@ -30,7 +30,7 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-__all__ = ["resolve_today", "time_range"]
+__all__ = ["resolve_today", "time_range", "span"]
 
 
 def resolve_today(tz_name, now=None):
@@ -89,7 +89,7 @@ def _monday_of(d):
     return d - timedelta(days=d.weekday())
 
 
-def _span(today, name):
+def span(today, name):
     if name == "today":
         return today, today
     if name == "yesterday":
@@ -109,6 +109,9 @@ def _span(today, name):
         last_day = today.replace(day=1) - timedelta(days=1)
         return last_day.replace(day=1), last_day
     raise AssertionError(f"unhandled span {name!r}")   # unreachable; loud if it ever is
+
+
+_span = span  # old private name, kept for existing callers
 
 
 def time_range(question, today):
