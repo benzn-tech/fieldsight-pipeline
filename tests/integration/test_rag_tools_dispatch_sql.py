@@ -116,3 +116,98 @@ def test_search_records_and_latest_activity_through_the_real_search(db, world):
 def test_unprovisioned_caller(world):
     res = _tools([{"id": "1", "name": "find_people", "args": {"name": "x"}}], sub="nobody")
     assert res[0]["meta"] == {"error": "not_provisioned"}
+
+
+# ---- §4.3 ACL red tests for the search tools and graded callers (review I1 a/b) ----
+
+UNIT = [1.0] + [0.0] * 1023          # a 1024-dim unit vector; seeded chunks use it too
+NOWHERE = "00000000-0000-4000-8000-000000000000"
+
+
+def _shape(results):
+    """Everything but timing: what a caller could compare between two answers."""
+    return [(r["rows"], {k: v for k, v in r["meta"].items() if k != "ms"}) for r in results]
+
+
+def _seed_chunks(db, w):
+    for site, user, text, day in ((w["sa"], w["wa"], "slab pour alpha", D),
+                                  (w["sb"], w["bw"], "slab pour bravo", "2026-10-13")):
+        chunks.insert_chunk(db, site["id"], day, "topic", text, UNIT, user_id=user["id"],
+                            source_s3_key=f"reports/{day}/x/daily_report.json")
+
+
+@pytest.mark.parametrize("tool", ["search_records", "latest_activity"])
+def test_search_tools_answer_another_companys_site_and_person_like_nothing(db, world, tool):
+    w = world
+    _seed_chunks(db, w)
+
+    def call(arg, value):
+        args = {"query": "slab pour", arg: value}
+        args.update({"date_from": "2026-10-13", "date_to": D} if tool == "search_records"
+                    else {"on_or_before": D})
+        return {"id": arg, "name": tool, "query_embedding": UNIT, "args": args}
+
+    foreign = _tools([call("site", str(w["sb"]["id"])), call("site", "Bravo"),
+                      call("person", str(w["bw"]["id"]))])
+    unknown = _tools([call("site", NOWHERE), call("site", "Nowhere"),
+                      call("person", NOWHERE)])
+    assert _shape(foreign) == _shape(unknown)
+    assert all(r["rows"] == [] and "error" not in r["meta"]
+               and "latest_before" not in r["meta"] for r in foreign)
+    assert [r["meta"]["empty_reason"] for r in foreign] == [
+        "no_match", "no_match", "person_unresolved"]
+    # Not vacuous: the same caller, unnarrowed, does find A's chunk and never B's.
+    own = _tools([call("site", "Alpha")])
+    assert [r["chunk_text"] for r in own[0]["rows"]] == ["slab pour alpha"]
+
+
+def test_a_graded_worker_naming_a_colleague_gets_what_a_stranger_gets(db, world):
+    from repositories import memberships
+    w = world
+    wc = _user(db, w["a"], "ColleagueC", "worker")
+    for u in (w["wa"], wc):
+        memberships.add_membership(db, u["id"], w["sa"]["id"], "worker")
+    for u, folder, title in ((w["wa"], "WorkerA", "My pour"), (wc, "ColleagueC", "C pour")):
+        topics.upsert_topic(db, w["sa"]["id"], D, title, user_id=u["id"],
+                            source_s3_key=f"extractions/{folder}/{D}/a.json")
+        chunks.insert_chunk(db, w["sa"]["id"], D, "topic", title.lower(), UNIT,
+                            user_id=u["id"],
+                            source_s3_key=f"reports/{D}/{folder}/daily_report.json")
+
+    def batch(person):
+        return [{"id": "d", "name": "day_overview",
+                 "args": {"date_from": D, "date_to": D, "person": person}},
+                {"id": "s", "name": "search_records", "query_embedding": UNIT,
+                 "args": {"query": "pour", "date_from": D, "date_to": D, "person": person}}]
+
+    by_ref = _tools(batch(str(wc["id"])), sub="sub-WorkerA")
+    by_name = _tools(batch("ColleagueC"), sub="sub-WorkerA")
+    assert _shape(by_ref) == _shape(_tools(batch(NOWHERE), sub="sub-WorkerA"))
+    assert _shape(by_name) == _shape(_tools(batch("Nobody"), sub="sub-WorkerA"))
+    assert all(r["rows"] == [] and r["meta"]["person_unresolved"] is True
+               and "error" not in r["meta"] for r in by_ref + by_name)
+    # Not vacuous: the worker sees their own day, and only their own.
+    mine = _tools([{"id": "d", "name": "day_overview",
+                    "args": {"date_from": D, "date_to": D}}], sub="sub-WorkerA")
+    assert [r["title"] for r in mine[0]["rows"]] == ["My pour"]
+
+
+# ---- per-call isolation on a NON-autocommit connection (review M6) ----
+
+def test_a_sql_error_in_one_call_does_not_abort_the_next(db, world, monkeypatch):
+    import rag_tools_dispatch
+    w = world
+    topics.upsert_topic(db, w["sa"]["id"], D, "Pour", user_id=w["wa"]["id"],
+                        source_s3_key=f"extractions/WorkerA/{D}/a.json")
+
+    def div_zero(conn, *a, **k):
+        conn.execute("SELECT 1/0")
+    monkeypatch.setattr(rag_tools_dispatch.users, "find_visible_people", div_zero)
+    day = {"date_from": D, "date_to": D}
+    res = _tools([{"id": "1", "name": "day_overview", "args": day},
+                  {"id": "2", "name": "find_people", "args": {"name": "x"}},
+                  {"id": "3", "name": "day_overview", "args": day}])
+    assert res[1]["meta"]["error"] == "upstream"
+    assert [r["title"] for r in res[0]["rows"]] == ["Pour"]
+    assert [r["title"] for r in res[2]["rows"]] == ["Pour"]
+    assert "error" not in res[2]["meta"]

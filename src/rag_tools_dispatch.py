@@ -15,8 +15,10 @@ argument or row text.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import math
 import os
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -34,6 +36,13 @@ MAX_DEADLINE_S = 20.0
 # truncation signal.
 DAY_LIMIT = 60
 DEFAULT_K = 8
+# latest_activity(query): the gate chose the day; search that day this wide so a
+# matching chunk ranked below k*2 is not lost to the gate filter (_search's own
+# ceiling is 64).
+LATEST_DAY_SEARCH_K = 64
+# Argument NAMES that may appear in logs (never values). Anything else is "?".
+_LOGGABLE_FIELDS = frozenset(("date_from", "date_to", "on_or_before", "site", "person",
+                              "query", "k", "name", "metric"))
 _TOPIC_TEXT = ("title", "summary")
 # _search already normalizes chunk_text; normalizing it again is not idempotent
 # when a right_term contains its wrong_term ("Jon" -> "Jon Smith").
@@ -138,7 +147,13 @@ def _search_author_folder(conn, caller, sc, user_id, meta):
     `_search` narrows by folder NAME and resolves it company-pinned first. A
     NULL folder would make it drop the author filter (search everyone); a folder
     it resolves to a DIFFERENT user would search the wrong person. Either way:
-    no rows, never a wider search."""
+    no rows, never a wider search.
+
+    KNOWN GAP (Task 5 review I1(c), parked): an external author whose folder
+    name collides with a home-company folder therefore cannot be searched at
+    all, although day_overview (which narrows by user id) works for the same
+    ref. The fix is an author-by-user-id field on `_search`, not loosening this
+    check."""
     u = users.get_by_id(conn, user_id)
     folder = u and u.get("folder_name")
     if folder:
@@ -179,10 +194,11 @@ def _need_embedding(call, meta):
         raise _NoRows()
 
 
-def _run_search(conn, caller, sc, args, call, search_fn, site_id, user_id, meta):
+def _run_search(conn, caller, sc, args, call, search_fn, site_id, user_id, meta,
+                search_k=None):
     _need_embedding(call, meta)
     ev = {"sub": caller["sub"], "query_embedding": call.get("query_embedding"),
-          "question": args["query"], "k": (args.get("k") or DEFAULT_K) * 2}
+          "question": args["query"], "k": search_k or (args.get("k") or DEFAULT_K) * 2}
     if args.get("date_from"):
         ev["date_from"], ev["date_to"] = args["date_from"], args.get("date_to") or args["date_from"]
     if site_id:
@@ -253,10 +269,12 @@ def _latest_activity(conn, caller, sc, a, meta, call, search_fn, source_family, 
         meta["empty_reason"] = _no_match(sc)
         return []
     rows = _run_search(conn, caller, sc, dict(a, date_from=day, date_to=day), call,
-                       search_fn, site_id, user_id, meta)
-    # The day was chosen by the gate; return only that day's items that pass it.
+                       search_fn, site_id, user_id, meta, search_k=LATEST_DAY_SEARCH_K)
+    # The day was chosen by the gate; return only that day's items that pass it,
+    # then as many as an ordinary search returns (k*2) for ask_tools' post-search.
     rows = [r for r in rows if r.get("lexical_hit")
             or (r.get("distance") is not None and r["distance"] <= gate)]
+    rows = rows[:(a.get("k") or DEFAULT_K) * 2]
     if not rows:
         meta["empty_reason"] = _no_match(sc)
     return rows
@@ -290,11 +308,38 @@ _TOOLS = {"day_overview": _day_overview, "search_records": _search_records,
 
 
 def _deadline(event):
+    """Seconds this batch may START calls in. Absent -> the 20 s default. 0 means 0:
+    no time left, every call times out. Negative, NaN or unparseable -> 0 (fail
+    closed: `t0 - start >= nan` is never true, so NaN would mean "no deadline")."""
+    raw = event.get("deadline_s")
+    if raw is None:
+        return MAX_DEADLINE_S
     try:
-        v = float(event.get("deadline_s") or MAX_DEADLINE_S)
+        v = float(raw)
     except (TypeError, ValueError):
-        v = MAX_DEADLINE_S
+        return 0.0
+    if math.isnan(v) or v < 0:
+        return 0.0
     return min(v, MAX_DEADLINE_S)
+
+
+def _sub_hash(sub) -> str:
+    """Same as ask_voice_turn.sub_hash (sha256, 12 hex chars), so one caller's lines
+    can be joined across the voice worker, ask-agent and rag-search."""
+    return hashlib.sha256(str(sub).encode("utf-8")).hexdigest()[:12]
+
+
+def _arg_shape(args):
+    """Which fields are set and the range length in days. Never a value."""
+    fields = ",".join(sorted(f if f in _LOGGABLE_FIELDS else "?" for f in args))
+    days = "-"
+    try:
+        if args.get("date_from"):
+            days = str((date.fromisoformat(args.get("date_to") or args["date_from"])
+                        - date.fromisoformat(args["date_from"])).days + 1)
+    except (TypeError, ValueError):
+        days = "?"
+    return fields, days
 
 
 def run(conn, caller, sc, event, *, search_fn, metric_fn, clock=time.monotonic,
@@ -314,6 +359,7 @@ def run(conn, caller, sc, event, *, search_fn, metric_fn, clock=time.monotonic,
                             for c in calls]}
     start = clock()
     deadline = _deadline(event)
+    who = _sub_hash(caller.get("sub"))
     out = []
     for call in calls:
         call = call if isinstance(call, dict) else {}
@@ -326,18 +372,27 @@ def run(conn, caller, sc, event, *, search_fn, metric_fn, clock=time.monotonic,
             meta.update({"error": "bad_args", "field": "name"})
         else:
             try:
-                rows = _TOOLS[name](conn, caller, sc, call.get("args") or {}, meta,
-                                    call=call, search_fn=search_fn, metric_fn=metric_fn,
-                                    source_family=source_family)
+                # One transaction per call: a failed statement rolls back only this
+                # call (a SAVEPOINT when already inside a transaction), so the next
+                # call never inherits an aborted transaction -- whatever the
+                # connection's autocommit mode. Not `with conn:`, which closes it.
+                with conn.transaction():
+                    rows = _TOOLS[name](conn, caller, sc, call.get("args") or {}, meta,
+                                        call=call, search_fn=search_fn,
+                                        metric_fn=metric_fn, source_family=source_family)
             except _NoRows:
                 rows = []
             except Exception as exc:                       # noqa: BLE001 -- per-call isolation
                 logger.warning("ask tool %s failed: %s", name, type(exc).__name__)
                 meta, rows = {"error": "upstream"}, []
         meta["ms"] = int((clock() - t0) * 1000)
-        logger.info("ask tool %s rows=%d empty=%s err=%s truncated=%s ms=%d",
-                    name if name in _TOOLS else "?", len(rows), meta.get("empty_reason"),
-                    meta.get("error"), meta.get("truncated"), meta["ms"])
+        args = call.get("args") if isinstance(call.get("args"), dict) else {}
+        fields, days = _arg_shape(args)
+        logger.info("ask tool %s fields=%s days=%s rows=%d empty=%s err=%s truncated=%s "
+                    "ms=%d caller=%s",
+                    name if name in _TOOLS else "?", fields, days, len(rows),
+                    meta.get("empty_reason"), meta.get("error"), meta.get("truncated"),
+                    meta["ms"], who)
         out.append({"id": call.get("id"), "name": name,
                     "rows": json.loads(json.dumps(rows, default=str)), "meta": meta})
     return {"results": out}

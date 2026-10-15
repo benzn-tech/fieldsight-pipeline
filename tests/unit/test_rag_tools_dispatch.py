@@ -20,11 +20,32 @@ DAY = {"date_from": "2026-10-14", "date_to": "2026-10-14"}
 REF = "7d3c1a52-0000-0000-0000-000000000000"
 
 
+class FakeConn:
+    """Records transaction() entries; the dispatcher wraps every call in one."""
+    def __init__(self):
+        self.transactions = 0
+
+    def transaction(self):
+        conn = self
+
+        class _Tx:
+            def __enter__(self):
+                conn.transactions += 1
+                return self
+
+            def __exit__(self, *exc):
+                return False
+        return _Tx()
+
+
 def _run(calls, monkeypatch, *, clock=None, search=None, metric=None, sc=SC,
-         source_family="report", normalize=False):
+         source_family="report", normalize=False, deadline=20, conn=None):
     if not normalize:
         monkeypatch.setattr(d, "_normalize_rows", lambda conn, caller, sc, rows, fields: rows)
-    return d.run(object(), CALLER, sc, {"calls": calls, "deadline_s": 20},
+    event = {"calls": calls}
+    if deadline is not ...:
+        event["deadline_s"] = deadline
+    return d.run(conn or FakeConn(), CALLER, sc, event,
                  search_fn=search or (lambda e, c: {"chunks": []}),
                  metric_fn=metric or (lambda e: {"value": 0}),
                  clock=clock or Clock([0.0]), source_family=source_family)["results"]
@@ -67,6 +88,54 @@ def test_past_deadline_calls_do_not_run(monkeypatch):
                monkeypatch, clock=Clock([0.0, 0.0, 25.0]))
     assert len(ran) == 1 and res[1]["meta"]["error"] == "timeout"
     assert res[1]["rows"] == []
+
+
+@pytest.mark.parametrize("deadline", [0, 0.0, -1, float("nan"), float("inf") * -1])
+def test_no_time_left_means_every_call_times_out_without_running(monkeypatch, deadline):
+    ran = []
+    monkeypatch.setattr(d.users, "find_visible_people", lambda *a, **k: ran.append(1) or [])
+    res = _run([{"id": "a", "name": "find_people", "args": {"name": "x"}},
+                {"id": "b", "name": "find_people", "args": {"name": "y"}}],
+               monkeypatch, deadline=deadline)
+    assert not ran
+    assert [r["meta"]["error"] for r in res] == ["timeout", "timeout"]
+
+
+def test_missing_deadline_means_the_twenty_second_default(monkeypatch):
+    ran = []
+    monkeypatch.setattr(d.users, "find_visible_people", lambda *a, **k: ran.append(1) or [])
+    res = _run([{"id": "a", "name": "find_people", "args": {"name": "x"}}],
+               monkeypatch, deadline=..., clock=Clock([0.0, 19.9]))
+    assert ran and "error" not in res[0]["meta"]
+    assert d._deadline({}) == 20.0 and d._deadline({"deadline_s": 99}) == 20.0
+
+
+def test_every_call_runs_in_its_own_transaction(monkeypatch):
+    conn = FakeConn()
+    monkeypatch.setattr(d.users, "find_visible_people", lambda *a, **k: [])
+    _run([{"id": "a", "name": "find_people", "args": {"name": "x"}},
+          {"id": "b", "name": "find_people", "args": {"name": "y"}}], monkeypatch, conn=conn)
+    assert conn.transactions == 2
+
+
+def test_log_carries_arg_shape_and_caller_hash_never_values(monkeypatch, caplog):
+    import ask_voice_turn
+    monkeypatch.setattr(d.users, "find_visible_people", lambda *a, **k: [
+        {"person_ref": "m1", "name": "Mike Tane", "folder_name": "Mike_T"}])
+    monkeypatch.setattr(d.topics, "day_overview_rows", lambda *a, **k: [{"id": "t", "title": "Pour"}])
+    monkeypatch.setattr(d.sites, "list_sites_by_ids",
+                        lambda conn, ids: [{"id": "s1", "name": "Riverside"}])
+    with caplog.at_level("INFO"):
+        _run([{"id": "a", "name": "day_overview",
+               "args": {"date_from": "2026-10-12", "date_to": "2026-10-14",
+                        "person": "Mike Tane", "site": "Riverside"}}], monkeypatch)
+    line = next(r.getMessage() for r in caplog.records if "ask tool day_overview" in r.getMessage())
+    assert "fields=date_from,date_to,person,site" in line
+    assert "days=3" in line
+    assert f"caller={ask_voice_turn.sub_hash('sub-1')}" in line
+    assert "rows=1" in line and "err=None" in line
+    for value in ("Mike", "Riverside", "2026-10-1", "Pour", "sub-1 "):
+        assert value not in caplog.text
 
 
 def test_more_than_four_calls_rejected(monkeypatch):
@@ -345,6 +414,22 @@ def test_latest_activity_with_query_uses_the_gate_and_search_terms(monkeypatch):
     assert seen["on_or_before"] == "2026-10-14" and seen["source_family"] == "report"
     assert searches[0]["date_from"] == searches[0]["date_to"] == "2026-10-11"
     assert [r["id"] for r in res[0]["rows"]] == ["near", "kw"]
+
+
+def test_latest_activity_with_query_searches_wide_then_gates_then_trims(monkeypatch):
+    monkeypatch.setattr(d.chunks, "latest_matching_date", lambda *a, **k: "2026-10-11")
+    seen = []
+    far = [{"id": f"far{i}", "distance": 0.9, "lexical_hit": False} for i in range(30)]
+    near = [{"id": f"near{i}", "distance": 0.1 + i / 100, "lexical_hit": False} for i in range(20)]
+    def search(ev, c):
+        seen.append(ev)
+        return {"chunks": far + near}   # the matches rank BELOW the default k*2
+    res = _run([{"id": "a", "name": "latest_activity", "query_embedding": [0.1],
+                 "args": {"query": "pour"}}], monkeypatch, search=search)
+    assert seen[0]["k"] == 64
+    # Trimmed to what an ordinary search returns (k*2): ask_tools' post-search
+    # (lexical admit + rerank) reduces that to k, as for search_records.
+    assert [r["id"] for r in res[0]["rows"]] == [f"near{i}" for i in range(d.DEFAULT_K * 2)]
 
 
 def test_latest_activity_with_query_no_day_is_no_match(monkeypatch):
