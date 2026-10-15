@@ -166,6 +166,17 @@ jobs:
           if [ -n "${{ vars.TEST_VAD_LAYER_ARN }}" ]; then
             VAD_LAYER_PARAM="VadLayerArn=${{ vars.TEST_VAD_LAYER_ARN }}"
           fi
+          # Ask orchestration v2 (ASK_AGENTIC, judge model). Same bare-"Key=" guard as
+          # the layer ARNs: an unset TEST_ASK_AGENTIC must not become `AskAgentic=`
+          # (SAM exits 2 on it); the template Default '' keeps the flag off.
+          ASK_AGENTIC_PARAM=""
+          if [ -n "${{ vars.TEST_ASK_AGENTIC }}" ]; then
+            ASK_AGENTIC_PARAM="AskAgentic=${{ vars.TEST_ASK_AGENTIC }}"
+          fi
+          ASK_JUDGE_MODEL_PARAM=""
+          if [ -n "${{ vars.TEST_ASK_JUDGE_MODEL }}" ]; then
+            ASK_JUDGE_MODEL_PARAM="AskJudgeModel=${{ vars.TEST_ASK_JUDGE_MODEL }}"
+          fi
           # Non-work (personal) topic retention sweep. Two independent gates, both
           # off by default, because this one DELETES: it tombstones the topic and
           # drops its vectors (the transcript and audio are left alone).
@@ -242,6 +253,8 @@ jobs:
               "EnableThreadSuggestions=${{ vars.TEST_ENABLE_THREAD_SUGGESTIONS || 'true' }}" \
               $KF_LAYER_PARAM \
               $VAD_LAYER_PARAM \
+              $ASK_AGENTIC_PARAM \
+              $ASK_JUDGE_MODEL_PARAM \
               "ItemsTableName=fieldsight-test-items" \
               "ReportsTableName=fieldsight-test-reports" \
               "AuditTableName=fieldsight-test-audit" \
