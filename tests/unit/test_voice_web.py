@@ -193,3 +193,46 @@ def test_a_leading_minus_sign_is_not_a_bullet():
     assert voice_web.speakable("-5 degrees overnight") is True
     assert voice_web.speakable("-  a dash bullet") is False
     assert voice_web.speakable("*bold*") is True
+
+
+# ------------------------------------------------- reply_kind (offer replies)
+
+@pytest.mark.parametrize("said", [
+    "yes", "Yes.", "yeah go ahead", "yes please", "yes thanks", "sure", "search it",
+    "look it up", "do it", "search online",
+])
+def test_reply_kind_yes(said):
+    assert voice_web.reply_kind(said) == "yes"
+
+
+@pytest.mark.parametrize("said", [
+    "no", "nope", "no thanks", "never mind", "nah cancel", "don't", "No, stop.",
+])
+def test_reply_kind_no(said):
+    assert voice_web.reply_kind(said) == "no"
+
+
+@pytest.mark.parametrize("said", [
+    "thank you", "okay", "thanks", "", "yes the crane was moved",
+    "no the slab was poured", "yes yes yes yes yes yes yes", "yes no", None,
+])
+def test_reply_kind_is_none_for_anything_else(said):
+    # "thank you" / "okay" right after an answer is a new question, not a reply.
+    assert voice_web.reply_kind(said) is None
+
+
+@pytest.mark.parametrize("said,expected", [
+    ("Search online.", True),
+    ("search it online", True),
+    ("search online for the slump of 25 MPa concrete", False),
+    ("yes", False),
+    ("", False),
+])
+def test_is_bare_search_request(said, expected):
+    assert voice_web.is_bare_search_request(said) is expected
+
+
+def test_offer_strings_are_the_spec_wording():
+    assert voice_web.OFFER_NO_RECORDS == "Your site records don't cover that. Want me to search online?"
+    assert voice_web.OFFER_ALSO == "Want me to check online as well?"
+    assert voice_web.DECLINED == "Okay."

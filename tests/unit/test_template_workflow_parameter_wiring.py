@@ -90,6 +90,8 @@ UNWIRED_BY_DESIGN = {
     # (false); wiring them in deploy-prod.yml would be a product decision.
     "AskVoiceRestate": {"prod"},
     "VoiceWebEnabled": {"prod"},
+    # Voice Ask memory + web offer: TEST-only until the owner has used it on a device.
+    "AskVoiceConvo": {"prod"},
 }
 
 

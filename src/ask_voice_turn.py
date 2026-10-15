@@ -47,6 +47,13 @@ _CITATION = re.compile(r"\s*\[\d+(?:\s*,\s*\d+)*\]")
 
 _MISSING_CODES = ("NoSuchKey", "404", "NotFound")
 
+# Conversation memory and the web offer (spec 2026-10-15 voice offer and memory).
+# Both are per-caller objects under the turn prefix, so they share its IAM, its
+# hashing and its 24 h sweep.
+CONVO_WINDOW_S = 180
+OFFER_WINDOW_S = 120
+CONVO_MAX_TURNS = 3
+
 _s3 = None
 _lambda = None
 
@@ -102,6 +109,18 @@ def cancel_key(caller_sub, turn_id) -> str:
     return "%s%s.cancel" % (owner_prefix(caller_sub), turn_id)
 
 
+def convo_key(caller_sub) -> str:
+    return owner_prefix(caller_sub) + "convo.json"
+
+
+def offer_key(caller_sub) -> str:
+    return owner_prefix(caller_sub) + "offer.json"
+
+
+def _convo_on() -> bool:
+    return os.environ.get("ASK_VOICE_CONVO", "") == "true"
+
+
 def _is_missing(exc) -> bool:
     """A key that is not there. The roles hold s3:ListBucket on ask_turns/*, so a
     missing key is NoSuchKey/404; AccessDenied/403 is a real IAM fault and raises."""
@@ -137,6 +156,91 @@ def is_cancelled(s3, bucket, caller_sub, turn_id) -> bool:
 
 def put_cancel(s3, bucket, caller_sub, turn_id):
     s3.put_object(Bucket=bucket, Key=cancel_key(caller_sub, turn_id), Body=b"")
+
+
+# --- conversation memory and the web offer -------------------------------
+# Memory is a convenience, never a dependency: every read here fails soft to
+# "nothing remembered". A 403 is logged at ERROR, though, because the roles'
+# missing-key answer is 404 and a denial is an IAM fault that would otherwise
+# look exactly like an empty store.
+
+def _read_json(s3, bucket, key):
+    """The parsed object, or None when absent, unreadable or not valid JSON."""
+    try:
+        resp = s3.get_object(Bucket=bucket, Key=key)
+    except Exception as exc:  # noqa: BLE001
+        if _is_missing(exc):
+            return None
+        code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
+        if code in ("AccessDenied", "403"):
+            logger.error("voice convo read denied")
+        else:
+            logger.error("voice convo read failed: %s", type(exc).__name__)
+        return None
+    try:
+        return json.loads(resp["Body"].read())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def read_convo(s3, bucket, caller_sub, now) -> list:
+    """This caller's fresh turns, oldest first, at most CONVO_MAX_TURNS."""
+    doc = _read_json(s3, bucket, convo_key(caller_sub))
+    turns = doc.get("turns") if isinstance(doc, dict) else None
+    if not isinstance(turns, list):
+        return []
+    fresh = []
+    for t in turns:
+        if not isinstance(t, dict):
+            continue
+        q, a, at = t.get("question"), t.get("answer"), _num(t.get("at"))
+        if (isinstance(q, str) and isinstance(a, str) and at is not None
+                and now - at <= CONVO_WINDOW_S):
+            fresh.append({"question": q, "answer": a, "at": at})
+    return fresh[-CONVO_MAX_TURNS:]
+
+
+def write_convo(s3, bucket, caller_sub, question, answer, now):
+    """Append this turn to the caller's memory, dropping stale turns. Worker only."""
+    turns = read_convo(s3, bucket, caller_sub, now)
+    turns.append({"question": question, "answer": answer, "at": now})
+    turns = turns[-CONVO_MAX_TURNS:]
+    s3.put_object(Bucket=bucket, Key=convo_key(caller_sub),
+                  Body=json.dumps({"updated_at": now, "turns": turns}).encode("utf-8"),
+                  ContentType="application/json")
+
+
+def put_offer(s3, bucket, caller_sub, question, now):
+    s3.put_object(Bucket=bucket, Key=offer_key(caller_sub),
+                  Body=json.dumps({"question": question, "at": now}).encode("utf-8"),
+                  ContentType="application/json")
+
+
+def delete_offer(s3, bucket, caller_sub):
+    s3.delete_object(Bucket=bucket, Key=offer_key(caller_sub))
+
+
+def consume_offer(s3, bucket, caller_sub, now):
+    """The offered question if a fresh offer exists, else None. The offer is
+    deleted whenever it was there (read then delete, no read-modify-write), so
+    it can be honoured at most once and a stale one does not linger."""
+    doc = _read_json(s3, bucket, offer_key(caller_sub))
+    if doc is None:
+        return None
+    try:
+        delete_offer(s3, bucket, caller_sub)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("voice offer delete failed: %s", type(exc).__name__)
+    if not isinstance(doc, dict):
+        return None
+    q, at = doc.get("question"), _num(doc.get("at"))
+    if isinstance(q, str) and q.strip() and at is not None and now - at <= OFFER_WINDOW_S:
+        return q
+    return None
 
 
 def delete_turn(s3, bucket, caller_sub, turn_id, keep_marker=False):
@@ -225,6 +329,33 @@ def _restatement(question, web_intent, laa, t0):
             r.get("reason"), restate_s, time.perf_counter() - t1)
 
 
+def _decline(s3, bucket, caller_sub, turn_id, transcript, laa, history_turns, stt_s, t0):
+    """The caller said no to the web offer: finish the turn here with a spoken
+    "Okay." and no worker. The state is shaped like a worker's `done` so the
+    device's first result poll plays it."""
+    import voice_web
+    try:
+        wav = laa._tts(voice_web.DECLINED)
+        state = {"status": "done", "transcript": transcript,
+                 "answerText": voice_web.DECLINED, "basis": None,
+                 "audioBase64": base64.b64encode(wav).decode("ascii"),
+                 "audioFormat": "wav", "web": False, "created_at": time.time()}
+    except Exception as e:  # noqa: BLE001
+        logger.error("  voice TTS failed: %s", type(e).__name__)
+        state = {"status": "error", "error": "Speech synthesis failed"}
+    try:
+        put_state(s3, bucket, caller_sub, turn_id, state)
+    except Exception as e:  # noqa: BLE001
+        logger.error("  voice start decline write failed: %s", type(e).__name__)
+        return {"error": "No answer", "transcript": transcript}
+    logger.info("voice start: stt=%.2fs start_total=%.2fs declined=True history_turns=%d "
+                "offer=consumed_no turn=%s sub_hash=%s",
+                stt_s, time.perf_counter() - t0, history_turns, turn_id,
+                sub_hash(caller_sub))
+    return {"turn_id": turn_id, "transcript": transcript, "web_intent": False,
+            "restatement": None}
+
+
 def start(body) -> dict:
     """Spec 3.1 steps 1-7. Returns the response body; never raises.
 
@@ -272,12 +403,38 @@ def start(body) -> dict:
     except Exception as e:  # noqa: BLE001 - housekeeping must never fail an ask
         logger.warning("  voice start sweep failed (non-fatal): %s", type(e).__name__)
 
+    # Memory and the web offer. Flag off: none of this runs and no S3 call is made.
+    convo_history, offer_log = [], "none"
+    if _convo_on():
+        now = time.time()
+        offered = consume_offer(s3, bucket, caller_sub, now)
+        convo_history = [{"question": t["question"], "answer": t["answer"]}
+                         for t in read_convo(s3, bucket, caller_sub, now)]
+        if offered is not None:
+            offer_log = "cleared"
+            kind = voice_web.reply_kind(transcript)
+            if _voice_web_on() and (kind == "yes"
+                                    or voice_web.is_bare_search_request(transcript)):
+                # A yes searches the question that was offered, not the word "yes".
+                # The device still shows what was said.
+                offer_log, web_intent, question = "consumed_yes", True, offered
+                convo_history = []
+            elif kind == "no":
+                return _decline(s3, bucket, caller_sub, turn_id, transcript, laa,
+                                len(convo_history), stt_s, t0)
+
     payload = {"turn_id": turn_id, "caller_sub": caller_sub,
                "transcript": transcript, "web_intent": web_intent}
+    if offer_log == "consumed_yes":
+        payload["question"] = question
     if body.get("tz") is not None:
         payload["tz"] = body.get("tz")
     if "history" in body:
         payload["history"] = body.get("history")
+    elif convo_history:
+        payload["history"] = convo_history
+    if _convo_on():
+        payload["offer_web"] = _voice_web_on() and not web_intent
 
     try:
         put_state(s3, bucket, caller_sub, turn_id,
@@ -298,12 +455,14 @@ def start(body) -> dict:
     restatement, reason, restate_s, restate_tts_s = _restatement(
         question, web_intent, laa, t_restate)
 
+    memory = (" history_turns=%d offer=%s" % (len(convo_history), offer_log)
+              if _convo_on() else "")
     logger.info(
         "voice start: stt=%.2fs restate=%.2fs restate_tts=%.2fs start_total=%.2fs "
-        "restated=%s reason=%s web_intent=%s turn=%s sub_hash=%s",
+        "restated=%s reason=%s web_intent=%s turn=%s sub_hash=%s%s",
         stt_s, restate_s, restate_tts_s, time.perf_counter() - t0,
         restatement is not None, reason if restatement is None else None,
-        web_intent, turn_id, sub_hash(caller_sub))
+        web_intent, turn_id, sub_hash(caller_sub), memory)
     return {"turn_id": turn_id, "transcript": transcript, "web_intent": web_intent,
             "restatement": restatement}
 
@@ -311,6 +470,26 @@ def start(body) -> dict:
 # --------------------------------------------------------------------------
 # AskVoiceWorker
 # --------------------------------------------------------------------------
+
+def _remember(s3, bucket, caller_sub, question, answer_text, rag):
+    """Record a heard answer as context and keep the web offer in step with it.
+    Each write is best effort and logs a type name only: the turn is already done."""
+    now = time.time()
+    try:
+        write_convo(s3, bucket, caller_sub, question, answer_text, now)
+    except Exception as e:  # noqa: BLE001
+        logger.error("voice convo write failed: %s", type(e).__name__)
+    # No delete when there is no offer: start consumed any earlier offer before
+    # this turn began, and the worker holds no s3:DeleteObject on ask_turns/*.
+    if not rag.get("web_offer"):
+        return
+    try:
+        # The standalone form when a rewrite ran, so a yes searches the whole
+        # question and not a follow-up fragment.
+        put_offer(s3, bucket, caller_sub, rag.get("asked") or question, now)
+    except Exception as e:  # noqa: BLE001
+        logger.error("voice offer write failed: %s", type(e).__name__)
+
 
 def worker_handler(event, context):
     """Spec section 5 steps 0-6. Returns None; the result is the turn state."""
@@ -349,13 +528,22 @@ def worker_handler(event, context):
             return None
 
         # 2. RAG body.
-        question = voice_web.detect_intent(transcript)[1] if web_intent else transcript
+        # A yes to the web offer carries the offered question; the transcript is
+        # just the spoken "yes".
+        offered_q = event.get("question")
+        audited = transcript
+        if isinstance(offered_q, str) and offered_q.strip():
+            question = audited = offered_q
+        else:
+            question = voice_web.detect_intent(transcript)[1] if web_intent else transcript
         rag_body = {"question": question, "caller_sub": caller_sub, "mode": "voice",
                     "k": 5, "tz": event.get("tz"),
                     "voice_web": os.environ.get("VOICE_WEB_ENABLED", "") == "true",
                     "web_intent": web_intent}
         if "history" in event:
             rag_body["history"] = event.get("history")
+        if event.get("offer_web"):
+            rag_body["offer_web"] = True
 
         def _on_web_start():
             if not is_cancelled(s3, bucket, caller_sub, turn_id):
@@ -404,7 +592,9 @@ def worker_handler(event, context):
             len(audio_out), "-", len(h) if isinstance(h, list) else 0,
             turn_id, web, sub_hash(caller_sub))
         if not is_cancelled(s3, bucket, caller_sub, turn_id):
-            laa._invoke_voice_audit(caller_sub, transcript, answer_text)
+            laa._invoke_voice_audit(caller_sub, audited, answer_text)
+            if _convo_on():
+                _remember(s3, bucket, caller_sub, question, answer_text, rag)
     except Exception as e:  # noqa: BLE001
         logger.error("voice worker failed: turn=%s err=%s", turn_id, type(e).__name__)
         try:
