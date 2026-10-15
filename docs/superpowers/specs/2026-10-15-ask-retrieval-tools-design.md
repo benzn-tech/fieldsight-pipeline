@@ -125,7 +125,8 @@ is reported in `meta.clamped`.
 
 3. **`latest_activity`** — "when did X last happen / what's the latest"
    - args: `query` (opt), `on_or_before` (opt, default today), `site` (opt), `person` (opt)
-   - no `query`: the latest visible day (`latest_visible_date`) + its `day_overview`.
+   - no `query`: the latest visible topics day (`topics.latest_visible_topic_date`, same rules as `day_overview` -- ruling 2026-10-16, so it agrees with `day_overview` rather than with chunks) + its `day_overview`.
+   - with `query`, `meta.matched_date` names the chosen day even when no row survives the filter.
    - with `query`: the most recent day that has a chunk within a distance gate
      for `query`, + the matching items from that day. The gate is owned here
      (`ASK_TOOLS_MATCH_GATE`, default 0.55 = today's `_NO_LEX_MAX_DIST`);
@@ -196,7 +197,7 @@ Every tool returns:
   "meta": {
     "range": {"from": "2026-10-14", "to": "2026-10-14"},
     "empty_reason": null,
-    "latest_before": "2026-10-12",
+    "latest_before": {"date": "2026-10-12", "from": "topics"},
     "truncated": false,
     "clamped": null,
     "person_ambiguous": null,
@@ -372,3 +373,11 @@ on all text / M17 clamps split (7 / 92).
 Not taken: M16's premise that rerank is off in both environments --
 `ENABLE_RERANK=true` on TEST and prod (set 2026-10-13/14; TEST log 2026-10-15
 `rerank: 35 candidates -> 5`). The rest of M16 (k is post-merge) is taken.
+
+## 9. Final-review amendments (2026-10-16)
+
+- `latest_before` is `{"date": str | null, "from": "topics" | "chunks"}`; `date` is null when nothing earlier exists.
+- Topic items carry `n_tasks` and `n_findings`. Chunk items carry no `who` (the live search SQL selects no author name).
+- `latest_activity` rejects `date_from`/`date_to`; it takes `on_or_before`.
+- The dispatcher refuses to START `latest_activity(query)` with < 5 s left (`meta.error="timeout"`).
+- Live search SQL (`build_search_sql`, `build_latest_date_sql`) is pinned by sha256 golden tests.
