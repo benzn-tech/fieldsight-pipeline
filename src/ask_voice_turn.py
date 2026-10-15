@@ -37,7 +37,9 @@ PREFIX = "ask_turns/"
 # Restate has its own timeout; the TTS of the restatement gets 1.8 s more.
 # 1.5, not the spec's first 1.2: measured on TEST 2026-10-15, uncached restates
 # took 0.81-1.16 s (n=7), so 1.2 would drop a share of them to the filler.
-RESTATE_TIMEOUT_S = 1.5
+# 2.0 after the owner's device test (2026-10-15): 2 of 5 restates timed out at
+# 1.52 s and 1.83 s, so the owner heard no restatement on those turns.
+RESTATE_TIMEOUT_S = 2.0
 RESTATE_TTS_TIMEOUT_S = 1.8
 
 # Voice must never speak citation markers such as [1] or [1, 2].
