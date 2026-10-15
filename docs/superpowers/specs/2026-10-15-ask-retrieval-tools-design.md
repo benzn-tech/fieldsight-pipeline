@@ -77,10 +77,19 @@ is reported in `meta.clamped`.
   timeline and `session_index.build_chunks` already use).
 - topics with NULL `user_id` stay hidden under a graded author filter (as
   `topics.py` does today).
-- **Family rule on the topics side:** per (site, user, day), extraction-sourced
-  topics if any exist, else report-sourced topics -- the rule the timeline
-  uses. The chunks side keeps `family_predicate` exactly as `search_records`
-  does.
+- **Family rule on the topics side** (mirrors `/timeline`,
+  `lambda_org_api.py` ~10307 + `topics.has_topics_for_source_prefix`):
+  per (user, day) across the caller's `site_ids`, the extraction family
+  (`source_s3_key LIKE 'extractions/%'`) is used when ANY not-superseded
+  extraction topic exists — non_work and deleted ones included, exactly as
+  the timeline's presence check counts them; otherwise the report family
+  (`source_s3_key LIKE 'reports/%'`). Topics under any other prefix or with a
+  NULL key are not shown (the timeline never shows them). NULL-`user_id` rows
+  decide presence per (site, day). The outer row still applies every
+  visibility arm and the non_work exclusion. The chunks side keeps
+  `family_predicate` exactly as `search_records` does.
+- Known v1 limitation: merged meetings (`merged_keys`) are not mirrored, so a
+  joiner of a merged meeting does not see it in `day_overview`.
 - Alias rewriting (`aliases.list_active`) is applied to every returned text
   field, as `_search` does today, so all tools spell names the same.
 - `site` argument: a site UUID or a site name, resolved only within
@@ -92,10 +101,11 @@ is reported in `meta.clamped`.
    - args: `date_from` (req), `date_to` (opt, ≤ 7 days span), `site` (opt), `person` (opt)
    - returns one evidence item per visible topic in range (shared visibility
      rules above), chronological: title, local time, site, recorder, one-line
-     summary, item counts (tasks/findings/decisions) -- no embedding, pure SQL.
-   - `time` = the topic's local start-end from `occurred_at`/end when present,
-     else from the session's recording start; omitted (never guessed) when
-     neither exists.
+     summary, item counts (tasks/findings) -- no embedding, pure SQL.
+   - `time` = the topic's stored `time_range` text (local "HH:MM - HH:MM", as
+     the timeline shows it); omitted (never guessed) when NULL.
+   - the SQL fetches `limit + 1` rows; the dispatcher returns `limit` and sets
+     `meta.truncated` when the extra row exists.
    - empty result carries `meta.empty_reason` (see 3.3) and
      `meta.latest_before = {"date": ..., "from": "topics"}` -- the latest
      visible topics day before `date_from`, under the same rules (so "nothing
