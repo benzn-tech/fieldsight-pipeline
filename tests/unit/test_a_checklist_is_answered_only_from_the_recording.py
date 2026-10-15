@@ -186,3 +186,50 @@ def test_the_worker_records_what_each_answer_stood_on(run):
     assert [c.text for c in table.rows[1].cells] == [ITEMS[0], "Yes", "Serviced twice weekly", "", ""]
     assert [c.text for c in table.rows[4].cells][1:] == ["", checklist.NOT_COVERED, "", ""], \
         "item 4: no answer, and it says why"
+
+
+# ---- the gaps: what the inspector did not do -----------------------------------
+
+ITEMS_G = ["Formwork braced | plumb", "Edge protection installed",
+           "Cover to steel checked", "Pour booked", "Hand rails on stair"]
+TRANSCRIPT_G = ("formwork is braced and plumb all good. "
+                "edge protection is not installed on the north side, Mike will fix it by friday. "
+                "stair rails not applicable today")
+
+
+def gaps_rows():
+    # Item 1 Yes with evidence; item 2 No with evidence; item 3 No WITHOUT
+    # evidence (dropped); item 4 not mentioned; item 5 N/A with evidence.
+    return [
+        "1 | Yes | | | | formwork is braced and plumb",
+        "2 | No | rail missing north side | Mike | friday | edge protection is not installed on the north side",
+        "3 | No | | | | cover was never measured at all",
+        "5 | N/A | | | | stair rails not applicable today",
+    ]
+
+
+def test_THE_gaps_are_the_blank_items_and_the_no_answers():
+    sec = model_section(gaps_rows())
+    _, _, report = checklist.rebuild(sec, ITEMS_G, TRANSCRIPT_G)
+    gaps = report["gaps"]
+    assert [g["n"] for g in gaps["not_covered"]] == [3, 4]
+    assert [g["text"] for g in gaps["not_covered"]] == ["Cover to steel checked", "Pour booked"]
+    assert len(gaps["failed"]) == 1
+    f = gaps["failed"][0]
+    assert f["n"] == 2 and f["text"] == "Edge protection installed"
+    assert f["comment"] == "rail missing north side" and f["responsible"] == "Mike"
+    assert f["due"] == "friday"
+
+
+def test_a_gap_keeps_the_customers_wording_even_with_a_pipe():
+    _, _, report = checklist.rebuild(model_section([]), ITEMS_G, TRANSCRIPT_G)
+    assert report["gaps"]["not_covered"][0]["text"] == "Formwork braced | plumb"
+    assert len(report["gaps"]["not_covered"]) == 5 and report["gaps"]["failed"] == []
+
+
+def test_a_checklist_the_model_left_out_has_every_item_not_covered():
+    tpl = {"sections": [{"title": "Pre-pour", "kind": "checklist", "items": ITEMS_G}],
+           "catch_all": {"title": "Other"}}
+    prose = [{"title": "Other", "paragraphs": [], "line_refs": []}]
+    reports = checklist.apply(prose, tpl, TRANSCRIPT_G)
+    assert [g["n"] for g in reports["Pre-pour"]["gaps"]["not_covered"]] == [1, 2, 3, 4, 5]
