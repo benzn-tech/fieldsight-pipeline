@@ -298,6 +298,41 @@ def _voice_web_on() -> bool:
             and os.environ.get("ENABLE_WEB_ANSWER", "false").lower() == "true")
 
 
+def _agentic(channel) -> bool:
+    """True iff `channel` is listed in ASK_AGENTIC (comma list, e.g. "screen,voice").
+    Read per call, never at import: a flag captured at import survives a warm
+    container after the stack is redeployed with it off."""
+    raw = os.environ.get("ASK_AGENTIC", "")
+    return channel in {part.strip() for part in raw.split(",") if part.strip()}
+
+
+# Progress states the orchestrator reports, and which of them each channel writes.
+# Voice is pinned to the statuses the device knows (spec 2026-10-15 §4.4):
+# GrandTime ends a turn on any status it does not recognise.
+_SCREEN_STATES = ("searching_records", "searching_web", "writing")
+_VOICE_STATES = ("searching_web",)
+
+
+def _state_writer(s3, bucket, caller_sub, turn_id, created_at, channel):
+    """`on_state` for ask_orchestrator: filtered per channel, silent once the turn
+    is cancelled, and never raising (it also runs on the web thread)."""
+    allowed = _SCREEN_STATES if channel == SCREEN else _VOICE_STATES
+
+    def on_state(status):
+        if status not in allowed:
+            return
+        try:
+            if is_cancelled(s3, bucket, caller_sub, turn_id):
+                return
+            state = {"status": status, "created_at": created_at}
+            if channel == SCREEN:
+                state = {"status": status, "channel": SCREEN, "created_at": created_at}
+            put_state(s3, bucket, caller_sub, turn_id, state)
+        except Exception as e:  # noqa: BLE001 - progress is best effort
+            logger.warning("ask progress write failed: %s", type(e).__name__)
+    return on_state
+
+
 def _restatement(question, web_intent, laa, t0):
     """(restatement dict | None, reason, restate_s, restate_tts_s). Never raises."""
     import voice_restate
@@ -576,7 +611,13 @@ def _work_screen(s3, bucket, caller_sub, turn_id, state, laa, t0):
                            "created_at": created_at})
 
         t_rag = time.perf_counter()
-        rag = laa._rag_answer(rag_body, on_web_start=_on_web_start)
+        if _agentic(SCREEN):
+            import ask_orchestrator
+            rag = ask_orchestrator.answer(
+                rag_body, channel=SCREEN,
+                on_state=_state_writer(s3, bucket, caller_sub, turn_id, created_at, SCREEN))
+        else:
+            rag = laa._rag_answer(rag_body, on_web_start=_on_web_start)
         rag_s = time.perf_counter() - t_rag
         # /api/ask serialises with default=str; do the same so a stray datetime
         # in the result cannot fail the done write.
@@ -663,7 +704,13 @@ def worker_handler(event, context):
 
         # 3. RAG (+web).
         t_rag = time.perf_counter()
-        rag = laa._rag_answer(rag_body, on_web_start=_on_web_start)
+        if _agentic("voice"):
+            import ask_orchestrator
+            rag = ask_orchestrator.answer(
+                rag_body, channel="voice",
+                on_state=_state_writer(s3, bucket, caller_sub, turn_id, created_at, "voice"))
+        else:
+            rag = laa._rag_answer(rag_body, on_web_start=_on_web_start)
         rag_s = time.perf_counter() - t_rag
         answer_text = _CITATION.sub("", (rag.get("answer") or "")).strip()
         if rag.get("error") or not answer_text:

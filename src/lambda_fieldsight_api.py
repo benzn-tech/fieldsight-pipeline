@@ -482,6 +482,12 @@ def _result_wait_s():
     return max(0.0, min(25.0, v))
 
 
+# `since` values the result route accepts. Screen turns also report
+# searching_records / writing when ask_orchestrator answers them (ASK_AGENTIC).
+_VOICE_SINCE = ('pending', 'searching_web')
+_SCREEN_SINCE = _VOICE_SINCE + ('searching_records', 'writing')
+
+
 def ask_voice_result(query, caller, clock=time.monotonic, sleep=time.sleep, wall=time.time):
     """GET /api/ask/voice/result?turn=&since=: long-poll the turn store. Returns
     when the status is terminal or differs from `since`, else after RESULT_WAIT_S
@@ -495,7 +501,9 @@ def ask_voice_result(query, caller, clock=time.monotonic, sleep=time.sleep, wall
     if not isinstance(turn, str) or not ask_voice_turn.TURN_RE.match(turn):
         return error('Invalid turn')
     since = query.get('since') or 'pending'
-    if since not in ('pending', 'searching_web'):
+    # Garbage is rejected before any read. Which of these a turn may use depends
+    # on its channel, checked once the state is read below.
+    if since not in _SCREEN_SINCE:
         return error('Invalid since')
     bucket = os.environ.get('ASK_TURN_BUCKET', '')
     if not bucket:
@@ -511,6 +519,12 @@ def ask_voice_result(query, caller, clock=time.monotonic, sleep=time.sleep, wall
         state = ask_voice_turn.get_state(s3, bucket, sub, turn)
         if state is None:
             return error('Turn not found', 404)
+        # Voice (and any state without a channel) keeps the two values it has
+        # always had: the device fails a turn on a status it does not know, so it
+        # can never be told one (spec 2026-10-15 ask orchestration v2 §4.4).
+        if (state.get('channel') != ask_voice_turn.SCREEN
+                and since not in _VOICE_SINCE):
+            return error('Invalid since')
         if ask_voice_turn.is_cancelled(s3, bucket, sub, turn):
             out = {'status': 'cancelled'}
         else:

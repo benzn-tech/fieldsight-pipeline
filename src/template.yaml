@@ -339,6 +339,29 @@ Parameters:
       records miss into a spoken offer to search online, honouring a yes or no
       to it. TEST-only; prod leaves it unset (false).
 
+  AskAgentic:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(|screen|voice|screen,voice|voice,screen)$'
+    Description: >-
+      Ask orchestration v2 (evidence first, judge after): the channels whose
+      worker turns go through ask_orchestrator instead of _rag_answer. Empty is
+      off. TEST-only via TEST_ASK_AGENTIC; prod never passes it.
+
+  AskJudgeModel:
+    Type: String
+    Default: ''
+    Description: >-
+      Ask orchestration v2: the tool-calling judge model (llm_tools_client).
+      Empty falls back to CORROBORATION_CHEAP_MODEL, then the client default.
+
+  AskJudgeFallbacks:
+    Type: String
+    Default: ''
+    Description: >-
+      Ask orchestration v2: comma-separated judge fallback models, tried on a
+      5xx or a transport failure. Empty means no fallback.
+
   VoiceWebEnabled:
     Type: String
     Default: 'false'
@@ -2509,6 +2532,10 @@ Resources:
           ASK_TURN_BUCKET: !Ref DataBucketName
           VOICE_WEB_ENABLED: !Ref VoiceWebEnabled
           ASK_VOICE_CONVO: !Ref AskVoiceConvo
+          # Worker-only: the orchestrator runs in the worker, never in AskAgent.
+          ASK_AGENTIC: !Ref AskAgentic
+          ASK_JUDGE_MODEL: !Ref AskJudgeModel
+          ASK_JUDGE_FALLBACKS: !Ref AskJudgeFallbacks
       Layers:
         - !Ref DashScopeLayer
       Policies:
