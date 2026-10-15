@@ -1,6 +1,6 @@
 # Ask orchestration v2 — design
 
-**Date:** 2026-10-15. **Status:** rev 1, draft for Fable review.
+**Date:** 2026-10-15. **Status:** rev 2 (rev 1 reviewed by Fable: APPROVE WITH CHANGES, 1 blocker + 10 major; all folded in, see §13).
 **Owner line:** ASR+LLM优化v3. This spec owns *when* evidence is gathered, how it is judged, how the answer is written and delivered.
 **Companion spec (line 搜索和向量):** `docs/superpowers/specs/2026-10-15-ask-retrieval-tools-design.md` on branch `spec/ask-retrieval-tools` (commit d919b1a3). It owns the records tools, `ask_tools.execute(calls, ctx)`, and the evidence envelope. This spec consumes that contract and does not restate it.
 **File ownership:** this line does not edit `src/ask_tools.py`, `src/lambda_rag_search.py`, `src/repositories/chunks.py`. The other line does not edit `_rag_answer`, `web_answer.py`, `voice_web.py`, `ask_voice_turn.py`.
@@ -48,19 +48,32 @@ Prod for every phase is the owner's release; flags stay unset on prod.
 
 ## 3. Phase 0 — screen parity (small PR, ships first)
 
-Define one predicate in `_rag_answer`, computed once:
+Define one predicate in `_rag_answer`, computed once after the rewrite and time-slot step:
 
 ```
-time_anchored = bool(orig_q_from) and not _wi
+time_anchored = bool(q_from) and not _wi
 ```
 
-`orig_q_from` comes from the question's own time phrase (`query_slots.time_range`, before any rewrite fills it). `_wi` is the voice explicit web intent. **The screen has no explicit web intent today**; "search online for X" on the screen is a phase 3 concern (§6.2).
+`q_from` is retrieval's own anchor after the rewrite. It covers a follow-up such as "and the day before that?", which gets its date only from the rewritten question.
+
+This is deliberately not `orig_q_from`. The metric gate uses `orig_q_from` so that a rewrite cannot *open* a counted route. Here the predicate *closes* the web, so the post-rewrite value is strictly more conservative.
+
+`_wi` is the voice explicit web intent. **The screen has no explicit web intent today**, and phase 0 does not add one.
 
 Three changes:
 
-1. **Project override for both channels.** Drop the `mode == "voice"` condition on the #1120 override: `not _wi and kind == "project"` ⇒ `_run_general = False`. This removes `PROJECT_FALLBACK_LEAD` from every live path. Keep the constant until phase 3 deletes the flow, but nothing prepends it. Update the existing test in `tests/unit/test_ask_voice_web_gates.py` that asserts the lead on the screen. The PR must state that this is the behaviour the owner reported.
-2. **Distance-gated time-anchored questions.** `_classify_for_route` returns `kind=general, source=gated` without a model call when the gate trips, so (1) never sees `project`. Add: `time_anchored` ⇒ `_run_general = False`. This applies to both channels and to every `_cls`.
-3. **Empty-chunk branch.** `time_anchored` ⇒ no web try. The answer is the records' own no-records answer.
+1. **Project override for both channels. This is the fix for the owner's case.**
+   - Drop the `mode == "voice"` condition on the #1120 override (`lambda_ask_agent.py:1621`): `not _wi and kind == "project"` ⇒ `_run_general = False`.
+   - This removes `PROJECT_FALLBACK_LEAD` from every live path. Keep the constant until phase 3 deletes the flow, but nothing prepends it.
+   - Update the existing screen test in `tests/unit/test_ask_voice_web_gates.py` (around :391) that asserts the lead. The PR must state that this is the behaviour the owner reported.
+   - The owner's case is the *widened* case: nothing on the 14th, and retrieval widened to chunks from the 12th (`basis.widened=True`). The distance gate cannot trip on it, because `_skip` requires `not basis.widened` (:1582).
+   - **What it answers:** the plain sequential records synthesis (:1821–1859) over the widened chunks. That is one model call, with the existing "no records for yesterday, so this is for …" wording.
+2. **Time-anchored ⇒ no general flow, on every `_cls`. This is defensive.**
+   - It covers distance-gated and general/mixed-labelled time-anchored questions: `time_anchored` ⇒ `_run_general = False`, on both channels.
+   - With `_useful` false, no concurrent synthesis runs (:1664), `web is None` skips :1770, and the sequential synthesis runs over the retrieved chunks. That is one model call, not a canned string.
+3. **Empty-chunk branch.**
+   - `time_anchored` is tested **first** in this branch: before the #1122 offer (:1387) and before `web_answer.enabled()`.
+   - The result is the existing no-records return (:1442). There is no web call and no offer.
 
 Why `time_anchored` is not folded into `scoped`:
 
@@ -72,13 +85,23 @@ Why `time_anchored` is not folded into `scoped`:
 
 **Tests:**
 
-- Screen and voice, each of the three paths:
-  - project not useful ⇒ no general call, no lead;
-  - gated with "yesterday" ⇒ no general call;
-  - empty chunks with "yesterday" ⇒ no general call.
-- "what is the minimum cover" (no time phrase, general) ⇒ the general flow runs as today.
-- Voice with `_wi` and "yesterday" ⇒ web as today.
-- Offer interplay (#1122): `time_anchored` ⇒ no offer (offer only fires when `_run_general` would be true).
+- **Replay of the owner's defect.** This test must fail on today's code.
+  - Setup: screen, "What did we do yesterday?", chunks dated two days earlier, `basis.widened=True`, classify returns `project` / `records_answer=False`.
+  - Expected: no `_general_run`, no `PROJECT_FALLBACK_LEAD`, one sequential synthesis call over the widened chunks.
+- **The same on voice.** Already true after #1120; pinned again.
+- **Gated + "yesterday", both channels:** no general call, one synthesis call.
+- **General/mixed label + "yesterday", both channels:** no general call.
+- **Empty chunks + "yesterday", both channels:** no general call.
+- **Empty chunks + "yesterday" on voice with `offer_web`:** no offer; the answer is the no-records answer.
+- **Follow-up whose date comes only from the rewrite** (`orig_q_from` None, `q_from` set): no general call.
+- **"What is the minimum cover?"** (no time phrase, general): the general flow runs as today. On voice with `offer_web`, the offer fires as today.
+- **Voice with `_wi` and "yesterday":** web as today.
+
+**Live gate before merge:** a TEST smoke with the owner's exact question on both channels.
+- Screen: invoke ApiFunction `/api/ask`.
+- Voice: invoke `/api/ask/voice/start`.
+- Both: `ASK_ROUTE` shows `general_status=not_needed`, and the answer carries no lead.
+- About 4 model calls.
 
 ## 4. Phase 1 — one transport for both clients
 
@@ -112,7 +135,33 @@ The voice routes stay as they are: the device ships them.
 
 There is no STT and no restatement.
 
-The request body goes into the state object rather than the Event payload. The Event payload limit is 256 KB and history can be long. The worker reads it back on its first S3 GET. **Identity:** `caller_sub` is taken from the authorizer by ApiFunction (as `/api/ask` does today) and written into the state by AskAgent. The worker never reads identity from anywhere else.
+**Where the request goes.** The request body goes into the state object rather than the Event payload, because the Event payload limit is 256 KB and history can be long. The worker reads it back on its first S3 GET.
+
+**Identity.**
+- The Event is `{turn_id, caller_sub, channel}`, the same shape as today plus `channel`. The worker needs `caller_sub` to locate the state, because the key is `owner_prefix(caller_sub)`.
+- `caller_sub` comes from the authorizer `sub`, taken by ApiFunction as `/api/ask` does today.
+- The stored `request` never carries `caller_sub`. If one is present, the worker ignores it.
+
+**New exposure.** Screen `history` is user text, and it now rests in S3 under `ask_turns/`. It stays there until the result read deletes the terminal state (`lambda_fieldsight_api.py:476`) or the 24 h sweep removes it. This is the same lifetime as voice turn state. It is never logged.
+
+### 4.2a Worker branches by channel
+
+The worker is voice-shaped today (`ask_voice_turn.py:539–597`). For `channel == "screen"`:
+
+| Step | Voice (unchanged) | Screen |
+|---|---|---|
+| `rag_body["mode"]` | `"voice"` | absent (screen mode), as `/api/ask` sends today |
+| Citation `[n]` strip | yes | no |
+| TTS | yes | no |
+| Audit row (`_invoke_voice_audit`) | yes | no: `/api/ask` is not audited today |
+| `_remember` (convo.json / offer.json) | yes, flag-gated | **never**: the UI sends its own history, and a screen turn must not seed the device's offer or convo |
+| Done fields | `_DONE_FIELDS_VOICE` | `_DONE_FIELDS_SCREEN` |
+
+**Per-channel deadline.**
+- Today `ASK_DEADLINE_SECONDS` (`lambda_ask_agent.py:77`, read by `_ask_budget_left`) and `WEB_ANSWER_HARD_STOP` (`web_answer.py:66`) are module-level constants.
+- Phase 1 adds an optional `deadline_s` field on the rag body, read by `_rag_answer`, which falls back to the constant.
+- It also adds a `hard_stop` parameter on `web_answer.general_answer` / `classify` / `compose`, which falls back to `HARD_STOP_SECONDS`.
+- The worker passes 40 for screen and nothing for voice, so voice behaviour is unchanged.
 
 ### 4.3 Done fields per channel
 
@@ -124,7 +173,15 @@ The request body goes into the state object rather than the Event payload. The E
 
 `pending → searching_records → searching_web → writing → done | error`. Each transition is one PutObject, and it is written only when the state actually changes.
 
-- Voice keeps `pending / searching_web / done / error`. Its `since` validation adds the new values, and the device ignores ones it does not know: GrandTime treats unknown statuses as still pending. **Verify this in the device code before this phase merges.**
+**Voice is pinned to the four statuses it has today.**
+- On `channel == "voice"`, and on any state without `channel`, the worker and orchestrator write only `pending | searching_web | done | error`. `searching_records` and `writing` map to no write.
+- **Why:** GrandTime maps an unknown status to `Failed("unknown status")` and ends the turn (`AskApiClient.kt:181-191`, `AskTurnRunner.kt:141`). One extra status would fail every fielded device turn.
+- A named test drives `on_state` under `channel=voice` and asserts the exact set of statuses written.
+- "Unknown status ⇒ keep polling" in GrandTime is recorded as a device follow-up for the owner. Phase 3 voice must not depend on it.
+
+**Screen.**
+- The full sequence is written for screen only.
+- The result route's `since` validation accepts the new values only for screen turns.
 - The UI shows one line per state: "Searching your records…", "Checking the web…", "Writing the answer…".
 
 ### 4.5 Budgets
@@ -137,16 +194,20 @@ The request body goes into the state object rather than the Event payload. The E
 | UI | 35 s single request | 55 s total |
 
 - **Total deadline:** 40 s from `start` (`ASK_DEADLINE_SECONDS` 45 on the worker becomes channel-dependent: screen 40, voice 45 as today).
-- **Long-poll:** each result poll is ≤ 25 s, under the gateway.
-- **UI:** gives up after 55 s total.
+- **Long-poll:** each result poll keeps today's 20 s hold. ApiFunction's `Timeout: 28` with S3 `read_timeout=2` leaves no room for 25.
+- **UI:** gives up after 55 s total and then POSTs `/ask/cancel`, as the device does. Without that, the worker keeps spending model calls on a turn nobody reads.
+- **`turn_start` invoke:** its 8 s timeout needs its own boto client in ApiFunction, because the shared one uses `ASK_INVOKE_TIMEOUT=26`.
 
 ### 4.6 UI (fieldsight-ui, integration branch `dev`, no CI)
 
 `scripts/api/ask.js`:
 
 - `ask(body)` becomes start + poll. It keeps the same resolved value shape, so `ask-chat.js` changes only for the progress line.
-- The `isStale()` generation guard also cancels: a superseded question sends `/ask/cancel`.
-- **Fallback:** if `/ask/start` returns 404 (a backend without phase 1), call the old `/ask` once. This keeps the UI deployable before the backend.
+- **Poll timeout:** the per-poll `timeoutMs` must exceed the 20 s hold. Use the existing `MODEL_CALL_TIMEOUT_MS=35000`.
+- **Cancel:** the `isStale()` generation guard also cancels, so a superseded question sends `/ask/cancel`.
+- **Fallback for an old backend:** `_fetch.js` *resolves* a JSON 404 as `{_notFound: true, status: 404}` rather than throwing (`_fetch.js:307-309`).
+  - So the test is `if (res._notFound)` on the **`/ask/start`** response only. In that case call the old `/ask` once. This keeps the UI deployable before the backend.
+  - A `_notFound` on `/ask/result` means "turn not found". It is an error line, not a fallback.
 
 The old sync `POST /api/ask` stays until the UI on `main` uses the new routes. Removing it is the owner's prod step later.
 
@@ -176,6 +237,10 @@ ChatTurn = {tool_calls: [{id, name, arguments: dict}], text, usage, model, error
   - The owner is short on OpenRouter credit. DashScope Qwen (records synthesis today) also supports OpenAI-shape tools through its compatible endpoint. `ASK_JUDGE_PROVIDER=openrouter|dashscope` keeps that open.
   - The phase 4 eval picks the model. This spec does not.
 - **Arguments:** malformed tool-call JSON counts as one `bad_args` result fed back to the model, not as an exception. Two in a row end the loop (§6.4).
+- **`tool_choice` portability.** DashScope's compatible mode may not accept `"required"`. Verify on TEST with one call before the eval picks a provider. The portable form, used whenever `"required"` is rejected:
+  - `tool_choice="auto"` on ordinary turns;
+  - `tool_choice={"type":"function","function":{"name":"final_answer"}}` on the forced last turn;
+  - plus the rule: **a turn that returns text and no tool call is treated as `final_answer(answer=text, basis="records" if any R ref in text else "none")`**.
 - **Logging:** caller, model, tool names, token usage, ms. Never message text.
 
 ## 6. Phase 3 — the orchestrator
@@ -208,13 +273,14 @@ These steps run as today:
 |---|---|
 | Identity error (`not_provisioned`) | never; error answer |
 | Scoped (body site/author/topic/date) or `time_anchored` | never, unless explicit web intent |
-| Explicit web intent (voice `_wi`; screen: the same `voice_web.detect_intent` regex on the question) | required: the web is started in round 1 |
+| Explicit web intent: voice `_wi`, or on the screen the same `voice_web.detect_intent` regex on an **unscoped** question | required: the web is started in round 1. On the screen, a scoped question keeps "never" even with the phrase, which matches the scoped-Ask rule and `test_web_intent_is_ignored_in_screen_mode_even_when_scoped` |
 | Channel voice, otherwise | **offer** (#1122 behaviour): the web is not run speculatively; the judge may set `offer_web` |
 | Channel screen, otherwise | **auto**: pre-check decides whether the web runs in round 1, in parallel with the records |
 
 **Pre-check (screen auto only).** One cheap call on the question text alone, so it can start at t=0 in parallel with the records tools:
 
-- **Call:** `CORROBORATION_CHEAP_MODEL`, 3 s, 64 tokens. It returns `{"web": "no" | "yes"}`.
+- **Call:** `CORROBORATION_CHEAP_MODEL`, 3 s, `max_tokens=512`, effort `low`. Reasoning tokens are completion tokens (BUG-16), so a 64-token cap returns empty content. It returns `{"web": "no" | "yes"}`.
+- **Empty or unparseable reply:** treated as "no" and logged as `precheck=failed`.
 - **Rubric:**
   - "yes" for standards, codes, regulations, products, general technique, or anything outside the team's own work.
   - "no" for what the team did, said, decided or recorded, and for people, sites and days.
@@ -233,11 +299,15 @@ Built from the pre-pass, executed as one `ask_tools.execute` batch:
 | otherwise | `search_records(asked)` |
 | body scope | the same `site` / `person` / dates on every call (the scope is a filter, never widened) |
 
+**Round 1b, deterministic.** When `day_overview` returns empty with `meta.latest_before.date`, the orchestrator immediately runs `day_overview(latest_before.date)`. No model is involved. This produces the owner's "nothing on the 14th; here is the 12th" answer in one judge call. The ctx deadline still applies.
+
 The web call, when §6.2 says so, runs in a parallel thread:
 
 ```
-web_search(query = asked) → web_answer.general_answer(asked, budget, kind="general", voice=channel=="voice")
+web_search() → web_answer.general_answer(question, budget, kind="general", voice=channel=="voice")
 ```
+
+The query is the caller's **original `question`**, not the history rewrite `asked`. Today only `question` ever leaves the account (`lambda_ask_agent.py:1601-1603`, `:1643`); "nothing history-derived leaves the account" is kept.
 
 Its output is wrapped in the envelope (§7).
 
@@ -267,13 +337,16 @@ A web result that arrives after the judge has finished is discarded and logged a
 - At most 3 rounds total, round 1 included, so at most 2 judge-requested rounds.
 - At most 4 calls per round; calls beyond 4 are dropped with a `bad_args`-style note.
 - At most 2 consecutive `bad_args`.
-- The total deadline is §4.5. If the next round cannot start with ≥ 6 s left, the judge is told "no more tools; answer now" and `tool_choice` is forced to `final_answer`.
+- **Deadline.** The total deadline is §4.5.
+  - 8 s is always reserved for the final answer turn.
+  - A further tool round starts only if ≥ 14 s are left (≥ 6 s for its tools, plus the 8 s answer reserve).
+  - Otherwise the judge is told "no more tools; answer now", and `tool_choice` is forced to `final_answer`.
 
-**`web_search` from the judge (round 2+).** This is only allowed when the policy is `auto` or `required`.
+**`web_search` from the judge (round 2+).** It is only allowed when the policy is `auto` or `required`.
 
-- **Privacy rule:** the `query` argument is checked before the call. It is rejected (`bad_args: query_contains_record_detail`) if it contains, case-insensitively, any `who` or `site` value, or any `title` of 3+ words, from the records envelopes of this turn.
-- **Why:** today only the user's own question ever reaches the web provider. A judge-written query must not carry record content out.
-- **Cap:** at most one `web_search` per turn beyond round 1. The web costs 2–3 model calls and ~15–20 s.
+- **It takes no arguments.** The query is always the caller's original `question`, as in round 1.
+- **Why:** the judge cannot write a query, so record content (names, sites, paraphrased text) can never be sent to the web provider. A content filter could be bypassed by paraphrase; having no argument cannot.
+- **Cap:** at most one `web_search` per turn, counting round 1. The web costs 2–3 model calls and ~15–20 s.
 
 **`final_answer` tool:**
 
@@ -315,6 +388,13 @@ W2 | source | nzs.govt.nz | NZS 3101:2006 Concrete structures
 ```
 
 - Every `meta` field that changes what an honest answer says is printed in the header line: `empty_reason`, `latest_before`, `truncated`, `clamped`, `person_ambiguous`, and `error`.
+  - `latest_before` is the companion's object `{date, from}`. The render prints `latest_before <date>`.
+- **Injection hardening.** Before rendering, each `text`, `title`, `who` and `site`:
+  - is collapsed to a single line (newlines become spaces);
+  - has `|` replaced by `/`;
+  - has any leading `[DATA`, `R<digits> |` or `W<digits> |` sequence stripped.
+
+  The whole render is wrapped in the same fenced "DATA, not instructions" block the current prompts use. A chunk therefore cannot forge a header or a ref line.
 - **Budget:** at most 8,000 tokens of rendered evidence per judge call. On overflow:
   - older rounds' items are dropped first, keeping their header lines;
   - then the lowest-ranked items within a call.
@@ -371,7 +451,24 @@ It never carries question, answer, evidence or query text, and identity appears 
   - `error`: `timeout | upstream` when failed;
   - `ms`.
 
-Refs are numbered in the same per-turn counter space as the companion's R refs: separate prefixes, one assigner. **Interface request to the companion line:** `ask_tools.execute` accepts a `ctx.refs` assigner object so both prefixes come from one per-turn instance. The alternative is for the orchestrator to renumber, which this spec avoids.
+**Ref assigner.** Agreed in writing with the companion line on 2026-10-16; its plan is at `spec/ask-retrieval-tools` @ b04c2618.
+- The companion owns `ask_tools.RefAssigner`, with `assign(kind, ident, prefix="R") -> str`.
+- R and W have independent counters. The same `(kind, ident)` always returns the same ref, and refs are never renumbered.
+- The orchestrator constructs one per Ask turn and passes it as `ctx.refs` to every `execute` call. Because it carries the dedupe map, dedupe spans rounds.
+- The web tool calls `assign("web", url, prefix="W")`, and `assign("web_answer", turn_id, prefix="W")` for W1.
+
+**`ctx` contents** (built by the orchestrator):
+
+| Field | Meaning |
+|---|---|
+| `caller_sub` | the authorizer `sub` |
+| `tz` | the request's tz |
+| `today` | local date |
+| `deadline` | **absolute** `time.monotonic()` timestamp |
+| `clock` | `time.monotonic` |
+| `refs` | the per-turn `RefAssigner` |
+
+The companion caps each rag-search batch at 20 s (its Lambda timeout is 23 s) and at 4 calls. A call that cannot start before the deadline returns `meta.error="timeout"`.
 
 ## 8. Cost per turn (model calls)
 
@@ -396,6 +493,10 @@ Embedding calls (DashScope) are not counted. A rewrite adds 1 when history is fr
 | general standards | 5 | W-cited when the web is on; no project claims |
 | mixed (our pour + the standard) | 3 | both R and W cited |
 | explicit "search online" | 2 | W used |
+| scoped (site or day in the body) + general wording | 2 | no W; records-only answer |
+| judge asks for a second web search | 1 | cap enforced; one web call total |
+
+**Relative dates.** Relative items ("yesterday", "last Tuesday") pin `now` per item through the existing `_parse_now` override (`lambda_ask_agent.py:805`), so results do not drift with the run date.
 
 - **Runs:**
   - screen: n=3, so 60 turns;
@@ -409,10 +510,10 @@ Embedding calls (DashScope) are not counted. A rewrite adds 1 when history is fr
   - every project and empty-day item passes 3/3;
   - general and mixed items pass ≥ 2/3;
   - zero `bad_refs` reaching the client;
-  - zero time-anchored answers with basis `web`;
+  - judge raw `basis=web` on time-anchored or scoped items, counted as **guard fires** before the §6.5 guard rewrites the answer: ≤ 1 in the whole run, and 0 on project items. The client-side outcome is guaranteed by the guard, so it measures nothing.
   - p50 latency: project ≤ 7 s screen, general ≤ 25 s.
   - Report per-item results, not only totals.
-- **Scoring:** structural checks are automatic (refs, basis, cited provenance). Correctness of the project facts is hand-checked by this line against the web timeline for those days, and the method is stated in the report.
+- **Scoring:** structural checks are automatic (refs, basis, cited provenance). Correctness of the project facts is hand-checked by this line against the UI timeline for those days, and the method is stated in the report.
 
 ## 10. Flags and rollout
 
@@ -446,3 +547,26 @@ Each step is the owner's.
 1. The judge model and provider (§5), given OpenRouter credit.
 2. Phase 0's accepted cost (§3): a general question with a time phrase stays on the records.
 3. Screen `auto` web (§6.2). The owner asked for parallel evidence, but this spends 2–3 web calls on every pre-check "yes". The alternative is the voice-style offer on the screen too.
+4. GrandTime follow-up: map an unknown result status to "keep polling" (§4.4). This is not needed by any phase here.
+
+## 13. Rev 1 review (Fable) → rev 2
+
+| Finding | Where it is fixed |
+|---|---|
+| B1 device fails on unknown status | Voice is pinned to 4 statuses, with a named test (§4.4) |
+| M1 no replay; change 2 cannot fire on the owner's case | Replay test with `widened`; change 2 marked defensive; the answer on each path stated (§3) |
+| M2 `asked` sent to the web | Web query = `question` (§6.3) |
+| M3 offer before the predicate | `time_anchored` is checked first in the empty branch (§3) |
+| M4 `orig_q_from` | `q_from` used (§3) |
+| M5 worker is voice-shaped | Branch table and per-call deadline (§4.2a) |
+| M6 identity vs Event | Event carries `caller_sub`; request does not; S3 exposure noted (§4.2) |
+| M7 query filter bypassable | `web_search` takes no arguments (§6.4) |
+| M8 `ctx.refs` not accepted | Accepted by the companion; `ctx` table added (§7) |
+| M9 64-token pre-check | 512 tokens, effort low, failure = "no" (§6.2) |
+| M10 `tool_choice` on DashScope | Portable form plus the text-as-final rule (§5) |
+| m1 UI 404 shape, poll timeout, cancel | §4.5, §4.6 |
+| m2 budgets | 20 s hold, 8 s answer reserve, own client (§4.5, §6.4) |
+| m3 render injection | Single-line render, escaping, fence (§6.6) |
+| m4 eval measures a guaranteed outcome | Gate on guard fires, pinned `now`, scoped and cap items, phase 0 live gate (§9, §3) |
+| m5 screen intent vs scope | Scoped keeps "never" (§6.2) |
+| m6 `latest_before` shape; round 1b | Render reads `.date`; deterministic round 1b (§6.3, §6.6) |
