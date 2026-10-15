@@ -335,3 +335,46 @@ def test_latest_match_date_sql_shares_search_scope_and_keyword_expression():
     assert "@@ websearch_to_tsquery('simple', %(q_text)s)" in sql
     assert "(c.embedding <=> %(q)s::vector) <= %(gate)s" in sql
     assert "ILIKE" not in sql.upper()
+
+
+# ---- golden: the live search SQL is byte-identical to before the Ask-tools branch ----
+
+# sha256 of the UTF-8 text at b04c2618 (the branch base), computed by loading
+# `git show b04c2618:src/repositories/search_sql.py` (with that commit's
+# deleted_predicates) and confirmed equal to the refactored builders (4177 / 1153
+# chars). The search box and Ask both run this SQL: a "refactor" of
+# _visibility_predicate / _scope_predicate that changes one character must fail
+# here and be reviewed as a change to the live search, not slip through.
+GOLDEN_SEARCH_SQL_SHA256 = "bfcf0fb8aaafb7586af65e4cd71c6b606e93f801303d673ddd8735d7df156fdd"
+GOLDEN_LATEST_DATE_SQL_SHA256 = "4bb02a766a290d4e4b195d957b130a2d6a21e5f4e2efc3584162c9ef41fc59bf"
+
+
+def test_build_search_sql_is_byte_identical_to_the_pre_branch_sql():
+    import hashlib
+    from repositories.search_sql import build_search_sql
+    sql = build_search_sql()
+    assert len(sql) == 4177
+    assert hashlib.sha256(sql.encode("utf-8")).hexdigest() == GOLDEN_SEARCH_SQL_SHA256
+
+
+def test_build_latest_date_sql_is_byte_identical_to_the_pre_branch_sql():
+    import hashlib
+    from repositories.search_sql import build_latest_date_sql
+    sql = build_latest_date_sql()
+    assert len(sql) == 1153
+    assert hashlib.sha256(sql.encode("utf-8")).hexdigest() == GOLDEN_LATEST_DATE_SQL_SHA256
+
+
+def test_keyword_recheck_uses_the_search_keyword_arm_expression_verbatim():
+    """latest_activity(query) keeps a day's keyword rows by this re-check; it must
+    mean exactly what the lex arm and the day-choosing SQL mean by a keyword hit."""
+    from repositories.search_sql import (_LEXICAL_QUERY, _lexical_vector,
+                                         build_keyword_recheck_sql,
+                                         build_latest_match_date_sql)
+    def flat(text):
+        return " ".join(text.split())          # the lex arm spaces its pieces wider
+    match = flat("(" + _lexical_vector("c") + ") @@ " + _LEXICAL_QUERY)
+    sql = flat(build_keyword_recheck_sql())
+    assert match in sql
+    assert match in flat(build_search_sql()) and match in flat(build_latest_match_date_sql())
+    assert "c.id = ANY(%(ids)s::uuid[])" in sql

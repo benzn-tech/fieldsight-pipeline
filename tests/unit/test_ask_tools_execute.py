@@ -587,3 +587,30 @@ def test_candidate_k_default_and_rerank_off_match_rag_answer(monkeypatch):
     monkeypatch.setenv("RERANK_CANDIDATE_K", "junk")
     ask_tools.execute([{"name": "search_records", "args": {"query": "pour"}}], _ctx(fake))
     assert "candidate_k" not in fake.events[-1]["calls"][0]
+
+
+# --- final review fixes (I2, M1) -------------------------------------------
+
+def test_topic_items_carry_task_and_finding_counts():
+    """Spec §3.1.1: day_overview items carry item counts. day_overview_rows pays
+    for n_tasks/n_findings; the item must carry them, zero included."""
+    rows = [{"id": "t1", "title": "Pour", "n_tasks": 3, "n_findings": 0},
+            {"id": "t2", "title": "Strip", "n_tasks": 0, "n_findings": 2}]
+    env = ask_tools.execute([{"name": "day_overview", "args": {"date_from": "yesterday"}}],
+                            _ctx(FakeLambda(_echo(rows))))
+    got = [(i["n_tasks"], i["n_findings"]) for i in env[0]["items"]]
+    assert got == [(3, 0), (0, 2)]
+    assert all(isinstance(v, int) for pair in got for v in pair)
+
+
+def test_one_result_without_an_id_does_not_fail_the_batch():
+    def results(ev):
+        out = _echo([{"id": "t1", "title": "Pour"}])(ev)
+        del out[1]["id"]                              # malformed: no id
+        return out
+    env = ask_tools.execute([{"name": "day_overview", "args": {"date_from": "yesterday"}},
+                             {"name": "day_overview", "args": {"date_from": "today"}}],
+                            _ctx(FakeLambda(results)))
+    assert [i["title"] for i in env[0]["items"]] == ["Pour"]
+    assert "error" not in env[0]["meta"]
+    assert env[1]["meta"]["error"] == "upstream" and env[1]["items"] == []

@@ -352,6 +352,8 @@ def _item(name, args, row, call_id):
         "title": row.get("title") or row.get("topic_title"),
         "text": _text(row.get("summary")),
         "topic_id": row.get("id"),
+        # Spec §3.1.1: the day's item counts (day_overview_rows' count subqueries).
+        "n_tasks": row.get("n_tasks"), "n_findings": row.get("n_findings"),
         "chunk_type": row.get("chunk_type"), "time_start": None,
         "source": row.get("source_s3_key")}
 
@@ -411,7 +413,10 @@ def _invoke(ctx, wire):
     if resp.get("FunctionError"):
         raise RuntimeError("rag-search FunctionError")
     body = json.loads(resp["Payload"].read())
-    return {r["id"]: r for r in body["results"] if isinstance(r, dict)}
+    # .get: one result without an id must not fail the batch; its call has no
+    # result and becomes `upstream` on its own (results.get(cid) is None).
+    return {r.get("id"): r for r in body["results"]
+            if isinstance(r, dict) and r.get("id") is not None}
 
 
 def execute(calls, ctx):

@@ -264,3 +264,21 @@ def build_latest_match_date_sql() -> str:
         "AND ((c.embedding <=> %(q)s::vector) <= %(gate)s "
         "OR (" + _lexical_vector("c") + ") @@ " + _LEXICAL_QUERY + ")"
     )
+
+
+def build_keyword_recheck_sql() -> str:
+    """Which of the given chunk ids the keyword arm matches (Ask tools,
+    `latest_activity` with a query).
+
+    build_search_sql's `lexical_hit=True` means "found ONLY by the keyword arm"
+    (DISTINCT ON keeps the vector copy when both arms return a row), so it cannot
+    say whether a row's text matched. This re-check uses the SAME expression and
+    tsquery as the lex arm and build_latest_match_date_sql, so "keyword matched"
+    means here exactly what it meant when the day was chosen. Ids only: the rows
+    already passed the search's visibility predicate.
+    """
+    return (
+        "SELECT c.id FROM report_chunks c "
+        "WHERE c.id = ANY(%(ids)s::uuid[]) "
+        "AND (" + _lexical_vector("c") + ") @@ " + _LEXICAL_QUERY
+    )

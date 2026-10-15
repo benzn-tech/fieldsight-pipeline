@@ -2,7 +2,8 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from deleted_predicates import LIVE_TOPIC_PREDICATE
-from repositories.search_sql import (build_latest_date_sql, build_latest_match_date_sql,  # re-export
+from repositories.search_sql import (build_keyword_recheck_sql,  # re-export
+                                     build_latest_date_sql, build_latest_match_date_sql,
                                      build_search_sql)
 
 __all__ = ["build_search_sql", "build_latest_date_sql", "insert_chunk", "search_chunks",
@@ -153,6 +154,19 @@ def latest_matching_date(conn, query_embedding, accessible_site_ids, *, on_or_be
     ).fetchone()
     latest = (row or {}).get("latest")
     return latest.isoformat() if latest is not None else None
+
+
+def keyword_matched_ids(conn, chunk_ids, query_text) -> set:
+    """The subset of `chunk_ids` (as lower-case str) whose text the search's
+    keyword arm matches for `query_text` (bound verbatim, like search_chunks and
+    latest_matching_date: pass the same `or_query(...)` value). "" matches nothing.
+    """
+    ids = [str(i) for i in chunk_ids if i is not None]
+    if not ids or not query_text:
+        return set()
+    rows = conn.cursor(row_factory=dict_row).execute(
+        build_keyword_recheck_sql(), {"ids": ids, "q_text": query_text}).fetchall()
+    return {str(r["id"]).lower() for r in rows}
 
 
 def delete_chunks_for_source(conn, source_s3_key) -> int:

@@ -40,6 +40,11 @@ DEFAULT_K = 8
 # matching chunk ranked below k*2 is not lost to the gate filter (_search's own
 # ceiling is 64).
 LATEST_DAY_SEARCH_K = 64
+# latest_activity(query) runs an exact scan over its window (no HNSW). The deadline
+# governs call START only, so one started late can outrun RagSearchFunction's 23 s
+# Timeout -- and a Lambda timeout loses the WHOLE batch, not one call. Refuse to
+# start it with less than this many seconds left (final review M8).
+LATEST_QUERY_MIN_START_S = 5.0
 # A search never fetches more than this (rag-search's own list clamp).
 MAX_SEARCH_K = 64
 _TOPIC_TEXT = ("title", "summary")
@@ -111,7 +116,7 @@ def _resolve_site(conn, sc, value, meta):
         # to the wrong project, so it is no match like any other unresolved name.
         if len(hits) == 1:
             return hits[0]
-    meta["empty_reason"] = "no_match"
+    meta["empty_reason"] = _no_match(sc)
     raise _NoRows()
 
 
@@ -205,7 +210,7 @@ def _candidate_pool(call, args):
 
 
 def _run_search(conn, caller, sc, args, call, search_fn, site_id, user_id, meta,
-                search_k=None):
+                search_k=None, author_folder=None):
     _need_embedding(call, meta)
     ev = {"sub": caller["sub"], "query_embedding": call.get("query_embedding"),
           "question": args["query"], "k": search_k or _candidate_pool(call, args)}
@@ -214,7 +219,7 @@ def _run_search(conn, caller, sc, args, call, search_fn, site_id, user_id, meta,
     if site_id:
         ev["site"] = site_id
     if user_id:
-        ev["author"] = _search_author_folder(conn, caller, sc, user_id, meta)
+        ev["author"] = author_folder or _search_author_folder(conn, caller, sc, user_id, meta)
     res = search_fn(ev, None) or {}
     if res.get("error"):
         meta["error"] = ("not_provisioned" if "provision" in str(res["error"])
@@ -268,21 +273,30 @@ def _latest_activity(conn, caller, sc, a, meta, call, search_fn, source_family, 
     _need_embedding(call, meta)
     gate = float(os.environ.get("ASK_TOOLS_MATCH_GATE", "0.55"))
     site_ids, author_ids = _narrowed(sc, site_id, user_id)
-    if user_id:
-        # Fail closed BEFORE the scan if _search could not narrow to this person.
-        _search_author_folder(conn, caller, sc, user_id, meta)
+    # Fail closed BEFORE the scan if _search could not narrow to this person; the
+    # folder resolved here is the one the day's search uses (resolved once).
+    folder = _search_author_folder(conn, caller, sc, user_id, meta) if user_id else None
+    # ONE keyword query for choosing the day and for keeping its rows -- the same
+    # value _search binds for its own keyword arm.
+    q_text = or_query(query_terms(a["query"]))
     day = chunks.latest_matching_date(
         conn, call.get("query_embedding"), site_ids, on_or_before=upto, gate=gate,
-        query_text=or_query(query_terms(a["query"])), author_ids=author_ids,
-        source_family=source_family)
+        query_text=q_text, author_ids=author_ids, source_family=source_family)
     if not day:
         meta["empty_reason"] = _no_match(sc)
         return []
+    meta["matched_date"] = day
     rows = _run_search(conn, caller, sc, dict(a, date_from=day, date_to=day), call,
-                       search_fn, site_id, user_id, meta, search_k=LATEST_DAY_SEARCH_K)
-    # The day was chosen by the gate; return only that day's items that pass it,
-    # then as many as an ordinary search returns for ask_tools' post-search.
-    rows = [r for r in rows if r.get("lexical_hit")
+                       search_fn, site_id, user_id, meta, search_k=LATEST_DAY_SEARCH_K,
+                       author_folder=folder)
+    # The day was chosen by "distance <= gate OR keyword match"; keep that day's
+    # rows by the same rule. `lexical_hit` cannot decide the keyword half: it means
+    # "found ONLY by the keyword arm", and a small day's matching chunk arrives as
+    # its vector copy (lexical_hit=False). So re-check the text in SQL with the
+    # exact expression that chose the day. Then as many as an ordinary search
+    # returns for ask_tools' post-search.
+    matched = chunks.keyword_matched_ids(conn, [r.get("id") for r in rows], q_text)
+    rows = [r for r in rows if str(r.get("id")).lower() in matched
             or (r.get("distance") is not None and r["distance"] <= gate)]
     rows = rows[:_candidate_pool(call, a)]
     if not rows:
@@ -362,10 +376,14 @@ def run(conn, caller, sc, event, *, search_fn, metric_fn, clock=time.monotonic,
         name = call.get("name")
         meta, rows = {}, []
         t0 = clock()
+        call_args = call.get("args") if isinstance(call.get("args"), dict) else {}
         if t0 - start >= deadline:
             meta["error"] = "timeout"
         elif name not in _TOOLS:
             meta.update({"error": "bad_args", "field": "name"})
+        elif (name == "latest_activity" and call_args.get("query")
+              and deadline - (t0 - start) < LATEST_QUERY_MIN_START_S):
+            meta["error"] = "timeout"
         else:
             try:
                 # One transaction per call: a failed statement rolls back only this
@@ -382,8 +400,7 @@ def run(conn, caller, sc, event, *, search_fn, metric_fn, clock=time.monotonic,
                 logger.warning("ask tool %s failed: %s", name, type(exc).__name__)
                 meta, rows = {"error": "upstream"}, []
         meta["ms"] = int((clock() - t0) * 1000)
-        args = call.get("args") if isinstance(call.get("args"), dict) else {}
-        fields, days = _arg_shape(args)
+        fields, days = _arg_shape(call_args)
         logger.info("ask tool %s fields=%s days=%s rows=%d empty=%s err=%s truncated=%s "
                     "ms=%d caller=%s",
                     name if name in _TOOLS else "?", fields, days, len(rows),

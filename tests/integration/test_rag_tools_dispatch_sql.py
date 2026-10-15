@@ -211,3 +211,46 @@ def test_a_sql_error_in_one_call_does_not_abort_the_next(db, world, monkeypatch)
     assert [r["title"] for r in res[0]["rows"]] == ["Pour"]
     assert [r["title"] for r in res[2]["rows"]] == ["Pour"]
     assert "error" not in res[2]["meta"]
+
+
+# ---- final review I1: the keyword-chosen day keeps its keyword rows ----
+
+ORTHO = [0.0, 1.0] + [0.0] * 1022     # cosine distance 1.0 from UNIT: far past the gate
+
+
+def test_latest_activity_keeps_the_keyword_rows_that_chose_the_day(db, world):
+    """latest_matching_date accepts a day on a keyword hit alone. On a small day
+    every chunk is in the vector top-k, so the keyword-matched chunk arrives from
+    _search as the vector copy (lexical_hit=False) at distance 1.0. The filter must
+    keep it because its TEXT matches, and drop the same day's unrelated far chunk."""
+    w = world
+    key = "reports/2026-10-12/WorkerA/daily_report.json"
+    topics.upsert_topic(db, w["sa"]["id"], "2026-10-12", "Day", user_id=w["wa"]["id"],
+                        source_s3_key=key)
+    for text in ("scaffolding inspection on level two", "concrete pour on level three"):
+        chunks.insert_chunk(db, w["sa"]["id"], "2026-10-12", "topic", text, UNIT,
+                            user_id=w["wa"]["id"], source_s3_key=key)
+    res = _tools([{"id": "1", "name": "latest_activity", "query_embedding": ORTHO,
+                   "args": {"query": "scaffolding", "on_or_before": D}}])
+    rows, meta = res[0]["rows"], res[0]["meta"]
+    assert [r["chunk_text"] for r in rows] == ["scaffolding inspection on level two"]
+    assert rows[0]["lexical_hit"] is False and rows[0]["distance"] > 0.55
+    assert meta["matched_date"] == "2026-10-12"
+    assert "empty_reason" not in meta and "error" not in meta
+
+
+def test_latest_activity_keeps_rows_within_the_gate_without_the_keyword(db, world):
+    """The other half of the rule: a chunk near the query embedding is kept although
+    its text has no query term; a far chunk without the term is still dropped."""
+    w = world
+    key = "reports/2026-10-12/WorkerA/daily_report.json"
+    topics.upsert_topic(db, w["sa"]["id"], "2026-10-12", "Day", user_id=w["wa"]["id"],
+                        source_s3_key=key)
+    for text, emb in (("formwork stripped on level one", ORTHO),
+                      ("concrete pour on level three", UNIT)):
+        chunks.insert_chunk(db, w["sa"]["id"], "2026-10-12", "topic", text, emb,
+                            user_id=w["wa"]["id"], source_s3_key=key)
+    res = _tools([{"id": "1", "name": "latest_activity", "query_embedding": ORTHO,
+                   "args": {"query": "scaffolding", "on_or_before": D}}])
+    assert [r["chunk_text"] for r in res[0]["rows"]] == ["formwork stripped on level one"]
+    assert res[0]["meta"]["matched_date"] == "2026-10-12"
