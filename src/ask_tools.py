@@ -25,6 +25,11 @@ MAX_K = 12
 
 _DATE_DESC = ("ISO date YYYY-MM-DD in the user's local time, or one of: "
               + ", ".join(RELATIVE_DATES) + ".")
+# Without date_to a range is ONE day; the model must be told, or "since Oct 1"
+# silently becomes "on Oct 1".
+_DATE_TO = {"type": "string",
+            "description": _DATE_DESC + " Defaults to date_from. Omitted means a single day. "
+                           "Requires date_from."}
 _SITE = {"type": "string", "description": "Optional project/site name or id."}
 _PERSON = {"type": "string",
            "description": "Optional person: a person_ref from find_people, or a name."}
@@ -42,7 +47,7 @@ TOOLS = [
         "time, site, who, and a one-line summary. Use for 'what did we do yesterday'. "
         "When nothing is recorded, meta.latest_before gives the latest earlier day.",
         {"date_from": {"type": "string", "description": _DATE_DESC},
-         "date_to": {"type": "string", "description": _DATE_DESC + " Defaults to date_from."},
+         "date_to": _DATE_TO,
          "site": _SITE, "person": _PERSON},
         ["date_from"]),
     _fn("search_records",
@@ -50,7 +55,7 @@ TOOLS = [
         "a site or a person.",
         {"query": {"type": "string"},
          "date_from": {"type": "string", "description": _DATE_DESC},
-         "date_to": {"type": "string", "description": _DATE_DESC},
+         "date_to": _DATE_TO,
          "site": _SITE, "person": _PERSON,
          "k": {"type": "integer", "minimum": 1, "maximum": MAX_K}},
         ["query"]),
@@ -71,7 +76,7 @@ TOOLS = [
         "photos, safety or quality findings, over a date range.",
         {"metric": {"type": "string", "enum": list(METRICS)},
          "date_from": {"type": "string", "description": _DATE_DESC},
-         "date_to": {"type": "string", "description": _DATE_DESC}},
+         "date_to": _DATE_TO},
         ["metric", "date_from"]),
 ]
 _BY_NAME = {t["name"]: t for t in TOOLS}
@@ -133,23 +138,40 @@ def validate_call(call, today):
             if raw["metric"] not in METRICS:
                 raise _Bad("metric")
             out["metric"] = raw["metric"]
+        clamped = {}
+        # Order: resolve, cap at today, then clamp. Nothing is recorded after
+        # today, so a future end only shrinks the real window; capping first
+        # means the clamp keeps real days.
         if "on_or_before" in raw:
-            out["on_or_before"] = _one_date(raw["on_or_before"], today, "on_or_before",
-                                            end=True).isoformat()
+            ob = _one_date(raw["on_or_before"], today, "on_or_before", end=True)
+            if today is not None and ob > today:
+                ob = today
+                clamped["capped_to_today"] = True
+            out["on_or_before"] = ob.isoformat()
         if "date_from" in raw:
             lo = _one_date(raw["date_from"], today, "date_from", end=False)
+            # None means absent (a single day); "" is a malformed date.
             hi = (_one_date(raw["date_to"], today, "date_to", end=True)
-                  if raw.get("date_to") else
+                  if raw.get("date_to") is not None else
                   _one_date(raw["date_from"], today, "date_from", end=True))
             if hi < lo:
                 raise _Bad("date_to")
+            if today is not None and hi > today:
+                if lo > today:
+                    raise _Bad("date_from")   # wholly in the future: nothing to read
+                hi = today
+                clamped["capped_to_today"] = True
             max_days = MAX_DAYS.get(name, DEFAULT_MAX_DAYS)
             if (hi - lo).days + 1 > max_days:
-                out["clamped"] = {"requested_to": hi.isoformat(), "max_days": max_days}
-                hi = lo + timedelta(days=max_days - 1)
+                # Keep the most recent days: questions are about recent activity.
+                clamped["requested_from"] = lo.isoformat()
+                clamped["max_days"] = max_days
+                lo = hi - timedelta(days=max_days - 1)
             out["date_from"], out["date_to"] = lo.isoformat(), hi.isoformat()
         elif "date_to" in raw:
             raise _Bad("date_from")
+        if clamped:
+            out["clamped"] = clamped
         return out, None
     except _Bad as bad:
         return None, {"error": "bad_args", "field": bad.field}
