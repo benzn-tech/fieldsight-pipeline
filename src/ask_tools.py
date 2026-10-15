@@ -31,8 +31,9 @@ MAX_DAYS = {"day_overview": 7}
 DEFAULT_MAX_DAYS = 92
 MAX_K = 12
 
+_SPOKEN_DATES = "Resolve spoken dates (e.g. '3 September', 'last Tuesday') to ISO before calling."
 _DATE_DESC = ("ISO date YYYY-MM-DD in the user's local time, or one of: "
-              + ", ".join(RELATIVE_DATES) + ".")
+              + ", ".join(RELATIVE_DATES) + ". " + _SPOKEN_DATES)
 # Without date_to a range is ONE day; the model must be told, or "since Oct 1"
 # silently becomes "on Oct 1".
 _DATE_TO = {"type": "string",
@@ -53,7 +54,8 @@ TOOLS = [
     _fn("day_overview",
         "List what was recorded on a day or a few days (up to 7): every topic with "
         "time, site, who, and a one-line summary. Use for 'what did we do yesterday'. "
-        "When nothing is recorded, meta.latest_before gives the latest earlier day.",
+        "When nothing is recorded, meta.latest_before gives the latest earlier day. "
+        + _SPOKEN_DATES,
         {"date_from": {"type": "string", "description": _DATE_DESC},
          "date_to": _DATE_TO,
          "site": _SITE, "person": _PERSON},

@@ -55,12 +55,11 @@ def is_content_free(question, today=None):
     sentence would never read as content-free. Each unspaced run has the known
     phrases cut out of it instead, and any character left over is content.
 
-    A spoken date or weekday ("on 3 September", "9月3日", "on Tue", "周二") is
-    non-content ONLY when time_range actually anchored on it for this question
-    and this `today` (query_slots.spoken_anchor gives the exact span). There is
-    deliberately no global list of month names, short weekday forms, ordinals
-    or 月/日/号: "until Friday", "the dec 2 slab" and "9月3号楼" do not anchor,
-    so every word in them stays content.
+    "last Tue" (query_slots' one spoken-date rule) is non-content ONLY when
+    time_range actually anchored on it for this question and this `today`;
+    query_slots.spoken_anchor gives the exact span. There is deliberately no
+    global list of short weekday forms or month names, so words that did not
+    anchor stay content.
     """
     q = question if isinstance(question, str) else ""
     hit = query_slots.spoken_anchor(q, today)

@@ -170,196 +170,69 @@ def _time_range_v1(question, today):
 
 
 # ==========================================================================
-# Spoken dates: day + month, and weekday names (2026-10-16).
+# "last <weekday>" (2026-10-16): the one spoken-date rule kept.
 #
-# PRECISION OVER RECALL. A wrong range silently filters Ask to the wrong day,
-# which is strictly worse than no range (search everything). Every rule below
-# therefore fires only on a narrow, closed shape and returns nothing when in
-# doubt. A site sentence is full of words that look like dates and are not:
-# "Level 3 May inspection", "march 3 crews", "dec 2 slab", "Monday Street",
-# "due Friday", "上周二层浇筑", "9月3号楼".
+# WHY ONLY THIS ONE. Two review rounds showed that regexes cannot tell a past
+# day from a future one ("we pour on Friday"), a deadline from an event ("due
+# by 30 November", 11月30日前), a habit from an instance (逢周二), or a date
+# from a label ("Rev 3 Mar"). Each new guard uncovered a new class of misread.
+# A wrong range silently filters Ask to the wrong day, which is worse than no
+# range. So general spoken dates are left to the Ask judge model, which knows
+# today and writes ISO dates into tool arguments that the tool layer
+# validates and caps. "last Tuesday" is kept because it is unambiguous: it
+# always names a past day.
 #
 # OLD ANCHORS ARE IMMUTABLE. `time_range` runs the original parser
-# (`_time_range_v1`, byte-identical to 86262261) first, and these rules run
-# ONLY when it returned (None, None). So any sentence that anchored before
-# keeps exactly the range it had: "上周二" is still the whole of last week
-# (上周 wins), "last week on Tuesday" is still last week, and "昨天9月3号楼"
-# is still yesterday. Pinned against a frozen copy of the old module in
+# (`_time_range_v1`, byte-identical in behaviour to 86262261) first, and this
+# rule runs ONLY when that returned (None, None). "last week on Tuesday"
+# stays last week. Pinned against a frozen copy of the old module in
 # tests/unit/test_query_slots_old_anchors.py.
 # ==========================================================================
 
-# --- Day + month ----------------------------------------------------------
-# "3 September", "3rd of Sep", "September 3", "Sept 3rd", "Sep. 3", optionally
-# with a year. The month word is only a month when it is glued to a day
-# number, AND the date ends the noun phrase: what follows must be the end of
-# the text, punctuation, or one of a few words that cannot continue a noun
-# phrase. "3 Sep pour" is therefore NOT a date -- losing it is the price of
-# never reading "the dec 2 slab" or "march 3 crews" as one.
-_MONTH = (r"(?P<mon{n}>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?"
-          r"|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b\.?")
-_ORD = r"(?:st|nd|rd|th)?"
-_YEAR = r"(?:,?\s+(?P<y{n}>\d{{4}})\b)?"
-_DATE_END = (r"(?=\s*$|\s*[^\w\s]|\s+(?:and|or|at|in|on|we|i|they|did|was|were|what"
-             r"|when|about)\b)")
-_DAY_MONTH_EN = re.compile(
-    r"\b(?P<d1>\d{1,2})" + _ORD + r"\s+(?:of\s+)?" + _MONTH.format(n=1)
-    + _YEAR.format(n=1) + _DATE_END
-    + r"|\b" + _MONTH.format(n=2) + r"\s*(?P<d2>\d{1,2})" + _ORD + r"\b"
-    + _YEAR.format(n=2) + _DATE_END,
-    re.IGNORECASE,
-)
-# "9月3日", "2026年9月3日", "9月3号". 号 also numbers buildings, lines,
-# machines and piles (9月3号楼 = "building 3 in September"), so a 号/日 that
-# a word-forming character follows is not a date.
-_DAY_MONTH_ZH = re.compile(
-    r"(?:(?P<y3>\d{4})\s*年\s*)?(?<!\d)(?P<m3>\d{1,2})\s*月\s*(?P<d3>\d{1,2})\s*[日号號]"
-    r"(?![楼樓线線机機桩樁栋棟层層门門座房室厅廳院区區段井位台车車口间間单單元])"
-)
-_MONTH_NUM = {k: i + 1 for i, k in enumerate(
-    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"))}
-
-# --- English weekdays -------------------------------------------------------
-# ONLY behind "on" / "last" / "this". A bare weekday is too often a deadline
-# ("due Friday"), a habit ("Monday to Friday"), or a name ("Friday Lane").
-# Sat/Sun are ordinary words ("sat down", "sun deck"), so their short forms
-# need "last"/"this"; "on Sat scaffold" is not a date.
-_WD_EN = re.compile(
-    r"\b(?P<mod>on|last|this)\s+"
-    r"(?:(?P<full>monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
-    r"|(?P<abbr>mon|tues?|weds?|thu(?:rs?)?|fri)\.?"
-    r"|(?<=(?:last|this)\s)(?P<ss>sat|sun)\.?"
-    r")\b"
-    # what may NOT follow: a possessive or plural, a range, a part of day in
-    # the plural (a habit), a street name
-    r"(?!['’]s?\b|s\b|\s*[-–—~]|\s+(?:to|till|until|through|thru)\b"
+# Full weekday names, or a 3-letter form, directly after "last". Not when it
+# continues into a range ("last Monday to Friday", "last Mon-Fri"), a
+# possessive or plural ("last Sunday's slab", "last Mondays"), a part of day in
+# the plural (a habit), "of" ("the last Friday of the month"), or a street.
+_LAST_WEEKDAY = re.compile(
+    r"\blast\s+(?P<wd>monday|tuesday|wednesday|thursday|friday|saturday|sunday"
+    r"|mon|tue|wed|thu|fri|sat|sun)\b\.?"
+    r"(?!['’]s?\b|s\b|\s*[-–—~]|\s+(?:to|till|until|through|thru|of)\b"
     r"|\s+(?:mornings|afternoons|evenings|nights)\b"
-    r"|\s+(?:street|st|road|rd|avenue|ave|lane)\b|\s+as\s+usual\b)",
+    r"|\s+(?:street|st|road|rd|avenue|ave|lane)\b)",
     re.IGNORECASE,
 )
-# What may NOT precede "on/last/this <weekday>": a deadline, a range start, a
-# habit or a future. "due on Friday", "until this Friday", "every last ...".
-_WD_EN_BLOCKED_BEFORE = re.compile(
-    r"\b(?:due|by|until|till|before|from|to|every|each|next|coming|following|good)\s+$",
-    re.IGNORECASE,
-)
+# "since last Monday" / "until last Friday" name a range or a bound, not the day.
+_LAST_WEEKDAY_BLOCKED_BEFORE = re.compile(
+    r"\b(?:since|until|till|from|before|after|by|due)\s+$", re.IGNORECASE)
 _WD_INDEX = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
-
-# --- Chinese weekdays -------------------------------------------------------
-# 周二 / 星期二 / 礼拜二, optionally behind 上(个) / 这(个) / 本. 上周X and 这周X
-# never reach here (the old 上周/这周 phrases anchor them first, and that is
-# final). The weekday character is also a numeral and 日/天 are nouns, so
-# 周二层 / 周日报 / 周五金 / 周天气 are words, not days: the weekday anchors
-# only when the text ends there, punctuation follows, or one of a short list
-# of particles / pronouns / verbs / parts of day starts the next word. That
-# list also excludes 到 / 至 (a range: 周一到周五) and 次 (一周一次).
-# 每 / 每个 / 下 / 下个 before it (a habit, the future) -> no anchor, and
-# neither end of a range anchors: 到 / 至 / ~ / - before the weekday as well.
-_WD_ZH = re.compile(
-    r"(?P<pre>上个|上個|上|这个|這個|这|這|本)?"
-    r"(?<![每下两兩几幾一二三四五六七八九十到至~～\-—–])(?<!每个)(?<!每個)(?<!下个)(?<!下個)"
-    r"(?:周|週|星期|礼拜|禮拜)(?P<zd>[一二三四五六日天])"
-    r"(?=$|[\s，。,.!?！？、；;：:]"
-    r"|的|了|吗|嗎|呢|吧|我|你|他|她|咱|大家|有|做|干|幹|发生|發生|开会|開會"
-    r"|讨论|討論|说|說|谈|談|在|和|跟|与|與|那|上午|下午|早上|晚上|中午|都|是"
-    r"|怎|什么|什麼|见|見|去|来|來)"
-)
-_ZH_INDEX = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
-
-
-def _plausible_year(y, today):
-    """A 4-digit number after a date is a year only when it is 19xx/20xx and,
-    with an anchor, within one year of it -- "Sept 3 2000 litres" is litres."""
-    if not 1900 <= y <= 2099:
-        return False
-    return not isinstance(today, date) or abs(y - today.year) <= 1
-
-
-def _spoken_day_month(text, today):
-    """(date, span) for the first well-formed day+month, else None.
-
-    Without a year: the most recent such day on or before `today` (else last
-    year). An impossible date -- 31 Sep, 30 Feb, and 29 Feb with no year in a
-    non-leap year (deliberately None rather than stepping back to the last
-    leap year) -- is None. A year that is not plausible voids the anchor."""
-    for pattern in (_DAY_MONTH_EN, _DAY_MONTH_ZH):
-        m = pattern.search(text)
-        if not m:
-            continue
-        g = m.groupdict()
-        if g.get("m3"):
-            month, day, year = int(g["m3"]), int(g["d3"]), g.get("y3")
-        else:
-            month = _MONTH_NUM[(g["mon1"] or g["mon2"]).lower()[:3]]
-            day = int(g["d1"] or g["d2"])
-            year = g.get("y1") or g.get("y2")
-        if year:
-            y = int(year)
-            if not _plausible_year(y, today):
-                return None
-        elif isinstance(today, date):
-            y = today.year if (month, day) <= (today.month, today.day) else today.year - 1
-        else:
-            return None
-        try:
-            return date(y, month, day), m.span()
-        except ValueError:
-            return None
-    return None
-
-
-def _spoken_weekday(text, today):
-    """(date, span) for a weekday phrase, else None.
-
-    "on X" / "last X" / bare Chinese 周X: the most recent X STRICTLY before
-    today -- said on a Monday, "on Monday" is a week ago, not this morning.
-    "this X" / 这(个)X / 本X: X of the current Mon-Sun week, only if <= today.
-    上礼拜X / 上个周X (the 上 forms the old 上周/上星期 phrases do not cover): X
-    of the previous calendar week."""
-    m = _WD_ZH.search(text)
-    if m:
-        wd = _ZH_INDEX[m.group("zd")]
-        pre = (m.group("pre") or "")[:1]
-        mod = {"上": "prev", "这": "this", "這": "this", "本": "this"}.get(pre, "")
-    else:
-        m = None
-        for cand in _WD_EN.finditer(text):
-            if not _WD_EN_BLOCKED_BEFORE.search(text[:cand.start()]):
-                m = cand
-                break
-        if m is None:
-            return None
-        word = m.group("full") or m.group("abbr") or m.group("ss")
-        wd = _WD_INDEX[word.lower()[:3]]
-        mod = "this" if m.group("mod").lower() == "this" else ""
-    monday = _monday_of(today)
-    if mod == "prev":
-        return monday - timedelta(days=7) + timedelta(days=wd), m.span()
-    if mod == "this":
-        d = monday + timedelta(days=wd)
-        return (d, m.span()) if d <= today else None
-    back = (today.weekday() - wd) % 7 or 7
-    return today - timedelta(days=back), m.span()
 
 
 def spoken_anchor(question, today):
-    """(date, (start, end)) when `time_range` anchored on a NEW spoken-date
-    rule for this question, else None. search_browse uses the span to treat
-    exactly those characters -- and nothing else -- as non-content."""
+    """(date, (start, end)) when `time_range` anchored on "last <weekday>" for
+    this question, else None. search_browse uses the span to treat exactly
+    those characters -- and nothing else -- as non-content.
+
+    The day is the most recent such weekday STRICTLY before today: said on a
+    Monday, "last Monday" is a week ago, not this morning."""
     text = question if isinstance(question, str) else ""
-    if not text.strip() or _time_range_v1(text, today) != (None, None):
+    if not isinstance(today, date) or not text.strip():
         return None
-    hit = _spoken_day_month(text, today)
-    if hit is None and isinstance(today, date):
-        hit = _spoken_weekday(text, today)
-    return hit
+    if _time_range_v1(text, today) != (None, None):
+        return None
+    for m in _LAST_WEEKDAY.finditer(text):
+        if _LAST_WEEKDAY_BLOCKED_BEFORE.search(text[:m.start()]):
+            continue
+        wd = _WD_INDEX[m.group("wd").lower()[:3]]
+        back = (today.weekday() - wd) % 7 or 7
+        return today - timedelta(days=back), m.span()
+    return None
 
 
 def time_range(question, today):
     """(date_from, date_to) as ISO strings, or (None, None).
 
     The original rules (`_time_range_v1`) run first and their answer is final;
-    the spoken day+month and weekday rules only fill a gap they left. See the
-    block comment above `_MONTH`.
+    "last <weekday>" only fills a gap they left. See the block comment above.
     """
     result = _time_range_v1(question, today)
     if result != (None, None):
