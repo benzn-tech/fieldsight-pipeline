@@ -1338,6 +1338,19 @@ Parameters:
       on = org-api serves a company caller its own per-company daily summary. off
       (default) = the summary route behaves as before. Owner product decision.
 
+  # Template digitise (spec 2026-10-16): org-api's /templates/digitise routes. Wired in
+  # three pieces, pinned by tests/unit/test_template_digitise_wiring.py: this Parameter ->
+  # OrgApiFunction env TEMPLATE_DIGITISE -> lambda_org_api._template_digitise_on().
+  TemplateDigitise:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      When true, org-api serves /templates/digitise (read a checklist form from a photo,
+      PDF or Word file into a draft template). False (default) answers 404 on those
+      routes, which is the UI's only gate. Set per environment by the repo variables
+      TEST_TEMPLATE_DIGITISE / PROD_TEMPLATE_DIGITISE.
+
   VoiceprintMaxFrameSpread:
     Type: String
     Default: 'default'
@@ -2794,6 +2807,8 @@ Resources:
           SEARCH_INDEX_WRITE: !Ref SearchIndexWrite
           # owner product decision (see the CompanySummaryServe parameter)
           COMPANY_SUMMARY_SERVE: !Ref CompanySummaryServe
+          # off -> /templates/digitise answers 404 (see the TemplateDigitise parameter)
+          TEMPLATE_DIGITISE: !Ref TemplateDigitise
       Policies:
         # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
         # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
@@ -3072,6 +3087,33 @@ Resources:
               # valid if the role can GetObject the key).
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_report_requests/*
+            - Effect: Allow
+              # Template digitise (spec 2026-10-16). POST /templates/digitise/upload-url
+              # presigns a PUT into template_sources/ (a presigned PUT is only valid if
+              # this role may PutObject the key); POST /templates/digitise HEADs each
+              # upload and writes the request the non-VPC TemplateDigitiseFunction is
+              # triggered by; GET /templates/digitise/{id} reads the request (pending vs
+              # 404), the result, and presigns the sources for the review screen.
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/template_sources/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/template_digitise_requests/*
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/template_digitise_results/*
+            - Effect: Allow
+              # Without ListBucket a missing key answers AccessDenied, not NoSuchKey, and
+              # "pending" / "never uploaded" become 500s (test_missing_key_must_read_as_404).
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - template_sources/*
+                    - template_digitise_requests/*
+                    - template_digitise_results/*
             - Effect: Allow
               # POST /api/org/reports/regenerate: the caller's own report, handed to
               # the non-VPC ReportGeneratorFunction as report_requests/<folder>/<rid>.json

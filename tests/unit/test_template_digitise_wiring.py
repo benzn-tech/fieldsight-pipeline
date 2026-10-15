@@ -133,3 +133,50 @@ def test_a_failed_run_is_not_retried_into_a_second_paid_model_call():
     """Async S3 delivery retries twice by default; each retry re-runs the vision call.
     A result write that fails must not buy the same reading again (controller ruling)."""
     assert _fn()["EventInvokeConfig"]["MaximumRetryAttempts"] == 0
+
+
+WORKFLOWS = {"test": os.path.join(REPO, ".github", "workflows", "deploy.yml"),
+             "prod": os.path.join(REPO, ".github", "workflows", "deploy-prod.yml")}
+
+
+def _list_prefixes(fn, bucket="IngestBucketName"):
+    out = []
+    for st in _statements(fn):
+        if "s3:ListBucket" not in _as_list(st.get("Action")):
+            continue
+        if not any(isinstance(r, str) and r.endswith("${%s}" % bucket)
+                   for r in _as_list(st.get("Resource"))):
+            continue
+        out += _as_list(((st.get("Condition") or {}).get("StringLike") or {}).get("s3:prefix"))
+    return out
+
+
+def test_the_switch_exists_defaults_off_and_reaches_org_api():
+    tpl = _yaml.load(io.open(TEMPLATE, encoding="utf-8").read(), Loader=_Loader)
+    p = tpl["Parameters"]["TemplateDigitise"]
+    assert p["Default"] == "false" and p["AllowedValues"] == ["true", "false"]
+    env = _fn("OrgApiFunction")["Environment"]["Variables"]
+    assert env["TEMPLATE_DIGITISE"] == "TemplateDigitise"   # the !Ref, as the loader reads it
+
+
+def test_both_workflows_pass_the_switch_and_default_it_off():
+    for stage, path in WORKFLOWS.items():
+        text = open(path, encoding="utf-8").read()
+        line = '"TemplateDigitise=${{ vars.%s_TEMPLATE_DIGITISE || \'false\' }}"' % stage.upper()
+        assert line in text, f"{stage} cannot set TemplateDigitise"
+
+
+def test_org_api_may_do_exactly_what_the_routes_do():
+    g = _grants(_fn("OrgApiFunction"))
+    assert ("s3:PutObject", "template_digitise_requests/*") in g      # the request
+    assert ("s3:PutObject", "template_sources/*") in g                # a presigned PUT is the role's
+    assert ("s3:GetObject", "template_sources/*") in g                # HEAD + the preview presign
+    assert ("s3:GetObject", "template_digitise_results/*") in g       # the poll
+    assert ("s3:GetObject", "template_digitise_requests/*") in g      # pending vs 404
+    assert ("s3:PutObject", "template_digitise_results/*") not in g   # the worker's alone
+
+
+def test_org_api_can_tell_a_missing_key_from_a_denied_one_on_all_three():
+    prefixes = _list_prefixes(_fn("OrgApiFunction"))
+    for p in ("template_sources/*", "template_digitise_requests/*", "template_digitise_results/*"):
+        assert p in prefixes, f"{p}: a missing key would read as AccessDenied (500), not 404"
