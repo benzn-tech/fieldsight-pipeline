@@ -6,8 +6,20 @@ this module (rule 2; tests/unit/test_project_docs_contamination.py).
 
 Locks: every write that touches a series (insert of a revision, delete, apply) takes
 pg_advisory_xact_lock on that series first, so the revision number, the supersede and the
-"bring back the predecessor" step see one consistent series (spec ruling 8).
+supersede recompute see one consistent series (spec ruling 8). Callers MUST run
+insert_document / soft_delete / apply_result inside `conn.transaction()` on a
+non-autocommit connection: the advisory lock and FOR UPDATE only hold for the transaction.
+
+Supersede invariant: a live row is superseded only while a live, INDEXED higher revision of
+its series exists. `_recompute_superseded` restores that after every delete and every apply,
+so an unreadable, failed, pending or deleted higher revision never hides the last good one.
+
+Keyword search uses the 'simple' parser, which splits on spaces and punctuation only. Chinese
+written without spaces becomes ONE token per run, so a term matches only a whole run (e.g.
+"保护层" does not match "保护层厚度40毫米"); the vector arm carries unsegmented text. How
+non-Latin letters are classified also depends on the database's LC_CTYPE.
 """
+import math
 import uuid
 
 from psycopg.rows import dict_row
@@ -28,6 +40,18 @@ _UPLOADER = "NULLIF(btrim(concat_ws(' ', u.first_name, u.last_name)), '') AS upl
 def _lock_series(conn, series_id):
     conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
                  (f"project_doc_series:{series_id}",))
+
+
+def _recompute_superseded(conn, series_id):
+    """Clear superseded_at on every live row that no live, indexed higher revision covers.
+    Run under the series lock. Only clears: superseding is done when a revision lands
+    indexed (apply_result), which is the only way a covering revision comes into being."""
+    conn.execute(
+        "UPDATE project_documents d SET superseded_at = NULL WHERE d.series_id = %s "
+        "AND d.deleted_at IS NULL AND d.superseded_at IS NOT NULL AND NOT EXISTS ("
+        "  SELECT 1 FROM project_documents h WHERE h.series_id = d.series_id "
+        "  AND h.revision > d.revision AND h.deleted_at IS NULL AND h.status = 'indexed')",
+        (str(series_id),))
 
 
 def get_document(conn, doc_id):
@@ -87,40 +111,53 @@ def rename(conn, doc_id, title):
 
 
 def mark_pending(conn, doc_id):
-    """Retry: back to pending, reason cleared, the 20-minute clock restarted."""
+    """Retry: back to pending, reason cleared, the 20-minute clock restarted. Only for an
+    error / unreadable / stale pending document; False for an indexed (or deleted) one, so a
+    Retry can never take a searchable document out of search."""
     return conn.execute(
         "UPDATE project_documents SET status = 'pending', reason = NULL, requested_at = now() "
-        "WHERE id = %s AND deleted_at IS NULL RETURNING id", (str(doc_id),)).fetchone() is not None
+        "WHERE id = %s AND deleted_at IS NULL AND status <> 'indexed' RETURNING id",
+        (str(doc_id),)).fetchone() is not None
 
 
 def soft_delete(conn, doc_id):
-    """Soft delete. Deleting the CURRENT revision (no live higher revision) clears
-    superseded_at on its immediate live predecessor in the same transaction, so the list
-    and search agree on what the document now says (R8)."""
+    """Soft delete, then recompute the series' supersede state in the same transaction:
+    deleting the indexed revision that covered older ones brings back the newest of them
+    that no other live indexed revision covers, so list and search agree (R8)."""
     row = get_document(conn, doc_id)
     if row is None or row["deleted_at"] is not None:
         return False
     _lock_series(conn, row["series_id"])
-    conn.execute("UPDATE project_documents SET deleted_at = now() "
-                 "WHERE id = %s AND deleted_at IS NULL", (str(doc_id),))
-    higher = conn.execute(
-        "SELECT 1 FROM project_documents WHERE series_id = %s AND revision > %s "
-        "AND deleted_at IS NULL", (str(row["series_id"]), row["revision"])).fetchone()
-    if higher is None:
-        conn.execute(
-            "UPDATE project_documents SET superseded_at = NULL WHERE id = ("
-            "  SELECT id FROM project_documents WHERE series_id = %s AND revision < %s "
-            "  AND deleted_at IS NULL ORDER BY revision DESC LIMIT 1)",
-            (str(row["series_id"]), row["revision"]))
+    if conn.execute("UPDATE project_documents SET deleted_at = now() "
+                    "WHERE id = %s AND deleted_at IS NULL RETURNING id",
+                    (str(doc_id),)).fetchone() is None:
+        return False                                    # deleted concurrently
+    _recompute_superseded(conn, row["series_id"])
     return True
 
 
+def _is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _int_or_none(v):
+    return v if _is_int(v) else None
+
+
 def _valid_chunks(chunks):
+    """Every chunk well-formed enough to insert without Postgres raising: text, an int
+    ordinal, int-or-None pages and EMBED_DIM finite numbers (NaN/inf would poison distances)."""
     for c in chunks:
+        if not isinstance(c, dict):
+            return False
         emb = c.get("embedding")
         if (not isinstance(c.get("chunk_text"), str) or not c["chunk_text"].strip()
+                or not _is_int(c.get("ordinal"))
+                or any(c.get(p) is not None and not _is_int(c.get(p))
+                       for p in ("page_from", "page_to"))
                 or not isinstance(emb, list) or len(emb) != EMBED_DIM
-                or not isinstance(c.get("ordinal"), int)):
+                or not all(isinstance(x, (int, float)) and not isinstance(x, bool)
+                           and math.isfinite(x) for x in emb)):
             return False
     return True
 
@@ -132,8 +169,9 @@ def apply_result(conn, result):
     the document is missing, deleted, or owned by another company than the artifact says.
     `indexed` supersedes every lower revision, pending ones included -- so the artifact of a
     lower revision that arrives AFTER a higher one was indexed lands already superseded
-    (apply never clears its own superseded_at; spec ruling 5). An unreadable/error result
-    supersedes nothing: the previous revision stays searchable."""
+    (spec ruling 5). An unreadable/error result supersedes nothing, and every apply ends
+    with `_recompute_superseded`, so a revision that turns unreadable/error hands search
+    back to the newest older indexed one."""
     doc_id = str(result.get("document_id") or "")
     try:
         uuid.UUID(doc_id)
@@ -155,9 +193,11 @@ def apply_result(conn, result):
     conn.execute("DELETE FROM project_doc_chunks WHERE document_id = %s", (doc_id,))
     status = result.get("status")
     chunks = result.get("chunks") or []
+    pages, chars = _int_or_none(result.get("pages")), _int_or_none(result.get("chars"))
     if status == "indexed" and (not chunks or not _valid_chunks(chunks)):
         conn.execute("UPDATE project_documents SET status = 'error', reason = %s, chunks = 0, "
                      "indexed_at = NULL WHERE id = %s", (MSG_INVALID, doc_id))
+        _recompute_superseded(conn, row["series_id"])
         return "invalid"
     if status == "indexed":
         conn.cursor().executemany(
@@ -168,18 +208,19 @@ def apply_result(conn, result):
         conn.execute(
             "UPDATE project_documents SET status = 'indexed', reason = NULL, pages = %s, "
             "chars = %s, chunks = %s, indexed_at = now() WHERE id = %s",
-            (result.get("pages"), result.get("chars"), len(chunks), doc_id))
+            (pages, chars, len(chunks), doc_id))
         conn.execute(
             "UPDATE project_documents SET superseded_at = now() WHERE series_id = %s "
             "AND revision < %s AND superseded_at IS NULL",
             (str(row["series_id"]), row["revision"]))
+        _recompute_superseded(conn, row["series_id"])
         return "indexed"
     final = status if status in ("unreadable", "error") else "error"
     conn.execute(
         "UPDATE project_documents SET status = %s, reason = %s, pages = %s, chars = %s, "
         "chunks = 0, indexed_at = NULL WHERE id = %s",
-        (final, result.get("reason") or MSG_INVALID, result.get("pages"), result.get("chars"),
-         doc_id))
+        (final, result.get("reason") or MSG_INVALID, pages, chars, doc_id))
+    _recompute_superseded(conn, row["series_id"])
     return final
 
 
