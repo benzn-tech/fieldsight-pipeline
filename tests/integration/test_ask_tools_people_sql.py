@@ -138,3 +138,82 @@ def test_candidates_exclude_archived_membership(db, w):
     db.execute("INSERT INTO memberships (user_id, site_id, role, archived_at) "
                "VALUES (%s, %s, 'worker', now())", (gone["id"], w["sa"]["id"]))
     assert str(gone["id"]) not in recordings.author_candidates_in_sites(db, [w["sa"]["id"]])
+
+
+# ---- fix round 1 -------------------------------------------------------------------
+
+def _rec(db, co, user, site, key):
+    return recordings.insert_pending(db, co["id"], user["id"], site["id"], "audio",
+                                     f"users/x/audio/2026-10-14/{key}.wav", key,
+                                     "2026-10-14T01:00:00Z")
+
+
+def test_recording_only_author_is_a_candidate_and_findable(db, w):
+    rec_only = _user(db, w["a"], "Tama_Rec", "Tama", "Rec")
+    _rec(db, w["a"], rec_only, w["sa"], "tama-1")
+    assert str(rec_only["id"]) in recordings.author_candidates_in_sites(db, [w["sa"]["id"]])
+    got = users.find_visible_people(db, w["a"]["id"], [w["sa"]["id"]], None, "tama")
+    assert [p["person_ref"] for p in got] == [str(rec_only["id"])]
+    assert users.person_in_reach(db, [w["sa"]["id"]], None, str(rec_only["id"]))
+
+
+def test_null_user_topic_is_not_a_candidate_and_does_not_crash(db, w):
+    topics.upsert_topic(db, w["sa"]["id"], "2026-10-14", "orphan", user_id=None,
+                        source_s3_key="reports/2026-10-14/x/daily_report.json")
+    cands = recordings.author_candidates_in_sites(db, [w["sa"]["id"]])
+    assert "None" not in cands and None not in cands
+    assert cands == {str(w["mike1"]["id"]), str(w["mike2"]["id"])}
+    got = users.find_visible_people(db, w["a"]["id"], [w["sa"]["id"]], None, "mike")
+    assert sorted(p["name"] for p in got) == ["Mike Smith", "Mike Tane"]
+
+
+def test_recordings_user_id_cannot_be_null(db, w):
+    # The recordings arm's `user_id IS NOT NULL` is defence in depth: the schema
+    # (0009) already forbids a NULL author, so no such row can exist to test against.
+    import psycopg
+    with pytest.raises(psycopg.errors.NotNullViolation):
+        with db.transaction():
+            db.execute("INSERT INTO recordings (company_id, user_id, site_id, kind, s3_key, "
+                       "client_uuid, started_at) VALUES (%s, NULL, %s, 'audio', 'k', 'c', now())",
+                       (w["a"]["id"], w["sa"]["id"]))
+
+
+def test_person_in_reach_malformed_ref_is_false_without_db(db, w):
+    class _NoDb:
+        def __getattr__(self, name):
+            raise AssertionError(f"DB touched: {name}")
+    for ref in ("not-a-uuid", "None", "123", "'; drop table users; --", None, "", 42):
+        assert users.person_in_reach(_NoDb(), [w["sa"]["id"]], None, ref) is False, ref
+
+
+def test_person_in_reach_accepts_canonicalisable_ref(db, w):
+    ref = str(w["mike1"]["id"])
+    assert users.person_in_reach(db, [w["sa"]["id"]], None, ref.upper())
+    assert users.person_in_reach(db, [w["sa"]["id"]], {ref}, "{" + ref + "}")
+    assert users.person_in_reach(db, [w["sa"]["id"]], None, w["mike1"]["id"])
+
+
+def test_stored_double_space_name_matches(db, w):
+    mj = _user(db, w["a"], "Mary_Jane", "Mary  Jane", "Ruru")
+    topics.upsert_topic(db, w["sa"]["id"], "2026-10-14", "z", user_id=mj["id"],
+                        source_s3_key="extractions/2026-10-14/z/a.json")
+    for q in ("mary jane", "Mary  Jane", "mary jane ruru", "MARY_JANE"):
+        got = users.find_visible_people(db, w["a"]["id"], [w["sa"]["id"]], None, q)
+        assert [p["person_ref"] for p in got] == [str(mj["id"])], q
+
+
+def test_double_underscore_folder_matches(db, w):
+    ab = _user(db, w["a"], "Aroha__Brown", "Aroha", None)
+    topics.upsert_topic(db, w["sa"]["id"], "2026-10-14", "z", user_id=ab["id"],
+                        source_s3_key="extractions/2026-10-14/z/b.json")
+    for q in ("aroha brown", "Aroha__Brown", "aroha_brown", "aroha  brown"):
+        got = users.find_visible_people(db, w["a"]["id"], [w["sa"]["id"]], None, q)
+        assert [p["person_ref"] for p in got] == [str(ab["id"])], q
+
+
+def test_alias_terms_normalised_like_names(db, w):
+    db.execute("INSERT INTO name_aliases (company_id, wrong_term, right_term, kind) "
+               "VALUES (%s, ' Big__Mike ', 'mike_  tane', 'person')", (w["a"]["id"],))
+    for q in ("big mike", "Big  Mike", "big_mike"):
+        got = users.find_visible_people(db, w["a"]["id"], [w["sa"]["id"]], None, q)
+        assert [p["name"] for p in got] == ["Mike Tane"], q
