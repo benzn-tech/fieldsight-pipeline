@@ -453,3 +453,20 @@ def test_web_tool_w1_text_carries_no_numeric_markers(monkeypatch):
     env = orch.web_tool("q", 20, False, RefAssigner())
     assert env["items"][0]["text"] == "Cover is 40 mm per NZS."
     assert env["block"]["answer"] == "Cover is 40 mm [1] per NZS [2, 3]."   # client block as today
+
+
+def test_hung_records_batch_is_bounded_by_the_answer_reserve(no_model):
+    release = threading.Event()
+    tools = FakeTools(_rows, before=lambda calls: release.wait(5))
+    route = {}
+    t = time.monotonic()
+    try:
+        envs, web = orch.run_round1(_req(), _ctx(deadline_in=orch.FINAL_RESERVE_S + 0.3),
+                                    tools, route=route)
+        elapsed = time.monotonic() - t
+    finally:
+        release.set()
+    assert elapsed < 2
+    assert route["records_late"] is True
+    assert [e["meta"]["error"] for e in envs] == ["timeout"]
+    assert envs[0]["tool"] == "search_records" and envs[0]["round"] == 1

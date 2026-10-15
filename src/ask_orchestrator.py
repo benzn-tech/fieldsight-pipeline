@@ -612,7 +612,19 @@ def run_round1(req, ctx, tools=None, *, route=None, on_web_start=None):
         if pol in ("auto", "required"):
             web = pool.submit(_web_round1, req.get("question"), pol, ctx, voice, t0, route,
                               on_web_start)
-        envelopes = rec.result()
+        # Bounded: the shared boto3 Lambda client has the default 60 s read
+        # timeout and retries, so a hung rag-search must not hold the turn past
+        # the answer reserve (and into the worker's 60 s kill).
+        try:
+            envelopes = rec.result(
+                timeout=max(0.0, ctx.deadline - ctx.clock() - FINAL_RESERVE_S))
+        except FuturesTimeout:
+            route["records_late"] = True
+            logger.warning("ask orch records_late=true")
+            envelopes = [{"tool": c["name"], "id": str(i), "items": [],
+                          "meta": {"error": "timeout", "truncated": False},
+                          "args": dict(c["args"]), "round": 1}
+                         for i, c in enumerate(calls)]
         web_env = None
         if web is not None:
             try:
