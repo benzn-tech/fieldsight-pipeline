@@ -1,0 +1,38 @@
+{
+ "penina_photo": {
+  "truth_items": 115,
+  "pred_items": 115,
+  "recall": 1.0,
+  "precision": 1.0,
+  "exact": 1.0,
+  "strict": 1.0,
+  "order": 1.0,
+  "sec_titles": "19/19 (pred 19)",
+  "item_in_right_section": 1.0,
+  "sec": 38.7
+ },
+ "bicl_photo": {
+  "truth_items": 47,
+  "pred_items": 47,
+  "recall": 1.0,
+  "precision": 1.0,
+  "exact": 1.0,
+  "strict": 1.0,
+  "order": 1.0,
+  "sec_titles": "11/11 (pred 11)",
+  "item_in_right_section": 1.0,
+  "sec": 17.1
+ },
+ "bicl_pdf": {
+  "truth_items": 47,
+  "pred_items": 47,
+  "recall": 1.0,
+  "precision": 1.0,
+  "exact": 1.0,
+  "strict": 1.0,
+  "order": 1.0,
+  "sec_titles": "11/11 (pred 11)",
+  "item_in_right_section": 1.0,
+  "sec": 12.5
+ }
+}

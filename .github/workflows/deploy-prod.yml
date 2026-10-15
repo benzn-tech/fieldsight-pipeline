@@ -286,6 +286,7 @@ jobs:
               "SearchIndexWrite=${{ vars.PROD_SEARCH_INDEX_WRITE || 'false' }}" \
               "SearchIndexRead=${{ vars.PROD_SEARCH_INDEX_READ || 'report' }}" \
               "CompanySummaryServe=${{ vars.PROD_COMPANY_SUMMARY_SERVE || 'off' }}" \
+              "TemplateDigitise=${{ vars.PROD_TEMPLATE_DIGITISE || 'false' }}" \
               "EnableUserDeletion=${{ vars.PROD_ENABLE_USER_DELETION || 'false' }}" \
               "EnableExternalCorroboration=${{ vars.PROD_ENABLE_EXTERNAL_CORROBORATION || 'false' }}" \
               "CorroborationApiKey=${{ secrets.OPENROUTER_API_KEY }}" \

@@ -1247,6 +1247,19 @@ Parameters:
       on = org-api serves a company caller its own per-company daily summary. off
       (default) = the summary route behaves as before. Owner product decision.
 
+  # Template digitise (spec 2026-10-16): org-api's /templates/digitise routes. Wired in
+  # three pieces, pinned by tests/unit/test_template_digitise_wiring.py: this Parameter ->
+  # OrgApiFunction env TEMPLATE_DIGITISE -> lambda_org_api._template_digitise_on().
+  TemplateDigitise:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      When true, org-api serves /templates/digitise (read a checklist form from a photo,
+      PDF or Word file into a draft template). False (default) answers 404 on those
+      routes, which is the UI's only gate. Set per environment by the repo variables
+      TEST_TEMPLATE_DIGITISE / PROD_TEMPLATE_DIGITISE.
+
   VoiceprintMaxFrameSpread:
     Type: String
     Default: 'default'
@@ -2344,6 +2357,68 @@ Resources:
         - VPCAccessPolicy: {}
 
   # ----------------------------------------------------------
+  # Template digitise worker (spec 2026-10-16). Reads a checklist form a person
+  # uploaded (template_sources/) into a DRAFT template: a Word file with python-docx,
+  # a PDF or photos with one vision call. Non-VPC: it calls OpenRouter, and org-api
+  # (in-VPC, no outbound) hands it the work through template_digitise_requests/
+  # (BUG-36). NO Events: wired by scripts/wire-s3-events.sh (fs-template-digitise,
+  # BUG-33). Its output prefix template_digitise_results/ matches no trigger.
+  # ----------------------------------------------------------
+  TemplateDigitiseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ["${P}-template-digitise", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_template_digitise.lambda_handler
+      Timeout: 900
+      MemorySize: 1024
+      # No async retry: a failed result write must not re-run the paid vision call.
+      # The source stays, so a person retries with POST /templates/digitise (spec).
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+      Runtime: python3.12  # python-docx-layer is built for cp312 (BUG-24); it also carries Pillow
+      Layers: !If
+        - HasDocxLayer
+        - - !Ref DocxLayerArn
+        - !Ref AWS::NoValue
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref IngestBucketName   # the lake -- where org-api writes requests and sources
+          LLM_PROVIDER: !Ref LlmProvider
+          # Carried because every LLM_PROVIDER carrier must carry it (wiring test); the
+          # vision call sends temperature 0 explicitly whatever this says (ruling R3).
+          LLM_TEMPERATURE: !Ref LlmTemperature
+          QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
+          QWEN_BASE_URL: !Ref QwenBaseUrl
+          LLM_CHAIN_BUDGET_SECONDS: '840'  # Lambda Timeout 900 - 60
+          # A 115-item form took 27-40 s in the spike; 300 s leaves the chain room to retry.
+          LLM_HTTP_TIMEOUT: '300'
+          # EMPTY on purpose. Globals sets the TEXT models' chain; this function never
+          # calls call_llm, and a text model handed page images would invent items.
+          LLM_FALLBACK_MODELS: ''
+          TEMPLATE_DIGITISE_MODEL: google/gemini-3.8-flash
+          TEMPLATE_DIGITISE_FALLBACK_MODELS: ''
+      Policies:
+        # lake_put: the result write also appends one manifest line in the bucket it wrote to.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/template_digitise_requests/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/template_sources/*
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/template_digitise_results/*
+
+  # ----------------------------------------------------------
   # Lambda 10: Org API (Phase 3) — real write backend for
   # projects/members/roles/profile/images. In-VPC (psycopg → Aurora).
   # Gated by HasOrgApi (DbStackName + OrgUserPoolId both set).
@@ -2420,6 +2495,8 @@ Resources:
           SEARCH_INDEX_WRITE: !Ref SearchIndexWrite
           # owner product decision (see the CompanySummaryServe parameter)
           COMPANY_SUMMARY_SERVE: !Ref CompanySummaryServe
+          # off -> /templates/digitise answers 404 (see the TemplateDigitise parameter)
+          TEMPLATE_DIGITISE: !Ref TemplateDigitise
       Policies:
         # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
         # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
@@ -2698,6 +2775,33 @@ Resources:
               # valid if the role can GetObject the key).
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/session_report_requests/*
+            - Effect: Allow
+              # Template digitise (spec 2026-10-16). POST /templates/digitise/upload-url
+              # presigns a PUT into template_sources/ (a presigned PUT is only valid if
+              # this role may PutObject the key); POST /templates/digitise HEADs each
+              # upload and writes the request the non-VPC TemplateDigitiseFunction is
+              # triggered by; GET /templates/digitise/{id} reads the request (pending vs
+              # 404), the result, and presigns the sources for the review screen.
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/template_sources/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/template_digitise_requests/*
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/template_digitise_results/*
+            - Effect: Allow
+              # Without ListBucket a missing key answers AccessDenied, not NoSuchKey, and
+              # "pending" / "never uploaded" become 500s (test_missing_key_must_read_as_404).
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - template_sources/*
+                    - template_digitise_requests/*
+                    - template_digitise_results/*
             - Effect: Allow
               # POST /api/org/reports/regenerate: the caller's own report, handed to
               # the non-VPC ReportGeneratorFunction as report_requests/<folder>/<rid>.json

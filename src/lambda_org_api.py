@@ -187,6 +187,7 @@ import speaker_match_request
 from repositories import speaker_name_proposals
 from repositories import speaker_intro_suggestions
 import turn_name_overlay
+import template_types
 from transcript_utils import extract_base_time_from_filename, speaker_turns_from_items
 
 logger = logging.getLogger()
@@ -756,6 +757,15 @@ def dispatch(conn, event, method, route):
     m_tb = re.match(r"^/templates/bindings/([^/]+)$", route)
     if m_tb and method == "PUT":
         return set_report_template_binding(conn, caller, m_tb.group(1), event)
+    # Template digitise (spec 2026-10-16). Before every "/templates/{id}..." pattern
+    # below, or "digitise" is read as a template id.
+    if route == "/templates/digitise/upload-url" and method == "POST":
+        return digitise_upload_url(conn, caller, event)
+    if route == "/templates/digitise" and method == "POST":
+        return digitise_request(conn, caller, event)
+    m_td = re.match(r"^/templates/digitise/([^/]+)$", route)
+    if m_td and method == "GET":
+        return digitise_status(conn, caller, m_td.group(1), event)
     m_tvr = re.match(r"^/templates/([^/]+)/versions/([^/]+)/restore$", route)
     if m_tvr and method == "POST":
         return restore_report_template_version(conn, caller, m_tvr.group(1), m_tvr.group(2))
@@ -12751,6 +12761,171 @@ def create_report_template(conn, caller, event):
                                            caller["id"])
     fresh = report_templates.get_any(conn, row["id"])
     return ok(_template_payload(fresh, versions=[_version_payload(version)]), 201)
+
+
+# ---- Template digitise (spec 2026-10-16) ----------------------------------------------
+#
+# A person uploads a checklist form; a non-VPC worker reads it into a DRAFT; the person
+# checks it and saves it through POST /templates. Nothing here writes a template. org-api
+# is in-VPC with no outbound (BUG-36), so the read is handed off through the lake like
+# session reports: template_digitise_requests/ -> TemplateDigitiseFunction ->
+# template_digitise_results/. Off (the default), every route answers 404: the UI's only
+# gate is the route itself, because /me carries no feature list.
+
+_DIGITISE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_DIGITISE_SOURCE_RE = re.compile(
+    r"^template_sources/(?P<company>[^/]+)/[0-9a-f]{32}\.(?P<ext>pdf|docx|jpg|jpeg|png)$")
+DIGITISE_MAX_AGE = timedelta(days=7)
+DIGITISE_PREVIEW_EXPIRY = 3600
+_DIGITISE_PUBLIC = ("id", "status", "name", "sections", "counts", "flags", "route", "model",
+                    "pages", "error", "reason")
+
+
+def _template_digitise_on():
+    """Read per call so a test, or an emergency env edit, takes effect without a reload."""
+    return os.environ.get("TEMPLATE_DIGITISE", "false").lower() == "true"
+
+
+def _s3_missing(e):
+    return e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404", "NotFound")
+
+
+def digitise_upload_url(conn, caller, event):
+    """POST /api/org/templates/digitise/upload-url {filename, contentType, size}"""
+    if not _template_digitise_on():
+        return error("not found", 404)
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    ext = template_types.ext_of(body.get("filename"))
+    allowed = template_types.accepted_exts()
+    if ext not in allowed:
+        return error("file type must be one of: %s" % ", ".join("." + e for e in allowed), 400)
+    content_type = template_types.EXT_TYPES[ext]
+    if body.get("contentType") != content_type:
+        return error("contentType does not match the file extension (.%s is %s)"
+                     % (ext, content_type), 400)
+    size = body.get("size")
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        return error("size (bytes) is required", 400)
+    if size > template_types.MAX_BYTES:
+        return error("the file is larger than 20 MB", 400)
+    key = f"template_sources/{company_id}/{uuid.uuid4().hex}.{ext}"
+    url = s3().generate_presigned_url(
+        "put_object",
+        Params={"Bucket": LAKE_BUCKET, "Key": key, "ContentType": content_type},
+        ExpiresIn=PRESIGNED_URL_EXPIRY)
+    return ok({"uploadUrl": url, "sourceKey": key, "expiresIn": PRESIGNED_URL_EXPIRY})
+
+
+def digitise_request(conn, caller, event):
+    """POST /api/org/templates/digitise {sourceKeys, name} -> 202 {id, status: pending}"""
+    if not _template_digitise_on():
+        return error("not found", 404)
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    keys = body.get("sourceKeys")
+    if not isinstance(keys, list) or not keys or len(keys) > template_types.MAX_IMAGES \
+            or len(set(map(str, keys))) != len(keys):
+        return error(template_types.SHAPE_ERROR, 400)
+    exts = []
+    for k in keys:
+        m = _DIGITISE_SOURCE_RE.match(k) if isinstance(k, str) else None
+        if m is None or m.group("company") != company_id:
+            # Never another company's object, whatever the caller sends.
+            return error("sourceKeys must be files uploaded for this company", 400)
+        exts.append(m.group("ext"))
+    why = template_types.source_shape_error(exts)
+    if why:
+        return error(why, 400)
+    name, err = _template_name(body)
+    if err is not None:
+        return err
+    sizes = {}
+    for k in keys:
+        try:
+            head = s3().head_object(Bucket=LAKE_BUCKET, Key=k)
+        except ClientError as e:
+            if _s3_missing(e):
+                return error("an uploaded file was not found — upload it again", 404)
+            raise
+        sizes[k] = head.get("ContentLength") or 0
+        # A presigned PUT cannot enforce a size; this is where it is enforced.
+        if sizes[k] > template_types.MAX_BYTES:
+            return error("the file is larger than 20 MB", 400)
+    request_id = uuid.uuid4().hex
+    request_key = f"template_digitise_requests/{company_id}/{request_id}.json"
+    result_key = f"template_digitise_results/{company_id}/{request_id}.json"
+    artifact = {"id": request_id, "companyId": company_id, "userId": str(caller["id"]),
+                "sourceKeys": keys, "name": name,
+                "requestedAt": datetime.now(timezone.utc).isoformat()}
+    s3().put_object(Bucket=LAKE_BUCKET, Key=request_key, Body=json.dumps(artifact),
+                    ContentType="application/json")
+    # lake_keys does not know these families, so the kind is stated (spec section 2).
+    for k in keys:
+        lake_objects.record_best_effort(conn, k, company_id=company_id, user_id=caller["id"],
+                                        source="upload", kind="template_source",
+                                        size_bytes=sizes[k])
+    for k in (request_key, result_key):
+        lake_objects.record_best_effort(conn, k, company_id=company_id, user_id=caller["id"],
+                                        source="upload", kind="template_digitise")
+    return ok({"id": request_id, "status": "pending"}, 202)
+
+
+def _digitise_owner_ok(caller, owner_id):
+    """A draft is its requester's until Save (ruling R5); platform_admin may act for them."""
+    return str(owner_id) == str(caller["id"]) or is_cross_company(caller["global_role"])
+
+
+def digitise_status(conn, caller, request_id, event):
+    """GET /api/org/templates/digitise/{id} -- the poll."""
+    if not _template_digitise_on():
+        return error("not found", 404)
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    if not _DIGITISE_ID_RE.match(request_id or ""):
+        return error("not found", 404)
+    result_key = f"template_digitise_results/{company_id}/{request_id}.json"
+    request_key = f"template_digitise_requests/{company_id}/{request_id}.json"
+    try:
+        obj = s3().get_object(Bucket=LAKE_BUCKET, Key=result_key)
+    except ClientError as e:
+        if not _s3_missing(e):
+            raise
+        try:
+            req = json.loads(s3().get_object(Bucket=LAKE_BUCKET, Key=request_key)["Body"]
+                             .read().decode("utf-8"))
+        except ClientError as e2:
+            if _s3_missing(e2):
+                return error("not found", 404)
+            raise
+        if not _digitise_owner_ok(caller, req.get("userId")):
+            return error("not found", 404)
+        return ok({"id": request_id, "status": "pending"})
+    result = json.loads(obj["Body"].read().decode("utf-8"))
+    # Ownership before age: "expired" to a non-requester would confirm the draft exists.
+    if not _digitise_owner_ok(caller, result.get("userId")):
+        return error("not found", 404)
+    modified = obj.get("LastModified")
+    if modified is not None and datetime.now(timezone.utc) - modified > DIGITISE_MAX_AGE:
+        return error("this draft has expired — upload the form again", 404)
+    out = {k: result[k] for k in _DIGITISE_PUBLIC if k in result}
+    prefix = f"template_sources/{company_id}/"
+    out["sources"] = [
+        {"key": k, "contentType": template_types.EXT_TYPES.get(template_types.ext_of(k), ""),
+         "url": s3().generate_presigned_url("get_object",
+                                            Params={"Bucket": LAKE_BUCKET, "Key": k},
+                                            ExpiresIn=DIGITISE_PREVIEW_EXPIRY)}
+        for k in (result.get("sourceKeys") or []) if isinstance(k, str) and k.startswith(prefix)]
+    return ok(out)
 
 
 def update_report_template(conn, caller, template_id, event):

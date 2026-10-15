@@ -270,6 +270,9 @@ LAKE_PUT_CALLERS = {
     "ReportGeneratorFunction": "lambda_report_generator, deletion_mirror, pipeline_trace, transcript_utils",
     "MeetingMinutesFunction": "lambda_meeting_minutes, pipeline_trace, transcript_utils",
     "SessionReportFunction": "lambda_session_report, lambda_meeting_minutes, deletion_mirror, pipeline_trace",
+    # Also reaches pipeline_trace (via llm_utils -> llm_usage) but never flushes a trace;
+    # the grant is for its own result write.
+    "TemplateDigitiseFunction": "lambda_template_digitise",
     "OrgApiFunction": "deletion_mirror, extraction_pending, pipeline_trace, reindex, transcript_utils",
     "ExtractSessionFunction": "lambda_extract_session, extraction_pending, pipeline_trace",
     "RollingSummaryFunction": "lambda_rolling_summary, lambda_extract_session, extraction_pending",
