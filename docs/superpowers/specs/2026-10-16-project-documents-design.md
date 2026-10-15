@@ -1,6 +1,8 @@
 # Project documents: specs and docs a project can be asked about
 
-Status: design (2026-10-16). Sub-project 1 of the "project assets / template
+Status: design (2026-10-16), Fable-reviewed (approve with changes; all
+findings resolved in "Review resolutions" at the end, which is binding and
+overrides earlier text where they differ). Sub-project 1 of the "project assets / template
 digitisation / inspection gaps" batch (sub-projects 3B and 2 are on TEST).
 Decisions taken by the controller under the owner's standing instruction
 (2026-10-15: pick the long-term, reasonable option); each is marked
@@ -87,7 +89,7 @@ CREATE TABLE IF NOT EXISTS project_doc_chunks (
   chunk_text text NOT NULL,
   embedding vector(1024) NOT NULL
 );
--- HNSW cosine on embedding; GIN on to_tsvector('simple', heading||' '||chunk_text);
+-- NO HNSW index (exact scan, see R12); GIN on the lexical expression (R11);
 -- btree (document_id, ordinal); btree (site_id).
 ```
 
@@ -119,8 +121,7 @@ with no outbound (BUG-36) and DashScope needs outbound.
 - **DOCX** (python-docx layer): paragraphs in order; Word heading styles and
   numbered clause patterns (`^\d+(\.\d+)*\s`) start a new heading path; tables
   are flattened row by row (`cell | cell`).
-- **PDF** (new pypdf layer, pure Python, published by
-  `scripts/build-pypdf-layer.sh`, parameter `PdfLayerArn`): text per page;
+- **PDF** (pypdf in its own pure-Python layer, see R13): text per page;
   headings detected by the same clause pattern; page numbers kept. A PDF whose
   extracted text is under 200 characters per page on average is `unreadable`
   with "This looks like a scanned PDF -- scanned documents are not read yet."
@@ -246,3 +247,112 @@ workers read only.
 - Prod hand steps (release notes): the pypdf layer must be published in the
   account (script) and `PROD_PDF_LAYER_ARN` set; prod bucket CORS PUT (already
   required by template digitise); lifecycle: none (documents are kept).
+
+## Review resolutions (binding; Fable review 2026-10-16)
+
+**R1 -- Document rows must never become R refs.** `ask_tools._item`
+classifies by shape (a row with `chunk_text` becomes `kind: "chunk"`,
+provenance records) and `_envelope` defaults the prefix to `R`. So: `_item`
+branches on the tool name `search_project_documents` BEFORE the shape check
+and returns `kind: "document"` with `title, heading, page_from, page_to,
+document_id, series_id, revision`; `_envelope` passes `prefix="D"`;
+`_CARD_KINDS` and `_item_line` gain a `document` branch rendering
+`title · heading · p.N`. Documents do NOT go through `_rerank_chunks`
+(`_post_search`): the reranker is tuned on recordings.
+
+**R2 -- D refs are parsed, sanitised and returned separately.** Five sites in
+`ask_orchestrator.py` change together: `_FORGED_LEAD` becomes `[RWD]\d+`;
+`_REF_GROUP`/`_REF_TOKEN` accept `D`; `to_client.repl` gets a D branch that
+strips the ref from the text and collects cited D items, in citation order,
+into a `documents` block `[{n, title, heading, page, document_id}]` plus
+`refs_d`; `_cited_card_refs` stays R-only (documents are never cards). A test
+feeds an answer citing R, W and D and asserts each lands only in its own
+block, and that a document whose text begins `D1 |` or contains a code fence
+is neutralised.
+
+**R3 -- Prod reach.** The `D` family exists only on the orchestrator-v2 path
+(`ASK_AGENTIC`), TEST-only today; prod Ask falls back to `_rag_answer`, which
+never sees documents (rule 4). On prod, documents are reachable through the
+project page and the search palette until ASK_AGENTIC is promoted. Stated in
+the release notes.
+
+**R4 -- Basis and guard.** The final-answer basis enum, `_derived_basis` and
+`guard_basis` gain `documents` (only D cited); R+D is `mixed`. The
+time-anchored guard applies to R only: a D-only answer is never forced to
+fallback for lacking a date. `_SYSTEM` gains rule 2b: "D refs are the
+project's documents -- what should be done. Never state that something
+happened on site because a document requires it. When records and documents
+disagree, say both, each with its ref."
+
+**R5 -- Write role.** Upload / revision / rename / delete are allowed when: on
+a home-company site, `global_role` in `_MANAGER_ROLES`; on an external site,
+the external membership's role (computed by `repositories.scope`) in
+`_MANAGER_ROLES`; or `is_cross_company(global_role)` (platform_admin),
+written explicitly. Reads use `_allowed_site_ids` unchanged.
+
+**R6 -- Ownership follows the project.** At insert
+`company_id = sites.company_id` (not the caller's). Presigned keys and the
+request key use the SITE's company:
+`project_doc_sources/{site_company}/{id}.{ext}`; the request route checks the
+key against the site's company; `lake_objects` rows carry `site_id` and the
+site's company, so `lake_objects.reassign_site` moves them with the project.
+
+**R7 -- Search palette path.** The palette goes `scripts/api/search.js` ->
+`POST /api/search` -> `lambda_fieldsight_api.py` -> ask-agent `mode=search`
+-> `_rag_search_list` -> rag-search, with the embedding computed in
+ask-agent. So `_rag_search_list` gains an optional `include_documents` that
+makes a second rag-search call in `documents` mode and returns
+`{results, documents}`; the proxy passes `documents` through untouched; the
+palette renders it as its own group.
+
+**R8 -- Revisions and lifecycle.**
+- `UNIQUE (series_id, revision)`; the revision is computed inside the insert
+  transaction (lock the series rows `FOR UPDATE`).
+- Deleting the current revision clears `superseded_at` on its immediate
+  predecessor in the same transaction, so list and search agree. Deleting a
+  non-current revision only removes it from history.
+- A new revision on a series whose every revision is deleted -> 404.
+- The same filename twice in one project is allowed: two series.
+- `sites.archived_at` set -> the project's documents are read-only (writes
+  answer 409 "This project is archived").
+
+**R9 -- Never stuck pending.** The worker's top level catches everything and
+writes an error artifact under `project_doc_vectors/` (`status: error,
+reason`) that Ingest applies; `MaximumRetryAttempts: 0`; embedding runs
+against a deadline from the Lambda context (minus a 60 s write reserve) and
+writes `error` "Too large to index in one go" when it cannot finish. The UI
+shows `pending` older than 20 minutes as "Taking too long -- Retry".
+Documents over 1,000 chunks are refused up front as unreadable ("too long to
+index").
+
+**R10 -- IAM (simulate every action on TEST before the flag goes on).**
+org-api: Put+Get on `project_doc_sources/*`, Put on `project_doc_requests/*`,
+ListBucket prefix-conditioned on both. Worker: Get on sources and requests,
+Put on `project_doc_vectors/*` and `lake_manifest/*`. Ingest: Get on
+`project_doc_vectors/*` plus prefix-conditioned ListBucket (403-vs-404).
+
+**R11 -- Lexical index.** Expression
+`to_tsvector('simple', coalesce(heading,'') || ' ' || chunk_text)` -- the
+`simple` config only, without the `regexp_replace` of 0061 (which strips
+non-Latin text; documents may be in Chinese). The repository query uses the
+identical expression; a test pins expression == index.
+
+**R12 -- No HNSW.** The repo forces exact scans for ACL-filtered search
+because filtered HNSW top-k drops rows. Project-document search is filtered
+by site, so it uses exact cosine distance; indexes are btree `(site_id)`,
+`(document_id, ordinal)` and the GIN above. `project_doc_chunks` carries no
+`company_id` (tenant via the document join).
+
+**R13 -- pypdf.** A separate pure-Python layer `fieldsight-pypdf` built by
+`scripts/build-pypdf-layer.sh` (pip install pypdf into `python/`, zip,
+`publish-layer-version`), published once per account by hand; parameter
+`PdfLayerArn` (TEST var `TEST_PDF_LAYER_ARN`, prod var `PROD_PDF_LAYER_ARN`),
+attached only to `ProjectDocIndexFunction`. The python-docx layer and every
+other function are untouched. With the parameter empty, PDFs get `error`
+"PDF reading is not set up on this deployment".
+
+**R14 -- The contamination import test** names the forbidden importers:
+`lambda_extract_session`, `lambda_item_writer`, `lambda_session_report`,
+`lambda_report_generator`, `checklist*`, `report_template`, `session_index`,
+`chunking` must not import `repositories.project_docs` or any `project_doc_*`
+module (`lambda_ingest` may, for its apply route).
