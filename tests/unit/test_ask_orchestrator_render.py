@@ -320,3 +320,47 @@ def test_to_client_strips_and_counts_stray_numeric_markers():
     assert len(out["citations"]) == 1
     voice = orch.to_client("Cover is 40 mm [1] [R1].", _round(), None, "voice")
     assert voice["answer"] == "Cover is 40 mm." and voice["bad_refs"] == 1
+
+
+# ---- Task 3 rulings on to_client ------------------------------------------
+
+def _mixed_round():
+    return [_env("search_records", [_topic("R1"), _topic("R2", title="Pour B2"),
+                                    _topic("R3", title="Crane")], args={"query": "q"}),
+            _env("find_people", [{"ref": "R4", "kind": "person", "who": "Mike Hall",
+                                  "person_ref": "u-7", "text": "Mike Hall"}],
+                 args={"name": "Mike"}, id_="1"),
+            _env("count_metric", [{"ref": "R5", "kind": "metric", "text": '{"value": 3}'}],
+                 args={"metric": "photos", "date_from": "2026-10-01"}, id_="2")]
+
+
+def test_to_client_space_separated_and_range_groups():
+    out = orch.to_client("A [R1 R3]. B [R1-R3]. C [R2-R9]. D [R7-R9].", _mixed_round(),
+                         None, "screen")
+    assert out["answer"] == "A [1][2]. B [1][3][2]. C [3][2]. D."
+    assert [c["topic_title"] for c in out["citations"]] == ["Level 2 inspection", "Crane",
+                                                            "Pour B2"]
+    assert out["bad_refs"] == 1                  # only the all-unknown range
+
+
+def test_to_client_person_and_metric_refs_have_no_card_and_are_not_bad():
+    out = orch.to_client("Mike [R4] took 3 photos [R5] at the pour [R2].", _mixed_round(),
+                         None, "screen")
+    assert out["answer"] == "Mike took 3 photos at the pour [1]."
+    assert [c["topic_title"] for c in out["citations"]] == ["Pour B2"]
+    assert out["bad_refs"] == 0 and out["grounded"] is True
+    only_person = orch.to_client("Mike [R4].", _mixed_round(), None, "screen")
+    assert only_person["citations"] == [] and only_person["grounded"] is True
+
+
+def test_render_each_splits_per_envelope_with_one_budget():
+    big = "x" * 590
+    envs = [_env("search_records", [_topic(f"R{i}", text=big) for i in range(1, 41)],
+                 args={"query": "a"}),
+            _env("search_records", [_topic(f"R{i}", text=big) for i in range(41, 81)],
+                 args={"query": "b"}, rnd=2, id_="1")]
+    parts = orch.render_each(envs)
+    assert len(parts) == 2
+    assert all(p.startswith(orch.DATA_FENCE_HEADING) for p in parts)
+    assert sum(len(p) for p in parts) <= orch.RENDER_MAX_CHARS + 800
+    assert '"a"' in parts[0].splitlines()[3] and "shown" in parts[0].splitlines()[3]
