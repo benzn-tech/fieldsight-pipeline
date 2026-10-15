@@ -203,16 +203,31 @@ def _it(group, channels=("screen", "voice")):
 def test_estimate_arithmetic():
     items = [_it("project_day"), _it("general"), _it("mixed"), _it("web_cap"),
              _it("scoped_general", ("screen",))]
-    assert run.turn_cost("project_day") == 2
-    assert run.turn_cost("general") == 4.5
-    assert run.turn_cost("explicit_web") == 4.5
-    assert run.turn_cost("mixed") == 5.5
-    assert run.turn_cost("web_cap") == 5.5
+    for ch in ("screen", "voice"):
+        assert run.turn_cost("project_day", ch) == 2
+        assert run.turn_cost("explicit_web", ch) == 4.5
+        assert run.turn_cost("mixed", ch) == 5.5
+        assert run.turn_cost("web_cap", ch) == 5.5
+    # Spec 2026-10-16 §6: the screen offers the web on a general question
+    # instead of running it, so its web calls are not counted.
+    assert run.turn_cost("general", "screen") == 2
+    assert run.turn_cost("general", "voice") == 4.5
     est = run.estimate(run.selection(items, "both", None), 3)
-    # screen: (2 + 4.5 + 5.5 + 5.5 + 2) * 3 = 58.5 -> 59; voice: (2 + 4.5 + 5.5 + 5.5) * 3
+    # screen: (2 + 2 + 5.5 + 5.5 + 2) * 3 = 51; voice: (2 + 4.5 + 5.5 + 5.5) * 3
     # = 52.5 -> 53.
-    assert est == {"screen": 59, "voice": 53, "total": 112}
+    assert est == {"screen": 51, "voice": 53, "total": 104}
     assert run.estimate(run.selection(items, "voice", None), 1) == {"voice": 18, "total": 18}
+
+
+def test_screen_offer_brings_the_full_set_estimate_down():
+    # Before the screen offer (spec 2026-10-16) the full set cost screen 239,
+    # voice 233, total 472 at --repeat 3. Only screen general moved: 5 items x
+    # 2.5 web calls x 3 repeats = 37.5 fewer.
+    both = run.estimate(run.selection(run.load_set(), "both", None), 3)
+    assert both == {"screen": 201, "voice": 233, "total": 434}
+    assert both["screen"] < 239 and both["total"] < 472
+    assert run.estimate(run.selection(run.load_set(), "screen", None), 3) == {
+        "screen": 201, "total": 201}
 
 
 def test_selection_only_and_channels():
@@ -241,12 +256,26 @@ def test_screen_driver_event_shape(world):
     assert ev["httpMethod"] == "POST" and ev["path"] == "/api/ask/start"
     assert ev["requestContext"]["authorizer"]["claims"]["sub"] == SUB
     assert json.loads(ev["body"]) == {"question": "Fire watch rules?", "tz": "Pacific/Auckland",
-                                      "site_id": "site-9"}
+                                      "offer_web": True, "site_id": "site-9"}
     assert poll1["event"]["httpMethod"] == "GET" and poll1["event"]["path"] == "/api/ask/result"
     assert poll1["event"]["queryStringParameters"] == {"turn": turn, "since": "pending"}
     assert poll2["event"]["queryStringParameters"] == {"turn": turn,
                                                       "since": "searching_records"}
     assert terminal["status"] == "done" and terminal["result"]["answer"] == "Poured [1]."
+
+
+def test_screen_driver_sends_web_intent_only_for_explicit_web(world):
+    ew = {"id": "ew1", "group": "explicit_web", "channels": ["screen"], "expect": {},
+          "question": "What are the current NZS 3604 bracing requirements? Search online."}
+    run.screen_turn(world["lam"], STACK + "-api", SUB, ew, None, clock=world["clock"],
+                    sleep=world["clock"].sleep)
+    run.screen_turn(world["lam"], STACK + "-api", SUB, _it("general"), None,
+                    clock=world["clock"], sleep=world["clock"].sleep)
+    bodies = [json.loads(i["event"]["body"]) for i in world["lam"].invokes
+              if i["event"].get("path") == "/api/ask/start"]
+    assert bodies[0] == {"question": ew["question"], "tz": "Pacific/Auckland",
+                         "offer_web": True, "web_intent": True}
+    assert bodies[1] == {"question": "q", "tz": "Pacific/Auckland", "offer_web": True}
 
 
 def test_screen_driver_gives_up_after_70_s(world):
@@ -347,6 +376,9 @@ def test_full_run_writes_results_and_a_missing_route_is_unscored(world, capsys):
     assert {t["item"]["id"] + "/" + t["channel"] for t in data["turns"]} == {
         "pd1/screen", "pd1/voice", "sg1/screen"}
     assert "QUFBQQ" not in json.dumps(data)               # no audio in the results
+    # Screen turns record the offer opt-in they were sent with; voice turns do not.
+    assert {(t["channel"], t.get("offer_web")) for t in data["turns"]} == {
+        ("screen", True), ("voice", None)}
     # The scoped item got the org-api site id.
     starts = [i["event"] for i in world["lam"].invokes
               if i["event"].get("path") == "/api/ask/start"]

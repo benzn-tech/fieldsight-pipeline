@@ -46,6 +46,9 @@ The total is rounded up per channel.
 
 - Web groups: `general`, `mixed`, `explicit_web`, `web_cap`.
 - Multi-round groups: `mixed`, `web_cap`.
+- Screen `general` adds no web calls: the screen sends `offer_web`, so the web is
+  offered, not run (spec `2026-10-16-ask-screen-web-offer-design.md` §6). The full
+  set at `--repeat 3` is screen 201, voice 233, total 434 (it was 239 / 233 / 472).
 
 The pre-check is counted on every turn, even where none runs (voice, `never`), so
 the number is an upper bound.
@@ -73,6 +76,10 @@ Some limits of the set:
 
 ## Scoring
 
+Screen turns send `offer_web: true`, as the screen client does, and the results
+file records it on each screen turn. `explicit_web` items also send
+`web_intent: true` on the screen.
+
 `score.normalize` maps each channel's terminal state onto one shape.
 
 - **Voice** states carry no citation cards and no `web_offer`. On voice,
@@ -80,6 +87,11 @@ Some limits of the set:
   sentence the worker appends (`voice_web.OFFER_ALSO` / `OFFER_NO_RECORDS`).
 - **Unjoined turns:** a turn with no joined `ASK_ROUTE` line is `unscored`, and any
   unscored turn fails the gate.
+- **Screen `general`:** passes on `route.policy == "offer"` with `web_offer`. A
+  `from_web` answer under `offer` fails as "web ran unasked".
+- **`mixed`:** `route.refs_r >= 1`, plus the offer when `policy == "offer"`
+  (`web_offer` on the screen, the appended sentence on voice), else
+  `route.refs_w >= 1`.
 - **Web cap:** round 1's web run is not listed in `route.calls`. A refused second
   `web_search` is still listed there. So `web_cap` passes on `route.web_ran`, and
   it notes how many times the judge asked again.
