@@ -10,6 +10,7 @@ Pure functions only: no boto3, no I/O.
 """
 import re
 
+import query_slots
 from lexical_terms import query_terms
 
 # Words that only say WHEN. Latin terms are compared as-is; the Chinese entries
@@ -19,10 +20,24 @@ TIME_WORDS_EN = frozenset({
     "weekend", "month", "months", "last", "this", "past", "previous",
     "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
     "sunday", "day", "days",
+    # Spoken dates (query_slots): month names and their 3/4-letter forms, the
+    # weekday short forms, and "on". A day number or ordinal is NOT here: it
+    # is only non-content inside a recognised date phrase, which
+    # query_slots.mask_spoken_dates blanks out before tokenising. "Level 2" or
+    # "grid 12" must stay a topic.
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december", "jan", "feb", "mar",
+    "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+    "mon", "tue", "tues", "wed", "weds", "thu", "thur", "thurs", "fri",
+    "sat", "sun", "on",
 })
 TIME_WORDS_ZH = frozenset({
     "昨天", "今天", "今早", "上午", "下午", "本周", "这周", "上周", "本月",
     "这个月", "上个月", "上月",
+    # Weekday words left over once mask_spoken_dates has run, e.g. a bare
+    # "星期" or "礼拜" ("这个星期"). The dated forms (9月3日, 上周二) are
+    # removed whole by the mask, digits included.
+    "星期", "礼拜", "周末",
 })
 
 # Words that only say "tell me what happened": they name no topic.
@@ -55,6 +70,9 @@ def is_content_free(question):
     phrases cut out of it instead, and any character left over is content.
     """
     q = _ISO_DATE.sub(" ", (question or "").lower())
+    # "3rd of Sep" / "9月3日" / "上周二": the day number, the ordinal and the
+    # 月/日/号 characters are part of the date, not a topic.
+    q = query_slots.mask_spoken_dates(q)
     latin = [t for t in query_terms(q) if t not in _NON_CONTENT_EN
              and not _UNSPACED_RUN.fullmatch(t)]
     if latin:

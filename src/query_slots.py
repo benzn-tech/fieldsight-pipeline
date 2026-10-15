@@ -30,7 +30,7 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-__all__ = ["resolve_today", "time_range", "span"]
+__all__ = ["resolve_today", "time_range", "span", "has_time_anchor", "mask_spoken_dates"]
 
 
 def resolve_today(tz_name, now=None):
@@ -77,6 +77,116 @@ _PHRASES = (
     (re.compile(r"上个月|上月|\blast\s+month\b", re.IGNORECASE), "last_month"),
     (re.compile(r"这个月|本月|这月|\bthis\s+month\b", re.IGNORECASE), "this_month"),
 )
+
+# --- Spoken dates -----------------------------------------------------------
+# Day + month, as people say them: "3 September", "3rd of Sep", "Sept 3rd",
+# "Sep. 3", "9月3日", "9月3号", optionally with a year. A month word on its own
+# is never an anchor -- only a month word glued to a day number is.
+_MONTH = (r"(?P<mon{n}>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may{may}|june?|july?"
+          r"|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b\.?")
+_ORD = r"(?:st|nd|rd|th)?"
+# "3 May" is a date but "level 3 may need propping" is not: after a day
+# number, "may" counts only when no word follows it.
+_MAY_AFTER_DAY = r"(?!\s+[a-z])"
+_DAY_MONTH = re.compile(
+    # "3 September", "3rd of Sep", "3 September 2026"
+    r"\b(?P<d1>\d{1,2})" + _ORD + r"\s+(?:of\s+)?" + _MONTH.format(n=1, may=_MAY_AFTER_DAY)
+    + r"(?:,?\s+(?P<y1>\d{4})\b)?"
+    # "September 3", "Sept 3rd", "Sep. 3", "September 3, 2026"
+    + r"|\b" + _MONTH.format(n=2, may="") + r"\s*(?P<d2>\d{1,2})" + _ORD + r"\b"
+    + r"(?:,?\s+(?P<y2>\d{4})\b)?"
+    # "9月3日", "2026年9月3日", "9月3号"
+    + r"|(?:(?P<y3>\d{4})\s*年\s*)?(?P<m3>\d{1,2})\s*月\s*(?P<d3>\d{1,2})\s*[日号號]",
+    re.IGNORECASE,
+)
+_MONTH_NUM = {k: i + 1 for i, k in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"))}
+
+# Weekdays. Full names may stand alone; the short forms ("Tue", "Sat", "Sun")
+# are ordinary English words often enough ("we sat down", "sun exposure") that
+# they count only behind "on" / "last" / "this". "next"/"coming" name a future
+# day, which no record can be about, and "every" names no particular day, so
+# they yield no anchor at all rather than being misread as the bare weekday
+# that follows them.
+_WD_FULL = r"(?P<full>monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b"
+_WD_ABBR = r"(?P<abbr>mon|tues?|weds?|thu(?:rs?)?|fri|sat|sun)\b\.?"
+_WEEKDAY_EN = re.compile(
+    r"\b(?:(?P<mod>on|last|this|next|coming|every)\s+)?" + _WD_FULL
+    + r"|\b(?P<mod2>on|last|this|next|coming|every)\s+" + _WD_ABBR,
+    re.IGNORECASE,
+)
+_WD_INDEX = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+# Chinese: 周二 / 星期二 / 礼拜二, optionally behind 上(个) (previous calendar
+# week), 这(个)/本 (this week) or 下(个) (next week -> no anchor). The
+# lookbehind keeps 每周三次 ("three times a week") and 两周 ... from reading as
+# Wednesday; the lookahead keeps 周三次 / 星期一个 ... out for the same reason.
+_WEEKDAY_ZH = re.compile(
+    r"(?P<pre>上个?|这个?|這個?|本|下个?)?(?<![每一两二三四五六七八九十几])"
+    r"(?:周|週|星期|礼拜|禮拜)(?P<zd>[一二三四五六日天])(?![次个個天年遍回])"
+)
+_ZH_INDEX = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+
+
+def _day_month(m, today):
+    """(date or None, matched) for a _DAY_MONTH match. A date with a year needs
+    no anchor; without one it is the most recent such day on or before
+    `today`. An impossible date (31 Sep) is None -- no anchor, never a guess."""
+    if m.group("m3"):
+        month, day, year = int(m.group("m3")), int(m.group("d3")), m.group("y3")
+    else:
+        mon = (m.group("mon1") or m.group("mon2")).lower()[:3]
+        month = _MONTH_NUM[mon]
+        day = int(m.group("d1") or m.group("d2"))
+        year = m.group("y1") or m.group("y2")
+    if year:
+        y = int(year)
+    elif isinstance(today, date):
+        y = today.year if (month, day) <= (today.month, today.day) else today.year - 1
+    else:
+        return None
+    try:
+        return date(y, month, day)
+    except ValueError:
+        return None
+
+
+def _weekday(text, today):
+    """The day a weekday phrase names, or None. Callers reach this only after
+    every more specific rule has missed."""
+    m = _WEEKDAY_ZH.search(text)
+    if m:
+        wd = _ZH_INDEX[m.group("zd")]
+        pre = (m.group("pre") or "")[:1]
+        if pre == "上":
+            return _monday_of(today) - timedelta(days=7) + timedelta(days=wd)
+        mod = {"这": "this", "這": "this", "本": "this", "下": "next"}.get(pre, "")
+    else:
+        m = _WEEKDAY_EN.search(text)
+        if not m:
+            return None
+        wd = _WD_INDEX[(m.group("full") or m.group("abbr")).lower()[:3]]
+        mod = (m.group("mod") or m.group("mod2") or "").lower()
+    if mod in ("next", "coming", "every"):
+        return None
+    if mod == "this":
+        d = _monday_of(today) + timedelta(days=wd)
+        return d if d <= today else None
+    # Bare, "on", "last": the most recent such weekday STRICTLY before today --
+    # "Monday" said on a Monday means a week ago, not this morning.
+    back = (today.weekday() - wd) % 7 or 7
+    return today - timedelta(days=back)
+
+
+def mask_spoken_dates(text):
+    """`text` with every day+month(+year) and weekday phrase blanked out --
+    for search_browse, so the day number and ordinal inside "on the 3rd of
+    Sep" read as part of the date rather than as content."""
+    text = text if isinstance(text, str) else ""
+    for pattern in (_DAY_MONTH, _WEEKDAY_ZH, _WEEKDAY_EN):
+        text = pattern.sub(" ", text)
+    return text
+
 
 _UNIT_DAYS = {"天": 1, "day": 1, "周": 7, "星期": 7, "week": 7, "个月": 30, "month": 30}
 
@@ -141,6 +251,15 @@ def time_range(question, today):
         if d is not None:
             return _iso(d), _iso(d)
 
+    # 1b. A spoken day + month. With a year it needs no anchor; without one it
+    #     is relative to today and _day_month returns None when there is none.
+    #     An impossible date is no anchor from this rule and falls through.
+    m = _DAY_MONTH.search(text)
+    if m:
+        d = _day_month(m, today)
+        if d is not None:
+            return _iso(d), _iso(d)
+
     # Everything below is relative, so it needs a day to be relative TO.
     if not isinstance(today, date):
         return None, None
@@ -158,10 +277,32 @@ def time_range(question, today):
                 start = today - timedelta(days=n * days - 1)
                 return _iso(start), _iso(today)
 
+    # 2b. 上周二 / 这周二 contain 上周 / 这周, but name ONE day: they are the
+    #     more specific phrase, so they are read before the week phrases below.
+    #     (English has no such compound -- "last week on Tuesday" stays last
+    #     week, see 4.)
+    m = _WEEKDAY_ZH.search(text)
+    if m and m.group("pre"):
+        d = _weekday(text, today)
+        return (_iso(d), _iso(d)) if d is not None else (None, None)
+
     # 3. Named periods, most specific first.
     for pattern, name in _PHRASES:
         if pattern.search(text):
             start, end = _span(today, name)
             return _iso(start), _iso(end)
 
+    # 4. A weekday name, last: it never narrows a phrase matched above, so
+    #    "last week on Tuesday" keeps the whole of last week and "yesterday,
+    #    Tuesday" keeps yesterday.
+    d = _weekday(text, today)
+    if d is not None:
+        return _iso(d), _iso(d)
+
     return None, None
+
+
+def has_time_anchor(question, today):
+    """True iff `time_range` resolves the question to a range."""
+    date_from, date_to = time_range(question, today)
+    return date_from is not None or date_to is not None

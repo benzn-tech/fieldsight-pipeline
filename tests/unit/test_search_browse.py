@@ -15,6 +15,18 @@ import search_browse as sb
     "上周发生了什么",
     "这个月我们讨论了什么",
     "今天的工作",
+    "what did we do on 3 September",
+    "what happened on the 3rd of Sep",
+    "what did we do Sept 3rd 2026",
+    "我们9月3日做了什么",
+    "2026年9月3日发生了什么",
+    "what happened last Tuesday",
+    "anything on Tue",
+    "上周二发生了什么",
+    "周二我们做了什么",
+    "星期天的工作",
+    "what happened last week in September",
+    "anything this week, sept",
 ])
 def test_content_free(q):
     assert sb.is_content_free(q) is True
@@ -27,6 +39,12 @@ def test_content_free(q):
     "昨天钢筋验收",
     "上周我们讨论了什么钢筋",
     "door damage",
+    "level 2 inspection",
+    "what happened at 1500 on 3 September",
+    "PS4 on 3 September",
+    "drainage last Tuesday",
+    "上周二钢筋验收",
+    "9月3日钢筋",
 ])
 def test_has_content(q):
     assert sb.is_content_free(q) is False
