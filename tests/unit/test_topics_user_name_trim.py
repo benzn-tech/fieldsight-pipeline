@@ -59,8 +59,9 @@ def test_user_name_uses_trim_concat_ws(source: str) -> None:
         r"NULLIF\(TRIM\(CONCAT_WS\(' ', u\.first_name, u\.last_name\)\), ''\) AS user_name",
         source,
     )
-    assert len(safe) == 3, (
-        f"expected 3 safe user_name projections, found {len(safe)}. If a query "
+    # 4th: day_overview_rows (Ask tools, 2026-10-15).
+    assert len(safe) == 4, (
+        f"expected 4 safe user_name projections, found {len(safe)}. If a query "
         "was added or removed, update this count deliberately -- do not switch "
         "the new one back to a bare concat."
     )

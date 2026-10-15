@@ -1301,20 +1301,30 @@ def list_expired_non_work(conn, *, older_than, created_since, limit=500) -> list
 # Known v1 limitation: /timeline also folds in merged-meeting keys
 # (_merged_keys_for); a joiner's view of a meeting led by someone else is not
 # mirrored here.
-def _ask_tools_where(site_ids, *, author_ids, site_id, user_id):
-    site_list = [str(s) for s in site_ids]
-    presence = (
+def _ask_tools_extraction_presence():
+    """The family-presence probe (one %s: the caller's site_ids). Supersession only,
+    on purpose: deleted and non_work extraction topics still count, exactly as
+    /timeline's has_topics_for_source_prefix counts them (exempt from the deleted-read
+    scan for that reason). It decides WHICH family is shown and returns no content."""
+    return (
         "EXISTS (SELECT 1 FROM topics x WHERE x.report_date = t.report_date"
         " AND x.source_s3_key LIKE 'extractions/%%'"
         " AND " + LIVE_TOPIC_PREDICATE.format(alias="x") +
         " AND ((t.user_id IS NOT NULL AND x.user_id = t.user_id"
         " AND x.site_id = ANY(%s::uuid[]))"
         " OR (t.user_id IS NULL AND x.user_id IS NULL AND x.site_id = t.site_id)))")
+
+
+def _ask_tools_where(site_ids, *, author_ids, site_id, user_id):
+    """Every clause EXCEPT the outer deletion arms: each caller interpolates
+    `visible_topics_predicate("t")` into its own statement, where the
+    deleted-read scan (tests/unit/test_deleted_read_paths.py) can see it."""
+    site_list = [str(s) for s in site_ids]
     clauses = ["t.site_id = ANY(%s::uuid[])",
-               visible_topics_predicate("t"),
                "t.work_class IS DISTINCT FROM 'non_work'",
                "(t.source_s3_key LIKE 'extractions/%%'"
-               " OR (t.source_s3_key LIKE 'reports/%%' AND NOT " + presence + "))"]
+               " OR (t.source_s3_key LIKE 'reports/%%' AND NOT "
+               + _ask_tools_extraction_presence() + "))"]
     params = [site_list, site_list]
     if author_ids is not None:
         # = ANY never matches a NULL user_id, so unattributed topics stay hidden.
@@ -1342,13 +1352,14 @@ def day_overview_rows(conn, site_ids, date_from, date_to, *, author_ids=None,
                                      site_id=site_id, user_id=user_id)
     sql = (
         "SELECT t.id, t.site_id, s.name AS site_name, t.user_id, "
-        "NULLIF(trim(concat_ws(' ', u.first_name, u.last_name)), '') AS user_name, "
+        "NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '') AS user_name, "
         "t.report_date, t.time_range, t.title, t.summary, t.source_s3_key, "
         "(SELECT count(*) FROM action_items a WHERE a.topic_id = t.id) AS n_tasks, "
         "(SELECT count(*) FROM findings f WHERE f.topic_id = t.id) AS n_findings "
         "FROM topics t JOIN sites s ON s.id = t.site_id "
         "LEFT JOIN users u ON u.id = t.user_id "
-        f"WHERE {where} AND t.report_date BETWEEN %s AND %s "
+        f"WHERE {where} AND {visible_topics_predicate('t')} "
+        "AND t.report_date BETWEEN %s AND %s "
         "ORDER BY t.report_date, t.occurred_at NULLS LAST, t.time_range NULLS LAST, t.created_at "
         "LIMIT %s")
     return conn.cursor(row_factory=dict_row).execute(
@@ -1364,6 +1375,7 @@ def latest_visible_topic_date(conn, site_ids, before, *, author_ids=None,
     where, params = _ask_tools_where(site_ids, author_ids=author_ids,
                                      site_id=site_id, user_id=user_id)
     row = conn.execute(
-        f"SELECT max(t.report_date) FROM topics t WHERE {where} AND t.report_date < %s",
+        f"SELECT max(t.report_date) FROM topics t WHERE {where} "
+        f"AND {visible_topics_predicate('t')} AND t.report_date < %s",
         params + [before]).fetchone()
     return row[0].isoformat() if row and row[0] else None
