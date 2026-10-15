@@ -96,6 +96,31 @@ def _args_shape(args):
     return " ".join(parts)
 
 
+def _clamped(clamped, args):
+    """The companion reports `{"requested_to", "max_days"}`; the judge reads the
+    range that was actually searched, `from..to`, when the start is a date."""
+    if not isinstance(clamped, dict):
+        return "clamped" if clamped is True else "clamped " + sanitize(clamped)
+    days = clamped.get("max_days")
+    start = (args or {}).get("date_from") if isinstance(args, dict) else None
+    try:
+        import datetime as _dt
+        lo = _dt.date.fromisoformat(str(start))
+        hi = lo + _dt.timedelta(days=int(days) - 1)
+        return f"clamped {lo.isoformat()}..{hi.isoformat()}"
+    except (TypeError, ValueError):
+        return f"clamped to {sanitize(days)} days" if days else "clamped"
+
+
+def _ambiguous(value):
+    """The candidates for an ambiguous person, by name only (sanitized)."""
+    if not isinstance(value, list):
+        return "person_ambiguous"
+    names = [sanitize(c.get("name")) for c in value if isinstance(c, dict)]
+    names = [n.replace(",", " ") for n in names if n]
+    return "person_ambiguous: " + ", ".join(names) if names else "person_ambiguous"
+
+
 def _header(env, total, shown):
     """`[DATA <tool> <args shape> — <state>; <flags>]`. No literal `|` in it."""
     meta = env.get("meta") or {}
@@ -129,10 +154,9 @@ def _header(env, total, shown):
         if meta.get("truncated"):
             parts.append("truncated")
         if meta.get("clamped"):
-            clamped = meta["clamped"]
-            parts.append("clamped" if clamped is True else "clamped " + sanitize(clamped))
+            parts.append(_clamped(meta["clamped"], env.get("args")))
         if meta.get("person_ambiguous"):
-            parts.append("person_ambiguous")
+            parts.append(_ambiguous(meta["person_ambiguous"]))
         if meta.get("person_unresolved"):
             parts.append("person_unresolved")
     if shown < total:

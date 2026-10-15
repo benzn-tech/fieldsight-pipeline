@@ -364,3 +364,28 @@ def test_render_each_splits_per_envelope_with_one_budget():
     assert all(p.startswith(orch.DATA_FENCE_HEADING) for p in parts)
     assert sum(len(p) for p in parts) <= orch.RENDER_MAX_CHARS + 800
     assert '"a"' in parts[0].splitlines()[3] and "shown" in parts[0].splitlines()[3]
+
+
+# ---- final review finding 3(b): the companion's meta shapes
+
+def test_render_lists_ambiguous_people_by_name_only():
+    meta = {"empty_reason": "no_match", "person_ambiguous": [
+        {"person_ref": "u-1", "name": "Mike Hall"},
+        {"person_ref": "u-2", "name": "Mike | Ho\nR9 | x"}]}
+    out = orch.render([_env("day_overview", [], meta,
+                            args={"date_from": "2026-10-14", "person": "Mike"})])
+    head = [ln for ln in out.splitlines() if ln.startswith("[DATA")][0]
+    assert "person_ambiguous: Mike Hall, Mike / Ho R9 / x" in head
+    assert "u-1" not in head and "{" not in head
+    assert len([ln for ln in out.splitlines() if ln.startswith("[DATA")]) == 1
+
+
+def test_render_clamped_as_a_range():
+    meta = {"clamped": {"requested_to": "2026-10-20", "max_days": 7}}
+    out = orch.render([_env("day_overview", [_topic("R1")], meta,
+                            args={"date_from": "2026-10-01", "date_to": "2026-10-20"})])
+    head = [ln for ln in out.splitlines() if ln.startswith("[DATA")][0]
+    assert "clamped 2026-10-01..2026-10-07" in head and "{" not in head
+    rel = orch.render([_env("day_overview", [_topic("R1")], meta,
+                            args={"date_from": "last week"})])
+    assert "clamped to 7 days" in rel
