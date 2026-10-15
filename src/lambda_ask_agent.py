@@ -2263,6 +2263,12 @@ def lambda_handler(event, context):
         import ask_voice_turn
         return ok(ask_voice_turn.start(body))
 
+    if body.get('mode') == 'turn_start':
+        # Screen Ask on the async turn store: returns {turn_id} at once and the
+        # AskVoiceWorker answers it (spec 2026-10-15 ask orchestration v2 s4).
+        import ask_voice_turn
+        return ok(ask_voice_turn.start_screen(body))
+
     if body.get('audio') and os.environ.get('RAG_SEARCH_FUNCTION'):
         # Refuse before STT is spent: _voice_answer needs a caller_sub for the ACL.
         if not body.get('caller_sub'):

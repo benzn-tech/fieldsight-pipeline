@@ -22,6 +22,7 @@ import os
 import re
 import secrets
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from datetime import datetime
@@ -468,6 +469,65 @@ def start(body) -> dict:
 
 
 # --------------------------------------------------------------------------
+# start_screen (runs inside AskAgent, mode "turn_start")
+# --------------------------------------------------------------------------
+
+SCREEN = "screen"
+# Never forwarded from a stored screen request to the RAG body: identity comes
+# from the worker event only, and the voice-only keys would change the answer
+# path (`_rag_answer` branches on mode == "voice").
+_SCREEN_DROP = ("caller_sub", "mode", "voice_web", "web_intent", "offer_web")
+
+
+def start_screen(body) -> dict:
+    """Mint a screen Ask turn: store the request, Event-invoke the worker and
+    return {"turn_id"} at once. Spec 2026-10-15 ask orchestration v2 section 4.
+    Returns the response body; never raises."""
+    t0 = time.perf_counter()
+    caller_sub = body.get("caller_sub")
+    if not caller_sub:
+        return {"error": "sign-in required"}
+    question = body.get("question")
+    if not isinstance(question, str) or not question.strip():
+        return {"error": "Missing question"}
+
+    s3, bucket = _get_s3(), _bucket()
+    if not bucket:
+        _bucket_missing()
+        return {"error": "Ask temporarily unavailable"}
+    turn_id = uuid.uuid4().hex
+
+    try:
+        sweep_old(s3, bucket, caller_sub, time.time())
+    except Exception as e:  # noqa: BLE001 - housekeeping must never fail an ask
+        logger.warning("  screen start sweep failed (non-fatal): %s", type(e).__name__)
+
+    # The stored request never carries the caller's identity (the worker takes
+    # it from the event) nor the routing mode.
+    request = {k: v for k, v in body.items() if k not in ("caller_sub", "mode")}
+    payload = {"turn_id": turn_id, "caller_sub": caller_sub, "channel": SCREEN}
+    try:
+        put_state(s3, bucket, caller_sub, turn_id,
+                  {"status": "pending", "channel": SCREEN,
+                   "created_at": time.time(), "request": request})
+        _get_lambda().invoke(FunctionName=os.environ.get("ASK_VOICE_WORKER_FUNCTION", ""),
+                             InvocationType="Event",
+                             Payload=json.dumps(payload).encode("utf-8"))
+    except Exception as e:  # noqa: BLE001
+        logger.error("  screen start worker invoke failed: %s", type(e).__name__)
+        try:
+            put_state(s3, bucket, caller_sub, turn_id,
+                      {"status": "error", "channel": SCREEN, "error": "No answer"})
+        except Exception:  # noqa: BLE001
+            pass
+        return {"error": "Ask temporarily unavailable"}
+
+    logger.info("screen start: start_total=%.2fs turn=%s sub_hash=%s",
+                time.perf_counter() - t0, turn_id, sub_hash(caller_sub))
+    return {"turn_id": turn_id}
+
+
+# --------------------------------------------------------------------------
 # AskVoiceWorker
 # --------------------------------------------------------------------------
 
@@ -489,6 +549,55 @@ def _remember(s3, bucket, caller_sub, question, answer_text, rag):
         put_offer(s3, bucket, caller_sub, rag.get("asked") or question, now)
     except Exception as e:  # noqa: BLE001
         logger.error("voice offer write failed: %s", type(e).__name__)
+
+
+def _work_screen(s3, bucket, caller_sub, turn_id, state, laa, t0):
+    """The worker's screen branch: RAG (+web) -> state "done" carrying the whole
+    `_rag_answer` dict, exactly what /api/ask returns. No TTS, no audit, no
+    conversation memory or web offer, and citation markers are kept (the screen
+    renders them). Returns None; the result is the turn state."""
+    created_at = state.get("created_at")
+    try:
+        if is_cancelled(s3, bucket, caller_sub, turn_id):
+            return None
+        request = state.get("request")
+        if not isinstance(request, dict):
+            logger.error("screen worker: no request turn=%s", turn_id)
+            put_state(s3, bucket, caller_sub, turn_id,
+                      {"status": "error", "channel": SCREEN, "error": "No answer"})
+            return None
+        rag_body = {k: v for k, v in request.items() if k not in _SCREEN_DROP}
+        rag_body["caller_sub"] = caller_sub
+
+        def _on_web_start():
+            if not is_cancelled(s3, bucket, caller_sub, turn_id):
+                put_state(s3, bucket, caller_sub, turn_id,
+                          {"status": "searching_web", "channel": SCREEN,
+                           "created_at": created_at})
+
+        t_rag = time.perf_counter()
+        rag = laa._rag_answer(rag_body, on_web_start=_on_web_start)
+        rag_s = time.perf_counter() - t_rag
+        # /api/ask serialises with default=str; do the same so a stray datetime
+        # in the result cannot fail the done write.
+        result = json.loads(json.dumps(rag, default=str))
+
+        if is_cancelled(s3, bucket, caller_sub, turn_id):
+            return None
+        web = bool(rag.get("from_web")) if isinstance(rag, dict) else False
+        put_state(s3, bucket, caller_sub, turn_id,
+                  {"status": "done", "channel": SCREEN, "result": result,
+                   "created_at": created_at})
+        logger.info("screen ask: rag=%.2fs total=%.2fs turn=%s web=%s sub_hash=%s",
+                    rag_s, time.perf_counter() - t0, turn_id, web, sub_hash(caller_sub))
+    except Exception as e:  # noqa: BLE001
+        logger.error("screen worker failed: turn=%s err=%s", turn_id, type(e).__name__)
+        try:
+            put_state(s3, bucket, caller_sub, turn_id,
+                      {"status": "error", "channel": SCREEN, "error": "No answer"})
+        except Exception:  # noqa: BLE001
+            pass
+    return None
 
 
 def worker_handler(event, context):
@@ -520,6 +629,8 @@ def worker_handler(event, context):
         return None
     if not state or state.get("status") != "pending":
         return None
+    if event.get("channel") == SCREEN:
+        return _work_screen(s3, bucket, caller_sub, turn_id, state, laa, t0)
     created_at = state.get("created_at")
 
     try:
