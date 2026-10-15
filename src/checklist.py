@@ -128,7 +128,12 @@ def rebuild(section, items, transcript_text):
     (paragraphs, line_refs, report). `section` is a _prose_sections dict."""
     t_words = _words(transcript_text)
     answered, report = {}, {"items": len(items), "answered": 0, "dropped": [],
-                            "evidence": {}}
+                            "evidence": {},
+                            # What the inspector did not do (owner, 2026-10-16): items the
+                            # recording never addressed, and items answered No. Built from
+                            # the same `answered` map as the rows below. `text`, not `item`:
+                            # `dropped` already uses `item` for the number.
+                            "gaps": {"not_covered": [], "failed": []}}
     for num, cells, refs in _model_rows(section.get("paragraphs") or [],
                                         section.get("line_refs") or []):
         cells = (cells + [""] * len(MODEL_COLUMNS))[:len(MODEL_COLUMNS)]
@@ -155,8 +160,12 @@ def rebuild(section, items, transcript_text):
         if a:
             ans, comment, responsible, due, refs = a
             row = [item, ans, comment, responsible, due]
+            if ans == "No":
+                report["gaps"]["failed"].append({"n": i, "text": item, "comment": comment or "",
+                                                 "responsible": responsible or "", "due": due or ""})
         else:
             refs, row = [], [item, "", NOT_COVERED, "", ""]
+            report["gaps"]["not_covered"].append({"n": i, "text": item})
         paragraphs.append(" | ".join(c.replace("|", "/") for c in row))
         line_refs.append(list(refs))
     return paragraphs, line_refs, report

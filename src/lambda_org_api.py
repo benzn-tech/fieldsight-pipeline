@@ -3993,28 +3993,58 @@ def _hms_len(clock):
     return parts[0] * 3600 + parts[1] * 60 + (parts[2] if len(parts) > 2 else 0)
 
 
+def _checklist_gaps(result):
+    """What the inspector did not do, summed over the report's checklists
+    (owner, 2026-10-16), or None when the result says nothing about it.
+
+    None, never two empty lists, unless at least one checklist carries `gaps`:
+    a result from before gaps were recorded, or `checklists: {}`, must not read
+    as "all items covered". Never raises -- a malformed result only loses its
+    gaps, never its status."""
+    try:
+        checklists = result.get("checklists")
+        if not isinstance(checklists, dict):
+            return None
+        out, known = {"notCovered": [], "failed": []}, False
+        for title, rep in checklists.items():
+            gaps = rep.get("gaps") if isinstance(rep, dict) else None
+            if not isinstance(gaps, dict):
+                continue
+            nc, failed = gaps.get("not_covered"), gaps.get("failed")
+            if not isinstance(nc, list) or not isinstance(failed, list):
+                continue
+            known = True
+            out["notCovered"] += [dict(g, checklist=title) for g in nc if isinstance(g, dict)]
+            out["failed"] += [dict(g, checklist=title) for g in failed if isinstance(g, dict)]
+        return out if known else None
+    except Exception:
+        logger.exception("checklist gaps unreadable")
+        return None
+
+
 def _checklist_report_status(result_key):
-    """pending | done | error | removed-free status of one auto report, read off
-    the worker's result (no presign here -- the download goes through
+    """(status, error, gaps) of one auto report -- status pending | done | error,
+    read off the worker's result (no presign here -- the download goes through
     /days/{date}/report/status, which re-checks deletions first)."""
     try:
         obj = s3().get_object(Bucket=LAKE_BUCKET, Key=result_key)
     except ClientError as e:
         if e.response.get("Error", {}).get("Code") in _LAKE_NOT_FOUND_CODES:
-            return "pending", None
+            return "pending", None, None
         raise
     result = json.loads(obj["Body"].read().decode("utf-8"))
-    return result.get("status") or "pending", result.get("error")
+    status = result.get("status") or "pending"
+    return status, result.get("error"), (_checklist_gaps(result) if status == "done" else None)
 
 
 def _checklist_report_payload(r):
-    status, err = _checklist_report_status(r["result_key"])
+    status, err, gaps = _checklist_report_status(r["result_key"])
     return {"id": str(r["id"]), "date": str(r.get("report_date") or ""),
             "checkName": r["check_name"], "templateName": r["template_name"],
             "templateId": str(r["template_id"]) if r.get("template_id") else None,
             "startAt": r["start_at"], "endAt": r.get("end_at"),
             "segments": r.get("segments"), "requestId": r["request_id"],
-            "status": status, "error": err}
+            "status": status, "error": err, "gaps": gaps}
 
 
 def _unmatched_checks(rows):

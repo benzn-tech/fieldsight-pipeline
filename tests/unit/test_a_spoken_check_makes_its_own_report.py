@@ -111,7 +111,7 @@ def test_the_endpoints_list_reports_with_status_and_unmatched_checks(monkeypatch
     monkeypatch.setattr(org.inspection_windows, "for_day", lambda c, co, f, d: [
         {"name": "steel inspection", "start_at": "11:02:21", "end_at": "11:02:41", "kind": "steel",
          "template_id": None}])
-    monkeypatch.setattr(org, "_checklist_report_status", lambda key: ("done", None))
+    monkeypatch.setattr(org, "_checklist_report_status", lambda key: ("done", None, None))
     caller = {"id": "u", "company_id": "c-1", "global_role": "gm"}
     res = org.get_day_checklist_reports(None, caller, "2026-10-06", {"queryStringParameters": {"user": "Ben_Lin_test2"}})
     body = json.loads(res["body"])
