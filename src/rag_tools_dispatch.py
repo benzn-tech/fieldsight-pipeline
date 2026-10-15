@@ -171,7 +171,16 @@ def _overview(conn, caller, sc, date_from, date_to, kw, meta):
     return _normalize_rows(conn, caller, sc, rows, _TOPIC_TEXT)
 
 
+def _need_embedding(call, meta):
+    """A search-shaped call without an embedding is the orchestrator's contract
+    break, not a transient failure: bad_args, so the model is not told to retry."""
+    if not call.get("query_embedding"):
+        meta.update({"error": "bad_args", "field": "query_embedding"})
+        raise _NoRows()
+
+
 def _run_search(conn, caller, sc, args, call, search_fn, site_id, user_id, meta):
+    _need_embedding(call, meta)
     ev = {"sub": caller["sub"], "query_embedding": call.get("query_embedding"),
           "question": args["query"], "k": (args.get("k") or DEFAULT_K) * 2}
     if args.get("date_from"):
@@ -230,6 +239,7 @@ def _latest_activity(conn, caller, sc, a, meta, call, search_fn, source_family, 
             meta["empty_reason"] = _empty_reason(sc)
             return []
         return _overview(conn, caller, sc, day, day, kw, meta)
+    _need_embedding(call, meta)
     gate = float(os.environ.get("ASK_TOOLS_MATCH_GATE", "0.55"))
     site_ids, author_ids = _narrowed(sc, site_id, user_id)
     if user_id:

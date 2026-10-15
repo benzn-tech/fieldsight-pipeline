@@ -283,6 +283,16 @@ def test_search_not_provisioned_maps_to_error(monkeypatch):
     assert res[0]["meta"]["error"] == "not_provisioned"
 
 
+@pytest.mark.parametrize("name", ["search_records", "latest_activity"])
+def test_search_call_without_embedding_is_bad_args_not_upstream(monkeypatch, name):
+    ran = []
+    monkeypatch.setattr(d.chunks, "latest_matching_date", lambda *a, **k: ran.append(1))
+    res = _run([{"id": "a", "name": name, "args": {"query": "pour"}}], monkeypatch,
+               search=lambda ev, c: ran.append(1) or {"chunks": []})
+    assert not ran and res[0]["rows"] == []
+    assert (res[0]["meta"]["error"], res[0]["meta"]["field"]) == ("bad_args", "query_embedding")
+
+
 # ---- latest_activity ---------------------------------------------------------------
 
 def test_latest_activity_without_query_reads_that_days_overview(monkeypatch):
