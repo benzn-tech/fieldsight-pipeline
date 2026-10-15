@@ -14,6 +14,9 @@ MAX_BYTES = 50 * 1024 * 1024
 MAX_PAGES = 500
 MAX_CHARS = 2_000_000
 MAX_CHUNKS = 1000
+# A .docx is a zip: refuse one that declares more than this uncompressed, before
+# python-docx inflates it (zip bomb).
+MAX_UNPACKED_BYTES = 200 * 1024 * 1024
 
 TYPE_ERROR = "Upload a Word file (.docx), a PDF, or a text file (.txt, .md)."
 

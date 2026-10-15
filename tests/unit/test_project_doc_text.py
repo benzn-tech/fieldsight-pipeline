@@ -71,15 +71,42 @@ def test_plain_text_is_paragraphs_as_is():
     assert [b["text"] for b in out["blocks"]] == ["First para\nstill first.", "Second."]
 
 
-@pytest.mark.parametrize("data,ext", [
-    (b"this is not a zip", "docx"),
-    (b"%PDF-1.4\n1 0 obj\n<<", "pdf"),
+def _rc4_encrypted_pdf():
+    import io
+
+    import pypdf
+    w = pypdf.PdfWriter(clone_from=pypdf.PdfReader(io.BytesIO(make_pdf([["x" * 300]]))))
+    w.encrypt("pw", algorithm="RC4-128")
+    buf = io.BytesIO()
+    w.write(buf)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("data,ext,reason", [
+    (b"this is not a zip", "docx", "MSG_DAMAGED"),
+    (b"%PDF-1.4\n1 0 obj\n<<", "pdf", "MSG_DAMAGED"),
+    (None, "pdf", "MSG_PASSWORD"),          # RC4 user password: pure-Python pypdf reads it
 ])
-def test_a_damaged_file_is_unreadable_with_a_reason(data, ext):
+def test_a_damaged_file_is_unreadable_with_a_reason(data, ext, reason):
     """Review Focus 4."""
+    data = _rc4_encrypted_pdf() if data is None else data
     with pytest.raises(t.Unreadable) as e:
         t.extract(data, ext)
-    assert e.value.reason == t.MSG_DAMAGED
+    assert e.value.reason == getattr(t, reason)
+
+
+def test_an_aes_pdf_without_cryptography_is_protected_not_damaged(monkeypatch):
+    """AES needs `cryptography`, which the layer does not carry: pypdf raises
+    DependencyError, and that is the file's protection, not damage."""
+    import pypdf
+    from pypdf.errors import DependencyError
+
+    def boom(*a, **k):
+        raise DependencyError("cryptography is required for AES")
+    monkeypatch.setattr(pypdf, "PdfReader", boom)
+    with pytest.raises(t.Unreadable) as e:
+        t.extract(make_pdf([["x" * 300]]), "pdf")
+    assert e.value.reason == t.MSG_PROTECTED
 
 
 def test_an_empty_file_is_unreadable():
@@ -123,3 +150,115 @@ def test_a_missing_reader_is_not_configured_not_unreadable(monkeypatch):
 def test_an_unknown_extension_is_unreadable():
     with pytest.raises(t.Unreadable):
         t.extract(b"x", "xlsx")
+
+
+# --- Fix round 1 --------------------------------------------------------------------
+
+def test_a_wrapped_pdf_line_starting_with_a_number_is_not_a_heading():
+    lines = ["The contractor shall use", "20 MPa concrete for all", "footings."]
+    out = t.extract(make_pdf([lines + ["x" * 250]]), "pdf")
+    assert [b for b in out["blocks"] if b["kind"] == "heading"] == []
+    assert out["blocks"][0]["text"].startswith(
+        "The contractor shall use 20 MPa concrete for all footings.")
+
+
+def test_a_real_pdf_clause_heading_after_a_sentence_is_still_found():
+    out = t.extract(make_pdf([["General requirements apply.", "3.2 Formwork",
+                               "Tolerance is 5 mm on all faces. " * 8]]), "pdf")
+    heads = [(b["level"], b["text"]) for b in out["blocks"] if b["kind"] == "heading"]
+    assert heads == [(2, "3.2 Formwork")]
+
+
+@pytest.mark.parametrize("line", ["20 MPa concrete", "3 no. footings", "12 mm bars",
+                                  "4 the contractor"])
+def test_a_quantity_or_lowercase_continuation_is_never_a_clause_heading(line):
+    assert t._clause_heading(line) is None
+
+
+def test_a_pdf_heading_also_stays_in_the_body():
+    out = t.extract(make_pdf([["3.2 Formwork", "Tolerance is 5 mm on all faces. " * 8]]),
+                    "pdf")
+    para = next(b for b in out["blocks"] if b["kind"] == "para")
+    assert para["text"].startswith("3.2 Formwork Tolerance")
+
+
+@pytest.mark.parametrize("n,scanned", [(199, True), (200, False)])
+def test_the_scanned_threshold_is_an_average_of_200_chars_per_page(n, scanned):
+    data = make_pdf([["a" * n], ["b" * n]])
+    if scanned:
+        with pytest.raises(t.Unreadable) as e:
+            t.extract(data, "pdf")
+        assert e.value.reason == t.MSG_SCANNED
+    else:
+        assert t.extract(data, "pdf")["pages"] == 2
+
+
+def test_cjk_lines_join_without_a_space_and_latin_lines_with_one():
+    assert t._join_lines(["混凝土", "保护层"]) == "混凝土保护层"
+    assert t._join_lines(["concrete", "cover"]) == "concrete cover"
+    assert t._join_lines(["厚度", "40 mm"]) == "厚度 40 mm"
+
+
+def test_gbk_text_is_read():
+    out = t.extract("混凝土保护层厚度 40 mm".encode("gbk"), "txt")
+    assert out["blocks"][0]["text"] == "混凝土保护层厚度 40 mm"
+
+
+def test_utf16_text_with_a_bom_is_read():
+    out = t.extract("Cover 40 mm\n\n保护层".encode("utf-16"), "txt")
+    assert [b["text"] for b in out["blocks"]] == ["Cover 40 mm", "保护层"]
+
+
+def test_undecodable_text_is_unreadable():
+    with pytest.raises(t.Unreadable) as e:
+        t.extract(b"\x80\x81" * 50, "txt")
+    assert e.value.reason == t.MSG_ENCODING
+
+
+def test_a_markdown_heading_directly_followed_by_text_is_a_heading():
+    out = t.extract(b"# Spec\nIntro text.\n## C# usage ##\nBody", "md")
+    assert _kinds(out["blocks"]) == [("heading", 1, "Spec"), ("para", None, "Intro text."),
+                                     ("heading", 2, "C# usage"), ("para", None, "Body")]
+
+
+def test_a_hash_inside_a_code_fence_is_not_a_heading():
+    out = t.extract(b"```\n# not a heading\n```", "md")
+    assert [b["kind"] for b in out["blocks"]] == ["para"]
+
+
+def test_too_much_pdf_text_stops_early(monkeypatch):
+    monkeypatch.setattr(project_doc_types, "MAX_CHARS", 400)
+    with pytest.raises(t.Unreadable) as e:
+        t.extract(make_pdf([["a" * 300], ["b" * 300], ["c" * 300]]), "pdf")
+    assert e.value.reason == t.MSG_TOO_MUCH_TEXT and e.value.pages == 3
+
+
+def test_a_docx_that_unpacks_too_large_is_refused_before_parsing(monkeypatch):
+    data = make_docx(lambda d: d.add_paragraph("hello"))
+    monkeypatch.setattr(project_doc_types, "MAX_UNPACKED_BYTES", 100)
+    with pytest.raises(t.Unreadable) as e:
+        t.extract(data, "docx")
+    assert e.value.reason == t.MSG_TOO_BIG_UNPACKED
+
+
+def test_a_docx_body_that_cannot_be_walked_is_damaged(monkeypatch):
+    def broken(d):
+        raise ValueError("bad xml")
+    monkeypatch.setattr(t, "_docx_blocks", broken)
+    with pytest.raises(t.Unreadable) as e:
+        t.extract(make_docx(lambda d: d.add_paragraph("hello")), "docx")
+    assert e.value.reason == t.MSG_DAMAGED
+
+
+def test_the_limits_in_the_messages_come_from_the_constants():
+    assert f"{project_doc_types.MAX_BYTES // (1024 * 1024)} MB" in t.MSG_TOO_BIG
+    assert str(project_doc_types.MAX_PAGES) in t.MSG_TOO_MANY_PAGES
+    assert f"{project_doc_types.MAX_CHARS:,}" in t.MSG_TOO_MUCH_TEXT
+
+
+def test_a_title_cased_wrapped_line_mid_sentence_is_not_a_heading():
+    """Rule (b) on its own: the line reads like a title, but the previous line did not end
+    a sentence, so it is a wrapped continuation."""
+    out = t.extract(make_pdf([["The walls shall be built from", "40 Series Masonry Blocks",
+                               "x" * 250]]), "pdf")
+    assert [b for b in out["blocks"] if b["kind"] == "heading"] == []

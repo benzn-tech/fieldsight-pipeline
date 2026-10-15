@@ -67,3 +67,51 @@ def test_the_heading_path_is_embedded_but_not_stored():
     assert x["chunk_text"] == "Tolerance 5 mm"
     assert c.embed_text(x) == "3.2 Formwork\n\nTolerance 5 mm"
     assert c.embed_text(dict(x, heading=None)) == "Tolerance 5 mm"
+
+
+# --- Fix round 1 --------------------------------------------------------------------
+
+def test_a_cjk_full_stop_is_a_cut_point():
+    sentence = "混凝土保护层厚度应符合设计要求" * 6 + "。"        # 91 chars
+    out = c.chunk([H(1, "规范"), P(sentence * 60)])
+    assert len(out) > 1
+    assert out[0]["chunk_text"].endswith("。")
+
+
+def test_the_cut_point_is_the_target_not_the_hard_cap():
+    out = c.chunk([H(1, "A"), P("x" * 5000)])
+    assert len(out[0]["chunk_text"]) == c.TARGET
+
+
+def test_split_long_terminates_and_loses_nothing_on_a_run_with_no_break():
+    pieces = c._split_long("x" * 100_000, c.TARGET)
+    assert "".join(pieces) == "x" * 100_000
+    assert all(len(p) <= c.TARGET for p in pieces)
+
+
+def _rebuild(chunks):
+    """The chunks with each overlap removed, concatenated."""
+    parts = []
+    for i, x in enumerate(chunks):
+        text = x["chunk_text"]
+        if i:
+            carry = c._tail(chunks[i - 1]["chunk_text"])
+            assert text.startswith(carry + "\n\n")
+            text = text[len(carry) + 2:]
+        parts.append(text)
+    return " ".join(parts)
+
+
+def test_chunks_minus_overlap_rebuild_the_input():
+    paras = [" ".join(f"w{j}_{i}" for i in range(60 + 37 * j)) for j in range(12)]
+    out = c.chunk([H(1, "A")] + [P(p) for p in paras])
+    assert len(out) > 2
+    assert _rebuild(out).split() == " ".join(paras).split()
+
+
+def test_zero_overlap_carries_nothing(monkeypatch):
+    monkeypatch.setattr(c, "OVERLAP", 0)
+    assert c._tail("alpha beta gamma") == ""
+    out = c.chunk([H(1, "A"), P("word " * 1000)])
+    assert len(out) > 1
+    assert sum(len(x["chunk_text"].split()) for x in out) == 1000
