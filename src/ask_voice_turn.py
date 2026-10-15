@@ -615,7 +615,8 @@ def _work_screen(s3, bucket, caller_sub, turn_id, state, laa, t0):
             import ask_orchestrator
             rag = ask_orchestrator.answer(
                 rag_body, channel=SCREEN,
-                on_state=_state_writer(s3, bucket, caller_sub, turn_id, created_at, SCREEN))
+                on_state=_state_writer(s3, bucket, caller_sub, turn_id, created_at, SCREEN),
+                turn_id=turn_id)
         else:
             rag = laa._rag_answer(rag_body, on_web_start=_on_web_start)
         rag_s = time.perf_counter() - t_rag
@@ -708,7 +709,8 @@ def worker_handler(event, context):
             import ask_orchestrator
             rag = ask_orchestrator.answer(
                 rag_body, channel="voice",
-                on_state=_state_writer(s3, bucket, caller_sub, turn_id, created_at, "voice"))
+                on_state=_state_writer(s3, bucket, caller_sub, turn_id, created_at, "voice"),
+                turn_id=turn_id)
         else:
             rag = laa._rag_answer(rag_body, on_web_start=_on_web_start)
         rag_s = time.perf_counter() - t_rag
