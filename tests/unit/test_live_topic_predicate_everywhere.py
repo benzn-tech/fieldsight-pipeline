@@ -134,6 +134,7 @@ def test_search_sql_helpers_carry_the_live_arm():
     assert "superseded_at IS NULL" in search_sql.build_search_sql()
     assert "superseded_at IS NULL" in search_sql.build_latest_date_sql()
     assert "superseded_at IS NULL" in search_sql._scope_predicate("c")
+    assert "superseded_at IS NULL" in search_sql.build_latest_match_date_sql()
 
 
 # ---------------------------------------------------------------------------------------
@@ -149,6 +150,7 @@ _MARKERS = (
     "CHILD_OF_VISIBLE_TOPIC", "_VISIBLE_T", "_VISIBLE_P",
     "_TOPIC_VISIBLE_SQL", "_TOPIC_VISIBLE_ACTION_ITEMS_SQL",
     "company_excluded_topic_ids", "build_search_sql(", "build_latest_date_sql(",
+    "_visibility_predicate(", "_scope_predicate(", "build_latest_match_date_sql(",
 )
 
 FILTERED = [
@@ -176,8 +178,11 @@ FILTERED = [
     (search_sql, "_scope_predicate"),
     (search_sql, "build_search_sql"),
     (search_sql, "build_latest_date_sql"),
+    (search_sql, "build_latest_match_date_sql"),
+    (search_sql, "_visibility_predicate"),
     (chunks, "search_chunks"),
     (chunks, "latest_visible_date"),
+    (chunks, "latest_matching_date"),
 ]
 
 
