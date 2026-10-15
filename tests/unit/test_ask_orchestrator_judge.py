@@ -735,3 +735,11 @@ def test_locked_refs_fresh_holds_the_lock():
     inner.fresh = lambda prefix="R": held.append(locked._lock.locked()) or "R9"
     locked.fresh()
     assert held == [True]
+
+
+def test_system_prompt_says_to_answer_from_the_latest_day():
+    # Live TEST 2026-10-16: with round 1b's records shown, the judge only said
+    # "the latest recorded day is 23 September" and dropped them under rule 3.
+    import datetime
+    prompt = orch._system_prompt(datetime.date(2026, 10, 16), "screen", "never")
+    assert "Those records DO bear on the question." in prompt
