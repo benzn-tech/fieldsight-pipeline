@@ -201,6 +201,11 @@ def render(envelopes) -> str:
 # blanks are captured so a group that turns into nothing takes them with it.
 _REF_GROUP = re.compile(r"([ \t]*)\[\s*([RW]\d+(?:\s*[,;]\s*[RW]\d+)*)\s*\]")
 _REF_SPLIT = re.compile(r"\s*[,;]\s*")
+# A bare numeric marker ([1], [1, 2], [1-3]). The judge has no numbered
+# evidence, so one in its answer points at nothing -- most likely copied from
+# the web answer's own source numbering. Stripped and counted as a bad ref,
+# never left to collide with the renumbered [n] cards.
+_NUMERIC_GROUP = re.compile(r"[ \t]*\[\s*\d+(?:\s*[-–,;]\s*\d+)*\s*\]")
 _MULTI_BLANK = re.compile(r"[ \t]{2,}")
 
 
@@ -263,7 +268,14 @@ def to_client(answer_text, envelopes, web_block, channel) -> dict:
                 cited_w.append(ref)
         return lead + "".join(out) if out else ""
 
-    text = _REF_GROUP.sub(repl, answer_text or "")
+    def numeric(m):
+        nonlocal bad
+        bad += 1
+        return ""
+
+    # Numeric markers first: the [n] that repl writes must not be stripped.
+    text = _NUMERIC_GROUP.sub(numeric, answer_text or "")
+    text = _REF_GROUP.sub(repl, text)
     text = _MULTI_BLANK.sub(" ", text).strip()
 
     web = None
@@ -435,7 +447,9 @@ def web_tool(question, budget, voice, refs) -> dict:
     ms = int((time.monotonic() - t) * 1000)
 
     items, meta = [], {"ms": ms}
-    answer = (block.get("answer") or "").strip()
+    # The web answer numbers its own sources [1], [2]. Those sources are W2.. here,
+    # so the judge never sees the old numbering (it would copy it).
+    answer = _MULTI_BLANK.sub(" ", _NUMERIC_GROUP.sub("", block.get("answer") or "")).strip()
     if answer:
         items.append({"ref": refs.assign("web_answer", "turn", "W"), "kind": "web_answer",
                       "provenance": "web", "text": answer[:WEB_ANSWER_MAX_CHARS]})

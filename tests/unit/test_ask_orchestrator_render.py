@@ -310,3 +310,13 @@ def test_guard_fires_only_on_web_basis_when_anchored_or_scoped():
     assert orch.guard_basis("web", False, False) is False
     for basis in ("records", "mixed", "none", None):
         assert orch.guard_basis(basis, True, True) is False
+
+
+def test_to_client_strips_and_counts_stray_numeric_markers():
+    out = orch.to_client("Cover is 40 mm [1] [R1]. See [2, 3].", _round(), _web_block(),
+                         "screen")
+    assert out["answer"] == "Cover is 40 mm [1]. See."
+    assert out["bad_refs"] == 2
+    assert len(out["citations"]) == 1
+    voice = orch.to_client("Cover is 40 mm [1] [R1].", _round(), None, "voice")
+    assert voice["answer"] == "Cover is 40 mm." and voice["bad_refs"] == 1

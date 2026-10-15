@@ -445,3 +445,11 @@ def test_web_wait_never_eats_the_final_answer_reserve(monkeypatch):
     monkeypatch.setattr(web_answer, "general_answer", fake)
     orch.run_round1(_req(policy="required"), _ctx(deadline_in=20.0), FakeTools(_rows))
     assert seen["budget"] <= 20.0 - orch.FINAL_RESERVE_S
+
+
+def test_web_tool_w1_text_carries_no_numeric_markers(monkeypatch):
+    monkeypatch.setattr(web_answer, "general_answer",
+                        lambda *a, **k: _block(answer="Cover is 40 mm [1] per NZS [2, 3]."))
+    env = orch.web_tool("q", 20, False, RefAssigner())
+    assert env["items"][0]["text"] == "Cover is 40 mm per NZS."
+    assert env["block"]["answer"] == "Cover is 40 mm [1] per NZS [2, 3]."   # client block as today
