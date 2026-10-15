@@ -60,3 +60,6 @@ clips*.json
 # Continuity eval harness output (scripts/continuity_eval): real session transcripts
 # and extractions, from TEST and read-only PROD. Only committed counts leave here.
 continuity_eval_runs/
+
+# Ask routing eval: per-run answers and routes (may hold answer text), never committed.
+tools/ask-routing-eval/results/

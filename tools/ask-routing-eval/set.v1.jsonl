@@ -1,0 +1,22 @@
+{"id": "pd1", "group": "project_day", "question": "What did we do on site on 2026-09-03?", "channels": ["screen", "voice"], "expect": {"dates": ["2026-09-03"]}}
+{"id": "pd2", "group": "project_day", "question": "What was said about the slab pour programme on 2026-09-02?", "channels": ["screen", "voice"], "expect": {"dates": ["2026-09-02"]}}
+{"id": "pd3", "group": "project_day", "question": "What did we discuss on 2026-09-23?", "channels": ["screen", "voice"], "expect": {"dates": ["2026-09-23"]}}
+{"id": "pd4", "group": "project_day", "question": "What came up about pricing on 2026-08-27?", "channels": ["screen", "voice"], "expect": {"dates": ["2026-08-27"]}}
+{"id": "pe1", "group": "project_empty_day", "question": "What happened on site yesterday?", "channels": ["screen", "voice"], "expect": {"dates": ["2026-10-15"], "relative": true, "written_on": "2026-10-16", "latest_before": "2026-09-23"}}
+{"id": "pe2", "group": "project_empty_day", "question": "What did we do on site on 2026-10-01?", "channels": ["screen", "voice"], "expect": {"dates": ["2026-10-01"], "latest_before": "2026-09-23"}}
+{"id": "pe3", "group": "project_empty_day", "question": "What happened on site on 2026-09-10?", "channels": ["screen", "voice"], "expect": {"dates": ["2026-09-10"], "latest_before": "2026-09-07"}}
+{"id": "pl1", "group": "person_or_latest", "question": "When did we last talk about the total station?", "channels": ["screen", "voice"], "expect": {"dates": ["2026-09-03"], "latest": "2026-09-03"}}
+{"id": "pl2", "group": "person_or_latest", "question": "When did we last discuss Twizel?", "channels": ["screen", "voice"], "expect": {"dates": ["2026-09-02", "2026-09-03"], "latest": "2026-09-03"}}
+{"id": "pl3", "group": "person_or_latest", "question": "When did we last talk about camera placement on site?", "channels": ["screen", "voice"], "expect": {"dates": ["2026-07-31", "2026-08-27", "2026-09-23"], "latest": "2026-09-23"}}
+{"id": "g1", "group": "general", "question": "What is the minimum concrete cover for a slab exposed to the weather under NZS 3101?", "channels": ["screen", "voice"], "expect": {}}
+{"id": "g2", "group": "general", "question": "How long should concrete cure before the formwork is stripped from a suspended slab?", "channels": ["screen", "voice"], "expect": {}}
+{"id": "g3", "group": "general", "question": "What does clause E2 of the New Zealand Building Code cover?", "channels": ["screen", "voice"], "expect": {}}
+{"id": "g4", "group": "general", "question": "What is the difference between H3.2 and H4 treated timber?", "channels": ["screen", "voice"], "expect": {}}
+{"id": "g5", "group": "general", "question": "What wind zones does NZS 3604 define?", "channels": ["screen", "voice"], "expect": {}}
+{"id": "m1", "group": "mixed", "question": "How does our slab QA with the total station compare with the NZS 3109 tolerances for floor level?", "channels": ["screen", "voice"], "expect": {"dates": ["2026-09-03"]}}
+{"id": "m2", "group": "mixed", "question": "We talked about hot works permits and a fire watcher. What does WorkSafe guidance say a fire watch after hot works needs?", "channels": ["screen", "voice"], "expect": {"dates": ["2026-09-02"]}}
+{"id": "m3", "group": "mixed", "question": "We discussed the crane height restriction at the airport job. What are the CAA rules for cranes near an aerodrome?", "channels": ["screen", "voice"], "expect": {"dates": ["2026-09-02"]}}
+{"id": "ew1", "group": "explicit_web", "question": "What are the current NZS 3604 bracing requirements? Search online.", "channels": ["screen", "voice"], "expect": {}}
+{"id": "ew2", "group": "explicit_web", "question": "Look it up online: what PPE is required for working at height in New Zealand?", "channels": ["screen", "voice"], "expect": {}}
+{"id": "sg1", "group": "scoped_general", "question": "What are the rules for a fire watch after hot works?", "channels": ["screen"], "body": {"site_id": "@visible_site"}, "expect": {"test_site_id": "4326dbc7-14a2-4251-8381-9d0067595a85"}}
+{"id": "wc1", "group": "web_cap", "question": "Search online and compare the concrete cover rules for marine exposure in NZS 3101 with those in AS 3600.", "channels": ["screen", "voice"], "expect": {}}
