@@ -1372,7 +1372,7 @@ def _rag_answer(body, on_web_start=None):
         # online" (`_wi`) is the caller's answer to that offer, so it wins. The
         # screen offers the same way once it opted in.
         _offer = ((_voice and bool(body.get("offer_web")) and not _wi)
-                  or (_screen_opt and not _wi))
+                  or (_screen_opt and not scoped and not _wi))
         _offer_text = (voice_web.OFFER_NO_RECORDS if _voice
                        else voice_web.SCREEN_OFFER_NO_RECORDS)
         # What the web sees. The voice worker strips the phrase before this

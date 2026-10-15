@@ -94,6 +94,17 @@ def test_scoped_with_web_intent_gets_no_web_and_no_offer(monkeypatch, chunks, of
     assert "from_web" not in out and "web_offer" not in out
 
 
+@pytest.mark.parametrize("chunks", [(), (FAR_CHUNK,)])
+def test_site_scoped_with_offer_web_and_web_intent_gets_no_web_and_no_offer(
+        monkeypatch, chunks):
+    rig = wire(monkeypatch, chunks=chunks, kind="general", records_answer=False,
+               web=WEB_OK)
+    out = ask(rig.cb(), offer_web=True, web_intent=True,
+              site_id="5c0e8d7a-1111-4222-8333-444455556666")
+    assert _no_web(rig)
+    assert "from_web" not in out and "web_offer" not in out
+
+
 def test_scoped_with_typed_phrase_and_offer_web_gets_no_web(monkeypatch):
     rig = wire(monkeypatch, chunks=(), web=WEB_OK)
     out = ask(rig.cb(), question=PHRASE_Q, offer_web=True, scoped=True,
