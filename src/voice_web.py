@@ -17,6 +17,10 @@ NO_CLEAR_ANSWER = "I couldn't get a clear answer online for that."
 # instead of being used unasked (spec 2026-10-15 voice offer, section 4.1).
 OFFER_NO_RECORDS = "Your site records don't cover that. Want me to search online?"
 OFFER_ALSO = "Want me to check online as well?"
+# The screen's offer (spec 2026-10-16 section 3): the button is the offer, so the
+# text asks no question the user could only answer by typing "yes". There is no
+# screen counterpart to OFFER_ALSO; a partial answer carries the flag alone.
+SCREEN_OFFER_NO_RECORDS = "Your site records don't cover that."
 DECLINED = "Okay."
 
 # Appended to the web_answer prompts when the answer will be read out by a device.
