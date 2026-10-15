@@ -39,6 +39,7 @@ just skips the DB round-trip and makes the deny-by-default case explicit).
 """
 import json
 import logging
+import os
 
 from db.connection import close_cached_connection, get_cached_connection
 from lexical_terms import or_query, query_terms
@@ -48,6 +49,10 @@ import text_normalize
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+# Which index family search reads: "report" (nightly report chunks, the default) or
+# "session" (extraction-built chunks, source_s3_key under extractions/).
+INDEX_FAMILY = os.environ.get("SEARCH_INDEX_READ", "report")
 
 
 def lambda_handler(event, context):
@@ -236,7 +241,7 @@ def _search(event, context):
         k = int(event.get("k", 8))
     except (TypeError, ValueError):
         k = 8
-    k = max(1, min(k, 32))
+    k = max(1, min(k, 64))
     qv = event.get("query_embedding")
     # The keyword arm (Task 3, 2026-09-20 spec) needs the caller's raw text,
     # not just its embedding. ask-agent sends the question (or its rewrite,
@@ -395,7 +400,8 @@ def _search(event, context):
         return {"chunks": [], "site_count": 0, "basis": basis, "applied": applied}
 
     rows = chunks.search_chunks(conn, qv, site_ids, k=k, author_ids=author_ids,
-                                date_from=date_from, date_to=date_to, query_text=query_text)
+                                date_from=date_from, date_to=date_to, query_text=query_text,
+                                source_family=INDEX_FAMILY)
 
     # "Nothing yesterday" must not become an empty answer. Retry on the nearest
     # day this caller can actually see, at or BEFORE the range they asked
@@ -409,14 +415,16 @@ def _search(event, context):
     # feature stays broken unnoticed here.
     if widen and not rows and (date_from or date_to):
         latest = chunks.latest_visible_date(
-            conn, site_ids, author_ids=author_ids, on_or_before=date_to or date_from)
+            conn, site_ids, author_ids=author_ids, on_or_before=date_to or date_from,
+            source_family=INDEX_FAMILY)
         logger.info("rag-search: %s..%s empty; nearest visible day is %s",
                     date_from, date_to, latest)
         if latest:
             widened_rows = chunks.search_chunks(conn, qv, site_ids, k=k,
                                                 author_ids=author_ids,
                                                 date_from=latest, date_to=latest,
-                                                query_text=query_text)
+                                                query_text=query_text,
+                                                source_family=INDEX_FAMILY)
             # Claimed ONLY if the retry actually returned something. Setting it
             # unconditionally reports "based on 2026-07-18" over zero excerpts --
             # a statement about a day nothing was read from. It cannot happen
@@ -442,7 +450,8 @@ def _search(event, context):
     # and report_date is datetime.date -- Lambda's JSON marshaller can't
     # serialize either. Coerce to plain strings before returning.
     rows = json.loads(json.dumps(rows, default=str))
-    out = {"chunks": rows, "site_count": len(site_ids), "basis": basis, "applied": applied}
+    out = {"chunks": rows, "site_count": len(site_ids), "basis": basis, "applied": applied,
+           "index_family": INDEX_FAMILY}
     if pinned:
         out["pinned_topic"] = pinned
     return out

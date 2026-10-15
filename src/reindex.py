@@ -13,12 +13,18 @@ The request/vectors handoff mirrors the existing embed->ingest sidecar
 contract, just triggered by an edit instead of the nightly report and sourced
 from corrected Aurora rows instead of daily_report.json."""
 import json
+import logging
+import os
 
 from psycopg.rows import dict_row
 
+import index_request
 from repositories import aliases, chunks, redactions, topics
 from chunking import chunk_report
 from lake_put import lake_put
+from session_scope import parse_extraction_key
+
+logger = logging.getLogger()
 
 REQUEST_PREFIX = "reindex_requests/"
 # Vectors go under a SEPARATE top-level prefix (not reindex_requests/*.vectors
@@ -45,6 +51,40 @@ def _company_id_for_site(conn, site_id):
     return row["company_id"] if row else None
 
 
+def _search_index_write():
+    # Read per call (not at import) so org-api's env wiring and tests both see it.
+    return os.environ.get("SEARCH_INDEX_WRITE", "false").lower() == "true"
+
+
+def _enqueue_session_index(s3_client, bucket, conn, t):
+    """Emit the index request for the extraction key `t` came from. Returns its S3
+    key, or None when it cannot be built (unparseable key, site without a company) so
+    the caller falls back to the per-topic chain.
+
+    tier / extracted_at are unknown on the edit path (the apply step decides currency
+    from Aurora). A group key (`grp...`) gets no members: its member keys live in the
+    extraction object, which org-api does not read, so the embedder indexes the topics
+    and digest without transcript windows."""
+    parsed = parse_extraction_key(t["source_s3_key"])
+    if not parsed:
+        logger.warning("search index edit: unparseable extraction key %s -- "
+                       "falling back to the per-topic reindex", t["source_s3_key"])
+        return None
+    folder, date, base = parsed
+    company_id = _company_id_for_site(conn, t["site_id"])
+    if not company_id:
+        logger.warning("search index edit: site %s has no company -- "
+                       "falling back to the per-topic reindex", t["site_id"])
+        return None
+    request = index_request.build(
+        conn, t["source_s3_key"], site_id=t["site_id"], user_id=t.get("user_id"),
+        owner_company_id=company_id, report_date=str(t["report_date"]),
+        user_folder=folder, session_base=base, tier=None, extracted_at=None)
+    if base.startswith("grp"):
+        request["members"] = []
+    return index_request.emit(s3_client, bucket, request)
+
+
 def enqueue_topic_reindex(s3_client, bucket, conn, topic_id, folder, date):
     """Build + write the reindex request for one corrected topic. Returns the
     S3 key, or None if the topic vanished (a concurrent supersession) -- the
@@ -57,6 +97,15 @@ def enqueue_topic_reindex(s3_client, bucket, conn, topic_id, folder, date):
     t = topics.get_topic_full(conn, topic_id)
     if t is None:
         return None
+
+    # Extraction-sourced topics are indexed per session, not per topic: re-emit the
+    # session's index request (all its live topics) and skip the per-topic chain. Runs
+    # before the delete-only guard on purpose -- the rebuild reads only visible topics,
+    # so a redacted / deleted one simply drops out of the replaced session index.
+    if _search_index_write() and str(t.get("source_s3_key") or "").startswith("extractions/"):
+        key = _enqueue_session_index(s3_client, bucket, conn, t)
+        if key is not None:
+            return key
 
     # Life-conversation separation (spec §6): a redacted or non_work topic is
     # removed from RAG. Write a DELETE-ONLY request (no topic_chunks) so

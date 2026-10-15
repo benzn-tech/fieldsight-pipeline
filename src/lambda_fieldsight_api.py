@@ -364,7 +364,7 @@ def search_topics(body, caller):
         'question': question,
         'user': resolve_user_display_name(caller),  # soft context only
         'caller_sub': caller.get('sub', ''),
-        'k': int(body.get('k', 30)) if str(body.get('k', 30)).isdigit() else 30,
+        'k': int(body.get('k', 64)) if str(body.get('k', 64)).isdigit() else 64,
     }
     date_from = body.get('date_from')
     date_to = body.get('date_to')

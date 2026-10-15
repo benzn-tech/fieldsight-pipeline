@@ -2,6 +2,29 @@
 from deleted_predicates import visible_chunks_predicate
 
 
+def family_predicate(alias: str = "c") -> str:
+    # NULL family = no filter (callers that predate the switch stay byte-identical).
+    #
+    # 'session' reads session-family rows (extractions/ keys) and ALSO falls back to
+    # report-family rows for any (site, user, day) the session index does not cover yet:
+    # a day that only ever had a nightly report (no extraction) has zero session rows, and
+    # a pure family filter would make search/Ask answer "No relevant records" for it.
+    # "Covered" = at least one session row exists for the same (site_id, user_id,
+    # report_date); user_id is compared IS NOT DISTINCT FROM so NULL-user rows match each
+    # other. The coverage test deliberately ignores tombstones/supersession: a deleted
+    # session row must keep its day covered, or deleting a recording would resurface the
+    # report-family copy of the same day. Correlated NOT EXISTS so it rides
+    # idx_report_chunks_site_date. The 'report' arm is unchanged.
+    return (f"(%(source_family)s::text IS NULL "
+            f"OR (%(source_family)s::text = 'session' AND ({alias}.source_s3_key LIKE 'extractions/%%' "
+            f"OR NOT EXISTS (SELECT 1 FROM report_chunks s WHERE s.site_id = {alias}.site_id "
+            f"AND s.report_date = {alias}.report_date "
+            f"AND s.user_id IS NOT DISTINCT FROM {alias}.user_id "
+            f"AND s.source_s3_key LIKE 'extractions/%%'))) "
+            f"OR (%(source_family)s::text = 'report' AND ({alias}.source_s3_key IS NULL "
+            f"OR {alias}.source_s3_key NOT LIKE 'extractions/%%')))")
+
+
 def _scope_predicate(alias: str = "c") -> str:
     """The WHERE clause every read of report_chunks must carry: deny-by-default
     site ACL, optional per-author narrowing, optional inclusive date range, and
@@ -19,7 +42,8 @@ def _scope_predicate(alias: str = "c") -> str:
         f"AND (%(author_ids)s::uuid[] IS NULL OR {alias}.user_id = ANY(%(author_ids)s::uuid[])) "
         f"AND (%(date_from)s::date IS NULL OR {alias}.report_date >= %(date_from)s::date) "
         f"AND (%(date_to)s::date IS NULL OR {alias}.report_date <= %(date_to)s::date) "
-        f"AND " + visible_chunks_predicate(alias)
+        f"AND " + visible_chunks_predicate(alias) + " "
+        f"AND " + family_predicate(alias)
     )
 
 
@@ -64,17 +88,21 @@ def build_search_sql() -> str:
     # silently falls back to a sequential scan --
     # test_keyword_arm_expression_matches_the_index_exactly pins this.
     #
-    # The keyword arm's rows carry NO meaningful cosine distance (never scored
-    # against the query embedding) -- NULL, not a fabricated "good" number, so
-    # a keyword hit cannot silently outrank a true semantic top-1. lexical_hit
-    # distinguishes the two arms; downstream ranking (_aggregate_topics in
-    # lambda_ask_agent.py) must admit a lexical_hit=True row past its distance
-    # gate rather than dropping it one hop downstream of this fix.
+    # The keyword arm's rows carry their REAL cosine distance to the query
+    # embedding (2026-10-14 change; the 2026-09-20 spec used NULL so a keyword
+    # hit could never look like a semantic match). A real `<=>` value is not
+    # fabricated, and NULL made _aggregate_topics score such rows 1.0, ranking
+    # a relevant keyword-only row below dozens of weak vector rows. The cost
+    # is one extra vector distance per matched row (<= the arm's LIMIT).
+    # lexical_hit, NOT `distance IS NULL`, is the only way to tell the arms
+    # apart; downstream ranking (_aggregate_topics in lambda_ask_agent.py)
+    # must still admit a lexical_hit=True row past its distance gate.
     #
     # DISTINCT ON (id): a row found by BOTH arms is one row. Its own
     # ORDER BY id, lexical_hit ASC, distance ASC NULLS LAST keeps that row's
-    # vector-arm copy (lexical_hit=false, with a real distance) over the
-    # keyword copy's NULL when both exist -- unchanged tiebreak.
+    # vector-arm copy (lexical_hit=false) over the keyword copy when both
+    # exist; the two copies carry the same distance, so the tiebreak is
+    # unchanged and decided by lexical_hit alone.
     #
     # This SQL has TWO consumers, not one, and they need different things:
     #   - the search box goes through _aggregate_topics, which re-sorts by
@@ -97,7 +125,8 @@ def build_search_sql() -> str:
     #     outside the DISTINCT ON re-imposes it.
     #
     # So the outer SELECT re-sorts the deduped rows by lexical_hit ASC,
-    # distance ASC NULLS LAST. Since lexical_hit=false sorts before true and
+    # distance ASC NULLS LAST (keyword-only rows now order by real distance
+    # among themselves). Since lexical_hit=false sorts before true and
     # the vec CTE is unchanged, this reproduces the pre-this-branch vec-only
     # order EXACTLY for the vector rows, then appends keyword-only rows
     # after all of them (never interleaved). It does not decide how a
@@ -124,7 +153,7 @@ def build_search_sql() -> str:
         "         c.metadata, c.report_date, c.site_id, s.name AS site_name, "
         "         s.slug AS site_slug, "
         "         t.title AS topic_title, t.summary AS topic_summary, "
-        "         NULL::float8 AS distance, true AS lexical_hit "
+        "         c.embedding <=> %(q)s::vector AS distance, true AS lexical_hit "
         "  FROM report_chunks c "
         "  LEFT JOIN topics t ON t.id = c.topic_id "
         "  LEFT JOIN sites s ON s.id = c.site_id "
@@ -183,5 +212,6 @@ def build_latest_date_sql() -> str:
         "WHERE c.site_id = ANY(%(site_ids)s) "
         "AND (%(author_ids)s::uuid[] IS NULL OR c.user_id = ANY(%(author_ids)s::uuid[])) "
         "AND (%(on_or_before)s::date IS NULL OR c.report_date <= %(on_or_before)s::date) "
-        "AND " + visible_chunks_predicate("c")
+        "AND " + visible_chunks_predicate("c") + " "
+        "AND " + family_predicate("c")
     )

@@ -47,6 +47,9 @@ CASES = [
     # 8 / 9 reindex
     ("reindex_requests/%s/Ada_L/t1.json" % D, dict(scope="tenant", kind="reindex", folder="Ada_L", day=D)),
     ("reindex_vectors/%s/Ada_L/t1.json" % D, dict(scope="tenant", kind="reindex", folder="Ada_L", day=D)),
+    # session search index: same shape as the reindex pair, its own kind
+    ("index_requests/%s/Ada_L/%s.json" % (D, BASE), dict(scope="tenant", kind="search_index", folder="Ada_L", day=D)),
+    ("index_vectors/%s/Ada_L/%s.json" % (D, BASE), dict(scope="tenant", kind="search_index", folder="Ada_L", day=D)),
     # 10 meeting minutes
     ("meeting_minutes/%s/standup.docx" % D, dict(scope="lake_wide", kind="meeting_minutes")),
     # 11-13 session reports: sid is a directory segment (or "day")

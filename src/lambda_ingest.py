@@ -59,11 +59,13 @@ import json
 import logging
 import os
 import re
+import uuid
 from urllib.parse import unquote_plus
 
 import boto3
 
 import deadline_parse
+import index_request
 import match_request
 import photo_binding
 import photo_rebind
@@ -75,6 +77,9 @@ from repositories import (chunks, companies, memberships, recordings, redactions
                           sites, topics, users)
 import batch_stitch
 import deletion_mirror
+from deleted_predicates import DELETED_SOURCE_PREDICATE, visible_topics_predicate
+from psycopg.rows import dict_row
+from session_scope import parse_extraction_key
 from transcript_utils import normalize_transcript
 
 logger = logging.getLogger()
@@ -891,8 +896,7 @@ def run_backfill():
     return {"processed": processed, "skipped": skipped, "failed": failed}
 
 
-REINDEX_VECTORS_RE = re.compile(
-    r"^reindex_requests/[^/]+/[^/]+/[^/]+\.vectors\.json$")
+REINDEX_VECTORS_RE = re.compile(r"^reindex_vectors/[^/]+/[^/]+/[^/]+\.json$")
 
 
 def apply_reindex_vectors(key):
@@ -906,17 +910,178 @@ def apply_reindex_vectors(key):
 
 
 # ----------------------------------------------------------
+# Session search index apply (spec D5) + backfill
+# ----------------------------------------------------------
+INDEX_VECTORS_RE = re.compile(r"^index_vectors/[^/]+/[^/]+/[^/]+\.json$")
+
+# Is this extraction key under a recording tombstone? The negation of the SAME predicate
+# every read path carries (DELETED_SOURCE_PREDICATE), bound to a one-row relation that
+# supplies the `source_s3_key` column it names -- one definition of "deleted", not a second
+# hand-written LIKE. Returns a row when the key is NOT deleted.
+_SOURCE_NOT_DELETED_SQL = (
+    "SELECT 1 FROM (SELECT %s::text AS source_s3_key) k WHERE "
+    + DELETED_SOURCE_PREDICATE.format(alias="k"))
+
+BACKFILL_LIMIT_CAP = 2000
+
+
+def _source_is_tombstoned(conn, key):
+    return conn.execute(_SOURCE_NOT_DELETED_SQL, (key,)).fetchone() is None
+
+
+def _apply_index_result(conn, result):
+    """The decision, inside the caller's transaction. Returns (outcome, chunk_count).
+
+    The live topic set is read UNDER the advisory lock item-writer takes for the same key,
+    so the request's idea of "live" is compared with the database's at the moment of
+    writing: vectors for an extraction that has since been re-extracted, superseded by a
+    group pass or deleted must not land. Every skip path returns before any write."""
+    key = result["extraction_key"]
+    cid = result["owner_company_id"]
+    base = result["session_base"]
+    conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (key,))
+    live = set(index_request.live_topic_ids(conn, key))
+    req_ids = {t["id"] for t in result.get("topics") or []}
+
+    if not live and not req_ids:
+        # Windows-only request: no topic ids to compare, so the live set cannot say whether
+        # the session is still wanted. The one thing it can still be is deleted.
+        if _source_is_tombstoned(conn, key):
+            return "cleared", chunks.archive_chunks_for_sources(
+                conn, [key], uuid.uuid4(), company_id=cid)
+    elif not live:
+        # Topics were requested but none is live any more: deleted, or taken over by a
+        # group pass. Archive K's own session rows -- by source key, so neither the report
+        # family nor a group's chunks (which list this base in source_files) are touched.
+        return "cleared", chunks.archive_chunks_for_sources(
+            conn, [key], uuid.uuid4(), company_id=cid)
+    elif not req_ids or not (live & req_ids):
+        # Stale: the extraction has live topics this request does not describe (including a
+        # windows-only request that predates a topic-bearing re-extraction).
+        return "stale", 0
+
+    replaces = [k for k in (result.get("replaces") or []) if k.startswith("extractions/")]
+    dropped = [k for k in (result.get("replaces") or []) if not k.startswith("extractions/")]
+    if dropped:
+        logger.warning("index apply %s: ignoring non-extraction replaces %s", key, dropped)
+    # A member the customer deleted must not be heard through the group: its speech is in
+    # the group's windows and its topic titles in the digest. The tombstone names the
+    # member's own extraction key, which no group row carries, so ask here.
+    dead = []
+    for m in result.get("members") or []:
+        member_key = f"extractions/{m['user_folder']}/{m['date']}/{m['session_base']}.json"
+        if _source_is_tombstoned(conn, member_key):
+            dead.append(m["session_base"])
+    if dead:
+        logger.info("index apply %s: members %s are deleted -- dropping their windows and the digest",
+                    key, dead)
+
+    chunks.delete_chunks_for_sources(conn, [key, *replaces], cid)
+    n = 0
+    for c in result.get("chunks") or []:
+        tid = c.get("topic_id")
+        if tid is not None and tid not in live:
+            # Its topic is gone (deleted, redacted, superseded). A newer request rebuilds it;
+            # inserting it unattached would leave that content searchable.
+            continue
+        if dead and (c["chunk_type"] == "session_digest" or (
+                c["chunk_type"] == "transcript_window" and any(
+                    b in f for f in (c.get("metadata") or {}).get("source_files") or []
+                    for b in dead))):
+            continue
+        chunks.insert_chunk(
+            conn, result["site_id"], result["report_date"], c["chunk_type"], c["chunk_text"],
+            c["embedding"], user_id=result.get("user_id"), source_s3_key=key,
+            topic_id=tid, metadata=c.get("metadata"))
+        n += 1
+    return "applied", n
+
+
+def apply_index_vectors(key):
+    """In-VPC apply of an index_vectors/ object (spec D5): replace the session's search
+    chunks with the embedded ones, unless the extraction moved on since the request.
+
+    One transaction. An unexpected error re-raises after a metric, so S3 re-delivers the
+    event for a transient DB failure; a skip is a normal return."""
+    try:
+        result = json.loads(
+            s3().get_object(Bucket=S3_BUCKET, Key=key)["Body"].read().decode("utf-8"))
+        with get_connection() as conn:
+            outcome, n = _apply_index_result(conn, result)
+    except Exception:
+        logger.exception("index vectors apply failed: %s", key)
+        index_request.emit_failed_metric(key, metric="SearchIndexApplyFailed")
+        raise
+    logger.info("index vectors %s outcome=%s chunks=%d", key, outcome, n)
+    return {"index_applied": key, "outcome": outcome, "chunks": n}
+
+
+def run_index_backfill(spec):
+    """Emit index requests for extraction keys that already have visible topics. Defaults to
+    a dry run that only counts. Group (`grp...`) keys go out with no members: their member
+    keys live in the extraction object, which this lambda has no read grant for, so the
+    embedder resolves them. A key that fails is logged, listed under `failed` and skipped."""
+    spec = spec if isinstance(spec, dict) else {}
+    limit = max(1, min(int(spec.get("limit") or BACKFILL_LIMIT_CAP), BACKFILL_LIMIT_CAP))
+    dry_run = spec.get("dry_run", True) is not False
+    where, params = [], []
+    if spec.get("user_folder"):
+        where.append("t.source_s3_key LIKE %s")
+        params.append(f"extractions/{chunks._escape_like(spec['user_folder'])}/%")
+    if spec.get("date_from"):
+        where.append("t.report_date >= %s")
+        params.append(spec["date_from"])
+    extra = "".join(f" AND {w}" for w in where)
+    emitted, failed = 0, []
+    with get_connection() as conn:
+        rows = conn.cursor(row_factory=dict_row).execute(
+            "SELECT DISTINCT t.source_s3_key, t.site_id, t.user_id, t.report_date "
+            "FROM topics t WHERE t.source_s3_key LIKE 'extractions/%%' "
+            f"AND {visible_topics_predicate('t')}{extra} "
+            "ORDER BY t.report_date DESC LIMIT %s",
+            (*params, limit)).fetchall()
+        for r in rows:
+            parsed = parse_extraction_key(r["source_s3_key"])
+            if not parsed:
+                continue
+            folder, date, base = parsed
+            if dry_run:
+                continue
+            try:
+                company = conn.cursor(row_factory=dict_row).execute(
+                    "SELECT company_id FROM sites WHERE id = %s", (r["site_id"],)).fetchone()
+                if not company or not company["company_id"]:
+                    logger.warning("index backfill: no company for site %s", r["site_id"])
+                    continue
+                request = index_request.build(
+                    conn, r["source_s3_key"], site_id=r["site_id"], user_id=r["user_id"],
+                    owner_company_id=company["company_id"], report_date=str(r["report_date"]),
+                    user_folder=folder, session_base=base, tier=None, extracted_at=None)
+                index_request.emit(s3(), S3_BUCKET, request)
+                emitted += 1
+            except Exception:
+                logger.exception("index backfill: %s failed -- continuing", r["source_s3_key"])
+                failed.append(r["source_s3_key"])
+    return {"keys": len(rows), "emitted": emitted, "dry_run": dry_run, "failed": failed}
+
+
+# ----------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------
 def lambda_handler(event, context):
     event = event or {}
     if event.get("backfill"):
         return run_backfill()
+    if event.get("index_backfill") is not None:
+        return run_index_backfill(event["index_backfill"])
 
     if "Records" in event:
         results = []
         for record in event["Records"]:
             key = unquote_plus(record["s3"]["object"]["key"])
+            if INDEX_VECTORS_RE.match(key):
+                results.append(apply_index_vectors(key))
+                continue
             if REINDEX_VECTORS_RE.match(key):
                 results.append(apply_reindex_vectors(key))
                 continue

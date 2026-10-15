@@ -43,7 +43,7 @@ def test_disabled_is_byte_for_byte_the_old_behaviour(monkeypatch):
 # Task 4, second downstream (CONTROLLER AMENDMENT, 2026-09-20/21): with
 # reranking off (both environments today -- see src/repositories/search_sql.py
 # and lambda_ask_agent.py's own comment above RERANK_ENABLED), build_search_sql
-# now APPENDS keyword-only rows (lexical_hit=True, distance=None) after every
+# now APPENDS keyword-only rows (lexical_hit=True) after every
 # vector row. `chunks[:keep]` alone silently discards all of them whenever the
 # vector arm is saturated at `keep` -- Ask's answering path would then never
 # see the literal token this whole plan exists to surface, even though the
@@ -56,13 +56,13 @@ def test_disabled_is_byte_for_byte_the_old_behaviour(monkeypatch):
 def _lex_chunk(text, key):
     c = _chunk(text, key)
     c["lexical_hit"] = True
-    c["distance"] = None
+    c["distance"] = 0.3  # real cosine distance; only the flag marks it keyword-only
     return c
 
 
 def test_a_keyword_only_row_beyond_k_is_admitted_when_vector_arm_saturates_k(monkeypatch):
     """The exact CONTROLLER AMENDMENT scenario: k vector rows fill the window,
-    one keyword-only row (distance=None) arrives after all of them (Task 3's
+    one keyword-only row arrives after all of them (Task 3's
     append-only ordering). Naive chunks[:keep] would drop it -- the fix must
     reserve a slot for it."""
     monkeypatch.setattr(agent, "RERANK_ENABLED", False)
