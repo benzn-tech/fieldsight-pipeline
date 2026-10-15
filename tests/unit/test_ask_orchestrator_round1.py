@@ -169,7 +169,7 @@ def test_precheck_call_shape(monkeypatch):
     orch.precheck("q two", 1.5)
     (p1, kw1), (_, kw2) = spy.calls
     assert "q one" in p1
-    assert kw1 == {"timeout": 3, "model": web_answer.CHEAP_MODEL, "max_tokens": 512,
+    assert kw1 == {"timeout": orch.PRECHECK_TIMEOUT_S, "model": web_answer.CHEAP_MODEL, "max_tokens": 512,
                    "effort": "low", "caller": "ask_precheck"}
     assert kw2["timeout"] == 1.5
 
@@ -491,3 +491,10 @@ def test_a_late_records_thread_never_writes_the_route(no_model):
     time.sleep(0.3)
     assert json.dumps(route, sort_keys=True) == snapshot
     assert route["calls"] == [["day_overview", "search_records"]]
+
+
+def test_precheck_timeout_clears_the_measured_latency():
+    # Live TEST 2026-10-16: gemini-3.8-flash pre-check took 2.47 s and 2.93 s
+    # (43/123 reasoning tokens at effort low); at 3 s one turn timed out and
+    # logged precheck=failed, which silently skips the web for a general question.
+    assert orch.PRECHECK_TIMEOUT_S >= 6

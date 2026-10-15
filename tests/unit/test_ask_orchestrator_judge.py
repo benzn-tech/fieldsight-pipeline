@@ -743,3 +743,12 @@ def test_system_prompt_says_to_answer_from_the_latest_day():
     import datetime
     prompt = orch._system_prompt(datetime.date(2026, 10, 16), "screen", "never")
     assert "Those records DO bear on the question." in prompt
+
+
+def test_system_prompt_tells_the_judge_to_resolve_spoken_dates():
+    # query_slots (#1133) anchors only ISO and "last <weekday>"; every other
+    # spoken day ("3 September", 上周二那天) is the judge's to resolve.
+    import datetime
+    prompt = orch._system_prompt(datetime.date(2026, 10, 16), "screen", "never")
+    assert "resolve it to an ISO date" in prompt
+    assert "deadlines" in prompt
