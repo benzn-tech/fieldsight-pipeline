@@ -1276,3 +1276,74 @@ def list_expired_non_work(conn, *, older_than, created_since, limit=500) -> list
         "LIMIT %s",
         (older_than, created_since, limit),
     ).fetchall()
+
+
+# ---- Ask tools (spec 2026-10-15-ask-retrieval-tools §3.1) -------------------
+# One WHERE for both functions so day_overview and latest_before can never
+# disagree about what is visible. Rules: deletion/supersession arms, non_work
+# out (NULL counts as work, as the timeline does), graded author filter with
+# NULL user_id hidden, and the timeline's family rule -- per (site,user,day)
+# extraction-sourced topics if any visible one exists, else report-sourced.
+# The family rule's inner EXISTS carries the same visibility arms as the outer
+# row: a deleted, superseded or non_work extraction topic must not suppress the
+# report family, or the day reads as empty.
+def _ask_tools_where(site_ids, *, author_ids, site_id, user_id):
+    clauses = ["t.site_id = ANY(%s::uuid[])",
+               visible_topics_predicate("t"),
+               "t.work_class IS DISTINCT FROM 'non_work'",
+               "(t.source_s3_key LIKE 'extractions/%%' OR NOT EXISTS ("
+               " SELECT 1 FROM topics x WHERE x.site_id = t.site_id"
+               " AND x.user_id IS NOT DISTINCT FROM t.user_id"
+               " AND x.report_date = t.report_date"
+               " AND x.source_s3_key LIKE 'extractions/%%'"
+               " AND x.work_class IS DISTINCT FROM 'non_work'"
+               " AND " + visible_topics_predicate("x") + "))"]
+    params = [[str(s) for s in site_ids]]
+    if author_ids is not None:
+        # = ANY never matches a NULL user_id, so unattributed topics stay hidden.
+        clauses.append("t.user_id = ANY(%s::uuid[])")
+        params.append([str(a) for a in author_ids])
+    if site_id is not None:
+        clauses.append("t.site_id = %s")
+        params.append(str(site_id))
+    if user_id is not None:
+        clauses.append("t.user_id = %s")
+        params.append(str(user_id))
+    return " AND ".join(clauses), params
+
+
+def day_overview_rows(conn, site_ids, date_from, date_to, *, author_ids=None,
+                      site_id=None, user_id=None, limit=60) -> list[dict]:
+    """Visible work topics in [date_from, date_to], chronological. Empty site_ids or
+    an empty (not None) author set means nothing is visible -- never 'no filter'."""
+    if not site_ids or (author_ids is not None and not author_ids):
+        return []
+    where, params = _ask_tools_where(site_ids, author_ids=author_ids,
+                                     site_id=site_id, user_id=user_id)
+    sql = (
+        "SELECT t.id, t.site_id, s.name AS site_name, t.user_id, "
+        "NULLIF(trim(concat_ws(' ', u.first_name, u.last_name)), '') AS user_name, "
+        "t.report_date, t.time_range, t.title, t.summary, t.source_s3_key, "
+        "(SELECT count(*) FROM action_items a WHERE a.topic_id = t.id) AS n_tasks, "
+        "(SELECT count(*) FROM findings f WHERE f.topic_id = t.id) AS n_findings "
+        "FROM topics t JOIN sites s ON s.id = t.site_id "
+        "LEFT JOIN users u ON u.id = t.user_id "
+        f"WHERE {where} AND t.report_date BETWEEN %s AND %s "
+        "ORDER BY t.report_date, t.occurred_at NULLS LAST, t.time_range NULLS LAST, t.created_at "
+        "LIMIT %s")
+    return conn.cursor(row_factory=dict_row).execute(
+        sql, params + [date_from, date_to, limit]).fetchall()
+
+
+def latest_visible_topic_date(conn, site_ids, before, *, author_ids=None,
+                              site_id=None, user_id=None):
+    """Latest report_date strictly before `before` under the same visibility rules
+    as day_overview_rows, as 'YYYY-MM-DD', or None."""
+    if not site_ids or (author_ids is not None and not author_ids):
+        return None
+    where, params = _ask_tools_where(site_ids, author_ids=author_ids,
+                                     site_id=site_id, user_id=user_id)
+    row = conn.execute(
+        f"SELECT max(t.report_date) FROM topics t WHERE {where} AND t.report_date < %s",
+        params + [before]).fetchone()
+    return row[0].isoformat() if row and row[0] else None
