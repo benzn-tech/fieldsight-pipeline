@@ -624,6 +624,6 @@ def test_a_weekday_content_question_retrieves_with_that_day(monkeypatch):
 @pytest.mark.parametrize("mode", [{}, {"mode": "voice", "voice_web": True}])
 def test_a_weekday_anchored_question_never_runs_the_web_flow(monkeypatch, mode):
     rig = wire(monkeypatch, kind="general", records_answer=False, web=WEB_OK)
-    out = ask(rig.cb(), question="What does NZS 4541 require, from Monday's talk?", **mode)
+    out = ask(rig.cb(), question="What does NZS 4541 require, as discussed on Monday?", **mode)
     assert "general" not in rig.events and "on_web_start" not in rig.events
     assert "from_web" not in out

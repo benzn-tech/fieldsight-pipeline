@@ -20,24 +20,10 @@ TIME_WORDS_EN = frozenset({
     "weekend", "month", "months", "last", "this", "past", "previous",
     "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
     "sunday", "day", "days",
-    # Spoken dates (query_slots): month names and their 3/4-letter forms, the
-    # weekday short forms, and "on". A day number or ordinal is NOT here: it
-    # is only non-content inside a recognised date phrase, which
-    # query_slots.mask_spoken_dates blanks out before tokenising. "Level 2" or
-    # "grid 12" must stay a topic.
-    "january", "february", "march", "april", "may", "june", "july", "august",
-    "september", "october", "november", "december", "jan", "feb", "mar",
-    "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
-    "mon", "tue", "tues", "wed", "weds", "thu", "thur", "thurs", "fri",
-    "sat", "sun", "on",
 })
 TIME_WORDS_ZH = frozenset({
     "昨天", "今天", "今早", "上午", "下午", "本周", "这周", "上周", "本月",
     "这个月", "上个月", "上月",
-    # Weekday words left over once mask_spoken_dates has run, e.g. a bare
-    # "星期" or "礼拜" ("这个星期"). The dated forms (9月3日, 上周二) are
-    # removed whole by the mask, digits included.
-    "星期", "礼拜", "周末",
 })
 
 # Words that only say "tell me what happened": they name no topic.
@@ -60,7 +46,7 @@ _ISO_DATE = re.compile(r"\d{4}-\d{1,2}-\d{1,2}")
 _UNSPACED_RUN = re.compile(r"[㐀-䶿一-鿿぀-ヿ豈-﫿]+")
 
 
-def is_content_free(question):
+def is_content_free(question, today=None):
     """True when the question is only a time phrase plus generic "what
     happened" words, so nothing in it can be matched against a topic.
 
@@ -68,11 +54,20 @@ def is_content_free(question):
     straddling two words ("天我" in 昨天我们做了什么) is in no word list, so the
     sentence would never read as content-free. Each unspaced run has the known
     phrases cut out of it instead, and any character left over is content.
+
+    A spoken date or weekday ("on 3 September", "9月3日", "on Tue", "周二") is
+    non-content ONLY when time_range actually anchored on it for this question
+    and this `today` (query_slots.spoken_anchor gives the exact span). There is
+    deliberately no global list of month names, short weekday forms, ordinals
+    or 月/日/号: "until Friday", "the dec 2 slab" and "9月3号楼" do not anchor,
+    so every word in them stays content.
     """
-    q = _ISO_DATE.sub(" ", (question or "").lower())
-    # "3rd of Sep" / "9月3日" / "上周二": the day number, the ordinal and the
-    # 月/日/号 characters are part of the date, not a topic.
-    q = query_slots.mask_spoken_dates(q)
+    q = question if isinstance(question, str) else ""
+    hit = query_slots.spoken_anchor(q, today)
+    if hit is not None:
+        start, end = hit[1]
+        q = q[:start] + " " + q[end:]
+    q = _ISO_DATE.sub(" ", q.lower())
     latin = [t for t in query_terms(q) if t not in _NON_CONTENT_EN
              and not _UNSPACED_RUN.fullmatch(t)]
     if latin:

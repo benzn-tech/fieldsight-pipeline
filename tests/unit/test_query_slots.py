@@ -142,10 +142,14 @@ def test_an_absolute_date_still_resolves_without_an_anchor():
 
 
 # --------------------------------------------------------------------------
-# Spoken dates: day + month (no ISO), and weekday names.
+# Spoken dates: day + month, and weekday names. Precision over recall: a
+# wrong range filters Ask to the wrong day, so every doubtful shape is pinned
+# as NO anchor. Old anchors are immutable (test_query_slots_old_anchors.py).
 # --------------------------------------------------------------------------
 
 FRI = date(2026, 10, 16)           # a Friday
+LAST_WEEK = ("2026-10-05", "2026-10-11")
+THIS_WEEK = ("2026-10-12", "2026-10-16")
 
 
 @pytest.mark.parametrize("question", [
@@ -154,11 +158,15 @@ FRI = date(2026, 10, 16)           # a Friday
     "the 3rd of Sep",
     "September 3",
     "Sept 3rd",
-    "Sep. 3 pour",
+    "Sep. 3?",
     "3 SEPTEMBER",
+    "on 3 Sep, what happened",
+    "3 September and 4 September",
+    "September 3 what happened",
     "9月3日做了什么",
     "9月3号",
     "9 月 3 日",
+    "9月3号的会议",
 ])
 def test_day_and_month_resolve_to_the_most_recent_such_date(question):
     assert qs.time_range(question, FRI) == ("2026-09-03", "2026-09-03")
@@ -182,6 +190,12 @@ def test_an_impossible_day_and_month_is_no_anchor(question):
     assert qs.time_range(question, FRI) == (None, None)
 
 
+def test_29_february_without_a_year_in_a_non_leap_year_is_no_anchor():
+    """Documented choice (review M2): not stepped back to the last leap year."""
+    assert qs.time_range("29 Feb", FRI) == (None, None)
+    assert qs.time_range("29 Feb", date(2028, 3, 1)) == ("2028-02-29", "2028-02-29")
+
+
 @pytest.mark.parametrize("question", [
     "3 September 2025", "September 3, 2025", "3rd of Sept 2025", "2025年9月3日",
 ])
@@ -191,14 +205,29 @@ def test_day_month_and_year_is_that_exact_date(question):
 
 def test_day_month_and_year_needs_no_anchor():
     assert qs.time_range("3 September 2025", None) == ("2025-09-03", "2025-09-03")
+    # with no day to compare against, a "year" must still look like one
+    assert qs.time_range("3 September 2400", None) == (None, None)
+    assert qs.time_range("3 September 1899", None) == (None, None)
 
 
 def test_day_and_month_without_a_year_needs_an_anchor():
     assert qs.time_range("3 September", None) == (None, None)
 
 
-def test_day_and_month_beats_a_relative_phrase():
-    assert qs.time_range("last week, on 3 September", FRI) == ("2026-09-03", "2026-09-03")
+@pytest.mark.parametrize("question", [
+    "Sept 3 2000 litres of water",
+    "the 3 March 1500 mm beam",
+    "on 3 May 2400 sheets",
+    "3 September 2023",           # more than a year from today
+    "3 September 2026 mm",
+])
+def test_a_number_after_a_date_is_a_year_only_when_plausible(question):
+    assert qs.time_range(question, FRI) == (None, None)
+
+
+def test_a_relative_phrase_the_old_parser_anchored_keeps_its_range():
+    """Old anchors are immutable: "last week, on 3 September" stays last week."""
+    assert qs.time_range("last week, on 3 September", FRI) == LAST_WEEK
 
 
 def test_iso_still_beats_day_and_month():
@@ -206,75 +235,162 @@ def test_iso_still_beats_day_and_month():
 
 
 @pytest.mark.parametrize("question", [
-    "Tuesday", "what happened on Tuesday?", "on Tue", "last Tuesday", "LAST TUES",
-    "周二", "星期二", "礼拜二", "周二我们做了什么",
+    "level 3 may need propping",
+    "Level 3 May inspection report",
+    "Stage 2 May pour",
+    "May 3 pour",
+    "3 Sep pour",
+    "we march 3 crews to block B",
+    "march 3 crews over",
+    "mar 3 drawing revision",
+    "the Mar 2 sheet",
+    "check the mark on 3 mar sheets",
+    "the dec 2 level slab",
+    "dec 2 balustrade",
+    "1 dec 2 crane",
+    "jun 2 apprentice",
+    "sept 3 tank",
+    "the 3 sept tank was pumped",
+    "aug 2 bore",
+    "may 3 crews",
+    "they may 2 more pours",
+    "May 2 cranes be used",
+    "on the 3 apr level",
+    "1 march street site",
+    "12 May Street access",
+    "on 12 may road",
+    "on the 3rd",                 # review M5: a bare ordinal is no date
+    "9月3号楼进度",
+    "2月3号楼",
+    "12月25号线",
+    "1月2号机",
+    "3月5号桩",
+    "10个月3号楼",
 ])
-def test_a_bare_or_last_weekday_is_the_most_recent_one_before_today(question):
+def test_month_words_and_day_numbers_that_are_not_dates(question):
+    assert qs.time_range(question, FRI) == (None, None)
+
+
+@pytest.mark.parametrize("question", [
+    "what happened on Tuesday?", "on Tue", "last Tuesday", "LAST TUES", "on Tues.",
+    "周二", "星期二", "礼拜二", "周二我们做了什么", "星期二的会", "周二上午",
+])
+def test_on_or_last_weekday_is_the_most_recent_one_before_today(question):
     # 2026-10-16 is a Friday; the Tuesday before it is the 13th.
     assert qs.time_range(question, FRI) == ("2026-10-13", "2026-10-13")
 
 
-def test_a_bare_weekday_naming_today_means_a_week_ago():
-    assert qs.time_range("Friday", FRI) == ("2026-10-09", "2026-10-09")
+def test_a_weekday_naming_today_means_a_week_ago():
+    assert qs.time_range("on Friday", FRI) == ("2026-10-09", "2026-10-09")
     assert qs.time_range("星期五", FRI) == ("2026-10-09", "2026-10-09")
 
 
-def test_on_a_monday_last_monday_and_monday_are_seven_days_earlier():
+def test_on_a_monday_last_monday_and_on_monday_are_seven_days_earlier():
     mon = date(2026, 10, 12)
-    for q in ("last Monday", "Monday", "on Mon", "周一"):
+    for q in ("last Monday", "on Monday", "on Mon", "周一"):
         assert qs.time_range(q, mon) == ("2026-10-05", "2026-10-05"), q
 
 
 @pytest.mark.parametrize("question,expected", [
     ("this Tuesday", ("2026-10-13", "2026-10-13")),
     ("this Friday", ("2026-10-16", "2026-10-16")),
-    ("这周二", ("2026-10-13", "2026-10-13")),
-    ("本周二的会", ("2026-10-13", "2026-10-13")),
-    ("这个星期五", ("2026-10-16", "2026-10-16")),
+    ("last Sat", ("2026-10-10", "2026-10-10")),
+    ("last sun", ("2026-10-11", "2026-10-11")),
+    ("这个周二", ("2026-10-13", "2026-10-13")),
+    ("这礼拜三", ("2026-10-14", "2026-10-14")),
+    ("上礼拜五", ("2026-10-09", "2026-10-09")),
+    ("上个周二", ("2026-10-06", "2026-10-06")),
 ])
-def test_this_weekday_is_in_the_current_week(question, expected):
+def test_this_and_previous_week_weekdays(question, expected):
     assert qs.time_range(question, FRI) == expected
 
 
-@pytest.mark.parametrize("question", ["this Saturday", "这周六", "本周日"])
+@pytest.mark.parametrize("question", ["this Saturday", "this Sat", "这礼拜六", "本礼拜日"])
 def test_this_weekday_still_ahead_is_no_anchor(question):
     assert qs.time_range(question, FRI) == (None, None)
 
 
 @pytest.mark.parametrize("question,expected", [
-    ("上周二", ("2026-10-06", "2026-10-06")),
-    ("上星期二发生了什么", ("2026-10-06", "2026-10-06")),
-    ("上个星期二", ("2026-10-06", "2026-10-06")),
-    ("上周日", ("2026-10-11", "2026-10-11")),
-    ("上礼拜五", ("2026-10-09", "2026-10-09")),
+    # The old 上周/这周/本周/这个星期 phrases anchor these first, and that is final.
+    ("上周二", LAST_WEEK), ("上星期二发生了什么", LAST_WEEK), ("上个星期二", LAST_WEEK),
+    ("上周日", LAST_WEEK), ("这周二", THIS_WEEK), ("本周二的会", THIS_WEEK),
+    ("这个星期五", THIS_WEEK), ("这周六", THIS_WEEK), ("本周日报", THIS_WEEK),
+    ("上周二层浇筑", LAST_WEEK), ("上周一到周五的进度", LAST_WEEK),
 ])
-def test_chinese_last_week_weekday_is_in_the_previous_calendar_week(question, expected):
+def test_chinese_week_compounds_keep_the_old_week_range(question, expected):
     assert qs.time_range(question, FRI) == expected
 
 
 @pytest.mark.parametrize("question", [
-    "we sat down with the client",
-    "sun exposure on the deck",
-    "wedge anchors",
-    "monitor the crack",
-    "Mondays are busy",
+    # English: bare, deadline, habit, range, name, possessive, plural
+    "Tuesday",
+    "what happened Monday",
+    "Monday's pour",
+    "on Monday's pour",
+    "submittals due Friday",
+    "submittals due on Friday",
+    "deliver it by Friday",
+    "deliver it by this Friday",
+    "until Friday",
+    "until this Friday",
+    "from last Monday",
+    "Friday deadline for the RFI",
+    "Monday to Friday hours",
+    "work on Monday to Friday",
+    "on Monday through Friday",
+    "on Mon-Fri crew",
+    "on Mon–Fri crew",
+    "on Monday mornings we do toolbox",
+    "we pour on Mondays",
+    "we pour on Monday as usual",
+    "every Monday we test",
+    "we pour every Monday",
+    "next Tuesday inspection",
     "next Tuesday's pour",
     "the coming Friday",
-    "we pour every Monday",
+    "on the following Monday",
+    "Good Friday closure",
+    "on Good Friday",
+    "on Monday Street site",
+    "on Sunday Road",
+    "on Friday Lane",
+    "on Friday St",
+    "on sun deck formwork",
+    "on sun",
+    "we sat on Sat scaffold",
+    "on Sat the crane",
+    "we sat down with the client",
+    "wedge anchors",
+    "monitor the crack",
+    # Chinese: habit, range, future, words built on a weekday character
     "下周二的计划",
+    "下个星期二",
     "每周三次检查",
     "每周三开会",
-    "we may need 3 more",
+    "每个星期一",
+    "每個星期一",
+    "每礼拜一",
+    "周一到周五",
+    "周一至周五",
+    "周一~周五",
+    "周日休息",
+    "一周一次",
+    "周一次检查",
+    "两个星期一次",
+    "周二层浇筑",
+    "周日报",
+    "周五金店",
+    "周天气",
+    "星期六角螺栓",
+    "礼拜三号楼",
 ])
-def test_weekday_and_month_words_do_not_fire_elsewhere(question):
+def test_weekday_words_that_are_not_a_past_day(question):
     assert qs.time_range(question, FRI) == (None, None)
 
 
-def test_a_weekday_does_not_override_last_week():
-    """'last week on Tuesday' keeps the existing last-week range: the weekday
-    rule runs after the relative phrases, and does not narrow them."""
-    assert qs.time_range("last week on Tuesday", FRI) == ("2026-10-05", "2026-10-11")
-    assert qs.time_range("yesterday, Tuesday", FRI) == ("2026-10-15", "2026-10-15")
+def test_a_weekday_does_not_override_an_old_phrase():
+    assert qs.time_range("last week on Tuesday", FRI) == LAST_WEEK
+    assert qs.time_range("yesterday, on Tuesday", FRI) == ("2026-10-15", "2026-10-15")
 
 
 def test_has_time_anchor():
@@ -284,11 +400,12 @@ def test_has_time_anchor():
     assert qs.has_time_anchor("yesterday", FRI) is True
     assert qs.has_time_anchor("door schedule", FRI) is False
     assert qs.has_time_anchor("this Saturday", FRI) is False
-    assert qs.has_time_anchor("Tuesday", None) is False
+    assert qs.has_time_anchor("on Tuesday", None) is False
 
 
-def test_may_after_a_day_number_is_a_month_only_when_no_word_follows():
-    assert qs.time_range("level 3 may need propping", FRI) == (None, None)
-    assert qs.time_range("what happened on 3 May?", FRI) == ("2026-05-03", "2026-05-03")
-    assert qs.time_range("3 May, any issues", FRI) == ("2026-05-03", "2026-05-03")
-    assert qs.time_range("May 3 pour", FRI) == ("2026-05-03", "2026-05-03")
+def test_spoken_anchor_reports_only_new_rule_spans():
+    assert qs.spoken_anchor("yesterday on Tuesday", FRI) is None      # old rule anchored
+    d, (a, b) = qs.spoken_anchor("what did we do on 3 September", FRI)
+    assert d == date(2026, 9, 3)
+    assert "what did we do on 3 September"[a:b] == "3 September"
+    assert qs.spoken_anchor("door schedule", FRI) is None
