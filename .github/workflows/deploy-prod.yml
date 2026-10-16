@@ -193,6 +193,29 @@ jobs:
           if [ -n "${{ vars.PROD_KEYFRAME_FFMPEG_LAYER_ARN }}" ]; then
             KF_LAYER_PARAM="KeyframeFfmpegLayerArn=${{ vars.PROD_KEYFRAME_FFMPEG_LAYER_ARN }}"
           fi
+          # Ask orchestration v2 (ASK_AGENTIC, judge model). Same bare-"Key=" guard as
+          # deploy.yml: an unset PROD_ var must not become `AskAgentic=` (SAM exits 2
+          # on it); the template Default '' keeps the flag off until PROD_ASK_AGENTIC is set.
+          ASK_AGENTIC_PARAM=""
+          if [ -n "${{ vars.PROD_ASK_AGENTIC }}" ]; then
+            ASK_AGENTIC_PARAM="AskAgentic=${{ vars.PROD_ASK_AGENTIC }}"
+          fi
+          ASK_JUDGE_MODEL_PARAM=""
+          if [ -n "${{ vars.PROD_ASK_JUDGE_MODEL }}" ]; then
+            ASK_JUDGE_MODEL_PARAM="AskJudgeModel=${{ vars.PROD_ASK_JUDGE_MODEL }}"
+          fi
+          ASK_JUDGE_FALLBACKS_PARAM=""
+          if [ -n "${{ vars.PROD_ASK_JUDGE_FALLBACKS }}" ]; then
+            ASK_JUDGE_FALLBACKS_PARAM="AskJudgeFallbacks=${{ vars.PROD_ASK_JUDGE_FALLBACKS }}"
+          fi
+          ASK_JUDGE_PROVIDER_PARAM=""
+          if [ -n "${{ vars.PROD_ASK_JUDGE_PROVIDER }}" ]; then
+            ASK_JUDGE_PROVIDER_PARAM="AskJudgeProvider=${{ vars.PROD_ASK_JUDGE_PROVIDER }}"
+          fi
+          ASK_JUDGE_REASONING_PARAM=""
+          if [ -n "${{ vars.PROD_ASK_JUDGE_REASONING }}" ]; then
+            ASK_JUDGE_REASONING_PARAM="AskJudgeReasoning=${{ vars.PROD_ASK_JUDGE_REASONING }}"
+          fi
           # Non-work (personal) topic retention sweep. Two independent gates, both
           # off by default, because this one DELETES: it tombstones the topic and
           # drops its vectors (the transcript and audio are left alone).
@@ -313,6 +336,11 @@ jobs:
               "EnableTodoCollapse=${{ vars.PROD_ENABLE_TODO_COLLAPSE || 'false' }}" \
               "EnableThreadSuggestions=${{ vars.PROD_ENABLE_THREAD_SUGGESTIONS || 'true' }}" \
               $KF_LAYER_PARAM \
+              $ASK_AGENTIC_PARAM \
+              $ASK_JUDGE_MODEL_PARAM \
+              $ASK_JUDGE_FALLBACKS_PARAM \
+              $ASK_JUDGE_PROVIDER_PARAM \
+              $ASK_JUDGE_REASONING_PARAM \
               "RealPTTAccount=$REALPTT_ACCOUNT" \
               "RealPTTPassword=$REALPTT_PASSWORD" \
               "ClaudeApiKey=$CLAUDE_API_KEY" \

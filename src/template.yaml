@@ -346,7 +346,7 @@ Parameters:
     Description: >-
       Ask orchestration v2 (evidence first, judge after): the channels whose
       worker turns go through ask_orchestrator instead of _rag_answer. Empty is
-      off. TEST-only via TEST_ASK_AGENTIC; prod never passes it.
+      off. Set via TEST_ASK_AGENTIC / PROD_ASK_AGENTIC; an unset var keeps it off.
 
   AskJudgeModel:
     Type: String
