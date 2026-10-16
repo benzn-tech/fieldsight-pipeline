@@ -42,7 +42,8 @@ class FakePool:
 def _env(monkeypatch):
     monkeypatch.setenv("CORROBORATION_API_KEY", "test-key")
     for name in ("ASK_JUDGE_MODEL", "ASK_JUDGE_FALLBACKS",
-                 "CORROBORATION_CHEAP_MODEL"):
+                 "CORROBORATION_CHEAP_MODEL", "ASK_JUDGE_PROVIDER",
+                 "ASK_JUDGE_REASONING"):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -442,3 +443,109 @@ def test_an_auto_only_model_is_remembered_for_the_next_turn(monkeypatch):
     tools_client.chat(MESSAGES, TOOLS)
     tools_client.chat(MESSAGES, TOOLS)
     assert [c["body"]["tool_choice"] for c in pool.calls] == ["required", "auto", "auto"]
+
+
+# ------------------------------------------- provider pin and reasoning control
+
+def test_payload_has_no_provider_or_reasoning_when_unset(monkeypatch):
+    pool = _install(monkeypatch, FakePool(_ok_tool_reply()))
+    tools_client.chat(MESSAGES, TOOLS)
+    body = pool.calls[0]["body"]
+    assert set(body) == {"model", "messages", "tools", "tool_choice", "max_tokens"}
+
+
+def test_empty_env_values_send_nothing(monkeypatch):
+    monkeypatch.setenv("ASK_JUDGE_PROVIDER", " , ")
+    monkeypatch.setenv("ASK_JUDGE_REASONING", "")
+    pool = _install(monkeypatch, FakePool(_ok_tool_reply()))
+    tools_client.chat(MESSAGES, TOOLS)
+    body = pool.calls[0]["body"]
+    assert "provider" not in body and "reasoning" not in body
+
+
+def test_provider_pin_rides_on_the_primary(monkeypatch):
+    monkeypatch.setenv("ASK_JUDGE_MODEL", "deepseek/deepseek-v4.1-flash")
+    monkeypatch.setenv("ASK_JUDGE_PROVIDER", "coreweave/fp8, other/tag")
+    pool = _install(monkeypatch, FakePool(_ok_tool_reply()))
+    tools_client.chat(MESSAGES, TOOLS)
+    assert pool.calls[0]["body"]["provider"] == {
+        "only": ["coreweave/fp8", "other/tag"], "allow_fallbacks": False}
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("off", {"enabled": False}),
+    ("OFF", {"enabled": False}),
+    ("low", {"effort": "low"}),
+    ("medium", {"effort": "medium"}),
+    (" high ", {"effort": "high"}),
+])
+def test_reasoning_control_on_the_primary(monkeypatch, value, expected):
+    monkeypatch.setenv("ASK_JUDGE_REASONING", value)
+    pool = _install(monkeypatch, FakePool(_ok_tool_reply()))
+    tools_client.chat(MESSAGES, TOOLS)
+    assert pool.calls[0]["body"]["reasoning"] == expected
+
+
+def test_unknown_reasoning_value_warns_and_sends_nothing(monkeypatch, caplog):
+    monkeypatch.setenv("ASK_JUDGE_REASONING", "turbo")
+    pool = _install(monkeypatch, FakePool(_ok_tool_reply()))
+    with caplog.at_level(logging.WARNING):
+        tools_client.chat(MESSAGES, TOOLS)
+    assert "reasoning" not in pool.calls[0]["body"]
+    assert any("ASK_JUDGE_REASONING" in r.getMessage() for r in caplog.records)
+
+
+def test_env_is_read_at_call_time(monkeypatch):
+    pool = _install(monkeypatch, FakePool(_ok_tool_reply(), _ok_tool_reply()))
+    tools_client.chat(MESSAGES, TOOLS)
+    monkeypatch.setenv("ASK_JUDGE_PROVIDER", "coreweave/fp8")
+    monkeypatch.setenv("ASK_JUDGE_REASONING", "off")
+    tools_client.chat(MESSAGES, TOOLS)
+    assert "provider" not in pool.calls[0]["body"]
+    assert pool.calls[1]["body"]["provider"]["only"] == ["coreweave/fp8"]
+    assert pool.calls[1]["body"]["reasoning"] == {"enabled": False}
+
+
+def test_fallback_models_get_no_provider_or_reasoning(monkeypatch):
+    """A fallback on another vendor must not inherit a CoreWeave-only pin."""
+    monkeypatch.setenv("ASK_JUDGE_MODEL", "deepseek/deepseek-v4.1-flash")
+    monkeypatch.setenv("ASK_JUDGE_FALLBACKS", "fb/one,fb/two")
+    monkeypatch.setenv("ASK_JUDGE_PROVIDER", "coreweave/fp8")
+    monkeypatch.setenv("ASK_JUDGE_REASONING", "off")
+    pool = _install(monkeypatch, FakePool(_http_error(502, "x"),
+                                          _http_error(503, "y"),
+                                          _ok_tool_reply()))
+    turn = tools_client.chat(MESSAGES, TOOLS)
+    assert turn.error is None
+    bodies = [c["body"] for c in pool.calls]
+    assert [b["model"] for b in bodies] == [
+        "deepseek/deepseek-v4.1-flash", "fb/one", "fb/two"]
+    assert bodies[0]["provider"] == {"only": ["coreweave/fp8"],
+                                     "allow_fallbacks": False}
+    assert bodies[0]["reasoning"] == {"enabled": False}
+    for b in bodies[1:]:
+        assert "provider" not in b and "reasoning" not in b
+
+
+def test_an_explicit_other_model_gets_no_pin(monkeypatch):
+    monkeypatch.setenv("ASK_JUDGE_MODEL", "deepseek/deepseek-v4.1-flash")
+    monkeypatch.setenv("ASK_JUDGE_PROVIDER", "coreweave/fp8")
+    monkeypatch.setenv("ASK_JUDGE_REASONING", "off")
+    pool = _install(monkeypatch, FakePool(_ok_tool_reply()))
+    tools_client.chat(MESSAGES, TOOLS, model="other/model")
+    body = pool.calls[0]["body"]
+    assert "provider" not in body and "reasoning" not in body
+
+
+def test_pin_survives_the_tool_choice_downgrade_retry(monkeypatch):
+    monkeypatch.setenv("ASK_JUDGE_PROVIDER", "coreweave/fp8")
+    monkeypatch.setenv("ASK_JUDGE_REASONING", "off")
+    pool = _install(monkeypatch, FakePool(
+        _http_error(400, "tool_choice required is not supported"),
+        _ok_tool_reply()))
+    turn = tools_client.chat(MESSAGES, TOOLS)
+    assert turn.error is None
+    assert [c["body"]["tool_choice"] for c in pool.calls] == ["required", "auto"]
+    for c in pool.calls:
+        assert c["body"]["provider"]["only"] == ["coreweave/fp8"]
+        assert c["body"]["reasoning"] == {"enabled": False}

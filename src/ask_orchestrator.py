@@ -897,6 +897,25 @@ def _bad_indices(turn):
     return out
 
 
+# Tool-call markup some models leak into the answer string. DeepSeek V4.1
+# Flash (live, 2026-10-16) ended a final_answer.answer with
+# `...minimums.</answer> <parameter name="basis">mixed`.
+_TOOL_MARKUP = ("</answer>", "<parameter name=", "</parameter>", "<invoke",
+                "</invoke>", "<function_calls>", "</function_calls>",
+                "<tool_call>", "</tool_call>")
+
+
+def _strip_tool_markup(text):
+    """Cut at the first leaked tool-markup marker. Nothing is recovered from
+    what follows (a leaked basis is not trusted), and nothing is logged."""
+    cut = len(text)
+    for marker in _TOOL_MARKUP:
+        i = text.find(marker)
+        if i != -1 and i < cut:
+            cut = i
+    return text[:cut].rstrip()
+
+
 def _final_of(turn):
     """The final answer in a judge turn: a dict, "bad" for an unusable
     final_answer call, or None when the turn asks for tools. A text-only reply
@@ -906,15 +925,19 @@ def _final_of(turn):
         if tc.get("name") != "final_answer":
             continue
         args = tc.get("arguments") or {}
-        if (i in bad or not isinstance(args.get("answer"), str)
-                or not args["answer"].strip()):
+        answer = args.get("answer")
+        answer = _strip_tool_markup(answer) if isinstance(answer, str) else ""
+        if i in bad or not answer.strip():
             return "bad"
         basis = args.get("basis")
-        return {"answer": args["answer"],
+        return {"answer": answer,
                 "basis": basis if basis in ("records", "web", "mixed", "none") else None,
                 "offer_web": args.get("offer_web") is True}
     if not turn.tool_calls and (turn.text or "").strip():
-        return {"answer": turn.text, "basis": None, "offer_web": False}
+        answer = _strip_tool_markup(turn.text)
+        if not answer.strip():
+            return "bad"
+        return {"answer": answer, "basis": None, "offer_web": False}
     return None
 
 

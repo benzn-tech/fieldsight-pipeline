@@ -413,9 +413,12 @@ def test_ask_agentic_parameter(tmpl):
     p = tmpl["Parameters"]["AskAgentic"]
     assert p["Type"] == "String" and p["Default"] == ""
     assert p["AllowedPattern"] == "^(|screen|voice|screen,voice|voice,screen)$"
-    for name in ("AskJudgeModel", "AskJudgeFallbacks"):
+    for name in ("AskJudgeModel", "AskJudgeFallbacks", "AskJudgeProvider",
+                 "AskJudgeReasoning"):
         assert tmpl["Parameters"][name]["Type"] == "String"
         assert tmpl["Parameters"][name]["Default"] == ""
+    reasoning = tmpl["Parameters"]["AskJudgeReasoning"]
+    assert reasoning["AllowedPattern"] == "^(|off|low|medium|high)$"
 
 
 def test_judge_env_is_on_the_worker_only(tmpl):
@@ -424,11 +427,14 @@ def test_judge_env_is_on_the_worker_only(tmpl):
     assert worker["ASK_AGENTIC"] == {"Ref": "AskAgentic"}
     assert worker["ASK_JUDGE_MODEL"] == {"Ref": "AskJudgeModel"}
     assert worker["ASK_JUDGE_FALLBACKS"] == {"Ref": "AskJudgeFallbacks"}
+    assert worker["ASK_JUDGE_PROVIDER"] == {"Ref": "AskJudgeProvider"}
+    assert worker["ASK_JUDGE_REASONING"] == {"Ref": "AskJudgeReasoning"}
     for name, r in res.items():
         if name == "AskVoiceWorkerFunction":
             continue
         env = ((r.get("Properties") or {}).get("Environment") or {}).get("Variables") or {}
-        assert not {"ASK_AGENTIC", "ASK_JUDGE_MODEL", "ASK_JUDGE_FALLBACKS"} & set(env), name
+        assert not {"ASK_AGENTIC", "ASK_JUDGE_MODEL", "ASK_JUDGE_FALLBACKS",
+                    "ASK_JUDGE_PROVIDER", "ASK_JUDGE_REASONING"} & set(env), name
 
 
 def test_test_workflow_passes_the_flag_only_when_set():
@@ -438,7 +444,11 @@ def test_test_workflow_passes_the_flag_only_when_set():
     text = io.open(TEST_WORKFLOW, encoding="utf-8").read()
     for var, param, shell in (("TEST_ASK_AGENTIC", "AskAgentic", "ASK_AGENTIC_PARAM"),
                               ("TEST_ASK_JUDGE_MODEL", "AskJudgeModel",
-                               "ASK_JUDGE_MODEL_PARAM")):
+                               "ASK_JUDGE_MODEL_PARAM"),
+                              ("TEST_ASK_JUDGE_PROVIDER", "AskJudgeProvider",
+                               "ASK_JUDGE_PROVIDER_PARAM"),
+                              ("TEST_ASK_JUDGE_REASONING", "AskJudgeReasoning",
+                               "ASK_JUDGE_REASONING_PARAM")):
         assert re.search(r'if \[ -n "\$\{\{ vars\.%s \}\}" \]; then\s+%s="%s=\$\{\{ vars\.%s \}\}"'
                          % (var, shell, param, var), text), param
         assert re.search(r"^\s+\$%s \\$" % shell, text, re.M), shell
@@ -449,5 +459,7 @@ def test_prod_workflow_never_passes_the_flag():
     Not in UNWIRED_BY_DESIGN: that list is for boolean parameters only
     (test_the_exception_list_does_not_rot), and AskAgentic is a pattern."""
     text = io.open(PROD_WORKFLOW, encoding="utf-8").read()
-    for name in ("AskAgentic", "AskJudgeModel", "AskJudgeFallbacks", "ASK_AGENTIC"):
+    for name in ("AskAgentic", "AskJudgeModel", "AskJudgeFallbacks", "ASK_AGENTIC",
+                 "AskJudgeProvider", "AskJudgeReasoning", "ASK_JUDGE_PROVIDER",
+                 "ASK_JUDGE_REASONING"):
         assert name not in text
