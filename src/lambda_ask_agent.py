@@ -282,15 +282,30 @@ RERANK_CANDIDATES = int(os.environ.get("RERANK_CANDIDATE_K", "32"))
 RERANK_PER_SESSION_CAP = int(os.environ.get("RERANK_PER_SESSION_CAP", "4"))
 
 
+RERANK_DIVERSIFY_KEY = os.environ.get("RERANK_DIVERSIFY_KEY", "source")  # EXPERIMENT
+RERANK_MAX_CANDIDATES = int(os.environ.get("RERANK_MAX_CANDIDATES", "0"))  # EXPERIMENT, 0 = no limit
+
+
+def _diversify_key(c):
+    src = c.get("source_s3_key") or c.get("topic_id") or id(c)
+    if RERANK_DIVERSIFY_KEY == "source":
+        return src
+    md = c.get("metadata") if isinstance(c.get("metadata"), dict) else {}
+    block = md.get("block") if isinstance(md.get("block"), dict) else {}
+    return (src, c.get("topic_id") or (block.get("from") or "")[:2] or c.get("chunk_type"))
+
+
 def _diversify(chunks, cap):
     """At most `cap` chunks per source recording, original order preserved."""
     seen, out = {}, []
     for c in chunks:
-        key = c.get("source_s3_key") or c.get("topic_id") or id(c)
+        key = _diversify_key(c)
         if seen.get(key, 0) >= cap:
             continue
         seen[key] = seen.get(key, 0) + 1
         out.append(c)
+        if RERANK_MAX_CANDIDATES and len(out) >= RERANK_MAX_CANDIDATES:
+            break
     return out
 
 
