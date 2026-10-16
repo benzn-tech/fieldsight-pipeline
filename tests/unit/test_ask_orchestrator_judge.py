@@ -864,3 +864,13 @@ def test_leaked_markup_never_reaches_the_client(monkeypatch):
                             '<parameter name="basis">mixed'))
     out = run(body(), chat)
     assert out["answer"] == "We poured the B2 slab [1]."
+
+
+def test_system_prompt_says_a_nearest_match_is_not_a_mention():
+    # Eval 2026-10-16, pl2 "When did we last discuss Twizel?": latest_activity
+    # returned 23 September records that never name Twizel and the judge said
+    # Twizel was discussed then (3 of 6 turns).
+    import datetime
+    prompt = orch._system_prompt(datetime.date(2026, 10, 16), "screen", "never")
+    assert "nearest match, not proof" in prompt
+    assert "only when that day's record text names it" in prompt
