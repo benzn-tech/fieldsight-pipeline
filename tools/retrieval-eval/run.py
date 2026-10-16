@@ -143,6 +143,9 @@ LIST_K = int(os.environ.get("EVAL_LIST_K", "30"))
 PROD_RERANK_BUDGET_MS = 3000
 LIST_RERANK_SYSTEMS = {"rerank@32": 32, "rerank@50": 50}
 SYSTEMS = ["prod", "link-rollup", "rerank@32", "rerank@50"]
+# --family: the index family rag-search reads (SEARCH_INDEX_READ, "report" | "session").
+# None keeps the pre-switch behaviour (no family filter) so older runs stay reproducible.
+FAMILY = None
 
 REWRITES = [
     ("%(q)s::vector", "CAST(:q AS vector)"),
@@ -159,7 +162,6 @@ REWRITES = [
 OPTIONAL_REWRITES = [
     ("EXISTS (SELECT 1 FROM topics t WHERE t.id = c.topic_id AND t.superseded_at IS NULL)",
      "EXISTS (SELECT 1 FROM topics t WHERE t.id = c.topic_id)"),
-    ("%(source_family)s::text", "CAST(NULL AS text)"),
 ]
 
 
@@ -172,6 +174,10 @@ def data_api_sql():
     # Applied to every ref alike, so before/after comparisons stay like for like.
     for old, new in OPTIONAL_REWRITES:
         sql = sql.replace(old, new)
+    if FAMILY is not None and "%(source_family)s" not in sql:
+        raise SystemExit("--family given but the imported search SQL has no source_family switch")
+    sql = sql.replace("%(source_family)s::text",
+                      "CAST(NULL AS text)" if FAMILY is None else "CAST(:source_family AS text)")
     for old, new in REWRITES:
         if old not in sql:
             raise SystemExit("production search SQL no longer contains %r -- "
@@ -258,6 +264,8 @@ class Searcher:
             {"name": "date_to", "value": {"stringValue": date_to} if date_to else {"isNull": True}},
             {"name": "k", "value": {"longValue": k}},
         ]
+        if ":source_family" in self.sql:
+            params.append({"name": "source_family", "value": {"stringValue": FAMILY}})
         t0 = time.perf_counter()
         rows = self._query(self.sql, params)
         sql_ms = (time.perf_counter() - t0) * 1000
@@ -391,7 +399,10 @@ def list_rank(rows, question, item, max_dist=None, order_by_chunk=False):
     if max_dist is not None:
         lambda_ask_agent._NO_LEX_MAX_DIST = max_dist
     try:
-        listed = lambda_ask_agent._aggregate_topics(rows, question)
+        if FAMILY is None:
+            listed = lambda_ask_agent._aggregate_topics(rows, question)
+        else:
+            listed = lambda_ask_agent._aggregate_topics(rows, question, family=FAMILY)
     finally:
         lambda_ask_agent._NO_LEX_MAX_DIST = saved
     members = []
@@ -522,7 +533,7 @@ def signature(run):
 
 
 def main():
-    global DATABASE, SYSTEMS
+    global DATABASE, SYSTEMS, FAMILY
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gold", required=True)
     ap.add_argument("--label", required=True, help="short name for this configuration")
@@ -534,8 +545,11 @@ def main():
     ap.add_argument("--diagnose", action="store_true",
                     help="Ask-drop diagnosis: no reranker calls; systems prod, prod-no-admit, vector-only@5")
     ap.add_argument("--database", default=DATABASE, help="`fieldsight` = prod, `fieldsight_test` = TEST")
+    ap.add_argument("--family", choices=["report", "session"], default=None,
+                    help="index family to read, as SEARCH_INDEX_READ; omit for no family filter")
     args = ap.parse_args()
     DATABASE = args.database
+    FAMILY = args.family
     if args.diagnose:
         LIST_RERANK_SYSTEMS.clear()
         SYSTEMS = ["prod", "prod-no-admit", "vector-only@5"]
@@ -574,6 +588,7 @@ def main():
         "gold_file": os.path.relpath(args.gold, REPO),
         "gold_sha256": sha256_text(gold_text),
         "database": args.database,
+        "source_family": FAMILY,
         "scope": {"site": args.site, "author": args.author},
         "today": args.today,
     }
