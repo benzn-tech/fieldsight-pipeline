@@ -177,6 +177,10 @@ jobs:
           if [ -n "${{ vars.TEST_ASK_JUDGE_MODEL }}" ]; then
             ASK_JUDGE_MODEL_PARAM="AskJudgeModel=${{ vars.TEST_ASK_JUDGE_MODEL }}"
           fi
+          ASK_JUDGE_FALLBACKS_PARAM=""
+          if [ -n "${{ vars.TEST_ASK_JUDGE_FALLBACKS }}" ]; then
+            ASK_JUDGE_FALLBACKS_PARAM="AskJudgeFallbacks=${{ vars.TEST_ASK_JUDGE_FALLBACKS }}"
+          fi
           ASK_JUDGE_PROVIDER_PARAM=""
           if [ -n "${{ vars.TEST_ASK_JUDGE_PROVIDER }}" ]; then
             ASK_JUDGE_PROVIDER_PARAM="AskJudgeProvider=${{ vars.TEST_ASK_JUDGE_PROVIDER }}"
@@ -263,6 +267,7 @@ jobs:
               $VAD_LAYER_PARAM \
               $ASK_AGENTIC_PARAM \
               $ASK_JUDGE_MODEL_PARAM \
+              $ASK_JUDGE_FALLBACKS_PARAM \
               $ASK_JUDGE_PROVIDER_PARAM \
               $ASK_JUDGE_REASONING_PARAM \
               "ItemsTableName=fieldsight-test-items" \

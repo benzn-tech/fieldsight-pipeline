@@ -437,29 +437,27 @@ def test_judge_env_is_on_the_worker_only(tmpl):
                     "ASK_JUDGE_PROVIDER", "ASK_JUDGE_REASONING"} & set(env), name
 
 
-def test_test_workflow_passes_the_flag_only_when_set():
+@pytest.mark.parametrize("workflow,prefix", [(TEST_WORKFLOW, "TEST_"),
+                                              (PROD_WORKFLOW, "PROD_")])
+def test_workflow_passes_the_flag_only_when_set(workflow, prefix):
     """`"AskAgentic=${{ vars.X || '' }}"` would be a bare `AskAgentic=` when the
     variable is unset, which SAM rejects (test_no_override_can_evaluate_to_a_bare_key).
-    So both use the conditional $PARAM idiom the layer ARNs use."""
-    text = io.open(TEST_WORKFLOW, encoding="utf-8").read()
-    for var, param, shell in (("TEST_ASK_AGENTIC", "AskAgentic", "ASK_AGENTIC_PARAM"),
-                              ("TEST_ASK_JUDGE_MODEL", "AskJudgeModel",
+    So both use the conditional $PARAM idiom the layer ARNs use. Prod was wired on
+    the owner's 2026-10-16 call (DeepSeek judge on prod); an unset PROD_ var still
+    leaves the template default, so the flag stays off until PROD_ASK_AGENTIC is set."""
+    text = io.open(workflow, encoding="utf-8").read()
+    for var, param, shell in (("ASK_AGENTIC", "AskAgentic", "ASK_AGENTIC_PARAM"),
+                              ("ASK_JUDGE_MODEL", "AskJudgeModel",
                                "ASK_JUDGE_MODEL_PARAM"),
-                              ("TEST_ASK_JUDGE_PROVIDER", "AskJudgeProvider",
+                              ("ASK_JUDGE_FALLBACKS", "AskJudgeFallbacks",
+                               "ASK_JUDGE_FALLBACKS_PARAM"),
+                              ("ASK_JUDGE_PROVIDER", "AskJudgeProvider",
                                "ASK_JUDGE_PROVIDER_PARAM"),
-                              ("TEST_ASK_JUDGE_REASONING", "AskJudgeReasoning",
+                              ("ASK_JUDGE_REASONING", "AskJudgeReasoning",
                                "ASK_JUDGE_REASONING_PARAM")):
+        var = prefix + var
         assert re.search(r'if \[ -n "\$\{\{ vars\.%s \}\}" \]; then\s+%s="%s=\$\{\{ vars\.%s \}\}"'
                          % (var, shell, param, var), text), param
         assert re.search(r"^\s+\$%s \\$" % shell, text, re.M), shell
-
-
-def test_prod_workflow_never_passes_the_flag():
-    """Prod holds the template default (the flag off) until the owner flips it.
-    Not in UNWIRED_BY_DESIGN: that list is for boolean parameters only
-    (test_the_exception_list_does_not_rot), and AskAgentic is a pattern."""
-    text = io.open(PROD_WORKFLOW, encoding="utf-8").read()
-    for name in ("AskAgentic", "AskJudgeModel", "AskJudgeFallbacks", "ASK_AGENTIC",
-                 "AskJudgeProvider", "AskJudgeReasoning", "ASK_JUDGE_PROVIDER",
-                 "ASK_JUDGE_REASONING"):
-        assert name not in text
+        # Never the `|| default` form: that would turn an unset var into a bare key.
+        assert "%s=${{ vars.%s ||" % (param, var) not in text, param
