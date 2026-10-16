@@ -295,8 +295,31 @@ def _diversify_key(c):
     return (src, c.get("topic_id") or (block.get("from") or "")[:2] or c.get("chunk_type"))
 
 
+RERANK_VECTOR_CANDIDATES = int(os.environ.get("RERANK_VECTOR_CANDIDATES", "24"))  # EXPERIMENT
+RERANK_KEYWORD_CANDIDATES = int(os.environ.get("RERANK_KEYWORD_CANDIDATES", "8"))  # EXPERIMENT
+
+
+def _select_by_arm(chunks):
+    """EXPERIMENT: first V vector rows + first K keyword-only rows, arrival
+    order within each arm, exact-duplicate texts collapsed."""
+    texts, vec, kw = set(), [], []
+    for c in chunks:
+        t = c.get("chunk_text") or ""
+        if t in texts:
+            continue
+        arm = kw if c.get("lexical_hit") else vec
+        cap = RERANK_KEYWORD_CANDIDATES if arm is kw else RERANK_VECTOR_CANDIDATES
+        if len(arm) >= cap:
+            continue
+        texts.add(t)
+        arm.append(c)
+    return vec + kw
+
+
 def _diversify(chunks, cap):
     """At most `cap` chunks per source recording, original order preserved."""
+    if RERANK_DIVERSIFY_KEY == "arms":
+        return _select_by_arm(chunks)
     seen, out = {}, []
     for c in chunks:
         key = _diversify_key(c)
