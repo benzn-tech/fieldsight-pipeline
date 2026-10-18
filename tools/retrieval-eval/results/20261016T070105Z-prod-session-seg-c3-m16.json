@@ -1,0 +1,6222 @@
+{
+ "label": "prod-session-seg-c3-m16",
+ "ran_at": "2026-10-16T07:01:05+00:00",
+ "fingerprint": {
+  "git_commit": "510c001e94f2e7ee6ca734eb557f6fb1a17a63ba",
+  "src_ref": "exp/diversify-key",
+  "src_sha": "92cca2f6ebd868bcd999c5263c3ec96335400031",
+  "embed_model": "text-embedding-v4",
+  "embed_dim": "1024",
+  "rerank_model": "qwen3-rerank",
+  "ask_k": 5,
+  "list_k": 64,
+  "rerank_candidates": {
+   "rerank@32": 32,
+   "rerank@50": 50
+  },
+  "rerank_per_session_cap": 3,
+  "search_sql_sha256": "a55c055e26ca0d8a9b516a10fa38d6a20b414af64278bcd4d366a378178f48ba",
+  "aggregator_sha256": "d734808532d5f8d50b04817d2117b8ac551932dd42cc6dddd991059c1a683a07",
+  "no_lex_max_dist": 0.55,
+  "admit_one_sha256": "3b983dd085eaecace6f6eda09ffb801758e2b88520623660c2227ff229facc51",
+  "link_sha256": "da6774280b88d248dacfc7c1bca2f02d9cb2c6bc4e0ac509e494b8aaaf46d2ed",
+  "gold_file": "tools\\retrieval-eval\\gold\\v1.jsonl",
+  "gold_sha256": "458413974d45569a617f476987ad6c3f3046c69bf0df7e4deea72763fbe35fe7",
+  "database": "fieldsight",
+  "source_family": "session",
+  "scope": {
+   "site": "4326dbc7-14a2-4251-8381-9d0067595a85",
+   "author": "f531eb99-d79c-4e6c-bac1-ff944b802349"
+  },
+  "today": "2026-10-16"
+ },
+ "repeat_identical": true,
+ "runs": [
+  {
+   "results": [
+    {
+     "id": "v1-01",
+     "lang": "en",
+     "expect": "answerable",
+     "category": null,
+     "style": null,
+     "raw": 1,
+     "systems": {
+      "prod": {
+       "ask": 1,
+       "list": 37,
+       "list_rows": 50
+      },
+      "link-rollup": {
+       "ask": 1,
+       "list": 29,
+       "list_rows": 39
+      },
+      "prod-no-admit": {
+       "ask": 1,
+       "list": 37,
+       "list_rows": 50
+      },
+      "vector-only@5": {
+       "ask": 1,
+       "list": 37,
+       "list_rows": 50
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 37
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 47
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 3069.8397999804,
+      "rerank@50": 3466.121999983443
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 56,
+      "rerank@50": 84
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4226448972264024,
+        "text80": "[09:17:18] spk_0: Better than month. Better than month, yeah.\n[09:17:22] spk_1: ",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.42691371280469115,
+        "text80": "[13:13:51] spk_0: Sharky Painting. Doesn't even have a website. He's got a fucki",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.43263089656829834,
+        "text80": "[08:59:58] spk_1: Well, yeah.\n[08:59:58] spk_0: The roof, the roofers are a bit ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.44391770507865635,
+        "text80": "[10:28:28] spk_1: Well, that's what being back with-\n[10:28:30] spk_0: Yeah\n[10:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.5262814321005769,
+        "text80": "[09:18:01] spk_0: I think, I think basically what, what it really is, is that th",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4226448972264024,
+        "text80": "[09:17:18] spk_0: Better than month. Better than month, yeah.\n[09:17:22] spk_1: ",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.42691371280469115,
+        "text80": "[13:13:51] spk_0: Sharky Painting. Doesn't even have a website. He's got a fucki",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.43263089656829834,
+        "text80": "[08:59:58] spk_1: Well, yeah.\n[08:59:58] spk_0: The roof, the roofers are a bit ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.44391770507865635,
+        "text80": "[10:28:28] spk_1: Well, that's what being back with-\n[10:28:30] spk_0: Yeah\n[10:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4601421356201172,
+        "text80": "[14:55:02] spk_1: And, uh, .\n[14:55:08] spk_0: Yeah. Hey, if I get something fro",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 1,
+      "k5_search_rows": 9,
+      "k5_keyword_rows": 4
+     },
+     "keyword_rows_k30": 38,
+     "best_distance": 0.4226448972264024,
+     "embed_ms": 3018.343300005654,
+     "sql_ms": 1062.923600024078
+    },
+    {
+     "id": "v1-02",
+     "lang": "en",
+     "expect": "answerable",
+     "category": null,
+     "style": null,
+     "raw": 2,
+     "systems": {
+      "prod": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 30
+      },
+      "link-rollup": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 29
+      },
+      "prod-no-admit": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 30
+      },
+      "vector-only@5": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 30
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 16
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 24
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 2993.0484000069555,
+      "rerank@50": 3644.3209999997634
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 51,
+      "rerank@50": 86
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4957780392235992,
+        "text80": "[12:37:10] spk_0: Uh, once a year.\n[12:37:13] spk_1: Do they give you notice?\n[1",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5057534137000758,
+        "text80": "[10:39:04] spk_0: Yeah\n[10:39:04] spk_1: ... um, budget for the carpentry packag",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5484942851655815,
+        "text80": "[10:37:22] spk_2: ... yeah, we've had that, but some subs have.\n[10:37:24] spk_1",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5494318768212709,
+        "text80": "[11:22:07] spk_0: ， OK， 这 个 报 价 什 么 再 - 再 说 ， 就 是 pricing。\n[11:22:17] spk_1: 知 道",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.5737846923681543,
+        "text80": "[12:39:51] spk_0: 'Cause it's a pain when I induct people up there instead of do",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4957780392235992,
+        "text80": "[12:37:10] spk_0: Uh, once a year.\n[12:37:13] spk_1: Do they give you notice?\n[1",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5057534137000758,
+        "text80": "[10:39:04] spk_0: Yeah\n[10:39:04] spk_1: ... um, budget for the carpentry packag",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5484942851655815,
+        "text80": "[10:37:22] spk_2: ... yeah, we've had that, but some subs have.\n[10:37:24] spk_1",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5494318768212709,
+        "text80": "[11:22:07] spk_0: ， OK， 这 个 报 价 什 么 再 - 再 说 ， 就 是 pricing。\n[11:22:17] spk_1: 知 道",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.571441876037172,
+        "text80": "[17:58:04] spk_1: and uh Hay both of them intend\n[17:58:08] spk_2: to engage per",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 2,
+      "k5_search_rows": 8,
+      "k5_keyword_rows": 3
+     },
+     "keyword_rows_k30": 48,
+     "best_distance": 0.4957780392235992,
+     "embed_ms": 1757.8592000063509,
+     "sql_ms": 1696.672399993986
+    },
+    {
+     "id": "v1-03",
+     "lang": "en",
+     "expect": "answerable",
+     "category": null,
+     "style": null,
+     "raw": 1,
+     "systems": {
+      "prod": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 38
+      },
+      "link-rollup": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 33
+      },
+      "prod-no-admit": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 38
+      },
+      "vector-only@5": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 38
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 22
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 31
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 2719.199800019851,
+      "rerank@50": 3480.104800022673
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 52,
+      "rerank@50": 76
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.38689037483277067,
+        "text80": "[10:46:39] spk_2: It becomes five thousand cards. It just keep coming backwards ",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.44866874508075294,
+        "text80": "[10:48:27] spk_0: So it would start paying over and above what we're currently r",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.46082353591918945,
+        "text80": "[10:32:56] spk_1: Done that.\n[10:32:58] spk_0: We knew we were retiring. I can u",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.46878085937442937,
+        "text80": "[10:43:07] spk_0: True\n[10:43:07] spk_1: ... the second write-down again. So tha",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.5044972598552704,
+        "text80": "[10:44:57] spk_0: Okay.\n[10:44:58] spk_1: So we'll have a structure weathertight",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.38689037483277067,
+        "text80": "[10:46:39] spk_2: It becomes five thousand cards. It just keep coming backwards ",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.44866874508075294,
+        "text80": "[10:48:27] spk_0: So it would start paying over and above what we're currently r",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.46082353591918945,
+        "text80": "[10:32:56] spk_1: Done that.\n[10:32:58] spk_0: We knew we were retiring. I can u",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.46878085937442937,
+        "text80": "[10:43:07] spk_0: True\n[10:43:07] spk_1: ... the second write-down again. So tha",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4793722629547119,
+        "text80": "[09:58 – 10:48] Waipuna Commercial Loss and Programme Risk (progress)\nGovernance",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 1,
+      "k5_search_rows": 6,
+      "k5_keyword_rows": 1
+     },
+     "keyword_rows_k30": 33,
+     "best_distance": 0.38689037483277067,
+     "embed_ms": 1747.0289000193588,
+     "sql_ms": 1343.3757000020705
+    },
+    {
+     "id": "v1-04",
+     "lang": "en",
+     "expect": "answerable",
+     "category": null,
+     "style": null,
+     "raw": 6,
+     "systems": {
+      "prod": {
+       "ask": 5,
+       "list": 1,
+       "list_rows": 39
+      },
+      "link-rollup": {
+       "ask": 5,
+       "list": 1,
+       "list_rows": 31
+      },
+      "prod-no-admit": {
+       "ask": null,
+       "list": 1,
+       "list_rows": 39
+      },
+      "vector-only@5": {
+       "ask": null,
+       "list": 1,
+       "list_rows": 39
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 19
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 27
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 3080.1975000067614,
+      "rerank@50": 4299.038500001188
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 54,
+      "rerank@50": 84
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.45316202519792326,
+        "text80": "[10:32:56] spk_1: Done that.\n[10:32:58] spk_0: We knew we were retiring. I can u",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.503294125297485,
+        "text80": "[13:40 – 13:40] Current Job Assignment Query (progress)\nThe speaker asked which ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5248630501289031,
+        "text80": "[13:40:32] spk_0: 那 我 现 在 是 哪 个 job 呢 ？",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5298803028357281,
+        "text80": "[12:11 – 12:13] Next week schedule and hiring (progress)\nParticipants: Ben\n梳理了下周",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.534966987225368,
+        "text80": "[14:24:39] spk_0: ... makes, makes our numbers look worse. Yeah. So at this stag",
+        "evidence": true
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.45316202519792326,
+        "text80": "[10:32:56] spk_1: Done that.\n[10:32:58] spk_0: We knew we were retiring. I can u",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.503294125297485,
+        "text80": "[13:40 – 13:40] Current Job Assignment Query (progress)\nThe speaker asked which ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5248630501289031,
+        "text80": "[13:40:32] spk_0: 那 我 现 在 是 哪 个 job 呢 ？",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5298803028357281,
+        "text80": "[12:11 – 12:13] Next week schedule and hiring (progress)\nParticipants: Ben\n梳理了下周",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5309679982931594,
+        "text80": "[09:04:01] spk_0: The problem is, is that with this job is, is that all of them ",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 6,
+      "k5_search_rows": 9,
+      "k5_keyword_rows": 4
+     },
+     "keyword_rows_k30": 42,
+     "best_distance": 0.45316202519792326,
+     "embed_ms": 1762.3305000015534,
+     "sql_ms": 1216.6346000158228
+    },
+    {
+     "id": "v1-05",
+     "lang": "en",
+     "expect": "answerable",
+     "category": null,
+     "style": null,
+     "raw": 3,
+     "systems": {
+      "prod": {
+       "ask": 3,
+       "list": 1,
+       "list_rows": 48
+      },
+      "link-rollup": {
+       "ask": 3,
+       "list": 1,
+       "list_rows": 47
+      },
+      "prod-no-admit": {
+       "ask": 3,
+       "list": 1,
+       "list_rows": 48
+      },
+      "vector-only@5": {
+       "ask": 3,
+       "list": 1,
+       "list_rows": 48
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 29
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": 2,
+       "list_rows": 43
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 2986.8448000052013,
+      "rerank@50": 3000.484399992274
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 43,
+      "rerank@50": 59
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.3253952681075839,
+        "text80": "[09:08:11] spk_1: Yeah.\n[09:08:11] spk_0: Um, plastering obviously is with Plast",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4002299546647138,
+        "text80": "[11:01 – 11:02] Subcontractor Coordination & Onboarding (progress)\nParticipants:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4172285645195335,
+        "text80": "[14:55:02] spk_1: And, uh, .\n[14:55:08] spk_0: Yeah. Hey, if I get something fro",
+        "evidence": true
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.42571546418297734,
+        "text80": "[14:48 – 15:06] Rainwater Tanks and Stormwater Clash (quality)\nLarge blue cylind",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.42839808125517165,
+        "text80": "[15:03:48] spk_1: Bro, I fucking... All the shit Nick's meant to have sort out, ",
+        "evidence": true
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.3253952681075839,
+        "text80": "[09:08:11] spk_1: Yeah.\n[09:08:11] spk_0: Um, plastering obviously is with Plast",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4002299546647138,
+        "text80": "[11:01 – 11:02] Subcontractor Coordination & Onboarding (progress)\nParticipants:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4172285645195335,
+        "text80": "[14:55:02] spk_1: And, uh, .\n[14:55:08] spk_0: Yeah. Hey, if I get something fro",
+        "evidence": true
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.42571546418297734,
+        "text80": "[14:48 – 15:06] Rainwater Tanks and Stormwater Clash (quality)\nLarge blue cylind",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.42800287699647044,
+        "text80": "[16:28:35] spk_1: Well, we're gonna do it. Yeah. I think Chris is gonna take-- g",
+        "evidence": true
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 3,
+      "k5_search_rows": 7,
+      "k5_keyword_rows": 2
+     },
+     "keyword_rows_k30": 9,
+     "best_distance": 0.3253952681075839,
+     "embed_ms": 2395.7452000177,
+     "sql_ms": 890.7984000397846
+    },
+    {
+     "id": "v1-06",
+     "lang": "en",
+     "expect": "answerable",
+     "category": null,
+     "style": null,
+     "raw": 7,
+     "systems": {
+      "prod": {
+       "ask": null,
+       "list": null,
+       "list_rows": 46
+      },
+      "link-rollup": {
+       "ask": null,
+       "list": 5,
+       "list_rows": 45
+      },
+      "prod-no-admit": {
+       "ask": null,
+       "list": null,
+       "list_rows": 46
+      },
+      "vector-only@5": {
+       "ask": null,
+       "list": null,
+       "list_rows": 46
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 35
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 42
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 4665.663100022357,
+      "rerank@50": 2309.5592000172473
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 61,
+      "rerank@50": 90
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4596639645700509,
+        "text80": "[15:08:01] spk_0: You lucky bastard.\n[15:08:04] spk_1: Can't figure out how to w",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.48911136518580967,
+        "text80": "[09:04 – 09:09] H&S - Toolbox TAs Sitewise Flooding (safety)\nParticipants: Jesse",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.48940083574041593,
+        "text80": "[15:17:10] spk_0: But not a one fifty.\n[15:17:11] spk_1: But not a one fifty blo",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4921164512634133,
+        "text80": "[10:25:21] spk_0: Where are they?\n[10:25:22] spk_1: Up on site. There's fences a",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.5476025016544686,
+        "text80": "[10:22:29] spk_1: You can ask them for whatever you like.\n[10:22:31] spk_0: So w",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4596639645700509,
+        "text80": "[15:08:01] spk_0: You lucky bastard.\n[15:08:04] spk_1: Can't figure out how to w",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.48911136518580967,
+        "text80": "[09:04 – 09:09] H&S - Toolbox TAs Sitewise Flooding (safety)\nParticipants: Jesse",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.48940083574041593,
+        "text80": "[15:17:10] spk_0: But not a one fifty.\n[15:17:11] spk_1: But not a one fifty blo",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4921164512634133,
+        "text80": "[10:25:21] spk_0: Where are they?\n[10:25:22] spk_1: Up on site. There's fences a",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.49739605281493804,
+        "text80": "[12:10 – 12:11] UC Site rollout strategy (progress)\nParticipants: Ben\n讨论了在 UC Si",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 7,
+      "k5_search_rows": 10,
+      "k5_keyword_rows": 5
+     },
+     "keyword_rows_k30": 46,
+     "best_distance": 0.4596639645700509,
+     "embed_ms": 2940.5085000034887,
+     "sql_ms": 2136.1247000168078
+    },
+    {
+     "id": "v1-07",
+     "lang": "en",
+     "expect": "answerable",
+     "category": null,
+     "style": null,
+     "raw": 9,
+     "systems": {
+      "prod": {
+       "ask": 5,
+       "list": 2,
+       "list_rows": 36
+      },
+      "link-rollup": {
+       "ask": 5,
+       "list": 2,
+       "list_rows": 31
+      },
+      "prod-no-admit": {
+       "ask": null,
+       "list": 2,
+       "list_rows": 36
+      },
+      "vector-only@5": {
+       "ask": null,
+       "list": 2,
+       "list_rows": 36
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 18
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 27
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 2539.288200001465,
+      "rerank@50": 2879.27039997885
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 47,
+      "rerank@50": 72
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4359482526779175,
+        "text80": "[11:11 – 11:15] Scaffold Methodology & Crane Restrictions (progress)\nParticipant",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.446010774849557,
+        "text80": "[10:08:14] spk_1: Um, yeah, I think... Oh, we paid a little bit. It wasn't, wasn",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.44877731800079346,
+        "text80": "[08:36 – 08:44] Crane methodology and purlin deliveries (progress)\nParticipants:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.44972672159552673,
+        "text80": "[08:34:00] spk_0: He's just a bit shy.\n[08:34:04] spk_2: That's what I thought.\n",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.5567055212469552,
+        "text80": "[10:06:36] spk_0: Copy and pasting, uh, block.\n[10:06:38] spk_1: And like simple",
+        "evidence": true
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4359482526779175,
+        "text80": "[11:11 – 11:15] Scaffold Methodology & Crane Restrictions (progress)\nParticipant",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.446010774849557,
+        "text80": "[10:08:14] spk_1: Um, yeah, I think... Oh, we paid a little bit. It wasn't, wasn",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.44877731800079346,
+        "text80": "[08:36 – 08:44] Crane methodology and purlin deliveries (progress)\nParticipants:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.44972672159552673,
+        "text80": "[08:34:00] spk_0: He's just a bit shy.\n[08:34:04] spk_2: That's what I thought.\n",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4533761143684387,
+        "text80": "[08:37:39] spk_0: Do we?\n[08:37:39] spk_1: A lot of the lagging documents fallin",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 9,
+      "k5_search_rows": 8,
+      "k5_keyword_rows": 3
+     },
+     "keyword_rows_k30": 33,
+     "best_distance": 0.4359482526779175,
+     "embed_ms": 3251.775799988536,
+     "sql_ms": 1075.7027000072412
+    },
+    {
+     "id": "v1-08",
+     "lang": "en",
+     "expect": "answerable",
+     "category": null,
+     "style": null,
+     "raw": 2,
+     "systems": {
+      "prod": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 56
+      },
+      "link-rollup": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 56
+      },
+      "prod-no-admit": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 56
+      },
+      "vector-only@5": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 56
+      },
+      "rerank@32": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 37
+      },
+      "rerank@50": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 48
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 3399.8968999949284,
+      "rerank@50": 4768.801500002155
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 59,
+      "rerank@50": 89
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4320147714597219,
+        "text80": "[12:37:10] spk_0: Uh, once a year.\n[12:37:13] spk_1: Do they give you notice?\n[1",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.49411331099609446,
+        "text80": "[13:32:39] spk_1: I don't know.\n[13:32:41] spk_0: Yeah, right. Um.\n[13:32:45] sp",
+        "evidence": true
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4972677530486722,
+        "text80": "[11:48 – 11:49] Mitre 10 Procurement and Site Meeting (progress)\nThe speaker pla",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.509243369102478,
+        "text80": "[13:37:46] spk_0: Going site inspections. Coming to the car park.\n[13:38:45] spk",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.5169144868850708,
+        "text80": "[13:34:38] spk_0: But we all-\n[13:34:38] spk_1: And I, I'll, I, I don't cro- I a",
+        "evidence": true
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4320147714597219,
+        "text80": "[12:37:10] spk_0: Uh, once a year.\n[12:37:13] spk_1: Do they give you notice?\n[1",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.49411331099609446,
+        "text80": "[13:32:39] spk_1: I don't know.\n[13:32:41] spk_0: Yeah, right. Um.\n[13:32:45] sp",
+        "evidence": true
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4972677530486722,
+        "text80": "[11:48 – 11:49] Mitre 10 Procurement and Site Meeting (progress)\nThe speaker pla",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.509243369102478,
+        "text80": "[13:37:46] spk_0: Going site inspections. Coming to the car park.\n[13:38:45] spk",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.513880044221878,
+        "text80": "[11:25 – 11:29] AI Database & Site Manager Templates (progress)\nParticipants: Be",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 2,
+      "k5_search_rows": 9,
+      "k5_keyword_rows": 4
+     },
+     "keyword_rows_k30": 48,
+     "best_distance": 0.4320147714597219,
+     "embed_ms": 3065.9836000122596,
+     "sql_ms": 2129.826199961826
+    },
+    {
+     "id": "v1-09",
+     "lang": "en",
+     "expect": "answerable",
+     "category": null,
+     "style": null,
+     "raw": 11,
+     "systems": {
+      "prod": {
+       "ask": 5,
+       "list": 6,
+       "list_rows": 34
+      },
+      "link-rollup": {
+       "ask": 5,
+       "list": 6,
+       "list_rows": 36
+      },
+      "prod-no-admit": {
+       "ask": null,
+       "list": 6,
+       "list_rows": 34
+      },
+      "vector-only@5": {
+       "ask": null,
+       "list": 6,
+       "list_rows": 34
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 23
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 29
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 2937.9603999841493,
+      "rerank@50": 2105.388399999356
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 57,
+      "rerank@50": 90
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.44237829628508174,
+        "text80": "[14:24 – 14:24] Subcontractor Access Cards (progress)\nParticipants: Ben\nBen need",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4593621814631029,
+        "text80": "[09:52:04] spk_2: I mean, someone will get to me on a few moments\n[09:52:05] spk",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4600179839112739,
+        "text80": "[14:59 – 15:11] Subcontractor Access and Phase Inspections (progress)\nNavigated ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4643797044075054,
+        "text80": "[11:01 – 11:02] Subcontractor Coordination & Onboarding (progress)\nParticipants:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.5386768281459677,
+        "text80": "[09:08:01] spk_2: Anyone heard her?\n[09:08:02] spk_0: Well, nothing. I just don'",
+        "evidence": true
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.44237829628508174,
+        "text80": "[14:24 – 14:24] Subcontractor Access Cards (progress)\nParticipants: Ben\nBen need",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4593621814631029,
+        "text80": "[09:52:04] spk_2: I mean, someone will get to me on a few moments\n[09:52:05] spk",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4600179839112739,
+        "text80": "[14:59 – 15:11] Subcontractor Access and Phase Inspections (progress)\nNavigated ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4643797044075054,
+        "text80": "[11:01 – 11:02] Subcontractor Coordination & Onboarding (progress)\nParticipants:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5013201533174296,
+        "text80": "[10:10:53] spk_0: Yeah. There's just a few areas where we might have to do it to",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 11,
+      "k5_search_rows": 10,
+      "k5_keyword_rows": 5
+     },
+     "keyword_rows_k30": 48,
+     "best_distance": 0.44237829628508174,
+     "embed_ms": 1808.014699985506,
+     "sql_ms": 1814.0084999904502
+    },
+    {
+     "id": "v1-10",
+     "lang": "en",
+     "expect": "answerable",
+     "category": null,
+     "style": null,
+     "raw": 2,
+     "systems": {
+      "prod": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 55
+      },
+      "link-rollup": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 53
+      },
+      "prod-no-admit": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 55
+      },
+      "vector-only@5": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 55
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 40
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 49
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 1451.9244999974035,
+      "rerank@50": 2614.364299981389
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 51,
+      "rerank@50": 80
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.3547167181968689,
+        "text80": "[11:15 – 11:17] QA Inspections & Concrete Testing (quality)\nParticipants: Jesse,",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.3740508706508985,
+        "text80": "[09:26:10] spk_2: ... Tuesday with Margaret.\n[09:26:11] spk_1: Yeah.\n[09:26:12] ",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.45666623632117886,
+        "text80": "[16:47:16] spk_0: Block one. This is Zoe.\n[16:47:20] spk_1: This is Zoe.\n[16:47:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.46794402217197306,
+        "text80": "[11:14:15] spk_0: at the, the meeting minutes on Aconex, it'll just tell you the",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.5254949927330017,
+        "text80": "[16:48:42] spk_0: Block one. This is Zoe.\n[16:48:49] spk_1: This is Zoe.\n[16:48:",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.3547167181968689,
+        "text80": "[11:15 – 11:17] QA Inspections & Concrete Testing (quality)\nParticipants: Jesse,",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.3740508706508985,
+        "text80": "[09:26:10] spk_2: ... Tuesday with Margaret.\n[09:26:11] spk_1: Yeah.\n[09:26:12] ",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.45666623632117886,
+        "text80": "[16:47:16] spk_0: Block one. This is Zoe.\n[16:47:20] spk_1: This is Zoe.\n[16:47:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.46794402217197306,
+        "text80": "[11:14:15] spk_0: at the, the meeting minutes on Aconex, it'll just tell you the",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4704138671858431,
+        "text80": "[16:47 – 16:48] Level 3 Slab Rebar & Pre-Pour (progress)\nParticipants: Zoe, Mike",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 2,
+      "k5_search_rows": 9,
+      "k5_keyword_rows": 4
+     },
+     "keyword_rows_k30": 37,
+     "best_distance": 0.3547167181968689,
+     "embed_ms": 1836.7519000021275,
+     "sql_ms": 1257.7505999943241
+    },
+    {
+     "id": "v1-11",
+     "lang": "en",
+     "expect": "answerable",
+     "category": null,
+     "style": null,
+     "raw": 2,
+     "systems": {
+      "prod": {
+       "ask": 2,
+       "list": 1,
+       "list_rows": 13
+      },
+      "link-rollup": {
+       "ask": 2,
+       "list": 1,
+       "list_rows": 10
+      },
+      "prod-no-admit": {
+       "ask": 2,
+       "list": 1,
+       "list_rows": 13
+      },
+      "vector-only@5": {
+       "ask": 2,
+       "list": 1,
+       "list_rows": 13
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 13
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 12
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 2723.5218999849167,
+      "rerank@50": 4859.425000002375
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 44,
+      "rerank@50": 61
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5559152629425894,
+        "text80": "[13:51:12] spk_0: Yeah. Yeah, yeah, I'm on it now. Yeah, I've- I've seen, I've s",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5580966403369109,
+        "text80": "[08:37:57] spk_0: So that's like 5K now.\n[08:37:59] spk_1: This is mirrors?\n[08:",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5651196539401884,
+        "text80": "[16:32:55] spk_1: No, he didn't say shit about Tom.\n[16:32:57] spk_0: I was just",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5791132559506282,
+        "text80": "[11:28:58] spk_2: 700K was just obviously ten last year but it actually did well",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.6033402373372794,
+        "text80": "[10:17:04] spk_1: You know?\n[10:17:10] spk_0: Ticky, ticky. What's ticky? You kn",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5559152629425894,
+        "text80": "[13:51:12] spk_0: Yeah. Yeah, yeah, I'm on it now. Yeah, I've- I've seen, I've s",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5580966403369109,
+        "text80": "[08:37:57] spk_0: So that's like 5K now.\n[08:37:59] spk_1: This is mirrors?\n[08:",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5651196539401884,
+        "text80": "[16:32:55] spk_1: No, he didn't say shit about Tom.\n[16:32:57] spk_0: I was just",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5791132559506282,
+        "text80": "[11:28:58] spk_2: 700K was just obviously ten last year but it actually did well",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5829793960488915,
+        "text80": "[11:34:58] spk_2: Yeah, that's a good dinner.\n[11:35:06] spk_0: Ugh. I'm coming ",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 2,
+      "k5_search_rows": 6,
+      "k5_keyword_rows": 1
+     },
+     "keyword_rows_k30": 10,
+     "best_distance": 0.5559152629425894,
+     "embed_ms": 1919.6653999970295,
+     "sql_ms": 1015.8053999766707
+    },
+    {
+     "id": "v1-12",
+     "lang": "zh",
+     "expect": "answerable",
+     "category": null,
+     "style": null,
+     "raw": 1,
+     "systems": {
+      "prod": {
+       "ask": 1,
+       "list": 6,
+       "list_rows": 10
+      },
+      "link-rollup": {
+       "ask": 1,
+       "list": 2,
+       "list_rows": 10
+      },
+      "prod-no-admit": {
+       "ask": 1,
+       "list": 6,
+       "list_rows": 10
+      },
+      "vector-only@5": {
+       "ask": 1,
+       "list": 6,
+       "list_rows": 10
+      },
+      "rerank@32": {
+       "ask": 3,
+       "list": 3,
+       "list_rows": 10
+      },
+      "rerank@50": {
+       "ask": 3,
+       "list": 3,
+       "list_rows": 10
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 3552.865700010443,
+      "rerank@50": 3578.420500009088
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 33,
+      "rerank@50": 51
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.49540001263617806,
+        "text80": "[13:13:51] spk_0: Sharky Painting. Doesn't even have a website. He's got a fucki",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5074143098447882,
+        "text80": "[14:33:18] spk_0: sometimes the\n[14:33:19] spk_1: boss takes off work that we do",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5085205718540045,
+        "text80": "[08:59:58] spk_1: Well, yeah.\n[08:59:58] spk_0: The roof, the roofers are a bit ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5154445730579883,
+        "text80": "[22:48:04] spk_1: 好 ， 今 天 下 午 3 点 在 B2 做 一 次 例 行 检 查 。The stair enforcement on t",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.6330010573861435,
+        "text80": "[17:58:04] spk_1: and uh Hay both of them intend\n[17:58:08] spk_2: to engage per",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.49540001263617806,
+        "text80": "[13:13:51] spk_0: Sharky Painting. Doesn't even have a website. He's got a fucki",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5074143098447882,
+        "text80": "[14:33:18] spk_0: sometimes the\n[14:33:19] spk_1: boss takes off work that we do",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5085205718540045,
+        "text80": "[08:59:58] spk_1: Well, yeah.\n[08:59:58] spk_0: The roof, the roofers are a bit ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5154445730579883,
+        "text80": "[22:48:04] spk_1: 好 ， 今 天 下 午 3 点 在 B2 做 一 次 例 行 检 查 。The stair enforcement on t",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5186026029815902,
+        "text80": "[09:17:18] spk_0: Better than month. Better than month, yeah.\n[09:17:22] spk_1: ",
+        "evidence": true
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 1,
+      "k5_search_rows": 6,
+      "k5_keyword_rows": 1
+     },
+     "keyword_rows_k30": 1,
+     "best_distance": 0.49540001263617806,
+     "embed_ms": 1757.1048999961931,
+     "sql_ms": 756.1291999882087
+    },
+    {
+     "id": "v1-13",
+     "lang": "zh",
+     "expect": "answerable",
+     "category": null,
+     "style": null,
+     "raw": 2,
+     "systems": {
+      "prod": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 4
+      },
+      "link-rollup": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 4
+      },
+      "prod-no-admit": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 4
+      },
+      "vector-only@5": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 4
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 4
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 4
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 3299.2888999870047,
+      "rerank@50": 2419.4731999887154
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 32,
+      "rerank@50": 50
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.45408216392504097,
+        "text80": "[14:19:36] spk_0: Stop. Um, so, um, yeah, probably. Yeah, the day rate for a, fo",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.46450972557067494,
+        "text80": "[10:46:39] spk_2: It becomes five thousand cards. It just keep coming backwards ",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5164995049387016,
+        "text80": "[11:25:01] spk_0: 听 着 到 ， 但 是 我 跟 ， 我 跟 双 双 说 ， 我 说 ， 就 说 ：“ 双 总 ， 这 不 对 ， 你 看 我",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5201780486000739,
+        "text80": "[10:30:47] spk_1: Have you got that?\n[10:30:49] spk_0: Yeah, there would be back",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5284042043444981,
+        "text80": "[12:11 – 12:13] Next week schedule and hiring (progress)\nParticipants: Ben\n梳理了下周",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.45408216392504097,
+        "text80": "[14:19:36] spk_0: Stop. Um, so, um, yeah, probably. Yeah, the day rate for a, fo",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.46450972557067494,
+        "text80": "[10:46:39] spk_2: It becomes five thousand cards. It just keep coming backwards ",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5164995049387016,
+        "text80": "[11:25:01] spk_0: 听 着 到 ， 但 是 我 跟 ， 我 跟 双 双 说 ， 我 说 ， 就 说 ：“ 双 总 ， 这 不 对 ， 你 看 我",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5201780486000739,
+        "text80": "[10:30:47] spk_1: Have you got that?\n[10:30:49] spk_0: Yeah, there would be back",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5284042043444981,
+        "text80": "[12:11 – 12:13] Next week schedule and hiring (progress)\nParticipants: Ben\n梳理了下周",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 2,
+      "k5_search_rows": 5,
+      "k5_keyword_rows": 0
+     },
+     "keyword_rows_k30": 0,
+     "best_distance": 0.45408216392504097,
+     "embed_ms": 1698.4225000196602,
+     "sql_ms": 729.1399999812711
+    },
+    {
+     "id": "v1-14",
+     "lang": "en",
+     "expect": "answerable",
+     "category": null,
+     "style": null,
+     "raw": 3,
+     "systems": {
+      "prod": {
+       "ask": 3,
+       "list": 1,
+       "list_rows": 50
+      },
+      "link-rollup": {
+       "ask": 3,
+       "list": 1,
+       "list_rows": 53
+      },
+      "prod-no-admit": {
+       "ask": 3,
+       "list": 1,
+       "list_rows": 50
+      },
+      "vector-only@5": {
+       "ask": 3,
+       "list": 1,
+       "list_rows": 50
+      },
+      "rerank@32": {
+       "ask": 2,
+       "list": 1,
+       "list_rows": 28
+      },
+      "rerank@50": {
+       "ask": 2,
+       "list": 1,
+       "list_rows": 43
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 2009.1301999927964,
+      "rerank@50": 2889.783000020543
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 43,
+      "rerank@50": 65
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.340407748806243,
+        "text80": "[11:29 – 11:35] Concrete Pour Dates & Upcoming Schedule (progress)\nParticipants:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.38053471272004036,
+        "text80": "[07:18 – 07:26] Backfill and tanking sequencing Zone 1 (progress)\nParticipants: ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.3845719924314017,
+        "text80": "[11:33:06] spk_0: Okay.\n[11:33:06] spk_2: Do you know what I mean? I'm not worri",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.3972441496928729,
+        "text80": "[16:47:16] spk_0: Block one. This is Zoe.\n[16:47:20] spk_1: This is Zoe.\n[16:47:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.45748361691734896,
+        "text80": "[11:29:01] spk_1: As far as watching that site.\n[11:29:02] spk_2: Yeah. Just hav",
+        "evidence": true
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.340407748806243,
+        "text80": "[11:29 – 11:35] Concrete Pour Dates & Upcoming Schedule (progress)\nParticipants:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.38053471272004036,
+        "text80": "[07:18 – 07:26] Backfill and tanking sequencing Zone 1 (progress)\nParticipants: ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.3845719924314017,
+        "text80": "[11:33:06] spk_0: Okay.\n[11:33:06] spk_2: Do you know what I mean? I'm not worri",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.3972441496928729,
+        "text80": "[16:47:16] spk_0: Block one. This is Zoe.\n[16:47:20] spk_1: This is Zoe.\n[16:47:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "session_digest",
+        "lexical_hit": false,
+        "distance": 0.3980969248500694,
+        "text80": "Session 16:47–16:48\n- [16:47 – 16:48] Level 3 Slab Rebar & Pre-Pour",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 3,
+      "k5_search_rows": 8,
+      "k5_keyword_rows": 3
+     },
+     "keyword_rows_k30": 24,
+     "best_distance": 0.340407748806243,
+     "embed_ms": 1965.2097999933176,
+     "sql_ms": 1016.5778000373393
+    },
+    {
+     "id": "v1-15",
+     "lang": "en",
+     "expect": "answerable",
+     "category": null,
+     "style": null,
+     "raw": 1,
+     "systems": {
+      "prod": {
+       "ask": 1,
+       "list": 33,
+       "list_rows": 34
+      },
+      "link-rollup": {
+       "ask": 1,
+       "list": 36,
+       "list_rows": 38
+      },
+      "prod-no-admit": {
+       "ask": 1,
+       "list": 33,
+       "list_rows": 34
+      },
+      "vector-only@5": {
+       "ask": 1,
+       "list": 33,
+       "list_rows": 34
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 17
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 30
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 4862.223000003723,
+      "rerank@50": 2695.6508999865036
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 56,
+      "rerank@50": 89
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.3502109468234714,
+        "text80": "[11:04:08] spk_1: Yeah, yeah.\n[11:04:08] spk_0: They just-\n[11:04:09] spk_1: Yea",
+        "evidence": true
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.37567111108726814,
+        "text80": "[11:02 – 11:04] Safety Compliance & Documentation (safety)\nParticipants: Jesse, ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4174500854224109,
+        "text80": "[11:03:21] spk_1: Well, I can give you one a week if you want.\n[11:03:23] spk_2:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5355646567863503,
+        "text80": "[10:52:09] spk_2: Fire suits and speaker. Um, SS 15.3 fire separation, fire door",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5545892980939497,
+        "text80": "[10:50:41] spk_0: Yeah. Well, it's just SIO2, isn't it?\n[10:50:42] spk_1: Exactl",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.3502109468234714,
+        "text80": "[11:04:08] spk_1: Yeah, yeah.\n[11:04:08] spk_0: They just-\n[11:04:09] spk_1: Yea",
+        "evidence": true
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.37567111108726814,
+        "text80": "[11:02 – 11:04] Safety Compliance & Documentation (safety)\nParticipants: Jesse, ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4174500854224109,
+        "text80": "[11:03:21] spk_1: Well, I can give you one a week if you want.\n[11:03:23] spk_2:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5355646567863503,
+        "text80": "[10:52:09] spk_2: Fire suits and speaker. Um, SS 15.3 fire separation, fire door",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5545892980939497,
+        "text80": "[10:50:41] spk_0: Yeah. Well, it's just SIO2, isn't it?\n[10:50:42] spk_1: Exactl",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 1,
+      "k5_search_rows": 5,
+      "k5_keyword_rows": 0
+     },
+     "keyword_rows_k30": 50,
+     "best_distance": 0.3502109468234714,
+     "embed_ms": 4414.060500013875,
+     "sql_ms": 1164.4442999968305
+    },
+    {
+     "id": "v1-16",
+     "lang": "en",
+     "expect": "answerable",
+     "category": null,
+     "style": null,
+     "raw": 18,
+     "systems": {
+      "prod": {
+       "ask": null,
+       "list": 33,
+       "list_rows": 37
+      },
+      "link-rollup": {
+       "ask": null,
+       "list": 32,
+       "list_rows": 36
+      },
+      "prod-no-admit": {
+       "ask": null,
+       "list": 33,
+       "list_rows": 37
+      },
+      "vector-only@5": {
+       "ask": null,
+       "list": 33,
+       "list_rows": 37
+      },
+      "rerank@32": {
+       "ask": null,
+       "list": 1,
+       "list_rows": 26
+      },
+      "rerank@50": {
+       "ask": null,
+       "list": 1,
+       "list_rows": 32
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 2344.662799994694,
+      "rerank@50": 2036.786500015296
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 63,
+      "rerank@50": 93
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4900174129030005,
+        "text80": "[11:37:53] spk_0: 'Cause he'll still be able to test even if we've got our scaff",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5074204798090094,
+        "text80": "[10:12 – 10:28] Site operations tools and fencing (progress)\nParticipants: Ben, ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5217622699979347,
+        "text80": "[17:31:41] spk_1: Yeah. Got two. Start at 11, have to have open by 4.\n[17:31:48]",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5218912025884411,
+        "text80": "[11:27 – 11:29] Weather Forecast & Backfill Completion (progress)\nParticipants: ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.5835120231232678,
+        "text80": "[10:25:21] spk_0: Where are they?\n[10:25:22] spk_1: Up on site. There's fences a",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4900174129030005,
+        "text80": "[11:37:53] spk_0: 'Cause he'll still be able to test even if we've got our scaff",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5074204798090094,
+        "text80": "[10:12 – 10:28] Site operations tools and fencing (progress)\nParticipants: Ben, ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5217622699979347,
+        "text80": "[17:31:41] spk_1: Yeah. Got two. Start at 11, have to have open by 4.\n[17:31:48]",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5218912025884411,
+        "text80": "[11:27 – 11:29] Weather Forecast & Backfill Completion (progress)\nParticipants: ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5271335526029063,
+        "text80": "[11:22 – 11:27] Plumbing Trenching & Hanlon's Schedule (progress)\nParticipants: ",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 18,
+      "k5_search_rows": 9,
+      "k5_keyword_rows": 4
+     },
+     "keyword_rows_k30": 55,
+     "best_distance": 0.4900174129030005,
+     "embed_ms": 4146.028799994383,
+     "sql_ms": 2134.063100005733
+    },
+    {
+     "id": "v1-17",
+     "lang": "en",
+     "expect": "answerable",
+     "category": null,
+     "style": null,
+     "raw": 1,
+     "systems": {
+      "prod": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 30
+      },
+      "link-rollup": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 26
+      },
+      "prod-no-admit": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 30
+      },
+      "vector-only@5": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 30
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 30
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 30
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 2384.6841999911703,
+      "rerank@50": 2534.6167999960016
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 47,
+      "rerank@50": 63
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.24204422675772297,
+        "text80": "[11:24:03] spk_0: just, j- j- just with the, with the, the plumbing now, just wi",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.3853062757667127,
+        "text80": "[11:22:50] spk_0: Without, without Hanlon's stuff.\n[11:22:52] spk_1: Yeah. I kno",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.3925480736706114,
+        "text80": "[11:22 – 11:27] Plumbing Trenching & Hanlon's Schedule (progress)\nParticipants: ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4472971888007399,
+        "text80": "[11:25:26] spk_0: That's it.\n[11:25:26] spk_2: So Friday arvo.\n[11:25:28] spk_0:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "session_digest",
+        "lexical_hit": true,
+        "distance": 0.4629776201857545,
+        "text80": "Session 11:01–18:14\n- [11:01 – 11:02] Subcontractor Coordination & Onboarding\n- ",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.24204422675772297,
+        "text80": "[11:24:03] spk_0: just, j- j- just with the, with the, the plumbing now, just wi",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.3853062757667127,
+        "text80": "[11:22:50] spk_0: Without, without Hanlon's stuff.\n[11:22:52] spk_1: Yeah. I kno",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.3925480736706114,
+        "text80": "[11:22 – 11:27] Plumbing Trenching & Hanlon's Schedule (progress)\nParticipants: ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4472971888007399,
+        "text80": "[11:25:26] spk_0: That's it.\n[11:25:26] spk_2: So Friday arvo.\n[11:25:28] spk_0:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4572303022604991,
+        "text80": "[14:46:26] spk_0: and whatever, and if they-- I'll send it to them. If they push",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 1,
+      "k5_search_rows": 7,
+      "k5_keyword_rows": 2
+     },
+     "keyword_rows_k30": 13,
+     "best_distance": 0.24204422675772297,
+     "embed_ms": 1950.3969999786932,
+     "sql_ms": 868.1504999985918
+    },
+    {
+     "id": "v1-18",
+     "lang": "en",
+     "expect": "answerable",
+     "category": null,
+     "style": null,
+     "raw": 2,
+     "systems": {
+      "prod": {
+       "ask": 2,
+       "list": null,
+       "list_rows": 35
+      },
+      "link-rollup": {
+       "ask": 2,
+       "list": 1,
+       "list_rows": 32
+      },
+      "prod-no-admit": {
+       "ask": 2,
+       "list": null,
+       "list_rows": 35
+      },
+      "vector-only@5": {
+       "ask": 2,
+       "list": null,
+       "list_rows": 35
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 20
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 26
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 3769.8785999964457,
+      "rerank@50": 2632.8506999998353
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 58,
+      "rerank@50": 91
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5465293121215085,
+        "text80": "[17:55:06] spk_0: 下 周四 我要 回忆 M 这个 邮件 关于 Open Space 的 问题\n[17:55:09] spk_0: 邮件 关于 ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5708366846040741,
+        "text80": "[17:29:37] spk_1: Yeah, the Blue Rover.\n[17:29:37] spk_0: Like two weeks or so.\n",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5798898637294739,
+        "text80": "[12:10:06] spk_1: 我 还 估 计 还 会 ， 还 是 会 给 稍 微 pause 这 个 东 西 啊 ， 调 整 一 下 。 行 吧 ， 这 ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5812797795963351,
+        "text80": "[10:40:47] spk_1: Yeah.\n[10:40:48] spk_0: Just because, um, yeah, I mean, yeah, ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.6552488803863501,
+        "text80": "[13:38:25] spk_0: I just want to catch you by hair. I just want to be there when",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5465293121215085,
+        "text80": "[17:55:06] spk_0: 下 周四 我要 回忆 M 这个 邮件 关于 Open Space 的 问题\n[17:55:09] spk_0: 邮件 关于 ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5708366846040741,
+        "text80": "[17:29:37] spk_1: Yeah, the Blue Rover.\n[17:29:37] spk_0: Like two weeks or so.\n",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5798898637294739,
+        "text80": "[12:10:06] spk_1: 我 还 估 计 还 会 ， 还 是 会 给 稍 微 pause 这 个 东 西 啊 ， 调 整 一 下 。 行 吧 ， 这 ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5812797795963351,
+        "text80": "[10:40:47] spk_1: Yeah.\n[10:40:48] spk_0: Just because, um, yeah, I mean, yeah, ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5823728691117178,
+        "text80": "[11:28:58] spk_2: 700K was just obviously ten last year but it actually did well",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 2,
+      "k5_search_rows": 8,
+      "k5_keyword_rows": 3
+     },
+     "keyword_rows_k30": 53,
+     "best_distance": 0.5465293121215085,
+     "embed_ms": 1796.1506999854464,
+     "sql_ms": 2162.3063999868464
+    },
+    {
+     "id": "v1-19",
+     "lang": "zh",
+     "expect": "answerable",
+     "category": null,
+     "style": null,
+     "raw": 10,
+     "systems": {
+      "prod": {
+       "ask": null,
+       "list": 11,
+       "list_rows": 43
+      },
+      "link-rollup": {
+       "ask": null,
+       "list": 12,
+       "list_rows": 46
+      },
+      "prod-no-admit": {
+       "ask": null,
+       "list": 11,
+       "list_rows": 43
+      },
+      "vector-only@5": {
+       "ask": null,
+       "list": 11,
+       "list_rows": 43
+      },
+      "rerank@32": {
+       "ask": null,
+       "list": 1,
+       "list_rows": 33
+      },
+      "rerank@50": {
+       "ask": null,
+       "list": 1,
+       "list_rows": 43
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 1868.3183999964967,
+      "rerank@50": 1908.471600007033
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 45,
+      "rerank@50": 63
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4024077530370189,
+        "text80": "[22:48:04] spk_1: 好 ， 今 天 下 午 3 点 在 B2 做 一 次 例 行 检 查 。The stair enforcement on t",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.43422715051880667,
+        "text80": "[11:29 – 11:35] Concrete Pour Dates & Upcoming Schedule (progress)\nParticipants:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4369246271021935,
+        "text80": "[12:12:58] spk_0: Tell me when did the concrete pour?\n[12:13:18] spk_1: The conc",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4443716903592563,
+        "text80": "[12:13:34] spk_0: Say it again. When did the concrete pour?\n[12:13:43] spk_1: Th",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": true,
+        "distance": 0.4608458601924178,
+        "text80": "[07:18 – 07:26] Backfill and tanking sequencing Zone 1 (progress)\nParticipants: ",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4024077530370189,
+        "text80": "[22:48:04] spk_1: 好 ， 今 天 下 午 3 点 在 B2 做 一 次 例 行 检 查 。The stair enforcement on t",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.43422715051880667,
+        "text80": "[11:29 – 11:35] Concrete Pour Dates & Upcoming Schedule (progress)\nParticipants:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4369246271021935,
+        "text80": "[12:12:58] spk_0: Tell me when did the concrete pour?\n[12:13:18] spk_1: The conc",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4443716903592563,
+        "text80": "[12:13:34] spk_0: Say it again. When did the concrete pour?\n[12:13:43] spk_1: Th",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4502147704490638,
+        "text80": "[16:54 – 16:55] Concrete pour schedule (progress)\nThe user queries the AI assist",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 10,
+      "k5_search_rows": 10,
+      "k5_keyword_rows": 5
+     },
+     "keyword_rows_k30": 11,
+     "best_distance": 0.4024077530370189,
+     "embed_ms": 1733.252599980915,
+     "sql_ms": 733.9867000409868
+    },
+    {
+     "id": "v1-20",
+     "lang": "en",
+     "expect": "unanswerable",
+     "category": null,
+     "style": null,
+     "raw": null,
+     "systems": {
+      "prod": {
+       "ask": null,
+       "list": null,
+       "list_rows": 42
+      },
+      "link-rollup": {
+       "ask": null,
+       "list": null,
+       "list_rows": 40
+      },
+      "prod-no-admit": {
+       "ask": null,
+       "list": null,
+       "list_rows": 42
+      },
+      "vector-only@5": {
+       "ask": null,
+       "list": null,
+       "list_rows": 42
+      },
+      "rerank@32": {
+       "ask": null,
+       "list": null,
+       "list_rows": 26
+      },
+      "rerank@50": {
+       "ask": null,
+       "list": null,
+       "list_rows": 36
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 6216.525299998466,
+      "rerank@50": 3941.5128999971785
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 54,
+      "rerank@50": 85
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4352303561156341,
+        "text80": "[11:22:17] spk_1: Kuma makes, um... Yes, Kuma.\n[11:22:19] spk_0: Oh, Kuma.\n[11:2",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.48325878581299586,
+        "text80": "[08:37:39] spk_0: Do we?\n[08:37:39] spk_1: A lot of the lagging documents fallin",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.48492771746451435,
+        "text80": "[10:08:14] spk_1: Um, yeah, I think... Oh, we paid a little bit. It wasn't, wasn",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4917380223586496,
+        "text80": "[11:11 – 11:15] Scaffold Methodology & Crane Restrictions (progress)\nParticipant",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": true,
+        "distance": 0.5623901412021914,
+        "text80": "[10:06 – 10:16] Crane CAA and Vehicle Access Safety (safety)\nCAA rejected daytim",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4352303561156341,
+        "text80": "[11:22:17] spk_1: Kuma makes, um... Yes, Kuma.\n[11:22:19] spk_0: Oh, Kuma.\n[11:2",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.48325878581299586,
+        "text80": "[08:37:39] spk_0: Do we?\n[08:37:39] spk_1: A lot of the lagging documents fallin",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.48492771746451435,
+        "text80": "[10:08:14] spk_1: Um, yeah, I think... Oh, we paid a little bit. It wasn't, wasn",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4917380223586496,
+        "text80": "[11:11 – 11:15] Scaffold Methodology & Crane Restrictions (progress)\nParticipant",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.49808362160617825,
+        "text80": "[10:09:46] spk_1: Yeah.\n[10:09:47] spk_0: Early on Saturday.\n[10:09:48] spk_1: E",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": null,
+      "k5_search_rows": 7,
+      "k5_keyword_rows": 2
+     },
+     "keyword_rows_k30": 45,
+     "best_distance": 0.4352303561156341,
+     "embed_ms": 1737.3941000259947,
+     "sql_ms": 1438.199900003383
+    },
+    {
+     "id": "v1-21",
+     "lang": "en",
+     "expect": "answerable",
+     "category": "commercial",
+     "style": "typo,no-punctuation,vague",
+     "raw": 1,
+     "systems": {
+      "prod": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 50
+      },
+      "link-rollup": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 48
+      },
+      "prod-no-admit": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 50
+      },
+      "vector-only@5": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 50
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 32
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 44
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 2422.053299989784,
+      "rerank@50": 2907.9448000120465
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 58,
+      "rerank@50": 90
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.36010485887527466,
+        "text80": "[08:48:22] spk_0: ... that's the last thing pretty much on your plate. You know ",
+        "evidence": true
+       },
+       {
+        "chunk_type": "session_digest",
+        "lexical_hit": false,
+        "distance": 0.47494086473827657,
+        "text80": "Session 14:19–14:26\n- [14:24 – 14:24] Level Three Slab Inspection\n- [14:19 – 14:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.48282289505004883,
+        "text80": "[09:58 – 10:48] Waipuna Commercial Loss and Programme Risk (progress)\nGovernance",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4901532226892238,
+        "text80": "[14:00 – 16:02] Rebates and flashing allocation workshop (quality)\nParticipants:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.5018967987237444,
+        "text80": "[13:20:06] spk_0: Download his WhatsApp, yeah\n[13:20:07] spk_1: Correct\n[13:20:0",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.36010485887527466,
+        "text80": "[08:48:22] spk_0: ... that's the last thing pretty much on your plate. You know ",
+        "evidence": true
+       },
+       {
+        "chunk_type": "session_digest",
+        "lexical_hit": false,
+        "distance": 0.47494086473827657,
+        "text80": "Session 14:19–14:26\n- [14:24 – 14:24] Level Three Slab Inspection\n- [14:19 – 14:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.48282289505004883,
+        "text80": "[09:58 – 10:48] Waipuna Commercial Loss and Programme Risk (progress)\nGovernance",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4901532226892238,
+        "text80": "[14:00 – 16:02] Rebates and flashing allocation workshop (quality)\nParticipants:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.492670207778823,
+        "text80": "[15:05:57] spk_1: No, they're our ones as well.\n[15:05:58] spk_0: Yeah, they're ",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 1,
+      "k5_search_rows": 9,
+      "k5_keyword_rows": 4
+     },
+     "keyword_rows_k30": 53,
+     "best_distance": 0.36010485887527466,
+     "embed_ms": 1949.8135999892838,
+     "sql_ms": 3091.735400026664
+    },
+    {
+     "id": "v1-22",
+     "lang": "en",
+     "expect": "answerable",
+     "category": "commercial",
+     "style": "lowercase,run-on,slang",
+     "raw": 1,
+     "systems": {
+      "prod": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 39
+      },
+      "link-rollup": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 36
+      },
+      "prod-no-admit": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 39
+      },
+      "vector-only@5": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 39
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 25
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 32
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 3050.8404999854974,
+      "rerank@50": 2737.089800008107
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 52,
+      "rerank@50": 79
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4154435295395249,
+        "text80": "[11:42:06] spk_0: I'm not losing my TomTom. You connect Ali. Or you connect Dan.",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.45952788236570963,
+        "text80": "[11:34:58] spk_2: Yeah, that's a good dinner.\n[11:35:06] spk_0: Ugh. I'm coming ",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4669681787490845,
+        "text80": "[09:54:05] spk_1: Yeah, yeah. I, I, yeah. I've just gotta find time to do it, so",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.46818172552367376,
+        "text80": "[11:40:25] spk_0: G, what this is? Fuckin' hell. Um, oh, what's up, man? Yeah, i",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.5298309045929248,
+        "text80": "[09:52:04] spk_2: I mean, someone will get to me on a few moments\n[09:52:05] spk",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4154435295395249,
+        "text80": "[11:42:06] spk_0: I'm not losing my TomTom. You connect Ali. Or you connect Dan.",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.45952788236570963,
+        "text80": "[11:34:58] spk_2: Yeah, that's a good dinner.\n[11:35:06] spk_0: Ugh. I'm coming ",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4669681787490845,
+        "text80": "[09:54:05] spk_1: Yeah, yeah. I, I, yeah. I've just gotta find time to do it, so",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.46818172552367376,
+        "text80": "[11:40:25] spk_0: G, what this is? Fuckin' hell. Um, oh, what's up, man? Yeah, i",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4948212648768343,
+        "text80": "[12:10:53] spk_2: And they are basically all the same.\n[12:10:56] spk_1: Yeah, I",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 1,
+      "k5_search_rows": 7,
+      "k5_keyword_rows": 2
+     },
+     "keyword_rows_k30": 40,
+     "best_distance": 0.4154435295395249,
+     "embed_ms": 2807.207699981518,
+     "sql_ms": 1579.419699992286
+    },
+    {
+     "id": "v1-23",
+     "lang": "zh",
+     "expect": "answerable",
+     "category": "commercial",
+     "style": "chinese,no-punctuation",
+     "raw": 1,
+     "systems": {
+      "prod": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 14
+      },
+      "link-rollup": {
+       "ask": 1,
+       "list": 7,
+       "list_rows": 14
+      },
+      "prod-no-admit": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 14
+      },
+      "vector-only@5": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 14
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 14
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 14
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 3776.6866000019945,
+      "rerank@50": 3397.5365000078455
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 39,
+      "rerank@50": 57
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.39138181312301,
+        "text80": "[12:00:01] spk_0: Hey. You all right? Um, couple things of, can you try chase up",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4752728157151772,
+        "text80": "[14:10:43] spk_1: 嗯 哼 。\n[14:10:43] spk_0: 那 是 CM 的 -\n[14:10:45] spk_1: 大 家 知 道 。",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4790605151373244,
+        "text80": "[11:25:01] spk_0: 听 着 到 ， 但 是 我 跟 ， 我 跟 双 双 说 ， 我 说 ， 就 说 ：“ 双 总 ， 这 不 对 ， 你 看 我",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.49151977947236336,
+        "text80": "[12:08:28] spk_1: ... was run-\n[12:08:28] spk_0: Thanks. Bye\n[12:08:29] spk_1: .",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": true,
+        "distance": 0.6060624592229773,
+        "text80": "[12:52 – 12:54] Conversational PS4 Search Demo (progress)\nSpeaker demonstrates c",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.39138181312301,
+        "text80": "[12:00:01] spk_0: Hey. You all right? Um, couple things of, can you try chase up",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4752728157151772,
+        "text80": "[14:10:43] spk_1: 嗯 哼 。\n[14:10:43] spk_0: 那 是 CM 的 -\n[14:10:45] spk_1: 大 家 知 道 。",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4790605151373244,
+        "text80": "[11:25:01] spk_0: 听 着 到 ， 但 是 我 跟 ， 我 跟 双 双 说 ， 我 说 ， 就 说 ：“ 双 总 ， 这 不 对 ， 你 看 我",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.49151977947236336,
+        "text80": "[12:08:28] spk_1: ... was run-\n[12:08:28] spk_0: Thanks. Bye\n[12:08:29] spk_1: .",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4973026517268835,
+        "text80": "[11:22:07] spk_0: ， OK， 这 个 报 价 什 么 再 - 再 说 ， 就 是 pricing。\n[11:22:17] spk_1: 知 道",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 1,
+      "k5_search_rows": 9,
+      "k5_keyword_rows": 4
+     },
+     "keyword_rows_k30": 6,
+     "best_distance": 0.39138181312301,
+     "embed_ms": 1775.0598000129685,
+     "sql_ms": 788.9215000031982
+    },
+    {
+     "id": "v1-24",
+     "lang": "en",
+     "expect": "answerable",
+     "category": "commercial",
+     "style": "typo,dropped-words",
+     "raw": 2,
+     "systems": {
+      "prod": {
+       "ask": 2,
+       "list": null,
+       "list_rows": 34
+      },
+      "link-rollup": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 28
+      },
+      "prod-no-admit": {
+       "ask": 2,
+       "list": null,
+       "list_rows": 34
+      },
+      "vector-only@5": {
+       "ask": 2,
+       "list": null,
+       "list_rows": 34
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 20
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 29
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 2515.42400001199,
+      "rerank@50": 5804.015400004573
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 56,
+      "rerank@50": 85
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.40128178011908844,
+        "text80": "[09:02 – 09:06] Bond extension and PC pressure (progress)\nParticipants: Ben, Jam",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.48198230403502385,
+        "text80": "[12:00:01] spk_0: Hey. You all right? Um, couple things of, can you try chase up",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5071016113611422,
+        "text80": "[09:04:01] spk_0: The problem is, is that with this job is, is that all of them ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5081207615316994,
+        "text80": "[16:36:41] spk_1: It's all right. It's g- The gate's locked though.\n[16:36:44] s",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.6367900318127901,
+        "text80": "[13:39:34] spk_1: ... my wife's shopping list and stuff and everything. 'Cause I",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.40128178011908844,
+        "text80": "[09:02 – 09:06] Bond extension and PC pressure (progress)\nParticipants: Ben, Jam",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.48198230403502385,
+        "text80": "[12:00:01] spk_0: Hey. You all right? Um, couple things of, can you try chase up",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5071016113611422,
+        "text80": "[09:04:01] spk_0: The problem is, is that with this job is, is that all of them ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5081207615316994,
+        "text80": "[16:36:41] spk_1: It's all right. It's g- The gate's locked though.\n[16:36:44] s",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5352511330472788,
+        "text80": "[17:41:07] spk_0: ... you know, Jack's like, \"Bro, we're going Auckland. I got f",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 2,
+      "k5_search_rows": 8,
+      "k5_keyword_rows": 3
+     },
+     "keyword_rows_k30": 46,
+     "best_distance": 0.40128178011908844,
+     "embed_ms": 2203.0214999977034,
+     "sql_ms": 2775.26600001147
+    },
+    {
+     "id": "v1-25",
+     "lang": "en",
+     "expect": "answerable",
+     "category": "commercial",
+     "style": "typo,half-remembered",
+     "raw": 1,
+     "systems": {
+      "prod": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 55
+      },
+      "link-rollup": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 44
+      },
+      "prod-no-admit": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 55
+      },
+      "vector-only@5": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 55
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 29
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 43
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 3277.1500000089873,
+      "rerank@50": 3114.7316000133287
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 62,
+      "rerank@50": 96
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.45687246322631836,
+        "text80": "[12:08:28] spk_1: ... was run-\n[12:08:28] spk_0: Thanks. Bye\n[12:08:29] spk_1: .",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5776793519831795,
+        "text80": "[17:14:04] spk_0: Sorry, fifty if you're doing a day trip. So if you, if you... ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5780174480687044,
+        "text80": "[10:46:39] spk_2: It becomes five thousand cards. It just keep coming backwards ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5856045761115172,
+        "text80": "[07:08:19] spk_0: Yeah, well, honestly, we priced off the back of a fucking ciga",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.6747398778641145,
+        "text80": "[10:22:29] spk_1: You can ask them for whatever you like.\n[10:22:31] spk_0: So w",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.45687246322631836,
+        "text80": "[12:08:28] spk_1: ... was run-\n[12:08:28] spk_0: Thanks. Bye\n[12:08:29] spk_1: .",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5776793519831795,
+        "text80": "[17:14:04] spk_0: Sorry, fifty if you're doing a day trip. So if you, if you... ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5780174480687044,
+        "text80": "[10:46:39] spk_2: It becomes five thousand cards. It just keep coming backwards ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5856045761115172,
+        "text80": "[07:08:19] spk_0: Yeah, well, honestly, we priced off the back of a fucking ciga",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5864627361297607,
+        "text80": "[17:12:05] spk_0: Well, like I said, my wife is very like clear cut. He's, he's ",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 1,
+      "k5_search_rows": 10,
+      "k5_keyword_rows": 5
+     },
+     "keyword_rows_k30": 58,
+     "best_distance": 0.45687246322631836,
+     "embed_ms": 1763.0278000142425,
+     "sql_ms": 1301.2321999704
+    },
+    {
+     "id": "v1-26",
+     "lang": "en",
+     "expect": "answerable",
+     "category": "subcontractor",
+     "style": "typo,no-punctuation,slang",
+     "raw": 2,
+     "systems": {
+      "prod": {
+       "ask": 2,
+       "list": 29,
+       "list_rows": 29
+      },
+      "link-rollup": {
+       "ask": 2,
+       "list": 32,
+       "list_rows": 32
+      },
+      "prod-no-admit": {
+       "ask": 2,
+       "list": 29,
+       "list_rows": 29
+      },
+      "vector-only@5": {
+       "ask": 2,
+       "list": 29,
+       "list_rows": 29
+      },
+      "rerank@32": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 16
+      },
+      "rerank@50": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 25
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 3757.9412999912165,
+      "rerank@50": 5036.786499986192
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 63,
+      "rerank@50": 96
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4724830952266559,
+        "text80": "[11:06 – 11:07] Scaffolders Contract Status (progress)\nParticipants: Jesse, Nate",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5372348885904168,
+        "text80": "[11:06:07] spk_2: Oh, yeah.\n[11:06:07] spk_1: We're gonna try, trying to avoid g",
+        "evidence": true
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5550389190052956,
+        "text80": "[12:11 – 12:13] Next week schedule and hiring (progress)\nParticipants: Ben\n梳理了下周",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5637590701149231,
+        "text80": "[11:25:01] spk_0: 听 着 到 ， 但 是 我 跟 ， 我 跟 双 双 说 ， 我 说 ， 就 说 ：“ 双 总 ， 这 不 对 ， 你 看 我",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.6424947870521145,
+        "text80": "[08:22:00] spk_0: This is just full capacity.\n[08:22:01] spk_0: I've just full c",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4724830952266559,
+        "text80": "[11:06 – 11:07] Scaffolders Contract Status (progress)\nParticipants: Jesse, Nate",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5372348885904168,
+        "text80": "[11:06:07] spk_2: Oh, yeah.\n[11:06:07] spk_1: We're gonna try, trying to avoid g",
+        "evidence": true
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5550389190052956,
+        "text80": "[12:11 – 12:13] Next week schedule and hiring (progress)\nParticipants: Ben\n梳理了下周",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5637590701149231,
+        "text80": "[11:25:01] spk_0: 听 着 到 ， 但 是 我 跟 ， 我 跟 双 双 说 ， 我 说 ， 就 说 ：“ 双 总 ， 这 不 对 ， 你 看 我",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5749822519693153,
+        "text80": "[20:41:37] spk_1: 这 是 在 做 一 个 测 试 。 哦 ， 我 的 凭 证 过 期 了 ，AWS 凭 证 过 期 了 。5 分 钟 后 我 ",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 2,
+      "k5_search_rows": 10,
+      "k5_keyword_rows": 5
+     },
+     "keyword_rows_k30": 59,
+     "best_distance": 0.4724830952266559,
+     "embed_ms": 1716.9097999867518,
+     "sql_ms": 1442.750399990473
+    },
+    {
+     "id": "v1-27",
+     "lang": "en",
+     "expect": "answerable",
+     "category": "subcontractor",
+     "style": "wrong-name,run-on,slang",
+     "raw": 1,
+     "systems": {
+      "prod": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 37
+      },
+      "link-rollup": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 29
+      },
+      "prod-no-admit": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 37
+      },
+      "vector-only@5": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 37
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 23
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 30
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 2484.3234000145458,
+      "rerank@50": 3904.31310000713
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 60,
+      "rerank@50": 91
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5181098425951542,
+        "text80": "[11:25:26] spk_0: Like, um-\n[11:25:27] spk_1: Should be clearly laid out\n[11:25:",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.6189871132373701,
+        "text80": "[16:32:55] spk_1: No, he didn't say shit about Tom.\n[16:32:57] spk_0: I was just",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.6369457812438533,
+        "text80": "[11:45:11] spk_0: 厘 米 距 离 。 今 天 要 去 Mitre 10 买 木 头 和 螺 丝 。 明 天 早 上 8 点 在 工 地 碰 面",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.6377602867316681,
+        "text80": "[11:32:05] spk_2: The next three years or whatever we're all gonna be working fo",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.7289949978595955,
+        "text80": "[17:17:08] spk_0: It just gets so-\n[17:17:09] spk_1: But yeah, I think that's to",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5181098425951542,
+        "text80": "[11:25:26] spk_0: Like, um-\n[11:25:27] spk_1: Should be clearly laid out\n[11:25:",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.6189871132373701,
+        "text80": "[16:32:55] spk_1: No, he didn't say shit about Tom.\n[16:32:57] spk_0: I was just",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.6369457812438533,
+        "text80": "[11:45:11] spk_0: 厘 米 距 离 。 今 天 要 去 Mitre 10 买 木 头 和 螺 丝 。 明 天 早 上 8 点 在 工 地 碰 面",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.6377602867316681,
+        "text80": "[11:32:05] spk_2: The next three years or whatever we're all gonna be working fo",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.6418040821785803,
+        "text80": "[12:18:25] spk_1: It's just James's\n[12:18:25] spk_0: ... and this is safety rel",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 1,
+      "k5_search_rows": 10,
+      "k5_keyword_rows": 5
+     },
+     "keyword_rows_k30": 53,
+     "best_distance": 0.5181098425951542,
+     "embed_ms": 1908.0648999952246,
+     "sql_ms": 1898.3024000190198
+    },
+    {
+     "id": "v1-28",
+     "lang": "en",
+     "expect": "answerable",
+     "category": "subcontractor",
+     "style": "lowercase,vague,dropped-words",
+     "raw": 1,
+     "systems": {
+      "prod": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 31
+      },
+      "link-rollup": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 30
+      },
+      "prod-no-admit": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 31
+      },
+      "vector-only@5": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 31
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 22
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 26
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 2412.4630999867804,
+      "rerank@50": 3230.3667000087444
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 59,
+      "rerank@50": 89
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5801985216022412,
+        "text80": "[16:30:20] spk_0: So who-\n[16:30:22] spk_1: That's why I went out\n[16:30:23] spk",
+        "evidence": true
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5935290567313385,
+        "text80": "[16:54 – 16:55] Concrete pour schedule (progress)\nThe user queries the AI assist",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.6037552592900234,
+        "text80": "[16:36:41] spk_1: It's all right. It's g- The gate's locked though.\n[16:36:44] s",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.6079530897126479,
+        "text80": "[11:25:26] spk_0: Like, um-\n[11:25:27] spk_1: Should be clearly laid out\n[11:25:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.7061518360104848,
+        "text80": "[09:06:14] spk_0: concrete pours next week. Uh, those TAs are in place, and Jess",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5801985216022412,
+        "text80": "[16:30:20] spk_0: So who-\n[16:30:22] spk_1: That's why I went out\n[16:30:23] spk",
+        "evidence": true
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5935290567313385,
+        "text80": "[16:54 – 16:55] Concrete pour schedule (progress)\nThe user queries the AI assist",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.6037552592900234,
+        "text80": "[16:36:41] spk_1: It's all right. It's g- The gate's locked though.\n[16:36:44] s",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.6079530897126479,
+        "text80": "[11:25:26] spk_0: Like, um-\n[11:25:27] spk_1: Should be clearly laid out\n[11:25:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.6085488316849207,
+        "text80": "[16:53:38] spk_0: 这 是 麦 克 风 测 试 ， 忽 略 。 实 验 二 开 始 。 一 二 三 四 五 六 七 八 九 十 ， 一 二 三 ",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 1,
+      "k5_search_rows": 8,
+      "k5_keyword_rows": 3
+     },
+     "keyword_rows_k30": 44,
+     "best_distance": 0.5801985216022412,
+     "embed_ms": 3341.431500011822,
+     "sql_ms": 1354.9856000463478
+    },
+    {
+     "id": "v1-29",
+     "lang": "mixed",
+     "expect": "answerable",
+     "category": "subcontractor",
+     "style": "mixed,wrong-name",
+     "raw": 4,
+     "systems": {
+      "prod": {
+       "ask": 4,
+       "list": null,
+       "list_rows": 32
+      },
+      "link-rollup": {
+       "ask": 4,
+       "list": 1,
+       "list_rows": 30
+      },
+      "prod-no-admit": {
+       "ask": 4,
+       "list": null,
+       "list_rows": 32
+      },
+      "vector-only@5": {
+       "ask": 4,
+       "list": null,
+       "list_rows": 32
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 22
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 30
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 3671.370600000955,
+      "rerank@50": 1942.5689000054263
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 56,
+      "rerank@50": 82
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.528001219034195,
+        "text80": "[12:05:23] spk_1: 我 们 是 不 是 去 Bunnings 把 木 头 先 买 了 ？ 哦 对 ， 去 Mitre 10， 对 ， 我 们 买",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5302168884938026,
+        "text80": "[13:37:06] spk_0: Going to ground floor. Access the ground floor. And finished.",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5304404442714775,
+        "text80": "[17:29:37] spk_1: Yeah, the Blue Rover.\n[17:29:37] spk_0: Like two weeks or so.\n",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5352142037642762,
+        "text80": "[17:31:41] spk_1: Yeah. Got two. Start at 11, have to have open by 4.\n[17:31:48]",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.6319128117665251,
+        "text80": "[11:28:58] spk_2: 700K was just obviously ten last year but it actually did well",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.528001219034195,
+        "text80": "[12:05:23] spk_1: 我 们 是 不 是 去 Bunnings 把 木 头 先 买 了 ？ 哦 对 ， 去 Mitre 10， 对 ， 我 们 买",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5302168884938026,
+        "text80": "[13:37:06] spk_0: Going to ground floor. Access the ground floor. And finished.",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5304404442714775,
+        "text80": "[17:29:37] spk_1: Yeah, the Blue Rover.\n[17:29:37] spk_0: Like two weeks or so.\n",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5352142037642762,
+        "text80": "[17:31:41] spk_1: Yeah. Got two. Start at 11, have to have open by 4.\n[17:31:48]",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5434651238758896,
+        "text80": "[10:06:36] spk_0: Copy and pasting, uh, block.\n[10:06:38] spk_1: And like simple",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 4,
+      "k5_search_rows": 7,
+      "k5_keyword_rows": 2
+     },
+     "keyword_rows_k30": 32,
+     "best_distance": 0.528001219034195,
+     "embed_ms": 2100.4750999854878,
+     "sql_ms": 885.3548000333831
+    },
+    {
+     "id": "v1-30",
+     "lang": "en",
+     "expect": "answerable",
+     "category": "subcontractor",
+     "style": "typo,no-punctuation",
+     "raw": 9,
+     "systems": {
+      "prod": {
+       "ask": null,
+       "list": null,
+       "list_rows": 43
+      },
+      "link-rollup": {
+       "ask": null,
+       "list": 6,
+       "list_rows": 37
+      },
+      "prod-no-admit": {
+       "ask": null,
+       "list": null,
+       "list_rows": 43
+      },
+      "vector-only@5": {
+       "ask": null,
+       "list": null,
+       "list_rows": 43
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 32
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 40
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 4810.738600004697,
+      "rerank@50": 4996.989000006579
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 61,
+      "rerank@50": 95
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4543576240539551,
+        "text80": "[16:28:35] spk_1: Well, we're gonna do it. Yeah. I think Chris is gonna take-- g",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4567726960873012,
+        "text80": "[13:12:10] spk_0: He hands over the substrates\n[13:12:11] spk_1: Period.\n[13:12:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.48960513000426764,
+        "text80": "[13:57:56] spk_2: Jimmy Pribble, and he lived in Queenstown for years, so he was",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.497171297416503,
+        "text80": "[12:55:12] spk_1: Yeah.\n[12:55:13] spk_0: Like-\n[12:55:13] spk_1: That's why I t",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.5821092128753662,
+        "text80": "[16:30:20] spk_0: So who-\n[16:30:22] spk_1: That's why I went out\n[16:30:23] spk",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4543576240539551,
+        "text80": "[16:28:35] spk_1: Well, we're gonna do it. Yeah. I think Chris is gonna take-- g",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4567726960873012,
+        "text80": "[13:12:10] spk_0: He hands over the substrates\n[13:12:11] spk_1: Period.\n[13:12:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.48960513000426764,
+        "text80": "[13:57:56] spk_2: Jimmy Pribble, and he lived in Queenstown for years, so he was",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.497171297416503,
+        "text80": "[12:55:12] spk_1: Yeah.\n[12:55:13] spk_0: Like-\n[12:55:13] spk_1: That's why I t",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5187397908413277,
+        "text80": "[20:41:37] spk_1: 这 是 在 做 一 个 测 试 。 哦 ， 我 的 凭 证 过 期 了 ，AWS 凭 证 过 期 了 。5 分 钟 后 我 ",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 9,
+      "k5_search_rows": 9,
+      "k5_keyword_rows": 4
+     },
+     "keyword_rows_k30": 58,
+     "best_distance": 0.4543576240539551,
+     "embed_ms": 1951.9908999791369,
+     "sql_ms": 2157.270100025926
+    },
+    {
+     "id": "v1-31",
+     "lang": "en",
+     "expect": "answerable",
+     "category": "quality",
+     "style": "slang,typo",
+     "raw": 61,
+     "systems": {
+      "prod": {
+       "ask": null,
+       "list": null,
+       "list_rows": 31
+      },
+      "link-rollup": {
+       "ask": null,
+       "list": 9,
+       "list_rows": 28
+      },
+      "prod-no-admit": {
+       "ask": null,
+       "list": null,
+       "list_rows": 31
+      },
+      "vector-only@5": {
+       "ask": null,
+       "list": null,
+       "list_rows": 31
+      },
+      "rerank@32": {
+       "ask": null,
+       "list": null,
+       "list_rows": 25
+      },
+      "rerank@50": {
+       "ask": null,
+       "list": null,
+       "list_rows": 28
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 4459.718700003577,
+      "rerank@50": 2869.7775000182446
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 59,
+      "rerank@50": 87
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5202498603090517,
+        "text80": "[15:05:57] spk_1: No, they're our ones as well.\n[15:05:58] spk_0: Yeah, they're ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5463633076440284,
+        "text80": "[11:18 – 11:19] Reinforcement Installation Check (progress)\nParticipants: Jesse,",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5719642256466351,
+        "text80": "[12:04:07] spk_2: Induction.\n[12:04:12] spk_0: That's the, how they obviously ha",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5767099868348167,
+        "text80": "[08:34:00] spk_0: He's just a bit shy.\n[08:34:04] spk_2: That's what I thought.\n",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.5813743943385598,
+        "text80": "[08:08:51] spk_0: Oh, yeah. And then you can explain this is what happened in th",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5202498603090517,
+        "text80": "[15:05:57] spk_1: No, they're our ones as well.\n[15:05:58] spk_0: Yeah, they're ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5463633076440284,
+        "text80": "[11:18 – 11:19] Reinforcement Installation Check (progress)\nParticipants: Jesse,",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5719642256466351,
+        "text80": "[12:04:07] spk_2: Induction.\n[12:04:12] spk_0: That's the, how they obviously ha",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5767099868348167,
+        "text80": "[08:34:00] spk_0: He's just a bit shy.\n[08:34:04] spk_2: That's what I thought.\n",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.576900153210712,
+        "text80": "[08:49:55] spk_0: Um, I probably next time I'll do one is I thought, I thought i",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 61,
+      "k5_search_rows": 10,
+      "k5_keyword_rows": 5
+     },
+     "keyword_rows_k30": 44,
+     "best_distance": 0.5202498603090517,
+     "embed_ms": 2308.722800022224,
+     "sql_ms": 1169.829300022684
+    },
+    {
+     "id": "v1-32",
+     "lang": "zh",
+     "expect": "answerable",
+     "category": "quality",
+     "style": "chinese,no-punctuation",
+     "raw": 1,
+     "systems": {
+      "prod": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 1
+      },
+      "link-rollup": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 1
+      },
+      "prod-no-admit": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 1
+      },
+      "vector-only@5": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 1
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 1
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 1
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 2154.260500014061,
+      "rerank@50": 3274.4333000155166
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 32,
+      "rerank@50": 50
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.3985492349535672,
+        "text80": "[11:08:12] spk_0: All right. Um, design issues. Um, I think the penetration deta",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.6116621129714177,
+        "text80": "[08:32:44] spk_1: Mm.\n[08:32:44] spk_0: I'm not fucking having it.\n[08:32:45] sp",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.622413002108752,
+        "text80": "[11:07 – 11:11] Design Issues & Shop Drawings (progress)\nParticipants: Jesse, Na",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.623210154580464,
+        "text80": "[11:34:18] spk_1: Yeah.\n[11:34:18] spk_2: This one\n[11:34:18] spk_1: Yeah, yeah.",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.6243499667227308,
+        "text80": "[22:48:04] spk_1: 好 ， 今 天 下 午 3 点 在 B2 做 一 次 例 行 检 查 。The stair enforcement on t",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.3985492349535672,
+        "text80": "[11:08:12] spk_0: All right. Um, design issues. Um, I think the penetration deta",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.6116621129714177,
+        "text80": "[08:32:44] spk_1: Mm.\n[08:32:44] spk_0: I'm not fucking having it.\n[08:32:45] sp",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.622413002108752,
+        "text80": "[11:07 – 11:11] Design Issues & Shop Drawings (progress)\nParticipants: Jesse, Na",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.623210154580464,
+        "text80": "[11:34:18] spk_1: Yeah.\n[11:34:18] spk_2: This one\n[11:34:18] spk_1: Yeah, yeah.",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.6243499667227308,
+        "text80": "[22:48:04] spk_1: 好 ， 今 天 下 午 3 点 在 B2 做 一 次 例 行 检 查 。The stair enforcement on t",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 1,
+      "k5_search_rows": 5,
+      "k5_keyword_rows": 0
+     },
+     "keyword_rows_k30": 0,
+     "best_distance": 0.3985492349535672,
+     "embed_ms": 3834.679599996889,
+     "sql_ms": 694.5200999907684
+    },
+    {
+     "id": "v1-33",
+     "lang": "en",
+     "expect": "answerable",
+     "category": "quality",
+     "style": "typo,dropped-words",
+     "raw": 13,
+     "systems": {
+      "prod": {
+       "ask": null,
+       "list": 52,
+       "list_rows": 53
+      },
+      "link-rollup": {
+       "ask": null,
+       "list": 51,
+       "list_rows": 52
+      },
+      "prod-no-admit": {
+       "ask": null,
+       "list": 52,
+       "list_rows": 53
+      },
+      "vector-only@5": {
+       "ask": null,
+       "list": 52,
+       "list_rows": 53
+      },
+      "rerank@32": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 40
+      },
+      "rerank@50": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 49
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 2047.8152000287082,
+      "rerank@50": 4614.689400012139
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 60,
+      "rerank@50": 94
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4156922798523528,
+        "text80": "[11:15 – 11:17] QA Inspections & Concrete Testing (quality)\nParticipants: Jesse,",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4192772603896505,
+        "text80": "[11:34:18] spk_1: Yeah.\n[11:34:18] spk_2: This one\n[11:34:18] spk_1: Yeah, yeah.",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.45843834180374454,
+        "text80": "[14:33:18] spk_0: sometimes the\n[14:33:19] spk_1: boss takes off work that we do",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.47210136222234345,
+        "text80": "[09:45:59] spk_3: So we're definitely going to start with the M3\n[09:46:01] spk_",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.49888980415110484,
+        "text80": "[09:26:10] spk_2: ... Tuesday with Margaret.\n[09:26:11] spk_1: Yeah.\n[09:26:12] ",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4156922798523528,
+        "text80": "[11:15 – 11:17] QA Inspections & Concrete Testing (quality)\nParticipants: Jesse,",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4192772603896505,
+        "text80": "[11:34:18] spk_1: Yeah.\n[11:34:18] spk_2: This one\n[11:34:18] spk_1: Yeah, yeah.",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.45843834180374454,
+        "text80": "[14:33:18] spk_0: sometimes the\n[14:33:19] spk_1: boss takes off work that we do",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.47210136222234345,
+        "text80": "[09:45:59] spk_3: So we're definitely going to start with the M3\n[09:46:01] spk_",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4935160287003447,
+        "text80": "[10:28 – 10:28] Stud Inspection -- Today (quality)\nThe speaker noted a stud insp",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 13,
+      "k5_search_rows": 9,
+      "k5_keyword_rows": 4
+     },
+     "keyword_rows_k30": 51,
+     "best_distance": 0.4156922798523528,
+     "embed_ms": 1749.053500010632,
+     "sql_ms": 2026.3049000350293
+    },
+    {
+     "id": "v1-34",
+     "lang": "en",
+     "expect": "answerable",
+     "category": "quality",
+     "style": "typo,lowercase",
+     "raw": 2,
+     "systems": {
+      "prod": {
+       "ask": 2,
+       "list": 10,
+       "list_rows": 15
+      },
+      "link-rollup": {
+       "ask": 2,
+       "list": 9,
+       "list_rows": 14
+      },
+      "prod-no-admit": {
+       "ask": 2,
+       "list": 10,
+       "list_rows": 15
+      },
+      "vector-only@5": {
+       "ask": 2,
+       "list": 10,
+       "list_rows": 15
+      },
+      "rerank@32": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 13
+      },
+      "rerank@50": {
+       "ask": 2,
+       "list": 2,
+       "list_rows": 15
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 1854.4607000076212,
+      "rerank@50": 1919.45330001181
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 37,
+      "rerank@50": 55
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.33705127239227295,
+        "text80": "[11:15 – 11:17] QA Inspections & Concrete Testing (quality)\nParticipants: Jesse,",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4929729095665073,
+        "text80": "[11:14:15] spk_0: at the, the meeting minutes on Aconex, it'll just tell you the",
+        "evidence": true
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.513618263057152,
+        "text80": "[16:54 – 16:55] Concrete pour schedule (progress)\nThe user queries the AI assist",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5273439553566,
+        "text80": "[12:11 – 12:11] Concrete pour schedule (progress)\nSpeakers discussed the timing ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": true,
+        "distance": 0.648225507245927,
+        "text80": "[12:08 – 12:10] Microphone Noise Reduction Testing (quality)\nThe speakers conduc",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.33705127239227295,
+        "text80": "[11:15 – 11:17] QA Inspections & Concrete Testing (quality)\nParticipants: Jesse,",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4929729095665073,
+        "text80": "[11:14:15] spk_0: at the, the meeting minutes on Aconex, it'll just tell you the",
+        "evidence": true
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.513618263057152,
+        "text80": "[16:54 – 16:55] Concrete pour schedule (progress)\nThe user queries the AI assist",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5273439553566,
+        "text80": "[12:11 – 12:11] Concrete pour schedule (progress)\nSpeakers discussed the timing ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "session_digest",
+        "lexical_hit": false,
+        "distance": 0.5344343185424805,
+        "text80": "Session 16:53–16:55\n- [16:53 – 16:54] Microphone test\n- [16:54 – 16:55] Concrete",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 2,
+      "k5_search_rows": 8,
+      "k5_keyword_rows": 3
+     },
+     "keyword_rows_k30": 5,
+     "best_distance": 0.33705127239227295,
+     "embed_ms": 1745.806499995524,
+     "sql_ms": 851.427399989916
+    },
+    {
+     "id": "v1-35",
+     "lang": "en",
+     "expect": "answerable",
+     "category": "quality",
+     "style": "run-on,slang,vague",
+     "raw": 10,
+     "systems": {
+      "prod": {
+       "ask": 5,
+       "list": null,
+       "list_rows": 25
+      },
+      "link-rollup": {
+       "ask": 5,
+       "list": 6,
+       "list_rows": 28
+      },
+      "prod-no-admit": {
+       "ask": null,
+       "list": null,
+       "list_rows": 25
+      },
+      "vector-only@5": {
+       "ask": null,
+       "list": null,
+       "list_rows": 25
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 16
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 20
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 3252.7372000040486,
+      "rerank@50": 3248.0717999860644
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 58,
+      "rerank@50": 89
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5340622006543507,
+        "text80": "[09:02 – 09:06] Bond extension and PC pressure (progress)\nParticipants: Ben, Jam",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5569548274901541,
+        "text80": "[07:56 – 08:04] Twizel defects and labour resourcing (progress)\nParticipants: Be",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5604194497687067,
+        "text80": "[17:04 – 17:08] Twizel PC date revision and DLP extension (progress)\nParticipant",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5791339434741829,
+        "text80": "[12:52 – 12:54] Conversational PS4 Search Demo (progress)\nSpeaker demonstrates c",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.6055444227351134,
+        "text80": "[17:20:42] spk_0: No, no.\n[17:20:42] spk_1: Yeah. Fair call. That's all good.\n[1",
+        "evidence": true
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5340622006543507,
+        "text80": "[09:02 – 09:06] Bond extension and PC pressure (progress)\nParticipants: Ben, Jam",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5569548274901541,
+        "text80": "[07:56 – 08:04] Twizel defects and labour resourcing (progress)\nParticipants: Be",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5604194497687067,
+        "text80": "[17:04 – 17:08] Twizel PC date revision and DLP extension (progress)\nParticipant",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5791339434741829,
+        "text80": "[12:52 – 12:54] Conversational PS4 Search Demo (progress)\nSpeaker demonstrates c",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.584378132968394,
+        "text80": "[17:44:15] spk_0: Yeah. Oh, fuck you. We break him in.\n[17:44:16] spk_1: He's go",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 10,
+      "k5_search_rows": 10,
+      "k5_keyword_rows": 5
+     },
+     "keyword_rows_k30": 50,
+     "best_distance": 0.5340622006543507,
+     "embed_ms": 1934.1084999905434,
+     "sql_ms": 1460.3867999685463
+    },
+    {
+     "id": "v1-36",
+     "lang": "en",
+     "expect": "answerable",
+     "category": "programme",
+     "style": "typo,no-punctuation",
+     "raw": null,
+     "systems": {
+      "prod": {
+       "ask": null,
+       "list": null,
+       "list_rows": 33
+      },
+      "link-rollup": {
+       "ask": null,
+       "list": null,
+       "list_rows": 35
+      },
+      "prod-no-admit": {
+       "ask": null,
+       "list": null,
+       "list_rows": 33
+      },
+      "vector-only@5": {
+       "ask": null,
+       "list": null,
+       "list_rows": 33
+      },
+      "rerank@32": {
+       "ask": null,
+       "list": null,
+       "list_rows": 24
+      },
+      "rerank@50": {
+       "ask": null,
+       "list": null,
+       "list_rows": 28
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 2690.3061000048183,
+      "rerank@50": 2612.9849999852013
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 50,
+      "rerank@50": 75
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.40716993595064643,
+        "text80": "[09:28:00] spk_1: Yeah.\n[09:28:00] spk_0: Staying in work.\n[09:28:01] spk_1: Jus",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.41318776293090986,
+        "text80": "[11:07 – 11:11] Design Issues & Shop Drawings (progress)\nParticipants: Jesse, Na",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.42893227496184605,
+        "text80": "[09:13 – 09:18] Programme Dates and Lookahead (progress)\nContract PC confirmed 2",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4445332420984963,
+        "text80": "[14:46:26] spk_0: and whatever, and if they-- I'll send it to them. If they push",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.5629633980767633,
+        "text80": "[10:43:07] spk_0: True\n[10:43:07] spk_1: ... the second write-down again. So tha",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.40716993595064643,
+        "text80": "[09:28:00] spk_1: Yeah.\n[09:28:00] spk_0: Staying in work.\n[09:28:01] spk_1: Jus",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.41318776293090986,
+        "text80": "[11:07 – 11:11] Design Issues & Shop Drawings (progress)\nParticipants: Jesse, Na",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.42893227496184605,
+        "text80": "[09:13 – 09:18] Programme Dates and Lookahead (progress)\nContract PC confirmed 2",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4445332420984963,
+        "text80": "[14:46:26] spk_0: and whatever, and if they-- I'll send it to them. If they push",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4669107634797478,
+        "text80": "[11:12:29] spk_0: Shop drawings.\n[11:12:30] spk_1: Yeah.\n[11:12:30] spk_0: Shop ",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": null,
+      "k5_search_rows": 7,
+      "k5_keyword_rows": 2
+     },
+     "keyword_rows_k30": 34,
+     "best_distance": 0.40716993595064643,
+     "embed_ms": 1703.0585999891628,
+     "sql_ms": 1570.5439999874216
+    },
+    {
+     "id": "v1-37",
+     "lang": "mixed",
+     "expect": "answerable",
+     "category": "programme",
+     "style": "mixed,dropped-words",
+     "raw": 1,
+     "systems": {
+      "prod": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 43
+      },
+      "link-rollup": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 39
+      },
+      "prod-no-admit": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 43
+      },
+      "vector-only@5": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 43
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 32
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 39
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 5262.090799980797,
+      "rerank@50": 4422.931099979905
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 58,
+      "rerank@50": 87
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.3890939222686155,
+        "text80": "[17:46:35] spk_0: See you.\n[17:46:35] spk_1: See you.\n[17:57:22] spk_0: Brother,",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4656705933718128,
+        "text80": "[18:10:24] spk_0: You, you're, you're, you're more in the game than you ever wer",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4897444540109823,
+        "text80": "[12:13 – 12:14] Site visit and FJS scan (progress)\nParticipants: Ben\n计划周三与杨志前往一个",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.49657992967663944,
+        "text80": "[18:06:09] spk_0: So does he need a hand? Or do we give, do we give him, do we g",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.5345081728110486,
+        "text80": "[09:54:05] spk_1: Yeah, yeah. I, I, yeah. I've just gotta find time to do it, so",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.3890939222686155,
+        "text80": "[17:46:35] spk_0: See you.\n[17:46:35] spk_1: See you.\n[17:57:22] spk_0: Brother,",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4656705933718128,
+        "text80": "[18:10:24] spk_0: You, you're, you're, you're more in the game than you ever wer",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4897444540109823,
+        "text80": "[12:13 – 12:14] Site visit and FJS scan (progress)\nParticipants: Ben\n计划周三与杨志前往一个",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.49657992967663944,
+        "text80": "[18:06:09] spk_0: So does he need a hand? Or do we give, do we give him, do we g",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5189627133563381,
+        "text80": "[17:22:32] spk_0: And, and yeah, well, we did, but when you remove something fro",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 1,
+      "k5_search_rows": 8,
+      "k5_keyword_rows": 3
+     },
+     "keyword_rows_k30": 44,
+     "best_distance": 0.3890939222686155,
+     "embed_ms": 1759.7022000118159,
+     "sql_ms": 1594.7662999678869
+    },
+    {
+     "id": "v1-38",
+     "lang": "en",
+     "expect": "answerable",
+     "category": "programme",
+     "style": "lowercase,no-punctuation",
+     "raw": 1,
+     "systems": {
+      "prod": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 34
+      },
+      "link-rollup": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 24
+      },
+      "prod-no-admit": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 34
+      },
+      "vector-only@5": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 34
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 21
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 30
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 2879.9330000183545,
+      "rerank@50": 8504.659199999878
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 58,
+      "rerank@50": 89
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5715136102115422,
+        "text80": "[18:00:06] spk_0: So he'll just be here for the foreseeable future. Yeah. Mm, in",
+        "evidence": true
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.589149190935619,
+        "text80": "[17:56 – 17:57] Sam Device Handover and Setup (progress)\nParticipants: Ben_UCPK2",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.6078953485738289,
+        "text80": "[11:23:56] spk_2: Right.\n[11:23:56] spk_0: In case, you know, if I can just get ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.6087567780146601,
+        "text80": "[17:57:01] spk_0: he says\n[17:57:06] spk_0: Because it'll be a holiday from tomo",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.6426159186453806,
+        "text80": "[12:12:53] spk_0: Yes, I think it-- and most likely we just-\n[12:12:56] spk_1: J",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5715136102115422,
+        "text80": "[18:00:06] spk_0: So he'll just be here for the foreseeable future. Yeah. Mm, in",
+        "evidence": true
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.589149190935619,
+        "text80": "[17:56 – 17:57] Sam Device Handover and Setup (progress)\nParticipants: Ben_UCPK2",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.6078953485738289,
+        "text80": "[11:23:56] spk_2: Right.\n[11:23:56] spk_0: In case, you know, if I can just get ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.6087567780146601,
+        "text80": "[17:57:01] spk_0: he says\n[17:57:06] spk_0: Because it'll be a holiday from tomo",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.6094784475616231,
+        "text80": "[12:30 – 12:30] FieldSight Onboarding Meetings Schedule (progress)\nThe speaker o",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 1,
+      "k5_search_rows": 9,
+      "k5_keyword_rows": 4
+     },
+     "keyword_rows_k30": 50,
+     "best_distance": 0.5715136102115422,
+     "embed_ms": 1712.6251000154298,
+     "sql_ms": 1067.2802999906708
+    },
+    {
+     "id": "v1-39",
+     "lang": "en",
+     "expect": "answerable",
+     "category": "programme",
+     "style": "typo,run-on",
+     "raw": 1,
+     "systems": {
+      "prod": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 51
+      },
+      "link-rollup": {
+       "ask": 1,
+       "list": 1,
+       "list_rows": 49
+      },
+      "prod-no-admit": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 51
+      },
+      "vector-only@5": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 51
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 34
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 48
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 2071.3504000159446,
+      "rerank@50": 1880.7849999866448
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 63,
+      "rerank@50": 95
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.369597177791511,
+        "text80": "[11:05:36] spk_0: I made it. I put my head under\n[11:14:23] spk_0: Jesse. Good, ",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.44382355939816087,
+        "text80": "[12:13:34] spk_0: Say it again. When did the concrete pour?\n[12:13:43] spk_1: Th",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4452119204275645,
+        "text80": "[12:13 – 12:13] Concrete pour schedule (progress)\nSpeaker 0 asked for clarificat",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.45008494557468226,
+        "text80": "[16:54 – 16:55] Concrete pour schedule (progress)\nThe user queries the AI assist",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.5367659650305481,
+        "text80": "[11:37:53] spk_0: 'Cause he'll still be able to test even if we've got our scaff",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.369597177791511,
+        "text80": "[11:05:36] spk_0: I made it. I put my head under\n[11:14:23] spk_0: Jesse. Good, ",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.44382355939816087,
+        "text80": "[12:13:34] spk_0: Say it again. When did the concrete pour?\n[12:13:43] spk_1: Th",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4452119204275645,
+        "text80": "[12:13 – 12:13] Concrete pour schedule (progress)\nSpeaker 0 asked for clarificat",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.45008494557468226,
+        "text80": "[16:54 – 16:55] Concrete pour schedule (progress)\nThe user queries the AI assist",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.46388332438121194,
+        "text80": "[11:29:01] spk_1: As far as watching that site.\n[11:29:02] spk_2: Yeah. Just hav",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 1,
+      "k5_search_rows": 10,
+      "k5_keyword_rows": 5
+     },
+     "keyword_rows_k30": 55,
+     "best_distance": 0.369597177791511,
+     "embed_ms": 3985.2409999875817,
+     "sql_ms": 2371.5909000020474
+    },
+    {
+     "id": "v1-40",
+     "lang": "en",
+     "expect": "answerable",
+     "category": "programme",
+     "style": "vague,slang,no-punctuation",
+     "raw": 1,
+     "systems": {
+      "prod": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 32
+      },
+      "link-rollup": {
+       "ask": 1,
+       "list": 29,
+       "list_rows": 30
+      },
+      "prod-no-admit": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 32
+      },
+      "vector-only@5": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 32
+      },
+      "rerank@32": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 21
+      },
+      "rerank@50": {
+       "ask": 1,
+       "list": null,
+       "list_rows": 29
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 3243.4452999732457,
+      "rerank@50": 3659.577000013087
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 57,
+      "rerank@50": 87
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.45314274076054284,
+        "text80": "[16:30:20] spk_0: So who-\n[16:30:22] spk_1: That's why I went out\n[16:30:23] spk",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5148600295603178,
+        "text80": "[12:04:39] spk_1: Yeah, so he's, um, here.\n[12:04:41] spk_0: Oh, no.\n[12:04:42] ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5279204762218955,
+        "text80": "[07:40:46] spk_0: Hey, um, we were looking at reaches. You gonna reach all the n",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5402977877588893,
+        "text80": "[13:12:10] spk_0: He hands over the substrates\n[13:12:11] spk_1: Period.\n[13:12:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.5739704238229164,
+        "text80": "[16:28:35] spk_1: Well, we're gonna do it. Yeah. I think Chris is gonna take-- g",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.45314274076054284,
+        "text80": "[16:30:20] spk_0: So who-\n[16:30:22] spk_1: That's why I went out\n[16:30:23] spk",
+        "evidence": true
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5148600295603178,
+        "text80": "[12:04:39] spk_1: Yeah, so he's, um, here.\n[12:04:41] spk_0: Oh, no.\n[12:04:42] ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5279204762218955,
+        "text80": "[07:40:46] spk_0: Hey, um, we were looking at reaches. You gonna reach all the n",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5402977877588893,
+        "text80": "[13:12:10] spk_0: He hands over the substrates\n[13:12:11] spk_1: Period.\n[13:12:",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5598068690760416,
+        "text80": "[10:13:11] spk_1: Panos reloading successfully. Enter group South Island\n[10:13:",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": 1,
+      "k5_search_rows": 9,
+      "k5_keyword_rows": 4
+     },
+     "keyword_rows_k30": 44,
+     "best_distance": 0.45314274076054284,
+     "embed_ms": 1805.173200002173,
+     "sql_ms": 1688.5139999794774
+    },
+    {
+     "id": "v1-41",
+     "lang": "en",
+     "expect": "unanswerable",
+     "category": "control",
+     "style": "typo,no-punctuation",
+     "raw": null,
+     "systems": {
+      "prod": {
+       "ask": null,
+       "list": null,
+       "list_rows": 42
+      },
+      "link-rollup": {
+       "ask": null,
+       "list": null,
+       "list_rows": 35
+      },
+      "prod-no-admit": {
+       "ask": null,
+       "list": null,
+       "list_rows": 42
+      },
+      "vector-only@5": {
+       "ask": null,
+       "list": null,
+       "list_rows": 42
+      },
+      "rerank@32": {
+       "ask": null,
+       "list": null,
+       "list_rows": 22
+      },
+      "rerank@50": {
+       "ask": null,
+       "list": null,
+       "list_rows": 34
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 2974.330299999565,
+      "rerank@50": 3638.0531000031624
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 54,
+      "rerank@50": 86
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5236065699819658,
+        "text80": "[10:28 – 10:28] Stud Inspection -- Today (quality)\nThe speaker noted a stud insp",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5294671935160565,
+        "text80": "[10:28:29] spk_0: Have a stud inspection today. Scrunched ball. Now going to the",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5353429082649177,
+        "text80": "[14:21 – 14:22] North Face Scaffolding Safety (safety)\nParticipants: Ben\nA loose",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5689506741420035,
+        "text80": "[13:37 \u000e2\b13:37] Car Park Site Inspection (progress)\nSpeaker announced the start",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": true,
+        "distance": 0.5938719445948549,
+        "text80": "[16:52 – 16:54] Panel Delivery and Crane Lift (progress)\nParticipants: Leo, Joe\n",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5236065699819658,
+        "text80": "[10:28 – 10:28] Stud Inspection -- Today (quality)\nThe speaker noted a stud insp",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5294671935160565,
+        "text80": "[10:28:29] spk_0: Have a stud inspection today. Scrunched ball. Now going to the",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5353429082649177,
+        "text80": "[14:21 – 14:22] North Face Scaffolding Safety (safety)\nParticipants: Ben\nA loose",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5689506741420035,
+        "text80": "[13:37 \u000e2\b13:37] Car Park Site Inspection (progress)\nSpeaker announced the start",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5707459407600131,
+        "text80": "[16:54 – 16:54] Safety - Walking Under Suspended Load (safety)\nParticipants: Leo",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": null,
+      "k5_search_rows": 10,
+      "k5_keyword_rows": 5
+     },
+     "keyword_rows_k30": 47,
+     "best_distance": 0.5236065699819658,
+     "embed_ms": 2328.1644999806304,
+     "sql_ms": 1010.1603000075556
+    },
+    {
+     "id": "v1-42",
+     "lang": "en",
+     "expect": "unanswerable",
+     "category": "control",
+     "style": "no-capitals,run-on",
+     "raw": null,
+     "systems": {
+      "prod": {
+       "ask": null,
+       "list": null,
+       "list_rows": 30
+      },
+      "link-rollup": {
+       "ask": null,
+       "list": null,
+       "list_rows": 28
+      },
+      "prod-no-admit": {
+       "ask": null,
+       "list": null,
+       "list_rows": 30
+      },
+      "vector-only@5": {
+       "ask": null,
+       "list": null,
+       "list_rows": 30
+      },
+      "rerank@32": {
+       "ask": null,
+       "list": null,
+       "list_rows": 15
+      },
+      "rerank@50": {
+       "ask": null,
+       "list": null,
+       "list_rows": 25
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 5970.953200012445,
+      "rerank@50": 2491.6799000056926
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 55,
+      "rerank@50": 87
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.47497907430058184,
+        "text80": "[15:08:01] spk_0: You lucky bastard.\n[15:08:04] spk_1: Can't figure out how to w",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5218478713216901,
+        "text80": "[09:26:10] spk_2: ... Tuesday with Margaret.\n[09:26:11] spk_1: Yeah.\n[09:26:12] ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5428733416980493,
+        "text80": "[09:28:45] spk_1: Yeah.\n[09:28:45] spk_0: We hit windows early, and then hopeful",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5583492885052278,
+        "text80": "[09:08:01] spk_2: Anyone heard her?\n[09:08:02] spk_0: Well, nothing. I just don'",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.5953123157844138,
+        "text80": "[13:15:20] spk_1: Mate, I've done plenty of schools\n[13:15:21] spk_0: ... the Mi",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.47497907430058184,
+        "text80": "[15:08:01] spk_0: You lucky bastard.\n[15:08:04] spk_1: Can't figure out how to w",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5218478713216901,
+        "text80": "[09:26:10] spk_2: ... Tuesday with Margaret.\n[09:26:11] spk_1: Yeah.\n[09:26:12] ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5428733416980493,
+        "text80": "[09:28:45] spk_1: Yeah.\n[09:28:45] spk_0: We hit windows early, and then hopeful",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5583492885052278,
+        "text80": "[09:08:01] spk_2: Anyone heard her?\n[09:08:02] spk_0: Well, nothing. I just don'",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.560657981673358,
+        "text80": "[11:27:05] spk_0: Um, the block truck's in our access way at the moment-\n[11:27:",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": null,
+      "k5_search_rows": 8,
+      "k5_keyword_rows": 3
+     },
+     "keyword_rows_k30": 43,
+     "best_distance": 0.47497907430058184,
+     "embed_ms": 3941.9453000009526,
+     "sql_ms": 1930.2528999687638
+    },
+    {
+     "id": "v1-43",
+     "lang": "en",
+     "expect": "unanswerable",
+     "category": "control",
+     "style": "typo,no-punctuation",
+     "raw": null,
+     "systems": {
+      "prod": {
+       "ask": null,
+       "list": null,
+       "list_rows": 23
+      },
+      "link-rollup": {
+       "ask": null,
+       "list": null,
+       "list_rows": 25
+      },
+      "prod-no-admit": {
+       "ask": null,
+       "list": null,
+       "list_rows": 23
+      },
+      "vector-only@5": {
+       "ask": null,
+       "list": null,
+       "list_rows": 23
+      },
+      "rerank@32": {
+       "ask": null,
+       "list": null,
+       "list_rows": 13
+      },
+      "rerank@50": {
+       "ask": null,
+       "list": null,
+       "list_rows": 24
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 14270.536700001685,
+      "rerank@50": 3761.7175000195857
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 54,
+      "rerank@50": 86
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4396181774594413,
+        "text80": "[10:52:09] spk_2: Fire suits and speaker. Um, SS 15.3 fire separation, fire door",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5090824078419695,
+        "text80": "[11:04:08] spk_1: Yeah, yeah.\n[11:04:08] spk_0: They just-\n[11:04:09] spk_1: Yea",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5148623296536394,
+        "text80": "[11:02 – 11:04] Safety Compliance & Documentation (safety)\nParticipants: Jesse, ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5365436055336159,
+        "text80": "[10:50:41] spk_0: Yeah. Well, it's just SIO2, isn't it?\n[10:50:42] spk_1: Exactl",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.6721640033819671,
+        "text80": "[08:34:19] spk_0: The clinker was like-\n[08:34:21] spk_1: Oh, yeah.\n[08:34:22] s",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4396181774594413,
+        "text80": "[10:52:09] spk_2: Fire suits and speaker. Um, SS 15.3 fire separation, fire door",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5090824078419695,
+        "text80": "[11:04:08] spk_1: Yeah, yeah.\n[11:04:08] spk_0: They just-\n[11:04:09] spk_1: Yea",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5148623296536394,
+        "text80": "[11:02 – 11:04] Safety Compliance & Documentation (safety)\nParticipants: Jesse, ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5365436055336159,
+        "text80": "[10:50:41] spk_0: Yeah. Well, it's just SIO2, isn't it?\n[10:50:42] spk_1: Exactl",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5604006946086852,
+        "text80": "[07:02 – 07:12] Morning commercial and PCG issues (progress)\nParticipants: Ben, ",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": null,
+      "k5_search_rows": 8,
+      "k5_keyword_rows": 3
+     },
+     "keyword_rows_k30": 35,
+     "best_distance": 0.4396181774594413,
+     "embed_ms": 2826.883000001544,
+     "sql_ms": 911.396599985892
+    },
+    {
+     "id": "v1-44",
+     "lang": "en",
+     "expect": "unanswerable",
+     "category": "control",
+     "style": "typo,no-punctuation",
+     "raw": null,
+     "systems": {
+      "prod": {
+       "ask": null,
+       "list": null,
+       "list_rows": 16
+      },
+      "link-rollup": {
+       "ask": null,
+       "list": null,
+       "list_rows": 17
+      },
+      "prod-no-admit": {
+       "ask": null,
+       "list": null,
+       "list_rows": 16
+      },
+      "vector-only@5": {
+       "ask": null,
+       "list": null,
+       "list_rows": 16
+      },
+      "rerank@32": {
+       "ask": null,
+       "list": null,
+       "list_rows": 19
+      },
+      "rerank@50": {
+       "ask": null,
+       "list": null,
+       "list_rows": 16
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 2614.2977999988943,
+      "rerank@50": 4845.284599985462
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 55,
+      "rerank@50": 70
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.521806058668368,
+        "text80": "[12:08 – 12:10] Microphone Noise Reduction Testing (quality)\nThe speakers conduc",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5277509705871847,
+        "text80": "[12:08:04] spk_1: 我 要 录 一 段 关 于 降 噪 能 力 测 试 ， 主 要 是 用 棉 套 把 麦 克 风 区 域 给 堵 住 。 我 ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5416552325117001,
+        "text80": "[11:40:19] spk_1: Cooked to the same thing to me anyway. They're gonna try to ge",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5454947569081614,
+        "text80": "[17:16:21] spk_0: My agent was like, \"Oh, Nick, Nick gets eighty dollars a day f",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.6487012118875252,
+        "text80": "[12:59:26] spk_2: We all love this tune.\n[12:59:28] spk_0: Well, I stretched out",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.521806058668368,
+        "text80": "[12:08 – 12:10] Microphone Noise Reduction Testing (quality)\nThe speakers conduc",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5277509705871847,
+        "text80": "[12:08:04] spk_1: 我 要 录 一 段 关 于 降 噪 能 力 测 试 ， 主 要 是 用 棉 套 把 麦 克 风 区 域 给 堵 住 。 我 ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5416552325117001,
+        "text80": "[11:40:19] spk_1: Cooked to the same thing to me anyway. They're gonna try to ge",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5454947569081614,
+        "text80": "[17:16:21] spk_0: My agent was like, \"Oh, Nick, Nick gets eighty dollars a day f",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.5528694061714756,
+        "text80": "[11:31:03] spk_0: Oh, nice. Yeah.\n[11:31:03] spk_1: It's pretty warm, you know, ",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": null,
+      "k5_search_rows": 9,
+      "k5_keyword_rows": 4
+     },
+     "keyword_rows_k30": 19,
+     "best_distance": 0.521806058668368,
+     "embed_ms": 4629.015200014692,
+     "sql_ms": 1619.9794999847654
+    },
+    {
+     "id": "v1-45",
+     "lang": "zh",
+     "expect": "unanswerable",
+     "category": "control",
+     "style": "mixed-language,no-punctuation",
+     "raw": null,
+     "systems": {
+      "prod": {
+       "ask": null,
+       "list": null,
+       "list_rows": 50
+      },
+      "link-rollup": {
+       "ask": null,
+       "list": null,
+       "list_rows": 47
+      },
+      "prod-no-admit": {
+       "ask": null,
+       "list": null,
+       "list_rows": 50
+      },
+      "vector-only@5": {
+       "ask": null,
+       "list": null,
+       "list_rows": 50
+      },
+      "rerank@32": {
+       "ask": null,
+       "list": null,
+       "list_rows": 37
+      },
+      "rerank@50": {
+       "ask": null,
+       "list": null,
+       "list_rows": 45
+      }
+     },
+     "rerank_ms": {
+      "rerank@32": 3192.074299993692,
+      "rerank@50": 3825.87390000117
+     },
+     "rerank_ok": {
+      "rerank@32": true,
+      "rerank@50": true
+     },
+     "rerank_rows": {
+      "rerank@32": 54,
+      "rerank@50": 87
+     },
+     "diag": {
+      "ask_prod_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.47458599432069026,
+        "text80": "[11:17 – 11:18] Scaffold Plan Update & Height Restraints (progress)\nParticipants",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4906115380111793,
+        "text80": "[11:11 – 11:15] Scaffold Methodology & Crane Restrictions (progress)\nParticipant",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4976205676084924,
+        "text80": "[17:33:39] spk_1: No, it's-- the-it's just it's only two bedrooms but... Where t",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.49817045060239373,
+        "text80": "[11:12:29] spk_0: Shop drawings.\n[11:12:30] spk_1: Yeah.\n[11:12:30] spk_0: Shop ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": true,
+        "distance": 0.5086375025320777,
+        "text80": "[10:09:46] spk_1: Yeah.\n[10:09:47] spk_0: Early on Saturday.\n[10:09:48] spk_1: E",
+        "evidence": false
+       }
+      ],
+      "no_admit_rows": [
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.47458599432069026,
+        "text80": "[11:17 – 11:18] Scaffold Plan Update & Height Restraints (progress)\nParticipants",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.4906115380111793,
+        "text80": "[11:11 – 11:15] Scaffold Methodology & Crane Restrictions (progress)\nParticipant",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.4976205676084924,
+        "text80": "[17:33:39] spk_1: No, it's-- the-it's just it's only two bedrooms but... Where t",
+        "evidence": false
+       },
+       {
+        "chunk_type": "transcript_window",
+        "lexical_hit": false,
+        "distance": 0.49817045060239373,
+        "text80": "[11:12:29] spk_0: Shop drawings.\n[11:12:30] spk_1: Yeah.\n[11:12:30] spk_0: Shop ",
+        "evidence": false
+       },
+       {
+        "chunk_type": "topic",
+        "lexical_hit": false,
+        "distance": 0.5043525996418357,
+        "text80": "[16:52 – 16:54] Panel Delivery and Crane Lift (progress)\nParticipants: Leo, Joe\n",
+        "evidence": false
+       }
+      ],
+      "vector_arm_evidence_rank_in_30": null,
+      "k5_search_rows": 7,
+      "k5_keyword_rows": 2
+     },
+     "keyword_rows_k30": 47,
+     "best_distance": 0.47458599432069026,
+     "embed_ms": 1716.544700000668,
+     "sql_ms": 945.1159999880474
+    }
+   ],
+   "summary": {
+    "answerable": 39,
+    "raw_hit_pct": 97.4,
+    "systems": {
+     "prod": {
+      "ask_hit_pct": 82.1,
+      "list_hit_pct": 53.8,
+      "list_rows_median": 35,
+      "zh_list_hits": 4
+     },
+     "link-rollup": {
+      "ask_hit_pct": 82.1,
+      "list_hit_pct": 94.9,
+      "list_rows_median": 32,
+      "zh_list_hits": 5
+     },
+     "rerank@32": {
+      "ask_hit_pct": 89.7,
+      "list_hit_pct": 53.8,
+      "list_rows_median": 22,
+      "zh_list_hits": 4
+     },
+     "rerank@50": {
+      "ask_hit_pct": 89.7,
+      "list_hit_pct": 53.8,
+      "list_rows_median": 30,
+      "zh_list_hits": 4
+     }
+    },
+    "by_category": {
+     "commercial": {
+      "n": 5,
+      "prod": "5/0",
+      "link-rollup": "5/5",
+      "rerank@32": "5/0",
+      "rerank@50": "5/0"
+     },
+     "programme": {
+      "n": 5,
+      "prod": "4/0",
+      "link-rollup": "4/4",
+      "rerank@32": "4/0",
+      "rerank@50": "4/0"
+     },
+     "quality": {
+      "n": 5,
+      "prod": "3/3",
+      "link-rollup": "3/5",
+      "rerank@32": "4/3",
+      "rerank@50": "4/3"
+     },
+     "subcontractor": {
+      "n": 5,
+      "prod": "4/1",
+      "link-rollup": "4/4",
+      "rerank@32": "5/1",
+      "rerank@50": "5/1"
+     },
+     "uncategorised": {
+      "n": 19,
+      "prod": "16/17",
+      "link-rollup": "16/19",
+      "rerank@32": "17/17",
+      "rerank@50": "17/17"
+     }
+    },
+    "by_style": {
+     "clean": {
+      "n": 19,
+      "prod": "16/17",
+      "link-rollup": "16/19",
+      "rerank@32": "17/17",
+      "rerank@50": "17/17"
+     },
+     "messy": {
+      "n": 20,
+      "prod": "16/4",
+      "link-rollup": "16/18",
+      "rerank@32": "18/4",
+      "rerank@50": "18/4"
+     }
+    },
+    "controls_with_list_rows": {
+     "prod": 6,
+     "link-rollup": 6,
+     "rerank@32": 6,
+     "rerank@50": 6
+    },
+    "embed_ms_p50": 1934,
+    "sql_ms_total_p50": 1343,
+    "rerank": {
+     "rerank@32": {
+      "p50_ms": 2993,
+      "p90_ms": 4862,
+      "max_ms": 14271,
+      "over_3s": 22,
+      "failed": 0
+     },
+     "rerank@50": {
+      "p50_ms": 3248,
+      "p90_ms": 4859,
+      "max_ms": 8505,
+      "over_3s": 26,
+      "failed": 0
+     }
+    }
+   }
+  }
+ ]
+}
