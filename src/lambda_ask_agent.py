@@ -377,10 +377,11 @@ def _admit_one_lexical_hit(chunks, keep):
 def _rerank_chunks(question, chunks, keep):
     """Reorder by relevance and keep the best `keep`.
 
-    Every failure path returns the chunks the caller already had, truncated.
-    The reranker improves an answer that is already shippable, so it may never
-    be the reason a question goes unanswered -- `dashscope_utils.rerank`
-    returns None rather than raising, and this returns the cosine order.
+    Every failure path returns what Ask would have used without the
+    reranker: `_admit_one_lexical_hit` over the candidates, so a keyword-only
+    row survives a timeout. The reranker improves an answer that is already
+    shippable, so it may never be the reason a question goes unanswered --
+    `dashscope_utils.rerank` returns None rather than raising.
     """
     if not RERANK_ENABLED:
         # Arrival order is no longer pure cosine order (Task 3 appends
@@ -396,10 +397,14 @@ def _rerank_chunks(question, chunks, keep):
     import dashscope_utils
 
     candidates = _select_candidates(chunks)
+    if len(candidates) <= keep:
+        return candidates
     order = dashscope_utils.rerank(
         question, [c.get("chunk_text") or "" for c in candidates], keep)
     if not order:
-        return candidates[:keep]
+        # Candidates hold keyword rows after vector rows; a plain [:keep]
+        # would drop them all on a timeout (prod timeout is 3s).
+        return _admit_one_lexical_hit(candidates, keep)
     return [candidates[i] for i in order[:keep]]
 
 

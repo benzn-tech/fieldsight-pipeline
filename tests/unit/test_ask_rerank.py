@@ -203,3 +203,34 @@ def test_select_collapses_duplicate_text_and_keeps_the_keyword_flag():
 def test_select_does_not_collapse_empty_texts():
     rows = [_row(""), _row(""), _row("")]
     assert len(agent._select_candidates(rows, total=32)) == 3
+
+
+def test_failed_rerank_keeps_a_keyword_row(monkeypatch):
+    """Candidates put keyword rows after vector rows, so a plain [:keep] on
+    a timeout would drop every keyword row -- the defect
+    _admit_one_lexical_hit exists for. Prod's timeout is 3s."""
+    monkeypatch.setattr(agent, "RERANK_ENABLED", True)
+    monkeypatch.setattr(dashscope_utils, "rerank", lambda *a, **k: None)
+    rows = [_row("v%d" % i) for i in range(32)] + [_row("kw", lex=True)]
+    out = agent._rerank_chunks("q", rows, 5)
+    assert [c["chunk_text"] for c in out] == ["v0", "v1", "v2", "v3", "kw"]
+
+
+def test_reranker_sees_at_most_the_configured_total(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(agent, "RERANK_ENABLED", True)
+    monkeypatch.setattr(agent, "RERANK_CANDIDATES", 32)
+    monkeypatch.setattr(dashscope_utils, "rerank",
+                        lambda q, docs, n: seen.update(n=len(docs)) or list(range(n)))
+    rows = [_row("v%d" % i) for i in range(32)] + \
+        [_row("k%d" % i, lex=True) for i in range(32)]
+    agent._rerank_chunks("q", rows, 5)
+    assert seen["n"] == 32
+
+
+def test_dedup_below_keep_skips_the_reranker(monkeypatch):
+    monkeypatch.setattr(agent, "RERANK_ENABLED", True)
+    monkeypatch.setattr(dashscope_utils, "rerank",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("reranked")))
+    rows = [_row("same") for _ in range(9)] + [_row("b")]
+    assert [c["chunk_text"] for c in agent._rerank_chunks("q", rows, 5)] == ["same", "b"]
