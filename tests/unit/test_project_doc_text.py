@@ -262,3 +262,26 @@ def test_a_title_cased_wrapped_line_mid_sentence_is_not_a_heading():
     out = t.extract(make_pdf([["The walls shall be built from", "40 Series Masonry Blocks",
                                "x" * 250]]), "pdf")
     assert [b for b in out["blocks"] if b["kind"] == "heading"] == []
+
+
+# --- Fix round 2 --------------------------------------------------------------------
+
+@pytest.mark.parametrize("original", ["Pour at 20°C minimum.", "Señor naïve"])
+def test_cp1252_text_is_not_mis_decoded_as_gb18030(original):
+    """GB18030 decodes these bytes without error into "20癈" / "Se駉r na飗e"."""
+    out = t.extract(original.encode("cp1252"), "txt")
+    assert out["blocks"][0]["text"] == original
+
+
+@pytest.mark.parametrize("original", ["混凝土强度", "混凝土强度 C30，坍落度 “180 mm” — 见 3.2 条"])
+def test_short_or_mixed_gbk_text_still_decodes_to_chinese(original):
+    assert t.extract(original.encode("gbk"), "txt")["blocks"][0]["text"] == original
+
+
+def test_a_deep_pdf_heading_is_not_seeded_into_the_body_twice():
+    """Level > MAX_PATH_LEVEL headings are already body text for the chunker."""
+    out = t.extract(make_pdf([["Intro sentence.", "1.2.3.4 Note",
+                               "Tolerance is 5 mm on all faces. " * 8]]), "pdf")
+    assert [b["level"] for b in out["blocks"] if b["kind"] == "heading"] == [4]
+    para = [b for b in out["blocks"] if b["kind"] == "para"][-1]
+    assert para["text"].startswith("Tolerance")
