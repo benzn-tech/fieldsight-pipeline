@@ -24,8 +24,10 @@ they are meant to differ in:
                 linked to the Aurora topic of the same author and date whose
                 time_range overlaps their window_span most; windows that still
                 overlap nothing are kept under a one-hour row.
-  rerank@32     32 candidates through the same SQL (up to 64 rows), at most 4 per
-                recording (`_diversify`), reranked by qwen3-rerank. Ask = top 5 of
+  rerank@32     32 candidates through the same SQL (up to 64 rows), chosen by
+                production's selector -- `_select_candidates` (per search arm)
+                when the imported source has it, else the old per-recording
+                cap `_diversify` -- reranked by qwen3-rerank. Ask = top 5 of
                 the reranked order. List = the same aggregation, with rows ordered
                 by the best reranked position of any chunk grouped under them.
   rerank@50     the same with k=50. Production's rag-search clamps k to 32 per arm
@@ -37,7 +39,7 @@ develop's visibility predicate references `topics.superseded_at`, a column the
 prod database does not have): the SQL is `repositories.search_sql.
 build_search_sql()`, the keyword-arm text is `lexical_terms.or_query(query_terms
 (q))`, Ask's context is `_admit_one_lexical_hit`, the list is `_aggregate_topics`,
-the rerank is `_diversify` + `dashscope_utils.rerank`. Set EVAL_SRC_REF to another
+the rerank is `select_candidates` + `dashscope_utils.rerank`. Set EVAL_SRC_REF to another
 ref (or "worktree") to measure something else. The SQL is re-spelled for the RDS
 Data API and every rewrite is asserted, so if production SQL changes shape this
 fails loudly instead of quietly measuring another search.
@@ -353,13 +355,21 @@ def link_windows(rows, topics_by_date, rollup, blocks_by_date=None):
     return out
 
 
-def rerank_all(question, rows):
-    """Production's rerank step on `rows` (what rag-search returned): at most
-    RERANK_PER_SESSION_CAP per recording, then qwen3-rerank. Returns
+def select_candidates(rows, total):
+    """Production's candidate selection for the imported source: the per-arm
+    `_select_candidates` (2026-10-16 spec) or, on older code, `_diversify`."""
+    if hasattr(lambda_ask_agent, "_select_candidates"):
+        return lambda_ask_agent._select_candidates(rows, total)
+    return lambda_ask_agent._diversify(rows, lambda_ask_agent.RERANK_PER_SESSION_CAP)
+
+
+def rerank_all(question, rows, total):
+    """Production's rerank step on `rows` (what rag-search returned): the
+    candidate selection (`select_candidates`), then qwen3-rerank. Returns
     (ordered rows -- reranked candidates first, diversify-dropped rows after in
     their original order --, latency ms, whether the reranker answered). On
     failure the candidates keep their arrival order, as production's fallback."""
-    candidates = lambda_ask_agent._diversify(rows, lambda_ask_agent.RERANK_PER_SESSION_CAP)
+    candidates = select_candidates(rows, total)
     kept = {id(c) for c in candidates}
     dropped = [r for r in rows if id(r) not in kept]
     t0 = time.perf_counter()
@@ -468,7 +478,7 @@ def score_question(searcher, item, today):
             "k5_keyword_rows": sum(bool(r.get("lexical_hit")) for r in fetched[ASK_K])}
     rerank_ms, rerank_ok, rerank_cands = {}, {}, {}
     for name, k in LIST_RERANK_SYSTEMS.items():
-        ordered, ms, ok = rerank_all(q, fetched[k])
+        ordered, ms, ok = rerank_all(q, fetched[k], k)
         ask_rr = first_hit(as_text(ordered[:ASK_K]), item)
         # The list path (mode=search) is k=30 and has no reranker today; this is the
         # hypothetical list built from the same candidates in reranked order.
@@ -579,7 +589,10 @@ def main():
         "rerank_model": dashscope_utils.DASHSCOPE_RERANK_MODEL,
         "ask_k": ASK_K, "list_k": LIST_K,
         "rerank_candidates": dict(LIST_RERANK_SYSTEMS),
-        "rerank_per_session_cap": lambda_ask_agent.RERANK_PER_SESSION_CAP,
+        "candidate_selector": ("per-arm" if hasattr(lambda_ask_agent, "_select_candidates")
+                               else "per-source-cap"),
+        "rerank_keyword_candidates": getattr(lambda_ask_agent, "RERANK_KEYWORD_CANDIDATES", None),
+        "rerank_per_session_cap": getattr(lambda_ask_agent, "RERANK_PER_SESSION_CAP", None),
         "search_sql_sha256": sha256_text(search_sql.build_search_sql()),
         "aggregator_sha256": sha256_text(inspect.getsource(lambda_ask_agent._aggregate_topics)),
         "no_lex_max_dist": lambda_ask_agent._NO_LEX_MAX_DIST,
