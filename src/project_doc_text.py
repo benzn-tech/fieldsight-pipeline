@@ -27,6 +27,7 @@ import re
 import zipfile
 
 import project_doc_types as types
+from project_doc_chunks import MAX_PATH_LEVEL
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,7 @@ MSG_EMPTY = "No text found in this file."
 MSG_PASSWORD = "This PDF is password-protected -- upload an unprotected copy."
 # AES-encrypted PDFs need the `cryptography` package, which the layer deliberately does
 # not carry (pure Python only, R13).
-MSG_PROTECTED = "This PDF is protected — export an unprotected copy and upload that."
+MSG_PROTECTED = "This PDF is protected -- export an unprotected copy and upload that."
 MSG_DAMAGED = "This file could not be opened -- it may be damaged."
 MSG_ENCODING = "The text encoding could not be read."
 MSG_TYPE = types.TYPE_ERROR
@@ -239,7 +240,8 @@ def _pdf(data):
             if head:
                 flush()
                 blocks.append(_block("heading", head[1], level=head[0], page=page))
-                seeds.append(head[1])         # kept in the body too (see docstring)
+                if head[0] <= MAX_PATH_LEVEL:   # deeper ones the chunker keeps as body
+                    seeds.append(head[1])       # kept in the body too (see docstring)
                 block_ended = True
                 continue
             if not para and seeds:
@@ -255,6 +257,26 @@ def _pdf(data):
     return blocks, n
 
 
+def _looks_chinese(text):
+    """GB18030 decodes almost any byte string, so a cp1252 file ("20°C", "Señor") decodes
+    "successfully" into stray hanzi ("20癈", "Se駉r") with no replacement character. Real
+    Chinese runs CJK characters together; mojibake leaves them isolated between Latin
+    letters, digits and spaces. Accept only when there is CJK and at most half of it is
+    isolated. (Other non-ASCII -- curly quotes, dashes, the degree sign -- is ignored:
+    real GBK text carries plenty of it.)"""
+    cjk = isolated = 0
+    for i, ch in enumerate(text):
+        if not _CJK.match(ch):
+            continue
+        cjk += 1
+        before = text[i - 1] if i else ""
+        after = text[i + 1] if i + 1 < len(text) else ""
+        if not (_CJK.match(before) if before else False) and \
+                not (_CJK.match(after) if after else False):
+            isolated += 1
+    return cjk > 0 and isolated * 2 <= cjk
+
+
 def _decode(data):
     """utf-8 (BOM or not), UTF-16 with a BOM, GB18030 (a superset of GBK), then cp1252.
     A result that is still more than 2% replacement characters is not text we can read."""
@@ -262,13 +284,18 @@ def _decode(data):
     candidates = ["utf-8-sig"]
     if data[:2] in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE):
         candidates.insert(0, "utf-16")
-    candidates.append("gb18030")
     for enc in candidates:
         try:
             text = data.decode(enc)
             break
         except UnicodeDecodeError:
             continue
+    if text is None:
+        try:
+            gb = data.decode("gb18030")
+            text = gb if _looks_chinese(gb) else None
+        except UnicodeDecodeError:
+            pass
     if text is None:
         text = data.decode("cp1252", errors="replace")
     if text and text.count("�") > MAX_REPLACEMENT_RATIO * len(text):
