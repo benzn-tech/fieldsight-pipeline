@@ -172,6 +172,7 @@ from repositories import (action_items, aliases, chunks, classification_feedback
                           voice_messages,
                           voiceprints)
 from repositories import lake_objects
+from repositories import project_docs
 import lake_keys
 import lake_owner
 import company_export
@@ -190,6 +191,8 @@ from repositories import speaker_name_proposals
 from repositories import speaker_intro_suggestions
 import turn_name_overlay
 import template_types
+import project_doc_flag
+import project_doc_types
 from transcript_utils import extract_base_time_from_filename, speaker_turns_from_items
 
 logger = logging.getLogger()
@@ -644,6 +647,10 @@ def dispatch(conn, event, method, route):
     m_sc = re.match(r"^/sites/([^/]+)/contributors$", route)
     if m_sc and method == "GET":
         return list_site_contributors(conn, caller, m_sc.group(1), event)
+    # Project documents (spec 2026-10-16-project-documents-design): one line, one handler.
+    m_pd = re.match(r"^/sites/([^/]+)/documents(?:/(.*))?$", route)
+    if m_pd:
+        return project_documents_route(conn, caller, m_pd.group(1), m_pd.group(2), method, event)
     m_ma = re.match(r"^/members/([^/]+)/(archive|unarchive)$", route)
     if m_ma and method == "POST":
         return _directory_after(conn, archive_member_endpoint(conn, caller, m_ma.group(1), m_ma.group(2)))
@@ -13426,3 +13433,293 @@ def set_report_template_binding(conn, caller, report_type, event):
         "set_by": str(row["set_by"]),
         "set_at": row["set_at"],
     })
+
+
+# ---- Project documents (spec 2026-10-16-project-documents-design) ---------------------
+#
+# A project's specs and documents. org-api is in-VPC with no outbound (BUG-36): it stores
+# the upload, inserts the row (status pending) and writes project_doc_requests/{co}/{id}.json;
+# the non-VPC ProjectDocIndexFunction reads, chunks and embeds it; IngestFunction applies the
+# result. Off (the default), every route answers 404 "not found" -- the UI's only gate.
+#
+# Reads: anyone who reaches the project (_allowed_site_ids). Writes (R5): home-company site
+# -> global_role in _MANAGER_ROLES; external site -> the external membership's role in
+# _MANAGER_ROLES; platform_admin. Keys and company_id follow the SITE's company (R6).
+# An archived project: writes 409 for its writers, reads 404 (plan ruling 7).
+#
+# Every repository write runs inside `conn.transaction()` on the request's non-autocommit
+# connection: insert_document / soft_delete take an advisory lock and FOR UPDATE that hold
+# only for the transaction (project_docs module docstring).
+
+_PD_UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_PD_ID_RE = re.compile(rf"^{_PD_UUID}$")
+_PD_SOURCE_RE = re.compile(
+    rf"^project_doc_sources/(?P<company>{_PD_UUID})/(?P<id>{_PD_UUID})\.(?P<ext>docx|pdf|txt|md)$")
+_PD_SUB_RE = re.compile(rf"^(?P<id>{_PD_UUID})(?:/(?P<sub>file|retry))?$")
+PROJECT_DOC_UPLOAD_EXPIRY = 900
+PROJECT_DOC_FILE_EXPIRY = 3600
+PROJECT_DOC_STUCK = timedelta(minutes=20)
+_PD_ARCHIVED = "This project is archived"
+_PD_NOT_WRITER = "Only the project's managers can change its documents."
+_PD_INDEXED = "This document is already indexed."
+
+
+def _doc_writer(conn, caller, site):
+    role = caller.get("global_role")
+    if is_cross_company(role):
+        return True
+    if str(site["company_id"]) == str(caller["company_id"]):
+        return role in _MANAGER_ROLES
+    return memberships.external_site_roles(conn, caller["id"]).get(str(site["id"])) in _MANAGER_ROLES
+
+
+def _doc_site(conn, caller, site_id, write):
+    """(site, None) or (None, error). Ruling 7: an archived project answers 409 to the
+    people who could otherwise write to it, before the reach check (visible_scope drops
+    archived sites, so the reach check alone would make the 409 unreachable)."""
+    if not _PD_ID_RE.match(str(site_id or "").lower()):
+        return None, error("project not found", 404)
+    site = sites.get_site(conn, site_id)
+    if site is None:
+        return None, error("project not found", 404)
+    if site.get("archived_at") is not None:
+        if write and _doc_writer(conn, caller, site):
+            return None, error(_PD_ARCHIVED, 409)
+        if not write:
+            return None, error("project not found", 404)
+    if str(site["id"]) not in {str(s) for s in _allowed_site_ids(conn, caller)}:
+        return None, error("project not found", 404)
+    if write and not _doc_writer(conn, caller, site):
+        return None, error(_PD_NOT_WRITER, 403)
+    return site, None
+
+
+def _doc_public(r):
+    return {"id": str(r["id"]), "seriesId": str(r["series_id"]), "revision": r["revision"],
+            "title": r["title"], "filename": r["filename"], "contentType": r["content_type"],
+            "status": r["status"], "reason": r["reason"], "pages": r["pages"],
+            "chars": r["chars"], "chunks": r["chunks"], "uploadedBy": str(r["uploaded_by"]),
+            "uploadedByName": r.get("uploaded_by_name"), "createdAt": _iso(r["created_at"]),
+            "requestedAt": _iso(r["requested_at"]), "indexedAt": _iso(r["indexed_at"]),
+            "supersededAt": _iso(r["superseded_at"])}
+
+
+def _iso(v):
+    """ISO 8601 with a 'T'. ok() would str() a datetime ("2026-10-16 10:00:00+00:00"), which
+    Safari's Date.parse rejects -- and the UI's 20-minute "Retry" depends on parsing it."""
+    return v.isoformat() if v is not None else None
+
+
+def _site_doc(conn, site, doc_id):
+    row = project_docs.get_document(conn, doc_id)
+    if row is None or str(row["site_id"]) != str(site["id"]) or row["deleted_at"] is not None:
+        return None
+    return row
+
+
+def _write_doc_request(caller, row):
+    key = f"project_doc_requests/{row['company_id']}/{row['id']}.json"
+    artifact = {"id": str(row["id"]), "companyId": str(row["company_id"]),
+                "siteId": str(row["site_id"]), "seriesId": str(row["series_id"]),
+                "revision": row["revision"], "sourceKey": row["source_key"],
+                "contentType": row["content_type"], "filename": row["filename"],
+                "userId": str(caller["id"]),
+                "requestedAt": datetime.now(timezone.utc).isoformat()}
+    s3().put_object(Bucket=LAKE_BUCKET, Key=key, Body=json.dumps(artifact),
+                    ContentType="application/json")
+    return key
+
+
+def project_documents_route(conn, caller, site_id, rest, method, event):
+    if not project_doc_flag.on():
+        return error("not found", 404)
+    rest = rest or ""
+    site, err = _doc_site(conn, caller, site_id, write=method != "GET")
+    if err is not None:
+        return err
+    if rest == "" and method == "GET":
+        return list_project_documents(conn, caller, site, event)
+    if rest == "upload-url" and method == "POST":
+        return project_document_upload_url(site, event)
+    if rest == "" and method == "POST":
+        return create_project_document(conn, caller, site, event)
+    m = _PD_SUB_RE.match(rest.lower())
+    if m:
+        doc_id, sub = m.group("id"), m.group("sub")
+        if sub is None and method == "PATCH":
+            return rename_project_document(conn, site, doc_id, event)
+        if sub is None and method == "DELETE":
+            return delete_project_document(conn, site, doc_id)
+        if sub == "file" and method == "GET":
+            return project_document_file(conn, site, doc_id)
+        if sub == "retry" and method == "POST":
+            return retry_project_document(conn, caller, site, doc_id)
+    return error("not found", 404)
+
+
+def list_project_documents(conn, caller, site, event):
+    """GET /sites/{site}/documents[?series={id}]"""
+    series = (event.get("queryStringParameters") or {}).get("series")
+    if series:
+        if not _PD_ID_RE.match(series.lower()):
+            return error("document not found", 404)
+        rows = project_docs.list_series(conn, site["id"], series.lower())
+        if not rows:
+            return error("document not found", 404)
+    else:
+        rows = project_docs.list_current(conn, site["id"])
+    can_write = site.get("archived_at") is None and _doc_writer(conn, caller, site)
+    return ok({"documents": [_doc_public(r) for r in rows], "canWrite": can_write})
+
+
+def project_document_upload_url(site, event):
+    """POST /sites/{site}/documents/upload-url {filename, contentType, size}. The id is
+    minted here and travels in the key (spec ruling 2)."""
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    ext = project_doc_types.ext_of(body.get("filename"))
+    if ext not in project_doc_types.EXT_TYPES:
+        return error(project_doc_types.TYPE_ERROR, 400)
+    content_type = project_doc_types.EXT_TYPES[ext]
+    if body.get("contentType") != content_type:
+        return error("contentType does not match the file extension (.%s is %s)"
+                     % (ext, content_type), 400)
+    size = body.get("size")
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        return error("size (bytes) is required", 400)
+    if size > project_doc_types.MAX_BYTES:
+        return error("the file is larger than 50 MB", 400)
+    doc_id = str(uuid.uuid4())
+    key = f"project_doc_sources/{site['company_id']}/{doc_id}.{ext}"
+    url = s3().generate_presigned_url(
+        "put_object", Params={"Bucket": LAKE_BUCKET, "Key": key, "ContentType": content_type},
+        ExpiresIn=PROJECT_DOC_UPLOAD_EXPIRY)
+    return ok({"uploadUrl": url, "sourceKey": key, "documentId": doc_id,
+               "expiresIn": PROJECT_DOC_UPLOAD_EXPIRY})
+
+
+def create_project_document(conn, caller, site, event):
+    """POST /sites/{site}/documents {sourceKey, filename, title?, seriesId?} -> 202."""
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    key = body.get("sourceKey")
+    m = _PD_SOURCE_RE.match(key) if isinstance(key, str) else None
+    if m is None or m.group("company") != str(site["company_id"]):
+        # Never another company's object, whatever the caller sends (R6).
+        return error("sourceKey must be a file uploaded for this project", 400)
+    ext, doc_id = m.group("ext"), m.group("id")
+    filename = (body.get("filename") or "").strip() if isinstance(body.get("filename"), str) else ""
+    if not filename or len(filename) > 255:
+        return error("filename is required", 400)
+    if project_doc_types.ext_of(filename) != ext:
+        return error("filename does not match the uploaded file type", 400)
+    title = body.get("title") if isinstance(body.get("title"), str) else ""
+    title = (title.strip() or filename)[:200]
+    series_id = body.get("seriesId")
+    if series_id is not None and (not isinstance(series_id, str)
+                                  or not _PD_ID_RE.match(series_id.lower())):
+        return error("document not found", 404)
+    try:
+        head = s3().head_object(Bucket=LAKE_BUCKET, Key=key)
+    except ClientError as e:
+        if _s3_missing(e):
+            return error("the uploaded file was not found — upload it again", 404)
+        raise
+    size = head.get("ContentLength") or 0
+    if size > project_doc_types.MAX_BYTES:        # a presigned PUT cannot enforce a size
+        return error("the file is larger than 50 MB", 400)
+    if project_docs.get_document(conn, doc_id) is not None:
+        return error("This file was already added.", 409)
+    try:
+        with conn.transaction():
+            row = project_docs.insert_document(
+                conn, doc_id=doc_id, site_id=str(site["id"]),
+                company_id=str(site["company_id"]), title=title, filename=filename,
+                source_key=key, content_type=project_doc_types.EXT_TYPES[ext],
+                uploaded_by=str(caller["id"]),
+                series_id=series_id.lower() if series_id else None)
+    except UniqueViolation:                       # a second create raced past the check
+        return error("This file was already added.", 409)
+    if row is None:                               # nothing was written: no live series here
+        return error("document not found", 404)
+    # The request is written before dispatch's connection commits: if the PUT raises, the
+    # whole request rolls back and no pending row is left without a request.
+    request_key = _write_doc_request(caller, row)
+    owner = {"company_id": str(site["company_id"]), "site_id": str(site["id"]),
+             "user_id": caller["id"], "source": "upload"}
+    lake_objects.record_best_effort(conn, key, kind="project_doc_source", size_bytes=size, **owner)
+    for k in (request_key, f"project_doc_vectors/{site['company_id']}/{doc_id}.json"):
+        lake_objects.record_best_effort(conn, k, kind="project_doc", **owner)
+    return ok({"id": doc_id, "status": "pending", "seriesId": str(row["series_id"]),
+               "revision": row["revision"]}, 202)
+
+
+def rename_project_document(conn, site, doc_id, event):
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    title = body.get("title").strip() if isinstance(body.get("title"), str) else ""
+    if not title or len(title) > 200:
+        return error("title must be 1 to 200 characters", 400)
+    if _site_doc(conn, site, doc_id) is None:
+        return error("document not found", 404)
+    with conn.transaction():
+        renamed = project_docs.rename(conn, doc_id, title)
+    if not renamed:
+        return error("document not found", 404)
+    return ok({"id": doc_id, "title": title})
+
+
+def delete_project_document(conn, site, doc_id):
+    if _site_doc(conn, site, doc_id) is None:
+        return error("document not found", 404)
+    with conn.transaction():
+        deleted = project_docs.soft_delete(conn, doc_id)
+    if not deleted:
+        return error("document not found", 404)
+    return ok({"id": doc_id, "deleted": True})
+
+
+def _content_disposition(filename):
+    ascii_name = re.sub(r'[^A-Za-z0-9._ -]', "_", filename) or "document"
+    from urllib.parse import quote
+    return f"inline; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"
+
+
+def project_document_file(conn, site, doc_id):
+    """GET /sites/{site}/documents/{id}/file -- a 1-hour presigned GET of the original,
+    named as uploaded (Review Focus 2)."""
+    row = _site_doc(conn, site, doc_id)
+    if row is None:
+        return error("document not found", 404)
+    url = s3().generate_presigned_url(
+        "get_object", Params={"Bucket": LAKE_BUCKET, "Key": row["source_key"],
+                              "ResponseContentType": row["content_type"],
+                              "ResponseContentDisposition": _content_disposition(row["filename"])},
+        ExpiresIn=PROJECT_DOC_FILE_EXPIRY)
+    return ok({"url": url, "contentType": row["content_type"], "filename": row["filename"],
+               "expiresIn": PROJECT_DOC_FILE_EXPIRY})
+
+
+def retry_project_document(conn, caller, site, doc_id):
+    """POST /sites/{site}/documents/{id}/retry -- for `error` / `unreadable`, or `pending`
+    for longer than 20 minutes since the last request (R9). Re-writes the request for the
+    same id. Never for an indexed document: a Retry must not take it out of search, and
+    mark_pending's guarded UPDATE refuses one that was indexed after the read above."""
+    row = _site_doc(conn, site, doc_id)
+    if row is None:
+        return error("document not found", 404)
+    if row["status"] == "indexed":
+        return error(_PD_INDEXED, 409)
+    stuck = (row["status"] == "pending" and row["requested_at"] is not None
+             and datetime.now(timezone.utc) - row["requested_at"] > PROJECT_DOC_STUCK)
+    if row["status"] not in ("error", "unreadable") and not stuck:
+        return error("This document is not waiting on a retry.", 409)
+    with conn.transaction():
+        marked = project_docs.mark_pending(conn, doc_id)
+    if not marked:
+        return error(_PD_INDEXED, 409)
+    _write_doc_request(caller, row)
+    return ok({"id": doc_id, "status": "pending"}, 202)
