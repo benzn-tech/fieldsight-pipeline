@@ -1,0 +1,742 @@
+[
+  {
+    "checked_at": {
+      "S": "2026-07-06T00:54:23.443094Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#0#ACTION#0"
+    },
+    "action_text": {
+      "S": "Ensure worker complies with PPE requirements (gloves and glasses)"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-03-09"
+    },
+    "checked_by": {
+      "S": "Ben Lin"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-06T00:54:24.150868Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#0#ACTION#1"
+    },
+    "action_text": {
+      "S": "Close side door that was left open"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-03-09"
+    },
+    "checked_by": {
+      "S": "Ben Lin"
+    }
+  },
+  {
+    "checked": {
+      "BOOL": false
+    },
+    "unchecked_by": {
+      "S": "Ben Lin"
+    },
+    "SK": {
+      "S": "TOPIC#8#ACTION#0"
+    },
+    "action_text": {
+      "S": "Ensure KME team reviews latest inspection report comments"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-03-09"
+    },
+    "unchecked_at": {
+      "S": "2026-03-17T10:29:34.465808Z"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-03-17T09:41:41.103582Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#0#ACTION#0"
+    },
+    "action_text": {
+      "S": "Follow up on damaged door resolution with Jordan"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Jarley Trainor"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-03T08:16:04.088282Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#0#ACTION#1"
+    },
+    "action_text": {
+      "S": "Reinforce proper skip usage and waste disposal with site workers"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Jarley Trainor"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-03-17T09:41:43.390259Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#1#ACTION#0"
+    },
+    "action_text": {
+      "S": "Retrieve gloves from desk/bench"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Jarley Trainor"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-13T03:00:00.290695Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#1#ACTION#1"
+    },
+    "action_text": {
+      "S": "Coordinate with Sam on door handle installation requirements"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Ben Lin"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-13T03:00:02.652628Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#1#ACTION#2"
+    },
+    "action_text": {
+      "S": "Remove improperly installed component (Dante's work)"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Ben Lin"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-03-17T09:41:46.611338Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#2#ACTION#0"
+    },
+    "action_text": {
+      "S": "Remove incorrectly installed component using hammer and chisel"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Jarley Trainor"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-03-17T09:41:47.251234Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#2#ACTION#1"
+    },
+    "action_text": {
+      "S": "Take photo of removed component for Dante"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Jarley Trainor"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-03-17T09:41:47.612695Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#2#ACTION#2"
+    },
+    "action_text": {
+      "S": "Check with Sam about door stop completion requirements"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Jarley Trainor"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-03T09:49:48.709175Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#2#ACTION#flag_0"
+    },
+    "action_text": {
+      "S": "Workers walking on finished paving instead of using proper walkways"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Jarley Trainor"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-03T10:33:49.703051Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#3#ACTION#0"
+    },
+    "action_text": {
+      "S": "Locate door stops delivery for Buildings 2 and Senior area"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Jarley Trainor"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-03T10:33:48.680667Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#3#ACTION#1"
+    },
+    "action_text": {
+      "S": "Check with Dan on door stop installation progress"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Jarley Trainor"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-13T05:52:31.197457Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#5#ACTION#0"
+    },
+    "action_text": {
+      "S": "Install sockets in Building 2 and Senior area following splash back completion"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Ben Lin"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-13T05:52:32.374850Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#5#ACTION#1"
+    },
+    "action_text": {
+      "S": "Complete hardware installations after socket work"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Ben Lin"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-13T05:52:27.897213Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#5#ACTION#2"
+    },
+    "action_text": {
+      "S": "Complete 3 floor boxes"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Ben Lin"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-03T08:24:43.799429Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#6#ACTION#0"
+    },
+    "action_text": {
+      "S": "Vacuum dust off finished carpet and implement covering protocols"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Jarley Trainor"
+    }
+  },
+  {
+    "checked": {
+      "BOOL": false
+    },
+    "unchecked_by": {
+      "S": "Ben Lin"
+    },
+    "SK": {
+      "S": "TOPIC#7#ACTION#0"
+    },
+    "action_text": {
+      "S": "Order and apply non-stock tape to plaster repair areas"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "unchecked_at": {
+      "S": "2026-07-13T03:13:28.180559Z"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-13T05:53:05.491331Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#7#ACTION#1"
+    },
+    "action_text": {
+      "S": "Remove plaster from ceilings"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Ben Lin"
+    }
+  },
+  {
+    "checked": {
+      "BOOL": false
+    },
+    "unchecked_by": {
+      "S": "Ben Lin"
+    },
+    "SK": {
+      "S": "TOPIC#7#ACTION#2"
+    },
+    "action_text": {
+      "S": "Apply tinted top coat to repair areas"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "unchecked_at": {
+      "S": "2026-07-13T03:12:05.603982Z"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-13T03:11:25.600953Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#8#ACTION#0"
+    },
+    "action_text": {
+      "S": "Complete door painting in Buildings 2, 3, and Senior area"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Ben Lin"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-13T03:11:19.980970Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#8#ACTION#1"
+    },
+    "action_text": {
+      "S": "Complete handrail welding and installation"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Ben Lin"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-13T03:11:15.734552Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#8#ACTION#2"
+    },
+    "action_text": {
+      "S": "Complete floor joint work in hallways"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Ben Lin"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-13T03:11:16.740976Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#8#ACTION#3"
+    },
+    "action_text": {
+      "S": "Coordinate toilet block painting with John"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Ben Lin"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-13T03:16:34.071646Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#9#ACTION#0"
+    },
+    "action_text": {
+      "S": "Complete 3 floor boxes in Building 2"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Ben Lin"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-13T03:16:34.135481Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#9#ACTION#1"
+    },
+    "action_text": {
+      "S": "Continue floor box installations in Building 3 as areas become ready"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Ben Lin"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-13T03:16:34.771818Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#9#ACTION#2"
+    },
+    "action_text": {
+      "S": "Complete plaster work before vinyl installation"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Ben Lin"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-13T03:16:35.711754Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#9#ACTION#3"
+    },
+    "action_text": {
+      "S": "Install carpet in Building 3"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-09"
+    },
+    "checked_by": {
+      "S": "Ben Lin"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-03T10:23:48.544957Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#-1#ACTION#obs_0"
+    },
+    "action_text": {
+      "S": "Worker entering clean area with muddy shoes risking damage to finished surfaces"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-03-02"
+    },
+    "checked_by": {
+      "S": "Jarley Trainor"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-05T01:18:51.259789Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#2#ACTION#flag_0"
+    },
+    "action_text": {
+      "S": "Worker entering clean area with muddy shoes"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-03-02"
+    },
+    "checked_by": {
+      "S": "Jarley Trainor"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-03T09:49:52.909830Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#-1#ACTION#obs_0"
+    },
+    "action_text": {
+      "S": "Concrete bags left in ute overnight with rain forecast"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-26"
+    },
+    "checked_by": {
+      "S": "Jarley Trainor"
+    }
+  },
+  {
+    "checked": {
+      "BOOL": false
+    },
+    "unchecked_by": {
+      "S": "Jarley Trainor"
+    },
+    "SK": {
+      "S": "TOPIC#10#ACTION#0"
+    },
+    "action_text": {
+      "S": "Flooring contractors to feather out floor boxes"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-26"
+    },
+    "unchecked_at": {
+      "S": "2026-07-03T09:50:10.339311Z"
+    }
+  },
+  {
+    "checked": {
+      "BOOL": false
+    },
+    "unchecked_by": {
+      "S": "Jarley Trainor"
+    },
+    "SK": {
+      "S": "TOPIC#10#ACTION#1"
+    },
+    "action_text": {
+      "S": "Remove or protect concrete bags from ute before rain"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-26"
+    },
+    "unchecked_at": {
+      "S": "2026-07-03T09:50:09.499364Z"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-07-03T09:50:28.076523Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#10#ACTION#flag_0"
+    },
+    "action_text": {
+      "S": "Concrete bags left in ute overnight with rain forecast"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-26"
+    },
+    "checked_by": {
+      "S": "Jarley Trainor"
+    }
+  },
+  {
+    "checked": {
+      "BOOL": false
+    },
+    "unchecked_by": {
+      "S": "Ben Lin"
+    },
+    "SK": {
+      "S": "TOPIC#0#ACTION#0"
+    },
+    "action_text": {
+      "S": "Issue site instruction with KME for patching holes where cables were changed"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-02-25"
+    },
+    "unchecked_at": {
+      "S": "2026-07-08T02:26:15.083222Z"
+    }
+  },
+  {
+    "checked_at": {
+      "S": "2026-04-22T02:08:45.029859Z"
+    },
+    "checked": {
+      "BOOL": true
+    },
+    "SK": {
+      "S": "TOPIC#4#ACTION#0"
+    },
+    "action_text": {
+      "S": "Determine compressor placement location - separate room or outdoor installation preferred"
+    },
+    "PK": {
+      "S": "ACTIONS#2026-04-07"
+    },
+    "checked_by": {
+      "S": "Ben Test"
+    }
+  }
+]
