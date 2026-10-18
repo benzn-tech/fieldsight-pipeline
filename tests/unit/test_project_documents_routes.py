@@ -417,16 +417,23 @@ def test_a_retry_that_loses_the_race_to_indexing_is_a_409_and_writes_no_request(
     assert world["s3"].puts == {}
 
 
+def _archived_reads(monkeypatch, caller, doc):
+    return [_routed(monkeypatch, caller, "GET", _base())[0],
+            _routed(monkeypatch, caller, "GET", _base(), qs={"series": doc["seriesId"]})[0],
+            _routed(monkeypatch, caller, "GET", f"{_base()}/{doc['id']}/file")[0]]
+
+
 def test_an_archived_project_is_readable_not_writable_for_those_who_see_it(world, monkeypatch):
-    """R8: read-only, not hidden. Whoever the sites page shows archived projects to (a
-    same-company admin/gm, platform_admin) still lists, opens history and the file -- with
-    canWrite false -- even though visible_scope has dropped the site from their reach."""
+    """R8: read-only, not hidden -- for exactly whom list_org_sites(include_archived) shows
+    the archived project to (GRADED_ROLES off, same-company admin/gm): list, history and
+    the file with canWrite false, even though the site has left their reach."""
+    monkeypatch.setattr(oa, "GRADED_ROLES", False)
     (_, doc), _ = _upload(world, monkeypatch)
     SITES[SITE]["archived_at"] = NOW
     try:
         for uid in world["reach"]:
             world["reach"][uid] = set()
-        for caller in (GM, ADMIN, PLATFORM):
+        for caller in (GM, ADMIN):
             st, out = _routed(monkeypatch, caller, "GET", _base())
             assert st == 200 and out["canWrite"] is False and len(out["documents"]) == 1
             st, out = _routed(monkeypatch, caller, "GET", _base(), qs={"series": doc["seriesId"]})
@@ -440,12 +447,29 @@ def test_an_archived_project_is_readable_not_writable_for_those_who_see_it(world
 
 
 def test_an_archived_project_stays_404_for_those_who_cannot_see_it(world, monkeypatch):
-    _upload(world, monkeypatch)
+    """No sites listing shows platform_admin an archived project, nor anyone below
+    admin/gm, nor another company's admin: 404 on list, history and file."""
+    monkeypatch.setattr(oa, "GRADED_ROLES", False)
+    (_, doc), _ = _upload(world, monkeypatch)
     SITES[SITE]["archived_at"] = NOW
     try:
-        for caller in (WORKER, SM, PM, OTHER_ADMIN):
-            st, out = _routed(monkeypatch, caller, "GET", _base())
-            assert (st, out["error"]) == (404, "project not found"), caller["id"]
+        for caller in (PLATFORM, WORKER, SM, PM, OTHER_ADMIN):
+            assert _archived_reads(monkeypatch, caller, doc) == [404, 404, 404], caller["id"]
+    finally:
+        SITES[SITE]["archived_at"] = None
+
+
+def test_with_graded_roles_an_archived_project_is_404_for_every_reader(world, monkeypatch):
+    """GRADED_ROLES on: list_org_sites lists visible_scope, which drops archived sites for
+    every role, so the documents are 404 for admin/gm too; writes still say archived."""
+    monkeypatch.setattr(oa, "GRADED_ROLES", True)
+    (_, doc), _ = _upload(world, monkeypatch)
+    SITES[SITE]["archived_at"] = NOW
+    try:
+        for caller in (GM, ADMIN, PLATFORM):
+            assert _archived_reads(monkeypatch, caller, doc) == [404, 404, 404], caller["id"]
+        st, out = _routed(monkeypatch, GM, "POST", f"{_base()}/{doc['id']}/retry")
+        assert (st, out["error"]) == (409, "This project is archived")
     finally:
         SITES[SITE]["archived_at"] = None
 

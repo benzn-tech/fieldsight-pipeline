@@ -13446,9 +13446,9 @@ def set_report_template_binding(conn, caller, report_type, event):
 # -> global_role in _MANAGER_ROLES; external site -> the external membership's role in
 # _MANAGER_ROLES; platform_admin. Keys and company_id follow the SITE's company (R6).
 # An archived project is read-only, not hidden (spec R8): writes 409 for its writers; reads
-# (list, history, /file) for whoever the sites page shows archived projects to -- a
-# same-company admin/gm (resolve_scope ALL, `include_archived`) or platform_admin -- with
-# canWrite false; 404 for everyone else.
+# (list, history, /file) with canWrite false for exactly whom list_org_sites(include_archived)
+# shows the archived project to -- GRADED_ROLES off and a same-company admin/gm -- and 404
+# for everyone else (platform_admin included; with GRADED_ROLES on, nobody).
 #
 # Every repository write runs inside `conn.transaction()` on the request's non-autocommit
 # connection: insert_document / soft_delete take an advisory lock and FOR UPDATE that hold
@@ -13478,13 +13478,16 @@ def _doc_writer(conn, caller, site):
 
 
 def _sees_archived(caller, site):
-    """Who the sites page lists an archived project to (list_org_sites with
-    include_archived): a same-company admin/gm, or platform_admin across companies."""
-    role = caller.get("global_role")
-    if is_cross_company(role):
-        return True
-    return (str(site["company_id"]) == str(caller["company_id"])
-            and resolve_scope(role) == "ALL")
+    """Exactly whom list_org_sites(include_archived=1) shows an archived project to, never
+    more. list_org_sites has no shared helper for this, so its conditions are mirrored
+    here -- keep the two in step: under GRADED_ROLES it lists visible_scope, which drops
+    archived sites for every role (platform_admin included) -> nobody; otherwise only the
+    resolve_scope "ALL" branch (admin/gm) honours include_archived, and only over the
+    caller's own company (list_company_sites(caller["company_id"]))."""
+    if GRADED_ROLES:
+        return False
+    return (resolve_scope(caller.get("global_role")) == "ALL"
+            and str(site["company_id"]) == str(caller["company_id"]))
 
 
 def _doc_site(conn, caller, site_id, write):
