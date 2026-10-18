@@ -1,0 +1,262 @@
+[
+ {
+  "key": "transcripts/Ben_Lin_test2/2026-09-25/ben_lin_2026-09-25_12-47-38_sid9221ba96d7904b92b4d883c48c28d199_c0000_off0.0_to11.1_srcmp4.json",
+  "folder": "Ben_Lin_test2",
+  "date": "2026-09-25",
+  "device": "ben_lin",
+  "session": "sid9221ba96d7904b92b4d883c48c28d199",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "Ben Lin"
+ },
+ {
+  "key": "transcripts/Ben_UCPK2/2026-08-07/ben_ucpk2_2026-08-07_16-02-23_sidfc0ae18e75bc487f9f4c8085f1ca76d3_c0000_off0.0_to30.0_srcwav.json",
+  "folder": "Ben_UCPK2",
+  "date": "2026-08-07",
+  "device": "ben_ucpk2",
+  "session": "sidfc0ae18e75bc487f9f4c8085f1ca76d3",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "Ben Lin"
+ },
+ {
+  "key": "transcripts/Ben_Lin/2026-09-15/ben_lin_2026-09-15_09-29-08_sid89cc1208f19049ab9fae811d61beee18_c0000_off0.0_to30.0_srcwav.json",
+  "folder": "Ben_Lin",
+  "date": "2026-09-15",
+  "device": "ben_lin",
+  "session": "sid89cc1208f19049ab9fae811d61beee18",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "Ben Lin"
+ },
+ {
+  "key": "transcripts/Ben_UCPK2/2026-08-11/ben_ucpk2_2026-08-11_00-15-49_sid17fd39d869874765ae738268deb6cfa4_c0000_off0.0_to29.2_srcmp4.json",
+  "folder": "Ben_UCPK2",
+  "date": "2026-08-11",
+  "device": "ben_ucpk2",
+  "session": "sid17fd39d869874765ae738268deb6cfa4",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "Ben Lin"
+ },
+ {
+  "key": "transcripts/Ben_UCPK2/2026-08-09/ben_ucpk2_2026-08-09_20-41-35_sid0581bee11cf049d1991ffeaf9cb3d98e_c0000_off0.0_to30.0_srcwav.json",
+  "folder": "Ben_UCPK2",
+  "date": "2026-08-09",
+  "device": "ben_ucpk2",
+  "session": "sid0581bee11cf049d1991ffeaf9cb3d98e",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "Ben Lin"
+ },
+ {
+  "key": "transcripts/Ben_UCPK2/2026-09-23/ben_ucpk2_2026-09-23_12-44-11_sid13e10e16fb3d4e5db852a1ca2353c0bc_c0000_bn2_off0.0_to33.0_srcwav.json",
+  "folder": "Ben_UCPK2",
+  "date": "2026-09-23",
+  "device": "ben_ucpk2",
+  "session": "sid13e10e16fb3d4e5db852a1ca2353c0bc",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "Ben Lin"
+ },
+ {
+  "key": "transcripts/Sam_Yu/2026-08-13/sam_yu_2026-08-13_13-59-04_sid92ecfafec598414181361c2752b7da6b_c0000_off0.0_to30.0_srcwav.json",
+  "folder": "Sam_Yu",
+  "date": "2026-08-13",
+  "device": "sam_yu",
+  "session": "sid92ecfafec598414181361c2752b7da6b",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "Sam Yu"
+ },
+ {
+  "key": "transcripts/Sam_Yu/2026-09-23/sam_yu_2026-09-23_11-54-17_sidcaa5829398c349e6bf1865835200abe7_c0000_off0.0_to8.0_srcwav.json",
+  "folder": "Sam_Yu",
+  "date": "2026-09-23",
+  "device": "sam_yu",
+  "session": "sidcaa5829398c349e6bf1865835200abe7",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "Sam Yu"
+ },
+ {
+  "key": "transcripts/Sam_Yu/2026-08-03/sam_yu_2026-08-03_13-07-21_sid52b441b8fdd14814bdd345bd32ad2f9b_c0000_off0.0_to5.0_srcwav.json",
+  "folder": "Sam_Yu",
+  "date": "2026-08-03",
+  "device": "sam_yu",
+  "session": "sid52b441b8fdd14814bdd345bd32ad2f9b",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "Sam Yu"
+ },
+ {
+  "key": "transcripts/Sam_Yu/2026-08-09/sam_yu_2026-08-09_15-21-13_sid5b373d67972e47679564394e1dfb7df5_c0000_off0.0_to18.0_srcwav.json",
+  "folder": "Sam_Yu",
+  "date": "2026-08-09",
+  "device": "sam_yu",
+  "session": "sid5b373d67972e47679564394e1dfb7df5",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "Sam Yu"
+ },
+ {
+  "key": "transcripts/Sam_Yu/2026-08-08/sam_yu_2026-08-08_14-41-28_sid14697d46137047a989f1eadcee8ba7ed_c0000_off0.0_to20.0_srcwav.json",
+  "folder": "Sam_Yu",
+  "date": "2026-08-08",
+  "device": "sam_yu",
+  "session": "sid14697d46137047a989f1eadcee8ba7ed",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "Sam Yu"
+ },
+ {
+  "key": "transcripts/Sam_Yu/2026-08-06/sam_yu_2026-08-06_12-59-57_sid1f3bd43924fa43018df0131d0b98a9bb_c0000_off0.0_to2.0_srcwav.json",
+  "folder": "Sam_Yu",
+  "date": "2026-08-06",
+  "device": "sam_yu",
+  "session": "sid1f3bd43924fa43018df0131d0b98a9bb",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "Sam Yu"
+ },
+ {
+  "key": "transcripts/James_Alcock/2026-08-12/james_alcock_2026-08-12_13-02-17_sidbde5ee3493904c90aa6f64a760277d63_c0001_off0.0_to3.0_srcmp4.json",
+  "folder": "James_Alcock",
+  "date": "2026-08-12",
+  "device": "james_alcock",
+  "session": "sidbde5ee3493904c90aa6f64a760277d63",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "James Alcock"
+ },
+ {
+  "key": "transcripts/James_Alcock/2026-08-07/james_alcock_2026-08-07_15-50-34_sid0225f384a83c47db8b797242113c9f68_c0000_off0.0_to21.0_srcwav.json",
+  "folder": "James_Alcock",
+  "date": "2026-08-07",
+  "device": "james_alcock",
+  "session": "sid0225f384a83c47db8b797242113c9f68",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "James Alcock"
+ },
+ {
+  "key": "transcripts/James_Alcock/2026-08-13/james_alcock_2026-08-13_16-02-29_sid32c7eb752f9749858ce920bbce903550_c0000_off0.0_to2.0_srcwav.json",
+  "folder": "James_Alcock",
+  "date": "2026-08-13",
+  "device": "james_alcock",
+  "session": "sid32c7eb752f9749858ce920bbce903550",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "James Alcock"
+ },
+ {
+  "key": "transcripts/Neil_Blunden/2026-08-12/neil_blunden_2026-08-12_12-54-05_sid4d6e35e3398540b09705011d951c8a11_c0000_off0.0_to30.0_srcwav.json",
+  "folder": "Neil_Blunden",
+  "date": "2026-08-12",
+  "device": "neil_blunden",
+  "session": "sid4d6e35e3398540b09705011d951c8a11",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "Neil Blunden"
+ },
+ {
+  "key": "transcripts/Neil_Blunden/2026-08-14/neil_blunden_2026-08-14_14-48-15_side51896f11bd04aaf97b23800bb67094f_c0000_off0.0_to15.0_srcwav.json",
+  "folder": "Neil_Blunden",
+  "date": "2026-08-14",
+  "device": "neil_blunden",
+  "session": "side51896f11bd04aaf97b23800bb67094f",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "Neil Blunden"
+ },
+ {
+  "key": "transcripts/Neil_Blunden/2026-08-13/neil_blunden_2026-08-13_14-34-29_sidb6d5d2abb86b4add901e3511a78bdce6_c0001_off0.0_to30.0_srcwav.json",
+  "folder": "Neil_Blunden",
+  "date": "2026-08-13",
+  "device": "neil_blunden",
+  "session": "sidb6d5d2abb86b4add901e3511a78bdce6",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "Neil Blunden"
+ },
+ {
+  "key": "transcripts/Neil_Blunden/2026-08-18/neil_blunden_2026-08-18_14-32-50_sid05803e12c5b040999db40e466f28d1ab_c0000_off0.0_to8.0_srcwav.json",
+  "folder": "Neil_Blunden",
+  "date": "2026-08-18",
+  "device": "neil_blunden",
+  "session": "sid05803e12c5b040999db40e466f28d1ab",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "Neil Blunden"
+ },
+ {
+  "key": "transcripts/Neil_Blunden/2026-09-02/neil_blunden_2026-09-02_17-02-58_sidb5ae5db542724e1b89b48015f882f5e0_c0000_off0.0_to4.0_srcwav.json",
+  "folder": "Neil_Blunden",
+  "date": "2026-09-02",
+  "device": "neil_blunden",
+  "session": "sidb5ae5db542724e1b89b48015f882f5e0",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "Neil Blunden"
+ },
+ {
+  "key": "transcripts/Neil_Blunden/2026-09-04/neil_blunden_2026-09-04_14-21-18_sid6dde1640cbc5490d8a6ead41314df37e_c0000_off0.0_to26.0_srcwav.json",
+  "folder": "Neil_Blunden",
+  "date": "2026-09-04",
+  "device": "neil_blunden",
+  "session": "sid6dde1640cbc5490d8a6ead41314df37e",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "Neil Blunden"
+ },
+ {
+  "key": "transcripts/James_Lamb/2026-09-23/james_lamb_2026-09-23_07-38-50_sid7d9fd284e3e14f7eaed62ad1be73b5db_c0000_off0.0_to2.2_srcmp4.json",
+  "folder": "James_Lamb",
+  "date": "2026-09-23",
+  "device": "james_lamb",
+  "session": "sid7d9fd284e3e14f7eaed62ad1be73b5db",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "James Lamb"
+ },
+ {
+  "key": "transcripts/James_Lamb/2026-09-17/james_lamb_2026-09-17_06-46-28_sidba98e0d129214031af0720935e641b69_c0000_bn4_off0.0_to114.0_srcwav.json",
+  "folder": "James_Lamb",
+  "date": "2026-09-17",
+  "device": "james_lamb",
+  "session": "sidba98e0d129214031af0720935e641b69",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "James Lamb"
+ },
+ {
+  "key": "transcripts/James_Lamb/2026-09-16/james_lamb_2026-09-16_15-33-35_sidc902328c1e764749a939662f31723024_c0000_off0.0_to30.0_srcwav.json",
+  "folder": "James_Lamb",
+  "date": "2026-09-16",
+  "device": "james_lamb",
+  "session": "sidc902328c1e764749a939662f31723024",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "James Lamb"
+ },
+ {
+  "key": "transcripts/Petros_Pan/2026-09-22/petros_pan_2026-09-22_15-27-34_sid524e341a857f4e21b77cb26d53b311b8_c0000_off0.0_to29.7_srcmp4.json",
+  "folder": "Petros_Pan",
+  "date": "2026-09-22",
+  "device": "petros_pan",
+  "session": "sid524e341a857f4e21b77cb26d53b311b8",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "Petros Pan"
+ },
+ {
+  "key": "transcripts/John_Gudsell/2026-09-25/john_gudsell_2026-09-25_11-57-55_sidf11621865b6a4ac6b1a13324d7413b55_c0000_off0.0_to8.2_srcmp4.json",
+  "folder": "John_Gudsell",
+  "date": "2026-09-25",
+  "device": "john_gudsell",
+  "session": "sidf11621865b6a4ac6b1a13324d7413b55",
+  "turns_wanted": 4,
+  "min_turn_s": 3.0,
+  "person": "John Gudsell"
+ }
+]

@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "<stdin>", line 38, in <module>
+  File "C:\Users\camil\Dropbox\wt-voiceprint\src\repositories\voiceprints.py", line 33, in <module>
+    from psycopg.rows import dict_row
+ModuleNotFoundError: No module named 'psycopg'

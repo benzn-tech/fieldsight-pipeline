@@ -1,0 +1,1121 @@
+{
+  "session": "sid15770a285fc0478c8abcf4ed3f8bcfd0",
+  "folder": "Ben_UCPK2",
+  "date": "2026-08-13",
+  "bucket": "fieldsight-data-509194952652",
+  "profiles": [
+    {
+      "person_key": "28af494b-d82e-4d52-afd8-2e3f8237a98e",
+      "display_name": "Ben Lin"
+    },
+    {
+      "person_key": "28af494b-d82e-4d52-afd8-2e3f8237a98e",
+      "display_name": "Ben Lin"
+    },
+    {
+      "person_key": "28af494b-d82e-4d52-afd8-2e3f8237a98e",
+      "display_name": "Ben Lin"
+    },
+    {
+      "person_key": "28af494b-d82e-4d52-afd8-2e3f8237a98e",
+      "display_name": "Ben Lin"
+    },
+    {
+      "person_key": "28af494b-d82e-4d52-afd8-2e3f8237a98e",
+      "display_name": "Ben Lin"
+    },
+    {
+      "person_key": "28af494b-d82e-4d52-afd8-2e3f8237a98e",
+      "display_name": "Ben Lin"
+    },
+    {
+      "person_key": "28af494b-d82e-4d52-afd8-2e3f8237a98e",
+      "display_name": "Ben Lin"
+    },
+    {
+      "person_key": "28af494b-d82e-4d52-afd8-2e3f8237a98e",
+      "display_name": "Ben Lin"
+    },
+    {
+      "person_key": "28af494b-d82e-4d52-afd8-2e3f8237a98e",
+      "display_name": "Ben Lin"
+    },
+    {
+      "person_key": "28af494b-d82e-4d52-afd8-2e3f8237a98e",
+      "display_name": "Ben Lin"
+    },
+    {
+      "person_key": "28af494b-d82e-4d52-afd8-2e3f8237a98e",
+      "display_name": "Ben Lin"
+    },
+    {
+      "person_key": "28af494b-d82e-4d52-afd8-2e3f8237a98e",
+      "display_name": "Ben Lin"
+    },
+    {
+      "person_key": "22684ac4-06b5-413b-89c9-4c67028939f5",
+      "display_name": "Sam Yu"
+    },
+    {
+      "person_key": "22684ac4-06b5-413b-89c9-4c67028939f5",
+      "display_name": "Sam Yu"
+    },
+    {
+      "person_key": "22684ac4-06b5-413b-89c9-4c67028939f5",
+      "display_name": "Sam Yu"
+    },
+    {
+      "person_key": "22684ac4-06b5-413b-89c9-4c67028939f5",
+      "display_name": "Sam Yu"
+    },
+    {
+      "person_key": "22684ac4-06b5-413b-89c9-4c67028939f5",
+      "display_name": "Sam Yu"
+    }
+  ],
+  "min_turn_s": 3.0,
+  "turns": [
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-09-55_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0096_off0.0_to30.0_srcwav@0.119",
+      "source_filename": "ben_ucpk2_2026-08-13_14-09-55_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0096_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 25.8,
+      "scores": {
+        "Ben Lin": 0.0781,
+        "Sam Yu": 0.5023
+      },
+      "best": "Sam Yu",
+      "best_score": 0.5023,
+      "margin": 0.4243,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.424",
+      "text": "\u91cc\u9762\u7684\u662fCM don't give a fuck\u3002\u7136\u540e\u5462\uff0c\u90a3\u4e2aCM\u5462\uff0c\u5176\u5b9e\u5bf9ELT\u7684\u89d2\u5ea6\uff0c\u4ed6\u7684\u4e1c\u897f\u662f\u6700\u6709\u7528\uff0c\u56e0\u4e3a\u4ed6\u5185\u90e8\u8981\u987e\uff0csubbie\u4e5f\u8981\u987e\u3002\u4f46\u662f\u5462\uff0c\u90a3\u4e2a\u4eba\u5462\uff0c\u5728\u4e2d\u95f4\uff0c\u4ed6\u7684pri"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-07-07_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0090_off0.0_to30.0_srcwav@0.379",
+      "source_filename": "ben_ucpk2_2026-08-13_14-07-07_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0090_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 23.16,
+      "scores": {
+        "Ben Lin": 0.3543,
+        "Sam Yu": -0.0048
+      },
+      "best": "Ben Lin",
+      "best_score": 0.3543,
+      "margin": 0.3592,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.359",
+      "text": "Well\uff0cthey do\uff0c\u4f46\u662f\u4ed6\u4eecrandomly take some photo\uff0cthen launch their AI\u3002They only need to they have"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_13-41-27_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0035_off0.0_to30.0_srcwav@1.539",
+      "source_filename": "ben_ucpk2_2026-08-13_13-41-27_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0035_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_1",
+      "duration_s": 22.4,
+      "scores": {
+        "Ben Lin": 0.107,
+        "Sam Yu": 0.566
+      },
+      "best": "Sam Yu",
+      "best_score": 0.566,
+      "margin": 0.459,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.459",
+      "text": "So as, as a s-- as a, as a, as a salesperson or as a person that has to introduce tech, wh"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-23-27_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0125_off0.0_to30.0_srcwav@0.019",
+      "source_filename": "ben_ucpk2_2026-08-13_14-23-27_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0125_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 20.48,
+      "scores": {
+        "Ben Lin": 0.0959,
+        "Sam Yu": 0.5431
+      },
+      "best": "Sam Yu",
+      "best_score": 0.5431,
+      "margin": 0.4472,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.447",
+      "text": "What you have to do with the function. As I-- as-- even when I give you these, uh, feedbac"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-34-11_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0148_off0.0_to30.0_srcwav@0.059",
+      "source_filename": "ben_ucpk2_2026-08-13_14-34-11_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0148_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 19.5,
+      "scores": {
+        "Ben Lin": 0.4182,
+        "Sam Yu": 0.1082
+      },
+      "best": "Ben Lin",
+      "best_score": 0.4182,
+      "margin": 0.31,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.310",
+      "text": "By the way, there's an email sent to you from Amazon and from noreplyaws@amazon.com sent t"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_13-25-03_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0000_off0.0_to30.0_srcwav@10.719",
+      "source_filename": "ben_ucpk2_2026-08-13_13-25-03_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0000_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 19.24,
+      "scores": {
+        "Ben Lin": 0.1007,
+        "Sam Yu": 0.586
+      },
+      "best": "Sam Yu",
+      "best_score": 0.586,
+      "margin": 0.4852,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.485",
+      "text": "Uh, yeah. No, no. I mean, like the lo- list of people that I actually approached. And I th"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_13-29-47_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0010_off0.0_to30.0_srcwav@10.199",
+      "source_filename": "ben_ucpk2_2026-08-13_13-29-47_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0010_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 17.84,
+      "scores": {
+        "Ben Lin": 0.0911,
+        "Sam Yu": 0.5627
+      },
+      "best": "Sam Yu",
+      "best_score": 0.5627,
+      "margin": 0.4717,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.472",
+      "text": "So he finally talked. I don't know, I put-- I think I put that in the notes. So he told me"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-21-07_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0120_off0.0_to30.0_srcwav@9.92",
+      "source_filename": "ben_ucpk2_2026-08-13_14-21-07_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0120_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 17.72,
+      "scores": {
+        "Ben Lin": 0.0855,
+        "Sam Yu": 0.5597
+      },
+      "best": "Sam Yu",
+      "best_score": 0.5597,
+      "margin": 0.4742,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.474",
+      "text": "So the device is important, it has to look very harmless, and then the software is where t"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_13-41-55_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0036_off0.0_to30.0_srcwav@0.68",
+      "source_filename": "ben_ucpk2_2026-08-13_13-41-55_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0036_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 17.28,
+      "scores": {
+        "Ben Lin": 0.0953,
+        "Sam Yu": 0.5092
+      },
+      "best": "Sam Yu",
+      "best_score": 0.5092,
+      "margin": 0.4139,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.414",
+      "text": "And then they launch a ticket to procure it of a known looking thing. Oh, yeah. PPTQ\u51e0\u767e\u5757\u6ca1\u6240\u8c13"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_13-58-43_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0072_off0.0_to30.0_srcwav@12.859",
+      "source_filename": "ben_ucpk2_2026-08-13_13-58-43_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0072_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_1",
+      "duration_s": 15.82,
+      "scores": {
+        "Ben Lin": 0.071,
+        "Sam Yu": 0.4613
+      },
+      "best": "Sam Yu",
+      "best_score": 0.4613,
+      "margin": 0.3903,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.390",
+      "text": "So we need to find people that would pay for it themselves. And it sounds like it's a devi"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-11-47_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0100_off0.0_to30.0_srcwav@0.059",
+      "source_filename": "ben_ucpk2_2026-08-13_14-11-47_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0100_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 15.8,
+      "scores": {
+        "Ben Lin": 0.2455,
+        "Sam Yu": 0.0382
+      },
+      "best": "Ben Lin",
+      "best_score": 0.2455,
+      "margin": 0.2073,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.207",
+      "text": "That again, if you ask them, they barely get the correct answer. I said, \"Hey,\" for the, t"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-29-31_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0138_off0.0_to30.0_srcwav@4.319",
+      "source_filename": "ben_ucpk2_2026-08-13_14-29-31_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0138_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_1",
+      "duration_s": 15.26,
+      "scores": {
+        "Ben Lin": 0.419,
+        "Sam Yu": 0.0965
+      },
+      "best": "Ben Lin",
+      "best_score": 0.419,
+      "margin": 0.3225,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.323",
+      "text": "Yeah, the bottom line for them time is people, a project PM, they don't have tangible info"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-09-27_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0095_off0.0_to30.0_srcwav@12.3",
+      "source_filename": "ben_ucpk2_2026-08-13_14-09-27_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0095_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_1",
+      "duration_s": 14.9,
+      "scores": {
+        "Ben Lin": 0.0839,
+        "Sam Yu": 0.6154
+      },
+      "best": "Sam Yu",
+      "best_score": 0.6154,
+      "margin": 0.5315,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.532",
+      "text": "Right. Yeah. So from the product point of view, site-- uh, for this note-taking function, "
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_13-43-47_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0040_off0.0_to30.0_srcwav@3.439",
+      "source_filename": "ben_ucpk2_2026-08-13_13-43-47_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0040_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 14.88,
+      "scores": {
+        "Ben Lin": 0.3467,
+        "Sam Yu": 0.093
+      },
+      "best": "Ben Lin",
+      "best_score": 0.3467,
+      "margin": 0.2538,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.254",
+      "text": "Yeah, going to external first. That's why we stop convince people from... And the GIB is c"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_13-56-51_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0068_off0.0_to30.0_srcwav@13.799",
+      "source_filename": "ben_ucpk2_2026-08-13_13-56-51_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0068_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 14.44,
+      "scores": {
+        "Ben Lin": 0.1382,
+        "Sam Yu": 0.5266
+      },
+      "best": "Sam Yu",
+      "best_score": 0.5266,
+      "margin": 0.3884,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.388",
+      "text": "Yeah. So, uh, that's, that's, uh, so definitely agree there's a market to putting that tem"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_13-45-39_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0044_off0.0_to30.0_srcwav@1.259",
+      "source_filename": "ben_ucpk2_2026-08-13_13-45-39_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0044_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_1",
+      "duration_s": 14.3,
+      "scores": {
+        "Ben Lin": 0.0912,
+        "Sam Yu": 0.5809
+      },
+      "best": "Sam Yu",
+      "best_score": 0.5809,
+      "margin": 0.4896,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.490",
+      "text": "And then, uh, when I went to the doctor's appointment with my dad, for another thing, not "
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-20-11_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0118_off0.0_to30.0_srcwav@12.139",
+      "source_filename": "ben_ucpk2_2026-08-13_14-20-11_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0118_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 14.24,
+      "scores": {
+        "Ben Lin": 0.1002,
+        "Sam Yu": 0.5327
+      },
+      "best": "Sam Yu",
+      "best_score": 0.5327,
+      "margin": 0.4325,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.432",
+      "text": "But he's just very focused with lawyers now. So after I l- look at this device and I'm thi"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-00-07_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0075_off0.0_to30.0_srcwav@6.5",
+      "source_filename": "ben_ucpk2_2026-08-13_14-00-07_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0075_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 14.24,
+      "scores": {
+        "Ben Lin": 0.3321,
+        "Sam Yu": 0.0226
+      },
+      "best": "Ben Lin",
+      "best_score": 0.3321,
+      "margin": 0.3096,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.310",
+      "text": "... combine them together. But the thing is, on site, like we're trying to make people, or"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_13-52-11_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0058_off0.0_to30.0_srcwav@9.84",
+      "source_filename": "ben_ucpk2_2026-08-13_13-52-11_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0058_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 13.92,
+      "scores": {
+        "Ben Lin": 0.3864,
+        "Sam Yu": 0.0456
+      },
+      "best": "Ben Lin",
+      "best_score": 0.3864,
+      "margin": 0.3407,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.341",
+      "text": "Yeah. The main contractor want, want to get, yeah, want to get the maintenance quicker bec"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-28-35_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0136_off0.0_to30.0_srcwav@5.099",
+      "source_filename": "ben_ucpk2_2026-08-13_14-28-35_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0136_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 13.88,
+      "scores": {
+        "Ben Lin": 0.1041,
+        "Sam Yu": 0.5602
+      },
+      "best": "Sam Yu",
+      "best_score": 0.5602,
+      "margin": 0.4561,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.456",
+      "text": "Is it, you know, is there other technology solving problem that is easier to sell into in "
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_13-51-43_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0057_off0.0_to30.0_srcwav@4.92",
+      "source_filename": "ben_ucpk2_2026-08-13_13-51-43_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0057_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 13.7,
+      "scores": {
+        "Ben Lin": 0.3273,
+        "Sam Yu": 0.0531
+      },
+      "best": "Ben Lin",
+      "best_score": 0.3273,
+      "margin": 0.2742,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.274",
+      "text": "You have article one all the time with you, and now I'm visiting on site. You pass on to m"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-20-39_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0119_off0.0_to30.0_srcwav@9.159",
+      "source_filename": "ben_ucpk2_2026-08-13_14-20-39_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0119_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 13.68,
+      "scores": {
+        "Ben Lin": 0.0931,
+        "Sam Yu": 0.5679
+      },
+      "best": "Sam Yu",
+      "best_score": 0.5679,
+      "margin": 0.4749,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.475",
+      "text": "... then, you know, it's a collar, and then it has to look small and harmless, and privacy"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_13-26-31_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0003_off0.0_to30.0_srcwav@11.48",
+      "source_filename": "ben_ucpk2_2026-08-13_13-26-31_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0003_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 13.64,
+      "scores": {
+        "Ben Lin": 0.1306,
+        "Sam Yu": 0.5284
+      },
+      "best": "Sam Yu",
+      "best_score": 0.5284,
+      "margin": 0.3978,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.398",
+      "text": "But I can look it up here 'cause, in here anyway. Um, so I have a list that I give to Benn"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_13-34-55_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0021_off0.0_to30.0_srcwav@8.939",
+      "source_filename": "ben_ucpk2_2026-08-13_13-34-55_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0021_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 13.56,
+      "scores": {
+        "Ben Lin": 0.1279,
+        "Sam Yu": 0.5449
+      },
+      "best": "Sam Yu",
+      "best_score": 0.5449,
+      "margin": 0.417,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.417",
+      "text": "It's, uh, it's how you sell it into it. So let's say you advocate as, \"Well, Phil is reall"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-31-51_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0143_off0.0_to30.0_srcwav@16.84",
+      "source_filename": "ben_ucpk2_2026-08-13_14-31-51_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0143_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 13.14,
+      "scores": {
+        "Ben Lin": 0.1212,
+        "Sam Yu": 0.5208
+      },
+      "best": "Sam Yu",
+      "best_score": 0.5208,
+      "margin": 0.3996,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.400",
+      "text": "But no response, right? So, so what's the bottleneck, you know? But I hear there's a usage"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-25-47_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0130_off0.0_to30.0_srcwav@0.159",
+      "source_filename": "ben_ucpk2_2026-08-13_14-25-47_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0130_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 12.96,
+      "scores": {
+        "Ben Lin": 0.0672,
+        "Sam Yu": 0.5181
+      },
+      "best": "Sam Yu",
+      "best_score": 0.5181,
+      "margin": 0.4509,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.451",
+      "text": "And, you know. And then actually from the j- the doctor, you know, he's just a patient and"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-01-03_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0077_off0.0_to30.0_srcwav@13.699",
+      "source_filename": "ben_ucpk2_2026-08-13_14-01-03_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0077_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 12.8,
+      "scores": {
+        "Ben Lin": 0.3821,
+        "Sam Yu": 0.0691
+      },
+      "best": "Ben Lin",
+      "best_score": 0.3821,
+      "margin": 0.313,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.313",
+      "text": "... the size. Soft base, yes, it does. And, uh, what I found, they-- At this stage, yes. T"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-10-51_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0098_off0.0_to30.0_srcwav@2.0",
+      "source_filename": "ben_ucpk2_2026-08-13_14-10-51_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0098_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 12.76,
+      "scores": {
+        "Ben Lin": 0.0759,
+        "Sam Yu": 0.6019
+      },
+      "best": "Sam Yu",
+      "best_score": 0.6019,
+      "margin": 0.5259,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.526",
+      "text": "Okay. So from a product development point of view, you want to develop product for the CM "
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-25-19_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0129_off0.0_to30.0_srcwav@9.739",
+      "source_filename": "ben_ucpk2_2026-08-13_14-25-19_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0129_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 12.52,
+      "scores": {
+        "Ben Lin": 0.1371,
+        "Sam Yu": 0.5713
+      },
+      "best": "Sam Yu",
+      "best_score": 0.5713,
+      "margin": 0.4342,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.434",
+      "text": "So you just have to go-- So they're kind of like your site, uh, coordinators. They don't r"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_13-53-35_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0061_off0.0_to30.0_srcwav@6.259",
+      "source_filename": "ben_ucpk2_2026-08-13_13-53-35_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0061_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 12.28,
+      "scores": {
+        "Ben Lin": 0.0886,
+        "Sam Yu": 0.5926
+      },
+      "best": "Sam Yu",
+      "best_score": 0.5926,
+      "margin": 0.504,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.504",
+      "text": "But I'm even talking about the next phase, which is, so how do we buy it? That's why I kee"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_13-43-19_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0039_off0.0_to30.0_srcwav@17.799",
+      "source_filename": "ben_ucpk2_2026-08-13_13-43-19_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0039_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 12.08,
+      "scores": {
+        "Ben Lin": 0.2973,
+        "Sam Yu": -0.0064
+      },
+      "best": "Ben Lin",
+      "best_score": 0.2973,
+      "margin": 0.3037,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.304",
+      "text": "And we, we started, we, we, we started, right? But we couldn't. So that's a way. But the r"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_13-32-07_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0015_off0.0_to30.0_srcwav@2.819",
+      "source_filename": "ben_ucpk2_2026-08-13_13-32-07_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0015_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 12.06,
+      "scores": {
+        "Ben Lin": 0.0685,
+        "Sam Yu": 0.6248
+      },
+      "best": "Sam Yu",
+      "best_score": 0.6248,
+      "margin": 0.5563,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.556",
+      "text": "Or they tell me their circumstance. So for example, City Care, what's the recent one? Oh, "
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-24-23_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0127_off0.0_to30.0_srcwav@0.419",
+      "source_filename": "ben_ucpk2_2026-08-13_14-24-23_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0127_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 11.86,
+      "scores": {
+        "Ben Lin": 0.0929,
+        "Sam Yu": 0.5464
+      },
+      "best": "Sam Yu",
+      "best_score": 0.5464,
+      "margin": 0.4536,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.454",
+      "text": "But as long as you know, oh, he's speaking from the jiao du of, um, uh, um, uh, the ultima"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_13-51-15_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0056_off0.0_to30.0_srcwav@7.48",
+      "source_filename": "ben_ucpk2_2026-08-13_13-51-15_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0056_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 10.8,
+      "scores": {
+        "Ben Lin": 0.3677,
+        "Sam Yu": 0.0496
+      },
+      "best": "Ben Lin",
+      "best_score": 0.3677,
+      "margin": 0.318,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.318",
+      "text": "But if main contractor provide their devices, \"Hey, you may try this thing,\" you have the "
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_13-58-15_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0071_off0.0_to30.0_srcwav@13.679",
+      "source_filename": "ben_ucpk2_2026-08-13_13-58-15_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0071_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_1",
+      "duration_s": 10.74,
+      "scores": {
+        "Ben Lin": 0.1135,
+        "Sam Yu": 0.5686
+      },
+      "best": "Sam Yu",
+      "best_score": 0.5686,
+      "margin": 0.455,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.455",
+      "text": "So I agree city council people, but you would also agree from your logic and your explanat"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-27-39_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0134_off0.0_to30.0_srcwav@17.379",
+      "source_filename": "ben_ucpk2_2026-08-13_14-27-39_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0134_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 10.68,
+      "scores": {
+        "Ben Lin": 0.1362,
+        "Sam Yu": 0.5428
+      },
+      "best": "Sam Yu",
+      "best_score": 0.5428,
+      "margin": 0.4066,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.407",
+      "text": "Well\uff0cyou don't have the pressure at this moment of the resourcing of this idea\uff0cright\uff1fThat'"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_13-31-11_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0013_off0.0_to30.0_srcwav@10.5",
+      "source_filename": "ben_ucpk2_2026-08-13_13-31-11_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0013_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 10.64,
+      "scores": {
+        "Ben Lin": 0.1093,
+        "Sam Yu": 0.5511
+      },
+      "best": "Sam Yu",
+      "best_score": 0.5511,
+      "margin": 0.4418,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.442",
+      "text": "Yeah. Kiwis and Australians probably don't respond. If I push a bit more and they respond,"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-23-55_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0126_off0.0_to30.0_srcwav@10.079",
+      "source_filename": "ben_ucpk2_2026-08-13_14-23-55_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0126_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 10.58,
+      "scores": {
+        "Ben Lin": 0.0775,
+        "Sam Yu": 0.4722
+      },
+      "best": "Sam Yu",
+      "best_score": 0.4722,
+      "margin": 0.3948,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.395",
+      "text": "And, and, and why\u81ea\u5df1\u4eba\u90fd\u4e0d\u7528\uff0c\u6240\u4ee5\u6211\u8bf4\u5916\u9762\u7684\u4eba\u66f4\u96be\u3002But\u8fd9\u4e2a\u6c38\u8fdc\u662f\u4e00\u4e2aproduct development\u8fc7\u7a0b\u3002"
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-32-19_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0144_off0.0_to30.0_srcwav@14.859",
+      "source_filename": "ben_ucpk2_2026-08-13_14-32-19_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0144_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_0",
+      "duration_s": 10.56,
+      "scores": {
+        "Ben Lin": 0.1015,
+        "Sam Yu": 0.5347
+      },
+      "best": "Sam Yu",
+      "best_score": 0.5347,
+      "margin": 0.4332,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.433",
+      "text": "And just go $300 rather than 350, and use a software that's a bit more easier to use than "
+    },
+    {
+      "turn_ref": "ben_ucpk2_2026-08-13_14-05-43_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0087_off0.0_to30.0_srcwav@11.159",
+      "source_filename": "ben_ucpk2_2026-08-13_14-05-43_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0087_off0.0_to30.0_srcwav.json",
+      "speaker_label": "spk_1",
+      "duration_s": 10.5,
+      "scores": {
+        "Ben Lin": 0.3465,
+        "Sam Yu": 0.0014
+      },
+      "best": "Ben Lin",
+      "best_score": 0.3465,
+      "margin": 0.3451,
+      "status": "confirmed",
+      "reason": "clear of the runner-up by 0.345",
+      "text": "\u5426\u5219\u4ed6\u5982\u679c\u53ef\u4ee5\uff0cfor example\uff0ceight hours a day\uff0cthey finish on time\uff0cand even they only work six hour"
+    }
+  ],
+  "by_group": [
+    {
+      "file": "ben_ucpk2_2026-08-13_14-09-55_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0096_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.0781,
+        "Sam Yu": 0.5023
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_14-07-07_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0090_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.3543,
+        "Sam Yu": -0.0048
+      },
+      "winner": "Ben Lin"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_13-41-27_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0035_off0.0_to30.0_srcwav.json",
+      "label": "spk_1",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.107,
+        "Sam Yu": 0.566
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_14-23-27_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0125_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.0959,
+        "Sam Yu": 0.5431
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_14-34-11_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0148_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.4182,
+        "Sam Yu": 0.1082
+      },
+      "winner": "Ben Lin"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_13-25-03_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0000_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.1007,
+        "Sam Yu": 0.586
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_13-29-47_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0010_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.0911,
+        "Sam Yu": 0.5627
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_14-21-07_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0120_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.0855,
+        "Sam Yu": 0.5597
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_13-41-55_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0036_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.0953,
+        "Sam Yu": 0.5092
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_13-58-43_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0072_off0.0_to30.0_srcwav.json",
+      "label": "spk_1",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.071,
+        "Sam Yu": 0.4613
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_14-11-47_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0100_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.2455,
+        "Sam Yu": 0.0382
+      },
+      "winner": "Ben Lin"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_14-29-31_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0138_off0.0_to30.0_srcwav.json",
+      "label": "spk_1",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.419,
+        "Sam Yu": 0.0965
+      },
+      "winner": "Ben Lin"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_14-09-27_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0095_off0.0_to30.0_srcwav.json",
+      "label": "spk_1",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.0839,
+        "Sam Yu": 0.6154
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_13-43-47_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0040_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.3467,
+        "Sam Yu": 0.093
+      },
+      "winner": "Ben Lin"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_13-56-51_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0068_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.1382,
+        "Sam Yu": 0.5266
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_13-45-39_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0044_off0.0_to30.0_srcwav.json",
+      "label": "spk_1",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.0912,
+        "Sam Yu": 0.5809
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_14-20-11_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0118_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.1002,
+        "Sam Yu": 0.5327
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_14-00-07_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0075_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.3321,
+        "Sam Yu": 0.0226
+      },
+      "winner": "Ben Lin"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_13-52-11_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0058_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.3864,
+        "Sam Yu": 0.0456
+      },
+      "winner": "Ben Lin"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_14-28-35_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0136_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.1041,
+        "Sam Yu": 0.5602
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_13-51-43_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0057_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.3273,
+        "Sam Yu": 0.0531
+      },
+      "winner": "Ben Lin"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_14-20-39_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0119_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.0931,
+        "Sam Yu": 0.5679
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_13-26-31_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0003_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.1306,
+        "Sam Yu": 0.5284
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_13-34-55_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0021_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.1279,
+        "Sam Yu": 0.5449
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_14-31-51_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0143_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.1212,
+        "Sam Yu": 0.5208
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_14-25-47_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0130_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.0672,
+        "Sam Yu": 0.5181
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_14-01-03_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0077_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.3821,
+        "Sam Yu": 0.0691
+      },
+      "winner": "Ben Lin"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_14-10-51_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0098_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.0759,
+        "Sam Yu": 0.6019
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_14-25-19_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0129_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.1371,
+        "Sam Yu": 0.5713
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_13-53-35_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0061_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.0886,
+        "Sam Yu": 0.5926
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_13-43-19_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0039_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.2973,
+        "Sam Yu": -0.0064
+      },
+      "winner": "Ben Lin"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_13-32-07_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0015_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.0685,
+        "Sam Yu": 0.6248
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_14-24-23_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0127_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.0929,
+        "Sam Yu": 0.5464
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_13-51-15_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0056_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.3677,
+        "Sam Yu": 0.0496
+      },
+      "winner": "Ben Lin"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_13-58-15_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0071_off0.0_to30.0_srcwav.json",
+      "label": "spk_1",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.1135,
+        "Sam Yu": 0.5686
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_14-27-39_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0134_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.1362,
+        "Sam Yu": 0.5428
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_13-31-11_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0013_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.1093,
+        "Sam Yu": 0.5511
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_14-23-55_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0126_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.0775,
+        "Sam Yu": 0.4722
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_14-32-19_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0144_off0.0_to30.0_srcwav.json",
+      "label": "spk_0",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.1015,
+        "Sam Yu": 0.5347
+      },
+      "winner": "Sam Yu"
+    },
+    {
+      "file": "ben_ucpk2_2026-08-13_14-05-43_sid15770a285fc0478c8abcf4ed3f8bcfd0_c0087_off0.0_to30.0_srcwav.json",
+      "label": "spk_1",
+      "turns": 1,
+      "mean_scores": {
+        "Ben Lin": 0.3465,
+        "Sam Yu": 0.0014
+      },
+      "winner": "Ben Lin"
+    }
+  ]
+}

@@ -1,0 +1,363 @@
+<title>Who Is Speaking</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+  :root{
+    --ground:#E9EEF2; --sheet:#FDFEFE; --rule:#C3D2DC; --rule-soft:#DCE6EC;
+    --ink:#123047; --ink-soft:#4A6478; --ink-faint:#7D94A4;
+    --mark:#C63329; --mark-soft:#F4DCDA;
+    --done:#1F6F5C; --done-soft:#DCEBE6;
+    --shadow:0 1px 0 rgba(18,48,71,.06), 0 8px 24px -18px rgba(18,48,71,.5);
+    --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+    --disp:'Archivo',system-ui,sans-serif;
+    --body:'Inter',system-ui,sans-serif;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --ground:#0B1922; --sheet:#11242F; --rule:#27414F; --rule-soft:#1B3341;
+      --ink:#DCE8EF; --ink-soft:#9FB6C4; --ink-faint:#6C8798;
+      --mark:#F06A5E; --mark-soft:#3A1F1E;
+      --done:#57BFA1; --done-soft:#12312A;
+      --shadow:0 1px 0 rgba(0,0,0,.3), 0 10px 30px -20px #000;
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#0B1922; --sheet:#11242F; --rule:#27414F; --rule-soft:#1B3341;
+    --ink:#DCE8EF; --ink-soft:#9FB6C4; --ink-faint:#6C8798;
+    --mark:#F06A5E; --mark-soft:#3A1F1E;
+    --done:#57BFA1; --done-soft:#12312A;
+    --shadow:0 1px 0 rgba(0,0,0,.3), 0 10px 30px -20px #000;
+  }
+
+  *{box-sizing:border-box}
+  body{
+    background:var(--ground); color:var(--ink); font-family:var(--body);
+    font-size:15px; line-height:1.55; margin:0;
+    background-image:linear-gradient(var(--rule-soft) 1px, transparent 1px),
+                     linear-gradient(90deg, var(--rule-soft) 1px, transparent 1px);
+    background-size:28px 28px;
+  }
+  .wrap{max-width:780px; margin:0 auto; padding-block:24px 64px; padding-left:16px; padding-right:16px}
+
+  header{display:flex; flex-wrap:wrap; gap:12px 20px; align-items:baseline; margin-bottom:18px}
+  h1{
+    font-family:var(--disp); font-weight:700; font-size:clamp(22px,4.4vw,30px);
+    letter-spacing:-.015em; margin:0; text-wrap:balance;
+  }
+  .sub{color:var(--ink-soft); font-size:13.5px; margin:0}
+  .rail{
+    display:flex; gap:3px; flex-wrap:wrap; margin:14px 0 20px;
+    padding:10px 12px; background:var(--sheet); border:1px solid var(--rule);
+    border-radius:3px; box-shadow:var(--shadow);
+  }
+  .tick{
+    width:13px; height:22px; border-radius:2px; background:var(--rule-soft);
+    border:1px solid var(--rule); cursor:pointer; padding:0;
+  }
+  .tick[data-s="done"]{background:var(--done); border-color:var(--done)}
+  .tick[data-s="cur"]{background:var(--mark); border-color:var(--mark)}
+  .tick:focus-visible{outline:2px solid var(--mark); outline-offset:2px}
+  .railmeta{
+    margin-left:auto; font-family:var(--mono); font-size:12px; color:var(--ink-soft);
+    align-self:center; font-variant-numeric:tabular-nums;
+  }
+
+  .card{
+    background:var(--sheet); border:1px solid var(--rule); border-radius:3px;
+    box-shadow:var(--shadow); padding:20px; margin-bottom:16px;
+  }
+  .stamp{
+    display:flex; flex-wrap:wrap; gap:6px 14px; font-family:var(--mono);
+    font-size:11.5px; color:var(--ink-faint); text-transform:uppercase;
+    letter-spacing:.06em; border-bottom:1px solid var(--rule-soft);
+    padding-bottom:12px; margin-bottom:16px;
+  }
+  .stamp b{color:var(--ink-soft); font-weight:500}
+
+  .transport{display:flex; gap:14px; align-items:center; margin-bottom:16px}
+  .play{
+    width:58px; height:58px; flex:none; border-radius:50%; border:2px solid var(--ink);
+    background:transparent; color:var(--ink); cursor:pointer; display:grid;
+    place-items:center; transition:background .12s, color .12s;
+  }
+  .play:hover{background:var(--ink); color:var(--sheet)}
+  .play:focus-visible{outline:2px solid var(--mark); outline-offset:3px}
+  .play svg{width:20px; height:20px}
+  .bar{flex:1; min-width:0}
+  .track{height:6px; background:var(--rule-soft); border-radius:3px; overflow:hidden}
+  .fill{height:100%; width:0; background:var(--mark); transition:width .08s linear}
+  .times{
+    display:flex; justify-content:space-between; font-family:var(--mono);
+    font-size:11.5px; color:var(--ink-faint); margin-top:5px;
+    font-variant-numeric:tabular-nums;
+  }
+
+  .quote{
+    font-size:15px; color:var(--ink-soft); border-left:3px solid var(--rule);
+    padding:2px 0 2px 14px; margin:0 0 4px; font-style:italic;
+  }
+  .quote-note{font-size:12px; color:var(--ink-faint); margin:8px 0 0}
+
+  h2{
+    font-family:var(--disp); font-size:12px; font-weight:600; text-transform:uppercase;
+    letter-spacing:.1em; color:var(--ink-faint); margin:0 0 10px;
+  }
+  .opts{display:grid; grid-template-columns:repeat(auto-fill,minmax(168px,1fr)); gap:8px}
+  .opt{
+    display:flex; align-items:center; gap:10px; text-align:left; cursor:pointer;
+    border:1px solid var(--rule); background:transparent; color:var(--ink);
+    border-radius:3px; padding:10px 12px; font:inherit; font-size:14px;
+    transition:border-color .12s, background .12s;
+  }
+  .opt:hover{border-color:var(--ink-soft)}
+  .opt:focus-visible{outline:2px solid var(--mark); outline-offset:2px}
+  .opt[aria-pressed="true"]{border-color:var(--done); background:var(--done-soft)}
+  .opt kbd{
+    font-family:var(--mono); font-size:11px; background:var(--rule-soft);
+    border:1px solid var(--rule); border-radius:2px; padding:1px 6px; color:var(--ink-soft);
+  }
+  .opt[aria-pressed="true"] kbd{background:var(--done); border-color:var(--done); color:var(--sheet)}
+  .opts--special{margin-top:10px; grid-template-columns:repeat(auto-fill,minmax(210px,1fr))}
+  .opts--special .opt{border-style:dashed}
+
+  .why{margin-top:14px; border-top:1px solid var(--rule-soft); padding-top:12px}
+  .why summary{
+    cursor:pointer; font-size:12.5px; color:var(--ink-faint);
+    font-family:var(--disp); text-transform:uppercase; letter-spacing:.08em;
+  }
+  .why p{font-size:13.5px; color:var(--ink-soft); margin:10px 0 0}
+  .why b{color:var(--ink)}
+
+  .nav{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
+  .btn{
+    font:inherit; font-size:14px; padding:9px 16px; border-radius:3px; cursor:pointer;
+    border:1px solid var(--rule); background:transparent; color:var(--ink);
+  }
+  .btn:hover{border-color:var(--ink-soft)}
+  .btn:focus-visible{outline:2px solid var(--mark); outline-offset:2px}
+  .btn--go{background:var(--ink); border-color:var(--ink); color:var(--sheet)}
+  .status{
+    margin-left:auto; font-family:var(--mono); font-size:11.5px; color:var(--ink-faint);
+  }
+  .status[data-warn="1"]{color:var(--mark)}
+
+  footer{margin-top:22px; font-size:12.5px; color:var(--ink-faint)}
+  footer code{font-family:var(--mono); font-size:11.5px}
+  @media (prefers-reduced-motion: reduce){*{transition:none !important}}
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Who Is Speaking</h1>
+    <p class="sub">42 clips &middot; 7 people on site &middot; 30 July &ndash; 25 September</p>
+  </header>
+
+  <div class="rail" id="rail" aria-label="Progress"></div>
+
+  <div class="card">
+    <div class="stamp" id="stamp"></div>
+
+    <div class="transport">
+      <button class="play" id="play" aria-label="Play clip (Space)">
+        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path id="picon" d="M8 5v14l11-7z"/></svg>
+      </button>
+      <div class="bar">
+        <div class="track"><div class="fill" id="fill"></div></div>
+        <div class="times"><span id="tnow">0.0s</span><span id="tlen"></span></div>
+      </div>
+    </div>
+
+    <p class="quote" id="quote"></p>
+    <p class="quote-note">The transcriber's guess at the words &mdash; it gets names wrong, so read it for context, not for the answer.</p>
+  </div>
+
+  <div class="card">
+    <h2>Whose voice is this?</h2>
+    <div class="opts" id="people"></div>
+    <div class="opts opts--special" id="special"></div>
+
+    <details class="why">
+      <summary>Why three answers that are not a name</summary>
+      <p><b>Not sure</b> &mdash; use it freely. A forced guess and a confident label look identical once
+      they are in the file, and a curve built on quietly-guessed labels is worse than no curve,
+      because it looks like one.</p>
+      <p><b>Someone else</b> &mdash; a real person, none of those listed. This is the most valuable
+      answer here. Without clips where nobody in the library was present, there is no way to tell
+      &ldquo;the system recognised Ben&rdquo; from &ldquo;the system picks Ben out of anyone&rdquo;
+      &mdash; which is exactly what happened on 10 September, when a stranger was confirmed at 0.445.</p>
+      <p><b>Unusable</b> &mdash; silence, noise, or cut off mid-word. Better recorded than laboured over.</p>
+    </details>
+  </div>
+
+  <div class="nav">
+    <button class="btn" id="prev">&larr; Back</button>
+    <button class="btn btn--go" id="next">Next &rarr;</button>
+    <span class="status" id="status">&nbsp;</span>
+  </div>
+
+  <footer>
+    Space plays &middot; number keys answer &middot; arrows move. Answers save as you go &mdash;
+    stop and come back. Clip ids are <code>folder / date / speaker-label</code>.
+  </footer>
+</div>
+
+<script>
+const CLIPS = [{"file":"c000.wav","folder":"Petros_Pan","date":"2026-09-22","label":"spk_2","dur":8.8,"text":"There is another generation we are dealing with the manuf- manufacturer. It's, um, only voice recording. It's a sm- small, like a recording pen.","url":"/_blob/18d53bf20f22e203f02204ea5db11878"},{"file":"c001.wav","folder":"James_Lamb","date":"2026-09-16","label":"spk_0","dur":38.7,"text":"Yeah. Yeah, yeah, yeah. Yeah. Yeah. So I've got, um, we've got a red light flashing here. Yeah. Yeah, yeah, I heard that, yeah","url":"/_blob/a418fd2cfd9036a40cc530f918024475"},{"file":"c002.wav","folder":"James_Lamb","date":"2026-09-17","label":"spk_0","dur":93.6,"text":"Heading on to Hanley's Farm project today. Trial number one for Hanley's Farm. Um, few jobs planned today. Um, about 9:30 there should be a couple of loads, two loads to be more precise, of, um, prefabricated structural panels, um, for a sc","url":"/_blob/335ca743374cf7050fbbec136c44c4d6"},{"file":"c003.wav","folder":"Sam_Yu","date":"2026-09-23","label":"spk_0","dur":5.4,"text":"Hi, just linking today's session with any photos or notes taken","url":"/_blob/5cf2684ffbc37cd2cb45a0413475e977"},{"file":"c004.wav","folder":"Neil_Blunden","date":"2026-08-14","label":"spk_0","dur":7,"text":"Recording started. Recording started. Recording started","url":"/_blob/b2c4a73c081e0e3d3a158b0a58a51d5c"},{"file":"c005.wav","folder":"James_Alcock","date":"2026-08-07","label":"spk_1","dur":12.1,"text":"Kiwi accent And people are just talking about should be should be clear enough according the especially in the room and after down that just finish press and hold to finish it","url":"/_blob/a8b1fea812433c4ec21fb2477e9741f4"},{"file":"c006.wav","folder":"Neil_Blunden","date":"2026-09-04","label":"spk_0","dur":22.4,"text":"Recording stop something. It has a more obvious screen. It's like a red button, you know? It's kind of like traditional, you click on and it cancel it, finishes. I think, I think that one's more obvious than this way. So I upgrade for you. ","url":"/_blob/a6735064d8bc73204a35baf6e5e8c365"},{"file":"c007.wav","folder":"Sam_Yu","date":"2026-08-08","label":"spk_0","dur":16.8,"text":"Hello, just doing a test meeting record. Just testing FieldSight AI at the moment and seeing if it synchronizes with, uh, some of my photos randomly picked of construction sites around the city.","url":"/_blob/4bb4eb6d42e207913374c69408fef574"},{"file":"c008.wav","folder":"Ben_Lin","date":"2026-09-11","label":"spk_0","dur":5.3,"text":"它 就 两 个 灯 ， 它 还 -- 这 还 有 两 个 灯 ， 这 两 个 灯 是 比 较 闪 ， 比 较 像 是 闪 光 灯 一 样 。","url":"/_blob/808992f0759f156a5ecdab6bfbc10d7a"},{"file":"c009.wav","folder":"Sam_Yu","date":"2026-08-12","label":"spk_0","dur":7.4,"text":"Oh two, three, six. Oh two, three, six. Oh two, three?","url":"/_blob/469b393b6fd2f660b14cea3f149984ac"},{"file":"c010.wav","folder":"Neil_Blunden","date":"2026-08-12","label":"spk_0","dur":11.6,"text":"Bulk of ceiling tiles removed from level two by midday. Joe and Troy have moved up to start removing tiles on level three.","url":"/_blob/b9601525ef2201f2a800b2eff8cf246c"},{"file":"c011.wav","folder":"Sam_Yu","date":"2026-08-13","label":"spk_0","dur":3.9,"text":"Rather than software. So if you, if you bring up the Claude software","url":"/_blob/d85c91e624eeb204283d96f367cedad3"},{"file":"c012.wav","folder":"Ben_UCPK2","date":"2026-08-10","label":"spk_0","dur":29.7,"text":"这 里 ， 这 里 是 麦 克 风 测 试 ， 忽 略 。 实 验 五 开 始 。 一 、 二 、 三 、 四 、 五 、 六 、 七 、 八 、 九 、 十 。 一 、 二 、 三 、 四 、 五 、 六 、 七 、 八 、 九 、 十 。 一 、 二 、 三 、 四 、 五 、 六 、 七 、 八 、 九 、 十 。","url":"/_blob/0642eab69d6ffbd83d4118e768b4416d"},{"file":"c013.wav","folder":"James_Alcock","date":"2026-08-07","label":"spk_0","dur":26.9,"text":"Recording started James we're gonna have a UCPK meeting next week next Monday is it Yeah next Monday for internal only Yeah that's it I think that's uh long enough to carry some information and uh being gonna come to here to set up a news n","url":"/_blob/97f66ffb56b15e20769d59bd06960ed0"},{"file":"c014.wav","folder":"Sam_Yu","date":"2026-08-13","label":"spk_1","dur":8.7,"text":"But, uh, you are... But he, what he was like, it doesn't have to because the Plaud stick with the ca- with the cell phone all the time","url":"/_blob/dfd1a805d75995083ce4c9424b465aed"},{"file":"c015.wav","folder":"Sam_Yu","date":"2026-08-12","label":"spk_0","dur":6.3,"text":"I will have a look, so we'll get a part from, okay?","url":"/_blob/0ad82fa68640944fc3d0610fedfc91df"},{"file":"c016.wav","folder":"Ben_Lin","date":"2026-09-15","label":"spk_0","dur":4.3,"text":"跳 一 次 啊 ， 答 应 好 的 啊 ， 一 次 。 我 也 跳 一 次 。","url":"/_blob/87ed2194c72ff0e12a160dba1fce9931"},{"file":"c017.wav","folder":"Ben_UCPK2","date":"2026-07-31","label":"spk_0","dur":4.8,"text":"现在 我来 看看 我 的 WiFi 的 事情 现在 的 WiFi 能够 用","url":"/_blob/93a61487f32fa30330976e1ec957af25"},{"file":"c018.wav","folder":"Ben_UCPK2","date":"2026-09-22","label":"spk_0","dur":21.9,"text":"Yeah, I think, I think it's a perfect idea. We will upgrade it. I think in the evidence in the future, we will create like the foot-- like a voi-voice print for each of the person. Like admin, you can save multiple people over the year. And","url":"/_blob/e140233908ffd728e2809ed2dee64856"},{"file":"c019.wav","folder":"Sam_Yu","date":"2026-08-09","label":"spk_0","dur":13.6,"text":"Just doing another test recording, uh, for meetings just to, uh, align the photos that I randomly take of sites.","url":"/_blob/95a5cca80d75d172304a92e0b561d6dc"},{"file":"c020.wav","folder":"Ben_UCPK2","date":"2026-08-27","label":"spk_0","dur":81,"text":"Well, we'll have a meeting with James and Benny this morning, eleven o'clock, talking about, uh, the FieldSight platform and the hardware. Show indicating what features we're gonna have. And, um, what I'm doing today, I'm going to check wit","url":"/_blob/d07c6038bd34ca18c41ad1cc8b71eb44"},{"file":"c021.wav","folder":"Ben_UCPK2","date":"2026-08-12","label":"spk_1","dur":3,"text":"The concrete pour is scheduled for Monday with the-","url":"/_blob/a48f1069d3057061591ea2e561d93e00"},{"file":"c022.wav","folder":"Ben_UCPK2","date":"2026-09-22","label":"spk_0","dur":22.4,"text":"Well, let me introduce any- everyone here. So this is Benny from Performance Construction. That's, uh, Performance Technology. And then that's, uh, uh, Will from Cassidy Construction. Pedro from Cassidy Construction, John from Cassidy Const","url":"/_blob/f7da705e2df262d5262059c3a372a859"},{"file":"c023.wav","folder":"Ben_Lin","date":"2026-09-15","label":"spk_0","dur":4,"text":"我 可 以 ， 我 可 以 教 你 。 跳 。","url":"/_blob/215193106bb9badd468949bf28f4c858"},{"file":"c024.wav","folder":"Ben_Lin","date":"2026-09-15","label":"spk_2","dur":3.8,"text":"一 次 对 不 对 ， 小 弟 弟 ？ 一 二 。","url":"/_blob/f7ff5d8a080182ffa89a7147fe9cdb94"},{"file":"c025.wav","folder":"Neil_Blunden","date":"2026-08-14","label":"spk_0","dur":11.7,"text":"I am gonna test, uh, one of the functions about our pause. Let's say if we-- if our conversation is gonna be record after, after pause. So","url":"/_blob/5d37eb419b8747a7f582a50cb6408a3a"},{"file":"c026.wav","folder":"Sam_Yu","date":"2026-08-12","label":"spk_0","dur":14.3,"text":"Right, I'm doing another trial testing of, um, FieldSight device. So I'm making a recording at the moment just so they can take some photos to link up with the software","url":"/_blob/a2aa3ef64355ec3c63411a98f8cdadda"},{"file":"c027.wav","folder":"Ben_Lin","date":"2026-09-15","label":"spk_1","dur":5.1,"text":"要 等 它 好 ， 恢 复 了 之 后 再 来 。 今 天 不 能 。 这 周 可 能 -","url":"/_blob/28c40ac7158eab826ff40cc998790955"},{"file":"c028.wav","folder":"Ben_UCPK","date":"2026-07-30","label":"spk_0","dur":3.7,"text":"干什么 呀 家里 干什么 搬床 对 不 对 把 床 给 布置 了","url":"/_blob/84212d198ca2b04bbed961ad1e40b82d"},{"file":"c029.wav","folder":"Ben_Lin","date":"2026-09-11","label":"spk_0","dur":6.4,"text":"对 ， 所 以 它 是 这 两 个 灯 。 主 要 的 闪 现 的 是 这 个 灯 ， 它 会 起","url":"/_blob/8505dfabb0f754f828f8a855d047db58"},{"file":"c030.wav","folder":"Ben_UCPK2","date":"2026-08-14","label":"spk_0","dur":5.3,"text":"It might not be in here now, but so I came in here and I was talking to","url":"/_blob/6efa4e01881ad166364b72d393873fc6"},{"file":"c031.wav","folder":"Neil_Blunden","date":"2026-08-13","label":"spk_0","dur":27.3,"text":"Ceiling tiles complete on level three for the removal. Joe and Troy have started on level four at approximately two o'clock. Everything's all tidied, left well. Clined a safety inspection of the site. Uh, was happy with everything across th","url":"/_blob/33d9eb457a5b22d4e41247f41595363f"},{"file":"c032.wav","folder":"Petros_Pan","date":"2026-09-22","label":"spk_0","dur":36,"text":"Test. Test, test. Hello, this is Petrus Pang from Cassidy Construction, uh, doing a test recording with Performance Tech, introducing, introducing this wonderful technology, AI camera, AI capture. Uh, sitting with me is John, uh, my dear bu","url":"/_blob/e957473fbfea5b84a56c125ff3a965bd"},{"file":"c033.wav","folder":"Ben_UCPK2","date":"2026-08-13","label":"spk_0","dur":28.4,"text":"Okay. So I'm talking to Ben about a construction project, um, in Manchester Street. Uh, but now I need to summarize. So let's say, uh, number one is about, um, lighting, and number one is, uh, we need to follow up about, um, one hundred and","url":"/_blob/376a9d33fb5487c5d4acf25005b7d82a"},{"file":"c034.wav","folder":"Ben_UCPK2","date":"2026-08-13","label":"spk_0","dur":11.8,"text":"OK， 我 测 试 一 下 还 会 不 会 把 Recording started 这 个 语 音 给 收 进 去 。 开 头 应 该 是 没 有 的 ， 就 是 中 间 暂 - 暂 停 这 件 事 情 。","url":"/_blob/332e02f43243f047ef61b9caea7b1944"},{"file":"c035.wav","folder":"Petros_Pan","date":"2026-09-22","label":"spk_0","dur":4.9,"text":"Yeah. Just for those instances where like 100% sure you're not being recorded by video.","url":"/_blob/b8eb9296f8d085577ddf3e4621cf1cdb"},{"file":"c036.wav","folder":"Sam_Yu","date":"2026-08-12","label":"spk_0","dur":3.9,"text":"Make that a part will be sent here. Can we get a brand new part?","url":"/_blob/8d1d706b47e9f91c846c61a9b2b75bed"},{"file":"c037.wav","folder":"John_Gudsell","date":"2026-09-25","label":"spk_0","dur":4.4,"text":"Are you GIB Technology? Okay","url":"/_blob/e69b93688efe66dc52660b55553eed94"},{"file":"c038.wav","folder":"Ben_UCPK2","date":"2026-08-09","label":"spk_1","dur":26.8,"text":"我 们 是 不 是 去 Bunnings 把 木 头 先 买 了 ？ 哦 对 ， 去 Mitre 10， 对 ， 我 们 买 一 个 小 的 木 柄 ， 然 后 买 点 螺 丝 ， 今 天 就 把 东 西 给 弄 了 。 看 看 还 有 什 么 ？ 哦 ， 要 带 钻 ， 要 带 我 的 冲 击 钻 ， 要 带 - 带 个 尺 子 量 一 下 。","url":"/_blob/6598f6809db80e7e7eedd09da93c7114"},{"file":"c039.wav","folder":"James_Lamb","date":"2026-09-16","label":"spk_0","dur":14.2,"text":"Oh, no, it's all right. No, no, you can put it as a Mancunian accent if you want, yeah. But we won't be speaking about Manchester City, whatever. No, there'll be too many profanities.","url":"/_blob/92b4772a584cab52f23b5308b6c1d90a"},{"file":"c040.wav","folder":"John_Gudsell","date":"2026-09-25","label":"spk_0","dur":54.7,"text":"I need to scan the code and write. Oh. Oh. No way. Crazy. Today's uploads. One uploaded, three held. Oh, where do I see those? Ah, bullshit. Two recordings arrived on this day. Can I listen to them? Can we report them? Right, how do I repor","url":"/_blob/6c548b2d04c0b306ae558bde9e4dec1f"},{"file":"c041.wav","folder":"Ben_UCPK2","date":"2026-08-09","label":"spk_1","dur":27.7,"text":"这 是 在 做 一 个 测 试 。 哦 ， 我 的 凭 证 过 期 了 ，AWS 凭 证 过 期 了 。5 分 钟 后 我 得 去 把 它 做 完 ， 因 为 Claude 没 法 跑 我 的 CLI。 还 有 什 么 ？ 还 有 明 天 去 一 趟 UCPK， 给 Neil。","url":"/_blob/579b78fff9462a12bb17dc2c65be9121"}];
+const PEOPLE = ["Ben Lin","James Alcock","James Lamb","John Gudsell","Neil Blunden","Petros Pan","Sam Yu"];
+const SPECIAL = [
+  {id:"__unsure__",  label:"Not sure"},
+  {id:"__other__",   label:"Someone else"},
+  {id:"__unusable__",label:"Unusable clip"}
+];
+
+let i = 0;
+const answers = Object.create(null);
+let db = null;
+let audio = new Audio();
+
+const $ = id => document.getElementById(id);
+const clipKey = c => c.file.replace(/\.wav$/, "");
+
+/* ---------- persistence -------------------------------------------------- */
+/* Answers go to the shared store, not to this browser: they are the product of
+   the sitting and Claude reads them back to build the curve. A viewer with no
+   store still gets a working page -- the status line says so rather than
+   pretending the work is being kept. */
+async function boot() {
+  try { db = await window.claude?.use?.("db") ?? null; } catch (e) { db = null; }
+  if (!db) { setStatus("not saving — no store on this view", true); render(); return; }
+  try {
+    const docs = await db.collection("labels").limit(500).get();
+    for (const d of (docs?.docs ?? docs ?? [])) {
+      const v = d.data ? d.data() : d;
+      if (v && v.clip) answers[v.clip] = v.answer;
+    }
+    const firstUnanswered = CLIPS.findIndex(c => !answers[clipKey(c)]);
+    i = firstUnanswered === -1 ? 0 : firstUnanswered;
+    setStatus(count() + " of " + CLIPS.length + " saved");
+  } catch (e) {
+    setStatus("could not read earlier answers", true);
+  }
+  render();
+}
+
+async function save(clip, answer) {
+  if (!db) return;
+  try {
+    await db.doc("labels/" + clip).set({ clip, answer, at: new Date().toISOString() });
+    setStatus(count() + " of " + CLIPS.length + " saved");
+  } catch (e) {
+    setStatus("that answer did not save", true);
+  }
+}
+
+const count = () => Object.keys(answers).length;
+function setStatus(text, warn) {
+  const el = $("status");
+  el.textContent = text;
+  if (warn) el.setAttribute("data-warn", "1"); else el.removeAttribute("data-warn");
+}
+
+/* ---------- rendering ---------------------------------------------------- */
+function render() {
+  const c = CLIPS[i];
+
+  const rail = $("rail");
+  rail.textContent = "";
+  CLIPS.forEach((cc, n) => {
+    const b = document.createElement("button");
+    b.className = "tick";
+    b.setAttribute("data-s", n === i ? "cur" : (answers[clipKey(cc)] ? "done" : "todo"));
+    b.title = "Clip " + (n + 1) + (answers[clipKey(cc)] ? " — answered" : "");
+    b.setAttribute("aria-label", b.title);
+    b.addEventListener("click", () => { i = n; render(); });
+    rail.appendChild(b);
+  });
+  const meta = document.createElement("span");
+  meta.className = "railmeta";
+  meta.textContent = count() + " / " + CLIPS.length + " answered";
+  rail.appendChild(meta);
+
+  $("stamp").textContent = "";
+  [["clip", (i + 1) + " of " + CLIPS.length],
+   ["recorded", c.date],
+   ["folder", c.folder],
+   ["speaker label", c.label],
+   ["length", c.dur + "s"]].forEach(([k, v]) => {
+    const s = document.createElement("span");
+    s.textContent = k + " ";
+    const b = document.createElement("b");
+    b.textContent = v;
+    s.appendChild(b);
+    $("stamp").appendChild(s);
+  });
+
+  $("quote").textContent = "“" + (c.text || "—") + "”";
+  $("tlen").textContent = c.dur.toFixed(1) + "s";
+  $("tnow").textContent = "0.0s";
+  $("fill").style.width = "0%";
+
+  audio.pause();
+  audio = new Audio(c.url);
+  audio.addEventListener("timeupdate", () => {
+    const pct = audio.duration ? (audio.currentTime / audio.duration) * 100 : 0;
+    $("fill").style.width = pct + "%";
+    $("tnow").textContent = audio.currentTime.toFixed(1) + "s";
+  });
+  audio.addEventListener("ended", () => { $("picon").setAttribute("d", "M8 5v14l11-7z"); });
+
+  const chosen = answers[clipKey(c)];
+  const build = (host, list, offset) => {
+    host.textContent = "";
+    list.forEach((o, n) => {
+      const key = String((offset + n + 1) % 10);
+      const b = document.createElement("button");
+      b.className = "opt";
+      b.setAttribute("aria-pressed", chosen === o.id ? "true" : "false");
+      const k = document.createElement("kbd");
+      k.textContent = key;
+      const t = document.createElement("span");
+      t.textContent = o.label;
+      b.append(k, t);
+      b.addEventListener("click", () => pick(o.id));
+      host.appendChild(b);
+    });
+  };
+  build($("people"), PEOPLE.map(p => ({ id: p, label: p })), 0);
+  build($("special"), SPECIAL, PEOPLE.length);
+
+  $("prev").disabled = i === 0;
+}
+
+function pick(id) {
+  const c = CLIPS[i];
+  answers[clipKey(c)] = id;
+  save(clipKey(c), id);
+  if (i < CLIPS.length - 1) { i++; render(); } else { render(); }
+}
+
+function toggle() {
+  if (audio.paused) { audio.play().catch(() => {}); $("picon").setAttribute("d", "M6 5h4v14H6zm8 0h4v14h-4z"); }
+  else { audio.pause(); $("picon").setAttribute("d", "M8 5v14l11-7z"); }
+}
+
+$("play").addEventListener("click", toggle);
+$("next").addEventListener("click", () => { if (i < CLIPS.length - 1) { i++; render(); } });
+$("prev").addEventListener("click", () => { if (i > 0) { i--; render(); } });
+
+document.addEventListener("keydown", e => {
+  if (e.target.closest("summary")) return;
+  if (e.code === "Space") { e.preventDefault(); toggle(); return; }
+  if (e.key === "ArrowRight") { if (i < CLIPS.length - 1) { i++; render(); } return; }
+  if (e.key === "ArrowLeft") { if (i > 0) { i--; render(); } return; }
+  if (/^[0-9]$/.test(e.key)) {
+    const all = PEOPLE.map(p => ({ id: p })).concat(SPECIAL);
+    const n = e.key === "0" ? 9 : Number(e.key) - 1;
+    if (all[n]) pick(all[n].id);
+  }
+});
+
+render();
+boot();
+</script>

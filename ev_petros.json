@@ -1,0 +1,12 @@
+{
+  "httpMethod": "POST",
+  "path": "/api/org/sessions/petros_pan_2026-09-22_15-32-57_sid90cce14c3d3b4278bb1c69d3f90a18a2/speaker-corrections",
+  "rawPath": "/api/org/sessions/petros_pan_2026-09-22_15-32-57_sid90cce14c3d3b4278bb1c69d3f90a18a2/speaker-corrections",
+  "resource": "/api/org/sessions/petros_pan_2026-09-22_15-32-57_sid90cce14c3d3b4278bb1c69d3f90a18a2/speaker-corrections",
+  "queryStringParameters": null,
+  "requestContext": {
+    "authorizer": {"claims": {"sub": "49de74b8-5001-7067-2543-41070e9d8f11"}},
+    "http": {"method": "POST"}
+  },
+  "body": "{\"user\":\"Petros_Pan\",\"source_filename\":\"petros_pan_2026-09-22_15-32-57_sid90cce14c3d3b4278bb1c69d3f90a18a2_c0000_bn2_off0.0_to39.0_srcwav.json\",\"start_sec\":1.6,\"end_sec\":37.6,\"display_name\":\"Petros Pan\"}"
+}
