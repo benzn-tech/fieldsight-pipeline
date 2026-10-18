@@ -85,13 +85,6 @@ UNWIRED_BY_DESIGN = {
     # The data bucket lives in the prod account and its policy is owned there;
     # the test stack must never try to manage it.
     "ManageDataBucketPolicy": {"test"},
-    # Device voice-Ask two-phase flags: TEST-only until measured and until the
-    # owner releases the backend to main. Prod must hold the template default
-    # (false); wiring them in deploy-prod.yml would be a product decision.
-    "AskVoiceRestate": {"prod"},
-    "VoiceWebEnabled": {"prod"},
-    # Voice Ask memory + web offer: TEST-only until the owner has used it on a device.
-    "AskVoiceConvo": {"prod"},
 }
 
 

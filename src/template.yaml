@@ -328,7 +328,7 @@ Parameters:
     AllowedValues: ['true', 'false']
     Description: >-
       Voice Ask two-phase: speak a short restatement of the question while the
-      worker is still answering. TEST-only; prod leaves it unset (false).
+      worker is still answering. Set via TEST_/PROD_ repo vars; unset is false.
 
   AskVoiceConvo:
     Type: String
@@ -337,7 +337,7 @@ Parameters:
     Description: >-
       Voice Ask two-phase: remember the last turns for a follow-up and turn a
       records miss into a spoken offer to search online, honouring a yes or no
-      to it. TEST-only; prod leaves it unset (false).
+      to it. Set via TEST_/PROD_ repo vars; unset is false.
 
   AskAgentic:
     Type: String
@@ -388,7 +388,7 @@ Parameters:
       not answer the question. Separate from EnableWebAnswer (the typed /ask
       path) so voice can be enabled after its latency is measured. Voice web
       answers need BOTH this and EnableWebAnswer true: web_answer.enabled()
-      still gates the whole branch. TEST-only; prod leaves it unset (false).
+      still gates the whole branch. Set via TEST_/PROD_ repo vars; unset is false.
 
   EnableWebAnswer:
     Type: String
