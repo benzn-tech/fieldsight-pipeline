@@ -310,3 +310,59 @@ def test_the_handler_uses_the_contained_version(monkeypatch):
     src = inspect.getsource(fc.lambda_handler)
     assert "_sweep_groups_contained(conn)" in src
     assert "sweep_groups_if_enabled(conn)" not in src
+
+
+# ----------------------------------------------------------
+# The two ends of the email's time range come from DIFFERENT CLOCKS. `opened_at` is set
+# from the chunk filename, which is the device's wall clock (session_activity: "The
+# filename's time is the DEVICE's NZ wall clock"); `closed_at` is the server's, from
+# /close or from the idle inference. These ROMs have been seen 12 hours out (BUG-37) --
+# this file's own GROUP_MAX_SPAN_SECONDS comment says so.
+#
+# Rendered as bare HH:MM–HH:MM, a 22-hour span reads as an ordinary afternoon meeting and
+# the day is gone. Observed on TEST 2026-08-12: "16:48–14:29".
+# ----------------------------------------------------------
+
+def _ctx_for(monkeypatch, opened, closed):
+    monkeypatch.setattr(fc.users, "get_by_id",
+                        lambda conn, uid: {"email": "b@x.com", "folder_name": "Ben_UCPK"})
+    monkeypatch.setattr(fc.sites, "get_site", lambda conn, sid: {"name": "UC PK"})
+    return fc._resolve_context("CONN", {"user_id": "u1", "site_id": "s",
+                                        "opened_at": opened, "closed_at": closed})
+
+
+def test_a_range_that_crosses_a_day_says_so_instead_of_hiding_it(monkeypatch):
+    import datetime as _dt
+    ctx = _ctx_for(monkeypatch,
+                   _dt.datetime(2026, 8, 11, 4, 48),    # NZ 08-11 16:48
+                   _dt.datetime(2026, 8, 12, 2, 29))    # NZ 08-12 14:29
+    assert ctx["timeRange"] != "16:48–14:29", \
+        "a 22-hour span must not render as an ordinary meeting"
+    assert "+1d" in ctx["timeRange"]
+
+
+def test_an_end_before_its_start_is_not_rendered_as_a_range(monkeypatch):
+    """Only a broken clock produces this. Printing it hides the fault; the start alone is
+    true, and the log line is where the fault belongs."""
+    import datetime as _dt
+    ctx = _ctx_for(monkeypatch,
+                   _dt.datetime(2026, 8, 11, 4, 48),
+                   _dt.datetime(2026, 8, 10, 4, 48))    # a day EARLIER
+    assert ctx["timeRange"] == "16:48"
+
+
+def test_an_ordinary_meeting_is_unchanged(monkeypatch):
+    import datetime as _dt
+    ctx = _ctx_for(monkeypatch,
+                   _dt.datetime(2026, 7, 30, 23, 3),
+                   _dt.datetime(2026, 7, 30, 23, 6))
+    assert ctx["timeRange"] == "11:03–11:06"
+
+
+def test_a_real_meeting_over_midnight_keeps_both_ends(monkeypatch):
+    """Rare but legitimate. The day marker makes it readable rather than suppressed."""
+    import datetime as _dt
+    ctx = _ctx_for(monkeypatch,
+                   _dt.datetime(2026, 8, 11, 11, 40),   # NZ 08-11 23:40
+                   _dt.datetime(2026, 8, 11, 12, 15))   # NZ 08-12 00:15
+    assert ctx["timeRange"] == "23:40–00:15 (+1d)"

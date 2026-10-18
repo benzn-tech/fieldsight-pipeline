@@ -44,6 +44,7 @@ import logging
 import re
 import boto3
 import urllib3
+import agent_turn_filter
 import llm_utils
 from datetime import datetime, timedelta
 from io import BytesIO
@@ -58,6 +59,14 @@ logger.setLevel(logging.INFO)
 
 # Initialize AWS clients
 s3_client = boto3.client('s3')
+
+
+def _user_and_date_from_key(key):
+    """transcripts/{user_folder}/{date}/{file}.json -> (user_folder, date)."""
+    parts = (key or '').split('/')
+    if len(parts) < 4 or parts[0] != 'transcripts':
+        return None, None
+    return parts[1], parts[2]
 
 # Configuration
 S3_BUCKET = os.environ.get('S3_BUCKET', '')
@@ -285,6 +294,14 @@ def collect_transcripts(bucket, target_date, user_filter=None, custom_prefix=Non
         normalized = normalize_transcript(data, filename, user_mapping=user_mapping)
         if normalized and normalized.get('full_text'):
             normalized['key'] = key
+            # The Ask agent's own answer, played aloud into the meeting it is minuting. Same
+            # shared matcher as extraction and ingest -- this consumer has speaker turns, so the
+            # turn-level path applies unchanged.
+            user_folder, date = _user_and_date_from_key(key)
+            if user_folder and date:
+                turns, _st = agent_turn_filter.apply_agent_filter(
+                    normalized.get('speaker_turns') or [], s3_client, bucket, user_folder, date)
+                normalized['speaker_turns'] = [t for t in turns if not t.get('from_agent')]
             transcripts.append(normalized)
 
     if custom_prefix:

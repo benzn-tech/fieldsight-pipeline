@@ -22,15 +22,25 @@ a DB/S3; lambda_handler supplies the real ones.
 import json
 import logging
 import os
+import time
 
 import sweep_state
 from repositories import meeting_session, users, sites
+import session_scope
 from session_scope import SESSION_GAP_MINUTES
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
+
+# Batched transcription (spec 2026-08-11). Read here too because the sweep is the only
+# thing that can seal a session's LAST run — it has no fourth chunk coming. Defaults off,
+# same as the transcriber's, so this deploys inert.
+BATCH_TRANSCRIPTION = os.environ.get("BATCH_TRANSCRIPTION", "false").lower() == "true"
+BATCH_MAX_CHUNKS = int(os.environ.get("BATCH_MAX_CHUNKS", "4"))
+BATCH_SEAL_DEADLINE_SEC = int(os.environ.get("BATCH_SEAL_DEADLINE_SEC", "150"))
+TRANSCRIPT_TABLE = os.environ.get("TRANSCRIPT_TABLE", "fieldsight-transcripts")
 FINALIZE_REQUESTS_PREFIX = "session_finalize_requests/"
 # Asks the (non-VPC) extraction lambda for this session's FINAL, thinking-mode
 # pass. Same artifact-on-S3 channel as FINALIZE_REQUESTS_PREFIX and for the same
@@ -174,6 +184,19 @@ def _to_nz(dt):
         return u + timedelta(hours=13 if (u >= dst_start or u < dst_end) else 12)
 
 
+def _time_range(opened_nz, closed_nz, session_id=None):
+    """The email's "which meeting was this?" line.
+
+    The rule itself lives in `session_scope.format_time_range`, shared with the session
+    picker: both render the same fact, and two implementations of one rule is how they
+    drift — which is exactly what happened between 2026-08-12 morning and afternoon.
+    """
+    text, note = session_scope.format_time_range(opened_nz, closed_nz)
+    if note:
+        logger.warning("finalize: session %s time range — %s", session_id, note)
+    return text
+
+
 def _resolve_context(conn, row):
     """Recipient email + folder + date + site name for a claimed session, from
     Aurora. date = the session's close (or open) day; siteName from the site pick."""
@@ -191,10 +214,7 @@ def _resolve_context(conn, row):
         site_name = (site or {}).get("name")
     # Meeting time window for the email subject — "which meeting was this?". NZ
     # wall-clock HH:MM of open→close (start only if the close time is unknown).
-    def _hm(dt):
-        return dt.strftime("%H:%M") if dt else None
-    start_hm, end_hm = _hm(opened_nz), _hm(closed_nz)
-    time_range = f"{start_hm}–{end_hm}" if start_hm and end_hm else (start_hm or None)
+    time_range = _time_range(opened_nz, closed_nz, session_id=row.get("session_id"))
     return {"recipient": user.get("email"), "folder": user.get("folder_name"),
             "date": date, "siteName": site_name, "timeRange": time_range}
 
@@ -525,6 +545,47 @@ def infer_idle_closes(conn, idle_seconds):
     return closed
 
 
+def _seal_tail_batches(session_id):
+    """Seal this session's last 1–3 chunks, BEFORE it is finalized.
+
+    Nothing in the transcriber will ever do it: a tail run has no fourth arrival to
+    complete it, so it sits in the ledger until someone notices the session is over. That
+    someone is this sweep.
+
+    The ordering is the point. Finalizing first requests the extraction against transcripts
+    that do not yet include the tail, and the confirmation email that follows reads
+    perfectly well while missing the end of the meeting — the grew-rerun coverage recheck
+    would eventually catch up, but the first email is the one people act on.
+
+    Never raises. A missing tail costs the end of one email; a sweep that dies costs every
+    email after it, which is the same trade the group scan already had to learn.
+    """
+    if not BATCH_TRANSCRIPTION:
+        return
+    try:
+        import boto3
+
+        import batch_seal
+        batch_seal.seal_ready_runs(
+            boto3.client("s3"), S3_BUCKET, session_id,
+            boto3.resource("dynamodb").Table(TRANSCRIPT_TABLE),
+            # Deadline ZERO, not BATCH_SEAL_DEADLINE_SEC. That deadline exists so a run of
+            # 1-3 does not seal while a fourth chunk might still arrive; at close nothing
+            # more can arrive, so waiting is not caution, it is the failure this function
+            # was written to prevent.
+            #
+            # This line has been wrong TWICE. First by omission, measured on TEST
+            # 2026-08-12: a session whose last chunk was 93s old finalized with its tail
+            # unsealed. Then again by regression -- the fix and its test were both erased
+            # by a whole-file rewrite in an unrelated commit, so CI stayed green while the
+            # path was dead, and a real 6-minute recording lost its last 19 seconds.
+            int(time.time()), 0, BATCH_MAX_CHUNKS,
+            sealed_by="session_close")
+    except Exception:
+        logger.exception("batch: could not seal the tail of session %s — the final "
+                         "extraction may be missing its last chunks", session_id)
+
+
 def sweep(conn, grace_seconds=None, idle_seconds=None, infer_idle=None):
     """Finalize every session on `conn` whose grace has elapsed, reusing
     finalize_claim per session (CAS-claim -> gather -> enqueue). First (when
@@ -539,6 +600,7 @@ def sweep(conn, grace_seconds=None, idle_seconds=None, infer_idle=None):
         infer_idle_closes(conn, idle)
     results = []
     for row in meeting_session.list_due_finalize(conn, grace):
+        _seal_tail_batches(row["session_id"])
         results.append(finalize_claim(
             conn, row["session_id"], row["version"],
             resolve_context=_resolve_context, read_rolling=_read_rolling, enqueue=_enqueue,

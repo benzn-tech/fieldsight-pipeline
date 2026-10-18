@@ -4787,12 +4787,38 @@ def _session_end_dt(conn, caller, folder, date, session_id, rows, start_dt):
     instant (see recordings.duration_for_media); (2) the LLM time_range end
     label; (3) null. RealPTT / worker-device uploads have no recordings row
     (the G5b fallback path), so (2)/(3) are the common case today."""
+    # (0) A CHUNK session's own close, from the session row. Deterministic, on the same
+    # clock as the start (both come from that row, both converted to NZ), and it was never
+    # asked. Measured on prod 2026-08-12: every chunk session rendered "12:11 – ?" while
+    # 87 of 88 rows held a closed_at, in the row `_chunk_session_start` already reads.
+    #
+    # It goes FIRST rather than after the recordings tier because that tier cannot help a
+    # chunk session at all: its LIKE is `users/{folder}/%/{date}/{session_base}.%`, and a
+    # chunk base is `sid{32hex}` — which sits in the MIDDLE of the filename, followed by
+    # `_c0000`, not a dot. Zero rows matched out of 87. Worse, if it ever did match it
+    # would return ONE ~30s chunk's duration (LIMIT 1) and label a 36-minute meeting as
+    # 18 seconds long, which reads like an answer rather than like a gap.
+    closed = _chunk_session_close(conn, session_id)
+    if closed is not None and start_dt is not None and closed > start_dt:
+        return closed
     if start_dt is not None:
         duration_s = recordings.duration_for_media(
             conn, caller["company_id"], folder, date, session_id)
         if duration_s:
             return start_dt + timedelta(seconds=duration_s)
     return _time_range_end_dt(rows, start_dt)
+
+
+def _session_label(start_dt, end_dt):
+    """The picker row's time label. Delegates the rule; keeps "?" for the unknown end."""
+    text, note = session_scope.format_time_range(start_dt, end_dt, sep=" – ")
+    if note:
+        logger.warning("session picker: %s", note)
+    if text is None:
+        return "? – ?"
+    if end_dt is None or (end_dt is not None and start_dt is not None and end_dt < start_dt):
+        return f"{text} – ?"
+    return text
 
 
 def _hhmm(dt):
@@ -4811,6 +4837,24 @@ def _chunk_session_start(conn, session_base):
         return None
     row = meeting_session.get(conn, sid)
     return session_scope.to_nz((row or {}).get("opened_at"))
+
+
+def _chunk_session_close(conn, session_base):
+    """End time for a CHUNK session, from `meeting_session.closed_at`.
+
+    The mirror of `_chunk_session_start`, and read from the same row: stored UTC, so
+    converted to NZ, otherwise the picker would mix a UTC end with an NZ start — the same
+    way it once showed "06:36 – 18:39" for an 18:36–18:39 meeting.
+
+    None for a legacy base (no `sid` token), for an unknown session, or for a session that
+    has not closed. The caller declines an end that precedes the start rather than
+    rendering a span that runs backwards.
+    """
+    sid = session_scope.device_session_id(session_base)
+    if not sid:
+        return None
+    row = meeting_session.get(conn, sid)
+    return session_scope.to_nz((row or {}).get("closed_at"))
 
 
 def _session_title(srows, site_name):
@@ -4882,7 +4926,11 @@ def build_day_sessions(conn, caller, folder, date, rows):
                                      if a["status"] == "open"),
             "participants": _session_participants(srows),
             "topic_row_ids": [str(r["id"]) for r in srows],   # the export's scope handle
-            "label": f"{_hhmm(start_dt) or '?'} – {_hhmm(end_dt) or '?'}",   # cosmetic
+            # ONE rule, shared with the confirmation email (session_scope.format_time_range):
+            # both render the same fact, and the two used to drift — the email learned that
+            # a span crossing a day must say so while this did not. "?" is kept for a
+            # genuinely unknown end; it is honest, and better than a guess.
+            "label": _session_label(start_dt, end_dt),   # cosmetic
             "_start_dt": start_dt,
             "_end_dt": end_dt,
         })

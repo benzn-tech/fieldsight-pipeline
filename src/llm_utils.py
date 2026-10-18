@@ -34,6 +34,31 @@ LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 
+def _optional_float(name):
+    """A knob that is UNSET must stay unsent, not become 0.0. Sending a default
+    would change every caller in this repo silently."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("%s=%r is not a number -- ignoring", name, raw)
+        return None
+
+
+# Sampling temperature, applied to whichever provider is in use. Never set
+# before 2026-08-12, so every call has taken the provider default (DashScope
+# documents 0.7 for the non-thinking Qwen path).
+#
+# It does NOT make extraction reproducible: a preregistered 2x2 (10 calls per
+# cell, one fixed session) found the action count still ranged 1-9 at
+# temperature=0 against 1-10 at the default, coverage difference inside the
+# noise. What it did do, far too large to be noise, is take the share of action
+# items carrying a `responsible` from 79% to 92% -- and that is the field a
+# misheard name has already cost something on.
+LLM_TEMPERATURE = _optional_float("LLM_TEMPERATURE")
+
 QWEN_API_KEY = os.environ.get("QWEN_API_KEY", os.environ.get("DASHSCOPE_API_KEY", ""))
 QWEN_BASE_URL = os.environ.get(
     "QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
@@ -108,11 +133,14 @@ def _call_anthropic(prompt, max_tokens):
     if not ANTHROPIC_API_KEY:
         logger.error("ANTHROPIC_API_KEY not set")
         return None, "ANTHROPIC_API_KEY not configured"
-    body = json.dumps({
+    payload = {
         "model": CLAUDE_MODEL,
         "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": prompt}],
-    })
+    }
+    if LLM_TEMPERATURE is not None:
+        payload["temperature"] = LLM_TEMPERATURE
+    body = json.dumps(payload)
     resp, err = _post_with_retry(
         "https://api.anthropic.com/v1/messages",
         body,
@@ -139,6 +167,8 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None):
         logger.error("QWEN_API_KEY / DASHSCOPE_API_KEY not set")
         return None, "QWEN_API_KEY not configured"
     payload = {"model": QWEN_MODEL, "messages": [{"role": "user", "content": prompt}]}
+    if LLM_TEMPERATURE is not None:
+        payload["temperature"] = LLM_TEMPERATURE
     # Per-call override wins; None falls back to the function's env default.
     thinking = QWEN_ENABLE_THINKING if enable_thinking is None else bool(enable_thinking)
     if thinking:

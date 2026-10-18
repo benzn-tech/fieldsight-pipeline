@@ -93,3 +93,64 @@ def test_a_member_with_no_resolved_context_is_skipped():
     written, put = _capture()
     iw._enqueue_updated_emails(_artifact(), {S1: _contexts()[S1]}, put=put)
     assert len(written) == 1, "an unresolvable member must not get a blank email"
+
+
+# ----------------------------------------------------------
+# The same gap again, one field along. `_artifact()` above hands the producer a
+# "summary" key -- and a real merged artifact does not have one. Verified on the
+# test stack 2026-08-11: a genuine group extraction wrote
+# {topics, declared_site, schema_version, tier, groupId, user_folder, date,
+#  session_base, mergedMembers, memberSessions, omittedMembers,
+#  source_transcripts, speaker_count, extracted_at} -- no summary anywhere. The
+# solo path takes its summary from the rolling summary, and
+# `_todos_from_topics`'s own docstring already says a merged artifact has no
+# rolling summary at all. The todos were rebuilt from the topics; the summary
+# was not, so every member's updated email quoted nothing.
+# ----------------------------------------------------------
+
+def _real_artifact():
+    """Shaped like what the group extraction actually writes: no `summary`."""
+    return {"tier": "group", "groupId": GID, "memberSessions": [S1, S2],
+            "topics": [
+                {"topic_title": "Slab pour", "summary": "Trimmer bars unfinished on the east side.",
+                 "action_items": [{"action": "raise an RFI", "responsible": "Ben"}]},
+                {"topic_title": "Edge protection", "summary": "A handrail was removed."},
+            ]}
+
+
+def test_a_merged_artifact_without_a_summary_key_still_says_something():
+    written, put = _capture()
+    iw._enqueue_updated_emails(_real_artifact(), _contexts(), put=put)
+    for body in written.values():
+        assert body["summary"], \
+            "the producer never writes a top-level summary, so reading one sends an empty email"
+        assert "Trimmer bars" in body["summary"]
+        assert "handrail" in body["summary"]
+
+
+def test_every_member_quotes_the_same_summary():
+    """The whole point of the merged record: one meeting, one account of it."""
+    written, put = _capture()
+    iw._enqueue_updated_emails(_real_artifact(), _contexts(), put=put)
+    summaries = {body["summary"] for body in written.values()}
+    assert len(summaries) == 1
+
+
+def test_an_explicit_summary_is_preferred_over_the_derived_one():
+    """If the extraction ever starts writing one, it wins -- the fallback must
+    not quietly override a real summary."""
+    written, put = _capture()
+    iw._enqueue_updated_emails(_artifact(), _contexts(), put=put)
+    for body in written.values():
+        assert body["summary"] == "The merged summary."
+
+
+def test_a_merge_that_produced_nothing_does_not_invent_a_summary():
+    """An empty merge is already guarded elsewhere (#348); if one reaches here
+    the email should be empty rather than fabricated."""
+    written, put = _capture()
+    iw._enqueue_updated_emails({"tier": "group", "groupId": GID,
+                                "memberSessions": [S1], "topics": []},
+                               {S1: _contexts()[S1]}, put=put)
+    for body in written.values():
+        assert body["summary"] == ""

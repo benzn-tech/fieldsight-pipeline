@@ -6972,3 +6972,68 @@ def test_video_segments_single_minute_topic_window_is_not_zero_width(presign_wir
         params={"date": "2026-08-09", "start": "12:07:00", "end": "12:07:00"}), None)
     assert res["statusCode"] == 200
     assert body_of(res)["count"] == 1
+
+
+# ----------------------------------------------------------
+# The picker's "?" end time. Measured on prod 2026-08-12: every chunk session shows
+# "12:11 – ?", because the first resolution tier asks `recordings` with
+#     users/{folder}/%/{date}/{session_base}.%
+# and a chunk session's base is `sid{32hex}` -- which sits in the MIDDLE of the real
+# filename, followed by `_c0000`, not by a dot. The pattern matched 0 rows out of 87
+# sessions that do have recordings. It was written for the legacy whole-file naming and
+# never updated when chunk naming shipped.
+#
+# Meanwhile `meeting_session.closed_at` -- the device's own end, in the row the picker
+# ALREADY reads for the start -- was never in the resolution order at all. 87 of 88
+# sessions have one.
+# ----------------------------------------------------------
+
+def test_a_chunk_session_takes_its_end_from_the_session_row(monkeypatch):
+    import datetime as dt
+    monkeypatch.setattr(org.meeting_session, "get", lambda conn, sid: {
+        "opened_at": dt.datetime(2026, 8, 10, 0, 11),     # 12:11 NZ
+        "closed_at": dt.datetime(2026, 8, 10, 0, 47)})    # 12:47 NZ
+    monkeypatch.setattr(org.recordings, "duration_for_media", lambda *a, **k: None)
+    start = dt.datetime(2026, 8, 10, 12, 11)
+    end = org._session_end_dt("CONN", {"company_id": "c"}, "Ben_UCPK2", "2026-08-10",
+                              "sid" + "a" * 32, [], start)
+    assert end == dt.datetime(2026, 8, 10, 12, 47), "the row knew; nothing had asked it"
+
+
+def test_one_chunk_s_duration_is_never_mistaken_for_the_meeting_s_length(monkeypatch):
+    """A recordings row for a chunk session is ONE ~30s chunk. Adding it to the start
+    would label a 36-minute meeting as 18 seconds long -- which reads as a real answer,
+    and is worse than the "?" it replaced."""
+    import datetime as dt
+    monkeypatch.setattr(org.meeting_session, "get", lambda conn, sid: {
+        "opened_at": dt.datetime(2026, 8, 10, 0, 11),
+        "closed_at": dt.datetime(2026, 8, 10, 0, 47)})
+    monkeypatch.setattr(org.recordings, "duration_for_media", lambda *a, **k: 18.0)
+    start = dt.datetime(2026, 8, 10, 12, 11)
+    end = org._session_end_dt("CONN", {"company_id": "c"}, "Ben_UCPK2", "2026-08-10",
+                              "sid" + "a" * 32, [], start)
+    assert end == dt.datetime(2026, 8, 10, 12, 47)
+
+
+def test_an_end_before_the_start_is_declined_rather_than_shown(monkeypatch):
+    """The historical unconverted-opened_at rows (fixed 2026-08-10) can produce this.
+    Declining leaves "?" -- honest -- instead of a span that runs backwards."""
+    import datetime as dt
+    monkeypatch.setattr(org.meeting_session, "get", lambda conn, sid: {
+        "opened_at": dt.datetime(2026, 8, 10, 0, 11),
+        "closed_at": dt.datetime(2026, 8, 9, 23, 0)})
+    monkeypatch.setattr(org.recordings, "duration_for_media", lambda *a, **k: None)
+    start = dt.datetime(2026, 8, 10, 12, 11)
+    assert org._session_end_dt("CONN", {"company_id": "c"}, "Ben_UCPK2", "2026-08-10",
+                               "sid" + "a" * 32, [], start) is None
+
+
+def test_a_legacy_whole_file_session_is_unaffected(monkeypatch):
+    """Legacy bases carry their own timestamp and DO match the recordings pattern; that
+    tier stays first for them."""
+    import datetime as dt
+    monkeypatch.setattr(org.recordings, "duration_for_media", lambda *a, **k: 600.0)
+    start = dt.datetime(2026, 7, 31, 14, 11)
+    end = org._session_end_dt("CONN", {"company_id": "c"}, "Ben_UCPK", "2026-07-31",
+                              "Benl1_2026-07-31_14-11-56", [], start)
+    assert end == dt.datetime(2026, 7, 31, 14, 21)

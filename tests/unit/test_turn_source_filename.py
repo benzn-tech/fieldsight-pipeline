@@ -36,6 +36,14 @@ def two_segments(monkeypatch):
                 def read(self_inner): return b"{}"
             return {"Body": _B()}
 
+        # assemble_session_turns lists voice_ask/ for the agent-answer sidecars. No sidecars in
+        # this fixture, so an empty page -- but the double has to model the call, or the
+        # dependency is invisible here and only shows up in production.
+        def get_paginator(self, op):
+            class _P:
+                def paginate(self_inner, **kwargs): return [{"Contents": []}]
+            return _P()
+
     monkeypatch.setattr(ex, "s3", lambda: _S3())
     monkeypatch.setattr(ex, "normalize_transcript",
                         lambda data, filename: payloads.get(filename))
@@ -94,6 +102,14 @@ def test_a_skipped_segment_does_not_shift_the_pairing(monkeypatch):
             class _B:
                 def read(self_inner): return b"{}"
             return {"Body": _B()}
+
+        # assemble_session_turns lists voice_ask/ for the agent-answer sidecars. No sidecars in
+        # this fixture, so an empty page -- but the double has to model the call, or the
+        # dependency is invisible here and only shows up in production.
+        def get_paginator(self, op):
+            class _P:
+                def paginate(self_inner, **kwargs): return [{"Contents": []}]
+            return _P()
 
     monkeypatch.setattr(ex, "s3", lambda: _S3())
     monkeypatch.setattr(ex, "normalize_transcript",

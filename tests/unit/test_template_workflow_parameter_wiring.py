@@ -88,6 +88,49 @@ def _overrides(path):
     return names
 
 
+def _raw_override_lines(path):
+    """The `--parameter-overrides` continuation block verbatim, including the
+    `$SHELL_VAR` entries `_overrides` skips because they carry no literal name."""
+    lines = open(path, encoding="utf-8").read().splitlines()
+    start = next(i for i, ln in enumerate(lines)
+                 if ln.strip().startswith("--parameter-overrides"))
+    out = []
+    for ln in lines[start + 1:]:
+        stripped = ln.strip()
+        out.append(stripped)
+        if not stripped.endswith("\\"):
+            break
+    return "\n".join(out)
+
+
+def test_no_override_can_evaluate_to_a_bare_key():
+    """`sam deploy` REJECTS `Key=` with an empty value — it does not fall back to
+    the template default.
+
+    So an override whose expression can produce nothing is not "unset", it is a
+    deploy that never runs. On 2026-08-12 `"LlmTemperature=${{ vars.X || '' }}"`
+    shipped to `main` and the prod deploy died at argument parsing with the whole
+    release still un-deployed and every check downstream reading the OLD stack.
+    The idiom for optional is the conditional `$SOME_PARAM` shell variable a few
+    lines above it, appended only when the repo variable is non-empty.
+
+    Scanning for the shape rather than the one name, because the two existing
+    conditional overrides prove this is a repeated temptation.
+    """
+    for env, path in WORKFLOWS.items():
+        lines = open(path, encoding="utf-8").read().splitlines()
+        start = next(i for i, ln in enumerate(lines)
+                     if ln.strip().startswith("--parameter-overrides"))
+        for ln in lines[start + 1:]:
+            stripped = ln.strip()
+            if not stripped.endswith("\\") and not stripped.startswith('"'):
+                break
+            assert not re.search(r"\|\|\s*''\s*\}\}", stripped), (
+                f"{env} deploy: {stripped!r} evaluates to a bare Key= when the "
+                f"repo variable is unset, and SAM exits 2 on that. Use the "
+                f"conditional $PARAM idiom instead.")
+
+
 def test_every_override_names_a_real_template_parameter():
     names, _ = _template_parameters()
     for env, path in WORKFLOWS.items():
@@ -353,3 +396,161 @@ def test_the_code_defaults_match_the_template_defaults():
         assert float(tpl_default) == float(code_default), (
             f"{env}: template default {tpl_default!r} != code default "
             f"{code_default!r}")
+
+
+def test_the_temperature_knob_reaches_every_function_that_calls_an_llm():
+    """`call_llm` is shared. A knob wired to some of its callers and not others
+    means the extraction runs at one temperature and the summary at another,
+    with nothing saying so."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    assert re.search(r"\n  LlmTemperature:\n", text), "no LlmTemperature Parameter"
+    providers = text.count("LLM_PROVIDER: !Ref LlmProvider")
+    temps = text.count("LLM_TEMPERATURE: !Ref LlmTemperature")
+    assert providers == temps, (
+        f"{providers} functions carry LLM_PROVIDER but {temps} carry "
+        f"LLM_TEMPERATURE -- every LLM caller must get both or neither")
+
+
+def test_both_workflows_can_set_the_temperature():
+    """Test passes it inline; prod passes it conditionally. Either way the repo
+    variable must be able to reach CloudFormation — a Parameter no workflow can
+    set holds its default forever."""
+    assert "LlmTemperature" in _overrides(WORKFLOWS["test"]), (
+        "test does not pass LlmTemperature; the Parameter holds its default forever")
+    prod = open(WORKFLOWS["prod"], encoding="utf-8").read()
+    assert 'LLM_TEMP_PARAM="LlmTemperature=${{ vars.PROD_LLM_TEMPERATURE }}"' in prod, (
+        "PROD_LLM_TEMPERATURE cannot reach the stack")
+    assert "$LLM_TEMP_PARAM" in _raw_override_lines(WORKFLOWS["prod"]), (
+        "the conditional is built and then never appended")
+
+
+def test_prod_temperature_defaults_to_unset():
+    """Unset means the override is ABSENT, not empty.
+
+    Absent lets the template default (`''`) through, which is what makes the call
+    omit `temperature` entirely — deliberate, because the 2x2 behind this knob
+    covered one task on one session while call_llm serves the rolling summary,
+    finalize, the matcher and the ask agent. Test runs it at 0 so the effect is
+    observed somewhere before prod inherits it.
+
+    Empty means the deploy does not happen at all; that is the 2026-08-12 failure
+    and `test_no_override_can_evaluate_to_a_bare_key` is what stops it returning.
+    """
+    prod = open(WORKFLOWS["prod"], encoding="utf-8").read()
+    assert "LlmTemperature" not in _overrides(WORKFLOWS["prod"]), (
+        "prod must not pass the parameter unconditionally")
+    assert 'if [ -n "${{ vars.PROD_LLM_TEMPERATURE }}" ]' in prod
+
+
+# ----------------------------------------------------------
+# Batched transcription (spec 2026-08-11). Two functions read BATCH_TRANSCRIPTION and both
+# must be given it: the transcriber accumulates members, and the sweep seals a session's
+# LAST run — the one that has no fourth chunk coming. Give it to only one and the failure
+# is silent in the worse direction: members accumulate, nothing ever seals the tail, and
+# the end of every session goes untranscribed with no error anywhere.
+# ----------------------------------------------------------
+
+_BATCH_READERS = ("TranscribeFunction", "FinalizeSweepFunction")
+
+
+def test_the_batch_switch_is_wired_in_both_environments():
+    for env, path in WORKFLOWS.items():
+        assert "BatchTranscription" in _overrides(path), (
+            f"{env} does not pass BatchTranscription, so BATCH_TRANSCRIPTION can only "
+            f"ever hold its template default and neither turning batching on nor rolling "
+            f"it back would work")
+
+
+def test_every_function_that_reads_the_batch_switch_is_given_it():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for fn in _BATCH_READERS:
+        assert "BATCH_TRANSCRIPTION: !Ref BatchTranscription" in _function_block(text, fn), \
+            (f"{fn} reads BATCH_TRANSCRIPTION but is not given it — it would silently take "
+             f"the code default and disagree with the other function")
+
+
+def test_the_transcriber_is_told_whether_chunks_are_whole():
+    """Batching's precondition. The function refuses to batch per-VAD-segment units, so it
+    has to be able to see which mode the VAD is in — reading a code default here would let
+    it batch fragments the moment someone flips whole-chunk off."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    assert "TRANSCRIBE_WHOLE_CHUNK: !Ref TranscribeWholeChunk" in \
+        _function_block(text, "TranscribeFunction"), \
+        "TranscribeFunction reads TRANSCRIBE_WHOLE_CHUNK but is not given it"
+
+
+# ----------------------------------------------------------
+# The batch ledger lives in the transcriber's existing table, and TWO functions now reach
+# it. Found by running phase 4 on TEST, 2026-08-12: the sweep queried
+# `fieldsight-transcripts` -- the PROD table -- from the TEST stack, because the env var was
+# never wired and the code default names prod's table. IAM refused the Query, which is the
+# only reason it was a stack trace instead of a test environment writing prod's ledger.
+#
+# A default that names another environment's resource is not an inert default.
+# ----------------------------------------------------------
+
+_LEDGER_READERS = ("TranscribeFunction", "FinalizeSweepFunction")
+
+
+def test_every_function_that_reaches_the_batch_ledger_is_told_which_table():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for fn in _LEDGER_READERS:
+        assert "TRANSCRIPT_TABLE: !Ref TranscriptTableName" in _function_block(text, fn), (
+            f"{fn} reads TRANSCRIPT_TABLE but is not given it, so it falls back to the code "
+            f"default -- which names the PROD table and would be used from test")
+
+
+def test_every_function_that_reaches_the_batch_ledger_may_actually_use_it():
+    """The grant, not just the name. Without it the failure is an AccessDeniedException
+    deep inside the seal, caught by the guard and visible only in a log line."""
+    text = open(TEMPLATE, encoding="utf-8").read()
+    for fn in _LEDGER_READERS:
+        blk = _function_block(text, fn)
+        assert "DynamoDBCrudPolicy" in blk and "TableName: !Ref TranscriptTableName" in blk, \
+            f"{fn} is given TRANSCRIPT_TABLE but no DynamoDB policy for it"
+
+
+# ----------------------------------------------------------
+# Sealing a session's tail is real S3 work: read the member units, read the raw uploads to
+# measure the overlap, write the batch and its map. Phase 4 wired the code and the switch
+# and not the grants, and the failure was invisible in the intended way -- the guard caught
+# the AccessDenied, the sweep carried on, the session finalized WITHOUT its last chunks.
+# Found on TEST 2026-08-12, twice in a row: first the ledger Query, then s3:GetObject.
+# ----------------------------------------------------------
+
+_SWEEP_SEAL_GRANTS = (
+    ("s3:GetObject", "audio_segments/*"),   # the member units being joined
+    ("s3:GetObject", "users/*"),            # the raw uploads the trim is measured on
+    ("s3:PutObject", "audio_segments/*"),   # the batch and its map
+)
+
+
+def test_the_sweep_may_do_the_s3_work_that_sealing_a_tail_requires():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    blk = _function_block(text, "FinalizeSweepFunction")
+    for action, prefix in _SWEEP_SEAL_GRANTS:
+        stmts = [s for s in blk.split("- Effect: Allow") if action in s]
+        assert any(prefix in s for s in stmts), (
+            f"FinalizeSweepFunction has no {action} on {prefix}; the tail seal fails with "
+            f"AccessDenied behind the guard and every session's last chunks go "
+            f"untranscribed with nothing failing")
+
+
+# ----------------------------------------------------------
+# The reader half of the same map. `_rebase_batch_turns` fetches
+# `audio_segments/…_batch_map.json`, a prefix the extractor has never had. Fixing only the
+# key (PR #392) moved the failure from "wrong key" to "AccessDenied on the right key" and
+# the symptom did not change at all: one WARNING, filename arithmetic, plausible times.
+# Found by re-running the deployed function on TEST after that fix and reading the log
+# instead of trusting the unit suite.
+# ----------------------------------------------------------
+
+
+def test_the_extractor_may_read_the_batch_maps_it_looks_for():
+    text = open(TEMPLATE, encoding="utf-8").read()
+    blk = _function_block(text, "ExtractSessionFunction")
+    reads = [s for s in blk.split("- Effect: Allow") if "s3:GetObject" in s]
+    assert any("audio_segments/*" in s for s in reads), (
+        "ExtractSessionFunction has no s3:GetObject on audio_segments/*, where the seal "
+        "writes every batch's time map — batched sessions silently keep filename "
+        "arithmetic and only a WARNING says so")

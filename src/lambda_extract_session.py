@@ -43,8 +43,10 @@ from urllib.parse import unquote_plus
 
 import boto3
 
+import agent_turn_filter
 import evidence_match
 import llm_utils
+import batch_stitch
 import chunk_stitch
 from transcript_utils import (
     extract_base_time_from_filename,
@@ -323,8 +325,26 @@ def verify_evidence(result, turns, session_date, user_folder=None, date=None):
     Never raises. This is a measurement, and a measurement that can fail an
     extraction is worse than no measurement."""
     if result.get('tier') == TIER_GROUP:
+        # Skip the CHECK, but still strip what cannot be checked. The group prompt reuses
+        # _instructions_block verbatim, so with EMIT_EVIDENCE on the model is asked for citations
+        # here too -- and returning early used to leave them in the artifact with no status, which
+        # _evidence_payload then wrote to Aurora as {"status": None, "quotes": [...]}. That is a
+        # fourth state the column was never designed for (its three are NULL for never-measured,
+        # `absent` for measured-and-uncited, and a real status), and a reader sees quotes with no
+        # reason to doubt them. Exactly the defect the child strip below exists to prevent.
+        #
+        # Stripped rather than marked `unchecked`: that status means OUR code failed to measure
+        # something, and it exists to stop our own bugs deflating the signal. Borrowing it for
+        # "we never try on groups" would make that number unreadable. No quotes and no status
+        # leaves the column NULL -- never measured, which is the truth.
         logger.info("evidence: skipping a group extraction -- no shared clock "
-                    "across devices to window on")
+                    "across devices to window on; citations stripped, not shipped unverified")
+        for topic in result.get('topics') or []:
+            topic.pop('evidence', None)
+            for child_key in ('action_items', 'findings'):
+                for child in topic.get(child_key) or []:
+                    if isinstance(child, dict):
+                        child.pop('evidence', None)
         return {}
     counts = {k: 0 for k in _EVIDENCE_STATUSES}
     # Why the failures failed, aggregated per extraction. The counts say how big
@@ -918,6 +938,56 @@ def _is_empty_transcript(data):
     return not text.strip()
 
 
+def _rebase_batch_turns(bucket, key, normalized):
+    """Re-time a batched transcript's turns through its map.
+
+    A batch's `word.start` is counted from the first sample of the concatenated file — an
+    origin that appears in no filename. Filename arithmetic gets the batch's start right
+    and then drifts by however much overlap was trimmed at each earlier seam: a second or
+    two, invisible in a rendered report, wrong in every timestamp after the first chunk.
+
+    The map is written beside the batch WAV under `audio_segments/`, never beside the
+    transcript — putting a `.json` under `transcripts/` would fire this very lambda's own
+    S3 trigger. `batch_stitch.map_key_for_transcript` is the one place that swap lives.
+
+    `start_sec` / `end_sec` are deliberately left batch-relative. They are the in-file
+    offsets the evidence and playback paths seek with, and the file they name
+    (`source_filename`) is the batch WAV — re-basing them would point every quote at a
+    position that does not exist in the object it names.
+
+    A missing map keeps the filename times and says so loudly. The error is bounded — a
+    batch never spans a gap, by design — and a bounded time error is recoverable in a way
+    that a dropped transcript is not.
+    """
+    if not batch_stitch.is_batch_key(key):
+        return normalized
+    map_key = batch_stitch.map_key_for_transcript(key)
+    if map_key is None:
+        logger.warning("batch transcript %s is not shaped like a session key — keeping "
+                       "filename arithmetic", key)
+        return normalized
+    try:
+        doc = json.loads(s3().get_object(Bucket=bucket, Key=map_key)['Body'].read())
+    except Exception:
+        logger.warning("batch map %s is unreadable — keeping filename arithmetic for %s, "
+                       "so its times may be off by the trimmed overlap", map_key, key)
+        return normalized
+
+    for turn in normalized.get('speaker_turns') or []:
+        if turn.get('abs_start') is None:
+            continue                       # no time to re-base; do not invent one
+        start = batch_stitch.resolve_abs_time(doc, turn.get('start_sec') or 0.0)
+        if start is None:
+            continue
+        turn['abs_start'] = start
+        turn['abs_start_str'] = start.strftime('%H:%M:%S')
+        end = batch_stitch.resolve_abs_time(doc, turn.get('end_sec') or 0.0)
+        if end is not None:
+            turn['abs_end'] = end
+            turn['abs_end_str'] = end.strftime('%H:%M:%S')
+    return normalized
+
+
 def assemble_session_turns(bucket, keys):
     """Download + normalize each transcript segment for a session (skipping
     corrupt / unnormalizable ones), collect its abs-timed speaker turns, order
@@ -947,6 +1017,9 @@ def assemble_session_turns(bucket, keys):
 
         filename = key.rsplit('/', 1)[-1]
         normalized = normalize_transcript(data, filename)
+        if normalized is not None:
+            # A batched transcript's times come from its map, never from the filename.
+            normalized = _rebase_batch_turns(bucket, key, normalized)
         if normalized is None:
             # normalize_transcript returns None for BOTH "this file is not a
             # transcript I can read" and "this is a perfectly good transcript
@@ -1003,7 +1076,36 @@ def assemble_session_turns(bucket, keys):
     # tag is gone. See filter_audio_event_tags.
     turns, _tag_stats = filter_audio_event_tags(turns)
     turns, announcement_stats = filter_device_announcements(turns)
+    # The Ask agent's own answer, played aloud into the running recording. Same family as the
+    # announcements above -- machine speech arriving as an ordinary speaker turn -- but it cannot
+    # be pattern-matched, because the text is whatever the model said. It is matched against what
+    # the agent is recorded as having said, published per ask by the in-VPC voice-audit function.
+    #
+    # Derived from the key rather than taken as a parameter so the five callers (extraction,
+    # rolling summary, finalize email, group merge) need no signature change and cannot forget it.
+    user_folder, date = _user_and_date_from_key(keys[0] if keys else None)
+    if user_folder and date:
+        turns, agent_stats = agent_turn_filter.apply_agent_filter(
+            turns, s3(), bucket, user_folder, date)
+        # Dropped from the stream, not from the record: the transcript JSON and the audio are
+        # untouched, so the viewer still shows the exchange. What must not see them is anything
+        # derived -- `speaker_count` (a solo wearer plus an agent turn counts as 2 and silently
+        # disables item-writer's speaker_count==1 gate), the extraction prompt (whose
+        # participants rule would list the agent as a person), and the embedded windows.
+        # Removing them here covers all three at one site instead of three.
+        turns = [t for t in turns if not t.get('from_agent')]
+        announcement_stats = dict(announcement_stats or {}, agent_turns=agent_stats)
     return turns, source_filenames, announcement_stats
+
+
+def _user_and_date_from_key(key):
+    """transcripts/{user_folder}/{date}/{file}.json -> (user_folder, date)."""
+    if not key:
+        return None, None
+    parts = key.split('/')
+    if len(parts) < 4 or parts[0] != 'transcripts':
+        return None, None
+    return parts[1], parts[2]
 
 
 def assemble_deduped_turns(bucket, keys):
