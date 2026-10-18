@@ -123,8 +123,9 @@ From a developer machine in NZ the ruler measured p50 3.0–4.0 s at ~8–16
 candidates and 8–10 s at ~45–63. Those numbers are not the prod gate: the existing
 docstring's measurement ("K=16 → 3.6 s, K=100 → 4.6 s, near-flat") and the prod
 log line are both faster. **Before merge, the candidate count is checked from the
-Lambda region** (CloudShell probe: the same `rerank()` call at 16/32/48 docs of
-~2600 chars, three reps each; read-only). If 32 does not fit 3 s with margin, the
+Lambda region** (CloudShell probe: the same request as `rerank()` — endpoint, model, a new
+connection per call — at 8/16/24/32/48 docs of ~2600 chars, five reps each;
+read-only). If 32 does not fit 3 s with margin, the
 owner chooses between a smaller bound and raising `PROD_RERANK_TIMEOUT_SECONDS`
 (TEST already runs 6 s). Parallel batched reranking is the fallback only if
 neither is acceptable; it needs per-document scores the current `rerank()`
@@ -172,14 +173,27 @@ unless noted; latency from a developer machine):
 | group key, cap 2, total 16 | 84.6 | 89.7 |
 | group key, cap 2, total 24 | 82.1 | 92.3 |
 | group key, cap 3, total 16 | 84.6 | 89.7 |
+| group key, cap 3, total 24 | 84.6 | 92.3 |
+| **§3a: per arm, 24 vector + 8 keyword** | **92.3** | **94.9** |
 
-(The cap-3/total-24 runs were stopped by the host for memory and are absent.)
-Every bounded variant lost questions the uncapped run kept, for three reasons
+Every group-key variant lost questions the uncapped run kept, for three reasons
 confirmed row by row: keyword-only rows cut by the arrival-order total (v1-35),
 report-family NULL-topic windows of one day collapsing into one group (v1-11), and
 sibling windows of one topic sharing a group (v1-19). Hence §3a.
 
-Next: the arm-aware 24 + 8 variant on both families, then the final run.
+§3a (experiment commit `902c09b1`), rerank@32 Ask, against prod today:
+
+- session: gains v1-06, v1-16, v1-31; loses nothing; still misses v1-19 and
+  v1-36. v1-36 is the §1b tail window (rank 65, outside the 64-row fetch), which
+  no candidate rule can reach. v1-19 is the one question §3a gives up against
+  no cap.
+- report: gains v1-27, v1-30, v1-31; loses v1-32; still misses v1-06, v1-36.
+
+Developer-machine rerank p50 (comparable with each other, not with prod):
+cap 4 3.0–4.0 s, §3a 5.1 s (session) / 7.0 s (report), no cap 8.4–9.9 s.
+
+Remaining before merge: the in-region latency check of §3c at 32 candidates,
+and `--repeat 3` of §3a on both families (the §3a rows above are one run each).
 
 3b changes indexed text, and the ruler corpus lives in the prod database, which
 only the owner writes. So before merge 3b is evidenced by the read-only probe in
