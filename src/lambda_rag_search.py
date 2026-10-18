@@ -43,8 +43,9 @@ import os
 
 from db.connection import close_cached_connection, get_cached_connection
 from lexical_terms import or_query, query_terms
-from repositories import (aliases, chunks, findings, memberships, recordings, redactions,
-                          scope, sites, topics, users)
+from repositories import (aliases, chunks, findings, memberships, project_docs, recordings,
+                          redactions, scope, sites, topics, users)
+import project_doc_flag
 import text_normalize
 
 logger = logging.getLogger()
@@ -258,6 +259,39 @@ def _tools(event):
                                   source_family=INDEX_FAMILY)
 
 
+DOCUMENTS_MAX_K = 20
+
+
+def _documents(event):
+    """Search the project documents the caller can see (spec 2026-10-16 "Search and Ask").
+
+    The ACL is the SAME primitive every other mode uses (scope.visible_scope), resolved from
+    the same `sub`; only its site set applies -- documents belong to the project, not a
+    person, so there is no author narrowing. `site` narrows inside the reach and never
+    widens it. No alias normalisation: documents are written text, not transcripts."""
+    if not project_doc_flag.on():
+        return {"documents": [], "off": True}
+    sub, qv = event.get("sub"), event.get("query_embedding")
+    if not sub or not qv:
+        return {"documents": [], "error": "missing sub or query_embedding"}
+    try:
+        k = max(1, min(int(event.get("k", 8)), DOCUMENTS_MAX_K))
+    except (TypeError, ValueError):
+        k = 8
+    conn = get_cached_connection()
+    caller = users.get_user_by_sub(conn, sub)
+    if caller is None:
+        return {"documents": [], "error": "caller not provisioned"}
+    site_ids = sorted(str(s) for s in scope.visible_scope(conn, caller)["site_ids"])
+    if event.get("site"):
+        site_ids = [s for s in site_ids if s == str(event["site"])]
+    if not site_ids:
+        return {"documents": [], "site_count": 0}
+    rows = project_docs.search(conn, site_ids, qv,
+                               or_query(query_terms(event.get("question") or "")), k=k)
+    return {"documents": json.loads(json.dumps(rows, default=str)), "site_count": len(site_ids)}
+
+
 def _search(event, context):
     # The metric route answers with a number instead of chunks. Placed first
     # because everything below it is about embeddings, and a metric question
@@ -268,6 +302,9 @@ def _search(event, context):
     # tool calls, no top-level embedding. Additive: no other mode changes.
     if event.get("mode") == "tools":
         return _tools(event)
+    # Project documents (spec 2026-10-16): their own tables, their own mode. Additive.
+    if event.get("mode") == "documents":
+        return _documents(event)
 
     sub = event.get("sub")
     try:
