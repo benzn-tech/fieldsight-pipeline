@@ -195,8 +195,10 @@ Downstream effects, accepted:
 - The tail's `window_span` and `turns` metadata cover the borrowed turns, so its
   citation start (`_citation_time_start`) moves earlier, to its true first turn.
 - For hour-bucketed (no-topic) windows, `block.from` moves earlier too. The list
-  groups windows by `block:<source>|<from>`; since the tail cannot start where
-  its predecessor starts, no two windows merge into one group.
+  groups windows by `block:<source>|<from>`, and `from` is HH:MM. The tail
+  always starts on a later turn than its predecessor, but the two can start in
+  the same minute; the list then shows them as one row. They overlap, so that
+  row loses nothing (it keeps the closer of the two distances).
 - More duplicated text between the last two windows of a bucket, so both can
   reach the reranker. The reranker then picks the better of the two.
 
