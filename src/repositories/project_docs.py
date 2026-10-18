@@ -120,6 +120,19 @@ def mark_pending(conn, doc_id):
         (str(doc_id),)).fetchone() is not None
 
 
+def fail_pending(conn, doc_id, company_id, reason=MSG_INVALID):
+    """Ingest's last resort when an artifact cannot be applied (spec R9, never stuck
+    pending): a PENDING, live document of `company_id` becomes `error` with `reason`. Any
+    other status is left alone -- a failed re-apply of an indexed document must not take it
+    out of search. No supersede recompute: only an indexed revision supersedes, and a
+    pending one never was. True when a row changed."""
+    return conn.execute(
+        "UPDATE project_documents SET status = 'error', reason = %s, chunks = 0, "
+        "indexed_at = NULL WHERE id = %s AND company_id = %s AND status = 'pending' "
+        "AND deleted_at IS NULL RETURNING id",
+        (reason, str(doc_id), str(company_id))).fetchone() is not None
+
+
 def soft_delete(conn, doc_id):
     """Soft delete, then recompute the series' supersede state in the same transaction:
     deleting the indexed revision that covered older ones brings back the newest of them
