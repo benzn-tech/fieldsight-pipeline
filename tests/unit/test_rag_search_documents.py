@@ -18,6 +18,9 @@ def env(monkeypatch):
                         lambda conn, sub: {"id": "u1", "company_id": "c1"} if sub == "s" else None)
     monkeypatch.setattr(rag.scope, "visible_scope",
                         lambda conn, caller: {"site_ids": {S1, S2}, "author_ids": {"u1"}})
+    monkeypatch.setattr(rag.sites, "get_company_site_by_slug",
+                        lambda conn, company_id, slug: {"id": S2} if (company_id, slug) == (
+                            "c1", "tower-b") else None)
     calls = []
 
     def search(conn, site_ids, qv, q_text, k=8):
@@ -47,6 +50,19 @@ def test_a_site_narrows_inside_the_reach_and_a_foreign_site_yields_nothing(env):
     assert rag.lambda_handler(_ev(site=S1), None)["site_count"] == 1
     assert env[-1]["site_ids"] == [S1]
     out = rag.lambda_handler(_ev(site="59000000-0000-0000-0000-000000000009"), None)
+    assert out == {"documents": [], "site_count": 0}
+
+
+def test_the_site_pin_resolves_like_records_mode_any_case_uuid_or_slug(env):
+    """Same resolver as records mode (_pin_site): an upper-case UUID is the same project,
+    and the legacy slug still pins -- never outside the reach."""
+    assert rag.lambda_handler(_ev(site=S1.upper()), None)["site_count"] == 1
+    assert env[-1]["site_ids"] == [S1]
+    assert rag.lambda_handler(_ev(site="tower-b"), None)["site_count"] == 1
+    assert env[-1]["site_ids"] == [S2]
+    out = rag.lambda_handler(_ev(site="59000000-0000-0000-0000-00000000000A"), None)
+    assert out == {"documents": [], "site_count": 0}
+    out = rag.lambda_handler(_ev(site="no-such-slug"), None)
     assert out == {"documents": [], "site_count": 0}
 
 

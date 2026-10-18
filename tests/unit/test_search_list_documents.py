@@ -11,9 +11,10 @@ fa = pytest.importorskip("lambda_fieldsight_api")
 
 
 class FakeLambda:
-    def __init__(self, documents=None, fail_documents=False, off=False):
+    def __init__(self, documents=None, fail_documents=False, off=False, raw_documents=None):
         self.events, self.documents = [], documents or []
         self.fail_documents, self.off = fail_documents, off
+        self.raw_documents = raw_documents          # a documents-mode body sent as is
 
     def invoke(self, FunctionName, InvocationType, Payload):
         ev = json.loads(Payload)
@@ -21,6 +22,8 @@ class FakeLambda:
         if ev.get("mode") == "documents":
             if self.fail_documents:
                 return {"FunctionError": "Unhandled", "Payload": io.BytesIO(b"{}")}
+            if self.raw_documents is not None:
+                return {"Payload": io.BytesIO(json.dumps(self.raw_documents).encode())}
             body = {"documents": [], "off": True} if self.off else {"documents": self.documents}
         else:
             body = {"chunks": [], "site_count": 1}
@@ -86,6 +89,15 @@ def test_a_failed_documents_call_never_costs_the_records(env):
     env(FakeLambda(fail_documents=True))
     out = laa._rag_search_list(_body())
     assert out["documents"] == [] and "error" not in out
+
+
+@pytest.mark.parametrize("raw", [["not", "a", "dict"], "a string", 7, {"documents": ["x"]}])
+def test_a_malformed_documents_payload_never_costs_the_records(env, raw):
+    """Shaping sits inside the try too: a non-dict body or a non-dict hit is [] documents,
+    and the records result comes back as it would have."""
+    env(FakeLambda(raw_documents=raw))
+    out = laa._rag_search_list(_body())
+    assert out["documents"] == [] and out["results"] == [] and "error" not in out
 
 
 def test_the_proxy_forwards_only_an_explicit_true_and_passes_documents_through(monkeypatch):

@@ -106,12 +106,18 @@ def test_THE_a_docx_is_indexed_end_to_end(s3):
 
 
 def test_the_embedding_is_batched_by_ten_and_carries_the_heading(s3, monkeypatch):
-    seen = []
+    seen, dims = [], []
     real = dashscope_utils.embed
-    monkeypatch.setattr(dashscope_utils, "embed", lambda texts: seen.extend(texts) or real(texts))
+
+    def embed(texts, dim=None):
+        seen.extend(texts)
+        dims.append(dim)
+        return real(texts, dim=dim)
+    monkeypatch.setattr(dashscope_utils, "embed", embed)
     paras = "\n\n".join("# H%d\n\nbody %d" % (i, i) for i in range(23))
     _run(_request(s3, "md", paras.encode()))
     assert _Pool.batches == [10, 10, 3]
+    assert dims == [1024, 1024, 1024]          # vector(1024): never the env default
     assert seen[0] == "H0\n\nbody 0"
     assert _artifact(s3)["chunks"][0]["chunk_text"] == "body 0"
 

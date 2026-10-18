@@ -21,6 +21,8 @@ GM = {"id": "u-gm", "company_id": HOME, "global_role": "gm", "cognito_sub": "s-g
 PM = {"id": "u-pm", "company_id": HOME, "global_role": "pm", "cognito_sub": "s-pm"}
 SM = {"id": "u-sm", "company_id": HOME, "global_role": "site_manager", "cognito_sub": "s-sm"}
 WORKER = {"id": "u-wk", "company_id": HOME, "global_role": "worker", "cognito_sub": "s-wk"}
+ADMIN = {"id": "u-ad", "company_id": HOME, "global_role": "admin", "cognito_sub": "s-ad"}
+OTHER_ADMIN = {"id": "u-oa", "company_id": OTHER, "global_role": "admin", "cognito_sub": "s-oa"}
 PLATFORM = {"id": "u-pa", "company_id": "c-op", "global_role": "platform_admin",
             "cognito_sub": "s-pa"}
 SITES = {SITE: {"id": SITE, "company_id": HOME, "archived_at": None},
@@ -135,7 +137,7 @@ def world(monkeypatch):
     monkeypatch.setattr(oa, "project_docs", docs)
     monkeypatch.setattr(oa.sites, "get_site", lambda conn, sid: SITES.get(str(sid)))
     reach = {"u-gm": {SITE}, "u-pm": {SITE}, "u-sm": {SITE}, "u-wk": {SITE},
-             "u-pa": {SITE, EXT}}
+             "u-pa": {SITE, EXT}, "u-ad": {SITE}, "u-oa": {EXT}}
     ext_roles = {}
     monkeypatch.setattr(oa, "_allowed_site_ids", lambda conn, caller: reach[caller["id"]])
     monkeypatch.setattr(oa.memberships, "external_site_roles",
@@ -384,8 +386,11 @@ def test_retry_only_for_a_failed_or_stuck_document(world, monkeypatch):
     st, _ = _routed(monkeypatch, GM, "POST", f"{_base()}/{doc['id']}/retry")
     assert st == 202 and row["status"] == "pending"
     row.update(status="unreadable", reason="protected")
-    st, _ = _routed(monkeypatch, GM, "POST", f"{_base()}/{doc['id']}/retry")
-    assert st == 202 and row["status"] == "pending"
+    world["s3"].puts.clear()
+    st, out = _routed(monkeypatch, GM, "POST", f"{_base()}/{doc['id']}/retry")
+    assert (st, out["error"]) == (
+        409, "This document can't be read as is — upload a new revision.")
+    assert row["status"] == "unreadable" and world["s3"].puts == {}   # R9: a new revision
     row["status"] = "indexed"
     st, out = _routed(monkeypatch, GM, "POST", f"{_base()}/{doc['id']}/retry")
     assert (st, out["error"]) == (409, "This document is already indexed.")
@@ -412,15 +417,53 @@ def test_a_retry_that_loses_the_race_to_indexing_is_a_409_and_writes_no_request(
     assert world["s3"].puts == {}
 
 
-def test_an_archived_project_is_404_for_reads(world, monkeypatch):
+def test_an_archived_project_is_readable_not_writable_for_those_who_see_it(world, monkeypatch):
+    """R8: read-only, not hidden. Whoever the sites page shows archived projects to (a
+    same-company admin/gm, platform_admin) still lists, opens history and the file -- with
+    canWrite false -- even though visible_scope has dropped the site from their reach."""
+    (_, doc), _ = _upload(world, monkeypatch)
+    SITES[SITE]["archived_at"] = NOW
+    try:
+        for uid in world["reach"]:
+            world["reach"][uid] = set()
+        for caller in (GM, ADMIN, PLATFORM):
+            st, out = _routed(monkeypatch, caller, "GET", _base())
+            assert st == 200 and out["canWrite"] is False and len(out["documents"]) == 1
+            st, out = _routed(monkeypatch, caller, "GET", _base(), qs={"series": doc["seriesId"]})
+            assert st == 200 and len(out["documents"]) == 1
+            st, out = _routed(monkeypatch, caller, "GET", f"{_base()}/{doc['id']}/file")
+            assert st == 200 and out["url"].startswith("https://s3.example/get_object/")
+            st, out = _routed(monkeypatch, caller, "POST", f"{_base()}/{doc['id']}/retry")
+            assert (st, out["error"]) == (409, "This project is archived")
+    finally:
+        SITES[SITE]["archived_at"] = None
+
+
+def test_an_archived_project_stays_404_for_those_who_cannot_see_it(world, monkeypatch):
     _upload(world, monkeypatch)
     SITES[SITE]["archived_at"] = NOW
     try:
-        for caller in (GM, WORKER, PLATFORM):
+        for caller in (WORKER, SM, PM, OTHER_ADMIN):
             st, out = _routed(monkeypatch, caller, "GET", _base())
-            assert (st, out["error"]) == (404, "project not found")
+            assert (st, out["error"]) == (404, "project not found"), caller["id"]
     finally:
         SITES[SITE]["archived_at"] = None
+
+
+@pytest.mark.parametrize("method,suffix,status,message", [
+    ("GET", "/not-a-uuid", 404, "document not found"),
+    ("GET", "/" + DOC + "/nope", 404, "document not found"),
+    ("GET", "/" + DOC, 405, "method not allowed"),
+    ("POST", "/" + DOC + "/file", 405, "method not allowed"),
+    ("PUT", "", 405, "method not allowed"),
+    ("GET", "/upload-url", 405, "method not allowed"),
+])
+def test_with_the_flag_on_a_fall_through_never_says_the_bare_not_found(
+        world, monkeypatch, method, suffix, status, message):
+    """The UI reads `{"error": "not found"}` as "feature off" and hides the section: a bad
+    path or id under a real project must answer something else."""
+    st, out = _routed(monkeypatch, GM, method, _base() + suffix)
+    assert (st, out) == (status, {"error": message})
 
 
 def test_an_external_pm_reads_and_writes_the_other_companys_project(world, monkeypatch):

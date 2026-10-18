@@ -13445,7 +13445,10 @@ def set_report_template_binding(conn, caller, report_type, event):
 # Reads: anyone who reaches the project (_allowed_site_ids). Writes (R5): home-company site
 # -> global_role in _MANAGER_ROLES; external site -> the external membership's role in
 # _MANAGER_ROLES; platform_admin. Keys and company_id follow the SITE's company (R6).
-# An archived project: writes 409 for its writers, reads 404 (plan ruling 7).
+# An archived project is read-only, not hidden (spec R8): writes 409 for its writers; reads
+# (list, history, /file) for whoever the sites page shows archived projects to -- a
+# same-company admin/gm (resolve_scope ALL, `include_archived`) or platform_admin -- with
+# canWrite false; 404 for everyone else.
 #
 # Every repository write runs inside `conn.transaction()` on the request's non-autocommit
 # connection: insert_document / soft_delete take an advisory lock and FOR UPDATE that hold
@@ -13462,6 +13465,7 @@ PROJECT_DOC_STUCK = timedelta(minutes=20)
 _PD_ARCHIVED = "This project is archived"
 _PD_NOT_WRITER = "Only the project's managers can change its documents."
 _PD_INDEXED = "This document is already indexed."
+_PD_UNREADABLE = "This document can't be read as is — upload a new revision."
 
 
 def _doc_writer(conn, caller, site):
@@ -13473,10 +13477,22 @@ def _doc_writer(conn, caller, site):
     return memberships.external_site_roles(conn, caller["id"]).get(str(site["id"])) in _MANAGER_ROLES
 
 
+def _sees_archived(caller, site):
+    """Who the sites page lists an archived project to (list_org_sites with
+    include_archived): a same-company admin/gm, or platform_admin across companies."""
+    role = caller.get("global_role")
+    if is_cross_company(role):
+        return True
+    return (str(site["company_id"]) == str(caller["company_id"])
+            and resolve_scope(role) == "ALL")
+
+
 def _doc_site(conn, caller, site_id, write):
-    """(site, None) or (None, error). Ruling 7: an archived project answers 409 to the
-    people who could otherwise write to it, before the reach check (visible_scope drops
-    archived sites, so the reach check alone would make the 409 unreachable)."""
+    """(site, None) or (None, error). R8: an archived project is read-only, not hidden. A
+    write answers 409 to the people who could otherwise write to it, before the reach check
+    (visible_scope drops archived sites, so the reach check alone would make the 409
+    unreachable); a read is allowed, for the same reason before the reach check, to whoever
+    can see archived projects (_sees_archived), and is 404 for everyone else."""
     if not _PD_ID_RE.match(str(site_id or "").lower()):
         return None, error("project not found", 404)
     site = sites.get_site(conn, site_id)
@@ -13486,6 +13502,8 @@ def _doc_site(conn, caller, site_id, write):
         if write and _doc_writer(conn, caller, site):
             return None, error(_PD_ARCHIVED, 409)
         if not write:
+            if _sees_archived(caller, site):
+                return site, None
             return None, error("project not found", 404)
     if str(site["id"]) not in {str(s) for s in _allowed_site_ids(conn, caller)}:
         return None, error("project not found", 404)
@@ -13554,7 +13572,12 @@ def project_documents_route(conn, caller, site_id, rest, method, event):
             return project_document_file(conn, site, doc_id)
         if sub == "retry" and method == "POST":
             return retry_project_document(conn, caller, site, doc_id)
-    return error("not found", 404)
+        return error("method not allowed", 405)
+    if rest in ("", "upload-url"):
+        return error("method not allowed", 405)
+    # Never the bare "not found" here: with the flag on, the UI reads that body as
+    # "feature off" and would hide the whole section over one bad path or id.
+    return error("document not found", 404)
 
 
 def list_project_documents(conn, caller, site, event):
@@ -13704,8 +13727,9 @@ def project_document_file(conn, site, doc_id):
 
 
 def retry_project_document(conn, caller, site, doc_id):
-    """POST /sites/{site}/documents/{id}/retry -- for `error` / `unreadable`, or `pending`
-    for longer than 20 minutes since the last request (R9). Re-writes the request for the
+    """POST /sites/{site}/documents/{id}/retry -- for `error`, or `pending` for longer than
+    20 minutes since the last request (R9). Not for `unreadable`: the same bytes would fail
+    the same way, so the answer is a new revision. Re-writes the request for the
     same id. Never for an indexed document: a Retry must not take it out of search, and
     mark_pending's guarded UPDATE refuses one that was indexed after the read above."""
     row = _site_doc(conn, site, doc_id)
@@ -13713,9 +13737,11 @@ def retry_project_document(conn, caller, site, doc_id):
         return error("document not found", 404)
     if row["status"] == "indexed":
         return error(_PD_INDEXED, 409)
+    if row["status"] == "unreadable":
+        return error(_PD_UNREADABLE, 409)
     stuck = (row["status"] == "pending" and row["requested_at"] is not None
              and datetime.now(timezone.utc) - row["requested_at"] > PROJECT_DOC_STUCK)
-    if row["status"] not in ("error", "unreadable") and not stuck:
+    if row["status"] != "error" and not stuck:
         return error("This document is not waiting on a retry.", 409)
     with conn.transaction():
         marked = project_docs.mark_pending(conn, doc_id)

@@ -619,11 +619,13 @@ def _project_documents(caller_sub, query_vec, question, site):
     import project_doc_flag
     if not project_doc_flag.on():
         return None
-    payload = {"mode": "documents", "sub": caller_sub, "query_embedding": query_vec,
-               "question": question, "k": DOC_SEARCH_K}
-    if site:
-        payload["site"] = site
+    # The whole call, parse and shaping sit inside the try: a non-dict payload or a
+    # malformed hit must cost only the documents, never the records result.
     try:
+        payload = {"mode": "documents", "sub": caller_sub, "query_embedding": query_vec,
+                   "question": question, "k": DOC_SEARCH_K}
+        if site:
+            payload["site"] = site
         resp = _get_lambda_client().invoke(FunctionName=RAG_SEARCH_FUNCTION,
                                            InvocationType="RequestResponse",
                                            Payload=json.dumps(payload))
@@ -631,15 +633,15 @@ def _project_documents(caller_sub, query_vec, question, site):
             logger.error("  documents search FunctionError: %s", resp.get("FunctionError"))
             return []
         result = json.loads(resp["Payload"].read().decode("utf-8"))
+        if result.get("off"):
+            return None
+        if result.get("error"):
+            logger.warning("  documents search error: %s", result["error"])
+            return []
+        return [_doc_hit(r) for r in result.get("documents") or []]
     except Exception as e:                                   # noqa: BLE001
         logger.warning("  documents search failed: %s", type(e).__name__)
         return []
-    if result.get("off"):
-        return None
-    if result.get("error"):
-        logger.warning("  documents search error: %s", result["error"])
-        return []
-    return [_doc_hit(r) for r in result.get("documents") or []]
 
 
 def _rag_search_list(body):

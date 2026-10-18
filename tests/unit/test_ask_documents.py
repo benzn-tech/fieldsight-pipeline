@@ -290,6 +290,24 @@ def test_a_documents_answer_is_not_replaced_by_the_no_records_offer(turn_env):
     assert out["documents"][0]["document_id"] == "doc-1"
 
 
+def test_the_no_records_offer_ships_no_document_origins(turn_env):
+    """basis none + offer: the offer row has no citations, and a D ref the model still
+    wrote must not bring a "from project documents" block in beside it."""
+    out = orch.answer(_body("What does the spec say about slab cover?", offer_web=True),
+                      channel="screen", on_state=lambda s: None, tools=DocTools(),
+                      chat=ScriptChat(_final("Nothing recorded [D1].", "none", offer_web=True)))
+    assert out.get("web_offer") is True and out["citations"] == []
+    assert "documents" not in out
+
+
+@pytest.mark.parametrize("lo,hi,label", [
+    (4, 4, "p.4"), ("4", "6", "pp.4-6"), (4.0, None, "p.4"), ("four", 5, ""),
+    (None, 5, ""), (4, "x", "p.4"), (True, 5, ""), ({"a": 1}, 2, ""),
+])
+def test_doc_page_takes_only_integer_pages(lo, hi, label):
+    assert orch._doc_page({"page_from": lo, "page_to": hi}) == label
+
+
 # ---- whole turns through the REAL ask_tools (only the network edges are faked) ----------
 
 import dashscope_utils  # noqa: E402

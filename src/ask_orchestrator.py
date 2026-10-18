@@ -170,8 +170,19 @@ def _dash(value):
     return sanitize(value) or "-"
 
 
+def _page_int(value):
+    """A page number as an int, or None: the values come from a tool result, and only an
+    integer may reach the model's evidence line."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _doc_page(item):
-    lo, hi = item.get("page_from"), item.get("page_to")
+    lo, hi = _page_int(item.get("page_from")), _page_int(item.get("page_to"))
     if lo is None:
         return ""
     return f"p.{lo}" if hi in (None, lo) else f"pp.{lo}-{hi}"
@@ -1451,7 +1462,9 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
 
     if no_records_offer:
         # "Records don't cover that" must not ship with record cards beside it
-        # (spec 2026-10-16 section 3: the offer row has no citations).
+        # (spec 2026-10-16 section 3: the offer row has no citations) -- and that
+        # includes document origins: no basis was cited, so none is shown.
+        extra.pop("documents", None)
         return t.result(text, [], grounded=False, extra=extra, cited=())
     if t.web_failed:
         text, kept = _web_failed_answer(t, text, bool(out["refs_r"]))

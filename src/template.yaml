@@ -1379,8 +1379,9 @@ Parameters:
 
   # Project documents (spec 2026-10-16). Wired in pieces, pinned by
   # tests/unit/test_project_documents_wiring.py: this Parameter -> PROJECT_DOCUMENTS on
-  # OrgApiFunction (routes), RagSearchFunction (documents mode) and AskAgentFunction (the
-  # Ask tool and the palette's documents group) -> project_doc_flag.on().
+  # OrgApiFunction (routes), RagSearchFunction (documents mode), AskAgentFunction (the
+  # Ask tool and the palette's documents group) and AskVoiceWorkerFunction (it runs the
+  # orchestrator, so its documents tool must agree) -> project_doc_flag.on().
   ProjectDocuments:
     Type: String
     Default: 'false'

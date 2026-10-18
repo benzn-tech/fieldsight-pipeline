@@ -80,13 +80,20 @@ def _artifact(company, doc_id, request, status, reason=None, pages=None, chars=N
             "finished_at": datetime.now(timezone.utc).isoformat()}
 
 
+#: project_doc_chunks.embedding is vector(1024) (migration 0088) and IngestFunction rejects
+#: any other length (repositories.project_docs.EMBED_DIM). Passed explicitly so a changed
+#: DASHSCOPE_EMBED_DIM default can never make every document fail at apply time.
+EMBED_DIM = 1024
+
+
 def _embed(texts, deadline_at):
     vectors = []
     for i in range(0, len(texts), dashscope_utils.BATCH_SIZE):
         if _clock() >= deadline_at:
             raise _OutOfTime()
         try:
-            vectors.extend(dashscope_utils.embed(texts[i:i + dashscope_utils.BATCH_SIZE]))
+            vectors.extend(dashscope_utils.embed(texts[i:i + dashscope_utils.BATCH_SIZE],
+                                                 dim=EMBED_DIM))
         except RuntimeError as e:
             logger.warning("project doc embed failed: %s", e)
             raise _EmbedFailed()
