@@ -89,6 +89,27 @@ TOOLS = [
          "date_to": _DATE_TO},
         ["metric", "date_from"]),
 ]
+
+# Project documents (spec 2026-10-16). Always KNOWN (validation, dispatch); OFFERED to the
+# model only when PROJECT_DOCUMENTS is on (offered_tools). Its rows are D refs (R1).
+DOC_TOOL = "search_project_documents"
+TOOLS.append(_fn(
+    DOC_TOOL,
+    "Search this project's own documents (specifications, contracts, method statements) "
+    "for what they REQUIRE. Use for requirements, specs, tolerances, clauses, or 'what does "
+    "the spec say'. A document says what should be done, never what happened on site.",
+    {"query": {"type": "string"}, "site": _SITE,
+     "k": {"type": "integer", "minimum": 1, "maximum": MAX_K}},
+    ["query"]))
+
+
+def offered_tools():
+    """The tools the orchestrator offers the model: TOOLS, minus the documents tool while
+    PROJECT_DOCUMENTS is off."""
+    import project_doc_flag
+    return [t for t in TOOLS if t["name"] != DOC_TOOL or project_doc_flag.on()]
+
+
 _BY_NAME = {t["name"]: t for t in TOOLS}
 _ISO = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -200,7 +221,11 @@ MAX_TEXT = 600
 MAX_BATCH = 4
 MAX_DEADLINE_S = 20
 DEFAULT_K = 8
-_SEARCH_SHAPED = ("search_records", "latest_activity")
+# Calls that need a query embedding ...
+_SEARCH_SHAPED = ("search_records", "latest_activity", DOC_TOOL)
+# ... and the subset that goes through the RECORDINGS post-search/reranker. Documents do
+# not (R1): the reranker and the lexical-admit rule are tuned on recordings.
+_RERANKED = ("search_records", "latest_activity")
 # Keys the orchestrator maps onto a citation card (lambda_ask_agent._build_citations).
 # Always present on topic/chunk items, even when None, so a card never needs a
 # re-fetch; every other None-valued key is dropped to save budget.
@@ -320,6 +345,17 @@ def _metadata(row):
 
 def _item(name, args, row, call_id):
     """(kind, dedupe ident, item-without-ref) for one dispatcher row."""
+    if name == DOC_TOOL:
+        # Before the shape check (R1): a document row carries chunk_text and would
+        # otherwise become a recording chunk with provenance "records".
+        return "document", row.get("id"), {
+            "kind": "document", "provenance": "documents",
+            "title": row.get("title"), "heading": row.get("heading"),
+            "page_from": row.get("page_from"), "page_to": row.get("page_to"),
+            "document_id": row.get("document_id"), "series_id": row.get("series_id"),
+            "revision": row.get("revision"), "site": row.get("site_name"),
+            "site_id": row.get("site_id"), "content_type": row.get("content_type"),
+            "text": _text(row.get("chunk_text"))}
     if name == "find_people":
         return "person", row.get("person_ref"), {
             "kind": "person", "provenance": "records", "who": row.get("name"),
@@ -386,7 +422,8 @@ def _envelope(name, call_id, args, rows, meta, ctx):
             meta["truncated"] = True
             break
         # No id: its own ref, never deduped onto another id-less row.
-        ref = ctx.refs.fresh() if key is None else ctx.refs.assign(*key)
+        prefix = "D" if name == DOC_TOOL else "R"
+        ref = ctx.refs.fresh(prefix) if key is None else ctx.refs.assign(key[0], key[1], prefix)
         if key is not None:
             seen.add(key)
         items.append({"ref": ref, **item})
@@ -482,7 +519,7 @@ def _execute(calls, ctx):
         w = {"id": cid, "name": name, "args": args}
         if cid in vectors:
             w["query_embedding"] = vectors[cid]
-            if candidate_k:
+            if candidate_k and pending[cid][0] in _RERANKED:
                 # The same candidate pool _rag_answer reranks over (rag-search
                 # fetches max(k*2, candidate_k), capped).
                 w["candidate_k"] = candidate_k
@@ -506,13 +543,15 @@ def _execute(calls, ctx):
         else:
             meta = dict(r["meta"]) if isinstance(r.get("meta"), dict) else {}
             rows = r["rows"] if isinstance(r.get("rows"), list) else []
-        if name in _SEARCH_SHAPED and args.get("query") and rows:
+        if name in _RERANKED and args.get("query") and rows:
             k = args.get("k") or DEFAULT_K
             try:
                 rows = _post_search(args["query"], rows, k)
             except Exception as exc:                    # noqa: BLE001
                 logger.warning("ask tools post-search failed: %s", type(exc).__name__)
                 rows = rows[:k]
+        elif name == DOC_TOOL:
+            rows = rows[:args.get("k") or DEFAULT_K]
         if clamped:
             meta["clamped"] = clamped
         if args.get("date_from"):

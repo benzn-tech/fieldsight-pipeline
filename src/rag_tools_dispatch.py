@@ -23,6 +23,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 
 import ask_tools_log
+import project_doc_flag
 import text_normalize
 from lexical_terms import or_query, query_terms
 from repositories import aliases, chunks, sites, topics, users
@@ -326,9 +327,36 @@ def _count_metric(conn, caller, sc, a, meta, metric_fn, **_):
     return [res]
 
 
+def _search_project_documents(conn, caller, sc, a, meta, call, search_fn, **_):
+    """Project documents (spec 2026-10-16): through rag-search's own `documents` mode, so
+    there is one implementation of document search and its ACL. Off -> bad_args, the same
+    answer an unknown tool gets."""
+    if not project_doc_flag.on():
+        meta.update({"error": "bad_args", "field": "name"})
+        raise _NoRows()
+    _need_embedding(call, meta)
+    site_id = _resolve_site(conn, sc, a.get("site"), meta)
+    if not sc["site_ids"]:
+        meta["empty_reason"] = "nothing_visible"
+        return []
+    ev = {"mode": "documents", "sub": caller["sub"], "query_embedding": call["query_embedding"],
+          "question": a["query"], "k": a.get("k") or DEFAULT_K}
+    if site_id:
+        ev["site"] = site_id
+    res = search_fn(ev, None) or {}
+    if res.get("error"):
+        meta["error"] = "not_provisioned" if "provision" in str(res["error"]) else "upstream"
+        raise _NoRows()
+    rows = list(res.get("documents") or [])
+    if not rows:
+        meta["empty_reason"] = _no_match(sc)
+    return rows
+
+
 _TOOLS = {"day_overview": _day_overview, "search_records": _search_records,
           "latest_activity": _latest_activity, "find_people": _find_people,
-          "count_metric": _count_metric}
+          "count_metric": _count_metric,
+          "search_project_documents": _search_project_documents}
 
 
 def _deadline(event):

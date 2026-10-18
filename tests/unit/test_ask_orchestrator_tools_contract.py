@@ -138,7 +138,7 @@ def test_judge_round_two_uses_real_tools_and_real_refs(monkeypatch):
     assert out["answer"] == "B2 was poured at 32 MPa [1]; the one before at 25 MPa [2]."
     # The offered tool list is the real ask_tools.TOOLS plus the orchestrator's own.
     names = {t["function"]["name"] for t in chat.seen[0]["tools"]}
-    assert {t["name"] for t in ask_tools.TOOLS} <= names and "final_answer" in names
+    assert {t["name"] for t in ask_tools.offered_tools()} <= names and "final_answer" in names
 
 
 def test_id_less_rows_use_fresh_refs_through_the_lock(monkeypatch):
