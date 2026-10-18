@@ -14,6 +14,8 @@
 #   EmbedReport ← index_requests/**.json        (session search index REQUEST: item-writer/org-api/backfill output)
 #   Ingest      ← index_vectors/**.json         (embed-report session-index VECTORS output, in-VPC Aurora apply)
 #   TemplateDigitise ← template_digitise_requests/**.json (org-api's request to read an uploaded form)
+#   ProjectDocIndex ← project_doc_requests/**.json (org-api's request to index an uploaded project document)
+#   Ingest      ← project_doc_vectors/**.json  (project-doc worker output, in-VPC Aurora apply)
 #
 # SAFETY:
 #   * MERGE, not clobber: we read the existing notification config and
@@ -52,6 +54,7 @@ REPORT_GENERATOR_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-
 SESSION_FINALIZE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-session-finalize"
 SPEAKER_EMBED_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-speaker-embed"
 TEMPLATE_DIGITISE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-template-digitise"
+PROJECT_DOC_INDEX_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-project-doc-index"
 
 echo "Bucket=${BUCKET} Stage=${STAGE} VAD=${PREFIX}-vad Transcribe=${PREFIX}-transcribe EmbedReport=${PREFIX}-embed-report Ingest=${PREFIX}-ingest ExtractSession=${PREFIX}-extract-session ItemWriter=${PREFIX}-item-writer ProgrammeMatcher=${PREFIX}-programme-matcher Keyframe=${PREFIX}-keyframe"
 
@@ -135,7 +138,9 @@ if fn_exists "${PREFIX}-ingest"; then
     {"Id":"fs-ingest-reindex","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
      "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"reindex_vectors/"},{"Name":"suffix","Value":".json"}]}}},
     {"Id":"fs-ingest-index","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
-     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"index_vectors/"},{"Name":"suffix","Value":".json"}]}}}
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"index_vectors/"},{"Name":"suffix","Value":".json"}]}}},
+    {"Id":"fs-ingest-project-doc","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"project_doc_vectors/"},{"Name":"suffix","Value":".json"}]}}}
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-ingest not deployed — skipping ingest trigger"
@@ -226,6 +231,19 @@ if fn_exists "${PREFIX}-template-digitise"; then
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-template-digitise not deployed — skipping template-digitise trigger"
+fi
+# NOTE(project documents, spec 2026-10-16): the non-VPC worker triggers on
+# project_doc_requests/*.json -- org-api's request for one uploaded document. Its output
+# (project_doc_vectors/) is Ingest's trigger above, and the uploads (project_doc_sources/)
+# match no rule, so there is no BUG-13 loop; both prefixes are disjoint from every other.
+if fn_exists "${PREFIX}-project-doc-index"; then
+  WIRE_FNS+=("${PREFIX}-project-doc-index")
+  DESIRED=$(jq -c --arg arn "$PROJECT_DOC_INDEX_ARN" '. + [
+    {"Id":"fs-project-doc-index","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"project_doc_requests/"},{"Name":"suffix","Value":".json"}]}}}
+  ]' <<<"$DESIRED")
+else
+  echo "NOTE: ${PREFIX}-project-doc-index not deployed — skipping project-doc-index trigger"
 fi
 # NOTE(regenerate-own-report): the non-VPC report generator triggers on
 # report_requests/*.json -- org-api's request for ONE person's own report. The

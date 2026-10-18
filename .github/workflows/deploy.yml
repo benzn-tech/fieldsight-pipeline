@@ -166,6 +166,12 @@ jobs:
           if [ -n "${{ vars.TEST_VAD_LAYER_ARN }}" ]; then
             VAD_LAYER_PARAM="VadLayerArn=${{ vars.TEST_VAD_LAYER_ARN }}"
           fi
+          # Project documents' pypdf layer (spec 2026-10-16, R13). Same bare-"Key=" guard:
+          # unset TEST_PDF_LAYER_ARN keeps the template Default '' and the layer is skipped.
+          PDF_LAYER_PARAM=""
+          if [ -n "${{ vars.TEST_PDF_LAYER_ARN }}" ]; then
+            PDF_LAYER_PARAM="PdfLayerArn=${{ vars.TEST_PDF_LAYER_ARN }}"
+          fi
           # Ask orchestration v2 (ASK_AGENTIC, judge model). Same bare-"Key=" guard as
           # the layer ARNs: an unset TEST_ASK_AGENTIC must not become `AskAgentic=`
           # (SAM exits 2 on it); the template Default '' keeps the flag off.
@@ -281,6 +287,8 @@ jobs:
               "SearchIndexRead=${{ vars.TEST_SEARCH_INDEX_READ || 'report' }}" \
               "CompanySummaryServe=${{ vars.TEST_COMPANY_SUMMARY_SERVE || 'off' }}" \
               "TemplateDigitise=${{ vars.TEST_TEMPLATE_DIGITISE || 'false' }}" \
+              "ProjectDocuments=${{ vars.TEST_PROJECT_DOCUMENTS || 'false' }}" \
+              $PDF_LAYER_PARAM \
               "EnableUserDeletion=${{ vars.TEST_ENABLE_USER_DELETION || 'false' }}" \
               "EnableExternalCorroboration=${{ vars.TEST_ENABLE_EXTERNAL_CORROBORATION || 'false' }}" \
               "CorroborationApiKey=${{ secrets.OPENROUTER_API_KEY }}" \
