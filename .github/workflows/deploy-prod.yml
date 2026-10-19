@@ -193,6 +193,12 @@ jobs:
           if [ -n "${{ vars.PROD_KEYFRAME_FFMPEG_LAYER_ARN }}" ]; then
             KF_LAYER_PARAM="KeyframeFfmpegLayerArn=${{ vars.PROD_KEYFRAME_FFMPEG_LAYER_ARN }}"
           fi
+          # Project documents' pypdf layer (spec 2026-10-16, R13). Same bare-"Key=" guard:
+          # unset PROD_PDF_LAYER_ARN keeps the template Default '' and the layer is skipped.
+          PDF_LAYER_PARAM=""
+          if [ -n "${{ vars.PROD_PDF_LAYER_ARN }}" ]; then
+            PDF_LAYER_PARAM="PdfLayerArn=${{ vars.PROD_PDF_LAYER_ARN }}"
+          fi
           # Ask orchestration v2 (ASK_AGENTIC, judge model). Same bare-"Key=" guard as
           # deploy.yml: an unset PROD_ var must not become `AskAgentic=` (SAM exits 2
           # on it); the template Default '' keeps the flag off until PROD_ASK_AGENTIC is set.
@@ -311,6 +317,8 @@ jobs:
               "SearchIndexRead=${{ vars.PROD_SEARCH_INDEX_READ || 'report' }}" \
               "CompanySummaryServe=${{ vars.PROD_COMPANY_SUMMARY_SERVE || 'off' }}" \
               "TemplateDigitise=${{ vars.PROD_TEMPLATE_DIGITISE || 'false' }}" \
+              "ProjectDocuments=${{ vars.PROD_PROJECT_DOCUMENTS || 'false' }}" \
+              $PDF_LAYER_PARAM \
               "EnableUserDeletion=${{ vars.PROD_ENABLE_USER_DELETION || 'false' }}" \
               "EnableExternalCorroboration=${{ vars.PROD_ENABLE_EXTERNAL_CORROBORATION || 'false' }}" \
               "CorroborationApiKey=${{ secrets.OPENROUTER_API_KEY }}" \

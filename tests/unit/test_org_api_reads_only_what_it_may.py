@@ -36,8 +36,10 @@ NOT_A_LAKE_PREFIX = {
 #: the string a tombstone matches on — neither is an S3 call, and org-api deletes no objects
 #: (deletion is a tombstone; the lake keeps every byte). Granting these would hand the API a
 #: read on the raw extraction corpus for no route that wants one.
+#: `project_doc_vectors/{company}/{doc}.json` is the project-document index worker's output
+#: key, recorded in lake_objects at create; org-api never reads it.
 #: Checked, not assumed: `test_these_really_are_only_database_values` below.
-DATABASE_VALUES_NOT_S3_KEYS = {"extractions"}
+DATABASE_VALUES_NOT_S3_KEYS = {"extractions", "project_doc_vectors"}
 
 
 def _org_api_policy():

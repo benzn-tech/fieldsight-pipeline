@@ -12,10 +12,14 @@ def test_span_is_public_and_matches_private():
     assert query_slots._span is query_slots.span
 
 
-def test_tools_have_exactly_the_five_v1_names_and_no_identity_args():
+def test_tools_have_exactly_the_five_v1_names_and_no_identity_args(monkeypatch):
+    # The five v1 tools, plus the project-documents tool (spec 2026-10-16), which is
+    # known to validation and dispatch but offered only while PROJECT_DOCUMENTS is on.
+    v1 = ["day_overview", "search_records", "latest_activity", "find_people", "count_metric"]
     names = [t["name"] for t in ask_tools.TOOLS]
-    assert names == ["day_overview", "search_records", "latest_activity",
-                     "find_people", "count_metric"]
+    assert names == v1 + [ask_tools.DOC_TOOL]
+    monkeypatch.setenv("PROJECT_DOCUMENTS", "false")
+    assert [t["name"] for t in ask_tools.offered_tools()] == v1
     for t in ask_tools.TOOLS:
         props = t["parameters"]["properties"]
         for forbidden in ("sub", "caller_sub", "company", "company_id", "tz", "today"):
