@@ -128,3 +128,14 @@ Functions:
 7. **`lambda_extract_session` is imported lazily** (as `lambda_rolling_summary` does) rather than copied; `assemble_deduped_turns` is used (the two-value view of `assemble_session_turns`).
 8. **IAM beyond the spec's list:** `voice_ask/*` (Get + List) because `assemble_session_turns` runs `agent_turn_filter`, which raises on an unreadable listing; `audio_segments/*` Get for the batch-map sidecar.
 9. **Batch map for the covered index** is read from the embedded `fieldsight_batch_map` in the batch transcript JSON (one extra GET per batch key); a batch with none falls back to first index + count - 1, which can only re-transcribe, never skip.
+10. **Say line names the customer's template** ("3 items open on the Pre-pour Inspection
+    Checklist: ...") rather than echoing the spoken name: the template name is the
+    customer's wording and is always present (the live-window fallback has no usable
+    spoken name). Over five items: "...; and N more." then "See the app for the rest."
+11. **Video is detected from `meeting_session.kind`** ('video' -> no audio listed,
+    `partial`); `users/*/video/*` is never listed or read.
+12. **Shared test pins moved** (each pin exists to make a new function look here):
+    `test_template_pgdatabase` 20 -> 21 guarded PGDATABASE; `test_qwen_model_follows_the_thinking_mode`
+    QwenModelFast carriers 2 -> 3; `test_lake_ownership_template` lists CheckGapsFunction under
+    IMPORTS_BUT_NEVER_WRITES (it imports lake_put modules via extract_session, never writes).
+13. **No-template line** with no candidates: "I couldn't find a checklist set up for this check."
