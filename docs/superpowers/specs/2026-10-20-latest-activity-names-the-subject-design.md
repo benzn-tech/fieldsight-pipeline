@@ -275,6 +275,87 @@ The golden hashes at `test_search_sql.py:352-363` must not change, because
   `matched_date` is the latest such day; a direct SQL count on
   `fieldsight_test` confirms it.
 
+## 8. Amendment A (2026-10-20): coverage first, not ALL
+
+**Why.** The main caller is not the model. `ask_orchestrator.round1_calls`
+(`ask_orchestrator.py:576`) runs deterministically on every question matching
+`_LATEST` (last|latest|most recent|when did). It sends the raw question as `query`,
+so the tool description in §3.5 never reaches it.
+
+A natural question yields 4–6 subject terms. For example, "When did we last pour
+concrete for the B2 slab on level 2?" gives `pour concrete b2 slab level`. Under
+an AND over all terms, one missing word produces `no_match`. The judge then
+spends a model round on `search_records` (+2–3 s), and the "latest" ordering is
+lost. The orchestration line asked that the tool handle full questions.
+
+**Rule.** This replaces "every subject word" in §2, §3.2 and §3.3:
+
+- The coverage of a chunk is the number of subject terms it matches. Each term
+  is matched by the per-term fold of §3.2.
+- `k*` is the largest coverage of any visible chunk in the window. The floor is
+  `min(2, n)`: with `n ≤ 2` all terms are still required, and a single generic
+  word never selects a day once there are two or more terms.
+- The day is the latest `report_date` that has a chunk with coverage `k*`. This
+  is the orchestration line's "AND over all, then drop terms until a day
+  matches", done as one query.
+- The rows kept on that day are the rows with coverage `≥ k*`.
+- `meta.subject_match = {"matched": k*, "of": n}`. This is a new key; the
+  existing keys and the result shape are unchanged.
+- The result is `no_match` only when no chunk reaches the floor.
+
+**Trade-off, accepted by the orchestration line.** `k*` is the window maximum,
+so an older day naming 5 terms beats a newer day naming 4. Judge rule 7 still
+checks the text, so the risk is a less recent day, not a wrong one.
+
+**SQL.** The day query becomes:
+
+    WITH m AS (
+      SELECT c.report_date, <cover> AS k FROM report_chunks c
+      WHERE <scope> AND <lexical vector> @@ (<t0> || <t1> || …)
+    )
+    SELECT report_date, k FROM m
+    WHERE k >= %(floor)s
+    ORDER BY k DESC, report_date DESC
+    LIMIT 1
+
+- `<ti>` is term i's fold from §3.2.
+- `<cover>` is `(<lexical vector> @@ <t0>)::int + (<lexical vector> @@ <t1>)::int + …`.
+- The OR prefilter is GIN-served. The coverage sum runs only on the rows that
+  pass it.
+- The recheck returns `(id, k)` for the given ids by the same `<cover>`
+  expression.
+
+`chunks.latest_matching_date` returns `(day, k)` or `None`.
+`chunks.subject_matched_ids` becomes `subject_coverage(conn, ids, terms) ->
+dict[id, k]`.
+
+**Asking words added:** `hear conversation conversations update updates news
+status`. Measured: "When did we last hear from Hector Eggar…" had kept `hear`,
+and "most recent conversation about the crane…" had kept `conversation`.
+
+**Measured** (read-only, prod, the same scope, 10 round-1-shaped questions,
+probe `fspy-runs/latest_probe2.py`):
+
+- All 10 chose a day, and none returned `no_match`.
+- Drainage: 08-08 "Drainage Outlet Discrepancy" (2/3).
+- Hector Eggar scaffold methodology: 09-02 "Scaffold Methodology & Crane
+  Restrictions" (4/5).
+- Flat slab shop drawings with Jesse: 09-10 (4/5).
+- Insulation R-value: 09-02 (2/2).
+- The weak cases are 2/3 or 2/4 matches on generic words: "Dave … arriving on
+  site", and "geotech report for the retaining wall", where the corpus spells it
+  "geotek". The judge's rule 7 text check handles these.
+
+**Tests in round-1 shape** (raw question plus site/person, as `round1_calls`
+sends it):
+
+- Full question where no chunk has all terms but one has 4 of 5: that day is
+  returned and `subject_match == {"matched": 4, "of": 5}`.
+- An older 5/5 day beats a newer 4/5 day.
+- A single-term match with `n ≥ 2` returns `no_match`.
+- With `n == 2`, both terms are required.
+- On the chosen day, rows below `k*` are dropped.
+
 ## 7. Review log (Fable, 2026-10-20)
 
 Applied:
