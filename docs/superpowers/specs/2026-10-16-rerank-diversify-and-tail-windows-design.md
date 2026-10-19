@@ -261,8 +261,36 @@ Per arm 24 + 8 (experiment commit `902c09b1`), rerank@32 Ask, against prod today
 Developer-machine rerank p50 (comparable with each other, not with prod):
 cap 4 3.0–4.0 s, 24 + 8 5.1 s (session) / 7.0 s (report), no cap 8.4–9.9 s.
 
-Remaining before merge: the in-region latency check of §3c at 32 candidates,
-and `--repeat 3` of the final §3a selector (with spill) on both families.
+Acceptance, final §3a selector with spill (branch head `1f663b2b`, `--repeat 3`,
+`--today 2026-10-16`, `EVAL_LIST_K=64`), rerank@32 Ask hit against the cap-4
+baseline (`20261016T033855Z` session, `20261016T031604Z` report):
+
+| family | cap 4, 3 runs | per arm + spill, 3 runs |
+|---|---|---|
+| session | 87.2 / 87.2 / 87.2 | 94.9 / 94.9 / 94.9 |
+| report | 89.7 / 89.7 / 89.7 | 94.9 / 92.3 / 94.9 |
+
+- session: gains v1-06, v1-16, v1-31 in all three runs; loses nothing. Every
+  category equal or better (quality 4 → 5, uncategorised 16 → 18).
+- report: gains v1-30, v1-31 in all three runs; v1-27 hits 3/3 (was 1/3) and
+  v1-32 3/3 (was 2/3); v1-12 misses 1/3 (was 0/3). Subcontractor 3–4 → 5,
+  quality 3–4 → 5, programme 5 → 4.
+- report loses v1-36 in all three runs (the 24 + 8 bullet above wrongly listed it
+  as "still misses"; cap 4 hits it at rank 4). Row by row: the transcript row the
+  gold quote matches is in the candidate set under both selectors (position 10 of
+  32 vs 9 of 15); with 32 candidates the reranker puts it 7th instead of 3rd. Both
+  selectors rank first the 2026-09-02 topic chunk whose text reads "Decision: Flat
+  slab shop drawings deadline pushed to the 9th." So Ask's context still carries
+  the answer; the gold item's `match_any` names only the spoken quote. Not changed
+  in v1 (changing gold mid-comparison moves the baseline); a v1.1 candidate.
+
+Rerank latency for 32 ~2600-char documents from ap-southeast-2 (CloudShell, 5
+reps): median 1.86 s, max 1.87 s, 0/5 over the prod 3 s timeout (NZ developer
+machine: median 1.83 s). The ruler's own rerank timings from the NZ machine are
+higher (p50 2.8 s session, 4.5 s report, drifting up across runs) and are not
+comparable: they use real candidate texts and `top_n` = 32. Prod ask-agent logs
+for 2026-10-05..19 show 2 reranks (26 and 27 candidates) and 0 `rerank: request
+failed`, too few to bound the prod tail; a timeout falls back to §3a's fallback.
 
 3b changes indexed text, and the ruler corpus lives in the prod database, which
 only the owner writes. So before merge 3b is evidenced by the read-only probe in
