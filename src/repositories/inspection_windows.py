@@ -69,3 +69,21 @@ def for_day(conn, company_id, user_folder, date):
         if not r.get("segments"):
             r["segments"] = [{"from": r["start_at"], "to": r["end_at"]}]   # one stretch
     return rows
+
+
+def for_session(conn, company_ids, user_folder, session):
+    """One recording's checks so far (check done, spec 2026-10-20). Never by
+    session alone: the same filter as the report dialog (company AND folder),
+    plus the session. `company_ids` empty reads nothing -- here an empty list is
+    "no company", not "no filter"."""
+    ids = [str(c) for c in company_ids or [] if c]
+    if not ids:
+        return []
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT name, kind, start_at, end_at, end_source, template_id, report_date "
+        "FROM inspection_windows "
+        "WHERE company_id = ANY(%s::uuid[]) AND user_folder = %s AND session = %s "
+        "ORDER BY start_at, name",
+        (ids, user_folder, session),
+    ).fetchall()
+    return rows
