@@ -222,3 +222,17 @@ def test_only_the_last_few_indices_are_searched_for_holes():
     keys = [chunk(i) for i in range(12)]
     chosen, _ = cd.select_new_chunks(keys, SID, covered=10, covered_set={10})
     assert [cd.chunk_index(k) for k in chosen] == [7, 8, 9, 11]
+
+
+def test_wav_seconds_trust_the_bytes_not_the_frame_count():
+    # A streaming writer that never patched its header claims 0x7fffffff bytes of
+    # data; the length of what was actually uploaded is the truth.
+    data = bytearray(_wav(3.0))
+    at = data.index(b"data")
+    data[at + 4:at + 8] = (0x7FFFFFF0).to_bytes(4, "little")
+    data[4:8] = (0x7FFFFFF0).to_bytes(4, "little")
+    assert abs(cd.wav_seconds(bytes(data)) - 3.0) < 0.01
+
+
+def test_wav_seconds_are_clamped_to_a_chunk():
+    assert cd.wav_seconds(_wav(90.0, rate=8000)) == cd.MAX_CHUNK_SECONDS

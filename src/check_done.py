@@ -72,6 +72,8 @@ SAY_MAX_ITEMS = 5
 # How many indices at and below the highest covered one are checked for a chunk
 # with no transcript yet (select_new_chunks).
 HOLE_WINDOW = 4
+# A device chunk is ~30 s; no chunk's length is believed past this.
+MAX_CHUNK_SECONDS = 60.0
 CLAUSE_MAX_WORDS = 12
 
 # Not in inspection_match.GENERIC (they never appear in a template name, so
@@ -221,13 +223,23 @@ def select_new_chunks(audio_keys, session_id, covered, covered_set=None):
 
 
 def wav_seconds(data):
-    """Duration from the WAV header, or None when it is not a readable WAV."""
+    """Duration of an uploaded WAV, or None when it is not a readable WAV.
+
+    The header gives the format (rate, channels, sample width); the LENGTH comes
+    from the bytes actually uploaded after the `data` tag, not the header's frame
+    count -- a recorder that streams its file and never patches the header claims
+    0xFFFFFFFF bytes, which would put covered_until hours in the future. Clamped
+    to MAX_CHUNK_SECONDS: a chunk is ~30 s, and one claiming more cannot move the
+    "as of" line past what the device could have recorded."""
     try:
         with wave.open(io.BytesIO(data), "rb") as w:
-            rate = w.getframerate()
-            return w.getnframes() / float(rate) if rate else None
+            byte_rate = w.getframerate() * w.getnchannels() * w.getsampwidth()
     except Exception:                                 # noqa: BLE001 -- any unreadable header
         return None
+    at = data.find(b"data")
+    if not byte_rate or at < 0:
+        return None
+    return min(max(0, len(data) - (at + 8)) / float(byte_rate), MAX_CHUNK_SECONDS)
 
 
 def _epoch_from_nz(local):
