@@ -226,3 +226,17 @@ def test_subject_terms_cap_at_six():
   `fieldsight-test-rag-search` `mode: tools` with three subjects. Every row
   names the subject, and `matched_date` equals `max(report_date)` from a
   direct SQL query on `fieldsight_test`.
+
+### Task 5: Amendment A (coverage first), spec §8 + §8.1
+
+**Files:** `src/lexical_terms.py` (dedupe; add `hear conversation conversations update updates news status` to `ASKING_WORDS`), `src/repositories/search_sql.py`, `src/repositories/chunks.py`, `src/rag_tools_dispatch.py`; tests in the same files as Tasks 1-3.
+
+**Interfaces:**
+- `search_sql.subject_term_query(i) -> str` (term i's fold, reused by every builder).
+- `search_sql.build_latest_match_date_sql(n)` returns `report_date, k` (one row, `ORDER BY k DESC, report_date DESC LIMIT 1`, `WHERE k >= %(floor)s`); candidates in a `MATERIALIZED` CTE selecting the lexical vector once; prefilter = OR of pairwise `(ti && tj)` for n >= 2, `t0` for n = 1.
+- `search_sql.build_subject_coverage_sql(n)` returns `id, k` for `%(ids)s` (same coverage expression).
+- `chunks.latest_matching_date(...) -> tuple[str, int] | None`; `chunks.subject_coverage(conn, chunk_ids, subject_terms) -> dict[str, int]` (replaces `subject_matched_ids`); floor = `min(2, n)` bound as `%(floor)s`.
+- dispatch: `day, k_star = ...`; keep fetched rows with coverage >= `k_fetched` = max fetched coverage if >= floor, else `[]`/no_match; `meta["subject_match"] = {"matched": k_fetched, "of": n, "day_max": k_star}`.
+
+- [ ] Step 1: failing tests -- round-1 shape (raw question + site/person through `_latest_activity`): 4/5 day returned with `subject_match == {"matched": 4, "of": 5, "day_max": 4}`; older 5/5 beats newer 4/5; single-term hit with n >= 2 -> no_match; n == 2 needs both; n == 1 floor 1; dedupe (`"panel panel"` -> `["panel"]`); rows below k_fetched dropped; k* chunk absent from the fetched 64 -> lower fetched tier kept, `day_max` > `matched`; crowded stem-only day through `lambda_rag_search`; EXPLAIN with a term in most rows uses `idx_report_chunks_tsv_multi_config`; `json.dumps` of the envelope meta.
+- [ ] Step 2: run -> FAIL. Step 3: implement. Step 4: run the Task 2/3 unit + integration sets -> PASS. Step 5: commit `fix(ask-tools): latest_activity coverage-first day choice for full questions`.
