@@ -101,17 +101,27 @@ def stt_chunk(audio_bytes, filename):
     return (json.loads(resp.data).get("text") or "").strip()
 
 
-def _gather(bucket, folder, date, session_base):
-    # Lazy, as lambda_rolling_summary does: the extraction module is heavy at
-    # import and only this step needs it. Its gather/assemble are used, not
-    # copied, so the stored transcript is the one extraction and step B read.
+def _extraction_module():
+    """lambda_extract_session, reading through OUR bounded S3 client.
+
+    Lazy, as lambda_rolling_summary does: the module is heavy at import and only
+    this step needs it. Its gather/assemble are used, not copied, so the stored
+    transcript is the one extraction and step B read. But they read through the
+    module's own cached client (`s3()` -> `_s3_client`: 60 s reads, legacy
+    retries), and so do the batch-map and voice_ask/ reads assemble makes with
+    it -- a slow S3 there would spend the whole ask. Setting the cache to our
+    client bounds every one of them without touching that module."""
     import lambda_extract_session as ex
-    return ex.gather_session_segments(bucket, folder, date, session_base)
+    ex._s3_client = _get_s3()
+    return ex
+
+
+def _gather(bucket, folder, date, session_base):
+    return _extraction_module().gather_session_segments(bucket, folder, date, session_base)
 
 
 def _assemble(bucket, keys):
-    import lambda_extract_session as ex
-    return ex.assemble_deduped_turns(bucket, keys)
+    return _extraction_module().assemble_deduped_turns(bucket, keys)
 
 
 def lambda_handler(event, context):

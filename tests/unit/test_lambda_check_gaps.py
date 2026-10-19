@@ -104,3 +104,33 @@ def test_the_clients_do_not_retry_behind_the_persons_back(monkeypatch):
     assert lam.retries["total_max_attempts"] == 1
     assert s3.retries["total_max_attempts"] <= 2
     assert lam.read_timeout == h.DB_HOP_READ_TIMEOUT_S
+
+
+def test_the_stored_transcript_reads_use_the_bounded_client(monkeypatch):
+    """lambda_extract_session reads through its own cached client (60 s reads,
+    legacy retries); its gather/assemble -- and the voice_ask/ reads
+    agent_turn_filter makes with the same client -- must use ours."""
+    import types
+    seen = {}
+    fake = types.ModuleType("lambda_extract_session")
+    fake._s3_client = "plain"
+
+    def gather(bucket, folder, date, base):
+        seen["gather"] = fake._s3_client
+        return []
+
+    def assemble(bucket, keys):
+        seen["assemble"] = fake._s3_client
+        return [], []
+    fake.gather_session_segments, fake.assemble_deduped_turns = gather, assemble
+    monkeypatch.setitem(sys.modules, "lambda_extract_session", fake)
+    bounded = object()
+    monkeypatch.setattr(h, "_get_s3", lambda: bounded)
+    h._gather("b", "f", "d", "sidx")
+    h._assemble("b", [])
+    assert seen == {"gather": bounded, "assemble": bounded}
+
+
+def test_the_extraction_module_caches_its_client_where_we_inject_it():
+    src = open(os.path.join(SRC, "lambda_extract_session.py"), encoding="utf-8").read()
+    assert "_s3_client = None" in src and "global _s3_client" in src
