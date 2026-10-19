@@ -136,10 +136,22 @@ def test_it_reads_exactly_what_the_transcript_step_reads_and_writes_nothing(doc)
     assert lists == LISTS
 
 
+# An exact function ARN, not the SAM LambdaInvokePolicy template: that one grants
+# `function:<name>*`, and `fieldsight-test-check-gaps*` also matches
+# `fieldsight-test-check-gaps-db` -- the worker could call the DB hop directly
+# (simulated allowed on TEST, 2026-10-20).
+def _invoke_statement(function):
+    return {"Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Action": "lambda:InvokeFunction",
+                           "Resource": {"GetAtt": "%s.Arn" % function}}]}
+
+
 def test_it_invokes_only_its_db_hop(doc):
-    invokes = [p["LambdaInvokePolicy"]["FunctionName"] for p in _props(doc, "CheckGapsFunction")["Policies"]
-               if isinstance(p, dict) and "LambdaInvokePolicy" in p]
-    assert invokes == [{"Ref": "CheckGapsDbFunction"}]
+    pols = _props(doc, "CheckGapsFunction")["Policies"]
+    assert not [p for p in pols if isinstance(p, dict) and "LambdaInvokePolicy" in p]
+    invokes = [st for st in _statements(doc, "CheckGapsFunction")
+               if "lambda:InvokeFunction" in _as_list(st["Action"])]
+    assert invokes == _invoke_statement("CheckGapsDbFunction")["Statement"]
 
 
 def test_the_worker_reaches_it_only_when_it_exists(doc):
@@ -147,8 +159,7 @@ def test_the_worker_reaches_it_only_when_it_exists(doc):
     assert env["CHECK_GAPS_FUNCTION"] == {"If": [COND, {"Ref": "CheckGapsFunction"}, ""]}
     guarded = [p["If"] for p in _props(doc, "AskVoiceWorkerFunction")["Policies"]
                if isinstance(p, dict) and "If" in p]
-    assert [COND, {"LambdaInvokePolicy": {"FunctionName": {"Ref": "CheckGapsFunction"}}},
-            {"Ref": "AWS::NoValue"}] in guarded
+    assert [COND, _invoke_statement("CheckGapsFunction"), {"Ref": "AWS::NoValue"}] in guarded
 
 
 def _unguarded_refs(node, names):
