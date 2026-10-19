@@ -335,6 +335,56 @@ def test_a_long_session_assembles_only_the_recent_keys_and_reads_one_batch_map()
     assert len(kept) <= 45, len(kept)                      # 45 + 10 minutes of 90 s keys, + c0000/1
 
 
+class SlowWorld(World):
+    """A clock that moves: the DB hop costs `db_cost` seconds."""
+
+    def __init__(self, db_cost, **over):
+        super().__init__(**over)
+        self.t, self.db_cost = float(PRESSED + 1), db_cost
+
+    def db_hop(self, payload):
+        self.t += self.db_cost
+        return super().db_hop(payload)
+
+    def run(self, event=None, stt="default", budget=None):
+        ev = {"caller_sub": "sub-1", "check_name": "pre-pour check done", "pressed_at": PRESSED}
+        ev.update(event or {})
+        kw = {} if budget is None else {"budget_s": budget}
+        return cd.run(ev, db_hop=self.db_hop, s3=self.s3, bucket="lake", gather=self.gather,
+                      assemble=self.assemble, stt=self.stt if stt == "default" else stt,
+                      call_llm=self.call_llm, now=lambda: self.t, **kw)
+
+
+def test_the_model_gets_only_what_is_left_of_the_budget():
+    w = SlowWorld(db_cost=cd.RUN_BUDGET_S - 6)
+    out = w.run()
+    assert out["status"] == "ok"
+    assert w.prompts[0][1]["deadline"] == 5, "budget left minus a second for the answer"
+
+
+def test_too_little_left_skips_the_model_and_says_so():
+    w = SlowWorld(db_cost=cd.RUN_BUDGET_S - 2)
+    out = w.run()
+    assert w.prompts == [] and out["status"] == "error" and out["say"] == cd.say_error()
+
+
+def test_no_time_left_for_hearing_means_partial_not_late():
+    # The STT window closes LLM_DEADLINE_S + 1 before the end of the budget.
+    w = SlowWorld(db_cost=cd.RUN_BUDGET_S - cd.LLM_DEADLINE_S - 1)
+    out = w.run()
+    assert w.heard == [] and out["partial"] is True
+    assert w.prompts and w.prompts[0][1]["deadline"] == cd.LLM_DEADLINE_S
+
+
+def test_the_handler_budget_can_only_shrink_the_run():
+    w = SlowWorld(db_cost=0)
+    w.run(budget=8)
+    assert w.prompts[0][1]["deadline"] == 7
+    w2 = SlowWorld(db_cost=0)
+    w2.run(budget=500)
+    assert w2.prompts[0][1]["deadline"] == cd.LLM_DEADLINE_S
+
+
 def test_the_function_never_raises(monkeypatch):
     w = World()
     monkeypatch.setattr(cd, "_answer", lambda *a, **k: 1 / 0)

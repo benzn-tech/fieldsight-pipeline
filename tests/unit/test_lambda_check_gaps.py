@@ -134,3 +134,13 @@ def test_the_stored_transcript_reads_use_the_bounded_client(monkeypatch):
 def test_the_extraction_module_caches_its_client_where_we_inject_it():
     src = open(os.path.join(SRC, "lambda_extract_session.py"), encoding="utf-8").read()
     assert "_s3_client = None" in src and "global _s3_client" in src
+
+
+def test_the_lambdas_remaining_time_bounds_the_run(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(h.check_done, "run", lambda event, **kw: seen.update(kw) or {"status": "ok"})
+    ctx = type("C", (), {"get_remaining_time_in_millis": lambda self: 20000})()
+    h.lambda_handler({"caller_sub": "s"}, ctx)
+    assert seen["budget_s"] == 20 - h.RETURN_RESERVE_S
+    h.lambda_handler({"caller_sub": "s"}, None)
+    assert seen["budget_s"] is None

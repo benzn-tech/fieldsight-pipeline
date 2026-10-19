@@ -38,6 +38,8 @@ CHECK_GAPS_DB_FUNCTION = os.environ.get("CHECK_GAPS_DB_FUNCTION", "")
 # (check_done.RUN_BUDGET_S) when the hop is warm, and a cold slow hop is the
 # case the budget then cuts, by name.
 DB_HOP_READ_TIMEOUT_S = 13
+# Seconds kept back from the Lambda's remaining time to log and return.
+RETURN_RESERVE_S = 3
 
 _s3 = None
 _lambda = None
@@ -126,6 +128,11 @@ def _assemble(bucket, keys):
 
 def lambda_handler(event, context):
     stt = stt_chunk if elevenlabs_utils.ELEVENLABS_ASK_API_KEY else None
+    # The run's budget is RUN_BUDGET_S from now, or less when the runtime has less
+    # left (a slow cold init): the shaped answer must be returned before the kill.
+    budget = None
+    if context is not None and hasattr(context, "get_remaining_time_in_millis"):
+        budget = context.get_remaining_time_in_millis() / 1000.0 - RETURN_RESERVE_S
     return check_done.run(event or {}, db_hop=db_hop, s3=_get_s3(), bucket=S3_BUCKET,
                           gather=_gather, assemble=_assemble, stt=stt,
-                          call_llm=llm_utils.call_llm)
+                          call_llm=llm_utils.call_llm, budget_s=budget)

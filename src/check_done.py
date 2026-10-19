@@ -52,6 +52,12 @@ STT_TIMEOUT_S = 12.0
 # result(timeout=what is left), so eight slow posts cost 14 s, not 8 x 12.
 STT_PHASE_S = 14.0
 LLM_DEADLINE_S = 12
+# The whole ask, from invoke: under the function's 35 s Timeout with room to
+# return the shaped answer, so the runtime kill is never what the worker sees.
+RUN_BUDGET_S = 30
+# Below this a model call cannot usefully start (llm_utils.MIN_USEFUL_SECONDS's
+# reasoning); the answer is `error` instead of a guaranteed timeout.
+MIN_LLM_S = 3
 LLM_MAX_TOKENS = 4000
 # With no live window to start from, the model looks for the start of the
 # check in this much transcript before the newest evidence.
@@ -399,17 +405,22 @@ def _prompt(template, items, transcript_text, from_window):
                checklist.items_block(items), transcript_text))
 
 
-def run(event, *, db_hop, s3, bucket, gather, assemble, stt, call_llm, now=time.time):
+def run(event, *, db_hop, s3, bucket, gather, assemble, stt, call_llm, now=time.time,
+        budget_s=None):
     """One "check done" ask -> the response dict (spec "Response"). Never raises.
 
     db_hop(payload) -> the CheckGapsDb facts; gather(bucket, folder, date,
     session_base) / assemble(bucket, keys) -> lambda_extract_session's stored
     transcript; stt(bytes, filename) -> text, or None when there is no Ask key;
-    call_llm(prompt, **kw) -> (text, error)."""
+    call_llm(prompt, **kw) -> (text, error). `budget_s` (the handler's remaining
+    Lambda time) can only shrink RUN_BUDGET_S, never extend it."""
     started = now()
     timings = {}
+    budget = RUN_BUDGET_S if budget_s is None else min(RUN_BUDGET_S, budget_s)
+    deadline = started + budget
     try:
-        out = _answer(event or {}, db_hop, s3, bucket, gather, assemble, stt, call_llm, now, timings)
+        out = _answer(event or {}, db_hop, s3, bucket, gather, assemble, stt, call_llm, now,
+                      timings, deadline)
     except Exception:                                 # noqa: BLE001 -- the device must hear something
         logger.exception("check_gaps: failed")
         out = _result("error", say_error())
@@ -423,7 +434,7 @@ def run(event, *, db_hop, s3, bucket, gather, assemble, stt, call_llm, now=time.
     return out
 
 
-def _answer(event, db_hop, s3, bucket, gather, assemble, stt, call_llm, now, timings):
+def _answer(event, db_hop, s3, bucket, gather, assemble, stt, call_llm, now, timings, deadline):
     caller = event.get("caller_sub")
     if not caller:
         return _result("error", say_error())
@@ -482,10 +493,16 @@ def _answer(event, db_hop, s3, bucket, gather, assemble, stt, call_llm, now, tim
         if chosen and stt is None:
             partial, chosen = True, []    # no Ask key: never borrow the pipeline's
     pool, futures, stt_deadline = None, [], None
+    # Hearing ends in time for the gap pass to have its full LLM_DEADLINE_S; a
+    # chunk not heard by then makes the answer partial, never late.
+    stt_end = min(now() + STT_PHASE_S, deadline - LLM_DEADLINE_S - 1)
+    if chosen and stt_end <= now():
+        logger.warning("check_gaps: no time left to hear %d chunk(s)", len(chosen))
+        partial, chosen = True, []
     if chosen:
         pool = ThreadPoolExecutor(max_workers=len(chosen))
         futures = [(k, pool.submit(_hear, s3, bucket, stt, k)) for k in chosen]
-        stt_deadline = now() + STT_PHASE_S
+        stt_deadline = stt_end
     # The stored transcript is assembled while the chunks are being heard.
     turns = assemble(bucket, to_assemble)[0] if to_assemble else []
     heard = []
@@ -529,10 +546,15 @@ def _answer(event, db_hop, s3, bucket, gather, assemble, stt, call_llm, now, tim
     # 5. Gap pass. Nothing heard -> nothing can be covered, and no model call.
     paragraphs = []
     if transcript_text:
+        left = deadline - now() - 1               # a second to shape and return the answer
+        if left < MIN_LLM_S:
+            logger.warning("check_gaps: %.1fs left, too little for the gap pass", left + 1)
+            return _result("error", say_error(), check=check, items=len(items),
+                           covered_until=covered_until, partial=partial)
         t = now()
         text, err = call_llm(_prompt(tpl, items, transcript_text, start is not None),
                              max_tokens=LLM_MAX_TOKENS, enable_thinking=False,
-                             deadline=LLM_DEADLINE_S, caller="check_gaps")
+                             deadline=min(LLM_DEADLINE_S, left), caller="check_gaps")
         timings["llm"] = int((now() - t) * 1000)
         if err or not (text or "").strip():
             logger.warning("check_gaps: gap pass failed: %s", err or "empty answer")
