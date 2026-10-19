@@ -151,6 +151,12 @@ jobs:
           if [ -n "${{ vars.TEST_VAD_LAYER_ARN }}" ]; then
             VAD_LAYER_PARAM="VadLayerArn=${{ vars.TEST_VAD_LAYER_ARN }}"
           fi
+          # Project documents' pypdf layer (spec 2026-10-16, R13). Same bare-"Key=" guard:
+          # unset TEST_PDF_LAYER_ARN keeps the template Default '' and the layer is skipped.
+          PDF_LAYER_PARAM=""
+          if [ -n "${{ vars.TEST_PDF_LAYER_ARN }}" ]; then
+            PDF_LAYER_PARAM="PdfLayerArn=${{ vars.TEST_PDF_LAYER_ARN }}"
+          fi
           # Non-work (personal) topic retention sweep. Two independent gates, both
           # off by default, because this one DELETES: it tombstones the topic and
           # drops its vectors (the transcript and audio are left alone).
@@ -237,6 +243,9 @@ jobs:
               "SearchIndexWrite=${{ vars.TEST_SEARCH_INDEX_WRITE || 'false' }}" \
               "SearchIndexRead=${{ vars.TEST_SEARCH_INDEX_READ || 'report' }}" \
               "CompanySummaryServe=${{ vars.TEST_COMPANY_SUMMARY_SERVE || 'off' }}" \
+              "TemplateDigitise=${{ vars.TEST_TEMPLATE_DIGITISE || 'false' }}" \
+              "ProjectDocuments=${{ vars.TEST_PROJECT_DOCUMENTS || 'false' }}" \
+              $PDF_LAYER_PARAM \
               "EnableUserDeletion=${{ vars.TEST_ENABLE_USER_DELETION || 'false' }}" \
               "EnableExternalCorroboration=${{ vars.TEST_ENABLE_EXTERNAL_CORROBORATION || 'false' }}" \
               "CorroborationApiKey=${{ secrets.OPENROUTER_API_KEY }}" \

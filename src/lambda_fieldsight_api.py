@@ -378,6 +378,10 @@ def search_topics(body, caller):
         payload['date_to'] = date_to
     if body.get('site'):
         payload['site'] = body['site']  # project-scoped search (Ask omits site)
+    # Project documents (spec 2026-10-16, R7): the palette's own group. Only an explicit
+    # true is forwarded; the answer's `documents` passes through below untouched.
+    if body.get('include_documents') is True:
+        payload['include_documents'] = True
     # The caller's IANA zone, so the ask-agent can resolve "yesterday" / "last
     # week" in the question to a date range. Dropped, never an error, when it is
     # not a plausible zone string: the ask-agent treats an unusable zone as "no

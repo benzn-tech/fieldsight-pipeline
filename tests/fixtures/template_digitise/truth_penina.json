@@ -1,0 +1,214 @@
+{
+ "sections": [
+  {
+   "title": "General",
+   "items": [
+    "Site Hazard Identification Board displayed, with review date?",
+    "Is there a notice board for minutes, policies etc.?",
+    "Is the H&S Policy displayed?",
+    "Has a Job Analysis been completed for all task?"
+   ]
+  },
+  {
+   "title": "Site Amenities",
+   "items": [
+    "Is the toilet facility in a clean and sanitary condition?",
+    "Is the lunchroom clean and tidy?",
+    "Are the shower and washroom clean and tidy?",
+    "Is the locker room clean and tidy?",
+    "Is rubbish cleared?",
+    "Is there an adequate supply of clean, fresh drinking water?",
+    "Are the amenities in good repair?"
+   ]
+  },
+  {
+   "title": "Emergency Response Preparedness",
+   "items": [
+    "Are sufficient fire extinguishers provided?",
+    "Have all extinguishers been tested in the last 12 months?",
+    "Are signs indicating specific use of fire extinguishers in place?",
+    "Have site personnel been trained in the use of extinguishers?",
+    "Are combustible materials properly stored/disposed of?",
+    "Is there easy access to firefighting equipment?",
+    "Do emergency service vehicles have clear access to the site?",
+    "Have evacuation drills been carried out in the last six months?",
+    "Is there a functioning alarm system for emergencies?"
+   ]
+  },
+  {
+   "title": "First Aid",
+   "items": [
+    "Is there an adequate number of first aid kits?",
+    "Are they adequately stocked?",
+    "Is there a list of qualified first aiders attached to each kit?",
+    "Are the kits visible/accessible?",
+    "Are emergency eyewash/shower facilities clean and serviceable?",
+    "Are first aiders identified by safety vests or singage?"
+   ]
+  },
+  {
+   "title": "Housekeeping",
+   "items": [
+    "Is the work area in a clean and tidy state?",
+    "Is there adequate, appropriate and clear signage?",
+    "Are all storage areas tidy?",
+    "Is the work area free from slipping/tripping hazards?"
+   ]
+  },
+  {
+   "title": "Access and Egress",
+   "items": [
+    "Is there safe access around the work area?",
+    "Is lighting adequate for safe access?",
+    "Are access ways in storage areas/containers free of obstructions?"
+   ]
+  },
+  {
+   "title": "Ladders",
+   "items": [
+    "Are all ladders stable and securely fixed at the top and bottom?",
+    "Are all rungs and styles intact and in good condition?",
+    "Is the slope of the ladder at a safe angle 4:1?",
+    "Are the ladders clear of doorways?",
+    "Do the ladders extend at least 1m above landing places?",
+    "Are only fibreglass or timber ladders used near electricity?",
+    "Are ladders protected from moving vehicles?",
+    "Are 3 and 4 step ladders present on site?"
+   ]
+  },
+  {
+   "title": "Electrical",
+   "items": [
+    "Are portable electrical equipment/leads tested & tagged?",
+    "Are they currently in date for test & tag?",
+    "Are RCDs used with all portable electrical equipment?",
+    "Are leads and cables in good condition?",
+    "Is electrical equipment properly stored when not in use?",
+    "Are extension leads supported above work and damp areas?",
+    "Do leads have clear plugs fitted and not hard plastic?"
+   ]
+  },
+  {
+   "title": "Compressed Gasses",
+   "items": [
+    "Are bottles stored upright and secured?",
+    "Are bottles free from grease and oil?",
+    "Are cylinders turned off at the bottle and not the regulator?",
+    "Are storage and transport adequate?",
+    "Are all cylinders fitted with flashback arresters?",
+    "Are gas cutting equipment hoses in good condition?",
+    "Are compressed air hoses secured with pins/chains?"
+   ]
+  },
+  {
+   "title": "Plant, Equipment and Vehicles",
+   "items": [
+    "Are all plant/trucks fitted with functioning reversing alarms?",
+    "Is all plant, equipment & vehicles maintained on a recorded schedule?",
+    "Do only qualified/licensed personnel operate the plant/equipment?",
+    "Are extinguishers installed and operable?",
+    "Is the plant working too close to overhead power lines?",
+    "Does all plant have the Safe Working Load (SWL) displayed?",
+    "Is plant in confined spaces fitted with exhaust emission devices?",
+    "Does each item of the plant have a correctly filled out logbook?",
+    "Are Personal Danger Tags correctly completed and in place?",
+    "Are Out of Service Tags correctly completed and in place?",
+    "Are barricades / barrier tape in use",
+    "Are isolations/lockouts in use?"
+   ]
+  },
+  {
+   "title": "Personal Protective Equipment",
+   "items": [
+    "Is eye protection worn when necessary?",
+    "Are hard hats worn when necessary?",
+    "Is foot protection adequate?",
+    "Is SPF15+ sunscreen provided for personnel exposed to the sun?",
+    "Are appropriate gloves provided to protect hands?",
+    "Is hearing protection worn when necessary?",
+    "Is respiratory protection worn when necessary?",
+    "Are all personal on-site wearing the correct PPE"
+   ]
+  },
+  {
+   "title": "Dangerous Good and Hazardous Substances",
+   "items": [
+    "Is there a register of DGs & Haz. Subs?",
+    "Is there a store for DGs & Haz. Subs?",
+    "Are Material Safety Data Sheets available for all goods in this store?",
+    "Is there adequate signage around this store?",
+    "Are all containers clearly labelled?",
+    "Is ventilation equipment operating effectively?",
+    "Is the amount stored by statutory limits?",
+    "Is waste material stored/disposed of safely?"
+   ]
+  },
+  {
+   "title": "Scaffolding",
+   "items": [
+    "Are there solid foundations under the scaffolding?",
+    "Are there proper sole and base plates for the standards?",
+    "Is there adequate bracing in all directions?",
+    "Are handrails and toe boards in place on all over 2m scaffolds?",
+    "Are all work platforms fully decked out?",
+    "Is there safe access to the work platforms?",
+    "Is scaffolding tied to the structure at least every 3.6m in height?",
+    "Do mobile scaffolds have both hand and mid rails?",
+    "Do mobile scaffolds have lockable castor wheels?",
+    "Are all wheels locked when the scaffold is in use?",
+    "Is there safe ladder access to the mobile scaffold?",
+    "Are scaffolds inspected regularly by a competent/qualified person?"
+   ]
+  },
+  {
+   "title": "Welding and Grinding",
+   "items": [
+    "Are protective screens used during welding operations?",
+    "Are welder/grinder/cutter operators using appropriate PPE?",
+    "Are surrounding personnel protected against welding/grinding operations?"
+   ]
+  },
+  {
+   "title": "Manual Handling",
+   "items": [
+    "Have all personnel been trained in manual handling techniques?",
+    "Are correct manual handling techniques being followed?",
+    "Is mechanical equipment available for lifting heavy loads?"
+   ]
+  },
+  {
+   "title": "Environmental Work Practices",
+   "items": [
+    "Are there any leaks or spills causing land or water pollution?",
+    "Is waste being stored and disposed of appropriately?",
+    "Is plant, equipment or vehicles emitting noise or air pollution?",
+    "Is there sufficient containment for drums, tanks and other containers?",
+    "Are there spill kits available for use?",
+    "Is there soil erosion, vegetation damage or other environmental harm?"
+   ]
+  },
+  {
+   "title": "Quality Assurance",
+   "items": [
+    "Have ITPs been captured?",
+    "Have ITPs been closed?"
+   ]
+  },
+  {
+   "title": "Defects",
+   "items": [
+    "BLACK defects captured?",
+    "Client defects received?",
+    "All defects closed out?"
+   ]
+  },
+  {
+   "title": "Contractors Management",
+   "items": [
+    "Are Sub-contractors pre-qualified? (completed sub-contractor H&S questionnaire)",
+    "Has pre-start sub-contractor audit been completed?",
+    "Has a senior BLACK representative conducted a sub-contractor audit?"
+   ]
+  }
+ ]
+}

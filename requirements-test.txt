@@ -30,6 +30,10 @@ numpy
 # python-docx -- the Word-export tests open with importorskip("docx"); without it they
 #   SKIP and the suite is green over a path nothing checked.
 python-docx>=1.1
+# pypdf -- project documents read PDFs with it (its own Lambda layer, fieldsight-pypdf,
+#   built by scripts/build-pypdf-layer.sh at THIS version); the extraction tests
+#   importorskip("pypdf") and would SKIP without it.
+pypdf==6.20.1
 # Pillow -- report photographs are shrunk to page size (python-docx-layer:3
 #   carries it in Lambda); the shrink tests importorskip("PIL") and would SKIP.
 Pillow>=10

@@ -193,6 +193,12 @@ jobs:
           if [ -n "${{ vars.PROD_KEYFRAME_FFMPEG_LAYER_ARN }}" ]; then
             KF_LAYER_PARAM="KeyframeFfmpegLayerArn=${{ vars.PROD_KEYFRAME_FFMPEG_LAYER_ARN }}"
           fi
+          # Project documents' pypdf layer (spec 2026-10-16, R13). Same bare-"Key=" guard:
+          # unset PROD_PDF_LAYER_ARN keeps the template Default '' and the layer is skipped.
+          PDF_LAYER_PARAM=""
+          if [ -n "${{ vars.PROD_PDF_LAYER_ARN }}" ]; then
+            PDF_LAYER_PARAM="PdfLayerArn=${{ vars.PROD_PDF_LAYER_ARN }}"
+          fi
           # Non-work (personal) topic retention sweep. Two independent gates, both
           # off by default, because this one DELETES: it tombstones the topic and
           # drops its vectors (the transcript and audio are left alone).
@@ -286,6 +292,9 @@ jobs:
               "SearchIndexWrite=${{ vars.PROD_SEARCH_INDEX_WRITE || 'false' }}" \
               "SearchIndexRead=${{ vars.PROD_SEARCH_INDEX_READ || 'report' }}" \
               "CompanySummaryServe=${{ vars.PROD_COMPANY_SUMMARY_SERVE || 'off' }}" \
+              "TemplateDigitise=${{ vars.PROD_TEMPLATE_DIGITISE || 'false' }}" \
+              "ProjectDocuments=${{ vars.PROD_PROJECT_DOCUMENTS || 'false' }}" \
+              $PDF_LAYER_PARAM \
               "EnableUserDeletion=${{ vars.PROD_ENABLE_USER_DELETION || 'false' }}" \
               "EnableExternalCorroboration=${{ vars.PROD_ENABLE_EXTERNAL_CORROBORATION || 'false' }}" \
               "CorroborationApiKey=${{ secrets.OPENROUTER_API_KEY }}" \

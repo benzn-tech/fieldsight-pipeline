@@ -170,6 +170,7 @@ from repositories import (action_items, aliases, chunks, classification_feedback
                           sites, threads, topics, users, voice_messages,
                           voiceprints)
 from repositories import lake_objects
+from repositories import project_docs
 import lake_keys
 import lake_owner
 import company_export
@@ -187,6 +188,9 @@ import speaker_match_request
 from repositories import speaker_name_proposals
 from repositories import speaker_intro_suggestions
 import turn_name_overlay
+import template_types
+import project_doc_flag
+import project_doc_types
 from transcript_utils import extract_base_time_from_filename, speaker_turns_from_items
 
 logger = logging.getLogger()
@@ -634,6 +638,10 @@ def dispatch(conn, event, method, route):
     m_sc = re.match(r"^/sites/([^/]+)/contributors$", route)
     if m_sc and method == "GET":
         return list_site_contributors(conn, caller, m_sc.group(1), event)
+    # Project documents (spec 2026-10-16-project-documents-design): one line, one handler.
+    m_pd = re.match(r"^/sites/([^/]+)/documents(?:/(.*))?$", route)
+    if m_pd:
+        return project_documents_route(conn, caller, m_pd.group(1), m_pd.group(2), method, event)
     m_ma = re.match(r"^/members/([^/]+)/(archive|unarchive)$", route)
     if m_ma and method == "POST":
         return _directory_after(conn, archive_member_endpoint(conn, caller, m_ma.group(1), m_ma.group(2)))
@@ -756,6 +764,15 @@ def dispatch(conn, event, method, route):
     m_tb = re.match(r"^/templates/bindings/([^/]+)$", route)
     if m_tb and method == "PUT":
         return set_report_template_binding(conn, caller, m_tb.group(1), event)
+    # Template digitise (spec 2026-10-16). Before every "/templates/{id}..." pattern
+    # below, or "digitise" is read as a template id.
+    if route == "/templates/digitise/upload-url" and method == "POST":
+        return digitise_upload_url(conn, caller, event)
+    if route == "/templates/digitise" and method == "POST":
+        return digitise_request(conn, caller, event)
+    m_td = re.match(r"^/templates/digitise/([^/]+)$", route)
+    if m_td and method == "GET":
+        return digitise_status(conn, caller, m_td.group(1), event)
     m_tvr = re.match(r"^/templates/([^/]+)/versions/([^/]+)/restore$", route)
     if m_tvr and method == "POST":
         return restore_report_template_version(conn, caller, m_tvr.group(1), m_tvr.group(2))
@@ -3993,28 +4010,58 @@ def _hms_len(clock):
     return parts[0] * 3600 + parts[1] * 60 + (parts[2] if len(parts) > 2 else 0)
 
 
+def _checklist_gaps(result):
+    """What the inspector did not do, summed over the report's checklists
+    (owner, 2026-10-16), or None when the result says nothing about it.
+
+    None, never two empty lists, unless at least one checklist carries `gaps`:
+    a result from before gaps were recorded, or `checklists: {}`, must not read
+    as "all items covered". Never raises -- a malformed result only loses its
+    gaps, never its status."""
+    try:
+        checklists = result.get("checklists")
+        if not isinstance(checklists, dict):
+            return None
+        out, known = {"notCovered": [], "failed": []}, False
+        for title, rep in checklists.items():
+            gaps = rep.get("gaps") if isinstance(rep, dict) else None
+            if not isinstance(gaps, dict):
+                continue
+            nc, failed = gaps.get("not_covered"), gaps.get("failed")
+            if not isinstance(nc, list) or not isinstance(failed, list):
+                continue
+            known = True
+            out["notCovered"] += [dict(g, checklist=title) for g in nc if isinstance(g, dict)]
+            out["failed"] += [dict(g, checklist=title) for g in failed if isinstance(g, dict)]
+        return out if known else None
+    except Exception:
+        logger.exception("checklist gaps unreadable")
+        return None
+
+
 def _checklist_report_status(result_key):
-    """pending | done | error | removed-free status of one auto report, read off
-    the worker's result (no presign here -- the download goes through
+    """(status, error, gaps) of one auto report -- status pending | done | error,
+    read off the worker's result (no presign here -- the download goes through
     /days/{date}/report/status, which re-checks deletions first)."""
     try:
         obj = s3().get_object(Bucket=LAKE_BUCKET, Key=result_key)
     except ClientError as e:
         if e.response.get("Error", {}).get("Code") in _LAKE_NOT_FOUND_CODES:
-            return "pending", None
+            return "pending", None, None
         raise
     result = json.loads(obj["Body"].read().decode("utf-8"))
-    return result.get("status") or "pending", result.get("error")
+    status = result.get("status") or "pending"
+    return status, result.get("error"), (_checklist_gaps(result) if status == "done" else None)
 
 
 def _checklist_report_payload(r):
-    status, err = _checklist_report_status(r["result_key"])
+    status, err, gaps = _checklist_report_status(r["result_key"])
     return {"id": str(r["id"]), "date": str(r.get("report_date") or ""),
             "checkName": r["check_name"], "templateName": r["template_name"],
             "templateId": str(r["template_id"]) if r.get("template_id") else None,
             "startAt": r["start_at"], "endAt": r.get("end_at"),
             "segments": r.get("segments"), "requestId": r["request_id"],
-            "status": status, "error": err}
+            "status": status, "error": err, "gaps": gaps}
 
 
 def _unmatched_checks(rows):
@@ -12723,6 +12770,171 @@ def create_report_template(conn, caller, event):
     return ok(_template_payload(fresh, versions=[_version_payload(version)]), 201)
 
 
+# ---- Template digitise (spec 2026-10-16) ----------------------------------------------
+#
+# A person uploads a checklist form; a non-VPC worker reads it into a DRAFT; the person
+# checks it and saves it through POST /templates. Nothing here writes a template. org-api
+# is in-VPC with no outbound (BUG-36), so the read is handed off through the lake like
+# session reports: template_digitise_requests/ -> TemplateDigitiseFunction ->
+# template_digitise_results/. Off (the default), every route answers 404: the UI's only
+# gate is the route itself, because /me carries no feature list.
+
+_DIGITISE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_DIGITISE_SOURCE_RE = re.compile(
+    r"^template_sources/(?P<company>[^/]+)/[0-9a-f]{32}\.(?P<ext>pdf|docx|jpg|jpeg|png)$")
+DIGITISE_MAX_AGE = timedelta(days=7)
+DIGITISE_PREVIEW_EXPIRY = 3600
+_DIGITISE_PUBLIC = ("id", "status", "name", "sections", "counts", "flags", "route", "model",
+                    "pages", "error", "reason")
+
+
+def _template_digitise_on():
+    """Read per call so a test, or an emergency env edit, takes effect without a reload."""
+    return os.environ.get("TEMPLATE_DIGITISE", "false").lower() == "true"
+
+
+def _s3_missing(e):
+    return e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404", "NotFound")
+
+
+def digitise_upload_url(conn, caller, event):
+    """POST /api/org/templates/digitise/upload-url {filename, contentType, size}"""
+    if not _template_digitise_on():
+        return error("not found", 404)
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    ext = template_types.ext_of(body.get("filename"))
+    allowed = template_types.accepted_exts()
+    if ext not in allowed:
+        return error("file type must be one of: %s" % ", ".join("." + e for e in allowed), 400)
+    content_type = template_types.EXT_TYPES[ext]
+    if body.get("contentType") != content_type:
+        return error("contentType does not match the file extension (.%s is %s)"
+                     % (ext, content_type), 400)
+    size = body.get("size")
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        return error("size (bytes) is required", 400)
+    if size > template_types.MAX_BYTES:
+        return error("the file is larger than 20 MB", 400)
+    key = f"template_sources/{company_id}/{uuid.uuid4().hex}.{ext}"
+    url = s3().generate_presigned_url(
+        "put_object",
+        Params={"Bucket": LAKE_BUCKET, "Key": key, "ContentType": content_type},
+        ExpiresIn=PRESIGNED_URL_EXPIRY)
+    return ok({"uploadUrl": url, "sourceKey": key, "expiresIn": PRESIGNED_URL_EXPIRY})
+
+
+def digitise_request(conn, caller, event):
+    """POST /api/org/templates/digitise {sourceKeys, name} -> 202 {id, status: pending}"""
+    if not _template_digitise_on():
+        return error("not found", 404)
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    keys = body.get("sourceKeys")
+    if not isinstance(keys, list) or not keys or len(keys) > template_types.MAX_IMAGES \
+            or len(set(map(str, keys))) != len(keys):
+        return error(template_types.SHAPE_ERROR, 400)
+    exts = []
+    for k in keys:
+        m = _DIGITISE_SOURCE_RE.match(k) if isinstance(k, str) else None
+        if m is None or m.group("company") != company_id:
+            # Never another company's object, whatever the caller sends.
+            return error("sourceKeys must be files uploaded for this company", 400)
+        exts.append(m.group("ext"))
+    why = template_types.source_shape_error(exts)
+    if why:
+        return error(why, 400)
+    name, err = _template_name(body)
+    if err is not None:
+        return err
+    sizes = {}
+    for k in keys:
+        try:
+            head = s3().head_object(Bucket=LAKE_BUCKET, Key=k)
+        except ClientError as e:
+            if _s3_missing(e):
+                return error("an uploaded file was not found — upload it again", 404)
+            raise
+        sizes[k] = head.get("ContentLength") or 0
+        # A presigned PUT cannot enforce a size; this is where it is enforced.
+        if sizes[k] > template_types.MAX_BYTES:
+            return error("the file is larger than 20 MB", 400)
+    request_id = uuid.uuid4().hex
+    request_key = f"template_digitise_requests/{company_id}/{request_id}.json"
+    result_key = f"template_digitise_results/{company_id}/{request_id}.json"
+    artifact = {"id": request_id, "companyId": company_id, "userId": str(caller["id"]),
+                "sourceKeys": keys, "name": name,
+                "requestedAt": datetime.now(timezone.utc).isoformat()}
+    s3().put_object(Bucket=LAKE_BUCKET, Key=request_key, Body=json.dumps(artifact),
+                    ContentType="application/json")
+    # lake_keys does not know these families, so the kind is stated (spec section 2).
+    for k in keys:
+        lake_objects.record_best_effort(conn, k, company_id=company_id, user_id=caller["id"],
+                                        source="upload", kind="template_source",
+                                        size_bytes=sizes[k])
+    for k in (request_key, result_key):
+        lake_objects.record_best_effort(conn, k, company_id=company_id, user_id=caller["id"],
+                                        source="upload", kind="template_digitise")
+    return ok({"id": request_id, "status": "pending"}, 202)
+
+
+def _digitise_owner_ok(caller, owner_id):
+    """A draft is its requester's until Save (ruling R5); platform_admin may act for them."""
+    return str(owner_id) == str(caller["id"]) or is_cross_company(caller["global_role"])
+
+
+def digitise_status(conn, caller, request_id, event):
+    """GET /api/org/templates/digitise/{id} -- the poll."""
+    if not _template_digitise_on():
+        return error("not found", 404)
+    company_id, err = _template_company(conn, caller, event)
+    if err is not None:
+        return err
+    if not _DIGITISE_ID_RE.match(request_id or ""):
+        return error("not found", 404)
+    result_key = f"template_digitise_results/{company_id}/{request_id}.json"
+    request_key = f"template_digitise_requests/{company_id}/{request_id}.json"
+    try:
+        obj = s3().get_object(Bucket=LAKE_BUCKET, Key=result_key)
+    except ClientError as e:
+        if not _s3_missing(e):
+            raise
+        try:
+            req = json.loads(s3().get_object(Bucket=LAKE_BUCKET, Key=request_key)["Body"]
+                             .read().decode("utf-8"))
+        except ClientError as e2:
+            if _s3_missing(e2):
+                return error("not found", 404)
+            raise
+        if not _digitise_owner_ok(caller, req.get("userId")):
+            return error("not found", 404)
+        return ok({"id": request_id, "status": "pending"})
+    result = json.loads(obj["Body"].read().decode("utf-8"))
+    # Ownership before age: "expired" to a non-requester would confirm the draft exists.
+    if not _digitise_owner_ok(caller, result.get("userId")):
+        return error("not found", 404)
+    modified = obj.get("LastModified")
+    if modified is not None and datetime.now(timezone.utc) - modified > DIGITISE_MAX_AGE:
+        return error("this draft has expired — upload the form again", 404)
+    out = {k: result[k] for k in _DIGITISE_PUBLIC if k in result}
+    prefix = f"template_sources/{company_id}/"
+    out["sources"] = [
+        {"key": k, "contentType": template_types.EXT_TYPES.get(template_types.ext_of(k), ""),
+         "url": s3().generate_presigned_url("get_object",
+                                            Params={"Bucket": LAKE_BUCKET, "Key": k},
+                                            ExpiresIn=DIGITISE_PREVIEW_EXPIRY)}
+        for k in (result.get("sourceKeys") or []) if isinstance(k, str) and k.startswith(prefix)]
+    return ok(out)
+
+
 def update_report_template(conn, caller, template_id, event):
     """PATCH /api/org/templates/{id} -- name and description only.
 
@@ -12971,3 +13183,322 @@ def set_report_template_binding(conn, caller, report_type, event):
         "set_by": str(row["set_by"]),
         "set_at": row["set_at"],
     })
+
+
+# ---- Project documents (spec 2026-10-16-project-documents-design) ---------------------
+#
+# A project's specs and documents. org-api is in-VPC with no outbound (BUG-36): it stores
+# the upload, inserts the row (status pending) and writes project_doc_requests/{co}/{id}.json;
+# the non-VPC ProjectDocIndexFunction reads, chunks and embeds it; IngestFunction applies the
+# result. Off (the default), every route answers 404 "not found" -- the UI's only gate.
+#
+# Reads: anyone who reaches the project (_allowed_site_ids). Writes (R5): home-company site
+# -> global_role in _MANAGER_ROLES; external site -> the external membership's role in
+# _MANAGER_ROLES; platform_admin. Keys and company_id follow the SITE's company (R6).
+# An archived project is read-only, not hidden (spec R8): writes 409 for its writers; reads
+# (list, history, /file) with canWrite false for exactly whom list_org_sites(include_archived)
+# shows the archived project to -- GRADED_ROLES off and a same-company admin/gm -- and 404
+# for everyone else (platform_admin included; with GRADED_ROLES on, nobody).
+#
+# Every repository write runs inside `conn.transaction()` on the request's non-autocommit
+# connection: insert_document / soft_delete take an advisory lock and FOR UPDATE that hold
+# only for the transaction (project_docs module docstring).
+
+_PD_UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_PD_ID_RE = re.compile(rf"^{_PD_UUID}$")
+_PD_SOURCE_RE = re.compile(
+    rf"^project_doc_sources/(?P<company>{_PD_UUID})/(?P<id>{_PD_UUID})\.(?P<ext>docx|pdf|txt|md)$")
+_PD_SUB_RE = re.compile(rf"^(?P<id>{_PD_UUID})(?:/(?P<sub>file|retry))?$")
+PROJECT_DOC_UPLOAD_EXPIRY = 900
+PROJECT_DOC_FILE_EXPIRY = 3600
+PROJECT_DOC_STUCK = timedelta(minutes=20)
+_PD_ARCHIVED = "This project is archived"
+_PD_NOT_WRITER = "Only the project's managers can change its documents."
+_PD_INDEXED = "This document is already indexed."
+_PD_UNREADABLE = "This document can't be read as is — upload a new revision."
+
+
+def _doc_writer(conn, caller, site):
+    role = caller.get("global_role")
+    if is_cross_company(role):
+        return True
+    if str(site["company_id"]) == str(caller["company_id"]):
+        return role in _MANAGER_ROLES
+    return memberships.external_site_roles(conn, caller["id"]).get(str(site["id"])) in _MANAGER_ROLES
+
+
+def _sees_archived(caller, site):
+    """Exactly whom list_org_sites(include_archived=1) shows an archived project to, never
+    more. list_org_sites has no shared helper for this, so its conditions are mirrored
+    here -- keep the two in step: under GRADED_ROLES it lists visible_scope, which drops
+    archived sites for every role (platform_admin included) -> nobody; otherwise only the
+    resolve_scope "ALL" branch (admin/gm) honours include_archived, and only over the
+    caller's own company (list_company_sites(caller["company_id"]))."""
+    if GRADED_ROLES:
+        return False
+    return (resolve_scope(caller.get("global_role")) == "ALL"
+            and str(site["company_id"]) == str(caller["company_id"]))
+
+
+def _doc_site(conn, caller, site_id, write):
+    """(site, None) or (None, error). R8: an archived project is read-only, not hidden. A
+    write answers 409 to the people who could otherwise write to it, before the reach check
+    (visible_scope drops archived sites, so the reach check alone would make the 409
+    unreachable); a read is allowed, for the same reason before the reach check, to whoever
+    can see archived projects (_sees_archived), and is 404 for everyone else."""
+    if not _PD_ID_RE.match(str(site_id or "").lower()):
+        return None, error("project not found", 404)
+    site = sites.get_site(conn, site_id)
+    if site is None:
+        return None, error("project not found", 404)
+    if site.get("archived_at") is not None:
+        if write and _doc_writer(conn, caller, site):
+            return None, error(_PD_ARCHIVED, 409)
+        if not write:
+            if _sees_archived(caller, site):
+                return site, None
+            return None, error("project not found", 404)
+    if str(site["id"]) not in {str(s) for s in _allowed_site_ids(conn, caller)}:
+        return None, error("project not found", 404)
+    if write and not _doc_writer(conn, caller, site):
+        return None, error(_PD_NOT_WRITER, 403)
+    return site, None
+
+
+def _doc_public(r):
+    return {"id": str(r["id"]), "seriesId": str(r["series_id"]), "revision": r["revision"],
+            "title": r["title"], "filename": r["filename"], "contentType": r["content_type"],
+            "status": r["status"], "reason": r["reason"], "pages": r["pages"],
+            "chars": r["chars"], "chunks": r["chunks"], "uploadedBy": str(r["uploaded_by"]),
+            "uploadedByName": r.get("uploaded_by_name"), "createdAt": _iso(r["created_at"]),
+            "requestedAt": _iso(r["requested_at"]), "indexedAt": _iso(r["indexed_at"]),
+            "supersededAt": _iso(r["superseded_at"])}
+
+
+def _iso(v):
+    """ISO 8601 with a 'T'. ok() would str() a datetime ("2026-10-16 10:00:00+00:00"), which
+    Safari's Date.parse rejects -- and the UI's 20-minute "Retry" depends on parsing it."""
+    return v.isoformat() if v is not None else None
+
+
+def _site_doc(conn, site, doc_id):
+    row = project_docs.get_document(conn, doc_id)
+    if row is None or str(row["site_id"]) != str(site["id"]) or row["deleted_at"] is not None:
+        return None
+    return row
+
+
+def _write_doc_request(caller, row):
+    key = f"project_doc_requests/{row['company_id']}/{row['id']}.json"
+    artifact = {"id": str(row["id"]), "companyId": str(row["company_id"]),
+                "siteId": str(row["site_id"]), "seriesId": str(row["series_id"]),
+                "revision": row["revision"], "sourceKey": row["source_key"],
+                "contentType": row["content_type"], "filename": row["filename"],
+                "userId": str(caller["id"]),
+                "requestedAt": datetime.now(timezone.utc).isoformat()}
+    s3().put_object(Bucket=LAKE_BUCKET, Key=key, Body=json.dumps(artifact),
+                    ContentType="application/json")
+    return key
+
+
+def project_documents_route(conn, caller, site_id, rest, method, event):
+    if not project_doc_flag.on():
+        return error("not found", 404)
+    rest = rest or ""
+    site, err = _doc_site(conn, caller, site_id, write=method != "GET")
+    if err is not None:
+        return err
+    if rest == "" and method == "GET":
+        return list_project_documents(conn, caller, site, event)
+    if rest == "upload-url" and method == "POST":
+        return project_document_upload_url(site, event)
+    if rest == "" and method == "POST":
+        return create_project_document(conn, caller, site, event)
+    m = _PD_SUB_RE.match(rest.lower())
+    if m:
+        doc_id, sub = m.group("id"), m.group("sub")
+        if sub is None and method == "PATCH":
+            return rename_project_document(conn, site, doc_id, event)
+        if sub is None and method == "DELETE":
+            return delete_project_document(conn, site, doc_id)
+        if sub == "file" and method == "GET":
+            return project_document_file(conn, site, doc_id)
+        if sub == "retry" and method == "POST":
+            return retry_project_document(conn, caller, site, doc_id)
+        return error("method not allowed", 405)
+    if rest in ("", "upload-url"):
+        return error("method not allowed", 405)
+    # Never the bare "not found" here: with the flag on, the UI reads that body as
+    # "feature off" and would hide the whole section over one bad path or id.
+    return error("document not found", 404)
+
+
+def list_project_documents(conn, caller, site, event):
+    """GET /sites/{site}/documents[?series={id}]"""
+    series = (event.get("queryStringParameters") or {}).get("series")
+    if series:
+        if not _PD_ID_RE.match(series.lower()):
+            return error("document not found", 404)
+        rows = project_docs.list_series(conn, site["id"], series.lower())
+        if not rows:
+            return error("document not found", 404)
+    else:
+        rows = project_docs.list_current(conn, site["id"])
+    can_write = site.get("archived_at") is None and _doc_writer(conn, caller, site)
+    return ok({"documents": [_doc_public(r) for r in rows], "canWrite": can_write})
+
+
+def project_document_upload_url(site, event):
+    """POST /sites/{site}/documents/upload-url {filename, contentType, size}. The id is
+    minted here and travels in the key (spec ruling 2)."""
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    ext = project_doc_types.ext_of(body.get("filename"))
+    if ext not in project_doc_types.EXT_TYPES:
+        return error(project_doc_types.TYPE_ERROR, 400)
+    content_type = project_doc_types.EXT_TYPES[ext]
+    if body.get("contentType") != content_type:
+        return error("contentType does not match the file extension (.%s is %s)"
+                     % (ext, content_type), 400)
+    size = body.get("size")
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        return error("size (bytes) is required", 400)
+    if size > project_doc_types.MAX_BYTES:
+        return error("the file is larger than 50 MB", 400)
+    doc_id = str(uuid.uuid4())
+    key = f"project_doc_sources/{site['company_id']}/{doc_id}.{ext}"
+    url = s3().generate_presigned_url(
+        "put_object", Params={"Bucket": LAKE_BUCKET, "Key": key, "ContentType": content_type},
+        ExpiresIn=PROJECT_DOC_UPLOAD_EXPIRY)
+    return ok({"uploadUrl": url, "sourceKey": key, "documentId": doc_id,
+               "expiresIn": PROJECT_DOC_UPLOAD_EXPIRY})
+
+
+def create_project_document(conn, caller, site, event):
+    """POST /sites/{site}/documents {sourceKey, filename, title?, seriesId?} -> 202."""
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    key = body.get("sourceKey")
+    m = _PD_SOURCE_RE.match(key) if isinstance(key, str) else None
+    if m is None or m.group("company") != str(site["company_id"]):
+        # Never another company's object, whatever the caller sends (R6).
+        return error("sourceKey must be a file uploaded for this project", 400)
+    ext, doc_id = m.group("ext"), m.group("id")
+    filename = (body.get("filename") or "").strip() if isinstance(body.get("filename"), str) else ""
+    if not filename or len(filename) > 255:
+        return error("filename is required", 400)
+    if project_doc_types.ext_of(filename) != ext:
+        return error("filename does not match the uploaded file type", 400)
+    title = body.get("title") if isinstance(body.get("title"), str) else ""
+    title = (title.strip() or filename)[:200]
+    series_id = body.get("seriesId")
+    if series_id is not None and (not isinstance(series_id, str)
+                                  or not _PD_ID_RE.match(series_id.lower())):
+        return error("document not found", 404)
+    try:
+        head = s3().head_object(Bucket=LAKE_BUCKET, Key=key)
+    except ClientError as e:
+        if _s3_missing(e):
+            return error("the uploaded file was not found — upload it again", 404)
+        raise
+    size = head.get("ContentLength") or 0
+    if size > project_doc_types.MAX_BYTES:        # a presigned PUT cannot enforce a size
+        return error("the file is larger than 50 MB", 400)
+    if project_docs.get_document(conn, doc_id) is not None:
+        return error("This file was already added.", 409)
+    try:
+        with conn.transaction():
+            row = project_docs.insert_document(
+                conn, doc_id=doc_id, site_id=str(site["id"]),
+                company_id=str(site["company_id"]), title=title, filename=filename,
+                source_key=key, content_type=project_doc_types.EXT_TYPES[ext],
+                uploaded_by=str(caller["id"]),
+                series_id=series_id.lower() if series_id else None)
+    except UniqueViolation:                       # a second create raced past the check
+        return error("This file was already added.", 409)
+    if row is None:                               # nothing was written: no live series here
+        return error("document not found", 404)
+    # The request is written before dispatch's connection commits: if the PUT raises, the
+    # whole request rolls back and no pending row is left without a request.
+    request_key = _write_doc_request(caller, row)
+    owner = {"company_id": str(site["company_id"]), "site_id": str(site["id"]),
+             "user_id": caller["id"], "source": "upload"}
+    lake_objects.record_best_effort(conn, key, kind="project_doc_source", size_bytes=size, **owner)
+    for k in (request_key, f"project_doc_vectors/{site['company_id']}/{doc_id}.json"):
+        lake_objects.record_best_effort(conn, k, kind="project_doc", **owner)
+    return ok({"id": doc_id, "status": "pending", "seriesId": str(row["series_id"]),
+               "revision": row["revision"]}, 202)
+
+
+def rename_project_document(conn, site, doc_id, event):
+    body = parse_body(event)
+    if body is None:
+        return error("malformed JSON body", 400)
+    title = body.get("title").strip() if isinstance(body.get("title"), str) else ""
+    if not title or len(title) > 200:
+        return error("title must be 1 to 200 characters", 400)
+    if _site_doc(conn, site, doc_id) is None:
+        return error("document not found", 404)
+    with conn.transaction():
+        renamed = project_docs.rename(conn, doc_id, title)
+    if not renamed:
+        return error("document not found", 404)
+    return ok({"id": doc_id, "title": title})
+
+
+def delete_project_document(conn, site, doc_id):
+    if _site_doc(conn, site, doc_id) is None:
+        return error("document not found", 404)
+    with conn.transaction():
+        deleted = project_docs.soft_delete(conn, doc_id)
+    if not deleted:
+        return error("document not found", 404)
+    return ok({"id": doc_id, "deleted": True})
+
+
+def _content_disposition(filename):
+    ascii_name = re.sub(r'[^A-Za-z0-9._ -]', "_", filename) or "document"
+    from urllib.parse import quote
+    return f"inline; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"
+
+
+def project_document_file(conn, site, doc_id):
+    """GET /sites/{site}/documents/{id}/file -- a 1-hour presigned GET of the original,
+    named as uploaded (Review Focus 2)."""
+    row = _site_doc(conn, site, doc_id)
+    if row is None:
+        return error("document not found", 404)
+    url = s3().generate_presigned_url(
+        "get_object", Params={"Bucket": LAKE_BUCKET, "Key": row["source_key"],
+                              "ResponseContentType": row["content_type"],
+                              "ResponseContentDisposition": _content_disposition(row["filename"])},
+        ExpiresIn=PROJECT_DOC_FILE_EXPIRY)
+    return ok({"url": url, "contentType": row["content_type"], "filename": row["filename"],
+               "expiresIn": PROJECT_DOC_FILE_EXPIRY})
+
+
+def retry_project_document(conn, caller, site, doc_id):
+    """POST /sites/{site}/documents/{id}/retry -- for `error`, or `pending` for longer than
+    20 minutes since the last request (R9). Not for `unreadable`: the same bytes would fail
+    the same way, so the answer is a new revision. Re-writes the request for the
+    same id. Never for an indexed document: a Retry must not take it out of search, and
+    mark_pending's guarded UPDATE refuses one that was indexed after the read above."""
+    row = _site_doc(conn, site, doc_id)
+    if row is None:
+        return error("document not found", 404)
+    if row["status"] == "indexed":
+        return error(_PD_INDEXED, 409)
+    if row["status"] == "unreadable":
+        return error(_PD_UNREADABLE, 409)
+    stuck = (row["status"] == "pending" and row["requested_at"] is not None
+             and datetime.now(timezone.utc) - row["requested_at"] > PROJECT_DOC_STUCK)
+    if row["status"] != "error" and not stuck:
+        return error("This document is not waiting on a retry.", 409)
+    with conn.transaction():
+        marked = project_docs.mark_pending(conn, doc_id)
+    if not marked:
+        return error(_PD_INDEXED, 409)
+    _write_doc_request(caller, row)
+    return ok({"id": doc_id, "status": "pending"}, 202)
