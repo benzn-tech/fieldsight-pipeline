@@ -78,7 +78,8 @@ def test_no_company_reads_no_windows():
     assert conn.calls == []
 
 
-def _wire(monkeypatch, user, session, site=None, templates=None, windows=None):
+def _wire(monkeypatch, user, session, site=None, templates=None, windows=None,
+          media_site=None, day_site=None):
     seen = {}
     monkeypatch.setattr(hop, "get_cached_connection", lambda: "conn")
     monkeypatch.setattr(hop, "close_cached_connection", lambda: seen.setdefault("closed", True))
@@ -86,6 +87,12 @@ def _wire(monkeypatch, user, session, site=None, templates=None, windows=None):
     monkeypatch.setattr(hop.meeting_session, "latest_for_user_near",
                         lambda conn, uid, at, window_s=300: seen.setdefault("near", (uid, at)) and session)
     monkeypatch.setattr(hop.sites, "get_site", lambda conn, sid: site)
+    monkeypatch.setattr(hop.recordings, "site_for_media",
+                        lambda conn, uid, folder, date, base: seen.setdefault(
+                            "media", (uid, folder, date, base)) and media_site)
+    monkeypatch.setattr(hop.recordings, "site_for_day",
+                        lambda conn, uid, folder, date: seen.setdefault(
+                            "day", (uid, folder, date)) and day_site)
 
     def tpls(conn, company_id, user_id):
         seen["templates_for"] = (company_id, user_id)
@@ -124,7 +131,29 @@ def test_the_hop_answers_json_safe_facts_with_the_sites_company(monkeypatch):
     assert seen["closed"] is True
 
 
-def test_no_site_falls_back_to_the_sessions_then_the_users_company(monkeypatch):
+def test_no_session_site_climbs_item_writers_rungs(monkeypatch):
+    """meeting_session.site_id is NULL whenever the device's /open never reached the
+    server; item-writer then finds the site from the recordings rows, and so must
+    this, or the windows it wrote under the site's company are never found."""
+    day = {"id": uuid.uuid4(), "company_id": SITE_CO}
+    seen = _wire(monkeypatch, USER, dict(SESSION, site_id=None), day_site=day)
+    out = hop.lambda_handler({"caller_sub": "sub-1", "pressed_at": 1760000000}, None)
+    # opened 2026-10-19 20:50 UTC == 2026-10-20 09:50 NZDT: the device-date folder.
+    assert seen["media"] == (UID, "Ben_Lin", "2026-10-20", "sid" + SID)
+    assert seen["day"] == (UID, "Ben_Lin", "2026-10-20")
+    assert out["owner_company_id"] == str(SITE_CO)
+    assert seen["templates_for"] == (SITE_CO, UID)
+
+
+def test_the_tagged_recording_wins_over_the_days_majority(monkeypatch):
+    media = {"id": uuid.uuid4(), "company_id": SITE_CO}
+    seen = _wire(monkeypatch, USER, dict(SESSION, site_id=None), media_site=media,
+                 day_site={"id": uuid.uuid4(), "company_id": uuid.uuid4()})
+    out = hop.lambda_handler({"caller_sub": "sub-1", "pressed_at": 1760000000}, None)
+    assert out["owner_company_id"] == str(SITE_CO) and "day" not in seen
+
+
+def test_no_site_anywhere_falls_back_to_the_sessions_then_the_users_company(monkeypatch):
     seen = _wire(monkeypatch, USER, dict(SESSION, site_id=None))
     out = hop.lambda_handler({"caller_sub": "sub-1", "pressed_at": 1760000000}, None)
     assert out["owner_company_id"] == str(HOME)

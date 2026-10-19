@@ -24,7 +24,8 @@ import json
 import logging
 
 from db.connection import close_cached_connection, get_cached_connection
-from repositories import inspection_windows, meeting_session, sites, users
+import nz_time
+from repositories import inspection_windows, meeting_session, recordings, sites, users
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -50,6 +51,35 @@ def _jsonable(value):
     return json.loads(json.dumps(value, default=lambda v: v.isoformat() if hasattr(v, "isoformat") else str(v)))
 
 
+def _site(conn, user, session):
+    """The site item-writer files this recording under, by its rungs in the same
+    order (lambda_item_writer, the ladder before `owner_company_id`): the app's
+    tagged recording, the session's own site, then the day's majority site. The
+    windows it wrote are under that site's company (project-owned tenancy), so a
+    different answer here reads nobody's windows.
+
+    The group-lead rung is left out: a merged artifact's base is `grp{gid}`, and
+    this reads one device session's live state, never a merged one. resolve_site
+    (the legacy membership guess) is left out too: it is a company-pinned guess,
+    and the session's or his own company is the same guess without a query."""
+    folder = user.get("folder_name")
+    opened = session.get("opened_at")
+    local = nz_time.to_nz(opened) if opened is not None else None
+    date = local.date().isoformat() if local is not None else None
+    base = "sid%s" % session["session_id"]
+    if folder and date:
+        site = recordings.site_for_media(conn, user["id"], folder, date, base)
+        if site:
+            return site
+    if session.get("site_id"):
+        site = sites.get_site(conn, session["site_id"])
+        if site:
+            return site
+    if folder and date:
+        return recordings.site_for_day(conn, user["id"], folder, date)
+    return None
+
+
 def _facts(event):
     sub = event.get("caller_sub")
     if not sub:
@@ -65,10 +95,7 @@ def _facts(event):
                    "folder_name": user.get("folder_name")}
     session = meeting_session.latest_for_user_near(conn, user["id"], at, SESSION_WINDOW_S)
     if session:
-        # The company item-writer writes this recording's checks under, and matches
-        # its templates against: the SITE's (project-owned tenancy), else the
-        # session's, else his own.
-        site = sites.get_site(conn, session["site_id"]) if session.get("site_id") else None
+        site = _site(conn, user, session)
         owner = (site or {}).get("company_id") or session.get("company_id") or user.get("company_id")
         out["owner_company_id"] = owner
         out["session"] = {k: session.get(k) for k in (
