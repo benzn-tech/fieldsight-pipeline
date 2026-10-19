@@ -126,6 +126,35 @@ def query_terms(question):
     return [t for t in lexical_terms(question) if t not in QUERY_STOPWORDS]
 
 
+# Words that describe the ASKING ("when did we last talk about ..."), not the
+# subject -- Ask-tool policy for latest_activity, not a list pinned by Postgres
+# like QUERY_STOPWORDS (spec 2026-10-20 §3.1). The asymmetry decides what goes
+# here: a missing word makes the AND demand it, so a real subject day is missed
+# (false no_match); a subject word listed here ("lead time") only loosens the AND.
+ASKING_WORDS = frozenset({
+    "last", "latest", "recent", "recently", "lately", "time", "times", "when",
+    "ever", "ago", "earlier", "previous", "previously", "before", "date", "day",
+    "week", "month", "talked", "talk", "talking", "spoke", "spoken", "speak",
+    "discussed", "discuss", "discussion", "mentioned", "mention", "said", "say",
+    "told", "asked", "heard", "raised", "brought", "came", "come", "happened",
+    "someone", "anyone", "something", "anything",
+})
+MAX_SUBJECT_TERMS = 6
+
+
+def subject_terms(question):
+    """The words latest_activity requires ALL of on the day it returns.
+
+    query_terms() minus ASKING_WORDS and minus CJK bigrams (an AND over
+    overlapping bigrams never matches English speech, and they include asking
+    bigrams such as 上次). A purely Chinese question therefore yields [] and the
+    caller answers no_match, leaving the vector-led search_records to serve it.
+    Capped at MAX_SUBJECT_TERMS: each extra word narrows the AND.
+    """
+    return [t for t in query_terms(question)
+            if t.isascii() and t not in ASKING_WORDS][:MAX_SUBJECT_TERMS]
+
+
 def or_query(terms):
     """Join extracted terms into ONE `websearch_to_tsquery` input string that
     parses as an OR, not an AND -- the fix for Cause A of "the keyword arm can
