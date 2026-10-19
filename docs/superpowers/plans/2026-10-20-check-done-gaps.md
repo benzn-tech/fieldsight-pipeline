@@ -139,3 +139,7 @@ Functions:
     QwenModelFast carriers 2 -> 3; `test_lake_ownership_template` lists CheckGapsFunction under
     IMPORTS_BUT_NEVER_WRITES (it imports lake_put modules via extract_session, never writes).
 13. **No-template line** with no candidates: "I couldn't find a checklist set up for this check."
+14. **Bounded stored read (not in the spec's budget).** Only stored keys from the window
+    (live-window start, else 45 min before the newest stored key, minus a 10-minute margin)
+    are assembled, and only the newest batch's embedded map is read. Unbounded, a
+    three-hour session is ~100+ sequential GETs before the gap pass.
