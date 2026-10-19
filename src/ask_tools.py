@@ -70,8 +70,13 @@ TOOLS = [
          "k": {"type": "integer", "minimum": 1, "maximum": MAX_K}},
         ["query"]),
     _fn("latest_activity",
-        "Find the most recent day with records (optionally: the most recent day a "
-        "subject came up) and what was recorded that day.",
+        # With `query`, the day must contain EVERY subject word (spec 2026-10-20
+        # §3.5): a long model-written query over-constrains that AND, so ask for
+        # one to three words. Without it: the latest day with any records.
+        "Find the most recent day with records and what was recorded that day. "
+        "With query: the most recent day on which every word of `query` was "
+        "recorded (stemmed or exact). Give the subject in one to three words, "
+        "e.g. \"concrete pour\", \"drainage\".",
         {"query": {"type": "string"},
          "on_or_before": {"type": "string", "description": _DATE_DESC},
          "site": _SITE, "person": _PERSON},

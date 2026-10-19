@@ -392,56 +392,111 @@ def test_latest_activity_default_bound_never_excludes_a_local_today_ahead_of_utc
     assert datetime.date.fromisoformat(seen["before"]) >= utc_today + datetime.timedelta(days=2)
 
 
-def test_latest_activity_with_query_uses_the_gate_and_search_terms(monkeypatch):
+def test_latest_activity_with_query_uses_the_subject_terms(monkeypatch):
     seen = {}
-    monkeypatch.setenv("ASK_TOOLS_MATCH_GATE", "0.4")
-    def match(conn, qv, site_ids, **kw):
+    def match(conn, site_ids, **kw):
         seen.update(kw)
         return "2026-10-11"
     monkeypatch.setattr(d.chunks, "latest_matching_date", match)
     searches = []
     def search(ev, c):
         searches.append(ev)
-        # "kw" arrives as the VECTOR copy (lexical_hit False), as a small day's
-        # keyword-matched chunk does; "flag" claims lexical_hit but its text does
-        # not match. Only the SQL re-check decides the keyword half.
-        return {"chunks": [{"id": "near", "distance": 0.3, "lexical_hit": False},
-                           {"id": "far", "distance": 0.9, "lexical_hit": False},
-                           {"id": "kw", "distance": 0.9, "lexical_hit": False},
+        # "named" arrives as the vector copy (lexical_hit False) and is far; "near"
+        # is close but does not name the subject; "flag" claims lexical_hit but its
+        # text does not name it. Only the SQL re-check decides.
+        return {"chunks": [{"id": "near", "distance": 0.1, "lexical_hit": False},
+                           {"id": "named", "distance": 0.9, "lexical_hit": False},
                            {"id": "flag", "distance": 0.9, "lexical_hit": True}]}
-    def recheck(conn, ids, q_text):
-        seen["recheck"] = (list(ids), q_text)
-        return {"kw"}
-    monkeypatch.setattr(d.chunks, "keyword_matched_ids", recheck)
+    def recheck(conn, ids, terms):
+        seen["recheck"] = (list(ids), list(terms))
+        return {"named"}
+    monkeypatch.setattr(d.chunks, "subject_matched_ids", recheck)
     res = _run([{"id": "a", "name": "latest_activity", "query_embedding": [0.1],
                  "args": {"query": "when did we pour the slab", "on_or_before": "2026-10-14"}}],
                monkeypatch, search=search)
-    from lexical_terms import or_query, query_terms
-    assert seen["gate"] == 0.4
-    assert seen["query_text"] == or_query(query_terms("when did we pour the slab"))
+    assert seen["subject_terms"] == ["pour", "slab"]
+    assert "gate" not in seen and "query_text" not in seen
     assert seen["on_or_before"] == "2026-10-14" and seen["source_family"] == "report"
     assert searches[0]["date_from"] == searches[0]["date_to"] == "2026-10-11"
-    # The re-check binds the SAME keyword query that chose the day.
-    assert seen["recheck"] == (["near", "far", "kw", "flag"], seen["query_text"])
-    assert [r["id"] for r in res[0]["rows"]] == ["near", "kw"]
+    # The re-check binds the SAME subject words that chose the day.
+    assert seen["recheck"] == (["near", "named", "flag"], ["pour", "slab"])
+    assert [r["id"] for r in res[0]["rows"]] == ["named"]
     assert res[0]["meta"]["matched_date"] == "2026-10-11"
 
 
-def test_latest_activity_with_query_searches_wide_then_gates_then_trims(monkeypatch):
+def test_latest_activity_with_query_searches_wide_then_rechecks_then_trims(monkeypatch):
     monkeypatch.setattr(d.chunks, "latest_matching_date", lambda *a, **k: "2026-10-11")
-    monkeypatch.setattr(d.chunks, "keyword_matched_ids", lambda *a, **k: set())
-    seen = []
     far = [{"id": f"far{i}", "distance": 0.9, "lexical_hit": False} for i in range(30)]
-    near = [{"id": f"near{i}", "distance": 0.1 + i / 100, "lexical_hit": False} for i in range(20)]
+    named = [{"id": f"named{i}", "distance": 0.1 + i / 100, "lexical_hit": False}
+             for i in range(20)]
+    monkeypatch.setattr(d.chunks, "subject_matched_ids",
+                        lambda conn, ids, terms: {r["id"] for r in named})
+    seen = []
     def search(ev, c):
         seen.append(ev)
-        return {"chunks": far + near}   # the matches rank BELOW the default k*2
+        return {"chunks": far + named}   # the matches rank BELOW the default k*2
     res = _run([{"id": "a", "name": "latest_activity", "query_embedding": [0.1],
                  "args": {"query": "pour"}}], monkeypatch, search=search)
     assert seen[0]["k"] == 64
     # Trimmed to what an ordinary search returns (k*2): ask_tools' post-search
     # (lexical admit + rerank) reduces that to k, as for search_records.
-    assert [r["id"] for r in res[0]["rows"]] == [f"near{i}" for i in range(d.DEFAULT_K * 2)]
+    assert [r["id"] for r in res[0]["rows"]] == [f"named{i}" for i in range(d.DEFAULT_K * 2)]
+
+
+def test_missing_embedding_is_bad_args_before_subject_check(monkeypatch):
+    """Only asking words (no subject) AND no embedding: the orchestrator's
+    contract break wins, so the model is not told "no match"."""
+    res = _run([{"id": "a", "name": "latest_activity", "args": {"query": "when did we last talk"}}],
+               monkeypatch)
+    assert res[0]["rows"] == []
+    assert (res[0]["meta"]["error"], res[0]["meta"]["field"]) == ("bad_args", "query_embedding")
+    assert "empty_reason" not in res[0]["meta"]
+
+
+def test_cjk_only_query_is_no_match_without_sql(monkeypatch):
+    ran = []
+    monkeypatch.setattr(d.chunks, "latest_matching_date", lambda *a, **k: ran.append(1))
+    res = _run([{"id": "a", "name": "latest_activity", "query_embedding": [0.1],
+                 "args": {"query": "上次浇混凝土是什么时候"}}],
+               monkeypatch, search=lambda ev, c: ran.append(1) or {"chunks": []})
+    assert not ran
+    assert res[0]["rows"] == [] and res[0]["meta"]["empty_reason"] == "no_match"
+
+
+def test_day_search_gets_only_subject_words(monkeypatch):
+    """The day's search gets the subject words, not the whole question: fed
+    "last"/"time"/"talk", its keyword arm's top 64 can be crowded out (spec
+    2026-10-20 §3.3)."""
+    monkeypatch.setattr(d.chunks, "latest_matching_date", lambda *a, **k: "2026-10-11")
+    monkeypatch.setattr(d.chunks, "subject_matched_ids", lambda *a, **k: set())
+    seen = []
+    res = _run([{"id": "a", "name": "latest_activity", "query_embedding": [0.1],
+                 "args": {"query": "when did we last pour concrete"}}], monkeypatch,
+               search=lambda ev, c: seen.append(ev) or {"chunks": []})
+    assert seen[0]["question"] == "pour concrete"
+    assert seen[0]["date_from"] == seen[0]["date_to"] == "2026-10-11"
+    assert seen[0]["k"] == 64
+    assert res[0]["meta"]["matched_date"] == "2026-10-11"
+
+
+def test_only_rechecked_rows_are_kept(monkeypatch):
+    monkeypatch.setattr(d.chunks, "latest_matching_date", lambda *a, **k: "2026-10-11")
+    monkeypatch.setattr(d.chunks, "subject_matched_ids", lambda *a, **k: {"b"})
+    res = _run([{"id": "a", "name": "latest_activity", "query_embedding": [0.1],
+                 "args": {"query": "pour concrete"}}], monkeypatch,
+               search=lambda ev, c: {"chunks": [{"id": "a", "distance": 0.2},
+                                                {"id": "b", "distance": 0.6}]})
+    assert [r["id"] for r in res[0]["rows"]] == ["b"]
+
+
+def test_day_without_rechecked_rows_is_no_match_with_date(monkeypatch):
+    monkeypatch.setattr(d.chunks, "latest_matching_date", lambda *a, **k: "2026-10-11")
+    monkeypatch.setattr(d.chunks, "subject_matched_ids", lambda *a, **k: set())
+    res = _run([{"id": "a", "name": "latest_activity", "query_embedding": [0.1],
+                 "args": {"query": "pour concrete"}}], monkeypatch,
+               search=lambda ev, c: {"chunks": [{"id": "a", "distance": 0.2}]})
+    assert res[0]["rows"] == [] and res[0]["meta"]["empty_reason"] == "no_match"
+    assert res[0]["meta"]["matched_date"] == "2026-10-11"
 
 
 def test_latest_activity_with_query_no_day_is_no_match(monkeypatch):
@@ -539,9 +594,10 @@ def test_search_records_fetch_is_max_of_2k_and_candidate_k_capped_64(monkeypatch
 
 def test_latest_activity_trims_to_the_candidate_pool(monkeypatch):
     monkeypatch.setattr(d.chunks, "latest_matching_date", lambda *a, **k: "2026-10-11")
-    monkeypatch.setattr(d.chunks, "keyword_matched_ids", lambda *a, **k: set())
-    seen = []
     near = [{"id": f"n{i}", "distance": 0.1, "lexical_hit": False} for i in range(50)]
+    monkeypatch.setattr(d.chunks, "subject_matched_ids",
+                        lambda conn, ids, terms: {r["id"] for r in near})
+    seen = []
     res = _run([{"id": "a", "name": "latest_activity", "query_embedding": [0.1],
                  "candidate_k": 32, "args": {"query": "pour"}}], monkeypatch,
                search=lambda ev, c: seen.append(ev) or {"chunks": near})
@@ -570,7 +626,7 @@ def test_latest_activity_with_query_and_person_resolves_the_folder_once(monkeypa
     monkeypatch.setattr(d.users, "get_by_folder_name",
                         lambda conn, co, f: {"id": REF, "folder_name": "Mike_S"})
     monkeypatch.setattr(d.chunks, "latest_matching_date", lambda *a, **k: "2026-10-11")
-    monkeypatch.setattr(d.chunks, "keyword_matched_ids", lambda *a, **k: set())
+    monkeypatch.setattr(d.chunks, "subject_matched_ids", lambda *a, **k: {"c"})
     res = _run([{"id": "a", "name": "latest_activity", "query_embedding": [0.1],
                  "args": {"query": "pour", "person": REF}}], monkeypatch,
                search=lambda ev, c: seen.append(ev) or {

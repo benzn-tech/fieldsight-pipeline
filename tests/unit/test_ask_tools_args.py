@@ -151,3 +151,10 @@ def test_the_model_is_told_to_resolve_spoken_dates_itself():
     assert SPOKEN_HINT in props["date_from"]["description"]
     latest = by_name["latest_activity"]["parameters"]["properties"]
     assert SPOKEN_HINT in latest["on_or_before"]["description"]
+
+
+def test_latest_activity_description_asks_for_a_short_subject():
+    """latest_activity(query) requires EVERY word of `query` on the day (spec
+    2026-10-20 §3.5): a long model-written query over-constrains that AND."""
+    desc = {t["name"]: t for t in ask_tools.offered_tools()}["latest_activity"]["description"]
+    assert "every word" in desc and "one to three words" in desc
