@@ -126,15 +126,20 @@ def _latest(windows, template_id=None):
 
 
 def choose_template(check_name, templates, live_windows):
-    """(template, live window, closest names). The spoken name first, matched the
-    way item-writer matches a spoken check (inspection_match); then the session's
-    latest live window that matched a template. A template with no checklist
-    items cannot have gaps, so it is no template."""
+    """(template, live window, closest names). A spoken name is matched the way
+    item-writer matches a spoken check (inspection_match), and when it matches
+    nothing the answer is no template -- never the latest live window: he named a
+    check, and reading a different checklist's gaps aloud as his would be worse
+    than saying none was found. Only a name with nothing left after the done-words
+    ("check done") falls back to the session's latest live window that matched a
+    template. A template with no checklist items cannot have gaps, so it is no
+    template."""
     name = strip_done_words(check_name)
     tpl = None
     if inspection_match.words(name):
         tpl, _score = inspection_match.match({"kind": name, "name": name}, templates or [])
-    if tpl is not None:
+        if tpl is None:
+            return None, None, _closest(name, templates or [])
         window = _latest(live_windows, tpl.get("id"))
     else:
         window = _latest(live_windows)

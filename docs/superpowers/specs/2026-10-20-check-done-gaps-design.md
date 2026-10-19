@@ -142,9 +142,13 @@ Input `{caller_sub, check_name, pressed_at}`. Returns:
 2. **Which template.** Strip the done-words ("done", "finished", "complete",
    "what's left on", "check") from `check_name` -- they are not in
    `inspection_match.GENERIC` -- then `inspection_match.match({"kind": name,
-   "name": name}, templates)`. No spoken match but a live window with a
-   template -> that template. No template, or one without checklist sections
-   -> `no_template`, with the two closest names in the `say` line.
+   "name": name}, templates)`. A spoken name that matches nothing ->
+   `no_template` (never the live window: he named a check, and another
+   checklist's gaps read aloud as his are worse than "not found"). Only when
+   nothing is left of the name after the done-words ("check done") -> the
+   session's latest live window with a template. No template, or one without
+   checklist sections -> `no_template`, with the two closest names in the `say`
+   line. (Revised in review, 2026-10-20.)
 3. **Transcript so far.** All S3 keys are built under
    `users/{folder_name}/...` from the DB hop; nothing from the request.
    - Stored: `gather_session_segments` + `assemble_session_turns` for the

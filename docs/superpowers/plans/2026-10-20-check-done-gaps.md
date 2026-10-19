@@ -143,3 +143,19 @@ Functions:
     (live-window start, else 45 min before the newest stored key, minus a 10-minute margin)
     are assembled, and only the newest batch's embedded map is read. Unbounded, a
     three-hour session is ~100+ sequential GETs before the gap pass.
+15. **Review round (2026-10-20):**
+    - A spoken name that matches nothing is `no_template`; the live-window fallback is only
+      for a name that is empty after the done-words (spec step 2 revised to say so).
+    - The DB-hop invoke reads for 13 s, not 11: the hop's Timeout is 10 s, but a cold VPC
+      start runs its init (psycopg import, ENI attach) before that clock starts, so 11 could
+      cut a cold hop that would have answered. Warm, the 30 s run budget still leaves the gap
+      pass its 12 s; a slow cold hop is the case the run deadline then cuts by name
+      (`error`), not the runtime. Retries are 0 on that client (legacy mode counts retries).
+    - One run deadline (30 s, or the Lambda's remaining time less 3 s): hearing stops
+      LLM_DEADLINE_S + 1 before it (`partial`), the gap pass gets min(12, what is left - 1),
+      and under 3 s left it is `error` without a model call.
+    - Owner company when `meeting_session.site_id` is NULL: item-writer's rungs
+      (`recordings.site_for_media`, the session's site, `recordings.site_for_day`), then the
+      session's company, then his own. A NULL owner reads no templates -> `no_template`.
+    - Holes in the last 4 indices at or below the covered one are heard too.
+    - WAV length from the uploaded bytes, clamped to 60 s.

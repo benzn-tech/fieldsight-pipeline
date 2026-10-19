@@ -236,3 +236,11 @@ def test_wav_seconds_trust_the_bytes_not_the_frame_count():
 
 def test_wav_seconds_are_clamped_to_a_chunk():
     assert cd.wav_seconds(_wav(90.0, rate=8000)) == cd.MAX_CHUNK_SECONDS
+
+
+def test_a_named_check_that_matches_nothing_is_no_template_even_with_a_live_window():
+    # He said "scaffold check done" during a pre-pour window: answering about the
+    # pre-pour checklist would read the wrong list aloud as if it were his.
+    windows = [{"template_id": "t-pp", "start_at": "10:30:00"}]
+    tpl, window, closest = cd.choose_template("scaffold check done", [STEEL, PREPOUR], windows)
+    assert tpl is None and window is None and closest
