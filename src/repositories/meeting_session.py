@@ -463,7 +463,11 @@ def latest_for_user_near(conn, user_id, at_epoch, window_s=300) -> dict | None:
     `last_segment_at` is server time written for every chunk (silent ones
     included, by their VAD sidecar), but a session opened by /upload-url seconds
     ago has none yet, and that is exactly when a short check can end. Bound by
-    `user_id` alone: the session's company may be the project's, not his."""
+    `user_id` alone: the session's company may be the project's, not his.
+
+    No status filter, on purpose: a session already closed (pending_close, sent)
+    within the window still counts. "Pre-pour check done" is often said just
+    after he stops recording, and that recording is still the one he means."""
     if not user_id:
         return None
     return conn.cursor(row_factory=dict_row).execute(
