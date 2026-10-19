@@ -180,3 +180,14 @@ def test_a_missing_caller_or_a_db_failure_is_an_error_never_a_raise(monkeypatch)
     monkeypatch.setattr(hop.users, "get_user_by_sub", boom)
     out = hop.lambda_handler({"caller_sub": "sub-1", "pressed_at": 1}, None)
     assert out == {"error": "db"}
+
+
+def test_no_company_anywhere_reads_no_templates_and_is_not_an_error(monkeypatch):
+    # checklist_templates(conn, None, ...) would send the text "None" as a uuid and
+    # fail the whole hop; nothing to match against is no_template downstream.
+    seen = _wire(monkeypatch, dict(USER, company_id=None),
+                 dict(SESSION, site_id=None, company_id=None))
+    out = hop.lambda_handler({"caller_sub": "sub-1", "pressed_at": 1760000000}, None)
+    assert "error" not in out and out["owner_company_id"] is None
+    assert out["templates"] == [] and out["live_windows"] == []
+    assert "templates_for" not in seen

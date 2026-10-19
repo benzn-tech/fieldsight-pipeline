@@ -100,7 +100,11 @@ def _facts(event):
         out["owner_company_id"] = owner
         out["session"] = {k: session.get(k) for k in (
             "session_id", "company_id", "site_id", "kind", "status", "opened_at", "last_segment_at")}
-        out["templates"] = inspection_windows.checklist_templates(conn, owner, user["id"])
+        # No company anywhere: nothing to match against, which CheckGaps answers
+        # as no_template. Querying with None would send "None" as a uuid and fail
+        # the hop as a database error instead.
+        out["templates"] = (inspection_windows.checklist_templates(conn, owner, user["id"])
+                            if owner else [])
         companies = list(dict.fromkeys(str(c) for c in (owner, session.get("company_id"),
                                                         user.get("company_id")) if c))
         out["live_windows"] = inspection_windows.for_session(

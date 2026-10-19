@@ -412,3 +412,10 @@ def test_the_function_never_raises(monkeypatch):
     monkeypatch.setattr(cd, "_answer", lambda *a, **k: 1 / 0)
     out = w.run()
     assert out["status"] == "error" and out["say"] == cd.say_error()
+
+
+def test_a_hop_with_no_templates_is_no_template_not_an_error():
+    w = World(db=facts(owner_company_id=None, templates=[], live_windows=[]))
+    out = w.run()
+    assert out["status"] == "no_template"
+    assert out["say"] == "I couldn't find a checklist set up for this check."
