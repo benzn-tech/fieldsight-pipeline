@@ -100,7 +100,14 @@ def _split_topic_text(header, body):
 def _pack_windows(turns):
     """Pack turns into <= TARGET_CHARS windows on turn boundaries, carrying
     OVERLAP_TURNS turns into the next window. A window is only emitted if it
-    holds at least one turn not already in the previous window."""
+    holds at least one turn not already in the previous window.
+
+    A last window under TARGET_CHARS // 2 is back-filled with the turns
+    before it, stopping before the first that would take it over
+    TARGET_CHARS: a 639-char tail of a few turns was cosine rank 65 for a
+    question whose words sat in the window before it, and rank 20 once
+    back-filled (2026-10-16 spec §3b). It then overlaps its predecessor by
+    more than OVERLAP_TURNS; window count is unchanged."""
     out, window, size, fresh = [], [], 0, 0
     for turn in turns:
         n = len(_window_line(turn)) + 1
@@ -114,7 +121,25 @@ def _pack_windows(turns):
         fresh += 1
     if window and fresh:
         out.append(window)
+    if len(out) >= 2 and _window_size(out[-1]) < TARGET_CHARS // 2:
+        out[-1] = _backfill(turns, out[-1])
     return out
+
+
+def _window_size(window):
+    return sum(len(_window_line(t)) + 1 for t in window)
+
+
+def _backfill(turns, tail):
+    start = next(n for n, t in enumerate(turns) if t is tail[0])
+    i, size = start, _window_size(tail)
+    while i > 0:
+        n = len(_window_line(turns[i - 1])) + 1
+        if size + n > TARGET_CHARS:
+            break
+        i -= 1
+        size += n
+    return turns[i:start] + tail
 
 
 def _window_line(turn):

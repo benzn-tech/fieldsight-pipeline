@@ -275,24 +275,41 @@ RERANK_ENABLED = os.environ.get("ENABLE_RERANK", "false").lower() == "true"
 # now 64 (search list only; Ask keeps 32 here), the reranker itself measured
 # fine at 100+.
 RERANK_CANDIDATES = int(os.environ.get("RERANK_CANDIDATE_K", "32"))
-# Adjacent transcript windows overlap by OVERLAP_TURNS=2 and one session's
-# windows are near-identical, so positions 6..32 of a cosine ranking are
-# dominated by neighbours of the same few sessions. Reranking 32 near-duplicates
-# re-orders duplicates. Capping per session first is what makes the widening
-# mean anything.
-RERANK_PER_SESSION_CAP = int(os.environ.get("RERANK_PER_SESSION_CAP", "4"))
+# The reranker sees at most RERANK_CANDIDATES rows, chosen per search arm
+# (2026-10-16 spec, docs/superpowers/specs/2026-10-16-rerank-diversify-and-
+# tail-windows-design.md). It used to be capped at 4 per source_s3_key, but a
+# key is a whole day (report family) or a whole recording session, so the cap
+# showed the reranker the first four rows of a day. Measured on ruler v1:
+# Ask 87-90% with the cap, 92-95% per arm.
+#
+# Per arm because build_search_sql appends every keyword-only row after every
+# vector row: any arrival-order total cuts keyword rows first. Keyword slots a
+# question does not use go to vector rows, so the total stays RERANK_CANDIDATES.
+RERANK_KEYWORD_CANDIDATES = int(os.environ.get("RERANK_KEYWORD_CANDIDATES", "8"))
 
 
-def _diversify(chunks, cap):
-    """At most `cap` chunks per source recording, original order preserved."""
-    seen, out = {}, []
+def _select_candidates(chunks, total=None):
+    """Rows for the reranker: up to RERANK_KEYWORD_CANDIDATES keyword-only rows
+    and vector rows to fill `total` (default RERANK_CANDIDATES), each arm in
+    arrival order, vector rows first.
+
+    The same non-empty chunk_text indexed twice is kept once, at its first
+    position and in that position's arm; if a dropped copy was a keyword
+    hit, the kept row's `lexical_hit` is set True (the kept dict is modified
+    in place) so `_basis` still sees it."""
+    total = RERANK_CANDIDATES if total is None else total
+    seen, vector, keyword = {}, [], []
     for c in chunks:
-        key = c.get("source_s3_key") or c.get("topic_id") or id(c)
-        if seen.get(key, 0) >= cap:
+        text = c.get("chunk_text") or ""
+        if text and text in seen:
+            if c.get("lexical_hit"):
+                seen[text]["lexical_hit"] = True
             continue
-        seen[key] = seen.get(key, 0) + 1
-        out.append(c)
-    return out
+        if text:
+            seen[text] = c
+        (keyword if c.get("lexical_hit") else vector).append(c)
+    keyword = keyword[:min(RERANK_KEYWORD_CANDIDATES, total)]
+    return vector[:total - len(keyword)] + keyword
 
 
 def _admit_one_lexical_hit(chunks, keep):
@@ -360,10 +377,11 @@ def _admit_one_lexical_hit(chunks, keep):
 def _rerank_chunks(question, chunks, keep):
     """Reorder by relevance and keep the best `keep`.
 
-    Every failure path returns the chunks the caller already had, truncated.
-    The reranker improves an answer that is already shippable, so it may never
-    be the reason a question goes unanswered -- `dashscope_utils.rerank`
-    returns None rather than raising, and this returns the cosine order.
+    Every failure path returns what Ask would have used without the
+    reranker: `_admit_one_lexical_hit` over the candidates, so a keyword-only
+    row survives a timeout. The reranker improves an answer that is already
+    shippable, so it may never be the reason a question goes unanswered --
+    `dashscope_utils.rerank` returns None rather than raising.
     """
     if not RERANK_ENABLED:
         # Arrival order is no longer pure cosine order (Task 3 appends
@@ -378,11 +396,15 @@ def _rerank_chunks(question, chunks, keep):
     # would kill that deploy's paths on the way past.
     import dashscope_utils
 
-    candidates = _diversify(chunks, RERANK_PER_SESSION_CAP)
+    candidates = _select_candidates(chunks)
+    if len(candidates) <= keep:
+        return candidates
     order = dashscope_utils.rerank(
         question, [c.get("chunk_text") or "" for c in candidates], keep)
     if not order:
-        return candidates[:keep]
+        # Candidates hold keyword rows after vector rows; a plain [:keep]
+        # would drop them all on a timeout (prod timeout is 3s).
+        return _admit_one_lexical_hit(candidates, keep)
     return [candidates[i] for i in order[:keep]]
 
 
