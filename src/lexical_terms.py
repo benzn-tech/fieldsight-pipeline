@@ -128,9 +128,10 @@ def query_terms(question):
 
 # Words that describe the ASKING ("when did we last talk about ..."), not the
 # subject -- Ask-tool policy for latest_activity, not a list pinned by Postgres
-# like QUERY_STOPWORDS (spec 2026-10-20 §3.1). The asymmetry decides what goes
-# here: a missing word makes the AND demand it, so a real subject day is missed
-# (false no_match); a subject word listed here ("lead time") only loosens the AND.
+# like QUERY_STOPWORDS (spec 2026-10-20 §3.1, §8). The asymmetry decides what
+# goes here: a missing word counts toward coverage, so a chunk that merely says it
+# can outscore the subject day (or, with few terms, the day is missed); a subject
+# word listed here ("lead time") only loosens the match.
 ASKING_WORDS = frozenset({
     "last", "latest", "recent", "recently", "lately", "time", "times", "when",
     "ever", "ago", "earlier", "previous", "previously", "before", "date", "day",
@@ -138,21 +139,30 @@ ASKING_WORDS = frozenset({
     "discussed", "discuss", "discussion", "mentioned", "mention", "said", "say",
     "told", "asked", "heard", "raised", "brought", "came", "come", "happened",
     "someone", "anyone", "something", "anything",
+    # Amendment A (§8): measured on round-1 questions ("When did we last hear
+    # from Hector Eggar...", "most recent conversation about the crane").
+    "hear", "conversation", "conversations", "update", "updates", "news", "status",
 })
 MAX_SUBJECT_TERMS = 6
 
 
 def subject_terms(question):
-    """The words latest_activity requires ALL of on the day it returns.
+    """The subject words latest_activity counts per chunk to choose its day
+    (spec 2026-10-20 §3.1; coverage rule §8).
 
-    query_terms() minus ASKING_WORDS and minus CJK bigrams (an AND over
-    overlapping bigrams never matches English speech, and they include asking
-    bigrams such as 上次). A purely Chinese question therefore yields [] and the
-    caller answers no_match, leaving the vector-led search_records to serve it.
-    Capped at MAX_SUBJECT_TERMS: each extra word narrows the AND.
+    query_terms() minus ASKING_WORDS and minus CJK bigrams (overlapping bigrams
+    never match English speech, and they include asking bigrams such as 上次).
+    A purely Chinese question therefore yields [] and the caller answers
+    no_match, leaving the vector-led search_records to serve it. Exact
+    duplicates are dropped, keeping order, before the cap (a repeated word
+    would count twice); stem duplicates ("panel panels") are accepted (§8.1).
+    Capped at MAX_SUBJECT_TERMS.
     """
-    return [t for t in query_terms(question)
-            if t.isascii() and t not in ASKING_WORDS][:MAX_SUBJECT_TERMS]
+    out = []
+    for t in query_terms(question):
+        if t.isascii() and t not in ASKING_WORDS and t not in out:
+            out.append(t)
+    return out[:MAX_SUBJECT_TERMS]
 
 
 def or_query(terms):

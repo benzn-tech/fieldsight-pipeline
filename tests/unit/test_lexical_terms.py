@@ -124,3 +124,22 @@ def test_subject_terms_cap_at_six():
     assert MAX_SUBJECT_TERMS == 6
     assert subject_terms("alpha bravo charlie delta foxtrot hotel india") == \
         ["alpha", "bravo", "charlie", "delta", "foxtrot", "hotel"]
+
+
+# --- Amendment A (spec 2026-10-20 §8 / §8.1): dedupe, more asking words ---
+
+def test_subject_terms_drop_exact_duplicates_before_the_cap():
+    assert subject_terms("panel panel") == ["panel"]
+    assert subject_terms("alpha alpha bravo charlie delta foxtrot hotel india") == \
+        ["alpha", "bravo", "charlie", "delta", "foxtrot", "hotel"]
+    # stem duplicates are accepted (§8.1 item 3)
+    assert subject_terms("panel panels") == ["panel", "panels"]
+
+
+def test_subject_terms_drop_the_amendment_asking_words():
+    assert subject_terms("When did we last hear from Hector Eggar about the scaffold?") == \
+        ["hector", "eggar", "scaffold"]
+    assert subject_terms("most recent conversation about the crane") == ["crane"]
+    assert subject_terms("any updates or news on the status of the crane") == ["crane"]
+    for w in ("hear", "conversation", "conversations", "update", "updates", "news", "status"):
+        assert subject_terms(f"{w} crane") == ["crane"], w

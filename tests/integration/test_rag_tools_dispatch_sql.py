@@ -280,3 +280,83 @@ def test_naming_chunk_survives_a_crowded_day(db, world):
                             "on_or_before": D}}])
     assert [r["chunk_text"] for r in res[0]["rows"]] == ["precast panels arrive Friday"]
     assert res[0]["meta"]["matched_date"] == day
+
+
+# ---- Amendment A (spec 2026-10-20 §8 / §8.1): round-1-shaped full questions ----
+
+FIVE_Q = "When did we last pour concrete for the B2 slab on level 2?"   # 5 subject words
+
+
+def _seed(db, w, day, text, emb=UNIT):
+    key = f"reports/{day}/WorkerA/daily_report.json"
+    topics.upsert_topic(db, w["sa"]["id"], day, "Day", user_id=w["wa"]["id"],
+                        source_s3_key=key)
+    chunks.insert_chunk(db, w["sa"]["id"], day, "topic", text, emb,
+                        user_id=w["wa"]["id"], source_s3_key=key)
+
+
+def _round1(question, emb=UNIT):
+    """Exactly what ask_orchestrator.round1_calls sends for a "when did we last"
+    question scoped to a site and a person: the RAW question as `query`."""
+    import ask_orchestrator
+    calls = ask_orchestrator.round1_calls(question, None, None,
+                                          {"site": "Alpha", "person": "WorkerA"})
+    assert [c["name"] for c in calls] == ["latest_activity"]
+    assert calls[0]["args"] == {"query": question, "site": "Alpha", "person": "WorkerA"}
+    res = _tools([dict(calls[0], id="1", query_embedding=emb)])
+    return res[0]["rows"], res[0]["meta"]
+
+
+def test_round1_full_question_finds_the_four_of_five_day(db, world):
+    w = world
+    _seed(db, w, "2026-10-12", "pour concrete for the B2 slab")
+    _seed(db, w, "2026-10-13", "concrete on level 3")
+    _seed(db, w, "2026-10-14", "general site chatter today")
+    rows, meta = _round1(FIVE_Q)
+    assert [r["chunk_text"] for r in rows] == ["pour concrete for the B2 slab"]
+    assert meta["matched_date"] == "2026-10-12"
+    assert meta["subject_match"] == {"matched": 4, "of": 5, "day_max": 4}
+    assert "empty_reason" not in meta and "error" not in meta
+
+
+def test_round1_older_full_day_beats_newer_partial_day(db, world):
+    w = world
+    _seed(db, w, "2026-10-10", "pour concrete for the B2 slab on level 2")
+    _seed(db, w, "2026-10-13", "pour concrete for the B2 slab")
+    rows, meta = _round1(FIVE_Q)
+    assert [r["chunk_text"] for r in rows] == ["pour concrete for the B2 slab on level 2"]
+    assert meta["matched_date"] == "2026-10-10"
+    assert meta["subject_match"] == {"matched": 5, "of": 5, "day_max": 5}
+
+
+def test_round1_single_word_hits_are_no_match(db, world):
+    w = world
+    _seed(db, w, "2026-10-12", "concrete delivered")
+    _seed(db, w, "2026-10-13", "the slab looked fine")
+    rows, meta = _round1(FIVE_Q)
+    assert rows == [] and meta["empty_reason"] == "no_match"
+    assert "matched_date" not in meta
+
+
+def test_round1_rows_below_the_day_maximum_are_dropped(db, world):
+    w = world
+    for text in ("pour concrete for the B2 slab", "concrete pour later", "B2 slab level check"):
+        _seed(db, w, "2026-10-12", text)
+    rows, meta = _round1(FIVE_Q)
+    assert [r["chunk_text"] for r in rows] == ["pour concrete for the B2 slab"]
+    assert meta["subject_match"] == {"matched": 4, "of": 5, "day_max": 4}
+
+
+def test_round1_stem_only_k_star_chunk_on_a_crowded_day_keeps_the_next_tier(db, world):
+    """§8.1 item 2. The 3/3 chunk names every word only through english stems
+    ("precasts panel cranes"), so the day search's keyword arm (exact tokens) never
+    fetches it, and 70 nearer 2/3 chunks fill its vector arm. The fetched 2/3 tier
+    is kept, and day_max says a better chunk exists on that day."""
+    w = world
+    for _ in range(70):
+        _seed(db, w, "2026-10-12", "precast panels stacked by the gate")
+    _seed(db, w, "2026-10-12", "precasts panel cranes", ORTHO)
+    rows, meta = _round1("when did we last discuss the precast panels crane")
+    assert rows and {r["chunk_text"] for r in rows} == {"precast panels stacked by the gate"}
+    assert meta["matched_date"] == "2026-10-12"
+    assert meta["subject_match"] == {"matched": 2, "of": 3, "day_max": 3}

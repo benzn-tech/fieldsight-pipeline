@@ -1,6 +1,7 @@
-"""`chunks.latest_matching_date` / `chunks.subject_matched_ids` against a real
+"""`chunks.latest_matching_date` / `chunks.subject_coverage` against a real
 PostgreSQL (Ask tools, spec 2026-10-15 §3.1 item 3, `latest_activity` with a
-query; day rule from spec 2026-10-20 §3.2: every subject word, stemmed or exact).
+query; day rule from spec 2026-10-20 §3.2 and Amendment A §8: the latest day
+reaching the window's highest subject-word coverage, at least min(2, n)).
 
 The answer is a DATE, and a date is still a disclosure: a deleted recording, an
 author the caller cannot see, or a report-family row that the session family
@@ -35,9 +36,15 @@ def _user(db, company_id, tag):
         (company_id, f"{tag}@x.com", tag)).fetchone()[0]
 
 
-def _latest(db, site_ids, terms, **kw):
+def _pick(db, site_ids, terms, **kw):
+    """(day, k*) or None -- latest_matching_date's own return."""
     return chunks.latest_matching_date(db, site_ids, on_or_before="2026-10-15",
                                        subject_terms=terms, **kw)
+
+
+def _latest(db, site_ids, terms, **kw):
+    got = _pick(db, site_ids, terms, **kw)
+    return None if got is None else got[0]
 
 
 def test_latest_day_naming_the_subject_within_window(db):
@@ -193,17 +200,90 @@ def test_family_agrees_with_latest_visible_date_when_every_row_names_the_word(
                                       source_family=family)
 
 
-def test_subject_matched_ids_returns_only_naming_rows(db):
+def test_subject_coverage_counts_the_words_each_row_names(db):
     s = _site(db)
     both = chunks.insert_chunk(db, s["id"], "2026-10-12", "topic", "Precast panels arrive", _v(0))
     one = chunks.insert_chunk(db, s["id"], "2026-10-12", "topic", "panels stacked", _v(0))
     none = chunks.insert_chunk(db, s["id"], "2026-10-12", "topic", "last time we talked", _v(0))
     ids = [both["id"], one["id"], none["id"]]
-    assert chunks.subject_matched_ids(db, ids, ["precast", "panel"]) == {str(both["id"]).lower()}
-    assert chunks.subject_matched_ids(db, ids, ["panels"]) == \
-        {str(both["id"]).lower(), str(one["id"]).lower()}
-    assert chunks.subject_matched_ids(db, ids, []) == set()
-    assert chunks.subject_matched_ids(db, [], ["panels"]) == set()
+    assert chunks.subject_coverage(db, ids, ["precast", "panel"]) == {
+        str(both["id"]).lower(): 2, str(one["id"]).lower(): 1, str(none["id"]).lower(): 0}
+    assert chunks.subject_coverage(db, ids, []) == {}
+    assert chunks.subject_coverage(db, [], ["panels"]) == {}
+
+
+# ---- Amendment A (spec 2026-10-20 §8 / §8.1): coverage first, not ALL ----
+
+FIVE = ["pour", "concrete", "b2", "slab", "level"]
+
+
+def test_a_day_with_four_of_five_words_is_chosen_when_none_has_all(db):
+    s = _site(db)
+    chunks.insert_chunk(db, s["id"], "2026-10-12", "topic", "pour concrete for the B2 slab", _v(0))
+    chunks.insert_chunk(db, s["id"], "2026-10-14", "topic", "concrete on level 3", _v(0))
+    assert _pick(db, [s["id"]], FIVE) == ("2026-10-12", 4)
+
+
+def test_an_older_full_day_beats_a_newer_partial_one(db):
+    """k* is the window maximum (§8 trade-off): 5/5 on the 10th beats 4/5 on the 13th."""
+    s = _site(db)
+    chunks.insert_chunk(db, s["id"], "2026-10-10", "topic",
+                        "pour concrete for the B2 slab on level 2", _v(0))
+    chunks.insert_chunk(db, s["id"], "2026-10-13", "topic", "pour concrete for the B2 slab", _v(0))
+    assert _pick(db, [s["id"]], FIVE) == ("2026-10-10", 5)
+
+
+def test_coverage_is_per_chunk_not_per_day(db):
+    """Two chunks on one day naming two words each are coverage 2, not 4."""
+    s = _site(db)
+    chunks.insert_chunk(db, s["id"], "2026-10-12", "topic", "pour concrete", _v(0))
+    chunks.insert_chunk(db, s["id"], "2026-10-12", "topic", "B2 slab", _v(0))
+    assert _pick(db, [s["id"]], FIVE) == ("2026-10-12", 2)
+
+
+def test_one_word_never_chooses_a_day_when_there_are_two_or_more(db):
+    s = _site(db)
+    chunks.insert_chunk(db, s["id"], "2026-10-12", "topic", "concrete only", _v(0))
+    assert _pick(db, [s["id"]], ["pour", "concrete"]) is None
+    assert _pick(db, [s["id"]], FIVE) is None
+
+
+def test_two_words_are_both_required(db):
+    s = _site(db)
+    chunks.insert_chunk(db, s["id"], "2026-10-13", "topic", "pour tomorrow", _v(0))
+    chunks.insert_chunk(db, s["id"], "2026-10-12", "topic", "concrete pour", _v(0))
+    assert _pick(db, [s["id"]], ["pour", "concrete"]) == ("2026-10-12", 2)
+
+
+def test_one_word_has_a_floor_of_one(db):
+    """§8.1 item 4: a single (even generic) subject word picks the latest day naming it."""
+    s = _site(db)
+    chunks.insert_chunk(db, s["id"], "2026-10-11", "topic", "site tidy", _v(0))
+    chunks.insert_chunk(db, s["id"], "2026-10-13", "topic", "the site was busy", _v(0))
+    assert _pick(db, [s["id"]], ["site"]) == ("2026-10-13", 1)
+
+
+def test_day_query_uses_the_text_index_with_a_generic_term(db):
+    """§8.1 item 1: with a term present in almost every row ("site"), an OR of the
+    single terms is not GIN-served (the planner walked the site/date index). The
+    pairwise-AND prefilter is, because every pair has a rare term."""
+    s = _site(db)
+    for i in range(500):
+        chunks.insert_chunk(db, s["id"], "2026-10-12", "topic",
+                            f"site electrical note number {i}", _v(i % 1024))
+    chunks.insert_chunk(db, s["id"], "2026-10-12", "topic", "site precast crane lift", _v(0))
+    db.execute("ANALYZE report_chunks")
+    db.execute("SET LOCAL enable_seqscan = off")
+    terms = ["site", "precast", "crane"]
+    plan = "\n".join(r[0] for r in db.execute(
+        "EXPLAIN " + build_latest_match_date_sql(3),
+        {**subject_params(terms), "floor": 2,
+         "site_ids": [s["id"]], "author_ids": None,
+         "date_from": "2026-07-16", "date_to": "2026-10-15",
+         "source_family": None},
+    ).fetchall())
+    assert "idx_report_chunks_tsv_multi_config" in plan, plan
+    assert _pick(db, [s["id"]], terms) == ("2026-10-12", 3)
 
 
 def test_day_query_uses_the_text_index(db):
@@ -219,7 +299,7 @@ def test_day_query_uses_the_text_index(db):
     db.execute("SET LOCAL enable_seqscan = off")
     plan = "\n".join(r[0] for r in db.execute(
         "EXPLAIN " + build_latest_match_date_sql(1),
-        {**subject_params(["precast"]),
+        {**subject_params(["precast"]), "floor": 1,
          "site_ids": [s["id"]], "author_ids": None,
          "date_from": "2026-07-16", "date_to": "2026-10-15",
          "source_family": None},

@@ -4,11 +4,12 @@ from psycopg.types.json import Jsonb
 from deleted_predicates import LIVE_TOPIC_PREDICATE
 from repositories.search_sql import (build_latest_date_sql,  # re-export
                                      build_latest_match_date_sql, build_search_sql,
-                                     build_subject_recheck_sql, subject_params)
+                                     build_subject_coverage_sql, subject_floor,
+                                     subject_params)
 
 __all__ = ["build_search_sql", "build_latest_date_sql", "insert_chunk", "search_chunks",
            "latest_visible_date", "latest_matching_date", "build_latest_match_date_sql",
-           "subject_matched_ids", "build_subject_recheck_sql",
+           "subject_coverage", "build_subject_coverage_sql", "subject_floor",
            "delete_chunks_for_source", "delete_chunks_for_sources", "delete_chunks_for_topic",
            "archive_chunks_for_session", "archive_chunks_for_sources",
            "restore_chunks_for_batch",
@@ -121,18 +122,20 @@ def latest_visible_date(conn, accessible_site_ids, *, author_ids=None, on_or_bef
 
 def latest_matching_date(conn, accessible_site_ids, *, on_or_before, subject_terms,
                          window_days=92, author_ids=None, source_family=None):
-    """Latest report_date in [on_or_before - window_days + 1, on_or_before] with a
-    visible chunk naming every subject word, or None (Ask tools, spec 2026-10-15
-    §3.1 item 3; day rule from spec 2026-10-20 §3.2).
+    """`(day, k)` for the window [on_or_before - window_days + 1, on_or_before], or
+    None (Ask tools, spec 2026-10-15 §3.1 item 3; day rule from spec 2026-10-20
+    §3.2 and Amendment A §8). Callers test `is None`.
 
-    `subject_terms` is `lexical_terms.subject_terms(question)`: each word matches
-    its english stem or its exact token, and all must be present
-    (search_sql.subject_tsquery). No words -> None, and no SQL runs.
-    Visibility is the search's own (build_latest_match_date_sql reuses
-    _scope_predicate): site pin, author narrowing, deletion tombstones,
-    supersession and the source family -- a date is a disclosure too.
+    `subject_terms` is `lexical_terms.subject_terms(question)`; each word matches
+    its english stem or its exact token (search_sql.subject_term_query). k is the
+    highest number of them any visible chunk in the window names, at least
+    subject_floor(n) = min(2, n); day is the latest report_date with a chunk at k.
+    No words -> None, and no SQL runs. Visibility is the search's own
+    (build_latest_match_date_sql reuses _scope_predicate): site pin, author
+    narrowing, deletion tombstones, supersession and the source family -- a date
+    is a disclosure too.
 
-    The text match is served by the GIN expression index; the window bounds the
+    The prefilter is served by the GIN expression index; the window bounds the
     rest (spec 2026-10-15 §3.4: shrink the window first if p95 is missed).
     """
     terms = list(subject_terms or [])
@@ -145,29 +148,30 @@ def latest_matching_date(conn, accessible_site_ids, *, on_or_before, subject_ter
     lo = hi - timedelta(days=window_days - 1)
     row = conn.cursor(row_factory=dict_row).execute(
         build_latest_match_date_sql(len(terms)),
-        {**subject_params(terms),
+        {**subject_params(terms), "floor": subject_floor(len(terms)),
          "site_ids": list(accessible_site_ids),
          "author_ids": list(author_ids) if author_ids is not None else None,
          "date_from": lo, "date_to": hi,
          "source_family": source_family},
     ).fetchone()
-    latest = (row or {}).get("latest")
-    return latest.isoformat() if latest is not None else None
+    if not row or row.get("report_date") is None:
+        return None
+    return row["report_date"].isoformat(), int(row["k"])
 
 
-def subject_matched_ids(conn, chunk_ids, subject_terms) -> set:
-    """The subset of `chunk_ids` (as lower-case str) whose text names every
-    subject word -- the same subject_tsquery latest_matching_date chose the day
-    by, so a kept row means what the day meant. No ids or no words -> empty set.
+def subject_coverage(conn, chunk_ids, subject_terms) -> dict:
+    """{lower-case id: k} -- how many subject words each of `chunk_ids` names, by
+    the same coverage expression latest_matching_date chose the day by, so a
+    row's k means what the day's k meant. No ids or no words -> {}.
     """
     ids = [str(i) for i in chunk_ids if i is not None]
     terms = list(subject_terms or [])
     if not ids or not terms:
-        return set()
+        return {}
     rows = conn.cursor(row_factory=dict_row).execute(
-        build_subject_recheck_sql(len(terms)),
+        build_subject_coverage_sql(len(terms)),
         {"ids": ids, **subject_params(terms)}).fetchall()
-    return {str(r["id"]).lower() for r in rows}
+    return {str(r["id"]).lower(): int(r["k"]) for r in rows}
 
 
 def delete_chunks_for_source(conn, source_s3_key) -> int:

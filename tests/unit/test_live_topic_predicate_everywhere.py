@@ -237,6 +237,10 @@ UNFILTERED = {
     (chunks, "restore_chunks_for_batch"):
         "undelete/restore path; its scalar subquery asks only whether the topic row still "
         "EXISTS (ON DELETE SET NULL emulation), never whether it is superseded",
+    (chunks, "subject_coverage"):
+        "Ask latest_activity(query) re-check by ids only: counts which subject words "
+        "the given chunks name; every id already passed the search's own visibility "
+        "predicate (live arm included) in the day search that fetched it",
     (chunks, "archive_chunks_for_session"):
         "delete-time MOVE, not a filtered read; must move every chunk that matches "
         "SESSION_CHUNK_PREDICATE regardless of its parent topic's supersession status",

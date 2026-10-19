@@ -37,7 +37,7 @@ MAX_DEADLINE_S = 20.0
 DAY_LIMIT = 60
 DEFAULT_K = 8
 # latest_activity(query): the subject words chose the day; search that day this
-# wide so a chunk naming them ranked below k*2 is not lost to the re-check filter
+# wide so a chunk naming them ranked below k*2 is not lost to the coverage filter
 # (_search's own ceiling is 64).
 LATEST_DAY_SEARCH_K = 64
 # latest_activity(query) runs a day query (served by the GIN text index) AND a full
@@ -275,9 +275,10 @@ def _latest_activity(conn, caller, sc, a, meta, call, search_fn, source_family, 
     # A missing embedding is the orchestrator's contract break: bad_args, checked
     # before the subject so it is never reported as "no match".
     _need_embedding(call, meta)
-    # The day must name the subject (spec 2026-10-20): every subject word, stemmed
-    # or exact. A question with none (only asking words, or purely Chinese) is
-    # no_match without any SQL -- the judge falls back to search_records.
+    # The day must name the subject (spec 2026-10-20): as many subject words as
+    # any chunk names (§8, coverage first -- round 1 sends the raw question), each
+    # stemmed or exact. A question with none (only asking words, or purely
+    # Chinese) is no_match without any SQL -- the judge falls back to search_records.
     terms = subject_terms(a["query"])
     if not terms:
         meta["empty_reason"] = _no_match(sc)
@@ -288,12 +289,13 @@ def _latest_activity(conn, caller, sc, a, meta, call, search_fn, source_family, 
     # Fail closed BEFORE the day query if _search could not narrow to this person;
     # the folder resolved here is the one the day's search uses (resolved once).
     folder = _search_author_folder(conn, caller, sc, user_id, meta) if user_id else None
-    day = chunks.latest_matching_date(
+    picked = chunks.latest_matching_date(
         conn, site_ids, on_or_before=upto, subject_terms=terms,
         author_ids=author_ids, source_family=source_family)
-    if not day:
+    if picked is None:
         meta["empty_reason"] = _no_match(sc)
         return []
+    day, k_star = picked
     meta["matched_date"] = day
     # Search that day with the subject words only, not the whole question: the
     # keyword arm takes its top 64 by ts_rank of an OR over the question's terms,
@@ -304,13 +306,21 @@ def _latest_activity(conn, caller, sc, a, meta, call, search_fn, source_family, 
                        dict(a, query=" ".join(terms), date_from=day, date_to=day), call,
                        search_fn, site_id, user_id, meta, search_k=LATEST_DAY_SEARCH_K,
                        author_folder=folder)
-    # Keep only the rows that name the subject, by the SAME subject_tsquery that
-    # chose the day; a row near only by distance is dropped. `lexical_hit` cannot
-    # decide this: it means "found ONLY by the keyword arm", and a small day's
-    # matching chunk arrives as its vector copy (lexical_hit=False). Then as many
-    # as an ordinary search returns for ask_tools' post-search.
-    matched = chunks.subject_matched_ids(conn, [r.get("id") for r in rows], terms)
-    rows = [r for r in rows if str(r.get("id")).lower() in matched]
+    # Keep the fetched rows at the highest fetched coverage, by the SAME coverage
+    # expression that chose the day; a row near only by distance is dropped.
+    # `lexical_hit` cannot decide this: it means "found ONLY by the keyword arm",
+    # and a small day's matching chunk arrives as its vector copy. The tier is the
+    # FETCHED maximum, not k*: the keyword arm matches exact tokens only, so a k*
+    # chunk resting on a stem can be missing from the 64 (§8.1 item 2). Below the
+    # floor nothing is kept. Then as many as an ordinary search returns for
+    # ask_tools' post-search. subject_match is for logs/diagnostics only (§8.1
+    # item 5): the orchestrator header does not render it.
+    cover = chunks.subject_coverage(conn, [r.get("id") for r in rows], terms)
+    k_fetched = max(cover.values(), default=0)
+    meta["subject_match"] = {"matched": k_fetched, "of": len(terms), "day_max": k_star}
+    if k_fetched < chunks.subject_floor(len(terms)):
+        rows = []
+    rows = [r for r in rows if cover.get(str(r.get("id")).lower(), 0) >= k_fetched]
     rows = rows[:_candidate_pool(call, a)]
     if not rows:
         meta["empty_reason"] = _no_match(sc)
