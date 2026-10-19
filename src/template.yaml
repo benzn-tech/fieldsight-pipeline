@@ -2626,10 +2626,15 @@ Resources:
             FunctionName: !Ref RagSearchFunction
         - LambdaInvokePolicy:
             FunctionName: !Ref VoiceAuditFunction
+        # Exact ARN, not LambdaInvokePolicy: that grants `<name>*`, which also
+        # matches fieldsight-<env>-check-gaps-db (the DB hop is CheckGaps' only).
         - !If
           - ShouldCheckDoneGaps
-          - LambdaInvokePolicy:
-              FunctionName: !Ref CheckGapsFunction
+          - Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt CheckGapsFunction.Arn
           - !Ref AWS::NoValue
         # Turn store: prefix-scoped inside the existing data bucket (no new
         # bucket, no lifecycle rule). Spec section 4.
@@ -5353,8 +5358,11 @@ Resources:
           QWEN_MODEL: !Ref QwenModelFast
           LLM_REASONING_EFFORT: !Ref LlmReasoningEffortFast
       Policies:
-        - LambdaInvokePolicy:
-            FunctionName: !Ref CheckGapsDbFunction
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt CheckGapsDbFunction.Arn
         - Version: '2012-10-17'
           Statement:
             # Read-only. What lambda_extract_session's gather/assemble read for one

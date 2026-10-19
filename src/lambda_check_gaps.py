@@ -30,6 +30,20 @@ import llm_utils
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+
+class _NoAnnouncementText(logging.Filter):
+    """Drop lambda_extract_session's "Filtered N device announcement turn(s): [...]".
+
+    That line carries the removed turns' TEXT and is logged on the root logger,
+    which this function shares once assemble runs. This function logs no
+    transcript text (spec, Log line); every other line passes untouched."""
+
+    def filter(self, record):
+        return not str(record.msg).startswith("Filtered %d device announcement")
+
+
+logger.addFilter(_NoAnnouncementText())
+
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 CHECK_GAPS_DB_FUNCTION = os.environ.get("CHECK_GAPS_DB_FUNCTION", "")
 # The hop's Timeout is 10 s, but a cold VPC start runs its init (psycopg import,

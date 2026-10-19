@@ -144,3 +144,16 @@ def test_the_lambdas_remaining_time_bounds_the_run(monkeypatch):
     assert seen["budget_s"] == 20 - h.RETURN_RESERVE_S
     h.lambda_handler({"caller_sub": "s"}, None)
     assert seen["budget_s"] is None
+
+
+def test_the_removed_announcement_texts_never_reach_our_log(caplog):
+    # lambda_extract_session logs the TEXT of the device announcements it filters
+    # out, on the root logger (seen on TEST 2026-10-20). This function logs no
+    # transcript text, so that line is dropped here; its other lines still pass.
+    import logging
+    root = logging.getLogger()
+    with caplog.at_level(logging.INFO):
+        root.info("Filtered %d device announcement turn(s): %s", 2, ["Photo captured."])
+        root.info("check_gaps status=%s", "ok")
+    assert "Photo captured" not in caplog.text
+    assert "check_gaps status=ok" in caplog.text
