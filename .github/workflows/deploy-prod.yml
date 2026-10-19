@@ -317,6 +317,7 @@ jobs:
               "SearchIndexRead=${{ vars.PROD_SEARCH_INDEX_READ || 'report' }}" \
               "CompanySummaryServe=${{ vars.PROD_COMPANY_SUMMARY_SERVE || 'off' }}" \
               "TemplateDigitise=${{ vars.PROD_TEMPLATE_DIGITISE || 'false' }}" \
+              "CheckDoneGaps=${{ vars.PROD_CHECK_DONE_GAPS || 'false' }}" \
               "ProjectDocuments=${{ vars.PROD_PROJECT_DOCUMENTS || 'false' }}" \
               $PDF_LAYER_PARAM \
               "EnableUserDeletion=${{ vars.PROD_ENABLE_USER_DELETION || 'false' }}" \

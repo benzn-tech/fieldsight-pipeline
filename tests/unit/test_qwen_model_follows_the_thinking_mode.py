@@ -194,9 +194,12 @@ def test_the_ask_path_is_deliberately_left_out():
 
     This pins the ABSENCE, which is the half a reviewer forgets to pin. The
     device voice worker runs the same Ask code path asynchronously, so the same
-    rule applies to it."""
+    rule applies to it. CheckGapsFunction (check done, spec 2026-10-20) is the voice
+    worker's synchronous callee and always calls with enable_thinking=False, so the
+    same rule applies to it too."""
     fast = [b for b in _qwen_env_blocks() if b[0] == "QwenModelFast"]
-    assert len(fast) == 2, f"expected AskAgent and the voice worker, found {len(fast)}"
+    assert len(fast) == 3, (f"expected AskAgent, the voice worker and check-gaps, "
+                            f"found {len(fast)}")
     assert all(b[1] is None for b in fast), (
         "the Ask path must NOT carry QWEN_MODEL_NONTHINKING -- see the "
         "parameter Description in template.yaml")

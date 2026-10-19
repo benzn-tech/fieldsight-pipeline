@@ -318,6 +318,8 @@ IMPORTS_BUT_NEVER_WRITES = {
     "SessionActivityFunction": "imports helpers; calls none of the writers",
     "RecordingSegmentsFunction": "reads transcripts only; its own test forbids PutObject",
     "SpeakerEmbedFunction": "reads a raw window via batch_seal; never seals",
+    "CheckGapsFunction": ("reads transcripts via extract_session's gather/assemble; "
+                          "read-only by spec (check done 2026-10-20)"),
 }
 
 
