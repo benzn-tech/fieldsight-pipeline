@@ -198,3 +198,27 @@ def test_say_no_template_and_error_and_no_recording():
     assert cd.say_no_template("", []) == "I couldn't find a checklist set up for this check."
     assert cd.say_error() == "I couldn't check the list just now; it will be in today's report."
     assert "recording" in cd.say_no_recording()
+
+
+# ---- holes just below the covered index -----------------------------------------
+
+def test_covered_indices_list_every_chunk_a_stored_transcript_holds():
+    b = tkey(5, "_bn3_off0.4_to88.0_srcwav.json")
+    maps = {b: {"members": [{"chunk_index": 5}, {"chunk_index": 7}]}}
+    assert cd.covered_indices([tkey(0), tkey(2), b], maps) == {0, 2, 5, 7}
+    assert cd.covered_indices([tkey(9, "_bn2_off0.0_to50.0_srcwav.json")], {}) == {9, 10}
+
+
+def test_a_hole_just_below_the_covered_index_is_heard_too():
+    # c0005 and c0006 have no transcript yet (a batch still open, or a failed
+    # one) while c0007 has: they are not silence until we know it.
+    keys = [chunk(i) for i in range(9)]
+    chosen, skipped = cd.select_new_chunks(keys, SID, covered=7, covered_set={0, 1, 2, 3, 4, 7})
+    assert [cd.chunk_index(k) for k in chosen] == [5, 6, 8]
+    assert skipped == 0
+
+
+def test_only_the_last_few_indices_are_searched_for_holes():
+    keys = [chunk(i) for i in range(12)]
+    chosen, _ = cd.select_new_chunks(keys, SID, covered=10, covered_set={10})
+    assert [cd.chunk_index(k) for k in chosen] == [7, 8, 9, 11]

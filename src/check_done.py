@@ -69,6 +69,9 @@ KEY_MARGIN_MIN = 10
 # Evidence older than this before the press means the answer is "as of" then.
 STALE_S = 20
 SAY_MAX_ITEMS = 5
+# How many indices at and below the highest covered one are checked for a chunk
+# with no transcript yet (select_new_chunks).
+HOLE_WINDOW = 4
 CLAUSE_MAX_WORDS = 12
 
 # Not in inspection_match.GENERIC (they never appear in a template name, so
@@ -150,38 +153,52 @@ def chunk_index(key):
     return extract_chunk_index_from_filename((key or "").rsplit("/", 1)[-1])
 
 
-def last_covered_index(stored_keys, batch_maps):
-    """The highest chunk index any stored transcript covers, or None.
-
-    By index, not by presence: with DROP_SILENT_CHUNKS a silent chunk never gets
-    a transcript, so a hole below the highest index is silence, not a gap. A
-    batch covers every member in its map; a batch whose map is unreadable is
-    credited only with what its name proves (first index + count - 1), which can
-    make us hear a chunk twice but never skip one."""
-    best = None
+def covered_indices(stored_keys, batch_maps):
+    """Every chunk index a stored transcript covers. A batch covers every member
+    in its map; a batch whose map was not read is credited only with what its
+    name proves (first index .. first + count - 1), which can make us hear a
+    chunk twice but never skip one."""
+    out = set()
     for key in stored_keys or []:
         idx = chunk_index(key)
         if idx is None:
             continue
-        top = idx
+        out.add(idx)
         if batch_stitch.is_batch_key(key):
             members = ((batch_maps or {}).get(key) or {}).get("members") or []
             listed = [int(m["chunk_index"]) for m in members
                       if isinstance(m, dict) and m.get("chunk_index") is not None]
             if listed:
-                top = max(listed)
+                out.update(listed)
             else:
                 m = _BATCH_COUNT.search(key)
-                top = idx + max(int(m.group(1)), 1) - 1 if m else idx
-        best = top if best is None else max(best, top)
-    return best
+                out.update(range(idx, idx + max(int(m.group(1)), 1) if m else idx + 1))
+    return out
+
+
+def last_covered_index(stored_keys, batch_maps):
+    """The highest chunk index any stored transcript covers, or None.
+
+    By index, not by presence: with DROP_SILENT_CHUNKS a silent chunk never gets
+    a transcript, so a hole well below the highest index is silence, not a gap.
+    Holes in the last HOLE_WINDOW indices are the exception (select_new_chunks)."""
+    covered = covered_indices(stored_keys, batch_maps)
+    return max(covered) if covered else None
 
 
 # ---- which chunks still need hearing ----------------------------------------
 
-def select_new_chunks(audio_keys, session_id, covered):
-    """(chosen, skipped): this session's raw .wav chunks above `covered`, the
-    newest MAX_NEW_CHUNKS in index order, and how many older ones were left."""
+def select_new_chunks(audio_keys, session_id, covered, covered_set=None):
+    """(chosen, skipped): this session's raw .wav chunks above `covered`, plus any
+    in the last HOLE_WINDOW indices at or below it that no stored transcript
+    holds (`covered_set`); the newest MAX_NEW_CHUNKS in index order, and how many
+    older ones were left.
+
+    A hole just below the top is not yet known to be silence: transcripts land
+    out of order (a per-chunk transcript can beat a still-open batch over an
+    earlier chunk, and a failed batch leaves its chunks bare). Hearing a silent
+    chunk costs one empty STT call; skipping a spoken one costs an item reported
+    open that was covered. Deeper holes are old enough to be silence."""
     mine = []
     for key in audio_keys or []:
         name = key.rsplit("/", 1)[-1]
@@ -190,8 +207,13 @@ def select_new_chunks(audio_keys, session_id, covered):
         if extract_session_id_from_filename(name) != session_id:
             continue
         idx = extract_chunk_index_from_filename(name)
-        if idx is None or (covered is not None and idx <= covered):
+        if idx is None:
             continue
+        if covered is not None and idx <= covered:
+            hole = (covered_set is not None and idx > covered - HOLE_WINDOW
+                    and idx not in covered_set)
+            if not hole:
+                continue
         mine.append((idx, key))
     mine.sort()
     chosen = [k for _, k in mine[-MAX_NEW_CHUNKS:]]
@@ -476,7 +498,8 @@ def _answer(event, db_hop, s3, bucket, gather, assemble, stt, call_llm, now, tim
     stored_keys = []
     for date in dates:
         stored_keys.extend(gather(bucket, folder, date, "sid" + sid))
-    covered = last_covered_index(stored_keys, _batch_maps(s3, bucket, stored_keys))
+    covered_set = covered_indices(stored_keys, _batch_maps(s3, bucket, stored_keys))
+    covered = max(covered_set) if covered_set else None
     # The window is known before anything is read: the live window's start, else
     # LOOKBACK_MIN before the newest stored key (the window step below narrows it
     # again by the turns themselves).
@@ -488,7 +511,8 @@ def _answer(event, db_hop, s3, bucket, gather, assemble, stt, call_llm, now, tim
     if (session.get("kind") or "") == "video":
         partial = True                    # v1 hears audio chunks only (spec "Not in this spec")
     else:
-        chosen, skipped = select_new_chunks(_list_audio(s3, bucket, folder, dates), sid, covered)
+        chosen, skipped = select_new_chunks(_list_audio(s3, bucket, folder, dates), sid, covered,
+                                            covered_set)
         partial = skipped > 0
         if chosen and stt is None:
             partial, chosen = True, []    # no Ask key: never borrow the pipeline's

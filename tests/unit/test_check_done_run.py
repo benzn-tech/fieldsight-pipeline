@@ -221,6 +221,15 @@ def test_covered_until_is_the_last_heard_chunk_end_from_its_header():
     assert out["covered_until"] == calendar.timegm((2026, 10, 19, 21, 4, 59))
 
 
+def test_a_chunk_below_the_covered_index_with_no_transcript_is_heard():
+    w = World()
+    del w.s3.objects[tkey(1, "10-03-30")]
+    w.s3.objects[tkey(2, "10-04-00")] = b"{}"           # c0002 transcribed, c0001 not yet
+    w.stt_text[1] = "edge protection is not installed on the north side"
+    w.run()
+    assert w.heard == [1, 3]
+
+
 def test_a_failed_chunk_is_skipped_and_the_answer_is_partial():
     w = World()
     w.stt_text[3] = RuntimeError("HTTP 500")
