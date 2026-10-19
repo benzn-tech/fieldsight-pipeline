@@ -93,3 +93,14 @@ def test_importing_the_handler_does_not_import_the_extraction_module():
     out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, cwd=SRC)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "False"
+
+
+def test_the_clients_do_not_retry_behind_the_persons_back(monkeypatch):
+    # botocore legacy mode counts RETRIES: max_attempts 1 is two attempts. A
+    # retried DB hop is a second cold start the person waits for.
+    monkeypatch.setattr(h, "_lambda", None)
+    monkeypatch.setattr(h, "_s3", None)
+    lam, s3 = h._get_lambda()._client_config, h._get_s3()._client_config
+    assert lam.retries["total_max_attempts"] == 1
+    assert s3.retries["total_max_attempts"] <= 2
+    assert lam.read_timeout == h.DB_HOP_READ_TIMEOUT_S

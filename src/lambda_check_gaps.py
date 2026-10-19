@@ -32,6 +32,12 @@ logger.setLevel(logging.INFO)
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 CHECK_GAPS_DB_FUNCTION = os.environ.get("CHECK_GAPS_DB_FUNCTION", "")
+# The hop's Timeout is 10 s, but a cold VPC start runs its init (psycopg import,
+# ENI) BEFORE that clock starts, so 11 could cut a cold hop that would have
+# answered. 13 still leaves the gap pass its 12 s inside the 30 s run budget
+# (check_done.RUN_BUDGET_S) when the hop is warm, and a cold slow hop is the
+# case the budget then cuts, by name.
+DB_HOP_READ_TIMEOUT_S = 13
 
 _s3 = None
 _lambda = None
@@ -41,18 +47,22 @@ def _get_s3():
     global _s3
     if _s3 is None:
         # Bounded: a 30 s chunk is ~1 MB; a hung GET must not eat the STT phase.
+        # Legacy retry mode counts RETRIES, so 1 is two attempts at most: one
+        # retry on a transient 5xx, never a third.
         _s3 = boto3.client("s3", config=Config(connect_timeout=2, read_timeout=5,
-                                               retries={"max_attempts": 2}))
+                                               retries={"max_attempts": 1}))
     return _s3
 
 
 def _get_lambda():
     global _lambda
     if _lambda is None:
-        # Under the hop's own Timeout (10) plus a cold start's connect; one attempt,
-        # because a retried DB hop is a second cold start the person waits for.
-        _lambda = boto3.client("lambda", config=Config(connect_timeout=2, read_timeout=11,
-                                                       retries={"max_attempts": 1}))
+        # retries 0 (legacy mode counts retries: 1 would be two attempts), as
+        # lambda_fieldsight_api's ask clients: a retried DB hop is a second cold
+        # start the person waits for.
+        _lambda = boto3.client("lambda", config=Config(connect_timeout=2,
+                                                       read_timeout=DB_HOP_READ_TIMEOUT_S,
+                                                       retries={"max_attempts": 0}))
     return _lambda
 
 

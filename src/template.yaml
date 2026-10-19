@@ -5387,7 +5387,8 @@ Resources:
       FunctionName: !Sub ["${P}-check-gaps-db", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
       CodeUri: src/
       Handler: lambda_check_gaps_db.lambda_handler
-      # Under CheckGapsFunction's 11 s read timeout on this invoke.
+      # Under CheckGapsFunction's 13 s read timeout on this invoke (13, not 11: a cold
+      # VPC start's init runs before this Timeout's clock starts).
       Timeout: 10
       MemorySize: 256
       Layers:
