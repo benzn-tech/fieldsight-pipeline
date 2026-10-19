@@ -356,6 +356,47 @@ sends it):
 - With `n == 2`, both terms are required.
 - On the chosen day, rows below `k*` are dropped.
 
+### 8.1 Amendment A review (Fable, 2026-10-20), applied
+
+The review probed local PG 16 with 3,036 chunks over 92 days, where every chunk
+says "site".
+
+1. **SQL shape.** An OR prefilter that contains a generic term is not
+   GIN-served (the planner walked `idx_report_chunks_site_date`), and the n+1
+   `@@` evaluations recompute `to_tsvector` per row (282 ms). The fix:
+   - For `n ≥ 2`, the prefilter is the OR of the pairwise ANDs `(ti && tj)`
+     (at most 15 clauses at n = 6). This is exactly "coverage ≥ 2", so it equals
+     the floor and the GIN index serves it.
+   - For `n = 1`, the prefilter is the term itself.
+   - The candidate rows are computed in a `MATERIALIZED` CTE that selects the
+     lexical vector once as a column. Coverage is summed over that column.
+     Measured: 36 ms, with `to_tsvector` evaluated 6 times.
+   - The EXPLAIN test seeds a term that is present in most rows.
+2. **Rows kept.** On the chosen day, keep the rows whose coverage is at least
+   the highest coverage among the fetched rows, provided that is ≥ the floor.
+   The day search's keyword arm matches exact tokens only, so the `k*` chunk,
+   which may rest on a stem, can be missing from the 64 fetched rows.
+   `meta.subject_match = {"matched": <kept rows' coverage>, "of": n, "day_max": k*}`.
+   The result is `[]` with `no_match` only if no fetched row reaches the floor.
+3. **Duplicate terms.** `subject_terms` drops exact duplicates, keeping order,
+   before the cap of 6. Stem duplicates ("panel panels") are accepted.
+4. **n = 1** keeps a floor of 1. A question with a single generic subject word
+   ("latest on the site") picks the latest day naming that word. This is
+   accepted and stated here.
+5. **`subject_match` is for logs and diagnostics only.** The orchestrator
+   header does not render it (`ask_orchestrator.py:127-162`), and nothing
+   relies on it.
+6. **Tests added:**
+   - the n = 1 path;
+   - dedupe;
+   - a stem-only `k*` chunk on a crowded day, run through `lambda_rag_search`;
+   - the `k*` chunk absent from the 64 fetched rows (finding 2);
+   - EXPLAIN with a generic term;
+   - the renamed recheck in `test_live_topic_predicate_everywhere`;
+   - a JSON round trip of the meta.
+
+   `latest_matching_date` returns `(day, k)` and the caller tests `is None`.
+
 ## 7. Review log (Fable, 2026-10-20)
 
 Applied:
