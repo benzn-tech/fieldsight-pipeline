@@ -1391,6 +1391,21 @@ Parameters:
       them. False (default) answers 404 on /sites/{id}/documents, which is the UI's only
       gate. Set per environment by TEST_PROJECT_DOCUMENTS / PROD_PROJECT_DOCUMENTS.
 
+  # Check done (spec 2026-10-20-check-done-gaps-design, step A). Pinned by
+  # tests/unit/test_check_gaps_template.py: this Parameter -> ShouldCheckDoneGaps ->
+  # CheckGapsFunction + CheckGapsDbFunction, and the Ask worker's CHECK_GAPS_FUNCTION
+  # env + invoke grant, both !If-guarded (the flag defaults off, so an unguarded Ref
+  # would name a resource that does not exist).
+  CheckDoneGaps:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      When true, the stack has the "check done" gap pass (CheckGapsFunction, its in-VPC
+      DB hop) and the Ask voice worker is told its name. False (default) creates
+      neither and the worker sees an empty CHECK_GAPS_FUNCTION. Set per environment by
+      TEST_CHECK_DONE_GAPS / PROD_CHECK_DONE_GAPS.
+
   VoiceprintMaxFrameSpread:
     Type: String
     Default: 'default'
@@ -1601,6 +1616,9 @@ Conditions:
   HasPgDatabaseOverride: !Not [!Equals [!Ref PgDatabase, ""]]
   HasOrgApi: !And [!Condition HasDb, !Condition HasOrgPool]
   HasSiteVoice: !And [!Condition HasOrgApi, !Equals [!Ref EnableSiteVoice, 'true']]
+  # The DB hop needs the DB stack and PsycopgLayer (both HasDb), so the flag alone
+  # is not enough -- the HasSiteVoice shape.
+  ShouldCheckDoneGaps: !And [!Condition HasDb, !Equals [!Ref CheckDoneGaps, 'true']]
   # video-keyframe plan: the KeyframeFunction needs Aurora (HasDb) for the
   # topic_photos bind AND a runtime-agnostic ffmpeg layer (HasKeyframeFfmpegLayer,
   # the sitesync-vad-layer with CompatibleRuntimes [3.11, 3.12]) for the static
@@ -2596,6 +2614,11 @@ Resources:
           ASK_JUDGE_FALLBACKS: !Ref AskJudgeFallbacks
           ASK_JUDGE_PROVIDER: !Ref AskJudgeProvider
           ASK_JUDGE_REASONING: !Ref AskJudgeReasoning
+          # Check done (spec 2026-10-20): the gap pass the worker invokes on a
+          # "<check> done" ask. Empty when the flag is off -- the Ask line treats
+          # that as `error`. NOT the RagSearch W1001 shape: that one survives only
+          # because HasDb is always true, and this flag defaults to false.
+          CHECK_GAPS_FUNCTION: !If [ShouldCheckDoneGaps, !Ref CheckGapsFunction, '']
       Layers:
         - !Ref DashScopeLayer
       Policies:
@@ -2603,6 +2626,11 @@ Resources:
             FunctionName: !Ref RagSearchFunction
         - LambdaInvokePolicy:
             FunctionName: !Ref VoiceAuditFunction
+        - !If
+          - ShouldCheckDoneGaps
+          - LambdaInvokePolicy:
+              FunctionName: !Ref CheckGapsFunction
+          - !Ref AWS::NoValue
         # Turn store: prefix-scoped inside the existing data bucket (no new
         # bucket, no lifecycle rule). Spec section 4.
         - Version: '2012-10-17'
@@ -5275,6 +5303,108 @@ Resources:
           # report (default) | session: which chunk family Ask/Search read.
           SEARCH_INDEX_READ: !Ref SearchIndexRead
           PROJECT_DOCUMENTS: !Ref ProjectDocuments   # spec 2026-10-16 project documents
+      Policies:
+        - VPCAccessPolicy: {}
+
+  # ----------------------------------------------------------
+  # Check done (spec 2026-10-20-check-done-gaps-design, step A): "pre-pour check
+  # done" on the device -> the items still open, said aloud while he is still at
+  # the pour. Invoked synchronously by AskVoiceWorkerFunction only; no API route,
+  # no Events. The AskAgent -> RagSearch split again: CheckGapsFunction is outside
+  # the VPC (S3, the Ask STT key, the model) and asks CheckGapsDbFunction (in the
+  # VPC, Aurora only, no egress) for the caller, his live session, the templates
+  # and the session's live check windows. Both read-only.
+  #
+  # Timeouts: worker 60 > CheckGaps 35 > DB hop 10 (SYNC_CALLEES in
+  # test_template_timeout_invariants.py). Inside the 35: DB hop ~1 s, STT phase
+  # bounded at 14 s in code, the gap pass at 12 s (LLM_HTTP_TIMEOUT below).
+  # ----------------------------------------------------------
+  CheckGapsFunction:
+    Type: AWS::Serverless::Function
+    Condition: ShouldCheckDoneGaps
+    Properties:
+      FunctionName: !Sub ["${P}-check-gaps", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_check_gaps.lambda_handler
+      Timeout: 35
+      # Up to eight ~1 MB chunks held at once while they are heard in parallel.
+      MemorySize: 512
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref IngestBucketName      # the lake: transcripts/ and users/*/audio/
+          CHECK_GAPS_DB_FUNCTION: !Ref CheckGapsDbFunction
+          # The Ask STT key, never the recording pipeline's ELEVENLABS_API_KEY: up to
+          # eight parallel posts per ask, and that key's credits running out would
+          # stop recordings. No key -> stored transcript only, answer `partial`.
+          ELEVENLABS_ASK_API_KEY: !Ref ElevenLabsAskApiKey
+          ELEVENLABS_STT_MODEL: !Ref ElevenLabsSttModel
+          ELEVENLABS_LANGUAGE: !Ref ElevenLabsLanguage
+          # The Ask worker's fast model (copied, not a new choice). The gap pass
+          # asks for deadline=12 and no thinking; these keep the chain under the
+          # 35 s Timeout even if that deadline were dropped.
+          LLM_HTTP_TIMEOUT: '12'
+          LLM_CHAIN_BUDGET_SECONDS: '14'
+          ANTHROPIC_API_KEY: !Ref ClaudeApiKey
+          CLAUDE_MODEL: claude-haiku-4-5-20251001
+          LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
+          QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
+          QWEN_BASE_URL: !Ref QwenBaseUrl
+          QWEN_MODEL: !Ref QwenModelFast
+          LLM_REASONING_EFFORT: !Ref LlmReasoningEffortFast
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CheckGapsDbFunction
+        - Version: '2012-10-17'
+          Statement:
+            # Read-only. What lambda_extract_session's gather/assemble read for one
+            # session (transcripts/, the agent-answer sidecars under voice_ask/ and
+            # the batch map under audio_segments/), plus the device's raw chunks.
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/audio_segments/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/users/*/audio/*
+            # agent_turn_filter RAISES on an unreadable voice_ask/ listing (a 403 that
+            # means "absent" must not look like "none"), so without this every ask on
+            # a day with no Ask answers would fail. Same trap for the other two.
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - transcripts/*
+                    - voice_ask/*
+                    - users/*/audio/*
+
+  CheckGapsDbFunction:
+    Type: AWS::Serverless::Function
+    Condition: ShouldCheckDoneGaps
+    Properties:
+      FunctionName: !Sub ["${P}-check-gaps-db", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_check_gaps_db.lambda_handler
+      # Under CheckGapsFunction's 11 s read timeout on this invoke.
+      Timeout: 10
+      MemorySize: 256
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          # Deploy-time credential injection — see MigrateFunction notes.
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
       Policies:
         - VPCAccessPolicy: {}
 
