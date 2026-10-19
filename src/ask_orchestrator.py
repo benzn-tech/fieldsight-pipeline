@@ -702,6 +702,10 @@ UNKNOWN_TOOL = "unknown_tool"
 MAX_BAD_ROUNDS = 2
 FALLBACK_MAX_CHUNKS = 12
 NO_RECORDS = "No relevant records found for this question."
+# Spec 2026-10-19-ask-explicit-web-failure §3: the caller asked for the web and
+# the web step failed. Model-free: said instead of "not in your records".
+WEB_UNREACHABLE = "I couldn't search the web just now."
+WEB_TRY_AGAIN = "Please try again in a moment."
 
 # A test seam for the deadline arithmetic; production is time.monotonic.
 _clock = time.monotonic
@@ -995,6 +999,34 @@ class _Turn:
         return out
 
 
+def _web_failed_answer(t, text, has_records):
+    """(text, records kept). Spec 2026-10-19 §3: a records answer keeps its place
+    behind WEB_UNREACHABLE; with none, or when voice cannot speak the join even
+    shortened to two sentences, only the two fixed sentences are said."""
+    alone = WEB_UNREACHABLE + " " + WEB_TRY_AGAIN
+    body = (text or "").strip()
+    if not has_records or not body:
+        return alone, False
+    if not t.voice:
+        return WEB_UNREACHABLE + "\n\n" + body, True
+    import lambda_ask_agent as laa
+    import voice_web
+    body = laa._VOICE_CITATION.sub("", body).strip()
+    head = " ".join(s.strip() for s in laa._SENTENCE.findall(body)[:2])
+    for cand in (body, head):
+        joined = WEB_UNREACHABLE + " " + cand if cand else ""
+        if joined and voice_web.speakable(joined):
+            return joined, True
+    return alone, False
+
+
+def _web_failed_extra(t):
+    """The screen's "Web check unavailable" line (fieldsight-ui webStatusLine)."""
+    if t.voice:
+        return {}
+    return {"web": {"status": "unverified", "answer": "", "sources": []}}
+
+
 def _fallback(t, reason, shown):
     """Spec §6.8: the legacy records synthesis over the records evidence, else
     the honest no-records answer. Never web-only."""
@@ -1020,6 +1052,12 @@ def _fallback(t, reason, shown):
             cards = laa._build_citations(chunks)
             for card, it in zip(cards, items):
                 card["time_start"] = card.get("time_start") or it.get("time_start")
+            if getattr(t, "web_failed", None):
+                answer, kept = _web_failed_answer(t, answer, True)
+                if not kept:
+                    return t.result(answer, [], grounded=False,
+                                    extra=_web_failed_extra(t), cited=())
+                return t.result(answer, cards, extra=_web_failed_extra(t), cited=items)
             return t.result(answer, cards, cited=items)
         # Records exist but could not be written up: saying "no records" would
         # be false, so the turn ends as an error (the worker writes `error`).
@@ -1027,6 +1065,9 @@ def _fallback(t, reason, shown):
         return {"answer": "", "error": "No answer", "citations": [],
                 "applied_scope": t.applied_scope,
                 "asked": t.asked if t.rewritten else None}
+    if getattr(t, "web_failed", None):
+        text, _ = _web_failed_answer(t, "", False)
+        return t.result(text, [], grounded=False, extra=_web_failed_extra(t), cited=())
     text = NO_RECORDS
     day = _latest_before(shown)
     if day:
@@ -1212,7 +1253,7 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
     t = _Turn(question=question, asked=asked, rewritten=rewritten, today=today,
               date_from=date_from, date_to=date_to, applied_scope=applied_scope,
               voice=voice, pol=pol, deadline=deadline, route=route, web_env=None,
-              round1b_day=None, web_question=web_question)
+              round1b_day=None, web_question=web_question, web_failed=None)
 
     # ---- round 1 (spec §6.3)
     states("searching_records")
@@ -1237,6 +1278,10 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
     t.web_env = web_env if web_env and web_env.get("items") else None
     if web_env is not None:
         route["web_ran"] = True
+        wmeta = web_env.get("meta") or {}
+        if pol == "required" and wmeta.get("status") == "failed":
+            t.web_failed = wmeta.get("error") or "upstream"
+            route["web_failed"] = t.web_failed
     shown = list(batches[0])
 
     # ---- judge loop (spec §6.4)
@@ -1340,6 +1385,11 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
         # "Records don't cover that" must not ship with record cards beside it
         # (spec 2026-10-16 section 3: the offer row has no citations).
         return t.result(text, [], grounded=False, extra=extra, cited=())
+    if t.web_failed:
+        text, kept = _web_failed_answer(t, text, bool(out["refs_r"]))
+        extra.update(_web_failed_extra(t))
+        if not kept:
+            return t.result(text, [], grounded=False, extra=extra, cited=())
     cited_refs = _cited_card_refs(fin["answer"], shown)
     cited = [it for it in _card_items(shown) if it.get("ref") in cited_refs]
     # Spec §6.7: grounded means an R ref was cited.
