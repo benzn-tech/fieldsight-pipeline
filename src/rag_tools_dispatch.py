@@ -18,14 +18,13 @@ from __future__ import annotations
 import json
 import logging
 import math
-import os
 import time
 from datetime import date, datetime, timedelta, timezone
 
 import ask_tools_log
 import project_doc_flag
 import text_normalize
-from lexical_terms import or_query, query_terms
+from lexical_terms import subject_terms
 from repositories import aliases, chunks, sites, topics, users
 
 logger = logging.getLogger()
@@ -37,14 +36,16 @@ MAX_DEADLINE_S = 20.0
 # truncation signal.
 DAY_LIMIT = 60
 DEFAULT_K = 8
-# latest_activity(query): the gate chose the day; search that day this wide so a
-# matching chunk ranked below k*2 is not lost to the gate filter (_search's own
-# ceiling is 64).
+# latest_activity(query): the subject words chose the day; search that day this
+# wide so a chunk naming them ranked below k*2 is not lost to the coverage filter
+# (_search's own ceiling is 64).
 LATEST_DAY_SEARCH_K = 64
-# latest_activity(query) runs an exact scan over its window (no HNSW). The deadline
-# governs call START only, so one started late can outrun RagSearchFunction's 23 s
-# Timeout -- and a Lambda timeout loses the WHOLE batch, not one call. Refuse to
-# start it with less than this many seconds left (final review M8).
+# latest_activity(query) runs a day query (served by the GIN text index) AND a full
+# search of the chosen day. The deadline governs call START only, so one started
+# late can outrun RagSearchFunction's 23 s Timeout -- and a Lambda timeout loses
+# the WHOLE batch, not one call. The guard now covers the day search, which costs
+# as much as any search. Refuse to start it with less than this many seconds left
+# (final review M8).
 LATEST_QUERY_MIN_START_S = 5.0
 # A search never fetches more than this (rag-search's own list clamp).
 MAX_SEARCH_K = 64
@@ -261,44 +262,65 @@ def _search_records(conn, caller, sc, a, meta, call, search_fn, source_family, *
 
 
 def _latest_activity(conn, caller, sc, a, meta, call, search_fn, source_family, **_):
-    site_id = _resolve_site(conn, sc, a.get("site"), meta)
-    user_id = _resolve_person(conn, caller, sc, a.get("person"), meta)
     upto = a.get("on_or_before") or _open_upper_bound()
     if not a.get("query"):
+        site_id = _resolve_site(conn, sc, a.get("site"), meta)
+        user_id = _resolve_person(conn, caller, sc, a.get("person"), meta)
         kw = dict(author_ids=sc["author_ids"], site_id=site_id, user_id=user_id)
         day = topics.latest_visible_topic_date(conn, sc["site_ids"], _day_after(upto), **kw)
         if not day:
             meta["empty_reason"] = _empty_reason(sc)
             return []
         return _overview(conn, caller, sc, day, day, kw, meta)
+    # A missing embedding is the orchestrator's contract break: bad_args, checked
+    # before the subject so it is never reported as "no match".
     _need_embedding(call, meta)
-    gate = float(os.environ.get("ASK_TOOLS_MATCH_GATE", "0.55"))
-    site_ids, author_ids = _narrowed(sc, site_id, user_id)
-    # Fail closed BEFORE the scan if _search could not narrow to this person; the
-    # folder resolved here is the one the day's search uses (resolved once).
-    folder = _search_author_folder(conn, caller, sc, user_id, meta) if user_id else None
-    # ONE keyword query for choosing the day and for keeping its rows -- the same
-    # value _search binds for its own keyword arm.
-    q_text = or_query(query_terms(a["query"]))
-    day = chunks.latest_matching_date(
-        conn, call.get("query_embedding"), site_ids, on_or_before=upto, gate=gate,
-        query_text=q_text, author_ids=author_ids, source_family=source_family)
-    if not day:
+    # The day must name the subject (spec 2026-10-20): as many subject words as
+    # any chunk names (§8, coverage first -- round 1 sends the raw question), each
+    # stemmed or exact. A question with none (only asking words, or purely
+    # Chinese) is no_match without any SQL -- the judge falls back to search_records.
+    terms = subject_terms(a["query"])
+    if not terms:
         meta["empty_reason"] = _no_match(sc)
         return []
+    site_id = _resolve_site(conn, sc, a.get("site"), meta)
+    user_id = _resolve_person(conn, caller, sc, a.get("person"), meta)
+    site_ids, author_ids = _narrowed(sc, site_id, user_id)
+    # Fail closed BEFORE the day query if _search could not narrow to this person;
+    # the folder resolved here is the one the day's search uses (resolved once).
+    folder = _search_author_folder(conn, caller, sc, user_id, meta) if user_id else None
+    picked = chunks.latest_matching_date(
+        conn, site_ids, on_or_before=upto, subject_terms=terms,
+        author_ids=author_ids, source_family=source_family)
+    if picked is None:
+        meta["empty_reason"] = _no_match(sc)
+        return []
+    day, k_star = picked
     meta["matched_date"] = day
-    rows = _run_search(conn, caller, sc, dict(a, date_from=day, date_to=day), call,
+    # Search that day with the subject words only, not the whole question: the
+    # keyword arm takes its top 64 by ts_rank of an OR over the question's terms,
+    # and fed "last"/"time"/"talk" a long day's chatter can outrank the one chunk
+    # that names the subject (spec 2026-10-20 §3.3). The vector arm still ranks
+    # by the question's embedding.
+    rows = _run_search(conn, caller, sc,
+                       dict(a, query=" ".join(terms), date_from=day, date_to=day), call,
                        search_fn, site_id, user_id, meta, search_k=LATEST_DAY_SEARCH_K,
                        author_folder=folder)
-    # The day was chosen by "distance <= gate OR keyword match"; keep that day's
-    # rows by the same rule. `lexical_hit` cannot decide the keyword half: it means
-    # "found ONLY by the keyword arm", and a small day's matching chunk arrives as
-    # its vector copy (lexical_hit=False). So re-check the text in SQL with the
-    # exact expression that chose the day. Then as many as an ordinary search
-    # returns for ask_tools' post-search.
-    matched = chunks.keyword_matched_ids(conn, [r.get("id") for r in rows], q_text)
-    rows = [r for r in rows if str(r.get("id")).lower() in matched
-            or (r.get("distance") is not None and r["distance"] <= gate)]
+    # Keep the fetched rows at the highest fetched coverage, by the SAME coverage
+    # expression that chose the day; a row near only by distance is dropped.
+    # `lexical_hit` cannot decide this: it means "found ONLY by the keyword arm",
+    # and a small day's matching chunk arrives as its vector copy. The tier is the
+    # FETCHED maximum, not k*: the keyword arm matches exact tokens only, so a k*
+    # chunk resting on a stem can be missing from the 64 (§8.1 item 2). Below the
+    # floor nothing is kept. Then as many as an ordinary search returns for
+    # ask_tools' post-search. subject_match is for logs/diagnostics only (§8.1
+    # item 5): the orchestrator header does not render it.
+    cover = chunks.subject_coverage(conn, [r.get("id") for r in rows], terms)
+    k_fetched = max(cover.values(), default=0)
+    meta["subject_match"] = {"matched": k_fetched, "of": len(terms), "day_max": k_star}
+    if k_fetched < chunks.subject_floor(len(terms)):
+        rows = []
+    rows = [r for r in rows if cover.get(str(r.get("id")).lower(), 0) >= k_fetched]
     rows = rows[:_candidate_pool(call, a)]
     if not rows:
         meta["empty_reason"] = _no_match(sc)

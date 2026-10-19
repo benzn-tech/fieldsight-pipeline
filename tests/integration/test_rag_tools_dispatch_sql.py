@@ -213,16 +213,16 @@ def test_a_sql_error_in_one_call_does_not_abort_the_next(db, world, monkeypatch)
     assert "error" not in res[2]["meta"]
 
 
-# ---- final review I1: the keyword-chosen day keeps its keyword rows ----
+# ---- latest_activity(query): the chosen day names the subject (spec 2026-10-20) ----
 
-ORTHO = [0.0, 1.0] + [0.0] * 1022     # cosine distance 1.0 from UNIT: far past the gate
+ORTHO = [0.0, 1.0] + [0.0] * 1022     # cosine distance 1.0 from UNIT: as far as it gets
 
 
-def test_latest_activity_keeps_the_keyword_rows_that_chose_the_day(db, world):
-    """latest_matching_date accepts a day on a keyword hit alone. On a small day
-    every chunk is in the vector top-k, so the keyword-matched chunk arrives from
-    _search as the vector copy (lexical_hit=False) at distance 1.0. The filter must
-    keep it because its TEXT matches, and drop the same day's unrelated far chunk."""
+def test_latest_activity_keeps_the_rows_that_name_the_subject(db, world):
+    """On a small day every chunk is in the vector top-k, so the chunk naming the
+    subject arrives from _search as the vector copy (lexical_hit=False) at
+    distance 1.0. The filter must keep it because its TEXT names the subject, and
+    drop the same day's unrelated chunk."""
     w = world
     key = "reports/2026-10-12/WorkerA/daily_report.json"
     topics.upsert_topic(db, w["sa"]["id"], "2026-10-12", "Day", user_id=w["wa"]["id"],
@@ -239,18 +239,124 @@ def test_latest_activity_keeps_the_keyword_rows_that_chose_the_day(db, world):
     assert "empty_reason" not in meta and "error" not in meta
 
 
-def test_latest_activity_keeps_rows_within_the_gate_without_the_keyword(db, world):
-    """The other half of the rule: a chunk near the query embedding is kept although
-    its text has no query term; a far chunk without the term is still dropped."""
+def test_latest_activity_does_not_choose_a_near_day_without_the_words(db, world):
+    """The distance gate is gone from day choice: a LATER day whose chunk is as
+    near the query embedding as it gets, but does not name the subject, is not
+    chosen; the earlier day that names it is, and only its naming row is kept."""
     w = world
-    key = "reports/2026-10-12/WorkerA/daily_report.json"
-    topics.upsert_topic(db, w["sa"]["id"], "2026-10-12", "Day", user_id=w["wa"]["id"],
-                        source_s3_key=key)
-    for text, emb in (("formwork stripped on level one", ORTHO),
-                      ("concrete pour on level three", UNIT)):
-        chunks.insert_chunk(db, w["sa"]["id"], "2026-10-12", "topic", text, emb,
+    for day, text, emb in (("2026-10-13", "formwork stripped on level one", ORTHO),
+                           ("2026-10-12", "scaffolding inspection on level two", UNIT),
+                           ("2026-10-12", "concrete pour on level three", ORTHO)):
+        key = f"reports/{day}/WorkerA/daily_report.json"
+        topics.upsert_topic(db, w["sa"]["id"], day, "Day", user_id=w["wa"]["id"],
+                            source_s3_key=key)
+        chunks.insert_chunk(db, w["sa"]["id"], day, "topic", text, emb,
                             user_id=w["wa"]["id"], source_s3_key=key)
     res = _tools([{"id": "1", "name": "latest_activity", "query_embedding": ORTHO,
                    "args": {"query": "scaffolding", "on_or_before": D}}])
-    assert [r["chunk_text"] for r in res[0]["rows"]] == ["formwork stripped on level one"]
+    assert [r["chunk_text"] for r in res[0]["rows"]] == ["scaffolding inspection on level two"]
     assert res[0]["meta"]["matched_date"] == "2026-10-12"
+
+
+def test_naming_chunk_survives_a_crowded_day(db, world):
+    """Spec 2026-10-20 §3.3: the day's search gets the subject words only. Fed the
+    whole question, its keyword arm ORs "last or discuss or precast or panels" and
+    takes the top 64 by ts_rank, so 70 chunks of chatter that say "last" and
+    "discuss" over and over -- also the nearest by embedding -- outrank the one
+    chunk that names the subject in both arms and push it out."""
+    w = world
+    day = "2026-10-12"
+    key = f"reports/{day}/WorkerA/daily_report.json"
+    topics.upsert_topic(db, w["sa"]["id"], day, "Day", user_id=w["wa"]["id"],
+                        source_s3_key=key)
+    for _ in range(70):
+        chunks.insert_chunk(db, w["sa"]["id"], day, "topic",
+                            "last time we said we would discuss it, discuss it at the last meeting", UNIT,
+                            user_id=w["wa"]["id"], source_s3_key=key)
+    chunks.insert_chunk(db, w["sa"]["id"], day, "topic", "precast panels arrive Friday",
+                        ORTHO, user_id=w["wa"]["id"], source_s3_key=key)
+    res = _tools([{"id": "1", "name": "latest_activity", "query_embedding": UNIT,
+                   "args": {"query": "when did we last discuss the precast panels",
+                            "on_or_before": D}}])
+    assert [r["chunk_text"] for r in res[0]["rows"]] == ["precast panels arrive Friday"]
+    assert res[0]["meta"]["matched_date"] == day
+
+
+# ---- Amendment A (spec 2026-10-20 §8 / §8.1): round-1-shaped full questions ----
+
+FIVE_Q = "When did we last pour concrete for the B2 slab on level 2?"   # 5 subject words
+
+
+def _seed(db, w, day, text, emb=UNIT):
+    key = f"reports/{day}/WorkerA/daily_report.json"
+    topics.upsert_topic(db, w["sa"]["id"], day, "Day", user_id=w["wa"]["id"],
+                        source_s3_key=key)
+    chunks.insert_chunk(db, w["sa"]["id"], day, "topic", text, emb,
+                        user_id=w["wa"]["id"], source_s3_key=key)
+
+
+def _round1(question, emb=UNIT):
+    """Exactly what ask_orchestrator.round1_calls sends for a "when did we last"
+    question scoped to a site and a person: the RAW question as `query`."""
+    import ask_orchestrator
+    calls = ask_orchestrator.round1_calls(question, None, None,
+                                          {"site": "Alpha", "person": "WorkerA"})
+    assert [c["name"] for c in calls] == ["latest_activity"]
+    assert calls[0]["args"] == {"query": question, "site": "Alpha", "person": "WorkerA"}
+    res = _tools([dict(calls[0], id="1", query_embedding=emb)])
+    return res[0]["rows"], res[0]["meta"]
+
+
+def test_round1_full_question_finds_the_four_of_five_day(db, world):
+    w = world
+    _seed(db, w, "2026-10-12", "pour concrete for the B2 slab")
+    _seed(db, w, "2026-10-13", "concrete on level 3")
+    _seed(db, w, "2026-10-14", "general site chatter today")
+    rows, meta = _round1(FIVE_Q)
+    assert [r["chunk_text"] for r in rows] == ["pour concrete for the B2 slab"]
+    assert meta["matched_date"] == "2026-10-12"
+    assert meta["subject_match"] == {"matched": 4, "of": 5, "day_max": 4}
+    assert "empty_reason" not in meta and "error" not in meta
+
+
+def test_round1_older_full_day_beats_newer_partial_day(db, world):
+    w = world
+    _seed(db, w, "2026-10-10", "pour concrete for the B2 slab on level 2")
+    _seed(db, w, "2026-10-13", "pour concrete for the B2 slab")
+    rows, meta = _round1(FIVE_Q)
+    assert [r["chunk_text"] for r in rows] == ["pour concrete for the B2 slab on level 2"]
+    assert meta["matched_date"] == "2026-10-10"
+    assert meta["subject_match"] == {"matched": 5, "of": 5, "day_max": 5}
+
+
+def test_round1_single_word_hits_are_no_match(db, world):
+    w = world
+    _seed(db, w, "2026-10-12", "concrete delivered")
+    _seed(db, w, "2026-10-13", "the slab looked fine")
+    rows, meta = _round1(FIVE_Q)
+    assert rows == [] and meta["empty_reason"] == "no_match"
+    assert "matched_date" not in meta
+
+
+def test_round1_rows_below_the_day_maximum_are_dropped(db, world):
+    w = world
+    for text in ("pour concrete for the B2 slab", "concrete pour later", "B2 slab level check"):
+        _seed(db, w, "2026-10-12", text)
+    rows, meta = _round1(FIVE_Q)
+    assert [r["chunk_text"] for r in rows] == ["pour concrete for the B2 slab"]
+    assert meta["subject_match"] == {"matched": 4, "of": 5, "day_max": 4}
+
+
+def test_round1_stem_only_k_star_chunk_on_a_crowded_day_keeps_the_next_tier(db, world):
+    """§8.1 item 2. The 3/3 chunk names every word only through english stems
+    ("precasts panel cranes"), so the day search's keyword arm (exact tokens) never
+    fetches it, and 70 nearer 2/3 chunks fill its vector arm. The fetched 2/3 tier
+    is kept, and day_max says a better chunk exists on that day."""
+    w = world
+    for _ in range(70):
+        _seed(db, w, "2026-10-12", "precast panels stacked by the gate")
+    _seed(db, w, "2026-10-12", "precasts panel cranes", ORTHO)
+    rows, meta = _round1("when did we last discuss the precast panels crane")
+    assert rows and {r["chunk_text"] for r in rows} == {"precast panels stacked by the gate"}
+    assert meta["matched_date"] == "2026-10-12"
+    assert meta["subject_match"] == {"matched": 2, "of": 3, "day_max": 3}

@@ -151,3 +151,12 @@ def test_the_model_is_told_to_resolve_spoken_dates_itself():
     assert SPOKEN_HINT in props["date_from"]["description"]
     latest = by_name["latest_activity"]["parameters"]["properties"]
     assert SPOKEN_HINT in latest["on_or_before"]["description"]
+
+
+def test_latest_activity_description_asks_for_a_short_subject():
+    """latest_activity(query) picks the day naming the MOST words of `query`
+    (spec 2026-10-20 §8, coverage first): a short subject keeps generic words
+    from deciding it, so the model is still asked for one to three words."""
+    desc = {t["name"]: t for t in ask_tools.offered_tools()}["latest_activity"]["description"]
+    assert "most words" in desc and "one to three words" in desc
+    assert "every word" not in desc

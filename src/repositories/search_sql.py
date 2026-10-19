@@ -244,41 +244,116 @@ def build_latest_date_sql() -> str:
     )
 
 
-def build_latest_match_date_sql() -> str:
-    """The most recent day with a visible chunk NEAR a query (Ask tools,
-    spec 2026-10-15 §3.1 item 3, `latest_activity` with a query).
+def subject_term_query(i: int) -> str:
+    """Subject word i, matching its english stem OR its exact token (Ask tools,
+    spec 2026-10-20 §3.2, `latest_activity` with a query). Every subject builder
+    below is made of these, so a "match" means one thing everywhere.
+
+    Parameter %(st{i})s, one `lexical_terms.subject_terms` word (bind them with
+    subject_params). Those words are [a-z0-9]+, so to_tsquery's operator syntax
+    cannot be injected through them.
+
+    A fold PER TERM, not `websearch_to_tsquery('english', all) ||
+    websearch_to_tsquery('simple', all)`: that ORs two whole AND-queries, and the
+    english half drops english stopwords -- 'crane' | 'don' & 'crane' matched
+    "the crane arrived" for the subject "don crane". Here to_tsquery('english',
+    'don') is empty, so that term reduces to the simple 'don'.
+      * english half: stems (scaffolding ~ scaffold, panels ~ panel);
+      * simple half: exact tokens, incl. what the english parser splits
+        differently ("RFI-108": english 'rfi' '-108', simple '108').
+    Spacing variants ("rfi108" vs "RFI 108") match neither half: a stated miss.
+    """
+    return f"(to_tsquery('english', %(st{i})s) || to_tsquery('simple', %(st{i})s))"
+
+
+def subject_params(terms) -> dict:
+    """The %(st*)s bindings for subject_term_query(0..len(terms)-1)."""
+    return {f"st{i}": t for i, t in enumerate(terms)}
+
+
+def subject_floor(n: int) -> int:
+    """The least coverage that may choose a day or keep a row (spec 2026-10-20 §8):
+    min(2, n). With n <= 2 every term is required; with more, one generic word
+    alone never decides."""
+    return min(2, n)
+
+
+def _coverage(col: str, n: int) -> str:
+    """How many of the n subject words the tsvector column `col` matches."""
+    return "(" + " + ".join(
+        f"({col} @@ {subject_term_query(i)})::int" for i in range(n)) + ")"
+
+
+def _subject_prefilter(n: int) -> str:
+    """A tsquery true exactly when coverage >= subject_floor(n) (spec §8.1 item 1).
+
+    n >= 2: the OR of every pairwise AND (ti && tj), at most 15 pairs at n = 6.
+    An OR of the single terms would be "coverage >= 1", and with one generic term
+    in it ("site") the planner walked idx_report_chunks_site_date instead of the
+    GIN index; every pair here carries the other term too, so the index serves it.
+    n = 1: the term itself.
+    """
+    if n == 1:
+        return subject_term_query(0)
+    return "(" + " || ".join(
+        f"({subject_term_query(i)} && {subject_term_query(j)})"
+        for i in range(n) for j in range(i + 1, n)) + ")"
+
+
+def build_latest_match_date_sql(n: int) -> str:
+    """The day naming the subject best, most recent first (Ask tools, spec
+    2026-10-15 §3.1 item 3; 2026-10-20 §3.2 and Amendment A §8/§8.1,
+    `latest_activity` with a query). One row `report_date, k`, or none.
+
+    Coverage of a chunk = how many of the n subject words it matches. k* is the
+    highest coverage of any visible chunk in the window; the day is the latest
+    report_date with a chunk at k*; nothing below %(floor)s (subject_floor(n))
+    counts. Round 1 sends the raw question (4-6 subject words), so ALL of them
+    on one chunk is rare -- this is "AND over all, drop terms until a day
+    matches" done as one query. Trade-off (§8): an older day naming 5 words
+    beats a newer one naming 4.
 
     WHERE = the search's own scope (`_scope_predicate`, with date_from/date_to as
-    the bounded window) AND (vector arm OR keyword arm):
-      * vector: `(c.embedding <=> %(q)s::vector) <= %(gate)s` -- the distance gate
-        owned by the Ask tools (ASK_TOOLS_MATCH_GATE, default 0.55);
-      * keyword: the SAME expression and tsquery as build_search_sql's lex arm,
-        so "a keyword hit counts" means exactly what it means for search.
-    An exact scan over the window: the gate is a threshold, not a top-k, so HNSW
-    cannot serve it -- the window (date_from) is what bounds the cost.
+    the bounded window -- a date is a disclosure too) AND the prefilter, whose
+    left side is _lexical_vector unchanged, so the GIN expression index
+    (idx_report_chunks_tsv_multi_config) serves it. The candidates are
+    MATERIALIZED with the lexical vector selected once as a column, and coverage
+    is summed over that column: n + 1 `@@` against the expression would rebuild
+    to_tsvector per evaluation (measured 282 ms vs 36 ms, §8.1).
     """
+    if n < 1:
+        raise ValueError("build_latest_match_date_sql needs at least one term")
     return (
-        "SELECT max(c.report_date) AS latest "
-        "FROM report_chunks c "
-        "WHERE " + _scope_predicate("c") + " "
-        "AND ((c.embedding <=> %(q)s::vector) <= %(gate)s "
-        "OR (" + _lexical_vector("c") + ") @@ " + _LEXICAL_QUERY + ")"
+        "WITH cand AS MATERIALIZED ("
+        "  SELECT c.report_date, " + _lexical_vector("c") + " AS v "
+        "  FROM report_chunks c "
+        "  WHERE " + _scope_predicate("c") + " "
+        "  AND (" + _lexical_vector("c") + ") @@ " + _subject_prefilter(n) +
+        "), m AS ("
+        "  SELECT report_date, " + _coverage("v", n) + " AS k FROM cand"
+        ") "
+        "SELECT report_date, k FROM m "
+        "WHERE k >= %(floor)s "
+        "ORDER BY k DESC, report_date DESC LIMIT 1"
     )
 
 
-def build_keyword_recheck_sql() -> str:
-    """Which of the given chunk ids the keyword arm matches (Ask tools,
-    `latest_activity` with a query).
+def build_subject_coverage_sql(n: int) -> str:
+    """`id, k` for the given chunk ids: how many of the n subject words each
+    names (Ask tools, `latest_activity` with a query; bound %(ids)s plus
+    subject_params).
 
-    build_search_sql's `lexical_hit=True` means "found ONLY by the keyword arm"
-    (DISTINCT ON keeps the vector copy when both arms return a row), so it cannot
-    say whether a row's text matched. This re-check uses the SAME expression and
-    tsquery as the lex arm and build_latest_match_date_sql, so "keyword matched"
-    means here exactly what it meant when the day was chosen. Ids only: the rows
-    already passed the search's visibility predicate.
+    build_search_sql's rows say nothing about whether a row's text names the
+    subject: the day's search ranks by distance and by ts_rank of an OR list.
+    This uses the SAME coverage expression as build_latest_match_date_sql, so a
+    row's k means here exactly what it meant when the day was chosen. Ids only:
+    the rows already passed the search's visibility predicate.
     """
+    if n < 1:
+        raise ValueError("build_subject_coverage_sql needs at least one term")
     return (
-        "SELECT c.id FROM report_chunks c "
-        "WHERE c.id = ANY(%(ids)s::uuid[]) "
-        "AND (" + _lexical_vector("c") + ") @@ " + _LEXICAL_QUERY
+        "SELECT id, " + _coverage("v", n) + " AS k FROM ("
+        "  SELECT c.id, " + _lexical_vector("c") + " AS v "
+        "  FROM report_chunks c WHERE c.id = ANY(%(ids)s::uuid[])"
+        ") x"
     )
