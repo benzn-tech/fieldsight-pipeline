@@ -56,6 +56,10 @@ LLM_MAX_TOKENS = 4000
 # With no live window to start from, the model looks for the start of the
 # check in this much transcript before the newest evidence.
 LOOKBACK_MIN = 45
+# Stored keys older than the window by more than this are not assembled. A batch
+# is named for its first chunk and spans up to BatchMaxChunks (4) x 30 s, more
+# where it bridges a dropped chunk; ten minutes covers it with room to spare.
+KEY_MARGIN_MIN = 10
 # Evidence older than this before the press means the answer is "as of" then.
 STALE_S = 20
 SAY_MAX_ITEMS = 5
@@ -313,18 +317,39 @@ def _nz_dates(session, pressed_at):
 
 
 def _batch_maps(s3, bucket, keys):
-    """The map embedded in each batched transcript (batch_stitch.EMBEDDED_MAP_KEY).
-    Unreadable -> absent, and last_covered_index falls back to the name."""
-    maps = {}
-    for key in keys:
-        if not batch_stitch.is_batch_key(key):
-            continue
-        try:
-            doc = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
-            maps[key] = doc.get(batch_stitch.EMBEDDED_MAP_KEY) or {}
-        except Exception:                             # noqa: BLE001 -- see last_covered_index
-            logger.warning("check_gaps: batch map unreadable in %s", key)
-    return maps
+    """The map embedded in the NEWEST batched transcript (batch_stitch.EMBEDDED_MAP_KEY).
+
+    One GET, not one per batch: batches are sealed in order over disjoint chunk
+    ranges, so the batch whose first chunk is highest also holds the highest
+    member, and every older batch is below it whatever its map says. On a
+    three-hour recording that is one read instead of ninety. Unreadable -> absent,
+    and last_covered_index falls back to the name."""
+    batches = [k for k in keys if batch_stitch.is_batch_key(k) and chunk_index(k) is not None]
+    if not batches:
+        return {}
+    key = max(batches, key=chunk_index)
+    try:
+        doc = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+        return {key: doc.get(batch_stitch.EMBEDDED_MAP_KEY) or {}}
+    except Exception:                                 # noqa: BLE001 -- see last_covered_index
+        logger.warning("check_gaps: batch map unreadable in %s", key)
+        return {}
+
+
+def _recent_keys(keys, floor):
+    """The stored keys worth assembling: those starting at or after `floor` (an
+    NZ wall-clock datetime), less a margin so a batch straddling it is kept.
+
+    assemble reads one transcript per key, sequentially; a whole site day is too
+    many reads for a 35 s function. Only the window the prompt will use is
+    needed, and a superset of it costs nothing in correctness. Judged by the
+    filename's clock -- the device's, the same clock as the turns -- so a device
+    clock hours out (BUG-37) moves the anchor with it instead of dropping
+    everything. A key with no time in its name is kept."""
+    if floor is None:
+        return list(keys)
+    edge = floor - timedelta(minutes=KEY_MARGIN_MIN)
+    return [k for k in keys if chunk_start_local(k) is None or chunk_start_local(k) >= edge]
 
 
 def _list_audio(s3, bucket, folder, dates):
@@ -441,6 +466,13 @@ def _answer(event, db_hop, s3, bucket, gather, assemble, stt, call_llm, now, tim
     for date in dates:
         stored_keys.extend(gather(bucket, folder, date, "sid" + sid))
     covered = last_covered_index(stored_keys, _batch_maps(s3, bucket, stored_keys))
+    # The window is known before anything is read: the live window's start, else
+    # LOOKBACK_MIN before the newest stored key (the window step below narrows it
+    # again by the turns themselves).
+    start = _window_start(window, dates)
+    named = [chunk_start_local(k) for k in stored_keys if chunk_start_local(k)]
+    key_floor = start or (max(named) - timedelta(minutes=LOOKBACK_MIN) if named else None)
+    to_assemble = _recent_keys(stored_keys, key_floor)
     partial, chosen = False, []
     if (session.get("kind") or "") == "video":
         partial = True                    # v1 hears audio chunks only (spec "Not in this spec")
@@ -455,7 +487,7 @@ def _answer(event, db_hop, s3, bucket, gather, assemble, stt, call_llm, now, tim
         futures = [(k, pool.submit(_hear, s3, bucket, stt, k)) for k in chosen]
         stt_deadline = now() + STT_PHASE_S
     # The stored transcript is assembled while the chunks are being heard.
-    turns = assemble(bucket, stored_keys)[0] if stored_keys else []
+    turns = assemble(bucket, to_assemble)[0] if to_assemble else []
     heard = []
     for key, fut in futures:
         try:
@@ -478,7 +510,6 @@ def _answer(event, db_hop, s3, bucket, gather, assemble, stt, call_llm, now, tim
         partial = True
 
     # 4. Window: the live window's start, else the last LOOKBACK_MIN minutes.
-    start = _window_start(window, dates)
     times = [tr["abs_start"] for tr in turns if hasattr(tr.get("abs_start"), "strftime")]
     times += [chunk_start_local(k) for k, _, _ in heard if chunk_start_local(k)]
     floor = start or (max(times) - timedelta(minutes=LOOKBACK_MIN) if times else None)

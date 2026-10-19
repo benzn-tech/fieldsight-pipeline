@@ -309,6 +309,32 @@ def test_the_log_line_has_no_transcript_text(caplog):
     assert body["not_covered"] == 1 and body["failed"] == 1 and "ms" in body
 
 
+def test_a_long_session_assembles_only_the_recent_keys_and_reads_one_batch_map():
+    """A site recording runs for hours: assembling every stored transcript is one
+    sequential GET each, which on a three-hour session would eat the 35 s Timeout
+    before the gap pass starts."""
+    from datetime import timedelta
+    w = World()
+    base = datetime(2026, 10, 20, 7, 0, 0)
+    stored = {}
+    for i in range(120):                                   # 3 hours, one key per 90 s
+        at = (base + timedelta(seconds=90 * i)).strftime("%H-%M-%S")
+        stored["transcripts/%s/%s/F2SP01_%s_%s_sid%s_c%04d_off0.0_to29.0_srcwav.json"
+               % (FOLDER, DATE, DATE, at, SID, 1000 + i)] = b"{}"
+    early = ("transcripts/%s/%s/F2SP01_%s_07-00-05_sid%s_c0001_bn4_off0.0_to110.0_srcwav.json"
+             % (FOLDER, DATE, DATE, SID))
+    late = ("transcripts/%s/%s/F2SP01_%s_09-58-00_sid%s_c1200_bn4_off0.0_to110.0_srcwav.json"
+            % (FOLDER, DATE, DATE, SID))
+    stored[early] = json.dumps({"fieldsight_batch_map": {"members": [{"chunk_index": 4}]}}).encode()
+    stored[late] = json.dumps({"fieldsight_batch_map": {"members": [{"chunk_index": 1203}]}}).encode()
+    w.s3.objects.update(stored)
+    w.run()
+    assert w.s3.got.count(late) == 1 and early not in w.s3.got, "only the newest batch's map"
+    kept = w.assembled[0]
+    assert late in kept and early not in kept
+    assert len(kept) <= 45, len(kept)                      # 45 + 10 minutes of 90 s keys, + c0000/1
+
+
 def test_the_function_never_raises(monkeypatch):
     w = World()
     monkeypatch.setattr(cd, "_answer", lambda *a, **k: 1 / 0)
