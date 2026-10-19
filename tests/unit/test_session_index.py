@@ -194,3 +194,68 @@ def test_huge_header_terminates_and_every_part_fits():
     for part in parts:
         assert len(part["chunk_text"]) <= si.TOPIC_SPLIT_CHARS
         assert len(part["chunk_text"].splitlines()[0]) <= si.HEADER_MAX_CHARS
+
+
+# --- short tail windows are back-filled (2026-10-16 spec §3b) ---------------
+
+def _size(window):
+    return sum(len(si._window_line(t)) + 1 for t in window)
+
+
+def _short_tail_turns(start_min=0):
+    # 12 turns of 219 chars: packing emits t0..t10, then a tail of the two
+    # carried turns + t11 = 657 chars, under TARGET_CHARS // 2.
+    return [turn(f"10:{start_min + i:02d}:00", "y" * 200) for i in range(12)]
+
+
+def test_short_tail_is_backfilled():
+    turns = _short_tail_turns()
+    w = si._pack_windows(turns)
+    assert len(w) == 2
+    assert si.TARGET_CHARS // 2 <= _size(w[-1]) <= si.TARGET_CHARS
+    first = turns.index(w[-1][0])
+    assert w[-1] == turns[first:]
+    assert first > 0 and w[0][0] is turns[0]
+
+
+def test_tail_already_long_enough_is_unchanged():
+    turns = [turn(f"11:52:{i:02d}", f"line{i} " + "x" * 700) for i in range(10)]
+    w = si._pack_windows(turns)
+    for a, b in zip(w, w[1:]):
+        assert a[-si.OVERLAP_TURNS:] == b[:si.OVERLAP_TURNS]
+
+
+def test_single_window_bucket_is_unchanged():
+    turns = [turn(f"10:00:0{i}", "short") for i in range(3)]
+    assert si._pack_windows(turns) == [turns]
+
+
+def test_backfill_stops_before_a_turn_that_does_not_fit():
+    # big + s1..s4 fill the first window; the tail s3, s4, s5 is 357 chars.
+    # Borrowing s2 and s1 fits, borrowing big would exceed TARGET_CHARS.
+    big = turn("10:00:00", "b" * 2000)
+    small = [turn(f"10:0{i}:00", "s" * 100) for i in range(1, 6)]
+    w = si._pack_windows([big] + small)
+    assert len(w) == 2
+    assert w[-1] == small
+    assert _size(w[-1]) <= si.TARGET_CHARS
+
+
+def test_backfill_never_absorbs_the_whole_predecessor():
+    for turns in (_short_tail_turns(),
+                  [turn("10:00:00", "b" * 2000)] + [turn(f"10:0{i}:00", "s" * 100) for i in range(1, 6)]):
+        w = si._pack_windows(turns)
+        assert w[-1] != w[-2]
+        assert turns.index(w[-1][0]) > turns.index(w[-2][0])
+
+
+def test_backfilled_hour_tail_metadata_starts_at_its_first_turn():
+    # Turns outside every topic bucket by hour and carry a `block`.
+    chunks = [c for c in windows(si.build_chunks(REQ, _short_tail_turns()))
+              if c["topic_id"] is None]
+    assert len(chunks) == 2
+    tail = chunks[-1]
+    first_line = tail["chunk_text"].splitlines()[0]
+    assert tail["metadata"]["block"]["from"] == first_line[1:6]
+    assert tail["metadata"]["window_span"].startswith(first_line[1:9])
+    assert tail["metadata"]["block"]["from"] > chunks[0]["metadata"]["block"]["from"]
