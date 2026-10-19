@@ -134,7 +134,7 @@ def test_search_sql_helpers_carry_the_live_arm():
     assert "superseded_at IS NULL" in search_sql.build_search_sql()
     assert "superseded_at IS NULL" in search_sql.build_latest_date_sql()
     assert "superseded_at IS NULL" in search_sql._scope_predicate("c")
-    assert "superseded_at IS NULL" in search_sql.build_latest_match_date_sql()
+    assert "superseded_at IS NULL" in search_sql.build_latest_match_date_sql(1)
 
 
 # ---------------------------------------------------------------------------------------

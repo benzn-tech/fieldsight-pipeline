@@ -244,41 +244,71 @@ def build_latest_date_sql() -> str:
     )
 
 
-def build_latest_match_date_sql() -> str:
-    """The most recent day with a visible chunk NEAR a query (Ask tools,
-    spec 2026-10-15 §3.1 item 3, `latest_activity` with a query).
+def subject_tsquery(n: int) -> str:
+    """AND of `n` subject words, each matching its english stem OR its exact
+    token (Ask tools, spec 2026-10-20 §3.2, `latest_activity` with a query).
+
+    Parameters %(st0)s..%(st{n-1})s, one `lexical_terms.subject_terms` word each
+    (bind them with subject_params). Those words are [a-z0-9]+, so to_tsquery's
+    operator syntax cannot be injected through them.
+
+    A fold PER TERM, not `websearch_to_tsquery('english', all) ||
+    websearch_to_tsquery('simple', all)`: that ORs two whole AND-queries, and the
+    english half drops english stopwords -- 'crane' | 'don' & 'crane' matched
+    "the crane arrived" for the subject "don crane". Here to_tsquery('english',
+    'don') is empty, so that term reduces to the simple 'don' and the AND holds.
+      * english half: stems (scaffolding ~ scaffold, panels ~ panel);
+      * simple half: exact tokens, incl. what the english parser splits
+        differently ("RFI-108": english 'rfi' '-108', simple '108').
+    Spacing variants ("rfi108" vs "RFI 108") match neither half: a stated no_match.
+    """
+    if n < 1:
+        raise ValueError("subject_tsquery needs at least one term")
+    return "(" + " && ".join(
+        f"(to_tsquery('english', %(st{i})s) || to_tsquery('simple', %(st{i})s))"
+        for i in range(n)) + ")"
+
+
+def subject_params(terms) -> dict:
+    """The %(st*)s bindings for subject_tsquery(len(terms))."""
+    return {f"st{i}": t for i, t in enumerate(terms)}
+
+
+def build_latest_match_date_sql(n: int) -> str:
+    """The most recent day with a visible chunk NAMING a subject (Ask tools,
+    spec 2026-10-15 §3.1 item 3 / 2026-10-20 §3.2, `latest_activity` with a query).
 
     WHERE = the search's own scope (`_scope_predicate`, with date_from/date_to as
-    the bounded window) AND (vector arm OR keyword arm):
-      * vector: `(c.embedding <=> %(q)s::vector) <= %(gate)s` -- the distance gate
-        owned by the Ask tools (ASK_TOOLS_MATCH_GATE, default 0.55);
-      * keyword: the SAME expression and tsquery as build_search_sql's lex arm,
-        so "a keyword hit counts" means exactly what it means for search.
-    An exact scan over the window: the gate is a threshold, not a top-k, so HNSW
-    cannot serve it -- the window (date_from) is what bounds the cost.
+    the bounded window) AND the chunk text contains every one of the `n` subject
+    words (subject_tsquery). The day used to be chosen by a cosine-distance gate
+    OR an or_query keyword hit; at 0.55 almost every site chunk was "near", and
+    "last"/"time" alone was a keyword hit, so the latest recording day won.
+
+    The left side is _lexical_vector, unchanged, so the GIN expression index
+    (idx_report_chunks_tsv_multi_config) serves the match whatever the tsquery's
+    shape; the window (date_from) still bounds what is left.
     """
     return (
         "SELECT max(c.report_date) AS latest "
         "FROM report_chunks c "
         "WHERE " + _scope_predicate("c") + " "
-        "AND ((c.embedding <=> %(q)s::vector) <= %(gate)s "
-        "OR (" + _lexical_vector("c") + ") @@ " + _LEXICAL_QUERY + ")"
+        "AND (" + _lexical_vector("c") + ") @@ " + subject_tsquery(n)
     )
 
 
-def build_keyword_recheck_sql() -> str:
-    """Which of the given chunk ids the keyword arm matches (Ask tools,
-    `latest_activity` with a query).
+def build_subject_recheck_sql(n: int) -> str:
+    """Which of the given chunk ids name all `n` subject words (Ask tools,
+    `latest_activity` with a query; bound %(ids)s plus subject_params).
 
-    build_search_sql's `lexical_hit=True` means "found ONLY by the keyword arm"
-    (DISTINCT ON keeps the vector copy when both arms return a row), so it cannot
-    say whether a row's text matched. This re-check uses the SAME expression and
-    tsquery as the lex arm and build_latest_match_date_sql, so "keyword matched"
-    means here exactly what it meant when the day was chosen. Ids only: the rows
-    already passed the search's visibility predicate.
+    build_search_sql's rows say nothing about whether a row's text names the
+    subject: the day's search ranks by distance and by ts_rank of an OR list.
+    This re-check uses the SAME subject_tsquery fragment as
+    build_latest_match_date_sql, so "names the subject" means here exactly what
+    it meant when the day was chosen. Ids only: the rows already passed the
+    search's visibility predicate.
     """
     return (
         "SELECT c.id FROM report_chunks c "
         "WHERE c.id = ANY(%(ids)s::uuid[]) "
-        "AND (" + _lexical_vector("c") + ") @@ " + _LEXICAL_QUERY
+        "AND (" + _lexical_vector("c") + ") @@ " + subject_tsquery(n)
     )

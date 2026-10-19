@@ -1,3 +1,5 @@
+import pytest
+
 from repositories.search_sql import build_search_sql
 
 
@@ -324,16 +326,40 @@ def test_keyword_arm_selects_the_real_cosine_distance_not_null():
     assert "NULL::float8" not in sql
 
 
-def test_latest_match_date_sql_shares_search_scope_and_keyword_expression():
-    """Ask's latest_activity(query) must hide exactly what search hides and treat
-    a keyword hit exactly as search does -- by construction, not by lookalike text."""
+def test_subject_tsquery_folds_each_term():
+    """Per-term fold (spec 2026-10-20 §3.2): each subject word matches its english
+    stem OR its exact token, and the words are ANDed. Not two whole-query halves
+    ORed together -- that lets the english half drop a stopword subject ('don')."""
+    from repositories.search_sql import subject_tsquery
+    assert subject_tsquery(1) == (
+        "((to_tsquery('english', %(st0)s) || to_tsquery('simple', %(st0)s)))")
+    assert subject_tsquery(2) == (
+        "((to_tsquery('english', %(st0)s) || to_tsquery('simple', %(st0)s)) && "
+        "(to_tsquery('english', %(st1)s) || to_tsquery('simple', %(st1)s)))")
+    assert "%(st2)s" in subject_tsquery(3) and "%(st3)s" not in subject_tsquery(3)
+
+
+def test_subject_tsquery_needs_a_term():
+    from repositories.search_sql import subject_tsquery
+    with pytest.raises(ValueError):
+        subject_tsquery(0)
+
+
+def test_subject_params_name_one_term_each():
+    from repositories.search_sql import subject_params
+    assert subject_params(["pour", "concrete"]) == {"st0": "pour", "st1": "concrete"}
+
+
+def test_latest_match_date_sql_is_subject_only():
+    """Ask's latest_activity(query) must hide exactly what search hides (the
+    search's own scope, by construction) and choose the day on the subject words
+    alone: no distance gate, no or_query keyword arm."""
     import repositories.search_sql as search_sql
-    sql = search_sql.build_latest_match_date_sql()
+    sql = search_sql.build_latest_match_date_sql(3)
     assert search_sql._scope_predicate("c") in sql
-    for piece in (search_sql._lexical_vector("c"), search_sql._LEXICAL_QUERY):
-        assert piece in sql and piece in build_search_sql()
-    assert "@@ websearch_to_tsquery('simple', %(q_text)s)" in sql
-    assert "(c.embedding <=> %(q)s::vector) <= %(gate)s" in sql
+    assert "(" + search_sql._lexical_vector("c") + ") @@ " + search_sql.subject_tsquery(3) in sql
+    for gone in ("<=>", "%(gate)s", "q_text"):
+        assert gone not in sql
     assert "ILIKE" not in sql.upper()
 
 
@@ -365,16 +391,12 @@ def test_build_latest_date_sql_is_byte_identical_to_the_pre_branch_sql():
     assert hashlib.sha256(sql.encode("utf-8")).hexdigest() == GOLDEN_LATEST_DATE_SQL_SHA256
 
 
-def test_keyword_recheck_uses_the_search_keyword_arm_expression_verbatim():
-    """latest_activity(query) keeps a day's keyword rows by this re-check; it must
-    mean exactly what the lex arm and the day-choosing SQL mean by a keyword hit."""
-    from repositories.search_sql import (_LEXICAL_QUERY, _lexical_vector,
-                                         build_keyword_recheck_sql,
-                                         build_latest_match_date_sql)
-    def flat(text):
-        return " ".join(text.split())          # the lex arm spaces its pieces wider
-    match = flat("(" + _lexical_vector("c") + ") @@ " + _LEXICAL_QUERY)
-    sql = flat(build_keyword_recheck_sql())
-    assert match in sql
-    assert match in flat(build_search_sql()) and match in flat(build_latest_match_date_sql())
+def test_recheck_uses_the_same_subject_fragment():
+    """latest_activity(query) keeps a day's rows by this re-check; it must mean
+    exactly what the day-choosing SQL means by "names the subject"."""
+    from repositories.search_sql import (_lexical_vector, build_latest_match_date_sql,
+                                         build_subject_recheck_sql, subject_tsquery)
+    match = "(" + _lexical_vector("c") + ") @@ " + subject_tsquery(2)
+    sql = build_subject_recheck_sql(2)
+    assert match in sql and match in build_latest_match_date_sql(2)
     assert "c.id = ANY(%(ids)s::uuid[])" in sql
