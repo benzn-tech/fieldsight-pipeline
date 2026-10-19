@@ -644,8 +644,9 @@ def _latest_query_call(query="pour"):
 
 @pytest.mark.parametrize("left,runs", [(4.9, False), (5.0, True), (20.0, True)])
 def test_latest_activity_with_query_needs_five_seconds_to_start(monkeypatch, left, runs):
-    """Its exact scan can outrun the 23 s Lambda timeout if it starts late, and a
-    Lambda timeout loses the whole batch: refuse to START it with < 5 s left."""
+    """Its day query plus the full search of that day can outrun the 23 s Lambda
+    timeout if it starts late, and a Lambda timeout loses the whole batch: refuse
+    to START it with < 5 s left."""
     scans = []
     monkeypatch.setattr(d.chunks, "latest_matching_date",
                         lambda *a, **k: scans.append(1) or None)
