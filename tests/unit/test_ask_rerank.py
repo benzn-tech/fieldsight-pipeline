@@ -157,43 +157,80 @@ def test_nothing_to_choose_from_is_left_alone(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# Diversity: the thing that makes widening mean anything
+# Candidate selection: per search arm, not per source (2026-10-16 spec)
 # --------------------------------------------------------------------------
 
-def test_one_recording_cannot_fill_the_candidate_list(monkeypatch):
-    """Adjacent transcript windows overlap by two turns and one session's
-    windows are near-identical, so positions 6..32 of a cosine ranking are
-    dominated by neighbours of the same few sessions. Without this cap the
-    reranker is handed near-duplicates and re-orders duplicates."""
-    monkeypatch.setattr(agent, "RERANK_PER_SESSION_CAP", 2)
-    same = [_chunk("s%d" % i, "one-session") for i in range(6)]
-    other = [_chunk("other", "second-session")]
-    assert [c["chunk_text"] for c in agent._diversify(same + other, 2)] == \
-        ["s0", "s1", "other"]
+def _row(text, lex=False, key="one-session"):
+    return {"chunk_text": text, "source_s3_key": key, "topic_id": None,
+            "lexical_hit": lex}
 
 
-def test_diversify_keeps_the_incoming_order(monkeypatch):
-    """It is a filter, not a sort. Reordering here would silently become the
-    ranking whenever the reranker declines."""
-    mixed = [_chunk("a", "k1"), _chunk("b", "k2"), _chunk("c", "k1"),
-             _chunk("d", "k3")]
-    assert [c["chunk_text"] for c in agent._diversify(mixed, 5)] == \
-        ["a", "b", "c", "d"]
+def test_select_spills_unused_keyword_slots_to_vector_rows():
+    vec = [_row("v%d" % i) for i in range(40)]
+    out = agent._select_candidates(vec, total=32)
+    assert [c["chunk_text"] for c in out] == ["v%d" % i for i in range(32)]
 
 
-def test_chunks_with_no_source_key_are_not_collapsed_together(monkeypatch):
-    """A missing key must not make every such chunk look like one session and
-    get capped away. Distinct objects stay distinct."""
-    anon = [{"chunk_text": "x%d" % i} for i in range(4)]
-    assert len(agent._diversify(anon, 1)) == 4
+def test_select_caps_keyword_rows_and_puts_vector_rows_first(monkeypatch):
+    monkeypatch.setattr(agent, "RERANK_KEYWORD_CANDIDATES", 8)
+    rows = [_row("v%d" % i) for i in range(32)] +         [_row("k%d" % i, lex=True) for i in range(20)]
+    out = [c["chunk_text"] for c in agent._select_candidates(rows, total=32)]
+    assert out == ["v%d" % i for i in range(24)] + ["k%d" % i for i in range(8)]
 
 
-def test_the_cap_is_applied_before_the_reranker_sees_anything(monkeypatch):
+def test_select_reaches_a_keyword_row_past_position_32(monkeypatch):
+    """build_search_sql appends every keyword-only row after every vector
+    row, so an arrival-order total would cut this one first (v1-35)."""
+    monkeypatch.setattr(agent, "RERANK_KEYWORD_CANDIDATES", 8)
+    rows = [_row("v%d" % i) for i in range(33)] + [_row("kw", lex=True)]
+    out = [c["chunk_text"] for c in agent._select_candidates(rows, total=32)]
+    assert len(out) == 32 and out[-1] == "kw"
+
+
+def test_select_keeps_many_rows_from_one_source():
+    """One source key is a whole day or session; capping it was the defect."""
+    rows = [_row("s%d" % i, key="same") for i in range(10)]
+    assert len(agent._select_candidates(rows, total=32)) == 10
+
+
+def test_select_collapses_duplicate_text_and_keeps_the_keyword_flag():
+    rows = [_row("same"), _row("other"), _row("same", lex=True)]
+    out = agent._select_candidates(rows, total=32)
+    assert [c["chunk_text"] for c in out] == ["same", "other"]
+    assert out[0]["lexical_hit"] is True
+
+
+def test_select_does_not_collapse_empty_texts():
+    rows = [_row(""), _row(""), _row("")]
+    assert len(agent._select_candidates(rows, total=32)) == 3
+
+
+def test_failed_rerank_keeps_a_keyword_row(monkeypatch):
+    """Candidates put keyword rows after vector rows, so a plain [:keep] on
+    a timeout would drop every keyword row -- the defect
+    _admit_one_lexical_hit exists for. Prod's timeout is 3s."""
+    monkeypatch.setattr(agent, "RERANK_ENABLED", True)
+    monkeypatch.setattr(dashscope_utils, "rerank", lambda *a, **k: None)
+    rows = [_row("v%d" % i) for i in range(32)] + [_row("kw", lex=True)]
+    out = agent._rerank_chunks("q", rows, 5)
+    assert [c["chunk_text"] for c in out] == ["v0", "v1", "v2", "v3", "kw"]
+
+
+def test_reranker_sees_at_most_the_configured_total(monkeypatch):
     seen = {}
     monkeypatch.setattr(agent, "RERANK_ENABLED", True)
-    monkeypatch.setattr(agent, "RERANK_PER_SESSION_CAP", 2)
+    monkeypatch.setattr(agent, "RERANK_CANDIDATES", 32)
     monkeypatch.setattr(dashscope_utils, "rerank",
-                        lambda q, docs, n: seen.update(n=len(docs)) or list(range(len(docs))))
-    dupes = [_chunk("s%d" % i, "one-session") for i in range(8)]
-    agent._rerank_chunks("q", dupes, 5)
-    assert seen["n"] == 2
+                        lambda q, docs, n: seen.update(n=len(docs)) or list(range(n)))
+    rows = [_row("v%d" % i) for i in range(32)] + \
+        [_row("k%d" % i, lex=True) for i in range(32)]
+    agent._rerank_chunks("q", rows, 5)
+    assert seen["n"] == 32
+
+
+def test_dedup_below_keep_skips_the_reranker(monkeypatch):
+    monkeypatch.setattr(agent, "RERANK_ENABLED", True)
+    monkeypatch.setattr(dashscope_utils, "rerank",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("reranked")))
+    rows = [_row("same") for _ in range(9)] + [_row("b")]
+    assert [c["chunk_text"] for c in agent._rerank_chunks("q", rows, 5)] == ["same", "b"]
