@@ -219,3 +219,28 @@ case has ever occurred:
 
 Zero means the change is preventive only. Non-zero lists the people whose `find_people` /
 folder-gate reach shrinks on deploy; check each is a move orphan, not a writer bug.
+
+## 7. Status (2026-10-20)
+
+The rollout count was run read-only on both databases:
+
+| database | count |
+|---|---|
+| `fieldsight_test` | 0 |
+| `fieldsight` (prod) | 0 |
+
+Defect (1) is therefore preventive only: no live data has this shape. The fix narrows
+functions that org-api's /timeline folder gates also call, which belongs to another line,
+so it is parked rather than shipped in the 2026-10-20 night window. All lines were
+deploying that night and the goal was a mutually compatible state.
+
+Ship it together with the owner's decision on `move_site_company`: archive the old
+company's memberships, or mark them external. That decision removes the only way such
+rows can be created.
+
+Defects (2) and (3) are not real (sections 2 and 3). Two changes stand without the
+implementation PR:
+
+- The KNOWN GAP docstring in `rag_tools_dispatch._search_author_folder` is wrong and
+  should be corrected.
+- The parked follow-up list in memory should drop (2) and (3).
