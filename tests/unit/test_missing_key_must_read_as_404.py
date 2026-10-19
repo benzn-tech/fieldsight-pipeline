@@ -48,6 +48,8 @@ MISSING_KEY_IS_NORMAL = [
      "GET /templates/digitise/{id} -> 404 for an id that was never requested"),
     ("OrgApiFunction", "template_sources/*",
      "POST /templates/digitise HEADs each upload; a file never uploaded must be 404"),
+    ("OrgApiFunction", "project_doc_sources/*",
+     "POST /sites/{id}/documents HEADs the upload; a file never uploaded must be 404"),
     ("OrgApiFunction", "programmes/*",
      "read_programme on a site that has never had a programme uploaded"),
     ("OrgApiFunction", "redactions/*",

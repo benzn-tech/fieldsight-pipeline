@@ -913,6 +913,9 @@ def apply_reindex_vectors(key):
 # Session search index apply (spec D5) + backfill
 # ----------------------------------------------------------
 INDEX_VECTORS_RE = re.compile(r"^index_vectors/[^/]+/[^/]+/[^/]+\.json$")
+# Project documents (spec 2026-10-16-project-documents-design): the non-VPC worker's
+# vectors artifact. Applied by project_doc_apply, imported lazily below (R14).
+PROJECT_DOC_VECTORS_RE = re.compile(r"^project_doc_vectors/[^/]+/[^/]+\.json$")
 
 # Is this extraction key under a recording tombstone? The negation of the SAME predicate
 # every read path carries (DELETED_SOURCE_PREDICATE), bound to a one-row relation that
@@ -1079,6 +1082,10 @@ def lambda_handler(event, context):
         results = []
         for record in event["Records"]:
             key = unquote_plus(record["s3"]["object"]["key"])
+            if PROJECT_DOC_VECTORS_RE.match(key):
+                import project_doc_apply  # lazy: lambda_item_writer imports this module (R14)
+                results.append(project_doc_apply.apply_key(key, s3(), S3_BUCKET))
+                continue
             if INDEX_VECTORS_RE.match(key):
                 results.append(apply_index_vectors(key))
                 continue

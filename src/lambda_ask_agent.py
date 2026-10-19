@@ -596,6 +596,53 @@ def _aggregate_topics(chunks, question="", browse=False, family="report"):
     return rows
 
 
+DOC_SEARCH_K = 8
+DOC_SNIPPET_CHARS = 240
+
+
+def _doc_hit(r):
+    """One palette row for a project-document hit (spec 2026-10-16, R7)."""
+    return {"document_id": r.get("document_id"), "series_id": r.get("series_id"),
+            "revision": r.get("revision"), "site_id": r.get("site_id"),
+            "site_name": r.get("site_name"), "title": r.get("title"),
+            "heading": r.get("heading"), "page_from": r.get("page_from"),
+            "page_to": r.get("page_to"), "content_type": r.get("content_type"),
+            "snippet": (r.get("chunk_text") or "")[:DOC_SNIPPET_CHARS],
+            "lexical": bool(r.get("lexical_hit"))}
+
+
+def _project_documents(caller_sub, query_vec, question, site):
+    """The second rag-search call (`documents` mode). None when the feature is off (the
+    caller then adds no key); [] when it failed -- a broken documents search must never
+    cost the person their records results, and is logged."""
+    import project_doc_flag
+    if not project_doc_flag.on():
+        return None
+    # The whole call, parse and shaping sit inside the try: a non-dict payload or a
+    # malformed hit must cost only the documents, never the records result.
+    try:
+        payload = {"mode": "documents", "sub": caller_sub, "query_embedding": query_vec,
+                   "question": question, "k": DOC_SEARCH_K}
+        if site:
+            payload["site"] = site
+        resp = _get_lambda_client().invoke(FunctionName=RAG_SEARCH_FUNCTION,
+                                           InvocationType="RequestResponse",
+                                           Payload=json.dumps(payload))
+        if resp.get("FunctionError"):
+            logger.error("  documents search FunctionError: %s", resp.get("FunctionError"))
+            return []
+        result = json.loads(resp["Payload"].read().decode("utf-8"))
+        if result.get("off"):
+            return None
+        if result.get("error"):
+            logger.warning("  documents search error: %s", result["error"])
+            return []
+        return [_doc_hit(r) for r in result.get("documents") or []]
+    except Exception as e:                                   # noqa: BLE001
+        logger.warning("  documents search failed: %s", type(e).__name__)
+        return []
+
+
 def _rag_search_list(body):
     """mode=search: embed question -> rag-search (ACL + optional date range)
     -> aggregate to a ranked topic list. NO Claude synthesis."""
@@ -668,6 +715,10 @@ def _rag_search_list(body):
             out["date_range"] = date_range  # computed here, never by a model
         if browse:
             out["browse"] = True
+        if body.get("include_documents") is True and not browse:
+            docs = _project_documents(caller_sub, query_vec, question, site)
+            if docs is not None:
+                out["documents"] = docs
         return out
     except Exception as e:
         logger.error(f"  RAG search-list failed: {e}")

@@ -736,6 +736,15 @@ Parameters:
       Leave empty — report/meeting Lambdas will still deploy but skip Word generation.
     Default: ''
 
+  # Project documents (spec 2026-10-16-project-documents-design, R13): the pure-Python
+  # pypdf layer built by scripts/build-pypdf-layer.sh and published once per account by
+  # hand. Attached only to ProjectDocIndexFunction. Empty -> PDFs answer "PDF reading is
+  # not set up on this deployment"; Word and text files are unaffected.
+  PdfLayerArn:
+    Type: String
+    Default: ''
+    Description: ARN of the fieldsight-pypdf layer (repo variables TEST_PDF_LAYER_ARN / PROD_PDF_LAYER_ARN).
+
   # --- DynamoDB table names (existing, created outside this stack) ---
   ItemsTableName:
     Type: String
@@ -1260,6 +1269,19 @@ Parameters:
       routes, which is the UI's only gate. Set per environment by the repo variables
       TEST_TEMPLATE_DIGITISE / PROD_TEMPLATE_DIGITISE.
 
+  # Project documents (spec 2026-10-16). Wired in pieces, pinned by
+  # tests/unit/test_project_documents_wiring.py: this Parameter -> PROJECT_DOCUMENTS on
+  # OrgApiFunction (routes), RagSearchFunction (documents mode) and AskAgentFunction (the
+  # palette's documents group) -> project_doc_flag.on().
+  ProjectDocuments:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      When true, projects have a Documents section (upload/list/search) and Ask may search
+      them. False (default) answers 404 on /sites/{id}/documents, which is the UI's only
+      gate. Set per environment by TEST_PROJECT_DOCUMENTS / PROD_PROJECT_DOCUMENTS.
+
   VoiceprintMaxFrameSpread:
     Type: String
     Default: 'default'
@@ -1463,6 +1485,7 @@ Conditions:
   HasVadLayer: !Not [!Equals [!Ref VadLayerArn, '']]
   HasKeyframeFfmpegLayer: !Not [!Equals [!Ref KeyframeFfmpegLayerArn, '']]
   HasDocxLayer: !Not [!Equals [!Ref DocxLayerArn, '']]
+  HasPdfLayer: !Not [!Equals [!Ref PdfLayerArn, '']]
   HasDb: !Not [!Equals [!Ref DbStackName, '']]
   HasOrgPool: !Not [!Equals [!Ref OrgUserPoolId, '']]
   HasPgDatabaseOverride: !Not [!Equals [!Ref PgDatabase, ""]]
@@ -2255,6 +2278,7 @@ Resources:
           # Reads the same credential and the same vendor as corroboration; the
           # separate flag is about the decision, not the plumbing.
           ENABLE_WEB_ANSWER: !Ref EnableWebAnswer
+          PROJECT_DOCUMENTS: !Ref ProjectDocuments   # spec 2026-10-16 project documents
       Layers:
         - !Ref DashScopeLayer
       Policies:
@@ -2419,6 +2443,57 @@ Resources:
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/template_digitise_results/*
 
   # ----------------------------------------------------------
+  # Project documents worker (spec 2026-10-16-project-documents-design). Reads one uploaded
+  # document (project_doc_sources/), chunks it and embeds it with DashScope, and ALWAYS
+  # writes project_doc_vectors/{company}/{id}.json (R9), which IngestFunction applies.
+  # Non-VPC (DashScope; org-api and Ingest have no outbound, BUG-36). No PsycopgLayer: it
+  # has no database. NO Events: wired by scripts/wire-s3-events.sh (fs-project-doc-index,
+  # BUG-33). Its output prefix is Ingest's trigger, never its own.
+  # ----------------------------------------------------------
+  ProjectDocIndexFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasDb
+    Properties:
+      FunctionName: !Sub ["${P}-project-doc-index", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_project_doc_index.lambda_handler
+      Timeout: 900
+      MemorySize: 1024
+      # No async retry: a failed run already wrote an error artifact; a person retries.
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+      Runtime: python3.12  # python-docx-layer is built for cp312 (BUG-24)
+      Layers:
+        - !If [HasDocxLayer, !Ref DocxLayerArn, !Ref AWS::NoValue]
+        - !If [HasPdfLayer, !Ref PdfLayerArn, !Ref AWS::NoValue]
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref IngestBucketName
+          DASHSCOPE_API_KEY: !Ref DashScopeApiKey
+          DASHSCOPE_BASE_URL: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+          DASHSCOPE_EMBED_MODEL: text-embedding-v4
+          DASHSCOPE_EMBED_DIM: '1024'
+      Policies:
+        # lake_put: the artifact write also appends one manifest line in the bucket it wrote to.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource:
+                - !Sub arn:aws:s3:::${DataBucketName}/lake_manifest/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/lake_manifest/*
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/project_doc_requests/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/project_doc_sources/*
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/project_doc_vectors/*
+
+  # ----------------------------------------------------------
   # Lambda 10: Org API (Phase 3) — real write backend for
   # projects/members/roles/profile/images. In-VPC (psycopg → Aurora).
   # Gated by HasOrgApi (DbStackName + OrgUserPoolId both set).
@@ -2497,6 +2572,8 @@ Resources:
           COMPANY_SUMMARY_SERVE: !Ref CompanySummaryServe
           # off -> /templates/digitise answers 404 (see the TemplateDigitise parameter)
           TEMPLATE_DIGITISE: !Ref TemplateDigitise
+          # off -> /sites/{id}/documents answers 404 (see the ProjectDocuments parameter)
+          PROJECT_DOCUMENTS: !Ref ProjectDocuments
       Policies:
         # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
         # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
@@ -2802,6 +2879,27 @@ Resources:
                     - template_sources/*
                     - template_digitise_requests/*
                     - template_digitise_results/*
+            - Effect: Allow
+              # Project documents (spec 2026-10-16, R10). upload-url presigns a PUT into
+              # project_doc_sources/ (valid only if this role may PutObject the key); create
+              # HEADs the upload; /file presigns a GET of the original; create and Retry
+              # write the worker's request.
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/project_doc_sources/*
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/project_doc_requests/*
+            - Effect: Allow
+              # A missing upload must answer 404 ("upload it again"), not AccessDenied.
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - project_doc_sources/*
+                    - project_doc_requests/*
             - Effect: Allow
               # POST /api/org/reports/regenerate: the caller's own report, handed to
               # the non-VPC ReportGeneratorFunction as report_requests/<folder>/<rid>.json
@@ -4033,6 +4131,10 @@ Resources:
               Action: s3:GetObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/index_vectors/*
             - Effect: Allow
+              # Project documents (spec 2026-10-16, R10): the worker's vectors artifact.
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/project_doc_vectors/*
+            - Effect: Allow
               # ...and the backfill emits index_requests/ for extractions that predate the switch.
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/index_requests/*
@@ -4072,6 +4174,8 @@ Resources:
                     # grew the same call and not the same grant. List only --
                     # binding needs the key and the filename, never the bytes.
                     - users/*
+                    # Project documents (R10): a missing vectors artifact reads as 404.
+                    - project_doc_vectors/*
 
   # ----------------------------------------------------------
   # Lambda 15: Embed Report (Phase 4d) — S3 event on reports/,
@@ -4824,6 +4928,7 @@ Resources:
           PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
           # report (default) | session: which chunk family Ask/Search read.
           SEARCH_INDEX_READ: !Ref SearchIndexRead
+          PROJECT_DOCUMENTS: !Ref ProjectDocuments   # spec 2026-10-16 project documents
       Policies:
         - VPCAccessPolicy: {}
 
