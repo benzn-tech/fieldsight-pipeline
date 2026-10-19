@@ -341,6 +341,9 @@ jobs:
               $ASK_JUDGE_FALLBACKS_PARAM \
               $ASK_JUDGE_PROVIDER_PARAM \
               $ASK_JUDGE_REASONING_PARAM \
+              "AskVoiceRestate=${{ vars.PROD_ASK_VOICE_RESTATE || 'false' }}" \
+              "AskVoiceConvo=${{ vars.PROD_ASK_VOICE_CONVO || 'false' }}" \
+              "VoiceWebEnabled=${{ vars.PROD_VOICE_WEB_ENABLED || 'false' }}" \
               "RealPTTAccount=$REALPTT_ACCOUNT" \
               "RealPTTPassword=$REALPTT_PASSWORD" \
               "ClaudeApiKey=$CLAUDE_API_KEY" \

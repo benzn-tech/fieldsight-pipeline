@@ -190,12 +190,15 @@ def test_flags_are_false_by_default_string_booleans():
         assert params[name]["Description"]
 
 
-def test_prod_workflow_passes_neither_flag_and_test_passes_both():
+def test_both_workflows_pass_the_flags_defaulting_off():
+    """Prod was wired on 2026-10-19 so the release is a repo-var flip, not a code
+    change (the owner chose the tested TEST setup for prod). An unset PROD_ var
+    still deploys the template default, false."""
     prod = io.open(PROD_WORKFLOW, encoding="utf-8").read()
     test = io.open(TEST_WORKFLOW, encoding="utf-8").read()
     for name in ("AskVoiceRestate", "VoiceWebEnabled", "AskVoiceConvo"):
-        assert name not in prod
         assert re.search(r'"%s=\$\{\{ vars\.TEST_\w+ \|\| \'false\' \}\}"' % name, test)
+        assert re.search(r'"%s=\$\{\{ vars\.PROD_\w+ \|\| \'false\' \}\}"' % name, prod)
 
 
 def test_the_convo_flag_reaches_both_lambdas_that_use_it(resources):
