@@ -278,8 +278,10 @@ baseline (`20261016T033855Z` session, `20261016T031604Z` report):
 - report loses v1-36 in all three runs (the 24 + 8 bullet above wrongly listed it
   as "still misses"; cap 4 hits it at rank 4). Row by row: the transcript row the
   gold quote matches is in the candidate set under both selectors (position 10 of
-  32 vs 9 of 15); with 32 candidates the reranker puts it 7th instead of 3rd. Both
-  selectors rank first the 2026-09-02 topic chunk whose text reads "Decision: Flat
+  32 vs 9 of 15); with 32 candidates the reranker puts it 6th–8th instead of 4th.
+  In three diagnostic rerank calls per selector (separate from the acceptance
+  runs, whose JSON does not keep the reranked rows), both selectors rank first
+  the 2026-09-02 topic chunk whose text reads "Decision: Flat
   slab shop drawings deadline pushed to the 9th." So Ask's context still carries
   the answer; the gold item's `match_any` names only the spoken quote. Not changed
   in v1 (changing gold mid-comparison moves the baseline); a v1.1 candidate.
@@ -287,8 +289,10 @@ baseline (`20261016T033855Z` session, `20261016T031604Z` report):
 Rerank latency for 32 ~2600-char documents from ap-southeast-2 (CloudShell, 5
 reps): median 1.86 s, max 1.87 s, 0/5 over the prod 3 s timeout (NZ developer
 machine: median 1.83 s). The ruler's own rerank timings from the NZ machine are
-higher (p50 2.8 s session, 4.5 s report, drifting up across runs) and are not
-comparable: they use real candidate texts and `top_n` = 32. Prod ask-agent logs
+higher (p50 2.8 s session, 4.5 s report; per report run 4.1 → 5.7 s p50, max
+15 s) and are not comparable: they use real candidate texts and `top_n` = 32, and
+the ruler issues two rerank calls per question back to back, so the steady drift
+upward looks like throttling of the eval client rather than per-call cost. Prod ask-agent logs
 for 2026-10-05..19 show 2 reranks (26 and 27 candidates) and 0 `rerank: request
 failed`, too few to bound the prod tail; a timeout falls back to §3a's fallback.
 
