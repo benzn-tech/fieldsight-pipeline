@@ -228,6 +228,16 @@ class DataApiConnection:
     def execute(self, sql, params=None):
         return self.cursor().execute(sql, params)
 
+    def run_typed(self, sql, parameters):
+        """dict rows of one statement bound by Data API typed parameters (run.py's
+        spelling): the parity smoke only. Same allow/deny check, same transaction."""
+        check_template(sql)
+        resp = self._client.execute_statement(sql=sql, parameters=parameters,
+                                              transactionId=self._tx,
+                                              includeResultMetadata=True, **self._target)
+        return coerce_rows(resp.get("columnMetadata") or [], resp.get("records") or [],
+                           as_dict=True, warnings=self._log.warnings)
+
     @contextmanager
     def transaction(self):
         """A SAVEPOINT, as psycopg's transaction() is inside an open transaction:

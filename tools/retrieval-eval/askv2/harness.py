@@ -20,12 +20,10 @@ from askv2.srcref import export_src
 
 FAKE_FUNCTION = "eval-in-process"
 
-# lambda_ask_agent and friends read these at import. Placeholders only: S3 and the
-# Anthropic key are never reached on this path (the worker is not used; the boto3
-# guard refuses s3).
+# lambda_ask_agent and friends read these at import. Placeholders only: S3 is never
+# reached on this path (the worker is not used; the boto3 guard refuses s3).
 PLACEHOLDERS = {
     "S3_BUCKET": "retrieval-eval-unused",
-    "ANTHROPIC_API_KEY": "retrieval-eval-unused",
     "AWS_DEFAULT_REGION": "ap-southeast-2",
     "DASHSCOPE_EMBED_MODEL": "text-embedding-v4",
     "DASHSCOPE_EMBED_DIM": "1024",
@@ -37,6 +35,9 @@ FORCED = {
     "RAG_SEARCH_FUNCTION": FAKE_FUNCTION,
     "ENABLE_WEB_ANSWER": "false",
     "ASK_CONVERSATION_MEMORY": "false",
+    # Never injected (spec §7). Empty, so an `anthropic` fallback synthesis fails at once
+    # ("not configured" -> `+no_synthesis`) instead of sending a placeholder key out.
+    "ANTHROPIC_API_KEY": "",
 }
 # Unset: the worker's '45' would cap the raised DEADLINE_S patch (spec §3 Timing),
 # and voice audit is a voice-only path.

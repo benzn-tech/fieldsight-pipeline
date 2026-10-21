@@ -17,6 +17,11 @@ def test_import_env_is_the_eval_one():
     assert "ASK_DEADLINE_SECONDS" not in os.environ
 
 
+def test_fallback_synthesis_has_no_anthropic_key_so_it_fails_without_a_call():
+    import llm_utils
+    assert os.environ["ANTHROPIC_API_KEY"] == "" and llm_utils.ANTHROPIC_API_KEY == ""
+
+
 def test_assert_seams_passes_on_the_exported_source():
     harness.assert_seams("report", rerank=False)
 

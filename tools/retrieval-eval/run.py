@@ -135,45 +135,17 @@ SYSTEMS = ["prod", "link-rollup", "rerank@32", "rerank@50"]
 # None keeps the pre-switch behaviour (no family filter) so older runs stay reproducible.
 FAMILY = None
 
-REWRITES = [
-    ("%(q)s::vector", "CAST(:q AS vector)"),
-    ("ANY(%(site_ids)s)", "ANY(CAST(:site_ids AS uuid[]))"),
-    ("%(author_ids)s::uuid[]", "CAST(:author_ids AS uuid[])"),
-    ("%(date_from)s::date", "CAST(:date_from AS date)"),
-    ("%(date_to)s::date", "CAST(:date_to AS date)"),
-    ("%(q_text)s", ":q_text"),
-    ("%(k)s", ":k"),
-    ("%%", "%"),
-]
-
-
-OPTIONAL_REWRITES = [
-    ("EXISTS (SELECT 1 FROM topics t WHERE t.id = c.topic_id AND t.superseded_at IS NULL)",
-     "EXISTS (SELECT 1 FROM topics t WHERE t.id = c.topic_id)"),
-]
+# run.py's typed spelling, shared with the Ask v2 parity smoke (askv2/typed_sql.py).
+from askv2.typed_sql import OPTIONAL_REWRITES, REWRITES, typed_search_sql  # noqa: E402,F401
 
 
 def data_api_sql():
-    sql = search_sql.build_search_sql()
     # Schema compatibility for measuring newer source against a database that has
     # not migrated yet (the `fieldsight` database has no topics.superseded_at), and
     # for develop's source_family switch, which this ruler leaves off (None = no
     # filter, as in every call the ruler models). Optional: absent in older source.
     # Applied to every ref alike, so before/after comparisons stay like for like.
-    for old, new in OPTIONAL_REWRITES:
-        sql = sql.replace(old, new)
-    if FAMILY is not None and "%(source_family)s" not in sql:
-        raise SystemExit("--family given but the imported search SQL has no source_family switch")
-    sql = sql.replace("%(source_family)s::text",
-                      "CAST(NULL AS text)" if FAMILY is None else "CAST(:source_family AS text)")
-    for old, new in REWRITES:
-        if old not in sql:
-            raise SystemExit("production search SQL no longer contains %r -- "
-                             "update REWRITES before trusting any number" % old)
-        sql = sql.replace(old, new)
-    if "%(" in sql:
-        raise SystemExit("unrewritten parameter left in search SQL")
-    return sql
+    return typed_search_sql(search_sql.build_search_sql(), FAMILY)
 
 
 def sha256_text(text):
