@@ -488,3 +488,22 @@ def test_a_far_keyword_only_row_is_still_admitted_past_the_distance_cut(monkeypa
     wire(monkeypatch, [kw, plain])
     out = run(ev(question="PS4"))
     assert [r["title"] for r in out["results"]] == ["Unrelated title"]
+
+
+def test_a_last_weekday_browses_that_day(monkeypatch):
+    """The search box passes the caller's day to is_content_free, so the
+    "last Tue" that time_range anchored on is not content and the question
+    is a browse of that day. 2026-10-13 (NOW) is a Tuesday: a week ago."""
+    fc = wire(monkeypatch, [chunk("t-1", "2026-10-06", 0.9, "Slab pour")])
+    out = run(ev(question="what did we do last Tue", tz="Pacific/Auckland", now=NOW))
+    p = fc.calls[0]["Payload"]
+    assert p["date_from"] == p["date_to"] == "2026-10-06"
+    assert out["browse"] is True and out["count"] == 1
+
+
+def test_a_last_weekday_with_content_does_not_browse(monkeypatch):
+    fc = wire(monkeypatch, [chunk("t-1", "2026-10-06", 0.9, "Drainage")])
+    out = run(ev(question="drainage last Tuesday", tz="Pacific/Auckland", now=NOW))
+    p = fc.calls[0]["Payload"]
+    assert p["date_from"] == p["date_to"] == "2026-10-06"
+    assert "browse" not in out

@@ -1,4 +1,5 @@
 import re
+import uuid as _uuid
 
 import folder_key
 from psycopg.rows import dict_row
@@ -378,3 +379,106 @@ def homes_for_folders(conn, folders) -> dict:
         "SELECT folder_name, id, company_id FROM users WHERE folder_name = ANY(%s)",
         (folders,)).fetchall()
     return {r["folder_name"]: {"id": r["id"], "company_id": r["company_id"]} for r in rows}
+
+
+def _candidates(conn, site_ids, author_ids) -> set:
+    """Ask find_people candidate set (spec 2026-10-15 §3.1.4): footprint on
+    `site_ids`, narrowed by the graded `author_ids` when that is not None."""
+    from repositories import recordings
+    cands = recordings.author_candidates_in_sites(conn, site_ids)
+    if author_ids is not None:
+        cands &= {str(a) for a in author_ids}
+    return cands
+
+
+def _canonical_uuid(ref) -> str | None:
+    """`ref` as a canonical lowercase UUID string, or None when it is not one.
+    Accepts a UUID, or a string in any form `uuid.UUID` parses (upper case,
+    braces, no hyphens)."""
+    if isinstance(ref, _uuid.UUID):
+        return str(ref)
+    if not isinstance(ref, str) or not ref.strip():
+        return None
+    try:
+        return str(_uuid.UUID(ref.strip()))
+    except ValueError:
+        return None
+
+
+def person_in_reach(conn, site_ids, author_ids, user_id) -> bool:
+    """Re-validated on EVERY tool call (spec §3.1.4): a person_ref is never
+    trusted because find_people minted it.
+
+    Order matters. A ref that is not a UUID is False with no DB call, so a
+    garbage or forged ref looks exactly like an out-of-reach one and can never
+    raise a cast error (§3.3: out-of-ACL looks like no match). Then the graded
+    author set. Then the footprint boolean, which stops at the first match
+    rather than building the whole candidate set."""
+    uid = _canonical_uuid(user_id)
+    if uid is None:
+        return False
+    if author_ids is not None and uid not in {str(a) for a in author_ids}:
+        return False
+    from repositories import recordings
+    return recordings.author_footprint_in_sites(conn, uid, site_ids)
+
+
+def _norm_name(s) -> str:
+    """One normaliser for both sides of every name comparison: `_` reads as a
+    space, whitespace runs collapse to one space, case folds. Applied to the
+    query, the stored first/last/folder names and both alias terms."""
+    return " ".join((s or "").replace("_", " ").split()).lower()
+
+
+def _name_keys(row) -> set:
+    first = _norm_name(row["first_name"])
+    full = _norm_name(f"{row['first_name'] or ''} {row['last_name'] or ''}")
+    folder = _norm_name(row["folder_name"])
+    return {k for k in (first, full, folder) if k}
+
+
+def find_visible_people(conn, company_id, site_ids, author_ids, name) -> list[dict]:
+    """People the caller may ask about whose name matches `name` (spec §3.1.4).
+
+    Candidates are the users with a footprint on the caller's sites (topics,
+    recordings, live memberships), intersected with `author_ids`. The user rows
+    are then read by id with NO company pin, so an external author from another
+    company who worked on these sites is found, while anyone without a footprint
+    never enters the set. Archived users are not filtered: visibility (scope,
+    author_footprint_in_sites, topic reads) never looks at users.archived_at, so
+    a departed person's history stays readable and they stay findable.
+
+    Matching is exact on `_norm_name` keys (case-insensitive, `_` = space,
+    whitespace collapsed): first name, full name, folder name, or an active
+    `kind='person'` alias of the CALLER's company (company-wide or on one of
+    `site_ids`) whose `wrong_term` is the query and whose `right_term` is one of
+    a candidate's keys. Never substring: "Mi" is not "Mike". Ambiguity is
+    returned, not resolved -- two Mikes are two entries, sorted by name.
+    """
+    q = _norm_name(name)
+    if not q or not company_id:
+        return []
+    cands = _candidates(conn, site_ids, author_ids)
+    if not cands:
+        return []
+    # Normalised in Python, not SQL, so both alias terms go through exactly the
+    # same function as the query and the names. One company's person glossary.
+    alias_targets = {
+        _norm_name(right) for wrong, right in conn.execute(
+            "SELECT wrong_term, right_term FROM name_aliases "
+            "WHERE company_id=%s AND status='active' AND kind='person' "
+            "AND (site_id IS NULL OR site_id = ANY(%s::uuid[]))",
+            (company_id, [str(s) for s in site_ids])).fetchall()
+        if _norm_name(wrong) == q}
+    alias_targets.discard("")
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT id, first_name, last_name, folder_name FROM users "
+        "WHERE id = ANY(%s::uuid[])", (sorted(cands),)).fetchall()
+    out = []
+    for r in rows:
+        keys = _name_keys(r)
+        if q in keys or keys & alias_targets:
+            full = " ".join(p.strip() for p in (r["first_name"], r["last_name"]) if p and p.strip())
+            out.append({"person_ref": str(r["id"]), "name": full or r["folder_name"],
+                        "folder_name": r["folder_name"]})
+    return sorted(out, key=lambda p: ((p["name"] or "").lower(), p["person_ref"]))

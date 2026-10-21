@@ -1,9 +1,15 @@
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
-from repositories.search_sql import build_latest_date_sql, build_search_sql  # re-export
+
+from deleted_predicates import LIVE_TOPIC_PREDICATE
+from repositories.search_sql import (build_latest_date_sql,  # re-export
+                                     build_latest_match_date_sql, build_search_sql,
+                                     build_subject_coverage_sql, subject_floor,
+                                     subject_params)
 
 __all__ = ["build_search_sql", "build_latest_date_sql", "insert_chunk", "search_chunks",
-           "latest_visible_date",
+           "latest_visible_date", "latest_matching_date", "build_latest_match_date_sql",
+           "subject_coverage", "build_subject_coverage_sql", "subject_floor",
            "delete_chunks_for_source", "delete_chunks_for_sources", "delete_chunks_for_topic",
            "archive_chunks_for_session", "archive_chunks_for_sources",
            "restore_chunks_for_batch",
@@ -112,6 +118,60 @@ def latest_visible_date(conn, accessible_site_ids, *, author_ids=None, on_or_bef
     ).fetchone()
     latest = (row or {}).get("latest")
     return latest.isoformat() if latest is not None else None
+
+
+def latest_matching_date(conn, accessible_site_ids, *, on_or_before, subject_terms,
+                         window_days=92, author_ids=None, source_family=None):
+    """`(day, k)` for the window [on_or_before - window_days + 1, on_or_before], or
+    None (Ask tools, spec 2026-10-15 §3.1 item 3; day rule from spec 2026-10-20
+    §3.2 and Amendment A §8). Callers test `is None`.
+
+    `subject_terms` is `lexical_terms.subject_terms(question)`; each word matches
+    its english stem or its exact token (search_sql.subject_term_query). k is the
+    highest number of them any visible chunk in the window names, at least
+    subject_floor(n) = min(2, n); day is the latest report_date with a chunk at k.
+    No words -> None, and no SQL runs. Visibility is the search's own
+    (build_latest_match_date_sql reuses _scope_predicate): site pin, author
+    narrowing, deletion tombstones, supersession and the source family -- a date
+    is a disclosure too.
+
+    The prefilter is served by the GIN expression index; the window bounds the
+    rest (spec 2026-10-15 §3.4: shrink the window first if p95 is missed).
+    """
+    terms = list(subject_terms or [])
+    if not accessible_site_ids or not terms:
+        return None
+    if window_days < 1:
+        raise ValueError("window_days must be >= 1")
+    from datetime import date, timedelta
+    hi = date.fromisoformat(str(on_or_before))
+    lo = hi - timedelta(days=window_days - 1)
+    row = conn.cursor(row_factory=dict_row).execute(
+        build_latest_match_date_sql(len(terms)),
+        {**subject_params(terms), "floor": subject_floor(len(terms)),
+         "site_ids": list(accessible_site_ids),
+         "author_ids": list(author_ids) if author_ids is not None else None,
+         "date_from": lo, "date_to": hi,
+         "source_family": source_family},
+    ).fetchone()
+    if not row or row.get("report_date") is None:
+        return None
+    return row["report_date"].isoformat(), int(row["k"])
+
+
+def subject_coverage(conn, chunk_ids, subject_terms) -> dict:
+    """{lower-case id: k} -- how many subject words each of `chunk_ids` names, by
+    the same coverage expression latest_matching_date chose the day by, so a
+    row's k means what the day's k meant. No ids or no words -> {}.
+    """
+    ids = [str(i) for i in chunk_ids if i is not None]
+    terms = list(subject_terms or [])
+    if not ids or not terms:
+        return {}
+    rows = conn.cursor(row_factory=dict_row).execute(
+        build_subject_coverage_sql(len(terms)),
+        {"ids": ids, **subject_params(terms)}).fetchall()
+    return {str(r["id"]).lower(): int(r["k"]) for r in rows}
 
 
 def delete_chunks_for_source(conn, source_s3_key) -> int:
@@ -240,17 +300,34 @@ def restore_chunks_for_batch(conn, batch_id) -> int:
             "chunk_type, chunk_text, embedding, metadata, created_at")
     # `topic_id` is resolved through `topics` instead of copied, and the reason is a clock:
     # `report_chunks.topic_id` is `REFERENCES topics(id) ON DELETE SET NULL`, but the
-    # archive is `LIKE report_chunks`, which copies no foreign keys. While a chunk waits in
-    # the archive the nightly ingest hard-deletes and rebuilds that day's topics
-    # (`delete_topics_for_source`, whose own comment says "always"), and nothing nulls the
-    # archived copy. Re-inserting it then violates the FK and fails the whole undelete —
-    # `revert_batch` with it. Delete works tonight; restore would break one nightly run
-    # later, which is the worst possible schedule for a promise of reversibility.
+    # archive is `LIKE report_chunks`, which copies no foreign keys. Before Track B Task 3,
+    # while a chunk waited in the archive the nightly ingest could hard-delete and rebuild
+    # that day's topics (`delete_topics_for_source`, whose own comment said "always"), and
+    # nothing nulled the archived copy. Re-inserting it then violated the FK and failed the
+    # whole undelete — `revert_batch` with it. Delete worked tonight; restore would break one
+    # nightly run later, which is the worst possible schedule for a promise of reversibility.
     #
-    # The scalar subquery yields NULL for a topic that is gone: not a workaround, but
-    # exactly what ON DELETE SET NULL would have done had the row never left the table.
+    # Task 3 retargeted the nightly ingest's report-key clear to
+    # `supersede_topics_for_source`, which marks a row instead of removing it, so the topic a
+    # chunk was archived against normally still exists (superseded, not gone) by the time a
+    # restore runs. This resolution stays regardless — belt-and-suspenders for whatever
+    # DOES still physically remove a topics row (`delete_topics_for_source[_prefix]` remain
+    # in this repo for a caller that means an actual, irreversible delete), so a restore
+    # never fails the whole undelete transaction on a dangling FK.
+    #
+    # The scalar subquery yields NULL for a topic that is gone OR superseded (fix round 1,
+    # PR #972 review): "exists" is not enough any more. A chunk can be archived while its
+    # topic is live and restored after that SAME topic was later superseded by an unrelated
+    # re-extraction (the topic row still exists — Task 3 stopped deleting it) — binding the
+    # restored chunk to it would put it right back under `visible_chunks_predicate`'s
+    # superseded-topic arm, hidden, exactly the state R21 exists to repair for a supersede's
+    # own chunks. `LIVE_TOPIC_PREDICATE` (deleted_predicates — one definition, not an inlined
+    # `superseded_at` check that could drift from Task 2's) makes this the same "does the
+    # parent still count" test every other live read uses, so a restored chunk with a
+    # since-superseded topic comes back unbound rather than invisible.
     select_cols = ("a.id, a.site_id, a.user_id, a.source_s3_key, "
-                   "(SELECT t.id FROM topics t WHERE t.id = a.topic_id), "
+                   f"(SELECT t.id FROM topics t WHERE t.id = a.topic_id "
+                   f"AND {LIVE_TOPIC_PREDICATE.format(alias='t')}), "
                    "a.report_date, a.chunk_type, a.chunk_text, a.embedding, "
                    "a.metadata, a.created_at")
     conn.execute(

@@ -95,6 +95,42 @@ def test_evidence_forgives_case_punctuation_and_a_dropped_filler():
     assert not checklist.evidence_found("the toilets were inspected by the council", words)
 
 
+# A sentence the speaker said across two turns (or two recording chunks) is one
+# sentence: the "[time] name (spk):" heads between them were never said.
+# Measured 2026-10-21 on TEST: the weather item, answered Yes by the model, was
+# dropped in 6 of 7 runs because its quote ran over a "[10:56:18]" head.
+
+def test_a_quote_said_across_a_turn_boundary_is_found():
+    t = checklist.transcript_words(TRANSCRIPT)
+    assert checklist.evidence_found(
+        "they get serviced twice a week so they're fine. Lunchroom is a bit of a mess", t)
+    assert not checklist.evidence_found(
+        "they get serviced twice a week so they're fine. clement spk 0 Lunchroom", t), \
+        "the head is not speech, so a quote that includes it is not in the recording"
+
+
+def test_a_quote_across_a_chunk_seam_in_the_check_done_format_is_found():
+    text = ("[10:55:40] Weather looks okay for Thursday, but we have got covers on standby ju-\n"
+            "[10:56:18] We have got covers on standby just in case. Vibrators, two on site.")
+    assert checklist.evidence_found(
+        "Weather looks okay for Thursday, but we have got covers on standby ju- "
+        "We have got covers on standby just in case.", checklist.transcript_words(text))
+
+
+def test_only_the_head_is_dropped_a_colon_in_speech_stays():
+    assert checklist.transcript_words("[09:01:02] Note: the gate is locked") == \
+        ["note", "the", "gate", "is", "locked"]
+    assert checklist.transcript_words("[09:01:02 – 09:01:09] Ben Lin (spk_1): Note: the gate") == \
+        ["note", "the", "gate"]
+
+
+def test_rebuild_keeps_an_answer_whose_quote_spans_two_turns():
+    sec = model_section(["1 | Yes | Serviced | | | they get serviced twice a week so they're fine. "
+                         "Lunchroom is a bit of a mess"])
+    _p, _r, report = checklist.rebuild(sec, ITEMS, TRANSCRIPT)
+    assert report["answered"] == 1 and report["dropped"] == []
+
+
 def test_a_header_row_starting_with_a_hash_is_not_read_as_a_heading():
     # The model's habit of numbering a table "# | ..." split the section in two.
     sec = sr._prose_sections("### Site Amenities\n# | Answer | Evidence\n---|---|---\n1 | Yes | x\n")

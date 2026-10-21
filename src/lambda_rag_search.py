@@ -230,6 +230,35 @@ def _metric(event):
     return dict(out, value=value, n=value, notes=notes)
 
 
+def _tools(event):
+    """Ask tools batch (spec 2026-10-15-ask-retrieval-tools §3.4). The caller and
+    the ACL are resolved ONCE here and handed to the dispatcher; `search_records`
+    then reuses `_search` itself (which resolves the ACL again -- one extra query,
+    accepted to keep a single implementation of search)."""
+    import rag_tools_dispatch
+    sub = event.get("sub")
+    calls = event.get("calls") or []
+    caller = None
+    if sub:
+        conn = get_cached_connection()
+        caller = users.get_user_by_sub(conn, sub)
+    if caller is None:
+        logger.info("rag-search tools: caller not provisioned (%d calls)", len(calls))
+        return {"results": [{"id": c.get("id") if isinstance(c, dict) else None,
+                             "name": c.get("name") if isinstance(c, dict) else None,
+                             "rows": [], "meta": {"error": "not_provisioned"}}
+                            for c in calls]}
+    vs = scope.visible_scope(conn, caller)
+    sc = {"site_ids": {str(s) for s in vs["site_ids"]},
+          "author_ids": ({str(a) for a in vs["author_ids"]}
+                         if vs["author_ids"] is not None else None),
+          "company_id": caller["company_id"],
+          "cross_company": bool(vs.get("cross_company"))}
+    return rag_tools_dispatch.run(conn, dict(caller, sub=sub), sc, event,
+                                  search_fn=_search, metric_fn=_metric,
+                                  source_family=INDEX_FAMILY)
+
+
 DOCUMENTS_MAX_K = 20
 
 
@@ -287,6 +316,10 @@ def _search(event, context):
     # carries none.
     if event.get("mode") == "metric":
         return _metric(event)
+    # Ask retrieval tools (spec 2026-10-15-ask-retrieval-tools): a batch of
+    # tool calls, no top-level embedding. Additive: no other mode changes.
+    if event.get("mode") == "tools":
+        return _tools(event)
     # Project documents (spec 2026-10-16): their own tables, their own mode. Additive.
     if event.get("mode") == "documents":
         return _documents(event)

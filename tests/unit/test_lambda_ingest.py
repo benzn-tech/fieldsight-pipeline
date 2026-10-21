@@ -129,10 +129,17 @@ def wired(monkeypatch):
     # override this explicitly.
     monkeypatch.setattr(ing.recordings, "site_for_day", lambda conn, uid, user_folder, date: None)
     monkeypatch.setattr(ing.chunks, "delete_chunks_for_source", lambda *a, **k: 0)
-    monkeypatch.setattr(ing.topics, "delete_topics_for_source", lambda *a, **k: 0)
-    monkeypatch.setattr(ing.topics, "delete_topics_for_source_prefix", lambda *a, **k: 0)
+    monkeypatch.setattr(ing.topics, "supersede_topics_for_source", lambda *a, **k: [])
+    monkeypatch.setattr(ing.topics, "supersede_topics_for_source_prefix", lambda *a, **k: [])
     monkeypatch.setattr(ing.topics, "upsert_topic",
                         lambda *a, **k: {"id": "topic-uuid-0"})
+    # Track B final wave (Ruling R19): topic_decisions.insert_decisions /
+    # topic_questions.insert_questions hit conn.cursor(...), which FakeConn does not model
+    # (it only implements .execute()) -- stubbed inert by default here, same reasoning
+    # test_lambda_item_writer.py's own `wired` fixture gives for findings/decision_records.
+    # Tests that care about a specific dual-written row override this.
+    monkeypatch.setattr(ing.topic_decisions, "insert_decisions", lambda *a, **k: [])
+    monkeypatch.setattr(ing.topic_questions, "insert_questions", lambda *a, **k: [])
     monkeypatch.setattr(ing.chunks, "insert_chunk", lambda *a, **k: {"id": "chunk-x"})
     monkeypatch.setattr(ing, "_load_vectors", lambda bucket, sidecar_key: {})
     monkeypatch.setattr(ing, "embed_from_sidecar",
@@ -336,8 +343,8 @@ def test_site_bridge_miss_skips(wired):
     write_calls = []
     wired.setattr(ing.chunks, "delete_chunks_for_source",
                   lambda *a, **k: write_calls.append("delete_chunks"))
-    wired.setattr(ing.topics, "delete_topics_for_source",
-                  lambda *a, **k: write_calls.append("delete_topics"))
+    wired.setattr(ing.topics, "supersede_topics_for_source",
+                  lambda *a, **k: write_calls.append("supersede_topics") or [])
     wired.setattr(ing.topics, "upsert_topic",
                   lambda *a, **k: write_calls.append("upsert_topic") or {"id": "x"})
     wired.setattr(ing.chunks, "insert_chunk",
@@ -354,12 +361,12 @@ def test_site_bridge_miss_skips(wired):
 # Idempotency — source-key delete before insert
 # ---------------------------------------------------------------------------
 
-def test_idempotent_source_delete_before_insert(wired):
+def test_idempotent_source_supersede_before_insert(wired):
     order = []
     wired.setattr(ing.chunks, "delete_chunks_for_source",
                   lambda *a, **k: order.append("delete_chunks"))
-    wired.setattr(ing.topics, "delete_topics_for_source",
-                  lambda *a, **k: order.append("delete_topics"))
+    wired.setattr(ing.topics, "supersede_topics_for_source",
+                  lambda *a, **k: order.append("supersede_topics") or [])
     wired.setattr(ing.topics, "upsert_topic",
                   lambda *a, **k: order.append("upsert_topic") or {"id": "topic-uuid-0"})
     wired.setattr(ing.chunks, "insert_chunk",
@@ -368,7 +375,7 @@ def test_idempotent_source_delete_before_insert(wired):
     ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
 
     assert order.index("delete_chunks") < order.index("upsert_topic")
-    assert order.index("delete_topics") < order.index("upsert_topic")
+    assert order.index("supersede_topics") < order.index("upsert_topic")
     assert order.index("upsert_topic") < order.index("insert_chunk")
 
 
@@ -415,9 +422,9 @@ def test_map_action_items_carries_raw_deadline_text_alongside_date_filter():
 
     assert mapped == [
         {"text": "Order more hard hats", "responsible": "Bob", "deadline": None,
-         "deadline_text": "Friday", "priority": "high"},
+         "deadline_text": "Friday", "priority": "high", "item_id": None},
         {"text": "Submit permit", "responsible": "Alice", "deadline": "2026-07-06",
-         "deadline_text": "2026-07-06", "priority": None},
+         "deadline_text": "2026-07-06", "priority": None, "item_id": None},
     ]
 
 
@@ -657,8 +664,8 @@ def test_user_bridge_null_on_miss(wired):
 
 def test_ingest_supersedes_session_items(wired):
     calls = []
-    wired.setattr(ing.topics, "delete_topics_for_source_prefix",
-                  lambda conn, prefix: calls.append(prefix) or 0)
+    wired.setattr(ing.topics, "supersede_topics_for_source_prefix",
+                  lambda conn, prefix, run: calls.append(prefix) or [])
 
     ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
 
@@ -670,16 +677,16 @@ def test_ingest_supersedes_session_items(wired):
 # flag is on AND extraction topics already exist for (user_folder, date),
 # the nightly report ingest stops overwriting them: no extraction-prefix
 # wipe, no report topics written, no match_request emitted. Chunks still
-# flow (RAG) with topic_id=None. The report-key deletes (delete_chunks_for_
-# source / delete_topics_for_source) run ALWAYS regardless of the flag —
-# stale pre-flip report rows must still clear on re-ingest.
+# flow (RAG) with topic_id=None. The report-key clears (delete_chunks_for_
+# source / supersede_topics_for_source, Track B Task 3) run ALWAYS regardless
+# of the flag — stale pre-flip report rows must still clear on re-ingest.
 # ---------------------------------------------------------------------------
 
 def test_flip_off_behavior_unchanged(wired):
     wired.setattr(ing, "AUTHORITY_FLIP", False)
     prefix_deletes = []
-    wired.setattr(ing.topics, "delete_topics_for_source_prefix",
-                  lambda conn, prefix: prefix_deletes.append(prefix) or 0)
+    wired.setattr(ing.topics, "supersede_topics_for_source_prefix",
+                  lambda conn, prefix, run: prefix_deletes.append(prefix) or [])
     upserts = []
     wired.setattr(ing.topics, "upsert_topic",
                   lambda *a, **k: upserts.append(1) or {"id": "topic-uuid-0"})
@@ -705,11 +712,11 @@ def test_flip_on_with_extractions_defers(wired):
     report_deletes = []
     wired.setattr(ing.chunks, "delete_chunks_for_source",
                   lambda conn, key: report_deletes.append(("chunks", key)) or 0)
-    wired.setattr(ing.topics, "delete_topics_for_source",
-                  lambda conn, key: report_deletes.append(("topics", key)) or 0)
+    wired.setattr(ing.topics, "supersede_topics_for_source",
+                  lambda conn, key, run: report_deletes.append(("topics", key)) or [])
     prefix_deletes = []
-    wired.setattr(ing.topics, "delete_topics_for_source_prefix",
-                  lambda conn, prefix: prefix_deletes.append(prefix) or 0)
+    wired.setattr(ing.topics, "supersede_topics_for_source_prefix",
+                  lambda conn, prefix, run: prefix_deletes.append(prefix) or [])
     upserts = []
     wired.setattr(ing.topics, "upsert_topic",
                   lambda *a, **k: upserts.append(1) or {"id": "topic-uuid-0"})
@@ -742,8 +749,8 @@ def test_flip_on_without_extractions_falls_back_to_legacy(wired):
     wired.setattr(ing, "AUTHORITY_FLIP", True)
     wired.setattr(ing.topics, "has_topics_for_source_prefix", lambda conn, prefix: False)
     prefix_deletes = []
-    wired.setattr(ing.topics, "delete_topics_for_source_prefix",
-                  lambda conn, prefix: prefix_deletes.append(prefix) or 0)
+    wired.setattr(ing.topics, "supersede_topics_for_source_prefix",
+                  lambda conn, prefix, run: prefix_deletes.append(prefix) or [])
     upserts = []
     wired.setattr(ing.topics, "upsert_topic",
                   lambda *a, **k: upserts.append(1) or {"id": "topic-uuid-0"})
@@ -785,23 +792,33 @@ def test_defer_day_links_chunks_to_extraction_topic_by_time(wired):
     # match on time overlap alone.
     wired.setattr(ing, "AUTHORITY_FLIP", True)
     wired.setattr(ing.topics, "has_topics_for_source_prefix", lambda conn, prefix: True)
+    ext_key = "extractions/Jarley_Trainor/2026-03-02/sidEXT1234567890.json"
     wired.setattr(
         ing.topics, "list_extraction_topics_for_day",
         lambda conn, site_id, user_id, report_date: [
-            {"id": "ext-a", "title": "Unrelated title", "occurred_at": "09:02:00"},
+            {"id": "ext-a", "title": "Unrelated title", "occurred_at": "09:02:00",
+             "source_s3_key": ext_key},
         ],
     )
-    captured_topic_ids = []
+    captured = []
     wired.setattr(
         ing.chunks, "insert_chunk",
         lambda conn, site_id, report_date, chunk_type, chunk_text, embedding, **kw:
-            captured_topic_ids.append(kw["topic_id"]) or {"id": "chunk-x"},
+            captured.append(kw) or {"id": "chunk-x"},
     )
 
     ing.ingest_report("2026-03-02", "Jarley_Trainor", REPORT_KEY)
 
+    captured_topic_ids = [kw["topic_id"] for kw in captured]
     assert captured_topic_ids
     assert captured_topic_ids[0] == "ext-a"
+
+    # PR #972 review #1: the matched extraction topic's own source_s3_key must land on
+    # the topic-type (chunk_report) chunk's metadata.source_files -- the only thing that
+    # lets archive_chunks_for_session's session_base arm still find this chunk once R21
+    # unbinds its topic_id on a later supersede of "ext-a". `_load_turns` is stubbed to
+    # [] by `wired`, so chunk_transcripts produces no windows and this is the only chunk.
+    assert captured[0]["metadata"]["source_files"] == [ext_key]
 
 
 def test_defer_day_unmatched_report_topic_stays_none(wired):
@@ -886,10 +903,10 @@ def test_defer_day_two_report_topics_do_not_collide_on_one_extraction(monkeypatc
         {"topic_id": 1, "time_range": "09:01 – 09:04", "topic_title": "Toolbox Talk"},
     ]
 
-    seq_to_id = ing._match_report_topics_to_extraction(
+    seq_to_ext = ing._match_report_topics_to_extraction(
         None, "site-1", "user-1", "2026-03-02", report_topics)
 
-    topic_ids = [seq_to_id.get(0), seq_to_id.get(1)]
+    topic_ids = [seq_to_ext.get(0, {}).get("id"), seq_to_ext.get(1, {}).get("id")]
     assert topic_ids[0] != topic_ids[1]
     non_none = [v for v in topic_ids if v is not None]
     assert len(non_none) == 1
@@ -913,8 +930,8 @@ def test_null_user_reports_do_not_collide(wired, monkeypatch):
     deleted_keys = []
     wired.setattr(ing.chunks, "delete_chunks_for_source",
                   lambda conn, key: deleted_keys.append(("chunks", key)) or 0)
-    wired.setattr(ing.topics, "delete_topics_for_source",
-                  lambda conn, key: deleted_keys.append(("topics", key)) or 0)
+    wired.setattr(ing.topics, "supersede_topics_for_source",
+                  lambda conn, key, run: deleted_keys.append(("topics", key)) or [])
     wired.setattr(ing.topics, "upsert_topic", lambda *a, **k: {"id": "t-uuid"})
     wired.setattr(ing.chunks, "insert_chunk", lambda *a, **k: {"id": "c-uuid"})
     # user bridge misses for both (wired fixture's get_by_folder_name returns None)

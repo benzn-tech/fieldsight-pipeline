@@ -57,7 +57,7 @@ def test_actions_reach_the_reader_through_this_path_too():
     actions = _sections(shape).get("Actions")
     assert actions, "an action item on a topic must become an Actions row"
     assert actions["rows"][0]["action"] == "Chase the steel delivery"
-    assert actions["rows"][0]["due"] == "2026-07-16"
+    assert actions["rows"][0]["due"] == "Thu 16 Jul 2026"   # the day, as every surface shows it
 
 
 def test_no_on_site_panel_of_zeros_on_this_path():

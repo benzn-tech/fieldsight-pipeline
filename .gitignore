@@ -4,7 +4,9 @@
 *.key
 
 # Claude Code local settings
-.claude/
+.claude/*
+# Shared agent definitions are repo content; everything else under .claude/ stays local.
+!.claude/agents/
 
 # Python
 __pycache__/
@@ -54,3 +56,10 @@ uv.lock
 # (voiceprint_eval/), never in the repository.
 runs/
 clips*.json
+
+# Continuity eval harness output (scripts/continuity_eval): real session transcripts
+# and extractions, from TEST and read-only PROD. Only committed counts leave here.
+continuity_eval_runs/
+
+# Ask routing eval: per-run answers and routes (may hold answer text), never committed.
+tools/ask-routing-eval/results/

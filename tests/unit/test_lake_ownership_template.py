@@ -220,6 +220,17 @@ PRE_EXISTING_DELETERS = {
     "SessionFinalizeFunction",
 }
 
+# Deleters added later whose every DeleteObject resource is confined to a prefix that
+# holds no lake data. The device Ask turn store (ask_turns/) is transient per-turn state:
+# the result route deletes a turn once served, and start sweeps a caller's day-old turns.
+# The Ask thread store (ask_threads/, spec 2026-10-22) holds a caller's last five
+# conversations: the worker evicts beyond five. No lake data under either prefix.
+CONFINED_DELETERS = {
+    "ApiFunction": "/ask_turns/*",
+    "AskAgentFunction": "/ask_turns/*",
+    "AskVoiceWorkerFunction": "/ask_threads/*",
+}
+
 
 def test_delete_is_confined_to_the_manifest_for_lake_ops_and_added_nowhere_else():
     res = _resources()
@@ -231,8 +242,14 @@ def test_delete_is_confined_to_the_manifest_for_lake_ops_and_added_nowhere_else(
                 for r in resources), s
     deleters = {name for name, block in res.items()
                 if any(_has_action(s, "s3:DeleteObject") for s in _statements(block))}
-    assert deleters - {"LakeOpsFunction"} <= PRE_EXISTING_DELETERS, \
-        f"new s3:DeleteObject grant: {sorted(deleters - {'LakeOpsFunction'} - PRE_EXISTING_DELETERS)}"
+    for name, suffix in CONFINED_DELETERS.items():
+        for s in _statements(res[name]):
+            if _has_action(s, "s3:DeleteObject"):
+                resources = re.findall(r"arn:aws:s3:::\$\{\w+\}[^\s]*", s)
+                assert resources and all(r.rstrip("'\"").endswith(suffix) for r in resources), (name, s)
+    allowed = PRE_EXISTING_DELETERS | set(CONFINED_DELETERS)
+    assert deleters - {"LakeOpsFunction"} <= allowed, \
+        f"new s3:DeleteObject grant: {sorted(deleters - {'LakeOpsFunction'} - allowed)}"
 
 
 def test_put_object_tagging_is_granted_to_lake_ops_only():
@@ -298,10 +315,14 @@ LAKE_PUT_CALLERS = {
 # completeness scan below accepts them only if listed here with the reason.
 IMPORTS_BUT_NEVER_WRITES = {
     "AskAgentFunction": "imports pipeline_trace via llm_usage; never flushes a trace",
+    "AskVoiceWorkerFunction": "runs AskAgent's code path; never flushes a trace",
+    "ApiFunction": "imports ask_voice_turn for its turn-store helpers only",
     "MatcherFunction": "imports pipeline_trace via llm_usage; never flushes a trace",
     "SessionActivityFunction": "imports helpers; calls none of the writers",
     "RecordingSegmentsFunction": "reads transcripts only; its own test forbids PutObject",
     "SpeakerEmbedFunction": "reads a raw window via batch_seal; never seals",
+    "CheckGapsFunction": ("reads transcripts via extract_session's gather/assemble; "
+                          "read-only by spec (check done 2026-10-20)"),
 }
 
 

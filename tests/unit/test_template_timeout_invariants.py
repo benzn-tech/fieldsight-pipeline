@@ -47,6 +47,10 @@ OVERLAP_ACCEPTED = {
 # the plan research (lambda-timeout-tiers.md, "Sync callee chains").
 SYNC_CALLEES = [
     ("AskAgentFunction", "RagSearchFunction"),
+    ("AskVoiceWorkerFunction", "RagSearchFunction"),
+    # Check done (spec 2026-10-20): worker -> gap pass -> its in-VPC DB hop.
+    ("AskVoiceWorkerFunction", "CheckGapsFunction"),
+    ("CheckGapsFunction", "CheckGapsDbFunction"),
     ("WsSendVoiceFunction", "VoiceResolveFunction"),
     ("SpeakerEmbedFunction", "VoiceprintWriterFunction"),
     ("MatcherFunction", "SuggestionWriterFunction"),

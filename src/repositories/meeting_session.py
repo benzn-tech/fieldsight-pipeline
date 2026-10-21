@@ -453,3 +453,29 @@ def members_for_groups(conn, group_ids) -> dict:
         out.setdefault(r["gid"], []).append(
             {"site_id": r["site_id"], "site_company_id": r["site_company_id"]})
     return out
+
+
+def latest_for_user_near(conn, user_id, at_epoch, window_s=300) -> dict | None:
+    """The caller's session most recently active within `window_s` of `at_epoch`
+    (check done, spec 2026-10-20): "the recording he is in" when he presses Ask.
+
+    Activity is COALESCE(last_segment_at, opened_at) -- the idle sweep's anchor.
+    `last_segment_at` is server time written for every chunk (silent ones
+    included, by their VAD sidecar), but a session opened by /upload-url seconds
+    ago has none yet, and that is exactly when a short check can end. Bound by
+    `user_id` alone: the session's company may be the project's, not his.
+
+    No status filter, on purpose: a session already closed (pending_close, sent)
+    within the window still counts. "Pre-pour check done" is often said just
+    after he stops recording, and that recording is still the one he means."""
+    if not user_id:
+        return None
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {_COLS} FROM meeting_session "
+        f"WHERE user_id = %s "
+        f"AND COALESCE(last_segment_at, opened_at) "
+        f"    BETWEEN to_timestamp(%s) - make_interval(secs => %s) "
+        f"        AND to_timestamp(%s) + make_interval(secs => %s) "
+        f"ORDER BY COALESCE(last_segment_at, opened_at) DESC LIMIT 1",
+        (str(user_id), at_epoch, window_s, at_epoch, window_s),
+    ).fetchone()

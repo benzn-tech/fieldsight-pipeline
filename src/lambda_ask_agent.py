@@ -13,6 +13,7 @@ Environment Variables:
 """
 
 import os
+import re
 import json
 import logging
 import time
@@ -678,7 +679,7 @@ def _rag_search_list(body):
             date_range = {"from": q_from, "to": q_to, "source": "question"}
             # Only a time phrase and generic "what happened" words: nothing to
             # rank by, so list what happened in the range instead.
-            browse = search_browse.is_content_free(question)
+            browse = search_browse.is_content_free(question, today)
             if browse:
                 k = 64  # rag-search's maximum
 
@@ -805,11 +806,59 @@ def _classify_for_route(web_answer, asked, chunks, gated, started, route):
     return cls
 
 
+def _intent_cls(chunks, skip, route):
+    """Explicit "search online" (`web_intent`): no classify, no distance-gate
+    skip. Same shape `_classify_for_route` returns. `general` when no chunk
+    passed the gate (or there are none), else `mixed` with the records useful."""
+    mixed = bool(chunks) and not skip
+    cls = {"kind": "mixed" if mixed else "general", "records_answer": mixed,
+           "source": "intent"}
+    route["ms"]["classify"] = 0
+    route["kind"] = cls["kind"]
+    route["records_answer"] = cls["records_answer"]
+    route["classify"] = cls["source"]
+    return cls
+
+
+def _announce_web_start(on_web_start):
+    """Tell the caller the slow web lookup is starting. Never raises."""
+    if on_web_start is None:
+        return
+    try:
+        on_web_start()
+    except Exception as exc:                              # noqa: BLE001
+        logger.warning("  on_web_start failed: %s", exc)
+
+
+_SENTENCE = re.compile(r"[^.!?]+[.!?]+(?=\s|$)")
+_VOICE_CITATION = re.compile(r"\s*\[\d+(?:\s*[,\-–]\s*\d+)*\]")
+
+
+def _speakable_web_answer(answer, records_answer):
+    """Voice only: a web-derived answer is read aloud, so drop [n] markers and
+    fall back to the records answer (else NO_CLEAR_ANSWER) if it is not
+    speakable. Screen mode never calls this."""
+    import voice_web
+    cleaned = _VOICE_CITATION.sub("", answer or "").strip()
+    if voice_web.speakable(cleaned):
+        return cleaned
+    # Too long is the common miss (measured on TEST 2026-10-15): the first two
+    # sentences usually carry the answer and its source, so try them before
+    # giving the turn away to the records text.
+    head = " ".join(s.strip() for s in _SENTENCE.findall(cleaned)[:2])
+    if head and voice_web.speakable(head):
+        return head
+    fallback = _VOICE_CITATION.sub("", records_answer or "").strip()
+    if fallback and voice_web.speakable(fallback):
+        return fallback
+    return voice_web.NO_CLEAR_ANSWER
+
+
 def _records_useful(cls, chunks):
     return bool(cls["records_answer"]) and bool(chunks)
 
 
-def _general_run(web_answer, question, cls, chunks, started, route):
+def _general_run(web_answer, question, cls, chunks, started, route, voice=False):
     """draft -> verify for a general or mixed question. Runs on a worker thread
     beside the records synthesis; writes only its own keys of `route`. Only the
     asker's own `question` goes out. Mixed (and general with useful records)
@@ -817,7 +866,8 @@ def _general_run(web_answer, question, cls, chunks, started, route):
     reserve = (web_answer.COMPOSE_RESERVE
                if cls["kind"] != "project" and _records_useful(cls, chunks) else 0.0)
     left = web_answer.HARD_STOP_SECONDS - (time.monotonic() - started)
-    gen = web_answer.general_answer(question, left - reserve, kind=cls["kind"])
+    gen = web_answer.general_answer(question, left - reserve, kind=cls["kind"],
+                                    voice=voice)
     trace = gen.pop("_trace", {})
     route["general_status"] = gen["status"]
     route["retried"] = bool(trace.get("retried"))
@@ -1064,7 +1114,7 @@ def _metric_answer(caller_sub, question, metric, date_from, date_to, applied_sco
     }
 
 
-def _rag_answer(body):
+def _rag_answer(body, on_web_start=None):
     """RAG path: embed the question, invoke RAG_SEARCH_FUNCTION for grounded
     chunks (ACL-narrowed to caller_sub's accessible sites), then synthesize
     a cited markdown answer via llm_utils.call_llm. Returns a plain
@@ -1182,7 +1232,17 @@ def _rag_answer(body):
             # floor makes `standalone_question` skip the call and fall back
             # to `question` -- an existing, tested path -- so the rewrite
             # can never be the thing that blows the budget.
-            deadline_left = ASK_DEADLINE_SECONDS - (time.monotonic() - _started)
+            # prompt_only callers (the voice endpoint) carry their own, shorter
+            # budget; a missing or unusable one falls back to the default.
+            _base = ASK_DEADLINE_SECONDS
+            if body.get("prompt_only"):
+                try:
+                    _ds = float(body.get("deadline_s"))
+                    if _ds > 0 and _ds == _ds and _ds != float("inf"):
+                        _base = _ds
+                except (TypeError, ValueError):
+                    pass
+            deadline_left = _base - (time.monotonic() - _started)
             _t_rewrite = time.monotonic()
             asked, rewritten = ask_rewrite.standalone_question(
                 question, history,
@@ -1203,6 +1263,7 @@ def _rag_answer(body):
         # gain by lying about it.
         import answer_language
         import query_slots
+        import voice_web
         today = query_slots.resolve_today(body.get("tz"), now=_parse_now(body.get("now")))
         # ALWAYS from the ORIGINAL question first -- `asked` is read only as a
         # fallback below, and never to move an anchor the caller already gave.
@@ -1357,11 +1418,62 @@ def _rag_answer(body):
         # actually built from, not the wider set fetched to choose from.
         chunks = _rerank_chunks(question, chunks, k)
         basis = _basis(result, chunks, date_from, date_to)
+        # The source manifest for Ask threads (spec 2026-10-22 §4): every chunk
+        # the answer may be built from, cited or not. Only the returns whose text
+        # can carry record content attach it; the worker strips it before `done`
+        # and the sync handler before it serialises, so no client ever sees it.
+        # A pinned topic block has no source key, so the topic itself is named:
+        # the re-check withholds the answer once that topic stops being visible.
+        import ask_threads
+        _sources = ask_threads.sources_from_chunks(
+            chunks, None,
+            topic_ids=[(pinned_topic or {}).get("id"), scope_req.get("topic_row_id")]
+            if pinned_topic else None)
         # A scoped ask (day/site/author/topic) never consults the web: the web
         # cannot know that site or day (spec 2026-09-15 §4.2 step 7). Computed
         # once so the empty-retrieval branch and the pre-synthesis check below
         # cannot drift apart.
         scoped = narrowed or plan["body_date_sent"]
+        _voice = body.get("mode") == "voice"
+        # Screen web offer (spec 2026-10-16 section 3): every screen change hangs
+        # on this. JSON true only, as the API forwards it; a screen body without
+        # it (prod UI, old clients) keeps `_wi` False and behaves as it always has.
+        _screen_opt = (not _voice) and body.get("offer_web") is True
+        _wi_typed = False
+        if _voice:
+            # "Search online" only counts on a voice turn that opted into web.
+            _wi = bool(body.get("web_intent")) and bool(body.get("voice_web"))
+        else:
+            # Screen: an accepted offer (`web_intent`) or the phrase typed, never
+            # on a scoped turn -- the web cannot know that site or day.
+            _wi_typed = (_screen_opt and not scoped
+                         and body.get("web_intent") is not True
+                         and voice_web.detect_intent(question)[0])
+            _wi = (_screen_opt and not scoped
+                   and (body.get("web_intent") is True or _wi_typed))
+        # Voice two-phase: instead of going online unasked, say the records do not
+        # cover it and offer (spec 2026-10-15 voice offer). An explicit "search
+        # online" (`_wi`) is the caller's answer to that offer, so it wins. The
+        # screen offers the same way once it opted in.
+        _offer = ((_voice and bool(body.get("offer_web")) and not _wi)
+                  or (_screen_opt and not scoped and not _wi))
+        _offer_text = (voice_web.OFFER_NO_RECORDS if _voice
+                       else voice_web.SCREEN_OFFER_NO_RECORDS)
+        # What the web sees. The voice worker strips the phrase before this
+        # point; a typed screen phrase is stripped here. Retrieval, the rewrite
+        # and the records prompt keep `question` / `asked`.
+        web_question = (voice_web.detect_intent(question)[1] if _wi_typed
+                        else question)
+        _append_offer = False
+        # A question that names its own time ("yesterday", "last week") is about
+        # what the team recorded then, on either channel: it never runs the
+        # general/web flow unless the caller said "search online". The web cannot
+        # know the site or the day; the records can say what IS there instead
+        # ("nothing on the 14th, the latest is the 12th"). Owner, TEST 2026-10-15:
+        # the screen answered "What did we do yesterday?" with general guidance.
+        # `q_from`, not `orig_q_from`: a date only the history rewrite supplies
+        # ("and the day before?") closes the web too -- closing is the safe side.
+        _time_anchored = bool(q_from) and not _wi
 
         if result.get("error"):
             # Distinguish "caller not provisioned" / ACL misses from genuine
@@ -1383,21 +1495,44 @@ def _rag_answer(body):
             # no-records path (spec 2026-09-15 §4.2 step 7): the web cannot know
             # that site or day, and the UI's "Ask across everything" offer
             # depends on the no-answer result.
-            if body.get("mode") != "voice" and not result.get("error") and not scoped:
+            if ((body.get("mode") != "voice" or body.get("voice_web"))
+                    and not result.get("error")
+                    and (not scoped or _wi)
+                    and not _time_anchored):
                 import web_answer
+                if _offer and not scoped and web_answer.enabled() and question:
+                    # Nothing retrieved and the web is available: offer it, spend
+                    # no web call and no classification.
+                    return {
+                        "answer": _offer_text,
+                        "web_offer": True,
+                        "grounded": True,
+                        "citations": [],
+                        "basis": basis,
+                        "applied_scope": applied_scope,
+                        "asked": asked if rewritten else None,
+                    }
                 if web_answer.enabled() and question:
                     # Nothing retrieved: no classification is spent (it would
                     # judge an empty list). The general flow runs alone --
                     # "project + no records" falls back to it by design (spec D2).
                     _t_web = time.monotonic()
-                    _cls = _classify_for_route(web_answer, asked, [], False,
-                                               _started, route)
-                    empty_web = _general_run(web_answer, question, _cls, [],
-                                             _started, route)
+                    if _wi:
+                        _cls = _intent_cls([], True, route)
+                    else:
+                        _cls = _classify_for_route(web_answer, asked, [], False,
+                                                   _started, route)
+                    _announce_web_start(on_web_start)
+                    empty_web = _general_run(web_answer, web_question, _cls, [],
+                                             _started, route,
+                                             voice=body.get("mode") == "voice")
                     marks["synthesis"] = time.monotonic() - _t_web
                     if empty_web.get("answer"):
+                        _empty_answer = empty_web["answer"]
+                        if body.get("mode") == "voice":
+                            _empty_answer = _speakable_web_answer(_empty_answer, None)
                         return {
-                            "answer": empty_web["answer"],
+                            "answer": _empty_answer,
                             "citations": [],
                             "grounded": False,
                             "from_web": True,
@@ -1408,8 +1543,11 @@ def _rag_answer(body):
                         }
                     # The draft failed too. The reader is still told what
                     # happened to the outside lookup (D5), never nothing.
+                    _d5 = "No relevant records found for this question."
+                    if body.get("mode") == "voice":
+                        _d5 = _speakable_web_answer(_d5, None)
                     return {
-                        "answer": "No relevant records found for this question.",
+                        "answer": _d5,
                         "citations": [],
                         "grounded": True,
                         "web": empty_web,
@@ -1455,6 +1593,28 @@ def _rag_answer(body):
                                   mode=body.get("mode"),
                                   today=today, basis=basis, pinned_topic=pinned_topic)
 
+        if body.get("prompt_only"):
+            # Voice agent (spec 2026-10-14 phase 2 section 4): every rule above
+            # has run; Node streams the synthesis with exactly the request this
+            # path would have sent. Nothing below (web check, synthesis,
+            # language retry) runs for this caller. Resolved the same way as
+            # the synthesis call further down: the voice model applies to
+            # mode=voice only, and travels with enable_thinking=False.
+            _vm = os.environ.get("ASK_VOICE_MODEL", "").strip()
+            _vm = None if _vm.lower() in ("", "none") else _vm
+            if body.get("mode") != "voice":
+                _vm = None
+            _req = llm_utils.build_qwen_payload(
+                prompt, MAX_ANSWER_TOKENS, False,
+                enable_thinking=(False if _vm else None), model=_vm)
+            return {
+                "kind": "prompt", "prompt": prompt,
+                "asked": asked, "rewritten": bool(rewritten),
+                "chunk_ids": [str(c.get("id")) for c in chunks if c.get("id") is not None],
+                "basis": basis, "history_turns": history_turns,
+                "llm": {k: _req.get(k) for k in ("model", "reasoning", "max_tokens", "temperature")},
+            }
+
         # With no chunks this can only be a pinned topic, which is the reader's
         # own record; asking the web whether records answer it would judge an
         # empty list.
@@ -1466,7 +1626,8 @@ def _rag_answer(body):
         # Flag off (ENABLE_WEB_ANSWER) skips the whole general flow, classify
         # included: today's records-only behaviour, one synthesis call, below.
         _cls = None
-        if (body.get("mode") != "voice" and chunks and not scoped
+        if ((body.get("mode") != "voice" or body.get("voice_web")) and chunks
+                and (not scoped or _wi)
                 and not pinned_topic and _web_answer_enabled()):
             import web_answer
 
@@ -1561,13 +1722,46 @@ def _rag_answer(body):
             # records synthesis only for a project/mixed question or a general
             # one whose records are useful. A gated or not-useful set pays no
             # synthesis. The records path is ~2.5 s slower for it.
-            _cls = _classify_for_route(web_answer, asked, chunks, _skip, _started, route)
+            if _wi:
+                _cls = _intent_cls(chunks, _skip, route)
+            else:
+                _cls = _classify_for_route(web_answer, asked, chunks, _skip, _started, route)
             _useful = _records_useful(_cls, chunks)
             _run_general = _cls["kind"] != "project" or not _useful
+            # A project question stays on the records, even when they do not
+            # hold the answer, on both channels. The records synthesis can say
+            # what IS there ("nothing on the 14th, the latest is the 12th"); the
+            # web cannot know the site. On the device "What did we do yesterday?"
+            # played "searching online" (2026-10-15, fixed for voice in #1120);
+            # the screen prefixed PROJECT_FALLBACK_LEAD to general guidance.
+            # Only an explicit "search online" (`_wi`) sends a turn out. A
+            # time-anchored question stays too, whatever the label: a distance-
+            # gated set is labelled "general" without a model call.
+            if not _wi and (_cls["kind"] == "project" or _time_anchored):
+                _run_general = False
+            if _offer and _run_general:
+                if not _useful:
+                    # Records cannot answer it (including a distance-gated set):
+                    # no synthesis, no web, just the offer.
+                    return {
+                        "answer": _offer_text,
+                        "web_offer": True,
+                        "grounded": True,
+                        "citations": [],
+                        "basis": basis,
+                        "applied_scope": applied_scope,
+                        "asked": asked if rewritten else None,
+                    }
+                # Records answer part of it: speak that, then offer the web.
+                _run_general = False
+                _append_offer = True
             _t_synthesis = time.monotonic()
+            if _run_general:
+                _announce_web_start(on_web_start)
             with ThreadPoolExecutor(max_workers=2) as _pool:
-                _fut_web = (_pool.submit(_general_run, web_answer, question, _cls,
-                                         chunks, _started, route)
+                _fut_web = (_pool.submit(_general_run, web_answer, web_question, _cls,
+                                         chunks, _started, route,
+                                         voice=body.get("mode") == "voice")
                             if _run_general else None)
                 # DEADLINE (review F2): llm_utils' ladder is 4 x 150 s, and the
                 # `with` joins this thread, so an unbounded synthesis could hold
@@ -1635,8 +1829,9 @@ def _rag_answer(body):
                     try:
                         import web_answer
                         _merged = web_answer.compose(
-                            _grounded[0], web, question,
-                            web_answer.HARD_STOP_SECONDS - (time.monotonic() - _started))
+                            _grounded[0], web, web_question,
+                            web_answer.HARD_STOP_SECONDS - (time.monotonic() - _started),
+                            voice=body.get("mode") == "voice")
                     except Exception as _cmp_exc:            # noqa: BLE001
                         logger.error("  Ask compose failed: %s", _cmp_exc)
                         _merged = {"answer": _grounded[0], "conflicts": [],
@@ -1644,6 +1839,17 @@ def _rag_answer(body):
                     route["ms"]["compose"] = int((time.monotonic() - _t_compose) * 1000)
                     _answer = _merged["answer"]
                     web["conflicts"] = _merged["conflicts"]
+                    # Voice: a failed compose would otherwise speak only the
+                    # records text, which on TEST was "the reports do not
+                    # contain ..." after the caller asked to search online
+                    # (4 of 26 web turns, 2026-10-15). The web answer is what
+                    # this route exists to give; the guard below still falls
+                    # back to the records text if it cannot be spoken.
+                    if (body.get("mode") == "voice" and not _merged.get("composed")
+                            and web.get("answer")):
+                        _answer = web["answer"]
+                if body.get("mode") == "voice":
+                    _answer = _speakable_web_answer(_answer, _grounded[0])
                 return {
                     "answer": _answer,
                     "citations": _build_citations(chunks),
@@ -1653,6 +1859,7 @@ def _rag_answer(body):
                     "basis": basis,
                     "applied_scope": applied_scope,
                     "asked": asked if rewritten else None,
+                    "_sources": _sources,
                 }
             if _useful:
                 logger.warning(
@@ -1660,12 +1867,16 @@ def _rag_answer(body):
                     "carries the response alone (err=%s)",
                     _grounded[1] if _grounded else "not attempted")
             _answer = web["answer"]
-            if _cls is not None and _cls["kind"] == "project" and not _useful:
+            if (_cls is not None and _cls["kind"] == "project" and not _useful
+                    and body.get("mode") != "voice"):
                 # PROJECT-FALLBACK ROUTE ONLY: a project question the records
                 # could not answer. Said by the CODE, not the model (TEST
                 # 2026-10-06: the model opened with "Project Records:
                 # Confirmed. ..."). `web.answer` stays the general answer alone.
                 _answer = (PROJECT_FALLBACK_LEAD + "\n\n" + _answer)
+            if body.get("mode") == "voice":
+                _answer = _speakable_web_answer(_answer, None)
+            # The general flow was handed `chunks`, so its text can carry them.
             return {
                 "answer": _answer,
                 "citations": [],
@@ -1675,6 +1886,7 @@ def _rag_answer(body):
                 "basis": basis,
                 "applied_scope": applied_scope,
                 "asked": asked if rewritten else None,
+                "_sources": _sources,
             }
 
         if _cls is not None and _grounded is None and web is not None:
@@ -1826,6 +2038,11 @@ def _rag_answer(body):
         # reorder here without also renumbering the prompt. See _build_citations.
         citations = _build_citations(chunks)
 
+        # Voice speaks the offer; the screen's button is the offer, so the
+        # screen gets the `web_offer` flag below and no appended text.
+        if _append_offer and _voice:
+            answer = (answer or "").rstrip() + " " + voice_web.OFFER_ALSO
+
         return {
             "answer": answer,
             "answer_language": answer_language.policy(),
@@ -1843,6 +2060,8 @@ def _rag_answer(body):
             # told what happened to the outside lookup (D5). Absent for a
             # project question, which never ran it.
             **({"web": web} if web is not None else {}),
+            **({"web_offer": True} if _append_offer else {}),
+            "_sources": _sources,
         }
     except Exception as e:
         logger.error(f"  RAG path failed: {e}")
@@ -2151,6 +2370,17 @@ def lambda_handler(event, context):
     # back out of this branch. (This is separate from the company's CDK-
     # managed production account, which runs a different template entirely
     # and never has RAG_SEARCH_FUNCTION -- see fieldsight-two-accounts.)
+    if body.get('mode') == 'voice_start':
+        # Device Ask two-phase: the turn module is loaded on this path only.
+        import ask_voice_turn
+        return ok(ask_voice_turn.start(body))
+
+    if body.get('mode') == 'turn_start':
+        # Screen Ask on the async turn store: returns {turn_id} at once and the
+        # AskVoiceWorker answers it (spec 2026-10-15 ask orchestration v2 s4).
+        import ask_voice_turn
+        return ok(ask_voice_turn.start_screen(body))
+
     if body.get('audio') and os.environ.get('RAG_SEARCH_FUNCTION'):
         # Refuse before STT is spent: _voice_answer needs a caller_sub for the ACL.
         if not body.get('caller_sub'):
@@ -2191,7 +2421,18 @@ def lambda_handler(event, context):
     if body.get('caller_sub') and os.environ.get('RAG_SEARCH_FUNCTION'):
         if body.get('mode') == 'search':
             return ok(_rag_search_list(body))
-        return ok(_rag_answer(body))
+        result = _rag_answer(body)
+        # The Ask-threads source manifest is for the async worker only (spec
+        # 2026-10-22 §4); this path never stores a turn, so it never sends it.
+        import ask_threads
+        ask_threads.pop_sources(result)
+        if body.get("prompt_only") and "kind" not in result:
+            # The early returns (metric route, rag-search error, empty
+            # retrieval) and the outer except carry a finished answer, not a
+            # prompt. Node speaks it verbatim; an empty one becomes the
+            # fallback line on the Node side.
+            result = {"kind": "answer", **result}
+        return ok(result)
 
     # The company-blind S3 path (load_report/load_transcripts by a named user) was
     # removed 2026-10: a deploy without a rag-search function has nothing safe to

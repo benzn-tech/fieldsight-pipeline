@@ -1,0 +1,7 @@
+{
+  "key": "fixture-key-not-secret",
+  "now": 1800000000,
+  "sub": "11111111-2222-3333-4444-555555555555",
+  "token": "eyJzdWIiOiIxMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUiLCJhdWQiOiJ2b2ljZS1sbG0iLCJleHAiOjE4MDAwMDAzMDB9.vMuC_b_xius5_A54ELpUrBO1yjeX9namAxPftZsl4w4",
+  "expires_at": 1800000300
+}

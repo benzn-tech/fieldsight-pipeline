@@ -132,7 +132,7 @@ def test_a_content_free_browse_makes_no_documents_call(env, monkeypatch):
     import query_slots
     import search_browse
     monkeypatch.setattr(query_slots, "time_range", lambda q, today: ("2026-10-15", "2026-10-15"))
-    monkeypatch.setattr(search_browse, "is_content_free", lambda q, *today: True)
+    monkeypatch.setattr(search_browse, "is_content_free", lambda q, today: True)
     fake = env(FakeLambda(documents=[ROW]))
     out = laa._rag_search_list(_body(question="what happened yesterday"))
     assert len(fake.events) == 1 and "documents" not in out and out.get("browse") is True

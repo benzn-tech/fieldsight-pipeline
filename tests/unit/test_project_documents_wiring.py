@@ -120,11 +120,11 @@ def test_ingest_may_read_the_vectors_and_tell_missing_from_denied():
     assert "project_doc_vectors/*" in _list_prefixes(fn)
 
 
-def test_the_flag_exists_defaults_off_and_reaches_all_three_functions():
+def test_the_flag_exists_defaults_off_and_reaches_all_four_functions():
     p = _tpl()["Parameters"]["ProjectDocuments"]
     assert p["Default"] == "false" and p["AllowedValues"] == ["true", "false"]
-    # main has no AskVoiceWorkerFunction yet; it joins this list when the agentic Ask ships.
-    for name in ("OrgApiFunction", "RagSearchFunction", "AskAgentFunction"):
+    for name in ("OrgApiFunction", "RagSearchFunction", "AskAgentFunction",
+                 "AskVoiceWorkerFunction"):
         assert _fn(name)["Environment"]["Variables"]["PROJECT_DOCUMENTS"] == "ProjectDocuments", name
 
 

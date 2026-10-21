@@ -365,7 +365,13 @@ def test_handler_invalid_progress_coerced_and_no_status_drops_suggestion(monkeyp
     )
     result = lpm.lambda_handler(_match_request_event(req_key), None)
     assert result["suggestions"] == []
-    assert fake_lambda.invoke_calls == []
+    # Track B Task 6a: the double gate still ACCEPTED this verdict (T-1 is a
+    # survivor, confidence 0.9 >= CONF_MIN) -- only the real-change filter
+    # dropped the suggestion, so a decision record is still written (and the
+    # writer is still invoked to carry it) even though `suggestions` is empty.
+    assert len(result["verdicts"]) == 1
+    assert result["verdicts"][0]["auto_outcome"] == "accepted"
+    assert len(fake_lambda.invoke_calls) == 1
 
 
 def test_handler_invalid_progress_coerced_valid_status_still_suggests(monkeypatch):
@@ -466,7 +472,8 @@ def test_handler_clean_match_produces_one_suggestion(monkeypatch):
 
     assert len(fake_lambda.invoke_calls) == 1
     sent = json.loads(fake_lambda.invoke_calls[0]["Payload"])
-    assert sent == {"suggestions": result["suggestions"], "impacts": result["impacts"]}
+    assert sent == {"suggestions": result["suggestions"], "impacts": result["impacts"],
+                    "verdicts": result["verdicts"]}
 
 
 def test_handler_below_threshold_produces_zero(monkeypatch):
@@ -475,7 +482,12 @@ def test_handler_below_threshold_produces_zero(monkeypatch):
     result = lpm.lambda_handler(_match_request_event(req_key), None)
 
     assert result["suggestions"] == []
-    assert fake_lambda.invoke_calls == []
+    # Track B Task 6a: a below-threshold verdict is now a decision record
+    # (auto_outcome='rejected'), not a silent drop -- so the writer IS
+    # invoked, just with no suggestion in the payload.
+    assert len(result["verdicts"]) == 1
+    assert result["verdicts"][0]["auto_outcome"] == "rejected"
+    assert len(fake_lambda.invoke_calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -583,7 +595,12 @@ def test_handler_progress_decrease_not_real_change(monkeypatch):
     result = lpm.lambda_handler(_match_request_event(req_key), None)
 
     assert result["suggestions"] == []
-    assert fake_lambda.invoke_calls == []
+    # Track B Task 6a: the double gate ACCEPTED this verdict; only the
+    # real-change filter dropped the suggestion, so a decision record is
+    # still written and the writer is still invoked to carry it.
+    assert len(result["verdicts"]) == 1
+    assert result["verdicts"][0]["auto_outcome"] == "accepted"
+    assert len(fake_lambda.invoke_calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -734,10 +751,11 @@ def test_handler_collects_impacts_and_invokes_writer_once(monkeypatch):
     assert impact["impact_evidence"]["llm_confidence"] == 0.9
     assert impact["impact_evidence"]["programme_updated_at"] == "2026-07-10T00:00:00Z"
 
-    # ONE writer invoke carrying BOTH keys, after everything is processed.
+    # ONE writer invoke carrying every key, after everything is processed.
     assert len(fake_lambda.invoke_calls) == 1
     sent = json.loads(fake_lambda.invoke_calls[0]["Payload"])
-    assert sent == {"suggestions": result["suggestions"], "impacts": result["impacts"]}
+    assert sent == {"suggestions": result["suggestions"], "impacts": result["impacts"],
+                    "verdicts": result["verdicts"]}
 
 
 def test_report_artifact_without_findings_skips_impact_phase(monkeypatch):

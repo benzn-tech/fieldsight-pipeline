@@ -22,6 +22,8 @@ reworded into something the customer did not ask.
 import difflib
 import re
 
+import due_display
+
 ANSWERS = {"yes": "Yes", "y": "Yes", "no": "No", "n": "No", "n/a": "N/A", "na": "N/A",
            "not applicable": "N/A"}
 MODEL_COLUMNS = ["Item no", "Answer", "Comment", "Responsible", "Due", "Evidence"]
@@ -37,6 +39,10 @@ EVIDENCE_MATCH = 0.9
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
 _TAG_RE = re.compile(r"\s*\[\s*(t\d+(?:\s*(?:,|and|&)\s*t\d+)*)\s*\]\s*$", re.IGNORECASE)
+# The head of a transcript line: "[10:56:18] " (check done) or
+# "[09:01:02 – 09:01:09] Ben Lin (spk_1): " (transcript_utils.format_turns_for_prompt).
+# Only a label ending in "(speaker):" is a head; "Note:" at the start of speech is speech.
+_HEAD_RE = re.compile(r"^\[[^\]\n]*\]\s*(?:[^():\n]*\([^()\n]*\):\s*)?", re.MULTILINE)
 
 
 def shape_sentence():
@@ -75,6 +81,13 @@ def validate_items(items, where):
 
 def _words(text):
     return _WORD_RE.findall((text or "").lower())
+
+
+def transcript_words(transcript_text):
+    """The words that were said, for evidence_found: each line's time / speaker
+    head removed, so a quote spoken across two turns or two recording chunks
+    matches as the one sentence it was."""
+    return _words(_HEAD_RE.sub("", transcript_text or ""))
 
 
 def evidence_found(quote, transcript_words):
@@ -123,10 +136,14 @@ def _model_rows(paragraphs, line_refs):
     return out
 
 
-def rebuild(section, items, transcript_text):
+def rebuild(section, items, transcript_text, report_date=None):
     """The checklist section rebuilt from the model's rows. Returns
-    (paragraphs, line_refs, report). `section` is a _prose_sections dict."""
-    t_words = _words(transcript_text)
+    (paragraphs, line_refs, report). `section` is a _prose_sections dict.
+
+    Due is rewritten as the day it names ("tomorrow morning" -> "Tue 13 Oct
+    2026, morning"), anchored on `report_date`; what names no day stays as the
+    model wrote it."""
+    t_words = transcript_words(transcript_text)
     answered, report = {}, {"items": len(items), "answered": 0, "dropped": [],
                             "evidence": {},
                             # What the inspector did not do (owner, 2026-10-16): items the
@@ -150,6 +167,7 @@ def rebuild(section, items, transcript_text):
         if why:
             report["dropped"].append({"item": num, "reason": why})
             continue
+        due = due_display.display(due, report_date) or "" if report_date else due
         answered[num] = (ANSWERS[answer.strip().lower()], comment, responsible, due, refs)
         report["evidence"][num] = quote
     report["answered"] = len(answered)
@@ -184,7 +202,7 @@ def checklist_sections(template):
     return out
 
 
-def apply(prose, template, transcript_text):
+def apply(prose, template, transcript_text, report_date=None):
     """Rebuild every checklist section of the answer in place. Returns a report
     per section title, for the result's provenance.
 
@@ -199,7 +217,7 @@ def apply(prose, template, transcript_text):
         if not items:
             continue
         seen.add(key)
-        paragraphs, line_refs, report = rebuild(sec, items, transcript_text)
+        paragraphs, line_refs, report = rebuild(sec, items, transcript_text, report_date)
         sec["paragraphs"], sec["line_refs"] = paragraphs, line_refs
         reports[sec["title"]] = report
     catch_all = ((template or {}).get("catch_all") or {}).get("title", "").strip().lower()

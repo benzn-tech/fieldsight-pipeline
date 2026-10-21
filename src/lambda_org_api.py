@@ -142,6 +142,7 @@ import nz_time
 import checklist_reports
 import pipeline_trace
 import trace_views
+import voice_session
 import reindex
 import recording_blocks
 import report_download_name
@@ -159,7 +160,7 @@ from repositories import day_recording_segments, location_markers
 from repositories import directory as directory_repo
 from repositories import inspection_windows
 from repositories import (action_items, aliases, chunks, classification_feedback, companies,
-                          findings, speaker_label_groups,
+                          decision_records, findings, speaker_label_groups,
                           compliance_resolutions, content, content_edits, keyframes,
                           meeting_session, memberships, observations, programme,
                           programme_delay_flags, programme_import,
@@ -167,7 +168,8 @@ from repositories import (action_items, aliases, chunks, classification_feedback
                           programme_suggestions, programme_tasks, programme_window,
                           recordings, redactions, report_templates, rollup, scope,
                           session_group, site_attendance,
-                          sites, threads, topics, users, voice_messages,
+                          sites, threads, topic_questions, topics, users,
+                          voice_messages,
                           voiceprints)
 from repositories import lake_objects
 from repositories import project_docs
@@ -548,6 +550,49 @@ def get_app_latest():
     ))
 
 
+def ask_threads_route(conn, caller, sub, thread_id, method):
+    """GET /ask/threads, GET and DELETE /ask/threads/{id} (spec 2026-10-22 §5).
+
+    Flag off (ASK_THREADS), an unknown method or a malformed id: 404. A stored turn's
+    source manifest is never returned; a turn the §6 re-check withholds carries
+    `withheld: true` and no result. S3 errors are NOT caught here: an AccessDenied
+    must reach the dispatcher's 500, never read as "no conversations" (the
+    `except ClientError: pass` shape get_app_latest's docstring warns about).
+    """
+    import ask_threads
+    if not ask_threads.enabled():
+        return error("not found", 404)
+    if thread_id is None:
+        if method != "GET":
+            return error("not found", 404)
+        return ok({"threads": ask_threads.list_threads(s3(), S3_BUCKET, sub, time.time())})
+    if not ask_threads.THREAD_RE.match(thread_id) or method not in ("GET", "DELETE"):
+        return error("not found", 404)
+    if method == "DELETE":
+        ask_threads.delete_thread(s3(), S3_BUCKET, sub, thread_id)
+        res = ok(None, 204)
+        res["body"] = ""
+        return res
+    doc = ask_threads.get_thread(s3(), S3_BUCKET, sub, thread_id)
+    if doc is None:
+        return error("not found", 404)
+    import ask_thread_check
+    turns = [t for t in doc["turns"] if isinstance(t, dict)]
+    withheld = ask_thread_check.withheld_turns(conn, caller, turns)
+    out = []
+    for t in turns:
+        row = {k: t.get(k) for k in ("turn_id", "question", "at", "request")}
+        # Fail closed: a turn the re-check could not address by id is never shown.
+        if (not isinstance(t.get("turn_id"), str) or not t.get("turn_id")
+                or t.get("turn_id") in withheld):
+            row["withheld"] = True
+        else:
+            row["result"] = t.get("result")
+        out.append(row)
+    return ok({"thread_id": doc.get("thread_id") or thread_id, "scope": doc.get("scope") or {},
+               "turns": out})
+
+
 def dispatch(conn, event, method, route):
     claims = (event.get("requestContext", {}) or {}).get("authorizer", {}).get("claims", {})
     sub = claims.get("sub", "")
@@ -574,6 +619,20 @@ def dispatch(conn, event, method, route):
     # In-app updates. After the caller guard on purpose -- signed-in, provisioned devices only.
     if route == "/app/latest" and method == "GET":
         return get_app_latest()
+
+    # Voice-agent session token: the sub is the authorizer-verified Cognito sub, never a body field.
+    if route == "/voice/session" and method == "POST":
+        key = os.environ.get("VOICE_SESSION_SIGNING_KEY", "")
+        if not key:
+            return error("voice sessions are not configured", 503)
+        return ok(voice_session.mint(sub, key, now=int(time.time())))
+
+    # Ask conversation history (spec 2026-10-22 §5). After the caller guard, so an
+    # archived caller is refused above; the threads are addressed by the authorizer
+    # sub alone, never by a body or path identity.
+    m_at = re.match(r"^/ask/threads(?:/([^/]+))?$", route)
+    if m_at:
+        return ask_threads_route(conn, caller, sub, m_at.group(1), method)
 
     if route == "/me":
         if method == "GET":
@@ -670,6 +729,12 @@ def dispatch(conn, event, method, route):
     m_ai = re.match(r"^/action-items/([^/]+)$", route)
     if m_ai and method == "PATCH":
         return patch_action_item(conn, caller, m_ai.group(1), parse_body(event))
+
+    # Track B Task 5 Step 2 -- addressed by topic_questions.stable_id, not .id (see
+    # patch_question's docstring for why that differs from action-items above).
+    m_q = re.match(r"^/questions/([^/]+)$", route)
+    if m_q and method == "PATCH":
+        return patch_question(conn, caller, m_q.group(1), parse_body(event))
 
     # Durable safety/quality resolved-state (spec 2026-07-26). Literal routes,
     # no id in the path (the row is addressed by its natural key in the body /
@@ -7031,6 +7096,103 @@ def patch_action_item(conn, caller, action_item_id, body):
     return ok(updated)
 
 
+class _QuestionVanished(Exception):
+    """The row disappeared between the ACL read and the UPDATE -- abort the
+    whole transaction rather than commit an audit row for a question that isn't
+    there any more (mirrors _ActionItemVanished)."""
+
+
+_QUESTION_STATUSES = ("open", "answered", "dropped")
+
+
+def patch_question(conn, caller, stable_id, body):
+    """Answer, drop or reopen one topic question (Track B Task 5 Step 2). Addressed by
+    `topic_questions.stable_id`, never `.id` -- a question's row is replaced wholesale on
+    every re-extraction (Task 4's carry_forward assigns the successor a NEW id and only
+    copies `stable_id` across), so the id the client saw when it opened the panel may
+    already be gone by the time this PATCH lands, while the stable_id is not.
+
+    ACL is the SAME THREE checks patch_action_item makes -- company scope via
+    `is_cross_company`, the caller's site reach via `_allowed_site_ids`, and per-site role
+    authority (`is_admin` = resolve_scope==ALL or cross; `is_site_authority` = the caller's
+    OWN membership.role at THIS site is pm/site_manager, via
+    `memberships.caller_site_roles` -- reused, not re-derived, so the two endpoints can never
+    drift on what "site authority" means) -- minus patch_action_item's fourth tier
+    (assignee), which does not apply: a question has no responsible party. A caller whose
+    GLOBAL role happens to be pm/site_manager but who is only a `worker` MEMBER at this
+    question's site fails `is_site_authority` exactly like they would on an action item at
+    that site.
+
+    ONE deliberate difference from patch_action_item in the OUTCOME, not the checks:
+    patch_action_item fetches its row by a fixed id first and can therefore tell "exists,
+    wrong company" (404) apart from "exists, right company, wrong site or role" (403) as two
+    different facts about a real row it already has in hand. Here the row is reached ONLY by
+    `stable_id` through `topic_questions.get_live_by_stable_id` (itself scoped to the live
+    topic via `visible_topics_predicate`), so a caller who fails ANY of the three checks was
+    never holding a reference to anything they can prove exists -- there is nothing left to
+    leak by collapsing every refusal to 404, and the task brief calls for exactly that: same
+    checks, every refusal 404 (never the 403 patch_action_item uses for its site-reach and
+    site-authority tiers).
+
+    Role-gated to `_CORRECTION_ROLES` first (no assignee carve-out -- a question has no
+    assignee, unlike an action item's responsible party).
+
+    `status` is the only writable field. Re-sending the status the row already has is a
+    no-op -- returned as-is, same "must not litter the History panel" posture
+    patch_action_item's per-field changed-check takes, just applied to this endpoint's one
+    field. Otherwise: 'answered'/'dropped' stamp `answered_by` (the caller's users.id) and
+    `answered_at` (the database's `now()`, in topic_questions.set_status); reopening to
+    'open' clears both. One `content_edits` row (table_name='topic_questions',
+    field='status') records the transition, and the UPDATE + that audit row share ONE
+    transaction -- CLAUDE.md: a `return error(...)` after a partial write does not roll it
+    back, so both must commit or neither does (same posture as patch_action_item)."""
+    if caller["global_role"] not in _CORRECTION_ROLES:
+        return error("admin, gm, pm, site_manager or platform_admin role required", 403)
+    if body is None:
+        return error("malformed JSON body", 400)
+    status = body.get("status")
+    if status not in _QUESTION_STATUSES:
+        return error(f"status must be one of {sorted(_QUESTION_STATUSES)}", 400)
+
+    row = topic_questions.get_live_by_stable_id(conn, stable_id)
+    cross = is_cross_company(caller["global_role"])
+    if row is None or (not cross and not _row_company_ok(
+            conn, caller, row["company_id"], row["site_id"])):
+        return error("question not found", 404)             # incl. cross-company
+    site_id = str(row["site_id"])
+    if site_id not in _allowed_site_ids(conn, caller):
+        # Same reach gate as patch_action_item's, but 404 rather than 403 -- see docstring.
+        return error("question not found", 404)
+    site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
+    is_admin = _is_company_admin_of(caller, row["company_id"], cross)
+    is_site_authority = site_role in ("pm", "site_manager")
+    if not (is_admin or is_site_authority):
+        # Same site-authority gate as patch_action_item's, but 404 rather than 403 -- see
+        # docstring: this endpoint never confirms a row exists to leak *which* check failed.
+        return error("question not found", 404)
+
+    before = row["status"]
+    if status == before:
+        # No-op: the row is returned unchanged -- neither the UPDATE nor the content_edits
+        # audit row runs (patch_action_item's own "must not litter the History panel" rule,
+        # applied to this endpoint's one field). `row` carries an extra `company_id` key
+        # `set_status`'s RETURNING does not (topic_questions._COLS), so the response shape
+        # matches the write path exactly.
+        return ok({k: v for k, v in row.items() if k != "company_id"})
+    answered_by = caller["id"] if status != "open" else None
+    try:
+        with conn.transaction():           # UPDATE + audit row commit together
+            updated = topic_questions.set_status(conn, row["id"], status, answered_by)
+            if updated is None:
+                raise _QuestionVanished(stable_id)
+            content_edits.append_content_edit(
+                conn, row["company_id"], "topic_questions", row["id"], "status",
+                before, status, caller["id"], caller["global_role"])
+    except _QuestionVanished:
+        return error("question not found", 404)
+    return ok(updated)
+
+
 # ----------------------------------------------------------
 # GET /action-items/closures?from=&to= — the Today page's weekly KPI.
 #
@@ -7809,7 +7971,11 @@ def delete_recordings_endpoint(conn, caller, body):
             redactions.create_recording_tombstone(
                 conn, target_company, prefix, reason,
                 caller.get("id"), caller.get("global_role"), batch_id=batch_id)
-            for row in topics.list_topics_for_source_prefix(conn, prefix) or []:
+            # include_superseded=True: this enumeration must tombstone EVERY row under the
+            # deleted prefix, superseded or not -- an untouched superseded copy would sit
+            # outside every batch and never come back with the undelete (Track B Task 2).
+            for row in topics.list_topics_for_source_prefix(
+                    conn, prefix, include_superseded=True) or []:
                 topic_ids.append(row["id"])
                 if redactions.create_redaction(
                         conn, target_company, row["id"], reason,
@@ -7823,7 +7989,8 @@ def delete_recordings_endpoint(conn, caller, body):
         # regenerates the report WITHOUT the deleted session and re-inserts clean topics
         # under new uuids, and a prefix tombstone would keep hiding those forever.
         for row in topics.list_topics_for_source_prefix(
-                conn, f"reports/{rec['date']}/{rec['folder']}/") or []:
+                conn, f"reports/{rec['date']}/{rec['folder']}/",
+                include_superseded=True) or []:
             if redactions.create_redaction(
                     conn, target_company, row["id"], reason,
                     caller.get("id"), caller.get("global_role"),
@@ -7988,8 +8155,10 @@ def undelete_recordings_endpoint(conn, caller, body):
         if not still:
             continue
         company = next((r["company_id"] for r in existing), caller["company_id"])
+        # include_superseded=True: same reason as the delete side -- this re-hide must reach
+        # a superseded report topic too, or it stays outside every batch once freed.
         for row in topics.list_topics_for_source_prefix(
-                conn, f"reports/{date}/{folder}/") or []:
+                conn, f"reports/{date}/{folder}/", include_superseded=True) or []:
             redactions.create_redaction(
                 conn, company, row["id"], reason, caller.get("id"),
                 caller.get("global_role"), target_type="topic", scope="deleted",
@@ -8095,6 +8264,16 @@ def create_classification_feedback_endpoint(conn, caller, body):
         conn, row["company_id"], topic_id, verdict,
         classifier_verdict=cv, classifier_confidence=conf,
         topic_category=tc, actor_user_id=caller["id"])
+    # Track B Task 6b. object_ref=None -- a work_class verdict has no "other side"
+    # (unlike a programme_match's task or a thread's earlier topic). 'missed_personal'
+    # maps to 'rejected' like 'reject_is_work': both are the human overturning what the
+    # classifier decided (non_work in the first case, work in the second), never a
+    # confirmation of it.
+    _stamp_decision(
+        conn, kind="work_class", subject_type="topic", subject_stable_id=topic_id,
+        object_ref=None,
+        outcome=("confirmed" if verdict == "confirm_non_work" else "rejected"),
+        actor=caller["id"])
     if verdict == "reject_is_work":                           # Fable review C3
         topics.set_work_class(conn, topic_id, "work")
         try:
@@ -9340,6 +9519,38 @@ _ALLOWED_CONFIRM_STATUSES = ("in_progress", "completed", "blocked", "delayed")
 _SUGGESTION_MANAGER_ROLES = ("admin", "gm", "pm")
 
 
+def _stamp_decision(conn, *, kind, subject_type, subject_stable_id, object_ref, outcome, actor):
+    """Track B Task 6b: best-effort `decision_records.set_human_outcome` call, shared by
+    every endpoint that answers a gated verdict (confirm/reject suggestion, confirm/reject
+    thread suggestion, classification-feedback).
+
+    Runs inside its own SAVEPOINT (`conn.transaction()`) with a WARNING on failure -- same
+    posture as `lambda_suggestion_writer._record_verdict` / `lambda_item_writer`'s
+    `_record_work_class_decision` (Ruling R10/R14). A missing or failed decision record
+    must never fail the human's confirm/reject: every one of this function's callers has
+    already committed (or is about to commit, in the same outer transaction) the REAL
+    effect of the human's decision -- a task write, a thread attach, a work_class flip --
+    and a decision_records row is provenance for that, not a precondition of it.
+
+    0 rows updated is the ordinary case for anything confirmed/rejected before this change
+    landed (no decision_records row exists yet for it) -- not logged, so routine confirms
+    do not spam WARNING. Only a genuine exception (a bad enum value, a DB error) is a
+    WARNING; it still never raises past this function."""
+    try:
+        with conn.transaction():
+            n = decision_records.set_human_outcome(
+                conn, kind=kind, subject_type=subject_type,
+                subject_stable_id=subject_stable_id, object_ref=object_ref,
+                outcome=outcome, actor=actor)
+            if n == 0:
+                logger.debug("decision record stamp matched no row: kind=%s subject=%s object=%s",
+                            kind, subject_stable_id, object_ref)
+    except Exception:
+        logger.warning("decision record stamp failed for kind=%s subject=%s object=%s -- "
+                       "the human decision itself is unaffected",
+                       kind, subject_stable_id, object_ref)
+
+
 class _SuggestionAlreadyDecided(Exception):
     """Another request decided this suggestion first — unwind rather than
     commit a second decision."""
@@ -9391,12 +9602,17 @@ def confirm_suggestion(conn, caller, suggestion_id, body):
         return error("already decided", 409)
     if str(row["site_id"]) not in _allowed_site_ids(conn, caller):
         return error("access denied to this site", 403)
-    if row["topic_id"] is None:
-        # Fable review IMPORTANT #5: the source topic was deleted/superseded
-        # (ON DELETE SET NULL — topics.py delete_topics_for_source[_prefix])
-        # before anyone reviewed this suggestion. Caught here, at confirm
-        # time, rather than proactively when the topic is superseded (see
-        # programme_suggestions.mark_stale docstring for why).
+    # Fable review IMPORTANT #5, extended for Track B Task 3: the source topic is gone from
+    # this suggestion's point of view either way -- `topic_id IS NULL` (ON DELETE SET NULL,
+    # a genuine physical delete via topics.delete_topics_for_source[_prefix]) or the id is
+    # still there but the row it names is superseded (Task 3: re-extraction marks a row
+    # instead of removing it, so `topic_id` stops going NULL for the common case -- the
+    # re-extraction that made THIS suggestion stale). `topics.get_topic` is the named lookup
+    # (deleted_predicates.visible_topics_predicate under it) rather than an inlined
+    # `superseded_at` check here, so this and every other topic-by-id lookup drift together
+    # or not at all. Caught here, at confirm time, rather than proactively when the topic is
+    # superseded (see programme_suggestions.mark_stale docstring for why).
+    if row["topic_id"] is None or topics.get_topic(conn, row["topic_id"]) is None:
         programme_suggestions.mark_stale(conn, suggestion_id)
         return error("source topic was superseded; re-review", 409)
 
@@ -9486,6 +9702,23 @@ def confirm_suggestion(conn, caller, suggestion_id, body):
                 # other programme write does. The old code wrote the derived
                 # document directly and never touched the table.
                 _write_snapshot(conn, str(row["site_id"]), prog["id"])
+
+            # Track B Task 6b: stamp the matcher's verdict with the human's answer.
+            # `new_status`/`new_progress` (computed above, BEFORE this block) are what
+            # was actually applied -- comparing THEM against the suggestion's own
+            # `suggested_status`/`suggested_progress` is 'edited' vs 'confirmed'
+            # regardless of whether the reviewer typed an explicit override or the
+            # never-lower-progress guard silently raised it; either way the outcome
+            # differs from what the model proposed. Inside this same SAVEPOINT so it
+            # commits with the confirm or not at all, but a decision-record failure
+            # alone (see _stamp_decision) can never turn this 200 into a 500.
+            _stamp_decision(
+                conn, kind="programme_match", subject_type="topic",
+                subject_stable_id=row["topic_id"], object_ref=row["task_id"],
+                outcome=("edited" if (new_status != row["suggested_status"]
+                                      or new_progress != row["suggested_progress"])
+                         else "confirmed"),
+                actor=caller["id"])
     except _SuggestionAlreadyDecided:
         return error("already decided", 409)
     except _SuggestionTaskMoved:
@@ -9506,6 +9739,10 @@ def reject_suggestion(conn, caller, suggestion_id):
     if str(row["site_id"]) not in _allowed_site_ids(conn, caller):
         return error("access denied to this site", 403)
     programme_suggestions.decide(conn, suggestion_id, "rejected", decided_by=caller["id"])
+    # Track B Task 6b.
+    _stamp_decision(conn, kind="programme_match", subject_type="topic",
+                    subject_stable_id=row["topic_id"], object_ref=row["task_id"],
+                    outcome="rejected", actor=caller["id"])
     return ok({"rejected": True})
 
 
@@ -9573,6 +9810,34 @@ def list_thread_suggestions(conn, caller, event):
     } for r in rows]})
 
 
+def _thread_decision_object_ref(conn, row):
+    """The `object_ref` `lambda_item_writer._suggest_threads_inner` used for THIS
+    suggestion's decision_records row -- always "the earlier topic id", never the
+    thread id (Track B Task 6b; see `decision_records.object_ref_for_accepted`'s
+    docstring for the full seam this closes).
+
+    `topic_thread_suggestions` carries `thread_id XOR parent_topic_id` (migration
+    0032's CHECK): when the winning candidate anchored a NEW thread, `parent_topic_id`
+    IS the earlier topic id directly -- cast to text for the object_ref column, same
+    as the writer's own `str(c["id"])`. When it joined an EXISTING thread, only
+    `thread_id` survived onto this row, and the specific candidate topic scored
+    against it is not recoverable from the row alone -- resolved instead by asking
+    decision_records for the object_ref its own writer already stamped.
+
+    Never raises (R10/R14 posture, same as `_stamp_decision` below): a lookup
+    failure here must not turn a successful confirm/reject into a 500. Returns None
+    on failure, which `_stamp_decision`/`set_human_outcome` already treat as a safe
+    no-op (no thread record has a NULL object_ref, so it simply matches nothing)."""
+    if row["parent_topic_id"] is not None:
+        return str(row["parent_topic_id"])
+    try:
+        return decision_records.object_ref_for_accepted(conn, "thread", "topic", row["topic_id"])
+    except Exception:
+        logger.warning("decision record object_ref lookup failed for thread topic=%s",
+                       row["topic_id"])
+        return None
+
+
 def confirm_thread_suggestion(conn, caller, suggestion_id):
     """Link the topic to the subject it restates.
 
@@ -9609,6 +9874,11 @@ def confirm_thread_suggestion(conn, caller, suggestion_id):
 
     threads.attach_topic(conn, row["topic_id"], thread_id, row["topic_date"])
     facts = threads.thread_facts(conn, thread_id)
+    # Track B Task 6b.
+    _stamp_decision(conn, kind="thread", subject_type="topic",
+                    subject_stable_id=row["topic_id"],
+                    object_ref=_thread_decision_object_ref(conn, row),
+                    outcome="confirmed", actor=caller["id"])
     return ok({
         "confirmed": True,
         "threadId": str(thread_id),
@@ -9621,12 +9891,17 @@ def reject_thread_suggestion(conn, caller, suggestion_id):
     """Turn a proposal down. The row is kept, not deleted: the repository
     refuses to propose the same link again, and re-asking a question someone
     already answered is the fastest way to train them to ignore the queue."""
-    _row, err = _thread_suggestion_or_error(conn, caller, suggestion_id)
+    row, err = _thread_suggestion_or_error(conn, caller, suggestion_id)
     if err is not None:
         return err
     if threads.resolve_suggestion(conn, suggestion_id, "rejected",
                                   str(caller["id"])) is None:
         return error("already decided", 409)
+    # Track B Task 6b.
+    _stamp_decision(conn, kind="thread", subject_type="topic",
+                    subject_stable_id=row["topic_id"],
+                    object_ref=_thread_decision_object_ref(conn, row),
+                    outcome="rejected", actor=caller["id"])
     return ok({"rejected": True})
 
 
@@ -9767,6 +10042,17 @@ def _normalize_prose(value, alias_pairs):
     return value
 
 
+def _deadline_fields(a, date):
+    """{deadline_display, deadline_by} for one action-item row, anchored on the
+    day it was recorded. A user-set date (PATCH writes it to both columns) reads
+    the same way as a spoken one."""
+    import due_display
+    said = a.get("deadline_text") or (str(a["deadline"]) if a.get("deadline") else None)
+    d = due_display.describe(said, date)
+    return {"deadline_display": d["display"] if d else None,
+            "deadline_by": d["by"] if d else None}
+
+
 def render_report_shape(rows, doc, date, folder, conn=None, company_id=None,
                         all_companies=False):
     """Pure function: render Aurora extraction topics INTO the
@@ -9857,6 +10143,14 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None,
             # emit strings, so strings is the contract, not a simplification.
             # Until 0058 this was a hardcoded [] -- and report_sections,
             # chunking and lambda_ask_agent were all already reading it.
+            #
+            # Track B Task 5: `topics.decisions`/`topics.open_questions` (this jsonb, both
+            # keys below) is now a MIRROR of `topic_decisions`/`topic_questions` -- the two
+            # tables migration 0073 added, dual-written by lambda_item_writer alongside this
+            # same jsonb. This narrowing still reads the jsonb; switching readers over to the
+            # row tables (so a client sees an answered question's status, a decision's
+            # stable_id, etc.) is a separate, later change (Ruling R6) -- payload shape here
+            # is untouched by Task 5.
             "key_decisions": [d if isinstance(d, str) else d.get("decision")
                               for d in (t.get("decisions") or [])
                               if (d.get("decision") if isinstance(d, dict) else d)],
@@ -9885,6 +10179,12 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None,
             # has to be added here too.
             "action_items": [{"id": str(a["id"]), "action": a["text"], "responsible": a["responsible"],
                               "deadline": a["deadline_text"] or (str(a["deadline"]) if a["deadline"] else None),
+                              # The day it names, said once here for every page
+                              # (owner, 2026-10-12): "Tue 13 Oct 2026, morning",
+                              # and `deadline_by`, the local moment it is overdue
+                              # after. Readers show these instead of parsing
+                              # `deadline` again; the words stay in `deadline`.
+                              **_deadline_fields(a, date),
                               "priority": a["priority"], "status": a["status"],
                               "mention_count": a.get("mention_count", 1),
                               "collapsed_ids": [str(x) for x in (a.get("collapsed_ids") or [])],

@@ -139,3 +139,97 @@ def test_no_today_yields_nothing_even_with_a_time_word():
 def test_an_absolute_date_still_resolves_without_an_anchor():
     """An explicit date needs no 'today', so losing the zone must not cost it."""
     assert qs.time_range("2026-08-12 那次会", None) == ("2026-08-12", "2026-08-12")
+
+
+# --------------------------------------------------------------------------
+# "last <weekday>": the one spoken-date rule. Every other spoken date is the
+# Ask judge model's job (ask_tools tells it to resolve them to ISO). Old
+# anchors are immutable (test_query_slots_old_anchors.py).
+# --------------------------------------------------------------------------
+
+FRI = date(2026, 10, 16)           # a Friday
+LAST_WEEK = ("2026-10-05", "2026-10-11")
+
+
+@pytest.mark.parametrize("question", [
+    "last Tuesday", "what happened last Tuesday?", "LAST TUESDAY", "last tue",
+    "last Tue.", "drainage last Tuesday, any issues",
+])
+def test_last_weekday_is_the_most_recent_one_before_today(question):
+    # 2026-10-16 is a Friday; the Tuesday before it is the 13th.
+    assert qs.time_range(question, FRI) == ("2026-10-13", "2026-10-13")
+
+
+def test_last_weekday_naming_today_means_a_week_ago():
+    assert qs.time_range("last Friday", FRI) == ("2026-10-09", "2026-10-09")
+    assert qs.time_range("last fri", FRI) == ("2026-10-09", "2026-10-09")
+
+
+def test_on_a_monday_last_monday_is_seven_days_earlier():
+    mon = date(2026, 10, 12)
+    for q in ("last Monday", "last mon"):
+        assert qs.time_range(q, mon) == ("2026-10-05", "2026-10-05"), q
+
+
+def test_every_weekday_name():
+    names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    expected = ["2026-10-12", "2026-10-13", "2026-10-14", "2026-10-15", "2026-10-09",
+                "2026-10-10", "2026-10-11"]
+    for name, day in zip(names, expected):
+        assert qs.time_range("last " + name, FRI) == (day, day), name
+        assert qs.time_range("last " + name[:3], FRI) == (day, day), name[:3]
+
+
+def test_last_weekday_across_the_year_boundary():
+    assert qs.time_range("last Sunday", date(2026, 1, 1)) == ("2025-12-28", "2025-12-28")
+
+
+@pytest.mark.parametrize("question", [
+    # no "last": general spoken dates are the judge's
+    "Tuesday", "on Tuesday", "this Tuesday", "we pour on Friday", "next Tuesday",
+    "3 September", "Sept 3rd", "9月3日", "周二", "上礼拜五", "on the 3rd",
+    # "last" but not a single past day
+    "last tues", "last thurs",                 # only full names or 3 letters
+    "last Sunday's slab", "last Mondays",
+    "last Monday to Friday", "last Mon-Fri", "last Mon–Fri", "last Monday through Friday",
+    "last Monday till Friday", "the last Friday of the month",
+    "last Monday mornings", "last Friday nights",
+    "last Monday Street site", "last Friday Lane", "last Sun Rd",
+    "since last Monday", "until last Friday", "from last Monday", "due last Friday",
+    # not a weekday at all
+    "the last sundial", "last monitor check", "last wedge", "last saturation test",
+])
+def test_no_anchor(question):
+    assert qs.time_range(question, FRI) == (None, None)
+
+
+def test_last_weekday_does_not_override_an_old_phrase():
+    assert qs.time_range("last week on Tuesday", FRI) == LAST_WEEK
+    assert qs.time_range("yesterday, last Tuesday", FRI) == ("2026-10-15", "2026-10-15")
+
+
+def test_last_weekday_needs_today():
+    assert qs.time_range("last Tuesday", None) == (None, None)
+
+
+def test_a_blocked_last_weekday_does_not_hide_a_later_good_one():
+    assert qs.time_range("since last Monday, and last Tuesday", FRI) == \
+        ("2026-10-13", "2026-10-13")
+
+
+def test_has_time_anchor():
+    assert "has_time_anchor" in qs.__all__
+    assert qs.has_time_anchor("what happened last Tuesday", FRI) is True
+    assert qs.has_time_anchor("yesterday", FRI) is True
+    assert qs.has_time_anchor("door schedule", FRI) is False
+    assert qs.has_time_anchor("on Tuesday", FRI) is False
+    assert qs.has_time_anchor("last Tuesday", None) is False
+
+
+def test_spoken_anchor_reports_only_the_last_weekday_span():
+    assert qs.spoken_anchor("yesterday, last Tuesday", FRI) is None   # old rule anchored
+    q = "what did we do last Tue?"
+    d, (a, b) = qs.spoken_anchor(q, FRI)
+    assert d == date(2026, 10, 13)
+    assert q[a:b] == "last Tue"
+    assert qs.spoken_anchor("door schedule", FRI) is None

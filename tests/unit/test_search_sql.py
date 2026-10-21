@@ -1,3 +1,5 @@
+import pytest
+
 from repositories.search_sql import build_search_sql
 
 
@@ -322,3 +324,115 @@ def test_keyword_arm_selects_the_real_cosine_distance_not_null():
     lex = lex.split("), ", 1)[0] if "), " in lex else lex
     assert "c.embedding <=> %(q)s::vector AS distance, true AS lexical_hit" in lex
     assert "NULL::float8" not in sql
+
+
+def test_subject_term_query_folds_one_term():
+    """Per-term fold (spec 2026-10-20 §3.2): a subject word matches its english
+    stem OR its exact token. Folded per term, not as two whole-query halves --
+    that lets the english half drop a stopword subject ('don')."""
+    from repositories.search_sql import subject_term_query
+    assert subject_term_query(0) == (
+        "(to_tsquery('english', %(st0)s) || to_tsquery('simple', %(st0)s))")
+    assert "%(st4)s" in subject_term_query(4)
+
+
+def test_subject_params_name_one_term_each():
+    from repositories.search_sql import subject_params
+    assert subject_params(["pour", "concrete"]) == {"st0": "pour", "st1": "concrete"}
+
+
+def test_subject_floor_is_two_unless_there_is_one_term():
+    from repositories.search_sql import subject_floor
+    assert [subject_floor(n) for n in (1, 2, 3, 6)] == [1, 2, 2, 2]
+
+
+def test_latest_match_date_sql_needs_a_term():
+    from repositories.search_sql import build_latest_match_date_sql, build_subject_coverage_sql
+    with pytest.raises(ValueError):
+        build_latest_match_date_sql(0)
+    with pytest.raises(ValueError):
+        build_subject_coverage_sql(0)
+
+
+def test_latest_match_date_sql_is_coverage_first():
+    """Amendment A (spec 2026-10-20 §8/§8.1): the day is the latest one reaching
+    the window's highest coverage k*, k* >= %(floor)s. Same scope as search, no
+    distance gate, no or_query keyword arm."""
+    import repositories.search_sql as search_sql
+    sql = search_sql.build_latest_match_date_sql(3)
+    vec = search_sql._lexical_vector("c")
+    assert search_sql._scope_predicate("c") in sql
+    assert "AS MATERIALIZED" in sql
+    # the lexical vector is computed once per candidate, as a column; coverage is
+    # summed over that column
+    assert vec + " AS v" in sql
+    assert search_sql._coverage("v", 3) + " AS k" in sql
+    assert "k >= %(floor)s" in sql
+    assert "ORDER BY k DESC, report_date DESC LIMIT 1" in sql
+    for gone in ("<=>", "%(gate)s", "q_text"):
+        assert gone not in sql
+    assert "ILIKE" not in sql.upper()
+
+
+def test_prefilter_is_the_pairwise_and_so_the_gin_index_serves_it():
+    """§8.1 item 1: for n >= 2 the prefilter is OR over (ti && tj) -- exactly
+    "coverage >= 2" -- so one generic term cannot turn it into a scan; for n = 1
+    it is the term itself."""
+    import repositories.search_sql as search_sql
+    t = search_sql.subject_term_query
+    vec = search_sql._lexical_vector("c")
+    sql3 = search_sql.build_latest_match_date_sql(3)
+    pairs = " || ".join(f"({t(i)} && {t(j)})" for i, j in ((0, 1), (0, 2), (1, 2)))
+    assert "(" + vec + ") @@ (" + pairs + ")" in sql3
+    assert "(" + vec + ") @@ " + t(0) + ")" in search_sql.build_latest_match_date_sql(1)
+    assert "&&" not in search_sql.build_latest_match_date_sql(1)
+    six = search_sql.build_latest_match_date_sql(6).split("AS v", 1)[1].split("), m AS", 1)[0]
+    assert six.count("&&") == 15
+
+
+def test_coverage_expression_counts_each_term_once():
+    import repositories.search_sql as search_sql
+    assert search_sql._coverage("v", 2) == (
+        "((v @@ " + search_sql.subject_term_query(0) + ")::int + "
+        "(v @@ " + search_sql.subject_term_query(1) + ")::int)")
+
+
+# ---- golden: the live search SQL is byte-identical to before the Ask-tools branch ----
+
+# sha256 of the UTF-8 text at b04c2618 (the branch base), computed by loading
+# `git show b04c2618:src/repositories/search_sql.py` (with that commit's
+# deleted_predicates) and confirmed equal to the refactored builders (4177 / 1153
+# chars). The search box and Ask both run this SQL: a "refactor" of
+# _visibility_predicate / _scope_predicate that changes one character must fail
+# here and be reviewed as a change to the live search, not slip through.
+GOLDEN_SEARCH_SQL_SHA256 = "bfcf0fb8aaafb7586af65e4cd71c6b606e93f801303d673ddd8735d7df156fdd"
+GOLDEN_LATEST_DATE_SQL_SHA256 = "4bb02a766a290d4e4b195d957b130a2d6a21e5f4e2efc3584162c9ef41fc59bf"
+
+
+def test_build_search_sql_is_byte_identical_to_the_pre_branch_sql():
+    import hashlib
+    from repositories.search_sql import build_search_sql
+    sql = build_search_sql()
+    assert len(sql) == 4177
+    assert hashlib.sha256(sql.encode("utf-8")).hexdigest() == GOLDEN_SEARCH_SQL_SHA256
+
+
+def test_build_latest_date_sql_is_byte_identical_to_the_pre_branch_sql():
+    import hashlib
+    from repositories.search_sql import build_latest_date_sql
+    sql = build_latest_date_sql()
+    assert len(sql) == 1153
+    assert hashlib.sha256(sql.encode("utf-8")).hexdigest() == GOLDEN_LATEST_DATE_SQL_SHA256
+
+
+def test_coverage_recheck_uses_the_same_coverage_expression():
+    """latest_activity(query) keeps a day's rows by this coverage; it must count
+    exactly what the day-choosing SQL counted."""
+    from repositories.search_sql import (_coverage, _lexical_vector,
+                                         build_latest_match_date_sql,
+                                         build_subject_coverage_sql)
+    sql = build_subject_coverage_sql(2)
+    assert _coverage("v", 2) + " AS k" in sql
+    assert _coverage("v", 2) + " AS k" in build_latest_match_date_sql(2)
+    assert _lexical_vector("c") + " AS v" in sql
+    assert "c.id = ANY(%(ids)s::uuid[])" in sql

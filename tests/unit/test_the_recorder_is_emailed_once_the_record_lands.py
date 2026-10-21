@@ -72,10 +72,17 @@ def test_the_folder_rides_along_for_the_brief_poll(wired):
 
 
 def test_the_due_date_is_the_one_the_record_holds(wired):
-    """Aurora stores the RESOLVED date; the email used to show the spoken text,
-    so the same item read differently in the two places."""
+    """Aurora stores the RESOLVED date; the email once showed the spoken text, so
+    the same item read differently in the two places. The row now carries the
+    words (the resolved day has lost "08:00"), and the email resolves them with
+    the same parser the record used -- same day, plus the time that was said."""
+    import due_display
+    import lambda_session_finalize as fin
     ctx = iw._final_email_context("CONN", BASE, EXTRACTION, DATE)
-    assert ctx["openTodos"][0]["due"] == "2026-09-17"
+    assert ctx["openTodos"][0]["due"] == "Tomorrow 08:00"
+    assert due_display.describe("Tomorrow 08:00", DATE)["date"] == "2026-09-17"
+    _, text, _ = fin.build_confirmation_email(date=DATE, open_todos=ctx["openTodos"])
+    assert "| Neil | Thu 17 Sep 2026, 8am |" in text
 
 
 def test_an_unresolvable_deadline_keeps_what_was_said(wired):

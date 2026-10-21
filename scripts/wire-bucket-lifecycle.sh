@@ -8,6 +8,8 @@
 # traces/ (pipeline_trace: what the pipeline did with each recording) is kept
 # 180 days (owner, 2026-10-05).
 # template_sources/ and template_digitise_{requests,results}/ (a form a person uploaded to read into a template, spec 2026-10-16) are kept 90 days.
+# ask_threads/ (a caller's last five Ask conversations, spec 2026-10-22) expire 30 days
+# after their last turn in code; this 31-day rule is the backstop.
 # put-bucket-lifecycle-configuration REPLACES the whole config — abort if
 # the bucket already has OTHER rules so we never clobber them.
 set -euo pipefail
@@ -15,7 +17,7 @@ BUCKET="${1:?usage: wire-bucket-lifecycle.sh BUCKET [REGION]}"
 REGION="${2:-ap-southeast-2}"
 
 EXISTING="$(aws s3api get-bucket-lifecycle-configuration --bucket "$BUCKET" \
-  --region "$REGION" --query 'Rules[?ID!=`org-assets-pending-expiry` && ID!=`download-claims-expiry` && ID!=`voice-clips-expiry` && ID!=`voiceprint-requests-expiry` && ID!=`traces-expiry` && ID!=`template-sources-expiry` && ID!=`template-digitise-requests-expiry` && ID!=`template-digitise-results-expiry`].ID' \
+  --region "$REGION" --query 'Rules[?ID!=`org-assets-pending-expiry` && ID!=`download-claims-expiry` && ID!=`voice-clips-expiry` && ID!=`voiceprint-requests-expiry` && ID!=`traces-expiry` && ID!=`template-sources-expiry` && ID!=`template-digitise-requests-expiry` && ID!=`template-digitise-results-expiry` && ID!=`ask-threads-expiry`].ID' \
   --output text 2>/dev/null || true)"
 if [ -n "$EXISTING" ]; then
   # Refusing is right — this script REPLACES the whole configuration, and prod's rules
@@ -86,6 +88,12 @@ aws s3api put-bucket-lifecycle-configuration --bucket "$BUCKET" --region "$REGIO
         "Status": "Enabled",
         "Filter": { "Prefix": "template_digitise_results/" },
         "Expiration": { "Days": 90 }
+      }
+      ,{
+        "ID": "ask-threads-expiry",
+        "Status": "Enabled",
+        "Filter": { "Prefix": "ask_threads/" },
+        "Expiration": { "Days": 31 }
       }
     ]
   }'

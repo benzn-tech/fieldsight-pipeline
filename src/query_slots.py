@@ -30,7 +30,7 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-__all__ = ["resolve_today", "time_range"]
+__all__ = ["resolve_today", "time_range", "span", "has_time_anchor", "spoken_anchor"]
 
 
 def resolve_today(tz_name, now=None):
@@ -89,7 +89,7 @@ def _monday_of(d):
     return d - timedelta(days=d.weekday())
 
 
-def _span(today, name):
+def span(today, name):
     if name == "today":
         return today, today
     if name == "yesterday":
@@ -111,8 +111,13 @@ def _span(today, name):
     raise AssertionError(f"unhandled span {name!r}")   # unreachable; loud if it ever is
 
 
-def time_range(question, today):
-    """(date_from, date_to) as ISO strings, or (None, None).
+_span = span  # old private name, kept for existing callers
+
+
+def _time_range_v1(question, today):
+    """The original rules, unchanged since 86262261 -- see `time_range`.
+
+    (date_from, date_to) as ISO strings, or (None, None).
 
     (None, None) is the common case and the safe one: it is what a question
     with no time expression returns, and what a question WITH one returns when
@@ -162,3 +167,83 @@ def time_range(question, today):
             return _iso(start), _iso(end)
 
     return None, None
+
+
+# ==========================================================================
+# "last <weekday>" (2026-10-16): the one spoken-date rule kept.
+#
+# WHY ONLY THIS ONE. Two review rounds showed that regexes cannot tell a past
+# day from a future one ("we pour on Friday"), a deadline from an event ("due
+# by 30 November", 11月30日前), a habit from an instance (逢周二), or a date
+# from a label ("Rev 3 Mar"). Each new guard uncovered a new class of misread.
+# A wrong range silently filters Ask to the wrong day, which is worse than no
+# range. So general spoken dates are left to the Ask judge model, which knows
+# today and writes ISO dates into tool arguments that the tool layer
+# validates and caps. "last Tuesday" is kept because it is unambiguous: it
+# always names a past day.
+#
+# OLD ANCHORS ARE IMMUTABLE. `time_range` runs the original parser
+# (`_time_range_v1`, byte-identical in behaviour to 86262261) first, and this
+# rule runs ONLY when that returned (None, None). "last week on Tuesday"
+# stays last week. Pinned against a frozen copy of the old module in
+# tests/unit/test_query_slots_old_anchors.py.
+# ==========================================================================
+
+# Full weekday names, or a 3-letter form, directly after "last". Not when it
+# continues into a range ("last Monday to Friday", "last Mon-Fri"), a
+# possessive or plural ("last Sunday's slab", "last Mondays"), a part of day in
+# the plural (a habit), "of" ("the last Friday of the month"), or a street.
+_LAST_WEEKDAY = re.compile(
+    r"\blast\s+(?P<wd>monday|tuesday|wednesday|thursday|friday|saturday|sunday"
+    r"|mon|tue|wed|thu|fri|sat|sun)\b\.?"
+    r"(?!['’]s?\b|s\b|\s*[-–—~]|\s+(?:to|till|until|through|thru|of)\b"
+    r"|\s+(?:mornings|afternoons|evenings|nights)\b"
+    r"|\s+(?:street|st|road|rd|avenue|ave|lane)\b)",
+    re.IGNORECASE,
+)
+# "since last Monday" / "until last Friday" name a range or a bound, not the day.
+_LAST_WEEKDAY_BLOCKED_BEFORE = re.compile(
+    r"\b(?:since|until|till|from|before|after|by|due)\s+$", re.IGNORECASE)
+_WD_INDEX = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+
+def spoken_anchor(question, today):
+    """(date, (start, end)) when `time_range` anchored on "last <weekday>" for
+    this question, else None. search_browse uses the span to treat exactly
+    those characters -- and nothing else -- as non-content.
+
+    The day is the most recent such weekday STRICTLY before today: said on a
+    Monday, "last Monday" is a week ago, not this morning."""
+    text = question if isinstance(question, str) else ""
+    if not isinstance(today, date) or not text.strip():
+        return None
+    if _time_range_v1(text, today) != (None, None):
+        return None
+    for m in _LAST_WEEKDAY.finditer(text):
+        if _LAST_WEEKDAY_BLOCKED_BEFORE.search(text[:m.start()]):
+            continue
+        wd = _WD_INDEX[m.group("wd").lower()[:3]]
+        back = (today.weekday() - wd) % 7 or 7
+        return today - timedelta(days=back), m.span()
+    return None
+
+
+def time_range(question, today):
+    """(date_from, date_to) as ISO strings, or (None, None).
+
+    The original rules (`_time_range_v1`) run first and their answer is final;
+    "last <weekday>" only fills a gap they left. See the block comment above.
+    """
+    result = _time_range_v1(question, today)
+    if result != (None, None):
+        return result
+    hit = spoken_anchor(question, today)
+    if hit is None:
+        return None, None
+    return _iso(hit[0]), _iso(hit[0])
+
+
+def has_time_anchor(question, today):
+    """True iff `time_range` resolves the question to a range."""
+    date_from, date_to = time_range(question, today)
+    return date_from is not None or date_to is not None

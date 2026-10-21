@@ -365,7 +365,7 @@ def test_undelete_keeps_the_day_hidden_while_another_batch_still_holds_it(monkey
     monkeypatch.setattr(org, "_s3_client", _S3())
     _undelete_stubs(monkeypatch, still=["b-2"])
     monkeypatch.setattr(org.topics, "list_topics_for_source_prefix",
-                        lambda conn, p: [{"id": "t-report"}] if p.startswith("reports/") else [])
+                        lambda conn, p, **kw: [{"id": "t-report"}] if p.startswith("reports/") else [])
     monkeypatch.setattr(org.redactions, "revert_batch", lambda conn, b, c, **kw: BATCH_ROWS)
     rehidden = []
     monkeypatch.setattr(org.redactions, "create_redaction",
@@ -381,7 +381,7 @@ def test_undelete_does_not_rehide_when_nothing_else_holds_the_day(monkeypatch):
     monkeypatch.setattr(org, "_s3_client", _S3())
     _undelete_stubs(monkeypatch, still=[])
     monkeypatch.setattr(org.topics, "list_topics_for_source_prefix",
-                        lambda conn, p: [{"id": "t-report"}])
+                        lambda conn, p, **kw: [{"id": "t-report"}])
     monkeypatch.setattr(org.redactions, "revert_batch", lambda conn, b, c, **kw: BATCH_ROWS)
     rehidden = []
     monkeypatch.setattr(org.redactions, "create_redaction",

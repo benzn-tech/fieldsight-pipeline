@@ -94,3 +94,52 @@ def test_query_stopwords_are_pure_alphabetic_disjoint_from_identifier_shapes():
     # never collide (see query_terms's docstring).
     for w in QUERY_STOPWORDS:
         assert w.isalpha(), f"{w!r} is not pure alphabetic"
+
+
+# --- subject_terms (latest_activity, spec 2026-10-20 §3.1) ---
+
+from lexical_terms import MAX_SUBJECT_TERMS, subject_terms  # noqa: E402
+
+
+def test_subject_terms_drop_asking_words():
+    assert subject_terms("when did we last talk about drainage") == ["drainage"]
+    assert subject_terms("last time someone mentioned the site safe course") == \
+        ["site", "safe", "course"]
+
+
+def test_subject_terms_keep_identifiers():
+    assert subject_terms("what was the latest on RFI 108") == ["rfi", "108"]
+
+
+def test_subject_terms_drop_cjk_bigrams_keep_latin():
+    assert subject_terms("上次讨论 crane 是哪天") == ["crane"]
+    assert subject_terms("上次浇混凝土是什么时候") == []
+
+
+def test_subject_terms_all_asking_is_empty():
+    assert subject_terms("when did we last talk") == []
+
+
+def test_subject_terms_cap_at_six():
+    assert MAX_SUBJECT_TERMS == 6
+    assert subject_terms("alpha bravo charlie delta foxtrot hotel india") == \
+        ["alpha", "bravo", "charlie", "delta", "foxtrot", "hotel"]
+
+
+# --- Amendment A (spec 2026-10-20 §8 / §8.1): dedupe, more asking words ---
+
+def test_subject_terms_drop_exact_duplicates_before_the_cap():
+    assert subject_terms("panel panel") == ["panel"]
+    assert subject_terms("alpha alpha bravo charlie delta foxtrot hotel india") == \
+        ["alpha", "bravo", "charlie", "delta", "foxtrot", "hotel"]
+    # stem duplicates are accepted (§8.1 item 3)
+    assert subject_terms("panel panels") == ["panel", "panels"]
+
+
+def test_subject_terms_drop_the_amendment_asking_words():
+    assert subject_terms("When did we last hear from Hector Eggar about the scaffold?") == \
+        ["hector", "eggar", "scaffold"]
+    assert subject_terms("most recent conversation about the crane") == ["crane"]
+    assert subject_terms("any updates or news on the status of the crane") == ["crane"]
+    for w in ("hear", "conversation", "conversations", "update", "updates", "news", "status"):
+        assert subject_terms(f"{w} crane") == ["crane"], w

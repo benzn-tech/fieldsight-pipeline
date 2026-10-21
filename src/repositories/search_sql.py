@@ -37,14 +37,44 @@ def _scope_predicate(alias: str = "c") -> str:
     was first written, which meant every other surface hid the content and the two
     the customer is most likely to try still returned it verbatim.
     """
+    return _visibility_predicate(
+        alias,
+        f"(%(date_from)s::date IS NULL OR {alias}.report_date >= %(date_from)s::date) "
+        f"AND (%(date_to)s::date IS NULL OR {alias}.report_date <= %(date_to)s::date)")
+
+
+def _visibility_predicate(alias: str, date_sql: str) -> str:
+    """The ONE visibility rule for report_chunks: site pin, per-author narrowing,
+    both tombstone arms + supersession (visible_chunks_predicate), and the index
+    family (family_predicate, coverage fallback included). `date_sql` is the
+    caller's own date bound, spliced in where the date clauses have always sat so
+    the search SQL stays byte-identical.
+
+    _scope_predicate (search, and Ask's latest_matching_date), and
+    build_latest_date_sql all build their WHERE through here, so a date that a
+    deleted, superseded, other-author or other-family row would have produced
+    cannot leak through one of them while the others hide it.
+    """
     return (
         f"{alias}.site_id = ANY(%(site_ids)s) "
         f"AND (%(author_ids)s::uuid[] IS NULL OR {alias}.user_id = ANY(%(author_ids)s::uuid[])) "
-        f"AND (%(date_from)s::date IS NULL OR {alias}.report_date >= %(date_from)s::date) "
-        f"AND (%(date_to)s::date IS NULL OR {alias}.report_date <= %(date_to)s::date) "
+        f"AND {date_sql} "
         f"AND " + visible_chunks_predicate(alias) + " "
         f"AND " + family_predicate(alias)
     )
+
+
+def _lexical_vector(alias: str = "c") -> str:
+    # MUST equal idx_report_chunks_tsv_multi_config's expression (0061) character for
+    # character (modulo alias) -- test_keyword_arm_expression_matches_the_index_exactly.
+    return (f"to_tsvector('english', {alias}.chunk_text) || to_tsvector('simple', "
+            f"regexp_replace({alias}.chunk_text, '[^a-zA-Z0-9]+', ' ', 'g'))")
+
+
+# The keyword arm's query side: the caller's %(q_text)s bound verbatim (see
+# build_search_sql's header -- an OR list built by lexical_terms.or_query, or "",
+# which is an empty tsquery that matches nothing).
+_LEXICAL_QUERY = "websearch_to_tsquery('simple', %(q_text)s)"
 
 
 def build_search_sql() -> str:
@@ -158,8 +188,8 @@ def build_search_sql() -> str:
         "  LEFT JOIN topics t ON t.id = c.topic_id "
         "  LEFT JOIN sites s ON s.id = c.site_id "
         "  WHERE " + scope + " "
-        "  AND (to_tsvector('english', c.chunk_text) || to_tsvector('simple', regexp_replace(c.chunk_text, '[^a-zA-Z0-9]+', ' ', 'g'))) "
-        "  @@ websearch_to_tsquery('simple', %(q_text)s) "
+        "  AND (" + _lexical_vector("c") + ") "
+        "  @@ " + _LEXICAL_QUERY + " "
         # 2026-09-22 round-2 fix ("the keyword arm can actually fire"): this
         # LIMIT used to have NO ORDER BY, which was fine when the arm's query
         # was an AND of every word (Cause A) -- matches were rare, so
@@ -172,7 +202,7 @@ def build_search_sql() -> str:
         # it for the scan) before the LIMIT makes the k rows this arm
         # contributes its best k by relevance, not whichever k the planner
         # happened to visit first.
-        "  ORDER BY ts_rank(to_tsvector('english', c.chunk_text) || to_tsvector('simple', regexp_replace(c.chunk_text, '[^a-zA-Z0-9]+', ' ', 'g')), websearch_to_tsquery('simple', %(q_text)s)) DESC "
+        "  ORDER BY ts_rank(" + _lexical_vector("c") + ", " + _LEXICAL_QUERY + ") DESC "
         "  LIMIT %(k)s"
         ") "
         "SELECT id, chunk_text, chunk_type, topic_id, source_s3_key, "
@@ -209,9 +239,121 @@ def build_latest_date_sql() -> str:
     return (
         "SELECT max(c.report_date) AS latest "
         "FROM report_chunks c "
-        "WHERE c.site_id = ANY(%(site_ids)s) "
-        "AND (%(author_ids)s::uuid[] IS NULL OR c.user_id = ANY(%(author_ids)s::uuid[])) "
-        "AND (%(on_or_before)s::date IS NULL OR c.report_date <= %(on_or_before)s::date) "
-        "AND " + visible_chunks_predicate("c") + " "
-        "AND " + family_predicate("c")
+        "WHERE " + _visibility_predicate(
+            "c", "(%(on_or_before)s::date IS NULL OR c.report_date <= %(on_or_before)s::date)")
+    )
+
+
+def subject_term_query(i: int) -> str:
+    """Subject word i, matching its english stem OR its exact token (Ask tools,
+    spec 2026-10-20 §3.2, `latest_activity` with a query). Every subject builder
+    below is made of these, so a "match" means one thing everywhere.
+
+    Parameter %(st{i})s, one `lexical_terms.subject_terms` word (bind them with
+    subject_params). Those words are [a-z0-9]+, so to_tsquery's operator syntax
+    cannot be injected through them.
+
+    A fold PER TERM, not `websearch_to_tsquery('english', all) ||
+    websearch_to_tsquery('simple', all)`: that ORs two whole AND-queries, and the
+    english half drops english stopwords -- 'crane' | 'don' & 'crane' matched
+    "the crane arrived" for the subject "don crane". Here to_tsquery('english',
+    'don') is empty, so that term reduces to the simple 'don'.
+      * english half: stems (scaffolding ~ scaffold, panels ~ panel);
+      * simple half: exact tokens, incl. what the english parser splits
+        differently ("RFI-108": english 'rfi' '-108', simple '108').
+    Spacing variants ("rfi108" vs "RFI 108") match neither half: a stated miss.
+    """
+    return f"(to_tsquery('english', %(st{i})s) || to_tsquery('simple', %(st{i})s))"
+
+
+def subject_params(terms) -> dict:
+    """The %(st*)s bindings for subject_term_query(0..len(terms)-1)."""
+    return {f"st{i}": t for i, t in enumerate(terms)}
+
+
+def subject_floor(n: int) -> int:
+    """The least coverage that may choose a day or keep a row (spec 2026-10-20 §8):
+    min(2, n). With n <= 2 every term is required; with more, one generic word
+    alone never decides."""
+    return min(2, n)
+
+
+def _coverage(col: str, n: int) -> str:
+    """How many of the n subject words the tsvector column `col` matches."""
+    return "(" + " + ".join(
+        f"({col} @@ {subject_term_query(i)})::int" for i in range(n)) + ")"
+
+
+def _subject_prefilter(n: int) -> str:
+    """A tsquery true exactly when coverage >= subject_floor(n) (spec §8.1 item 1).
+
+    n >= 2: the OR of every pairwise AND (ti && tj), at most 15 pairs at n = 6.
+    An OR of the single terms would be "coverage >= 1", and with one generic term
+    in it ("site") the planner walked idx_report_chunks_site_date instead of the
+    GIN index; every pair here carries the other term too, so the index serves it.
+    n = 1: the term itself.
+    """
+    if n == 1:
+        return subject_term_query(0)
+    return "(" + " || ".join(
+        f"({subject_term_query(i)} && {subject_term_query(j)})"
+        for i in range(n) for j in range(i + 1, n)) + ")"
+
+
+def build_latest_match_date_sql(n: int) -> str:
+    """The day naming the subject best, most recent first (Ask tools, spec
+    2026-10-15 §3.1 item 3; 2026-10-20 §3.2 and Amendment A §8/§8.1,
+    `latest_activity` with a query). One row `report_date, k`, or none.
+
+    Coverage of a chunk = how many of the n subject words it matches. k* is the
+    highest coverage of any visible chunk in the window; the day is the latest
+    report_date with a chunk at k*; nothing below %(floor)s (subject_floor(n))
+    counts. Round 1 sends the raw question (4-6 subject words), so ALL of them
+    on one chunk is rare -- this is "AND over all, drop terms until a day
+    matches" done as one query. Trade-off (§8): an older day naming 5 words
+    beats a newer one naming 4.
+
+    WHERE = the search's own scope (`_scope_predicate`, with date_from/date_to as
+    the bounded window -- a date is a disclosure too) AND the prefilter, whose
+    left side is _lexical_vector unchanged, so the GIN expression index
+    (idx_report_chunks_tsv_multi_config) serves it. The candidates are
+    MATERIALIZED with the lexical vector selected once as a column, and coverage
+    is summed over that column: n + 1 `@@` against the expression would rebuild
+    to_tsvector per evaluation (measured 282 ms vs 36 ms, §8.1).
+    """
+    if n < 1:
+        raise ValueError("build_latest_match_date_sql needs at least one term")
+    return (
+        "WITH cand AS MATERIALIZED ("
+        "  SELECT c.report_date, " + _lexical_vector("c") + " AS v "
+        "  FROM report_chunks c "
+        "  WHERE " + _scope_predicate("c") + " "
+        "  AND (" + _lexical_vector("c") + ") @@ " + _subject_prefilter(n) +
+        "), m AS ("
+        "  SELECT report_date, " + _coverage("v", n) + " AS k FROM cand"
+        ") "
+        "SELECT report_date, k FROM m "
+        "WHERE k >= %(floor)s "
+        "ORDER BY k DESC, report_date DESC LIMIT 1"
+    )
+
+
+def build_subject_coverage_sql(n: int) -> str:
+    """`id, k` for the given chunk ids: how many of the n subject words each
+    names (Ask tools, `latest_activity` with a query; bound %(ids)s plus
+    subject_params).
+
+    build_search_sql's rows say nothing about whether a row's text names the
+    subject: the day's search ranks by distance and by ts_rank of an OR list.
+    This uses the SAME coverage expression as build_latest_match_date_sql, so a
+    row's k means here exactly what it meant when the day was chosen. Ids only:
+    the rows already passed the search's visibility predicate.
+    """
+    if n < 1:
+        raise ValueError("build_subject_coverage_sql needs at least one term")
+    return (
+        "SELECT id, " + _coverage("v", n) + " AS k FROM ("
+        "  SELECT c.id, " + _lexical_vector("c") + " AS v "
+        "  FROM report_chunks c WHERE c.id = ANY(%(ids)s::uuid[])"
+        ") x"
     )

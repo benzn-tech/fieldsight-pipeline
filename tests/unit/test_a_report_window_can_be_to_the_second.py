@@ -88,7 +88,7 @@ def test_a_windowed_report_lists_only_its_topics_actions():
     assert [a["action"] for a in sr._action_items_for_prompt(content, offer)] == ["HVAC email"]
     assert len(sr._action_items_for_prompt(content)) == 2, "no window, every action as before"
     src = open(sr.__file__, encoding="utf-8").read()
-    assert src.count("_action_items_for_prompt(content, topic_offer)") == 2
+    assert src.count("_action_items_for_prompt(content, topic_offer, date)") == 2
 
 
 

@@ -386,7 +386,7 @@ def day_with_an_earlier_session(monkeypatch):
     monkeypatch.setattr(iw.lambda_ingest, "resolve_user", lambda conn, cid, user_folder: None)
     monkeypatch.setattr(iw.recordings, "site_for_media", lambda *a, **k: None)
     monkeypatch.setattr(iw.recordings, "site_for_day", lambda *a, **k: None)
-    monkeypatch.setattr(iw.topics, "delete_topics_for_source", lambda *a, **k: 0)
+    monkeypatch.setattr(iw.topics, "supersede_topics_for_source", lambda *a, **k: [])
     monkeypatch.setattr(iw.topics, "upsert_topic",
                         lambda *a, **k: {"id": "topic-from-session-B"})
     monkeypatch.setattr(iw.findings, "insert_findings", lambda *a, **k: [])

@@ -199,6 +199,35 @@ jobs:
           if [ -n "${{ vars.PROD_PDF_LAYER_ARN }}" ]; then
             PDF_LAYER_PARAM="PdfLayerArn=${{ vars.PROD_PDF_LAYER_ARN }}"
           fi
+          # Ask orchestration v2 (ASK_AGENTIC, judge model). Same bare-"Key=" guard as
+          # deploy.yml: an unset PROD_ var must not become `AskAgentic=` (SAM exits 2
+          # on it); the template Default '' keeps the flag off until PROD_ASK_AGENTIC is set.
+          ASK_AGENTIC_PARAM=""
+          if [ -n "${{ vars.PROD_ASK_AGENTIC }}" ]; then
+            ASK_AGENTIC_PARAM="AskAgentic=${{ vars.PROD_ASK_AGENTIC }}"
+          fi
+          # Ask conversation history (spec 2026-10-22). Same bare-"Key=" guard; the
+          # template Default '' keeps it off until PROD_ASK_THREADS is set.
+          ASK_THREADS_PARAM=""
+          if [ -n "${{ vars.PROD_ASK_THREADS }}" ]; then
+            ASK_THREADS_PARAM="AskThreads=${{ vars.PROD_ASK_THREADS }}"
+          fi
+          ASK_JUDGE_MODEL_PARAM=""
+          if [ -n "${{ vars.PROD_ASK_JUDGE_MODEL }}" ]; then
+            ASK_JUDGE_MODEL_PARAM="AskJudgeModel=${{ vars.PROD_ASK_JUDGE_MODEL }}"
+          fi
+          ASK_JUDGE_FALLBACKS_PARAM=""
+          if [ -n "${{ vars.PROD_ASK_JUDGE_FALLBACKS }}" ]; then
+            ASK_JUDGE_FALLBACKS_PARAM="AskJudgeFallbacks=${{ vars.PROD_ASK_JUDGE_FALLBACKS }}"
+          fi
+          ASK_JUDGE_PROVIDER_PARAM=""
+          if [ -n "${{ vars.PROD_ASK_JUDGE_PROVIDER }}" ]; then
+            ASK_JUDGE_PROVIDER_PARAM="AskJudgeProvider=${{ vars.PROD_ASK_JUDGE_PROVIDER }}"
+          fi
+          ASK_JUDGE_REASONING_PARAM=""
+          if [ -n "${{ vars.PROD_ASK_JUDGE_REASONING }}" ]; then
+            ASK_JUDGE_REASONING_PARAM="AskJudgeReasoning=${{ vars.PROD_ASK_JUDGE_REASONING }}"
+          fi
           # Non-work (personal) topic retention sweep. Two independent gates, both
           # off by default, because this one DELETES: it tombstones the topic and
           # drops its vectors (the transcript and audio are left alone).
@@ -278,6 +307,7 @@ jobs:
               "GroupMergeCap=${{ vars.PROD_GROUP_MERGE_CAP || '2' }}" \
               "StuckMergeSeconds=${{ vars.PROD_STUCK_MERGE_SECONDS || '1800' }}" \
               "GroupMaxSpanSeconds=${{ vars.PROD_GROUP_MAX_SPAN_SECONDS || '43200' }}" \
+              "DeclareContinuity=${{ vars.PROD_DECLARE_CONTINUITY || 'false' }}" \
               "EmitEvidence=${{ vars.PROD_EMIT_EVIDENCE || 'false' }}" \
               "EvidenceWindowSec=${{ vars.PROD_EVIDENCE_WINDOW_SEC || '60' }}" \
               "EvidenceFuzzyThreshold=${{ vars.PROD_EVIDENCE_FUZZY_THRESHOLD || '0.80' }}" \
@@ -293,6 +323,7 @@ jobs:
               "SearchIndexRead=${{ vars.PROD_SEARCH_INDEX_READ || 'report' }}" \
               "CompanySummaryServe=${{ vars.PROD_COMPANY_SUMMARY_SERVE || 'off' }}" \
               "TemplateDigitise=${{ vars.PROD_TEMPLATE_DIGITISE || 'false' }}" \
+              "CheckDoneGaps=${{ vars.PROD_CHECK_DONE_GAPS || 'false' }}" \
               "ProjectDocuments=${{ vars.PROD_PROJECT_DOCUMENTS || 'false' }}" \
               $PDF_LAYER_PARAM \
               "EnableUserDeletion=${{ vars.PROD_ENABLE_USER_DELETION || 'false' }}" \
@@ -320,6 +351,15 @@ jobs:
               "EnableTodoCollapse=${{ vars.PROD_ENABLE_TODO_COLLAPSE || 'false' }}" \
               "EnableThreadSuggestions=${{ vars.PROD_ENABLE_THREAD_SUGGESTIONS || 'true' }}" \
               $KF_LAYER_PARAM \
+              $ASK_AGENTIC_PARAM \
+              $ASK_THREADS_PARAM \
+              $ASK_JUDGE_MODEL_PARAM \
+              $ASK_JUDGE_FALLBACKS_PARAM \
+              $ASK_JUDGE_PROVIDER_PARAM \
+              $ASK_JUDGE_REASONING_PARAM \
+              "AskVoiceRestate=${{ vars.PROD_ASK_VOICE_RESTATE || 'false' }}" \
+              "AskVoiceConvo=${{ vars.PROD_ASK_VOICE_CONVO || 'false' }}" \
+              "VoiceWebEnabled=${{ vars.PROD_VOICE_WEB_ENABLED || 'false' }}" \
               "RealPTTAccount=$REALPTT_ACCOUNT" \
               "RealPTTPassword=$REALPTT_PASSWORD" \
               "ClaudeApiKey=$CLAUDE_API_KEY" \
@@ -348,8 +388,8 @@ jobs:
               "AskSttProvider=${{ vars.PROD_ASK_STT_PROVIDER || 'dashscope' }}" \
               "AskTtsProvider=${{ vars.PROD_ASK_TTS_PROVIDER || 'dashscope' }}" \
               "ElevenLabsTtsVoice=QlZn2MPaf2jDn0461bnj" \
-              "ElevenLabsTtsSpeed=1.10" \
-              "ElevenLabsTtsModel=eleven_multilingual_v2" \
+              "ElevenLabsTtsSpeed=1.20" \
+              "ElevenLabsTtsModel=eleven_v4_turbo" \
               $EL_TTS_KEY_PARAM \
               "AskVoiceModel=${{ vars.PROD_ASK_VOICE_MODEL || 'none' }}" \
               $EL_ASK_KEY_PARAM \

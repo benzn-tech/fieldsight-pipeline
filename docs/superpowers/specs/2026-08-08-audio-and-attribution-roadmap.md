@@ -214,6 +214,11 @@ consequences that were not part of the decision above:
   coherent build rather than a larger one. Note the tag naming is not stable
   (`点击鼠标` vs `鼠标点击`), so strip the bracket form, not a phrase list.
 
+  **Done** (after this roadmap was written): `filter_audio_event_tags` in
+  `src/lambda_extract_session.py` strips the bracket form (`AUDIO_EVENT_TAG_RE`), on by
+  default behind `FILTER_AUDIO_EVENT_TAGS` — commit 359d5461, "an audio-event tag is not
+  something a person said".
+
 ### P3 — Device-side gain, and microphone placement
 
 The only thing the backend **cannot** repair. The distant speakers are captured at about

@@ -322,6 +322,84 @@ Parameters:
       Vector-distance cutoff for retrieved chunks used by Ask's retrieval
       step. A Parameter so the gate can be recalibrated without a code change.
 
+  AskVoiceRestate:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Voice Ask two-phase: speak a short restatement of the question while the
+      worker is still answering. Set via TEST_/PROD_ repo vars; unset is false.
+
+  AskVoiceConvo:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Voice Ask two-phase: remember the last turns for a follow-up and turn a
+      records miss into a spoken offer to search online, honouring a yes or no
+      to it. Set via TEST_/PROD_ repo vars; unset is false.
+
+  AskAgentic:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(|screen|voice|screen,voice|voice,screen)$'
+    Description: >-
+      Ask orchestration v2 (evidence first, judge after): the channels whose
+      worker turns go through ask_orchestrator instead of _rag_answer. Empty is
+      off. Set via TEST_ASK_AGENTIC / PROD_ASK_AGENTIC; an unset var keeps it off.
+
+  AskThreads:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(|true|false)$'
+    Description: >-
+      Ask conversation history (spec 2026-10-22): the AskVoiceWorker stores a
+      palette turn that opted in under ask_threads/ and org-api serves the
+      caller's last five conversations. Anything but 'true' is off. Set via
+      TEST_ASK_THREADS / PROD_ASK_THREADS; an unset var keeps it off.
+
+  AskJudgeModel:
+    Type: String
+    Default: ''
+    Description: >-
+      Ask orchestration v2: the tool-calling judge model (llm_tools_client).
+      Empty falls back to CORROBORATION_CHEAP_MODEL, then the client default.
+
+  AskJudgeFallbacks:
+    Type: String
+    Default: ''
+    Description: >-
+      Ask orchestration v2: comma-separated judge fallback models, tried on a
+      5xx or a transport failure. Empty means no fallback.
+
+  AskJudgeProvider:
+    Type: String
+    Default: ''
+    Description: >-
+      Ask orchestration v2: comma-separated OpenRouter endpoint tags the
+      primary judge model is pinned to (e.g. coreweave/fp8), no provider
+      fallback. Never applied to AskJudgeFallbacks. Empty means no pin.
+
+  AskJudgeReasoning:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(|off|low|medium|high)$'
+    Description: >-
+      Ask orchestration v2: reasoning control for the primary judge model
+      only. off disables reasoning; low/medium/high set the effort. Empty
+      sends no reasoning setting (the provider default).
+
+  VoiceWebEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Let the voice Ask worker answer from the open web when the excerpts do
+      not answer the question. Separate from EnableWebAnswer (the typed /ask
+      path) so voice can be enabled after its latency is measured. Voice web
+      answers need BOTH this and EnableWebAnswer true: web_answer.enabled()
+      still gates the whole branch. Set via TEST_/PROD_ repo vars; unset is false.
+
   EnableWebAnswer:
     Type: String
     Default: 'false'
@@ -561,11 +639,20 @@ Parameters:
       1.58-1.72s against v3-conversational's 0.98-1.20s), which is inside the
       voice path's budget and buys a voice the customer recognises every time.
 
+      2026-10-14, owner decision: the default is now eleven_v4_turbo. TTS A/B,
+      105 renders, James voice: v4_turbo first audio 0.79-0.92s against
+      multilingual_v2's 1.76-2.74s (flash_v2_5 0.79s); pronunciation 40/40 on
+      v4_turbo. The owner blind-listened to 12 clips (4 per model, 2 renders
+      each) and judged every accent a steady New Zealand accent and the "..."
+      pause natural. The accent-drift risk that chose multilingual_v2 above is
+      non-deterministic and 4 v4_turbo clips is a small sample, so TEST ships
+      first and prod follows only after the owner listens on TEST.
+
       This matters ONLY for live renders. A bundled device prompt is a file:
       it is recorded once, listened to, and shipped byte for byte, so it
       cannot drift. A spoken answer is rendered on every question, so the
       model is the only place its steadiness can be decided.
-    Default: eleven_multilingual_v2
+    Default: eleven_v4_turbo
 
   ElevenLabsTtsSpeed:
     Type: String
@@ -578,13 +665,17 @@ Parameters:
       1.10 is the speed the owner auditioned and approved on James
       (2026-09-22), replacing 1.2.
 
+      2026-10-14, owner decision: 1.20, the ElevenLabs maximum, after the
+      owner listened to v4_turbo (see ElevenLabsTtsModel). This reverses the
+      2026-09-22 change from 1.2 to 1.10 at the owner's request.
+
       This number now ALWAYS reaches the vendor, including at 1.0.
       elevenlabs_utils used to omit voice_settings entirely at 1.0, which does
       not mean "the API default" -- it means "whatever this voice has saved in
       the ElevenLabs workspace", a web console no deploy can see. Measured the
       same day on James: no voice_settings gave 1.90s and 2.04s of audio,
       explicit 1.0 gave 2.18s and 2.23s.
-    Default: '1.10' 
+    Default: '1.20' 
 
   AskTtsProvider:
     Type: String
@@ -597,6 +688,24 @@ Parameters:
       providers return the same WAV container to the device.
     AllowedValues: [dashscope, elevenlabs]
     Default: dashscope
+
+  VoiceLlmBearer:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: >-
+      Bearer token ElevenLabs presents to the voice-agent Custom LLM endpoint
+      (spec 2026-10-13). Empty = the endpoint is not created at all, which is
+      how prod stays without it until the shell phase has been measured.
+
+  VoiceSessionSigningKey:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: >-
+      HMAC key that org-api signs the short-lived voice-agent session token
+      with and VoiceLlmFunction verifies it against. Passed on TEST only, next
+      to VoiceLlmBearer; empty on prod, where the endpoint does not exist.
 
   ElevenLabsTtsApiKey:
     Type: String
@@ -1083,6 +1192,15 @@ Parameters:
       switching it back off leaves the merged record and does not restore what
       was deleted. Flip it on a day when a two-device recording can be watched.
 
+  DeclareContinuity:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Spec 2026-09-30: the extraction call is shown the published items and states which new item
+      continues which; code verifies each claim. Off = today's prompt byte-for-byte. Switch on only
+      after the pre-registered measurement passes.
+
   EmitEvidence:
     Type: String
     Default: 'false'
@@ -1271,8 +1389,9 @@ Parameters:
 
   # Project documents (spec 2026-10-16). Wired in pieces, pinned by
   # tests/unit/test_project_documents_wiring.py: this Parameter -> PROJECT_DOCUMENTS on
-  # OrgApiFunction (routes), RagSearchFunction (documents mode) and AskAgentFunction (the
-  # palette's documents group) -> project_doc_flag.on().
+  # OrgApiFunction (routes), RagSearchFunction (documents mode), AskAgentFunction (the
+  # Ask tool and the palette's documents group) and AskVoiceWorkerFunction (it runs the
+  # orchestrator, so its documents tool must agree) -> project_doc_flag.on().
   ProjectDocuments:
     Type: String
     Default: 'false'
@@ -1281,6 +1400,21 @@ Parameters:
       When true, projects have a Documents section (upload/list/search) and Ask may search
       them. False (default) answers 404 on /sites/{id}/documents, which is the UI's only
       gate. Set per environment by TEST_PROJECT_DOCUMENTS / PROD_PROJECT_DOCUMENTS.
+
+  # Check done (spec 2026-10-20-check-done-gaps-design, step A). Pinned by
+  # tests/unit/test_check_gaps_template.py: this Parameter -> ShouldCheckDoneGaps ->
+  # CheckGapsFunction + CheckGapsDbFunction, and the Ask worker's CHECK_GAPS_FUNCTION
+  # env + invoke grant, both !If-guarded (the flag defaults off, so an unguarded Ref
+  # would name a resource that does not exist).
+  CheckDoneGaps:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      When true, the stack has the "check done" gap pass (CheckGapsFunction, its in-VPC
+      DB hop) and the Ask voice worker is told its name. False (default) creates
+      neither and the worker sees an empty CHECK_GAPS_FUNCTION. Set per environment by
+      TEST_CHECK_DONE_GAPS / PROD_CHECK_DONE_GAPS.
 
   VoiceprintMaxFrameSpread:
     Type: String
@@ -1487,10 +1621,14 @@ Conditions:
   HasDocxLayer: !Not [!Equals [!Ref DocxLayerArn, '']]
   HasPdfLayer: !Not [!Equals [!Ref PdfLayerArn, '']]
   HasDb: !Not [!Equals [!Ref DbStackName, '']]
+  HasVoiceLlm: !Not [!Equals [!Ref VoiceLlmBearer, '']]
   HasOrgPool: !Not [!Equals [!Ref OrgUserPoolId, '']]
   HasPgDatabaseOverride: !Not [!Equals [!Ref PgDatabase, ""]]
   HasOrgApi: !And [!Condition HasDb, !Condition HasOrgPool]
   HasSiteVoice: !And [!Condition HasOrgApi, !Equals [!Ref EnableSiteVoice, 'true']]
+  # The DB hop needs the DB stack and PsycopgLayer (both HasDb), so the flag alone
+  # is not enough -- the HasSiteVoice shape.
+  ShouldCheckDoneGaps: !And [!Condition HasDb, !Equals [!Ref CheckDoneGaps, 'true']]
   # video-keyframe plan: the KeyframeFunction needs Aurora (HasDb) for the
   # topic_photos bind AND a runtime-agnostic ffmpeg layer (HasKeyframeFfmpegLayer,
   # the sitesync-vad-layer with CompatibleRuntimes [3.11, 3.12]) for the static
@@ -1540,6 +1678,59 @@ Globals:
 # Resources
 # ============================================================
 Resources:
+  # ---------------------------------------------------------------------------
+  # Voice agent: Custom LLM endpoint for ElevenLabs (spec 2026-10-13), SHELL.
+  # Node.js because Lambda response streaming is native only there; Python
+  # would need the Web Adapter layer, which the deploy role may not read.
+  # Outside the VPC on purpose: Function URLs do not stream inside a VPC, and
+  # the retrieval it will front is invoked VPC-out -> VPC-in, the direction
+  # AskAgentFunction already uses for RagSearchFunction.
+  # ---------------------------------------------------------------------------
+  VoiceLlmFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasVoiceLlm
+    Properties:
+      FunctionName: !Sub fieldsight-${Stage}-voice-llm
+      CodeUri: voice_llm/
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Timeout: 90
+      MemorySize: 256
+      Environment:
+        Variables:
+          VOICE_LLM_BEARER: !Ref VoiceLlmBearer
+          DEFAULT_ANSWER_DELAY_MS: '1500'
+          VOICE_SESSION_SIGNING_KEY: !Ref VoiceSessionSigningKey
+          ASK_AGENT_FUNCTION: !Ref AskAgentFunction
+          # Same vendor Python resolved the request for (AskAgentFunction's
+          # QWEN_API_KEY / QWEN_BASE_URL), so Node hits the same endpoint.
+          OPENROUTER_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
+          OPENROUTER_BASE_URL: !Ref QwenBaseUrl
+          VOICE_LLM_PROBES: 'false'
+          # On (TEST only, this whole function is HasVoiceLlm): measured 2026-10-14,
+          # n=72 on 36 site questions -- 72/72 passed the guards, p50 0.70 s,
+          # 71/72 inside the 1.8 s deadline, no invented number, name or answer;
+          # 2/72 misread a jargon term (PS3) without adding a fact.
+          VOICE_RESTATE_ENABLED: 'true'
+          VOICE_RESTATE_MODEL: 'meta-llama/llama-3.1-8b-instruct'
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AskAgentFunction
+      FunctionUrlConfig:
+        AuthType: NONE
+        InvokeMode: RESPONSE_STREAM
+
+  # A public Function URL needs BOTH permissions since October 2025: SAM adds
+  # lambda:InvokeFunctionUrl, and without this one every call is a 403.
+  VoiceLlmUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasVoiceLlm
+    Properties:
+      FunctionName: !Ref VoiceLlmFunction
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
+
 
   # ----------------------------------------------------------
   # S3 Bucket Policy (bucket itself is managed outside this stack)
@@ -2278,6 +2469,16 @@ Resources:
           # Reads the same credential and the same vendor as corroboration; the
           # separate flag is about the decision, not the plumbing.
           ENABLE_WEB_ANSWER: !Ref EnableWebAnswer
+          # Two-phase voice Ask: /start writes a pending turn and invokes the
+          # worker async; restatement is a cheap model speaking ahead.
+          ASK_VOICE_WORKER_FUNCTION: !Ref AskVoiceWorkerFunction
+          ASK_TURN_BUCKET: !Ref DataBucketName
+          ASK_VOICE_RESTATE: !Ref AskVoiceRestate
+          ASK_VOICE_CONVO: !Ref AskVoiceConvo
+          VOICE_RESTATE_MODEL: 'meta-llama/llama-3.1-8b-instruct'
+          # Read by /start so the restatement only says "searching online" when
+          # the worker will actually search.
+          VOICE_WEB_ENABLED: !Ref VoiceWebEnabled
           PROJECT_DOCUMENTS: !Ref ProjectDocuments   # spec 2026-10-16 project documents
       Layers:
         - !Ref DashScopeLayer
@@ -2286,6 +2487,201 @@ Resources:
             FunctionName: !Ref RagSearchFunction
         - LambdaInvokePolicy:
             FunctionName: !Ref VoiceAuditFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AskVoiceWorkerFunction
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}/ask_turns/*'
+            # Listing (the 1-day sweep in voice_start) only under the prefix.
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}'
+              Condition:
+                StringLike:
+                  s3:prefix: 'ask_turns/*'
+
+  # ----------------------------------------------------------
+  # Ask Voice Worker (two-phase device Ask)
+  # Why it exists: the synchronous voice path is capped by API Gateway's fixed
+  # 29 s integration timeout, which leaves no room for a web answer. The
+  # device now POSTs /api/ask/voice/start (AskAgent writes a `pending` turn
+  # and fires this function asynchronously) and polls /result. Running async
+  # lifts the 29 s ceiling, so the budgets here differ from AskAgent's:
+  # ASK_DEADLINE_SECONDS / WEB_ANSWER_HARD_STOP 45 and LLM_HTTP_TIMEOUT 40,
+  # plus TTS's fixed 10 s, all under Timeout 60 (see
+  # test_ask_voice_worker_template.py). Env is a copy of AskAgent's except
+  # those, plus the turn store and the voice web flag.
+  # RAG_SEARCH_FUNCTION / VOICE_AUDIT_FUNCTION are HasDb refs from an
+  # unconditional function, same as AskAgent: see the W1001 note in the
+  # top-of-file Metadata block.
+  # Retries are 0: a re-run would double-spend model/TTS calls, and the worker
+  # also guards on state==pending because async delivery is at-least-once.
+  # ----------------------------------------------------------
+  AskVoiceWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ["${P}-ask-voice-worker", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: ask_voice_turn.worker_handler
+      Timeout: 60
+      MemorySize: 256
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+        MaximumEventAgeInSeconds: 120
+      Environment:
+        Variables:
+          # Under the Lambda Timeout above, or the runtime hard-kills this function
+          # before urllib3 raises and the `except` that exists for a slow LLM never
+          # runs. `llm_utils` defaults it to 150 s and explains the ordering; three
+          # functions here had it inverted, all by leaving it at that default.
+          # One model call inside a request whose whole budget is
+          # ASK_DEADLINE_SECONDS below -- strictly less, or a single call can
+          # spend the entire request and leave nothing for retrieval, the
+          # rewrite or synthesis.
+          LLM_HTTP_TIMEOUT: '40'
+          # Caps the whole fallback chain (llm_utils), so muse->luna->mimo at 40 s
+          # each cannot run past ASK_DEADLINE_SECONDS and into the 60 s runtime kill.
+          LLM_CHAIN_BUDGET_SECONDS: '44'
+          # Voluntary deadline: the agent's whole-request budget. A ladder
+          # constant, not a switch -- kept a literal (not a Parameter) so one
+          # reader (_env_value) works for every number in the ladder; see
+          # ASK_INVOKE_TIMEOUT on ApiFunction for the rest of it.
+          ASK_DEADLINE_SECONDS: '45'
+          # Task 9: the three Ask flags, wired in three places each (Parameter,
+          # here, both workflows).
+          ASK_CONVERSATION_MEMORY: !Ref AskConversationMemory
+          ASK_REWRITE_BUDGET: !Ref AskRewriteBudget
+          ASK_DISTANCE_GATE: !Ref AskDistanceGate
+          ANTHROPIC_API_KEY: !Ref ClaudeApiKey
+          RAG_SEARCH_FUNCTION: !Ref RagSearchFunction
+          DASHSCOPE_API_KEY: !Ref DashScopeApiKey
+          # Voice STT provider and its OWN key. Both belong here: a provider
+          # named without a key RAISES rather than falling back, which is the
+          # point -- see ElevenLabsAskApiKey's description.
+          ASK_STT_PROVIDER: !Ref AskSttProvider
+          ASK_TTS_PROVIDER: !Ref AskTtsProvider
+          ELEVENLABS_API_KEY_TTS: !Ref ElevenLabsTtsApiKey
+          ELEVENLABS_TTS_VOICE: !Ref ElevenLabsTtsVoice
+          ELEVENLABS_TTS_MODEL: !Ref ElevenLabsTtsModel
+          ELEVENLABS_TTS_SPEED: !Ref ElevenLabsTtsSpeed
+          ASK_VOICE_MODEL: !Ref AskVoiceModel
+          ELEVENLABS_ASK_API_KEY: !Ref ElevenLabsAskApiKey
+          ELEVENLABS_STT_MODEL: !Ref ElevenLabsSttModel
+          ELEVENLABS_LANGUAGE: !Ref ElevenLabsLanguage
+          DASHSCOPE_BASE_URL: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+          DASHSCOPE_EMBED_MODEL: text-embedding-v4
+          DASHSCOPE_EMBED_DIM: '1024'
+          # Ask only. rag-search is in-VPC with no egress and could not make
+          # this call at all -- it would hang to the socket timeout.
+          ENABLE_RERANK: !Ref EnableRerank
+          DASHSCOPE_RERANK_TIMEOUT_SECONDS: !Ref RerankTimeoutSeconds
+          RERANK_CANDIDATE_K: !Ref RerankCandidateK
+          # SP-Ask: async audit hop (in-VPC). Same cross-condition Ref shape as
+          # RAG_SEARCH_FUNCTION above (VoiceAuditFunction is HasDb, this fn is
+          # unconditional) — safe in practice on the test stack; see the W1001
+          # note in the top-of-file Metadata block.
+          VOICE_AUDIT_FUNCTION: !Ref VoiceAuditFunction
+          # Same value as AskAgentFunction; see the reasoning there.
+          CLAUDE_MODEL: claude-haiku-4-5-20251001
+          LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
+          QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
+          QWEN_BASE_URL: !Ref QwenBaseUrl
+          QWEN_MODEL: !Ref QwenModelFast
+          LLM_REASONING_EFFORT: !Ref LlmReasoningEffortFast
+          # DASHSCOPE_TTS_* below default inside dashscope_utils.py (model
+          # qwen3-tts-flash-realtime, voice Cherry, intl WS url) — no env
+          # override needed here; DashScopeLayer (below) provides the SDK.
+          # External corroboration (/api/ask/corroborate). Off on both stacks
+          # until the pilot contracts are confirmed to permit sending entity
+          # names to a third-party search engine; the code reads this at call
+          # time, so the whole feature returns an empty body while it is false.
+          ENABLE_EXTERNAL_CORROBORATION: !Ref EnableExternalCorroboration
+          # Its own key, NOT QWEN_API_KEY above -- see the CorroborationApiKey
+          # parameter for why borrowing that one sends the wrong vendor's
+          # credential on any DashScope-pointed stack.
+          CORROBORATION_API_KEY: !Ref CorroborationApiKey
+          # Reads the same credential and the same vendor as corroboration; the
+          # separate flag is about the decision, not the plumbing.
+          ENABLE_WEB_ANSWER: !Ref EnableWebAnswer
+          # Worker-only. WEB_ANSWER_HARD_STOP overrides web_answer's in-code
+          # 27 s stop so a web answer can use the worker's longer budget.
+          WEB_ANSWER_HARD_STOP: '45'
+          ASK_TURN_BUCKET: !Ref DataBucketName
+          VOICE_WEB_ENABLED: !Ref VoiceWebEnabled
+          ASK_VOICE_CONVO: !Ref AskVoiceConvo
+          # Same flag as AskAgent (test_ask_voice_worker_template): the worker runs the
+          # orchestrator, so the documents tool must agree with the Ask path's.
+          PROJECT_DOCUMENTS: !Ref ProjectDocuments   # spec 2026-10-16 project documents
+          # Worker-only: the orchestrator runs in the worker, never in AskAgent.
+          ASK_AGENTIC: !Ref AskAgentic
+          ASK_JUDGE_MODEL: !Ref AskJudgeModel
+          ASK_JUDGE_FALLBACKS: !Ref AskJudgeFallbacks
+          ASK_JUDGE_PROVIDER: !Ref AskJudgeProvider
+          ASK_JUDGE_REASONING: !Ref AskJudgeReasoning
+          # Ask conversation history (spec 2026-10-22): store opted-in palette turns.
+          ASK_THREADS: !Ref AskThreads
+          # Check done (spec 2026-10-20): the gap pass the worker invokes on a
+          # "<check> done" ask. Empty when the flag is off -- the Ask line treats
+          # that as `error`. NOT the RagSearch W1001 shape: that one survives only
+          # because HasDb is always true, and this flag defaults to false.
+          CHECK_GAPS_FUNCTION: !If [ShouldCheckDoneGaps, !Ref CheckGapsFunction, '']
+      Layers:
+        - !Ref DashScopeLayer
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref RagSearchFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref VoiceAuditFunction
+        # Exact ARN, not LambdaInvokePolicy: that grants `<name>*`, which also
+        # matches fieldsight-<env>-check-gaps-db (the DB hop is CheckGaps' only).
+        - !If
+          - ShouldCheckDoneGaps
+          - Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt CheckGapsFunction.Arn
+          - !Ref AWS::NoValue
+        # Turn store: prefix-scoped inside the existing data bucket (no new
+        # bucket, no lifecycle rule). Spec section 4.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}/ask_turns/*'
+            # Without ListBucket a missing key answers 403, not 404, and the
+            # turn store could not tell "absent" from a real IAM error.
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}'
+              Condition:
+                StringLike:
+                  s3:prefix: ['ask_turns/*']
+        # Ask threads (spec 2026-10-22 §4): the worker appends a turn and evicts
+        # beyond five, so it deletes here -- unlike ask_turns/*. ListBucket for
+        # the eviction list and so a missing thread answers 404, not 403.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}/ask_threads/*'
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}'
+              Condition:
+                StringLike:
+                  s3:prefix: ['ask_threads/*']
 
   # ----------------------------------------------------------
   # Lambda Layer: dashscope SDK (SP-Ask TTS)
@@ -2522,6 +2918,7 @@ Resources:
       Environment:
         Variables:
           ENABLE_TODO_COLLAPSE: !Ref EnableTodoCollapse
+          VOICE_SESSION_SIGNING_KEY: !If [HasVoiceLlm, !Ref VoiceSessionSigningKey, !Ref AWS::NoValue]
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
@@ -2574,6 +2971,9 @@ Resources:
           TEMPLATE_DIGITISE: !Ref TemplateDigitise
           # off -> /sites/{id}/documents answers 404 (see the ProjectDocuments parameter)
           PROJECT_DOCUMENTS: !Ref ProjectDocuments
+          # off -> /ask/threads answers 404 (see the AskThreads parameter). The
+          # threads live in S3_BUCKET (DataBucketName) under ask_threads/.
+          ASK_THREADS: !Ref AskThreads
       Policies:
         # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
         # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
@@ -2760,6 +3160,17 @@ Resources:
                     # Most days have no photo selection: reading one must be a
                     # 404 (nothing left out), not a 403.
                     - report_photo_selection/*
+                    # Ask threads (spec 2026-10-22 §5): GET /ask/threads lists the
+                    # caller's prefix, and a missing thread must be a 404, not a 403.
+                    - ask_threads/*
+            - Effect: Allow
+              # Ask threads: read a caller's threads and delete one on request
+              # (DELETE /ask/threads/{id}) or once expired. Never written here:
+              # the AskVoiceWorker writes them.
+              Action:
+                - s3:GetObject
+                - s3:DeleteObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/ask_threads/*
             - Effect: Allow
               # In-app updates: the release manifest (app-releases/latest.json) and the APKs it
               # names, which GET /api/org/app/latest presigns for signed-in devices. Read only;
@@ -3211,6 +3622,7 @@ Resources:
       MemorySize: 256
       Environment:
         Variables:
+          DECLARE_CONTINUITY: !Ref DeclareContinuity
           EMIT_EVIDENCE: !Ref EmitEvidence
           EVIDENCE_WINDOW_SEC: !Ref EvidenceWindowSec
           EVIDENCE_FUZZY_THRESHOLD: !Ref EvidenceFuzzyThreshold
@@ -4070,6 +4482,11 @@ Resources:
           S3_BUCKET: !Ref IngestBucketName
           AUTHORITY_FLIP: !Ref AuthorityFlip
           SEARCH_INDEX_WRITE: !Ref SearchIndexWrite
+          # Ruling R22: carry_forward_apply.py's OrphanedHumanEdits EMF line reads this
+          # (os.environ.get("STAGE", "unknown")) — without it every emission lands under
+          # Stage=unknown instead of test/prod, and Task 8's live TEST check saw exactly
+          # that (0 emitted, but tagged unknown).
+          STAGE: !Ref Stage
       Policies:
         # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
         # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
@@ -4345,6 +4762,11 @@ Resources:
           # recurring-item threading: propose which earlier subject a new
           # topic restates. Writes suggestions only; never links.
           SUGGEST_THREADS: !Ref EnableThreadSuggestions
+          # Ruling R22: carry_forward_apply.py's OrphanedHumanEdits EMF line reads this
+          # (os.environ.get("STAGE", "unknown")) — without it every emission lands under
+          # Stage=unknown instead of test/prod, and Task 8's live TEST check saw exactly
+          # that (0 emitted, but tagged unknown).
+          STAGE: !Ref Stage
       Policies:
         # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
         # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
@@ -4933,6 +5355,112 @@ Resources:
         - VPCAccessPolicy: {}
 
   # ----------------------------------------------------------
+  # Check done (spec 2026-10-20-check-done-gaps-design, step A): "pre-pour check
+  # done" on the device -> the items still open, said aloud while he is still at
+  # the pour. Invoked synchronously by AskVoiceWorkerFunction only; no API route,
+  # no Events. The AskAgent -> RagSearch split again: CheckGapsFunction is outside
+  # the VPC (S3, the Ask STT key, the model) and asks CheckGapsDbFunction (in the
+  # VPC, Aurora only, no egress) for the caller, his live session, the templates
+  # and the session's live check windows. Both read-only.
+  #
+  # Timeouts: worker 60 > CheckGaps 35 > DB hop 10 (SYNC_CALLEES in
+  # test_template_timeout_invariants.py). Inside the 35: DB hop ~1 s, STT phase
+  # bounded at 14 s in code, the gap pass at 12 s (LLM_HTTP_TIMEOUT below).
+  # ----------------------------------------------------------
+  CheckGapsFunction:
+    Type: AWS::Serverless::Function
+    Condition: ShouldCheckDoneGaps
+    Properties:
+      FunctionName: !Sub ["${P}-check-gaps", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_check_gaps.lambda_handler
+      Timeout: 35
+      # Up to eight ~1 MB chunks held at once while they are heard in parallel.
+      MemorySize: 512
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref IngestBucketName      # the lake: transcripts/ and users/*/audio/
+          CHECK_GAPS_DB_FUNCTION: !Ref CheckGapsDbFunction
+          # The Ask STT key, never the recording pipeline's ELEVENLABS_API_KEY: up to
+          # eight parallel posts per ask, and that key's credits running out would
+          # stop recordings. No key -> stored transcript only, answer `partial`.
+          ELEVENLABS_ASK_API_KEY: !Ref ElevenLabsAskApiKey
+          ELEVENLABS_STT_MODEL: !Ref ElevenLabsSttModel
+          ELEVENLABS_LANGUAGE: !Ref ElevenLabsLanguage
+          # The Ask worker's fast model (copied, not a new choice). The gap pass
+          # asks for deadline=12 and no thinking; these keep the chain under the
+          # 35 s Timeout even if that deadline were dropped.
+          LLM_HTTP_TIMEOUT: '12'
+          LLM_CHAIN_BUDGET_SECONDS: '14'
+          ANTHROPIC_API_KEY: !Ref ClaudeApiKey
+          CLAUDE_MODEL: claude-haiku-4-5-20251001
+          LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
+          QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
+          QWEN_BASE_URL: !Ref QwenBaseUrl
+          QWEN_MODEL: !Ref QwenModelFast
+          LLM_REASONING_EFFORT: !Ref LlmReasoningEffortFast
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt CheckGapsDbFunction.Arn
+        - Version: '2012-10-17'
+          Statement:
+            # Read-only. What lambda_extract_session's gather/assemble read for one
+            # session (transcripts/, the agent-answer sidecars under voice_ask/ and
+            # the batch map under audio_segments/), plus the device's raw chunks.
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource:
+                - !Sub arn:aws:s3:::${IngestBucketName}/transcripts/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/audio_segments/*
+                - !Sub arn:aws:s3:::${IngestBucketName}/users/*/audio/*
+            # agent_turn_filter RAISES on an unreadable voice_ask/ listing (a 403 that
+            # means "absent" must not look like "none"), so without this every ask on
+            # a day with no Ask answers would fail. Same trap for the other two.
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - transcripts/*
+                    - voice_ask/*
+                    - users/*/audio/*
+
+  CheckGapsDbFunction:
+    Type: AWS::Serverless::Function
+    Condition: ShouldCheckDoneGaps
+    Properties:
+      FunctionName: !Sub ["${P}-check-gaps-db", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_check_gaps_db.lambda_handler
+      # Under CheckGapsFunction's 13 s read timeout on this invoke (13, not 11: a cold
+      # VPC start's init runs before this Timeout's clock starts).
+      Timeout: 10
+      MemorySize: 256
+      Layers:
+        - !Ref PsycopgLayer
+      VpcConfig:
+        SubnetIds: !Ref DbSubnetIds
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${DbStackName}-LambdaSG"
+      Environment:
+        Variables:
+          # Deploy-time credential injection — see MigrateFunction notes.
+          PGHOST: !ImportValue
+            Fn::Sub: "${DbStackName}-ClusterEndpoint"
+          PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
+          PGUSER: postgres
+          PGPASSWORD: !Sub '{{resolve:secretsmanager:${DbSecretArn}:SecretString:password}}'
+      Policies:
+        - VPCAccessPolicy: {}
+
+  # ----------------------------------------------------------
   # Lambda: Voice Audit (SP-Ask) — in-VPC write of one voice_ask_log row.
   # Async-invoked (Event) by AskAgentFunction (non-VPC) after a voice ask;
   # AskAgent can't reach Aurora (BUG-36) so the audit is split into this hop.
@@ -5460,11 +5988,30 @@ Resources:
           # correctly. Literal, not a Parameter -- see AskAgentFunction's
           # ASK_DEADLINE_SECONDS for why.
           ASK_INVOKE_TIMEOUT: '26'
+          ASK_TURN_BUCKET: !Ref DataBucketName
       # Retired data routes answer 410 without touching storage; what remains
-      # is the proxy into the Ask Agent, so that is the only grant.
+      # is the proxy into the Ask Agent, plus the voice-Ask turn store
+      # (/api/ask/voice/result and /cancel read, write and delete turn objects),
+      # scoped to the ask_turns/ prefix. Those are the only grants.
       Policies:
         - LambdaInvokePolicy:
             FunctionName: !Ref AskAgentFunction
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}/ask_turns/*'
+            # Without ListBucket a missing key answers 403, not 404, and the
+            # turn store could not tell "absent" from a real IAM error.
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}'
+              Condition:
+                StringLike:
+                  s3:prefix: ['ask_turns/*']
       Events:
         HealthCheck:
           Type: Api
@@ -6381,6 +6928,11 @@ Resources:
 # Outputs
 # ============================================================
 Outputs:
+  VoiceLlmUrl:
+    Condition: HasVoiceLlm
+    Description: ElevenLabs Custom LLM server URL (append /v1 in the agent config)
+    Value: !GetAtt VoiceLlmFunctionUrl.FunctionUrl
+
   BucketName:
     Description: S3 bucket name
     Value: !Ref DataBucketName

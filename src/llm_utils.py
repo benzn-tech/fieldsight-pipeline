@@ -296,9 +296,8 @@ def _why_stopped(last_error, remaining):
 
 
 def _provider_error(resp):
-    """True for OpenRouter's "Provider returned error" body (a vendor fault, whatever the
-    status) and False for any other body, such as a 404 for a model id that does not
-    exist. The fallback chain treats it as a reason to try the next model."""
+    """True for OpenRouter's "Provider returned error" 404 -- a vendor fault --
+    and False for any other 404, such as a model id that does not exist."""
     try:
         return "provider returned error" in (resp.data or b"").decode("utf-8", "replace").lower()
     except Exception:
@@ -382,10 +381,10 @@ def _post_with_retry(url, body, headers, deadline=None, clock=None,
             if _may_sleep(left(), attempt):
                 continue
             return None, _why_stopped(last_error, left())
-        if resp.status == 404 and attempt < MAX_ATTEMPTS - 1 and _provider_error(resp):
+        if resp.status == 404 and attempt < max_attempts - 1 and _provider_error(resp):
             last_error = "HTTP 404 (Provider returned error)"
             logger.warning("LLM vendor returned 404 Provider returned error -- retrying "
-                           "(attempt %d of %d)", attempt + 1, MAX_ATTEMPTS)
+                           "(attempt %d of %d)", attempt + 1, max_attempts)
             if _may_sleep(left(), attempt, base=PROVIDER_ERROR_WAIT_SECONDS):
                 continue
             return None, _why_stopped(last_error, left())
@@ -558,11 +557,12 @@ def _chain_budget():
     return v if v and v > 0 else None
 
 
-def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
-               deadline=None, caller="unknown"):
-    if not QWEN_API_KEY:
-        logger.error("QWEN_API_KEY / DASHSCOPE_API_KEY not set")
-        return None, "QWEN_API_KEY not configured"
+def build_qwen_payload(prompt, max_tokens, force_json, enable_thinking=None, model=None):
+    """The exact request body `_call_qwen` posts, before any model-chain swap.
+
+    One builder on purpose: the voice endpoint (Node) streams with the request
+    the Ask path resolves here, so a second copy of this logic would let the
+    two drift silently (spec 2026-10-14 phase 2, section 4)."""
     # Per-call override wins; None falls back to the function's env default.
     thinking = QWEN_ENABLE_THINKING if enable_thinking is None else bool(enable_thinking)
     # Resolved BEFORE the model, because the model depends on it.
@@ -596,6 +596,17 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
             payload["response_format"] = {"type": "json_object"}
         else:
             payload["max_tokens"] = max_tokens
+    return payload
+
+
+def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
+               deadline=None, caller="unknown"):
+    if not QWEN_API_KEY:
+        logger.error("QWEN_API_KEY / DASHSCOPE_API_KEY not set")
+        return None, "QWEN_API_KEY not configured"
+    # Per-call override wins; None falls back to the function's env default.
+    thinking = QWEN_ENABLE_THINKING if enable_thinking is None else bool(enable_thinking)
+    payload = build_qwen_payload(prompt, max_tokens, force_json, enable_thinking, model)
 
     chain = [payload["model"]]
     if not _is_dashscope(QWEN_BASE_URL):

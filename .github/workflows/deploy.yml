@@ -89,6 +89,8 @@ jobs:
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY_TEST }}
           ELEVENLABS_ASK_API_KEY: ${{ secrets.ELEVENLABS_ASK_API_KEY_TEST }}
           ELEVENLABS_API_KEY_TTS: ${{ secrets.ELEVENLABS_API_KEY_TTS }}
+          VOICE_LLM_BEARER: ${{ secrets.VOICE_LLM_BEARER_TEST }}
+          VOICE_SESSION_SIGNING_KEY: ${{ secrets.VOICE_SESSION_SIGNING_KEY_TEST }}
           FARGATE_SUBNET_IDS: ${{ secrets.FARGATE_SUBNET_IDS }}
           FARGATE_VPC_ID: ${{ secrets.FARGATE_VPC_ID }}
         run: |
@@ -134,6 +136,19 @@ jobs:
           if [ -n "$ELEVENLABS_API_KEY_TTS" ]; then
             EL_TTS_KEY_PARAM="ElevenLabsTtsApiKey=$ELEVENLABS_API_KEY_TTS"
           fi
+          # Voice agent shell (ElevenLabs Custom LLM, spec 2026-10-13). TEST only:
+          # deploy-prod.yml never passes it, so prod creates no VoiceLlmFunction
+          # (Condition HasVoiceLlm). Same bare-"Key=" guard as the keys above.
+          VOICE_LLM_PARAM=""
+          if [ -n "$VOICE_LLM_BEARER" ]; then
+            VOICE_LLM_PARAM="VoiceLlmBearer=$VOICE_LLM_BEARER"
+          fi
+          # Key that signs/verifies the voice session token; same TEST-only,
+          # bare-"Key=" guard as VOICE_LLM_PARAM.
+          VOICE_SESSION_PARAM=""
+          if [ -n "$VOICE_SESSION_SIGNING_KEY" ]; then
+            VOICE_SESSION_PARAM="VoiceSessionSigningKey=$VOICE_SESSION_SIGNING_KEY"
+          fi
           EL_ASK_KEY_PARAM=""
           if [ -n "$ELEVENLABS_ASK_API_KEY" ]; then
             EL_ASK_KEY_PARAM="ElevenLabsAskApiKey=$ELEVENLABS_ASK_API_KEY"
@@ -156,6 +171,35 @@ jobs:
           PDF_LAYER_PARAM=""
           if [ -n "${{ vars.TEST_PDF_LAYER_ARN }}" ]; then
             PDF_LAYER_PARAM="PdfLayerArn=${{ vars.TEST_PDF_LAYER_ARN }}"
+          fi
+          # Ask orchestration v2 (ASK_AGENTIC, judge model). Same bare-"Key=" guard as
+          # the layer ARNs: an unset TEST_ASK_AGENTIC must not become `AskAgentic=`
+          # (SAM exits 2 on it); the template Default '' keeps the flag off.
+          ASK_AGENTIC_PARAM=""
+          if [ -n "${{ vars.TEST_ASK_AGENTIC }}" ]; then
+            ASK_AGENTIC_PARAM="AskAgentic=${{ vars.TEST_ASK_AGENTIC }}"
+          fi
+          # Ask conversation history (spec 2026-10-22). Same bare-"Key=" guard; the
+          # template Default '' keeps it off until TEST_ASK_THREADS is set.
+          ASK_THREADS_PARAM=""
+          if [ -n "${{ vars.TEST_ASK_THREADS }}" ]; then
+            ASK_THREADS_PARAM="AskThreads=${{ vars.TEST_ASK_THREADS }}"
+          fi
+          ASK_JUDGE_MODEL_PARAM=""
+          if [ -n "${{ vars.TEST_ASK_JUDGE_MODEL }}" ]; then
+            ASK_JUDGE_MODEL_PARAM="AskJudgeModel=${{ vars.TEST_ASK_JUDGE_MODEL }}"
+          fi
+          ASK_JUDGE_FALLBACKS_PARAM=""
+          if [ -n "${{ vars.TEST_ASK_JUDGE_FALLBACKS }}" ]; then
+            ASK_JUDGE_FALLBACKS_PARAM="AskJudgeFallbacks=${{ vars.TEST_ASK_JUDGE_FALLBACKS }}"
+          fi
+          ASK_JUDGE_PROVIDER_PARAM=""
+          if [ -n "${{ vars.TEST_ASK_JUDGE_PROVIDER }}" ]; then
+            ASK_JUDGE_PROVIDER_PARAM="AskJudgeProvider=${{ vars.TEST_ASK_JUDGE_PROVIDER }}"
+          fi
+          ASK_JUDGE_REASONING_PARAM=""
+          if [ -n "${{ vars.TEST_ASK_JUDGE_REASONING }}" ]; then
+            ASK_JUDGE_REASONING_PARAM="AskJudgeReasoning=${{ vars.TEST_ASK_JUDGE_REASONING }}"
           fi
           # Non-work (personal) topic retention sweep. Two independent gates, both
           # off by default, because this one DELETES: it tombstones the topic and
@@ -233,6 +277,12 @@ jobs:
               "EnableThreadSuggestions=${{ vars.TEST_ENABLE_THREAD_SUGGESTIONS || 'true' }}" \
               $KF_LAYER_PARAM \
               $VAD_LAYER_PARAM \
+              $ASK_AGENTIC_PARAM \
+              $ASK_THREADS_PARAM \
+              $ASK_JUDGE_MODEL_PARAM \
+              $ASK_JUDGE_FALLBACKS_PARAM \
+              $ASK_JUDGE_PROVIDER_PARAM \
+              $ASK_JUDGE_REASONING_PARAM \
               "ItemsTableName=fieldsight-test-items" \
               "ReportsTableName=fieldsight-test-reports" \
               "AuditTableName=fieldsight-test-audit" \
@@ -244,12 +294,16 @@ jobs:
               "SearchIndexRead=${{ vars.TEST_SEARCH_INDEX_READ || 'report' }}" \
               "CompanySummaryServe=${{ vars.TEST_COMPANY_SUMMARY_SERVE || 'off' }}" \
               "TemplateDigitise=${{ vars.TEST_TEMPLATE_DIGITISE || 'false' }}" \
+              "CheckDoneGaps=${{ vars.TEST_CHECK_DONE_GAPS || 'false' }}" \
               "ProjectDocuments=${{ vars.TEST_PROJECT_DOCUMENTS || 'false' }}" \
               $PDF_LAYER_PARAM \
               "EnableUserDeletion=${{ vars.TEST_ENABLE_USER_DELETION || 'false' }}" \
               "EnableExternalCorroboration=${{ vars.TEST_ENABLE_EXTERNAL_CORROBORATION || 'false' }}" \
               "CorroborationApiKey=${{ secrets.OPENROUTER_API_KEY }}" \
               "EnableWebAnswer=${{ vars.TEST_ENABLE_WEB_ANSWER || 'false' }}" \
+              "AskVoiceRestate=${{ vars.TEST_ASK_VOICE_RESTATE || 'false' }}" \
+              "AskVoiceConvo=${{ vars.TEST_ASK_VOICE_CONVO || 'false' }}" \
+              "VoiceWebEnabled=${{ vars.TEST_VOICE_WEB_ENABLED || 'false' }}" \
               "AskConversationMemory=${{ vars.TEST_ASK_CONVERSATION_MEMORY || 'false' }}" \
               "AskRewriteBudget=${{ vars.TEST_ASK_REWRITE_BUDGET || '4.0' }}" \
               "AskDistanceGate=${{ vars.TEST_ASK_DISTANCE_GATE || '0.55' }}" \
@@ -279,6 +333,7 @@ jobs:
               "GroupMergeCap=${{ vars.TEST_GROUP_MERGE_CAP || '2' }}" \
               "StuckMergeSeconds=${{ vars.TEST_STUCK_MERGE_SECONDS || '1800' }}" \
               "GroupMaxSpanSeconds=${{ vars.TEST_GROUP_MAX_SPAN_SECONDS || '43200' }}" \
+              "DeclareContinuity=${{ vars.TEST_DECLARE_CONTINUITY || 'false' }}" \
               "EmitEvidence=${{ vars.TEST_EMIT_EVIDENCE || 'true' }}" \
               "EvidenceWindowSec=${{ vars.TEST_EVIDENCE_WINDOW_SEC || '60' }}" \
               "EvidenceFuzzyThreshold=${{ vars.TEST_EVIDENCE_FUZZY_THRESHOLD || '0.80' }}" \
@@ -312,9 +367,11 @@ jobs:
               "AskSttProvider=${{ vars.TEST_ASK_STT_PROVIDER || 'dashscope' }}" \
               "AskTtsProvider=${{ vars.TEST_ASK_TTS_PROVIDER || 'dashscope' }}" \
               "ElevenLabsTtsVoice=QlZn2MPaf2jDn0461bnj" \
-              "ElevenLabsTtsSpeed=1.10" \
-              "ElevenLabsTtsModel=eleven_multilingual_v2" \
+              "ElevenLabsTtsSpeed=1.20" \
+              "ElevenLabsTtsModel=eleven_v4_turbo" \
               $EL_TTS_KEY_PARAM \
+              $VOICE_LLM_PARAM \
+              $VOICE_SESSION_PARAM \
               "AskVoiceModel=${{ vars.TEST_ASK_VOICE_MODEL || 'none' }}" \
               $EL_ASK_KEY_PARAM \
               "ElevenLabsApiKey=$ELEVENLABS_API_KEY" \

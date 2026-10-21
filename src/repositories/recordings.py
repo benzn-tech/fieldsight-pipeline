@@ -842,3 +842,21 @@ def site_companies_for_folder_days(conn, pairs) -> dict:
         else:
             e["sites"][r["site_id"]] = r["company_id"]
     return out
+
+
+def author_candidates_in_sites(conn, site_ids) -> set:
+    """Set-returning sibling of `author_footprint_in_sites`: every user with a
+    topic or a recording on `site_ids`, or a live membership there. The
+    candidate set for Ask's find_people (spec 2026-10-15 §3.1.4). Same three
+    sources and the same rules as the boolean form, so the two never disagree
+    about who is in reach."""
+    if not site_ids:
+        return set()
+    ids = [str(s) for s in site_ids]
+    rows = conn.execute(
+        "SELECT user_id FROM topics WHERE site_id = ANY(%s::uuid[]) AND user_id IS NOT NULL "
+        "UNION SELECT user_id FROM recordings WHERE site_id = ANY(%s::uuid[]) AND user_id IS NOT NULL "
+        "UNION SELECT user_id FROM memberships WHERE site_id = ANY(%s::uuid[]) "
+        "AND archived_at IS NULL",
+        (ids, ids, ids)).fetchall()
+    return {str(r[0]) for r in rows}

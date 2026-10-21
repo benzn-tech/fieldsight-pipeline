@@ -182,20 +182,18 @@ def test_mixed_compose_that_invents_a_marker_is_discarded(monkeypatch):
     assert ask("is our barrier compliant")["answer"] == RECORDS_ANSWER
 
 
-@pytest.mark.parametrize("records_answer", [False])
-def test_project_question_the_records_cannot_answer_falls_back_to_the_general_flow(
-        monkeypatch, records_answer):
-    """Worst case 'slower', never 'nothing'."""
-    vendor = Vendor(web_classify=[classified("project", records_answer)], **general_script())
-    wire(monkeypatch, vendor)
+def test_project_question_the_records_cannot_answer_stays_on_the_records(monkeypatch):
+    """Owner, TEST 2026-10-15: the screen answered a project question the records
+    missed with PROJECT_FALLBACK_LEAD + general guidance. A project question now
+    gets the records' own answer on both channels (spec 2026-10-15 orchestration
+    v2, section 3 change 1); only the voice "search online" sends it out."""
+    vendor = Vendor(web_classify=[classified("project", False)], **general_script())
+    synth = wire(monkeypatch, vendor)
     out = ask("what was the barrier height on level 2")
-    assert out["from_web"] is True
-    assert out["grounded"] is False and out["citations"] == []
-    # The CODE says the records do not show it (TEST 2026-10-06: the model
-    # opened with "Project Records: Confirmed. ..."); web.answer stays general.
-    assert out["answer"] == ("Your project records don't show this." + chr(10) * 2
-                             + "Related general guidance:" + chr(10) * 2 + VERIFIED_TEXT)
-    assert out["web"]["answer"] == VERIFIED_TEXT
+    assert "from_web" not in out
+    assert out["answer"] == RECORDS_ANSWER
+    assert synth["n"] == 1
+    assert vendor.callers["web_draft"] == 0 and vendor.callers["web_verify"] == 0
 
 
 def test_project_question_with_no_records_at_all_falls_back_and_spends_no_classify(monkeypatch):
@@ -232,13 +230,6 @@ def test_no_records_synthesis_for_a_general_question_the_records_cannot_help(mon
     vendor = Vendor(web_classify=[classified("general", False)], **general_script())
     synth = wire(monkeypatch, vendor)
     ask()
-    assert synth["n"] == 0
-
-
-def test_no_records_synthesis_for_a_project_question_the_records_cannot_answer(monkeypatch):
-    vendor = Vendor(web_classify=[classified("project", False)], **general_script())
-    synth = wire(monkeypatch, vendor)
-    ask("what was the barrier height on level 2")
     assert synth["n"] == 0
 
 
@@ -452,7 +443,6 @@ def test_a_crashed_synthesis_still_delivers_the_general_answer(monkeypatch):
 
 @pytest.mark.parametrize("label,classify_reply,chunks,question", [
     ("general, records not useful", classified("general", False), (CHUNK,), SPRINKLER_Q),
-    ("project fallback", classified("project", False), (CHUNK,), "what was the barrier height"),
     ("distance gated", None, (dict(CHUNK, distance=0.9, topic_title="Unrelated"),), SPRINKLER_Q),
 ])
 def test_a_failed_draft_returns_the_no_records_answer_and_never_synthesises(
