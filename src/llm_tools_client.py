@@ -27,9 +27,10 @@ Rules that shape the code below:
   is sent as is first; when it is rejected the retry offers ONLY the named tool
   under `"auto"`, so the forced final answer stays the only tool there is.
 - **Fallbacks** (`ASK_JUDGE_FALLBACKS`, comma-separated) are tried in order on a
-  5xx or a transport failure (timeout included), and only while the deadline
-  leaves time for another attempt. A 4xx is our request's fault and another
-  model would fail the same way.
+  5xx, a 429 or a transport failure (timeout included), and only while the
+  deadline leaves time for another attempt. A 429 is the pinned endpoint's
+  capacity, which the pin forbids OpenRouter to route around. Any other 4xx is
+  our request's or the account's (402) and another model would fail the same way.
 - **Provider pin and reasoning** (`ASK_JUDGE_PROVIDER`, `ASK_JUDGE_REASONING`)
   ride on the primary judge model only, never on a fallback: a fallback on
   another vendor would fail under an endpoint pin that names someone else.
@@ -337,7 +338,7 @@ def chat(messages, tools, *, model=None, tool_choice="required",
             choice, tools = _auto_only(choice, tools)
             downgraded = True
             continue                          # same model, once
-        if 500 <= resp.status < 600:
+        if 500 <= resp.status < 600 or resp.status == 429:
             idx += 1
             continue
         break

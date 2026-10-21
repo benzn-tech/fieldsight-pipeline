@@ -55,7 +55,7 @@ The routing eval passed on this setup: ×3 (434 calls; only pl2 failed, then fix
 ## 5. Rollback
 
 - Behaviour: unset `PROD_ASK_AGENTIC` (and the three voice vars) and redeploy prod. The legacy path is unchanged and comes back.
-- Judge outage: CoreWeave is pinned with no provider fallback; a 5xx or transport failure moves to `google/gemini-3.8-flash`, then the turn fails.
+- Judge outage: CoreWeave is pinned with no provider fallback; a 5xx, a 429 or a transport failure moves to `google/gemini-3.8-flash`, then the turn fails.
 - UI: set `FS_ASK_ASYNC=false` on Amplify `main` and redeploy; the screen goes back to the synchronous Ask.
 
 ## 6. Also in this release, not checked here
