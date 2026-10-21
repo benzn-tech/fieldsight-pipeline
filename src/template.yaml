@@ -2971,6 +2971,9 @@ Resources:
           TEMPLATE_DIGITISE: !Ref TemplateDigitise
           # off -> /sites/{id}/documents answers 404 (see the ProjectDocuments parameter)
           PROJECT_DOCUMENTS: !Ref ProjectDocuments
+          # off -> /ask/threads answers 404 (see the AskThreads parameter). The
+          # threads live in S3_BUCKET (DataBucketName) under ask_threads/.
+          ASK_THREADS: !Ref AskThreads
       Policies:
         # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
         # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
@@ -3157,6 +3160,17 @@ Resources:
                     # Most days have no photo selection: reading one must be a
                     # 404 (nothing left out), not a 403.
                     - report_photo_selection/*
+                    # Ask threads (spec 2026-10-22 §5): GET /ask/threads lists the
+                    # caller's prefix, and a missing thread must be a 404, not a 403.
+                    - ask_threads/*
+            - Effect: Allow
+              # Ask threads: read a caller's threads and delete one on request
+              # (DELETE /ask/threads/{id}) or once expired. Never written here:
+              # the AskVoiceWorker writes them.
+              Action:
+                - s3:GetObject
+                - s3:DeleteObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/ask_threads/*
             - Effect: Allow
               # In-app updates: the release manifest (app-releases/latest.json) and the APKs it
               # names, which GET /api/org/app/latest presigns for signed-in devices. Read only;
