@@ -139,3 +139,73 @@ def test_the_real_forms_read_exactly_as_the_ground_truth(name, n_sections, n_ite
     assert got == truth["sections"]
     assert len(got) == n_sections
     assert sum(len(s["items"]) for s in got) == n_items
+
+
+# ---- separate answer columns (prod hand test, 2026-10-22) ----------------------------
+# The most common layout of all: one column each for Yes, No and N/A with empty boxes
+# to tick, a "#" number column, and the section title as a heading ABOVE the table.
+# Neither rule above saw it -- no cell reads "Yes No N/A" -- so the form was refused
+# with "No checklist table found".
+
+def _columns_like(ticks=False):
+    d = docx.Document()
+    d.add_heading("Pre-Pour Inspection Checklist", 0)
+    d.add_paragraph("Project: ________   Date: ________")
+    for title, items in (("Formwork", ["Formwork set out checked against drawings",
+                                       "Release agent applied to all form faces"]),
+                         ("Reinforcement", ["Seperation between top and bottom mesh maintained"])):
+        d.add_heading(title, 2)
+        t = d.add_table(rows=0, cols=5)
+        _row(t, "#", "Item", "Yes", "No", "N/A")
+        for n, it in enumerate(items, start=1):
+            _row(t, str(n), it, "✓" if ticks and n == 1 else "", "", "")
+    d.add_paragraph("Comments / defects: ________")
+    return _save(d)
+
+
+def test_THE_separate_yes_no_na_columns_with_the_title_above_the_table():
+    assert template_docx.read(_columns_like()) == [
+        {"title": "Formwork", "items": ["Formwork set out checked against drawings",
+                                        "Release agent applied to all form faces"]},
+        {"title": "Reinforcement", "items": ["Seperation between top and bottom mesh maintained"]},
+    ]
+
+
+def test_a_ticked_answer_column_still_reads_as_an_item():
+    got = template_docx.read(_columns_like(ticks=True))
+    assert got[0]["items"][0] == "Formwork set out checked against drawings"
+
+
+def test_a_header_row_that_names_its_section_keeps_that_name():
+    d = docx.Document()
+    d.add_paragraph("Some heading that is not the section")
+    t = d.add_table(rows=0, cols=4)
+    _row(t, "Scaffolding", "Y", "N", "NA")
+    _row(t, "Scaffold tag current", "", "", "")
+    assert template_docx.read(_save(d)) == [{"title": "Scaffolding", "items": ["Scaffold tag current"]}]
+
+
+def test_merged_section_rows_inside_an_answer_column_table():
+    d = docx.Document()
+    t = d.add_table(rows=0, cols=4)
+    _row(t, "Item", "Yes", "No", "N/A")
+    _row(t, "Fire", merge=True)
+    _row(t, "Extinguishers tagged", "", "", "")
+    assert template_docx.read(_save(d)) == [{"title": "Fire", "items": ["Extinguishers tagged"]}]
+
+
+def test_a_row_with_a_written_answer_in_the_answer_columns_is_not_an_item():
+    d = docx.Document()
+    t = d.add_table(rows=0, cols=4)
+    _row(t, "Item", "Yes", "No", "N/A")
+    _row(t, "Gate locked", "", "", "")
+    _row(t, "Signed off by Dom Walker on Tuesday", "see attached report", "", "")
+    assert template_docx.read(_save(d)) == [{"title": "", "items": ["Gate locked"]}]
+
+
+def test_a_yes_no_table_that_is_not_a_checklist_has_no_items():
+    d = docx.Document()
+    t = d.add_table(rows=0, cols=3)
+    _row(t, "Attendee", "Yes", "No")
+    _row(t, "", "", "")
+    assert template_docx.read(_save(d)) == []
