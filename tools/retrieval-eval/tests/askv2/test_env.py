@@ -76,7 +76,8 @@ def test_injected_env_is_the_eval_one(monkeypatch):
         monkeypatch.delenv(k, raising=False)
     copied, secrets, _ = env.fetch_configs(FakeLambdaApi(), "fieldsight-prod")
     monkeypatch.setattr(os, "environ", dict(os.environ))
-    harness.set_import_env("report", {**copied, **secrets})
+    harness.set_import_env("report", {**copied, **secrets, "DASHSCOPE_RERANK_TIMEOUT_SECONDS": "3"})
+    assert os.environ["DASHSCOPE_RERANK_TIMEOUT_SECONDS"] == "20"      # spec §3, not prod 3 s
     assert os.environ["CORROBORATION_API_KEY"] == "fake-judge-key"
     assert "ASK_DEADLINE_SECONDS" not in os.environ and "VOICE_AUDIT_FUNCTION" not in os.environ
     assert os.environ["ENABLE_WEB_ANSWER"] == "false"

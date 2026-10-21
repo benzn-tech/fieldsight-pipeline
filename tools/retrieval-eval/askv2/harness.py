@@ -27,11 +27,12 @@ PLACEHOLDERS = {
     "AWS_DEFAULT_REGION": "ap-southeast-2",
     "DASHSCOPE_EMBED_MODEL": "text-embedding-v4",
     "DASHSCOPE_EMBED_DIM": "1024",
-    # A laptop timeout would fall back to arrival order and change the items (spec §3).
-    "DASHSCOPE_RERANK_TIMEOUT_SECONDS": "20",
 }
 # Forced whatever the copied worker env says (spec §3).
 FORCED = {
+    # A laptop timeout would fall back to arrival order and change the items (spec §3);
+    # forced, so a deployed 3 s cannot win.
+    "DASHSCOPE_RERANK_TIMEOUT_SECONDS": "20",
     "RAG_SEARCH_FUNCTION": FAKE_FUNCTION,
     "ENABLE_WEB_ANSWER": "false",
     "ASK_CONVERSATION_MEMORY": "false",
