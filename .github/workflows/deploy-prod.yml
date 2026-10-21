@@ -206,6 +206,12 @@ jobs:
           if [ -n "${{ vars.PROD_ASK_AGENTIC }}" ]; then
             ASK_AGENTIC_PARAM="AskAgentic=${{ vars.PROD_ASK_AGENTIC }}"
           fi
+          # Ask conversation history (spec 2026-10-22). Same bare-"Key=" guard; the
+          # template Default '' keeps it off until PROD_ASK_THREADS is set.
+          ASK_THREADS_PARAM=""
+          if [ -n "${{ vars.PROD_ASK_THREADS }}" ]; then
+            ASK_THREADS_PARAM="AskThreads=${{ vars.PROD_ASK_THREADS }}"
+          fi
           ASK_JUDGE_MODEL_PARAM=""
           if [ -n "${{ vars.PROD_ASK_JUDGE_MODEL }}" ]; then
             ASK_JUDGE_MODEL_PARAM="AskJudgeModel=${{ vars.PROD_ASK_JUDGE_MODEL }}"
@@ -346,6 +352,7 @@ jobs:
               "EnableThreadSuggestions=${{ vars.PROD_ENABLE_THREAD_SUGGESTIONS || 'true' }}" \
               $KF_LAYER_PARAM \
               $ASK_AGENTIC_PARAM \
+              $ASK_THREADS_PARAM \
               $ASK_JUDGE_MODEL_PARAM \
               $ASK_JUDGE_FALLBACKS_PARAM \
               $ASK_JUDGE_PROVIDER_PARAM \

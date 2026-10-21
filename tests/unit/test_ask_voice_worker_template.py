@@ -153,6 +153,8 @@ def test_object_grants_are_prefix_scoped(resources, fn):
         if not action.startswith("s3:") or action == "s3:ListBucket":
             continue
         s = _sub(res)
+        if fn == "AskVoiceWorkerFunction" and s == "arn:aws:s3:::${DataBucketName}/ask_threads/*":
+            continue        # the thread store's own grant, pinned in test_ask_screen_threads
         assert s == "arn:aws:s3:::${DataBucketName}/ask_turns/*", \
             "%s: %s resource %r is not prefix-scoped" % (fn, action, s)
         object_actions.add(action)

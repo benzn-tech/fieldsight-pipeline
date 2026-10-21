@@ -550,6 +550,49 @@ def get_app_latest():
     ))
 
 
+def ask_threads_route(conn, caller, sub, thread_id, method):
+    """GET /ask/threads, GET and DELETE /ask/threads/{id} (spec 2026-10-22 §5).
+
+    Flag off (ASK_THREADS), an unknown method or a malformed id: 404. A stored turn's
+    source manifest is never returned; a turn the §6 re-check withholds carries
+    `withheld: true` and no result. S3 errors are NOT caught here: an AccessDenied
+    must reach the dispatcher's 500, never read as "no conversations" (the
+    `except ClientError: pass` shape get_app_latest's docstring warns about).
+    """
+    import ask_threads
+    if not ask_threads.enabled():
+        return error("not found", 404)
+    if thread_id is None:
+        if method != "GET":
+            return error("not found", 404)
+        return ok({"threads": ask_threads.list_threads(s3(), S3_BUCKET, sub, time.time())})
+    if not ask_threads.THREAD_RE.match(thread_id) or method not in ("GET", "DELETE"):
+        return error("not found", 404)
+    if method == "DELETE":
+        ask_threads.delete_thread(s3(), S3_BUCKET, sub, thread_id)
+        res = ok(None, 204)
+        res["body"] = ""
+        return res
+    doc = ask_threads.get_thread(s3(), S3_BUCKET, sub, thread_id)
+    if doc is None:
+        return error("not found", 404)
+    import ask_thread_check
+    turns = [t for t in doc["turns"] if isinstance(t, dict)]
+    withheld = ask_thread_check.withheld_turns(conn, caller, turns)
+    out = []
+    for t in turns:
+        row = {k: t.get(k) for k in ("turn_id", "question", "at", "request")}
+        # Fail closed: a turn the re-check could not address by id is never shown.
+        if (not isinstance(t.get("turn_id"), str) or not t.get("turn_id")
+                or t.get("turn_id") in withheld):
+            row["withheld"] = True
+        else:
+            row["result"] = t.get("result")
+        out.append(row)
+    return ok({"thread_id": doc.get("thread_id") or thread_id, "scope": doc.get("scope") or {},
+               "turns": out})
+
+
 def dispatch(conn, event, method, route):
     claims = (event.get("requestContext", {}) or {}).get("authorizer", {}).get("claims", {})
     sub = claims.get("sub", "")
@@ -583,6 +626,13 @@ def dispatch(conn, event, method, route):
         if not key:
             return error("voice sessions are not configured", 503)
         return ok(voice_session.mint(sub, key, now=int(time.time())))
+
+    # Ask conversation history (spec 2026-10-22 §5). After the caller guard, so an
+    # archived caller is refused above; the threads are addressed by the authorizer
+    # sub alone, never by a body or path identity.
+    m_at = re.match(r"^/ask/threads(?:/([^/]+))?$", route)
+    if m_at:
+        return ask_threads_route(conn, caller, sub, m_at.group(1), method)
 
     if route == "/me":
         if method == "GET":

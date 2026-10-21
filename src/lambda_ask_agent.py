@@ -1418,6 +1418,17 @@ def _rag_answer(body, on_web_start=None):
         # actually built from, not the wider set fetched to choose from.
         chunks = _rerank_chunks(question, chunks, k)
         basis = _basis(result, chunks, date_from, date_to)
+        # The source manifest for Ask threads (spec 2026-10-22 §4): every chunk
+        # the answer may be built from, cited or not. Only the returns whose text
+        # can carry record content attach it; the worker strips it before `done`
+        # and the sync handler before it serialises, so no client ever sees it.
+        # A pinned topic block has no source key, so the topic itself is named:
+        # the re-check withholds the answer once that topic stops being visible.
+        import ask_threads
+        _sources = ask_threads.sources_from_chunks(
+            chunks, None,
+            topic_ids=[(pinned_topic or {}).get("id"), scope_req.get("topic_row_id")]
+            if pinned_topic else None)
         # A scoped ask (day/site/author/topic) never consults the web: the web
         # cannot know that site or day (spec 2026-09-15 §4.2 step 7). Computed
         # once so the empty-retrieval branch and the pre-synthesis check below
@@ -1848,6 +1859,7 @@ def _rag_answer(body, on_web_start=None):
                     "basis": basis,
                     "applied_scope": applied_scope,
                     "asked": asked if rewritten else None,
+                    "_sources": _sources,
                 }
             if _useful:
                 logger.warning(
@@ -1864,6 +1876,7 @@ def _rag_answer(body, on_web_start=None):
                 _answer = (PROJECT_FALLBACK_LEAD + "\n\n" + _answer)
             if body.get("mode") == "voice":
                 _answer = _speakable_web_answer(_answer, None)
+            # The general flow was handed `chunks`, so its text can carry them.
             return {
                 "answer": _answer,
                 "citations": [],
@@ -1873,6 +1886,7 @@ def _rag_answer(body, on_web_start=None):
                 "basis": basis,
                 "applied_scope": applied_scope,
                 "asked": asked if rewritten else None,
+                "_sources": _sources,
             }
 
         if _cls is not None and _grounded is None and web is not None:
@@ -2047,6 +2061,7 @@ def _rag_answer(body, on_web_start=None):
             # project question, which never ran it.
             **({"web": web} if web is not None else {}),
             **({"web_offer": True} if _append_offer else {}),
+            "_sources": _sources,
         }
     except Exception as e:
         logger.error(f"  RAG path failed: {e}")
@@ -2407,6 +2422,10 @@ def lambda_handler(event, context):
         if body.get('mode') == 'search':
             return ok(_rag_search_list(body))
         result = _rag_answer(body)
+        # The Ask-threads source manifest is for the async worker only (spec
+        # 2026-10-22 §4); this path never stores a turn, so it never sends it.
+        import ask_threads
+        ask_threads.pop_sources(result)
         if body.get("prompt_only") and "kind" not in result:
             # The early returns (metric route, rag-search error, empty
             # retrieval) and the outer except carry a finished answer, not a
