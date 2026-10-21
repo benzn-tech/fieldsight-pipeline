@@ -18,7 +18,7 @@ import re
 from psycopg.rows import dict_row
 
 from deleted_predicates import DELETED_SOURCE_PREDICATE
-from repositories import redactions, scope, search_sql
+from repositories import redactions, scope, search_sql, topics
 
 logger = logging.getLogger()
 
@@ -49,8 +49,8 @@ _LIVE_DOCS_SQL = ("SELECT d.id::text AS id FROM project_documents d "
 
 
 def _manifest(t):
-    """(record keys, document ids, report days) of one stored turn, or None when the
-    turn carries no manifest at all."""
+    """(record keys, document ids, report days, topic ids) of one stored turn, or None
+    when the turn carries no manifest at all."""
     src = t.get("sources") if isinstance(t, dict) else None
     if not isinstance(src, dict):
         return None
@@ -60,7 +60,8 @@ def _manifest(t):
     days = [(d["folder"], d["report_date"]) for d in src.get("report_days") or []
             if isinstance(d, dict) and isinstance(d.get("folder"), str)
             and isinstance(d.get("report_date"), str)]
-    return keys, docs, days
+    tids = [str(x) for x in src.get("topic_ids") or [] if x is not None and str(x)]
+    return keys, docs, days, tids
 
 
 def _rows(conn, sql, params):
@@ -81,6 +82,7 @@ def withheld_turns(conn, caller, turns) -> set:
     all_keys = sorted({k for m in manifests.values() if m for k in m[0]})
     all_docs = sorted({d for m in manifests.values() if m for d in m[1]})
     all_days = sorted({d for m in manifests.values() if m for d in m[2]})
+    all_topics = sorted({x for m in manifests.values() if m for x in m[3]})
     try:
         sc = scope.visible_scope(conn, caller)
         site_ids = sorted(str(s) for s in sc["site_ids"])
@@ -107,6 +109,14 @@ def withheld_turns(conn, caller, turns) -> set:
         # report's folder and date withholds it.
         dead_days = {day for day in all_days
                      if redactions.deleted_source_prefixes(conn, day[0], day[1])}
+        # Topic rule (pinned topic blocks, orchestrator topic items): the very read the
+        # pinned path makes, topics.get_topic_visible -- visible_topics_predicate
+        # (deleted, recording tombstone, superseded), any active redaction, non-work,
+        # and the caller's site and author reach. Once per distinct topic; a thread
+        # holds a handful.
+        dead_topics = {x for x in all_topics
+                       if not site_ids
+                       or topics.get_topic_visible(conn, x, site_ids, author_ids) is None}
     except Exception as exc:  # noqa: BLE001
         logger.error("ask thread check failed, withholding sourced turns: %s",
                      type(exc).__name__)
@@ -116,9 +126,11 @@ def withheld_turns(conn, caller, turns) -> set:
         if m is None:
             out.add(tid)
             continue
-        keys, docs, days = m
-        if (dead_keys & set(keys)) or (dead_docs & set(docs)) or (dead_days & set(days)):
+        keys, docs, days, tids = m
+        if ((dead_keys & set(keys)) or (dead_docs & set(docs)) or (dead_days & set(days))
+                or (dead_topics & set(tids))):
             out.add(tid)
-    logger.info("ask thread check: turns=%d withheld=%d keys=%d docs=%d days=%d",
-                len(manifests), len(out), len(all_keys), len(all_docs), len(all_days))
+    logger.info("ask thread check: turns=%d withheld=%d keys=%d docs=%d days=%d topics=%d",
+                len(manifests), len(out), len(all_keys), len(all_docs), len(all_days),
+                len(all_topics))
     return out

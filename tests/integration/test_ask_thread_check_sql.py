@@ -5,7 +5,8 @@ import uuid
 import pytest
 
 import ask_thread_check as atc
-from repositories import chunks, companies, memberships, project_docs, redactions, sites, users
+from repositories import (chunks, companies, memberships, project_docs, redactions, sites,
+                          topics, users)
 
 pytestmark = pytest.mark.integration
 
@@ -25,11 +26,12 @@ def _admin(db, co, sub):
             "folder_name": None}
 
 
-def _turn(tid, keys=(), docs=(), days=()):
+def _turn(tid, keys=(), docs=(), days=(), topic_ids=()):
     return {"turn_id": tid, "question": "q", "at": 1.0, "result": {"answer": "a"},
             "sources": {"record_keys": list(keys),
                         "documents": [{"document_id": str(d), "site_id": None} for d in docs],
-                        "report_days": [{"folder": f, "report_date": d} for f, d in days]}}
+                        "report_days": [{"folder": f, "report_date": d} for f, d in days],
+                        "topic_ids": [str(t) for t in topic_ids]}}
 
 
 def test_reingested_key_still_visible(db):
@@ -133,3 +135,46 @@ def test_document_deleted_withheld(db):
     project_docs.soft_delete(db, gone)
     out = atc.withheld_turns(db, caller, [_turn("t1", docs=[keep]), _turn("t2", docs=[gone])])
     assert out == {"t2"}
+
+
+
+def test_pinned_topic_rule(db):
+    """A pinned-topic answer is built from the topic block, which has no source key.
+    It is withheld once the topic is deleted, redacted, tombstoned through its
+    recording, superseded, or its site leaves the caller's reach."""
+    co = companies.create_company(db, "Threads Co G")
+    s = sites.create_site(db, co["id"], "S")
+    other = sites.create_site(db, co["id"], "Other")
+    caller = _admin(db, co, "sub-thr-g")
+
+    def topic(title, site=s, key=None):
+        t = topics.upsert_topic(db, site["id"], "2026-10-20", title, summary="s")
+        if key:
+            db.execute("UPDATE topics SET source_s3_key = %s WHERE id = %s", (key, t["id"]))
+        return str(t["id"])
+
+    live = topic("Live")
+    redacted = topic("Redacted")
+    deleted = topic("Deleted")
+    tomb = topic("Tombstoned", key=SESSION)
+    superseded = topic("Superseded")
+    elsewhere = topic("Elsewhere", site=other)
+    missing = str(uuid.uuid4())
+    redactions.create_redaction(db, co["id"], redacted, "personal", None, "admin")
+    redactions.create_redaction(db, co["id"], deleted, "removed", None, "admin",
+                                scope="deleted")
+    redactions.create_recording_tombstone(db, co["id"], SESSION, "removed", None, "admin")
+    db.execute("UPDATE topics SET superseded_at = now() WHERE id = %s", (superseded,))
+
+    turns = [_turn(n, topic_ids=[t]) for n, t in (
+        ("live", live), ("redacted", redacted), ("deleted", deleted), ("tomb", tomb),
+        ("superseded", superseded), ("elsewhere", elsewhere), ("missing", missing))]
+    assert atc.withheld_turns(db, dict(caller), turns) == {
+        "redacted", "deleted", "tomb", "superseded", "missing"}
+
+    # The site leaves the caller's reach: a worker who is a member of `other` only.
+    w = users.upsert_user(db, "sub-thr-gw", "gw@thr.nz", company_id=co["id"])
+    memberships.add_membership(db, w["id"], other["id"], "site_manager")
+    worker = {"id": w["id"], "company_id": co["id"], "global_role": "worker",
+              "folder_name": None}
+    assert atc.withheld_turns(db, worker, [_turn("live", topic_ids=[live])]) == {"live"}

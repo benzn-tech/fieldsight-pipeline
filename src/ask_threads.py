@@ -60,12 +60,18 @@ def new_thread_id() -> str:
 _REPORT_DAY = re.compile(r"^reports/(\d{4}-\d{2}-\d{2})/([^/]+)/daily_report\.json$")
 
 
-def sources_from_chunks(chunks, documents) -> dict:
+def sources_from_chunks(chunks, documents, topic_ids=None) -> dict:
     """The retrieved-source manifest both answer paths attach as `result["_sources"]`
     (spec §4 "Manifest"): every distinct, non-empty `source_s3_key` of the chunks
     the answer was built from (cited or not), every document as
-    {document_id, site_id}, and the report days those keys name. Server-side only:
-    the worker lifts it into the thread turn and it never reaches a client."""
+    {document_id, site_id}, the report days those keys name, and `topic_ids`: the
+    topics whose own text the answer was given with no source key to stand for it
+    (a pinned topic block, an orchestrator topic item). Server-side only: the worker
+    lifts it into the thread turn and it never reaches a client.
+
+    Metric-route answers carry no manifest at all, on purpose: `_metric_answer`
+    renders counts and fixed notes (metric_render), never record text or a topic
+    title, so there is nothing in them a deletion could have to take back."""
     keys, days, docs, seen_docs = [], [], [], set()
     for c in chunks or []:
         key = c.get("source_s3_key") if isinstance(c, dict) else None
@@ -85,7 +91,11 @@ def sources_from_chunks(chunks, documents) -> dict:
         site_id = d.get("site_id")
         docs.append({"document_id": str(doc_id),
                      "site_id": str(site_id) if site_id is not None else None})
-    return {"record_keys": keys, "documents": docs, "report_days": days}
+    topics = []
+    for t in topic_ids or []:
+        if t is not None and str(t) and str(t) not in topics:
+            topics.append(str(t))
+    return {"record_keys": keys, "documents": docs, "report_days": days, "topic_ids": topics}
 
 
 def pop_sources(result):
@@ -127,25 +137,33 @@ def _fit(doc):
     """The encoded thread, at most MAX_BYTES, or None when it cannot fit. A last
     turn that would cross the cap keeps `result.answer` only, cut until it fits,
     with `result.truncated: true`. The question and the source manifest are never
-    cut: the manifest is what the open-time re-check reads."""
+    cut: the manifest is what the open-time re-check reads. An answer that would
+    be cut to nothing does not fit (D8: an empty answer is never stored)."""
     body = _encode(doc)
     if len(body) <= MAX_BYTES:
         return body
     turn = doc["turns"][-1]
     result = turn.get("result") if isinstance(turn.get("result"), dict) else {}
     answer = result.get("answer") if isinstance(result.get("answer"), str) else ""
-    turn["result"] = {"answer": answer, "truncated": True}
-    while True:
+    turn["result"] = {"answer": "", "truncated": True}
+    if len(_encode(doc)) > MAX_BYTES:
+        return None
+    # The longest prefix that fits, by bisection over the ENCODED size: a character
+    # is 1 to 12 bytes once escaped, so no single cut-by-overflow is right for both
+    # ASCII and CJK (cutting by the byte overflow empties a Chinese answer).
+    lo, hi, best = 1, len(answer), None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        turn["result"]["answer"] = answer[:mid]
         body = _encode(doc)
-        over = len(body) - MAX_BYTES
-        if over <= 0:
-            return body
-        if not answer:
-            return None
-        # Every character is at least one encoded byte, so dropping `over`
-        # characters drops at least `over` bytes.
-        answer = answer[:max(0, len(answer) - over)]
-        turn["result"]["answer"] = answer
+        if len(body) <= MAX_BYTES:
+            lo, best = mid + 1, body
+        else:
+            hi = mid - 1
+    if best is None:
+        return None
+    turn["result"]["answer"] = answer[:lo - 1]
+    return best
 
 
 def _new_doc(thread_id, scope, now):
@@ -153,9 +171,10 @@ def _new_doc(thread_id, scope, now):
             "scope": scope, "turns": []}
 
 
-def append_turn(s3, bucket, caller_sub, thread_id, turn: dict, scope: dict, now: float) -> dict:
+def append_turn(s3, bucket, caller_sub, thread_id, turn: dict, scope: dict, now: float):
     """Append `turn` to the caller's thread and return
-    {"thread_id", "rolled_over", "created"}.
+    {"thread_id", "rolled_over", "created"}, or None when the turn is not stored
+    because no non-empty answer fits under MAX_BYTES (D8).
 
     `thread_id` None mints a thread. A supplied id that is missing (evicted,
     expired, another caller's) or already holds MAX_TURNS mints a new thread
@@ -182,7 +201,9 @@ def append_turn(s3, bucket, caller_sub, thread_id, turn: dict, scope: dict, now:
         doc["turns"].append(turn)
         body = _fit(doc)
     if body is None:
-        raise ValueError("thread turn does not fit")
+        logger.info("ask thread append skipped: does not fit with an answer sub_hash=%s",
+                    ask_voice_turn.sub_hash(caller_sub))
+        return None
     s3.put_object(Bucket=bucket, Key=thread_key(caller_sub, doc["thread_id"]), Body=body,
                   ContentType="application/json")
     logger.info("ask thread append: thread=%s turns=%d bytes=%d created=%s rolled_over=%s "

@@ -66,12 +66,18 @@ def test_sources_from_chunks_distinct_non_null_and_report_days():
     assert src == {
         "record_keys": [DAY_KEY, SESSION_KEY, "reports/2026-10-20/ben_lin/other.json"],
         "documents": [{"document_id": "d-1", "site_id": "s-1"}],
-        "report_days": [{"folder": "ben_lin", "report_date": "2026-10-20"}]}
+        "report_days": [{"folder": "ben_lin", "report_date": "2026-10-20"}],
+        "topic_ids": []}
 
 
 def test_sources_from_chunks_empty():
     assert ask_threads.sources_from_chunks([], None) == {
-        "record_keys": [], "documents": [], "report_days": []}
+        "record_keys": [], "documents": [], "report_days": [], "topic_ids": []}
+
+
+def test_sources_from_chunks_topic_ids_distinct_non_null():
+    src = ask_threads.sources_from_chunks([], None, topic_ids=["t-1", None, "", "t-1", "t-2"])
+    assert src["topic_ids"] == ["t-1", "t-2"]
 
 
 def test_pop_sources_removes_key():
@@ -94,7 +100,7 @@ def test_rag_answer_success_carries_sources(monkeypatch):
     # The uncited chunk is in the manifest; the NULL key is not.
     assert out["_sources"] == {
         "record_keys": [SESSION_KEY, DAY_KEY], "documents": [],
-        "report_days": [{"folder": "ben_lin", "report_date": "2026-10-20"}]}
+        "report_days": [{"folder": "ben_lin", "report_date": "2026-10-20"}], "topic_ids": []}
 
 
 def test_rag_answer_error_return_has_no_sources(monkeypatch):
@@ -242,3 +248,49 @@ def test_orchestrator_error_result_has_no_sources(monkeypatch, orch_env):
     monkeypatch.setattr(llm_utils, "call_llm", lambda prompt, **kw: (None, "down"))
     out = run("What did we pour on B2?", ScriptChat(ChatTurn(error="deadline", timed_out=True)))
     assert out.get("error") and "_sources" not in out
+
+
+# ------------------------------------------- pinned topic and metric answers
+
+PINNED = "66666666-6666-6666-6666-666666666666"
+
+
+def test_pinned_topic_answer_names_the_topic(monkeypatch):
+    """A scoped Ask on a topic answers from the pinned topic block, which carries no
+    source key: the manifest must name the topic itself (spec §6, topic rule)."""
+    monkeypatch.delenv("ENABLE_WEB_ANSWER", raising=False)
+    monkeypatch.setenv("RAG_SEARCH_FUNCTION", "rag-fn")
+    monkeypatch.delenv("ASK_CONVERSATION_MEMORY", raising=False)
+    monkeypatch.setattr(dashscope_utils, "embed", lambda texts, dim=None: [[0.1] * 1024])
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: FakeLambdaClient({
+        "chunks": [], "pinned_topic": {"id": PINNED, "title": "Pour B2", "summary": "Poured.",
+                                       "report_date": "2026-10-20", "site_id": "s-1"},
+        "applied": {"topic_row_id": PINNED}}))
+    monkeypatch.setattr(llm_utils, "call_llm", lambda prompt, **kw: ("We poured B2.", None))
+    out = laa._rag_answer({"question": "What happened here?", "caller_sub": SUB,
+                           "topic_row_id": PINNED})
+    assert out["answer"] == "We poured B2."
+    assert out["_sources"]["topic_ids"] == [PINNED]
+
+
+def test_orchestrator_topic_items_name_their_topic(orch_env):
+    def rows(call):
+        if call["name"] == "day_overview":
+            return [{"id": "t1", "title": "Inspection", "text": "Level 2 checked.",
+                     "date": "2026-10-19", "site": "Riverside", "topic_id": PINNED}], {}
+        return [], {"empty_reason": "no_match"}
+    chat = ScriptChat(calls(("day_overview", {"date_from": "2026-10-19",
+                                              "date_to": "2026-10-19"})),
+                      final("Level 2 was checked [R1]."))
+    out = run("What did we check on the 19th?", chat, tools=DocTools(rows))
+    assert PINNED in out["_sources"]["topic_ids"]
+
+
+def test_metric_answer_carries_no_manifest(monkeypatch):
+    """Counts only (metric_render): no record text, so nothing to re-check."""
+    monkeypatch.setenv("RAG_SEARCH_FUNCTION", "rag-fn")
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: FakeLambdaClient(
+        {"metric": "count_sessions", "value": 3, "unit": "sessions"}))
+    out = laa._metric_answer(SUB, "How many sessions yesterday?", "count_sessions",
+                             "2026-10-20", "2026-10-20")
+    assert "_sources" not in out

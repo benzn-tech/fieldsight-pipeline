@@ -1422,8 +1422,13 @@ def _rag_answer(body, on_web_start=None):
         # the answer may be built from, cited or not. Only the returns whose text
         # can carry record content attach it; the worker strips it before `done`
         # and the sync handler before it serialises, so no client ever sees it.
+        # A pinned topic block has no source key, so the topic itself is named:
+        # the re-check withholds the answer once that topic stops being visible.
         import ask_threads
-        _sources = ask_threads.sources_from_chunks(chunks, None)
+        _sources = ask_threads.sources_from_chunks(
+            chunks, None,
+            topic_ids=[(pinned_topic or {}).get("id"), scope_req.get("topic_row_id")]
+            if pinned_topic else None)
         # A scoped ask (day/site/author/topic) never consults the web: the web
         # cannot know that site or day (spec 2026-09-15 §4.2 step 7). Computed
         # once so the empty-retrieval branch and the pre-synthesis check below

@@ -284,7 +284,8 @@ def test_missing_manifest_stores_an_empty_one(wk):
     wk.rag_result = {"answer": ANSWER, "citations": []}
     st = run(wk)
     doc = wk.s3.threads(SUB)[ask_threads.thread_key(SUB, st["result"]["thread"]["thread_id"])]
-    assert doc["turns"][0]["sources"] == {"record_keys": [], "documents": [], "report_days": []}
+    assert doc["turns"][0]["sources"] == {"record_keys": [], "documents": [], "report_days": [],
+                                          "topic_ids": []}
 
 
 # ------------------------------------------------- template and deploy wiring
@@ -358,3 +359,13 @@ def test_workflow_passes_ask_threads_only_when_set(workflow, prefix):
     assert re.search(r'ASK_THREADS_PARAM=""\s+if \[ -n "\$\{\{ vars\.%s \}\}" \]; then\s+'
                      r'ASK_THREADS_PARAM="AskThreads=\$\{\{ vars\.%s \}\}"' % (var, var), text)
     assert re.search(r"^\s+\$ASK_THREADS_PARAM \\$", text, re.M)
+
+
+
+def test_turn_whose_answer_truncates_to_nothing_is_not_stored(wk):
+    # D8 holds for the STORED answer: a question that fills the object leaves no room
+    # for any answer text, so the turn is not stored rather than stored empty.
+    st = run(wk, request(question="q" * ask_threads.MAX_BYTES))
+    assert st["status"] == "done" and st["result"]["answer"] == ANSWER
+    assert "thread" not in st["result"]
+    assert wk.s3.threads(SUB) == {}

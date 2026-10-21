@@ -606,15 +606,17 @@ def _thread_turn(turn_id, request, result, sources, now):
                         "history_len": len(history) if isinstance(history, list) else 0},
             "result": result,
             "sources": sources if isinstance(sources, dict) else
-            {"record_keys": [], "documents": [], "report_days": []}}
+            {"record_keys": [], "documents": [], "report_days": [], "topic_ids": []}}
 
 
 def _store_thread_turn(s3, bucket, caller_sub, turn_id, request, result, sources):
     """Append a successful palette turn to the caller's thread before `done`
     (spec 2026-10-22 §4, D4/D7/D8). Returns append_turn's dict, or None when the
     turn is not stored. Stored only when the flag is on, the request opted in
-    (`thread_id` or `new_thread: true`) and the result is a success. A failure
-    logs the type only: the answer is still delivered, without `thread`."""
+    (`thread_id` or `new_thread: true`) and the result is a success -- including
+    the stored copy: append_turn returns None rather than store an answer the size
+    cap would cut to nothing. A failure logs the type only: the answer is still
+    delivered, without `thread`."""
     import ask_threads
     if not ask_threads.enabled():
         return None

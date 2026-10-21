@@ -1042,13 +1042,15 @@ def _card_items(envelopes):
 
 def _sources_of(envelopes):
     """The Ask-threads source manifest (spec 2026-10-22 §4) from every envelope the
-    judge was shown: each record card's source and each document, cited or not --
-    the judge can use evidence it did not cite. The worker strips it before `done`."""
+    judge was shown: each record card's source, each document and each topic item's
+    topic (a topic summary can carry no source key), cited or not -- the judge can
+    use evidence it did not cite. The worker strips it before `done`."""
     import ask_threads
     items = [it for env in envelopes for it in env.get("items") or []]
     return ask_threads.sources_from_chunks(
         [{"source_s3_key": it.get("source")} for it in items if it.get("kind") in _CARD_KINDS],
-        [it for it in items if it.get("kind") == "document"])
+        [it for it in items if it.get("kind") == "document"],
+        topic_ids=[it.get("topic_id") for it in items if it.get("kind") == "topic"])
 
 
 def _latest_before(envelopes):

@@ -136,7 +136,11 @@ def test_size_cap_counts_bytes_not_characters(s3):
     out = ask_threads.append_turn(s3, BUCKET, SUB, None, _turn(answer=big), SCOPE, NOW)
     raw = s3.objs[ask_threads.thread_key(SUB, out["thread_id"])][0]
     assert len(raw) <= ask_threads.MAX_BYTES
-    assert json.loads(raw)["turns"][0]["result"]["truncated"] is True
+    stored = json.loads(raw)["turns"][0]["result"]
+    assert stored["truncated"] is True
+    # Cut by encoded size, not emptied: a CJK character is six bytes once escaped.
+    assert len(stored["answer"]) > 1000 and big.startswith(stored["answer"])
+    assert len(raw) > ask_threads.MAX_BYTES - 64
 
 
 def test_full_thread_rolls_over_when_even_a_truncated_turn_cannot_fit(s3):
@@ -285,3 +289,27 @@ def test_store_logs_no_text(s3, caplog):
     ask_threads.get_thread(s3, BUCKET, SUB, tid, now=NOW)
     text = caplog.text
     assert "slab" not in text and "extractions/" not in text and SUB not in text
+
+
+
+def test_never_stores_an_answer_truncated_to_nothing(s3):
+    turn = dict(_turn(answer="a" * 5000), question="q" * (ask_threads.MAX_BYTES - 300))
+    assert ask_threads.append_turn(s3, BUCKET, SUB, None, turn, SCOPE, NOW) is None
+    assert s3.puts == []
+    # A thread that is full gets a new one, and when even that cannot hold any answer
+    # text the turn is not stored at all; the old thread is untouched.
+    tid = ask_threads.append_turn(s3, BUCKET, SUB, None, _turn(0), SCOPE, NOW)["thread_id"]
+    before = s3.objs[ask_threads.thread_key(SUB, tid)][0]
+    assert ask_threads.append_turn(s3, BUCKET, SUB, tid, turn, SCOPE, NOW) is None
+    assert s3.objs[ask_threads.thread_key(SUB, tid)][0] == before
+    assert len([k for k in s3.objs if k.startswith(ask_threads.thread_prefix(SUB))]) == 1
+
+
+def test_truncation_keeps_a_non_empty_answer(s3):
+    for size in range(1, 400, 37):
+        turn = dict(_turn(answer="a" * 5000), question="q" * (ask_threads.MAX_BYTES - 700 + size))
+        out = ask_threads.append_turn(s3, BUCKET, SUB, None, turn, SCOPE, NOW)
+        if out is None:
+            continue
+        doc = s3.doc(ask_threads.thread_key(SUB, out["thread_id"]))
+        assert doc["turns"][-1]["result"]["answer"]

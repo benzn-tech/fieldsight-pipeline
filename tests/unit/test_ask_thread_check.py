@@ -7,7 +7,7 @@ import logging
 import pytest
 
 import ask_thread_check as atc
-from repositories import scope, search_sql
+from repositories import scope, search_sql, topics
 
 SITE = "11111111-1111-1111-1111-111111111111"
 OTHER_SITE = "22222222-2222-2222-2222-222222222222"
@@ -68,11 +68,12 @@ def visible(monkeypatch):
     return sc
 
 
-def turn(tid, keys=(), docs=(), days=()):
+def turn(tid, keys=(), docs=(), days=(), topics_=()):
     return {"turn_id": tid, "question": "q", "at": 1.0, "result": {"answer": "a"},
             "sources": {"record_keys": list(keys),
                         "documents": [{"document_id": d, "site_id": SITE} for d in docs],
-                        "report_days": [{"folder": f, "report_date": d} for f, d in days]}}
+                        "report_days": [{"folder": f, "report_date": d} for f, d in days],
+                        "topic_ids": list(topics_)}}
 
 
 def test_live_key_is_shown():
@@ -198,3 +199,55 @@ def test_check_logs_no_keys_or_ids(caplog):
     atc.withheld_turns(FakeConn(), CALLER, [turn("t1", [KEY], docs=[DOC],
                                                  days=[("ben", "2026-10-20")])])
     assert KEY not in caplog.text and DOC not in caplog.text and "ben" not in caplog.text
+
+
+
+# ------------------------------------------------------------ topic rule
+
+TOPIC = "77777777-7777-7777-7777-777777777777"
+GONE_TOPIC = "88888888-8888-8888-8888-888888888888"
+
+
+@pytest.fixture
+def topic_reads(monkeypatch):
+    seen = []
+
+    def visible(conn, topic_id, site_ids, author_ids):
+        seen.append((topic_id, list(site_ids), author_ids))
+        return {"id": topic_id} if topic_id == TOPIC else None
+
+    monkeypatch.setattr(topics, "get_topic_visible", visible)
+    return seen
+
+
+def test_topic_gone_or_invisible_withheld(topic_reads):
+    out = atc.withheld_turns(FakeConn(), CALLER, [turn("t1", topics_=[TOPIC]),
+                                                  turn("t2", topics_=[GONE_TOPIC]),
+                                                  turn("t3", topics_=[TOPIC, GONE_TOPIC])])
+    assert out == {"t2", "t3"}
+
+
+def test_topic_rule_uses_the_pinned_path_read_with_the_callers_scope(topic_reads, visible):
+    visible["author_ids"] = {ME}
+    atc.withheld_turns(FakeConn(), CALLER, [turn("t%d" % i, topics_=[TOPIC]) for i in range(3)])
+    # Once per distinct topic, with the caller's resolved reach.
+    assert topic_reads == [(TOPIC, [SITE], [ME])]
+
+
+def test_topic_with_no_visible_sites_withheld(topic_reads, visible):
+    visible["site_ids"] = set()
+    assert atc.withheld_turns(FakeConn(), CALLER, [turn("t1", topics_=[TOPIC])]) == {"t1"}
+
+
+def test_topic_read_error_fails_closed(monkeypatch):
+    def boom(conn, topic_id, site_ids, author_ids):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(topics, "get_topic_visible", boom)
+    assert atc.withheld_turns(FakeConn(), CALLER, [turn("t1", topics_=[TOPIC]),
+                                                   turn("t2")]) == {"t1"}
+
+
+def test_manifest_without_topic_ids_still_reads(topic_reads):
+    t = turn("t1", [KEY])
+    del t["sources"]["topic_ids"]
+    assert atc.withheld_turns(FakeConn(live={KEY}), CALLER, [t]) == set()
