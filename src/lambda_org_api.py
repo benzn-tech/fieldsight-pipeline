@@ -582,7 +582,9 @@ def ask_threads_route(conn, caller, sub, thread_id, method):
     out = []
     for t in turns:
         row = {k: t.get(k) for k in ("turn_id", "question", "at", "request")}
-        if t.get("turn_id") in withheld:
+        # Fail closed: a turn the re-check could not address by id is never shown.
+        if (not isinstance(t.get("turn_id"), str) or not t.get("turn_id")
+                or t.get("turn_id") in withheld):
             row["withheld"] = True
         else:
             row["result"] = t.get("result")

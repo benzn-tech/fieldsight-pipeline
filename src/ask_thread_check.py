@@ -43,6 +43,12 @@ _TOMBSTONED_KEYS_SQL = ("SELECT k.source_s3_key "
 
 # Rule 3: the document still exists (not soft-deleted) in a site the caller sees.
 # The document's site is read from the row, never from the manifest.
+# Deliberately narrower than search's project_docs_sql.visible_predicate (which also
+# drops superseded and not-yet-indexed rows), per spec §6 rule 3 "no longer exists":
+# a superseded revision is still the caller's own project document, unchanged and
+# still openable from the project's documents list, so an answer quoting it reveals
+# nothing the caller cannot read today. Deletion and loss of the site are what must
+# take the answer back, and both are checked here.
 _LIVE_DOCS_SQL = ("SELECT d.id::text AS id FROM project_documents d "
                   "WHERE d.id = ANY(%(ids)s::uuid[]) AND d.deleted_at IS NULL "
                   "AND d.site_id = ANY(%(site_ids)s::uuid[])")
@@ -114,6 +120,9 @@ def withheld_turns(conn, caller, turns) -> set:
         # (deleted, recording tombstone, superseded), any active redaction, non-work,
         # and the caller's site and author reach. Once per distinct topic; a thread
         # holds a handful.
+        # Superseded topics are withheld deliberately, on the safe side: a nightly
+        # re-extraction supersedes a topic whose stored answer may still be correct,
+        # and that turn is then withheld -- Ask again recovers it from the live pass.
         dead_topics = {x for x in all_topics
                        if not site_ids
                        or topics.get_topic_visible(conn, x, site_ids, author_ids) is None}

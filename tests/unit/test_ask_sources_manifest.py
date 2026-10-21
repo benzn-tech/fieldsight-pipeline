@@ -294,3 +294,34 @@ def test_metric_answer_carries_no_manifest(monkeypatch):
     out = laa._metric_answer(SUB, "How many sessions yesterday?", "count_sessions",
                              "2026-10-20", "2026-10-20")
     assert "_sources" not in out
+
+
+
+def test_orchestrator_fallback_from_topic_items_names_and_withholds_the_topic(
+        monkeypatch, orch_env):
+    """A fallback answer written from topic items with no source key carries their
+    topic ids, so the re-check withholds it once the topic is gone."""
+    import ask_thread_check
+    from repositories import scope, topics
+
+    def rows(call):
+        if call["name"] == "day_overview":
+            return [{"id": "t1", "title": "Inspection", "text": "Level 2 checked.",
+                     "date": "2026-10-20", "site": "Riverside", "topic_id": PINNED}], {}
+        return [], {"empty_reason": "no_match"}
+    monkeypatch.setattr(llm_utils, "call_llm", lambda prompt, **kw: ("Synth [1].", None))
+    out = run("What did we do yesterday?", ScriptChat(ChatTurn(error="deadline", timed_out=True)),
+              tools=DocTools(rows))
+    assert out["answer"] == "Synth [1]."
+    src = out["_sources"]
+    assert src["record_keys"] == [] and src["topic_ids"] == [PINNED]
+
+    monkeypatch.setattr(scope, "visible_scope",
+                        lambda conn, caller: {"site_ids": {"s-1"}, "author_ids": None})
+    live = {PINNED}
+    monkeypatch.setattr(topics, "get_topic_visible",
+                        lambda conn, tid, site_ids, author_ids: {"id": tid} if tid in live else None)
+    stored = [{"turn_id": "t1", "question": "q", "sources": src}]
+    assert ask_thread_check.withheld_turns(object(), {"id": "u"}, stored) == set()
+    live.clear()
+    assert ask_thread_check.withheld_turns(object(), {"id": "u"}, stored) == {"t1"}

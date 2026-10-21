@@ -313,3 +313,40 @@ def test_truncation_keeps_a_non_empty_answer(s3):
             continue
         doc = s3.doc(ask_threads.thread_key(SUB, out["thread_id"]))
         assert doc["turns"][-1]["result"]["answer"]
+
+
+
+def _fill(s3, tid, room):
+    """Make the stored thread's first question so long that only `room` bytes are left."""
+    key = ask_threads.thread_key(SUB, tid)
+    doc = s3.doc(key)
+    size = len(json.dumps(doc).encode("utf-8"))
+    doc["turns"][0]["question"] += "q" * (ask_threads.MAX_BYTES - size - room)
+    s3.objs[key] = (json.dumps(doc).encode("utf-8"), s3.clock, "application/json")
+    return key
+
+
+@pytest.mark.parametrize("room", [300, 3000])
+def test_rollover_keeps_the_answer_intact(s3, room):
+    """An existing thread never truncates a new turn: whenever the whole turn does not
+    fit, it opens a fresh thread, and there it fits untouched (with its citations).
+    The caller's turn dict is never mutated."""
+    tid = ask_threads.append_turn(s3, BUCKET, SUB, None, _turn(0), SCOPE, NOW)["thread_id"]
+    key = _fill(s3, tid, room)
+    before = s3.objs[key][0]
+    turn = _turn(1, answer="a" * 5000)
+    turn["result"]["citations"] = [{"n": 1, "source_s3_key": "k"}]
+    original = json.loads(json.dumps(turn))
+    out = ask_threads.append_turn(s3, BUCKET, SUB, tid, turn, SCOPE, NOW)
+    assert out["thread_id"] != tid and out["rolled_over"] is True and out["created"] is True
+    stored = s3.doc(ask_threads.thread_key(SUB, out["thread_id"]))["turns"]
+    assert stored == [original]
+    assert turn == original
+    assert s3.objs[key][0] == before
+
+
+def test_truncation_never_mutates_the_callers_turn(s3):
+    turn = _turn(answer="x" * (300 * 1024))
+    original = json.loads(json.dumps(turn))
+    ask_threads.append_turn(s3, BUCKET, SUB, None, turn, SCOPE, NOW)
+    assert turn == original

@@ -13,6 +13,7 @@ carry a hash of the caller, thread ids, counts and byte sizes.
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -134,8 +135,9 @@ def _encode(doc) -> bytes:
 
 
 def _fit(doc):
-    """The encoded thread, at most MAX_BYTES, or None when it cannot fit. A last
-    turn that would cross the cap keeps `result.answer` only, cut until it fits,
+    """The encoded thread, at most MAX_BYTES, or None when it cannot fit. Only ever
+    called on a fresh single-turn thread, whose turn is the thread's own copy (it is
+    rewritten here). A turn that would cross the cap keeps `result.answer` only, cut until it fits,
     with `result.truncated: true`. The question and the source manifest are never
     cut: the manifest is what the open-time re-check reads. An answer that would
     be cut to nothing does not fit (D8: an empty answer is never stored)."""
@@ -179,8 +181,13 @@ def append_turn(s3, bucket, caller_sub, thread_id, turn: dict, scope: dict, now:
     `thread_id` None mints a thread. A supplied id that is missing (evicted,
     expired, another caller's) or already holds MAX_TURNS mints a new thread
     instead, never re-creates the old id, and `rolled_over` says so. `scope` is
-    stored only when the thread is created. Raises on any S3 error other than a
-    missing key; the caller logs the type and carries on."""
+    stored only when the thread is created. A turn that does not fit whole in an
+    existing thread opens a new one (`rolled_over`); only a fresh single-turn thread
+    ever truncates. Raises on any S3 error other than a missing key; the caller logs
+    the type and carries on."""
+    # The thread's own copy: truncation rewrites it, and the caller's `turn` is the
+    # worker's live result.
+    turn = copy.deepcopy(turn)
     doc, rolled_over = None, False
     if thread_id is not None:
         if _valid_id(thread_id):
@@ -189,15 +196,18 @@ def append_turn(s3, bucket, caller_sub, thread_id, turn: dict, scope: dict, now:
                 or not isinstance(doc.get("updated_at"), (int, float))
                 or now - doc["updated_at"] > EXPIRY_S):
             doc, rolled_over = None, True
+    body = None
+    if doc is not None:
+        doc["turns"].append(turn)
+        doc["updated_at"] = now
+        body = _encode(doc)
+        if len(body) > MAX_BYTES:
+            # Never truncate inside an existing thread: an answer cut short to make
+            # room beside old turns is worse than the same answer whole in a new one.
+            doc, body, rolled_over = None, None, True
     created = doc is None
     if created:
         doc = _new_doc(new_thread_id(), scope, now)
-    doc["turns"].append(turn)
-    doc["updated_at"] = now
-    body = _fit(doc)
-    if body is None and not created:
-        # The earlier turns alone fill the object: this turn opens a new thread.
-        doc, rolled_over, created = _new_doc(new_thread_id(), scope, now), True, True
         doc["turns"].append(turn)
         body = _fit(doc)
     if body is None:

@@ -1141,8 +1141,9 @@ def _fallback(t, reason, shown):
             cards = laa._build_citations(chunks)
             for card, it in zip(cards, items):
                 card["time_start"] = card.get("time_start") or it.get("time_start")
-            import ask_threads
-            sources = {"_sources": ask_threads.sources_from_chunks(chunks, None)}
+            # The items it was written from, topic ids included: a topic item's
+            # summary can carry no source key.
+            sources = {"_sources": _sources_of([{"items": items}])}
             if getattr(t, "web_failed", None):
                 answer, kept = _web_failed_answer(t, answer, True)
                 if not kept:

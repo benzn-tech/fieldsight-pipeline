@@ -88,7 +88,7 @@ def env(monkeypatch):
     state.s3, state.caller, state.withheld, state.checked = fake, dict(CALLER), set(), []
 
     def withheld(conn, caller, turns):
-        state.checked.append((caller["id"], [t["turn_id"] for t in turns]))
+        state.checked.append((caller["id"], [t.get("turn_id") for t in turns]))
         return set(state.withheld)
 
     monkeypatch.setattr(ask_thread_check, "withheld_turns", withheld)
@@ -275,3 +275,22 @@ def test_lifecycle_script_expires_ask_threads_at_31_days():
     assert rule["Filter"]["Prefix"] == "ask_threads/"
     assert rule["Expiration"]["Days"] == 31
     assert "ID!=`ask-threads-expiry`" in script
+
+
+
+@pytest.mark.parametrize("bad_id", [None, "", 7])
+def test_turn_without_a_turn_id_is_withheld(env, bad_id):
+    """Fail closed: a stored turn the re-check cannot address is never shown."""
+    tid = seed(env, n_turns=2)
+    key = ask_threads.thread_key(SUB, tid)
+    doc = json.loads(env.s3.objs[key][0])
+    if bad_id is None:
+        del doc["turns"][0]["turn_id"]
+    else:
+        doc["turns"][0]["turn_id"] = bad_id
+    env.s3.objs[key] = (json.dumps(doc).encode("utf-8"), env.s3.objs[key][1])
+    status, body = call("GET", "/ask/threads/" + tid)
+    assert status == 200
+    first, second = body["turns"]
+    assert first["withheld"] is True and "result" not in first
+    assert second["result"]["answer"] == "The slab is 200 mm [1]."
