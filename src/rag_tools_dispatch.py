@@ -155,11 +155,10 @@ def _search_author_folder(conn, caller, sc, user_id, meta):
     it resolves to a DIFFERENT user would search the wrong person. Either way:
     no rows, never a wider search.
 
-    KNOWN GAP (Task 5 review I1(c), parked): an external author whose folder
-    name collides with a home-company folder therefore cannot be searched at
-    all, although day_overview (which narrows by user id) works for the same
-    ref. The fix is an author-by-user-id field on `_search`, not loosening this
-    check."""
+    A folder-name collision cannot produce the mismatch: migration 0012 made
+    `users.folder_name` globally unique, so both lookups can only return the
+    user who owns the folder. The check guards against a future change in
+    `_search`'s resolution, not a known gap."""
     u = users.get_by_id(conn, user_id)
     folder = u and u.get("folder_name")
     if folder:
