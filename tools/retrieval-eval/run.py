@@ -89,22 +89,8 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 
 
-def _export_src(ref):
-    """Directory holding `src/` as it is at `ref` (default origin/main = prod),
-    or this worktree's own src for ref "worktree"."""
-    if ref == "worktree":
-        return REPO / "src", None
-    import io
-    import tarfile
-    import tempfile
-    sha = subprocess.run(["git", "-C", str(REPO), "rev-parse", ref], capture_output=True,
-                         text=True, check=True).stdout.strip()
-    blob = subprocess.run(["git", "-C", str(REPO), "archive", sha, "src"], capture_output=True,
-                          check=True).stdout
-    dest = Path(tempfile.mkdtemp(prefix="retrieval-eval-src-"))
-    with tarfile.open(fileobj=io.BytesIO(blob)) as tf:
-        tf.extractall(dest)
-    return dest / "src", sha
+# One copy of the export, shared with the Ask v2 mode (askv2/srcref.py).
+from askv2.srcref import export_src as _export_src  # noqa: E402
 
 
 SRC_REF = os.environ.get("EVAL_SRC_REF", "origin/main")
