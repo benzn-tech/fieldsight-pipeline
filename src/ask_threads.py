@@ -55,6 +55,46 @@ def new_thread_id() -> str:
     return secrets.token_hex(16)
 
 
+# A day-level report key. One deleted session inside that day must withhold an
+# answer built from it (spec §6 rule 4), so the manifest names the day too.
+_REPORT_DAY = re.compile(r"^reports/(\d{4}-\d{2}-\d{2})/([^/]+)/daily_report\.json$")
+
+
+def sources_from_chunks(chunks, documents) -> dict:
+    """The retrieved-source manifest both answer paths attach as `result["_sources"]`
+    (spec §4 "Manifest"): every distinct, non-empty `source_s3_key` of the chunks
+    the answer was built from (cited or not), every document as
+    {document_id, site_id}, and the report days those keys name. Server-side only:
+    the worker lifts it into the thread turn and it never reaches a client."""
+    keys, days, docs, seen_docs = [], [], [], set()
+    for c in chunks or []:
+        key = c.get("source_s3_key") if isinstance(c, dict) else None
+        if not isinstance(key, str) or not key or key in keys:
+            continue
+        keys.append(key)
+        m = _REPORT_DAY.match(key)
+        if m:
+            day = {"folder": m.group(2), "report_date": m.group(1)}
+            if day not in days:
+                days.append(day)
+    for d in documents or []:
+        doc_id = d.get("document_id") if isinstance(d, dict) else None
+        if doc_id is None or str(doc_id) in seen_docs:
+            continue
+        seen_docs.add(str(doc_id))
+        site_id = d.get("site_id")
+        docs.append({"document_id": str(doc_id),
+                     "site_id": str(site_id) if site_id is not None else None})
+    return {"record_keys": keys, "documents": docs, "report_days": days}
+
+
+def pop_sources(result):
+    """Remove the manifest from an answer dict and return it (None when absent)."""
+    if not isinstance(result, dict):
+        return None
+    return result.pop("_sources", None)
+
+
 def _valid_id(thread_id) -> bool:
     return isinstance(thread_id, str) and bool(THREAD_RE.match(thread_id))
 

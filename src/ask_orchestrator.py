@@ -1040,6 +1040,17 @@ def _card_items(envelopes):
     return out
 
 
+def _sources_of(envelopes):
+    """The Ask-threads source manifest (spec 2026-10-22 §4) from every envelope the
+    judge was shown: each record card's source and each document, cited or not --
+    the judge can use evidence it did not cite. The worker strips it before `done`."""
+    import ask_threads
+    items = [it for env in envelopes for it in env.get("items") or []]
+    return ask_threads.sources_from_chunks(
+        [{"source_s3_key": it.get("source")} for it in items if it.get("kind") in _CARD_KINDS],
+        [it for it in items if it.get("kind") == "document"])
+
+
 def _latest_before(envelopes):
     for env in envelopes:
         lb = (env.get("meta") or {}).get("latest_before")
@@ -1128,13 +1139,16 @@ def _fallback(t, reason, shown):
             cards = laa._build_citations(chunks)
             for card, it in zip(cards, items):
                 card["time_start"] = card.get("time_start") or it.get("time_start")
+            import ask_threads
+            sources = {"_sources": ask_threads.sources_from_chunks(chunks, None)}
             if getattr(t, "web_failed", None):
                 answer, kept = _web_failed_answer(t, answer, True)
                 if not kept:
                     return t.result(answer, [], grounded=False,
                                     extra=_web_failed_extra(t), cited=())
-                return t.result(answer, cards, extra=_web_failed_extra(t), cited=items)
-            return t.result(answer, cards, cited=items)
+                return t.result(answer, cards, extra={**_web_failed_extra(t), **sources},
+                                cited=items)
+            return t.result(answer, cards, extra=sources, cited=items)
         # Records exist but could not be written up: saying "no records" would
         # be false, so the turn ends as an error (the worker writes `error`).
         t.route["fallback"] = reason + "+no_synthesis"
@@ -1471,6 +1485,7 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
         extra.update(_web_failed_extra(t))
         if not kept:
             return t.result(text, [], grounded=False, extra=extra, cited=())
+    extra["_sources"] = _sources_of(shown)
     cited_refs = _cited_card_refs(fin["answer"], shown)
     cited = [it for it in _card_items(shown) if it.get("ref") in cited_refs]
     # Spec §6.7: grounded means an R ref was cited.
