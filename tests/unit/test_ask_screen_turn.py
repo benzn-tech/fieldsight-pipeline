@@ -372,3 +372,21 @@ def test_worker_screen_log_line_has_no_text(wk, caplog):
     assert re.fullmatch(r"screen ask: rag=\d+\.\d\ds total=\d+\.\d\ds turn=f{32} "
                         r"web=False sub_hash=[0-9a-f]{12}", lines[0])
     assert QUESTION not in caplog.text and SUB not in caplog.text and "slab" not in caplog.text
+
+
+# ------------------------------------------------- Ask threads (spec 2026-10-22) ----
+
+def test_start_screen_keeps_thread_fields_in_the_stored_request(env):
+    out = avt.start_screen(screen_body(thread_id="a" * 32, new_thread=True))
+    st = env.s3.state(SUB, out["turn_id"])
+    assert st["request"]["thread_id"] == "a" * 32 and st["request"]["new_thread"] is True
+
+
+def test_screen_rag_body_excludes_thread_fields(wk):
+    req = dict(wk.request, thread_id="a" * 32, new_thread=True)
+    avt.put_state(wk.s3, BUCKET, SUB, TURN, {"status": "pending", "channel": "screen",
+                                             "created_at": 1.0, "request": req})
+    avt.worker_handler(sevent(), None)
+    body = wk.rag_calls[0]
+    assert "thread_id" not in body and "new_thread" not in body
+    assert body == dict(wk.request, caller_sub=SUB)

@@ -513,7 +513,9 @@ SCREEN = "screen"
 # path (`_rag_answer` branches on mode == "voice"). `offer_web` / `web_intent`
 # are NOT dropped: they are the screen web opt-in (spec 2026-10-16
 # ask-screen-web-offer §2), already whitelisted to JSON true by the API.
-_SCREEN_DROP = ("caller_sub", "mode", "voice_web")
+# `thread_id` / `new_thread` (spec 2026-10-22 ask conversation history §4) are
+# for the worker's thread append, never for the model.
+_SCREEN_DROP = ("caller_sub", "mode", "voice_web", "thread_id", "new_thread")
 
 
 def start_screen(body) -> dict:

@@ -302,3 +302,42 @@ def test_dispatch_result_and_cancel(s3):
                                None)["statusCode"] == 400
     assert fapi.lambda_handler(ev("POST", "/api/ask/cancel", b={"turn_id": TURN}, sub=""),
                                None)["statusCode"] == 401
+
+
+# ---- Ask threads: thread_id / new_thread on /api/ask/start (spec 2026-10-22 §4) ----
+
+THREAD = "abcdef0123456789abcdef0123456789"
+
+
+def test_start_passes_valid_thread_id(start_client):
+    r = fapi.ask_start({"question": "q", "thread_id": THREAD}, CALLER)
+    assert r["statusCode"] == 200
+    sent = start_client.calls[0][2]
+    assert sent["thread_id"] == THREAD and "new_thread" not in sent
+
+
+@pytest.mark.parametrize("bad", ["../x", THREAD.upper(), THREAD[:31], THREAD + "0",
+                                 "g" * 32, 123, "", ["x"], True])
+def test_start_rejects_bad_thread_id_400(start_client, bad):
+    r = fapi.ask_start({"question": "q", "thread_id": bad}, CALLER)
+    assert r["statusCode"] == 400
+    assert start_client.calls == []
+
+
+def test_start_null_thread_id_is_absent(start_client):
+    fapi.ask_start({"question": "q", "thread_id": None}, CALLER)
+    assert "thread_id" not in start_client.calls[0][2]
+
+
+def test_start_passes_new_thread_true_only_when_bool_true(start_client):
+    fapi.ask_start({"question": "q", "new_thread": True}, CALLER)
+    assert start_client.calls[-1][2]["new_thread"] is True
+    for v in (False, "true", 1, None, {}):
+        fapi.ask_start({"question": "q", "new_thread": v}, CALLER)
+        assert "new_thread" not in start_client.calls[-1][2]
+
+
+def test_sync_ask_never_forwards_thread_fields(ask_client):
+    fapi.ask_question({"question": "q", "thread_id": THREAD, "new_thread": True}, CALLER)
+    sent = ask_client.calls[0][2]
+    assert "thread_id" not in sent and "new_thread" not in sent

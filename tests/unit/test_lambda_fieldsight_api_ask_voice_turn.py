@@ -306,3 +306,11 @@ def test_dispatch_and_known_routes(s3):
     assert fapi.lambda_handler(ev("GET", "/api/ask/voice/start"), None)["statusCode"] == 404
     assert fapi.lambda_handler(
         ev("GET", "/api/ask/voice/result", qs=None), None)["statusCode"] == 400
+
+
+def test_voice_start_ignores_thread_fields(monkeypatch):
+    # Voice and device Ask never store a thread (spec 2026-10-22 D7).
+    fl = FakeLambda()
+    monkeypatch.setattr(fapi, "lambda_client", fl)
+    fapi.ask_voice_start({"audio": "QUJD", "thread_id": "a" * 32, "new_thread": True}, CALLER)
+    assert set(fl.calls[0][2]) == {"mode", "audio", "format", "caller_sub"}

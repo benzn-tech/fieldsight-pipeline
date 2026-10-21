@@ -29,6 +29,7 @@ from datetime import datetime
 
 # Light at import (boto3 + stdlib only; lambda_ask_agent etc. load lazily inside its
 # functions), so it is safe to import eagerly. Device Ask two-phase turn store.
+import ask_threads
 import ask_voice_turn
 
 # Pure module, no boto3 -- safe to import eagerly. Moved out of this file
@@ -270,6 +271,18 @@ def ask_start(body, caller):
     payload, err = _build_ask_payload(body, caller)
     if err:
         return err
+    # Ask threads (spec 2026-10-22 §4): the palette's opt-in to store this turn.
+    # Here and not in _build_ask_payload: the sync /api/ask never stores a turn.
+    # They reach the stored turn request, never the model (_SCREEN_DROP). The
+    # id only ever addresses the caller's own prefix: the key is built from the
+    # authorizer sub.
+    thread_id = body.get('thread_id')
+    if thread_id is not None:
+        if not (isinstance(thread_id, str) and ask_threads.THREAD_RE.match(thread_id)):
+            return error('Invalid thread_id')
+        payload['thread_id'] = thread_id
+    if body.get('new_thread') is True:
+        payload['new_thread'] = True
     payload['mode'] = 'turn_start'
     try:
         resp = ask_start_client.invoke(
