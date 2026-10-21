@@ -348,6 +348,16 @@ Parameters:
       worker turns go through ask_orchestrator instead of _rag_answer. Empty is
       off. Set via TEST_ASK_AGENTIC / PROD_ASK_AGENTIC; an unset var keeps it off.
 
+  AskThreads:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(|true|false)$'
+    Description: >-
+      Ask conversation history (spec 2026-10-22): the AskVoiceWorker stores a
+      palette turn that opted in under ask_threads/ and org-api serves the
+      caller's last five conversations. Anything but 'true' is off. Set via
+      TEST_ASK_THREADS / PROD_ASK_THREADS; an unset var keeps it off.
+
   AskJudgeModel:
     Type: String
     Default: ''
@@ -2614,6 +2624,8 @@ Resources:
           ASK_JUDGE_FALLBACKS: !Ref AskJudgeFallbacks
           ASK_JUDGE_PROVIDER: !Ref AskJudgeProvider
           ASK_JUDGE_REASONING: !Ref AskJudgeReasoning
+          # Ask conversation history (spec 2026-10-22): store opted-in palette turns.
+          ASK_THREADS: !Ref AskThreads
           # Check done (spec 2026-10-20): the gap pass the worker invokes on a
           # "<check> done" ask. Empty when the flag is off -- the Ask line treats
           # that as `error`. NOT the RagSearch W1001 shape: that one survives only
@@ -2653,6 +2665,23 @@ Resources:
               Condition:
                 StringLike:
                   s3:prefix: ['ask_turns/*']
+        # Ask threads (spec 2026-10-22 §4): the worker appends a turn and evicts
+        # beyond five, so it deletes here -- unlike ask_turns/*. ListBucket for
+        # the eviction list and so a missing thread answers 404, not 403.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}/ask_threads/*'
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}'
+              Condition:
+                StringLike:
+                  s3:prefix: ['ask_threads/*']
 
   # ----------------------------------------------------------
   # Lambda Layer: dashscope SDK (SP-Ask TTS)

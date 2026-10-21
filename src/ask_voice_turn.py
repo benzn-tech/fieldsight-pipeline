@@ -590,6 +590,53 @@ def _remember(s3, bucket, caller_sub, question, answer_text, rag):
         logger.error("voice offer write failed: %s", type(e).__name__)
 
 
+# The request fields a thread keeps as its scope (spec 2026-10-22 §3): the first
+# turn's context, so a reopened thread can say what it was asked about.
+_THREAD_SCOPE_KEYS = ("site_id", "author_folder", "topic_row_id", "topic_id", "date",
+                      "scoped")
+
+
+def _thread_turn(turn_id, request, result, sources, now):
+    """One stored thread turn (spec 2026-10-22 §3). `result` is the client result
+    as `done` carries it, without the manifest; `sources` is the manifest."""
+    history = request.get("history")
+    return {"turn_id": turn_id, "question": request.get("question"), "at": now,
+            "request": {"offer_web": request.get("offer_web") is True,
+                        "web_intent": request.get("web_intent") is True,
+                        "history_len": len(history) if isinstance(history, list) else 0},
+            "result": result,
+            "sources": sources if isinstance(sources, dict) else
+            {"record_keys": [], "documents": [], "report_days": []}}
+
+
+def _store_thread_turn(s3, bucket, caller_sub, turn_id, request, result, sources):
+    """Append a successful palette turn to the caller's thread before `done`
+    (spec 2026-10-22 §4, D4/D7/D8). Returns append_turn's dict, or None when the
+    turn is not stored. Stored only when the flag is on, the request opted in
+    (`thread_id` or `new_thread: true`) and the result is a success. A failure
+    logs the type only: the answer is still delivered, without `thread`."""
+    import ask_threads
+    if not ask_threads.enabled():
+        return None
+    thread_id = request.get("thread_id")
+    if not (isinstance(thread_id, str) and ask_threads.THREAD_RE.match(thread_id)):
+        thread_id = None
+    if thread_id is None and request.get("new_thread") is not True:
+        return None
+    answer = result.get("answer")
+    if result.get("error") or not isinstance(answer, str) or not answer.strip():
+        return None
+    now = time.time()
+    try:
+        return ask_threads.append_turn(
+            s3, bucket, caller_sub, thread_id,
+            _thread_turn(turn_id, request, json.loads(json.dumps(result)), sources, now),
+            {k: request[k] for k in _THREAD_SCOPE_KEYS if k in request}, now)
+    except Exception as e:  # noqa: BLE001
+        logger.error("screen thread append failed: turn=%s err=%s", turn_id, type(e).__name__)
+        return None
+
+
 def _work_screen(s3, bucket, caller_sub, turn_id, state, laa, t0):
     """The worker's screen branch: RAG (+web) -> state "done" carrying the whole
     `_rag_answer` dict, exactly what /api/ask returns. No TTS, no audit, no
@@ -631,11 +678,29 @@ def _work_screen(s3, bucket, caller_sub, turn_id, state, laa, t0):
         if is_cancelled(s3, bucket, caller_sub, turn_id):
             return None
         web = bool(rag.get("from_web")) if isinstance(rag, dict) else False
+        # The source manifest never reaches a client, flag on or off (spec
+        # 2026-10-22 §4). A turn stored here is stored BEFORE `done`, so the
+        # client learns its thread id from `done` itself.
+        import ask_threads
+        sources = ask_threads.pop_sources(result)
+        thread = (_store_thread_turn(s3, bucket, caller_sub, turn_id, request, result, sources)
+                  if isinstance(result, dict) else None)
+        if thread is not None:
+            result["thread"] = {"thread_id": thread["thread_id"],
+                                "rolled_over": thread["rolled_over"]}
         put_state(s3, bucket, caller_sub, turn_id,
                   {"status": "done", "channel": SCREEN, "result": result,
                    "created_at": created_at})
         logger.info("screen ask: rag=%.2fs total=%.2fs turn=%s web=%s sub_hash=%s",
                     rag_s, time.perf_counter() - t0, turn_id, web, sub_hash(caller_sub))
+        if thread is not None and thread["created"]:
+            # Off the user's path, and never into the except below: a failed
+            # eviction must not turn a delivered answer into an error.
+            try:
+                ask_threads.evict(s3, bucket, caller_sub)
+            except Exception as e:  # noqa: BLE001
+                logger.error("screen thread evict failed: turn=%s err=%s",
+                             turn_id, type(e).__name__)
     except Exception as e:  # noqa: BLE001
         logger.error("screen worker failed: turn=%s err=%s", turn_id, type(e).__name__)
         try:

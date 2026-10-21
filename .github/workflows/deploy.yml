@@ -179,6 +179,12 @@ jobs:
           if [ -n "${{ vars.TEST_ASK_AGENTIC }}" ]; then
             ASK_AGENTIC_PARAM="AskAgentic=${{ vars.TEST_ASK_AGENTIC }}"
           fi
+          # Ask conversation history (spec 2026-10-22). Same bare-"Key=" guard; the
+          # template Default '' keeps it off until TEST_ASK_THREADS is set.
+          ASK_THREADS_PARAM=""
+          if [ -n "${{ vars.TEST_ASK_THREADS }}" ]; then
+            ASK_THREADS_PARAM="AskThreads=${{ vars.TEST_ASK_THREADS }}"
+          fi
           ASK_JUDGE_MODEL_PARAM=""
           if [ -n "${{ vars.TEST_ASK_JUDGE_MODEL }}" ]; then
             ASK_JUDGE_MODEL_PARAM="AskJudgeModel=${{ vars.TEST_ASK_JUDGE_MODEL }}"
@@ -272,6 +278,7 @@ jobs:
               $KF_LAYER_PARAM \
               $VAD_LAYER_PARAM \
               $ASK_AGENTIC_PARAM \
+              $ASK_THREADS_PARAM \
               $ASK_JUDGE_MODEL_PARAM \
               $ASK_JUDGE_FALLBACKS_PARAM \
               $ASK_JUDGE_PROVIDER_PARAM \

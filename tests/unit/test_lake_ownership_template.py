@@ -223,9 +223,12 @@ PRE_EXISTING_DELETERS = {
 # Deleters added later whose every DeleteObject resource is confined to a prefix that
 # holds no lake data. The device Ask turn store (ask_turns/) is transient per-turn state:
 # the result route deletes a turn once served, and start sweeps a caller's day-old turns.
+# The Ask thread store (ask_threads/, spec 2026-10-22) holds a caller's last five
+# conversations: the worker evicts beyond five. No lake data under either prefix.
 CONFINED_DELETERS = {
     "ApiFunction": "/ask_turns/*",
     "AskAgentFunction": "/ask_turns/*",
+    "AskVoiceWorkerFunction": "/ask_threads/*",
 }
 
 
