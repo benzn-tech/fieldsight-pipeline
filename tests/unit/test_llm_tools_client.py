@@ -357,6 +357,30 @@ def test_a_4xx_does_not_advance_the_chain(monkeypatch):
     assert turn.error
 
 
+def test_a_429_advances_the_chain(monkeypatch):
+    """A rate limit is the pinned endpoint's capacity, not our request: the
+    primary is pinned with allow_fallbacks false, so OpenRouter cannot route
+    around it and the next model is the only way past (TEST 2026-10-21: six
+    429s from deepseek@coreweave in a week, each one a judge_error fallback)."""
+    monkeypatch.setenv("ASK_JUDGE_MODEL", "primary/m")
+    monkeypatch.setenv("ASK_JUDGE_FALLBACKS", "fb/one")
+    pool = _install(monkeypatch, FakePool(_http_error(429, "rate limited"),
+                                          _ok_tool_reply()))
+    turn = tools_client.chat(MESSAGES, TOOLS)
+    assert [c["body"]["model"] for c in pool.calls] == ["primary/m", "fb/one"]
+    assert turn.error is None and turn.tool_calls
+
+
+def test_a_402_does_not_advance_the_chain(monkeypatch):
+    """Out of credits is the account's, shared by every model in the chain."""
+    monkeypatch.setenv("ASK_JUDGE_FALLBACKS", "fb/one")
+    pool = _install(monkeypatch, FakePool(_http_error(402, "more credits"),
+                                          _ok_tool_reply()))
+    turn = tools_client.chat(MESSAGES, TOOLS)
+    assert len(pool.calls) == 1
+    assert turn.error and "402" in turn.error
+
+
 def test_the_fallback_chain_stops_at_the_deadline(monkeypatch):
     """The chain is tried within the deadline, not past it."""
     monkeypatch.setenv("ASK_JUDGE_FALLBACKS", "fb/one,fb/two")
