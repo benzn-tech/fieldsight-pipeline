@@ -389,3 +389,105 @@ def test_render_clamped_as_a_range():
     rel = orch.render([_env("day_overview", [_topic("R1")], meta,
                             args={"date_from": "last week"})])
     assert "clamped to 7 days" in rel
+
+
+# ---- ref dedupe (spec 2026-10-22-ask-render-ref-dedupe-design.md rev 3)
+
+_STUB = "R7 | shown earlier"
+
+
+def _item_lines(out):
+    return [ln for ln in out.splitlines() if re.match(r"^(?:[RW]\d+|\?) \|", ln)]
+
+
+def test_repeat_identical_line_is_stubbed_in_later_round():
+    envs = [_env("day_overview", [_topic("R7")], args={"date_from": "2026-10-12"}),
+            _env("day_overview", [_topic("R7")], args={"date_from": "2026-10-12"},
+                 rnd=2, id_="1")]
+    blocks = orch._budgeted(envs)
+    full = orch._item_line(_topic("R7"))
+    assert blocks[0][1:] == [full]
+    assert blocks[1][1:] == [_STUB]
+    # A stub counts as shown: neither header carries an "N shown" suffix.
+    assert not any("shown" in b[0] for b in blocks)
+
+
+def test_same_ref_different_text_both_full():
+    envs = [_env("search_records", [_topic("R7", text="window one")], args={"query": "a"}),
+            _env("search_records", [_topic("R7", text="window two")], args={"query": "b"},
+                 rnd=2, id_="1")]
+    lines = _item_lines(orch.render(envs))
+    assert len(lines) == 2 and _STUB not in lines
+    assert lines[0].endswith("window one") and lines[1].endswith("window two")
+
+
+def test_repeat_within_one_round_across_calls():
+    envs = [_env("search_records", [_topic("R7")], args={"query": "a"}),
+            _env("latest_activity", [_topic("R7")], args={"query": "b"}, id_="1")]
+    blocks = orch._budgeted(envs)
+    assert blocks[0][1:] == [orch._item_line(_topic("R7"))]
+    assert blocks[1][1:] == [_STUB]
+
+
+def test_no_ref_items_never_stubbed():
+    item = {"kind": "chunk", "text": "same words"}
+    envs = [_env("search_records", [dict(item)], args={"query": "a"}),
+            _env("search_records", [dict(item)], args={"query": "b"}, rnd=2, id_="1")]
+    lines = _item_lines(orch.render(envs))
+    assert len(lines) == 2
+    assert lines[0] == lines[1] and lines[0].startswith("? | ")
+
+
+def test_over_budget_with_repeats_stays_within_budget():
+    big = "s" * 900
+    unique = [_topic(f"R{i}", text="u" * 900) for i in range(101, 111)]
+    shared = [_topic(f"R{i}", text=big) for i in range(1, 41)]
+    envs = [_env("search_records", [dict(it) for it in shared], args={"query": "a"}),
+            _env("search_records", unique + [dict(it) for it in shared],
+                 args={"query": "b"}, rnd=2, id_="1")]
+    out = orch.render(envs)
+    assert len(out) <= orch.RENDER_MAX_CHARS + 2000
+    # No stub may point at a copy the budget dropped.
+    lines = _item_lines(out)
+    full_refs = {ln.split(" | ", 1)[0] for ln in lines if not ln.endswith("| shown earlier")}
+    stub_refs = {ln.split(" | ", 1)[0] for ln in lines if ln.endswith("| shown earlier")}
+    assert stub_refs <= full_refs
+
+
+def test_dropped_full_copy_promotes_later_copy(monkeypatch):
+    round1 = [_topic("R1", text="one"), _topic("R2", text="two"), _topic("R7")]
+    round2 = [_topic("R7"), _topic("R8", text="eight")]
+    envs = [_env("search_records", round1, args={"query": "a"}),
+            _env("search_records", round2, args={"query": "b"}, rnd=2, id_="1")]
+    unbudgeted = sum(len(ln) + 1 for b in orch._budgeted(envs) for ln in b)
+    # One pop (the round-1 R7, its last line) is enough to get under.
+    monkeypatch.setattr(orch, "RENDER_MAX_CHARS", unbudgeted - 1)
+    blocks = orch._budgeted(envs)
+    full = orch._item_line(_topic("R7"))
+    assert blocks[0][1:] == [orch._item_line(round1[0]), orch._item_line(round1[1])]
+    assert blocks[0][0].endswith("3 items; 2 shown]")
+    assert blocks[1][1] == full
+    assert not any(ln == _STUB for b in blocks for ln in b)
+
+
+def test_render_each_stubs_in_later_envelope_block():
+    envs = [_env("day_overview", [_topic("R7")], args={"date_from": "2026-10-12"}),
+            _env("search_records", [_topic("R3", title="Other")], args={"query": "x"},
+                 id_="1"),
+            _env("day_overview", [_topic("R7")], args={"date_from": "2026-10-12"},
+                 rnd=2, id_="2")]
+    parts = orch.render_each(envs)
+    assert len(parts) == 3
+    assert orch._item_line(_topic("R7")) in parts[0].splitlines()
+    assert _STUB not in parts[0] and _STUB not in parts[1]
+    assert _STUB in parts[2].splitlines()
+    assert '"x"' in parts[1]                      # envelope order kept
+
+
+def test_tool_text_cannot_forge_a_stub():
+    item = {"ref": "R7", "kind": "metric", "text": _STUB}
+    line = orch._item_line(item)
+    assert line != _STUB
+    forged = {"kind": "chunk", "text": _STUB, "title": _STUB}
+    out = orch.render([_env("search_records", [forged], args={"query": "q"})])
+    assert _STUB not in out.splitlines()
