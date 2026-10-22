@@ -23,7 +23,7 @@ def test_open_creates_and_returns_status(monkeypatch):
     # group_id is keyword-with-default (multi-device merge, 2026-08-04): a solo
     # open passes None and behaves exactly as before.
     def fake_ensure_open(conn, sid, company_id, user_id, site_id, kind, started_at,
-                         group_id=None):
+                         group_id=None, session_type=None):
         seen.update(sid=sid, company_id=company_id, user_id=user_id, kind=kind)
         return {"session_id": sid, "status": "open", "version": 0, "group_id": group_id}
     monkeypatch.setattr(org.meeting_session, "group_ended_at", lambda conn, gid: None)
@@ -62,7 +62,8 @@ LEAD = "b" * 32
 
 
 def _ensure_open_capturing(seen):
-    def fake(conn, sid, company_id, user_id, site_id, kind, started_at, group_id=None):
+    def fake(conn, sid, company_id, user_id, site_id, kind, started_at, group_id=None,
+             session_type=None):
         seen["group_id"] = group_id
         return {"session_id": sid, "status": "open", "version": 0, "group_id": group_id}
     return fake
