@@ -23,8 +23,13 @@ def captured(monkeypatch):
     calls = {"open": [], "touch": []}
     monkeypatch.setattr(sa.meeting_session, "ensure_open",
                         lambda conn, *a: calls["open"].append(a) or {"session_id": a[0]})
-    monkeypatch.setattr(sa.meeting_session, "touch_segment",
-                        lambda conn, sid, at: calls["touch"].append((sid, at)))
+    calls["chunk_at"] = []
+
+    def _touch(conn, sid, at, chunk_at=None):
+        calls["touch"].append((sid, at))
+        calls["chunk_at"].append(chunk_at)
+
+    monkeypatch.setattr(sa.meeting_session, "touch_segment", _touch)
     return calls
 
 
@@ -182,3 +187,19 @@ def test_round_trip_through_the_email_path_recovers_the_device_wall_clock(captur
     fc = pytest.importorskip("lambda_finalize_claim", reason="requires psycopg")
     stored = _opened_at_for(captured, CHUNK_KEY)
     assert fc._to_nz(stored) == datetime(2026, 7, 28, 14, 3, 0)
+
+
+def test_touch_carries_the_chunk_time(captured):
+    """touch_segment also gets the chunk's DEVICE file-name time (as UTC) so
+    meeting_session.last_chunk_at can tell a late chunk from a re-driven old one
+    after an idle close; `at` stays SERVER now (idle detection)."""
+    from session_scope import to_utc
+    key = (f"transcripts/Ben_UCPK/2026-10-22/"
+           f"Benl1_2026-10-22_10-21-00_sid{SID}_c0003_off0.0_to60.0_srcwav.json")
+    now = datetime(2026, 10, 21, 21, 30, 0)
+    rc, ru = _resolvers()
+    assert sa.process_transcript_key(object(), key, resolve_company=rc,
+                                     resolve_user=ru, now=now) == SID
+    assert captured["touch"] == [(SID, now)]
+    assert captured["chunk_at"] == [to_utc(datetime(2026, 10, 22, 10, 21, 0))]
+    assert captured["chunk_at"][0] is not None

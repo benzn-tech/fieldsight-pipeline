@@ -105,7 +105,9 @@ def process_transcript_key(conn, key, *, resolve_company, resolve_user, now):
     opened_at = to_utc(extract_base_time_from_filename(basename))  # device T1 -> UTC; may be None
     meeting_session.ensure_open(
         conn, sid, company_id, user_id, None, _kind_from_key(basename), opened_at)
-    meeting_session.touch_segment(conn, sid, now)         # server time -> skew-proof idle
+    # `now` (server time) drives idle detection; the chunk's device time
+    # (chunk_at) only feeds last_chunk_at, the late-chunk reopen test.
+    meeting_session.touch_segment(conn, sid, now, chunk_at=opened_at)
     return sid
 
 
