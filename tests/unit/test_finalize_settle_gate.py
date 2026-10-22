@@ -162,7 +162,7 @@ def test_one_deferred_session_does_not_hold_up_another(world, monkeypatch):
 def test_sidecar_key_mirrors_lambda_vad():
     """The sidecar's key is built by lambda_vad.parse_source_filename: folder
     from the path, DATE FROM THE FILENAME (not the path), name without ext."""
-    import lambda_vad  # noqa: F401 -- skip cleanly if its deps are absent
+    import lambda_vad  # module-level imports only; onnxruntime is loaded lazily
     info = lambda_vad.parse_source_filename(_key(3))
     expected = (f"{lambda_vad.OUTPUT_PREFIX}{info['user_name']}/{info['date']}/"
                 f"{info['basename_no_ext']}_vad_metadata.json")
