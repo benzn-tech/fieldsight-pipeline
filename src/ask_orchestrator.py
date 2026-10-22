@@ -218,9 +218,32 @@ def _fence(lines):
     return f"{DATA_FENCE_HEADING}\n\n```\n" + "\n".join(lines) + "\n```"
 
 
+_STUB_TEXT = "shown earlier"
+
+
+def _shown(blocks):
+    """The lines each block displays: a line already shown in full earlier in
+    this render becomes `<ref> | shown earlier` (spec 2026-10-22 ref dedupe,
+    D1/D3). The key is the whole line, so the same ref with different text
+    stays in full; lines without a ref (`? |`) are never stubbed."""
+    seen = set()
+    out = []
+    for b in blocks:
+        shown = []
+        for ln in b["lines"]:
+            if ln in seen and not ln.startswith("? |"):
+                shown.append(ln.split(" | ", 1)[0] + " | " + _STUB_TEXT)
+            else:
+                seen.add(ln)
+                shown.append(ln)
+        out.append(shown)
+    return out
+
+
 def _budgeted(envelopes):
     """Each envelope's (header + item lines), with the 8,000-token budget
-    applied once over all of them (spec §6.6)."""
+    applied once over all of them (spec §6.6). A repeated line renders as a
+    stub, and the budget is measured on what is shown."""
     blocks = []
     for env in envelopes or []:
         items = list(env.get("items") or [])
@@ -229,8 +252,10 @@ def _budgeted(envelopes):
 
     def size():
         # header estimated at its full length; +1 per line for the newline.
-        return sum(len(_header(b["env"], b["total"], len(b["lines"]))) + 1
-                   + sum(len(ln) + 1 for ln in b["lines"]) for b in blocks)
+        # Measured on the shown lines, stubs included.
+        return sum(len(_header(b["env"], b["total"], len(v))) + 1
+                   + sum(len(ln) + 1 for ln in v)
+                   for b, v in zip(blocks, _shown(blocks)))
 
     current = size()
     for rnd in sorted({b["round"] for b in blocks}):
@@ -239,10 +264,14 @@ def _budgeted(envelopes):
             biggest = max(group, key=lambda b: len(b["lines"]))
             if not biggest["lines"]:
                 break
-            current -= len(biggest["lines"].pop()) + 1
+            biggest["lines"].pop()
+            # Re-measured, not subtracted: dropping a full copy promotes its
+            # later twin from stub to full, so the saving is not the line's length.
+            current = size()
         if current <= RENDER_MAX_CHARS:
             break
-    return [[_header(b["env"], b["total"], len(b["lines"]))] + b["lines"] for b in blocks]
+    return [[_header(b["env"], b["total"], len(v))] + v
+            for b, v in zip(blocks, _shown(blocks))]
 
 
 def render(envelopes) -> str:
@@ -250,7 +279,8 @@ def render(envelopes) -> str:
 
     Over budget: items of older rounds go first (their header lines stay), then
     within the newest round the lowest item of the call holding the most items,
-    repeatedly. Each header then says how many of its items are shown.
+    repeatedly. Each header then says how many of its items are shown. An item
+    line already shown in full earlier in the render appears as `<ref> | shown earlier`.
     """
     return _fence([ln for block in _budgeted(envelopes) for ln in block])
 
