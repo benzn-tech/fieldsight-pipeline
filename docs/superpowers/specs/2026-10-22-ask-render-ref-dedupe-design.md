@@ -1,6 +1,6 @@
 # Ask render: show a repeated item once (ref dedupe) — design
 
-Status: draft rev 2, 2026-10-22 (Fable review applied; plan gated on §6 step 1). Line: ASR+LLM优化v3 (Ask orchestrator). Review: Fable before plan.
+Status: rev 3, 2026-10-22 (Fable review applied; §6 step 1 gate PASSED, see §6.1). Line: ASR+LLM优化v3 (Ask orchestrator). Review: Fable before plan.
 
 ## 1. Problem
 
@@ -119,6 +119,27 @@ Non-goals:
   plus about 6 retrieval embeddings. The count is stated before running. Check that answers
   still cite refs that were stubbed in later rounds, and that the cards resolve.
 
+### 6.1 Gate result (2026-10-22)
+
+Data: the search line's replay dumps of 90 turns per family (45 gold questions × 2) on
+prod data. Tool calls are held fixed; arms are before (600 / 10,000) and after
+(WINDOW_CHARS=1000, MAX_RESULT_CHARS=12,000). Computed with the real `_item_line` /
+`_header` and a prototype of D4 (`size()` recomputed per pop).
+
+| arm | multi-call turns | turns with a repeat | budget freed: mean / p90 / max | `_budgeted` drops, before → with dedupe |
+|---|---|---|---|---|
+| session, before | 72 | 59 | 9.3% / 18.4% / 28.9% | 0 → 0 |
+| report, before | 76 | 70 | 11.1% / 19.9% / 41.6% | 0 → 0 |
+| session, after | 72 | 56 | 9.9% / 24.3% / 34.8% | 3 → 0 |
+| report, after | 76 | 67 | 12.1% / 26.0% / 37.2% | 16 → 0 |
+
+Repeats, after arm: session has 261 `search_records → search_records`, 30
+`search_records → latest_activity` and 5 the other way. Report has 284 / 59 / 5. So centred
+windows still land on the same span; §1's worry that windowing would kill chunk repeats
+did not hold. The mean saving of ~3.5K chars is about 20–25% of the median render (13.9K
+session, 17.2K report), which also cuts judge prompt size and latency. The drop count
+matches the search line's metric on 179 of 180 turns. Decision: go.
+
 ## 7. Risks
 
 - The judge could treat a stub as an empty item. Mitigated by D3 (the full copy is
@@ -132,3 +153,4 @@ Non-goals:
 - rev 2 (Fable): D4 recomputes the total after every pop (HIGH); §1 repeat shapes
   corrected (chunk vs topic kinds); replay made an unconditional go/no-go gate; stub
   wording "shown earlier"; the line itself is the dedupe key; tests 8–10 added.
+- rev 3: gate passed (§6.1).
