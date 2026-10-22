@@ -218,21 +218,32 @@ def touch_segment(conn, session_id, at, chunk_at=None) -> dict | None:
     no-ops. All SET expressions read the OLD row, so the version bump and status
     flip both key off the pre-update status.
 
+    NOT for a deliberate End. It has grace 0, so there is no window to resume
+    within, and the touch that arrives after it is the ended recording's own
+    last chunk: its VAD sidecar lands 2-11 s after the /complete that preceded
+    the /close (TEST 2026-10-22, 3 of 4 phone sessions undone this way, each
+    then waiting out the idle hour). The phone sends close(end) right behind
+    its last upload; a device's close worker usually waits a 30 s retry for
+    in-flight uploads first, which hides the race without excluding it. The
+    activity columns still advance; an `end` row is never reopened later
+    either (_LATE_CHUNK_WHERE), so End is terminal everywhere.
+
     `chunk_at` is the chunk's DEVICE file-name time (UTC). When given it
     advances `last_chunk_at` (never backwards), which reopen_late compares with
     the snapshot taken at an idle close. None leaves `last_chunk_at` alone."""
     chunk_set = ("last_chunk_at = GREATEST(COALESCE(last_chunk_at, %s), %s), "
                  if chunk_at is not None else "")
     chunk_args = (chunk_at, chunk_at) if chunk_at is not None else ()
+    resumable = "status = 'pending_close' AND close_intent IS DISTINCT FROM 'end'"
     return conn.cursor(row_factory=dict_row).execute(
         f"UPDATE meeting_session SET "
         f"last_segment_at = GREATEST(COALESCE(last_segment_at, %s), %s), "
         f"{chunk_set}"
         f"segment_count = segment_count + 1, "
-        f"version = CASE WHEN status = 'pending_close' THEN version + 1 ELSE version END, "
-        f"closed_at = CASE WHEN status = 'pending_close' THEN NULL ELSE closed_at END, "
-        f"close_intent = CASE WHEN status = 'pending_close' THEN NULL ELSE close_intent END, "
-        f"status = CASE WHEN status = 'pending_close' THEN 'open' ELSE status END, "
+        f"version = CASE WHEN {resumable} THEN version + 1 ELSE version END, "
+        f"closed_at = CASE WHEN {resumable} THEN NULL ELSE closed_at END, "
+        f"close_intent = CASE WHEN {resumable} THEN NULL ELSE close_intent END, "
+        f"status = CASE WHEN {resumable} THEN 'open' ELSE status END, "
         f"updated_at = now() "
         f"WHERE session_id = %s RETURNING {_COLS}",
         (at, at, *chunk_args, session_id),

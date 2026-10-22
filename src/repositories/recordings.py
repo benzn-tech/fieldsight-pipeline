@@ -530,6 +530,31 @@ def session_span(conn, company_id, user_folder, date, session_base):
     return row["lo"], row["hi"]
 
 
+def recent_session_chunks(conn, session_id, within_seconds) -> list:
+    """s3_keys of this device session's audio/video chunks whose `/complete`
+    landed in the last `within_seconds` (server time).
+
+    For the finalize sweep's settle check: a chunk the recorder has uploaded but
+    the pipeline has not yet registered must not be left out of the email. Only
+    RECENT uploads are asked about, so the check costs nothing for a session
+    whose chunks all landed long ago, and a chunk that never gets processed can
+    delay the claim by at most `within_seconds`.
+
+    Scoped to the session's recorder (`user_id`, indexed), then matched on the
+    `sid{id}_c` token every chunk filename carries; a photo carries no `_c`.
+    `uploaded_at` NULL (presigned, never completed) is not asked about."""
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT r.s3_key FROM recordings r "
+        "JOIN meeting_session m ON m.user_id = r.user_id "
+        "WHERE m.session_id = %s AND r.kind IN ('audio', 'video') "
+        "AND r.uploaded_at > now() - make_interval(secs => %s) "
+        "AND r.s3_key LIKE %s ESCAPE '\\' "
+        "ORDER BY r.s3_key",
+        (session_id, within_seconds, f"%sid{_escape_like(session_id)}_c%"),
+    ).fetchall()
+    return [r["s3_key"] for r in rows]
+
+
 def session_local_span(conn, company_id, user_folder, date, session_base):
     """(start_minute, end_minute) of one session IN THE DEVICE'S LOCAL CLOCK,
     or None when it cannot be known.
