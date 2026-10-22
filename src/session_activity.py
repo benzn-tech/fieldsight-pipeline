@@ -6,7 +6,9 @@ The Tier-0 confirmation email needs a session that is (a) OPEN — so the recipi
 finalizes. Today the ONLY things that open/close a session are the device's
 best-effort live `POST /sessions/{id}/open|close` (org-api). Per §8.4 those are an
 optimization, never a requirement: "start = first chunk; if close is missing,
-infer close when the session sees no new chunk for SESSION_GAP_MINUTES."
+infer close when the session sees no new chunk for SESSION_GAP_MINUTES." (That
+idle threshold is now its own setting, IDLE_CLOSE_MINUTES in
+lambda_finalize_claim, 60 by default -- not session_scope.SESSION_GAP_MINUTES.)
 
 This module is the OPEN + TOUCH half of that durable path. It listens on TWO
 per-chunk arrivals, because since 2026-08-08 a chunk with no detected speech is
@@ -35,7 +37,8 @@ On either arrival it:
     off that (repositories/meeting_session.list_idle_open).
 A late resume chunk flips a `pending_close` session back to `open` + bumps
 `version`, so any stale scheduled finalize no-ops (the §8.4 idempotency guard,
-finally exercised).
+finally exercised) -- unless the close was a deliberate End, which a touch never
+undoes (see meeting_session.touch_segment).
 
 In-VPC (touches Aurora); SEPARATE from the non-VPC rolling summary (BUG-36),
 though both trigger on the same `transcripts/` arrival. Pure core takes injected
@@ -105,7 +108,9 @@ def process_transcript_key(conn, key, *, resolve_company, resolve_user, now):
     opened_at = to_utc(extract_base_time_from_filename(basename))  # device T1 -> UTC; may be None
     meeting_session.ensure_open(
         conn, sid, company_id, user_id, None, _kind_from_key(basename), opened_at)
-    meeting_session.touch_segment(conn, sid, now)         # server time -> skew-proof idle
+    # `now` (server time) drives idle detection; the chunk's device time
+    # (chunk_at) only feeds last_chunk_at, the late-chunk reopen test.
+    meeting_session.touch_segment(conn, sid, now, chunk_at=opened_at)
     return sid
 
 

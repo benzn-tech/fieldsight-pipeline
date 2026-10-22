@@ -153,6 +153,7 @@ import report_template
 import report_modules
 import report_photos
 import photo_binding
+import photo_rebind
 import session_scope
 import sweep_state
 from db.connection import get_connection
@@ -175,6 +176,7 @@ from repositories import (action_items, aliases, chunks, classification_feedback
                           voiceprints)
 from repositories import lake_objects
 from repositories import project_docs
+from repositories import voice_note_photo
 import lake_keys
 import lake_owner
 import company_export
@@ -224,6 +226,9 @@ ALLOWED_OBSERVATION_STATUS = {"open", "closed"}
 ALLOWED_ACTION_STATUS = {"open", "in_progress", "blocked", "done"}
 ALLOWED_ACTION_PRIORITY = {"low", "medium", "high"}
 RECORDING_KINDS = {"video", "audio", "photo"}
+# What a client may SAY it is on /upload-url. 'device' is never claimed in the
+# body -- it is inferred from the device headers (X-Device-Tag/X-Device-Id).
+RECORDING_SOURCES = ("phone", "web")
 
 # Does `complete` check that the bytes actually reached S3 before it stamps
 # uploaded_at? Three states, not a boolean, because the two risks are not
@@ -285,6 +290,10 @@ STOP_GRACE_SECONDS = int(os.environ.get("STOP_GRACE_SECONDS", "30"))
 # here costs nothing (a too-late join simply records solo); being tight would
 # break a long meeting with a break in it.
 GROUP_JOIN_MAX_AGE_SECONDS = int(os.environ.get("GROUP_JOIN_MAX_AGE_SECONDS", str(4 * 3600)))
+# Photos one voice note's /open may claim (M2 plan decision 6). The phone picks
+# photos taken after the previous note and within 10 min before this one, so a
+# real note claims a handful; the cap only bounds one request's INSERT.
+VOICE_NOTE_MAX_PHOTOS = 200
 GROUP_MAX_SPAN_SECONDS = int(os.environ.get("GROUP_MAX_SPAN_SECONDS", str(4 * 3600)))
 
 _SID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -1179,6 +1188,10 @@ def create_recording_upload_url(conn, caller, body, device_ident=None):
     kind = body.get("kind")
     if kind not in RECORDING_KINDS:
         return error(f"kind must be one of {sorted(RECORDING_KINDS)}", 400)
+    body_source = body.get("source")
+    if body_source is not None and body_source not in RECORDING_SOURCES:
+        return error(f"source must be one of {list(RECORDING_SOURCES)}", 400)
+    source = body_source or ("device" if device_ident else None)
     client_uuid = body.get("clientUuid")
     file_name = body.get("fileName")
     content_type = body.get("contentType")
@@ -1228,6 +1241,7 @@ def create_recording_upload_url(conn, caller, body, device_ident=None):
                     resolution=body.get("resolution"), codec=body.get("codec"),
                     size_bytes=body.get("sizeBytes"),
                     device_id=recording_device_id,
+                    source=source,
                 )
             rec_id = row["id"]
         except UniqueViolation:
@@ -1323,18 +1337,22 @@ def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id, compa
         if meeting_session.group_ended_at(conn, group_id) is not None:
             logger.info("upload-url: group %s has ended; this recording stays solo", group_id)
             return
-        # opened_at comes from the FILENAME's timestamp, not the body's
-        # startedAt. The body's is this CHUNK's start; the filename's is the
-        # session's, identical on every chunk of the session (the chunk-session
-        # naming contract). Using the body's would let whichever chunk happened
-        # to arrive first — after an offline day, not necessarily the first one —
-        # set the session's start to its own, and ensure_open COALESCEs, so the
-        # wrong value would never be corrected. session_activity reads it from
-        # the same place for the same reason. None is fine: it leaves the field
-        # for whoever does know.
+        # opened_at comes from the FILENAME's timestamp. In a chunk key that is
+        # THIS CHUNK's own start (the {HH-MM-SS} token; see the chunk-token
+        # notes in transcript_utils), not the session's -- it equals the
+        # session's start only for chunk 0. ensure_open fills opened_at only
+        # while it is NULL, so whichever writer reaches the row first sets it:
+        # normally /open (queued before the chunks, carrying the session's
+        # startedAt); failing that, the first chunk to arrive, which after an
+        # offline day is not necessarily chunk 0 and is then never corrected.
+        # session_activity reads the same field the same way. None is fine: it
+        # leaves the field for whoever does know. Converted from the device's NZ wall clock to UTC,
+        # as session_activity does: opened_at is a UTC column, /open stores the
+        # body's offset-carrying startedAt, and voice notes are ordered by it.
         meeting_session.ensure_open(
             conn, m.group(1), company_id, caller["id"], site_id, kind,
-            extract_base_time_from_filename(file_name), group_id=group_id,
+            session_scope.to_utc(extract_base_time_from_filename(file_name)),
+            group_id=group_id,
         )
         # Beside ensure_open, not instead of it: this is the OFFLINE join, the
         # one whose /open never landed, so it is the only chance this group has
@@ -1442,6 +1460,7 @@ def complete_recording(conn, caller, rec_id, body):
                                     b.get("sizeBytes"), gps_track)
     if row is None:
         return error("recording not found", 404)
+    _rebind_after_photo_complete(conn, row)
     payload = {"ok": True}
     if _group_ended_for(conn, row.get("s3_key")):
         # Only present when true. A solo upload's response stays byte-identical
@@ -1450,6 +1469,66 @@ def complete_recording(conn, caller, rec_id, body):
         # part in.
         payload["groupEnded"] = True
     return ok(payload)
+
+
+_PHOTO_KEY_RE = re.compile(r"^users/([^/]+)/pictures/(\d{4}-\d{2}-\d{2})/[^/]+$")
+
+
+def _rebind_after_photo_complete(conn, row) -> None:
+    """Re-bind the photo's day now, instead of at the next extraction/ingest.
+
+    A photo often lands late, out of the phone's offline queue, after the day's
+    extraction has run; until this it stayed unbound for hours. The rebind is
+    the pin-aware one (`photo_rebind.rebind_day_photos`), so a voice note's
+    claimed photos and hand-moved ones keep their topic. Not
+    `photo_collapse.rebind_one_day`: that guesses the company with a LIKE scan,
+    and the row already names it (the SITE's company).
+
+    NEVER RAISES. The upload is good and already stamped; a failed rebind must
+    not turn it into an error, or the phone queue re-sends the photo forever.
+    So the work runs in a savepoint -- a Postgres error inside it would
+    otherwise abort the whole request transaction, and the stamp with it -- and
+    any exception is logged and dropped. The next extraction re-binds anyway.
+
+    `lock_timeout` caps the wait on the day's advisory lock (an extraction of
+    the same day may hold it for its whole run). It is SET LOCAL inside the
+    savepoint, and a RELEASED savepoint keeps a SET LOCAL until the end of the
+    OUTER transaction (only a rollback to the savepoint reverts it), so it is
+    put back explicitly before the savepoint releases. On the failure path the
+    rollback to the savepoint reverts it by itself.
+    """
+    if row.get("kind") != "photo":
+        return
+    m = _PHOTO_KEY_RE.match(row.get("s3_key") or "")
+    if not m:
+        return
+    folder, date = m.group(1), m.group(2)
+    t0 = time.monotonic()
+    try:
+        with conn.transaction():
+            prev = conn.execute("SELECT current_setting('lock_timeout')").fetchone()[0]
+            conn.execute("SET LOCAL lock_timeout = '2s'")
+            # Exactly the WHERE of topics.list_day_topics_for_binding: a day
+            # with no topic a photo could bind to is a no-op, and on that day
+            # there is no reason to list S3 or take the lock.
+            has_topics = conn.execute(
+                "SELECT 1 FROM topics "
+                "WHERE (source_s3_key LIKE %s ESCAPE '\\' OR source_s3_key = %s) "
+                f"AND {topics.visible_topics_predicate('topics')} LIMIT 1",
+                (f"extractions/{topics._escape_like(folder)}/{topics._escape_like(date)}/%",
+                 f"reports/{date}/{folder}/daily_report.json"),
+            ).fetchone() is not None
+            if has_topics:
+                written = photo_rebind.rebind_day_photos(
+                    conn, row["company_id"], folder, date,
+                    photo_binding.list_pictures(s3(), S3_BUCKET,
+                                                f"users/{folder}/pictures/{date}/"))
+                logger.info("complete %s: photo rebind %s/%s wrote %s row(s) in %d ms",
+                            row["id"], folder, date, written,
+                            (time.monotonic() - t0) * 1000)
+            conn.execute("SELECT set_config('lock_timeout', %s, true)", (prev,))
+    except Exception:
+        logger.exception("complete %s: photo rebind skipped", row["id"])
 
 
 def _group_ended_for(conn, s3_key) -> bool:
@@ -1510,6 +1589,27 @@ def session_open(conn, caller, session_id, body):
     kind = body.get("kind")
     if kind is not None and kind not in ("audio", "video"):
         return error("kind must be 'audio' or 'video'", 400)
+    # Voice notes (M2 plan decision 6). Validated before ANY write, and siteId is
+    # never required here: a 400 would leave the phone's note unopened, and the
+    # first chunk would then open it as a plain (emailed) meeting.
+    session_type = body.get("sessionType")
+    if session_type not in (None, "meeting", "voice_note"):
+        return error("sessionType must be 'meeting' or 'voice_note'", 400)
+    photos = body.get("photos")
+    if photos is not None:
+        if session_type != "voice_note":
+            return error("photos is only allowed with sessionType 'voice_note'", 400)
+        if not isinstance(photos, list):
+            return error("photos must be a list of photo clientUuids", 400)
+        if len(photos) > VOICE_NOTE_MAX_PHOTOS:
+            return error(f"photos may hold at most {VOICE_NOTE_MAX_PHOTOS} entries", 400)
+        for p in photos:
+            try:
+                if not isinstance(p, str):
+                    raise ValueError
+                uuid.UUID(p)
+            except ValueError:
+                return error("each photo must be a clientUuid", 400)
     site_id = body.get("siteId")
     site = None
     if site_id:
@@ -1555,8 +1655,22 @@ def session_open(conn, caller, session_id, body):
     # chunk arrives first opens the session; a later call never regresses it.
     row = meeting_session.ensure_open(
         conn, session_id, session_company_id, caller["id"], site_id, kind,
-        body.get("startedAt"), group_id=group_id,
+        body.get("startedAt"), group_id=group_id, session_type=session_type,
     )
+    # After ensure_open (the claim compares the notes' stored opened_at) and in the
+    # same request transaction. Stored as sent: each must equal the photo's
+    # recordings.client_uuid, which is stored as sent.
+    # Only onto the caller's own voice note. ensure_open never changes an existing
+    # row's owner or type, so a session already opened as a meeting, or someone
+    # else's session id, keeps what it is -- and the request still succeeds, as
+    # /open always has; the claim is simply not made.
+    if photos:
+        if (str(row.get("user_id")) == str(caller["id"])
+                and row.get("session_type") == "voice_note"):
+            voice_note_photo.link(conn, caller["id"], session_id, photos)
+        else:
+            logger.info("session_open: %s is not the caller's voice note (type %r); "
+                        "photos not linked", session_id, row.get("session_type"))
     # After ensure_open, so a group is only registered once the join itself has
     # passed every guard above (tenant, staleness, meeting-already-ended).
     _ensure_group_state(conn, session_company_id, group_id)

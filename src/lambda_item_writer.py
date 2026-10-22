@@ -57,6 +57,7 @@ import json
 import todo_collapse
 import logging
 import os
+import re
 from urllib.parse import unquote_plus
 
 import boto3
@@ -98,6 +99,7 @@ from repositories import speaker_intro_suggestions
 # keyframe_selection already followed.
 from session_scope import EXTRACTION_KEY_RE  # noqa: F401  (re-export)
 from session_scope import device_session_id as _device_session_id
+from session_scope import round_suffix as _round_suffix
 from session_scope import parse_extraction_key as _parse_extraction_key
 
 logger = logging.getLogger()
@@ -400,6 +402,11 @@ def _final_email_context(conn, session_base, extraction, date, follow_up=False):
     if not sid:
         return None                      # a whole-file base, not a device session
     row = meeting_session.get(conn, sid)
+    if (row or {}).get("session_type") == "voice_note":
+        # A voice note never sends a stop email (owner, M2 Task 7) -- on either arm:
+        # the claim settled it without one, so there is nobody waiting for notes.
+        logger.info("session %s: voice note -- no email", sid)
+        return None
     status = (row or {}).get("status")
     # A FOLLOW-UP is the notes email owed to a recorder who was told (extraction_pending,
     # spec D5) that their notes were delayed. By then the session is settled, so the
@@ -415,8 +422,12 @@ def _final_email_context(conn, session_base, extraction, date, follow_up=False):
         # The claim step already marked this session failed and said whose
         # email is missing; repeating it here would only double the noise.
         return None
+    # A reopened session's round (Task 4B): picks its per-round request/result/
+    # brief keys and the "Updated" subject. Absent for round 0.
+    reopened = int(row.get("reopen_count") or 0)
     return {"kind": "final", "sessionId": sid,
             **({"followUp": True} if follow_up else {}),
+            **({"reopened": reopened} if reopened > 0 else {}),
             "recipient": ctx["recipient"], "date": ctx.get("date") or date,
             "timeRange": ctx.get("timeRange"), "siteName": ctx.get("siteName"),
             # handoff-sync plan §2.2: the worker needs the folder to poll
@@ -429,6 +440,42 @@ def _final_email_context(conn, session_base, extraction, date, follow_up=False):
             # Withholding would send them down the backstop, which quotes the
             # OTHER summariser -- the disagreement this whole change removes.
             "openTodos": _final_email_rows(extraction, date) + _topic_rows(extraction)}
+
+
+_CLOCK_RE = re.compile(r"\d{1,2}:\d{2}")
+
+
+def _merge_voice_note_topics(extraction_topics):
+    """A voice note is ONE topic on the timeline (plan decision 9): several
+    extracted topics become one -- the first topic's title (and other fields),
+    summaries joined with a space, action items / decisions / questions (and
+    findings, so a safety finding is never dropped) concatenated, participants and
+    safety flags unioned, and the time
+    range from the first start to the last end. Zero or one topic is returned as
+    given."""
+    if len(extraction_topics) <= 1:
+        return list(extraction_topics)
+    merged = dict(extraction_topics[0])
+    merged["summary"] = " ".join(
+        (t.get("summary") or "").strip() for t in extraction_topics
+        if (t.get("summary") or "").strip())
+    for field in ("action_items", "decisions", "questions", "findings"):
+        merged[field] = [x for t in extraction_topics for x in (t.get(field) or [])]
+    # Who spoke and what was flagged belong to the whole note: unioned, first-seen
+    # order, each entry once.
+    for field in ("participants", "safety_flags"):
+        seen, union = set(), []
+        for x in (x for t in extraction_topics for x in (t.get(field) or [])):
+            k = json.dumps(x, sort_keys=True, default=str)
+            if k not in seen:
+                seen.add(k)
+                union.append(x)
+        merged[field] = union
+    clocks = [_CLOCK_RE.findall(t.get("time_range") or "") for t in extraction_topics]
+    clocks = [c for c in clocks if c]
+    if clocks:
+        merged["time_range"] = f"{clocks[0][0]} - {clocks[-1][-1]}"
+    return [merged]
 
 
 def email_checks(stored, topics=None):
@@ -474,7 +521,11 @@ def _kept_under(check, others, topics):
 def _enqueue_final_email(ctx, put=None):
     """One confirmation email per session, whoever gets there first."""
     put = put or _put_finalize_request
-    suffix = "-notes" if ctx.get("followUp") else ""
+    # `-r{n}` for a late-chunk reopen's round: this put is conditional, so round 2
+    # on round 1's key would 412 and never be mailed. Before `-notes`, so a
+    # round's follow-up is `{sid}-r{n}-notes`; `-updated` is the group merge's.
+    suffix = _round_suffix(ctx.get("reopened")) + (
+        "-notes" if ctx.get("followUp") else "")
     return put(f"session_finalize_requests/{ctx['sessionId']}{suffix}.json", ctx,
                only_if_absent=True)
 
@@ -1149,6 +1200,9 @@ def write_extraction_items(date, user_folder, extraction_key):
         # All explicit tags are recorder-scoped (membership on the site, or the
         # recorder's own company's site); fall through only on no match.
         session_base = _parse_extraction_key(extraction_key)[2]
+        voice_sid = _device_session_id(session_base)
+        is_voice_note = bool(voice_sid) and (
+            meeting_session.get(conn, voice_sid) or {}).get("session_type") == "voice_note"
 
         # A member whose group has already merged must not re-publish its own
         # topics: that reintroduces the duplicate the merge removed. Checked
@@ -1199,6 +1253,21 @@ def write_extraction_items(date, user_folder, extraction_key):
             logger.info("%s: source is deleted — writing no topics", extraction_key)
             return {"skipped": "source_deleted", "key": extraction_key}
 
+        # A voice note is exactly one topic (M2 Task 7, plan decision 9). With none
+        # extracted, the claim's "Voice note HH:MM" placeholder stays: this key's
+        # supersede is skipped (and the topic loop has nothing to write), but every
+        # other step -- index request, markers, checks, photo rebind, speakers -- runs
+        # as for any zero-topic pass, so the note's content still reaches search and
+        # Ask (spec 5.1). Otherwise the topics merge into one, in the ARTIFACT, so every
+        # reader below (records, index, matcher) sees what Aurora gets.
+        placeholder_kept = None
+        if is_voice_note:
+            if not extraction.get("topics"):
+                placeholder_kept = "voice note: no topics, placeholder kept"
+                logger.info("%s: %s", extraction_key, placeholder_kept)
+            else:
+                extraction["topics"] = _merge_voice_note_topics(extraction["topics"])
+
         # Source-key idempotency (Phase 4a pattern): supersede this extraction's prior rows
         # (Track B Task 3) before re-inserting -- an UPDATE that stamps superseded_at /
         # superseded_by_run, not a DELETE, so the row and its children (action_items,
@@ -1221,7 +1290,9 @@ def write_extraction_items(date, user_folder, extraction_key):
         # below the topic-insert loop (Track B Task 4) -- the count an operator needs to see
         # is now measured AFTER matching (an actual orphan), not before (every closed item
         # about to be superseded, most of which will find their successor).
-        retired_topics.extend(topics.supersede_topics_for_source(conn, extraction_key, run))
+        if not placeholder_kept:
+            retired_topics.extend(
+                topics.supersede_topics_for_source(conn, extraction_key, run))
 
         # A MERGED artifact additionally supersedes each member's own topics.
         # BEFORE the writes below, never after: this key's own rows were just
@@ -1669,7 +1740,8 @@ def write_extraction_items(date, user_folder, extraction_key):
                    site_id=(site or {}).get("id"),
                    home_company_id=company["id"], recorder_user_id=user_id)
 
-    return {"skipped": False, "topics": topics_n}
+    return {"skipped": False, "topics": topics_n,
+            **({"reason": placeholder_kept} if placeholder_kept else {})}
 
 
 def _emit_index_request(extraction, extraction_key, *, site, user_id, owner_company_id,

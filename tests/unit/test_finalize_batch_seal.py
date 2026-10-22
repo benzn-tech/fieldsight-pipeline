@@ -53,6 +53,9 @@ def swept(monkeypatch):
     import batch_seal
     monkeypatch.setattr(batch_seal, "seal_ready_runs", rec.seal)
     monkeypatch.setattr(mod, "BATCH_TRANSCRIPTION", True, raising=False)
+    # Every upload already through VAD and the ledger: the settle gate has its own
+    # tests (test_finalize_settle_gate.py); here it must simply not wait.
+    monkeypatch.setattr(mod, "_unsettled_chunks", lambda conn, sid: [])
     return monkeypatch, rec
 
 

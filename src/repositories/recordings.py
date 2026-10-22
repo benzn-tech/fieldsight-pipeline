@@ -6,12 +6,12 @@ from repositories import sites
 from repositories.topics import _escape_like
 
 _COLS = ("id, company_id, user_id, site_id, kind, s3_key, client_uuid, started_at, "
-         "ended_at, duration_s, resolution, codec, size_bytes, gps_track, uploaded_at, created_at")
+         "ended_at, duration_s, resolution, codec, size_bytes, gps_track, uploaded_at, created_at, source")
 
 
 def insert_pending(conn, company_id, user_id, site_id, kind, s3_key, client_uuid,
                    started_at, ended_at=None, duration_s=None, resolution=None,
-                   codec=None, size_bytes=None, device_id=None) -> dict:
+                   codec=None, size_bytes=None, device_id=None, source=None) -> dict:
     """`device_id` answers "which physical unit recorded this", and until
     2026-09-06 nothing ever wrote it.
 
@@ -29,13 +29,16 @@ def insert_pending(conn, company_id, user_id, site_id, kind, s3_key, client_uuid
     NULL stays a legitimate value: the web app carries no device headers and
     `device_heartbeat.device_id` returns None for an unknown device. A
     recording whose device cannot be named is still a recording.
+
+    `source` is where the capture came from -- 'device', 'phone' (PWA) or
+    'web' -- for later analysis; NULL when nobody said (CHECK from 0089).
     """
     return conn.cursor(row_factory=dict_row).execute(
         f"INSERT INTO recordings (company_id, user_id, site_id, kind, s3_key, client_uuid, "
-        f"started_at, ended_at, duration_s, resolution, codec, size_bytes, device_id) "
-        f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING {_COLS}",
+        f"started_at, ended_at, duration_s, resolution, codec, size_bytes, device_id, source) "
+        f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING {_COLS}",
         (company_id, user_id, site_id, kind, s3_key, client_uuid,
-         started_at, ended_at, duration_s, resolution, codec, size_bytes, device_id),
+         started_at, ended_at, duration_s, resolution, codec, size_bytes, device_id, source),
     ).fetchone()
 
 
@@ -525,6 +528,50 @@ def session_span(conn, company_id, user_folder, date, session_base):
     if not row or row["lo"] is None or row["hi"] is None:
         return None
     return row["lo"], row["hi"]
+
+
+# The settle check's read (recent_session_chunks), module-level so a test can
+# EXPLAIN exactly this text. `started_at >= opened_at - 1 day` is an index
+# condition on (user_id, started_at): without it the best available plan walks
+# the recorder's whole history (~100k rows a year at 1-minute chunks) on every
+# due session. Which plan wins is still the planner's call on real statistics.
+# Both columns are device time, so clock skew cancels; a sid never spans days.
+# COALESCE to the row's server created_at for a session with no opened_at yet.
+RECENT_SESSION_CHUNKS_SQL = (
+    "SELECT r.s3_key, EXTRACT(EPOCH FROM (now() - r.uploaded_at))::float AS age_s "
+    "FROM recordings r "
+    "JOIN meeting_session m ON m.user_id = r.user_id "
+    "WHERE m.session_id = %s "
+    "AND r.started_at >= COALESCE(m.opened_at, m.created_at) - interval '1 day' "
+    "AND r.kind IN ('audio', 'video') "
+    "AND r.uploaded_at > now() - make_interval(secs => %s) "
+    "AND r.s3_key LIKE %s ESCAPE '\\' "
+    "ORDER BY r.s3_key"
+)
+
+
+def recent_session_chunks_params(session_id, within_seconds):
+    return (session_id, within_seconds, f"%sid{_escape_like(session_id)}_c%")
+
+
+def recent_session_chunks(conn, session_id, within_seconds) -> list:
+    """[{s3_key, age_s}] for this device session's audio/video chunks whose
+    `/complete` landed in the last `within_seconds` (server time); `age_s` is
+    the seconds since then.
+
+    For the finalize sweep's settle check: a chunk the recorder has uploaded but
+    the pipeline has not yet registered must not be left out of the email. Only
+    RECENT uploads are asked about, so the check costs nothing for a session
+    whose chunks all landed long ago; `age_s` lets the caller name a chunk it
+    stopped waiting for rather than drop it in silence.
+
+    Scoped to the session's recorder (`user_id`, indexed, bounded on
+    `started_at`), then matched on the `sid{id}_c` token every chunk filename
+    carries; a photo carries no `_c`. `uploaded_at` NULL (presigned, never
+    completed) is not asked about, nor is a row with `started_at` NULL."""
+    return conn.cursor(row_factory=dict_row).execute(
+        RECENT_SESSION_CHUNKS_SQL, recent_session_chunks_params(session_id, within_seconds),
+    ).fetchall()
 
 
 def session_local_span(conn, company_id, user_folder, date, session_base):

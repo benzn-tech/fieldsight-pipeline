@@ -33,6 +33,7 @@ Nothing about the matcher changed. It is called ONCE, for the whole day.
 import logging
 
 import photo_binding
+import photo_pins
 import pipeline_trace
 from repositories import location_markers, recordings, topics
 
@@ -100,6 +101,17 @@ def rebind_day_photos(conn, company_id, user_folder, date, photo_objects):
     conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
                  (f"photobind:{user_folder}:{date}",))
     pipeline_trace.identify(company_id=company_id)
+    # Pins first (M2 Task 6): a voice note's claimed photos are rebuilt under its
+    # live topic, and every pinned photo -- claimed by a note, or moved by hand
+    # ('human') -- is withheld from the matcher, so a time window cannot pull it
+    # onto an overlapping meeting.
+    photo_pins.apply_voice_note_pins(conn, user_folder, date)
+    pinned = photo_pins.pinned_photo_keys(conn, user_folder, date)
+    if pinned:
+        before = len(photo_objects)
+        photo_objects = [p for p in photo_objects if p["key"] not in pinned]
+        logger.info("photo rebind %s/%s: %d pinned photo(s) excluded",
+                    user_folder, date, before - len(photo_objects))
     day_topics = topics.list_day_topics_for_binding(conn, user_folder, date)
 
     topic_sessions, spans = {}, {}

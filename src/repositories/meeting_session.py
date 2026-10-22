@@ -18,12 +18,13 @@ _COLS = (
     "session_id, company_id, user_id, site_id, kind, status, version, "
     "opened_at, last_segment_at, closed_at, close_intent, rolling_summary, "
     "rolling_summary_version, segment_count, word_count, created_at, updated_at, "
-    "group_id, group_ended_at, finalizing_at"
+    "group_id, group_ended_at, finalizing_at, "
+    "session_type, last_chunk_at, closed_chunk_at, reopen_count"
 )
 
 
 def ensure_open(conn, session_id, company_id, user_id, site_id, kind, opened_at,
-                group_id=None) -> dict:
+                group_id=None, session_type=None) -> dict:
     """Create the session if new, else keep it. Idempotent — safe whether the
     device's best-effort record-start signal or the first uploaded chunk reaches
     the backend first (either may open the session). Only fills `opened_at`/
@@ -39,19 +40,26 @@ def ensure_open(conn, session_id, company_id, user_id, site_id, kind, opened_at,
     2026-08-04); NULL for a solo recording, which is every pre-existing row.
     Like the other columns here it is only ever filled in, never cleared: /open
     is best-effort and may legitimately arrive twice, and a second call that
-    omits the group must not orphan a device that already joined."""
+    omits the group must not orphan a device that already joined.
+
+    `session_type` ('meeting' | 'voice_note', migration 0089) follows the same
+    rule: filled in, never cleared. Devices send 'meeting'; a body without it
+    stays NULL (today's behaviour), and a retried /open that omits it must not
+    turn a voice note back into an emailed meeting."""
     return conn.cursor(row_factory=dict_row).execute(
         f"INSERT INTO meeting_session "
-        f"(session_id, company_id, user_id, site_id, kind, opened_at, status, group_id) "
-        f"VALUES (%s, %s, %s, %s, %s, %s, 'open', %s) "
+        f"(session_id, company_id, user_id, site_id, kind, opened_at, status, group_id, "
+        f"session_type) "
+        f"VALUES (%s, %s, %s, %s, %s, %s, 'open', %s, %s) "
         f"ON CONFLICT (session_id) DO UPDATE SET "
         f"opened_at = COALESCE(meeting_session.opened_at, EXCLUDED.opened_at), "
         f"site_id = COALESCE(meeting_session.site_id, EXCLUDED.site_id), "
         f"kind = COALESCE(meeting_session.kind, EXCLUDED.kind), "
         f"group_id = COALESCE(meeting_session.group_id, EXCLUDED.group_id), "
+        f"session_type = COALESCE(meeting_session.session_type, EXCLUDED.session_type), "
         f"updated_at = now() "
         f"RETURNING {_COLS}",
-        (session_id, company_id, user_id, site_id, kind, opened_at, group_id),
+        (session_id, company_id, user_id, site_id, kind, opened_at, group_id, session_type),
     ).fetchone()
 
 
@@ -203,36 +211,61 @@ def group_span_ok(conn, group_id, max_span_seconds) -> bool:
     return float(span) <= float(max_span_seconds)
 
 
-def touch_segment(conn, session_id, at) -> dict | None:
+def touch_segment(conn, session_id, at, chunk_at=None) -> dict | None:
     """A chunk arrived. Advance last_segment_at + segment_count. If the session
     was `pending_close`, this arrival is a RESUME within the grace window: flip
     back to `open`, clear the close, and bump `version` so the scheduled finalize
     no-ops. All SET expressions read the OLD row, so the version bump and status
-    flip both key off the pre-update status."""
+    flip both key off the pre-update status.
+
+    NOT for a deliberate End. It has grace 0, so there is no window to resume
+    within, and the touch that arrives after it is the ended recording's own
+    last chunk: its VAD sidecar lands 2-11 s after the /complete that preceded
+    the /close (TEST 2026-10-22, 3 of 4 phone sessions undone this way, each
+    then waiting out the idle hour). The phone sends close(end) right behind
+    its last upload; a device's close worker usually waits a 30 s retry for
+    in-flight uploads first, which hides the race without excluding it. The
+    activity columns still advance; an `end` row is never reopened later
+    either (_LATE_CHUNK_WHERE), so End is terminal everywhere.
+
+    `chunk_at` is the chunk's DEVICE file-name time (UTC). When given it
+    advances `last_chunk_at` (never backwards), which reopen_late compares with
+    the snapshot taken at an idle close. None leaves `last_chunk_at` alone."""
+    chunk_set = ("last_chunk_at = GREATEST(COALESCE(last_chunk_at, %s), %s), "
+                 if chunk_at is not None else "")
+    chunk_args = (chunk_at, chunk_at) if chunk_at is not None else ()
+    resumable = "status = 'pending_close' AND close_intent IS DISTINCT FROM 'end'"
     return conn.cursor(row_factory=dict_row).execute(
         f"UPDATE meeting_session SET "
         f"last_segment_at = GREATEST(COALESCE(last_segment_at, %s), %s), "
+        f"{chunk_set}"
         f"segment_count = segment_count + 1, "
-        f"version = CASE WHEN status = 'pending_close' THEN version + 1 ELSE version END, "
-        f"closed_at = CASE WHEN status = 'pending_close' THEN NULL ELSE closed_at END, "
-        f"close_intent = CASE WHEN status = 'pending_close' THEN NULL ELSE close_intent END, "
-        f"status = CASE WHEN status = 'pending_close' THEN 'open' ELSE status END, "
+        f"version = CASE WHEN {resumable} THEN version + 1 ELSE version END, "
+        f"closed_at = CASE WHEN {resumable} THEN NULL ELSE closed_at END, "
+        f"close_intent = CASE WHEN {resumable} THEN NULL ELSE close_intent END, "
+        f"status = CASE WHEN {resumable} THEN 'open' ELSE status END, "
         f"updated_at = now() "
         f"WHERE session_id = %s RETURNING {_COLS}",
-        (at, at, session_id),
+        (at, at, *chunk_args, session_id),
     ).fetchone()
 
 
 def mark_pending_close(conn, session_id, closed_at, intent) -> dict | None:
     """Stop signal received -> `pending_close`; bump `version` (the grace timer is
-    scheduled against the returned version). No-op if already finalizing/sent."""
+    scheduled against the returned version). No-op if already finalizing/sent.
+
+    An IDLE close snapshots `last_chunk_at` into `closed_chunk_at`: the device
+    time of the newest chunk the email will cover, which reopen_late compares a
+    later chunk against. An `end` close leaves it NULL (never reopened)."""
     return conn.cursor(row_factory=dict_row).execute(
         f"UPDATE meeting_session SET "
         f"status = 'pending_close', closed_at = %s, close_intent = %s, "
+        f"closed_chunk_at = CASE WHEN %s::text = 'idle' THEN last_chunk_at "
+        f"ELSE closed_chunk_at END, "
         f"version = version + 1, updated_at = now() "
         f"WHERE session_id = %s AND status IN ('open', 'pending_close') "
         f"RETURNING {_COLS}",
-        (closed_at, intent, session_id),
+        (closed_at, intent, intent, session_id),
     ).fetchone()
 
 
@@ -269,22 +302,39 @@ def list_due_finalize(conn, idle_grace_seconds) -> list[dict]:
     ).fetchall()
 
 
+# A session's idle anchor, in SERVER time. `last_segment_at` once any chunk has
+# touched the row. Before that, the later of `opened_at` and `created_at`:
+# `opened_at` is the body's startedAt (device time), and a phone that queued
+# /open offline delivers it an hour or more after recording started, so
+# `opened_at` alone would idle-close the session on the next tick, before its
+# first chunk lands. `created_at` (server now() at insert) bounds that.
+# GREATEST ignores NULLs, so the CASE keeps a row with neither `opened_at` nor
+# `last_segment_at` anchorless (NULL) -- excluded, exactly as before (count_live).
+_IDLE_ANCHOR = (
+    "COALESCE(last_segment_at, "
+    "CASE WHEN opened_at IS NOT NULL THEN GREATEST(opened_at, created_at) END)"
+)
+
+
 def list_idle_open(conn, idle_seconds) -> list[dict]:
-    """Sessions still `open` whose last activity — `last_segment_at` (server time,
-    advanced by touch_segment on every chunk), or `opened_at` if no chunk has
-    touched yet — is older than `idle_seconds`. The device stopped (or crashed)
-    without a `/close`, so the server INFERS close (spec §8.4: "if close is
-    missing, infer close when the session sees no new chunk for
-    SESSION_GAP_MINUTES"). Returns [{session_id, version, last_activity}] — the
-    sweep mark_pending_close's each at `last_activity` with intent 'idle'. Keys on
+    """Sessions still `open` whose last activity (_IDLE_ANCHOR: `last_segment_at`,
+    server time, advanced by touch_segment on every chunk; or, before any chunk,
+    the later of `opened_at` and the row's server `created_at`) is older than
+    `idle_seconds`. The device stopped (or crashed) without a `/close`, so the
+    server INFERS close (spec §8.4: "if close is missing, infer close when the
+    session sees no new chunk for SESSION_GAP_MINUTES" -- IDLE_CLOSE_MINUTES
+    here). Returns [{session_id, version, last_activity}] — the sweep
+    mark_pending_close's each at `last_activity` with intent 'idle'. Keys on
     `last_segment_at`, never `opened_at` alone, so a long ACTIVE meeting (chunks
-    still arriving) is never mistaken for idle. A row whose activity time is NULL
-    (never opened with a timestamp) is excluded — nothing to anchor a close on."""
+    still arriving) is never mistaken for idle, and a late `/open` (queued
+    offline, startedAt hours old) is not closed before its first chunk. A row
+    with neither `last_segment_at` nor `opened_at` is excluded — nothing to
+    anchor a close on."""
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT session_id, version, "
-        "COALESCE(last_segment_at, opened_at) AS last_activity "
+        f"{_IDLE_ANCHOR} AS last_activity "
         "FROM meeting_session WHERE status = 'open' "
-        "AND COALESCE(last_segment_at, opened_at) <= now() - make_interval(secs => %s)",
+        f"AND {_IDLE_ANCHOR} <= now() - make_interval(secs => %s)",
         (idle_seconds,),
     ).fetchall()
 
@@ -300,8 +350,63 @@ def list_finalizing(conn) -> list[dict]:
     same rows: a second query would be a second answer to one question."""
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT session_id, version, user_id, site_id, opened_at, closed_at, "
-        "finalizing_at FROM meeting_session WHERE status = 'finalizing'",
+        "finalizing_at, session_type, reopen_count "
+        "FROM meeting_session WHERE status = 'finalizing'",
     ).fetchall()
+
+
+# The late-chunk test compares last_chunk_at with closed_chunk_at -- BOTH the
+# device's file-name time -- and never with closed_at (server time). Device
+# clocks can be hours off (BUG-37); comparing device time with device time
+# cancels the skew, while device-vs-server would reopen every session from a
+# fast device and never one from a slow device. A NULL snapshot (closed before
+# 0089, or an `end` close) compares as unknown and so never reopens.
+# `finalizing` is deliberately excluded: the send in flight settles first
+# (sent/failed), and the next tick reopens it.
+# Recency bound: touch_segment / mark_pending_close record last_chunk_at and
+# closed_chunk_at whether or not REOPEN_LATE_CHUNKS is on, so on a stage where
+# it is off, eligible rows accumulate; the first tick after the flag flips would
+# otherwise reopen all of them and mail "Updated" for meetings days old (and the
+# capped WARNING would repeat forever). Only a late chunk that ARRIVED within the
+# window counts -- last_segment_at is server arrival time, so a genuinely late
+# chunk arriving now qualifies and an old backlog does not. Takes one parameter
+# (window hours), placed before the caller's own.
+_LATE_CHUNK_WHERE = (
+    "status IN ('sent', 'failed') AND close_intent = 'idle' "
+    "AND last_chunk_at > closed_chunk_at "
+    "AND last_segment_at > now() - make_interval(hours => %s)"
+)
+
+
+def reopen_late(conn, max_reopens: int, window_hours: int) -> list[dict]:
+    """Reopen every idle-closed, settled session that has since received a chunk
+    newer (device time) than the one its email covered -- a phone that was
+    offline past the idle window -- provided that chunk arrived (server time,
+    last_segment_at) within the last `window_hours`. `open` again with `version`
+    bumped and the close cleared, so the normal idle-close -> finalize path
+    re-sends it. At most `max_reopens` times per session. Returns
+    [{session_id, reopen_count}]."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "UPDATE meeting_session SET status = 'open', version = version + 1, "
+        "reopen_count = reopen_count + 1, closed_at = NULL, close_intent = NULL, "
+        "closed_chunk_at = NULL, finalizing_at = NULL, updated_at = now() "
+        f"WHERE {_LATE_CHUNK_WHERE} AND reopen_count < %s "
+        "RETURNING session_id, reopen_count",
+        (window_hours, max_reopens),
+    ).fetchall()
+
+
+def list_reopen_capped(conn, max_reopens: int, window_hours: int) -> list[str]:
+    """Sessions that WOULD reopen on a late chunk but already reached the cap --
+    so the sweep can say so rather than drop the chunk in silence. Same
+    `window_hours` bound as reopen_late, so the warning stops once the late
+    chunk is older than the window."""
+    rows = conn.cursor(row_factory=dict_row).execute(
+        f"SELECT session_id FROM meeting_session "
+        f"WHERE {_LATE_CHUNK_WHERE} AND reopen_count >= %s ORDER BY session_id",
+        (window_hours, max_reopens),
+    ).fetchall()
+    return [r["session_id"] for r in rows]
 
 
 def count_live(conn) -> int:
@@ -309,7 +414,8 @@ def count_live(conn) -> int:
 
     `pending_close` (waiting out its grace) and `finalizing` (claimed, awaiting
     the send worker) always count. An `open` session counts only if it has an
-    activity anchor -- COALESCE(last_segment_at, opened_at) -- because that is
+    activity anchor -- _IDLE_ANCHOR, non-NULL iff last_segment_at or opened_at
+    is set -- because that is
     exactly the condition list_idle_open requires to infer a close. An `open` row
     with neither timestamp can never be closed by the sweep no matter how long it
     waits, so counting it as live would pin the pending flag on FOREVER and the
@@ -331,7 +437,7 @@ def count_live(conn) -> int:
         "SELECT count(*) AS n FROM meeting_session "
         "WHERE status IN ('pending_close', 'finalizing') "
         "   OR (status = 'open' "
-        "       AND COALESCE(last_segment_at, opened_at) IS NOT NULL)",
+        f"       AND {_IDLE_ANCHOR} IS NOT NULL)",
     ).fetchone()["n"]
 
 

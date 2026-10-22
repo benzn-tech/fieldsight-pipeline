@@ -17,7 +17,17 @@ os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
 os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
 os.environ.setdefault("AWS_DEFAULT_REGION", "ap-southeast-2")
 
+import pytest
+
 import lambda_finalize_claim as fc
+
+
+@pytest.fixture(autouse=True)
+def _uploads_settled(monkeypatch):
+    """The sweep tests here drive sweep() with a bare "CONN"; the settle gate
+    (tested in test_finalize_settle_gate.py) would fail open on it and log a
+    traceback per due row. Stubbed so it simply has nothing to wait for."""
+    monkeypatch.setattr(fc, "_unsettled_chunks", lambda conn, sid: [])
 
 
 def test_noop_when_version_superseded(monkeypatch):

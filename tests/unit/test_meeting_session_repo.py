@@ -59,11 +59,27 @@ def test_touch_segment_resumes_from_pending_close_and_bumps_version():
     conn = FakeConn(results=[[{"session_id": SID, "status": "open", "version": 2}]])
     ms.touch_segment(conn, SID, "2026-07-28T14:07:20")
     sql = conn.calls[0]["sql"]
-    # resume: pending_close -> open, clear close, bump version — all keyed off OLD status
-    assert "status = CASE WHEN status = 'pending_close' THEN 'open' ELSE status END" in sql
-    assert "version = CASE WHEN status = 'pending_close' THEN version + 1 ELSE version END" in sql
-    assert "closed_at = CASE WHEN status = 'pending_close' THEN NULL" in sql
+    # resume: pending_close -> open, clear close, bump version — all keyed off OLD
+    # status, and only for a close that is not a deliberate End
+    resumable = "status = 'pending_close' AND close_intent IS DISTINCT FROM 'end'"
+    assert f"status = CASE WHEN {resumable} THEN 'open' ELSE status END" in sql
+    assert f"version = CASE WHEN {resumable} THEN version + 1 ELSE version END" in sql
+    assert f"closed_at = CASE WHEN {resumable} THEN NULL" in sql
+    assert f"close_intent = CASE WHEN {resumable} THEN NULL" in sql
     assert "segment_count = segment_count + 1" in sql
+
+
+def test_touch_segment_never_resumes_an_end_close():
+    """The last chunk's VAD sidecar lands 2-11 s after the phone's /close(end)
+    (TEST 2026-10-22, 3 of 4 phone sessions). It belongs to the recording that
+    was just ended, so it must not reopen the session -- every resume arm must
+    exclude `end`, or the session waits out the idle hour instead."""
+    conn = FakeConn(results=[[{"session_id": SID, "status": "pending_close"}]])
+    ms.touch_segment(conn, SID, "2026-10-22T11:47:01")
+    sql = conn.calls[0]["sql"]
+    for col in ("version", "closed_at", "close_intent", "status"):
+        arm = sql.split(f"{col} = CASE WHEN ", 1)[1].split(" THEN", 1)[0]
+        assert arm == "status = 'pending_close' AND close_intent IS DISTINCT FROM 'end'", col
 
 
 def test_mark_pending_close_bumps_version_and_guards_status():
@@ -74,7 +90,8 @@ def test_mark_pending_close_bumps_version_and_guards_status():
     assert "status = 'pending_close'" in sql
     assert "version = version + 1" in sql
     assert "AND status IN ('open', 'pending_close')" in sql
-    assert conn.calls[0]["params"] == ("2026-07-28T14:19:41", "end", SID)
+    # intent twice: once for close_intent, once for the idle-only closed_chunk_at snapshot
+    assert conn.calls[0]["params"] == ("2026-07-28T14:19:41", "end", "end", SID)
 
 
 def test_claim_finalize_is_a_version_cas():
@@ -123,9 +140,11 @@ def test_list_idle_open_selects_open_sessions_past_the_idle_window():
     assert out == [{"session_id": SID, "version": 2, "last_activity": "2026-07-28T14:05:00"}]
     sql = conn.calls[0]["sql"]
     assert "status = 'open'" in sql
-    # keys on last activity (last_segment_at, else opened_at) -> a still-active
-    # long meeting (chunks arriving) is never mistaken for idle
-    assert "COALESCE(last_segment_at, opened_at)" in sql
+    # keys on last activity (last_segment_at, else the later of opened_at and
+    # the row's server created_at) -> a still-active long meeting (chunks
+    # arriving) is never mistaken for idle, and a late /open is not closed
+    # before its first chunk
+    assert "COALESCE(last_segment_at, CASE WHEN opened_at IS NOT NULL THEN "            "GREATEST(opened_at, created_at) END)" in sql
     assert "make_interval(secs => %s)" in sql
     assert conn.calls[0]["params"] == (900,)
 

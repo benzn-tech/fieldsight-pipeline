@@ -22,14 +22,15 @@ a DB/S3; lambda_handler supplies the real ones.
 import json
 import logging
 import os
+import re
 import time
 
 import nz_time
 import sweep_state
 from lake_put import lake_put
-from repositories import meeting_session, users, sites
+import photo_pins
+from repositories import meeting_session, recordings, users, sites, topics
 import session_scope
-from session_scope import SESSION_GAP_MINUTES
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -59,6 +60,13 @@ FINALIZE_REQUESTS_PREFIX = "session_finalize_requests/"
 # is ~250 s (prod, S3 object versions), and a backstop set at the measured worst
 # case races the thing it is backing up.
 FINALIZE_EMAIL_WAIT_SEC = int(os.environ.get("FINALIZE_EMAIL_WAIT_SEC", "300"))
+# How long a due session may wait for its recent uploads to reach the pipeline
+# before it is claimed anyway (_unsettled_chunks). A phone that reconnects sends
+# its backlog and `close(end)` within seconds, and VAD + ledger registration take
+# 2-11 s more; claiming in between sealed nothing and emailed 30 s of a 2-minute
+# meeting (TEST 2026-10-22). Normally a wait is one tick. The bound is for a chunk
+# VAD never finishes: that costs one email this much delay, never the email.
+FINALIZE_SETTLE_MAX_SEC = int(os.environ.get("FINALIZE_SETTLE_MAX_SEC", "300"))
 # Asks the (non-VPC) extraction lambda for this session's FINAL, thinking-mode
 # pass. Same artifact-on-S3 channel as FINALIZE_REQUESTS_PREFIX and for the same
 # reason: this sweep is in-VPC and cannot invoke another lambda (no NAT, no
@@ -69,15 +77,36 @@ EXTRACTION_REQUESTS_PREFIX = "extraction_requests/"
 # The idle-stop grace window (a deliberate End is grace 0). Mirrors org-api's
 # STOP_GRACE_SECONDS so the sweep's due-check matches what session_close intended.
 STOP_GRACE_SECONDS = int(os.environ.get("STOP_GRACE_SECONDS", "30"))
-# §8.4: a session with no new chunk for SESSION_GAP_MINUTES is INFERRED closed
-# (the device stopped/crashed without a /close). Reuses the one "one session"
-# inactivity constant rather than a second literal.
-IDLE_CLOSE_SECONDS = SESSION_GAP_MINUTES * 60
+# §8.4: a session with no new chunk for IDLE_CLOSE_MINUTES is INFERRED closed
+# (the device stopped/crashed without a /close). It is also the quiet period
+# group merge waits for (_real_group_scan). 60, not SESSION_GAP_MINUTES (15):
+# idle is measured on SERVER arrival (last_segment_at), and a phone that queued
+# offline delivers its chunks late, so 15 min closed sessions still being
+# recorded (M2 spec §8). Same 1 h on every platform. Per-stage SAM parameter
+# (IdleCloseMinutes) so it rolls back without code -- prod runs idle-close today
+# (PROD_ENABLE_FINALIZE -> INFER_IDLE_CLOSE=true), so shipping this moves prod
+# devices from 15 to 60 min; PROD_IDLE_CLOSE_MINUTES=15 is the rollback.
+IDLE_CLOSE_MINUTES = int(os.environ.get("IDLE_CLOSE_MINUTES", "60"))
+IDLE_CLOSE_SECONDS = IDLE_CLOSE_MINUTES * 60
 # Gated OFF until SessionActivityFunction is live to keep last_segment_at fresh:
 # without per-chunk touch, a still-active /open session (last_segment_at NULL ->
-# COALESCE falls back to opened_at) would be closed prematurely. Flipped on WITH
+# the anchor falls back to opened_at / created_at, see
+# meeting_session._IDLE_ANCHOR) would be closed prematurely. Flipped on WITH
 # that lambda's deploy.
 INFER_IDLE_CLOSE = os.environ.get("INFER_IDLE_CLOSE", "false").lower() == "true"
+# Owner decision (M2): chunks that arrive after a session was idle-closed and
+# emailed (a phone offline > IDLE_CLOSE_MINUTES) reopen it, so it is
+# re-finalized with a complete "Updated" email. "Late" is last_chunk_at >
+# closed_chunk_at -- device time vs device time, so clock skew cancels (BUG-37);
+# see meeting_session.reopen_late. Per-stage SAM parameter ReopenLateChunks.
+REOPEN_LATE_CHUNKS = os.environ.get("REOPEN_LATE_CHUNKS", "false").lower() == "true"
+# At most this many reopens per session; past it the late chunk is logged, not sent.
+REOPEN_MAX = int(os.environ.get("REOPEN_MAX", "3"))
+# Only a late chunk that ARRIVED (server time) within this many hours reopens.
+# last_chunk_at / closed_chunk_at are recorded even while REOPEN_LATE_CHUNKS is
+# off, so without a bound the first tick after the flag flips would reopen and
+# re-mail every backlog row, however old.
+REOPEN_WINDOW_HOURS = int(os.environ.get("REOPEN_WINDOW_HOURS", "48"))
 # Phase C multi-device merge. Off means the standing scan never runs, so no
 # group is ever claimed and every downstream branch stays inert.
 ENABLE_GROUP_MERGE = os.environ.get("ENABLE_GROUP_MERGE", "false").lower() == "true"
@@ -128,12 +157,14 @@ PREWARM_NZ_MINUTES = (45, 46)
 
 
 def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_rolling,
-                   request_extraction=None):
+                   request_extraction=None, place_voice_note=None):
     """CAS-claim the session at expected_version and ask for its final extraction.
     Returns a small status dict:
       noop         — claim failed (a resume bumped version, or it already moved on)
       no_recipient — claimed but the recorder has no email (session marked failed)
       waiting      — claimed; the confirmation email waits for the final extraction
+      voice_note   — a voice note (M2 Task 7): settled `sent` here, no email ever;
+                     place_voice_note(conn, row, ctx) writes its placeholder topic
 
     THE EMAIL IS NO LONGER ENQUEUED HERE. It used to be, in the same breath as
     requesting the extraction -- so it went out before that extraction existed
@@ -162,12 +193,39 @@ def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_
     # email on file needs just as much. Best-effort — a failure here must never
     # block finalize — but never silent (CLAUDE.md BUG-40: a swallowed except is
     # how a whole feature stays broken unnoticed).
+    # A reopened session's round picks its own request keys (session_scope.
+    # round_suffix). Passed only when > 0 so a first round's call is unchanged.
+    reopened = int(row.get("reopen_count") or 0)
+    voice_note = row.get("session_type") == "voice_note"
     if request_extraction and ctx.get("folder") and ctx.get("date"):
         try:
-            request_extraction(session_id, ctx["folder"], ctx["date"])
+            # A voice note asks for no brief (voice_note=True): the brief only feeds
+            # the stop email, which a voice note never gets.
+            request_extraction(session_id, ctx["folder"], ctx["date"],
+                               **({"reopened": reopened} if reopened > 0 else {}),
+                               **({"voice_note": True} if voice_note else {}))
         except Exception:
             logger.exception("finalize: could not request final extraction for %s",
                              session_id)
+
+    # A voice note never sends a stop email (owner, M2), so it settles here -- before
+    # the recipient check, so a recorder with no email on file is not marked failed.
+    # Its final extraction was still requested above; until it lands the note is on
+    # the timeline as a placeholder topic with its claimed photos pinned under it.
+    if voice_note:
+        if place_voice_note:
+            try:
+                # A savepoint, not a bare try/except (Ruling R10): a SQL error here
+                # aborts the transaction, and the mark_sent below -- and every other
+                # session in this tick -- would fail with it, once a minute, forever.
+                with conn.transaction():
+                    place_voice_note(conn, row, ctx)
+            except Exception:
+                logger.exception("finalize: could not place voice note %s on the timeline",
+                                 session_id)
+        meeting_session.mark_sent(conn, session_id)
+        logger.info("finalize: voice note %s settled without an email", session_id)
+        return {"status": "voice_note", "sessionId": session_id}
 
     recipient = (ctx.get("recipient") or "").strip()
     if not recipient:
@@ -187,7 +245,7 @@ def backstop(conn, *, list_waiting, resolve_context, read_rolling, enqueue, now=
     Anchored on `finalizing_at` -- when the sweep CLAIMED the session -- and not
     on `closed_at`. An idle-inferred close stores the session's LAST ACTIVITY as
     `closed_at` (infer_idle_closes marks pending_close at last_activity), which
-    is already SESSION_GAP_MINUTES old before anything claims it, so a deadline
+    is already IDLE_CLOSE_MINUTES old before anything claims it, so a deadline
     measured from the close would fire on the very next tick, ahead of any
     extraction -- for exactly the offline and crashed recordings this protects.
 
@@ -203,6 +261,12 @@ def backstop(conn, *, list_waiting, resolve_context, read_rolling, enqueue, now=
     now = now or datetime.now(timezone.utc)
     mailed = []
     for row in list_waiting(conn):
+        if row.get("session_type") == "voice_note":
+            # Never mailed (M2 Task 7). The claim settles a voice note at once, so one
+            # here was claimed by an older sweep; it waits for reconcile, not an email.
+            logger.info("finalize: %s is a voice note -- the backstop sends no email",
+                        row.get("session_id"))
+            continue
         anchor = row.get("finalizing_at")
         if anchor is None:
             continue
@@ -217,9 +281,12 @@ def backstop(conn, *, list_waiting, resolve_context, read_rolling, enqueue, now=
         # `rolling`, not `updated`: the subject rewrite and the `-updated` result
         # key belong to the merge alone, and a result on that key is invisible to
         # reconcile -- the session would sit in `finalizing` for good.
+        reopened = int(row.get("reopen_count") or 0)
         artifact = {
             "kind": "rolling",
             "sessionId": session_id,
+            # The round, so _enqueue and the worker key it as `{sid}-r{n}`.
+            **({"reopened": reopened} if reopened > 0 else {}),
             "version": row.get("version"),
             "recipient": recipient,
             "folder": ctx.get("folder"),
@@ -295,6 +362,43 @@ def _resolve_context(conn, row):
             "date": date, "siteName": site_name, "timeRange": time_range}
 
 
+def _place_voice_note(conn, row, ctx):
+    """Put a claimed voice note on the timeline before its extraction exists: a
+    "Voice note HH:MM" placeholder under the note's own extraction key (the key
+    item-writer supersedes when the real extraction lands), then pin the note's
+    claimed photos under it. Returns the new topic, or None when nothing was written.
+
+    Site (plan decision 7): the note's own `meeting_session.site_id`, else the day's
+    app-tagged site; with neither there is no placeholder (topics.site_id is NOT
+    NULL) and the note gets a topic only if its extraction produces one."""
+    sid = row["session_id"]
+    folder, date = ctx.get("folder"), ctx.get("date")
+    if not folder or not date:
+        logger.warning("finalize: voice note %s has no folder/date -- no placeholder", sid)
+        return None
+    site_id = row.get("site_id")
+    if not site_id:
+        site = recordings.site_for_day(conn, row["user_id"], folder, date)
+        site_id = (site or {}).get("id")
+    if not site_id:
+        logger.warning("finalize: voice note %s has no site and %s/%s has no day site -- "
+                       "no placeholder topic", sid, folder, date)
+        return None
+    opened_nz = _to_nz(row.get("opened_at"))
+    closed_nz = _to_nz(row.get("closed_at")) or opened_nz
+    if opened_nz is None:
+        logger.warning("finalize: voice note %s has no opened_at -- no placeholder", sid)
+        return None
+    start, end = opened_nz.strftime("%H:%M"), closed_nz.strftime("%H:%M")
+    topic = topics.ensure_placeholder_topic(
+        conn, site_id, date, f"Voice note {start}",
+        user_id=row.get("user_id"),
+        source_s3_key=f"extractions/{folder}/{date}/sid{sid}.json",
+        time_range=f"{start} - {end}")
+    photo_pins.apply_voice_note_pins(conn, folder, date)
+    return topic
+
+
 def _read_rolling(folder, date, session_id):
     """The Tier-1 rolling summary the rolling lambda wrote to S3, or {} if none.
     Its session_base is `sid`+session_id (extract_session's grouping key)."""
@@ -338,7 +442,10 @@ def _enqueue(artifact):
     caller wrote it."""
     import boto3
     from botocore.exceptions import ClientError
-    key = f"{FINALIZE_REQUESTS_PREFIX}{artifact['sessionId']}.json"
+    # `-r{n}` for a reopened round: this put is conditional, so round 2 on round
+    # 1's key would 412 and never be mailed. Not `-updated` (the group merge's).
+    key = (f"{FINALIZE_REQUESTS_PREFIX}{artifact['sessionId']}"
+           f"{session_scope.round_suffix(artifact.get('reopened'))}.json")
     try:
         lake_put(
             S3_BUCKET, key,
@@ -355,7 +462,7 @@ def _enqueue(artifact):
         raise
 
 
-def _request_extraction(session_id, folder, date):
+def _request_extraction(session_id, folder, date, reopened=0, voice_note=False):
     """Ask lambda_extract_session for this session's FINAL (thinking-mode,
     unthrottled) pass now that the session has closed, and -- in the same
     breath -- ask for the session's brief (handoff-sync plan §2.1).
@@ -370,20 +477,30 @@ def _request_extraction(session_id, folder, date):
     that already triggers SessionFinalizeFunction, under its own `brief-`
     key -- no new trigger, and it runs CONCURRENTLY with the final
     extraction rather than after it, so the email is not delayed by a
-    serial LLM call waiting on another one."""
+    serial LLM call waiting on another one.
+
+    `reopened` (> 0 for a late-chunk reopen's round) gives the request its own
+    `-r{n}` key: S3 notifies on an overwrite too, but a round's request is its
+    own object so nothing reads round 1's as round 2's. extract-session reads
+    the BODY, not the key (parse_final_request), so it needs no change."""
     import boto3
+    body = {"userFolder": folder, "date": date, "sessionBase": f"sid{session_id}"}
+    if reopened:
+        body["reopened"] = reopened
     lake_put(
         S3_BUCKET,
-        f"{EXTRACTION_REQUESTS_PREFIX}{session_id}.json",
-        json.dumps({"userFolder": folder, "date": date,
-                    "sessionBase": f"sid{session_id}"}),
+        f"{EXTRACTION_REQUESTS_PREFIX}{session_id}{session_scope.round_suffix(reopened)}.json",
+        json.dumps(body),
         client=boto3.client("s3"),
         owner_hint={"folder": folder, "session_base": f"sid{session_id}"},
         ContentType="application/json")
-    _enqueue_brief_request(session_id, folder, date)
+    if voice_note:
+        # The brief exists for the stop email; a voice note has none (M2 Task 7).
+        return
+    _enqueue_brief_request(session_id, folder, date, reopened=reopened)
 
 
-def _enqueue_brief_request(session_id, folder, date):
+def _enqueue_brief_request(session_id, folder, date, reopened=0):
     """Enqueue `session_finalize_requests/brief-<sessionId>.json`, conditional
     on nothing else having written it yet.
 
@@ -395,12 +512,16 @@ def _enqueue_brief_request(session_id, folder, date):
     fine, and must not raise."""
     import boto3
     from botocore.exceptions import ClientError
-    key = f"{FINALIZE_REQUESTS_PREFIX}brief-{session_id}.json"
+    # `-r{n}` for a reopened round: conditional put, so round 2 on round 1's key
+    # would 412 and round 2 would get no brief of its own.
+    key = f"{FINALIZE_REQUESTS_PREFIX}brief-{session_id}{session_scope.round_suffix(reopened)}.json"
+    body = {"kind": "brief", "sessionId": session_id, "folder": folder, "date": date}
+    if reopened:
+        body["reopened"] = reopened
     try:
         lake_put(
             S3_BUCKET, key,
-            json.dumps({"kind": "brief", "sessionId": session_id,
-                        "folder": folder, "date": date}, ensure_ascii=False),
+            json.dumps(body, ensure_ascii=False),
             client=boto3.client("s3"),
             owner_hint={"folder": folder, "session_base": f"sid{session_id}"},
             ContentType="application/json", IfNoneMatch="*")
@@ -666,7 +787,7 @@ def _real_group_scan(conn):
     from repositories import session_group
     return sweep_groups(
         conn,
-        list_due=lambda c: session_group.list_due(c, SESSION_GAP_MINUTES * 60),
+        list_due=lambda c: session_group.list_due(c, IDLE_CLOSE_SECONDS),
         claim=session_group.claim,
         mark_result=session_group.mark_result,
         span_ok=lambda c, gid: meeting_session.group_span_ok(
@@ -831,16 +952,122 @@ def _seal_tail_batches(session_id):
                          "extraction may be missing its last chunks", session_id)
 
 
-def sweep(conn, grace_seconds=None, idle_seconds=None, infer_idle=None):
+# lambda_vad writes the sidecar under the folder from the PATH and the date from
+# the FILENAME (parse_source_filename); mirrored here rather than imported, since
+# lambda_vad builds an S3 client at import and pulls in the VAD runtime.
+_VAD_DATE_RE = re.compile(r'^(\w+)_(\d{4}-\d{2}-\d{2})[-_](\d{2}-\d{2}-\d{2})')
+
+
+def _sidecar_key(recording_key):
+    """The VAD sidecar lambda_vad writes for this uploaded chunk -- for EVERY
+    chunk, a silent one included, after its segments."""
+    parts = recording_key.split("/")
+    folder = parts[1] if len(parts) >= 2 and parts[0] == "users" else "Unknown"
+    name = os.path.splitext(os.path.basename(recording_key))[0]
+    m = _VAD_DATE_RE.match(name)
+    return f"audio_segments/{folder}/{m.group(2) if m else ''}/{name}_vad_metadata.json"
+
+
+def _s3_client():
+    import boto3
+    return boto3.client("s3")
+
+
+def _read_sidecar(s3, recording_key):
+    """The chunk's VAD sidecar, or None when it has not been written yet.
+
+    LISTED first, not inferred from a GET's error: a missing key answers 404
+    only with an s3:ListBucket that applies to the GET, and this role's grant is
+    conditioned on s3:prefix, so a bare GET could answer 403 for "not written
+    yet" (memory: s3-missing-key-403-vs-404). The listing is unambiguous, and
+    any S3 error -- on the list or the GET -- RAISES, so the caller fails open
+    instead of turning a missing grant into the full wait on every email."""
+    key = _sidecar_key(recording_key)
+    listed = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=key, MaxKeys=1)
+    if not any(o.get("Key") == key for o in listed.get("Contents") or []):
+        return None
+    obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+    return json.loads(obj["Body"].read().decode("utf-8"))
+
+
+def _ledger_indices(session_id):
+    """Chunk indices the transcriber has registered for this session."""
+    import boto3
+
+    import batch_ledger
+    table = boto3.resource("dynamodb").Table(TRANSCRIPT_TABLE)
+    return {int(r["chunk_index"]) for r in batch_ledger.list_members(table, session_id)}
+
+
+def _unsettled_chunks(conn, session_id):
+    """This session's recent uploads the pipeline has not caught up with yet.
+
+    A chunk is settled when the transcriber has registered it in the batch ledger,
+    or when its VAD sidecar exists and either holds no speech (dropped: it never
+    reaches the ledger) or batching is off. Anything else -- no sidecar yet, or
+    speech that is not registered yet -- would be missed by the tail seal and the
+    final extraction, so the claim waits for it.
+
+    A chunk is waited for until FINALIZE_SETTLE_MAX_SEC after its upload. Uploads
+    from twice that window are read, so one still unsettled past the cap is NAMED
+    in a warning when the claim goes ahead without it, not dropped in silence.
+
+    Fails OPEN (returns []): a check that cannot run -- SQL, DynamoDB or any S3
+    error -- must leave the sweep as it was before. The read runs in a savepoint
+    so a SQL error cannot abort the tick (R10)."""
+    from transcript_utils import extract_chunk_index_from_filename
+    try:
+        with conn.transaction():
+            rows = recordings.recent_session_chunks(conn, session_id,
+                                                    2 * FINALIZE_SETTLE_MAX_SEC)
+        if not rows:
+            return []
+        members = _ledger_indices(session_id) if BATCH_TRANSCRIPTION else set()
+        s3 = None
+        out, given_up = [], []
+        for r in rows:
+            key = r["s3_key"]
+            if extract_chunk_index_from_filename(key) in members:
+                continue
+            s3 = s3 or _s3_client()
+            meta = _read_sidecar(s3, key)
+            if meta is None or (BATCH_TRANSCRIPTION and meta.get("segments")):
+                (given_up if r["age_s"] > FINALIZE_SETTLE_MAX_SEC else out).append(key)
+        if given_up and not out:
+            logger.warning("finalize: %s is claimed WITHOUT %d chunk(s) still not through "
+                           "VAD and the batch ledger after %ds -- its email will be "
+                           "missing them: %s", session_id, len(given_up),
+                           FINALIZE_SETTLE_MAX_SEC,
+                           ", ".join(k.rsplit("/", 1)[-1] for k in given_up))
+        return out
+    except Exception:
+        logger.exception("finalize: could not check whether %s's uploads have settled "
+                         "-- claiming without waiting", session_id)
+        return []
+
+
+def sweep(conn, grace_seconds=None, idle_seconds=None, infer_idle=None, reopen=None):
     """Finalize every session on `conn` whose grace has elapsed, reusing
     finalize_claim per session (CAS-claim -> gather -> enqueue). First (when
     enabled) infers idle closes (§8.4): an `open` session gone quiet becomes
     pending_close and is then picked up by the same due-check. Returns the list of
     per-session status dicts. Separated from lambda_handler so the sweep loop is
-    testable without a real DB connection; `infer_idle` overrides the env gate."""
+    testable without a real DB connection; `infer_idle` overrides the env gate.
+
+    Before anything else (when `reopen`, default REOPEN_LATE_CHUNKS) reopens
+    idle-closed sent/failed sessions that have since received a later chunk;
+    they are `open` again and close + finalize through the normal path."""
     grace = STOP_GRACE_SECONDS if grace_seconds is None else grace_seconds
     idle = IDLE_CLOSE_SECONDS if idle_seconds is None else idle_seconds
     do_infer = INFER_IDLE_CLOSE if infer_idle is None else infer_idle
+    do_reopen = REOPEN_LATE_CHUNKS if reopen is None else reopen
+    if do_reopen:
+        for row in meeting_session.reopen_late(conn, REOPEN_MAX, REOPEN_WINDOW_HOURS):
+            logger.info("finalize: reopened %s after a late chunk (reopen %d)",
+                        row["session_id"], row["reopen_count"])
+        for sid in meeting_session.list_reopen_capped(conn, REOPEN_MAX,
+                                                      REOPEN_WINDOW_HOURS):
+            logger.warning("finalize: %s has a late chunk but reached REOPEN_MAX", sid)
     if do_infer:
         infer_idle_closes(conn, idle)
     # A STANDING pass, before the due-session loop and independent of it. Sealing otherwise
@@ -849,11 +1076,21 @@ def sweep(conn, grace_seconds=None, idle_seconds=None, infer_idle=None):
     revisit_active_batch_sessions()
     results = []
     for row in meeting_session.list_due_finalize(conn, grace):
+        # BEFORE the seal: sealing a partial tail turns the rest into stragglers,
+        # and the claim after it requests the extraction the email is built from.
+        # The row stays `pending_close`, so it is due again next tick and keeps
+        # count_live (and with it the sweep's pending flag) up meanwhile.
+        unsettled = _unsettled_chunks(conn, row["session_id"])
+        if unsettled:
+            logger.info("finalize: %s waits -- %d uploaded chunk(s) not through VAD "
+                        "and the batch ledger yet: %s", row["session_id"],
+                        len(unsettled), ", ".join(k.rsplit("/", 1)[-1] for k in unsettled))
+            continue
         _seal_tail_batches(row["session_id"])
         results.append(finalize_claim(
             conn, row["session_id"], row["version"],
             resolve_context=_resolve_context, read_rolling=_read_rolling,
-            request_extraction=_request_extraction))
+            request_extraction=_request_extraction, place_voice_note=_place_voice_note))
     return results
 
 
@@ -867,7 +1104,9 @@ def reconcile(conn, read_result):
     out = []
     for row in meeting_session.list_finalizing(conn):
         sid = row["session_id"]
-        res = read_result(sid)
+        # A reopened round settles on ITS result (`{sid}-r{n}`): round 1's `sent`
+        # at the bare key would otherwise settle round 2 before its email exists.
+        res = read_result(f"{sid}{session_scope.round_suffix(row.get('reopen_count'))}")
         if not res:
             continue
         status = res.get("status")
@@ -893,10 +1132,11 @@ def reconcile(conn, read_result):
     return out
 
 
-def _read_result(session_id):
-    """The send worker's recorded outcome for a session, or None if not written yet."""
+def _read_result(result_id):
+    """The send worker's recorded outcome for a session round (`{sid}` or
+    `{sid}-r{n}`), or None if not written yet."""
     import boto3
-    key = f"session_finalize_results/{session_id}.json"
+    key = f"session_finalize_results/{result_id}.json"
     try:
         obj = boto3.client("s3").get_object(Bucket=S3_BUCKET, Key=key)
         return json.loads(obj["Body"].read().decode("utf-8"))
