@@ -6621,10 +6621,17 @@ def backfill_member_folders(conn, caller, body=None):
     return ok({"enrolled": enrolled, "skipped": skipped})
 
 
+# Who may invite (POST /members) and resend an invitation. gm added 2026-10-22
+# (owner decision), limited to granting _GM_GRANTABLE_ROLES in create_member.
+_INVITER_ROLES = ("admin", "gm", "platform_admin")
+_GM_GRANTABLE_ROLES = ("gm", "regional_manager", "pm", "site_manager", "worker")
+
+
 def create_member(conn, caller, body):
-    """Admin-only. Creates the Cognito login (email invite w/ temp password),
-    the Aurora profile, and site memberships. Idempotent: an existing Cognito
-    user is looked up instead of failing, and the DB writes are upserts —
+    """Admin or gm (gm with limits, see below). Creates the Cognito login
+    (email invite w/ temp password), the Aurora profile, and site
+    memberships. Idempotent: an existing Cognito user is looked up instead of
+    failing, and the DB writes are upserts —
     safe to retry after a partial failure (Cognito ok, DB rolled back).
     An existing user keeps their current global_role unless global_role is
     explicitly sent in the body (no silent reset to "worker" on re-invite).
@@ -6633,9 +6640,16 @@ def create_member(conn, caller, body):
     D6: an optional target_company_id lets ONLY a platform_admin create a
     member in another company (default = caller's own company, unchanged for
     everyone else); granting global_role="platform_admin" itself requires the
-    caller to already be a platform_admin."""
-    if caller["global_role"] not in ("admin", "platform_admin"):
-        return error("admin role required", 403)
+    caller to already be a platform_admin.
+
+    A gm may invite too (owner decision 2026-10-22), with limits: the role it
+    sets -- explicit, or the new person's default "worker" -- must be gm or
+    below (_GM_GRANTABLE_ROLES); it may not re-invite (and so alter) an
+    existing admin or platform_admin; it may not change its own role through
+    this endpoint; and, like admin, it stays inside its own company."""
+    if caller["global_role"] not in _INVITER_ROLES:
+        return error("admin or gm role required", 403)
+    caller_is_gm = caller["global_role"] == "gm"
     if body is None:
         return error("malformed JSON body", 400)
     email = (body.get("email") or "").strip().lower()
@@ -6645,6 +6659,10 @@ def create_member(conn, caller, body):
     if global_role is not None and (
             not isinstance(global_role, str) or global_role not in ALLOWED_GLOBAL_ROLES):
         return error(f"global_role must be one of {sorted(ALLOWED_GLOBAL_ROLES)}", 400)
+    # A gm grants gm and below only. A new person with no global_role gets the
+    # default "worker", which is inside the set.
+    if caller_is_gm and global_role is not None and global_role not in _GM_GRANTABLE_ROLES:
+        return error("a gm may grant only gm, regional_manager, pm, site_manager or worker", 403)
     # D6: only a platform_admin may grant platform_admin.
     if global_role == "platform_admin" and not is_cross_company(caller["global_role"]):
         return error("only platform_admin may grant platform_admin", 403)
@@ -6708,6 +6726,17 @@ def create_member(conn, caller, body):
         return error("user already belongs to another company", 409)
     if existing and existing["company_id"] == target_company_id and existing.get("archived_at"):
         return error("user is archived — unarchive them instead", 409)
+    # A gm cannot alter an admin or platform_admin through a re-invite (the
+    # upsert below would rewrite their memberships, name and -- if sent -- role),
+    # and cannot change its own role here. Checked after the Cognito lookup: for
+    # an existing login that call only raised UsernameExistsException, so
+    # nothing has been sent or written yet.
+    if caller_is_gm and existing:
+        if existing.get("global_role") in ("admin", "platform_admin"):
+            return error("a gm cannot change an admin or platform_admin", 403)
+        if (existing.get("cognito_sub") == caller.get("cognito_sub")
+                and global_role is not None and global_role != existing.get("global_role")):
+            return error("you cannot change your own role", 403)
 
     user = users.upsert_user(
         conn, sub, email,
@@ -6777,7 +6806,7 @@ def archive_member_endpoint(conn, caller, target_sub, action):
 
 
 # ----------------------------------------------------------
-# resend invite (admin / platform_admin, same gate as POST /members)
+# resend invite (admin / gm / platform_admin, same gate as POST /members)
 # ----------------------------------------------------------
 # Cognito only re-sends an invitation while the login is still waiting for its
 # first password (FORCE_CHANGE_PASSWORD). Any other status means the person has
@@ -6791,7 +6820,8 @@ def resend_member_invite(conn, caller, target_sub):
     validity window) to a member who never set their password.
 
     Authorization copies create_member, the endpoint that sent the original
-    invite: admin or platform_admin only. The target must be a non-archived
+    invite: admin, gm or platform_admin. A resend changes no role, so a gm gets
+    the same company rule as an admin. The target must be a non-archived
     member of the caller's company; a platform_admin (cross-company) may reach
     any company, exactly as it may invite into any company. A member outside
     that reach answers 404 rather than 403 so the route does not confirm which
@@ -6804,8 +6834,8 @@ def resend_member_invite(conn, caller, target_sub):
     rejects a sub as Username ("Username should be an email") even with
     MessageAction=RESEND, while AdminGetUser accepts either (TEST, 2026-10-22).
     Nothing in Aurora changes."""
-    if caller["global_role"] not in ("admin", "platform_admin"):
-        return error("admin role required", 403)
+    if caller["global_role"] not in _INVITER_ROLES:
+        return error("admin or gm role required", 403)
     target = users.get_user_by_sub(conn, target_sub)
     if target is None or (
             not is_cross_company(caller["global_role"])
