@@ -365,3 +365,66 @@ def test_log_line_counts_windowed_and_head_items(caplog):
                 if r.getMessage().startswith("ask tool search_records"))
     assert "windowed=1 head=1" in line
     assert "crane" not in caplog.text and "Thursday" not in caplog.text
+
+
+
+# --- result budget (Task 4; review SHOULD 1) -----------------------------------
+
+UUID = "0e3c5a52-7d1f-4c2b-9a7e-3f1d2b4c5e6f"
+# Spec §3: about 539 characters of item JSON before the text, measured on real rows.
+SPEC_OVERHEAD = 539
+# Field shapes. "measured": real-looking fields with the title padded until the item
+# costs SPEC_OVERHEAD before its text. "longest": the longest plausible values. Task 10
+# re-pins both from the replay's per-item overhead p95/max over real rows.
+SHAPES = {
+    "measured": {"source_s3_key": f"extractions/{UUID}/2026-09-10/{'a' * 32}_extraction.json",
+                 "site_name": "Riverside Stage 2", "site_slug": "riverside-stage-2",
+                 "user_name": "Ben Lin", "topic_title": "Roofing subcontractor withdrawal"},
+    "longest": {"source_s3_key": f"extractions/{UUID}/2026-09-10/{'a' * 40}_extraction.json",
+                "site_name": "S" * 40, "site_slug": "s" * 40, "user_name": "U" * 30,
+                "topic_title": "T" * 80},
+}
+FULL_TEXT = _transcript(40)[:ask_tools.WINDOW_CHARS]
+
+
+def _row_with(fields, i=0):
+    """A chunk whose item text is exactly WINDOW_CHARS, on transcript lines (each
+    newline costs two characters of JSON)."""
+    return dict(fields, id=f"{UUID[:-2]}{i:02d}", chunk_text=FULL_TEXT,
+                chunk_type="transcript_window", topic_id=UUID, report_date="2026-09-10",
+                metadata={"window_span": "08:10:00–08:10:39"})
+
+
+def _overhead(fields):
+    """Item JSON (ref included) minus the text's own characters; the text's newline
+    escapes are excluded, so this is comparable with the spec's figure."""
+    _, _, item = ask_tools._item("search_records", {"query": "q"}, _row_with(fields), "0")
+    item.pop("_window")
+    return (ask_tools._size(dict(item, ref="R0000")) - len(item["text"])
+            - item["text"].count("\n"))
+
+
+def _shape(name):
+    fields = dict(SHAPES[name])
+    if name == "measured":
+        fields["topic_title"] += "x" * (SPEC_OVERHEAD - _overhead(fields))
+    return fields
+
+
+@pytest.mark.parametrize("shape", [
+    "measured",
+    pytest.param("longest", marks=pytest.mark.xfail(
+        strict=True, reason="~13.4k > 12,500: Task 10 sets MAX_RESULT_CHARS from the "
+                            "replay's overhead p95, or stops counting source/ids (SHOULD 1)")),
+])
+def test_eight_windowed_items_fit_one_envelope(shape):
+    fields = _shape(shape)
+    env = _run("search_records", {"query": "q"}, [_row_with(fields, i) for i in range(8)])
+    assert all(len(it["text"]) == ask_tools.WINDOW_CHARS for it in env["items"])
+    assert len(env["items"]) == 8 and env["meta"]["truncated"] is False, _overhead(fields)
+    assert len(json.dumps(env["items"], ensure_ascii=False)) <= ask_tools.MAX_RESULT_CHARS
+
+
+def test_budget_shapes_are_what_they_claim():
+    assert _overhead(_shape("measured")) == SPEC_OVERHEAD
+    assert _overhead(_shape("longest")) > SPEC_OVERHEAD + 100
