@@ -5,7 +5,8 @@ _DATE = r"(?P<day>\d{4}-\d{2}-\d{2})"
 _FOLDER = r"(?P<folder>[^/]+)"
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 SID_RE = re.compile(r"sid(?P<sid>[0-9a-f]{32})")
-_SID_SEGMENT_RE = re.compile(r"^(?P<sid>[0-9a-f]{32})(?:-(?:updated|notes))?$")
+# `-r{n}`: a late-chunk reopen's round (session_scope.round_suffix), before `-notes`.
+_SID_SEGMENT_RE = re.compile(r"^(?P<sid>[0-9a-f]{32})(?:-r[0-9]+)?(?:-(?:updated|notes))?$")
 _UUID_RE = re.compile(rf"^{_UUID}$")
 
 _TENANT = [

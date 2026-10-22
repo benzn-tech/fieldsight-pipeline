@@ -184,6 +184,24 @@ def device_session_id(session_base):
     return m.group(1) if m else None
 
 
+def round_suffix(reopen_count):
+    """`""` for a session's first round (reopen_count 0/None), `"-r{n}"` after
+    its n-th late-chunk reopen (meeting_session.reopen_count).
+
+    Every per-round S3 object of the finalize path -- extraction request, brief
+    request, finalize request, finalize result, stored brief -- is keyed by the
+    session id, and most are write-once (conditional puts) or read as the truth
+    about the round (`_already_sent`, reconcile). A reopened session reusing
+    round 1's keys would 412 or be answered by round 1's result ("already
+    sent"), so each round gets its own. Not `-updated`: that suffix is the group
+    merge's. Round 0 is the bare key, byte-identical to before reopens existed."""
+    try:
+        n = int(reopen_count or 0)
+    except (TypeError, ValueError):
+        n = 0
+    return f"-r{n}" if n > 0 else ""
+
+
 def session_start(session_id):
     """AUTHORITATIVE session start: the wall-clock time encoded in
     session_base itself (e.g. `Benl1_2026-07-25_13-05-12` -> 13:05:12), via

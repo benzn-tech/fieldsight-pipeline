@@ -176,9 +176,13 @@ def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_
     # email on file needs just as much. Best-effort — a failure here must never
     # block finalize — but never silent (CLAUDE.md BUG-40: a swallowed except is
     # how a whole feature stays broken unnoticed).
+    # A reopened session's round picks its own request keys (session_scope.
+    # round_suffix). Passed only when > 0 so a first round's call is unchanged.
+    reopened = int(row.get("reopen_count") or 0)
     if request_extraction and ctx.get("folder") and ctx.get("date"):
         try:
-            request_extraction(session_id, ctx["folder"], ctx["date"])
+            request_extraction(session_id, ctx["folder"], ctx["date"],
+                               **({"reopened": reopened} if reopened > 0 else {}))
         except Exception:
             logger.exception("finalize: could not request final extraction for %s",
                              session_id)
@@ -231,9 +235,12 @@ def backstop(conn, *, list_waiting, resolve_context, read_rolling, enqueue, now=
         # `rolling`, not `updated`: the subject rewrite and the `-updated` result
         # key belong to the merge alone, and a result on that key is invisible to
         # reconcile -- the session would sit in `finalizing` for good.
+        reopened = int(row.get("reopen_count") or 0)
         artifact = {
             "kind": "rolling",
             "sessionId": session_id,
+            # The round, so _enqueue and the worker key it as `{sid}-r{n}`.
+            **({"reopened": reopened} if reopened > 0 else {}),
             "version": row.get("version"),
             "recipient": recipient,
             "folder": ctx.get("folder"),
@@ -352,7 +359,10 @@ def _enqueue(artifact):
     caller wrote it."""
     import boto3
     from botocore.exceptions import ClientError
-    key = f"{FINALIZE_REQUESTS_PREFIX}{artifact['sessionId']}.json"
+    # `-r{n}` for a reopened round: this put is conditional, so round 2 on round
+    # 1's key would 412 and never be mailed. Not `-updated` (the group merge's).
+    key = (f"{FINALIZE_REQUESTS_PREFIX}{artifact['sessionId']}"
+           f"{session_scope.round_suffix(artifact.get('reopened'))}.json")
     try:
         lake_put(
             S3_BUCKET, key,
@@ -369,7 +379,7 @@ def _enqueue(artifact):
         raise
 
 
-def _request_extraction(session_id, folder, date):
+def _request_extraction(session_id, folder, date, reopened=0):
     """Ask lambda_extract_session for this session's FINAL (thinking-mode,
     unthrottled) pass now that the session has closed, and -- in the same
     breath -- ask for the session's brief (handoff-sync plan §2.1).
@@ -384,20 +394,27 @@ def _request_extraction(session_id, folder, date):
     that already triggers SessionFinalizeFunction, under its own `brief-`
     key -- no new trigger, and it runs CONCURRENTLY with the final
     extraction rather than after it, so the email is not delayed by a
-    serial LLM call waiting on another one."""
+    serial LLM call waiting on another one.
+
+    `reopened` (> 0 for a late-chunk reopen's round) gives the request its own
+    `-r{n}` key: S3 notifies on an overwrite too, but a round's request is its
+    own object so nothing reads round 1's as round 2's. extract-session reads
+    the BODY, not the key (parse_final_request), so it needs no change."""
     import boto3
+    body = {"userFolder": folder, "date": date, "sessionBase": f"sid{session_id}"}
+    if reopened:
+        body["reopened"] = reopened
     lake_put(
         S3_BUCKET,
-        f"{EXTRACTION_REQUESTS_PREFIX}{session_id}.json",
-        json.dumps({"userFolder": folder, "date": date,
-                    "sessionBase": f"sid{session_id}"}),
+        f"{EXTRACTION_REQUESTS_PREFIX}{session_id}{session_scope.round_suffix(reopened)}.json",
+        json.dumps(body),
         client=boto3.client("s3"),
         owner_hint={"folder": folder, "session_base": f"sid{session_id}"},
         ContentType="application/json")
-    _enqueue_brief_request(session_id, folder, date)
+    _enqueue_brief_request(session_id, folder, date, reopened=reopened)
 
 
-def _enqueue_brief_request(session_id, folder, date):
+def _enqueue_brief_request(session_id, folder, date, reopened=0):
     """Enqueue `session_finalize_requests/brief-<sessionId>.json`, conditional
     on nothing else having written it yet.
 
@@ -409,12 +426,16 @@ def _enqueue_brief_request(session_id, folder, date):
     fine, and must not raise."""
     import boto3
     from botocore.exceptions import ClientError
-    key = f"{FINALIZE_REQUESTS_PREFIX}brief-{session_id}.json"
+    # `-r{n}` for a reopened round: conditional put, so round 2 on round 1's key
+    # would 412 and round 2 would get no brief of its own.
+    key = f"{FINALIZE_REQUESTS_PREFIX}brief-{session_id}{session_scope.round_suffix(reopened)}.json"
+    body = {"kind": "brief", "sessionId": session_id, "folder": folder, "date": date}
+    if reopened:
+        body["reopened"] = reopened
     try:
         lake_put(
             S3_BUCKET, key,
-            json.dumps({"kind": "brief", "sessionId": session_id,
-                        "folder": folder, "date": date}, ensure_ascii=False),
+            json.dumps(body, ensure_ascii=False),
             client=boto3.client("s3"),
             owner_hint={"folder": folder, "session_base": f"sid{session_id}"},
             ContentType="application/json", IfNoneMatch="*")
@@ -892,7 +913,9 @@ def reconcile(conn, read_result):
     out = []
     for row in meeting_session.list_finalizing(conn):
         sid = row["session_id"]
-        res = read_result(sid)
+        # A reopened round settles on ITS result (`{sid}-r{n}`): round 1's `sent`
+        # at the bare key would otherwise settle round 2 before its email exists.
+        res = read_result(f"{sid}{session_scope.round_suffix(row.get('reopen_count'))}")
         if not res:
             continue
         status = res.get("status")
@@ -918,10 +941,11 @@ def reconcile(conn, read_result):
     return out
 
 
-def _read_result(session_id):
-    """The send worker's recorded outcome for a session, or None if not written yet."""
+def _read_result(result_id):
+    """The send worker's recorded outcome for a session round (`{sid}` or
+    `{sid}-r{n}`), or None if not written yet."""
     import boto3
-    key = f"session_finalize_results/{session_id}.json"
+    key = f"session_finalize_results/{result_id}.json"
     try:
         obj = boto3.client("s3").get_object(Bucket=S3_BUCKET, Key=key)
         return json.loads(obj["Body"].read().decode("utf-8"))

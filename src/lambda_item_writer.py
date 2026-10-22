@@ -98,6 +98,7 @@ from repositories import speaker_intro_suggestions
 # keyframe_selection already followed.
 from session_scope import EXTRACTION_KEY_RE  # noqa: F401  (re-export)
 from session_scope import device_session_id as _device_session_id
+from session_scope import round_suffix as _round_suffix
 from session_scope import parse_extraction_key as _parse_extraction_key
 
 logger = logging.getLogger()
@@ -415,8 +416,12 @@ def _final_email_context(conn, session_base, extraction, date, follow_up=False):
         # The claim step already marked this session failed and said whose
         # email is missing; repeating it here would only double the noise.
         return None
+    # A reopened session's round (Task 4B): picks its per-round request/result/
+    # brief keys and the "Updated" subject. Absent for round 0.
+    reopened = int(row.get("reopen_count") or 0)
     return {"kind": "final", "sessionId": sid,
             **({"followUp": True} if follow_up else {}),
+            **({"reopened": reopened} if reopened > 0 else {}),
             "recipient": ctx["recipient"], "date": ctx.get("date") or date,
             "timeRange": ctx.get("timeRange"), "siteName": ctx.get("siteName"),
             # handoff-sync plan §2.2: the worker needs the folder to poll
@@ -474,7 +479,11 @@ def _kept_under(check, others, topics):
 def _enqueue_final_email(ctx, put=None):
     """One confirmation email per session, whoever gets there first."""
     put = put or _put_finalize_request
-    suffix = "-notes" if ctx.get("followUp") else ""
+    # `-r{n}` for a late-chunk reopen's round: this put is conditional, so round 2
+    # on round 1's key would 412 and never be mailed. Before `-notes`, so a
+    # round's follow-up is `{sid}-r{n}-notes`; `-updated` is the group merge's.
+    suffix = _round_suffix(ctx.get("reopened")) + (
+        "-notes" if ctx.get("followUp") else "")
     return put(f"session_finalize_requests/{ctx['sessionId']}{suffix}.json", ctx,
                only_if_absent=True)
 
