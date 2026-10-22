@@ -22,6 +22,7 @@ a DB/S3; lambda_handler supplies the real ones.
 import json
 import logging
 import os
+import re
 import time
 
 import nz_time
@@ -59,6 +60,13 @@ FINALIZE_REQUESTS_PREFIX = "session_finalize_requests/"
 # is ~250 s (prod, S3 object versions), and a backstop set at the measured worst
 # case races the thing it is backing up.
 FINALIZE_EMAIL_WAIT_SEC = int(os.environ.get("FINALIZE_EMAIL_WAIT_SEC", "300"))
+# How long a due session may wait for its recent uploads to reach the pipeline
+# before it is claimed anyway (_unsettled_chunks). A phone that reconnects sends
+# its backlog and `close(end)` within seconds, and VAD + ledger registration take
+# 2-11 s more; claiming in between sealed nothing and emailed 30 s of a 2-minute
+# meeting (TEST 2026-10-22). Normally a wait is one tick. The bound is for a chunk
+# VAD never finishes: that costs one email this much delay, never the email.
+FINALIZE_SETTLE_MAX_SEC = int(os.environ.get("FINALIZE_SETTLE_MAX_SEC", "300"))
 # Asks the (non-VPC) extraction lambda for this session's FINAL, thinking-mode
 # pass. Same artifact-on-S3 channel as FINALIZE_REQUESTS_PREFIX and for the same
 # reason: this sweep is in-VPC and cannot invoke another lambda (no NAT, no
@@ -944,6 +952,100 @@ def _seal_tail_batches(session_id):
                          "extraction may be missing its last chunks", session_id)
 
 
+# lambda_vad writes the sidecar under the folder from the PATH and the date from
+# the FILENAME (parse_source_filename); mirrored here rather than imported, since
+# lambda_vad builds an S3 client at import and pulls in the VAD runtime.
+_VAD_DATE_RE = re.compile(r'^(\w+)_(\d{4}-\d{2}-\d{2})[-_](\d{2}-\d{2}-\d{2})')
+
+
+def _sidecar_key(recording_key):
+    """The VAD sidecar lambda_vad writes for this uploaded chunk -- for EVERY
+    chunk, a silent one included, after its segments."""
+    parts = recording_key.split("/")
+    folder = parts[1] if len(parts) >= 2 and parts[0] == "users" else "Unknown"
+    name = os.path.splitext(os.path.basename(recording_key))[0]
+    m = _VAD_DATE_RE.match(name)
+    return f"audio_segments/{folder}/{m.group(2) if m else ''}/{name}_vad_metadata.json"
+
+
+def _s3_client():
+    import boto3
+    return boto3.client("s3")
+
+
+def _read_sidecar(s3, recording_key):
+    """The chunk's VAD sidecar, or None when it has not been written yet.
+
+    LISTED first, not inferred from a GET's error: a missing key answers 404
+    only with an s3:ListBucket that applies to the GET, and this role's grant is
+    conditioned on s3:prefix, so a bare GET could answer 403 for "not written
+    yet" (memory: s3-missing-key-403-vs-404). The listing is unambiguous, and
+    any S3 error -- on the list or the GET -- RAISES, so the caller fails open
+    instead of turning a missing grant into the full wait on every email."""
+    key = _sidecar_key(recording_key)
+    listed = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=key, MaxKeys=1)
+    if not any(o.get("Key") == key for o in listed.get("Contents") or []):
+        return None
+    obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+    return json.loads(obj["Body"].read().decode("utf-8"))
+
+
+def _ledger_indices(session_id):
+    """Chunk indices the transcriber has registered for this session."""
+    import boto3
+
+    import batch_ledger
+    table = boto3.resource("dynamodb").Table(TRANSCRIPT_TABLE)
+    return {int(r["chunk_index"]) for r in batch_ledger.list_members(table, session_id)}
+
+
+def _unsettled_chunks(conn, session_id):
+    """This session's recent uploads the pipeline has not caught up with yet.
+
+    A chunk is settled when the transcriber has registered it in the batch ledger,
+    or when its VAD sidecar exists and either holds no speech (dropped: it never
+    reaches the ledger) or batching is off. Anything else -- no sidecar yet, or
+    speech that is not registered yet -- would be missed by the tail seal and the
+    final extraction, so the claim waits for it.
+
+    A chunk is waited for until FINALIZE_SETTLE_MAX_SEC after its upload. Uploads
+    from twice that window are read, so one still unsettled past the cap is NAMED
+    in a warning when the claim goes ahead without it, not dropped in silence.
+
+    Fails OPEN (returns []): a check that cannot run -- SQL, DynamoDB or any S3
+    error -- must leave the sweep as it was before. The read runs in a savepoint
+    so a SQL error cannot abort the tick (R10)."""
+    from transcript_utils import extract_chunk_index_from_filename
+    try:
+        with conn.transaction():
+            rows = recordings.recent_session_chunks(conn, session_id,
+                                                    2 * FINALIZE_SETTLE_MAX_SEC)
+        if not rows:
+            return []
+        members = _ledger_indices(session_id) if BATCH_TRANSCRIPTION else set()
+        s3 = None
+        out, given_up = [], []
+        for r in rows:
+            key = r["s3_key"]
+            if extract_chunk_index_from_filename(key) in members:
+                continue
+            s3 = s3 or _s3_client()
+            meta = _read_sidecar(s3, key)
+            if meta is None or (BATCH_TRANSCRIPTION and meta.get("segments")):
+                (given_up if r["age_s"] > FINALIZE_SETTLE_MAX_SEC else out).append(key)
+        if given_up and not out:
+            logger.warning("finalize: %s is claimed WITHOUT %d chunk(s) still not through "
+                           "VAD and the batch ledger after %ds -- its email will be "
+                           "missing them: %s", session_id, len(given_up),
+                           FINALIZE_SETTLE_MAX_SEC,
+                           ", ".join(k.rsplit("/", 1)[-1] for k in given_up))
+        return out
+    except Exception:
+        logger.exception("finalize: could not check whether %s's uploads have settled "
+                         "-- claiming without waiting", session_id)
+        return []
+
+
 def sweep(conn, grace_seconds=None, idle_seconds=None, infer_idle=None, reopen=None):
     """Finalize every session on `conn` whose grace has elapsed, reusing
     finalize_claim per session (CAS-claim -> gather -> enqueue). First (when
@@ -974,6 +1076,16 @@ def sweep(conn, grace_seconds=None, idle_seconds=None, infer_idle=None, reopen=N
     revisit_active_batch_sessions()
     results = []
     for row in meeting_session.list_due_finalize(conn, grace):
+        # BEFORE the seal: sealing a partial tail turns the rest into stragglers,
+        # and the claim after it requests the extraction the email is built from.
+        # The row stays `pending_close`, so it is due again next tick and keeps
+        # count_live (and with it the sweep's pending flag) up meanwhile.
+        unsettled = _unsettled_chunks(conn, row["session_id"])
+        if unsettled:
+            logger.info("finalize: %s waits -- %d uploaded chunk(s) not through VAD "
+                        "and the batch ledger yet: %s", row["session_id"],
+                        len(unsettled), ", ".join(k.rsplit("/", 1)[-1] for k in unsettled))
+            continue
         _seal_tail_batches(row["session_id"])
         results.append(finalize_claim(
             conn, row["session_id"], row["version"],

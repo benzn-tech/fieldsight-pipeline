@@ -37,7 +37,8 @@ On either arrival it:
     off that (repositories/meeting_session.list_idle_open).
 A late resume chunk flips a `pending_close` session back to `open` + bumps
 `version`, so any stale scheduled finalize no-ops (the §8.4 idempotency guard,
-finally exercised).
+finally exercised) -- unless the close was a deliberate End, which a touch never
+undoes (see meeting_session.touch_segment).
 
 In-VPC (touches Aurora); SEPARATE from the non-VPC rolling summary (BUG-36),
 though both trigger on the same `transcripts/` arrival. Pure core takes injected
