@@ -51,12 +51,20 @@ import voice_web
 
 logger = logging.getLogger()
 
-# Per-call ceilings. Measured: classify 2.4-3.3 s; draft ~3-4 s; verify 8.8-11 s
+# Per-call ceilings. Measured: classify 2.4-3.3 s; draft ~3-4 s (tail to 12.8 s); verify 8.8-11 s
 # (the vendor aborts at ~11 s when it aborts); compose ~3 s. The whole chain is
 # further bounded by the caller-supplied budget, which comes out of
 # HARD_STOP_SECONDS (API Gateway gives up at 29 s).
 CLASSIFY_BUDGET = 8.0
-DRAFT_BUDGET = 8.0
+# The draft may stretch to DRAFT_BUDGET while VERIFY_FLOOR seconds stay for the
+# web check, and never gets less than DRAFT_FLOOR (or what is left). Prod
+# 2026-10-22: gemini-3.8-flash drafts took 2.1-12.8 s (p90 7.5 s), so a flat 8 s
+# lost three of three web turns. VERIFY_FLOOR (9 s) sits below a full verify
+# (8.8-11 s) on purpose: after a slow draft the verify may end "unverified",
+# which still delivers the draft -- raising the floor brings the lost drafts back.
+DRAFT_BUDGET = 12.0
+DRAFT_FLOOR = 8.0
+VERIFY_FLOOR = 9.0
 VERIFY_BUDGET = 14.0
 COMPOSE_BUDGET = 8.0
 # A verify retry (~9 s) is attempted only if at least this many seconds remain.
@@ -270,6 +278,12 @@ def _voiced(prompt, voice):
     return prompt + "\n\n" + voice_web.VOICE_RULES if voice else prompt
 
 
+def _draft_timeout(left):
+    """The draft's ceiling: up to DRAFT_BUDGET while VERIFY_FLOOR stays for the
+    verify, never below min(DRAFT_FLOOR, left)."""
+    return max(min(DRAFT_BUDGET, left - VERIFY_FLOOR), min(DRAFT_FLOOR, left))
+
+
 def general_answer(question, budget, *, kind="general", clock=None, voice=False):
     """Draft from the model's knowledge, verify on the web, never nothing.
 
@@ -306,7 +320,7 @@ def general_answer(question, budget, *, kind="general", clock=None, voice=False)
     t = clock()
     draft_reply = client.call(
         _voiced(DRAFT_PROMPT.format(question=question), voice),
-        timeout=min(DRAFT_BUDGET, left()), max_tokens=1024, effort="low",
+        timeout=_draft_timeout(left()), max_tokens=1024, effort="low",
         caller="web_draft")
     ms["draft"] = int((clock() - t) * 1000)
     draft = (draft_reply.text or "").strip() if draft_reply.ok else ""
