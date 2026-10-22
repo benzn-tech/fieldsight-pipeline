@@ -6,12 +6,12 @@ from repositories import sites
 from repositories.topics import _escape_like
 
 _COLS = ("id, company_id, user_id, site_id, kind, s3_key, client_uuid, started_at, "
-         "ended_at, duration_s, resolution, codec, size_bytes, gps_track, uploaded_at, created_at")
+         "ended_at, duration_s, resolution, codec, size_bytes, gps_track, uploaded_at, created_at, source")
 
 
 def insert_pending(conn, company_id, user_id, site_id, kind, s3_key, client_uuid,
                    started_at, ended_at=None, duration_s=None, resolution=None,
-                   codec=None, size_bytes=None, device_id=None) -> dict:
+                   codec=None, size_bytes=None, device_id=None, source=None) -> dict:
     """`device_id` answers "which physical unit recorded this", and until
     2026-09-06 nothing ever wrote it.
 
@@ -29,13 +29,16 @@ def insert_pending(conn, company_id, user_id, site_id, kind, s3_key, client_uuid
     NULL stays a legitimate value: the web app carries no device headers and
     `device_heartbeat.device_id` returns None for an unknown device. A
     recording whose device cannot be named is still a recording.
+
+    `source` is where the capture came from -- 'device', 'phone' (PWA) or
+    'web' -- for later analysis; NULL when nobody said (CHECK from 0089).
     """
     return conn.cursor(row_factory=dict_row).execute(
         f"INSERT INTO recordings (company_id, user_id, site_id, kind, s3_key, client_uuid, "
-        f"started_at, ended_at, duration_s, resolution, codec, size_bytes, device_id) "
-        f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING {_COLS}",
+        f"started_at, ended_at, duration_s, resolution, codec, size_bytes, device_id, source) "
+        f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING {_COLS}",
         (company_id, user_id, site_id, kind, s3_key, client_uuid,
-         started_at, ended_at, duration_s, resolution, codec, size_bytes, device_id),
+         started_at, ended_at, duration_s, resolution, codec, size_bytes, device_id, source),
     ).fetchone()
 
 

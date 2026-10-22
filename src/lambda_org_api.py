@@ -224,6 +224,9 @@ ALLOWED_OBSERVATION_STATUS = {"open", "closed"}
 ALLOWED_ACTION_STATUS = {"open", "in_progress", "blocked", "done"}
 ALLOWED_ACTION_PRIORITY = {"low", "medium", "high"}
 RECORDING_KINDS = {"video", "audio", "photo"}
+# What a client may SAY it is on /upload-url. 'device' is never claimed in the
+# body -- it is inferred from the device headers (X-Device-Tag/X-Device-Id).
+RECORDING_SOURCES = ("phone", "web")
 
 # Does `complete` check that the bytes actually reached S3 before it stamps
 # uploaded_at? Three states, not a boolean, because the two risks are not
@@ -1179,6 +1182,10 @@ def create_recording_upload_url(conn, caller, body, device_ident=None):
     kind = body.get("kind")
     if kind not in RECORDING_KINDS:
         return error(f"kind must be one of {sorted(RECORDING_KINDS)}", 400)
+    body_source = body.get("source")
+    if body_source is not None and body_source not in RECORDING_SOURCES:
+        return error(f"source must be one of {list(RECORDING_SOURCES)}", 400)
+    source = body_source or ("device" if device_ident else None)
     client_uuid = body.get("clientUuid")
     file_name = body.get("fileName")
     content_type = body.get("contentType")
@@ -1228,6 +1235,7 @@ def create_recording_upload_url(conn, caller, body, device_ident=None):
                     resolution=body.get("resolution"), codec=body.get("codec"),
                     size_bytes=body.get("sizeBytes"),
                     device_id=recording_device_id,
+                    source=source,
                 )
             rec_id = row["id"]
         except UniqueViolation:
