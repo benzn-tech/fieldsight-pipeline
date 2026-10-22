@@ -342,6 +342,159 @@ def _window_terms(query):
     return out
 
 
+# A unit longer than the room is cut by characters; each cut end moves to the nearest
+# space within this many characters, else it is a hard cut (CJK has no spaces).
+SNAP_CHARS = 40
+_ELLIPSIS = "…"
+# `session_index._window_line`: `[HH:MM:SS] speaker: text`. Kept on a cut turn.
+_TURN_PREFIX = re.compile(r"\[\d\d:\d\d:\d\d\] [^:\n]{1,60}: ")
+_TURN_TIME = re.compile(r"\[(\d\d:\d\d:\d\d)\]")
+
+
+def _unit_score(unit, terms):
+    """(distinct terms found, total occurrences) in one unit, by lowercase substring."""
+    low = unit.lower()
+    found = frozenset(t for t in terms if t in low)
+    return found, sum(low.count(t) for t in found)
+
+
+def _cut(unit, terms, budget, keep_prefix):
+    """`unit` cut to <= `budget` characters around its earliest term hit (the start
+    when none hits). A transcript turn keeps its `[HH:MM:SS] spk: ` prefix. Each cut
+    end moves inward to a space within SNAP_CHARS, never past the hit, and is marked
+    with an inline `…`."""
+    budget = max(budget, 0)
+    if len(unit) <= budget:
+        return unit
+    prefix = ""
+    m = _TURN_PREFIX.match(unit) if keep_prefix else None
+    if m and len(m.group(0)) <= budget // 2:
+        prefix = m.group(0)
+    body = unit[len(prefix):]
+    avail = budget - len(prefix) - 2 * len(_ELLIPSIS)
+    if avail <= 0:
+        return unit[:budget]
+    pos, hl = 0, 0
+    for t in terms:
+        # On the original text, not an offset into body.lower(): lower() can change
+        # a string's length (review NIT 1).
+        hit = re.search(re.escape(t), body, re.IGNORECASE)
+        if hit and (not hl or hit.start() < pos):
+            pos, hl = hit.start(), len(hit.group(0))
+    start = max(0, min(pos + hl // 2 - avail // 2, len(body) - avail))
+    end = min(len(body), start + avail)
+    if start > 0 and body[start - 1] != " ":
+        sp = body.find(" ", start, start + SNAP_CHARS)
+        if sp != -1 and sp + 1 <= pos:
+            start = sp + 1
+    if end < len(body) and body[end] != " ":
+        sp = body.rfind(" ", max(start, end - SNAP_CHARS), end)
+        if sp != -1 and sp >= pos + hl:
+            end = sp
+    piece = body[start:end]
+    if start > 0:
+        piece = _ELLIPSIS + piece.lstrip(" ")
+    if end < len(body):
+        piece = piece.rstrip(" ") + _ELLIPSIS
+    return prefix + piece
+
+
+def _window(text, terms, cap, sep="\n", keep_first=False):
+    """The part of `text` an item shows: (shown, first_unit_index, mode).
+
+    Spec 2026-10-22-ask-tools-item-window §4-§5, review BLOCKER 1. `mode` is
+    "whole" (text <= cap, returned unchanged), "window" (centred on the terms) or
+    "head" (no term hits: today's head rule, on whole units). `first_unit_index` is
+    the index in text.split(sep) of the first unit shown after skipped ones (0 when
+    nothing above was skipped): `_item` reads a turn's time from it.
+
+        units = text.split(sep)            -- never splitlines(): `\\r` stays on its unit
+        keep_first: units[0] always shown (topic/digest header), the rest is the body
+        score(unit) = (terms found, occurrences), lowercase substring
+        candidates: every run body[i..j] whose joined length plus markers fits, and
+                    every single unit too long to fit even alone
+        best = max by (distinct terms, occurrences, fewest units, earliest start)
+        an oversize best: cut by characters around its first hit (_cut)
+        a run best: extended by the unit before, then after, alternately, while it
+                    fits; a side that does not fit stops, the other is still tried
+        markers: a `…` unit before the run when units above were skipped, after it
+                 when units below were; they count against `cap`
+
+    "Fewest units" before "earliest" picks the tightest run around the hits, so the
+    extension centres it; otherwise a lone hit lands at the bottom edge of the run.
+    """
+    if len(text) <= cap:
+        return text, 0, "whole"
+    units = text.split(sep)
+    mark = len(_ELLIPSIS) + len(sep)
+    head = []
+    if keep_first and len(units) > 1 and len(units[0]) + len(sep) <= cap // 2:
+        head = units[:1]
+    room = cap - (len(head[0]) + len(sep) if head else 0)
+    body = units[len(head):]
+    n = len(body)
+    acc = [0]
+    for u in body:
+        acc.append(acc[-1] + len(u))
+
+    def cost(i, j):
+        return (acc[j + 1] - acc[i] + (j - i) * len(sep)
+                + (mark if i > 0 else 0) + (mark if j < n - 1 else 0))
+
+    def shown(parts, i, j):
+        return sep.join(head + ([_ELLIPSIS] if i > 0 else []) + parts
+                        + ([_ELLIPSIS] if j < n - 1 else []))
+
+    def first(i):
+        return i + len(head) if i > 0 else 0
+
+    keep_prefix = sep == "\n"
+    scores = [_unit_score(u, terms) for u in body]
+    if not any(found for found, _ in scores):
+        j = -1
+        while j + 1 < n and cost(0, j + 1) <= room:
+            j += 1
+        if j < 0:                                       # the first unit alone is too long
+            budget = room - cost(0, 0) + len(body[0])
+            return shown([_cut(body[0], (), budget, keep_prefix)], 0, 0), 0, "head"
+        return shown(body[:j + 1], 0, j), 0, "head"
+
+    best = None
+    for i in range(n):
+        if cost(i, i) > room:
+            key = (len(scores[i][0]), scores[i][1], 0, -i)
+            if best is None or key > best[0]:
+                best = (key, i, None)
+            continue
+        found, hits = set(), 0
+        for j in range(i, n):
+            if cost(i, j) > room:
+                break
+            found |= scores[j][0]
+            hits += scores[j][1]
+            key = (len(found), hits, -(j - i), -i)
+            if best is None or key > best[0]:
+                best = (key, i, j)
+    _, i, j = best
+    if j is None:                                       # one oversize unit
+        budget = room - cost(i, i) + len(body[i])
+        return shown([_cut(body[i], terms, budget, keep_prefix)], i, i), first(i), "window"
+    prev_open, next_open, turn = True, True, 0
+    while prev_open or next_open:
+        if turn == 0 and prev_open:
+            if i > 0 and cost(i - 1, j) <= room:
+                i -= 1
+            else:
+                prev_open = False
+        elif turn == 1 and next_open:
+            if j < n - 1 and cost(i, j + 1) <= room:
+                j += 1
+            else:
+                next_open = False
+        turn ^= 1
+    return shown(body[i:j + 1], i, j), first(i), "window"
+
+
 def _metric_text(metric, row):
     """`duration=5400 seconds`, `count_photos=0 (no_rows_for_that_day)`."""
     value = row.get("value")
