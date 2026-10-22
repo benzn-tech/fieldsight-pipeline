@@ -121,11 +121,12 @@ def score_turn(item, rec, route, result):
             out["lost_at"] = "dispatcher_dropped"
         elif first_false == "item":
             # The row reached ask_tools; its own item exists but no longer carries the
-            # words: they were past MAX_TEXT. No item at all: the post-search k cut or
-            # the 10k result budget.
+            # words: they were past the item's text cap (the 600 head, or outside the
+            # item window since 2026-10-22). No item at all: the post-search k cut or
+            # the result budget.
             ids = {_item_id(it) for it in items}
             capped = any(str(r.get("id")) in ids for _, r in hit_rows)
-            out["lost_at"] = "cut_600_cap" if capped else "cut_post_search"
+            out["lost_at"] = "cut_text_cap" if capped else "cut_post_search"
         elif first_false == "seen":
             out["lost_at"] = "cut_render_budget"
         elif first_false == "final_view":

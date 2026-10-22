@@ -35,8 +35,8 @@ For `rendered` matching, split tool messages into item lines (`_item_line` :197 
 `sanitize` (:56) collapses whitespace; patterns are word-level so this is accepted.
 
 Derived per question: `lost_at` = first stage that is false: `never_retrieved` (rows),
-`cut_post_search` / `cut_600_cap` (in a row's `chunk_text` but not its item text: the cap,
-detectable by matching the row past char 600), `cut_render_budget` (item but not seen),
+`cut_post_search` / `cut_text_cap` (in a row's `chunk_text` but not its item text: the cap,
+detectable by matching the row past char 600; named `cut_600_cap` before 2026-10-22), `cut_render_budget` (item but not seen),
 `seen_not_cited`. Controls (`expect: unanswerable`): record `grounded`, `basis`, `citations`
 count; report "control answered with citations" as the false-answer count.
 

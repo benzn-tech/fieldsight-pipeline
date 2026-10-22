@@ -98,3 +98,13 @@ def test_diff_reports_majority_changes():
     d = report.diff(a, b)
     assert d["cited"] == {"q1": [True, False]}
     assert d["seen"] == {"q1": [True, False]}
+    assert "label_note" not in d
+
+
+def test_diff_notes_the_cut_text_cap_rename():
+    fp = {"model_chain": ["m1"]}
+    old = turn("q1", stages=ALL_TRUE, lost_at="cut_600_cap")
+    a = {"fingerprint": fp, "runs": [{"turns": [old]}]}
+    new = turn("q1", stages=ALL_TRUE, lost_at="cut_text_cap")
+    b = {"fingerprint": fp, "runs": [{"turns": [new]}]}
+    assert "cut_text_cap" in report.diff(a, b)["label_note"]

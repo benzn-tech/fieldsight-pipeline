@@ -178,7 +178,7 @@ Files: `askv2/funnel.py`, `tests/askv2/test_funnel.py`.
   whose `_item_line` date field is the gold date and whose text matches), `final_view` (last
   request only), `cited` (refs from `ask_orchestrator._cited_card_refs(final_answer.answer,
   shown)` mapped to items, reuse not re-spell). `lost_at` = first false stage, with
-  `cut_600_cap` detected by matching the row's `chunk_text` past char 600,
+  `cut_text_cap` (was `cut_600_cap` until 2026-10-22) detected by matching the row's `chunk_text` past char 600,
   `dispatcher_dropped` (sql true, rows false), `cut_render_budget` (item true, seen false),
   `seen_not_cited`. Round-1 vs judge-round split for `rows` (round 1 is deterministic).
 - Turn status: `invalid` (adapter error), `fallback` (`route.fallback is not None`),

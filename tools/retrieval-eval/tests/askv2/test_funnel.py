@@ -84,10 +84,10 @@ def test_alias_normalised_row_counts_at_sql_not_rows():
     assert s["lost_at"] == "dispatcher_dropped"
 
 
-def test_600_cap():
+def test_text_cap():
     rec = record(sql=[chunk_row("c1", LONG)], rows=[chunk_row("c1", LONG)],
                  envs=[env([chunk_item("R1", "c1", LONG)])])
-    assert funnel.score_turn(ITEM, rec, ROUTE, {})["lost_at"] == "cut_600_cap"
+    assert funnel.score_turn(ITEM, rec, ROUTE, {})["lost_at"] == "cut_text_cap"
 
 
 def test_post_search_cut():

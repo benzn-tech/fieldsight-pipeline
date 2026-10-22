@@ -123,4 +123,8 @@ def diff(a, b):
         mb = majority([r["turns"] for r in b["runs"]], stage)
         out[stage] = {q: [ma.get(q), mb.get(q)] for q in sorted(set(ma) | set(mb))
                       if ma.get(q) != mb.get(q)}
+    if any(t["funnel"].get("lost_at") == "cut_600_cap"
+           for f in (a, b) for r in f["runs"] for t in r["turns"]):
+        out["label_note"] = ("cut_600_cap was renamed cut_text_cap on 2026-10-22 "
+                             "(the item window): the same stage, compare them as one")
     return out
