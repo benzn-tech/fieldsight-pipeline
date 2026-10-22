@@ -40,6 +40,12 @@ def _patterns(item):
     return [re.compile(p, re.I) for ev in item.get("evidence", []) for p in ev["match_any"]]
 
 
+def hit(pats, day, text, date):
+    """The evidence rule: on the gold day and any pattern matches (shared with
+    replay_window.py, which must not re-spell it)."""
+    return str(date or "")[:10] == day and any(p.search(text or "") for p in pats)
+
+
 def _row_text(row):
     """The record text a row carries: a chunk's text, or a topic's title + summary."""
     if "chunk_text" in row:
@@ -70,6 +76,9 @@ def _tool_lines(messages):
     return out
 
 
+_hit = hit
+
+
 def score_turn(item, rec, route, result):
     """One turn's funnel (spec §1, review S1/S2/S10/N6). `rec` is a harness.TurnRecord,
     `route` the turn's ASK_ROUTE dict, `result` what `answer()` returned."""
@@ -80,7 +89,7 @@ def score_turn(item, rec, route, result):
     day = item.get("date")
 
     def hit(text, date):
-        return str(date or "")[:10] == day and any(p.search(text or "") for p in pats)
+        return _hit(pats, day, text, date)
 
     envelopes = [e for b in rec.batches for e in (b.get("envelopes") or [])]
     items = [it for e in envelopes for it in e.get("items") or []
