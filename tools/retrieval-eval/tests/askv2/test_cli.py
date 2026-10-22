@@ -8,7 +8,8 @@ import run_ask_v2
 GOLD = str(Path(__file__).resolve().parents[2] / "gold" / "v1.1.jsonl")
 
 
-def test_full_run_needs_yes_and_caps():
+def test_full_run_needs_yes_and_caps(monkeypatch):
+    monkeypatch.delenv("EVAL_SRC_REF", raising=False)     # the default, not the test run's ref
     with pytest.raises(SystemExit, match="--yes"):
         run_ask_v2.parse_args(["--gold", GOLD, "--label", "x", "--family", "report"])
     with pytest.raises(SystemExit, match="--max-judge-calls"):
