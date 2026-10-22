@@ -27,7 +27,8 @@ import time
 import nz_time
 import sweep_state
 from lake_put import lake_put
-from repositories import meeting_session, users, sites
+import photo_pins
+from repositories import meeting_session, recordings, users, sites, topics
 import session_scope
 
 logger = logging.getLogger()
@@ -142,12 +143,14 @@ PREWARM_NZ_MINUTES = (45, 46)
 
 
 def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_rolling,
-                   request_extraction=None):
+                   request_extraction=None, place_voice_note=None):
     """CAS-claim the session at expected_version and ask for its final extraction.
     Returns a small status dict:
       noop         — claim failed (a resume bumped version, or it already moved on)
       no_recipient — claimed but the recorder has no email (session marked failed)
       waiting      — claimed; the confirmation email waits for the final extraction
+      voice_note   — a voice note (M2 Task 7): settled `sent` here, no email ever;
+                     place_voice_note(conn, row, ctx) writes its placeholder topic
 
     THE EMAIL IS NO LONGER ENQUEUED HERE. It used to be, in the same breath as
     requesting the extraction -- so it went out before that extraction existed
@@ -187,6 +190,21 @@ def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_
             logger.exception("finalize: could not request final extraction for %s",
                              session_id)
 
+    # A voice note never sends a stop email (owner, M2), so it settles here -- before
+    # the recipient check, so a recorder with no email on file is not marked failed.
+    # Its final extraction was still requested above; until it lands the note is on
+    # the timeline as a placeholder topic with its claimed photos pinned under it.
+    if row.get("session_type") == "voice_note":
+        if place_voice_note:
+            try:
+                place_voice_note(conn, row, ctx)
+            except Exception:
+                logger.exception("finalize: could not place voice note %s on the timeline",
+                                 session_id)
+        meeting_session.mark_sent(conn, session_id)
+        logger.info("finalize: voice note %s settled without an email", session_id)
+        return {"status": "voice_note", "sessionId": session_id}
+
     recipient = (ctx.get("recipient") or "").strip()
     if not recipient:
         # Named so prod ops can see WHICH recorder has no email on file (a
@@ -221,6 +239,12 @@ def backstop(conn, *, list_waiting, resolve_context, read_rolling, enqueue, now=
     now = now or datetime.now(timezone.utc)
     mailed = []
     for row in list_waiting(conn):
+        if row.get("session_type") == "voice_note":
+            # Never mailed (M2 Task 7). The claim settles a voice note at once, so one
+            # here was claimed by an older sweep; it waits for reconcile, not an email.
+            logger.info("finalize: %s is a voice note -- the backstop sends no email",
+                        row.get("session_id"))
+            continue
         anchor = row.get("finalizing_at")
         if anchor is None:
             continue
@@ -314,6 +338,43 @@ def _resolve_context(conn, row):
     time_range = _time_range(opened_nz, closed_nz, session_id=row.get("session_id"))
     return {"recipient": user.get("email"), "folder": user.get("folder_name"),
             "date": date, "siteName": site_name, "timeRange": time_range}
+
+
+def _place_voice_note(conn, row, ctx):
+    """Put a claimed voice note on the timeline before its extraction exists: a
+    "Voice note HH:MM" placeholder under the note's own extraction key (the key
+    item-writer supersedes when the real extraction lands), then pin the note's
+    claimed photos under it. Returns the new topic, or None when nothing was written.
+
+    Site (plan decision 7): the note's own `meeting_session.site_id`, else the day's
+    app-tagged site; with neither there is no placeholder (topics.site_id is NOT
+    NULL) and the note gets a topic only if its extraction produces one."""
+    sid = row["session_id"]
+    folder, date = ctx.get("folder"), ctx.get("date")
+    if not folder or not date:
+        logger.warning("finalize: voice note %s has no folder/date -- no placeholder", sid)
+        return None
+    site_id = row.get("site_id")
+    if not site_id:
+        site = recordings.site_for_day(conn, row["user_id"], folder, date)
+        site_id = (site or {}).get("id")
+    if not site_id:
+        logger.warning("finalize: voice note %s has no site and %s/%s has no day site -- "
+                       "no placeholder topic", sid, folder, date)
+        return None
+    opened_nz = _to_nz(row.get("opened_at"))
+    closed_nz = _to_nz(row.get("closed_at")) or opened_nz
+    if opened_nz is None:
+        logger.warning("finalize: voice note %s has no opened_at -- no placeholder", sid)
+        return None
+    start, end = opened_nz.strftime("%H:%M"), closed_nz.strftime("%H:%M")
+    topic = topics.ensure_placeholder_topic(
+        conn, site_id, date, f"Voice note {start}",
+        user_id=row.get("user_id"),
+        source_s3_key=f"extractions/{folder}/{date}/sid{sid}.json",
+        time_range=f"{start} - {end}")
+    photo_pins.apply_voice_note_pins(conn, folder, date)
+    return topic
 
 
 def _read_rolling(folder, date, session_id):
@@ -899,7 +960,7 @@ def sweep(conn, grace_seconds=None, idle_seconds=None, infer_idle=None, reopen=N
         results.append(finalize_claim(
             conn, row["session_id"], row["version"],
             resolve_context=_resolve_context, read_rolling=_read_rolling,
-            request_extraction=_request_extraction))
+            request_extraction=_request_extraction, place_voice_note=_place_voice_note))
     return results
 
 

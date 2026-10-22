@@ -1249,7 +1249,9 @@ def test_recordings_tag_still_overrides_meeting_session(wired):
     seen = _capture_topic_site(wired)
     iw.write_extraction_items("2026-07-28", "Ben_UCPK", CHUNK_EXTRACTION_KEY)
     assert seen and all(s == "site-TAG" for s in seen)
-    assert called == []                             # short-circuited before meeting_session
+    # One read only: the voice-note check (M2 Task 7). The site ladder short-circuited
+    # before its own meeting_session rung, which would have been a second read.
+    assert called == [1]
 
 
 def test_cross_tenant_meeting_session_site_is_rejected(wired):

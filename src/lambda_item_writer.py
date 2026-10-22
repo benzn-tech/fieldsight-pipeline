@@ -57,6 +57,7 @@ import json
 import todo_collapse
 import logging
 import os
+import re
 from urllib.parse import unquote_plus
 
 import boto3
@@ -401,6 +402,11 @@ def _final_email_context(conn, session_base, extraction, date, follow_up=False):
     if not sid:
         return None                      # a whole-file base, not a device session
     row = meeting_session.get(conn, sid)
+    if (row or {}).get("session_type") == "voice_note":
+        # A voice note never sends a stop email (owner, M2 Task 7) -- on either arm:
+        # the claim settled it without one, so there is nobody waiting for notes.
+        logger.info("session %s: voice note -- no email", sid)
+        return None
     status = (row or {}).get("status")
     # A FOLLOW-UP is the notes email owed to a recorder who was told (extraction_pending,
     # spec D5) that their notes were delayed. By then the session is settled, so the
@@ -434,6 +440,31 @@ def _final_email_context(conn, session_base, extraction, date, follow_up=False):
             # Withholding would send them down the backstop, which quotes the
             # OTHER summariser -- the disagreement this whole change removes.
             "openTodos": _final_email_rows(extraction, date) + _topic_rows(extraction)}
+
+
+_CLOCK_RE = re.compile(r"\d{1,2}:\d{2}")
+
+
+def _merge_voice_note_topics(extraction_topics):
+    """A voice note is ONE topic on the timeline (plan decision 9): several
+    extracted topics become one -- the first topic's title (and other fields),
+    summaries joined with a space, action items / decisions / questions (and
+    findings, so a safety finding is never dropped) concatenated, and the time
+    range from the first start to the last end. Zero or one topic is returned as
+    given."""
+    if len(extraction_topics) <= 1:
+        return list(extraction_topics)
+    merged = dict(extraction_topics[0])
+    merged["summary"] = " ".join(
+        (t.get("summary") or "").strip() for t in extraction_topics
+        if (t.get("summary") or "").strip())
+    for field in ("action_items", "decisions", "questions", "findings"):
+        merged[field] = [x for t in extraction_topics for x in (t.get(field) or [])]
+    clocks = [_CLOCK_RE.findall(t.get("time_range") or "") for t in extraction_topics]
+    clocks = [c for c in clocks if c]
+    if clocks:
+        merged["time_range"] = f"{clocks[0][0]} - {clocks[-1][-1]}"
+    return [merged]
 
 
 def email_checks(stored, topics=None):
@@ -1158,6 +1189,9 @@ def write_extraction_items(date, user_folder, extraction_key):
         # All explicit tags are recorder-scoped (membership on the site, or the
         # recorder's own company's site); fall through only on no match.
         session_base = _parse_extraction_key(extraction_key)[2]
+        voice_sid = _device_session_id(session_base)
+        is_voice_note = bool(voice_sid) and (
+            meeting_session.get(conn, voice_sid) or {}).get("session_type") == "voice_note"
 
         # A member whose group has already merged must not re-publish its own
         # topics: that reintroduces the duplicate the merge removed. Checked
@@ -1207,6 +1241,16 @@ def write_extraction_items(date, user_folder, extraction_key):
         if _source_is_deleted(conn, extraction_key):
             logger.info("%s: source is deleted — writing no topics", extraction_key)
             return {"skipped": "source_deleted", "key": extraction_key}
+
+        # A voice note is exactly one topic (M2 Task 7, plan decision 9). With none
+        # extracted, the claim's "Voice note HH:MM" placeholder stays: nothing is
+        # superseded and nothing written. Otherwise the topics merge into one, in the
+        # ARTIFACT, so every reader below (records, index, matcher) sees what Aurora gets.
+        if is_voice_note:
+            if not extraction.get("topics"):
+                logger.info("%s: voice note with no topics -- placeholder kept", extraction_key)
+                return {"skipped": True, "reason": "voice note: no topics, placeholder kept"}
+            extraction["topics"] = _merge_voice_note_topics(extraction["topics"])
 
         # Source-key idempotency (Phase 4a pattern): supersede this extraction's prior rows
         # (Track B Task 3) before re-inserting -- an UPDATE that stamps superseded_at /
