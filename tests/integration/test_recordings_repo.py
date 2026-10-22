@@ -36,17 +36,17 @@ def test_null_site_allowed(db):
     assert row["site_id"] is None and row["kind"] == "photo"
 
 
-def test_mark_uploaded_company_guarded(db):
+def test_mark_uploaded_recorder_guarded(db):
     co, u, s = _seed(db)
-    other = companies.create_company(db, "Other")
+    other = users.upsert_user(db, "sub-rec-other", "o@acme.com", company_id=co["id"])
     row = recordings.insert_pending(
         db, company_id=co["id"], user_id=u["id"], site_id=None, kind="audio",
         s3_key="users/r/audio/2026-07-13/z.wav", client_uuid="cap-3",
         started_at="2026-07-13T16:06:00Z", ended_at=None, duration_s=None,
         resolution=None, codec=None, size_bytes=None,
     )
-    assert recordings.mark_uploaded(db, row["id"], other["id"], 999) is None, "wrong company must not update"
-    done = recordings.mark_uploaded(db, row["id"], co["id"], 12345)
+    assert recordings.mark_uploaded(db, row["id"], other["id"], 999) is None, "another user must not update"
+    done = recordings.mark_uploaded(db, row["id"], u["id"], 12345)
     assert done["uploaded_at"] is not None and done["size_bytes"] == 12345
 
 
@@ -62,7 +62,7 @@ def test_mark_uploaded_persists_gps_track(db):
 
     track = [{"t": 1752421200000, "lat": -36.8485, "lon": 174.7633},
              {"t": 1752421205000, "lat": -36.8486, "lon": 174.7634}]
-    done = recordings.mark_uploaded(db, row["id"], co["id"], 4096, track)
+    done = recordings.mark_uploaded(db, row["id"], u["id"], 4096, track)
     assert done["gps_track"] == track
 
     fetched = recordings.get_by_id(db, row["id"])
@@ -70,7 +70,7 @@ def test_mark_uploaded_persists_gps_track(db):
 
     # A later call omitting gps_track (None) must not wipe the stored value —
     # COALESCE(%s, gps_track) keeps the existing track, mirroring size_bytes.
-    kept = recordings.mark_uploaded(db, row["id"], co["id"], None, None)
+    kept = recordings.mark_uploaded(db, row["id"], u["id"], None, None)
     assert kept["gps_track"] == track
 
 
