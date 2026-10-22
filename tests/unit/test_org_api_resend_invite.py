@@ -3,7 +3,8 @@
 Some invitees never receive the first email (the pool sends from Cognito's
 default address, which corporate mail filters quarantine). The endpoint re-sends
 it while the login is still FORCE_CHANGE_PASSWORD, and refuses with a clear
-message once the person has set a password. Authorization mirrors POST /members.
+message once the person has set a password. Authorization mirrors POST /members
+(admin, gm, platform_admin).
 """
 import json
 
@@ -139,12 +140,31 @@ def test_race_unsupported_state_is_409(env):
     assert body["user_status"] == "CONFIRMED"
 
 
-@pytest.mark.parametrize("role", ["gm", "pm", "site_manager", "worker"])
-def test_non_admin_is_403(env, role):
+@pytest.mark.parametrize("role", ["regional_manager", "pm", "site_manager", "worker"])
+def test_non_inviter_is_403(env, role):
     people, fake = env
     people["sub-1"]["global_role"] = role
     status, _ = call()
     assert status == 403
+    assert fake.got == [] and fake.created == []
+
+
+def test_gm_resends_for_own_company_member(env):
+    # Owner decision 2026-10-22: a gm may resend, with the admin's company rule.
+    people, fake = env
+    people["sub-1"]["global_role"] = "gm"
+    status, body = call()
+    assert status == 200
+    assert body["resent"] is True
+    assert len(fake.created) == 1
+
+
+def test_other_company_target_is_404_for_gm(env):
+    people, fake = env
+    people["sub-1"]["global_role"] = "gm"
+    people["sub-2"]["company_id"] = "c-other"
+    status, _ = call()
+    assert status == 404
     assert fake.got == [] and fake.created == []
 
 
