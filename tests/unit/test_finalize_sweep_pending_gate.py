@@ -204,7 +204,12 @@ def test_count_live_sql_excludes_open_sessions_with_no_activity_anchor():
     c = _Conn()
     ms.count_live(c)
     sql = c.cur.sql
-    assert "COALESCE(last_segment_at, opened_at) IS NOT NULL" in sql, (
+    # Same anchor list_idle_open closes on; its CASE keeps a row with neither
+    # last_segment_at nor opened_at NULL (GREATEST would otherwise fall back to
+    # the always-set created_at). Proven on a real row in
+    # tests/integration/test_idle_close_sql.py.
+    assert f"{ms._IDLE_ANCHOR} IS NOT NULL" in sql, (
         "count_live must ignore open sessions the sweep can never close")
+    assert "CASE WHEN opened_at IS NOT NULL" in ms._IDLE_ANCHOR
     # pending_close / finalizing stay unconditional — they are always actionable.
     assert "'pending_close', 'finalizing'" in sql
