@@ -291,22 +291,39 @@ def list_due_finalize(conn, idle_grace_seconds) -> list[dict]:
     ).fetchall()
 
 
+# A session's idle anchor, in SERVER time. `last_segment_at` once any chunk has
+# touched the row. Before that, the later of `opened_at` and `created_at`:
+# `opened_at` is the body's startedAt (device time), and a phone that queued
+# /open offline delivers it an hour or more after recording started, so
+# `opened_at` alone would idle-close the session on the next tick, before its
+# first chunk lands. `created_at` (server now() at insert) bounds that.
+# GREATEST ignores NULLs, so the CASE keeps a row with neither `opened_at` nor
+# `last_segment_at` anchorless (NULL) -- excluded, exactly as before (count_live).
+_IDLE_ANCHOR = (
+    "COALESCE(last_segment_at, "
+    "CASE WHEN opened_at IS NOT NULL THEN GREATEST(opened_at, created_at) END)"
+)
+
+
 def list_idle_open(conn, idle_seconds) -> list[dict]:
-    """Sessions still `open` whose last activity — `last_segment_at` (server time,
-    advanced by touch_segment on every chunk), or `opened_at` if no chunk has
-    touched yet — is older than `idle_seconds`. The device stopped (or crashed)
-    without a `/close`, so the server INFERS close (spec §8.4: "if close is
-    missing, infer close when the session sees no new chunk for
-    SESSION_GAP_MINUTES"). Returns [{session_id, version, last_activity}] — the
-    sweep mark_pending_close's each at `last_activity` with intent 'idle'. Keys on
+    """Sessions still `open` whose last activity (_IDLE_ANCHOR: `last_segment_at`,
+    server time, advanced by touch_segment on every chunk; or, before any chunk,
+    the later of `opened_at` and the row's server `created_at`) is older than
+    `idle_seconds`. The device stopped (or crashed) without a `/close`, so the
+    server INFERS close (spec §8.4: "if close is missing, infer close when the
+    session sees no new chunk for SESSION_GAP_MINUTES" -- IDLE_CLOSE_MINUTES
+    here). Returns [{session_id, version, last_activity}] — the sweep
+    mark_pending_close's each at `last_activity` with intent 'idle'. Keys on
     `last_segment_at`, never `opened_at` alone, so a long ACTIVE meeting (chunks
-    still arriving) is never mistaken for idle. A row whose activity time is NULL
-    (never opened with a timestamp) is excluded — nothing to anchor a close on."""
+    still arriving) is never mistaken for idle, and a late `/open` (queued
+    offline, startedAt hours old) is not closed before its first chunk. A row
+    with neither `last_segment_at` nor `opened_at` is excluded — nothing to
+    anchor a close on."""
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT session_id, version, "
-        "COALESCE(last_segment_at, opened_at) AS last_activity "
+        f"{_IDLE_ANCHOR} AS last_activity "
         "FROM meeting_session WHERE status = 'open' "
-        "AND COALESCE(last_segment_at, opened_at) <= now() - make_interval(secs => %s)",
+        f"AND {_IDLE_ANCHOR} <= now() - make_interval(secs => %s)",
         (idle_seconds,),
     ).fetchall()
 
@@ -373,7 +390,8 @@ def count_live(conn) -> int:
 
     `pending_close` (waiting out its grace) and `finalizing` (claimed, awaiting
     the send worker) always count. An `open` session counts only if it has an
-    activity anchor -- COALESCE(last_segment_at, opened_at) -- because that is
+    activity anchor -- _IDLE_ANCHOR, non-NULL iff last_segment_at or opened_at
+    is set -- because that is
     exactly the condition list_idle_open requires to infer a close. An `open` row
     with neither timestamp can never be closed by the sweep no matter how long it
     waits, so counting it as live would pin the pending flag on FOREVER and the
@@ -395,7 +413,7 @@ def count_live(conn) -> int:
         "SELECT count(*) AS n FROM meeting_session "
         "WHERE status IN ('pending_close', 'finalizing') "
         "   OR (status = 'open' "
-        "       AND COALESCE(last_segment_at, opened_at) IS NOT NULL)",
+        f"       AND {_IDLE_ANCHOR} IS NOT NULL)",
     ).fetchone()["n"]
 
 

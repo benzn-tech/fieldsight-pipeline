@@ -82,7 +82,8 @@ IDLE_CLOSE_MINUTES = int(os.environ.get("IDLE_CLOSE_MINUTES", "60"))
 IDLE_CLOSE_SECONDS = IDLE_CLOSE_MINUTES * 60
 # Gated OFF until SessionActivityFunction is live to keep last_segment_at fresh:
 # without per-chunk touch, a still-active /open session (last_segment_at NULL ->
-# COALESCE falls back to opened_at) would be closed prematurely. Flipped on WITH
+# the anchor falls back to opened_at / created_at, see
+# meeting_session._IDLE_ANCHOR) would be closed prematurely. Flipped on WITH
 # that lambda's deploy.
 INFER_IDLE_CLOSE = os.environ.get("INFER_IDLE_CLOSE", "false").lower() == "true"
 # Owner decision (M2): chunks that arrive after a session was idle-closed and
