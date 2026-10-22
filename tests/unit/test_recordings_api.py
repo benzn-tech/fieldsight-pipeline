@@ -190,16 +190,16 @@ def test_complete_marks_uploaded(wired):
     mp, fake = wired
     seen = {}
     mp.setattr(org.recordings, "mark_uploaded",
-               lambda c, rid, cid, sz=None, gps_track=None: seen.update(
-                   rid=rid, cid=cid, sz=sz, gps_track=gps_track) or
+               lambda c, rid, uid, sz=None, gps_track=None: seen.update(
+                   rid=rid, uid=uid, sz=sz, gps_track=gps_track) or
                {"id": rid, "uploaded_at": "2026-07-13T16:10:00Z", "size_bytes": sz})
     res = org.lambda_handler(make_event("POST", "/api/org/recordings/rec-1/complete",
                                         body={"sizeBytes": 12345}), None)
     assert res["statusCode"] == 200 and body_of(res)["ok"] is True
-    assert seen == {"rid": "rec-1", "cid": "c-1", "sz": 12345, "gps_track": None}
+    assert seen == {"rid": "rec-1", "uid": "u-1", "sz": 12345, "gps_track": None}
 
 
-def test_complete_unknown_or_wrong_company_404(wired):
+def test_complete_unknown_or_wrong_recorder_404(wired):
     mp, fake = wired
     mp.setattr(org.recordings, "mark_uploaded", lambda c, rid, cid, sz=None, gps_track=None: None)
     res = org.lambda_handler(make_event("POST", "/api/org/recordings/rec-x/complete",
