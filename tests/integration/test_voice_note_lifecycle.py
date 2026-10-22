@@ -135,6 +135,18 @@ def test_placeholder_is_idempotent(db):
     assert len(_visible(db, w["key"])) == 1
 
 
+def test_a_failing_placement_still_settles_the_note(db):
+    """Best effort for real: a SQL error while placing the note must not abort the
+    sweep's transaction (it runs in a savepoint), so the note still settles."""
+    w = _world(db)
+    out = fc.finalize_claim(
+        db, w["sid"], 3, resolve_context=fc._resolve_context, read_rolling=lambda *a: {},
+        request_extraction=lambda *a, **k: None,
+        place_voice_note=lambda c, r, x: c.execute("SELECT 1/0"))
+    assert out == {"status": "voice_note", "sessionId": w["sid"]}
+    assert meeting_session.get(db, w["sid"])["status"] == "sent"
+
+
 def test_backstop_never_mails_a_voice_note(db):
     w = _world(db)
     db.execute("UPDATE meeting_session SET status='finalizing', finalizing_at=%s "

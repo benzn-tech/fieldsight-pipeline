@@ -197,7 +197,11 @@ def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_
     if row.get("session_type") == "voice_note":
         if place_voice_note:
             try:
-                place_voice_note(conn, row, ctx)
+                # A savepoint, not a bare try/except (Ruling R10): a SQL error here
+                # aborts the transaction, and the mark_sent below -- and every other
+                # session in this tick -- would fail with it, once a minute, forever.
+                with conn.transaction():
+                    place_voice_note(conn, row, ctx)
             except Exception:
                 logger.exception("finalize: could not place voice note %s on the timeline",
                                  session_id)
