@@ -164,3 +164,83 @@ def test_out_must_not_point_into_results(tmp_path):
         replay_window.parse_args(["--rows", "r.json", "--gold", "g.jsonl", "--src-ref", "x",
                                   "--family", "session",
                                   "--out", str(replay_window.HERE / "results" / "r.json")])
+
+
+# --- --dump-envelopes ---------------------------------------------------------
+
+def _dup_dump():
+    """q-dup: round 1 search_records [ev, shared]; round 2 latest_activity [shared, other]
+    (`shared` comes back byte-identical: same row, same ref) plus a 30-row search. q-win
+    is a single-call turn."""
+    ev = _row("c-ev", "the engineer signed off the pour")
+    shared = _row("c-shared", "the scaffold inspection is on Friday")
+    other = _row("c-other", "the rest of the plan")
+    big = [_row(f"c-big{i}", _transcript(40, {}) + f" {i}") for i in range(30)]
+    dup = _turn("q-big", [(0, [("search_records", {"query": "engineer pour"}, [ev, shared],
+                                ["c-ev", "c-shared"])]),
+                          (1, [("latest_activity", {}, [shared, other],
+                                ["c-shared", "c-other"]),
+                               ("search_records", {"query": "pour"}, big,
+                                [r["id"] for r in big])])])
+    return [_dump()[0], dup]
+
+
+def _dumped(**kw):
+    sink = []
+    replay_window.replay(_dup_dump(), GOLD, ask_tools, ask_orchestrator, window=1000,
+                         result_chars=12_500, envelope_dump=sink, **kw)
+    return {d["qid"]: d for d in sink}
+
+
+def test_dump_one_line_per_turn_with_rounds_and_flattened_items():
+    d = _dumped()
+    assert set(d) == {"q-win", "q-big"}
+    t = d["q-big"]
+    assert (t["repeat"], t["turn"]) == (1, "t-q-big")
+    assert t["arm"]["window"] == 1000 and t["arm"]["result_chars"] == 12_500
+    assert [r["round"] for r in t["rounds"]] == [1, 2]
+    assert [[(e["name"], e["call_id"]) for e in r["envelopes"]] for r in t["rounds"]] == \
+        [[("search_records", "0")], [("latest_activity", "0"), ("search_records", "1")]]
+    r1 = t["rounds"][0]["envelopes"][0]["items"]
+    assert [it["chunk_id"] for it in r1] == ["c-ev", "c-shared"]
+    assert all("ref" in it and "text" in it for it in r1)
+    assert d["q-win"]["metrics"] is None               # single-call turn
+    json.dumps(list(d.values()))                       # serialisable as is
+
+
+def test_dump_metrics_dup_lines_render_len_and_budget_drops(monkeypatch):
+    m = _dumped()["q-big"]["metrics"]
+    assert m["dup_item_lines_by_tool_pair"] == {"search_records->latest_activity": 1}
+    assert m["budget_dropped_items"] == 0
+    assert m["render_len"] > 0
+    monkeypatch.setattr(ask_orchestrator, "RENDER_MAX_CHARS", 3000)
+    m2 = _dumped()["q-big"]["metrics"]
+    assert ask_orchestrator.RENDER_MAX_CHARS == 3000   # restored to the patched value
+    assert m2["render_len"] == m["render_len"] > 3000  # measured before the budget
+    assert m2["budget_dropped_items"] > 0
+    assert m2["dup_item_lines_by_tool_pair"] == m["dup_item_lines_by_tool_pair"]
+
+
+def test_dump_envelopes_must_not_point_into_results():
+    with pytest.raises(SystemExit, match="results/"):
+        replay_window.parse_args(["--rows", "r.json", "--gold", "g.jsonl", "--src-ref", "x",
+                                  "--family", "session", "--out", "o.json",
+                                  "--dump-envelopes",
+                                  str(replay_window.HERE / "results" / "e.jsonl")])
+
+
+def test_main_writes_the_envelope_dump(tmp_path):
+    import os
+    rows, gold = tmp_path / "rows.json", tmp_path / "gold.jsonl"
+    rows.write_text(json.dumps(_dup_dump()), encoding="utf-8")
+    gold.write_text("\n".join(json.dumps(g) for g in GOLD.values()), encoding="utf-8")
+    dump = tmp_path / "env.jsonl"
+    ref = os.environ.get("EVAL_SRC_REF", "origin/main")
+    replay_window.main(["--rows", str(rows), "--gold", str(gold), "--src-ref", ref,
+                        "--family", "session", "--window", "1000", "--result-chars", "12500",
+                        "--out", str(tmp_path / "o.json"), "--dump-envelopes", str(dump)])
+    lines = [json.loads(ln) for ln in dump.read_text(encoding="utf-8").splitlines()]
+    assert [ln["qid"] for ln in lines] == ["q-win", "q-big"]
+    assert lines[1]["family"] == "session"
+    assert lines[1]["arm"] == {"src_ref": ref, "window": 1000, "result_chars": 12_500}
+    assert set(lines[1]) == {"family", "qid", "repeat", "turn", "arm", "rounds", "metrics"}

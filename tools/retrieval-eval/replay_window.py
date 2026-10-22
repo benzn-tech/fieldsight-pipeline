@@ -24,6 +24,13 @@ imports resolve from sys.path), so an arm is one run of this script:
 `--window` sets `ask_tools.WINDOW_CHARS` when the src has an item window, else
 `MAX_TEXT` (the head rule at that size; it also caps topic rows). The output holds no
 record text, only ids, flags and counts; it still belongs in scratch, not results/.
+
+`--dump-envelopes PATH` also writes one JSONL line per replayed turn: the envelopes
+`ask_orchestrator._messages` flattens, grouped by round, with the items as built, plus
+for a multi-call turn (null otherwise) the item lines byte-identical to an earlier one
+by (earlier tool -> later tool), `len(render(flat))` with the budget lifted, and the
+items `_budgeted` drops -- all from the imported renderer. It holds record text: scratch
+only, never results/.
 """
 import argparse
 import json
@@ -156,6 +163,50 @@ def _score_turn(rec, gold, envs, rebuilt, ask_tools, ask_orchestrator):
     }, overhead
 
 
+def _envelope_metrics(envs, ask_orchestrator):
+    """--dump-envelopes metrics of one multi-call turn, from the production renderer:
+    item lines byte-identical to an earlier item's line in the turn, by (earlier tool ->
+    later tool); the render length with the budget lifted; the items `_budgeted` drops.
+    None for a single-call turn."""
+    if len(envs) < 2:
+        return None
+    first, dups = {}, {}
+    for env in envs:
+        tool = env.get("tool") or "unknown"
+        for it in env.get("items") or []:
+            line = ask_orchestrator._item_line(it)
+            if line in first:
+                pair = "%s->%s" % (first[line], tool)
+                dups[pair] = dups.get(pair, 0) + 1
+            else:
+                first[line] = tool
+    budget = ask_orchestrator.RENDER_MAX_CHARS
+    ask_orchestrator.RENDER_MAX_CHARS = sys.maxsize
+    try:
+        render_len = len(ask_orchestrator.render(envs))
+    finally:
+        ask_orchestrator.RENDER_MAX_CHARS = budget
+    blocks = ask_orchestrator._budgeted(envs)
+    dropped = sum(len(env.get("items") or []) - (len(block) - 1)
+                  for env, block in zip(envs, blocks))
+    return {"dup_item_lines_by_tool_pair": dups, "render_len": render_len,
+            "budget_dropped_items": dropped}
+
+
+def _envelope_record(rec, repeat, envs, arm, ask_orchestrator):
+    """One --dump-envelopes line (family and arm.src_ref are main's to add): the
+    envelopes `_messages` flattens, grouped by round in call order."""
+    rounds = []
+    for env in envs:
+        if not rounds or rounds[-1]["round"] != env.get("round"):
+            rounds.append({"round": env.get("round"), "envelopes": []})
+        rounds[-1]["envelopes"].append({"name": env.get("tool"), "call_id": env.get("id"),
+                                        "items": list(env.get("items") or [])})
+    return {"qid": rec.get("id"), "repeat": repeat, "turn": rec.get("turn"),
+            "arm": dict(arm), "rounds": rounds,
+            "metrics": _envelope_metrics(envs, ask_orchestrator)}
+
+
 def _baseline_lost_at(results):
     """turn id -> the live run's lost_at, old labels read as new."""
     out = {}
@@ -167,17 +218,23 @@ def _baseline_lost_at(results):
 
 
 def replay(rows, gold, ask_tools, ask_orchestrator, *, window=None, result_chars=None,
-           results=None):
+           results=None, envelope_dump=None):
     """Score every turn of a --keep-rows dump at one arm. `gold`: {id: gold item}.
+    `envelope_dump`: a list that gets one --dump-envelopes record per turn.
     The module constants are restored before returning."""
     saved = _configure(ask_tools, window, result_chars)
     try:
         lost_at = _baseline_lost_at(results)
         turns, overhead, seen = {}, [], {}
+        dump_arm = {"window": getattr(ask_tools, "WINDOW_CHARS", ask_tools.MAX_TEXT),
+                    "result_chars": ask_tools.MAX_RESULT_CHARS}
         for rec in rows:
             qid = rec.get("id")
             seen[qid] = seen.get(qid, 0) + 1
             envs, rebuilt, unreplayed = _rebuild_turn(rec, ask_tools)
+            if envelope_dump is not None:
+                envelope_dump.append(_envelope_record(rec, seen[qid], envs, dump_arm,
+                                                      ask_orchestrator))
             t, oh = _score_turn(rec, gold.get(qid), envs, rebuilt, ask_tools, ask_orchestrator)
             t["unreplayed"] = unreplayed
             if results is not None:
@@ -241,13 +298,18 @@ def parse_args(argv=None):
     ap.add_argument("--results", default=None,
                     help="the live run's results file: attaches each turn's lost_at")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--dump-envelopes", default=None, metavar="PATH",
+                    help="JSONL, one line per turn: the envelopes and items each round "
+                         "rendered, with duplicate-line, render-length and budget-drop "
+                         "metrics (record text: scratch only)")
     args = ap.parse_args(argv)
     if args.compare:
         return args
     if not (args.rows and args.gold and args.src_ref and args.family and args.out):
         ap.error("--rows, --gold, --src-ref, --family and --out are required")
-    if Path(args.out).resolve().is_relative_to((HERE / "results").resolve()):
-        raise SystemExit("--out must not point into results/ (scratch only)")
+    for flag, path in (("--out", args.out), ("--dump-envelopes", args.dump_envelopes)):
+        if path and Path(path).resolve().is_relative_to((HERE / "results").resolve()):
+            raise SystemExit("%s must not point into results/ (scratch only)" % flag)
     return args
 
 
@@ -269,8 +331,17 @@ def main(argv=None):
             gold[g["id"]] = g
     results = (json.loads(Path(args.results).read_text(encoding="utf-8"))
                if args.results else None)
+    dump = [] if args.dump_envelopes else None
     out = replay(rows, gold, ask_tools, ask_orchestrator, window=args.window,
-                 result_chars=args.result_chars, results=results)
+                 result_chars=args.result_chars, results=results, envelope_dump=dump)
+    if dump is not None:
+        Path(args.dump_envelopes).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.dump_envelopes, "w", encoding="utf-8", newline="\n") as fh:
+            for d in dump:
+                d = dict(family=args.family, **d)
+                d["arm"] = dict(src_ref=args.src_ref, **d["arm"])
+                fh.write(json.dumps(d, ensure_ascii=False, default=str) + "\n")
+        print("wrote %s (%d turns)" % (args.dump_envelopes, len(dump)))
     out.update(src_ref=args.src_ref, src_sha=sha, family=args.family,
                rows_file=Path(args.rows).name)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
