@@ -29,7 +29,6 @@ import sweep_state
 from lake_put import lake_put
 from repositories import meeting_session, users, sites
 import session_scope
-from session_scope import SESSION_GAP_MINUTES
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -69,10 +68,17 @@ EXTRACTION_REQUESTS_PREFIX = "extraction_requests/"
 # The idle-stop grace window (a deliberate End is grace 0). Mirrors org-api's
 # STOP_GRACE_SECONDS so the sweep's due-check matches what session_close intended.
 STOP_GRACE_SECONDS = int(os.environ.get("STOP_GRACE_SECONDS", "30"))
-# §8.4: a session with no new chunk for SESSION_GAP_MINUTES is INFERRED closed
-# (the device stopped/crashed without a /close). Reuses the one "one session"
-# inactivity constant rather than a second literal.
-IDLE_CLOSE_SECONDS = SESSION_GAP_MINUTES * 60
+# §8.4: a session with no new chunk for IDLE_CLOSE_MINUTES is INFERRED closed
+# (the device stopped/crashed without a /close). It is also the quiet period
+# group merge waits for (_real_group_scan). 60, not SESSION_GAP_MINUTES (15):
+# idle is measured on SERVER arrival (last_segment_at), and a phone that queued
+# offline delivers its chunks late, so 15 min closed sessions still being
+# recorded (M2 spec §8). Same 1 h on every platform. Per-stage SAM parameter
+# (IdleCloseMinutes) so it rolls back without code -- prod runs idle-close today
+# (PROD_ENABLE_FINALIZE -> INFER_IDLE_CLOSE=true), so shipping this moves prod
+# devices from 15 to 60 min; PROD_IDLE_CLOSE_MINUTES=15 is the rollback.
+IDLE_CLOSE_MINUTES = int(os.environ.get("IDLE_CLOSE_MINUTES", "60"))
+IDLE_CLOSE_SECONDS = IDLE_CLOSE_MINUTES * 60
 # Gated OFF until SessionActivityFunction is live to keep last_segment_at fresh:
 # without per-chunk touch, a still-active /open session (last_segment_at NULL ->
 # COALESCE falls back to opened_at) would be closed prematurely. Flipped on WITH
@@ -187,7 +193,7 @@ def backstop(conn, *, list_waiting, resolve_context, read_rolling, enqueue, now=
     Anchored on `finalizing_at` -- when the sweep CLAIMED the session -- and not
     on `closed_at`. An idle-inferred close stores the session's LAST ACTIVITY as
     `closed_at` (infer_idle_closes marks pending_close at last_activity), which
-    is already SESSION_GAP_MINUTES old before anything claims it, so a deadline
+    is already IDLE_CLOSE_MINUTES old before anything claims it, so a deadline
     measured from the close would fire on the very next tick, ahead of any
     extraction -- for exactly the offline and crashed recordings this protects.
 
@@ -666,7 +672,7 @@ def _real_group_scan(conn):
     from repositories import session_group
     return sweep_groups(
         conn,
-        list_due=lambda c: session_group.list_due(c, SESSION_GAP_MINUTES * 60),
+        list_due=lambda c: session_group.list_due(c, IDLE_CLOSE_SECONDS),
         claim=session_group.claim,
         mark_result=session_group.mark_result,
         span_ok=lambda c, gid: meeting_session.group_span_ok(

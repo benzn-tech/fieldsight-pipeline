@@ -1192,6 +1192,19 @@ Parameters:
       switching it back off leaves the merged record and does not restore what
       was deleted. Flip it on a day when a two-device recording can be watched.
 
+  IdleCloseMinutes:
+    Type: Number
+    Default: 60
+    MinValue: 1
+    Description: >-
+      M2 spec section 8: minutes an open session may go without a new chunk
+      before the finalize sweep infers it closed (intent 'idle'); also the quiet
+      period group merge waits for. 60 on every platform -- idle is measured on
+      server arrival, and a phone that queued offline delivers chunks late, so
+      the old 15 (SESSION_GAP_MINUTES) closed sessions still being recorded.
+      Per stage so it rolls back without code: set TEST_IDLE_CLOSE_MINUTES or
+      PROD_IDLE_CLOSE_MINUTES (15 restores the old behaviour).
+
   DeclareContinuity:
     Type: String
     Default: 'false'
@@ -4132,6 +4145,8 @@ Resources:
       Environment:
         Variables:
           ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
+          # Idle-close threshold AND group merge's quiet test (spec section 8).
+          IDLE_CLOSE_MINUTES: !Ref IdleCloseMinutes
           # Batched transcription (spec 2026-08-11): the sweep is the only thing that
           # can seal a session's LAST run — it has no fourth chunk coming. Same switch
           # as the transcriber's, and both must be given it or they disagree in
