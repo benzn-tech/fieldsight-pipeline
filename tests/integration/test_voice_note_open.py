@@ -172,3 +172,69 @@ def test_second_open_without_type_keeps_it(db):
     assert api.session_open(db, u1, sid, _note([str(uuid.uuid4())]))["statusCode"] == 200
     assert api.session_open(db, u1, sid, {})["statusCode"] == 200
     assert meeting_session.get(db, sid)["session_type"] == "voice_note"
+
+
+# --- fix round 1 -------------------------------------------------------------
+
+class _S3:
+    def generate_presigned_url(self, op, Params=None, ExpiresIn=0):
+        return "https://s3.example/" + Params["Key"]
+
+
+def _chunk_open(db, user, sid, nz_wall="2026-10-21_10-00-00"):
+    """Open `sid` the way an offline group join does: via the chunk's upload-url,
+    whose filename carries the device's NAIVE NZ wall-clock start."""
+    name = f"{user['folder_name']}_{nz_wall}_sid{sid}_c0001.m4a"
+    body = {"kind": "audio", "clientUuid": uuid.uuid4().hex, "fileName": name,
+            "contentType": "audio/mp4", "startedAt": "2026-10-20T21:00:00Z",
+            "groupId": uuid.uuid4().hex}
+    res = api.create_recording_upload_url(db, user, body)
+    assert res["statusCode"] == 200, res
+    assert meeting_session.get(db, sid) is not None
+
+
+@pytest.mark.parametrize("order", ["a_first", "b_first"])
+def test_chunk_opened_note_compares_in_utc(db, monkeypatch, order):
+    """Note A was opened by its chunk (filename 10:00 NZ, naive) and its /open
+    retried later; note B by /open at 10:05 NZ sent as UTC. B is later and must
+    hold the photo whichever order the calls land in. Storing the filename time
+    raw put A at 10:00 'UTC' -- 13h later than it was -- so A stole the photo."""
+    monkeypatch.setattr(api, "s3", lambda: _S3())
+    u1, _ = _world(db)
+    users.set_folder_name(db, u1["cognito_sub"], f"Vee_N1_{uuid.uuid4().hex[:6]}")
+    u1 = users.get_by_id(db, u1["id"])
+    a, b = uuid.uuid4().hex, uuid.uuid4().hex
+    p1 = str(uuid.uuid4())
+    a_open = _note([p1], "2026-10-20T21:00:00Z")   # 10:00 NZDT
+    b_open = _note([p1], "2026-10-20T21:05:00Z")   # 10:05 NZDT
+    if order == "a_first":
+        _chunk_open(db, u1, a)
+        assert api.session_open(db, u1, a, a_open)["statusCode"] == 200
+        assert api.session_open(db, u1, b, b_open)["statusCode"] == 200
+    else:
+        assert api.session_open(db, u1, b, b_open)["statusCode"] == 200
+        _chunk_open(db, u1, a)
+        assert api.session_open(db, u1, a, a_open)["statusCode"] == 200
+    assert [r[2] for r in _rows(db, u1)] == [b]
+
+
+def test_photos_on_a_session_that_is_already_a_meeting_are_not_linked(db):
+    u1, _ = _world(db)
+    sid = uuid.uuid4().hex
+    assert api.session_open(db, u1, sid, {"kind": "audio", "sessionType": "meeting"})["statusCode"] == 200
+    res = api.session_open(db, u1, sid, _note([str(uuid.uuid4())]))
+    assert res["statusCode"] == 200, res
+    assert meeting_session.get(db, sid)["session_type"] == "meeting"
+    assert db.execute("SELECT count(*) FROM voice_note_photo WHERE session_id=%s",
+                      (sid,)).fetchone()[0] == 0
+
+
+def test_photos_on_another_users_session_are_not_linked(db):
+    u1, u2 = _world(db)
+    sid = uuid.uuid4().hex
+    assert api.session_open(db, u1, sid, _note([]))["statusCode"] == 200
+    res = api.session_open(db, u2, sid, _note([str(uuid.uuid4())]))
+    assert res["statusCode"] == 200, res
+    assert db.execute("SELECT count(*) FROM voice_note_photo WHERE session_id=%s",
+                      (sid,)).fetchone()[0] == 0
+    assert _rows(db, u2) == []

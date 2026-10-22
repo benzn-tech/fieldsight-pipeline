@@ -1344,10 +1344,13 @@ def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id, compa
         # set the session's start to its own, and ensure_open COALESCEs, so the
         # wrong value would never be corrected. session_activity reads it from
         # the same place for the same reason. None is fine: it leaves the field
-        # for whoever does know.
+        # for whoever does know. Converted from the device's NZ wall clock to UTC,
+        # as session_activity does: opened_at is a UTC column, /open stores the
+        # body's offset-carrying startedAt, and voice notes are ordered by it.
         meeting_session.ensure_open(
             conn, m.group(1), company_id, caller["id"], site_id, kind,
-            extract_base_time_from_filename(file_name), group_id=group_id,
+            session_scope.to_utc(extract_base_time_from_filename(file_name)),
+            group_id=group_id,
         )
         # Beside ensure_open, not instead of it: this is the OFFLINE join, the
         # one whose /open never landed, so it is the only chance this group has
@@ -1594,8 +1597,17 @@ def session_open(conn, caller, session_id, body):
     # After ensure_open (the claim compares the notes' stored opened_at) and in the
     # same request transaction. Stored as sent: each must equal the photo's
     # recordings.client_uuid, which is stored as sent.
+    # Only onto the caller's own voice note. ensure_open never changes an existing
+    # row's owner or type, so a session already opened as a meeting, or someone
+    # else's session id, keeps what it is -- and the request still succeeds, as
+    # /open always has; the claim is simply not made.
     if photos:
-        voice_note_photo.link(conn, caller["id"], session_id, photos)
+        if (str(row.get("user_id")) == str(caller["id"])
+                and row.get("session_type") == "voice_note"):
+            voice_note_photo.link(conn, caller["id"], session_id, photos)
+        else:
+            logger.info("session_open: %s is not the caller's voice note (type %r); "
+                        "photos not linked", session_id, row.get("session_type"))
     # After ensure_open, so a group is only registered once the join itself has
     # passed every guard above (tenant, staleness, meeting-already-ended).
     _ensure_group_state(conn, session_company_id, group_id)
