@@ -7931,6 +7931,36 @@ def test_the_verbatim_timeline_fallback_is_refused_when_the_day_has_deleted_sour
     assert "the deleted day, in full" not in str(body)
 
 
+def test_a_day_whose_every_topic_is_deleted_is_a_404_not_a_crash_or_the_old_prose(monkeypatch):
+    """The other way into the same hole. Here the day DOES have Aurora topics, they
+    survive the site clip, and only the renderer drops them (`scope='deleted'`) --
+    deleting one session hides the whole report rollup by id. The renderer used to
+    read `rows[0]` for the alias lookup and raise IndexError (prod, 2026-10-21,
+    GET /timeline 500s). Not crashing is not enough: rendering the day anyway would
+    serve the pre-deletion doc's prose as a 200 with no topics under it."""
+    import repositories.redactions as red
+
+    row = _topic_row(id="22222222-2222-2222-2222-222222222222", summary="the secret words")
+    monkeypatch.setattr(org, "_get_lake_json",
+                        lambda key: {"executive_summary": "the deleted day, in full"})
+    monkeypatch.setattr(red, "deleted_source_prefixes",
+                        lambda conn, folder=None, date=None: ["extractions/Ada_L/2026-07-14/sid1"])
+    monkeypatch.setattr(org.topics, "has_topics_for_source_prefix", lambda *a, **k: True)
+    monkeypatch.setattr(org.topics, "list_topics_for_source_prefix", lambda *a, **k: [dict(row)])
+    monkeypatch.setattr(org, "_allowed_site_ids", lambda conn, caller: {str(row["site_id"])})
+    monkeypatch.setattr(org.redactions, "list_active_for_topics", lambda conn, ids: {
+        row["id"]: {"id": "r-1", "target_id": row["id"], "scope": "deleted"}})
+    monkeypatch.setattr(org, "_prose_alias_pairs", lambda conn, site_id: [])
+    monkeypatch.setattr(org.recordings, "day_stats",
+                        lambda conn, cid, folder, date: {"sessions": 0, "duration_s": 0})
+
+    res = org._render_timeline_for_user(object(), CALLER, "2026-07-14", "Ada_L")
+    body = json.loads(res["body"])
+    assert res["statusCode"] == 404, f"served the deleted day: {body}"
+    assert "the deleted day, in full" not in str(body)
+    assert "the secret words" not in str(body)
+
+
 def test_the_admin_summary_verbatim_serve_is_refused_for_a_date_with_deleted_sources(monkeypatch):
     """Same shape, the aggregate door. `summary_report.json` is lake-wide and served
     byte-verbatim to platform_admin -- a deleted session's content sits inside it."""
