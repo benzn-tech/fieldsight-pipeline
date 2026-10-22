@@ -101,6 +101,16 @@ def test_render_header_and_item_line_shapes():
             "Level 2 inspection — Formwork checked on level 2.") in lines
 
 
+def test_render_header_ignores_the_window_counts():
+    """ask_tools puts `windowed`/`head` counts in meta for its log line (spec
+    2026-10-22-ask-tools-item-window, review SHOULD 5); the judge never sees them."""
+    env = _env("search_records", [_topic("R1")],
+               {"truncated": False, "windowed": 3, "head": 2}, args={"query": "pour"})
+    out = orch.render([env])
+    assert '[DATA search_records "pour" — 1 items]' in out.splitlines()
+    assert "windowed" not in out and "head" not in out
+
+
 def test_render_is_wrapped_in_the_existing_data_fence():
     out = orch.render([_env("search_records", [_topic("R1")], args={"query": "x"})])
     assert out.startswith(orch.DATA_FENCE_HEADING + "\n\n```\n")

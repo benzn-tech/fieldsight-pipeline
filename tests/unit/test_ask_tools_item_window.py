@@ -1,10 +1,15 @@
 """ask_tools item window: an item shows the part of a chunk that matches the query
 (spec 2026-10-22-ask-tools-item-window, amended by its review)."""
+import io
+import json
 import random
 import re
+from datetime import date
+
+import pytest
 
 import ask_tools
-from session_index import _window_line
+from session_index import _split_topic_text, _topic_lines, _window_line
 
 
 # --- terms -------------------------------------------------------------------
@@ -229,3 +234,134 @@ def test_window_property_cap_units_determinism():
             if u not in units:                       # a cut of one oversize unit
                 piece = max(u.split("…"), key=len)
                 assert any(piece in w for w in units), u[:60]
+
+
+
+# --- wired into _item (through execute) --------------------------------------
+
+class FakeLambda:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def invoke(self, FunctionName, InvocationType, Payload):
+        ev = json.loads(Payload)
+        body = {"results": [{"id": c["id"], "name": c["name"], "rows": list(self.rows),
+                             "meta": {}} for c in ev["calls"]]}
+        return {"Payload": io.BytesIO(json.dumps(body).encode())}
+
+
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch):
+    monkeypatch.setattr(ask_tools, "_embed", lambda texts: [[0.0] * 4 for _ in texts])
+    monkeypatch.setattr(ask_tools, "_post_search", lambda q, rows, k: rows[:k])
+
+
+def _run(name, args, rows):
+    ctx = ask_tools.ToolContext(caller_sub="sub-1", today=date(2026, 10, 15), deadline=1030.0,
+                                lambda_client=FakeLambda(rows), function_name="rag",
+                                clock=lambda: 1000.0)
+    return ask_tools.execute([{"name": name, "args": args}], ctx)[0]
+
+
+def _chunk(text, chunk_type="transcript_window", span="08:10:00–08:10:39", cid="c1"):
+    return {"id": cid, "chunk_text": text, "chunk_type": chunk_type, "topic_id": "t1",
+            "metadata": {"window_span": span} if span else {}, "report_date": "2026-09-10",
+            "site_name": "Riverside", "topic_title": "Roof", "source_s3_key": "s.json"}
+
+
+EVIDENCE = "the crane hire is booked for Thursday at seven"
+
+
+def test_search_records_item_shows_the_matching_part_and_its_time():
+    text = _transcript(40, {30: EVIDENCE})
+    env = _run("search_records", {"query": "Is the crane booked?"}, [_chunk(text)])
+    item = env["items"][0]
+    assert EVIDENCE in item["text"] and len(item["text"]) <= ask_tools.WINDOW_CHARS
+    assert item["time"] == "08:10:00–08:10:39"                  # the chunk's span, unchanged
+    first_kept = _units(item["text"])[0]
+    assert item["time_start"] == first_kept[1:9] != "08:10:00"  # review BLOCKER 3
+    assert env["meta"]["windowed"] == 1 and env["meta"]["head"] == 0
+
+
+def test_no_hit_keeps_the_head_and_the_span_start():
+    text = _transcript(40, {30: EVIDENCE})
+    env = _run("search_records", {"query": "scaffold"}, [_chunk(text)])
+    item = env["items"][0]
+    assert text.startswith(item["text"][:-2]) and item["text"].endswith("\n…")
+    assert len(item["text"]) > ask_tools.MAX_TEXT
+    assert item["time_start"] == "08:10:00"
+
+
+def test_a_first_kept_unit_without_a_time_keeps_the_span_start():
+    """A turn whose text holds a newline: its second half is a unit with no
+    `[HH:MM:SS]`. The window starts there (the line above is too long to add)."""
+    text = _transcript(30, {20: "x " * 600 + "\nand the crane comes at seven"})
+    env = _run("search_records", {"query": "crane"}, [_chunk(text)])
+    item = env["items"][0]
+    assert item["text"].startswith("…\nand the crane comes at seven")
+    assert item["time_start"] == "08:10:00"
+
+
+def test_topic_and_digest_chunks_keep_line_one_and_no_time_start():
+    header, body = _topic_lines({
+        "time_range": "09:00 - 09:40", "title": "Level 3 slab pour", "category": "progress",
+        "summary": "General progress on the slab. " * 10,
+        "decisions": [{"decision": f"Decision {i}: " + FILLER[i % 4]} for i in range(30)],
+        "action_items": [{"action": "confirm the crane booking", "responsible": "Smith"}]})
+    topic = _split_topic_text(header, body)[0]
+    digest = "\n".join(["Session 08:00–12:00"] + [f"- [08:{i:02d}] topic {i} " + FILLER[i % 4]
+                                                  for i in range(40)] + ["- [11:50] crane"])
+    assert len(topic) > ask_tools.WINDOW_CHARS and "crane" in topic[1500:]
+    for text, kind, first in ((topic, "topic", header), (digest, "session_digest",
+                                                         "Session 08:00–12:00")):
+        env = _run("search_records", {"query": "crane"}, [_chunk(text, kind, span=None)])
+        item = env["items"][0]
+        assert item["text"].split("\n")[0] == first, kind
+        assert "crane" in item["text"] and len(item["text"]) <= ask_tools.WINDOW_CHARS
+        assert item["time_start"] is None
+
+
+def test_document_rows_centre_on_a_paragraph(monkeypatch):
+    import project_doc_flag
+    monkeypatch.setattr(project_doc_flag, "on", lambda: True)
+    paras = [f"Clause {i}. " + ("General requirement text that applies. " * 12) for i in range(6)]
+    paras[4] = "Clause 4. Scaffold ties shall be inspected weekly by a competent person."
+    row = {"id": "d1", "chunk_text": "\n\n".join(paras), "title": "Spec", "document_id": "doc"}
+    env = _run(ask_tools.DOC_TOOL, {"query": "scaffold ties"}, [row])
+    item = env["items"][0]
+    assert paras[4] in item["text"].split("\n\n") and len(item["text"]) <= ask_tools.WINDOW_CHARS
+    assert "time_start" not in item
+
+
+def test_topic_rows_people_and_metrics_keep_the_600_head():
+    env = _run("day_overview", {"date_from": "yesterday"},
+               [{"id": "t", "title": "T", "summary": "crane " * 200}])
+    assert len(env["items"][0]["text"]) == ask_tools.MAX_TEXT == 600
+    assert "windowed" not in env["meta"] and "head" not in env["meta"]
+
+
+def test_latest_activity_centres_on_the_subject_not_the_asking_words():
+    lines = {i: "we talked about it last time and said it again" for i in range(40)}
+    lines[33] = "the crane is coming Monday"
+    text = _transcript(40, lines)
+    env = _run("latest_activity", {"query": "When did we last talk about the crane?"},
+               [_chunk(text)])
+    assert "the crane is coming Monday" in env["items"][0]["text"]
+
+
+def test_a_windowed_card_snippet_starts_with_the_marker():
+    """Review SHOULD 4: `_card` snippets text[:200], so the card shows the window."""
+    text = _transcript(40, {30: EVIDENCE})
+    item = _run("search_records", {"query": "crane"}, [_chunk(text)])["items"][0]
+    assert item["text"][:200] != text[:200] and item["text"].startswith("…\n[08:10:")
+
+
+def test_log_line_counts_windowed_and_head_items(caplog):
+    rows = [_chunk(_transcript(40, {30: EVIDENCE}), cid="c1"),
+            _chunk(_transcript(40), cid="c2"), _chunk("short", cid="c3")]
+    with caplog.at_level("INFO"):
+        _run("search_records", {"query": "crane"}, rows)
+    line = next(r.getMessage() for r in caplog.records
+                if r.getMessage().startswith("ask tool search_records"))
+    assert "windowed=1 head=1" in line
+    assert "crane" not in caplog.text and "Thursday" not in caplog.text

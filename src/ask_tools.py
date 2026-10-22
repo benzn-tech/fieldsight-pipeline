@@ -223,7 +223,14 @@ def validate_call(call, today):
 # results the same way -- with the default ensure_ascii=True a CJK character costs
 # six characters (\uXXXX), and a Chinese day would fit 2 topics where English fits 15.
 MAX_RESULT_CHARS = 10_000
+# Item text (spec 2026-10-22-ask-tools-item-window §5). A topic row, person or metric
+# keeps the first MAX_TEXT characters. A recording chunk (transcript window, topic,
+# session digest) or a document chunk is packed to ~2,600 characters, so it shows a
+# WINDOW_CHARS window centred on the query's terms instead (`_window`): lines for
+# recordings, blank-line paragraphs for documents; a topic/digest chunk keeps line 1.
 MAX_TEXT = 600
+WINDOW_CHARS = 1000
+_KEEP_FIRST = ("topic", "session_digest")
 # Spec §3.4: one rag-search batch is at most 4 calls and never plans past 20 s
 # (RagSearchFunction Timeout is 23 s).
 MAX_BATCH = 4
@@ -321,12 +328,17 @@ def _time_start(row):
         return None
 
 
-def _text(value):
-    """Item text: a string capped at MAX_TEXT. A non-string value is coerced, so
-    one malformed row can never fail the turn."""
+def _coerce(value):
+    """A string. A non-string value is coerced, so one malformed row can never fail
+    the turn."""
     if value is None:
         return ""
-    return (value if isinstance(value, str) else str(value))[:MAX_TEXT]
+    return value if isinstance(value, str) else str(value)
+
+
+def _text(value):
+    """Item text: a string capped at MAX_TEXT."""
+    return _coerce(value)[:MAX_TEXT]
 
 
 def _window_terms(query):
@@ -518,10 +530,14 @@ def _metadata(row):
 
 
 def _item(name, args, row, call_id):
-    """(kind, dedupe ident, item-without-ref) for one dispatcher row."""
+    """(kind, dedupe ident, item-without-ref) for one dispatcher row. A chunk or
+    document item also carries `_window` (its `_window` mode), which `_envelope`
+    counts and removes."""
     if name == DOC_TOOL:
         # Before the shape check (R1): a document row carries chunk_text and would
         # otherwise become a recording chunk with provenance "records".
+        text, _, mode = _window(_coerce(row.get("chunk_text")),
+                                _window_terms(args.get("query")), WINDOW_CHARS, sep="\n\n")
         return "document", row.get("id"), {
             "kind": "document", "provenance": "documents",
             "title": row.get("title"), "heading": row.get("heading"),
@@ -529,7 +545,7 @@ def _item(name, args, row, call_id):
             "document_id": row.get("document_id"), "series_id": row.get("series_id"),
             "revision": row.get("revision"), "site": row.get("site_name"),
             "site_id": row.get("site_id"), "content_type": row.get("content_type"),
-            "text": _text(row.get("chunk_text"))}
+            "text": text, "_window": mode}
     if name == "find_people":
         return "person", row.get("person_ref"), {
             "kind": "person", "provenance": "records", "who": row.get("name"),
@@ -543,6 +559,17 @@ def _item(name, args, row, call_id):
     if "chunk_text" in row:
         md = _metadata(row)
         span = md.get("window_span")
+        full = _coerce(row.get("chunk_text"))
+        chunk_type = row.get("chunk_type")
+        text, first, mode = _window(full, _window_terms(args.get("query")), WINDOW_CHARS,
+                                    keep_first=chunk_type in _KEEP_FIRST)
+        time_start = _time_start(dict(row, metadata=md))
+        if chunk_type == "transcript_window" and first > 0:
+            # The card jumps to what the model read (spec §7). Only a turn line carries
+            # `[HH:MM:SS]`; anything else keeps the span start (review BLOCKER 3).
+            m = _TURN_TIME.match(full.split("\n")[first])
+            if m:
+                time_start = m.group(1)
         return "chunk", row.get("id"), {
             "kind": "chunk", "provenance": "records",
             "date": str(row.get("report_date") or ""),
@@ -550,10 +577,9 @@ def _item(name, args, row, call_id):
             "site": row.get("site_name"), "site_slug": row.get("site_slug"),
             "who": row.get("user_name"),
             "title": row.get("topic_title") or row.get("title"),
-            "text": _text(row.get("chunk_text")),
+            "text": text, "_window": mode,
             "topic_id": row.get("topic_id"), "chunk_id": row.get("id"),
-            "chunk_type": row.get("chunk_type"),
-            "time_start": _time_start(dict(row, metadata=md)),
+            "chunk_type": chunk_type, "time_start": time_start,
             "source": row.get("source_s3_key")}
     return "topic", row.get("id"), {
         "kind": "topic", "provenance": "records",
@@ -577,6 +603,7 @@ def _size(obj):
 
 def _envelope(name, call_id, args, rows, meta, ctx):
     items, used, seen = [], 2, set()                    # 2: the list's brackets
+    shown = {"window": 0, "head": 0}                    # `_window` modes, for the log
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -588,6 +615,7 @@ def _envelope(name, call_id, args, rows, meta, ctx):
         key = None if ident in (None, "") else (kind, str(ident))
         if key is not None and key in seen:
             continue                                    # same row twice in one result
+        mode = item.pop("_window", None)
         keep = _CITATION_KEYS if kind in ("topic", "chunk") else ()
         item = {k: v for k, v in item.items() if v is not None or k in keep}
         # Measured before a ref is assigned: a dropped item must not consume one.
@@ -602,7 +630,13 @@ def _envelope(name, call_id, args, rows, meta, ctx):
             seen.add(key)
         items.append({"ref": ref, **item})
         used += size
+        if mode in shown:
+            shown[mode] += 1
     meta.setdefault("truncated", False)
+    if any(shown.values()):
+        # Counts only. `ask_orchestrator._header` reads named meta keys, so these
+        # never reach the judge.
+        meta["windowed"], meta["head"] = shown["window"], shown["head"]
     if not items and not meta.get("empty_reason") and not meta.get("error"):
         # §3.3: items [] always comes with a reason. A result that gives none
         # (malformed, or every row unusable) is a failure, not "nothing there".
@@ -734,9 +768,9 @@ def _execute(calls, ctx):
         env = _envelope(name, cid, args, rows, meta, ctx)
         fields, days = arg_shape(args)
         logger.info("ask tool %s fields=%s days=%s items=%d rows=%d empty=%s err=%s "
-                    "truncated=%s caller=%s",
+                    "truncated=%s windowed=%d head=%d caller=%s",
                     name, fields, days, len(env["items"]), len(rows),
                     meta.get("empty_reason"), meta.get("error"), meta.get("truncated"),
-                    sub_hash(ctx.caller_sub))
+                    meta.get("windowed", 0), meta.get("head", 0), sub_hash(ctx.caller_sub))
         envs[int(cid)] = env
     return envs
