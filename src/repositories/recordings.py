@@ -530,29 +530,48 @@ def session_span(conn, company_id, user_folder, date, session_base):
     return row["lo"], row["hi"]
 
 
+# The settle check's read (recent_session_chunks), module-level so a test can
+# EXPLAIN exactly this text. `started_at >= opened_at - 1 day` is an index
+# condition on (user_id, started_at): without it the best available plan walks
+# the recorder's whole history (~100k rows a year at 1-minute chunks) on every
+# due session. Which plan wins is still the planner's call on real statistics.
+# Both columns are device time, so clock skew cancels; a sid never spans days.
+# COALESCE to the row's server created_at for a session with no opened_at yet.
+RECENT_SESSION_CHUNKS_SQL = (
+    "SELECT r.s3_key, EXTRACT(EPOCH FROM (now() - r.uploaded_at))::float AS age_s "
+    "FROM recordings r "
+    "JOIN meeting_session m ON m.user_id = r.user_id "
+    "WHERE m.session_id = %s "
+    "AND r.started_at >= COALESCE(m.opened_at, m.created_at) - interval '1 day' "
+    "AND r.kind IN ('audio', 'video') "
+    "AND r.uploaded_at > now() - make_interval(secs => %s) "
+    "AND r.s3_key LIKE %s ESCAPE '\\' "
+    "ORDER BY r.s3_key"
+)
+
+
+def recent_session_chunks_params(session_id, within_seconds):
+    return (session_id, within_seconds, f"%sid{_escape_like(session_id)}_c%")
+
+
 def recent_session_chunks(conn, session_id, within_seconds) -> list:
-    """s3_keys of this device session's audio/video chunks whose `/complete`
-    landed in the last `within_seconds` (server time).
+    """[{s3_key, age_s}] for this device session's audio/video chunks whose
+    `/complete` landed in the last `within_seconds` (server time); `age_s` is
+    the seconds since then.
 
     For the finalize sweep's settle check: a chunk the recorder has uploaded but
     the pipeline has not yet registered must not be left out of the email. Only
     RECENT uploads are asked about, so the check costs nothing for a session
-    whose chunks all landed long ago, and a chunk that never gets processed can
-    delay the claim by at most `within_seconds`.
+    whose chunks all landed long ago; `age_s` lets the caller name a chunk it
+    stopped waiting for rather than drop it in silence.
 
-    Scoped to the session's recorder (`user_id`, indexed), then matched on the
-    `sid{id}_c` token every chunk filename carries; a photo carries no `_c`.
-    `uploaded_at` NULL (presigned, never completed) is not asked about."""
-    rows = conn.cursor(row_factory=dict_row).execute(
-        "SELECT r.s3_key FROM recordings r "
-        "JOIN meeting_session m ON m.user_id = r.user_id "
-        "WHERE m.session_id = %s AND r.kind IN ('audio', 'video') "
-        "AND r.uploaded_at > now() - make_interval(secs => %s) "
-        "AND r.s3_key LIKE %s ESCAPE '\\' "
-        "ORDER BY r.s3_key",
-        (session_id, within_seconds, f"%sid{_escape_like(session_id)}_c%"),
+    Scoped to the session's recorder (`user_id`, indexed, bounded on
+    `started_at`), then matched on the `sid{id}_c` token every chunk filename
+    carries; a photo carries no `_c`. `uploaded_at` NULL (presigned, never
+    completed) is not asked about, nor is a row with `started_at` NULL."""
+    return conn.cursor(row_factory=dict_row).execute(
+        RECENT_SESSION_CHUNKS_SQL, recent_session_chunks_params(session_id, within_seconds),
     ).fetchall()
-    return [r["s3_key"] for r in rows]
 
 
 def session_local_span(conn, company_id, user_folder, date, session_base):

@@ -974,14 +974,20 @@ def _s3_client():
 
 
 def _read_sidecar(s3, recording_key):
-    """The chunk's VAD sidecar, or None when it is not readable yet. "Not
-    there" (404) and "may not look" (403) are one answer here, and the settle
-    bound caps both: a missing grant delays an email, it cannot lose one."""
-    try:
-        obj = s3.get_object(Bucket=S3_BUCKET, Key=_sidecar_key(recording_key))
-        return json.loads(obj["Body"].read().decode("utf-8"))
-    except Exception:
+    """The chunk's VAD sidecar, or None when it has not been written yet.
+
+    LISTED first, not inferred from a GET's error: a missing key answers 404
+    only with an s3:ListBucket that applies to the GET, and this role's grant is
+    conditioned on s3:prefix, so a bare GET could answer 403 for "not written
+    yet" (memory: s3-missing-key-403-vs-404). The listing is unambiguous, and
+    any S3 error -- on the list or the GET -- RAISES, so the caller fails open
+    instead of turning a missing grant into the full wait on every email."""
+    key = _sidecar_key(recording_key)
+    listed = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=key, MaxKeys=1)
+    if not any(o.get("Key") == key for o in listed.get("Contents") or []):
         return None
+    obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+    return json.loads(obj["Body"].read().decode("utf-8"))
 
 
 def _ledger_indices(session_id):
@@ -1002,26 +1008,37 @@ def _unsettled_chunks(conn, session_id):
     speech that is not registered yet -- would be missed by the tail seal and the
     final extraction, so the claim waits for it.
 
-    Only uploads from the last FINALIZE_SETTLE_MAX_SEC are asked about. Fails OPEN
-    (returns []): a check that cannot run must leave the sweep as it was before.
-    The read runs in a savepoint so a SQL error cannot abort the tick (R10)."""
+    A chunk is waited for until FINALIZE_SETTLE_MAX_SEC after its upload. Uploads
+    from twice that window are read, so one still unsettled past the cap is NAMED
+    in a warning when the claim goes ahead without it, not dropped in silence.
+
+    Fails OPEN (returns []): a check that cannot run -- SQL, DynamoDB or any S3
+    error -- must leave the sweep as it was before. The read runs in a savepoint
+    so a SQL error cannot abort the tick (R10)."""
     from transcript_utils import extract_chunk_index_from_filename
     try:
         with conn.transaction():
-            keys = recordings.recent_session_chunks(conn, session_id,
-                                                    FINALIZE_SETTLE_MAX_SEC)
-        if not keys:
+            rows = recordings.recent_session_chunks(conn, session_id,
+                                                    2 * FINALIZE_SETTLE_MAX_SEC)
+        if not rows:
             return []
         members = _ledger_indices(session_id) if BATCH_TRANSCRIPTION else set()
         s3 = None
-        out = []
-        for key in keys:
+        out, given_up = [], []
+        for r in rows:
+            key = r["s3_key"]
             if extract_chunk_index_from_filename(key) in members:
                 continue
             s3 = s3 or _s3_client()
             meta = _read_sidecar(s3, key)
             if meta is None or (BATCH_TRANSCRIPTION and meta.get("segments")):
-                out.append(key)
+                (given_up if r["age_s"] > FINALIZE_SETTLE_MAX_SEC else out).append(key)
+        if given_up and not out:
+            logger.warning("finalize: %s is claimed WITHOUT %d chunk(s) still not through "
+                           "VAD and the batch ledger after %ds -- its email will be "
+                           "missing them: %s", session_id, len(given_up),
+                           FINALIZE_SETTLE_MAX_SEC,
+                           ", ".join(k.rsplit("/", 1)[-1] for k in given_up))
         return out
     except Exception:
         logger.exception("finalize: could not check whether %s's uploads have settled "

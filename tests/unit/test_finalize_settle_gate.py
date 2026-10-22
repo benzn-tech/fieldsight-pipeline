@@ -20,11 +20,16 @@ import pytest
 mod = pytest.importorskip("lambda_finalize_claim")
 
 SID = "f59eb9274e8741a695ed6b5e36e0b605"
+_real_read_sidecar = mod._read_sidecar     # before any fixture stubs it
 
 
 def _key(i):
     return (f"users/Ben_Lin_test2/audio/2026-10-23/"
             f"ben_lin_2026-10-23_00-26-{i:02d}_sid{SID}_c{i:04d}.wav")
+
+
+def _rows(keys, ages=None):
+    return [{"s3_key": k, "age_s": (ages or {}).get(k, 5)} for k in keys]
 
 
 class FakeConn:
@@ -41,9 +46,10 @@ def world(monkeypatch):
     w = {"recent": [_key(0), _key(1), _key(2), _key(3)],
          "members": {0, 1, 2, 3},
          "sidecars": {},           # recording key -> sidecar dict (absent = not written)
+         "ages": {},               # recording key -> seconds since /complete (default 5)
          "calls": []}
     monkeypatch.setattr(mod.recordings, "recent_session_chunks",
-                        lambda conn, sid, within: list(w["recent"]))
+                        lambda conn, sid, within: _rows(w["recent"], w["ages"]))
     monkeypatch.setattr(mod, "_ledger_indices", lambda sid: set(w["members"]))
     monkeypatch.setattr(mod, "_read_sidecar",
                         lambda s3, key: w["sidecars"].get(key))
@@ -131,7 +137,8 @@ def test_the_window_asked_about_is_the_settle_bound(world, monkeypatch):
     monkeypatch.setattr(mod.recordings, "recent_session_chunks",
                         lambda conn, sid, within: seen.setdefault("within", within) and [])
     _sweep()
-    assert seen["within"] == mod.FINALIZE_SETTLE_MAX_SEC
+    # Twice the cap: a chunk past the cap is still SEEN, so it can be named (M3).
+    assert seen["within"] == 2 * mod.FINALIZE_SETTLE_MAX_SEC
     assert 60 <= mod.FINALIZE_SETTLE_MAX_SEC <= 600
 
 
@@ -153,7 +160,7 @@ def test_one_deferred_session_does_not_hold_up_another(world, monkeypatch):
                         lambda conn, grace: [{"session_id": SID, "version": 1},
                                              {"session_id": other, "version": 1}])
     monkeypatch.setattr(mod.recordings, "recent_session_chunks",
-                        lambda conn, sid, within: list(world["recent"]) if sid == SID else [])
+                        lambda conn, sid, within: _rows(world["recent"]) if sid == SID else [])
     world["members"] = {0}
     _sweep()
     assert world["calls"] == [("seal", other), ("finalize", other)]
@@ -171,3 +178,78 @@ def test_sidecar_key_mirrors_lambda_vad():
     info = lambda_vad.parse_source_filename(video)
     assert mod._sidecar_key(video) == (
         f"audio_segments/Ann/2026-10-23/{info['basename_no_ext']}_vad_metadata.json")
+
+
+def test_a_chunk_past_the_cap_is_claimed_without_but_named(world, caplog):
+    """M3: VAD throttled past the cap (the account concurrency ceiling during the
+    very backlog flush this gate exists for). The claim goes ahead -- one late
+    email beats none -- but it must say which chunk the email will be missing."""
+    world["members"] = {0, 1, 2}
+    world["ages"][_key(3)] = mod.FINALIZE_SETTLE_MAX_SEC + 1
+    with caplog.at_level("WARNING"):
+        _sweep()
+    assert world["calls"] == [("seal", SID), ("finalize", SID)]
+    warned = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any(SID in r.getMessage() and "c0003" in r.getMessage() for r in warned),         [r.getMessage() for r in warned]
+
+
+def test_a_chunk_inside_the_cap_still_waits(world):
+    world["members"] = {0, 1, 2}
+    world["ages"][_key(3)] = mod.FINALIZE_SETTLE_MAX_SEC - 1
+    _sweep()
+    assert world["calls"] == []
+
+
+# --- M4: what the sidecar read can answer ------------------------------------
+
+class FakeS3:
+    def __init__(self, objects=None, list_error=None, get_error=None):
+        self.objects = objects or {}
+        self.list_error, self.get_error = list_error, get_error
+
+    def list_objects_v2(self, Bucket, Prefix, MaxKeys=1000):
+        if self.list_error:
+            raise self.list_error
+        return {"Contents": [{"Key": k} for k in sorted(self.objects) if k.startswith(Prefix)]}
+
+    def get_object(self, Bucket, Key):
+        if self.get_error:
+            raise self.get_error
+        import io
+        import json
+        return {"Body": io.BytesIO(json.dumps(self.objects[Key]).encode())}
+
+
+class AccessDenied(Exception):
+    pass
+
+
+def test_read_sidecar_absent_is_not_there_yet():
+    """Listed, not guessed from a GET's 403-vs-404 (which depends on how the
+    ListBucket grant is conditioned): an empty listing is "not written yet"."""
+    assert mod._read_sidecar(FakeS3(), _key(3)) is None
+
+
+def test_read_sidecar_present_is_read():
+    s3 = FakeS3({mod._sidecar_key(_key(3)): {"segments": []}})
+    assert mod._read_sidecar(s3, _key(3)) == {"segments": []}
+
+
+def test_read_sidecar_other_errors_raise():
+    with pytest.raises(AccessDenied):
+        mod._read_sidecar(FakeS3(list_error=AccessDenied()), _key(3))
+    s3 = FakeS3({mod._sidecar_key(_key(3)): {}}, get_error=AccessDenied())
+    with pytest.raises(AccessDenied):
+        mod._read_sidecar(s3, _key(3))
+
+
+def test_an_s3_permission_error_fails_the_gate_open(world, monkeypatch, caplog):
+    """A missing grant must not add the whole cap to every email: the gate
+    stands aside and says so."""
+    world["members"] = {0}
+    monkeypatch.setattr(mod, "_read_sidecar", _real_read_sidecar)   # the fixture stubbed it
+    monkeypatch.setattr(mod, "_s3_client", lambda: FakeS3(list_error=AccessDenied()))
+    with caplog.at_level("ERROR"):
+        _sweep()
+    assert world["calls"] == [("seal", SID), ("finalize", SID)]
+    assert any("claiming without waiting" in r.getMessage() for r in caplog.records)
