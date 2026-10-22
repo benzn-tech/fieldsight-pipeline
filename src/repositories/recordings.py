@@ -52,13 +52,16 @@ def get_by_id(conn, rec_id) -> dict | None:
     ).fetchone()
 
 
-def mark_uploaded(conn, rec_id, company_id, size_bytes=None, gps_track=None) -> dict | None:
+def mark_uploaded(conn, rec_id, user_id, size_bytes=None, gps_track=None) -> dict | None:
+    """Stamp the row uploaded. Scoped on the RECORDER (`user_id`), not a company:
+    `/upload-url` stores the site's company on the row, which for a member
+    capturing onto a partner company's site is not the recorder's own."""
     return conn.cursor(row_factory=dict_row).execute(
         f"UPDATE recordings SET uploaded_at=now(), "
         f"size_bytes=COALESCE(%s, size_bytes), "
         f"gps_track=COALESCE(%s, gps_track) "
-        f"WHERE id=%s AND company_id=%s RETURNING {_COLS}",
-        (size_bytes, Jsonb(gps_track) if gps_track is not None else None, rec_id, company_id),
+        f"WHERE id=%s AND user_id=%s RETURNING {_COLS}",
+        (size_bytes, Jsonb(gps_track) if gps_track is not None else None, rec_id, user_id),
     ).fetchone()
 
 
