@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 
 import ask_tools_log
+import lexical_terms
 import query_slots
 
 logger = logging.getLogger()
@@ -217,12 +218,23 @@ def validate_call(call, today):
 
 # --- execution (spec §3.2-§3.4) ---------------------------------------------
 
-# Spec §3.2: <= 2,500 tokens per tool result, measured as
+# Spec §3.2: <= ~3,100 tokens per tool result, measured as
 # json.dumps(items, ensure_ascii=False). SEAM: the orchestrator must render tool
 # results the same way -- with the default ensure_ascii=True a CJK character costs
 # six characters (\uXXXX), and a Chinese day would fit 2 topics where English fits 15.
-MAX_RESULT_CHARS = 10_000
+# 12,000 (was 10,000) so DEFAULT_K = 8 full WINDOW_CHARS items still fit:
+# 8 x (p95 + W + 2) + 2 rounded up to 500, where p95 = 477 is an item's JSON besides
+# its text (ids, source key, newline escapes), measured by the item-window replay over
+# real rows (2026-10-22-ask-tools-item-window plan Task 10; max 490).
+MAX_RESULT_CHARS = 12_000
+# Item text (spec 2026-10-22-ask-tools-item-window §5). A topic row, person or metric
+# keeps the first MAX_TEXT characters. A recording chunk (transcript window, topic,
+# session digest) or a document chunk is packed to ~2,600 characters, so it shows a
+# WINDOW_CHARS window centred on the query's terms instead (`_window`): lines for
+# recordings, blank-line paragraphs for documents; a topic/digest chunk keeps line 1.
 MAX_TEXT = 600
+WINDOW_CHARS = 1000
+_KEEP_FIRST = ("topic", "session_digest")
 # Spec §3.4: one rag-search batch is at most 4 calls and never plans past 20 s
 # (RagSearchFunction Timeout is 23 s).
 MAX_BATCH = 4
@@ -320,12 +332,183 @@ def _time_start(row):
         return None
 
 
-def _text(value):
-    """Item text: a string capped at MAX_TEXT. A non-string value is coerced, so
-    one malformed row can never fail the turn."""
+def _coerce(value):
+    """A string. A non-string value is coerced, so one malformed row can never fail
+    the turn."""
     if value is None:
         return ""
-    return (value if isinstance(value, str) else str(value))[:MAX_TEXT]
+    return value if isinstance(value, str) else str(value)
+
+
+def _text(value):
+    """Item text: a string capped at MAX_TEXT."""
+    return _coerce(value)[:MAX_TEXT]
+
+
+def _window_terms(query):
+    """The words an item window centres on: `query_terms` minus ASKING_WORDS,
+    deduplicated in order. CJK bigrams are kept (unlike `subject_terms`): a Chinese
+    query over Chinese speech must centre too. Lowercase only, no ASCII step."""
+    if not isinstance(query, str):
+        return []
+    out = []
+    for t in lexical_terms.query_terms(query):
+        if t not in lexical_terms.ASKING_WORDS and t not in out:
+            out.append(t)
+    return out
+
+
+# A unit longer than the room is cut by characters; each cut end moves to the nearest
+# space within this many characters, else it is a hard cut (CJK has no spaces).
+SNAP_CHARS = 40
+_ELLIPSIS = "…"
+# `session_index._window_line`: `[HH:MM:SS] speaker: text`. Kept on a cut turn.
+_TURN_PREFIX = re.compile(r"\[\d\d:\d\d:\d\d\] [^:\n]{1,60}: ")
+_TURN_TIME = re.compile(r"\[(\d\d:\d\d:\d\d)\]")
+
+
+def _unit_score(unit, terms):
+    """(distinct terms found, total occurrences) in one unit, by lowercase substring."""
+    low = unit.lower()
+    found = frozenset(t for t in terms if t in low)
+    return found, sum(low.count(t) for t in found)
+
+
+def _cut(unit, terms, budget, keep_prefix):
+    """`unit` cut to <= `budget` characters around its earliest term hit (the start
+    when none hits). A transcript turn keeps its `[HH:MM:SS] spk: ` prefix. Each cut
+    end moves inward to a space within SNAP_CHARS, never past the hit, and is marked
+    with an inline `…`."""
+    budget = max(budget, 0)
+    if len(unit) <= budget:
+        return unit
+    prefix = ""
+    m = _TURN_PREFIX.match(unit) if keep_prefix else None
+    if m and len(m.group(0)) <= budget // 2:
+        prefix = m.group(0)
+    body = unit[len(prefix):]
+    avail = budget - len(prefix) - 2 * len(_ELLIPSIS)
+    if avail <= 0:
+        return unit[:budget]
+    pos, hl = 0, 0
+    for t in terms:
+        # On the original text, not an offset into body.lower(): lower() can change
+        # a string's length (review NIT 1).
+        hit = re.search(re.escape(t), body, re.IGNORECASE)
+        if hit and (not hl or hit.start() < pos):
+            pos, hl = hit.start(), len(hit.group(0))
+    start = max(0, min(pos + hl // 2 - avail // 2, len(body) - avail))
+    end = min(len(body), start + avail)
+    if start > 0 and body[start - 1] != " ":
+        sp = body.find(" ", start, start + SNAP_CHARS)
+        if sp != -1 and sp + 1 <= pos:
+            start = sp + 1
+    if end < len(body) and body[end] != " ":
+        sp = body.rfind(" ", max(start, end - SNAP_CHARS), end)
+        if sp != -1 and sp >= pos + hl:
+            end = sp
+    piece = body[start:end]
+    if start > 0:
+        piece = _ELLIPSIS + piece.lstrip(" ")
+    if end < len(body):
+        piece = piece.rstrip(" ") + _ELLIPSIS
+    return prefix + piece
+
+
+def _window(text, terms, cap, sep="\n", keep_first=False):
+    """The part of `text` an item shows: (shown, first_unit_index, mode).
+
+    Spec 2026-10-22-ask-tools-item-window §4-§5, review BLOCKER 1. `mode` is
+    "whole" (text <= cap, returned unchanged), "window" (centred on the terms) or
+    "head" (no term hits: today's head rule, on whole units). `first_unit_index` is
+    the index in text.split(sep) of the first unit shown after skipped ones (0 when
+    nothing above was skipped): `_item` reads a turn's time from it.
+
+        units = text.split(sep)            -- never splitlines(): `\\r` stays on its unit
+        keep_first: units[0] always shown (topic/digest header), the rest is the body
+        score(unit) = (terms found, occurrences), lowercase substring
+        candidates: every run body[i..j] whose joined length plus markers fits, and
+                    every single unit too long to fit even alone
+        best = max by (distinct terms, occurrences, fewest units, earliest start)
+        an oversize best: cut by characters around its first hit (_cut)
+        a run best: extended by the unit before, then after, alternately, while it
+                    fits; a side that does not fit stops, the other is still tried
+        markers: a `…` unit before the run when units above were skipped, after it
+                 when units below were; they count against `cap`
+
+    "Fewest units" before "earliest" picks the tightest run around the hits, so the
+    extension centres it; otherwise a lone hit lands at the bottom edge of the run.
+    """
+    if len(text) <= cap:
+        return text, 0, "whole"
+    units = text.split(sep)
+    mark = len(_ELLIPSIS) + len(sep)
+    head = []
+    if keep_first and len(units) > 1 and len(units[0]) + len(sep) <= cap // 2:
+        head = units[:1]
+    room = cap - (len(head[0]) + len(sep) if head else 0)
+    body = units[len(head):]
+    n = len(body)
+    acc = [0]
+    for u in body:
+        acc.append(acc[-1] + len(u))
+
+    def cost(i, j):
+        return (acc[j + 1] - acc[i] + (j - i) * len(sep)
+                + (mark if i > 0 else 0) + (mark if j < n - 1 else 0))
+
+    def shown(parts, i, j):
+        return sep.join(head + ([_ELLIPSIS] if i > 0 else []) + parts
+                        + ([_ELLIPSIS] if j < n - 1 else []))
+
+    def first(i):
+        return i + len(head) if i > 0 else 0
+
+    keep_prefix = sep == "\n"
+    scores = [_unit_score(u, terms) for u in body]
+    if not any(found for found, _ in scores):
+        j = -1
+        while j + 1 < n and cost(0, j + 1) <= room:
+            j += 1
+        if j < 0:                                       # the first unit alone is too long
+            budget = room - cost(0, 0) + len(body[0])
+            return shown([_cut(body[0], (), budget, keep_prefix)], 0, 0), 0, "head"
+        return shown(body[:j + 1], 0, j), 0, "head"
+
+    best = None
+    for i in range(n):
+        if cost(i, i) > room:
+            key = (len(scores[i][0]), scores[i][1], 0, -i)
+            if best is None or key > best[0]:
+                best = (key, i, None)
+            continue
+        found, hits = set(), 0
+        for j in range(i, n):
+            if cost(i, j) > room:
+                break
+            found |= scores[j][0]
+            hits += scores[j][1]
+            key = (len(found), hits, -(j - i), -i)
+            if best is None or key > best[0]:
+                best = (key, i, j)
+    _, i, j = best
+    if j is None:                                       # one oversize unit
+        budget = room - cost(i, i) + len(body[i])
+        return shown([_cut(body[i], terms, budget, keep_prefix)], i, i), first(i), "window"
+    prev_open, next_open, turn = True, True, 0
+    while prev_open or next_open:
+        if turn == 0 and prev_open:
+            if i > 0 and cost(i - 1, j) <= room:
+                i -= 1
+            else:
+                prev_open = False
+        elif turn == 1 and next_open:
+            if j < n - 1 and cost(i, j + 1) <= room:
+                j += 1
+            else:
+                next_open = False
+        turn ^= 1
+    return shown(body[i:j + 1], i, j), first(i), "window"
 
 
 def _metric_text(metric, row):
@@ -351,10 +534,14 @@ def _metadata(row):
 
 
 def _item(name, args, row, call_id):
-    """(kind, dedupe ident, item-without-ref) for one dispatcher row."""
+    """(kind, dedupe ident, item-without-ref) for one dispatcher row. A chunk or
+    document item also carries `_window` (its `_window` mode), which `_envelope`
+    counts and removes."""
     if name == DOC_TOOL:
         # Before the shape check (R1): a document row carries chunk_text and would
         # otherwise become a recording chunk with provenance "records".
+        text, _, mode = _window(_coerce(row.get("chunk_text")),
+                                _window_terms(args.get("query")), WINDOW_CHARS, sep="\n\n")
         return "document", row.get("id"), {
             "kind": "document", "provenance": "documents",
             "title": row.get("title"), "heading": row.get("heading"),
@@ -362,7 +549,7 @@ def _item(name, args, row, call_id):
             "document_id": row.get("document_id"), "series_id": row.get("series_id"),
             "revision": row.get("revision"), "site": row.get("site_name"),
             "site_id": row.get("site_id"), "content_type": row.get("content_type"),
-            "text": _text(row.get("chunk_text"))}
+            "text": text, "_window": mode}
     if name == "find_people":
         return "person", row.get("person_ref"), {
             "kind": "person", "provenance": "records", "who": row.get("name"),
@@ -376,6 +563,17 @@ def _item(name, args, row, call_id):
     if "chunk_text" in row:
         md = _metadata(row)
         span = md.get("window_span")
+        full = _coerce(row.get("chunk_text"))
+        chunk_type = row.get("chunk_type")
+        text, first, mode = _window(full, _window_terms(args.get("query")), WINDOW_CHARS,
+                                    keep_first=chunk_type in _KEEP_FIRST)
+        time_start = _time_start(dict(row, metadata=md))
+        if chunk_type == "transcript_window" and first > 0:
+            # The card jumps to what the model read (spec §7). Only a turn line carries
+            # `[HH:MM:SS]`; anything else keeps the span start (review BLOCKER 3).
+            m = _TURN_TIME.match(full.split("\n")[first])
+            if m:
+                time_start = m.group(1)
         return "chunk", row.get("id"), {
             "kind": "chunk", "provenance": "records",
             "date": str(row.get("report_date") or ""),
@@ -383,10 +581,9 @@ def _item(name, args, row, call_id):
             "site": row.get("site_name"), "site_slug": row.get("site_slug"),
             "who": row.get("user_name"),
             "title": row.get("topic_title") or row.get("title"),
-            "text": _text(row.get("chunk_text")),
+            "text": text, "_window": mode,
             "topic_id": row.get("topic_id"), "chunk_id": row.get("id"),
-            "chunk_type": row.get("chunk_type"),
-            "time_start": _time_start(dict(row, metadata=md)),
+            "chunk_type": chunk_type, "time_start": time_start,
             "source": row.get("source_s3_key")}
     return "topic", row.get("id"), {
         "kind": "topic", "provenance": "records",
@@ -410,6 +607,7 @@ def _size(obj):
 
 def _envelope(name, call_id, args, rows, meta, ctx):
     items, used, seen = [], 2, set()                    # 2: the list's brackets
+    shown = {"window": 0, "head": 0}                    # `_window` modes, for the log
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -421,6 +619,7 @@ def _envelope(name, call_id, args, rows, meta, ctx):
         key = None if ident in (None, "") else (kind, str(ident))
         if key is not None and key in seen:
             continue                                    # same row twice in one result
+        mode = item.pop("_window", None)
         keep = _CITATION_KEYS if kind in ("topic", "chunk") else ()
         item = {k: v for k, v in item.items() if v is not None or k in keep}
         # Measured before a ref is assigned: a dropped item must not consume one.
@@ -435,7 +634,13 @@ def _envelope(name, call_id, args, rows, meta, ctx):
             seen.add(key)
         items.append({"ref": ref, **item})
         used += size
+        if mode in shown:
+            shown[mode] += 1
     meta.setdefault("truncated", False)
+    if any(shown.values()):
+        # Counts only. `ask_orchestrator._header` reads named meta keys, so these
+        # never reach the judge.
+        meta["windowed"], meta["head"] = shown["window"], shown["head"]
     if not items and not meta.get("empty_reason") and not meta.get("error"):
         # §3.3: items [] always comes with a reason. A result that gives none
         # (malformed, or every row unusable) is a failure, not "nothing there".
@@ -567,9 +772,9 @@ def _execute(calls, ctx):
         env = _envelope(name, cid, args, rows, meta, ctx)
         fields, days = arg_shape(args)
         logger.info("ask tool %s fields=%s days=%s items=%d rows=%d empty=%s err=%s "
-                    "truncated=%s caller=%s",
+                    "truncated=%s windowed=%d head=%d caller=%s",
                     name, fields, days, len(env["items"]), len(rows),
                     meta.get("empty_reason"), meta.get("error"), meta.get("truncated"),
-                    sub_hash(ctx.caller_sub))
+                    meta.get("windowed", 0), meta.get("head", 0), sub_hash(ctx.caller_sub))
         envs[int(cid)] = env
     return envs
