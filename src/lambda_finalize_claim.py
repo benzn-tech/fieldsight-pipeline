@@ -84,6 +84,14 @@ IDLE_CLOSE_SECONDS = IDLE_CLOSE_MINUTES * 60
 # COALESCE falls back to opened_at) would be closed prematurely. Flipped on WITH
 # that lambda's deploy.
 INFER_IDLE_CLOSE = os.environ.get("INFER_IDLE_CLOSE", "false").lower() == "true"
+# Owner decision (M2): chunks that arrive after a session was idle-closed and
+# emailed (a phone offline > IDLE_CLOSE_MINUTES) reopen it, so it is
+# re-finalized with a complete "Updated" email. "Late" is last_chunk_at >
+# closed_chunk_at -- device time vs device time, so clock skew cancels (BUG-37);
+# see meeting_session.reopen_late. Per-stage SAM parameter ReopenLateChunks.
+REOPEN_LATE_CHUNKS = os.environ.get("REOPEN_LATE_CHUNKS", "false").lower() == "true"
+# At most this many reopens per session; past it the late chunk is logged, not sent.
+REOPEN_MAX = int(os.environ.get("REOPEN_MAX", "3"))
 # Phase C multi-device merge. Off means the standing scan never runs, so no
 # group is ever claimed and every downstream branch stays inert.
 ENABLE_GROUP_MERGE = os.environ.get("ENABLE_GROUP_MERGE", "false").lower() == "true"
@@ -837,16 +845,27 @@ def _seal_tail_batches(session_id):
                          "extraction may be missing its last chunks", session_id)
 
 
-def sweep(conn, grace_seconds=None, idle_seconds=None, infer_idle=None):
+def sweep(conn, grace_seconds=None, idle_seconds=None, infer_idle=None, reopen=None):
     """Finalize every session on `conn` whose grace has elapsed, reusing
     finalize_claim per session (CAS-claim -> gather -> enqueue). First (when
     enabled) infers idle closes (§8.4): an `open` session gone quiet becomes
     pending_close and is then picked up by the same due-check. Returns the list of
     per-session status dicts. Separated from lambda_handler so the sweep loop is
-    testable without a real DB connection; `infer_idle` overrides the env gate."""
+    testable without a real DB connection; `infer_idle` overrides the env gate.
+
+    Before anything else (when `reopen`, default REOPEN_LATE_CHUNKS) reopens
+    idle-closed sent/failed sessions that have since received a later chunk;
+    they are `open` again and close + finalize through the normal path."""
     grace = STOP_GRACE_SECONDS if grace_seconds is None else grace_seconds
     idle = IDLE_CLOSE_SECONDS if idle_seconds is None else idle_seconds
     do_infer = INFER_IDLE_CLOSE if infer_idle is None else infer_idle
+    do_reopen = REOPEN_LATE_CHUNKS if reopen is None else reopen
+    if do_reopen:
+        for row in meeting_session.reopen_late(conn, REOPEN_MAX):
+            logger.info("finalize: reopened %s after a late chunk (reopen %d)",
+                        row["session_id"], row["reopen_count"])
+        for sid in meeting_session.list_reopen_capped(conn, REOPEN_MAX):
+            logger.warning("finalize: %s has a late chunk but reached REOPEN_MAX", sid)
     if do_infer:
         infer_idle_closes(conn, idle)
     # A STANDING pass, before the due-session loop and independent of it. Sealing otherwise

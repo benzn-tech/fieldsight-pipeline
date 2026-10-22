@@ -18,7 +18,8 @@ _COLS = (
     "session_id, company_id, user_id, site_id, kind, status, version, "
     "opened_at, last_segment_at, closed_at, close_intent, rolling_summary, "
     "rolling_summary_version, segment_count, word_count, created_at, updated_at, "
-    "group_id, group_ended_at, finalizing_at"
+    "group_id, group_ended_at, finalizing_at, "
+    "session_type, last_chunk_at, closed_chunk_at, reopen_count"
 )
 
 
@@ -203,15 +204,23 @@ def group_span_ok(conn, group_id, max_span_seconds) -> bool:
     return float(span) <= float(max_span_seconds)
 
 
-def touch_segment(conn, session_id, at) -> dict | None:
+def touch_segment(conn, session_id, at, chunk_at=None) -> dict | None:
     """A chunk arrived. Advance last_segment_at + segment_count. If the session
     was `pending_close`, this arrival is a RESUME within the grace window: flip
     back to `open`, clear the close, and bump `version` so the scheduled finalize
     no-ops. All SET expressions read the OLD row, so the version bump and status
-    flip both key off the pre-update status."""
+    flip both key off the pre-update status.
+
+    `chunk_at` is the chunk's DEVICE file-name time (UTC). When given it
+    advances `last_chunk_at` (never backwards), which reopen_late compares with
+    the snapshot taken at an idle close. None leaves `last_chunk_at` alone."""
+    chunk_set = ("last_chunk_at = GREATEST(COALESCE(last_chunk_at, %s), %s), "
+                 if chunk_at is not None else "")
+    chunk_args = (chunk_at, chunk_at) if chunk_at is not None else ()
     return conn.cursor(row_factory=dict_row).execute(
         f"UPDATE meeting_session SET "
         f"last_segment_at = GREATEST(COALESCE(last_segment_at, %s), %s), "
+        f"{chunk_set}"
         f"segment_count = segment_count + 1, "
         f"version = CASE WHEN status = 'pending_close' THEN version + 1 ELSE version END, "
         f"closed_at = CASE WHEN status = 'pending_close' THEN NULL ELSE closed_at END, "
@@ -219,20 +228,26 @@ def touch_segment(conn, session_id, at) -> dict | None:
         f"status = CASE WHEN status = 'pending_close' THEN 'open' ELSE status END, "
         f"updated_at = now() "
         f"WHERE session_id = %s RETURNING {_COLS}",
-        (at, at, session_id),
+        (at, at, *chunk_args, session_id),
     ).fetchone()
 
 
 def mark_pending_close(conn, session_id, closed_at, intent) -> dict | None:
     """Stop signal received -> `pending_close`; bump `version` (the grace timer is
-    scheduled against the returned version). No-op if already finalizing/sent."""
+    scheduled against the returned version). No-op if already finalizing/sent.
+
+    An IDLE close snapshots `last_chunk_at` into `closed_chunk_at`: the device
+    time of the newest chunk the email will cover, which reopen_late compares a
+    later chunk against. An `end` close leaves it NULL (never reopened)."""
     return conn.cursor(row_factory=dict_row).execute(
         f"UPDATE meeting_session SET "
         f"status = 'pending_close', closed_at = %s, close_intent = %s, "
+        f"closed_chunk_at = CASE WHEN %s::text = 'idle' THEN last_chunk_at "
+        f"ELSE closed_chunk_at END, "
         f"version = version + 1, updated_at = now() "
         f"WHERE session_id = %s AND status IN ('open', 'pending_close') "
         f"RETURNING {_COLS}",
-        (closed_at, intent, session_id),
+        (closed_at, intent, intent, session_id),
     ).fetchone()
 
 
@@ -300,8 +315,50 @@ def list_finalizing(conn) -> list[dict]:
     same rows: a second query would be a second answer to one question."""
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT session_id, version, user_id, site_id, opened_at, closed_at, "
-        "finalizing_at FROM meeting_session WHERE status = 'finalizing'",
+        "finalizing_at, session_type, reopen_count "
+        "FROM meeting_session WHERE status = 'finalizing'",
     ).fetchall()
+
+
+# The late-chunk test compares last_chunk_at with closed_chunk_at -- BOTH the
+# device's file-name time -- and never with closed_at (server time). Device
+# clocks can be hours off (BUG-37); comparing device time with device time
+# cancels the skew, while device-vs-server would reopen every session from a
+# fast device and never one from a slow device. A NULL snapshot (closed before
+# 0089, or an `end` close) compares as unknown and so never reopens.
+# `finalizing` is deliberately excluded: the send in flight settles first
+# (sent/failed), and the next tick reopens it.
+_LATE_CHUNK_WHERE = (
+    "status IN ('sent', 'failed') AND close_intent = 'idle' "
+    "AND last_chunk_at > closed_chunk_at"
+)
+
+
+def reopen_late(conn, max_reopens: int) -> list[dict]:
+    """Reopen every idle-closed, settled session that has since received a chunk
+    newer (device time) than the one its email covered -- a phone that was
+    offline past the idle window. `open` again with `version` bumped and the
+    close cleared, so the normal idle-close -> finalize path re-sends it.
+    At most `max_reopens` times per session. Returns [{session_id, reopen_count}]."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "UPDATE meeting_session SET status = 'open', version = version + 1, "
+        "reopen_count = reopen_count + 1, closed_at = NULL, close_intent = NULL, "
+        "closed_chunk_at = NULL, finalizing_at = NULL, updated_at = now() "
+        f"WHERE {_LATE_CHUNK_WHERE} AND reopen_count < %s "
+        "RETURNING session_id, reopen_count",
+        (max_reopens,),
+    ).fetchall()
+
+
+def list_reopen_capped(conn, max_reopens: int) -> list[str]:
+    """Sessions that WOULD reopen on a late chunk but already reached the cap --
+    so the sweep can say so rather than drop the chunk in silence."""
+    rows = conn.cursor(row_factory=dict_row).execute(
+        f"SELECT session_id FROM meeting_session "
+        f"WHERE {_LATE_CHUNK_WHERE} AND reopen_count >= %s ORDER BY session_id",
+        (max_reopens,),
+    ).fetchall()
+    return [r["session_id"] for r in rows]
 
 
 def count_live(conn) -> int:
