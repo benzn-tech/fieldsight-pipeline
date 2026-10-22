@@ -3,7 +3,9 @@
 Two kinds of pin, both scoped to one (folder, day) -- the scope the rebind covers:
 
   * voice_note -- a phone voice note claimed the photo at /open
-    (`voice_note_photo`). The photo sits under the note's own topic. The rows are
+    (`voice_note_photo`). The photo sits under the note's own topic (and waits,
+    unbound, while the note is pending without one; a note that settled with no
+    topic releases it to time binding). The rows are
     DERIVED, never stored by topic id: every rebind deletes the day's
     `source='voice_note'` rows and rebuilds them from `voice_note_photo`, so a pin
     follows the live topic when item-writer supersedes the note's placeholder and
@@ -76,19 +78,33 @@ def apply_voice_note_pins(conn, user_folder, date) -> int:
 
 
 def pinned_photo_keys(conn, user_folder, date) -> set:
-    """Keys under this day's picture prefix the matcher must not bind: every key a
-    voice note has claimed (bound under its topic or not -- a claimed photo whose
-    note has no topic yet stays unbound rather than drifting to a meeting), plus
-    every key with a `source='human'` row on a visible topic."""
+    """Keys under this day's picture prefix the matcher must not bind:
+
+      * a key a voice note has claimed, while that note either has a visible
+        topic under this folder (it is, or will be, pinned there) or is still
+        pending -- `meeting_session.status` not in ('sent','failed') -- so its
+        topic may yet be written; until then the photo stays unbound rather than
+        drifting to a meeting. Once the note has settled with no topic (e.g. an
+        empty extraction), no topic will ever come, so the photo falls back to
+        time binding instead of staying unbound forever.
+      * every key with a `source='human'` row on a visible topic.
+
+    `voice_note_photo.session_id` is a NOT NULL FK to meeting_session, so the
+    inner join drops nothing."""
     prefix = _picture_prefix(user_folder, date)
     rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT r.s3_key FROM voice_note_photo v "
         "JOIN recordings r ON r.user_id = v.user_id AND r.client_uuid = v.photo_client_uuid "
+        "JOIN meeting_session ms ON ms.session_id = v.session_id "
         "WHERE r.s3_key LIKE %s ESCAPE '\\' "
+        "AND (ms.status NOT IN ('sent', 'failed') OR EXISTS ("
+        "  SELECT 1 FROM topics t WHERE t.source_s3_key LIKE "
+        "       %s || v.session_id || '.json' ESCAPE '\\' "
+        f"  AND {visible_topics_predicate('t')})) "
         "UNION "
         "SELECT tp.s3_key FROM topic_photos tp JOIN topics t ON t.id = tp.topic_id "
         "WHERE tp.source = 'human' AND tp.s3_key LIKE %s ESCAPE '\\' "
         f"AND {visible_topics_predicate('t')}",
-        (prefix, prefix),
+        (prefix, f"extractions/{_escape_like(user_folder)}/%/sid", prefix),
     ).fetchall()
     return {r["s3_key"] for r in rows}

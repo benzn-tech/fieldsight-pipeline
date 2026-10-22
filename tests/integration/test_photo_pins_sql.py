@@ -44,11 +44,12 @@ def _photo(db, cid, uid, site, key=PHOTO, client_uuid="u1", uploaded=True):
         (cid, uid, site, key, client_uuid))
 
 
-def _session(db, cid, uid, opened_at):
+def _session(db, cid, uid, opened_at, status="open"):
     sid = uuid.uuid4().hex
     db.execute(
-        "INSERT INTO meeting_session (session_id, company_id, user_id, session_type, opened_at) "
-        "VALUES (%s, %s, %s, 'voice_note', %s)", (sid, cid, uid, opened_at))
+        "INSERT INTO meeting_session (session_id, company_id, user_id, session_type, "
+        "opened_at, status) VALUES (%s, %s, %s, 'voice_note', %s, %s)",
+        (sid, cid, uid, opened_at, status))
     return sid
 
 
@@ -105,11 +106,33 @@ def test_unpinned_photo_binds_by_time(db):
 
 
 def test_claimed_but_no_topic_stays_unbound(db):
+    # The note is still pending (open): its topic may yet be written, so the
+    # photo waits rather than drifting to the meeting.
     cid, uid, _, _, _, _ = _world(db)
-    s2 = _session(db, cid, uid, "2026-10-21T09:30:00Z")
+    s2 = _session(db, cid, uid, "2026-10-21T09:30:00Z", status="open")
     voice_note_photo.link(db, uid, s2, ["u1"])
     _rebind(db, cid)
     assert _rows_for(db, PHOTO) == []
+
+
+@pytest.mark.parametrize("status", ["sent", "failed"])
+def test_claimed_by_a_settled_note_with_no_topic_binds_by_time(db, status):
+    # The note is done and never got a topic (e.g. an empty extraction): no
+    # topic will ever appear, so the claim must not hold the photo out of the
+    # time match forever.
+    cid, uid, _, _, _, m_topic = _world(db)
+    s2 = _session(db, cid, uid, "2026-10-21T09:30:00Z", status=status)
+    voice_note_photo.link(db, uid, s2, ["u1"])
+    _rebind(db, cid)
+    assert _rows_for(db, PHOTO) == [(str(m_topic), "binding")]
+
+
+def test_settled_note_with_a_topic_still_pins(db):
+    cid, uid, _, s, s_topic, _ = _world(db)
+    db.execute("UPDATE meeting_session SET status = 'sent' WHERE session_id = %s", (s,))
+    voice_note_photo.link(db, uid, s, ["u1"])
+    _rebind(db, cid)
+    assert _rows_for(db, PHOTO) == [(str(s_topic), "voice_note")]
 
 
 def test_later_note_replaces_the_pin(db):
