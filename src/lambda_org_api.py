@@ -6797,9 +6797,13 @@ def resend_member_invite(conn, caller, target_sub):
     that reach answers 404 rather than 403 so the route does not confirm which
     subs exist elsewhere.
 
-    The Cognito login is addressed by the member's sub (the pool's Username),
-    not by the email in Aurora, so a drifted email column cannot point the
-    resend at a different login. Nothing in Aurora changes."""
+    The login is looked up by the member's sub, and the resend then names it
+    by the email Cognito itself holds for that sub -- not the email in Aurora,
+    so a drifted email column cannot point the resend at a different login.
+    It has to be an email: this pool signs in by email, and AdminCreateUser
+    rejects a sub as Username ("Username should be an email") even with
+    MessageAction=RESEND, while AdminGetUser accepts either (TEST, 2026-10-22).
+    Nothing in Aurora changes."""
     if caller["global_role"] not in ("admin", "platform_admin"):
         return error("admin role required", 403)
     target = users.get_user_by_sub(conn, target_sub)
@@ -6823,10 +6827,14 @@ def resend_member_invite(conn, caller, target_sub):
             "This person has already accepted the invitation and set a password. "
             "If they cannot sign in, ask them to use 'Forgot password' on the sign-in page.",
             409, extra={"user_status": status})
+    email = next((a["Value"] for a in got.get("UserAttributes", [])
+                  if a.get("Name") == "email"), None)
+    if not email:
+        return error("this login has no email address to send the invitation to", 409)
     try:
         client.admin_create_user(
             UserPoolId=COGNITO_USER_POOL_ID,
-            Username=target_sub,
+            Username=email,
             MessageAction="RESEND",
             DesiredDeliveryMediums=["EMAIL"],
         )
@@ -6837,8 +6845,6 @@ def resend_member_invite(conn, caller, target_sub):
                 "This person has just accepted the invitation -- no resend needed.",
                 409, extra={"user_status": "CONFIRMED"})
         raise
-    email = next((a["Value"] for a in got.get("UserAttributes", [])
-                  if a.get("Name") == "email"), target.get("email"))
     logger.info("resend-invite: %s re-sent invitation to %s", caller.get("cognito_sub"), target_sub)
     return ok({"resent": True, "email": email, "user_status": status})
 
