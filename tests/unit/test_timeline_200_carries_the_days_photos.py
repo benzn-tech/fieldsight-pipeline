@@ -62,9 +62,11 @@ def wired(monkeypatch):
                         lambda conn, prefix: [{"site_id": SITE_ID}])
     monkeypatch.setattr(org, "_allowed_site_ids", lambda conn, caller: {SITE_ID})
     monkeypatch.setattr(org, "_get_lake_json", lambda key: None)
+    # One topic, because a rendered shape with NO topics is a deleted day and is not served.
     monkeypatch.setattr(org, "render_report_shape",
                         lambda rows, doc, date, user, conn=None, company_id=None:
-                        {"report_date": date, "topics": [], "_report_metadata": {}})
+                        {"report_date": date, "_report_metadata": {},
+                         "topics": [{"topic_id": 0, "related_photos": []}]})
     monkeypatch.setattr(org.recordings, "photo_list_for_day",
                         lambda conn, company, folder, date: list(THREE_PHOTOS))
     monkeypatch.setattr(org.redactions, "deleted_photo_keys",
