@@ -131,11 +131,16 @@ def iter_assignments(run_dir):
 
 def _assignments_for_chain(shape, arm, rep, session_dir):
     steps = _load_chain_steps(session_dir)
+    # Mirrors run.py's `next_prior = topics if topics else prior_topics`: an empty step does
+    # not reset the prior list, so the annotator sees the list the model was actually shown.
+    prior_topics = None
     for step_idx in range(1, len(steps)):
+        prev_topics = steps[step_idx - 1].get("extraction", {}).get("topics")
+        if prev_topics:
+            prior_topics = prev_topics
         step = steps[step_idx]
         if step.get("void"):
             continue
-        prior_topics = steps[step_idx - 1].get("extraction", {}).get("topics")
         prior_list = item_continuity.prior_items({"topics": prior_topics})
         prior_by_kind = {}
         for p in prior_list:

@@ -378,3 +378,18 @@ def test_adjudication_row_carries_the_same_transcript_ref(tmp_path):
     [row] = label.build_adjudication_todo(tmp_path, agent_done, tmp_path / "continuity_eval_runs" / "adj.jsonl",
                                             sample_rate=0.0)
     assert row["transcript_ref"] == assignment["transcript_ref"]
+
+
+def test_iter_assignments_pairs_against_the_last_non_empty_step_like_run_py(tmp_path):
+    # run.py feeds the next step `topics if topics else prior_topics`: a step that came back
+    # empty (an error, or a pass that extracted nothing) does not reset the prior list. The
+    # annotator must judge the new item against the list the model was actually shown.
+    prior_id = str(uuid.uuid4())
+    _write_step(tmp_path, "a", "with_block", 1, "sess", 0,
+                topics=[{"action_items": [_child("action_items", "Fix the pump", prior_id)]}])
+    _write_step(tmp_path, "a", "with_block", 1, "sess", 1, topics=[])
+    _write_step(tmp_path, "a", "with_block", 1, "sess", 2,
+                topics=[{"action_items": [_child("action_items", "Pump fixed", prior_id)]}])
+    assignments = list(label.iter_assignments(tmp_path))
+    assert [a["step"] for a in assignments] == [2]
+    assert [p["text"] for p in assignments[0]["prior_list"]] == ["Fix the pump"]
