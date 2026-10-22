@@ -1419,18 +1419,21 @@ def complete_recording(conn, caller, rec_id, body):
         gps_track = None
     if UPLOAD_VERIFY_MODE in ("observe", "enforce"):
         # The key lives on the row, so the check needs it before the UPDATE.
-        # Company scoping is repeated here because mark_uploaded — which used
-        # to be the only statement — carried it in its WHERE clause, and this
-        # lookup must not become a way around it.
+        # Recorder scoping is repeated here because mark_uploaded — which used
+        # to be the only statement — carries it in its WHERE clause, and this
+        # lookup must not become a way around it. The scope is the recorder,
+        # not the caller's company: the row's company is the SITE's
+        # (`_capture_company_id`), so a member capturing onto a partner
+        # company's site would never match their own company.
         rec = recordings.get_by_id(conn, rec_id)
-        if rec is None or str(rec.get("company_id")) != str(caller["company_id"]):
+        if rec is None or str(rec.get("user_id")) != str(caller["id"]):
             return error("recording not found", 404)
         if _upload_is_missing(rec_id, rec.get("s3_key"), b.get("sizeBytes")) \
                 and UPLOAD_VERIFY_MODE == "enforce":
             # Not 404: the row exists, the bytes do not. The device re-sends,
             # and its classifier must read 409 as retryable (GrandTime #18).
             return error("upload not found in storage — re-send the file", 409)
-    row = recordings.mark_uploaded(conn, rec_id, caller["company_id"],
+    row = recordings.mark_uploaded(conn, rec_id, caller["id"],
                                     b.get("sizeBytes"), gps_track)
     if row is None:
         return error("recording not found", 404)
