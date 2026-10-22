@@ -66,11 +66,13 @@ def aurora(monkeypatch):
     monkeypatch.setattr(org.topics, "list_topics_for_source_prefix",
                         lambda conn, prefix: [{"site_id": SITE_ID}])
     monkeypatch.setattr(org, "_get_lake_json", lambda key: None)
-    # user_name is a DISPLAY name, exactly as the real shape builds it.
+    # user_name is a DISPLAY name, exactly as the real shape builds it. One topic,
+    # because a rendered shape with NO topics is a deleted day and is not served.
     monkeypatch.setattr(org, "render_report_shape",
                         lambda rows, doc, date, user, conn=None, company_id=None, **kw:
                         {"report_date": date, "user_name": "Ben Lin",
-                         "topics": [], "_report_metadata": {}})
+                         "topics": [{"topic_id": 0, "related_photos": []}],
+                         "_report_metadata": {}})
     return monkeypatch
 
 

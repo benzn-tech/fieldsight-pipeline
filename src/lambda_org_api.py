@@ -1424,18 +1424,21 @@ def complete_recording(conn, caller, rec_id, body):
         gps_track = None
     if UPLOAD_VERIFY_MODE in ("observe", "enforce"):
         # The key lives on the row, so the check needs it before the UPDATE.
-        # Company scoping is repeated here because mark_uploaded — which used
-        # to be the only statement — carried it in its WHERE clause, and this
-        # lookup must not become a way around it.
+        # Recorder scoping is repeated here because mark_uploaded — which used
+        # to be the only statement — carries it in its WHERE clause, and this
+        # lookup must not become a way around it. The scope is the recorder,
+        # not the caller's company: the row's company is the SITE's
+        # (`_capture_company_id`), so a member capturing onto a partner
+        # company's site would never match their own company.
         rec = recordings.get_by_id(conn, rec_id)
-        if rec is None or str(rec.get("company_id")) != str(caller["company_id"]):
+        if rec is None or str(rec.get("user_id")) != str(caller["id"]):
             return error("recording not found", 404)
         if _upload_is_missing(rec_id, rec.get("s3_key"), b.get("sizeBytes")) \
                 and UPLOAD_VERIFY_MODE == "enforce":
             # Not 404: the row exists, the bytes do not. The device re-sends,
             # and its classifier must read 409 as retryable (GrandTime #18).
             return error("upload not found in storage — re-send the file", 409)
-    row = recordings.mark_uploaded(conn, rec_id, caller["company_id"],
+    row = recordings.mark_uploaded(conn, rec_id, caller["id"],
                                     b.get("sizeBytes"), gps_track)
     if row is None:
         return error("recording not found", 404)
@@ -10339,8 +10342,10 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None,
     }
     # One alias load for all four fields, and none at all when there is no
     # prose to rewrite (the reindex builder renders with doc=None, so this
-    # costs it nothing).
-    if any(prose.values()):
+    # costs it nothing). No row left (the deleted-scope filter above dropped
+    # every topic of the day) means no site to resolve aliases against, so the
+    # prose is served as the doc has it.
+    if any(prose.values()) and rows:
         alias_pairs = _prose_alias_pairs(conn, rows[0].get("site_id"))
         if alias_pairs:
             prose = {k: _normalize_prose(v, alias_pairs) for k, v in prose.items()}
@@ -10366,15 +10371,16 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None,
             meta["duration_seconds"] = stats["duration_s"]
     shaped = {
         "report_date": date,
-        "site": rows[0]["site_name"],
+        # `rows` can be empty here (see the alias load above): no row, no site.
+        "site": rows[0]["site_name"] if rows else None,
         # site_id (org UUID) alongside the display name: the compliance-resolution
         # durable key is (company_id, site_id, report_date, domain, user_folder,
         # content_hash), and the client can only rebuild it with a real site_id.
         # The name alone would 404 on write and never match on read (site_name is
         # not the slug _resolve_site_param accepts), silently orphaning every mark.
         # rows[0]["site_id"] is already in hand here (used for the alias lookup).
-        "site_id": str(rows[0]["site_id"]) if rows[0].get("site_id") else None,
-        "user_name": rows[0]["user_name"] or folder.replace("_", " "),
+        "site_id": str(rows[0]["site_id"]) if rows and rows[0].get("site_id") else None,
+        "user_name": (rows[0]["user_name"] if rows else None) or folder.replace("_", " "),
         **prose,
         "_report_metadata": meta,
         "topics": topics_out,
@@ -10566,6 +10572,14 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False,
                                     **({"all_companies": True}
                                        if _read_company(caller, user) is None
                                        and not is_cross_company(caller["global_role"]) else {}))
+        # Every row deleted. The renderer drops `scope='deleted'` topics itself, so rows that
+        # survived the ACL clip can still render to NO topics -- deleting a session hides the
+        # day's whole report rollup by id, and deleting every session hides all of it. The
+        # shape would then be the pre-deletion doc's prose with nothing under it: the
+        # deleted content, served as a 200. Treat it as "no Aurora topics" so the loop
+        # moves on and, failing that, the deleted-sources guard below answers 404.
+        if not shape["topics"]:
+            return None
         # The day's photos, as a property of the DAY rather than of a topic.
         #
         # Measured on prod the morning this was written: 71 of 90 photos on days

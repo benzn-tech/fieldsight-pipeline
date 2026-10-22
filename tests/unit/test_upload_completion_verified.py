@@ -93,12 +93,13 @@ def wired(monkeypatch):
                         lambda conn, sub: dict(CALLER) if sub == "sub-1" else None)
     monkeypatch.setattr(org, "S3_BUCKET", "fieldsight-data")
     monkeypatch.setattr(org.recordings, "get_by_id",
-                        lambda conn, rid: {"id": rid, "company_id": "c-1", "s3_key": KEY,
+                        lambda conn, rid: {"id": rid, "company_id": "c-1", "user_id": "u-1",
+                                           "s3_key": KEY,
                                            "size_bytes": None, "uploaded_at": None})
     marked = {}
 
-    def fake_mark(conn, rid, cid, sz=None, gps_track=None):
-        marked.update(rid=rid, cid=cid, sz=sz)
+    def fake_mark(conn, rid, uid, sz=None, gps_track=None):
+        marked.update(rid=rid, uid=uid, sz=sz)
         return {"id": rid, "s3_key": KEY}
 
     monkeypatch.setattr(org.recordings, "mark_uploaded", fake_mark)
@@ -203,12 +204,14 @@ def test_an_unknown_recording_is_still_a_404(wired):
     assert res["statusCode"] == 404
 
 
-def test_another_company_cannot_complete_this_recording(wired):
+def test_another_user_cannot_complete_this_recording(wired):
     """The row lookup added for verification must not become a way around the
-    company scoping mark_uploaded used to enforce on its own."""
+    recorder scoping mark_uploaded enforces on its own. Same company, other
+    user: still a 404 -- the scope is the recorder, not the company."""
     mp, marked = wired
     mp.setattr(org.recordings, "get_by_id",
-               lambda conn, rid: {"id": rid, "company_id": "c-OTHER", "s3_key": KEY})
+               lambda conn, rid: {"id": rid, "company_id": "c-1", "user_id": "u-OTHER",
+                                  "s3_key": KEY})
     res = _run(mp, "enforce", FakeS3(objects={KEY: 1}))
     assert res["statusCode"] == 404
     assert marked == {}
