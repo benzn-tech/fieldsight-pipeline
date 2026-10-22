@@ -94,6 +94,11 @@ INFER_IDLE_CLOSE = os.environ.get("INFER_IDLE_CLOSE", "false").lower() == "true"
 REOPEN_LATE_CHUNKS = os.environ.get("REOPEN_LATE_CHUNKS", "false").lower() == "true"
 # At most this many reopens per session; past it the late chunk is logged, not sent.
 REOPEN_MAX = int(os.environ.get("REOPEN_MAX", "3"))
+# Only a late chunk that ARRIVED (server time) within this many hours reopens.
+# last_chunk_at / closed_chunk_at are recorded even while REOPEN_LATE_CHUNKS is
+# off, so without a bound the first tick after the flag flips would reopen and
+# re-mail every backlog row, however old.
+REOPEN_WINDOW_HOURS = int(os.environ.get("REOPEN_WINDOW_HOURS", "48"))
 # Phase C multi-device merge. Off means the standing scan never runs, so no
 # group is ever claimed and every downstream branch stays inert.
 ENABLE_GROUP_MERGE = os.environ.get("ENABLE_GROUP_MERGE", "false").lower() == "true"
@@ -955,10 +960,11 @@ def sweep(conn, grace_seconds=None, idle_seconds=None, infer_idle=None, reopen=N
     do_infer = INFER_IDLE_CLOSE if infer_idle is None else infer_idle
     do_reopen = REOPEN_LATE_CHUNKS if reopen is None else reopen
     if do_reopen:
-        for row in meeting_session.reopen_late(conn, REOPEN_MAX):
+        for row in meeting_session.reopen_late(conn, REOPEN_MAX, REOPEN_WINDOW_HOURS):
             logger.info("finalize: reopened %s after a late chunk (reopen %d)",
                         row["session_id"], row["reopen_count"])
-        for sid in meeting_session.list_reopen_capped(conn, REOPEN_MAX):
+        for sid in meeting_session.list_reopen_capped(conn, REOPEN_MAX,
+                                                      REOPEN_WINDOW_HOURS):
             logger.warning("finalize: %s has a late chunk but reached REOPEN_MAX", sid)
     if do_infer:
         infer_idle_closes(conn, idle)

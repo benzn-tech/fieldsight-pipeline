@@ -1215,8 +1215,9 @@ Parameters:
       finalize sweep reopens the session so it is re-finalized with a complete
       email. "Late" compares device time with device time (last_chunk_at vs the
       snapshot taken at the idle close), so clock skew cancels. At most
-      REOPEN_MAX (3) reopens per session. Per stage: TEST_REOPEN_LATE_CHUNKS /
-      PROD_REOPEN_LATE_CHUNKS.
+      REOPEN_MAX (3) reopens per session, and only for a late chunk that
+      arrived within REOPEN_WINDOW_HOURS (48). Per stage:
+      TEST_REOPEN_LATE_CHUNKS / PROD_REOPEN_LATE_CHUNKS.
 
   DeclareContinuity:
     Type: String
@@ -4163,6 +4164,9 @@ Resources:
           # Late-chunk reopen of idle-closed, emailed sessions (M2).
           REOPEN_LATE_CHUNKS: !Ref ReopenLateChunks
           REOPEN_MAX: '3'
+          # Only a late chunk that arrived (server time) in the last 48 h reopens,
+          # so flipping ReopenLateChunks on does not re-mail an old backlog.
+          REOPEN_WINDOW_HOURS: '48'
           # Batched transcription (spec 2026-08-11): the sweep is the only thing that
           # can seal a session's LAST run — it has no fourth chunk coming. Same switch
           # as the transcriber's, and both must be given it or they disagree in

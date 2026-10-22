@@ -352,35 +352,48 @@ def list_finalizing(conn) -> list[dict]:
 # 0089, or an `end` close) compares as unknown and so never reopens.
 # `finalizing` is deliberately excluded: the send in flight settles first
 # (sent/failed), and the next tick reopens it.
+# Recency bound: touch_segment / mark_pending_close record last_chunk_at and
+# closed_chunk_at whether or not REOPEN_LATE_CHUNKS is on, so on a stage where
+# it is off, eligible rows accumulate; the first tick after the flag flips would
+# otherwise reopen all of them and mail "Updated" for meetings days old (and the
+# capped WARNING would repeat forever). Only a late chunk that ARRIVED within the
+# window counts -- last_segment_at is server arrival time, so a genuinely late
+# chunk arriving now qualifies and an old backlog does not. Takes one parameter
+# (window hours), placed before the caller's own.
 _LATE_CHUNK_WHERE = (
     "status IN ('sent', 'failed') AND close_intent = 'idle' "
-    "AND last_chunk_at > closed_chunk_at"
+    "AND last_chunk_at > closed_chunk_at "
+    "AND last_segment_at > now() - make_interval(hours => %s)"
 )
 
 
-def reopen_late(conn, max_reopens: int) -> list[dict]:
+def reopen_late(conn, max_reopens: int, window_hours: int) -> list[dict]:
     """Reopen every idle-closed, settled session that has since received a chunk
     newer (device time) than the one its email covered -- a phone that was
-    offline past the idle window. `open` again with `version` bumped and the
-    close cleared, so the normal idle-close -> finalize path re-sends it.
-    At most `max_reopens` times per session. Returns [{session_id, reopen_count}]."""
+    offline past the idle window -- provided that chunk arrived (server time,
+    last_segment_at) within the last `window_hours`. `open` again with `version`
+    bumped and the close cleared, so the normal idle-close -> finalize path
+    re-sends it. At most `max_reopens` times per session. Returns
+    [{session_id, reopen_count}]."""
     return conn.cursor(row_factory=dict_row).execute(
         "UPDATE meeting_session SET status = 'open', version = version + 1, "
         "reopen_count = reopen_count + 1, closed_at = NULL, close_intent = NULL, "
         "closed_chunk_at = NULL, finalizing_at = NULL, updated_at = now() "
         f"WHERE {_LATE_CHUNK_WHERE} AND reopen_count < %s "
         "RETURNING session_id, reopen_count",
-        (max_reopens,),
+        (window_hours, max_reopens),
     ).fetchall()
 
 
-def list_reopen_capped(conn, max_reopens: int) -> list[str]:
+def list_reopen_capped(conn, max_reopens: int, window_hours: int) -> list[str]:
     """Sessions that WOULD reopen on a late chunk but already reached the cap --
-    so the sweep can say so rather than drop the chunk in silence."""
+    so the sweep can say so rather than drop the chunk in silence. Same
+    `window_hours` bound as reopen_late, so the warning stops once the late
+    chunk is older than the window."""
     rows = conn.cursor(row_factory=dict_row).execute(
         f"SELECT session_id FROM meeting_session "
         f"WHERE {_LATE_CHUNK_WHERE} AND reopen_count >= %s ORDER BY session_id",
-        (max_reopens,),
+        (window_hours, max_reopens),
     ).fetchall()
     return [r["session_id"] for r in rows]
 
