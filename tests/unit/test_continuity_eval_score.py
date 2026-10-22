@@ -585,3 +585,13 @@ def test_scored_assignments_reads_hard_negatives_from_gold_and_scores_the_pair(t
     # The model claimed "A2" (wrong -- gold's real counterpart is "A1"), and gold had
     # separately flagged "A2" as a hard negative for this new item: a wrong carry onto it.
     assert hn_rows == [{"session": session, "wrongly_carried": True}]
+
+
+def test_hard_negative_rows_never_count_a_gold_counterpart_as_a_distractor():
+    # An owner adjudication overrides `counterpart` but inherits the agent's `hard_negatives`;
+    # the alias gold now calls THE counterpart cannot also be a different-work distractor.
+    rows = [{"session": "s1", "hard_negatives": ["A1", "A3"], "gold_counterparts": {"A1"},
+              "claim_alias": "A1", "claim_outcome": "accepted"}]
+    pairs = score.hard_negative_rows(rows)
+    assert len(pairs) == 1
+    assert pairs[0]["wrongly_carried"] is False

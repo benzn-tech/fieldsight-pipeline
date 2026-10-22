@@ -397,10 +397,15 @@ def hard_negative_rows(rows, session_ref=None):
     `hard_negatives` list -- NOT one row per assignment. `wrongly_carried` is True only when
     an ACCEPTED claim on that assignment named exactly that hard-negative alias -- the model
     carried the new item onto the specific distractor gold flagged, not merely onto something
-    gold disagrees with in general (that is the separate, broader `wrong_carries` bar)."""
+    gold disagrees with in general (that is the separate, broader `wrong_carries` bar).
+
+    An alias that is also one of the gold counterparts is skipped: an owner adjudication
+    replaces `counterpart` but inherits the agent's `hard_negatives`, and the item gold calls
+    the counterpart cannot at the same time be different work."""
     return [{"session": _ref(session_ref, r["session"]),
               "wrongly_carried": r["claim_outcome"] == "accepted" and r["claim_alias"] == alias}
-            for r in rows for alias in r["hard_negatives"]]
+            for r in rows for alias in r["hard_negatives"]
+            if alias not in r.get("gold_counterparts", ())]
 
 
 def carry_recall_rows(rows, arm="with_block"):
