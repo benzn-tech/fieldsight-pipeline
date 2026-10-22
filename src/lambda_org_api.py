@@ -153,6 +153,7 @@ import report_template
 import report_modules
 import report_photos
 import photo_binding
+import photo_rebind
 import session_scope
 import sweep_state
 from db.connection import get_connection
@@ -1458,6 +1459,7 @@ def complete_recording(conn, caller, rec_id, body):
                                     b.get("sizeBytes"), gps_track)
     if row is None:
         return error("recording not found", 404)
+    _rebind_after_photo_complete(conn, row)
     payload = {"ok": True}
     if _group_ended_for(conn, row.get("s3_key")):
         # Only present when true. A solo upload's response stays byte-identical
@@ -1466,6 +1468,66 @@ def complete_recording(conn, caller, rec_id, body):
         # part in.
         payload["groupEnded"] = True
     return ok(payload)
+
+
+_PHOTO_KEY_RE = re.compile(r"^users/([^/]+)/pictures/(\d{4}-\d{2}-\d{2})/[^/]+$")
+
+
+def _rebind_after_photo_complete(conn, row) -> None:
+    """Re-bind the photo's day now, instead of at the next extraction/ingest.
+
+    A photo often lands late, out of the phone's offline queue, after the day's
+    extraction has run; until this it stayed unbound for hours. The rebind is
+    the pin-aware one (`photo_rebind.rebind_day_photos`), so a voice note's
+    claimed photos and hand-moved ones keep their topic. Not
+    `photo_collapse.rebind_one_day`: that guesses the company with a LIKE scan,
+    and the row already names it (the SITE's company).
+
+    NEVER RAISES. The upload is good and already stamped; a failed rebind must
+    not turn it into an error, or the phone queue re-sends the photo forever.
+    So the work runs in a savepoint -- a Postgres error inside it would
+    otherwise abort the whole request transaction, and the stamp with it -- and
+    any exception is logged and dropped. The next extraction re-binds anyway.
+
+    `lock_timeout` caps the wait on the day's advisory lock (an extraction of
+    the same day may hold it for its whole run). It is SET LOCAL inside the
+    savepoint, and a RELEASED savepoint keeps a SET LOCAL until the end of the
+    OUTER transaction (only a rollback to the savepoint reverts it), so it is
+    put back explicitly before the savepoint releases. On the failure path the
+    rollback to the savepoint reverts it by itself.
+    """
+    if row.get("kind") != "photo":
+        return
+    m = _PHOTO_KEY_RE.match(row.get("s3_key") or "")
+    if not m:
+        return
+    folder, date = m.group(1), m.group(2)
+    t0 = time.monotonic()
+    try:
+        with conn.transaction():
+            prev = conn.execute("SELECT current_setting('lock_timeout')").fetchone()[0]
+            conn.execute("SET LOCAL lock_timeout = '2s'")
+            # Exactly the WHERE of topics.list_day_topics_for_binding: a day
+            # with no topic a photo could bind to is a no-op, and on that day
+            # there is no reason to list S3 or take the lock.
+            has_topics = conn.execute(
+                "SELECT 1 FROM topics "
+                "WHERE (source_s3_key LIKE %s ESCAPE '\\' OR source_s3_key = %s) "
+                f"AND {topics.visible_topics_predicate('topics')} LIMIT 1",
+                (f"extractions/{topics._escape_like(folder)}/{topics._escape_like(date)}/%",
+                 f"reports/{date}/{folder}/daily_report.json"),
+            ).fetchone() is not None
+            if has_topics:
+                written = photo_rebind.rebind_day_photos(
+                    conn, row["company_id"], folder, date,
+                    photo_binding.list_pictures(s3(), S3_BUCKET,
+                                                f"users/{folder}/pictures/{date}/"))
+                logger.info("complete %s: photo rebind %s/%s wrote %s row(s) in %d ms",
+                            row["id"], folder, date, written,
+                            (time.monotonic() - t0) * 1000)
+            conn.execute("SELECT set_config('lock_timeout', %s, true)", (prev,))
+    except Exception:
+        logger.exception("complete %s: photo rebind skipped", row["id"])
 
 
 def _group_ended_for(conn, s3_key) -> bool:
