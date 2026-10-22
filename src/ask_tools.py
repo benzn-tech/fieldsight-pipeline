@@ -222,11 +222,11 @@ def validate_call(call, today):
 # json.dumps(items, ensure_ascii=False). SEAM: the orchestrator must render tool
 # results the same way -- with the default ensure_ascii=True a CJK character costs
 # six characters (\uXXXX), and a Chinese day would fit 2 topics where English fits 15.
-# 12,500 (was 10,000) so DEFAULT_K = 8 full WINDOW_CHARS items still fit: an item
-# costs ~539 characters of JSON besides its text (ids, source key), plus a newline
-# escape per line. PROVISIONAL: the item-window replay (plan Task 10) sets it from
-# the measured per-item overhead p95 (2026-10-22-ask-tools-item-window review SHOULD 1).
-MAX_RESULT_CHARS = 12_500
+# 12,000 (was 10,000) so DEFAULT_K = 8 full WINDOW_CHARS items still fit:
+# 8 x (p95 + W + 2) + 2 rounded up to 500, where p95 = 477 is an item's JSON besides
+# its text (ids, source key, newline escapes), measured by the item-window replay over
+# real rows (2026-10-22-ask-tools-item-window plan Task 10; max 490).
+MAX_RESULT_CHARS = 12_000
 # Item text (spec 2026-10-22-ask-tools-item-window §5). A topic row, person or metric
 # keeps the first MAX_TEXT characters. A recording chunk (transcript window, topic,
 # session digest) or a document chunk is packed to ~2,600 characters, so it shows a

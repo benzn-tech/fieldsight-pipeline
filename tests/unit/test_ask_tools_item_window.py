@@ -371,19 +371,17 @@ def test_log_line_counts_windowed_and_head_items(caplog):
 # --- result budget (Task 4; review SHOULD 1) -----------------------------------
 
 UUID = "0e3c5a52-7d1f-4c2b-9a7e-3f1d2b4c5e6f"
-# Spec §3: about 539 characters of item JSON before the text, measured on real rows.
-SPEC_OVERHEAD = 539
-# Field shapes. "measured": real-looking fields with the title padded until the item
-# costs SPEC_OVERHEAD before its text. "longest": the longest plausible values. Task 10
-# re-pins both from the replay's per-item overhead p95/max over real rows.
-SHAPES = {
-    "measured": {"source_s3_key": f"extractions/{UUID}/2026-09-10/{'a' * 32}_extraction.json",
-                 "site_name": "Riverside Stage 2", "site_slug": "riverside-stage-2",
-                 "user_name": "Ben Lin", "topic_title": "Roofing subcontractor withdrawal"},
-    "longest": {"source_s3_key": f"extractions/{UUID}/2026-09-10/{'a' * 40}_extraction.json",
-                "site_name": "S" * 40, "site_slug": "s" * 40, "user_name": "U" * 30,
-                "topic_title": "T" * 80},
-}
+# Per-item JSON cost besides the text (ref and newline escapes included), measured by the
+# Task 10 replay over the before-arm rows at W = 1,000 (2026-10-22): session p95 477 /
+# max 490, report 449 / 465. The spec's 539 excluded escapes and over-counted; these are
+# the replay's own `_size(item) - len(text)`.
+OVERHEAD_P95, OVERHEAD_MAX = 477, 490
+# Short real-looking fields (with this fixture's 12 newline escapes they already cost
+# ~460), the title padded until the item costs the measured overhead.
+FIELDS = {"source_s3_key": f"extractions/{UUID}/2026-09-10/x_extraction.json",
+          "site_name": "Site A", "site_slug": "site-a", "user_name": "Ben Lin",
+          "topic_title": "Roof"}
+SHAPES = {"p95": OVERHEAD_P95, "max": OVERHEAD_MAX}
 FULL_TEXT = _transcript(40)[:ask_tools.WINDOW_CHARS]
 
 
@@ -396,27 +394,21 @@ def _row_with(fields, i=0):
 
 
 def _overhead(fields):
-    """Item JSON (ref included) minus the text's own characters; the text's newline
-    escapes are excluded, so this is comparable with the spec's figure."""
+    """Item JSON (ref included) minus the text's own characters, as the replay counts it."""
     _, _, item = ask_tools._item("search_records", {"query": "q"}, _row_with(fields), "0")
     item.pop("_window")
-    return (ask_tools._size(dict(item, ref="R0000")) - len(item["text"])
-            - item["text"].count("\n"))
+    return ask_tools._size(dict(item, ref="R0000")) - len(item["text"])
 
 
 def _shape(name):
-    fields = dict(SHAPES[name])
-    if name == "measured":
-        fields["topic_title"] += "x" * (SPEC_OVERHEAD - _overhead(fields))
+    fields = dict(FIELDS)
+    pad = SHAPES[name] - _overhead(fields)
+    assert pad > 0, "FIELDS already cost more than the measured overhead"
+    fields["topic_title"] += "x" * pad
     return fields
 
 
-@pytest.mark.parametrize("shape", [
-    "measured",
-    pytest.param("longest", marks=pytest.mark.xfail(
-        strict=True, reason="~13.4k > 12,500: Task 10 sets MAX_RESULT_CHARS from the "
-                            "replay's overhead p95, or stops counting source/ids (SHOULD 1)")),
-])
+@pytest.mark.parametrize("shape", ["p95", "max"])
 def test_eight_windowed_items_fit_one_envelope(shape):
     fields = _shape(shape)
     env = _run("search_records", {"query": "q"}, [_row_with(fields, i) for i in range(8)])
@@ -425,6 +417,12 @@ def test_eight_windowed_items_fit_one_envelope(shape):
     assert len(json.dumps(env["items"], ensure_ascii=False)) <= ask_tools.MAX_RESULT_CHARS
 
 
+def test_budget_is_derived_from_the_measured_overhead():
+    """Plan Task 10: 8 x (p95 + W + 2) + 2, rounded up to 500."""
+    need = 8 * (OVERHEAD_P95 + ask_tools.WINDOW_CHARS + 2) + 2
+    assert ask_tools.MAX_RESULT_CHARS == -(-need // 500) * 500
+
+
 def test_budget_shapes_are_what_they_claim():
-    assert _overhead(_shape("measured")) == SPEC_OVERHEAD
-    assert _overhead(_shape("longest")) > SPEC_OVERHEAD + 100
+    assert _overhead(_shape("p95")) == OVERHEAD_P95
+    assert _overhead(_shape("max")) == OVERHEAD_MAX

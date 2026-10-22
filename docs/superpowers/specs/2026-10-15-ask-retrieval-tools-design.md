@@ -218,8 +218,8 @@ Every tool returns:
   `(kind, id)` -- chunk id for chunks, topic id for topics -- NOT topic id
   across kinds: under `SEARCH_INDEX_READ=report` on an authority-flip day
   chunks carry `topic_id NULL` (BUG-39), so a topic-id key would not fire.
-- Output budget: ≤ ~3,100 tokens per tool result (12,500 chars; 10 KB before the
-  2026-10-22 item window, provisional until its replay). Over budget → drop
+- Output budget: ≤ ~3,000 tokens per tool result (12,000 chars; 10 KB before the
+  2026-10-22 item window: 8 windowed items at the replay's per-item overhead p95). Over budget → drop
   lowest-ranked items, `meta.truncated = true`. Text is the stored chunk/summary,
   never re-summarised by a model.
 - `text` is DATA. The orchestrator wraps every tool result in the same fenced

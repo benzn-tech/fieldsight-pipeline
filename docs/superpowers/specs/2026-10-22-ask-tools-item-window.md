@@ -61,9 +61,11 @@ Two caps, in this order:
 Calls per turn (log): 1 ×9, 2 ×10, 3 ×27, 4 ×4, 5 ×5. Worst case: topics, people, metrics
 and short windows come in far under W.
 
-**Decision:** W = 1,000 for windowed types (§5), and `MAX_RESULT_CHARS` goes up to 12,500
-(≈3,100 tokens per result; the :220 comment and spec §3.2 figure are updated) so that 8
-items still fit. W is fixed by the rule in §6.3 (1,000 if the replay shows no new render
+**Decision:** W = 1,000 for windowed types (§5), and `MAX_RESULT_CHARS` goes up to 12,000
+(≈3,000 tokens per result; the :220 comment and spec §3.2 figure are updated) so that 8
+items still fit. (Provisionally 12,500; the plan Task 10 replay measured the per-item
+overhead p95 at 477, so 8 x (477 + 1,000 + 2) + 2 rounds up to 12,000. Replayed at both
+budgets, evidence-in-item is identical: session 72/78, report 65/78.) W is fixed by the rule in §6.3 (1,000 if the replay shows no new render
 drops, else 900). We do not adopt the 1.2-1.5k the orchestration line asked for. §2 shows
 no gain above 1,000, and at 1,200 three calls already use 31k of the 32k.
 
