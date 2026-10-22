@@ -189,7 +189,7 @@ Every tool returns:
       "site": "Riverside Stage 2",
       "who": "Ben Lin",
       "title": "Level 2 inspection",
-      "text": "≤ 600 chars",
+      "text": "≤ 600 chars; a chunk: ≤ 1,000-char window on the query (2026-10-22)",
       "topic_id": "…", "chunk_id": "…", "source": "extractions/…",
       "site_slug": "…", "chunk_type": "…", "time_start": "…"
     }
@@ -218,7 +218,8 @@ Every tool returns:
   `(kind, id)` -- chunk id for chunks, topic id for topics -- NOT topic id
   across kinds: under `SEARCH_INDEX_READ=report` on an authority-flip day
   chunks carry `topic_id NULL` (BUG-39), so a topic-id key would not fire.
-- Output budget: ≤ 2,500 tokens per tool result (≈ 10 KB). Over budget → drop
+- Output budget: ≤ ~3,000 tokens per tool result (12,000 chars; 10 KB before the
+  2026-10-22 item window: 8 windowed items at the replay's per-item overhead p95). Over budget → drop
   lowest-ranked items, `meta.truncated = true`. Text is the stored chunk/summary,
   never re-summarised by a model.
 - `text` is DATA. The orchestrator wraps every tool result in the same fenced
@@ -275,7 +276,7 @@ orchestrator (ask-agent / worker)
   whatever the transport (the voice worker's longer timeout does not extend
   it). The executor passes `deadline_s = min(ctx.deadline_left, 20)` and caps
   a batch at 4 calls. Payload is not a constraint: a few 1024-float
-  embeddings in, <= 10 KB per result out, far below the 6 MB sync limit.
+  embeddings in, <= 12.5 KB per result out, far below the 6 MB sync limit.
 - Per-call timeout passed in by the orchestrator (`ctx.deadline`); a call that
   cannot start before the deadline returns `meta.error = "timeout"` without
   running.
@@ -353,7 +354,7 @@ because nothing calls `mode: "tools"` until the orchestrator does.
 ## 7. Open questions for the companion spec
 
 - Does the judge see raw envelopes, or a compacted render? (This spec only
-  guarantees ≤ 2,500 tokens per result.)
+  guarantees ≤ ~3,100 tokens per result.)
 - Max tools per turn / rounds — this spec supports any batch size; suggest ≤ 4
   calls per round, ≤ 3 rounds.
 
