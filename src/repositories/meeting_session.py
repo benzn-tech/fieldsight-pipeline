@@ -24,7 +24,7 @@ _COLS = (
 
 
 def ensure_open(conn, session_id, company_id, user_id, site_id, kind, opened_at,
-                group_id=None) -> dict:
+                group_id=None, session_type=None) -> dict:
     """Create the session if new, else keep it. Idempotent — safe whether the
     device's best-effort record-start signal or the first uploaded chunk reaches
     the backend first (either may open the session). Only fills `opened_at`/
@@ -40,19 +40,26 @@ def ensure_open(conn, session_id, company_id, user_id, site_id, kind, opened_at,
     2026-08-04); NULL for a solo recording, which is every pre-existing row.
     Like the other columns here it is only ever filled in, never cleared: /open
     is best-effort and may legitimately arrive twice, and a second call that
-    omits the group must not orphan a device that already joined."""
+    omits the group must not orphan a device that already joined.
+
+    `session_type` ('meeting' | 'voice_note', migration 0089) follows the same
+    rule: filled in, never cleared. Devices send 'meeting'; a body without it
+    stays NULL (today's behaviour), and a retried /open that omits it must not
+    turn a voice note back into an emailed meeting."""
     return conn.cursor(row_factory=dict_row).execute(
         f"INSERT INTO meeting_session "
-        f"(session_id, company_id, user_id, site_id, kind, opened_at, status, group_id) "
-        f"VALUES (%s, %s, %s, %s, %s, %s, 'open', %s) "
+        f"(session_id, company_id, user_id, site_id, kind, opened_at, status, group_id, "
+        f"session_type) "
+        f"VALUES (%s, %s, %s, %s, %s, %s, 'open', %s, %s) "
         f"ON CONFLICT (session_id) DO UPDATE SET "
         f"opened_at = COALESCE(meeting_session.opened_at, EXCLUDED.opened_at), "
         f"site_id = COALESCE(meeting_session.site_id, EXCLUDED.site_id), "
         f"kind = COALESCE(meeting_session.kind, EXCLUDED.kind), "
         f"group_id = COALESCE(meeting_session.group_id, EXCLUDED.group_id), "
+        f"session_type = COALESCE(meeting_session.session_type, EXCLUDED.session_type), "
         f"updated_at = now() "
         f"RETURNING {_COLS}",
-        (session_id, company_id, user_id, site_id, kind, opened_at, group_id),
+        (session_id, company_id, user_id, site_id, kind, opened_at, group_id, session_type),
     ).fetchone()
 
 

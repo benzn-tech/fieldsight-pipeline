@@ -71,7 +71,7 @@ def test_open_still_joins_a_live_meeting(monkeypatch):
     monkeypatch.setattr(org.meeting_session, "lead_is_joinable", lambda *a, **k: True)
     monkeypatch.setattr(org.meeting_session, "group_ended_at", lambda conn, gid: None)
 
-    def fake(conn, sid, cid, uid, site, kind, at, group_id=None):
+    def fake(conn, sid, cid, uid, site, kind, at, group_id=None, session_type=None):
         seen["group_id"] = group_id
         return {"session_id": sid, "status": "open", "version": 0, "group_id": group_id}
     monkeypatch.setattr(org.meeting_session, "ensure_open", fake)

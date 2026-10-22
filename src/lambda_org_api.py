@@ -175,6 +175,7 @@ from repositories import (action_items, aliases, chunks, classification_feedback
                           voiceprints)
 from repositories import lake_objects
 from repositories import project_docs
+from repositories import voice_note_photo
 import lake_keys
 import lake_owner
 import company_export
@@ -288,6 +289,10 @@ STOP_GRACE_SECONDS = int(os.environ.get("STOP_GRACE_SECONDS", "30"))
 # here costs nothing (a too-late join simply records solo); being tight would
 # break a long meeting with a break in it.
 GROUP_JOIN_MAX_AGE_SECONDS = int(os.environ.get("GROUP_JOIN_MAX_AGE_SECONDS", str(4 * 3600)))
+# Photos one voice note's /open may claim (M2 plan decision 6). The phone picks
+# photos taken after the previous note and within 10 min before this one, so a
+# real note claims a handful; the cap only bounds one request's INSERT.
+VOICE_NOTE_MAX_PHOTOS = 200
 GROUP_MAX_SPAN_SECONDS = int(os.environ.get("GROUP_MAX_SPAN_SECONDS", str(4 * 3600)))
 
 _SID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -1518,6 +1523,27 @@ def session_open(conn, caller, session_id, body):
     kind = body.get("kind")
     if kind is not None and kind not in ("audio", "video"):
         return error("kind must be 'audio' or 'video'", 400)
+    # Voice notes (M2 plan decision 6). Validated before ANY write, and siteId is
+    # never required here: a 400 would leave the phone's note unopened, and the
+    # first chunk would then open it as a plain (emailed) meeting.
+    session_type = body.get("sessionType")
+    if session_type not in (None, "meeting", "voice_note"):
+        return error("sessionType must be 'meeting' or 'voice_note'", 400)
+    photos = body.get("photos")
+    if photos is not None:
+        if session_type != "voice_note":
+            return error("photos is only allowed with sessionType 'voice_note'", 400)
+        if not isinstance(photos, list):
+            return error("photos must be a list of photo clientUuids", 400)
+        if len(photos) > VOICE_NOTE_MAX_PHOTOS:
+            return error(f"photos may hold at most {VOICE_NOTE_MAX_PHOTOS} entries", 400)
+        for p in photos:
+            try:
+                if not isinstance(p, str):
+                    raise ValueError
+                uuid.UUID(p)
+            except ValueError:
+                return error("each photo must be a clientUuid", 400)
     site_id = body.get("siteId")
     site = None
     if site_id:
@@ -1563,8 +1589,13 @@ def session_open(conn, caller, session_id, body):
     # chunk arrives first opens the session; a later call never regresses it.
     row = meeting_session.ensure_open(
         conn, session_id, session_company_id, caller["id"], site_id, kind,
-        body.get("startedAt"), group_id=group_id,
+        body.get("startedAt"), group_id=group_id, session_type=session_type,
     )
+    # After ensure_open (the claim compares the notes' stored opened_at) and in the
+    # same request transaction. Stored as sent: each must equal the photo's
+    # recordings.client_uuid, which is stored as sent.
+    if photos:
+        voice_note_photo.link(conn, caller["id"], session_id, photos)
     # After ensure_open, so a group is only registered once the join itself has
     # passed every guard above (tenant, staleness, meeting-already-ended).
     _ensure_group_state(conn, session_company_id, group_id)
