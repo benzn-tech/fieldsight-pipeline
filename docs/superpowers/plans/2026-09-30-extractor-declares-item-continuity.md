@@ -1347,7 +1347,7 @@ Harness: set `DECLARE_CONTINUITY=true` and reload `lambda_extract_session`. Use 
     - admission drift: prod 0.573 <= 0.582, TEST 1.202 <= 1.212 (narrow margins)
     - transcript support, block-only unsupported: prod 0.4% vs baseline 1.7%, TEST 0.8% vs 0.7%
     - added final-pass latency p90: prod 7.3 s, TEST 7.5 s
-    - agent-owner agreement: prod 16/17 = 94% (95% lower bound 73%: n too small to rely on). Owner continues on the review page until about 50 sample items; `results/summary.json` is committed once that settles.
+    - agent-owner agreement: prod 16/17 = 94% (95% lower bound 73%). Passes the pre-registered point bar; continuing to about 50 sample items is suggested, not pre-registered -- owner decides. `results/summary.json` is committed after that decision.
 - [ ] **Step 6:** Decision per spec §7:
   - **pass:** proceed to Task 13;
   - **fail or insufficient:** the flag stays off; write the numbers into the spec's §7 as a dated result and stop.
