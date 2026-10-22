@@ -1337,15 +1337,16 @@ def _adopt_group_from_upload(conn, caller, body, file_name, kind, site_id, compa
         if meeting_session.group_ended_at(conn, group_id) is not None:
             logger.info("upload-url: group %s has ended; this recording stays solo", group_id)
             return
-        # opened_at comes from the FILENAME's timestamp, not the body's
-        # startedAt. The body's is this CHUNK's start; the filename's is the
-        # session's, identical on every chunk of the session (the chunk-session
-        # naming contract). Using the body's would let whichever chunk happened
-        # to arrive first — after an offline day, not necessarily the first one —
-        # set the session's start to its own, and ensure_open COALESCEs, so the
-        # wrong value would never be corrected. session_activity reads it from
-        # the same place for the same reason. None is fine: it leaves the field
-        # for whoever does know. Converted from the device's NZ wall clock to UTC,
+        # opened_at comes from the FILENAME's timestamp. In a chunk key that is
+        # THIS CHUNK's own start (the {HH-MM-SS} token; see the chunk-token
+        # notes in transcript_utils), not the session's -- it equals the
+        # session's start only for chunk 0. ensure_open fills opened_at only
+        # while it is NULL, so whichever writer reaches the row first sets it:
+        # normally /open (queued before the chunks, carrying the session's
+        # startedAt); failing that, the first chunk to arrive, which after an
+        # offline day is not necessarily chunk 0 and is then never corrected.
+        # session_activity reads the same field the same way. None is fine: it
+        # leaves the field for whoever does know. Converted from the device's NZ wall clock to UTC,
         # as session_activity does: opened_at is a UTC column, /open stores the
         # body's offset-carrying startedAt, and voice notes are ordered by it.
         meeting_session.ensure_open(

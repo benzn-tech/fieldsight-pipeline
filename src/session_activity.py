@@ -6,7 +6,9 @@ The Tier-0 confirmation email needs a session that is (a) OPEN — so the recipi
 finalizes. Today the ONLY things that open/close a session are the device's
 best-effort live `POST /sessions/{id}/open|close` (org-api). Per §8.4 those are an
 optimization, never a requirement: "start = first chunk; if close is missing,
-infer close when the session sees no new chunk for SESSION_GAP_MINUTES."
+infer close when the session sees no new chunk for SESSION_GAP_MINUTES." (That
+idle threshold is now its own setting, IDLE_CLOSE_MINUTES in
+lambda_finalize_claim, 60 by default -- not session_scope.SESSION_GAP_MINUTES.)
 
 This module is the OPEN + TOUCH half of that durable path. It listens on TWO
 per-chunk arrivals, because since 2026-08-08 a chunk with no detected speech is
