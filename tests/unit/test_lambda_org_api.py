@@ -886,13 +886,179 @@ def test_create_member_same_company_reinvite_preserves_role(member_wired):
     assert seen["global_role"] is None  # not demoted to "worker"
 
 
-def test_create_member_non_admin_403(member_wired):
+@pytest.mark.parametrize("role", ["regional_manager", "pm", "site_manager", "worker"])
+def test_create_member_non_inviter_403(member_wired, role):
     wired, fake = member_wired
     wired.setattr(org.users, "get_user_by_sub",
-                  lambda conn, sub: {**CALLER, "global_role": "gm"})
+                  lambda conn, sub: {**CALLER, "global_role": role})
     res = org.lambda_handler(make_event("POST", "/api/org/members", body={
         "email": "x@x.nz"}), None)
     assert res["statusCode"] == 403
+    assert fake.created == []
+
+
+# ---- a gm may invite, with limits (owner decision 2026-10-22) ---------------
+#
+# gm grants gm and below only; cannot alter an existing admin/platform_admin by
+# re-inviting them; cannot change its own role here; own company only.
+
+GM_CALLER = {**CALLER, "global_role": "gm"}
+
+
+def _gm_wired(wired, existing=None):
+    """Caller sub-1 is a gm. `existing` is the Aurora row for the Cognito user
+    an already-registered email resolves to (sub-existing)."""
+    def by_sub(conn, sub):
+        if sub == "sub-1":
+            return dict(GM_CALLER)
+        if sub == "sub-existing" and existing is not None:
+            return dict(existing)
+        return None
+    wired.setattr(org.users, "get_user_by_sub", by_sub)
+    upserts = []
+
+    def fake_upsert(conn, sub, email, **kw):
+        upserts.append(kw)
+        return {"id": "u-x", "cognito_sub": sub, "email": email, **kw}
+    wired.setattr(org.users, "upsert_user", fake_upsert)
+    return upserts
+
+
+@pytest.mark.parametrize("role", ["gm", "regional_manager", "pm", "site_manager", "worker"])
+def test_gm_invites_with_gm_or_lower_role(member_wired, role):
+    wired, fake = member_wired
+    upserts = _gm_wired(wired)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "new@x.nz", "global_role": role,
+        "memberships": [{"site_id": "s-1", "role": "worker"}]}), None)
+    assert res["statusCode"] == 201
+    assert upserts[0]["global_role"] == role
+    assert upserts[0]["company_id"] == "c-uuid-1"
+    assert len(fake.created) == 1
+
+
+def test_gm_invites_new_person_with_default_role(member_wired):
+    wired, fake = member_wired
+    upserts = _gm_wired(wired)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "new@x.nz"}), None)
+    assert res["statusCode"] == 201
+    assert upserts[0]["global_role"] is None  # upsert_user's default: worker
+
+
+@pytest.mark.parametrize("role", ["admin", "platform_admin"])
+def test_gm_cannot_grant_admin_roles(member_wired, role):
+    wired, fake = member_wired
+    upserts = _gm_wired(wired)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "new@x.nz", "global_role": role}), None)
+    assert res["statusCode"] == 403
+    assert fake.created == [] and upserts == []  # no invite email, no row
+
+
+def test_gm_grant_admin_is_refused_by_the_gm_guard(member_wired):
+    # "platform_admin" is also refused by the older platform_admin-only guard,
+    # so this pins the gm guard itself by its message.
+    wired, fake = member_wired
+    _gm_wired(wired)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "new@x.nz", "global_role": "admin"}), None)
+    assert res["statusCode"] == 403
+    assert "gm may grant only" in body_of(res)["error"]
+
+
+@pytest.mark.parametrize("role", ["admin", "platform_admin"])
+def test_gm_cannot_reinvite_an_existing_admin(member_wired, role):
+    # No global_role sent: upsert would keep their role but still rewrite the
+    # name and add memberships. A gm must not touch an admin at all.
+    wired, fake = member_wired
+    fake.exists = True
+    upserts = _gm_wired(wired, existing={**CALLER, "cognito_sub": "sub-existing",
+                                         "global_role": role})
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "boss@x.nz", "first_name": "Renamed",
+        "memberships": [{"site_id": "s-1", "role": "worker"}]}), None)
+    assert res["statusCode"] == 403
+    assert upserts == []
+
+
+def test_gm_cannot_demote_an_existing_admin(member_wired):
+    wired, fake = member_wired
+    fake.exists = True
+    upserts = _gm_wired(wired, existing={**CALLER, "cognito_sub": "sub-existing",
+                                         "global_role": "admin"})
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "boss@x.nz", "global_role": "worker"}), None)
+    assert res["statusCode"] == 403
+    assert upserts == []
+
+
+def test_gm_may_reinvite_an_existing_lower_member(member_wired):
+    wired, fake = member_wired
+    fake.exists = True
+    upserts = _gm_wired(wired, existing={**CALLER, "cognito_sub": "sub-existing",
+                                         "global_role": "pm"})
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "pm@x.nz", "global_role": "site_manager"}), None)
+    assert res["statusCode"] == 201
+    assert upserts[0]["global_role"] == "site_manager"
+
+
+def test_gm_cannot_change_own_role(member_wired):
+    wired, fake = member_wired
+    fake.exists = True
+    # The email resolves to the caller's own login.
+    fake.admin_get_user = lambda **kw: {"UserAttributes": [{"Name": "sub", "Value": "sub-1"}]}
+    upserts = _gm_wired(wired)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "a@x.nz", "global_role": "worker"}), None)
+    assert res["statusCode"] == 403
+    assert "own role" in body_of(res)["error"]
+    assert upserts == []
+
+
+def test_gm_reinviting_self_without_role_change_is_allowed(member_wired):
+    wired, fake = member_wired
+    fake.exists = True
+    fake.admin_get_user = lambda **kw: {"UserAttributes": [{"Name": "sub", "Value": "sub-1"}]}
+    upserts = _gm_wired(wired)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "a@x.nz", "global_role": "gm"}), None)
+    assert res["statusCode"] == 201
+    assert upserts[0]["global_role"] == "gm"
+
+
+def test_gm_cannot_target_another_company(member_wired):
+    wired, fake = member_wired
+    upserts = _gm_wired(wired)
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "new@x.nz", "target_company_id": "c-uuid-B"}), None)
+    assert res["statusCode"] == 403
+    assert fake.created == [] and upserts == []
+
+
+def test_gm_cannot_invite_onto_another_company_site(member_wired):
+    wired, fake = member_wired
+    upserts = _gm_wired(wired)
+    wired.setattr(org.sites, "get_site",
+                  lambda conn, sid: {"id": sid, "company_id": "c-uuid-B"})
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "new@x.nz", "memberships": [{"site_id": "s-9", "role": "worker"}]}), None)
+    assert res["statusCode"] == 403
+    assert fake.created == [] and upserts == []
+
+
+def test_admin_still_grants_admin(member_wired):
+    wired, fake = member_wired
+    seen = {}
+    wired.setattr(org.users, "upsert_user",
+                  lambda conn, sub, email, **kw: (seen.update(kw)
+                                                  or {"id": "u-new", "cognito_sub": sub,
+                                                      "email": email, **kw}))
+    res = org.lambda_handler(make_event("POST", "/api/org/members", body={
+        "email": "new@x.nz", "global_role": "admin"}), None)
+    assert res["statusCode"] == 201
+    assert seen["global_role"] == "admin"
 
 
 def test_create_member_rejects_archived_site(member_wired):
