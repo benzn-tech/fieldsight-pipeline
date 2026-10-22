@@ -25,6 +25,7 @@ from urllib.parse import unquote_plus
 
 import extraction_pending
 from lake_put import lake_put
+from session_scope import round_suffix
 
 logger = logging.getLogger()
 # INFO, set HERE. The Lambda runtime leaves the root logger at WARNING, and this
@@ -530,27 +531,37 @@ def _complete_summary(artifact, summarize=None):
         # clean turn stream. Store it before handing the caller its two keys.
         # Best-effort: the email must still go out if the write fails.
         if result and result.get("sections"):
-            _store_brief(folder, date, sid, result)
+            reopened = artifact.get("reopened")
+            _store_brief(folder, date, sid, result,
+                         **({"reopened": reopened} if reopened else {}))
         return result
     except Exception:
         logger.exception("finalize: complete re-summary failed for %s — using rolling summary", sid)
         return None
 
 
-def _store_brief(folder, date, session_id, brief):
+def _store_brief(folder, date, session_id, brief, reopened=0):
     """Write the session brief to S3, mirroring session_rolling/'s layout so the
     read path is the one already proven for the rolling summary. Never raises:
-    losing the stored copy must not cost the recorder their email."""
+    losing the stored copy must not cost the recorder their email.
+
+    `latest.json` always (the web's brief endpoint reads it, and the newest round
+    is the latest). A reopened round ALSO writes `r{n}.json`, which is the key its
+    final email polls: polling `latest.json` would find round 1's brief at once
+    and render it under round 2's "Updated" subject."""
     try:
         import boto3
-        key = f"{BRIEF_PREFIX}{folder}/{date}/sid{session_id}/latest.json"
-        lake_put(
-            S3_BUCKET, key,
-            json.dumps(brief, ensure_ascii=False).encode("utf-8"),
-            client=boto3.client("s3"),
-            owner_hint={"folder": folder, "session_base": f"sid{session_id}"},
-            ContentType="application/json")
-        logger.info("session brief stored at %s", key)
+        keys = [_brief_key(folder, date, session_id)]
+        if reopened:
+            keys.append(_brief_key(folder, date, session_id, reopened))
+        data = json.dumps(brief, ensure_ascii=False).encode("utf-8")
+        for key in keys:
+            lake_put(
+                S3_BUCKET, key, data,
+                client=boto3.client("s3"),
+                owner_hint={"folder": folder, "session_base": f"sid{session_id}"},
+                ContentType="application/json")
+            logger.info("session brief stored at %s", key)
     except Exception:
         logger.exception("session brief could not be stored for %s "
                          "-- the email is unaffected", session_id)
@@ -610,11 +621,14 @@ def _session_was_deleted(artifact):
     return sid in deleted or f"sid{sid}" in deleted
 
 
-def _brief_key(folder, date, session_id):
-    return f"{BRIEF_PREFIX}{folder}/{date}/sid{session_id}/latest.json"
+def _brief_key(folder, date, session_id, reopened=0):
+    """`latest.json` for a first round; `r{n}.json` for a reopened round's own
+    brief (see _store_brief)."""
+    leaf = f"r{int(reopened)}.json" if reopened else "latest.json"
+    return f"{BRIEF_PREFIX}{folder}/{date}/sid{session_id}/{leaf}"
 
 
-def _read_brief(folder, date, session_id):
+def _read_brief(folder, date, session_id, reopened=0):
     """The stored session brief, or None if it is not there YET.
 
     Distinguishes "not written yet" (NoSuchKey/404 -- the ordinary, expected
@@ -630,7 +644,7 @@ def _read_brief(folder, date, session_id):
     "brief never arrives"."""
     import boto3
     from botocore.exceptions import ClientError
-    key = _brief_key(folder, date, session_id)
+    key = _brief_key(folder, date, session_id, reopened)
     try:
         obj = boto3.client("s3").get_object(Bucket=S3_BUCKET, Key=key)
         return json.loads(obj["Body"].read().decode("utf-8"))
@@ -651,7 +665,7 @@ def _read_brief(folder, date, session_id):
 
 
 def _poll_for_brief(folder, date, session_id, *, read_brief=None, sleep=None,
-                    poll_seconds=None, wait_seconds=None):
+                    poll_seconds=None, wait_seconds=None, reopened=0):
     """Poll for the concurrently-enqueued session brief (§2.1) up to
     BRIEF_WAIT_SECONDS, checking every BRIEF_POLL_SECONDS. Returns the brief
     dict, or None if it never appeared within the budget.
@@ -668,8 +682,10 @@ def _poll_for_brief(folder, date, session_id, *, read_brief=None, sleep=None,
     poll = BRIEF_POLL_SECONDS if poll_seconds is None else poll_seconds
     wait = BRIEF_WAIT_SECONDS if wait_seconds is None else wait_seconds
     attempts = max(1, int(wait // poll) + 1) if poll > 0 else 1
+    # A reopened round polls its OWN brief (r{n}.json), never round 1's latest.
+    round_kw = {"reopened": reopened} if reopened else {}
     for i in range(attempts):
-        brief = read_brief(folder, date, session_id)
+        brief = read_brief(folder, date, session_id, **round_kw)
         if brief is not None:
             return brief
         if i < attempts - 1:
@@ -758,7 +774,9 @@ def _rows_from_brief_or_request(artifact, request_todos, *, poll_brief=None):
         logger.info("finalize: %s email rows from the request -- missing folder/date "
                     "to look up a brief", session_id)
         return request_todos
-    brief = (poll_brief or _poll_for_brief)(folder, date, session_id)
+    reopened = artifact.get("reopened")
+    brief = (poll_brief or _poll_for_brief)(folder, date, session_id,
+                                            **({"reopened": reopened} if reopened else {}))
     if brief is None:
         logger.info("finalize: %s email rows from the request -- no brief within %ss",
                     session_id, BRIEF_WAIT_SECONDS)
@@ -992,8 +1010,9 @@ def process_finalize_request(artifact, *, send=None, write_result=None, complete
         # from this file; a skip that writes nothing leaves the session stuck in
         # `finalizing` forever, which is a different bug wearing this fix's
         # clothes.
+        # On the ROUND's key: reconcile settles a reopened round from `{sid}-r{n}`.
         (write_result if write_result is not None else _default_write_result)(
-            session_id, outcome)
+            f"{session_id}{round_suffix(artifact.get('reopened'))}", outcome)
         return outcome
 
     # Prefer a FRESH complete summary re-derived from the full transcript over the
@@ -1008,7 +1027,13 @@ def process_finalize_request(artifact, *, send=None, write_result=None, complete
     # A follow-up notes email (item-writer: a final extraction that recovered after the
     # recorder was told it was delayed) has its own key for the same reason.
     is_follow_up = bool(artifact.get("followUp"))
-    suffix = "-updated" if is_updated else "-notes" if is_follow_up else ""
+    # A late-chunk reopen's round (`reopened` = meeting_session.reopen_count) gets
+    # its own `-r{n}` result, before `-notes`: on round 1's key, round 1's `sent`
+    # would answer "already sent" and the complete email would never go out.
+    # Group merge (`-updated`) is its own round and is never suffixed.
+    reopened = 0 if is_updated else int(artifact.get("reopened") or 0)
+    suffix = ("-updated" if is_updated else
+              round_suffix(reopened) + ("-notes" if is_follow_up else ""))
     result_id = f"{artifact.get('sessionId')}{suffix}"
     if (already_sent if already_sent is not None else _already_sent)(result_id):
         logger.info("finalize: %s was already sent -- not sending again", result_id)
@@ -1066,10 +1091,15 @@ def process_finalize_request(artifact, *, send=None, write_result=None, complete
         # so an updated result on the solo key could move that session to `sent`
         # on the wrong evidence.
         session_id = f"{session_id}-updated"
-    elif is_follow_up:
-        # Same reason as `-updated`: reconcile already settled {sid}.json from the
-        # model-error email, and this result must not be mistaken for it.
-        session_id = f"{session_id}-notes"
+    else:
+        if reopened:
+            # The recorder already had round 1's email for this recording; this
+            # one has more in it and must say it supersedes, not repeat.
+            subject = f"Updated — replaces the earlier summary: {subject}"
+        # `-notes` for the same reason as `-updated`: reconcile already settled
+        # {sid}.json from the model-error email, and this result must not be
+        # mistaken for it. `-r{n}`: see result_id above.
+        session_id = result_id
     if send is None:
         from email_sender import get_sender
         send = get_sender().send
