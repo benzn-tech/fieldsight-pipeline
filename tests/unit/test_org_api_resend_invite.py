@@ -44,8 +44,10 @@ TARGET = {"id": "u-2", "cognito_sub": "sub-2", "company_id": "c-1",
 
 
 class FakeCognito:
-    def __init__(self, status="FORCE_CHANGE_PASSWORD", get_error=None, create_error=None):
+    def __init__(self, status="FORCE_CHANGE_PASSWORD", get_error=None, create_error=None,
+                 email="invitee@x.nz"):
         self.status = status
+        self.email = email
         self.get_error = get_error
         self.create_error = create_error
         self.got = []
@@ -55,11 +57,18 @@ class FakeCognito:
         self.got.append(kw)
         if self.get_error:
             raise ClientError({"Error": {"Code": self.get_error, "Message": "x"}}, "AdminGetUser")
-        return {"Username": kw["Username"], "UserStatus": self.status,
-                "UserAttributes": [{"Name": "email", "Value": "invitee@x.nz"},
-                                   {"Name": "sub", "Value": kw["Username"]}]}
+        attrs = [{"Name": "sub", "Value": kw["Username"]}]
+        if self.email:
+            attrs.append({"Name": "email", "Value": self.email})
+        return {"Username": kw["Username"], "UserStatus": self.status, "UserAttributes": attrs}
 
     def admin_create_user(self, **kw):
+        # The real pool signs in by email: a sub here is InvalidParameterException
+        # "Username should be an email" (TEST, 2026-10-22) -- the first deploy did that.
+        if "@" not in kw["Username"]:
+            raise ClientError({"Error": {"Code": "InvalidParameterException",
+                                         "Message": "Username should be an email."}},
+                              "AdminCreateUser")
         self.created.append(kw)
         if self.create_error:
             raise ClientError({"Error": {"Code": self.create_error, "Message": "x"}},
@@ -83,15 +92,33 @@ def call(sub_path="sub-2", caller="sub-1"):
     return res["statusCode"], json.loads(res["body"])
 
 
-def test_pending_invitee_gets_a_resend_addressed_by_sub(env):
+def test_pending_invitee_gets_a_resend_addressed_by_cognito_email(env):
     _, fake = env
     status, body = call()
     assert status == 200
     assert body == {"resent": True, "email": "invitee@x.nz",
                     "user_status": "FORCE_CHANGE_PASSWORD"}
-    assert fake.created == [{"UserPoolId": org.COGNITO_USER_POOL_ID, "Username": "sub-2",
+    assert fake.created == [{"UserPoolId": org.COGNITO_USER_POOL_ID, "Username": "invitee@x.nz",
                              "MessageAction": "RESEND", "DesiredDeliveryMediums": ["EMAIL"]}]
     assert fake.got[0]["Username"] == "sub-2"
+
+
+def test_resend_uses_the_email_cognito_holds_not_the_aurora_column(env):
+    people, fake = env
+    people["sub-2"]["email"] = "drifted@elsewhere.nz"
+    fake.email = "real-login@x.nz"
+    status, body = call()
+    assert status == 200
+    assert fake.created[0]["Username"] == "real-login@x.nz"
+    assert body["email"] == "real-login@x.nz"
+
+
+def test_login_without_email_is_409_and_no_call(env):
+    _, fake = env
+    fake.email = None
+    status, _ = call()
+    assert status == 409
+    assert fake.created == []
 
 
 def test_confirmed_member_gets_409_and_no_email(env):
