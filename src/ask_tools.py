@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 
 import ask_tools_log
+import lexical_terms
 import query_slots
 
 logger = logging.getLogger()
@@ -326,6 +327,19 @@ def _text(value):
     if value is None:
         return ""
     return (value if isinstance(value, str) else str(value))[:MAX_TEXT]
+
+
+def _window_terms(query):
+    """The words an item window centres on: `query_terms` minus ASKING_WORDS,
+    deduplicated in order. CJK bigrams are kept (unlike `subject_terms`): a Chinese
+    query over Chinese speech must centre too. Lowercase only, no ASCII step."""
+    if not isinstance(query, str):
+        return []
+    out = []
+    for t in lexical_terms.query_terms(query):
+        if t not in lexical_terms.ASKING_WORDS and t not in out:
+            out.append(t)
+    return out
 
 
 def _metric_text(metric, row):
