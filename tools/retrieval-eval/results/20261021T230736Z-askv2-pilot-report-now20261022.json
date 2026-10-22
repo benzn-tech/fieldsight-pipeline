@@ -1,0 +1,1336 @@
+{
+ "label": "pilot",
+ "mode": "ask-v2",
+ "ran_at": "2026-10-21T23:07:36+00:00",
+ "aborted": null,
+ "runs": [
+  {
+   "repeat": 1,
+   "turns": [
+    {
+     "id": "v1-01",
+     "expect": "answerable",
+     "turn": "79f1c275250be0bb",
+     "funnel": {
+      "stages": {
+       "sql": true,
+       "rows": true,
+       "item": true,
+       "seen": true,
+       "final_view": true,
+       "cited": true
+      },
+      "lost_at": null,
+      "rows_round1": true,
+      "rows_judge": true,
+      "evidence_lines": [
+       "R17 | 2026-09-10 08:22:18–08:25:51 | UC PK | - | - — [08:22:18] spk_2: Yeah. As soon as he called, he's like, \"You're not gonna happy. You're not gonna be happy",
+       "R4 | 2026-09-10 | UC PK | - | - — [08:19 – 08:48] Procurement strategy and staffing review (progress) Participants: Ben, Ali, Alex, Tom Reviewed roofing, intern",
+       "R9 | 2026-09-10 09:19:26–09:22:07 | UC PK | - | - — [09:19:26] spk_1: Xtreme. [09:19:27] spk_0: Xtreme have pulled out. They can't meet our program, so we're ha"
+      ],
+      "control": null,
+      "status": "scored",
+      "fallback": null,
+      "flags": [],
+      "timing": {
+       "judge_ms": 2711,
+       "tools_ms": 19068,
+       "sql_ms": 3619,
+       "statements": 29,
+       "estimated_prod_ms": 18305
+      }
+     },
+     "route": {
+      "bad_refs": 0,
+      "basis": "records",
+      "basis_derived": "records",
+      "calls": [
+       [
+        "search_records"
+       ],
+       [
+        "search_records",
+        "search_records"
+       ]
+      ],
+      "channel": "screen",
+      "fallback": null,
+      "guard": false,
+      "history_turns": 0,
+      "ms": {
+       "judge": [
+        1515,
+        1203
+       ],
+       "total": 21828
+      },
+      "orch": "v2",
+      "policy": "never",
+      "precheck": "n/a",
+      "refs_d": 0,
+      "refs_r": 3,
+      "refs_w": 0,
+      "rounds": 2,
+      "sub_hash": "0e4a3ab6f567",
+      "turn": "79f1c275250be0bb",
+      "web_late": false
+     },
+     "states": [
+      "searching_records",
+      "writing",
+      "searching_records",
+      "writing"
+     ],
+     "tool_calls": [
+      {
+       "round": 1,
+       "calls": [
+        {
+         "name": "search_records",
+         "args": {
+          "query": "Why did the roofing subcontractor pull out?",
+          "site": "4326dbc7-14a2-4251-8381-9d0067595a85"
+         }
+        }
+       ]
+      },
+      {
+       "round": 2,
+       "calls": [
+        {
+         "name": "search_records",
+         "args": {
+          "query": "roofing subcontractor withdraw Xtreme Roofing Hub out",
+          "k": 12
+         }
+        },
+        {
+         "name": "search_records",
+         "args": {
+          "query": "roofing risk procurement",
+          "k": 12
+         }
+        }
+       ]
+      }
+     ],
+     "judge": [
+      {
+       "tool_choice": "required",
+       "tool_calls": [
+        {
+         "name": "search_records",
+         "args": {
+          "query": "roofing subcontractor withdraw Xtreme Roofing Hub out",
+          "k": 12
+         }
+        },
+        {
+         "name": "search_records",
+         "args": {
+          "query": "roofing risk procurement",
+          "k": 12
+         }
+        }
+       ],
+       "final": false,
+       "usage": {
+        "prompt": 4294,
+        "completion": 115,
+        "reasoning": 0
+       },
+       "model": "deepseek/deepseek-v4.1-flash",
+       "error": null,
+       "ms": 1515.9
+      },
+      {
+       "tool_choice": "required",
+       "tool_calls": [],
+       "final": true,
+       "usage": {
+        "prompt": 8973,
+        "completion": 157,
+        "reasoning": 0
+       },
+       "model": "deepseek/deepseek-v4.1-flash",
+       "error": null,
+       "ms": 1195.3
+      }
+     ],
+     "answer": "Xtreme pulled out because they couldn't meet our programme (\"Xtreme have pulled out. They can't meet our program, so we're having a meeting today with the battens\") [1]; roofing was flagged that same day as the biggest procurement risk with both Xtreme and Roofing Hub out [2]. Nothing recorded gives a further reason. Roofing Hub is seen as unlikely to come back [3].",
+     "final_raw": "Xtreme pulled out because they couldn't meet our programme (\"Xtreme have pulled out. They can't meet our program, so we're having a meeting today with the battens\") [R9]; roofing was flagged that same day as the biggest procurement risk with both Xtreme and Roofing Hub out [R4]. Nothing recorded gives a further reason. Roofing Hub is seen as unlikely to come back [R10].",
+     "citations": 3,
+     "grounded": true,
+     "error": null,
+     "sql": {
+      "statements": 29,
+      "ms_total": 3619.4,
+      "ms_max": 531.4,
+      "transactions": 2,
+      "errors": [],
+      "warnings": [],
+      "largest_response": 242852,
+      "templates": [
+       [
+        "117acc18c369107a02c37d213eea0eaeea580842755f9399b9e5f2474ad348bc",
+        "SELECT site_id, role FROM memberships WHERE user_id=%s AND external AND archived"
+       ],
+       [
+        "971b9873e4fbc71c126099e6b30774f68b48fa2b3ed9a01674c7c4778f5a86b1",
+        "SELECT users.id, users.cognito_sub, users.company_id, users.email, users.first_n"
+       ],
+       [
+        "99d68e07be40e6532de3143024f0b69390585a8401d0b52694ba3859a609b83b",
+        "SELECT DISTINCT user_id FROM memberships WHERE site_id = ANY(%s::uuid[]) AND rol"
+       ],
+       [
+        "bfcf0fb8aaafb7586af65e4cd71c6b606e93f801303d673ddd8735d7df156fdd",
+        "WITH vec AS ( SELECT c.id, c.chunk_text, c.chunk_type, c.topic_id, c.source_s3_k"
+       ],
+       [
+        "d11b90767631518ab93023c7bf97397b578842abbf097982b129bfb912223039",
+        "SELECT id, company_id, site_id, wrong_term, right_term, kind, source, status, cr"
+       ],
+       [
+        "daf346f977a25957e94e3eb70223b09e8d0b63a81b189bc2e8889b3e3e34c3b1",
+        "SELECT site_id, role FROM memberships WHERE user_id=%s AND archived_at IS NULL"
+       ]
+      ]
+     }
+    },
+    {
+     "id": "v1-03",
+     "expect": "answerable",
+     "turn": "53cade43fc6d6548",
+     "funnel": {
+      "stages": {
+       "sql": true,
+       "rows": true,
+       "item": false,
+       "seen": false,
+       "final_view": false,
+       "cited": false
+      },
+      "lost_at": "cut_600_cap",
+      "rows_round1": true,
+      "rows_judge": false,
+      "evidence_lines": [],
+      "control": null,
+      "status": "scored",
+      "fallback": null,
+      "flags": [],
+      "timing": {
+       "judge_ms": 1135,
+       "tools_ms": 7416,
+       "sql_ms": 2137,
+       "statements": 16,
+       "estimated_prod_ms": 6494
+      }
+     },
+     "route": {
+      "bad_refs": 0,
+      "basis": "records",
+      "basis_derived": "records",
+      "calls": [
+       [
+        "search_records",
+        "search_project_documents"
+       ]
+      ],
+      "channel": "screen",
+      "fallback": null,
+      "guard": false,
+      "history_turns": 0,
+      "ms": {
+       "judge": [
+        1139
+       ],
+       "total": 8562
+      },
+      "orch": "v2",
+      "policy": "never",
+      "precheck": "n/a",
+      "refs_d": 0,
+      "refs_r": 1,
+      "refs_w": 0,
+      "rounds": 1,
+      "sub_hash": "0e4a3ab6f567",
+      "turn": "53cade43fc6d6548",
+      "web_late": false
+     },
+     "states": [
+      "searching_records",
+      "writing"
+     ],
+     "tool_calls": [
+      {
+       "round": 1,
+       "calls": [
+        {
+         "name": "search_records",
+         "args": {
+          "query": "What is the staff cost to the contract completion date?",
+          "site": "4326dbc7-14a2-4251-8381-9d0067595a85"
+         }
+        },
+        {
+         "name": "search_project_documents",
+         "args": {
+          "query": "What is the staff cost to the contract completion date?",
+          "site": "4326dbc7-14a2-4251-8381-9d0067595a85"
+         }
+        }
+       ]
+      }
+     ],
+     "judge": [
+      {
+       "tool_choice": "required",
+       "tool_calls": [],
+       "final": true,
+       "usage": {
+        "prompt": 4380,
+        "completion": 142,
+        "reasoning": 0
+       },
+       "model": "deepseek/deepseek-v4.1-flash",
+       "error": null,
+       "ms": 1135.0
+      }
+     ],
+     "answer": "The records show a $300K staff cost to the contract date. On 10 September the governance meeting for Waipuna Rise reported a commercial forecast with a $160K loss plus a $150K supervision overrun and $300K to the contract date, with a decision to add a $300K staff cost management adjustment that month [1].",
+     "final_raw": "The records show a $300K staff cost to the contract date. On 10 September the governance meeting for Waipuna Rise reported a commercial forecast with a $160K loss plus a $150K supervision overrun and $300K to the contract date, with a decision to add a $300K staff cost management adjustment that month [R2].",
+     "citations": 1,
+     "grounded": true,
+     "error": null,
+     "sql": {
+      "statements": 16,
+      "ms_total": 2136.8,
+      "ms_max": 517.0,
+      "transactions": 1,
+      "errors": [],
+      "warnings": [],
+      "largest_response": 222446,
+      "templates": [
+       [
+        "117acc18c369107a02c37d213eea0eaeea580842755f9399b9e5f2474ad348bc",
+        "SELECT site_id, role FROM memberships WHERE user_id=%s AND external AND archived"
+       ],
+       [
+        "7df7032d8621b27ae93c116e6ade33bac669def0201a4f3251dc31947eb838a4",
+        "WITH vec AS (SELECT c.id, c.document_id, d.series_id, d.revision, d.title, d.fil"
+       ],
+       [
+        "971b9873e4fbc71c126099e6b30774f68b48fa2b3ed9a01674c7c4778f5a86b1",
+        "SELECT users.id, users.cognito_sub, users.company_id, users.email, users.first_n"
+       ],
+       [
+        "99d68e07be40e6532de3143024f0b69390585a8401d0b52694ba3859a609b83b",
+        "SELECT DISTINCT user_id FROM memberships WHERE site_id = ANY(%s::uuid[]) AND rol"
+       ],
+       [
+        "bfcf0fb8aaafb7586af65e4cd71c6b606e93f801303d673ddd8735d7df156fdd",
+        "WITH vec AS ( SELECT c.id, c.chunk_text, c.chunk_type, c.topic_id, c.source_s3_k"
+       ],
+       [
+        "d11b90767631518ab93023c7bf97397b578842abbf097982b129bfb912223039",
+        "SELECT id, company_id, site_id, wrong_term, right_term, kind, source, status, cr"
+       ],
+       [
+        "daf346f977a25957e94e3eb70223b09e8d0b63a81b189bc2e8889b3e3e34c3b1",
+        "SELECT site_id, role FROM memberships WHERE user_id=%s AND archived_at IS NULL"
+       ]
+      ]
+     }
+    },
+    {
+     "id": "v1-20",
+     "expect": "unanswerable",
+     "turn": "821eb47393c3f329",
+     "funnel": {
+      "stages": null,
+      "lost_at": null,
+      "rows_round1": null,
+      "rows_judge": null,
+      "evidence_lines": [],
+      "control": {
+       "grounded": true,
+       "basis": "records",
+       "citations": 3,
+       "answered_with_citations": true
+      },
+      "status": "scored",
+      "fallback": null,
+      "flags": [],
+      "timing": {
+       "judge_ms": 2145,
+       "tools_ms": 11332,
+       "sql_ms": 2567,
+       "statements": 22,
+       "estimated_prod_ms": 11019
+      }
+     },
+     "route": {
+      "bad_refs": 0,
+      "basis": "records",
+      "basis_derived": "records",
+      "calls": [
+       [
+        "search_records"
+       ],
+       [
+        "search_records"
+       ]
+      ],
+      "channel": "screen",
+      "fallback": null,
+      "guard": false,
+      "history_turns": 0,
+      "ms": {
+       "judge": [
+        875,
+        1282
+       ],
+       "total": 13485
+      },
+      "orch": "v2",
+      "policy": "never",
+      "precheck": "n/a",
+      "refs_d": 0,
+      "refs_r": 3,
+      "refs_w": 0,
+      "rounds": 2,
+      "sub_hash": "0e4a3ab6f567",
+      "turn": "821eb47393c3f329",
+      "web_late": false
+     },
+     "states": [
+      "searching_records",
+      "writing",
+      "searching_records",
+      "writing"
+     ],
+     "tool_calls": [
+      {
+       "round": 1,
+       "calls": [
+        {
+         "name": "search_records",
+         "args": {
+          "query": "Did the tower crane collapse on site?",
+          "site": "4326dbc7-14a2-4251-8381-9d0067595a85"
+         }
+        }
+       ]
+      },
+      {
+       "round": 2,
+       "calls": [
+        {
+         "name": "search_records",
+         "args": {
+          "query": "crane collapse incident",
+          "site": "4326dbc7-14a2-4251-8381-9d0067595a85",
+          "k": 8
+         }
+        }
+       ]
+      }
+     ],
+     "judge": [
+      {
+       "tool_choice": "required",
+       "tool_calls": [
+        {
+         "name": "search_records",
+         "args": {
+          "query": "crane collapse incident",
+          "site": "4326dbc7-14a2-4251-8381-9d0067595a85",
+          "k": 8
+         }
+        }
+       ],
+       "final": false,
+       "usage": {
+        "prompt": 4191,
+        "completion": 94,
+        "reasoning": 0
+       },
+       "model": "deepseek/deepseek-v4.1-flash",
+       "error": null,
+       "ms": 864.5
+      },
+      {
+       "tool_choice": "required",
+       "tool_calls": [],
+       "final": true,
+       "usage": {
+        "prompt": 5868,
+        "completion": 152,
+        "reasoning": 0
+       },
+       "model": "deepseek/deepseek-v4.1-flash",
+       "error": null,
+       "ms": 1280.3
+      }
+     ],
+     "answer": "No — nothing recorded mentions a tower crane collapsing on site. Site records only cover crane methodology, lifts and constraints: cranage from bottom vs top with 15m lifts, operator visibility and CAA crane height limits requiring 10pm–6am lifts [1][2], plus panel delivery and lift timing [3]. There is no collapse, crane failure or related incident in any record found.",
+     "final_raw": "No — nothing recorded mentions a tower crane collapsing on site. Site records only cover crane methodology, lifts and constraints: cranage from bottom vs top with 15m lifts, operator visibility and CAA crane height limits requiring 10pm–6am lifts [R5, R4], plus panel delivery and lift timing [R2]. There is no collapse, crane failure or related incident in any record found.",
+     "citations": 3,
+     "grounded": true,
+     "error": null,
+     "sql": {
+      "statements": 22,
+      "ms_total": 2567.4,
+      "ms_max": 550.3,
+      "transactions": 2,
+      "errors": [],
+      "warnings": [],
+      "largest_response": 221931,
+      "templates": [
+       [
+        "117acc18c369107a02c37d213eea0eaeea580842755f9399b9e5f2474ad348bc",
+        "SELECT site_id, role FROM memberships WHERE user_id=%s AND external AND archived"
+       ],
+       [
+        "971b9873e4fbc71c126099e6b30774f68b48fa2b3ed9a01674c7c4778f5a86b1",
+        "SELECT users.id, users.cognito_sub, users.company_id, users.email, users.first_n"
+       ],
+       [
+        "99d68e07be40e6532de3143024f0b69390585a8401d0b52694ba3859a609b83b",
+        "SELECT DISTINCT user_id FROM memberships WHERE site_id = ANY(%s::uuid[]) AND rol"
+       ],
+       [
+        "bfcf0fb8aaafb7586af65e4cd71c6b606e93f801303d673ddd8735d7df156fdd",
+        "WITH vec AS ( SELECT c.id, c.chunk_text, c.chunk_type, c.topic_id, c.source_s3_k"
+       ],
+       [
+        "d11b90767631518ab93023c7bf97397b578842abbf097982b129bfb912223039",
+        "SELECT id, company_id, site_id, wrong_term, right_term, kind, source, status, cr"
+       ],
+       [
+        "daf346f977a25957e94e3eb70223b09e8d0b63a81b189bc2e8889b3e3e34c3b1",
+        "SELECT site_id, role FROM memberships WHERE user_id=%s AND archived_at IS NULL"
+       ]
+      ]
+     }
+    }
+   ],
+   "summary": {
+    "answerable_scored": 2,
+    "stages": {
+     "sql": "2/2",
+     "rows": "2/2",
+     "item": "1/2",
+     "seen": "1/2",
+     "final_view": "1/2",
+     "cited": "1/2"
+    },
+    "lost_at": {
+     "cut_600_cap": 1
+    },
+    "status": {
+     "scored": 3
+    },
+    "fallback_reasons": {},
+    "controls": {
+     "n": 1,
+     "answered_with_citations": 1
+    },
+    "judge_calls": 5,
+    "tokens": {
+     "prompt": 27706,
+     "completion": 660,
+     "reasoning": 0
+    },
+    "sql": {
+     "statements": 67,
+     "turn_ms_p50": 2567.4,
+     "stmt_ms_max": 550.3,
+     "largest_response": 242852
+    }
+   }
+  },
+  {
+   "repeat": 2,
+   "turns": [
+    {
+     "id": "v1-01",
+     "expect": "answerable",
+     "turn": "ee196fc8c225065b",
+     "funnel": {
+      "stages": {
+       "sql": true,
+       "rows": true,
+       "item": true,
+       "seen": true,
+       "final_view": true,
+       "cited": true
+      },
+      "lost_at": null,
+      "rows_round1": true,
+      "rows_judge": true,
+      "evidence_lines": [
+       "R4 | 2026-09-10 | UC PK | - | - — [08:19 – 08:48] Procurement strategy and staffing review (progress) Participants: Ben, Ali, Alex, Tom Reviewed roofing, intern"
+      ],
+      "control": null,
+      "status": "scored",
+      "fallback": null,
+      "flags": [],
+      "timing": {
+       "judge_ms": 2923,
+       "tools_ms": 14315,
+       "sql_ms": 4413,
+       "statements": 31,
+       "estimated_prod_ms": 12980
+      }
+     },
+     "route": {
+      "bad_refs": 0,
+      "basis": "records",
+      "basis_derived": "records",
+      "calls": [
+       [
+        "search_records"
+       ],
+       [
+        "search_records",
+        "latest_activity"
+       ]
+      ],
+      "channel": "screen",
+      "fallback": null,
+      "guard": false,
+      "history_turns": 0,
+      "ms": {
+       "judge": [
+        1235,
+        1687
+       ],
+       "total": 17250
+      },
+      "orch": "v2",
+      "policy": "never",
+      "precheck": "n/a",
+      "refs_d": 0,
+      "refs_r": 3,
+      "refs_w": 0,
+      "rounds": 2,
+      "sub_hash": "0e4a3ab6f567",
+      "turn": "ee196fc8c225065b",
+      "web_late": false
+     },
+     "states": [
+      "searching_records",
+      "writing",
+      "searching_records",
+      "writing"
+     ],
+     "tool_calls": [
+      {
+       "round": 1,
+       "calls": [
+        {
+         "name": "search_records",
+         "args": {
+          "query": "Why did the roofing subcontractor pull out?",
+          "site": "4326dbc7-14a2-4251-8381-9d0067595a85"
+         }
+        }
+       ]
+      },
+      {
+       "round": 2,
+       "calls": [
+        {
+         "name": "search_records",
+         "args": {
+          "query": "roofing subcontractor pulled out withdrew"
+         }
+        },
+        {
+         "name": "latest_activity",
+         "args": {
+          "query": "roofing subcontractor"
+         }
+        }
+       ]
+      }
+     ],
+     "judge": [
+      {
+       "tool_choice": "required",
+       "tool_calls": [
+        {
+         "name": "search_records",
+         "args": {
+          "query": "roofing subcontractor pulled out withdrew"
+         }
+        },
+        {
+         "name": "latest_activity",
+         "args": {
+          "query": "roofing subcontractor"
+         }
+        }
+       ],
+       "final": false,
+       "usage": {
+        "prompt": 4337,
+        "completion": 78,
+        "reasoning": 0
+       },
+       "model": "deepseek/deepseek-v4.1-flash",
+       "error": null,
+       "ms": 1239.2
+      },
+      {
+       "tool_choice": "required",
+       "tool_calls": [],
+       "final": true,
+       "usage": {
+        "prompt": 6253,
+        "completion": 187,
+        "reasoning": 0
+       },
+       "model": "deepseek/deepseek-v4.1-flash",
+       "error": null,
+       "ms": 1684.0
+      }
+     ],
+     "answer": "The records name the two roofing bidders as out, but give no reason for them pulling out. On 10 September roofing was flagged as the biggest procurement risk \"with Xtreme and Roofing Hub out\" [1], and in a separate note that day \"the roofings gone there, we'll just move to cheapest\" [2]. The only related complaint is from 3 September, when the roofers were said not to turn up and to have supplied poor gear [3], which is not stated as a cause. Nothing recorded explains why they withdrew.",
+     "final_raw": "The records name the two roofing bidders as out, but give no reason for them pulling out. On 10 September roofing was flagged as the biggest procurement risk \"with Xtreme and Roofing Hub out\" [R4], and in a separate note that day \"the roofings gone there, we'll just move to cheapest\" [R7]. The only related complaint is from 3 September, when the roofers were said not to turn up and to have supplied poor gear [R2], which is not stated as a cause. Nothing recorded explains why they withdrew.",
+     "citations": 3,
+     "grounded": true,
+     "error": null,
+     "sql": {
+      "statements": 31,
+      "ms_total": 4413.4,
+      "ms_max": 653.9,
+      "transactions": 2,
+      "errors": [],
+      "warnings": [],
+      "largest_response": 242849,
+      "templates": [
+       [
+        "088acb2774f02e0d816e3669c62ea58a8b8de5ff9f44f65a38f896ea1261111f",
+        "SELECT id, ((v @@ (to_tsquery('english', %(st0)s) || to_tsquery('simple', %(st0)"
+       ],
+       [
+        "117acc18c369107a02c37d213eea0eaeea580842755f9399b9e5f2474ad348bc",
+        "SELECT site_id, role FROM memberships WHERE user_id=%s AND external AND archived"
+       ],
+       [
+        "971b9873e4fbc71c126099e6b30774f68b48fa2b3ed9a01674c7c4778f5a86b1",
+        "SELECT users.id, users.cognito_sub, users.company_id, users.email, users.first_n"
+       ],
+       [
+        "99d68e07be40e6532de3143024f0b69390585a8401d0b52694ba3859a609b83b",
+        "SELECT DISTINCT user_id FROM memberships WHERE site_id = ANY(%s::uuid[]) AND rol"
+       ],
+       [
+        "bfcf0fb8aaafb7586af65e4cd71c6b606e93f801303d673ddd8735d7df156fdd",
+        "WITH vec AS ( SELECT c.id, c.chunk_text, c.chunk_type, c.topic_id, c.source_s3_k"
+       ],
+       [
+        "d11b90767631518ab93023c7bf97397b578842abbf097982b129bfb912223039",
+        "SELECT id, company_id, site_id, wrong_term, right_term, kind, source, status, cr"
+       ],
+       [
+        "d43811af4c8f19936a3cca41794ac54c5e473307f9b987f55c20c37ee23631ee",
+        "WITH cand AS MATERIALIZED ( SELECT c.report_date, to_tsvector('english', c.chunk"
+       ],
+       [
+        "daf346f977a25957e94e3eb70223b09e8d0b63a81b189bc2e8889b3e3e34c3b1",
+        "SELECT site_id, role FROM memberships WHERE user_id=%s AND archived_at IS NULL"
+       ]
+      ]
+     }
+    },
+    {
+     "id": "v1-03",
+     "expect": "answerable",
+     "turn": "403ce479ff8e76cd",
+     "funnel": {
+      "stages": {
+       "sql": true,
+       "rows": true,
+       "item": false,
+       "seen": false,
+       "final_view": false,
+       "cited": false
+      },
+      "lost_at": "cut_600_cap",
+      "rows_round1": true,
+      "rows_judge": false,
+      "evidence_lines": [],
+      "control": null,
+      "status": "scored",
+      "fallback": null,
+      "flags": [],
+      "timing": {
+       "judge_ms": 1388,
+       "tools_ms": 9461,
+       "sql_ms": 2174,
+       "statements": 16,
+       "estimated_prod_ms": 8755
+      }
+     },
+     "route": {
+      "bad_refs": 0,
+      "basis": "records",
+      "basis_derived": "records",
+      "calls": [
+       [
+        "search_records",
+        "search_project_documents"
+       ]
+      ],
+      "channel": "screen",
+      "fallback": null,
+      "guard": false,
+      "history_turns": 0,
+      "ms": {
+       "judge": [
+        1391
+       ],
+       "total": 10858
+      },
+      "orch": "v2",
+      "policy": "never",
+      "precheck": "n/a",
+      "refs_d": 0,
+      "refs_r": 3,
+      "refs_w": 0,
+      "rounds": 1,
+      "sub_hash": "0e4a3ab6f567",
+      "turn": "403ce479ff8e76cd",
+      "web_late": false
+     },
+     "states": [
+      "searching_records",
+      "writing"
+     ],
+     "tool_calls": [
+      {
+       "round": 1,
+       "calls": [
+        {
+         "name": "search_records",
+         "args": {
+          "query": "What is the staff cost to the contract completion date?",
+          "site": "4326dbc7-14a2-4251-8381-9d0067595a85"
+         }
+        },
+        {
+         "name": "search_project_documents",
+         "args": {
+          "query": "What is the staff cost to the contract completion date?",
+          "site": "4326dbc7-14a2-4251-8381-9d0067595a85"
+         }
+        }
+       ]
+      }
+     ],
+     "judge": [
+      {
+       "tool_choice": "required",
+       "tool_calls": [],
+       "final": true,
+       "usage": {
+        "prompt": 4380,
+        "completion": 256,
+        "reasoning": 0
+       },
+       "model": "deepseek/deepseek-v4.1-flash",
+       "error": null,
+       "ms": 1387.9
+      }
+     ],
+     "answer": "The staff cost to the contract completion date was put at $300K, presented in the 10 September governance meeting commercial forecast. [1]\n\n- The forecast showed a $160K loss plus $150K supervision overrun and $300K staff cost to contract date [1]\n- It was decided to add a $300K staff cost management adjustment that month (Ben) and to report to the contract PC date on a worst-case basis with opportunity upside (Carl) [1]\n- Discussion noted the current CCC of about $425K and another $300K if four-class staffing continues — \"six hundred all round\" [2]\n- A further ~$125K staff shortfall was flagged against the target date, versus ~$125K on the spot for the contract (PC) date [3]\n\nNote: no project document on file addresses this; the figures are from meeting records only.",
+     "final_raw": "The staff cost to the contract completion date was put at $300K, presented in the 10 September governance meeting commercial forecast. [R2]\n\n- The forecast showed a $160K loss plus $150K supervision overrun and $300K staff cost to contract date [R2]\n- It was decided to add a $300K staff cost management adjustment that month (Ben) and to report to the contract PC date on a worst-case basis with opportunity upside (Carl) [R2]\n- Discussion noted the current CCC of about $425K and another $300K if four-class staffing continues — \"six hundred all round\" [R1]\n- A further ~$125K staff shortfall was flagged against the target date, versus ~$125K on the spot for the contract (PC) date [R3]\n\nNote: no project document on file addresses this; the figures are from meeting records only.",
+     "citations": 3,
+     "grounded": true,
+     "error": null,
+     "sql": {
+      "statements": 16,
+      "ms_total": 2174.0,
+      "ms_max": 573.4,
+      "transactions": 1,
+      "errors": [],
+      "warnings": [],
+      "largest_response": 222446,
+      "templates": [
+       [
+        "117acc18c369107a02c37d213eea0eaeea580842755f9399b9e5f2474ad348bc",
+        "SELECT site_id, role FROM memberships WHERE user_id=%s AND external AND archived"
+       ],
+       [
+        "7df7032d8621b27ae93c116e6ade33bac669def0201a4f3251dc31947eb838a4",
+        "WITH vec AS (SELECT c.id, c.document_id, d.series_id, d.revision, d.title, d.fil"
+       ],
+       [
+        "971b9873e4fbc71c126099e6b30774f68b48fa2b3ed9a01674c7c4778f5a86b1",
+        "SELECT users.id, users.cognito_sub, users.company_id, users.email, users.first_n"
+       ],
+       [
+        "99d68e07be40e6532de3143024f0b69390585a8401d0b52694ba3859a609b83b",
+        "SELECT DISTINCT user_id FROM memberships WHERE site_id = ANY(%s::uuid[]) AND rol"
+       ],
+       [
+        "bfcf0fb8aaafb7586af65e4cd71c6b606e93f801303d673ddd8735d7df156fdd",
+        "WITH vec AS ( SELECT c.id, c.chunk_text, c.chunk_type, c.topic_id, c.source_s3_k"
+       ],
+       [
+        "d11b90767631518ab93023c7bf97397b578842abbf097982b129bfb912223039",
+        "SELECT id, company_id, site_id, wrong_term, right_term, kind, source, status, cr"
+       ],
+       [
+        "daf346f977a25957e94e3eb70223b09e8d0b63a81b189bc2e8889b3e3e34c3b1",
+        "SELECT site_id, role FROM memberships WHERE user_id=%s AND archived_at IS NULL"
+       ]
+      ]
+     }
+    },
+    {
+     "id": "v1-20",
+     "expect": "unanswerable",
+     "turn": "e643006e7122b7e0",
+     "funnel": {
+      "stages": null,
+      "lost_at": null,
+      "rows_round1": null,
+      "rows_judge": null,
+      "evidence_lines": [],
+      "control": {
+       "grounded": true,
+       "basis": "records",
+       "citations": 3,
+       "answered_with_citations": true
+      },
+      "status": "scored",
+      "fallback": null,
+      "flags": [],
+      "timing": {
+       "judge_ms": 2266,
+       "tools_ms": 13158,
+       "sql_ms": 3558,
+       "statements": 23,
+       "estimated_prod_ms": 11980
+      }
+     },
+     "route": {
+      "bad_refs": 0,
+      "basis": "records",
+      "basis_derived": "records",
+      "calls": [
+       [
+        "search_records"
+       ],
+       [
+        "search_records",
+        "latest_activity"
+       ]
+      ],
+      "channel": "screen",
+      "fallback": null,
+      "guard": false,
+      "history_turns": 0,
+      "ms": {
+       "judge": [
+        812,
+        1453
+       ],
+       "total": 15437
+      },
+      "orch": "v2",
+      "policy": "never",
+      "precheck": "n/a",
+      "refs_d": 0,
+      "refs_r": 3,
+      "refs_w": 0,
+      "rounds": 2,
+      "sub_hash": "0e4a3ab6f567",
+      "turn": "e643006e7122b7e0",
+      "web_late": false
+     },
+     "states": [
+      "searching_records",
+      "writing",
+      "searching_records",
+      "writing"
+     ],
+     "tool_calls": [
+      {
+       "round": 1,
+       "calls": [
+        {
+         "name": "search_records",
+         "args": {
+          "query": "Did the tower crane collapse on site?",
+          "site": "4326dbc7-14a2-4251-8381-9d0067595a85"
+         }
+        }
+       ]
+      },
+      {
+       "round": 2,
+       "calls": [
+        {
+         "name": "search_records",
+         "args": {
+          "query": "crane collapse incident tower crane"
+         }
+        },
+        {
+         "name": "latest_activity",
+         "args": {
+          "query": "crane collapse"
+         }
+        }
+       ]
+      }
+     ],
+     "judge": [
+      {
+       "tool_choice": "required",
+       "tool_calls": [
+        {
+         "name": "search_records",
+         "args": {
+          "query": "crane collapse incident tower crane"
+         }
+        },
+        {
+         "name": "latest_activity",
+         "args": {
+          "query": "crane collapse"
+         }
+        }
+       ],
+       "final": false,
+       "usage": {
+        "prompt": 4241,
+        "completion": 74,
+        "reasoning": 0
+       },
+       "model": "deepseek/deepseek-v4.1-flash",
+       "error": null,
+       "ms": 819.7
+      },
+      {
+       "tool_choice": "required",
+       "tool_calls": [],
+       "final": true,
+       "usage": {
+        "prompt": 5896,
+        "completion": 224,
+        "reasoning": 0
+       },
+       "model": "deepseek/deepseek-v4.1-flash",
+       "error": null,
+       "ms": 1446.2
+      }
+     ],
+     "answer": "No — nothing in the site records mentions a tower crane collapse; the crane records are about lifts, methodology and safety controls. [1][2]\n\n- 3 September: crane methodology and purlin deliveries discussed; decision that the subcontractor crane must lift from the bottom, and a medium safety note that the operator can't see the landing zone. [1]\n- 11 August: panel delivery delayed and wind picking up before the crane was demobbed; blockwork subbies caught walking under a suspended load, exclusion zones tightened. [2]\n- 10 September: CAA crane height limits requiring 10pm–6am lifts noted at governance. [3]\n- A search for any crane collapse or incident returned no matching records.",
+     "final_raw": "No — nothing in the site records mentions a tower crane collapse; the crane records are about lifts, methodology and safety controls. [R5, R7]\n\n- 3 September: crane methodology and purlin deliveries discussed; decision that the subcontractor crane must lift from the bottom, and a medium safety note that the operator can't see the landing zone. [R5]\n- 11 August: panel delivery delayed and wind picking up before the crane was demobbed; blockwork subbies caught walking under a suspended load, exclusion zones tightened. [R7]\n- 10 September: CAA crane height limits requiring 10pm–6am lifts noted at governance. [R4]\n- A search for any crane collapse or incident returned no matching records.",
+     "citations": 3,
+     "grounded": true,
+     "error": null,
+     "sql": {
+      "statements": 23,
+      "ms_total": 3558.5,
+      "ms_max": 1090.7,
+      "transactions": 2,
+      "errors": [],
+      "warnings": [],
+      "largest_response": 221931,
+      "templates": [
+       [
+        "117acc18c369107a02c37d213eea0eaeea580842755f9399b9e5f2474ad348bc",
+        "SELECT site_id, role FROM memberships WHERE user_id=%s AND external AND archived"
+       ],
+       [
+        "971b9873e4fbc71c126099e6b30774f68b48fa2b3ed9a01674c7c4778f5a86b1",
+        "SELECT users.id, users.cognito_sub, users.company_id, users.email, users.first_n"
+       ],
+       [
+        "99d68e07be40e6532de3143024f0b69390585a8401d0b52694ba3859a609b83b",
+        "SELECT DISTINCT user_id FROM memberships WHERE site_id = ANY(%s::uuid[]) AND rol"
+       ],
+       [
+        "bfcf0fb8aaafb7586af65e4cd71c6b606e93f801303d673ddd8735d7df156fdd",
+        "WITH vec AS ( SELECT c.id, c.chunk_text, c.chunk_type, c.topic_id, c.source_s3_k"
+       ],
+       [
+        "d11b90767631518ab93023c7bf97397b578842abbf097982b129bfb912223039",
+        "SELECT id, company_id, site_id, wrong_term, right_term, kind, source, status, cr"
+       ],
+       [
+        "d43811af4c8f19936a3cca41794ac54c5e473307f9b987f55c20c37ee23631ee",
+        "WITH cand AS MATERIALIZED ( SELECT c.report_date, to_tsvector('english', c.chunk"
+       ],
+       [
+        "daf346f977a25957e94e3eb70223b09e8d0b63a81b189bc2e8889b3e3e34c3b1",
+        "SELECT site_id, role FROM memberships WHERE user_id=%s AND archived_at IS NULL"
+       ]
+      ]
+     }
+    }
+   ],
+   "summary": {
+    "answerable_scored": 2,
+    "stages": {
+     "sql": "2/2",
+     "rows": "2/2",
+     "item": "1/2",
+     "seen": "1/2",
+     "final_view": "1/2",
+     "cited": "1/2"
+    },
+    "lost_at": {
+     "cut_600_cap": 1
+    },
+    "status": {
+     "scored": 3
+    },
+    "fallback_reasons": {},
+    "controls": {
+     "n": 1,
+     "answered_with_citations": 1
+    },
+    "judge_calls": 5,
+    "tokens": {
+     "prompt": 25107,
+     "completion": 819,
+     "reasoning": 0
+    },
+    "sql": {
+     "statements": 70,
+     "turn_ms_p50": 3558.5,
+     "stmt_ms_max": 1090.7,
+     "largest_response": 242849
+    }
+   }
+  }
+ ],
+ "fingerprint": {
+  "src_ref": "6a07de4b",
+  "src_sha": "6a07de4b32dea8bb51e6a986925e6c1c81ec3a1e",
+  "env": {
+   "secrets": {
+    "CORROBORATION_API_KEY": true,
+    "DASHSCOPE_API_KEY": true,
+    "QWEN_API_KEY": true
+   },
+   "values": {
+    "ASK_JUDGE_MODEL": "deepseek/deepseek-v4.1-flash",
+    "ASK_JUDGE_FALLBACKS": "google/gemini-3.8-flash",
+    "ASK_JUDGE_PROVIDER": "coreweave/fp8",
+    "ASK_JUDGE_REASONING": "off",
+    "ENABLE_RERANK": "true",
+    "RERANK_CANDIDATE_K": "32",
+    "RERANK_KEYWORD_CANDIDATES": null,
+    "PROJECT_DOCUMENTS": "true",
+    "SEARCH_INDEX_READ": "report",
+    "LLM_PROVIDER": "qwen",
+    "SERVER_BUILD": null,
+    "ASK_ANSWER_LANGUAGE": null
+   },
+   "qwen_base_host": "openrouter.ai",
+   "deployed": {
+    "fieldsight-prod-ask-voice-worker": {
+     "CodeSha256": "nWmUGtjc2VtN4FvrCl69IvWWOq8FQRCcaTb66ZeuilA=",
+     "LastModified": "2026-10-21T22:09:00.868+0000",
+     "SERVER_BUILD": null
+    },
+    "fieldsight-prod-rag-search": {
+     "CodeSha256": "nWmUGtjc2VtN4FvrCl69IvWWOq8FQRCcaTb66ZeuilA=",
+     "LastModified": "2026-10-21T22:08:29.000+0000",
+     "SERVER_BUILD": null
+    }
+   },
+   "fallback_synthesis": "qwen"
+  },
+  "model_chain": [
+   "deepseek/deepseek-v4.1-flash",
+   "google/gemini-3.8-flash",
+   "provider=coreweave/fp8",
+   "reasoning=off"
+  ],
+  "caller": {
+   "has_login": true,
+   "global_role": "site_manager",
+   "user_scope": "SELF+WORKERS",
+   "site_count": 1,
+   "author_count": 1,
+   "cross_company": false,
+   "gold_site_visible": true,
+   "gold_author_in_scope": true,
+   "sub_hash": "0e4a3ab6f567",
+   "ok": true
+  },
+  "preflight": {
+   "iam": {
+    "principal": "arn:aws:iam::509194952652:user/fieldsight-deployer",
+    "verified": true,
+    "allowed": [
+     "rds-data:BeginTransaction",
+     "rds-data:ExecuteStatement",
+     "rds-data:RollbackTransaction",
+     "lambda:GetFunctionConfiguration"
+    ]
+   },
+   "ro_probe": "refused with 25006",
+   "schema_missing": [],
+   "parity": {
+    "rows": 32,
+    "identical": true
+   }
+  },
+  "git_commit": "ce6bb1ff0bf8e6c20b909d408a5d64703b2f5e75",
+  "database": "fieldsight",
+  "family": "report",
+  "now": "2026-10-22T12:07:36+13:00",
+  "scope_site": "4326dbc7-14a2-4251-8381-9d0067595a85",
+  "gold_file": "tools\\retrieval-eval\\gold\\v1.1.jsonl",
+  "gold_sha256": "1eaf91ed7f252e419907d1f13918e5ce58837b25f587d2b066c8d30b0c7a3305",
+  "deadline_screen_s": 120.0,
+  "pilot": true,
+  "template_registry": [
+   [
+    "088acb2774f02e0d816e3669c62ea58a8b8de5ff9f44f65a38f896ea1261111f",
+    "SELECT id, ((v @@ (to_tsquery('english', %(st0)s) || to_tsquery('simple', %(st0)"
+   ],
+   [
+    "117acc18c369107a02c37d213eea0eaeea580842755f9399b9e5f2474ad348bc",
+    "SELECT site_id, role FROM memberships WHERE user_id=%s AND external AND archived"
+   ],
+   [
+    "7df7032d8621b27ae93c116e6ade33bac669def0201a4f3251dc31947eb838a4",
+    "WITH vec AS (SELECT c.id, c.document_id, d.series_id, d.revision, d.title, d.fil"
+   ],
+   [
+    "971b9873e4fbc71c126099e6b30774f68b48fa2b3ed9a01674c7c4778f5a86b1",
+    "SELECT users.id, users.cognito_sub, users.company_id, users.email, users.first_n"
+   ],
+   [
+    "99d68e07be40e6532de3143024f0b69390585a8401d0b52694ba3859a609b83b",
+    "SELECT DISTINCT user_id FROM memberships WHERE site_id = ANY(%s::uuid[]) AND rol"
+   ],
+   [
+    "bfcf0fb8aaafb7586af65e4cd71c6b606e93f801303d673ddd8735d7df156fdd",
+    "WITH vec AS ( SELECT c.id, c.chunk_text, c.chunk_type, c.topic_id, c.source_s3_k"
+   ],
+   [
+    "d11b90767631518ab93023c7bf97397b578842abbf097982b129bfb912223039",
+    "SELECT id, company_id, site_id, wrong_term, right_term, kind, source, status, cr"
+   ],
+   [
+    "d43811af4c8f19936a3cca41794ac54c5e473307f9b987f55c20c37ee23631ee",
+    "WITH cand AS MATERIALIZED ( SELECT c.report_date, to_tsvector('english', c.chunk"
+   ],
+   [
+    "daf346f977a25957e94e3eb70223b09e8d0b63a81b189bc2e8889b3e3e34c3b1",
+    "SELECT site_id, role FROM memberships WHERE user_id=%s AND archived_at IS NULL"
+   ]
+  ],
+  "http_counts": {
+   "rds-data.ap-southeast-2.amazonaws.com": 282,
+   "dashscope-intl.aliyuncs.com": 21,
+   "openrouter.ai": 10
+  },
+  "fallback_llm_usage": [
+   {
+    "provider": "openrouter",
+    "model": "deepseek/deepseek-v4.1-flash",
+    "caller": "ask_judge",
+    "prompt_tokens": "4294",
+    "completion_tokens": "115",
+    "reasoning_tokens": "0"
+   },
+   {
+    "provider": "openrouter",
+    "model": "deepseek/deepseek-v4.1-flash",
+    "caller": "ask_judge",
+    "prompt_tokens": "8973",
+    "completion_tokens": "157",
+    "reasoning_tokens": "0"
+   },
+   {
+    "provider": "openrouter",
+    "model": "deepseek/deepseek-v4.1-flash",
+    "caller": "ask_judge",
+    "prompt_tokens": "4380",
+    "completion_tokens": "142",
+    "reasoning_tokens": "0"
+   },
+   {
+    "provider": "openrouter",
+    "model": "deepseek/deepseek-v4.1-flash",
+    "caller": "ask_judge",
+    "prompt_tokens": "4191",
+    "completion_tokens": "94",
+    "reasoning_tokens": "0"
+   },
+   {
+    "provider": "openrouter",
+    "model": "deepseek/deepseek-v4.1-flash",
+    "caller": "ask_judge",
+    "prompt_tokens": "5868",
+    "completion_tokens": "152",
+    "reasoning_tokens": "0"
+   },
+   {
+    "provider": "openrouter",
+    "model": "deepseek/deepseek-v4.1-flash",
+    "caller": "ask_judge",
+    "prompt_tokens": "4337",
+    "completion_tokens": "78",
+    "reasoning_tokens": "0"
+   },
+   {
+    "provider": "openrouter",
+    "model": "deepseek/deepseek-v4.1-flash",
+    "caller": "ask_judge",
+    "prompt_tokens": "6253",
+    "completion_tokens": "187",
+    "reasoning_tokens": "0"
+   },
+   {
+    "provider": "openrouter",
+    "model": "deepseek/deepseek-v4.1-flash",
+    "caller": "ask_judge",
+    "prompt_tokens": "4380",
+    "completion_tokens": "256",
+    "reasoning_tokens": "0"
+   },
+   {
+    "provider": "openrouter",
+    "model": "deepseek/deepseek-v4.1-flash",
+    "caller": "ask_judge",
+    "prompt_tokens": "4241",
+    "completion_tokens": "74",
+    "reasoning_tokens": "0"
+   },
+   {
+    "provider": "openrouter",
+    "model": "deepseek/deepseek-v4.1-flash",
+    "caller": "ask_judge",
+    "prompt_tokens": "5896",
+    "completion_tokens": "224",
+    "reasoning_tokens": "0"
+   }
+  ]
+ },
+ "flips": [],
+ "min_detectable_delta": 0,
+ "extrapolation": {
+  "turns": 270,
+  "judge_calls": 450,
+  "prompt_tokens": 2376585,
+  "completion_tokens": 66555,
+  "reasoning_tokens": 0,
+  "sql_statements": 6165
+ }
+}
