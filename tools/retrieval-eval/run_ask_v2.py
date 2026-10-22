@@ -87,8 +87,29 @@ def _judge_summary(rec):
     return out
 
 
+def _rows_record(item, turn_id, rec):
+    """What the tools were given in one turn, for the offline item-window replay
+    (replay_window.py): every batch's calls and envelope shapes (no item text), the raw
+    rag-search invokes (rows WITH transcript text) and the rows each envelope was built
+    from. Scratch only, never results/."""
+    batches = []
+    for b in rec.batches:
+        envs = [{"tool": e.get("tool"), "id": e.get("id"), "meta": e.get("meta"),
+                 "items": [{"ref": it.get("ref"), "kind": it.get("kind"),
+                            "chunk_id": it.get("chunk_id"), "topic_id": it.get("topic_id"),
+                            "date": it.get("date"), "text_len": len(it.get("text") or "")}
+                           for it in e.get("items") or []]}
+                for e in b.get("envelopes") or []]
+        batches.append({"calls": [{"name": c.get("name"), "args": c.get("args")}
+                                  for c in b["calls"] if isinstance(c, dict)],
+                        "judge_calls_before": b["judge_calls_before"], "envelopes": envs})
+    return {"id": item["id"], "expect": item.get("expect"), "date": item.get("date"),
+            "turn": turn_id, "batches": batches, "invokes": list(rec.invokes),
+            "post_search": list(rec.post_search)}
+
+
 def run_turn(item, *, ev, chat, proxy, capture, now, caller_sub, scope_site=None,
-             keep_renders=None):
+             keep_renders=None, keep_rows=None):
     """One question through `ask_orchestrator.answer`, as `_work_screen` builds the body
     (spec §4): question, tz, pinned now, caller_sub; `site_id` under --scope-site."""
     import ask_orchestrator
@@ -109,6 +130,8 @@ def run_turn(item, *, ev, chat, proxy, capture, now, caller_sub, scope_site=None
     if keep_renders is not None:
         keep_renders.append({"id": item["id"], "turn": turn_id,
                              "messages": [j["messages"] for j in rec.judge]})
+    if keep_rows is not None:
+        keep_rows.append(_rows_record(item, turn_id, rec))
     stmt_ms = sorted(st["ms"] for st in rec.log.statements)
     return {
         "id": item["id"], "expect": item.get("expect"), "turn": turn_id, "funnel": score,
@@ -157,6 +180,9 @@ def parse_args(argv=None):
     ap.add_argument("--max-tokens", type=int, default=None, help="prompt + completion")
     ap.add_argument("--keep-renders", default=None,
                     help="directory (scratchpad, never results/) for full judge messages")
+    ap.add_argument("--keep-rows", default=None,
+                    help="directory (scratchpad, never results/) for the rows the tools "
+                         "were given (transcript text), for replay_window.py")
     ap.add_argument("--out", default=str(HERE / "results"))
     args = ap.parse_args(argv)
     if args.diff:
@@ -171,6 +197,10 @@ def parse_args(argv=None):
     if args.keep_renders and Path(args.keep_renders).resolve().is_relative_to(
             (HERE / "results").resolve()):
         raise SystemExit("--keep-renders must not point into results/ (spec §8)")
+    if args.keep_rows and Path(args.keep_rows).resolve().is_relative_to(
+            (HERE / "results").resolve()):
+        raise SystemExit("--keep-rows must not point into results/ (rows hold transcript "
+                         "text; spec §8)")
     args.prefix = args.prefix or PREFIX[args.database]
     return args
 
@@ -324,6 +354,7 @@ def main(argv=None):
         chat = harness.chat_wrapper(ev, llm_tools_client.chat)
         caps = report.Caps(args.max_judge_calls, args.max_tokens)
         renders = [] if args.keep_renders else None
+        kept_rows = [] if args.keep_rows else None
         done = []
         try:
             for i in range(args.repeat):
@@ -333,7 +364,7 @@ def main(argv=None):
                     t = run_turn(item, ev=ev, chat=chat, proxy=proxy, capture=capture, now=now,
                                  caller_sub=caller_sub,
                                  scope_site=args.site if args.scope_site else None,
-                                 keep_renders=renders)
+                                 keep_renders=renders, keep_rows=kept_rows)
                     turns.append(t)
                     done.append(t)
                     print("run %d %s" % (i + 1, _line(t)))
@@ -361,6 +392,12 @@ def main(argv=None):
             dest_r = Path(args.keep_renders) / ("renders-%s.json" % args.label)
             dest_r.write_text(json.dumps(renders, ensure_ascii=False), encoding="utf-8")
             print("renders (scratch only): %s" % dest_r)
+        if kept_rows is not None:
+            Path(args.keep_rows).mkdir(parents=True, exist_ok=True)
+            dest_k = Path(args.keep_rows) / ("rows-%s-%s.json" % (args.label, args.family))
+            dest_k.write_text(json.dumps(kept_rows, ensure_ascii=False, default=str),
+                              encoding="utf-8")
+            print("rows (scratch only): %s" % dest_k)
         Path(args.out).mkdir(parents=True, exist_ok=True)
         dest = Path(args.out) / result_name(started.strftime("%Y%m%dT%H%M%SZ"), args.label,
                                            args.family, now)

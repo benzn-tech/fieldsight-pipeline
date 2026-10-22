@@ -112,6 +112,7 @@ def assert_seams(family, rerank):
     has(ask_tools, "RefAssigner", "class")
     has(ask_tools, "ToolContext", "class")
     has(ask_tools, "execute", "function")
+    has(ask_tools, "_envelope", "function")
     has(connection, "get_connection", "function")
 
 
@@ -128,6 +129,11 @@ class TurnRecord:
         self.batches = []         # {"calls", "envelopes", "ms", "judge_calls_before"}
         self.judge = []           # {"messages", "tool_choice", "turn", "usage", ...}
         self.states = []
+        # The rows each envelope was built from, per call: after the post-search
+        # (rerank, k cut) for search_records/latest_activity, rows[:k] for documents,
+        # the dispatcher's rows otherwise (item-window review BLOCKER 2: `invokes` holds
+        # only the pre-rerank pool). {"batch", "call_id", "name", "args", "ids"}
+        self.post_search = []
 
 
 class EvalTurns:
@@ -356,6 +362,9 @@ class ToolsProxy:
         self._t, self._ev, self._fake = ask_tools, ev, fake
         self.TOOLS = ask_tools.TOOLS
         self.RefAssigner = ask_tools.RefAssigner
+        # `_envelope` is wrapped while any execute runs (a late round-1 thread and a
+        # judge round can overlap): installed by the first, restored by the last.
+        self._lock, self._depth, self._envelope = threading.Lock(), 0, None
 
     def offered_tools(self):
         return self._t.offered_tools()
@@ -363,16 +372,32 @@ class ToolsProxy:
     def ToolContext(self, **kw):
         return self._t.ToolContext(**{**kw, "lambda_client": self._fake})
 
+    def _recording_envelope(self, name, call_id, args, rows, meta, ctx):
+        ids = [r.get("id") if isinstance(r, dict) else None for r in rows or []]
+        self._ev.rec.post_search.append({"batch": getattr(self._ev.local, "batch", None),
+                                         "call_id": call_id, "name": name,
+                                         "args": copy.deepcopy(args), "ids": ids})
+        return self._envelope(name, call_id, args, rows, meta, ctx)
+
     def execute(self, calls, ctx):
         rec = self._ev.rec
         entry = {"calls": copy.deepcopy(calls), "envelopes": None, "ms": None,
                  "judge_calls_before": len(rec.judge)}
         rec.batches.append(entry)
         self._ev.local.batch = len(rec.batches) - 1
+        with self._lock:
+            if self._depth == 0:
+                self._envelope = self._t._envelope
+                self._t._envelope = self._recording_envelope
+            self._depth += 1
         t0 = time.perf_counter()
         try:
             envs = self._t.execute(calls, ctx)
         finally:
+            with self._lock:
+                self._depth -= 1
+                if self._depth == 0:
+                    self._t._envelope = self._envelope
             self._ev.local.batch = None
             entry["ms"] = round((time.perf_counter() - t0) * 1000, 1)
         entry["envelopes"] = copy.deepcopy(envs)

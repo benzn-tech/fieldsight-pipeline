@@ -112,3 +112,11 @@ def test_preflight_only_runs_step0_with_fakes_and_stops(monkeypatch, capsys, tmp
     assert list(tmp_path.iterdir()) == []          # step 0 writes no result file
     methods = [m for m, _ in rds.calls]
     assert methods.count("begin_transaction") == methods.count("rollback_transaction")
+
+
+def test_keep_rows_must_not_point_into_results():
+    base = ["--gold", GOLD, "--label", "p", "--family", "report", "--pilot"]
+    results = Path(run_ask_v2.HERE) / "results" / "rows"
+    with pytest.raises(SystemExit, match="--keep-rows must not point into results/"):
+        run_ask_v2.parse_args(base + ["--keep-rows", str(results)])
+    assert run_ask_v2.parse_args(base + ["--keep-rows", "/tmp/x"]).keep_rows == "/tmp/x"

@@ -195,3 +195,38 @@ def test_chat_wrapper_records_a_raise(ev):
     with pytest.raises(TimeoutError):
         harness.chat_wrapper(ev, boom)([], [])
     assert ev.rec.judge[0]["error"] == "raised:TimeoutError"
+
+
+class _RowsLambda:
+    """A rag-search stand-in that answers every call with the same rows."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def invoke(self, FunctionName, InvocationType, Payload, **_):
+        ev = json.loads(Payload)
+        body = {"results": [{"id": c["id"], "name": c["name"], "rows": self.rows, "meta": {}}
+                            for c in ev["calls"]]}
+        return {"Payload": io.BytesIO(json.dumps(body).encode())}
+
+
+def test_tools_proxy_records_the_rows_each_envelope_was_built_from(ev, monkeypatch):
+    """Review BLOCKER 2: the post-search rows (reranked, k-cut) are recorded per call, so
+    an offline replay can rebuild every envelope, truncated ones included."""
+    monkeypatch.setattr(ask_tools, "_embed", lambda texts: [[0.0] * 4 for _ in texts])
+    monkeypatch.setattr(ask_tools, "_post_search", lambda q, rows, k: list(reversed(rows)))
+    original = ask_tools._envelope
+    rows = [{"id": "c1", "chunk_text": "a"}, {"id": "c2", "chunk_text": "b"}]
+    proxy = harness.ToolsProxy(ev, _RowsLambda(rows))
+    ctx = proxy.ToolContext(caller_sub="s", today=date(2026, 10, 15), deadline=1e12,
+                            lambda_client=None, function_name=harness.FAKE_FUNCTION,
+                            refs=ask_tools.RefAssigner())
+    proxy.execute([{"name": "search_records", "args": {"query": "q"}},
+                   {"name": "day_overview", "args": {"date_from": "2026-10-14"}}], ctx)
+    assert ask_tools._envelope is original                  # restored after the call
+    assert ev.rec.post_search == [
+        {"batch": 0, "call_id": "0", "name": "search_records", "args": {"query": "q"},
+         "ids": ["c2", "c1"]},
+        {"batch": 0, "call_id": "1", "name": "day_overview",
+         "args": {"date_from": "2026-10-14", "date_to": "2026-10-14"}, "ids": ["c1", "c2"]}]
+    assert [i["chunk_id"] for i in ev.rec.batches[0]["envelopes"][0]["items"]] == ["c2", "c1"]

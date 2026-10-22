@@ -111,3 +111,27 @@ def test_a_sql_error_makes_the_turn_invalid_not_a_miss(wired):
                               caller_sub="sub-ben")
     assert out["funnel"]["status"] == "invalid"
     assert "superseded_at" in out["sql"]["errors"][0]
+
+
+def test_keep_rows_dumps_what_the_tools_were_given_and_no_item_text(wired):
+    w = wired
+    judge = ScriptChat(ChatTurn(tool_calls=[{"id": "f", "name": "final_answer", "arguments": {
+        "answer": "We did the slab pour on level two [R1].", "basis": "records"}}]))
+    rows = []
+    run_ask_v2.run_turn(ITEM, ev=w["ev"], chat=harness.chat_wrapper(w["ev"], judge),
+                        proxy=w["proxy"], capture=w["cap"], now="2026-10-22T09:00:00+13:00",
+                        caller_sub="sub-ben", scope_site=SITE, keep_rows=rows)
+    (r,) = rows
+    assert (r["id"], r["expect"], r["date"]) == ("v1-01", "answerable", D) and r["turn"]
+    (b,) = r["batches"]
+    assert b["judge_calls_before"] == 0
+    assert b["calls"] == [{"name": "search_records",
+                           "args": {"query": ITEM["question"], "site": SITE}}]
+    (e,) = b["envelopes"]
+    assert e["tool"] == "search_records" and e["id"] == "0" and "truncated" in e["meta"]
+    assert e["items"] == [{"ref": "R1", "kind": "chunk", "chunk_id": CHUNK, "topic_id": None,
+                           "date": D, "text_len": len("we did the slab pour on level two")}]
+    assert r["invokes"][0]["results"][0]["rows"][0]["chunk_text"].startswith("we did")
+    assert r["post_search"][0]["ids"] == [CHUNK]
+    assert r["post_search"][0]["args"]["query"] == ITEM["question"]
+    assert "sub-ben" not in json.dumps(r)
