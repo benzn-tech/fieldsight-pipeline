@@ -30,6 +30,8 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   GET   /api/org/sites/{id}/members       → site's members from memberships (ACL,
                                              fixes legacy USERS ON SITE empty for Aurora-only sites)
   POST  /api/org/members/{sub}/(un)archive→ soft-delete / restore member (admin/gm, never self)
+  POST  /api/org/members/{sub}/resend-invite → re-send the Cognito invitation email to a member who
+                                            has not set their password yet (admin / platform_admin)
   POST  /api/org/observations             → create safety/quality observation (any member)
   GET   /api/org/observations             → list observations (company-scoped filters)
   PATCH /api/org/observations/{id}        → update status (author or admin/gm)
@@ -701,6 +703,9 @@ def dispatch(conn, event, method, route):
     m_pd = re.match(r"^/sites/([^/]+)/documents(?:/(.*))?$", route)
     if m_pd:
         return project_documents_route(conn, caller, m_pd.group(1), m_pd.group(2), method, event)
+    m_ri = re.match(r"^/members/([^/]+)/resend-invite$", route)
+    if m_ri and method == "POST":
+        return resend_member_invite(conn, caller, m_ri.group(1))
     m_ma = re.match(r"^/members/([^/]+)/(archive|unarchive)$", route)
     if m_ma and method == "POST":
         return _directory_after(conn, archive_member_endpoint(conn, caller, m_ma.group(1), m_ma.group(2)))
@@ -6769,6 +6774,73 @@ def archive_member_endpoint(conn, caller, target_sub, action):
     if row is None:
         return error("member not found in your company", 404)
     return ok(row)
+
+
+# ----------------------------------------------------------
+# resend invite (admin / platform_admin, same gate as POST /members)
+# ----------------------------------------------------------
+# Cognito only re-sends an invitation while the login is still waiting for its
+# first password (FORCE_CHANGE_PASSWORD). Any other status means the person has
+# already accepted -- a resend would fail with UnsupportedUserStateException,
+# and what they actually need is "Forgot password" on the sign-in page.
+_INVITE_PENDING = "FORCE_CHANGE_PASSWORD"
+
+
+def resend_member_invite(conn, caller, target_sub):
+    """Re-send the invitation email (a fresh temporary password, and a fresh
+    validity window) to a member who never set their password.
+
+    Authorization copies create_member, the endpoint that sent the original
+    invite: admin or platform_admin only. The target must be a non-archived
+    member of the caller's company; a platform_admin (cross-company) may reach
+    any company, exactly as it may invite into any company. A member outside
+    that reach answers 404 rather than 403 so the route does not confirm which
+    subs exist elsewhere.
+
+    The Cognito login is addressed by the member's sub (the pool's Username),
+    not by the email in Aurora, so a drifted email column cannot point the
+    resend at a different login. Nothing in Aurora changes."""
+    if caller["global_role"] not in ("admin", "platform_admin"):
+        return error("admin role required", 403)
+    target = users.get_user_by_sub(conn, target_sub)
+    if target is None or (
+            not is_cross_company(caller["global_role"])
+            and str(target.get("company_id")) != str(caller["company_id"])):
+        return error("member not found in your company", 404)
+    if target.get("archived_at"):
+        return error("member is archived — unarchive them first", 409)
+
+    client = cognito()
+    try:
+        got = client.admin_get_user(UserPoolId=COGNITO_USER_POOL_ID, Username=target_sub)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "UserNotFoundException":
+            return error("this member has no login -- invite them again with POST /members", 404)
+        raise
+    status = got.get("UserStatus")
+    if status != _INVITE_PENDING:
+        return error(
+            "This person has already accepted the invitation and set a password. "
+            "If they cannot sign in, ask them to use 'Forgot password' on the sign-in page.",
+            409, extra={"user_status": status})
+    try:
+        client.admin_create_user(
+            UserPoolId=COGNITO_USER_POOL_ID,
+            Username=target_sub,
+            MessageAction="RESEND",
+            DesiredDeliveryMediums=["EMAIL"],
+        )
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "UnsupportedUserStateException":
+            # Accepted between the two calls.
+            return error(
+                "This person has just accepted the invitation -- no resend needed.",
+                409, extra={"user_status": "CONFIRMED"})
+        raise
+    email = next((a["Value"] for a in got.get("UserAttributes", [])
+                  if a.get("Name") == "email"), target.get("email"))
+    logger.info("resend-invite: %s re-sent invitation to %s", caller.get("cognito_sub"), target_sub)
+    return ok({"resent": True, "email": email, "user_status": status})
 
 
 # ----------------------------------------------------------
