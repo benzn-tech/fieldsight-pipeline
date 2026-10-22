@@ -1332,11 +1332,22 @@ Harness: set `DECLARE_CONTINUITY=true` and reload `lambda_extract_session`. Use 
 
 ### Task 12: Run the measurement (operational; needs the owner)
 
-- [ ] **Step 1:** Merge Tasks 1–11 to develop with the flag OFF. Deploy TEST. Confirm migration 0075 through the Data API (`SELECT column_name FROM information_schema.columns WHERE table_name='action_items' AND column_name='item_id'`).
-- [ ] **Step 2:** Build the session set: TEST plus prod (read-only, owner-approved 2026-09-30). Record the per-kind prod item-count distribution (`counts.json`) in this step's note, and confirm the cap of 40 is not hit by more than a handful of sessions.
-- [ ] **Step 3:** Run shapes a and b × 2 arms × 3 reps under TEST config. Report void runs.
-- [ ] **Step 4:** Labelling. The agent annotator labels TEST sessions, and prod sessions too if the owner allowed it; otherwise the owner labels prod. The owner adjudicates the adjudication file.
+- [x] **Step 1:** Merge Tasks 1–11 to develop with the flag OFF. Deploy TEST. Confirm migration 0075 through the Data API (`SELECT column_name FROM information_schema.columns WHERE table_name='action_items' AND column_name='item_id'`).
+- [x] **Step 2:** Build the session set: TEST plus prod (read-only, owner-approved 2026-09-30). Record the per-kind prod item-count distribution (`counts.json`) in this step's note, and confirm the cap of 40 is not hit by more than a handful of sessions.
+- [x] **Step 3:** Run shapes a and b × 2 arms × 3 reps under TEST config. Report void runs.
+- [x] **Step 4:** Labelling. The agent annotator labels TEST sessions, and prod sessions too if the owner allowed it; otherwise the owner labels prod. The owner adjudicates the adjudication file.
 - [ ] **Step 5:** Score. Commit `results/summary.json` only, and paste the one-line-per-bar result into this step's note.
+  - Labelling note (2026-10-01 to 2026-10-23): TEST 4361 and prod 1825 assignments, blind agent labels on both (owner ruling: the owner reviews prod only, and only items needing judgement -- exact, >=0.90-similar and no-prior items excluded, 105 prod items on the review page).
+  - Labeller fix (2026-10-23, PR #1176): `label.py` paired each step with `steps[i-1]`, while `run.py` carries the last non-empty topics forward. 92 assignments (84 TEST, 8 prod) were shown a different prior list from the model's; all 92 were blind-relabelled. 2 TEST owner decisions had been made on the wrong (empty) list and are dropped (Ruling C11). Both TEST "wrong carries" were this artefact.
+  - Scorer fix (same PR): an owner-adjudicated row inherited the agent's `hard_negatives`, so the alias the owner ruled to be the counterpart still counted as a distractor (2 false hard-negative wrong carries on prod).
+  - Result 2026-10-23 (`scripts/continuity_eval/finalize.py`; agent gold + 19 prod / 2 TEST owner labels). All seven bars pass on both sets:
+    - wrong carries: prod 0/193, TEST 0/323
+    - hard-negative wrong carries: prod 0/180, TEST 0/122
+    - carry recall: prod 99.0% (text-only 81.1%), TEST 99.2% (text-only 87.6%)
+    - admission drift: prod 0.573 <= 0.582, TEST 1.202 <= 1.212 (narrow margins)
+    - transcript support, block-only unsupported: prod 0.4% vs baseline 1.7%, TEST 0.8% vs 0.7%
+    - added final-pass latency p90: prod 7.3 s, TEST 7.5 s
+    - agent-owner agreement: prod 16/17 = 94% (95% lower bound 73%: n too small to rely on). Owner continues on the review page until about 50 sample items; `results/summary.json` is committed once that settles.
 - [ ] **Step 6:** Decision per spec §7:
   - **pass:** proceed to Task 13;
   - **fail or insufficient:** the flag stays off; write the numbers into the spec's §7 as a dated result and stop.
