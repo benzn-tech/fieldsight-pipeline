@@ -449,7 +449,8 @@ def _merge_voice_note_topics(extraction_topics):
     """A voice note is ONE topic on the timeline (plan decision 9): several
     extracted topics become one -- the first topic's title (and other fields),
     summaries joined with a space, action items / decisions / questions (and
-    findings, so a safety finding is never dropped) concatenated, and the time
+    findings, so a safety finding is never dropped) concatenated, participants and
+    safety flags unioned, and the time
     range from the first start to the last end. Zero or one topic is returned as
     given."""
     if len(extraction_topics) <= 1:
@@ -460,6 +461,16 @@ def _merge_voice_note_topics(extraction_topics):
         if (t.get("summary") or "").strip())
     for field in ("action_items", "decisions", "questions", "findings"):
         merged[field] = [x for t in extraction_topics for x in (t.get(field) or [])]
+    # Who spoke and what was flagged belong to the whole note: unioned, first-seen
+    # order, each entry once.
+    for field in ("participants", "safety_flags"):
+        seen, union = set(), []
+        for x in (x for t in extraction_topics for x in (t.get(field) or [])):
+            k = json.dumps(x, sort_keys=True, default=str)
+            if k not in seen:
+                seen.add(k)
+                union.append(x)
+        merged[field] = union
     clocks = [_CLOCK_RE.findall(t.get("time_range") or "") for t in extraction_topics]
     clocks = [c for c in clocks if c]
     if clocks:
@@ -1243,14 +1254,19 @@ def write_extraction_items(date, user_folder, extraction_key):
             return {"skipped": "source_deleted", "key": extraction_key}
 
         # A voice note is exactly one topic (M2 Task 7, plan decision 9). With none
-        # extracted, the claim's "Voice note HH:MM" placeholder stays: nothing is
-        # superseded and nothing written. Otherwise the topics merge into one, in the
-        # ARTIFACT, so every reader below (records, index, matcher) sees what Aurora gets.
+        # extracted, the claim's "Voice note HH:MM" placeholder stays: this key's
+        # supersede is skipped (and the topic loop has nothing to write), but every
+        # other step -- index request, markers, checks, photo rebind, speakers -- runs
+        # as for any zero-topic pass, so the note's content still reaches search and
+        # Ask (spec 5.1). Otherwise the topics merge into one, in the ARTIFACT, so every
+        # reader below (records, index, matcher) sees what Aurora gets.
+        placeholder_kept = None
         if is_voice_note:
             if not extraction.get("topics"):
-                logger.info("%s: voice note with no topics -- placeholder kept", extraction_key)
-                return {"skipped": True, "reason": "voice note: no topics, placeholder kept"}
-            extraction["topics"] = _merge_voice_note_topics(extraction["topics"])
+                placeholder_kept = "voice note: no topics, placeholder kept"
+                logger.info("%s: %s", extraction_key, placeholder_kept)
+            else:
+                extraction["topics"] = _merge_voice_note_topics(extraction["topics"])
 
         # Source-key idempotency (Phase 4a pattern): supersede this extraction's prior rows
         # (Track B Task 3) before re-inserting -- an UPDATE that stamps superseded_at /
@@ -1274,7 +1290,9 @@ def write_extraction_items(date, user_folder, extraction_key):
         # below the topic-insert loop (Track B Task 4) -- the count an operator needs to see
         # is now measured AFTER matching (an actual orphan), not before (every closed item
         # about to be superseded, most of which will find their successor).
-        retired_topics.extend(topics.supersede_topics_for_source(conn, extraction_key, run))
+        if not placeholder_kept:
+            retired_topics.extend(
+                topics.supersede_topics_for_source(conn, extraction_key, run))
 
         # A MERGED artifact additionally supersedes each member's own topics.
         # BEFORE the writes below, never after: this key's own rows were just
@@ -1722,7 +1740,8 @@ def write_extraction_items(date, user_folder, extraction_key):
                    site_id=(site or {}).get("id"),
                    home_company_id=company["id"], recorder_user_id=user_id)
 
-    return {"skipped": False, "topics": topics_n}
+    return {"skipped": False, "topics": topics_n,
+            **({"reason": placeholder_kept} if placeholder_kept else {})}
 
 
 def _emit_index_request(extraction, extraction_key, *, site, user_id, owner_company_id,

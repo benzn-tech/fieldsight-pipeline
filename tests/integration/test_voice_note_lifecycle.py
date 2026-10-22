@@ -230,12 +230,23 @@ def test_real_extraction_replaces_the_placeholder(db, monkeypatch):
 
 
 def test_empty_extraction_keeps_the_placeholder(db, monkeypatch):
+    """Only the topic write is skipped (spec 5.1): the placeholder and its pinned
+    photo stay, and the rest of the pass -- the search index request included -- runs
+    so the note's content still reaches Ask."""
     w = _world(db)
+    _photo(db, w)
     _claim(db, w)
     (placeholder,) = _visible(db, w["key"])
+    indexed = []
+    monkeypatch.setattr(lambda_item_writer, "SEARCH_INDEX_WRITE", True)
+    monkeypatch.setattr(lambda_item_writer, "_emit_index_request",
+                        lambda extraction, key, **kw: indexed.append(key))
     out = _write(db, monkeypatch, w, _artifact([]))
     assert [r[0] for r in _visible(db, w["key"])] == [placeholder[0]]
-    assert out == {"skipped": True, "reason": "voice note: no topics, placeholder kept"}
+    assert _photo_rows(db, w["photo"]) == [(str(placeholder[0]), "voice_note")]
+    assert indexed == [w["key"]]
+    assert out == {"skipped": False, "topics": 0,
+                   "reason": "voice note: no topics, placeholder kept"}
 
 
 def test_meeting_session_unchanged(db):

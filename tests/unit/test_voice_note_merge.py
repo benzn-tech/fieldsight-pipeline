@@ -14,9 +14,10 @@ BASE = "sid" + SID
 DATE = "2026-10-21"
 
 
-def _topic(title, time_range, action, summary):
+def _topic(title, time_range, action, summary, participants=(), flags=()):
     return {"topic_title": title, "time_range": time_range, "summary": summary,
             "category": "progress",
+            "participants": list(participants), "safety_flags": list(flags),
             "action_items": [{"action": action}],
             "decisions": [{"decision": f"{title} decided"}],
             "questions": [{"question": f"{title}?"}]}
@@ -24,8 +25,11 @@ def _topic(title, time_range, action, summary):
 
 def test_merge_two_topics():
     merged = iw._merge_voice_note_topics([
-        _topic("Crack on level 2", "14:32 - 14:33", "Fill the crack", "A crack on level 2."),
-        _topic("Order more ties", "14:33 - 14:34", "Order ties", "Ties are running low."),
+        _topic("Crack on level 2", "14:32 - 14:33", "Fill the crack", "A crack on level 2.",
+               participants=["Ben", "Neil"], flags=[{"flag": "crack", "severity": "minor"}]),
+        _topic("Order more ties", "14:33 - 14:34", "Order ties", "Ties are running low.",
+               participants=["Neil", "Sam"],
+               flags=[{"flag": "crack", "severity": "minor"}, {"flag": "ties"}]),
     ])
     assert len(merged) == 1
     t = merged[0]
@@ -34,6 +38,9 @@ def test_merge_two_topics():
     assert [a["action"] for a in t["action_items"]] == ["Fill the crack", "Order ties"]
     assert "A crack on level 2." in t["summary"] and "Ties are running low." in t["summary"]
     assert len(t["decisions"]) == 2 and len(t["questions"]) == 2
+    # Unioned across the note, first-seen order, each once.
+    assert t["participants"] == ["Ben", "Neil", "Sam"]
+    assert t["safety_flags"] == [{"flag": "crack", "severity": "minor"}, {"flag": "ties"}]
 
 
 def test_merge_handles_the_extractors_en_dash():
@@ -49,6 +56,32 @@ def test_merge_one_topic_is_identity():
 
 def test_merge_zero_is_empty():
     assert iw._merge_voice_note_topics([]) == []
+
+
+def test_voice_note_claim_asks_for_no_brief(monkeypatch):
+    import lambda_finalize_claim as fc
+    row = {"session_id": SID, "user_id": "u", "session_type": "voice_note",
+           "reopen_count": 0}
+    monkeypatch.setattr(fc.meeting_session, "claim_finalize", lambda c, s, v: dict(row))
+    monkeypatch.setattr(fc.meeting_session, "mark_sent", lambda c, s: None)
+    puts, briefs = [], []
+    monkeypatch.setattr(fc, "lake_put", lambda bucket, key, *a, **k: puts.append(key))
+    monkeypatch.setattr(fc, "_enqueue_brief_request", lambda *a, **k: briefs.append(a))
+    out = fc.finalize_claim(
+        "C", SID, 1, resolve_context=lambda c, r: {"folder": "F", "date": DATE},
+        read_rolling=lambda *a: {}, request_extraction=fc._request_extraction)
+    assert out["status"] == "voice_note"
+    assert puts == [f"extraction_requests/{SID}.json"]   # the extraction is still asked for
+    assert briefs == []                                  # ...but no brief
+
+
+def test_meeting_claim_still_asks_for_a_brief(monkeypatch):
+    import lambda_finalize_claim as fc
+    monkeypatch.setattr(fc, "lake_put", lambda *a, **k: None)
+    briefs = []
+    monkeypatch.setattr(fc, "_enqueue_brief_request", lambda *a, **k: briefs.append(a))
+    fc._request_extraction(SID, "F", DATE)
+    assert briefs == [(SID, "F", DATE)]
 
 
 def test_voice_note_gets_no_follow_up_email(monkeypatch):

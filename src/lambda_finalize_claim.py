@@ -182,10 +182,14 @@ def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_
     # A reopened session's round picks its own request keys (session_scope.
     # round_suffix). Passed only when > 0 so a first round's call is unchanged.
     reopened = int(row.get("reopen_count") or 0)
+    voice_note = row.get("session_type") == "voice_note"
     if request_extraction and ctx.get("folder") and ctx.get("date"):
         try:
+            # A voice note asks for no brief (voice_note=True): the brief only feeds
+            # the stop email, which a voice note never gets.
             request_extraction(session_id, ctx["folder"], ctx["date"],
-                               **({"reopened": reopened} if reopened > 0 else {}))
+                               **({"reopened": reopened} if reopened > 0 else {}),
+                               **({"voice_note": True} if voice_note else {}))
         except Exception:
             logger.exception("finalize: could not request final extraction for %s",
                              session_id)
@@ -194,7 +198,7 @@ def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_
     # the recipient check, so a recorder with no email on file is not marked failed.
     # Its final extraction was still requested above; until it lands the note is on
     # the timeline as a placeholder topic with its claimed photos pinned under it.
-    if row.get("session_type") == "voice_note":
+    if voice_note:
         if place_voice_note:
             try:
                 # A savepoint, not a bare try/except (Ruling R10): a SQL error here
@@ -444,7 +448,7 @@ def _enqueue(artifact):
         raise
 
 
-def _request_extraction(session_id, folder, date, reopened=0):
+def _request_extraction(session_id, folder, date, reopened=0, voice_note=False):
     """Ask lambda_extract_session for this session's FINAL (thinking-mode,
     unthrottled) pass now that the session has closed, and -- in the same
     breath -- ask for the session's brief (handoff-sync plan §2.1).
@@ -476,6 +480,9 @@ def _request_extraction(session_id, folder, date, reopened=0):
         client=boto3.client("s3"),
         owner_hint={"folder": folder, "session_base": f"sid{session_id}"},
         ContentType="application/json")
+    if voice_note:
+        # The brief exists for the stop email; a voice note has none (M2 Task 7).
+        return
     _enqueue_brief_request(session_id, folder, date, reopened=reopened)
 
 
