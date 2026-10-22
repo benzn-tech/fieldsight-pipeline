@@ -159,7 +159,9 @@ def test_the_session_start_comes_from_the_filename_not_the_chunk(monkeypatch):
         CONN, CALLER,
         {"groupId": LEAD, "fileName": late_chunk, "startedAt": "2026-08-06T11:25:00"},
         late_chunk, "audio", None)
+    # The filename's 09:00 is the device's NZ wall clock (NZST in August); the
+    # column is UTC, so it is stored converted, as session_activity stores it.
     opened = str(seen[0]["opened_at"])
-    assert "09:00" in opened, f"expected the session start (09:00), got {opened!r}"
-    assert "11:25" not in opened, "took the chunk's own start"
+    assert opened == "2026-08-05 21:00:00", f"expected the session start (09:00 NZ), got {opened!r}"
+    assert "11:25" not in opened and "23:25" not in opened, "took the chunk's own start"
 

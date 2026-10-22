@@ -140,6 +140,28 @@ def upsert_topic(conn, site_id, report_date, title, *, user_id=None, source_s3_k
     return topic
 
 
+def ensure_placeholder_topic(conn, site_id, report_date, title, *, user_id, source_s3_key,
+                             time_range) -> dict | None:
+    """A voice note's placeholder topic (M2 Task 7): inserted through upsert_topic only
+    when no VISIBLE topic already carries `source_s3_key`. Returns the new row, or None
+    when one is already there (a reopen round's second claim, or the real extraction
+    already landed).
+
+    Takes item-writer's own per-key advisory lock first, so this check-then-insert
+    cannot interleave with a writer superseding and re-inserting the same key. Lock
+    order (key, then the photo day lock) matches item-writer's."""
+    conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (source_s3_key,))
+    present = conn.cursor(row_factory=dict_row).execute(
+        f"SELECT 1 FROM topics t WHERE t.source_s3_key = %s "
+        f"AND {visible_topics_predicate('t')} LIMIT 1",
+        (source_s3_key,),
+    ).fetchone()
+    if present is not None:
+        return None
+    return upsert_topic(conn, site_id, report_date, title, user_id=user_id,
+                        source_s3_key=source_s3_key, time_range=time_range)
+
+
 # CHILD_OF_VISIBLE_TOPIC now lives in deleted_predicates (Track B Task 2): it grew a
 # supersession arm alongside its deletion arm, and every other shared predicate already
 # lives there so the two do not drift apart. Kept importable from this module under its

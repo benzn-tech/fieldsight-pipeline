@@ -124,9 +124,11 @@ def test_list_idle_open_selects_open_sessions_past_the_idle_window():
     assert out == [{"session_id": SID, "version": 2, "last_activity": "2026-07-28T14:05:00"}]
     sql = conn.calls[0]["sql"]
     assert "status = 'open'" in sql
-    # keys on last activity (last_segment_at, else opened_at) -> a still-active
-    # long meeting (chunks arriving) is never mistaken for idle
-    assert "COALESCE(last_segment_at, opened_at)" in sql
+    # keys on last activity (last_segment_at, else the later of opened_at and
+    # the row's server created_at) -> a still-active long meeting (chunks
+    # arriving) is never mistaken for idle, and a late /open is not closed
+    # before its first chunk
+    assert "COALESCE(last_segment_at, CASE WHEN opened_at IS NOT NULL THEN "            "GREATEST(opened_at, created_at) END)" in sql
     assert "make_interval(secs => %s)" in sql
     assert conn.calls[0]["params"] == (900,)
 

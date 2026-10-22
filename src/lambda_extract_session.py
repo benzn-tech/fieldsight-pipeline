@@ -2206,7 +2206,8 @@ def _supersedes(new_sources, prev):
         return False                      # nothing new to say (equal, or prev is wider)
     # Strictly wider than what is published. This beats tier: the final pass is
     # scheduled off session CLOSE, but transcripts keep landing after it (idle
-    # close fires 15 min after the last chunk, while a backed-up Transcribe queue
+    # close fires IDLE_CLOSE_MINUTES -- 60 by default -- after the last chunk
+    # arrives, while a backed-up Transcribe queue or a phone that queued offline
     # can trail by longer). A final that ran early therefore publishes a TRUNCATED
     # session, and deferring to it on tier alone would lock the rest of the
     # recording out permanently. Missing content is worse than fast-tier content,

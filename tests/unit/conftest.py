@@ -30,7 +30,13 @@ def _single_company_world_defaults():
         mp.setattr(users, "get_by_folder_name_global", lambda conn, folder: None)
         mp.setattr(sites, "list_company_sites",
                    lambda conn, company_id, include_archived=False: [])
-        org = sys.modules.get("lambda_org_api")      # never import it just for this
+        # Photo pins (M2 Task 6): every day rebind asks which photos a voice note
+        # claimed or a person moved by hand. A connection double cannot answer, so:
+        # none pinned. The real SQL is proven in tests/integration/test_photo_pins_sql.py.
+        import photo_pins
+        mp.setattr(photo_pins, "apply_voice_note_pins", lambda conn, folder, date: 0)
+        mp.setattr(photo_pins, "pinned_photo_keys", lambda conn, folder, date: set())
+        org =sys.modules.get("lambda_org_api")      # never import it just for this
         if org is not None:
             # The session whitelist (final review F1) asks the database which sessions lie
             # on which sites; a connection double cannot answer, so: nothing restricted.

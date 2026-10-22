@@ -37,16 +37,22 @@ def _seed(db):
     return cid, uid
 
 
+# Reopen only looks back REOPEN_WINDOW_HOURS on last_segment_at (SERVER arrival
+# time), so the seeded row's last chunk landed `segment_age` ago -- relative to
+# the real now(), never a fixed date that ages out of the window.
+WINDOW = 48
+
+
 def _session(db, *, status="sent", close_intent="idle", closed_at=_t(11, 20),
              closed_chunk_at=_t(10, 5), last_chunk_at=_t(10, 6), version=4,
-             reopen_count=0):
+             reopen_count=0, segment_age=timedelta(hours=1)):
     cid, uid = _seed(db)
     db.execute(
         "INSERT INTO meeting_session (session_id, company_id, user_id, kind, status, "
         "opened_at, last_segment_at, closed_at, close_intent, closed_chunk_at, "
         "last_chunk_at, version, reopen_count, finalizing_at) "
-        "VALUES (%s,%s,%s,'audio',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-        (SID, cid, uid, status, _t(9, 0), _t(10, 20), closed_at, close_intent,
+        "VALUES (%s,%s,%s,'audio',%s,%s,now() - %s,%s,%s,%s,%s,%s,%s,%s)",
+        (SID, cid, uid, status, _t(9, 0), segment_age, closed_at, close_intent,
          closed_chunk_at, last_chunk_at, version, reopen_count,
          _t(11, 21) if status != "open" else None))
 
@@ -86,7 +92,7 @@ def test_end_close_does_not_snapshot_chunk_time(db):
 def test_idle_sent_with_late_chunk_reopens(db):
     _session(db)
 
-    assert meeting_session.reopen_late(db, 3) == [
+    assert meeting_session.reopen_late(db, 3, WINDOW) == [
         {"session_id": SID, "reopen_count": 1}]
     row = _row(db)
     assert row["status"] == "open"
@@ -100,7 +106,7 @@ def test_idle_sent_with_late_chunk_reopens(db):
 
 def test_failed_also_reopens(db):
     _session(db, status="failed")
-    assert meeting_session.reopen_late(db, 3) == [
+    assert meeting_session.reopen_late(db, 3, WINDOW) == [
         {"session_id": SID, "reopen_count": 1}]
     assert _row(db)["status"] == "open"
 
@@ -108,14 +114,14 @@ def test_failed_also_reopens(db):
 def test_end_is_never_reopened(db):
     _session(db, close_intent="end")
     before = _row(db)
-    assert meeting_session.reopen_late(db, 3) == []
+    assert meeting_session.reopen_late(db, 3, WINDOW) == []
     assert _row(db) == before
 
 
 def test_old_chunk_does_not_reopen(db):
     # A re-driven old transcript touches with the same (or an older) time.
     _session(db, closed_chunk_at=_t(10, 5), last_chunk_at=_t(10, 5))
-    assert meeting_session.reopen_late(db, 3) == []
+    assert meeting_session.reopen_late(db, 3, WINDOW) == []
     assert _row(db)["status"] == "sent"
 
 
@@ -123,42 +129,60 @@ def test_skewed_clock_does_not_reopen(db):
     # Device 12 h fast: its file-name times are far past the server's closed_at.
     _session(db, closed_at=_t(10, 20), closed_chunk_at=_t(22, 5),
              last_chunk_at=_t(22, 5))
-    assert meeting_session.reopen_late(db, 3) == []
+    assert meeting_session.reopen_late(db, 3, WINDOW) == []
     assert _row(db)["status"] == "sent"
 
     db.execute("UPDATE meeting_session SET last_chunk_at = %s WHERE session_id = %s",
                (_t(22, 6), SID))
-    assert meeting_session.reopen_late(db, 3) == [
+    assert meeting_session.reopen_late(db, 3, WINDOW) == [
         {"session_id": SID, "reopen_count": 1}]
 
 
 def test_null_snapshot_never_reopens(db):
     # Closed before 0089: no snapshot to compare against.
     _session(db, closed_chunk_at=None)
-    assert meeting_session.reopen_late(db, 3) == []
-    assert meeting_session.list_reopen_capped(db, 0) == []
+    assert meeting_session.reopen_late(db, 3, WINDOW) == []
+    assert meeting_session.list_reopen_capped(db, 0, WINDOW) == []
 
 
 def test_finalizing_waits_until_settled(db):
     _session(db, status="finalizing")
-    assert meeting_session.reopen_late(db, 3) == []
+    assert meeting_session.reopen_late(db, 3, WINDOW) == []
     assert _row(db)["status"] == "finalizing"
 
     meeting_session.mark_sent(db, SID)
-    assert meeting_session.reopen_late(db, 3) == [
+    assert meeting_session.reopen_late(db, 3, WINDOW) == [
         {"session_id": SID, "reopen_count": 1}]
 
 
 def test_reopen_stops_at_reopen_max(db):
     _session(db, reopen_count=3)
-    assert meeting_session.reopen_late(db, 3) == []
+    assert meeting_session.reopen_late(db, 3, WINDOW) == []
     assert _row(db)["status"] == "sent"
-    assert meeting_session.list_reopen_capped(db, 3) == [SID]
+    assert meeting_session.list_reopen_capped(db, 3, WINDOW) == [SID]
+
+
+def test_late_chunk_older_than_the_window_does_not_reopen(db):
+    # Prod records last_chunk_at/closed_chunk_at with REOPEN_LATE_CHUNKS off, so
+    # eligible rows pile up until the owner flips it. Only a late chunk that
+    # ARRIVED (server time) within the window reopens; an old backlog does not,
+    # and is not reported as capped on every tick either.
+    _session(db, segment_age=timedelta(hours=WINDOW + 1))
+    assert meeting_session.reopen_late(db, 3, WINDOW) == []
+    assert _row(db)["status"] == "sent"
+    db.execute("UPDATE meeting_session SET reopen_count = 3 WHERE session_id = %s", (SID,))
+    assert meeting_session.list_reopen_capped(db, 3, WINDOW) == []
+
+
+def test_late_chunk_inside_the_window_reopens(db):
+    _session(db, segment_age=timedelta(hours=1))
+    assert meeting_session.reopen_late(db, 3, WINDOW) == [
+        {"session_id": SID, "reopen_count": 1}]
 
 
 def test_capped_list_excludes_rows_under_the_cap(db):
     _session(db, reopen_count=2)
-    assert meeting_session.list_reopen_capped(db, 3) == []
+    assert meeting_session.list_reopen_capped(db, 3, WINDOW) == []
 
 
 def test_list_finalizing_carries_type_and_reopen_count(db):
