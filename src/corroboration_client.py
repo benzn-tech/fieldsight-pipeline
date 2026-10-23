@@ -74,6 +74,30 @@ WEB_PLUGIN = [{"id": "web"}]
 
 DEFAULT_MODEL = os.environ.get("CORROBORATION_MODEL", "google/gemini-3.8-flash")
 
+# OpenRouter routes google/* models between Vertex and AI Studio on its own.
+# Measured 2026-10-23/24 (spec 2026-10-23-gemini-provider-order-design): Vertex is
+# rate-limited there (429), OpenRouter retries it ~10 s before falling back, so a
+# draft "served by AI Studio" took 13.5-15 s and a verify was aborted at ~11 s;
+# AI Studio asked directly answered drafts in 3.4-5.1 s. AI Studio first, Vertex
+# kept as the fallback. "off" (or empty) sends no preference: the rollback.
+DEFAULT_PROVIDER_ORDER = "google-ai-studio,google-vertex"
+
+
+def provider_preference(model):
+    """OpenRouter's `provider` routing object for `model`, or None.
+
+    Only for google/* models: an order naming providers that cannot serve the
+    model would be meaningless. Read per call, so an env change takes effect on
+    a warm container."""
+    if not (model or "").startswith("google/"):
+        return None
+    raw = os.environ.get("CORROBORATION_PROVIDER_ORDER", DEFAULT_PROVIDER_ORDER)
+    order = [p.strip() for p in raw.split(",") if p.strip()]
+    if not order or order == ["off"]:
+        return None
+    return {"order": order, "allow_fallbacks": True}
+
+
 # Below this there is no time for a request to do anything but time out, and
 # spending the caller's remaining budget on a doomed attempt is worse than
 # reporting that the budget ran out.
@@ -127,11 +151,12 @@ class Reply:
     """
 
     __slots__ = ("text", "search_results", "citations", "stop_reason",
-                 "error", "elapsed", "searched", "search_error", "timed_out")
+                 "error", "elapsed", "searched", "search_error", "timed_out",
+                 "provider")
 
     def __init__(self, text="", search_results=None, citations=None,
                  stop_reason=None, error=None, elapsed=0.0, searched=False,
-                 search_error=None, timed_out=False):
+                 search_error=None, timed_out=False, provider=None):
         self.text = text
         self.search_results = search_results or []
         self.citations = citations or []
@@ -149,6 +174,9 @@ class Reply:
         # and matching on an error string would make a phrase into an interface
         # -- which this repo has paid for before.
         self.timed_out = timed_out
+        # Who actually served it (OpenRouter's top-level `provider`), for the
+        # served_by line. None when the reply did not say.
+        self.provider = provider
 
     @property
     def ok(self) -> bool:
@@ -190,11 +218,13 @@ def _parse(data) -> Reply:
         if url:
             results.append(SearchResult(url, cit.get("title")))
 
+    served = data.get("provider")
     return Reply(text=message.get("content") or "",
                  search_results=results,
                  citations=list(annotations),
                  stop_reason=choice.get("finish_reason"),
-                 searched=bool(results))
+                 searched=bool(results),
+                 provider=served if isinstance(served, str) else None)
 
 
 def call(prompt, *, timeout, model=None, max_tokens=1024, web=False,
@@ -244,6 +274,9 @@ def call(prompt, *, timeout, model=None, max_tokens=1024, web=False,
         payload["plugins"] = WEB_PLUGIN
     if effort:
         payload["reasoning"] = {"effort": effort}
+    preference = provider_preference(payload["model"])
+    if preference:
+        payload["provider"] = preference
 
     body = json.dumps(payload)
     headers = {
@@ -314,6 +347,10 @@ def call(prompt, *, timeout, model=None, max_tokens=1024, web=False,
             except Exception:  # noqa: BLE001 - telemetry must never break the call
                 logger.warning("LLM_USAGE logging failed (corroboration)",
                                exc_info=True)
+            # LLM_USAGE keeps provider=openrouter (queries filter on it); this
+            # line says which upstream served the call. Counts only, no text.
+            logger.info("corroboration: served_by=%s caller=%s latency_ms=%d",
+                        reply.provider or "-", caller, int(reply.elapsed * 1000))
             return reply
 
         if resp.status in _RETRYABLE and attempt + 1 < attempts_left:
