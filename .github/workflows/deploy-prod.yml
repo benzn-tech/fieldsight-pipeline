@@ -228,6 +228,12 @@ jobs:
           if [ -n "${{ vars.PROD_ASK_JUDGE_REASONING }}" ]; then
             ASK_JUDGE_REASONING_PARAM="AskJudgeReasoning=${{ vars.PROD_ASK_JUDGE_REASONING }}"
           fi
+          # Gemini provider order (spec 2026-10-23). Unset keeps the template
+          # default (AI Studio first); 'off' is the rollback.
+          PROVIDER_ORDER_PARAM=""
+          if [ -n "${{ vars.PROD_CORROBORATION_PROVIDER_ORDER }}" ]; then
+            PROVIDER_ORDER_PARAM="CorroborationProviderOrder=${{ vars.PROD_CORROBORATION_PROVIDER_ORDER }}"
+          fi
           # Non-work (personal) topic retention sweep. Two independent gates, both
           # off by default, because this one DELETES: it tombstones the topic and
           # drops its vectors (the transcript and audio are left alone).
@@ -359,6 +365,7 @@ jobs:
               $ASK_JUDGE_FALLBACKS_PARAM \
               $ASK_JUDGE_PROVIDER_PARAM \
               $ASK_JUDGE_REASONING_PARAM \
+              $PROVIDER_ORDER_PARAM \
               "AskVoiceRestate=${{ vars.PROD_ASK_VOICE_RESTATE || 'false' }}" \
               "AskVoiceConvo=${{ vars.PROD_ASK_VOICE_CONVO || 'false' }}" \
               "VoiceWebEnabled=${{ vars.PROD_VOICE_WEB_ENABLED || 'false' }}" \
