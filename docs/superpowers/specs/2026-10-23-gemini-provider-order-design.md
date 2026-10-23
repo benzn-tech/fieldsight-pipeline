@@ -87,6 +87,15 @@ exactly the §3 `provider` object). Pass: drafts over 12 s materially below the
 30 % measured under default routing; served_by AI Studio on most rows; verifies
 return sources.
 
+**6.1 result (2026-10-24, owner-run, 50 calls): PASS for the draft.**
+40/40 drafts served by Google AI Studio, p50 3.73, p90 4.17, max 4.5 s, 0 over
+12 s (was 30 % under default routing). The 10 verifies (web plugin) were ALL
+served by Google (Vertex) despite the order: 10/10 ok with sources, p50 8.5 s,
+2 over 12 s (13.5, 32.7). So with the web plugin OpenRouter does not use AI
+Studio; the verify is not fixed by this change and not made worse. Follow-up
+(separate): bench the verify with `only: [google-ai-studio]` to learn whether AI
+Studio can serve the plugin at all.
+
 **6.2 TEST.** Deploy to TEST; run the routing eval's explicit-web turns (call count stated
 first). Pass: served_by shows AI Studio on the draft/verify lines; no draft lost;
 verify outcomes no worse than the #1177 check (2 verified / 1 unverified / 1
