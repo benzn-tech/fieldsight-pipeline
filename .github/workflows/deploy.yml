@@ -55,8 +55,10 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+      # Pinned: SAM 1.170.0's bundled cfn-lint rejects the multi-pool UserPoolArn list
+      # (E3003/E3002, same false positive as the cfn-lint 1.54.0 pin in ci.yml). Bump on purpose.
       - uses: aws-actions/setup-sam@v2
-        with: { use-installer: true }
+        with: { use-installer: true, version: 1.169.0 }
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }  # must match Lambda runtime: PsycopgLayer BuildMethod python3.11 needs a 3.11 binary
 
