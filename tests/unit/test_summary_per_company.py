@@ -92,7 +92,7 @@ def _company_prompts(prompts):
 
 def test_each_company_summary_holds_only_its_own_folders(run, caplog):
     caplog.set_level("INFO")
-    puts, prompts = run(["Ada", "Al", "Bo", "Ext", "NoCo", "Ben_Lin"])
+    puts, prompts = run(["Ada", "Al", "Bo", "Ext", "NoCo", "Ben_Lin"], flag="on")
     # lake-wide sees everyone (unchanged); A sees Ada+Al only; B sees Bo only
     assert sorted(prompts) == sorted([
         "SUMMARY:Ada,Al,Ben_Lin,Bo,Ext,NoCo",
@@ -105,7 +105,7 @@ def test_each_company_summary_holds_only_its_own_folders(run, caplog):
 
 
 def test_written_keys_and_ownership(run):
-    puts, _ = run(["Ada", "Al", "Bo"])
+    puts, _ = run(["Ada", "Al", "Bo"], flag="on")
     summaries = {k: (body, hint) for k, body, hint in puts if "summary_report" in k
                  and k.endswith(".json") and "_debug" not in k}
     assert set(summaries) == {
@@ -127,14 +127,14 @@ def test_written_keys_and_ownership(run):
 
 
 def test_an_external_member_is_in_no_company_summary(run):
-    puts, prompts = run(["Ada", "Ext", "Bo"])
+    puts, prompts = run(["Ada", "Ext", "Bo"], flag="on")
     assert "SUMMARY:Ada" in prompts and "SUMMARY:Bo" in prompts
     assert not any("Ext" in p for p in prompts if p != "SUMMARY:Ada,Bo,Ext")
 
 
 def test_one_call_per_company_with_folders_and_none_for_empty_companies(run, caplog):
     caplog.set_level("INFO")
-    _, prompts = run(["Ada", "Al", "Bo"])          # Cy (company C) has no folder that day
+    _, prompts = run(["Ada", "Al", "Bo"], flag="on")  # Cy (company C) has no folder that day
     assert len(prompts) == 3                       # A, B and the lake-wide one
     assert any("Per-company summaries: 2 model call(s)" in r.message for r in caplog.records)
     assert not any(CO_C in p for p in prompts)
@@ -149,14 +149,37 @@ def test_flag_off_skips_only_the_lake_wide_summary(run):
     assert sorted(prompts) == ["SUMMARY:Ada", "SUMMARY:Bo"]      # no lake-wide model call either
 
 
-def test_flag_is_read_at_call_time_and_defaults_on(run, monkeypatch):
-    puts, _ = run(["Ada"], flag=None)
+def test_flag_is_read_at_call_time_and_defaults_off(run, monkeypatch):
+    # Retired 2026-10-26: unset means OFF; only an explicit "on" (any case) writes it.
+    puts, prompts = run(["Ada"], flag=None)
+    keys = {k for k, _b, _h in puts}
+    assert f"reports/{DATE}/summary_report.json" not in keys
+    assert f"reports/{DATE}/companies/{CO_A}/summary_report.json" in keys
+    assert prompts == ["SUMMARY:Ada"]
+    puts, _ = run(["Ada"], flag="ON")
     assert f"reports/{DATE}/summary_report.json" in {k for k, _b, _h in puts}
-    puts, _ = run(["Ada"], flag="OFF")
+    puts, _ = run(["Ada"], flag="anything-else")
     assert f"reports/{DATE}/summary_report.json" not in {k for k, _b, _h in puts}
 
 
+def test_stale_check_ignores_a_leftover_lake_wide_summary_when_off(monkeypatch):
+    # A summary_report.json written before the switch is never rewritten once off; its
+    # recordings_processed must not decide staleness (it would re-flag the day nightly).
+    docs = {f"reports/{DATE}/summary_report.json": {"_report_metadata": {"recordings_processed": 1}},
+            f"reports/{DATE}/Ada/daily_report.json": {"_report_metadata": {"recordings_processed": 3}}}
+    monkeypatch.setattr(rg, "download_json_from_s3", lambda b, k: docs.get(k))
+    monkeypatch.setattr(rg, "list_s3_objects", lambda b, p: [{"key": k} for k in docs if k.startswith(p)])
+    monkeypatch.delenv("SUMMARY_LAKE_WIDE", raising=False)
+    assert rg.get_report_transcript_count("bkt", DATE) == 3
+    monkeypatch.setenv("SUMMARY_LAKE_WIDE", "on")
+    assert rg.get_report_transcript_count("bkt", DATE) == 1
+
+
 def test_unreadable_directory_writes_no_company_summary(run):
-    puts, prompts = run(["Ada", "Bo"], doc={"people": {}})
+    puts, prompts = run(["Ada", "Bo"], doc={"people": {}}, flag="on")
     assert not any("/companies/" in k for k, _b, _h in puts)
     assert prompts == ["SUMMARY:Ada,Bo"]                          # lake-wide unaffected
+    # Default (lake-wide off): fails closed -- no day summary of any kind is written.
+    puts, prompts = run(["Ada", "Bo"], doc={"people": {}})
+    assert not any("summary_report" in k for k, _b, _h in puts)
+    assert prompts == []
