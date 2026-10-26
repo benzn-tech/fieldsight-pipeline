@@ -187,11 +187,12 @@ def test_company_summary_serve_is_wired_in_three_pieces():
 
 
 def test_summary_lake_wide_reaches_the_generator():
-    # A literal env value, no Parameter: it is retired one release later by editing it.
+    # A literal env value, no Parameter. Retired 2026-10-26: pinned 'off' in the stack AND
+    # as the code default, so a missing env var cannot bring the lake-wide write back.
     env = _env_block(_resources()["ReportGeneratorFunction"])
-    assert re.search(r"\n          SUMMARY_LAKE_WIDE: 'on'\n", "\n" + env)
+    assert re.search(r"\n          SUMMARY_LAKE_WIDE: 'off'\n", "\n" + env)
     code = (SRC / "lambda_report_generator.py").read_text(encoding="utf-8")
-    assert re.search(r"os\.environ\.get\('SUMMARY_LAKE_WIDE'", code)
+    assert re.search(r"os\.environ\.get\('SUMMARY_LAKE_WIDE', 'off'\)", code)
 
 
 def test_org_api_requests_exports_through_s3_and_reads_the_results():

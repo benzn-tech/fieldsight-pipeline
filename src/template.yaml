@@ -2095,9 +2095,9 @@ Resources:
           # rather than arriving late.
           LLM_HTTP_TIMEOUT: '540'
           REPORT_PREFIX: reports/
-          # Lake ownership: one release of the old lake-wide summary alongside the
-          # per-company ones. 'off' stops the lake-wide write (see the rollout notes).
-          SUMMARY_LAKE_WIDE: 'on'
+          # Lake ownership: the old lake-wide summary is retired (2026-10-26); only the
+          # per-company ones are written. 'on' brings the lake-wide write back (rollback).
+          SUMMARY_LAKE_WIDE: 'off'
           SITE_NAME: !Ref SiteName
           ITEMS_TABLE: !Ref ItemsTableName
           REPORTS_TABLE: !Ref ReportsTableName
