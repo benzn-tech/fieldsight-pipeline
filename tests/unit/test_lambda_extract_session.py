@@ -27,7 +27,7 @@ import llm_utils  # noqa: E402  (import after importorskip, same module the hand
 
 
 BUCKET = "test-bucket"
-CONFIG_KEY = "config/user_mapping.json"
+CONFIG_KEY = "config/directory.json"   # the published directory (directory.KEY)
 
 
 class FakeNoSuchKey(Exception):
@@ -101,7 +101,12 @@ def make_transcribe_json(text, start=0.0, end=None, speaker=None):
 
 
 def config_with_sites(sites):
-    return json.dumps({"mapping": {}, "sites": sites})
+    """A directory document (config/directory.json shape) holding these sites, keyed
+    by id, all in the speaker's company (the declared_site match is company-scoped)."""
+    return json.dumps({"version": 2,
+                       "people": {"Benl1": {"name": "Ben Lin", "company_id": "co-1"}},
+                       "sites": {"id-" + slug: {**info, "slug": slug, "company_id": "co-1"}
+                                 for slug, info in sites.items()}})
 
 
 @pytest.fixture(autouse=True)

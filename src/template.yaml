@@ -3053,11 +3053,11 @@ Resources:
               # Site coordinates, published for the report generator.
               #
               # ONE KEY, NOT THE `config/` PREFIX, and the narrowness is the
-              # point. `config/user_mapping.json` sits in that prefix, is
-              # maintained by hand, carries the device mapping and the
-              # reassignment log, and is read by six lambdas. Granting
-              # `config/*` would put it one bug away from being overwritten by
-              # a request handler. This grant cannot reach it.
+              # point. Other objects share that prefix (the frozen
+              # `config/user_mapping.json`, which the disabled orchestrator still
+              # reads, among them). Granting `config/*` would put each one a bug
+              # away from being overwritten by a request handler. This grant
+              # cannot reach them.
               Action:
                 - s3:PutObject
                 - s3:GetObject
@@ -3728,7 +3728,6 @@ Resources:
                 # Agent-answer sidecars, read by the shared agent_turn_filter. Granted
                 # wherever transcripts are, because the code that reads one reads the other.
                 - !Sub arn:aws:s3:::${IngestBucketName}/voice_ask/*
-                - !Sub arn:aws:s3:::${IngestBucketName}/config/user_mapping.json
                 - !Sub arn:aws:s3:::${IngestBucketName}/config/directory.json
                 # The close-driven final-pass request written by FinalizeSweepFunction.
                 - !Sub arn:aws:s3:::${IngestBucketName}/extraction_requests/*
