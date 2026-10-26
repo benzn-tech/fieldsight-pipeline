@@ -20,6 +20,7 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "k")
 
 import directory  # noqa: E402
 
+OLD_KEY = "config/user_mapping.json"   # the frozen file; nothing in directory.py reads it now
 TEMPLATE = os.path.join(os.path.dirname(__file__), "..", "..", "src", "template.yaml")
 
 DIRECTORY_DOC = {
@@ -78,25 +79,30 @@ def fresh_cache():
 # ---- directory.load ---------------------------------------------------------------
 
 def test_THE_load_prefers_the_directory_and_never_touches_the_old_file():
-    s3 = FakeS3({directory.KEY: DIRECTORY_DOC, directory.LEGACY_KEY: LEGACY_DOC})
+    s3 = FakeS3({directory.KEY: DIRECTORY_DOC, OLD_KEY: LEGACY_DOC})
     doc = directory.load(s3, "b")
     assert doc["people"]["Deandre__Alberts"]["role"] == "gm"
     assert s3.gets == [directory.KEY]
 
 
-def test_load_adapts_the_old_file_and_warns_once(caplog):
-    s3 = FakeS3({directory.LEGACY_KEY: LEGACY_DOC})
+def test_THE_the_old_file_is_never_read_even_when_the_directory_is_missing(caplog):
+    """M5: the transition fallback is gone. A bucket that still holds the frozen file
+    but has lost directory.json gets an empty directory and an ERROR -- never the
+    August answer."""
+    s3 = FakeS3({OLD_KEY: LEGACY_DOC})
     with caplog.at_level(logging.WARNING):
         doc = directory.load(s3, "b")
-        directory.load(s3, "b")      # cached: no second read, no second warning
-    ben = doc["people"]["Ben_Lin"]
-    assert ben["name"] == "Ben Lin" and ben["role"] == "site_manager"
-    assert ben["primary_site"] == "legacy:uc-pk" and ben["sites"] == ["legacy:uc-pk"]
-    assert doc["sites"]["legacy:uc-pk"]["name"] == "UC PK"
-    assert doc["sites"]["legacy:uc-pk"]["slug"] == "uc-pk"
-    assert "Benl1" not in doc["people"]          # device ids are not carried over
-    warnings = [r for r in caplog.records if "falling back to user_mapping.json" in r.getMessage()]
-    assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
+        directory.load(s3, "b")      # cached: no second read
+    assert doc == directory.empty()
+    assert OLD_KEY not in s3.gets and s3.gets == [directory.KEY]
+    assert not [r for r in caplog.records if "user_mapping" in r.getMessage()]
+    errs = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errs) == 1 and directory.KEY in errs[0].getMessage()
+
+
+def test_the_legacy_adapter_is_gone():
+    for name in ("LEGACY_KEY", "LEGACY_PREFIX", "adapt_legacy"):
+        assert not hasattr(directory, name), name
 
 
 def test_THE_both_missing_is_an_error_not_a_silent_empty(caplog):
@@ -104,7 +110,7 @@ def test_THE_both_missing_is_an_error_not_a_silent_empty(caplog):
         doc = directory.load(FakeS3(), "b")
     assert doc["people"] == {} and doc["sites"] == {}
     errs = [r for r in caplog.records if r.levelno >= logging.ERROR]
-    assert errs and "neither" in errs[0].getMessage()
+    assert errs and directory.KEY in errs[0].getMessage()
 
 
 def test_a_403_on_a_missing_key_reads_as_absent_not_as_a_crash():
@@ -114,8 +120,42 @@ def test_a_403_on_a_missing_key_reads_as_absent_not_as_a_crash():
                 raise ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject")
             return super().get_object(Bucket, Key)
 
-    doc = directory.load(Denied({directory.LEGACY_KEY: LEGACY_DOC}), "b")
-    assert "Ben_Lin" in doc["people"]
+    s3 = Denied({OLD_KEY: LEGACY_DOC})
+    doc = directory.load(s3, "b")
+    assert doc == directory.empty()
+    assert OLD_KEY not in s3.gets
+
+
+def _errors_after_load(caplog, s3):
+    with caplog.at_level(logging.ERROR):
+        doc = directory.load(s3, "b")
+    return doc, [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_a_403_on_the_directory_is_reported_as_an_error(caplog):
+    class Denied(FakeS3):
+        def get_object(self, Bucket, Key):
+            raise ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject")
+    doc, errs = _errors_after_load(caplog, Denied())
+    assert doc == directory.empty() and errs and directory.KEY in errs[-1].getMessage()
+
+
+def test_an_s3_failure_that_is_not_absence_is_an_empty_directory_and_an_error(caplog):
+    class Throttled(FakeS3):
+        def get_object(self, Bucket, Key):
+            self.gets.append(Key)
+            raise ClientError({"Error": {"Code": "SlowDown"}}, "GetObject")
+    s3 = Throttled({OLD_KEY: LEGACY_DOC})
+    doc, errs = _errors_after_load(caplog, s3)
+    assert doc == directory.empty() and s3.gets == [directory.KEY]
+    assert errs and directory.KEY in errs[-1].getMessage()
+
+
+def test_a_malformed_directory_is_an_empty_directory_and_an_error(caplog):
+    s3 = FakeS3({directory.KEY: {"sites": {}}, OLD_KEY: LEGACY_DOC})   # no `people`
+    doc, errs = _errors_after_load(caplog, s3)
+    assert doc == directory.empty() and s3.gets == [directory.KEY]
+    assert errs and directory.KEY in errs[-1].getMessage()
 
 
 # ---- report generator -------------------------------------------------------------
@@ -139,6 +179,24 @@ def test_THE_a_daily_report_for_deandre_gets_role_and_site_from_the_directory(mo
     assert sites_info["id-b"]["name"] == "Alpha Schooling"
     assert sites_info["id-a"]["slug"] == sites_info["id-b"]["slug"] == "main-site"
     assert rg.site_name_for(sites_info["id-a"]) == "Alpha School"
+    # Every directory site id is an Aurora UUID (no `legacy:` ids any more).
+    assert sites_info["id-a"]["site_uuid"] == "id-a"
+    assert sites_info["id-b"]["site_uuid"] == "id-b"
+
+
+def test_THE_the_directory_id_wins_over_a_slug_keyed_coordinate_uuid(monkeypatch):
+    """site-coords.json is keyed by slug, and slugs are unique per company only. Two
+    tenants' `main-site` share one coords entry; its site_id must not become the
+    other tenant's site_uuid (programme and weather are read by it)."""
+    s3 = FakeS3({directory.KEY: DIRECTORY_DOC,
+                 "config/site-coords.json": {"main-site": {"site_id": "id-a",
+                                                           "latitude": -43.5, "longitude": 172.6}}})
+    monkeypatch.setattr(rg, "s3_client", s3)
+    monkeypatch.setattr(rg, "download_json_from_s3",
+                        lambda bucket, key: json.loads(s3.objects[key]) if key in s3.objects else None)
+    _p, _a, _r, sites_info = rg.get_user_site_mapping("b")
+    assert sites_info["id-a"]["site_uuid"] == "id-a"
+    assert sites_info["id-b"]["site_uuid"] == "id-b"
 
 
 def test_the_spaced_display_name_finds_the_folder(monkeypatch):
@@ -231,10 +289,17 @@ def test_the_site_match_reads_the_directory_and_is_scoped_to_the_speakers_compan
     assert es._fuzzy_match_site("Alpha School", None) is None
 
 
-def test_the_legacy_directory_with_no_company_ids_still_matches_unscoped(monkeypatch):
-    monkeypatch.setattr(es, "s3", lambda: FakeS3({directory.LEGACY_KEY: LEGACY_DOC}))
+def test_THE_the_site_match_is_always_scoped_now_that_the_unscoped_document_is_gone(monkeypatch):
+    """Only the frozen-file adapter produced sites with no company id; the published
+    directory always stamps one (sites.company_id is NOT NULL). With the adapter gone,
+    the unscoped branch would only ever fire on a broken document -- it fails closed."""
+    doc = {"version": 2,
+           "people": {"Ann_Lee": {"name": "Ann Lee", "company_id": None}},
+           "sites": {"id-u": {"slug": "uc-pk", "name": "UC PK", "company_id": None}}}
+    monkeypatch.setattr(es, "s3", lambda: FakeS3({directory.KEY: doc, OLD_KEY: LEGACY_DOC}))
     monkeypatch.setattr(es, "_sites_cache", None)
-    assert es._fuzzy_match_site("UC PK", "anybody") == "UC PK"
+    assert es._fuzzy_match_site("UC PK", "anybody") is None
+    assert es._fuzzy_match_site("UC PK", "Ann_Lee") is None
 
 
 # ---- orchestrator -----------------------------------------------------------------
@@ -328,8 +393,10 @@ def test_the_extract_session_reader_can_read_the_directory():
 def test_no_env_var_or_grant_is_left_pointing_at_the_mapping_without_a_reader():
     t = _template()
     assert "CONFIG_KEY" not in t
-    # Only extract-session (via the directory's fallback) still has an exact grant.
-    assert t.count("${IngestBucketName}/config/user_mapping.json") == 1
+    # M5: the directory's fallback was the last reader behind an exact grant. The
+    # orchestrator reads the file through its bucket-wide S3ReadPolicy, not a key grant.
+    assert t.count("${IngestBucketName}/config/user_mapping.json") == 0
+    assert t.count("${DataBucketName}/config/user_mapping.json") == 0
 
 
 def test_the_dead_loader_is_gone():
