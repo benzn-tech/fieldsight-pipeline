@@ -1579,8 +1579,12 @@ def count_transcripts_for_date(bucket, target_date):
     return count
 
 def get_report_transcript_count(bucket, target_date):
-    summary_key = f"{REPORT_PREFIX}{target_date}/summary_report.json"
-    summary_data = download_json_from_s3(bucket, summary_key)
+    # With the lake-wide summary off, a summary_report.json left from before the switch is
+    # never rewritten: trusting its count would re-flag that day as stale every night.
+    summary_data = None
+    if _lake_wide_summary_on():
+        summary_key = f"{REPORT_PREFIX}{target_date}/summary_report.json"
+        summary_data = download_json_from_s3(bucket, summary_key)
     if summary_data:
         meta = summary_data.get('_report_metadata', {})
         return meta.get('recordings_processed', 0)
@@ -1663,9 +1667,10 @@ def check_summary_freshness(bucket, target_date, current_transcript_count, key=N
 
 
 def _lake_wide_summary_on():
-    """Read at call time (never at import): "off" skips the lake-wide summary. Default on
-    for one release while readers move to the per-company documents."""
-    return os.environ.get('SUMMARY_LAKE_WIDE', 'on').strip().lower() != 'off'
+    """Read at call time (never at import): only "on" writes the lake-wide summary.
+    Default off since 2026-10-26: per-company summaries (reports/{date}/companies/{cid}/)
+    have run on prod since 2026-10-13 and are what org-api serves; "on" is the rollback."""
+    return os.environ.get('SUMMARY_LAKE_WIDE', 'off').strip().lower() == 'on'
 
 
 def _build_summary(users_data, target_date, site_name, triggered_by, *,
