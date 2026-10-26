@@ -1534,14 +1534,13 @@ def _fuzzy_match_site(stated, user_folder=None):
     # the matched name is persisted in the speaker's own extraction. FAILS
     # CLOSED: when the directory carries company ids (it is the Aurora one) and
     # this speaker has none -- a folder not yet published, an archived user, a
-    # warm container with an older directory -- there is no match at all. Only
-    # the legacy fallback document, which has no company ids anywhere, matches
-    # against every site (it is one company's hand-written list).
+    # warm container with an older directory -- there is no match at all. There
+    # is no unscoped case any more: only the frozen-file adapter (removed, M5)
+    # produced sites without a company id; sites.company_id is NOT NULL.
     company = directory.person(doc, user_folder).get('company_id')
-    if any(v.get('company_id') for v in sites.values()):
-        if not company:
-            return None
-        sites = {k: v for k, v in sites.items() if v.get('company_id') == company}
+    if not company:
+        return None
+    sites = {k: v for k, v in sites.items() if v.get('company_id') == company}
     names = [info.get('name', '') for info in sites.values() if info.get('name')]
     if not stated or not names:
         return None

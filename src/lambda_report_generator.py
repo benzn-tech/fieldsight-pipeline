@@ -413,8 +413,11 @@ def get_user_site_mapping(bucket):
         slug = entry.get('slug') or sid
         merged = site_coords.overlay_sites_info({slug: entry}, coords).get(slug, dict(entry))
         merged['slug'] = slug
-        if not sid.startswith(directory.LEGACY_PREFIX):
-            merged.setdefault('site_uuid', sid)
+        # Every directory site id is an Aurora sites.id (the frozen-file adapter and its
+        # `legacy:` ids are gone, M5), and it WINS over the coordinate file's: that file
+        # is keyed by slug, slugs are unique per company only, so its site_id for a
+        # shared slug can be another tenant's -- and programme/weather are read by it.
+        merged['site_uuid'] = sid
         sites_info[sid] = merged
     user_primary_site = {}
     user_all_sites = {}
