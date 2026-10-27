@@ -1,6 +1,6 @@
 # Daily report + session extraction — prompt × model bench
 
-Date: 2026-10-28 · Line: ASR+LLM优化v3 (bench owner, per owner 10-27) · Status: rev 2
+Date: 2026-10-28 · Line: ASR+LLM优化v3 (bench owner, per owner 10-27) · Status: rev 2.1
 (Fable review applied, §10). Production prompt changes that come out of this go through
 the report / extraction line (authors of #864, #1022-#1069, #914-#997); this spec
 changes nothing in `src/`.
@@ -68,7 +68,7 @@ The rendered inline prompt is identical across Sep–Oct; prod and TEST serve th
 
 | id | what |
 |---|---|
-| `R-cur` | develop + the S3 template **as prod serves it**, read from the `prompt` field of an owner-folder `reports/<date>/<owner-folder>/daily_report_debug.json` (never `summary_report_debug.json`); if it differs from git v3.0 the debug copy wins and the diff is recorded |
+| `R-cur` | develop + the S3 template **as prod serves it**, read from the `prompt` field of an owner-folder `reports/<date>/<owner-folder>/daily_report_debug.json` (never the `_summary` folder, lambda_report_generator.py:526); if it differs from git v3.0 the debug copy wins and the diff is recorded |
 
 The pre-#950 weather block is not a candidate: weather is now written by code, so a win
 there could not ship. The daily report is therefore a **model** comparison with
@@ -125,7 +125,7 @@ recorded, the run's outcome is the retry's.
   vendors already process this data class in prod (Anthropic in July, OpenRouter
   muse / mimo / gemini / DeepSeek since Sep–Oct).
 - **Set:** 4 extraction sessions (one dense > 40 min, one short, one mixed Chinese /
-  English, the `task_admission_ground_truth.json` meeting) + 2-3 days for R (one dense)
+  English, the `task_admission_ground_truth.json` meeting) + for R, the 2-3 days that contain those sessions (one dense)
   + the same 4 sessions for T. Held-out: 2 further sessions (§6).
 - **Collection** reuses `scripts/extraction_ab.py`'s real turn assembly (`--turns-file`)
   and writes only under the bench `--out` (outside the repo).
@@ -146,7 +146,8 @@ recorded, the run's outcome is the retry's.
    match, as `extraction_ab --analyse`); only **unmatched** items go to the owner, deduped
    across all cells, each marked `true` (owner missed it — added to gold) / `misread`
    (an utterance exists, but it is not a commitment / decision) / `fabricated` (no
-   supporting utterance). P0 measures the unmatched pool on one session from a 1-rep
+   supporting utterance). Auto-matches below a similarity threshold are shown too, for
+   one-click confirm, so a loose match cannot hide a wrong item behind a right one. P0 measures the unmatched pool on one session from a 1-rep
    pilot before any owner time is booked; if it exceeds 60 items per session, the page
    shows items produced by ≥ 2 reps first and the rest only on request.
 
@@ -155,22 +156,26 @@ checks only. `continuity_eval/label.py` is a pattern for the page, not reused co
 
 ### 5.2 Per-run metrics
 
-- **Mechanical:** parsed (`extract_json`) · schema keys · finish normal (not length /
+- **Mechanical:** parsed (`extract_json`) · schema keys (not evidence for Claude
+  cells: `json_schema` enforces keys, `json_object` does not) · finish normal (not length /
   max_tokens / refusal / empty 200) · placeholder scan (the 14 patterns of the 09-08
   replay: `Bullet N`, `[insert`, `{{`, `<field>`, `YYYY-MM-DD`, …) · latency · tokens ·
   reasoning tokens · $ · provider.
 - **Against gold:** action recall and precision; decision recall and precision;
   `fabricated` count; `misread` count; `responsible` correct (person / crew / trade /
   Speaker / null); `due` kept when gold has one.
+- **R:** recall on gold items of the labelled sessions that fall in that day;
+  `fabricated` checked against the whole day's transcript by the same adjudication;
+  precision is not measured for R (other sessions of the day are unlabelled).
 - **T:** coverage of gold-true actions / decisions and of the pinned input's true items
   (T-cur), fabricated count, every template section present. Matching T's free text to
   gold is done by fuzzy match + the owner confirming only uncertain matches.
 
 ### 5.3 Noise floor and failure
 
-- Per (cell, session): an item is *stable* when all 3 reps agree on it (present /
-  absent). A metric's **noise floor F** for a cell = the max over sessions of its range
-  across the 3 reps.
+- A metric's **noise floor F** for a cell = the max over sessions of its range across
+  the 3 reps, and **at least one gold item** (for recall: 1 / that session's gold-true
+  count). The keep rule uses the **incumbent's** F.
 - A cell **fails a session** when ≥ 2 of 3 reps are unparsed, truncated (after the T
   retry), contain a placeholder, or contain a `fabricated` item.
 
@@ -179,10 +184,10 @@ checks only. `continuity_eval/label.py` is a pattern for the page, not reused co
 - **Round 0:** every candidate × every model × 3 reps.
 - **Underperforming** (owner's word, made testable; per model, using its best round-0
   cell per task):
-  (a) fails ≥ 2 of the 4 sessions (§5.3); or
+  (a) fails ≥ 2 of the 4 sessions (§5.3; fabrication is one of the failure causes);
+      or
   (b) action recall below the **cross-model median** of best cells by more than that
-      model's F on ≥ 2 sessions; or
-  (c) median `fabricated` ≥ 1 on ≥ 2 sessions.
+      model's F on ≥ 2 sessions.
   `misread` is reported, not a trigger (most false items are misreads and every model
   has some).
 - **Rounds 1-2:** only for underperforming models, at most 2 edits per (model, task),
@@ -225,7 +230,11 @@ rate when the input exceeds 100 K).
   before round 0; round 0 (≈ $14 expected, Sonnet ≈ 93 runs ≤ $47 upper) runs
   extraction → template → report and stops at $31, so a cap hit loses the least-changed
   task; rounds 1-2 run only with room above the reserve.
-- OpenRouter (muse / DeepSeek / gemini / mimo ≈ 380 round-0 runs at ≤ $0.05): ≤ $19.
+- OpenRouter (muse / DeepSeek / gemini / mimo ≈ 372 round-0 runs at ≤ $0.05): ≤ $19,
+  plus T retries (≤ 144 at ≤ $0.03) ≤ $4; Sonnet T retries ≤ 36 at 12 000 tokens ≈ $5
+  upper, inside the report pool.
+- At upper cost round 0 stops before Sonnet's report cells; that is the accepted
+  outcome (the report is the least-changed task), and the summary names the cut cells.
 - Every live step: `--dry-run` prints calls and $ upper; `--confirm-calls N` required;
   the owner runs it (keys).
 
@@ -244,7 +253,8 @@ rate when the input exceeds 100 K).
 
 ## 9. Risks
 
-- Owner time: blind listing ≈ 10-15 min per session; adjudication bounded by §5.1.
+- Owner time: blind listing ≈ 10-15 min per session, for the 4 sessions and the 2
+  held-out sessions; adjudication bounded by §5.1.
 - muse empty 200 under reasoning: a failed rep, not retried (except T's prod retry).
 - Claude json_schema may reject a schema feature; then that cell runs with the prompt
   rule only and the fact is recorded.
@@ -274,3 +284,9 @@ rev 2 — Fable review (NOT-READY), all applied:
     on the never-write list; read-only access.
 11. LOW label.py as pattern only; unresolved → unsure; Haiku > 100 K pricing; budgets
     pinned; X-0901 on today's turn assembly stated; group extraction out of scope.
+
+rev 2.1 — Fable re-check (READY-WITH-FIXES), all applied: R days = the gold sessions'
+days, R recall on labelled items, no R precision; F ≥ one gold item, incumbent's F;
+§6(c) folded into (a); `_summary` folder name; schema keys not evidence for Claude;
+T retry cost and the accepted round-0 cut; low-similarity matches shown; held-out
+owner time.
