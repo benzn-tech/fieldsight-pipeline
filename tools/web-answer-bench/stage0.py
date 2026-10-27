@@ -47,6 +47,8 @@ CHAIN_BUDGET_S = 22.1          # 25 - t_pre 2.9 (spec §4.1)
 VERIFY_BUDGET_S = 14.0
 P50_GATE_MS = 9000             # VERIFY_FLOOR
 MAX_GATE_MS = 14000            # VERIFY_BUDGET
+OVER_BUDGET_MS = MAX_GATE_MS + 1
+GATE_OK = ("ok", "max_tokens")
 # Upper-bound assumptions per Anthropic request (spec §7).
 UPPER_INPUT_TOKENS = 46_000
 UPPER_OUTPUT_TOKENS = claude_verify.MAX_TOKENS
@@ -119,12 +121,17 @@ def summarize(records):
         rs = [r for r in records if r["config"] == name]
         rejected = any(r["outcome"] == "rejected" for r in rs)
         live = [r for r in rs if r["outcome"] != "rejected"]
-        walls = [MAX_GATE_MS if r["outcome"] == "timeout" else r["latency_ms"] for r in live]
+        # Anything but an answer (or a max_tokens stop, reported on its own) is
+        # over budget: a verify that fails fast is not a fast verify.
+        failed = [r for r in live if r["outcome"] not in GATE_OK]
+        walls = [OVER_BUDGET_MS if r["outcome"] not in GATE_OK else r["latency_ms"]
+                 for r in live]
         configs[name] = {
             "model": model, "tool": tool, "rejected": rejected, "n": len(live),
             "p50_ms": int(statistics.median(walls)) if walls else None,
             "max_ms": max(walls) if walls else None,
             "searched_rate": (sum(r["searched"] for r in live) / len(live)) if live else None,
+            "failures": len(failed),
             "timeouts": sum(r["outcome"] == "timeout" for r in live),
             "refusals": sum(r["outcome"] == "refusal" for r in live),
             "max_tokens_stops": sum(r["outcome"] == "max_tokens" for r in live),

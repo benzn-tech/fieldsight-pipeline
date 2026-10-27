@@ -379,13 +379,38 @@ def test_summary_counts_refusals_and_max_tokens_separately(tmp_path):
     assert h["searched_rate"] == pytest.approx(12 / 12)
 
 
-def test_timeout_counts_as_14s_in_max(tmp_path):
+def test_timeout_fails_the_max_gate(tmp_path):
     clock = Clock()
     key = ("claude-haiku-5-5", "web_search_20250305")
     client = FakeClient(clock, {key: [(20.0, APITimeoutError("t"))]},
                         default=lambda: (1.0, response()))
     _, summary, _, _ = _run(tmp_path, client, clock)
-    assert summary["configs"]["haiku-20250305"]["max_ms"] == 14000
+    h = summary["configs"]["haiku-20250305"]
+    assert h["max_ms"] > stage0.MAX_GATE_MS
+    assert "claude-haiku-5-5" in stage0.stop_rule(summary)["dropped"]
+
+
+def test_a_fast_failure_fails_the_max_gate(tmp_path):
+    # A verify that returns quickly without searching is not a fast verify.
+    clock = Clock()
+    key = ("claude-haiku-5-5", "web_search_20250305")
+    client = FakeClient(clock, {key: [(0.5, FakeStatusError(429))]},
+                        default=lambda: (1.0, response()))
+    _, summary, _, _ = _run(tmp_path, client, clock)
+    h = summary["configs"]["haiku-20250305"]
+    assert h["failures"] == 1
+    assert h["max_ms"] > stage0.MAX_GATE_MS
+    assert "claude-haiku-5-5" in stage0.stop_rule(summary)["dropped"]
+
+
+def test_max_tokens_stop_is_not_a_gate_failure(tmp_path):
+    clock = Clock()
+    key = ("claude-haiku-5-5", "web_search_20250305")
+    client = FakeClient(clock, {key: [response(stop="max_tokens")]},
+                        default=lambda: (1.0, response()))
+    _, summary, _, _ = _run(tmp_path, client, clock)
+    assert summary["configs"]["haiku-20250305"]["failures"] == 0
+    assert summary["stop_rule"]["frozen"].get("claude-haiku-5-5") == "web_search_20250305"
 
 
 def test_stop_rule_freezes_fastest_tool_per_model_and_drops_others():

@@ -168,7 +168,7 @@ the full bench is guarded by the hard stop (§6).
   (non-empty `web_search_tool_result` list), error-block code, stop_reason,
   continuation flag, HTTP status, prompt sha256. Answer text only in `--out` files.
 - *Per-config summary.* p50 and max over all 12 wall times (failures / timeouts
-  included, a timeout recorded as 14 s), searched rate, max_tokens stops, refusals,
+  included, any outcome other than an answer or a max_tokens stop recorded as over 14 s, so a fast failure cannot pass the max gate), searched rate, max_tokens stops, refusals,
   rejected flag, $ = tokens + searches × price.
 - *Stop rule* as above.
 
