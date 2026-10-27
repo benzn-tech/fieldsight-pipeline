@@ -1,0 +1,5 @@
+{
+ "_note": "Owner-test folders the collector may read (spec section 4). The owner checks the names (the spec says test3; memory records test3's folder as Ben_Lin_Test) and sets confirmed to true. _summary is always refused.",
+ "confirmed": false,
+ "folders": ["Ben_Lin_test2", "Ben_Lin_Test", "Ben_UCPK2"]
+}
