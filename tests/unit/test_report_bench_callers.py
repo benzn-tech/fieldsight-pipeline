@@ -108,8 +108,15 @@ def test_openrouter_no_key(monkeypatch):
 
 
 class FakeStream:
-    def __init__(self, reply):
+    def __init__(self, reply, events=()):
         self.reply = reply
+        self.events = list(events)
+
+    def __iter__(self):
+        for e in self.events:
+            if isinstance(e, BaseException):
+                raise e
+            yield e
 
     def __enter__(self):
         if isinstance(self.reply, BaseException):
@@ -131,7 +138,8 @@ class FakeClient:
 
     def stream(self, **kw):
         self.requests.append(kw)
-        return FakeStream(self.replies.pop(0))
+        r = self.replies.pop(0)
+        return r if isinstance(r, FakeStream) else FakeStream(r)
 
 
 def _msg(text, stop="end_turn"):
@@ -184,3 +192,48 @@ def test_no_text_in_logs(caplog):
                  clock=Clock())
     for rec in caplog.records:
         assert SECRET_P not in rec.getMessage() and SECRET_A not in rec.getMessage()
+
+
+class JumpClock:
+    """Each read advances 1 s; `jump` adds a big step once."""
+    def __init__(self):
+        self.t, self.jump = 0.0, False
+
+    def __call__(self):
+        self.t += 1000.0 if self.jump else 1.0
+        self.jump = False
+        return self.t
+
+
+def test_claude_wall_clock_deadline_charges_upper():
+    clock = JumpClock()
+
+    class Ev:
+        def __init__(self, jump):
+            self.jump = jump
+    events = []
+
+    class S(FakeStream):
+        def __iter__(self):
+            yield "e1"
+            clock.jump = True
+            yield "e2"
+            yield "e3"
+    c = FakeClient([S(_msg(SECRET_A))])
+    r = callers.call("sonnet", "X", '"topics"', 9000, client=c, clock=clock)
+    a = r["attempts"][0]
+    assert r["outcome"] == "timeout" and a["cost_estimated"] is True
+    assert a["usd"] == a["usd_upper"] > 0 and r["usd"] == pytest.approx(a["usd_upper"], abs=1e-6)
+
+
+def test_claude_error_after_stream_start_charges_upper():
+    c = FakeClient([FakeStream(_msg(SECRET_A), events=["e1", ConnectionError("reset")])])
+    r = callers.call("sonnet", "X", '"topics"', 9000, client=c, clock=Clock())
+    a = r["attempts"][0]
+    assert r["outcome"] == "http_error" and a["cost_estimated"] is True and a["usd"] > 0
+
+
+def test_claude_error_before_stream_is_free():
+    c = FakeClient([APIStatusError(529, "overloaded")])
+    r = callers.call("sonnet", "X", '"topics"', 9000, client=c, clock=Clock())
+    assert r["attempts"][0]["usd"] is None and not r["attempts"][0].get("cost_estimated")

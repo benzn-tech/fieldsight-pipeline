@@ -62,7 +62,7 @@ def usd_upper(key, prompt, max_tokens):
 
 
 def _blank(key, prompt, req):
-    return {"finish": None, "outcome": "http_error", "latency_ms": 0, "input_tokens": 0,
+    return {"cost_estimated": False, "finish": None, "outcome": "http_error", "latency_ms": 0, "input_tokens": 0,
             "output_tokens": 0, "reasoning_tokens": None, "provider": None,
             "http_status": None, "error_code": None,
             "usd_upper": usd_upper(key, prompt, req["max_tokens"]), "usd": None,
@@ -129,8 +129,14 @@ def _claude_attempt(key, req, prompt, client, clock):
     a["effort"] = req["output_config"]["effort"]
     a["provider"] = "anthropic"
     started = clock()
+    streaming = False
     try:
         with client.messages.stream(timeout=rb_requests.TIMEOUT_S, **req) as stream:
+            streaming = True
+            # The SDK timeout bounds each read; this bounds the whole answer.
+            for _event in stream:
+                if clock() - started > rb_requests.TIMEOUT_S:
+                    raise TimeoutError("wall-clock deadline")
             msg = stream.get_final_message()
     except Exception as exc:                              # noqa: BLE001 - classified
         a["latency_ms"] = int(round((clock() - started) * 1000))
@@ -140,6 +146,10 @@ def _claude_attempt(key, req, prompt, client, clock):
             a["outcome"] = "schema_rejected"
         else:
             a["outcome"] = "timeout" if outcome == "timeout" else "http_error"
+        if streaming:
+            # Tokens were generated and are billed; the usage never arrived, so
+            # the ledger is charged the call's upper bound.
+            a["usd"], a["cost_estimated"] = a["usd_upper"], True
         return a, ""
     a["latency_ms"] = int(round((clock() - started) * 1000))
     a["http_status"] = 200
