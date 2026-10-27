@@ -34,6 +34,7 @@ import todo_collapse
 from psycopg.rows import dict_row
 
 from repositories import redactions
+from repositories.content_edits import FINISHED_STATUSES
 
 _ZERO_FIELDS = ("open_safety", "open_high_safety", "open_actions", "total_actions",
                  "overdue_actions", "topics_count", "participants")
@@ -135,10 +136,12 @@ def portfolio_counts(conn, site_ids) -> dict:
         kept = todo_collapse.collapse_if_enabled(rows)
         b = merged.setdefault(site_key, _zero())
         b["total_actions"] += len(kept)
-        b["open_actions"] += sum(1 for r in kept if r["status"] == "open")
+        # Open = not finished. in_progress and blocked are still owed; only
+        # `done` (finished) and `closed` (no longer needed) leave the count.
+        b["open_actions"] += sum(1 for r in kept if r["status"] not in FINISHED_STATUSES)
         b["overdue_actions"] += sum(
             1 for r in kept
-            if r["status"] == "open" and r["deadline"] is not None
+            if r["status"] not in FINISHED_STATUSES and r["deadline"] is not None
             and r["deadline"] < _date.today())
 
     topic_rows = conn.cursor(row_factory=dict_row).execute(

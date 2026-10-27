@@ -79,7 +79,7 @@ def candidate_corpus(conn, site_id, before_date, window_days):
     not go through here."""
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT t.id, t.report_date, t.site_id, t.title, t.summary, t.thread_id, "
-        "       count(a.id) FILTER (WHERE a.status='open') AS open_items "
+        "       count(a.id) FILTER (WHERE a.status NOT IN ('done','closed')) AS open_items "
         "FROM topics t LEFT JOIN action_items a ON a.topic_id = t.id "
         "WHERE t.site_id = %s AND t.report_date < %s "
         "  AND t.report_date >= (%s::date - %s::int) "
@@ -87,7 +87,7 @@ def candidate_corpus(conn, site_id, before_date, window_days):
         # merely shows: without it the matcher keeps proposing threads built out of a
         # recording the customer removed, and each proposal is a new row carrying its text.
         f"  AND {_VISIBLE_T} "
-        "GROUP BY t.id HAVING count(a.id) FILTER (WHERE a.status='open') > 0",
+        "GROUP BY t.id HAVING count(a.id) FILTER (WHERE a.status NOT IN ('done','closed')) > 0",
         (site_id, before_date, before_date, window_days)).fetchall()
 
 
@@ -133,7 +133,7 @@ def thread_facts(conn, thread_id):
         "SELECT count(DISTINCT t.report_date) AS times_raised, "
         "       min(t.report_date) AS first_seen, "
         "       max(t.report_date) AS last_raised, "
-        "       count(a.id) FILTER (WHERE a.status='open') AS open_items "
+        "       count(a.id) FILTER (WHERE a.status NOT IN ('done','closed')) AS open_items "
         "FROM topics t LEFT JOIN action_items a ON a.topic_id = t.id "
         f"WHERE t.thread_id = %s AND {_VISIBLE_T}", (thread_id,)).fetchone()
 
@@ -153,7 +153,7 @@ def facts_for_threads(conn, thread_ids):
         "       count(DISTINCT t.report_date) AS times_raised, "
         "       min(t.report_date) AS first_seen, "
         "       max(t.report_date) AS last_raised, "
-        "       count(a.id) FILTER (WHERE a.status='open') AS open_items "
+        "       count(a.id) FILTER (WHERE a.status NOT IN ('done','closed')) AS open_items "
         "FROM topics t LEFT JOIN action_items a ON a.topic_id = t.id "
         f"WHERE t.thread_id = ANY(%s) AND {_VISIBLE_T} GROUP BY t.thread_id",
         (list(thread_ids),)).fetchall()

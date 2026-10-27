@@ -5751,6 +5751,17 @@ def test_patch_action_item_bad_status_400(wired):
     assert res["statusCode"] == 400
 
 
+def test_patch_action_item_accepts_closed_and_audits_it(wired):
+    """`closed` = no longer needs doing (owner, 2026-10-27). Same audited write as a
+    tick: the report's "Closed today" reads that audit row for its day and actor."""
+    seen = _wire_item(wired)
+    res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1",
+                                        body={"status": "closed"}), None)
+    assert res["statusCode"] == 200 and seen["fields"] == {"status": "closed"}
+    assert [a[3:5] for a in seen["audits"]] == [("status", "open")]
+    assert seen["audits"][0][5] == "closed"
+
+
 def test_patch_action_item_empty_body_400(wired):
     _wire_item(wired)
     res = org.lambda_handler(make_event("PATCH", "/api/org/action-items/a-1", body={}), None)
@@ -7163,20 +7174,21 @@ def test_org_report_history_s3_failure_degrades_to_empty(presign_wired):
 OTHER_SITE_ID = "b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2"
 
 
-def _wire_closures(wired, counts=None, reach=None):
+def _wire_closures(wired, counts=None, reach=None, dropped=None):
     """`seen["args"]` = the (site_ids, start, end, company_id) the handler hands
     the repo; absent means the aggregate was never queried at all."""
     seen = {}
     allowed = {SITE_ID} if reach is None else set(reach)
     wired.setattr(org, "_allowed_site_ids", lambda conn, caller: allowed)
 
-    def _agg(conn, site_ids, start, end, company_id=None, **kw):
+    def _agg(conn, site_ids, start, end, company_id=None, status="done", **kw):
         seen["args"] = (set(site_ids), start.isoformat(), end.isoformat(), company_id)
+        seen.setdefault("statuses", []).append(status)
         # Emulate the repo's empty-reach short circuit so an ACL test that
         # empties the reach still sees a zero, not the canned counts.
         if not site_ids:
             return {}
-        return dict(counts or {})
+        return dict((counts if status == "done" else dropped) or {})
 
     wired.setattr(org.content_edits, "count_action_closures_by_day", _agg)
     return seen
@@ -7206,9 +7218,24 @@ def test_action_closures_previous_window_is_the_same_length_immediately_before(w
     seen = _wire_closures(wired, counts={"2026-07-15": 3, "2026-07-19": 1,
                                          "2026-07-21": 4})
     b = body_of(org.lambda_handler(_closures_event(), None))
-    assert b["previous"] == {"from": "2026-07-14", "to": "2026-07-19", "closed": 4}
+    assert b["previous"] == {"from": "2026-07-14", "to": "2026-07-19", "closed": 4,
+                             "not_needed": 0}
     assert b["closed"] == 4                       # the current window is disjoint
     assert seen["args"][1] == "2026-07-14"
+
+
+def test_action_closures_counts_the_closed_status_beside_done_never_into_it(wired):
+    """`closed` = no longer needed (owner, 2026-10-27). Not a completion: the
+    `closed` KEY (which predates the status and means ticked-done) must not move."""
+    seen = _wire_closures(wired, counts={"2026-07-21": 2},
+                          dropped={"2026-07-15": 1, "2026-07-21": 3})
+    b = body_of(org.lambda_handler(_closures_event(), None))
+    assert b["closed"] == 2
+    assert b["not_needed"] == 3
+    assert b["previous"]["closed"] == 0 and b["previous"]["not_needed"] == 1
+    day = next(d for d in b["by_day"] if d["date"] == "2026-07-21")
+    assert day == {"date": "2026-07-21", "closed": 2, "not_needed": 3}
+    assert sorted(seen["statuses"]) == ["closed", "done"]
 
 
 def test_action_closures_empty_window_is_a_well_formed_zero(wired):
