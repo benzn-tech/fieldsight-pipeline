@@ -28,21 +28,21 @@
   "task": "X"
  },
  "X-0917": {
-  "fixed_sha256": "aa3605d4fce9a95344326af4ad34f07a3eda39e92beaccc206100374ab1df5c5",
+  "fixed_sha256": "a7c225564210f52c027c8f321ca26a124502301326c75ce1b0b9ec40cb8512e5",
   "names": true,
   "resolved": "83abd0d49923ebe10fba821b0c90e5ba81e7d8e6",
   "sha": "83abd0d4",
   "task": "X"
  },
  "X-1005": {
-  "fixed_sha256": "8c967f5d4e4fb4b0599b818a0b8ebfdf8e4737d88e30333d37510564a4833ff8",
+  "fixed_sha256": "4a5e51a0bedfc4c7169b87ae16fd8c50995359c8d8a94012d453dd9f5fe43fc8",
   "names": true,
   "resolved": "8703e69a320f9ca8362f81245e9f9548a7ba79c3",
   "sha": "8703e69a",
   "task": "X"
  },
  "X-cur": {
-  "fixed_sha256": "616725b85822356dc70bfb0dfb6b08b502561cedde7c169ec2a575311a805479",
+  "fixed_sha256": "dfbcd6c8a3a3342dfec8277a89ca7a2af5e9d15cc33d007a0d3e7f7a0d3df27a",
   "names": true,
   "resolved": "82036cf2c478413aed576b8941ac3eed90d3eba6",
   "sha": "82036cf2",

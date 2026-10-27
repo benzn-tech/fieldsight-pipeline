@@ -23,7 +23,8 @@ snap = _load("rb_snapshot")
 
 X_IN = {"user_folder": "u", "date": "2026-08-27", "session_base": "s",
         "turns": [{"speaker": "spk_0", "text": "hi"}], "n_segments": 1,
-        "speaker_names": {"spk_0": "Ann"}}
+        "speaker_names": [{"source_filename": "f1", "speaker_label": "spk_0",
+                           "display_name": "Ann"}]}
 
 
 def _stub(tmp_path, body):
@@ -44,8 +45,9 @@ def test_worker_accepts_str_return_and_names(tmp_path):
     src = _stub(tmp_path, (
         "def build_extraction_prompt(user_folder, date, session_base, turns, n_segments,\n"
         "                            speaker_names=None, continuity_block=''):\n"
-        "    return 'N:' + ','.join(sorted((speaker_names or {}).values()))\n"))
-    assert snap.render(src, "X", X_IN) == "N:Ann"
+        "    return 'N:' + ','.join(sorted('%s/%s=%s' % (k[0], k[1], v)\n"
+        "                                  for k, v in (speaker_names or {}).items()))\n"))
+    assert snap.render(src, "X", X_IN) == "N:f1/spk_0=Ann"
 
 
 def test_worker_is_cold(tmp_path, monkeypatch):

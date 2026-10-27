@@ -55,7 +55,14 @@ def _first(result):
 def render_x(inputs):
     import lambda_extract_session as les
     kw = {k: inputs[k] for k in ("user_folder", "date", "session_base", "turns",
-                                 "n_segments", "speaker_names") if k in inputs}
+                                 "n_segments") if k in inputs}
+    rows = inputs.get("speaker_names")
+    if rows:
+        # The artifact's `speakerNames` rows -> {(source_filename, label): name},
+        # the key every candidate sha's render_transcript reads (JSON cannot
+        # carry tuple keys, so the rows travel and are keyed here).
+        kw["speaker_names"] = {(r["source_filename"], r["speaker_label"]): r["display_name"]
+                               for r in rows}
     return _first(les.build_extraction_prompt(**_filtered(les.build_extraction_prompt, kw)))
 
 
