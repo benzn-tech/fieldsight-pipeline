@@ -1354,13 +1354,17 @@ Harness: set `DECLARE_CONTINUITY=true` and reload `lambda_extract_session`. Use 
 
 ### Task 13: Switch on for TEST and watch (operational; needs the owner)
 
-- [ ] **Step 1:** Set repo variable `TEST_DECLARE_CONTINUITY=true` and redeploy TEST.
-- [ ] **Step 2:** The owner makes a fresh recording on TEST and ticks one action item in the app during recording. After the final pass, check through the Data API:
+- [x] **Step 1:** Set repo variable `TEST_DECLARE_CONTINUITY=true` and redeploy TEST.
+  - Done 2026-10-23: deploy run 39897991262 (after #1179 pinned SAM CLI 1.169.0; 1.170.0's cfn-lint false positive failed run 39897340284). `fieldsight-test-extract-session` DECLARE_CONTINUITY=true; prod Lambda still false.
+- [x] **Step 2:** The owner makes a fresh recording on TEST and ticks one action item in the app during recording. After the final pass, check through the Data API:
   - the ticked item has the same `stable_id` and is still ticked;
   - the item writer log shows a `CarriedByMethod` line with `Method=item_id` ≥ 1;
   - there is an accepted `item_continuity` record.
+  - Done 2026-10-27 (owner, one TEST session, 5 passes 22:17-22:25 UTC). **Pass.** The ticked item kept its `stable_id` and `item_id` through all 5 passes and stayed `done` while its text was reworded twice; `CarriedByMethod` Method=item_id 3/7/7/5, OrphanedHumanEdits 0 in every pass; `decision_records` item_continuity: 10 accepted, 2 rejected `echo`, 12 `exact_matched_item`.
+  - Miss noted: an unticked item reworded in the final pass had its claim rejected by `echo`, fell below the fuzzy floor and got a new id. `starts` was not persisted, so the cause is unknown; #1186 now records it (capped `starts`, reason, prefix match, colliding alias) on echo rejections in the artifact's `continuity.claims`.
 - [ ] **Step 3:** Watch until at least 20 real sessions have run with the flag on, for at most 2 weeks (owner, 2026-10-01):
   - `OrphanedHumanEdits`, `CarriedByMethod` by method;
   - `prior_stale` counts: grep the `continuity_write` lines, and join them with the writer's processed `extracted_at` lines using the Logs Insights query written in this step's note;
   - accepted and rejected `item_continuity` records by guard.
+  - Progress 2026-10-27: 4 sessions with `item_continuity` records since 2026-10-23 (need 20; window ends 2026-11-06).
 - [ ] **Step 4:** Summarise for the owner. Prod needs the owner's decision and a prod-config measurement run (Task 10's `run.py` pointed at `fieldsight-prod-extract-session`'s env) first.
