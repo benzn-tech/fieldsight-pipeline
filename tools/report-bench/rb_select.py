@@ -180,7 +180,10 @@ def frozen_entry(task, model, candidate, metrics, round_, candidates, edits=None
                              "min(8192 + 700 n, 32000)") + " + headroom per vendor",
              "metrics": metrics, "evidential": False, "heldout": None}
     if candidate in candidates:
-        entry["prompt_sha256"] = candidates[candidate]["fixed_sha256"]
+        # R-cur has no fixed-input hash: its prompt is develop's code + the
+        # served template, whose sha256 is in <out>/prompts/r_template.json.
+        entry["prompt_sha256"] = candidates[candidate].get("fixed_sha256")
+        entry["resolved"] = candidates[candidate].get("resolved")
     else:
         spec = (edits or load_edits())[candidate]
         with open(os.path.join(_HERE, "prompts", spec["base"] + ".txt"), encoding="utf-8",

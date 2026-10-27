@@ -172,14 +172,16 @@ def collect(sessions_file, out, s3, x_loader=load_x, r_loader=load_r, with_r=Tru
                                        "n_segments": n_seg, "n_turns": len(turns),
                                        "sha256": rb_common.sha256_file(path)}
     if with_r:
-        days = sorted({(s["bucket"], s["folder"], s["date"]) for s in sessions
-                       if s.get("role", "set") == "set"})
+        days = sorted({(s["bucket"], s["folder"], s["date"]) for s in sessions})
         for bucket, folder, date in days:
+            # A day is in the set when any set session is on it, else held out.
+            role = "set" if any(s.get("role", "set") == "set" and s["folder"] == folder
+                                and s["date"] == date for s in sessions) else "heldout"
             r = r_loader(ro, bucket, folder, date)
             path = os.path.join(inputs, "R", f"{folder}_{date}.json")
             rb_common.write_json(path, r)
             manifest["R"][f"{folder}_{date}"] = {"folder": folder, "date": date,
-                                                 "bucket": bucket,
+                                                 "bucket": bucket, "role": role,
                                                  "n_transcripts": r["n_transcripts"],
                                                  "sha256": rb_common.sha256_file(path)}
     rb_common.write_json(os.path.join(inputs, "manifest.json"), manifest)

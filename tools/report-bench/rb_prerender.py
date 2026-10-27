@@ -44,6 +44,30 @@ class PinError(RuntimeError):
     pass
 
 
+def report_shape(extraction: dict) -> dict:
+    """The final-pass answer in the shape a session report reads: prod's T
+    input is the reviewed content org-api renders (lambda_org_api
+    .render_report_shape), which spells decisions `key_decisions` (strings)
+    and questions `open_questions`; develop's `_topic_content` (the #997 record
+    block) reads those names, so the raw `decisions` / `questions` would drop
+    out of T-cur's record silently. Everything else is kept as the model wrote it."""
+    out = dict(extraction)
+    topics = []
+    for t in extraction.get("topics") or []:
+        if not isinstance(t, dict):
+            continue
+        t = dict(t)
+        t.setdefault("key_decisions", [d if isinstance(d, str) else (d or {}).get("decision")
+                                       for d in (t.get("decisions") or [])
+                                       if (d if isinstance(d, str) else (d or {}).get("decision"))])
+        t.setdefault("open_questions", [q if isinstance(q, str) else (q or {}).get("question")
+                                        for q in (t.get("questions") or [])
+                                        if (q if isinstance(q, str) else (q or {}).get("question"))])
+        topics.append(t)
+    out["topics"] = topics
+    return out
+
+
 def _pins_path(out):
     return os.path.join(out, "inputs", "T", "pins.json")
 
@@ -67,7 +91,7 @@ def pin_tcur_input(runs_jsonl_paths, out) -> dict:
             if not isinstance(content, dict):
                 continue
             p = os.path.join(out, "inputs", "T", session + ".extraction.json")
-            rb_common.write_json(p, content)
+            rb_common.write_json(p, report_shape(content))
             pins[session] = {"sha256": rb_common.sha256_file(p), "from_key": rec["key"]}
     rb_common.write_json(_pins_path(out), pins)
     return {s: v["sha256"] for s, v in pins.items()}
@@ -107,7 +131,8 @@ def run(candidates, manifest, out, cache=None, tasks=("X", "T", "R"), r_template
     def put(cid, key, task, n, prompt):
         rb_common.write_text(os.path.join(out, "prompts", cid, key + ".txt"), prompt)
         index.setdefault(cid, {})[key] = {"sha256": rb_common.sha256_text(prompt),
-                                          "task": task, "n": n, "chars": len(prompt)}
+                                          "task": task, "n": n, "chars": len(prompt),
+                                          "est_tokens": rb_common.est_tokens(prompt)}
 
     for cid, c in sorted(candidates.items()):
         if c["task"] == "X" and "X" in tasks:
@@ -135,7 +160,7 @@ def run(candidates, manifest, out, cache=None, tasks=("X", "T", "R"), r_template
     if "R" in tasks:
         if r_templates is None:
             raise ValueError("R needs the served template (--r-template)")
-        develop = rb_snapshot.resolve(rb_inventory.DEVELOP_REF)
+        develop = candidates[R_CANDIDATE]["resolved"]   # pinned, same tree as T-cur
         for key, d in sorted(manifest.get("R", {}).items()):
             r = rb_common.read_json(os.path.join(out, "inputs", "R", key + ".json"))
             put(R_CANDIDATE, key, "R", d["n_transcripts"],
@@ -161,7 +186,10 @@ def main(argv=None):
     manifest = rb_common.read_json(os.path.join(out, "inputs", "manifest.json"))
     tmpl = rb_common.read_json(a.r_template) if a.r_template else None
     if tmpl is not None:
-        print("r-template sha256", rb_common.sha256_file(a.r_template)[:12])
+        h = rb_common.sha256_file(a.r_template)
+        rb_common.write_json(os.path.join(out, "prompts", "r_template.json"),
+                             {"path": os.path.abspath(a.r_template), "sha256": h})
+        print("r-template sha256", h[:12])
     idx = run(cands, manifest, out, a.cache, a.tasks, tmpl)
     for cid, keys in sorted(idx.items()):
         print(cid, "prompts=%d" % len(keys))

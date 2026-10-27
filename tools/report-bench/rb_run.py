@@ -50,17 +50,14 @@ POOLS = {"pilot": "report/pilot", "round0": "report/round0", "rounds12": "report
 PILOT_CANDIDATE = "X-cur"
 
 
-def est_tokens(chars):
-    return (int(chars) + 1) // 2
-
-
-def usd_upper(task, model_key, chars, budget):
+def usd_upper(task, model_key, tokens, budget):
+    """`tokens` = the prompt's upper token estimate (rb_common.est_tokens)."""
     m = rb_requests.MODELS[model_key]
     if m["vendor"] != "anthropic":
         return OPENROUTER_UPPER + (OPENROUTER_T_RETRY_UPPER if task == "T" else 0.0)
-    up = rb_ledger.call_cost(m["model"], est_tokens(chars), budget + rb_requests.HEADROOM)
+    up = rb_ledger.call_cost(m["model"], tokens, budget + rb_requests.HEADROOM)
     if task == "T":
-        up += rb_ledger.call_cost(m["model"], est_tokens(chars),
+        up += rb_ledger.call_cost(m["model"], tokens,
                                   rb_requests.T_RETRY_BUDGET + rb_requests.HEADROOM)
     return up
 
@@ -73,7 +70,7 @@ def _keys_for(index, cid, roles, manifest):
     for k in keys:
         role = (manifest.get(k) or {}).get("role")
         if role is None and k in manifest.get("R", {}):
-            role = "set"
+            role = manifest["R"][k].get("role", "set")
         if (role or "set") in roles:
             out.append(k)
     return out
@@ -84,7 +81,9 @@ def _entry(phase, task, cid, model, key, rep, e, pool):
     return {"key": f"{phase}|{task}|{cid}|{model}|{key}|{rep}", "phase": phase, "task": task,
             "candidate": cid, "model": model, "session": key, "rep": rep, "budget": budget,
             "prompt_sha256": e["sha256"], "prompt_path": os.path.join("prompts", cid, key + ".txt"),
-            "usd_upper": usd_upper(task, model, e.get("chars", 0), budget), "pool": pool}
+            "usd_upper": usd_upper(task, model, e.get("est_tokens",
+                                                      rb_common.est_tokens(e.get("chars", 0))),
+                                   budget), "pool": pool}
 
 
 def plan(phase, tasks, index, manifest=None, pilot_session=None, cells=None):

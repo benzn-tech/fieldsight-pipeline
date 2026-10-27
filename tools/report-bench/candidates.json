@@ -1,4 +1,11 @@
 {
+ "R-cur": {
+  "names": true,
+  "note": "rendered per day with the served S3 template (--r-template); no fixed-input hash",
+  "resolved": "78afae49ba5d463cc463951828ea2f4a4dadb300",
+  "sha": "develop",
+  "task": "R"
+ },
  "T-0928": {
   "fixed_sha256": "2f07b97f11daf5f66eda03c614ca6af9669b13ee923c9027c290ce7c6ad838e0",
   "names": true,

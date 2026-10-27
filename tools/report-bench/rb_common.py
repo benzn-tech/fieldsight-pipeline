@@ -72,6 +72,15 @@ def check_out_dir(path: str) -> str:
     return ap
 
 
+def est_tokens(text_or_chars) -> int:
+    """Upper token estimate for a $ bound before a call: each CJK character
+    one token, everything else one per 2 characters (a bare int = non-CJK)."""
+    if isinstance(text_or_chars, int):
+        return (text_or_chars + 1) // 2
+    cjk = sum(1 for ch in text_or_chars if "一" <= ch <= "鿿")
+    return cjk + (len(text_or_chars) - cjk + 1) // 2
+
+
 def sha256_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 

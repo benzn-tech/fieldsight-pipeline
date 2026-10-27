@@ -76,7 +76,8 @@ def _setup(out):
 
 CANDS = {"X-0901": {"task": "X", "resolved": "s1", "names": False},
          "X-cur": {"task": "X", "resolved": "s2", "names": True},
-         "T-cur": {"task": "T", "resolved": "s3", "names": True}}
+         "T-cur": {"task": "T", "resolved": "s3", "names": True},
+         "R-cur": {"task": "R", "resolved": "s4", "names": True}}
 
 
 def _stub(calls):
@@ -102,7 +103,6 @@ def test_prerender_writes_one_file_per_key(tmp_path, monkeypatch):
                       [{"source_filename": "f", "speaker_label": "spk_0", "display_name": "A"}])
     pins = _pin(out, str(tmp_path))
     assert set(pins) == {"sidA"}
-    monkeypatch.setattr(pre.rb_snapshot, "resolve", lambda ref, repo=None: "dev")
     calls = []
     idx = pre.run(CANDS, m, out, tasks=("X", "T", "R"), r_templates={"daily_report": {}},
                   renderer=_stub(calls))
@@ -153,3 +153,26 @@ def test_prerender_merges_into_existing_index(tmp_path, monkeypatch):
     _pin(out, str(tmp_path))
     idx = pre.run({"T-cur": CANDS["T-cur"]}, m, out, tasks=("T",), renderer=_stub([]))
     assert set(idx) == {"X-cur", "T-cur"}
+
+
+def test_r_renders_on_the_pinned_develop_sha(tmp_path):
+    out = str(tmp_path / "out")
+    m = _setup(out)
+    calls = []
+    pre.run(CANDS, m, out, tasks=("R",), r_templates={"daily_report": {}}, renderer=_stub(calls))
+    assert [c[0] for c in calls] == ["s4"]
+
+
+def test_pin_is_in_report_shape(tmp_path):
+    out = str(tmp_path / "out")
+    _setup(out)
+    ans = os.path.join(str(tmp_path), "a.txt")
+    common.write_text(ans, json.dumps({"topics": [{"decisions": [{"decision": "Pour Monday"}],
+                                                   "questions": [{"question": "Who signs?"}],
+                                                   "action_items": []}]}))
+    runs = os.path.join(str(tmp_path), "r.jsonl")
+    common.append_jsonl(runs, {"task": "X", "candidate": "X-cur", "model": "muse", "rep": 1,
+                               "outcome": "ok", "session": "sidA", "key": "k", "text_path": ans})
+    pre.pin_tcur_input([runs], out)
+    t = common.read_json(os.path.join(out, "inputs", "T", "sidA.extraction.json"))["topics"][0]
+    assert t["key_decisions"] == ["Pour Monday"] and t["open_questions"] == ["Who signs?"]

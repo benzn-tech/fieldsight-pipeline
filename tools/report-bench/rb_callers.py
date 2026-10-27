@@ -50,8 +50,8 @@ def openrouter_key():
 
 
 def est_input_tokens(prompt: str) -> int:
-    """Upper estimate for $ before a call: one token per 2 characters."""
-    return (len(prompt) + 1) // 2
+    """Upper estimate for $ before a call (CJK one token per character)."""
+    return rb_common.est_tokens(prompt)
 
 
 def usd_upper(key, prompt, max_tokens):

@@ -71,10 +71,26 @@ def test_plan_skips_heldout_sessions_in_round0():
 
 
 def test_usd_upper():
-    up = run.usd_upper("T", "sonnet", 30000, 8000)
+    up = run.usd_upper("T", "sonnet", 15000, 8000)
     assert up == pytest.approx((15000 * 2 + 16000 * 10) / 1e6 + (15000 * 2 + 20000 * 10) / 1e6)
-    assert run.usd_upper("T", "muse", 30000, 8000) == pytest.approx(0.08)
-    assert run.usd_upper("X", "muse", 30000, 8000) == pytest.approx(0.05)
+    assert run.usd_upper("T", "muse", 15000, 8000) == pytest.approx(0.08)
+    assert run.usd_upper("X", "muse", 15000, 8000) == pytest.approx(0.05)
+
+
+def test_cjk_counts_one_token_per_character():
+    assert common.est_tokens("abcd") == 2
+    assert common.est_tokens("明天浇筑") == 4
+    assert common.est_tokens(30000) == 15000
+
+
+def test_heldout_r_day_is_planned():
+    idx = _index()
+    manifest = {s: {"role": "set"} for s in SESSIONS}
+    manifest["R"] = {"F_d1": {"role": "set"}, "F_d2": {"role": "set"},
+                     "F_d3": {"role": "heldout"}}
+    keys = {c["session"] for c in run.plan("heldout", ["R"], idx, manifest,
+                                          cells={("R", "R-cur", "muse")})}
+    assert keys == {"F_d3"}
 
 
 class FakeCaller:
