@@ -91,7 +91,7 @@ class FakeClient:
 
     def create(self, **kw):
         self.requests.append(kw)
-        key = (kw["model"], kw["tools"][0]["type"])
+        key = (kw["model"], kw["tools"][0]["type"] if kw.get("tools") else None)
         queue = self.script.get(key)
         item = queue.pop(0) if queue else (self.default() if self.default else response())
         if isinstance(item, tuple):
@@ -216,6 +216,46 @@ def test_answer_without_any_search_attempt_is_no_search():
     key = ("claude-sonnet-5-5", "web_search_20260209")
     client = FakeClient(clock, {key: [response(blocks=[], u=usage(searches=0))]})
     assert _verify(client, clock)["outcome"] == "no_search"
+
+
+def test_draft_request_has_no_tools():
+    req = cv.build_request("claude-haiku-5-5", None, "PROMPT")
+    assert "tools" not in req
+    assert req["output_config"] == {"effort": "low"} and "thinking" not in req
+
+
+def test_draft_text_only_is_ok_unsearched():
+    # A draft is not expected to search: text without a tool is the answer.
+    clock = Clock()
+    client = FakeClient(clock, {("claude-haiku-5-5", None): [
+        (2.0, response(blocks=[], u=usage(searches=0)))]})
+    r = cv.verify(client, model="claude-haiku-5-5", tool_version=None, prompt="P",
+                  budget_s=12.0, clock=clock)
+    assert r["outcome"] == "ok" and r["searched"] is False
+    assert "tools" not in client.requests[0]
+    assert r["latency_ms"] == 2000
+
+
+def test_draft_without_text_is_failed():
+    clock = Clock()
+    client = FakeClient(clock, {("claude-haiku-5-5", None): [
+        response(blocks=[], text=None, u=usage(searches=0))]})
+    r = cv.verify(client, model="claude-haiku-5-5", tool_version=None, prompt="P",
+                  clock=clock)
+    assert r["outcome"] == "failed"
+
+
+def test_results_without_text_is_failed_not_an_empty_answer():
+    clock = Clock()
+    key = ("claude-sonnet-5-5", "web_search_20260209")
+    client = FakeClient(clock, {key: [response(blocks=[results_block(3)], text=None)]})
+    r = _verify(client, clock)
+    assert r["outcome"] == "failed" and r["searched"] is True and r["text"] == ""
+
+
+def test_parse_keeps_result_urls():
+    p = cv.parse(response(blocks=[results_block(2)]))
+    assert p["result_urls"] == ["https://ex0.govt.nz/p", "https://ex1.govt.nz/p"]
 
 
 # ---------------------------------------------------------- Task 2: ledger

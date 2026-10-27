@@ -27,15 +27,18 @@ USER_LOCATION = {"type": "approximate", "country": "NZ", "timezone": "Pacific/Au
 
 def build_request(model, tool_version, prompt, max_uses=MAX_USES):
     """kwargs for `client.messages.create`, without `timeout`. No `thinking`
-    field: `{type: disabled}` is a 400 on Sonnet 5.5."""
-    return {
+    field: `{type: disabled}` is a 400 on Sonnet 5.5. `tool_version=None` is a
+    draft: no tools at all."""
+    req = {
         "model": model,
         "max_tokens": MAX_TOKENS,
         "output_config": {"effort": "low"},
-        "tools": [{"type": tool_version, "name": "web_search", "max_uses": max_uses,
-                   "user_location": dict(USER_LOCATION)}],
         "messages": [{"role": "user", "content": prompt}],
     }
+    if tool_version:
+        req["tools"] = [{"type": tool_version, "name": "web_search", "max_uses": max_uses,
+                         "user_location": dict(USER_LOCATION)}]
+    return req
 
 
 def _get(obj, name, default=None):
@@ -46,7 +49,7 @@ def _get(obj, name, default=None):
 
 def parse(response):
     """The numbers (and the text) of one response."""
-    text, results, error_code, urls = [], 0, None, set()
+    text, results, error_code, urls = [], 0, None, []
     for block in _get(response, "content", None) or []:
         kind = _get(block, "type")
         if kind == "text":
@@ -57,8 +60,8 @@ def parse(response):
                 for r in content:
                     if _get(r, "type") == "web_search_result":
                         results += 1
-                        if _get(r, "url"):
-                            urls.add(_get(r, "url"))
+                        if _get(r, "url") and _get(r, "url") not in urls:
+                            urls.append(_get(r, "url"))
             else:
                 error_code = _get(content, "error_code") or "unknown_error"
     u = _get(response, "usage")
@@ -68,6 +71,7 @@ def parse(response):
         "searched": results > 0,
         "result_count": results,
         "source_count": len(urls),
+        "result_urls": urls,
         "error_code": error_code,
         "stop_reason": _get(response, "stop_reason"),
         "input_tokens": int(_get(u, "input_tokens", 0) or 0),
@@ -87,13 +91,14 @@ def _classify(exc):
 
 def verify(client, *, model, tool_version, prompt, budget_s=14.0, clock=time.monotonic,
            max_uses=MAX_USES):
-    """One verify: a call, at most one `pause_turn` continuation. Never raises."""
+    """One verify: a call, at most one `pause_turn` continuation. Never raises.
+    With `tool_version=None` it is a draft (no tool): text alone is `ok`."""
     request = build_request(model, tool_version, prompt, max_uses)
     started = clock()
     total = {"input_tokens": 0, "output_tokens": 0, "search_requests": 0}
     out = {"text": "", "searched": False, "result_count": 0, "source_count": 0,
            "error_code": None, "stop_reason": None, "continuation": False,
-           "http_status": None, "outcome": "failed"}
+           "http_status": None, "outcome": "failed", "result_urls": []}
     calls = 0
     while True:
         left = budget_s - (clock() - started)
@@ -113,6 +118,7 @@ def verify(client, *, model, tool_version, prompt, budget_s=14.0, clock=time.mon
         out.update({k: p[k] for k in ("text", "stop_reason", "error_code")})
         out["result_count"] += p["result_count"]
         out["source_count"] = max(out["source_count"], p["source_count"])
+        out["result_urls"] += [u for u in p["result_urls"] if u not in out["result_urls"]]
         out["searched"] = out["searched"] or p["searched"]
         if p["stop_reason"] == "pause_turn":
             if calls >= 2:
@@ -125,6 +131,9 @@ def verify(client, *, model, tool_version, prompt, budget_s=14.0, clock=time.mon
             continue
         if p["stop_reason"] in ("refusal", "max_tokens"):
             out["outcome"] = p["stop_reason"]
+        elif tool_version is None:
+            # A draft: no tool, so text is the answer and searching is not expected.
+            out["outcome"] = "ok" if out["text"] else "failed"
         elif out["searched"] and out["text"]:
             out["outcome"] = "ok"
         elif out["text"] and not out["error_code"] and not total["search_requests"]:
