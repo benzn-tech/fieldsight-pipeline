@@ -5,8 +5,8 @@
 Reads `<out>/inputs/manifest.json` (rb_collect) and candidates.json; renders
 cold from each candidate's snapshot (rb_snapshot), so the live runner never
 touches git. Writes `<out>/prompts/<id>/<key>.txt` and `<out>/prompts/index.json`
-= {id: {key: {sha256, task, n}}} (`n` = n_segments / n_transcripts, for the
-answer budget). Keys: X / T = session_base, R = <folder>_<date>.
+= {id: {key: {sha256, task, n, chars}}} (`n` = n_segments / n_transcripts,
+for the answer budget; `chars` for the $ upper). Keys: X / T = session_base, R = <folder>_<date>.
 
   X  every X candidate x every session (set and held-out); X-0901 without
      speaker names; the others with the session's `speaker_names` rows when
@@ -104,7 +104,7 @@ def run(candidates, manifest, out, cache=None, tasks=("X", "T", "R"), r_template
     def put(cid, key, task, n, prompt):
         rb_common.write_text(os.path.join(out, "prompts", cid, key + ".txt"), prompt)
         index.setdefault(cid, {})[key] = {"sha256": rb_common.sha256_text(prompt),
-                                          "task": task, "n": n}
+                                          "task": task, "n": n, "chars": len(prompt)}
 
     for cid, c in sorted(candidates.items()):
         if c["task"] == "X" and "X" in tasks:
