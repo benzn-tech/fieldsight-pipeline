@@ -106,6 +106,12 @@ def plan(cells, reps=REPS, *, items=5, price_per_1000=0.0):
     return p
 
 
+def unconfirmed_tune(path):
+    with open(path, encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f if line.strip()]
+    return [r["id"] for r in rows if r["split"] == "tune" and r.get("confirmed") is not True]
+
+
 def validate(argv, env, repo_root=REPO):
     ap = argparse.ArgumentParser(prog="matrix")
     ap.add_argument("--out", required=True)
@@ -124,6 +130,10 @@ def validate(argv, env, repo_root=REPO):
         missing = [k for k in stage0.ENV_KEYS if not env.get(k)]
         if missing:
             stage0._refuse("missing environment variable(s): " + ", ".join(missing))
+        # Spec §4.4 gate (2): grades are only as good as the gold they are read against.
+        unconfirmed = unconfirmed_tune(args.set)
+        if unconfirmed:
+            stage0._refuse("tune gold not confirmed: " + ", ".join(unconfirmed))
         upper = plan(round0_cells())["upper"]
         if args.confirm_calls != upper:
             stage0._refuse(f"--confirm-calls must equal the upper bound {upper} "

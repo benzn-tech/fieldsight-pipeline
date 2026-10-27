@@ -4,6 +4,7 @@ Fakes only: no SDK, no network. The modules are loaded by path because the
 directory name has a hyphen.
 """
 import importlib.util
+import json
 import os
 import sys
 
@@ -871,3 +872,15 @@ def test_spot_check_sheet_is_blind():
     ids = {line.split("|")[1].strip() for line in table}
     cells = {r["cell"] for r in _sheet_rows() if r["run_id"] in ids}
     assert len(cells) == 4
+
+
+def test_live_matrix_refuses_unconfirmed_tune_gold(tmp_path):
+    rows = [{"id": f"t{i}", "split": "tune", "question": "q", "confirmed": i != 3}
+            for i in range(1, 6)]
+    gold = tmp_path / "set.jsonl"
+    gold.write_text("".join(json.dumps(r) + chr(10) for r in rows), encoding="utf-8")
+    assert matrix.unconfirmed_tune(str(gold)) == ["t3"]
+    with pytest.raises(SystemExit):
+        matrix.validate(_m_argv(tmp_path / "o", "--confirm-calls", "495", "--set", str(gold)),
+                        KEYS, REPO)
+    assert matrix.validate(_m_argv(tmp_path / "o", "--dry-run", "--set", str(gold)), {}, REPO)
