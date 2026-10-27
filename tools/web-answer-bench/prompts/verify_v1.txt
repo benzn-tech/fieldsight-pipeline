@@ -1,0 +1,9 @@
+A colleague answered the question below from memory. Search the open web
+to check it. Keep what the sources confirm, correct what they contradict (citing
+the source), and mark anything still unconfirmed as [unverified]. Be brief.
+
+## Question
+{question}
+
+## Colleague's answer
+{draft}
