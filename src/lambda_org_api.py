@@ -223,7 +223,9 @@ ALLOWED_MEMBERSHIP_ROLES = {"pm", "site_manager", "worker"}
 ALLOWED_OBSERVATION_KINDS = {"safety", "quality"}
 ALLOWED_RISK_LEVELS = {"low", "medium", "high"}
 ALLOWED_OBSERVATION_STATUS = {"open", "closed"}
-ALLOWED_ACTION_STATUS = {"open", "in_progress", "blocked", "done"}
+# `done` = the work was done. `closed` = it no longer needs doing (cancelled,
+# superseded, duplicate) -- finished, but NOT a completion (owner, 2026-10-27).
+ALLOWED_ACTION_STATUS = {"open", "in_progress", "blocked", "done", "closed"}
 ALLOWED_ACTION_PRIORITY = {"low", "medium", "high"}
 RECORDING_KINDS = {"video", "audio", "photo"}
 # What a client may SAY it is on /upload-url. 'device' is never claimed in the
@@ -7485,19 +7487,33 @@ def get_action_closures(conn, caller, event):
     prev_start = prev_end - timedelta(days=span - 1)
 
     cross = is_cross_company(caller["global_role"])
+    reach = _allowed_site_ids(conn, caller)
+    company_id = None if cross else caller["company_id"]
     counts = content_edits.count_action_closures_by_day(
-        conn, _allowed_site_ids(conn, caller), prev_start, end,
-        company_id=None if cross else caller["company_id"])
+        conn, reach, prev_start, end, company_id=company_id)
+    # `closed` in this response predates the `closed` STATUS and means "ticked
+    # done" -- the dashboard reads it, so it keeps that meaning. Items set to the
+    # `closed` status (no longer needed) are counted beside it as `not_needed`,
+    # never added in: cancelling half the list is not a productive week.
+    dropped = content_edits.count_action_closures_by_day(
+        conn, reach, prev_start, end, company_id=company_id,
+        status=content_edits.NO_LONGER_NEEDED_STATUS)
 
     days = _day_series(counts, start, end)
     prev_days = _day_series(counts, prev_start, prev_end)
+    dropped_days = _day_series(dropped, start, end)
+    prev_dropped = _day_series(dropped, prev_start, prev_end)
+    for day, d in zip(days, dropped_days):
+        day["not_needed"] = d["closed"]
     return ok({
         "from": start.isoformat(), "to": end.isoformat(),
         "timezone": content_edits.CLOSURE_TZ,
         "closed": sum(d["closed"] for d in days),
+        "not_needed": sum(d["closed"] for d in dropped_days),
         "by_day": days,
         "previous": {"from": prev_start.isoformat(), "to": prev_end.isoformat(),
-                     "closed": sum(d["closed"] for d in prev_days)},
+                     "closed": sum(d["closed"] for d in prev_days),
+                     "not_needed": sum(d["closed"] for d in prev_dropped)},
     })
 
 
@@ -10483,6 +10499,8 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None,
             meta["recordings_processed"] = stats["sessions"]
         if stats["duration_s"] > 0:
             meta["duration_seconds"] = stats["duration_s"]
+    closures = _report_closures(conn, rows, date, None if all_companies else company_id) \
+        if conn is not None and company_id is not None else None
     shaped = {
         "report_date": date,
         # `rows` can be empty here (see the alias load above): no row, no site.
@@ -10499,6 +10517,8 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None,
         "_report_metadata": meta,
         "topics": topics_out,
     }
+    if closures is not None:
+        shaped["closures"] = closures
 
     # The reader's shape, built by the SAME function the lake reports use.
     #
@@ -10516,6 +10536,34 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None,
         logger.exception("sections could not be built for %s %s", folder, date)
         shaped["sections"] = []
     return shaped
+
+
+_CLOSURES_WEEK_DAYS = 7
+
+
+def _report_closures(conn, rows, date, company_id):
+    """The action items finished (done or closed) in the seven days ending on
+    `date`, for report_sections' "Closed today" / "Closed this week".
+
+    Bounded by the rows the caller was already allowed to render: their sites
+    and their authors. A day report is one person's (plus meeting rows merged
+    into it), so the trace is what happened to THAT list -- never the words of
+    every recording on the site, which a site-clipped or graded reader may not
+    be cleared to open.
+
+    Never fatal, like the sections it feeds: None (no sections) on any error."""
+    site_ids = sorted({str(r["site_id"]) for r in rows if r.get("site_id")})
+    author_ids = sorted({str(r["user_id"]) for r in rows if r.get("user_id")})
+    end = _parse_iso_date(date)
+    if not site_ids or not author_ids or end is None:
+        return None
+    try:
+        return content_edits.list_action_finishes(
+            conn, site_ids, end - timedelta(days=_CLOSURES_WEEK_DAYS - 1), end,
+            company_id=company_id, author_ids=author_ids)
+    except Exception:  # noqa: BLE001
+        logger.exception("closures could not be read for %s", date)
+        return None
 
 
 def _day_has_deleted_sources(conn, folder, date) -> bool:
@@ -11369,7 +11417,8 @@ def _session_title(srows, site_name):
         # max() keeps the FIRST element on ties, and `titled` preserves
         # appearance order, so the earliest-appearing top-action topic wins.
         lead = max(titled, key=lambda r: sum(
-            1 for a in (r.get("action_items") or []) if a.get("status") == "open"))
+            1 for a in (r.get("action_items") or [])
+            if a.get("status") not in content_edits.FINISHED_STATUSES))
         return lead["title"].strip()
     n = len(srows)
     return f"{n} topic{'' if n == 1 else 's'} · {site_name or 'site'}"
@@ -11423,7 +11472,7 @@ def build_day_sessions(conn, caller, folder, date, rows):
             "title": _session_title(srows, site_name),   # cosmetic label (T1)
             "topic_count": len(srows),
             "open_action_count": sum(1 for r in srows for a in r["action_items"]
-                                     if a["status"] == "open"),
+                                     if a["status"] not in content_edits.FINISHED_STATUSES),
             "participants": _session_participants(srows),
             "topic_row_ids": [str(r["id"]) for r in srows],   # the export's scope handle
             # ONE rule, shared with the confirmation email (session_scope.format_time_range):
