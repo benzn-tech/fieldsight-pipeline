@@ -9,6 +9,11 @@ OWNER DECISION 2026-10-27 (A): folder `Ben_Lin` has no users row. Its rows go to
   * rows of any OTHER company (the 9 Southbase rows)   -> untouched, not counted as a change
   * rows with company NULL for another reason (e.g. split_day) -> untouched, reported
 
+--claim-only (owner, 2026-10-27): change ONLY the company-NULL 'unresolved' rows. Rows the
+resolver already gave the target's company keep their user (608 of Ben_Lin's are
+Ben_Lin_admin's per recordings/meeting_session; re-labelling them would make the index
+disagree with those tables). The flag is recorded in the manifest and --apply must repeat it.
+
 `reason = 'operator'` records that a person decided this. migration 0087 has no CHECK on
 reason (only on source, which is left alone), lake_owner.REASONS is not read by any code
 path, and repositories.lake_objects skips every later upsert onto an 'operator' row, so a
@@ -68,7 +73,9 @@ def plan_reassign(rows, target_user_id, target_company_id):
     return out
 
 
-def change_set(plan):
+def change_set(plan, claim_only=False):
+    if claim_only:
+        return list(plan["claim"])
     return plan["claim"] + plan["set_user"] + plan["pin_only"]
 
 
@@ -137,10 +144,10 @@ def run_dry(db, args, log):
                      rx=common.folder_segment_regex([args.from_folder]), f=args.from_folder)[0]["n"]
     manifest = {"op": "reassign_folder", "created_at": common.now_iso(), "database": args.database,
                 "from_folder": args.from_folder, "to_folder": args.to_folder,
-                "target": tgt, "summary": summarise(plan),
+                "target": tgt, "claim_only": bool(args.claim_only), "summary": summarise(plan),
                 "rows_with_folder_segment_but_other_folder_column": stray,
-                "before": change_set(plan),
-                "fingerprint": fingerprint(change_set(plan))}
+                "before": change_set(plan, args.claim_only),
+                "fingerprint": fingerprint(change_set(plan, args.claim_only))}
     log("dry_run", target=tgt["id"], company=tgt["company"], live_rows=len(rows),
         changes=len(manifest["before"]))
     return manifest
@@ -151,11 +158,13 @@ def run_apply(db, args, log):
     if (m.get("op"), m.get("database"), m.get("from_folder"), m.get("to_folder")) != \
             ("reassign_folder", args.database, args.from_folder, args.to_folder):
         raise SystemExit("manifest does not match these arguments")
+    if bool(m.get("claim_only")) != bool(args.claim_only):
+        raise SystemExit("--claim-only differs from the dry run's manifest")
     tgt = load_state(db, args)
     if tgt["id"] != m["target"]["id"] or tgt["company_id"] != m["target"]["company_id"]:
         raise SystemExit("target account changed since the dry run")
     rows = folder_rows(db, args.from_folder, lock=True)
-    todo = change_set(plan_reassign(rows, tgt["id"], tgt["company_id"]))
+    todo = change_set(plan_reassign(rows, tgt["id"], tgt["company_id"]), args.claim_only)
     if [list(x) for x in fingerprint(todo)] != [list(x) for x in m["fingerprint"]]:
         raise SystemExit("rows changed since the dry run; nothing written. Run a new dry run.")
     keys = [r["s3_key"] for r in todo]
@@ -220,6 +229,8 @@ def main(argv=None):
     ap.add_argument("--manifest", help="--apply: the dry run's manifest")
     ap.add_argument("--rollback", help="restore the `before` rows of this manifest")
     ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--claim-only", action="store_true",
+                    help="change only company-NULL 'unresolved' rows; keep every resolved row as is")
     ap.add_argument("--log", help="JSONL action log (appended)")
     args = ap.parse_args(argv)
     if common.refuse_prod_without_flag(args.database, args.allow_prod):
