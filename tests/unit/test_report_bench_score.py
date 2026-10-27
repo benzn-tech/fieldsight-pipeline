@@ -151,3 +151,36 @@ def test_verdict_tables_are_per_phase(tmp_path):
     common.write_json(os.path.join(out, "gold", "verdicts_pilot_s.json"), {"a": 1})
     common.write_json(os.path.join(out, "gold", "verdicts_round0_s.json"), {"b": 2})
     assert score._verdict_tables(out, "round0") == {"b": 2}
+
+
+def test_verdicts_do_not_leak_across_sessions(tmp_path):
+    common = _load("rb_common")
+    out = str(tmp_path)
+    common.write_json(os.path.join(out, "inputs", "manifest.json"),
+                      {"s1": {"folder": "F", "date": "D", "role": "set"},
+                       "s2": {"folder": "F", "date": "E", "role": "set"}, "R": {}})
+    g = {"schema": "report-bench-gold/v1", "items": [
+        {"id": "g1", "kind": "action", "what": "Clear the drainage channel", "label": "true"}]}
+    ans = '{"topics": [{"action_items": [{"action": "Paint the fence"}]}]}'
+    for sess in ("s1", "s2"):
+        common.write_json(os.path.join(out, "gold", f"gold_{sess}.json"), dict(g, session=sess))
+        tp = os.path.join(out, "answers", sess + ".txt")
+        common.write_text(tp, ans)
+        common.append_jsonl(os.path.join(out, "runs", "round0.jsonl"), {
+            "key": f"round0|X|X-cur|muse|{sess}|1", "task": "X", "candidate": "X-cur",
+            "model": "muse", "session": sess, "rep": 1, "outcome": "ok",
+            "attempts": [{"latency_ms": 1}], "usd": 0.0, "text_path": tp,
+            "prompt_path": "none.txt"})
+    # The owner judges "Paint the fence" on s1 only.
+    gm = gold_mod
+    gold1 = gm.load_gold(os.path.join(out, "gold", "gold_s1.json"))
+    pool = gm.adjudication_pool([{"cell": "X|X-cur|muse", "rep": 1, "items": [
+        {"kind": "action", "text": "Paint the fence"}]}], gold1)
+    new, table = gm.apply_adjudication(gold1, pool, {pool[0]["pid"]: "fabricated"})
+    assert all(k.startswith("s1|") for k in table)
+    assert all(i["id"].startswith(("g", "adj-s1-")) for i in new["items"])
+    common.write_json(os.path.join(out, "gold", "verdicts_round0_s1.json"), table)
+    res = score.score_phase(out, "round0")["X|X-cur|muse"]["sessions"]
+    assert res["s1"]["reps"][0]["fabricated"] == 1
+    assert res["s2"]["reps"][0]["fabricated"] == 0
+    assert res["s2"]["reps"][0]["unadjudicated"] == 1

@@ -247,10 +247,12 @@ def adjudicate_page(scope_id: str, turns: list, pool: list, out: str) -> str:
 
 def apply_adjudication(gold: dict, pool: list, verdicts: dict) -> tuple:
     """(gold with adjudicated-true items added, verdict table). The table maps
-    "<cell>|<rep>|<idx>" -> {verdict, gold_id}; verdict is "match" for a
+    "<scope>|<cell>|<rep>|<idx>" -> {verdict, gold_id} (scope = gold["session"]:
+    the same cell / rep / index on another session is a different item); verdict is "match" for a
     confirmed loose match or an adjudicated true item, else misread /
     fabricated. Rows with no verdict are left out (still unadjudicated)."""
     new = json.loads(json.dumps(gold))
+    scope = gold["session"]
     table = {}
     for r in pool:
         v = verdicts.get(r["pid"])
@@ -259,7 +261,7 @@ def apply_adjudication(gold: dict, pool: list, verdicts: dict) -> tuple:
         if v == "confirm" and r.get("gold_id"):
             entry = {"verdict": "match", "gold_id": r["gold_id"]}
         elif v == "true":
-            gid = "adj-" + r["pid"]
+            gid = f"adj-{scope}-{r['pid']}"
             if gid not in {i["id"] for i in new["items"]}:
                 new["items"].append({"id": gid, "kind": r["kind"], "what": r["text"],
                                      "responsible": "", "due": "", "label": "true",
@@ -270,7 +272,7 @@ def apply_adjudication(gold: dict, pool: list, verdicts: dict) -> tuple:
         else:
             raise ValueError(f"{r['pid']}: verdict {v!r}")
         for m in r["members"]:
-            table[f"{m['cell']}|{m['rep']}|{m['idx']}"] = entry
+            table[f"{scope}|{m['cell']}|{m['rep']}|{m['idx']}"] = entry
     return new, table
 
 

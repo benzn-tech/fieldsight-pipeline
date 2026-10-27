@@ -265,7 +265,7 @@ def score_phase(out, phase):
                 if os.path.exists(pin):
                     input_items = rb_gold.items_from_parsed("X", rb_common.read_json(pin))
             m.update(against_gold(items, gold, verdicts, task,
-                                  f"{task}|{r['candidate']}|{r['model']}|{r['rep']}",
+                                  f"{sess}|{task}|{r['candidate']}|{r['model']}|{r['rep']}",
                                   input_items=input_items, text=text))
         cells[f"{task}|{r['candidate']}|{r['model']}"][sess].append(m)
     result = {}

@@ -122,8 +122,8 @@ def test_apply_adjudication():
                                                          by["Fly to Mars"]: "fabricated"})
     added = [i for i in new["items"] if i.get("source") == "adjudicated"]
     assert len(added) == 1 and added[0]["what"] == "Paint the fence"
-    assert table["c|1|0"] == {"verdict": "match", "gold_id": added[0]["id"]}
-    assert table["c|1|1"]["verdict"] == "fabricated"
+    assert table["s|c|1|0"] == {"verdict": "match", "gold_id": added[0]["id"]}
+    assert table["s|c|1|1"]["verdict"] == "fabricated"
 
 
 def test_load_gold_rejects_duplicate_ids(tmp_path):
@@ -171,4 +171,4 @@ def test_loose_match_goes_to_the_owner():
     assert len(pool) == 1
     assert pool[0]["gold_id"] == "g1" and 0.4 <= pool[0]["sim"] < 0.6
     new, table = gold.apply_adjudication(_gold(), pool, {pool[0]["pid"]: "confirm"})
-    assert table["c|1|0"] == {"verdict": "match", "gold_id": "g1"}
+    assert table["s|c|1|0"] == {"verdict": "match", "gold_id": "g1"}
