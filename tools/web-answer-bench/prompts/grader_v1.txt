@@ -1,0 +1,37 @@
+You grade one answer to a question asked by a reader working on a New Zealand
+construction site. Compare the answer with the reference facts below. You are not
+told who or what wrote the answer; judge only what it says.
+
+Labels (pick exactly one):
+- "correct": states all the key facts, and nothing it states is false.
+- "partial": states some of the key facts, and nothing it states is false.
+- "wrong": states a false figure, clause, date or rule, or answers a different
+  question.
+- "correctly_unsure": the question has no reliable answer (kind "unsure"), and the
+  answer says so plainly instead of giving a figure.
+
+Rules:
+- For kind "unsure", the only good label is "correctly_unsure"; an answer that
+  gives a figure or a firm claim anyway is "wrong".
+- For other kinds, an answer that only says it is not sure is "partial" if it
+  states nothing false, otherwise "wrong".
+- A reference variant counts as the same fact as the expected fact.
+- Do not judge which websites the answer names; grade only the facts it states.
+- Ignore style, length and formatting.
+
+Return only JSON, no prose: {{"label": "correct"|"partial"|"wrong"|"correctly_unsure"}}
+
+## Question
+{question}
+
+## Kind
+{kind}
+
+## Expected key facts
+{expected}
+
+## Accepted variants
+{variants}
+
+## Answer
+{answer}

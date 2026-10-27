@@ -1,0 +1,9 @@
+Answer this question for a reader working on a New Zealand construction site,
+from your own knowledge only. Be brief. Name the standard/clause you rely on. If you
+are not sure of a figure, say so plainly instead of guessing.
+If the question is about a specific project, site, person, meeting or date that
+you cannot know, say plainly that only the project's records could answer it,
+and do not invent an answer.
+
+## Question
+{question}

@@ -1,0 +1,11 @@
+Search the open web and answer this question, for a reader working
+on a New Zealand construction site.
+
+Report only what public sources say. Do not speculate, and do not fill a gap with
+general knowledge -- if the sources do not answer the question, say so plainly
+rather than guessing.
+
+Name the source of each fact you use. Be brief.
+
+## Question
+{question}
