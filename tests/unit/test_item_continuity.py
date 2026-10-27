@@ -161,6 +161,39 @@ def test_echo_shorter_than_min_four_is_rejected():
     assert c["guard"] == "echo"
 
 
+def test_echo_rejection_records_the_echo_and_why():
+    prior = ic.prior_items(_prev(action_items=[{"action": "Book the crane for Tuesday morning"}]))
+    new = _new(action_items=[{"action": "Crane booked", "continues": _claim("A1", "Order the crane now")}])
+    [c] = ic.resolve(new, prior)
+    assert c["echo"] == {"starts": "Order the crane now", "reason": "mismatch", "echo_tokens": 4,
+                         "target_tokens": 6, "prefix_match": 0, "collides_with": None}
+
+
+def test_echo_rejection_names_the_sibling_that_shares_the_prefix():
+    prior = ic.prior_items(_prev(action_items=[
+        {"action": "Door delivery level 3 on Monday"}, {"action": "Door delivery level 3 on Tuesday"}]))
+    new = _new(action_items=[{"action": "Level 3 doors arrive Monday",
+                               "continues": _claim("A1", "Door delivery level 3 on")}])
+    [c] = ic.resolve(new, prior)
+    assert c["echo"]["reason"] == "ambiguous" and c["echo"]["collides_with"] == "A2"
+    assert c["echo"]["prefix_match"] == 5
+
+
+def test_echo_too_short_and_long_starts_are_bounded():
+    prior = ic.prior_items(_prev(action_items=[{"action": "Book the crane for Tuesday morning"}]))
+    [c] = ic.resolve(_new(action_items=[{"action": "x", "continues": _claim("A1", "Book the")}]), prior)
+    assert c["echo"]["reason"] == "too_short"
+    [c] = ic.resolve(_new(action_items=[{"action": "x", "continues": _claim("A1", "z" * 500)}]), prior)
+    assert len(c["echo"]["starts"]) == ic.ECHO_LOG_CHARS
+
+
+def test_only_echo_rejections_carry_an_echo_record():
+    prior = ic.prior_items(_prev(action_items=[{"action": "Call electrician"}]))
+    [c] = ic.resolve(_new(action_items=[{"action": "Ring the sparky",
+                                         "continues": _claim("A1", "call electrician")}]), prior)
+    assert "echo" not in c
+
+
 def test_two_claims_on_one_alias_are_both_rejected():
     prior = ic.prior_items(_prev(action_items=[{"action": "Book the crane for Tuesday"}]))
     new = _new(action_items=[

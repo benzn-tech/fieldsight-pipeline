@@ -30,6 +30,7 @@ KINDS = {
 }
 PRIOR_CAP_PER_KIND = 40
 MIN_ECHO_TOKENS = 4
+ECHO_LOG_CHARS = 120   # cap on the `starts` text kept for a rejected echo (diagnosis only)
 PriorItem = namedtuple("PriorItem", "alias list_name text item_id")
 
 _OPEN, _CLOSE = "<<<PRIOR_ITEMS>>>", "<<<END_PRIOR_ITEMS>>>"
@@ -149,13 +150,27 @@ def _claim_record(alias, prior_item_id, new_item_id, outcome, guard, list_name):
             "outcome": outcome, "guard": guard, "list_name": list_name}
 
 
-def _echo_ok(starts, target, prior_same_kind):
+def _echo_failure(starts, target, prior_same_kind):
+    """None when the echo passes; otherwise why it failed, for the claim record. The `starts`
+    text is kept (capped) because without it a rejected echo cannot be diagnosed afterwards."""
     echo = tokens(starts)
     tgt = tokens(target.text)
-    if not echo or len(echo) < min(MIN_ECHO_TOKENS, len(tgt)) or tgt[:len(echo)] != echo:
-        return False
-    return not any(p.alias != target.alias and tokens(p.text)[:len(echo)] == echo
-                   for p in prior_same_kind)
+    prefix = next((n for n, (a, b) in enumerate(zip(echo, tgt)) if a != b), min(len(echo), len(tgt)))
+    collides = None
+    if not echo:
+        reason = "empty"
+    elif len(echo) < min(MIN_ECHO_TOKENS, len(tgt)):
+        reason = "too_short"
+    elif tgt[:len(echo)] != echo:
+        reason = "mismatch"
+    else:
+        collides = next((p.alias for p in prior_same_kind
+                         if p.alias != target.alias and tokens(p.text)[:len(echo)] == echo), None)
+        if collides is None:
+            return None
+        reason = "ambiguous"
+    return {"starts": starts[:ECHO_LOG_CHARS], "reason": reason, "echo_tokens": len(echo),
+            "target_tokens": len(tgt), "prefix_match": prefix, "collides_with": collides}
 
 
 def assign_fresh_ids(topics):
@@ -188,6 +203,7 @@ def resolve(topics, prior):
 
     # 2. validate claims
     verdicts = {}      # i -> (alias, guard or None)
+    echo_failures = {}  # i -> _echo_failure() record, for echo rejections only
     for i, (ln, ch, claim) in enumerate(raw):
         if claim is None:
             continue
@@ -206,9 +222,10 @@ def resolve(topics, prior):
             verdicts[i] = (alias, "kind")
         elif alias in exact_prior:
             verdicts[i] = (alias, "prior_exact_matched")
-        elif not _echo_ok(claim["starts"], target,
-                           [p for p in prior if p.list_name == ln]):
+        elif (failure := _echo_failure(claim["starts"], target,
+                                       [p for p in prior if p.list_name == ln])) is not None:
             verdicts[i] = (alias, "echo")
+            echo_failures[i] = failure
         else:
             verdicts[i] = (alias, None)
     passing = {}
@@ -232,8 +249,11 @@ def resolve(topics, prior):
         if i in verdicts:
             alias, guard = verdicts[i]
             target = by_alias.get(alias) if alias else None
-            claims.append(_claim_record(alias, target.item_id if target else None, ch["item_id"],
-                                         "accepted" if guard is None else "rejected", guard, ln))
+            record = _claim_record(alias, target.item_id if target else None, ch["item_id"],
+                                   "accepted" if guard is None else "rejected", guard, ln)
+            if i in echo_failures:
+                record["echo"] = echo_failures[i]
+            claims.append(record)
     return claims
 
 
