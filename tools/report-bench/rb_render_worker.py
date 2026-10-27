@@ -26,6 +26,10 @@ still renders and never raises TypeError:
      did; e4e2ea19 has no report_facts and sends the whole plan).
      action_items = inputs["action_items"] when given, else the snapshot's
      lambda_session_report._action_items_for_prompt(content[, offer][, date]).
+     topics = the snapshot's lambda_session_report._offered_topics(artifact, 0,
+     day 00:00, day 23:59) when inputs carry `artifact` ({folder, date,
+     content}): f2191232+ adds each topic's content ("the record", #997), so
+     the T-1001 vs T-cur difference lives there, not in render_prompt.
   R  lambda_report_generator.build_daily_prompt(**filtered inputs) with the
      served S3 template injected as `_prompt_templates_cache`.
 """
@@ -70,16 +74,31 @@ def _template(inputs):
     return split(template)[0] if split else template
 
 
+def _offer(inputs):
+    """The snapshot's own topic offer for a whole-day window (no photographs:
+    the bench sends none, so nothing is fetched)."""
+    if "artifact" not in inputs:
+        return inputs.get("topics")
+    import datetime
+    import lambda_session_report as lsr
+    day = datetime.datetime.strptime(inputs["scope"]["date"], "%Y-%m-%d")
+    fn = lsr._offered_topics
+    kw = {"artifact": inputs["artifact"], "budget": 0, "win_from": day,
+          "win_to": day + datetime.timedelta(hours=23, minutes=59)}
+    return _first(fn(**_filtered(fn, kw)))
+
+
 def render_t(inputs):
     import report_template as rt
     template = _template(inputs)
-    topics = inputs.get("topics")
+    topics = _offer(inputs)
     if "action_items" in inputs:
         actions = inputs["action_items"]
     else:
         import lambda_session_report as lsr
         fn = lsr._action_items_for_prompt
-        actions = fn(**_filtered(fn, {"content": inputs["content"], "offer": topics,
+        content = (inputs.get("artifact") or {}).get("content") or inputs.get("content")
+        actions = fn(**_filtered(fn, {"content": content, "offer": topics,
                                       "date": inputs["scope"]["date"]}))
     kw = {"template": template, "scope": inputs["scope"], "action_items": actions,
           "transcript": inputs["transcript"], "source": rt.SOURCE_BUILTIN, "topics": topics}

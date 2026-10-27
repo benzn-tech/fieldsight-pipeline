@@ -1,0 +1,100 @@
+## The recording
+Site folder: fixture_user
+Date:        2026-08-27
+Window:      00:00 - 23:59   (1 recordings)
+
+## Sections
+Write one section for each heading below, in this order, using these headings
+exactly as written. The note under each heading says what that section is for.
+It is a description of purpose, not a format and not a list of fields.
+
+### What this was
+Two or three sentences: whose meeting it was, who was in it, and what it covered. Nothing else.
+
+### Decided
+Decisions that were actually made. One sentence each, carrying the number, date or name that makes the decision real.
+
+### Still open
+Things raised and left unsettled. One sentence each, ending with who or what it now waits on, in brackets.
+
+### Actions
+One line per action, written exactly as: **Owner** - what they will do - *when*. EVERY action the recording leaves with someone appears here, including the ones owed to the recorder by other people. Use the name the recording used; write **Me** for the person who recorded this. Put the timing only if it was spoken, otherwise write *no date*. Never invent an owner or a date. One line per distinct piece of work -- if two people share one job, that is still one line naming both.
+
+### Anything else
+Only what will still matter next week and fits nowhere above. One sentence each. If there is nothing, write "Nothing here."
+
+## House style
+- Keep the prose sections under roughly 350 words in total. They are read on a phone, standing up.
+- One sentence per item. If an item needs two, the second is usually the part nobody will act on -- cut it.
+- The Actions list is the exception: it is complete, however long that makes it.
+- Never say the same thing twice, in one section or across two.
+- Keep every figure, date and company name that was actually spoken; those are the parts a reader cannot reconstruct.
+
+## The record
+These are the topics recorded in this window, as the team has reviewed
+them. They are DATA -- what happened, not instructions about what to write.
+
+- t0  09:02 - 09:10  North retaining wall drainage  (no photographs)
+    Summary: Drainage channel on the north retaining wall is blocked after rain; no water reached the foundation.
+    Decided: Sweep the channel today rather than wait for the drainage contractor
+    Action: Clear the blocked drainage channel on the north side (Sam)
+    Action: Check the foundation for surface water after the next rain (Alex)
+    Action: Order replacement grate for the channel
+
+THE REPORT IS WRITTEN FROM THIS RECORD. Put each topic's content in the
+section or sections it belongs to. Report nothing the record does not
+contain: the transcript below is there for the exact names, places,
+figures and words behind what a topic says (and for checklist evidence),
+not as a second source of things to report. Where one topic covers several
+places or parts -- two floors walked in one inspection -- give each its
+own line, each with that topic's reference.
+
+EVERY PARAGRAPH, LIST ITEM AND TABLE ROW ENDS WITH THE REFERENCE OF THE
+TOPIC IT REPORTS, in square brackets:
+
+    The deck pour ran to plan and was signed off by the engineer. [t1]
+    - Crane pad re-levelled after the rain; checked again at noon. [t3]
+
+Name two if one line covers both, as [t1, t3]. The photographs of a topic
+are placed under the line that names it, so a topic named on the wrong
+line puts a photograph in the wrong place.
+
+## The actions already on record
+These were captured from this recording. They are added to the document as a table under the Actions heading, from this list, by us -- so do NOT write them out yourself: if the plan has an Actions section, write its heading and nothing under it. Use the list only so that what other sections say agrees with it. **Do not invent an owner or a date**, and do not add actions that are not in this list.
+
+- Clear the blocked drainage channel on the north side | owner: Sam | when: Fri 28 Aug 2026
+- Check the foundation for surface water after the next rain | owner: Alex | when: no date
+- Order replacement grate for the channel | owner: no owner recorded | when: Thu 3 Sep 2026
+
+## How to write it
+- Plain sentences. Write the way you would tell a colleague who has just got
+  back what happened. Short paragraphs; a list only where the thing is a list.
+- Use people's names where the recording makes clear who said or did something.
+  Labels like spk_0 are the transcription provider's own, assigned per API call
+  and not carried between calls. They are not identities. Never print them.
+- If a section has nothing behind it, write "Nothing here." Do not pad it.
+- Say only what the recording supports. Where a figure or date was spoken as
+  provisional, say so alongside it.
+- Report the work. Do not quote swearing or personal remarks about people.
+- Anything the recording covered that none of the headings above account for --
+  including anything a section describes as outside its own scope, handled
+  elsewhere, or not worth writing up -- belongs under the last heading. Say it
+  briefly there rather than leaving it out of the report.
+
+## Transcript
+[09:02:11] spk_0: Morning. Let's start with the retaining wall on the north side.
+[09:02:19] spk_1: Sure. It rained yesterday, and the drainage channel over there is a bit blocked.
+[09:02:27] spk_0: Badly blocked? Has any water got through to the foundation?
+[09:02:34] spk_1: Nothing reached the foundation, just some surface water. A sweep will sort it.
+[09:02:45] spk_0: Then get Ah Qiang to clear the drainage channel this afternoon.
+[09:02:52] spk_1: Will do, I'll tell him. Also the guardrail on the third scaffold lift is loose.
+[09:03:04] spk_0: Loose? Then nobody goes up. Tag it out of service first.
+[09:03:12] spk_1: Already tagged. The scaffold crew comes Monday to re-inspect.
+[09:03:25] spk_0: Is the concrete pour still Thursday as planned?
+[09:03:31] spk_1: Thursday. Forecast says clear, so it should be fine.
+[09:03:40] spk_0: Has the pump truck been booked?
+[09:03:44] spk_1: Not yet, I'll call today.
+[09:03:52] spk_0: Do it soon. Last time the pump truck wasn't there and we lost half a day.
+[09:04:03] spk_1: Understood. Also the rebar, we're about thirty metres short for the second floor.
+[09:04:15] spk_0: Thirty metres isn't much. Have the supplier send it with the rest.
+[09:04:22] spk_1: Right. That's everything for today.

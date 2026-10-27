@@ -1,0 +1,51 @@
+{
+ "T-0928": {
+  "fixed_sha256": "2f07b97f11daf5f66eda03c614ca6af9669b13ee923c9027c290ce7c6ad838e0",
+  "names": true,
+  "resolved": "e4e2ea19c04e4d08916f924d5444cf2dc92cc995",
+  "sha": "e4e2ea19",
+  "task": "T"
+ },
+ "T-1001": {
+  "fixed_sha256": "9e41bfcc501ec075e4df53b3680d63a6926eb9f55b0656a923354c9eab28c25a",
+  "names": true,
+  "resolved": "751481a31a5d6c1ef2a3c039ca2e8d170689540c",
+  "sha": "751481a3",
+  "task": "T"
+ },
+ "T-cur": {
+  "fixed_sha256": "0176d26fd94f9a4c6b1a7db4bcda973c2083f2f6b1bd339271bdfc9b614779e9",
+  "names": true,
+  "resolved": "78afae49ba5d463cc463951828ea2f4a4dadb300",
+  "sha": "develop",
+  "task": "T"
+ },
+ "X-0901": {
+  "fixed_sha256": "58d6afacae12f40d492f37d1937e4e98b23b4e8f3acb6125a5afe5be4fea297e",
+  "names": false,
+  "resolved": "763b3082daef52a42e707bab3ac78c82fd97adbd",
+  "sha": "763b3082",
+  "task": "X"
+ },
+ "X-0917": {
+  "fixed_sha256": "aa3605d4fce9a95344326af4ad34f07a3eda39e92beaccc206100374ab1df5c5",
+  "names": true,
+  "resolved": "83abd0d49923ebe10fba821b0c90e5ba81e7d8e6",
+  "sha": "83abd0d4",
+  "task": "X"
+ },
+ "X-1005": {
+  "fixed_sha256": "8c967f5d4e4fb4b0599b818a0b8ebfdf8e4737d88e30333d37510564a4833ff8",
+  "names": true,
+  "resolved": "8703e69a320f9ca8362f81245e9f9548a7ba79c3",
+  "sha": "8703e69a",
+  "task": "X"
+ },
+ "X-cur": {
+  "fixed_sha256": "616725b85822356dc70bfb0dfb6b08b502561cedde7c169ec2a575311a805479",
+  "names": true,
+  "resolved": "82036cf2c478413aed576b8941ac3eed90d3eba6",
+  "sha": "82036cf2",
+  "task": "X"
+ }
+}

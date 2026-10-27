@@ -93,40 +93,45 @@
  "scope": {
   "folder": "fixture_user",
   "date": "2026-08-27",
-  "from": "09:00",
-  "to": "09:30",
+  "from": "00:00",
+  "to": "23:59",
   "recordings": 1
  },
- "topics": [
-  {
-   "ref": "t0",
-   "time_range": "09:02-09:10",
-   "title": "North retaining wall drainage",
-   "photos": 0
+ "artifact": {
+  "folder": "fixture_user",
+  "date": "2026-08-27",
+  "content": {
+   "topics": [
+    {
+     "action_items": [
+      {
+       "action": "Clear the blocked drainage channel on the north side",
+       "responsible": "Sam",
+       "deadline": "2026-08-28"
+      },
+      {
+       "action": "Check the foundation for surface water after the next rain",
+       "responsible": "Alex",
+       "deadline": null
+      },
+      {
+       "action": "Order replacement grate for the channel",
+       "responsible": null,
+       "deadline": "next week"
+      }
+     ],
+     "topic_title": "North retaining wall drainage",
+     "time_range": "09:02 - 09:10",
+     "summary": "Drainage channel on the north retaining wall is blocked after rain; no water reached the foundation.",
+     "key_decisions": [
+      "Sweep the channel today rather than wait for the drainage contractor"
+     ],
+     "open_questions": [],
+     "safety_flags": [],
+     "related_photos": []
+    }
+   ],
+   "date": "2026-08-27"
   }
- ],
- "content": {
-  "topics": [
-   {
-    "title": "North retaining wall drainage",
-    "action_items": [
-     {
-      "action": "Clear the blocked drainage channel on the north side",
-      "responsible": "Sam",
-      "deadline": "2026-08-28"
-     },
-     {
-      "action": "Check the foundation for surface water after the next rain",
-      "responsible": "Alex",
-      "deadline": null
-     },
-     {
-      "action": "Order replacement grate for the channel",
-      "responsible": null,
-      "deadline": "next week"
-     }
-    ]
-   }
-  ]
  }
 }
