@@ -90,3 +90,43 @@ def test_sha_is_of_the_file_text():
 def test_unknown_prompt_id_refused():
     with pytest.raises(KeyError):
         prompts.load("../set.v1")
+
+
+# ------------------------------------------------------- Task 2: ledger pools
+
+ledger = _load("ledger")
+
+
+def test_old_format_ledger_counts_as_stage0(tmp_path):
+    p = tmp_path / "anthropic_ledger.json"
+    p.write_text('{"spent_usd": 1.42, "cap_usd": 45.0}', encoding="utf-8")
+    lg = ledger.Ledger(str(p))
+    assert lg.spent == pytest.approx(1.42)
+    assert lg.pool_spent("stage0") == pytest.approx(1.42)
+    assert lg.pool_spent("matrix") == 0.0
+    assert lg.room() == pytest.approx(43.58)
+
+
+def test_matrix_pool_exhaustion_and_persistence(tmp_path):
+    p = str(tmp_path / "anthropic_ledger.json")
+    lg = ledger.Ledger(p)
+    lg.add(1.42)                                  # bare add() is Stage 0's
+    lg.add(17.9, pool="matrix")
+    assert not lg.pool_exhausted("matrix", ledger.MATRIX_POOL_CAP)
+    lg.add(0.2, pool="matrix")
+    assert lg.pool_exhausted("matrix", 18)
+    again = ledger.Ledger(p)
+    assert again.pool_spent("matrix") == pytest.approx(18.1)
+    assert again.pool_spent("stage0") == pytest.approx(1.42)
+    assert again.spent == pytest.approx(19.52)
+    assert again.room() == pytest.approx(45 - 19.52)
+
+
+def test_total_cap_still_45_across_pools(tmp_path):
+    lg = ledger.Ledger(str(tmp_path / "l.json"))
+    lg.add(30.0, pool="matrix")
+    lg.add(14.99, pool="scored")
+    assert not lg.exhausted()
+    lg.add(0.01)
+    assert lg.exhausted()
+    assert (ledger.CAP_USD, ledger.MATRIX_POOL_CAP, ledger.SCORED_RESERVE) == (45.0, 18.0, 23.0)
