@@ -39,7 +39,7 @@ try:
 except ImportError:  # run as `python scripts/prod_lake_delete_folders.py`
     import lake_ops_common as common
 
-PAGE = 500
+PAGE = 200
 MAX_MANIFEST_AGE_H = 24
 DYNAMO = {common.PROD_DATABASE: ["fieldsight-transcripts", "fieldsight-items",
                                  "fieldsight-reports", "fieldsight-users"],

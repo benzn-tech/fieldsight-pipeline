@@ -38,7 +38,7 @@ _COLS = ("s3_key, company_id::text AS company_id, site_id::text AS site_id, "
          "source, reason, object_modified_at::text AS object_modified_at, "
          "created_at::text AS created_at, updated_at::text AS updated_at, "
          "deleted_at::text AS deleted_at")
-PAGE = 500
+PAGE = 200
 
 
 # ---- pure selection logic (unit-tested) ------------------------------------------------
