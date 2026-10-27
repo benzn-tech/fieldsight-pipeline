@@ -751,3 +751,123 @@ def test_grade_live_writes_grades_and_cells_blind_and_reproducible(tmp_path):
     blob = out.getvalue() + (tmp_path / "grades_r0.jsonl").read_text("utf-8") + \
         (tmp_path / "cells_r0.json").read_text("utf-8")
     assert SECRET_A not in blob and SECRET_Q not in blob
+
+
+# ------------------------------------- Task 7: keep rule, freeze, spot-check sheet
+
+sf = _load("select_freeze")
+
+
+def _cell(pid, majors, *, p50=5000, stable=True, step="verify", model="sonnet",
+          kinds=None):
+    return {"step": step, "prompt_id": pid, "model_key": model, "p50_ms": p50,
+            "items": {f"t{i + 1}": {"labels": [m] * 3, "majority": m,
+                                    "stable": stable if isinstance(stable, bool)
+                                    else stable[i],
+                                    "kind": (kinds or {}).get(f"t{i + 1}", "standard")}
+                      for i, m in enumerate(majors)}}
+
+
+def _cells(*cells):
+    return {f"{c['step']}/{c['prompt_id']}/{c['model_key']}": c for c in cells}
+
+
+def test_best_round0_most_good_items():
+    cells = _cells(
+        _cell("verify_v1", ["correct", "correct", "partial", "wrong", "correctly_unsure"]),
+        _cell("verify_v2", ["correct", "correct", "correct", "wrong", "correctly_unsure"]),
+        _cell("verify_v2", ["correct"] * 5, model="haiku"),
+        _cell("web_v1", ["correct"] * 5, step="single"))
+    assert sf.best_round0(cells, "verify", "sonnet") == "verify_v2"
+
+
+def test_best_round0_ties_fewer_wrong_then_faster():
+    a = _cell("verify_v1", ["correct", "correct", "wrong", "partial", "partial"], p50=4000)
+    b = _cell("verify_v2", ["correct", "correct", "partial", "partial", "partial"], p50=9000)
+    assert sf.best_round0(_cells(a, b), "verify", "sonnet") == "verify_v2"
+    c = _cell("verify_v1", ["correct", "correct", "partial", "partial", "partial"], p50=4000)
+    assert sf.best_round0(_cells(c, b), "verify", "sonnet") == "verify_v1"
+    with pytest.raises(KeyError):
+        sf.best_round0(_cells(c), "single", "mimo")
+
+
+def test_keep_edit_branches():
+    inc = _cell("verify_v2", ["correct", "partial", "partial", "wrong", "correctly_unsure"],
+                stable=[True, True, False, True, True])
+    # (a) an item worse -> rejected, even with another better.
+    worse = _cell("sonnet_verify_v3",
+                  ["partial", "correct", "partial", "wrong", "correctly_unsure"])
+    assert sf.keep_edit(inc, worse) is False
+    # (b) nothing better -> rejected.
+    same = _cell("sonnet_verify_v3", ["correct", "partial", "partial", "wrong",
+                                      "correctly_unsure"])
+    assert sf.keep_edit(inc, same) is False
+    # better only where the incumbent was unstable -> rejected (noise).
+    noisy = _cell("sonnet_verify_v3", ["correct", "partial", "correct", "wrong",
+                                       "correctly_unsure"])
+    assert sf.keep_edit(inc, noisy) is False
+    # better on a stable item, nothing worse -> kept.
+    better = _cell("sonnet_verify_v3", ["correct", "correct", "partial", "partial",
+                                        "correctly_unsure"])
+    assert sf.keep_edit(inc, better) is True
+    # an item the edit could not grade is not evidence it is no worse.
+    missing = _cell("sonnet_verify_v3", ["correct", "correct", "partial", "wrong",
+                                         "ungraded"])
+    assert sf.keep_edit(inc, missing) is False
+
+
+def test_write_frozen_entries_and_merge(tmp_path):
+    path = str(tmp_path / "frozen.v1.json")
+    params = sf.params_for("verify", "sonnet")
+    assert params["model"] == "claude-sonnet-5-5" and params["max_uses"] == 3
+    assert params["tool"] == "web_search_20250305"
+    labels = {"t1": "correct", "t2": "partial"}
+    sf.write_frozen(path, [{"step": "verify", "model": "sonnet", "prompt_id": "verify_v2",
+                            "params": params, "round": 0, "tune_labels": labels,
+                            "evidential": True}])
+    data = json.loads(open(path, encoding="utf-8").read())
+    (e,) = data["entries"]
+    assert set(e) == {"step", "model", "prompt_id", "text", "sha256", "params", "round",
+                      "tune_labels", "evidential"}
+    assert e["evidential"] is False                  # winner's curse: never evidence
+    assert e["text"] == prompts.load("verify_v2") and e["sha256"] == prompts.sha("verify_v2")
+    sf.write_frozen(path, [{"step": "draft", "model": "gemini", "prompt_id": "draft_v1",
+                            "params": sf.params_for("draft", "gemini"), "round": 0,
+                            "tune_labels": {}}])
+    data = json.loads(open(path, encoding="utf-8").read())
+    assert {(x["step"], x["model"]) for x in data["entries"]} == \
+        {("verify", "sonnet"), ("draft", "gemini")}
+    g = [x for x in data["entries"] if x["model"] == "gemini"][0]
+    assert g["params"]["provider"] == \
+        corroboration_client.provider_preference("google/gemini-3.8-flash")
+    assert g["params"]["web"] is False and g["params"]["reasoning"] == {"effort": "low"}
+
+
+def _sheet_rows():
+    rows = []
+    for c, model in enumerate(("gemini", "sonnet", "haiku", "deepseek")):
+        for i in range(1, 6):
+            rows.append({"run_id": f"r0-{c * 5 + i:04d}",
+                         "cell": f"verify/verify_v2/{model}",
+                         "question": f"{SECRET_Q}-{i}", "gold": ["GOLD-FACT"],
+                         "answer": f"{SECRET_A} [unverified] https://x.govt.nz/p",
+                         "label": "hallucinated_source", "model_key": model})
+    return rows
+
+
+def test_spot_check_sheet_is_blind():
+    md = sf.spot_check_sheet(_sheet_rows(), n=10, seed=3)
+    table = [l for l in md.splitlines() if l.startswith("| r0-")]
+    assert len(table) == 10
+    for line in table:
+        assert line.rstrip().endswith("|  |")         # blank owner label column
+        for leak in ("hallucinated_source", "gemini", "sonnet", "haiku", "deepseek",
+                     "verify_v2", "[unverified]", "https://"):
+            assert leak not in line
+        assert SECRET_Q in line and "GOLD-FACT" in line
+    assert md == sf.spot_check_sheet(_sheet_rows(), n=10, seed=3)
+    assert md != sf.spot_check_sheet(_sheet_rows(), n=10, seed=4)
+    # Drawn across cells: 10 answers from 4 cells means every cell is in it.
+    ids = {line.split("|")[1].strip() for line in table}
+    cells = {r["cell"] for r in _sheet_rows() if r["run_id"] in ids}
+    assert len(cells) == 4
