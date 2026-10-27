@@ -252,3 +252,43 @@ def test_upsert_many_returns_rows_actually_written(db):
         {"key": "new", "company_id": a["id"], "kind": "media", "source": "upload"},
     ])
     assert n == 1
+
+
+# ---- operator pin (2026-10-27 Ben_Lin -> Ben_Lin_test2 reassignment) ----
+
+def test_operator_row_is_never_rewritten_by_a_later_upsert(db):
+    """R7e covers company only; a re-backfill resolving the SAME company with the resolver's
+    user would otherwise put that user back over an operator's decision."""
+    a, _, s1, _ = _world(db)
+    def user(email, folder):
+        return {"id": db.execute(
+            "INSERT INTO users (company_id, email, global_role, folder_name) "
+            "VALUES (%s, %s, 'worker', %s) RETURNING id", (a["id"], email, folder)).fetchone()[0]}
+    u_resolver = user("resolver@example.com", "Res_Olver")
+    u_owner = user("owner@example.com", "Own_Er")
+    _put(db, "pinned", a["id"], s1["id"], user_id=u_resolver["id"])
+    db.execute("UPDATE lake_objects SET user_id=%s, reason='operator' WHERE s3_key='pinned'",
+               (u_owner["id"],))
+    # same company + different user (what a backfill re-run produces): skipped entirely
+    assert lake_objects.upsert_many(db, [{"key": "pinned", "company_id": a["id"],
+                                          "user_id": u_resolver["id"], "kind": "media",
+                                          "source": "backfill"}]) == 0
+    row = db.execute("SELECT user_id, reason FROM lake_objects WHERE s3_key='pinned'").fetchone()
+    assert row[0] == u_owner["id"] and row[1] == "operator"
+    # a NULL-company write (the resolver's 'unresolved') does not touch it either
+    assert lake_objects.upsert(db, "pinned", company_id=None, kind="media", source="backfill",
+                               reason="unresolved") is True
+    assert _row(db, "pinned")[2] == "operator"
+    # a site move still moves it, and keeps the pin
+    b = companies.create_company(db, "LakeC")
+    assert lake_objects.reassign_site(db, s1["id"], b["id"]) == 1
+    row = _row(db, "pinned")
+    assert row[0] == b["id"] and row[2] == "operator"
+
+
+def test_non_operator_reassign_still_clears_reason(db):
+    a, b, s1, _ = _world(db)
+    lake_objects.upsert(db, "sd", company_id=None, site_id=s1["id"], kind="report",
+                        source="backfill", reason="split_day")
+    assert lake_objects.reassign_site(db, s1["id"], b["id"]) == 1
+    assert _row(db, "sd")[2] is None
