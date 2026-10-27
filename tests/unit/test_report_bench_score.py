@@ -143,3 +143,11 @@ def test_score_phase_end_to_end(tmp_path):
     assert c["failed_sessions"] == 0
     assert c["mean"]["action_recall"] == pytest.approx(2 / 3)
     assert c["noise_floor"]["action_recall"] == 1.0
+
+
+def test_verdict_tables_are_per_phase(tmp_path):
+    common = _load("rb_common")
+    out = str(tmp_path)
+    common.write_json(os.path.join(out, "gold", "verdicts_pilot_s.json"), {"a": 1})
+    common.write_json(os.path.join(out, "gold", "verdicts_round0_s.json"), {"b": 2})
+    assert score._verdict_tables(out, "round0") == {"b": 2}

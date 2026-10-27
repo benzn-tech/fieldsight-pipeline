@@ -228,7 +228,9 @@ def _verdict_tables(out, phase):
     tables = {}
     if os.path.isdir(d):
         for name in os.listdir(d):
-            if name.startswith("verdicts_") and name.endswith(".json"):
+            # A phase's own tables only: verdict keys are cell|rep|idx, and rep 1
+            # of the pilot is a different run from rep 1 of round 0.
+            if name.startswith(f"verdicts_{phase}_") and name.endswith(".json"):
                 tables.update(rb_common.read_json(os.path.join(d, name)))
     return tables
 
