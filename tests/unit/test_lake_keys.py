@@ -75,6 +75,9 @@ CASES = [
     ("session_finalize_requests/%s-updated.json" % SID, dict(kind="session_marker", sid=SID, session_base=SID)),
     ("session_finalize_requests/%s-notes.json" % SID, dict(kind="session_marker", sid=SID, session_base=SID)),
     ("session_finalize_results/%s.json" % SID, dict(kind="session_marker", sid=SID, session_base=SID)),
+    # the Session Brief request (lambda_finalize_claim._enqueue_brief_request): brief-{sid}[-r{n}]
+    ("session_finalize_requests/brief-%s.json" % SID, dict(kind="session_marker", sid=SID, session_base=SID)),
+    ("session_finalize_requests/brief-%s-r2.json" % SID, dict(kind="session_marker", sid=SID, session_base=SID)),
     # 27-31 site / company keyed
     ("voice/%s/%s/a_b.m4a" % (U, S), dict(scope="tenant", kind="voice", company_id=U, site_id=S)),
     ("voiceprint_requests/%s/base1/r.json" % U, dict(scope="tenant", kind="voiceprint", company_id=U, session_base="base1")),
