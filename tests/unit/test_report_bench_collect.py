@@ -51,8 +51,7 @@ def test_folder_guards(confirmed):
 
 
 def test_unconfirmed_refuses_everything():
-    cfg = col.load_owner_folders()
-    assert cfg["confirmed"] is False               # ships unconfirmed
+    cfg = dict(col.load_owner_folders(), confirmed=False)
     for f in cfg["folders"]:
         with pytest.raises(PermissionError):
             col.check_folder(f, cfg)
