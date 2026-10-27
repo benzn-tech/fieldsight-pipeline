@@ -50,6 +50,9 @@ logger = logging.getLogger(__name__)
 
 REASONS = ("recording", "session", "folder_day_site", "folder_home", "key", "hint",
            "unresolved", "split_day", "external_member_uncertain", "global", "lake_wide")
+# Never produced by the resolver: written only by an operator script to pin an owner decision
+# (repositories.lake_objects skips every upsert onto a row carrying it).
+OPERATOR_REASON = "operator"
 
 
 def _s(v):

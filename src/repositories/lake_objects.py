@@ -55,9 +55,15 @@ _UPSERT = (
     # R7e: a write never replaces a non-NULL company with a DIFFERENT non-NULL one; the whole
     # write is skipped (reassign_site, on a site move, is the only path that changes it).
     "AND (EXCLUDED.company_id IS NULL OR lake_objects.company_id IS NULL "
-    "OR EXCLUDED.company_id = lake_objects.company_id)")
+    "OR EXCLUDED.company_id = lake_objects.company_id) "
+    # An owner decision recorded by an operator script (reason 'operator', e.g. the 2026-10-27
+    # Ben_Lin -> Ben_Lin_test2 reassignment) is pinned: no drain, backfill or upload write
+    # changes it, not even user_id or reason under the SAME company (R7e alone would let a
+    # re-backfill put the resolver's user back). reassign_site still moves it, keeping the pin.
+    "AND lake_objects.reason IS DISTINCT FROM 'operator'")
 
-_REASSIGN = ("UPDATE lake_objects SET company_id=%s, reason=NULL, updated_at=now() "
+_REASSIGN = ("UPDATE lake_objects SET company_id=%s, "
+             "reason=CASE WHEN reason='operator' THEN reason END, updated_at=now() "
              "WHERE site_id=%s AND company_id IS DISTINCT FROM %s")
 
 
