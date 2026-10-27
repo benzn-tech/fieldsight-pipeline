@@ -194,6 +194,10 @@ the full bench is guarded by the hard stop (§6).
   input tokens). §9 names `max_uses` as the post-Stage-0 lever: one re-probe at
   `max_uses` 2 on the stored drafts (`reprobe.py`, ≤ 24 calls, ≤ $0.64). It joins
   only if it passes the same gate.
+- **Re-probe result (10-27, $0.24):** Haiku 5.5 + `20250305`, `max_uses` 2: p50
+  8.44 s, max 11.6 s, 12/12 searched (9-19 results), 0 failures → **passes; Haiku
+  joins at `max_uses` 2** (a cell parameter, §4.4). Sonnet stays at 3 (it passed
+  there; not re-probed). Stage 0 total $1.42.
 
 ### 4.1 Budget
 
@@ -280,7 +284,7 @@ b8c96342 fixed. Its Claude latency is already in §1.
   (reasoning off), Sonnet 5.5, Haiku 5.5 (effort low).
 - *verify / single call* (must search): gemini-3.8-flash + OpenRouter web plugin
   (shipped), DeepSeek V4.1 Flash + web plugin, Sonnet 5.5 + `web_search_20250305`
-  (Stage 0, §4.0), Haiku 5.5 + `web_search_20250305` only if its re-probe passes.
+  (Stage 0, §4.0), Haiku 5.5 + `web_search_20250305` at `max_uses` 2 (re-probe, §4.0).
 - *DeepSeek cells are informational* (no DeepSeek arm in §4.2; one is added only if
   its cells beat gemini's on tune and the owner asks). They need a bench-side
   OpenRouter payload builder: `plugins` web + `provider.only ["coreweave/fp8"]` +
@@ -443,7 +447,7 @@ OpenRouter < $6.
   scored + repeat runs** (32 runs per arm; B + C + C′ ≈ $23 upper). The harness
   refuses to start the scored run unless the ledger has that much room, so a scored
   set is never cut off mid-way (§2's paired rule needs all 20 items).
-- Stage 0 actually spent $1.18, so $1.18 + $18 + $23 ≈ $42 fits the $45 cap. Raise
+- Stage 0 actually spent $1.42, so $1.42 + $18 + $23 ≈ $42 fits the $45 cap. Raise
   it (owner, within the $100 / month credit) only if rounds 1-2 need more room. The
   full bench's 15 tune runs per arm are dropped: the frozen cell already produced
   them.
