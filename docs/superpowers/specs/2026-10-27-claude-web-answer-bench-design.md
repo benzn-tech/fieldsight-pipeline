@@ -226,11 +226,54 @@ Retries are also reported separately per arm.
 - **Billing:** tokens (results count as input) plus a per-search fee; the price is
   taken from the pricing page by the owner and passed to the harness (§6).
 
-### 4.4 Prompt iteration
+### 4.4 Prompt iteration — prompt × model matrix
 
-Max 3 rounds per arm on the 5 `tune` items, one run per round; the author sees tune
-answers and grades, never `score` items. Chosen prompts are frozen (file + sha256)
-before the scored run. A may be tuned too; a gain there is reported separately.
+No prompt has ever been tuned for a model other than gemini (inventory: 55 prompts,
+134 versions, none model-conditional; per-model tuning lived in parameters). So
+before the arms are frozen, every historical candidate runs on every model that can
+do the step. Only `tune` items (5) are used; the author sees tune answers and grades,
+never `score` items.
+
+**Cell** = (step, prompt version, model, parameters). Parameters are part of the
+cell, not a constant: effort / reasoning setting, provider pin, `max_uses`.
+
+**Historical candidates** (texts read from git, sha256 recorded per cell):
+
+| id | step | source | note |
+|---|---|---|---|
+| `draft_v1` | draft | `DRAFT_PROMPT`, 518900a8 (unchanged since) | only draft version |
+| `verify_v1` | verify | `VERIFY_PROMPT`, 518900a8 ("colleague") | on gemini it wrote review-style replies (b8c96342 comment); re-tested on other models |
+| `verify_v2` | verify | `VERIFY_PROMPT`, b8c96342 (shipped) | |
+| `web_v1` | single call | `WEB_PROMPT`, 518900a8^ | arm B shape |
+| `merged_v1` | single call | `draft_v1` rules + `verify_v2` rules in one prompt | arm B round 0 (§4.2) |
+| `search_v1` | verify | `corroboration.SEARCH_PROMPT`, e73e90c2, one entity = the draft | the only prompt that ran on Claude + web_search (claude-opus-5 / haiku-4.5) |
+
+**Models by step** (admission by capability, with the evidence):
+- *draft* (no search): gemini-3.8-flash (shipped), DeepSeek V4.1 Flash @ coreweave
+  (reasoning off), Sonnet 5.5, Haiku 5.5 (effort low).
+- *verify / single call* (must search): gemini-3.8-flash + OpenRouter web plugin
+  (shipped), DeepSeek V4.1 Flash + OpenRouter web plugin (never measured; one cell),
+  Sonnet 5.5 + `web_search_<version Stage 0 picked>`, Haiku 5.5 + `web_search_20250305`.
+  A Claude config that failed Stage 0's gate is not tuned.
+- **Excluded:** muse-spark (web plugin: 16-29 s and 0 sources while claiming to have
+  searched, ledger 09-08 / 09-21) — over `VERIFY_BUDGET` before accuracy matters.
+
+**Round 0** = every admitted (step, candidate, model) cell, 5 items × 3 reps. Verify
+cells verify gemini's stored `draft_v1` for that item / rep (paired, as §4.2), so a
+verify difference is the verify prompt's, not the draft's. Draft cells are graded as
+standalone answers (they are what the reader gets when verify fails).
+**Rounds 1-2** = per model, the best round-0 verify / single-call cell gets at most 2
+edits (`<model>_verify_v*`, `<model>_answer_v*`), each 5 × 3; an edit is kept only
+if it is not worse on any item and better on at least one (paired, tune only).
+Total rounds per model ≤ 3, as before.
+
+**Freeze.** Per (step, model) the chosen prompt + parameters are written to
+`tools/web-answer-bench/frozen.v1.json` (text, sha256, parameters, round, tune
+grades) before any `score` run. This file is the seed of P2's `web_prompts.VARIANTS`
+— a model switch reads its own entry and never overwrites another model's.
+
+**Gate.** Round 0 runs only after (1) Stage 0 has picked the Claude configs and (2)
+the owner has confirmed the 5 `tune` gold answers; grades need `grade.py` (§5.1).
 
 ## 5. Grading
 
@@ -327,6 +370,25 @@ Dollars (tokens per search ≈ 15 k is the dominant unknown):
 - OpenRouter (gemini + plugin + DeepSeek grading): under $5.
 - **Full bench ≈ $13 expected, ≤ ~$39 upper; Stage 0 ≤ ~$9.** Hard stop $45.
 
+Prompt matrix (§4.4), tune items only, 5 × 3 = 15 runs per cell:
+
+| cells | round 0 | calls (upper, with continuation / retry) |
+|---|---|---|
+| draft: 4 models × `draft_v1` | 4 | 60 (no search) |
+| verify: gemini, DeepSeek × `verify_v1/v2`, `search_v1` | 6 | 90 OpenRouter |
+| verify: Sonnet, Haiku × `verify_v1/v2`, `search_v1` | 6 | 180 Anthropic |
+| single call: gemini, DeepSeek × `web_v1`, `merged_v1` | 4 | 60 OpenRouter |
+| single call: Sonnet, Haiku × `web_v1`, `merged_v1` | 4 | 120 Anthropic |
+| rounds 1-2: ≤ 2 edits × 8 (model, step) | ≤ 16 | ≤ 300 (Claude share ≤ 240) |
+| grader, 1 per answer | — | ≤ 840 (DeepSeek, cheap) |
+
+Anthropic ≤ 540 calls, ≤ 1 620 searches upper (expected ~2 per call ≈ 700).
+Dollars: Sonnet ≤ 270 calls × $0.133 ≈ $36 upper, expected ≈ $7; Haiku ≤ $1.5;
+searches $16 upper / $7 expected at $10 / 1 000; OpenRouter < $6. **Matrix ≈ $15
+expected.** The upper bound exceeds the remaining hard-stop room, so the ledger
+stops it first: matrix + full bench share the one $45 ledger, and the harness
+refuses to start the scored run if fewer than the full bench's expected $13 remain.
+
 ## 8. Phases
 
 - **P0 — inputs (owner).** Confirm the gold set (exit: ≥ 18 of 20 scored items);
@@ -388,7 +450,8 @@ Dollars (tokens per search ≈ 15 k is the dominant unknown):
 
 ## 10. Out of scope
 
-Draft on Claude (gemini draft is 3.7 s p50); changing ANSWER_RESERVE_S / deadlines;
+Shipping a Claude draft (it is measured in §4.4 only; gemini draft is 3.7 s p50);
+changing ANSWER_RESERVE_S / deadlines;
 classify / compose models; voice prompt rules.
 
 ## 11. Review log
@@ -455,3 +518,8 @@ rev 3.1 — Fable third pass (READY-WITH-FIXES), all applied:
 5. `max_uses` 3 + `user_location` NZ on all Claude calls (§4.2, §7).
 6. Rev-2 lines on offline screen replay / screen verify tagged superseded.
 7. Full Stage 0 definition block added to §4.0 per Fable's checklist.
+
+rev 4 — owner request 10-27: tune prompts per model before freezing. §4.4 rewritten
+as a prompt × model matrix (historical candidates from git × every model able to do
+the step, parameters part of the cell, freeze file seeds P2 variants); §7 matrix
+cost; §10 Claude draft now measured (not shipped). Pending Fable delta review.
