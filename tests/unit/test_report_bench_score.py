@@ -184,3 +184,26 @@ def test_verdicts_do_not_leak_across_sessions(tmp_path):
     assert res["s1"]["reps"][0]["fabricated"] == 1
     assert res["s2"]["reps"][0]["fabricated"] == 0
     assert res["s2"]["reps"][0]["unadjudicated"] == 1
+
+
+def test_noise_floor_per_kind(tmp_path):
+    common = _load("rb_common")
+    out = str(tmp_path)
+    common.write_json(os.path.join(out, "inputs", "manifest.json"),
+                      {"s": {"folder": "F", "date": "D", "role": "set"}, "R": {}})
+    g = {"schema": "report-bench-gold/v1", "session": "s", "items":
+         [{"id": f"a{i}", "kind": "action", "what": f"action number {i} zz{i}", "label": "true"}
+          for i in range(10)] +
+         [{"id": "d1", "kind": "decision", "what": "Pour on Monday", "label": "true"},
+          {"id": "d2", "kind": "decision", "what": "Hire a crane", "label": "true"}]}
+    common.write_json(os.path.join(out, "gold", "gold_s.json"), g)
+    tp = os.path.join(out, "answers", "a.txt")
+    common.write_text(tp, '{"topics": []}')
+    for rep in (1, 2, 3):
+        common.append_jsonl(os.path.join(out, "runs", "round0.jsonl"), {
+            "key": f"round0|X|X-cur|muse|s|{rep}", "task": "X", "candidate": "X-cur",
+            "model": "muse", "session": "s", "rep": rep, "outcome": "ok",
+            "attempts": [{}], "usd": 0.0, "text_path": tp, "prompt_path": "none"})
+    f = score.score_phase(out, "round0")["X|X-cur|muse"]["noise_floor"]
+    assert f["action_recall"] == pytest.approx(0.1)
+    assert f["decision_recall"] == pytest.approx(0.5)

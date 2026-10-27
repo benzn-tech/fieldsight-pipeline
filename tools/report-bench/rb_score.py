@@ -276,7 +276,10 @@ def score_phase(out, phase):
     for cell, by_sess in sorted(cells.items()):
         metrics = sorted({k for reps in by_sess.values() for rep in reps for k, v in rep.items()
                           if isinstance(v, (int, float)) and not isinstance(v, bool)})
-        gold_true = {s: (reps[0].get("action_gold_true") or 0) for s, reps in by_sess.items()}
+        # F's one-gold-item floor uses that metric's own kind of gold.
+        gold_true = {kind: {s: (reps[0].get(f"{kind}_gold_true") or 0)
+                            for s, reps in by_sess.items()}
+                     for kind in ("action", "decision")}
         result[cell] = {
             "sessions": {s: {"reps": reps, "failed": session_failed(reps)}
                          for s, reps in sorted(by_sess.items())},
@@ -286,7 +289,9 @@ def score_phase(out, phase):
                                         and not isinstance(v, bool))
                      for k in metrics},
             "noise_floor": {k: noise_floor({s: [rep.get(k) for rep in reps]
-                                            for s, reps in by_sess.items()}, gold_true, k)
+                                            for s, reps in by_sess.items()},
+                                           gold_true["decision" if k.startswith("decision")
+                                                     else "action"], k)
                             for k in metrics},
         }
     return result
