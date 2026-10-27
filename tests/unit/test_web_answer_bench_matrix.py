@@ -318,3 +318,257 @@ def test_missing_key_fails_without_a_request(monkeypatch):
     r = orb.call("gemini", "P", web=True, timeout=14.0, http=http, clock=clock)
     assert r["outcome"] == "failed" and r["error_code"] == "no_key"
     assert http.requests == []
+
+
+# ------------------------------------------------- Task 5: cells and round 0
+
+import io                                                # noqa: E402
+
+stage0 = _load("stage0")
+matrix = _load("matrix")
+
+KEYS = {"ANTHROPIC_API_KEY": "sk-ant-x", "CORROBORATION_API_KEY": "sk-or-x"}
+
+
+def test_round0_cells_and_order():
+    cells = matrix.round0_cells()
+    assert len(cells) == 21 and len(set(cells)) == 21
+    assert cells[0] == ("draft", "draft_v1", "gemini")
+    assert sorted(c for c in cells if c[0] == "draft") == sorted(
+        ("draft", "draft_v1", m) for m in matrix.MODEL_KEYS)
+    for step, pids in (("verify", ("verify_v1", "verify_v2")),
+                       ("single", ("web_v1", "merged_v1"))):
+        assert sorted(c for c in cells if c[0] == step) == sorted(
+            (step, p, m) for p in pids for m in ("gemini", "deepseek", "sonnet", "haiku"))
+    vendor = [{"sonnet": 2, "haiku": 1}.get(m, 0) for _, _, m in cells]
+    assert vendor == sorted(vendor)             # OpenRouter, then Haiku, then Sonnet
+
+
+def test_plan_hand_count():
+    # Anthropic: drafts 2 x 15 x 1, verify 4 x 15 x 2, single 4 x 15 x 2 = 270.
+    # OpenRouter: drafts 3 x 15, verify 4 x 15 x 2 (retry), single 4 x 15 = 225.
+    # $: Sonnet 135 calls x (46k x $2 + 4096 x $10)/M = 17.9496; Haiku 135 x
+    # (46k x $0.1 + 4096 x $0.5)/M = 0.89748; searches 120 x 3 + 120 x 2 = 600 x $0.01.
+    p = matrix.plan(matrix.round0_cells(), reps=3, price_per_1000=10.0)
+    assert (p["runs"], p["anthropic_upper"], p["openrouter_upper"]) == (315, 270, 225)
+    assert p["upper"] == 495 and p["searches_upper"] == 600
+    assert p["anthropic_usd_upper"] == pytest.approx(17.9496 + 0.89748 + 6.0, abs=1e-4)
+
+
+def _m_argv(out, *extra):
+    return ["--out", str(out), "--round", "0", "--search-price-per-1000", "10", *extra]
+
+
+def test_validate_confirm_and_out(tmp_path):
+    with pytest.raises(SystemExit) as e:
+        matrix.validate(_m_argv(tmp_path, "--confirm-calls", "494"), KEYS, REPO)
+    assert e.value.code == 2
+    with pytest.raises(SystemExit):
+        matrix.validate(_m_argv(tmp_path, "--confirm-calls", "495"), {}, REPO)
+    with pytest.raises(SystemExit):
+        matrix.validate(_m_argv(os.path.join(REPO, "x"), "--dry-run"), {}, REPO)
+    assert matrix.validate(_m_argv(tmp_path, "--confirm-calls", "495"), KEYS, REPO)
+    assert matrix.validate(_m_argv(tmp_path, "--dry-run"), {}, REPO).dry_run
+
+
+def _m_items():
+    return [{"id": f"t{i}", "question": f"{SECRET_Q}-{i}",
+             "kind": "unsure" if i == 5 else "standard"} for i in range(1, 6)]
+
+
+class ClaudeFake:
+    """Echoes the prompt back as the answer; searches when it has a tool."""
+
+    def __init__(self, clock, usage=(1000, 100, 1), secs=2.0):
+        self.clock, self.usage, self.secs = clock, usage, secs
+        self.requests = []
+        self.messages = self
+
+    def create(self, **kw):
+        self.requests.append(kw)
+        self.clock.t += self.secs
+        inp, out, s = self.usage
+        tools = bool(kw.get("tools"))
+        content = []
+        if tools:
+            content.append(NS(type="web_search_tool_result", content=[
+                NS(type="web_search_result", url="https://ex0.govt.nz/p", title="t")]))
+        content.append(NS(type="text", text=SECRET_A + " ECHO " + kw["messages"][0]["content"]))
+        return NS(stop_reason="end_turn", content=content,
+                  usage=NS(input_tokens=inp, output_tokens=out,
+                           server_tool_use=NS(web_search_requests=s if tools else 0)))
+
+
+class OrFake:
+    """Fake `openrouter_bench.call`: gemini drafts are numbered, the rest echo."""
+
+    def __init__(self, clock, fail_draft=None, no_search_items=()):
+        self.clock, self.fail_draft, self.no_search_items = clock, fail_draft, no_search_items
+        self.calls = []
+        self.n_drafts = 0
+
+    def __call__(self, profile, prompt, *, web, timeout, max_tokens=1024, retry_left_s=None,
+                 http=None, clock=None):
+        self.calls.append({"profile": profile, "web": web, "timeout": timeout,
+                           "retry_left_s": retry_left_s, "prompt": prompt})
+        self.clock.t += 3.0
+        base = {"searched": web, "result_count": int(web), "source_count": int(web),
+                "result_urls": ["https://x.govt.nz/a"] if web else [],
+                "result_titles": ["x.govt.nz"] if web else [],
+                "latency_ms": 3000, "calls": 1, "input_tokens": 10, "output_tokens": 5,
+                "http_status": 200, "error_code": None, "stop_reason": "stop",
+                "retried": False, "openrouter_cost_usd": 0.001}
+        if profile == "gemini" and not web:
+            self.n_drafts += 1
+            if self.n_drafts == self.fail_draft:
+                return dict(base, text="", outcome="failed", error_code="empty_completion")
+            return dict(base, text=f"{SECRET_A} DRAFT<{self.n_drafts}>", outcome="ok")
+        if web and any(f"{SECRET_Q}-{i[1:]}\n" in prompt for i in self.no_search_items):
+            return dict(base, text=SECRET_A, outcome="no_search", searched=False,
+                        result_count=0, source_count=0, result_urls=[], result_titles=[])
+        return dict(base, text=SECRET_A + " ECHO " + prompt, outcome="ok")
+
+
+def _m_run(tmp_path, *, dry=False, client=None, or_fake=None, clock=None):
+    clock = clock or Clock()
+    args = matrix.validate(_m_argv(tmp_path, *(["--dry-run"] if dry else
+                                               ["--confirm-calls", "495"])), KEYS, REPO)
+    client = client or ClaudeFake(clock)
+    or_fake = or_fake or OrFake(clock)
+    out = io.StringIO()
+    code, summary = matrix.run(args, items=_m_items(), client=client, or_call=or_fake,
+                               clock=clock, stdout=out)
+    return code, summary, out.getvalue(), client, or_fake
+
+
+def _rows(tmp_path):
+    with open(tmp_path / "matrix_r0_calls.jsonl", encoding="utf-8") as f:
+        return [json.loads(line) for line in f]
+
+
+def _is_verify_prompt(p):
+    return "## Draft answer" in p or "## Colleague's answer" in p
+
+
+def test_dry_run_prints_plan_and_makes_no_call(tmp_path):
+    code, summary, text, client, or_fake = _m_run(tmp_path, dry=True)
+    assert code == 0
+    assert client.requests == [] and or_fake.calls == []
+    assert "315" in text and "495" in text and "$24.85" in text
+    assert not (tmp_path / "matrix_r0_calls.jsonl").exists()
+
+
+def test_full_round0_counts_order_and_ledger(tmp_path):
+    code, summary, _, client, or_fake = _m_run(tmp_path)
+    assert code == 0
+    rows = _rows(tmp_path)
+    assert len(rows) == 315
+    assert [r["cell"] for r in rows[:15]] == ["draft/draft_v1/gemini"] * 15
+    assert len({r["run_id"] for r in rows}) == 315
+    assert all(not any(m in r["run_id"] for m in matrix.MODEL_KEYS) for r in rows)
+    assert len(client.requests) == 150 and len(or_fake.calls) == 165
+    sonnet = [i for i, r in enumerate(rows) if r["model_key"] == "sonnet"]
+    haiku = [i for i, r in enumerate(rows) if r["model_key"] == "haiku"]
+    assert max(haiku) < min(sonnet)
+    assert len([q for q in client.requests if "tools" not in q]) == 30
+    tools = {q["model"]: q["tools"][0] for q in client.requests if "tools" in q}
+    assert tools["claude-sonnet-5-5"]["max_uses"] == 3
+    assert tools["claude-haiku-5-5"]["max_uses"] == 2
+    assert {t["type"] for t in tools.values()} == {"web_search_20250305"}
+    lg = ledger.Ledger(str(tmp_path / "anthropic_ledger.json"))
+    assert lg.pool_spent("matrix") == pytest.approx(
+        sum(r["cost_usd"] for r in rows if r["model_key"] in matrix.CLAUDE))
+    assert rows[0]["prompt_sha256"] == prompts.sha("draft_v1")
+    s = json.loads((tmp_path / "matrix_r0_summary.json").read_text("utf-8"))
+    assert s["cells"]["verify/verify_v2/haiku"]["n"] == 15
+
+
+def test_verify_uses_the_stored_draft_of_the_same_item_and_rep(tmp_path):
+    _m_run(tmp_path)
+    rows = _rows(tmp_path)
+    drafts = {(r["item"], r["rep"]): r["text"] for r in rows
+              if r["cell"] == "draft/draft_v1/gemini"}
+    assert len(set(drafts.values())) == 15
+    verify = [r for r in rows if r["step"] == "verify"]
+    assert len(verify) == 120
+    for r in verify:
+        # The echo ends with the prompt, and the prompt ends with the draft.
+        assert [k for k, d in drafts.items() if r["text"].rstrip().endswith(d)] == \
+            [(r["item"], r["rep"])]
+        assert r["draft_ms"] == 3000
+
+
+def test_verify_budget_is_the_chain_left_after_the_draft(tmp_path):
+    _, _, _, client, or_fake = _m_run(tmp_path)
+    v = [c for c in or_fake.calls if c["web"] and _is_verify_prompt(c["prompt"])]
+    assert len(v) == 60
+    assert all(c["timeout"] == pytest.approx(14.0) for c in v)
+    assert all(c["retry_left_s"] == pytest.approx(22.1 - 3.0) for c in v)
+    single = [c for c in or_fake.calls if c["web"] and not _is_verify_prompt(c["prompt"])]
+    assert len(single) == 60 and all(c["retry_left_s"] is None for c in single)
+    drafts = [c for c in or_fake.calls if not c["web"]]
+    assert all(c["timeout"] == pytest.approx(12.0) for c in drafts)
+    claude_verify = [q for q in client.requests
+                     if "tools" in q and _is_verify_prompt(q["messages"][0]["content"])]
+    assert all(q["timeout"] == pytest.approx(14.0) for q in claude_verify)
+
+
+def test_failed_gemini_draft_skips_its_verify_runs(tmp_path):
+    clock = Clock()
+    code, summary, _, client, or_fake = _m_run(tmp_path, clock=clock,
+                                               or_fake=OrFake(clock, fail_draft=2))
+    rows = _rows(tmp_path)
+    failed = [(r["item"], r["rep"]) for r in rows
+              if r["cell"] == "draft/draft_v1/gemini" and r["outcome"] != "ok"]
+    assert len(failed) == 1
+    skipped = [r for r in rows if r["outcome"] == "no_draft"]
+    assert len(skipped) == 8
+    assert {(r["item"], r["rep"]) for r in skipped} == set(failed)
+    assert all(r["calls"] == 0 and r["answer"] is None for r in skipped)
+    assert summary["cells"]["verify/verify_v1/sonnet"]["no_draft"] == 1
+    assert summary["cells"]["verify/verify_v1/sonnet"]["n"] == 14
+
+
+def test_no_search_on_a_web_item_is_failed(tmp_path):
+    clock = Clock()
+    _m_run(tmp_path, clock=clock, or_fake=OrFake(clock, no_search_items=("t1", "t5")))
+    rows = _rows(tmp_path)
+    single = {r["item"]: r for r in rows if r["cell"] == "single/web_v1/gemini"}
+    assert single["t1"]["outcome"] == "failed" and single["t1"]["answer"] is None
+    assert single["t5"]["outcome"] == "no_search"
+    assert single["t5"]["answer"] == SECRET_A         # the reader still gets the text
+    v = {r["item"]: r for r in rows if r["cell"] == "verify/verify_v2/gemini"}
+    assert v["t1"]["outcome"] == "failed"
+    assert v["t1"]["answer_source"] == "draft" and "[unverified]" in v["t1"]["answer"]
+    assert v["t2"]["answer_source"] == "verify"
+
+
+def test_matrix_pool_exhausted_mid_cell_stops_and_writes_summary(tmp_path):
+    lg = ledger.Ledger(str(tmp_path / "anthropic_ledger.json"))
+    lg.add(1.42)
+    lg.add(17.99, pool="matrix")
+    clock = Clock()
+    client = ClaudeFake(clock, usage=(100_000, 1000, 1))        # ~$0.01 per Haiku draft
+    code, summary, text, client, or_fake = _m_run(tmp_path, clock=clock, client=client)
+    assert code == 3 and summary["hard_stop"] is True
+    assert len(client.requests) == 1
+    assert len(or_fake.calls) == 165                  # OpenRouter cells ran first
+    s = json.loads((tmp_path / "matrix_r0_summary.json").read_text("utf-8"))
+    assert s["hard_stop"] is True
+    assert ledger.Ledger(str(tmp_path / "anthropic_ledger.json")).room() > \
+        ledger.SCORED_RESERVE
+
+
+def test_scored_reserve_is_never_touched(tmp_path):
+    ledger.Ledger(str(tmp_path / "anthropic_ledger.json")).add(22.0)   # room = 23
+    code, summary, _, client, _ = _m_run(tmp_path)
+    assert code == 3 and client.requests == []
+
+
+def test_no_question_or_answer_text_in_stdout_or_summary(tmp_path):
+    code, summary, text, _, _ = _m_run(tmp_path)
+    blob = text + json.dumps(summary) + \
+        (tmp_path / "matrix_r0_summary.json").read_text("utf-8")
+    assert SECRET_Q not in blob and SECRET_A not in blob and "DRAFT<" not in blob
+    calls = (tmp_path / "matrix_r0_calls.jsonl").read_text("utf-8")
+    assert SECRET_A in calls
