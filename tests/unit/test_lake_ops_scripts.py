@@ -87,6 +87,16 @@ def test_reassign_plan_keeps_southbase_rows_and_claims_only_unresolved():
     assert "d" not in {r["s3_key"] for r in ra.change_set(plan)}
 
 
+def test_reassign_claim_only_leaves_every_resolved_row_alone():
+    rows = [_row("a", FP, ADMIN), _row("b", FP, TEST2), _row("c", None, None, "unresolved"),
+            _row("d", SB, ADMIN), _row("e", None, None, "split_day")]
+    plan = ra.plan_reassign(rows, TEST2, FP)
+    assert [r["s3_key"] for r in ra.change_set(plan, claim_only=True)] == ["c"]
+    claimed = [dict(r, company_id=FP, user_id=TEST2, reason="operator") if r["s3_key"] == "c"
+               else r for r in rows]
+    assert ra.change_set(ra.plan_reassign(claimed, TEST2, FP), claim_only=True) == []
+
+
 def test_reassign_is_idempotent_after_apply():
     rows = [_row("a", FP, ADMIN), _row("c", None, None, "unresolved"), _row("d", SB, ADMIN)]
     applied = []
