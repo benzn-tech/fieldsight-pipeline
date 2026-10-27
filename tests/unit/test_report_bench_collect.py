@@ -163,3 +163,28 @@ def test_debug_cmd_refuses_summary(tmp_path, confirmed):
     line = col.debug_fetch_command("b", "2026-10-01", "Ben_Lin_test2", str(tmp_path))
     assert line.startswith("aws s3 cp s3://b/reports/2026-10-01/Ben_Lin_test2/"
                            "daily_report_debug.json ")
+
+
+def test_summary_refused_on_paginate_and_bare_prefix():
+    class Pager:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def paginate(self, **kw):
+            self.calls.append("paginate")
+            return []
+
+    class S3(FakeS3):
+        def get_paginator(self, name):
+            return Pager(self.calls)
+
+    fake = S3()
+    ro = col.ReadOnlyS3(fake)
+    for prefix in ("reports/2026-10-01/_summary/", "reports/2026-10-01/_summary"):
+        with pytest.raises(PermissionError):
+            ro.get_paginator("list_objects_v2").paginate(Bucket="b", Prefix=prefix)
+        with pytest.raises(PermissionError):
+            ro.list_objects_v2(Bucket="b", Prefix=prefix)
+    assert "paginate" not in fake.calls
+    ro.get_paginator("list_objects_v2").paginate(Bucket="b", Prefix="transcripts/x/")
+    assert fake.calls == ["paginate"]

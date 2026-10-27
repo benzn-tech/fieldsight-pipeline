@@ -38,7 +38,7 @@ _ORB = rb_common.load_web("openrouter_bench")
 _get = _CV._get
 
 OUTCOMES = ("ok", "empty", "truncated", "refusal", "http_error", "timeout",
-            "schema_rejected")
+            "schema_rejected", "context_exceeded", "unexpected_stop")
 
 
 def openrouter_url():
@@ -166,6 +166,10 @@ def _claude_attempt(key, req, prompt, client, clock):
         a["outcome"] = "truncated"
     elif stop == "refusal":
         a["outcome"] = "refusal"
+    elif stop == "model_context_window_exceeded":
+        a["outcome"] = "context_exceeded"
+    elif stop not in (None, "end_turn", "stop_sequence"):
+        a["outcome"] = "unexpected_stop"
     elif not text.strip():
         a["outcome"] = "empty"
     else:

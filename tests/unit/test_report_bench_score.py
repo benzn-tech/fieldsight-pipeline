@@ -207,3 +207,32 @@ def test_noise_floor_per_kind(tmp_path):
     f = score.score_phase(out, "round0")["X|X-cur|muse"]["noise_floor"]
     assert f["action_recall"] == pytest.approx(0.1)
     assert f["decision_recall"] == pytest.approx(0.5)
+
+
+def test_t_sections_come_from_the_template():
+    secs = score.t_sections()
+    assert secs and all(isinstance(s, str) and s for s in secs)
+    text = "\n".join("## " + s + "\nNothing here." for s in secs)
+    r = score.against_gold([], GOLD, {}, "T", "p", sections=secs, text=text)
+    assert r["sections_present"] is True
+    r = score.against_gold([], GOLD, {}, "T", "p", sections=secs, text="\n".join(
+        s for s in secs[1:]))                       # plain title lines count too, first missing
+    assert r["sections_present"] is False
+
+
+def test_r_gold_is_rederived_at_scoring_time(tmp_path):
+    common = _load("rb_common")
+    out = str(tmp_path)
+    manifest = {"s1": {"folder": "F", "date": "D", "role": "set"},
+                "R": {"F_D": {"folder": "F", "date": "D", "role": "set"}}}
+    common.write_json(os.path.join(out, "inputs", "manifest.json"), manifest)
+    # stale day file from an earlier adjudication, plus one adjudicated R item
+    common.write_json(os.path.join(out, "gold", "gold_F_D.json"), {
+        "schema": "report-bench-gold/v1", "session": "F_D",
+        "items": [{"id": "adj-F_D-p1", "kind": "action", "what": "Paint the fence",
+                   "label": "true", "source": "adjudicated"}]})
+    # the session gold was adjudicated later and gained an item
+    common.write_json(os.path.join(out, "gold", "gold_s1.json"), dict(GOLD, session="s1"))
+    g = gold_mod.current_day_gold(out, "F_D", manifest)
+    ids = {i["id"] for i in g["items"]}
+    assert {"s1:g1", "s1:g3", "adj-F_D-p1"} <= ids

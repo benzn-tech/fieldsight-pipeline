@@ -140,5 +140,6 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except BaseException as exc:                        # noqa: BLE001 - reported by type
-        sys.stderr.write(f"render failed: {type(exc).__name__}: {str(exc)[:200]}\n")
+        # Type name only: an exception message can carry transcript text.
+        sys.stderr.write(f"render failed: {type(exc).__name__}\n")
         raise SystemExit(1)

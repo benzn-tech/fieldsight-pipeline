@@ -237,3 +237,9 @@ def test_claude_error_before_stream_is_free():
     c = FakeClient([APIStatusError(529, "overloaded")])
     r = callers.call("sonnet", "X", '"topics"', 9000, client=c, clock=Clock())
     assert r["attempts"][0]["usd"] is None and not r["attempts"][0].get("cost_estimated")
+
+
+def test_context_window_exceeded_is_not_ok():
+    c = FakeClient([_msg(SECRET_A, stop="model_context_window_exceeded")])
+    r = callers.call("haiku", "X", '"topics"', 9000, client=c, clock=Clock())
+    assert r["outcome"] == "context_exceeded"

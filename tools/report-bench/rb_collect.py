@@ -50,8 +50,24 @@ def assert_never_write(key: str) -> None:
 
 
 def _refuse_summary(value):
-    if isinstance(value, str) and f"/{SUMMARY}/" in "/" + value:
+    """Any key or prefix naming the _summary folder, with or without the
+    trailing slash (`reports/<d>/_summary` lists it just the same)."""
+    if not isinstance(value, str):
+        return
+    parts = value.split("/")
+    if any(p == SUMMARY or (i == len(parts) - 1 and p.startswith(SUMMARY))
+           for i, p in enumerate(parts)):
         raise PermissionError("the _summary report folder is never read")
+
+
+class _GuardedPaginator:
+    def __init__(self, pager):
+        self._pager = pager
+
+    def paginate(self, **kwargs):
+        _refuse_summary(kwargs.get("Prefix"))
+        _refuse_summary(kwargs.get("StartAfter"))
+        return self._pager.paginate(**kwargs)
 
 
 class ReadOnlyS3:
@@ -73,7 +89,8 @@ class ReadOnlyS3:
             for k in ("CopySource", "Destination", "DestinationKey"):
                 if k in kwargs:
                     assert_never_write(str(kwargs[k]))
-            return fn(*args, **kwargs)
+            result = fn(*args, **kwargs)
+            return _GuardedPaginator(result) if name == "get_paginator" else result
         return guarded
 
     def __setattr__(self, name, value):

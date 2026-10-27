@@ -193,10 +193,22 @@ def against_gold(items, gold, verdicts, task="X", run_prefix="", input_items=Non
         got = {f["gold_id"] for f in fates if f["fate"] == "match"}
         res["input_coverage"] = (len(got & in_true) / len(in_true)) if in_true else None
     if task == "T" and sections is not None:
-        heads = {m.group(1).strip().lower() for m in
-                 (rb_gold._HEADING.match(line) for line in (text or "").splitlines()) if m}
+        # A heading line, or a line that is just the title (bold / colon allowed).
+        heads = {line.strip().strip("#*_: ").strip().lower()
+                 for line in (text or "").splitlines() if line.strip()}
         res["sections_present"] = all((s or "").strip().lower() in heads for s in sections if s)
     return res
+
+
+def t_sections(template_id="personal-meeting", version=3) -> list:
+    """The headings the model is asked to write: develop's built-in template
+    after report_facts.split_plan (code-filled sections leave the plan), plus
+    the catch-all. Sub-sections are not required."""
+    import report_facts
+    import report_template
+    tmpl = report_facts.split_plan(report_template.load_template(template_id, version))[0]
+    secs = list(tmpl.get("sections") or []) + [tmpl.get("catch_all") or {}]
+    return [s["title"] for s in secs if (s.get("title") or "").strip()]
 
 
 def noise_floor(values_by_session: dict, gold_true_by_session: dict, metric: str) -> float:
@@ -246,13 +258,14 @@ def score_phase(out, phase):
     golds = {}
     manifest = rb_common.read_json(os.path.join(out, "inputs", "manifest.json"))
     cells = defaultdict(lambda: defaultdict(list))
+    sections = t_sections() if any(r["task"] == "T" for r in recs) else None
     for r in recs:
         task, sess = r["task"], r["session"]
         if sess not in golds:
             gp = os.path.join(out, "gold", f"gold_{sess}.json")
-            golds[sess] = (rb_gold.load_gold(gp) if os.path.exists(gp) else
-                           rb_gold.gold_for_day(out, sess, manifest)
-                           if sess in manifest.get("R", {}) else None)
+            golds[sess] = (rb_gold.current_day_gold(out, sess, manifest)
+                           if sess in manifest.get("R", {}) else
+                           rb_gold.load_gold(gp) if os.path.exists(gp) else None)
         with open(r["text_path"], encoding="utf-8") as f:
             text = f.read()
         prompt_path = os.path.join(out, r["prompt_path"])
@@ -270,7 +283,8 @@ def score_phase(out, phase):
                     input_items = rb_gold.items_from_parsed("X", rb_common.read_json(pin))
             m.update(against_gold(items, gold, verdicts, task,
                                   f"{sess}|{task}|{r['candidate']}|{r['model']}|{r['rep']}",
-                                  input_items=input_items, text=text))
+                                  input_items=input_items, text=text,
+                                  sections=sections if task == "T" else None))
         cells[f"{task}|{r['candidate']}|{r['model']}"][sess].append(m)
     result = {}
     for cell, by_sess in sorted(cells.items()):

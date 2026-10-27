@@ -94,3 +94,12 @@ def test_worker_t_without_report_facts(tmp_path):
 def test_build_refuses_cache_inside_repo():
     with pytest.raises(ValueError):
         snap.build("HEAD", os.path.join(REPO, "tmp-cache"))
+
+
+def test_worker_error_never_echoes_exception_text(tmp_path):
+    src = _stub(tmp_path, (
+        "def build_extraction_prompt(user_folder, date, session_base, turns, n_segments):\n"
+        "    raise ValueError('SECRETTEXT from the transcript')\n"))
+    with pytest.raises(snap.RenderError) as e:
+        snap.render(src, "X", X_IN)
+    assert "ValueError" in str(e.value) and "SECRETTEXT" not in str(e.value)

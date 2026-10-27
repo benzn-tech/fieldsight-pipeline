@@ -290,6 +290,18 @@ def gold_for_day(out: str, day_key: str, manifest: dict) -> dict:
     return {"schema": GOLD_SCHEMA, "session": day_key, "items": items}
 
 
+def current_day_gold(out: str, day_key: str, manifest: dict) -> dict:
+    """R's gold as it stands now: re-derived from the sessions' current
+    (adjudicated) gold, plus the items adjudicated on the day itself."""
+    g = gold_for_day(out, day_key, manifest)
+    p = os.path.join(out, "gold", f"gold_{day_key}.json")
+    if os.path.exists(p):
+        have = {i["id"] for i in g["items"]}
+        g["items"] += [i for i in load_gold(p)["items"]
+                       if i.get("source") == "adjudicated" and i["id"] not in have]
+    return g
+
+
 # ------------------------------------------------------------------ CLI
 
 def _runs_for_scope(out, phase, scope):
@@ -328,8 +340,8 @@ def main(argv=None):
         return 0
     scope = a.scope or a.session
     manifest = rb_common.read_json(os.path.join(out, "inputs", "manifest.json"))
-    if scope in manifest.get("R", {}) and not os.path.exists(gold_path(scope)):
-        rb_common.write_json(gold_path(scope), gold_for_day(out, scope, manifest))
+    if scope in manifest.get("R", {}):
+        rb_common.write_json(gold_path(scope), current_day_gold(out, scope, manifest))
     gold = load_gold(gold_path(scope))
     pool = adjudication_pool(_runs_for_scope(out, a.phase, scope), gold)
     pool_path = os.path.join(out, "gold", f"pool_{a.phase}_{scope}.json")
