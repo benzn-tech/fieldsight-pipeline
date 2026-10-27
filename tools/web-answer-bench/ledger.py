@@ -54,7 +54,12 @@ class Ledger:
         return self.pool_spent(pool) >= pool_cap - 1e-9
 
     def add(self, dollars, pool="stage0"):
-        self.spent += float(dollars)
+        # Re-read before writing: the report bench (or another run) may have
+        # written report/* pools or spend since this ledger was loaded, and a
+        # rewrite from memory would drop them.
+        state = read_state(self.path)
+        self.spent = state["spent_usd"] + float(dollars)
+        self.pools = state["pools"]
         self.pools[pool] = self.pools.get(pool, 0.0) + float(dollars)
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -71,6 +76,15 @@ class Ledger:
 # `Ledger` above behaves exactly as before (its `add` rewrites `pools` whole and
 # so carries the report pools along). Web $45 + report $40 = global $85.
 REPORT_POOL_PREFIX = "report/"
+# Held by tools/report-bench/rb_run.py in the shared --out while it runs.
+LOCK_NAME = "bench.lock"
+
+
+def refuse_if_locked(out, refuse):
+    """Call `refuse(msg)` (which exits 2) when the report bench holds --out."""
+    if os.path.exists(os.path.join(str(out), LOCK_NAME)):
+        refuse(f"{LOCK_NAME} exists in --out: the report bench is running (shared ledger); "
+               "wait for it, or delete the file only if no bench is running")
 REPORT_CAP_USD = 40.0
 GLOBAL_CAP_USD = 85.0
 

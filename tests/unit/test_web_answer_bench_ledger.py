@@ -83,3 +83,59 @@ def test_non_report_pool_refused(tmp_path):
 def test_caps():
     assert L.REPORT_CAP_USD == 40.0 and L.GLOBAL_CAP_USD == 85.0
     assert L.CAP_USD + L.REPORT_CAP_USD == L.GLOBAL_CAP_USD
+
+
+def test_web_add_merges_a_report_write_made_after_web_start(tmp_path):
+    p = str(tmp_path / "anthropic_ledger.json")
+    led = L.Ledger(p)                       # web run starts, reads the (empty) file
+    L.add_report_spend(p, "report/round0", 2.5)   # report bench writes afterwards
+    led.add(1.0, pool="matrix")
+    st = L.read_state(p)
+    assert st["pools"]["report/round0"] == 2.5
+    assert st["pools"]["matrix"] == 1.0 and st["spent_usd"] == 1.0
+    led.add(0.5, pool="matrix")
+    assert L.read_state(p)["pools"] == {"report/round0": 2.5, "matrix": 1.5}
+    assert led.spent == 1.5
+
+
+def test_web_add_keeps_web_spend_written_by_another_instance(tmp_path):
+    p = str(tmp_path / "anthropic_ledger.json")
+    a, b = L.Ledger(p), L.Ledger(p)
+    a.add(1.0, pool="matrix")
+    b.add(1.0, pool="matrix")
+    assert L.read_state(p)["spent_usd"] == 2.0
+
+
+def _load_web(name):
+    import sys
+    d = os.path.dirname(PATH)
+    if d not in sys.path:
+        sys.path.insert(0, d)
+    spec = importlib.util.spec_from_file_location(name, os.path.join(d, name + ".py"))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.parametrize("name,argv", [
+    ("stage0", ["--search-price-per-1000", "10", "--dry-run"]),
+    ("matrix", ["--round", "0", "--search-price-per-1000", "10", "--dry-run"]),
+    ("reprobe", ["--config", None, "--max-uses", "1", "--search-price-per-1000", "10",
+                 "--dry-run"]),
+    ("grade", ["--calls", "matrix_r0_calls.jsonl", "--seed", "1", "--dry-run"]),
+])
+def test_web_scripts_refuse_while_the_report_bench_holds_the_lock(tmp_path, name, argv):
+    mod = _load_web(name)
+    if name == "reprobe":
+        argv = [a if a is not None else sorted(mod.CONFIGS)[0] for a in argv]
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / L.LOCK_NAME).write_text("{}", encoding="utf-8")
+    args = ["--out", str(out)] + argv
+    with pytest.raises(SystemExit) as e:
+        if name == "reprobe":
+            mod.validate(args, {})
+        else:
+            mod.validate(args, {}, repo_root=REPO)
+    assert e.value.code == 2

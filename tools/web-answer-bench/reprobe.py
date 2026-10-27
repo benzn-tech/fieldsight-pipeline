@@ -26,6 +26,7 @@ if HERE not in sys.path:
 
 import claude_verify                                     # noqa: E402
 import stage0                                            # noqa: E402
+import ledger as ledger_mod                               # noqa: E402
 from ledger import CAP_USD, Ledger, call_cost             # noqa: E402
 
 CONFIGS = {name: (model, tool) for name, model, tool in stage0.CONFIGS}
@@ -49,6 +50,7 @@ def validate(argv, env):
     ap.add_argument("--confirm-calls", type=int)
     ap.add_argument("--set", default=os.path.join(HERE, "set.v1.jsonl"))
     args = ap.parse_args(argv)
+    ledger_mod.refuse_if_locked(args.out, stage0._refuse)
     if not 1 <= args.max_uses <= claude_verify.MAX_USES:
         stage0._refuse(f"--max-uses must be 1..{claude_verify.MAX_USES}")
     if not os.path.exists(os.path.join(args.out, "stage0_drafts.jsonl")):
