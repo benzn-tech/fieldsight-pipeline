@@ -572,3 +572,182 @@ def test_no_question_or_answer_text_in_stdout_or_summary(tmp_path):
     assert SECRET_Q not in blob and SECRET_A not in blob and "DRAFT<" not in blob
     calls = (tmp_path / "matrix_r0_calls.jsonl").read_text("utf-8")
     assert SECRET_A in calls
+
+
+# ------------------------------------------------------- Task 6: blind grader
+
+grade = _load("grade")
+
+GOLD = {"expected": ["GOLD-FACT"], "variants": ["GOLD-VARIANT"], "kind": "standard"}
+
+
+def test_blind_strips_markers_and_links():
+    raw = ("Clause E3 [unverified] applies [MBIE](https://www.building.govt.nz/e3) and "
+           "see https://www.legislation.govt.nz/act/x?y=1. [Unverified]")
+    b = grade.blind(raw)
+    assert "unverified" not in b.lower()
+    assert "](" not in b and "http" not in b
+    assert "MBIE" in b and "legislation.govt.nz" in b
+
+
+def test_source_flag_by_domain():
+    answer = "See https://www.fake-standards.co.nz/x and [B](https://building.govt.nz/a)."
+    f = grade.source_flag(answer, ["building.govt.nz"])
+    assert f == ["fake-standards.co.nz"]
+    assert grade.source_flag(answer, ["building.govt.nz", "fake-standards.co.nz"]) == []
+    # A literal that is exactly a result URL is in the set even when its host is not
+    # (gemini's grounding redirects, spec §5.2).
+    redirect = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/abc"
+    assert grade.source_flag("x " + redirect, ["building.govt.nz"], urls=[redirect]) == []
+    assert grade.source_flag("x " + redirect, ["building.govt.nz"]) == \
+        ["vertexaisearch.cloud.google.com"]
+
+
+class GraderFake:
+    def __init__(self, replies=None, default='{"label": "correct"}'):
+        self.replies, self.default = list(replies or []), default
+        self.prompts = []
+
+    def __call__(self, profile, prompt, *, web, timeout, max_tokens=1024, **kw):
+        assert profile == "grader" and web is False
+        self.prompts.append(prompt)
+        text = self.replies.pop(0) if self.replies else self.default
+        return {"text": text, "outcome": "ok" if text else "failed", "calls": 1,
+                "latency_ms": 900, "http_status": 200, "openrouter_cost_usd": 0.0001}
+
+
+def test_grade_one_labels_and_ungraded():
+    for reply, label, ok in (('{"label": "partial"}', "partial", True),
+                             ('```json\n{"label": "wrong"}\n```', "wrong", True),
+                             ("The answer is correct.", "ungraded", False),
+                             ('{"label": "excellent"}', "ungraded", False),
+                             ("", "ungraded", False)):
+        fake = GraderFake([reply])
+        g = grade.grade_one("Q?", GOLD, "an answer", ["building.govt.nz"], call=fake)
+        assert (g["label"], g["raw_ok"]) == (label, ok), reply
+
+
+def test_grade_one_prompt_is_blind_and_carries_gold_and_flag():
+    fake = GraderFake()
+    g = grade.grade_one("Q?", GOLD, "Fact [unverified] https://www.fake.co.nz/p",
+                        ["building.govt.nz"], call=fake)
+    p = fake.prompts[0]
+    assert "GOLD-FACT" in p and "GOLD-VARIANT" in p and "building.govt.nz" in p
+    assert "[unverified]" not in p and "https://" not in p.split("## Answer")[1]
+    assert g["source_flag"] is True and g["flagged_hosts"] == ["fake.co.nz"]
+
+
+def test_grader_template_formats():
+    t = prompts.load("grader_v1")
+    filled = t.format(question="Q", kind="unsure", expected="E", variants="V",
+                      answer="A", domains="d")
+    assert '{"label"' in filled
+    for label in grade.ORDER:
+        assert label in t
+
+
+def test_majority_worst_stable():
+    m = grade.majority
+    assert m(["correct", "correct", "wrong"]) == ("correct", False)
+    assert m(["correct", "correct", "correct"]) == ("correct", True)
+    assert m(["correct", "partial", "wrong"]) == ("wrong", False)       # no majority
+    assert m(["correctly_unsure", "partial", "hallucinated_source"]) == \
+        ("hallucinated_source", False)
+    assert m(["correct", "no_answer", "partial"]) == ("no_answer", False)
+    assert m(["correct", "correct", "ungraded"]) == ("correct", False)
+    assert m(["correct", "wrong", "ungraded"]) == ("wrong", False)
+    assert m(["ungraded"] * 3) == ("ungraded", False)
+    assert grade.ORDER == ["wrong", "hallucinated_source", "partial", "correctly_unsure",
+                           "correct"]
+
+
+def _calls_file(tmp_path, n_cells=2):
+    rows, seq = [], 0
+    for c in range(n_cells):
+        model = ("gemini", "sonnet")[c % 2]
+        for rep in range(3):
+            for i in range(1, 6):
+                seq += 1
+                rows.append({"run_id": f"r0-{seq:04d}", "cell": f"single/web_v1/{model}",
+                             "step": "single", "prompt_id": "web_v1", "model_key": model,
+                             "item": f"t{i}", "rep": rep, "outcome": "ok", "calls": 1,
+                             "latency_ms": 1000 * (c + 1),
+                             "answer": f"{SECRET_A}-{seq} https://building.govt.nz/a",
+                             "result_domains": ["building.govt.nz"], "result_urls": []})
+    rows[0].update(outcome="failed", answer=None)
+    rows[1].update(outcome="no_draft", answer=None, calls=0)
+    p = tmp_path / "matrix_r0_calls.jsonl"
+    p.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    return rows
+
+
+def _gold_file(tmp_path):
+    p = tmp_path / "set.jsonl"
+    p.write_text("".join(json.dumps({"id": f"t{i}", "split": "tune", "question":
+                                     f"{SECRET_Q}-{i}", "expected": ["E"], "variants": [],
+                                     "kind": "unsure" if i == 5 else "standard"}) + "\n"
+                         for i in range(1, 6)), encoding="utf-8")
+    return str(p)
+
+
+def _g_argv(tmp_path, *extra):
+    return ["--out", str(tmp_path), "--calls", "matrix_r0_calls.jsonl", "--seed", "7",
+            "--set", _gold_file(tmp_path), *extra]
+
+
+def test_grade_dry_run_counts_answers_no_calls(tmp_path):
+    _calls_file(tmp_path)
+    args = grade.validate(_g_argv(tmp_path, "--dry-run"), {}, REPO)
+    fake = GraderFake()
+    out = io.StringIO()
+    code, info = grade.run(args, call=fake, stdout=out)
+    assert code == 0 and fake.prompts == []
+    assert info["to_grade"] == 28 and info["no_answer"] == 1 and info["skipped"] == 1
+    assert "28" in out.getvalue()
+
+
+def test_grade_refuses_without_calls_file_or_wrong_confirm(tmp_path):
+    with pytest.raises(SystemExit) as e:
+        grade.validate(_g_argv(tmp_path, "--dry-run"), {}, REPO)
+    assert e.value.code == 2
+    _calls_file(tmp_path)
+    with pytest.raises(SystemExit):
+        grade.validate(_g_argv(tmp_path, "--confirm-calls", "27"),
+                       {"CORROBORATION_API_KEY": "k"}, REPO)
+    with pytest.raises(SystemExit):
+        grade.validate(_g_argv(tmp_path, "--confirm-calls", "28"), {}, REPO)
+
+
+def test_grade_live_writes_grades_and_cells_blind_and_reproducible(tmp_path):
+    rows = _calls_file(tmp_path)
+    args = grade.validate(_g_argv(tmp_path, "--confirm-calls", "28"),
+                          {"CORROBORATION_API_KEY": "k"}, REPO)
+    fake = GraderFake()
+    out = io.StringIO()
+    code, _ = grade.run(args, call=fake, stdout=out)
+    assert code == 0 and len(fake.prompts) == 28
+    for p in fake.prompts:
+        for leak in ("gemini", "sonnet", "web_v1", "single/", "r0-"):
+            assert leak not in p
+    order1 = [p.split(SECRET_A + "-")[1].split()[0] for p in fake.prompts]
+    assert order1 != sorted(order1, key=int)          # shuffled
+    fake2 = GraderFake()
+    grade.run(args, call=fake2, stdout=io.StringIO())
+    assert fake2.prompts == fake.prompts              # same seed, same order
+    grades = [json.loads(l) for l in open(tmp_path / "grades_r0.jsonl", encoding="utf-8")]
+    by_id = {g["run_id"]: g["label"] for g in grades}
+    assert by_id[rows[0]["run_id"]] == "no_answer" and rows[1]["run_id"] not in by_id
+    cells = json.loads((tmp_path / "cells_r0.json").read_text("utf-8"))
+    c = cells["single/web_v1/gemini"]
+    assert (c["step"], c["prompt_id"], c["model_key"], c["p50_ms"]) == \
+        ("single", "web_v1", "gemini", 1000)
+    assert c["items"]["t1"]["labels"] == ["no_answer", "correct", "correct"]
+    assert (c["items"]["t1"]["majority"], c["items"]["t1"]["stable"]) == ("correct", False)
+    assert c["items"]["t2"]["labels"] == ["correct", "correct"]     # no_draft: not a label
+    assert c["items"]["t2"]["stable"] is False
+    assert c["items"]["t3"] == {"labels": ["correct"] * 3, "majority": "correct",
+                                "stable": True, "kind": "standard"}
+    assert c["items"]["t5"]["kind"] == "unsure"
+    blob = out.getvalue() + (tmp_path / "grades_r0.jsonl").read_text("utf-8") + \
+        (tmp_path / "cells_r0.json").read_text("utf-8")
+    assert SECRET_A not in blob and SECRET_Q not in blob

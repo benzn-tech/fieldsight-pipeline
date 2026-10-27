@@ -1,0 +1,262 @@
+"""Blind grader for matrix answers: one DeepSeek call per answer, no cell label.
+
+Spec: docs/superpowers/specs/2026-10-27-claude-web-answer-bench-design.md §5.1, §5.2, §4.4
+Plan: docs/superpowers/plans/2026-10-28-web-answer-prompt-matrix.md (Task 6)
+
+    C:/Users/camil/wt/benchenv/Scripts/python.exe tools/web-answer-bench/grade.py \
+        --out <matrix out dir> --calls matrix_r0_calls.jsonl --seed <int> --dry-run
+    # state the printed count, then: ... --confirm-calls <count>
+
+Exit codes: 0 done, 2 refused (arguments / env / no calls file).
+
+The grader sees the question, the gold facts, the kind, the retrieved source
+domains and the blinded answer -- never a run id, cell, prompt or model name.
+Answers go out in a seeded shuffle. Three labels exist besides the rubric's:
+  ungraded   the grader's reply was not JSON or not a known label (counted,
+             never read as `wrong`)
+  no_answer  the run produced nothing a reader would see; not sent to the
+             grader, ranked below `wrong`
+  (skipped)  a verify run with no gemini draft (`no_draft`): not the verify
+             prompt's doing, so it gets no label at all
+Nothing printed or written here carries question or answer text.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import re
+import statistics
+import sys
+from collections import Counter
+from pathlib import Path
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(os.path.dirname(HERE))
+for _p in (HERE, os.path.join(REPO, "src")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import openrouter_bench                                  # noqa: E402
+import prompts                                           # noqa: E402
+
+ORDER = ["wrong", "hallucinated_source", "partial", "correctly_unsure", "correct"]
+NO_ANSWER = "no_answer"
+UNGRADED = "ungraded"
+_RANK = {NO_ANSWER: -1, **{label: i for i, label in enumerate(ORDER)}}
+GRADER_PROMPT = "grader_v1"
+GRADER_TIMEOUT_S = 30.0          # not on a reader's clock
+GRADER_MAX_TOKENS = 256
+
+_UNVERIFIED = re.compile(r"\s*\[\s*unverified\s*\]", re.I)
+_MD_LINK = re.compile(r"\[([^\]]*)\]\((https?://[^)\s]+)\)")
+_URL = re.compile(r"https?://[^\s)\]>\"']+", re.I)
+_FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.MULTILINE)
+
+
+def _host(url):
+    m = re.match(r"^[a-z][a-z0-9+.-]*://([^/?#]+)", url, re.I)
+    host = m.group(1).split("@")[-1].split(":")[0].lower() if m else ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def _strip_url(url):
+    return url.rstrip(".,;:!?")
+
+
+def _url_to_host(m):
+    url = _strip_url(m.group(0))
+    return _host(url) + m.group(0)[len(url):]          # keep trailing punctuation
+
+
+def blind(text):
+    """The grader's copy: no [unverified] markers, links reduced to their text,
+    bare URLs to their host."""
+    t = _UNVERIFIED.sub("", text or "")
+    t = _MD_LINK.sub(lambda m: m.group(1), t)
+    t = _URL.sub(_url_to_host, t)
+    return re.sub(r"[ \t]{2,}", " ", t).strip()
+
+
+def source_flag(answer, domains, urls=()):
+    """Hosts of http(s) literals in the answer that are in no retrieved domain
+    (spec §5.2). A literal that is exactly a result URL counts as retrieved."""
+    allowed = {(d or "").lower().removeprefix("www.") for d in domains or () if d}
+    seen = set(urls or ())
+    flagged = []
+    for m in _URL.finditer(answer or ""):
+        url = _strip_url(m.group(0))
+        host = _host(url)
+        if not host or url in seen:
+            continue
+        if host in allowed or any(host.endswith("." + d) for d in allowed):
+            continue
+        if host not in flagged:
+            flagged.append(host)
+    return flagged
+
+
+def _parse_label(text):
+    try:
+        parsed = json.loads(_FENCE.sub("", text or "").strip())
+    except Exception:                                     # noqa: BLE001 - any shape but ours
+        return None
+    label = parsed.get("label") if isinstance(parsed, dict) else None
+    return label if label in ORDER else None
+
+
+def _lines(values):
+    return "\n".join(f"- {v}" for v in values) if values else "(none)"
+
+
+def grade_one(question, gold, answer, domains, *, urls=(), call=openrouter_bench.call):
+    flagged = source_flag(answer, domains, urls)
+    prompt = prompts.load(GRADER_PROMPT).format(
+        question=question, kind=gold.get("kind") or "standard",
+        expected=_lines(gold.get("expected") or []),
+        variants=_lines(gold.get("variants") or []),
+        domains=", ".join(domains) if domains else "(none)", answer=blind(answer))
+    r = call("grader", prompt, web=False, timeout=GRADER_TIMEOUT_S,
+             max_tokens=GRADER_MAX_TOKENS)
+    label = _parse_label(r.get("text")) if r.get("outcome") == "ok" else None
+    return {"label": label or UNGRADED, "raw_ok": label is not None,
+            "source_flag": bool(flagged), "flagged_hosts": flagged,
+            "grader_outcome": r.get("outcome"),
+            "grader_cost_usd": r.get("openrouter_cost_usd")}
+
+
+def majority(labels):
+    """(label, stable) over one cell's reps of one item. `ungraded` is left out;
+    no majority -> the worst label. Stable = three reps, all graded, all equal."""
+    graded = [x for x in labels if x != UNGRADED]
+    if not graded:
+        return UNGRADED, False
+    label, n = Counter(graded).most_common(1)[0]
+    if n * 2 <= len(graded):
+        label = min(graded, key=lambda x: _RANK[x])
+    stable = len(labels) == 3 and len(graded) == 3 and len(set(graded)) == 1
+    return label, stable
+
+
+def load_gold(path):
+    with open(path, encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f if line.strip()]
+    return {r["id"]: r for r in rows if r.get("split") == "tune"}
+
+
+def _read_calls(path):
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def split(rows):
+    """(to grade, no answer, skipped)."""
+    skipped = [r for r in rows if r.get("outcome") == "no_draft"]
+    live = [r for r in rows if r.get("outcome") != "no_draft"]
+    return ([r for r in live if (r.get("answer") or "").strip()],
+            [r for r in live if not (r.get("answer") or "").strip()], skipped)
+
+
+def shuffled(rows, seed):
+    rows = sorted(rows, key=lambda r: r["run_id"])
+    random.Random(seed).shuffle(rows)
+    return rows
+
+
+def build_cells(rows, labels, gold):
+    """Per cell, per item: the labels by rep, the majority, `stable`; plus the
+    cell's p50 latency (the tie-break of select_freeze.best_round0)."""
+    cells = {}
+    for r in sorted(rows, key=lambda r: (r["cell"], r["item"], r["rep"])):
+        c = cells.setdefault(r["cell"], {"step": r["step"], "prompt_id": r["prompt_id"],
+                                         "model_key": r["model_key"], "_ms": [],
+                                         "items": {}})
+        if r.get("calls"):
+            c["_ms"].append(r["latency_ms"])
+        if r["run_id"] not in labels:
+            continue
+        it = c["items"].setdefault(r["item"], {"labels": []})
+        it["labels"].append(labels[r["run_id"]])
+    for c in cells.values():
+        ms = c.pop("_ms")
+        c["p50_ms"] = int(statistics.median(ms)) if ms else None
+        for item, it in c["items"].items():
+            it["majority"], it["stable"] = majority(it["labels"])
+            it["kind"] = (gold.get(item) or {}).get("kind")
+    return cells
+
+
+def _refuse(msg):
+    print("grade: " + msg, file=sys.stderr)
+    raise SystemExit(2)
+
+
+def validate(argv, env, repo_root=REPO):
+    ap = argparse.ArgumentParser(prog="grade")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--calls", required=True)
+    ap.add_argument("--seed", type=int, required=True)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--confirm-calls", type=int)
+    ap.add_argument("--set", default=os.path.join(HERE, "set.v1.jsonl"))
+    args = ap.parse_args(argv)
+    out = Path(args.out).resolve()
+    if out == Path(repo_root).resolve() or Path(repo_root).resolve() in out.parents:
+        _refuse("--out must be outside the repository")
+    calls = Path(args.calls)
+    calls = calls if calls.is_absolute() else out / calls
+    if not calls.exists():
+        _refuse(f"no calls file {calls.name} in --out (run matrix.py first)")
+    args.out, args.calls = str(out), str(calls)
+    if not args.dry_run:
+        if not env.get("CORROBORATION_API_KEY"):
+            _refuse("missing environment variable(s): CORROBORATION_API_KEY")
+        n = len(split(_read_calls(args.calls))[0])
+        if args.confirm_calls != n:
+            _refuse(f"--confirm-calls must equal the answers to grade {n} "
+                    "(run --dry-run first)")
+    return args
+
+
+def run(args, *, call=openrouter_bench.call, stdout=sys.stdout):
+    rows = _read_calls(args.calls)
+    todo, empty, skipped = split(rows)
+    info = {"to_grade": len(todo), "no_answer": len(empty), "skipped": len(skipped)}
+    print(f"grade: {len(todo)} grader calls (1 per answer, no retry), {len(empty)} runs "
+          f"without an answer (no_answer), {len(skipped)} skipped (no_draft), "
+          f"seed {args.seed}", file=stdout)
+    if args.dry_run:
+        return 0, dict(info, dry_run=True)
+
+    gold = load_gold(args.set)
+    labels = {}
+    with open(os.path.join(args.out, "grades_r0.jsonl"), "w", encoding="utf-8",
+              newline="") as f:
+        for r in empty:
+            labels[r["run_id"]] = NO_ANSWER
+            f.write(json.dumps({"run_id": r["run_id"], "label": NO_ANSWER, "raw_ok": None,
+                                "source_flag": False, "flagged_hosts": []}) + "\n")
+        for n, r in enumerate(shuffled(todo, args.seed)):
+            g = gold[r["item"]]
+            res = grade_one(g["question"], g, r["answer"], r.get("result_domains") or [],
+                            urls=r.get("result_urls") or [], call=call)
+            labels[r["run_id"]] = res["label"]
+            f.write(json.dumps(dict(res, run_id=r["run_id"], order=n)) + "\n")
+    cells = build_cells(rows, labels, gold)
+    with open(os.path.join(args.out, "cells_r0.json"), "w", encoding="utf-8",
+              newline="") as f:
+        json.dump(cells, f, indent=2)
+    counts = Counter(labels.values())
+    print("grade: labels " + json.dumps(dict(sorted(counts.items()))), file=stdout)
+    return 0, dict(info, labels=dict(counts))
+
+
+def main(argv=None):
+    args = validate(sys.argv[1:] if argv is None else argv, os.environ)
+    code, _ = run(args)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
