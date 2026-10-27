@@ -57,6 +57,7 @@ import llm_utils
 import batch_stitch
 import chunk_stitch
 import self_introduction
+import status_suggestions
 from transcript_utils import (
     extract_base_time_from_filename,
     extract_device_from_filename,
@@ -295,6 +296,14 @@ EMIT_EVIDENCE = os.environ.get('EMIT_EVIDENCE', 'false').lower() == 'true'
 # to before and no item_id is emitted. Wired template -> workflow -> env (fieldsight-unwired-toggle-trap).
 DECLARE_CONTINUITY = os.environ.get('DECLARE_CONTINUITY', 'false').lower() == 'true'
 
+# Spec 2026-10-27 (status suggestions from speech, v1 same-session). Rides on the continuity
+# block, so it does nothing unless DECLARE_CONTINUITY is on too and there is a prior pass. Off:
+# the prompt is byte-identical and every stray `status_suggestion` is stripped.
+STATUS_SUGGESTIONS = os.environ.get('STATUS_SUGGESTIONS', 'false').lower() == 'true'
+# Its own floor, not EVIDENCE_FLOOR_TOKENS: "that's done" is two tokens, and where this one
+# belongs is a measurement (dropped_by.weak in the eval), not a guess shared with topic evidence.
+STATUS_EVIDENCE_FLOOR_TOKENS = int(os.environ.get('STATUS_EVIDENCE_FLOOR_TOKENS', '5'))
+
 
 # Calibrated 2026-08-10 against two real sessions; the reasoning is in the
 # template Parameters and the PR. The code defaults are kept EQUAL to the
@@ -342,6 +351,25 @@ def _parse_at(at_str, session_date, turns):
     mid = anchored[len(anchored) // 2]
     return min((t, t + timedelta(days=1), t - timedelta(days=1)),
                key=lambda c: abs((c - mid).total_seconds()))
+
+
+def _check_status_quote(quote, at_str, turns, date, user_folder):
+    """One status-suggestion quote against the transcript the model saw: check_quote's result
+    plus the audio anchor as a segment key. Never raises -- a failure is `unchecked`, which the
+    filter drops."""
+    try:
+        at = _parse_at(at_str, date, turns)
+    except Exception:
+        return {"status": "unchecked"}
+    try:
+        r = evidence_match.check_quote(
+            quote, turns, at, w_seconds=EVIDENCE_WINDOW_SEC,
+            floor_tokens=STATUS_EVIDENCE_FLOOR_TOKENS, fuzzy_threshold=EVIDENCE_FUZZY)
+    except Exception:
+        logger.warning("status suggestions: quote check failed", exc_info=True)
+        return {"status": "unchecked"}
+    r["segment_key"] = _segment_key_for(r.get("segment_key_source"), user_folder, date)
+    return r
 
 
 def verify_evidence(result, turns, session_date, user_folder=None, date=None):
@@ -2069,6 +2097,7 @@ def extract_group(bucket, artifact):
             for child in topic.get(list_name) or []:
                 if isinstance(child, dict):
                     child.pop("continues", None)
+                    child.pop(status_suggestions.FIELD, None)   # no prior, no carry, no clock
 
     merged = dict(parsed)
     merged.update({
@@ -2231,6 +2260,7 @@ def _assign_fresh_ids_best_effort(topics):
             for child in children:
                 if isinstance(child, dict):
                     child.pop("continues", None)
+                    child.pop(status_suggestions.FIELD, None)
                     child["item_id"] = str(uuid.uuid4())
 
 
@@ -2375,7 +2405,9 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
     prompt, transcript_stats = build_extraction_prompt(
         user_folder, date, session_base, turns, n_segments,
         speaker_names=speaker_names,
-        continuity_block=item_continuity.render_block(continuity_prior))
+        continuity_block=item_continuity.render_block(
+            continuity_prior,
+            status_suggestions.INSTRUCTION if STATUS_SUGGESTIONS else ""))
     max_tokens = max_tokens_for(n_segments)  # BUG-16
 
     # Tier selects the model mode: the live pass must stay well inside the
@@ -2441,6 +2473,24 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
                       "question_set": item_continuity.QUESTION_SET, "claims": claims}
         if continuity_error is not None:
             continuity["error"] = continuity_error
+
+    # Spec 2026-10-27: keep a status suggestion only on an item carried by identity from the
+    # earlier pass (resolve above decided that) whose quoted words are really in the transcript.
+    # Runs its own quote check whatever EMIT_EVIDENCE says. Never fails the extraction.
+    suggestion_counts = None
+    if STATUS_SUGGESTIONS and continuity is not None and continuity_prior \
+            and continuity_error is None:
+        try:
+            suggestion_counts = status_suggestions.filter_suggestions(
+                parsed_topics, continuity_prior,
+                lambda quote, at: _check_status_quote(quote, at, turns, date, user_folder))
+            logger.info("status suggestions: %s", suggestion_counts)
+        except Exception:
+            logger.exception("status suggestions: filter failed -- all dropped")
+            status_suggestions.strip_all(parsed_topics)
+            suggestion_counts = {"error": True}
+    else:
+        status_suggestions.strip_all(parsed_topics)
 
     # Task 1 compatibility bridge: derive legacy safety_flags from the new
     # findings so lambda_item_writer/_map_safety keep working unchanged.
@@ -2595,6 +2645,9 @@ def _extract_session(bucket, user_folder, date, session_base, final=False,
     # extraction` keeps seeing today's shape.
     if continuity is not None:
         extraction['continuity'] = continuity
+    # Same additive posture: counts only (never quote text), present only when the filter ran.
+    if suggestion_counts is not None:
+        extraction['status_suggestions'] = suggestion_counts
     if final and _known_short(bucket, user_folder, date, session_base, keys, generation):
         # THIS RECORD IS KNOWN TO BE SHORT, and a fuller one follows: transcripts
         # landed while the model was thinking, and _rerun_if_the_session_grew

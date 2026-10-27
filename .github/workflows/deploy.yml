@@ -345,6 +345,8 @@ jobs:
               "StuckMergeSeconds=${{ vars.TEST_STUCK_MERGE_SECONDS || '1800' }}" \
               "GroupMaxSpanSeconds=${{ vars.TEST_GROUP_MAX_SPAN_SECONDS || '43200' }}" \
               "DeclareContinuity=${{ vars.TEST_DECLARE_CONTINUITY || 'false' }}" \
+              "StatusSuggestions=${{ vars.TEST_STATUS_SUGGESTIONS || 'false' }}" \
+              "StatusEvidenceFloorTokens=${{ vars.TEST_STATUS_EVIDENCE_FLOOR_TOKENS || '5' }}" \
               "EmitEvidence=${{ vars.TEST_EMIT_EVIDENCE || 'true' }}" \
               "EvidenceWindowSec=${{ vars.TEST_EVIDENCE_WINDOW_SEC || '60' }}" \
               "EvidenceFuzzyThreshold=${{ vars.TEST_EVIDENCE_FUZZY_THRESHOLD || '0.80' }}" \

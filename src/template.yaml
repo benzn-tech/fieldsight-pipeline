@@ -1239,6 +1239,23 @@ Parameters:
       continues which; code verifies each claim. Off = today's prompt byte-for-byte. Switch on only
       after the pre-registered measurement passes.
 
+  StatusSuggestions:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Spec 2026-10-27: on an item carried from an earlier pass of the same session, the extractor
+      may propose done/closed/blocked/in_progress with a verbatim quote; code keeps it only when
+      the quote verifies. Proposals are stored for a person to accept or dismiss -- never written
+      to action_items.status. Needs DeclareContinuity. Off = prompt byte-identical.
+
+  StatusEvidenceFloorTokens:
+    Type: Number
+    Default: 5
+    Description: >-
+      Fewest tokens a status-suggestion quote needs to count as verified (below it: weak, dropped).
+      Separate from EvidenceFloorTokens; set from the eval's dropped_by.weak.
+
   EmitEvidence:
     Type: String
     Default: 'false'
@@ -3663,6 +3680,8 @@ Resources:
       Environment:
         Variables:
           DECLARE_CONTINUITY: !Ref DeclareContinuity
+          STATUS_SUGGESTIONS: !Ref StatusSuggestions
+          STATUS_EVIDENCE_FLOOR_TOKENS: !Ref StatusEvidenceFloorTokens
           EMIT_EVIDENCE: !Ref EmitEvidence
           EVIDENCE_WINDOW_SEC: !Ref EvidenceWindowSec
           EVIDENCE_FUZZY_THRESHOLD: !Ref EvidenceFuzzyThreshold

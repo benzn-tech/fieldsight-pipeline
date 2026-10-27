@@ -133,15 +133,20 @@ def _scrub(text):
     return " ".join(text.split())
 
 
-def render_block(prior):
+def render_block(prior, extra_instruction=""):
     """The prior list as one JSON line per item inside its own fence, placed before the
     instructions. Sentinels are stripped from the texts because they are model output derived
-    from speech (final review I8)."""
+    from speech (final review I8).
+
+    `extra_instruction` rides on this block, and only on it, for a rule that is meaningful only
+    when there is an earlier item to continue (status_suggestions.INSTRUCTION): no prior, no
+    block, so the prompt stays byte-identical to today's."""
     if not prior:
         return ""
     lines = [json.dumps({"alias": p.alias, "kind": KINDS[p.list_name].record_type,
                           "text": _scrub(p.text)}, ensure_ascii=False) for p in prior]
-    return ("\n## Items from the earlier pass\n" + CONTINUITY_INSTRUCTION + "\n"
+    extra = (extra_instruction + "\n") if extra_instruction else ""
+    return ("\n## Items from the earlier pass\n" + CONTINUITY_INSTRUCTION + "\n" + extra
             + _OPEN + "\n" + "\n".join(lines) + "\n" + _CLOSE + "\n")
 
 

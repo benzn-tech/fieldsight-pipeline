@@ -37,6 +37,8 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   PATCH /api/org/observations/{id}        → update status (author or admin/gm)
   PATCH /api/org/action-items/{id}        → update priority/status/deadline/responsible
                                              (site-authority ACL + member-validated reassignment)
+  POST  /api/org/action-items/{id}/status-suggestion → accept/dismiss a status heard in
+                                             speech (same ACL; accept = the PATCH, audited)
   GET   /api/org/action-items/closures?from=&to= → action items CLOSED per NZ
                                              calendar day in the window + the same-length
                                              window before it, from the content_edits
@@ -192,6 +194,7 @@ import batch_stitch
 import deletion_mirror
 import speaker_match_request
 from repositories import speaker_name_proposals
+from repositories import status_suggestions as status_suggestions_repo
 from repositories import speaker_intro_suggestions
 import turn_name_overlay
 import template_types
@@ -745,6 +748,9 @@ def dispatch(conn, event, method, route):
     m_ai = re.match(r"^/action-items/([^/]+)$", route)
     if m_ai and method == "PATCH":
         return patch_action_item(conn, caller, m_ai.group(1), parse_body(event))
+    m_ais = re.match(r"^/action-items/([^/]+)/status-suggestion$", route)
+    if m_ais and method == "POST":
+        return decide_status_suggestion(conn, caller, m_ais.group(1), parse_body(event))
 
     # Track B Task 5 Step 2 -- addressed by topic_questions.stable_id, not .id (see
     # patch_question's docstring for why that differs from action-items above).
@@ -7236,6 +7242,77 @@ def _audit_text(value):
     return None if value is None else str(value)
 
 
+def _action_item_edit_acl(conn, caller, action_item_id):
+    """`(row, None)` when the caller may edit this action item, else `(None, error_response)`.
+
+    The one definition of "may edit a task", shared by PATCH /action-items/{id} and the
+    status-suggestion decision (which has no PATCH of its own to ride on when dismissing):
+    tenant, the caller's site reach, then admin/gm, this site's pm/site_manager, or the
+    current assignee."""
+    row = action_items.get_action_item(conn, action_item_id)
+    # platform_admin (is_cross_company) edits across every tenant; company roles
+    # stay pinned to their own company (mirrors the Team/sites fix in #96).
+    cross = is_cross_company(caller["global_role"])
+    if row is None or (not cross and not _row_company_ok(
+            conn, caller, row["company_id"], row["site_id"])):
+        return None, error("action item not found", 404)            # incl. cross-company
+    site_id = str(row["site_id"])
+    if site_id not in _allowed_site_ids(conn, caller):
+        return None, error("access denied to this task's site", 403)  # reach gate
+    site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
+    is_admin = _is_company_admin_of(caller, row["company_id"], cross)
+    is_site_authority = site_role in ("pm", "site_manager")
+    is_assignee = _is_assignee(row, caller)
+    if not (is_admin or is_site_authority or is_assignee):
+        return None, error("admin/gm, this site's pm/site_manager, or the assignee only", 403)
+    return row, None
+
+
+class _SuggestionNotApplied(Exception):
+    """The accept's PATCH answered non-200: roll the whole decision back."""
+
+    def __init__(self, response):
+        super().__init__("status suggestion not applied")
+        self.response = response
+
+
+def decide_status_suggestion(conn, caller, action_item_id, body):
+    """POST /action-items/{id}/status-suggestion {suggestion_id, decision: accept|dismiss}
+    (spec 2026-10-27 §4.5).
+
+    ACL first -- the same check as PATCH, before anything about the suggestion is revealed.
+    Then 404 unless the suggestion targets THIS item's stable_id and is still pending.
+    accept: the normal PATCH (audit row, actor = the person) and the suggestion marked accepted,
+    in ONE transaction -- a refused PATCH rolls the mark back. dismiss: marked dismissed, no
+    status change; the (stable_id, status) unique key keeps it from coming back."""
+    if body is None:
+        return error("malformed JSON body", 400)
+    decision = body.get("decision")
+    if decision not in ("accept", "dismiss"):
+        return error("decision must be accept or dismiss", 400)
+    row, denied = _action_item_edit_acl(conn, caller, action_item_id)
+    if denied is not None:
+        return denied
+    s = status_suggestions_repo.get_suggestion(conn, body.get("suggestion_id"))
+    if s is None or s["state"] != "pending" or str(s["stable_id"]) != str(row.get("stable_id")):
+        return error("suggestion not found", 404)
+    try:
+        with conn.transaction():
+            if decision == "accept":
+                res = patch_action_item(conn, caller, action_item_id,
+                                        {"status": s["suggested_status"]})
+                if res.get("statusCode") != 200:
+                    raise _SuggestionNotApplied(res)
+            done = status_suggestions_repo.resolve_suggestion(
+                conn, s["id"], "accepted" if decision == "accept" else "dismissed", caller["id"])
+            if done is None:                       # someone decided it first
+                raise _SuggestionNotApplied(error("suggestion already decided", 409))
+    except _SuggestionNotApplied as e:
+        return e.response
+    return ok({"suggestion_id": str(s["id"]), "state": done["state"],
+               "status": s["suggested_status"] if decision == "accept" else row["status"]})
+
+
 def patch_action_item(conn, caller, action_item_id, body):
     """Edit priority/status/deadline/responsible on one action item (spec §3).
     ACL mirrors patch_observation_status widened to site authority: the task's
@@ -7252,22 +7329,10 @@ def patch_action_item(conn, caller, action_item_id, body):
     does (same posture as apply_topic_correction)."""
     if body is None:
         return error("malformed JSON body", 400)
-    row = action_items.get_action_item(conn, action_item_id)
-    # platform_admin (is_cross_company) edits across every tenant; company roles
-    # stay pinned to their own company (mirrors the Team/sites fix in #96).
-    cross = is_cross_company(caller["global_role"])
-    if row is None or (not cross and not _row_company_ok(
-            conn, caller, row["company_id"], row["site_id"])):
-        return error("action item not found", 404)            # incl. cross-company
+    row, denied = _action_item_edit_acl(conn, caller, action_item_id)
+    if denied is not None:
+        return denied
     site_id = str(row["site_id"])
-    if site_id not in _allowed_site_ids(conn, caller):
-        return error("access denied to this task's site", 403)  # reach gate
-    site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
-    is_admin = _is_company_admin_of(caller, row["company_id"], cross)
-    is_site_authority = site_role in ("pm", "site_manager")
-    is_assignee = _is_assignee(row, caller)
-    if not (is_admin or is_site_authority or is_assignee):
-        return error("admin/gm, this site's pm/site_manager, or the assignee only", 403)
 
     fields = {}
     if "priority" in body:
@@ -10294,6 +10359,40 @@ def _deadline_fields(a, date):
             "deadline_by": d["by"] if d else None}
 
 
+def _pending_status_suggestions(conn, rows):
+    """Pending status suggestions (spec 2026-10-27) for every action item on these rows, in ONE
+    query. Callers without a conn (reindex's builder) get none. Never fatal: a view that cannot
+    read suggestions still renders the day."""
+    if conn is None:
+        return {}
+    ids = [i for t in rows for a in (t.get("action_items") or [])
+           for i in [a.get("id"), *(a.get("collapsed_ids") or [])] if i]
+    if not ids:
+        return {}
+    try:
+        return status_suggestions_repo.pending_for_action_item_ids(conn, ids)
+    except Exception:  # noqa: BLE001
+        logger.exception("status suggestions could not be read")
+        return {}
+
+
+def _status_suggestion_field(item, suggestions):
+    """`{"status_suggestion": {...}}` for one serialized action item, or `{}`.
+
+    The newest pending suggestion across the row and any rows the 0-day collapse folded into it
+    (the folded rows' suggestions would otherwise vanish with them), and only one that would
+    CHANGE something: a suggestion equal to the current status is not shown."""
+    found = [s for i in [item.get("id"), *(item.get("collapsed_ids") or [])] if i
+             for s in suggestions.get(str(i), [])]
+    found = [s for s in found if s["suggested_status"] != item.get("status")]
+    if not found:
+        return {}
+    s = max(found, key=lambda r: (r["created_at"], str(r["id"])))
+    return {"status_suggestion": {"id": str(s["id"]), "status": s["suggested_status"],
+                                  "quote": s["quote"], "segment_key": s["segment_key"],
+                                  "offset_sec": s["offset_sec"]}}
+
+
 def render_report_shape(rows, doc, date, folder, conn=None, company_id=None,
                         all_companies=False):
     """Pure function: render Aurora extraction topics INTO the
@@ -10345,6 +10444,7 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None,
     _thread_ids = {str(r["thread_id"]) for r in rows if r.get("thread_id")}
     _thread_facts = (threads.facts_for_threads(conn, list(_thread_ids))
                      if conn is not None and _thread_ids else {})
+    _suggestions = _pending_status_suggestions(conn, rows)
     for i, t in enumerate(rows):
         flags = [{"observation": f["observation"],
                   "risk_level": _SEV_TO_RISK.get(f["severity"], "medium"),
@@ -10435,6 +10535,7 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None,
                               # count, so its rows are v1. The session-report preview reads
                               # through list_topics_for_source_prefix and carries the count.
                               "version": 1 + int(a.get("edit_count") or 0),
+                              **_status_suggestion_field(a, _suggestions),
                               } for a in t["action_items"]],
             # The subject this topic belongs to, when a human has confirmed
             # one. FACTS ONLY -- how many days it was raised on, when last,

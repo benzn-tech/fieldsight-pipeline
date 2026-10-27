@@ -64,6 +64,8 @@ import boto3
 from lake_put import lake_put
 
 import carry_forward_apply
+import status_suggestions
+from repositories import status_suggestions as status_suggestions_repo
 import index_request
 import continuity_records
 import item_continuity
@@ -1092,6 +1094,50 @@ def _record_work_class_decision(conn, company_id, site_id, topic_id,
         logger.warning("work_class decision record not stored for topic=%s", topic_id)
 
 
+def _has_status_suggestions(extraction_topics):
+    return any(isinstance(a, dict) and isinstance(a.get(status_suggestions.FIELD), dict)
+               for t in extraction_topics if isinstance(t, dict)
+               for a in (t.get("action_items") or []))
+
+
+def _store_status_suggestions(conn, extraction_topics, new_topic_ids, company_id, run):
+    """Store the extractor's kept status suggestions against the items they target (spec
+    2026-10-27 §4.3). Returns counts; never logs quote text.
+
+    Read from the artifact's children (after clean_item_ids), not from the mapped insert rows --
+    _map_action_items is a closed key set. A suggestion lands only when this pass's row for its
+    item_id was carried BY IDENTITY (repo.target_for_item_id: the predecessor wears the same
+    item_id; Part C.3) and its status is not already the suggested one. The status itself is
+    never touched (Part C.2).
+
+    This is the SECOND guard. The first, and the authoritative one, is the extractor's filter
+    after item_continuity.resolve: a child that got a fresh id never reaches the artifact with a
+    suggestion. This one catches what the database knows and the extractor cannot -- an id the
+    writer cleaned to NULL, a predecessor row that is gone, a text-only carry. It cannot catch a
+    REDELIVERY of an artifact that bypassed the extractor: the first write makes that child's
+    fresh id its own lineage, so the second write sees an identity carry."""
+    stats = {"stored": 0, "not_carried": 0, "already": 0, "duplicate": 0}
+    for t in extraction_topics:
+        if not isinstance(t, dict):
+            continue
+        for a in t.get("action_items") or []:
+            s = a.get(status_suggestions.FIELD) if isinstance(a, dict) else None
+            if not isinstance(s, dict) or s.get("status") not in status_suggestions.STATUSES:
+                continue
+            row = status_suggestions_repo.target_for_item_id(conn, new_topic_ids, a.get("item_id"))
+            if row is None:
+                stats["not_carried"] += 1
+                continue
+            if row["status"] == s["status"]:
+                stats["already"] += 1
+                continue
+            made = status_suggestions_repo.insert_suggestion(
+                conn, company_id, row["site_id"], row["stable_id"], s["status"], s.get("quote"),
+                s.get("segment_key"), s.get("offset_sec"), run)
+            stats["stored" if made else "duplicate"] += 1
+    return stats
+
+
 def write_extraction_items(date, user_folder, extraction_key):
     raw = s3().get_object(Bucket=S3_BUCKET, Key=extraction_key)["Body"].read()
     extraction = json.loads(raw.decode("utf-8"))
@@ -1582,6 +1628,19 @@ def write_extraction_items(date, user_folder, extraction_key):
         except Exception:
             logger.warning("continuity decision records not stored for %s", extraction_key,
                             exc_info=True)
+
+        # Status suggestions from speech (spec 2026-10-27). AFTER carry-forward: the guard is
+        # "this row's predecessor wears the same item_id", which only the item_id pairing pass
+        # above produces. Never writes action_items.status. Own SAVEPOINT, never fatal.
+        if new_topic_ids and _has_status_suggestions(extraction_topics):
+            try:
+                with conn.transaction():
+                    s_stats = _store_status_suggestions(
+                        conn, extraction_topics, new_topic_ids, owner_company_id, run)
+                logger.info("status suggestions stored: %s key=%s", s_stats, extraction_key)
+            except Exception:
+                logger.warning("status suggestions not stored for %s", extraction_key,
+                               exc_info=True)
 
         # THE DAY'S PHOTOS, BOUND ONCE, AFTER THIS EXTRACTION'S TOPICS EXIST.
         # Never fatal: a rebind that turned a good extraction into a failed one
