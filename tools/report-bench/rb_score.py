@@ -237,7 +237,11 @@ def _verdict_tables(out, phase):
 
 def score_phase(out, phase):
     import rb_requests
-    recs = rb_common.read_jsonl(os.path.join(out, "runs", phase + ".jsonl"))
+    import rb_run
+    # The last record per key, and only runs the model finished (an infra
+    # failure is rerun, not scored).
+    recs = [r for r in rb_run.latest(rb_common.read_jsonl(
+        os.path.join(out, "runs", phase + ".jsonl"))).values() if rb_run.is_done(r)]
     verdicts = _verdict_tables(out, phase)
     golds = {}
     manifest = rb_common.read_json(os.path.join(out, "inputs", "manifest.json"))

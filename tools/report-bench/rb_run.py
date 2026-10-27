@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import os
 import sys
 from collections import Counter
@@ -113,6 +114,48 @@ def plan(phase, tasks, index, manifest=None, pilot_session=None, cells=None):
     return out
 
 
+def is_done(rec) -> bool:
+    """A finished run, for resume. Not done: no key, 429, 5xx, connection
+    errors (status None) -- the vendor or our setup, not the model -- and a
+    schema_rejected cell whose format-free rerun has not happened."""
+    if rec.get("outcome") == "schema_rejected":
+        return False
+    a = (rec.get("attempts") or [{}])[-1]
+    if a.get("error_code") == "no_key":
+        return False
+    if rec.get("outcome") == "http_error":
+        st = a.get("http_status")
+        return not (st is None or st == 429 or st >= 500)
+    return True
+
+
+def latest(records) -> dict:
+    """The last record per key (a retried run appends a new one)."""
+    out = {}
+    for r in records:
+        out[r["key"]] = r
+    return out
+
+
+def done_keys(runs_path):
+    return {k for k, r in latest(rb_common.read_jsonl(runs_path)).items() if is_done(r)}
+
+
+def preflight(todo, client_factory) -> list:
+    """What would make the run fail on its first call, checked before the lock."""
+    vendors = {rb_requests.MODELS[c["model"]]["vendor"] for c in todo}
+    problems = []
+    if "openrouter" in vendors and not (os.environ.get("QWEN_API_KEY")
+                                        or os.environ.get("DASHSCOPE_API_KEY")):
+        problems.append("QWEN_API_KEY (the OpenRouter key) is not set")
+    if "anthropic" in vendors:
+        if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
+            problems.append("ANTHROPIC_API_KEY is not set")
+        if client_factory is _default_client and importlib.util.find_spec("anthropic") is None:
+            problems.append("the anthropic SDK is not importable (use benchenv)")
+    return problems
+
+
 def _cell(c):
     return f"{c['task']}|{c['candidate']}|{c['model']}"
 
@@ -140,8 +183,9 @@ def execute(phase, calls, out, *, caller=None, client_factory=_default_client, h
     import rb_callers
     caller = caller or rb_callers.call
     runs_path = os.path.join(out, "runs", phase + ".jsonl")
-    done = {r["key"] for r in rb_common.read_jsonl(runs_path)}
-    dropped = {_cell(r) for r in rb_common.read_jsonl(runs_path) if r.get("format_dropped")}
+    done = done_keys(runs_path)
+    dropped = {_cell(r) for r in rb_common.read_jsonl(runs_path)
+               if r.get("format_dropped") or r.get("outcome") == "schema_rejected"}
     ledger = rb_ledger.ReportLedger(os.path.join(out, rb_ledger.LEDGER_NAME))
     client, cap_hit, cut = None, False, []
     for c in calls:
@@ -163,6 +207,11 @@ def execute(phase, calls, out, *, caller=None, client_factory=_default_client, h
         format_dropped = not with_format
         if claude and r["outcome"] == "schema_rejected":
             dropped.add(_cell(c))
+        if claude and r["outcome"] == "schema_rejected" and (
+                cap_hit or not ledger.can_spend(c["pool"], c["usd_upper"])):
+            cap_hit = True                      # recorded as schema_rejected: not done
+            cut.append(c["key"])
+        elif claude and r["outcome"] == "schema_rejected":
             first = r["attempts"]
             r = caller(c["model"], c["task"], prompt, c["budget"], http=http, client=client,
                        with_format=False)
@@ -184,7 +233,8 @@ def execute(phase, calls, out, *, caller=None, client_factory=_default_client, h
 
 
 def summary(phase, out, cut):
-    recs = rb_common.read_jsonl(os.path.join(out, "runs", phase + ".jsonl"))
+    recs = list(latest(rb_common.read_jsonl(os.path.join(out, "runs",
+                                                          phase + ".jsonl"))).values())
     counts = Counter(f"{_cell(r)}|{r['outcome']}" for r in recs)
     cut_cells = sorted({k.split("|", 1)[1].rsplit("|", 2)[0] for k in cut})
     s = {"phase": phase, "runs": len(recs), "counts": dict(sorted(counts.items())),
@@ -215,8 +265,7 @@ def main(argv=None, *, caller=None, client_factory=_default_client, http=None, c
         import rb_select
         cells = rb_select.cells_for_phase(a.phase, out)
     calls = plan(a.phase, a.task, index, manifest, a.pilot_session, cells)
-    done = {r["key"] for r in rb_common.read_jsonl(os.path.join(out, "runs",
-                                                                a.phase + ".jsonl"))}
+    done = done_keys(os.path.join(out, "runs", a.phase + ".jsonl"))
     todo = [c for c in calls if c["key"] not in done]
     an, orr = split_upper(todo)
     print(f"phase {a.phase}: planned {len(calls)} calls, done {len(calls) - len(todo)}, "
@@ -229,6 +278,11 @@ def main(argv=None, *, caller=None, client_factory=_default_client, http=None, c
         return 0
     if a.confirm_calls != len(todo):
         print(f"--confirm-calls {a.confirm_calls} != {len(todo)} calls to make; nothing sent")
+        return 2
+    problems = preflight(todo, client_factory)
+    if problems:
+        for p in problems:
+            print("refused: " + p)
         return 2
     with rb_common.bench_lock(out, "report"):
         res = execute(a.phase, todo, out, caller=caller, client_factory=client_factory,

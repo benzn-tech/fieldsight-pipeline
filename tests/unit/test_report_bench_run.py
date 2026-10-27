@@ -39,6 +39,12 @@ def _index():
     return idx
 
 
+@pytest.fixture(autouse=True)
+def _keys(monkeypatch):
+    monkeypatch.setenv("QWEN_API_KEY", "k")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+
+
 def _setup(tmp_path, index=None):
     out = str(tmp_path / "out")
     index = index or _index()
@@ -206,3 +212,62 @@ def test_import_does_not_pull_the_sdk():
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                        cwd=REPO, env=dict(os.environ))
     assert r.stdout.strip() == "False", r.stderr[-500:]
+
+
+def test_missing_key_exits_2_before_lock(tmp_path, monkeypatch):
+    out = _setup(tmp_path)
+    monkeypatch.delenv("QWEN_API_KEY")
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    fc = FakeCaller()
+    assert _main(out, ["--phase", "pilot", "--task", "X", "--confirm-calls", "6"], fc) == 2
+    assert fc.n == 0 and not os.path.exists(os.path.join(out, common.LOCK_NAME))
+    monkeypatch.setenv("QWEN_API_KEY", "k")
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    assert _main(out, ["--phase", "pilot", "--task", "X", "--confirm-calls", "6"], fc) == 2
+    assert fc.n == 0
+
+
+def test_missing_sdk_exits_2(tmp_path, monkeypatch):
+    out = _setup(tmp_path)
+    monkeypatch.setattr(run.importlib.util, "find_spec",
+                        lambda name, *a: None if name == "anthropic" else object())
+    fc = FakeCaller()
+    assert run.main(["--out", out, "--phase", "pilot", "--task", "X", "--confirm-calls", "6"],
+                    caller=fc) == 2
+    assert fc.n == 0
+
+
+def test_infra_failures_are_not_done_on_resume(tmp_path):
+    out = _setup(tmp_path)
+    keys = [c["key"] for c in run.plan("pilot", ["X"], _index())]
+    outcomes = [("http_error", None, "no_key"), ("http_error", 429, None),
+                ("http_error", 503, None), ("http_error", None, "ConnectionError"),
+                ("truncated", 200, None), ("timeout", None, "ReadTimeout")]
+    for k, (o, st, ec) in zip(keys, outcomes):
+        common.append_jsonl(os.path.join(out, "runs", "pilot.jsonl"),
+                            {"key": k, "task": "X", "candidate": "X-cur", "model": k.split("|")[3],
+                             "outcome": o, "attempts": [{"http_status": st, "error_code": ec}],
+                             "usd": 0.0})
+    fc = FakeCaller()
+    assert _main(out, ["--phase", "pilot", "--task", "X", "--confirm-calls", "4"], fc) == 0
+    assert fc.n == 4
+    s = common.read_json(os.path.join(out, "summary_pilot.json"))
+    assert s["runs"] == 6 and sum(v for k, v in s["counts"].items() if k.endswith("|ok")) == 4
+
+
+def test_schema_rerun_checks_the_pool(tmp_path):
+    out = _setup(tmp_path)
+    led = ledger.ReportLedger(os.path.join(out, ledger.LEDGER_NAME))
+    calls = []
+
+    def caller(key, task, prompt, budget, http=None, client=None, with_format=True):
+        calls.append((key, with_format))
+        if key == "sonnet" and with_format:
+            led.add("report/pilot", 31.0)          # pool gone between the two calls
+            return {"attempts": [{"outcome": "schema_rejected", "usd": None}],
+                    "outcome": "schema_rejected", "text": "", "usd": 0.0}
+        return {"attempts": [{"outcome": "ok", "usd": 0.0}], "outcome": "ok", "text": "{}",
+                "usd": 0.0}
+    assert _main(out, ["--phase", "pilot", "--task", "X", "--confirm-calls", "6"], caller) == 3
+    assert ("sonnet", False) not in calls
