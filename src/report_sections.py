@@ -37,6 +37,8 @@ outrank a real one merely for containing characters. The text the model wrote is
 still what gets displayed.
 """
 
+from datetime import date as _date
+
 import due_dates
 import due_display
 
@@ -110,6 +112,7 @@ def build(report):
     sections = [
         _summary(report),
         _actions(topics, report.get("report_date")),
+        *_closures(report),
         _open_questions(topics),
         _decisions(topics),
         _dates(report),
@@ -259,6 +262,63 @@ def _rank(row):
         _PRIORITY.get(row["priority"], len(_PRIORITY)),
         row["_seq"],
     )
+
+
+#: The slot word for each finished status. `done` and `closed` are both "off
+#: the list", and the reader must be able to tell which: done is work that was
+#: done, closed is work that will not be (cancelled, superseded, duplicate).
+_FINISH_LABEL = {"done": "done", "closed": "not needed"}
+
+_WEEKDAY = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def _closures(report):
+    """"Closed today" and "Closed this week" -- what left the list, and how.
+
+    Built from `report["closures"]`, which the caller fills from the audit trail
+    (content_edits status transitions, so each row has a real day and actor), not
+    from the status the Actions section shows. A report without it -- the nightly
+    generator and meeting minutes have no database -- gets neither section.
+
+    The week is the seven local days ending on the report date. Today's rows are
+    NOT repeated under the week: the week section lists the six days before, so
+    one closure is read once.
+    """
+    closures = report.get("closures")
+    if not isinstance(closures, list):
+        return []
+    today = str(report.get("report_date") or "")
+    rows_today, rows_week = [], []
+    for c in closures:
+        if not isinstance(c, dict):
+            continue
+        text = _clean(c.get("text"))
+        label = _FINISH_LABEL.get(_clean(c.get("status")).lower())
+        if not text or not label:
+            continue
+        on = _clean(c.get("closed_on"))
+        by = _clean(c.get("closed_by"))
+        if on == today:
+            rows_today.append({"title": text, "status": label,
+                               "note": f"by {by}" if by else ""})
+        else:
+            rows_week.append({"title": text, "status": label,
+                              "note": _join(_day_label(on), f"by {by}" if by else "")})
+    out = []
+    if rows_today:
+        out.append({"title": "Closed today", "kind": "entries", "items": rows_today})
+    if rows_week:
+        out.append({"title": "Closed this week", "kind": "entries", "items": rows_week})
+    return out
+
+
+def _day_label(iso):
+    """`Tue 21 Oct` for a YYYY-MM-DD, or the text as given when it is not one."""
+    try:
+        d = _date.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return iso
+    return f"{_WEEKDAY[d.weekday()]} {d.day} {d.strftime('%b')}"
 
 
 def _open_questions(topics):
