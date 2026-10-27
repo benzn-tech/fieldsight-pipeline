@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blind listing</title>
+<style>
+:root { --bg:#fbfaf7; --fg:#1d1d1b; --muted:#6b6a65; --line:#dedbd2; --card:#ffffff; --accent:#2f5d8a; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#161614; --fg:#ecebe6; --muted:#a3a19a; --line:#34332f; --card:#1f1f1c; --accent:#8db4dc; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, sans-serif; }
+main { display:grid; grid-template-columns: minmax(0,3fr) minmax(0,2fr); gap:16px; padding:16px; }
+@media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+h1 { font-size:18px; margin:16px 16px 0; } p.note { color:var(--muted); margin:4px 16px 0; }
+.turns { max-height: 85vh; overflow:auto; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px 12px; }
+.turn { margin:4px 0; } .turn b { color:var(--accent); font-weight:600; } .turn span.t { color:var(--muted); font-size:12px; margin-right:6px; }
+.items { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px; }
+.item { border-bottom:1px solid var(--line); padding:8px 0; display:grid; gap:4px; }
+.item input, .item select, .item textarea { width:100%; font:inherit; color:var(--fg); background:var(--bg); border:1px solid var(--line); border-radius:4px; padding:4px 6px; }
+button { font:inherit; padding:6px 12px; border-radius:6px; border:1px solid var(--accent); background:transparent; color:var(--accent); cursor:pointer; margin:4px 4px 0 0; }
+</style>
+</head>
+<body>
+<h1>Blind listing: <span id="sid"></span></h1>
+<p class="note">Read the transcript. List every action item (what, who, by when) and every decision actually made. No model output is on this page.</p>
+<main>
+  <section class="turns" id="turns"></section>
+  <section class="items">
+    <div id="items"></div>
+    <button id="add-action">+ action</button><button id="add-decision">+ decision</button>
+    <button id="save">Save gold JSON</button>
+  </section>
+</main>
+<script type="application/json" id="data">__DATA__</script>
+<script>
+const D = JSON.parse(document.getElementById('data').textContent);
+document.getElementById('sid').textContent = D.session;
+const turns = document.getElementById('turns');
+for (const t of D.turns) {
+  const div = document.createElement('div'); div.className = 'turn';
+  const ts = document.createElement('span'); ts.className = 't'; ts.textContent = t.at || '';
+  const sp = document.createElement('b'); sp.textContent = (t.speaker || '') + ': ';
+  div.append(ts, sp, document.createTextNode(t.text || '')); turns.append(div);
+}
+let items = (D.prefill || []).map((x, i) => Object.assign({id: x.id || ('g' + (i + 1))}, x));
+let next = items.length + 1;
+function field(it, key, ph) {
+  const el = document.createElement('input'); el.placeholder = ph; el.value = it[key] || '';
+  el.oninput = () => { it[key] = el.value; }; return el;
+}
+function render() {
+  const box = document.getElementById('items'); box.textContent = '';
+  for (const it of items) {
+    const d = document.createElement('div'); d.className = 'item';
+    const kind = document.createElement('select');
+    for (const k of ['action', 'decision']) { const o = document.createElement('option'); o.value = o.textContent = k; kind.append(o); }
+    kind.value = it.kind; kind.onchange = () => { it.kind = kind.value; };
+    const lab = document.createElement('select');
+    for (const k of ['true', 'unsure', 'false']) { const o = document.createElement('option'); o.value = o.textContent = k; lab.append(o); }
+    lab.value = it.label || 'true'; lab.onchange = () => { it.label = lab.value; };
+    const del = document.createElement('button'); del.textContent = 'remove';
+    del.onclick = () => { items = items.filter(x => x !== it); render(); };
+    d.append(kind, field(it, 'what', 'what'), field(it, 'responsible', 'who (person / crew / trade / Speaker / blank)'),
+             field(it, 'due', 'due (as said, blank if none)'), lab, del);
+    box.append(d);
+  }
+}
+function add(kind) { items.push({id: 'g' + (next++), kind, what: '', responsible: '', due: '', label: 'true'}); render(); }
+document.getElementById('add-action').onclick = () => add('action');
+document.getElementById('add-decision').onclick = () => add('decision');
+document.getElementById('save').onclick = () => {
+  const out = {schema: 'report-bench-gold/v1', session: D.session, items};
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(out, null, 1)], {type: 'application/json'}));
+  a.download = 'gold_' + D.session + '.json'; a.click();
+};
+render();
+</script>
+</body>
+</html>

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Adjudication</title>
+<style>
+:root { --bg:#fbfaf7; --fg:#1d1d1b; --muted:#6b6a65; --line:#dedbd2; --card:#ffffff; --accent:#2f5d8a; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#161614; --fg:#ecebe6; --muted:#a3a19a; --line:#34332f; --card:#1f1f1c; --accent:#8db4dc; }
+}
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, sans-serif; }
+main { display:grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap:16px; padding:16px; }
+@media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+h1 { font-size:18px; margin:16px 16px 0; } p.note { color:var(--muted); margin:4px 16px 0; }
+.turns, .rows { max-height: 85vh; overflow:auto; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px 12px; }
+.turn { margin:4px 0; } .turn b { color:var(--accent); font-weight:600; } .turn span.t { color:var(--muted); font-size:12px; margin-right:6px; }
+.row { border-bottom:1px solid var(--line); padding:8px 0; }
+.row .gold { color:var(--muted); font-size:13px; }
+.row.hidden { display:none; } body.all .row.hidden { display:block; }
+label { margin-right:10px; white-space:nowrap; }
+button { font:inherit; padding:6px 12px; border-radius:6px; border:1px solid var(--accent); background:transparent; color:var(--accent); cursor:pointer; margin:4px 4px 0 0; }
+</style>
+</head>
+<body>
+<h1>Adjudication: <span id="scope"></span></h1>
+<p class="note">Each row is an item some model produced that did not match your list (or matched it loosely). Sources are not shown. true = you missed it; misread = said, but not a commitment / decision; fabricated = nothing in the transcript supports it. Loose matches: confirm, or reject and label.</p>
+<main>
+  <section class="turns" id="turns"></section>
+  <section class="rows"><div id="rows"></div>
+    <button id="more">Show the rest</button><button id="save">Save verdicts JSON</button></section>
+</main>
+<script type="application/json" id="data">__DATA__</script>
+<script>
+const D = JSON.parse(document.getElementById('data').textContent);
+document.getElementById('scope').textContent = D.scope;
+for (const t of D.turns) {
+  const div = document.createElement('div'); div.className = 'turn';
+  const ts = document.createElement('span'); ts.className = 't'; ts.textContent = t.at || '';
+  const sp = document.createElement('b'); sp.textContent = (t.speaker || '') + ': ';
+  div.append(ts, sp, document.createTextNode(t.text || '')); document.getElementById('turns').append(div);
+}
+const verdicts = {};
+for (const r of D.rows) {
+  const d = document.createElement('div'); d.className = 'row' + (r.hidden ? ' hidden' : '');
+  const k = document.createElement('div'); k.textContent = '[' + r.kind + '] ' + r.text; d.append(k);
+  if (r.gold_what) { const g = document.createElement('div'); g.className = 'gold'; g.textContent = 'loosely matched to: ' + r.gold_what; d.append(g); }
+  const opts = r.gold_what ? ['confirm', 'true', 'misread', 'fabricated'] : ['true', 'misread', 'fabricated'];
+  for (const o of opts) {
+    const l = document.createElement('label'); const i = document.createElement('input');
+    i.type = 'radio'; i.name = r.pid; i.value = o; i.onchange = () => { verdicts[r.pid] = o; };
+    l.append(i, document.createTextNode(' ' + o)); d.append(l);
+  }
+  document.getElementById('rows').append(d);
+}
+document.getElementById('more').onclick = () => document.body.classList.add('all');
+document.getElementById('save').onclick = () => {
+  const out = {schema: 'report-bench-verdicts/v1', scope: D.scope, verdicts};
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(out, null, 1)], {type: 'application/json'}));
+  a.download = 'verdicts_' + D.scope + '.json'; a.click();
+};
+</script>
+</body>
+</html>
