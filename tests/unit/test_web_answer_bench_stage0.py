@@ -305,7 +305,8 @@ def test_load_tune_reads_the_five_tune_rows():
 
 
 def _items():
-    return [{"id": f"t{i}", "question": f"{SECRET_Q}-{i}"} for i in range(1, 6)]
+    return [{"id": f"t{i}", "question": f"{SECRET_Q}-{i}",
+             "kind": "unsure" if i == 5 else "standard"} for i in range(1, 6)]
 
 
 def _run(tmp_path, client, clock, *, dry=False):
@@ -423,16 +424,41 @@ def test_max_tokens_stop_is_not_a_gate_failure(tmp_path):
     assert summary["stop_rule"]["frozen"].get("claude-haiku-5-5") == "web_search_20250305"
 
 
+def _no_search():
+    return (0.5, response(blocks=[], u=usage(searches=0)))
+
+
 def test_no_search_counts_its_wall_time_but_is_reported(tmp_path):
+    # Round robin t1..t5: the 5th call is t5, the unsure item.
     clock = Clock()
     key = ("claude-haiku-5-5", "web_search_20250305")
-    client = FakeClient(clock, {key: [(0.5, response(blocks=[], u=usage(searches=0)))]},
+    ok = (1.0, response())
+    client = FakeClient(clock, {key: [ok, ok, ok, ok, _no_search()]},
                         default=lambda: (1.0, response()))
     _, summary, _, _ = _run(tmp_path, client, clock)
     h = summary["configs"]["haiku-20250305"]
     assert h["failures"] == 0
     assert h["no_search"] == 1
     assert h["max_ms"] <= stage0.MAX_GATE_MS
+
+
+def test_no_search_on_a_web_item_is_a_failure(tmp_path):
+    clock = Clock()
+    key = ("claude-haiku-5-5", "web_search_20250305")
+    client = FakeClient(clock, {key: [_no_search()]}, default=lambda: (1.0, response()))
+    _, summary, _, _ = _run(tmp_path, client, clock)
+    h = summary["configs"]["haiku-20250305"]
+    assert h["failures"] == 1 and h["no_search"] == 0
+    assert "claude-haiku-5-5" in stage0.stop_rule(summary)["dropped"]
+
+
+def test_a_config_that_never_searches_does_not_pass(tmp_path):
+    clock = Clock()
+    key = ("claude-haiku-5-5", "web_search_20250305")
+    client = FakeClient(clock, {key: [_no_search() for _ in range(12)]},
+                        default=lambda: (1.0, response()))
+    _, summary, _, _ = _run(tmp_path, client, clock)
+    assert "claude-haiku-5-5" in stage0.stop_rule(summary)["dropped"]
 
 
 def test_resummarize_reclassifies_recorded_no_search_rows():
@@ -444,22 +470,35 @@ def test_resummarize_reclassifies_recorded_no_search_rows():
              "stop_reason": "end_turn", "searched": False,
              "error_code": "too_many_requests", "search_requests": 1,
              "latency_ms": 2000, "continuation": False, "cost_usd": 0.01}]
-    fixed = [stage0.reclassify(r) for r in rows]
+    rows = [dict(r, item="t5") for r in rows]
+    fixed = [stage0.reclassify(r, frozenset({"t5"})) for r in rows]
     assert [r["outcome"] for r in fixed] == ["no_search", "failed"]
 
 
 def test_stop_rule_freezes_fastest_tool_per_model_and_drops_others():
     s = {"configs": {
         "sonnet-20260209": {"model": "claude-sonnet-5-5", "tool": "web_search_20260209",
-                            "rejected": False, "n": 12, "p50_ms": 8000, "max_ms": 13000},
+                            "rejected": False, "n": 12, "p50_ms": 8000, "max_ms": 13000,
+                            "p50_searched_ms": 8000, "searched_rate_web": 1.0},
         "sonnet-20250305": {"model": "claude-sonnet-5-5", "tool": "web_search_20250305",
-                            "rejected": False, "n": 12, "p50_ms": 6000, "max_ms": 9000},
+                            "rejected": False, "n": 12, "p50_ms": 6000, "max_ms": 9000,
+                            "p50_searched_ms": 6000, "searched_rate_web": 1.0},
         "haiku-20250305": {"model": "claude-haiku-5-5", "tool": "web_search_20250305",
-                           "rejected": False, "n": 12, "p50_ms": 5000, "max_ms": 15000}}}
+                           "rejected": False, "n": 12, "p50_ms": 5000, "max_ms": 15000,
+                            "p50_searched_ms": 5000, "searched_rate_web": 1.0}}}
     r = stage0.stop_rule(s)
     assert r["proceed"] is True
     assert r["frozen"] == {"claude-sonnet-5-5": "web_search_20250305"}
     assert r["dropped"] == ["claude-haiku-5-5"]
+
+
+def test_stop_rule_needs_searching_on_web_items():
+    c = {"model": "claude-haiku-5-5", "tool": "web_search_20250305", "rejected": False,
+         "n": 12, "p50_ms": 5000, "max_ms": 9000, "p50_searched_ms": 6000,
+         "searched_rate_web": 0.8}
+    assert stage0.stop_rule({"configs": {"haiku-20250305": c}})["proceed"] is False
+    c = dict(c, searched_rate_web=1.0, p50_searched_ms=9500)
+    assert stage0.stop_rule({"configs": {"haiku-20250305": c}})["proceed"] is False
 
 
 def test_stop_rule_none_passing_stops():

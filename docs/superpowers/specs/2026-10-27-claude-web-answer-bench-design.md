@@ -1,7 +1,7 @@
 # Claude + web search for Ask's web answer — bench design
 
-Date: 2026-10-27 · Line: ASR+LLM优化v3 (Ask orchestration / web) · Status: rev 4.1 (Fable
-review applied, §11). No code, no live call has been made for this spec.
+Date: 2026-10-27 · Line: ASR+LLM优化v3 (Ask orchestration / web) · Status: rev 4.2 (Fable
+review applied, §11). Stage 0 has run (owner, $1.42); the rest is not yet built.
 
 ## 1. Problem
 
@@ -177,23 +177,30 @@ the full bench is guarded by the hard stop (§6).
 | config | p50 | max | searched | timeouts | answered without searching |
 |---|---|---|---|---|---|
 | Sonnet 5.5 + `20260209` | 11.0 s | over 14 s | 7/12 | 3 | 2 (t5) |
-| **Sonnet 5.5 + `20250305`** | **7.0 s** (8.1 s over searched runs) | **9.9 s** | 10/12 | 0 | 2 (t5) |
+| **Sonnet 5.5 + `20250305`** | **7.0 s** (7.6 s over searched runs) | **9.9 s** | 10/12 | 0 | 2 (t5) |
 | Haiku 5.5 + `20250305` | 9.02 s | 12.3 s | 12/12 | 0 | 0 |
 
 - Under the rule as first written, nothing passed: every non-answer counted as over
   14 s, and Sonnet's t5 runs were `failed`. They were HTTP 200, `end_turn`, 3.5-4.3 s,
   no tool call: Sonnet declined to search the unknowable item. **Post-hoc amendment**
   (code: `no_search` outcome, `stage0.reclassify`; same recorded calls, no new call):
-  a `no_search` counts its real wall time and is reported apart; an error block or a
-  timeout is still over budget. Prod returns the draft "unverified" for it
-  (`_verify_ok` needs searched, web_answer.py:270-273), so it costs no latency; its
-  accuracy is a §4.4 question.
+  a `no_search` counts its real wall time and is reported apart, **only on an
+  `unsure` item** (elsewhere it is `failed`); an error block or a timeout is still
+  over budget. The gate also requires p50 over *searched* runs ≤ 9 s and searching on
+  ≥ 90 % of web-needing runs, so a config that answers fast without searching cannot
+  pass (rev 4.2). Prod treats it as a failed verify (`_verify_ok` needs searched,
+  web_answer.py:270-273): it **costs a retry when ≥ `VERIFY_RETRY_MIN_LEFT` remains**
+  (web_answer.py:336-345), else the draft is returned "unverified". Arm C inherits the
+  retry (§4.2), so that cost is measured there; accuracy is a §4.4 question.
+- Re-summarised under rev 4.2 from the same recorded calls: verdict unchanged
+  (Sonnet + `20250305`: searched-run p50 7.6 s, web-item search rate 100 %).
 - Frozen: **Sonnet 5.5 + `web_search_20250305`** (the basic tool works on Sonnet 5.5;
   the dynamic-filtering tool is too slow). Dropped: Sonnet + `20260209`.
 - Haiku missed p50 by 24 ms with the full 3 searches per call (18-29 results, ~30 k
   input tokens). §9 names `max_uses` as the post-Stage-0 lever: one re-probe at
   `max_uses` 2 on the stored drafts (`reprobe.py`, ≤ 24 calls, ≤ $0.64). It joins
-  only if it passes the same gate.
+  only if it passes the same gate. **No further re-probes** (Haiku has had two
+  looks at the gate; a third would be gate-shopping).
 - **Re-probe result (10-27, $0.24):** Haiku 5.5 + `20250305`, `max_uses` 2: p50
   8.44 s, max 11.6 s, 12/12 searched (9-19 results), 0 failures → **passes; Haiku
   joins at `max_uses` 2** (a cell parameter, §4.4). Sonnet stays at 3 (it passed
@@ -226,7 +233,8 @@ Retries are also reported separately per arm.
 - **C — Sonnet 5.5 verify** and **C′ — Haiku 5.5 verify** (pre-registered). Each
   verifies **A's stored draft for the same item and rep** (paired verify test, no new
   draft calls) with the model's frozen verify entry from §4.4; question + draft only. Same retry rule as A. The tool settings above
-  (`max_uses` 3, `user_location` NZ) apply to every Claude call, B, C and C′. Failure → the draft,
+  (`user_location` NZ; `max_uses` per model as Stage 0 froze it: **Sonnet 3, Haiku 2**)
+  apply to every Claude call, B, C and C′. Failure → the draft,
   "unverified".
 
 ### 4.3 Claude call contract
@@ -434,8 +442,8 @@ is admitted; without it the Anthropic rows halve.
 | grader, 1 per run | — | — | — | ≤ 540 |
 | **total** | ≤ 36 | ≤ 540 | **≤ 510** | **≤ 930** |
 
-Anthropic dollars: Sonnet ≤ 255 calls × $0.133 ≈ $34; Haiku ≈ $1.3; searches ≤ 1 440
-(480 search-capable calls × 3) ≈ $14 at $10 / 1 000. Expected (Stage 0 measured
+Anthropic dollars: Sonnet ≤ 255 calls × $0.133 ≈ $34; Haiku ≈ $1.3; searches ≤ 1 200
+(240 Sonnet search-capable calls × 3 + 240 Haiku × 2) ≈ $12 at $10 / 1 000. Expected (Stage 0 measured
 Sonnet ≈ $0.04 and Haiku ≈ $0.022 per verify incl. searches): ≈ $8 Anthropic;
 OpenRouter < $6.
 
@@ -587,7 +595,7 @@ as a prompt × model matrix; §7 matrix cost; §10 Claude draft now measured.
 
 rev 4.1 — Fable delta review (NOT-READY), all applied, plus Stage 0 results:
 1. BLOCKER shared $45 ledger vs matrix → §7 matrix sub-cap $18, scored-run reserve =
-   Anthropic upper of surviving arms; with Stage 0's actual $1.18 the cap holds.
+   Anthropic upper of surviving arms; with Stage 0's actual $1.42 the cap holds.
 2. HIGH A ambiguous → §4.2: A = shipped prompts, tuned gemini = A′ delta; DeepSeek
    cells informational.
 3. HIGH keep rule over reps → §4.4 majority labels, "better" only where the
@@ -602,3 +610,12 @@ rev 4.1 — Fable delta review (NOT-READY), all applied, plus Stage 0 results:
    §4.2 round-0 text replaced; status line.
 Stage 0 → §4.0 result table and the post-hoc `no_search` amendment (with raw
 numbers, same recorded calls).
+
+rev 4.2 — Fable re-check (READY-WITH-FIXES), all applied:
+1. HIGH no searched floor → `stop_rule` needs searched-run p50 ≤ 9 s and ≥ 90 % search
+   on web items; `no_search` allowed only on `unsure` items; tests (12× no_search
+   fails). Recorded runs re-summarised: verdict unchanged.
+2. MED "costs no latency" wrong → it costs a retry in prod; measured in arm C.
+3. MED per-model `max_uses` (Sonnet 3, Haiku 2) in §4.2 / §7; no further re-probes.
+4. LOW status line, $1.42 everywhere. Matrix sub-cap / scored reserve are prose
+   until the matrix harness implements them in `ledger.py`.

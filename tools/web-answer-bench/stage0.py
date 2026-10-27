@@ -48,8 +48,11 @@ VERIFY_BUDGET_S = 14.0
 P50_GATE_MS = 9000             # VERIFY_FLOOR
 MAX_GATE_MS = 14000            # VERIFY_BUDGET
 OVER_BUDGET_MS = MAX_GATE_MS + 1
-# no_search: answered in its own wall time without searching (reported apart).
+# no_search: answered without searching. Allowed only on an `unsure` item (where
+# declining to search is the right call) and counted at its own wall time; on any
+# other item it is a failed verify.
 GATE_OK = ("ok", "max_tokens", "no_search")
+SEARCHED_RATE_GATE = 0.9       # on items that need the web (not `unsure`)
 # Upper-bound assumptions per Anthropic request (spec §7).
 UPPER_INPUT_TOKENS = 46_000
 UPPER_OUTPUT_TOKENS = claude_verify.MAX_TOKENS
@@ -60,7 +63,12 @@ ENV_KEYS = ("ANTHROPIC_API_KEY", "CORROBORATION_API_KEY")
 def load_tune(path):
     with open(path, encoding="utf-8") as f:
         rows = [json.loads(line) for line in f if line.strip()]
-    return [{"id": r["id"], "question": r["question"]} for r in rows if r["split"] == "tune"]
+    return [{"id": r["id"], "question": r["question"], "kind": r.get("kind")}
+            for r in rows if r["split"] == "tune"]
+
+
+def unsure_ids(items):
+    return frozenset(it["id"] for it in items if it.get("kind") == "unsure")
 
 
 def order(ids, reps=REPS):
@@ -116,13 +124,25 @@ def _sha(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def reclassify(r):
-    """Records written before `no_search` existed called it `failed`."""
+def reclassify(r, unsure=frozenset()):
+    """Records written before `no_search` existed called it `failed`; `unsure`
+    marks the items where declining to search is allowed."""
+    r = dict(r, unsure=r.get("unsure", r.get("item") in unsure))
     if (r["outcome"] == "failed" and r.get("http_status") == 200
             and r.get("stop_reason") == "end_turn" and not r.get("searched")
             and not r.get("error_code") and not r.get("search_requests")):
-        return dict(r, outcome="no_search")
+        r["outcome"] = "no_search"
+    if r["outcome"] == "no_search" and not r["unsure"]:
+        r["outcome"] = "failed"
     return r
+
+
+def _rate(flags):
+    return (sum(flags) / len(flags)) if flags else None
+
+
+def _p50(values):
+    return int(statistics.median(values)) if values else None
 
 
 def summarize(records):
@@ -141,6 +161,9 @@ def summarize(records):
             "p50_ms": int(statistics.median(walls)) if walls else None,
             "max_ms": max(walls) if walls else None,
             "searched_rate": (sum(r["searched"] for r in live) / len(live)) if live else None,
+            "searched_rate_web": _rate([r["searched"] for r in live if not r.get("unsure")]),
+            "p50_searched_ms": _p50([r["latency_ms"] for r in live
+                                     if r["searched"] and r["outcome"] in GATE_OK]),
             "failures": len(failed),
             "timeouts": sum(r["outcome"] == "timeout" for r in live),
             "no_search": sum(r["outcome"] == "no_search" for r in live),
@@ -159,8 +182,13 @@ def stop_rule(summary):
     for name, c in summary["configs"].items():
         if c["model"] not in models:
             models.append(c["model"])
+        # Speed of a verify that searched, and searching where the web is needed:
+        # a config that answers fast without searching is not a fast verify.
         ok = (not c["rejected"] and c["n"] == REPS and c["p50_ms"] is not None
-              and c["p50_ms"] <= P50_GATE_MS and c["max_ms"] <= MAX_GATE_MS)
+              and c["p50_ms"] <= P50_GATE_MS and c["max_ms"] <= MAX_GATE_MS
+              and c.get("p50_searched_ms") is not None
+              and c["p50_searched_ms"] <= P50_GATE_MS
+              and (c.get("searched_rate_web") or 0) >= SEARCHED_RATE_GATE)
         if ok and (c["model"] not in passing or c["p50_ms"] < passing[c["model"]][1]):
             passing[c["model"]] = (c["tool"], c["p50_ms"])
     return {"proceed": bool(passing),
@@ -209,6 +237,7 @@ def run(args, *, items, client, draft_fn, clock=time.monotonic, stdout=sys.stdou
             print(f"draft {it['id']} {ms} ms", file=stdout)
 
     questions = {it["id"]: it["question"] for it in items}
+    unsure = unsure_ids(items)
     ids = [it["id"] for it in items]
     records = []
     with open(os.path.join(args.out, "stage0_calls.jsonl"), "w", encoding="utf-8") as f:
@@ -222,6 +251,7 @@ def run(args, *, items, client, draft_fn, clock=time.monotonic, stdout=sys.stdou
                 r = claude_verify.verify(client, model=model, tool_version=tool,
                                          prompt=prompt, budget_s=VERIFY_BUDGET_S,
                                          clock=clock)
+                r = reclassify(dict(r, item=item), unsure)
                 cost = call_cost(model, r["input_tokens"], r["output_tokens"],
                                  r["search_requests"], args.search_price_per_1000)
                 ledger.add(cost)

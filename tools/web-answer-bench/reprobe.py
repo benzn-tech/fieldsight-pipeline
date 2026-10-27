@@ -81,7 +81,9 @@ def run(args, *, client, clock=time.monotonic, stdout=sys.stdout):
 
     with open(os.path.join(args.out, "stage0_drafts.jsonl"), encoding="utf-8") as f:
         drafts = {d["item"]: d["draft"] for d in map(json.loads, f) if d.get("draft")}
-    questions = {it["id"]: it["question"] for it in stage0.load_tune(args.set)}
+    tune = stage0.load_tune(args.set)
+    questions = {it["id"]: it["question"] for it in tune}
+    unsure = stage0.unsure_ids(tune)
     ledger = Ledger(os.path.join(args.out, "anthropic_ledger.json"))
     stem = f"reprobe_{args.config}_mu{args.max_uses}"
     records, hard_stop = [], False
@@ -95,6 +97,7 @@ def run(args, *, client, clock=time.monotonic, stdout=sys.stdout):
             r = claude_verify.verify(client, model=model, tool_version=tool, prompt=prompt,
                                      budget_s=stage0.VERIFY_BUDGET_S, clock=clock,
                                      max_uses=args.max_uses)
+            r = stage0.reclassify(dict(r, item=item), unsure)
             cost = call_cost(model, r["input_tokens"], r["output_tokens"],
                              r["search_requests"], args.search_price_per_1000)
             ledger.add(cost)
