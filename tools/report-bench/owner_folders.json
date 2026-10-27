@@ -1,0 +1,9 @@
+{
+ "_note": "Owner-test folders the collector may read (spec section 4). The owner checks the names (the spec says test3; memory records test3's folder as Ben_Lin_Test) and sets confirmed to true. _summary is always refused. Checked 2026-10-28 by S3 listing (owner-delegated): Ben_Lin_test2 and Ben_UCPK2 in both buckets; Ben_Lin_Test (= test3) in the prod bucket only.",
+ "confirmed": true,
+ "folders": [
+  "Ben_Lin_test2",
+  "Ben_Lin_Test",
+  "Ben_UCPK2"
+ ]
+}

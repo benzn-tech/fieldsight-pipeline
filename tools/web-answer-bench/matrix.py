@@ -43,6 +43,7 @@ import claude_verify                                     # noqa: E402
 import openrouter_bench                                  # noqa: E402
 import prompts                                           # noqa: E402
 import stage0                                            # noqa: E402
+import ledger as ledger_mod                               # noqa: E402
 from ledger import (CAP_USD, MATRIX_POOL_CAP, SCORED_RESERVE, Ledger,  # noqa: E402
                     call_cost)
 
@@ -128,6 +129,7 @@ def validate(argv, env, repo_root=REPO):
     out = Path(args.out).resolve()
     if out == Path(repo_root).resolve() or Path(repo_root).resolve() in out.parents:
         stage0._refuse("--out must be outside the repository")
+    ledger_mod.refuse_if_locked(out, stage0._refuse)
     if args.search_price_per_1000 < 0:
         stage0._refuse("--search-price-per-1000 must be >= 0")
     if not args.dry_run:

@@ -35,6 +35,7 @@ for _p in (HERE, SRC):
         sys.path.insert(0, _p)
 
 import claude_verify                                     # noqa: E402
+import ledger as ledger_mod                               # noqa: E402
 from ledger import CAP_USD, PRICES, Ledger, call_cost     # noqa: E402
 
 CONFIGS = (
@@ -107,6 +108,7 @@ def validate(argv, env, repo_root=REPO):
     out = Path(args.out).resolve()
     if out == Path(repo_root).resolve() or Path(repo_root).resolve() in out.parents:
         _refuse("--out must be outside the repository")
+    ledger_mod.refuse_if_locked(out, _refuse)
     if args.search_price_per_1000 < 0:
         _refuse("--search-price-per-1000 must be >= 0")
     if not args.dry_run:

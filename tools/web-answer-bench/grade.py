@@ -51,6 +51,7 @@ for _p in (HERE, os.path.join(REPO, "src")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import ledger as ledger_mod                               # noqa: E402
 import openrouter_bench                                  # noqa: E402
 import prompts                                           # noqa: E402
 
@@ -244,6 +245,7 @@ def validate(argv, env, repo_root=REPO):
     out = Path(args.out).resolve()
     if out == Path(repo_root).resolve() or Path(repo_root).resolve() in out.parents:
         _refuse("--out must be outside the repository")
+    ledger_mod.refuse_if_locked(out, _refuse)
     calls = Path(args.calls)
     calls = calls if calls.is_absolute() else out / calls
     if not calls.exists():
