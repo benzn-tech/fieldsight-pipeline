@@ -173,6 +173,21 @@ def test_session_marker_resolves_by_sid_and_unknown_sid_falls_to_unresolved():
     assert o["company_id"] is None and o["folder"] == "Ada_L"  # hint folder is descriptive only
 
 
+def test_session_brief_marker_resolves_through_its_session_not_the_folder():
+    """session_finalize_requests/brief-{sid}.json (Session Brief) names its session. It stayed
+    NULL 'unresolved' on prod because the parser did not see the sid behind `brief-`. The
+    folder (Ada_L, home CO_A) is NOT the owner: the session's site company (CO_B) is."""
+    hint = {"folder": "Ada_L", "session_base": f"sid{SID}"}  # what the writer sends
+    for key in (f"session_finalize_requests/brief-{SID}.json",
+                f"session_finalize_requests/brief-{SID}-r2.json"):
+        o = resolve(world(sessions=SESS), key, hint)
+        assert (o["company_id"], o["site_id"], o["reason"]) == (CO_B, SITE_B, "session"), key
+        assert o["folder"] == "Ada_L"
+    # an unknown session still never falls to the folder's home company
+    o = resolve(world(), f"session_finalize_requests/brief-{SID2}.json", hint)
+    assert (o["company_id"], o["reason"]) == (None, "unresolved")
+
+
 # ---- rule 3b: groups (R5d) ---------------------------------------------------------------
 def _grp(*members):
     return {"g1": [{"site_id": s, "site_company_id": c} for s, c in members]}

@@ -6,7 +6,10 @@ _FOLDER = r"(?P<folder>[^/]+)"
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 SID_RE = re.compile(r"sid(?P<sid>[0-9a-f]{32})")
 # `-r{n}`: a late-chunk reopen's round (session_scope.round_suffix), before `-notes`.
-_SID_SEGMENT_RE = re.compile(r"^(?P<sid>[0-9a-f]{32})(?:-r[0-9]+)?(?:-(?:updated|notes))?$")
+# `brief-`: the Session Brief request (lambda_finalize_claim._enqueue_brief_request) names
+# its session the same way; without it the sid was never seen and the marker stayed NULL.
+_SID_SEGMENT_RE = re.compile(
+    r"^(?:brief-)?(?P<sid>[0-9a-f]{32})(?:-r[0-9]+)?(?:-(?:updated|notes))?$")
 _UUID_RE = re.compile(rf"^{_UUID}$")
 
 _TENANT = [
