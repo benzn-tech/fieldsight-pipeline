@@ -1,6 +1,6 @@
 # Claude + web search for Ask's web answer — bench design
 
-Date: 2026-10-27 · Line: ASR+LLM优化v3 (Ask orchestration / web) · Status: rev 3.1 (Fable
+Date: 2026-10-27 · Line: ASR+LLM优化v3 (Ask orchestration / web) · Status: rev 4.1 (Fable
 review applied, §11). No code, no live call has been made for this spec.
 
 ## 1. Problem
@@ -172,6 +172,29 @@ the full bench is guarded by the hard stop (§6).
   rejected flag, $ = tokens + searches × price.
 - *Stop rule* as above.
 
+**Result (2026-10-27, owner-run, $1.18 Anthropic, gemini drafts 5/5).** n = 12 each.
+
+| config | p50 | max | searched | timeouts | answered without searching |
+|---|---|---|---|---|---|
+| Sonnet 5.5 + `20260209` | 11.0 s | over 14 s | 7/12 | 3 | 2 (t5) |
+| **Sonnet 5.5 + `20250305`** | **7.0 s** (8.1 s over searched runs) | **9.9 s** | 10/12 | 0 | 2 (t5) |
+| Haiku 5.5 + `20250305` | 9.02 s | 12.3 s | 12/12 | 0 | 0 |
+
+- Under the rule as first written, nothing passed: every non-answer counted as over
+  14 s, and Sonnet's t5 runs were `failed`. They were HTTP 200, `end_turn`, 3.5-4.3 s,
+  no tool call: Sonnet declined to search the unknowable item. **Post-hoc amendment**
+  (code: `no_search` outcome, `stage0.reclassify`; same recorded calls, no new call):
+  a `no_search` counts its real wall time and is reported apart; an error block or a
+  timeout is still over budget. Prod returns the draft "unverified" for it
+  (`_verify_ok` needs searched, web_answer.py:270-273), so it costs no latency; its
+  accuracy is a §4.4 question.
+- Frozen: **Sonnet 5.5 + `web_search_20250305`** (the basic tool works on Sonnet 5.5;
+  the dynamic-filtering tool is too slow). Dropped: Sonnet + `20260209`.
+- Haiku missed p50 by 24 ms with the full 3 searches per call (18-29 results, ~30 k
+  input tokens). §9 names `max_uses` as the post-Stage-0 lever: one re-probe at
+  `max_uses` 2 on the stored drafts (`reprobe.py`, ≤ 24 calls, ≤ $0.64). It joins
+  only if it passes the same gate.
+
 ### 4.1 Budget
 
 One budget for every arm: **25 − t_pre** with t_pre = 2.9 s (the screen precheck's
@@ -186,19 +209,19 @@ Retries are also reported separately per arm.
 
 - **A — shipped.** `web_answer.general_answer(question, budget)` imported at the bench
   commit: gemini-3.8-flash on OpenRouter, provider order, shipped prompts. Calls:
-  draft 1 + verify 1 + retry ≤ 1. Its drafts are stored per item and rep.
+  draft 1 + verify 1 + retry ≤ 1. Its drafts are stored per item and rep. A is
+  always the **shipped** prompts (the prod baseline §2 compares against); a tuned
+  gemini cell from §4.4 is reported as an A′ delta and never replaces A.
 - **B — Sonnet 5.5 single-call answerer.** One call with the web_search tool
   (`max_uses` 3, `user_location {type: approximate, country: NZ, timezone:
   Pacific/Auckland}`), `output_config {effort: low}`, no prefill, never
-  `thinking: {type: disabled}` (400). Prompt `claude_answer_v*` (round 0 = DRAFT +
-  VERIFY rules merged). B has no draft, so "never nothing" needs a fallback: P2 runs
+  `thinking: {type: disabled}` (400). Prompt = B's frozen entry from §4.4. B has no draft, so "never nothing" needs a fallback: P2 runs
   the gemini draft **in parallel** and returns it unverified when B fails. The bench
   simulates that from A's stored draft, records B's raw failure rate, and adds the
   draft's cost to B's per-answer cost.
 - **C — Sonnet 5.5 verify** and **C′ — Haiku 5.5 verify** (pre-registered). Each
   verifies **A's stored draft for the same item and rep** (paired verify test, no new
-  draft calls) with the `VERIFY_PROMPT` text (round 0) or a `claude_verify_v*`
-  candidate; question + draft only. Same retry rule as A. The tool settings above
+  draft calls) with the model's frozen verify entry from §4.4; question + draft only. Same retry rule as A. The tool settings above
   (`max_uses` 3, `user_location` NZ) apply to every Claude call, B, C and C′. Failure → the draft,
   "unverified".
 
@@ -230,50 +253,74 @@ Retries are also reported separately per arm.
 
 No prompt has ever been tuned for a model other than gemini (inventory: 55 prompts,
 134 versions, none model-conditional; per-model tuning lived in parameters). So
-before the arms are frozen, every historical candidate runs on every model that can
-do the step. Only `tune` items (5) are used; the author sees tune answers and grades,
-never `score` items.
+before the arms are frozen, every usable historical candidate runs on every model
+that can do the step. Only `tune` items (5) are used; the author sees tune answers
+and grades, never `score` items.
 
 **Cell** = (step, prompt version, model, parameters). Parameters are part of the
 cell, not a constant: effort / reasoning setting, provider pin, `max_uses`.
 
-**Historical candidates** (texts read from git, sha256 recorded per cell):
+**Candidates** (text file + sha256 recorded per cell):
 
-| id | step | source | note |
-|---|---|---|---|
-| `draft_v1` | draft | `DRAFT_PROMPT`, 518900a8 (unchanged since) | only draft version |
-| `verify_v1` | verify | `VERIFY_PROMPT`, 518900a8 ("colleague") | on gemini it wrote review-style replies (b8c96342 comment); re-tested on other models |
-| `verify_v2` | verify | `VERIFY_PROMPT`, b8c96342 (shipped) | |
-| `web_v1` | single call | `WEB_PROMPT`, 518900a8^ | arm B shape |
-| `merged_v1` | single call | `draft_v1` rules + `verify_v2` rules in one prompt | arm B round 0 (§4.2) |
-| `search_v1` | verify | `corroboration.SEARCH_PROMPT`, e73e90c2, one entity = the draft | the only prompt that ran on Claude + web_search (claude-opus-5 / haiku-4.5) |
+| id | step | source |
+|---|---|---|
+| `draft_v1` | draft | `DRAFT_PROMPT`, 518900a8 (unchanged since; the only draft version) |
+| `verify_v1` | verify | `VERIFY_PROMPT`, 518900a8 ("colleague"); on gemini it wrote review-style replies (b8c96342 comment), re-tested on other models |
+| `verify_v2` | verify | `VERIFY_PROMPT`, b8c96342 (shipped) |
+| `web_v1` | single call | `WEB_PROMPT`, 518900a8^ (byte-identical to 156522ed's) |
+| `merged_v1` | single call | **new**, `tools/web-answer-bench/prompts/merged_v1.txt`: `draft_v1`'s rules + `verify_v2`'s output rules, no draft reference; committed before round 0 |
 
-**Models by step** (admission by capability, with the evidence):
+Not a candidate: `corroboration.SEARCH_PROMPT` (e73e90c2). It is the only text that
+ran on Claude + web_search, but it asks for a per-entity corroboration report, not
+an answer to a reader — graded as an answer it reproduces the review-style failure
+b8c96342 fixed. Its Claude latency is already in §1.
+
+**Models by step** (admitted by capability, with evidence):
 - *draft* (no search): gemini-3.8-flash (shipped), DeepSeek V4.1 Flash @ coreweave
   (reasoning off), Sonnet 5.5, Haiku 5.5 (effort low).
 - *verify / single call* (must search): gemini-3.8-flash + OpenRouter web plugin
-  (shipped), DeepSeek V4.1 Flash + OpenRouter web plugin (never measured; one cell),
-  Sonnet 5.5 + `web_search_<version Stage 0 picked>`, Haiku 5.5 + `web_search_20250305`.
-  A Claude config that failed Stage 0's gate is not tuned.
-- **Excluded:** muse-spark (web plugin: 16-29 s and 0 sources while claiming to have
-  searched, ledger 09-08 / 09-21) — over `VERIFY_BUDGET` before accuracy matters.
+  (shipped), DeepSeek V4.1 Flash + web plugin, Sonnet 5.5 + `web_search_20250305`
+  (Stage 0, §4.0), Haiku 5.5 + `web_search_20250305` only if its re-probe passes.
+- *DeepSeek cells are informational* (no DeepSeek arm in §4.2; one is added only if
+  its cells beat gemini's on tune and the owner asks). They need a bench-side
+  OpenRouter payload builder: `plugins` web + `provider.only ["coreweave/fp8"]` +
+  reasoning off — `corroboration_client.provider_preference` returns None for
+  non-google models (corroboration_client.py:92-94) and `llm_tools_client` sends no
+  plugins. A 429 from the pinned endpoint is recorded, not retried.
+- **Excluded:** muse-spark — with the web plugin it returned 0 sources while
+  claiming to have searched, at 16-18 s (corroboration_client.py:24-35, ledger 09-08).
+
+**Labels over reps.** Per item, a cell's label = the majority of its 3 reps (no
+majority → the worst of the three). An item is *stable* for a cell when all 3 reps
+agree.
 
 **Round 0** = every admitted (step, candidate, model) cell, 5 items × 3 reps. Verify
 cells verify gemini's stored `draft_v1` for that item / rep (paired, as §4.2), so a
-verify difference is the verify prompt's, not the draft's. Draft cells are graded as
-standalone answers (they are what the reader gets when verify fails).
-**Rounds 1-2** = per model, the best round-0 verify / single-call cell gets at most 2
-edits (`<model>_verify_v*`, `<model>_answer_v*`), each 5 × 3; an edit is kept only
-if it is not worse on any item and better on at least one (paired, tune only).
-Total rounds per model ≤ 3, as before.
+verify difference is the verify prompt's, not the draft's. Draft cells are graded
+as standalone answers (what the reader gets when verify fails). A `no_search` verify
+(§4.0) is graded on what the reader would get: the draft, "unverified".
+
+**Rounds 1-2** = per (model, step ∈ verify, single call) the best round-0 cell gets
+at most 2 edits (`<model>_verify_v*`, `<model>_answer_v*`), each 5 × 3. An edit is
+kept only if (a) no item's majority label is worse and (b) at least one item is
+better **on which the incumbent was stable**; otherwise the incumbent stays. Total
+rounds per model ≤ 3.
+
+**Grader check before freezing.** The owner blind-grades 10 tune answers drawn
+across cells; agreement < 80 % → fix the grader prompt before any freeze (prompts
+must not be selected on a grader that later fails §5.3).
 
 **Freeze.** Per (step, model) the chosen prompt + parameters are written to
 `tools/web-answer-bench/frozen.v1.json` (text, sha256, parameters, round, tune
-grades) before any `score` run. This file is the seed of P2's `web_prompts.VARIANTS`
-— a model switch reads its own entry and never overwrites another model's.
+labels) before any `score` run. The tune labels in it are **non-evidential**
+(best-of-several on 15 samples carries winner's-curse bias); every accuracy claim
+comes from the scored run, and §5.3's F only from scored repeats. The file seeds
+P2's `web_prompts.VARIANTS` — a model switch reads its own entry and never
+overwrites another model's.
 
-**Gate.** Round 0 runs only after (1) Stage 0 has picked the Claude configs and (2)
-the owner has confirmed the 5 `tune` gold answers; grades need `grade.py` (§5.1).
+**Gate.** Round 0 runs only after (1) Stage 0 has picked the Claude configs (done,
+§4.0), (2) the owner has confirmed the 5 `tune` gold answers, and (3) `grade.py`
+(§5.1) exists.
 
 ## 5. Grading
 
@@ -370,24 +417,36 @@ Dollars (tokens per search ≈ 15 k is the dominant unknown):
 - OpenRouter (gemini + plugin + DeepSeek grading): under $5.
 - **Full bench ≈ $13 expected, ≤ ~$39 upper; Stage 0 ≤ ~$9.** Hard stop $45.
 
-Prompt matrix (§4.4), tune items only, 5 × 3 = 15 runs per cell:
+Prompt matrix (§4.4), tune items only, 15 runs per cell. Calls per run: Claude ≤ 2
+(continuation), OpenRouter verify ≤ 2 (retry), single call / draft 1. Assumes Haiku
+is admitted; without it the Anthropic rows halve.
 
-| cells | round 0 | calls (upper, with continuation / retry) |
-|---|---|---|
-| draft: 4 models × `draft_v1` | 4 | 60 (no search) |
-| verify: gemini, DeepSeek × `verify_v1/v2`, `search_v1` | 6 | 90 OpenRouter |
-| verify: Sonnet, Haiku × `verify_v1/v2`, `search_v1` | 6 | 180 Anthropic |
-| single call: gemini, DeepSeek × `web_v1`, `merged_v1` | 4 | 60 OpenRouter |
-| single call: Sonnet, Haiku × `web_v1`, `merged_v1` | 4 | 120 Anthropic |
-| rounds 1-2: ≤ 2 edits × 8 (model, step) | ≤ 16 | ≤ 300 (Claude share ≤ 240) |
-| grader, 1 per answer | — | ≤ 840 (DeepSeek, cheap) |
+| | cells | runs | Anthropic calls (upper) | OpenRouter calls (upper) |
+|---|---|---|---|---|
+| draft: 4 models × `draft_v1` | 4 | 60 | 30 | 30 |
+| verify: 4 models × `verify_v1/v2` | 8 | 120 | 120 | 120 |
+| single call: 4 models × `web_v1`, `merged_v1` | 8 | 120 | 120 | 60 |
+| rounds 1-2: ≤ 2 edits × 8 (model, step) | ≤ 16 | ≤ 240 | ≤ 240 | ≤ 180 |
+| grader, 1 per run | — | — | — | ≤ 540 |
+| **total** | ≤ 36 | ≤ 540 | **≤ 510** | **≤ 930** |
 
-Anthropic ≤ 540 calls, ≤ 1 620 searches upper (expected ~2 per call ≈ 700).
-Dollars: Sonnet ≤ 270 calls × $0.133 ≈ $36 upper, expected ≈ $7; Haiku ≤ $1.5;
-searches $16 upper / $7 expected at $10 / 1 000; OpenRouter < $6. **Matrix ≈ $15
-expected.** The upper bound exceeds the remaining hard-stop room, so the ledger
-stops it first: matrix + full bench share the one $45 ledger, and the harness
-refuses to start the scored run if fewer than the full bench's expected $13 remain.
+Anthropic dollars: Sonnet ≤ 255 calls × $0.133 ≈ $34; Haiku ≈ $1.3; searches ≤ 1 440
+(480 search-capable calls × 3) ≈ $14 at $10 / 1 000. Expected (Stage 0 measured
+Sonnet ≈ $0.04 and Haiku ≈ $0.022 per verify incl. searches): ≈ $8 Anthropic;
+OpenRouter < $6.
+
+**Ledger rules** (the one persisted Anthropic-dollar ledger of §6):
+- **Matrix sub-cap $18 Anthropic.** The harness refuses matrix calls past it. Round
+  0 runs cheapest cells first (drafts, Haiku), then Sonnet; rounds 1-2 only with
+  room left.
+- **Scored-run reserve = the Anthropic upper bound of the surviving Claude arms'
+  scored + repeat runs** (32 runs per arm; B + C + C′ ≈ $23 upper). The harness
+  refuses to start the scored run unless the ledger has that much room, so a scored
+  set is never cut off mid-way (§2's paired rule needs all 20 items).
+- Stage 0 actually spent $1.18, so $1.18 + $18 + $23 ≈ $42 fits the $45 cap. Raise
+  it (owner, within the $100 / month credit) only if rounds 1-2 need more room. The
+  full bench's 15 tune runs per arm are dropped: the frozen cell already produced
+  them.
 
 ## 8. Phases
 
@@ -520,6 +579,22 @@ rev 3.1 — Fable third pass (READY-WITH-FIXES), all applied:
 7. Full Stage 0 definition block added to §4.0 per Fable's checklist.
 
 rev 4 — owner request 10-27: tune prompts per model before freezing. §4.4 rewritten
-as a prompt × model matrix (historical candidates from git × every model able to do
-the step, parameters part of the cell, freeze file seeds P2 variants); §7 matrix
-cost; §10 Claude draft now measured (not shipped). Pending Fable delta review.
+as a prompt × model matrix; §7 matrix cost; §10 Claude draft now measured.
+
+rev 4.1 — Fable delta review (NOT-READY), all applied, plus Stage 0 results:
+1. BLOCKER shared $45 ledger vs matrix → §7 matrix sub-cap $18, scored-run reserve =
+   Anthropic upper of surviving arms; with Stage 0's actual $1.18 the cap holds.
+2. HIGH A ambiguous → §4.2: A = shipped prompts, tuned gemini = A′ delta; DeepSeek
+   cells informational.
+3. HIGH keep rule over reps → §4.4 majority labels, "better" only where the
+   incumbent was stable; freeze-file tune labels non-evidential.
+4. HIGH candidates → `search_v1` dropped (corroboration report, not an answer);
+   `merged_v1` text written and committed.
+5. MED DeepSeek + plugin needs a bench payload builder → §4.4.
+6. MED §7 arithmetic restated as cells × runs × calls.
+7. MED full bench tune runs dropped; owner grader check on 10 tune answers before
+   freeze.
+8. LOW muse evidence cited in-repo; tool version = what Stage 0 picked; stale
+   §4.2 round-0 text replaced; status line.
+Stage 0 → §4.0 result table and the post-hoc `no_search` amendment (with raw
+numbers, same recorded calls).

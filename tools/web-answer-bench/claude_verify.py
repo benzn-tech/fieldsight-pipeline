@@ -25,14 +25,14 @@ MIN_CONTINUE_S = 2.0
 USER_LOCATION = {"type": "approximate", "country": "NZ", "timezone": "Pacific/Auckland"}
 
 
-def build_request(model, tool_version, prompt):
+def build_request(model, tool_version, prompt, max_uses=MAX_USES):
     """kwargs for `client.messages.create`, without `timeout`. No `thinking`
     field: `{type: disabled}` is a 400 on Sonnet 5.5."""
     return {
         "model": model,
         "max_tokens": MAX_TOKENS,
         "output_config": {"effort": "low"},
-        "tools": [{"type": tool_version, "name": "web_search", "max_uses": MAX_USES,
+        "tools": [{"type": tool_version, "name": "web_search", "max_uses": max_uses,
                    "user_location": dict(USER_LOCATION)}],
         "messages": [{"role": "user", "content": prompt}],
     }
@@ -85,9 +85,10 @@ def _classify(exc):
     return "http_error", status
 
 
-def verify(client, *, model, tool_version, prompt, budget_s=14.0, clock=time.monotonic):
+def verify(client, *, model, tool_version, prompt, budget_s=14.0, clock=time.monotonic,
+           max_uses=MAX_USES):
     """One verify: a call, at most one `pause_turn` continuation. Never raises."""
-    request = build_request(model, tool_version, prompt)
+    request = build_request(model, tool_version, prompt, max_uses)
     started = clock()
     total = {"input_tokens": 0, "output_tokens": 0, "search_requests": 0}
     out = {"text": "", "searched": False, "result_count": 0, "source_count": 0,
@@ -126,6 +127,10 @@ def verify(client, *, model, tool_version, prompt, budget_s=14.0, clock=time.mon
             out["outcome"] = p["stop_reason"]
         elif out["searched"] and out["text"]:
             out["outcome"] = "ok"
+        elif out["text"] and not out["error_code"] and not total["search_requests"]:
+            # Answered without calling the tool: a decision, not an error. Prod
+            # keeps the draft "unverified" (_verify_ok needs searched).
+            out["outcome"] = "no_search"
         else:
             out["outcome"] = "failed"
         break

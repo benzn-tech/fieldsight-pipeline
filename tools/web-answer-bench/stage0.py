@@ -48,7 +48,8 @@ VERIFY_BUDGET_S = 14.0
 P50_GATE_MS = 9000             # VERIFY_FLOOR
 MAX_GATE_MS = 14000            # VERIFY_BUDGET
 OVER_BUDGET_MS = MAX_GATE_MS + 1
-GATE_OK = ("ok", "max_tokens")
+# no_search: answered in its own wall time without searching (reported apart).
+GATE_OK = ("ok", "max_tokens", "no_search")
 # Upper-bound assumptions per Anthropic request (spec §7).
 UPPER_INPUT_TOKENS = 46_000
 UPPER_OUTPUT_TOKENS = claude_verify.MAX_TOKENS
@@ -115,6 +116,15 @@ def _sha(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def reclassify(r):
+    """Records written before `no_search` existed called it `failed`."""
+    if (r["outcome"] == "failed" and r.get("http_status") == 200
+            and r.get("stop_reason") == "end_turn" and not r.get("searched")
+            and not r.get("error_code") and not r.get("search_requests")):
+        return dict(r, outcome="no_search")
+    return r
+
+
 def summarize(records):
     configs = {}
     for name, model, tool in CONFIGS:
@@ -133,6 +143,7 @@ def summarize(records):
             "searched_rate": (sum(r["searched"] for r in live) / len(live)) if live else None,
             "failures": len(failed),
             "timeouts": sum(r["outcome"] == "timeout" for r in live),
+            "no_search": sum(r["outcome"] == "no_search" for r in live),
             "refusals": sum(r["outcome"] == "refusal" for r in live),
             "max_tokens_stops": sum(r["outcome"] == "max_tokens" for r in live),
             "continuations": sum(bool(r["continuation"]) for r in live),

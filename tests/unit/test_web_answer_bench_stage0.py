@@ -208,6 +208,16 @@ def test_ok_without_search_is_failed():
     assert _verify(client, clock)["outcome"] == "failed"
 
 
+def test_answer_without_any_search_attempt_is_no_search():
+    # Stage 0 10-27: Sonnet answered the unknowable item (t5) in ~4 s without
+    # calling the tool. That is a decision, not an error: prod returns the draft
+    # "unverified" (_verify_ok needs searched), so it costs no latency.
+    clock = Clock()
+    key = ("claude-sonnet-5-5", "web_search_20260209")
+    client = FakeClient(clock, {key: [response(blocks=[], u=usage(searches=0))]})
+    assert _verify(client, clock)["outcome"] == "no_search"
+
+
 # ---------------------------------------------------------- Task 2: ledger
 
 def test_ledger_persists_across_instances(tmp_path):
@@ -413,6 +423,31 @@ def test_max_tokens_stop_is_not_a_gate_failure(tmp_path):
     assert summary["stop_rule"]["frozen"].get("claude-haiku-5-5") == "web_search_20250305"
 
 
+def test_no_search_counts_its_wall_time_but_is_reported(tmp_path):
+    clock = Clock()
+    key = ("claude-haiku-5-5", "web_search_20250305")
+    client = FakeClient(clock, {key: [(0.5, response(blocks=[], u=usage(searches=0)))]},
+                        default=lambda: (1.0, response()))
+    _, summary, _, _ = _run(tmp_path, client, clock)
+    h = summary["configs"]["haiku-20250305"]
+    assert h["failures"] == 0
+    assert h["no_search"] == 1
+    assert h["max_ms"] <= stage0.MAX_GATE_MS
+
+
+def test_resummarize_reclassifies_recorded_no_search_rows():
+    rows = [{"config": "haiku-20250305", "outcome": "failed", "http_status": 200,
+             "stop_reason": "end_turn", "searched": False, "error_code": None,
+             "search_requests": 0, "latency_ms": 3500, "continuation": False,
+             "cost_usd": 0.01},
+            {"config": "haiku-20250305", "outcome": "failed", "http_status": 200,
+             "stop_reason": "end_turn", "searched": False,
+             "error_code": "too_many_requests", "search_requests": 1,
+             "latency_ms": 2000, "continuation": False, "cost_usd": 0.01}]
+    fixed = [stage0.reclassify(r) for r in rows]
+    assert [r["outcome"] for r in fixed] == ["no_search", "failed"]
+
+
 def test_stop_rule_freezes_fastest_tool_per_model_and_drops_others():
     s = {"configs": {
         "sonnet-20260209": {"model": "claude-sonnet-5-5", "tool": "web_search_20260209",
@@ -442,3 +477,56 @@ def test_no_question_or_answer_text_in_stdout_or_summary(tmp_path):
     assert SECRET_Q not in blob and SECRET_A not in blob and "draft of" not in blob
     calls = (tmp_path / "stage0_calls.jsonl").read_text("utf-8")
     assert SECRET_A in calls        # the text lives only in the --out calls file
+
+
+# ------------------------------------------- re-probe (one config, lower max_uses)
+
+reprobe = _load("reprobe")
+
+
+
+def _stage0_out(tmp_path):
+    out = tmp_path / "s0"
+    out.mkdir()
+    with open(out / "stage0_drafts.jsonl", "w", encoding="utf-8") as f:
+        for i in range(1, 6):
+            f.write(json.dumps({"item": f"t{i}", "draft_ms": 3000, "draft": f"D{i}"}) + "\n")
+    return out
+
+
+def _rp_argv(out, *extra):
+    return ["--out", str(out), "--config", "haiku-20250305", "--max-uses", "2",
+            "--search-price-per-1000", "10", *extra]
+
+
+def test_reprobe_plan_is_one_config_no_drafts():
+    assert reprobe.plan(2) == {"verifies": 12, "upper": 24, "searches_upper": 48}
+
+
+def test_reprobe_confirm_calls_must_equal_upper(tmp_path):
+    with pytest.raises(SystemExit):
+        reprobe.validate(_rp_argv(_stage0_out(tmp_path), "--confirm-calls", "77"), KEYS)
+
+
+def test_reprobe_run_uses_stored_drafts_and_the_lower_max_uses(tmp_path):
+    out = _stage0_out(tmp_path)
+    args = reprobe.validate(_rp_argv(out, "--confirm-calls", "24"), KEYS)
+    clock = Clock()
+    client = FakeClient(clock, default=lambda: (1.0, response()))
+    code, summary = reprobe.run(args, client=client, clock=clock, stdout=io.StringIO())
+    assert code == 0
+    assert len(client.requests) == 12
+    assert {r["tools"][0]["max_uses"] for r in client.requests} == {2}
+    assert all(r["model"] == "claude-haiku-5-5" for r in client.requests)
+    assert "D1" in client.requests[0]["messages"][0]["content"]
+    c = summary["config"]
+    assert c["n"] == 12 and c["max_uses"] == 2
+    assert (out / "reprobe_haiku-20250305_mu2_calls.jsonl").exists()
+    assert json.loads((out / "anthropic_ledger.json").read_text())  # shared ledger
+
+
+def test_reprobe_missing_stage0_drafts_refuses(tmp_path):
+    empty = tmp_path / "e"
+    empty.mkdir()
+    with pytest.raises(SystemExit):
+        reprobe.validate(_rp_argv(empty, "--confirm-calls", "24"), KEYS)
