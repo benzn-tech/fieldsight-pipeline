@@ -99,7 +99,10 @@ def run(candidates, manifest, out, cache=None, tasks=("X", "T", "R"), r_template
     out = rb_common.check_out_dir(out)
     render = renderer or default_renderer(cache)
     sessions = {k: v for k, v in manifest.items() if k != "R"}
-    index = {}
+    ipath = os.path.join(out, "prompts", "index.json")
+    # Merged into, never replaced: T is pre-rendered after the pilot pins its
+    # input, and held-out T after the held-out pins, long after X and R.
+    index = rb_common.read_json(ipath) if os.path.exists(ipath) else {}
 
     def put(cid, key, task, n, prompt):
         rb_common.write_text(os.path.join(out, "prompts", cid, key + ".txt"), prompt)
@@ -137,7 +140,7 @@ def run(candidates, manifest, out, cache=None, tasks=("X", "T", "R"), r_template
             r = rb_common.read_json(os.path.join(out, "inputs", "R", key + ".json"))
             put(R_CANDIDATE, key, "R", d["n_transcripts"],
                 render(develop, "R", {"served_templates": r_templates, "kwargs": r["kwargs"]}))
-    rb_common.write_json(os.path.join(out, "prompts", "index.json"), index)
+    rb_common.write_json(ipath, index)
     return index
 
 

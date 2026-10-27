@@ -144,3 +144,12 @@ def test_r_needs_template(tmp_path):
     m = _setup(out)
     with pytest.raises(ValueError):
         pre.run({}, m, out, tasks=("R",), renderer=_stub([]))
+
+
+def test_prerender_merges_into_existing_index(tmp_path, monkeypatch):
+    out = str(tmp_path / "out")
+    m = _setup(out)
+    pre.run({"X-cur": CANDS["X-cur"]}, m, out, tasks=("X",), renderer=_stub([]))
+    _pin(out, str(tmp_path))
+    idx = pre.run({"T-cur": CANDS["T-cur"]}, m, out, tasks=("T",), renderer=_stub([]))
+    assert set(idx) == {"X-cur", "T-cur"}
