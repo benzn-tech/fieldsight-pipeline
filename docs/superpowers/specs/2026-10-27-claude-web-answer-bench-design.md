@@ -289,7 +289,9 @@ b8c96342 fixed. Its Claude latency is already in §1.
 
 **Models by step** (admitted by capability, with evidence):
 - *draft* (no search): gemini-3.8-flash (shipped), DeepSeek V4.1 Flash @ coreweave
-  (reasoning off), Sonnet 5.5, Haiku 5.5 (effort low).
+  (reasoning off), mimo-v2.6-pro (reasoning off, llm_utils.py:483-488; owner's model
+  list 10-27; draft only — its web-plugin behaviour is unmeasured), Sonnet 5.5,
+  Haiku 5.5 (effort low).
 - *verify / single call* (must search): gemini-3.8-flash + OpenRouter web plugin
   (shipped), DeepSeek V4.1 Flash + web plugin, Sonnet 5.5 + `web_search_20250305`
   (Stage 0, §4.0), Haiku 5.5 + `web_search_20250305` at `max_uses` 2 (re-probe, §4.0).
@@ -435,12 +437,12 @@ is admitted; without it the Anthropic rows halve.
 
 | | cells | runs | Anthropic calls (upper) | OpenRouter calls (upper) |
 |---|---|---|---|---|
-| draft: 4 models × `draft_v1` | 4 | 60 | 30 | 30 |
+| draft: 5 models × `draft_v1` | 5 | 75 | 30 | 45 |
 | verify: 4 models × `verify_v1/v2` | 8 | 120 | 120 | 120 |
 | single call: 4 models × `web_v1`, `merged_v1` | 8 | 120 | 120 | 60 |
 | rounds 1-2: ≤ 2 edits × 8 (model, step) | ≤ 16 | ≤ 240 | ≤ 240 | ≤ 180 |
-| grader, 1 per run | — | — | — | ≤ 540 |
-| **total** | ≤ 36 | ≤ 540 | **≤ 510** | **≤ 930** |
+| grader, 1 per run | — | — | — | ≤ 555 |
+| **total** | ≤ 37 | ≤ 555 | **≤ 510** | **≤ 960** |
 
 Anthropic dollars: Sonnet ≤ 255 calls × $0.133 ≈ $34; Haiku ≈ $1.3; searches ≤ 1 200
 (240 Sonnet search-capable calls × 3 + 240 Haiku × 2) ≈ $12 at $10 / 1 000. Expected (Stage 0 measured
