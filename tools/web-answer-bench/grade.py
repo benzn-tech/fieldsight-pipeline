@@ -9,9 +9,21 @@ Plan: docs/superpowers/plans/2026-10-28-web-answer-prompt-matrix.md (Task 6)
 
 Exit codes: 0 done, 2 refused (arguments / env / no calls file).
 
-The grader sees the question, the gold facts, the kind, the retrieved source
-domains and the blinded answer -- never a run id, cell, prompt or model name.
-Answers go out in a seeded shuffle. Three labels exist besides the rubric's:
+The grader sees the question, the gold facts, the kind and the blinded answer --
+never a run id, cell, prompt or model name. Answers go out in a seeded shuffle.
+
+The grader cannot say `hallucinated_source`: it never sees what was retrieved,
+and a model is not trusted to judge that. The §5.2 domain check runs here,
+mechanically, on the raw answer, and is recorded as `source_flag` beside the
+grader's label for the owner to confirm; it never downgrades the label. Draft
+text (a draft cell, or a draft handed to the reader after a failed verify /
+single call) searched nothing, so it is never checked against another call's
+domains (`source_checked: false`).
+
+`--only-ungraded` re-grades only runs that are ungraded or missing and merges
+them into grades_r0.jsonl. A grader 429 is retried once after 2 s.
+
+Three labels exist besides the rubric's:
   ungraded   the grader's reply was not JSON or not a known label (counted,
              never read as `wrong`)
   no_answer  the run produced nothing a reader would see; not sent to the
@@ -29,6 +41,7 @@ import random
 import re
 import statistics
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -42,6 +55,11 @@ import openrouter_bench                                  # noqa: E402
 import prompts                                           # noqa: E402
 
 ORDER = ["wrong", "hallucinated_source", "partial", "correctly_unsure", "correct"]
+# What the grader may answer. hallucinated_source is set only from an
+# owner-confirmed source_flag, never by a model.
+GRADER_LABELS = ["wrong", "partial", "correctly_unsure", "correct"]
+DRAFT_SOURCES = ("draft", "fallback")
+RETRY_429_S = 2.0
 NO_ANSWER = "no_answer"
 UNGRADED = "ungraded"
 _RANK = {NO_ANSWER: -1, **{label: i for i, label in enumerate(ORDER)}}
@@ -103,27 +121,34 @@ def _parse_label(text):
     except Exception:                                     # noqa: BLE001 - any shape but ours
         return None
     label = parsed.get("label") if isinstance(parsed, dict) else None
-    return label if label in ORDER else None
+    return label if label in GRADER_LABELS else None
 
 
 def _lines(values):
     return "\n".join(f"- {v}" for v in values) if values else "(none)"
 
 
-def grade_one(question, gold, answer, domains, *, urls=(), call=openrouter_bench.call):
-    flagged = source_flag(answer, domains, urls)
+def grade_one(question, gold, answer, domains, *, urls=(), call=openrouter_bench.call,
+              check_sources=True, sleep=time.sleep):
+    flagged = source_flag(answer, domains, urls) if check_sources else []
     prompt = prompts.load(GRADER_PROMPT).format(
         question=question, kind=gold.get("kind") or "standard",
         expected=_lines(gold.get("expected") or []),
-        variants=_lines(gold.get("variants") or []),
-        domains=", ".join(domains) if domains else "(none)", answer=blind(answer))
-    r = call("grader", prompt, web=False, timeout=GRADER_TIMEOUT_S,
-             max_tokens=GRADER_MAX_TOKENS)
+        variants=_lines(gold.get("variants") or []), answer=blind(answer))
+    cost = 0.0
+    for attempt in (1, 2):
+        r = call("grader", prompt, web=False, timeout=GRADER_TIMEOUT_S,
+                 max_tokens=GRADER_MAX_TOKENS)
+        if isinstance(r.get("openrouter_cost_usd"), (int, float)):
+            cost += r["openrouter_cost_usd"]
+        if r.get("http_status") != 429 or attempt == 2:
+            break
+        sleep(RETRY_429_S)
     label = _parse_label(r.get("text")) if r.get("outcome") == "ok" else None
     return {"label": label or UNGRADED, "raw_ok": label is not None,
-            "source_flag": bool(flagged), "flagged_hosts": flagged,
-            "grader_outcome": r.get("outcome"),
-            "grader_cost_usd": r.get("openrouter_cost_usd")}
+            "source_checked": bool(check_sources), "source_flag": bool(flagged),
+            "flagged_hosts": flagged, "grader_outcome": r.get("outcome"),
+            "grader_calls": attempt, "grader_cost_usd": round(cost, 8)}
 
 
 def majority(labels):
@@ -156,6 +181,20 @@ def split(rows):
     live = [r for r in rows if r.get("outcome") != "no_draft"]
     return ([r for r in live if (r.get("answer") or "").strip()],
             [r for r in live if not (r.get("answer") or "").strip()], skipped)
+
+
+def _read_grades(out):
+    path = os.path.join(out, "grades_r0.jsonl")
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def pending(todo, grades):
+    """--only-ungraded: the runs with no label yet, or an ungraded one."""
+    labelled = {g["run_id"] for g in grades if g.get("label") != UNGRADED}
+    return [r for r in todo if r["run_id"] not in labelled]
 
 
 def shuffled(rows, seed):
@@ -199,6 +238,7 @@ def validate(argv, env, repo_root=REPO):
     ap.add_argument("--seed", type=int, required=True)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--confirm-calls", type=int)
+    ap.add_argument("--only-ungraded", action="store_true")
     ap.add_argument("--set", default=os.path.join(HERE, "set.v1.jsonl"))
     args = ap.parse_args(argv)
     out = Path(args.out).resolve()
@@ -212,16 +252,22 @@ def validate(argv, env, repo_root=REPO):
     if not args.dry_run:
         if not env.get("CORROBORATION_API_KEY"):
             _refuse("missing environment variable(s): CORROBORATION_API_KEY")
-        n = len(split(_read_calls(args.calls))[0])
+        todo = split(_read_calls(args.calls))[0]
+        if args.only_ungraded:
+            todo = pending(todo, _read_grades(args.out))
+        n = len(todo)
         if args.confirm_calls != n:
             _refuse(f"--confirm-calls must equal the answers to grade {n} "
                     "(run --dry-run first)")
     return args
 
 
-def run(args, *, call=openrouter_bench.call, stdout=sys.stdout):
+def run(args, *, call=openrouter_bench.call, stdout=sys.stdout, sleep=time.sleep):
     rows = _read_calls(args.calls)
     todo, empty, skipped = split(rows)
+    previous = _read_grades(args.out) if args.only_ungraded else []
+    if args.only_ungraded:
+        todo = pending(todo, previous)
     info = {"to_grade": len(todo), "no_answer": len(empty), "skipped": len(skipped)}
     print(f"grade: {len(todo)} grader calls (1 per answer, no retry), {len(empty)} runs "
           f"without an answer (no_answer), {len(skipped)} skipped (no_draft), "
@@ -230,19 +276,27 @@ def run(args, *, call=openrouter_bench.call, stdout=sys.stdout):
         return 0, dict(info, dry_run=True)
 
     gold = load_gold(args.set)
-    labels = {}
-    with open(os.path.join(args.out, "grades_r0.jsonl"), "w", encoding="utf-8",
-              newline="") as f:
-        for r in empty:
-            labels[r["run_id"]] = NO_ANSWER
-            f.write(json.dumps({"run_id": r["run_id"], "label": NO_ANSWER, "raw_ok": None,
-                                "source_flag": False, "flagged_hosts": []}) + "\n")
-        for n, r in enumerate(shuffled(todo, args.seed)):
-            g = gold[r["item"]]
-            res = grade_one(g["question"], g, r["answer"], r.get("result_domains") or [],
-                            urls=r.get("result_urls") or [], call=call)
-            labels[r["run_id"]] = res["label"]
-            f.write(json.dumps(dict(res, run_id=r["run_id"], order=n)) + "\n")
+    redo = {r["run_id"] for r in todo}
+    out_rows = [g for g in previous if g["run_id"] not in redo]
+    have = {g["run_id"] for g in out_rows}
+    for r in empty:
+        if r["run_id"] not in have:
+            out_rows.append({"run_id": r["run_id"], "label": NO_ANSWER, "raw_ok": None,
+                             "source_checked": False, "source_flag": False,
+                             "flagged_hosts": []})
+    for n, r in enumerate(shuffled(todo, args.seed)):
+        g = gold[r["item"]]
+        draft_text = r.get("step") == "draft" or r.get("answer_source") in DRAFT_SOURCES
+        res = grade_one(g["question"], g, r["answer"], r.get("result_domains") or [],
+                        urls=r.get("result_urls") or [], call=call,
+                        check_sources=not draft_text, sleep=sleep)
+        out_rows.append(dict(res, run_id=r["run_id"], order=n))
+    tmp = os.path.join(args.out, "grades_r0.jsonl.tmp")
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        for g in out_rows:
+            f.write(json.dumps(g) + "\n")
+    os.replace(tmp, os.path.join(args.out, "grades_r0.jsonl"))
+    labels = {g["run_id"]: g["label"] for g in out_rows}
     cells = build_cells(rows, labels, gold)
     with open(os.path.join(args.out, "cells_r0.json"), "w", encoding="utf-8",
               newline="") as f:

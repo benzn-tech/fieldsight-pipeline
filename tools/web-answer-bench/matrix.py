@@ -12,6 +12,10 @@ Owner-run, from the bench venv (the SDK is not in the CI environment):
 Exit codes: 0 done, 2 refused (arguments / env), 3 hard stop (matrix pool at its
 cap, or the scored-run reserve would be touched).
 
+A rerun resumes: matrix_r0_calls.jsonl is appended to, never truncated, and a
+(cell, item, rep) already in it is not run again (stored gemini drafts are
+reused for the verify / fallback pairing). Paid records are never thrown away.
+
 Order: gemini drafts first (every verify cell verifies them, paired by item and
 rep), then the other cells cheapest first: OpenRouter, Haiku, Sonnet. Nothing
 printed or summarised carries question, draft or answer text; that text lives
@@ -154,16 +158,21 @@ def _domains(r):
 
 
 def _answer(step, r, draft):
-    """What the reader gets, and from where. A verify that did not verify hands
-    the reader the draft, unverified (web_answer.general_answer)."""
+    """(answer, source, fallback): what the reader gets. A verify that did not
+    verify hands the reader the draft, unverified (web_answer.general_answer); a
+    single call that failed falls back to gemini's draft of the same item / rep
+    (spec §4.2 B). `no_search` on an unsure item is the model's own decision and
+    stands; on any other item reclassify has already made it `failed`."""
     text = (r.get("text") or "").strip()
     if step == "verify":
         if r["outcome"] == "ok" and text:
-            return text, "verify"
-        return draft + "\n\n[unverified]", "draft"
+            return text, "verify", False
+        return draft + "\n\n[unverified]", "draft", True
     if text and (r["outcome"] == "ok" or (step == "single" and r["outcome"] == "no_search")):
-        return text, "model"
-    return None, None
+        return text, "model", False
+    if step == "single" and draft:
+        return draft + "\n\n[unverified]", "fallback", True
+    return None, None, False
 
 
 def _one(cell, prompt, *, client, or_call, clock, draft_ms=None):
@@ -228,6 +237,35 @@ def _write_summary(out, summary):
         json.dump(summary, f, indent=2)
 
 
+def _claude_cost(model, step, r, price):
+    """Anthropic $ for one run. A timeout or transport error left no usage to
+    read but may still have been billed, so it is booked at one call's upper
+    bound (spec §7 assumptions) and marked estimated."""
+    name, max_uses = CLAUDE[model]
+    cost = call_cost(name, r["input_tokens"], r["output_tokens"],
+                     r.get("search_requests", 0), price)
+    if r["outcome"] in ("timeout", "http_error"):
+        searches = max_uses if step != "draft" else 0
+        return cost + call_cost(name, stage0.UPPER_INPUT_TOKENS, stage0.UPPER_OUTPUT_TOKENS,
+                                searches, price), True
+    return cost, False
+
+
+def _load_done(path):
+    """Rows already paid for, keyed by (cell, item, rep). A torn last line (a
+    kill mid-write) is dropped; the next write starts on a fresh line."""
+    rows = []
+    if not os.path.exists(path):
+        return rows
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+    return rows
+
+
 def _blocked(ledger):
     """No Anthropic call once the matrix pool is spent or the scored reserve
     would be the next thing spent."""
@@ -255,15 +293,30 @@ def run(args, *, items, client, or_call=openrouter_bench.call, clock=time.monoto
     os.makedirs(args.out, exist_ok=True)
     unsure = stage0.unsure_ids(items)
     summary = {"round": 0, "plan": p, "hard_stop": False}
-    drafts, records, seq = {}, [], 0
-    with open(os.path.join(args.out, "matrix_r0_calls.jsonl"), "w", encoding="utf-8",
-              newline="") as f:
+    calls_path = os.path.join(args.out, "matrix_r0_calls.jsonl")
+    records = _load_done(calls_path)
+    done = {(r["cell"], r["item"], r["rep"]) for r in records}
+    drafts = {(r["item"], r["rep"]): (r["text"], r["latency_ms"]) for r in records
+              if r["cell"] == _cell_id(GEMINI_DRAFT) and r["outcome"] == "ok" and r.get("text")}
+    seq = max([int(r["run_id"].split("-")[1]) for r in records] or [0])
+    if records:
+        print(f"matrix: resuming, {len(records)} runs already recorded", file=stdout)
+    torn = os.path.exists(calls_path) and os.path.getsize(calls_path) > 0
+    if torn:
+        with open(calls_path, "rb") as f:
+            f.seek(-1, os.SEEK_END)
+            torn = f.read(1) != b"\n"
+    with open(calls_path, "a", encoding="utf-8", newline="") as f:
+        if torn:
+            f.write("\n")
         for cell in cells:
             step, pid, model = cell
             template = prompts.load(pid)
             for rep in range(REPS):
                 for it in items:
                     item = it["id"]
+                    if (_cell_id(cell), item, rep) in done:
+                        continue
                     if model in CLAUDE and _blocked(ledger):
                         summary["hard_stop"] = True
                         break
@@ -277,8 +330,8 @@ def run(args, *, items, client, or_call=openrouter_bench.call, clock=time.monoto
                     draft = drafts.get((item, rep))
                     if step == "verify" and draft is None:
                         rec.update(outcome="no_draft", calls=0, latency_ms=0,
-                                   searched=False, cost_usd=0.0, answer=None,
-                                   answer_source=None, text="")
+                                   searched=False, cost_usd=0.0, cost_estimated=False,
+                                   answer=None, answer_source=None, fallback=False, text="")
                     else:
                         kw = {"question": it["question"]}
                         if step == "verify":
@@ -288,17 +341,17 @@ def run(args, *, items, client, or_call=openrouter_bench.call, clock=time.monoto
                                  draft_ms=draft[1] if draft else None)
                         if step != "draft":
                             r = stage0.reclassify(dict(r, item=item), unsure)
-                        cost = 0.0
+                        cost, estimated = 0.0, False
                         if model in CLAUDE:
-                            cost = call_cost(CLAUDE[model][0], r["input_tokens"],
-                                             r["output_tokens"], r.get("search_requests", 0),
-                                             args.search_price_per_1000)
+                            cost, estimated = _claude_cost(model, step, r,
+                                                           args.search_price_per_1000)
                             ledger.add(cost, pool=POOL)
-                        answer, source = _answer(step, r, draft[0] if draft else "")
+                        answer, source, fallback = _answer(step, r,
+                                                           draft[0] if draft else "")
                         rec.update(r)
                         rec.update(item=item, cost_usd=round(cost, 6),
-                                   result_domains=_domains(r), answer=answer,
-                                   answer_source=source)
+                                   cost_estimated=estimated, result_domains=_domains(r),
+                                   answer=answer, answer_source=source, fallback=fallback)
                         if step == "verify":
                             rec["draft_ms"] = draft[1]
                         if cell == GEMINI_DRAFT and r["outcome"] == "ok" and r["text"]:
@@ -317,6 +370,10 @@ def run(args, *, items, client, or_call=openrouter_bench.call, clock=time.monoto
                 break
 
     summary["cells"] = summarize(records)
+    per_cell = Counter(r["cell"] for r in records)
+    summary["cut_by_pool"] = [_cell_id(c) for c in cells
+                              if per_cell[_cell_id(c)] < REPS * len(items)] \
+        if summary["hard_stop"] else []
     summary["anthropic_spent_usd"] = round(ledger.spent, 4)
     summary["matrix_pool_spent_usd"] = round(ledger.pool_spent(POOL), 4)
     _write_summary(args.out, summary)
@@ -324,6 +381,8 @@ def run(args, *, items, client, or_call=openrouter_bench.call, clock=time.monoto
         print(f"{cid}: n={c['n']} outcomes={json.dumps(c['outcomes'], sort_keys=True)} "
               f"p50={c['p50_ms']} max={c['max_ms']} searched={c['searched_rate']} "
               f"${c['anthropic_usd']:.4f}", file=stdout)
+    if summary["cut_by_pool"]:
+        print("cut by pool: " + ", ".join(summary["cut_by_pool"]), file=stdout)
     return (3 if summary["hard_stop"] else 0), summary
 
 

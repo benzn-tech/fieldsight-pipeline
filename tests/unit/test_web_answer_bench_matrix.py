@@ -534,13 +534,20 @@ def test_no_search_on_a_web_item_is_failed(tmp_path):
     clock = Clock()
     _m_run(tmp_path, clock=clock, or_fake=OrFake(clock, no_search_items=("t1", "t5")))
     rows = _rows(tmp_path)
+    drafts = {(r["item"], r["rep"]): r["text"] for r in rows
+              if r["cell"] == "draft/draft_v1/gemini"}
     single = {r["item"]: r for r in rows if r["cell"] == "single/web_v1/gemini"}
-    assert single["t1"]["outcome"] == "failed" and single["t1"]["answer"] is None
+    t1 = single["t1"]
+    assert t1["outcome"] == "failed" and t1["fallback"] is True
+    assert t1["answer_source"] == "fallback"
+    assert t1["answer"] == drafts[("t1", t1["rep"])] + "\n\n[unverified]"
     assert single["t5"]["outcome"] == "no_search"
-    assert single["t5"]["answer"] == SECRET_A         # the reader still gets the text
+    assert single["t5"]["answer"] == SECRET_A         # declining on an unsure item
+    assert single["t5"]["fallback"] is False
     v = {r["item"]: r for r in rows if r["cell"] == "verify/verify_v2/gemini"}
     assert v["t1"]["outcome"] == "failed"
     assert v["t1"]["answer_source"] == "draft" and "[unverified]" in v["t1"]["answer"]
+    assert v["t1"]["fallback"] is True and v["t2"]["fallback"] is False
     assert v["t2"]["answer_source"] == "verify"
 
 
@@ -556,6 +563,10 @@ def test_matrix_pool_exhausted_mid_cell_stops_and_writes_summary(tmp_path):
     assert len(or_fake.calls) == 165                  # OpenRouter cells ran first
     s = json.loads((tmp_path / "matrix_r0_summary.json").read_text("utf-8"))
     assert s["hard_stop"] is True
+    claude_cells = [matrix._cell_id(c) for c in matrix.round0_cells()
+                    if c[2] in matrix.CLAUDE]
+    assert s["cut_by_pool"] == claude_cells
+    assert "cut by pool: " + ", ".join(claude_cells) in text
     assert ledger.Ledger(str(tmp_path / "anthropic_ledger.json")).room() > \
         ledger.SCORED_RESERVE
 
@@ -622,6 +633,7 @@ def test_grade_one_labels_and_ungraded():
                              ('```json\n{"label": "wrong"}\n```', "wrong", True),
                              ("The answer is correct.", "ungraded", False),
                              ('{"label": "excellent"}', "ungraded", False),
+                             ('{"label": "hallucinated_source"}', "ungraded", False),
                              ("", "ungraded", False)):
         fake = GraderFake([reply])
         g = grade.grade_one("Q?", GOLD, "an answer", ["building.govt.nz"], call=fake)
@@ -633,18 +645,25 @@ def test_grade_one_prompt_is_blind_and_carries_gold_and_flag():
     g = grade.grade_one("Q?", GOLD, "Fact [unverified] https://www.fake.co.nz/p",
                         ["building.govt.nz"], call=fake)
     p = fake.prompts[0]
-    assert "GOLD-FACT" in p and "GOLD-VARIANT" in p and "building.govt.nz" in p
+    assert "GOLD-FACT" in p and "GOLD-VARIANT" in p
     assert "[unverified]" not in p and "https://" not in p.split("## Answer")[1]
+    assert "hallucinated_source" not in p
+    # Flagged mechanically for the owner; the grader's label is not downgraded.
+    assert g["label"] == "correct"
     assert g["source_flag"] is True and g["flagged_hosts"] == ["fake.co.nz"]
+    g = grade.grade_one("Q?", GOLD, "Fact https://www.fake.co.nz/p", ["building.govt.nz"],
+                        call=GraderFake(), check_sources=False)
+    assert g["source_flag"] is False and g["source_checked"] is False
 
 
 def test_grader_template_formats():
     t = prompts.load("grader_v1")
-    filled = t.format(question="Q", kind="unsure", expected="E", variants="V",
-                      answer="A", domains="d")
+    filled = t.format(question="Q", kind="unsure", expected="E", variants="V", answer="A")
     assert '{"label"' in filled
-    for label in grade.ORDER:
+    for label in grade.GRADER_LABELS:
         assert label in t
+    assert "hallucinated_source" not in t
+    assert set(grade.GRADER_LABELS) == set(grade.ORDER) - {"hallucinated_source"}
 
 
 def test_majority_worst_stable():
@@ -884,3 +903,147 @@ def test_live_matrix_refuses_unconfirmed_tune_gold(tmp_path):
         matrix.validate(_m_argv(tmp_path / "o", "--confirm-calls", "495", "--set", str(gold)),
                         KEYS, REPO)
     assert matrix.validate(_m_argv(tmp_path / "o", "--dry-run", "--set", str(gold)), {}, REPO)
+
+
+# ------------------------------------------------------- review fixes (10-28)
+
+class GraderFake429(GraderFake):
+    def __init__(self, statuses):
+        super().__init__()
+        self.statuses = list(statuses)
+
+    def __call__(self, profile, prompt, **kw):
+        r = super().__call__(profile, prompt, **kw)
+        status = self.statuses.pop(0) if self.statuses else 200
+        if status != 200:
+            r.update(outcome="http_error", http_status=status, text="")
+        return r
+
+
+def test_grader_429_retried_once_after_two_seconds():
+    slept = []
+    fake = GraderFake429([429])
+    g = grade.grade_one("Q?", GOLD, "a", [], call=fake, sleep=slept.append)
+    assert g["label"] == "correct" and len(fake.prompts) == 2 and slept == [2.0]
+    fake = GraderFake429([429, 429])
+    g = grade.grade_one("Q?", GOLD, "a", [], call=fake, sleep=slept.append)
+    assert g["label"] == "ungraded" and len(fake.prompts) == 2
+    fake = GraderFake429([500])
+    assert grade.grade_one("Q?", GOLD, "a", [], call=fake, sleep=slept.append)["label"] == \
+        "ungraded"
+    assert len(fake.prompts) == 1
+
+
+def test_draft_answers_are_never_source_checked(tmp_path):
+    rows = _calls_file(tmp_path)
+    bad = "https://www.not-retrieved.co.nz/p"
+    rows[2].update(step="draft", answer=f"{SECRET_A} {bad}")
+    rows[3].update(answer_source="fallback", answer=f"{SECRET_A} {bad}")
+    rows[4].update(answer_source="draft", answer=f"{SECRET_A} {bad}")
+    rows[5].update(answer_source="model", answer=f"{SECRET_A} {bad}")
+    (tmp_path / "matrix_r0_calls.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    args = grade.validate(_g_argv(tmp_path, "--confirm-calls", "28"),
+                          {"CORROBORATION_API_KEY": "k"}, REPO)
+    grade.run(args, call=GraderFake(), stdout=io.StringIO())
+    g = {x["run_id"]: x for x in map(json.loads, open(tmp_path / "grades_r0.jsonl",
+                                                       encoding="utf-8"))}
+    for r in rows[2:5]:
+        assert g[r["run_id"]]["source_flag"] is False
+        assert g[r["run_id"]]["source_checked"] is False
+    assert g[rows[5]["run_id"]]["source_flag"] is True
+    assert g[rows[5]["run_id"]]["label"] == "correct"
+
+
+def test_only_ungraded_regrades_and_merges(tmp_path):
+    rows = _calls_file(tmp_path)
+    args = grade.validate(_g_argv(tmp_path, "--confirm-calls", "28"),
+                          {"CORROBORATION_API_KEY": "k"}, REPO)
+    grade.run(args, call=GraderFake(replies=["nonsense"] * 3), stdout=io.StringIO())
+    before = [json.loads(l) for l in open(tmp_path / "grades_r0.jsonl", encoding="utf-8")]
+    ungraded = {g["run_id"] for g in before if g["label"] == "ungraded"}
+    assert len(ungraded) == 3
+    with pytest.raises(SystemExit):
+        grade.validate(_g_argv(tmp_path, "--only-ungraded", "--confirm-calls", "28"),
+                       {"CORROBORATION_API_KEY": "k"}, REPO)
+    args = grade.validate(_g_argv(tmp_path, "--only-ungraded", "--confirm-calls", "3"),
+                          {"CORROBORATION_API_KEY": "k"}, REPO)
+    fake = GraderFake()
+    code, info = grade.run(args, call=fake, stdout=io.StringIO())
+    assert code == 0 and len(fake.prompts) == 3
+    after = [json.loads(l) for l in open(tmp_path / "grades_r0.jsonl", encoding="utf-8")]
+    assert len(after) == len(before) == 29
+    assert len({g["run_id"] for g in after}) == 29
+    assert all(g["label"] != "ungraded" for g in after)
+    kept = {g["run_id"]: g for g in before if g["run_id"] not in ungraded}
+    assert all(kept[g["run_id"]] == g for g in after if g["run_id"] in kept)
+    cells = json.loads((tmp_path / "cells_r0.json").read_text("utf-8"))
+    assert cells["single/web_v1/gemini"]["items"]["t3"]["labels"] == ["correct"] * 3
+
+
+class Boom(Exception):
+    pass
+
+
+class OrFakeDies(OrFake):
+    def __init__(self, clock, after):
+        super().__init__(clock)
+        self.after = after
+
+    def __call__(self, *a, **kw):
+        if len(self.calls) >= self.after:
+            raise Boom("killed")
+        return super().__call__(*a, **kw)
+
+
+def test_rerun_resumes_without_repeating_paid_calls(tmp_path):
+    clock = Clock()
+    with pytest.raises(Boom):
+        _m_run(tmp_path, clock=clock, or_fake=OrFakeDies(clock, after=50))
+    first = _rows(tmp_path)
+    assert len(first) == 50
+    clock = Clock()
+    or2 = OrFake(clock)
+    or2.n_drafts = 100                    # a re-drafted text would show up as DRAFT<101>
+    code, summary, _, client, _ = _m_run(tmp_path, clock=clock, or_fake=or2)
+    assert code == 0
+    rows = _rows(tmp_path)
+    assert len(rows) == 315
+    assert rows[:50] == first                         # paid records kept, untouched
+    assert len({(r["cell"], r["item"], r["rep"]) for r in rows}) == 315
+    assert len({r["run_id"] for r in rows}) == 315
+    assert len(or2.calls) == 165 - 50 and len(client.requests) == 150
+    assert or2.n_drafts == 100                        # no gemini draft re-run
+    drafts = {(r["item"], r["rep"]): r["text"] for r in rows
+              if r["cell"] == "draft/draft_v1/gemini"}
+    for r in rows:
+        if r["step"] == "verify":
+            assert r["text"].rstrip().endswith(drafts[(r["item"], r["rep"])])
+    assert summary["cells"]["draft/draft_v1/gemini"]["n"] == 15
+
+
+class ClaudeTimeout(ClaudeFake):
+    def create(self, **kw):
+        if kw["model"] == "claude-sonnet-5-5" and kw.get("tools"):
+            self.requests.append(kw)
+            raise APITimeoutError("t")
+        return super().create(**kw)
+
+
+class APITimeoutError(Exception):
+    pass
+
+
+def test_claude_timeout_is_booked_at_the_upper_cost(tmp_path):
+    clock = Clock()
+    code, summary, _, client, _ = _m_run(tmp_path, clock=clock, client=ClaudeTimeout(clock))
+    rows = [r for r in _rows(tmp_path) if r["model_key"] == "sonnet" and r["step"] != "draft"]
+    assert rows and all(r["outcome"] == "timeout" for r in rows)
+    upper = ledger.call_cost("claude-sonnet-5-5", stage0.UPPER_INPUT_TOKENS,
+                             stage0.UPPER_OUTPUT_TOKENS, 3, 10.0)
+    assert all(r["cost_usd"] == pytest.approx(upper) and r["cost_estimated"] is True
+               for r in rows)
+    ok = [r for r in _rows(tmp_path) if r["model_key"] == "haiku"]
+    assert all(r["cost_estimated"] is False for r in ok)
+    lg = ledger.Ledger(str(tmp_path / "anthropic_ledger.json"))
+    assert lg.pool_spent("matrix") >= len(rows) * upper
