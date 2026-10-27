@@ -81,10 +81,11 @@ distinguishable at n=20", never "equal".
 ## 3. Gold set
 
 25 generic NZ construction questions, no customer records, no site names. File
-`tools/web-answer-bench/set.v1.jsonl`: `{id, split, kind, question, expect, accept,
-source, as_of, confirmed_by, confirmed_on}`.
+`tools/web-answer-bench/set.v1.jsonl`: `{id, split (tune|scored), kind, question,
+expected, variants, source, confirmed}`; P0 adds `as_of`, `confirmed_by`,
+`confirmed_on` when the owner confirms a row.
 
-- **Splits.** `tune` (5) only for prompt iteration and Stage 0. `score` (20: 8
+- **Splits.** `tune` (5) only for prompt iteration and Stage 0. `scored` (20: 8
   standard, 8 current, 4 no-reliable-answer) is never shown to a prompt author.
 - **Confirmation (P0).** The owner confirms each gold fact against the source.
   Unconfirmed items are excluded (not scored); the result states how many.
