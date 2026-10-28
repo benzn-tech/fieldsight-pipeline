@@ -142,8 +142,7 @@ def test_no_override_line_can_emit_an_empty_value_from_a_shell_variable():
     # SHOULD fail loudly rather than deploy a stack wired to nothing -- the same
     # reasoning the sibling test applies to the layer ARNs.
     REQUIRED = {"ClaudeApiKey", "DashScopeApiKey", "DbSecretArn",
-                "ElevenLabsApiKey", "FargateSubnetIds", "FargateVpcId",
-                "RealPTTAccount", "RealPTTPassword"}
+                "ElevenLabsApiKey"}
 
     for env in WORKFLOWS:
         offenders = [k for k, _ in pattern.findall(_text(env)) if k not in REQUIRED]

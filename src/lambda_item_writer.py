@@ -815,7 +815,7 @@ def _put_finalize_request(key, body, only_if_absent=False):
     every put INCLUDING an overwrite, so without this the recorder gets two
     emails. Checking first is not the fix: this role cannot read the prefix, and
     AccessDenied reads as "absent" (403 != 404, eight recurrences), so both
-    writers would pass the check. Same idiom as lambda_orchestrator's claim.
+    writers would pass the check. Same idiom as the retired orchestrator's claim.
 
     Returns True when this caller wrote it."""
     import boto3

@@ -77,7 +77,7 @@ def test_the_bundle_is_a_glob_not_a_hand_kept_list():
 def test_every_handler_the_script_deploys_is_reachable_by_that_glob():
     local = _local_modules()
     handlers = _handlers_the_script_deploys()
-    assert len(handlers) >= 9, handlers
+    assert len(handlers) >= 7, handlers   # 9 until the RealPTT pair was removed 2026-10-29
     for h in handlers:
         assert h in local, "%s is deployed but not a src/ module" % h
 

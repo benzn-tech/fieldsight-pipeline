@@ -21,10 +21,8 @@ earlier draft of this comment claimed -- a reviewer counted:
       lambda_meeting_minutes and lambda_report_generator.
     3 left in lambda_fieldsight_api: that gateway's lambda measured ZERO
       invocations in fourteen days while the live one served 78-509 a day.
-    2 left in lambda_orchestrator (TIMEZONE_OFFSET = -780 and
-      TIME_DIFFERENCE_MS = 46800000): those go out on the RealPTT wire, so
-      correcting them changes an external contract and needs a verified
-      before/after against the live API. Its own docstrings carry the detail.
+    2 were in lambda_orchestrator (the RealPTT wire offsets); that module
+      was removed 2026-10-29 with the rest of the RealPTT ingest path.
 
 Anyone extending this: count again before claiming the sweep is complete.
 

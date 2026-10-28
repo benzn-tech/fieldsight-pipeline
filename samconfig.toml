@@ -1,7 +1,7 @@
 # ============================================================
 # FieldSight SAM Configuration (committed — NO secrets here)
 # ============================================================
-# Secrets (RealPTTPassword, ClaudeApiKey, Fargate VPC/subnets) are NOT stored
+# Secrets (ClaudeApiKey, DashScopeApiKey, ...) are NOT stored
 # here. They are injected at deploy time from GitHub Actions secrets via
 # --parameter-overrides. See .github/workflows/deploy.yml.
 #

@@ -127,8 +127,6 @@ jobs:
       # Retain protects delete, not this update-time replace. Keep Task 5 merge-blocking.
       - name: SAM deploy (PROD stack)
         env:
-          REALPTT_ACCOUNT: ${{ secrets.REALPTT_ACCOUNT }}
-          REALPTT_PASSWORD: ${{ secrets.REALPTT_PASSWORD }}
           CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           # Chat only. Empty -> the template falls back to DashScopeApiKey,
@@ -155,11 +153,7 @@ jobs:
           # owner 2026-09-22; split it if Ask voice ever carries real load.
           ELEVENLABS_ASK_API_KEY: ${{ secrets.ELEVENLABS_ASK_API_KEY_PROD }}
           ELEVENLABS_API_KEY_TTS: ${{ secrets.ELEVENLABS_ASK_API_KEY_PROD }}
-          FARGATE_SUBNET_IDS: ${{ secrets.FARGATE_SUBNET_IDS }}
-          FARGATE_VPC_ID: ${{ secrets.FARGATE_VPC_ID }}
         run: |
-          VPC="$(echo "$FARGATE_VPC_ID" | xargs)"
-          SUBNETS="$(echo "$FARGATE_SUBNET_IDS" | tr ',' ' ' | xargs | tr ' ' ',')"
           DB_SECRET_ARN="$(aws cloudformation list-exports --query "Exports[?Name=='fieldsight-db-test-SecretArn'].Value" --output text)"
           # KEYFRAME FEATURE — activating it on PROD needs BOTH repo vars set:
           #   * PROD_KEYFRAME_FFMPEG_LAYER_ARN -> the ffmpeg layer ARN
@@ -373,12 +367,8 @@ jobs:
               "AskVoiceRestate=${{ vars.PROD_ASK_VOICE_RESTATE || 'false' }}" \
               "AskVoiceConvo=${{ vars.PROD_ASK_VOICE_CONVO || 'false' }}" \
               "VoiceWebEnabled=${{ vars.PROD_VOICE_WEB_ENABLED || 'false' }}" \
-              "RealPTTAccount=$REALPTT_ACCOUNT" \
-              "RealPTTPassword=$REALPTT_PASSWORD" \
               "ClaudeApiKey=$CLAUDE_API_KEY" \
               "DashScopeApiKey=$DASHSCOPE_API_KEY" \
-              "FargateSubnetIds=$SUBNETS" \
-              "FargateVpcId=$VPC" \
               "DbStackName=fieldsight-db-test" \
               "DbSubnetIds=subnet-082dd4480f7e20014,subnet-08b15b36113e542d4,subnet-05fb05613cf529121" \
               "DbSecretArn=$DB_SECRET_ARN" \
