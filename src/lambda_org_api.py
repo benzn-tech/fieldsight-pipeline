@@ -5406,17 +5406,16 @@ def _publish_site_coords(row):
 
     WHY IT HAS TO BE PUBLISHED AT ALL. The generator fetches weather, stores it
     on the report and feeds it to the prompt with a correlation instruction --
-    and has never produced one, because it takes the coordinate from
-    config/user_mapping.json, where every site is null, while the coordinates
+    and never produced one, because it took the coordinate from
+    config/user_mapping.json, where every site was null, while the coordinates
     entered here live in Aurora. The generator has no VpcConfig (deliberately:
     it needs egress for the model and the weather API), so it cannot read
-    Aurora. S3 is the only place both of them stand.
+    Aurora. S3 is the only place both of them stand. (Since M5 the generator
+    reads sites from the directory, which has no coordinates, so this is still
+    the only path.)
 
-    NOT user_mapping.json. Nothing in this repository writes that file -- six
-    lambdas read it and people maintain it by hand, alongside the device
-    mapping and the reassignment log. This writes a separate machine-owned
-    object, and the IAM grant names that one key rather than the config/
-    prefix, so a bug here cannot reach the hand-maintained file.
+    A SEPARATE, MACHINE-OWNED OBJECT. The IAM grant names that one key rather
+    than the config/ prefix, so a bug here cannot reach any other config object.
 
     NEVER RAISES, and that is the whole contract. Saving a project must not
     fail because a config object could not be refreshed; the cost of a missed
