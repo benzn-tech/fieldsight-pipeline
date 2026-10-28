@@ -302,66 +302,6 @@ def test_THE_the_site_match_is_always_scoped_now_that_the_unscoped_document_is_g
     assert es._fuzzy_match_site("UC PK", "Ann_Lee") is None
 
 
-# ---- orchestrator -----------------------------------------------------------------
-
-orch = pytest.importorskip("lambda_orchestrator", reason="requires boto3 (installed in CI)")
-
-
-@pytest.fixture
-def orch_s3(monkeypatch):
-    monkeypatch.setattr(orch, "_user_mapping", None)
-
-    def make(objects):
-        monkeypatch.setattr(orch, "s3_client", FakeS3(objects))
-    yield make
-    orch._user_mapping = None
-
-
-def test_THE_the_orchestrator_refuses_to_file_under_a_device_folder(orch_s3):
-    orch_s3({})                                   # no mapping at all
-    with pytest.raises(orch.MappingUnavailable):
-        orch.get_display_name("Benl1", "b")
-    info = {"type": "audio", "user_name": "Benl1", "time": "2026-10-07 09:00:00"}
-    with pytest.raises(orch.MappingUnavailable):
-        orch.generate_s3_key(info, "b")
-
-
-def test_an_empty_mapping_is_unavailable_too(orch_s3):
-    orch_s3({"config/user_mapping.json": {"mapping": {}}})
-    with pytest.raises(orch.MappingUnavailable):
-        orch.load_user_mapping("b")
-
-
-def test_THE_a_missing_mapping_skips_the_sweep_without_raising(orch_s3, monkeypatch):
-    orch_s3({})
-    monkeypatch.setattr(orch, "get_config", lambda: {
-        "s3_bucket": "b", "start_days_ago": 1, "time_difference_ms": 0, "account": "a",
-        "password": "p", "download_audio": True, "download_video": True,
-        "download_files": True}, raising=False)
-    monkeypatch.setattr(orch, "login", lambda *a, **k: pytest.fail("must not log in"))
-    out = orch.lambda_handler({}, None)
-    assert out == {"skipped": "mapping unavailable"}
-
-
-def test_a_mapping_entry_with_no_name_is_unmapped(orch_s3):
-    orch_s3({"config/user_mapping.json": {"mapping": {"Benl1": {"role": "x"}, "Benl2": "Ann Lee"}}})
-    assert orch.load_user_mapping("b") == {"Benl2": "Ann Lee"}
-    with pytest.raises(orch.UnmappedDevice):
-        orch.get_display_name("Benl1", "b")
-
-
-def test_a_device_nobody_owns_is_skipped_not_filed_under_its_id(orch_s3):
-    orch_s3({"config/user_mapping.json": LEGACY_DOC})
-    with pytest.raises(orch.UnmappedDevice):
-        orch.get_display_name("Stranger9", "b")
-    stats = {"total_found": 0, "already_exists": 0}
-    orch.process_file({"type": "audio", "user_name": "Stranger9",
-                       "time": "2026-10-07 09:00:00", "download_url": "u"},
-                      stats, {"s3_bucket": "b"})
-    assert stats["unmapped_device"] == 1
-    assert orch.get_display_name("Benl1", "b") == "Ben Lin"
-
-
 # ---- template ---------------------------------------------------------------------
 
 def _template():
@@ -393,8 +333,8 @@ def test_the_extract_session_reader_can_read_the_directory():
 def test_no_env_var_or_grant_is_left_pointing_at_the_mapping_without_a_reader():
     t = _template()
     assert "CONFIG_KEY" not in t
-    # M5: the directory's fallback was the last reader behind an exact grant. The
-    # orchestrator reads the file through its bucket-wide S3ReadPolicy, not a key grant.
+    # M5 removed the directory's fallback, the last reader behind an exact grant; the
+    # orchestrator, which read it through a bucket-wide policy, was removed 2026-10-29.
     assert t.count("${IngestBucketName}/config/user_mapping.json") == 0
     assert t.count("${DataBucketName}/config/user_mapping.json") == 0
 

@@ -6480,11 +6480,12 @@ def _enrol_folder_on_upload(conn, caller):
 
 def patch_member_folder(conn, caller, target_sub, body):
     """Admin-only enrollment step: links a member's login (cognito_sub) to
-    the recording-folder identity (folder_name) the orchestrator/app write
+    the recording-folder identity (folder_name) the app writes
     S3 keys under (users/{folder_name}/...) — without this, POST /members
     creates the login+membership but the member's own Today/Timeline (which
     is self-keyed on folder_name) never shows their clips. Normalization
-    mirrors lambda_orchestrator.py's safe_name EXACTLY, so an admin typing
+    mirrors the old RealPTT orchestrator's safe_name EXACTLY (removed
+    2026-10-29; existing folders were named by it), so an admin typing
     the display name they see in the app produces the identical S3 folder
     segment. folder_name is globally unique (0012) — collision_guard below
     avoids crashing that unique index with a raw IntegrityError."""
@@ -6871,7 +6872,7 @@ def create_member(conn, caller, body):
         global_role=global_role,
     )
     # Auto-enroll the recording-folder identity (D4): link the login to its report
-    # folder from creation. Underscored safe_name (matches lambda_orchestrator.safe_name
+    # folder from creation. Underscored safe_name (matches the old orchestrator's safe_name
     # and patch_member_folder). Skip on collision — the global unique index (0012)
     # would otherwise 500; folder can still be set later via PATCH /members/{sub}/folder.
     if not user.get("folder_name"):
