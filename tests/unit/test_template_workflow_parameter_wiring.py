@@ -76,11 +76,8 @@ def _env_text(fn):
 # Adding to this list should be a decision, not a reflex: a toggle in here can
 # only ever hold its template default.
 UNWIRED_BY_DESIGN = {
-    # Legacy ingest switches from the pre-VAD pipeline. Nothing sets them and
-    # the paths they gate are no longer the ones in use.
-    "DownloadAudio": {"prod", "test"},
-    "DownloadVideo": {"prod", "test"},
-    "DownloadFiles": {"prod", "test"},
+    # Legacy switch from the pre-VAD pipeline. Nothing sets it and the path it
+    # gates is no longer the one in use.
     "EnableTranscribe": {"prod", "test"},
     # The data bucket lives in the prod account and its policy is owned there;
     # the test stack must never try to manage it.

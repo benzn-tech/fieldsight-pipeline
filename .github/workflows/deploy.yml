@@ -70,8 +70,6 @@ jobs:
 
       - name: SAM deploy (TEST)
         env:
-          REALPTT_ACCOUNT: ${{ secrets.REALPTT_ACCOUNT }}
-          REALPTT_PASSWORD: ${{ secrets.REALPTT_PASSWORD }}
           CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
           # Chat only. Empty -> the template falls back to DashScopeApiKey,
@@ -93,13 +91,8 @@ jobs:
           ELEVENLABS_API_KEY_TTS: ${{ secrets.ELEVENLABS_API_KEY_TTS }}
           VOICE_LLM_BEARER: ${{ secrets.VOICE_LLM_BEARER_TEST }}
           VOICE_SESSION_SIGNING_KEY: ${{ secrets.VOICE_SESSION_SIGNING_KEY_TEST }}
-          FARGATE_SUBNET_IDS: ${{ secrets.FARGATE_SUBNET_IDS }}
-          FARGATE_VPC_ID: ${{ secrets.FARGATE_VPC_ID }}
         run: |
           # A space inside any --parameter-overrides "Key=Value" breaks SAM's parser.
-          # Trim the VPC id; normalize the subnet list (space- OR comma-separated) to clean commas.
-          VPC="$(echo "$FARGATE_VPC_ID" | xargs)"
-          SUBNETS="$(echo "$FARGATE_SUBNET_IDS" | tr ',' ' ' | xargs | tr ' ' ',')"
           # DB secret ARN: read from the db stack's export; passed as a plain
           # parameter because {{resolve:secretsmanager:...}} can't compose
           # with Fn::ImportValue (only with Parameters).
@@ -353,12 +346,8 @@ jobs:
               "ReportBlockGapSeconds=${{ vars.TEST_REPORT_BLOCK_GAP_SECONDS || '600' }}" \
               "ReportLongBlockSeconds=${{ vars.TEST_REPORT_LONG_BLOCK_SECONDS || '5400' }}" \
               "LlmTemperature=${{ vars.TEST_LLM_TEMPERATURE || '0' }}" \
-              "RealPTTAccount=$REALPTT_ACCOUNT" \
-              "RealPTTPassword=$REALPTT_PASSWORD" \
               "ClaudeApiKey=$CLAUDE_API_KEY" \
               "DashScopeApiKey=$DASHSCOPE_API_KEY" \
-              "FargateSubnetIds=$SUBNETS" \
-              "FargateVpcId=$VPC" \
               "DbStackName=fieldsight-db-test" \
               "DbSubnetIds=subnet-082dd4480f7e20014,subnet-08b15b36113e542d4,subnet-05fb05613cf529121" \
               "DbSecretArn=$DB_SECRET_ARN" \
