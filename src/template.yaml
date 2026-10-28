@@ -826,7 +826,7 @@ Parameters:
 
   SiteName:
     Type: String
-    Description: Default site name (fallback when not resolved from user_mapping)
+    Description: Default site name (fallback when the directory resolves no site)
     Default: 'SB1108 Ellesmere College'
 
   # --- Lambda Layer ARNs (created outside this stack) ---
