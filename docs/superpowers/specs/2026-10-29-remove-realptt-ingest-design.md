@@ -84,7 +84,10 @@ in `test_template_workflow_parameter_wiring.py`, and the handler-count floor in
 - `EnableSchedules` / `ShouldEnableSchedules` stay; many other schedules use them.
 - The hand-made unmanaged lambdas (`fieldsight-orchestrator`, `fieldsight-downloader`,
   `fieldsight-fargate-trigger`, and others without a stage prefix) are not in this stack.
-  They are retired separately by the owner.
+  They are retired separately by the owner, together with the out-of-stack log groups
+  `/aws/lambda/fieldsight-{orchestrator,downloader,fargate-trigger}`, the `realptt-*` log
+  groups and the disabled EventBridge Scheduler entries `daily-download` and
+  `fargate-trigger`. This deploy does not touch any of them.
 
 ## Deploy and rollback
 
@@ -94,9 +97,24 @@ retention for the orchestrator, 14 days for the rest. No deletion is expected to
 there are no ENIs on the security groups, no running tasks, and no retained resources.
 The roles have fixed names but no external attachments.
 
+Gate before releasing to main (Fable review). A DELETE_FAILED in the cleanup phase of an
+update does not fail the update: the stack still reaches UPDATE_COMPLETE and the resource
+is orphaned, and a later revert would then collide on its fixed name. So after the TEST
+deploy, and again after prod, check `aws cloudformation describe-stack-events` for
+DELETE_FAILED on the removed logical IDs (or `aws iam get-role` on the four
+`fieldsight-<stage>-fargate-*` roles and `describe-log-groups` on the fixed names). A green
+deploy alone is not the gate.
+
+Avoid deploying prod around 07:30Z: the prod Fargate trigger schedule fires then, and an
+invocation landing after its log group is deleted but before the function is would
+recreate `/aws/lambda/fieldsight-prod-fargate-trigger` without retention (delete it if so).
+
+The prod orchestrator log group (about 1.9 MB, the last RealPTT sweeps up to ~10-12) goes
+with the stack resource; export it first if that history is wanted.
+
 Rollback means reverting the PR. CloudFormation recreates the resources, but the
-deploy-workflow secrets must still exist then, so the owner deletes the GitHub secrets
-only after prod has deployed cleanly.
+deploy-workflow secrets and `s3://.../scripts/fargate_downloader.py` must still exist
+then, so the owner deletes both only after prod has deployed cleanly.
 
 ## Owner follow-ups (after prod is clean)
 
