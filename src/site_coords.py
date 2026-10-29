@@ -4,21 +4,20 @@ THE PROBLEM THIS SOLVES. The report generator already fetches weather, stores
 it on the report and feeds it to the prompt with a correlation instruction
 ("rain -> concrete/paint delays; high wind -> crane work; do not invent impacts
 the transcript does not support"). It has never produced a single one, because
-`build_weather_block_for_site` takes the coordinate from
-`config/user_mapping.json`, where all five sites have null lat/lng -- while the
+`build_weather_block_for_site` took the coordinate from
+`config/user_mapping.json`, where all five sites had null lat/lng -- while the
 coordinates people enter in the web UI live in the Aurora `sites` table.
 
 Two sources, one of them empty. The feature was not missing, it was starved.
 
-WHY NOT JUST WRITE THE COORDINATES INTO user_mapping.json. Nothing in this
-repository writes that file -- six lambdas read it and humans maintain it, and
-it carries the device mapping and the reassignment log alongside the sites
-block. Making it machine-written puts a hand-edited file under read-modify-write
-from a request handler.
+Since M5 (2026-10-26) the generator no longer reads user_mapping.json at all:
+its `sites` block comes from the directory (`directory.py`), which carries no
+coordinates either, so this object is still the only place they reach it.
 
-So this is a SEPARATE, SINGLE-PURPOSE, MACHINE-OWNED object. The IAM grant for
-it names the one key rather than the `config/` prefix, so a bug here cannot
-reach user_mapping.json even by mistake.
+WHY A SEPARATE OBJECT. It is SINGLE-PURPOSE and MACHINE-OWNED, so a
+read-modify-write from a request handler never touches a hand-maintained file.
+The IAM grant for it names the one key rather than the `config/` prefix, so a
+bug here cannot reach any other config object even by mistake.
 
 KEYED BY SLUG, because that is what the generator looks sites up by
 (`sites_info.get(user_site_id)` where `user_site_id` is a primary_site slug).
@@ -106,11 +105,10 @@ def coords_for_slug(doc, slug):
 def overlay_sites_info(sites_info, doc):
     """Fold published coordinates onto the generator's `sites` block.
 
-    ADDITIVE, and user_mapping WINS where it has a value. That direction is
-    deliberate: user_mapping.json is hand-maintained, so a coordinate written
-    there is a human overriding whatever the UI holds, and silently replacing
-    it would make the file's contents a lie. In practice every entry there is
-    null today, so in practice this fills all of them.
+    ADDITIVE, and the incoming `sites` block WINS where it has a value. That
+    direction dates from when the block came from the hand-maintained
+    user_mapping.json; since M5 it comes from the directory, which carries no
+    coordinates, so in practice this fills all of them.
     """
     # A CONFIG OBJECT OF THE WRONG SHAPE MUST NOT STOP A REPORT. This runs on
     # the daily generation path, in front of a weather fetch that is already
@@ -137,7 +135,7 @@ def overlay_sites_info(sites_info, doc):
             merged.setdefault("site_uuid", entry["site_id"])
         out[slug] = merged
 
-    # A site that exists in Aurora but not in user_mapping.json still needs to
+    # A site with a coordinate but absent from the `sites` block still needs to
     # be reachable: the generator looks up by primary_site slug, and if that
     # slug is absent from `sites` it gets {} and no weather. Adding it costs
     # nothing and is the difference between "weather for the sites someone

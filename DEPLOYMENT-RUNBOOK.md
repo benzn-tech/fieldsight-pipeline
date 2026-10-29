@@ -29,7 +29,7 @@ Two independent tracks, both branch-driven:
 
 ## One-time setup (AWS console / IAM — do once)
 
-> GitHub repo secrets are already set (`AWS_ROLE_ARN`, `REALPTT_*`, `CLAUDE_API_KEY`, `FARGATE_*`). Verify with `gh secret list`.
+> GitHub repo secrets are already set (`AWS_ROLE_ARN`, `CLAUDE_API_KEY`; the RealPTT/Fargate secrets are no longer used since 2026-10-29). Verify with `gh secret list`.
 
 1. **OIDC role** — confirm an IAM role trusts `token.actions.githubusercontent.com` for this repo and is the `AWS_ROLE_ARN` secret. Audit:
    ```bash

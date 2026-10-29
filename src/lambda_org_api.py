@@ -5400,17 +5400,16 @@ def _publish_site_coords(row):
 
     WHY IT HAS TO BE PUBLISHED AT ALL. The generator fetches weather, stores it
     on the report and feeds it to the prompt with a correlation instruction --
-    and has never produced one, because it takes the coordinate from
-    config/user_mapping.json, where every site is null, while the coordinates
+    and never produced one, because it took the coordinate from
+    config/user_mapping.json, where every site was null, while the coordinates
     entered here live in Aurora. The generator has no VpcConfig (deliberately:
     it needs egress for the model and the weather API), so it cannot read
-    Aurora. S3 is the only place both of them stand.
+    Aurora. S3 is the only place both of them stand. (Since M5 the generator
+    reads sites from the directory, which has no coordinates, so this is still
+    the only path.)
 
-    NOT user_mapping.json. Nothing in this repository writes that file -- six
-    lambdas read it and people maintain it by hand, alongside the device
-    mapping and the reassignment log. This writes a separate machine-owned
-    object, and the IAM grant names that one key rather than the config/
-    prefix, so a bug here cannot reach the hand-maintained file.
+    A SEPARATE, MACHINE-OWNED OBJECT. The IAM grant names that one key rather
+    than the config/ prefix, so a bug here cannot reach any other config object.
 
     NEVER RAISES, and that is the whole contract. Saving a project must not
     fail because a config object could not be refreshed; the cost of a missed
@@ -6474,11 +6473,12 @@ def _enrol_folder_on_upload(conn, caller):
 
 def patch_member_folder(conn, caller, target_sub, body):
     """Admin-only enrollment step: links a member's login (cognito_sub) to
-    the recording-folder identity (folder_name) the orchestrator/app write
+    the recording-folder identity (folder_name) the app writes
     S3 keys under (users/{folder_name}/...) — without this, POST /members
     creates the login+membership but the member's own Today/Timeline (which
     is self-keyed on folder_name) never shows their clips. Normalization
-    mirrors lambda_orchestrator.py's safe_name EXACTLY, so an admin typing
+    mirrors the old RealPTT orchestrator's safe_name EXACTLY (removed
+    2026-10-29; existing folders were named by it), so an admin typing
     the display name they see in the app produces the identical S3 folder
     segment. folder_name is globally unique (0012) — collision_guard below
     avoids crashing that unique index with a raw IntegrityError."""
@@ -6865,7 +6865,7 @@ def create_member(conn, caller, body):
         global_role=global_role,
     )
     # Auto-enroll the recording-folder identity (D4): link the login to its report
-    # folder from creation. Underscored safe_name (matches lambda_orchestrator.safe_name
+    # folder from creation. Underscored safe_name (matches the old orchestrator's safe_name
     # and patch_member_folder). Skip on collision — the global unique index (0012)
     # would otherwise 500; folder can still be set later via PATCH /members/{sub}/folder.
     if not user.get("folder_name"):

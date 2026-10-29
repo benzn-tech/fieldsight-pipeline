@@ -216,9 +216,8 @@ def test_org_api_requests_exports_through_s3_and_reads_the_results():
 # Functions that held s3:DeleteObject before lake ownership. Extending this list is a
 # decision, not a chore: a new entry is a new function that can delete lake objects.
 PRE_EXISTING_DELETERS = {
-    "DownloaderFunction", "ExtractSessionFunction", "ExtractionBacklogFunction",
-    "FargateTaskRole", "KeyframeFunction", "OrchestratorFunction", "OrgApiFunction",
-    "SessionFinalizeFunction",
+    "ExtractSessionFunction", "ExtractionBacklogFunction",
+    "KeyframeFunction", "OrgApiFunction", "SessionFinalizeFunction",
 }
 
 # Deleters added later whose every DeleteObject resource is confined to a prefix that
@@ -282,7 +281,6 @@ def test_there_is_no_managed_policy_and_no_bucket_notification_or_lifecycle():
 # a module that contains one.
 # EXTEND THIS MAP when a new Lambda handler writes through lake_put.
 LAKE_PUT_CALLERS = {
-    "DownloaderFunction": "lambda_downloader",
     "TranscribeFunction": "lambda_transcribe, batch_seal, transcript_utils",
     "VadFunction": "lambda_vad",
     "ReportGeneratorFunction": "lambda_report_generator, deletion_mirror, pipeline_trace, transcript_utils",

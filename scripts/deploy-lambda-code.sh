@@ -36,12 +36,9 @@ REGION="${2:?missing region}"
 SHARED=()
 while IFS= read -r _m; do SHARED+=("$_m"); done < <(ls src/*.py)
 
-# function-name suffix → handler source file (the 9 real-logic lambdas).
-# fieldsight-fargate-trigger is intentionally omitted: it is an inline-code
-# launcher (Handler: index.handler), not a src/ handler that changes.
+# function-name suffix → handler source file (the 7 real-logic lambdas).
+# The RealPTT orchestrator/downloader/fargate-trigger were removed 2026-10-29.
 declare -A MAP=(
-  [orchestrator]=lambda_orchestrator
-  [downloader]=lambda_downloader
   [transcribe]=lambda_transcribe
   [vad]=lambda_vad
   [report-generator]=lambda_report_generator
