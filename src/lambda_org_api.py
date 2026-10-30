@@ -5036,7 +5036,22 @@ def redeem_qr_login_code(event):
 # ----------------------------------------------------------
 # /me
 # ----------------------------------------------------------
+def _stamp_last_seen(conn, caller):
+    """Record that the caller was here (Team page "Last seen"). Never fails /me.
+
+    A SAVEPOINT: the request runs in one transaction that `with conn:` commits on a clean
+    exit, so a successful stamp is committed with the response -- and a failing UPDATE
+    (column not migrated yet, lock, anything) would otherwise abort that transaction and
+    every read after it in get_me would 500. The savepoint rolls back the stamp alone."""
+    try:
+        with conn.transaction():
+            users.touch_last_seen(conn, caller["cognito_sub"])
+    except Exception:  # noqa: BLE001 - telemetry never fails a request
+        logger.exception("last_seen stamp failed for user %s", caller.get("id"))
+
+
 def get_me(conn, caller):
+    _stamp_last_seen(conn, caller)
     if GRADED_ROLES:
         # MINOR-2: source /me's site_ids from the graded reach (visible_scope
         # via _allowed_site_ids) so the site-selector matches /live-items -- a
@@ -6365,6 +6380,36 @@ def patch_org_company(conn, caller, company_id, body):
 # ----------------------------------------------------------
 # /members
 # ----------------------------------------------------------
+def _cognito_login_status_by_sub():
+    """{cognito sub: UserStatus} for every user in the pool (Team page "has signed in").
+
+    One paginated ListUsers sweep per request, sub attribute only. UserStatus is e.g.
+    CONFIRMED (has set a password), FORCE_CHANGE_PASSWORD (invited, never signed in),
+    RESET_REQUIRED. Any failure -- AccessDenied, throttling, network -- is logged and
+    answers {}, so every row gets login_status null: this decorates the member list and
+    must never fail it."""
+    if not COGNITO_USER_POOL_ID:
+        return {}
+    out = {}
+    try:
+        client = cognito()
+        kwargs = {"UserPoolId": COGNITO_USER_POOL_ID, "AttributesToGet": ["sub"], "Limit": 60}
+        while True:
+            resp = client.list_users(**kwargs)
+            for u in resp.get("Users") or []:
+                sub = next((a.get("Value") for a in u.get("Attributes") or []
+                            if a.get("Name") == "sub"), None)
+                if sub:
+                    out[sub] = u.get("UserStatus")
+            token = resp.get("PaginationToken")
+            if not token:
+                return out
+            kwargs["PaginationToken"] = token
+    except Exception:  # noqa: BLE001 - login_status is decoration; null beats a failed list
+        logger.exception("cognito ListUsers failed; members get login_status null")
+        return {}
+
+
 def list_members(conn, caller, event):
     # platform_admin (is_cross_company) sits in its own operator company, so
     # the legacy resolve_scope==ALL company-pin would return an empty directory
@@ -6387,8 +6432,10 @@ def list_members(conn, caller, event):
     for mem in mem_rows:
         per_user.setdefault(mem["user_id"], []).append(
             {"site_id": mem["site_id"], "role": mem["role"]})
+    status_by_sub = _cognito_login_status_by_sub()
     for row in rows:
         row["memberships"] = per_user.get(row["id"], [])
+        row["login_status"] = status_by_sub.get(row.get("cognito_sub"))
         if co_name is not None:
             row["company_name"] = co_name.get(str(row.get("company_id")))
     return ok({"members": rows})
