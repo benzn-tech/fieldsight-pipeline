@@ -7,6 +7,14 @@ from psycopg.types.json import Jsonb
 
 _COLS = "id, cognito_sub, company_id, email, first_name, last_name, avatar_s3_key, global_role, created_at, archived_at, folder_name, kind, prefs"
 
+# The Team directory (list_company_users / list_all_users) also carries last_seen_at
+# (migration 0091). Kept OUT of the shared _COLS on purpose: _COLS is read by
+# get_user_by_sub on every org-api request, and the deploy runs sam deploy BEFORE the
+# migrate step -- a column the database does not have yet would 500 every request in
+# that window (or for good, if the migrate step failed). Here it can only break the
+# member list.
+_MEMBER_COLS = _COLS + ", last_seen_at"
+
 
 def upsert_user(conn, cognito_sub, email, company_id=None, first_name=None,
                 last_name=None, global_role=None) -> dict:
@@ -147,10 +155,26 @@ def set_folder_name(conn, cognito_sub, folder_name) -> None:
     return None
 
 
+def touch_last_seen(conn, cognito_sub) -> bool:
+    """Stamp users.last_seen_at = now() for a signed-in caller, at most once per 5 minutes.
+
+    The throttle is in the WHERE clause, so a caller polling /me does not write a row on
+    every request. FOR UPDATE SKIP LOCKED: if another transaction holds the row, skip the
+    stamp rather than wait -- /me must never queue behind it. True when a row was written."""
+    cur = conn.execute(
+        "UPDATE users SET last_seen_at = now() WHERE id = ("
+        " SELECT id FROM users WHERE cognito_sub = %s"
+        " AND (last_seen_at IS NULL OR last_seen_at < now() - interval '5 minutes')"
+        " FOR UPDATE SKIP LOCKED)",
+        (cognito_sub,),
+    )
+    return cur.rowcount == 1
+
+
 def list_company_users(conn, company_id, include_archived=False) -> list[dict]:
     guard = "" if include_archived else "AND archived_at IS NULL "
     return conn.cursor(row_factory=dict_row).execute(
-        f"SELECT {_COLS} FROM users WHERE company_id=%s {guard}ORDER BY created_at",
+        f"SELECT {_MEMBER_COLS} FROM users WHERE company_id=%s {guard}ORDER BY created_at",
         (company_id,),
     ).fetchall()
 
@@ -189,7 +213,7 @@ def list_all_users(conn, include_archived=False) -> list[dict]:
     company_id (in _COLS) so callers can group / label by company."""
     guard = "" if include_archived else "WHERE archived_at IS NULL "
     return conn.cursor(row_factory=dict_row).execute(
-        f"SELECT {_COLS} FROM users {guard}ORDER BY company_id, created_at",
+        f"SELECT {_MEMBER_COLS} FROM users {guard}ORDER BY company_id, created_at",
     ).fetchall()
 
 
