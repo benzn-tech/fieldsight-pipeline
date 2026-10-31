@@ -190,13 +190,15 @@ def claim(conn, pack_id) -> bool:
 def get_for_worker(conn, pack_id) -> dict | None:
     """What the worker needs to run a claimed pack (org-api's claim task, S1): the pack's id,
     site, company (creation-time owner), state, instruction, creator and the creator's
-    Cognito sub -- the identity every tool call runs as (§7 "run identity"). No reader
-    check: this is only reached through an internal task, never from the gateway.
+    Cognito sub -- the identity every tool call runs as (§7 "run identity"), and the site's
+    name (the Plan stage's only project context, Task 11). No reader check: this is only
+    reached through an internal task, never from the gateway.
     None when the pack does not exist."""
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT p.id, p.site_id, p.company_id, p.state, p.instruction, p.created_by, "
-        "u.cognito_sub AS created_by_sub, p.created_at "
-        "FROM action_packs p JOIN users u ON u.id = p.created_by WHERE p.id = %s",
+        "u.cognito_sub AS created_by_sub, p.created_at, s.name AS site_name "
+        "FROM action_packs p JOIN users u ON u.id = p.created_by "
+        "LEFT JOIN sites s ON s.id = p.site_id WHERE p.id = %s",
         (pack_id,)).fetchone()
 
 

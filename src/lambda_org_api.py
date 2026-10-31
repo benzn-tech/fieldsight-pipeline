@@ -1394,7 +1394,7 @@ def _action_pack_claim(conn, pack_id, event):
         "id": str(row["id"]), "site_id": str(row["site_id"]),
         "company_id": str(row["company_id"]), "instruction": row["instruction"],
         "created_by": str(row["created_by"]), "created_by_sub": row["created_by_sub"],
-        "created_at": row["created_at"].isoformat()}}
+        "created_at": row["created_at"].isoformat(), "site_name": row.get("site_name")}}
 
 
 def _action_pack_heartbeat(conn, pack_id, event):

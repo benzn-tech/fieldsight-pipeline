@@ -427,7 +427,8 @@ def test_claim_task_returns_the_run_identity_once(db, env):
     assert got["pack"] == {
         "id": pid, "site_id": str(site["id"]), "company_id": str(site["company_id"]),
         "instruction": "close #69", "created_by": str(creator["id"]),
-        "created_by_sub": creator["cognito_sub"], "created_at": got["pack"]["created_at"]}
+        "created_by_sub": creator["cognito_sub"], "created_at": got["pack"]["created_at"],
+        "site_name": site["name"]}
     assert org._action_pack_claim(db, pid, {}) == {"claimed": False}       # second delivery
     assert org._action_pack_claim(db, str(uuid.uuid4()), {}) == {"claimed": False}
 
