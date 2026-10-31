@@ -217,16 +217,40 @@ def test_the_settings_reach_the_worker_and_default_to_todays_request():
     assert params["TemplateDigitiseReasoning"]["AllowedPattern"] == "^(|off|low|medium|high)$"
 
 
+BACKSLASH = chr(92)  # the line continuation after a sam deploy argument
+_STRIP = "| tr -d '[:space:]'"
+_LOWER = "| tr '[:upper:]' '[:lower:]'"
+# (parameter, variable suffix, shell value, lowercased)
+_SETTINGS = (("TemplateDigitiseModel", "TEMPLATE_DIGITISE_MODEL", "TD_MODEL", False),
+             ("TemplateDigitiseReasoning", "TEMPLATE_DIGITISE_REASONING", "TD_REASONING", True),
+             ("TemplateDigitiseProvider", "TEMPLATE_DIGITISE_PROVIDER", "TD_PROVIDER", False),
+             ("TemplateDigitisePdfModel", "TEMPLATE_DIGITISE_PDF_MODEL", "TD_PDF_MODEL", False))
+
+
+def _line_assigning(text, var):
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip().startswith(var + '="$(')]
+    assert len(lines) == 1, f"{var}: expected one normalising assignment, got {lines}"
+    return lines[0]
+
+
 @pytest.mark.parametrize("env", sorted(WORKFLOWS))
 def test_both_workflows_pass_the_settings_from_repo_variables(env):
+    """Normalised in the shell before use: a hand-typed repo variable with a space or
+    a capital must neither split into stray `sam deploy` arguments nor reach the
+    template's AllowedPattern / the endpoint pin as typed."""
     text = open(WORKFLOWS[env], encoding="utf-8").read()
-    # The model has a non-empty default, so the inline `||` form is safe.
-    assert ('"TemplateDigitiseModel=${{ vars.%s_TEMPLATE_DIGITISE_MODEL '
-            "|| 'google/gemini-3.8-flash' }}\"" % env) in text
-    # The other three default to empty, and a bare `Key=` makes SAM exit 2: shell guard.
-    for param, var in (("TemplateDigitiseReasoning", "TEMPLATE_DIGITISE_REASONING"),
-                       ("TemplateDigitiseProvider", "TEMPLATE_DIGITISE_PROVIDER"),
-                       ("TemplateDigitisePdfModel", "TEMPLATE_DIGITISE_PDF_MODEL")):
-        assert 'if [ -n "${{ vars.%s_%s }}" ]' % (env, var) in text, (env, var)
-        assert '_PARAM="%s=${{ vars.%s_%s }}"' % (param, env, var) in text, (env, var)
-        assert "$%s_PARAM" % var in text, (env, var)
+    for param, var, shell, lower in _SETTINGS:
+        line = _line_assigning(text, shell)
+        assert "vars.%s_%s" % (env, var) in line, (env, var)
+        assert _STRIP in line, f"{env} {shell}: whitespace not stripped"
+        assert (_LOWER in line) is lower, f"{env} {shell}: lowercase {'missing' if lower else 'unexpected'}"
+        assert '%s_PARAM="%s=$%s"' % (var, param, shell) in text, (env, param)
+    # The model can never be empty: a cleared or blank variable falls back to the
+    # template default, so it is passed unconditionally, quoted.
+    assert 'TD_MODEL="${TD_MODEL:-google/gemini-3.8-flash}"' in text
+    assert '"$TEMPLATE_DIGITISE_MODEL_PARAM" ' + BACKSLASH in text
+    # The other three are '' by default and a bare `Key=` makes SAM exit 2: guarded,
+    # and expanded quoted only when set.
+    for _, var, shell, _ in _SETTINGS[1:]:
+        assert 'if [ -n "$%s" ]; then' % shell in text, (env, shell)
+        assert '${%s_PARAM:+"$%s_PARAM"} ' % (var, var) + BACKSLASH in text, (env, var)
