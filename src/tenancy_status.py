@@ -155,6 +155,37 @@ def blocked_reason(conn, caller) -> str | None:
     return None
 
 
+def write_refusal(conn, caller, company_id, where: str = "") -> str | None:
+    """Writes that add people or access to an inactive company (spec §5.6, Task 5).
+
+    `company_id` is the TARGET of the write -- the company the member / membership / site
+    belongs to, or the company owning the site a session lies on -- never the caller's own
+    company as such (that is the caller gate's question, caller_blocked).
+
+    platform_admin -> None, no DB read (R5: comeback and admin fix-ups write into an
+    inactive company). Target active, unknown or not migrated -> None.
+    Target inactive: flag on  -> 'company_inactive' (the endpoint answers 409);
+                     flag off -> None, after one WARNING line
+                     `COMPANY_GATE_WOULD_REFUSE where=... company=... status=... user=...`.
+
+    Callers must check BEFORE their first write: an error() return is a clean exit and
+    the request transaction commits."""
+    if caller and caller.get("global_role") == "platform_admin":
+        return None
+    if company_id is None:
+        return None
+    status = company_status(conn, company_id)
+    if status == ACTIVE:
+        return None
+    if enforce_enabled():
+        return REASON_COMPANY_INACTIVE
+    logger.warning(
+        "COMPANY_GATE_WOULD_REFUSE where=%s company=%s status=%s user=%s sub=%s",
+        where, company_id, status, (caller or {}).get("id"),
+        (caller or {}).get("cognito_sub"))
+    return None
+
+
 def caller_blocked(conn, caller, *, where: str = "") -> str | None:
     """The caller gate (spec §5.1). Call at CALLER resolution, never at lookups of
     other users.

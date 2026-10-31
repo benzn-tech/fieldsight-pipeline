@@ -397,6 +397,16 @@ def error(message, status=400, extra=None):
     return ok(body, status)
 
 
+def _write_refused(conn, caller, company_id, where):
+    """409 `company_inactive` when this write would add people or access to an inactive
+    company (spec 2026-11-01 §5.6), else None. `company_id` is the write's TARGET company.
+    One rule for every endpoint: tenancy_status.write_refusal (platform_admin exempt; flag
+    off logs COMPANY_GATE_WOULD_REFUSE and allows). Call it before the first write."""
+    if tenancy_status.write_refusal(conn, caller, company_id, where=where):
+        return error(tenancy_status.REASON_COMPANY_INACTIVE, 409)
+    return None
+
+
 def parse_body(event):
     """Return the parsed JSON body dict, or None on malformed JSON."""
     raw = event.get("body") or "{}"
@@ -2851,17 +2861,48 @@ def _session_site_company_guard(conn, caller, folder, date, session_key, what,
     extraction of someone else's project. So the company that owns the session's SITE must be
     the caller's. platform_admin is exempt; a session on no site is the recorder's home
     company's and passes. `allow_recorder` lets the recorder act on their own session (a
-    regenerate of their own report) -- never a voiceprint enrolment."""
+    regenerate of their own report) -- never a voiceprint enrolment. Even then, a session on
+    a site of an inactive company answers 409 (`_session_write_refused`)."""
     if is_cross_company(caller["global_role"]):
         return None
     if allow_recorder and folder and folder == (caller.get("folder_name") or None):
-        return None
+        # The recorder's own session, wherever it lies -- except on a site of an inactive
+        # company (spec 2026-11-01 §5.6): re-driving it is a write into that company.
+        return _session_write_refused(conn, caller, [folder], date, session_key, what)
     foreign = {c for _s, c in recordings.session_site_companies(conn, folder, date, session_key)
                if str(c) != str(caller["company_id"])}
     if foreign:
         return error(
             f"this session was recorded on another company's project, so {what} on it "
             f"belongs to that company.", 403)
+    return None
+
+
+def _session_write_refused(conn, caller, folders, date, session_key, where):
+    """409 `company_inactive` when the session lies on a site of an inactive company (spec
+    2026-11-01 §5.6), else None. The site's company decides (recordings.session_site_companies,
+    the same read F5 uses), judged by tenancy_status.write_refusal: platform_admin exempt,
+    flag off logs and allows. A session on no site, or one whose rows have not landed, is
+    nobody else's and passes. `date` None judges the folder's every day.
+
+    `folders` may be a thunk (a callable returning them), so the folder lookup is only paid
+    when some company is inactive: with none (the normal case) this costs one read of
+    companies and touches no session table, flag on or off."""
+    if is_cross_company(caller["global_role"]) or not tenancy_status.inactive_company_ids(conn):
+        return None
+    if callable(folders):
+        folders = folders()
+    companies_seen = set()
+    for folder in folders:
+        if not folder:
+            continue
+        for _s, company in recordings.session_site_companies(conn, folder, date or "%",
+                                                             session_key):
+            companies_seen.add(str(company))
+    for company in sorted(companies_seen):
+        refused = _write_refused(conn, caller, company, where)
+        if refused:
+            return refused
     return None
 
 
@@ -3001,6 +3042,16 @@ def unname_speaker(conn, caller, session_base, event):
         if len(owners) != 1 or not self_folder or owners[0] != self_folder:
             return error("removing a name needs an admin, gm, pm, site_manager or "
                          "platform_admin role, or your own recording", 403)
+    # A session on a site of an inactive company is that company's (spec 2026-11-01 §5.6),
+    # whichever arm let the caller this far. The recorder folder(s) come from the session's
+    # own topics, as above; the date from the URL spelling when it carries one.
+    date_m = re.search(r"(\d{4}-\d{2}-\d{2})", session_base or "")
+    refused = _session_write_refused(
+        conn, caller,
+        lambda: topics.folders_for_session_base(conn, str(caller["company_id"]), key),
+        date_m.group(1) if date_m else None, key, "unname_speaker")
+    if refused:
+        return refused
     n = voiceprints.unname(conn, str(caller["company_id"]), session_base=key,
                            display_name=name, rejected_by=str(caller["id"]))
     logger.info("speaker name removed: session=%s name=%s turns=%d", key, name, n)
@@ -5282,6 +5333,9 @@ def create_org_site(conn, caller, body):
         if companies.get_company_by_id(conn, req_company_id) is None:
             return error("target company not found", 404)
         target_company_id = req_company_id
+    refused = _write_refused(conn, caller, target_company_id, "site_create")
+    if refused:
+        return refused
     lat, lat_err = _coerce_coord(body.get("latitude"), -90.0, 90.0, "latitude")
     if lat_err:
         return lat_err
@@ -5319,6 +5373,12 @@ def patch_org_site(conn, caller, site_id, body):
         return error("admin, gm, or platform_admin role required", 403)
     if body is None:
         return error("malformed JSON body", 400)
+    # The site's company. For everyone but platform_admin (exempt, and the only role that
+    # may move a site) update_site below is pinned to the caller's own company, so that
+    # is the company this write lands in. Before the icon relocation: no side effect first.
+    refused = _write_refused(conn, caller, caller["company_id"], "site_patch")
+    if refused:
+        return refused
     name = body.get("name")
     if name is not None:
         if not isinstance(name, str) or not name.strip():
@@ -6692,6 +6752,11 @@ def add_external_member(conn, caller, site_id, body):
         return error(f"role must be one of {sorted(ALLOWED_MEMBERSHIP_ROLES)}", 400)
     if site.get("archived_at"):
         return error("site is archived — unarchive it first", 409)
+    # Access to the SITE's company is what this grants; the person's home company is not
+    # the question (their own login is that company's business).
+    refused = _write_refused(conn, caller, site["company_id"], "add_external_member")
+    if refused:
+        return refused
     matches = users.find_live_users_by_email_global(conn, email)
     if len(matches) > 1:
         # Two live accounts share this email: attaching the wrong person to a project is a
@@ -6753,6 +6818,11 @@ def put_member_membership(conn, caller, target_sub, site_id, body):
         return error(f"role must be one of {sorted(ALLOWED_MEMBERSHIP_ROLES)}", 400)
     if target.get("archived_at"):
         return error("member is archived — unarchive them first", 409)
+    # ensure_membership adds or REVIVES the row: access to the site's company. Here and not
+    # in _resolve_staffing, which DELETE shares -- taking access away is never refused.
+    refused = _write_refused(conn, caller, _site["company_id"], "put_member_membership")
+    if refused:
+        return refused
     row = memberships.ensure_membership(conn, target["id"], site_id, role)
     if _is_external_target(conn, _site, target, site_id):
         memberships.record_audit(conn, "external_role", caller, target["id"], _site, role,
@@ -6912,6 +6982,11 @@ def create_member(conn, caller, body):
             return error("site not found in your company", 403)
         if site.get("archived_at"):
             return error("site is archived — unarchive it first", 409)
+    # Before the Cognito call: an inactive company must not get a new login, nor an
+    # invitation email sent for one. Every site above is in target_company_id.
+    refused = _write_refused(conn, caller, target_company_id, "create_member")
+    if refused:
+        return refused
 
     client = cognito()
     display_name = " ".join(
@@ -6998,6 +7073,11 @@ def create_member(conn, caller, body):
 def archive_site_endpoint(conn, caller, site_id, action):
     if resolve_scope(caller["global_role"]) != "ALL":
         return error("admin or gm role required", 403)
+    if action != "archive":
+        # Reopening a site is access to its company (pinned to the caller's own below).
+        refused = _write_refused(conn, caller, caller["company_id"], "site_unarchive")
+        if refused:
+            return refused
     fn = sites.archive_site if action == "archive" else sites.unarchive_site
     row = fn(conn, site_id, caller["company_id"])
     if row is None:
@@ -7010,6 +7090,12 @@ def archive_member_endpoint(conn, caller, target_sub, action):
         return error("admin or gm role required", 403)
     if action == "archive" and target_sub == caller["cognito_sub"]:
         return error("cannot archive yourself", 400)
+    if action != "archive":
+        # Unarchiving restores a person and their memberships in the member's company,
+        # which unarchive_user pins to the caller's own below. Archiving is never refused.
+        refused = _write_refused(conn, caller, caller["company_id"], "member_unarchive")
+        if refused:
+            return refused
     fn = users.archive_user if action == "archive" else users.unarchive_user
     row = fn(conn, target_sub, caller["company_id"])
     if row is None:
