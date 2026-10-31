@@ -13,6 +13,7 @@ through dispatch.
 Nothing is committed (the `db` fixture rolls back), so no company_status_events cleanup.
 Skipped without TEST_DATABASE_URL -- a skip is NOT a pass.
 """
+import io
 import json
 import logging
 import uuid
@@ -46,14 +47,23 @@ class _Cognito:
 
 
 class _S3:
+    """Stateful enough for the photo selection: what was put can be read back."""
+    class exceptions:
+        class NoSuchKey(Exception):
+            pass
+
     def __init__(self):
         self.puts = []
+        self.objects = {}
 
     def put_object(self, **kw):
         self.puts.append(kw["Key"])
+        self.objects[kw["Key"]] = kw["Body"]
 
     def get_object(self, **kw):
-        raise org.ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        if kw["Key"] in self.objects:
+            return {"Body": io.BytesIO(self.objects[kw["Key"]])}
+        raise self.exceptions.NoSuchKey(kw["Key"])
 
     def generate_presigned_url(self, *a, **k):
         return "https://example.invalid/x"
@@ -390,3 +400,50 @@ def test_photo_selection_cannot_name_the_suspended_sites_photo(db, session_on_a,
     status, body = _call(db, w["bw"], "PUT", route, {"excluded": ["IMG_b.jpg"]})
     assert status == 200, body
     assert [p["filename"] for p in body["photos"]] == ["IMG_b.jpg"]
+
+
+def _stored_excluded(w):
+    import report_photos
+    return report_photos.read_excluded(w["s3"], org.LAKE_BUCKET, w["folder"], DATE)
+
+
+def test_photo_selection_keeps_hidden_exclusions_across_a_suspension(db, session_on_a, flag_on):
+    """Review fix C3: the PUT replaces the whole stored choice but can only name visible
+    photos, so while A is suspended an earlier exclusion of A's photo must be carried over,
+    not dropped (spec §2 anti-goal: no data loss)."""
+    w = session_on_a
+    f = w["folder"]
+    for name, site, co in (("IMG_a.jpg", w["sa"], w["a"]), ("IMG_b.jpg", w["sb"], w["b"])):
+        recordings.insert_pending(db, co["id"], w["bw"]["id"], site["id"], "photo",
+                                  f"users/{f}/pictures/{DATE}/{name}", uuid.uuid4().hex,
+                                  f"{DATE}T01:00:00Z")
+    route = f"/days/{DATE}/photos/selection"
+    assert _call(db, w["bw"], "PUT", route, {"excluded": ["IMG_a.jpg"]})[0] == 200
+    assert _stored_excluded(w) == {"IMG_a.jpg"}
+    _suspend(db, w["a"])
+    status, body = _call(db, w["bw"], "PUT", route, {"excluded": []})
+    assert status == 200, body
+    assert [p["filename"] for p in body["photos"]] == ["IMG_b.jpg"]   # A's photo stays hidden
+    assert _stored_excluded(w) == {"IMG_a.jpg"}
+    status, body = _call(db, w["bw"], "PUT", route, {"excluded": ["IMG_b.jpg"]})
+    assert status == 200 and _stored_excluded(w) == {"IMG_a.jpg", "IMG_b.jpg"}
+    db.execute("UPDATE companies SET status='active' WHERE id=%s", (w["a"]["id"],))
+    status, body = _call(db, w["bw"], "GET", route)
+    assert status == 200
+    assert {p["filename"]: p["excluded"] for p in body["photos"]} == {
+        "IMG_a.jpg": True, "IMG_b.jpg": True}
+
+
+def test_photo_selection_flag_off_replaces_exactly_as_before(db, session_on_a, flag_off):
+    """Flag off: the PUT stores exactly the names sent, as today."""
+    w = session_on_a
+    f = w["folder"]
+    for name, site, co in (("IMG_a.jpg", w["sa"], w["a"]), ("IMG_b.jpg", w["sb"], w["b"])):
+        recordings.insert_pending(db, co["id"], w["bw"]["id"], site["id"], "photo",
+                                  f"users/{f}/pictures/{DATE}/{name}", uuid.uuid4().hex,
+                                  f"{DATE}T01:00:00Z")
+    route = f"/days/{DATE}/photos/selection"
+    assert _call(db, w["bw"], "PUT", route, {"excluded": ["IMG_a.jpg"]})[0] == 200
+    _suspend(db, w["a"])
+    assert _call(db, w["bw"], "PUT", route, {"excluded": []})[0] == 200
+    assert _stored_excluded(w) == set()

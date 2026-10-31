@@ -4495,6 +4495,13 @@ def put_photo_selection(conn, caller, date, event):
     if unknown:
         return error("not a photograph of this day: %s" % ", ".join(unknown[:5]), 400)
     excluded = sorted(set(body["excluded"]))
+    if tenancy_status.inactive_site_ids(conn, caller) is not None:
+        # Some company is inactive (flag on): photos on its sites are hidden from `day`, so
+        # the caller cannot name them -- but an exclusion made before the suspension must
+        # survive this replace (spec 2026-11-01 §2: no data loss), so carry the stored
+        # names that are not visible now. Flag off / nobody inactive: unchanged.
+        prev = report_photos.read_excluded(s3(), LAKE_BUCKET, folder, date)
+        excluded = sorted(set(excluded) | (prev - day))
     s3().put_object(Bucket=LAKE_BUCKET, Key=report_photos.selection_key(folder, date),
                     Body=json.dumps({"excluded": excluded, "updatedBy": str(caller["id"]),
                                      "updatedAt": nz_time.nz_now().isoformat()}).encode(),

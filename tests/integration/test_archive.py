@@ -114,9 +114,17 @@ def test_unarchive_user_restores_only_the_cascaded_memberships(db):
                "WHERE user_id=%s AND site_id=%s", (u["id"], s_off["id"]))
     earlier = _mem_archived_at(db, u["id"], s_off["id"])
 
+    s_closed = sites.create_site(db, co["id"], "Closed after the person left")
+    memberships.ensure_membership(db, u["id"], s_closed["id"], "worker")
+
     archived = users.archive_user(db, "sub-unarch", co["id"])
-    for s in (s_kept, s_also, s_ext):
+    for s in (s_kept, s_also, s_ext, s_closed):
         assert _mem_archived_at(db, u["id"], s["id"]) == archived["archived_at"]
+    # The site is archived AFTER the person: its cascade skips the already-archived row,
+    # which keeps the user's stamp -- unarchive_user must still not revive it onto a closed
+    # site (review fix C4).
+    sites.archive_site(db, s_closed["id"], co["id"])
+    assert _mem_archived_at(db, u["id"], s_closed["id"]) == archived["archived_at"]
     db.execute("UPDATE companies SET status='suspended' WHERE id=%s", (other["id"],))
 
     # Wrong company / not archived: None, nothing touched.
@@ -128,6 +136,7 @@ def test_unarchive_user_restores_only_the_cascaded_memberships(db):
     for s in (s_kept, s_also, s_ext):
         assert _mem_archived_at(db, u["id"], s["id"]) is None, s["name"]
     assert _mem_archived_at(db, u["id"], s_off["id"]) == earlier
+    assert _mem_archived_at(db, u["id"], s_closed["id"]) == archived["archived_at"]
     assert set(memberships.accessible_site_ids(db, u["id"], "worker")) >= {
         s_kept["id"], s_also["id"]}
     assert s_off["id"] not in memberships.accessible_site_ids(db, u["id"], "worker")

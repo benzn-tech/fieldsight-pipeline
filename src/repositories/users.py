@@ -295,6 +295,11 @@ def unarchive_user(conn, cognito_sub, company_id) -> dict | None:
     site archive, carries a different stamp and stays closed (spec 2026-11-01 company
     offboarding §8). Returns None if not found / wrong company / not archived.
 
+    A membership on a site that is archived now stays closed even with the user's stamp
+    (the site was archived after the person, so its cascade skipped the row):
+    unarchive_site restores no memberships, so reviving one here would put this person
+    alone back on the project when it reopens.
+
     The user's archived_at is read (and the row locked) BEFORE it is cleared; the three
     statements run in the caller's one transaction."""
     cur = conn.cursor(row_factory=dict_row)
@@ -306,7 +311,8 @@ def unarchive_user(conn, cognito_sub, company_id) -> dict | None:
     if found is None:
         return None
     cur.execute(
-        "UPDATE memberships SET archived_at=NULL WHERE user_id=%s AND archived_at=%s",
+        "UPDATE memberships SET archived_at=NULL WHERE user_id=%s AND archived_at=%s "
+        "AND site_id IN (SELECT id FROM sites WHERE archived_at IS NULL)",
         (found["id"], found["archived_at"]))
     return cur.execute(
         f"UPDATE users SET archived_at=NULL WHERE id=%s RETURNING {_COLS}",
