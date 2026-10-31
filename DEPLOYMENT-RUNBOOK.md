@@ -1,92 +1,72 @@
 # FieldSight Deployment Runbook
 
-How code in GitHub reaches AWS — automatically, per branch, with zero manual copy-paste.
+How code in GitHub reaches AWS. Both environments are SAM stacks built from
+`src/template.yaml`; the branch decides which one.
 
 ```
-                      ┌────────────── push develop ──────────────┐        ┌──────── merge → main ────────┐
-   you commit ───────►│  GitHub                                  │        │  (PR approved & merged)       │
-                      └──────────┬────────────────────┬──────────┘        └────────┬──────────────┬───────┘
-                                 │ backend (SAM)       │ ui/ (S3+CloudFront)        │ backend        │ ui/
-                                 ▼                     ▼                            ▼ (approval gate) ▼
-                    Actions: deploy.yml         deploy-ui.sh test          Actions: deploy-prod-code  deploy-ui.sh prod
-                    sam build → deploy           build ui/ + env-config     (waits for reviewer)   build ui/ + env-config
-                    → fieldsight-test stack       → test URL                → update-function-code  → prod URL
-                    → wire-s3-events --apply       (existing prod lambdas)                                  → wire-s3-events (dry-run)
-                    → smoke /api/health                                       → smoke /api/health
+push develop ──► deploy.yml ──► sam build/deploy fieldsight-test ──► migrate ──► wire S3 events ──► smoke /api/health
+merge to main ──► deploy-prod.yml ──► `production` environment gate (15-minute wait)
+              ──► sam build/deploy fieldsight-prod ──► migrate ──► wire S3 events ──► smoke /api/health
 ```
 
-Two independent tracks, both branch-driven:
-| Tier | Hosted by | Trigger | TEST (`develop`) | PROD (`main`) |
-|---|---|---|---|---|
-| Backend Lambda code | GitHub Actions | push (non-`ui/`, non-docs) | **`develop`**: full SAM → `fieldsight-test` stack (`deploy.yml`) | **`main`**: code-only `update-function-code` to the existing prod lambdas (`deploy-prod-code.yml`, approval gate) |
-| Frontend (`ui/`, static) | S3 + CloudFront (this account; `scripts/deploy-ui.sh`, run manually) | — | `fieldsight-web-test-*` + CF `E34AAK2PCGPWVZ` | `fieldsight-web-*` + CF `E12IVML224YUEE` |
+| | TEST | PROD |
+|---|---|---|
+| Branch | `develop` | `main` |
+| Workflow | `.github/workflows/deploy.yml` ("Deploy FieldSight TEST (SAM)") | `.github/workflows/deploy-prod.yml` ("Deploy FieldSight PROD (SAM)") |
+| Stack | `fieldsight-test` | `fieldsight-prod` |
+| Database (shared Aurora cluster) | `fieldsight_test` | `fieldsight` |
+| Data bucket | `fieldsight-data-test-509194952652` | `fieldsight-data-509194952652` |
+| Migrations | `fieldsight-test-migrate` | `fieldsight-prod-migrate` |
 
-- **Canonical SAM template** = `src/template.yaml` (the complete 9-Lambda stack; `CodeUri: src/` resolves via `base_dir = "."`). The legacy root `template.yaml` has been removed — `src/template.yaml` is the only template in the repo.
-- **`samconfig.toml` is committed** (no secrets; secrets injected from GitHub secrets via `--parameter-overrides`).
-- **PROD is NOT in CloudFormation.** The prod backend was hand-assembled (10 lambdas sharing `fieldsight-lambda-role`, crons in EventBridge Scheduler group `sitesync`, a manual `fieldsight-api` Gateway). A `sam deploy` to prod would collide with all of it, so **prod ships CODE-ONLY** via `deploy-prod-code.yml` (`update-function-code`, the documented manual process, automated). Full SAM adoption of prod is a separate migration (not done here). TEST is full SAM (fresh, isolated).
+- Both workflows skip pushes that only touch markdown, `docs/`, `ui/`, `frontend/` or
+  `scripts/` (prod also skips `tests/`); see each file's `paths-ignore`.
+  `workflow_dispatch` runs one by hand.
+- Each workflow is serialised per stack (`concurrency`, no cancel), so merging several
+  PRs queues deploys instead of failing on "UPDATE_IN_PROGRESS".
+- Prod waits on the `production` GitHub environment, then deploys. Every migration
+  merged to `main` runs on prod automatically, so experimental migrations never go to
+  `main`.
+- S3 ObjectCreated triggers are not in the template (SAM cannot attach events to an
+  external bucket). `scripts/wire-s3-events.sh` merges them in after each deploy; on
+  prod it applies only while the repo variable `PROD_WIRE_LAKE` is `true` (it is).
+- Stack parameters and secrets come from repo variables (`TEST_*`, `PROD_*`) and GitHub
+  secrets passed as `--parameter-overrides`. A parameter override for a parameter the
+  template no longer has fails the deploy, so remove both in the same commit.
+- Secrets in use include `AWS_ROLE_ARN` and the vendor API keys; the RealPTT/Fargate
+  secrets are no longer used since 2026-10-29. Verify with `gh secret list`.
 
----
+## Shipping
 
-## One-time setup (AWS console / IAM — do once)
+- **To TEST:** merge a PR into `develop`. Watch Actions → "Deploy FieldSight TEST (SAM)".
+- **To prod:** open a release PR into `main` (a branch off `main` with cherry-picks, or
+  `develop` → `main`), merge, then approve the waiting "Deploy FieldSight PROD (SAM)"
+  run once the gate allows it.
+- **Frontend:** the deployed web app is the separate `fieldsight-ui` repo on Amplify
+  (app `d2fssznicvuckr`: branch `main` = prod, `dev` = test). The `ui/` and `frontend/`
+  folders in this repo are not deployed.
 
-> GitHub repo secrets are already set (`AWS_ROLE_ARN`, `CLAUDE_API_KEY`; the RealPTT/Fargate secrets are no longer used since 2026-10-29). Verify with `gh secret list`.
+## After a deploy
 
-1. **OIDC role** — confirm an IAM role trusts `token.actions.githubusercontent.com` for this repo and is the `AWS_ROLE_ARN` secret. Audit:
-   ```bash
-   aws iam list-open-id-connect-providers
-   aws iam get-role --role-name <role-from-AWS_ROLE_ARN>   # check trust policy repo sub
-   ```
-   Permissions the role needs: CloudFormation, Lambda, S3, DynamoDB, Cognito, ECS, EventBridge, IAM (for SAM), `s3:PutBucketNotification`, `lambda:AddPermission`.
-
-2. **GitHub `production` environment** (the prod approval gate): repo → Settings → Environments → New environment `production` → add **Required reviewers**. `deploy-prod-code` will pause until approved.
-
-3. **TEST data plane** — `aws login`, then:
-   ```bash
-   bash scripts/bootstrap-env.sh test            # read-only audit: what exists / what's missing
-   bash scripts/bootstrap-env.sh test --create   # create test bucket + 3 tables (mirrors prod schema)
-   ```
-
-4. **UI (S3 + CloudFront — this account has NO Amplify)** — the frontend infra already exists on account 509194952652:
-
-   | env | bucket | CloudFront | URL |
-   |---|---|---|---|
-   | prod | `fieldsight-web-509194952652` | `E12IVML224YUEE` | d20o8d5t6bd7gm.cloudfront.net |
-   | test | `fieldsight-web-test-509194952652` | `E34AAK2PCGPWVZ` | d3qwnuldpg1tmp.cloudfront.net |
-
-   Deploy manually — `deploy-ui.sh` generates `ui/scripts/env-config.js`, syncs to the bucket, invalidates CloudFront (needs only the aws CLI; runs in Git Bash / WSL / CloudShell):
-   ```bash
-   bash scripts/deploy-ui.sh test    # test API URL auto-read from the fieldsight-test stack output
-   COGNITO_CLIENT_ID=<test-pool-client> bash scripts/deploy-ui.sh test   # add the test Cognito client for login
-   bash scripts/deploy-ui.sh prod    # prod API + fieldsight-web-client (4ratjdjonqm17tln6bs2761ci3) are built in
-   ```
-   (`amplify.yml` is the alternative path for an account where an Amplify app is connected — e.g. the company account / FS — **not** this account.)
-
-5. **PROD S3 events** — nothing to do. Prod's S3 notifications are already wired and working (`vad-on-users` on `users/`, `transcribe-on-segments` on `audio_segments/*.wav`). Since prod is not under SAM, leave them as-is. (`wire-s3-events.sh` is used only for the fresh TEST bucket, applied automatically by `deploy.yml`.)
-
----
-
-## Day-to-day (the whole point)
-
-- **Ship to test**: commit → push `develop`. Actions deploys the backend to `fieldsight-test`. UI: run `bash scripts/deploy-ui.sh test` (manual).
-- **Ship to prod**: open PR `develop → main`, merge. `deploy-prod-code.yml` **pauses for a reviewer** → approve → updates the existing prod lambdas' CODE (`update-function-code`, each published as a new version; infra/layers/env untouched). UI: run `bash scripts/deploy-ui.sh prod` (manual).
-- **Roll back prod code**: each update publishes a Lambda version — in the console (or CLI) point the function back to the previous version, or revert the commit on `main` and re-merge.
-- **UI-only change** (`ui/**`): backend workflow is path-ignored, so just run `deploy-ui.sh`. **Backend-only change**: push triggers the SAM (test) / code (prod) workflow; UI untouched.
-
-## Where to look
-| What | Where |
-|---|---|
-| Backend deploy logs | GitHub → Actions → "Deploy FieldSight (SAM backend)" |
-| Stack resources / drift | CloudFormation console → `fieldsight-test` / `fieldsight-pipeline` |
-| Lambda runtime logs | CloudWatch → `/aws/lambda/fieldsight[-test]-<fn>` |
-| UI deploy | local terminal output of `deploy-ui.sh` + CloudFront invalidation status |
-| PR validation (template lint) | GitHub → Actions → "CI (PR validation)" |
+```bash
+export AWS_PROFILE=fieldsight-deployer AWS_DEFAULT_REGION=ap-southeast-2
+aws cloudformation describe-stacks --stack-name fieldsight-prod --query 'Stacks[0].StackStatus'
+# A DELETE_FAILED during cleanup does not fail the update; check it when resources were removed
+aws cloudformation describe-stack-events --stack-name fieldsight-prod   --query 'StackEvents[?ResourceStatus==`DELETE_FAILED`]'
+```
 
 ## Rollback
-- **Backend**: CloudFormation console → stack → **Stack actions → previous changeset**, or revert the commit and re-push (redeploys the prior template).
-- **UI**: re-run `deploy-ui.sh <env>` from a previous commit (or enable S3 bucket versioning to restore prior objects), then invalidate CloudFront.
-- **Schedules**: TEST has `EnableSchedules=false` (no RealPTT polling / cron). PROD has them ENABLED.
 
-## Notes / guardrails
-- TEST and PROD are fully isolated: separate stack, S3 bucket (`fieldsight-data-test-*`), DynamoDB tables (`fieldsight-test-*`), Cognito pool, function names (`fieldsight-test-*`). A test deploy can never touch prod data — `deploy.yml` passes every env param explicitly.
-- Never commit secrets. They live only in GitHub secrets (backend CI). The UI's `env-config.js` holds only public values (API URL, Cognito client id) and is generated at deploy time, never committed.
-- Local SAM use: `sam build && sam deploy --config-env test` (samconfig handles template + base_dir).
+- **Backend:** revert the commit on the branch and let the workflow redeploy. A revert
+  that re-creates removed resources needs their parameters and secrets to still exist.
+- **Migrations** do not roll back by themselves; write a forward migration.
+- **Frontend:** redeploy the previous build in Amplify.
+
+## Guardrails
+
+- Never `update-function-code` a hand-made zip. Every function is built from
+  `CodeUri: src/`; a hand-picked bundle deploys and then fails at import.
+- TEST sends real SES email. Scripts that create users or sessions on TEST use only the
+  owner's alias accounts.
+- Prod data writes (migrations aside) are run by the owner, not by CI.
+- Local SAM: `sam build && sam deploy --config-env test` (samconfig.toml handles the
+  template path and `base_dir`).

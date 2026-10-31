@@ -56,7 +56,7 @@
 | Per-industry prompts | a second industry customer |
 | Face blurring | its own compute environment |
 | HTML one-pager report | not scheduled |
-| Small cleanups: the spare user pool, `deploy-prod-code.yml`, the old `ui/` copy, bringing S3 notifications under CloudFormation | low, except the S3 one (a CFN-managed notification can overwrite the existing config) |
+| Small cleanups: the spare user pool, the old `ui/` copy, bringing S3 notifications under CloudFormation | low, except the S3 one (a CFN-managed notification can overwrite the existing config) |
 
 ## Owner follow-ups still open
 

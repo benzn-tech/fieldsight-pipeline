@@ -479,25 +479,18 @@ result = [u for u in all_users
 
 ## Lambda Deployment
 
-**CRITICAL: bundle the whole of `src/*.py` in every Lambda zip — do not pick modules.**
+**Deploy only through SAM** (`deploy.yml` for TEST from `develop`, `deploy-prod.yml`
+for prod from `main`). Every function is built from `CodeUri: src/`, so each package
+carries the whole of `src/*.py`.
 
-The two-file `zip -j rg.zip lambda_report_generator.py transcript_utils.py` that
-used to live here was accurate in 2026-03 and silently wrong by 2026-09: those
-handlers now import ~20 further local modules (`output_language`, `nz_time`,
-`weather`, `site_coords`, `deletion_mirror`, `agent_turn_filter`,
-`report_sections`, `batch_stitch`, …). `update-function-code` validates a zip,
-not an import graph, so a bundle missing one of them **deploys successfully** and
-then raises ImportError on the next cold start.
-
-Use the script; it globs `src/*.py` so it cannot fall behind an import again:
-
-```bash
-bash scripts/deploy-lambda-code.sh fieldsight ap-southeast-2
-```
-
-It already does `aws lambda wait function-updated` between functions. If you must
-do one by hand, bundle the same way — `zip -j fn.zip src/*.py` — and never a
-hand-picked subset.
+Never hand-zip a subset and `update-function-code` it. The two-file
+`zip -j rg.zip lambda_report_generator.py transcript_utils.py` that used to live here
+was right in 2026-03 and wrong by 2026-09: those handlers import ~20 further local
+modules (`output_language`, `nz_time`, `weather`, `site_coords`, …), and
+`update-function-code` validates a zip, not an import graph, so a short bundle
+**deploys successfully** and then raises ImportError on the next cold start. The
+`deploy-lambda-code.sh` script and `deploy-prod-code.yml` that served the hand-built
+March lambdas were removed when those lambdas were deleted (2026-10-31).
 
 ---
 

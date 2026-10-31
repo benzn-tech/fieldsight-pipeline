@@ -47,9 +47,6 @@ Each deploy runs `sam build` / `sam deploy`, applies DB migrations through the s
 `*-migrate` function (`src/migrations/`) and wires the S3 events. Region:
 ap-southeast-2.
 
-`deploy-prod-code.yml` is a manual-only leftover for the March hand-made lambdas, which
-were deleted on 2026-10-31; it is no longer used.
-
 ## Tests
 
 ```bash
