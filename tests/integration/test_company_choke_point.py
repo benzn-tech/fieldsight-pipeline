@@ -575,3 +575,17 @@ def test_single_candidate_nobody_inactive_is_unchanged(db, single, flag_on, monk
     on = _disambiguate(db, single["bad"], DATE)
     monkeypatch.delenv(FLAG, raising=False)
     assert _disambiguate(db, single["bad"], DATE) == on
+
+
+def test_a_topic_row_always_has_a_site(db):
+    """Final review M1's premise, pinned: the own-day inactive clip filters TOPIC rows by
+    site, and topics.site_id is NOT NULL, so there is no site-less topic row for it to drop
+    (a site-less session's work reaches the day view only through the whole-day prose and
+    photos, which the clip withholds by design -- deferred M4). If this column ever becomes
+    nullable, the clip in _render_timeline_for_user / _day_report_rows must keep those rows
+    for the person's own day."""
+    with pytest.raises(psycopg.errors.NotNullViolation):
+        with db.transaction():
+            db.execute("INSERT INTO topics (site_id, report_date, title) "
+                       "VALUES (NULL, %s, 'x')", (DATE,))
+    assert db.execute("SELECT 1").fetchone()[0] == 1
