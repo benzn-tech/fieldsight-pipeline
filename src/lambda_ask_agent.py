@@ -1122,15 +1122,15 @@ def _rag_answer(body, on_web_start=None):
     ok() same as every other result.
 
     llm_utils / dashscope_utils are imported HERE (lazily), not at module
-    top level: scripts/deploy-lambda-code.sh zips lambda_ask_agent.py +
-    transcript_utils.py + llm_utils.py for the LEGACY hand-built prod (the
-    fieldsight-* lambdas outside CloudFormation/SAM entirely -- see CLAUDE.md
-    / the two-accounts note). A top-level `import llm_utils` would still
-    ImportModuleError the entire module there if that bundle were ever out of
-    sync (killing the legacy S3-file path too, not just RAG) -- lazy import
-    keeps this path degrading gracefully instead. That legacy prod's zip has
-    no dashscope_utils.py in it and no RAG_SEARCH_FUNCTION env var (it's not SAM-managed, so
-    template.yaml doesn't apply to it at all). This is UNRELATED to whether
+    top level. The original reason was the LEGACY hand-built prod lambdas
+    (fieldsight-*, outside CloudFormation/SAM), whose minimal zip carried
+    lambda_ask_agent.py + transcript_utils.py + llm_utils.py and no
+    dashscope_utils.py; a top-level import would have failed the whole
+    module there. Those lambdas and their minimal zip were deleted on
+    2026-10-31, and every SAM function is built from `CodeUri: src/`, so that
+    reason is gone; the lazy import is kept so importing this module stays
+    cheap and free of vendor SDKs. That legacy prod also had no
+    RAG_SEARCH_FUNCTION env var (template.yaml never applied to it). This is UNRELATED to whether
     THIS SAM pipeline's own prod target (fieldsight-prod-*, template.yaml)
     has RAG_SEARCH_FUNCTION -- it does, same as SAM test (see the
     caller_sub-and-RAG_SEARCH_FUNCTION guard in lambda_handler for that).
@@ -2413,11 +2413,10 @@ def lambda_handler(event, context):
     # and template.yaml's own top-of-file Metadata says HasDb is true on
     # BOTH real SAM deploy targets (TEST via deploy.yml and PROD=fieldsight-
     # prod via deploy-prod.yml) -- so this branch is live on SAM prod too,
-    # not just test. (The LEGACY hand-built fieldsight-* lambdas -- deployed
-    # by scripts/deploy-lambda-code.sh, outside CloudFormation/SAM entirely
-    # -- are a different deploy target not governed by template.yaml at all;
-    # those never get RAG_SEARCH_FUNCTION and now answer 503 below.
-    # Don't conflate the two "prod"s.)
+    # not just test. (The LEGACY hand-built fieldsight-* lambdas, outside
+    # CloudFormation/SAM, never had RAG_SEARCH_FUNCTION and answered 503
+    # below; they were deleted on 2026-10-31, so the 503 now only covers a
+    # deploy without a rag-search function.)
     if body.get('caller_sub') and os.environ.get('RAG_SEARCH_FUNCTION'):
         if body.get('mode') == 'search':
             return ok(_rag_search_list(body))

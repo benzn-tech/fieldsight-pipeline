@@ -2,10 +2,8 @@ name: Deploy FieldSight TEST (SAM)
 
 # ============================================================
 # develop → TEST stack (fieldsight-test) via full SAM deploy.
-# PROD is NOT deployed by SAM: the prod backend was hand-assembled
-# (shared IAM role, EventBridge Scheduler crons, manual API Gateway —
-# no CloudFormation stack), so `sam deploy` would collide with it.
-# Prod code updates are handled by deploy-prod-code.yml instead.
+# PROD is the fieldsight-prod SAM stack, deployed from main by
+# deploy-prod.yml behind the `production` environment gate.
 # ============================================================
 # Canonical template: src/template.yaml (built with base_dir "." via samconfig).
 # All env params are passed explicitly so a TEST deploy can never touch PROD data.

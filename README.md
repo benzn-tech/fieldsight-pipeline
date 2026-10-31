@@ -1,163 +1,80 @@
 # FieldSight Pipeline
 
-Automated pipeline that downloads construction site radio recordings, body camera footage, and photos from RealPTT Cloud Platform, transcribes them, and generates AI-powered daily reports.
+Backend for FieldSight: devices and the web app upload site recordings and photos,
+the pipeline transcribes and extracts them, writes the results to Aurora, and serves
+reports, search and Ask through the org API. The web app lives in the separate
+`fieldsight-ui` repo.
 
-## Architecture
+## How data moves
 
 ```
-EventBridge (20:00 NZDT)
-    │
-    ▼
-Lambda 1: Orchestrator ──→ realptt.com (web scraping)
-    │                       ├── org_videolist (HTML → Ud() parse)
-    │                       ├── org_audiolist (HTML → per group/day)
-    │                       └── /ptt/uploadFile (JSON, limit=20)
-    │
-    │ Async invoke per file
-    ▼
-Lambda 2: Downloader ──→ S3 (users/{name}/audio|video|pictures/)
-                              │
-                              │ S3 Event trigger
-                              ▼
-                         Lambda 3: Transcribe ──→ AWS Transcribe
-                              │                        │
-                              │                        ▼
-                         Lambda: VAD ──→ audio_segments/{user}/{date}/
-                                                       │
-                                                       ▼
-                                               S3 (transcripts/{name}/)
-EventBridge (05:00 NZDT)                              │
-    │                                                  │
-    ▼                                                  │
-Lambda 5: Report Generator ←───────────────────────────┘
-    │
-    ├── Anthropic Claude API (Sonnet 4.6) for AI summaries
-    │
-    ▼
-S3 (reports/{date}/summary.json + by_user/{name}.json + .docx)
-
-Frontend:
-  CloudFront → S3 (fieldsight-web)
-  Cognito (user auth) → API Gateway → Lambda: API
+Device / web app ──POST /api/org/recordings/upload-url──► presigned PUT
+                                                            │
+                                     S3 users/<folder>/audio|video|pictures/...
+                                                            │ S3 event
+                                                            ▼
+  vad ──► audio_segments/ ──► transcribe ──► transcripts/
+                                                │ S3 event (live pass) / extraction_requests/ (final pass)
+                                                ▼
+                                       extract-session ──► extractions/ ──► item-writer ──► Aurora
+                                                                                  │
+          report-generator (nightly + report_requests/) ──► reports/ ──► embed-report ──► ingest ──► Aurora
+                                                                                  │
+                     org-api (API Gateway, Cognito) ◄── web app, devices, Ask, search
 ```
 
-## Quick Start
+- S3 ObjectCreated triggers on the data bucket are not in the SAM template (SAM cannot
+  attach events to an external bucket). `scripts/wire-s3-events.sh` merges them in after
+  every deploy; the prefix → function map is at the top of that script.
+- org-api and the other in-VPC functions reach Aurora (`fieldsight-db-test` cluster,
+  databases `fieldsight` for prod and `fieldsight_test` for TEST).
+- Ownership of every lake object is indexed in `lake_objects` (`src/lake_owner.py`).
+  Isolation is enforced by org-api, not by the S3 key layout.
+- The ASR and LLM vendors are stack parameters (`AsrProvider`, `LlmProvider` and the
+  model parameters); TEST and prod set them from repo variables in the deploy workflows.
 
-### Prerequisites
-- AWS account with CLI access
-- [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html) installed
-- RealPTT company account credentials
+## Environments and deploy
 
-### Deploy (3 commands)
+| | TEST | PROD |
+|---|---|---|
+| Branch | `develop` | `main` |
+| Stack | `fieldsight-test` | `fieldsight-prod` |
+| Workflow | `.github/workflows/deploy.yml` | `.github/workflows/deploy-prod.yml` (gated by the `production` environment) |
+| Data bucket | `fieldsight-data-test-509194952652` | `fieldsight-data-509194952652` |
+| Org API gateway | `wdsgobb7b0` | `ys94qy2tk0` |
+
+Each deploy runs `sam build` / `sam deploy`, applies DB migrations through the stage's
+`*-migrate` function (`src/migrations/`) and wires the S3 events. Region:
+ap-southeast-2.
+
+## Tests
 
 ```bash
-# 1. Build
-sam build
-
-# 2. First-time deploy (interactive, creates samconfig.toml)
-sam deploy --guided
-#   Stack name: fieldsight-pipeline
-#   Region: ap-southeast-2  (Sydney, closest to NZ)
-#   Fill in: RealPTTAccount, RealPTTPassword, BucketNameSuffix
-#   Accept defaults for the rest
-
-# 3. Future deploys (one command)
-sam deploy
+pytest tests/unit                 # unit suite (CI: .github/workflows/test.yml)
+pytest tests/integration          # needs Postgres with pgvector (CI starts one)
 ```
 
-### Upload User Mapping
+`ci.yml` lints `src/template.yaml` and `infra/db-template.yaml` with cfn-lint (pinned 1.53.3;
+see the comment there before bumping it).
 
-```bash
-aws s3 cp config/user_mapping.json s3://fieldsight-data-YOURSUFFIX/config/user_mapping.json
-```
-
-### Test
-
-```bash
-aws lambda invoke --function-name fieldsight-orchestrator output.json
-cat output.json
-```
-
-## Repository Structure
+## Repository layout
 
 ```
-.
-├── .github/workflows/
-│   └── deploy.yml              # GitHub Actions: push-to-deploy
-├── src/
-│   ├── lambda_orchestrator.py       # Query files from RealPTT (web scraping)
-│   ├── lambda_downloader.py         # Download single file → S3
-│   ├── lambda_transcribe.py         # Trigger AWS Transcribe
-│   ├── lambda_transcribe_callback.py # Process Transcribe completions
-│   ├── lambda_report_generator.py   # AI-powered daily/weekly/monthly reports
-│   ├── lambda_meeting_minutes.py    # AI-powered meeting minutes
-│   ├── lambda_vad.py                # Voice Activity Detection
-│   ├── lambda_fieldsight_api.py     # Frontend REST API
-│   ├── transcript_utils.py          # Shared transcript normalization
-│   └── fargate_downloader.py        # Fargate large file downloader
-├── config/
-│   ├── user_mapping.json            # Device → user name mapping
-│   ├── prompt_templates.json        # Report generation prompts
-│   └── prompt_templates_meeting.json # Meeting minutes prompts
-├── frontend/
-│   └── index.html                   # React frontend
-├── scripts/
-│   ├── scan-aws-naming.sh           # AWS resource naming audit
-│   └── batch_convert_h264.py        # H265→H264 video conversion
-├── docs/
-│   ├── ARCHITECTURE.md              # System architecture diagram
-│   └── MONITORING.md                # Monitoring & debugging guide
-├── src/template.yaml                # SAM template (canonical)
-├── CLAUDE.md                        # Claude Code project rules
-├── ROADMAP.md                       # Product roadmap
-└── README.md                        # This file
+src/                 Lambda handlers (lambda_*.py), shared modules, template.yaml (canonical SAM template)
+src/migrations/      Aurora schema migrations, applied in order by the migrate function
+scripts/             deploy helpers (wire-s3-events.sh, deploy-ui.sh, smoke tests) and one-off ops scripts
+config/              prompt templates and vocabularies uploaded to S3 config/
+tests/unit, tests/integration
+docs/superpowers/    specs and plans, one pair per piece of work
+CLAUDE.md            working rules and the bug log
+ROADMAP.md           what is still open
 ```
 
-## Configuration
+## Retired
 
-### SAM Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `RealPTTAccount` | - | RealPTT platform account |
-| `RealPTTPassword` | - | RealPTT platform password |
-| `BucketNameSuffix` | mycompany | S3 bucket suffix (final: fieldsight-data-xxx) |
-| `StartDaysAgo` | 1 | How many days back to query |
-| `DownloadAudio` | true | Download PTT radio recordings |
-| `DownloadVideo` | true | Download PTT video calls |
-| `DownloadFiles` | true | Download body cam & photos |
-| `EnableTranscribe` | true | Auto-transcribe audio |
-| `TimeDifferenceMs` | 46800000 | NZ timezone offset (13h) |
-| `LanguageOptions` | en-NZ,en-AU,en-GB,en-US,zh-CN | Transcribe languages |
-| `MaxSpeakers` | 5 | Speaker diarization max |
-| `AlertEmail` | (empty) | Email for failure alerts |
-| `ClaudeApiKey` | (empty) | Anthropic API key for report generation |
-
-## AWS Resources
-
-| # | Service | Name | Purpose |
-|---|---------|------|---------|
-| 1 | Lambda | fieldsight-orchestrator | Query RealPTT, trigger downloads |
-| 2 | Lambda | fieldsight-downloader | Download files → S3 |
-| 3 | Lambda | fieldsight-transcribe | Start Transcribe jobs |
-| 4 | Lambda | fieldsight-fargate-trigger | Launch Fargate for large files |
-| 5 | Lambda | fieldsight-report-generator | Daily/weekly/monthly reports |
-| 6 | Lambda | fieldsight-vad | Voice activity detection |
-| 7 | Lambda | fieldsight-api | Frontend REST API |
-| 8 | Lambda | fieldsight-transcribe-callback | Transcribe job completions |
-| 9 | Lambda | fieldsight-meeting-minutes | Meeting minutes generation |
-| 10 | ECS Fargate | fieldsight-fargate-downloader | Large file downloads |
-| 11 | S3 | fieldsight-data-{suffix} | All media, transcripts, reports |
-| 12 | DynamoDB | fieldsight-items/reports/audit/users/transcripts | App data |
-| 13 | API Gateway | fieldsight-api | HTTPS endpoint |
-| 14 | CloudFront | fieldsight-web | Frontend CDN |
-| 15 | Cognito | fieldsight-users | User authentication |
-
-## Key Design Decisions
-
-- **Domain**: Uses `realptt.com` (web interface), NOT `api.realptt.com` (JSON API returns empty for video/audio)
-- **Video/Upload download**: Direct URLs from realptt.com, no session auth needed
-- **Audio download**: `record.realptt.com/voice/?SpkId=...` — trailing slash required, no auth needed
-- **Transcribe**: Auto language detection (en-NZ, en-AU, en-GB, en-US, zh-CN) with speaker diarization
-- **Reports**: Claude Sonnet 4.6 generates structured JSON → optional Word document via python-docx Lambda Layer
-- **Region**: ap-southeast-2 (Sydney) — closest to NZ, all resources colocated
+- RealPTT ingest (orchestrator, downloader, Fargate downloader) was removed from the
+  stack in #1198 (prod 2026-10-30). Devices upload directly.
+- `config/user_mapping.json` is no longer read by any function (M5 #1184, #1198).
+  Users, folders and sites come from Aurora and the published directory
+  (`config/directory.json`, `src/directory.py`).
+- The March hand-made lambdas and API gateway `khfj3p1fkb` were deleted on 2026-10-31.
