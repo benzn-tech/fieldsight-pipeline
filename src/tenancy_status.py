@@ -42,8 +42,32 @@ def enforce_enabled() -> bool:
     return (os.environ.get("COMPANY_STATUS_ENFORCE") or "").lower() in _ENFORCE_ON
 
 
+STATUSES = (ACTIVE, SUSPENDED, EXITED)
+
+
 def _not_migrated(exc) -> bool:
     return getattr(exc, "sqlstate", None) in _NOT_MIGRATED
+
+
+def not_migrated(exc) -> bool:
+    """True when `exc` is a database error meaning migration 0092 is not applied yet
+    (undefined column / table). For endpoints that answer 503 `not migrated`."""
+    return _not_migrated(exc)
+
+
+def company_statuses(conn) -> dict:
+    """{str(company id): status} for every company -- or {} when companies.status is not
+    migrated yet (callers then treat every company as 'active'). Savepoint-guarded (module
+    doc). A separate query on purpose: companies.list_companies is shared with other
+    routes and must not grow a 0092 column."""
+    try:
+        with conn.transaction():
+            rows = conn.execute("SELECT id, status FROM companies").fetchall()
+    except Exception as exc:  # noqa: BLE001 - narrowed below
+        if _not_migrated(exc):
+            return {}
+        raise
+    return {str(r[0]): r[1] for r in rows}
 
 
 def company_status(conn, company_id) -> str:

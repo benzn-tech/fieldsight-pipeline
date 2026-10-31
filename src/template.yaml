@@ -3382,6 +3382,14 @@ Resources:
             - Effect: Allow
               Action: s3:GetObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/exports/*
+        # Company offboarding (spec 2026-11-01 §5.3): POST /companies/{id}/status leaves a
+        # company_status_requests/{company_id}/{event_id}.json marker for LakeOps's Cognito
+        # task, the same way and for the same reason as export_requests/ above. Write only.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/company_status_requests/*
       Events:
         OrgProxy:
           Type: Api

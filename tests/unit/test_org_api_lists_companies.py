@@ -3,7 +3,7 @@
 A list of every tenant's name is a cross-tenant disclosure. The gate is
 is_cross_company (platform_admin only), the same predicate that alone lets a caller
 send target_company_id to create_org_site / patch_org_site. Every other role is
-refused, and the body carries exactly {id, name}.
+refused, and the body carries exactly {id, name, status}.
 """
 import json
 
@@ -35,6 +35,9 @@ def call(monkeypatch, role):
     monkeypatch.setattr(org.users, "get_user_by_sub", lambda conn, sub: dict(caller))
     monkeypatch.setattr(org.device_heartbeat, "record", lambda *a, **k: None)
     monkeypatch.setattr(org.companies, "list_companies", lambda conn: [dict(r) for r in ROWS])
+    # companies.status comes from its own savepoint-guarded read (offboarding, 0092).
+    monkeypatch.setattr(org.tenancy_status, "company_statuses",
+                        lambda conn: {"c-1": "suspended"})
     resp = org.lambda_handler({
         "httpMethod": "GET", "path": "/api/org/companies", "queryStringParameters": None,
         "body": None, "headers": {}, "requestContext": {"authorizer": {"claims": {"sub": "sub-1"}}},
@@ -45,14 +48,14 @@ def call(monkeypatch, role):
 def test_platform_admin_gets_every_company(monkeypatch):
     status, body = call(monkeypatch, "platform_admin")
     assert status == 200
-    assert body == {"companies": [{"id": "c-1", "name": "Alpha Build"},
-                                  {"id": "c-2", "name": "Beta Civil"}]}
+    assert body == {"companies": [{"id": "c-1", "name": "Alpha Build", "status": "suspended"},
+                                  {"id": "c-2", "name": "Beta Civil", "status": "active"}]}
 
 
-def test_only_id_and_name_leave_the_handler(monkeypatch):
+def test_only_id_name_and_status_leave_the_handler(monkeypatch):
     _, body = call(monkeypatch, "platform_admin")
     for c in body["companies"]:
-        assert set(c) == {"id", "name"}
+        assert set(c) == {"id", "name", "status"}
 
 
 @pytest.mark.parametrize("role", ["admin", "gm", "pm", "site_manager", "worker",

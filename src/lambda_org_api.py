@@ -10,6 +10,12 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   PATCH /api/org/me                       → update first/last name, avatar key
   POST  /api/org/companies/{id}/export    → platform_admin: start a company data export (async, LakeOps; 202 exportId)
   GET   /api/org/companies/{id}/export/{export_id} → platform_admin: export status + 15-minute presigned part URLs
+  POST  /api/org/companies/{id}/status    → platform_admin, never the caller's own company: set
+                                            active|suspended|exited with a reason (idempotent);
+                                            status + audit + Cognito work rows in one transaction,
+                                            then a company_status_requests/ marker for LakeOps
+  GET   /api/org/companies/{id}/status-events → platform_admin: status audit trail, newest
+                                            first, with per-user Cognito rows
   GET   /api/org/sites                    → sites visible to caller (ACL)
   POST  /api/org/sites                    → create site (admin/gm)
   GET   /api/org/members                  → company members + memberships (admin/gm)
@@ -196,6 +202,7 @@ import deletion_mirror
 import speaker_match_request
 from repositories import speaker_name_proposals
 from repositories import status_suggestions as status_suggestions_repo
+from repositories import company_status as company_status_repo
 from repositories import speaker_intro_suggestions
 import turn_name_overlay
 import template_types
@@ -428,6 +435,9 @@ BACKFILL_LAKE_OBJECTS_TASK = "backfill_lake_objects"
 EXPORT_COMPANY_TASK = "export_company"
 EXPORT_TICK_TASK = "export_tick"
 EXPORT_REQUEST_PREFIX = "export_requests/"
+# Company offboarding (spec 2026-11-01 §5.3): POST /companies/{id}/status leaves
+# company_status_requests/{company_id}/{event_id}.json for LakeOps's Cognito task.
+COMPANY_STATUS_REQUEST_PREFIX = "company_status_requests/"
 
 
 def lambda_handler(event, context):
@@ -697,6 +707,12 @@ def dispatch(conn, event, method, route):
     m_cxs = re.match(r"^/companies/([^/]+)/export/([^/]+)$", route)
     if m_cxs and method == "GET":
         return company_export_status(conn, caller, m_cxs.group(1), m_cxs.group(2))
+    m_cst = re.match(r"^/companies/([^/]+)/status$", route)
+    if m_cst and method == "POST":
+        return set_company_status(conn, caller, m_cst.group(1), parse_body(event))
+    m_cse = re.match(r"^/companies/([^/]+)/status-events$", route)
+    if m_cse and method == "GET":
+        return company_status_events(conn, caller, m_cse.group(1))
 
     if route == "/members":
         if method == "GET":
@@ -6059,6 +6075,173 @@ def _export_alt_bucket_for(kind):
     return None
 
 
+# ----------------------------------------------------------
+# /companies/{id}/status -- company offboarding (spec 2026-11-01 §5.3, §5.4, §8, §9)
+# ----------------------------------------------------------
+STATUS_REASON_MAX = 1000
+
+
+def _status_iso(value):
+    return value.isoformat() if hasattr(value, "isoformat") else value
+
+
+def set_company_status(conn, caller, company_id, body):
+    """POST /companies/{id}/status {"status", "reason", "stop_billing"?}.
+
+    platform_admin only, never the caller's own company. Same status as now: 200
+    `changed: false`, nothing written. Otherwise ONE transaction (a savepoint inside the
+    request's): lock the company row, set the status fields, append the audit event and
+    the Cognito work rows (repositories.company_status), and -- deactivations only, flag
+    on only -- delete the company's ws_connections rows. Then an explicit COMMIT, and only
+    then the S3 marker company_status_requests/{company_id}/{event_id}.json for LakeOps
+    (in-VPC org-api cannot invoke a Lambda; see start_company_export). The marker is
+    written whenever there are pending rows, whatever the flag says: the executor is what
+    holds off while the flag is off (R1). A marker failure does not fail the request --
+    the change is already durable -- and is reported as `cognitoTrigger: "failed"`.
+    Migration 0092 not applied: 503 `not migrated`, nothing written."""
+    cid, err = _export_company_or_error(conn, caller, company_id)
+    if err:
+        return err
+    if str(caller.get("company_id")) == cid:
+        return error("cannot change your own company's status", 403)
+    if body is None:
+        return error("body must be a JSON object", 400)
+    to_status = body.get("status")
+    if not isinstance(to_status, str) or to_status not in tenancy_status.STATUSES:
+        return error("status must be one of: active, suspended, exited", 400)
+    reason = body.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return error("reason is required", 400)
+    reason = reason.strip()
+    if len(reason) > STATUS_REASON_MAX:
+        return error(f"reason is longer than {STATUS_REASON_MAX} characters", 400)
+    stop_billing = body.get("stop_billing", False)
+    if stop_billing is None:
+        stop_billing = False
+    if not isinstance(stop_billing, bool):
+        return error("stop_billing must be true or false", 400)
+
+    try:
+        with conn.transaction():
+            result = _apply_company_status(conn, caller, cid, to_status, reason, stop_billing)
+    except Exception as exc:  # noqa: BLE001 - narrowed below
+        if tenancy_status.not_migrated(exc):
+            logger.warning("company status: migration 0092 not applied (%s)", exc)
+            return error("not migrated", 503)
+        raise
+    if not result["changed"]:
+        return ok(result)
+    conn.commit()  # the change is durable BEFORE the executor can be told about it
+    logger.warning("COMPANY_STATUS_CHANGED company=%s %s->%s event=%s by user=%s",
+                   cid, result["previousStatus"], to_status, result["eventId"],
+                   caller.get("id"))
+    if sum(result["cognito"].values()) == 0:
+        result["cognitoTrigger"] = "none"
+    else:
+        result["cognitoTrigger"] = _queue_company_status_cognito(
+            cid, result["eventId"], caller)
+    return ok(result)
+
+
+def _apply_company_status(conn, caller, cid, to_status, reason, stop_billing):
+    """The database half of set_company_status. Runs inside the caller's transaction."""
+    current = company_status_repo.lock_company(conn, cid)
+    if current is None:            # deleted between the 404 check and the lock
+        raise LookupError(f"company {cid} vanished")
+    from_status = current["status"]
+    out = {"companyId": cid, "status": to_status, "previousStatus": from_status,
+           "changed": from_status != to_status, "eventId": None,
+           "affectedUsers": 0, "affectedDevices": 0,
+           "cognito": {"disable": 0, "signout": 0, "enable": 0},
+           "cognitoTrigger": "none", "socketsClosed": 0}
+    if from_status == to_status:
+        out["status"] = from_status
+        return out
+    after = company_status_repo.apply_status(conn, cid, to_status, reason, stop_billing)
+    detail = {"stop_billing": stop_billing,
+              "previous": {"status_reason": current["status_reason"],
+                           "billing_stopped_at": _status_iso(current["billing_stopped_at"]),
+                           "exited_at": _status_iso(current["exited_at"])}}
+    event_id = company_status_repo.insert_event(
+        conn, cid, from_status, to_status, reason, caller.get("id"),
+        caller.get("cognito_sub"), detail)
+    was_active = from_status == tenancy_status.ACTIVE
+    if was_active:                                 # active -> suspended / exited
+        company_status_repo.supersede_pending_enables(conn, event_id, cid)
+        rows = company_status_repo.create_deactivation_rows(conn, event_id, cid)
+        out["cognito"].update(rows)
+    elif to_status == tenancy_status.ACTIVE:       # suspended / exited -> active
+        rows = company_status_repo.create_reactivation_rows(conn, event_id, cid)
+        out["cognito"]["enable"] = rows["enable"]
+    # inactive -> inactive: the event alone; the first deactivation listed the users.
+    if to_status != tenancy_status.ACTIVE:
+        if tenancy_status.enforce_enabled():
+            out["socketsClosed"] = company_status_repo.close_sockets(conn, cid)
+        else:
+            logger.warning("COMPANY_GATE_WOULD_DELETE_SOCKETS company=%s status=%s sockets=%d",
+                           cid, to_status, company_status_repo.count_sockets(conn, cid))
+    out.update({"eventId": str(event_id),
+                "affectedUsers": company_status_repo.home_user_count(conn, cid),
+                "affectedDevices": company_status_repo.home_device_count(conn, cid),
+                "statusChangedAt": _status_iso(after["status_changed_at"]),
+                "billingStoppedAt": _status_iso(after["billing_stopped_at"]),
+                "exitedAt": _status_iso(after["exited_at"])})
+    return out
+
+
+def _queue_company_status_cognito(cid, event_id, caller):
+    """Write the LakeOps trigger for one status event: 'queued', or 'failed' (logged)."""
+    request = {"company_id": cid, "event_id": event_id,
+               "requested_by": str(caller.get("id")) if caller.get("id") else None,
+               "requested_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        s3().put_object(Bucket=_export_bucket_for("exports"),
+                        Key=f"{COMPANY_STATUS_REQUEST_PREFIX}{cid}/{event_id}.json",
+                        Body=json.dumps(request).encode("utf-8"),
+                        ContentType="application/json")
+    except Exception:
+        logger.exception("company status: could not write the Cognito request for company "
+                         "%s event %s (rows stay pending)", cid, event_id)
+        return "failed"
+    return "queued"
+
+
+def company_status_events(conn, caller, company_id):
+    """GET /companies/{id}/status-events -- the company's status fields and its audit
+    trail, newest first, each event with its Cognito rows. platform_admin only (any
+    company, the caller's own included: reading changes nothing). 503 before 0092."""
+    cid, err = _export_company_or_error(conn, caller, company_id)
+    if err:
+        return err
+    try:
+        with conn.transaction():
+            current = company_status_repo.read_status(conn, cid)
+            events = company_status_repo.list_events(conn, cid)
+    except Exception as exc:  # noqa: BLE001 - narrowed below
+        if tenancy_status.not_migrated(exc):
+            return error("not migrated", 503)
+        raise
+    current = current or {}
+    return ok({
+        "companyId": cid,
+        "status": current.get("status") or tenancy_status.ACTIVE,
+        "statusChangedAt": _status_iso(current.get("status_changed_at")),
+        "statusReason": current.get("status_reason"),
+        "billingStoppedAt": _status_iso(current.get("billing_stopped_at")),
+        "exitedAt": _status_iso(current.get("exited_at")),
+        "events": [{
+            "id": str(e["id"]), "fromStatus": e["from_status"], "toStatus": e["to_status"],
+            "reason": e["reason"],
+            "actorUserId": str(e["actor_user_id"]) if e["actor_user_id"] else None,
+            "actorSub": e["actor_sub"], "at": _status_iso(e["at"]), "detail": e["detail"],
+            "cognito": [{"userSub": c["user_sub"], "action": c["action"],
+                         "state": c["state"], "attempts": c["attempts"],
+                         "lastError": c["last_error"], "updatedAt": _status_iso(c["updated_at"])}
+                        for c in e["cognito"]],
+        } for e in events],
+    })
+
+
 def export_company_task(event, context=None):
     """Run one time budget of export_company and return the result (next_cursor if not done).
 
@@ -6370,14 +6553,19 @@ def list_org_companies(conn, caller):
     a directory of other tenants, so resolve_scope is deliberately NOT consulted here.
     Every other role is refused. The list is every tenant's name: default is refusal.
 
-    WHAT: id and name only. companies.list_companies also selects industry and
+    WHAT: id, name and status only. companies.list_companies also selects industry and
     created_at, and the row may grow; the projection is explicit so a widened repo
-    query cannot leak a new column through this route.
+    query cannot leak a new column through this route. `status` (company offboarding,
+    spec 2026-11-01 §9) comes from a separate savepoint-guarded read, so before migration
+    0092 every company reads 'active' and list_companies' shared SELECT stays unchanged.
     """
     if not is_cross_company(caller["global_role"]):
         return error("platform_admin role required", 403)
+    statuses = tenancy_status.company_statuses(conn)
     return ok({"companies": [
-        {"id": str(c["id"]), "name": c["name"]} for c in companies.list_companies(conn)
+        {"id": str(c["id"]), "name": c["name"],
+         "status": statuses.get(str(c["id"])) or tenancy_status.ACTIVE}
+        for c in companies.list_companies(conn)
     ]})
 
 
