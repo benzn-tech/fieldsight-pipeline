@@ -343,11 +343,11 @@ def test_the_company_blind_s3_path_no_longer_exists():
 
 def test_claude_and_dashscope_are_not_top_level_imports():
     """C2: llm_utils/dashscope_utils must be imported lazily inside
-    _rag_answer, not at module top level. deploy-lambda-code.sh zips
-    lambda_ask_agent.py + transcript_utils.py + llm_utils.py for prod, but
-    dashscope_utils.py is NOT in that bundle -- a top-level import would
-    ImportModuleError the whole module (killing the legacy path too) the
-    instant this file reaches prod."""
+    _rag_answer, not at module top level. Written for the legacy hand-built
+    prod lambdas, whose minimal zip had no dashscope_utils.py (a top-level
+    import would have failed the whole module there). That minimal zip was
+    deleted with those lambdas on 2026-10-31 and SAM bundles all of src/;
+    the guard stays so importing the module never pulls vendor SDKs."""
     assert not hasattr(laa, "llm_utils")
     assert not hasattr(laa, "dashscope_utils")
 
