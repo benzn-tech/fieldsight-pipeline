@@ -315,6 +315,16 @@ Parameters:
       caller's last five conversations. Anything but 'true' is off. Set via
       TEST_ASK_THREADS / PROD_ASK_THREADS; an unset var keeps it off.
 
+  CompanyStatusEnforce:
+    Type: String
+    Default: 'off'
+    AllowedValues: ['on', 'off']
+    Description: >-
+      Company offboarding (spec 2026-11-01): 'on' makes tenancy_status block
+      callers of suspended/exited companies; 'off' only logs
+      COMPANY_GATE_WOULD_BLOCK. Set via TEST_COMPANY_STATUS_ENFORCE /
+      PROD_COMPANY_STATUS_ENFORCE (literally on or off); an unset var keeps it off.
+
   AskJudgeModel:
     Type: String
     Default: ''
@@ -1977,6 +1987,8 @@ Resources:
         - !Ref AWS::NoValue
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           S3_BUCKET: !Ref DataBucketName
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-5-5
@@ -2191,6 +2203,8 @@ Resources:
         - !Ref AWS::NoValue
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           S3_BUCKET: !Ref IngestBucketName   # the lake — where org-api enqueues the request
           # Email is stub (logs, sends nothing) until an SES identity is verified as
           # part of the DNS/SES work; flip to 'ses' + set SENDER_EMAIL then.
@@ -2868,6 +2882,8 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           ENABLE_TODO_COLLAPSE: !Ref EnableTodoCollapse
           VOICE_SESSION_SIGNING_KEY: !If [HasVoiceLlm, !Ref VoiceSessionSigningKey, !Ref AWS::NoValue]
           # Deploy-time credential injection — see MigrateFunction notes.
@@ -3366,6 +3382,14 @@ Resources:
             - Effect: Allow
               Action: s3:GetObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/exports/*
+        # Company offboarding (spec 2026-11-01 §5.3): POST /companies/{id}/status leaves a
+        # company_status_requests/{company_id}/{event_id}.json marker for LakeOps's Cognito
+        # task, the same way and for the same reason as export_requests/ above. Write only.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/company_status_requests/*
       Events:
         OrgProxy:
           Type: Api
@@ -3412,9 +3436,15 @@ Resources:
   #   drain_lake_manifest   -- fold lake_manifest/ lines into lake_objects (hourly, below)
   #   backfill_lake_objects -- one-off walk of the bucket(s), dry-run by default
   #   export_company        -- one company's lake data as zip parts under exports/
-  #   export_tick           -- every 10 minutes: advance one pending export_requests/ item
+  #   export_tick           -- every 10 minutes: first the company-status Cognito executor
+  #                            (company_status_requests/, spec 2026-11-01 §5.3), then advance
+  #                            one pending export_requests/ item
+  #   company_status_cognito -- direct invoke: sweep one company's Cognito work rows
+  #                            ({"event_id"} and/or {"company_id"}) when a marker was lost
   # No function invokes another here: the VPC has no route to the Lambda API, so the export
-  # route leaves a request object in S3 and export_tick (S3 first, no DB when idle) resumes it.
+  # and company-status routes leave a request object in S3 and export_tick (S3 first, no DB
+  # when idle) picks it up. Cognito is reached through the CognitoIdpEndpoint interface
+  # endpoint (infra/db-template.yaml), which admits LambdaSG -- LakeOps' security group.
   #
   # NO ReservedConcurrentExecutions and NO API events: the mobile upload path must never
   # share a pool with a 15-minute export.
@@ -3439,6 +3469,8 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           # Deploy-time credential injection -- same as OrgApiFunction.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
@@ -3501,6 +3533,19 @@ Resources:
               # export_tick deletes a request object once its export is done.
               Action: s3:DeleteObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/export_requests/*
+            - Effect: Allow
+              # The company-status Cognito executor deletes a request object once the
+              # company has no retryable work row left (marker written by OrgApiFunction).
+              Action: s3:DeleteObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/company_status_requests/*
+            - Effect: Allow
+              # Company offboarding (spec 2026-11-01 §5.3): disable + global sign-out of an
+              # inactive company's home users, enable on reactivation. Username = the sub.
+              Action:
+                - cognito-idp:AdminDisableUser
+                - cognito-idp:AdminEnableUser
+                - cognito-idp:AdminUserGlobalSignOut
+              Resource: !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${OrgUserPoolId}
       Events:
         # Hourly. Each run lists lake_manifest/ in S3 first and opens no database connection
         # when it is empty (so Aurora can still auto-pause), otherwise it drains in passes
@@ -3514,8 +3559,10 @@ Resources:
             Description: Fold the lake manifest into lake_objects (S3 only when idle)
             State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
             Input: '{"task": "drain_lake_manifest"}'
-        # Advances one pending company export. Lists export_requests/ in S3 first and opens no
-        # database connection when there is nothing to do, so this does not keep Aurora awake.
+        # Runs the company-status Cognito executor, then advances one pending company export.
+        # Both list their prefix (company_status_requests/, export_requests/) in S3 first and
+        # open no database connection when there is nothing to do, so this does not keep
+        # Aurora awake.
         ExportTick:
           Type: Schedule
           Properties:
@@ -4085,6 +4132,8 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           # Idle-close threshold AND group merge's quiet test (spec section 8).
           IDLE_CLOSE_MINUTES: !Ref IdleCloseMinutes
@@ -4691,6 +4740,8 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           ENABLE_TODO_COLLAPSE: !Ref EnableTodoCollapse
           ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           GROUP_MERGE_CAP: !Ref GroupMergeCap
@@ -5304,6 +5355,8 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
@@ -5413,6 +5466,8 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
@@ -5560,6 +5615,8 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
           PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
@@ -5616,6 +5673,8 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
           PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
@@ -6458,6 +6517,8 @@ Resources:
       MemorySize: 256
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           S3_BUCKET: !Ref DataBucketName
           # Both stacks publish to one namespace. Without a dimension they
           # write the SAME series: test's backlog would page prod, and if the
@@ -6508,8 +6569,11 @@ Resources:
                 - !Sub arn:aws:s3:::${DataBucketName}/extraction_requests/*
                 - !Sub arn:aws:s3:::${DataBucketName}/extraction_pending/*
                 - !Sub arn:aws:s3:::${DataBucketName}/notices/external_member/*
+                # Company offboarding (Task 9): a notice is HELD while its site's company
+                # is suspended / exited; the published directory says which are.
+                - !Sub arn:aws:s3:::${DataBucketName}/config/directory.json
             # External-member notices: sent -> copied to notices/sent/, original deleted;
-            # unsent after 24 h -> deleted.
+            # unsent after 24 h -> deleted; held -> copied onto itself (expiry clock restarts).
             - Effect: Allow
               Action:
                 - s3:PutObject

@@ -16,6 +16,7 @@ SELF+WORKERS (site_manager) branch. platform_admin's list_all_sites REPLACES
 (never adds to) the membership query, same for admin/gm's list_company_sites.
 Net: +0 queries for pm/regional/worker vs the legacy accessible_site_ids call,
 +1 for site_manager."""
+import tenancy_status
 from repositories import acl, memberships, sites
 
 
@@ -88,6 +89,16 @@ def visible_scope(conn, caller) -> dict:
             if (home_tier == "SITE" and ext_tier == "SITE") or (
                     home_tier == "SELF" and ext_tier == "SELF"):
                 site_ids.add(sid)
+
+    # Company offboarding choke point (spec 2026-11-01 §5.2): a site whose company is not
+    # 'active' leaves the reach of every non-platform-admin caller, external memberships
+    # included. Applied BEFORE the author tier / worker set below are derived, so nothing is
+    # computed from a hidden site. None (flag off, platform_admin, nobody inactive, not
+    # migrated) -> nothing dropped.
+    inactive = tenancy_status.inactive_site_ids(conn, caller)
+    site_ids = tenancy_status.drop_inactive(site_ids, inactive)
+    site_roles = tenancy_status.drop_inactive(site_roles, inactive)
+    external_pm = tenancy_status.drop_inactive(external_pm, inactive)
 
     user_scope = acl.visible_user_scope(global_role, site_roles.values())
 

@@ -7,6 +7,7 @@ import logging
 
 from db.connection import get_connection
 from repositories import users, ws_connections
+import tenancy_status
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -23,6 +24,12 @@ def lambda_handler(event, context):
             caller = users.get_user_by_sub(conn, sub)
             if caller is None or not caller["company_id"]:
                 logger.warning("ws connect refused: sub %s not provisioned", sub)
+                return {"statusCode": 403}
+            # Company offboarding gate (spec 2026-11-01 §5.1, §5.4): refused like an
+            # unprovisioned caller. Flag off: logs and allows.
+            blocked = tenancy_status.caller_blocked(conn, caller, where="ws-connect")
+            if blocked:
+                logger.warning("ws connect refused: sub %s %s", sub, blocked)
                 return {"statusCode": 403}
             ws_connections.upsert_connection(
                 conn, connection_id, caller["id"], caller["company_id"])

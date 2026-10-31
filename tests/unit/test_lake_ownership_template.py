@@ -239,6 +239,7 @@ def test_delete_is_confined_to_the_manifest_for_lake_ops_and_added_nowhere_else(
             resources = re.findall(r"arn:aws:s3:::\$\{\w+\}[^\s]*", s)
             assert resources and all(
                 r.endswith("/lake_manifest/*") or r.endswith("/export_requests/*")
+                or r.endswith("/company_status_requests/*")
                 for r in resources), s
     deleters = {name for name, block in res.items()
                 if any(_has_action(s, "s3:DeleteObject") for s in _statements(block))}
@@ -424,3 +425,27 @@ def test_lake_manifest_and_exports_match_no_s3_trigger():
 
 def _eventbridge_key_rules():
     return re.findall(r"^\s+- (prefix|suffix): (\S+)$", _text(), re.M)
+
+
+def test_lake_ops_runs_the_company_status_cognito_executor():
+    """Company offboarding (spec 2026-11-01 §5.3, Task 8): LakeOps calls the three Cognito
+    admin actions on the org pool -- nothing broader -- and deletes only its own markers.
+    Reads of the marker are already bucket-wide (GetObject / ListBucket on IngestBucketName)."""
+    block = _resources()["LakeOpsFunction"]
+    stmts = _statements(block)
+    cog = [s for s in stmts if "cognito-idp:" in s]
+    assert len(cog) == 1, cog
+    assert sorted(re.findall(r"cognito-idp:\w+", cog[0])) == [
+        "cognito-idp:AdminDisableUser", "cognito-idp:AdminEnableUser",
+        "cognito-idp:AdminUserGlobalSignOut"]
+    assert ("Resource: !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}"
+            ":userpool/${OrgUserPoolId}") in cog[0]
+    assert any(_has_action(s, "s3:DeleteObject")
+               and "${IngestBucketName}/company_status_requests/*" in s for s in stmts)
+    assert any(_has_action(s, "s3:GetObject") and "${IngestBucketName}/*" in s for s in stmts)
+    assert any(_has_action(s, "s3:ListBucket") and "${IngestBucketName}" in s for s in stmts)
+    assert "COGNITO_USER_POOL_ID: !Ref OrgUserPoolId" in _env_block(block)
+    # The org-api writes the marker into the same bucket (LAKE_BUCKET = IngestBucketName).
+    org = [s for s in _statements(_resources()["OrgApiFunction"])
+           if "company_status_requests/*" in s]
+    assert org and _has_action(org[0], "s3:PutObject") and "${IngestBucketName}" in org[0]

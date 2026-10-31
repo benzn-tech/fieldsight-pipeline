@@ -22,6 +22,12 @@ SHAPE (keyed by identity -- the recording folder -- not by display name)::
      "sites":  {"<site id>": {"slug", "name", "location", "client",
                               "company_id"}}}
 
+INACTIVE COMPANIES (company offboarding, spec 2026-11-01 §5.5). When any company is
+suspended or exited the document also carries
+`"inactive_companies": {"<company id>": "suspended"|"exited"}` -- absent when none is,
+so the document is unchanged until the first status change. The non-VPC senders use it
+(suppress_reason below) to hold customer email and skip generated reports.
+
 SITES ARE KEYED BY ID, NOT SLUG. A slug is unique per company only
 (`idx_sites_company_slug`), so a slug-keyed document lets two tenants'
 `main-site` overwrite one another and stamps one company's name and weather on
@@ -40,6 +46,7 @@ import json
 import logging
 
 import site_coords
+import tenancy_status
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +80,7 @@ def display_name(first, last):
 
 
 def build(user_rows, membership_rows, site_rows, published_at, activity=None,
-          external_user_ids=()):
+          external_user_ids=(), company_statuses=None):
     """Rows from Aurora -> the document.
 
     `user_rows`: live users (archived already excluded) with folder_name,
@@ -86,6 +93,8 @@ def build(user_rows, membership_rows, site_rows, published_at, activity=None,
     site among several.
     `external_user_ids`: users who have EVER held an external membership (archived included). Each person gets
     `has_external` true/false; the external sites themselves are NOT listed.
+    `company_statuses`: {company id: status} (tenancy_status.company_statuses); the
+    companies that are not 'active' become `inactive_companies`.
     """
     ext = {str(x) for x in (external_user_ids or ())}
     sites = {}
@@ -123,8 +132,13 @@ def build(user_rows, membership_rows, site_rows, published_at, activity=None,
             "sites": mine,
             "has_external": uid in ext,
         }
-    return {"version": VERSION, "published_at": published_at,
-            "people": dict(sorted(people.items())), "sites": dict(sorted(sites.items()))}
+    doc = {"version": VERSION, "published_at": published_at,
+           "people": dict(sorted(people.items())), "sites": dict(sorted(sites.items()))}
+    inactive = {str(cid): st for cid, st in (company_statuses or {}).items()
+                if st and st != tenancy_status.ACTIVE}
+    if inactive:
+        doc["inactive_companies"] = dict(sorted(inactive.items()))
+    return doc
 
 
 def primary_site(user_id, site_ids, act):
@@ -208,6 +222,29 @@ def company_of_folder(doc, folder):
     p = ((doc or {}).get("people") or {}).get(folder)
     cid = p.get("company_id") if isinstance(p, dict) else None
     return str(cid) if cid else None
+
+
+def company_status(doc, company_id):
+    """A company's status as published: 'suspended' / 'exited' when listed under
+    `inactive_companies`, else 'active' (also for a document published before any
+    status change, or by code that predates the key)."""
+    if company_id is None:
+        return tenancy_status.ACTIVE
+    inactive = (doc or {}).get("inactive_companies") or {}
+    return inactive.get(str(company_id)) or tenancy_status.ACTIVE
+
+
+def suppress_reason(doc, *, site_id=None, company_id=None, where=""):
+    """tenancy_status.suppress_reason for the senders that cannot reach Aurora: the
+    SITE's company from the document's `sites` -- else, for a site-less item or a site
+    the document does not list, `company_id` (the recipient's / folder owner's home
+    company). 'company_inactive' or None; flag and shadow log as suppress_decision."""
+    site = ((doc or {}).get("sites") or {}).get(str(site_id)) if site_id else None
+    cid = (site or {}).get("company_id") or company_id
+    if cid is None:
+        return None
+    return tenancy_status.suppress_decision(cid, company_status(doc, cid), where=where,
+                                            site_id=site_id)
 
 
 def names_by_folder(doc):

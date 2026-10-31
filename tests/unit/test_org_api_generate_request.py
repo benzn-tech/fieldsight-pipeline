@@ -348,3 +348,90 @@ def test_the_companys_glossary_travels_with_the_request(day, monkeypatch):
     assert json.loads(puts[0]["Body"])["reportFacts"]["aliases"] == [
         {"wrong_term": "Tikaha", "right_term": "TEKAHA"}]
     assert seen == {"cid": "c-uuid-1", "site_ids": [SITE_ID]}
+
+
+# ----------------------------------------------------------
+# Company offboarding, Task 9 (spec 2026-11-01 §5.5): a report about an inactive
+# company's site is not emailed. The worker has no database, so org-api decides at
+# the enqueue: the request goes as a download, recipients dropped, `emailSuppressed`
+# on the artifact and in the 202. Keyed by the SITE's company; site-less -> the folder
+# owner's home company.
+# ----------------------------------------------------------
+
+import logging  # noqa: E402
+
+import tenancy_status  # noqa: E402
+
+
+def _statuses(monkeypatch, sites=None, companies=None):
+    monkeypatch.setattr(tenancy_status, "site_company_status",
+                        lambda conn, sid: (sites or {}).get(str(sid)))
+    monkeypatch.setattr(tenancy_status, "company_status",
+                        lambda conn, cid: (companies or {}).get(str(cid), "active"))
+
+
+def _email_day(day):
+    res, puts = _generate_raw(day, {"deliver": "email", "recipients": ["a@x.nz"]})
+    assert res["statusCode"] == 202, res
+    return json.loads(res["body"]), json.loads(puts[0]["Body"])
+
+
+def test_day_email_for_an_inactive_site_company_is_suppressed(day, monkeypatch):
+    monkeypatch.setenv("COMPANY_STATUS_ENFORCE", "on")
+    _statuses(monkeypatch, sites={SITE_ID: ("c-site", "suspended")})
+    body, artifact = _email_day(day)
+    assert artifact["deliver"] == "download" and artifact["recipients"] == []
+    assert artifact["emailSuppressed"] == "company_inactive"
+    assert body["emailSuppressed"] == "company_inactive"
+
+
+def test_day_email_for_an_active_site_company_is_unchanged(day, monkeypatch):
+    monkeypatch.setenv("COMPANY_STATUS_ENFORCE", "on")
+    # The folder owner's home company does not decide when there is a site.
+    _statuses(monkeypatch, sites={SITE_ID: ("c-site", "active")},
+              companies={"c-owner": "suspended"})
+    monkeypatch.setattr(org.users, "get_by_folder_name_global",
+                        lambda conn, folder: {"id": "u-2", "company_id": "c-owner"})
+    body, artifact = _email_day(day)
+    assert artifact["deliver"] == "email" and artifact["recipients"] == ["a@x.nz"]
+    assert "emailSuppressed" not in artifact and "emailSuppressed" not in body
+
+
+def test_day_email_flag_off_sends_and_logs(day, monkeypatch, caplog):
+    monkeypatch.setenv("COMPANY_STATUS_ENFORCE", "off")
+    caplog.set_level(logging.WARNING)
+    _statuses(monkeypatch, sites={SITE_ID: ("c-site", "exited")})
+    body, artifact = _email_day(day)
+    assert artifact["deliver"] == "email" and "emailSuppressed" not in artifact
+    assert any("COMPANY_GATE_WOULD_SUPPRESS" in r.getMessage()
+               and "where=report-email" in r.getMessage() for r in caplog.records)
+
+
+def test_a_download_reads_no_status(day, monkeypatch):
+    monkeypatch.setenv("COMPANY_STATUS_ENFORCE", "on")
+    monkeypatch.setattr(tenancy_status, "suppress_reason",
+                        lambda *a, **k: pytest.fail("a download is never suppressed"))
+    res, _ = _generate_raw(day, {"deliver": "download"})
+    assert res["statusCode"] == 202
+
+
+def test_session_email_for_an_inactive_site_company_is_suppressed(day, monkeypatch):
+    monkeypatch.setenv("COMPANY_STATUS_ENFORCE", "on")
+    _statuses(monkeypatch, sites={SITE_ID: ("c-site", "exited")})
+    res, puts = _session_generate_raw(day, S1300, {"deliver": "email", "recipients": ["a@x.nz"]})
+    assert res["statusCode"] == 202, res
+    artifact = json.loads(puts[0]["Body"])
+    assert artifact["deliver"] == "download" and artifact["recipients"] == []
+    assert artifact["emailSuppressed"] == "company_inactive"
+    assert json.loads(res["body"])["emailSuppressed"] == "company_inactive"
+
+
+def test_site_less_report_uses_the_folder_owners_home_company(monkeypatch):
+    monkeypatch.setenv("COMPANY_STATUS_ENFORCE", "on")
+    _statuses(monkeypatch, companies={"c-owner": "suspended", "c-other": "active"})
+    owners = {"Ada_L": {"company_id": "c-owner"}, "Bo_K": {"company_id": "c-other"}}
+    monkeypatch.setattr(org.users, "get_by_folder_name_global",
+                        lambda conn, folder: owners.get(folder))
+    assert org._report_email_suppression("C", "email", [], "Ada_L") == "company_inactive"
+    assert org._report_email_suppression("C", "email", [None], "Bo_K") is None
+    assert org._report_email_suppression("C", "download", [], "Ada_L") is None
