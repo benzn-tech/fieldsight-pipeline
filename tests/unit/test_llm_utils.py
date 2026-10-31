@@ -259,6 +259,8 @@ def test_the_anthropic_path_honours_it_too(monkeypatch):
     shape: flipping LLM_PROVIDER would quietly drop it."""
     monkeypatch.setattr(lu, "LLM_TEMPERATURE", 0.0)
     monkeypatch.setattr(lu, "ANTHROPIC_API_KEY", "k")
+    # A 4.x id on purpose: 5.x omits temperature by design (test_anthropic_5x_payload).
+    monkeypatch.setattr(lu, "CLAUDE_MODEL", "claude-sonnet-4-6")
     sent = {}
     monkeypatch.setattr(lu, "_post_with_retry",
                         lambda url, body, headers: (sent.update(body=json.loads(body)), (None, "stop"))[1])
