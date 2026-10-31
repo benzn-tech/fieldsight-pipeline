@@ -98,6 +98,15 @@ def test_get_action_item_carries_topic_source(db):
     assert action_items.get_action_item(db, reg_item)["topic_source"] == "ai"
 
 
+def test_patch_response_carries_source(db):
+    d = _day(db)
+    resp = lambda_org_api.patch_action_item(db, d["caller"], str(d["agent_item"]),
+                                            {"priority": "high"})
+    assert resp["statusCode"] == 200, resp["body"]
+    body = json.loads(resp["body"])
+    assert body["source"] == "agent" and body["priority"] == "high"
+
+
 def test_agent_topic_untouched_by_supersede_of_the_day(db):
     """§3.4 check (a): the re-extraction and nightly supersede paths key on source_s3_key
     (exact key, or an escaped `extractions/{folder}/{date}/` prefix) and never reach an

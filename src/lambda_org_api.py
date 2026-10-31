@@ -7943,6 +7943,8 @@ def patch_action_item(conn, caller, action_item_id, body):
         return error("action item not found", 404)
     # ADDITIVE (action packs spec §14 D1): the item's per-site task number, null when none.
     updated["task_no"] = _task_numbers(conn, [updated["id"]]).get(str(updated["id"]))
+    # ADDITIVE (D2): the parent topic's source, from the ACL read above -- no extra query.
+    updated["source"] = row.get("topic_source")
     return ok(updated)
 
 
