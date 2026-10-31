@@ -37,6 +37,20 @@ def _key(tmp_path):
     return str(kf)
 
 
+def test_a_labelled_key_file_yields_the_bare_key(tmp_path):
+    kf = tmp_path / "labelled.key"
+    kf.write_text("field_sight_v2=" + KEY + "\n", encoding="utf-8")
+    keys = []
+
+    def spawn(cmd, env):
+        keys.append(env["ANTHROPIC_API_KEY"])
+        return 0, json.dumps({"call": cmd[-1], "model": env["CLAUDE_MODEL"], "ok": True,
+                              "status": 200, "stop_reason": "end_turn", "text_len": 5})
+    A.run(["--key-file", str(kf)], src_dir=_src(tmp_path, True), spawn=spawn,
+          stdout=io.StringIO())
+    assert keys == [KEY, KEY]
+
+
 def test_gate_read_from_source(tmp_path):
     assert A.has_5x_gate(_src(tmp_path, False)) is False
     assert A.has_5x_gate(_src(tmp_path, True)) is True

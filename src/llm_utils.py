@@ -34,7 +34,7 @@ logger.setLevel(logging.INFO)
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic")
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 
 def _optional_float(name):
     """A knob that is UNSET must stay unsent, not become 0.0. Sending a default
@@ -221,7 +221,8 @@ def call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None,
     ceiling is MAX_ATTEMPTS x HTTP_TIMEOUT plus backoff and outlives every
     gateway this repo serves through.
 
-    enable_thinking (qwen path only; the anthropic path ignores it):
+    enable_thinking (qwen path; on the anthropic path only Claude 5.x reads it,
+    False there meaning effort low, and 4.x ignores it):
       None  - use the QWEN_ENABLE_THINKING env default (every pre-existing
               caller keeps its exact behaviour).
       True  - force thinking mode for THIS call.
@@ -251,7 +252,10 @@ def call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None,
     if LLM_PROVIDER == "qwen":
         return _call_qwen(prompt, max_tokens, force_json, enable_thinking, model,
                           deadline=deadline, caller=caller)
-    return _call_anthropic(prompt, max_tokens, deadline=deadline, caller=caller)
+    # Passed only when there IS one, so a stub of the old four-argument shape keeps
+    # working -- the same rule `_bound` follows for the deadline below.
+    _think = {"enable_thinking": enable_thinking} if enable_thinking is not None else {}
+    return _call_anthropic(prompt, max_tokens, deadline=deadline, caller=caller, **_think)
 
 
 def active_model(enable_thinking=None):
@@ -392,17 +396,44 @@ def _post_with_retry(url, body, headers, deadline=None, clock=None,
     return None, last_error
 
 
-def _call_anthropic(prompt, max_tokens, deadline=None, caller="unknown"):
+def _is_claude_5x(model):
+    """Claude 5.x ids (`claude-sonnet-5-5`, `claude-haiku-5-5`), by the major right
+    after the family name. `claude-haiku-4-5-20251001` carries a "-5-" as well, so a
+    looser test would move a 4.x payload -- and those must stay byte for byte."""
+    return bool(re.match(r"^claude-[a-z]+-5-", model or ""))
+
+
+def _call_anthropic(prompt, max_tokens, deadline=None, caller="unknown",
+                    enable_thinking=None):
     if not ANTHROPIC_API_KEY:
         logger.error("ANTHROPIC_API_KEY not set")
         return None, "ANTHROPIC_API_KEY not configured"
+    is5 = _is_claude_5x(CLAUDE_MODEL)
     payload = {
         "model": CLAUDE_MODEL,
         "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": prompt}],
     }
-    if LLM_TEMPERATURE is not None:
-        payload["temperature"] = LLM_TEMPERATURE
+    if not is5:
+        if LLM_TEMPERATURE is not None:
+            payload["temperature"] = LLM_TEMPERATURE
+    else:
+        # Claude 5.x (spec 2026-10-31 Part C). Three differences, all forced by the
+        # model, none by taste:
+        # * no temperature -- Haiku 5.5 answers 400 to non-default sampling, and
+        #   Sonnet 5.5 is treated the same rather than discovered the same way;
+        # * thinking is ON by default and its tokens count against max_tokens, so the
+        #   caller's number stays the ANSWER budget and the headroom goes on top --
+        #   the same rule, for the same measured reason, as `_openrouter_fields`;
+        # * effort, never `thinking.type=disabled` or `budget_tokens`. A caller that
+        #   asked for the fast path for THIS call gets `low`, which beats the deploy's
+        #   setting exactly as it does on the OpenRouter path; otherwise the deploy's
+        #   level when it names one; otherwise nothing, the model's own default.
+        payload["max_tokens"] = max_tokens + REASONING_HEADROOM_TOKENS
+        if enable_thinking is False:
+            payload["output_config"] = {"effort": "low"}
+        elif LLM_REASONING_EFFORT in VALID_EFFORTS:
+            payload["output_config"] = {"effort": LLM_REASONING_EFFORT}
     body = json.dumps(payload)
     # Passed only when there IS one. "Inert by default" has to include the call
     # SHAPE, not just the behaviour: 65 existing tests stub this helper with the
@@ -448,6 +479,21 @@ def _call_anthropic(prompt, max_tokens, deadline=None, caller="unknown"):
             )
         except Exception:  # noqa: BLE001 - telemetry must never break the call
             logger.warning("LLM_USAGE logging failed (anthropic)", exc_info=True)
+        if is5:
+            # A 200 is not an answer. With thinking on, a budget spent thinking comes
+            # back as thinking blocks only and stop_reason max_tokens -- joined, that
+            # is "", and a caller that trusts the 200 writes a blank report for a
+            # real day. The qwen path learned this on muse; the 5.x models reason by
+            # default, so the same shape is the likeliest failure here. Gated to 5.x
+            # with the rest of this change: 4.x behaviour stays exactly as it was.
+            stop = data.get("stop_reason")
+            if stop == "refusal":
+                logger.error("Claude refused: model=%s", data.get("model") or CLAUDE_MODEL)
+                return None, "refusal"
+            if stop == "max_tokens" and not "".join(blocks).strip():
+                logger.error("Claude hit max_tokens before any text: max_tokens=%s model=%s",
+                             payload["max_tokens"], data.get("model") or CLAUDE_MODEL)
+                return None, "max_tokens before any text"
         return "\n".join(blocks), None
     msg = data.get("error", {}).get("message", f"HTTP {resp.status}")
     logger.error(f"Claude API error: {msg}")
@@ -471,6 +517,45 @@ def _is_dashscope(base_url):
 
 def _is_mimo(model):
     return (model or "").startswith("xiaomi/mimo")
+
+
+def _is_muse(model):
+    return (model or "").startswith("meta/muse")
+
+
+def parse_reasoning(raw, model=None, name="reasoning"):
+    """OpenRouter `reasoning` from a per-function setting: off, low, medium or high.
+    Unset or empty means None (no key at all, the payload as before); anything else
+    is warned about, naming `name`, and also None.
+
+    Shared by the Ask judge (ASK_JUDGE_REASONING) and the template digitise read
+    (TEMPLATE_DIGITISE_REASONING) so the two cannot drift. `model`, when given, is the
+    model the setting will reach: muse refuses `{"enabled": false}` with a hard 400
+    ("Reasoning is mandatory for this endpoint", see `_openrouter_fields`), so `off`
+    aimed at muse is dropped with a warning rather than failing every call. The judge
+    passes no model and keeps exactly the behaviour it had.
+    """
+    raw = (raw or "").strip().lower()
+    if not raw:
+        return None
+    if raw == "off":
+        if model is not None and _is_muse(model):
+            logger.warning("%s=off ignored for %s: muse cannot disable reasoning; "
+                           "sending no reasoning setting", name, model)
+            return None
+        return {"enabled": False}
+    if raw in VALID_EFFORTS:
+        return {"effort": raw}
+    logger.warning("%s value not recognised "
+                   "(expected off|low|medium|high); sending no reasoning", name)
+    return None
+
+
+def parse_provider(raw):
+    """`{"only": [...], "allow_fallbacks": False}` from a comma-separated list of
+    OpenRouter endpoint tags (e.g. "coreweave/fp8"), or None when there are none."""
+    tags = [t.strip() for t in (raw or "").split(",") if t.strip()]
+    return {"only": tags, "allow_fallbacks": False} if tags else None
 
 
 def _openrouter_fields(payload, max_tokens, force_json, enable_thinking, thinking):
@@ -682,7 +767,8 @@ PARTS_CUT_OFF = "answer cut off: "
 
 
 def call_llm_parts(parts, *, model, max_tokens, force_json=True, temperature=0,
-                   fallback_env=None, deadline=None, caller="unknown"):
+                   fallback_env=None, deadline=None, caller="unknown",
+                   reasoning=None, provider=None):
     """One user message made of content parts (text + image_url / file) -> (text, None)
     or (None, error). OpenRouter path only.
 
@@ -692,11 +778,19 @@ def call_llm_parts(parts, *, model, max_tokens, force_json=True, temperature=0,
     -- it would invent checklist items that no code check can tell from real ones
     (template digitise spec 2026-10-16, section 3).
 
-    The request is built here and not by `_openrouter_fields`: no `reasoning` field, no
-    reasoning headroom, and an explicit temperature. That is the request the 2026-10-16
-    spike measured; the text path's effort and headroom were never measured on a vision
-    read. Retries, the empty-answer check and the LLM_USAGE line come from
+    The request is built here and not by `_openrouter_fields`: by default no `reasoning`
+    field, no reasoning headroom, and an explicit temperature. That is the request the
+    2026-10-16 spike measured; the text path's effort and headroom were never measured on
+    a vision read. Retries, the empty-answer check and the LLM_USAGE line come from
     `_qwen_attempt`, unchanged.
+
+    `reasoning` / `provider` (spec 2026-10-31 B2) are the caller's already-parsed
+    OpenRouter fields (`parse_reasoning` / `parse_provider`), so a move off gemini is a
+    setting the caller measured, not the text path's. Both None is the request above,
+    byte for byte. They ride on `model` only, never on a fallback -- an endpoint pin
+    naming one vendor fails on another's model, the Ask judge's rule. With an effort
+    set the answer budget gets REASONING_HEADROOM_TOKENS on top: reasoning tokens are
+    completion tokens and are spent before the answer. Reasoning off adds nothing.
 
     Two failures are told apart by a stable prefix on the error, because retrying either
     one later cannot help:
@@ -731,15 +825,24 @@ def call_llm_parts(parts, *, model, max_tokens, force_json=True, temperature=0,
             break
         payload = {"model": name, "messages": [{"role": "user", "content": parts}],
                    "temperature": temperature, "max_tokens": max_tokens}
+        if i == 0 and reasoning:
+            payload["reasoning"] = reasoning
+            # Only an effort thinks. `{"enabled": false}` spends nothing on reasoning,
+            # so the caller's number stays the whole budget -- as on the MiMo path.
+            if "effort" in reasoning:
+                payload["max_tokens"] = max_tokens + REASONING_HEADROOM_TOKENS
+        if i == 0 and provider:
+            payload["provider"] = provider
         if force_json:
             payload["response_format"] = {"type": "json_object"}
         info = {}
         text, err, movable = _qwen_attempt(payload, False, remaining, caller, info=info)
         if info.get("finish_reason") == "length":
             # Truncated JSON (err None) or an empty answer (err set): either way the
-            # budget, not the vendor, is what stopped it.
+            # budget, not the vendor, is what stopped it. The number on the wire, so a
+            # reader sizing the next budget sees the one that was actually spent.
             return None, PARTS_CUT_OFF + "finish_reason=length at max_tokens=%d (%s)" % (
-                max_tokens, name)
+                payload["max_tokens"], name)
         if err is None:
             return text, None
         if len(chain) == 1 or not movable:

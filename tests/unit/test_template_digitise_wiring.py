@@ -29,8 +29,12 @@ for _tag in ("!Sub", "!Ref", "!If", "!Not", "!Equals", "!GetAtt", "!FindInMap",
     _Loader.add_constructor(_tag, lambda loader, node: getattr(node, "value", None))
 
 
+def _template():
+    return _yaml.load(io.open(TEMPLATE, encoding="utf-8").read(), Loader=_Loader)
+
+
 def _resources():
-    return _yaml.load(io.open(TEMPLATE, encoding="utf-8").read(), Loader=_Loader)["Resources"]
+    return _template()["Resources"]
 
 
 def _fn(name="TemplateDigitiseFunction"):
@@ -76,7 +80,11 @@ def test_the_worker_reads_no_text_fallback_chain_and_has_its_own_empty_one():
     env = _fn()["Environment"]["Variables"]
     assert env["LLM_FALLBACK_MODELS"] == "", "Globals' text chain must not leak in"
     assert env["TEMPLATE_DIGITISE_FALLBACK_MODELS"] == ""
-    assert env["TEMPLATE_DIGITISE_MODEL"] == "google/gemini-3.8-flash"
+    # A parameter now (spec 2026-10-31 B2): the model moves by a repo variable, and the
+    # default is still the one the 2026-10-16 gate measured.
+    assert env["TEMPLATE_DIGITISE_MODEL"] == "TemplateDigitiseModel"  # !Ref, by name
+    assert _template()["Parameters"]["TemplateDigitiseModel"]["Default"] == (
+        "google/gemini-3.8-flash")
     assert env["LLM_CHAIN_BUDGET_SECONDS"] == "840"
     assert int(env["LLM_HTTP_TIMEOUT"]) < 900
     assert "QWEN_API_KEY" in env and "QWEN_BASE_URL" in env
@@ -185,3 +193,64 @@ def test_org_api_can_tell_a_missing_key_from_a_denied_one_on_all_three():
     prefixes = _list_prefixes(_fn("OrgApiFunction"))
     for p in ("template_sources/*", "template_digitise_requests/*", "template_digitise_results/*"):
         assert p in prefixes, f"{p}: a missing key would read as AccessDenied (500), not 404"
+
+
+# ---- per-model settings (spec 2026-10-31 B2) --------------------------------------
+WORKFLOWS = {"TEST": os.path.join(REPO, ".github", "workflows", "deploy.yml"),
+             "PROD": os.path.join(REPO, ".github", "workflows", "deploy-prod.yml")}
+KNOBS = {"TemplateDigitiseModel": "TEMPLATE_DIGITISE_MODEL",
+         "TemplateDigitiseReasoning": "TEMPLATE_DIGITISE_REASONING",
+         "TemplateDigitiseProvider": "TEMPLATE_DIGITISE_PROVIDER",
+         "TemplateDigitisePdfModel": "TEMPLATE_DIGITISE_PDF_MODEL"}
+
+
+def test_the_settings_reach_the_worker_and_default_to_todays_request():
+    """Inert on deploy: an unset repo variable must reproduce the request shipped
+    2026-10-16 -- gemini, no reasoning, no pin, PDFs to the same model."""
+    params = _template()["Parameters"]
+    env = _fn()["Environment"]["Variables"]
+    for param, var in KNOBS.items():
+        assert env[var] == param, f"{var} is not wired to {param}"
+    assert params["TemplateDigitiseReasoning"]["Default"] == ""
+    assert params["TemplateDigitiseProvider"]["Default"] == ""
+    assert params["TemplateDigitisePdfModel"]["Default"] == ""
+    assert params["TemplateDigitiseReasoning"]["AllowedPattern"] == "^(|off|low|medium|high)$"
+
+
+BACKSLASH = chr(92)  # the line continuation after a sam deploy argument
+_STRIP = "| tr -d '[:space:]'"
+_LOWER = "| tr '[:upper:]' '[:lower:]'"
+# (parameter, variable suffix, shell value, lowercased)
+_SETTINGS = (("TemplateDigitiseModel", "TEMPLATE_DIGITISE_MODEL", "TD_MODEL", False),
+             ("TemplateDigitiseReasoning", "TEMPLATE_DIGITISE_REASONING", "TD_REASONING", True),
+             ("TemplateDigitiseProvider", "TEMPLATE_DIGITISE_PROVIDER", "TD_PROVIDER", False),
+             ("TemplateDigitisePdfModel", "TEMPLATE_DIGITISE_PDF_MODEL", "TD_PDF_MODEL", False))
+
+
+def _line_assigning(text, var):
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip().startswith(var + '="$(')]
+    assert len(lines) == 1, f"{var}: expected one normalising assignment, got {lines}"
+    return lines[0]
+
+
+@pytest.mark.parametrize("env", sorted(WORKFLOWS))
+def test_both_workflows_pass_the_settings_from_repo_variables(env):
+    """Normalised in the shell before use: a hand-typed repo variable with a space or
+    a capital must neither split into stray `sam deploy` arguments nor reach the
+    template's AllowedPattern / the endpoint pin as typed."""
+    text = open(WORKFLOWS[env], encoding="utf-8").read()
+    for param, var, shell, lower in _SETTINGS:
+        line = _line_assigning(text, shell)
+        assert "vars.%s_%s" % (env, var) in line, (env, var)
+        assert _STRIP in line, f"{env} {shell}: whitespace not stripped"
+        assert (_LOWER in line) is lower, f"{env} {shell}: lowercase {'missing' if lower else 'unexpected'}"
+        assert '%s_PARAM="%s=$%s"' % (var, param, shell) in text, (env, param)
+    # The model can never be empty: a cleared or blank variable falls back to the
+    # template default, so it is passed unconditionally, quoted.
+    assert 'TD_MODEL="${TD_MODEL:-google/gemini-3.8-flash}"' in text
+    assert '"$TEMPLATE_DIGITISE_MODEL_PARAM" ' + BACKSLASH in text
+    # The other three are '' by default and a bare `Key=` makes SAM exit 2: guarded,
+    # and expanded quoted only when set.
+    for _, var, shell, _ in _SETTINGS[1:]:
+        assert 'if [ -n "$%s" ]; then' % shell in text, (env, shell)
+        assert '${%s_PARAM:+"$%s_PARAM"} ' % (var, var) + BACKSLASH in text, (env, var)

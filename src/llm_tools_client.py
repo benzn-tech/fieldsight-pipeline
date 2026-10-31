@@ -96,30 +96,21 @@ def _primary_model():
             or DEFAULT_MODEL)
 
 
-_REASONING_EFFORTS = ("low", "medium", "high")
-
-
 def _provider_pin():
     """`{"only": [...], "allow_fallbacks": False}` from `ASK_JUDGE_PROVIDER`
-    (comma-separated OpenRouter endpoint tags, e.g. "coreweave/fp8"), or None."""
-    raw = os.environ.get("ASK_JUDGE_PROVIDER") or ""
-    tags = [t.strip() for t in raw.split(",") if t.strip()]
-    return {"only": tags, "allow_fallbacks": False} if tags else None
+    (comma-separated OpenRouter endpoint tags, e.g. "coreweave/fp8"), or None.
+    The parser is shared with the template digitise read (llm_utils)."""
+    return llm_utils.parse_provider(os.environ.get("ASK_JUDGE_PROVIDER"))
 
 
 def _reasoning():
     """OpenRouter `reasoning` from `ASK_JUDGE_REASONING`: off, low, medium or
-    high; anything else (after a warning) and unset mean no key at all."""
-    raw = (os.environ.get("ASK_JUDGE_REASONING") or "").strip().lower()
-    if not raw:
-        return None
-    if raw == "off":
-        return {"enabled": False}
-    if raw in _REASONING_EFFORTS:
-        return {"effort": raw}
-    logger.warning("llm_tools: ASK_JUDGE_REASONING value not recognised "
-                   "(expected off|low|medium|high); sending no reasoning")
-    return None
+    high; anything else (after a warning) and unset mean no key at all.
+
+    No model is passed, on purpose: the judge's `off` reaches the wire as
+    `{"enabled": false}` whatever the judge model is, as it always has."""
+    return llm_utils.parse_reasoning(os.environ.get("ASK_JUDGE_REASONING"),
+                                     name="llm_tools: ASK_JUDGE_REASONING")
 
 
 def _model_chain(primary):

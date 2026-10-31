@@ -196,6 +196,30 @@ jobs:
           if [ -n "${{ vars.TEST_ASK_JUDGE_REASONING }}" ]; then
             ASK_JUDGE_REASONING_PARAM="AskJudgeReasoning=${{ vars.TEST_ASK_JUDGE_REASONING }}"
           fi
+          # Template digitise settings (spec 2026-10-31 B2). Normalised before use: these
+          # are typed by hand into repo variables, and a stray space or capital would
+          # otherwise split into extra sam deploy arguments or miss the template's
+          # AllowedPattern / the endpoint pin. Whitespace is stripped from all four,
+          # reasoning is lowercased. The model falls back to the template default when
+          # blank; the other three default to '' and use the bare-"Key=" guard.
+          TD_MODEL="$(printf '%s' "${{ vars.TEST_TEMPLATE_DIGITISE_MODEL || 'google/gemini-3.8-flash' }}" | tr -d '[:space:]')"
+          TD_MODEL="${TD_MODEL:-google/gemini-3.8-flash}"
+          TD_REASONING="$(printf '%s' "${{ vars.TEST_TEMPLATE_DIGITISE_REASONING }}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+          TD_PROVIDER="$(printf '%s' "${{ vars.TEST_TEMPLATE_DIGITISE_PROVIDER }}" | tr -d '[:space:]')"
+          TD_PDF_MODEL="$(printf '%s' "${{ vars.TEST_TEMPLATE_DIGITISE_PDF_MODEL }}" | tr -d '[:space:]')"
+          TEMPLATE_DIGITISE_MODEL_PARAM="TemplateDigitiseModel=$TD_MODEL"
+          TEMPLATE_DIGITISE_REASONING_PARAM=""
+          if [ -n "$TD_REASONING" ]; then
+            TEMPLATE_DIGITISE_REASONING_PARAM="TemplateDigitiseReasoning=$TD_REASONING"
+          fi
+          TEMPLATE_DIGITISE_PROVIDER_PARAM=""
+          if [ -n "$TD_PROVIDER" ]; then
+            TEMPLATE_DIGITISE_PROVIDER_PARAM="TemplateDigitiseProvider=$TD_PROVIDER"
+          fi
+          TEMPLATE_DIGITISE_PDF_MODEL_PARAM=""
+          if [ -n "$TD_PDF_MODEL" ]; then
+            TEMPLATE_DIGITISE_PDF_MODEL_PARAM="TemplateDigitisePdfModel=$TD_PDF_MODEL"
+          fi
           # Gemini provider order (spec 2026-10-23). Unset keeps the template
           # default (AI Studio first); 'off' is the rollback.
           PROVIDER_ORDER_PARAM=""
@@ -296,6 +320,10 @@ jobs:
               "SearchIndexRead=${{ vars.TEST_SEARCH_INDEX_READ || 'report' }}" \
               "CompanySummaryServe=${{ vars.TEST_COMPANY_SUMMARY_SERVE || 'off' }}" \
               "TemplateDigitise=${{ vars.TEST_TEMPLATE_DIGITISE || 'false' }}" \
+              "$TEMPLATE_DIGITISE_MODEL_PARAM" \
+              ${TEMPLATE_DIGITISE_REASONING_PARAM:+"$TEMPLATE_DIGITISE_REASONING_PARAM"} \
+              ${TEMPLATE_DIGITISE_PROVIDER_PARAM:+"$TEMPLATE_DIGITISE_PROVIDER_PARAM"} \
+              ${TEMPLATE_DIGITISE_PDF_MODEL_PARAM:+"$TEMPLATE_DIGITISE_PDF_MODEL_PARAM"} \
               "CheckDoneGaps=${{ vars.TEST_CHECK_DONE_GAPS || 'false' }}" \
               "ProjectDocuments=${{ vars.TEST_PROJECT_DOCUMENTS || 'false' }}" \
               $PDF_LAYER_PARAM \

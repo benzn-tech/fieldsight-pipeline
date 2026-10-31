@@ -123,6 +123,9 @@ def run(argv, *, src_dir=SRC, spawn=_spawn, stdout=sys.stdout):
     try:
         with open(a.key_file, encoding="utf-8") as f:
             key = f.read().strip()
+        # The owner's key file reads `name=sk-ant-...` (the dashboard's label kept).
+        if not key.startswith("sk-") and "=" in key:
+            key = key.split("=", 1)[1].strip()
     except OSError:
         print("refused: --key-file unreadable", file=stdout)
         return 2
