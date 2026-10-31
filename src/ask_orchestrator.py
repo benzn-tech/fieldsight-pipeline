@@ -804,8 +804,9 @@ MAX_BAD_ROUNDS = 2
 FALLBACK_MAX_CHUNKS = 12
 NO_RECORDS = "No relevant records found for this question."
 # Tool-meta errors that are about the caller, not the records: answered NO_RECORDS,
-# never with the web. company_inactive: rag-search's company gate (offboarding §5.1).
-_IDENTITY_ERRORS = ("not_provisioned", "company_inactive")
+# never with the web. company_inactive / account_archived: rag-search's caller gate
+# (offboarding §5.1, the tenancy_status reasons).
+_IDENTITY_ERRORS = ("not_provisioned", "company_inactive", "account_archived")
 # Spec 2026-10-19-ask-explicit-web-failure §3: the caller asked for the web and
 # the web step failed. Model-free: said instead of "not in your records".
 WEB_UNREACHABLE = "I couldn't search the web just now."

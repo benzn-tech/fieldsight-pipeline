@@ -380,30 +380,33 @@ def test_checklist_auto_generate_matrix(monkeypatch, caplog):
 
 # --------------------------------------------------------------------------- Ask
 
-def test_ask_agent_takes_no_web_path_on_company_inactive(monkeypatch):
+@pytest.mark.parametrize("reason", ["company_inactive", "account_archived"])
+def test_ask_agent_takes_no_web_path_on_company_inactive(monkeypatch, reason):
     """ask-agent's web fallback/offer is skipped on any rag-search `error`
-    (lambda_ask_agent ~1498); this locks that in for the gate's blocked shape."""
+    (lambda_ask_agent ~1498); this locks that in for the gate's blocked shapes."""
     laa = pytest.importorskip("lambda_ask_agent")
     from tests.unit.test_ask_voice_web_gates import WEB_OK, FakeLambdaClient, ask, wire
     for offer in ({}, {"offer_web": True}):
         rig = wire(monkeypatch, chunks=(), web=WEB_OK)
         monkeypatch.setattr(laa, "_get_lambda_client", lambda: FakeLambdaClient(
-            [{"chunks": [], "error": "company_inactive"}]))
+            [{"chunks": [], "error": reason}]))
         out = ask(rig.cb(), **offer)
         assert "general" not in rig.events and "on_web_start" not in rig.events
         assert "classify" not in rig.events
         assert "from_web" not in out and "web_offer" not in out
 
 
-def test_ask_orchestrator_company_inactive_gives_no_records_and_never_the_web(monkeypatch):
+@pytest.mark.parametrize("reason", ["company_inactive", "account_archived"])
+def test_ask_orchestrator_company_inactive_gives_no_records_and_never_the_web(monkeypatch,
+                                                                             reason):
     """The tools path (orchestration v2): rag-search's blocked tools envelope carries
-    meta.error 'company_inactive' on every call; it must end like not_provisioned."""
+    meta.error = the gate's reason on every call; it must end like not_provisioned."""
     pytest.importorskip("lambda_ask_agent")
     from tests.unit.test_ask_orchestrator_judge import ScriptChat, body, run
     from tests.unit.test_ask_orchestrator_round1 import FakeTools
     chat = ScriptChat()
     out = run(body("What does NZS 3101 say? search online"), chat,
-              tools=FakeTools(lambda call: ([], {"error": "company_inactive"})))
+              tools=FakeTools(lambda call: ([], {"error": reason})))
     assert out["answer"] == "No relevant records found for this question."
     assert out["citations"] == [] and "web" not in out and not out.get("from_web")
     assert chat.calls == []
