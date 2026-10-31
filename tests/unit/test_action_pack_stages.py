@@ -177,7 +177,8 @@ class Verify:
     def __init__(self, label="supported", model=VERIFIER):
         self.label, self.model, self.calls = label, model, []
 
-    def __call__(self, draft, *, registry, items, sources, ctx, writer_model, deadline):
+    def __call__(self, draft, *, registry, items, sources, ctx, writer_model, deadline,
+                 writer_served=None):
         self.calls.append({"draft": draft, "sources": sources, "writer_model": writer_model,
                            "deadline": deadline, "registry": registry})
         return {"conclusion": [{"index": i, "confidence": c["confidence"]}

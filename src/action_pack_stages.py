@@ -1255,7 +1255,9 @@ def apply_verdicts(draft, result):
     counts) is reason `verifier`.
     -> (conclusion, actions, model, counts, tokens, ignored counts)."""
     bad = agent.VerifierFailure
-    if not isinstance(result, dict) or not isinstance(result.get("conclusion"), list)             or not isinstance(result.get("actions"), list)             or not isinstance(result.get("model"), str) or not result["model"].strip():
+    if not isinstance(result, dict) or not isinstance(result.get("conclusion"), list)             or not isinstance(result.get("actions"), list)             or not (result.get("model") is None or (isinstance(result["model"], str)
+                                                   and result["model"].strip())):
+        # model None = no model call was needed (Task 12 fix 1); "" is malformed.
         raise bad("verifier answer shape")
     counts = result.get("counts", {})
     tokens = result.get("tokens", 0)
@@ -1351,7 +1353,12 @@ def run(ctx, deps: Optional[Deps] = None) -> dict:
         raise
     except Exception as exc:                                # noqa: BLE001 -- re-raised
         try:
-            exc.run_trace = r.failure_trace()
+            trace = r.failure_trace()
+            vcounts = getattr(exc, "verify_counts", None)    # the verifier's own counts
+            if isinstance(vcounts, dict) and action_pack_view.fail_trace_error(
+                    dict(trace, verify=vcounts)) is None:
+                trace = dict(trace, verify=vcounts)
+            exc.run_trace = trace
         except Exception:                                   # noqa: BLE001 -- best effort
             pass
         raise
@@ -1385,7 +1392,8 @@ def _run(r: Run) -> dict:
     t0 = ctx.clock()
     result = deps.verify(draft, registry=dict(r.registry), items=dict(r.items),
                          sources=sources, ctx=ctx, writer_model=r.models.get("writer"),
-                         deadline=ctx.deadline_for("verify"))
+                         deadline=ctx.deadline_for("verify"),
+                         writer_served=r.models.get("writer_served"))
     # The verifier only labels and drops: every other field comes from the draft.
     conclusion, actions, vmodel, vcounts, vtokens, vignored = apply_verdicts(draft, result)
     r.models["verifier"] = vmodel

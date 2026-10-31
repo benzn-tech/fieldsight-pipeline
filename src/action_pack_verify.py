@@ -4,7 +4,8 @@ after Write and the web snapshots.
 
 Contract (what action_pack_stages passes and expects):
 
-    verify(draft, *, registry, items, sources, ctx, writer_model, deadline) -> {
+    verify(draft, *, registry, items, sources, ctx, writer_model, deadline,
+           writer_served=None) -> {
         "conclusion": [{"index": i, "confidence": "supported"|"uncertain"}],
             # i indexes draft["conclusion"]; the verifier maps its own labels: weak ->
             # "uncertain", unsupported -> leave the line out. Never an upgrade.
@@ -12,7 +13,8 @@ Contract (what action_pack_stages passes and expects):
             # i indexes draft["actions"]; a code-check failure is left out (dropped) or
             # labelled unsupported; unsupported actions are KEPT (stored for the eval,
             # never applicable -- S15)
-        "model": str,          # the verifier model actually used (after its fallbacks)
+        "model": str|None,     # the verifier model actually used (after its fallbacks);
+                               # None when no element needed a model call
         "counts": {str: int},  # optional, counts only, merged into run_trace["verify"]
         "tokens": int,         # optional, added to the run's token count
     }
@@ -33,12 +35,16 @@ Contract (what action_pack_stages passes and expects):
   items        -- {stable_id: items-tool row} (latest read wins)
   sources      -- {ref: source row} for the cited refs, web_source rows already carrying
                   snapshot_s3_key (None = no snapshot: cap the claims at weak, §6)
-  writer_model -- the writer model actually used (S6: the verifier must differ in family)
+  writer_model -- the writer model actually used (S6: the verifier must differ in family);
+                  None/empty fails closed (ModelFailure)
+  writer_served-- the vendor's served id for the writer (models.writer_served), also
+                  excluded by family
   deadline     -- absolute ctx.clock() deadline of the verify stage
 
 Failures raise a lambda_action_agent.StageError subclass (the pack's failure reason); S6's
 "no remaining verifier of a different family" is reason `model` (ModelFailure); every model
-check failing is reason `verifier` (VerifierFailure).
+check failing is reason `verifier` (VerifierFailure). Either carries `exc.verify_counts`,
+which action_pack_stages.run puts in the fail trace as run_trace["verify"].
 
 What it does
 ------------
@@ -50,11 +56,15 @@ What it does
      close of a done/closed item) (`drop_transition`); at most ONE close/update per target
      -- apply would mark a second one stale after the first applied (`drop_duplicate_target`);
    * create_item: not a near-duplicate (`near_duplicate`) of an open/in_progress/blocked
-     item on the site, nor of an earlier create in the same draft (`drop_near_duplicate`).
+     item on the site, nor of an earlier create in the same draft (`drop_near_duplicate`):
+     todo_collapse's key equal, or carry_forward's normalisation at ratio >= 0.90 with
+     identical identifier tokens (digits, single capitals: level 12 != level 13).
      Dropped rather than turned into an update: an update needs fields the writer did not
      propose, so the conversion is never trivially safe.
    A conclusion line with no refs (the writer's own "uncertain", e.g. "no standard found in
    your project library") is kept `uncertain` without a model call (`conclusion_no_refs`).
+   An element whose every cited ref has no text is `unsupported` without a call
+   (`empty_refs`).
 2. Model check: ONE call per surviving element, with only that element (type, target text,
    proposed fields, rationale / the line's text) and the full text of its cited refs,
    sanitized and fenced as data -> {"label": supported|weak|unsupported}. The calls run in
@@ -74,16 +84,18 @@ ACTION_VERIFIER_FALLBACKS in order, minus every candidate in the writer's family
 model AS USED (the chain entry that answered, after its fallbacks). None left -> ModelFailure.
 Each element tries the candidates in order (a failed call moves to the next). A call goes
 through llm_tools_client.complete_json(judge_routing=False): only the model asked for, never
-the Ask judge's provider pin/reasoning or its fallbacks. An answer whose reported model is in
-the writer's family is invalid (`family_answers_rejected`) and the next candidate is asked.
+the Ask judge's provider pin/reasoning or its fallbacks. "The writer's family" is the family
+of its requested id AND of its served id; an answer whose requested or served id is in either
+is invalid (`family_answers_rejected`) and the next candidate is asked.
 
 The family of a model id (`family`) is its vendor prefix -- the text before the first '/',
-lower-cased (`google/gemini-3.8-flash` -> google), with `meta-llama` read as `meta`. An id
-without '/' maps its leading letters through BARE_FAMILIES (`claude-*` -> anthropic,
+lower-cased (`google/gemini-3.8-flash` -> google), through FAMILY_ALIASES (meta-llama ->
+meta, deepseek-ai -> deepseek, thudm/zhipuai -> z-ai, ...). An id without '/' maps its
+leading letters through BARE_FAMILIES (`claude-*`/opus/sonnet/haiku -> anthropic,
 `qwen*` -> qwen, `gemini*` -> google, ...); an unknown leading token is its own family.
 
 Counts (run_trace["verify"], flat ints, no text): raw_conclusion, raw_actions, drop_*,
-conclusion_no_refs, checks, check_failures, check_timeouts, family_skips,
+conclusion_no_refs, empty_refs, checks, check_failures, check_timeouts, family_skips,
 family_answers_rejected, fallback_answers, label_conclusion_<label>, label_actions_<label>,
 conclusion_unsupported, actions_unsupported, web_only_conclusion, web_only_actions,
 no_snapshot_capped -- so the eval can report the writer's raw rates and the post-verifier
@@ -121,8 +133,11 @@ VERIFY_MAX_TOKENS = 200
 REF_MAX_CHARS = 24_000           # one cited ref's text in a prompt (a snapshot can be 200 kB)
 
 FAMILY_ALIASES = {"meta-llama": "meta", "x-ai": "xai", "mistral": "mistralai",
-                  "moonshot": "moonshotai"}
-BARE_FAMILIES = {"claude": "anthropic", "gpt": "openai", "o": "openai", "gemini": "google",
+                  "moonshot": "moonshotai", "deepseek-ai": "deepseek", "thudm": "z-ai",
+                  "zhipuai": "z-ai", "zhipu": "z-ai", "alibaba": "qwen"}
+BARE_FAMILIES = {"claude": "anthropic", "opus": "anthropic", "sonnet": "anthropic",
+                 "haiku": "anthropic", "gpt": "openai", "o": "openai", "chatgpt": "openai",
+                 "gemini": "google",
                  "gemma": "google", "deepseek": "deepseek", "qwen": "qwen", "qwq": "qwen",
                  "mimo": "xiaomi", "muse": "meta", "llama": "meta", "glm": "z-ai",
                  "kimi": "moonshotai", "grok": "xai", "mistral": "mistralai"}
@@ -142,16 +157,22 @@ def family(model_id):
     return BARE_FAMILIES.get(token, token)
 
 
-def candidates(writer_model):
-    """-> (verifier models outside the writer's family, in order; how many were skipped)."""
+def writer_families(writer_model, writer_served=None):
+    """The families the verifier must stay out of: the writer's requested id (the chain
+    entry that answered) and the id the vendor says it served."""
+    return {f for f in (family(writer_model), family(writer_served)) if f is not None}
+
+
+def candidates(writer_model, writer_served=None):
+    """-> (verifier models outside the writer's families, in order; how many were skipped)."""
     wanted = [agent.verifier_model()] + agent.verifier_fallbacks()
     seen, out, skipped = set(), [], 0
-    writer_fam = family(writer_model)
+    fams = writer_families(writer_model, writer_served)
     for m in wanted:
         if not m or m in seen:
             continue
         seen.add(m)
-        if writer_fam is not None and family(m) == writer_fam:
+        if family(m) in fams:
             skipped += 1
             continue
         out.append(m)
@@ -161,19 +182,20 @@ def candidates(writer_model):
 def call_json(prompt, *, model, max_tokens, deadline, caller):
     """One verifier call (the seam tests replace). `deadline` is seconds from now, used as
     the call's deadline; one attempt is capped at ATTEMPT_CAP_S so a hung primary still
-    leaves the element time for the next candidate. -> (text, error, model that answered,
-    tokens used)."""
+    leaves the element time for the next candidate. -> (text, error, model that answered
+    (the chain entry), tokens used, the vendor's served id). A seam may return only the
+    first four (no served id)."""
     import llm_tools_client
     turn = llm_tools_client.complete_json(
         prompt, model=model, max_tokens=max_tokens,
         deadline=llm_tools_client._now() + float(deadline), caller=caller,
         attempt_timeout=min(float(deadline), ATTEMPT_CAP_S), judge_routing=False)
     if turn.error is not None:
-        return None, turn.error, None, 0
+        return None, turn.error, None, 0, None
     usage = turn.usage if isinstance(turn.usage, dict) else {}
     tokens = sum(v for v in (usage.get("prompt_tokens"), usage.get("completion_tokens"))
                  if isinstance(v, int) and not isinstance(v, bool))
-    return turn.text, None, (turn.requested_model or model), tokens
+    return turn.text, None, (turn.requested_model or model), tokens, (turn.model or None)
 
 
 # ---- code checks ------------------------------------------------------------------------
@@ -184,22 +206,39 @@ def _dup_key(text):
     return carry_forward._key(todo_collapse.normalise(text))
 
 
+_ALNUM = re.compile(r"[A-Za-z0-9]+")
+
+
+def identifiers(text):
+    """The identifier tokens of a todo: every ASCII-alphanumeric token containing a digit
+    (level 12, C3, L12, the 3 of 3号楼) and every single capital letter (block A). Two
+    todos that differ only in these are different jobs, however similar the rest reads."""
+    out = Counter()
+    for tok in _ALNUM.findall(str(text or "")):
+        if any(ch.isdigit() for ch in tok) or (len(tok) == 1 and tok.isupper()):
+            out[tok.lower()] += 1
+    return out
+
+
 def near_duplicate(text, others, floor=NEAR_DUP_FLOOR):
-    """True when `text` would collapse onto one of `others` at read time (todo_collapse's
-    key is equal -- S16: a created item must never collapse onto the item it was meant to
-    differ from) or is the same item reworded (carry_forward's normalisation, ratio >=
-    floor). Text with no words is never a duplicate (todo_collapse treats "" the same)."""
+    """True when `text` would collapse onto one of `others` at read time -- todo_collapse's
+    key is equal, exactly its rule (S16: a created item must never collapse onto the item
+    it was meant to differ from) -- or is the same item reworded: carry_forward's
+    normalisation at ratio >= floor AND identical identifier tokens (`identifiers`), so
+    "level 12" vs "level 13" or "grid C3" vs "C4" survive. Text with no words is never a
+    duplicate (todo_collapse treats "" the same)."""
     key = todo_collapse.normalise(text)
     if not key:
         return False
-    fkey = _dup_key(text)
+    fkey, idents = _dup_key(text), identifiers(text)
     for other in others:
         okey = todo_collapse.normalise(other)
         if not okey:
             continue
         if okey == key:
             return True
-        if difflib.SequenceMatcher(None, fkey, _dup_key(other)).ratio() >= floor:
+        if identifiers(other) == idents and \
+                difflib.SequenceMatcher(None, fkey, _dup_key(other)).ratio() >= floor:
             return True
     return False
 
@@ -301,25 +340,28 @@ def parse_label(text):
     return obj["label"]
 
 
-def _check(prompt, *, cands, writer_fam, deadline, clock):
+def _check(prompt, *, cands, writer_fams, deadline, clock):
     """One element's model check, run in a worker thread; touches no shared state.
-    -> {"label": str|None, "model": str|None, "tokens": int, "rejected": int}."""
+    -> {"label": str|None, "model": str|None, "tokens": int, "rejected": int}.
+    An answer whose requested OR served id is in one of the writer's families is invalid
+    and the next candidate is asked."""
     out = {"label": None, "model": None, "tokens": 0, "rejected": 0}
     for model in cands:
         left = deadline - MARGIN_S - clock()
         if left < MIN_CALL_S:
             break
         try:
-            text, err, used, tokens = call_json(prompt, model=model,
-                                                max_tokens=VERIFY_MAX_TOKENS,
-                                                deadline=left, caller="action_verify")
+            answer = call_json(prompt, model=model, max_tokens=VERIFY_MAX_TOKENS,
+                               deadline=left, caller="action_verify")
+            text, err, used, tokens = answer[:4]
+            served = answer[4] if len(answer) > 4 else None
         except Exception:                                   # noqa: BLE001 -- a failed call
             continue
         out["tokens"] += tokens if isinstance(tokens, int) else 0
         if err is not None:
             continue
         used = used or model
-        if writer_fam is not None and family(used) == writer_fam:
+        if family(used) in writer_fams or family(served) in writer_fams:
             out["rejected"] += 1
             continue
         label = parse_label(text)
@@ -330,20 +372,36 @@ def _check(prompt, *, cands, writer_fam, deadline, clock):
     return out
 
 
-def verify(draft, *, registry, items, sources, ctx, writer_model, deadline):
+def _fail(exc, counts):
+    """Attach the counts so the pack's fail trace keeps them (§4.5; action_pack_stages.run
+    merges `verify_counts` into exc.run_trace["verify"])."""
+    exc.verify_counts = dict(counts)
+    return exc
+
+
+def verify(draft, *, registry, items, sources, ctx, writer_model, deadline,
+           writer_served=None):
     counts = {"raw_conclusion": len(draft["conclusion"]),
               "raw_actions": len(draft["actions"])}
-    cands, skipped = candidates(writer_model)
+    if family(writer_model) is None:
+        # Fail closed: without the writer's model there is no family to stay out of.
+        raise _fail(agent.ModelFailure("writer model unknown"), counts)
+    cands, skipped = candidates(writer_model, writer_served)
     if skipped:
         counts["family_skips"] = skipped
     if not cands:
         logger.error("action verifier: no candidate outside the writer's family pack=%s",
                      getattr(ctx, "pack_id", None))
-        raise agent.ModelFailure("no verifier outside the writer's model family")
+        raise _fail(agent.ModelFailure("no verifier outside the writer's model family"),
+                    counts)
+
+    def no_text(refs):
+        return all(not str(_ref_text(registry[r])).strip() for r in refs)
 
     # 1. code checks -> the elements that go to the model
     todo = []          # (kind, index, element)
     kept_uncertain = []
+    empty = []         # (kind, index): every cited ref is empty -> unsupported, no call
     for i, c in enumerate(draft["conclusion"]):
         refs = c.get("refs") or []
         if any(r not in registry for r in refs):
@@ -351,6 +409,8 @@ def verify(draft, *, registry, items, sources, ctx, writer_model, deadline):
         elif not refs:
             _bump(counts, "conclusion_no_refs")
             kept_uncertain.append(i)
+        elif no_text(refs):
+            empty.append(("conclusion", i))
         else:
             todo.append(("conclusion", i, c))
     targets, created = set(), []
@@ -359,6 +419,8 @@ def verify(draft, *, registry, items, sources, ctx, writer_model, deadline):
                                  targets=targets, created=created)
         if why:
             _bump(counts, why)
+        elif no_text(a["refs"]):
+            empty.append(("actions", i))
         else:
             todo.append(("actions", i, a))
 
@@ -366,20 +428,21 @@ def verify(draft, *, registry, items, sources, ctx, writer_model, deadline):
     results = {}
     if todo:
         counts["checks"] = len(todo)
-        writer_fam = family(writer_model)
+        fams = writer_families(writer_model, writer_served)
         prompts = [build_prompt("conclusion" if k == "conclusion" else "action", el,
                                 registry=registry, items=items) for k, _, el in todo]
         pool = ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(todo)))
         try:
-            futs = {pool.submit(_check, p, cands=cands, writer_fam=writer_fam,
+            futs = {pool.submit(_check, p, cands=cands, writer_fams=fams,
                                 deadline=deadline, clock=ctx.clock): n
                     for n, p in enumerate(prompts)}
             done, _ = futures_wait(futs, timeout=max(0.0, deadline - MARGIN_S - ctx.clock()))
             for f in done:
                 try:
                     results[futs[f]] = f.result()
-                except Exception:                           # noqa: BLE001
-                    pass
+                except Exception:                           # noqa: BLE001 -- a failure
+                    results[futs[f]] = {"label": None, "model": None, "tokens": 0,
+                                        "rejected": 0}
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
         timeouts = len(todo) - len(results)
@@ -390,6 +453,12 @@ def verify(draft, *, registry, items, sources, ctx, writer_model, deadline):
     used, tokens, answered = Counter(), 0, 0
     out = {"conclusion": [{"index": i, "confidence": "uncertain"} for i in kept_uncertain],
            "actions": []}
+    for kind, i in empty:
+        _bump(counts, "empty_refs")
+        _bump(counts, f"label_{kind}_unsupported")
+        _bump(counts, f"{kind}_unsupported")
+        if kind == "actions":
+            out["actions"].append({"index": i, "verifier": "unsupported"})
     for n, (kind, i, el) in enumerate(todo):
         res = results.get(n)
         if res is not None:
@@ -404,7 +473,9 @@ def verify(draft, *, registry, items, sources, ctx, writer_model, deadline):
         else:
             answered += 1
             used[res["model"]] += 1
-        kinds = [registry[r].get("kind") for r in el["refs"]]
+        # A4 over the refs that carry text: an empty record ref lends a web claim nothing.
+        kinds = [registry[r].get("kind") for r in el["refs"]
+                 if str(_ref_text(registry[r])).strip()]
         if all(k in WEB_KINDS for k in kinds):
             _bump(counts, f"web_only_{kind}")
             if label == "supported":
@@ -430,14 +501,17 @@ def verify(draft, *, registry, items, sources, ctx, writer_model, deadline):
     if todo and not answered:
         logger.error("action verifier: every model check failed pack=%s checks=%d",
                      getattr(ctx, "pack_id", None), len(todo))
-        raise agent.VerifierFailure("every verifier check failed")
+        raise _fail(agent.VerifierFailure("every verifier check failed"), counts)
     rank = {m: n for n, m in enumerate(cands)}
+    # None = no model answered anything (nothing needed a model check): the pack's
+    # models.verifier is then None, never a model that did not run.
     model = min(used, key=lambda m: (-used[m], rank.get(m, len(rank)), m)) if used \
-        else cands[0]
+        else None
     fallback = sum(v for m, v in used.items() if m != cands[0])
     if fallback:
         counts["fallback_answers"] = fallback
     out["conclusion"].sort(key=lambda e: e["index"])
+    out["actions"].sort(key=lambda e: e["index"])
     out.update(model=model, counts=counts, tokens=tokens)
     logger.info("action verifier done pack=%s checks=%d answered=%d model_family=%s",
                 getattr(ctx, "pack_id", None), len(todo), answered, family(model))

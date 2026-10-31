@@ -94,13 +94,16 @@ def _env(monkeypatch):
     monkeypatch.delenv("ACTION_VERIFIER_FALLBACKS", raising=False)
 
 
-def run_verify(draft, monkeypatch, fake=None, writer=WRITER, ctx=None, **fx):
+def run_verify(draft, monkeypatch, fake=None, writer=WRITER, ctx=None, writer_served=None,
+               real_call=False, **fx):
     fake = fake or Fake()
-    monkeypatch.setattr(apv, "call_json", fake)
+    if not real_call:
+        monkeypatch.setattr(apv, "call_json", fake)
     registry, items, sources = fixture(**fx)
     ctx = ctx or make_ctx()
     result = apv.verify(draft, registry=registry, items=items, sources=sources, ctx=ctx,
-                        writer_model=writer, deadline=ctx.deadline_for("verify"))
+                        writer_model=writer, deadline=ctx.deadline_for("verify"),
+                        writer_served=writer_served)
     return result, fake
 
 
@@ -410,7 +413,8 @@ def test_every_model_check_failing_is_a_verifier_failure(monkeypatch):
 def test_nothing_to_check_is_not_a_failure(monkeypatch):
     result, fake = run_verify({"conclusion": [], "actions": [close(refs=["Z1"])]},
                               monkeypatch)
-    assert fake.calls == [] and result["actions"] == [] and result["model"] == VERIFIER
+    assert fake.calls == [] and result["actions"] == [] and result["model"] is None
+    st.apply_verdicts({"conclusion": [], "actions": [close(refs=["Z1"])]}, result)
 
 
 def test_checks_run_in_parallel_under_the_deadline(monkeypatch):
@@ -530,8 +534,209 @@ def test_the_real_call_caps_one_attempt_so_a_hang_leaves_time_for_a_fallback(mon
         return llm_tools_client.ChatTurn(text='{"label": "weak"}', requested_model=kw["model"])
     monkeypatch.setattr(llm_tools_client, "complete_json", complete_json)
     monkeypatch.setattr(llm_tools_client, "_now", lambda: 100.0)
-    text, err, used, _ = apv.call_json("p", model=VERIFIER, max_tokens=10, deadline=85.0,
-                                       caller="action_verify")
-    assert (text, err, used) == ('{"label": "weak"}', None, VERIFIER)
+    text, err, used, _, served = apv.call_json("p", model=VERIFIER, max_tokens=10,
+                                               deadline=85.0, caller="action_verify")
+    assert (text, err, used, served) == ('{"label": "weak"}', None, VERIFIER, None)
     assert seen["deadline"] == 185.0 and seen["attempt_timeout"] == apv.ATTEMPT_CAP_S
     assert seen["judge_routing"] is False
+
+
+# ---- fix round 1 -----------------------------------------------------------------------------
+
+@pytest.mark.parametrize("model, fam", [
+    ("deepseek-ai/DeepSeek-V4", "deepseek"),
+    ("thudm/glm-4.9", "z-ai"),
+    ("zhipuai/glm-5", "z-ai"),
+    ("z-ai/glm-5", "z-ai"),
+    ("opus-5", "anthropic"),
+    ("sonnet-5-5", "anthropic"),
+    ("haiku-4", "anthropic"),
+    ("o3-mini", "openai"),
+    ("gpt-6-luna-pro", "openai"),
+    ("gemini-3.8-flash-001", "google"),
+])
+def test_more_family_aliases(model, fam):
+    assert apv.family(model) == fam
+
+
+def test_a_candidate_in_the_writers_served_family_is_skipped(monkeypatch):
+    monkeypatch.setenv("ACTION_VERIFIER_FALLBACKS", "anthropic/claude-sonnet-5-5")
+    result, fake = run_verify({"conclusion": [line()], "actions": []}, monkeypatch,
+                              writer=LUNA, writer_served="google/gemini-3.8-flash-001")
+    assert {c["model"] for c in fake.calls} == {"anthropic/claude-sonnet-5-5"}
+    assert result["counts"]["family_skips"] == 1
+
+
+def test_no_writer_model_fails_closed(monkeypatch):
+    for writer in (None, "", "  "):
+        with pytest.raises(agent.StageError) as ei:
+            run_verify({"conclusion": [line()], "actions": []}, monkeypatch, writer=writer)
+        assert agent.failure_reason(ei.value) == "model"
+
+
+def test_a_served_id_in_the_writers_family_invalidates_the_answer(monkeypatch):
+    """The real call_json: the vendor reports the model it SERVED (turn.model)."""
+    import llm_tools_client
+    monkeypatch.setenv("ACTION_VERIFIER_FALLBACKS", LUNA)
+    calls = []
+
+    def complete_json(prompt, **kw):
+        calls.append(kw["model"])
+        served = ("deepseek/deepseek-v4.1-flash-20261001" if kw["model"] == VERIFIER
+                  else kw["model"])
+        return llm_tools_client.ChatTurn(text='{"label": "supported"}', model=served,
+                                         requested_model=kw["model"])
+    monkeypatch.setattr(llm_tools_client, "complete_json", complete_json)
+    result, _ = run_verify({"conclusion": [], "actions": [close()]}, monkeypatch,
+                           real_call=True)
+    assert calls == [VERIFIER, LUNA]
+    assert labels(result) == {0: "supported"} and result["model"] == LUNA
+    assert result["counts"]["family_answers_rejected"] == 1
+
+
+def test_an_answer_served_in_the_writers_served_family_is_invalid(monkeypatch):
+    def answer(prompt, model):
+        return '{"label": "supported"}', None, model, 1, "x-ai/grok-5"
+    with pytest.raises(agent.StageError) as ei:
+        run_verify({"conclusion": [line()], "actions": []}, monkeypatch, fake=Fake(answer),
+                   writer=WRITER, writer_served="x-ai/grok-5")
+    assert agent.failure_reason(ei.value) == "verifier"
+
+
+@pytest.mark.parametrize("existing, created", [
+    ("Pour slab on level 12", "Pour slab on level 13"),
+    ("Fix the crack at grid C3", "Fix the crack at grid C4"),
+    ("Install handrail on block A", "Install handrail on block B"),
+    ("Check rebar at L12 north", "Check rebar at L11 north"),
+    ("3号楼 检查脚手架", "4号楼 检查脚手架"),
+])
+def test_creates_that_differ_only_in_an_identifier_survive(monkeypatch, existing, created):
+    items = {SID1: item_row(SID1, existing)}
+    result, _ = run_verify({"conclusion": [], "actions": [create(created)]}, monkeypatch,
+                           items=items)
+    assert labels(result) == {0: "supported"}
+    assert not apv.near_duplicate(created, [existing])
+
+
+@pytest.mark.parametrize("existing, created", [
+    ("Pour slab on level 12", "Pour the slab on level 12"),
+    ("Fix the crack at grid C3", "Fix the cracks at grid C3"),
+    ("Install handrail on block A", "Install handrails on block A"),
+])
+def test_rewording_with_the_same_identifiers_is_a_near_duplicate(monkeypatch, existing,
+                                                                 created):
+    items = {SID1: item_row(SID1, existing)}
+    result, _ = run_verify({"conclusion": [], "actions": [create(created)]}, monkeypatch,
+                           items=items)
+    assert result["actions"] == [] and result["counts"]["drop_near_duplicate"] == 1
+
+
+def test_an_exact_collapse_key_is_a_duplicate_whatever_the_identifiers():
+    for existing, created in [("Pour slab on level 12", "pour slab on level 12."),
+                              ("Grid C3: fix", "grid c3: fix!")]:
+        rows = [{"id": 1, "text": existing, "status": "open"},
+                {"id": 2, "text": created, "status": "open"}]
+        assert len(todo_collapse.collapse(rows)) == 1
+        assert apv.near_duplicate(created, [existing])
+
+
+def test_cited_refs_with_no_text_are_unsupported_without_a_call(monkeypatch):
+    empty = {"R1": entry("R1", "topic", "   "), "D1": entry("D1", "document", "")}
+    draft = {"conclusion": [line("x", ["R1", "D1"])],
+             "actions": [dict(close(), refs=["R1"]), close(SID2, refs=["D1", "W1"])]}
+    result, fake = run_verify(draft, monkeypatch, extra_registry=empty)
+    assert len(fake.calls) == 1                      # only the action that cites W1's text
+    assert result["conclusion"] == []
+    assert labels(result) == {0: "unsupported", 1: "weak"}
+    assert result["counts"]["empty_refs"] == 2
+
+
+def test_a_raising_worker_is_a_failure_not_a_timeout(monkeypatch):
+    real = apv._check
+
+    def check(prompt, **kw):
+        if "BOOM" in prompt:
+            raise RuntimeError("bug")
+        return real(prompt, **kw)
+    monkeypatch.setattr(apv, "_check", check)
+    result, _ = run_verify({"conclusion": [line("BOOM"), line("fine")], "actions": []},
+                           monkeypatch)
+    assert labels(result, "conclusion", "confidence") == {1: "supported"}
+    assert result["counts"]["check_failures"] == 1
+    assert "check_timeouts" not in result["counts"]
+
+
+def test_more_elements_than_workers_stay_inside_the_deadline(monkeypatch):
+    monkeypatch.setattr(apv, "MIN_CALL_S", 0.05)
+    monkeypatch.setattr(apv, "MARGIN_S", 0.0)
+    monkeypatch.setattr(apv, "MAX_WORKERS", 2)
+
+    def answer(prompt, model):
+        time.sleep(0.4)
+        return '{"label": "supported"}', None, model, 0
+    t0 = time.monotonic()
+    ctx = make_ctx(clock=time.monotonic, end=t0 + 1.0)
+    draft = {"conclusion": [line(f"line {i}") for i in range(8)], "actions": []}
+    result, fake = run_verify(draft, monkeypatch, fake=Fake(answer), ctx=ctx)
+    elapsed = time.monotonic() - t0
+    assert elapsed < 1.6                             # 8 x 0.4 s over 2 workers would be 1.6 s
+    got = labels(result, "conclusion", "confidence")
+    assert 2 <= len(got) <= 6 and set(got.values()) == {"supported"}
+    c = result["counts"]
+    assert c["label_conclusion_unsupported"] == 8 - len(got)
+    assert c.get("check_timeouts", 0) + c.get("check_failures", 0) == 8 - len(got)
+
+
+def test_a_verifier_failure_keeps_its_counts_in_the_fail_trace(monkeypatch):
+    from tests.unit import test_action_pack_stages as base
+    monkeypatch.setenv("ACTION_WRITER_MODEL", WRITER)
+    monkeypatch.setattr(apv, "call_json", Fake(lambda p, m: (None, "HTTP 503", None, 0)))
+    with pytest.raises(agent.StageError) as ei:
+        st.run(base.make_ctx(), base.deps(verify=apv.verify))
+    assert agent.failure_reason(ei.value) == "verifier"
+    trace = ei.value.run_trace
+    assert trace["stage"] == "verify"
+    assert trace["verify"]["raw_actions"] == 1 and trace["verify"]["check_failures"] == 2
+
+
+def test_a_model_failure_keeps_its_counts_in_the_fail_trace(monkeypatch):
+    from tests.unit import test_action_pack_stages as base
+    monkeypatch.setenv("ACTION_WRITER_MODEL", WRITER)
+    model = base.Model(used={"action_write": "google/gemini-3.9-pro"})
+    with pytest.raises(agent.StageError) as ei:
+        st.run(base.make_ctx(), base.deps(model=model, verify=apv.verify))
+    assert ei.value.run_trace["verify"]["family_skips"] == 1
+
+
+def test_the_stage_runner_passes_the_writers_served_id(monkeypatch):
+    from tests.unit import test_action_pack_stages as base
+    monkeypatch.setenv("ACTION_WRITER_MODEL", WRITER)
+    monkeypatch.setattr(apv, "call_json", Fake())
+    seen = {}
+
+    def verify(draft, **kw):
+        seen.update(kw)
+        return apv.verify(draft, **kw)
+
+    class Served(base.Model):
+        def __call__(self, prompt, **kw):
+            out = super().__call__(prompt, **kw)
+            kw["info"]["served_model"] = "google/gemini-3.8-flash-001"
+            return out
+    with pytest.raises(agent.StageError) as ei:     # the only verifier is in that family
+        st.run(base.make_ctx(), base.deps(model=Served(), verify=verify))
+    assert seen["writer_served"] == "google/gemini-3.8-flash-001"
+    assert agent.failure_reason(ei.value) == "model"
+
+
+def test_nothing_model_checked_stores_no_verifier_model(monkeypatch):
+    from tests.unit import test_action_pack_stages as base
+    monkeypatch.setenv("ACTION_WRITER_MODEL", WRITER)
+    fake = Fake()
+    monkeypatch.setattr(apv, "call_json", fake)
+    write = base.write_obj(conclusion=[{"text": "Nothing on record.", "refs": [],
+                                        "confidence": "uncertain"}], actions=[])
+    payload = st.run(base.make_ctx(), base.deps(model=base.Model(write=[write]),
+                                                verify=apv.verify))
+    assert fake.calls == [] and payload["models"]["verifier"] is None
+    assert payload["conclusion"][0]["confidence"] == "uncertain"
