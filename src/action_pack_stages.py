@@ -1228,7 +1228,10 @@ def snapshot_stage(run, sources):
             company_id=ctx.company_id, pack_id=ctx.pack_id)
         sources[r].update(fetched_at=row.get("fetched_at"),
                           snapshot_s3_key=row.get("snapshot_s3_key"))
-        stored += 1 if row.get("snapshot_s3_key") else 0
+        if row.get("snapshot_s3_key"):
+            stored += 1
+            # The verifier reads the page text it stored (the excerpt is only the domain).
+            run.registry[r]["snapshot_text"] = page.get("text")
     run.trace["snapshots"] = stored
     run.trace["snapshots_none"] = len(todo) - stored
     run.trace.setdefault("ms", {})["snapshot"] = int((ctx.clock() - t0) * 1000)

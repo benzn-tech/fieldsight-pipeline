@@ -112,3 +112,21 @@ def test_an_empty_200_is_a_failure(monkeypatch):
     _install(monkeypatch, FakePool(_ok(text="")))
     turn = tc.complete_json("p", model=JUDGE, max_tokens=500, deadline=None, caller="t")
     assert turn.error == "empty completion"
+
+
+def test_plain_routing_tries_only_the_model_asked_for_and_never_pins(monkeypatch):
+    """The action-pack verifier (Task 12) is not the judge: no judge pin or reasoning even
+    on the judge's model id, and no ASK_JUDGE_FALLBACKS (it walks its own chain)."""
+    monkeypatch.setenv("ASK_JUDGE_FALLBACKS", FB)
+    pool = _install(monkeypatch, FakePool(FakeResponse(503, {"error": {"message": "x"}})))
+    turn = tc.complete_json("p", model=JUDGE, max_tokens=50, deadline=None, caller="v",
+                            judge_routing=False)
+    assert [c["body"]["model"] for c in pool.calls] == [JUDGE]
+    assert "provider" not in pool.calls[0]["body"]
+    assert "reasoning" not in pool.calls[0]["body"]
+    assert turn.error and turn.requested_model == ""
+
+    pool = _install(monkeypatch, FakePool(_ok(served="g")))
+    turn = tc.complete_json("p", model="google/gemini-3.8-flash", max_tokens=50,
+                            deadline=None, caller="v", judge_routing=False)
+    assert turn.error is None and turn.requested_model == "google/gemini-3.8-flash"

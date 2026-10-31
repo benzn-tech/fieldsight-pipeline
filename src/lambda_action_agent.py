@@ -93,7 +93,8 @@ class ToolsFailure(StageError):
 
 
 class VerifierFailure(StageError):
-    """The verifier could not run (e.g. no verifier of a different family, §14 S6)."""
+    """The verifier could not run (every model check failed, or a malformed answer). No
+    verifier of a different family (§14 S6) is ModelFailure (reason `model`)."""
     reason = "verifier"
 
 

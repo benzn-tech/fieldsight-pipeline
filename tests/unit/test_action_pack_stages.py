@@ -588,13 +588,6 @@ def test_a_verifier_that_drops_everything_leaves_only_cited_sources():
     assert payload["sources"] == [] and payload["actions"] == []
 
 
-def test_the_default_verifier_is_not_built_yet():
-    import action_pack_verify
-    with pytest.raises(NotImplementedError):
-        action_pack_verify.verify({}, registry={}, items={}, sources={}, ctx=None,
-                                  writer_model=None, deadline=0)
-
-
 # ---- cancellation -------------------------------------------------------------------------
 
 def test_cancel_at_a_checkpoint_stops_every_further_call():

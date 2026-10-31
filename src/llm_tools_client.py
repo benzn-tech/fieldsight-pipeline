@@ -341,7 +341,7 @@ def chat(messages, tools, *, model=None, tool_choice="required",
 
 
 def complete_json(prompt, *, model=None, max_tokens=2048, deadline=None,
-                  caller="ask_judge", attempt_timeout=None) -> ChatTurn:
+                  caller="ask_judge", attempt_timeout=None, judge_routing=True) -> ChatTurn:
     """One tool-less JSON answer routed exactly like the Ask judge: `model` (default the
     judge model) then ASK_JUDGE_FALLBACKS (unset = none), the provider pin and reasoning on
     the configured judge model only, a fallback on a 5xx, a 429 or a transport failure,
@@ -349,7 +349,11 @@ def complete_json(prompt, *, model=None, max_tokens=2048, deadline=None,
     vendor failure. `deadline` is absolute on `_now()`; `attempt_timeout` (default
     HTTP_TIMEOUT_CAP) caps one attempt. `turn.requested_model` is the chain entry that
     answered, `turn.model` the vendor's served id. Added for the action agent (action
-    packs Task 11); `chat` is unchanged."""
+    packs Task 11); `chat` is unchanged.
+
+    `judge_routing=False` (the action-pack verifier, Task 12): only `model`, no
+    ASK_JUDGE_FALLBACKS and never the judge's provider pin or reasoning -- the verifier
+    walks its own chain and checks each answer's family itself."""
     key = corroboration_client.api_key()
     if not key:
         logger.error("llm_tools: API key not set caller=%s", caller)
@@ -357,9 +361,9 @@ def complete_json(prompt, *, model=None, max_tokens=2048, deadline=None,
     if deadline is not None and deadline - _now() < MIN_TIME_LEFT:
         return ChatTurn(error="no time left", timed_out=True)
     env_primary = _primary_model()
-    chain = _model_chain(model or env_primary)
+    chain = _model_chain(model or env_primary) if judge_routing else [model or env_primary]
     primary_extras = {}
-    if chain[0] == env_primary:
+    if judge_routing and chain[0] == env_primary:
         pin, reasoning = _provider_pin(), _reasoning()
         if pin:
             primary_extras["provider"] = pin
