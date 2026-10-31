@@ -273,7 +273,7 @@ def test_a_failing_probe_leaves_the_transaction_usable(db, monkeypatch):
 
 
 def test_the_probe_index_exists(db):
-    """Migration 0093's partial index the probe reads: agent topics only."""
+    """Migration 0094's partial index the probe reads: agent topics only."""
     row = db.execute("SELECT indexdef FROM pg_indexes "
                      "WHERE indexname = 'idx_topics_agent_user_date'").fetchone()
     assert row is not None

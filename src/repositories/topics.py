@@ -965,7 +965,7 @@ def agent_topic_author_for_folder_day(conn, folder, report_date):
 
     The day view's cheap probe (action packs spec §14 D2): ONE indexed SELECT --
     idx_users_folder_global (folder_name is globally unique, migration 0012) into the
-    partial idx_topics_agent_user_date (migration 0093), which holds only agent topics.
+    partial idx_topics_agent_user_date (migration 0094), which holds only agent topics.
     Visibility and reach are NOT checked here; `agent_topic_ids_for_day` does that on a
     hit. No folder -> None without a round-trip."""
     if not folder:
