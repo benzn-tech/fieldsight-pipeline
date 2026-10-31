@@ -85,3 +85,13 @@ def test_add_rereads_the_file(tmp_path):
     a.add("report/round0", 1.0)
     b.add("report/round0", 1.0)
     assert a.report_spent() == 2.0
+
+
+def test_openrouter_spend_never_counts_toward_the_anthropic_stops(tmp_path):
+    led = RL.ReportLedger(str(tmp_path / "anthropic_ledger.json"))
+    led.add("report/round0", 30.0)
+    led.add_openrouter(9.5)
+    assert led.report_spent() == 30.0 and led.global_spent() == 30.0
+    assert led.can_spend("report/round0", 1.0)
+    assert led.openrouter_spent() == 9.5
+    assert led.openrouter_room(10.0) == 0.5

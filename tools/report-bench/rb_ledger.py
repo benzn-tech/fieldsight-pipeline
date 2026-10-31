@@ -5,6 +5,10 @@ tools/web-answer-bench/ledger.py (`read_state`, `add_report_spend`); this module
 adds the report bench's own rules: the held-out reserve, the pre-held-out stop
 and the Haiku long-context price. Every check reads the file fresh, so spend
 the web bench recorded since is seen.
+
+OpenRouter dollars (spec 2026-10-31 Part A) go to the shared `openrouter`
+pool through the web ledger's pools-only writer: never a `report/*` pool, so
+none of the Anthropic stops below see them.
 """
 from __future__ import annotations
 
@@ -76,3 +80,12 @@ class ReportLedger:
 
     def add(self, pool, dollars):
         _W.add_report_spend(self.path, pool, dollars)
+
+    def openrouter_spent(self):
+        return _W.openrouter_spent(self.path)
+
+    def openrouter_room(self, cap):
+        return _W.openrouter_room(self.path, cap)
+
+    def add_openrouter(self, dollars):
+        _W.add_openrouter_spend(self.path, dollars)

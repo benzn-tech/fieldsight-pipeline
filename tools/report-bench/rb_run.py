@@ -11,6 +11,12 @@ Order: extraction -> template -> report, then model, candidate, session, rep
 * `--dry-run` prints the number of calls still to make and the $ upper, split
   Anthropic / OpenRouter, and exits 0. A live run whose `--confirm-calls` is
   missing or differs from that number exits 2 before any call.
+* OpenRouter (spec 2026-10-31 Part A): `--openrouter-key-file` = the owner's
+  bench-only key (without it QWEN_API_KEY, the prod key, and a printed warning);
+  dollars go to the shared ledger's `openrouter` pool, capped by
+  `--openrouter-cap` (default $10, both benches together). The dry run (and a
+  live start) exits 2 when the OpenRouter upper is over the room left; a call
+  is refused once the pool is spent (cut, exit 3, like the Claude cap).
 * `<out>/bench.lock` is held for the whole run: the report and web benches
   share `anthropic_ledger.json` and must never run at the same time.
 * Before each Claude call: `ReportLedger.can_spend("report/<phase>", upper)`.
@@ -43,8 +49,6 @@ import rb_ledger  # noqa: E402
 import rb_requests  # noqa: E402
 
 TASK_ORDER = ("X", "T", "R")
-OPENROUTER_UPPER = 0.05
-OPENROUTER_T_RETRY_UPPER = 0.03
 REPS = {"pilot": 1, "round0": 3, "rounds12": 3, "heldout": 3}
 POOLS = {"pilot": "report/pilot", "round0": "report/round0", "rounds12": "report/rounds12",
          "heldout": "report/heldout"}
@@ -55,7 +59,13 @@ def usd_upper(task, model_key, tokens, budget):
     """`tokens` = the prompt's upper token estimate (rb_common.est_tokens)."""
     m = rb_requests.MODELS[model_key]
     if m["vendor"] != "anthropic":
-        return OPENROUTER_UPPER + (OPENROUTER_T_RETRY_UPPER if task == "T" else 0.0)
+        # Pinned 2026-10-31 prices; every body carries the reasoning headroom.
+        W = rb_ledger.web_ledger()
+        up = W.or_upper(m["model"], tokens, budget + rb_requests.HEADROOM)
+        if task == "T":
+            up += W.or_upper(m["model"], tokens,
+                             rb_requests.T_RETRY_BUDGET + rb_requests.HEADROOM)
+        return up
     up = rb_ledger.call_cost(m["model"], tokens, budget + rb_requests.HEADROOM)
     if task == "T":
         up += rb_ledger.call_cost(m["model"], tokens,
@@ -143,10 +153,10 @@ def done_keys(runs_path):
 
 def preflight(todo, client_factory) -> list:
     """What would make the run fail on its first call, checked before the lock."""
+    import rb_callers
     vendors = {rb_requests.MODELS[c["model"]]["vendor"] for c in todo}
     problems = []
-    if "openrouter" in vendors and not (os.environ.get("QWEN_API_KEY")
-                                        or os.environ.get("DASHSCOPE_API_KEY")):
+    if "openrouter" in vendors and not rb_callers.openrouter_key():
         problems.append("QWEN_API_KEY (the OpenRouter key) is not set")
     if "anthropic" in vendors:
         if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
@@ -179,7 +189,7 @@ def _default_client():
 
 
 def execute(phase, calls, out, *, caller=None, client_factory=_default_client, http=None,
-            echo=print):
+            echo=print, openrouter_cap=None):
     import rb_callers
     caller = caller or rb_callers.call
     runs_path = os.path.join(out, "runs", phase + ".jsonl")
@@ -187,11 +197,17 @@ def execute(phase, calls, out, *, caller=None, client_factory=_default_client, h
     dropped = {_cell(r) for r in rb_common.read_jsonl(runs_path)
                if r.get("format_dropped") or r.get("outcome") == "schema_rejected"}
     ledger = rb_ledger.ReportLedger(os.path.join(out, rb_ledger.LEDGER_NAME))
-    client, cap_hit, cut = None, False, []
+    or_cap = (rb_ledger.web_ledger().OPENROUTER_CAP_USD if openrouter_cap is None
+              else openrouter_cap)
+    client, cap_hit, or_cap_hit, cut = None, False, False, []
     for c in calls:
         if c["key"] in done:
             continue
         claude = rb_requests.MODELS[c["model"]]["vendor"] == "anthropic"
+        if not claude and (or_cap_hit or ledger.openrouter_room(or_cap) <= 1e-9):
+            or_cap_hit = True
+            cut.append(c["key"])
+            continue
         if claude:
             if cap_hit or not ledger.can_spend(c["pool"], c["usd_upper"]):
                 cap_hit = True
@@ -220,6 +236,10 @@ def execute(phase, calls, out, *, caller=None, client_factory=_default_client, h
             format_dropped = True
         if claude and r.get("usd"):
             ledger.add(c["pool"], r["usd"])
+        if not claude:
+            spent = sum(a.get("openrouter_cost_usd") or 0.0 for a in r["attempts"])
+            if spent:
+                ledger.add_openrouter(spent)
         text = r.pop("text", "") or ""
         tp = _answer_path(out, c["key"])
         rb_common.write_text(tp, text)
@@ -229,7 +249,7 @@ def execute(phase, calls, out, *, caller=None, client_factory=_default_client, h
                     "format_dropped": format_dropped})
         rb_common.append_jsonl(runs_path, rec)
         echo(f"{c['key']} {r['outcome']} {r['attempts'][-1].get('latency_ms')}ms")
-    return {"cut": cut, "cap_hit": cap_hit}
+    return {"cut": cut, "cap_hit": cap_hit or or_cap_hit, "openrouter_cap_hit": or_cap_hit}
 
 
 def summary(phase, out, cut):
@@ -256,8 +276,19 @@ def main(argv=None, *, caller=None, client_factory=_default_client, http=None, c
     g.add_argument("--confirm-calls", type=int)
     ap.add_argument("--pilot-session")
     ap.add_argument("--r-template", help="recorded only; R prompts were pre-rendered with it")
+    ap.add_argument("--openrouter-key-file")
+    ap.add_argument("--openrouter-cap", type=float,
+                    default=rb_ledger.web_ledger().OPENROUTER_CAP_USD)
     a = ap.parse_args(argv)
     out = rb_common.check_out_dir(a.out)
+    import rb_callers
+    W = rb_ledger.web_ledger()
+    try:
+        key, _ = W.load_or_key(a.openrouter_key_file, "QWEN_API_KEY")
+    except ValueError as exc:
+        print("refused: " + str(exc))
+        return 2
+    rb_callers.set_openrouter_key(key if a.openrouter_key_file else None)
     index = rb_common.read_json(os.path.join(out, "prompts", "index.json"))
     mpath = os.path.join(out, "inputs", "manifest.json")
     manifest = rb_common.read_json(mpath) if os.path.exists(mpath) else None
@@ -274,6 +305,14 @@ def main(argv=None, *, caller=None, client_factory=_default_client, http=None, c
         n = sum(1 for c in todo if c["task"] == t)
         if n:
             print(f"  {t}: {n}")
+    led = rb_ledger.ReportLedger(os.path.join(out, rb_ledger.LEDGER_NAME))
+    room = led.openrouter_room(a.openrouter_cap)
+    print(f"openrouter pool ${led.openrouter_spent():.2f} of ${a.openrouter_cap:g}, "
+          f"room ${room:.2f}")
+    if orr > room + 1e-9:
+        print(f"refused: openrouter upper {orr:.2f} > room {room:.2f} "
+              "(raise --openrouter-cap or split the run)")
+        return 2
     if a.dry_run:
         return 0
     if a.confirm_calls != len(todo):
@@ -286,7 +325,7 @@ def main(argv=None, *, caller=None, client_factory=_default_client, http=None, c
         return 2
     with rb_common.bench_lock(out, "report"):
         res = execute(a.phase, todo, out, caller=caller, client_factory=client_factory,
-                      http=http)
+                      http=http, openrouter_cap=a.openrouter_cap)
     s = summary(a.phase, out, res["cut"])
     print(f"runs {s['runs']} anthropic ${s['anthropic_usd']:.2f} cut {s['cut_calls']}")
     for k, v in s["counts"].items():

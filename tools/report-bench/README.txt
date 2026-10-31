@@ -13,12 +13,23 @@ Rules that hold for every step
 - Anthropic pools in the shared ledger: report $40 (held-out reserve $9; pilot + round 0 + rounds 1-2 stop
   at $31); web $45 untouched; global $85.
 - Every live run: --dry-run first, then --confirm-calls N with N = the "to make" number it printed.
+- Models (spec 2026-10-31-model-scope-and-config-update-design Part A): muse, deepseek (OpenRouter),
+  haiku, sonnet (Claude 5.5). gemini / mimo are planned in no phase.
+- OpenRouter spend: pool "openrouter" in the same ledger file, shared with the web bench, never counted
+  toward the Anthropic caps. --openrouter-cap (default $10, both benches together): the dry run exits 2
+  when its OpenRouter upper is over the room left (raise the cap or split the run, e.g. X then T R); a
+  call is refused once the pool is spent (cut, exit 3). A response without usage.cost is charged at the
+  pinned 2026-10-31 price (muse 0.10/0.20, deepseek 0.13/0.65 $/M), never $0.
+- --openrouter-key-file <file>: the owner's bench-only OpenRouter key (own credit limit) on every
+  rb_run.py step. Without it the bench uses QWEN_API_KEY, which is the prod key, and prints
+  "WARNING: using the prod OpenRouter key". Keys are printed only as sha256[:8].
 
 Interpreters
   PY  = C:/Users/camil/wt/benchenv/Scripts/python.exe   (live steps: has the anthropic SDK)
   OUT = a directory outside the repo and Dropbox, e.g. C:/Users/camil/wt/report-bench-out
   CACHE = C:/Users/camil/wt/benchcache                   (git-archive snapshots of src/)
-  Keys (environment, owner): QWEN_API_KEY = the OpenRouter key (as llm_utils._call_qwen reads it);
+  KEYFILE = the bench-only OpenRouter key file (outside the repo and Dropbox), passed to rb_run.py as
+  --openrouter-key-file $KEYFILE; QWEN_API_KEY (the prod OpenRouter key) is only the fallback.
   ANTHROPIC_API_KEY for Claude; AWS: a read-only profile.
 
 P1 sequence (owner)
@@ -39,15 +50,17 @@ P1 sequence (owner)
     add --prefill-task-admission for sid93396a6...). Open the page, list items, Save; put the file at
     $OUT/gold/gold_<sid>.json. BEFORE any model output is looked at.
  8. $PY tools/report-bench/rb_run.py --phase pilot --task X --out $OUT --dry-run
-    $PY tools/report-bench/rb_run.py --phase pilot --task X --out $OUT --confirm-calls 6
+    $PY tools/report-bench/rb_run.py --phase pilot --task X --out $OUT --confirm-calls 4
+    (every rb_run.py line: add --openrouter-key-file $KEYFILE)
  9. $PY tools/report-bench/rb_gold.py pool --out $OUT --phase pilot --session <pilot sid>
     (> 60 rows for a session: two-rep rows come first, the rest behind "show the rest").
-10. Round 0, extraction first:
+10. Round 0, extraction first (X 4 candidates x 4 models x 4 sessions x 3 reps = 192):
     $PY tools/report-bench/rb_run.py --phase round0 --task X --out $OUT --dry-run    then --confirm-calls N
 11. Pin T's input (muse X-cur rep 1 per session) and pre-render T:
     $PY tools/report-bench/rb_prerender.py --out $OUT --pin-tcur $OUT/runs/pilot.jsonl $OUT/runs/round0.jsonl
     $PY tools/report-bench/rb_prerender.py --out $OUT --cache $CACHE --tasks T
 12. $PY tools/report-bench/rb_run.py --phase round0 --task T R --out $OUT --dry-run  then --confirm-calls N
+    (T 3 x 4 x 4 x 3 = 144, plus <= 144 retries; R 1 x 4 x 3 days x 3 = 36)
     Exit 3 = the report pool stopped Claude; the summary names the cut cells (accepted outcome).
 13. Adjudicate per session (and per R day, key <folder>_<date>):
     $PY tools/report-bench/rb_gold.py adjudicate --out $OUT --phase round0 --scope <sid or day>
