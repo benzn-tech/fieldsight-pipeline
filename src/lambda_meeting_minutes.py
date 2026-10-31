@@ -96,7 +96,7 @@ MINUTES_TRANSCRIPT_LIMIT = int(os.environ.get('MINUTES_TRANSCRIPT_LIMIT', '30000
 MINUTES_PREFIX = os.environ.get('MINUTES_PREFIX', 'meeting_minutes/')
 REPORT_PREFIX = os.environ.get('REPORT_PREFIX', 'reports/')  # compat output path
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
-CLAUDE_MODEL = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-4-6')
+CLAUDE_MODEL = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-5-5')
 
 import report_style
 

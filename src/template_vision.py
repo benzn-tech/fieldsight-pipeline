@@ -57,6 +57,40 @@ def model():
     return os.environ.get("TEMPLATE_DIGITISE_MODEL", "").strip() or DEFAULT_MODEL
 
 
+def pdf_model():
+    """TEMPLATE_DIGITISE_PDF_MODEL, or "" for "the image model reads PDFs too" (today).
+
+    Exists because the image winner of a model bench need not take a `file` part: if
+    it is a model with no PDF input, PDF uploads must still go somewhere that reads
+    them (spec 2026-10-31 B1, "PDF coupling")."""
+    return os.environ.get("TEMPLATE_DIGITISE_PDF_MODEL", "").strip()
+
+
+def model_for(pages):
+    """The model a read of THESE pages reaches. Anything reporting a model for a read
+    has to ask this, not `model()`: with a PDF model set, `model()` names a model that
+    did not write the answer."""
+    if pdf_model() and any(p["content_type"] == "application/pdf" for p in pages):
+        return pdf_model()
+    return model()
+
+
+def request_settings(name):
+    """(reasoning, provider) for a read by model `name`, from TEMPLATE_DIGITISE_REASONING
+    and TEMPLATE_DIGITISE_PROVIDER. Both unset is (None, None), the spike's request.
+
+    Reasoning is parsed for the model that gets it, so `off` aimed at a deepseek image
+    model is dropped (with a warning) when a PDF goes to muse, which 400s on it. The
+    provider pin names the IMAGE model's endpoint (e.g. coreweave/fp8 for deepseek), so
+    it never rides on a different PDF model, which that endpoint does not serve."""
+    reasoning = llm_utils.parse_reasoning(os.environ.get("TEMPLATE_DIGITISE_REASONING"),
+                                          model=name, name="TEMPLATE_DIGITISE_REASONING")
+    provider = None
+    if name == model():
+        provider = llm_utils.parse_provider(os.environ.get("TEMPLATE_DIGITISE_PROVIDER"))
+    return reasoning, provider
+
+
 def answer_tokens():
     raw = os.environ.get("TEMPLATE_DIGITISE_ANSWER_TOKENS", "").strip()
     try:
@@ -118,6 +152,8 @@ def read(pages, deadline=None):
     neither is an answer cut off at max_tokens -- the same request would be cut off
     again."""
     parts = build_parts(pages)
+    name = model_for(pages)
+    reasoning, provider = request_settings(name)
     started = time.monotonic()
     for attempt in range(2):
         left = None if deadline is None else deadline - (time.monotonic() - started)
@@ -125,8 +161,9 @@ def read(pages, deadline=None):
             logger.warning("template vision: no retry, %.1fs of the deadline left", left)
             break
         text, err = llm_utils.call_llm_parts(
-            parts, model=model(), max_tokens=answer_tokens(), fallback_env=FALLBACK_ENV,
-            deadline=left, caller="template_digitise")
+            parts, model=name, max_tokens=answer_tokens(), fallback_env=FALLBACK_ENV,
+            deadline=left, caller="template_digitise", reasoning=reasoning,
+            provider=provider)
         if err is not None:
             logger.error("template vision call failed: %s", err)
             if err.startswith(llm_utils.PARTS_CUT_OFF):

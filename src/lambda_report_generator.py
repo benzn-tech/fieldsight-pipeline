@@ -48,7 +48,7 @@ Trigger:
 Environment Variables:
     S3_BUCKET           - S3 bucket name
     ANTHROPIC_API_KEY   - Anthropic API key (sk-ant-xxx)
-    CLAUDE_MODEL        - Claude model ID (default: claude-sonnet-4-6)
+    CLAUDE_MODEL        - Claude model ID (default: claude-sonnet-5-5)
     REPORT_PREFIX       - Report output prefix (default: reports/)
     ITEMS_TABLE         - DynamoDB table for items (default: fieldsight-items)
     REPORTS_TABLE       - DynamoDB table for reports (default: fieldsight-reports)
@@ -106,7 +106,7 @@ DAILY_TRANSCRIPT_LIMIT = int(os.environ.get('DAILY_TRANSCRIPT_LIMIT', '300000'))
 # Roll-ups summarise summaries, so their source is already dense.
 ROLLUP_SOURCE_LIMIT = int(os.environ.get('ROLLUP_SOURCE_LIMIT', '60000'))
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
-CLAUDE_MODEL = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-4-6')
+CLAUDE_MODEL = os.environ.get('CLAUDE_MODEL', 'claude-sonnet-5-5')
 ITEMS_TABLE = os.environ.get('ITEMS_TABLE', 'fieldsight-items')
 REPORTS_TABLE = os.environ.get('REPORTS_TABLE', 'fieldsight-reports')
 AUDIT_TABLE = os.environ.get('AUDIT_TABLE', 'fieldsight-audit')
