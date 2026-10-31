@@ -34,7 +34,7 @@ logger.setLevel(logging.INFO)
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic")
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 
 def _optional_float(name):
     """A knob that is UNSET must stay unsent, not become 0.0. Sending a default

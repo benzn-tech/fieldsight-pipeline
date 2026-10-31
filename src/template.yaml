@@ -1943,7 +1943,7 @@ Resources:
         Variables:
           S3_BUCKET: !Ref DataBucketName
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
-          CLAUDE_MODEL: claude-sonnet-4-6
+          CLAUDE_MODEL: claude-sonnet-5-5
           LLM_PROVIDER: !Ref LlmProvider
           LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
@@ -2098,7 +2098,7 @@ Resources:
         Variables:
           S3_BUCKET: !Ref DataBucketName
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
-          CLAUDE_MODEL: claude-sonnet-4-6
+          CLAUDE_MODEL: claude-sonnet-5-5
           LLM_PROVIDER: !Ref LlmProvider
           LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
@@ -2164,7 +2164,7 @@ Resources:
           # names, not invented ones) — this worker now makes the one model call a
           # `generate` request needs.
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
-          CLAUDE_MODEL: claude-sonnet-4-6
+          CLAUDE_MODEL: claude-sonnet-5-5
           LLM_PROVIDER: !Ref LlmProvider
           LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
@@ -2357,7 +2357,7 @@ Resources:
           # rag-search invoke) on top of the Claude call itself. A 2048-token
           # sonnet completion risks blowing that budget; haiku is fast and
           # matches the legacy S3 path's HAIKU_MODEL.
-          CLAUDE_MODEL: claude-haiku-4-5-20251001
+          CLAUDE_MODEL: claude-haiku-5-5
           LLM_PROVIDER: !Ref LlmProvider
           LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
@@ -2498,7 +2498,7 @@ Resources:
           # note in the top-of-file Metadata block.
           VOICE_AUDIT_FUNCTION: !Ref VoiceAuditFunction
           # Same value as AskAgentFunction; see the reasoning there.
-          CLAUDE_MODEL: claude-haiku-4-5-20251001
+          CLAUDE_MODEL: claude-haiku-5-5
           LLM_PROVIDER: !Ref LlmProvider
           LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
@@ -3546,7 +3546,7 @@ Resources:
           ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           S3_BUCKET: !Ref IngestBucketName
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
-          CLAUDE_MODEL: claude-sonnet-4-6
+          CLAUDE_MODEL: claude-sonnet-5-5
           LLM_PROVIDER: !Ref LlmProvider
           LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
@@ -3709,7 +3709,7 @@ Resources:
           LLM_HTTP_TIMEOUT: '240'
           S3_BUCKET: !Ref IngestBucketName
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
-          CLAUDE_MODEL: claude-sonnet-4-6
+          CLAUDE_MODEL: claude-sonnet-5-5
           LLM_PROVIDER: !Ref LlmProvider
           LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
@@ -4223,7 +4223,7 @@ Resources:
           # summarisation needs no extended reasoning and thinking dominated latency
           # (qwen3.7-max + thinking took ~54 s, blowing the <=2-min finalize budget).
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
-          CLAUDE_MODEL: claude-sonnet-4-6
+          CLAUDE_MODEL: claude-sonnet-5-5
           LLM_PROVIDER: !Ref LlmProvider
           LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
@@ -5192,7 +5192,7 @@ Resources:
           DASHSCOPE_EMBED_DIM: '1024'
           # Claude key — mirrors ExtractSessionFunction's env block.
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
-          CLAUDE_MODEL: claude-sonnet-4-6
+          CLAUDE_MODEL: claude-sonnet-5-5
           LLM_PROVIDER: !Ref LlmProvider
           LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
@@ -5316,7 +5316,7 @@ Resources:
           LLM_HTTP_TIMEOUT: '12'
           LLM_CHAIN_BUDGET_SECONDS: '14'
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
-          CLAUDE_MODEL: claude-haiku-4-5-20251001
+          CLAUDE_MODEL: claude-haiku-5-5
           LLM_PROVIDER: !Ref LlmProvider
           LLM_TEMPERATURE: !Ref LlmTemperature
           QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
