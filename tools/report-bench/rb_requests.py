@@ -48,7 +48,10 @@ MODELS = {
     "sonnet": {"vendor": "anthropic", "model": "claude-sonnet-5-5"},
     "haiku": {"vendor": "anthropic", "model": "claude-haiku-5-5"},
 }
-MODEL_ORDER = ["muse", "deepseek", "gemini", "mimo", "sonnet", "haiku"]
+# The planned set (spec 2026-10-31 Part A): muse, DeepSeek, Haiku 5.5, Sonnet
+# 5.5. gemini / mimo stay in MODELS (their bodies are still built and tested)
+# but are planned in no phase.
+MODEL_ORDER = ["muse", "deepseek", "haiku", "sonnet"]
 
 
 _PINNED = {"QWEN_BASE_URL": rb_common.IMPORT_ENV["QWEN_BASE_URL"],
