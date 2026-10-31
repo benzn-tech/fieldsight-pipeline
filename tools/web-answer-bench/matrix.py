@@ -113,11 +113,13 @@ def calls_upper(cell):
 
 def or_run_upper(cell):
     """OpenRouter $ upper of one run of `cell`: every call at the pinned price,
-    Stage 0's input upper and the step's max_tokens."""
+    Stage 0's input upper and the step's max_tokens, plus the web plugin fee on
+    the steps that send the plugin (verify, single)."""
     step, _, model = cell
-    return calls_upper(cell) * ledger_mod.or_upper(
+    fee = ledger_mod.WEB_PLUGIN_USD_PER_CALL_2026_10_31 if step != "draft" else 0.0
+    return calls_upper(cell) * (ledger_mod.or_upper(
         openrouter_bench.PROFILES[model]["model"], stage0.UPPER_INPUT_TOKENS,
-        OR_MAX_TOKENS[step])
+        OR_MAX_TOKENS[step]) + fee)
 
 
 def plan(cells, reps=REPS, *, items=5, price_per_1000=0.0):
@@ -342,6 +344,9 @@ def run(args, *, items, client, or_call=openrouter_bench.call, clock=time.monoto
                   for rep in range(REPS) for it in items
                   if (_cell_id(c), it["id"], rep) not in done_before)
     or_room = ledger_mod.openrouter_room(ledger_path, or_cap)
+    claude_todo = any((_cell_id(c), it["id"], rep) not in done_before
+                      for c in cells if c[2] in CLAUDE
+                      for rep in range(REPS) for it in items)
     print(f"matrix r0 plan: {p['cells']} cells, {p['runs']} runs, upper bound "
           f"{p['upper']} calls (Anthropic {p['anthropic_upper']}, OpenRouter "
           f"{p['openrouter_upper']}), <= {p['searches_upper']} Anthropic searches, "
@@ -356,16 +361,25 @@ def run(args, *, items, client, or_call=openrouter_bench.call, clock=time.monoto
           f"${ledger_mod.openrouter_spent(ledger_path):.2f} of ${or_cap:g}, "
           f"room ${or_room:.2f}", file=stdout)
     if or_todo > or_room + 1e-9:
-        # Never planned to die halfway: the owner raises the cap or splits the run.
-        print(f"matrix: refused, OpenRouter upper ${or_todo:.2f} > room ${or_room:.2f} "
-              "(raise --openrouter-cap or split the run)", file=stdout)
-        return 2, {"refused": "openrouter_cap", "plan": p}
+        if not claude_todo:
+            # Only OpenRouter work left and it cannot fit: never planned to die
+            # halfway; the owner raises the cap or splits the run.
+            print(f"matrix: refused, OpenRouter upper ${or_todo:.2f} > room "
+                  f"${or_room:.2f} (raise --openrouter-cap or split the run)", file=stdout)
+            return 2, {"refused": "openrouter_cap", "plan": p}
+        # Claude cells still have work: they run; OpenRouter runs past the room
+        # are cut (cut_by_pool), a resume with a raised cap finishes them.
+        print(f"openrouter: shortfall ${or_todo - or_room:.2f}; OpenRouter runs past the "
+              "room will be cut, Claude cells still run", file=stdout)
     if args.dry_run:
         return 0, {"dry_run": True, "plan": p}
 
     os.makedirs(args.out, exist_ok=True)
     unsure = stage0.unsure_ids(items)
     summary = {"round": 0, "plan": p, "hard_stop": False, "openrouter_cap_hit": False}
+    # Runs skipped because the OpenRouter pool was spent: no row is written, so a
+    # resume runs them. A verify whose gemini draft was skipped is skipped too.
+    or_cut, cut_drafts = set(), set()
     records = _load_done(calls_path)
     done = {(r["cell"], r["item"], r["rep"]) for r in records}
     drafts = {(r["item"], r["rep"]): (r["text"], r["latency_ms"]) for r in records
@@ -393,8 +407,14 @@ def run(args, *, items, client, or_call=openrouter_bench.call, clock=time.monoto
                         summary["hard_stop"] = True
                         break
                     if model not in CLAUDE and _or_blocked(ledger_path, or_cap):
-                        summary["hard_stop"] = summary["openrouter_cap_hit"] = True
-                        break
+                        summary["openrouter_cap_hit"] = True
+                        or_cut.add(_cell_id(cell))
+                        if cell == GEMINI_DRAFT:
+                            cut_drafts.add((item, rep))
+                        continue
+                    if step == "verify" and (item, rep) in cut_drafts:
+                        or_cut.add(_cell_id(cell))
+                        continue
                     seq += 1
                     rec = {"run_id": f"r0-{seq:04d}", "round": 0, "cell": _cell_id(cell),
                            "step": step, "prompt_id": pid, "model_key": model,
@@ -451,8 +471,8 @@ def run(args, *, items, client, or_call=openrouter_bench.call, clock=time.monoto
     summary["cells"] = summarize(records)
     per_cell = Counter(r["cell"] for r in records)
     summary["cut_by_pool"] = [_cell_id(c) for c in cells
-                              if per_cell[_cell_id(c)] < REPS * len(items)] \
-        if summary["hard_stop"] else []
+                              if per_cell[_cell_id(c)] < REPS * len(items)
+                              and (summary["hard_stop"] or _cell_id(c) in or_cut)]
     summary["anthropic_spent_usd"] = round(ledger.spent, 4)
     summary["matrix_pool_spent_usd"] = round(ledger.pool_spent(POOL), 4)
     summary["openrouter_spent_usd"] = round(ledger_mod.openrouter_spent(ledger_path), 4)
@@ -463,7 +483,7 @@ def run(args, *, items, client, or_call=openrouter_bench.call, clock=time.monoto
               f"${c['anthropic_usd']:.4f}", file=stdout)
     if summary["cut_by_pool"]:
         print("cut by pool: " + ", ".join(summary["cut_by_pool"]), file=stdout)
-    return (3 if summary["hard_stop"] else 0), summary
+    return (3 if summary["hard_stop"] or summary["openrouter_cap_hit"] else 0), summary
 
 
 def main(argv=None):

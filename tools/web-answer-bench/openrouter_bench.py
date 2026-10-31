@@ -115,7 +115,8 @@ def _attempt(http, body, headers, timeout, web, model=None, upper_tokens=(0, 0))
         r["error_code"] = type(exc).__name__
         if _is_timeout(exc):
             if model in _L.OR_PRICES_2026_10_31:
-                r["openrouter_cost_usd"] = _L.or_upper(model, *upper_tokens)
+                r["openrouter_cost_usd"] = _L.or_upper(model, *upper_tokens) + (
+                    _L.WEB_PLUGIN_USD_PER_CALL_2026_10_31 if web else 0.0)
                 r["cost_estimated"] = True
             return r, "timeout"
         return r, "http_error"
@@ -140,6 +141,8 @@ def _attempt(http, body, headers, timeout, web, model=None, upper_tokens=(0, 0))
         # token counts either, at the call's upper token estimate.
         cost = _L.or_cost(data, model, *((in_tok, out_tok) if in_tok or out_tok
                                          else upper_tokens))
+        if web:
+            cost += _L.WEB_PLUGIN_USD_PER_CALL_2026_10_31   # not in the token price
         r["cost_estimated"] = True
     seen = []
     for s in reply.search_results:

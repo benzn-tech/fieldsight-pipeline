@@ -141,6 +141,10 @@ OR_PRICES_2026_10_31 = {
     "deepseek/deepseek-v4.1-flash": (0.13, 0.65),
     "google/gemini-3.8-flash": (0.825, 4.125),
 }
+# OpenRouter web plugin fee per request that sends plugins [{id: "web"}]:
+# max_results default 5 x $0.004 per result (OpenRouter web plugin pricing,
+# read 2026-10-31 -- verify before relying on it). Not in the token price.
+WEB_PLUGIN_USD_PER_CALL_2026_10_31 = 5 * 0.004
 PROD_KEY_WARNING = "WARNING: using the prod OpenRouter key"
 
 

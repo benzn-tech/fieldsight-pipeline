@@ -370,7 +370,10 @@ def test_plan_hand_count():
     gem = (45 * 46_000 * 0.825 + (15 * 1024 + 30 * 2048) * 4.125) / 1e6
     ds = (105 * 46_000 * 0.13 + (15 * 1024 + 90 * 2048) * 0.65) / 1e6
     mu = (105 * 46_000 * 0.10 + (15 * 1024 + 90 * 2048) * 0.20) / 1e6
-    assert p["openrouter_usd_upper"] == pytest.approx(gem + ds + mu, abs=1e-5)
+    # + the web plugin fee on every verify / single call: 150 + 60 = 210 x $0.02.
+    fee = 210 * 0.02
+    assert p["openrouter_usd_upper"] == pytest.approx(gem + ds + mu + fee, abs=1e-5)
+    assert ledger.WEB_PLUGIN_USD_PER_CALL_2026_10_31 == pytest.approx(0.02)
 
 
 def _m_argv(out, *extra):
@@ -500,16 +503,29 @@ def test_dry_run_prints_plan_and_makes_no_call(tmp_path):
     assert code == 0
     assert client.requests == [] and or_fake.calls == []
     assert "330" in text and "525" in text and "$24.85" in text
-    assert "openrouter: upper $3.31" in text and "room $10.00" in text
+    assert "openrouter: upper $7.51" in text and "room $10.00" in text
     assert not (tmp_path / "matrix_r0_calls.jsonl").exists()
 
 
-def test_dry_run_refuses_when_openrouter_upper_is_over_the_room(tmp_path):
+def test_openrouter_shortfall_with_claude_work_left_is_not_refused(tmp_path):
     ledger.add_openrouter_spend(str(tmp_path / "anthropic_ledger.json"), 7.0)
     code, summary, text, client, or_fake = _m_run(tmp_path, dry=True)
-    assert code == 2 and summary["refused"] == "openrouter_cap"
-    assert "$3.31 > room $3.00" in text
+    assert code == 0 and "shortfall $4.51" in text and "Claude cells still run" in text
     assert client.requests == [] and or_fake.calls == []
+
+
+def test_dry_run_refuses_when_only_openrouter_work_is_left_over_the_room(tmp_path):
+    ledger.add_openrouter_spend(str(tmp_path / "anthropic_ledger.json"), 7.0)
+    rows = [{"run_id": f"r0-{n:04d}", "cell": matrix._cell_id(c), "item": it["id"],
+             "rep": rep, "outcome": "ok"}
+            for n, (c, rep, it) in enumerate(
+                ((c, rep, it) for c in matrix.round0_cells() if c[2] in matrix.CLAUDE
+                 for rep in range(3) for it in _m_items()), start=1)]
+    (tmp_path / "matrix_r0_calls.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    code, summary, text, client, or_fake = _m_run(tmp_path, dry=True)
+    assert code == 2 and summary["refused"] == "openrouter_cap"
+    assert "$7.51 > room $3.00" in text
 
 
 def test_openrouter_spend_goes_to_its_pool_only(tmp_path):
@@ -538,8 +554,16 @@ def test_openrouter_pool_spent_stops_the_openrouter_cells(tmp_path):
     code, summary = matrix.run(args, items=_m_items(), client=ClaudeFake(clock),
                                or_call=or_fake, clock=clock, stdout=io.StringIO())
     assert code == 3 and summary["openrouter_cap_hit"] is True
-    assert len(or_fake.calls) == 10
+    assert len(or_fake.calls) == 10                    # 10 of the 15 gemini drafts
     assert ledger.openrouter_spent(lp) == pytest.approx(10.0)
+    # Claude cells keep running; only the verifies of the 5 cut drafts are skipped.
+    rows = _rows(tmp_path)
+    claude = [r for r in rows if r["model_key"] in matrix.CLAUDE]
+    assert len(claude) == 150 - 4 * 5
+    assert not any(r["outcome"] == "no_draft" for r in rows)   # skipped, not recorded
+    cut = set(summary["cut_by_pool"])
+    assert {matrix._cell_id(c) for c in matrix.round0_cells() if c[2] not in matrix.CLAUDE} <= cut
+    assert "verify/verify_v1/sonnet" in cut and "draft/draft_v1/sonnet" not in cut
 
 
 def test_full_round0_counts_order_and_ledger(tmp_path):
@@ -1214,3 +1238,12 @@ def test_grade_charges_the_openrouter_pool(tmp_path):
     st = ledger.read_state(str(tmp_path / "anthropic_ledger.json"))
     assert code == 0 and st["pools"]["openrouter"] == pytest.approx(28 * 0.0001)
     assert st["spent_usd"] == 0.0
+
+
+def test_web_call_without_cost_carries_the_plugin_fee(or_key):
+    clock = Clock()
+    r = orb.call("deepseek", "P", web=True, timeout=14.0, clock=clock,
+                 http=FakeHttp(clock, [completion(usage={"prompt_tokens": 1000,
+                                                         "completion_tokens": 100})]))
+    assert r["openrouter_cost_usd"] == pytest.approx(
+        (1000 * 0.13 + 100 * 0.65) / 1e6 + ledger.WEB_PLUGIN_USD_PER_CALL_2026_10_31)
