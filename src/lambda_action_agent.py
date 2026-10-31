@@ -187,6 +187,9 @@ class RunContext:
     budget: Budget
     checkpoint: Callable = field(repr=False, default=None)
     clock: Callable[[], float] = time.monotonic
+    # timeout -> a Lambda client for one rag-search hop (rag_lambda_client); None = use
+    # lambda_client (tests).
+    rag_client_factory: Optional[Callable] = field(repr=False, default=None)
 
     def deadline_for(self, stage: str) -> float:
         """The absolute deadline (on `clock`) of a stage: 'gather' (tool rounds), 'write'
@@ -235,6 +238,22 @@ def _lambda():
         _lambda_client = boto3.client("lambda", config=Config(read_timeout=120,
                                                               retries={"max_attempts": 0}))
     return _lambda_client
+
+
+_rag_clients = {}
+
+
+def rag_lambda_client(timeout):
+    """A Lambda client for one rag-search hop whose read timeout is `timeout` rounded up to
+    a whole second (cached per value): the hop is bounded by the gather time left, not by
+    the org-api client's 120 s. No botocore retries -- S8's single retry is the stages'."""
+    secs = max(1, int(-(-float(timeout) // 1)))
+    if secs not in _rag_clients:
+        import boto3
+        from botocore.config import Config
+        _rag_clients[secs] = boto3.client("lambda", config=Config(
+            read_timeout=secs, connect_timeout=min(5, secs), retries={"max_attempts": 0}))
+    return _rag_clients[secs]
 
 
 # ---- helpers ------------------------------------------------------------------------------
@@ -328,10 +347,14 @@ def _make_checkpoint(*, s3, lambda_client, bucket, org_fn, pack_id):
     return checkpoint
 
 
-def _fail(lambda_client, org_fn, pack_id, reason) -> str:
+def _fail(lambda_client, org_fn, pack_id, reason, run_trace=None) -> str:
+    """`run_trace`: the counts the stages gathered before failing (§4.5), when the
+    exception carried them; org-api keeps it only when it is counts-shaped."""
+    event = {"task": "action_pack_fail", "pack_id": pack_id, "reason": reason}
+    if isinstance(run_trace, dict):
+        event["run_trace"] = run_trace
     try:
-        _invoke_org(lambda_client, org_fn,
-                    {"task": "action_pack_fail", "pack_id": pack_id, "reason": reason})
+        _invoke_org(lambda_client, org_fn, event)
     except Exception as exc:  # noqa: BLE001 -- the stale-run sweep is the backstop (S9)
         logger.error("action agent fail invoke failed pack=%s reason=%s (%s)", pack_id,
                      reason, type(exc).__name__)
@@ -398,7 +421,8 @@ def process_key(key, *, s3, lambda_client, clock=time.monotonic, remaining_s=900
         s3=s3, lambda_client=lambda_client, data_bucket=bucket,
         lake_bucket=os.environ.get("LAKE_BUCKET", ""), org_api_function=org_fn,
         rag_search_function=os.environ.get("RAG_SEARCH_FUNCTION", ""),
-        budget=budget, checkpoint=checkpoint, clock=clock)
+        budget=budget, checkpoint=checkpoint, clock=clock,
+        rag_client_factory=rag_lambda_client)
 
     runner = stage_runner or run_stages
     try:
@@ -413,7 +437,8 @@ def process_key(key, *, s3, lambda_client, clock=time.monotonic, remaining_s=900
         reason = failure_reason(exc)
         logger.warning("action agent stage error pack=%s reason=%s (%s)", pack_id, reason,
                        type(exc).__name__)
-        return _fail(lambda_client, org_fn, pack_id, reason)
+        return _fail(lambda_client, org_fn, pack_id, reason,
+                     run_trace=getattr(exc, "run_trace", None))
 
     try:
         answer = _invoke_org(lambda_client, org_fn,

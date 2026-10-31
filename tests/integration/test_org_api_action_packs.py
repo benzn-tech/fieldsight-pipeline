@@ -475,6 +475,26 @@ def test_heartbeat_store_and_fail_tasks(db, env):
     assert org._action_pack_fail(db, str(p3["id"]), {"reason": "budget"}) == {"ok": True}
 
 
+def test_fail_task_keeps_a_counts_trace_and_drops_free_text(db, env):
+    """Task 11 fix round 1 (§4.5): a failed pack keeps the counts gathered so far."""
+    _, site, _, creator = _world(db)
+    p1 = ap.create_queued(db, site_id=site["id"], created_by=creator["id"], instruction="a")
+    ap.claim(db, p1["id"])
+    trace = {"stage": "write", "rounds": 3, "truncated": True, "ms": {"gather": 1200},
+             "truncated_reasons": ["time"]}
+    assert org._action_pack_fail(db, str(p1["id"]), {"reason": "model",
+                                                     "run_trace": trace}) == {"ok": True}
+    assert db.execute("SELECT state, failure, run_trace FROM action_packs WHERE id=%s",
+                      (p1["id"],)).fetchone() == ("failed", "model", trace)
+    p2 = ap.create_queued(db, site_id=site["id"], created_by=creator["id"], instruction="b")
+    assert org._action_pack_fail(db, str(p2["id"]), {
+        "reason": "budget", "run_trace": {"reading": "The pour at C4"}}) == {
+        "ok": True, "trace_dropped": "value"}
+    row = db.execute("SELECT state, failure, run_trace FROM action_packs WHERE id=%s",
+                     (p2["id"],)).fetchone()
+    assert row[:2] == ("failed", "budget") and "reading" not in (row[2] or {})
+
+
 # ---------------------------------------------------------------- fix round 1
 
 def test_heartbeat_plan_fields_do_not_erase_each_other(db, env):

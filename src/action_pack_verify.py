@@ -6,15 +6,23 @@ snapshots; until Task 12 lands it raises NotImplementedError, so a claimed pack 
 Contract (what action_pack_stages passes and expects):
 
     verify(draft, *, registry, items, sources, ctx, writer_model, deadline) -> {
-        "conclusion": [{"text": str, "refs": [ref], "confidence": "supported"|"uncertain"}],
-            # the verifier maps its own labels: weak -> "uncertain", unsupported -> dropped
-        "actions": [{...the draft action..., "verifier": "supported"|"weak"|"unsupported"}],
-            # code-check failures are dropped (or labelled unsupported); unsupported
-            # actions are KEPT (stored for the eval, never applicable -- S15)
+        "conclusion": [{"index": i, "confidence": "supported"|"uncertain"}],
+            # i indexes draft["conclusion"]; the verifier maps its own labels: weak ->
+            # "uncertain", unsupported -> leave the line out. Never an upgrade.
+        "actions": [{"index": i, "verifier": "supported"|"weak"|"unsupported"}],
+            # i indexes draft["actions"]; a code-check failure is left out (dropped) or
+            # labelled unsupported; unsupported actions are KEPT (stored for the eval,
+            # never applicable -- S15)
         "model": str,          # the verifier model actually used (after its fallbacks)
-        "counts": {str: int},  # counts only, merged into run_trace["verify"]
+        "counts": {str: int},  # optional, counts only, merged into run_trace["verify"]
         "tokens": int,         # optional, added to the run's token count
     }
+
+  The verifier only LABELS and DROPS (action_pack_stages.apply_verdicts): type, target,
+  proposed, rationale, refs and text always come from the draft; any other field it
+  returns, an element without an index, an index out of range or repeated, is ignored and
+  counted (run_trace.verify_ignored). A non-int index, an unknown label, refs that are not
+  a list of strings, an empty model or non-int counts fail the pack (reason verifier).
 
   draft        -- {"conclusion": [...], "actions": [...]} as Write produced it (validated:
                   every ref is a citable ref of this run, close/update targets are in

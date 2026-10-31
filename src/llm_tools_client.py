@@ -87,6 +87,8 @@ class ChatTurn:
     error: str | None = None
     timed_out: bool = False
     bad_args: list = field(default_factory=list)
+    # complete_json only: the chain entry that answered (`model` is the vendor's id).
+    requested_model: str = ""
 
 
 def _primary_model():
@@ -336,3 +338,83 @@ def chat(messages, tools, *, model=None, tool_choice="required",
 
     return ChatTurn(error=last_error or "no response", timed_out=last_timed_out,
                     model=chain[min(idx, len(chain) - 1)])
+
+
+def complete_json(prompt, *, model=None, max_tokens=2048, deadline=None,
+                  caller="ask_judge", attempt_timeout=None) -> ChatTurn:
+    """One tool-less JSON answer routed exactly like the Ask judge: `model` (default the
+    judge model) then ASK_JUDGE_FALLBACKS (unset = none), the provider pin and reasoning on
+    the configured judge model only, a fallback on a 5xx, a 429 or a transport failure,
+    never on another 4xx. `response_format` json_object; no tools. Never raises for a
+    vendor failure. `deadline` is absolute on `_now()`; `attempt_timeout` (default
+    HTTP_TIMEOUT_CAP) caps one attempt. `turn.requested_model` is the chain entry that
+    answered, `turn.model` the vendor's served id. Added for the action agent (action
+    packs Task 11); `chat` is unchanged."""
+    key = corroboration_client.api_key()
+    if not key:
+        logger.error("llm_tools: API key not set caller=%s", caller)
+        return ChatTurn(error="API key not configured")
+    if deadline is not None and deadline - _now() < MIN_TIME_LEFT:
+        return ChatTurn(error="no time left", timed_out=True)
+    env_primary = _primary_model()
+    chain = _model_chain(model or env_primary)
+    primary_extras = {}
+    if chain[0] == env_primary:
+        pin, reasoning = _provider_pin(), _reasoning()
+        if pin:
+            primary_extras["provider"] = pin
+        if reasoning:
+            primary_extras["reasoning"] = reasoning
+    headers = {"Content-Type": "application/json", "Authorization": "Bearer " + key}
+    http = corroboration_client.http_session()
+    cap = HTTP_TIMEOUT_CAP if attempt_timeout is None else float(attempt_timeout)
+    started = _now()
+    last_error, last_timed_out = None, False
+    for idx, current in enumerate(chain):
+        timeout = cap
+        if deadline is not None:
+            left = deadline - _now()
+            if left < MIN_TIME_LEFT:
+                return ChatTurn(error=f"deadline reached ({last_error})", timed_out=True,
+                                model=current, requested_model=current)
+            timeout = min(timeout, left)
+        payload = {"model": current,
+                   "messages": [{"role": "user", "content": prompt}],
+                   "response_format": {"type": "json_object"},
+                   "max_tokens": max_tokens + llm_utils.REASONING_HEADROOM_TOKENS}
+        if idx == 0:
+            payload.update(primary_extras)
+        attempt_start = _now()
+        try:
+            resp = http.request("POST", corroboration_client.API_URL,
+                                body=json.dumps(payload), headers=headers, timeout=timeout)
+        except Exception as e:                # noqa: BLE001 - all of it is a miss
+            last_error = f"{type(e).__name__} on {current}"
+            last_timed_out = isinstance(e, urllib3.exceptions.TimeoutError)
+            logger.warning("llm_tools json: %s caller=%s model=%s after %.2fs",
+                           type(e).__name__, caller, current, _now() - attempt_start)
+            continue
+        if resp.status == 200:
+            try:
+                data = json.loads(resp.data.decode("utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("not an object")
+            except Exception:                 # noqa: BLE001
+                return ChatTurn(error="unreadable completion", model=current,
+                                requested_model=current)
+            turn = _parse(data, current)
+            turn.requested_model = current
+            if not turn.text.strip():
+                turn.error = "empty completion"
+            _log(turn, caller, _now() - started, 0)
+            return turn
+        message = _error_detail(resp)
+        last_error = f"HTTP {resp.status}: {message}" if message else f"HTTP {resp.status}"
+        last_timed_out = False
+        logger.warning("llm_tools json: HTTP %d caller=%s model=%s after %.2fs",
+                       resp.status, caller, current, _now() - attempt_start)
+        if 500 <= resp.status < 600 or resp.status == 429:
+            continue
+        break
+    return ChatTurn(error=last_error or "no response", timed_out=last_timed_out,
+                    model=chain[-1], requested_model="")

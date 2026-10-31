@@ -1473,13 +1473,23 @@ def _action_pack_store(conn, pack_id, event):
 
 
 def _action_pack_fail(conn, pack_id, event):
-    """queued/running -> failed with a reason code. {ok: false} when already final."""
+    """queued/running -> failed with a reason code. {ok: false} when already final.
+    An optional `run_trace` (the counts gathered before the failure, §4.5) is stored when
+    it is counts-shaped (action_pack_view.fail_trace_error); a malformed one is dropped --
+    the pack still fails -- and the answer says why ({trace_dropped: code})."""
     reason = event.get("reason")
     if reason not in action_packs.FAILURE_REASONS:
         return {"error": "invalid", "detail": "reason"}
-    done = action_packs.fail(conn, pack_id, reason)
-    logger.info("action pack failed pack=%s reason=%s changed=%s", pack_id, reason, done)
-    return {"ok": done}
+    trace, dropped = event.get("run_trace"), None
+    if trace is not None:
+        dropped = action_pack_view.fail_trace_error(trace)
+        if dropped:
+            trace = None
+    done = (action_packs.fail(conn, pack_id, reason, run_trace=trace) if trace is not None
+            else action_packs.fail(conn, pack_id, reason))
+    logger.info("action pack failed pack=%s reason=%s changed=%s trace=%s", pack_id, reason,
+                done, dropped or ("kept" if trace is not None else "none"))
+    return {"ok": done, "trace_dropped": dropped} if dropped else {"ok": done}
 
 
 def dispatch(conn, event, method, route):

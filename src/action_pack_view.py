@@ -244,6 +244,50 @@ def payload_shape_error(payload):
     return None
 
 
+# A failed pack's trace (spec §4.5: counts kept, no excerpts). The worker sends what it
+# gathered with action_pack_fail; org-api stores it only when it is counts-shaped.
+FAIL_TRACE_MAX_BYTES = 8192
+_TRACE_KEY = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+_TRACE_CODE = re.compile(r"^[a-z0-9_:.-]{1,40}$")
+_TRACE_LIST_MAX = 16
+
+
+def _trace_scalar(v) -> bool:
+    if v is None or isinstance(v, bool) or isinstance(v, int):
+        return True
+    if isinstance(v, float):
+        return v == v and v not in (float("inf"), float("-inf"))
+    return isinstance(v, str) and bool(_TRACE_CODE.match(v))
+
+
+def _trace_value(v, depth) -> bool:
+    if _trace_scalar(v):
+        return True
+    if isinstance(v, list):
+        return len(v) <= _TRACE_LIST_MAX and all(_trace_scalar(x) for x in v)
+    if isinstance(v, dict) and depth == 0:
+        return all(isinstance(k, str) and _TRACE_KEY.match(k) and _trace_value(x, 1)
+                   for k, x in v.items())
+    return False
+
+
+def fail_trace_error(trace):
+    """None when `trace` is counts-shaped: an object whose keys are short identifiers and
+    whose values are numbers, booleans, null, short lowercase codes, lists (<= 16) of those,
+    or one level of objects of those; at most FAIL_TRACE_MAX_BYTES. Else a code: not_object
+    | key | value | size. Free text (a reading, an excerpt) fails `value`."""
+    if not isinstance(trace, dict):
+        return "not_object"
+    for k, v in trace.items():
+        if not isinstance(k, str) or not _TRACE_KEY.match(k):
+            return "key"
+        if not _trace_value(v, 0):
+            return "value"
+    if len(json.dumps(trace)) > FAIL_TRACE_MAX_BYTES:
+        return "size"
+    return None
+
+
 def invalid_detail(message: str) -> str:
     """A code for the repository's ValueError (its message names keys/refs; codes only leave)."""
     if message.startswith("unknown"):

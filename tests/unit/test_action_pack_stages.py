@@ -180,8 +180,10 @@ class Verify:
     def __call__(self, draft, *, registry, items, sources, ctx, writer_model, deadline):
         self.calls.append({"draft": draft, "sources": sources, "writer_model": writer_model,
                            "deadline": deadline, "registry": registry})
-        return {"conclusion": draft["conclusion"],
-                "actions": [dict(a, verifier=self.label) for a in draft["actions"]],
+        return {"conclusion": [{"index": i, "confidence": c["confidence"]}
+                               for i, c in enumerate(draft["conclusion"])],
+                "actions": [{"index": i, "verifier": self.label}
+                            for i in range(len(draft["actions"]))],
                 "model": self.model, "counts": {"checked": len(draft["actions"])}}
 
 
@@ -442,7 +444,8 @@ def test_every_model_call_gets_the_stage_deadline():
 
     def spy(prompt, **kw):
         stage = "write" if kw["caller"] == "action_write" else "gather"
-        seen.append((kw["deadline"], ctx.left(stage)))
+        hop = st.TOOL_HOP_S if kw["caller"] == "action_round" else 0.0   # fix round 1
+        seen.append((kw["deadline"], ctx.left(stage) - hop))
         return real(prompt, **kw)
     st.run(ctx, deps(model=spy, tools=tools))
     assert len(seen) == 3

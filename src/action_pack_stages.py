@@ -65,16 +65,23 @@ ROUND1_ITEMS_LIMIT = 100
 # A model call is not started with less than this left in its stage; a model round is not
 # started with less than ROUND_FLOOR_S of gather left (the call plus one 20 s tool hop).
 MIN_MODEL_CALL_S = 10.0
-ROUND_FLOOR_S = MIN_MODEL_CALL_S + ask_tools.MAX_DEADLINE_S
+TOOL_HOP_S = float(ask_tools.MAX_DEADLINE_S)      # one rag-search hop after a round's answer
+ROUND_FLOOR_S = MIN_MODEL_CALL_S + TOOL_HOP_S
 MIN_WRITE_S = 15.0
 # The rag-search retry (S8) only when another hop still fits.
 MIN_RETRY_S = 5.0
+# A rag-search hop's client read timeout: the hop's deadline_s plus this margin, never more
+# than RagSearchFunction's own 23 s Timeout.
+RAG_READ_MARGIN_S = 3.0
+RAG_CLIENT_MAX_TIMEOUT_S = ask_tools.MAX_DEADLINE_S + RAG_READ_MARGIN_S
 WEB_BUDGET_S = 45.0
 MIN_WEB_S = 10.0
 # Gather rounds read a compact render (Ask's 8k-token figure, §4.2); Write reads its own
 # full-excerpt render (S7) inside a larger budget of its own.
 GATHER_RENDER_MAX_CHARS = 8000 * 4
 GATHER_TEXT_MAX_CHARS = 300
+GATHER_MAX_HEADERS = 40
+GATHER_HEADER_MAX_CHARS = GATHER_RENDER_MAX_CHARS // 4
 WRITE_RENDER_MAX_CHARS = 30000 * 4
 PLAN_MAX_TOKENS = 1500
 ROUND_MAX_TOKENS = 1000
@@ -91,6 +98,8 @@ PRIORITY_MAX_CHARS = 32
 # Web snapshots (§4.2: <= 8 fetched pages per run); fetched in parallel.
 MAX_SNAPSHOTS = 8
 SNAPSHOT_WAIT_S = 30.0
+# Snapshot fetches and S3 puts stop once less than this is left of the verify window.
+SNAPSHOT_PUT_MIN_VERIFY_S = agent.VERIFY_RESERVE_S / 2
 
 ACTION_TYPES = ("close_item", "update_item", "create_item", "draft_rfi", "draft_email",
                 "note")
@@ -143,7 +152,7 @@ def _nz_today():
 @dataclass
 class Deps:
     """The seams. None = the real thing, resolved by `resolve()`."""
-    call_model: Optional[Callable] = None     # llm_utils.call_llm
+    call_model: Optional[Callable] = None     # judge_call (the Ask judge's routing)
     execute: Optional[Callable] = None        # ask_tools.execute
     items_run: Optional[Callable] = None      # ask_items.run
     general_answer: Optional[Callable] = None  # web_answer.general_answer (via web_search)
@@ -155,8 +164,7 @@ class Deps:
 
     def resolve(self) -> "Deps":
         if self.call_model is None:
-            import llm_utils
-            self.call_model = llm_utils.call_llm
+            self.call_model = judge_call
         if self.execute is None:
             self.execute = ask_tools.execute
         if self.items_run is None:
@@ -174,6 +182,26 @@ class Deps:
             import project_doc_flag
             self.docs_on = project_doc_flag.on
         return self
+
+
+def judge_call(prompt, *, max_tokens, force_json=True, model, deadline, caller, info):
+    """The writer IS the Ask judge (§4.4): one tool-less JSON answer through
+    llm_tools_client.complete_json -- ASK_JUDGE_PROVIDER pin and ASK_JUDGE_REASONING on the
+    judge model, ASK_JUDGE_FALLBACKS (unset = none). `deadline` is seconds from now (the
+    stage's), converted to the client's clock and also the per-attempt cap. -> (text, err);
+    `info` gets model (the chain entry that answered), served_model and usage."""
+    import llm_tools_client
+    turn = llm_tools_client.complete_json(
+        prompt, model=model, max_tokens=max_tokens,
+        deadline=llm_tools_client._now() + float(deadline), caller=caller,
+        attempt_timeout=float(deadline))
+    if turn.error is not None:
+        return None, turn.error
+    usage = turn.usage if isinstance(turn.usage, dict) else {}
+    info.update(model=turn.requested_model or model, served_model=turn.model or None,
+                usage={"prompt_tokens": usage.get("prompt_tokens"),
+                       "completion_tokens": usage.get("completion_tokens")})
+    return turn.text, None
 
 
 # ---- S8: the rag-search hop retries once, on a throttle or a 5xx only -----------------
@@ -197,21 +225,47 @@ def retryable(exc) -> bool:
 class RetryOnceLambda:
     """Wraps the run's Lambda client for every rag-search hop (ask_tools + items tool, both
     of which swallow exceptions into meta.error: the retry has to happen below them).
-    Retries one invoke once when `retryable(exc)` and MIN_RETRY_S still fits before the
-    gather deadline."""
 
-    def __init__(self, client, *, deadline, clock, trace):
+    * The invoke's `deadline_s` is lowered to the gather time actually left (a retry never
+      carries the first attempt's figure).
+    * With `client_factory(timeout)` (the handler's rag_lambda_client), each hop uses a
+      client whose read timeout is that deadline plus RAG_READ_MARGIN_S, capped at
+      RAG_CLIENT_MAX_TIMEOUT_S -- never the org-api client's flat 120 s.
+    * Retries one invoke once when `retryable(exc)` and MIN_RETRY_S still fits before the
+      gather deadline (S8)."""
+
+    def __init__(self, client, *, deadline, clock, trace, client_factory=None):
         self._client, self._deadline, self._clock, self._trace = client, deadline, clock, trace
+        self._factory = client_factory
+
+    def _attempt(self, kwargs):
+        left = self._deadline - self._clock()
+        kw = dict(kwargs)
+        try:
+            body = json.loads(kw.get("Payload") or "null")
+        except (TypeError, ValueError):
+            body = None
+        hop = None
+        if isinstance(body, dict) and isinstance(body.get("deadline_s"), (int, float)):
+            if left < body["deadline_s"]:
+                body["deadline_s"] = max(0.0, left)
+                kw["Payload"] = json.dumps(body)
+            hop = body["deadline_s"]
+        client = self._client
+        if self._factory is not None:
+            hop = max(1.0, min(left, hop if hop is not None else left))
+            client = self._factory(min(RAG_CLIENT_MAX_TIMEOUT_S, hop + RAG_READ_MARGIN_S))
+        return client.invoke(**kw)
 
     def invoke(self, **kwargs):
         try:
-            return self._client.invoke(**kwargs)
+            return self._attempt(kwargs)
         except Exception as exc:                            # noqa: BLE001
             if not retryable(exc) or self._deadline - self._clock() < MIN_RETRY_S:
                 raise
             self._trace["rag_retries"] = self._trace.get("rag_retries", 0) + 1
             logger.info("action agent rag-search retry (%s)", type(exc).__name__)
-            return self._client.invoke(**kwargs)
+            return self._attempt(kwargs)
 
 
 # ---- small helpers -------------------------------------------------------------------
@@ -318,6 +372,21 @@ class Run:
     as_of: Optional[str] = None
     tool_ctx: object = None
     web_trace: dict = field(default_factory=dict)
+    last_served: Optional[str] = None
+    stage: str = "start"
+
+    def failure_trace(self):
+        """Counts only (action_pack_view.fail_trace_error's shape): what was spent and how
+        far the run got -- never an excerpt, a reading or a model answer."""
+        out = {k: v for k, v in self.trace.items()
+               if action_pack_view.fail_trace_error({k: v}) is None}
+        out.update(stage=self.stage, tokens=self.tokens, token_cap=self.token_cap,
+                   truncated=self.truncated, truncated_reasons=list(self.truncated_reasons),
+                   refs_gathered=len(self.registry), items_seen=len(self.items))
+        if self.web_trace:
+            out["web"] = dict(self.web_trace)
+        return out if action_pack_view.fail_trace_error(out) is None else {
+            "stage": self.stage, "tokens": self.tokens}
 
     # -- budget --------------------------------------------------------------------
     def truncate(self, reason):
@@ -325,10 +394,11 @@ class Run:
         if reason not in self.truncated_reasons:
             self.truncated_reasons.append(reason)
 
-    def model(self, prompt, *, stage, max_tokens, caller):
-        """One model call with the stage's deadline -> (text, err, model actually used).
-        Raises _NoTime when the stage has no room left for a call."""
-        left = self.ctx.left(stage)
+    def model(self, prompt, *, stage, max_tokens, caller, reserve=0.0):
+        """One model call with the stage's deadline (minus `reserve`, the time the caller
+        still needs after the answer) -> (text, err, model actually used); the vendor's
+        served id is left in self.last_served. Raises _NoTime when there is no room."""
+        left = self.ctx.left(stage) - reserve
         if left < MIN_MODEL_CALL_S:
             raise _NoTime(stage)
         wanted = agent.writer_model()
@@ -345,6 +415,7 @@ class Run:
         if not counted:
             counted = (len(prompt) + len(text or "")) // 4      # estimate: chars / 4
         self.tokens += counted
+        self.last_served = info.get("served_model") if err is None else None
         return text, err, (info.get("model") or wanted)
 
     def over_cap(self):
@@ -510,6 +581,8 @@ def plan_stage(run: Run) -> Plan:
         plan, code = validate_plan(parse_json_object(text), today)
         if plan is not None:
             run.models["planner"] = used
+            if run.last_served:
+                run.models["planner_served"] = run.last_served
             if plan.clamped:
                 run.trace["plan_range_clamped"] = True
             if not plan.site_matches:
@@ -679,12 +752,28 @@ def budget_select(entries, max_chars, line_of):
 
 
 def gather_render(run):
-    heads = [_env_header(env) for _, env in run.envelopes]
+    """The round model's evidence: call headers (the most recent GATHER_MAX_HEADERS, inside
+    GATHER_HEADER_MAX_CHARS -- older ones condensed into one count line, so headers can
+    never crowd out the evidence), then the evidence lines inside what is left, with a
+    count line when some are left out."""
+    heads, used = [], 0
+    for _, env in reversed(run.envelopes):
+        h = _env_header(env)
+        if len(heads) >= GATHER_MAX_HEADERS or used + len(h) + 1 > GATHER_HEADER_MAX_CHARS:
+            break
+        heads.insert(0, h)
+        used += len(h) + 1
+    hidden = len(run.envelopes) - len(heads)
+    if hidden:
+        heads.insert(0, f"[DATA {hidden} earlier calls not shown]")
     entries = list(run.registry.values()) + [{"kind": "person", "item": p, "ref": p.get("ref")}
                                              for p in run.others]
-    room = GATHER_RENDER_MAX_CHARS - sum(len(h) + 1 for h in heads)
-    kept, _ = budget_select(entries, max(room, 0), lambda e: _line(e, full=False))
-    return _fence(heads + [_line(e, full=False) for e in kept])
+    room = GATHER_RENDER_MAX_CHARS - sum(len(h) + 1 for h in heads) - 64
+    kept, dropped = budget_select(entries, max(room, 0), lambda e: _line(e, full=False))
+    lines = heads + [_line(e, full=False) for e in kept]
+    if dropped:
+        lines.append(f"[DATA {dropped} evidence lines not shown (budget)]")
+    return _fence(lines)
 
 
 def _canon(call):
@@ -754,16 +843,18 @@ def model_rounds(run):
             evidence=gather_render(run))
         try:
             text, err, _ = run.model(prompt, stage="gather", max_tokens=ROUND_MAX_TOKENS,
-                                     caller="action_round")
+                                     caller="action_round", reserve=TOOL_HOP_S)
         except _NoTime:
             run.truncate("time")
             break
         if err is not None:
             _bump(run.trace, "round_model_errors")
+            run.truncate("round_model_error")
             break
         parsed = validate_round(parse_json_object(text), run)
         if parsed is None:
             _bump(run.trace, "round_invalid")
+            run.truncate("round_invalid")
             break
         calls, done, refused = parsed
         _bump(run.trace, "calls_refused", refused)
@@ -800,7 +891,9 @@ def gather_stage(run):
         caller_sub=ctx.caller_sub, today=run.deps.today(),
         deadline=ctx.deadline_for("gather"),
         lambda_client=RetryOnceLambda(ctx.lambda_client, deadline=ctx.deadline_for("gather"),
-                                      clock=ctx.clock, trace=run.trace),
+                                      clock=ctx.clock, trace=run.trace,
+                                      client_factory=getattr(ctx, "rag_client_factory",
+                                                             None)),
         function_name=ctx.rag_search_function, refs=run.refs, clock=ctx.clock)
     t0 = ctx.clock()
     round1(run)
@@ -831,10 +924,11 @@ Rules:
 - Records (R) and the project's documents (D) come first. Use web refs (W) only for what the records and documents do not cover, and never let a web source override the project's own records or documents.
 - Never state a clause or requirement of a standard from memory. When neither the project documents nor the web evidence cover it, say no standard was found in the project library (uncertain) and suggest uploading it.
 - Never ask the user questions.
+- Never reopen an item, and only change an item whose current status allows it.
 - close_item / update_item target an existing item: copy its stable_id exactly from an "item" evidence line. Never invent one. At most one action per item; put every change to an item in one update_item.
 - Action types and their "proposed" fields:
   close_item   {{"status": "done" | "closed"}}
-  update_item  any of {{"status": "open"|"in_progress"|"blocked"|"done"|"closed", "deadline": "YYYY-MM-DD", "responsible": "a name", "priority": "..."}}
+  update_item  any of {{"status": "in_progress"|"blocked"|"done"|"closed", "deadline": "YYYY-MM-DD", "responsible": "a name", "priority": "..."}}
   create_item  {{"text": "...", optional "responsible", "deadline", "priority"}} -- only when no open item already covers it
   draft_rfi    {{"subject": "...", "body": "..."}}
   draft_email  {{"subject": "...", "body": "...", optional "to"}}
@@ -924,6 +1018,25 @@ def _proposed(atype, raw):
     return out
 
 
+def legal_change(atype, proposed, current):
+    """S10 against the target's CURRENT status (its latest items read): the proposal with
+    an unchanged status removed, or None when what is left is not a legal transition, is a
+    reopen (the agent never proposes `-> open` in v1), or proposes nothing."""
+    proposed = dict(proposed)
+    status = proposed.get("status")
+    if status is not None and status == current:
+        if atype == "close_item":
+            return None                               # already closed that way
+        proposed.pop("status")
+    status = proposed.get("status")
+    if status is not None and (status == "open"
+                               or not action_pack_view.transition_allowed(current, status)):
+        return None
+    if atype == "close_item" and current in action_pack_view.CLOSE_STATUSES:
+        return None
+    return proposed or None
+
+
 def validate_draft(obj, run, citable):
     """{"conclusion": [...], "actions": [...]} from the writer's object, every element that
     breaks the schema dropped and counted in run.trace["write_dropped"]. None when the
@@ -976,6 +1089,10 @@ def validate_draft(obj, run, citable):
             if target is None or target not in run.items:
                 _bump(counts, "targets")
                 continue
+            proposed = legal_change(atype, proposed, run.items[target].get("status"))
+            if proposed is None:
+                _bump(counts, "transitions")
+                continue
         actions.append({"type": atype, "target_stable_id": target, "proposed": proposed,
                         "rationale": rationale, "refs": refs})
     if counts:
@@ -1008,6 +1125,8 @@ def write_stage(run):
         draft = validate_draft(parse_json_object(text), run, citable)
         if draft is not None:
             run.models["writer"] = used
+            if run.last_served:
+                run.models["writer_served"] = run.last_served
             return draft
     raise agent.ModelFailure("write schema")
 
@@ -1069,7 +1188,13 @@ def snapshot_stage(run, sources):
     if skipped > 0:
         run.trace["snapshots_skipped"] = skipped
     t0 = ctx.clock()
-    wait_s = max(0.0, min(SNAPSHOT_WAIT_S, ctx.left("verify") - agent.VERIFY_RESERVE_S / 2))
+    wait_s = min(SNAPSHOT_WAIT_S, ctx.left("verify") - SNAPSHOT_PUT_MIN_VERIFY_S)
+    if wait_s <= 0:
+        # No room before the verifier's half of the window: no fetch, no put.
+        _bump(run.trace, "snapshots_put_skipped", len(todo))
+        run.trace["snapshots"] = 0
+        run.trace["snapshots_none"] = len(todo)
+        return
     pages = {}
     pool = ThreadPoolExecutor(max_workers=len(todo))
     try:
@@ -1093,6 +1218,10 @@ def snapshot_stage(run, sources):
     stored = 0
     for r in todo:
         page = pages.get(r) or {"ok": False, "reason": "timeout"}
+        if page.get("ok") and ctx.left("verify") < SNAPSHOT_PUT_MIN_VERIFY_S:
+            # The verify window is for the verifier: no more puts (url kept, no snapshot).
+            _bump(run.trace, "snapshots_put_skipped")
+            continue
         item = dict(run.registry[r]["item"], ref=r)
         row = action_pack_web.snapshot_source(
             item, fetcher=_Prefetched(page), s3=ctx.s3, bucket=ctx.lake_bucket,
@@ -1105,21 +1234,75 @@ def snapshot_stage(run, sources):
     run.trace.setdefault("ms", {})["snapshot"] = int((ctx.clock() - t0) * 1000)
 
 
-def _verified(result):
-    """The verifier's answer, shape-checked: (conclusion, actions, model, counts, tokens)."""
-    if not isinstance(result, dict) or not isinstance(result.get("conclusion"), list) \
-            or not isinstance(result.get("actions"), list) \
-            or not isinstance(result.get("model"), str) or not result["model"]:
-        raise agent.VerifierFailure("verifier answer shape")
-    conclusion = [c for c in result["conclusion"]
-                  if isinstance(c, dict) and isinstance(c.get("text"), str)
-                  and c.get("confidence") in CONFIDENCE and isinstance(c.get("refs"), list)]
-    actions = [a for a in result["actions"]
-               if isinstance(a, dict) and a.get("verifier") in VERIFIER_LABELS
-               and a.get("type") in ACTION_TYPES and a.get("refs")]
-    counts = result.get("counts") if isinstance(result.get("counts"), dict) else {}
-    tokens = result.get("tokens") if isinstance(result.get("tokens"), int) else 0
-    return conclusion, actions, result["model"], counts, tokens
+def _is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def apply_verdicts(draft, result):
+    """Map the verifier's answer back onto the draft: the verifier may only LABEL and DROP.
+
+    `result` = {"conclusion": [{"index": i, "confidence": supported|uncertain}],
+                "actions": [{"index": i, "verifier": supported|weak|unsupported}],
+                "model": str, "counts": {str: int}?, "tokens": int?}.
+    Every other field (type, target, proposed, rationale, refs, text) comes from the draft;
+    a draft element the answer does not name is dropped; an element with no index, an
+    index out of range or repeated, is ignored; a field that differs from the draft is
+    ignored; a conclusion can be downgraded, never upgraded. All three are counted.
+    A malformed answer (non-int index, unknown label, odd refs, empty model, non-int
+    counts) is reason `verifier`.
+    -> (conclusion, actions, model, counts, tokens, ignored counts)."""
+    bad = agent.VerifierFailure
+    if not isinstance(result, dict) or not isinstance(result.get("conclusion"), list)             or not isinstance(result.get("actions"), list)             or not isinstance(result.get("model"), str) or not result["model"].strip():
+        raise bad("verifier answer shape")
+    counts = result.get("counts", {})
+    tokens = result.get("tokens", 0)
+    if not isinstance(counts, dict) or not all(isinstance(k, str) and _is_int(v)
+                                               for k, v in counts.items()):
+        raise bad("verifier counts")
+    if not _is_int(tokens):
+        raise bad("verifier tokens")
+    ignored = {"elements": 0, "fields": 0, "upgrades": 0}
+
+    def labels(elements, drafted, label_key, allowed):
+        out = {}
+        for el in elements:
+            if not isinstance(el, dict):
+                raise bad("verifier element")
+            refs = el.get("refs")
+            if refs is not None and not (isinstance(refs, list)
+                                         and all(isinstance(r, str) for r in refs)):
+                raise bad("verifier refs")
+            if el.get(label_key) not in allowed:
+                raise bad("verifier label")
+            if "index" not in el:
+                ignored["elements"] += 1
+                continue
+            idx = el["index"]
+            if not _is_int(idx):
+                raise bad("verifier index")
+            if not 0 <= idx < len(drafted) or idx in out:
+                ignored["elements"] += 1
+                continue
+            for k, v in el.items():
+                if k not in ("index", label_key) and drafted[idx].get(k) != v:
+                    ignored["fields"] += 1
+            out[idx] = el[label_key]
+        return out
+
+    c_labels = labels(result["conclusion"], draft["conclusion"], "confidence", CONFIDENCE)
+    a_labels = labels(result["actions"], draft["actions"], "verifier", VERIFIER_LABELS)
+    conclusion = []
+    for i, c in enumerate(draft["conclusion"]):
+        if i not in c_labels:
+            continue
+        conf = c_labels[i]
+        if conf == "supported" and c["confidence"] != "supported":
+            ignored["upgrades"] += 1
+            conf = c["confidence"]
+        conclusion.append(dict(c, confidence=conf))
+    actions = [dict(a, verifier=a_labels[i]) for i, a in enumerate(draft["actions"])
+               if i in a_labels]
+    return conclusion, actions, result["model"], counts, tokens, ignored
 
 
 def build_payload(run, conclusion, actions):
@@ -1143,7 +1326,9 @@ def build_payload(run, conclusion, actions):
                         "confidence": c["confidence"]} for c in conclusion],
         "actions": out_actions,
         "as_of": run.as_of,
-        "models": {k: run.models.get(k) for k in ("planner", "writer", "verifier")},
+        "models": {**{k: run.models.get(k) for k in ("planner", "writer", "verifier")},
+                   **{k: run.models[k] for k in ("planner_served", "writer_served")
+                      if run.models.get(k)}},
         "run_trace": None,          # filled by run()
         "sources": refs,            # replaced by run() with the rows
     }
@@ -1153,16 +1338,34 @@ def build_payload(run, conclusion, actions):
 
 def run(ctx, deps: Optional[Deps] = None) -> dict:
     """Plan -> Gather -> Write -> snapshots -> verify -> the store payload. Raises
-    lambda_action_agent.Cancelled at a checkpoint, a StageError subclass on failure."""
+    lambda_action_agent.Cancelled at a checkpoint, a StageError subclass on failure; a
+    failure carries `exc.run_trace`, the counts gathered so far (§4.5), for the fail task."""
     deps = (deps or Deps()).resolve()
     r = Run(ctx=ctx, deps=deps, token_cap=agent.token_cap())
+    try:
+        return _run(r)
+    except agent.Cancelled:
+        raise
+    except Exception as exc:                                # noqa: BLE001 -- re-raised
+        try:
+            exc.run_trace = r.failure_trace()
+        except Exception:                                   # noqa: BLE001 -- best effort
+            pass
+        raise
+
+
+def _run(r: Run) -> dict:
+    ctx, deps = r.ctx, r.deps
     t_start = ctx.clock()
 
+    r.stage = "plan"
     r.plan = plan_stage(r)
     ctx.checkpoint(reading=r.plan.reading, title=r.plan.title)
 
+    r.stage = "gather"
     gather_stage(r)
 
+    r.stage = "write"
     t0 = ctx.clock()
     draft = write_stage(r)
     r.trace.setdefault("ms", {})["write"] = int((ctx.clock() - t0) * 1000)
@@ -1172,20 +1375,21 @@ def run(ctx, deps: Optional[Deps] = None) -> dict:
     # snapshots); the payload keeps only those still cited after verification.
     sources = {ref: source_row(r.registry[ref], ctx.site_id)
                for ref in cited_refs(draft["conclusion"], draft["actions"])}
+    r.stage = "snapshot"
     snapshot_stage(r, sources)
+    r.stage = "verify"
 
     t0 = ctx.clock()
     result = deps.verify(draft, registry=dict(r.registry), items=dict(r.items),
                          sources=sources, ctx=ctx, writer_model=r.models.get("writer"),
                          deadline=ctx.deadline_for("verify"))
-    conclusion, actions, vmodel, vcounts, vtokens = _verified(result)
+    # The verifier only labels and drops: every other field comes from the draft.
+    conclusion, actions, vmodel, vcounts, vtokens, vignored = apply_verdicts(draft, result)
     r.models["verifier"] = vmodel
     r.tokens += vtokens
     r.trace.setdefault("ms", {})["verify"] = int((ctx.clock() - t0) * 1000)
-    # The verifier only labels and drops; it never adds a ref or a target.
-    actions = [a for a in actions if set(a["refs"]) <= set(sources)
-               and (a["type"] not in TARGETED or a.get("target_stable_id") in r.items)]
-    conclusion = [c for c in conclusion if set(c["refs"]) <= set(sources)]
+    if any(vignored.values()):
+        r.trace["verify_ignored"] = vignored
 
     payload = build_payload(r, conclusion, actions)
     payload["sources"] = [sources[ref] for ref in payload["sources"]]
@@ -1198,8 +1402,7 @@ def run(ctx, deps: Optional[Deps] = None) -> dict:
         "draft_conclusion": len(draft["conclusion"]), "draft_actions": len(draft["actions"]),
         "conclusion": len(payload["conclusion"]), "actions": len(payload["actions"]),
         "web": dict(r.web_trace),
-        "verify": {k: v for k, v in vcounts.items()
-                   if isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool)},
+        "verify": dict(vcounts),
     })
     trace["ms"] = dict(trace.get("ms") or {}, total=int((ctx.clock() - t_start) * 1000))
     payload["run_trace"] = trace
