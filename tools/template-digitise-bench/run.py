@@ -22,10 +22,15 @@ truth item: it ignored the image) is skipped.
 
 Each arm runs in its own subprocess (`run.py --worker <job>`) with an environment built
 from nothing: LLM_PROVIDER=qwen, QWEN_BASE_URL=OpenRouter, QWEN_API_KEY = the key file's,
-TEMPLATE_DIGITISE_MODEL / _REASONING / _PROVIDER, no fallbacks -- set before llm_utils is
-imported (its import-time constants). The worker calls `template_vision.read()`, the prod
-prompt, shrink and JSON retry, unchanged; it only watches `llm_utils._post_with_retry` to
-read each response's usage. OpenRouter dollars go to the `openrouter` pool of --ledger
+TEMPLATE_DIGITISE_MODEL / _REASONING / _PROVIDER, no fallbacks, and prod's timeouts
+(TemplateDigitiseFunction: LLM_HTTP_TIMEOUT 300, LLM_CHAIN_BUDGET_SECONDS 840) -- set
+before llm_utils is imported (its import-time constants). The worker calls
+`template_vision.read()` with prod's deadline (Lambda Timeout 900 - the 30 s write
+reserve), the prod prompt, shrink and JSON retry, unchanged; it only meters each HTTP
+attempt (the urllib3 pool llm_utils posts with), so an attempt that times out inside
+_post_with_retry's retry ladder is charged too. Logging is off in the worker (template
+_vision logs answer text on a bad answer) and its stderr is kept in <out>/jobs/, never
+echoed. OpenRouter dollars go to the `openrouter` pool of --ledger
 (the benches' shared anthropic_ledger.json; default <out>/anthropic_ledger.json): checked
 before every read, charged after it (usage.cost, else the pinned upper, never $0).
 
@@ -90,7 +95,13 @@ UPPER_PROMPT_TOKENS = 600
 ANSWER_TOKENS = 32000                   # template_vision.ANSWER_TOKENS
 HEADROOM_TOKENS = 8000                  # PR-2 adds REASONING_HEADROOM_TOKENS with reasoning
 READ_ATTEMPTS = 2                       # template_vision.read: one JSON retry
-READ_DEADLINE_S = 300.0
+# Prod (src/template.yaml TemplateDigitiseFunction, lambda_template_digitise._deadline):
+# Timeout 900 s, the read gets what is left minus WRITE_RESERVE_SECONDS (30).
+PROD_LAMBDA_TIMEOUT_S = 900
+PROD_WRITE_RESERVE_S = 30
+READ_DEADLINE_S = float(PROD_LAMBDA_TIMEOUT_S - PROD_WRITE_RESERVE_S)
+PROD_HTTP_TIMEOUT = "300"
+PROD_CHAIN_BUDGET_S = "840"
 WORKER_TIMEOUT_S = 3600
 
 _PASSTHROUGH = ("SYSTEMROOT", "PATH", "TEMP", "TMP")
@@ -229,13 +240,31 @@ def arm_env(arm, key, base=None):
         "TEMPLATE_DIGITISE_PROVIDER": arm["provider"],
         "TEMPLATE_DIGITISE_PDF_MODEL": "",
         "TEMPLATE_DIGITISE_FALLBACK_MODELS": "",
+        "LLM_FALLBACK_MODELS": "",
+        "LLM_HTTP_TIMEOUT": PROD_HTTP_TIMEOUT,
+        "LLM_CHAIN_BUDGET_SECONDS": PROD_CHAIN_BUDGET_S,
         "PYTHONIOENCODING": "utf-8",
     })
     return env
 
 
-def _spawn(cmd, env):
-    return subprocess.run(cmd, env=env, timeout=WORKER_TIMEOUT_S, check=False).returncode
+def _spawn(cmd, env, stdout=None):
+    """Runs the worker; its stdout (ids and numbers) passes through, its stderr is
+    kept beside the job file and only counted here (it can carry answer text)."""
+    stdout = stdout or sys.stdout
+    r = subprocess.run(cmd, env=env, timeout=WORKER_TIMEOUT_S, check=False,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out = r.stdout.decode("utf-8", "replace")
+    if out:
+        stdout.write(out)
+    err = r.stderr.decode("utf-8", "replace")
+    if err.strip():
+        path = cmd[-1] + ".stderr.txt"
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(err)
+        print(f"worker stderr: {len(err.splitlines())} lines kept in {path} (not shown)",
+              file=stdout)
+    return r.returncode
 
 
 # ---------------------------------------------------------------- worker side
@@ -267,9 +296,45 @@ def call_cost(model, calls, est_in, est_out):
     return usd
 
 
+class _MeteredPool:
+    """One urllib3 pool as llm_utils._post_with_retry makes it, recording every
+    attempt: status + numeric usage, or status None when the attempt raised."""
+
+    def __init__(self, real_pool, calls):
+        self._pool, self._calls = real_pool, calls
+
+    def request(self, method, url, **kw):
+        try:
+            resp = self._pool.request(method, url, **kw)
+        except Exception as exc:                          # noqa: BLE001 - re-raised
+            self._calls.append({"status": None, "error": type(exc).__name__, "usage": {}})
+            raise
+        rec = {"status": resp.status, "usage": {}}
+        try:
+            rec["usage"] = _numeric(json.loads(resp.data.decode("utf-8")).get("usage"))
+        except Exception:                                 # noqa: BLE001 - counts only
+            pass
+        self._calls.append(rec)
+        return resp
+
+
+class _Urllib3Meter:
+    """Stands in for the `urllib3` module inside llm_utils only."""
+
+    def __init__(self, real, calls):
+        self._real, self._calls = real, calls
+
+    def PoolManager(self, *a, **kw):                      # noqa: N802 - urllib3's name
+        return _MeteredPool(self._real.PoolManager(*a, **kw), self._calls)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
 def worker(job_path):
     """Runs in the arm's subprocess (env already set). Reads, writes one result file
-    per read, charges the ledger. Never prints item text."""
+    per read, charges the ledger. Never prints item text; logging is off."""
+    import logging
     with open(job_path, encoding="utf-8") as f:
         job = json.load(f)
     sys.path.insert(0, SRC)
@@ -277,20 +342,18 @@ def worker(job_path):
     import template_vision
     W = _load_web("ledger")
     calls = []
-    real_post = llm_utils._post_with_retry
+    real_urllib3 = llm_utils.urllib3
+    llm_utils.urllib3 = _Urllib3Meter(real_urllib3, calls)
+    # template_vision logs a bad answer's text (%.300r); nothing may reach stderr.
+    logging.disable(logging.CRITICAL)
+    try:
+        return _worker_reads(job, template_vision, W, calls)
+    finally:
+        logging.disable(logging.NOTSET)
+        llm_utils.urllib3 = real_urllib3
 
-    def watched(url, body, headers, **kw):
-        resp, err = real_post(url, body, headers, **kw)
-        rec = {"status": getattr(resp, "status", None), "usage": {}}
-        if resp is not None:
-            try:
-                rec["usage"] = _numeric(json.loads(resp.data.decode("utf-8")).get("usage"))
-            except Exception:                            # noqa: BLE001 - counts only
-                pass
-        calls.append(rec)
-        return resp, err
 
-    llm_utils._post_with_retry = watched
+def _worker_reads(job, template_vision, W, calls):
     arm = job["arm"]
     out_dir = job["out_dir"]
     os.makedirs(out_dir, exist_ok=True)
@@ -438,7 +501,7 @@ def run(args, *, caps=None, spawn=_spawn, key=None, stdout=sys.stdout, truths=No
         arm = next(a for a in p["arms"] if a["id"] == pr["arm"])
         pdir = os.path.join(args.out, "probes", pr["arm"])
         code = spawn([sys.executable, me, "--worker", _job(args, arm, pdir, probe=True)],
-                     arm_env(arm, key))
+                     arm_env(arm, key), stdout=stdout)
         probes[pr["key"]] = code == 0 and _probe_passed(pdir, truths)
         print(f"probe {pr['key']}: {'ok' if probes[pr['key']] else 'FAILED'}", file=stdout)
     with open(os.path.join(args.out, "probes.json"), "w", encoding="utf-8", newline="") as f:
@@ -453,7 +516,7 @@ def run(args, *, caps=None, spawn=_spawn, key=None, stdout=sys.stdout, truths=No
             continue
         adir = os.path.join(args.out, "arms", arm["id"])
         code = spawn([sys.executable, me, "--worker", _job(args, arm, adir)],
-                     arm_env(arm, key))
+                     arm_env(arm, key), stdout=stdout)
         if code == 3:
             cap_hit = True
             print(f"{arm['id']}: OpenRouter pool spent; stopping", file=stdout)

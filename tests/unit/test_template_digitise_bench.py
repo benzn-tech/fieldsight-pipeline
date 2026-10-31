@@ -215,7 +215,7 @@ def test_arm_env_is_built_not_inherited():
     assert env["TEMPLATE_DIGITISE_REASONING"] == "off"
     assert env["TEMPLATE_DIGITISE_PROVIDER"] == "coreweave/fp8"
     assert env["TEMPLATE_DIGITISE_FALLBACK_MODELS"] == ""
-    assert "DASHSCOPE_API_KEY" not in env and "LLM_FALLBACK_MODELS" not in env
+    assert "DASHSCOPE_API_KEY" not in env and env["LLM_FALLBACK_MODELS"] == ""
     assert (env["PATH"], env["SYSTEMROOT"], env["TMP"]) == ("p", "s", "t")
 
 
@@ -311,7 +311,7 @@ def test_dry_run_refuses_over_the_openrouter_room(tmp_path):
 
 def _fake_spawn(tmp_path, probe_ok=True, calls=None):
     """Plays the worker: writes one result file per read of the job."""
-    def spawn(cmd, env):
+    def spawn(cmd, env, stdout=None):
         assert cmd[2] == "--worker"
         calls.append((cmd, env)) if calls is not None else None
         with open(cmd[3], encoding="utf-8") as f:
@@ -433,30 +433,55 @@ class _Resp:
         self.status, self.data = status, json.dumps(data).encode("utf-8")
 
 
-def test_worker_reads_through_template_vision_and_charges_the_pool(tmp_path, monkeypatch,
-                                                                    capsys):
+class _FakeUrllib3:
+    """llm_utils' urllib3: PoolManager().request plays a script (response or exception)."""
+
+    class exceptions:                                     # noqa: N801
+        pass
+
+    def __init__(self, script):
+        self.script, self.sent = list(script), []
+        outer = self
+
+        class PM:
+            def request(self, method, url, body=None, headers=None, timeout=None):
+                outer.sent.append({"payload": json.loads(body), "timeout": timeout})
+                item = outer.script.pop(0) if len(outer.script) > 1 else outer.script[0]
+                if isinstance(item, Exception):
+                    raise item
+                return item
+        self.PoolManager = PM
+
+
+def _answer(content, usage=None):
+    return _Resp(200, {"model": "m", "choices": [{"finish_reason": "stop",
+                                                  "message": {"content": content}}],
+                       "usage": usage or {"prompt_tokens": 9000, "completion_tokens": 3000}})
+
+
+def _worker_env(monkeypatch, script):
     sys.path.insert(0, os.path.join(REPO, "src"))
     import llm_utils
     monkeypatch.setattr(llm_utils, "LLM_PROVIDER", "qwen")
     monkeypatch.setattr(llm_utils, "QWEN_BASE_URL", "https://openrouter.ai/api/v1")
     monkeypatch.setattr(llm_utils, "QWEN_API_KEY", "sk-or-test")
-    answer = json.dumps({"sections": TRUTH_BICL["sections"]})
-    sent = []
+    monkeypatch.setattr(llm_utils.time, "sleep", lambda s: None)
+    fake = _FakeUrllib3(script)
+    monkeypatch.setattr(llm_utils, "urllib3", fake)
+    return llm_utils, fake
 
-    def fake_post(url, body, headers, **kw):
-        sent.append(json.loads(body))
-        return _Resp(200, {"model": "m", "choices": [{"finish_reason": "stop",
-                                                      "message": {"content": answer}}],
-                           "usage": {"prompt_tokens": 9000, "completion_tokens": 3000}}), None
-    monkeypatch.setattr(llm_utils, "_post_with_retry", fake_post)
-    d = _inputs(tmp_path)
+
+def test_worker_reads_through_template_vision_and_charges_the_pool(tmp_path, monkeypatch,
+                                                                    capsys):
+    llm_utils, fake = _worker_env(monkeypatch, [
+        _answer(json.dumps({"sections": TRUTH_BICL["sections"]}))])
+    _inputs(tmp_path)
     arm = {a["id"]: a for a in R.ARMS}["gemini_shipped"]
     a = _args(tmp_path, "--dry-run")
     job = R._job(a, arm, str(tmp_path / "out" / "arms" / arm["id"]))
-    try:
-        assert R.worker(job) == 0
-    finally:
-        monkeypatch.setattr(llm_utils, "_post_with_retry", fake_post)
+    assert R.worker(job) == 0
+    assert llm_utils.urllib3 is fake                     # restored after the run
+    sent = [x["payload"] for x in fake.sent]
     assert len(sent) == 4 and "usage" not in sent[0]        # prod payload, unchanged
     assert sent[0]["model"] == "google/gemini-3.8-flash"
     res = json.loads((tmp_path / "out" / "arms" / arm["id"] / "bicl_photo_rep1.json")
@@ -468,3 +493,82 @@ def test_worker_reads_through_template_vision_and_charges_the_pool(tmp_path, mon
     assert W.openrouter_spent(a.ledger) == pytest.approx(4 * per)
     out = capsys.readouterr().out
     assert "items=47" in out and TRUTH_BICL["sections"][0]["items"][0] not in out
+
+
+class ReadTimeout(Exception):
+    pass
+
+
+def test_every_attempt_is_metered_and_a_timed_out_one_charged_at_the_upper(tmp_path,
+                                                                         monkeypatch):
+    # _post_with_retry retries inside one llm_utils call: the timed-out first
+    # attempt was billed by the vendor and must be charged too.
+    llm_utils, fake = _worker_env(monkeypatch, [
+        ReadTimeout("read timed out"), _answer(json.dumps({"sections": TRUTH_BICL["sections"]}))])
+    _inputs(tmp_path)
+    arm = dict({a["id"]: a for a in R.ARMS}["gemini_shipped"], inputs=["bicl_clean"])
+    a = _args(tmp_path, "--dry-run")
+    job = R._job(a, arm, str(tmp_path / "out" / "arms" / arm["id"]))
+    assert R.worker(job) == 0
+    res = json.loads((tmp_path / "out" / "arms" / arm["id"] / "bicl_clean_rep1.json")
+                     .read_text("utf-8"))
+    assert [c["status"] for c in res["calls"]] == [None, 200]
+    est_in = R.UPPER_PROMPT_TOKENS + R.UPPER_TOKENS_PER_PAGE * 3
+    upper = W.or_upper(R.GEMINI, est_in, R.ANSWER_TOKENS)
+    assert res["cost_usd"] == pytest.approx(upper + (9000 * 0.825 + 3000 * 4.125) / 1e6)
+    # Prod timeouts: the per-request timeout is the deploy's, bounded by the deadline.
+    assert fake.sent[0]["timeout"] <= R.READ_DEADLINE_S
+
+
+def test_prod_timeouts_reach_the_worker():
+    arm = {a["id"]: a for a in R.ARMS}["muse_low"]
+    env = R.arm_env(arm, "k", {})
+    assert (env["LLM_HTTP_TIMEOUT"], env["LLM_CHAIN_BUDGET_SECONDS"]) == ("300", "840")
+    assert env["LLM_FALLBACK_MODELS"] == ""
+    assert R.READ_DEADLINE_S == 900 - 30
+    yaml = open(os.path.join(REPO, "src", "template.yaml"), encoding="utf-8").read()
+    fn = yaml[yaml.index("  TemplateDigitiseFunction:"):]
+    fn = fn[:fn.index("Policies:")]
+    assert "Timeout: 900" in fn and "LLM_CHAIN_BUDGET_SECONDS: '840'" in fn
+    assert "LLM_HTTP_TIMEOUT: '300'" in fn
+    import lambda_template_digitise as ltd
+    assert ltd.WRITE_RESERVE_SECONDS == R.PROD_WRITE_RESERVE_S
+
+
+def test_a_bad_answer_text_never_reaches_stdout_or_stderr(tmp_path, monkeypatch, capfd):
+    secret = "NOTJSON-SENTINEL item wording the model echoed"
+    _worker_env(monkeypatch, [_answer(secret)])
+    _inputs(tmp_path)
+    arm = dict({a["id"]: a for a in R.ARMS}["gemini_shipped"], inputs=["bicl_clean"])
+    a = _args(tmp_path, "--dry-run")
+    job = R._job(a, arm, str(tmp_path / "out" / "arms" / arm["id"]))
+    import logging
+    # What the worker subprocess has: the root logger writing to stderr.
+    h = logging.StreamHandler(sys.stderr)
+    logging.getLogger().addHandler(h)
+    try:
+        assert R.worker(job) == 0
+        logging.getLogger().warning("after the worker: logging is back on")
+    finally:
+        logging.getLogger().removeHandler(h)
+    cap = capfd.readouterr()
+    assert "logging is back on" in cap.err               # the handler does write
+    assert "NOTJSON-SENTINEL" not in cap.out + cap.err
+    res = json.loads((tmp_path / "out" / "arms" / arm["id"] / "bicl_clean_rep1.json")
+                     .read_text("utf-8"))
+    assert res["ok"] is False
+    assert logging.root.manager.disable == logging.NOTSET
+
+
+def test_spawn_keeps_worker_stderr_out_of_the_parent(tmp_path, capfd):
+    job = tmp_path / "job.json"
+    job.write_text("{}", encoding="utf-8")
+    code = ("import sys; print('arm x rep1 ok'); "
+            "sys.stderr.write('WARNING answer NOTJSON-SENTINEL' + chr(10))")
+    out = io.StringIO()
+    rc = R._spawn([sys.executable, "-c", code, str(job)], dict(os.environ), stdout=out)
+    cap = capfd.readouterr()
+    assert rc == 0
+    assert "arm x rep1 ok" in out.getvalue() and "worker stderr: 1 lines" in out.getvalue()
+    assert "NOTJSON-SENTINEL" not in out.getvalue() + cap.out + cap.err
+    assert "NOTJSON-SENTINEL" in (tmp_path / "job.json.stderr.txt").read_text("utf-8")
