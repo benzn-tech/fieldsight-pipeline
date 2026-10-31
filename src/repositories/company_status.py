@@ -12,8 +12,10 @@ company_status_cognito rows are the work list of the async executor (Task 8):
   * inactive -> inactive: no rows (the first deactivation already listed the users).
   * inactive -> active: still-pending disable/signout rows of the events since the company
     was last active become 'failed' / SUPERSEDED_BY_REACTIVATION, and one 'enable' row is
-    created per user that has a 'done' disable row in those events (the union, §5.3) --
-    a user we never actually disabled is never enabled.
+    created per user whose LATEST 'done' disable/enable row (across all of this company's
+    events, by updated_at, tie-break event at/id) is a 'disable' -- we disabled them and
+    have not re-enabled them since (§5.3). A user we never actually disabled is never
+    enabled; superseded (failed) rows never count either way.
   * active -> inactive also fails still-pending 'enable' rows of earlier events
     (SUPERSEDED_BY_DEACTIVATION), so a slow enable can never land after the new disable.
 """
@@ -116,7 +118,9 @@ _SINCE_LAST_ACTIVE = (
 
 def create_reactivation_rows(conn, event_id, company_id) -> dict:
     """Fail the still-pending disable/signout rows of the events since last active, then
-    one pending 'enable' row per user with a 'done' disable in those events.
+    one pending 'enable' row per user whose latest 'done' disable/enable row of this
+    company is a 'disable' (per-user state, not a window: an enable superseded by a later
+    deactivation must not strand a user disabled by an earlier one).
     Returns {"superseded": n, "enable": n}."""
     params = {"cid": company_id, "eid": event_id, "err": SUPERSEDED_BY_REACTIVATION}
     superseded = conn.execute(
@@ -127,9 +131,14 @@ def create_reactivation_rows(conn, event_id, company_id) -> dict:
         params).rowcount
     enabled = conn.execute(
         "INSERT INTO company_status_cognito (event_id, user_sub, action) "
-        "SELECT DISTINCT %(eid)s::uuid, c.user_sub, 'enable' FROM company_status_cognito c "
-        f"WHERE c.event_id IN ({_SINCE_LAST_ACTIVE}) "
-        "  AND c.action = 'disable' AND c.state = 'done' "
+        "SELECT %(eid)s::uuid, l.user_sub, 'enable' FROM ("
+        "  SELECT DISTINCT ON (c.user_sub) c.user_sub, c.action "
+        "  FROM company_status_cognito c "
+        "  JOIN company_status_events e ON e.id = c.event_id "
+        "  WHERE e.company_id = %(cid)s AND e.id <> %(eid)s "
+        "    AND c.state = 'done' AND c.action IN ('disable', 'enable') "
+        "  ORDER BY c.user_sub, c.updated_at DESC, e.at DESC, e.id DESC"
+        ") l WHERE l.action = 'disable' "
         "ON CONFLICT (event_id, user_sub, action) DO NOTHING "
         "RETURNING user_sub",
         params).fetchall()
@@ -147,7 +156,8 @@ def home_user_count(conn, company_id) -> int:
 def home_device_count(conn, company_id) -> int:
     """Devices (device ledger) whose last heartbeat account is a home user of the company."""
     return conn.execute(
-        "SELECT count(*) FROM devices d JOIN users u ON u.cognito_sub = d.last_account_sub "
+        "SELECT count(DISTINCT d.id) FROM devices d "
+        "JOIN users u ON u.cognito_sub = d.last_account_sub "
         "WHERE u.company_id = %s",
         (company_id,)).fetchone()[0]
 

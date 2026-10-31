@@ -294,6 +294,64 @@ def test_reactivation_window_starts_at_the_last_active(db, w):
     assert _rows(db, uuid.UUID(r2["eventId"])) == {(aad, "enable"): ("pending", None)}
 
 
+def test_superseded_enable_does_not_strand_a_disabled_user(db, w):
+    """E1 suspend (U's disable done) -> E3 active (enable pending) -> E4 suspend before the
+    tick (E3's enable superseded, E4's disable pending) -> E5 active before the tick (E4's
+    disable superseded). U is still disabled from E1, so E5 must enable U."""
+    u = w["aw"]["cognito_sub"]
+    _, e1 = _set(w, "suspended")
+    _mark(db, uuid.UUID(e1["eventId"]), u, "disable", "done")
+    _, e3 = _set(w, "active")
+    _, e4 = _set(w, "suspended")
+    status, e5 = _set(w, "active")
+    assert status == 200
+    assert _rows(db, uuid.UUID(e3["eventId"])) == {
+        (u, "enable"): ("failed", "superseded by deactivation")}
+    assert _rows(db, uuid.UUID(e4["eventId"]))[(u, "disable")] == (
+        "failed", "superseded by reactivation")
+    assert _rows(db, uuid.UUID(e5["eventId"])) == {(u, "enable"): ("pending", None)}
+    assert e5["cognito"]["enable"] == 1 and e5["cognitoTrigger"] == "queued"
+
+
+def test_user_whose_latest_done_is_enable_gets_no_enable(db, w):
+    """Disabled and then re-enabled (both done): not disabled by us any more, so a later
+    reactivation (after a suspension the executor never processed) enables nobody."""
+    u = w["aad"]["cognito_sub"]
+    _, s1 = _set(w, "suspended")
+    _mark(db, uuid.UUID(s1["eventId"]), u, "disable", "done")
+    _, r1 = _set(w, "active")
+    _mark(db, uuid.UUID(r1["eventId"]), u, "enable", "done")
+    _set(w, "suspended")
+    status, r2 = _set(w, "active")
+    assert status == 200 and r2["cognito"]["enable"] == 0
+    assert _rows(db, uuid.UUID(r2["eventId"])) == {} and r2["cognitoTrigger"] == "none"
+
+
+def test_latest_done_is_ordered_by_updated_at(db, w):
+    """An enable marked done AFTER a later event's disable (updated_at) wins over it."""
+    u = w["aad"]["cognito_sub"]
+    _, s1 = _set(w, "suspended")
+    e1 = uuid.UUID(s1["eventId"])
+    _set(w, "active")
+    _, s2 = _set(w, "suspended")
+    e2 = uuid.UUID(s2["eventId"])
+    db.execute("UPDATE company_status_cognito SET state='done', updated_at=%s "
+               "WHERE event_id=%s AND user_sub=%s AND action='disable'",
+               ("2026-01-01T00:00:00Z", e2, u))
+    db.execute("UPDATE company_status_cognito SET state='done', updated_at=%s "
+               "WHERE event_id=%s AND user_sub=%s AND action='disable'",
+               ("2026-01-02T00:00:00Z", e1, u))
+    _, r2 = _set(w, "active")
+    assert _rows(db, uuid.UUID(r2["eventId"])) == {(u, "enable"): ("pending", None)}
+    # An enable done later than every disable: nobody to enable next time.
+    db.execute("UPDATE company_status_cognito SET state='done', updated_at=%s "
+               "WHERE event_id=%s AND user_sub=%s AND action='enable'",
+               ("2026-01-03T00:00:00Z", uuid.UUID(r2["eventId"]), u))
+    _set(w, "suspended")
+    _, r3 = _set(w, "active")
+    assert _rows(db, uuid.UUID(r3["eventId"])) == {}
+
+
 def test_deactivation_supersedes_pending_enables(db, w):
     ax = w["ax"]["cognito_sub"]
     _, s1 = _set(w, "suspended")
