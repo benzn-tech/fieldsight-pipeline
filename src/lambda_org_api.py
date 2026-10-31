@@ -11325,6 +11325,28 @@ def _timeline_target_id(conn, caller, user):
         return caller["id"]
 
 
+def _agent_topic_ids_for(conn, caller, user, date, reach):
+    """Ids of the agent-created topics (action packs spec §14 D2) that the person whose
+    day this is applied on `date`, on sites in `reach()` -- or [] (never raises).
+
+    Unlike `_timeline_target_id` this does NOT fall back to the caller: that fallback
+    would put the caller's own agent todos on someone else's day. An unresolvable
+    folder simply has none. The rows are still site-clipped by the renderer."""
+    try:
+        if user and user == (caller.get("folder_name") or ""):
+            target_id = caller["id"]
+        else:
+            target_id = (_resolve_target_user(conn, caller["company_id"], user) or {}).get("id")
+        if target_id is None:
+            return []
+        site_ids = list(reach())
+        with conn.transaction():   # a failed lookup must not abort the day read's transaction
+            return topics.agent_topic_ids_for_day(conn, target_id, date, site_ids)
+    except Exception:
+        logger.exception("agent topic lookup failed for %s on %s", user, date)
+        return []
+
+
 def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False,
                               clip_foreign=False):
     """The single-(user, date) D1 read: Aurora override when extraction
@@ -11396,14 +11418,8 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False,
                 day_cache.append(True)
         return day_cache[0]
 
-    def _aurora_shape(prefix, merged=()):
-        """Return the id-carrying rendered shape for `prefix` if it has
-        Aurora topics inside the caller's site ACL, else None."""
-        # The gate has to know about the merge too. A joiner's own prefix is
-        # EMPTY -- that is what the merge does -- so testing the prefix alone
-        # returns before any list call and no union downstream can ever run.
-        if not (topics.has_topics_for_source_prefix(conn, prefix) or merged):
-            return None
+    def _reach():
+        """The sites this read may show rows from (the site clip below)."""
         allowed = _allowed_site_ids(conn, caller)
         if user == (caller.get("folder_name") or None) and \
                 memberships.has_live_external(conn, caller["id"]):
@@ -11415,14 +11431,29 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False,
             allowed = tenancy_status.drop_inactive(
                 set(allowed) | set(memberships.caller_site_roles(conn, caller["id"])),
                 tenancy_status.inactive_site_ids(conn, caller))
-        # The kwarg is passed ONLY when there is something to union. A day with
-        # no group must reach this repository exactly as it did before -- same
-        # call, same SQL, same params -- so the change cannot alter the ordinary
-        # case, which is almost every case.
-        rows = (topics.list_topics_for_source_prefix(conn, prefix,
-                                                    merged_keys=list(merged))
-                if merged else
-                topics.list_topics_for_source_prefix(conn, prefix))
+        return allowed
+
+    def _aurora_shape(prefix, merged=(), agent_ids=(), agent_only=False):
+        """Return the id-carrying rendered shape for `prefix` if it has
+        Aurora topics inside the caller's site ACL, else None.
+
+        `agent_ids` (action packs spec §14 D2): this person's agent-created topics of
+        the day, unioned in BY ID. They are NOT merged rows: they get no site-clip
+        bypass and go through exactly the clip below. `agent_only` renders them on a
+        day whose recorder prefixes hold nothing, with no S3 prose (they have none)."""
+        # The gate has to know about the merge too. A joiner's own prefix is
+        # EMPTY -- that is what the merge does -- so testing the prefix alone
+        # returns before any list call and no union downstream can ever run.
+        if not (agent_only or topics.has_topics_for_source_prefix(conn, prefix) or merged):
+            return None
+        allowed = _reach()
+        # The kwargs are passed ONLY when there is something to union. A day with
+        # no group and no agent topic must reach this repository exactly as it did
+        # before -- same call, same SQL, same params -- so the change cannot alter
+        # the ordinary case, which is almost every case.
+        union = {**({"merged_keys": list(merged)} if merged else {}),
+                 **({"extra_topic_ids": list(agent_ids)} if agent_ids else {})}
+        rows = topics.list_topics_for_source_prefix(conn, prefix, **union)
         clip = cross_user_clip
         if not clip and user == (caller.get("folder_name") or None) and _rows_touch_inactive(
                 rows, tenancy_status.inactive_site_ids(conn, caller)):
@@ -11463,7 +11494,7 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False,
             return None
         # CRITICAL-1: cross-user graded view never merges the target's whole-day
         # prose (not site-clipped). Topic rows are already site-clipped above.
-        doc = None if clip else \
+        doc = None if (clip or agent_only) else \
             _get_lake_json(f"reports/{date}/{user}/daily_report.json")
         shape = render_report_shape(rows, doc, date, user, conn=conn,
                                     company_id=caller.get("company_id"),
@@ -11477,6 +11508,12 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False,
         # deleted content, served as a 200. Treat it as "no Aurora topics" so the loop
         # moves on and, failing that, the deleted-sources guard below answers 404.
         if not shape["topics"]:
+            return None
+        # The same rule when only agent topics survived (D2): the recorder's own rows were
+        # deleted or clipped away, so this arm must not carry the doc's prose under them.
+        # The agent-only render after the loop shows them with no prose.
+        if agent_ids and not agent_only and \
+                all(t.get("source") == "agent" for t in shape["topics"]):
             return None
         # The day's photos, as a property of the DAY rather than of a topic.
         #
@@ -11545,15 +11582,27 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False,
     # exist for this (user, date) -- extraction-sourced OR report-sourced -- so
     # report-sourced content is editable exactly like extraction-sourced. Only
     # a day with NO Aurora topics at all keeps the byte-verbatim S3 contract.
+    # Agent-created topics of this person's day (action packs spec §14 D2): an
+    # `agent://` key matches neither recorder prefix, so they are unioned in by id,
+    # into whichever arm renders, and clipped by site like every other row. On the
+    # ordinary day this is [] and every call below is exactly what it was.
+    agent_ids = _agent_topic_ids_for(conn, caller, user, date, _reach)
     for prefix, merged in ((f"extractions/{user}/{date}/", merged_keys),
                            (f"reports/{date}/{user}/", ())):
         # merged keys only widen the EXTRACTIONS prefix. A merged record is an
         # extraction artifact; unioning it into the report-sourced read would
         # return the same rows twice under a different provenance.
-        shape = _aurora_shape(prefix, merged)
+        shape = _aurora_shape(prefix, merged, agent_ids)
         if shape is not None:
             # `user` = the folder this read actually served, the same key the
             # 404 envelopes carry. `user_name` is a display name here, not a folder.
+            shape["user"] = user
+            return ok(shape)
+    if agent_ids:
+        # A day whose only Aurora topics are agent-created (the todos were applied on
+        # a day nothing else was extracted for this person).
+        shape = _aurora_shape(f"extractions/{user}/{date}/", (), agent_ids, agent_only=True)
+        if shape is not None:
             shape["user"] = user
             return ok(shape)
     if clip_foreign and not cross_user_clip and not saw_foreign:

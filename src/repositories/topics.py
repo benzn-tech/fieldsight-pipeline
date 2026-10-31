@@ -921,7 +921,7 @@ def report_date_counts(conn, site_ids, since_date, *, author_ids=None) -> list[d
     ).fetchall()
 
 
-def _prefix_or_merged(merged_keys):
+def _prefix_or_merged(merged_keys, extra_topic_ids=None):
     """The prefix condition, widened by exact merged keys when there are any.
 
     UNION ONLY. No DELETION predicate is added here, and that is deliberate
@@ -945,15 +945,43 @@ def _prefix_or_merged(merged_keys):
     the lead's user_id, a member off the lead's site is cut by the site filter,
     and adding the lead to author_ids would leak that lead's OTHER solo topics.
     The key names the merged rows and nothing else.
+
+    `extra_topic_ids` (action packs spec §14 D2) unions exact topic ids -- the
+    agent-created topics of this day, whose `agent://` key matches no recorder
+    prefix. By id, not by key: one pack's key is shared by its topics on every
+    site and apply date, so a key union would pull in other days.
     """
     cond = "t.source_s3_key LIKE %s ESCAPE '\\'"
     if merged_keys:
         cond += " OR t.source_s3_key = ANY(%s)"
+    if extra_topic_ids:
+        cond += " OR t.id = ANY(%s::uuid[])"
     return cond
 
 
+def agent_topic_ids_for_day(conn, user_id, report_date, site_ids) -> list[str]:
+    """Ids of the visible agent-created topics (`source='agent'`, action packs spec
+    §3.4/§14 D2) that `user_id` applied on `report_date`, on `site_ids` (the reader's
+    reach -- the caller still clips the rows by site afterwards). The day view unions
+    them into the recorder's day by id (`list_topics_for_source_prefix`'s
+    `extra_topic_ids`). Uses idx_topics_site_date. Empty `site_ids` or no user -> []
+    without a round-trip."""
+    if not site_ids or user_id is None:
+        return []
+    rows = conn.execute(
+        "SELECT t.id FROM topics t "
+        "WHERE t.site_id = ANY(%s::uuid[]) AND t.report_date = %s "
+        "AND t.user_id = %s AND t.source = 'agent' "
+        f"AND {visible_topics_predicate('t')} "
+        "ORDER BY t.created_at, t.id",
+        ([str(s) for s in site_ids], report_date, user_id),
+    ).fetchall()
+    return [str(r[0]) for r in rows]
+
+
 def list_topics_for_source_prefix(conn, source_prefix, *, merged_keys=None,
-                                  include_superseded=False) -> list[dict]:
+                                  include_superseded=False,
+                                  extra_topic_ids=None) -> list[dict]:
     """org-api timeline shim read (authority-flip Task 4): all topics whose
     source_s3_key starts with source_prefix (typically
     f"extractions/{user_folder}/{date}/"), so the shim can render the
@@ -991,7 +1019,7 @@ def list_topics_for_source_prefix(conn, source_prefix, *, merged_keys=None,
     every row `superseded_at` or not, or a delete leaves a superseded copy behind that no
     batch ever covers."""
     escaped = _escape_like(source_prefix)
-    where = f"WHERE ({_prefix_or_merged(merged_keys)})"
+    where = f"WHERE ({_prefix_or_merged(merged_keys, extra_topic_ids)})"
     if not include_superseded:
         where += f" AND {LIVE_TOPIC_PREDICATE.format(alias='t')}"
     topic_rows = conn.cursor(row_factory=dict_row).execute(
@@ -1004,7 +1032,8 @@ def list_topics_for_source_prefix(conn, source_prefix, *, merged_keys=None,
         f"LEFT JOIN users u ON u.id = t.user_id "
         f"{where} "
         f"ORDER BY t.time_range NULLS LAST, t.created_at, t.id",
-        tuple([escaped + '%'] + ([list(merged_keys)] if merged_keys else [])),
+        tuple([escaped + '%'] + ([list(merged_keys)] if merged_keys else [])
+              + ([[str(i) for i in extra_topic_ids]] if extra_topic_ids else [])),
     ).fetchall()
 
     if not topic_rows:
