@@ -191,6 +191,7 @@ from repositories import voice_note_photo
 import lake_keys
 import lake_owner
 import company_export
+import company_records_export
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import (diff_candidates, first_match_span, learned_pairs, normalize,
                             occurrences)
@@ -6094,12 +6095,13 @@ def company_export_status(conn, caller, company_id, export_id):
     prefix = company_export.export_prefix(cid, eid)
 
     def presign(key):
-        if not key.startswith(prefix) or ".." in key[len(prefix):] or "/" in key[len(prefix):]:
+        if not _export_key_presignable(prefix, key):
             return None
         return s3().generate_presigned_url(
             "get_object", Params={"Bucket": _export_bucket_for("exports"), "Key": key},
             ExpiresIn=PRESIGNED_URL_EXPIRY)
 
+    records = _records_status(prefix, cid, presign)
     manifest = _read_export_doc(prefix + "manifest.json")
     if manifest is not None and manifest.get("company_id") != cid:
         return error("export not found (or not started yet)", 404)
@@ -6115,6 +6117,7 @@ def company_export_status(conn, caller, company_id, export_id):
                    "excluded": manifest.get("excluded") or {},
                    "manifest": {"key": prefix + "manifest.json",
                                 "url": presign(prefix + "manifest.json")},
+                   "records": records,
                    "expiresIn": PRESIGNED_URL_EXPIRY})
     state = _read_export_doc(prefix + "state.json")
     if state is not None and state.get("company_id") != cid:
@@ -6122,8 +6125,48 @@ def company_export_status(conn, caller, company_id, export_id):
     if state is not None:
         return ok({"exportId": eid, "companyId": cid, "status": "running", "done": False,
                    "partsWritten": len(state.get("parts") or []),
-                   "objects": len(state.get("entries") or [])})
+                   "objects": len(state.get("entries") or []),
+                   "records": records})
     return error("export not found (or not started yet)", 404)
+
+
+_RECORDS_NAME_RE = re.compile(r"records/[A-Za-z0-9][A-Za-z0-9_.-]*")
+
+
+def _export_key_presignable(prefix, key) -> bool:
+    """True only for a key directly under the export prefix (a part, the manifest) or exactly
+    one level down in records/ (`records/<name>`, the structured records export). Nothing
+    with '..', a backslash, a control character, or any other subdirectory."""
+    if not isinstance(key, str) or not key.startswith(prefix):
+        return False
+    rest = key[len(prefix):]
+    if not rest or ".." in rest or "\\" in rest or any(ord(c) < 32 for c in rest):
+        return False
+    if "/" not in rest:
+        return True
+    return _RECORDS_NAME_RE.fullmatch(rest) is not None
+
+
+def _records_status(prefix, cid, presign):
+    """The structured records export's part of GET export status, from records_state.json:
+    None when there is none (an export from before the records export, or not started) or it
+    names another company; files are presigned only once it is done, each through `presign`
+    (so only exports/{cid}/{eid}/records/<name> is ever signed)."""
+    doc = _read_export_doc(prefix + company_records_export.STATE_NAME)
+    if doc is None or doc.get("company_id") != cid:
+        return None
+    done = bool(doc.get("done"))
+    files = []
+    if done:
+        for key in doc.get("files") or []:
+            url = presign(str(key))
+            if url:
+                files.append({"key": key, "url": url})
+    tables = {n: {"done": bool(t.get("done")), "rows": t.get("rows", 0),
+                  "excluded": dict(t.get("excluded") or {}),
+                  **({"note": t["note"]} if t.get("note") else {})}
+              for n, t in (doc.get("tables") or {}).items()}
+    return {"status": "done" if done else "running", "files": files, "tables": tables}
 
 
 def _export_bucket_for(kind):
@@ -6328,15 +6371,42 @@ def export_company_task(event, context=None):
     part_bytes = event.get("part_bytes")
     if isinstance(part_bytes, bool) or not isinstance(part_bytes, int) or part_bytes <= 0:
         part_bytes = company_export.DEFAULT_PART_BYTES
+    export_id = event.get("export_id")
+    if export_id is None:
+        if event.get("cursor") is not None:
+            return {"error": "a cursor needs the export_id it belongs to"}
+        export_id = str(uuid.uuid4())     # one id for the records and the file export
     try:
         with get_connection() as conn:
-            return company_export.run(
-                conn, s3(), event.get("company_id"), bucket_for=_export_bucket_for, alt_bucket_for=_export_alt_bucket_for,
-                export_id=event.get("export_id"), cursor=event.get("cursor"),
-                time_budget_s=budget, part_bytes=part_bytes,
-                dest_bucket=_export_bucket_for("exports"))
+            return _run_records_then_files(
+                conn, s3(), event.get("company_id"), export_id, budget,
+                _export_bucket_for("exports"), cursor=event.get("cursor"),
+                part_bytes=part_bytes)
     except (ValueError, company_export.ExportError) as exc:
         return {"error": str(exc)}
+
+
+def _run_records_then_files(conn, s3_client, company_id, export_id, budget, bucket, **file_kw):
+    """One time budget of an export: the structured records export (company_records_export)
+    first, then the file export of the same export id with what is left of the budget.
+
+    Records first, so a file export whose state says done always has its records done too
+    (export_tick's "state done -> delete the request" stays correct). The file export does not
+    start until the records are done; the result is the file export's, plus `records`."""
+    started = time.monotonic()
+    rec = company_records_export.run(conn, s3_client, company_id, export_id=export_id,
+                                     dest_bucket=bucket, time_budget_s=budget)
+    summary = {k: rec.get(k) for k in ("done", "tables", "files", "lost_race") if k in rec}
+    if not rec.get("done"):
+        return {"company_id": rec.get("company_id"), "export_id": rec.get("export_id"),
+                "done": False, "next_cursor": None, "records": summary}
+    remaining = max(1, budget - int(time.monotonic() - started))
+    out = company_export.run(
+        conn, s3_client, company_id, bucket_for=_export_bucket_for,
+        alt_bucket_for=_export_alt_bucket_for, export_id=export_id, time_budget_s=remaining,
+        dest_bucket=bucket, **file_kw)
+    out["records"] = summary
+    return out
 
 
 def _delete_export_request(s3_client, bucket, key):
@@ -6415,9 +6485,7 @@ def export_tick(event, context=None):
             continue
         try:
             with get_connection() as conn:
-                out = company_export.run(
-                    conn, s3_client, cid, bucket_for=_export_bucket_for, alt_bucket_for=_export_alt_bucket_for, export_id=eid,
-                    time_budget_s=budget, dest_bucket=bucket)
+                out = _run_records_then_files(conn, s3_client, cid, eid, budget, bucket)
         except (ValueError, company_export.ExportError) as exc:
             logger.warning("export_tick: export %s failed: %s", key, exc)
             return {"requests": len(keys), "ran": key, "error": str(exc)}
