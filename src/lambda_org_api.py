@@ -10,6 +10,12 @@ Routes (this file grows by task; see docs/superpowers/plans/2026-07-04-phase-3-o
   PATCH /api/org/me                       → update first/last name, avatar key
   POST  /api/org/companies/{id}/export    → platform_admin: start a company data export (async, LakeOps; 202 exportId)
   GET   /api/org/companies/{id}/export/{export_id} → platform_admin: export status + 15-minute presigned part URLs
+  POST  /api/org/companies/{id}/status    → platform_admin, never the caller's own company: set
+                                            active|suspended|exited with a reason (idempotent);
+                                            status + audit + Cognito work rows in one transaction,
+                                            then a company_status_requests/ marker for LakeOps
+  GET   /api/org/companies/{id}/status-events → platform_admin: status audit trail, newest
+                                            first, with per-user Cognito rows
   GET   /api/org/sites                    → sites visible to caller (ACL)
   POST  /api/org/sites                    → create site (admin/gm)
   GET   /api/org/members                  → company members + memberships (admin/gm)
@@ -131,10 +137,12 @@ from datetime import date as _date
 from datetime import datetime, timedelta, timezone
 
 import boto3
+from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError, ParamValidationError
 from psycopg.errors import UniqueViolation
 
 import chunk_stitch
+import company_status_cognito
 import content_hash
 import device_heartbeat
 import device_status
@@ -156,6 +164,7 @@ import photo_binding
 import photo_rebind
 import session_scope
 import sweep_state
+import tenancy_status
 from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
 import programme_reconcile
@@ -180,6 +189,7 @@ from repositories import voice_note_photo
 import lake_keys
 import lake_owner
 import company_export
+import company_records_export
 from repositories.acl import is_cross_company, resolve_scope
 from text_normalize import (diff_candidates, first_match_span, learned_pairs, normalize,
                             occurrences)
@@ -192,6 +202,7 @@ import batch_stitch
 import deletion_mirror
 import speaker_match_request
 from repositories import speaker_name_proposals
+from repositories import company_status as company_status_repo
 from repositories import speaker_intro_suggestions
 import turn_name_overlay
 import template_types
@@ -310,6 +321,7 @@ ALLOWED_VOICE_TYPES = {"audio/wav": "wav", "audio/x-wav": "wav",
 
 _s3_client = None
 _cognito_client = None
+_cognito_executor_client = None
 
 
 # `profiles_for_matching` used to be re-exported here, with a docstring saying the binding
@@ -332,6 +344,21 @@ def cognito():
     if _cognito_client is None:
         _cognito_client = boto3.client("cognito-idp")
     return _cognito_client
+
+
+# The company-status Cognito executor's own client (Task 8). Each of its calls runs while it
+# holds FOR SHARE on the company row, and POST /companies/{id}/status waits on that lock
+# (FOR UPDATE) inside org-api's 30 s. Short timeouts and one retry bound the hold to well
+# under that even when the endpoint hangs; a failed call is recorded and retried next tick.
+COGNITO_EXECUTOR_CONFIG = BotoConfig(connect_timeout=3, read_timeout=8,
+                                     retries={"max_attempts": 2, "mode": "standard"})
+
+
+def cognito_executor():
+    global _cognito_executor_client
+    if _cognito_executor_client is None:
+        _cognito_executor_client = boto3.client("cognito-idp", config=COGNITO_EXECUTOR_CONFIG)
+    return _cognito_executor_client
 
 
 # Which stage's sweep flag this API writes (Aurora scale-to-zero, spec
@@ -393,6 +420,16 @@ def error(message, status=400, extra=None):
     return ok(body, status)
 
 
+def _write_refused(conn, caller, company_id, where):
+    """409 `company_inactive` when this write would add people or access to an inactive
+    company (spec 2026-11-01 §5.6), else None. `company_id` is the write's TARGET company.
+    One rule for every endpoint: tenancy_status.write_refusal (platform_admin exempt; flag
+    off logs COMPANY_GATE_WOULD_REFUSE and allows). Call it before the first write."""
+    if tenancy_status.write_refusal(conn, caller, company_id, where=where):
+        return error(tenancy_status.REASON_COMPANY_INACTIVE, 409)
+    return None
+
+
 def parse_body(event):
     """Return the parsed JSON body dict, or None on malformed JSON."""
     raw = event.get("body") or "{}"
@@ -414,6 +451,10 @@ BACKFILL_LAKE_OBJECTS_TASK = "backfill_lake_objects"
 EXPORT_COMPANY_TASK = "export_company"
 EXPORT_TICK_TASK = "export_tick"
 EXPORT_REQUEST_PREFIX = "export_requests/"
+# Company offboarding (spec 2026-11-01 §5.3): POST /companies/{id}/status leaves
+# company_status_requests/{company_id}/{event_id}.json for LakeOps's Cognito task.
+COMPANY_STATUS_REQUEST_PREFIX = "company_status_requests/"
+COMPANY_STATUS_COGNITO_TASK = company_status_cognito.TASK
 
 
 def lambda_handler(event, context):
@@ -463,8 +504,17 @@ def lambda_handler(event, context):
     # SCHEDULED (LakeOps, rate(10 minutes)): picks up export_requests/ left by the route. It
     # lists S3 FIRST and opens no database connection unless there is work, so an idle tick
     # lets Aurora auto-pause. Deliberately dispatched before any get_connection().
+    # The same tick first runs the company-status Cognito executor (spec 2026-11-01 §5.3,
+    # company_status_cognito.tick): it lists company_status_requests/ in S3 first, opens no
+    # connection when there is none, and with COMPANY_STATUS_ENFORCE off only logs.
     if isinstance(event, dict) and event.get("task") == EXPORT_TICK_TASK:
-        return export_tick(event, context)
+        return lake_ops_tick(event, context)
+    # OPERATOR TASK (company offboarding): sweep one company's Cognito work rows without a
+    # marker (a lost marker: the status endpoint answered cognitoTrigger "failed").
+    # {"task": "company_status_cognito", "event_id": ...} and/or "company_id". Same
+    # envelope rule as above. Flag off -> {"enforced": false}, no connection, no Cognito.
+    if isinstance(event, dict) and event.get("task") == COMPANY_STATUS_COGNITO_TASK:
+        return company_status_cognito.run_task(event, context, **_company_status_deps())
     # OPERATOR TASK, invoked by hand with `aws lambda invoke` (IAM decides who
     # may). The same envelope rule as above keeps it out of reach of the API.
     # A dry run unless "apply" is exactly true: a typo must not write.
@@ -628,6 +678,12 @@ def dispatch(conn, event, method, route):
         return error("caller has no company", 403)
     if caller.get("archived_at") is not None and not (route == "/me" and method == "GET"):
         return error("account archived", 403)
+    # Company offboarding gate (spec 2026-11-01 §5.1). After the archived check, which
+    # stays exactly as it was whatever the flag says. Flag off: logs and allows. GET /me
+    # is still served, carrying `blocked` so the UI can show the notice.
+    blocked = tenancy_status.caller_blocked(conn, caller, where="org-api")
+    if blocked and not (route == "/me" and method == "GET"):
+        return error(tenancy_status.REASON_COMPANY_INACTIVE, 403)
 
     # In-app updates. After the caller guard on purpose -- signed-in, provisioned devices only.
     if route == "/app/latest" and method == "GET":
@@ -649,6 +705,8 @@ def dispatch(conn, event, method, route):
 
     if route == "/me":
         if method == "GET":
+            if blocked:
+                return get_me(conn, caller, blocked=blocked)
             return get_me(conn, caller)
         if method == "PATCH":
             return _directory_after(conn, patch_me(conn, caller, parse_body(event)))
@@ -675,6 +733,12 @@ def dispatch(conn, event, method, route):
     m_cxs = re.match(r"^/companies/([^/]+)/export/([^/]+)$", route)
     if m_cxs and method == "GET":
         return company_export_status(conn, caller, m_cxs.group(1), m_cxs.group(2))
+    m_cst = re.match(r"^/companies/([^/]+)/status$", route)
+    if m_cst and method == "POST":
+        return set_company_status(conn, caller, m_cst.group(1), parse_body(event))
+    m_cse = re.match(r"^/companies/([^/]+)/status-events$", route)
+    if m_cse and method == "GET":
+        return company_status_events(conn, caller, m_cse.group(1))
 
     if route == "/members":
         if method == "GET":
@@ -1126,6 +1190,10 @@ def _capture_site(conn, caller, site_id):
         m = memberships.get_membership(conn, caller["id"], site_id)
         if m is None or m.get("archived_at") is not None:
             return None, error("site not accessible", 403)
+    # Company offboarding (spec 2026-11-01 §5.2): nothing is captured onto a site of an
+    # inactive company by anyone but platform_admin. Flag off -> None -> unchanged.
+    if str(site["id"]) in (tenancy_status.inactive_site_ids(conn, caller) or ()):
+        return None, error("site not accessible", 403)
     return site, None
 
 
@@ -1812,6 +1880,14 @@ def _day_report_rows(conn, caller, folder, date):
         rows = topics.list_topics_for_source_prefix(conn, prefix)
     own_day = bool(folder) and folder == (caller.get("folder_name") or "")
     if own_day and merged:
+        # spec 2026-11-01 §5.2: a day touching an inactive company's site -- the caller's
+        # own rows, or a merged meeting's rows (which carry the LEAD's site) -- is read like
+        # another viewer reads it: merged rows clipped. Flag off etc.: inactive is None.
+        inactive = tenancy_status.inactive_site_ids(conn, caller)
+        if _rows_touch_inactive(rows, inactive) or \
+                _own_range_touches_inactive(conn, caller, folder, date, date):
+            own_day = False
+    if own_day and merged:
         merged_set = set(merged)
         return [r for r in rows
                 if str(r["site_id"]) in allowed or r.get("source_s3_key") in merged_set]
@@ -2052,6 +2128,37 @@ def _delivery_from_body(body):
     return deliver, recipients, None
 
 
+def _report_email_suppression(conn, deliver, site_ids, folder):
+    """Company offboarding (spec 2026-11-01 §5.5): 'company_inactive' when a report that
+    asks to be EMAILED is about a site whose company is suspended / exited -- any one
+    site in scope is enough -- or, with no site, when the folder owner's home company
+    is. None otherwise, always None for a download (no read at all), and None with the
+    flag off (tenancy_status logs COMPANY_GATE_WOULD_SUPPRESS). Decided here because
+    the worker that sends (lambda_session_report) has no database."""
+    if deliver != "email":
+        return None
+    ids = sorted({str(s) for s in (site_ids or []) if s})
+    for sid in ids:
+        reason = tenancy_status.suppress_reason(conn, site_id=sid, where="report-email")
+        if reason:
+            return reason
+    if ids:
+        return None
+    owner = users.get_by_folder_name_global(conn, folder) if folder else None
+    return tenancy_status.suppress_reason(
+        conn, company_id=(owner or {}).get("company_id"), where="report-email")
+
+
+def _suppress_report_email(artifact, reason):
+    """Turn an email request into a download, saying why (the worker reads
+    `deliver`; `emailSuppressed` is for whoever reads the artifact)."""
+    artifact["deliver"] = "download"
+    artifact["recipients"] = []
+    artifact["emailSuppressed"] = reason
+    logger.warning("COMPANY_EMAIL_SUPPRESSED report=%s folder=%s reason=%s",
+                   artifact.get("requestId"), artifact.get("folder"), reason)
+
+
 def session_report_generate(conn, caller, session_id, event):
     """POST /api/org/sessions/{session_id}/report — Tier-2 T3
     (session-report-review-export spec §6). ENQUEUES an async generate job.
@@ -2116,6 +2223,9 @@ def session_report_generate(conn, caller, session_id, event):
             "reportFacts": _report_facts(conn, caller["company_id"], folder,
                                          [content.get("siteId")], date)} if generate else {}),
     }
+    email_suppressed = _report_email_suppression(conn, deliver, [content.get("siteId")], folder)
+    if email_suppressed:
+        _suppress_report_email(artifact, email_suppressed)
     # Lake bucket (like the reindex_requests/ chain): org-api is in-VPC and hands
     # off to the non-VPC session-report worker via an S3 request artifact (BUG-36).
     # default=str for the same reason ok() uses it: `content` comes straight
@@ -2136,7 +2246,8 @@ def session_report_generate(conn, caller, session_id, event):
             site_id=(content.get("siteId") if owner else None),
             user_id=_lake_user_for_folder(conn, folder), source="upload")
     return ok({"status": "queued", "sessionId": session_id,
-               "requestId": request_id, "resultKey": result_key}, 202)
+               "requestId": request_id, "resultKey": result_key,
+               **({"emailSuppressed": email_suppressed} if email_suppressed else {})}, 202)
 
 
 def _assemble_day_report(conn, caller, date, event, selected=None):
@@ -2445,6 +2556,9 @@ def day_report_generate(conn, caller, date, event):
             "reportFacts": _report_facts(conn, caller["company_id"], folder,
                                          content.get("siteIds"), date)} if generate else {}),
     }
+    email_suppressed = _report_email_suppression(conn, deliver, content.get("siteIds"), folder)
+    if email_suppressed:
+        _suppress_report_email(artifact, email_suppressed)
     s3().put_object(Bucket=LAKE_BUCKET, Key=request_key,
                     Body=json.dumps(artifact, default=str),
                     ContentType="application/json")
@@ -2456,7 +2570,8 @@ def day_report_generate(conn, caller, date, event):
         lake_objects.record_best_effort(conn, lake_key, company_id=owner, site_id=one_site,
                                         user_id=_lake_user_for_folder(conn, folder), source="upload")
     return ok({"status": "queued", "scope": "day", "date": date,
-               "requestId": request_id, "resultKey": result_key}, 202)
+               "requestId": request_id, "resultKey": result_key,
+               **({"emailSuppressed": email_suppressed} if email_suppressed else {})}, 202)
 
 
 # ----------------------------------------------------------
@@ -2824,17 +2939,48 @@ def _session_site_company_guard(conn, caller, folder, date, session_key, what,
     extraction of someone else's project. So the company that owns the session's SITE must be
     the caller's. platform_admin is exempt; a session on no site is the recorder's home
     company's and passes. `allow_recorder` lets the recorder act on their own session (a
-    regenerate of their own report) -- never a voiceprint enrolment."""
+    regenerate of their own report) -- never a voiceprint enrolment. Even then, a session on
+    a site of an inactive company answers 409 (`_session_write_refused`)."""
     if is_cross_company(caller["global_role"]):
         return None
     if allow_recorder and folder and folder == (caller.get("folder_name") or None):
-        return None
+        # The recorder's own session, wherever it lies -- except on a site of an inactive
+        # company (spec 2026-11-01 §5.6): re-driving it is a write into that company.
+        return _session_write_refused(conn, caller, [folder], date, session_key, what)
     foreign = {c for _s, c in recordings.session_site_companies(conn, folder, date, session_key)
                if str(c) != str(caller["company_id"])}
     if foreign:
         return error(
             f"this session was recorded on another company's project, so {what} on it "
             f"belongs to that company.", 403)
+    return None
+
+
+def _session_write_refused(conn, caller, folders, date, session_key, where):
+    """409 `company_inactive` when the session lies on a site of an inactive company (spec
+    2026-11-01 §5.6), else None. The site's company decides (recordings.session_site_companies,
+    the same read F5 uses), judged by tenancy_status.write_refusal: platform_admin exempt,
+    flag off logs and allows. A session on no site, or one whose rows have not landed, is
+    nobody else's and passes. `date` None judges the folder's every day.
+
+    `folders` may be a thunk (a callable returning them), so the folder lookup is only paid
+    when some company is inactive: with none (the normal case) this costs one read of
+    companies and touches no session table, flag on or off."""
+    if is_cross_company(caller["global_role"]) or not tenancy_status.inactive_company_ids(conn):
+        return None
+    if callable(folders):
+        folders = folders()
+    companies_seen = set()
+    for folder in folders:
+        if not folder:
+            continue
+        for _s, company in recordings.session_site_companies(conn, folder, date or "%",
+                                                             session_key):
+            companies_seen.add(str(company))
+    for company in sorted(companies_seen):
+        refused = _write_refused(conn, caller, company, where)
+        if refused:
+            return refused
     return None
 
 
@@ -2974,6 +3120,16 @@ def unname_speaker(conn, caller, session_base, event):
         if len(owners) != 1 or not self_folder or owners[0] != self_folder:
             return error("removing a name needs an admin, gm, pm, site_manager or "
                          "platform_admin role, or your own recording", 403)
+    # A session on a site of an inactive company is that company's (spec 2026-11-01 §5.6),
+    # whichever arm let the caller this far. The recorder folder(s) come from the session's
+    # own topics, as above; the date from the URL spelling when it carries one.
+    date_m = re.search(r"(\d{4}-\d{2}-\d{2})", session_base or "")
+    refused = _session_write_refused(
+        conn, caller,
+        lambda: topics.folders_for_session_base(conn, str(caller["company_id"]), key),
+        date_m.group(1) if date_m else None, key, "unname_speaker")
+    if refused:
+        return refused
     n = voiceprints.unname(conn, str(caller["company_id"]), session_base=key,
                            display_name=name, rejected_by=str(caller["id"]))
     logger.info("speaker name removed: session=%s name=%s turns=%d", key, name, n)
@@ -4156,6 +4312,7 @@ def get_day_inspections(conn, caller, date, event):
         return err
     company = _read_company(caller, folder)
     rows = inspection_windows.for_day(conn, company, folder, date)
+    rows = _own_rows_visible(conn, caller, folder, date, rows)   # spec 2026-11-01 §5.2
     return ok({"date": date, "folder": folder, "inspections": [
         dict(r, id=str(r["id"]),
              template_id=str(r["template_id"]) if r.get("template_id") else None)
@@ -4271,8 +4428,11 @@ def get_day_checklist_reports(conn, caller, date, event):
     if err is not None:
         return err
     company = _read_company(caller, folder)
-    rows = checklist_reports.for_day(conn, company, folder, date)
-    checks = inspection_windows.for_day(conn, company, folder, date)
+    # spec 2026-11-01 §5.2: own folder loses sessions on an inactive company's site
+    rows = _own_rows_visible(conn, caller, folder, date,
+                             checklist_reports.for_day(conn, company, folder, date))
+    checks = _own_rows_visible(conn, caller, folder, date,
+                               inspection_windows.for_day(conn, company, folder, date))
     return ok({"date": date, "folder": folder,
                "reports": [_checklist_report_payload(r) for r in rows],
                "unmatched": _unmatched_checks(checks)})
@@ -4288,10 +4448,12 @@ def get_recent_checklist_reports(conn, caller, event):
     today = nz_time.nz_today()
     since = (today - timedelta(days=1)).isoformat()
     rows = checklist_reports.recent_for_folder(conn, caller["company_id"], folder, since)
+    rows = _own_rows_visible(conn, caller, folder, None, rows)   # spec 2026-11-01 §5.2
     unmatched = []
     for day in (today - timedelta(days=1), today):
-        for c in _unmatched_checks(inspection_windows.for_day(
-                conn, caller["company_id"], folder, day.isoformat())):
+        for c in _unmatched_checks(_own_rows_visible(conn, caller, folder, day.isoformat(),
+                                                     inspection_windows.for_day(
+                conn, caller["company_id"], folder, day.isoformat()))):
             unmatched.append(dict(c, date=day.isoformat()))
     return ok({"folder": folder, "reports": [_checklist_report_payload(r) for r in rows],
                "unmatched": unmatched})
@@ -4411,6 +4573,13 @@ def put_photo_selection(conn, caller, date, event):
     if unknown:
         return error("not a photograph of this day: %s" % ", ".join(unknown[:5]), 400)
     excluded = sorted(set(body["excluded"]))
+    if tenancy_status.inactive_site_ids(conn, caller) is not None:
+        # Some company is inactive (flag on): photos on its sites are hidden from `day`, so
+        # the caller cannot name them -- but an exclusion made before the suspension must
+        # survive this replace (spec 2026-11-01 §2: no data loss), so carry the stored
+        # names that are not visible now. Flag off / nobody inactive: unchanged.
+        prev = report_photos.read_excluded(s3(), LAKE_BUCKET, folder, date)
+        excluded = sorted(set(excluded) | (prev - day))
     s3().put_object(Bucket=LAKE_BUCKET, Key=report_photos.selection_key(folder, date),
                     Body=json.dumps({"excluded": excluded, "updatedBy": str(caller["id"]),
                                      "updatedAt": nz_time.nz_now().isoformat()}).encode(),
@@ -5050,7 +5219,10 @@ def _stamp_last_seen(conn, caller):
         logger.exception("last_seen stamp failed for user %s", caller.get("id"))
 
 
-def get_me(conn, caller):
+def get_me(conn, caller, blocked=None):
+    """`blocked`: the company gate's reason when it refuses this caller (flag on only).
+    /me is still served then, and carries `blocked: {"reason": ...}` -- the UI's notice.
+    Absent otherwise, so with the flag off the response is unchanged."""
     _stamp_last_seen(conn, caller)
     if GRADED_ROLES:
         # MINOR-2: source /me's site_ids from the graded reach (visible_scope
@@ -5066,11 +5238,15 @@ def get_me(conn, caller):
     # their read reach does not include it -- an admin/gm's reach is their own company's
     # sites. Pickers read this list, so without the union an external member could not
     # choose the project at all (TEST 2026-10-09). Reads stay clipped server-side.
-    site_ids = sorted({str(x) for x in site_ids} | set(
-        memberships.caller_site_roles(conn, caller["id"]).keys()))
-    # Strip the request-scoped visible_scope memo (MINOR-1) before echoing the
-    # caller profile -- it's an internal cache, not part of the /me contract.
-    profile = {k: v for k, v in caller.items() if k != "_visible_scope"}
+    # Company offboarding (spec 2026-11-01 §5.2): a site of an inactive company is not
+    # listed, through the reach or through the membership union (None -> unchanged).
+    inactive = tenancy_status.inactive_site_ids(conn, caller)
+    site_ids = sorted(tenancy_status.drop_inactive({str(x) for x in site_ids} | set(
+        memberships.caller_site_roles(conn, caller["id"]).keys()), inactive))
+    # Strip the request-scoped memos (visible_scope MINOR-1, the inactive-site set) before
+    # echoing the caller profile -- internal caches, not part of the /me contract.
+    profile = {k: v for k, v in caller.items()
+               if k not in ("_visible_scope", tenancy_status.INACTIVE_SITES_MEMO)}
     # Company name for the profile UI (the caller carries company_id; surface
     # the human name too — tenant-split shows each user their company/Corp).
     company = companies.get_company_by_id(conn, caller["company_id"]) if caller.get("company_id") else None
@@ -5087,14 +5263,18 @@ def get_me(conn, caller):
     # `effective_scope` is what the read paths ACTUALLY apply. It is None when GRADED_ROLES
     # is off, because then the membership floor is not applied either and claiming
     # SELF+WORKERS would be a second wrong answer rather than a fix.
-    site_roles = memberships.caller_site_roles(conn, caller["id"])
+    site_roles = tenancy_status.drop_inactive(
+        memberships.caller_site_roles(conn, caller["id"]), inactive)
     effective_scope = (scope.visible_scope(conn, caller)["user_scope"]
                        if GRADED_ROLES else None)
-    return ok({**profile, "site_ids": site_ids,
-               "scope": resolve_scope(caller["global_role"]),
-               "site_roles": site_roles,
-               "effective_scope": effective_scope,
-               "company_name": (company or {}).get("name")})
+    me = {**profile, "site_ids": site_ids,
+          "scope": resolve_scope(caller["global_role"]),
+          "site_roles": site_roles,
+          "effective_scope": effective_scope,
+          "company_name": (company or {}).get("name")}
+    if blocked:
+        me["blocked"] = {"reason": blocked}
+    return ok(me)
 
 
 def patch_me(conn, caller, body):
@@ -5161,6 +5341,8 @@ def list_org_sites(conn, caller, event):
         # membership scope never includes archived rows (param ignored)
         ids = memberships.accessible_site_ids(
             conn, caller["id"], caller["global_role"])
+        # Company offboarding choke point (spec 2026-11-01 §5.2); None -> unchanged.
+        ids = tenancy_status.drop_inactive(ids, tenancy_status.inactive_site_ids(conn, caller))
         rows = sites.list_sites_by_ids(conn, ids)
     # Card KPIs / labels: member count per site + owning company name. Both are
     # additive and scoped to the sites already returned, so they never widen
@@ -5236,6 +5418,9 @@ def create_org_site(conn, caller, body):
         if companies.get_company_by_id(conn, req_company_id) is None:
             return error("target company not found", 404)
         target_company_id = req_company_id
+    refused = _write_refused(conn, caller, target_company_id, "site_create")
+    if refused:
+        return refused
     lat, lat_err = _coerce_coord(body.get("latitude"), -90.0, 90.0, "latitude")
     if lat_err:
         return lat_err
@@ -5273,6 +5458,12 @@ def patch_org_site(conn, caller, site_id, body):
         return error("admin, gm, or platform_admin role required", 403)
     if body is None:
         return error("malformed JSON body", 400)
+    # The site's company. For everyone but platform_admin (exempt, and the only role that
+    # may move a site) update_site below is pinned to the caller's own company, so that
+    # is the company this write lands in. Before the icon relocation: no side effect first.
+    refused = _write_refused(conn, caller, caller["company_id"], "site_patch")
+    if refused:
+        return refused
     name = body.get("name")
     if name is not None:
         if not isinstance(name, str) or not name.strip():
@@ -5467,7 +5658,10 @@ def _build_directory(conn):
         directory_repo.live_sites(conn),
         datetime.now(timezone.utc).isoformat(timespec="seconds"),
         activity=directory_repo.recent_activity(conn, directory.PRIMARY_SITE_WINDOW_DAYS),
-        external_user_ids=directory_repo.external_user_ids(conn))
+        external_user_ids=directory_repo.external_user_ids(conn),
+        # Company offboarding (Task 9): the non-VPC senders hold email / skip reports
+        # for these. Savepoint-guarded; {} before migration 0092.
+        company_statuses=tenancy_status.company_statuses(conn))
 
 
 def _write_directory_if_changed(conn):
@@ -5895,12 +6089,13 @@ def company_export_status(conn, caller, company_id, export_id):
     prefix = company_export.export_prefix(cid, eid)
 
     def presign(key):
-        if not key.startswith(prefix) or ".." in key[len(prefix):] or "/" in key[len(prefix):]:
+        if not _export_key_presignable(prefix, key):
             return None
         return s3().generate_presigned_url(
             "get_object", Params={"Bucket": _export_bucket_for("exports"), "Key": key},
             ExpiresIn=PRESIGNED_URL_EXPIRY)
 
+    records = _records_status(prefix, cid, presign)
     manifest = _read_export_doc(prefix + "manifest.json")
     if manifest is not None and manifest.get("company_id") != cid:
         return error("export not found (or not started yet)", 404)
@@ -5916,6 +6111,7 @@ def company_export_status(conn, caller, company_id, export_id):
                    "excluded": manifest.get("excluded") or {},
                    "manifest": {"key": prefix + "manifest.json",
                                 "url": presign(prefix + "manifest.json")},
+                   "records": records,
                    "expiresIn": PRESIGNED_URL_EXPIRY})
     state = _read_export_doc(prefix + "state.json")
     if state is not None and state.get("company_id") != cid:
@@ -5923,8 +6119,51 @@ def company_export_status(conn, caller, company_id, export_id):
     if state is not None:
         return ok({"exportId": eid, "companyId": cid, "status": "running", "done": False,
                    "partsWritten": len(state.get("parts") or []),
-                   "objects": len(state.get("entries") or [])})
+                   "objects": len(state.get("entries") or []),
+                   "records": records})
+    if records is not None:            # the records phase runs before the file export starts
+        return ok({"exportId": eid, "companyId": cid, "status": "running", "done": False,
+                   "partsWritten": 0, "objects": 0, "records": records})
     return error("export not found (or not started yet)", 404)
+
+
+_RECORDS_NAME_RE = re.compile(r"records/[A-Za-z0-9][A-Za-z0-9_.-]*")
+
+
+def _export_key_presignable(prefix, key) -> bool:
+    """True only for a key directly under the export prefix (a part, the manifest) or exactly
+    one level down in records/ (`records/<name>`, the structured records export). Nothing
+    with '..', a backslash, a control character, or any other subdirectory."""
+    if not isinstance(key, str) or not key.startswith(prefix):
+        return False
+    rest = key[len(prefix):]
+    if not rest or ".." in rest or "\\" in rest or any(ord(c) < 32 for c in rest):
+        return False
+    if "/" not in rest:
+        return True
+    return _RECORDS_NAME_RE.fullmatch(rest) is not None
+
+
+def _records_status(prefix, cid, presign):
+    """The structured records export's part of GET export status, from records_state.json:
+    None when there is none (an export from before the records export, or not started) or it
+    names another company; files are presigned only once it is done, each through `presign`
+    (so only exports/{cid}/{eid}/records/<name> is ever signed)."""
+    doc = _read_export_doc(prefix + company_records_export.STATE_NAME)
+    if doc is None or doc.get("company_id") != cid:
+        return None
+    done = bool(doc.get("done"))
+    files = []
+    if done:
+        for key in doc.get("files") or []:
+            url = presign(str(key))
+            if url:
+                files.append({"key": key, "url": url})
+    tables = {n: {"done": bool(t.get("done")), "rows": t.get("rows", 0),
+                  "excluded": dict(t.get("excluded") or {}),
+                  **({"note": t["note"]} if t.get("note") else {})}
+              for n, t in (doc.get("tables") or {}).items()}
+    return {"status": "done" if done else "running", "files": files, "tables": tables}
 
 
 def _export_bucket_for(kind):
@@ -5946,6 +6185,177 @@ def _export_alt_bucket_for(kind):
     return None
 
 
+# ----------------------------------------------------------
+# /companies/{id}/status -- company offboarding (spec 2026-11-01 §5.3, §5.4, §8, §9)
+# ----------------------------------------------------------
+STATUS_REASON_MAX = 1000
+
+
+def _status_iso(value):
+    return value.isoformat() if hasattr(value, "isoformat") else value
+
+
+def set_company_status(conn, caller, company_id, body):
+    """POST /companies/{id}/status {"status", "reason", "stop_billing"?}.
+
+    platform_admin only, never the caller's own company. Same status as now: 200
+    `changed: false`, nothing written. Otherwise ONE transaction (a savepoint inside the
+    request's): lock the company row, set the status fields, append the audit event and
+    the Cognito work rows (repositories.company_status), and -- deactivations only, flag
+    on only -- delete the company's ws_connections rows. Then an explicit COMMIT, and only
+    then the S3 marker company_status_requests/{company_id}/{event_id}.json for LakeOps
+    (in-VPC org-api cannot invoke a Lambda; see start_company_export). The marker is
+    written whenever there are pending rows, whatever the flag says: the executor is what
+    holds off while the flag is off (R1). A marker failure does not fail the request --
+    the change is already durable -- and is reported as `cognitoTrigger: "failed"`.
+    Migration 0092 not applied: 503 `not migrated`, nothing written."""
+    cid, err = _export_company_or_error(conn, caller, company_id)
+    if err:
+        return err
+    if str(caller.get("company_id")) == cid:
+        return error("cannot change your own company's status", 403)
+    if body is None:
+        return error("body must be a JSON object", 400)
+    to_status = body.get("status")
+    if not isinstance(to_status, str) or to_status not in tenancy_status.STATUSES:
+        return error("status must be one of: active, suspended, exited", 400)
+    reason = body.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return error("reason is required", 400)
+    reason = reason.strip()
+    if len(reason) > STATUS_REASON_MAX:
+        return error(f"reason is longer than {STATUS_REASON_MAX} characters", 400)
+    stop_billing = body.get("stop_billing", False)
+    if stop_billing is None:
+        stop_billing = False
+    if not isinstance(stop_billing, bool):
+        return error("stop_billing must be true or false", 400)
+
+    try:
+        with conn.transaction():
+            result = _apply_company_status(conn, caller, cid, to_status, reason, stop_billing)
+    except Exception as exc:  # noqa: BLE001 - narrowed below
+        if tenancy_status.not_migrated(exc):
+            logger.warning("company status: migration 0092 not applied (%s)", exc)
+            return error("not migrated", 503)
+        raise
+    if not result["changed"]:
+        return ok(result)
+    conn.commit()  # the change is durable BEFORE the executor can be told about it
+    logger.warning("COMPANY_STATUS_CHANGED company=%s %s->%s event=%s by user=%s",
+                   cid, result["previousStatus"], to_status, result["eventId"],
+                   caller.get("id"))
+    # The non-VPC senders (report generator, external-member notices) read inactive
+    # companies from the directory (Task 9): republish now, after the commit, so a
+    # suspension holds their email at once and a reactivation releases it. Never raises.
+    _publish_directory(conn)
+    if sum(result["cognito"].values()) == 0:
+        result["cognitoTrigger"] = "none"
+    else:
+        result["cognitoTrigger"] = _queue_company_status_cognito(
+            cid, result["eventId"], caller)
+    return ok(result)
+
+
+def _apply_company_status(conn, caller, cid, to_status, reason, stop_billing):
+    """The database half of set_company_status. Runs inside the caller's transaction."""
+    current = company_status_repo.lock_company(conn, cid)
+    if current is None:            # deleted between the 404 check and the lock
+        raise LookupError(f"company {cid} vanished")
+    from_status = current["status"]
+    out = {"companyId": cid, "status": to_status, "previousStatus": from_status,
+           "changed": from_status != to_status, "eventId": None,
+           "affectedUsers": 0, "affectedDevices": 0,
+           "cognito": {"disable": 0, "signout": 0, "enable": 0},
+           "cognitoTrigger": "none", "socketsClosed": 0}
+    if from_status == to_status:
+        out["status"] = from_status
+        return out
+    after = company_status_repo.apply_status(conn, cid, to_status, reason, stop_billing)
+    detail = {"stop_billing": stop_billing,
+              "previous": {"status_reason": current["status_reason"],
+                           "billing_stopped_at": _status_iso(current["billing_stopped_at"]),
+                           "exited_at": _status_iso(current["exited_at"])}}
+    event_id = company_status_repo.insert_event(
+        conn, cid, from_status, to_status, reason, caller.get("id"),
+        caller.get("cognito_sub"), detail)
+    was_active = from_status == tenancy_status.ACTIVE
+    if was_active:                                 # active -> suspended / exited
+        company_status_repo.supersede_pending_enables(conn, event_id, cid)
+        rows = company_status_repo.create_deactivation_rows(conn, event_id, cid)
+        out["cognito"].update(rows)
+    elif to_status == tenancy_status.ACTIVE:       # suspended / exited -> active
+        rows = company_status_repo.create_reactivation_rows(conn, event_id, cid)
+        out["cognito"]["enable"] = rows["enable"]
+    # inactive -> inactive: the event alone; the first deactivation listed the users.
+    if to_status != tenancy_status.ACTIVE:
+        if tenancy_status.enforce_enabled():
+            out["socketsClosed"] = company_status_repo.close_sockets(conn, cid)
+        else:
+            logger.warning("COMPANY_GATE_WOULD_DELETE_SOCKETS company=%s status=%s sockets=%d",
+                           cid, to_status, company_status_repo.count_sockets(conn, cid))
+    out.update({"eventId": str(event_id),
+                "affectedUsers": company_status_repo.home_user_count(conn, cid),
+                "affectedDevices": company_status_repo.home_device_count(conn, cid),
+                "statusChangedAt": _status_iso(after["status_changed_at"]),
+                "billingStoppedAt": _status_iso(after["billing_stopped_at"]),
+                "exitedAt": _status_iso(after["exited_at"])})
+    return out
+
+
+def _queue_company_status_cognito(cid, event_id, caller):
+    """Write the LakeOps trigger for one status event: 'queued', or 'failed' (logged)."""
+    request = {"company_id": cid, "event_id": event_id,
+               "requested_by": str(caller.get("id")) if caller.get("id") else None,
+               "requested_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        s3().put_object(Bucket=_export_bucket_for("exports"),
+                        Key=f"{COMPANY_STATUS_REQUEST_PREFIX}{cid}/{event_id}.json",
+                        Body=json.dumps(request).encode("utf-8"),
+                        ContentType="application/json")
+    except Exception:
+        logger.exception("company status: could not write the Cognito request for company "
+                         "%s event %s (rows stay pending)", cid, event_id)
+        return "failed"
+    return "queued"
+
+
+def company_status_events(conn, caller, company_id):
+    """GET /companies/{id}/status-events -- the company's status fields and its audit
+    trail, newest first, each event with its Cognito rows. platform_admin only (any
+    company, the caller's own included: reading changes nothing). 503 before 0092."""
+    cid, err = _export_company_or_error(conn, caller, company_id)
+    if err:
+        return err
+    try:
+        with conn.transaction():
+            current = company_status_repo.read_status(conn, cid)
+            events = company_status_repo.list_events(conn, cid)
+    except Exception as exc:  # noqa: BLE001 - narrowed below
+        if tenancy_status.not_migrated(exc):
+            return error("not migrated", 503)
+        raise
+    current = current or {}
+    return ok({
+        "companyId": cid,
+        "status": current.get("status") or tenancy_status.ACTIVE,
+        "statusChangedAt": _status_iso(current.get("status_changed_at")),
+        "statusReason": current.get("status_reason"),
+        "billingStoppedAt": _status_iso(current.get("billing_stopped_at")),
+        "exitedAt": _status_iso(current.get("exited_at")),
+        "events": [{
+            "id": str(e["id"]), "fromStatus": e["from_status"], "toStatus": e["to_status"],
+            "reason": e["reason"],
+            "actorUserId": str(e["actor_user_id"]) if e["actor_user_id"] else None,
+            "actorSub": e["actor_sub"], "at": _status_iso(e["at"]), "detail": e["detail"],
+            "cognito": [{"userSub": c["user_sub"], "action": c["action"],
+                         "state": c["state"], "attempts": c["attempts"],
+                         "lastError": c["last_error"], "updatedAt": _status_iso(c["updated_at"])}
+                        for c in e["cognito"]],
+        } for e in events],
+    })
+
+
 def export_company_task(event, context=None):
     """Run one time budget of export_company and return the result (next_cursor if not done).
 
@@ -5958,15 +6368,42 @@ def export_company_task(event, context=None):
     part_bytes = event.get("part_bytes")
     if isinstance(part_bytes, bool) or not isinstance(part_bytes, int) or part_bytes <= 0:
         part_bytes = company_export.DEFAULT_PART_BYTES
+    export_id = event.get("export_id")
+    if export_id is None:
+        if event.get("cursor") is not None:
+            return {"error": "a cursor needs the export_id it belongs to"}
+        export_id = str(uuid.uuid4())     # one id for the records and the file export
     try:
         with get_connection() as conn:
-            return company_export.run(
-                conn, s3(), event.get("company_id"), bucket_for=_export_bucket_for, alt_bucket_for=_export_alt_bucket_for,
-                export_id=event.get("export_id"), cursor=event.get("cursor"),
-                time_budget_s=budget, part_bytes=part_bytes,
-                dest_bucket=_export_bucket_for("exports"))
+            return _run_records_then_files(
+                conn, s3(), event.get("company_id"), export_id, budget,
+                _export_bucket_for("exports"), cursor=event.get("cursor"),
+                part_bytes=part_bytes)
     except (ValueError, company_export.ExportError) as exc:
         return {"error": str(exc)}
+
+
+def _run_records_then_files(conn, s3_client, company_id, export_id, budget, bucket, **file_kw):
+    """One time budget of an export: the structured records export (company_records_export)
+    first, then the file export of the same export id with what is left of the budget.
+
+    Records first, so a file export whose state says done always has its records done too
+    (export_tick's "state done -> delete the request" stays correct). The file export does not
+    start until the records are done; the result is the file export's, plus `records`."""
+    started = time.monotonic()
+    rec = company_records_export.run(conn, s3_client, company_id, export_id=export_id,
+                                     dest_bucket=bucket, time_budget_s=budget)
+    summary = {k: rec.get(k) for k in ("done", "tables", "files", "lost_race") if k in rec}
+    if not rec.get("done"):
+        return {"company_id": rec.get("company_id"), "export_id": rec.get("export_id"),
+                "done": False, "next_cursor": None, "records": summary}
+    remaining = max(1, budget - int(time.monotonic() - started))
+    out = company_export.run(
+        conn, s3_client, company_id, bucket_for=_export_bucket_for,
+        alt_bucket_for=_export_alt_bucket_for, export_id=export_id, time_budget_s=remaining,
+        dest_bucket=bucket, **file_kw)
+    out["records"] = summary
+    return out
 
 
 def _delete_export_request(s3_client, bucket, key):
@@ -5974,6 +6411,27 @@ def _delete_export_request(s3_client, bucket, key):
         s3_client.delete_object(Bucket=bucket, Key=key)
     except Exception:  # noqa: BLE001 - it is retried, harmlessly, on the next tick
         logger.exception("export_tick: could not delete %s", key)
+
+
+def _company_status_deps():
+    return dict(s3_client=s3(), bucket=_export_bucket_for("exports"),
+                cognito_factory=cognito_executor, get_connection=get_connection,
+                pool_id=COGNITO_USER_POOL_ID)
+
+
+def lake_ops_tick(event, context=None):
+    """LakeOps' rate(10 minutes) ExportTick: the company-status Cognito executor first
+    (bounded to company_status_cognito.TICK_BUDGET_S), then export_tick unchanged. A failure
+    of the first never stops the export. Returns export_tick's result plus
+    `company_status`."""
+    try:
+        cs = company_status_cognito.tick(context, **_company_status_deps())
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("company_status_cognito tick failed")
+        cs = {"error": str(exc)}
+    out = export_tick(event, context)
+    out["company_status"] = cs
+    return out
 
 
 def export_tick(event, context=None):
@@ -6024,9 +6482,7 @@ def export_tick(event, context=None):
             continue
         try:
             with get_connection() as conn:
-                out = company_export.run(
-                    conn, s3_client, cid, bucket_for=_export_bucket_for, alt_bucket_for=_export_alt_bucket_for, export_id=eid,
-                    time_budget_s=budget, dest_bucket=bucket)
+                out = _run_records_then_files(conn, s3_client, cid, eid, budget, bucket)
         except (ValueError, company_export.ExportError) as exc:
             logger.warning("export_tick: export %s failed: %s", key, exc)
             return {"requests": len(keys), "ran": key, "error": str(exc)}
@@ -6257,14 +6713,19 @@ def list_org_companies(conn, caller):
     a directory of other tenants, so resolve_scope is deliberately NOT consulted here.
     Every other role is refused. The list is every tenant's name: default is refusal.
 
-    WHAT: id and name only. companies.list_companies also selects industry and
+    WHAT: id, name and status only. companies.list_companies also selects industry and
     created_at, and the row may grow; the projection is explicit so a widened repo
-    query cannot leak a new column through this route.
+    query cannot leak a new column through this route. `status` (company offboarding,
+    spec 2026-11-01 §9) comes from a separate savepoint-guarded read, so before migration
+    0092 every company reads 'active' and list_companies' shared SELECT stays unchanged.
     """
     if not is_cross_company(caller["global_role"]):
         return error("platform_admin role required", 403)
+    statuses = tenancy_status.company_statuses(conn)
     return ok({"companies": [
-        {"id": str(c["id"]), "name": c["name"]} for c in companies.list_companies(conn)
+        {"id": str(c["id"]), "name": c["name"],
+         "status": statuses.get(str(c["id"])) or tenancy_status.ACTIVE}
+        for c in companies.list_companies(conn)
     ]})
 
 
@@ -6381,11 +6842,15 @@ def patch_org_company(conn, caller, company_id, body):
 # /members
 # ----------------------------------------------------------
 def _cognito_login_status_by_sub():
-    """{cognito sub: UserStatus} for every user in the pool (Team page "has signed in").
+    """{cognito sub: {"UserStatus", "Enabled"}} for every user in the pool (Team page
+    "has signed in").
 
-    One paginated ListUsers sweep per request, sub attribute only. UserStatus is e.g.
-    CONFIRMED (has set a password), FORCE_CHANGE_PASSWORD (invited, never signed in),
-    RESET_REQUIRED. Any failure -- AccessDenied, throttling, network -- is logged and
+    One paginated ListUsers sweep per request, sub attribute only (Enabled is a top-level
+    field of each user, not an attribute). UserStatus is e.g. CONFIRMED (has set a
+    password), FORCE_CHANGE_PASSWORD (invited, never signed in), RESET_REQUIRED. Enabled is
+    false for a disabled user (company offboarding, spec 5.3), whose UserStatus stays
+    CONFIRMED; a record without Enabled counts as enabled. This is Cognito truth, read the
+    same whether or not COMPANY_STATUS_ENFORCE is on. Any failure -- AccessDenied, throttling, network -- is logged and
     answers {}, so every row gets login_status null: this decorates the member list and
     must never fail it."""
     if not COGNITO_USER_POOL_ID:
@@ -6400,7 +6865,8 @@ def _cognito_login_status_by_sub():
                 sub = next((a.get("Value") for a in u.get("Attributes") or []
                             if a.get("Name") == "sub"), None)
                 if sub:
-                    out[sub] = u.get("UserStatus")
+                    out[sub] = {"UserStatus": u.get("UserStatus"),
+                                "Enabled": u.get("Enabled", True) is not False}
             token = resp.get("PaginationToken")
             if not token:
                 return out
@@ -6408,6 +6874,17 @@ def _cognito_login_status_by_sub():
     except Exception:  # noqa: BLE001 - login_status is decoration; null beats a failed list
         logger.exception("cognito ListUsers failed; members get login_status null")
         return {}
+
+
+def _login_status(cognito_user):
+    """The member row's login_status: the Cognito UserStatus, or "DISABLED" when the Cognito
+    user is disabled (a disabled user keeps CONFIRMED and must not read "Signed in"), or
+    None when the sub is unknown. An enabled user's value is exactly the UserStatus."""
+    if not cognito_user:
+        return None
+    if not cognito_user["Enabled"]:
+        return "DISABLED"
+    return cognito_user["UserStatus"]
 
 
 def list_members(conn, caller, event):
@@ -6435,7 +6912,7 @@ def list_members(conn, caller, event):
     status_by_sub = _cognito_login_status_by_sub()
     for row in rows:
         row["memberships"] = per_user.get(row["id"], [])
-        row["login_status"] = status_by_sub.get(row.get("cognito_sub"))
+        row["login_status"] = _login_status(status_by_sub.get(row.get("cognito_sub")))
         if co_name is not None:
             row["company_name"] = co_name.get(str(row.get("company_id")))
     return ok({"members": rows})
@@ -6596,7 +7073,7 @@ EXTERNAL_MEMBER_NOTICE_PREFIX = "notices/external_member/"
 
 
 def _write_external_member_notice(membership_id, to_email, to_name, site_name,
-                                  inviting_company, role):
+                                  inviting_company, role, site_id=None, site_company_id=None):
     """Leave a notice for the non-VPC backlog lambda to email. Best effort by
     contract: the membership is already written, so a failed put is logged and
     never fails the request.
@@ -6604,7 +7081,10 @@ def _write_external_member_notice(membership_id, to_email, to_name, site_name,
     org-api runs in the VPC with no route to SES (and EMAIL_SENDER unset), so it
     cannot send. It reaches S3 over the gateway endpoint, so it writes the notice
     there -- one object per membership -- and
-    lambda_extraction_backlog's 5-minute run sends it exactly once."""
+    lambda_extraction_backlog's 5-minute run sends it exactly once.
+
+    `site_id` / `site_company_id` let that lambda (no database) HOLD the notice while the
+    site's company is suspended / exited (company offboarding, spec 2026-11-01 §5.5)."""
     try:
         s3().put_object(
             Bucket=LAKE_BUCKET,
@@ -6612,6 +7092,8 @@ def _write_external_member_notice(membership_id, to_email, to_name, site_name,
             Body=json.dumps({
                 "to_email": to_email, "to_name": to_name, "site_name": site_name,
                 "inviting_company": inviting_company, "role": role,
+                "site_id": str(site_id) if site_id else None,
+                "site_company_id": str(site_company_id) if site_company_id else None,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }).encode("utf-8"),
             ContentType="application/json")
@@ -6646,6 +7128,11 @@ def add_external_member(conn, caller, site_id, body):
         return error(f"role must be one of {sorted(ALLOWED_MEMBERSHIP_ROLES)}", 400)
     if site.get("archived_at"):
         return error("site is archived — unarchive it first", 409)
+    # Access to the SITE's company is what this grants; the person's home company is not
+    # the question (their own login is that company's business).
+    refused = _write_refused(conn, caller, site["company_id"], "add_external_member")
+    if refused:
+        return refused
     matches = users.find_live_users_by_email_global(conn, email)
     if len(matches) > 1:
         # Two live accounts share this email: attaching the wrong person to a project is a
@@ -6674,7 +7161,8 @@ def add_external_member(conn, caller, site_id, body):
     user_name = " ".join(p for p in (target.get("first_name"), target.get("last_name")) if p)
     _write_external_member_notice(
         row.get("id"), target.get("email") or email, user_name,
-        site.get("name") or "a project", site_company.get("name") or "A company", role)
+        site.get("name") or "a project", site_company.get("name") or "A company", role,
+        site_id=site.get("id"), site_company_id=site.get("company_id"))
     return ok({"membership": {
         **row,
         "user_name": user_name,
@@ -6707,6 +7195,11 @@ def put_member_membership(conn, caller, target_sub, site_id, body):
         return error(f"role must be one of {sorted(ALLOWED_MEMBERSHIP_ROLES)}", 400)
     if target.get("archived_at"):
         return error("member is archived — unarchive them first", 409)
+    # ensure_membership adds or REVIVES the row: access to the site's company. Here and not
+    # in _resolve_staffing, which DELETE shares -- taking access away is never refused.
+    refused = _write_refused(conn, caller, _site["company_id"], "put_member_membership")
+    if refused:
+        return refused
     row = memberships.ensure_membership(conn, target["id"], site_id, role)
     if _is_external_target(conn, _site, target, site_id):
         memberships.record_audit(conn, "external_role", caller, target["id"], _site, role,
@@ -6866,6 +7359,11 @@ def create_member(conn, caller, body):
             return error("site not found in your company", 403)
         if site.get("archived_at"):
             return error("site is archived — unarchive it first", 409)
+    # Before the Cognito call: an inactive company must not get a new login, nor an
+    # invitation email sent for one. Every site above is in target_company_id.
+    refused = _write_refused(conn, caller, target_company_id, "create_member")
+    if refused:
+        return refused
 
     client = cognito()
     display_name = " ".join(
@@ -6952,6 +7450,11 @@ def create_member(conn, caller, body):
 def archive_site_endpoint(conn, caller, site_id, action):
     if resolve_scope(caller["global_role"]) != "ALL":
         return error("admin or gm role required", 403)
+    if action != "archive":
+        # Reopening a site is access to its company (pinned to the caller's own below).
+        refused = _write_refused(conn, caller, caller["company_id"], "site_unarchive")
+        if refused:
+            return refused
     fn = sites.archive_site if action == "archive" else sites.unarchive_site
     row = fn(conn, site_id, caller["company_id"])
     if row is None:
@@ -6964,6 +7467,12 @@ def archive_member_endpoint(conn, caller, target_sub, action):
         return error("admin or gm role required", 403)
     if action == "archive" and target_sub == caller["cognito_sub"]:
         return error("cannot archive yourself", 400)
+    if action != "archive":
+        # Unarchiving restores a person and their memberships in the member's company,
+        # which unarchive_user pins to the caller's own below. Archiving is never refused.
+        refused = _write_refused(conn, caller, caller["company_id"], "member_unarchive")
+        if refused:
+            return refused
     fn = users.archive_user if action == "archive" else users.unarchive_user
     row = fn(conn, target_sub, caller["company_id"])
     if row is None:
@@ -8819,7 +9328,23 @@ def list_live_items(conn, caller, event):
     rows = topics.list_topics_for_date(conn, site_ids, date,
                                        author_ids=_author_filter(conn, caller),
                                        merged_keys=merged_keys)
+    # Merged-meeting rows carry the LEAD's site and bypass the site ACL in SQL; a site of
+    # an inactive company is dropped here (spec 2026-11-01 §5.2). None -> unchanged.
+    rows = _drop_inactive_rows(rows, tenancy_status.inactive_site_ids(conn, caller))
     return ok({"topics": rows})
+
+
+def _drop_inactive_rows(rows, inactive):
+    """`rows` (dicts with site_id) minus those on a site in `inactive`; None -> `rows`."""
+    if not inactive:
+        return rows
+    return [r for r in rows if str(r.get("site_id")) not in inactive]
+
+
+def _rows_touch_inactive(rows, inactive):
+    """Whether any row (e.g. a merged meeting's, carrying the LEAD's site) is on a site
+    in `inactive`."""
+    return bool(inactive) and any(str(r.get("site_id")) in inactive for r in rows)
 
 
 def _merged_keys_for(conn, user_id, date):
@@ -9040,9 +9565,16 @@ def _allowed_site_ids(conn, caller):
     # ?site= query param arrives as a string — a UUID-vs-str `in` check is
     # always False (every request 403'd, incl. admins). Unit mocks used string
     # ids so this only surfaced against real Aurora (smoke-caught).
+    # Company offboarding (spec 2026-11-01 §5.2): the same live-company choke point as
+    # visible_scope's, for the binary path (None -> unchanged).
+    inactive = tenancy_status.inactive_site_ids(conn, caller)
     if resolve_scope(caller["global_role"]) == "ALL":
-        return {str(s["id"]) for s in sites.list_company_sites(conn, caller["company_id"])}
-    return {str(x) for x in memberships.accessible_site_ids(conn, caller["id"], caller["global_role"])}
+        return tenancy_status.drop_inactive(
+            {str(s["id"]) for s in sites.list_company_sites(conn, caller["company_id"])},
+            inactive)
+    return tenancy_status.drop_inactive(
+        {str(x) for x in memberships.accessible_site_ids(conn, caller["id"], caller["global_role"])},
+        inactive)
 
 
 _SITE_UUID_RE = re.compile(
@@ -10696,6 +11228,11 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False,
     # to be the target -- asking about the caller would answer a question nobody
     # posed and return the caller's own unrelated meetings.
     merged_keys = _merged_keys_for(conn, _timeline_target_id(conn, caller, user), date)
+    # Company offboarding (spec 2026-11-01 §5.2): the person's own day that touches a site
+    # of an inactive company is read exactly as another viewer reads it -- site-clipped
+    # rows, no whole-day prose, no photo list, never the verbatim daily_report.json.
+    if not cross_user_clip and _own_range_touches_inactive(conn, caller, user, date, date):
+        cross_user_clip = True
     saw_foreign = []
     day_cache = []
 
@@ -10732,7 +11269,11 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False,
             # Their own day: every site they hold a live membership on counts,
             # including a project of another company they were added to (an ALL-tier
             # caller's reach is their own company's sites only).
-            allowed = set(allowed) | set(memberships.caller_site_roles(conn, caller["id"]))
+            # ...except a site of an inactive company (spec 2026-11-01 §5.2: own-folder
+            # reads lose it too). None -> unchanged.
+            allowed = tenancy_status.drop_inactive(
+                set(allowed) | set(memberships.caller_site_roles(conn, caller["id"])),
+                tenancy_status.inactive_site_ids(conn, caller))
         # The kwarg is passed ONLY when there is something to union. A day with
         # no group must reach this repository exactly as it did before -- same
         # call, same SQL, same params -- so the change cannot alter the ordinary
@@ -10742,6 +11283,13 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False,
                 if merged else
                 topics.list_topics_for_source_prefix(conn, prefix))
         clip = cross_user_clip
+        if not clip and user == (caller.get("folder_name") or None) and _rows_touch_inactive(
+                rows, tenancy_status.inactive_site_ids(conn, caller)):
+            # spec 2026-11-01 §5.2: own day whose rows (a merged meeting's carry the LEAD's
+            # site) touch an inactive company's site -- read like another viewer: clipped,
+            # no prose, and (saw_foreign) never the verbatim doc. Flag off: inactive None.
+            clip = True
+            saw_foreign.append(True)
         if clip_foreign and not clip:
             foreign = [r for r in rows if str(r["site_id"]) not in allowed]
             if foreign or _day_not_within():
@@ -10941,6 +11489,11 @@ def _day_photo_block(conn, caller, user, date):
         photos = [p for p in photos if p["s3_key"] not in hidden]
         if hidden:
             logger.info("day view: %s/%s hid %d deleted photo(s)", user, date, len(hidden))
+        # Own folder: photos taken on a site of an inactive company are withheld (spec
+        # 2026-11-01 §5.2). Anyone else's folder / flag off: unchanged.
+        own_hider = _session_hider(conn, caller, user, date)
+        if isinstance(own_hider, _InactiveSiteHider):
+            photos = [p for p in photos if not own_hider.hides_key(p["s3_key"])]
         return photos
     except Exception:  # noqa: BLE001 - see above
         logger.exception("photo list unavailable for %s/%s", user, date)
@@ -11141,7 +11694,17 @@ def admin_disambiguation(conn, caller, date):
     if not candidates:
         return ok({"message": f"No reports for {date}", "date": date}, 404)
     if len(candidates) == 1:
-        return _render_timeline_for_user(conn, caller, date, next(iter(candidates)))
+        cand = next(iter(candidates))
+        # Company offboarding (spec 2026-11-01 §5.2), FLAG-ON ONLY: while some company is
+        # inactive, the one candidate's day is read like any other viewer's (clip_foreign:
+        # site-clipped rows, no whole-day prose, no photo list, no verbatim fallback), so a
+        # suspended / exited company's rows never reach this caller through it. With the
+        # flag off or nobody inactive (None) it is the call it always was.
+        if (tenancy_status.inactive_site_ids(conn, caller) is not None
+                and not is_cross_company(caller["global_role"])
+                and cand != (caller.get("folder_name") or None)):
+            return _render_timeline_for_user(conn, caller, date, cand, clip_foreign=True)
+        return _render_timeline_for_user(conn, caller, date, cand)
     return ok({"date": date, "available_users": sorted(candidates)})
 
 
@@ -11896,16 +12459,91 @@ class _SessionHider:
         return not self.siteless_ok
 
 
+class _InactiveSiteHider(_SessionHider):
+    """The person's OWN folder while a company is inactive (spec 2026-11-01 §5.2/§6): the
+    inverse of the whitelist. A session is hidden when any recording or extraction row ties
+    it to a site of an inactive company; everything else (other sites, site-less, row-less)
+    stays visible, as it always was for the person themself."""
+
+    @classmethod
+    def build(cls, conn, folder, date, inactive):
+        deny = sorted(inactive)
+        outside, keys = set(), set()
+        like = recordings._escape_like(folder)
+        date = date or "%"
+        for sql, pat in (
+                ("SELECT s3_key FROM recordings WHERE s3_key LIKE %s "
+                 "AND site_id = ANY(%s::uuid[])", f"users/{like}/%/{date}/%"),
+                ("SELECT source_s3_key FROM topics WHERE source_s3_key LIKE %s "
+                 "AND site_id = ANY(%s::uuid[])", f"extractions/{like}/{date}/%")):
+            for (key,) in conn.execute(sql, (pat, deny)).fetchall():
+                keys.add(key)
+                sid = _session_of(key)
+                if sid:
+                    outside.add(sid)
+        # The base `_allowed` slot is a whitelist; this hider has none (its own hides_key
+        # never reads it), so the deny list lives under its own name.
+        hider = cls(conn, [], True, set(), outside)
+        hider.deny, hider.keys = deny, keys
+        return hider
+
+    def hides_key(self, key):
+        """A key with a session id: its session decides. Without one (a photo): hidden
+        when its own recordings row is on an inactive site (all fetched once in build,
+        so a day's photo list costs no per-photo query)."""
+        sid = _session_of(key)
+        if sid:
+            return self.hides(sid)
+        return key in self.keys
+
+    def hides_row(self, row, field="session"):
+        """For a row naming its session (inspection windows, checklist reports). A row
+        with no session id cannot be tied to a site and stays visible."""
+        return self.hides(_session_of(row.get(field) or ""))
+
+
+def _own_rows_visible(conn, caller, folder, date, rows, field="session"):
+    """`rows` minus those whose session lies on an inactive company's site, for the
+    caller's OWN folder (spec 2026-11-01 §5.2). Anyone else's folder, flag off,
+    platform_admin, nobody inactive: `rows` unchanged."""
+    hider = _session_hider(conn, caller, folder, date)
+    if not isinstance(hider, _InactiveSiteHider):
+        return rows
+    return [r for r in rows if not hider.hides_row(r, field)]
+
+
+def _own_range_touches_inactive(conn, caller, folder, date_from, date_to):
+    """Whether the caller's OWN day(s) hold work on a site of an inactive company. Such a
+    day is read exactly as another viewer would read it (spec 2026-11-01 §5.2: the
+    existing cross-user clip, never the unclipped whole-day artifacts). False for anyone
+    else's folder, flag off, platform_admin, nobody inactive -- no DB read then."""
+    if not folder or folder != (caller.get("folder_name") or None):
+        return False
+    inactive = tenancy_status.inactive_site_ids(conn, caller)
+    if inactive is None:
+        return False
+    return recordings.author_range_touches_sites(
+        conn, caller["id"], date_from, date_to, inactive)
+
+
 def _session_hider(conn, caller, folder, date):
     """A `_SessionHider` for one (folder, date), or None when nothing is restricted
-    (no caller, the person themself, platform_admin).
+    (no caller, the person themself, platform_admin). The person themself gets an
+    `_InactiveSiteHider` instead while a company is inactive and the flag is on.
 
     NOT fail-open, unlike the tombstone lookup: a failure here would hand one
     company another company's recording, so it propagates."""
     if conn is None or caller is None or not folder:
         return None
-    if is_cross_company(caller["global_role"]) or folder == (caller.get("folder_name") or None):
+    if is_cross_company(caller["global_role"]):
         return None
+    if folder == (caller.get("folder_name") or None):
+        # The person's own folder is unrestricted -- except the sessions captured on a site
+        # of an inactive company (spec 2026-11-01 §5.2/§6). None -> unchanged.
+        inactive = tenancy_status.inactive_site_ids(conn, caller)
+        if inactive is None:
+            return None
+        return _InactiveSiteHider.build(conn, folder, date, inactive)
     allowed = [str(x) for x in _allowed_site_ids(conn, caller)]
     inside, outside = set(), set()
     like = recordings._escape_like(folder)
@@ -12558,8 +13196,12 @@ def _user_report_hidden(conn, caller, key, owners=None):
         return False
     owner = _report_key_owner_folder(key)
     period = _report_key_period(key)
-    if not owner or not period or owner == (caller.get("folder_name") or None):
+    if not owner or not period:
         return False
+    if owner == (caller.get("folder_name") or None):
+        # The person's own document: theirs, unless its period holds work on a site of an
+        # inactive company (spec 2026-11-01 §5.2). Flag off etc. -> False, no DB read.
+        return _own_range_touches_inactive(conn, caller, owner, period[0], period[1])
     owners = owners if owners is not None else {}
     if owner not in owners:
         owners[owner] = users.get_by_folder_name_global(conn, owner)

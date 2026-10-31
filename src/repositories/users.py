@@ -289,10 +289,34 @@ def archive_user(conn, cognito_sub, company_id) -> dict | None:
 
 
 def unarchive_user(conn, cognito_sub, company_id) -> dict | None:
-    return conn.cursor(row_factory=dict_row).execute(
-        f"UPDATE users SET archived_at=NULL "
-        f"WHERE cognito_sub=%s AND company_id=%s AND archived_at IS NOT NULL RETURNING {_COLS}",
+    """Restore an archived user (company-guarded) and the memberships archive_user closed
+    WITH them -- those whose archived_at equals the user's (archive_user stamps both with
+    the one now() of its transaction). A membership closed earlier on its own, or by a
+    site archive, carries a different stamp and stays closed (spec 2026-11-01 company
+    offboarding §8). Returns None if not found / wrong company / not archived.
+
+    A membership on a site that is archived now stays closed even with the user's stamp
+    (the site was archived after the person, so its cascade skipped the row):
+    unarchive_site restores no memberships, so reviving one here would put this person
+    alone back on the project when it reopens.
+
+    The user's archived_at is read (and the row locked) BEFORE it is cleared; the three
+    statements run in the caller's one transaction."""
+    cur = conn.cursor(row_factory=dict_row)
+    found = cur.execute(
+        "SELECT id, archived_at FROM users "
+        "WHERE cognito_sub=%s AND company_id=%s AND archived_at IS NOT NULL FOR UPDATE",
         (cognito_sub, company_id),
+    ).fetchone()
+    if found is None:
+        return None
+    cur.execute(
+        "UPDATE memberships SET archived_at=NULL WHERE user_id=%s AND archived_at=%s "
+        "AND site_id IN (SELECT id FROM sites WHERE archived_at IS NULL)",
+        (found["id"], found["archived_at"]))
+    return cur.execute(
+        f"UPDATE users SET archived_at=NULL WHERE id=%s RETURNING {_COLS}",
+        (found["id"],),
     ).fetchone()
 
 

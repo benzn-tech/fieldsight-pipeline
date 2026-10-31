@@ -3,6 +3,11 @@
 login_status is the Cognito UserStatus for the row's cognito_sub (CONFIRMED,
 FORCE_CHANGE_PASSWORD, ...), from one paginated ListUsers sweep per request, or null when
 unknown. A Cognito failure must never fail the list: everyone gets null.
+
+A user whose Cognito account is disabled (Enabled false; offboarding disables a company's
+users) reads login_status "DISABLED" whatever its UserStatus, because a disabled user keeps
+CONFIRMED and must not show as "Signed in". A user record without Enabled counts as enabled,
+so an all-enabled pool answers exactly what it answered before.
 """
 import json
 
@@ -138,3 +143,58 @@ def test_me_stamps_the_caller_and_a_stamp_failure_does_not_fail_me(env):
     res = org.lambda_handler(make_event("GET", "/api/org/me"), None)
     assert seen == ["sub-1"]
     assert res["statusCode"] == 200, res
+
+
+def _u(sub, status, enabled):
+    u = _user(sub, status)
+    u["Enabled"] = enabled
+    return u
+
+
+def test_disabled_user_reads_disabled_not_confirmed_across_pages(env):
+    fake = FakeCognito(pages=[
+        {"Users": [_u("sub-1", "CONFIRMED", True)], "PaginationToken": "p2"},
+        {"Users": [_u("sub-x", "CONFIRMED", False)], "PaginationToken": "p3"},
+        {"Users": [_u("sub-2", "CONFIRMED", False)]},
+    ])
+    env.setattr(org, "_cognito_client", fake)
+    m = _members(org.lambda_handler(make_event("GET", "/api/org/members"), None))
+    assert m["u-1"]["login_status"] == "CONFIRMED"
+    assert m["u-2"]["login_status"] == "DISABLED"   # Cognito still says CONFIRMED
+    assert m["u-3"]["login_status"] is None          # not in the pool
+    assert m["u-4"]["login_status"] is None          # no login at all
+    assert len(fake.calls) == 3
+    assert fake.calls[2]["PaginationToken"] == "p3"
+    assert all(c["AttributesToGet"] == ["sub"] for c in fake.calls)
+
+
+def test_disabled_dominates_an_invited_status(env):
+    fake = FakeCognito(pages=[{"Users": [_u("sub-2", "FORCE_CHANGE_PASSWORD", False)]}])
+    env.setattr(org, "_cognito_client", fake)
+    m = _members(org.lambda_handler(make_event("GET", "/api/org/members"), None))
+    assert m["u-2"]["login_status"] == "DISABLED"
+
+
+def test_enabled_pool_answers_exactly_as_before(env):
+    """Explicit Enabled true and an absent Enabled give the same rows, with no new key."""
+    def rows(pages):
+        env.setattr(org, "_cognito_client", FakeCognito(pages=pages))
+        return _members(org.lambda_handler(make_event("GET", "/api/org/members"), None))
+    explicit = rows([{"Users": [_u("sub-1", "CONFIRMED", True),
+                                _u("sub-2", "FORCE_CHANGE_PASSWORD", True)]}])
+    absent = rows([{"Users": [_user("sub-1", "CONFIRMED"),
+                              _user("sub-2", "FORCE_CHANGE_PASSWORD")]}])
+    assert explicit == absent
+    assert explicit["u-1"]["login_status"] == "CONFIRMED"
+    assert explicit["u-2"]["login_status"] == "FORCE_CHANGE_PASSWORD"
+    assert set(explicit["u-1"]) == {"id", "cognito_sub", "last_seen_at", "memberships",
+                                    "login_status"}
+
+
+def test_helper_returns_status_and_enabled(env):
+    env.setattr(org, "_cognito_client", FakeCognito(pages=[
+        {"Users": [_u("sub-1", "CONFIRMED", False), _user("sub-2", "CONFIRMED")]}]))
+    assert org._cognito_login_status_by_sub() == {
+        "sub-1": {"UserStatus": "CONFIRMED", "Enabled": False},
+        "sub-2": {"UserStatus": "CONFIRMED", "Enabled": True},
+    }

@@ -27,6 +27,7 @@ from psycopg.rows import dict_row
 
 import inspection_match
 import pipeline_trace
+import tenancy_status
 from repositories import report_templates, topics as topics_repo, users
 
 logger = logging.getLogger(__name__)
@@ -127,6 +128,9 @@ def request_body(w, template, topic_ids=None):
     return body
 
 
+_UNREAD = object()
+
+
 def auto_generate(conn, company_id, folder, date, session, windows, generate=None):
     """Send each matched check of a final extraction to the report worker,
     once. `windows` are the rows just stored (start_at/end_at to the second,
@@ -145,11 +149,32 @@ def auto_generate(conn, company_id, folder, date, session, windows, generate=Non
     user = (users.get_by_folder_name(conn, company_id, folder)
             or users.get_by_folder_name_global(conn, folder) or {})
     caller = users.get_user_by_sub(conn, user["cognito_sub"]) if user.get("cognito_sub") else None
+    # Company offboarding gate (spec 2026-11-01 §5.1): the recorder is the caller of the
+    # report. Blocked -> each check is skipped, never raised; the extraction that called
+    # this is untouched (R6). Flag off: logs and generates as today.
+    blocked = (tenancy_status.caller_blocked(conn, caller, where="checklist-auto-report")
+               if caller is not None else None)
+    # Company offboarding, Task 9 (spec §5.5): no report for a check recorded on an
+    # inactive company's SITE (`company_id` is the site's company), whoever recorded it.
+    # Read once, inside the per-check try: a failed read costs that check ("error"),
+    # never the extraction. Flag off: logged COMPANY_GATE_WOULD_SUPPRESS, generated.
+    suppressed = _UNREAD
     for w in matched:
         try:
             if caller is None:
                 out.append((w["name"], "no login for %s" % folder))
                 pipeline_trace.event("checklist_report", "no_login", detail={"check": w["name"]})
+                continue
+            if blocked:
+                out.append((w["name"], blocked))
+                pipeline_trace.event("checklist_report", blocked, detail={"check": w["name"]})
+                continue
+            if suppressed is _UNREAD:
+                suppressed = tenancy_status.suppress_reason(
+                    conn, company_id=company_id, where="checklist-auto-report")
+            if suppressed:
+                out.append((w["name"], suppressed))
+                pipeline_trace.event("checklist_report", suppressed, detail={"check": w["name"]})
                 continue
             if already_made(conn, session, w["template_id"], w["start_at"], w.get("end_at"),
                             w.get("segments")):

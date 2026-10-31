@@ -50,6 +50,9 @@ logger.setLevel(logging.INFO)
 
 # Configuration
 RAG_SEARCH_FUNCTION = os.environ.get('RAG_SEARCH_FUNCTION', '')
+# rag-search's company-gate refusals (offboarding spec 2026-11-01 §5.1; the
+# tenancy_status reasons). Passed to the client as `error` next to today's answer.
+COMPANY_GATE_ERRORS = ("company_inactive", "account_archived")
 
 # Lazy lambda client (Phase 5 RAG path) -- mirrors the _s3_client-style lazy
 # singleton used elsewhere (lambda_ingest.py, lambda_extract_session.py):
@@ -1100,7 +1103,7 @@ def _metric_answer(caller_sub, question, metric, date_from, date_to, applied_sco
 
     logger.info("  metric=%s value=%s notes=%s", metric,
                 result.get("value"), result.get("notes"))
-    return {
+    out = {
         "answer": metric_render.render(question, result),
         "citations": [],
         "grounded": True,
@@ -1112,6 +1115,9 @@ def _metric_answer(caller_sub, question, metric, date_from, date_to, applied_sco
         "basis": basis,
         "applied_scope": applied_scope,
     }
+    if result.get("error") in COMPANY_GATE_ERRORS:
+        out["error"] = result["error"]
+    return out
 
 
 def _rag_answer(body, on_web_start=None):
@@ -1555,7 +1561,7 @@ def _rag_answer(body, on_web_start=None):
                         "applied_scope": applied_scope,
                         "asked": asked if rewritten else None,
                     }
-            return {
+            no_records = {
                 "answer": "No relevant records found for this question.",
                 "citations": [],
                 "grounded": True,
@@ -1563,6 +1569,12 @@ def _rag_answer(body, on_web_start=None):
                 "applied_scope": applied_scope,
                 "asked": asked if rewritten else None,
             }
+            # The company gate (offboarding spec §5.1): the client gets the reason
+            # as `error` so it can tell "your company is suspended" from "nothing
+            # recorded". Other rag-search errors keep today's response.
+            if result.get("error") in COMPANY_GATE_ERRORS:
+                no_records["error"] = result["error"]
+            return no_records
 
         # The records may not answer this. Ask before spending a synthesis on
         # them, not after: measured worst case, answering first and looking up
