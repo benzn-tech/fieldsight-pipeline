@@ -16,6 +16,7 @@
 #   TemplateDigitise ← template_digitise_requests/**.json (org-api's request to read an uploaded form)
 #   ProjectDocIndex ← project_doc_requests/**.json (org-api's request to index an uploaded project document)
 #   Ingest      ← project_doc_vectors/**.json  (project-doc worker output, in-VPC Aurora apply)
+#   ActionAgent ← action_pack_requests/**.json (org-api's request to run one action pack)
 #
 # SAFETY:
 #   * MERGE, not clobber: we read the existing notification config and
@@ -55,6 +56,7 @@ SESSION_FINALIZE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-
 SPEAKER_EMBED_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-speaker-embed"
 TEMPLATE_DIGITISE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-template-digitise"
 PROJECT_DOC_INDEX_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-project-doc-index"
+ACTION_AGENT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-action-agent"
 
 echo "Bucket=${BUCKET} Stage=${STAGE} VAD=${PREFIX}-vad Transcribe=${PREFIX}-transcribe EmbedReport=${PREFIX}-embed-report Ingest=${PREFIX}-ingest ExtractSession=${PREFIX}-extract-session ItemWriter=${PREFIX}-item-writer ProgrammeMatcher=${PREFIX}-programme-matcher Keyframe=${PREFIX}-keyframe"
 
@@ -291,6 +293,25 @@ if fn_exists "${PREFIX}-speaker-embed"; then
   ]' <<<"$DESIRED")
 else
   echo "NOTE: ${PREFIX}-speaker-embed not deployed — skipping speaker-embed trigger"
+fi
+
+# NOTE(action packs, spec 2026-11-01 §14 D3/S1): the non-VPC agent triggers on
+# action_pack_requests/*.json -- org-api's request to run one pack (pack id, caller sub,
+# site id; never the instruction). The cancel marker org-api writes beside it is
+# action_pack_requests/<pack>.cancel, which the .json suffix excludes. The agent's only S3
+# write is web snapshots under action_packs/<company>/<pack>/web/ on the lake bucket (the
+# same bucket as this one on prod) -- "action_packs/" and "action_pack_requests/" are not
+# prefixes of each other and no rule matches .txt, so there is no BUG-13 loop; the prefix
+# is disjoint from every other wired prefix (tests/unit/test_search_index_wiring.py).
+# ActionAgentFunction is conditional (HasOrgApi), hence the fn_exists guard.
+if fn_exists "${PREFIX}-action-agent"; then
+  WIRE_FNS+=("${PREFIX}-action-agent")
+  DESIRED=$(jq -c --arg arn "$ACTION_AGENT_ARN" '. + [
+    {"Id":"fs-action-agent","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"action_pack_requests/"},{"Name":"suffix","Value":".json"}]}}}
+  ]' <<<"$DESIRED")
+else
+  echo "NOTE: ${PREFIX}-action-agent not deployed — skipping action-agent trigger"
 fi
 
 CURRENT=$(aws s3api get-bucket-notification-configuration --bucket "$BUCKET" --output json 2>/dev/null || echo '{}')

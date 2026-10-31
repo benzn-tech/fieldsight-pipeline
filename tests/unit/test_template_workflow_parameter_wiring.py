@@ -1347,3 +1347,28 @@ def test_both_workflows_pass_the_rerank_tunables():
         for _, (param, _) in _RERANK_TUNABLES.items():
             assert f"{param}=" in wf, \
                 f"{env_name} does not pass {param}; the Parameter holds its default forever"
+
+
+# ---- action packs (spec 2026-11-01 §14 S16) ------------------------------------
+
+
+@pytest.mark.parametrize("env_name", ["prod", "test"])
+def test_both_workflows_pass_action_packs_only_when_their_variable_is_set(env_name):
+    """Reachable from a repo variable, never as a bare `ActionPacks=` (SAM exits 2 on it),
+    and an unset variable keeps the template Default 'off' on both stacks."""
+    wf = open(WORKFLOWS[env_name], encoding="utf-8").read()
+    var = f"{env_name.upper()}_ACTION_PACKS"
+    assert re.search(r'ACTION_PACKS_PARAM=""\s+if \[ -n "\$\{\{ vars\.%s \}\}" \]; then\s+'
+                     r'ACTION_PACKS_PARAM="ActionPacks=\$\{\{ vars\.%s \}\}"\s+fi' % (var, var),
+                     wf)
+    assert "$ACTION_PACKS_PARAM \\" in _raw_override_lines(WORKFLOWS[env_name])
+    assert not re.search(r'^\s+"ActionPacks=', wf, re.M)
+    other = "TEST_ACTION_PACKS" if env_name == "prod" else "PROD_ACTION_PACKS"
+    assert other not in wf, f"{env_name} must not read the other stage's switch"
+    assert _template()["Parameters"]["ActionPacks"]["Default"] == "off"
+
+
+def test_the_action_packs_switch_reaches_org_api_and_the_agent():
+    """The middle segment, for both readers: the routes/internal tasks and the worker."""
+    for fn in ("OrgApiFunction", "ActionAgentFunction"):
+        assert "ACTION_PACKS: !Ref ActionPacks" in _env_text(fn), fn

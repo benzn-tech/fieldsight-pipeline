@@ -229,3 +229,19 @@ def test_the_new_prefixes_are_disjoint_from_every_other_rule():
             assert not o[2].startswith(n[2]) and not n[2].startswith(o[2]), (n, o)
     # the request and vectors prefixes are also not a prefix of each other
     assert not new[0][2].startswith(new[1][2]) and not new[1][2].startswith(new[0][2])
+
+
+def test_the_action_agent_rule_is_disjoint_from_every_other_rule_and_its_own_output():
+    """Action packs (spec 2026-11-01 §14 D3): the request prefix shares "action_pack" with
+    the agent's own lake output (action_packs/) -- S3 compares literal prefixes, so neither
+    may be a prefix of the other, and no rule may match that output."""
+    rules = _wire_rules()
+    agent = [r for r in rules if r[0] == "fs-action-agent"]
+    assert agent == [("fs-action-agent", "ACTION_AGENT_ARN", "action_pack_requests/", ".json")]
+    for o in rules:
+        if o[0] != "fs-action-agent":
+            assert not o[2].startswith(agent[0][2]) and not agent[0][2].startswith(o[2]), o
+    output = "action_packs/00000000-0000-0000-0000-000000000000/p/web/W1.txt"
+    cancel = "action_pack_requests/00000000-0000-0000-0000-000000000000.cancel"
+    for key in (output, cancel):
+        assert not any(key.startswith(r[2]) and key.endswith(r[3]) for r in rules), key

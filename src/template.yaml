@@ -2656,6 +2656,121 @@ Resources:
                   s3:prefix: ['ask_threads/*']
 
   # ----------------------------------------------------------
+  # Background action agent (spec 2026-11-01 §4.1, §4.2, §14 D3/S1/S8/S9/S16).
+  # Kicked off by org-api's request object action_pack_requests/<pack>.json on the
+  # DATA bucket (S3 event wired by scripts/wire-s3-events.sh, entry fs-action-agent;
+  # BUG-33: SAM cannot attach events to an external bucket, and the script also adds
+  # the s3.amazonaws.com invoke permission -- same as every other S3-triggered worker).
+  # NOT in the VPC: it calls models and the web. Its in-VPC hops are org-api's
+  # internal tasks (claim / heartbeat / store / fail) and rag-search, both by
+  # RequestResponse invoke -- the sendVoice -> voice-resolve direction.
+  # Retries 0: a retry would re-run a paid run; a duplicate S3 delivery loses the
+  # claim and exits. Reserved concurrency 3 caps the spend and keeps a burst of
+  # packs from starving anything else. Inert unless ActionPacks is internal/on.
+  # Gated on HasOrgApi (it is useless without org-api); RagSearchFunction is HasDb,
+  # which HasOrgApi implies.
+  # ----------------------------------------------------------
+  ActionAgentFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasOrgApi
+    Properties:
+      FunctionName: !Sub ["${P}-action-agent", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_action_agent.lambda_handler
+      Timeout: 900
+      MemorySize: 1024
+      ReservedConcurrentExecutions: 3
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+        # A request older than this is stale (the stale-run sweep fails a queued pack
+        # whose heartbeat is 20 min old). Lambda re-queues a throttled async event until
+        # this age, so it also bounds how long a burst waits behind the cap of 3.
+        MaximumEventAgeInSeconds: 900
+      Environment:
+        Variables:
+          ACTION_PACKS: !Ref ActionPacks
+          # Writer = the Ask judge setting; verifier empty = the cheap model in code
+          # (CORROBORATION_CHEAP_MODEL / web_answer.CHEAP_MODEL). Fallbacks empty: the
+          # verifier must be a different family from the writer actually used (S6), so
+          # any fallback is a deliberate choice, not a default.
+          ACTION_WRITER_MODEL: !Ref AskJudgeModel
+          ACTION_VERIFIER_MODEL: ''
+          ACTION_VERIFIER_FALLBACKS: ''
+          # Per-run token cap (§4.2 cost guard): over it the run stores what is verified
+          # as a partial pack (run_trace.truncated).
+          ACTION_TOKEN_CAP: '400000'
+          # 900 Timeout - 60 store reserve (lambda_action_agent.STORE_RESERVE_S) = 840;
+          # 780 keeps a further 60 s so a chain started late in the run still ends with
+          # time for the final checkpoint, the store invoke and the fail invoke. The run's
+          # own target (600 s, S8) is far inside it.
+          LLM_CHAIN_BUDGET_SECONDS: '780'
+          # One model attempt; a write or verify call gets 90 s (S8), so 300 is a ceiling,
+          # not a plan -- the stages pass their own deadlines.
+          LLM_HTTP_TIMEOUT: '300'
+          ORG_API_FUNCTION: !Ref OrgApiFunction
+          RAG_SEARCH_FUNCTION: !Ref RagSearchFunction
+          # Request objects + cancel markers (data bucket, org-api's S3_BUCKET) and web
+          # snapshots (lake bucket, org-api's LAKE_BUCKET): the same names org-api uses.
+          S3_BUCKET: !Ref DataBucketName
+          LAKE_BUCKET: !Ref IngestBucketName
+          # The model and tool plumbing, mirrored from AskVoiceWorkerFunction
+          # (tests/unit/test_action_agent_template.py pins the parity).
+          ANTHROPIC_API_KEY: !Ref ClaudeApiKey
+          DASHSCOPE_API_KEY: !Ref DashScopeApiKey
+          DASHSCOPE_BASE_URL: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+          DASHSCOPE_EMBED_MODEL: text-embedding-v4
+          DASHSCOPE_EMBED_DIM: '1024'
+          ENABLE_RERANK: !Ref EnableRerank
+          DASHSCOPE_RERANK_TIMEOUT_SECONDS: !Ref RerankTimeoutSeconds
+          RERANK_CANDIDATE_K: !Ref RerankCandidateK
+          CLAUDE_MODEL: claude-haiku-5-5
+          LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
+          QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
+          QWEN_BASE_URL: !Ref QwenBaseUrl
+          QWEN_MODEL: !Ref QwenModelFast
+          LLM_REASONING_EFFORT: !Ref LlmReasoningEffortFast
+          CORROBORATION_API_KEY: !Ref CorroborationApiKey
+          CORROBORATION_PROVIDER_ORDER: !Ref CorroborationProviderOrder
+          ENABLE_WEB_ANSWER: !Ref EnableWebAnswer
+          PROJECT_DOCUMENTS: !Ref ProjectDocuments
+          ASK_JUDGE_MODEL: !Ref AskJudgeModel
+          ASK_JUDGE_FALLBACKS: !Ref AskJudgeFallbacks
+          ASK_JUDGE_PROVIDER: !Ref AskJudgeProvider
+          ASK_JUDGE_REASONING: !Ref AskJudgeReasoning
+      Layers:
+        - !Ref DashScopeLayer
+      Policies:
+        # Exact ARNs, not LambdaInvokePolicy: that grants `<name>*`.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource:
+                - !GetAtt OrgApiFunction.Arn
+                - !GetAtt RagSearchFunction.Arn
+        # Read the request object and probe the cancel marker. ListBucket so a missing
+        # marker answers 404, not 403 (a 403 fails the run: it is an IAM fault).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}/action_pack_requests/*'
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}'
+              Condition:
+                StringLike:
+                  s3:prefix: ['action_pack_requests/*']
+        # Web snapshots (Task 9): action_packs/<company>/<pack>/web/<ref>.txt on the lake.
+        # org-api's store task records them in the lake ownership index.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub 'arn:aws:s3:::${IngestBucketName}/action_packs/*'
+
+  # ----------------------------------------------------------
   # Lambda Layer: dashscope SDK (SP-Ask TTS)
   # AskAgentFunction's tts() needs the Qwen-TTS-Realtime WebSocket client
   # (dashscope.audio.qwen_tts_realtime), not available via a plain HTTP call
