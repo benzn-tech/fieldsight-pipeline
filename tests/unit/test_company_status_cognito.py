@@ -350,6 +350,30 @@ def test_max_attempts_stops_retrying(w):
     assert w.repo.rows[(E1, "u1", "disable")]["state"] == "failed"
 
 
+def test_an_exhausted_row_is_logged_as_an_error(w, caplog):
+    """M3: the row that reaches MAX_ATTEMPTS is an operator problem (the user stays
+    enabled / disabled against the company's status); say so once, at ERROR."""
+    w.repo.event(E1)
+    w.repo.row(E1, "u1", "disable", state="failed", attempts=exe.MAX_ATTEMPTS - 2,
+               last_error="boom")
+    w.cog.errors[("disable", "u1")] = _client_error("InternalErrorException", "down")
+    w.s3.objects[_key(CO, E1)] = _marker()
+
+    def exhausted():
+        return [r for r in caplog.records
+                if "COMPANY_STATUS_COGNITO_EXHAUSTED" in r.getMessage()]
+    with caplog.at_level(logging.WARNING):
+        _tick()                                   # attempt MAX-1: not yet exhausted
+        assert exhausted() == []
+        _tick()                                   # attempt MAX: exhausted
+        _tick()                                   # nothing left to run: no repeat
+    lines = exhausted()
+    assert len(lines) == 1 and lines[0].levelno == logging.ERROR
+    msg = lines[0].getMessage()
+    for part in (E1, "u1", "disable", "InternalErrorException: down"):
+        assert part in msg
+
+
 def test_status_changed_rows_are_superseded_without_a_call(w):
     _suspend_rows(w, subs=("u1",))
     w.repo.status[CO] = "active"

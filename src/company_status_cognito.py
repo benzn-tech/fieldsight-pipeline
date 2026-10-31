@@ -127,6 +127,11 @@ def _process_row(conn, client, pool_id, company_id, row):
                 if state == "failed":
                     logger.warning("company_status_cognito: %s %s failed (attempt %s): %s",
                                    row["action"], row["user_sub"], attempts, last_error)
+                    if n and attempts >= MAX_ATTEMPTS:
+                        logger.error("COMPANY_STATUS_COGNITO_EXHAUSTED event_id=%s "
+                                     "user_sub=%s action=%s attempts=%s last_error=%s",
+                                     row["event_id"], row["user_sub"], row["action"],
+                                     attempts, last_error)
     conn.commit()
     if outcome == "raced":
         logger.warning("company_status_cognito: row %s changed underneath, left as is", key)
