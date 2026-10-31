@@ -171,3 +171,125 @@ def get_live_by_stable_id(conn, stable_id) -> dict | None:
         f"ORDER BY a.created_at DESC LIMIT 1",
         (sid,),
     ).fetchone()
+
+
+# ---------------------------------------------------------------------------
+# Task numbers (migration 0093, spec §14 D1): "#69" on the Tasks page, per site,
+# tied to stable_id, assigned once and never reused.
+#
+# LOCK ORDER. The per-site lock below is always the LAST advisory lock a transaction takes:
+# the writers take their source lock (hashtext(extraction_key)) and photo_rebind's day lock
+# first and number their items at the very end of the pass; apply (action packs Task 7)
+# takes the source lock, then this one. Nothing takes another lock after it, so no cycle.
+# ---------------------------------------------------------------------------
+_SITE_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext('task_no:' || %s::text))"
+
+# 42P01 undefined_table / 42703 undefined_column: migration 0093 not applied yet (sam deploy
+# runs before migrate). Same pair as tenancy_status._NOT_MIGRATED.
+_NOT_MIGRATED = ("42P01", "42703")
+
+
+def lock_site_task_numbers(conn, site_id) -> None:
+    """Take the per-site task-number lock (transaction-scoped; re-entrant in one session)."""
+    conn.execute(_SITE_LOCK_SQL, (str(site_id),))
+
+
+def assign_task_no(conn, stable_id, site_id) -> int:
+    """The task number of `stable_id`, assigning the site's next one if it has none.
+
+    Runs in the CALLER's open transaction: the number becomes durable when the caller
+    commits, and the site lock is held until then, so a second writer on the same site
+    waits and then reads this one's max. Idempotent -- an existing stable_id returns its
+    number, whatever site asked. The counter is max(task_no)+1 over the ledger, which nothing
+    deletes from, so a deleted item's number is never handed out again."""
+    lock_site_task_numbers(conn, site_id)
+    row = conn.execute("SELECT task_no FROM action_task_numbers WHERE stable_id = %s",
+                       (stable_id,)).fetchone()
+    if row is not None:
+        return row[0]
+    return conn.execute(
+        "INSERT INTO action_task_numbers (stable_id, site_id, task_no) "
+        "SELECT %s, %s, COALESCE(max(task_no), 0) + 1 FROM action_task_numbers "
+        "WHERE site_id = %s RETURNING task_no",
+        (stable_id, site_id, site_id),
+    ).fetchone()[0]
+
+
+def assign_task_nos_for_topics(conn, topic_ids, site_id) -> int | None:
+    """Number every action item on `topic_ids` (this pass's new topics, AFTER carry-forward
+    has moved carried stable_ids onto them) whose stable_id has no number yet. Returns how
+    many were numbered, or None when migration 0093 is not applied yet.
+
+    Order: insertion order -- created_at, then the topic's position in `topic_ids`, then the
+    physical row order (a pass inserts all its rows in one transaction, so created_at ties).
+
+    Savepoint-guarded: this runs inside the existing extraction/report write, which must
+    keep working unchanged before migrate (42P01 -> None, nothing written, the caller's
+    transaction still usable). Any other error is raised -- after the savepoint has rolled
+    back -- for the caller to log and degrade on."""
+    if not topic_ids:
+        return 0
+    ids = list(topic_ids)
+    try:
+        with conn.transaction():
+            rows = conn.execute(
+                "SELECT a.stable_id FROM action_items a "
+                "WHERE a.topic_id = ANY(%s) AND a.site_id = %s AND NOT EXISTS "
+                "(SELECT 1 FROM action_task_numbers n WHERE n.stable_id = a.stable_id) "
+                "ORDER BY a.created_at, array_position(%s::uuid[], a.topic_id), a.ctid",
+                (ids, site_id, ids),
+            ).fetchall()
+            pending = list(dict.fromkeys(r[0] for r in rows))
+            for stable_id in pending:
+                assign_task_no(conn, stable_id, site_id)
+            return len(pending)
+    except psycopg.Error as exc:
+        if getattr(exc, "sqlstate", None) in _NOT_MIGRATED:
+            return None
+        raise
+
+
+def task_nos_for_item_ids(conn, action_item_ids) -> dict:
+    """{str(action_items.id): task_no} for the numbered ones among `action_item_ids`, in one
+    query -- keyed by the row id every payload already carries, so the existing heavy reads
+    stay untouched. Savepoint-guarded; {} when migration 0093 is not applied yet. Any other
+    error is raised (after the savepoint rolled back) for the caller to degrade on."""
+    ids = [str(i) for i in action_item_ids if i]
+    if not ids:
+        return {}
+    try:
+        with conn.transaction():
+            rows = conn.execute(
+                "SELECT a.id, n.task_no FROM action_items a "
+                "JOIN action_task_numbers n ON n.stable_id = a.stable_id "
+                "WHERE a.id = ANY(%s::uuid[])",
+                (ids,),
+            ).fetchall()
+    except psycopg.Error as exc:
+        if getattr(exc, "sqlstate", None) in _NOT_MIGRATED:
+            return {}
+        raise
+    return {str(r[0]): r[1] for r in rows}
+
+
+def get_live_by_task_no(conn, site_id, task_no) -> dict | None:
+    """The live action item numbered `task_no` on `site_id` ("#69" in an instruction):
+    the ledger's stable_id, then get_live_by_stable_id. None when the number is unknown,
+    its item is no longer live, or either argument is malformed."""
+    sid = _as_uuid(site_id)
+    try:
+        no = int(task_no)
+    except (TypeError, ValueError):
+        return None
+    if sid is None:
+        return None
+    row = conn.execute(
+        "SELECT stable_id FROM action_task_numbers WHERE site_id = %s AND task_no = %s",
+        (sid, no),
+    ).fetchone()
+    if row is None:
+        return None
+    item = get_live_by_stable_id(conn, row[0])
+    if item is None or str(item["site_id"]) != str(sid):
+        return None
+    return item

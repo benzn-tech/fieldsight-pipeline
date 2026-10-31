@@ -7941,6 +7941,8 @@ def patch_action_item(conn, caller, action_item_id, body):
                     col, before, after, caller["id"], caller["global_role"])
     except _ActionItemVanished:
         return error("action item not found", 404)
+    # ADDITIVE (action packs spec §14 D1): the item's per-site task number, null when none.
+    updated["task_no"] = _task_numbers(conn, [updated["id"]]).get(str(updated["id"]))
     return ok(updated)
 
 
@@ -10955,6 +10957,24 @@ def _pending_status_suggestions(conn, rows):
         return {}
 
 
+def _task_numbers(conn, item_ids):
+    """{str(action_items.id): task_no} (action packs spec §14 D1) for these item ids, in ONE
+    query, or {}. Callers without a conn (reindex's builder) get none. Never fatal: the
+    lookup runs in its own SAVEPOINT (action_items.task_nos_for_item_ids), returns {} before
+    migration 0093, and any other failure is logged and read as "no numbers" -- the payload
+    still renders, every item with `task_no: null`."""
+    if conn is None:
+        return {}
+    ids = [i for i in item_ids if i]
+    if not ids:
+        return {}
+    try:
+        return action_items.task_nos_for_item_ids(conn, ids)
+    except Exception:  # noqa: BLE001
+        logger.warning("task numbers could not be read", exc_info=True)
+        return {}
+
+
 def _status_suggestion_field(item, suggestions):
     """`{"status_suggestion": {...}}` for one serialized action item, or `{}`.
 
@@ -11024,6 +11044,8 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None,
     _thread_facts = (threads.facts_for_threads(conn, list(_thread_ids))
                      if conn is not None and _thread_ids else {})
     _suggestions = _pending_status_suggestions(conn, rows)
+    _task_nos = _task_numbers(conn, [a.get("id") for t in rows
+                                     for a in (t.get("action_items") or [])])
     for i, t in enumerate(rows):
         flags = [{"observation": f["observation"],
                   "risk_level": _SEV_TO_RISK.get(f["severity"], "medium"),
@@ -11114,6 +11136,9 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None,
                               # count, so its rows are v1. The session-report preview reads
                               # through list_topics_for_source_prefix and carries the count.
                               "version": 1 + int(a.get("edit_count") or 0),
+                              # Per-site task number, "#69" (migration 0093); null when
+                              # the item has none yet or the table is not migrated.
+                              "task_no": _task_nos.get(str(a["id"])),
                               **_status_suggestion_field(a, _suggestions),
                               } for a in t["action_items"]],
             # The subject this topic belongs to, when a human has confirmed
