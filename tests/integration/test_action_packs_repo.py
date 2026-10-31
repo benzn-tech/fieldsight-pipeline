@@ -188,6 +188,51 @@ def test_claim_race_threads_both_start_together(committed):
     assert sorted(out) == [False, True]
 
 
+@pytest.mark.parametrize("first", ["store", "cancel"])
+def test_store_vs_cancel_race(committed, first):
+    """Whoever takes the row lock first wins; the other waits, re-checks, and loses."""
+    url, conn, _, site, creator = committed
+    pack = ap.create_queued(conn, site_id=site["id"], created_by=creator["id"], instruction="x")
+    assert ap.claim(conn, pack["id"]) is True
+    ops = {"store": lambda c: ap.store_result(c, pack["id"], _payload()),
+           "cancel": lambda c: ap.cancel(c, pack["id"])}
+    second = "cancel" if first == "store" else "store"
+    a = psycopg.connect(url)
+    b = psycopg.connect(url)
+    try:
+        # Open each connection's transaction first (as org-api's request does), so
+        # store_result's `with conn.transaction()` is a savepoint, not a commit of its own.
+        a.execute("SELECT 1")
+        b.execute("SELECT 1")
+        ops[first](a)                                 # holds the lock, uncommitted
+        result = {}
+
+        def _second():
+            result["v"] = ops[second](b)
+            b.commit()
+
+        t = threading.Thread(target=_second)
+        t.start()
+        t.join(0.5)
+        assert t.is_alive(), "the second writer should wait on the first one's row lock"
+        a.commit()
+        t.join(10)
+    finally:
+        a.close()
+        b.close()
+    rows = conn.execute("SELECT (SELECT count(*) FROM action_pack_sources WHERE pack_id=%s), "
+                        "(SELECT count(*) FROM action_pack_actions WHERE pack_id=%s)",
+                        (pack["id"], pack["id"])).fetchone()
+    if first == "store":
+        assert result == {"v": False}                 # cancel lost
+        assert _state(conn, pack["id"]) == ("ready", None)
+        assert rows == (2, 2)
+    else:
+        assert result == {"v": "refused"}             # store lost, wrote nothing
+        assert _state(conn, pack["id"]) == ("cancelled", None)
+        assert rows == (0, 0)
+
+
 def test_one_active_pack_across_two_connections(committed):
     url, conn, _, site, creator = committed
     ap.create_queued(conn, site_id=site["id"], created_by=creator["id"], instruction="x")
@@ -421,47 +466,107 @@ def _ready_pack(db, site, creator):
     return pack, ids
 
 
+def _action_state(db, aid):
+    return db.execute("SELECT state FROM action_pack_actions WHERE id=%s", (aid,)).fetchone()[0]
+
+
 def test_set_action_state_applied(db):
     _, site, creator = _world(db)
     pack, (a1, _) = _ready_pack(db, site, creator)
     new_sid = uuid.uuid4()
-    row = ap.set_action_state(db, pack["id"], a1, "applied", applied_by=creator["id"],
-                              applied_result={"item_id": "x", "edit_ids": [1]},
-                              created_item_stable_id=new_sid)
+    outcome, row = ap.set_action_state(db, pack["id"], a1, "applied", applied_by=creator["id"],
+                                       applied_result={"item_id": "x", "edit_ids": [1]},
+                                       created_item_stable_id=new_sid)
+    assert outcome == "ok"
     assert row["state"] == "applied" and row["applied_by"] == creator["id"]
     assert row["applied_result"] == {"item_id": "x", "edit_ids": [1]}
     assert row["created_item_stable_id"] == new_sid and row["applied_at"] is not None
-    # applied is terminal
+    # applied is terminal; the replay is told the current state without a re-read
     for st in ("dismissed", "stale", "failed", "applied"):
-        assert ap.set_action_state(db, pack["id"], a1, st) is None
-    assert db.execute("SELECT state FROM action_pack_actions WHERE id=%s",
-                      (a1,)).fetchone()[0] == "applied"
+        assert ap.set_action_state(db, pack["id"], a1, st) == ("illegal", "applied")
+    assert _action_state(db, a1) == "applied"
 
 
-@pytest.mark.parametrize("target", ["dismissed", "stale", "failed"])
-def test_set_action_state_from_proposed_and_terminal_after(db, target):
+# from -> the targets that are legal from it; every (from, to) pair is exercised
+_LEGAL = {
+    "proposed": {"applied", "dismissed", "stale", "failed"},
+    "stale": {"dismissed"},
+    "failed": {"applied", "dismissed", "stale", "failed"},
+    "applied": set(),
+    "dismissed": set(),
+}
+
+
+@pytest.mark.parametrize("src", sorted(_LEGAL))
+@pytest.mark.parametrize("dst", ["applied", "dismissed", "stale", "failed"])
+def test_action_transition_table(db, src, dst):
     _, site, creator = _world(db)
     pack, (a1, _) = _ready_pack(db, site, creator)
-    row = ap.set_action_state(db, pack["id"], a1, target, applied_by=creator["id"],
-                              applied_result={"error": "changed"})
-    assert row["state"] == target
-    assert ap.set_action_state(db, pack["id"], a1, "applied") is None   # stale->applied: no
-    assert ap.set_action_state(db, pack["id"], a1, "dismissed") is None
-    with pytest.raises(ValueError):                                     # never a target
-        ap.set_action_state(db, pack["id"], a1, "proposed")
+    if src != "proposed":
+        db.execute("UPDATE action_pack_actions SET state=%s WHERE id=%s", (src, a1))
+    outcome, value = ap.set_action_state(db, pack["id"], a1, dst, applied_by=creator["id"])
+    if dst in _LEGAL[src]:
+        assert outcome == "ok" and value["state"] == dst
+        assert _action_state(db, a1) == dst
+    else:
+        assert (outcome, value) == ("illegal", src)
+        assert _action_state(db, a1) == src
+
+
+def test_failed_is_retryable_and_keeps_its_error_until_replaced(db):
+    _, site, creator = _world(db)
+    pack, (a1, _) = _ready_pack(db, site, creator)
+    ap.set_action_state(db, pack["id"], a1, "failed", applied_by=creator["id"],
+                        applied_result={"error": "acl"})
+    outcome, row = ap.set_action_state(db, pack["id"], a1, "failed")
+    assert outcome == "ok" and row["applied_result"] == {"error": "acl"}   # None keeps it
+    outcome, row = ap.set_action_state(db, pack["id"], a1, "applied",
+                                       applied_result={"item_id": "y"})
+    assert outcome == "ok" and row["applied_result"] == {"item_id": "y"}
+
+
+def test_stale_dismissed_keeps_both_values(db):
+    _, site, creator = _world(db)
+    pack, (a1, _) = _ready_pack(db, site, creator)
+    both = {"live": {"status": "done"}, "snapshot": {"status": "open"}}
+    ap.set_action_state(db, pack["id"], a1, "stale", applied_result=both)
+    outcome, row = ap.set_action_state(db, pack["id"], a1, "dismissed",
+                                       applied_by=creator["id"])
+    assert outcome == "ok" and row["applied_result"] == both
+    assert row["applied_by"] == creator["id"]
 
 
 def test_set_action_state_guards(db):
     _, site, creator = _world(db)
     pack, (a1, _) = _ready_pack(db, site, creator)
+    other, _ = _ready_pack(db, site, creator)
     with pytest.raises(ValueError):
         ap.set_action_state(db, pack["id"], a1, "proposed")
     with pytest.raises(ValueError):
         ap.set_action_state(db, pack["id"], a1, "done")
-    assert ap.set_action_state(db, uuid.uuid4(), a1, "dismissed") is None  # wrong pack
-    assert ap.set_action_state(db, pack["id"], uuid.uuid4(), "dismissed") is None
-    assert db.execute("SELECT state FROM action_pack_actions WHERE id=%s",
-                      (a1,)).fetchone()[0] == "proposed"
+    assert ap.set_action_state(db, other["id"], a1, "dismissed") == ("not_found", None)
+    assert ap.set_action_state(db, uuid.uuid4(), a1, "dismissed") == ("not_found", None)
+    assert ap.set_action_state(db, pack["id"], uuid.uuid4(), "dismissed") == ("not_found", None)
+    assert _action_state(db, a1) == "proposed"
+
+
+# ---------------------------------------------------------------- set_plan
+
+def test_set_plan_only_while_running(db):
+    _, site, creator = _world(db)
+    pack = ap.create_queued(db, site_id=site["id"], created_by=creator["id"], instruction="x")
+    assert ap.set_plan(db, pack["id"], "too early", "T") is False
+    ap.claim(db, pack["id"])
+    assert ap.set_plan(db, pack["id"], "Close #69 on Tower A", "Fire doors") is True
+    got = ap.get_for_reader(db, _reader(db, creator), pack["id"])
+    assert (got["state"], got["reading"], got["title"]) == (
+        "running", "Close #69 on Tower A", "Fire doors")
+    ap.cancel(db, pack["id"])
+    assert ap.set_plan(db, pack["id"], "late", "late") is False
+    row = db.execute("SELECT reading, title FROM action_packs WHERE id=%s",
+                     (pack["id"],)).fetchone()
+    assert row == ("Close #69 on Tower A", "Fire doors")
+    assert ap.set_plan(db, uuid.uuid4(), "r", "t") is False
 
 
 def test_archive_and_unarchive(db):
@@ -583,6 +688,43 @@ def test_list_archived_accepts_truthy_and_falsy(db):
     assert ap.list_for_reader(db, r, archived=0) == []
 
 
+def test_site_moved_to_another_company_moves_the_readers(acl_world):
+    db, co, site, _, w, packs = acl_world
+    new_co = _co(db, "acl-new")
+    w["new_admin"] = _user(db, new_co, "admin")
+    w["new_pm"] = _user(db, new_co, "pm")
+    memberships.ensure_membership(db, w["new_pm"]["id"], site["id"], "pm")
+    db.execute("UPDATE sites SET company_id=%s WHERE id=%s", (new_co["id"], site["id"]))
+    # the pack keeps its creation-time owner ...
+    assert db.execute("SELECT company_id FROM action_packs WHERE id=%s",
+                      (packs["creator"]["id"],)).fetchone()[0] == co["id"]
+    # ... but reading follows the site's current company
+    for who in ("admin", "gm", "pm", "sm"):
+        assert _sees(db, w, who, packs["creator"]) is False, who
+        assert packs["creator"]["id"] not in _lists(db, w, who), who
+    for who in ("new_admin", "new_pm"):
+        assert _sees(db, w, who, packs["creator"]) is True, who
+        assert _sees(db, w, who, packs["external"]) is True, who
+        assert packs["creator"]["id"] in _lists(db, w, who), who
+    # the old-company creator still reads while a member of the site ...
+    assert _sees(db, w, "creator", packs["creator"]) is True
+    # ... and not once that membership is gone
+    memberships.archive_membership(db, w["creator"]["id"], site["id"])
+    assert _sees(db, w, "creator", packs["creator"]) is False
+    assert packs["creator"]["id"] not in _lists(db, w, "creator")
+
+
+def test_list_limit_is_clamped(db):
+    co, site, creator = _world(db)
+    admin = _user(db, co, "admin")
+    pack, _ = _ready_pack(db, site, creator)
+    r = _reader(db, admin)
+    assert [p["id"] for p in ap.list_for_reader(db, r, limit=-5)] == [pack["id"]]
+    assert [p["id"] for p in ap.list_for_reader(db, r, limit=0)] == [pack["id"]]
+    assert [p["id"] for p in ap.list_for_reader(db, r, limit=10**9)] == [pack["id"]]
+    assert ap.LIST_LIMIT_MAX == 200
+
+
 def test_get_for_reader_returns_sources_and_actions(db):
     _, site, creator = _world(db)
     pack, _ = _ready_pack(db, site, creator)
@@ -603,7 +745,8 @@ def test_list_filters_and_counts(db):
     site2 = sites.create_site(db, co["id"], f"Site-ap2-{uuid.uuid4().hex[:6]}")
     admin = _user(db, co, "admin")
     ready, (a1, a2) = _ready_pack(db, site, creator)
-    ap.set_action_state(db, ready["id"], a1, "applied", applied_by=creator["id"])
+    assert ap.set_action_state(db, ready["id"], a1, "applied",
+                               applied_by=creator["id"])[0] == "ok"
     archived, _ = _ready_pack(db, site, creator)
     ap.archive(db, archived["id"], True)
     failed = _running(db, site, creator)

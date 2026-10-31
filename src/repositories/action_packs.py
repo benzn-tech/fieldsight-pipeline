@@ -62,17 +62,21 @@ Readers (§7, §14 D4) -- `PackReader`, built by org-api from facts it already h
 
     reader = reader_for(caller, memberships.caller_site_roles(conn, caller["id"]))
 
-  * the creator -- while the pack's company is the creator's own company, or while the
-    creator still holds a live membership on the pack's site (an EXTERNAL member reads only
-    the packs they created, and only while still a member of that site);
-  * admin/GM of the pack's company (global_role admin/gm, home company only);
-  * pm/site_manager (membership role) of the pack's site, home company only -- an external
-    pm/site_manager is a creator-only reader like any external member.
+  "The site's company" is ALWAYS the site's CURRENT owner (sites.company_id), not
+  action_packs.company_id (the creation-time owner): a project moved to another company
+  takes its packs with it.
+  * the creator -- while the site is still in their scope: their own company owns the site
+    now, or they hold a live membership on it (an EXTERNAL member reads only the packs they
+    created, and only while still a member of that site);
+  * admin/GM of the site's company (global_role admin/gm, home company only);
+  * pm/site_manager (membership role) of the pack's site, when the site's company is their
+    home company -- an external pm/site_manager is a creator-only reader like any external
+    member.
   platform_admin is not a reader by role (it is not in the spec's reader list), but it
   always reads the packs it created (`cross_company`): its home company is the platform
   company and it holds no memberships, so the creator arm's company/membership condition
-  would otherwise hide its own packs under ACTION_PACKS=internal. Company exit (tenancy_status) is the endpoint's gate, not this
-  module's: these predicates do not look at companies.status.
+  would otherwise hide its own packs under ACTION_PACKS=internal.
+  Company exit (tenancy_status) is the endpoint's gate, not this module's: these predicates do not look at companies.status.
 """
 import datetime as dt
 from dataclasses import dataclass, field
@@ -86,9 +90,15 @@ from repositories import acl
 STATES = ("queued", "running", "ready", "failed", "cancelled")
 FAILURE_REASONS = ("budget", "model", "tools", "verifier", "internal", "company_inactive")
 ACTION_STATES = ("proposed", "applied", "dismissed", "stale", "failed")
-# Legal action transitions: everything leaves `proposed` once; nothing leaves anything else
-# (applied is terminal; a stale action is re-proposed by a NEW run, never revived -- §5.2).
-ACTION_TRANSITIONS = {"proposed": ("applied", "dismissed", "stale", "failed")}
+# Legal action transitions. applied and dismissed are terminal. A stale action can only be
+# dismissed (a NEW run re-proposes it, never a revival -- §5.2). failed is NOT terminal: a
+# transient error or one applier's ACL refusal must not brick the action.
+ACTION_TRANSITIONS = {
+    "proposed": ("applied", "dismissed", "stale", "failed"),
+    "stale": ("dismissed",),
+    "failed": ("applied", "dismissed", "stale", "failed"),
+}
+LIST_LIMIT_MAX = 200
 _MANAGER_ROLES = ("pm", "site_manager")
 _ONE_ACTIVE_INDEX = "action_packs_one_active_per_creator"
 
@@ -209,6 +219,17 @@ def cancel(conn, pack_id) -> bool:
     return row is not None
 
 
+def set_plan(conn, pack_id, reading, title) -> bool:
+    """The Plan stage's reading (G1) and title (S16), written while the run is still going
+    so the UI can show the reading of a running pack (§10). Only while `running`; False
+    otherwise (cancelled / failed / missing). store_result writes both again at the end."""
+    row = conn.execute(
+        "UPDATE action_packs SET reading=%s, title=%s, updated_at=now() "
+        "WHERE id=%s AND state='running' RETURNING id",
+        (reading, title, pack_id)).fetchone()
+    return row is not None
+
+
 def sweep_stale(conn, older_than: dt.timedelta) -> int:
     """S9: fail (reason 'internal') every queued or running pack whose heartbeat_at is older
     than `older_than` -- a worker that died mid-run, or a request that never got claimed.
@@ -294,24 +315,36 @@ def store_result(conn, pack_id, payload: dict) -> str:
 # ------------------------------------------------------------------------- actions / archive
 
 def set_action_state(conn, pack_id, action_id, new_state, applied_by=None,
-                     applied_result=None, created_item_stable_id=None) -> dict | None:
-    """Move one action out of `proposed` (the only legal source state). applied_by /
-    applied_at / applied_result record who resolved it and how -- for dismissed/stale/failed
-    too (stale: both values; failed: the error). Returns the updated action row, None when
-    the action is not in this pack or is not `proposed` (applied is terminal; a stale action
-    cannot be applied). Raises ValueError for a state that is never a target."""
-    allowed = [src for src, targets in ACTION_TRANSITIONS.items() if new_state in targets]
-    if not allowed:
+                     applied_result=None, created_item_stable_id=None) -> tuple:
+    """Move one action along ACTION_TRANSITIONS. Locks the action row (FOR UPDATE), so two
+    concurrent appliers serialise. Returns one of
+        ("ok", updated action row)
+        ("not_found", None)          -- no such action in this pack (-> 404)
+        ("illegal", current_state)   -- e.g. already applied (idempotent replay) or
+                                        dismissed (-> 409); the caller needs no re-read
+    applied_by / applied_at record who resolved it, for every target state. applied_result
+    is replaced when given and KEPT when None (dismissing a stale action keeps its "both
+    values" record; a failed action keeps its error until a new result is written).
+    Raises ValueError for a state that is never a target (e.g. 'proposed', 'done')."""
+    if not any(new_state in targets for targets in ACTION_TRANSITIONS.values()):
         raise ValueError(f"illegal action target state: {new_state!r}")
+    cur = conn.cursor(row_factory=dict_row)
     with conn.transaction():
-        return conn.cursor(row_factory=dict_row).execute(
+        current = cur.execute(
+            "SELECT state FROM action_pack_actions WHERE id=%s AND pack_id=%s FOR UPDATE",
+            (action_id, pack_id)).fetchone()
+        if current is None:
+            return ("not_found", None)
+        if new_state not in ACTION_TRANSITIONS.get(current["state"], ()):
+            return ("illegal", current["state"])
+        row = cur.execute(
             "UPDATE action_pack_actions SET state=%s, applied_by=%s, applied_at=now(), "
-            "applied_result=%s, created_item_stable_id=COALESCE(%s, created_item_stable_id), "
-            "updated_at=now() "
-            "WHERE id=%s AND pack_id=%s AND state = ANY(%s) "
-            f"RETURNING {_ACTION_COLS}",
+            "applied_result=COALESCE(%s, applied_result), "
+            "created_item_stable_id=COALESCE(%s, created_item_stable_id), updated_at=now() "
+            f"WHERE id=%s AND pack_id=%s RETURNING {_ACTION_COLS}",
             (new_state, applied_by, _json(applied_result), created_item_stable_id,
-             action_id, pack_id, allowed)).fetchone()
+             action_id, pack_id)).fetchone()
+    return ("ok", row)
 
 
 def archive(conn, pack_id, archived: bool) -> bool:
@@ -327,13 +360,19 @@ def archive(conn, pack_id, archived: bool) -> bool:
 
 def _reader_clause(reader: PackReader):
     """(sql, params) -- the one read predicate over alias `p` (module docstring)."""
+    # Every arm compares the site's CURRENT company (sites.company_id), never p.company_id:
+    # a project that moves company (org-api's site move changes only sites.company_id)
+    # takes its packs with it -- the new owner reads them, the old one stops. p.company_id
+    # stays the creation-time owner. The creator reads while the site is still in their
+    # scope: their company owns it now, or they hold a live membership on it.
     managed = [sid for sid, role in reader.site_roles.items() if role in _MANAGER_ROLES]
     sql = (
-        "((p.created_by = %s AND (%s OR p.company_id = %s OR EXISTS ("
+        "EXISTS (SELECT 1 FROM sites s WHERE s.id = p.site_id AND ("
+        "(p.created_by = %s AND (%s OR s.company_id = %s OR EXISTS ("
         "   SELECT 1 FROM memberships m WHERE m.user_id = %s AND m.site_id = p.site_id "
         "   AND m.archived_at IS NULL)))"
-        " OR (%s AND p.company_id = %s)"
-        " OR (p.company_id = %s AND p.site_id = ANY(%s::uuid[])))")
+        " OR (%s AND s.company_id = %s)"
+        " OR (s.company_id = %s AND p.site_id = ANY(%s::uuid[]))))")
     params = (reader.user_id, bool(reader.cross_company), reader.company_id, reader.user_id,
               bool(reader.company_admin), reader.company_id,
               reader.company_id, managed)
@@ -351,7 +390,7 @@ def list_for_reader(conn, reader: PackReader, *, state=None, site_id=None, archi
     """Packs this reader may read, newest first, in the light list shape (no conclusion /
     reading / trace) plus `action_counts` = {action state: n} over all five states.
     Filters: state (one of STATES), site_id, archived (False = not archived [default],
-    True = archived only, None = both)."""
+    True = archived only, None = both). limit is clamped to 1..LIST_LIMIT_MAX."""
     if state is not None and state not in STATES:
         raise ValueError(f"unknown pack state: {state!r}")
     where, params = _reader_clause(reader)
@@ -368,7 +407,7 @@ def list_for_reader(conn, reader: PackReader, *, state=None, site_id=None, archi
         clauses.append("p.archived_at IS NOT NULL")
     else:
         clauses.append("p.archived_at IS NULL")
-    extra.append(int(limit))
+    extra.append(max(1, min(int(limit), LIST_LIMIT_MAX)))
     rows = conn.cursor(row_factory=dict_row).execute(
         f"SELECT {_LIST_COLS}, "
         "(SELECT jsonb_object_agg(c.state, c.n) FROM (SELECT a.state, count(*) AS n "

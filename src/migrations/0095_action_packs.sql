@@ -89,8 +89,9 @@ CREATE TABLE IF NOT EXISTS action_pack_sources (
   CONSTRAINT action_pack_sources_pack_ref_key UNIQUE (pack_id, ref)
 );
 
--- state (§3.3): proposed -> applied | dismissed | stale | failed. Transitions are enforced by
--- repositories.action_packs.set_action_state (only from proposed).
+-- state (§3.3): proposed -> applied | dismissed | stale | failed; stale -> dismissed;
+-- failed -> any of the four (not terminal). Transitions are enforced by
+-- repositories.action_packs.set_action_state (ACTION_TRANSITIONS).
 CREATE TABLE IF NOT EXISTS action_pack_actions (
   id                     uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   pack_id                uuid NOT NULL REFERENCES action_packs(id) ON DELETE CASCADE,
