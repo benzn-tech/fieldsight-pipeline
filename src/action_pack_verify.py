@@ -116,6 +116,7 @@ NEAR_DUP_FLOOR = 0.90            # carry_forward.match's fuzzy floor: "the same 
 MAX_WORKERS = 8
 MIN_CALL_S = 5.0                 # no verifier call is started with less than this left
 MARGIN_S = 2.0                   # kept back from the verify deadline to assemble the answer
+ATTEMPT_CAP_S = 30.0             # one attempt (the Ask judge's cap): a hang can fall back
 VERIFY_MAX_TOKENS = 200
 REF_MAX_CHARS = 24_000           # one cited ref's text in a prompt (a snapshot can be 200 kB)
 
@@ -159,13 +160,14 @@ def candidates(writer_model):
 
 def call_json(prompt, *, model, max_tokens, deadline, caller):
     """One verifier call (the seam tests replace). `deadline` is seconds from now, used as
-    the call's deadline and its per-attempt cap. -> (text, error, model that answered,
+    the call's deadline; one attempt is capped at ATTEMPT_CAP_S so a hung primary still
+    leaves the element time for the next candidate. -> (text, error, model that answered,
     tokens used)."""
     import llm_tools_client
     turn = llm_tools_client.complete_json(
         prompt, model=model, max_tokens=max_tokens,
         deadline=llm_tools_client._now() + float(deadline), caller=caller,
-        attempt_timeout=float(deadline), judge_routing=False)
+        attempt_timeout=min(float(deadline), ATTEMPT_CAP_S), judge_routing=False)
     if turn.error is not None:
         return None, turn.error, None, 0
     usage = turn.usage if isinstance(turn.usage, dict) else {}

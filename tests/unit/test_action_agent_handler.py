@@ -527,8 +527,8 @@ def test_the_default_stage_runner_is_the_stages_module(env, monkeypatch):
 
 
 def test_an_unbuilt_verifier_fails_internal(env, monkeypatch):
-    """Until Task 12 lands the verifier seam raises NotImplementedError: a claimed pack fails
-    `internal` (behind the flag only)."""
+    """An untyped exception from the stages (here NotImplementedError, what the verifier seam
+    raised before Task 12) fails the claimed pack `internal` (behind the flag only)."""
     import action_pack_stages
 
     def stages(ctx):

@@ -505,3 +505,33 @@ def test_the_stage_runner_fails_model_when_the_writer_took_the_verifier_family(m
     with pytest.raises(agent.StageError) as ei:
         st.run(base.make_ctx(), base.deps(model=model, verify=apv.verify))
     assert agent.failure_reason(ei.value) == "model"
+
+
+def test_a_failed_call_moves_the_element_to_the_next_candidate(monkeypatch):
+    monkeypatch.setenv("ACTION_VERIFIER_FALLBACKS", LUNA)
+
+    def answer(prompt, model):
+        if model == VERIFIER:
+            return None, "HTTP 503", None, 0
+        return '{"label": "supported"}', None, model, 3
+    result, fake = run_verify({"conclusion": [], "actions": [close()]}, monkeypatch,
+                              fake=Fake(answer))
+    assert labels(result) == {0: "supported"} and result["model"] == LUNA
+    assert result["counts"]["fallback_answers"] == 1
+    assert [c["model"] for c in fake.calls] == [VERIFIER, LUNA]
+
+
+def test_the_real_call_caps_one_attempt_so_a_hang_leaves_time_for_a_fallback(monkeypatch):
+    import llm_tools_client
+    seen = {}
+
+    def complete_json(prompt, **kw):
+        seen.update(kw)
+        return llm_tools_client.ChatTurn(text='{"label": "weak"}', requested_model=kw["model"])
+    monkeypatch.setattr(llm_tools_client, "complete_json", complete_json)
+    monkeypatch.setattr(llm_tools_client, "_now", lambda: 100.0)
+    text, err, used, _ = apv.call_json("p", model=VERIFIER, max_tokens=10, deadline=85.0,
+                                       caller="action_verify")
+    assert (text, err, used) == ('{"label": "weak"}', None, VERIFIER)
+    assert seen["deadline"] == 185.0 and seen["attempt_timeout"] == apv.ATTEMPT_CAP_S
+    assert seen["judge_routing"] is False
