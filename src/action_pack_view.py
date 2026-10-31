@@ -31,6 +31,38 @@ def snapshot_key_prefix(company_id, pack_id) -> str:
     this prefix, whatever the source row says."""
     return f"action_packs/{company_id}/{pack_id}/web/"
 
+
+def snapshot_key(company_id, pack_id, ref) -> str:
+    """The ONE key a web source's snapshot may have (Task 9 writes it, the store task
+    records only it, the viewer reads only it). ValueError for a ref that is not a ref."""
+    if not isinstance(ref, str) or not REF_RE.match(ref):
+        raise ValueError("bad ref")
+    return f"{snapshot_key_prefix(company_id, pack_id)}{ref}.txt"
+
+
+def snapshot_key_error(payload, company_id, pack_id):
+    """None, or 'snapshot_key' when any source's snapshot_s3_key is not EXACTLY
+    snapshot_key(company_id, pack_id, <its own ref>) or sits on a non-web source. Run by
+    the store task before anything is written: a key elsewhere would be recorded in the
+    lake ownership index under this pack's company."""
+    for s in (payload or {}).get("sources") or []:
+        key = s.get("snapshot_s3_key") if isinstance(s, dict) else None
+        if key is None:
+            continue
+        try:
+            want = snapshot_key(company_id, pack_id, s.get("ref"))
+        except ValueError:
+            return "snapshot_key"
+        if s.get("provenance") != "web" or key != want:
+            return "snapshot_key"
+    return None
+
+
+def snapshot_keys(payload) -> list:
+    """Every snapshot_s3_key in a store payload (after snapshot_key_error passed)."""
+    return [s["snapshot_s3_key"] for s in (payload or {}).get("sources") or []
+            if isinstance(s, dict) and s.get("snapshot_s3_key")]
+
 # off (also unset / anything unknown) -> every pack route 404s like an unknown route and the
 # internal tasks answer {"error": "disabled"}; internal -> platform_admin only; on -> everyone.
 MODES = ("off", "internal", "on")
