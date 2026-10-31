@@ -315,6 +315,16 @@ Parameters:
       caller's last five conversations. Anything but 'true' is off. Set via
       TEST_ASK_THREADS / PROD_ASK_THREADS; an unset var keeps it off.
 
+  CompanyStatusEnforce:
+    Type: String
+    Default: 'off'
+    AllowedValues: ['on', 'off']
+    Description: >-
+      Company offboarding (spec 2026-11-01): 'on' makes tenancy_status block
+      callers of suspended/exited companies; 'off' only logs
+      COMPANY_GATE_WOULD_BLOCK. Set via TEST_COMPANY_STATUS_ENFORCE /
+      PROD_COMPANY_STATUS_ENFORCE (literally on or off); an unset var keeps it off.
+
   AskJudgeModel:
     Type: String
     Default: ''
@@ -1977,6 +1987,8 @@ Resources:
         - !Ref AWS::NoValue
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           S3_BUCKET: !Ref DataBucketName
           ANTHROPIC_API_KEY: !Ref ClaudeApiKey
           CLAUDE_MODEL: claude-sonnet-5-5
@@ -2191,6 +2203,8 @@ Resources:
         - !Ref AWS::NoValue
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           S3_BUCKET: !Ref IngestBucketName   # the lake — where org-api enqueues the request
           # Email is stub (logs, sends nothing) until an SES identity is verified as
           # part of the DNS/SES work; flip to 'ses' + set SENDER_EMAIL then.
@@ -2868,6 +2882,8 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           ENABLE_TODO_COLLAPSE: !Ref EnableTodoCollapse
           VOICE_SESSION_SIGNING_KEY: !If [HasVoiceLlm, !Ref VoiceSessionSigningKey, !Ref AWS::NoValue]
           # Deploy-time credential injection — see MigrateFunction notes.
@@ -3439,6 +3455,8 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           # Deploy-time credential injection -- same as OrgApiFunction.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
@@ -4085,6 +4103,8 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           # Idle-close threshold AND group merge's quiet test (spec section 8).
           IDLE_CLOSE_MINUTES: !Ref IdleCloseMinutes
@@ -4691,6 +4711,8 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           ENABLE_TODO_COLLAPSE: !Ref EnableTodoCollapse
           ENABLE_GROUP_MERGE: !Ref EnableGroupMerge
           GROUP_MERGE_CAP: !Ref GroupMergeCap
@@ -5304,6 +5326,8 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
@@ -5413,6 +5437,8 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           # Deploy-time credential injection — see MigrateFunction notes.
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
@@ -5560,6 +5586,8 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
           PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
@@ -5616,6 +5644,8 @@ Resources:
             Fn::Sub: "${DbStackName}-LambdaSG"
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           PGHOST: !ImportValue
             Fn::Sub: "${DbStackName}-ClusterEndpoint"
           PGDATABASE: !If [HasPgDatabaseOverride, !Ref PgDatabase, !ImportValue {"Fn::Sub": "${DbStackName}-DbName"}]
@@ -6458,6 +6488,8 @@ Resources:
       MemorySize: 256
       Environment:
         Variables:
+          # Company offboarding gate (tenancy_status): off = shadow log only.
+          COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce
           S3_BUCKET: !Ref DataBucketName
           # Both stacks publish to one namespace. Without a dimension they
           # write the SAME series: test's backlog would page prod, and if the
