@@ -806,7 +806,8 @@ NO_RECORDS = "No relevant records found for this question."
 # Tool-meta errors that are about the caller, not the records: answered NO_RECORDS,
 # never with the web. company_inactive / account_archived: rag-search's caller gate
 # (offboarding §5.1, the tenancy_status reasons).
-_IDENTITY_ERRORS = ("not_provisioned", "company_inactive", "account_archived")
+_GATE_ERRORS = ("company_inactive", "account_archived")
+_IDENTITY_ERRORS = ("not_provisioned",) + _GATE_ERRORS
 # Spec 2026-10-19-ask-explicit-web-failure §3: the caller asked for the web and
 # the web step failed. Model-free: said instead of "not in your records".
 WEB_UNREACHABLE = "I couldn't search the web just now."
@@ -1398,12 +1399,14 @@ def _answer(body, channel, voice, caller_sub, states, route, started, tools, cha
 
     # Identity failure: today's answer, never papered over with the web. A caller the
     # company gate refuses (rag-search tools envelope, offboarding spec 2026-11-01 §5.1)
-    # is the same kind of failure.
+    # is the same kind of failure, and the client gets its reason as `error` (§5.1:
+    # distinguishable from "nothing recorded"); not_provisioned keeps today's response.
     _ident = next(((e.get("meta") or {}).get("error") for e in envs
                    if (e.get("meta") or {}).get("error") in _IDENTITY_ERRORS), None)
     if _ident:
         route["fallback"] = _ident
-        return t.result(NO_RECORDS, [])
+        return t.result(NO_RECORDS, [],
+                        extra={"error": _ident} if _ident in _GATE_ERRORS else None)
 
     batches = [envs + ([web_env] if web_env else [])]
     t.web_env = web_env if web_env and web_env.get("items") else None

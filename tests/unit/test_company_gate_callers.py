@@ -410,3 +410,84 @@ def test_ask_orchestrator_company_inactive_gives_no_records_and_never_the_web(mo
     assert out["answer"] == "No relevant records found for this question."
     assert out["citations"] == [] and "web" not in out and not out.get("from_web")
     assert chat.calls == []
+
+
+# Spec §5.1: the UI gets a distinguishable error. Both Ask paths keep their answer text
+# and add `error: <reason>`; not_provisioned is unchanged (no error key added).
+
+@pytest.mark.parametrize("reason", ["company_inactive", "account_archived"])
+def test_ask_agent_surfaces_the_gate_reason_as_error(monkeypatch, reason):
+    laa = pytest.importorskip("lambda_ask_agent")
+    from tests.unit.test_ask_voice_web_gates import WEB_OK, FakeLambdaClient, ask, wire
+    rig = wire(monkeypatch, chunks=(), web=WEB_OK)
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: FakeLambdaClient(
+        [{"chunks": [], "error": reason}]))
+    out = ask(rig.cb())
+    assert out["error"] == reason
+    assert out["answer"] == "No relevant records found for this question."
+    assert out["citations"] == []
+
+
+def test_ask_agent_not_provisioned_response_is_unchanged(monkeypatch):
+    laa = pytest.importorskip("lambda_ask_agent")
+    from tests.unit.test_ask_voice_web_gates import WEB_OK, FakeLambdaClient, ask, wire
+    rig = wire(monkeypatch, chunks=(), web=WEB_OK)
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: FakeLambdaClient(
+        [{"chunks": [], "error": "caller not provisioned"}]))
+    out = ask(rig.cb())
+    assert "error" not in out
+    assert out["answer"] == "No relevant records found for this question."
+    assert set(out) == {"answer", "citations", "grounded", "basis", "applied_scope", "asked"}
+
+
+def _metric_client(body):
+    import io
+
+    class C:
+        def invoke(self, FunctionName, InvocationType, Payload):
+            return {"Payload": io.BytesIO(json.dumps(body).encode())}
+    return C()
+
+
+@pytest.mark.parametrize("reason", ["company_inactive", "account_archived"])
+def test_ask_agent_metric_route_surfaces_the_gate_reason(monkeypatch, reason):
+    laa = pytest.importorskip("lambda_ask_agent")
+    monkeypatch.setattr(laa, "RAG_SEARCH_FUNCTION", "rag-search-test")
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: _metric_client(
+        {"metric": "duration", "error": reason}))
+    out = laa._rag_answer({"question": "how long did I record yesterday",
+                           "caller_sub": "s", "tz": "Pacific/Auckland"})
+    assert out["error"] == reason and out.get("computed") is True
+
+
+def test_ask_agent_metric_route_other_errors_are_unchanged(monkeypatch):
+    laa = pytest.importorskip("lambda_ask_agent")
+    monkeypatch.setattr(laa, "RAG_SEARCH_FUNCTION", "rag-search-test")
+    monkeypatch.setattr(laa, "_get_lambda_client", lambda: _metric_client(
+        {"metric": "duration", "error": "caller not provisioned"}))
+    out = laa._rag_answer({"question": "how long did I record yesterday",
+                           "caller_sub": "s", "tz": "Pacific/Auckland"})
+    assert "error" not in out
+
+
+@pytest.mark.parametrize("reason", ["company_inactive", "account_archived"])
+def test_ask_orchestrator_surfaces_the_gate_reason_as_error(monkeypatch, reason):
+    pytest.importorskip("lambda_ask_agent")
+    from tests.unit.test_ask_orchestrator_judge import ScriptChat, body, run
+    from tests.unit.test_ask_orchestrator_round1 import FakeTools
+    out = run(body("What did we pour?"), ScriptChat(),
+              tools=FakeTools(lambda call: ([], {"error": reason})))
+    assert out["error"] == reason
+    assert out["answer"] == "No relevant records found for this question."
+
+
+def test_ask_orchestrator_not_provisioned_response_is_unchanged(monkeypatch):
+    pytest.importorskip("lambda_ask_agent")
+    from tests.unit.test_ask_orchestrator_judge import ScriptChat, body, run
+    from tests.unit.test_ask_orchestrator_round1 import FakeTools
+    out = run(body("What did we pour?"), ScriptChat(),
+              tools=FakeTools(lambda call: ([], {"error": "not_provisioned"})))
+    assert "error" not in out
+    assert out["answer"] == "No relevant records found for this question."
+    assert set(out) == {"answer", "answer_language", "citations", "grounded", "basis",
+                        "applied_scope", "asked"}
