@@ -15,7 +15,7 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _single_company_world_defaults():
+def _single_company_world_defaults(request):
     from repositories import memberships, recordings, sites, users
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(memberships, "has_live_external", lambda conn, user_id: False)
@@ -36,6 +36,17 @@ def _single_company_world_defaults():
         import photo_pins
         mp.setattr(photo_pins, "apply_voice_note_pins", lambda conn, folder, date: 0)
         mp.setattr(photo_pins, "pinned_photo_keys", lambda conn, folder, date: set())
+        # Company offboarding gate (spec 2026-11-01 section 5.1): every caller resolution now
+        # reads companies.status. A connection double cannot answer, so: active. Only the
+        # SQL leaf is stubbed -- the flag, platform_admin exemption, archived branch and
+        # WOULD_BLOCK logging in tenancy_status stay real. Gate tests override this with
+        # their own monkeypatch. The real SQL is proven in
+        # tests/integration/test_tenancy_status.py and test_company_gate_org_api.py.
+        # test_tenancy_status.py tests company_status itself, so it stays real there.
+        if request.module.__name__.rsplit(".", 1)[-1] != "test_tenancy_status":
+            import tenancy_status
+            mp.setattr(tenancy_status, "company_status",
+                       lambda conn, company_id: tenancy_status.ACTIVE)
         org =sys.modules.get("lambda_org_api")      # never import it just for this
         if org is not None:
             # The session whitelist (final review F1) asks the database which sessions lie

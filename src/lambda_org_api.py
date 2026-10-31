@@ -158,6 +158,7 @@ import photo_binding
 import photo_rebind
 import session_scope
 import sweep_state
+import tenancy_status
 from db.connection import get_connection
 from psycopg.rows import dict_row as RealDictRow
 import programme_reconcile
@@ -631,6 +632,12 @@ def dispatch(conn, event, method, route):
         return error("caller has no company", 403)
     if caller.get("archived_at") is not None and not (route == "/me" and method == "GET"):
         return error("account archived", 403)
+    # Company offboarding gate (spec 2026-11-01 §5.1). After the archived check, which
+    # stays exactly as it was whatever the flag says. Flag off: logs and allows. GET /me
+    # is still served, carrying `blocked` so the UI can show the notice.
+    blocked = tenancy_status.caller_blocked(conn, caller, where="org-api")
+    if blocked and not (route == "/me" and method == "GET"):
+        return error(tenancy_status.REASON_COMPANY_INACTIVE, 403)
 
     # In-app updates. After the caller guard on purpose -- signed-in, provisioned devices only.
     if route == "/app/latest" and method == "GET":
@@ -652,6 +659,8 @@ def dispatch(conn, event, method, route):
 
     if route == "/me":
         if method == "GET":
+            if blocked:
+                return get_me(conn, caller, blocked=blocked)
             return get_me(conn, caller)
         if method == "PATCH":
             return _directory_after(conn, patch_me(conn, caller, parse_body(event)))
@@ -5056,7 +5065,10 @@ def _stamp_last_seen(conn, caller):
         logger.exception("last_seen stamp failed for user %s", caller.get("id"))
 
 
-def get_me(conn, caller):
+def get_me(conn, caller, blocked=None):
+    """`blocked`: the company gate's reason when it refuses this caller (flag on only).
+    /me is still served then, and carries `blocked: {"reason": ...}` -- the UI's notice.
+    Absent otherwise, so with the flag off the response is unchanged."""
     _stamp_last_seen(conn, caller)
     if GRADED_ROLES:
         # MINOR-2: source /me's site_ids from the graded reach (visible_scope
@@ -5096,11 +5108,14 @@ def get_me(conn, caller):
     site_roles = memberships.caller_site_roles(conn, caller["id"])
     effective_scope = (scope.visible_scope(conn, caller)["user_scope"]
                        if GRADED_ROLES else None)
-    return ok({**profile, "site_ids": site_ids,
-               "scope": resolve_scope(caller["global_role"]),
-               "site_roles": site_roles,
-               "effective_scope": effective_scope,
-               "company_name": (company or {}).get("name")})
+    me = {**profile, "site_ids": site_ids,
+          "scope": resolve_scope(caller["global_role"]),
+          "site_roles": site_roles,
+          "effective_scope": effective_scope,
+          "company_name": (company or {}).get("name")}
+    if blocked:
+        me["blocked"] = {"reason": blocked}
+    return ok(me)
 
 
 def patch_me(conn, caller, body):

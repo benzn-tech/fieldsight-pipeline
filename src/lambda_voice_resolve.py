@@ -10,6 +10,7 @@ import logging
 
 from db.connection import get_connection
 from repositories import memberships, users, voice_messages, ws_connections
+import tenancy_status
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -27,6 +28,10 @@ def lambda_handler(event, context):
         with get_connection() as conn:
             caller = users.get_user_by_sub(conn, sub)
             if caller is None or not caller["company_id"]:
+                return {"statusCode": 403}
+            # Company offboarding gate (spec 2026-11-01 §5.1): refused like an
+            # unprovisioned sender. Flag off: logs and allows.
+            if tenancy_status.caller_blocked(conn, caller, where="voice-resolve"):
                 return {"statusCode": 403}
             allowed = {str(x) for x in memberships.accessible_site_ids(
                 conn, caller["id"], caller["global_role"])}

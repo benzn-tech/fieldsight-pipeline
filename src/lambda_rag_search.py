@@ -46,6 +46,7 @@ from lexical_terms import or_query, query_terms
 from repositories import (aliases, chunks, findings, memberships, project_docs, recordings,
                           redactions, scope, sites, topics, users)
 import project_doc_flag
+import tenancy_status
 import text_normalize
 
 logger = logging.getLogger()
@@ -135,6 +136,10 @@ def _metric(event):
     if caller is None:
         logger.info("rag-search metric: caller not provisioned for sub=%s", sub)
         return dict(out, error="caller not provisioned")
+    # Company offboarding gate (spec 2026-11-01 §5.1); the metric envelope, no chunks.
+    blocked = tenancy_status.caller_blocked(conn, caller, where="rag-search:metric")
+    if blocked:
+        return dict(out, error=blocked)
 
     sc = scope.visible_scope(conn, caller)
     site_ids = [str(s) for s in sc["site_ids"]]
@@ -248,6 +253,15 @@ def _tools(event):
                              "name": c.get("name") if isinstance(c, dict) else None,
                              "rows": [], "meta": {"error": "not_provisioned"}}
                             for c in calls]}
+    # Company offboarding gate (spec 2026-11-01 §5.1): the not-provisioned envelope with
+    # the gate's reason per call, plus a top-level `error`.
+    blocked = tenancy_status.caller_blocked(conn, caller, where="rag-search:tools")
+    if blocked:
+        return {"error": blocked,
+                "results": [{"id": c.get("id") if isinstance(c, dict) else None,
+                             "name": c.get("name") if isinstance(c, dict) else None,
+                             "rows": [], "meta": {"error": blocked}}
+                            for c in calls]}
     vs = scope.visible_scope(conn, caller)
     sc = {"site_ids": {str(s) for s in vs["site_ids"]},
           "author_ids": ({str(a) for a in vs["author_ids"]}
@@ -300,6 +314,9 @@ def _documents(event):
     caller = users.get_user_by_sub(conn, sub)
     if caller is None:
         return {"documents": [], "error": "caller not provisioned"}
+    blocked = tenancy_status.caller_blocked(conn, caller, where="rag-search:documents")
+    if blocked:                                   # company offboarding gate (§5.1)
+        return {"documents": [], "error": blocked}
     site_ids = sorted(str(s) for s in scope.visible_scope(conn, caller)["site_ids"])
     if event.get("site"):
         site_ids = _pin_site(conn, caller, site_ids, event["site"])
@@ -405,6 +422,11 @@ def _search(event, context):
         logger.info("rag-search: caller not provisioned for sub=%s", sub)
         return {"chunks": [], "error": "caller not provisioned", "basis": basis,
                 "applied": applied}
+    # Company offboarding gate (spec 2026-11-01 §5.1). The error key is what makes
+    # ask-agent skip its web fallback and offer.
+    blocked = tenancy_status.caller_blocked(conn, caller, where="rag-search:search")
+    if blocked:
+        return {"chunks": [], "error": blocked, "basis": basis, "applied": applied}
 
     # Fail-safe: ALWAYS scope through the dashboard's ACL primitive (per-author
     # graded visibility). No GRADED_ROLES gate here — rag-search is a new

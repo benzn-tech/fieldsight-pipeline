@@ -26,6 +26,7 @@ import logging
 from db.connection import close_cached_connection, get_cached_connection
 import nz_time
 from repositories import inspection_windows, meeting_session, recordings, sites, users
+import tenancy_status
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -91,6 +92,11 @@ def _facts(event):
     user = users.get_user_by_sub(conn, sub)
     if not user:
         return out
+    # Company offboarding gate (spec 2026-11-01 section 5.1): this hop's error shape;
+    # check_done answers any `error` with its spoken error. Flag off: logs and allows.
+    blocked = tenancy_status.caller_blocked(conn, user, where="check-gaps-db")
+    if blocked:
+        return {"error": blocked}
     out["user"] = {"id": user["id"], "company_id": user.get("company_id"),
                    "folder_name": user.get("folder_name")}
     session = meeting_session.latest_for_user_near(conn, user["id"], at, SESSION_WINDOW_S)
