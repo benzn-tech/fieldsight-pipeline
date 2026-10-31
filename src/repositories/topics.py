@@ -15,6 +15,7 @@ from deleted_predicates import (
     visible_topics_predicate,
 )
 from psycopg.types.json import Jsonb
+from tenancy_status import not_migrated
 
 from repositories import findings
 
@@ -1411,16 +1412,23 @@ def _ask_tools_extraction_presence():
         " OR (t.user_id IS NULL AND x.user_id IS NULL AND x.site_id = t.site_id)))")
 
 
-def _ask_tools_where(site_ids, *, author_ids, site_id, user_id):
+def _ask_tools_where(site_ids, *, author_ids, site_id, user_id, include_agent=False):
     """Every clause EXCEPT the outer deletion arms: each caller interpolates
     `visible_topics_predicate("t")` into its own statement, where the
-    deleted-read scan (tests/unit/test_deleted_read_paths.py) can see it."""
+    deleted-read scan (tests/unit/test_deleted_read_paths.py) can see it.
+
+    include_agent=True (the action-pack items tool only, spec §14 S4) also admits
+    agent-created topics (`source = 'agent'`, key `agent://action_pack/<id>`), which the
+    family rule's key prefixes never match. Every other clause -- site reach, author
+    filter, non_work -- applies to them unchanged. Off (every Ask caller), the SQL is
+    exactly what it always was."""
     site_list = [str(s) for s in site_ids]
     clauses = ["t.site_id = ANY(%s::uuid[])",
                "t.work_class IS DISTINCT FROM 'non_work'",
                "(t.source_s3_key LIKE 'extractions/%%'"
                " OR (t.source_s3_key LIKE 'reports/%%' AND NOT "
-               + _ask_tools_extraction_presence() + "))"]
+               + _ask_tools_extraction_presence() + ")"
+               + (" OR t.source = 'agent'" if include_agent else "") + ")"]
     params = [site_list, site_list]
     if author_ids is not None:
         # = ANY never matches a NULL user_id, so unattributed topics stay hidden.
@@ -1475,3 +1483,73 @@ def latest_visible_topic_date(conn, site_ids, before, *, author_ids=None,
         f"AND {visible_topics_predicate('t')} AND t.report_date < %s",
         params + [before]).fetchone()
     return row[0].isoformat() if row and row[0] else None
+
+
+def _like_literal(text):
+    """`text` as an ILIKE substring pattern: % and _ (and the escape char) are literal."""
+    esc = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{esc}%"
+
+
+def _scoped_items(conn, site_ids, author_ids, site_id, statuses, query, task_no, limit,
+                  *, ledger):
+    """The items tool's one statement, in two shapes from one template: with the task-number
+    ledger (migration 0093) LEFT JOINed, or without it (task_no NULL) -- so the two cannot
+    drift. DISTINCT ON keeps one row per stable_id, the newest live one (the row
+    action_items.get_live_by_stable_id -- and so apply -- acts on); the item filters run
+    AFTER it, so a filter never resurrects an older row of the same stable_id."""
+    where, params = _ask_tools_where(site_ids, author_ids=author_ids, site_id=site_id,
+                                     user_id=None, include_agent=True)
+    outer, oparams = ["x.status = ANY(%s)"], [list(statuses)]
+    if query:
+        outer.append("x.text ILIKE %s ESCAPE '\\'")
+        oparams.append(_like_literal(query))
+    if task_no is not None:
+        outer.append("x.task_no = %s")
+        oparams.append(task_no)
+    sql = (
+        "SELECT x.* FROM (SELECT DISTINCT ON (a.stable_id) a.stable_id, "
+        + ("n.task_no" if ledger else "NULL::integer") + " AS task_no, "
+        "a.text, a.status, a.deadline, a.responsible, a.priority, a.updated_at, "
+        "a.created_at, a.site_id, s.name AS site, a.topic_id, t.report_date, t.source "
+        "FROM action_items a JOIN topics t ON t.id = a.topic_id "
+        "JOIN sites s ON s.id = a.site_id "
+        + ("LEFT JOIN action_task_numbers n ON n.stable_id = a.stable_id " if ledger else "")
+        + f"WHERE {where} AND {visible_topics_predicate('t')} AND a.site_id = t.site_id "
+        "ORDER BY a.stable_id, a.created_at DESC, a.id) x "
+        f"WHERE {' AND '.join(outer)} "
+        "ORDER BY x.site, x.site_id, x.task_no NULLS LAST, x.created_at, x.stable_id "
+        "LIMIT %s")
+    return conn.cursor(row_factory=dict_row).execute(
+        sql, params + oparams + [limit]).fetchall()
+
+
+def scoped_items_rows(conn, site_ids, *, author_ids=None, site_id=None,
+                      statuses=("open", "in_progress", "blocked"), query=None,
+                      task_no=None, limit=50) -> list[dict]:
+    """Live action items under the Ask tools' scope plus agent-created topics (action packs
+    items tool, spec §13 / §14 S4). Read-only.
+
+    Scope: `_ask_tools_where(include_agent=True)` -- the caller's site reach and author
+    filter, non_work dropped, the extraction/report family rule -- AND
+    visible_topics_predicate (not deleted, not superseded). Empty site_ids, an empty (not
+    None) author set or no statuses means nothing is visible -- never 'no filter'.
+
+    Order: site name, task_no NULLS LAST, created_at (stable_id breaks ties). Fetches up to
+    `limit` rows; the caller asks for limit + 1 to detect truncation.
+
+    The task-number ledger may not exist yet (sam deploy runs before migrate): the joined
+    read runs in a SAVEPOINT and on 42P01 the read is redone without it (task_no None); a
+    task_no filter then matches nothing."""
+    if not site_ids or (author_ids is not None and not author_ids) or not statuses:
+        return []
+    args = (conn, site_ids, author_ids, site_id, statuses, query, task_no, limit)
+    try:
+        with conn.transaction():
+            return _scoped_items(*args, ledger=True)
+    except psycopg.Error as exc:
+        if not not_migrated(exc):
+            raise
+    if task_no is not None:
+        return []
+    return _scoped_items(*args, ledger=False)
