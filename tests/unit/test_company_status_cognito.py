@@ -489,3 +489,9 @@ def test_direct_task_validation(w, ev, err):
     w.repo.event(E1)
     out = api.lambda_handler({"task": "company_status_cognito", **ev}, None)
     assert err in out["error"] and w.cog.calls == []
+
+
+def test_direct_task_accepts_an_upper_case_id(w):
+    _suspend_rows(w, subs=("u1",))
+    out = api.lambda_handler({"task": "company_status_cognito", "event_id": E1.upper()}, None)
+    assert out["company_id"] == CO and out["done"] == 2

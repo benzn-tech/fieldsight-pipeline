@@ -136,7 +136,10 @@ def _process_row(conn, client, pool_id, company_id, row):
 def sweep_company(conn, cognito_factory, pool_id, company_id, deadline) -> dict:
     """Run every retryable row of the company until the deadline. Returns the counts and
     `retryable_left` (0 means the company's markers can go)."""
-    rows = repo.list_retryable_cognito(conn, company_id, MAX_ATTEMPTS)
+    # Every read sits in its own transaction block, so a failing query never leaves the
+    # connection aborted for the next company of the same tick.
+    with conn.transaction():
+        rows = repo.list_retryable_cognito(conn, company_id, MAX_ATTEMPTS)
     conn.commit()           # end the read, so each row below is its own transaction
     counts = {"done": 0, "failed": 0, "superseded": 0, "raced": 0, "skipped": 0}
     more = False
@@ -146,7 +149,8 @@ def sweep_company(conn, cognito_factory, pool_id, company_id, deadline) -> dict:
             more = True
             break
         counts[_process_row(conn, client, pool_id, company_id, row)] += 1
-    left = repo.count_retryable_cognito(conn, company_id, MAX_ATTEMPTS)
+    with conn.transaction():
+        left = repo.count_retryable_cognito(conn, company_id, MAX_ATTEMPTS)
     conn.commit()
     return {**counts, "retryable_left": left, "more": more}
 
@@ -218,7 +222,8 @@ def tick(context, *, s3_client, bucket, cognito_factory, get_connection, pool_id
             try:
                 live = []
                 for key, eid in markers:
-                    owner = repo.event_company(conn, eid)
+                    with conn.transaction():
+                        owner = repo.event_company(conn, eid)
                     if owner is None or str(owner) != cid:
                         # Written after the event committed, so this is not a lag: the
                         # marker names nothing. Drop it, or it would wake Aurora forever.
@@ -254,16 +259,17 @@ def run_task(event, context, *, s3_client, bucket, cognito_factory, get_connecti
     eid, cid = event.get("event_id"), event.get("company_id")
     if not eid and not cid:
         return {"error": "event_id or company_id is required"}
-    try:
-        eid = _canon(eid, "event_id") if eid else None
-        cid = _canon(cid, "company_id") if cid else None
+    try:   # an operator's hand-typed id may be upper case: canonicalise, do not refuse
+        eid = _canon(str(eid).lower(), "event_id") if eid else None
+        cid = _canon(str(cid).lower(), "company_id") if cid else None
     except ValueError as exc:
         return {"error": str(exc)}
     if not pool_id:
         return {"error": "COGNITO_USER_POOL_ID not set"}
     with get_connection() as conn:
         if eid:
-            owner = repo.event_company(conn, eid)
+            with conn.transaction():
+                owner = repo.event_company(conn, eid)
             conn.commit()
             if owner is None:
                 return {"error": f"event not found: {eid}"}
