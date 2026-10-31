@@ -71,8 +71,9 @@ def test_live_items_carries_source_and_agent_topic_is_not_nightly(db):
 def test_timeline_and_tasks_rows_carry_source(db):
     d = _day(db)
     # The day view reads by the recorder's S3 prefix; an agent:// key matches none, so
-    # it is unioned in by key here (the same hook a merged meeting uses).
-    rows = topics.list_topics_for_source_prefix(db, d["prefix"], merged_keys=[d["agent_key"]])
+    # it is unioned in by topic id, as /timeline does (extra_topic_ids, fix round 0b).
+    rows = topics.list_topics_for_source_prefix(db, d["prefix"],
+                                                extra_topic_ids=[d["agent_id"]])
     shaped = lambda_org_api.render_report_shape(rows, {}, DATE, d["folder"], db,
                                                 company_id=d["co"]["id"])
     by_title = {t["topic_title"]: t for t in shaped["topics"]}

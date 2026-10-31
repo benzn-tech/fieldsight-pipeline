@@ -959,6 +959,25 @@ def _prefix_or_merged(merged_keys, extra_topic_ids=None):
     return cond
 
 
+def agent_topic_author_for_folder_day(conn, folder, report_date):
+    """The users.id behind `folder` when that person has an agent-created topic
+    (`source='agent'`) on `report_date`, else None.
+
+    The day view's cheap probe (action packs spec §14 D2): ONE indexed SELECT --
+    idx_users_folder_global (folder_name is globally unique, migration 0012) into the
+    partial idx_topics_agent_user_date (migration 0093), which holds only agent topics.
+    Visibility and reach are NOT checked here; `agent_topic_ids_for_day` does that on a
+    hit. No folder -> None without a round-trip."""
+    if not folder:
+        return None
+    row = conn.execute(
+        "SELECT t.user_id FROM users u JOIN topics t ON t.user_id = u.id "
+        "WHERE u.folder_name = %s AND t.report_date = %s AND t.source = 'agent' LIMIT 1",
+        (folder, report_date),
+    ).fetchone()
+    return row[0] if row else None
+
+
 def agent_topic_ids_for_day(conn, user_id, report_date, site_ids) -> list[str]:
     """Ids of the visible agent-created topics (`source='agent'`, action packs spec
     §3.4/§14 D2) that `user_id` applied on `report_date`, on `site_ids` (the reader's

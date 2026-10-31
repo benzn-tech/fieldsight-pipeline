@@ -11329,19 +11329,22 @@ def _agent_topic_ids_for(conn, caller, user, date, reach):
     """Ids of the agent-created topics (action packs spec §14 D2) that the person whose
     day this is applied on `date`, on sites in `reach()` -- or [] (never raises).
 
-    Unlike `_timeline_target_id` this does NOT fall back to the caller: that fallback
-    would put the caller's own agent todos on someone else's day. An unresolvable
-    folder simply has none. The rows are still site-clipped by the renderer."""
+    Probe first: one indexed SELECT (the folder's own agent topic that day, through a
+    partial index that holds only agent topics). Reach -- the costly part -- is computed
+    only on a hit, so a day with no agent topic (every day, with the feature off) pays
+    that one SELECT and nothing else. The probe resolves the person from the folder
+    itself (folder_name is globally unique) and never falls back to the caller, which
+    would put the caller's own agent todos on someone else's day.
+
+    Everything runs inside one savepoint: a database error anywhere in the lookup rolls
+    back to it and yields [], so the day read's transaction stays usable. The rows are
+    still site-clipped by the renderer."""
     try:
-        if user and user == (caller.get("folder_name") or ""):
-            target_id = caller["id"]
-        else:
-            target_id = (_resolve_target_user(conn, caller["company_id"], user) or {}).get("id")
-        if target_id is None:
-            return []
-        site_ids = list(reach())
-        with conn.transaction():   # a failed lookup must not abort the day read's transaction
-            return topics.agent_topic_ids_for_day(conn, target_id, date, site_ids)
+        with conn.transaction():
+            target_id = topics.agent_topic_author_for_folder_day(conn, user, date)
+            if target_id is None:
+                return []
+            return topics.agent_topic_ids_for_day(conn, target_id, date, list(reach()))
     except Exception:
         logger.exception("agent topic lookup failed for %s on %s", user, date)
         return []

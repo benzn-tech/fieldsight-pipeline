@@ -203,3 +203,78 @@ def test_deleted_recorder_rows_do_not_bring_the_prose_back_with_an_agent_topic(d
     code, body = _timeline(db, w["eve"])
     assert code == 200 and _titles(body) == ["Pack on A"]
     assert "WHOLE DAY PROSE" not in json.dumps(body)
+
+
+def test_graded_reader_never_sees_an_agent_topic_off_their_sites(db):
+    """A pm of site A (graded SITE tier) reading eve's day: cross-user clip. The site-B
+    agent topic is applied by eve on the same day and must stay out."""
+    w = _world(db)
+    pm = _user(db, {"id": w["site_a"]["company_id"]}, "pm", w["tag"], "pam")
+    memberships.add_membership(db, pm["id"], w["site_a"]["id"], "pm")
+    _regular(db, w, w["site_a"], "Yard A pour", "a" * 32)
+    _agent(db, w, w["site_a"], "Pack on A")
+    _agent(db, w, w["site_b"], "Pack on B")
+    code, body = _timeline(db, dict(pm), w["folder"])
+    assert code == 200, body
+    assert _titles(body) == ["Pack on A", "Yard A pour"]
+    assert "WHOLE DAY PROSE" not in json.dumps(body)
+
+
+def test_agent_topic_on_an_inactive_companys_site_is_not_shown(db, monkeypatch):
+    """Company offboarding (spec 2026-11-01 §5.2): eve's own day loses the site of a
+    suspended company -- her agent topic there included."""
+    monkeypatch.setenv("COMPANY_STATUS_ENFORCE", "on")
+    w = _world(db)
+    _regular(db, w, w["site_a"], "Yard A pour", "a" * 32)
+    _agent(db, w, w["site_a"], "Pack on A")
+    _agent(db, w, w["site_b"], "Pack on B")
+    code, body = _timeline(db, dict(w["eve"]))
+    assert code == 200 and _titles(body) == ["Pack on A", "Pack on B", "Yard A pour"]
+    db.execute("UPDATE companies SET status = 'suspended' WHERE id = %s",
+               (w["site_b"]["company_id"],))
+    code, body = _timeline(db, dict(w["eve"]))
+    assert code == 200 and _titles(body) == ["Pack on A", "Yard A pour"]
+
+
+def test_no_agent_topic_means_one_probe_and_no_reach(db, monkeypatch):
+    """The cost on every ordinary /timeline read: the probe only. Reach and the id
+    lookup run only on a hit."""
+    w = _world(db)
+    _regular(db, w, w["site_a"], "Yard A pour", "a" * 32)
+    probes, lookups = [], []
+    real_probe = topics.agent_topic_author_for_folder_day
+    monkeypatch.setattr(topics, "agent_topic_author_for_folder_day",
+                        lambda *a: probes.append(a) or real_probe(*a))
+    monkeypatch.setattr(topics, "agent_topic_ids_for_day",
+                        lambda *a: lookups.append(a) or [])
+    reach_calls = []
+    real_reach = api._agent_topic_ids_for
+
+    def spy(conn, caller, user, date, reach):
+        return real_reach(conn, caller, user, date,
+                          lambda: reach_calls.append(1) or reach())
+
+    monkeypatch.setattr(api, "_agent_topic_ids_for", spy)
+    code, _ = _timeline(db, w["eve"])
+    assert code == 200
+    assert len(probes) == 1 and lookups == [] and reach_calls == []
+    _agent(db, w, w["site_a"], "Pack on A")
+    _timeline(db, w["eve"])
+    assert len(lookups) == 1 and reach_calls == [1]
+
+
+def test_a_failing_probe_leaves_the_transaction_usable(db, monkeypatch):
+    w = _world(db)
+    _regular(db, w, w["site_a"], "Yard A pour", "a" * 32)
+    monkeypatch.setattr(topics, "agent_topic_author_for_folder_day",
+                        lambda conn, *a: conn.execute("SELECT * FROM no_such_probe_table"))
+    code, body = _timeline(db, w["eve"])
+    assert code == 200 and _titles(body) == ["Yard A pour"]
+
+
+def test_the_probe_index_exists(db):
+    """Migration 0093's partial index the probe reads: agent topics only."""
+    row = db.execute("SELECT indexdef FROM pg_indexes "
+                     "WHERE indexname = 'idx_topics_agent_user_date'").fetchone()
+    assert row is not None
+    assert "(user_id, report_date)" in row[0] and "'agent'" in row[0]
