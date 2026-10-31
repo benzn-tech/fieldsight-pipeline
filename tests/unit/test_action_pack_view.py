@@ -81,9 +81,11 @@ def test_shape_pack_applies_removal_and_flags():
 
 def test_target_snapshot_withheld_when_target_not_visible():
     view = v.shape_pack(_pack(), removed_refs=set(), site_name=None,
-                        targets={"a1": {"task_no": None, "visible": False}},
+                        targets={"a1": {"task_no": 69, "visible": False}},
                         applicable={}, viewer_id="x")
     assert view["actions"][0]["target_snapshot"] is None
+    assert view["actions"][0]["target_task_no"] is None       # names an item they cannot see
+    assert "#69" not in v.render_markdown(view)
     assert view["actions"][0]["applicable"] is False and view["is_creator"] is False
 
 

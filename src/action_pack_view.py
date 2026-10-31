@@ -5,15 +5,31 @@ action_pack_* internal tasks) gathers the facts and these functions decide and s
 
 * `mode()` / `route_allowed(caller)` -- the ACTION_PACKS switch, read per call.
 * `validate_create_body(body)` -- the POST /action-packs whitelist.
-* `store_payload_error(payload)` -- the internal store task's size gate.
+* `store_payload_error(payload)` / `payload_shape_error(payload)` -- the internal store
+  task's size and shape gates.
 * `shape_pack(...)` -- the GET one view after the S13 re-check (removed sources lose
   everything but their ref; claims/actions citing only removed sources are dropped).
 * `render_markdown(view)` -- GET /action-packs/{id}/export?format=md.
 
 Nothing here logs: the callers log ids and counts only.
 """
+import datetime as dt
 import json
 import os
+import re
+import uuid
+
+# A source ref as the worker writes it (R3, D2, W5); anything else in a path is a 404.
+REF_RE = re.compile(r"^[A-Za-z]{1,4}[0-9]{1,5}$")
+# The web snapshot viewer returns at most this much stored text (spec §14 S5 keeps 200 kB).
+SNAPSHOT_MAX_BYTES = 200_000
+
+
+def snapshot_key_prefix(company_id, pack_id) -> str:
+    """Where Task 9 stores a pack's web snapshots on the lake bucket (spec §3.2):
+    action_packs/<company_id>/<pack_id>/web/<ref>.txt. The viewer reads only keys under
+    this prefix, whatever the source row says."""
+    return f"action_packs/{company_id}/{pack_id}/web/"
 
 # off (also unset / anything unknown) -> every pack route 404s like an unknown route and the
 # internal tasks answer {"error": "disabled"}; internal -> platform_admin only; on -> everyone.
@@ -116,6 +132,85 @@ def store_payload_error(payload):
     return None
 
 
+def _is_uuid(v):
+    try:
+        uuid.UUID(v)
+        return True
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def _is_iso(v, kind):
+    try:
+        (dt.date.fromisoformat if kind == "date" else dt.datetime.fromisoformat)(v)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool) and -2**31 <= v < 2**31
+
+
+def _str_list(v):
+    return isinstance(v, list) and all(isinstance(x, str) and x for x in v)
+
+
+# Per-field type rules for the store payload; a value may always be None (= omitted).
+_PACK_TYPES = {"title": "str", "reading": "str", "conclusion": "list", "run_trace": "dict",
+               "models": "dict", "as_of": "datetime", "sources": "list", "actions": "list"}
+_SOURCE_TYPES = {"ref": "str", "kind": "str", "provenance": "str", "topic_id": "uuid",
+                 "chunk_id": "uuid", "document_id": "uuid", "revision": "int",
+                 "page_from": "int", "page_to": "int", "stable_id": "uuid", "title": "str",
+                 "date": "date", "site_id": "uuid", "who": "str", "excerpt": "str",
+                 "url": "str", "fetched_at": "datetime", "snapshot_s3_key": "str"}
+_ACTION_TYPES = {"seq": "int", "type": "str", "target_stable_id": "uuid",
+                 "target_snapshot": "dict", "proposed": "dict", "rationale": "str",
+                 "refs": "strlist", "verifier": "str"}
+_CHECK = {"str": lambda v: isinstance(v, str), "list": lambda v: isinstance(v, list),
+          "dict": lambda v: isinstance(v, dict), "int": _is_int, "uuid": _is_uuid,
+          "date": lambda v: _is_iso(v, "date"), "datetime": lambda v: _is_iso(v, "datetime"),
+          "strlist": _str_list}
+
+
+def _types_ok(obj, rules):
+    return all(obj.get(k) is None or _CHECK[t](obj[k]) for k, t in rules.items() if k in obj)
+
+
+def payload_shape_error(payload):
+    """None, or a detail code for a store payload whose SHAPE is wrong (a non-list sources,
+    a non-dict action, a string seq, a malformed uuid/date, ...). Run before the repository
+    so a malformed payload is answered {"error": "invalid", "detail": code} and never reaches
+    the database as a driver error, nor raises a TypeError (a Lambda FunctionError for the
+    worker). Unknown keys and dangling refs stay the repository's checks."""
+    if not isinstance(payload, dict):
+        return "payload_not_object"
+    if not _types_ok(payload, _PACK_TYPES):
+        return "pack_field_type"
+    for claim in payload.get("conclusion") or []:
+        if not isinstance(claim, dict) or not isinstance(claim.get("text"), str) or (
+                claim.get("refs") is not None and not _str_list(claim["refs"])) or (
+                claim.get("confidence") not in (None, "supported", "uncertain")):
+            return "conclusion_shape"
+    for s in payload.get("sources") or []:
+        if not isinstance(s, dict):
+            return "source_shape"
+        if not all(isinstance(s.get(k), str) and s.get(k) for k in ("ref", "kind", "provenance")):
+            return "source_required"
+        if not _types_ok(s, _SOURCE_TYPES):
+            return "source_field_type"
+    for a in payload.get("actions") or []:
+        if not isinstance(a, dict):
+            return "action_shape"
+        if not (_is_int(a.get("seq")) and isinstance(a.get("type"), str)
+                and _str_list(a.get("refs")) and a.get("refs")
+                and isinstance(a.get("verifier"), str)):
+            return "action_required"
+        if not _types_ok(a, _ACTION_TYPES):
+            return "action_field_type"
+    return None
+
+
 def invalid_detail(message: str) -> str:
     """A code for the repository's ValueError (its message names keys/refs; codes only leave)."""
     if message.startswith("unknown"):
@@ -185,7 +280,9 @@ def shape_pack(pack, *, removed_refs, site_name, targets, applicable, viewer_id)
             "proposed": a.get("proposed"),
             "target_stable_id": (str(a["target_stable_id"])
                                  if a.get("target_stable_id") is not None else None),
-            "target_task_no": target.get("task_no"),
+            # Like the snapshot below: the number names a live item, so only while the
+            # reader can see it.
+            "target_task_no": target.get("task_no") if target.get("visible") else None,
             "applicable": bool(applicable.get(aid)),
             "applied_at": a.get("applied_at"), "applied_result": a.get("applied_result"),
             "created_item_stable_id": (str(a["created_item_stable_id"])

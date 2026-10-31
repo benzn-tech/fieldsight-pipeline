@@ -3218,6 +3218,9 @@ Resources:
                     # state.json, and a running export has no manifest yet. Without this a
                     # missing key answers 403, not 404, and the status poll would 500.
                     - exports/*
+                    # GET /action-packs/{id}/sources/{ref}/snapshot: a snapshot the run never
+                    # wrote must read as 404, not a 403 -> 500.
+                    - action_packs/*
             - Effect: Allow
               # Task 20 (content correction reindex chain): after a content
               # edit commits, org-api (in-VPC) writes the per-topic reindex
@@ -3411,6 +3414,12 @@ Resources:
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${DataBucketName}/action_pack_requests/*
+            # The web snapshot viewer (GET /action-packs/{id}/sources/{ref}/snapshot) reads
+            # the page text the run stored on the lake (action_packs/<co>/<pack>/web/<ref>.txt,
+            # spec §3.2). Read only; the worker writes them.
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/action_packs/*
       Events:
         OrgProxy:
           Type: Api

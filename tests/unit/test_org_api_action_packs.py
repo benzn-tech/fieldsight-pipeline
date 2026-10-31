@@ -49,10 +49,29 @@ class FakeConn:
         return contextlib.nullcontext()
 
 
+SNAP_KEY = f"action_packs/{CO}/{PACK}/web/W1.txt"
+WEB = {"ref": "W1", "kind": "web_source", "provenance": "web", "url": "https://e.x/a",
+       "fetched_at": "2026-11-01T00:00:00+00:00", "snapshot_s3_key": SNAP_KEY,
+       "excerpt": "page"}
+
+
 class FakeS3:
     def __init__(self, fail=False):
         self.puts = []
         self.fail = fail
+        self.objs = {SNAP_KEY: b"stored page text"}
+        self.get_error = None
+        self.gets = []
+
+    def get_object(self, Bucket, Key):
+        import io
+        from botocore.exceptions import ClientError
+        if self.get_error:
+            raise ClientError({"Error": {"Code": self.get_error, "Message": "x"}}, "GetObject")
+        if Key not in self.objs:
+            raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "x"}}, "GetObject")
+        self.gets.append((Bucket, Key))
+        return {"Body": io.BytesIO(self.objs[Key])}
 
     def put_object(self, Bucket, Key, Body, ContentType=None):
         if self.fail:
@@ -65,7 +84,7 @@ def _pack(**over):
          "title": "T", "instruction": "secret instruction text", "reading": "R",
          "conclusion": [], "state": "ready", "failure": None, "archived_at": None,
          "as_of": None, "created_at": "2026-11-01", "updated_at": "2026-11-01",
-         "sources": [], "actions": []}
+         "sources": [dict(WEB)], "actions": []}
     p.update(over)
     return p
 
@@ -86,6 +105,7 @@ def env(monkeypatch):
     monkeypatch.setattr(org.tenancy_status, "write_refusal", lambda *a, **k: None)
     monkeypatch.setattr(org, "s3", lambda: st.s3)
     monkeypatch.setattr(org, "S3_BUCKET", "data-bucket")
+    monkeypatch.setattr(org, "LAKE_BUCKET", "lake-bucket")
     monkeypatch.setattr(org.scope, "visible_scope",
                         lambda conn, caller: {"site_ids": set(st.sites), "author_ids": None})
     monkeypatch.setattr(org.memberships, "caller_site_roles", lambda conn, uid: {})
@@ -129,7 +149,8 @@ ROUTES = [("POST", "/action-packs", {"instruction": "x"}),
           ("POST", f"/action-packs/{PACK}/cancel", {}),
           ("POST", f"/action-packs/{PACK}/archive", {"archived": True}),
           ("POST", f"/action-packs/{PACK}/actions/{ACTION}/dismiss", {}),
-          ("GET", f"/action-packs/{PACK}/export", None)]
+          ("GET", f"/action-packs/{PACK}/export", None),
+          ("GET", f"/action-packs/{PACK}/sources/W1/snapshot", None)]
 
 
 # ---------------------------------------------------------------- 1. the switch
@@ -174,7 +195,10 @@ def test_flag_on_everyone_reaches_the_routes(env, method, route, body, role):
 @pytest.mark.parametrize("method,route", [("PUT", "/action-packs"), ("DELETE", f"/action-packs/{PACK}"),
                                           ("GET", f"/action-packs/{PACK}/cancel"),
                                           ("POST", f"/action-packs/{PACK}/actions/{ACTION}/nope"),
-                                          ("GET", "/action-packs/not-a-uuid")])
+                                          ("GET", "/action-packs/not-a-uuid"),
+                                          ("POST", f"/action-packs/{PACK}/sources/W1/snapshot"),
+                                          ("GET", f"/action-packs/{PACK}/sources/../snapshot"),
+                                          ("GET", f"/action-packs/{PACK}/sources/W%2F1/snapshot")])
 def test_unknown_pack_subroutes_and_malformed_ids_404(env, method, route):
     assert _call(env, method, route, {})[0] == 404
 
@@ -508,3 +532,129 @@ def test_template_wires_the_switch_and_the_one_put_grant():
     param = text[text.index("\n  ActionPacks:"):]
     param = param[:param.index("\n\n")]
     assert "Default: 'off'" in param and "AllowedValues: ['off', 'internal', 'on']" in param
+
+
+# ---------------------------------------------------------------- fix round 1
+
+def test_snapshot_returns_the_stored_text_from_the_lake(env):
+    assert _call(env, "GET", f"/action-packs/{PACK}/sources/W1/snapshot") == (200, {
+        "ref": "W1", "url": "https://e.x/a", "fetched_at": "2026-11-01T00:00:00+00:00",
+        "text": "stored page text", "truncated": False})
+    assert env.s3.gets == [("lake-bucket", SNAP_KEY)]
+
+
+def test_snapshot_is_capped(env):
+    env.s3.objs[SNAP_KEY] = b"x" * (action_pack_view.SNAPSHOT_MAX_BYTES + 10)
+    status, body = _call(env, "GET", f"/action-packs/{PACK}/sources/W1/snapshot")
+    assert status == 200 and body["truncated"] is True
+    assert len(body["text"]) == action_pack_view.SNAPSHOT_MAX_BYTES
+
+
+@pytest.mark.parametrize("source", [
+    dict(WEB, kind="topic", provenance="records"),                          # not web
+    dict(WEB, snapshot_s3_key=None),                                        # never stored
+    dict(WEB, snapshot_s3_key=f"action_packs/{CO}/other-pack/web/W1.txt"),  # another pack
+    dict(WEB, snapshot_s3_key="reports/secret.json"),                       # outside prefix
+    dict(WEB, snapshot_s3_key=f"action_packs/{CO}/{PACK}/web/../../x.txt"),
+])
+def test_snapshot_refuses_non_web_or_foreign_keys(env, source):
+    env.pack = _pack(sources=[source])
+    assert _call(env, "GET", f"/action-packs/{PACK}/sources/W1/snapshot")[0] == 404
+    assert env.s3.gets == []
+
+
+def test_snapshot_missing_object_is_404_and_access_denied_is_not_swallowed(env):
+    env.s3.objs.clear()
+    assert _call(env, "GET", f"/action-packs/{PACK}/sources/W1/snapshot") == (
+        404, {"error": "snapshot not found"})
+    env.s3.get_error = "AccessDenied"
+    from botocore.exceptions import ClientError
+    with pytest.raises(ClientError):
+        _call(env, "GET", f"/action-packs/{PACK}/sources/W1/snapshot")
+
+
+def test_snapshot_unknown_ref_is_404(env):
+    assert _call(env, "GET", f"/action-packs/{PACK}/sources/W9/snapshot")[0] == 404
+
+
+def test_claim_with_the_creator_row_gone_fails_the_pack(task_env, monkeypatch):
+    seen = []
+    monkeypatch.setattr(org.action_packs, "claim", lambda conn, pid: True)
+    monkeypatch.setattr(org.action_packs, "get_for_worker", lambda conn, pid: None)
+    monkeypatch.setattr(org.action_packs, "fail",
+                        lambda conn, pid, reason, run_trace=None: seen.append(reason) or True)
+    assert org.lambda_handler({"task": "action_pack_claim", "pack_id": PACK}, None) == {
+        "claimed": False, "reason": "internal"}
+    assert seen == ["internal"]
+
+
+GOOD_SOURCE = {"ref": "R1", "kind": "topic", "provenance": "records"}
+GOOD_ACTION = {"seq": 1, "type": "note", "refs": ["R1"], "verifier": "weak"}
+
+
+@pytest.mark.parametrize("payload,detail", [
+    ({"sources": "R1"}, "pack_field_type"),
+    ({"actions": {"seq": 1}}, "pack_field_type"),
+    ({"title": 5}, "pack_field_type"),
+    ({"as_of": "yesterday"}, "pack_field_type"),
+    ({"conclusion": ["text"]}, "conclusion_shape"),
+    ({"conclusion": [{"text": "t", "refs": "R1"}]}, "conclusion_shape"),
+    ({"conclusion": [{"text": "t", "confidence": "high"}]}, "conclusion_shape"),
+    ({"sources": ["R1"]}, "source_shape"),
+    ({"sources": [{"ref": "R1", "kind": "topic"}]}, "source_required"),
+    ({"sources": [dict(GOOD_SOURCE, topic_id="not-a-uuid")]}, "source_field_type"),
+    ({"sources": [dict(GOOD_SOURCE, revision="2")]}, "source_field_type"),
+    ({"sources": [dict(GOOD_SOURCE, page_from=True)]}, "source_field_type"),
+    ({"sources": [dict(GOOD_SOURCE, date="30/10/2026")]}, "source_field_type"),
+    ({"sources": [dict(GOOD_SOURCE, excerpt=["x"])]}, "source_field_type"),
+    ({"actions": [7]}, "action_shape"),
+    ({"actions": [dict(GOOD_ACTION, seq="1")]}, "action_required"),
+    ({"actions": [dict(GOOD_ACTION, seq=2**40)]}, "action_required"),
+    ({"actions": [dict(GOOD_ACTION, refs="R1")]}, "action_required"),
+    ({"actions": [dict(GOOD_ACTION, refs=[])]}, "action_required"),
+    ({"actions": [dict(GOOD_ACTION, refs=[1])]}, "action_required"),
+    ({"actions": [dict(GOOD_ACTION, proposed="done")]}, "action_field_type"),
+    ({"actions": [dict(GOOD_ACTION, target_stable_id="69")]}, "action_field_type"),
+])
+def test_store_malformed_shapes_are_invalid_never_raised(task_env, monkeypatch, payload,
+                                                          detail):
+    monkeypatch.setattr(org.action_packs, "store_result", lambda *a: pytest.fail("stored"))
+    assert org.lambda_handler({"task": "action_pack_store", "pack_id": PACK,
+                               "payload": payload}, None) == {"error": "invalid",
+                                                             "detail": detail}
+
+
+def test_store_type_error_backstop(task_env, monkeypatch):
+    def boom(conn, pid, p):
+        raise TypeError("unexpected")
+    monkeypatch.setattr(org.action_packs, "store_result", boom)
+    assert org.lambda_handler({"task": "action_pack_store", "pack_id": PACK,
+                               "payload": {"sources": [GOOD_SOURCE],
+                                           "actions": [GOOD_ACTION]}}, None) == {
+        "error": "invalid", "detail": "invalid_payload"}
+
+
+def test_well_formed_payload_passes_the_shape_check():
+    assert action_pack_view.payload_shape_error({
+        "title": "t", "reading": "r", "as_of": "2026-11-01T00:00:00Z",
+        "conclusion": [{"text": "c", "refs": ["R1"], "confidence": "supported"}],
+        "sources": [dict(GOOD_SOURCE, topic_id="11111111-1111-1111-1111-111111111111",
+                         date="2026-10-30", revision=None, page_from=3)],
+        "actions": [dict(GOOD_ACTION, proposed={"status": "done"})]}) is None
+
+
+def test_create_and_get_one_run_the_sweep(env, monkeypatch):
+    swept = []
+    monkeypatch.setattr(org.action_packs, "sweep_stale",
+                        lambda conn, older_than: swept.append(older_than) or 0)
+    _call(env, "POST", "/action-packs", {"instruction": "x"})
+    _call(env, "GET", f"/action-packs/{PACK}")
+    assert len(swept) == 2
+
+
+def test_get_one_and_create_survive_a_sweep_error(env, monkeypatch):
+    def boom(conn, older_than):
+        raise RuntimeError("sweep broke")
+    monkeypatch.setattr(org.action_packs, "sweep_stale", boom)
+    assert _call(env, "GET", f"/action-packs/{PACK}")[0] == 200
+    assert _call(env, "POST", "/action-packs", {"instruction": "x"})[0] == 202

@@ -678,7 +678,8 @@ ACTION_PACK_REQUEST_PREFIX = "action_pack_requests/"
 ACTION_PACK_TASKS = ("action_pack_claim", "action_pack_heartbeat", "action_pack_store",
                      "action_pack_fail")
 _PACK_ROUTE_RE = re.compile(
-    r"^/action-packs(?:/([^/]+)(?:/(cancel|archive|export|actions/([^/]+)/(dismiss)))?)?$")
+    r"^/action-packs(?:/([^/]+)(?:/(cancel|archive|export|actions/([^/]+)/(dismiss)"
+    r"|sources/([^/]+)/snapshot))?)?$")
 
 
 def _uuid_or_none(value):
@@ -710,7 +711,7 @@ def action_packs_route(conn, caller, sub, event, method, route):
     m = _PACK_ROUTE_RE.match(route)
     if not m:
         return not_found
-    raw_pack, sub_route, raw_action, action_verb = m.groups()
+    raw_pack, sub_route, raw_action, action_verb, raw_ref = m.groups()
     if raw_pack is None:
         if method == "POST":
             return create_action_pack(conn, caller, sub, parse_body(event))
@@ -725,6 +726,10 @@ def action_packs_route(conn, caller, sub, event, method, route):
     if sub_route == "export":
         return export_action_pack(conn, caller, pack_id, event) if method == "GET" \
             else not_found
+    if raw_ref is not None:
+        if method != "GET" or not action_pack_view.REF_RE.match(raw_ref):
+            return not_found
+        return get_pack_snapshot(conn, caller, pack_id, raw_ref)
     if method != "POST":
         return not_found
     if sub_route == "cancel":
@@ -737,6 +742,21 @@ def action_packs_route(conn, caller, sub, event, method, route):
     if action_verb == "dismiss":
         return dismiss_pack_action(conn, caller, pack_id, action_id, parse_body(event))
     return not_found
+
+
+def _sweep_stale_packs(conn):
+    """S9: fail queued/running packs whose heartbeat is older than STALE_SWEEP_MINUTES, in its
+    own savepoint. Never fails the request it runs in (logged instead). Run on list, on create
+    (before the one-active check, so a dead run cannot block a new one) and on GET one (the
+    UI's poll target, so a dead run cannot show `running` forever)."""
+    try:
+        with conn.transaction():
+            swept = action_packs.sweep_stale(
+                conn, timedelta(minutes=action_pack_view.STALE_SWEEP_MINUTES))
+        if swept:
+            logger.warning("action pack sweep marked %d stale pack(s) failed", swept)
+    except Exception as exc:  # noqa: BLE001 - the request must not depend on the sweep
+        logger.error("action pack sweep failed (%s)", type(exc).__name__)
 
 
 def create_action_pack(conn, caller, sub, body):
@@ -765,6 +785,7 @@ def create_action_pack(conn, caller, sub, body):
     refused = _write_refused(conn, caller, site["company_id"], where="action-pack-create")
     if refused is not None:
         return refused
+    _sweep_stale_packs(conn)
     try:
         pack = action_packs.create_queued(conn, site_id=site_id, created_by=caller["id"],
                                           instruction=instruction)
@@ -806,14 +827,7 @@ def list_action_packs(conn, caller, event):
         params.get("archived"), "bad")
     if archived == "bad":
         return error("archived must be true, false or all", 400)
-    try:
-        with conn.transaction():
-            swept = action_packs.sweep_stale(
-                conn, timedelta(minutes=action_pack_view.STALE_SWEEP_MINUTES))
-        if swept:
-            logger.warning("action pack sweep marked %d stale pack(s) failed", swept)
-    except Exception as exc:  # noqa: BLE001 - the list must not depend on the sweep
-        logger.error("action pack sweep failed (%s)", type(exc).__name__)
+    _sweep_stale_packs(conn)
     rows = action_packs.list_for_reader(conn, _pack_reader(conn, caller), state=state,
                                         site_id=site_id, archived=archived)
     names = {str(s["id"]): s.get("name")
@@ -822,91 +836,94 @@ def list_action_packs(conn, caller, event):
                          for r in rows]})
 
 
-def _pack_removed_refs(conn, caller, pack):
-    """S13: the refs of this pack's sources that are deleted, redacted or not visible to THIS
-    reader now -- the ask_thread_check rules, evaluated with the reader's visible_scope.
+class _ReaderVisibility:
+    """S13 for one reader within one request: the ask_thread_check rules, evaluated with the
+    reader's visible_scope (site_ids / author_ids), cached per topic. Used for a pack's
+    sources and for its actions' live targets alike.
 
-    records   -> topics.get_topic_visible on the source's topic_id; an `item` source with no
-                 topic_id goes through its live row (get_live_by_stable_id). A records
-                 source with neither is removed (fail closed: nothing to re-check).
-    documents -> the document still exists, undeleted, on a site the reader sees
-                 (ask_thread_check._LIVE_DOCS_SQL, imported).
+    records   -> topics.get_topic_visible on the topic_id; an `item` source with no topic_id
+                 goes through its live row (get_live_by_stable_id). A records source with
+                 neither is removed (fail closed: nothing to re-check).
+    documents -> ask_thread_check.live_document_ids: exists, undeleted, on a site the reader
+                 sees.
     web       -> never removed (no record behind it; the snapshot is the pack's own copy).
-    Returns (removed refs, {topic_id: visible?}). Any failure removes every non-web source
-    (fail closed), inside a savepoint so the request transaction stays usable."""
-    import ask_thread_check
-    srcs = pack.get("sources") or []
-    non_web = {s["ref"] for s in srcs if s.get("provenance") != "web"}
-    topic_seen = {}
-    try:
-        with conn.transaction():
-            sc = scope.visible_scope(conn, caller)
-            site_ids = sorted(str(s) for s in sc["site_ids"])
-            author_ids = (sorted(str(a) for a in sc["author_ids"])
-                          if sc["author_ids"] is not None else None)
+    Every check runs inside a savepoint and fails CLOSED (removed / not visible), so a
+    database error never leaves the request transaction aborted."""
 
-            def topic_ok(tid):
-                key = str(tid)
-                if key not in topic_seen:
-                    topic_seen[key] = bool(site_ids) and topics.get_topic_visible(
-                        conn, key, site_ids, author_ids) is not None
-                return topic_seen[key]
+    def __init__(self, conn, caller):
+        self.conn, self.caller = conn, caller
+        self._scope = None
+        self._topics = {}
 
-            doc_ids = sorted({str(s["document_id"]) for s in srcs
-                              if s.get("provenance") == "documents" and s.get("document_id")})
-            live_docs = set()
-            if doc_ids and site_ids:
-                live_docs = {r[0].lower() for r in conn.execute(
-                    ask_thread_check._LIVE_DOCS_SQL, {"ids": doc_ids, "site_ids": site_ids})}
-            removed = set()
-            for s in srcs:
-                prov = s.get("provenance")
-                if prov == "web":
-                    continue
-                if prov == "documents":
-                    live = bool(s.get("document_id")) and str(s["document_id"]).lower() in live_docs
-                elif s.get("topic_id"):
-                    live = topic_ok(s["topic_id"])
-                elif s.get("stable_id"):
-                    item = action_items.get_live_by_stable_id(conn, s["stable_id"])
-                    live = item is not None and topic_ok(item["topic_id"])
-                else:
-                    live = False
-                if not live:
-                    removed.add(s["ref"])
-    except Exception as exc:  # noqa: BLE001 - fail closed
-        logger.error("action pack source re-check failed pack=%s (%s); hiding %d source(s)",
-                     pack.get("id"), type(exc).__name__, len(non_web))
-        return non_web, {}
-    return removed, topic_seen
+    def _site_author_ids(self):
+        if self._scope is None:
+            sc = scope.visible_scope(self.conn, self.caller)
+            self._scope = (sorted(str(s) for s in sc["site_ids"]),
+                           sorted(str(a) for a in sc["author_ids"])
+                           if sc["author_ids"] is not None else None)
+        return self._scope
 
+    def _topic(self, topic_id):
+        key = str(topic_id)
+        if key not in self._topics:
+            site_ids, author_ids = self._site_author_ids()
+            self._topics[key] = bool(site_ids) and topics.get_topic_visible(
+                self.conn, key, site_ids, author_ids) is not None
+        return self._topics[key]
 
-def _reader_sees_topic(conn, caller, topic_id, seen):
-    """Is this live item's topic visible to the reader (the S13 rule, applied to an action's
-    target so its stored snapshot -- which carries the item's text -- is shown only while the
-    reader could read the item itself)? Cached in `seen`; any failure reads as not visible,
-    inside a savepoint."""
-    key = str(topic_id)
-    if key not in seen:
+    def topic_visible(self, topic_id) -> bool:
+        """One topic (e.g. an action's live target), fail closed."""
         try:
-            with conn.transaction():
-                sc = scope.visible_scope(conn, caller)
-                site_ids = sorted(str(s) for s in sc["site_ids"])
-                author_ids = (sorted(str(a) for a in sc["author_ids"])
-                              if sc["author_ids"] is not None else None)
-                seen[key] = bool(site_ids) and topics.get_topic_visible(
-                    conn, key, site_ids, author_ids) is not None
+            with self.conn.transaction():
+                return self._topic(topic_id)
         except Exception as exc:  # noqa: BLE001 - fail closed
-            logger.error("action pack target re-check failed (%s)", type(exc).__name__)
-            seen[key] = False
-    return seen[key]
+            logger.error("action pack topic re-check failed (%s)", type(exc).__name__)
+            self._topics[str(topic_id)] = False
+            return False
+
+    def removed_refs(self, pack) -> set:
+        """The refs of this pack's sources that are deleted, redacted or not visible now."""
+        import ask_thread_check
+        srcs = pack.get("sources") or []
+        try:
+            with self.conn.transaction():
+                site_ids, _ = self._site_author_ids()
+                live_docs = ask_thread_check.live_document_ids(
+                    self.conn, sorted({str(s["document_id"]) for s in srcs
+                                       if s.get("provenance") == "documents"
+                                       and s.get("document_id")}), site_ids)
+                removed = set()
+                for s in srcs:
+                    prov = s.get("provenance")
+                    if prov == "web":
+                        continue
+                    if prov == "documents":
+                        live = (bool(s.get("document_id"))
+                                and str(s["document_id"]).lower() in live_docs)
+                    elif s.get("topic_id"):
+                        live = self._topic(s["topic_id"])
+                    elif s.get("stable_id"):
+                        item = action_items.get_live_by_stable_id(self.conn, s["stable_id"])
+                        live = item is not None and self._topic(item["topic_id"])
+                    else:
+                        live = False
+                    if not live:
+                        removed.add(s["ref"])
+                return removed
+        except Exception as exc:  # noqa: BLE001 - fail closed
+            non_web = {s["ref"] for s in srcs if s.get("provenance") != "web"}
+            logger.error("action pack source re-check failed pack=%s (%s); hiding %d "
+                         "source(s)", pack.get("id"), type(exc).__name__, len(non_web))
+            return non_web
 
 
 def may_create_item_on_site(conn, caller, site_id):
     """S15 for `create_item`: may this caller create a task on this site? The rule
     patch_action_item applies to an existing task on that site, minus the assignee tier (a
     new task has no assignee): tenant pin, the caller's site reach, then admin/gm of the
-    site's company or this site's pm/site_manager. Task 7's create apply uses this too."""
+    site's company or this site's pm/site_manager. Keep in step with _action_item_edit_acl
+    (the close/update half of S15): a tier added there belongs here too unless it is about
+    an existing row. Task 7's create apply uses this too."""
     site = sites.get_site(conn, site_id)
     if site is None:
         return False
@@ -923,7 +940,8 @@ def may_create_item_on_site(conn, caller, site_id):
 
 def _pack_view(conn, caller, pack):
     """The shaped GET body: S13 hiding, the target task numbers and S15 `applicable`."""
-    removed, topic_seen = _pack_removed_refs(conn, caller, pack)
+    vis = _ReaderVisibility(conn, caller)
+    removed = vis.removed_refs(pack)
     targets, applicable, live_ids = {}, {}, {}
     for a in action_pack_view.visible_actions(pack.get("actions"), removed):
         aid = str(a["id"])
@@ -932,8 +950,7 @@ def _pack_view(conn, caller, pack):
             live = action_items.get_live_by_stable_id(conn, a["target_stable_id"])
             if live is not None:
                 live_ids[aid] = str(live["id"])
-                targets[aid] = {"visible": _reader_sees_topic(conn, caller,
-                                                              live["topic_id"], topic_seen)}
+                targets[aid] = {"visible": vis.topic_visible(live["topic_id"])}
         ok_ = False
         if action_pack_view.applicable_candidate(a, pack):
             if a["type"] == "create_item":
@@ -958,7 +975,9 @@ def _pack_view(conn, caller, pack):
 
 def get_action_pack(conn, caller, pack_id):
     """GET /action-packs/{id}: reading, conclusion, actions (verifier label, state, refs,
-    applicable), sources (S13 applied). 404 for a pack this caller may not read."""
+    applicable), sources (S13 applied). 404 for a pack this caller may not read. Runs the
+    stale sweep first: this is the route the UI polls while a pack is queued/running."""
+    _sweep_stale_packs(conn)
     pack = action_packs.get_for_reader(conn, _pack_reader(conn, caller), pack_id)
     if pack is None:
         return error("not found", 404)
@@ -979,6 +998,40 @@ def export_action_pack(conn, caller, pack_id, event):
     return ok({"format": "md", "filename": f"action-pack-{pack_id}.md",
                "content_type": "text/markdown",
                "content": action_pack_view.render_markdown(view)})
+
+
+def get_pack_snapshot(conn, caller, pack_id, ref):
+    """GET /action-packs/{id}/sources/{ref}/snapshot -> {ref, url, fetched_at, text,
+    truncated}: the page text the run stored for a web source (spec §3.2, §10), read from
+    the lake bucket. Readers only; S13 applies; web sources only; the stored key must sit
+    under action_packs/<company_id>/<pack_id>/web/ (the source row is never trusted to point
+    elsewhere). At most SNAPSHOT_MAX_BYTES of text. A missing object is 404; any other S3
+    error is NOT caught (an AccessDenied must be a 500, never "no snapshot")."""
+    pack = action_packs.get_for_reader(conn, _pack_reader(conn, caller), pack_id)
+    if pack is None:
+        return error("not found", 404)
+    src = next((s for s in pack.get("sources") or [] if s.get("ref") == ref), None)
+    if src is None or src.get("provenance") != "web" or not src.get("snapshot_s3_key"):
+        return error("not found", 404)
+    if ref in _ReaderVisibility(conn, caller).removed_refs(pack):
+        return error("not found", 404)
+    key = src["snapshot_s3_key"]
+    if (not key.startswith(action_pack_view.snapshot_key_prefix(pack["company_id"], pack_id))
+            or ".." in key):
+        logger.warning("action pack snapshot key outside the pack prefix pack=%s ref=%s",
+                       pack_id, ref)
+        return error("not found", 404)
+    try:
+        obj = s3().get_object(Bucket=LAKE_BUCKET, Key=key)
+    except ClientError as exc:
+        if (exc.response.get("Error") or {}).get("Code") in ("NoSuchKey", "404"):
+            return error("snapshot not found", 404)
+        raise
+    raw = obj["Body"].read(action_pack_view.SNAPSHOT_MAX_BYTES + 1)
+    truncated = len(raw) > action_pack_view.SNAPSHOT_MAX_BYTES
+    text = raw[:action_pack_view.SNAPSHOT_MAX_BYTES].decode("utf-8", errors="ignore")
+    return ok({"ref": ref, "url": src.get("url"), "fetched_at": src.get("fetched_at"),
+               "text": text, "truncated": truncated})
 
 
 def cancel_action_pack(conn, caller, pack_id):
@@ -1035,7 +1088,7 @@ def dismiss_pack_action(conn, caller, pack_id, action_id, body):
         return error("not found", 404)
     if pack.get("archived_at") is not None:
         return error("pack is archived", 409)
-    removed, _ = _pack_removed_refs(conn, caller, pack)
+    removed = _ReaderVisibility(conn, caller).removed_refs(pack)
     if action_id not in {str(a["id"]) for a in
                          action_pack_view.visible_actions(pack.get("actions"), removed)}:
         return error("action not found", 404)
@@ -1082,6 +1135,10 @@ def _action_pack_claim(conn, pack_id, event):
         logger.info("action pack claim lost pack=%s", pack_id)
         return {"claimed": False}
     row = action_packs.get_for_worker(conn, pack_id)
+    if row is None:                     # claimed, but the creator row is gone: never run it
+        action_packs.fail(conn, pack_id, "internal")
+        logger.error("action pack claim without creator pack=%s", pack_id)
+        return {"claimed": False, "reason": "internal"}
     if tenancy_status.suppress_reason(conn, site_id=row["site_id"],
                                       where="action-pack-claim"):
         action_packs.fail(conn, pack_id, "company_inactive")
@@ -1098,8 +1155,8 @@ def _action_pack_claim(conn, pack_id, event):
 def _action_pack_heartbeat(conn, pack_id, event):
     """Refresh liveness (S9) and return the pack's state ('cancelled' = stop; null = no
     such pack). With `reading` and/or `title`, writes the plan first (set_plan, only while
-    running) so the UI can show the reading of a running pack. Send both together: a
-    missing one is written as null."""
+    running) so the UI can show the reading of a running pack. Only the fields sent are
+    written: the reading may come first and the title later."""
     reading, title = event.get("reading"), event.get("title")
     for name, value, cap in (("reading", reading, action_pack_view.READING_MAX_CHARS),
                              ("title", title, action_pack_view.TITLE_MAX_CHARS)):
@@ -1113,7 +1170,7 @@ def _action_pack_heartbeat(conn, pack_id, event):
 def _action_pack_store(conn, pack_id, event):
     """Store a finished run (running -> ready). {ok: true} | {error: payload_too_large} |
     {error: refused} (not running: cancelled, failed, swept, unknown) | {error: invalid,
-    detail: code}. A database CHECK/UNIQUE violation fails the pack ('internal') -- the
+    detail: code} -- a malformed shape (payload_shape_error) never reaches the database. A database CHECK/UNIQUE violation fails the pack ('internal') -- the
     repository leaves it running with no rows -- and answers invalid/constraint."""
     from psycopg import Error as _PgError
     payload = event.get("payload")
@@ -1121,8 +1178,16 @@ def _action_pack_store(conn, pack_id, event):
     if err is not None:
         logger.warning("action pack store rejected pack=%s %s", pack_id, err.get("error"))
         return err
+    shape = action_pack_view.payload_shape_error(payload)
+    if shape is not None:
+        logger.warning("action pack store invalid pack=%s detail=%s", pack_id, shape)
+        return {"error": "invalid", "detail": shape}
     try:
         outcome = action_packs.store_result(conn, pack_id, payload)
+    except (TypeError, AttributeError, KeyError) as exc:
+        # Backstop for a shape the check above does not know: never a FunctionError.
+        logger.warning("action pack store invalid pack=%s (%s)", pack_id, type(exc).__name__)
+        return {"error": "invalid", "detail": "invalid_payload"}
     except ValueError as exc:
         detail = action_pack_view.invalid_detail(str(exc))
         logger.warning("action pack store invalid pack=%s detail=%s", pack_id, detail)
@@ -8300,7 +8365,9 @@ def _action_item_edit_acl(conn, caller, action_item_id):
     The one definition of "may edit a task", shared by PATCH /action-items/{id} and the
     status-suggestion decision (which has no PATCH of its own to ride on when dismissing):
     tenant, the caller's site reach, then admin/gm, this site's pm/site_manager, or the
-    current assignee."""
+    current assignee. Action packs' S15 `applicable` flag calls this for close/update, and
+    may_create_item_on_site mirrors it (minus the assignee tier) for create_item: change
+    the tiers in both."""
     row = action_items.get_action_item(conn, action_item_id)
     # platform_admin (is_cross_company) edits across every tenant; company roles
     # stay pinned to their own company (mirrors the Team/sites fix in #96).

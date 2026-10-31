@@ -235,9 +235,12 @@ def cancel(conn, pack_id) -> bool:
 def set_plan(conn, pack_id, reading, title) -> bool:
     """The Plan stage's reading (G1) and title (S16), written while the run is still going
     so the UI can show the reading of a running pack (§10). Only while `running`; False
-    otherwise (cancelled / failed / missing). store_result writes both again at the end."""
+    otherwise (cancelled / failed / missing). store_result writes both again at the end.
+    A None argument leaves that field as it is (the worker may send the reading first and
+    the title later), so neither call can erase the other's value."""
     row = conn.execute(
-        "UPDATE action_packs SET reading=%s, title=%s, updated_at=now() "
+        "UPDATE action_packs SET reading=COALESCE(%s, reading), title=COALESCE(%s, title), "
+        "updated_at=now() "
         "WHERE id=%s AND state='running' RETURNING id",
         (reading, title, pack_id)).fetchone()
     return row is not None

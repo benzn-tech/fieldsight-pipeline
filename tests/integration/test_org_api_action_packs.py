@@ -28,9 +28,17 @@ DAY = "2026-10-30"
 class FakeS3:
     def __init__(self):
         self.puts = []
+        self.objs = {}
 
     def put_object(self, Bucket, Key, Body, ContentType=None):
         self.puts.append((Key, Body))
+
+    def get_object(self, Bucket, Key):
+        import io
+        from botocore.exceptions import ClientError
+        if (Bucket, Key) not in self.objs:
+            raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "x"}}, "GetObject")
+        return {"Body": io.BytesIO(self.objs[(Bucket, Key)])}
 
 
 @pytest.fixture
@@ -42,6 +50,7 @@ def env(db, monkeypatch):
     fake = FakeS3()
     monkeypatch.setattr(org, "s3", lambda: fake)
     monkeypatch.setattr(org, "S3_BUCKET", "data-bucket")
+    monkeypatch.setattr(org, "LAKE_BUCKET", "lake-bucket")
     return fake
 
 
@@ -364,8 +373,8 @@ def test_s15_applicable_and_target_task_numbers(db, env):
     got = flags(creator)
     assert got[1]["applicable"] is True and got[5]["applicable"] is False
     # The creator's reach (SELF) does not include the unattributed topic: the run's copy of
-    # the target is withheld from them even though the action itself is shown.
-    assert got[1]["target_snapshot"] is None
+    # the target, and its task number, are withheld even though the action itself is shown.
+    assert got[1]["target_snapshot"] is None and got[1]["target_task_no"] is None
     # A dismissed action, and an archived pack, are not applicable.
     aid1 = got[1]["id"]
     _call(db, pm, "POST", f"/action-packs/{pid}/actions/{aid1}/dismiss", {})
@@ -463,3 +472,81 @@ def test_heartbeat_store_and_fail_tasks(db, env):
         "error": "invalid", "detail": "unknown_keys"}
     p3 = ap.create_queued(db, site_id=site["id"], created_by=creator["id"], instruction="z")
     assert org._action_pack_fail(db, str(p3["id"]), {"reason": "budget"}) == {"ok": True}
+
+
+# ---------------------------------------------------------------- fix round 1
+
+def test_heartbeat_plan_fields_do_not_erase_each_other(db, env):
+    _, site, _, creator = _world(db)
+    pack = ap.create_queued(db, site_id=site["id"], created_by=creator["id"], instruction="x")
+    pid = str(pack["id"])
+    ap.claim(db, pid)
+    assert org._action_pack_heartbeat(db, pid, {"reading": "R first"}) == {"state": "running"}
+    assert org._action_pack_heartbeat(db, pid, {"title": "T later"}) == {"state": "running"}
+    assert org._action_pack_heartbeat(db, pid, {}) == {"state": "running"}
+    assert db.execute("SELECT reading, title FROM action_packs WHERE id=%s",
+                      (pid,)).fetchone() == ("R first", "T later")
+
+
+def test_store_malformed_shape_never_reaches_the_database(db, env):
+    _, site, _, creator = _world(db)
+    pack = ap.create_queued(db, site_id=site["id"], created_by=creator["id"], instruction="x")
+    pid = str(pack["id"])
+    ap.claim(db, pid)
+    for bad in ({"sources": "R1"}, {"actions": [{"seq": "1"}]},
+                {"sources": [{"ref": "R1", "kind": "topic", "provenance": "records",
+                              "topic_id": "nope"}]}):
+        assert org._action_pack_store(db, pid, {"payload": bad})["error"] == "invalid"
+    assert db.execute("SELECT state FROM action_packs WHERE id=%s",
+                      (pid,)).fetchone()[0] == "running"
+    assert db.execute("SELECT count(*) FROM action_pack_sources WHERE pack_id=%s",
+                      (pid,)).fetchone()[0] == 0
+
+
+def _stale(db, site, creator):
+    pack = ap.create_queued(db, site_id=site["id"], created_by=creator["id"], instruction="x")
+    ap.claim(db, pack["id"])
+    db.execute("UPDATE action_packs SET heartbeat_at = now() - interval '21 minutes' "
+               "WHERE id=%s", (pack["id"],))
+    return str(pack["id"])
+
+
+def test_get_one_fails_a_dead_run(db, env):
+    _, site, _, creator = _world(db)
+    pid = _stale(db, site, creator)
+    status, body = _call(db, creator, "GET", f"/action-packs/{pid}")
+    assert status == 200 and (body["state"], body["failure"]) == ("failed", "internal")
+
+
+def test_a_dead_run_does_not_block_create(db, env):
+    _, site, _, creator = _world(db)
+    pid = _stale(db, site, creator)
+    status, body = _call(db, creator, "POST", "/action-packs", {"instruction": "again"})
+    assert status == 202 and body["id"] != pid
+    assert db.execute("SELECT state FROM action_packs WHERE id=%s",
+                      (pid,)).fetchone()[0] == "failed"
+
+
+def test_snapshot_viewer_reads_the_lake_for_readers_only(db, env):
+    co, site, _, creator = _world(db)
+    outsider = _user(db, co, "worker")
+    pack = ap.create_queued(db, site_id=site["id"], created_by=creator["id"], instruction="x")
+    pid = str(pack["id"])
+    key = f"action_packs/{co['id']}/{pid}/web/W1.txt"
+    ap.claim(db, pid)
+    assert ap.store_result(db, pid, {"sources": [
+        {"ref": "W1", "kind": "web_source", "provenance": "web", "url": "https://e.x/a",
+         "fetched_at": "2026-11-01T00:00:00+00:00", "snapshot_s3_key": key},
+        {"ref": "R1", "kind": "topic", "provenance": "records",
+         "topic_id": str(uuid.uuid4())}]}) == "ok"
+    env.objs[("lake-bucket", key)] = "page text \u2014 stored".encode("utf-8")
+    status, body = _call(db, creator, "GET", f"/action-packs/{pid}/sources/W1/snapshot")
+    assert status == 200
+    assert body == {"ref": "W1", "url": "https://e.x/a", "fetched_at": body["fetched_at"],
+                    "text": "page text \u2014 stored", "truncated": False}
+    assert body["fetched_at"].startswith("2026-11-01")
+    assert _call(db, outsider, "GET", f"/action-packs/{pid}/sources/W1/snapshot")[0] == 404
+    assert _call(db, creator, "GET", f"/action-packs/{pid}/sources/R1/snapshot")[0] == 404
+    env.objs.clear()
+    assert _call(db, creator, "GET", f"/action-packs/{pid}/sources/W1/snapshot") == (
+        404, {"error": "snapshot not found"})
