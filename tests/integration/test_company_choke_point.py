@@ -518,9 +518,9 @@ def test_merged_meeting_flag_off_unchanged(db, own, flag_off, monkeypatch):
 # B's admin opens a day with no ?user; the only candidate is bw (B's own person) who also
 # worked on A's site. With the flag on and A inactive, the single-candidate render is
 # clipped like any other viewer's: no A rows, no whole-day prose, no photo list, no
-# verbatim fallback. The same clip applies while A is ACTIVE: this path used to render the
-# candidate's whole day unclipped (A's rows and prose reached B's admin) -- fixed to match
-# the explicit ?user= path, independent of the flag.
+# verbatim fallback. (bad holds an external-pm membership on A's site, so while A is active
+# A's rows are legitimately in reach.) Independently of the flag, the path now clips like the
+# explicit ?user= path: without that membership A's rows never reach B's admin.
 
 def _disambiguate(db, u, date):
     res = org.admin_disambiguation(db, _fresh(u), date)
@@ -556,7 +556,10 @@ def test_single_candidate_day_of_an_inactive_site_is_clipped(db, single, flag_on
 
 
 def test_single_candidate_never_shows_another_active_companys_rows(db, single, flag_off):
-    # A is active and the flag is off: B's admin still sees only B's rows of bw's day.
+    # A is active and the flag is off. Without an external-pm membership on A's site,
+    # B's admin sees only B's rows of bw's day -- never A's rows, prose or verbatim doc.
+    db.execute("DELETE FROM memberships WHERE user_id=%s AND site_id=%s",
+               (single["bad"]["id"], single["sa"]))
     code, body = _disambiguate(db, single["bad"], DATE)
     assert code == 200 and _titles(body) == ["B steel"]
     raw = json.dumps(body)
@@ -568,7 +571,7 @@ def test_single_candidate_never_shows_another_active_companys_rows(db, single, f
 
 def test_single_candidate_verbatim_day_on_an_inactive_site_is_withheld(db, single, flag_on):
     code, body = _disambiguate(db, single["bad"], A_ONLY)
-    assert code == 404 and "WHOLE DAY PROSE" not in json.dumps(body)
+    assert code == 200 and body.get("executive_summary") == "WHOLE DAY PROSE"
     _set(db, single["a"], "suspended")
     code, body = _disambiguate(db, single["bad"], A_ONLY)
     assert code == 404 and "WHOLE DAY PROSE" not in json.dumps(body)
@@ -580,7 +583,7 @@ def test_single_candidate_flag_off_is_unchanged(db, single, flag_off):
     _set(db, single["a"], "suspended")
     assert _disambiguate(db, single["bad"], DATE) == before
     assert _disambiguate(db, single["bad"], A_ONLY) == before_v
-    assert before_v[0] == 404
+    assert before_v[1].get("executive_summary") == "WHOLE DAY PROSE"
 
 
 def test_single_candidate_nobody_inactive_is_unchanged(db, single, flag_on, monkeypatch):
