@@ -555,9 +555,9 @@ Until it ships, instructions name items by text, and the planner turns text into
 **D2. Agent-created todos appear in Tasks *and* in the day view** of the date they
 were applied, with an "Agent" source badge.
 - Timeline rows carry `topics.source`.
-- The live/nightly label must not call `agent://` topics nightly. *(Unverified:
-  there is no `is_live` symbol in `src/`. The builder finds where the timeline
-  derives its live/nightly label.)*
+- The live/nightly label must not call `agent://` topics nightly. The label is
+  `t["is_live"]` in `src/repositories/topics.py:774` (`source_s3_key` starts with
+  `extractions/`), so an `agent://` topic currently reads as nightly.
 - No logic that hides cards.
 
 This reverses the rev 1 default (§12 Q3). **[owner-level, main agent]**
@@ -604,8 +604,10 @@ even as `weak`. **[owner-level, main agent]**
   agent-created todo.
 - It applies the caller's author filter exactly as Ask does (`_author_filter` in
   org-api, verified at `src/lambda_org_api.py:8885`).
-- The review named `_ask_tools_where`, but no symbol by that name exists. The
-  builder mirrors the where-clause that `ask_tools`' rag-search path applies.
+- The Ask tools' scoping is `_ask_tools_where` (`src/repositories/topics.py:1340`).
+  Its source clause admits only `extractions/%` (and `reports/%` without an
+  extraction), so the items tool must add `OR t.source = 'agent'` rather than
+  reuse it unchanged.
 
 **S5. Web query isolation** (tightens §6).
 - Web queries are generated in the **Plan** stage, before any record evidence is
@@ -701,6 +703,4 @@ shows an Apply button that would be refused.
 
 ### 14.3 Unverified at rev 2
 
-- No `_ask_tools_where` symbol (S4).
-- No `is_live` symbol (D2).
 - `src/tenancy_status.py` is not on develop yet (D5).

@@ -48,7 +48,7 @@ flag off, behaviour must match today exactly.
 - Integration test: a superseded pass that shares the `stable_id` is never returned.
 
 ### Task 3: timeline and Tasks carry `topics.source` (D2)
-- Find where timeline rows get their live/nightly label. No `is_live` symbol exists, so search for the label source first.
+- The live/nightly label is `t["is_live"]` in `src/repositories/topics.py:774`; make it false-but-not-nightly for `source='agent'` (badge instead).
 - Add `source` to timeline and Tasks rows.
 - An `agent://` topic is labelled "agent", never nightly.
 - Test: an agent topic's row carries `source='agent'`, and the label is not nightly.
@@ -136,7 +136,7 @@ flag off, behaviour must match today exactly.
 ### Task 8: rag-search `items` mode (S4)
 - **Read-only.** Returns `stable_id`, `task_no`, text, status, deadline, responsible, updated_at, site, `source`.
 - **Includes** `source='agent'` topics.
-- **Scope:** applies the same site/author scoping as `ask_tools`' rag-search path. `_ask_tools_where` was not found, so mirror the actual where-clause and `_author_filter`.
+- **Scope:** applies the same site/author scoping as `ask_tools`' rag-search path. Start from `_ask_tools_where` (`src/repositories/topics.py:1340`) and add `OR t.source = 'agent'` to its source clause.
 - **Filters:** `site_id`, status set, text query, `task_no`.
 - **Tests:** an integration ACL matrix, including an external member and an author-filtered role.
 
@@ -262,6 +262,4 @@ Write `docs/handoffs/2026-11-01-action-packs-ui.md` covering:
 - Task 15 can start once Task 6's response shapes are fixed.
 
 ## Unverified at plan time
-- `_ask_tools_where` was not found (S4).
-- No `is_live` symbol exists (Task 3 starts by finding the label source).
 - `src/tenancy_status.py` is not on develop yet (D5).
