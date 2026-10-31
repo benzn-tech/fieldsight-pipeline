@@ -544,3 +544,38 @@ def test_model_settings_fall_back_to_the_existing_ask_settings(monkeypatch):
     assert agent.token_cap() == 1234
     monkeypatch.setenv("ACTION_TOKEN_CAP", "nonsense")
     assert agent.token_cap() == agent.DEFAULT_TOKEN_CAP
+
+
+# ---- fix round 1 ---------------------------------------------------------------------
+
+def test_a_request_read_error_is_a_per_record_outcome_not_a_crash(env, monkeypatch):
+    """A 403/5xx on the request object must not escape lambda_handler (it would abort the
+    other records in the event, and with retries 0 nothing would say so)."""
+    s3 = _s3_with_request()
+    s3.forbidden.add(_key())
+    lam = FakeOrgApi(claim=lambda ev: _claimed(ev["pack_id"]))
+    assert _run(_key(), s3, lam, lambda ctx: pytest.fail("ran")) == "request_error"
+    assert lam.invocations == []
+    other = "11111111-2222-4333-8444-000000000000"
+    s3.objects[("data-bkt", _key(other))] = _request(other)
+    monkeypatch.setattr(agent, "_s3", lambda: s3)
+    monkeypatch.setattr(agent, "_lambda", lambda: lam)
+    monkeypatch.setattr(agent, "run_stages", lambda ctx: dict(GOOD_PAYLOAD))
+    out = agent.lambda_handler(_event(_key(), _key(other)), None)
+    assert out == {"ok": True, "outcomes": ["request_error", "stored"]}
+
+
+def test_ctx_gives_each_stage_its_deadline_and_the_time_left(env):
+    clock, seen = Clock(1000.0), []
+    _run(_key(), _s3_with_request(), FakeOrgApi(),
+         lambda ctx: seen.append(ctx) or dict(GOOD_PAYLOAD), clock=clock, remaining_s=899.0)
+    ctx = seen[0]
+    assert ctx.deadline_for("gather") == 1420.0
+    assert ctx.deadline_for("write") == 1510.0
+    assert ctx.deadline_for("verify") == 1600.0
+    clock.t = 1500.0
+    assert ctx.left("gather") == 0.0
+    assert ctx.left("write") == 10.0
+    assert ctx.left() == 100.0
+    with pytest.raises(ValueError):
+        ctx.deadline_for("plan")

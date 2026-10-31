@@ -304,12 +304,29 @@ fi
 # prefixes of each other and no rule matches .txt, so there is no BUG-13 loop; the prefix
 # is disjoint from every other wired prefix (tests/unit/test_search_index_wiring.py).
 # ActionAgentFunction is conditional (HasOrgApi), hence the fn_exists guard.
+#
+# Prod wiring is an OWNER step (spec D3), so this rule is ADDED only on test, or when the
+# caller sets WIRE_ACTION_AGENT=true. Anywhere else it is KEPT: an fs-action-agent rule
+# already on the bucket (the owner wired it once) is carried over unchanged below, because
+# the merge replaces every fs-* entry and a later prod deploy without the variable would
+# otherwise silently unwire it. Prod's owner command:
+#   WIRE_ACTION_AGENT=true bash scripts/wire-s3-events.sh fieldsight-data-509194952652 prod ap-southeast-2 --apply
+# If the function is gone the rule is dropped (S3 refuses a config naming a missing fn).
+action_agent_mode() {  # <stage> -> add | keep
+  if [ "$1" = "test" ] || [ "${WIRE_ACTION_AGENT:-}" = "true" ]; then echo add; else echo keep; fi
+}
+ACTION_AGENT_MODE=skip
 if fn_exists "${PREFIX}-action-agent"; then
-  WIRE_FNS+=("${PREFIX}-action-agent")
-  DESIRED=$(jq -c --arg arn "$ACTION_AGENT_ARN" '. + [
+  ACTION_AGENT_MODE="$(action_agent_mode "$STAGE")"
+  if [ "$ACTION_AGENT_MODE" = "add" ]; then
+    WIRE_FNS+=("${PREFIX}-action-agent")
+    DESIRED=$(jq -c --arg arn "$ACTION_AGENT_ARN" '. + [
     {"Id":"fs-action-agent","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
      "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"action_pack_requests/"},{"Name":"suffix","Value":".json"}]}}}
   ]' <<<"$DESIRED")
+  else
+    echo "NOTE: ${PREFIX}-action-agent not added on ${STAGE} (owner step: WIRE_ACTION_AGENT=true); an existing fs-action-agent rule is kept"
+  fi
 else
   echo "NOTE: ${PREFIX}-action-agent not deployed — skipping action-agent trigger"
 fi
@@ -317,6 +334,13 @@ fi
 CURRENT=$(aws s3api get-bucket-notification-configuration --bucket "$BUCKET" --output json 2>/dev/null || echo '{}')
 # A bucket with NO notification config returns EMPTY stdout (success) — not JSON.
 [ -n "$CURRENT" ] || CURRENT='{}'
+
+# Carry an owner-wired fs-action-agent rule over (see the action-agent NOTE above).
+if [ "$ACTION_AGENT_MODE" = "keep" ]; then
+  DESIRED=$(jq -c --argjson cur "$CURRENT" \
+    '. + [($cur.LambdaFunctionConfigurations // [])[] | select(.Id == "fs-action-agent")]' \
+    <<<"$DESIRED")
+fi
 
 # Keep every non-"fs-" lambda config + all SNS/SQS/EventBridge entries; replace our fs-* set.
 # RETIRE_IDS: comma-separated non-"fs-" notification Ids to DROP in this same

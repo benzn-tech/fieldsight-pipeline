@@ -2699,10 +2699,13 @@ Resources:
           # Per-run token cap (§4.2 cost guard): over it the run stores what is verified
           # as a partial pack (run_trace.truncated).
           ACTION_TOKEN_CAP: '400000'
-          # 900 Timeout - 60 store reserve (lambda_action_agent.STORE_RESERVE_S) = 840;
-          # 780 keeps a further 60 s so a chain started late in the run still ends with
-          # time for the final checkpoint, the store invoke and the fail invoke. The run's
-          # own target (600 s, S8) is far inside it.
+          # A backstop only. llm_utils measures this from the start of EACH call's
+          # fallback chain, not from the Lambda's start, so it bounds a single call that
+          # was given no deadline (780 < 900 Timeout - 60 store reserve) and says nothing
+          # about a call started late in the run. The real guard is in the code: every
+          # model call is given the run's remaining stage budget (ctx.left(stage) /
+          # ctx.deadline_for(stage) in lambda_action_agent), inside a 600 s target that
+          # keeps STORE_RESERVE_S for the store.
           LLM_CHAIN_BUDGET_SECONDS: '780'
           # One model attempt; a write or verify call gets 90 s (S8), so 300 is a ceiling,
           # not a plan -- the stages pass their own deadlines.
@@ -2761,7 +2764,8 @@ Resources:
               Resource: !Sub 'arn:aws:s3:::${DataBucketName}'
               Condition:
                 StringLike:
-                  s3:prefix: ['action_pack_requests/*']
+                  s3:prefix:
+                    - action_pack_requests/*
         # Web snapshots (Task 9): action_packs/<company>/<pack>/web/<ref>.txt on the lake.
         # org-api's store task records them in the lake ownership index.
         - Version: '2012-10-17'

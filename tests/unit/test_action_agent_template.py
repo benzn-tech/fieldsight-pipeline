@@ -10,6 +10,8 @@ import io
 import json
 import os
 import re
+import shutil
+import subprocess
 
 import pytest
 
@@ -85,15 +87,21 @@ def test_shape(fn):
     assert "action-agent" in json.dumps(p["FunctionName"])
 
 
-def test_the_chain_budget_leaves_the_store_reserve(fn):
+def test_the_chain_backstop_and_the_run_window_fit_the_timeout(fn):
+    """What this pins, and what it does not: LLM_CHAIN_BUDGET_SECONDS is measured per call
+    from that call's start (llm_utils), so `chain < Timeout - store reserve` only bounds ONE
+    call made without a deadline. A call started late is kept inside the Lambda by the
+    deadline every stage passes (ctx.left / ctx.deadline_for, pinned in
+    test_action_agent_handler), and that window itself must leave the store reserve."""
     import lambda_action_agent as agent
     env = _env(fn)
+    timeout = _props(fn)["Timeout"]
     chain = int(env["LLM_CHAIN_BUDGET_SECONDS"])
     assert chain == 780
-    assert chain < _props(fn)["Timeout"] - agent.STORE_RESERVE_S
-    # one model attempt never outlives the chain, nor the run's target window
-    assert int(env["LLM_HTTP_TIMEOUT"]) < chain
-    assert agent.TARGET_S + agent.STORE_RESERVE_S < _props(fn)["Timeout"]
+    assert chain < timeout - agent.STORE_RESERVE_S          # a no-deadline call, alone
+    assert int(env["LLM_HTTP_TIMEOUT"]) < chain              # one attempt < its chain
+    # the stage deadlines all end by TARGET_S after the claim, before the store reserve
+    assert agent.TARGET_S + agent.STORE_RESERVE_S < timeout
 
 
 def test_env_names_the_switch_the_models_the_hops_and_the_buckets(fn):
@@ -227,3 +235,137 @@ def test_test_deploy_applies_the_wiring_and_prod_keeps_its_gate():
                      test, re.M)
     prod = open(WORKFLOWS["PROD"], encoding="utf-8").read()
     assert 'if [ "${{ vars.PROD_WIRE_LAKE }}" = "true" ]; then' in prod
+    # deploy-prod never opts in: prod wiring is the owner's step (spec D3)
+    assert "WIRE_ACTION_AGENT" not in prod
+
+
+# ---- prod wiring is an owner step (spec D3; fix round 1) --------------------------------
+
+_BASH = shutil.which("bash")
+
+
+def _bash_works():
+    if not _BASH:
+        return False
+    try:
+        return subprocess.run([_BASH, "-c", "echo ok"], capture_output=True, text=True,
+                              timeout=20).stdout.strip() == "ok"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+needs_bash = pytest.mark.skipif(not _bash_works(), reason="no working bash")
+# The whole-script runs need jq (the script's JSON tool). CI's ubuntu runner has it; a
+# Windows box without it skips them -- the mode decision above still runs there.
+needs_jq = pytest.mark.skipif(not (_bash_works() and shutil.which("jq")), reason="no jq")
+
+
+def _mode_function():
+    text = open(WIRE, encoding="utf-8").read()
+    m = re.search(r"^action_agent_mode\(\) \{.*?^\}\n", text, re.S | re.M)
+    assert m, "the decision is a named function so it can be tested alone"
+    return m.group(0)
+
+
+@needs_bash
+@pytest.mark.parametrize("stage, var, expected", [
+    ("test", "", "add"), ("test", "false", "add"), ("test", "true", "add"),
+    ("prod", "", "keep"), ("prod", "false", "keep"), ("prod", "TRUE", "keep"),
+    ("prod", "true", "add"),
+])
+def test_only_test_or_an_explicit_opt_in_adds_the_rule(stage, var, expected):
+    env = {k: v for k, v in os.environ.items() if k != "WIRE_ACTION_AGENT"}
+    if var:
+        env["WIRE_ACTION_AGENT"] = var
+    out = subprocess.run([_BASH, "-c", _mode_function() + f'action_agent_mode "{stage}"'],
+                         capture_output=True, text=True, env=env, timeout=20)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == expected
+
+
+_FAKE_AWS = r"""#!/usr/bin/env bash
+case "$1 $2" in
+  "sts get-caller-identity") echo 123456789012 ;;
+  "lambda get-function")
+    for f in $FAKE_FNS; do [ "$4" = "$f" ] && exit 0; done; exit 254 ;;
+  "s3api get-bucket-notification-configuration") cat "$FAKE_CURRENT" ;;
+  "lambda add-permission") echo "$4" >> "$FAKE_PERMS" ;;
+  "s3api put-bucket-notification-configuration")
+    while [ $# -gt 0 ]; do
+      if [ "$1" = "--notification-configuration" ]; then printf '%s' "$2" > "$FAKE_OUT"; fi
+      shift
+    done ;;
+  *) echo "unexpected aws $*" >&2; exit 99 ;;
+esac
+"""
+
+OWNER_RULE = {"Id": "fs-action-agent",
+              "LambdaFunctionArn": "arn:aws:lambda:r:1:function:fieldsight-prod-action-agent",
+              "Events": ["s3:ObjectCreated:*"],
+              "Filter": {"Key": {"FilterRules": [
+                  {"Name": "prefix", "Value": "action_pack_requests/"},
+                  {"Name": "suffix", "Value": ".json"}]}}}
+
+
+def _run_wire(tmp_path, stage, *, current=None, fns=("action-agent",), opt_in=None):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    aws = bindir / "aws"
+    aws.write_text(_FAKE_AWS, encoding="utf-8", newline="\n")
+    aws.chmod(0o755)
+    cur = tmp_path / "current.json"
+    cur.write_text(json.dumps(current or {}), encoding="utf-8")
+    out, perms = tmp_path / "out.json", tmp_path / "perms.txt"
+    perms.write_text("", encoding="utf-8")
+    prefix = f"fieldsight-{stage}"
+    env = {k: v for k, v in os.environ.items() if k not in ("WIRE_ACTION_AGENT", "RETIRE_IDS")}
+    env.update(PATH=f"{bindir}{os.pathsep}{env.get('PATH', '')}", FAKE_CURRENT=str(cur),
+               FAKE_OUT=str(out), FAKE_PERMS=str(perms),
+               FAKE_FNS=" ".join(f"{prefix}-{f}" for f in fns))
+    if opt_in is not None:
+        env["WIRE_ACTION_AGENT"] = opt_in
+    res = subprocess.run([_BASH, WIRE, "bkt", stage, "r", "--apply"], capture_output=True,
+                         text=True, env=env, timeout=60)
+    assert res.returncode == 0, res.stdout + res.stderr
+    cfg = json.loads(out.read_text(encoding="utf-8"))
+    rules = {r["Id"]: r for r in cfg.get("LambdaFunctionConfigurations", [])}
+    return rules, perms.read_text(encoding="utf-8").split()
+
+
+@needs_jq
+def test_test_stage_wires_the_agent(tmp_path):
+    rules, perms = _run_wire(tmp_path, "test")
+    assert rules["fs-action-agent"]["LambdaFunctionArn"].endswith(
+        ":function:fieldsight-test-action-agent")
+    assert "fieldsight-test-action-agent" in perms
+
+
+@needs_jq
+def test_prod_without_the_opt_in_does_not_add_it(tmp_path):
+    rules, perms = _run_wire(tmp_path, "prod")
+    assert "fs-action-agent" not in rules
+    assert "fieldsight-prod-action-agent" not in perms
+
+
+@needs_jq
+def test_prod_without_the_opt_in_keeps_an_owner_wired_rule(tmp_path):
+    current = {"LambdaFunctionConfigurations": [OWNER_RULE, {
+        "Id": "fs-vad-wav", "LambdaFunctionArn": "x", "Events": ["s3:ObjectCreated:*"]}]}
+    rules, _ = _run_wire(tmp_path, "prod", current=current)
+    assert rules["fs-action-agent"] == OWNER_RULE
+    assert "fs-vad-wav" not in rules          # the rest of fs-* is still replaced as before
+
+
+@needs_jq
+def test_prod_with_the_opt_in_adds_it(tmp_path):
+    rules, perms = _run_wire(tmp_path, "prod", opt_in="true")
+    assert rules["fs-action-agent"]["LambdaFunctionArn"].endswith(
+        ":function:fieldsight-prod-action-agent")
+    assert "fieldsight-prod-action-agent" in perms
+
+
+@needs_jq
+def test_a_kept_rule_is_dropped_once_the_function_is_gone(tmp_path):
+    rules, _ = _run_wire(tmp_path, "prod", current={"LambdaFunctionConfigurations": [OWNER_RULE]},
+                         fns=())
+    assert "fs-action-agent" not in rules

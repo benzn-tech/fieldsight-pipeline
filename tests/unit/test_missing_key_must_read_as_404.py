@@ -112,6 +112,12 @@ MISSING_KEY_IS_NORMAL = [
      "_read_brief polls for the concurrently-requested brief; 'not written yet' "
      "must read as NoSuchKey, not AccessDenied, or every final email silently "
      "falls back to the request's own rows"),
+    # Action packs (spec 2026-11-01 §14 S1): the worker probes the cancel marker
+    # action_pack_requests/<pack>.cancel at every checkpoint, and it is absent on almost
+    # every probe. Without ListBucket that is AccessDenied, which the worker (rightly)
+    # treats as an IAM fault -- every run would fail `internal` at its first checkpoint.
+    ("ActionAgentFunction", "action_pack_requests/*",
+     "the cancel-marker probe: 'not cancelled' must read as 404, not AccessDenied"),
 ]
 
 

@@ -47,7 +47,14 @@ _MISSING_CODES = ("NoSuchKey", "404", "NotFound")
 # the write and verify stages each keep a fixed reserve at the end of that window, and the
 # tool rounds get what is left. STORE_RESERVE_S is never handed to the stages: it is the
 # Lambda time kept for the final checkpoint, the store invoke and, on failure, the fail
-# invoke. LLM_CHAIN_BUDGET_SECONDS on the function (780) is below Timeout 900 minus it.
+# invoke.
+#
+# What actually keeps a model call inside this window is the DEADLINE each call is given:
+# every stage passes `ctx.left(stage)` (llm_utils.call_llm, seconds from now) or
+# `ctx.deadline_for(stage)` (llm_tools_client.chat, absolute monotonic). The function's
+# LLM_CHAIN_BUDGET_SECONDS (780) is only a backstop: llm_utils measures it from the start of
+# EACH call's fallback chain, not from the Lambda's start, so it bounds one call that was
+# given no deadline -- it guarantees nothing about a call started late in the run.
 TARGET_S = 600.0
 WRITE_RESERVE_S = 90.0
 VERIFY_RESERVE_S = 90.0
@@ -180,6 +187,20 @@ class RunContext:
     budget: Budget
     checkpoint: Callable = field(repr=False, default=None)
     clock: Callable[[], float] = time.monotonic
+
+    def deadline_for(self, stage: str) -> float:
+        """The absolute deadline (on `clock`) of a stage: 'gather' (tool rounds), 'write'
+        or 'verify'. Pass it as llm_tools_client.chat(deadline=...)."""
+        try:
+            return {"gather": self.budget.gather_deadline, "write": self.budget.write_deadline,
+                    "verify": self.budget.verify_deadline}[stage]
+        except KeyError:
+            raise ValueError(f"unknown stage {stage!r}") from None
+
+    def left(self, stage: str = "verify") -> float:
+        """Seconds left before the stage's deadline (>= 0). Pass it as
+        llm_utils.call_llm(deadline=...) -- every model call must get one (see TARGET_S)."""
+        return self.budget.left(self.deadline_for(stage))
 
 
 def run_stages(ctx: RunContext) -> dict:
@@ -321,7 +342,8 @@ def _fail(lambda_client, org_fn, pack_id, reason) -> str:
 def process_key(key, *, s3, lambda_client, clock=time.monotonic, remaining_s=900.0,
                 stage_runner=None) -> str:
     """Run one request object. Returns an outcome code (for the handler's answer and the
-    tests): disabled | ignored | no_request | bad_request | claim_error | lost | stored |
+    tests): disabled | ignored | no_request | request_error | bad_request | claim_error |
+    lost | stored |
     refused | cancelled | failed:<reason>. `remaining_s` is the Lambda time left, measured
     at `clock()` now."""
     if not action_pack_view.enabled():
@@ -333,7 +355,12 @@ def process_key(key, *, s3, lambda_client, clock=time.monotonic, remaining_s=900
     bucket = os.environ.get("S3_BUCKET", "")
     org_fn = os.environ.get("ORG_API_FUNCTION", "")
 
-    request = _read_request(s3, bucket, key)
+    try:
+        request = _read_request(s3, bucket, key)
+    except Exception as exc:  # noqa: BLE001 -- 403/5xx: an IAM or S3 fault, never a crash
+        logger.error("action agent request read failed pack=%s code=%s (%s)", pack_id,
+                     _error_code(exc) or "-", type(exc).__name__)
+        return "request_error"
     if request is None:
         logger.warning("action agent request missing pack=%s", pack_id)
         return "no_request"
