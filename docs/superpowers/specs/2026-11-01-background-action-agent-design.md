@@ -1,6 +1,8 @@
 # Background action agent ("action packs") — design
 
-Date: 2026-11-01. Status: draft for review (Fable builder check, then a plan).
+Date: 2026-11-01. Status: rev 2 (Fable builder check folded in; plan: docs/superpowers/plans/2026-11-01-background-action-agent.md).
+
+**Rev 2 overrides:** §14 lists every change from the builder review. Where §14 and an earlier section disagree, §14 wins.
 Owner intent (2026-10-24/25 brainstorm, owner's words in brackets):
 
 - One instruction, then everything runs in the background. No back-and-forth, no
@@ -212,12 +214,8 @@ That relaxes a constraint dozens of queries rely on.
 ### 3.5 Retention and deletion
 
 Packs are kept, and the user can archive them.
-- **User deletion:** packs follow the existing deletion design (0041). A deleted
-  user's packs keep their content, and `created_by` is anonymised the same way topics
-  are.
-- **Redactions** (0022): a pack's excerpts are copies. **My call:** the redaction path
-  also redacts matching `action_pack_sources.excerpt` rows. Otherwise a redacted
-  sentence survives inside an archived pack. This is the "frozen copies leak" lesson.
+- **Deletion and redaction:** replaced by §14 S13. Packs are not rewritten; at read
+  time, sources whose records are deleted, redacted or no longer visible are hidden.
 
 ---
 
@@ -515,12 +513,9 @@ UI requirements:
 
 ## 12. Owner questions (short)
 
-1. **Who may read a pack** besides its creator and admins? Default: site
-   pm/site_manager.
+1. *(Resolved, rev 2: §14 D4.)*
 2. **Thresholds** in §8: tighten them?
-3. **Should a pack also post an "added by agent" topic into the day view**, or only
-   into Tasks? Default: Tasks and the item's history only; the synthetic topic is
-   hidden from day views.
+3. *(Resolved, rev 2: §14 D2. Agent todos show in Tasks and in the day view.)*
 
 ## 13. Left to the builder
 
@@ -532,3 +527,180 @@ UI requirements:
   browser).
 - Export rendering. Reuse the report section module library where it fits.
 - Migration number and index choices.
+
+---
+
+## 14. Revision 2: builder review (Fable) and owner-level decisions
+
+Every finding was checked against origin/develop on 2026-11-01. Anchors that could
+not be found are marked unverified. Where this section disagrees with §1–§13, **this
+section wins**.
+
+### 14.1 Owner-level decisions
+
+The main agent made these under the owner's standing instruction to choose the
+long-term reasonable option. Each one is marked **[owner-level, main agent]**.
+
+**D1. Server-side task numbers.** Naming "#69" in an instruction needs a number
+that lasts.
+- Add a per-site sequential `task_no`, tied to `stable_id`.
+- A number is assigned the first time a `stable_id` is inserted, travels with it
+  across re-extraction, and is never reused.
+- org-api exposes `task_no` and the Tasks page shows it.
+
+This is a separate prerequisite task in the plan, before the worked scenario.
+Until it ships, instructions name items by text, and the planner turns text into
+`stable_id`s through the items tool. **[owner-level, main agent]**
+
+**D2. Agent-created todos appear in Tasks *and* in the day view** of the date they
+were applied, with an "Agent" source badge.
+- Timeline rows carry `topics.source`.
+- The live/nightly label must not call `agent://` topics nightly. *(Unverified:
+  there is no `is_live` symbol in `src/`. The builder finds where the timeline
+  derives its live/nightly label.)*
+- No logic that hides cards.
+
+This reverses the rev 1 default (§12 Q3). **[owner-level, main agent]**
+
+**D3. Kickoff is an S3 request object plus `wire-s3-events`.** Wiring the new
+prefix on prod is an owner step in the rollout table. **[owner-level, main agent]**
+
+**D4. A pack belongs to its site's company, and v1 packs cover one site.**
+- `site_id uuid NOT NULL` replaces `site_ids uuid[]`.
+- `company_id` is the site's company, not the caller's.
+- Readers: the creator, that company's admins/GM, and that site's pm/site_manager.
+
+**[owner-level, main agent]**
+
+**D5. Company exit is not a dependency.** v1 ships without `company_inactive`. If
+`src/tenancy_status.py` exists on develop at build time (it did not at rev 2), the
+create, run-claim and apply paths call it. **[owner-level, main agent]**
+
+**D6. A web draft that fails verification is never citable.** A `web_answer` whose
+status is not verified is dropped from the pack's evidence. It cannot be cited, not
+even as `weak`. **[owner-level, main agent]**
+
+### 14.2 Builder findings folded in
+
+**S1. Kickoff, queue and cancel** (replaces the Event-invoke in §4.1).
+- **Kickoff.**
+  - org-api writes `action_pack_requests/<pack_id>.json` to the data bucket. It
+    holds the pack id, the caller's sub and the site id; never the instruction text.
+  - `scripts/wire-s3-events.sh` gains `ActionAgent ← action_pack_requests/**.json`.
+  - The TEST wiring runs in `deploy.yml`; the prod wiring is an owner step.
+- **Duplicate deliveries.** S3 may deliver the same notification more than once.
+  - The agent's first act is a compare-and-swap claim, `queued → running`, through
+    an org-api internal task (RequestResponse; result payload up to 6 MB).
+  - A second delivery loses the claim and exits.
+- **No automatic retries.** Set `EventInvokeConfig MaximumRetryAttempts: 0` on
+  ActionAgentFunction. A retry would rerun a paid run.
+- **Cancel.**
+  - org-api sets `cancelled` and writes an S3 cancel marker.
+  - The worker checks the marker between rounds, following the
+    `ask_voice_turn.is_cancelled` pattern (verified at `src/ask_voice_turn.py:148`).
+
+**S4. Items tool scope.**
+- It returns items under `source='agent'` topics too, so a later pack can close an
+  agent-created todo.
+- It applies the caller's author filter exactly as Ask does (`_author_filter` in
+  org-api, verified at `src/lambda_org_api.py:8885`).
+- The review named `_ask_tools_where`, but no symbol by that name exists. The
+  builder mirrors the where-clause that `ask_tools`' rag-search path applies.
+
+**S5. Web query isolation** (tightens §6).
+- Web queries are generated in the **Plan** stage, before any record evidence is
+  shown to a model.
+- Later stages may call `web_search` only with one of those fixed query ids. Code
+  enforces this.
+- Each query is at most 300 characters (`MAX_QUESTION_CHARS`, verified at
+  `src/ask_rewrite.py:27` and `src/question_admission.py:24`).
+- Every page fetch has an SSRF guard:
+  - https only;
+  - the resolved address must not be private, link-local or metadata;
+  - every redirect is checked again.
+- Fetches are size-capped: at most 2 MB downloaded and 200 kB of text kept.
+- No fetcher exists in the repo today, so this is new code with its own tests.
+
+**S6. Verifier independence.**
+- The verifier must come from a different model family than the model the writer
+  **actually used**, as recorded after fallbacks.
+- If the writer fell back onto the verifier's family, the run uses the second
+  verifier from `ACTION_VERIFIER_FALLBACKS`.
+- If no remaining verifier differs, the pack fails with reason `model`.
+
+**S7. Write-stage rendering.** The Write stage renders its own evidence: the full
+stored excerpt of every ref it may cite, inside its own budget. It does not reuse
+Ask's `_budgeted` render, which trims to fit a 40 s turn.
+
+**S8. Time and resource budget** (replaces the wall-clock line in §4.2).
+- Fixed reserves: 90 s for write and 90 s for verify, with the verify calls in
+  parallel. The tool rounds get whatever is left of the 600 s target.
+- This function's `LLM_CHAIN_BUDGET_SECONDS` stays below 900 s minus the store
+  reserve.
+- MemorySize is at least 1024 MB.
+- The rag-search hop retries once, and only on throttling or a 5xx.
+
+**S9. Heartbeat and stale-run sweep.**
+- The worker writes `heartbeat_at` through the org-api task after each round.
+- A sweep marks any `running` pack whose heartbeat is older than 20 minutes as
+  `failed` with reason `internal`. The sweep runs from an existing scheduled
+  function, or from org-api on list.
+
+**S10. Apply validation.**
+- `responsible` must match a `members_for_site` display name, the same rule as
+  `patch_action_item`.
+- `text` is never patchable by an action.
+- Allowed status transitions:
+
+  | from \ to | in_progress | blocked | done | closed | open |
+  |---|---|---|---|---|---|
+  | open | ✓ | ✓ | ✓ | ✓ | – |
+  | in_progress | – | ✓ | ✓ | ✓ | ✓ |
+  | blocked | ✓ | – | ✓ | ✓ | ✓ |
+  | done / closed | – | – | – | – | ✓ (reopen; the agent never proposes this in v1) |
+
+- **noop** applies only when every field the action touches already equals the
+  proposal. Any other difference makes the action `stale`.
+
+**S11. The human-edit check walks the `carried_from` chain.** A human edit can sit
+on an earlier row of the same `stable_id`. The check looks for `content_edits` rows
+after `as_of` on any row in that chain, or compares the carried `updated_at`.
+
+**S12. Apply concurrency and lookup.**
+- Apply takes `pg_advisory_xact_lock(hashtext(source_s3_key))`, the same lock the
+  writer path takes for that source.
+- It uses a new `action_items.get_live_by_stable_id`, mirroring
+  `topic_questions.get_live_by_stable_id` (verified at
+  `src/repositories/topic_questions.py:106`).
+
+**S13. No anonymiser exists** (replaces §3.5). Packs are never rewritten.
+- At read time, each source row is checked against its live record, following the
+  `ask_thread_check` pattern (`topics.get_topic_visible` with the reader's
+  `site_ids`/`author_ids`; verified at `src/ask_thread_check.py:95-128`).
+- A source whose record has been deleted, redacted or is no longer visible shows as
+  "source removed", without its excerpt.
+- A claim or action that cites only removed sources is hidden.
+
+**S15. "Applicable by you."** The UI's applicable flag uses the same check as
+`_action_item_edit_acl` (verified at `src/lambda_org_api.py:7292`), so the UI never
+shows an Apply button that would be refused.
+
+**S16. Smaller items.**
+- `ACTION_PACKS` is wired through both deploy workflows, with the bare-`Key` guard
+  against misformed parameter overrides.
+- Web snapshots are stored on the lake bucket and recorded with
+  `lake_objects.record_best_effort` (verified at
+  `src/repositories/lake_objects.py:109`).
+- An env-parity test covers the new function, and the function is gated on
+  `HasOrgApi`.
+- `todo_collapse` merges duplicates at read time (verified, `src/todo_collapse.py`).
+  The near-duplicate check in §4.4 must agree with it, so a created item never
+  collapses onto the item it was meant to differ from.
+- The eval reports the writer's raw rates and the post-verifier rates separately.
+- `action_packs` gains a `title` column, written by the Plan stage.
+
+### 14.3 Unverified at rev 2
+
+- No `_ask_tools_where` symbol (S4).
+- No `is_live` symbol (D2).
+- `src/tenancy_status.py` is not on develop yet (D5).
