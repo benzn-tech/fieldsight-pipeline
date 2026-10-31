@@ -1,8 +1,73 @@
 # FieldSight Product Roadmap
 
-> Last updated: 2026-03-22
-> Owner: Ben
-> Status tracking: ⬜ Not started | 🔲 Blocked | 🟡 In progress | ✅ Done
+> Last updated: 2026-11-01. Only open work is listed; finished items are removed, not
+> ticked. History is in git and in `docs/superpowers/specs/`.
+
+## Owner decisions in force (2026-10-26/27)
+
+- **SES production access:** paused until the sending domain is switched.
+- **Database least-privilege role:** later; the owner runs each step.
+- **Company exit / offboarding** (was "per-company delete"): not deletion. Logins,
+  devices and billing stop; the data is kept and can be exported; the company can come
+  back. Design in progress.
+- **External project managers:** access to another company's site is granted by the
+  company that owns the site, per company, not as a global role.
+- **Task owner ≠ speaker:** see Speaker identity below.
+- **Background agent:** after Track B item continuity is switched on in prod
+  (`PROD_DECLARE_CONTINUITY`), build v1: one instruction, run in the background, return
+  an action pack (draft changes to existing to-dos plus new ones, each applied by one
+  click, every claim cited, web search as a separate tool lane).
+
+## P0 — now
+
+| Item | Difficulty | Why it is hard |
+|---|---|---|
+| One create modal for all record types; fix the Safety photo upload | medium | a migration (TEST first), a new upload route needing IAM + authorisation, and a pipeline/ui release order |
+| Company exit / offboarding | medium-high | covers Cognito, device auth, nightly jobs and external memberships without touching any other company's data |
+
+## P1 — next
+
+| Item | Difficulty | Why it is hard |
+|---|---|---|
+| Track B: continuity on in prod | low (switch) | owner is finishing the ~50-item review; then `PROD_DECLARE_CONTINUITY` |
+| Background agent v1 (see above) | high | verifier pass and citations on every claim; DeepSeek invented 2 of 3 decisions in an earlier test |
+| Ask: per-user request cap | low-medium | the cap needs cost data; where to count; what the user sees |
+| Record who closed a manually entered issue | low | one migration and one write |
+| Stalled-upload recovery on a real device | low (work) | needs a device and forced offline / full-disk cases |
+| Custom vocabulary: proper A/B | medium | needs human reference transcripts and a measured noise floor first |
+| ElevenLabs voice agent to prod | medium | token-issuing client; cost and first-token limits; owner listens to the TTS before main |
+
+## P2 — valuable, needs a rule or a measurement first
+
+| Item | Difficulty | Why it is hard |
+|---|---|---|
+| Speaker / owner / company as separate fields | high | prompt and schema change; must be shown not to worsen owner assignment |
+| Condition-aware voiceprints | high | too few samples per person per condition; <3 s samples are unreliable; prod still shadow |
+| Enrol at site sign-in | medium-high | sign-in flow design; consent in the same act; natural speech, not a read-out |
+| Speaker-based opt-out | high | depends on voiceprint accuracy; touches transcripts, reports, search index and vectors |
+
+## P3 — waiting on something else
+
+| Item | Waiting on |
+|---|---|
+| Site sign-in system integrations (SignOnSite, 1Breadcrumb, calendars) | vendor APIs |
+| Voice sign-in on shared devices | only as a backup to QR login |
+| Searchable photo content | measure on the retrieval ruler first |
+| Per-industry prompts | a second industry customer |
+| Face blurring | its own compute environment |
+| HTML one-pager report | not scheduled |
+| Small cleanups: the spare user pool, `deploy-prod-code.yml`, the old `ui/` copy, bringing S3 notifications under CloudFormation | low, except the S3 one (a CFN-managed notification can overwrite the existing config) |
+
+## Owner follow-ups still open
+
+- Delete `s3://fieldsight-data-509194952652/config/user_mapping.json` and
+  `scripts/fargate_downloader.py`, and the GitHub secrets `REALPTT_ACCOUNT`,
+  `REALPTT_PASSWORD`, `FARGATE_SUBNET_IDS`, `FARGATE_VPC_ID` (safe since prod deployed
+  #1199 cleanly on 2026-10-30).
+- Delete IAM roles `fieldsight-lambda-role` and `fieldsight-transcribe-callback-role`
+  after a quiet week (their lambdas were deleted 2026-10-31).
+- About a month after 2026-10-29: purge the old S3 versions of the deleted folders
+  `MPI1`, `Benl1`, `Ben_UCPK_`.
 
 ---
 
@@ -18,23 +83,20 @@ Where the voiceprint work goes next. Ordered by value, not by ease. Items marked
 - **Enrol at site sign-in.** 15–20 s of natural speech (name, company, trade, today's
   task), not a read-out script; the embedder keeps the cleanest 10 s. Consent is taken
   in the same act.
-- ~~**Self-introduction → name proposal.** "Hi, this is Petros from Cassidy" proposes
-  that voice as Petros via the bell.~~ Done in #967 (`src/self_introduction.py`,
-  org-api introduction-suggestion routes).
 - **Voice sign-in on shared devices.** Replaces or backs up QR login; devices rotate
   monthly.
 
 ### A better library
 - **Condition-aware profiles.** Samples clustered by condition (wind, indoor, vehicle,
   phone, language); a turn is scored against each person's nearest condition centroid.
-- ~~**Bell asks the most informative passages first** (scores near the threshold), so a
-  company reaches the 20 corrections that calibrate its floor sooner.~~ Done in #964
-  (commit 56dcb034, candidates ordered by closeness to the company's boundary).
 
 ### Using the identity
-- **Who said it ≠ who owns it.** A task records the speaker (resolved by voiceprint or
-  by the site roster), the company/trade it binds, and the GC-side owner (the SM/PM for
-  that package). A subcontractor who is not in the library is never made the task owner.
+- **Who said it ≠ who owns it.** Owner ruling 2026-10-26: record the speaker and the
+  task owner as separate fields. The owner is whoever the instruction is addressed to
+  ("Simon, follow this up" → Simon); only when nobody is named does it fall back to the
+  speaker. Also record the company/trade it binds. Keep #1069's prompt contract and
+  measure owner assignment before and after. A subcontractor who is not in the library
+  is never made the task owner.
 - **Variation and safety evidence.** Who instructed extra work; who gave and who
   acknowledged a toolbox talk.
 
@@ -43,217 +105,3 @@ Where the voiceprint work goes next. Ordered by value, not by ease. Items marked
   recording automatically, not by a one-off deletion.
 - **Self-serve consent page — parked.** The person named gets a link to see, hear and
   withdraw their own voiceprint.
-
-## Parked follow-ups and scheduled cleanups (2026-10-13)
-
-Tenancy sub-projects 1-4 are all on prod. What was deliberately left is recorded in
-`docs/superpowers/specs/2026-10-05-tenancy-roadmap-design.md` ("Parked follow-ups" and
-"Scheduled cleanups"). In short:
-
-- **Parked** (each with trigger and approach in that spec): meeting minutes missing from
-  the per-company export; external project manager reach on another company's site;
-  576 unowned lake objects; database credentials (superuser + plaintext password);
-  per-company data delete; SES still in sandbox.
-- **Scheduled:** lake-wide summary off (~2026-10-16); frozen `user_mapping` fallback
-  removal, sub-project 2 M5 (~2026-10-18); legacy gateway phase B finish, delete
-  `khfj3p1fkb` and the legacy lambdas; remove the disabled prod orchestrator (~2026-10-20).
-
----
-
-## P0 — Ask Agent (对纪要追问)
-
-**Goal:** Users can ask questions about any report/meeting minutes and get answers grounded in transcript + report data.
-
-**Status:** ✅ Done — `lambda_ask_agent.py` (e7e0f376), cross-date RAG Ask with citations
-(#23), scoped Ask (#848).
-
-**Model choice:** Use cheaper model (Haiku 4.5 or equivalent) — this is retrieval + summarization, not complex reasoning. Reserve Sonnet for report generation.
-
-**Architecture:**
-```
-Frontend chat input → API Gateway → lambda_ask_agent.py
-  1. Load report JSON from S3: reports/{date}/{user}/daily_report.json
-  2. Load raw transcript(s) from S3: transcripts/{user}/{date}/*.json
-  3. Normalize via transcript_utils.normalize_transcript()
-  4. Build prompt: system context + report JSON + transcript text + user question
-  5. Call Claude Haiku → return answer
-  6. Stateless — no conversation memory needed (each question is independent)
-```
-
-**Key decisions needed:**
-- [x] Scope: per-report only, or cross-date search? — decided: both; cross-date RAG shipped in #23, scoped Ask in #848
-- [ ] Frontend: inline chat panel in report view, or separate page?
-- [ ] Rate limiting: per-user query cap?
-
-**Estimated effort:** 1-2 days (Lambda + API Gateway + frontend chat input)
-
-**Dependencies:** None — all infrastructure exists
-
----
-
-## P0 — Knowledge Base Search (知识库检索)
-
-**Goal:** Global search across all reports — find any topic, action item, safety flag, decision by keyword across all dates and users.
-
-**Status:** 🟡 In progress — Phases 2 and 3 were delivered on Aurora/pgvector instead of
-DynamoDB (search API #31, `src/lambda_rag_search.py`; hybrid keyword + semantic). Phase 1
-(DynamoDB) was not done: `ENABLE_DYNAMODB` is still unset in `src/template.yaml`.
-
-**Current state of DynamoDB:**
-- ⚠️ `ENABLE_DYNAMODB` = **false** (default in code, not set in src/template.yaml)
-- Tables defined in SAM template: `fieldsight-items`, `fieldsight-reports`, `fieldsight-audit`
-- Write functions exist in `lambda_report_generator.py` (lines 736-820) — gated behind flag
-- **No data has been written yet** — turning on only affects future reports
-
-**Phase 1 — Enable + Backfill:**
-- [ ] Set `ENABLE_DYNAMODB=true` in Lambda env vars (report generator + meeting minutes)
-- [ ] Run backfill: invoke report generator with `{"report_type": "daily", "force": true}` for past 30 days
-- [ ] Verify items appear in DynamoDB console
-
-**Phase 2 — Search API:** (done in #31 as GET/POST /api/search over Aurora, semantic, no LLM; not a DynamoDB scan)
-```
-GET /api/search?q=concrete+pour&from=2026-01&to=2026-03
-→ lambda_search.py
-→ DynamoDB scan with FilterExpression on topic_title, summary, key_decisions
-→ Return matching topics with report links
-```
-
-**Phase 3 — Flat Knowledge Base (长期):** (done: PostgreSQL pgvector semantic search, #23 and #31, feeding RAG Ask)
-- OpenSearch or PostgreSQL full-text search for cross-date, cross-site retrieval
-- Embedding-based semantic search if keyword matching isn't enough
-- Feed into Ask Agent for grounded cross-report Q&A
-
-**Estimated effort:** Phase 1: 2 hours | Phase 2: 1 day | Phase 3: 1 week
-
-**Dependencies:** Phase 1 is prerequisite for Phase 2
-
----
-
-## P1 — Custom Vocabulary (自定义行业词库)
-
-**Goal:** Improve transcription accuracy for NZ/AU construction terminology.
-
-**Status:** 🟡 In progress — vocabulary built and wired into `lambda_transcribe.py` (e7e0f376);
-ASR is now ElevenLabs, which reads the same file as keyterms (#1072, #1081, #1082).
-
-**How it works:**
-- AWS Transcribe supports [Custom Vocabulary](https://docs.aws.amazon.com/transcribe/latest/dg/custom-vocabulary.html)
-- Upload a vocabulary table (TSV) to S3
-- Add `VocabularyName` parameter to `lambda_transcribe.py` `build_transcribe_params()`
-- Zero code change beyond one parameter addition
-
-**TODO:**
-- [x] Research NZ/AU construction terminology (e7e0f376: 129 terms) (BRANZ, NZS standards, trade terms)
-- [x] Build vocabulary TSV (`config/custom_vocabulary_construction_nz.txt`, e7e0f376): columns = Phrase, SoundsLike, IPA, DisplayAs
-- [x] Terms needed (present in the file, spot-checked): GIB, BRANZ, dwang, nog, purlin, soffit, fascia, sarking, DPM, H1/H3/H5, NZBC, CCC, PS1/PS4, LBP, PIR, PIMs, RFI, EOT, PC Sum, Provisional Sum, variations, defects liability, practical completion, weathertightness, E2/AS1, Roskill, Hiab, Acrow props, boxing, falsework
-- [ ] Upload to S3: `config/custom_vocabulary_construction_nz.txt`
-- [x] Add to transcribe params: `VocabularyName` in `lambda_transcribe.py` (e7e0f376; `lambda_transcribe.py:274,287`)
-- [ ] Test on 5 diverse recordings, compare before/after
-
-**Estimated effort:** Research: 2 hours | Implementation: 30 min | Validation: 1 hour
-
-**Dependencies:** None
-
----
-
-## P1 — One-Pager Report (HTML)
-
-**Goal:** Auto-generate a single-page visual summary — executive-friendly, scannable, embeddable in frontend.
-
-**Status:** ⬜ Not started
-
-**Ben's direction:** HTML over PPT — better fit for frontend embed, no download required, responsive, printable.
-
-**Approach: HTML one-pager served via CloudFront**
-```
-report JSON exists
-  → lambda_onepager.py reads JSON
-  → Renders Jinja2 HTML template:
-     - Executive summary bullets
-     - Safety risk heatmap (high/med/low counts)
-     - Top 3 action items with owners
-     - Timeline bar (topics across the day)
-     - Key decisions
-  → Saves: reports/{date}/{user}/daily_onepager.html
-  → Frontend: iframe embed or link, direct print support
-```
-
-**Why HTML > PPT:**
-- Direct frontend embed — no download step
-- Responsive on mobile
-- Browser print = PDF export for free
-- Interactive (collapsible sections, links to full report)
-- Zero new dependencies (vs python-pptx)
-
-**Estimated effort:** Template: 1 day | Lambda: half day | Frontend link: 1 hour
-
-**Dependencies:** None — reads existing report JSON
-
----
-
-## P2 — Near Real-Time Processing + Voice Feedback
-
-**Goal:** Reduce latency from overnight batch to <15 min. Long-term: live voice agent with eyes, ears, brain, and mouth.
-
-**Status:** ⬜ Not started (conceptual)
-
-**Phase 1 — Event-Driven Minutes (~15 min latency):**
-- `lambda_transcribe_callback` already deployed (Steps 1-4 done)
-- On Transcribe completion → auto-invoke `lambda_meeting_minutes`
-- Fix needed: Step 5 function name mismatch (`fieldsight-transcribe` vs `fieldsight-transcribe`)
-- Result: meeting ends → 10-15 min → minutes available
-
-**Phase 2 — Streaming Transcribe (~30s latency):**
-- AWS Transcribe Streaming API (WebSocket)
-- Device streams audio → handler → real-time transcript accumulation
-- Trigger incremental analysis every N minutes
-
-**Phase 3 — Voice Agent (Ben's full vision):**
-```
-Camera (eyes)    → video stream → frame analysis (safety, context)
-Mic (ears)       → audio stream → real-time transcribe → conversation understanding
-Claude (brain)   → synthesize visual + audio → generate insights/warnings
-Earpiece (mouth) → TTS feedback → "注意: Block C scaffold inspection overdue"
-                                → "Reminder: concrete pour in 30min"
-                                → Real-time meeting participation & feedback
-```
-
-**Architecture considerations:**
-- Persistent connection (WebSocket/gRPC), not request/response
-- Edge compute for latency (AWS Wavelength or on-device inference)
-- Cost: streaming Transcribe ~2x batch pricing
-- Privacy: continuous analysis vs triggered recording
-- Agent meeting participation: Claude joins as a "participant" providing real-time input
-
-**Estimated effort:** Phase 1: 2 hours | Phase 2: 1 week | Phase 3: multi-month R&D
-
-**Dependencies:** Phase 1 needs callback fix. Phase 3 needs device independence from RealPTT.
-
----
-
-## Completed Items (2026-03-22 session)
-
-- ✅ `lambda_meeting_minutes.py` v1.1 — generic meeting minutes generator
-- ✅ `transcript_utils.py` — shared transcript normalization (unified time extraction)
-- ✅ `prompt_templates_meeting.json` v1.1 — meeting prompt templates
-- ✅ Offset-aware timestamp extraction (VAD segments + full audio)
-- ✅ Per-speaker-turn absolute timestamps from Transcribe word items
-- ✅ Attendee name constraint (explicit attendees override device mapping)
-- ✅ Executive summary as bullet array
-- ✅ Daily report compat layer (meeting minutes → frontend-compatible JSON)
-- ✅ Full audio re-transcription workflow (bypass VAD for meetings)
-- ✅ Transcript truncation fix (20K → 120K chars, dynamic max_tokens)
-
----
-
-## Infrastructure Status
-
-| Resource | Status | Action needed |
-|---|---|---|
-| DynamoDB tables | ⚠️ Defined, OFF | Set `ENABLE_DYNAMODB=true` + backfill |
-| transcript_utils.py | ✅ Deployed | Bundled with meeting minutes Lambda |
-| Report generator v3.4 | ✅ Production | Needs transcript_utils migration later |
-| Transcribe callback | ⚠️ Partial | Step 5 function name mismatch |
-| Face blurring pipeline | ⬜ Designed | Fargate-based, not built |
-| Batch H264 conversion | ⬜ Script ready | `batch_convert_h264.py` |
-| Audio normalization | ✅ Implemented (#281) | `loudnorm` + compression in `lambda_vad.py`, gated per stage by `*_NORMALISE_AUDIO` |
