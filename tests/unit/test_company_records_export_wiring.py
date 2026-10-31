@@ -171,3 +171,13 @@ def test_tick_keeps_the_request_while_records_are_unfinished(monkeypatch):
     out = api.lambda_handler({"task": "export_tick"}, None)
     assert [o[0] for o in order if o != "conn"] == ["records"]
     assert out["done"] is False and s3.deleted == []
+
+
+def test_records_phase_alone_reads_as_running(wired):
+    """The records export runs before the file export writes state.json: still 'running'."""
+    wired["s3"].docs[PREFIX + "records_state.json"] = _records_state(done=False)
+    out = body(call("GET", f"/companies/{CO}/export/{EID}"))
+    assert out["status"] == "running" and out["records"]["status"] == "running"
+    assert out["partsWritten"] == 0 and wired["s3"].presigned == []
+    wired["s3"].docs[PREFIX + "records_state.json"] = _records_state(company=OTHER_CO)
+    assert call("GET", f"/companies/{CO}/export/{EID}")["statusCode"] == 404

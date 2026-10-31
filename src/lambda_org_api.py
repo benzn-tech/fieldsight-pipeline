@@ -6127,6 +6127,9 @@ def company_export_status(conn, caller, company_id, export_id):
                    "partsWritten": len(state.get("parts") or []),
                    "objects": len(state.get("entries") or []),
                    "records": records})
+    if records is not None:            # the records phase runs before the file export starts
+        return ok({"exportId": eid, "companyId": cid, "status": "running", "done": False,
+                   "partsWritten": 0, "objects": 0, "records": records})
     return error("export not found (or not started yet)", 404)
 
 
