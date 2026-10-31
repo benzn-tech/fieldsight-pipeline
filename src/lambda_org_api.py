@@ -1142,22 +1142,46 @@ def _set_action(conn, pack_id, action_id, caller, state, result, created_item_st
     return row
 
 
+def _stale_for(conn, caller, snapshot, live):
+    """The 409 stale answer. The run's snapshot and the live values are shown only while
+    this caller can see the live target -- the same S13 rule GET applies to
+    target_snapshot (shape_pack's targets[aid].visible); otherwise both are null."""
+    visible = (live is not None
+               and _ReaderVisibility(conn, caller).topic_visible(live["topic_id"]))
+    return _stale_response(snapshot if visible else None,
+                           action_pack_view.item_view(live) if visible else None)
+
+
 def _live_under_source_lock(conn, stable_id):
-    """The live row for `stable_id`, read AFTER taking the writer's per-source advisory lock
-    (S12): a re-extraction holding it finishes first. The row may have been superseded while
-    apply waited -- its successor carries the stable_id, possibly under another key (a group
-    pass), so the lock is taken for each key met until the key held is the row's own."""
+    """The live row for `stable_id`, locked for the rest of the apply transaction (S12):
+
+    1. the writer's per-source advisory lock on the row's source key, so a re-extraction
+       of that key holding it finishes first;
+    2. FOR SHARE on the row's TOPIC, so a supersede of that topic by a path that does not
+       take this key's lock (ingest's report key and extraction-prefix supersede, the
+       item writer's authority-flip supersede of the report key) waits for apply to commit
+       -- and its carry-forward, which reads the retired items after its UPDATE, then sees
+       the applied value;
+    3. the item row itself, FOR UPDATE, so a concurrent PATCH waits or is seen.
+
+    Lock order: advisory key, then topic, then item (a writer holds its key and then
+    updates topics -- taking the topic first would deadlock with it). The row may have been
+    superseded while apply waited: its successor carries the stable_id, possibly under
+    another key or topic, so the round repeats until the (key, topic) held is the row's own."""
     live = action_items.get_live_by_stable_id(conn, stable_id)
-    held = set()
+    held_keys, held_topics = set(), set()
     for _ in range(_APPLY_LOCK_ROUNDS):
         if live is None:
             return None
-        key = live.get("source_s3_key")
-        if key is None or key in held:
+        key, topic_id = live.get("source_s3_key"), str(live["topic_id"])
+        if (key is None or key in held_keys) and topic_id in held_topics:
             return live
-        conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (key,))
-        held.add(key)
-        live = action_items.get_live_by_stable_id(conn, stable_id)
+        if key is not None and key not in held_keys:
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (key,))
+            held_keys.add(key)
+        conn.execute("SELECT 1 FROM topics WHERE id = %s FOR SHARE", (topic_id,))
+        held_topics.add(topic_id)
+        live = action_items.get_live_by_stable_id(conn, stable_id, for_update=True)
     raise RuntimeError("the target's source key kept changing")
 
 
@@ -1231,8 +1255,9 @@ def _apply_locked(conn, caller, pack, site, action_id, edits):
         return ok({"id": action_id, "state": "applied",
                    "applied_result": current.get("applied_result")})
     if state == "stale":
-        return _stale_response(current.get("target_snapshot"),
-                               (current.get("applied_result") or {}).get("live"))
+        live = (action_items.get_live_by_stable_id(conn, current["target_stable_id"])
+                if current.get("target_stable_id") is not None else None)
+        return _stale_for(conn, caller, current.get("target_snapshot"), live)
     if state not in action_pack_view.APPLICABLE_STATES:
         raise _ApplyRefused(error(f"action is {state}", 409, {"state": state}))
     fields, err = action_pack_view.effective_fields(current, edits)
@@ -1251,7 +1276,10 @@ def _apply_patch(conn, caller, pack, current, fields):
     live = _live_under_source_lock(conn, current["target_stable_id"])
     if live is None:                            # never guess another row (§3.3)
         _set_action(conn, pack_id, action_id, caller, "stale", {"reason": "target_gone"})
-        return _stale_response(snapshot, None)
+        return _stale_for(conn, caller, snapshot, None)
+    if str(live["site_id"]) != str(pack["site_id"]):   # the item moved off the pack's site
+        _set_action(conn, pack_id, action_id, caller, "stale", {"reason": "target_moved"})
+        return _stale_for(conn, caller, snapshot, live)
     denied = _action_item_edit_denial(conn, caller, live)
     if denied is not None:                      # the action stays as it was
         raise _ApplyRefused(denied)
@@ -1266,13 +1294,10 @@ def _apply_patch(conn, caller, pack, current, fields):
     if (as_of is None
             or action_pack_view.differs_from_snapshot(fields, snapshot, live)
             or content_edits.count_item_edits_after(conn, live["stable_id"], as_of) > 0):
-        view = action_pack_view.item_view(live)
-        # Stored WITHOUT the item's text: applied_result is returned to every reader later,
-        # unmasked, while S13 hides a target's text once the reader cannot see the item.
-        _set_action(conn, pack_id, action_id, caller, "stale",
-                    {"reason": "changed",
-                     "live": {k: v for k, v in view.items() if k != "text"}})
-        return _stale_response(snapshot, view)
+        # No copy of the live values is stored: applied_result reaches every reader
+        # unmasked, and a replay reads the live row again (under the same S13 gate).
+        _set_action(conn, pack_id, action_id, caller, "stale", {"reason": "changed"})
+        return _stale_for(conn, caller, snapshot, live)
     target = fields.get("status")
     # An unknown status is left to the PATCH validator below (400), not called a transition.
     if (target in ALLOWED_ACTION_STATUS

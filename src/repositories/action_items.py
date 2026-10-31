@@ -166,7 +166,7 @@ def _as_uuid(value):
         return None
 
 
-def get_live_by_stable_id(conn, stable_id) -> dict | None:
+def get_live_by_stable_id(conn, stable_id, *, for_update=False) -> dict | None:
     """The one LIVE action item addressed by `stable_id` (action packs, spec §14 S12) --
     mirrors topic_questions.get_live_by_stable_id: joined to its topic for
     `visible_topics_predicate` (a superseded pass of the same source key shares this
@@ -182,7 +182,11 @@ def get_live_by_stable_id(conn, stable_id) -> dict | None:
 
     None on missing OR a malformed id. Unlike topic_questions', the malformed case is caught
     in Python before any SQL runs, so it never rolls back: this is called inside the apply
-    transaction, where a `conn.rollback()` would discard the caller's own work."""
+    transaction, where a `conn.rollback()` would discard the caller's own work.
+
+    for_update=True locks the action_items row (FOR UPDATE OF a) until the caller's
+    transaction ends: apply's final read, so a concurrent PATCH of the same row either waits
+    for apply or has committed before the read (and its content_edits row is then seen)."""
     sid = _as_uuid(stable_id)
     if sid is None:
         return None
@@ -195,7 +199,7 @@ def get_live_by_stable_id(conn, stable_id) -> dict | None:
         f"JOIN topics t ON t.id = a.topic_id "
         f"JOIN sites s ON s.id = a.site_id "
         f"WHERE a.stable_id = %s AND {visible_topics_predicate('t')} "
-        f"ORDER BY a.created_at DESC LIMIT 1",
+        f"ORDER BY a.created_at DESC LIMIT 1" + (" FOR UPDATE OF a" if for_update else ""),
         (sid,),
     ).fetchone()
 

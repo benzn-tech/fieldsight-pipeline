@@ -263,7 +263,6 @@ def applicable_candidate(action, pack) -> bool:
 # POST /action-packs/{id}/actions/{aid}/apply -- spec §5, §14 S10/S11. The database half
 # (locks, live row, ACL, writes) is org-api's apply_pack_action; these decide and shape.
 
-DRAFT_TYPES = ("draft_rfi", "draft_email", "note")
 APPLY_BODY_KEYS = ("fields",)
 # The fields an applier may edit before applying, per type (S10: `text` is never patchable
 # on an existing item; a create carries its own text).

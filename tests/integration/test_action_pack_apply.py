@@ -251,13 +251,20 @@ def test_human_edit_after_as_of_makes_it_stale(db, env):
     assert body["snapshot"] == SNAP_OPEN
     assert _status(db, item_id) == "open"
     state, _, stored, _ = _action(db, aid)
-    assert state == "stale" and stored["reason"] == "changed"
-    # The stored copy never carries the item's text (applied_result is not S13-masked).
-    assert "text" not in stored["live"] and stored["live"]["priority"] == "high"
-    # Stale is sticky: a second apply answers the same, writing nothing.
+    # No copy of the live values is stored (applied_result reaches every reader unmasked).
+    assert (state, stored) == ("stale", {"reason": "changed"})
+    # Stale is sticky: a second apply answers the same, from the live row, writing nothing.
     again = _apply(db, admin, pid, aid)
     assert again[0] == 409 and again[1]["state"] == "stale"
+    assert again[1]["live"]["priority"] == "high" and again[1]["snapshot"] == SNAP_OPEN
     assert len(_edits(db, item_id)) == 1
+    # A reader who cannot see the target (the worker creator: not its author) gets the
+    # stale answer with neither the run's snapshot nor the live values (S13, as GET).
+    assert _apply(db, creator, pid, aid) == (409, {"error": "action is stale",
+                                                   "state": "stale", "live": None,
+                                                   "snapshot": None})
+    view = _call(db, creator, "GET", f"/action-packs/{pid}")[1]["actions"][0]
+    assert view["target_snapshot"] is None and view["applied_result"] == {"reason": "changed"}
 
 
 def test_an_edit_before_as_of_does_not_make_it_stale(db, env):
@@ -302,9 +309,24 @@ def test_target_gone_is_stale_with_no_live_row(db, env):
     pid, [aid] = _ready_pack(db, site, creator, [_close(stable)])
     topics.supersede_topics_for_source(db, t["source_s3_key"], "test:3")
     status, body = _apply(db, admin, pid, aid)
+    # No live target: nothing to check visibility against, so no snapshot either (GET
+    # shows a target_snapshot only while the live item is visible).
     assert status == 409 and body == {"error": "action is stale", "state": "stale",
-                                      "live": None, "snapshot": SNAP_OPEN}
+                                      "live": None, "snapshot": None}
     assert _action(db, aid)[2] == {"reason": "target_gone"}
+
+
+def test_target_moved_to_another_site_is_stale_and_nothing_is_written(db, env):
+    co, site, creator, admin = _world(db)
+    other = sites.create_site(db, co["id"], f"Site2-apa-{_tag()}")
+    t, item_id, stable = _topic(db, site)
+    pid, [aid] = _ready_pack(db, site, creator, [_close(stable)])
+    db.execute("UPDATE action_items SET site_id=%s WHERE id=%s", (other["id"], item_id))
+    db.execute("UPDATE topics SET site_id=%s WHERE id=%s", (other["id"], t["id"]))
+    status, body = _apply(db, admin, pid, aid)
+    assert status == 409 and body["state"] == "stale"
+    assert _action(db, aid)[2] == {"reason": "target_moved"}
+    assert _status(db, item_id) == "open" and _edits(db, item_id) == []
 
 
 def test_already_in_the_proposed_state_is_a_noop(db, env):
@@ -439,8 +461,26 @@ def test_inactive_company_is_refused_when_enforced(db, env, monkeypatch):
     pid, [aid] = _ready_pack(db, site, ext, [_close(stable)])
     db.execute("UPDATE companies SET status='suspended' WHERE id=%s", (co["id"],))
     monkeypatch.setenv("COMPANY_STATUS_ENFORCE", "on")
-    status, _ = _apply(db, ext, pid, aid)
-    assert status in (404, 409)                 # out of reach, or refused: never applied
+    # Enforced: the external member's reach to the inactive company's site is gone, so the
+    # pack's source no longer passes S13 and the action reads as unknown.
+    assert _apply(db, ext, pid, aid) == (404, {"error": "action not found"})
+    assert _status(db, item_id) == "open" and _action(db, aid)[0] == "proposed"
+
+
+def test_company_gate_refusal_is_409_before_any_write(db, env, monkeypatch):
+    """The gate itself (a caller who still reaches the site is rare once enforcement is on):
+    write_refusal answering company_inactive stops the apply before the savepoint."""
+    co, site, creator, admin = _world(db)
+    _, item_id, stable = _topic(db, site)
+    pid, [aid] = _ready_pack(db, site, creator, [_close(stable)])
+    seen = []
+
+    def refuse(conn, caller, company_id, where=""):
+        seen.append((str(company_id), where))
+        return "company_inactive"
+    monkeypatch.setattr(org.tenancy_status, "write_refusal", refuse)
+    assert _apply(db, admin, pid, aid) == (409, {"error": "company_inactive"})
+    assert seen == [(str(co["id"]), "action-pack-apply")]
     assert _status(db, item_id) == "open" and _action(db, aid)[0] == "proposed"
 
 
@@ -628,6 +668,111 @@ def test_re_extraction_waits_for_an_apply_in_flight(migrated_db_url, monkeypatch
             writer.close()
             applier.close()
         assert _status(seed, out["new_id"]) == "done"           # the close survived
+    finally:
+        if site is not None:
+            _cleanup(seed, co, site)
+        seed.close()
+
+
+def _two_conn_env(monkeypatch):
+    monkeypatch.setenv("ACTION_PACKS", "on")
+    monkeypatch.delenv("COMPANY_STATUS_ENFORCE", raising=False)
+    monkeypatch.setattr(org, "GRADED_ROLES", False)
+
+
+def test_a_patch_committing_while_apply_waits_makes_it_stale(migrated_db_url, monkeypatch):
+    """A3 against a concurrent human PATCH: apply's final read locks the item row, so it
+    waits for the PATCH and then sees its content_edits row -> stale, the human value kept."""
+    _two_conn_env(monkeypatch)
+    seed = get_connection(migrated_db_url, autocommit=True)
+    co = site = None
+    try:
+        co, site, creator, admin = _world(seed)
+        _, item_id, stable = _topic(seed, site)
+        pid, [aid] = _ready_pack(seed, site, creator, [_close(stable)])
+        human = get_connection(migrated_db_url)
+        applier = get_connection(migrated_db_url)
+        try:
+            assert _call(human, admin, "PATCH", f"/action-items/{item_id}",
+                         {"priority": "high"})[0] == 200          # row lock held, uncommitted
+            out = {}
+
+            def apply():
+                out["res"] = _apply(applier, admin, pid, aid)
+                applier.commit()
+
+            th = threading.Thread(target=apply)
+            th.start()
+            time.sleep(0.7)
+            assert th.is_alive(), "apply must wait on the item row"
+            human.commit()
+            th.join(15)
+            assert not th.is_alive()
+        finally:
+            human.close()
+            applier.close()
+        status, body = out["res"]
+        assert status == 409 and body["state"] == "stale", body
+        row = seed.execute("SELECT status, priority FROM action_items WHERE id=%s",
+                           (item_id,)).fetchone()
+        assert row == ("open", "high")
+        assert _action(seed, aid)[0] == "stale"
+    finally:
+        if site is not None:
+            _cleanup(seed, co, site)
+        seed.close()
+
+
+def test_cross_key_supersede_waits_for_apply_and_carries_the_close(migrated_db_url,
+                                                                   monkeypatch):
+    """S12 gap: lambda_ingest supersedes the day's extraction topics by PREFIX under the
+    report key, without the extraction key's lock. Apply holds FOR SHARE on the live topic,
+    so that supersede UPDATE waits for apply to commit; ingest's carry-forward (which reads
+    the retired items AFTER its UPDATE) then sees the close and carries it onto the report
+    row. Mirrors lambda_ingest's sequence: supersede report key, supersede prefix, upsert,
+    carry_forward_apply._carry_forward_children."""
+    import carry_forward_apply
+    _two_conn_env(monkeypatch)
+    seed = get_connection(migrated_db_url, autocommit=True)
+    co = site = None
+    try:
+        co, site, creator, admin = _world(seed)
+        folder = f"F_{_tag()}"
+        t, old_id, stable = _topic(seed, site, key=f"extractions/{folder}/{DAY}/sid1.json")
+        pid, [aid] = _ready_pack(seed, site, creator, [_close(stable)])
+        ingest = get_connection(migrated_db_url)
+        applier = get_connection(migrated_db_url)
+        report_key = f"reports/{DAY}/{folder}/daily_report.json"
+        try:
+            assert _apply(applier, admin, pid, aid)[0] == 200       # locks held, uncommitted
+            out = {}
+
+            def run_ingest():
+                retired = list(topics.supersede_topics_for_source(ingest, report_key, "r:1"))
+                retired.extend(topics.supersede_topics_for_source_prefix(
+                    ingest, f"extractions/{folder}/{DAY}/", "r:1"))
+                new_t = topics.upsert_topic(ingest, site["id"], DAY, "Fire doors",
+                                            source_s3_key=report_key,
+                                            action_items=[{"text": "Fix the fire door"}])
+                carry_forward_apply._carry_forward_children(
+                    ingest, [r["id"] for r in retired], [new_t["id"]], site["id"], report_key)
+                out["new_topic"] = new_t["id"]
+                ingest.commit()
+
+            th = threading.Thread(target=run_ingest)
+            th.start()
+            time.sleep(0.7)
+            assert th.is_alive(), "the prefix supersede must wait for the apply"
+            applier.commit()
+            th.join(15)
+            assert not th.is_alive()
+        finally:
+            ingest.close()
+            applier.close()
+        new_row = seed.execute("SELECT id, status, stable_id FROM action_items "
+                               "WHERE topic_id=%s", (out["new_topic"],)).fetchone()
+        assert new_row[1:] == ("done", stable)                    # the close was not lost
+        assert _status(seed, old_id) == "done"
     finally:
         if site is not None:
             _cleanup(seed, co, site)
