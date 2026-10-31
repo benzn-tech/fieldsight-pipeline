@@ -775,3 +775,114 @@ def test_local_page_inside_the_deadline_is_read_whole():
     finally:
         stop.set()
         srv.close()
+
+
+# ------------------------------------------- fix round 2: EOF is not completion
+
+class _AbortableServer(FakeServer):
+    """A connection whose abort() (the watchdog's hook) makes a blocked read1 return b"" --
+    what a POSIX recv does after shutdown(SHUT_RDWR)."""
+
+    def __init__(self, routes=None):
+        super().__init__(routes)
+        self.aborted = threading.Event()
+
+    def connect(self, host, ip, port, timeout):
+        conn = super().connect(host, ip, port, timeout)
+        conn.abort = self.aborted.set
+        return conn
+
+
+class _BlockingBody(FakeResponse):
+    def __init__(self, aborted):
+        super().__init__(200, {"Content-Type": "text/plain"}, b"")
+        self.aborted, self.calls = aborted, 0
+
+    def read1(self, n=-1):
+        self.calls += 1
+        if self.calls == 1:
+            return b"first part "
+        self.aborted.wait(10)            # blocked until the watchdog aborts the socket
+        return b""                       # ... and then it looks like a clean EOF
+
+
+def test_a_watchdog_abort_that_looks_like_eof_is_a_timeout_not_a_page():
+    server = _AbortableServer()
+    server.routes[("example.org", "/blk")] = _BlockingBody(server.aborted)
+    f = wf.Fetcher(resolver=resolver_of({"example.org": [PUBLIC]}), connect=server.connect,
+                   page_timeout=0.3, check_robots=False)
+    started = time.monotonic()
+    r = f.fetch("https://example.org/blk")
+    assert server.aborted.is_set()
+    assert r["ok"] is False and r["reason"] == "timeout" and r["text"] is None
+    assert time.monotonic() - started < 1.5
+
+
+def test_the_eof_check_alone_catches_an_eof_after_the_deadline():
+    """Without relying on the watchdog flag: an empty read after the deadline is a timeout."""
+    t = [0.0]
+
+    class LateEOF(FakeResponse):
+        def read1(self, n=-1):
+            t[0] += 20
+            return b""
+    server = FakeServer({("example.org", "/late"): LateEOF(200, {"Content-Type": "text/plain"})})
+    f = wf.Fetcher(resolver=resolver_of({"example.org": [PUBLIC]}), connect=server.connect,
+                   clock=lambda: t[0], page_timeout=10, check_robots=False)
+    assert f.fetch("https://example.org/late")["reason"] == "timeout"
+
+
+class _LengthResponse(FakeResponse):
+    """http.client's `length`: Content-Length bytes not yet read."""
+
+    def __init__(self, declared, body):
+        super().__init__(200, {"Content-Type": "text/plain",
+                               "Content-Length": str(declared)}, body)
+        self.length = declared
+
+    def read1(self, n=-1):
+        out = super().read1(n)
+        self.length -= len(out)
+        return out
+
+
+def test_eof_before_content_length_is_never_a_complete_page():
+    f, _, _ = make({("example.org", "/cut"): _LengthResponse(100, b"x" * 10)})
+    r = f.fetch("https://example.org/cut")
+    assert r["ok"] is False and r["reason"] == "truncated_body" and r["text"] is None
+
+
+def test_body_matching_content_length_is_complete():
+    f, _, _ = make({("example.org", "/whole"): _LengthResponse(10, b"y" * 10)})
+    r = f.fetch("https://example.org/whole")
+    assert r["ok"] is True and r["text"] == "y" * 10 and r["truncated"] is False
+
+
+def test_loopback_server_closing_before_content_length_is_truncated_body():
+    head = (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100\r\n"
+            b"Connection: close\r\n\r\n")
+    srv, stop = _local_server(lambda c, s: c.sendall(head + b"x" * 10))
+    port = srv.getsockname()[1]
+    try:
+        f = wf.Fetcher(connect=lambda host, ip, p, timeout: http.client.HTTPConnection(
+            ip, port, timeout=timeout))
+        target = wf.Target(url="https://loopback.test/", host="loopback.test",
+                           ips=("127.0.0.1",), path="/")
+        with pytest.raises(wf._Fail) as exc:
+            f._exchange(target, time.monotonic() + 5, max_bytes=wf.MAX_DOWNLOAD_BYTES,
+                        types=wf.ALLOWED_TYPES)
+        assert exc.value.code == "truncated_body"
+    finally:
+        stop.set()
+        srv.close()
+
+
+def test_robots_follows_up_to_five_redirects():
+    routes = {("example.org", "/robots.txt"): FakeResponse(302, {"Location": "/r1"})}
+    for i in range(1, 5):
+        routes[("example.org", f"/r{i}")] = FakeResponse(302, {"Location": f"/r{i + 1}"})
+    routes[("example.org", "/r5")] = FakeResponse(
+        200, {"Content-Type": "text/plain"}, b"User-agent: *\nDisallow: /\n")
+    f, _, _ = make(routes)
+    assert f.fetch("https://example.org/page")["reason"] == "robots"
+    assert wf.MAX_ROBOTS_REDIRECTS == 5 and wf.MAX_REDIRECTS == 3

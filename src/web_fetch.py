@@ -56,6 +56,7 @@ MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024
 MAX_TEXT_BYTES = 200_000            # = action_pack_view.SNAPSHOT_MAX_BYTES (the viewer's cap)
 MAX_ROBOTS_BYTES = 512 * 1024
 MAX_REDIRECTS = 3
+MAX_ROBOTS_REDIRECTS = 5        # RFC 9309 2.3.1.2: follow at least five for robots.txt
 PAGE_TIMEOUT_S = 10.0
 MAX_URL_CHARS = 2048
 ALLOWED_TYPES = ("text/html", "text/plain")
@@ -456,11 +457,12 @@ class Fetcher:
             raise _Fail("timeout")
         return left
 
-    def _get(self, url, deadline, *, max_bytes, types, robots):
+    def _get(self, url, deadline, *, max_bytes, types, robots,
+             max_redirects=MAX_REDIRECTS):
         """Follow up to MAX_REDIRECTS redirects, each hop vetted. Returns
         (final_url, status, (media, charset), raw bytes, truncated)."""
         current = url
-        for hop in range(MAX_REDIRECTS + 1):
+        for hop in range(max_redirects + 1):
             target = vet_url(current, self._resolve)
             if robots:
                 verdict = self._robots_verdict(target)
@@ -469,7 +471,7 @@ class Fetcher:
             out = self._exchange(target, deadline, max_bytes=max_bytes, types=types)
             if out[0] == "redirect":
                 _, location, status = out
-                if hop == MAX_REDIRECTS:
+                if hop == max_redirects:
                     raise _Fail("too_many_redirects", status)
                 current = urljoin(target.url, location.strip())
                 continue
@@ -498,6 +500,8 @@ class Fetcher:
                     location = resp.getheader("Location")
                     if not location:
                         raise _Fail("redirect_without_location", status)
+                    if watchdog.fired:
+                        raise _Fail("timeout")
                     return "redirect", location, status
                 if status != 200:
                     raise _Fail("http_status", status)
@@ -508,6 +512,10 @@ class Fetcher:
                 if enc not in ("", "identity"):
                     raise _Fail("content_encoding", status)
                 raw, truncated = self._read(conn, resp, deadline, max_bytes)
+                # POSIX: a shutdown makes a blocked recv return b"" (EOF), not an error. A
+                # body cut by the watchdog is never a complete page.
+                if watchdog.fired:
+                    raise _Fail("timeout")
                 return "ok", status, ctype, raw, truncated
             except BaseException as exc:
                 fail = _as_fail(exc, watchdog)
@@ -555,6 +563,13 @@ class Fetcher:
             _set_timeout(conn, self._left(deadline))
             chunk = read(min(_CHUNK, max_bytes + 1 - len(buf)))
             if not chunk:
+                self._left(deadline)          # an EOF at the deadline is the watchdog's
+                remaining = getattr(resp, "length", None)
+                if (isinstance(remaining, int) and not isinstance(remaining, bool)
+                        and remaining > 0):
+                    # The server closed before its own Content-Length: an incomplete page
+                    # is never stored as a complete snapshot.
+                    raise _Fail("truncated_body")
                 break
             buf += chunk
             self._left(deadline)
@@ -582,7 +597,8 @@ class Fetcher:
             authority = f"[{host}]" if ":" in host else host      # an IPv6 literal
             _, _, ctype, raw, _ = self._get(f"https://{authority}/robots.txt", deadline,
                                             max_bytes=MAX_ROBOTS_BYTES, types=None,
-                                            robots=False)
+                                            robots=False,
+                                            max_redirects=MAX_ROBOTS_REDIRECTS)
         except _Fail as exc:
             st = exc.status
             if (exc.code == "http_status" and st is not None
