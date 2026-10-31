@@ -465,3 +465,50 @@ def test_own_inspections_and_checklists_drop_the_inactive_sites_sessions(db, own
     assert checks() == ["A check", "B check"] and unmatched() == ["A check", "B check"]
     _set(db, own["a"], "suspended")
     assert checks() == ["B check"] and unmatched() == ["B check"]
+
+
+# ---- review fix 1: merged meetings carry the LEAD's site --------------------------------
+
+def test_merged_meeting_on_the_inactive_site_is_dropped_everywhere(db, own, flag_on, monkeypatch):
+    """bw's own device that day was on B's site only (QUIET); the merged meeting is the
+    A person's lead session on A's site. The caller's own-rows check alone sees nothing
+    on A -- the merged rows themselves must trigger the rule."""
+    lead_key = f"extractions/{own['aw']['folder_name']}/{QUIET}/{SID_A}.json"
+    topics.upsert_topic(db, own["sa"], QUIET, "A merged meeting", user_id=own["aw"]["id"],
+                        source_s3_key=lead_key, time_range="10:00 - 10:30")
+    monkeypatch.setattr(org, "_merged_keys_for", lambda conn, uid, date: [lead_key]
+                        if date == QUIET else [])
+
+    def live():
+        res = org.list_live_items(db, _fresh(own["bw"]), {"queryStringParameters": {"date": QUIET}})
+        assert res["statusCode"] == 200
+        return sorted(t["title"] for t in json.loads(res["body"])["topics"])
+
+    def picker():
+        return sorted(r["title"] for r in org._day_report_rows(
+            db, _fresh(own["bw"]), own["folder"], QUIET))
+
+    def timeline():
+        code, body = _timeline(db, own["bw"], QUIET)
+        return code, _titles(body), "WHOLE DAY PROSE" in json.dumps(body)
+
+    both = ["A merged meeting", "B quiet"]
+    assert live() == both and picker() == both
+    assert timeline()[:2] == (200, both)
+    _set(db, own["a"], "suspended")
+    assert live() == ["B quiet"] and picker() == ["B quiet"]
+    code, titles, prose = timeline()
+    assert code == 200 and titles == ["B quiet"] and not prose
+    _set(db, own["a"], "active")
+    assert live() == both and picker() == both and timeline()[:2] == (200, both)
+    _usable(db)
+
+
+def test_merged_meeting_flag_off_unchanged(db, own, flag_off, monkeypatch):
+    lead_key = f"extractions/{own['aw']['folder_name']}/{QUIET}/{SID_A}.json"
+    topics.upsert_topic(db, own["sa"], QUIET, "A merged meeting", user_id=own["aw"]["id"],
+                        source_s3_key=lead_key, time_range="10:00 - 10:30")
+    monkeypatch.setattr(org, "_merged_keys_for", lambda conn, uid, date: [lead_key])
+    _set(db, own["a"], "suspended")
+    res = org.list_live_items(db, _fresh(own["bw"]), {"queryStringParameters": {"date": QUIET}})
+    assert "A merged meeting" in {t["title"] for t in json.loads(res["body"])["topics"]}

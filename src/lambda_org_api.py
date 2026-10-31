@@ -1830,8 +1830,14 @@ def _day_report_rows(conn, caller, folder, date):
     else:
         rows = topics.list_topics_for_source_prefix(conn, prefix)
     own_day = bool(folder) and folder == (caller.get("folder_name") or "")
-    if own_day and merged and _own_range_touches_inactive(conn, caller, folder, date, date):
-        own_day = False   # spec 2026-11-01 §5.2: read like another viewer -- merged rows clipped
+    if own_day and merged:
+        # spec 2026-11-01 §5.2: a day touching an inactive company's site -- the caller's
+        # own rows, or a merged meeting's rows (which carry the LEAD's site) -- is read like
+        # another viewer reads it: merged rows clipped. Flag off etc.: inactive is None.
+        inactive = tenancy_status.inactive_site_ids(conn, caller)
+        if _rows_touch_inactive(rows, inactive) or \
+                _own_range_touches_inactive(conn, caller, folder, date, date):
+            own_day = False
     if own_day and merged:
         merged_set = set(merged)
         return [r for r in rows
@@ -8918,7 +8924,23 @@ def list_live_items(conn, caller, event):
     rows = topics.list_topics_for_date(conn, site_ids, date,
                                        author_ids=_author_filter(conn, caller),
                                        merged_keys=merged_keys)
+    # Merged-meeting rows carry the LEAD's site and bypass the site ACL in SQL; a site of
+    # an inactive company is dropped here (spec 2026-11-01 §5.2). None -> unchanged.
+    rows = _drop_inactive_rows(rows, tenancy_status.inactive_site_ids(conn, caller))
     return ok({"topics": rows})
+
+
+def _drop_inactive_rows(rows, inactive):
+    """`rows` (dicts with site_id) minus those on a site in `inactive`; None -> `rows`."""
+    if not inactive:
+        return rows
+    return [r for r in rows if str(r.get("site_id")) not in inactive]
+
+
+def _rows_touch_inactive(rows, inactive):
+    """Whether any row (e.g. a merged meeting's, carrying the LEAD's site) is on a site
+    in `inactive`."""
+    return bool(inactive) and any(str(r.get("site_id")) in inactive for r in rows)
 
 
 def _merged_keys_for(conn, user_id, date):
@@ -10893,6 +10915,13 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False,
                 if merged else
                 topics.list_topics_for_source_prefix(conn, prefix))
         clip = cross_user_clip
+        if not clip and user == (caller.get("folder_name") or None) and _rows_touch_inactive(
+                rows, tenancy_status.inactive_site_ids(conn, caller)):
+            # spec 2026-11-01 §5.2: own day whose rows (a merged meeting's carry the LEAD's
+            # site) touch an inactive company's site -- read like another viewer: clipped,
+            # no prose, and (saw_foreign) never the verbatim doc. Flag off: inactive None.
+            clip = True
+            saw_foreign.append(True)
         if clip_foreign and not clip:
             foreign = [r for r in rows if str(r["site_id"]) not in allowed]
             if foreign or _day_not_within():
@@ -12074,8 +12103,10 @@ class _InactiveSiteHider(_SessionHider):
                 sid = _session_of(key)
                 if sid:
                     outside.add(sid)
-        hider = cls(conn, deny, True, set(), outside)
-        hider.keys = keys
+        # The base `_allowed` slot is a whitelist; this hider has none (its own hides_key
+        # never reads it), so the deny list lives under its own name.
+        hider = cls(conn, [], True, set(), outside)
+        hider.deny, hider.keys = deny, keys
         return hider
 
     def hides_key(self, key):
