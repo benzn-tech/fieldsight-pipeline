@@ -315,6 +315,16 @@ Parameters:
       caller's last five conversations. Anything but 'true' is off. Set via
       TEST_ASK_THREADS / PROD_ASK_THREADS; an unset var keeps it off.
 
+  ActionPacks:
+    Type: String
+    Default: 'off'
+    AllowedValues: ['off', 'internal', 'on']
+    Description: >-
+      Background action agent (spec 2026-11-01): 'off' makes every
+      /api/org/action-packs route a 404 and refuses the worker's internal
+      tasks; 'internal' opens them to platform_admin only; 'on' to everyone
+      with access. Read per call (an env edit is the rollback).
+
   CompanyStatusEnforce:
     Type: String
     Default: 'off'
@@ -2941,6 +2951,8 @@ Resources:
           # off -> /ask/threads answers 404 (see the AskThreads parameter). The
           # threads live in S3_BUCKET (DataBucketName) under ask_threads/.
           ASK_THREADS: !Ref AskThreads
+          # off -> /action-packs answers 404 (see the ActionPacks parameter)
+          ACTION_PACKS: !Ref ActionPacks
       Policies:
         # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
         # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
@@ -3390,6 +3402,15 @@ Resources:
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/company_status_requests/*
+        # Action packs (spec 2026-11-01 §14 S1): POST /action-packs writes the kickoff request
+        # action_pack_requests/<pack>.json (pack id, caller sub, site id -- never the
+        # instruction) that triggers the non-VPC ActionAgent through wire-s3-events.sh, and
+        # cancel writes action_pack_requests/<pack>.cancel. Write only, this one prefix.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/action_pack_requests/*
       Events:
         OrgProxy:
           Type: Api

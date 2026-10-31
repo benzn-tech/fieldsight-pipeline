@@ -187,6 +187,19 @@ def claim(conn, pack_id) -> bool:
     return row is not None
 
 
+def get_for_worker(conn, pack_id) -> dict | None:
+    """What the worker needs to run a claimed pack (org-api's claim task, S1): the pack's id,
+    site, company (creation-time owner), state, instruction, creator and the creator's
+    Cognito sub -- the identity every tool call runs as (§7 "run identity"). No reader
+    check: this is only reached through an internal task, never from the gateway.
+    None when the pack does not exist."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT p.id, p.site_id, p.company_id, p.state, p.instruction, p.created_by, "
+        "u.cognito_sub AS created_by_sub, p.created_at "
+        "FROM action_packs p JOIN users u ON u.id = p.created_by WHERE p.id = %s",
+        (pack_id,)).fetchone()
+
+
 def heartbeat(conn, pack_id) -> str | None:
     """Refresh heartbeat_at while running. Returns the pack's current state either way
     ('cancelled' tells the worker to stop), None when the pack does not exist."""
