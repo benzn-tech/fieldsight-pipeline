@@ -6777,11 +6777,15 @@ def patch_org_company(conn, caller, company_id, body):
 # /members
 # ----------------------------------------------------------
 def _cognito_login_status_by_sub():
-    """{cognito sub: UserStatus} for every user in the pool (Team page "has signed in").
+    """{cognito sub: {"UserStatus", "Enabled"}} for every user in the pool (Team page
+    "has signed in").
 
-    One paginated ListUsers sweep per request, sub attribute only. UserStatus is e.g.
-    CONFIRMED (has set a password), FORCE_CHANGE_PASSWORD (invited, never signed in),
-    RESET_REQUIRED. Any failure -- AccessDenied, throttling, network -- is logged and
+    One paginated ListUsers sweep per request, sub attribute only (Enabled is a top-level
+    field of each user, not an attribute). UserStatus is e.g. CONFIRMED (has set a
+    password), FORCE_CHANGE_PASSWORD (invited, never signed in), RESET_REQUIRED. Enabled is
+    false for a disabled user (company offboarding, spec 5.3), whose UserStatus stays
+    CONFIRMED; a record without Enabled counts as enabled. This is Cognito truth, read the
+    same whether or not COMPANY_STATUS_ENFORCE is on. Any failure -- AccessDenied, throttling, network -- is logged and
     answers {}, so every row gets login_status null: this decorates the member list and
     must never fail it."""
     if not COGNITO_USER_POOL_ID:
@@ -6796,7 +6800,8 @@ def _cognito_login_status_by_sub():
                 sub = next((a.get("Value") for a in u.get("Attributes") or []
                             if a.get("Name") == "sub"), None)
                 if sub:
-                    out[sub] = u.get("UserStatus")
+                    out[sub] = {"UserStatus": u.get("UserStatus"),
+                                "Enabled": u.get("Enabled", True) is not False}
             token = resp.get("PaginationToken")
             if not token:
                 return out
@@ -6804,6 +6809,17 @@ def _cognito_login_status_by_sub():
     except Exception:  # noqa: BLE001 - login_status is decoration; null beats a failed list
         logger.exception("cognito ListUsers failed; members get login_status null")
         return {}
+
+
+def _login_status(cognito_user):
+    """The member row's login_status: the Cognito UserStatus, or "DISABLED" when the Cognito
+    user is disabled (a disabled user keeps CONFIRMED and must not read "Signed in"), or
+    None when the sub is unknown. An enabled user's value is exactly the UserStatus."""
+    if not cognito_user:
+        return None
+    if not cognito_user["Enabled"]:
+        return "DISABLED"
+    return cognito_user["UserStatus"]
 
 
 def list_members(conn, caller, event):
@@ -6831,7 +6847,7 @@ def list_members(conn, caller, event):
     status_by_sub = _cognito_login_status_by_sub()
     for row in rows:
         row["memberships"] = per_user.get(row["id"], [])
-        row["login_status"] = status_by_sub.get(row.get("cognito_sub"))
+        row["login_status"] = _login_status(status_by_sub.get(row.get("cognito_sub")))
         if co_name is not None:
             row["company_name"] = co_name.get(str(row.get("company_id")))
     return ok({"members": rows})
