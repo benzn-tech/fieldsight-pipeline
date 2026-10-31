@@ -11795,7 +11795,17 @@ def admin_disambiguation(conn, caller, date):
     if not candidates:
         return ok({"message": f"No reports for {date}", "date": date}, 404)
     if len(candidates) == 1:
-        return _render_timeline_for_user(conn, caller, date, next(iter(candidates)))
+        cand = next(iter(candidates))
+        # Company offboarding (spec 2026-11-01 §5.2), FLAG-ON ONLY: while some company is
+        # inactive, the one candidate's day is read like any other viewer's (clip_foreign:
+        # site-clipped rows, no whole-day prose, no photo list, no verbatim fallback), so a
+        # suspended / exited company's rows never reach this caller through it. With the
+        # flag off or nobody inactive (None) it is the call it always was.
+        if (tenancy_status.inactive_site_ids(conn, caller) is not None
+                and not is_cross_company(caller["global_role"])
+                and cand != (caller.get("folder_name") or None)):
+            return _render_timeline_for_user(conn, caller, date, cand, clip_foreign=True)
+        return _render_timeline_for_user(conn, caller, date, cand)
     return ok({"date": date, "available_users": sorted(candidates)})
 
 

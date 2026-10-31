@@ -512,3 +512,66 @@ def test_merged_meeting_flag_off_unchanged(db, own, flag_off, monkeypatch):
     _set(db, own["a"], "suspended")
     res = org.list_live_items(db, _fresh(own["bw"]), {"queryStringParameters": {"date": QUIET}})
     assert "A merged meeting" in {t["title"] for t in json.loads(res["body"])["topics"]}
+
+
+# ---- final review I2: admin_disambiguation's single candidate ----------------------------
+# B's admin opens a day with no ?user; the only candidate is bw (B's own person) who also
+# worked on A's site. With the flag on and A inactive, the single-candidate render is
+# clipped like any other viewer's: no A rows, no whole-day prose, no photo list, no
+# verbatim fallback. Flag off it is the call it always was (the pre-existing view of an
+# ACTIVE other company's rows on this path is NOT changed here -- reported separately).
+
+def _disambiguate(db, u, date):
+    res = org.admin_disambiguation(db, _fresh(u), date)
+    return res["statusCode"], json.loads(res["body"])
+
+
+@pytest.fixture
+def single(own, db, monkeypatch):
+    # The merged meeting: an A-site lead session bw attended. The lead row has no author
+    # folder, so it adds no second candidate.
+    lead_key = f"extractions/LEAD_{uuid.uuid4().hex[:6]}/{DATE}/{SID_A}.json"
+    topics.upsert_topic(db, own["sa"], DATE, "A merged meeting", user_id=None,
+                        source_s3_key=lead_key, time_range="10:00 - 10:30")
+    monkeypatch.setattr(org, "_merged_keys_for", lambda conn, uid, date: [lead_key]
+                        if date == DATE else [])
+    monkeypatch.setattr(org, "_list_report_folders",
+                        lambda date, conn=None, caller=None: [own["folder"]])
+    return own
+
+
+def test_single_candidate_day_of_an_inactive_site_is_clipped(db, single, flag_on):
+    code, body = _disambiguate(db, single["bad"], DATE)
+    assert code == 200 and body.get("user") == single["folder"]     # one candidate: rendered
+    _set(db, single["a"], "suspended")
+    code, body = _disambiguate(db, single["bad"], DATE)
+    assert code == 200 and _titles(body) == ["B steel"]
+    raw = json.dumps(body)
+    assert "A pour" not in raw and "A merged meeting" not in raw and "A topic-only" not in raw
+    assert "WHOLE DAY PROSE" not in raw
+    assert not body.get("photo_filenames") and "IMG_a.jpg" not in raw
+    assert single["sa"] not in raw
+    _usable(db)
+
+
+def test_single_candidate_verbatim_day_on_an_inactive_site_is_withheld(db, single, flag_on):
+    code, body = _disambiguate(db, single["bad"], A_ONLY)
+    assert code == 200 and body.get("executive_summary") == "WHOLE DAY PROSE"
+    _set(db, single["a"], "suspended")
+    code, body = _disambiguate(db, single["bad"], A_ONLY)
+    assert code == 404 and "WHOLE DAY PROSE" not in json.dumps(body)
+
+
+def test_single_candidate_flag_off_is_unchanged(db, single, flag_off):
+    before = _disambiguate(db, single["bad"], DATE)
+    before_v = _disambiguate(db, single["bad"], A_ONLY)
+    _set(db, single["a"], "suspended")
+    assert _disambiguate(db, single["bad"], DATE) == before
+    assert _disambiguate(db, single["bad"], A_ONLY) == before_v
+    assert before_v[1].get("executive_summary") == "WHOLE DAY PROSE"
+
+
+def test_single_candidate_nobody_inactive_is_unchanged(db, single, flag_on, monkeypatch):
+    on = _disambiguate(db, single["bad"], DATE)
+    monkeypatch.delenv(FLAG, raising=False)
+    assert _disambiguate(db, single["bad"], DATE) == on
