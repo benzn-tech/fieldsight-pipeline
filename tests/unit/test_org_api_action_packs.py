@@ -721,6 +721,13 @@ def test_store_rejects_a_snapshot_key_on_a_non_web_source(task_env, monkeypatch)
     assert stored == [] and recorded == []
 
 
+def test_store_rejects_a_snapshot_key_on_a_web_answer(task_env, monkeypatch):
+    recorded, stored = _store_env(monkeypatch)
+    src = dict(WEB, kind="web_answer")         # right key, provenance web, wrong kind
+    assert _store({"sources": [src]}) == {"error": "invalid", "detail": "snapshot_key"}
+    assert stored == [] and recorded == []
+
+
 def test_store_refused_records_nothing(task_env, monkeypatch):
     recorded, _ = _store_env(monkeypatch, outcome="refused")
     assert _store({"sources": [WEB]}) == {"error": "refused"}

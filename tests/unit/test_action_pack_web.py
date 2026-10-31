@@ -73,6 +73,16 @@ def test_bad_plans_are_refused(plan, code):
     assert exc.value.code == code
 
 
+@pytest.mark.parametrize("args,kw", [
+    (([("q1", "free text from a record")],), {}),
+    (([("q1", "free text")],), {"_token": object()}),
+    (([("q1", "free text")],), {"_token": None}),
+])
+def test_queries_cannot_be_built_around_the_plan(args, kw):
+    with pytest.raises(TypeError):
+        apw.WebQueries(*args, **kw)
+
+
 def test_300_chars_is_the_cap_and_three_queries_the_most():
     plan = [{"id": f"q{i}", "text": "x" * 300} for i in (1, 2, 3)]
     assert apw.WebQueries.from_plan(plan).ids == ("q1", "q2", "q3")

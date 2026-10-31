@@ -7,17 +7,22 @@ guard, and the guard decides the address the connection is made to:
 * `vet_url` -- https only, no userinfo, port 443 only, a host that is a canonical IP literal
   or a DNS name (numeric shortcuts such as 2130706433 / 0x7f000001 / 0177.0.0.1 / 127.1 and
   localhost are refused by name), resolved ONCE; refused when ANY answer is not a public
-  address (`address_allowed`). It returns the first vetted address.
-* `PinnedHTTPSConnection` -- dials that vetted address and wraps it in TLS with SNI and
+  address (`address_allowed`). It returns the vetted addresses, IPv4 first.
+* `PinnedHTTPSConnection` -- dials a vetted address and wraps it in TLS with SNI and
   certificate verification for the HOSTNAME. There is no second resolution, so DNS
-  rebinding cannot swap the address between the check and the connect.
+  rebinding cannot swap the address between the check and the connect. A connect failure
+  tries the next VETTED address (never a new lookup).
 * Redirects are followed by hand, at most MAX_REDIRECTS, every hop through `vet_url` again.
-* A per-page deadline on an injected monotonic clock (a slow-drip server defeats socket
-  timeouts), at most MAX_DOWNLOAD_BYTES read (then `truncated`), at most MAX_TEXT_BYTES of
-  text kept, text/html and text/plain only, identity encoding only.
+* A per-page deadline that holds in every phase. A socket timeout bounds one recv only (a
+  slow-drip server defeats it), so each hop arms a watchdog timer that shuts the socket
+  down at the deadline; the socket timeout is also reset to the time left before every
+  read, and the body is read with read1 (never "block until n bytes"). At most
+  MAX_DOWNLOAD_BYTES read (then `truncated`), at most MAX_TEXT_BYTES of text kept,
+  text/html and text/plain only, identity encoding only.
 * robots.txt via urllib.robotparser.parse on text fetched through this same guarded path
   (never RobotFileParser.read, which opens its own connection), once per host per Fetcher.
-  Missing (any 4xx), unreachable or refused robots.txt = allow all; only an explicit
+  RFC 9309: a 4xx robots.txt = allow all; a 5xx, timeout, network/TLS error or a refused
+  robots fetch = unreachable = disallow all (reason 'robots_unavailable'); an explicit
   disallow skips the page (reason 'robots').
 
 Every seam is injectable: the resolver, the connection factory, both clocks. Tests make no
@@ -35,6 +40,7 @@ import logging
 import re
 import socket
 import ssl
+import threading
 import time
 import urllib.robotparser
 from dataclasses import dataclass
@@ -85,8 +91,13 @@ class Refused(Exception):
 class Target:
     url: str
     host: str          # what Host and SNI carry (IDNA ascii, lower case, no trailing dot)
-    ip: str            # the vetted address the connection dials
+    ips: tuple         # every vetted address, IPv4 first; dialled in order, never re-resolved
     path: str          # path + query, never the fragment
+
+    @property
+    def ip(self) -> str:
+        """The address dialled first."""
+        return self.ips[0]
 
 
 def address_allowed(ip) -> bool:
@@ -189,7 +200,14 @@ def vet_url(url, resolver) -> Target:
     path = quote(parts.path or "/", safe=_PATH_SAFE)
     if parts.query:
         path += "?" + quote(parts.query, safe=_QUERY_SAFE)
-    return Target(url=url, host=host, ip=str(ips[0]), path=path)
+    ordered = []
+    for ip in ips:
+        ip = str(ip)
+        if ip not in ordered:
+            ordered.append(ip)
+    # IPv4 first (a Lambda outside a VPC usually has no IPv6 route); order kept otherwise.
+    ordered.sort(key=lambda a: ipaddress.ip_address(a).version != 4)
+    return Target(url=url, host=host, ips=tuple(ordered), path=path)
 
 
 class PinnedHTTPSConnection(http.client.HTTPSConnection):
@@ -203,7 +221,11 @@ class PinnedHTTPSConnection(http.client.HTTPSConnection):
 
     def connect(self):
         sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
-        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        # Handshake after self.sock is set, so the deadline watchdog can shut the socket
+        # down during a slow handshake too.
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host,
+                                              do_handshake_on_connect=False)
+        self.sock.do_handshake()
 
 
 def default_connect(host, ip, port, timeout):
@@ -285,8 +307,11 @@ def _content_type(value):
 
 
 def _decode(raw, charset):
+    """Decode with the declared charset when it is a TEXT encoding (not base64, zlib, rot13,
+    ...); anything else or unknown -> utf-8 with replacement."""
     try:
-        codecs.lookup(charset or "utf-8")
+        if not codecs.lookup(charset or "utf-8")._is_text_encoding:
+            charset = "utf-8"
     except LookupError:
         charset = "utf-8"
     return raw.decode(charset or "utf-8", errors="replace")
@@ -301,10 +326,74 @@ def _close(conn):
         pass
 
 
+def _sock_of(conn):
+    return getattr(conn, "sock", None)
+
+
+def _set_timeout(conn, seconds):
+    sock = _sock_of(conn)
+    if sock is not None:
+        try:
+            sock.settimeout(max(0.001, seconds))
+        except OSError:
+            pass
+
+
+def _abort(conn):
+    """Unblock whatever this connection is blocked in (connect/handshake/headers/body):
+    shut the socket down. Runs on the watchdog thread, so it never closes the connection
+    object (the fetching thread does that)."""
+    sock = _sock_of(conn)
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    hook = getattr(conn, "abort", None)          # a test double may expose one
+    if callable(hook):
+        hook()
+
+
+class _Watchdog:
+    """Fires once at the deadline and aborts the connection."""
+
+    def __init__(self, seconds, conn):
+        self.fired = False
+        self._conn = conn
+        self._timer = threading.Timer(max(0.0, seconds), self._fire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _fire(self):
+        self.fired = True
+        _abort(self._conn)
+
+    def cancel(self):
+        self._timer.cancel()
+
+
 class _Fail(Exception):
     def __init__(self, code, status=None):
         super().__init__(code)
         self.code, self.status = code, status
+
+
+def _as_fail(exc, watchdog):
+    """The _Fail an exception from the connection means, or None to re-raise it."""
+    if isinstance(exc, _Fail):
+        return exc
+    if watchdog is not None and watchdog.fired:
+        return _Fail("timeout")
+    if isinstance(exc, ssl.SSLError):
+        return _Fail("tls")
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return _Fail("timeout")
+    if isinstance(exc, (OSError, http.client.HTTPException)):
+        return _Fail("network")
+    return None
+
+
+_ROBOTS_UNAVAILABLE = object()      # cache value: robots.txt unreachable -> disallow all
 
 
 class Fetcher:
@@ -322,7 +411,7 @@ class Fetcher:
         self._now = now or (lambda: dt.datetime.now(dt.timezone.utc))
         self._timeout = float(page_timeout)
         self._check_robots = check_robots
-        self._robots = {}             # host -> RobotFileParser | None (allow all)
+        self._robots = {}             # host -> RobotFileParser | None (allow all) | _ROBOTS_UNAVAILABLE
 
     # ---------------------------------------------------------------- public
 
@@ -373,94 +462,144 @@ class Fetcher:
         current = url
         for hop in range(MAX_REDIRECTS + 1):
             target = vet_url(current, self._resolve)
-            if robots and not self._robots_allow(target):
-                raise _Fail("robots")
-            status, headers, resp, conn = self._open(target, deadline)
-            try:
-                if status in _REDIRECTS:
-                    location = headers("Location")
-                    if not location:
-                        raise _Fail("redirect_without_location", status)
-                    if hop == MAX_REDIRECTS:
-                        raise _Fail("too_many_redirects", status)
-                    current = urljoin(target.url, location.strip())
-                    continue
-                if status != 200:
-                    raise _Fail("http_status", status)
-                ctype = _content_type(headers("Content-Type"))
-                if types is not None and ctype[0] not in types:
-                    raise _Fail("content_type", status)
-                enc = (headers("Content-Encoding") or "identity").strip().lower()
-                if enc not in ("", "identity"):
-                    raise _Fail("content_encoding", status)
-                raw, truncated = self._read(resp, deadline, max_bytes)
-                return current, status, ctype, raw, truncated
-            finally:
-                _close(conn)
+            if robots:
+                verdict = self._robots_verdict(target)
+                if verdict is not None:
+                    raise _Fail(verdict)
+            out = self._exchange(target, deadline, max_bytes=max_bytes, types=types)
+            if out[0] == "redirect":
+                _, location, status = out
+                if hop == MAX_REDIRECTS:
+                    raise _Fail("too_many_redirects", status)
+                current = urljoin(target.url, location.strip())
+                continue
+            _, status, ctype, raw, truncated = out
+            return current, status, ctype, raw, truncated
         raise _Fail("too_many_redirects")      # unreachable; the loop returns or raises
 
-    def _open(self, target, deadline):
-        timeout = self._left(deadline)
-        conn = None
+    def _exchange(self, target, deadline, *, max_bytes, types):
+        """One request to an already-vetted target. ('redirect', location, status) or
+        ('ok', status, (media, charset), raw, truncated); raises _Fail. The watchdog armed
+        in _open holds the deadline through connect, handshake, headers and body."""
+        conn = watchdog = None
         try:
-            conn = self._connect(target.host, target.ip, 443, timeout)
-            # No explicit Host: http.client writes the hostname (bracketing an IPv6 literal).
-            conn.request("GET", target.path, headers={
-                "User-Agent": USER_AGENT,
-                "Accept": "text/html, text/plain;q=0.9",
-                "Accept-Encoding": "identity", "Connection": "close"})
-            resp = conn.getresponse()
-            self._left(deadline)
-        except BaseException as exc:
+            conn, watchdog = self._open(target, deadline)
+            try:
+                _set_timeout(conn, self._left(deadline))
+                # No explicit Host: http.client writes the hostname (bracketing IPv6).
+                conn.request("GET", target.path, headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "text/html, text/plain;q=0.9",
+                    "Accept-Encoding": "identity", "Connection": "close"})
+                resp = conn.getresponse()
+                self._left(deadline)
+                status = resp.status
+                if status in _REDIRECTS:
+                    location = resp.getheader("Location")
+                    if not location:
+                        raise _Fail("redirect_without_location", status)
+                    return "redirect", location, status
+                if status != 200:
+                    raise _Fail("http_status", status)
+                ctype = _content_type(resp.getheader("Content-Type"))
+                if types is not None and ctype[0] not in types:
+                    raise _Fail("content_type", status)
+                enc = (resp.getheader("Content-Encoding") or "identity").strip().lower()
+                if enc not in ("", "identity"):
+                    raise _Fail("content_encoding", status)
+                raw, truncated = self._read(conn, resp, deadline, max_bytes)
+                return "ok", status, ctype, raw, truncated
+            except BaseException as exc:
+                fail = _as_fail(exc, watchdog)
+                if fail is None or fail is exc:
+                    raise
+                raise fail
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
             _close(conn)
-            if isinstance(exc, ssl.SSLError):
-                raise _Fail("tls")
-            if isinstance(exc, (socket.timeout, TimeoutError)):
-                raise _Fail("timeout")
-            if isinstance(exc, (OSError, http.client.HTTPException)):
-                raise _Fail("network")
-            raise
-        return resp.status, resp.getheader, resp, conn
 
-    def _read(self, resp, deadline, max_bytes):
+    def _open(self, target, deadline):
+        """A connected (conn, watchdog) to the first vetted address that accepts; the next
+        vetted address on a connect failure, never a new lookup. A TLS failure is final."""
+        last = _Fail("network")
+        for ip in target.ips:
+            left = self._left(deadline)
+            conn = self._connect(target.host, ip, 443, left)
+            watchdog = _Watchdog(left, conn)
+            try:
+                connect = getattr(conn, "connect", None)
+                if callable(connect):
+                    connect()
+                return conn, watchdog
+            except BaseException as exc:
+                watchdog.cancel()
+                _close(conn)
+                fail = _as_fail(exc, watchdog)
+                if fail is None:
+                    raise
+                if fail.code == "tls":
+                    raise fail
+                last = fail
+                logger.info("web fetch connect failed reason=%s; next vetted address",
+                            fail.code)
+        raise last
+
+    def _read(self, conn, resp, deadline, max_bytes):
+        """Up to max_bytes (+1 to detect truncation). read1 returns what one recv gives, so
+        a read never waits for a full chunk; the socket timeout is reset to the time left
+        before each read and the watchdog covers the rest."""
         buf = bytearray()
-        try:
-            while len(buf) <= max_bytes:
-                self._left(deadline)
-                chunk = resp.read(min(_CHUNK, max_bytes + 1 - len(buf)))
-                if not chunk:
-                    break
-                buf += chunk
-                self._left(deadline)
-        except (socket.timeout, TimeoutError):
-            raise _Fail("timeout")
-        except (OSError, http.client.HTTPException):
-            raise _Fail("network")
+        read = getattr(resp, "read1", None) or resp.read
+        while len(buf) <= max_bytes:
+            _set_timeout(conn, self._left(deadline))
+            chunk = read(min(_CHUNK, max_bytes + 1 - len(buf)))
+            if not chunk:
+                break
+            buf += chunk
+            self._left(deadline)
         if len(buf) > max_bytes:
             return bytes(buf[:max_bytes]), True
         return bytes(buf), False
 
-    def _robots_allow(self, target) -> bool:
+    def _robots_verdict(self, target):
+        """None (fetch allowed), 'robots' (disallowed) or 'robots_unavailable'."""
         if target.host not in self._robots:
             self._robots[target.host] = self._load_robots(target.host)
         parser = self._robots[target.host]
-        return parser is None or parser.can_fetch(ROBOTS_TOKEN, target.url)
+        if parser is None:
+            return None
+        if parser is _ROBOTS_UNAVAILABLE:
+            return "robots_unavailable"
+        return None if parser.can_fetch(ROBOTS_TOKEN, target.url) else "robots"
 
     def _load_robots(self, host):
-        """A parser, or None = allow all (missing, 4xx, unreachable, refused, unparsable)."""
+        """RFC 9309 §2.3.1: a parser; None = allow all (any 4xx, a 2xx other than 200,
+        more redirects than we follow); _ROBOTS_UNAVAILABLE = disallow all (5xx, timeout,
+        network/TLS error, a refused hop, anything else)."""
         deadline = self._clock() + self._timeout
         try:
             authority = f"[{host}]" if ":" in host else host      # an IPv6 literal
             _, _, ctype, raw, _ = self._get(f"https://{authority}/robots.txt", deadline,
                                             max_bytes=MAX_ROBOTS_BYTES, types=None,
                                             robots=False)
-        except (Refused, _Fail) as exc:
-            logger.info("web fetch robots unavailable reason=%s",
-                        getattr(exc, "code", "unknown"))
-            return None
+        except _Fail as exc:
+            st = exc.status
+            if (exc.code == "http_status" and st is not None
+                    and (400 <= st < 500 or 200 <= st < 300)) \
+                    or exc.code == "too_many_redirects":
+                logger.info("web fetch robots absent reason=%s status=%s -> allow",
+                            exc.code, st)
+                return None
+            logger.info("web fetch robots unreachable reason=%s status=%s -> disallow",
+                        exc.code, st)
+            return _ROBOTS_UNAVAILABLE
+        except Refused as exc:
+            logger.info("web fetch robots refused reason=%s -> disallow", exc.code)
+            return _ROBOTS_UNAVAILABLE
         except Exception as exc:      # noqa: BLE001
-            logger.warning("web fetch robots error type=%s", type(exc).__name__)
-            return None
+            logger.warning("web fetch robots error type=%s -> disallow", type(exc).__name__)
+            return _ROBOTS_UNAVAILABLE
         parser = urllib.robotparser.RobotFileParser()
         parser.parse(_decode(raw, ctype[1]).splitlines())
         parser.modified()              # can_fetch answers False until "checked"

@@ -42,7 +42,8 @@ def snapshot_key(company_id, pack_id, ref) -> str:
 
 def snapshot_key_error(payload, company_id, pack_id):
     """None, or 'snapshot_key' when any source's snapshot_s3_key is not EXACTLY
-    snapshot_key(company_id, pack_id, <its own ref>) or sits on a non-web source. Run by
+    snapshot_key(company_id, pack_id, <its own ref>) or sits on anything but a web_source
+    (kind 'web_source', provenance 'web' -- a web_answer has no page to snapshot). Run by
     the store task before anything is written: a key elsewhere would be recorded in the
     lake ownership index under this pack's company."""
     for s in (payload or {}).get("sources") or []:
@@ -53,7 +54,7 @@ def snapshot_key_error(payload, company_id, pack_id):
             want = snapshot_key(company_id, pack_id, s.get("ref"))
         except ValueError:
             return "snapshot_key"
-        if s.get("provenance") != "web" or key != want:
+        if s.get("kind") != "web_source" or s.get("provenance") != "web" or key != want:
             return "snapshot_key"
     return None
 

@@ -212,7 +212,7 @@ class Resolver:
             found = self._c["slug"].get(p["site_slug"]) or []
             if len(found) == 1:  # R5c: slugs are unique per company only
                 site, company = _s(found[0]["id"]), found[0]["company_id"]
-        elif p["kind"] == "company_summary" and p["company_id"]:
+        elif p["kind"] in ("company_summary", "action_pack_web") and p["company_id"]:
             company = _uuid(p["company_id"])
         if company is None:
             return False

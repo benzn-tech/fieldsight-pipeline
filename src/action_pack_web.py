@@ -47,17 +47,24 @@ class WebQueryError(ValueError):
         self.code = code
 
 
-class WebQueries:
-    """The run's fixed web queries. Each id may be searched at most once."""
+_FROM_PLAN = object()       # only from_plan may construct WebQueries
 
-    def __init__(self, queries):
+
+class WebQueries:
+    """The run's fixed web queries. Each id may be searched at most once. Built ONLY by
+    `from_plan` (the constructor refuses any other caller), so no stage can mint a query
+    that skipped the plan's checks."""
+
+    def __init__(self, queries, *, _token=None):
+        if _token is not _FROM_PLAN:
+            raise TypeError("WebQueries is built only by WebQueries.from_plan")
         self._texts = dict(queries)
         self._searched = set()
 
     @classmethod
     def from_plan(cls, planned) -> "WebQueries":
         if planned is None:
-            return cls([])
+            return cls([], _token=_FROM_PLAN)
         if not isinstance(planned, list):
             raise WebQueryError("plan_not_list")
         if len(planned) > MAX_QUERIES:
@@ -76,7 +83,7 @@ class WebQueries:
             if any(qid == seen for seen, _ in out):
                 raise WebQueryError("duplicate_query_id")
             out.append((qid, text))
-        return cls(out)
+        return cls(out, _token=_FROM_PLAN)
 
     @property
     def ids(self) -> tuple:

@@ -30,17 +30,27 @@ class FakeResponse:
         return self._headers.get(name.lower(), default)
 
     def read(self, n=None):
+        """http.client semantics: n bytes unless EOF comes first."""
         n = len(self._body) - self._pos if n is None else n
         self.reads.append(n)
         out = self._body[self._pos:self._pos + n]
         self._pos += len(out)
         return out
 
+    def read1(self, n=-1):
+        """At most n bytes, whatever one recv would give (here: all that is buffered)."""
+        return self.read(len(self._body) - self._pos if n is None or n < 0 else n)
+
 
 class FakeConn:
     def __init__(self, server, host, ip, port, timeout):
         self.server, self.host, self.ip, self.port, self.timeout = server, host, ip, port, timeout
         self.closed = False
+
+    def connect(self):
+        err = self.server.refuse.get(self.ip)
+        if err is not None:
+            raise err
 
     def request(self, method, path, headers=None):
         self.server.requests.append({"host": self.host, "ip": self.ip, "port": self.port,
@@ -69,6 +79,7 @@ class FakeServer:
         self.routes = dict(routes or {})
         self.requests = []
         self.connects = []
+        self.refuse = {}                    # ip -> exception raised by connect()
 
     def connect(self, host, ip, port, timeout):
         self.connects.append((host, ip, port))
@@ -256,16 +267,21 @@ def test_real_pinned_connection_dials_the_ip_and_verifies_the_hostname(monkeypat
         verify_mode = ssl.CERT_REQUIRED
         check_hostname = True
 
-        def wrap_socket(self, sock, server_hostname=None):
+        def wrap_socket(self, sock, server_hostname=None, do_handshake_on_connect=True):
             dialled["wrapped"], dialled["sni"] = sock, server_hostname
-            return "tls-socket"
+            dialled["lazy_handshake"] = do_handshake_on_connect is False
+            return FakeTLS()
+
+    class FakeTLS:
+        def do_handshake(self):
+            dialled["handshake"] = True
 
     monkeypatch.setattr(wf.socket, "create_connection", fake_create_connection)
     conn = wf.PinnedHTTPSConnection("example.org", PUBLIC, timeout=7, context=FakeContext())
     conn.connect()
     assert dialled == {"addr": (PUBLIC, 443), "timeout": 7, "wrapped": "raw-socket",
-                       "sni": "example.org"}
-    assert conn.sock == "tls-socket" and conn.host == "example.org"
+                       "sni": "example.org", "lazy_handshake": True, "handshake": True}
+    assert isinstance(conn.sock, FakeTLS) and conn.host == "example.org"
 
 
 def test_default_tls_context_verifies_certificates():
@@ -415,9 +431,9 @@ def test_slow_drip_body_hits_the_page_deadline():
     t = [0.0]
 
     class Drip(FakeResponse):
-        def read(self, n=None):
-            t[0] += 4.0                     # every chunk costs 4 s of wall time
-            return b"x" * 10
+        def read1(self, n=-1):
+            t[0] += 4.0                     # every recv costs 4 s of (fake) time
+            return b"x" * min(10, n)
 
     server = FakeServer({("example.org", "/slow"): Drip(200, {"Content-Type": "text/plain"})})
     f = wf.Fetcher(resolver=resolver_of({"example.org": [PUBLIC]}), connect=server.connect,
@@ -495,22 +511,42 @@ def test_robots_for_our_token_is_honoured():
     FakeResponse(404, {"Content-Type": "text/html"}, b"missing"),
     FakeResponse(403, {"Content-Type": "text/html"}, b"forbidden"),
     FakeResponse(401, {}, b""),
-    ConnectionResetError("reset"),
+    FakeResponse(410, {}, b""),
 ])
-def test_robots_missing_forbidden_or_unreachable_allows(robots):
+def test_robots_4xx_allows_all(robots):
+    """RFC 9309 2.3.1.3: an unavailable (4xx) robots.txt means no restrictions."""
     f, _, _ = make({("example.org", "/robots.txt"): robots,
                     ("example.org", "/a"): html("<p>a</p>")})
     assert f.fetch("https://example.org/a")["ok"] is True
 
 
+@pytest.mark.parametrize("robots", [
+    FakeResponse(500, {"Content-Type": "text/html"}, b"oops"),
+    FakeResponse(503, {}, b""),
+    ConnectionResetError("reset"),
+    socket.timeout("timed out"),
+    ssl.SSLError("handshake"),
+])
+def test_robots_unreachable_disallows_all(robots):
+    """RFC 9309 2.3.1.4: a 5xx or an unreachable robots.txt means complete disallow. The
+    verdict is cached: no page on that host is fetched in this run."""
+    f, server, _ = make({("example.org", "/robots.txt"): robots,
+                         ("example.org", "/a"): html("<p>a</p>"),
+                         ("example.org", "/b"): html("<p>b</p>")})
+    for path in ("/a", "/b"):
+        r = f.fetch("https://example.org" + path)
+        assert r["ok"] is False and r["reason"] == "robots_unavailable"
+    assert [q["path"] for q in server.requests] == ["/robots.txt"]
+
+
 def test_robots_is_fetched_through_the_same_guard():
-    """robots.txt redirecting to a private host is refused (and so treated as allow-all);
-    the private host is never contacted."""
+    """robots.txt redirecting to a private host is refused by the guard: unreachable, so
+    disallow all. The private host is never contacted."""
     f, server, _ = make({("example.org", "/robots.txt"): FakeResponse(
         302, {"Location": "https://inside.example/robots.txt"}),
         ("example.org", "/a"): html("<p>a</p>")},
         dns={"example.org": [PUBLIC], "inside.example": ["192.168.0.2"]})
-    assert f.fetch("https://example.org/a")["ok"] is True
+    assert f.fetch("https://example.org/a")["reason"] == "robots_unavailable"
     assert all(c[0] != "inside.example" for c in server.connects)
 
 
@@ -581,3 +617,161 @@ def test_connection_is_closed_when_the_deadline_passes_after_the_response():
                    clock=lambda: t[0], page_timeout=10, check_robots=False)
     assert f.fetch("https://example.org/s")["reason"] == "timeout"
     assert conns and all(c.closed for c in conns)
+
+
+# ------------------------------------------------------- fix round 1: pinning order
+
+def test_vetted_addresses_put_ipv4_first():
+    t = wf.vet_url("https://dual.example/", resolver_of({"dual.example": [PUBLIC6, PUBLIC,
+                                                                          PUBLIC6, "8.8.8.8"]}))
+    assert t.ips == (PUBLIC, "8.8.8.8", PUBLIC6) and t.ip == PUBLIC
+
+
+def test_connect_failure_tries_the_next_vetted_address_without_resolving_again():
+    server = FakeServer({("multi.example", "/"): html("<p>ok</p>")})
+    server.refuse[PUBLIC] = ConnectionRefusedError("refused")
+    resolve = resolver_of({"multi.example": [PUBLIC, "8.8.8.8"]})
+    f = wf.Fetcher(resolver=resolve, connect=server.connect, check_robots=False)
+    r = f.fetch("https://multi.example/")
+    assert r["ok"] is True
+    assert server.connects == [("multi.example", PUBLIC, 443), ("multi.example", "8.8.8.8", 443)]
+    assert resolve.calls == [("multi.example", 443)]
+
+
+def test_every_vetted_address_failing_is_a_network_failure():
+    server = FakeServer({})
+    server.refuse[PUBLIC] = ConnectionRefusedError("refused")
+    server.refuse["8.8.8.8"] = OSError("unreachable")
+    f = wf.Fetcher(resolver=resolver_of({"multi.example": [PUBLIC, "8.8.8.8"]}),
+                   connect=server.connect, check_robots=False)
+    assert f.fetch("https://multi.example/")["reason"] == "network"
+    assert len(server.connects) == 2
+
+
+def test_tls_failure_on_connect_is_final():
+    server = FakeServer({})
+    server.refuse[PUBLIC] = ssl.SSLCertVerificationError("bad cert")
+    f = wf.Fetcher(resolver=resolver_of({"multi.example": [PUBLIC, "8.8.8.8"]}),
+                   connect=server.connect, check_robots=False)
+    assert f.fetch("https://multi.example/")["reason"] == "tls"
+    assert len(server.connects) == 1
+
+
+# ------------------------------------------------------- fix round 1: charset
+
+@pytest.mark.parametrize("charset", ["base64", "zlib", "rot13", "hex", "uu"])
+def test_a_non_text_codec_charset_falls_back_to_utf8(charset):
+    f, _, _ = make({("example.org", "/c"): FakeResponse(
+        200, {"Content-Type": f"text/plain; charset={charset}"}, "héllo".encode())})
+    r = f.fetch("https://example.org/c")
+    assert r["ok"] is True and r["text"] == "héllo"
+
+
+# --------------------------------------- fix round 1: the deadline on a real socket
+# A loopback server thread (no internet). The guard refuses loopback, so these call the
+# fetcher's one-hop path (_exchange) with a hand-made Target and a plain HTTP connection to
+# the local port: what is under test is the deadline, not the guard or TLS.
+
+import http.client  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+
+DEADLINE_S = 1.0
+MARGIN_S = 0.75
+
+
+def _local_server(script):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    stop = threading.Event()
+
+    def run():
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            return
+        try:
+            conn.recv(65536)                    # the request
+            script(conn, stop)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    return srv, stop
+
+
+def _drip(conn, stop, data, every=0.1):
+    for i in range(len(data)):
+        if stop.wait(every):
+            return
+        conn.sendall(data[i:i + 1])
+
+
+def _run_hop(script):
+    srv, stop = _local_server(script)
+    port = srv.getsockname()[1]
+    try:
+        f = wf.Fetcher(connect=lambda host, ip, p, timeout: http.client.HTTPConnection(
+            ip, port, timeout=timeout), page_timeout=DEADLINE_S)
+        target = wf.Target(url="https://loopback.test/", host="loopback.test",
+                           ips=("127.0.0.1",), path="/")
+        started = time.monotonic()
+        with pytest.raises(wf._Fail) as exc:
+            f._exchange(target, started + DEADLINE_S, max_bytes=wf.MAX_DOWNLOAD_BYTES,
+                        types=wf.ALLOWED_TYPES)
+        return exc.value.code, time.monotonic() - started
+    finally:
+        stop.set()
+        srv.close()
+
+
+def test_header_phase_drip_is_stopped_at_the_deadline():
+    """Every byte arrives well inside the socket timeout, so only the deadline watchdog
+    can stop getresponse()."""
+    head = b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * 400 + b"\r\n\r\n"
+    code, elapsed = _run_hop(lambda c, stop: _drip(c, stop, head))
+    assert code == "timeout" and elapsed < DEADLINE_S + MARGIN_S
+
+
+def test_body_phase_drip_is_stopped_at_the_deadline():
+    head = (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100000\r\n"
+            b"Connection: close\r\n\r\n")
+
+    def script(c, stop):
+        c.sendall(head)
+        _drip(c, stop, b"x" * 100000)
+    code, elapsed = _run_hop(script)
+    assert code == "timeout" and elapsed < DEADLINE_S + MARGIN_S
+
+
+def test_body_phase_silence_is_stopped_at_the_deadline():
+    head = (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100000\r\n"
+            b"Connection: close\r\n\r\n")
+
+    def script(c, stop):
+        c.sendall(head + b"x" * 10)
+        stop.wait(30)
+    code, elapsed = _run_hop(script)
+    assert code == "timeout" and elapsed < DEADLINE_S + MARGIN_S
+
+
+def test_local_page_inside_the_deadline_is_read_whole():
+    body = b"hello from loopback"
+    head = (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n"
+            b"Connection: close\r\n\r\n" % len(body))
+    srv, stop = _local_server(lambda c, s: c.sendall(head + body))
+    port = srv.getsockname()[1]
+    try:
+        f = wf.Fetcher(connect=lambda host, ip, p, timeout: http.client.HTTPConnection(
+            ip, port, timeout=timeout))
+        target = wf.Target(url="https://loopback.test/", host="loopback.test",
+                           ips=("127.0.0.1",), path="/")
+        out = f._exchange(target, time.monotonic() + 5, max_bytes=wf.MAX_DOWNLOAD_BYTES,
+                          types=wf.ALLOWED_TYPES)
+        assert out[0] == "ok" and out[3] == body and out[4] is False
+    finally:
+        stop.set()
+        srv.close()
