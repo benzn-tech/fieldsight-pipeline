@@ -181,3 +181,36 @@ def test_the_backlog_function_may_read_the_directory():
                       re.S | re.M).group(1)
     assert "${DataBucketName}/config/directory.json" in block
     assert "COMPANY_STATUS_ENFORCE: !Ref CompanyStatusEnforce" in block
+
+
+class _BadBodyS3(S3):
+    """A notice whose body is not JSON (or cannot be read)."""
+    def __init__(self, objs, body=b"{not json", raise_on_read=False):
+        super().__init__(objs)
+        self._body, self._raise = body, raise_on_read
+
+    def get_object(self, Bucket=None, Key=None):
+        if self._raise:
+            raise RuntimeError("unreadable")
+        body = self._body
+        return {"Body": type("B", (), {"read": lambda s: body})()}
+
+
+@pytest.mark.parametrize("raise_on_read", [False, True], ids=["malformed", "unreadable"])
+def test_flag_off_malformed_notice_still_expires_as_before(monkeypatch, published,
+                                                           raise_on_read):
+    """R1: the hold check must never change the flag-off outcome. A body that cannot be
+    read / parsed while some company is inactive expires exactly as it did before."""
+    monkeypatch.setenv("COMPANY_STATUS_ENFORCE", "off")
+    published["inactive_companies"] = {"co-B": "suspended"}
+    s3 = _BadBodyS3({KEY: (NOW - timedelta(hours=25), NOTICE)}, raise_on_read=raise_on_read)
+    out, snd = _run(s3)
+    assert out == (0, 0, 1) and KEY not in s3.objs
+
+
+def test_flag_on_malformed_notice_falls_through_to_the_old_path(monkeypatch, published):
+    monkeypatch.setenv("COMPANY_STATUS_ENFORCE", "on")
+    published["inactive_companies"] = {"co-B": "suspended"}
+    s3 = _BadBodyS3({KEY: (NOW - timedelta(hours=25), NOTICE)})
+    out, snd = _run(s3)
+    assert out == (0, 0, 1) and KEY not in s3.objs

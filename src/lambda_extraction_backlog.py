@@ -573,12 +573,18 @@ def send_external_member_notices(client, now=None, sender=None):
 def _hold_notice(client, key, modified, now, published):
     """True when this notice is held (its site's company is inactive and the flag is
     on); a held notice that is NOTICE_HOLD_REFRESH old is copied onto itself unchanged so its
-    expiry clock restarts."""
-    raw = client.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
-    n = json.loads(raw)
-    reason = directory.suppress_reason(
-        published, site_id=n.get("site_id"), company_id=n.get("site_company_id"),
-        where="external-member-notice")
+    expiry clock restarts. A notice whose body cannot be read / parsed is not held: the
+    pre-existing path decides (expiry / send / retry) exactly as it did before."""
+    try:
+        raw = client.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
+        n = json.loads(raw)
+        reason = directory.suppress_reason(
+            published, site_id=n.get("site_id"), company_id=n.get("site_company_id"),
+            where="external-member-notice")
+    except Exception:                                  # noqa: BLE001
+        logger.exception("backlog: external-member notice %s could not be checked for "
+                         "a hold; not held", key)
+        return False
     if not reason:
         return False
     if modified and now - modified >= NOTICE_HOLD_REFRESH:
