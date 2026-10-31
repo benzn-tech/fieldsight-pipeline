@@ -51,6 +51,10 @@ def _single_company_world_defaults(request):
             # None and nothing is filtered even when a test turns the flag on. Its SQL is
             # proven in tests/integration/test_company_choke_point.py.
             mp.setattr(tenancy_status, "inactive_company_ids", lambda conn: set())
+            # Email / report suppression (Task 9): no site row, so the company fallback
+            # (company_status above: active) decides. Its SQL is proven in
+            # tests/integration/test_tenancy_status.py.
+            mp.setattr(tenancy_status, "site_company_status", lambda conn, site_id: None)
         org =sys.modules.get("lambda_org_api")      # never import it just for this
         if org is not None:
             # The session whitelist (final review F1) asks the database which sessions lie

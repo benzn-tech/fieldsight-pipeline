@@ -128,6 +128,9 @@ def request_body(w, template, topic_ids=None):
     return body
 
 
+_UNREAD = object()
+
+
 def auto_generate(conn, company_id, folder, date, session, windows, generate=None):
     """Send each matched check of a final extraction to the report worker,
     once. `windows` are the rows just stored (start_at/end_at to the second,
@@ -151,6 +154,11 @@ def auto_generate(conn, company_id, folder, date, session, windows, generate=Non
     # this is untouched (R6). Flag off: logs and generates as today.
     blocked = (tenancy_status.caller_blocked(conn, caller, where="checklist-auto-report")
                if caller is not None else None)
+    # Company offboarding, Task 9 (spec §5.5): no report for a check recorded on an
+    # inactive company's SITE (`company_id` is the site's company), whoever recorded it.
+    # Read once, inside the per-check try: a failed read costs that check ("error"),
+    # never the extraction. Flag off: logged COMPANY_GATE_WOULD_SUPPRESS, generated.
+    suppressed = _UNREAD
     for w in matched:
         try:
             if caller is None:
@@ -160,6 +168,13 @@ def auto_generate(conn, company_id, folder, date, session, windows, generate=Non
             if blocked:
                 out.append((w["name"], blocked))
                 pipeline_trace.event("checklist_report", blocked, detail={"check": w["name"]})
+                continue
+            if suppressed is _UNREAD:
+                suppressed = tenancy_status.suppress_reason(
+                    conn, company_id=company_id, where="checklist-auto-report")
+            if suppressed:
+                out.append((w["name"], suppressed))
+                pipeline_trace.event("checklist_report", suppressed, detail={"check": w["name"]})
                 continue
             if already_made(conn, session, w["template_id"], w["start_at"], w.get("end_at"),
                             w.get("segments")):

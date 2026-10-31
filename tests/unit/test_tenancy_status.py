@@ -125,3 +125,29 @@ def test_flag_is_read_per_call(monkeypatch, status_stub):
     assert tenancy_status.caller_blocked(object(), _caller()) is None
     monkeypatch.setenv("COMPANY_STATUS_ENFORCE", "on")
     assert tenancy_status.caller_blocked(object(), _caller()) == "company_inactive"
+
+
+# ---- Task 9: suppress_decision -------------------------------------------------------
+
+@pytest.mark.parametrize("status", ["suspended", "exited"])
+def test_suppress_decision_inactive(monkeypatch, caplog, status):
+    monkeypatch.setenv("COMPANY_STATUS_ENFORCE", "on")
+    caplog.set_level(logging.WARNING)
+    assert tenancy_status.suppress_decision("co-9", status, where="w", site_id="s-1") == \
+        "company_inactive"
+    assert not [r for r in caplog.records if "WOULD_SUPPRESS" in r.getMessage()]
+    monkeypatch.setenv("COMPANY_STATUS_ENFORCE", "off")
+    assert tenancy_status.suppress_decision("co-9", status, where="w", site_id="s-1") is None
+    lines = [r for r in caplog.records if "COMPANY_GATE_WOULD_SUPPRESS" in r.getMessage()]
+    assert len(lines) == 1 and lines[0].levelno == logging.WARNING
+    msg = lines[0].getMessage()
+    assert "where=w" in msg and "company=co-9" in msg and "site=s-1" in msg
+
+
+@pytest.mark.parametrize("status", ["active", None])
+def test_suppress_decision_active_or_unknown_is_silent(monkeypatch, caplog, status):
+    caplog.set_level(logging.WARNING)
+    for flag in ("on", "off"):
+        monkeypatch.setenv("COMPANY_STATUS_ENFORCE", flag)
+        assert tenancy_status.suppress_decision("co-9", status, where="w") is None
+    assert not caplog.records

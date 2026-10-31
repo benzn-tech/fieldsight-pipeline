@@ -234,3 +234,25 @@ def test_a_dry_run_returns_the_document_and_writes_nothing(db, lake):
     out = api.republish_directory(db, dry_run=True)
     assert out["dry_run"] is True and "Two_Sites" in out["document"]["people"]
     assert lake["puts"] == []
+
+
+# ---- Company offboarding, Task 9: inactive companies travel in the directory ----------
+
+def test_THE_inactive_companies_are_published(db, lake):
+    co, *_ = _world(db)
+    api.republish_directory(db)
+    assert str(co["id"]) not in (lake["doc"].get("inactive_companies") or {})
+    db.execute("UPDATE companies SET status = 'suspended' WHERE id = %s", (co["id"],))
+    out = api.republish_directory(db)
+    assert out["changed"] is True
+    assert lake["doc"]["inactive_companies"][str(co["id"])] == "suspended"
+    assert lake["doc"]["sites"]  # the rest of the document is still there
+
+
+def test_THE_directory_publishes_without_the_status_column(db, lake):
+    co, *_ = _world(db)
+    db.execute("ALTER TABLE companies RENAME COLUMN status TO status_gone")
+    out = api.republish_directory(db)
+    assert out["changed"] is True
+    assert "inactive_companies" not in lake["doc"] and lake["doc"]["people"]
+    assert db.execute("SELECT 1").fetchone()[0] == 1

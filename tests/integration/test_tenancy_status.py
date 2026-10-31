@@ -117,3 +117,54 @@ def test_caller_blocked_end_to_end(db, monkeypatch, flag):
     assert tenancy_status.caller_blocked(db, resolve(archived)) == (
         "account_archived" if on else None)
     _assert_usable(db)
+
+
+# ---- Task 9: suppress_reason (customer email / generated reports) ------------------
+
+from repositories import sites as sites_repo  # noqa: E402
+
+
+def _site(db, co):
+    return sites_repo.create_site(db, co["id"], f"Site-ts-{uuid.uuid4().hex[:8]}")
+
+
+@pytest.mark.parametrize("flag", ["on", "off"])
+def test_suppress_reason_keys_on_the_site_company(db, monkeypatch, caplog, flag):
+    monkeypatch.setenv("COMPANY_STATUS_ENFORCE", flag)
+    active, suspended = _company(db), _company(db, "suspended")
+    inactive_site, live_site = _site(db, suspended), _site(db, active)
+    # The site's company decides, not the recipient's home company.
+    got = tenancy_status.suppress_reason(db, site_id=inactive_site["id"],
+                                         company_id=active["id"], where="t")
+    assert got == ("company_inactive" if flag == "on" else None)
+    assert tenancy_status.suppress_reason(db, site_id=live_site["id"],
+                                          company_id=suspended["id"], where="t") is None
+    shadow = [r.getMessage() for r in caplog.records
+              if "COMPANY_GATE_WOULD_SUPPRESS" in r.getMessage()]
+    assert len(shadow) == (1 if flag == "off" else 0)
+    _assert_usable(db)
+
+
+def test_suppress_reason_falls_back_to_company_for_site_less_and_missing_site(db, monkeypatch):
+    monkeypatch.setenv("COMPANY_STATUS_ENFORCE", "on")
+    exited, active = _company(db, "exited"), _company(db)
+    assert tenancy_status.suppress_reason(db, company_id=exited["id"], where="t") == \
+        "company_inactive"
+    assert tenancy_status.suppress_reason(db, company_id=active["id"], where="t") is None
+    # A site id with no row: the company id decides.
+    assert tenancy_status.suppress_reason(db, site_id=uuid.uuid4(), company_id=exited["id"],
+                                          where="t") == "company_inactive"
+    assert tenancy_status.suppress_reason(db, site_id=None, company_id=None, where="t") is None
+    _assert_usable(db)
+
+
+def test_suppress_reason_not_migrated_is_none_and_keeps_transaction(db, monkeypatch):
+    monkeypatch.setenv("COMPANY_STATUS_ENFORCE", "on")
+    co = _company(db, "suspended")
+    site = _site(db, co)
+    db.execute("ALTER TABLE companies RENAME COLUMN status TO status_gone")
+    assert tenancy_status.suppress_reason(db, site_id=site["id"], company_id=co["id"],
+                                          where="t") is None
+    _assert_usable(db)
+    assert db.execute("SELECT name FROM sites WHERE id=%s",
+                      (site["id"],)).fetchone()[0] == site["name"]

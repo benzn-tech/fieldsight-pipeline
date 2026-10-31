@@ -2133,6 +2133,37 @@ def _delivery_from_body(body):
     return deliver, recipients, None
 
 
+def _report_email_suppression(conn, deliver, site_ids, folder):
+    """Company offboarding (spec 2026-11-01 §5.5): 'company_inactive' when a report that
+    asks to be EMAILED is about a site whose company is suspended / exited -- any one
+    site in scope is enough -- or, with no site, when the folder owner's home company
+    is. None otherwise, always None for a download (no read at all), and None with the
+    flag off (tenancy_status logs COMPANY_GATE_WOULD_SUPPRESS). Decided here because
+    the worker that sends (lambda_session_report) has no database."""
+    if deliver != "email":
+        return None
+    ids = sorted({str(s) for s in (site_ids or []) if s})
+    for sid in ids:
+        reason = tenancy_status.suppress_reason(conn, site_id=sid, where="report-email")
+        if reason:
+            return reason
+    if ids:
+        return None
+    owner = users.get_by_folder_name_global(conn, folder) if folder else None
+    return tenancy_status.suppress_reason(
+        conn, company_id=(owner or {}).get("company_id"), where="report-email")
+
+
+def _suppress_report_email(artifact, reason):
+    """Turn an email request into a download, saying why (the worker reads
+    `deliver`; `emailSuppressed` is for whoever reads the artifact)."""
+    artifact["deliver"] = "download"
+    artifact["recipients"] = []
+    artifact["emailSuppressed"] = reason
+    logger.warning("COMPANY_EMAIL_SUPPRESSED report=%s folder=%s reason=%s",
+                   artifact.get("requestId"), artifact.get("folder"), reason)
+
+
 def session_report_generate(conn, caller, session_id, event):
     """POST /api/org/sessions/{session_id}/report — Tier-2 T3
     (session-report-review-export spec §6). ENQUEUES an async generate job.
@@ -2197,6 +2228,9 @@ def session_report_generate(conn, caller, session_id, event):
             "reportFacts": _report_facts(conn, caller["company_id"], folder,
                                          [content.get("siteId")], date)} if generate else {}),
     }
+    email_suppressed = _report_email_suppression(conn, deliver, [content.get("siteId")], folder)
+    if email_suppressed:
+        _suppress_report_email(artifact, email_suppressed)
     # Lake bucket (like the reindex_requests/ chain): org-api is in-VPC and hands
     # off to the non-VPC session-report worker via an S3 request artifact (BUG-36).
     # default=str for the same reason ok() uses it: `content` comes straight
@@ -2217,7 +2251,8 @@ def session_report_generate(conn, caller, session_id, event):
             site_id=(content.get("siteId") if owner else None),
             user_id=_lake_user_for_folder(conn, folder), source="upload")
     return ok({"status": "queued", "sessionId": session_id,
-               "requestId": request_id, "resultKey": result_key}, 202)
+               "requestId": request_id, "resultKey": result_key,
+               **({"emailSuppressed": email_suppressed} if email_suppressed else {})}, 202)
 
 
 def _assemble_day_report(conn, caller, date, event, selected=None):
@@ -2526,6 +2561,9 @@ def day_report_generate(conn, caller, date, event):
             "reportFacts": _report_facts(conn, caller["company_id"], folder,
                                          content.get("siteIds"), date)} if generate else {}),
     }
+    email_suppressed = _report_email_suppression(conn, deliver, content.get("siteIds"), folder)
+    if email_suppressed:
+        _suppress_report_email(artifact, email_suppressed)
     s3().put_object(Bucket=LAKE_BUCKET, Key=request_key,
                     Body=json.dumps(artifact, default=str),
                     ContentType="application/json")
@@ -2537,7 +2575,8 @@ def day_report_generate(conn, caller, date, event):
         lake_objects.record_best_effort(conn, lake_key, company_id=owner, site_id=one_site,
                                         user_id=_lake_user_for_folder(conn, folder), source="upload")
     return ok({"status": "queued", "scope": "day", "date": date,
-               "requestId": request_id, "resultKey": result_key}, 202)
+               "requestId": request_id, "resultKey": result_key,
+               **({"emailSuppressed": email_suppressed} if email_suppressed else {})}, 202)
 
 
 # ----------------------------------------------------------
@@ -5624,7 +5663,10 @@ def _build_directory(conn):
         directory_repo.live_sites(conn),
         datetime.now(timezone.utc).isoformat(timespec="seconds"),
         activity=directory_repo.recent_activity(conn, directory.PRIMARY_SITE_WINDOW_DAYS),
-        external_user_ids=directory_repo.external_user_ids(conn))
+        external_user_ids=directory_repo.external_user_ids(conn),
+        # Company offboarding (Task 9): the non-VPC senders hold email / skip reports
+        # for these. Savepoint-guarded; {} before migration 0092.
+        company_statuses=tenancy_status.company_statuses(conn))
 
 
 def _write_directory_if_changed(conn):
@@ -6163,6 +6205,10 @@ def set_company_status(conn, caller, company_id, body):
     logger.warning("COMPANY_STATUS_CHANGED company=%s %s->%s event=%s by user=%s",
                    cid, result["previousStatus"], to_status, result["eventId"],
                    caller.get("id"))
+    # The non-VPC senders (report generator, external-member notices) read inactive
+    # companies from the directory (Task 9): republish now, after the commit, so a
+    # suspension holds their email at once and a reactivation releases it. Never raises.
+    _publish_directory(conn)
     if sum(result["cognito"].values()) == 0:
         result["cognitoTrigger"] = "none"
     else:
@@ -6946,7 +6992,7 @@ EXTERNAL_MEMBER_NOTICE_PREFIX = "notices/external_member/"
 
 
 def _write_external_member_notice(membership_id, to_email, to_name, site_name,
-                                  inviting_company, role):
+                                  inviting_company, role, site_id=None, site_company_id=None):
     """Leave a notice for the non-VPC backlog lambda to email. Best effort by
     contract: the membership is already written, so a failed put is logged and
     never fails the request.
@@ -6954,7 +7000,10 @@ def _write_external_member_notice(membership_id, to_email, to_name, site_name,
     org-api runs in the VPC with no route to SES (and EMAIL_SENDER unset), so it
     cannot send. It reaches S3 over the gateway endpoint, so it writes the notice
     there -- one object per membership -- and
-    lambda_extraction_backlog's 5-minute run sends it exactly once."""
+    lambda_extraction_backlog's 5-minute run sends it exactly once.
+
+    `site_id` / `site_company_id` let that lambda (no database) HOLD the notice while the
+    site's company is suspended / exited (company offboarding, spec 2026-11-01 §5.5)."""
     try:
         s3().put_object(
             Bucket=LAKE_BUCKET,
@@ -6962,6 +7011,8 @@ def _write_external_member_notice(membership_id, to_email, to_name, site_name,
             Body=json.dumps({
                 "to_email": to_email, "to_name": to_name, "site_name": site_name,
                 "inviting_company": inviting_company, "role": role,
+                "site_id": str(site_id) if site_id else None,
+                "site_company_id": str(site_company_id) if site_company_id else None,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }).encode("utf-8"),
             ContentType="application/json")
@@ -7029,7 +7080,8 @@ def add_external_member(conn, caller, site_id, body):
     user_name = " ".join(p for p in (target.get("first_name"), target.get("last_name")) if p)
     _write_external_member_notice(
         row.get("id"), target.get("email") or email, user_name,
-        site.get("name") or "a project", site_company.get("name") or "A company", role)
+        site.get("name") or "a project", site_company.get("name") or "A company", role,
+        site_id=site.get("id"), site_company_id=site.get("company_id"))
     return ok({"membership": {
         **row,
         "user_name": user_name,

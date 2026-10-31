@@ -36,6 +36,7 @@ from datetime import datetime, timedelta, timezone
 import boto3
 from lake_put import lake_put
 
+import directory
 import extraction_pending
 
 logger = logging.getLogger()
@@ -483,6 +484,11 @@ NOTICE_SENT_PREFIX = "notices/sent/external_member/"
 #: A notice older than this is dropped (ERROR log): the SES sandbox rejects an
 #: unverified recipient forever, and a stale "you were added" mail is worse than none.
 NOTICE_EXPIRY = timedelta(hours=24)
+#: A HELD notice (its site's company is suspended / exited; spec 2026-11-01 §5.5) is
+#: copied onto itself once it is this old, so its LastModified -- the clock NOTICE_EXPIRY reads --
+#: restarts. Half the expiry, so even the tick right after a reactivation finds at
+#: least 12 h left and sends it rather than expiring it.
+NOTICE_HOLD_REFRESH = NOTICE_EXPIRY / 2
 
 
 def _notice_mail(n):
@@ -508,7 +514,16 @@ def send_external_member_notices(client, now=None, sender=None):
     worst once rather than losing it). Failure -- including an SES-sandbox rejection of
     an unverified recipient -- leaves it for the next tick; after NOTICE_EXPIRY it is
     deleted and logged at ERROR. A stub sender sends nothing, so it never marks a
-    notice sent. Returns (sent, failed, expired) counts."""
+    notice sent. Returns (sent, failed, expired) counts.
+
+    Company offboarding (spec 2026-11-01 §5.5): a notice whose site's company is
+    suspended / exited is HELD -- not sent, not moved, not expired, not counted -- and
+    copied onto itself when half-way to NOTICE_EXPIRY, so it goes out after reactivation. This
+    lambda has no database, so the decision reads the published directory
+    (`inactive_companies`; directory.suppress_reason: the notice's `site_id`, else its
+    `site_company_id`). Flag off: logged COMPANY_GATE_WOULD_SUPPRESS, sent as today.
+    The directory is read only when a notice is waiting, and a notice body is read
+    before the expiry check only when some company is inactive."""
     now = now or datetime.now(timezone.utc)
     sent_n = failed = expired = 0
     objs = list(_objects(client, NOTICE_PREFIX))
@@ -521,10 +536,15 @@ def send_external_member_notices(client, now=None, sender=None):
             logger.warning("backlog: %d external-member notice(s) waiting but "
                            "EMAIL_SENDER is not 'ses'; nothing sent", len(objs))
             sender = None
+    directory.reset_cache()
+    published = directory.load(client, S3_BUCKET)
+    may_hold = bool(published.get("inactive_companies"))
     for o in objs:
         key = o["Key"]
         try:
             modified = o.get("LastModified")
+            if may_hold and _hold_notice(client, key, modified, now, published):
+                continue
             if modified and now - modified >= NOTICE_EXPIRY:
                 client.delete_object(Bucket=S3_BUCKET, Key=key)
                 expired += 1
@@ -548,6 +568,30 @@ def send_external_member_notices(client, now=None, sender=None):
             logger.exception("backlog: external-member notice %s not sent; "
                              "will retry", key)
     return sent_n, failed, expired
+
+
+def _hold_notice(client, key, modified, now, published):
+    """True when this notice is held (its site's company is inactive and the flag is
+    on); a held notice that is NOTICE_HOLD_REFRESH old is copied onto itself unchanged so its
+    expiry clock restarts."""
+    raw = client.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
+    n = json.loads(raw)
+    reason = directory.suppress_reason(
+        published, site_id=n.get("site_id"), company_id=n.get("site_company_id"),
+        where="external-member-notice")
+    if not reason:
+        return False
+    if modified and now - modified >= NOTICE_HOLD_REFRESH:
+        # Copied onto itself (S3 needs REPLACE for an in-place copy): same body, new
+        # LastModified. Not a put: notices are not lake objects (no manifest line).
+        client.copy_object(Bucket=S3_BUCKET, Key=key,
+                           CopySource={"Bucket": S3_BUCKET, "Key": key},
+                           MetadataDirective="REPLACE", ContentType="application/json")
+        logger.info("backlog: external-member notice %s held (%s); expiry clock restarted",
+                    key, reason)
+    else:
+        logger.info("backlog: external-member notice %s held (%s)", key, reason)
+    return True
 
 
 def emit_pending_metric(stale):

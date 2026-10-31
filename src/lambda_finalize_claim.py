@@ -31,6 +31,7 @@ from lake_put import lake_put
 import photo_pins
 from repositories import meeting_session, recordings, users, sites, topics
 import session_scope
+import tenancy_status
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -227,6 +228,19 @@ def finalize_claim(conn, session_id, expected_version, *, resolve_context, read_
         logger.info("finalize: voice note %s settled without an email", session_id)
         return {"status": "voice_note", "sessionId": session_id}
 
+    # Company offboarding (spec 2026-11-01 §5.5): the session's SITE company (else the
+    # recorder's home company) is suspended / exited and the flag is on. _resolve_context
+    # blanked the recipient; the email path is skipped but the session is SETTLED, not
+    # failed -- like a voice note, after the final extraction was requested above -- so
+    # neither item-writer's final email (it needs status 'finalizing') nor the backstop
+    # ever mails it.
+    if ctx.get("emailSuppressed"):
+        meeting_session.mark_sent(conn, session_id)
+        logger.warning("COMPANY_EMAIL_SUPPRESSED session=%s reason=%s -- settled without "
+                       "a stop email", session_id, ctx["emailSuppressed"])
+        return {"status": "suppressed", "sessionId": session_id,
+                "reason": ctx["emailSuppressed"]}
+
     recipient = (ctx.get("recipient") or "").strip()
     if not recipient:
         # Named so prod ops can see WHICH recorder has no email on file (a
@@ -358,8 +372,27 @@ def _resolve_context(conn, row):
     # Meeting time window for the email subject — "which meeting was this?". NZ
     # wall-clock HH:MM of open→close (start only if the close time is unknown).
     time_range = _time_range(opened_nz, closed_nz, session_id=row.get("session_id"))
-    return {"recipient": user.get("email"), "folder": user.get("folder_name"),
-            "date": date, "siteName": site_name, "timeRange": time_range}
+    ctx = {"recipient": user.get("email"), "folder": user.get("folder_name"),
+           "date": date, "siteName": site_name, "timeRange": time_range}
+    # Company offboarding (spec 2026-11-01 §5.5): no stop email for a session whose SITE
+    # company -- else, site-less, the recorder's home company -- is suspended / exited.
+    # Decided HERE because every stop-email enqueuer resolves its recipient through this
+    # function (the claim, the backstop, item-writer's final and group-merge emails) and
+    # the send worker has no database. Suppressed: no recipient, and `emailSuppressed`
+    # says why. Flag off: tenancy_status logs COMPANY_GATE_WOULD_SUPPRESS and this
+    # returns None. A failed read sends rather than raise into the sweep tick.
+    try:
+        reason = tenancy_status.suppress_reason(
+            conn, site_id=row.get("site_id"), company_id=user.get("company_id"),
+            where="stop-email")
+    except Exception:  # noqa: BLE001 - see above
+        logger.exception("finalize: could not read the company status for session %s -- "
+                         "the email is not suppressed", row.get("session_id"))
+        reason = None
+    if reason:
+        ctx["recipient"] = None
+        ctx["emailSuppressed"] = reason
+    return ctx
 
 
 def _place_voice_note(conn, row, ctx):

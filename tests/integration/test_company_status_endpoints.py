@@ -88,8 +88,14 @@ def w(db, monkeypatch):
     s3 = _S3(log)
     monkeypatch.setattr(org, "s3", lambda: s3)
     monkeypatch.delenv(FLAG, raising=False)
+    conn = Conn(db, log)
+    # Task 9: the directory republish (its real SQL + S3 write are proven in
+    # test_directory_publisher.py); recorded with the commit count at call time.
+    published = []
+    monkeypatch.setattr(org, "_publish_directory",
+                        lambda c: published.append(conn.commits))
     return dict(a=a, b=b, p=p, sa=sa, aad=aad, aw=aw, ax=ax, bw=bw, pa=pa, t=t, s3=s3,
-                log=log, conn=Conn(db, log))
+                log=log, conn=conn, published=published)
 
 
 def _call(w, method, route, body=None, who="pa"):
@@ -173,6 +179,17 @@ def test_suspend_writes_status_event_rows_and_marker(db, w):
     assert doc["company_id"] == a and doc["event_id"] == body["eventId"]
     assert doc["requested_by"] == str(w["pa"]["id"]) and doc["requested_at"]
     _usable(db)
+
+
+def test_a_status_change_republishes_the_directory_after_commit(db, w):
+    """Task 9: the non-VPC senders read inactive companies from the directory, so every
+    change republishes it -- after the commit, so it reflects the new status."""
+    assert _set(w, "suspended")[0] == 200
+    assert w["published"] == [1]
+    assert _set(w, "suspended")[0] == 200          # unchanged: nothing to republish
+    assert w["published"] == [1]
+    assert _set(w, "active")[0] == 200             # reactivation releases held notices
+    assert w["published"] == [1, 2]
 
 
 def test_other_companies_get_no_rows(db, w):

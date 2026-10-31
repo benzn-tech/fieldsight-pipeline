@@ -111,6 +111,14 @@ def test_admin_adds_external_member(env):
     assert n["created_at"]
 
 
+def test_the_notice_names_its_site_and_the_sites_company(env):
+    """Company offboarding (Task 9): the backlog lambda holds a notice while the SITE's
+    company is inactive; it has no database, so the notice says which site/company."""
+    assert post()["statusCode"] == 201
+    n = json.loads(env["mails"][0]["Body"])
+    assert n["site_id"] == "s-9" and n["site_company_id"] == SITE_CO
+
+
 def test_adding_an_external_member_republishes_the_directory(env, monkeypatch):
     """I4: has_external is published in the directory; the add must republish it (and a
     refused add must not)."""

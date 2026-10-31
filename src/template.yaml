@@ -6569,8 +6569,11 @@ Resources:
                 - !Sub arn:aws:s3:::${DataBucketName}/extraction_requests/*
                 - !Sub arn:aws:s3:::${DataBucketName}/extraction_pending/*
                 - !Sub arn:aws:s3:::${DataBucketName}/notices/external_member/*
+                # Company offboarding (Task 9): a notice is HELD while its site's company
+                # is suspended / exited; the published directory says which are.
+                - !Sub arn:aws:s3:::${DataBucketName}/config/directory.json
             # External-member notices: sent -> copied to notices/sent/, original deleted;
-            # unsent after 24 h -> deleted.
+            # unsent after 24 h -> deleted; held -> copied onto itself (expiry clock restarts).
             - Effect: Allow
               Action:
                 - s3:PutObject

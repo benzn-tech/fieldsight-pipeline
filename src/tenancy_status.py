@@ -236,3 +236,54 @@ def caller_blocked(conn, caller, *, where: str = "") -> str | None:
         reason, caller.get("id"), caller.get("cognito_sub"), caller.get("company_id"),
         where)
     return None
+
+
+def suppress_decision(company_id, status, *, where: str = "", site_id=None) -> str | None:
+    """Customer email / generated reports for one item (spec §5.5, Task 9), once the
+    deciding company and its status are known. `status` None or 'active' -> None, silent.
+    Inactive: flag on -> 'company_inactive' (the caller does not send / generate);
+    flag off -> None after one WARNING line
+    `COMPANY_GATE_WOULD_SUPPRESS where=... company=... site=... status=...`.
+
+    Pure (no DB): the non-VPC senders decide from the published directory
+    (directory.suppress_reason) through this same function."""
+    if status is None or status == ACTIVE:
+        return None
+    if enforce_enabled():
+        return REASON_COMPANY_INACTIVE
+    logger.warning("COMPANY_GATE_WOULD_SUPPRESS where=%s company=%s site=%s status=%s",
+                   where, company_id, site_id, status)
+    return None
+
+
+def site_company_status(conn, site_id):
+    """(company id, status) of the company that owns `site_id`, or None when there is no
+    such site. Not migrated -> (None, 'active'). Savepoint-guarded (module doc)."""
+    try:
+        with conn.transaction():
+            row = conn.execute(
+                "SELECT c.id, c.status FROM sites s JOIN companies c ON c.id = s.company_id "
+                "WHERE s.id = %s", (str(site_id),)).fetchone()
+    except Exception as exc:  # noqa: BLE001 - narrowed below
+        if _not_migrated(exc):
+            return None, ACTIVE
+        raise
+    return (row[0], row[1]) if row is not None else None
+
+
+def suppress_reason(conn, *, site_id=None, company_id=None, where: str = "") -> str | None:
+    """Should a customer email / generated report about one item be suppressed?
+
+    The deciding company is the SITE's company of the item (`site_id`); for a site-less
+    item -- or a site id with no row -- it is `company_id` (the recipient's or the folder
+    owner's HOME company). Returns 'company_inactive' or None; see suppress_decision for
+    the flag and the shadow log. Not migrated (no companies.status) -> None. Both reads
+    savepoint-guarded (module doc), so the caller's transaction stays usable."""
+    if site_id is not None:
+        found = site_company_status(conn, site_id)
+        if found is not None:
+            return suppress_decision(found[0], found[1], where=where, site_id=site_id)
+    if company_id is None:
+        return None
+    return suppress_decision(company_id, company_status(conn, company_id), where=where,
+                             site_id=site_id)
