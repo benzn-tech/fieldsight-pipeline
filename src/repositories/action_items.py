@@ -1,5 +1,9 @@
+import uuid
+
 import psycopg
 from psycopg.rows import dict_row
+
+from deleted_predicates import visible_topics_predicate
 
 # Whitelist of columns PATCH /api/org/action-items/{id} may set. text/site_id/
 # topic_id/created_at are intentionally NOT here -- editing a task must never
@@ -123,3 +127,47 @@ def update_action_item_fields(conn, action_item_id, fields, updated_by) -> dict 
     except psycopg.Error:
         conn.rollback()
         return None
+
+
+def _as_uuid(value):
+    """`value` as a uuid.UUID, or None when it is not one (None, '', '69', 'abc')."""
+    if isinstance(value, uuid.UUID):
+        return value
+    try:
+        return uuid.UUID(str(value))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def get_live_by_stable_id(conn, stable_id) -> dict | None:
+    """The one LIVE action item addressed by `stable_id` (action packs, spec §14 S12) --
+    mirrors topic_questions.get_live_by_stable_id: joined to its topic for
+    `visible_topics_predicate` (a superseded pass of the same source key shares this
+    stable_id through carry_forward's carried_from chain, and only the live topic's row is
+    the one to act on; a deleted topic or recording hides it too) and to `sites` for
+    `company_id`, the tenant guard callers check.
+
+    `ORDER BY created_at DESC LIMIT 1`: two rows can share a stable_id for one commit's width
+    in a concurrent-pass race; the newest wins, as supersede_topics_for_source already does.
+
+    Also carries the topic's `source_s3_key` (the writer's advisory-lock key, which apply
+    takes before writing) and `topic_user_id` (who recorded it, for the assignee check).
+
+    None on missing OR a malformed id. Unlike topic_questions', the malformed case is caught
+    in Python before any SQL runs, so it never rolls back: this is called inside the apply
+    transaction, where a `conn.rollback()` would discard the caller's own work."""
+    sid = _as_uuid(stable_id)
+    if sid is None:
+        return None
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT a.id, a.topic_id, a.site_id, a.stable_id, a.carried_from, a.text, "
+        f"a.responsible, a.deadline, a.deadline_text, a.priority, a.status, a.audience, "
+        f"a.item_id, a.created_at, a.updated_at, a.updated_by, "
+        f"s.company_id, t.source_s3_key, t.user_id AS topic_user_id "
+        f"FROM action_items a "
+        f"JOIN topics t ON t.id = a.topic_id "
+        f"JOIN sites s ON s.id = a.site_id "
+        f"WHERE a.stable_id = %s AND {visible_topics_predicate('t')} "
+        f"ORDER BY a.created_at DESC LIMIT 1",
+        (sid,),
+    ).fetchone()
