@@ -531,3 +531,53 @@ def test_logs_never_carry_the_url_or_page_text(caplog):
     f.fetch("http://example.org/p?token=SECRET")
     joined = "\n".join(r.getMessage() for r in caplog.records)
     assert "SECRET" not in joined and "PAGE-TEXT" not in joined and "/p" not in joined
+
+
+# ------------------------------------------------------------- review fixes
+
+def test_non_ascii_path_is_percent_encoded_not_an_internal_error():
+    f, server, _ = make({("example.org", "/caf%C3%A9?q=%C3%A9"): html("<p>ok</p>")})
+    r = f.fetch("https://example.org/café?q=é")
+    assert r["ok"] is True
+    assert server.requests[-1]["path"] == "/caf%C3%A9?q=%C3%A9"
+
+
+def test_existing_percent_escapes_are_kept():
+    t = wf.vet_url("https://example.org/a%20b?x=%2F", resolver_of({"example.org": [PUBLIC]}))
+    assert t.path == "/a%20b?x=%2F"
+
+
+def test_ipv6_literal_robots_url_is_bracketed():
+    server = FakeServer({(PUBLIC6, "/robots.txt"): FakeResponse(
+        200, {"Content-Type": "text/plain"}, b"User-agent: *\nDisallow: /\n")})
+    f = wf.Fetcher(resolver=resolver_of({}), connect=server.connect)
+    assert f.fetch(f"https://[{PUBLIC6}]/p")["reason"] == "robots"
+
+
+def test_host_header_is_left_to_http_client():
+    """http.client writes Host itself (and brackets an IPv6 literal); an explicit Host
+    header would suppress that."""
+    f, server, _ = make({("example.org", "/s"): html("<p>s</p>")})
+    f.fetch("https://example.org/s")
+    assert all("Host" not in q["headers"] for q in server.requests)
+
+
+def test_connection_is_closed_when_the_deadline_passes_after_the_response():
+    t = [0.0]
+    conns = []
+    server = FakeServer({("example.org", "/s"): html("<p>s</p>")})
+
+    def connect(host, ip, port, timeout):
+        c = server.connect(host, ip, port, timeout)
+        conns.append(c)
+        orig = c.getresponse
+
+        def slow():
+            t[0] += 20
+            return orig()
+        c.getresponse = slow
+        return c
+    f = wf.Fetcher(resolver=resolver_of({"example.org": [PUBLIC]}), connect=connect,
+                   clock=lambda: t[0], page_timeout=10, check_robots=False)
+    assert f.fetch("https://example.org/s")["reason"] == "timeout"
+    assert conns and all(c.closed for c in conns)

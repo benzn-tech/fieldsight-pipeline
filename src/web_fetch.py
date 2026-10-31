@@ -39,7 +39,7 @@ import time
 import urllib.robotparser
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,9 @@ _NAT64 = ipaddress.ip_network("64:ff9b::/96")
 _LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _NUMERIC_LABEL = re.compile(r"^(?:0x[0-9a-f]*|[0-9]+)$")
 _BAD_URL_CHARS = re.compile(r"[\x00-\x20\x7f\\]")
+# Characters kept as they are when a path/query is percent-encoded (an existing %XX stays).
+_PATH_SAFE = "/%:@!$&'()*+,;=-._~"
+_QUERY_SAFE = _PATH_SAFE + "?"
 
 
 class Refused(Exception):
@@ -181,9 +184,11 @@ def vet_url(url, resolver) -> Target:
             raise Refused("dns")
     if not all(address_allowed(ip) for ip in ips):
         raise Refused("blocked_address")
-    path = parts.path or "/"
+    # A non-ASCII path or query (a cited page's own URL) is percent-encoded as UTF-8;
+    # http.client would otherwise refuse it.
+    path = quote(parts.path or "/", safe=_PATH_SAFE)
     if parts.query:
-        path += "?" + parts.query
+        path += "?" + quote(parts.query, safe=_QUERY_SAFE)
     return Target(url=url, host=host, ip=str(ips[0]), path=path)
 
 
@@ -287,6 +292,15 @@ def _decode(raw, charset):
     return raw.decode(charset or "utf-8", errors="replace")
 
 
+def _close(conn):
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except Exception:                 # noqa: BLE001
+        pass
+
+
 class _Fail(Exception):
     def __init__(self, code, status=None):
         super().__init__(code)
@@ -382,28 +396,30 @@ class Fetcher:
                 raw, truncated = self._read(resp, deadline, max_bytes)
                 return current, status, ctype, raw, truncated
             finally:
-                try:
-                    conn.close()
-                except Exception:     # noqa: BLE001
-                    pass
+                _close(conn)
         raise _Fail("too_many_redirects")      # unreachable; the loop returns or raises
 
     def _open(self, target, deadline):
         timeout = self._left(deadline)
+        conn = None
         try:
             conn = self._connect(target.host, target.ip, 443, timeout)
+            # No explicit Host: http.client writes the hostname (bracketing an IPv6 literal).
             conn.request("GET", target.path, headers={
-                "Host": target.host, "User-Agent": USER_AGENT,
+                "User-Agent": USER_AGENT,
                 "Accept": "text/html, text/plain;q=0.9",
                 "Accept-Encoding": "identity", "Connection": "close"})
             resp = conn.getresponse()
-        except ssl.SSLError:
-            raise _Fail("tls")
-        except (socket.timeout, TimeoutError):
-            raise _Fail("timeout")
-        except (OSError, http.client.HTTPException):
-            raise _Fail("network")
-        self._left(deadline)
+            self._left(deadline)
+        except BaseException as exc:
+            _close(conn)
+            if isinstance(exc, ssl.SSLError):
+                raise _Fail("tls")
+            if isinstance(exc, (socket.timeout, TimeoutError)):
+                raise _Fail("timeout")
+            if isinstance(exc, (OSError, http.client.HTTPException)):
+                raise _Fail("network")
+            raise
         return resp.status, resp.getheader, resp, conn
 
     def _read(self, resp, deadline, max_bytes):
@@ -434,7 +450,8 @@ class Fetcher:
         """A parser, or None = allow all (missing, 4xx, unreachable, refused, unparsable)."""
         deadline = self._clock() + self._timeout
         try:
-            _, _, ctype, raw, _ = self._get(f"https://{host}/robots.txt", deadline,
+            authority = f"[{host}]" if ":" in host else host      # an IPv6 literal
+            _, _, ctype, raw, _ = self._get(f"https://{authority}/robots.txt", deadline,
                                             max_bytes=MAX_ROBOTS_BYTES, types=None,
                                             robots=False)
         except (Refused, _Fail) as exc:

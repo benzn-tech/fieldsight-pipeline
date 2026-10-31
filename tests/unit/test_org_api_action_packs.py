@@ -561,6 +561,8 @@ def test_snapshot_is_capped(env):
 ])
 def test_snapshot_refuses_non_web_or_foreign_keys(env, source):
     env.pack = _pack(sources=[source])
+    if source.get("snapshot_s3_key"):          # the object exists: only the key check refuses
+        env.s3.objs[source["snapshot_s3_key"]] = b"foreign"
     assert _call(env, "GET", f"/action-packs/{PACK}/sources/W1/snapshot")[0] == 404
     assert env.s3.gets == []
 
