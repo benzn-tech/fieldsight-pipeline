@@ -159,3 +159,25 @@ def test_group_merge_updated_email_is_not_enqueued_for_a_suppressed_member(monke
     put = []
     iw._enqueue_updated_emails(artifact, contexts, put=lambda key, body, **k: put.append(key))
     assert put == ["session_finalize_requests/m2-updated.json"]
+
+
+# ---- backstop: a session claimed while active, suspended before its email -----------
+
+def test_backstop_settles_a_waiting_session_whose_company_went_inactive(monkeypatch, caplog):
+    """Claimed while active (so still `finalizing`), suspended before its email: item-writer
+    finds no recipient and sends nothing, so the backstop is what settles it -- otherwise it
+    is re-resolved every tick and never eligible for a late-chunk reopen."""
+    import datetime
+    now = datetime.datetime(2026, 11, 1, 12, 0, tzinfo=datetime.timezone.utc)
+    row = {**ROW, "finalizing_at": now - datetime.timedelta(hours=1)}
+    sent, enqueued = [], []
+    monkeypatch.setattr(fc.meeting_session, "mark_sent", lambda c, s: sent.append(s))
+    caplog.set_level(logging.WARNING)
+    mailed = fc.backstop(
+        "CONN", list_waiting=lambda conn: [row],
+        resolve_context=lambda conn, r: {"recipient": None, "folder": "Rec_F",
+                                         "emailSuppressed": "company_inactive"},
+        read_rolling=lambda *a: pytest.fail("no email is built"),
+        enqueue=lambda artifact: enqueued.append(artifact) or True, now=now)
+    assert mailed == [] and enqueued == [] and sent == ["sid-1"]
+    assert "COMPANY_EMAIL_SUPPRESSED" in caplog.text

@@ -288,6 +288,15 @@ def backstop(conn, *, list_waiting, resolve_context, read_rolling, enqueue, now=
             continue
         session_id = row["session_id"]
         ctx = resolve_context(conn, row) or {}
+        if ctx.get("emailSuppressed"):
+            # Company offboarding (spec 2026-11-01 §5.5): claimed while the company was
+            # active, inactive since. item-writer sends nothing for it (no recipient), so
+            # it is settled here, as the claim settles one suppressed from the start.
+            meeting_session.mark_sent(conn, session_id)
+            logger.warning("COMPANY_EMAIL_SUPPRESSED session=%s reason=%s -- settled "
+                           "by the backstop without a stop email",
+                           session_id, ctx["emailSuppressed"])
+            continue
         recipient = (ctx.get("recipient") or "").strip()
         if not recipient:
             continue          # already marked failed and named at claim time
