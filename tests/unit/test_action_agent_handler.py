@@ -513,8 +513,27 @@ def test_a_failed_fail_invoke_is_logged_not_raised(env):
     assert _run(_key(), _s3_with_request(), lam, runner) == "failed:model"
 
 
-def test_the_default_stage_runner_is_inert_until_task_11(env, monkeypatch):
-    """Until the stages land, a claimed pack fails `internal` -- and only behind the flag."""
+def test_the_default_stage_runner_is_the_stages_module(env, monkeypatch):
+    """run_stages delegates to action_pack_stages.run (Task 11); no model or tool is reached
+    here -- the stages module is faked."""
+    import action_pack_stages
+    seen = []
+    monkeypatch.setattr(action_pack_stages, "run",
+                        lambda ctx: seen.append(ctx.pack_id) or dict(GOOD_PAYLOAD))
+    lam = FakeOrgApi()
+    assert agent.process_key(_key(), s3=_s3_with_request(), lambda_client=lam,
+                             clock=Clock(), remaining_s=900.0) == "stored"
+    assert seen == [PACK]
+
+
+def test_an_unbuilt_verifier_fails_internal(env, monkeypatch):
+    """Until Task 12 lands the verifier seam raises NotImplementedError: a claimed pack fails
+    `internal` (behind the flag only)."""
+    import action_pack_stages
+
+    def stages(ctx):
+        raise NotImplementedError("verifier")
+    monkeypatch.setattr(action_pack_stages, "run", stages)
     lam = FakeOrgApi()
     assert agent.process_key(_key(), s3=_s3_with_request(), lambda_client=lam,
                              clock=Clock(), remaining_s=900.0) == "failed:internal"

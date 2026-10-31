@@ -8,7 +8,7 @@ Spec: docs/superpowers/specs/2026-11-01-background-action-agent-design.md §4.1,
       -> read the request object (its pack_id must match the key)
       -> org-api "action_pack_claim" (RequestResponse, compare-and-swap queued -> running).
          Lost claim (a second S3 delivery, cancelled, company inactive) -> exit, nothing spent.
-      -> run_stages(ctx) -> payload       (plan / gather / write / verify: Tasks 11 and 12)
+      -> run_stages(ctx) -> payload       (action_pack_stages; verify: Task 12)
          ctx.checkpoint() between rounds: cancel marker + heartbeat; raises Cancelled
       -> final checkpoint, then org-api "action_pack_store"
          ok -> done; refused (cancelled/failed meanwhile) -> stop quietly;
@@ -205,9 +205,11 @@ class RunContext:
 
 def run_stages(ctx: RunContext) -> dict:
     """The stage runner: plan, gather, write, verify -> the store payload (the shape in
-    repositories/action_packs.py). Task 11 replaces this body; until then a claimed pack
-    fails `internal` -- reachable only with ACTION_PACKS internal/on."""
-    raise NotImplementedError("action agent stages land in Task 11")
+    repositories/action_packs.py). The stages live in action_pack_stages (Task 11); the
+    verifier seam (action_pack_verify, Task 12) raises NotImplementedError until it lands,
+    so a claimed pack fails `internal` -- reachable only with ACTION_PACKS internal/on."""
+    import action_pack_stages
+    return action_pack_stages.run(ctx)
 
 
 # ---- clients ------------------------------------------------------------------------------
