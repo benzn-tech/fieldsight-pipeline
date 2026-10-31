@@ -256,6 +256,61 @@ TABLES = [
               owner_rule=_SITE_RULE),
 ]
 
+# Every other table the migrations create, named in README.txt under "Not included".
+# tests/unit/test_company_records_export_not_included.py pins this list against
+# src/migrations: a table is either in TABLES or here.
+NOT_EXPORTED = (
+    # Company work product that is not exported as records
+    ("recordings", "recording metadata (the recorded media itself is in the file export)"),
+    ("topic_photos", "photos linked to topics"),
+    ("voice_note_photo", "photos linked to voice notes"),
+    ("topic_questions", "open-question rows (topics.open_questions carries them)"),
+    ("topic_threads", "recurring-item threads across topics"),
+    ("topic_thread_suggestions", "suggested links of topics to recurring-item threads"),
+    ("action_status_suggestions", "suggested action item status changes awaiting review"),
+    ("programme_progress_suggestions", "suggested programme task progress awaiting review"),
+    ("checklist_reports", "inspection / checklist reports made from a spoken check (status "
+                          "and the result file key)"),
+    ("inspection_windows", "spoken inspection checks (start / end times per recording)"),
+    ("report_templates", "the company's report templates"),
+    ("report_template_versions", "versions of the company's report templates"),
+    ("report_template_bindings", "which report template is used where"),
+    ("report_modules", "the company's report section modules"),
+    ("report_chunks", "report / search text chunks derived from transcripts"),
+    ("report_chunks_archive", "archived report / search text chunks"),
+    ("project_doc_chunks", "search chunks of project documents (the documents are in the "
+                           "file export)"),
+    ("day_location_markers", "location markers recorded during a day"),
+    ("day_recording_segments", "per-day recording segment index"),
+    ("site_attendance", "who was on which site on which day"),
+    ("session_group", "meeting groups (sessions merged into one meeting)"),
+    ("voice_messages", "Site Voice messages"),
+    ("voice_ask_log", "Ask questions and answers log"),
+    ("name_aliases", "spelling aliases for names"),
+    ("classification_feedback", "feedback on topic classification"),
+    ("decision_records", "model decision records"),
+    ("keyframe_events", "video keyframe events"),
+    ("keyframe_tombstones", "deleted video keyframes"),
+    ("redactions", "deletion / redaction records (deleted content is excluded above)"),
+    # Speaker identification
+    ("speaker_voiceprints", "voiceprints (biometric)"),
+    ("speaker_voiceprint_samples", "voiceprint samples (biometric)"),
+    ("speaker_voiceprint_company_floors", "voiceprint matching thresholds"),
+    ("speaker_turn_names", "names given to speaker turns"),
+    ("speaker_label_groups", "speaker label groupings"),
+    ("speaker_name_proposals", "proposed speaker names"),
+    ("speaker_name_rejections", "rejected speaker names"),
+    ("speaker_intro_suggestions", "suggested speaker introductions"),
+    # Audit, operational and system state
+    ("membership_audit", "membership change audit"),
+    ("company_status_events", "company status change audit (suspend / exit / reactivate)"),
+    ("company_status_cognito", "sign-in disable / enable work items"),
+    ("lake_objects", "storage object ownership index (the objects are in the file export)"),
+    ("devices", "recording devices"),
+    ("device_upload_freezes", "device upload freezes"),
+    ("ws_connections", "live websocket connections"),
+)
+
 # compliance_resolutions' day tombstone is applied in Python from the Tombstones set
 _DAY_TOMBSTONED = {"compliance_resolutions"}
 _SESSION_TOMBSTONED = {"sessions"}
@@ -584,9 +639,7 @@ def _readme(conn, company_id, export_id, state, now):
         lines.append(f"    selection: {spec.owner_rule}.")
         if t.get("note"):
             lines.append(f"    NOTE: {t['note']} -- this file is empty.")
-    lines += ["",
-              "Not included (no file): recordings metadata, topic photos, open-question rows",
-              "(topics.open_questions carries them), meeting groups, membership audit, and",
-              "model decision records.",
-              ""]
+    lines += ["", "Not included (no file):"]
+    lines += [f"- {table}: {why}" for table, why in NOT_EXPORTED]
+    lines.append("")
     return "\n".join(lines)
