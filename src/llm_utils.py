@@ -788,9 +788,9 @@ def call_llm_parts(parts, *, model, max_tokens, force_json=True, temperature=0,
     OpenRouter fields (`parse_reasoning` / `parse_provider`), so a move off gemini is a
     setting the caller measured, not the text path's. Both None is the request above,
     byte for byte. They ride on `model` only, never on a fallback -- an endpoint pin
-    naming one vendor fails on another's model, the Ask judge's rule. With `reasoning`
+    naming one vendor fails on another's model, the Ask judge's rule. With an effort
     set the answer budget gets REASONING_HEADROOM_TOKENS on top: reasoning tokens are
-    completion tokens and are spent before the answer.
+    completion tokens and are spent before the answer. Reasoning off adds nothing.
 
     Two failures are told apart by a stable prefix on the error, because retrying either
     one later cannot help:
@@ -827,7 +827,10 @@ def call_llm_parts(parts, *, model, max_tokens, force_json=True, temperature=0,
                    "temperature": temperature, "max_tokens": max_tokens}
         if i == 0 and reasoning:
             payload["reasoning"] = reasoning
-            payload["max_tokens"] = max_tokens + REASONING_HEADROOM_TOKENS
+            # Only an effort thinks. `{"enabled": false}` spends nothing on reasoning,
+            # so the caller's number stays the whole budget -- as on the MiMo path.
+            if "effort" in reasoning:
+                payload["max_tokens"] = max_tokens + REASONING_HEADROOM_TOKENS
         if i == 0 and provider:
             payload["provider"] = provider
         if force_json:

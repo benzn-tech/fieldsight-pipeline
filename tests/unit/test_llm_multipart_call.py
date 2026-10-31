@@ -238,3 +238,12 @@ def test_muse_refuses_off_so_the_field_is_omitted_with_a_warning(caplog):
 ])
 def test_parse_provider(raw, expected):
     assert lu.parse_provider(raw) == expected
+
+
+def test_reasoning_off_buys_no_headroom(monkeypatch):
+    """`{"enabled": false}` spends no reasoning tokens, so the budget stays the answer's."""
+    sent = _stub(monkeypatch, [_ok("{}", "deepseek/deepseek-v4.1-flash")])
+    lu.call_llm_parts(PARTS, model="deepseek/deepseek-v4.1-flash", max_tokens=16000,
+                      caller="t", reasoning={"enabled": False})
+    assert sent[0]["reasoning"] == {"enabled": False}
+    assert sent[0]["max_tokens"] == 16000

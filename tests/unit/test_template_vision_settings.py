@@ -74,6 +74,16 @@ def test_reasoning_and_provider_come_from_env(monkeypatch):
     assert sent[0]["model"] == DEEPSEEK
     assert sent[0]["reasoning"] == {"enabled": False}
     assert sent[0]["provider"] == {"only": ["coreweave/fp8"], "allow_fallbacks": False}
+    # off spends no reasoning tokens: no headroom, the budget is the answer's.
+    assert sent[0]["max_tokens"] == template_vision.answer_tokens()
+
+
+def test_an_effort_buys_the_reasoning_headroom(monkeypatch):
+    monkeypatch.setenv("TEMPLATE_DIGITISE_MODEL", DEEPSEEK)
+    monkeypatch.setenv("TEMPLATE_DIGITISE_REASONING", "low")
+    sent = _stub(monkeypatch, [_ok('{"sections": []}')])
+    template_vision.read([PNG])
+    assert sent[0]["reasoning"] == {"effort": "low"}
     assert sent[0]["max_tokens"] == template_vision.answer_tokens() + lu.REASONING_HEADROOM_TOKENS
 
 

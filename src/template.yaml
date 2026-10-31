@@ -1399,9 +1399,10 @@ Parameters:
     Default: ''
     AllowedPattern: '^(|off|low|medium|high)$'
     Description: >-
-      Reasoning control for the digitise read. off disables reasoning (dropped with a
-      warning for muse, which cannot disable it); low/medium/high set the effort and add
-      the reasoning headroom to the answer budget. Empty sends no reasoning setting.
+      Reasoning control for the digitise read. off disables reasoning and adds no
+      headroom (dropped with a warning for muse, which cannot disable it);
+      low/medium/high set the effort and add the reasoning headroom to the answer
+      budget. Empty sends no reasoning setting.
 
   TemplateDigitiseProvider:
     Type: String
