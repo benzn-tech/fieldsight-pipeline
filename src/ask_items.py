@@ -189,6 +189,10 @@ def envelope(call_id, rows, meta, refs):
         size = _size(dict(item, ref="R0000")) + (2 if items else 0)
         if used + size > MAX_RESULT_CHARS:
             meta["truncated"] = True
+            if not items:
+                # Not a failure: the first item alone exceeds the budget. Narrow and ask
+                # again (site_id / status / query / task_no).
+                meta.setdefault("empty_reason", "over_budget")
             break
         seen.add(sid)
         items.append({"ref": refs.assign("item", sid, "R"), **item})

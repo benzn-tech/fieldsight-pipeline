@@ -346,9 +346,16 @@ def _items(event):
     Result: {"rows": [...], "meta": {"truncated": bool, "empty_reason"?, "error"?,
     "site_count"}}. Logs counts only."""
     import ask_items
+    import psycopg
+    from rag_tools_dispatch import _deadline
     norm, err = ask_items.validate_request(event.get("args"))
     if err:
         return {"rows": [], "meta": dict(err)}
+    # The same deadline rule as the tools batch (absent -> 20 s; 0, negative, NaN -> no
+    # time), enforced on the read itself as a statement timeout.
+    deadline = _deadline(event)
+    if deadline <= 0:
+        return {"rows": [], "meta": {"error": "timeout"}}
     sub = event.get("sub")
     conn = get_cached_connection()
     caller = users.get_user_by_sub(conn, sub) if sub else None
@@ -368,10 +375,14 @@ def _items(event):
                                          empty_reason="nothing_visible")}
     if norm["site_id"] is not None and norm["site_id"] not in site_ids:
         return {"rows": [], "meta": dict(meta, truncated=False, empty_reason="no_match")}
-    rows = topics.scoped_items_rows(
-        conn, site_ids, author_ids=author_ids, site_id=norm["site_id"],
-        statuses=norm["statuses"], query=norm["query"], task_no=norm["task_no"],
-        limit=norm["limit"] + 1)
+    try:
+        rows = topics.scoped_items_rows(
+            conn, site_ids, author_ids=author_ids, site_id=norm["site_id"],
+            statuses=norm["statuses"], query=norm["query"], task_no=norm["task_no"],
+            limit=norm["limit"] + 1, timeout_ms=int(deadline * 1000))
+    except psycopg.errors.QueryCanceled:
+        logger.info("rag-search items: read timed out (deadline_s=%.1f)", deadline)
+        return {"rows": [], "meta": dict(meta, error="timeout")}
     meta["truncated"] = len(rows) > norm["limit"]
     rows = [{k: (str(v) if k in ("stable_id", "site_id", "topic_id") and v is not None
                  else _iso(v)) for k, v in r.items()}

@@ -1213,6 +1213,18 @@ def get_topic_full(conn, topic_id) -> dict | None:
 # One statement, so "unknown", "hidden" and "out of reach" are the same None.
 # Casts are explicit because Postgres cannot infer a type for `%s IS NULL`
 # (a CASE WHEN %s IS NULL once returned 500 in production with every test green).
+def _topic_not_hidden(alias="t"):
+    """get_topic_visible's own hide rule beyond visible_topics_predicate: not non_work,
+    and no ACTIVE redaction of the topic, whatever its scope. Shared with the action-pack
+    items tool, which must not hand the agent a topic this rule hides."""
+    return (f"{alias}.work_class IS DISTINCT FROM 'non_work' "
+            # Same rule as redactions.company_excluded_topic_ids: ANY active redaction,
+            # whatever its scope. The pinned block is stricter than retrieval on purpose
+            # (spec §4.4 records the asymmetry).
+            "AND NOT EXISTS (SELECT 1 FROM redactions ra WHERE ra.target_type = 'topic' "
+            f"AND ra.target_id = {alias}.id AND ra.reverted_at IS NULL)")
+
+
 _TOPIC_VISIBLE_SQL = (
     "SELECT t.id, t.title, t.summary, t.report_date, t.site_id, "
     "       s.name AS site_name, t.user_id, t.time_range "
@@ -1221,12 +1233,7 @@ _TOPIC_VISIBLE_SQL = (
     "AND t.site_id = ANY(%(site_ids)s::uuid[]) "
     "AND (%(author_ids)s::uuid[] IS NULL OR t.user_id = ANY(%(author_ids)s::uuid[])) "
     f"AND {visible_topics_predicate('t')} "
-    "AND t.work_class IS DISTINCT FROM 'non_work' "
-    # Same rule as redactions.company_excluded_topic_ids: ANY active redaction,
-    # whatever its scope. The pinned block is stricter than retrieval on purpose
-    # (spec §4.4 records the asymmetry).
-    "AND NOT EXISTS (SELECT 1 FROM redactions ra WHERE ra.target_type = 'topic' "
-    "AND ra.target_id = t.id AND ra.reverted_at IS NULL)"
+    f"AND {_topic_not_hidden('t')}"
 )
 
 _TOPIC_VISIBLE_ACTION_ITEMS_SQL = (
@@ -1500,7 +1507,8 @@ def _scoped_items(conn, site_ids, author_ids, site_id, statuses, query, task_no,
     AFTER it, so a filter never resurrects an older row of the same stable_id."""
     where, params = _ask_tools_where(site_ids, author_ids=author_ids, site_id=site_id,
                                      user_id=None, include_agent=True)
-    outer, oparams = ["x.status = ANY(%s)"], [list(statuses)]
+    # lower(): the column is free text; validate_request lower-cases the filter values.
+    outer, oparams = ["lower(x.status) = ANY(%s)"], [[s.lower() for s in statuses]]
     if query:
         outer.append("x.text ILIKE %s ESCAPE '\\'")
         oparams.append(_like_literal(query))
@@ -1515,7 +1523,8 @@ def _scoped_items(conn, site_ids, author_ids, site_id, statuses, query, task_no,
         "FROM action_items a JOIN topics t ON t.id = a.topic_id "
         "JOIN sites s ON s.id = a.site_id "
         + ("LEFT JOIN action_task_numbers n ON n.stable_id = a.stable_id " if ledger else "")
-        + f"WHERE {where} AND {visible_topics_predicate('t')} AND a.site_id = t.site_id "
+        + f"WHERE {where} AND {visible_topics_predicate('t')} AND {_topic_not_hidden('t')} "
+        "AND a.site_id = t.site_id "
         "ORDER BY a.stable_id, a.created_at DESC, a.id) x "
         f"WHERE {' AND '.join(outer)} "
         "ORDER BY x.site, x.site_id, x.task_no NULLS LAST, x.created_at, x.stable_id "
@@ -1526,14 +1535,18 @@ def _scoped_items(conn, site_ids, author_ids, site_id, statuses, query, task_no,
 
 def scoped_items_rows(conn, site_ids, *, author_ids=None, site_id=None,
                       statuses=("open", "in_progress", "blocked"), query=None,
-                      task_no=None, limit=50) -> list[dict]:
+                      task_no=None, limit=50, timeout_ms=None) -> list[dict]:
     """Live action items under the Ask tools' scope plus agent-created topics (action packs
     items tool, spec §13 / §14 S4). Read-only.
 
     Scope: `_ask_tools_where(include_agent=True)` -- the caller's site reach and author
     filter, non_work dropped, the extraction/report family rule -- AND
-    visible_topics_predicate (not deleted, not superseded). Empty site_ids, an empty (not
+    visible_topics_predicate (not deleted, not superseded) AND get_topic_visible's hide rule
+    (`_topic_not_hidden`: no active redaction of any scope). Empty site_ids, an empty (not
     None) author set or no statuses means nothing is visible -- never 'no filter'.
+
+    timeout_ms: a statement_timeout for the read (transaction-local, restored after), so a
+    slow or blocked read ends inside the caller's deadline as psycopg.errors.QueryCanceled.
 
     Order: site name, task_no NULLS LAST, created_at (stable_id breaks ties). Fetches up to
     `limit` rows; the caller asks for limit + 1 to detect truncation.
@@ -1544,12 +1557,24 @@ def scoped_items_rows(conn, site_ids, *, author_ids=None, site_id=None,
     if not site_ids or (author_ids is not None and not author_ids) or not statuses:
         return []
     args = (conn, site_ids, author_ids, site_id, statuses, query, task_no, limit)
-    try:
+
+    def read(ledger):
         with conn.transaction():
-            return _scoped_items(*args, ledger=True)
+            prev = None
+            if timeout_ms is not None:
+                prev = conn.execute("SELECT current_setting('statement_timeout')").fetchone()[0]
+                conn.execute("SELECT set_config('statement_timeout', %s, true)",
+                             (str(max(1, int(timeout_ms))),))
+            rows = _scoped_items(*args, ledger=ledger)
+            if prev is not None:
+                conn.execute("SELECT set_config('statement_timeout', %s, true)", (prev,))
+            return rows
+
+    try:
+        return read(True)
     except psycopg.Error as exc:
         if not not_migrated(exc):
             raise
     if task_no is not None:
         return []
-    return _scoped_items(*args, ledger=False)
+    return read(False)

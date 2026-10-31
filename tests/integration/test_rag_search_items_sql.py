@@ -271,3 +271,87 @@ def test_existing_ask_tools_scope_still_excludes_agent_topics(w):
     """Ask's own day overview is unchanged: an agent topic is not a recording."""
     rows = topics.day_overview_rows(w["db"], [str(w["s1"]["id"])], D, D)
     assert "Pack topic" not in {r["title"] for r in rows}
+
+
+# ---------------------------------------------------------------- fix round 1
+
+def _redact(db, w, topic_id, scope, reverted=False):
+    db.execute("INSERT INTO redactions (company_id, target_type, target_id, reason, scope, "
+               "reverted_at) VALUES (%s, 'topic', %s, 'test', %s, %s)",
+               (w["a"]["id"], topic_id, scope, "2026-10-31T00:00:00+00:00" if reverted
+                else None))
+
+
+@pytest.mark.parametrize("scope", ["analysis", "all"])
+def test_actively_redacted_topic_is_hidden_reverted_one_is_back(w, scope):
+    """get_topic_visible's rule: ANY active redaction hides the topic, whatever its scope
+    (S13 would hide the resulting action anyway, and its text must not reach a prompt)."""
+    db = w["db"]
+    hidden = _item(db, w["s1"], w["w1"], "Redacted task")
+    _redact(db, w, hidden[2], scope)
+    back = _item(db, w["s1"], w["w1"], "Reverted task")
+    _redact(db, w, back[2], scope, reverted=True)
+    assert _texts(_items(w["w1"])) == ["Reverted task", "W1 task"]
+    assert _items(w["w1"], query="Redacted")["rows"] == []
+
+
+def test_redacted_agent_topic_is_hidden(w):
+    db = w["db"]
+    row = _agent_item(db, w["s1"], w["pm"], "Agent redacted")
+    _redact(db, w, row[2], "all")
+    assert "Agent redacted" not in _texts(_items(w["pm"]))
+
+
+def test_non_work_topic_is_hidden(w):
+    db = w["db"]
+    _item(db, w["s1"], w["w1"], "Lunch errand")
+    db.execute("UPDATE topics SET work_class='non_work' WHERE id = (SELECT topic_id FROM "
+               "action_items WHERE text='Lunch errand')")
+    assert _texts(_items(w["w1"])) == ["W1 task"]
+
+
+def test_deleted_recording_source_prefix_hides_its_items(w):
+    """The source arm: a deleted recording's tombstone names a key PREFIX, not topic ids."""
+    db = w["db"]
+    row = _item(db, w["s1"], w["w1"], "From a deleted recording")
+    key = db.execute("SELECT source_s3_key FROM topics WHERE id=%s", (row[2],)).fetchone()[0]
+    db.execute("INSERT INTO redactions (company_id, target_type, target_id, target_key, "
+               "reason, scope) VALUES (%s, 'recording', gen_random_uuid(), %s, 'test', "
+               "'deleted')",
+               (w["a"]["id"], key.rsplit(".", 1)[0]))
+    assert _texts(_items(w["w1"])) == ["W1 task"]
+
+
+def test_status_filter_ignores_case(w):
+    db = w["db"]
+    _item(db, w["s1"], w["w1"], "Shouty status", status="Blocked")
+    assert _texts(_items(w["w1"])) == ["Shouty status", "W1 task"]
+    assert _texts(_items(w["w1"], status=["BLOCKED"])) == ["Shouty status"]
+
+
+def test_deadline_is_a_statement_timeout(w):
+    """A read blocked past deadline_s ends as meta.error=timeout, the caller's transaction
+    stays usable and its statement_timeout is unchanged."""
+    import os
+    import psycopg
+    db = w["db"]
+    before = db.execute("SHOW statement_timeout").fetchone()[0]
+    # Without the statement timeout the read would wait on the lock forever: fail instead.
+    db.execute("SET lock_timeout = '5s'")
+    other = psycopg.connect(os.environ["TEST_DATABASE_URL"])
+    try:
+        other.execute("LOCK TABLE action_task_numbers IN ACCESS EXCLUSIVE MODE")
+        res = lambda_rag_search._search({"mode": "items", "sub": w["pm"]["cognito_sub"],
+                                         "deadline_s": 0.3, "args": {}}, None)
+        assert res["rows"] == [] and res["meta"]["error"] == "timeout"
+    finally:
+        other.rollback()
+        other.close()
+    assert db.execute("SHOW statement_timeout").fetchone()[0] == before
+    assert _texts(_items(w["pm"])) == S1_ALL           # same transaction, still usable
+
+
+def test_zero_deadline_never_reads(w):
+    res = lambda_rag_search._search({"mode": "items", "sub": w["pm"]["cognito_sub"],
+                                     "deadline_s": 0, "args": {}}, None)
+    assert res == {"rows": [], "meta": {"error": "timeout"}}

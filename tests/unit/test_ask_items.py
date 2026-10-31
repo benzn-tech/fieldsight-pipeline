@@ -195,3 +195,10 @@ def test_items_tool_is_not_an_ask_tool(monkeypatch):
     assert ask_items.TOOL_NAME not in {t["name"] for t in ask_tools.offered_tools()}
     _, err = ask_tools.validate_call({"name": ask_items.TOOL_NAME, "args": {}}, None)
     assert err == {"error": "bad_args", "field": "name"}
+
+
+def test_envelope_first_item_over_budget_is_a_reason_not_an_error(monkeypatch):
+    monkeypatch.setattr(ask_items, "MAX_RESULT_CHARS", 50)
+    env = ask_items.envelope("g", [_row()], {}, ask_tools.RefAssigner())
+    assert env["items"] == []
+    assert env["meta"] == {"truncated": True, "empty_reason": "over_budget"}

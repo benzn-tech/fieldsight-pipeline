@@ -61,3 +61,41 @@ def test_empty_author_set_short_circuits_without_sql(monkeypatch):
                         lambda *a, **k: pytest.fail("no SQL for an empty author set"))
     res = rag.lambda_handler({"mode": "items", "sub": "x", "args": {}}, None)
     assert res["rows"] == [] and res["meta"]["empty_reason"] == "nothing_visible"
+
+
+@pytest.mark.parametrize("deadline", [0, -1, "nan", "x"])
+def test_no_time_left_answers_timeout_before_any_connection(monkeypatch, deadline):
+    def boom():
+        raise AssertionError("no connection without time")
+    monkeypatch.setattr(rag, "get_cached_connection", boom)
+    monkeypatch.setattr(rag, "close_cached_connection", lambda: None)
+    res = rag.lambda_handler({"mode": "items", "sub": "s", "deadline_s": deadline,
+                              "args": {}}, None)
+    assert res == {"rows": [], "meta": {"error": "timeout"}}
+
+
+def test_deadline_becomes_the_reads_statement_timeout(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(rag, "get_cached_connection", lambda: object())
+    monkeypatch.setattr(rag, "close_cached_connection", lambda: None)
+    monkeypatch.setattr(rag.users, "get_user_by_sub",
+                        lambda conn, sub: {"id": "u", "company_id": "c",
+                                           "global_role": "gm", "archived_at": None})
+    monkeypatch.setattr(rag.tenancy_status, "caller_blocked", lambda *a, **k: None)
+    monkeypatch.setattr(rag.scope, "visible_scope",
+                        lambda conn, caller: {"site_ids": {"s1"}, "author_ids": None})
+    monkeypatch.setattr(rag.topics, "scoped_items_rows",
+                        lambda *a, **k: seen.update(k) or [])
+    for raw, ms in ((None, 20000), (2.5, 2500), (99, 20000)):
+        ev = {"mode": "items", "sub": "x", "args": {}}
+        if raw is not None:
+            ev["deadline_s"] = raw
+        rag.lambda_handler(ev, None)
+        assert seen["timeout_ms"] == ms
+
+
+def test_items_sql_carries_get_topic_visible_hide_rule():
+    """One hide rule, two readers: get_topic_visible and the items tool."""
+    hide = topics._topic_not_hidden("t")
+    assert hide in topics._TOPIC_VISIBLE_SQL
+    assert "reverted_at IS NULL" in hide and "non_work" in hide
