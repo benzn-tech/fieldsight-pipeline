@@ -1830,6 +1830,8 @@ def _day_report_rows(conn, caller, folder, date):
     else:
         rows = topics.list_topics_for_source_prefix(conn, prefix)
     own_day = bool(folder) and folder == (caller.get("folder_name") or "")
+    if own_day and merged and _own_range_touches_inactive(conn, caller, folder, date, date):
+        own_day = False   # spec 2026-11-01 §5.2: read like another viewer -- merged rows clipped
     if own_day and merged:
         merged_set = set(merged)
         return [r for r in rows
@@ -4175,6 +4177,7 @@ def get_day_inspections(conn, caller, date, event):
         return err
     company = _read_company(caller, folder)
     rows = inspection_windows.for_day(conn, company, folder, date)
+    rows = _own_rows_visible(conn, caller, folder, date, rows)   # spec 2026-11-01 §5.2
     return ok({"date": date, "folder": folder, "inspections": [
         dict(r, id=str(r["id"]),
              template_id=str(r["template_id"]) if r.get("template_id") else None)
@@ -4290,8 +4293,11 @@ def get_day_checklist_reports(conn, caller, date, event):
     if err is not None:
         return err
     company = _read_company(caller, folder)
-    rows = checklist_reports.for_day(conn, company, folder, date)
-    checks = inspection_windows.for_day(conn, company, folder, date)
+    # spec 2026-11-01 §5.2: own folder loses sessions on an inactive company's site
+    rows = _own_rows_visible(conn, caller, folder, date,
+                             checklist_reports.for_day(conn, company, folder, date))
+    checks = _own_rows_visible(conn, caller, folder, date,
+                               inspection_windows.for_day(conn, company, folder, date))
     return ok({"date": date, "folder": folder,
                "reports": [_checklist_report_payload(r) for r in rows],
                "unmatched": _unmatched_checks(checks)})
@@ -4307,10 +4313,12 @@ def get_recent_checklist_reports(conn, caller, event):
     today = nz_time.nz_today()
     since = (today - timedelta(days=1)).isoformat()
     rows = checklist_reports.recent_for_folder(conn, caller["company_id"], folder, since)
+    rows = _own_rows_visible(conn, caller, folder, None, rows)   # spec 2026-11-01 §5.2
     unmatched = []
     for day in (today - timedelta(days=1), today):
-        for c in _unmatched_checks(inspection_windows.for_day(
-                conn, caller["company_id"], folder, day.isoformat())):
+        for c in _unmatched_checks(_own_rows_visible(conn, caller, folder, day.isoformat(),
+                                                     inspection_windows.for_day(
+                conn, caller["company_id"], folder, day.isoformat()))):
             unmatched.append(dict(c, date=day.isoformat()))
     return ok({"folder": folder, "reports": [_checklist_report_payload(r) for r in rows],
                "unmatched": unmatched})
@@ -10830,6 +10838,11 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False,
     # to be the target -- asking about the caller would answer a question nobody
     # posed and return the caller's own unrelated meetings.
     merged_keys = _merged_keys_for(conn, _timeline_target_id(conn, caller, user), date)
+    # Company offboarding (spec 2026-11-01 §5.2): the person's own day that touches a site
+    # of an inactive company is read exactly as another viewer reads it -- site-clipped
+    # rows, no whole-day prose, no photo list, never the verbatim daily_report.json.
+    if not cross_user_clip and _own_range_touches_inactive(conn, caller, user, date, date):
+        cross_user_clip = True
     saw_foreign = []
     day_cache = []
 
@@ -11079,6 +11092,11 @@ def _day_photo_block(conn, caller, user, date):
         photos = [p for p in photos if p["s3_key"] not in hidden]
         if hidden:
             logger.info("day view: %s/%s hid %d deleted photo(s)", user, date, len(hidden))
+        # Own folder: photos taken on a site of an inactive company are withheld (spec
+        # 2026-11-01 §5.2). Anyone else's folder / flag off: unchanged.
+        own_hider = _session_hider(conn, caller, user, date)
+        if isinstance(own_hider, _InactiveSiteHider):
+            photos = [p for p in photos if not own_hider.hides_key(p["s3_key"])]
         return photos
     except Exception:  # noqa: BLE001 - see above
         logger.exception("photo list unavailable for %s/%s", user, date)
@@ -12043,7 +12061,7 @@ class _InactiveSiteHider(_SessionHider):
     @classmethod
     def build(cls, conn, folder, date, inactive):
         deny = sorted(inactive)
-        outside = set()
+        outside, keys = set(), set()
         like = recordings._escape_like(folder)
         date = date or "%"
         for sql, pat in (
@@ -12052,19 +12070,51 @@ class _InactiveSiteHider(_SessionHider):
                 ("SELECT source_s3_key FROM topics WHERE source_s3_key LIKE %s "
                  "AND site_id = ANY(%s::uuid[])", f"extractions/{like}/{date}/%")):
             for (key,) in conn.execute(sql, (pat, deny)).fetchall():
+                keys.add(key)
                 sid = _session_of(key)
                 if sid:
                     outside.add(sid)
-        return cls(conn, deny, True, set(), outside)
+        hider = cls(conn, deny, True, set(), outside)
+        hider.keys = keys
+        return hider
 
     def hides_key(self, key):
+        """A key with a session id: its session decides. Without one (a photo): hidden
+        when its own recordings row is on an inactive site (all fetched once in build,
+        so a day's photo list costs no per-photo query)."""
         sid = _session_of(key)
         if sid:
             return self.hides(sid)
-        row = self._conn.execute(
-            "SELECT COALESCE(site_id = ANY(%s::uuid[]), false) "
-            "FROM recordings WHERE s3_key = %s LIMIT 1", (self._allowed, key)).fetchone()
-        return bool(row and row[0])
+        return key in self.keys
+
+    def hides_row(self, row, field="session"):
+        """For a row naming its session (inspection windows, checklist reports). A row
+        with no session id cannot be tied to a site and stays visible."""
+        return self.hides(_session_of(row.get(field) or ""))
+
+
+def _own_rows_visible(conn, caller, folder, date, rows, field="session"):
+    """`rows` minus those whose session lies on an inactive company's site, for the
+    caller's OWN folder (spec 2026-11-01 §5.2). Anyone else's folder, flag off,
+    platform_admin, nobody inactive: `rows` unchanged."""
+    hider = _session_hider(conn, caller, folder, date)
+    if not isinstance(hider, _InactiveSiteHider):
+        return rows
+    return [r for r in rows if not hider.hides_row(r, field)]
+
+
+def _own_range_touches_inactive(conn, caller, folder, date_from, date_to):
+    """Whether the caller's OWN day(s) hold work on a site of an inactive company. Such a
+    day is read exactly as another viewer would read it (spec 2026-11-01 §5.2: the
+    existing cross-user clip, never the unclipped whole-day artifacts). False for anyone
+    else's folder, flag off, platform_admin, nobody inactive -- no DB read then."""
+    if not folder or folder != (caller.get("folder_name") or None):
+        return False
+    inactive = tenancy_status.inactive_site_ids(conn, caller)
+    if inactive is None:
+        return False
+    return recordings.author_range_touches_sites(
+        conn, caller["id"], date_from, date_to, inactive)
 
 
 def _session_hider(conn, caller, folder, date):
@@ -12737,8 +12787,12 @@ def _user_report_hidden(conn, caller, key, owners=None):
         return False
     owner = _report_key_owner_folder(key)
     period = _report_key_period(key)
-    if not owner or not period or owner == (caller.get("folder_name") or None):
+    if not owner or not period:
         return False
+    if owner == (caller.get("folder_name") or None):
+        # The person's own document: theirs, unless its period holds work on a site of an
+        # inactive company (spec 2026-11-01 §5.2). Flag off etc. -> False, no DB read.
+        return _own_range_touches_inactive(conn, caller, owner, period[0], period[1])
     owners = owners if owners is not None else {}
     if owner not in owners:
         owners[owner] = users.get_by_folder_name_global(conn, owner)

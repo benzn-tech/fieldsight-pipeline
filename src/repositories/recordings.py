@@ -824,6 +824,28 @@ def author_range_not_within_sites(conn, user_id, date_from, date_to, site_ids, *
     return bool(outside) or (bool(siteless_outside) and not inside)
 
 
+def author_range_touches_sites(conn, user_id, date_from, date_to, site_ids) -> bool:
+    """Whether ANY topic or recording of `user_id` in [date_from, date_to] lies on one
+    of `site_ids` -- the "inside" half of `author_range_not_within_sites`, same date
+    rules. Company offboarding (spec 2026-11-01 §5.2): a person's own day that touches
+    a site of an inactive company is read as another viewer would read it. Empty
+    `site_ids` -> False without a round-trip."""
+    ids = [str(s) for s in (site_ids or [])]
+    if not ids or not user_id:
+        return False
+    dfrom, dto = str(date_from), str(date_to)
+    row = conn.execute(
+        "SELECT EXISTS (SELECT 1 FROM topics WHERE user_id=%(u)s "
+        "   AND report_date BETWEEN %(f)s::date AND %(t)s::date "
+        "   AND site_id = ANY(%(s)s::uuid[])) "
+        " OR EXISTS (SELECT 1 FROM recordings WHERE user_id=%(u)s "
+        "   AND substring(s3_key from '/([0-9]{4}-[0-9]{2}-[0-9]{2})/') BETWEEN %(f)s::text AND %(t)s::text "
+        "   AND site_id = ANY(%(s)s::uuid[]))",
+        {"u": user_id, "f": dfrom, "t": dto, "s": ids},
+    ).fetchone()
+    return bool(row and row[0])
+
+
 def author_day_has_rows_outside_sites(conn, user_id, date, site_ids, *,
                                       siteless_outside=False) -> bool:
     """One-day form of `author_range_not_within_sites` (see there). The name is the

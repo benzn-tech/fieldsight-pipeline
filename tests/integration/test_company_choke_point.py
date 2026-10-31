@@ -317,3 +317,151 @@ def test_someone_elses_folder_on_the_inactive_site_is_hidden_too(db, w, flag_on,
     _set(db, w["a"], "suspended")
     h = org._session_hider(db, _fresh(w["bad"]), w["folder"], DATE)
     assert h is not None and h.hides(SID_A) and not h.hides(SID_B)
+
+
+# ---- own-folder whole-day reads (follow-up ruling: read like another viewer) -----------
+# A day of the person's own folder that touches a site of an inactive company is read
+# exactly as another viewer would read it: site-clipped rows, no whole-day prose, no
+# verbatim daily_report.json; photos / inspections / checklists / per-user reports pinned
+# to what is not on the inactive site. Days touching no inactive site are unchanged.
+
+from repositories import inspection_windows, topics  # noqa: E402
+
+VERBATIM = {"executive_summary": "WHOLE DAY PROSE", "topics": []}
+QUIET = "2026-10-29"      # a day with work on B's site only
+A_ONLY = "2026-10-28"     # a day with one recording on A's site and no topics
+SID_C = "sid" + "c" * 32  # an A-site session known ONLY from a topics row
+
+
+@pytest.fixture
+def own(w, db, monkeypatch):
+    monkeypatch.setattr(org, "GRADED_ROLES", True)
+    monkeypatch.setattr(org, "_get_lake_json", lambda key: dict(VERBATIM)
+                        if key.endswith("daily_report.json") else None)
+    monkeypatch.setattr(org, "_merged_keys_for", lambda conn, uid, date: [])
+    f = w["folder"]
+    for site, title, sid, date in ((w["sa"], "A pour", SID_A, DATE),
+                                   (w["sb"], "B steel", SID_B, DATE),
+                                   (w["sb"], "B quiet", SID_B, QUIET),
+                                   (w["sa"], "A topic-only", SID_C, DATE)):
+        topics.upsert_topic(db, site, date, title, user_id=w["bw"]["id"],
+                            source_s3_key=f"extractions/{f}/{date}/{sid}.json",
+                            time_range="09:00 - 09:30")
+    recordings.insert_pending(db, w["a"]["id"], w["bw"]["id"], w["sa"], "audio",
+                              f"users/{f}/audio/{A_ONLY}/dev_09-00-00.wav",
+                              uuid.uuid4().hex, f"{A_ONLY}T01:00:00Z")
+    return w
+
+
+def _timeline(db, u, date):
+    res = org.get_timeline_compat(db, _fresh(u), {"queryStringParameters": {"date": date}})
+    return res["statusCode"], json.loads(res["body"])
+
+
+def _titles(body):
+    return sorted(t.get("title") or t.get("topic_title") or "" for t in body.get("topics") or [])
+
+
+def test_own_timeline_day_touching_the_inactive_site_is_clipped(db, own, flag_on):
+    code, body = _timeline(db, own["bw"], DATE)
+    assert code == 200 and _titles(body) == ["A pour", "A topic-only", "B steel"]
+    assert body.get("photo_filenames")                       # the person's own day: photos
+    _set(db, own["a"], "suspended")
+    code, body = _timeline(db, own["bw"], DATE)
+    assert code == 200 and _titles(body) == ["B steel"]
+    assert "WHOLE DAY PROSE" not in json.dumps(body)
+    assert "IMG_a.jpg" not in json.dumps(body) and not body.get("photo_filenames")
+    _set(db, own["a"], "active")                                # restored
+    code, body = _timeline(db, own["bw"], DATE)
+    assert _titles(body) == ["A pour", "A topic-only", "B steel"]
+    _usable(db)
+
+
+def test_own_verbatim_day_on_the_inactive_site_is_withheld(db, own, flag_on):
+    code, body = _timeline(db, own["bw"], A_ONLY)
+    assert code == 200 and body.get("executive_summary") == "WHOLE DAY PROSE"
+    _set(db, own["a"], "suspended")
+    code, body = _timeline(db, own["bw"], A_ONLY)
+    assert code == 404 and "WHOLE DAY PROSE" not in json.dumps(body)
+
+
+def test_own_day_touching_no_inactive_site_is_unchanged(db, own, flag_on):
+    before = _timeline(db, own["bw"], QUIET)
+    _set(db, own["a"], "suspended")
+    assert _timeline(db, own["bw"], QUIET) == before
+
+
+def test_own_timeline_flag_off_and_platform_admin_unchanged(db, own, flag_off, monkeypatch):
+    _set(db, own["a"], "suspended")
+    code, body = _timeline(db, own["bw"], A_ONLY)
+    assert code == 200 and body.get("executive_summary") == "WHOLE DAY PROSE"
+    assert _titles(_timeline(db, own["bw"], DATE)[1]) == ["A pour", "A topic-only", "B steel"]
+    monkeypatch.setenv(FLAG, "on")
+    assert not org._own_range_touches_inactive(db, _fresh(own["pa"]), own["folder"], DATE, DATE)
+
+
+def test_own_sessions_list_drops_the_inactive_sites_sessions(db, own, flag_on):
+    def sessions():
+        res = org.get_org_sessions(db, _fresh(own["bw"]), {"queryStringParameters": {"date": DATE}})
+        assert res["statusCode"] == 200
+        return {s["session_id"] for s in json.loads(res["body"])["sessions"]}
+    assert {SID_A, SID_B, SID_C} <= {s[-35:] for s in sessions()}
+    _set(db, own["a"], "suspended")
+    got = {s[-35:] for s in sessions()}
+    assert SID_B in got and SID_A not in got and SID_C not in got
+
+
+def test_own_photos_drop_the_inactive_sites_photos(db, own, flag_on):
+    names = lambda: sorted(p["s3_key"].rsplit("/", 1)[-1]  # noqa: E731
+                           for p in org._day_photo_block(db, _fresh(own["bw"]), own["folder"], DATE))
+    assert names() == ["IMG_a.jpg", "IMG_b.jpg"]
+    _set(db, own["a"], "suspended")
+    assert names() == ["IMG_b.jpg"]
+    _set(db, own["a"], "active")
+    assert names() == ["IMG_a.jpg", "IMG_b.jpg"]
+
+
+def test_own_report_history_and_presign_guard(db, own, flag_on):
+    f = own["folder"]
+    day = f"reports/{DATE}/{f}/daily_report.json"
+    quiet = f"reports/{QUIET}/{f}/daily_report.json"
+    week_spanning = f"reports/2026-10-31/{f}/weekly_report.json"   # covers DATE
+    keep = org._report_entry_guard(db, _fresh(own["bw"]))
+    assert keep(day) and keep(quiet) and keep(week_spanning)
+    _set(db, own["a"], "suspended")
+    caller = _fresh(own["bw"])
+    keep = org._report_entry_guard(db, caller)
+    assert not keep(day) and not keep(week_spanning)
+    assert keep(quiet)
+    assert org._user_report_hidden(db, caller, day) is True       # the presign rule
+    assert org._user_report_hidden(db, caller, quiet) is False
+
+
+def test_topics_only_session_is_hidden_from_own_media(db, own, flag_on):
+    _set(db, own["a"], "suspended")
+    h = org._session_hider(db, _fresh(own["bw"]), own["folder"], DATE)
+    assert h.hides(SID_C)                                      # known only from topics
+    assert h.hides(SID_A) and not h.hides(SID_B)
+
+
+def test_own_inspections_and_checklists_drop_the_inactive_sites_sessions(db, own, flag_on):
+    f = own["folder"]
+    for co, sid, name in ((own["a"], SID_A, "A check"), (own["b"], SID_B, "B check")):
+        inspection_windows.replace_for_session(
+            db, co["id"], f, DATE, f"dev_10-00-00_{sid}",
+            [{"name": name, "start_at": "10:00:00"}])
+
+    def checks():
+        res = org.get_day_inspections(db, _fresh(own["bw"]), DATE,
+                                      {"queryStringParameters": {}})
+        assert res["statusCode"] == 200
+        return sorted(r["name"] for r in json.loads(res["body"])["inspections"])
+
+    def unmatched():
+        res = org.get_day_checklist_reports(db, _fresh(own["bw"]), DATE,
+                                            {"queryStringParameters": {}})
+        assert res["statusCode"] == 200
+        return sorted(c["checkName"] for c in json.loads(res["body"])["unmatched"])
+    assert checks() == ["A check", "B check"] and unmatched() == ["A check", "B check"]
+    _set(db, own["a"], "suspended")
+    assert checks() == ["B check"] and unmatched() == ["B check"]
