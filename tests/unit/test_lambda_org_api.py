@@ -3636,12 +3636,35 @@ def test_admin_one_candidate_recurses_to_single_user(presign_wired):
     wired.setattr(org.topics, "list_extraction_folder_names_for_date",
                   lambda conn, cid, date: ["Ada_L"])
     wired.setattr(org.topics, "has_topics_for_source_prefix", lambda conn, prefix: False)
+    # Ada_L is a colleague whose day sits wholly on this company's sites, so the
+    # clip_foreign read serves the verbatim doc exactly as before.
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-2", "folder_name": folder, "company_id": cid})
+    wired.setattr(org.recordings, "author_day_has_rows_outside_sites", lambda *a, **k: False)
     verbatim_doc = {"report_date": "2026-07-14", "topics": []}
     fake.objects["reports/2026-07-14/Ada_L/daily_report.json"] = json.dumps(verbatim_doc).encode()
     res = org.lambda_handler(make_event(
         "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
     assert res["statusCode"] == 200
     assert body_of(res) == {**verbatim_doc, "user": "Ada_L"}
+
+
+def test_admin_one_candidate_with_work_outside_reach_gets_no_verbatim_doc(presign_wired):
+    # The same single candidate, but their day also holds work on a site outside this
+    # admin's reach: the site-less verbatim doc would carry it, so it is withheld.
+    wired, fake = presign_wired
+    wired.setattr(org.topics, "list_extraction_folder_names_for_date",
+                  lambda conn, cid, date: ["Ada_L"])
+    wired.setattr(org.topics, "has_topics_for_source_prefix", lambda conn, prefix: False)
+    wired.setattr(org.users, "get_by_folder_name",
+                  lambda conn, cid, folder: {"id": "u-2", "folder_name": folder, "company_id": cid})
+    wired.setattr(org.recordings, "author_day_has_rows_outside_sites", lambda *a, **k: True)
+    fake.objects["reports/2026-07-14/Ada_L/daily_report.json"] = json.dumps(
+        {"report_date": "2026-07-14", "executive_summary": "OTHER SITE PROSE"}).encode()
+    res = org.lambda_handler(make_event(
+        "GET", "/api/org/timeline", params={"date": "2026-07-14"}), None)
+    assert res["statusCode"] == 404
+    assert "OTHER SITE PROSE" not in res["body"]
 
 
 def test_site_acl_filters_override_rows(presign_wired):
