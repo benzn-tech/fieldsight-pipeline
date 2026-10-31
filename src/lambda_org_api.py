@@ -811,7 +811,7 @@ def list_action_packs(conn, caller, event):
             swept = action_packs.sweep_stale(
                 conn, timedelta(minutes=action_pack_view.STALE_SWEEP_MINUTES))
         if swept:
-            logger.warning("action pack sweep failed %d stale pack(s)", swept)
+            logger.warning("action pack sweep marked %d stale pack(s) failed", swept)
     except Exception as exc:  # noqa: BLE001 - the list must not depend on the sweep
         logger.error("action pack sweep failed (%s)", type(exc).__name__)
     rows = action_packs.list_for_reader(conn, _pack_reader(conn, caller), state=state,

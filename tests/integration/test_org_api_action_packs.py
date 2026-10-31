@@ -154,9 +154,9 @@ def test_create_inactive_company_refused_when_enforced(db, env, monkeypatch):
     db.execute("UPDATE action_packs SET state='cancelled' WHERE created_by=%s", (ext["id"],))
     monkeypatch.setenv("COMPANY_STATUS_ENFORCE", "on")
     # Enforced: the site drops out of the caller's reach first, so it reads as unknown.
-    status, body = _call(db, ext, "POST", "/action-packs",
-                         {"instruction": "x", "site_id": str(site["id"])})
-    assert status in (404, 409)
+    assert _call(db, ext, "POST", "/action-packs",
+                 {"instruction": "x", "site_id": str(site["id"])}) == (
+        404, {"error": "site not found"})
     assert len(env.puts) == 1
 
 
