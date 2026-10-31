@@ -1141,6 +1141,10 @@ def _capture_site(conn, caller, site_id):
         m = memberships.get_membership(conn, caller["id"], site_id)
         if m is None or m.get("archived_at") is not None:
             return None, error("site not accessible", 403)
+    # Company offboarding (spec 2026-11-01 §5.2): nothing is captured onto a site of an
+    # inactive company by anyone but platform_admin. Flag off -> None -> unchanged.
+    if str(site["id"]) in (tenancy_status.inactive_site_ids(conn, caller) or ()):
+        return None, error("site not accessible", 403)
     return site, None
 
 
@@ -5084,11 +5088,15 @@ def get_me(conn, caller, blocked=None):
     # their read reach does not include it -- an admin/gm's reach is their own company's
     # sites. Pickers read this list, so without the union an external member could not
     # choose the project at all (TEST 2026-10-09). Reads stay clipped server-side.
-    site_ids = sorted({str(x) for x in site_ids} | set(
-        memberships.caller_site_roles(conn, caller["id"]).keys()))
-    # Strip the request-scoped visible_scope memo (MINOR-1) before echoing the
-    # caller profile -- it's an internal cache, not part of the /me contract.
-    profile = {k: v for k, v in caller.items() if k != "_visible_scope"}
+    # Company offboarding (spec 2026-11-01 §5.2): a site of an inactive company is not
+    # listed, through the reach or through the membership union (None -> unchanged).
+    inactive = tenancy_status.inactive_site_ids(conn, caller)
+    site_ids = sorted(tenancy_status.drop_inactive({str(x) for x in site_ids} | set(
+        memberships.caller_site_roles(conn, caller["id"]).keys()), inactive))
+    # Strip the request-scoped memos (visible_scope MINOR-1, the inactive-site set) before
+    # echoing the caller profile -- internal caches, not part of the /me contract.
+    profile = {k: v for k, v in caller.items()
+               if k not in ("_visible_scope", tenancy_status.INACTIVE_SITES_MEMO)}
     # Company name for the profile UI (the caller carries company_id; surface
     # the human name too — tenant-split shows each user their company/Corp).
     company = companies.get_company_by_id(conn, caller["company_id"]) if caller.get("company_id") else None
@@ -5105,7 +5113,8 @@ def get_me(conn, caller, blocked=None):
     # `effective_scope` is what the read paths ACTUALLY apply. It is None when GRADED_ROLES
     # is off, because then the membership floor is not applied either and claiming
     # SELF+WORKERS would be a second wrong answer rather than a fix.
-    site_roles = memberships.caller_site_roles(conn, caller["id"])
+    site_roles = tenancy_status.drop_inactive(
+        memberships.caller_site_roles(conn, caller["id"]), inactive)
     effective_scope = (scope.visible_scope(conn, caller)["user_scope"]
                        if GRADED_ROLES else None)
     me = {**profile, "site_ids": site_ids,
@@ -5182,6 +5191,8 @@ def list_org_sites(conn, caller, event):
         # membership scope never includes archived rows (param ignored)
         ids = memberships.accessible_site_ids(
             conn, caller["id"], caller["global_role"])
+        # Company offboarding choke point (spec 2026-11-01 §5.2); None -> unchanged.
+        ids = tenancy_status.drop_inactive(ids, tenancy_status.inactive_site_ids(conn, caller))
         rows = sites.list_sites_by_ids(conn, ids)
     # Card KPIs / labels: member count per site + owning company name. Both are
     # additive and scoped to the sites already returned, so they never widen
@@ -9120,9 +9131,16 @@ def _allowed_site_ids(conn, caller):
     # ?site= query param arrives as a string — a UUID-vs-str `in` check is
     # always False (every request 403'd, incl. admins). Unit mocks used string
     # ids so this only surfaced against real Aurora (smoke-caught).
+    # Company offboarding (spec 2026-11-01 §5.2): the same live-company choke point as
+    # visible_scope's, for the binary path (None -> unchanged).
+    inactive = tenancy_status.inactive_site_ids(conn, caller)
     if resolve_scope(caller["global_role"]) == "ALL":
-        return {str(s["id"]) for s in sites.list_company_sites(conn, caller["company_id"])}
-    return {str(x) for x in memberships.accessible_site_ids(conn, caller["id"], caller["global_role"])}
+        return tenancy_status.drop_inactive(
+            {str(s["id"]) for s in sites.list_company_sites(conn, caller["company_id"])},
+            inactive)
+    return tenancy_status.drop_inactive(
+        {str(x) for x in memberships.accessible_site_ids(conn, caller["id"], caller["global_role"])},
+        inactive)
 
 
 _SITE_UUID_RE = re.compile(
@@ -10848,7 +10866,11 @@ def _render_timeline_for_user(conn, caller, date, user, cross_user_clip=False,
             # Their own day: every site they hold a live membership on counts,
             # including a project of another company they were added to (an ALL-tier
             # caller's reach is their own company's sites only).
-            allowed = set(allowed) | set(memberships.caller_site_roles(conn, caller["id"]))
+            # ...except a site of an inactive company (spec 2026-11-01 §5.2: own-folder
+            # reads lose it too). None -> unchanged.
+            allowed = tenancy_status.drop_inactive(
+                set(allowed) | set(memberships.caller_site_roles(conn, caller["id"])),
+                tenancy_status.inactive_site_ids(conn, caller))
         # The kwarg is passed ONLY when there is something to union. A day with
         # no group must reach this repository exactly as it did before -- same
         # call, same SQL, same params -- so the change cannot alter the ordinary
@@ -12012,16 +12034,57 @@ class _SessionHider:
         return not self.siteless_ok
 
 
+class _InactiveSiteHider(_SessionHider):
+    """The person's OWN folder while a company is inactive (spec 2026-11-01 §5.2/§6): the
+    inverse of the whitelist. A session is hidden when any recording or extraction row ties
+    it to a site of an inactive company; everything else (other sites, site-less, row-less)
+    stays visible, as it always was for the person themself."""
+
+    @classmethod
+    def build(cls, conn, folder, date, inactive):
+        deny = sorted(inactive)
+        outside = set()
+        like = recordings._escape_like(folder)
+        date = date or "%"
+        for sql, pat in (
+                ("SELECT s3_key FROM recordings WHERE s3_key LIKE %s "
+                 "AND site_id = ANY(%s::uuid[])", f"users/{like}/%/{date}/%"),
+                ("SELECT source_s3_key FROM topics WHERE source_s3_key LIKE %s "
+                 "AND site_id = ANY(%s::uuid[])", f"extractions/{like}/{date}/%")):
+            for (key,) in conn.execute(sql, (pat, deny)).fetchall():
+                sid = _session_of(key)
+                if sid:
+                    outside.add(sid)
+        return cls(conn, deny, True, set(), outside)
+
+    def hides_key(self, key):
+        sid = _session_of(key)
+        if sid:
+            return self.hides(sid)
+        row = self._conn.execute(
+            "SELECT COALESCE(site_id = ANY(%s::uuid[]), false) "
+            "FROM recordings WHERE s3_key = %s LIMIT 1", (self._allowed, key)).fetchone()
+        return bool(row and row[0])
+
+
 def _session_hider(conn, caller, folder, date):
     """A `_SessionHider` for one (folder, date), or None when nothing is restricted
-    (no caller, the person themself, platform_admin).
+    (no caller, the person themself, platform_admin). The person themself gets an
+    `_InactiveSiteHider` instead while a company is inactive and the flag is on.
 
     NOT fail-open, unlike the tombstone lookup: a failure here would hand one
     company another company's recording, so it propagates."""
     if conn is None or caller is None or not folder:
         return None
-    if is_cross_company(caller["global_role"]) or folder == (caller.get("folder_name") or None):
+    if is_cross_company(caller["global_role"]):
         return None
+    if folder == (caller.get("folder_name") or None):
+        # The person's own folder is unrestricted -- except the sessions captured on a site
+        # of an inactive company (spec 2026-11-01 §5.2/§6). None -> unchanged.
+        inactive = tenancy_status.inactive_site_ids(conn, caller)
+        if inactive is None:
+            return None
+        return _InactiveSiteHider.build(conn, folder, date, inactive)
     allowed = [str(x) for x in _allowed_site_ids(conn, caller)]
     inside, outside = set(), set()
     like = recordings._escape_like(folder)

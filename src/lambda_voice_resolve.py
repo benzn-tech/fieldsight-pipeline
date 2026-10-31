@@ -35,6 +35,11 @@ def lambda_handler(event, context):
                 return {"statusCode": 403}
             allowed = {str(x) for x in memberships.accessible_site_ids(
                 conn, caller["id"], caller["global_role"])}
+            # Company offboarding choke point (spec 2026-11-01 §5.2): no voice onto a site of
+            # an inactive company, so nobody on it is resolved as a recipient. None (flag
+            # off / platform_admin / nobody inactive) -> unchanged.
+            allowed = tenancy_status.drop_inactive(
+                allowed, tenancy_status.inactive_site_ids(conn, caller))
             if str(site_id) not in allowed:
                 return {"statusCode": 403}
             msg = voice_messages.insert_message(

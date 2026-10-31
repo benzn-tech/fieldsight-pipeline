@@ -83,6 +83,63 @@ def inactive_company_ids(conn) -> set:
     return {r[0] for r in rows}
 
 
+INACTIVE_SITES_MEMO = "_inactive_site_ids"
+
+
+def inactive_site_ids(conn, caller=None) -> set | None:
+    """The live-company choke point (spec §5.2, ruling R4): ids (as str) of every site
+    whose company is not 'active', i.e. the sites a non-platform-admin caller must not
+    reach -- or None, meaning "filter nothing".
+
+    None when the flag is off (no DB read at all, so traffic is byte-identical to before),
+    when the caller is platform_admin (R5), when no company is inactive (the second query is
+    then never run), and when companies.status is not migrated yet. Never an empty set.
+
+    Callers apply it by post-filtering in Python (drop_inactive), so every existing SQL
+    statement stays byte-identical. Memoized on the caller dict (one read per request,
+    like scope.visible_scope's `_visible_scope`); anything that echoes the caller dict
+    must strip INACTIVE_SITES_MEMO. Savepoint-guarded (module doc)."""
+    if not enforce_enabled():
+        return None
+    if caller is not None:
+        if caller.get("global_role") == "platform_admin":
+            return None
+        if INACTIVE_SITES_MEMO in caller:
+            return caller[INACTIVE_SITES_MEMO]
+    out = None
+    company_ids = inactive_company_ids(conn)
+    if company_ids:
+        try:
+            with conn.transaction():
+                rows = conn.execute(
+                    "SELECT id FROM sites WHERE company_id = ANY(%s)",
+                    (list(company_ids),)).fetchall()
+        except Exception as exc:  # noqa: BLE001 - narrowed below
+            if not _not_migrated(exc):
+                raise
+            rows = []
+        out = {str(r[0]) for r in rows} or None
+    if caller is not None:
+        caller[INACTIVE_SITES_MEMO] = out
+    return out
+
+
+def drop_inactive(items, inactive):
+    """`items` without the entries whose site id is in `inactive` (inactive_site_ids).
+    Works on a set / list / tuple of site ids (str or UUID) or a dict keyed by site id;
+    returns the same kind. `inactive` None -> `items` unchanged (the same object)."""
+    if not inactive:
+        return items
+    if isinstance(items, dict):
+        return {k: v for k, v in items.items() if str(k) not in inactive}
+    kept = [x for x in items if str(x) not in inactive]
+    if isinstance(items, (set, frozenset)):
+        return set(kept)
+    if isinstance(items, tuple):
+        return tuple(kept)
+    return kept
+
+
 def blocked_reason(conn, caller) -> str | None:
     """What WOULD block this caller, regardless of the flag: 'account_archived',
     'company_inactive' or None. platform_admin -> None (exempt, no DB read). Archived is

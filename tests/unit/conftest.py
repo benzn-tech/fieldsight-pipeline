@@ -47,6 +47,10 @@ def _single_company_world_defaults(request):
             import tenancy_status
             mp.setattr(tenancy_status, "company_status",
                        lambda conn, company_id: tenancy_status.ACTIVE)
+            # Live-company choke point (Task 4): nobody inactive, so inactive_site_ids is
+            # None and nothing is filtered even when a test turns the flag on. Its SQL is
+            # proven in tests/integration/test_company_choke_point.py.
+            mp.setattr(tenancy_status, "inactive_company_ids", lambda conn: set())
         org =sys.modules.get("lambda_org_api")      # never import it just for this
         if org is not None:
             # The session whitelist (final review F1) asks the database which sessions lie
