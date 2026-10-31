@@ -139,6 +139,7 @@ from datetime import date as _date
 from datetime import datetime, timedelta, timezone
 
 import boto3
+from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError, ParamValidationError
 from psycopg.errors import UniqueViolation
 
@@ -322,6 +323,7 @@ ALLOWED_VOICE_TYPES = {"audio/wav": "wav", "audio/x-wav": "wav",
 
 _s3_client = None
 _cognito_client = None
+_cognito_executor_client = None
 
 
 # `profiles_for_matching` used to be re-exported here, with a docstring saying the binding
@@ -344,6 +346,21 @@ def cognito():
     if _cognito_client is None:
         _cognito_client = boto3.client("cognito-idp")
     return _cognito_client
+
+
+# The company-status Cognito executor's own client (Task 8). Each of its calls runs while it
+# holds FOR SHARE on the company row, and POST /companies/{id}/status waits on that lock
+# (FOR UPDATE) inside org-api's 30 s. Short timeouts and one retry bound the hold to well
+# under that even when the endpoint hangs; a failed call is recorded and retried next tick.
+COGNITO_EXECUTOR_CONFIG = BotoConfig(connect_timeout=3, read_timeout=8,
+                                     retries={"max_attempts": 2, "mode": "standard"})
+
+
+def cognito_executor():
+    global _cognito_executor_client
+    if _cognito_executor_client is None:
+        _cognito_executor_client = boto3.client("cognito-idp", config=COGNITO_EXECUTOR_CONFIG)
+    return _cognito_executor_client
 
 
 # Which stage's sweep flag this API writes (Aurora scale-to-zero, spec
@@ -6285,7 +6302,7 @@ def _delete_export_request(s3_client, bucket, key):
 
 def _company_status_deps():
     return dict(s3_client=s3(), bucket=_export_bucket_for("exports"),
-                cognito_factory=cognito, get_connection=get_connection,
+                cognito_factory=cognito_executor, get_connection=get_connection,
                 pool_id=COGNITO_USER_POOL_ID)
 
 

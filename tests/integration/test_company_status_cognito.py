@@ -116,7 +116,8 @@ def w(db, monkeypatch):
         opened.append(1)
         yield conn
     monkeypatch.setattr(org, "s3", lambda: s3)
-    monkeypatch.setattr(org, "cognito", lambda: cog)
+    monkeypatch.setattr(org, "cognito_executor", lambda: cog)
+    monkeypatch.setattr(org, "cognito", lambda: pytest.fail("shared cognito() used"))
     monkeypatch.setattr(org, "get_connection", get_connection)
     monkeypatch.setattr(org, "COGNITO_USER_POOL_ID", POOL)
     monkeypatch.setattr(org, "LAKE_BUCKET", "lake-b", raising=False)

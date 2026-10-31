@@ -187,7 +187,8 @@ def w(monkeypatch):
         yield conn
     monkeypatch.setattr(api, "get_connection", fake_conn)
     monkeypatch.setattr(api, "s3", lambda: s3)
-    monkeypatch.setattr(api, "cognito", lambda: cog)
+    monkeypatch.setattr(api, "cognito_executor", lambda: cog)
+    monkeypatch.setattr(api, "cognito", lambda: pytest.fail("shared cognito() used"))
     monkeypatch.setattr(api, "COGNITO_USER_POOL_ID", POOL)
     monkeypatch.setattr(api, "LAKE_BUCKET", "lake-b", raising=False)
     monkeypatch.setattr(api, "S3_BUCKET", "data-b", raising=False)
@@ -495,3 +496,23 @@ def test_direct_task_accepts_an_upper_case_id(w):
     _suspend_rows(w, subs=("u1",))
     out = api.lambda_handler({"task": "company_status_cognito", "event_id": E1.upper()}, None)
     assert out["company_id"] == CO and out["done"] == 2
+
+
+def test_the_executor_uses_its_own_short_timeout_client(monkeypatch):
+    """Each call runs under FOR SHARE on the company row, which the status POST waits on
+    inside org-api's 30 s: the executor's client must give up fast (controller ruling)."""
+    made = []
+
+    def fake_client(service, **kw):
+        made.append((service, kw))
+        return object()
+    monkeypatch.setattr(api.boto3, "client", fake_client)
+    monkeypatch.setattr(api, "_cognito_executor_client", None)
+    c1 = api.cognito_executor()
+    assert api.cognito_executor() is c1                       # lazy, created once
+    (service, kw), = made
+    cfg = kw["config"]
+    assert service == "cognito-idp" and cfg is api.COGNITO_EXECUTOR_CONFIG
+    assert cfg.connect_timeout == 3 and cfg.read_timeout == 8
+    assert cfg.retries == {"max_attempts": 2, "mode": "standard"}
+    assert api._company_status_deps()["cognito_factory"] is api.cognito_executor
