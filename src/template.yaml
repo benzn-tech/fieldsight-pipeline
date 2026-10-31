@@ -3436,9 +3436,15 @@ Resources:
   #   drain_lake_manifest   -- fold lake_manifest/ lines into lake_objects (hourly, below)
   #   backfill_lake_objects -- one-off walk of the bucket(s), dry-run by default
   #   export_company        -- one company's lake data as zip parts under exports/
-  #   export_tick           -- every 10 minutes: advance one pending export_requests/ item
+  #   export_tick           -- every 10 minutes: first the company-status Cognito executor
+  #                            (company_status_requests/, spec 2026-11-01 §5.3), then advance
+  #                            one pending export_requests/ item
+  #   company_status_cognito -- direct invoke: sweep one company's Cognito work rows
+  #                            ({"event_id"} and/or {"company_id"}) when a marker was lost
   # No function invokes another here: the VPC has no route to the Lambda API, so the export
-  # route leaves a request object in S3 and export_tick (S3 first, no DB when idle) resumes it.
+  # and company-status routes leave a request object in S3 and export_tick (S3 first, no DB
+  # when idle) picks it up. Cognito is reached through the CognitoIdpEndpoint interface
+  # endpoint (infra/db-template.yaml), which admits LambdaSG -- LakeOps' security group.
   #
   # NO ReservedConcurrentExecutions and NO API events: the mobile upload path must never
   # share a pool with a 15-minute export.
@@ -3527,6 +3533,19 @@ Resources:
               # export_tick deletes a request object once its export is done.
               Action: s3:DeleteObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/export_requests/*
+            - Effect: Allow
+              # The company-status Cognito executor deletes a request object once the
+              # company has no retryable work row left (marker written by OrgApiFunction).
+              Action: s3:DeleteObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/company_status_requests/*
+            - Effect: Allow
+              # Company offboarding (spec 2026-11-01 §5.3): disable + global sign-out of an
+              # inactive company's home users, enable on reactivation. Username = the sub.
+              Action:
+                - cognito-idp:AdminDisableUser
+                - cognito-idp:AdminEnableUser
+                - cognito-idp:AdminUserGlobalSignOut
+              Resource: !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${OrgUserPoolId}
       Events:
         # Hourly. Each run lists lake_manifest/ in S3 first and opens no database connection
         # when it is empty (so Aurora can still auto-pause), otherwise it drains in passes
@@ -3540,8 +3559,10 @@ Resources:
             Description: Fold the lake manifest into lake_objects (S3 only when idle)
             State: !If [ShouldEnableSchedules, ENABLED, DISABLED]
             Input: '{"task": "drain_lake_manifest"}'
-        # Advances one pending company export. Lists export_requests/ in S3 first and opens no
-        # database connection when there is nothing to do, so this does not keep Aurora awake.
+        # Runs the company-status Cognito executor, then advances one pending company export.
+        # Both list their prefix (company_status_requests/, export_requests/) in S3 first and
+        # open no database connection when there is nothing to do, so this does not keep
+        # Aurora awake.
         ExportTick:
           Type: Schedule
           Properties:

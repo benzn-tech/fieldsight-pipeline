@@ -143,6 +143,7 @@ from botocore.exceptions import ClientError, ParamValidationError
 from psycopg.errors import UniqueViolation
 
 import chunk_stitch
+import company_status_cognito
 import content_hash
 import device_heartbeat
 import device_status
@@ -438,6 +439,7 @@ EXPORT_REQUEST_PREFIX = "export_requests/"
 # Company offboarding (spec 2026-11-01 §5.3): POST /companies/{id}/status leaves
 # company_status_requests/{company_id}/{event_id}.json for LakeOps's Cognito task.
 COMPANY_STATUS_REQUEST_PREFIX = "company_status_requests/"
+COMPANY_STATUS_COGNITO_TASK = company_status_cognito.TASK
 
 
 def lambda_handler(event, context):
@@ -487,8 +489,17 @@ def lambda_handler(event, context):
     # SCHEDULED (LakeOps, rate(10 minutes)): picks up export_requests/ left by the route. It
     # lists S3 FIRST and opens no database connection unless there is work, so an idle tick
     # lets Aurora auto-pause. Deliberately dispatched before any get_connection().
+    # The same tick first runs the company-status Cognito executor (spec 2026-11-01 §5.3,
+    # company_status_cognito.tick): it lists company_status_requests/ in S3 first, opens no
+    # connection when there is none, and with COMPANY_STATUS_ENFORCE off only logs.
     if isinstance(event, dict) and event.get("task") == EXPORT_TICK_TASK:
-        return export_tick(event, context)
+        return lake_ops_tick(event, context)
+    # OPERATOR TASK (company offboarding): sweep one company's Cognito work rows without a
+    # marker (a lost marker: the status endpoint answered cognitoTrigger "failed").
+    # {"task": "company_status_cognito", "event_id": ...} and/or "company_id". Same
+    # envelope rule as above. Flag off -> {"enforced": false}, no connection, no Cognito.
+    if isinstance(event, dict) and event.get("task") == COMPANY_STATUS_COGNITO_TASK:
+        return company_status_cognito.run_task(event, context, **_company_status_deps())
     # OPERATOR TASK, invoked by hand with `aws lambda invoke` (IAM decides who
     # may). The same envelope rule as above keeps it out of reach of the API.
     # A dry run unless "apply" is exactly true: a typo must not write.
@@ -6270,6 +6281,27 @@ def _delete_export_request(s3_client, bucket, key):
         s3_client.delete_object(Bucket=bucket, Key=key)
     except Exception:  # noqa: BLE001 - it is retried, harmlessly, on the next tick
         logger.exception("export_tick: could not delete %s", key)
+
+
+def _company_status_deps():
+    return dict(s3_client=s3(), bucket=_export_bucket_for("exports"),
+                cognito_factory=cognito, get_connection=get_connection,
+                pool_id=COGNITO_USER_POOL_ID)
+
+
+def lake_ops_tick(event, context=None):
+    """LakeOps' rate(10 minutes) ExportTick: the company-status Cognito executor first
+    (bounded to company_status_cognito.TICK_BUDGET_S), then export_tick unchanged. A failure
+    of the first never stops the export. Returns export_tick's result plus
+    `company_status`."""
+    try:
+        cs = company_status_cognito.tick(context, **_company_status_deps())
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("company_status_cognito tick failed")
+        cs = {"error": str(exc)}
+    out = export_tick(event, context)
+    out["company_status"] = cs
+    return out
 
 
 def export_tick(event, context=None):

@@ -197,3 +197,88 @@ def list_events(conn, company_id) -> list[dict]:
     for e in events:
         e["cognito"] = by_event.get(e["id"], [])
     return events
+
+
+# ---- the async executor's queries (Task 8, src/company_status_cognito.py) ---------------
+# A row is retryable while it is 'pending', or 'failed' with attempts left and not
+# superseded (superseded rows are final). COALESCE: NOT LIKE on a NULL last_error is NULL.
+_RETRYABLE = (
+    "(c.state = 'pending' OR (c.state = 'failed' AND c.attempts < %(max)s "
+    "  AND COALESCE(c.last_error, '') NOT LIKE 'superseded%%'))")
+_ROW_KEY = "c.event_id = %(eid)s AND c.user_sub = %(sub)s AND c.action = %(action)s"
+
+
+def event_company(conn, event_id):
+    """The company of a status event, or None when there is no such event."""
+    row = conn.execute("SELECT company_id FROM company_status_events WHERE id = %s",
+                       (event_id,)).fetchone()
+    return row[0] if row else None
+
+
+def list_retryable_cognito(conn, company_id, max_attempts) -> list[dict]:
+    """Every retryable Cognito row of the company, across all its events, in execution
+    order: oldest event first, then per user disable before signout (enable last)."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT c.event_id, c.user_sub, c.action, c.state, c.attempts "
+        "FROM company_status_cognito c JOIN company_status_events e ON e.id = c.event_id "
+        f"WHERE e.company_id = %(cid)s AND {_RETRYABLE} "
+        "ORDER BY e.at, e.id, c.user_sub, "
+        "  CASE c.action WHEN 'disable' THEN 0 WHEN 'signout' THEN 1 ELSE 2 END",
+        {"cid": company_id, "max": max_attempts}).fetchall()
+
+
+def count_retryable_cognito(conn, company_id, max_attempts) -> int:
+    """How many rows list_retryable_cognito would return."""
+    return conn.execute(
+        "SELECT count(*) FROM company_status_cognito c "
+        "JOIN company_status_events e ON e.id = c.event_id "
+        f"WHERE e.company_id = %(cid)s AND {_RETRYABLE}",
+        {"cid": company_id, "max": max_attempts}).fetchone()[0]
+
+
+def lock_company_status(conn, company_id):
+    """The company's status, read under FOR SHARE: the status endpoint locks the row FOR
+    UPDATE before it changes the status or supersedes rows, so it waits until the
+    executor's transaction (one Cognito call) commits. None when there is no such company."""
+    row = conn.execute("SELECT status FROM companies WHERE id = %s FOR SHARE",
+                       (company_id,)).fetchone()
+    return row[0] if row else None
+
+
+def supersede_cognito_row(conn, event_id, user_sub, action, prev_state, prev_attempts,
+                          error) -> int:
+    """Fail one row as superseded (no Cognito call was made, so attempts is unchanged),
+    only if it is still as it was listed. Returns the rowcount (0: someone changed it)."""
+    return conn.execute(
+        "UPDATE company_status_cognito c SET state = 'failed', last_error = %(err)s, "
+        "  updated_at = now() "
+        f"WHERE {_ROW_KEY} AND c.state = %(ps)s AND c.attempts = %(pa)s",
+        {"eid": event_id, "sub": user_sub, "action": action, "ps": prev_state,
+         "pa": prev_attempts, "err": error}).rowcount
+
+
+def claim_cognito_row(conn, event_id, user_sub, action, prev_state, prev_attempts,
+                      max_attempts):
+    """Start one attempt: back to 'pending', attempts + 1, only if the row is still as it
+    was listed AND still retryable. Returns the new attempts, or None (someone changed it)."""
+    row = conn.execute(
+        "UPDATE company_status_cognito c SET state = 'pending', "
+        "  attempts = c.attempts + 1, updated_at = now() "
+        f"WHERE {_ROW_KEY} AND c.state = %(ps)s AND c.attempts = %(pa)s AND {_RETRYABLE} "
+        "RETURNING c.attempts",
+        {"eid": event_id, "sub": user_sub, "action": action, "ps": prev_state,
+         "pa": prev_attempts, "max": max_attempts}).fetchone()
+    return row[0] if row else None
+
+
+def finish_cognito_row(conn, event_id, user_sub, action, attempts, state,
+                       last_error) -> int:
+    """Record the attempt's outcome ('done' / 'failed'), only if the row is still the one
+    this attempt claimed (pending, same attempts) -- a supersede in between wins.
+    Returns the rowcount."""
+    return conn.execute(
+        "UPDATE company_status_cognito c SET state = %(s)s, last_error = %(err)s, "
+        "  updated_at = now() "
+        f"WHERE {_ROW_KEY} AND c.state = 'pending' AND c.attempts = %(n)s",
+        {"eid": event_id, "sub": user_sub, "action": action, "n": attempts, "s": state,
+         "err": last_error}).rowcount
