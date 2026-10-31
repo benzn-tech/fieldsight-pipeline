@@ -1,7 +1,7 @@
 # Word -> PDF for the template-digitise bench (owner-run; needs Word installed).
 # Spec: docs/superpowers/specs/2026-10-31-model-scope-and-config-update-design.md Part B1.
 #
-#   powershell -File tools/template-digitise-bench/convert.ps1 `
+#   powershell -NoProfile -ExecutionPolicy Bypass -File tools/template-digitise-bench/convert.ps1 `
 #       -Src "C:\Users\camil\Dropbox\ADE\Penina Site Inspection Checklist.docx" `
 #       -Out C:\Users\camil\wt\digitise-bench\inputs -Name penina
 #
@@ -36,7 +36,8 @@ if (-not (Test-Path -LiteralPath $srcFull)) {
 }
 if ($Name -eq "") { $Name = [System.IO.Path]::GetFileNameWithoutExtension($srcFull) }
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
-$pdf = Join-Path ([System.IO.Path]::GetFullPath($Out)) ($Name + ".pdf")
+# A plain string: Join-Path returns a PSObject-wrapped string that Word COM rejects.
+[string]$pdf = [System.IO.Path]::Combine([System.IO.Path]::GetFullPath($Out), $Name + ".pdf")
 
 $wdFormatPDF = 17
 $word = New-Object -ComObject Word.Application
@@ -45,7 +46,7 @@ try {
     # Open(FileName, ConfirmConversions, ReadOnly)
     $doc = $word.Documents.Open($srcFull, $false, $true)
     try {
-        $doc.SaveAs([ref]$pdf, [ref]$wdFormatPDF)
+        $doc.SaveAs2($pdf, $wdFormatPDF)
     } finally {
         $doc.Close([ref]$false)
     }
