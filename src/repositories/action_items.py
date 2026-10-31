@@ -4,6 +4,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from deleted_predicates import visible_topics_predicate
+from tenancy_status import not_migrated
 
 # Whitelist of columns PATCH /api/org/action-items/{id} may set. text/site_id/
 # topic_id/created_at are intentionally NOT here -- editing a task must never
@@ -36,7 +37,7 @@ def get_action_item(conn, action_item_id) -> dict | None:
     action item -- a missing topic yields NULL, which that predicate treats as
     "not mine" (fail-closed)."""
     try:
-        return conn.cursor(row_factory=dict_row).execute(
+        row = conn.cursor(row_factory=dict_row).execute(
             "SELECT a.id, a.topic_id, a.site_id, a.text, a.responsible, a.deadline, "
             "a.deadline_text, a.priority, a.status, a.created_at, a.updated_at, "
             "a.updated_by, a.stable_id, s.company_id, t.user_id AS topic_user_id "
@@ -47,6 +48,15 @@ def get_action_item(conn, action_item_id) -> dict | None:
     except psycopg.Error:
         conn.rollback()
         return None
+    if row is not None:
+        # ADDITIVE (action packs spec §14 D1): the per-site task number, None when the item
+        # has none, the table is not migrated yet, or the lookup failed -- never fatal, and
+        # its own SAVEPOINT (task_nos_for_item_ids), so the caller's transaction is intact.
+        try:
+            row["task_no"] = task_nos_for_item_ids(conn, [row["id"]]).get(str(row["id"]))
+        except Exception:  # noqa: BLE001
+            row["task_no"] = None
+    return row
 
 
 def list_for_carry_forward(conn, topic_ids, site_id) -> list[dict]:
@@ -184,9 +194,8 @@ def get_live_by_stable_id(conn, stable_id) -> dict | None:
 # ---------------------------------------------------------------------------
 _SITE_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext('task_no:' || %s::text))"
 
-# 42P01 undefined_table / 42703 undefined_column: migration 0093 not applied yet (sam deploy
-# runs before migrate). Same pair as tenancy_status._NOT_MIGRATED.
-_NOT_MIGRATED = ("42P01", "42703")
+# "Not migrated yet" (42P01 undefined_table / 42703 undefined_column -- sam deploy runs before
+# migrate) is tenancy_status.not_migrated, the one shared definition.
 
 
 def lock_site_task_numbers(conn, site_id) -> None:
@@ -244,7 +253,7 @@ def assign_task_nos_for_topics(conn, topic_ids, site_id) -> int | None:
                 assign_task_no(conn, stable_id, site_id)
             return len(pending)
     except psycopg.Error as exc:
-        if getattr(exc, "sqlstate", None) in _NOT_MIGRATED:
+        if not_migrated(exc):
             return None
         raise
 
@@ -266,10 +275,25 @@ def task_nos_for_item_ids(conn, action_item_ids) -> dict:
                 (ids,),
             ).fetchall()
     except psycopg.Error as exc:
-        if getattr(exc, "sqlstate", None) in _NOT_MIGRATED:
+        if not_migrated(exc):
             return {}
         raise
     return {str(r[0]): r[1] for r in rows}
+
+
+def _as_task_no(value):
+    """A positive int task number from an int or a digit string ("69"); None for anything
+    else -- bool (True is an int in Python), float, "6.9", "abc", "-1", 0, > int4."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        no = value
+    elif isinstance(value, str) and value.strip().isdecimal():
+        no = int(value.strip())
+    else:
+        return None
+    # task_no is a Postgres integer: a larger value can name no row, and would raise.
+    return no if 0 < no <= 2147483647 else None
 
 
 def get_live_by_task_no(conn, site_id, task_no) -> dict | None:
@@ -277,11 +301,8 @@ def get_live_by_task_no(conn, site_id, task_no) -> dict | None:
     the ledger's stable_id, then get_live_by_stable_id. None when the number is unknown,
     its item is no longer live, or either argument is malformed."""
     sid = _as_uuid(site_id)
-    try:
-        no = int(task_no)
-    except (TypeError, ValueError):
-        return None
-    if sid is None:
+    no = _as_task_no(task_no)
+    if sid is None or no is None:
         return None
     row = conn.execute(
         "SELECT stable_id FROM action_task_numbers WHERE site_id = %s AND task_no = %s",

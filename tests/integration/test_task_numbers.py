@@ -113,9 +113,24 @@ def test_task_nos_for_item_ids_and_get_live_by_task_no(db):
     assert action_items.get_live_by_task_no(db, _site(db)["id"], 1) is None  # other site
     assert action_items.get_live_by_task_no(db, "not-a-uuid", 1) is None
     assert action_items.get_live_by_task_no(db, site["id"], "x") is None
+    assert action_items.get_live_by_task_no(db, site["id"], "1")["id"] == aid   # digit string
+    for bad in (True, 1.0, 1.5, "1.0", "abc", "", " ", "-1", 0, -1, None, 2**31):
+        assert action_items.get_live_by_task_no(db, site["id"], bad) is None, bad
     # Superseded: the number still resolves to nothing live.
     db.execute("UPDATE topics SET superseded_at=now() WHERE id=%s", (t["id"],))
     assert action_items.get_live_by_task_no(db, site["id"], 1) is None
+
+
+def test_get_action_item_carries_task_no(db):
+    site = _site(db)
+    _t, [(aid, a), (bid, _b)] = _topic(db, site, ["Order timber", "Book crane"])
+    action_items.assign_task_no(db, a, site["id"])
+    assert action_items.get_action_item(db, aid)["task_no"] == 1
+    assert action_items.get_action_item(db, bid)["task_no"] is None
+    db.execute("DROP TABLE action_task_numbers")       # rolled back with the fixture
+    row = action_items.get_action_item(db, aid)
+    assert row["task_no"] is None and row["text"] == "Order timber"
+    assert db.execute("SELECT 1").fetchone() == (1,)    # transaction still usable
 
 
 # --------------------------------------------------------------------------- deploy window
@@ -204,3 +219,26 @@ def test_backfill_numbers_live_items_in_created_order_and_is_idempotent(db):
     again = backfill.run_backfill(db, apply=True, site_ids=scope)
     assert again == {"sites": 0, "to_number": 0, "numbered": 0}
     assert _ledger(db, s1) == [(b, 1), (old_stable, 2)]
+
+
+def test_backfill_default_all_sites_run_numbers_and_is_idempotent(db):
+    """The owner's exact command: no --site, so the `sites IS NULL` arm. Inside the fixture's
+    rolled-back transaction, so numbering every live item in the shared test DB is undone."""
+    s1, s2 = _site(db), _site(db)
+    _t, [(_, a), (_, b)] = _topic(db, s1, ["Order timber", "Book crane"])
+    _t, [(_, c)] = _topic(db, s2, ["Call council"])
+    db.execute("UPDATE action_items SET created_at = now() - interval '1 day' "
+               "WHERE stable_id=%s", (b,))
+
+    dry = backfill.run_backfill(db, apply=False)
+    assert dry["to_number"] >= 3 and dry["sites"] >= 2 and dry["numbered"] == 0
+    assert _ledger(db, s1) == [] and _ledger(db, s2) == []
+
+    done = backfill.run_backfill(db, apply=True)
+    assert done["numbered"] == done["to_number"] == dry["to_number"]
+    assert _ledger(db, s1) == [(b, 1), (a, 2)]
+    assert _ledger(db, s2) == [(c, 1)]
+
+    assert backfill.run_backfill(db, apply=False) == {"sites": 0, "to_number": 0, "numbered": 0}
+    assert backfill.run_backfill(db, apply=True) == {"sites": 0, "to_number": 0, "numbered": 0}
+    assert _ledger(db, s1) == [(b, 1), (a, 2)]

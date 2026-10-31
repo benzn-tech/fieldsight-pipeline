@@ -72,3 +72,27 @@ def test_payloads_unchanged_before_migration_0093(db):
         db, caller, str(items["Book crane"][0]), {"priority": "low"})
     assert resp["statusCode"] == 200, resp["body"]
     assert json.loads(resp["body"])["task_no"] is None
+
+
+def _live_items(db, caller):
+    resp = lambda_org_api.list_live_items(
+        db, caller, {"queryStringParameters": {"date": DATE}})
+    assert resp["statusCode"] == 200, resp["body"]
+    return {a["text"]: a for t in json.loads(resp["body"])["topics"]
+            for a in t["action_items"]}
+
+
+def test_live_items_rows_carry_task_no(db):
+    _co, site, _folder, _prefix, items, caller = _day(db)
+    action_items.assign_task_no(db, items["Order timber"][1], site["id"])
+    out = _live_items(db, caller)
+    assert out["Order timber"]["task_no"] == 1
+    assert out["Book crane"]["task_no"] is None
+
+
+def test_live_items_unchanged_before_migration_0093(db):
+    _co, _site, _folder, _prefix, _items, caller = _day(db)
+    db.execute("DROP TABLE action_task_numbers")          # rolled back with the fixture
+    out = _live_items(db, caller)
+    assert set(out) == {"Order timber", "Book crane"}
+    assert {a["task_no"] for a in out.values()} == {None}

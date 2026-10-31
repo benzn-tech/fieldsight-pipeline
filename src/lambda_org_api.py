@@ -9398,6 +9398,12 @@ def list_live_items(conn, caller, event):
     # Merged-meeting rows carry the LEAD's site and bypass the site ACL in SQL; a site of
     # an inactive company is dropped here (spec 2026-11-01 §5.2). None -> unchanged.
     rows = _drop_inactive_rows(rows, tenancy_status.inactive_site_ids(conn, caller))
+    # ADDITIVE (action packs spec §14 D1): `task_no` on every action item, one batched lookup.
+    _task_nos = _task_numbers(conn, [a.get("id") for t in rows
+                                     for a in (t.get("action_items") or [])])
+    for t in rows:
+        for a in t.get("action_items") or []:
+            a["task_no"] = _task_nos.get(str(a.get("id")))
     return ok({"topics": rows})
 
 
