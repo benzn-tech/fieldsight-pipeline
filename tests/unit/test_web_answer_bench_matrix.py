@@ -331,29 +331,46 @@ matrix = _load("matrix")
 KEYS = {"ANTHROPIC_API_KEY": "sk-ant-x", "CORROBORATION_API_KEY": "sk-or-x"}
 
 
+CANDIDATES = ("deepseek", "muse", "sonnet", "haiku")
+
+
 def test_round0_cells_and_order():
+    # Spec 2026-10-31 Part A: gemini only on the shipped draft_v1 / verify_v2.
     cells = matrix.round0_cells()
-    assert len(cells) == 21 and len(set(cells)) == 21
+    assert len(cells) == 22 and len(set(cells)) == 22
     assert cells[0] == ("draft", "draft_v1", "gemini")
     assert sorted(c for c in cells if c[0] == "draft") == sorted(
-        ("draft", "draft_v1", m) for m in matrix.MODEL_KEYS)
-    for step, pids in (("verify", ("verify_v1", "verify_v2")),
-                       ("single", ("web_v1", "merged_v1"))):
-        assert sorted(c for c in cells if c[0] == step) == sorted(
-            (step, p, m) for p in pids for m in ("gemini", "deepseek", "sonnet", "haiku"))
+        ("draft", "draft_v1", m) for m in ("gemini",) + CANDIDATES)
+    assert sorted(c for c in cells if c[0] == "verify") == sorted(
+        [("verify", p, m) for p in ("verify_v1", "verify_v2") for m in CANDIDATES]
+        + [("verify", "verify_v2", "gemini")])
+    assert sorted(c for c in cells if c[0] == "single") == sorted(
+        ("single", p, m) for p in ("web_v1", "merged_v1") for m in CANDIDATES)
+    assert sorted(c for c in cells if c[2] == "gemini") == [
+        ("draft", "draft_v1", "gemini"), ("verify", "verify_v2", "gemini")]
+    assert not any(c[2] == "mimo" for c in cells)
     vendor = [{"sonnet": 2, "haiku": 1}.get(m, 0) for _, _, m in cells]
     assert vendor == sorted(vendor)             # OpenRouter, then Haiku, then Sonnet
 
 
 def test_plan_hand_count():
+    # Cells 5 + 1 + 8 + 8 = 22, runs 22 x 15 = 330.
     # Anthropic: drafts 2 x 15 x 1, verify 4 x 15 x 2, single 4 x 15 x 2 = 270.
-    # OpenRouter: drafts 3 x 15, verify 4 x 15 x 2 (retry), single 4 x 15 = 225.
+    # OpenRouter: drafts 3 x 15 = 45, verify (gemini v2 + deepseek / muse x v1, v2)
+    # 5 x 15 x 2 (retry) = 150, single 4 x 15 = 60 -> 255. Total 525.
     # $: Sonnet 135 calls x (46k x $2 + 4096 x $10)/M = 17.9496; Haiku 135 x
     # (46k x $0.1 + 4096 x $0.5)/M = 0.89748; searches 120 x 3 + 120 x 2 = 600 x $0.01.
     p = matrix.plan(matrix.round0_cells(), reps=3, price_per_1000=10.0)
-    assert (p["runs"], p["anthropic_upper"], p["openrouter_upper"]) == (315, 270, 225)
-    assert p["upper"] == 495 and p["searches_upper"] == 600
+    assert (p["cells"], p["runs"], p["anthropic_upper"], p["openrouter_upper"]) == \
+        (22, 330, 270, 255)
+    assert p["upper"] == 525 and p["searches_upper"] == 600
     assert p["anthropic_usd_upper"] == pytest.approx(17.9496 + 0.89748 + 6.0, abs=1e-4)
+    # OpenRouter at the pinned prices, 46k input, max_tokens per step:
+    # gemini 15 x 1024 + 30 x 2048 out; deepseek / muse 15 x 1024 + 60 x 2048 + 30 x 2048.
+    gem = (45 * 46_000 * 0.825 + (15 * 1024 + 30 * 2048) * 4.125) / 1e6
+    ds = (105 * 46_000 * 0.13 + (15 * 1024 + 90 * 2048) * 0.65) / 1e6
+    mu = (105 * 46_000 * 0.10 + (15 * 1024 + 90 * 2048) * 0.20) / 1e6
+    assert p["openrouter_usd_upper"] == pytest.approx(gem + ds + mu, abs=1e-5)
 
 
 def _m_argv(out, *extra):
@@ -362,14 +379,41 @@ def _m_argv(out, *extra):
 
 def test_validate_confirm_and_out(tmp_path):
     with pytest.raises(SystemExit) as e:
-        matrix.validate(_m_argv(tmp_path, "--confirm-calls", "494"), KEYS, REPO)
+        matrix.validate(_m_argv(tmp_path, "--confirm-calls", "524"), KEYS, REPO)
     assert e.value.code == 2
     with pytest.raises(SystemExit):
-        matrix.validate(_m_argv(tmp_path, "--confirm-calls", "495"), {}, REPO)
+        matrix.validate(_m_argv(tmp_path, "--confirm-calls", "525"), {}, REPO)
     with pytest.raises(SystemExit):
         matrix.validate(_m_argv(os.path.join(REPO, "x"), "--dry-run"), {}, REPO)
-    assert matrix.validate(_m_argv(tmp_path, "--confirm-calls", "495"), KEYS, REPO)
+    assert matrix.validate(_m_argv(tmp_path, "--confirm-calls", "525"), KEYS, REPO)
     assert matrix.validate(_m_argv(tmp_path, "--dry-run"), {}, REPO).dry_run
+
+
+def test_key_file_replaces_the_env_key(tmp_path):
+    kf = tmp_path / "or.key"
+    kf.write_text("sk-or-bench", encoding="utf-8")
+    only_anthropic = {"ANTHROPIC_API_KEY": "sk-ant-x"}
+    with pytest.raises(SystemExit):
+        matrix.validate(_m_argv(tmp_path / "o", "--confirm-calls", "525"), only_anthropic, REPO)
+    a = matrix.validate(_m_argv(tmp_path / "o", "--confirm-calls", "525",
+                                "--openrouter-key-file", str(kf)), only_anthropic, REPO)
+    assert a.openrouter_key_file == str(kf) and a.openrouter_cap == 10.0
+    with pytest.raises(SystemExit):
+        matrix.validate(_m_argv(tmp_path / "o", "--dry-run", "--openrouter-key-file",
+                                str(tmp_path / "nope.key")), {}, REPO)
+
+
+def test_out_with_rows_of_a_removed_cell_is_refused(tmp_path, capsys):
+    rows = [{"run_id": "r0-0001", "cell": "draft/draft_v1/mimo", "item": "t1", "rep": 0},
+            {"run_id": "r0-0002", "cell": "verify/verify_v1/gemini", "item": "t1", "rep": 0},
+            {"run_id": "r0-0003", "cell": "draft/draft_v1/gemini", "item": "t1", "rep": 0}]
+    (tmp_path / "matrix_r0_calls.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in rows) + '{"torn', encoding="utf-8")
+    with pytest.raises(SystemExit) as e:
+        matrix.validate(_m_argv(tmp_path, "--dry-run"), {}, REPO)
+    assert e.value.code == 2
+    assert "2 rows" in capsys.readouterr().err
+    assert len(matrix.stale_rows(rows)) == 2
 
 
 def _m_items():
@@ -433,7 +477,7 @@ class OrFake:
 def _m_run(tmp_path, *, dry=False, client=None, or_fake=None, clock=None):
     clock = clock or Clock()
     args = matrix.validate(_m_argv(tmp_path, *(["--dry-run"] if dry else
-                                               ["--confirm-calls", "495"])), KEYS, REPO)
+                                               ["--confirm-calls", "525"])), KEYS, REPO)
     client = client or ClaudeFake(clock)
     or_fake = or_fake or OrFake(clock)
     out = io.StringIO()
@@ -455,19 +499,59 @@ def test_dry_run_prints_plan_and_makes_no_call(tmp_path):
     code, summary, text, client, or_fake = _m_run(tmp_path, dry=True)
     assert code == 0
     assert client.requests == [] and or_fake.calls == []
-    assert "315" in text and "495" in text and "$24.85" in text
+    assert "330" in text and "525" in text and "$24.85" in text
+    assert "openrouter: upper $3.31" in text and "room $10.00" in text
     assert not (tmp_path / "matrix_r0_calls.jsonl").exists()
+
+
+def test_dry_run_refuses_when_openrouter_upper_is_over_the_room(tmp_path):
+    ledger.add_openrouter_spend(str(tmp_path / "anthropic_ledger.json"), 7.0)
+    code, summary, text, client, or_fake = _m_run(tmp_path, dry=True)
+    assert code == 2 and summary["refused"] == "openrouter_cap"
+    assert "$3.31 > room $3.00" in text
+    assert client.requests == [] and or_fake.calls == []
+
+
+def test_openrouter_spend_goes_to_its_pool_only(tmp_path):
+    code, summary, _, client, or_fake = _m_run(tmp_path)
+    assert code == 0
+    st = ledger.read_state(str(tmp_path / "anthropic_ledger.json"))
+    assert st["pools"]["openrouter"] == pytest.approx(0.001 * len(or_fake.calls))
+    claude = sum(r["cost_usd"] for r in _rows(tmp_path) if r["model_key"] in matrix.CLAUDE)
+    assert st["spent_usd"] == pytest.approx(claude)            # Anthropic only
+    assert ledger.global_spent(st) == pytest.approx(claude)
+    assert summary["openrouter_spent_usd"] == pytest.approx(0.001 * len(or_fake.calls))
+
+
+def test_openrouter_pool_spent_stops_the_openrouter_cells(tmp_path):
+    clock = Clock()
+    lp = str(tmp_path / "anthropic_ledger.json")
+
+    class Spender(OrFake):
+        def __call__(self, *a, **kw):
+            r = super().__call__(*a, **kw)
+            if len(self.calls) == 10:
+                ledger.add_openrouter_spend(lp, 9.99)     # the pool is now $10.00
+            return r
+    args = matrix.validate(_m_argv(tmp_path, "--confirm-calls", "525"), KEYS, REPO)
+    or_fake = Spender(clock)
+    code, summary = matrix.run(args, items=_m_items(), client=ClaudeFake(clock),
+                               or_call=or_fake, clock=clock, stdout=io.StringIO())
+    assert code == 3 and summary["openrouter_cap_hit"] is True
+    assert len(or_fake.calls) == 10
+    assert ledger.openrouter_spent(lp) == pytest.approx(10.0)
 
 
 def test_full_round0_counts_order_and_ledger(tmp_path):
     code, summary, _, client, or_fake = _m_run(tmp_path)
     assert code == 0
     rows = _rows(tmp_path)
-    assert len(rows) == 315
+    assert len(rows) == 330
     assert [r["cell"] for r in rows[:15]] == ["draft/draft_v1/gemini"] * 15
-    assert len({r["run_id"] for r in rows}) == 315
+    assert len({r["run_id"] for r in rows}) == 330
     assert all(not any(m in r["run_id"] for m in matrix.MODEL_KEYS) for r in rows)
-    assert len(client.requests) == 150 and len(or_fake.calls) == 165
+    assert len(client.requests) == 150 and len(or_fake.calls) == 180
+    assert {r["model_key"] for r in rows} == {"gemini", "deepseek", "muse", "sonnet", "haiku"}
     sonnet = [i for i, r in enumerate(rows) if r["model_key"] == "sonnet"]
     haiku = [i for i, r in enumerate(rows) if r["model_key"] == "haiku"]
     assert max(haiku) < min(sonnet)
@@ -491,7 +575,7 @@ def test_verify_uses_the_stored_draft_of_the_same_item_and_rep(tmp_path):
               if r["cell"] == "draft/draft_v1/gemini"}
     assert len(set(drafts.values())) == 15
     verify = [r for r in rows if r["step"] == "verify"]
-    assert len(verify) == 120
+    assert len(verify) == 135
     for r in verify:
         # The echo ends with the prompt, and the prompt ends with the draft.
         assert [k for k, d in drafts.items() if r["text"].rstrip().endswith(d)] == \
@@ -502,7 +586,7 @@ def test_verify_uses_the_stored_draft_of_the_same_item_and_rep(tmp_path):
 def test_verify_budget_is_the_chain_left_after_the_draft(tmp_path):
     _, _, _, client, or_fake = _m_run(tmp_path)
     v = [c for c in or_fake.calls if c["web"] and _is_verify_prompt(c["prompt"])]
-    assert len(v) == 60
+    assert len(v) == 75
     assert all(c["timeout"] == pytest.approx(14.0) for c in v)
     assert all(c["retry_left_s"] == pytest.approx(22.1 - 3.0) for c in v)
     single = [c for c in or_fake.calls if c["web"] and not _is_verify_prompt(c["prompt"])]
@@ -523,7 +607,7 @@ def test_failed_gemini_draft_skips_its_verify_runs(tmp_path):
               if r["cell"] == "draft/draft_v1/gemini" and r["outcome"] != "ok"]
     assert len(failed) == 1
     skipped = [r for r in rows if r["outcome"] == "no_draft"]
-    assert len(skipped) == 8
+    assert len(skipped) == 9
     assert {(r["item"], r["rep"]) for r in skipped} == set(failed)
     assert all(r["calls"] == 0 and r["answer"] is None for r in skipped)
     assert summary["cells"]["verify/verify_v1/sonnet"]["no_draft"] == 1
@@ -536,7 +620,7 @@ def test_no_search_on_a_web_item_is_failed(tmp_path):
     rows = _rows(tmp_path)
     drafts = {(r["item"], r["rep"]): r["text"] for r in rows
               if r["cell"] == "draft/draft_v1/gemini"}
-    single = {r["item"]: r for r in rows if r["cell"] == "single/web_v1/gemini"}
+    single = {r["item"]: r for r in rows if r["cell"] == "single/web_v1/deepseek"}
     t1 = single["t1"]
     assert t1["outcome"] == "failed" and t1["fallback"] is True
     assert t1["answer_source"] == "fallback"
@@ -560,7 +644,7 @@ def test_matrix_pool_exhausted_mid_cell_stops_and_writes_summary(tmp_path):
     code, summary, text, client, or_fake = _m_run(tmp_path, clock=clock, client=client)
     assert code == 3 and summary["hard_stop"] is True
     assert len(client.requests) == 1
-    assert len(or_fake.calls) == 165                  # OpenRouter cells ran first
+    assert len(or_fake.calls) == 180                  # OpenRouter cells ran first
     s = json.loads((tmp_path / "matrix_r0_summary.json").read_text("utf-8"))
     assert s["hard_stop"] is True
     claude_cells = [matrix._cell_id(c) for c in matrix.round0_cells()
@@ -684,7 +768,7 @@ def test_majority_worst_stable():
 def _calls_file(tmp_path, n_cells=2):
     rows, seq = [], 0
     for c in range(n_cells):
-        model = ("gemini", "sonnet")[c % 2]
+        model = ("deepseek", "sonnet")[c % 2]
         for rep in range(3):
             for i in range(1, 6):
                 seq += 1
@@ -747,7 +831,7 @@ def test_grade_live_writes_grades_and_cells_blind_and_reproducible(tmp_path):
     code, _ = grade.run(args, call=fake, stdout=out)
     assert code == 0 and len(fake.prompts) == 28
     for p in fake.prompts:
-        for leak in ("gemini", "sonnet", "web_v1", "single/", "r0-"):
+        for leak in ("deepseek", "sonnet", "web_v1", "single/", "r0-"):
             assert leak not in p
     order1 = [p.split(SECRET_A + "-")[1].split()[0] for p in fake.prompts]
     assert order1 != sorted(order1, key=int)          # shuffled
@@ -758,9 +842,9 @@ def test_grade_live_writes_grades_and_cells_blind_and_reproducible(tmp_path):
     by_id = {g["run_id"]: g["label"] for g in grades}
     assert by_id[rows[0]["run_id"]] == "no_answer" and rows[1]["run_id"] not in by_id
     cells = json.loads((tmp_path / "cells_r0.json").read_text("utf-8"))
-    c = cells["single/web_v1/gemini"]
+    c = cells["single/web_v1/deepseek"]
     assert (c["step"], c["prompt_id"], c["model_key"], c["p50_ms"]) == \
-        ("single", "web_v1", "gemini", 1000)
+        ("single", "web_v1", "deepseek", 1000)
     assert c["items"]["t1"]["labels"] == ["no_answer", "correct", "correct"]
     assert (c["items"]["t1"]["majority"], c["items"]["t1"]["stable"]) == ("correct", False)
     assert c["items"]["t2"]["labels"] == ["correct", "correct"]     # no_draft: not a label
@@ -900,7 +984,7 @@ def test_live_matrix_refuses_unconfirmed_tune_gold(tmp_path):
     gold.write_text("".join(json.dumps(r) + chr(10) for r in rows), encoding="utf-8")
     assert matrix.unconfirmed_tune(str(gold)) == ["t3"]
     with pytest.raises(SystemExit):
-        matrix.validate(_m_argv(tmp_path / "o", "--confirm-calls", "495", "--set", str(gold)),
+        matrix.validate(_m_argv(tmp_path / "o", "--confirm-calls", "525", "--set", str(gold)),
                         KEYS, REPO)
     assert matrix.validate(_m_argv(tmp_path / "o", "--dry-run", "--set", str(gold)), {}, REPO)
 
@@ -978,7 +1062,7 @@ def test_only_ungraded_regrades_and_merges(tmp_path):
     kept = {g["run_id"]: g for g in before if g["run_id"] not in ungraded}
     assert all(kept[g["run_id"]] == g for g in after if g["run_id"] in kept)
     cells = json.loads((tmp_path / "cells_r0.json").read_text("utf-8"))
-    assert cells["single/web_v1/gemini"]["items"]["t3"]["labels"] == ["correct"] * 3
+    assert cells["single/web_v1/deepseek"]["items"]["t3"]["labels"] == ["correct"] * 3
 
 
 class Boom(Exception):
@@ -1008,11 +1092,11 @@ def test_rerun_resumes_without_repeating_paid_calls(tmp_path):
     code, summary, _, client, _ = _m_run(tmp_path, clock=clock, or_fake=or2)
     assert code == 0
     rows = _rows(tmp_path)
-    assert len(rows) == 315
+    assert len(rows) == 330
     assert rows[:50] == first                         # paid records kept, untouched
-    assert len({(r["cell"], r["item"], r["rep"]) for r in rows}) == 315
-    assert len({r["run_id"] for r in rows}) == 315
-    assert len(or2.calls) == 165 - 50 and len(client.requests) == 150
+    assert len({(r["cell"], r["item"], r["rep"]) for r in rows}) == 330
+    assert len({r["run_id"] for r in rows}) == 330
+    assert len(or2.calls) == 180 - 50 and len(client.requests) == 150
     assert or2.n_drafts == 100                        # no gemini draft re-run
     drafts = {(r["item"], r["rep"]): r["text"] for r in rows
               if r["cell"] == "draft/draft_v1/gemini"}
@@ -1047,3 +1131,86 @@ def test_claude_timeout_is_booked_at_the_upper_cost(tmp_path):
     assert all(r["cost_estimated"] is False for r in ok)
     lg = ledger.Ledger(str(tmp_path / "anthropic_ledger.json"))
     assert lg.pool_spent("matrix") >= len(rows) * upper
+
+
+# --------------------------- spec 2026-10-31 Part A: OpenRouter pool, key, muse
+
+def test_usage_include_is_sent_but_not_a_param(or_key):
+    clock = Clock()
+    http = FakeHttp(clock, [completion()])
+    orb.call("deepseek", "P", web=True, timeout=14.0, http=http, clock=clock)
+    sent = http.requests[0]["payload"]
+    assert sent["usage"] == {"include": True}
+    assert "usage" not in orb.build_payload("deepseek", "P", web=True, max_tokens=2048)
+    sf_mod = _load("select_freeze")
+    assert "usage" not in json.dumps(sf_mod.params_for("single", "deepseek"))
+
+
+def test_missing_cost_is_charged_at_the_pinned_upper(or_key):
+    clock = Clock()
+    r = orb.call("deepseek", "P", web=False, timeout=14.0, clock=clock,
+                 http=FakeHttp(clock, [completion(urls=(), usage={"prompt_tokens": 1000,
+                                                                  "completion_tokens": 100})]))
+    assert r["openrouter_cost_usd"] == pytest.approx((1000 * 0.13 + 100 * 0.65) / 1e6)
+    assert r["cost_estimated"] is True
+    r = orb.call("gemini", "P" * 500, web=False, timeout=14.0, max_tokens=1024, clock=clock,
+                 http=FakeHttp(clock, [(14.0, Timeout("read timed out"))]))
+    assert r["outcome"] == "timeout"
+    assert r["openrouter_cost_usd"] == pytest.approx((500 * 0.825 + 1024 * 4.125) / 1e6)
+    r = orb.call("gemini", "P", web=False, timeout=14.0, clock=clock,
+                 http=FakeHttp(clock, [completion()]))
+    assert r["openrouter_cost_usd"] == pytest.approx(0.0012) and r["cost_estimated"] is False
+
+
+def test_explicit_key_wins_over_env(or_key):
+    clock = Clock()
+    http = FakeHttp(clock, [completion()])
+    orb.call("gemini", "P", web=True, timeout=14.0, http=http, clock=clock,
+             key="sk-or-BENCH")
+    assert http.requests[0]["headers"]["Authorization"] == "Bearer sk-or-BENCH"
+
+
+def test_payload_muse_reasoning_low_no_json():
+    p = orb.build_payload("muse", "P", web=True, max_tokens=2048)
+    assert p["model"] == "meta/muse-spark-1.3-contributor"
+    assert p["reasoning"] == {"effort": "low"}
+    assert "provider" not in p and "response_format" not in p
+    assert p["plugins"] == corroboration_client.WEB_PLUGIN
+
+
+def test_dry_run_never_prints_the_key(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("CORROBORATION_API_KEY", OR_KEY)
+    kf = tmp_path / "or.key"
+    kf.write_text("sk-or-FILE-SENTINEL", encoding="utf-8")
+    monkeypatch.setattr(stage0, "load_tune", lambda path: _m_items())
+    for extra in ([], ["--openrouter-key-file", str(kf)]):
+        assert matrix.main(_m_argv(tmp_path / "o", "--dry-run", *extra)) == 0
+        cap = capsys.readouterr()
+        assert "SENTINEL" not in cap.out + cap.err
+        assert (ledger.PROD_KEY_WARNING in cap.err) == (not extra)
+
+
+def test_grade_refuses_over_cap_and_rows_of_removed_cells(tmp_path):
+    _calls_file(tmp_path)
+    ledger.add_openrouter_spend(str(tmp_path / "anthropic_ledger.json"), 9.99)
+    args = grade.validate(_g_argv(tmp_path, "--dry-run"), {}, REPO)
+    out = io.StringIO()
+    code, info = grade.run(args, call=GraderFake(), stdout=out)
+    assert code == 2 and info["refused"] == "openrouter_cap"
+    rows = _calls_file(tmp_path)
+    rows[5]["cell"] = "draft/draft_v1/mimo"
+    (tmp_path / "matrix_r0_calls.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    with pytest.raises(SystemExit) as e:
+        grade.validate(_g_argv(tmp_path, "--dry-run"), {}, REPO)
+    assert e.value.code == 2
+
+
+def test_grade_charges_the_openrouter_pool(tmp_path):
+    _calls_file(tmp_path)
+    args = grade.validate(_g_argv(tmp_path, "--confirm-calls", "28"),
+                          {"CORROBORATION_API_KEY": "k"}, REPO)
+    code, _ = grade.run(args, call=GraderFake(), stdout=io.StringIO())
+    st = ledger.read_state(str(tmp_path / "anthropic_ledger.json"))
+    assert code == 0 and st["pools"]["openrouter"] == pytest.approx(28 * 0.0001)
+    assert st["spent_usd"] == 0.0
