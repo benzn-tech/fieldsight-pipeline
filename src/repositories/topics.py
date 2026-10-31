@@ -771,6 +771,9 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
         t["safety_observations"] = (_findings_as_safety_rows(t_findings)
                                     or safety_by_topic.get(t["id"], []))
         t["findings"] = t_findings
+        # False does NOT mean nightly on its own: an action pack's topic
+        # ('agent://action_pack/<id>') is also False and carries source='agent' --
+        # read (is_live, source) together; 'agent' is labelled "Agent" (spec §14 D2).
         t["is_live"] = bool(t["source_s3_key"]) and t["source_s3_key"].startswith("extractions/")
 
     return topic_rows

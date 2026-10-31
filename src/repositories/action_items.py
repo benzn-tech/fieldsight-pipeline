@@ -40,7 +40,9 @@ def get_action_item(conn, action_item_id) -> dict | None:
         row = conn.cursor(row_factory=dict_row).execute(
             "SELECT a.id, a.topic_id, a.site_id, a.text, a.responsible, a.deadline, "
             "a.deadline_text, a.priority, a.status, a.created_at, a.updated_at, "
-            "a.updated_by, a.stable_id, s.company_id, t.user_id AS topic_user_id "
+            "a.updated_by, a.stable_id, s.company_id, t.user_id AS topic_user_id, "
+            # The parent topic's provenance ('agent' for an action pack's topic, D2).
+            "t.source AS topic_source "
             "FROM action_items a JOIN sites s ON s.id = a.site_id "
             "LEFT JOIN topics t ON t.id = a.topic_id WHERE a.id=%s",
             (action_item_id,),

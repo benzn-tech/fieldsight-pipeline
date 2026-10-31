@@ -11076,6 +11076,10 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None,
             "topic_row_id": str(t["id"]),           # durable topics.id (D fix — editable anchor)
             "session_id": session_id,
             "session_kind": session_kind,
+            # `topics.source` (action packs spec §14 D2) -- ADDITIVE. 'agent' marks a
+            # topic an action pack created (source_s3_key 'agent://action_pack/<id>'):
+            # the UI shows an "Agent" badge for it, never the live/nightly label.
+            "source": t.get("source"),
             "time_range": t["time_range"],
             "topic_title": t["title"],
             "category": t["category"],
@@ -11145,6 +11149,9 @@ def render_report_shape(rows, doc, date, folder, conn=None, company_id=None,
                               # Per-site task number, "#69" (migration 0093); null when
                               # the item has none yet or the table is not migrated.
                               "task_no": _task_nos.get(str(a["id"])),
+                              # The parent topic's `source` (D2): the Tasks page flattens
+                              # these items and loses the topic, so the badge rides here.
+                              "source": t.get("source"),
                               **_status_suggestion_field(a, _suggestions),
                               } for a in t["action_items"]],
             # The subject this topic belongs to, when a human has confirmed
