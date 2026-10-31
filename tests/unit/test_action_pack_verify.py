@@ -311,10 +311,9 @@ def test_a_legal_transition_is_kept(monkeypatch):
 @pytest.mark.parametrize("existing, created", [
     ("Inspect scaffold before Monday", "inspect scaffold before monday."),     # collapse key
     ("检查脚手架", "检查脚手架。"),                                              # CJK mark
-    ("Inspect the scaffold before Monday", "Inspect the scaffolds before Monday"),  # fuzzy
     ("Order rebar for level 3", "  Order  rebar for level 3!"),                # in_progress
 ])
-def test_a_near_duplicate_create_is_dropped(monkeypatch, existing, created):
+def test_an_exact_duplicate_create_is_dropped(monkeypatch, existing, created):
     items = {SID1: item_row(SID1, existing, status="in_progress"
                             if existing.startswith("Order") else "open")}
     result, fake = run_verify({"conclusion": [], "actions": [create(created)]}, monkeypatch,
@@ -332,7 +331,7 @@ def test_the_near_duplicate_check_agrees_with_todo_collapse(monkeypatch):
         rows = [{"id": 1, "text": existing, "status": "open"},
                 {"id": 2, "text": created, "status": "open"}]
         assert len(todo_collapse.collapse(rows)) == 1
-        assert apv.near_duplicate(created, [existing])
+        assert apv.near_duplicate(created, [existing]) == "exact"
 
 
 def test_distinct_creates_survive_and_a_closed_item_is_not_a_duplicate(monkeypatch):
@@ -607,37 +606,66 @@ def test_an_answer_served_in_the_writers_served_family_is_invalid(monkeypatch):
     ("Pour slab on level 12", "Pour slab on level 13"),
     ("Fix the crack at grid C3", "Fix the crack at grid C4"),
     ("Install handrail on block A", "Install handrail on block B"),
-    ("Check rebar at L12 north", "Check rebar at L11 north"),
-    ("3号楼 检查脚手架", "4号楼 检查脚手架"),
-])
-def test_creates_that_differ_only_in_an_identifier_survive(monkeypatch, existing, created):
-    items = {SID1: item_row(SID1, existing)}
-    result, _ = run_verify({"conclusion": [], "actions": [create(created)]}, monkeypatch,
-                           items=items)
-    assert labels(result) == {0: "supported"}
-    assert not apv.near_duplicate(created, [existing])
-
-
-@pytest.mark.parametrize("existing, created", [
+    ("Seal the east wall joints", "Seal the west wall joints"),
+    ("Check north stair handrail", "Check south stair handrail"),
+    ("Concrete pour booked Tuesday", "Concrete pour booked Thursday"),
+    ("Mike to order the rebar", "Mark to order the rebar"),
+    ("三号楼三层东侧检查脚手架", "四号楼三层东侧检查脚手架"),
+    ("Inspect the scaffold before Monday", "Inspect the scaffolds before Monday"),
     ("Pour slab on level 12", "Pour the slab on level 12"),
-    ("Fix the crack at grid C3", "Fix the cracks at grid C3"),
-    ("Install handrail on block A", "Install handrails on block A"),
 ])
-def test_rewording_with_the_same_identifiers_is_a_near_duplicate(monkeypatch, existing,
-                                                                 created):
+def test_a_fuzzy_only_match_is_kept_but_capped_at_weak(monkeypatch, existing, created):
+    """Fix round 2: similar wording may be a different job (east/west, Tuesday/Thursday,
+    Mike/Mark, 三号楼/四号楼): keep it, never above weak (never bulk-applied)."""
     items = {SID1: item_row(SID1, existing)}
-    result, _ = run_verify({"conclusion": [], "actions": [create(created)]}, monkeypatch,
-                           items=items)
-    assert result["actions"] == [] and result["counts"]["drop_near_duplicate"] == 1
+    result, fake = run_verify({"conclusion": [], "actions": [create(created)]}, monkeypatch,
+                              items=items)
+    assert apv.near_duplicate(created, [existing]) == "fuzzy"
+    assert labels(result) == {0: "weak"} and len(fake.calls) == 1
+    assert result["counts"]["near_duplicate_flagged"] == 1
+    assert "drop_near_duplicate" not in result["counts"]
 
 
-def test_an_exact_collapse_key_is_a_duplicate_whatever_the_identifiers():
+def test_a_flagged_create_is_never_upgraded(monkeypatch):
+    items = {SID1: item_row(SID1, "Seal the east wall joints")}
+    result, _ = run_verify({"conclusion": [], "actions": [create("Seal the west wall joints")]},
+                           monkeypatch, fake=Fake(label="unsupported"), items=items)
+    assert labels(result) == {0: "unsupported"}
+    assert result["counts"]["near_duplicate_flagged"] == 1
+
+
+def test_a_fuzzy_match_within_the_draft_is_flagged_not_dropped(monkeypatch):
+    draft = {"conclusion": [], "actions": [create("Fence the pit"), create("Fence the pits")]}
+    result, _ = run_verify(draft, monkeypatch)
+    assert labels(result) == {0: "supported", 1: "weak"}
+    assert result["counts"]["near_duplicate_flagged"] == 1
+
+
+def test_unrelated_creates_are_not_flagged(monkeypatch):
+    items = {SID1: item_row(SID1, "Seal the east wall joints")}
+    result, _ = run_verify({"conclusion": [], "actions": [create("Order rebar for level 3")]},
+                           monkeypatch, items=items)
+    assert labels(result) == {0: "supported"}
+    assert "near_duplicate_flagged" not in result["counts"]
+    assert apv.near_duplicate("Order rebar for level 3", ["Seal the east wall joints"]) is None
+    # short CJK pair below the floor: kept as it is, not flagged
+    items = {SID1: item_row(SID1, "三号楼检查脚手架")}
+    result, _ = run_verify({"conclusion": [], "actions": [create("四号楼检查脚手架")]},
+                           monkeypatch, items=items)
+    assert labels(result) == {0: "supported"}
+
+
+def test_an_exact_collapse_key_is_a_duplicate_whatever_the_identifiers(monkeypatch):
     for existing, created in [("Pour slab on level 12", "pour slab on level 12."),
                               ("Grid C3: fix", "grid c3: fix!")]:
         rows = [{"id": 1, "text": existing, "status": "open"},
                 {"id": 2, "text": created, "status": "open"}]
         assert len(todo_collapse.collapse(rows)) == 1
-        assert apv.near_duplicate(created, [existing])
+        assert apv.near_duplicate(created, [existing]) == "exact"
+        items = {SID1: item_row(SID1, existing)}
+        result, _ = run_verify({"conclusion": [], "actions": [create(created)]}, monkeypatch,
+                               items=items)
+        assert result["actions"] == [] and result["counts"]["drop_near_duplicate"] == 1
 
 
 def test_cited_refs_with_no_text_are_unsupported_without_a_call(monkeypatch):

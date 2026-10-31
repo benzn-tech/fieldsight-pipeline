@@ -55,12 +55,13 @@ What it does
      latest-read status (S10, action_pack_stages.legal_change: never -> open, never a
      close of a done/closed item) (`drop_transition`); at most ONE close/update per target
      -- apply would mark a second one stale after the first applied (`drop_duplicate_target`);
-   * create_item: not a near-duplicate (`near_duplicate`) of an open/in_progress/blocked
-     item on the site, nor of an earlier create in the same draft (`drop_near_duplicate`):
-     todo_collapse's key equal, or carry_forward's normalisation at ratio >= 0.90 with
-     identical identifier tokens (digits, single capitals: level 12 != level 13).
-     Dropped rather than turned into an update: an update needs fields the writer did not
-     propose, so the conversion is never trivially safe.
+   * create_item vs the open/in_progress/blocked items on the site and earlier creates
+     in the same draft (`near_duplicate`): todo_collapse's key equal -> dropped
+     (`drop_near_duplicate`: it would collapse at read time, S16); only carry_forward's
+     normalisation at ratio >= 0.90 -> KEPT but capped at weak, never bulk-applied
+     (`near_duplicate_flagged`: east/west, Tuesday/Thursday, level 12/13 read alike).
+     An exact duplicate is dropped rather than turned into an update: an update needs
+     fields the writer did not propose, so the conversion is never trivially safe.
    A conclusion line with no refs (the writer's own "uncertain", e.g. "no standard found in
    your project library") is kept `uncertain` without a model call (`conclusion_no_refs`).
    An element whose every cited ref has no text is `unsupported` without a call
@@ -96,7 +97,7 @@ leading letters through BARE_FAMILIES (`claude-*`/opus/sonnet/haiku -> anthropic
 
 Counts (run_trace["verify"], flat ints, no text): raw_conclusion, raw_actions, drop_*,
 conclusion_no_refs, empty_refs, checks, check_failures, check_timeouts, family_skips,
-family_answers_rejected, fallback_answers, label_conclusion_<label>, label_actions_<label>,
+family_answers_rejected, fallback_answers, near_duplicate_flagged, label_conclusion_<label>, label_actions_<label>,
 conclusion_unsupported, actions_unsupported, web_only_conclusion, web_only_actions,
 no_snapshot_capped -- so the eval can report the writer's raw rates and the post-verifier
 rates separately (S16).
@@ -130,6 +131,7 @@ MIN_CALL_S = 5.0                 # no verifier call is started with less than th
 MARGIN_S = 2.0                   # kept back from the verify deadline to assemble the answer
 ATTEMPT_CAP_S = 30.0             # one attempt (the Ask judge's cap): a hang can fall back
 VERIFY_MAX_TOKENS = 200
+FLAGGED = "near_duplicate_flagged"
 REF_MAX_CHARS = 24_000           # one cited ref's text in a prompt (a snapshot can be 200 kB)
 
 FAMILY_ALIASES = {"meta-llama": "meta", "x-ai": "xai", "mistral": "mistralai",
@@ -206,41 +208,28 @@ def _dup_key(text):
     return carry_forward._key(todo_collapse.normalise(text))
 
 
-_ALNUM = re.compile(r"[A-Za-z0-9]+")
-
-
-def identifiers(text):
-    """The identifier tokens of a todo: every ASCII-alphanumeric token containing a digit
-    (level 12, C3, L12, the 3 of 3号楼) and every single capital letter (block A). Two
-    todos that differ only in these are different jobs, however similar the rest reads."""
-    out = Counter()
-    for tok in _ALNUM.findall(str(text or "")):
-        if any(ch.isdigit() for ch in tok) or (len(tok) == 1 and tok.isupper()):
-            out[tok.lower()] += 1
-    return out
-
-
 def near_duplicate(text, others, floor=NEAR_DUP_FLOOR):
-    """True when `text` would collapse onto one of `others` at read time -- todo_collapse's
-    key is equal, exactly its rule (S16: a created item must never collapse onto the item
-    it was meant to differ from) -- or is the same item reworded: carry_forward's
-    normalisation at ratio >= floor AND identical identifier tokens (`identifiers`), so
-    "level 12" vs "level 13" or "grid C3" vs "C4" survive. Text with no words is never a
-    duplicate (todo_collapse treats "" the same)."""
+    """How `text` matches `others`:
+    "exact" -- todo_collapse's key is equal, exactly its rule: it WOULD collapse onto that
+               item at read time (S16), so the create is dropped;
+    "fuzzy" -- carry_forward's normalisation at ratio >= floor but a different key: maybe
+               the same job reworded, maybe a different one (east/west wall, Tuesday/
+               Thursday, Mike/Mark, level 12/13) -- kept, but never above weak;
+    None    -- neither. Text with no words never matches (todo_collapse treats "" the same).
+    An exact match anywhere wins over a fuzzy one."""
     key = todo_collapse.normalise(text)
     if not key:
-        return False
-    fkey, idents = _dup_key(text), identifiers(text)
+        return None
+    fkey, found = _dup_key(text), None
     for other in others:
         okey = todo_collapse.normalise(other)
         if not okey:
             continue
         if okey == key:
-            return True
-        if identifiers(other) == idents and \
-                difflib.SequenceMatcher(None, fkey, _dup_key(other)).ratio() >= floor:
-            return True
-    return False
+            return "exact"
+        if found is None and                 difflib.SequenceMatcher(None, fkey, _dup_key(other)).ratio() >= floor:
+            found = "fuzzy"
+    return found
 
 
 def _bump(counts, key, n=1):
@@ -248,7 +237,8 @@ def _bump(counts, key, n=1):
 
 
 def _code_check_action(a, *, registry, items, site_id, targets, created):
-    """None when the action passes, else the drop reason (counted by the caller)."""
+    """None when the action passes, FLAGGED when it passes as a fuzzy near-duplicate (kept,
+    capped at weak), else the drop reason (counted by the caller)."""
     import action_pack_stages as st
     if not a.get("refs") or any(r not in registry for r in a["refs"]):
         return "drop_refs"
@@ -270,9 +260,12 @@ def _code_check_action(a, *, registry, items, site_id, targets, created):
         live = [it.get("text") for it in items.values() if isinstance(it, dict)
                 and str(it.get("site_id") or "") == str(site_id or "")
                 and (it.get("status") or "open") in OPEN_STATUSES]
-        if near_duplicate(text, live + created):
+        match = near_duplicate(text, live + created)
+        if match == "exact":
             return "drop_near_duplicate"
         created.append(text)
+        if match == "fuzzy":
+            return FLAGGED
     return None
 
 
@@ -413,10 +406,14 @@ def verify(draft, *, registry, items, sources, ctx, writer_model, deadline,
             empty.append(("conclusion", i))
         else:
             todo.append(("conclusion", i, c))
-    targets, created = set(), []
+    targets, created, flagged = set(), [], set()
     for i, a in enumerate(draft["actions"]):
         why = _code_check_action(a, registry=registry, items=items, site_id=ctx.site_id,
                                  targets=targets, created=created)
+        if why == FLAGGED:
+            _bump(counts, FLAGGED)
+            flagged.add(i)
+            why = None
         if why:
             _bump(counts, why)
         elif no_text(a["refs"]):
@@ -485,6 +482,8 @@ def verify(draft, *, registry, items, sources, ctx, writer_model, deadline,
         if no_snap and label == "supported":
             label = "weak"
             _bump(counts, "no_snapshot_capped")
+        if kind == "actions" and i in flagged and label == "supported":
+            label = "weak"                  # a fuzzy near-duplicate: never bulk-applied
         _bump(counts, f"label_{kind}_{label}")
         if kind == "conclusion":
             if label == "unsupported":
