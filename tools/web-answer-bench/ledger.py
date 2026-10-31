@@ -125,3 +125,87 @@ def add_report_spend(path, pool, dollars):
                    "pools": {k: round(v, 6) for k, v in state["pools"].items()}}, f)
     os.replace(tmp, path)
     return state
+
+
+# ------------------------------------------------------------- OpenRouter pool
+# Spec 2026-10-31-model-scope-and-config-update-design Part A. Both benches'
+# OpenRouter dollars live in ONE pool, `openrouter`, of this same file. It is
+# not a `report/*` pool and never touches `spent_usd`, so the Anthropic stops
+# ($45 web / $40 report / $85 global) read exactly what they read before.
+OPENROUTER_POOL = "openrouter"
+OPENROUTER_CAP_USD = 10.0
+# $ per million tokens (input, output), pinned 2026-10-31: what a call is
+# charged when its response carries no `usage.cost`. Never $0.
+OR_PRICES_2026_10_31 = {
+    "meta/muse-spark-1.3-contributor": (0.10, 0.20),
+    "deepseek/deepseek-v4.1-flash": (0.13, 0.65),
+    "google/gemini-3.8-flash": (0.825, 4.125),
+}
+PROD_KEY_WARNING = "WARNING: using the prod OpenRouter key"
+
+
+def or_upper(model, input_tokens, output_tokens):
+    """Pinned-price $ for these tokens. KeyError for a model with no pinned
+    price (mimo): a guess would be a $0 the cap cannot see."""
+    pin, pout = OR_PRICES_2026_10_31[model]
+    return (int(input_tokens or 0) * pin + int(output_tokens or 0) * pout) / 1_000_000
+
+
+def or_cost(resp_json, model, in_tok, out_tok):
+    """The response's `usage.cost` when it is a number, else the pinned upper
+    price of the tokens it reports (or the caller's token estimate)."""
+    usage = resp_json.get("usage") if isinstance(resp_json, dict) else None
+    cost = usage.get("cost") if isinstance(usage, dict) else None
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        return float(cost)
+    return or_upper(model, in_tok, out_tok)
+
+
+def openrouter_spent(path):
+    return read_state(path)["pools"].get(OPENROUTER_POOL, 0.0)
+
+
+def openrouter_room(path, cap=OPENROUTER_CAP_USD):
+    return float(cap) - openrouter_spent(path)
+
+
+def add_openrouter_spend(path, usd):
+    """Pools-only writer, like `add_report_spend`: re-reads the file, adds to
+    the `openrouter` pool, writes `spent_usd` / `cap_usd` back as read."""
+    state = read_state(path)
+    state["pools"][OPENROUTER_POOL] = state["pools"].get(OPENROUTER_POOL, 0.0) + float(usd)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"spent_usd": state["spent_usd"], "cap_usd": state["cap_usd"],
+                   "pools": {k: round(v, 6) for k, v in state["pools"].items()}}, f)
+    os.replace(tmp, path)
+    return state
+
+
+def key_tag(key):
+    import hashlib
+    return hashlib.sha256((key or "").encode("utf-8")).hexdigest()[:8]
+
+
+def load_or_key(key_file, env_name, env=None, stderr=None):
+    """(key, warned). `key_file` (the owner's bench-only key) wins; without it
+    the env var is used and the prod-key warning printed. The key itself is
+    never printed, only its sha256[:8]. ValueError for an unreadable / empty
+    key file."""
+    import sys
+    stderr = stderr or sys.stderr
+    if key_file:
+        try:
+            with open(key_file, encoding="utf-8") as f:
+                key = f.read().strip()
+        except OSError as exc:
+            raise ValueError(f"--openrouter-key-file unreadable: {type(exc).__name__}")
+        if not key:
+            raise ValueError("--openrouter-key-file is empty")
+        print(f"openrouter key: file, sha256 {key_tag(key)}", file=stderr)
+        return key, False
+    key = (os.environ if env is None else env).get(env_name, "") or ""
+    print(f"{PROD_KEY_WARNING} ({env_name}, sha256 {key_tag(key)}); pass "
+          "--openrouter-key-file for the bench-only key", file=stderr)
+    return key, True

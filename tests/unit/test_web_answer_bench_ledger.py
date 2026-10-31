@@ -139,3 +139,66 @@ def test_web_scripts_refuse_while_the_report_bench_holds_the_lock(tmp_path, name
         else:
             mod.validate(args, {}, repo_root=REPO)
     assert e.value.code == 2
+
+
+# ------------------------------------------- OpenRouter pool (spec 2026-10-31 Part A)
+
+def test_openrouter_spend_is_pools_only(tmp_path):
+    p = str(tmp_path / "anthropic_ledger.json")
+    _write(p, {"spent_usd": 10.0, "cap_usd": 45.0,
+               "pools": {"stage0": 1.0, "matrix": 9.0, "report/round0": 2.0}})
+    before = L.read_state(p)
+    L.add_openrouter_spend(p, 0.75)
+    st = L.read_state(p)
+    assert st["spent_usd"] == 10.0 and st["cap_usd"] == 45.0
+    assert st["pools"]["openrouter"] == 0.75
+    # The Anthropic stops read exactly what they read before.
+    assert L.report_spent(st) == L.report_spent(before) == 2.0
+    assert L.global_spent(st) == L.global_spent(before) == 12.0
+    led = L.Ledger(p)
+    assert led.spent == 10.0 and led.room() == 35.0
+    led.add(1.0, pool="matrix")                 # web add carries the pool along
+    assert L.read_state(p)["pools"]["openrouter"] == 0.75
+    assert L.openrouter_spent(p) == 0.75
+    assert L.openrouter_room(p, 10.0) == pytest.approx(9.25)
+
+
+def test_openrouter_room_on_a_fresh_file(tmp_path):
+    p = str(tmp_path / "anthropic_ledger.json")
+    assert L.openrouter_room(p) == L.OPENROUTER_CAP_USD == 10.0
+    L.add_openrouter_spend(p, 10.0)
+    assert L.openrouter_room(p, 10.0) <= 0
+
+
+def test_or_cost_uses_usage_cost_else_pinned_upper():
+    m = "deepseek/deepseek-v4.1-flash"
+    assert L.or_cost({"usage": {"cost": 0.0012}}, m, 1000, 100) == 0.0012
+    assert L.or_cost({"usage": {"cost": 0}}, m, 1000, 100) == 0.0
+    upper = (1000 * 0.13 + 100 * 0.65) / 1e6
+    for resp in ({"usage": {}}, {}, {"usage": {"cost": None}}, None, {"usage": "x"}):
+        assert L.or_cost(resp, m, 1000, 100) == pytest.approx(upper)
+    assert L.OR_PRICES_2026_10_31 == {"meta/muse-spark-1.3-contributor": (0.10, 0.20),
+                                      "deepseek/deepseek-v4.1-flash": (0.13, 0.65),
+                                      "google/gemini-3.8-flash": (0.825, 4.125)}
+    with pytest.raises(KeyError):               # no pinned price: never a silent $0
+        L.or_cost({}, "xiaomi/mimo-v2.6-pro", 1, 1)
+
+
+def test_load_or_key_file_wins_and_env_warns(tmp_path, capsys):
+    kf = tmp_path / "or.key"
+    kf.write_text("sk-or-FILE-SENTINEL\n", encoding="utf-8")
+    env = {"CORROBORATION_API_KEY": "sk-or-ENV-SENTINEL"}
+    key, warned = L.load_or_key(str(kf), "CORROBORATION_API_KEY", env=env)
+    assert key == "sk-or-FILE-SENTINEL" and warned is False
+    err = capsys.readouterr().err
+    assert L.PROD_KEY_WARNING not in err and L.key_tag(key) in err
+    key, warned = L.load_or_key(None, "CORROBORATION_API_KEY", env=env)
+    assert key == "sk-or-ENV-SENTINEL" and warned is True
+    err = capsys.readouterr().err
+    assert L.PROD_KEY_WARNING in err
+    assert "SENTINEL" not in err
+    for bad in (tmp_path / "missing.key", tmp_path / "empty.key"):
+        if bad.name == "empty.key":
+            bad.write_text("  \n", encoding="utf-8")
+        with pytest.raises(ValueError):
+            L.load_or_key(str(bad), "CORROBORATION_API_KEY", env=env)

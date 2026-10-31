@@ -3,7 +3,12 @@
 OpenRouter: POST `<QWEN_BASE_URL>/chat/completions` with `QWEN_API_KEY` (the
 same env var and URL shape `llm_utils._call_qwen` uses), urllib3 pool from
 `corroboration_client.http_session`, timeout 540 s, no retry ladder, no
-fallback chain (the bench measures one model).
+fallback chain (the bench measures one model). `usage: {include: true}` is added
+to the body at send time only (never to `request_for`, so `params_of` and the
+recorded params do not change); the attempt's `openrouter_cost_usd` is the
+response's `usage.cost`, else the pinned upper price (spec 2026-10-31 Part A).
+The key is `--openrouter-key-file`'s when rb_run set one (`set_openrouter_key`),
+else the env's.
 
 Claude: `client.messages.stream(**request)` -> `get_final_message()`; the
 client is the official SDK built by the runner with `max_retries=0`, or a test
@@ -45,8 +50,23 @@ def openrouter_url():
     return rb_common.IMPORT_ENV["QWEN_BASE_URL"].rstrip("/") + "/chat/completions"
 
 
+_KEY_OVERRIDE = {"key": None}
+
+
+def set_openrouter_key(key):
+    """The bench-only key from --openrouter-key-file; held here, never put in
+    os.environ (a render worker or a child would inherit it)."""
+    _KEY_OVERRIDE["key"] = key or None
+
+
 def openrouter_key():
+    if _KEY_OVERRIDE["key"]:
+        return _KEY_OVERRIDE["key"]
     return os.environ.get("QWEN_API_KEY", os.environ.get("DASHSCOPE_API_KEY", ""))
+
+
+def _or_priced(key):
+    return rb_requests.MODELS[key]["model"] in rb_ledger.web_ledger().OR_PRICES_2026_10_31
 
 
 def est_input_tokens(prompt: str) -> int:
@@ -78,8 +98,11 @@ def _openrouter_attempt(key, req, prompt, http, clock):
         a["error_code"] = "no_key"
         return a, ""
     started = clock()
+    W = rb_ledger.web_ledger()
+    model = rb_requests.MODELS[key]["model"]
     try:
-        resp = http.request("POST", openrouter_url(), body=json.dumps(req),
+        resp = http.request("POST", openrouter_url(),
+                            body=json.dumps(dict(req, usage={"include": True})),
                             headers={"Content-Type": "application/json",
                                      "Authorization": "Bearer " + k},
                             timeout=rb_requests.TIMEOUT_S)
@@ -87,6 +110,11 @@ def _openrouter_attempt(key, req, prompt, http, clock):
         a["latency_ms"] = int(round((clock() - started) * 1000))
         a["error_code"] = type(exc).__name__
         a["outcome"] = "timeout" if _ORB._is_timeout(exc) else "http_error"
+        if a["outcome"] == "timeout" and _or_priced(key):
+            # Billed, usage never seen: booked at the call's upper.
+            a["openrouter_cost_usd"] = W.or_upper(model, est_input_tokens(prompt),
+                                                  req["max_tokens"])
+            a["or_cost_estimated"] = True
         return a, ""
     a["latency_ms"] = int(round((clock() - started) * 1000))
     a["http_status"] = resp.status
@@ -110,6 +138,13 @@ def _openrouter_attempt(key, req, prompt, http, clock):
              reasoning_tokens=details.get("reasoning_tokens") if isinstance(details, dict)
              else None,
              openrouter_cost_usd=usage.get("cost"))
+    if not isinstance(a["openrouter_cost_usd"], (int, float)) and _or_priced(key):
+        # No usage.cost: the pinned upper price, never $0.
+        tokens = ((a["input_tokens"], a["output_tokens"])
+                  if a["input_tokens"] or a["output_tokens"]
+                  else (est_input_tokens(prompt), req["max_tokens"]))
+        a["openrouter_cost_usd"] = W.or_cost(data, model, *tokens)
+        a["or_cost_estimated"] = True
     if a["finish"] == "length":
         a["outcome"] = "truncated"
     elif not text.strip():

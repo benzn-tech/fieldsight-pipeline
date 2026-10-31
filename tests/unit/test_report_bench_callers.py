@@ -243,3 +243,40 @@ def test_context_window_exceeded_is_not_ok():
     c = FakeClient([_msg(SECRET_A, stop="model_context_window_exceeded")])
     r = callers.call("haiku", "X", '"topics"', 9000, client=c, clock=Clock())
     assert r["outcome"] == "context_exceeded"
+
+
+# ------------------------------- spec 2026-10-31 Part A: OpenRouter pool and key
+
+def test_usage_include_sent_but_not_in_params():
+    rq = _load("rb_requests")
+    http = FakeHttp([_or(SECRET_A)])
+    callers.call("deepseek", "X", SECRET_P, 9000, http=http, clock=Clock())
+    assert http.bodies[0]["usage"] == {"include": True}
+    req = rq.request_for("deepseek", "X", SECRET_P, 9000)
+    assert "usage" not in req and "usage" not in rq.params_of(req)
+
+
+def test_missing_cost_is_the_pinned_upper_never_zero():
+    r = callers.call("muse", "X", SECRET_P, 9000, http=FakeHttp([_or(SECRET_A)]),
+                     clock=Clock())
+    a = r["attempts"][0]
+    assert a["openrouter_cost_usd"] == pytest.approx((100 * 0.10 + 50 * 0.20) / 1e6)
+    assert a["or_cost_estimated"] is True
+    with_cost = _or(SECRET_A)
+    with_cost["data"]["usage"]["cost"] = 0.0042
+    a = callers.call("muse", "X", SECRET_P, 9000, http=FakeHttp([with_cost]),
+                     clock=Clock())["attempts"][0]
+    assert a["openrouter_cost_usd"] == 0.0042 and not a.get("or_cost_estimated")
+    a = callers.call("deepseek", "X", SECRET_P, 9000, http=FakeHttp([TimeoutError("timed out")]),
+                     clock=Clock())["attempts"][0]
+    assert a["outcome"] == "timeout" and a["openrouter_cost_usd"] > 0
+
+
+def test_key_override_wins_and_is_not_put_in_env(monkeypatch):
+    callers.set_openrouter_key("k-bench-file")
+    try:
+        assert callers.openrouter_key() == "k-bench-file"
+        assert os.environ["QWEN_API_KEY"] == "k-test"
+    finally:
+        callers.set_openrouter_key(None)
+    assert callers.openrouter_key() == "k-test"
