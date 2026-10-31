@@ -1383,6 +1383,41 @@ Parameters:
       routes, which is the UI's only gate. Set per environment by the repo variables
       TEST_TEMPLATE_DIGITISE / PROD_TEMPLATE_DIGITISE.
 
+  # Template digitise model settings (spec 2026-10-31 B2). Defaults are the request the
+  # 2026-10-16 gate measured, so a deploy with the repo variables unset changes nothing;
+  # moving the model (and rolling it back) is a variable + redeploy, not a code change.
+  # Pinned by tests/unit/test_template_digitise_wiring.py.
+  TemplateDigitiseModel:
+    Type: String
+    Default: google/gemini-3.8-flash
+    Description: >-
+      The vision model that reads a form's pages (TEMPLATE_DIGITISE_MODEL). Set by
+      TEST_TEMPLATE_DIGITISE_MODEL / PROD_TEMPLATE_DIGITISE_MODEL.
+
+  TemplateDigitiseReasoning:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(|off|low|medium|high)$'
+    Description: >-
+      Reasoning control for the digitise read. off disables reasoning (dropped with a
+      warning for muse, which cannot disable it); low/medium/high set the effort and add
+      the reasoning headroom to the answer budget. Empty sends no reasoning setting.
+
+  TemplateDigitiseProvider:
+    Type: String
+    Default: ''
+    Description: >-
+      Comma-separated OpenRouter endpoint tags (e.g. coreweave/fp8) the digitise model is
+      pinned to, no provider fallback. Never applied to TemplateDigitisePdfModel or to a
+      fallback model. Empty means no pin.
+
+  TemplateDigitisePdfModel:
+    Type: String
+    Default: ''
+    Description: >-
+      The model PDF uploads go to, for when the image model takes no file input. Empty
+      means PDFs go to TemplateDigitiseModel, as before.
+
   # Project documents (spec 2026-10-16). Wired in pieces, pinned by
   # tests/unit/test_project_documents_wiring.py: this Parameter -> PROJECT_DOCUMENTS on
   # OrgApiFunction (routes), RagSearchFunction (documents mode), AskAgentFunction (the
@@ -2728,7 +2763,10 @@ Resources:
           # EMPTY on purpose. Globals sets the TEXT models' chain; this function never
           # calls call_llm, and a text model handed page images would invent items.
           LLM_FALLBACK_MODELS: ''
-          TEMPLATE_DIGITISE_MODEL: google/gemini-3.8-flash
+          TEMPLATE_DIGITISE_MODEL: !Ref TemplateDigitiseModel
+          TEMPLATE_DIGITISE_REASONING: !Ref TemplateDigitiseReasoning
+          TEMPLATE_DIGITISE_PROVIDER: !Ref TemplateDigitiseProvider
+          TEMPLATE_DIGITISE_PDF_MODEL: !Ref TemplateDigitisePdfModel
           TEMPLATE_DIGITISE_FALLBACK_MODELS: ''
       Policies:
         # lake_put: the result write also appends one manifest line in the bucket it wrote to.

@@ -304,3 +304,20 @@ def test_a_source_exactly_at_the_limit_is_still_read(s3, monkeypatch):
     _request(s3, [key])
     worker.lambda_handler(_event(), None)
     assert _result(s3)["status"] == "done"
+
+
+def test_a_pdf_read_by_the_pdf_model_is_labelled_with_that_model(s3, monkeypatch):
+    """With TEMPLATE_DIGITISE_PDF_MODEL set, `model()` names a model that did not read
+    the PDF; the result must name the one that did (spec 2026-10-31 B2)."""
+    monkeypatch.setenv("TEMPLATE_DIGITISE_MODEL", "deepseek/deepseek-v4.1-flash")
+    monkeypatch.setenv("TEMPLATE_DIGITISE_PDF_MODEL", "meta/muse-spark-1.3-contributor")
+    key = f"template_sources/{COMPANY}/{'d' * 32}.pdf"
+    s3.store[key] = b"%PDF <</Type/Page>>"
+    _request(s3, [key])
+    sent = _http(monkeypatch, [_ok(json.dumps({"sections": [
+        {"title": "General", "items": ["Gate locked"]}]}))])
+
+    worker.lambda_handler(_event(), None)
+
+    assert sent[0]["model"] == "meta/muse-spark-1.3-contributor"
+    assert _result(s3)["model"] == "meta/muse-spark-1.3-contributor"

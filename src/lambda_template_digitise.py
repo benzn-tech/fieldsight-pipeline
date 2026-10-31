@@ -130,13 +130,15 @@ def digitise(request, deadline=None):
                   if exts == ["pdf"] else len(pages))
     left = None if deadline is None else max(1.0, deadline - (time.monotonic() - started))
     raw, err = template_vision.read(pages, deadline=left)
+    # The model that read THESE pages: a PDF can go to TEMPLATE_DIGITISE_PDF_MODEL.
+    used = template_vision.model_for(pages)
     if err:
-        return _empty("error", route="vision", model=template_vision.model(), error=err)
+        return _empty("error", route="vision", model=used, error=err)
     draft = template_draft.clean(raw)
     if draft["counts"]["items"] == 0:
-        return _empty("unreadable", route="vision", model=template_vision.model(),
+        return _empty("unreadable", route="vision", model=used,
                       pages=page_count, reason=MSG_NO_ROWS)
-    return {"status": "done", **draft, "route": "vision", "model": template_vision.model(),
+    return {"status": "done", **draft, "route": "vision", "model": used,
             "pages": page_count}
 
 

@@ -519,6 +519,45 @@ def _is_mimo(model):
     return (model or "").startswith("xiaomi/mimo")
 
 
+def _is_muse(model):
+    return (model or "").startswith("meta/muse")
+
+
+def parse_reasoning(raw, model=None, name="reasoning"):
+    """OpenRouter `reasoning` from a per-function setting: off, low, medium or high.
+    Unset or empty means None (no key at all, the payload as before); anything else
+    is warned about, naming `name`, and also None.
+
+    Shared by the Ask judge (ASK_JUDGE_REASONING) and the template digitise read
+    (TEMPLATE_DIGITISE_REASONING) so the two cannot drift. `model`, when given, is the
+    model the setting will reach: muse refuses `{"enabled": false}` with a hard 400
+    ("Reasoning is mandatory for this endpoint", see `_openrouter_fields`), so `off`
+    aimed at muse is dropped with a warning rather than failing every call. The judge
+    passes no model and keeps exactly the behaviour it had.
+    """
+    raw = (raw or "").strip().lower()
+    if not raw:
+        return None
+    if raw == "off":
+        if model is not None and _is_muse(model):
+            logger.warning("%s=off ignored for %s: muse cannot disable reasoning; "
+                           "sending no reasoning setting", name, model)
+            return None
+        return {"enabled": False}
+    if raw in VALID_EFFORTS:
+        return {"effort": raw}
+    logger.warning("%s value not recognised "
+                   "(expected off|low|medium|high); sending no reasoning", name)
+    return None
+
+
+def parse_provider(raw):
+    """`{"only": [...], "allow_fallbacks": False}` from a comma-separated list of
+    OpenRouter endpoint tags (e.g. "coreweave/fp8"), or None when there are none."""
+    tags = [t.strip() for t in (raw or "").split(",") if t.strip()]
+    return {"only": tags, "allow_fallbacks": False} if tags else None
+
+
 def _openrouter_fields(payload, max_tokens, force_json, enable_thinking, thinking):
     """The reasoning / max_tokens / response_format part of an OpenRouter request.
 
@@ -728,7 +767,8 @@ PARTS_CUT_OFF = "answer cut off: "
 
 
 def call_llm_parts(parts, *, model, max_tokens, force_json=True, temperature=0,
-                   fallback_env=None, deadline=None, caller="unknown"):
+                   fallback_env=None, deadline=None, caller="unknown",
+                   reasoning=None, provider=None):
     """One user message made of content parts (text + image_url / file) -> (text, None)
     or (None, error). OpenRouter path only.
 
@@ -738,11 +778,19 @@ def call_llm_parts(parts, *, model, max_tokens, force_json=True, temperature=0,
     -- it would invent checklist items that no code check can tell from real ones
     (template digitise spec 2026-10-16, section 3).
 
-    The request is built here and not by `_openrouter_fields`: no `reasoning` field, no
-    reasoning headroom, and an explicit temperature. That is the request the 2026-10-16
-    spike measured; the text path's effort and headroom were never measured on a vision
-    read. Retries, the empty-answer check and the LLM_USAGE line come from
+    The request is built here and not by `_openrouter_fields`: by default no `reasoning`
+    field, no reasoning headroom, and an explicit temperature. That is the request the
+    2026-10-16 spike measured; the text path's effort and headroom were never measured on
+    a vision read. Retries, the empty-answer check and the LLM_USAGE line come from
     `_qwen_attempt`, unchanged.
+
+    `reasoning` / `provider` (spec 2026-10-31 B2) are the caller's already-parsed
+    OpenRouter fields (`parse_reasoning` / `parse_provider`), so a move off gemini is a
+    setting the caller measured, not the text path's. Both None is the request above,
+    byte for byte. They ride on `model` only, never on a fallback -- an endpoint pin
+    naming one vendor fails on another's model, the Ask judge's rule. With `reasoning`
+    set the answer budget gets REASONING_HEADROOM_TOKENS on top: reasoning tokens are
+    completion tokens and are spent before the answer.
 
     Two failures are told apart by a stable prefix on the error, because retrying either
     one later cannot help:
@@ -777,15 +825,21 @@ def call_llm_parts(parts, *, model, max_tokens, force_json=True, temperature=0,
             break
         payload = {"model": name, "messages": [{"role": "user", "content": parts}],
                    "temperature": temperature, "max_tokens": max_tokens}
+        if i == 0 and reasoning:
+            payload["reasoning"] = reasoning
+            payload["max_tokens"] = max_tokens + REASONING_HEADROOM_TOKENS
+        if i == 0 and provider:
+            payload["provider"] = provider
         if force_json:
             payload["response_format"] = {"type": "json_object"}
         info = {}
         text, err, movable = _qwen_attempt(payload, False, remaining, caller, info=info)
         if info.get("finish_reason") == "length":
             # Truncated JSON (err None) or an empty answer (err set): either way the
-            # budget, not the vendor, is what stopped it.
+            # budget, not the vendor, is what stopped it. The number on the wire, so a
+            # reader sizing the next budget sees the one that was actually spent.
             return None, PARTS_CUT_OFF + "finish_reason=length at max_tokens=%d (%s)" % (
-                max_tokens, name)
+                payload["max_tokens"], name)
         if err is None:
             return text, None
         if len(chain) == 1 or not movable:

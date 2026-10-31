@@ -224,6 +224,21 @@ jobs:
           if [ -n "${{ vars.PROD_ASK_JUDGE_REASONING }}" ]; then
             ASK_JUDGE_REASONING_PARAM="AskJudgeReasoning=${{ vars.PROD_ASK_JUDGE_REASONING }}"
           fi
+          # Template digitise settings (spec 2026-10-31 B2). Same bare-"Key=" guard: these
+          # three default to '' in the template, which is today's request; the model
+          # has a non-empty default and is passed inline below.
+          TEMPLATE_DIGITISE_REASONING_PARAM=""
+          if [ -n "${{ vars.PROD_TEMPLATE_DIGITISE_REASONING }}" ]; then
+            TEMPLATE_DIGITISE_REASONING_PARAM="TemplateDigitiseReasoning=${{ vars.PROD_TEMPLATE_DIGITISE_REASONING }}"
+          fi
+          TEMPLATE_DIGITISE_PROVIDER_PARAM=""
+          if [ -n "${{ vars.PROD_TEMPLATE_DIGITISE_PROVIDER }}" ]; then
+            TEMPLATE_DIGITISE_PROVIDER_PARAM="TemplateDigitiseProvider=${{ vars.PROD_TEMPLATE_DIGITISE_PROVIDER }}"
+          fi
+          TEMPLATE_DIGITISE_PDF_MODEL_PARAM=""
+          if [ -n "${{ vars.PROD_TEMPLATE_DIGITISE_PDF_MODEL }}" ]; then
+            TEMPLATE_DIGITISE_PDF_MODEL_PARAM="TemplateDigitisePdfModel=${{ vars.PROD_TEMPLATE_DIGITISE_PDF_MODEL }}"
+          fi
           # Gemini provider order (spec 2026-10-23). Unset keeps the template
           # default (AI Studio first); 'off' is the rollback.
           PROVIDER_ORDER_PARAM=""
@@ -329,6 +344,10 @@ jobs:
               "SearchIndexRead=${{ vars.PROD_SEARCH_INDEX_READ || 'report' }}" \
               "CompanySummaryServe=${{ vars.PROD_COMPANY_SUMMARY_SERVE || 'off' }}" \
               "TemplateDigitise=${{ vars.PROD_TEMPLATE_DIGITISE || 'false' }}" \
+              "TemplateDigitiseModel=${{ vars.PROD_TEMPLATE_DIGITISE_MODEL || 'google/gemini-3.8-flash' }}" \
+              $TEMPLATE_DIGITISE_REASONING_PARAM \
+              $TEMPLATE_DIGITISE_PROVIDER_PARAM \
+              $TEMPLATE_DIGITISE_PDF_MODEL_PARAM \
               "CheckDoneGaps=${{ vars.PROD_CHECK_DONE_GAPS || 'false' }}" \
               "ProjectDocuments=${{ vars.PROD_PROJECT_DOCUMENTS || 'false' }}" \
               $PDF_LAYER_PARAM \

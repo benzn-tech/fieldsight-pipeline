@@ -29,8 +29,12 @@ for _tag in ("!Sub", "!Ref", "!If", "!Not", "!Equals", "!GetAtt", "!FindInMap",
     _Loader.add_constructor(_tag, lambda loader, node: getattr(node, "value", None))
 
 
+def _template():
+    return _yaml.load(io.open(TEMPLATE, encoding="utf-8").read(), Loader=_Loader)
+
+
 def _resources():
-    return _yaml.load(io.open(TEMPLATE, encoding="utf-8").read(), Loader=_Loader)["Resources"]
+    return _template()["Resources"]
 
 
 def _fn(name="TemplateDigitiseFunction"):
@@ -76,7 +80,11 @@ def test_the_worker_reads_no_text_fallback_chain_and_has_its_own_empty_one():
     env = _fn()["Environment"]["Variables"]
     assert env["LLM_FALLBACK_MODELS"] == "", "Globals' text chain must not leak in"
     assert env["TEMPLATE_DIGITISE_FALLBACK_MODELS"] == ""
-    assert env["TEMPLATE_DIGITISE_MODEL"] == "google/gemini-3.8-flash"
+    # A parameter now (spec 2026-10-31 B2): the model moves by a repo variable, and the
+    # default is still the one the 2026-10-16 gate measured.
+    assert env["TEMPLATE_DIGITISE_MODEL"] == "TemplateDigitiseModel"  # !Ref, by name
+    assert _template()["Parameters"]["TemplateDigitiseModel"]["Default"] == (
+        "google/gemini-3.8-flash")
     assert env["LLM_CHAIN_BUDGET_SECONDS"] == "840"
     assert int(env["LLM_HTTP_TIMEOUT"]) < 900
     assert "QWEN_API_KEY" in env and "QWEN_BASE_URL" in env
@@ -185,3 +193,40 @@ def test_org_api_can_tell_a_missing_key_from_a_denied_one_on_all_three():
     prefixes = _list_prefixes(_fn("OrgApiFunction"))
     for p in ("template_sources/*", "template_digitise_requests/*", "template_digitise_results/*"):
         assert p in prefixes, f"{p}: a missing key would read as AccessDenied (500), not 404"
+
+
+# ---- per-model settings (spec 2026-10-31 B2) --------------------------------------
+WORKFLOWS = {"TEST": os.path.join(REPO, ".github", "workflows", "deploy.yml"),
+             "PROD": os.path.join(REPO, ".github", "workflows", "deploy-prod.yml")}
+KNOBS = {"TemplateDigitiseModel": "TEMPLATE_DIGITISE_MODEL",
+         "TemplateDigitiseReasoning": "TEMPLATE_DIGITISE_REASONING",
+         "TemplateDigitiseProvider": "TEMPLATE_DIGITISE_PROVIDER",
+         "TemplateDigitisePdfModel": "TEMPLATE_DIGITISE_PDF_MODEL"}
+
+
+def test_the_settings_reach_the_worker_and_default_to_todays_request():
+    """Inert on deploy: an unset repo variable must reproduce the request shipped
+    2026-10-16 -- gemini, no reasoning, no pin, PDFs to the same model."""
+    params = _template()["Parameters"]
+    env = _fn()["Environment"]["Variables"]
+    for param, var in KNOBS.items():
+        assert env[var] == param, f"{var} is not wired to {param}"
+    assert params["TemplateDigitiseReasoning"]["Default"] == ""
+    assert params["TemplateDigitiseProvider"]["Default"] == ""
+    assert params["TemplateDigitisePdfModel"]["Default"] == ""
+    assert params["TemplateDigitiseReasoning"]["AllowedPattern"] == "^(|off|low|medium|high)$"
+
+
+@pytest.mark.parametrize("env", sorted(WORKFLOWS))
+def test_both_workflows_pass_the_settings_from_repo_variables(env):
+    text = open(WORKFLOWS[env], encoding="utf-8").read()
+    # The model has a non-empty default, so the inline `||` form is safe.
+    assert ('"TemplateDigitiseModel=${{ vars.%s_TEMPLATE_DIGITISE_MODEL '
+            "|| 'google/gemini-3.8-flash' }}\"" % env) in text
+    # The other three default to empty, and a bare `Key=` makes SAM exit 2: shell guard.
+    for param, var in (("TemplateDigitiseReasoning", "TEMPLATE_DIGITISE_REASONING"),
+                       ("TemplateDigitiseProvider", "TEMPLATE_DIGITISE_PROVIDER"),
+                       ("TemplateDigitisePdfModel", "TEMPLATE_DIGITISE_PDF_MODEL")):
+        assert 'if [ -n "${{ vars.%s_%s }}" ]' % (env, var) in text, (env, var)
+        assert '_PARAM="%s=${{ vars.%s_%s }}"' % (param, env, var) in text, (env, var)
+        assert "$%s_PARAM" % var in text, (env, var)
