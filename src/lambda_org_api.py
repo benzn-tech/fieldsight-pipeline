@@ -1018,8 +1018,7 @@ def get_pack_snapshot(conn, caller, pack_id, ref):
     if ref in _ReaderVisibility(conn, caller).removed_refs(pack):
         return error("not found", 404)
     key = src["snapshot_s3_key"]
-    if (not key.startswith(action_pack_view.snapshot_key_prefix(pack["company_id"], pack_id))
-            or ".." in key):
+    if key != action_pack_view.snapshot_key(pack["company_id"], pack_id, ref):
         logger.warning("action pack snapshot key outside the pack prefix pack=%s ref=%s",
                        pack_id, ref)
         return error("not found", 404)
@@ -1428,6 +1427,22 @@ def _action_pack_store(conn, pack_id, event):
     if shape is not None:
         logger.warning("action pack store invalid pack=%s detail=%s", pack_id, shape)
         return {"error": "invalid", "detail": shape}
+    # Web snapshots (Task 9): a key must be EXACTLY action_packs/<company>/<pack>/web/<ref>.txt
+    # for the pack's own company and the source's own ref, checked before anything is
+    # written; after the store each one is recorded in the lake ownership index (the agent
+    # has no database connection, so this is where the index learns of them).
+    snap_pack = None
+    if any(isinstance(s, dict) and s.get("snapshot_s3_key") is not None
+           for s in payload.get("sources") or []):
+        snap_pack = action_packs.get_for_worker(conn, pack_id)
+        if snap_pack is None:
+            logger.info("action pack store refused pack=%s (no such pack)", pack_id)
+            return {"error": "refused"}
+        bad_key = action_pack_view.snapshot_key_error(payload, snap_pack["company_id"],
+                                                      pack_id)
+        if bad_key is not None:
+            logger.warning("action pack store invalid pack=%s detail=%s", pack_id, bad_key)
+            return {"error": "invalid", "detail": bad_key}
     try:
         outcome = action_packs.store_result(conn, pack_id, payload)
     except (TypeError, AttributeError, KeyError) as exc:
@@ -1446,8 +1461,14 @@ def _action_pack_store(conn, pack_id, event):
     if outcome != "ok":
         logger.info("action pack store refused pack=%s", pack_id)
         return {"error": "refused"}
-    logger.info("action pack stored pack=%s sources=%d actions=%d", pack_id,
-                len(payload.get("sources") or []), len(payload.get("actions") or []))
+    recorded = 0
+    for key in action_pack_view.snapshot_keys(payload) if snap_pack is not None else ():
+        recorded += bool(lake_objects.record_best_effort(
+            conn, key, company_id=snap_pack["company_id"], site_id=snap_pack["site_id"],
+            source="upload", kind="action_pack_web"))
+    logger.info("action pack stored pack=%s sources=%d actions=%d snapshots=%d", pack_id,
+                len(payload.get("sources") or []), len(payload.get("actions") or []),
+                recorded)
     return {"ok": True}
 
 

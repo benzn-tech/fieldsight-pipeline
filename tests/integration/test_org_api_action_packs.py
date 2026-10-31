@@ -550,3 +550,53 @@ def test_snapshot_viewer_reads_the_lake_for_readers_only(db, env):
     env.objs.clear()
     assert _call(db, creator, "GET", f"/action-packs/{pid}/sources/W1/snapshot") == (
         404, {"error": "snapshot not found"})
+
+
+# ---------------------------------------------------------------- Task 9: web snapshots
+
+def test_store_records_web_snapshots_in_the_lake_index(db, env):
+    co, site, _, creator = _world(db)
+    pack = ap.create_queued(db, site_id=site["id"], created_by=creator["id"], instruction="x")
+    pid = str(pack["id"])
+    ap.claim(db, pid)
+    key1 = f"action_packs/{co['id']}/{pid}/web/W2.txt"
+    key2 = f"action_packs/{co['id']}/{pid}/web/W3.txt"
+    payload = {"title": "t", "sources": [
+        {"ref": "W1", "kind": "web_answer", "provenance": "web", "excerpt": "answer"},
+        {"ref": "W2", "kind": "web_source", "provenance": "web", "url": "https://a.example/p",
+         "fetched_at": "2026-11-01T01:02:03+00:00", "snapshot_s3_key": key1},
+        {"ref": "W3", "kind": "web_source", "provenance": "web", "url": "https://b.example/q",
+         "fetched_at": "2026-11-01T01:02:04+00:00", "snapshot_s3_key": key2},
+        {"ref": "W4", "kind": "web_source", "provenance": "web", "url": "https://c.example/r",
+         "snapshot_s3_key": None}],
+        "actions": [{"seq": 1, "type": "note", "refs": ["W1", "W2"], "verifier": "weak"}]}
+    assert org._action_pack_store(db, pid, {"payload": payload}) == {"ok": True}
+    rows = db.execute("SELECT s3_key, company_id, site_id, kind, source, deleted_at "
+                      "FROM lake_objects WHERE s3_key LIKE %s ORDER BY s3_key",
+                      (f"action_packs/%/{pid}/%",)).fetchall()
+    assert rows == [(key1, co["id"], site["id"], "action_pack_web", "upload", None),
+                    (key2, co["id"], site["id"], "action_pack_web", "upload", None)]
+    assert db.execute("SELECT ref, snapshot_s3_key FROM action_pack_sources WHERE pack_id=%s "
+                      "ORDER BY ref", (pid,)).fetchall() == [
+        ("W1", None), ("W2", key1), ("W3", key2), ("W4", None)]
+
+
+def test_store_rejects_a_foreign_snapshot_key_before_writing(db, env):
+    co, site, _, creator = _world(db)
+    other = companies.create_company(db, f"Co-apo-other-{_tag()}")
+    pack = ap.create_queued(db, site_id=site["id"], created_by=creator["id"], instruction="x")
+    pid = str(pack["id"])
+    ap.claim(db, pid)
+    for key in (f"action_packs/{other['id']}/{pid}/web/W1.txt",   # another company
+                f"action_packs/{co['id']}/{pid}/web/W9.txt",      # another ref
+                "reports/secret.json"):
+        payload = {"sources": [{"ref": "W1", "kind": "web_source", "provenance": "web",
+                                "url": "https://a.example/p", "snapshot_s3_key": key}]}
+        assert org._action_pack_store(db, pid, {"payload": payload}) == {
+            "error": "invalid", "detail": "snapshot_key"}
+        assert db.execute("SELECT count(*) FROM lake_objects WHERE s3_key=%s",
+                          (key,)).fetchone()[0] == 0
+    assert db.execute("SELECT state FROM action_packs WHERE id=%s",
+                      (pid,)).fetchone()[0] == "running"
+    assert db.execute("SELECT count(*) FROM action_pack_sources WHERE pack_id=%s",
+                      (pid,)).fetchone()[0] == 0

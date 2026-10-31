@@ -556,6 +556,8 @@ def test_snapshot_is_capped(env):
     dict(WEB, snapshot_s3_key=f"action_packs/{CO}/other-pack/web/W1.txt"),  # another pack
     dict(WEB, snapshot_s3_key="reports/secret.json"),                       # outside prefix
     dict(WEB, snapshot_s3_key=f"action_packs/{CO}/{PACK}/web/../../x.txt"),
+    dict(WEB, snapshot_s3_key=f"action_packs/{CO}/{PACK}/web/W2.txt"),      # another ref (T9)
+    dict(WEB, snapshot_s3_key=f"action_packs/{CO}/{PACK}/web/sub/W1.txt"),  # exact key only
 ])
 def test_snapshot_refuses_non_web_or_foreign_keys(env, source):
     env.pack = _pack(sources=[source])
@@ -658,3 +660,80 @@ def test_get_one_and_create_survive_a_sweep_error(env, monkeypatch):
     monkeypatch.setattr(org.action_packs, "sweep_stale", boom)
     assert _call(env, "GET", f"/action-packs/{PACK}")[0] == 200
     assert _call(env, "POST", "/action-packs", {"instruction": "x"})[0] == 202
+
+
+# ---------------------------------------------------------------- Task 9: snapshot recording
+
+SITE_PACK = {"id": PACK, "site_id": SITE_A, "company_id": CO, "state": "running"}
+
+
+def _store_env(monkeypatch, pack=SITE_PACK, outcome="ok"):
+    recorded, stored = [], []
+    monkeypatch.setattr(org.action_packs, "get_for_worker", lambda conn, pid: pack)
+    monkeypatch.setattr(org.action_packs, "store_result",
+                        lambda conn, pid, p: stored.append(pid) or outcome)
+    monkeypatch.setattr(org.lake_objects, "record_best_effort",
+                        lambda conn, key, **kw: recorded.append((key, kw)) or True)
+    return recorded, stored
+
+
+def _store(payload):
+    return org.lambda_handler({"task": "action_pack_store", "pack_id": PACK,
+                               "payload": payload}, None)
+
+
+def test_store_records_each_snapshot_in_the_lake_index(task_env, monkeypatch):
+    recorded, stored = _store_env(monkeypatch)
+    w3 = dict(WEB, ref="W3", snapshot_s3_key=f"action_packs/{CO}/{PACK}/web/W3.txt")
+    none = dict(WEB, ref="W4", snapshot_s3_key=None)
+    assert _store({"sources": [WEB, w3, none]}) == {"ok": True}
+    assert stored == [PACK]
+    assert recorded == [
+        (SNAP_KEY, {"company_id": CO, "site_id": SITE_A, "source": "upload",
+                    "kind": "action_pack_web"}),
+        (w3["snapshot_s3_key"], {"company_id": CO, "site_id": SITE_A, "source": "upload",
+                                 "kind": "action_pack_web"})]
+
+
+@pytest.mark.parametrize("key", [
+    f"action_packs/{CO}/{PACK}/web/W2.txt",                # another ref's key
+    f"action_packs/{CO}/other-pack/web/W1.txt",            # another pack
+    f"action_packs/c0000000-0000-0000-0000-000000000002/{PACK}/web/W1.txt",  # other company
+    f"action_packs/{CO}/{PACK}/web/../../x/W1.txt",
+    f"action_packs/{CO}/{PACK}/web/W1.txt.bak",
+    f"action_packs/{CO}/{PACK}/web/W1.html",
+    "reports/secret.json",
+    "",
+])
+def test_store_rejects_a_snapshot_key_of_any_other_shape(task_env, monkeypatch, key):
+    recorded, stored = _store_env(monkeypatch)
+    assert _store({"sources": [dict(WEB, snapshot_s3_key=key)]}) == {
+        "error": "invalid", "detail": "snapshot_key"}
+    assert stored == [] and recorded == []
+
+
+def test_store_rejects_a_snapshot_key_on_a_non_web_source(task_env, monkeypatch):
+    recorded, stored = _store_env(monkeypatch)
+    src = {"ref": "W1", "kind": "topic", "provenance": "records", "snapshot_s3_key": SNAP_KEY}
+    assert _store({"sources": [src]}) == {"error": "invalid", "detail": "snapshot_key"}
+    assert stored == [] and recorded == []
+
+
+def test_store_refused_records_nothing(task_env, monkeypatch):
+    recorded, _ = _store_env(monkeypatch, outcome="refused")
+    assert _store({"sources": [WEB]}) == {"error": "refused"}
+    assert recorded == []
+
+
+def test_store_of_an_unknown_pack_with_snapshots_is_refused(task_env, monkeypatch):
+    recorded, stored = _store_env(monkeypatch, pack=None)
+    assert _store({"sources": [WEB]}) == {"error": "refused"}
+    assert stored == [] and recorded == []
+
+
+def test_store_without_snapshots_never_looks_the_pack_up(task_env, monkeypatch):
+    recorded, stored = _store_env(monkeypatch)
+    monkeypatch.setattr(org.action_packs, "get_for_worker",
+                        lambda conn, pid: pytest.fail("looked up"))
+    assert _store({"sources": [dict(WEB, snapshot_s3_key=None)]}) == {"ok": True}
+    assert stored == [PACK] and recorded == []
