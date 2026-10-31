@@ -1267,11 +1267,16 @@ def _apply_patch(conn, caller, pack, current, fields):
             or action_pack_view.differs_from_snapshot(fields, snapshot, live)
             or content_edits.count_item_edits_after(conn, live["stable_id"], as_of) > 0):
         view = action_pack_view.item_view(live)
+        # Stored WITHOUT the item's text: applied_result is returned to every reader later,
+        # unmasked, while S13 hides a target's text once the reader cannot see the item.
         _set_action(conn, pack_id, action_id, caller, "stale",
-                    {"reason": "changed", "live": view})
+                    {"reason": "changed",
+                     "live": {k: v for k, v in view.items() if k != "text"}})
         return _stale_response(snapshot, view)
     target = fields.get("status")
-    if (target is not None and not action_pack_view.same_value(live["status"], target)
+    # An unknown status is left to the PATCH validator below (400), not called a transition.
+    if (target in ALLOWED_ACTION_STATUS
+            and not action_pack_view.same_value(live["status"], target)
             and not action_pack_view.transition_allowed(live["status"], target)):
         raise _ApplyRefused(error("status transition not allowed", 409,
                                   {"from": live["status"], "to": target}))

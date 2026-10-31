@@ -252,6 +252,8 @@ def test_human_edit_after_as_of_makes_it_stale(db, env):
     assert _status(db, item_id) == "open"
     state, _, stored, _ = _action(db, aid)
     assert state == "stale" and stored["reason"] == "changed"
+    # The stored copy never carries the item's text (applied_result is not S13-masked).
+    assert "text" not in stored["live"] and stored["live"]["priority"] == "high"
     # Stale is sticky: a second apply answers the same, writing nothing.
     again = _apply(db, admin, pid, aid)
     assert again[0] == 409 and again[1]["state"] == "stale"
@@ -327,6 +329,17 @@ def test_illegal_transition_is_409_and_the_action_is_unchanged(db, env):
     assert status == 409 and body["error"] == "status transition not allowed"
     assert body["from"] == "done" and body["to"] == "closed"
     assert _action(db, aid)[0] == "proposed" and _status(db, item_id) == "done"
+
+
+def test_unknown_proposed_status_is_400_not_a_transition(db, env):
+    _, site, creator, admin = _world(db)
+    _, item_id, stable = _topic(db, site)
+    pid, [aid] = _ready_pack(db, site, creator, [{
+        "type": "update_item", "target_stable_id": str(stable), "target_snapshot": SNAP_OPEN,
+        "proposed": {"status": "finished"}}])
+    status, body = _apply(db, admin, pid, aid)
+    assert status == 400 and body["error"].startswith("status must be one of")
+    assert _action(db, aid)[0] == "proposed" and _status(db, item_id) == "open"
 
 
 def test_worker_without_acl_gets_403_and_the_action_stays_proposed(db, env):
