@@ -330,6 +330,16 @@ def store_result(conn, pack_id, payload: dict) -> str:
 
 # ------------------------------------------------------------------------- actions / archive
 
+def lock_action(conn, pack_id, action_id) -> dict | None:
+    """The action row, locked FOR UPDATE until the caller's transaction ends, or None when
+    this pack has no such action. Apply (Task 7) takes it first, so two concurrent appliers
+    of one action serialise BEFORE either writes the item; the loser then sees `applied`."""
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT {_ACTION_COLS} FROM action_pack_actions WHERE id=%s AND pack_id=%s "
+        "FOR UPDATE",
+        (action_id, pack_id)).fetchone()
+
+
 def set_action_state(conn, pack_id, action_id, new_state, applied_by=None,
                      applied_result=None, created_item_stable_id=None) -> tuple:
     """Move one action along ACTION_TRANSITIONS. Locks the action row (FOR UPDATE), so two

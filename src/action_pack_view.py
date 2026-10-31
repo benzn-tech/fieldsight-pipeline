@@ -259,6 +259,123 @@ def applicable_candidate(action, pack) -> bool:
             and pack.get("archived_at") is None)
 
 
+# ---------------------------------------------------------------------- apply (Task 7)
+# POST /action-packs/{id}/actions/{aid}/apply -- spec §5, §14 S10/S11. The database half
+# (locks, live row, ACL, writes) is org-api's apply_pack_action; these decide and shape.
+
+DRAFT_TYPES = ("draft_rfi", "draft_email", "note")
+APPLY_BODY_KEYS = ("fields",)
+# The fields an applier may edit before applying, per type (S10: `text` is never patchable
+# on an existing item; a create carries its own text).
+APPLY_EDIT_FIELDS = {
+    "close_item": ("status",),
+    "update_item": ("deadline", "responsible", "priority", "status"),
+    "create_item": ("text", "responsible", "deadline", "priority"),
+}
+CLOSE_STATUSES = ("done", "closed")
+CREATE_TEXT_MAX_CHARS = 2000
+# S10, from -> allowed targets. Same -> same is not a transition (it is the noop case).
+STATUS_TRANSITIONS = {
+    "open": ("in_progress", "blocked", "done", "closed"),
+    "in_progress": ("blocked", "done", "closed", "open"),
+    "blocked": ("in_progress", "done", "closed", "open"),
+    "done": ("open",),
+    "closed": ("open",),
+}
+# The live item's fields an apply response shows next to the run's snapshot (§5.2).
+ITEM_VIEW_FIELDS = ("status", "deadline", "responsible", "priority", "text", "updated_at")
+
+
+def validate_apply_body(body, action_type):
+    """(edits_dict, None) or (None, (message, status, extra)). The body is empty or
+    {"fields": {...}}; every edited field must be in APPLY_EDIT_FIELDS[action_type]
+    (refused, never ignored). A close's edited status must still close. Values are
+    otherwise validated by the PATCH rules at write time."""
+    if body is None:
+        return None, ("malformed JSON body", 400, None)
+    extra = sorted(set(body) - set(APPLY_BODY_KEYS))
+    if extra:
+        return None, ("unknown fields", 400, {"fields": extra})
+    edits = body.get("fields", {})
+    if not isinstance(edits, dict):
+        return None, ("fields must be an object", 400, None)
+    bad = sorted(set(edits) - set(APPLY_EDIT_FIELDS.get(action_type, ())))
+    if bad:
+        return None, ("field not editable", 400, {"fields": bad})
+    if action_type == "close_item" and "status" in edits \
+            and edits["status"] not in CLOSE_STATUSES:
+        return None, (f"status must be one of {list(CLOSE_STATUSES)}", 400, None)
+    return dict(edits), None
+
+
+def effective_fields(action, edits):
+    """The fields this apply writes: the action's proposal with the applier's edits on top.
+    (fields, None) or (None, (message, status, extra)).
+
+    A proposal naming a field apply may not write is refused whole (409
+    unsupported_field) rather than silently trimmed: the UI showed it. create_item's
+    `site_id` is the pack's own site (checked by the caller) and is dropped here."""
+    atype = action.get("type")
+    allowed = APPLY_EDIT_FIELDS.get(atype, ())
+    proposed = dict(action.get("proposed") or {})
+    if atype == "create_item":
+        proposed.pop("site_id", None)
+    bad = sorted(set(proposed) - set(allowed))
+    if bad:
+        return None, ("the action proposes a field apply cannot write", 409,
+                      {"code": "unsupported_field", "fields": bad})
+    fields = {**proposed, **(edits or {})}
+    if atype == "close_item":
+        fields.setdefault("status", "done")
+        if fields["status"] not in CLOSE_STATUSES:
+            return None, ("a close must set done or closed", 409,
+                          {"code": "unsupported_field", "fields": ["status"]})
+    if atype == "create_item":
+        text = fields.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return None, ("text is required", 400, None)
+        if len(text.strip()) > CREATE_TEXT_MAX_CHARS:
+            return None, (f"text must be at most {CREATE_TEXT_MAX_CHARS} characters", 400,
+                          None)
+        fields["text"] = text.strip()
+    if not fields:
+        return None, ("the action has nothing to apply", 409, {"code": "empty_proposal"})
+    return fields, None
+
+
+def transition_allowed(current, target) -> bool:
+    """S10's table. Same -> same is not a transition."""
+    return target in STATUS_TRANSITIONS.get(current, ())
+
+
+def _norm(value):
+    if value is None:
+        return None
+    if isinstance(value, (dt.date, dt.datetime)):
+        return value.isoformat()
+    return str(value)
+
+
+def same_value(a, b) -> bool:
+    """Field equality across a date and its ISO string (the row vs the JSON snapshot)."""
+    return _norm(a) == _norm(b)
+
+
+def differs_from_snapshot(fields, snapshot, live) -> bool:
+    """S10/§5.2: has any field this apply touches moved since the run read it? A snapshot
+    without that field (or none at all) cannot prove it has not -- fail closed (True)."""
+    snap = snapshot if isinstance(snapshot, dict) else {}
+    return any(f not in snap or not same_value(snap[f], live.get(f)) for f in fields)
+
+
+def item_view(row):
+    """The live item's comparable fields for a stale response (None when there is none)."""
+    if row is None:
+        return None
+    return {f: _norm(row.get(f)) if f in ("deadline", "updated_at") else row.get(f)
+            for f in ITEM_VIEW_FIELDS}
+
+
 def shape_pack(pack, *, removed_refs, site_name, targets, applicable, viewer_id) -> dict:
     """The GET /action-packs/{id} body.
 

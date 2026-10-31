@@ -678,7 +678,7 @@ ACTION_PACK_REQUEST_PREFIX = "action_pack_requests/"
 ACTION_PACK_TASKS = ("action_pack_claim", "action_pack_heartbeat", "action_pack_store",
                      "action_pack_fail")
 _PACK_ROUTE_RE = re.compile(
-    r"^/action-packs(?:/([^/]+)(?:/(cancel|archive|export|actions/([^/]+)/(dismiss)"
+    r"^/action-packs(?:/([^/]+)(?:/(cancel|archive|export|actions/([^/]+)/(dismiss|apply)"
     r"|sources/([^/]+)/snapshot))?)?$")
 
 
@@ -704,7 +704,7 @@ def _pack_request_key(pack_id, suffix):
 def action_packs_route(conn, caller, sub, event, method, route):
     """Every /action-packs route. 404 exactly like an unknown route while ACTION_PACKS is
     off (or internal and the caller is not platform_admin), for a malformed id, and for a
-    pack this caller may not read. Task 7 adds `.../actions/{aid}/apply` next to dismiss."""
+    pack this caller may not read."""
     not_found = error("not found", 404)
     if not action_pack_view.route_allowed(caller):
         return not_found
@@ -741,6 +741,8 @@ def action_packs_route(conn, caller, sub, event, method, route):
         return not_found
     if action_verb == "dismiss":
         return dismiss_pack_action(conn, caller, pack_id, action_id, parse_body(event))
+    if action_verb == "apply":
+        return apply_pack_action(conn, caller, pack_id, action_id, parse_body(event))
     return not_found
 
 
@@ -1102,6 +1104,220 @@ def dismiss_pack_action(conn, caller, pack_id, action_id, body):
     logger.info("action pack action dismissed pack=%s action=%s by user=%s", pack_id,
                 action_id, caller["id"])
     return ok({"id": action_id, "state": value["state"]})
+
+
+# ---- apply (Task 7: spec §5, §14 S10/S11/S12/S15) ----
+# The only path where a pack changes real data. Human wins (A3): anything a person changed
+# since the run read the item makes the action `stale` and writes nothing to the item. The
+# ACL is the APPLIER's, evaluated now (A2). One savepoint per apply: the action row lock,
+# the source lock, the item write, its content_edits rows and the action's new state land
+# together or not at all.
+
+AGENT_TOPIC_KEY = "agent://action_pack/{}"
+_APPLY_LOCK_ROUNDS = 4
+_CREATE_FIELDS_VALIDATED = ("responsible", "deadline", "priority")
+
+
+class _ApplyRefused(Exception):
+    """An apply outcome that writes nothing (ACL, validation, illegal transition): raised
+    inside the apply savepoint so it rolls back, then answered as `response`."""
+
+    def __init__(self, response):
+        super().__init__("apply refused")
+        self.response = response
+
+
+def _stale_response(snapshot, live_view):
+    return ok({"error": "action is stale", "state": "stale", "live": live_view,
+               "snapshot": snapshot}, 409)
+
+
+def _set_action(conn, pack_id, action_id, caller, state, result, created_item_stable_id=None):
+    """set_action_state under the row lock apply already holds: anything but 'ok' is a bug."""
+    outcome, row = action_packs.set_action_state(
+        conn, pack_id, action_id, state, applied_by=caller["id"], applied_result=result,
+        created_item_stable_id=created_item_stable_id)
+    if outcome != "ok":
+        raise RuntimeError(f"action state write refused: {outcome}")
+    return row
+
+
+def _live_under_source_lock(conn, stable_id):
+    """The live row for `stable_id`, read AFTER taking the writer's per-source advisory lock
+    (S12): a re-extraction holding it finishes first. The row may have been superseded while
+    apply waited -- its successor carries the stable_id, possibly under another key (a group
+    pass), so the lock is taken for each key met until the key held is the row's own."""
+    live = action_items.get_live_by_stable_id(conn, stable_id)
+    held = set()
+    for _ in range(_APPLY_LOCK_ROUNDS):
+        if live is None:
+            return None
+        key = live.get("source_s3_key")
+        if key is None or key in held:
+            return live
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (key,))
+        held.add(key)
+        live = action_items.get_live_by_stable_id(conn, stable_id)
+    raise RuntimeError("the target's source key kept changing")
+
+
+def apply_pack_action(conn, caller, pack_id, action_id, body):
+    """POST /action-packs/{id}/actions/{aid}/apply, body {} or {"fields": {...}} (an edited
+    version; the edit is audited as the applier's).
+
+    Pack: readers only (404), ready (409), not archived (409); the action must be visible
+    (S13, 404), an apply type (drafts 409) and not `unsupported` (409); `weak` may be
+    applied one at a time. Company exit gate as every write. Then, under the action row's
+    lock: applied -> its stored result, writing nothing (200); dismissed -> 409; stale ->
+    409 {state, live, snapshot}; proposed / failed -> apply.
+
+    Responses: 200 {id, state: "applied", applied_result}; 409 {state: "stale", live,
+    snapshot} (the action is now stale, the item untouched); 4xx with the action unchanged;
+    500 {code} after an unexpected error, which rolls the apply back and marks the action
+    failed with {"error": <code>} (failed is retryable)."""
+    pack = action_packs.get_for_reader(conn, _pack_reader(conn, caller), pack_id)
+    if pack is None:
+        return error("not found", 404)
+    if pack.get("archived_at") is not None:
+        return error("pack is archived", 409)
+    if pack.get("state") != "ready":
+        return error("pack is not ready", 409, {"state": pack.get("state")})
+    removed = _ReaderVisibility(conn, caller).removed_refs(pack)
+    action = next((a for a in action_pack_view.visible_actions(pack.get("actions"), removed)
+                   if str(a["id"]) == action_id), None)
+    if action is None:
+        return error("action not found", 404)
+    atype = action.get("type")
+    if atype not in action_pack_view.APPLY_TYPES:
+        return error("this action has no apply", 409, {"type": atype})
+    if action.get("verifier") == "unsupported":
+        return error("an unsupported action cannot be applied", 409)
+    edits, err = action_pack_view.validate_apply_body(body, atype)
+    if err is not None:
+        return error(*err)
+    site = sites.get_site(conn, pack["site_id"])
+    if site is None:
+        return error("not found", 404)
+    refused = _write_refused(conn, caller, site["company_id"], where="action-pack-apply")
+    if refused is not None:
+        return refused
+    try:
+        with conn.transaction():
+            res = _apply_locked(conn, caller, pack, site, action_id, edits)
+    except _ApplyRefused as r:
+        logger.info("action pack apply refused pack=%s action=%s by user=%s status=%s",
+                    pack_id, action_id, caller["id"], r.response.get("statusCode"))
+        return r.response
+    except Exception as exc:  # noqa: BLE001 - rolled back above; recorded as a code
+        logger.error("action pack apply failed pack=%s action=%s (%s)", pack_id, action_id,
+                     type(exc).__name__)
+        action_packs.set_action_state(conn, pack_id, action_id, "failed",
+                                      applied_by=caller["id"],
+                                      applied_result={"error": "internal"})
+        return error("apply failed", 500, {"code": "internal"})
+    logger.info("action pack apply pack=%s action=%s by user=%s status=%s", pack_id,
+                action_id, caller["id"], res.get("statusCode"))
+    return res
+
+
+def _apply_locked(conn, caller, pack, site, action_id, edits):
+    """Everything after the action row lock, inside the apply savepoint."""
+    pack_id = str(pack["id"])
+    current = action_packs.lock_action(conn, pack_id, action_id)
+    if current is None:
+        raise _ApplyRefused(error("action not found", 404))
+    state = current["state"]
+    if state == "applied":                      # idempotent replay: the stored result
+        return ok({"id": action_id, "state": "applied",
+                   "applied_result": current.get("applied_result")})
+    if state == "stale":
+        return _stale_response(current.get("target_snapshot"),
+                               (current.get("applied_result") or {}).get("live"))
+    if state not in action_pack_view.APPLICABLE_STATES:
+        raise _ApplyRefused(error(f"action is {state}", 409, {"state": state}))
+    fields, err = action_pack_view.effective_fields(current, edits)
+    if err is not None:
+        raise _ApplyRefused(error(*err))
+    if current["type"] == "create_item":
+        return _apply_create(conn, caller, pack, site, current, fields)
+    return _apply_patch(conn, caller, pack, current, fields)
+
+
+def _apply_patch(conn, caller, pack, current, fields):
+    """close_item / update_item: the live row under the source lock, the applier's ACL,
+    noop, staleness (S10/S11), the S10 transition table, then PATCH's own write."""
+    pack_id, action_id = str(pack["id"]), str(current["id"])
+    snapshot = current.get("target_snapshot")
+    live = _live_under_source_lock(conn, current["target_stable_id"])
+    if live is None:                            # never guess another row (§3.3)
+        _set_action(conn, pack_id, action_id, caller, "stale", {"reason": "target_gone"})
+        return _stale_response(snapshot, None)
+    denied = _action_item_edit_denial(conn, caller, live)
+    if denied is not None:                      # the action stays as it was
+        raise _ApplyRefused(denied)
+    item_id = str(live["id"])
+    # noop FIRST: "someone already closed it by hand" leaves a content_edits row after
+    # as_of, which must read as done, not as a conflict (§5.2, S10).
+    if all(action_pack_view.same_value(live.get(f), v) for f, v in fields.items()):
+        result = {"noop": True, "action_item_id": item_id}
+        _set_action(conn, pack_id, action_id, caller, "applied", result)
+        return ok({"id": action_id, "state": "applied", "applied_result": result})
+    as_of = pack.get("as_of")
+    if (as_of is None
+            or action_pack_view.differs_from_snapshot(fields, snapshot, live)
+            or content_edits.count_item_edits_after(conn, live["stable_id"], as_of) > 0):
+        view = action_pack_view.item_view(live)
+        _set_action(conn, pack_id, action_id, caller, "stale",
+                    {"reason": "changed", "live": view})
+        return _stale_response(snapshot, view)
+    target = fields.get("status")
+    if (target is not None and not action_pack_view.same_value(live["status"], target)
+            and not action_pack_view.transition_allowed(live["status"], target)):
+        raise _ApplyRefused(error("status transition not allowed", 409,
+                                  {"from": live["status"], "to": target}))
+    _updated, edit_rows, err = _patch_action_item_row(conn, caller, live, live["id"], fields)
+    if err is not None:
+        raise _ApplyRefused(err)
+    result = {"action_item_id": item_id,
+              "content_edit_ids": [str(e["id"]) for e in edit_rows]}
+    _set_action(conn, pack_id, action_id, caller, "applied", result)
+    return ok({"id": action_id, "state": "applied", "applied_result": result})
+
+
+def _apply_create(conn, caller, pack, site, current, fields):
+    """create_item: the pack's synthetic topic (§3.4, one per pack, created at first apply),
+    the item, its task number, and a content_edits 'created' row naming the pack/action."""
+    pack_id, action_id = str(pack["id"]), str(current["id"])
+    named_site = (current.get("proposed") or {}).get("site_id")
+    if named_site is not None and str(named_site) != str(pack["site_id"]):
+        raise _ApplyRefused(error("the action names another site", 409,
+                                  {"code": "site_mismatch"}))
+    if not may_create_item_on_site(conn, caller, pack["site_id"]):
+        raise _ApplyRefused(error("admin/gm or this site's pm/site_manager only", 403))
+    extra = {k: fields[k] for k in _CREATE_FIELDS_VALIDATED if fields.get(k) is not None}
+    validated = {}
+    if extra:
+        validated, err = _validate_action_item_fields(
+            conn, {"company_id": site["company_id"], "site_id": pack["site_id"]}, extra)
+        if err is not None:
+            raise _ApplyRefused(err)
+    topic = topics.ensure_agent_topic(
+        conn, AGENT_TOPIC_KEY.format(pack_id), pack["site_id"],
+        pack.get("title") or "Action pack", nz_time.nz_today().isoformat(), caller["id"])
+    item = action_items.insert_item(
+        conn, topic["id"], pack["site_id"], fields["text"],
+        responsible=validated.get("responsible"), deadline=validated.get("deadline"),
+        priority=validated.get("priority"))
+    task_no = action_items.assign_task_no(conn, item["stable_id"], pack["site_id"])
+    edit = content_edits.append_content_edit(
+        conn, site["company_id"], "action_items", item["id"], "created", None,
+        json.dumps({"pack_id": pack_id, "action_id": action_id}),
+        caller["id"], caller["global_role"])
+    result = {"action_item_id": str(item["id"]), "task_no": task_no,
+              "content_edit_ids": [str(edit["id"])]}
+    _set_action(conn, pack_id, action_id, caller, "applied", result,
+                created_item_stable_id=item["stable_id"])
+    return ok({"id": action_id, "state": "applied", "applied_result": result})
 
 
 # ---- internal tasks (the ActionAgent worker, RequestResponse) ----
@@ -8369,22 +8585,32 @@ def _action_item_edit_acl(conn, caller, action_item_id):
     may_create_item_on_site mirrors it (minus the assignee tier) for create_item: change
     the tiers in both."""
     row = action_items.get_action_item(conn, action_item_id)
+    denied = _action_item_edit_denial(conn, caller, row)
+    return (None, denied) if denied is not None else (row, None)
+
+
+def _action_item_edit_denial(conn, caller, row):
+    """The predicate behind _action_item_edit_acl, on a row already in hand: None when the
+    caller may edit it, else the error response. `row` needs company_id, site_id,
+    responsible and topic_user_id (get_action_item's and get_live_by_stable_id's shapes);
+    None is "not found". Action-pack apply (Task 7) calls this on the live row it read under
+    the source lock, so it never goes through get_action_item's rollback-on-error path."""
     # platform_admin (is_cross_company) edits across every tenant; company roles
     # stay pinned to their own company (mirrors the Team/sites fix in #96).
     cross = is_cross_company(caller["global_role"])
     if row is None or (not cross and not _row_company_ok(
             conn, caller, row["company_id"], row["site_id"])):
-        return None, error("action item not found", 404)            # incl. cross-company
+        return error("action item not found", 404)                  # incl. cross-company
     site_id = str(row["site_id"])
     if site_id not in _allowed_site_ids(conn, caller):
-        return None, error("access denied to this task's site", 403)  # reach gate
+        return error("access denied to this task's site", 403)      # reach gate
     site_role = memberships.caller_site_roles(conn, caller["id"]).get(site_id)
     is_admin = _is_company_admin_of(caller, row["company_id"], cross)
     is_site_authority = site_role in ("pm", "site_manager")
     is_assignee = _is_assignee(row, caller)
     if not (is_admin or is_site_authority or is_assignee):
-        return None, error("admin/gm, this site's pm/site_manager, or the assignee only", 403)
-    return row, None
+        return error("admin/gm, this site's pm/site_manager, or the assignee only", 403)
+    return None
 
 
 class _SuggestionNotApplied(Exception):
@@ -8451,35 +8677,62 @@ def patch_action_item(conn, caller, action_item_id, body):
     row, denied = _action_item_edit_acl(conn, caller, action_item_id)
     if denied is not None:
         return denied
-    site_id = str(row["site_id"])
+    updated, _edits, err = _patch_action_item_row(conn, caller, row, action_item_id, body)
+    if err is not None:
+        return err
+    # ADDITIVE (action packs spec §14 D1): the item's per-site task number, null when none.
+    updated["task_no"] = _task_numbers(conn, [updated["id"]]).get(str(updated["id"]))
+    # ADDITIVE (D2): the parent topic's source, from the ACL read above -- no extra query.
+    updated["source"] = row.get("topic_source")
+    return ok(updated)
 
+
+def _validate_action_item_fields(conn, row, body):
+    """PATCH's field validation, shared with action-pack apply: `(fields, None)` or
+    `(None, error_response)`. `row` supplies company_id and site_id (the `responsible`
+    must be a members_for_site display name of THAT site). `deadline` also sets its
+    free-text mirror `deadline_text`. An empty result is refused ("no editable fields")."""
+    site_id = str(row["site_id"])
     fields = {}
     if "priority" in body:
         if body["priority"] not in ALLOWED_ACTION_PRIORITY:
-            return error(f"priority must be one of {sorted(ALLOWED_ACTION_PRIORITY)}", 400)
+            return None, error(f"priority must be one of {sorted(ALLOWED_ACTION_PRIORITY)}", 400)
         fields["priority"] = body["priority"]
     if "status" in body:
         if body["status"] not in ALLOWED_ACTION_STATUS:
-            return error(f"status must be one of {sorted(ALLOWED_ACTION_STATUS)}", 400)
+            return None, error(f"status must be one of {sorted(ALLOWED_ACTION_STATUS)}", 400)
         fields["status"] = body["status"]
     if "deadline" in body:
         dl = body["deadline"]
         if dl is not None and not (isinstance(dl, str) and REPORT_DATE_RE.match(dl)):
-            return error("deadline must be YYYY-MM-DD or null", 400)
+            return None, error("deadline must be YYYY-MM-DD or null", 400)
         fields["deadline"] = dl                               # write both so the
         fields["deadline_text"] = dl                          # date + free-text mirror agree (§3.5)
     if "responsible" in body:
         target = body["responsible"]
         if not isinstance(target, str) or not target.strip():
-            return error("responsible must be a non-empty display name", 400)
+            return None, error("responsible must be a non-empty display name", 400)
         target = target.strip()
         member_names = {" ".join(p for p in (m.get("first_name"), m.get("last_name")) if p).strip()
                         for m in memberships.members_for_site(conn, row["company_id"], site_id)}
         if target not in member_names:
-            return error("assignee must be a member of this site", 400)
+            return None, error("assignee must be a member of this site", 400)
         fields["responsible"] = target
     if not fields:
-        return error("no editable fields provided", 400)
+        return None, error("no editable fields provided", 400)
+    return fields, None
+
+
+def _patch_action_item_row(conn, caller, row, action_item_id, body):
+    """The write half of PATCH /action-items/{id}, shared with action-pack apply (Task 7):
+    validate `body` (_validate_action_item_fields), then the UPDATE and one content_edits
+    row per field that actually changes, in ONE savepoint, actor = `caller`. `row` is the
+    PRE-update row the caller already authorised (_action_item_edit_denial). Returns
+    `(updated_row, [content_edit rows], None)` or `(None, None, error_response)`; nothing
+    is written on an error."""
+    fields, err = _validate_action_item_fields(conn, row, body)
+    if err is not None:
+        return None, None, err
 
     # Before/after come from the PRE-update row read above, one audit row per
     # field that ACTUALLY changes -- re-ticking an already-done task, or
@@ -8492,6 +8745,7 @@ def patch_action_item(conn, caller, action_item_id, body):
         if before != after:
             audits.append((col, before, after))
 
+    edits = []
     try:
         with conn.transaction():          # UPDATE + audit rows commit together
             updated = action_items.update_action_item_fields(
@@ -8499,16 +8753,12 @@ def patch_action_item(conn, caller, action_item_id, body):
             if updated is None:
                 raise _ActionItemVanished(action_item_id)
             for col, before, after in audits:
-                content_edits.append_content_edit(
+                edits.append(content_edits.append_content_edit(
                     conn, row["company_id"], "action_items", action_item_id,
-                    col, before, after, caller["id"], caller["global_role"])
+                    col, before, after, caller["id"], caller["global_role"]))
     except _ActionItemVanished:
-        return error("action item not found", 404)
-    # ADDITIVE (action packs spec §14 D1): the item's per-site task number, null when none.
-    updated["task_no"] = _task_numbers(conn, [updated["id"]]).get(str(updated["id"]))
-    # ADDITIVE (D2): the parent topic's source, from the ACL read above -- no extra query.
-    updated["source"] = row.get("topic_source")
-    return ok(updated)
+        return None, None, error("action item not found", 404)
+    return updated, edits, None
 
 
 class _QuestionVanished(Exception):

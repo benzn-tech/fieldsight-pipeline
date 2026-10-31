@@ -141,6 +141,21 @@ def update_action_item_fields(conn, action_item_id, fields, updated_by) -> dict 
         return None
 
 
+def insert_item(conn, topic_id, site_id, text, *, responsible=None, deadline=None,
+                priority=None) -> dict:
+    """One new open action item under `topic_id` (action-pack create_item, spec §5.1).
+    `deadline_text` mirrors `deadline`, as PATCH writes it. Returns id, stable_id (the
+    database's) and the written fields. No updated_by: the create is audited by the caller's
+    content_edits 'created' row, not as a later human edit."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "INSERT INTO action_items (topic_id, site_id, text, responsible, deadline, "
+        "deadline_text, priority, status) VALUES (%s,%s,%s,%s,%s,%s,%s,'open') "
+        "RETURNING id, stable_id, topic_id, site_id, text, responsible, deadline, priority, "
+        "status",
+        (topic_id, site_id, text, responsible, deadline, deadline, priority),
+    ).fetchone()
+
+
 def _as_uuid(value):
     """`value` as a uuid.UUID, or None when it is not one (None, '', '69', 'abc')."""
     if isinstance(value, uuid.UUID):

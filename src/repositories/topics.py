@@ -162,6 +162,29 @@ def ensure_placeholder_topic(conn, site_id, report_date, title, *, user_id, sour
                         source_s3_key=source_s3_key, time_range=time_range)
 
 
+def ensure_agent_topic(conn, source_s3_key, site_id, title, report_date, user_id) -> dict:
+    """An action pack's synthetic parent topic (spec §3.4): the VISIBLE topic carrying
+    `source_s3_key` ('agent://action_pack/<pack_id>'), or a new one with source='agent'.
+    Takes the per-key advisory lock first (the same lock item-writer takes for a source),
+    so two concurrent creates from one pack cannot both insert. An existing topic is
+    returned as it is: title/date/user are the FIRST apply's. Re-extraction never matches
+    this key -- every supersede/delete path keys on an extraction or report key."""
+    conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (source_s3_key,))
+    cur = conn.cursor(row_factory=dict_row)
+    present = cur.execute(
+        f"SELECT {_TOPIC_COLS} FROM topics t WHERE t.source_s3_key = %s "
+        f"AND {visible_topics_predicate('t')} ORDER BY t.created_at LIMIT 1",
+        (source_s3_key,),
+    ).fetchone()
+    if present is not None:
+        return present
+    return cur.execute(
+        f"INSERT INTO topics (site_id, user_id, source_s3_key, report_date, title, source) "
+        f"VALUES (%s,%s,%s,%s,%s,'agent') RETURNING {_TOPIC_COLS}",
+        (site_id, user_id, source_s3_key, report_date, title),
+    ).fetchone()
+
+
 # CHILD_OF_VISIBLE_TOPIC now lives in deleted_predicates (Track B Task 2): it grew a
 # supersession arm alongside its deletion arm, and every other shared predicate already
 # lives there so the two do not drift apart. Kept importable from this module under its
