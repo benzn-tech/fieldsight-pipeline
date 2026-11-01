@@ -22,6 +22,8 @@ An expected action has an `id` (unique within its instruction) and a `type` from
   only shows `target_task_no` while the reader can see the item.
 - **create / draft / note:** set `match_hint`, the text the annotator matches a proposal
   against.
+- **One type per target.** Two expectations of the same type on the same item (by stable id
+  or by task number) are an error: one action fills one expectation.
 - **`fields`:** optional on any type. It is documentation for the annotator and is not scored.
 
 Validation:
@@ -37,9 +39,10 @@ Validation:
  "packs": [{"gold_id": "G1", "pack_id": "<uuid>", "pack": {...}, "error": null}]}
 ```
 
-- **`pack`** is the body of `GET /api/org/action-packs/{id}`, plus `run_trace` and `models`
-  when they have been attached with `attach-traces`. It is `null` when no finished pack
-  exists; that instruction's expectations then count as missed.
+- **`pack`** is the body of `GET /api/org/action-packs/{id}`. That body includes `run_trace`
+  (its counts-shaped keys) and `models` (ids). For packs recorded before GET returned them,
+  `attach-traces` adds them. `pack` is `null` when no finished pack exists; that
+  instruction's expectations then count as missed.
 - **`error`** is one of `site_unresolved`, `post_<status>`, `get_<status>` or `timeout`.
   A timeout row carries `client_elapsed_s`.
 - **`inputs_sha256`** hashes what `submit` sent: each instruction's id, site and text.
@@ -126,11 +129,16 @@ update action was shown.
 
 ### Recall
 
-An expected action is matched in one of two ways:
+Matching is **one-to-one**: an action fills at most one expectation.
 
-- **close / update:** automatically, by type plus target.
-- **create, draft or note:** only by the annotator's `matches_expected` on an action of the
-  same type.
+1. Every annotator match (`matches_expected`) is honoured first. It must still have the
+   right type and, for close/update, the right target.
+2. Then, in gold order, each open close/update expectation takes the first unused action of
+   its type on its target.
+
+A create, draft or note expectation is matched only through step 1. An action that is a
+wrong target (on `must_not_touch`, or matched to an expectation on another item) never
+counts toward recall.
 
 The gate counts matches among shown actions. The raw figure also counts the stored
 unsupported actions.
@@ -156,8 +164,14 @@ Latency covers ready and failed packs. Two measures are kept:
 
 The gate uses end-to-end, and falls back per pack to worker time when the timestamps are
 missing. A `timeout` row enters the gate as its `client_elapsed_s`, a censored lower bound,
-so the slowest instructions stay in the tail. The p50 and p90 use the nearest rank. The verdict is `insufficient` with fewer than
-`latency_min_n` packs (default 20).
+so the slowest instructions stay in the tail. These are counted in `sources` but have no
+latency:
+
+- rows without a pack (`no_pack`: `site_unresolved`, `post_*` / `get_*` errors);
+- packs not finished at fetch time (`unfinished`).
+
+The p50 and p90 use the nearest rank. The verdict is `insufficient` with fewer than
+`latency_min_n` values; that minimum defaults to ceil(0.8 × gold size).
 
 ### Cost
 
@@ -180,6 +194,9 @@ undefined: no pairs, or chance agreement equal to 1.
 
 `compare` takes the report.json files from the scored runs:
 
+- **Identity:** every report needs a `run_id`, a `pack_ids_sha256` (a hash of its recorded
+  pack ids) and a `submitted_inputs_sha256`. A repeated run id, or two reports with the same
+  pack ids, is refused: a run passed twice, or a copied report, would give a floor of 0.
 - **Floor:** for each headline metric, the spread (max − min) across the baseline runs. There
   must be at least two baseline runs, and they must share the config label. Every compared
   report, baseline or variant, must share the gold set (sha256) and the submitted inputs.

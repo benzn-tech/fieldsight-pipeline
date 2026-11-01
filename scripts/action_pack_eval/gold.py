@@ -120,7 +120,7 @@ def validate_gold(entries):
 def _validate_expected(where, expected):
     if not isinstance(expected, list):
         return [f"{where}: expected_actions must be a list"]
-    errors, ids = [], set()
+    errors, ids, targets = [], set(), set()
     for x in expected:
         if not isinstance(x, dict) or not _nonempty_str(x.get("id")):
             errors.append(f"{where}: every expected action needs an id")
@@ -135,6 +135,14 @@ def _validate_expected(where, expected):
             if not (_nonempty_str(x.get("target_stable_id"))
                     or _is_task_no(x.get("target_task_no"))):
                 errors.append(f"{w}: a close/update needs target_stable_id or target_task_no")
+            # One action fills one expectation (metrics._match_entry): two expectations of
+            # one type on one item could never both be met.
+            for t in (("sid", x.get("target_stable_id")), ("no", x.get("target_task_no"))):
+                if t[1] is None:
+                    continue
+                if (x["type"],) + t in targets:
+                    errors.append(f"{w}: duplicate expected target ({x['type']} on {t[1]})")
+                targets.add((x["type"],) + t)
         elif not _nonempty_str(x.get("match_hint")):
             errors.append(f"{w}: a {x['type']} needs a match_hint for the annotator")
         if "fields" in x and not isinstance(x["fields"], dict):

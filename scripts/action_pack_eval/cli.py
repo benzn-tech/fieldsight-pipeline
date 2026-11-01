@@ -66,7 +66,14 @@ def cmd_score(args):
     sha = gold_mod.gold_sha256(args.gold)
     run = runs_mod.load_run(args.run)
     warnings = list(warnings)
-    if run.get("inputs_sha256") and run["inputs_sha256"] != gold_mod.inputs_sha256(gold):
+    if not run.get("inputs_sha256"):
+        if not args.allow_legacy:
+            raise SystemExit("the run has no inputs_sha256 (not recorded by submit), so it "
+                             "cannot be shown to come from this gold set; pass "
+                             "--allow-legacy to score it anyway")
+        warnings.append("legacy run without inputs_sha256: scored with --allow-legacy, and "
+                        "compare will refuse it")
+    elif run["inputs_sha256"] != gold_mod.inputs_sha256(gold):
         raise SystemExit("the run was submitted from different instructions than this gold "
                          "set (id/site/instruction changed); score it against the gold file "
                          "it was submitted from")
@@ -148,7 +155,7 @@ def cmd_submit(args):
                       client=live.urllib_client(timeout=30), site_map=site_map,
                       sleep=live.time.sleep, clock=live.time.monotonic, poll_s=args.poll_s,
                       max_wait_s=args.max_wait_s, config_label=args.config_label,
-                      run_id=args.run_id or Path(dest).stem,
+                      run_id=args.run_id or Path(dest).parent.name,
                       gold_sha256=gold_mod.gold_sha256(args.gold),
                       inputs_sha256=gold_mod.inputs_sha256(gold))
     paths.write_json(dest, run)
@@ -183,6 +190,8 @@ def build_parser():
     s.add_argument("--second", help="second annotator's labels (the blind subset)")
     s.add_argument("--prices", help="price table JSON; without it cost is tokens only")
     s.add_argument("--thresholds", help="JSON overriding metrics.DEFAULT_THRESHOLDS keys")
+    s.add_argument("--allow-legacy", action="store_true",
+                   help="score a run that carries no inputs_sha256 (compare will refuse it)")
     s.add_argument("--out", required=True)
     s.set_defaults(fn=cmd_score)
 
@@ -219,7 +228,7 @@ def build_parser():
     s.add_argument("--base-url", required=True, help="TEST org-api base, ending /api/org")
     s.add_argument("--site-map", help="JSON {site name: TEST site uuid}")
     s.add_argument("--config-label", default="baseline")
-    s.add_argument("--run-id")
+    s.add_argument("--run-id", help="default: the name of the directory --out is in")
     s.add_argument("--poll-s", type=float, default=15)
     s.add_argument("--max-wait-s", type=float, default=900)
     s.add_argument("--out", required=True)

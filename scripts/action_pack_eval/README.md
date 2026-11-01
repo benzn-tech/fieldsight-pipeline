@@ -54,7 +54,7 @@ Default thresholds (spec §8.3; the owner may tighten them):
 | Fabrication of shown elements | ≤ 5% |
 | Wrong target (shown) | 0 |
 | Recall | ≥ 60% |
-| Latency p90 | ≤ 300 s, measured on at least 20 finished packs |
+| Latency p90 | ≤ 300 s, measured on at least ceil(0.8 × gold size) instructions |
 
 "Uncertain" honesty, cost and agreement are reported without a gate.
 
@@ -65,7 +65,9 @@ Default thresholds (spec §8.3; the owner may tighten them):
 2. Set `ACTION_PACKS=internal` on TEST (§9 step 2).
 3. Put a TEST platform_admin's Cognito id token in `ACTION_PACK_EVAL_TOKEN`. If any gold
    `site` is a name rather than a uuid, write a `{name: uuid}` file for `--site-map`.
-4. Submit. Packs run one at a time, because org-api allows one active pack per creator:
+4. Submit. Packs run one at a time, because org-api allows one active pack per creator.
+   The run id defaults to the directory `--out` is in (`base1` below); every run needs its
+   own directory:
    ```bash
    $PY -m scripts.action_pack_eval.cli submit --gold action_pack_eval_runs/gold.json \
        --base-url https://<TEST api>/api/org --site-map action_pack_eval_runs/sites.json \
@@ -73,19 +75,9 @@ Default thresholds (spec §8.3; the owner may tighten them):
    ```
    Re-run `fetch --run ... --out ...` to refresh the packs later. Score before anyone applies
    or archives an action: `updated_at` is the end-to-end latency clock.
-5. Attach `run_trace` and `models`. **GET does not return them** (`action_pack_view.shape_pack`),
-   so export them read-only from TEST's `action_packs` table, one JSON object per line:
-   ```bash
-   psql "$TEST_DATABASE_URL" -At -c "SELECT json_build_object('id', id, 'run_trace',
-     run_trace, 'models', models) FROM action_packs
-     WHERE id = ANY('{<pack uuid>,<pack uuid>}'::uuid[])" > action_pack_eval_runs/base1/traces.jsonl
-   ```
-   ```bash
-   $PY -m scripts.action_pack_eval.cli attach-traces --run action_pack_eval_runs/base1/run.json \
-       --traces action_pack_eval_runs/base1/traces.jsonl --out action_pack_eval_runs/base1/run.json
-   ```
-   Without traces, latency falls back to timestamps only, and cost and the verifier-drop
-   counts read as n/a or 0.
+5. `run_trace` (its counts-shaped keys) and `models` come back on GET, so `submit` and
+   `fetch` record them with each pack. `attach-traces` remains only for packs recorded before
+   GET carried them: it takes an export of `{"id", "run_trace", "models"}` rows, one per line.
 6. Label every stored element (SCHEMA.md). Make the blind subset and give it to a second
    annotator who has not seen the packs.
 7. Score the run with `--second`, and with `--prices <price file>`. The price file holds
@@ -103,10 +95,12 @@ Default thresholds (spec §8.3; the owner may tighten them):
   lines the verifier rejected are not, so nobody can label them. The report counts them from
   `run_trace.verify` and also gives a raw upper bound that counts each one as a fabrication.
 - **Two-run floor.** A noise floor from two runs is a minimum bar, not a confidence interval.
-- **Latency minimum.** `latency_min_n` defaults to 20, the gold minimum. With exactly 20
-  instructions, a single entry that never produced a pack (`site_unresolved`, `post_4xx`)
-  leaves the latency gate `insufficient` unless `--thresholds` lowers it. Timed-out
-  instructions are not dropped: each one enters the gate as a censored value equal to its
-  client-side wait.
-- **409 at submit.** `submit` does not retry a 409. Make sure no pack of the token's user is
-  queued or running before a run starts; otherwise every POST gets `post_409`.
+- **Latency minimum.** `latency_min_n` defaults to ceil(0.8 × the gold set's size), so a
+  few instructions without a pack still leave the gate measured. Rows without a pack, and
+  packs not finished at fetch time, are counted in `sources`, not dropped. Timed-out
+  instructions enter the gate as a censored value equal to their client-side wait.
+- **409 at submit.** When the token's user already has a pack queued or running, `submit`
+  waits it out: it retries the POST every `--poll-s` seconds, up to `--max-wait-s`, before
+  recording `post_409`.
+- **Legacy runs.** `score` refuses a run without `inputs_sha256` unless you pass
+  `--allow-legacy`. `compare` always refuses such a report.

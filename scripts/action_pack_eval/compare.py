@@ -30,6 +30,20 @@ def compare(baseline, variants) -> dict:
     if len(baseline) < 2:
         raise CompareRefused("the noise floor needs at least two baseline runs of the same "
                              "gold set and config (spec §8.4)")
+    everything = list(baseline) + list(variants)
+    for field, what in (("run_id", "a run id"), ("pack_ids_sha256", "a pack-id hash"),
+                        ("submitted_inputs_sha256", "a submitted-inputs hash")):
+        if any(not r.get(field) for r in everything):
+            raise CompareRefused(f"every report needs {what} ({field}); re-score the runs "
+                                 "with the current harness")
+    run_ids = [r["run_id"] for r in everything]
+    if len(set(run_ids)) != len(run_ids):
+        raise CompareRefused(f"the same run is passed more than once: {sorted(run_ids)}; a "
+                             "floor from one run measured twice is 0 by construction")
+    packs = [r["pack_ids_sha256"] for r in everything]
+    if len(set(packs)) != len(packs):
+        raise CompareRefused("two reports scored the same packs (equal pack_ids_sha256): "
+                             "a copied report is not a second run")
     shas = {r.get("gold_sha256") for r in list(baseline) + list(variants)}
     if len(shas) != 1 or None in shas:
         raise CompareRefused(f"runs are scored against different gold sets: {sorted(map(str, shas))}")

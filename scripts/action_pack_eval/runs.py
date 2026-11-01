@@ -1,16 +1,16 @@
 """A recorded run: the packs one pass over the gold set produced (SCHEMA.md).
 
-    {"run_id": str, "config_label": str, "gold_sha256": str?,
-     "packs": [{"gold_id": "G1", "pack": <GET /api/org/action-packs/{id} body
-                                         + optional "run_trace" and "models">,
-                "error": str?, "http_status": int?, "submitted_at": str?}]}
+    {"run_id": str, "config_label": str, "gold_sha256": str?, "inputs_sha256": str?,
+     "packs": [{"gold_id": "G1", "pack_id": str?,
+                "pack": <GET /api/org/action-packs/{id} body, incl. run_trace and models>,
+                "error": str?, "http_status": int?, "client_elapsed_s": float?,
+                "conflict_retries": int?}]}
 
 `pack` is null when the instruction never produced a pack (site unresolved, POST refused,
 timeout): its expected actions then count as missed.
 
-GET does not return run_trace or models (action_pack_view.shape_pack), so latency's worker
-time and cost come from `attach_traces` with rows exported from TEST's action_packs table
-(README: after-merge steps).
+GET returns run_trace (counts-shaped keys) and models (action_pack_view.shape_pack);
+`attach_traces` is only for packs recorded before it did.
 
 Elements. Every stored conclusion line and action is one element, keyed
 "conclusion:<index in the stored list>" or "action:<seq>". An element is SHOWN unless it is
@@ -20,6 +20,8 @@ labelled; they are counted from run_trace.verify instead (metrics.score_fabricat
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 
 from scripts.action_pack_eval import paths
 
@@ -29,6 +31,17 @@ def load_run(path) -> dict:
     if not isinstance(run, dict) or not isinstance(run.get("packs"), list):
         raise SystemExit(f"{path}: a run is an object with a 'packs' list")
     return run
+
+
+def pack_ids_sha256(run):
+    """Hash of the run's recorded pack ids (sorted): two reports with the same hash scored
+    the SAME packs, so they cannot be two runs of a noise floor. None when no pack exists."""
+    ids = sorted(str((r.get("pack") or {}).get("id") or r.get("pack_id"))
+                 for r in run.get("packs") or []
+                 if (r.get("pack") or {}).get("id") or r.get("pack_id"))
+    if not ids:
+        return None
+    return hashlib.sha256(json.dumps(ids).encode("utf-8")).hexdigest()
 
 
 def is_shown(element) -> bool:

@@ -158,7 +158,9 @@ def test_report_gates_fail_on_the_example():
     assert rep["gates"]["fabrication"]["verdict"] == "fail"
     assert rep["gates"]["wrong_target"]["verdict"] == "fail"
     assert rep["gates"]["recall"]["verdict"] == "pass"
-    assert rep["gates"]["latency_p90"]["verdict"] == "insufficient"     # n 3 < 20
+    # min_n = ceil(0.8 x 3 instructions) = 3 -> measured; p90 400 s > 300 s.
+    assert rep["thresholds"]["latency_min_n"] == 3
+    assert rep["gates"]["latency_p90"]["verdict"] == "fail"
     assert rep["overall"] == "fail"
     assert rep["gold_sha256"] == "abc" and rep["config_label"] == "baseline"
 
@@ -191,12 +193,17 @@ def test_report_carries_agreement_when_a_second_file_is_given():
 
 # ---------------------------------------------------------------- noise floor
 
+_IDS = iter(range(10_000))
+
+
 def _summary(label="baseline", sha="abc", **m):
+    n = next(_IDS)
     base = {"fabrication_shown_rate": 0.04, "fabrication_raw_rate": 0.10,
             "wrong_target_rate": 0.0, "recall": 0.70, "uncertain_honesty": 0.8,
             "latency_p50_s": 100.0, "latency_p90_s": 200.0, "cost_mean": 0.20}
     base.update(m)
-    return {"run_id": label + str(m), "config_label": label, "gold_sha256": sha,
+    return {"run_id": f"run{n}", "config_label": label, "gold_sha256": sha,
+            "submitted_inputs_sha256": "inputs", "pack_ids_sha256": f"packs{n}",
             "headline": base}
 
 
@@ -521,3 +528,130 @@ def test_cli_fetch_uses_the_client_factory(monkeypatch, runs_dir, no_sockets, tm
                      "--out", str(out)]) == 0
     assert [c[:2] for c in api.calls] == [("GET", f"https://t/api/org/action-packs/{S}f1")]
     assert json.loads(out.read_text(encoding="utf-8"))["packs"][0]["pack"]["state"] == "ready"
+
+
+# ---------------------------------------------------------------- fix round 2
+
+def test_compare_refuses_the_same_run_passed_twice_as_its_own_floor():
+    r = _summary(recall=0.6)
+    with pytest.raises(compare_mod.CompareRefused, match="same run"):
+        compare_mod.compare([r, r], [_summary("v", recall=0.9)])
+
+
+def test_compare_refuses_a_copied_report_under_a_new_run_id():
+    a = _summary(recall=0.6)
+    b = dict(a, run_id="renamed")
+    with pytest.raises(compare_mod.CompareRefused, match="same packs"):
+        compare_mod.compare([a, b], [])
+
+
+def test_compare_refuses_a_variant_that_is_a_baseline_run():
+    a, b = _summary(recall=0.6), _summary(recall=0.7)
+    v = dict(a, run_id="v1", config_label="v")
+    with pytest.raises(compare_mod.CompareRefused, match="same packs"):
+        compare_mod.compare([a, b], [v])
+
+
+@pytest.mark.parametrize("k", ["run_id", "pack_ids_sha256", "submitted_inputs_sha256"])
+def test_compare_refuses_reports_without_identities_or_inputs_hash(k):
+    a, b = _summary(recall=0.6), _summary(recall=0.7)
+    with pytest.raises(compare_mod.CompareRefused):
+        compare_mod.compare([dict(a, **{k: None}), dict(b, **{k: None})], [])
+
+
+def test_report_carries_a_hash_of_the_recorded_pack_ids():
+    rep = _report()
+    run = runs_mod.load_run(EX / "run_a.json")
+    assert rep["pack_ids_sha256"] == runs_mod.pack_ids_sha256(run)
+    run["packs"][0]["pack"]["id"] = "00000000-0000-4000-8000-0000000000ff"
+    assert runs_mod.pack_ids_sha256(run) != rep["pack_ids_sha256"]
+
+
+def test_score_refuses_a_run_without_an_inputs_hash_unless_legacy(runs_dir, tmp_path):
+    run = runs_mod.load_run(EX / "run_a.json")
+    run.pop("inputs_sha256")
+    rp = tmp_path / "run.json"
+    rp.write_text(json.dumps(run), encoding="utf-8")
+    args = ["score", "--gold", str(EX / "gold.json"), "--run", str(rp),
+            "--annotations", str(EX / "annotations_a.jsonl"), "--out", str(runs_dir / "x")]
+    with pytest.raises(SystemExit, match="allow-legacy"):
+        cli.main(args)
+    cli.main(args + ["--allow-legacy"])
+    rep = json.loads((runs_dir / "x" / "report.json").read_text(encoding="utf-8"))
+    assert rep["submitted_inputs_sha256"] is None
+    assert any("legacy" in w for w in rep["warnings"])
+
+
+def test_gold_rejects_two_expectations_of_one_type_on_one_target():
+    g = _full_gold()
+    g[0]["expected_actions"] = [
+        {"id": "e1", "type": "close_item", "target_stable_id": "X"},
+        {"id": "e2", "type": "close_item", "target_stable_id": "X"}]
+    errors, _ = gold_mod.validate_gold(g)
+    assert any("duplicate expected target" in e for e in errors)
+    g[0]["expected_actions"][1]["type"] = "update_item"      # close + update on X: fine
+    assert gold_mod.validate_gold(g)[0] == []
+
+
+def test_submit_waits_out_a_409_then_retries(no_sockets):
+    class Busy(FakeApi):
+        """The caller already has a pack running when the eval starts; it finishes after
+        two more POST attempts."""
+        def __init__(self):
+            super().__init__()
+            self.busy = 2
+
+        def __call__(self, method, url, headers, body):
+            if method == "POST" and self.busy:
+                self.busy -= 1
+                self.calls.append((method, url, dict(headers), body))
+                return 409, {"error": "you already have a pack in progress"}
+            return super().__call__(method, url, headers, body)
+    gold = gold_mod.load_gold(EX / "gold.json")[:1]
+    slept = []
+    api = Busy()
+    run = live.submit(gold, base_url="https://t/api/org", token="tok", client=api,
+                      site_map={}, sleep=slept.append,
+                      clock=iter(range(0, 10_000, 5)).__next__, poll_s=3, max_wait_s=600)
+    assert run["packs"][0]["pack"]["state"] == "ready"
+    assert run["packs"][0]["conflict_retries"] == 2
+    assert [c[0] for c in api.calls][:3] == ["POST", "POST", "POST"]
+    assert slept[:2] == [3, 3]
+
+
+def test_submit_gives_up_on_a_409_after_max_wait(no_sockets):
+    class AlwaysBusy(FakeApi):
+        def __call__(self, method, url, headers, body):
+            self.calls.append((method, url, dict(headers), body))
+            return 409, {"error": "you already have a pack in progress"}
+    gold = gold_mod.load_gold(EX / "gold.json")[:2]
+    api = AlwaysBusy()
+    run = live.submit(gold, base_url="https://t/api/org", token="tok", client=api,
+                      site_map={"Example Site B": "00000000-0000-4000-8000-00000000a002"},
+                      sleep=lambda s: None, clock=iter(range(0, 10_000, 50)).__next__,
+                      poll_s=1, max_wait_s=120)
+    assert [p["error"] for p in run["packs"]] == ["post_409", "post_409"]
+    assert len(api.calls) < 20                              # bounded
+
+
+def test_cli_submit_defaults_the_run_id_to_the_run_directory(monkeypatch, runs_dir,
+                                                             no_sockets):
+    api = FakeApi()
+    monkeypatch.setenv("ACTION_PACK_EVAL_TOKEN", "tok")
+    monkeypatch.setattr(live, "urllib_client", lambda timeout: api)
+    out = runs_dir / "base1" / "run.json"
+    assert cli.main(["submit", "--gold", str(EX / "gold.json"), "--base-url",
+                     "https://t/api/org", "--poll-s", "0", "--out", str(out)]) == 0
+    run = json.loads(out.read_text(encoding="utf-8"))
+    assert run["run_id"] == "base1"
+    assert run["inputs_sha256"] == gold_mod.inputs_sha256(gold_mod.load_gold(EX / "gold.json"))
+
+
+def test_fetch_takes_run_trace_and_models_from_get(no_sockets):
+    api = FakeApi()
+    api.packs = {f"{S}f1": {"id": f"{S}f1", "state": "ready", "run_trace": {"tokens": 9},
+                            "models": {"writer": "m"}}}
+    prior = {"run_id": "r", "packs": [{"gold_id": "G1", "pack_id": f"{S}f1", "pack": None}]}
+    run = live.fetch(prior, base_url="https://t/api/org", token="tok", client=api)
+    assert run["packs"][0]["pack"]["run_trace"] == {"tokens": 9}
+    assert run["packs"][0]["pack"]["models"] == {"writer": "m"}

@@ -20,10 +20,11 @@ PASS, FAIL, INSUFFICIENT, REPORT_ONLY = "pass", "fail", "insufficient", "report_
 _EPS = 1e-12
 
 # Spec §8.3 (the builder's call; the owner may tighten). latency_min_n: below this many
-# finished packs a p90 is not a measurement (memory: n <= 8 cannot see a tail); 20 = the gold
-# set's minimum size.
+# measured instructions a p90 is not a measurement (memory: n <= 8 cannot see a tail).
+# None = ceil(0.8 x the gold set's size) (controller ruling), resolved by resolve_thresholds.
 DEFAULT_THRESHOLDS = {"fabrication_shown_max": 0.05, "wrong_target_max": 0,
-                      "recall_min": 0.60, "latency_p90_max_s": 300, "latency_min_n": 20}
+                      "recall_min": 0.60, "latency_p90_max_s": 300, "latency_min_n": None}
+LATENCY_MIN_SHARE = 0.8
 FINISHED_STATES = ("ready", "failed")
 
 
@@ -39,9 +40,20 @@ def load_thresholds(path=None) -> dict:
     for k in DEFAULT_THRESHOLDS:
         if k in data:
             v = data[k]
+            if v is None and k == "latency_min_n":
+                out[k] = None
+                continue
             if not isinstance(v, (int, float)) or isinstance(v, bool) or v < 0:
                 raise SystemExit(f"{path}: {k} must be a non-negative number")
             out[k] = v
+    return out
+
+
+def resolve_thresholds(thresholds, gold_size) -> dict:
+    """The thresholds with latency_min_n None replaced by ceil(0.8 x gold_size), at least 1."""
+    out = dict(DEFAULT_THRESHOLDS, **(thresholds or {}))
+    if out["latency_min_n"] is None:
+        out["latency_min_n"] = max(1, math.ceil(LATENCY_MIN_SHARE * gold_size - _EPS))
     return out
 
 
@@ -132,6 +144,20 @@ def _expected(entry, eid):
     return next((x for x in entry.get("expected_actions") or [] if x["id"] == eid), None)
 
 
+def wrong_target_reason(entry, el, label):
+    """None, or why this close/update is on the wrong item: `must_not_touch`, or
+    `mismatched_expectation` (the annotator matched it to a close/update expectation whose
+    target differs). Not a close/update -> None."""
+    if el["kind"] != "action" or el["type"] not in gold_mod.TARGETED:
+        return None
+    if touches_forbidden(entry, el):
+        return "must_not_touch"
+    exp = _expected(entry, (label or {}).get("matches_expected"))
+    if exp is not None and exp["type"] in gold_mod.TARGETED and not target_matches(exp, el):
+        return "mismatched_expectation"
+    return None
+
+
 def score_wrong_target(gold, run, labels, *, max_wrong=DEFAULT_THRESHOLDS["wrong_target_max"]):
     """Close/update actions on the wrong item. Wrong when the target is on the gold entry's
     must_not_touch list, or the annotator matched the action to a close/update expectation
@@ -146,15 +172,7 @@ def score_wrong_target(gold, run, labels, *, max_wrong=DEFAULT_THRESHOLDS["wrong
         if el["kind"] != "action" or el["type"] not in gold_mod.TARGETED:
             continue
         entry = gold_by.get(gid) or {}
-        reason = None
-        if touches_forbidden(entry, el):
-            reason = "must_not_touch"
-        else:
-            lab = idx.get((str(pack["id"]), el["element"])) or {}
-            exp = _expected(entry, lab.get("matches_expected"))
-            if exp is not None and exp["type"] in gold_mod.TARGETED \
-                    and not target_matches(exp, el):
-                reason = "mismatched_expectation"
+        reason = wrong_target_reason(entry, el, idx.get((str(pack["id"]), el["element"])))
         for scope in (("raw", "shown") if el["shown"] else ("raw",)):
             counts[scope][0] += 1
             counts[scope][1] += reason is not None
@@ -177,31 +195,69 @@ def _action_matches(expected, el, label) -> bool:
     return (label or {}).get("matches_expected") == expected["id"]
 
 
+def _match_entry(entry, candidates):
+    """One-to-one matching of an entry's expectations to its candidate actions
+    [(key, el, label)] -> {expected id: key}. First every annotator-confirmed match
+    (`matches_expected`, which must still be type- and, for close/update, target-correct),
+    then, greedily in gold order, each still-open close/update expectation takes the first
+    unused action of its type on its target. An action fills at most one expectation."""
+    matched, used = {}, set()
+    for key, el, lab in candidates:
+        exp = _expected(entry, (lab or {}).get("matches_expected"))
+        if exp is not None and exp["id"] not in matched and key not in used \
+                and _action_matches(exp, el, lab):
+            matched[exp["id"]] = key
+            used.add(key)
+    for exp in entry.get("expected_actions") or []:
+        if exp["id"] in matched or exp["type"] not in gold_mod.TARGETED:
+            continue
+        for key, el, lab in candidates:
+            if key not in used and _action_matches(exp, el, lab):
+                matched[exp["id"]] = key
+                used.add(key)
+                break
+    return matched
+
+
 def score_recall(gold, run, labels, *, min_rate=DEFAULT_THRESHOLDS["recall_min"]):
-    """Expected actions the run proposed. close/update match by type + target (automatic);
-    create/draft/note match only by the annotator's `matches_expected` on an action of the
-    same type. An instruction with no pack (or a failed one) misses all its expectations.
-    The gate reads SHOWN matches; raw also counts stored unsupported actions."""
+    """Expected actions the run proposed, matched ONE-TO-ONE (an action fills at most one
+    expectation; _match_entry). close/update match by type + target, create/draft/note only
+    by the annotator's `matches_expected` on an action of the same type; the annotator's
+    match is honoured first. An action that is a wrong target (must_not_touch, or matched to
+    an expectation on another item) never counts. An instruction with no pack (or a failed
+    one) misses all its expectations. The gate reads SHOWN matches; raw also lets the stored
+    unsupported actions match."""
     idx = ann_mod.label_index(labels)
-    packs_for = {}
+    gold_by = gold_mod.by_id(gold)
+    actions_for = {}
     for gid, pack, el in runs_mod.iter_elements(run):
-        packs_for.setdefault(gid, []).append((pack, el))
-    total = shown = raw = 0
-    missed = []
+        if el["kind"] != "action":
+            continue
+        lab = idx.get((str(pack["id"]), el["element"]))
+        if wrong_target_reason(gold_by.get(gid) or {}, el, lab):
+            continue
+        actions_for.setdefault(gid, []).append(
+            (f"{pack['id']}/{el['element']}", el, lab))
+    total = 0
+    shown_m, raw_m, missed = {}, {}, []
     for entry in gold:
+        cands = actions_for.get(entry["id"], [])
+        s = _match_entry(entry, [c for c in cands if c[1]["shown"]])
+        r = _match_entry(entry, cands)
         for exp in entry.get("expected_actions") or []:
             total += 1
-            hits = [el["shown"] for pack, el in packs_for.get(entry["id"], [])
-                    if _action_matches(exp, el, idx.get((str(pack["id"]), el["element"])))]
-            raw += bool(hits)
-            shown += any(hits)
-            if not any(hits):
+            if exp["id"] in s:
+                shown_m[f"{entry['id']}/{exp['id']}"] = s[exp["id"]]
+            else:
                 missed.append({"gold_id": entry["id"], "expected_id": exp["id"]})
+            if exp["id"] in r:
+                raw_m[f"{entry['id']}/{exp['id']}"] = r[exp["id"]]
+    shown, raw = len(shown_m), len(raw_m)
     verdict = INSUFFICIENT if total == 0 else (
         PASS if shown / total >= min_rate - _EPS else FAIL)
     return {"shown": {"expected": total, "matched": shown, "rate": _rate(shown, total)},
             "raw": {"expected": total, "matched": raw, "rate": _rate(raw, total)},
-            "missed": missed, "min_rate": min_rate, "verdict": verdict}
+            "matches": shown_m, "missed": missed, "min_rate": min_rate, "verdict": verdict}
 
 
 # ---------------------------------------------------------------- "uncertain" honesty
@@ -273,16 +329,20 @@ def _dist(values):
 
 
 def score_latency(run, *, max_p90_s=DEFAULT_THRESHOLDS["latency_p90_max_s"],
-                  min_n=DEFAULT_THRESHOLDS["latency_min_n"]):
+                  min_n=1):
     """Seconds per finished (ready/failed) pack. end_to_end = updated_at - created_at (the
     reader's wait incl. queue; read before anyone applies or archives); worker =
     run_trace.ms.total (the agent's own time). The gate takes end_to_end and falls back to
     worker per pack; `sources` says which was used. An instruction whose pack never
     finished inside submit's max wait (error "timeout") enters the gate as its client-side
     elapsed time, a censored value (the real latency is at least that), so the slowest
-    instructions cannot drop out of the tail. Insufficient below min_n values."""
+    instructions cannot drop out of the tail. Rows without a pack (site_unresolved, post_/
+    get_ errors) and packs not finished at fetch time have no latency; they are counted in
+    `sources` (no_pack, unfinished), never silently dropped. Insufficient below min_n values
+    (report.py passes resolve_thresholds' ceil(0.8 x gold size))."""
     e2e, worker, gate = [], [], []
-    sources = Counter({"timestamps": 0, "run_trace": 0, "timeout": 0, "none": 0})
+    sources = Counter({"timestamps": 0, "run_trace": 0, "timeout": 0, "none": 0,
+                       "no_pack": 0, "unfinished": 0})
     for row in run.get("packs") or []:
         waited = row.get("client_elapsed_s")
         if row.get("error") == "timeout":
@@ -292,8 +352,12 @@ def score_latency(run, *, max_p90_s=DEFAULT_THRESHOLDS["latency_p90_max_s"],
             else:
                 sources["none"] += 1
             continue
-        pack = row.get("pack") or {}
+        pack = row.get("pack")
+        if not pack:
+            sources["no_pack"] += 1          # site_unresolved, post_/get_ errors: no latency
+            continue
         if pack.get("state") not in FINISHED_STATES:
+            sources["unfinished"] += 1       # queued/running/cancelled at fetch time
             continue
         a, b = _ts(pack.get("created_at")), _ts(pack.get("updated_at"))
         e = (b - a).total_seconds() if a and b and b >= a else None

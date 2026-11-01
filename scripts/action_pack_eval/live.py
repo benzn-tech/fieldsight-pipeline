@@ -8,7 +8,8 @@ through an injected `client(method, url, headers, body) -> (status, json_body_or
   as the raw `Authorization` header like the web app does.
 * `submit` is SEQUENTIAL: org-api allows one queued/running pack per creator (409 "you
   already have a pack in progress"), so each pack is polled to a terminal state before the
-  next POST.
+  next POST. A 409 anyway (a pack started outside the eval) is waited out: the POST is
+  retried every poll_s until max_wait_s, then recorded as `post_409`.
 * POST needs a site uuid when the caller sees more than one site: a gold `site` that is not
   a uuid is resolved through `site_map` ({name: uuid}); unresolved entries are skipped and
   recorded (`error: site_unresolved`), their expectations then count as missed.
@@ -67,9 +68,16 @@ def submit(gold, *, base_url, token, client, site_map=None, sleep=None, clock=No
         if site_id is None:
             row["error"] = "site_unresolved"
             continue
-        status, body = client("POST", f"{base}/action-packs", _headers(token),
-                              json.dumps({"instruction": entry["instruction"],
-                                          "site_id": site_id}))
+        payload = json.dumps({"instruction": entry["instruction"], "site_id": site_id})
+        waited_from = clock()
+        while True:
+            status, body = client("POST", f"{base}/action-packs", _headers(token), payload)
+            # 409: this caller already has a queued/running pack (one per creator) -- a
+            # pack started outside the eval. Wait for it, bounded by max_wait_s.
+            if status != 409 or clock() - waited_from >= max_wait_s:
+                break
+            row["conflict_retries"] = row.get("conflict_retries", 0) + 1
+            sleep(poll_s)
         row["http_status"] = status
         if status != 202 or not isinstance(body, dict) or not body.get("id"):
             row["error"] = f"post_{status}"

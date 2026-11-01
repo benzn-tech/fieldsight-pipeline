@@ -1,6 +1,7 @@
 {
   "run_id": "example-a",
   "config_label": "baseline",
+  "inputs_sha256": "4e9d4c5482bdf828c64bd377c0fb1851ba598eb8c68525f2e1f1d620d99699b5",
   "note": "SYNTHETIC recorded packs (GET /api/org/action-packs/{id} body plus run_trace and models attached from a TEST export). No real data.",
   "packs": [
     {

@@ -8,13 +8,14 @@ from __future__ import annotations
 from collections import Counter
 
 from scripts.action_pack_eval import metrics
+from scripts.action_pack_eval import runs as runs_mod
 
 GATES = ("fabrication", "wrong_target", "recall", "latency_p90")
 
 
 def build_report(gold, run, labels, *, prices=None, thresholds=None, second=None,
                  gold_sha256=None, warnings=()):
-    th = dict(metrics.DEFAULT_THRESHOLDS, **(thresholds or {}))
+    th = metrics.resolve_thresholds(thresholds, len(gold))
     fab = metrics.score_fabrication(run, labels, max_rate=th["fabrication_shown_max"])
     wt = metrics.score_wrong_target(gold, run, labels, max_wrong=th["wrong_target_max"])
     rec = metrics.score_recall(gold, run, labels, min_rate=th["recall_min"])
@@ -45,6 +46,7 @@ def build_report(gold, run, labels, *, prices=None, thresholds=None, second=None
         "run_id": run.get("run_id"), "config_label": run.get("config_label"),
         "gold_sha256": gold_sha256,
         "submitted_inputs_sha256": run.get("inputs_sha256"),
+        "pack_ids_sha256": runs_mod.pack_ids_sha256(run),
         "counts": {"instructions": len(gold), "packs": sum(1 for p in packs if p),
                    "no_pack": sum(1 for p in packs if not p),
                    "by_state": dict(Counter((p or {}).get("state") for p in packs if p))},

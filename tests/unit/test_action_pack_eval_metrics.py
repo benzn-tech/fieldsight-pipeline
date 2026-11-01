@@ -143,7 +143,8 @@ def test_latency_p50_p90(ex):
     assert out["end_to_end"] == {"n": 3, "p50_s": 240.0, "p90_s": 400.0}
     # run_trace.ms.total: 110, 230, 390 s.
     assert out["worker"] == {"n": 3, "p50_s": 230.0, "p90_s": 390.0}
-    assert out["sources"] == {"timestamps": 3, "run_trace": 0, "timeout": 0, "none": 0}
+    assert out["sources"] == {"timestamps": 3, "run_trace": 0, "timeout": 0, "none": 0,
+                              "no_pack": 0, "unfinished": 0}
     assert out["verdict"] == metrics.FAIL
 
 
@@ -151,7 +152,8 @@ def test_latency_falls_back_to_worker_time_and_needs_min_n():
     run = {"packs": [{"gold_id": "G", "pack": {"id": "p", "state": "ready",
                                                "run_trace": {"ms": {"total": 60000}}}}]}
     out = metrics.score_latency(run, max_p90_s=300, min_n=1)
-    assert out["sources"] == {"timestamps": 0, "run_trace": 1, "timeout": 0, "none": 0}
+    assert out["sources"] == {"timestamps": 0, "run_trace": 1, "timeout": 0, "none": 0,
+                              "no_pack": 0, "unfinished": 0}
     assert out["gate_p90_s"] == 60.0 and out["verdict"] == metrics.PASS
     assert metrics.score_latency(run, max_p90_s=300, min_n=20)["verdict"] == metrics.INSUFFICIENT
 
@@ -213,12 +215,95 @@ def test_agreement_between_two_annotation_files():
 
 
 def test_thresholds_defaults_and_override(tmp_path):
+    # latency_min_n None = ceil(0.8 x gold size), resolved per report.
     assert metrics.DEFAULT_THRESHOLDS == {"fabrication_shown_max": 0.05,
                                           "wrong_target_max": 0, "recall_min": 0.60,
-                                          "latency_p90_max_s": 300, "latency_min_n": 20}
+                                          "latency_p90_max_s": 300, "latency_min_n": None}
+    assert metrics.resolve_thresholds(metrics.DEFAULT_THRESHOLDS, 20)["latency_min_n"] == 16
+    assert metrics.resolve_thresholds(metrics.DEFAULT_THRESHOLDS, 21)["latency_min_n"] == 17
+    assert metrics.resolve_thresholds(dict(metrics.DEFAULT_THRESHOLDS, latency_min_n=5),
+                                      21)["latency_min_n"] == 5
     f = tmp_path / "t.json"
     f.write_text('{"recall_min": 0.7}', encoding="utf-8")
     assert metrics.load_thresholds(f)["recall_min"] == 0.7
     f.write_text('{"recall_minimum": 0.7}', encoding="utf-8")
     with pytest.raises(SystemExit):
         metrics.load_thresholds(f)
+
+
+# ---------------------------------------------------------------- fix round 2
+
+def _g(expected, must_not_touch=()):
+    return [{"id": "G", "site": "s", "instruction": "i", "scenario": "other",
+             "expected_actions": expected, "must_not_touch": list(must_not_touch),
+             "expected_uncertain": []}]
+
+
+def _r(actions):
+    return {"packs": [{"gold_id": "G", "pack": {"id": "p", "state": "ready", "conclusion": [],
+                                               "sources": [], "actions": actions}}]}
+
+
+def test_recall_is_one_to_one_one_update_cannot_fill_two_expectations():
+    # Two update expectations name the same item two ways (stable id, task number); one
+    # proposed update on it fulfils one of them, never both.
+    gold = _g([{"id": "e1", "type": "update_item", "target_stable_id": "X"},
+               {"id": "e2", "type": "update_item", "target_task_no": 7}])
+    run = _r([{"seq": 1, "type": "update_item", "target_stable_id": "X", "target_task_no": 7,
+               "refs": ["R1"], "verifier": "supported"}])
+    out = metrics.score_recall(gold, run, [])
+    assert out["shown"] == {"expected": 2, "matched": 1, "rate": pytest.approx(0.5)}
+    assert out["raw"]["matched"] == 1
+
+
+def test_recall_honours_the_annotators_match_first():
+    # The annotator says action 1 fulfils e2; e1 is then free for action 2.
+    gold = _g([{"id": "e1", "type": "update_item", "target_stable_id": "X"},
+               {"id": "e2", "type": "update_item", "target_task_no": 7}])
+    run = _r([{"seq": 1, "type": "update_item", "target_stable_id": "X", "target_task_no": 7,
+               "refs": ["R1"], "verifier": "supported"},
+              {"seq": 2, "type": "update_item", "target_stable_id": "X", "target_task_no": 7,
+               "refs": ["R1"], "verifier": "supported"}])
+    labels = [{"pack_id": "p", "element": "action:1", "annotator": "a",
+               "supported_by_refs": "yes", "is_standards_claim": False,
+               "matches_expected": "e2"}]
+    out = metrics.score_recall(gold, run, labels)
+    assert out["shown"]["matched"] == 2
+    assert out["matches"] == {"G/e2": "p/action:1", "G/e1": "p/action:2"}
+
+
+def test_a_wrong_target_action_never_also_counts_for_recall():
+    # e1 expects a close on Y; e3 a close on X. An action closing X that the annotator
+    # matched to e1 is a wrong target, and does NOT also fulfil e3.
+    gold = _g([{"id": "e1", "type": "close_item", "target_stable_id": "Y"},
+               {"id": "e3", "type": "close_item", "target_stable_id": "X"}])
+    run = _r([{"seq": 1, "type": "close_item", "target_stable_id": "X",
+               "target_task_no": None, "refs": ["R1"], "verifier": "supported"}])
+    labels = [{"pack_id": "p", "element": "action:1", "annotator": "a",
+               "supported_by_refs": "yes", "is_standards_claim": False,
+               "matches_expected": "e1"}]
+    assert metrics.score_wrong_target(gold, run, labels)["shown"]["wrong"] == 1
+    out = metrics.score_recall(gold, run, labels)
+    assert out["shown"]["matched"] == 0 and out["raw"]["matched"] == 0
+
+
+def test_a_must_not_touch_action_never_counts_for_recall():
+    gold = _g([{"id": "e1", "type": "close_item", "target_stable_id": "X"}],
+              must_not_touch=["X"])
+    run = _r([{"seq": 1, "type": "close_item", "target_stable_id": "X",
+               "target_task_no": None, "refs": ["R1"], "verifier": "supported"}])
+    assert metrics.score_recall(gold, run, [])["shown"]["matched"] == 0
+
+
+def test_latency_counts_rows_without_a_pack_and_unfinished_packs():
+    run = {"packs": [
+        {"gold_id": "G1", "pack": {"id": "p", "state": "ready",
+                                   "created_at": "2026-11-01T00:00:00+00:00",
+                                   "updated_at": "2026-11-01T00:01:00+00:00"}},
+        {"gold_id": "G2", "pack": None, "error": "post_500", "http_status": 500},
+        {"gold_id": "G3", "pack": None, "error": "get_404"},
+        {"gold_id": "G4", "pack": None, "error": "site_unresolved"},
+        {"gold_id": "G5", "pack": {"id": "q", "state": "cancelled"}}]}
+    out = metrics.score_latency(run, max_p90_s=300, min_n=1)
+    assert out["sources"]["no_pack"] == 3 and out["sources"]["unfinished"] == 1
+    assert out["gate_n"] == 1
