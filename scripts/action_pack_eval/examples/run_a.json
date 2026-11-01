@@ -1,0 +1,117 @@
+{
+  "run_id": "example-a",
+  "config_label": "baseline",
+  "note": "SYNTHETIC recorded packs (GET /api/org/action-packs/{id} body plus run_trace and models attached from a TEST export). No real data.",
+  "packs": [
+    {
+      "gold_id": "G1",
+      "pack": {
+        "id": "00000000-0000-4000-8000-0000000000b1",
+        "site_id": "00000000-0000-4000-8000-00000000a001",
+        "title": "Level 3 pour review",
+        "instruction": "Review the level 3 slab pour on Example Site A and tidy what it leaves open.",
+        "reading": "Review of the level 3 pour on 2026-10-10.",
+        "state": "ready",
+        "failure": null,
+        "created_at": "2026-11-01T00:00:00+00:00",
+        "updated_at": "2026-11-01T00:02:00+00:00",
+        "conclusion": [
+          {"text": "The pour finished on 2026-10-10 after the pump was late.", "refs": ["R1"], "confidence": "supported"},
+          {"text": "The engineer signed off the reinforcement.", "refs": ["R2"], "confidence": "uncertain"}
+        ],
+        "actions": [
+          {"id": "00000000-0000-4000-8000-0000000000c1", "seq": 1, "type": "close_item",
+           "target_stable_id": "00000000-0000-4000-8000-000000000001", "target_task_no": 1,
+           "proposed": {"status": "done"}, "rationale": "Pour completed.", "refs": ["R1"],
+           "verifier": "supported", "state": "proposed", "applicable": true},
+          {"id": "00000000-0000-4000-8000-0000000000c2", "seq": 2, "type": "create_item",
+           "target_stable_id": null, "target_task_no": null,
+           "proposed": {"text": "Book the pump earlier for the level 4 pour."}, "rationale": "Pump was late.",
+           "refs": ["R2"], "verifier": "weak", "state": "proposed", "applicable": true},
+          {"id": "00000000-0000-4000-8000-0000000000c3", "seq": 3, "type": "close_item",
+           "target_stable_id": "00000000-0000-4000-8000-000000000009", "target_task_no": 9,
+           "proposed": {"status": "done"}, "rationale": "Looks finished.", "refs": ["R3"],
+           "verifier": "unsupported", "state": "proposed", "applicable": false}
+        ],
+        "sources": [
+          {"ref": "R1", "kind": "topic", "provenance": "records", "excerpt": "Synthetic excerpt one.", "removed": false},
+          {"ref": "R2", "kind": "topic", "provenance": "records", "excerpt": "Synthetic excerpt two.", "removed": false},
+          {"ref": "R3", "kind": "item", "provenance": "records", "excerpt": "Synthetic excerpt three.", "removed": false}
+        ],
+        "run_trace": {"tokens": 10000, "ms": {"total": 110000},
+                      "verify": {"raw_conclusion": 3, "raw_actions": 4, "conclusion_unsupported": 1,
+                                 "drop_target_missing": 1}},
+        "models": {"planner": "model-w", "writer": "model-w", "writer_served": "model-w-served", "verifier": "model-v"}
+      }
+    },
+    {
+      "gold_id": "G2",
+      "pack": {
+        "id": "00000000-0000-4000-8000-0000000000b2",
+        "site_id": "00000000-0000-4000-8000-00000000a002",
+        "title": "Tidy open items",
+        "instruction": "Tidy the open items on Example Site B.",
+        "reading": "Tidy the open items.",
+        "state": "ready",
+        "failure": null,
+        "created_at": "2026-11-01T01:00:00+00:00",
+        "updated_at": "2026-11-01T01:04:00+00:00",
+        "conclusion": [
+          {"text": "Three items are open on the site.", "refs": ["R1"], "confidence": "supported"}
+        ],
+        "actions": [
+          {"id": "00000000-0000-4000-8000-0000000000d1", "seq": 1, "type": "close_item",
+           "target_stable_id": "00000000-0000-4000-8000-000000000004", "target_task_no": 4,
+           "proposed": {"status": "done"}, "rationale": "Mentioned as done.", "refs": ["R1"],
+           "verifier": "supported", "state": "proposed", "applicable": true},
+          {"id": "00000000-0000-4000-8000-0000000000d2", "seq": 2, "type": "update_item",
+           "target_stable_id": "00000000-0000-4000-8000-000000000003", "target_task_no": 3,
+           "proposed": {"deadline": "2026-11-20"}, "rationale": "New date agreed.", "refs": ["R1"],
+           "verifier": "weak", "state": "proposed", "applicable": true},
+          {"id": "00000000-0000-4000-8000-0000000000d3", "seq": 3, "type": "close_item",
+           "target_stable_id": "00000000-0000-4000-8000-000000000002", "target_task_no": 2,
+           "proposed": {"status": "done"}, "rationale": "Closed out.", "refs": ["R1"],
+           "verifier": "unsupported", "state": "proposed", "applicable": false}
+        ],
+        "sources": [
+          {"ref": "R1", "kind": "item", "provenance": "records", "excerpt": "Synthetic excerpt.", "removed": false}
+        ],
+        "run_trace": {"tokens": 20000, "ms": {"total": 230000},
+                      "verify": {"raw_conclusion": 1, "raw_actions": 3}},
+        "models": {"planner": "model-x", "writer": "model-x", "verifier": "model-v"}
+      }
+    },
+    {
+      "gold_id": "G3",
+      "pack": {
+        "id": "00000000-0000-4000-8000-0000000000b3",
+        "site_id": "00000000-0000-4000-8000-00000000a001",
+        "title": "Cover check",
+        "instruction": "Check the cover to reinforcement against NZS 3109 for the level 3 slab.",
+        "reading": "Cover check against NZS 3109.",
+        "state": "ready",
+        "failure": null,
+        "created_at": "2026-11-01T02:00:00+00:00",
+        "updated_at": "2026-11-01T02:06:40+00:00",
+        "conclusion": [
+          {"text": "NZS 3109 requires 40 mm cover here.", "refs": ["R1"], "confidence": "supported"},
+          {"text": "The project specification sets 50 mm cover.", "refs": ["D1"], "confidence": "supported"},
+          {"text": "NZS 3109 may set a different minimum.", "refs": ["R2"], "confidence": "uncertain"}
+        ],
+        "actions": [
+          {"id": "00000000-0000-4000-8000-0000000000e1", "seq": 1, "type": "create_item",
+           "target_stable_id": null, "target_task_no": null,
+           "proposed": {"text": "Get NZS 3109 into the project library."}, "rationale": "Not in the library.",
+           "refs": ["R1"], "verifier": "supported", "state": "proposed", "applicable": true}
+        ],
+        "sources": [
+          {"ref": "R1", "kind": "topic", "provenance": "records", "excerpt": "Synthetic excerpt.", "removed": false},
+          {"ref": "R2", "kind": "topic", "provenance": "records", "excerpt": "Synthetic excerpt.", "removed": false},
+          {"ref": "D1", "kind": "document", "provenance": "documents", "excerpt": "Synthetic spec page.", "removed": false}
+        ],
+        "run_trace": {"tokens": 5000, "ms": {"total": 390000},
+                      "verify": {"raw_conclusion": 3, "raw_actions": 1}}
+      }
+    }
+  ]
+}

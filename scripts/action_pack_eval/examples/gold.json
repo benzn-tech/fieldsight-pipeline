@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "note": "SYNTHETIC example gold set. No real site, item or person. The real gold set (>= 20 instructions, owner-supplied) lives outside git under action_pack_eval_runs/.",
+  "instructions": [
+    {
+      "id": "G1",
+      "site": "00000000-0000-4000-8000-00000000a001",
+      "instruction": "Review the level 3 slab pour on Example Site A and tidy what it leaves open.",
+      "scenario": "pour_review",
+      "expected_actions": [
+        {"id": "e1", "type": "close_item", "target_stable_id": "00000000-0000-4000-8000-000000000001"},
+        {"id": "e2", "type": "create_item", "match_hint": "book the concrete pump for the level 3 pour",
+         "fields": {"responsible": "Example Foreman"}}
+      ],
+      "must_not_touch": ["00000000-0000-4000-8000-000000000009"],
+      "expected_uncertain": []
+    },
+    {
+      "id": "G2",
+      "site": "Example Site B",
+      "instruction": "Tidy the open items on Example Site B.",
+      "scenario": "tidy_open_items",
+      "expected_actions": [
+        {"id": "e1", "type": "close_item", "target_stable_id": "00000000-0000-4000-8000-000000000002"},
+        {"id": "e2", "type": "update_item", "target_task_no": 3, "fields": {"deadline": "2026-11-20"}}
+      ],
+      "must_not_touch": ["00000000-0000-4000-8000-000000000004"],
+      "expected_uncertain": []
+    },
+    {
+      "id": "G3",
+      "site": "00000000-0000-4000-8000-00000000a001",
+      "instruction": "Check the cover to reinforcement against NZS 3109 for the level 3 slab.",
+      "scenario": "standard_not_in_library",
+      "expected_actions": [
+        {"id": "e1", "type": "create_item", "match_hint": "obtain a copy of NZS 3109 for the project library"}
+      ],
+      "must_not_touch": [],
+      "expected_uncertain": [{"id": "u1", "standard": "NZS 3109"}]
+    }
+  ]
+}

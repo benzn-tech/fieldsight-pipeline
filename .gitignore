@@ -61,5 +61,10 @@ clips*.json
 # and extractions, from TEST and read-only PROD. Only committed counts leave here.
 continuity_eval_runs/
 
+# Action-pack eval harness (scripts/action_pack_eval): real gold sets, human labels, recorded
+# packs (instruction, conclusion and excerpt text from TEST) and their reports. Every write the
+# harness makes is refused outside this root; only the synthetic examples/ are committed.
+action_pack_eval_runs/
+
 # Ask routing eval: per-run answers and routes (may hold answer text), never committed.
 tools/ask-routing-eval/results/
