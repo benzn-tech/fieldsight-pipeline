@@ -45,6 +45,10 @@ user". Cache the probe for the session.
   parses it. Dates (`source.date`) are `"YYYY-MM-DD"`.
 - Values inside `target_snapshot` and `proposed` are JSON written by the worker, so they are
   ISO strings already (`"deadline": "2026-11-05"`).
+- **The exception is the stale 409's `live` object** (§3.9). Its `deadline` and
+  `updated_at` are ISO with a `T` (`"2026-10-31T22:40:12.004411+00:00"`), because it is
+  built with `isoformat()`. Every other org-api datetime uses the space form. Parse both,
+  for example with `new Date(s.replace(" ", "T"))`, which leaves an ISO string unchanged.
 - `actions` come in display order (`seq`). `sources` come ordered by `ref` **as text**
   (`R1, R10, R2, ...`). Look sources up by `ref`; do not rely on their order.
 
@@ -124,7 +128,7 @@ Newest first. **At most 50 rows; there is no paging parameter in v1.**
    "state": "ready",
    "failure": null,
    "site_id": "6f1c2a8e-3b7d-4c55-9a51-1f0e2b7c9d10",
-   "site_name": "Riccarton Rd Apartments",
+   "site_name": "Example Site 1 (fictional)",
    "created_at": "2026-11-01 02:14:07.512331+00:00",
    "archived": false,
    "action_counts": {"proposed": 3, "applied": 1, "dismissed": 0, "stale": 1, "failed": 0}}
@@ -142,7 +146,7 @@ Newest first. **At most 50 rows; there is no paging parameter in v1.**
 ```json
 {"id": "0b9e4d2c-77a1-4f3e-bb0c-5d8f6a1e2c33",
  "site_id": "6f1c2a8e-3b7d-4c55-9a51-1f0e2b7c9d10",
- "site_name": "Riccarton Rd Apartments",
+ "site_name": "Example Site 1 (fictional)",
  "title": "10-10 pour follow-up",
  "instruction": "Close the open items about the 10-10 pour ...",
  "reading": "Review the Level 3 slab pour on 10 Oct 2026: which open items it settles, and what is still unclear.",
@@ -328,7 +332,7 @@ taken ‹fetched_at›" and a link to the live page. Never render it as HTML.
 ```json
 {"format": "md", "filename": "action-pack-0b9e4d2c-77a1-4f3e-bb0c-5d8f6a1e2c33.md",
  "content_type": "text/markdown",
- "content": "# 10-10 pour follow-up\n\nState: ready · Site: Riccarton Rd Apartments · ..."}
+ "content": "# 10-10 pour follow-up\n\nState: ready · Site: Example Site 1 (fictional) · ..."}
 ```
 
 - The same view as GET one, as Markdown: Reading, Conclusion, Actions and Sources.
@@ -405,7 +409,7 @@ moved to another site. Nothing is written, the action becomes `stale`, and the b
 {"error": "action is stale", "state": "stale",
  "live":     {"status": "in_progress", "deadline": "2026-11-08", "responsible": "Ana Lee",
               "priority": "high", "text": "Take test cylinders at the L3 pour",
-              "updated_at": "2026-10-31 22:40:12.004411+00:00"},
+              "updated_at": "2026-10-31T22:40:12.004411+00:00"},
  "snapshot": {"status": "open", "deadline": "2026-10-12", "responsible": "Sam Patel",
               "priority": "high", "text": "Take test cylinders at the L3 pour",
               "updated_at": "2026-10-09T21:03:11+00:00"}}

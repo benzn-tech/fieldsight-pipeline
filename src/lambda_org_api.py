@@ -573,7 +573,8 @@ def lambda_handler(event, context):
         import task_numbers_backfill
         site_ids = event.get("site_ids")
         if site_ids is not None:
-            if not isinstance(site_ids, list) or not site_ids                     or any(_uuid_or_none(s) is None for s in site_ids):
+            if (not isinstance(site_ids, list) or not site_ids
+                    or any(_uuid_or_none(s) is None for s in site_ids)):
                 return {"error": "site_ids must be a non-empty list of UUIDs"}
             site_ids = [_uuid_or_none(s) for s in site_ids]
         apply = event.get("apply") is True

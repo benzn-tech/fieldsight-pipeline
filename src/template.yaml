@@ -3609,6 +3609,8 @@ Resources:
   #                            one pending export_requests/ item
   #   company_status_cognito -- direct invoke: sweep one company's Cognito work rows
   #                            ({"event_id"} and/or {"company_id"}) when a marker was lost
+  #   backfill_task_numbers -- direct invoke: number the live action items with no task_no
+  #                            (action packs spec 2026-11-01 §14 D1), dry-run by default
   # No function invokes another here: the VPC has no route to the Lambda API, so the export
   # and company-status routes leave a request object in S3 and export_tick (S3 first, no DB
   # when idle) picks it up. Cognito is reached through the CognitoIdpEndpoint interface

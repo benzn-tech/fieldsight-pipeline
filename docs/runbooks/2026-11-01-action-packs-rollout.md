@@ -53,17 +53,27 @@ verified. A denial rolls the whole TEST stack back.
 ```bash
 DEPLOY_ROLE=$(aws iam get-role --role-name github-actions-fieldsight-deploy --query Role.Arn --output text)
 FN=arn:aws:lambda:ap-southeast-2:509194952652:function:fieldsight-test-action-agent
+# SAM names the function's role <stack>-ActionAgentFunctionRole-<suffix>; any concrete name
+# of that shape works for the simulation (the role does not need to exist yet).
+ROLE=arn:aws:iam::509194952652:role/fieldsight-test-ActionAgentFunctionRole-EXAMPLE
+
+# Lambda actions, on the function ARN
 aws iam simulate-principal-policy --policy-source-arn "$DEPLOY_ROLE" \
   --action-names lambda:CreateFunction lambda:PutFunctionConcurrency \
                  lambda:PutFunctionEventInvokeConfig lambda:UpdateFunctionEventInvokeConfig \
-                 lambda:TagResource iam:CreateRole iam:PutRolePolicy iam:PassRole \
-  --resource-arns "$FN" "arn:aws:iam::509194952652:role/fieldsight-test-*" \
-  --query 'EvaluationResults[].[EvalActionName,EvalResourceName,EvalDecision]' --output table
+                 lambda:TagResource \
+  --resource-arns "$FN" \
+  --query 'EvaluationResults[].[EvalActionName,EvalDecision]' --output table
+
+# IAM actions, on the role ARN
+aws iam simulate-principal-policy --policy-source-arn "$DEPLOY_ROLE" \
+  --action-names iam:CreateRole iam:PutRolePolicy iam:AttachRolePolicy iam:PassRole \
+  --resource-arns "$ROLE" \
+  --query 'EvaluationResults[].[EvalActionName,EvalDecision]' --output table
 ```
 
-Every row must be `allowed`. If the stack names its roles differently, read the
-role-name pattern from an existing function's role (`get-function-configuration --query
-Role`).
+Every row must be `allowed`. If an existing function's role (`get-function-configuration
+--query Role`) has a different naming shape, use that shape for `ROLE`.
 
 ## 2. Merge to develop: TEST deploy (main agent)
 
@@ -259,10 +269,16 @@ Then run the step 3 IAM simulations with `fieldsight-prod-*` and
 
 ## 9. Prod `task_no` backfill (owner-only)
 
-Aurora is reachable only from inside the VPC, so the backfill runs as an **org-api internal
-task**, `backfill_task_numbers`, in the same way as `collapse_multibound_photos`. The logic is
+Aurora is reachable only from inside the VPC, so the backfill runs as an internal task,
+`backfill_task_numbers`, of the `lambda_org_api` handler. The logic is
 `src/task_numbers_backfill.py`; `scripts/backfill_task_numbers.py` is the same thing for
 anyone inside the VPC.
+
+**Invoke it on `fieldsight-<stage>-lake-ops`, not on org-api.**
+
+- `LakeOpsFunction` runs the same `lambda_org_api.lambda_handler`, in the VPC, with the same
+  database credentials. `backfill_lake_objects` already runs there.
+- Its timeout is 900 s. org-api's is 30 s, which an all-sites run may not fit.
 
 How the task behaves:
 
@@ -271,26 +287,33 @@ How the task behaves:
 - It is not behind `ACTION_PACKS`, so it runs with the flag off.
 - It returns counts only.
 
+**`--cli-read-timeout 900` is required.** The AWS CLI's default read timeout is 60 s. When
+it expires, the CLI **retries the invoke**, and that starts a second backfill alongside the
+first. The second waits on the same site locks and is harmless, but it is a run nobody
+asked for. With 900 s the CLI waits as long as the function can run.
+
 Commands:
 
 ```bash
 # 1. dry run: {"applied": false, "sites": N, "to_number": M, "numbered": 0}
-aws lambda invoke --function-name fieldsight-prod-org-api --cli-binary-format raw-in-base64-out   --payload '{"task":"backfill_task_numbers"}' /tmp/tn-dry.json && cat /tmp/tn-dry.json
+aws lambda invoke --function-name fieldsight-prod-lake-ops \
+  --cli-binary-format raw-in-base64-out --cli-read-timeout 900 \
+  --payload '{"task":"backfill_task_numbers"}' /tmp/tn-dry.json && cat /tmp/tn-dry.json
 
 # 2. apply: {"applied": true, ..., "numbered": M}
-aws lambda invoke --function-name fieldsight-prod-org-api --cli-binary-format raw-in-base64-out   --payload '{"task":"backfill_task_numbers","apply":true}' /tmp/tn-apply.json && cat /tmp/tn-apply.json
+aws lambda invoke --function-name fieldsight-prod-lake-ops \
+  --cli-binary-format raw-in-base64-out --cli-read-timeout 900 \
+  --payload '{"task":"backfill_task_numbers","apply":true}' /tmp/tn-apply.json && cat /tmp/tn-apply.json
 
-# 3. re-run the dry run: to_number must be 0
+# 3. run the dry run again: to_number must be 0
 ```
 
-- Optional `"site_ids": ["<uuid>", ...]` limits it to some sites. A malformed list answers
-  `{"error": "site_ids must be a non-empty list of UUIDs"}` and touches nothing.
-- Read the **body**, not only the invoke status. A `FunctionError` in the invoke metadata, or
-  an `errorMessage` in the body, means nothing useful was committed. The apply commits per
-  site, so a re-run finishes the rest.
-- org-api's **30 s** timeout bounds one call. If prod has many sites and the call times out, the
-  sites already done stay done: re-run it, or pass `site_ids` in batches.
-- TEST first: the same commands with `fieldsight-test-org-api` (the main agent may run TEST).
+- **Read the body, not only the invoke status.** A `FunctionError` in the invoke metadata, or
+  an `errorMessage` in the body, means the run stopped part way.
+- **To resume, re-run it.** Each finished site is already committed, so a re-run (after an
+  error or a timeout) numbers only what is left.
+- **TEST first.** Run the same commands with `fieldsight-test-lake-ops`; the main agent may
+  run TEST.
 
 Run it as soon as possible after step 7's migrate. Items numbered live after migrate get
 lower numbers than older items the backfill numbers later, and the backfill never renumbers.

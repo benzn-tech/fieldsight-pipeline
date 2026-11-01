@@ -1271,8 +1271,11 @@ def apply_verdicts(draft, result):
     counts) is reason `verifier`.
     -> (conclusion, actions, model, counts, tokens, ignored counts)."""
     bad = agent.VerifierFailure
-    if not isinstance(result, dict) or not isinstance(result.get("conclusion"), list)             or not isinstance(result.get("actions"), list)             or not (result.get("model") is None or (isinstance(result["model"], str)
-                                                   and result["model"].strip())):
+    if (not isinstance(result, dict)
+            or not isinstance(result.get("conclusion"), list)
+            or not isinstance(result.get("actions"), list)
+            or not (result.get("model") is None
+                    or (isinstance(result["model"], str) and result["model"].strip()))):
         # model None = no model call was needed (Task 12 fix 1); "" is malformed.
         raise bad("verifier answer shape")
     counts = result.get("counts", {})

@@ -227,7 +227,8 @@ def near_duplicate(text, others, floor=NEAR_DUP_FLOOR):
             continue
         if okey == key:
             return "exact"
-        if found is None and                 difflib.SequenceMatcher(None, fkey, _dup_key(other)).ratio() >= floor:
+        if (found is None
+                and difflib.SequenceMatcher(None, fkey, _dup_key(other)).ratio() >= floor):
             found = "fuzzy"
     return found
 

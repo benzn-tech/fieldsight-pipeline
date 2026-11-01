@@ -74,3 +74,26 @@ def test_an_api_request_cannot_reach_it(monkeypatch):
                         "body": json.dumps({"task": "backfill_task_numbers", "apply": True})},
                        None)
     assert calls == []
+
+
+def test_lake_ops_can_run_it():
+    """The owner invokes it on fieldsight-<stage>-lake-ops (runbook step 9), not on org-api:
+    org-api's 30 s timeout is too short for an all-sites run. That only works while LakeOps
+    runs this same handler, inside the VPC, with database credentials and a long timeout."""
+    import io
+    import os
+    import yaml
+
+    class L(yaml.SafeLoader):
+        pass
+    L.add_multi_constructor("!", lambda loader, suffix, node: None)
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    with io.open(os.path.join(repo, "src", "template.yaml"), encoding="utf-8") as f:
+        tpl = yaml.load(f.read(), Loader=L)
+    props = tpl["Resources"]["LakeOpsFunction"]["Properties"]
+    assert props["Handler"] == "lambda_org_api.lambda_handler"
+    assert props["Timeout"] == 900
+    assert "VpcConfig" in props
+    env = props["Environment"]["Variables"]
+    assert {"PGHOST", "PGDATABASE", "PGUSER", "PGPASSWORD"} <= set(env)
+    assert "ACTION_PACKS" not in env      # the task is not behind the flag; LakeOps has none
