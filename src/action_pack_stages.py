@@ -95,6 +95,9 @@ SUBJECT_MAX_CHARS = 200
 BODY_MAX_CHARS = 4000
 SHORT_FIELD_MAX_CHARS = 200
 PRIORITY_MAX_CHARS = 32
+# judge_call: the share of a stage's window one model attempt may take while
+# ASK_JUDGE_FALLBACKS names a fallback (llm_utils.call_llm's 0.6 rule).
+FALLBACK_ATTEMPT_SHARE = 0.6
 # Web snapshots (§4.2: <= 8 fetched pages per run); fetched in parallel.
 MAX_SNAPSHOTS = 8
 SNAPSHOT_WAIT_S = 30.0
@@ -118,9 +121,10 @@ _DRAFT_FIELDS = {"draft_rfi": (("subject", "body"), ()),
 CITABLE = ("item", "topic", "chunk", "document", "web_answer", "web_source")
 _RANK = {"item": 0, "topic": 1, "chunk": 1, "document": 2, "web_answer": 3, "web_source": 3}
 
-# Tools a model round may call (the agent's allowlist). count_metric is left out: it takes
-# no site, so on a one-site pack it would count the caller's other sites too.
-RECORD_TOOLS = ("day_overview", "search_records", "latest_activity", "find_people")
+# Tools a model round may call (the agent's allowlist). count_metric and find_people are
+# left out: they take no site, so on a one-site pack they would reach the caller's other
+# sites too (find_people would put other sites' names into the prompts).
+RECORD_TOOLS = ("day_overview", "search_records", "latest_activity")
 _SITE_ARG_TOOLS = ("day_overview", "search_records", "latest_activity", ask_tools.DOC_TOOL)
 WEB_TOOL = "web_search"
 
@@ -197,10 +201,15 @@ def judge_call(prompt, *, max_tokens, force_json=True, model, deadline, caller, 
     stage's), converted to the client's clock and also the per-attempt cap. -> (text, err);
     `info` gets model (the chain entry that answered), served_model and usage."""
     import llm_tools_client
+    # With a fallback configured, one attempt gets FALLBACK_ATTEMPT_SHARE of the window
+    # (call_llm's share rule) so a hung primary leaves the fallback the rest; without one
+    # the single attempt may use all of it.
+    chain = llm_tools_client._model_chain(model or llm_tools_client._primary_model())
+    attempt = float(deadline) * (FALLBACK_ATTEMPT_SHARE if len(chain) > 1 else 1.0)
     turn = llm_tools_client.complete_json(
         prompt, model=model, max_tokens=max_tokens,
         deadline=llm_tools_client._now() + float(deadline), caller=caller,
-        attempt_timeout=float(deadline))
+        attempt_timeout=attempt)
     if turn.error is not None:
         return None, turn.error
     usage = turn.usage if isinstance(turn.usage, dict) else {}
@@ -944,8 +953,8 @@ Rules:
 - close_item / update_item target an existing item: copy its stable_id exactly from an "item" evidence line. Never invent one. At most one action per item; put every change to an item in one update_item.
 - Action types and their "proposed" fields:
   close_item   {{"status": "done" | "closed"}}
-  update_item  any of {{"status": "in_progress"|"blocked"|"done"|"closed", "deadline": "YYYY-MM-DD", "responsible": "a name", "priority": "..."}}
-  create_item  {{"text": "...", optional "responsible", "deadline", "priority"}} -- only when no open item already covers it
+  update_item  any of {{"status": "in_progress"|"blocked"|"done"|"closed", "deadline": "YYYY-MM-DD", "responsible": "a name", "priority": "low"|"medium"|"high"}}
+  create_item  {{"text": "...", optional "responsible", "deadline", "priority" ("low"|"medium"|"high")}} -- only when no open item already covers it
   draft_rfi    {{"subject": "...", "body": "..."}}
   draft_email  {{"subject": "...", "body": "...", optional "to"}}
   note         {{"text": "..."}}
@@ -984,10 +993,12 @@ def _clean_refs(refs, citable, counts):
     return out
 
 
-def _proposed(atype, raw):
+def _proposed(atype, raw, counts=None):
     """The validated `proposed` of one action, or None. Apply types follow
     action_pack_view (APPLY_EDIT_FIELDS, CLOSE_STATUSES, CREATE_TEXT_MAX_CHARS): anything
-    apply would refuse (409 unsupported_field) is dropped here instead of stored dead."""
+    apply would refuse (409 unsupported_field) is dropped here instead of stored dead. A
+    priority outside ACTION_PRIORITIES (after lower-casing) drops just that field, counted
+    in `counts["priority"]`."""
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):
@@ -1009,7 +1020,14 @@ def _proposed(atype, raw):
             elif k == "responsible":
                 out[k] = _str(v, SHORT_FIELD_MAX_CHARS)
             elif k == "priority":
-                out[k] = _str(v, PRIORITY_MAX_CHARS)
+                # Apply (PATCH's rule) accepts only ACTION_PRIORITIES: a value it would
+                # refuse is dropped and counted, never stored on an applicable action.
+                p = _str(v, PRIORITY_MAX_CHARS)
+                p = p.lower() if p is not None else None
+                if p not in action_pack_view.ACTION_PRIORITIES:
+                    _bump(counts if counts is not None else {}, "priority")
+                    continue
+                out[k] = p
             elif k == "text":
                 out[k] = _str(v, action_pack_view.CREATE_TEXT_MAX_CHARS)
             if out.get(k) is None:
@@ -1094,7 +1112,7 @@ def validate_draft(obj, run, citable):
             _bump(counts, "actions")
             continue
         rationale = _str(a.get("rationale"), RATIONALE_MAX_CHARS)
-        proposed = _proposed(atype, a.get("proposed"))
+        proposed = _proposed(atype, a.get("proposed"), counts)
         if rationale is None or proposed is None:
             _bump(counts, "actions")
             continue

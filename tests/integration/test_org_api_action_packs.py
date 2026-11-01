@@ -304,7 +304,10 @@ def test_s13_removed_sources_hide_their_claims_and_actions(db, env):
         {"seq": 4, "type": "note", "refs": ["D1", "W1", "R5"], "verifier": "supported"},
     ]
     conclusion = [{"text": "SECRET-CLAIM", "refs": ["R4"], "confidence": "supported"},
-                  {"text": "Door fixed", "refs": ["R1", "R4"], "confidence": "supported"}]
+                  {"text": "Door fixed", "refs": ["R1", "R4"], "confidence": "supported"},
+                  # Uncited (never model-checked): hidden while any non-web source is
+                  # removed for the reader -- it may have been written from it.
+                  {"text": "SECRET-UNCITED", "refs": [], "confidence": "uncertain"}]
     pid = _ready_pack(db, site, creator, sources, actions, conclusion)
     status, body = _call(db, pm, "GET", f"/action-packs/{pid}")
     assert status == 200
@@ -381,6 +384,59 @@ def test_s15_applicable_and_target_task_numbers(db, env):
     assert flags(pm)[1]["applicable"] is False
     _call(db, pm, "POST", f"/action-packs/{pid}/archive", {"archived": True})
     assert not any(a["applicable"] for a in flags(pm).values())
+
+
+def test_s15_a_responsible_who_is_not_a_site_member_is_not_applicable(db, env):
+    """Apply runs PATCH's rule (responsible = a members_for_site display name of the
+    pack's site); GET must not offer Apply for a proposal that rule would 400."""
+    co, site, other_site, creator = _world(db)
+    pm = _user(db, co, "pm", "Pat")
+    memberships.ensure_membership(db, pm["id"], site["id"], "pm")
+    outsider = _user(db, co, "worker", "Olly")                   # member of ANOTHER site
+    memberships.ensure_membership(db, outsider["id"], other_site["id"], "worker")
+    t, _item, stable = _topic(db, site, "Fix the fire door", user_id=creator["id"])
+    member = f"{pm['first_name']} {pm['last_name']}"
+    stranger = f"{outsider['first_name']} {outsider['last_name']}"
+    r1 = {"ref": "R1", "kind": "topic", "provenance": "records", "topic_id": str(t["id"])}
+    w1 = {"ref": "W1", "kind": "web_source", "provenance": "web", "url": "https://e.x"}
+    actions = [
+        {"seq": 1, "type": "update_item", "target_stable_id": str(stable), "refs": ["R1"],
+         "verifier": "supported", "proposed": {"responsible": member}},
+        {"seq": 2, "type": "update_item", "target_stable_id": str(stable), "refs": ["R1"],
+         "verifier": "supported", "proposed": {"responsible": stranger},
+         "target_snapshot": {"responsible": None}},
+        {"seq": 3, "type": "create_item", "refs": ["R1"], "verifier": "supported",
+         "proposed": {"text": "Book inspection", "responsible": stranger}},
+        {"seq": 4, "type": "create_item", "refs": ["R1"], "verifier": "supported",
+         "proposed": {"text": "Book inspection", "responsible": member,
+                      "priority": "high"}},
+        {"seq": 5, "type": "update_item", "target_stable_id": str(stable), "refs": ["R1"],
+         "verifier": "supported", "proposed": {"priority": "low"}},
+    ]
+    conclusion = [{"text": "Uncited but nothing removed", "refs": [],
+                   "confidence": "uncertain"}]
+    pid = _ready_pack(db, site, creator, [r1, w1], actions, conclusion)
+    status, body = _call(db, pm, "GET", f"/action-packs/{pid}")
+    assert status == 200
+    got = {a["seq"]: (a["applicable"], a["applicable_reason"]) for a in body["actions"]}
+    assert got == {1: (True, None), 2: (False, "responsible_not_member"),
+                   3: (False, "responsible_not_member"), 4: (True, None), 5: (True, None)}
+    # Nothing is removed for this reader: the uncited line stays.
+    assert [c["text"] for c in body["conclusion"]] == ["Uncited but nothing removed"]
+    # The creator (a worker who recorded the topic: its unassigned task is their own work)
+    # may update but not create; where the ACL already says no there is no reason.
+    status, mine = _call(db, creator, "GET", f"/action-packs/{pid}")
+    got = {a["seq"]: (a["applicable"], a["applicable_reason"]) for a in mine["actions"]}
+    assert got == {1: (True, None), 2: (False, "responsible_not_member"),
+                   3: (False, None), 4: (False, None), 5: (True, None)}
+    # The rule GET used is the one apply enforces: the stranger is refused with a 400,
+    # and editing the field to a member makes it apply.
+    aid2 = next(a["id"] for a in body["actions"] if a["seq"] == 2)
+    status, res = _call(db, pm, "POST", f"/action-packs/{pid}/actions/{aid2}/apply", {})
+    assert status == 400, res
+    status, res = _call(db, pm, "POST", f"/action-packs/{pid}/actions/{aid2}/apply",
+                        {"fields": {"responsible": member}})
+    assert status == 200, res
 
 
 # ---------------------------------------------------------------- list + sweep

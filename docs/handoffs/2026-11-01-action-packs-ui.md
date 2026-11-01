@@ -45,10 +45,11 @@ user". Cache the probe for the session.
   parses it. Dates (`source.date`) are `"YYYY-MM-DD"`.
 - Values inside `target_snapshot` and `proposed` are JSON written by the worker, so they are
   ISO strings already (`"deadline": "2026-11-05"`).
-- **The exception is the stale 409's `live` object** (§3.9). Its `deadline` and
-  `updated_at` are ISO with a `T` (`"2026-10-31T22:40:12.004411+00:00"`), because it is
-  built with `isoformat()`. Every other org-api datetime uses the space form. Parse both,
-  for example with `new Date(s.replace(" ", "T"))`, which leaves an ISO string unchanged.
+- **The exception is the stale 409's `live` object** (§3.9). It is built with
+  `isoformat()`: its `updated_at` is ISO with a `T` (`"2026-10-31T22:40:12.004411+00:00"`),
+  and its `deadline` is a plain date (`"2026-11-08"`, no `T`, no time). Every other org-api
+  datetime uses the space form. Parse datetimes with `new Date(s.replace(" ", "T"))`, which
+  leaves an ISO string unchanged; treat `deadline` as a `YYYY-MM-DD` date, not a datetime.
 - `actions` come in display order (`seq`). `sources` come ordered by `ref` **as text**
   (`R1, R10, R2, ...`). Look sources up by `ref`; do not rely on their order.
 
@@ -176,7 +177,7 @@ Newest first. **At most 50 rows; there is no paging parameter in v1.**
     "target_snapshot": {"status": "open", "deadline": "2026-10-12", "responsible": "Sam Patel",
                         "priority": "high", "text": "Take test cylinders at the L3 pour",
                         "updated_at": "2026-10-09T21:03:11+00:00"},
-    "applicable": true,
+    "applicable": true, "applicable_reason": null,
     "applied_at": null,
     "applied_result": null,
     "created_item_stable_id": null},
@@ -191,7 +192,7 @@ Newest first. **At most 50 rows; there is no paging parameter in v1.**
     "target_stable_id": null,
     "target_task_no": null,
     "target_snapshot": null,
-    "applicable": true,
+    "applicable": true, "applicable_reason": null,
     "applied_at": null,
     "applied_result": null,
     "created_item_stable_id": null},
@@ -204,7 +205,7 @@ Newest first. **At most 50 rows; there is no paging parameter in v1.**
     "rationale": "The engineer's question about the curing period is still open.",
     "proposed": {"subject": "L3 slab curing period", "body": "..."},
     "target_stable_id": null, "target_task_no": null, "target_snapshot": null,
-    "applicable": false, "applied_at": null, "applied_result": null,
+    "applicable": false, "applicable_reason": null, "applied_at": null, "applied_result": null,
     "created_item_stable_id": null}
  ],
  "sources": [
@@ -289,8 +290,18 @@ Action fields:
     is admin/GM, this site's pm/site_manager, or the task's current assignee. For create it
     is admin/GM or this site's pm/site_manager.
 
+  - a proposed `responsible` (update/create) is a member of the pack's site, by display
+    name, as `PATCH /action-items/{id}` requires.
+
   Show the Apply button only when `applicable` is true. The backend still checks every
   apply, so a stale page can still get a 403 or 409.
+- `applicable_reason`: null, or why an action this viewer could otherwise apply is not
+  applicable as proposed. One code in v1: `"responsible_not_member"` (the proposed
+  `responsible` is not a member of this site, so apply would 400 `assignee must be a
+  member of this site`). Show "Assignee is not on this project" and let the viewer edit
+  `responsible` (to a name from `GET /api/org/sites/{site_id}/members`), then apply with
+  `{"fields": {"responsible": "<name>"}}` (§3.9). It is null whenever the viewer's own access
+  is what says no.
 - `applied_result` (after apply, dismiss or stale):
   - close/update applied: `{action_item_id, content_edit_ids: [...]}`;
   - already in the proposed state (someone did it by hand): `{noop: true, action_item_id}`.
@@ -306,7 +317,9 @@ Sources: §5.
 from this reader comes back as `{ref, kind, provenance, removed: true}` with nothing else.
 Render "source removed" with no excerpt. A conclusion line or action that cites **only**
 removed sources is left out of the response entirely, so different readers can see
-different numbers of actions on the same pack.
+different numbers of actions on the same pack. A conclusion line with **no** refs (always
+`uncertain`) is also left out as soon as any non-web source of the pack is removed for this
+reader, since it may have been written from that source. The export applies the same rules.
 
 ### 3.4 Web snapshot: GET `/action-packs/{id}/sources/{ref}/snapshot`
 

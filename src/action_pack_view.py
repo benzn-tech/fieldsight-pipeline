@@ -89,6 +89,11 @@ STORE_PAYLOAD_MAX_BYTES = 5_500_000
 APPLY_TYPES = ("close_item", "update_item", "create_item")
 APPLICABLE_STATES = ("proposed", "failed")
 STALE_SWEEP_MINUTES = 20                     # S9
+# The priority values PATCH /action-items (and so apply) accepts -- org-api's
+# ALLOWED_ACTION_PRIORITY IS this set, and the agent's writer keeps only these (S15).
+ACTION_PRIORITIES = frozenset({"low", "medium", "high"})
+# Why GET says `applicable: false` for an action the reader could otherwise apply.
+REASON_RESPONSIBLE_NOT_MEMBER = "responsible_not_member"
 
 # What a non-removed source returns. Excerpt/title/url only while the source is live (S13).
 _SOURCE_OUT = ("ref", "kind", "provenance", "topic_id", "chunk_id", "document_id",
@@ -480,16 +485,34 @@ def public_models(models):
         models[k] is None or (isinstance(models[k], str) and _MODEL_ID.match(models[k])))}
 
 
-def shape_pack(pack, *, removed_refs, site_name, targets, applicable, viewer_id) -> dict:
+def visible_conclusion(pack, removed_refs) -> list:
+    """S13 for the conclusion: a claim citing only removed sources is left out, and so is
+    every UNCITED claim (kept as uncertain, never model-checked against a source) once any
+    non-web source of the pack is removed for this reader -- it may have been written
+    from that source."""
+    removed_refs = set(removed_refs or ())
+    non_web_removed = any(isinstance(s, dict) and s.get("ref") in removed_refs
+                          and s.get("provenance") != "web"
+                          for s in pack.get("sources") or [])
+    return [c for c in (pack.get("conclusion") or [])
+            if isinstance(c, dict) and not cites_only_removed(c.get("refs"), removed_refs)
+            and not (non_web_removed and not c.get("refs"))]
+
+
+def shape_pack(pack, *, removed_refs, site_name, targets, applicable, viewer_id,
+               reasons=None) -> dict:
     """The GET /action-packs/{id} body.
 
     removed_refs -- refs whose source is deleted / redacted / not visible to this reader
     targets      -- {action id: {"task_no": int|None, "visible": bool}} for close/update
     applicable   -- {action id: bool}
-    Actions and claims that cite only removed sources are left out entirely."""
+    reasons      -- {action id: code} why an action is not applicable (e.g.
+                    REASON_RESPONSIBLE_NOT_MEMBER); null for every other action
+    Actions and claims that cite only removed sources are left out entirely (and see
+    visible_conclusion for uncited claims)."""
     removed_refs = set(removed_refs or ())
-    conclusion = [c for c in (pack.get("conclusion") or [])
-                  if isinstance(c, dict) and not cites_only_removed(c.get("refs"), removed_refs)]
+    reasons = reasons or {}
+    conclusion = visible_conclusion(pack, removed_refs)
     actions = []
     for a in visible_actions(pack.get("actions"), removed_refs):
         aid = str(a["id"])
@@ -505,6 +528,7 @@ def shape_pack(pack, *, removed_refs, site_name, targets, applicable, viewer_id)
             # reader can see it.
             "target_task_no": target.get("task_no") if target.get("visible") else None,
             "applicable": bool(applicable.get(aid)),
+            "applicable_reason": (None if applicable.get(aid) else reasons.get(aid)),
             "applied_at": a.get("applied_at"), "applied_result": a.get("applied_result"),
             "created_item_stable_id": (str(a["created_item_stable_id"])
                                        if a.get("created_item_stable_id") is not None

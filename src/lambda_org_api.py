@@ -242,7 +242,7 @@ ALLOWED_OBSERVATION_STATUS = {"open", "closed"}
 # `done` = the work was done. `closed` = it no longer needs doing (cancelled,
 # superseded, duplicate) -- finished, but NOT a completion (owner, 2026-10-27).
 ALLOWED_ACTION_STATUS = {"open", "in_progress", "blocked", "done", "closed"}
-ALLOWED_ACTION_PRIORITY = {"low", "medium", "high"}
+ALLOWED_ACTION_PRIORITY = action_pack_view.ACTION_PRIORITIES   # shared with the action agent's writer
 RECORDING_KINDS = {"video", "audio", "photo"}
 # What a client may SAY it is on /upload-url. 'device' is never claimed in the
 # body -- it is inferred from the device headers (X-Device-Tag/X-Device-Id).
@@ -966,7 +966,8 @@ def _pack_view(conn, caller, pack):
     """The shaped GET body: S13 hiding, the target task numbers and S15 `applicable`."""
     vis = _ReaderVisibility(conn, caller)
     removed = vis.removed_refs(pack)
-    targets, applicable, live_ids = {}, {}, {}
+    targets, applicable, live_ids, reasons = {}, {}, {}, {}
+    member_names = None                     # one members_for_site read per view, if needed
     for a in action_pack_view.visible_actions(pack.get("actions"), removed):
         aid = str(a["id"])
         live = None
@@ -982,6 +983,16 @@ def _pack_view(conn, caller, pack):
             elif live is not None:
                 row, denied = _action_item_edit_acl(conn, caller, live["id"])
                 ok_ = denied is None
+        responsible = (a.get("proposed") or {}).get("responsible")
+        if ok_ and responsible is not None:
+            # Apply runs PATCH's rule: the responsible must be a members_for_site display
+            # name of the pack's site. A proposal that would 400 is not applicable as is
+            # (the reader edits the field, then applies).
+            if member_names is None:
+                member_names = _site_member_names(conn, pack["site_id"])
+            if not isinstance(responsible, str) or responsible.strip() not in member_names:
+                ok_ = False
+                reasons[aid] = action_pack_view.REASON_RESPONSIBLE_NOT_MEMBER
         applicable[aid] = ok_
     numbers = _task_numbers(conn, list(live_ids.values()))
     for aid, item_id in live_ids.items():
@@ -990,7 +1001,7 @@ def _pack_view(conn, caller, pack):
              for s in sites.list_sites_by_ids(conn, [str(pack["site_id"])])}
     view = action_pack_view.shape_pack(
         pack, removed_refs=removed, site_name=names.get(str(pack["site_id"])),
-        targets=targets, applicable=applicable, viewer_id=caller["id"])
+        targets=targets, applicable=applicable, viewer_id=caller["id"], reasons=reasons)
     logger.info("action pack read pack=%s sources=%d removed=%d actions=%d shown=%d",
                 pack["id"], len(pack.get("sources") or []), len(removed),
                 len(pack.get("actions") or []), len(view["actions"]))
@@ -8770,6 +8781,19 @@ def patch_action_item(conn, caller, action_item_id, body):
     return ok(updated)
 
 
+def _site_member_names(conn, site_id, company_id=None):
+    """The display names a task on `site_id` may be assigned to (PATCH's `responsible`
+    rule): members_for_site of that site, pinned to the SITE's company (read here when
+    not given). An unknown site has none."""
+    if company_id is None:
+        site = sites.get_site(conn, site_id)
+        if site is None:
+            return set()
+        company_id = site["company_id"]
+    return {" ".join(p for p in (m.get("first_name"), m.get("last_name")) if p).strip()
+            for m in memberships.members_for_site(conn, company_id, str(site_id))}
+
+
 def _validate_action_item_fields(conn, row, body):
     """PATCH's field validation, shared with action-pack apply: `(fields, None)` or
     `(None, error_response)`. `row` supplies company_id and site_id (the `responsible`
@@ -8796,9 +8820,7 @@ def _validate_action_item_fields(conn, row, body):
         if not isinstance(target, str) or not target.strip():
             return None, error("responsible must be a non-empty display name", 400)
         target = target.strip()
-        member_names = {" ".join(p for p in (m.get("first_name"), m.get("last_name")) if p).strip()
-                        for m in memberships.members_for_site(conn, row["company_id"], site_id)}
-        if target not in member_names:
+        if target not in _site_member_names(conn, site_id, row["company_id"]):
             return None, error("assignee must be a member of this site", 400)
         fields["responsible"] = target
     if not fields:

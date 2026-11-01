@@ -287,22 +287,23 @@ How the task behaves:
 - It is not behind `ACTION_PACKS`, so it runs with the flag off.
 - It returns counts only.
 
-**`--cli-read-timeout 900` is required.** The AWS CLI's default read timeout is 60 s. When
+**`--cli-read-timeout 960` is required.** The AWS CLI's default read timeout is 60 s. When
 it expires, the CLI **retries the invoke**, and that starts a second backfill alongside the
 first. The second waits on the same site locks and is harmless, but it is a run nobody
-asked for. With 900 s the CLI waits as long as the function can run.
+asked for. The function's timeout is 900 s; 960 s lets the CLI wait for a run that uses
+all of it, plus the response, instead of timing out at the same moment.
 
 Commands:
 
 ```bash
 # 1. dry run: {"applied": false, "sites": N, "to_number": M, "numbered": 0}
 aws lambda invoke --function-name fieldsight-prod-lake-ops \
-  --cli-binary-format raw-in-base64-out --cli-read-timeout 900 \
+  --cli-binary-format raw-in-base64-out --cli-read-timeout 960 \
   --payload '{"task":"backfill_task_numbers"}' /tmp/tn-dry.json && cat /tmp/tn-dry.json
 
 # 2. apply: {"applied": true, ..., "numbered": M}
 aws lambda invoke --function-name fieldsight-prod-lake-ops \
-  --cli-binary-format raw-in-base64-out --cli-read-timeout 900 \
+  --cli-binary-format raw-in-base64-out --cli-read-timeout 960 \
   --payload '{"task":"backfill_task_numbers","apply":true}' /tmp/tn-apply.json && cat /tmp/tn-apply.json
 
 # 3. run the dry run again: to_number must be 0
