@@ -1762,6 +1762,32 @@ def _publish_summary(report, json_key, word_key, target_date, owner_hint=None):
         logger.error(f"Summary Word failed ({word_key}): {e}")
 
 
+def _report_suppressed(doc, folder, primary_site, where):
+    """Company offboarding (spec 2026-11-01 §5.5): 'company_inactive' when the company of
+    this person's report SITE (their primary site; site-less: their home company) is
+    suspended / exited and the flag is on; None otherwise (flag off: logged
+    COMPANY_GATE_WOULD_SUPPRESS). This lambda has no database: the published directory's
+    `inactive_companies` says which companies are inactive."""
+    return directory.suppress_reason(doc, site_id=primary_site or None,
+                                     company_id=directory.company_of_folder(doc, folder),
+                                     where=where)
+
+
+def _drop_suppressed_reports(reports_by_user, all_daily_reports, doc, user_primary_site,
+                             where):
+    """The periodic (weekly / monthly) inputs without the dailies of people whose report
+    is suppressed (_report_suppressed): their own, site and combined periodic reports are
+    then never built from them. '_summary' (the lake-wide fallback) is left as it is."""
+    dropped = {u for u in reports_by_user if u != '_summary'
+               and _report_suppressed(doc, u, user_primary_site.get(u), where)}
+    if not dropped:
+        return reports_by_user, all_daily_reports
+    logger.info(f"  Company inactive -- no {where} for: {sorted(dropped)}")
+    kept = {u: r for u, r in reports_by_user.items() if u not in dropped}
+    gone = {id(r) for u in dropped for r in reports_by_user[u]}
+    return kept, [r for r in all_daily_reports if id(r) not in gone]
+
+
 def _group_by_company(all_users_data):
     """{company_id: {folder: user_data}} by each folder's HOME company in the directory.
     Left out of EVERY company's summary (rulings C1, R10a): a folder with has_external (its
@@ -1784,6 +1810,13 @@ def _group_by_company(all_users_data):
         groups.setdefault(cid, {})[folder] = data
     if no_company:
         logger.info(f"  {no_company} folder(s) with no directory company: in no per-company summary")
+    # Company offboarding (spec 2026-11-01 §5.5): no summary for an inactive company. Its
+    # folders here are its own people on its own sites (has_external folders are already
+    # out), so the home company is also the site company.
+    for cid in list(groups):
+        if directory.suppress_reason(doc, company_id=cid, where="company-summary"):
+            logger.info(f"  Company {cid} summary: SKIP -- company inactive")
+            del groups[cid]
     return groups
 
 
@@ -1881,8 +1914,19 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
     logger.info(f"Users with data for {target_date}: {list(all_users_data.keys())}")
 
     skipped_users = []
+    suppressed_users = []
+    published = directory.load(s3_client, S3_BUCKET)
     for user_name, user_data in all_users_data.items():
         if not user_data['transcripts']:
+            continue
+
+        # Company offboarding (spec 2026-11-01 §5.5): no report for an inactive company,
+        # keyed by the report's SITE company. The recordings themselves were still
+        # transcribed and extracted (item-writer is not gated, R6).
+        if _report_suppressed(published, user_name, user_primary_site.get(user_name, ''),
+                              "daily-report"):
+            logger.info(f"  {user_name}: SKIP — company inactive")
+            suppressed_users.append(user_name)
             continue
 
         n_transcripts = len(user_data['transcripts'])
@@ -2115,6 +2159,7 @@ def generate_daily_report(target_date, hidden_topic_ids=None, triggered_by='syst
         'report_type': 'daily', 'date': target_date,
         'users_processed': list(all_users_data.keys()),
         'users_skipped': skipped_users,
+        'users_suppressed': suppressed_users,
         'total_transcripts': len(combined_transcripts),
         'total_photos': len(combined_photos),
         'total_duration_seconds': round(sum(d['total_duration'] for d in all_users_data.values()), 1),
@@ -2180,6 +2225,12 @@ def generate_periodic_report(report_type, start_date, end_date, user=None, trigg
 
     logger.info(f"  Collected {len(all_daily_reports)} daily reports, "
                 f"{len(reports_by_user)} unique users: {sorted(reports_by_user.keys())}")
+
+    # Company offboarding (spec 2026-11-01 §5.5): nothing built from an inactive
+    # company's dailies (dailies written before it went inactive included).
+    reports_by_user, all_daily_reports = _drop_suppressed_reports(
+        reports_by_user, all_daily_reports, directory.load(s3_client, S3_BUCKET),
+        user_primary_site, f"{report_type}-report")
 
     if not all_daily_reports:
         logger.warning("  No daily reports found for period")

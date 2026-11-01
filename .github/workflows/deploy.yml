@@ -2,10 +2,8 @@ name: Deploy FieldSight TEST (SAM)
 
 # ============================================================
 # develop → TEST stack (fieldsight-test) via full SAM deploy.
-# PROD is NOT deployed by SAM: the prod backend was hand-assembled
-# (shared IAM role, EventBridge Scheduler crons, manual API Gateway —
-# no CloudFormation stack), so `sam deploy` would collide with it.
-# Prod code updates are handled by deploy-prod-code.yml instead.
+# PROD is the fieldsight-prod SAM stack, deployed from main by
+# deploy-prod.yml behind the `production` environment gate.
 # ============================================================
 # Canonical template: src/template.yaml (built with base_dir "." via samconfig).
 # All env params are passed explicitly so a TEST deploy can never touch PROD data.
@@ -180,6 +178,12 @@ jobs:
           if [ -n "${{ vars.TEST_ASK_THREADS }}" ]; then
             ASK_THREADS_PARAM="AskThreads=${{ vars.TEST_ASK_THREADS }}"
           fi
+          # Company offboarding gate (spec 2026-11-01). Same bare-"Key=" guard; the
+          # template Default 'off' keeps it shadow-only until TEST_COMPANY_STATUS_ENFORCE is set.
+          COMPANY_STATUS_ENFORCE_PARAM=""
+          if [ -n "${{ vars.TEST_COMPANY_STATUS_ENFORCE }}" ]; then
+            COMPANY_STATUS_ENFORCE_PARAM="CompanyStatusEnforce=${{ vars.TEST_COMPANY_STATUS_ENFORCE }}"
+          fi
           ASK_JUDGE_MODEL_PARAM=""
           if [ -n "${{ vars.TEST_ASK_JUDGE_MODEL }}" ]; then
             ASK_JUDGE_MODEL_PARAM="AskJudgeModel=${{ vars.TEST_ASK_JUDGE_MODEL }}"
@@ -280,6 +284,7 @@ jobs:
               $VAD_LAYER_PARAM \
               $ASK_AGENTIC_PARAM \
               $ASK_THREADS_PARAM \
+              $COMPANY_STATUS_ENFORCE_PARAM \
               $ASK_JUDGE_MODEL_PARAM \
               $ASK_JUDGE_FALLBACKS_PARAM \
               $ASK_JUDGE_PROVIDER_PARAM \

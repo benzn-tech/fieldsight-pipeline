@@ -85,6 +85,80 @@ def test_archive_user_cascades_and_guards(db):
     assert users.unarchive_user(db, "sub-ua", co["id"])["archived_at"] is None
 
 
+def _mem_archived_at(db, user_id, site_id):
+    return db.execute("SELECT archived_at FROM memberships WHERE user_id=%s AND site_id=%s",
+                      (user_id, site_id)).fetchone()[0]
+
+
+def test_unarchive_user_restores_only_the_cascaded_memberships(db):
+    """Spec 2026-11-01 company offboarding §8 (Task 6). archive_user stamps the user and
+    every live membership with the same now(); unarchive_user brings back exactly those --
+    a membership closed earlier on its own (DELETE /members/{sub}/memberships/{site})
+    stays closed. An external membership on another company's site comes back too, even
+    while that company is suspended: the live-company choke point hides it, the row is
+    the person's."""
+    co = companies.create_company(db, "UnarchCo")
+    other = companies.create_company(db, "UnarchOther")
+    s_kept = sites.create_site(db, co["id"], "Kept")
+    s_also = sites.create_site(db, co["id"], "Also")
+    s_off = sites.create_site(db, co["id"], "Taken off earlier")
+    s_ext = sites.create_site(db, other["id"], "External")
+    u = users.upsert_user(db, "sub-unarch", "unarch@x.nz", company_id=co["id"])
+    for s in (s_kept, s_also, s_off):
+        memberships.ensure_membership(db, u["id"], s["id"], "worker")
+    memberships.add_external_membership(db, u["id"], s_ext["id"], "worker")
+    # Taken off one project an hour before the person was archived. (The `db` fixture is
+    # one transaction, so now() is the same everywhere in this test; stamp it explicitly.)
+    memberships.archive_membership(db, u["id"], s_off["id"])
+    db.execute("UPDATE memberships SET archived_at = now() - interval '1 hour' "
+               "WHERE user_id=%s AND site_id=%s", (u["id"], s_off["id"]))
+    earlier = _mem_archived_at(db, u["id"], s_off["id"])
+
+    s_closed = sites.create_site(db, co["id"], "Closed after the person left")
+    memberships.ensure_membership(db, u["id"], s_closed["id"], "worker")
+
+    archived = users.archive_user(db, "sub-unarch", co["id"])
+    for s in (s_kept, s_also, s_ext, s_closed):
+        assert _mem_archived_at(db, u["id"], s["id"]) == archived["archived_at"]
+    # The site is archived AFTER the person: its cascade skips the already-archived row,
+    # which keeps the user's stamp -- unarchive_user must still not revive it onto a closed
+    # site (review fix C4).
+    sites.archive_site(db, s_closed["id"], co["id"])
+    assert _mem_archived_at(db, u["id"], s_closed["id"]) == archived["archived_at"]
+    db.execute("UPDATE companies SET status='suspended' WHERE id=%s", (other["id"],))
+
+    # Wrong company / not archived: None, nothing touched.
+    assert users.unarchive_user(db, "sub-unarch", other["id"]) is None
+    assert _mem_archived_at(db, u["id"], s_kept["id"]) is not None
+
+    row = users.unarchive_user(db, "sub-unarch", co["id"])
+    assert row is not None and row["archived_at"] is None
+    for s in (s_kept, s_also, s_ext):
+        assert _mem_archived_at(db, u["id"], s["id"]) is None, s["name"]
+    assert _mem_archived_at(db, u["id"], s_off["id"]) == earlier
+    assert _mem_archived_at(db, u["id"], s_closed["id"]) == archived["archived_at"]
+    assert set(memberships.accessible_site_ids(db, u["id"], "worker")) >= {
+        s_kept["id"], s_also["id"]}
+    assert s_off["id"] not in memberships.accessible_site_ids(db, u["id"], "worker")
+    assert users.unarchive_user(db, "sub-unarch", co["id"]) is None   # already live
+
+
+def test_unarchive_user_leaves_other_peoples_memberships_alone(db):
+    """Equal timestamps are matched per USER: a colleague archived in the same instant
+    (same transaction here) is not brought back with them."""
+    co = companies.create_company(db, "UnarchPair")
+    s = sites.create_site(db, co["id"], "S")
+    a = users.upsert_user(db, "sub-unarch-a", "ua-a@x.nz", company_id=co["id"])
+    b = users.upsert_user(db, "sub-unarch-b", "ua-b@x.nz", company_id=co["id"])
+    for u in (a, b):
+        memberships.ensure_membership(db, u["id"], s["id"], "worker")
+        users.archive_user(db, u["cognito_sub"], co["id"])
+    users.unarchive_user(db, "sub-unarch-a", co["id"])
+    assert _mem_archived_at(db, a["id"], s["id"]) is None
+    assert _mem_archived_at(db, b["id"], s["id"]) is not None
+    assert users.get_user_by_sub(db, "sub-unarch-b")["archived_at"] is not None
+
+
 def test_set_site_icon_and_update_site(db):
     co = companies.create_company(db, "IconCo")
     s = sites.create_site(db, co["id"], "Icon Site", location="Chch")

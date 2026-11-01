@@ -1,0 +1,284 @@
+"""SQL for company status changes and their Cognito work rows (company offboarding,
+spec docs/superpowers/specs/2026-11-01-company-offboarding-design.md §4, §5.3, §5.4, §8).
+
+Used by org-api's POST /companies/{id}/status and GET /companies/{id}/status-events. The
+caller runs every function here inside one `conn.transaction()` and maps a missing
+table/column (migration 0092 not applied yet) to 503; nothing here swallows errors.
+
+company_status_cognito rows are the work list of the async executor (Task 8):
+  * active -> suspended/exited: one 'disable' and one 'signout' row, state 'pending', per
+    user whose HOME company (users.company_id) is the company -- archived users included
+    (archiving never touched Cognito).
+  * inactive -> inactive: no rows (the first deactivation already listed the users).
+  * inactive -> active: still-pending disable/signout rows of the events since the company
+    was last active become 'failed' / SUPERSEDED_BY_REACTIVATION, and one 'enable' row is
+    created per user whose LATEST 'done' disable/enable row (across all of this company's
+    events, by updated_at, tie-break event at/id) is a 'disable' -- we disabled them and
+    have not re-enabled them since (§5.3). A user we never actually disabled is never
+    enabled; superseded (failed) rows never count either way.
+  * active -> inactive also fails still-pending 'enable' rows of earlier events
+    (SUPERSEDED_BY_DEACTIVATION), so a slow enable can never land after the new disable.
+"""
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
+SUPERSEDED_BY_REACTIVATION = "superseded by reactivation"
+SUPERSEDED_BY_DEACTIVATION = "superseded by deactivation"
+
+_STATUS_COLS = "status, status_changed_at, status_reason, billing_stopped_at, exited_at"
+
+
+def lock_company(conn, company_id) -> dict | None:
+    """The company's status fields, row-locked (FOR UPDATE) until the transaction ends.
+    Touches both audit tables first, so an unmigrated database fails here -- before any
+    write -- with UndefinedTable / UndefinedColumn."""
+    conn.execute("SELECT 1 FROM company_status_events WHERE false")
+    conn.execute("SELECT 1 FROM company_status_cognito WHERE false")
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT id, {_STATUS_COLS} FROM companies WHERE id = %s FOR UPDATE",
+        (company_id,)).fetchone()
+
+
+def read_status(conn, company_id) -> dict | None:
+    """The company's status fields (no lock)."""
+    return conn.cursor(row_factory=dict_row).execute(
+        f"SELECT id, {_STATUS_COLS} FROM companies WHERE id = %s", (company_id,)).fetchone()
+
+
+def apply_status(conn, company_id, to_status, reason, stop_billing) -> dict:
+    """Set the status. exited: exited_at and billing_stopped_at are set unless already set
+    (exited_at is the FIRST exit). suspended: billing_stopped_at likewise, only when
+    stop_billing. active: billing_stopped_at cleared (billing resumes), exited_at kept."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "UPDATE companies SET status = %(s)s, status_changed_at = now(), "
+        "  status_reason = %(r)s, "
+        "  exited_at = CASE WHEN %(s)s::text = 'exited' "
+        "    THEN COALESCE(exited_at, now()) ELSE exited_at END, "
+        "  billing_stopped_at = CASE "
+        "    WHEN %(s)s::text = 'exited' OR (%(s)s::text = 'suspended' AND %(sb)s::boolean) "
+        "      THEN COALESCE(billing_stopped_at, now()) "
+        "    WHEN %(s)s::text = 'active' THEN NULL "
+        "    ELSE billing_stopped_at END "
+        f"WHERE id = %(cid)s RETURNING {_STATUS_COLS}",
+        {"s": to_status, "r": reason, "sb": bool(stop_billing), "cid": company_id},
+    ).fetchone()
+
+
+def insert_event(conn, company_id, from_status, to_status, reason, actor_user_id,
+                 actor_sub, detail):
+    """Append one audit row; returns its id. `at` is clock_timestamp(), not now(), so
+    events written in one transaction still order (the reactivation window depends on
+    the order)."""
+    return conn.execute(
+        "INSERT INTO company_status_events "
+        "(company_id, from_status, to_status, reason, actor_user_id, actor_sub, at, detail) "
+        "VALUES (%s, %s, %s, %s, %s, %s, clock_timestamp(), %s) RETURNING id",
+        (company_id, from_status, to_status, reason, actor_user_id, actor_sub,
+         Jsonb(detail or {})),
+    ).fetchone()[0]
+
+
+def create_deactivation_rows(conn, event_id, company_id) -> dict:
+    """'disable' + 'signout' pending rows for every home user of the company (archived
+    included). Returns {"disable": n, "signout": n}."""
+    rows = conn.execute(
+        "INSERT INTO company_status_cognito (event_id, user_sub, action) "
+        "SELECT %s::uuid, u.cognito_sub, a.action "
+        "FROM users u CROSS JOIN (VALUES ('disable'), ('signout')) AS a(action) "
+        "WHERE u.company_id = %s AND btrim(u.cognito_sub) <> '' "
+        "ON CONFLICT (event_id, user_sub, action) DO NOTHING "
+        "RETURNING action",
+        (event_id, company_id)).fetchall()
+    out = {"disable": 0, "signout": 0}
+    for (action,) in rows:
+        out[action] += 1
+    return out
+
+
+def supersede_pending_enables(conn, event_id, company_id) -> int:
+    """Fail every still-pending 'enable' row of this company's earlier events."""
+    return conn.execute(
+        "UPDATE company_status_cognito c SET state = 'failed', last_error = %s, "
+        "  updated_at = now() "
+        "FROM company_status_events e "
+        "WHERE e.id = c.event_id AND e.company_id = %s AND e.id <> %s "
+        "  AND c.action = 'enable' AND c.state = 'pending'",
+        (SUPERSEDED_BY_DEACTIVATION, company_id, event_id)).rowcount
+
+
+# The events since the company was last active: after the most recent EARLIER event whose
+# to_status is 'active' (all events when there is none), never the new event itself.
+_SINCE_LAST_ACTIVE = (
+    "SELECT e.id FROM company_status_events e "
+    "WHERE e.company_id = %(cid)s AND e.id <> %(eid)s "
+    "  AND e.at > COALESCE((SELECT max(x.at) FROM company_status_events x "
+    "                       WHERE x.company_id = %(cid)s AND x.id <> %(eid)s "
+    "                         AND x.to_status = 'active'), '-infinity'::timestamptz)")
+
+
+def create_reactivation_rows(conn, event_id, company_id) -> dict:
+    """Fail the still-pending disable/signout rows of the events since last active, then
+    one pending 'enable' row per user whose latest 'done' disable/enable row of this
+    company is a 'disable' (per-user state, not a window: an enable superseded by a later
+    deactivation must not strand a user disabled by an earlier one).
+    Returns {"superseded": n, "enable": n}."""
+    params = {"cid": company_id, "eid": event_id, "err": SUPERSEDED_BY_REACTIVATION}
+    superseded = conn.execute(
+        "UPDATE company_status_cognito SET state = 'failed', last_error = %(err)s, "
+        "  updated_at = now() "
+        f"WHERE event_id IN ({_SINCE_LAST_ACTIVE}) "
+        "  AND action IN ('disable', 'signout') AND state = 'pending'",
+        params).rowcount
+    enabled = conn.execute(
+        "INSERT INTO company_status_cognito (event_id, user_sub, action) "
+        "SELECT %(eid)s::uuid, l.user_sub, 'enable' FROM ("
+        "  SELECT DISTINCT ON (c.user_sub) c.user_sub, c.action "
+        "  FROM company_status_cognito c "
+        "  JOIN company_status_events e ON e.id = c.event_id "
+        "  WHERE e.company_id = %(cid)s AND e.id <> %(eid)s "
+        "    AND c.state = 'done' AND c.action IN ('disable', 'enable') "
+        "  ORDER BY c.user_sub, c.updated_at DESC, e.at DESC, e.id DESC"
+        ") l WHERE l.action = 'disable' "
+        "ON CONFLICT (event_id, user_sub, action) DO NOTHING "
+        "RETURNING user_sub",
+        params).fetchall()
+    return {"superseded": superseded, "enable": len(enabled)}
+
+
+def home_user_count(conn, company_id) -> int:
+    """Users whose home company this is (archived included) -- the people the status
+    governs and the Cognito work covers."""
+    return conn.execute(
+        "SELECT count(*) FROM users WHERE company_id = %s AND btrim(cognito_sub) <> ''",
+        (company_id,)).fetchone()[0]
+
+
+def home_device_count(conn, company_id) -> int:
+    """Devices (device ledger) whose last heartbeat account is a home user of the company."""
+    return conn.execute(
+        "SELECT count(DISTINCT d.id) FROM devices d "
+        "JOIN users u ON u.cognito_sub = d.last_account_sub "
+        "WHERE u.company_id = %s",
+        (company_id,)).fetchone()[0]
+
+
+def count_sockets(conn, company_id) -> int:
+    """ws_connections rows of the company (company_id there is the connecting user's
+    home company, lambda_ws_connect)."""
+    return conn.execute(
+        "SELECT count(*) FROM ws_connections WHERE company_id = %s",
+        (company_id,)).fetchone()[0]
+
+
+def close_sockets(conn, company_id) -> int:
+    """Delete the company's ws_connections rows so no broadcast reaches them (§5.4)."""
+    return conn.execute(
+        "DELETE FROM ws_connections WHERE company_id = %s", (company_id,)).rowcount
+
+
+def list_events(conn, company_id) -> list[dict]:
+    """The company's audit trail, newest first, each with its Cognito rows (by user_sub,
+    action) under "cognito"."""
+    cur = conn.cursor(row_factory=dict_row)
+    events = cur.execute(
+        "SELECT id, from_status, to_status, reason, actor_user_id, actor_sub, at, detail "
+        "FROM company_status_events WHERE company_id = %s ORDER BY at DESC, id DESC",
+        (company_id,)).fetchall()
+    if not events:
+        return []
+    rows = cur.execute(
+        "SELECT event_id, user_sub, action, state, attempts, last_error, updated_at "
+        "FROM company_status_cognito WHERE event_id = ANY(%s) "
+        "ORDER BY user_sub, action",
+        ([e["id"] for e in events],)).fetchall()
+    by_event = {}
+    for r in rows:
+        by_event.setdefault(r.pop("event_id"), []).append(r)
+    for e in events:
+        e["cognito"] = by_event.get(e["id"], [])
+    return events
+
+
+# ---- the async executor's queries (Task 8, src/company_status_cognito.py) ---------------
+# A row is retryable while it is 'pending', or 'failed' with attempts left and not
+# superseded (superseded rows are final). COALESCE: NOT LIKE on a NULL last_error is NULL.
+_RETRYABLE = (
+    "(c.state = 'pending' OR (c.state = 'failed' AND c.attempts < %(max)s "
+    "  AND COALESCE(c.last_error, '') NOT LIKE 'superseded%%'))")
+_ROW_KEY = "c.event_id = %(eid)s AND c.user_sub = %(sub)s AND c.action = %(action)s"
+
+
+def event_company(conn, event_id):
+    """The company of a status event, or None when there is no such event."""
+    row = conn.execute("SELECT company_id FROM company_status_events WHERE id = %s",
+                       (event_id,)).fetchone()
+    return row[0] if row else None
+
+
+def list_retryable_cognito(conn, company_id, max_attempts) -> list[dict]:
+    """Every retryable Cognito row of the company, across all its events, in execution
+    order: oldest event first, then per user disable before signout (enable last)."""
+    return conn.cursor(row_factory=dict_row).execute(
+        "SELECT c.event_id, c.user_sub, c.action, c.state, c.attempts "
+        "FROM company_status_cognito c JOIN company_status_events e ON e.id = c.event_id "
+        f"WHERE e.company_id = %(cid)s AND {_RETRYABLE} "
+        "ORDER BY e.at, e.id, c.user_sub, "
+        "  CASE c.action WHEN 'disable' THEN 0 WHEN 'signout' THEN 1 ELSE 2 END",
+        {"cid": company_id, "max": max_attempts}).fetchall()
+
+
+def count_retryable_cognito(conn, company_id, max_attempts) -> int:
+    """How many rows list_retryable_cognito would return."""
+    return conn.execute(
+        "SELECT count(*) FROM company_status_cognito c "
+        "JOIN company_status_events e ON e.id = c.event_id "
+        f"WHERE e.company_id = %(cid)s AND {_RETRYABLE}",
+        {"cid": company_id, "max": max_attempts}).fetchone()[0]
+
+
+def lock_company_status(conn, company_id):
+    """The company's status, read under FOR SHARE: the status endpoint locks the row FOR
+    UPDATE before it changes the status or supersedes rows, so it waits until the
+    executor's transaction (one Cognito call) commits. None when there is no such company."""
+    row = conn.execute("SELECT status FROM companies WHERE id = %s FOR SHARE",
+                       (company_id,)).fetchone()
+    return row[0] if row else None
+
+
+def supersede_cognito_row(conn, event_id, user_sub, action, prev_state, prev_attempts,
+                          error) -> int:
+    """Fail one row as superseded (no Cognito call was made, so attempts is unchanged),
+    only if it is still as it was listed. Returns the rowcount (0: someone changed it)."""
+    return conn.execute(
+        "UPDATE company_status_cognito c SET state = 'failed', last_error = %(err)s, "
+        "  updated_at = now() "
+        f"WHERE {_ROW_KEY} AND c.state = %(ps)s AND c.attempts = %(pa)s",
+        {"eid": event_id, "sub": user_sub, "action": action, "ps": prev_state,
+         "pa": prev_attempts, "err": error}).rowcount
+
+
+def claim_cognito_row(conn, event_id, user_sub, action, prev_state, prev_attempts,
+                      max_attempts):
+    """Start one attempt: back to 'pending', attempts + 1, only if the row is still as it
+    was listed AND still retryable. Returns the new attempts, or None (someone changed it)."""
+    row = conn.execute(
+        "UPDATE company_status_cognito c SET state = 'pending', "
+        "  attempts = c.attempts + 1, updated_at = now() "
+        f"WHERE {_ROW_KEY} AND c.state = %(ps)s AND c.attempts = %(pa)s AND {_RETRYABLE} "
+        "RETURNING c.attempts",
+        {"eid": event_id, "sub": user_sub, "action": action, "ps": prev_state,
+         "pa": prev_attempts, "max": max_attempts}).fetchone()
+    return row[0] if row else None
+
+
+def finish_cognito_row(conn, event_id, user_sub, action, attempts, state,
+                       last_error) -> int:
+    """Record the attempt's outcome ('done' / 'failed'), only if the row is still the one
+    this attempt claimed (pending, same attempts) -- a supersede in between wins.
+    Returns the rowcount."""
+    return conn.execute(
+        "UPDATE company_status_cognito c SET state = %(s)s, last_error = %(err)s, "
+        "  updated_at = now() "
+        f"WHERE {_ROW_KEY} AND c.state = 'pending' AND c.attempts = %(n)s",
+        {"eid": event_id, "sub": user_sub, "action": action, "n": attempts, "s": state,
+         "err": last_error}).rowcount

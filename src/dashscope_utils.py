@@ -504,9 +504,11 @@ def tts(text):
 
     The `dashscope` package is imported lazily (inside this function, first
     call only -- see the module-level QwenTtsRealtime/... globals above) so
-    that importing this module never requires the SDK to be installed. The
-    prod minimal zip (deploy-lambda-code.sh) does NOT bundle it; only
-    AskAgentFunction, which carries DashScopeLayer, does."""
+    that importing this module never requires the SDK to be installed. Every
+    function is built from `CodeUri: src/`, so this module is in every
+    package, but the SDK itself is not: it comes from DashScopeLayer, which
+    only AskAgentFunction and AskVoiceWorkerFunction carry. (The hand-built
+    prod "minimal zip" this once guarded against was deleted 2026-10-31.)"""
     if not DASHSCOPE_API_KEY:
         raise RuntimeError("DASHSCOPE_API_KEY not set")
     if not text or not text.strip():

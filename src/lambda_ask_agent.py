@@ -50,6 +50,9 @@ logger.setLevel(logging.INFO)
 
 # Configuration
 RAG_SEARCH_FUNCTION = os.environ.get('RAG_SEARCH_FUNCTION', '')
+# rag-search's company-gate refusals (offboarding spec 2026-11-01 §5.1; the
+# tenancy_status reasons). Passed to the client as `error` next to today's answer.
+COMPANY_GATE_ERRORS = ("company_inactive", "account_archived")
 
 # Lazy lambda client (Phase 5 RAG path) -- mirrors the _s3_client-style lazy
 # singleton used elsewhere (lambda_ingest.py, lambda_extract_session.py):
@@ -1100,7 +1103,7 @@ def _metric_answer(caller_sub, question, metric, date_from, date_to, applied_sco
 
     logger.info("  metric=%s value=%s notes=%s", metric,
                 result.get("value"), result.get("notes"))
-    return {
+    out = {
         "answer": metric_render.render(question, result),
         "citations": [],
         "grounded": True,
@@ -1112,6 +1115,9 @@ def _metric_answer(caller_sub, question, metric, date_from, date_to, applied_sco
         "basis": basis,
         "applied_scope": applied_scope,
     }
+    if result.get("error") in COMPANY_GATE_ERRORS:
+        out["error"] = result["error"]
+    return out
 
 
 def _rag_answer(body, on_web_start=None):
@@ -1122,15 +1128,15 @@ def _rag_answer(body, on_web_start=None):
     ok() same as every other result.
 
     llm_utils / dashscope_utils are imported HERE (lazily), not at module
-    top level: scripts/deploy-lambda-code.sh zips lambda_ask_agent.py +
-    transcript_utils.py + llm_utils.py for the LEGACY hand-built prod (the
-    fieldsight-* lambdas outside CloudFormation/SAM entirely -- see CLAUDE.md
-    / the two-accounts note). A top-level `import llm_utils` would still
-    ImportModuleError the entire module there if that bundle were ever out of
-    sync (killing the legacy S3-file path too, not just RAG) -- lazy import
-    keeps this path degrading gracefully instead. That legacy prod's zip has
-    no dashscope_utils.py in it and no RAG_SEARCH_FUNCTION env var (it's not SAM-managed, so
-    template.yaml doesn't apply to it at all). This is UNRELATED to whether
+    top level. The original reason was the LEGACY hand-built prod lambdas
+    (fieldsight-*, outside CloudFormation/SAM), whose minimal zip carried
+    lambda_ask_agent.py + transcript_utils.py + llm_utils.py and no
+    dashscope_utils.py; a top-level import would have failed the whole
+    module there. Those lambdas and their minimal zip were deleted on
+    2026-10-31, and every SAM function is built from `CodeUri: src/`, so that
+    reason is gone; the lazy import is kept so importing this module stays
+    cheap and free of vendor SDKs. That legacy prod also had no
+    RAG_SEARCH_FUNCTION env var (template.yaml never applied to it). This is UNRELATED to whether
     THIS SAM pipeline's own prod target (fieldsight-prod-*, template.yaml)
     has RAG_SEARCH_FUNCTION -- it does, same as SAM test (see the
     caller_sub-and-RAG_SEARCH_FUNCTION guard in lambda_handler for that).
@@ -1555,7 +1561,7 @@ def _rag_answer(body, on_web_start=None):
                         "applied_scope": applied_scope,
                         "asked": asked if rewritten else None,
                     }
-            return {
+            no_records = {
                 "answer": "No relevant records found for this question.",
                 "citations": [],
                 "grounded": True,
@@ -1563,6 +1569,12 @@ def _rag_answer(body, on_web_start=None):
                 "applied_scope": applied_scope,
                 "asked": asked if rewritten else None,
             }
+            # The company gate (offboarding spec §5.1): the client gets the reason
+            # as `error` so it can tell "your company is suspended" from "nothing
+            # recorded". Other rag-search errors keep today's response.
+            if result.get("error") in COMPANY_GATE_ERRORS:
+                no_records["error"] = result["error"]
+            return no_records
 
         # The records may not answer this. Ask before spending a synthesis on
         # them, not after: measured worst case, answering first and looking up
@@ -2413,11 +2425,10 @@ def lambda_handler(event, context):
     # and template.yaml's own top-of-file Metadata says HasDb is true on
     # BOTH real SAM deploy targets (TEST via deploy.yml and PROD=fieldsight-
     # prod via deploy-prod.yml) -- so this branch is live on SAM prod too,
-    # not just test. (The LEGACY hand-built fieldsight-* lambdas -- deployed
-    # by scripts/deploy-lambda-code.sh, outside CloudFormation/SAM entirely
-    # -- are a different deploy target not governed by template.yaml at all;
-    # those never get RAG_SEARCH_FUNCTION and now answer 503 below.
-    # Don't conflate the two "prod"s.)
+    # not just test. (The LEGACY hand-built fieldsight-* lambdas, outside
+    # CloudFormation/SAM, never had RAG_SEARCH_FUNCTION and answered 503
+    # below; they were deleted on 2026-10-31, so the 503 now only covers a
+    # deploy without a rag-search function.)
     if body.get('caller_sub') and os.environ.get('RAG_SEARCH_FUNCTION'):
         if body.get('mode') == 'search':
             return ok(_rag_search_list(body))

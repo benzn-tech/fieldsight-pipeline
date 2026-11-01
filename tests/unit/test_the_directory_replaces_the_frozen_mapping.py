@@ -319,7 +319,14 @@ def test_the_template_schedules_the_directory_after_the_coordinates_and_before_r
 
 def test_org_api_may_read_and_write_exactly_that_one_key():
     t = _template()
-    assert t.count("${DataBucketName}/config/directory.json") == 1
+    # Two grants on that one key: org-api's (read + write), and -- company offboarding,
+    # Task 9 -- the backlog lambda's GetObject (it holds external-member notices while
+    # the site's company is inactive). Nothing else.
+    assert t.count("${DataBucketName}/config/directory.json") == 2
+    org_api = t[t.index("  OrgApiFunction:"):t.index("  LakeOpsFunction:")]
+    assert org_api.count("${DataBucketName}/config/directory.json") == 1
+    backlog = t[t.index("  ExtractionBacklogFunction:"):t.index("  ExtractionBacklogAlarm:")]
+    assert backlog.count("${DataBucketName}/config/directory.json") == 1
     assert "config/directory.json" in t[t.index("- config/site-coords.json"):][:600]   # ListBucket list
     assert "${DataBucketName}/config/*" not in t
 

@@ -183,13 +183,15 @@ def test_get_still_works_on_the_same_route(monkeypatch):
     monkeypatch.setattr(org.device_heartbeat, "record", lambda *a, **k: None)
     monkeypatch.setattr(org.companies, "list_companies",
                         lambda conn: [dict(EXISTING)])
+    monkeypatch.setattr(org.tenancy_status, "company_statuses", lambda conn: {})
     resp = org.lambda_handler({
         "httpMethod": "GET", "path": "/api/org/companies", "queryStringParameters": None,
         "body": None, "headers": {},
         "requestContext": {"authorizer": {"claims": {"sub": "sub-1"}}},
     }, None)
     assert resp["statusCode"] == 200
-    assert json.loads(resp["body"])["companies"] == [{"id": "c-old", "name": "Frequency"}]
+    assert json.loads(resp["body"])["companies"] == [{"id": "c-old", "name": "Frequency",
+                                                      "status": "active"}]
 
 
 def test_the_refusal_carries_the_existing_company_as_data(monkeypatch):

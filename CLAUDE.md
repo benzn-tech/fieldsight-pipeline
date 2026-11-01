@@ -17,11 +17,13 @@ FieldSight (formerly SiteSync) is an AI-powered construction site documentation 
 ## Architecture
 
 ```
-RealPTT Device → Lambda Orchestrator → S3 (raw media)
-  → Lambda Transcribe → AWS Transcribe → S3 (transcript JSON)
-  → Lambda Report Generator → Claude API → S3 (report JSON + Word)
-  → Lambda Meeting Minutes → Claude API → S3 (minutes JSON + Word)
+Device / web app → org-api upload URL → S3 users/ (raw media)
+  → VAD → audio_segments/ → Transcribe → transcripts/
+  → extract-session → extractions/ → item-writer → Aurora
+  → report-generator (nightly + on request) → reports/ → embed-report → ingest → Aurora
 ```
+(RealPTT orchestrator/downloader/Fargate removed in #1198, 2026-10-30. Full trigger map:
+`ARCHITECTURE.md` and `scripts/wire-s3-events.sh`.)
 
 ```
 S3 Upload (video/audio)
@@ -59,7 +61,7 @@ Frontend (CloudFront → S3)
 | `lambda_transcribe.py` | Triggers AWS Transcribe jobs on new audio |
 | `prompt_templates.json` | Hot-swappable prompt templates (S3: config/) |
 | `prompt_templates_meeting.json` | Meeting-specific prompt templates (S3: config/) |
-| `user_mapping.json` | Device → person name + role + site mapping (S3: config/) |
+| ~~`user_mapping.json`~~ | Retired: nothing reads it since M5 #1184 / #1198. Users, folders and sites come from Aurora and `config/directory.json`. |
 
 ---
 
@@ -73,7 +75,7 @@ transcripts/{display_name}/{date}/{device}_{date}_{time}_off{start}_to{end}_src{
 web_video/{display_name}/{date}/{device}_{date}_{time}.mp4                              ← H264 preview (H265 only)
 reports/{date}/{display_name}/daily_report.json                                         ← Generated reports
 meeting_minutes/{date}/{title}.json                                                     ← Meeting minutes
-config/user_mapping.json                                                                ← User/device mapping
+config/directory.json                                                                   ← Published directory (users/sites); user_mapping.json is retired
 config/prompt_templates.json                                                            ← Report generation prompts
 models/silero_vad.onnx                                                                  ← VAD model (ALWAYS use this, not Layer)
 ```
@@ -477,25 +479,18 @@ result = [u for u in all_users
 
 ## Lambda Deployment
 
-**CRITICAL: bundle the whole of `src/*.py` in every Lambda zip — do not pick modules.**
+**Deploy only through SAM** (`deploy.yml` for TEST from `develop`, `deploy-prod.yml`
+for prod from `main`). Every function is built from `CodeUri: src/`, so each package
+carries the whole of `src/*.py`.
 
-The two-file `zip -j rg.zip lambda_report_generator.py transcript_utils.py` that
-used to live here was accurate in 2026-03 and silently wrong by 2026-09: those
-handlers now import ~20 further local modules (`output_language`, `nz_time`,
-`weather`, `site_coords`, `deletion_mirror`, `agent_turn_filter`,
-`report_sections`, `batch_stitch`, …). `update-function-code` validates a zip,
-not an import graph, so a bundle missing one of them **deploys successfully** and
-then raises ImportError on the next cold start.
-
-Use the script; it globs `src/*.py` so it cannot fall behind an import again:
-
-```bash
-bash scripts/deploy-lambda-code.sh fieldsight ap-southeast-2
-```
-
-It already does `aws lambda wait function-updated` between functions. If you must
-do one by hand, bundle the same way — `zip -j fn.zip src/*.py` — and never a
-hand-picked subset.
+Never hand-zip a subset and `update-function-code` it. The two-file
+`zip -j rg.zip lambda_report_generator.py transcript_utils.py` that used to live here
+was right in 2026-03 and wrong by 2026-09: those handlers import ~20 further local
+modules (`output_language`, `nz_time`, `weather`, `site_coords`, …), and
+`update-function-code` validates a zip, not an import graph, so a short bundle
+**deploys successfully** and then raises ImportError on the next cold start. The
+`deploy-lambda-code.sh` script and `deploy-prod-code.yml` that served the hand-built
+March lambdas were removed when those lambdas were deleted (2026-10-31).
 
 ---
 
@@ -779,7 +774,7 @@ DbStack 加同名资源会 `RouteAlreadyExists` 冲突,要纳管须走 `cloudfor
 
 ### BUG-37: Lambda 里 `datetime.now()` 是 UTC —— 拿去和 NZ 日期比会偏一天
 Lambda 运行时时区是 UTC,`datetime.now()`(naive)= UTC。RealPTT 录音按 **NZ 客户端时间**记日期。
-orchestrator 用 `end_date = datetime.now()` 算查询窗口(`lambda_orchestrator.py`),NZ 上午
+orchestrator(已于 2026-10-30 随 #1198 移除,规则仍适用)用 `end_date = datetime.now()` 算查询窗口(`lambda_orchestrator.py`),NZ 上午
 (UTC 还是前一天)时窗口末端锚在 UTC 昨天,**漏掉今天 NZ 的录音**,要拖到 UTC 翻天(≈NZ 中午)才拉。
 2026-07-16 实证:NZ 10:49(UTC 07-15 22:49)查询窗口是 `[07-14,07-15]`,今早录音全在窗外。
 **Fix**(`compute_query_range`,已上线 PR #70):`datetime.now(timezone.utc) + timedelta(ms=time_difference_ms)`
@@ -1009,6 +1004,7 @@ Team/sites/编辑任务/编辑项目都是这么一个个加上去的),所以 pr
 的 schedule(`PROD_ENABLE_SCHEDULES=true`):orchestrator 15 分钟 sweep(工作时段 05:00–19:59 NZ)
 让录音**盘中进湖**(不再一天一次 19:00)。5 个遗留 `sitesync` schedule 已 DISABLED(定义保留可回滚)。
 plan `docs/superpowers/plans/2026-07-15-schedules-cutover.md`。
+**2026-10 更新**:orchestrator sweep 约 10-12 停用,2026-10-30 随 #1198 从栈中移除;设备直接上传,无下载环节。
 
 ---
 

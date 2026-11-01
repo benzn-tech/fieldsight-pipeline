@@ -63,6 +63,10 @@ def _wire(monkeypatch, objects, runs):
         calls.append((company_id, kw))
         return runs.pop(0)
     monkeypatch.setattr(api.company_export, "run", fake_run)
+    # the records export (runs first, same export id) is covered in
+    # test_company_records_export_wiring.py; here it is always already done
+    monkeypatch.setattr(api.company_records_export, "run",
+                        lambda *a, **k: {"done": True, "tables": {}, "files": []})
     return s3, conns, calls
 
 
