@@ -166,6 +166,25 @@ def test_lake_index_is_no_longer_a_global_prefix_and_export_requests_is():
     assert lake_keys.parse("export_requests/r1.json")["scope"] == "global"
 
 
+def test_an_action_pack_web_snapshot_carries_its_company_and_the_recorded_kind():
+    pack = "33333333-3333-3333-3333-333333333333"
+    key = "action_packs/%s/%s/web/W2.txt" % (U, pack)
+    p = lake_keys.parse(key)
+    assert (p["scope"], p["kind"], p["company_id"]) == ("tenant", "action_pack_web", U)
+    assert p["folder"] is None and p["site_id"] is None and p["sid"] is None
+    # The kind the store task records (lambda_org_api._action_pack_store), so a drain or
+    # backfill of the same key keeps it.
+    import inspect
+    import lambda_org_api
+    assert 'kind="action_pack_web"' in inspect.getsource(lambda_org_api._action_pack_store)
+    for bad in ("action_packs/%s/%s/web/W2.html" % (U, pack),
+                "action_packs/%s/%s/web/../W2.txt" % (U, pack),
+                "action_packs/not-a-uuid/%s/web/W2.txt" % pack,
+                "action_packs/%s/%s/other/W2.txt" % (U, pack),
+                "action_pack_requests/%s.json" % pack):
+        assert lake_keys.parse(bad) is None, bad
+
+
 def test_a_voiceprint_request_names_its_session():
     sid = "c" * 32
     got = lake_keys.parse("voiceprint_requests/%s/ada_2026-10-01_09-00-00_sid%s/m.json" % (U, sid))

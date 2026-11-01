@@ -1,0 +1,6 @@
+{
+  "note": "SYNTHETIC rates for the example only. A real price table is passed with --prices; nothing is hardcoded.",
+  "currency": "USD",
+  "per_1k_tokens": {"model-w-served": 0.01},
+  "default": 0.02
+}

@@ -315,6 +315,34 @@ Parameters:
       caller's last five conversations. Anything but 'true' is off. Set via
       TEST_ASK_THREADS / PROD_ASK_THREADS; an unset var keeps it off.
 
+  ActionPacks:
+    Type: String
+    Default: 'off'
+    AllowedValues: ['off', 'internal', 'on']
+    Description: >-
+      Background action agent (spec 2026-11-01): 'off' makes every
+      /api/org/action-packs route a 404 and refuses the worker's internal
+      tasks; 'internal' opens them to platform_admin only; 'on' to everyone
+      with access. Read per call (an env edit is the rollback).
+
+  ActionVerifierModel:
+    Type: String
+    Default: ''
+    Description: >-
+      Action packs verifier model (spec 2026-11-01 §4.4, §14 S6). Empty = the
+      cheap model in code (CORROBORATION_CHEAP_MODEL / web_answer.CHEAP_MODEL).
+      It must be a different model family from the writer (the Ask judge) as
+      actually served, or every pack fails 'model'. Set via
+      TEST_ACTION_VERIFIER_MODEL / PROD_ACTION_VERIFIER_MODEL.
+
+  ActionVerifierFallbacks:
+    Type: String
+    Default: ''
+    Description: >-
+      Action packs verifier fallbacks, comma-separated, tried in order when the
+      verifier is in the writer's family (§14 S6). Empty = none. Set via
+      TEST_ACTION_VERIFIER_FALLBACKS / PROD_ACTION_VERIFIER_FALLBACKS.
+
   CompanyStatusEnforce:
     Type: String
     Default: 'off'
@@ -2646,6 +2674,126 @@ Resources:
                   s3:prefix: ['ask_threads/*']
 
   # ----------------------------------------------------------
+  # Background action agent (spec 2026-11-01 §4.1, §4.2, §14 D3/S1/S8/S9/S16).
+  # Kicked off by org-api's request object action_pack_requests/<pack>.json on the
+  # DATA bucket (S3 event wired by scripts/wire-s3-events.sh, entry fs-action-agent;
+  # BUG-33: SAM cannot attach events to an external bucket, and the script also adds
+  # the s3.amazonaws.com invoke permission -- same as every other S3-triggered worker).
+  # NOT in the VPC: it calls models and the web. Its in-VPC hops are org-api's
+  # internal tasks (claim / heartbeat / store / fail) and rag-search, both by
+  # RequestResponse invoke -- the sendVoice -> voice-resolve direction.
+  # Retries 0: a retry would re-run a paid run; a duplicate S3 delivery loses the
+  # claim and exits. Reserved concurrency 3 caps the spend and keeps a burst of
+  # packs from starving anything else. Inert unless ActionPacks is internal/on.
+  # Gated on HasOrgApi (it is useless without org-api); RagSearchFunction is HasDb,
+  # which HasOrgApi implies.
+  # ----------------------------------------------------------
+  ActionAgentFunction:
+    Type: AWS::Serverless::Function
+    Condition: HasOrgApi
+    Properties:
+      FunctionName: !Sub ["${P}-action-agent", {P: !FindInMap [StageConfig, !Ref Stage, Prefix]}]
+      CodeUri: src/
+      Handler: lambda_action_agent.lambda_handler
+      Timeout: 900
+      MemorySize: 1024
+      ReservedConcurrentExecutions: 3
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+        # A request older than this is stale (the stale-run sweep fails a queued pack
+        # whose heartbeat is 20 min old). Lambda re-queues a throttled async event until
+        # this age, so it also bounds how long a burst waits behind the cap of 3.
+        MaximumEventAgeInSeconds: 900
+      Environment:
+        Variables:
+          ACTION_PACKS: !Ref ActionPacks
+          # Writer = the Ask judge setting; verifier empty (the parameter default) = the
+          # cheap model in code (CORROBORATION_CHEAP_MODEL / web_answer.CHEAP_MODEL).
+          # Fallbacks empty by default: the verifier must be a different family from the
+          # writer actually used (S6), so any fallback is a deliberate choice (repo
+          # variables *_ACTION_VERIFIER_MODEL / *_ACTION_VERIFIER_FALLBACKS).
+          ACTION_WRITER_MODEL: !Ref AskJudgeModel
+          ACTION_VERIFIER_MODEL: !Ref ActionVerifierModel
+          ACTION_VERIFIER_FALLBACKS: !Ref ActionVerifierFallbacks
+          # Per-run token cap (§4.2 cost guard): over it the run stores what is verified
+          # as a partial pack (run_trace.truncated).
+          ACTION_TOKEN_CAP: '400000'
+          # A backstop only. llm_utils measures this from the start of EACH call's
+          # fallback chain, not from the Lambda's start, so it bounds a single call that
+          # was given no deadline (780 < 900 Timeout - 60 store reserve) and says nothing
+          # about a call started late in the run. The real guard is in the code: every
+          # model call is given the run's remaining stage budget (ctx.left(stage) /
+          # ctx.deadline_for(stage) in lambda_action_agent), inside a 600 s target that
+          # keeps STORE_RESERVE_S for the store.
+          LLM_CHAIN_BUDGET_SECONDS: '780'
+          # One model attempt; a write or verify call gets 90 s (S8), so 300 is a ceiling,
+          # not a plan -- the stages pass their own deadlines.
+          LLM_HTTP_TIMEOUT: '300'
+          ORG_API_FUNCTION: !Ref OrgApiFunction
+          RAG_SEARCH_FUNCTION: !Ref RagSearchFunction
+          # Request objects + cancel markers (data bucket, org-api's S3_BUCKET) and web
+          # snapshots (lake bucket, org-api's LAKE_BUCKET): the same names org-api uses.
+          S3_BUCKET: !Ref DataBucketName
+          LAKE_BUCKET: !Ref IngestBucketName
+          # The model and tool plumbing, mirrored from AskVoiceWorkerFunction
+          # (tests/unit/test_action_agent_template.py pins the parity).
+          ANTHROPIC_API_KEY: !Ref ClaudeApiKey
+          DASHSCOPE_API_KEY: !Ref DashScopeApiKey
+          DASHSCOPE_BASE_URL: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+          DASHSCOPE_EMBED_MODEL: text-embedding-v4
+          DASHSCOPE_EMBED_DIM: '1024'
+          ENABLE_RERANK: !Ref EnableRerank
+          DASHSCOPE_RERANK_TIMEOUT_SECONDS: !Ref RerankTimeoutSeconds
+          RERANK_CANDIDATE_K: !Ref RerankCandidateK
+          CLAUDE_MODEL: claude-haiku-5-5
+          LLM_PROVIDER: !Ref LlmProvider
+          LLM_TEMPERATURE: !Ref LlmTemperature
+          QWEN_API_KEY: !If [UsesSeparateChatVendor, !Ref QwenChatApiKey, !Ref DashScopeApiKey]
+          QWEN_BASE_URL: !Ref QwenBaseUrl
+          QWEN_MODEL: !Ref QwenModelFast
+          LLM_REASONING_EFFORT: !Ref LlmReasoningEffortFast
+          CORROBORATION_API_KEY: !Ref CorroborationApiKey
+          CORROBORATION_PROVIDER_ORDER: !Ref CorroborationProviderOrder
+          ENABLE_WEB_ANSWER: !Ref EnableWebAnswer
+          PROJECT_DOCUMENTS: !Ref ProjectDocuments
+          ASK_JUDGE_MODEL: !Ref AskJudgeModel
+          ASK_JUDGE_FALLBACKS: !Ref AskJudgeFallbacks
+          ASK_JUDGE_PROVIDER: !Ref AskJudgeProvider
+          ASK_JUDGE_REASONING: !Ref AskJudgeReasoning
+      Layers:
+        - !Ref DashScopeLayer
+      Policies:
+        # Exact ARNs, not LambdaInvokePolicy: that grants `<name>*`.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource:
+                - !GetAtt OrgApiFunction.Arn
+                - !GetAtt RagSearchFunction.Arn
+        # Read the request object and probe the cancel marker. ListBucket so a missing
+        # marker answers 404, not 403 (a 403 fails the run: it is an IAM fault).
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}/action_pack_requests/*'
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub 'arn:aws:s3:::${DataBucketName}'
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - action_pack_requests/*
+        # Web snapshots (Task 9): action_packs/<company>/<pack>/web/<ref>.txt on the lake.
+        # org-api's store task records them in the lake ownership index.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub 'arn:aws:s3:::${IngestBucketName}/action_packs/*'
+
+  # ----------------------------------------------------------
   # Lambda Layer: dashscope SDK (SP-Ask TTS)
   # AskAgentFunction's tts() needs the Qwen-TTS-Realtime WebSocket client
   # (dashscope.audio.qwen_tts_realtime), not available via a plain HTTP call
@@ -2941,6 +3089,8 @@ Resources:
           # off -> /ask/threads answers 404 (see the AskThreads parameter). The
           # threads live in S3_BUCKET (DataBucketName) under ask_threads/.
           ASK_THREADS: !Ref AskThreads
+          # off -> /action-packs answers 404 (see the ActionPacks parameter)
+          ACTION_PACKS: !Ref ActionPacks
       Policies:
         # lake_put (lake ownership): every put also appends a line under lake_manifest/ in
         # the bucket it wrote to. PutObject on that one prefix, nothing else -- no tagging,
@@ -3206,6 +3356,9 @@ Resources:
                     # state.json, and a running export has no manifest yet. Without this a
                     # missing key answers 403, not 404, and the status poll would 500.
                     - exports/*
+                    # GET /action-packs/{id}/sources/{ref}/snapshot: a snapshot the run never
+                    # wrote must read as 404, not a 403 -> 500.
+                    - action_packs/*
             - Effect: Allow
               # Task 20 (content correction reindex chain): after a content
               # edit commits, org-api (in-VPC) writes the per-topic reindex
@@ -3390,6 +3543,21 @@ Resources:
             - Effect: Allow
               Action: s3:PutObject
               Resource: !Sub arn:aws:s3:::${IngestBucketName}/company_status_requests/*
+        # Action packs (spec 2026-11-01 §14 S1): POST /action-packs writes the kickoff request
+        # action_pack_requests/<pack>.json (pack id, caller sub, site id -- never the
+        # instruction) that triggers the non-VPC ActionAgent through wire-s3-events.sh, and
+        # cancel writes action_pack_requests/<pack>.cancel. Write only, this one prefix.
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${DataBucketName}/action_pack_requests/*
+            # The web snapshot viewer (GET /action-packs/{id}/sources/{ref}/snapshot) reads
+            # the page text the run stored on the lake (action_packs/<co>/<pack>/web/<ref>.txt,
+            # spec §3.2). Read only; the worker writes them.
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${IngestBucketName}/action_packs/*
       Events:
         OrgProxy:
           Type: Api
@@ -3441,6 +3609,8 @@ Resources:
   #                            one pending export_requests/ item
   #   company_status_cognito -- direct invoke: sweep one company's Cognito work rows
   #                            ({"event_id"} and/or {"company_id"}) when a marker was lost
+  #   backfill_task_numbers -- direct invoke: number the live action items with no task_no
+  #                            (action packs spec 2026-11-01 §14 D1), dry-run by default
   # No function invokes another here: the VPC has no route to the Lambda API, so the export
   # and company-status routes leave a request object in S3 and export_tick (S3 first, no DB
   # when idle) picks it up. Cognito is reached through the CognitoIdpEndpoint interface

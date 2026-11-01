@@ -1,0 +1,888 @@
+"""web_fetch: the action-pack page fetcher's SSRF guard, caps and robots (spec 2026-11-01
+background action agent §6, §14 S5; Task 9).
+
+No network anywhere: DNS is a fake resolver, the HTTPS connection is a fake factory, the
+clocks are fakes. The one test of the real pinned connection monkeypatches
+socket.create_connection and hands it a fake TLS context.
+"""
+import socket
+import ssl
+
+import pytest
+
+import web_fetch as wf
+
+PUBLIC = "93.184.216.34"
+PUBLIC6 = "2606:2800:220:1:248:1893:25c8:1946"
+
+
+# ------------------------------------------------------------------------ fakes
+
+class FakeResponse:
+    def __init__(self, status=200, headers=None, body=b"", chunk_log=None):
+        self.status = status
+        self._headers = {k.lower(): v for k, v in (headers or {}).items()}
+        self._body = body
+        self._pos = 0
+        self.reads = chunk_log if chunk_log is not None else []
+
+    def getheader(self, name, default=None):
+        return self._headers.get(name.lower(), default)
+
+    def read(self, n=None):
+        """http.client semantics: n bytes unless EOF comes first."""
+        n = len(self._body) - self._pos if n is None else n
+        self.reads.append(n)
+        out = self._body[self._pos:self._pos + n]
+        self._pos += len(out)
+        return out
+
+    def read1(self, n=-1):
+        """At most n bytes, whatever one recv would give (here: all that is buffered)."""
+        return self.read(len(self._body) - self._pos if n is None or n < 0 else n)
+
+
+class FakeConn:
+    def __init__(self, server, host, ip, port, timeout):
+        self.server, self.host, self.ip, self.port, self.timeout = server, host, ip, port, timeout
+        self.closed = False
+
+    def connect(self):
+        err = self.server.refuse.get(self.ip)
+        if err is not None:
+            raise err
+
+    def request(self, method, path, headers=None):
+        self.server.requests.append({"host": self.host, "ip": self.ip, "port": self.port,
+                                     "method": method, "path": path,
+                                     "headers": dict(headers or {})})
+        self._path = path
+
+    def getresponse(self):
+        route = self.server.routes.get((self.host, self._path))
+        if route is None:
+            if self._path == "/robots.txt":
+                return FakeResponse(404, {"Content-Type": "text/plain"}, b"")
+            raise AssertionError(f"unexpected request {self.host}{self._path}")
+        if isinstance(route, Exception):
+            raise route
+        return route
+
+    def close(self):
+        self.closed = True
+
+
+class FakeServer:
+    """Routes (host, path) -> FakeResponse; records every connection and request."""
+
+    def __init__(self, routes=None):
+        self.routes = dict(routes or {})
+        self.requests = []
+        self.connects = []
+        self.refuse = {}                    # ip -> exception raised by connect()
+
+    def connect(self, host, ip, port, timeout):
+        self.connects.append((host, ip, port))
+        return FakeConn(self, host, ip, port, timeout)
+
+
+def resolver_of(table):
+    calls = []
+
+    def resolve(host, port):
+        calls.append((host, port))
+        if host not in table:
+            raise socket.gaierror("no such host")
+        return list(table[host])
+    resolve.calls = calls
+    return resolve
+
+
+def html(body, ctype="text/html; charset=utf-8", status=200, extra=None):
+    headers = {"Content-Type": ctype}
+    headers.update(extra or {})
+    return FakeResponse(status, headers, body.encode("utf-8") if isinstance(body, str) else body)
+
+
+def make(routes=None, dns=None, **kw):
+    server = FakeServer(routes)
+    resolve = resolver_of(dns if dns is not None else {"example.org": [PUBLIC]})
+    f = wf.Fetcher(resolver=resolve, connect=server.connect,
+                   now=lambda: __import__("datetime").datetime(2026, 11, 1, 1, 2, 3,
+                                                               tzinfo=__import__("datetime").timezone.utc),
+                   **kw)
+    return f, server, resolve
+
+
+# ----------------------------------------------------------------- SSRF table
+
+@pytest.mark.parametrize("addr", [
+    "127.0.0.1", "127.8.9.10", "10.0.0.1", "172.16.5.4", "192.168.1.1", "169.254.169.254",
+    "169.254.1.1", "100.64.0.1", "100.127.255.254", "0.0.0.0", "224.0.0.1", "239.1.2.3",
+    "240.0.0.1", "255.255.255.255", "192.0.2.1", "198.18.0.1",
+    "::1", "::", "fe80::1", "fc00::1", "fd00:ec2::254", "fd12:3456::1", "ff02::1",
+    "::ffff:127.0.0.1", "::ffff:10.0.0.1", "::ffff:169.254.169.254", "::127.0.0.1",
+    "2002:7f00:0001::1",        # 6to4 embedding 127.0.0.1
+    "2002:a9fe:a9fe::1",        # 6to4 embedding 169.254.169.254
+    "64:ff9b::a9fe:a9fe",       # NAT64 embedding 169.254.169.254
+    "2001:0:4136:e378:8000:63bf:3fff:fdd2",   # Teredo
+    "fec0::1",                  # site-local
+])
+def test_blocked_addresses(addr):
+    assert wf.address_allowed(addr) is False
+
+
+# 6to4 (2002::/16) embedding a public address is not listed: newer stdlib patch releases
+# class all of 2002::/16 as private, and refusing it costs nothing.
+@pytest.mark.parametrize("addr", [PUBLIC, "8.8.8.8", "1.1.1.1", PUBLIC6])
+def test_public_addresses_allowed(addr):
+    assert wf.address_allowed(addr) is True
+
+
+@pytest.mark.parametrize("url,reason", [
+    ("http://example.org/", "scheme"),
+    ("ftp://example.org/", "scheme"),
+    ("file:///etc/passwd", "scheme"),
+    ("gopher://example.org/", "scheme"),
+    ("javascript:alert(1)", "scheme"),
+    ("https://user:pw@example.org/", "userinfo"),
+    ("https://user@example.org/", "userinfo"),
+    ("https://example.org:8443/", "port"),
+    ("https://example.org:80/", "port"),
+    ("https://example.org:99999/", "port"),
+    ("https:///nohost", "bad_host"),
+    ("https://127.0.0.1/", "blocked_address"),
+    ("https://169.254.169.254/latest/meta-data/", "blocked_address"),
+    ("https://10.1.2.3/", "blocked_address"),
+    ("https://[::1]/", "blocked_address"),
+    ("https://[fd00:ec2::254]/", "blocked_address"),
+    ("https://[::ffff:127.0.0.1]/", "blocked_address"),
+    ("https://[fe80::1%25eth0]/", "bad_host"),
+    ("https://2130706433/", "bad_host"),          # decimal 127.0.0.1
+    ("https://0x7f000001/", "bad_host"),          # hex
+    ("https://0177.0.0.1/", "bad_host"),          # octal
+    ("https://127.1/", "bad_host"),               # short form
+    ("https://localhost/", "bad_host"),
+    ("https://a.localhost/", "bad_host"),
+    ("https://exa mple.org/", "bad_url"),
+    ("https://example.org/\npath", "bad_url"),
+    ("", "bad_url"),
+    (None, "bad_url"),
+    ({"url": "https://example.org/"}, "bad_url"),
+])
+def test_vet_url_refusals(url, reason):
+    resolve = resolver_of({"example.org": [PUBLIC], "2130706433": ["127.0.0.1"],
+                           "0x7f000001": ["127.0.0.1"], "0177.0.0.1": ["127.0.0.1"],
+                           "127.1": ["127.0.0.1"], "localhost": ["127.0.0.1"],
+                           "a.localhost": ["127.0.0.1"]})
+    with pytest.raises(wf.Refused) as exc:
+        wf.vet_url(url, resolve)
+    assert exc.value.code == reason
+
+
+def test_numeric_host_forms_are_refused_after_resolution_too():
+    """If a numeric form slipped past the name check, the resolved address is what is
+    judged: a resolver answering 127.0.0.1 for an ordinary-looking name is refused."""
+    resolve = resolver_of({"evil.example": ["127.0.0.1"]})
+    with pytest.raises(wf.Refused) as exc:
+        wf.vet_url("https://evil.example/", resolve)
+    assert exc.value.code == "blocked_address"
+
+
+def test_one_public_and_one_private_answer_is_refused():
+    resolve = resolver_of({"mixed.example": [PUBLIC, "10.0.0.5"]})
+    with pytest.raises(wf.Refused) as exc:
+        wf.vet_url("https://mixed.example/", resolve)
+    assert exc.value.code == "blocked_address"
+    resolve = resolver_of({"mixed6.example": [PUBLIC6, "fd00:ec2::254"]})
+    with pytest.raises(wf.Refused) as exc:
+        wf.vet_url("https://mixed6.example/", resolve)
+    assert exc.value.code == "blocked_address"
+
+
+def test_dns_failure_and_empty_answer_are_refused():
+    with pytest.raises(wf.Refused) as exc:
+        wf.vet_url("https://nowhere.example/", resolver_of({}))
+    assert exc.value.code == "dns"
+    with pytest.raises(wf.Refused) as exc:
+        wf.vet_url("https://empty.example/", resolver_of({"empty.example": []}))
+    assert exc.value.code == "dns"
+
+
+def test_vet_url_pins_the_first_vetted_address_and_keeps_the_query_in_the_path():
+    t = wf.vet_url("https://Example.ORG./a/b?q=1#frag", resolver_of({"example.org": [PUBLIC]}))
+    assert (t.host, t.ip, t.path) == ("example.org", PUBLIC, "/a/b?q=1")
+    t = wf.vet_url("https://example.org:443", resolver_of({"example.org": [PUBLIC]}))
+    assert t.path == "/"
+
+
+def test_ip_literal_host_is_judged_without_dns():
+    resolve = resolver_of({})
+    t = wf.vet_url(f"https://{PUBLIC}/x", resolve)
+    assert t.ip == PUBLIC and resolve.calls == []
+
+
+@pytest.mark.parametrize("url", ["http://example.org/", "https://169.254.169.254/",
+                                 "https://user@example.org/", "https://example.org:8443/"])
+def test_fetch_never_connects_for_a_refused_url(url):
+    f, server, _ = make()
+    r = f.fetch(url)
+    assert r["ok"] is False and r["text"] is None and server.connects == []
+
+
+# --------------------------------------------------------- pinned connection
+
+def test_fetch_connects_to_the_vetted_ip_with_the_hostname_for_host_and_sni():
+    f, server, resolve = make({("example.org", "/page"): html("<p>Hi</p>")})
+    r = f.fetch("https://example.org/page")
+    assert r["ok"] is True
+    page = [c for c in server.connects if c[0] == "example.org"]
+    assert page and all(c == ("example.org", PUBLIC, 443) for c in page)
+    # One resolution per hop at most: robots + page share the vetted address of this run.
+    assert all(h == "example.org" for h, _ in resolve.calls)
+
+
+def test_dns_rebinding_cannot_swap_the_address_between_check_and_connect():
+    """The resolver answers public first, private afterwards. The connection still targets
+    the vetted public address because the fetcher never resolves twice for one hop."""
+    answers = [[PUBLIC], ["127.0.0.1"], ["127.0.0.1"], ["127.0.0.1"]]
+
+    def rebinding(host, port):
+        return answers.pop(0)
+    server = FakeServer({("rebind.example", "/"): html("<p>ok</p>")})
+    f = wf.Fetcher(resolver=rebinding, connect=server.connect, check_robots=False)
+    r = f.fetch("https://rebind.example/")
+    assert r["ok"] is True
+    assert server.connects == [("rebind.example", PUBLIC, 443)]
+
+
+def test_real_pinned_connection_dials_the_ip_and_verifies_the_hostname(monkeypatch):
+    dialled = {}
+
+    def fake_create_connection(addr, timeout=None, *a, **k):
+        dialled["addr"], dialled["timeout"] = addr, timeout
+        return "raw-socket"
+
+    class FakeContext:
+        verify_mode = ssl.CERT_REQUIRED
+        check_hostname = True
+
+        def wrap_socket(self, sock, server_hostname=None, do_handshake_on_connect=True):
+            dialled["wrapped"], dialled["sni"] = sock, server_hostname
+            dialled["lazy_handshake"] = do_handshake_on_connect is False
+            return FakeTLS()
+
+    class FakeTLS:
+        def do_handshake(self):
+            dialled["handshake"] = True
+
+    monkeypatch.setattr(wf.socket, "create_connection", fake_create_connection)
+    conn = wf.PinnedHTTPSConnection("example.org", PUBLIC, timeout=7, context=FakeContext())
+    conn.connect()
+    assert dialled == {"addr": (PUBLIC, 443), "timeout": 7, "wrapped": "raw-socket",
+                       "sni": "example.org", "lazy_handshake": True, "handshake": True}
+    assert isinstance(conn.sock, FakeTLS) and conn.host == "example.org"
+
+
+def test_default_tls_context_verifies_certificates():
+    conn = wf.PinnedHTTPSConnection("example.org", PUBLIC, timeout=5)
+    ctx = conn._context
+    assert ctx.check_hostname is True and ctx.verify_mode == ssl.CERT_REQUIRED
+
+
+def test_default_resolver_uses_getaddrinfo(monkeypatch):
+    seen = []
+
+    def fake_gai(host, port, *a, **k):
+        seen.append((host, port))
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (PUBLIC, port)),
+                (socket.AF_INET6, socket.SOCK_STREAM, 6, "", (PUBLIC6, port, 0, 0)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", (PUBLIC, port))]
+    monkeypatch.setattr(wf.socket, "getaddrinfo", fake_gai)
+    assert wf.default_resolver("example.org", 443) == [PUBLIC, PUBLIC6]
+    assert seen == [("example.org", 443)]
+
+
+# --------------------------------------------------------------- redirects
+
+def test_redirect_to_a_private_host_is_refused():
+    f, server, _ = make({("example.org", "/a"): FakeResponse(
+        302, {"Location": "https://inside.example/admin"})},
+        dns={"example.org": [PUBLIC], "inside.example": ["10.0.0.7"]})
+    r = f.fetch("https://example.org/a")
+    assert r["ok"] is False and r["reason"] == "blocked_address"
+    assert all(c[0] != "inside.example" for c in server.connects)
+
+
+def test_redirect_to_metadata_literal_is_refused():
+    f, server, _ = make({("example.org", "/a"): FakeResponse(
+        301, {"Location": "https://169.254.169.254/latest/meta-data/"})})
+    r = f.fetch("https://example.org/a")
+    assert r["reason"] == "blocked_address"
+    assert all(c[1] != "169.254.169.254" for c in server.connects)
+
+
+def test_redirect_to_http_is_refused():
+    f, _, _ = make({("example.org", "/a"): FakeResponse(
+        302, {"Location": "http://example.org/b"})})
+    assert f.fetch("https://example.org/a")["reason"] == "scheme"
+
+
+def test_relative_redirect_is_followed_and_rechecked():
+    f, server, _ = make({("example.org", "/a"): FakeResponse(307, {"Location": "/b?x=1"}),
+                         ("example.org", "/b?x=1"): html("<p>landed</p>")})
+    r = f.fetch("https://example.org/a")
+    assert r["ok"] is True and r["final_url"] == "https://example.org/b?x=1"
+    assert r["url"] == "https://example.org/a" and r["text"] == "landed"
+
+
+def test_three_redirects_are_followed_a_fourth_is_refused():
+    routes = {("example.org", f"/{i}"): FakeResponse(302, {"Location": f"/{i + 1}"})
+              for i in range(4)}
+    routes[("example.org", "/3")] = html("<p>three</p>")
+    f, _, _ = make(routes)
+    assert f.fetch("https://example.org/0")["text"] == "three"
+
+    routes[("example.org", "/3")] = FakeResponse(302, {"Location": "/4"})
+    routes[("example.org", "/4")] = html("<p>four</p>")
+    f, server, _ = make(routes)
+    r = f.fetch("https://example.org/0")
+    assert r["ok"] is False and r["reason"] == "too_many_redirects"
+    assert all(q["path"] != "/4" for q in server.requests)
+
+
+def test_redirect_without_location_fails():
+    f, _, _ = make({("example.org", "/a"): FakeResponse(302, {})})
+    assert f.fetch("https://example.org/a")["reason"] == "redirect_without_location"
+
+
+# ------------------------------------------------------------- size / type
+
+def test_download_is_capped_at_2_mb_and_marked_truncated():
+    body = b"a" * (wf.MAX_DOWNLOAD_BYTES + 500_000)
+    resp = FakeResponse(200, {"Content-Type": "text/plain"}, body)
+    f, _, _ = make({("example.org", "/big"): resp})
+    r = f.fetch("https://example.org/big")
+    assert r["ok"] is True and r["truncated"] is True
+    assert sum(resp.reads) <= wf.MAX_DOWNLOAD_BYTES + 1
+    assert len(r["text"].encode("utf-8")) <= wf.MAX_TEXT_BYTES
+
+
+def test_text_is_capped_at_200_kb_on_a_character_boundary():
+    body = ("中" * 100_000).encode("utf-8")       # 300 kB of 3-byte characters
+    f, _, _ = make({("example.org", "/zh"): FakeResponse(
+        200, {"Content-Type": "text/plain; charset=utf-8"}, body)})
+    r = f.fetch("https://example.org/zh")
+    assert r["truncated"] is True
+    raw = r["text"].encode("utf-8")
+    assert len(raw) <= wf.MAX_TEXT_BYTES and set(r["text"]) == {"中"}
+
+
+def test_small_page_is_not_truncated():
+    f, _, _ = make({("example.org", "/s"): html("<p>small</p>")})
+    r = f.fetch("https://example.org/s")
+    assert r["truncated"] is False and r["status"] == 200
+    assert r["fetched_at"] == "2026-11-01T01:02:03+00:00" and r["reason"] is None
+
+
+@pytest.mark.parametrize("ctype", ["application/pdf", "application/json", "image/png",
+                                   "application/xhtml+xml", "text/csv", None, ""])
+def test_other_content_types_are_refused_before_the_body_is_read(ctype):
+    headers = {} if ctype is None else {"Content-Type": ctype}
+    resp = FakeResponse(200, headers, b"%PDF-1.7")
+    f, _, _ = make({("example.org", "/f"): resp})
+    r = f.fetch("https://example.org/f")
+    assert r["ok"] is False and r["reason"] == "content_type" and r["text"] is None
+    assert resp.reads == []
+
+
+def test_compressed_body_is_refused():
+    f, server, _ = make({("example.org", "/g"): html("x", extra={"Content-Encoding": "gzip"})})
+    assert f.fetch("https://example.org/g")["reason"] == "content_encoding"
+    assert server.requests[-1]["headers"]["Accept-Encoding"] == "identity"
+
+
+def test_non_200_status_fails_with_its_status():
+    f, _, _ = make({("example.org", "/x"): html("nope", status=404)})
+    r = f.fetch("https://example.org/x")
+    assert (r["ok"], r["reason"], r["status"]) == (False, "http_status", 404)
+
+
+def test_request_carries_a_descriptive_user_agent():
+    f, server, _ = make({("example.org", "/s"): html("<p>s</p>")})
+    f.fetch("https://example.org/s")
+    page = [q for q in server.requests if q["path"] == "/s"][0]
+    assert page["headers"]["User-Agent"] == wf.USER_AGENT
+    assert wf.ROBOTS_TOKEN in wf.USER_AGENT and page["method"] == "GET"
+
+
+def test_network_error_is_a_failure_not_a_raise():
+    f, _, _ = make({("example.org", "/n"): ConnectionResetError("reset")})
+    r = f.fetch("https://example.org/n")
+    assert r["ok"] is False and r["reason"] == "network"
+
+
+def test_ssl_error_is_a_failure_not_a_raise():
+    f, _, _ = make({("example.org", "/n"): ssl.SSLCertVerificationError("bad cert")})
+    assert f.fetch("https://example.org/n")["reason"] == "tls"
+
+
+def test_slow_drip_body_hits_the_page_deadline():
+    t = [0.0]
+
+    class Drip(FakeResponse):
+        def read1(self, n=-1):
+            t[0] += 4.0                     # every recv costs 4 s of (fake) time
+            return b"x" * min(10, n)
+
+    server = FakeServer({("example.org", "/slow"): Drip(200, {"Content-Type": "text/plain"})})
+    f = wf.Fetcher(resolver=resolver_of({"example.org": [PUBLIC]}), connect=server.connect,
+                   clock=lambda: t[0], page_timeout=10, check_robots=False)
+    r = f.fetch("https://example.org/slow")
+    assert r["ok"] is False and r["reason"] == "timeout"
+
+
+def test_socket_timeout_never_exceeds_the_page_budget():
+    seen = []
+    server = FakeServer({("example.org", "/s"): html("<p>s</p>")})
+
+    def connect(host, ip, port, timeout):
+        seen.append(timeout)
+        return server.connect(host, ip, port, timeout)
+    f = wf.Fetcher(resolver=resolver_of({"example.org": [PUBLIC]}), connect=connect,
+                   page_timeout=6, check_robots=False)
+    f.fetch("https://example.org/s")
+    assert seen and all(0 < s <= 6 for s in seen)
+
+
+# -------------------------------------------------------------- HTML -> text
+
+def test_html_to_text_drops_scripts_styles_and_head():
+    text = wf.html_to_text(
+        "<html><head><title>T</title><style>p{}</style><script>var a=1;</script></head>"
+        "<body><h1>Header</h1><p>First &amp; <b>bold</b></p><div>Second</div>"
+        "<noscript>ns</noscript><ul><li>one</li><li>two</li></ul>"
+        "<script>evil()</script>tail</body></html>")
+    assert text == "Header\nFirst & bold\nSecond\none\ntwo\ntail"
+
+
+def test_charset_from_header_is_used():
+    body = "<p>café</p>".encode("latin-1")
+    f, _, _ = make({("example.org", "/l"): FakeResponse(
+        200, {"Content-Type": "text/html; charset=ISO-8859-1"}, body)})
+    assert f.fetch("https://example.org/l")["text"] == "café"
+
+
+def test_unknown_charset_falls_back_to_utf8():
+    f, _, _ = make({("example.org", "/u"): FakeResponse(
+        200, {"Content-Type": "text/plain; charset=nonsense-9"}, "héllo".encode())})
+    assert f.fetch("https://example.org/u")["text"] == "héllo"
+
+
+# ------------------------------------------------------------------- robots
+
+ROBOTS_DENY = b"User-agent: *\nDisallow: /private/\n"
+
+
+def test_robots_disallow_skips_the_page():
+    f, server, _ = make({("example.org", "/robots.txt"): FakeResponse(
+        200, {"Content-Type": "text/plain"}, ROBOTS_DENY)})
+    r = f.fetch("https://example.org/private/page")
+    assert r["ok"] is False and r["reason"] == "robots"
+    assert [q["path"] for q in server.requests] == ["/robots.txt"]
+
+
+def test_robots_is_fetched_once_per_host_per_run():
+    f, server, _ = make({("example.org", "/robots.txt"): FakeResponse(
+        200, {"Content-Type": "text/plain"}, ROBOTS_DENY),
+        ("example.org", "/a"): html("<p>a</p>"), ("example.org", "/b"): html("<p>b</p>")})
+    assert f.fetch("https://example.org/a")["ok"] and f.fetch("https://example.org/b")["ok"]
+    assert [q["path"] for q in server.requests].count("/robots.txt") == 1
+
+
+def test_robots_for_our_token_is_honoured():
+    f, _, _ = make({("example.org", "/robots.txt"): FakeResponse(
+        200, {"Content-Type": "text/plain"},
+        b"User-agent: FieldSightBot\nDisallow: /\n\nUser-agent: *\nAllow: /\n")})
+    assert f.fetch("https://example.org/x")["reason"] == "robots"
+
+
+@pytest.mark.parametrize("robots", [
+    FakeResponse(404, {"Content-Type": "text/html"}, b"missing"),
+    FakeResponse(403, {"Content-Type": "text/html"}, b"forbidden"),
+    FakeResponse(401, {}, b""),
+    FakeResponse(410, {}, b""),
+])
+def test_robots_4xx_allows_all(robots):
+    """RFC 9309 2.3.1.3: an unavailable (4xx) robots.txt means no restrictions."""
+    f, _, _ = make({("example.org", "/robots.txt"): robots,
+                    ("example.org", "/a"): html("<p>a</p>")})
+    assert f.fetch("https://example.org/a")["ok"] is True
+
+
+@pytest.mark.parametrize("robots", [
+    FakeResponse(500, {"Content-Type": "text/html"}, b"oops"),
+    FakeResponse(503, {}, b""),
+    ConnectionResetError("reset"),
+    socket.timeout("timed out"),
+    ssl.SSLError("handshake"),
+])
+def test_robots_unreachable_disallows_all(robots):
+    """RFC 9309 2.3.1.4: a 5xx or an unreachable robots.txt means complete disallow. The
+    verdict is cached: no page on that host is fetched in this run."""
+    f, server, _ = make({("example.org", "/robots.txt"): robots,
+                         ("example.org", "/a"): html("<p>a</p>"),
+                         ("example.org", "/b"): html("<p>b</p>")})
+    for path in ("/a", "/b"):
+        r = f.fetch("https://example.org" + path)
+        assert r["ok"] is False and r["reason"] == "robots_unavailable"
+    assert [q["path"] for q in server.requests] == ["/robots.txt"]
+
+
+def test_robots_is_fetched_through_the_same_guard():
+    """robots.txt redirecting to a private host is refused by the guard: unreachable, so
+    disallow all. The private host is never contacted."""
+    f, server, _ = make({("example.org", "/robots.txt"): FakeResponse(
+        302, {"Location": "https://inside.example/robots.txt"}),
+        ("example.org", "/a"): html("<p>a</p>")},
+        dns={"example.org": [PUBLIC], "inside.example": ["192.168.0.2"]})
+    assert f.fetch("https://example.org/a")["reason"] == "robots_unavailable"
+    assert all(c[0] != "inside.example" for c in server.connects)
+
+
+def test_redirect_target_robots_is_checked_too():
+    f, _, _ = make({("example.org", "/a"): FakeResponse(302, {"Location": "https://other.example/p"}),
+                    ("other.example", "/robots.txt"): FakeResponse(
+                        200, {"Content-Type": "text/plain"}, b"User-agent: *\nDisallow: /\n")},
+                   dns={"example.org": [PUBLIC], "other.example": ["8.8.4.4"]})
+    assert f.fetch("https://example.org/a")["reason"] == "robots"
+
+
+# ------------------------------------------------------------------- logging
+
+def test_logs_never_carry_the_url_or_page_text(caplog):
+    caplog.set_level("DEBUG")
+    f, _, _ = make({("example.org", "/p?token=SECRET"): html("<p>PAGE-TEXT</p>")})
+    f.fetch("https://example.org/p?token=SECRET")
+    f.fetch("http://example.org/p?token=SECRET")
+    joined = "\n".join(r.getMessage() for r in caplog.records)
+    assert "SECRET" not in joined and "PAGE-TEXT" not in joined and "/p" not in joined
+
+
+# ------------------------------------------------------------- review fixes
+
+def test_non_ascii_path_is_percent_encoded_not_an_internal_error():
+    f, server, _ = make({("example.org", "/caf%C3%A9?q=%C3%A9"): html("<p>ok</p>")})
+    r = f.fetch("https://example.org/café?q=é")
+    assert r["ok"] is True
+    assert server.requests[-1]["path"] == "/caf%C3%A9?q=%C3%A9"
+
+
+def test_existing_percent_escapes_are_kept():
+    t = wf.vet_url("https://example.org/a%20b?x=%2F", resolver_of({"example.org": [PUBLIC]}))
+    assert t.path == "/a%20b?x=%2F"
+
+
+def test_ipv6_literal_robots_url_is_bracketed():
+    server = FakeServer({(PUBLIC6, "/robots.txt"): FakeResponse(
+        200, {"Content-Type": "text/plain"}, b"User-agent: *\nDisallow: /\n")})
+    f = wf.Fetcher(resolver=resolver_of({}), connect=server.connect)
+    assert f.fetch(f"https://[{PUBLIC6}]/p")["reason"] == "robots"
+
+
+def test_host_header_is_left_to_http_client():
+    """http.client writes Host itself (and brackets an IPv6 literal); an explicit Host
+    header would suppress that."""
+    f, server, _ = make({("example.org", "/s"): html("<p>s</p>")})
+    f.fetch("https://example.org/s")
+    assert all("Host" not in q["headers"] for q in server.requests)
+
+
+def test_connection_is_closed_when_the_deadline_passes_after_the_response():
+    t = [0.0]
+    conns = []
+    server = FakeServer({("example.org", "/s"): html("<p>s</p>")})
+
+    def connect(host, ip, port, timeout):
+        c = server.connect(host, ip, port, timeout)
+        conns.append(c)
+        orig = c.getresponse
+
+        def slow():
+            t[0] += 20
+            return orig()
+        c.getresponse = slow
+        return c
+    f = wf.Fetcher(resolver=resolver_of({"example.org": [PUBLIC]}), connect=connect,
+                   clock=lambda: t[0], page_timeout=10, check_robots=False)
+    assert f.fetch("https://example.org/s")["reason"] == "timeout"
+    assert conns and all(c.closed for c in conns)
+
+
+# ------------------------------------------------------- fix round 1: pinning order
+
+def test_vetted_addresses_put_ipv4_first():
+    t = wf.vet_url("https://dual.example/", resolver_of({"dual.example": [PUBLIC6, PUBLIC,
+                                                                          PUBLIC6, "8.8.8.8"]}))
+    assert t.ips == (PUBLIC, "8.8.8.8", PUBLIC6) and t.ip == PUBLIC
+
+
+def test_connect_failure_tries_the_next_vetted_address_without_resolving_again():
+    server = FakeServer({("multi.example", "/"): html("<p>ok</p>")})
+    server.refuse[PUBLIC] = ConnectionRefusedError("refused")
+    resolve = resolver_of({"multi.example": [PUBLIC, "8.8.8.8"]})
+    f = wf.Fetcher(resolver=resolve, connect=server.connect, check_robots=False)
+    r = f.fetch("https://multi.example/")
+    assert r["ok"] is True
+    assert server.connects == [("multi.example", PUBLIC, 443), ("multi.example", "8.8.8.8", 443)]
+    assert resolve.calls == [("multi.example", 443)]
+
+
+def test_every_vetted_address_failing_is_a_network_failure():
+    server = FakeServer({})
+    server.refuse[PUBLIC] = ConnectionRefusedError("refused")
+    server.refuse["8.8.8.8"] = OSError("unreachable")
+    f = wf.Fetcher(resolver=resolver_of({"multi.example": [PUBLIC, "8.8.8.8"]}),
+                   connect=server.connect, check_robots=False)
+    assert f.fetch("https://multi.example/")["reason"] == "network"
+    assert len(server.connects) == 2
+
+
+def test_tls_failure_on_connect_is_final():
+    server = FakeServer({})
+    server.refuse[PUBLIC] = ssl.SSLCertVerificationError("bad cert")
+    f = wf.Fetcher(resolver=resolver_of({"multi.example": [PUBLIC, "8.8.8.8"]}),
+                   connect=server.connect, check_robots=False)
+    assert f.fetch("https://multi.example/")["reason"] == "tls"
+    assert len(server.connects) == 1
+
+
+# ------------------------------------------------------- fix round 1: charset
+
+@pytest.mark.parametrize("charset", ["base64", "zlib", "rot13", "hex", "uu"])
+def test_a_non_text_codec_charset_falls_back_to_utf8(charset):
+    f, _, _ = make({("example.org", "/c"): FakeResponse(
+        200, {"Content-Type": f"text/plain; charset={charset}"}, "héllo".encode())})
+    r = f.fetch("https://example.org/c")
+    assert r["ok"] is True and r["text"] == "héllo"
+
+
+# --------------------------------------- fix round 1: the deadline on a real socket
+# A loopback server thread (no internet). The guard refuses loopback, so these call the
+# fetcher's one-hop path (_exchange) with a hand-made Target and a plain HTTP connection to
+# the local port: what is under test is the deadline, not the guard or TLS.
+
+import http.client  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+
+DEADLINE_S = 1.0
+MARGIN_S = 0.75
+
+
+def _local_server(script):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    stop = threading.Event()
+
+    def run():
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            return
+        try:
+            conn.recv(65536)                    # the request
+            script(conn, stop)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    return srv, stop
+
+
+def _drip(conn, stop, data, every=0.1):
+    for i in range(len(data)):
+        if stop.wait(every):
+            return
+        conn.sendall(data[i:i + 1])
+
+
+def _run_hop(script):
+    srv, stop = _local_server(script)
+    port = srv.getsockname()[1]
+    try:
+        f = wf.Fetcher(connect=lambda host, ip, p, timeout: http.client.HTTPConnection(
+            ip, port, timeout=timeout), page_timeout=DEADLINE_S)
+        target = wf.Target(url="https://loopback.test/", host="loopback.test",
+                           ips=("127.0.0.1",), path="/")
+        started = time.monotonic()
+        with pytest.raises(wf._Fail) as exc:
+            f._exchange(target, started + DEADLINE_S, max_bytes=wf.MAX_DOWNLOAD_BYTES,
+                        types=wf.ALLOWED_TYPES)
+        return exc.value.code, time.monotonic() - started
+    finally:
+        stop.set()
+        srv.close()
+
+
+def test_header_phase_drip_is_stopped_at_the_deadline():
+    """Every byte arrives well inside the socket timeout, so only the deadline watchdog
+    can stop getresponse()."""
+    head = b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * 400 + b"\r\n\r\n"
+    code, elapsed = _run_hop(lambda c, stop: _drip(c, stop, head))
+    assert code == "timeout" and elapsed < DEADLINE_S + MARGIN_S
+
+
+def test_body_phase_drip_is_stopped_at_the_deadline():
+    head = (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100000\r\n"
+            b"Connection: close\r\n\r\n")
+
+    def script(c, stop):
+        c.sendall(head)
+        _drip(c, stop, b"x" * 100000)
+    code, elapsed = _run_hop(script)
+    assert code == "timeout" and elapsed < DEADLINE_S + MARGIN_S
+
+
+def test_body_phase_silence_is_stopped_at_the_deadline():
+    head = (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100000\r\n"
+            b"Connection: close\r\n\r\n")
+
+    def script(c, stop):
+        c.sendall(head + b"x" * 10)
+        stop.wait(30)
+    code, elapsed = _run_hop(script)
+    assert code == "timeout" and elapsed < DEADLINE_S + MARGIN_S
+
+
+def test_local_page_inside_the_deadline_is_read_whole():
+    body = b"hello from loopback"
+    head = (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n"
+            b"Connection: close\r\n\r\n" % len(body))
+    srv, stop = _local_server(lambda c, s: c.sendall(head + body))
+    port = srv.getsockname()[1]
+    try:
+        f = wf.Fetcher(connect=lambda host, ip, p, timeout: http.client.HTTPConnection(
+            ip, port, timeout=timeout))
+        target = wf.Target(url="https://loopback.test/", host="loopback.test",
+                           ips=("127.0.0.1",), path="/")
+        out = f._exchange(target, time.monotonic() + 5, max_bytes=wf.MAX_DOWNLOAD_BYTES,
+                          types=wf.ALLOWED_TYPES)
+        assert out[0] == "ok" and out[3] == body and out[4] is False
+    finally:
+        stop.set()
+        srv.close()
+
+
+# ------------------------------------------- fix round 2: EOF is not completion
+
+class _AbortableServer(FakeServer):
+    """A connection whose abort() (the watchdog's hook) makes a blocked read1 return b"" --
+    what a POSIX recv does after shutdown(SHUT_RDWR)."""
+
+    def __init__(self, routes=None):
+        super().__init__(routes)
+        self.aborted = threading.Event()
+
+    def connect(self, host, ip, port, timeout):
+        conn = super().connect(host, ip, port, timeout)
+        conn.abort = self.aborted.set
+        return conn
+
+
+class _BlockingBody(FakeResponse):
+    def __init__(self, aborted):
+        super().__init__(200, {"Content-Type": "text/plain"}, b"")
+        self.aborted, self.calls = aborted, 0
+
+    def read1(self, n=-1):
+        self.calls += 1
+        if self.calls == 1:
+            return b"first part "
+        self.aborted.wait(10)            # blocked until the watchdog aborts the socket
+        return b""                       # ... and then it looks like a clean EOF
+
+
+def test_a_watchdog_abort_that_looks_like_eof_is_a_timeout_not_a_page():
+    server = _AbortableServer()
+    server.routes[("example.org", "/blk")] = _BlockingBody(server.aborted)
+    f = wf.Fetcher(resolver=resolver_of({"example.org": [PUBLIC]}), connect=server.connect,
+                   page_timeout=0.3, check_robots=False)
+    started = time.monotonic()
+    r = f.fetch("https://example.org/blk")
+    assert server.aborted.is_set()
+    assert r["ok"] is False and r["reason"] == "timeout" and r["text"] is None
+    assert time.monotonic() - started < 1.5
+
+
+def test_the_eof_check_alone_catches_an_eof_after_the_deadline():
+    """Without relying on the watchdog flag: an empty read after the deadline is a timeout."""
+    t = [0.0]
+
+    class LateEOF(FakeResponse):
+        def read1(self, n=-1):
+            t[0] += 20
+            return b""
+    server = FakeServer({("example.org", "/late"): LateEOF(200, {"Content-Type": "text/plain"})})
+    f = wf.Fetcher(resolver=resolver_of({"example.org": [PUBLIC]}), connect=server.connect,
+                   clock=lambda: t[0], page_timeout=10, check_robots=False)
+    assert f.fetch("https://example.org/late")["reason"] == "timeout"
+
+
+class _LengthResponse(FakeResponse):
+    """http.client's `length`: Content-Length bytes not yet read."""
+
+    def __init__(self, declared, body):
+        super().__init__(200, {"Content-Type": "text/plain",
+                               "Content-Length": str(declared)}, body)
+        self.length = declared
+
+    def read1(self, n=-1):
+        out = super().read1(n)
+        self.length -= len(out)
+        return out
+
+
+def test_eof_before_content_length_is_never_a_complete_page():
+    f, _, _ = make({("example.org", "/cut"): _LengthResponse(100, b"x" * 10)})
+    r = f.fetch("https://example.org/cut")
+    assert r["ok"] is False and r["reason"] == "truncated_body" and r["text"] is None
+
+
+def test_body_matching_content_length_is_complete():
+    f, _, _ = make({("example.org", "/whole"): _LengthResponse(10, b"y" * 10)})
+    r = f.fetch("https://example.org/whole")
+    assert r["ok"] is True and r["text"] == "y" * 10 and r["truncated"] is False
+
+
+def test_loopback_server_closing_before_content_length_is_truncated_body():
+    head = (b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100\r\n"
+            b"Connection: close\r\n\r\n")
+    srv, stop = _local_server(lambda c, s: c.sendall(head + b"x" * 10))
+    port = srv.getsockname()[1]
+    try:
+        f = wf.Fetcher(connect=lambda host, ip, p, timeout: http.client.HTTPConnection(
+            ip, port, timeout=timeout))
+        target = wf.Target(url="https://loopback.test/", host="loopback.test",
+                           ips=("127.0.0.1",), path="/")
+        with pytest.raises(wf._Fail) as exc:
+            f._exchange(target, time.monotonic() + 5, max_bytes=wf.MAX_DOWNLOAD_BYTES,
+                        types=wf.ALLOWED_TYPES)
+        assert exc.value.code == "truncated_body"
+    finally:
+        stop.set()
+        srv.close()
+
+
+def test_robots_follows_up_to_five_redirects():
+    routes = {("example.org", "/robots.txt"): FakeResponse(302, {"Location": "/r1"})}
+    for i in range(1, 5):
+        routes[("example.org", f"/r{i}")] = FakeResponse(302, {"Location": f"/r{i + 1}"})
+    routes[("example.org", "/r5")] = FakeResponse(
+        200, {"Content-Type": "text/plain"}, b"User-agent: *\nDisallow: /\n")
+    f, _, _ = make(routes)
+    assert f.fetch("https://example.org/page")["reason"] == "robots"
+    assert wf.MAX_ROBOTS_REDIRECTS == 5 and wf.MAX_REDIRECTS == 3

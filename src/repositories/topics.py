@@ -15,6 +15,7 @@ from deleted_predicates import (
     visible_topics_predicate,
 )
 from psycopg.types.json import Jsonb
+from tenancy_status import not_migrated
 
 from repositories import findings
 
@@ -160,6 +161,29 @@ def ensure_placeholder_topic(conn, site_id, report_date, title, *, user_id, sour
         return None
     return upsert_topic(conn, site_id, report_date, title, user_id=user_id,
                         source_s3_key=source_s3_key, time_range=time_range)
+
+
+def ensure_agent_topic(conn, source_s3_key, site_id, title, report_date, user_id) -> dict:
+    """An action pack's synthetic parent topic (spec §3.4): the VISIBLE topic carrying
+    `source_s3_key` ('agent://action_pack/<pack_id>'), or a new one with source='agent'.
+    Takes the per-key advisory lock first (the same lock item-writer takes for a source),
+    so two concurrent creates from one pack cannot both insert. An existing topic is
+    returned as it is: title/date/user are the FIRST apply's. Re-extraction never matches
+    this key -- every supersede/delete path keys on an extraction or report key."""
+    conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (source_s3_key,))
+    cur = conn.cursor(row_factory=dict_row)
+    present = cur.execute(
+        f"SELECT {_TOPIC_COLS} FROM topics t WHERE t.source_s3_key = %s "
+        f"AND {visible_topics_predicate('t')} ORDER BY t.created_at LIMIT 1",
+        (source_s3_key,),
+    ).fetchone()
+    if present is not None:
+        return present
+    return cur.execute(
+        f"INSERT INTO topics (site_id, user_id, source_s3_key, report_date, title, source) "
+        f"VALUES (%s,%s,%s,%s,%s,'agent') RETURNING {_TOPIC_COLS}",
+        (site_id, user_id, source_s3_key, report_date, title),
+    ).fetchone()
 
 
 # CHILD_OF_VISIBLE_TOPIC now lives in deleted_predicates (Track B Task 2): it grew a
@@ -771,6 +795,9 @@ def list_topics_for_date(conn, site_ids, report_date, *, author_ids=None,
         t["safety_observations"] = (_findings_as_safety_rows(t_findings)
                                     or safety_by_topic.get(t["id"], []))
         t["findings"] = t_findings
+        # False does NOT mean nightly on its own: an action pack's topic
+        # ('agent://action_pack/<id>') is also False and carries source='agent' --
+        # read (is_live, source) together; 'agent' is labelled "Agent" (spec §14 D2).
         t["is_live"] = bool(t["source_s3_key"]) and t["source_s3_key"].startswith("extractions/")
 
     return topic_rows
@@ -918,7 +945,7 @@ def report_date_counts(conn, site_ids, since_date, *, author_ids=None) -> list[d
     ).fetchall()
 
 
-def _prefix_or_merged(merged_keys):
+def _prefix_or_merged(merged_keys, extra_topic_ids=None):
     """The prefix condition, widened by exact merged keys when there are any.
 
     UNION ONLY. No DELETION predicate is added here, and that is deliberate
@@ -942,15 +969,62 @@ def _prefix_or_merged(merged_keys):
     the lead's user_id, a member off the lead's site is cut by the site filter,
     and adding the lead to author_ids would leak that lead's OTHER solo topics.
     The key names the merged rows and nothing else.
+
+    `extra_topic_ids` (action packs spec §14 D2) unions exact topic ids -- the
+    agent-created topics of this day, whose `agent://` key matches no recorder
+    prefix. By id, not by key: one pack's key is shared by its topics on every
+    site and apply date, so a key union would pull in other days.
     """
     cond = "t.source_s3_key LIKE %s ESCAPE '\\'"
     if merged_keys:
         cond += " OR t.source_s3_key = ANY(%s)"
+    if extra_topic_ids:
+        cond += " OR t.id = ANY(%s::uuid[])"
     return cond
 
 
+def agent_topic_author_for_folder_day(conn, folder, report_date):
+    """The users.id behind `folder` when that person has an agent-created topic
+    (`source='agent'`) on `report_date`, else None.
+
+    The day view's cheap probe (action packs spec §14 D2): ONE indexed SELECT --
+    idx_users_folder_global (folder_name is globally unique, migration 0012) into the
+    partial idx_topics_agent_user_date (migration 0094), which holds only agent topics.
+    Visibility and reach are NOT checked here; `agent_topic_ids_for_day` does that on a
+    hit. No folder -> None without a round-trip."""
+    if not folder:
+        return None
+    row = conn.execute(
+        "SELECT t.user_id FROM users u JOIN topics t ON t.user_id = u.id "
+        "WHERE u.folder_name = %s AND t.report_date = %s AND t.source = 'agent' LIMIT 1",
+        (folder, report_date),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def agent_topic_ids_for_day(conn, user_id, report_date, site_ids) -> list[str]:
+    """Ids of the visible agent-created topics (`source='agent'`, action packs spec
+    §3.4/§14 D2) that `user_id` applied on `report_date`, on `site_ids` (the reader's
+    reach -- the caller still clips the rows by site afterwards). The day view unions
+    them into the recorder's day by id (`list_topics_for_source_prefix`'s
+    `extra_topic_ids`). Uses idx_topics_site_date. Empty `site_ids` or no user -> []
+    without a round-trip."""
+    if not site_ids or user_id is None:
+        return []
+    rows = conn.execute(
+        "SELECT t.id FROM topics t "
+        "WHERE t.site_id = ANY(%s::uuid[]) AND t.report_date = %s "
+        "AND t.user_id = %s AND t.source = 'agent' "
+        f"AND {visible_topics_predicate('t')} "
+        "ORDER BY t.created_at, t.id",
+        ([str(s) for s in site_ids], report_date, user_id),
+    ).fetchall()
+    return [str(r[0]) for r in rows]
+
+
 def list_topics_for_source_prefix(conn, source_prefix, *, merged_keys=None,
-                                  include_superseded=False) -> list[dict]:
+                                  include_superseded=False,
+                                  extra_topic_ids=None) -> list[dict]:
     """org-api timeline shim read (authority-flip Task 4): all topics whose
     source_s3_key starts with source_prefix (typically
     f"extractions/{user_folder}/{date}/"), so the shim can render the
@@ -988,7 +1062,7 @@ def list_topics_for_source_prefix(conn, source_prefix, *, merged_keys=None,
     every row `superseded_at` or not, or a delete leaves a superseded copy behind that no
     batch ever covers."""
     escaped = _escape_like(source_prefix)
-    where = f"WHERE ({_prefix_or_merged(merged_keys)})"
+    where = f"WHERE ({_prefix_or_merged(merged_keys, extra_topic_ids)})"
     if not include_superseded:
         where += f" AND {LIVE_TOPIC_PREDICATE.format(alias='t')}"
     topic_rows = conn.cursor(row_factory=dict_row).execute(
@@ -1001,7 +1075,8 @@ def list_topics_for_source_prefix(conn, source_prefix, *, merged_keys=None,
         f"LEFT JOIN users u ON u.id = t.user_id "
         f"{where} "
         f"ORDER BY t.time_range NULLS LAST, t.created_at, t.id",
-        tuple([escaped + '%'] + ([list(merged_keys)] if merged_keys else [])),
+        tuple([escaped + '%'] + ([list(merged_keys)] if merged_keys else [])
+              + ([[str(i) for i in extra_topic_ids]] if extra_topic_ids else [])),
     ).fetchall()
 
     if not topic_rows:
@@ -1138,6 +1213,18 @@ def get_topic_full(conn, topic_id) -> dict | None:
 # One statement, so "unknown", "hidden" and "out of reach" are the same None.
 # Casts are explicit because Postgres cannot infer a type for `%s IS NULL`
 # (a CASE WHEN %s IS NULL once returned 500 in production with every test green).
+def _topic_not_hidden(alias="t"):
+    """get_topic_visible's own hide rule beyond visible_topics_predicate: not non_work,
+    and no ACTIVE redaction of the topic, whatever its scope. Shared with the action-pack
+    items tool, which must not hand the agent a topic this rule hides."""
+    return (f"{alias}.work_class IS DISTINCT FROM 'non_work' "
+            # Same rule as redactions.company_excluded_topic_ids: ANY active redaction,
+            # whatever its scope. The pinned block is stricter than retrieval on purpose
+            # (spec §4.4 records the asymmetry).
+            "AND NOT EXISTS (SELECT 1 FROM redactions ra WHERE ra.target_type = 'topic' "
+            f"AND ra.target_id = {alias}.id AND ra.reverted_at IS NULL)")
+
+
 _TOPIC_VISIBLE_SQL = (
     "SELECT t.id, t.title, t.summary, t.report_date, t.site_id, "
     "       s.name AS site_name, t.user_id, t.time_range "
@@ -1146,12 +1233,7 @@ _TOPIC_VISIBLE_SQL = (
     "AND t.site_id = ANY(%(site_ids)s::uuid[]) "
     "AND (%(author_ids)s::uuid[] IS NULL OR t.user_id = ANY(%(author_ids)s::uuid[])) "
     f"AND {visible_topics_predicate('t')} "
-    "AND t.work_class IS DISTINCT FROM 'non_work' "
-    # Same rule as redactions.company_excluded_topic_ids: ANY active redaction,
-    # whatever its scope. The pinned block is stricter than retrieval on purpose
-    # (spec §4.4 records the asymmetry).
-    "AND NOT EXISTS (SELECT 1 FROM redactions ra WHERE ra.target_type = 'topic' "
-    "AND ra.target_id = t.id AND ra.reverted_at IS NULL)"
+    f"AND {_topic_not_hidden('t')}"
 )
 
 _TOPIC_VISIBLE_ACTION_ITEMS_SQL = (
@@ -1337,16 +1419,23 @@ def _ask_tools_extraction_presence():
         " OR (t.user_id IS NULL AND x.user_id IS NULL AND x.site_id = t.site_id)))")
 
 
-def _ask_tools_where(site_ids, *, author_ids, site_id, user_id):
+def _ask_tools_where(site_ids, *, author_ids, site_id, user_id, include_agent=False):
     """Every clause EXCEPT the outer deletion arms: each caller interpolates
     `visible_topics_predicate("t")` into its own statement, where the
-    deleted-read scan (tests/unit/test_deleted_read_paths.py) can see it."""
+    deleted-read scan (tests/unit/test_deleted_read_paths.py) can see it.
+
+    include_agent=True (the action-pack items tool only, spec §14 S4) also admits
+    agent-created topics (`source = 'agent'`, key `agent://action_pack/<id>`), which the
+    family rule's key prefixes never match. Every other clause -- site reach, author
+    filter, non_work -- applies to them unchanged. Off (every Ask caller), the SQL is
+    exactly what it always was."""
     site_list = [str(s) for s in site_ids]
     clauses = ["t.site_id = ANY(%s::uuid[])",
                "t.work_class IS DISTINCT FROM 'non_work'",
                "(t.source_s3_key LIKE 'extractions/%%'"
                " OR (t.source_s3_key LIKE 'reports/%%' AND NOT "
-               + _ask_tools_extraction_presence() + "))"]
+               + _ask_tools_extraction_presence() + ")"
+               + (" OR t.source = 'agent'" if include_agent else "") + ")"]
     params = [site_list, site_list]
     if author_ids is not None:
         # = ANY never matches a NULL user_id, so unattributed topics stay hidden.
@@ -1401,3 +1490,91 @@ def latest_visible_topic_date(conn, site_ids, before, *, author_ids=None,
         f"AND {visible_topics_predicate('t')} AND t.report_date < %s",
         params + [before]).fetchone()
     return row[0].isoformat() if row and row[0] else None
+
+
+def _like_literal(text):
+    """`text` as an ILIKE substring pattern: % and _ (and the escape char) are literal."""
+    esc = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{esc}%"
+
+
+def _scoped_items(conn, site_ids, author_ids, site_id, statuses, query, task_no, limit,
+                  *, ledger):
+    """The items tool's one statement, in two shapes from one template: with the task-number
+    ledger (migration 0093) LEFT JOINed, or without it (task_no NULL) -- so the two cannot
+    drift. DISTINCT ON keeps one row per stable_id, the newest live one (the row
+    action_items.get_live_by_stable_id -- and so apply -- acts on); the item filters run
+    AFTER it, so a filter never resurrects an older row of the same stable_id."""
+    where, params = _ask_tools_where(site_ids, author_ids=author_ids, site_id=site_id,
+                                     user_id=None, include_agent=True)
+    # lower(): the column is free text; validate_request lower-cases the filter values.
+    outer, oparams = ["lower(x.status) = ANY(%s)"], [[s.lower() for s in statuses]]
+    if query:
+        outer.append("x.text ILIKE %s ESCAPE '\\'")
+        oparams.append(_like_literal(query))
+    if task_no is not None:
+        outer.append("x.task_no = %s")
+        oparams.append(task_no)
+    sql = (
+        "SELECT x.* FROM (SELECT DISTINCT ON (a.stable_id) a.stable_id, "
+        + ("n.task_no" if ledger else "NULL::integer") + " AS task_no, "
+        "a.text, a.status, a.deadline, a.responsible, a.priority, a.updated_at, "
+        "a.created_at, a.site_id, s.name AS site, a.topic_id, t.report_date, t.source "
+        "FROM action_items a JOIN topics t ON t.id = a.topic_id "
+        "JOIN sites s ON s.id = a.site_id "
+        + ("LEFT JOIN action_task_numbers n ON n.stable_id = a.stable_id " if ledger else "")
+        + f"WHERE {where} AND {visible_topics_predicate('t')} AND {_topic_not_hidden('t')} "
+        "AND a.site_id = t.site_id "
+        "ORDER BY a.stable_id, a.created_at DESC, a.id) x "
+        f"WHERE {' AND '.join(outer)} "
+        "ORDER BY x.site, x.site_id, x.task_no NULLS LAST, x.created_at, x.stable_id "
+        "LIMIT %s")
+    return conn.cursor(row_factory=dict_row).execute(
+        sql, params + oparams + [limit]).fetchall()
+
+
+def scoped_items_rows(conn, site_ids, *, author_ids=None, site_id=None,
+                      statuses=("open", "in_progress", "blocked"), query=None,
+                      task_no=None, limit=50, timeout_ms=None) -> list[dict]:
+    """Live action items under the Ask tools' scope plus agent-created topics (action packs
+    items tool, spec §13 / §14 S4). Read-only.
+
+    Scope: `_ask_tools_where(include_agent=True)` -- the caller's site reach and author
+    filter, non_work dropped, the extraction/report family rule -- AND
+    visible_topics_predicate (not deleted, not superseded) AND get_topic_visible's hide rule
+    (`_topic_not_hidden`: no active redaction of any scope). Empty site_ids, an empty (not
+    None) author set or no statuses means nothing is visible -- never 'no filter'.
+
+    timeout_ms: a statement_timeout for the read (transaction-local, restored after), so a
+    slow or blocked read ends inside the caller's deadline as psycopg.errors.QueryCanceled.
+
+    Order: site name, task_no NULLS LAST, created_at (stable_id breaks ties). Fetches up to
+    `limit` rows; the caller asks for limit + 1 to detect truncation.
+
+    The task-number ledger may not exist yet (sam deploy runs before migrate): the joined
+    read runs in a SAVEPOINT and on 42P01 the read is redone without it (task_no None); a
+    task_no filter then matches nothing."""
+    if not site_ids or (author_ids is not None and not author_ids) or not statuses:
+        return []
+    args = (conn, site_ids, author_ids, site_id, statuses, query, task_no, limit)
+
+    def read(ledger):
+        with conn.transaction():
+            prev = None
+            if timeout_ms is not None:
+                prev = conn.execute("SELECT current_setting('statement_timeout')").fetchone()[0]
+                conn.execute("SELECT set_config('statement_timeout', %s, true)",
+                             (str(max(1, int(timeout_ms))),))
+            rows = _scoped_items(*args, ledger=ledger)
+            if prev is not None:
+                conn.execute("SELECT set_config('statement_timeout', %s, true)", (prev,))
+            return rows
+
+    try:
+        return read(True)
+    except psycopg.Error as exc:
+        if not not_migrated(exc):
+            raise
+    if task_no is not None:
+        return []
+    return read(False)

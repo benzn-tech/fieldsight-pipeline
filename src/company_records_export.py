@@ -268,6 +268,11 @@ NOT_EXPORTED = (
     ("topic_threads", "recurring-item threads across topics"),
     ("topic_thread_suggestions", "suggested links of topics to recurring-item threads"),
     ("action_status_suggestions", "suggested action item status changes awaiting review"),
+    ("action_task_numbers", "the per-site task numbers (#N) shown for action items"),
+    ("action_packs", "action agent runs (instruction, reading, conclusion, run state)"),
+    ("action_pack_sources", "the records, documents and web pages an action agent run cited"),
+    ("action_pack_actions", "actions an action agent run proposed, and whether they were "
+                            "applied"),
     ("programme_progress_suggestions", "suggested programme task progress awaiting review"),
     ("checklist_reports", "inspection / checklist reports made from a spoken check (status "
                           "and the result file key)"),

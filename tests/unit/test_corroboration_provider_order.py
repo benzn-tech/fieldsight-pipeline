@@ -122,8 +122,10 @@ def test_template_parameter_and_both_functions():
     block = text.split("\n  CorroborationProviderOrder:\n", 1)[1].split("\n\n", 1)[0]
     assert "Default: 'google-ai-studio,google-vertex'" in block
     assert re.search(r"AllowedPattern: '\^\(off\|", block)
+    # AskAgent, the voice worker and the action agent (spec 2026-11-01: its web lane runs
+    # web_answer, which reads both).
     assert text.count("CORROBORATION_PROVIDER_ORDER: !Ref CorroborationProviderOrder") == \
-        text.count("CORROBORATION_API_KEY: !Ref CorroborationApiKey") == 2
+        text.count("CORROBORATION_API_KEY: !Ref CorroborationApiKey") == 3
 
 
 def test_template_default_matches_the_code():

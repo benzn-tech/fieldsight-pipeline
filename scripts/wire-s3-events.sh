@@ -16,6 +16,7 @@
 #   TemplateDigitise ← template_digitise_requests/**.json (org-api's request to read an uploaded form)
 #   ProjectDocIndex ← project_doc_requests/**.json (org-api's request to index an uploaded project document)
 #   Ingest      ← project_doc_vectors/**.json  (project-doc worker output, in-VPC Aurora apply)
+#   ActionAgent ← action_pack_requests/**.json (org-api's request to run one action pack)
 #
 # SAFETY:
 #   * MERGE, not clobber: we read the existing notification config and
@@ -55,6 +56,7 @@ SESSION_FINALIZE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-
 SPEAKER_EMBED_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-speaker-embed"
 TEMPLATE_DIGITISE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-template-digitise"
 PROJECT_DOC_INDEX_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-project-doc-index"
+ACTION_AGENT_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${PREFIX}-action-agent"
 
 echo "Bucket=${BUCKET} Stage=${STAGE} VAD=${PREFIX}-vad Transcribe=${PREFIX}-transcribe EmbedReport=${PREFIX}-embed-report Ingest=${PREFIX}-ingest ExtractSession=${PREFIX}-extract-session ItemWriter=${PREFIX}-item-writer ProgrammeMatcher=${PREFIX}-programme-matcher Keyframe=${PREFIX}-keyframe"
 
@@ -293,9 +295,52 @@ else
   echo "NOTE: ${PREFIX}-speaker-embed not deployed — skipping speaker-embed trigger"
 fi
 
+# NOTE(action packs, spec 2026-11-01 §14 D3/S1): the non-VPC agent triggers on
+# action_pack_requests/*.json -- org-api's request to run one pack (pack id, caller sub,
+# site id; never the instruction). The cancel marker org-api writes beside it is
+# action_pack_requests/<pack>.cancel, which the .json suffix excludes. The agent's only S3
+# write is web snapshots under action_packs/<company>/<pack>/web/ on the lake bucket (the
+# same bucket as this one on prod) -- "action_packs/" and "action_pack_requests/" are not
+# prefixes of each other and no rule matches .txt, so there is no BUG-13 loop; the prefix
+# is disjoint from every other wired prefix (tests/unit/test_search_index_wiring.py).
+# ActionAgentFunction is conditional (HasOrgApi), hence the fn_exists guard.
+#
+# Prod wiring is an OWNER step (spec D3), so this rule is ADDED only on test, or when the
+# caller sets WIRE_ACTION_AGENT=true. Anywhere else it is KEPT: an fs-action-agent rule
+# already on the bucket (the owner wired it once) is carried over unchanged below, because
+# the merge replaces every fs-* entry and a later prod deploy without the variable would
+# otherwise silently unwire it. Prod's owner command:
+#   WIRE_ACTION_AGENT=true bash scripts/wire-s3-events.sh fieldsight-data-509194952652 prod ap-southeast-2 --apply
+# If the function is gone the rule is dropped (S3 refuses a config naming a missing fn).
+action_agent_mode() {  # <stage> -> add | keep
+  if [ "$1" = "test" ] || [ "${WIRE_ACTION_AGENT:-}" = "true" ]; then echo add; else echo keep; fi
+}
+ACTION_AGENT_MODE=skip
+if fn_exists "${PREFIX}-action-agent"; then
+  ACTION_AGENT_MODE="$(action_agent_mode "$STAGE")"
+  if [ "$ACTION_AGENT_MODE" = "add" ]; then
+    WIRE_FNS+=("${PREFIX}-action-agent")
+    DESIRED=$(jq -c --arg arn "$ACTION_AGENT_ARN" '. + [
+    {"Id":"fs-action-agent","LambdaFunctionArn":$arn,"Events":["s3:ObjectCreated:*"],
+     "Filter":{"Key":{"FilterRules":[{"Name":"prefix","Value":"action_pack_requests/"},{"Name":"suffix","Value":".json"}]}}}
+  ]' <<<"$DESIRED")
+  else
+    echo "NOTE: ${PREFIX}-action-agent not added on ${STAGE} (owner step: WIRE_ACTION_AGENT=true); an existing fs-action-agent rule is kept"
+  fi
+else
+  echo "NOTE: ${PREFIX}-action-agent not deployed — skipping action-agent trigger"
+fi
+
 CURRENT=$(aws s3api get-bucket-notification-configuration --bucket "$BUCKET" --output json 2>/dev/null || echo '{}')
 # A bucket with NO notification config returns EMPTY stdout (success) — not JSON.
 [ -n "$CURRENT" ] || CURRENT='{}'
+
+# Carry an owner-wired fs-action-agent rule over (see the action-agent NOTE above).
+if [ "$ACTION_AGENT_MODE" = "keep" ]; then
+  DESIRED=$(jq -c --argjson cur "$CURRENT" \
+    '. + [($cur.LambdaFunctionConfigurations // [])[] | select(.Id == "fs-action-agent")]' \
+    <<<"$DESIRED")
+fi
 
 # Keep every non-"fs-" lambda config + all SNS/SQS/EventBridge entries; replace our fs-* set.
 # RETIRE_IDS: comma-separated non-"fs-" notification Ids to DROP in this same

@@ -327,6 +327,73 @@ def _documents(event):
     return {"documents": json.loads(json.dumps(rows, default=str)), "site_count": len(site_ids)}
 
 
+def _iso(value):
+    """Dates/timestamps as ISO strings -- what apply's snapshot comparison normalises to
+    (action_pack_view.same_value); str(datetime) would put a space where ISO has 'T'."""
+    return value.isoformat() if hasattr(value, "isoformat") else value
+
+
+def _items(event):
+    """Action items in the caller's scope, for the background action agent (action packs
+    spec §13 "items mode", §14 S4). Read-only.
+
+    The caller is the event's `sub` (injected by ask_items.run from the run's creator,
+    never chosen by a model), gated and scoped exactly like the Ask tools: visible_scope's
+    site reach (inactive companies already dropped) and author filter, through
+    topics._ask_tools_where with agent topics admitted. `args` is re-validated here.
+    `site_id` narrows inside the reach and never widens it: out of reach is "no_match".
+
+    Result: {"rows": [...], "meta": {"truncated": bool, "empty_reason"?, "error"?,
+    "site_count"}}. Logs counts only."""
+    import ask_items
+    import psycopg
+    from rag_tools_dispatch import _deadline
+    norm, err = ask_items.validate_request(event.get("args"))
+    if err:
+        return {"rows": [], "meta": dict(err)}
+    # The same deadline rule as the tools batch (absent -> 20 s; 0, negative, NaN -> no
+    # time), enforced on the read itself as a statement timeout.
+    deadline = _deadline(event)
+    if deadline <= 0:
+        return {"rows": [], "meta": {"error": "timeout"}}
+    sub = event.get("sub")
+    conn = get_cached_connection()
+    caller = users.get_user_by_sub(conn, sub) if sub else None
+    if caller is None:
+        logger.info("rag-search items: caller not provisioned")
+        return {"rows": [], "meta": {"error": "not_provisioned"}}
+    blocked = tenancy_status.caller_blocked(conn, caller, where="rag-search:items")
+    if blocked:                                   # company offboarding gate (§5.1)
+        return {"rows": [], "error": blocked, "meta": {"error": blocked}}
+    vs = scope.visible_scope(conn, caller)
+    site_ids = sorted(str(s).lower() for s in vs["site_ids"])
+    author_ids = (sorted(str(a) for a in vs["author_ids"])
+                  if vs["author_ids"] is not None else None)
+    meta = {"site_count": len(site_ids)}
+    if not site_ids or (author_ids is not None and not author_ids):
+        return {"rows": [], "meta": dict(meta, truncated=False,
+                                         empty_reason="nothing_visible")}
+    if norm["site_id"] is not None and norm["site_id"] not in site_ids:
+        return {"rows": [], "meta": dict(meta, truncated=False, empty_reason="no_match")}
+    try:
+        rows = topics.scoped_items_rows(
+            conn, site_ids, author_ids=author_ids, site_id=norm["site_id"],
+            statuses=norm["statuses"], query=norm["query"], task_no=norm["task_no"],
+            limit=norm["limit"] + 1, timeout_ms=int(deadline * 1000))
+    except psycopg.errors.QueryCanceled:
+        logger.info("rag-search items: read timed out (deadline_s=%.1f)", deadline)
+        return {"rows": [], "meta": dict(meta, error="timeout")}
+    meta["truncated"] = len(rows) > norm["limit"]
+    rows = [{k: (str(v) if k in ("stable_id", "site_id", "topic_id") and v is not None
+                 else _iso(v)) for k, v in r.items()}
+            for r in rows[:norm["limit"]]]
+    if not rows:
+        meta["empty_reason"] = "no_match"
+    logger.info("rag-search items: rows=%d sites=%d site_filter=%s truncated=%s",
+                len(rows), len(site_ids), norm["site_id"], meta["truncated"])
+    return {"rows": rows, "meta": meta}
+
+
 def _search(event, context):
     # The metric route answers with a number instead of chunks. Placed first
     # because everything below it is about embeddings, and a metric question
@@ -340,6 +407,10 @@ def _search(event, context):
     # Project documents (spec 2026-10-16): their own tables, their own mode. Additive.
     if event.get("mode") == "documents":
         return _documents(event)
+    # Action-pack items tool (spec 2026-11-01-background-action-agent §13/§14 S4).
+    # Read-only, additive: only the background agent's ask_items.run sends this mode.
+    if event.get("mode") == "items":
+        return _items(event)
 
     sub = event.get("sub")
     try:

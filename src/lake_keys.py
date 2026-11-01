@@ -43,6 +43,11 @@ _SITE_OR_COMPANY = [
     # weather/ and programmes/ carry a site uuid, or the site slug as a fallback
     ("weather",     rf"^weather/(?P<site_ref>[^/]+)/{_DATE}/[^/]+$"),
     ("programme",   r"^programmes/(?P<site_ref>[^/]+)/[^/]+$"),
+    # An action pack's web snapshot (Task 9): action_packs/{company}/{pack}/web/{ref}.txt.
+    # The company is the pack's own (creation-time) company; org-api's store task records
+    # the row with the same kind, so a drain/backfill never renames it.
+    ("action_pack_web", rf"^action_packs/(?P<company_id>{_UUID})/{_UUID}/web/"
+                        r"[A-Za-z]{1,4}[0-9]{1,5}\.txt$"),
 ]
 _LAKE_WIDE = [rf"^reports/{_DATE}/[^/]+_report\.[a-z]+$", rf"^reports/{_DATE}/summary_report[^/]*$"]
 _MEETING_MINUTES = re.compile(r"^meeting_minutes/.+$")
