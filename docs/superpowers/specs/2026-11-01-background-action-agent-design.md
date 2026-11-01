@@ -379,6 +379,18 @@ one stale action must not block the others.
   The extracted text goes to S3 (§3.2), and the excerpt the writer used is stored
   in `excerpt`. A page that fails to fetch keeps the URL and is marked
   `snapshot: none`; the verifier then caps its claims at `weak`.
+- **Amended 2026-11-01 (first live TEST runs).**
+  - The writer cites the `web_answer` (the verified text), not the `web_source`
+    lines (a domain each). A `web_answer` item lists its own source refs
+    (`sources`), and a cited answer brings them onto the claim, so the pages behind
+    it are snapshotted and the verifier reads them. A claim on a `web_answer` none
+    of whose sources was archived is at most `weak`; one archived source backs it.
+  - Every source URL from the web search vendor is a Google grounding redirect
+    (`vertexaisearch.cloud.google.com/grounding-api-redirect/...`), and that host's
+    robots.txt disallows the path. That one hop -- only the URL we were handed --
+    skips the redirector's robots check and must answer a redirect (only its
+    `Location` is read). The real page is SSRF-vetted and robots-checked as before,
+    and its URL replaces the redirect on the stored row.
 - **Priority** (A4): records, then project documents, then web.
   - NZ standards (NZS 3109 and similar) are mostly paywalled, so web results are
     usually secondary sources (BRANZ, suppliers, councils).

@@ -139,7 +139,8 @@ def test_verified_answer_becomes_ask_shaped_items():
                          trace={}, general_answer=FakeGeneral(verified(n_sources=6)))
     items = env["items"]
     assert items[0] == {"ref": "W1", "kind": "web_answer", "provenance": "web",
-                        "text": "Bracing per NZS 3604. Also see."}
+                        "text": "Bracing per NZS 3604. Also see.",
+                        "sources": ["W2", "W3", "W4", "W5"]}       # its own source refs
     sources = items[1:]
     assert len(sources) == 4                                       # WEB_MAX_SOURCES
     assert sources[0] == {"ref": "W2", "kind": "web_source", "provenance": "web",
