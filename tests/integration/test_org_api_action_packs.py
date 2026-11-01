@@ -621,3 +621,33 @@ def test_store_rejects_a_foreign_snapshot_key_before_writing(db, env):
                       (pid,)).fetchone()[0] == "running"
     assert db.execute("SELECT count(*) FROM action_pack_sources WHERE pack_id=%s",
                       (pid,)).fetchone()[0] == 0
+
+
+# ---------------------------------------------------------------- Task 13 fix round 2
+
+def test_get_one_returns_the_run_trace_counts_and_model_ids(db, env):
+    """Spec §1: the run trace is part of the pack. GET returns its counts-shaped keys and
+    the model ids (the eval harness reads latency, tokens and verifier counts from it)."""
+    _, site, _, creator = _world(db)
+    pack = ap.create_queued(db, site_id=site["id"], created_by=creator["id"],
+                            instruction="tidy the fire door items")
+    assert ap.claim(db, pack["id"])
+    trace = {"tokens": 4321, "ms": {"total": 95000}, "verify": {"conclusion_unsupported": 1},
+             "truncated": False, "reading": "Free text from the site"}
+    models = {"planner": "model-a", "writer": "model-a", "verifier": "model-b",
+              "writer_served": "vendor/model-a-001"}
+    assert ap.store_result(db, pack["id"], {
+        "title": "Fire doors", "reading": "Close the fire door items", "conclusion": [],
+        "as_of": "2026-11-01T00:00:00+00:00", "sources": [], "actions": [],
+        "run_trace": trace, "models": models}) == "ok"
+    status, body = _call(db, creator, "GET", f"/action-packs/{pack['id']}")
+    assert status == 200
+    assert body["run_trace"] == {"tokens": 4321, "ms": {"total": 95000},
+                                 "verify": {"conclusion_unsupported": 1}, "truncated": False}
+    assert body["models"] == models
+    assert "Free text" not in json.dumps(body)
+    # A queued pack has neither yet.
+    p2 = ap.create_queued(db, site_id=site["id"], created_by=creator["id"], instruction="x")
+    ap.fail(db, p2["id"], "budget")
+    status, body = _call(db, creator, "GET", f"/action-packs/{p2['id']}")
+    assert status == 200 and body["run_trace"] is None and body["models"] is None

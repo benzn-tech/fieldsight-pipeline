@@ -101,3 +101,37 @@ def test_applicable_candidate(over, expected):
     assert v.applicable_candidate(a, {"state": "ready", "archived_at": None}) is expected
     assert v.applicable_candidate(a, {"state": "ready", "archived_at": "x"}) is False
     assert v.applicable_candidate(a, {"state": "running", "archived_at": None}) is False
+
+
+# ---------------------------------------------------------------- Task 13 fix round 2
+
+def test_shape_pack_carries_the_run_trace_counts_and_model_ids():
+    """Spec §1 lists the run trace as part of the pack; the eval harness reads latency,
+    tokens and the verifier's counts from GET. Counts and model ids only."""
+    trace = {"tokens": 1234, "truncated": False, "truncated_reasons": ["time"],
+             "ms": {"total": 61000, "write": 2000}, "verify": {"drop_refs": 1},
+             "reading": "The pour at C4 was late",            # free text: dropped
+             "ms_bad": {"nested": {"too": "deep"}}}           # not counts-shaped: dropped
+    models = {"planner": "deepseek/deepseek-v4.1-flash", "writer": "gemini-2.5-flash",
+              "writer_served": "google/gemini-2.5-flash-001", "verifier": None,
+              "note": "free text here", "planner_served": "has spaces in it"}
+    view = v.shape_pack(_pack(run_trace=trace, models=models), removed_refs=set(),
+                        site_name=None, targets={}, applicable={}, viewer_id="u")
+    assert view["run_trace"] == {"tokens": 1234, "truncated": False,
+                                 "truncated_reasons": ["time"],
+                                 "ms": {"total": 61000, "write": 2000},
+                                 "verify": {"drop_refs": 1}}
+    assert view["models"] == {"planner": "deepseek/deepseek-v4.1-flash",
+                              "writer": "gemini-2.5-flash",
+                              "writer_served": "google/gemini-2.5-flash-001",
+                              "verifier": None}
+    assert "C4" not in json.dumps(view) and "free text" not in json.dumps(view)
+
+
+def test_shape_pack_without_trace_or_models_returns_nulls():
+    view = v.shape_pack(_pack(), removed_refs=set(), site_name=None, targets={},
+                        applicable={}, viewer_id="u")
+    assert view["run_trace"] is None and view["models"] is None
+    view = v.shape_pack(_pack(run_trace="not a dict", models=["x"]), removed_refs=set(),
+                        site_name=None, targets={}, applicable={}, viewer_id="u")
+    assert view["run_trace"] is None and view["models"] is None

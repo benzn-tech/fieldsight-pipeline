@@ -452,6 +452,29 @@ def item_view(row):
             for f in ITEM_VIEW_FIELDS}
 
 
+MODEL_KEYS = ("planner", "writer", "verifier", "planner_served", "writer_served")
+_MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
+
+
+def public_trace(trace):
+    """The run trace as GET shows it (spec §1: the trace is part of the pack): only the
+    top-level keys that are counts-shaped by fail_trace_error's rule (numbers, booleans,
+    short lowercase codes, short lists of those, one level of such objects). Anything else
+    -- free text, deeper nesting -- is left out. None when there is no trace object."""
+    if not isinstance(trace, dict):
+        return None
+    return {k: v for k, v in trace.items() if fail_trace_error({k: v}) is None}
+
+
+def public_models(models):
+    """The model ids the run used (MODEL_KEYS only; a value that is not an id-shaped string
+    is left out, None stays None). None when there is no models object."""
+    if not isinstance(models, dict):
+        return None
+    return {k: models[k] for k in MODEL_KEYS if k in models and (
+        models[k] is None or (isinstance(models[k], str) and _MODEL_ID.match(models[k])))}
+
+
 def shape_pack(pack, *, removed_refs, site_name, targets, applicable, viewer_id) -> dict:
     """The GET /action-packs/{id} body.
 
@@ -499,6 +522,8 @@ def shape_pack(pack, *, removed_refs, site_name, targets, applicable, viewer_id)
         "is_creator": str(pack.get("created_by")) == str(viewer_id),
         "actions": actions,
         "sources": [_source_out(s, s["ref"] in removed_refs) for s in pack.get("sources") or []],
+        "run_trace": public_trace(pack.get("run_trace")),
+        "models": public_models(pack.get("models")),
     }
 
 

@@ -977,8 +977,8 @@ def _pack_view(conn, caller, pack):
 
 def get_action_pack(conn, caller, pack_id):
     """GET /action-packs/{id}: reading, conclusion, actions (verifier label, state, refs,
-    applicable), sources (S13 applied). 404 for a pack this caller may not read. Runs the
-    stale sweep first: this is the route the UI polls while a pack is queued/running."""
+    applicable), sources (S13 applied), run_trace (counts only) and models (ids). 404 for a
+    pack this caller may not read. Runs the stale sweep first: this is the route the UI polls while a pack is queued/running."""
     _sweep_stale_packs(conn)
     pack = action_packs.get_for_reader(conn, _pack_reader(conn, caller), pack_id)
     if pack is None:
