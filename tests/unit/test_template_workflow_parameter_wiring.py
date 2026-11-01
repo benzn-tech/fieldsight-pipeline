@@ -1372,3 +1372,23 @@ def test_the_action_packs_switch_reaches_org_api_and_the_agent():
     """The middle segment, for both readers: the routes/internal tasks and the worker."""
     for fn in ("OrgApiFunction", "ActionAgentFunction"):
         assert "ACTION_PACKS: !Ref ActionPacks" in _env_text(fn), fn
+
+
+# ---- action packs: the verifier model is a deploy-time choice -----------------------------
+
+@pytest.mark.parametrize("parameter,var,shell", [
+    ("ActionVerifierModel", "ACTION_VERIFIER_MODEL", "ACTION_VERIFIER_MODEL_PARAM"),
+    ("ActionVerifierFallbacks", "ACTION_VERIFIER_FALLBACKS", "ACTION_VERIFIER_FALLBACKS_PARAM"),
+])
+def test_the_action_verifier_is_settable_from_a_repo_variable(parameter, var, shell):
+    """Spec 2026-11-01 §14 S6: the verifier must be a different family from the writer. On a
+    stage whose Ask judge is the cheap model's family every pack fails `model` until the
+    verifier is changed -- which must be a repo variable and a redeploy, not a template edit.
+    Optional (empty = the cheap model in code), so it uses the bare-Key guard: appended only
+    when the repo variable is non-empty."""
+    for env, path in WORKFLOWS.items():
+        text = open(path, encoding="utf-8").read()
+        prefix = env.upper()
+        assert f'if [ -n "${{{{ vars.{prefix}_{var} }}}}" ]; then' in text, env
+        assert f'{shell}="{parameter}=${{{{ vars.{prefix}_{var} }}}}"' in text, env
+        assert f"${shell}" in _raw_override_lines(path), env

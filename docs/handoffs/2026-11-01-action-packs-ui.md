@@ -243,7 +243,9 @@ Pack fields:
 - `is_creator`: whether the viewer created the pack. Use it to show Cancel to the creator; a
   company admin/GM may also cancel, and gets 403 otherwise.
 - `run_trace` and `models`: diagnostics, counts and model ids only. Optional "Run details"
-  disclosure; the UI does not need them otherwise.
+  disclosure; the UI does not need them otherwise. A very large trace comes back as
+  `{"dropped": "size"}`. `run_trace.web_disabled` > 0 means the stage has web answers
+  switched off (`ENABLE_WEB_ANSWER`), so no web sources were searched.
 
 Conclusion lines: `{text, refs, confidence}`, where `confidence` is `supported | uncertain`.
 An `uncertain` line may have **zero refs**. That is deliberate: "no standard found in your

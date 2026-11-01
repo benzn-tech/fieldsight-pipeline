@@ -188,12 +188,13 @@ class Verify:
                 "model": self.model, "counts": {"checked": len(draft["actions"])}}
 
 
-def deps(model=None, tools=None, web=None, fetcher=None, verify=None, docs=True):
+def deps(model=None, tools=None, web=None, fetcher=None, verify=None, docs=True,
+         web_on=True):
     tools = tools or Tools()
     return st.Deps(call_model=model or Model(), execute=tools.execute,
                    items_run=tools.items_run, general_answer=web or Web(),
                    fetcher=fetcher or Fetcher(), verify=verify or Verify(),
-                   docs_on=lambda: docs,
+                   docs_on=lambda: docs, web_on=lambda: web_on,
                    now=lambda: dt.datetime(2026, 11, 1, 1, 0, tzinfo=dt.timezone.utc),
                    today=lambda: TODAY)
 
@@ -326,6 +327,31 @@ def test_web_search_only_by_planned_id_and_no_record_text_reaches_it():
     trace = payload["run_trace"]
     assert trace["web_free_text_refused"] == 2
     assert trace["web"]["web_refused"] == 1 and trace["web"]["web_searches"] == 1
+
+
+def test_web_off_means_no_planned_query_is_searched():
+    """ENABLE_WEB_ANSWER off (the Ask web switch): the round model is not offered
+    web_search, a web call it makes anyway is refused and counted, and nothing reaches
+    general_answer. The planned queries are counted as web_disabled."""
+    web = Web()
+    rounds = [{"calls": [{"tool": "web_search", "args": {"query_id": "q1"}}], "done": True}]
+    model = Model(rounds=rounds)
+    payload = st.run(make_ctx(), deps(model=model, web=web, web_on=False))
+    assert web.queries == []
+    trace = payload["run_trace"]
+    assert trace["web_disabled"] == 1                   # the plan's one query
+    assert trace["web_disabled_refused"] == 1
+    round_prompts = [c["prompt"] for c in model.calls if c["caller"] == "action_round"]
+    assert round_prompts and all("- web_search:" not in p for p in round_prompts)
+
+
+def test_web_on_is_the_ask_switch_by_default(monkeypatch):
+    import web_answer
+    d = st.Deps(execute=1, items_run=1, general_answer=1, fetcher=1, verify=1,
+                docs_on=1).resolve()
+    assert d.web_on is web_answer.enabled
+    monkeypatch.setenv("ENABLE_WEB_ANSWER", "false")
+    assert d.web_on() is False
 
 
 def test_an_unverified_web_answer_never_becomes_evidence():

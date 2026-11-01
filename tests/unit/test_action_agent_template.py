@@ -108,9 +108,9 @@ def test_env_names_the_switch_the_models_the_hops_and_the_buckets(fn):
     env = _env(fn)
     assert env["ACTION_PACKS"] == {"Ref": "ActionPacks"}
     assert env["ACTION_WRITER_MODEL"] == {"Ref": "AskJudgeModel"}
-    # empty -> the cheap model in code (web_answer.CHEAP_MODEL): no model id invented here
-    assert env["ACTION_VERIFIER_MODEL"] == ""
-    assert env["ACTION_VERIFIER_FALLBACKS"] == ""
+    # parameters defaulting to empty -> the cheap model in code (web_answer.CHEAP_MODEL)
+    assert env["ACTION_VERIFIER_MODEL"] == {"Ref": "ActionVerifierModel"}
+    assert env["ACTION_VERIFIER_FALLBACKS"] == {"Ref": "ActionVerifierFallbacks"}
     assert int(env["ACTION_TOKEN_CAP"]) > 0
     assert env["RAG_SEARCH_FUNCTION"] == {"Ref": "RagSearchFunction"}
     assert env["ORG_API_FUNCTION"] == {"Ref": "OrgApiFunction"}
@@ -152,6 +152,19 @@ def test_the_switch_reaches_exactly_org_api_and_the_worker(tpl):
     assert carriers == {"OrgApiFunction", "ActionAgentFunction"}
     for name in carriers:
         assert _env(tpl["Resources"][name])["ACTION_PACKS"] == {"Ref": "ActionPacks"}
+
+
+@pytest.mark.parametrize("name", ["ActionVerifierModel", "ActionVerifierFallbacks"])
+def test_the_verifier_parameters_default_empty(tpl, name):
+    """Empty = the cheap model in code, no fallbacks: no model id invented in the
+    template. Only the worker reads them."""
+    p = tpl["Parameters"][name]
+    assert p["Type"] == "String" and p["Default"] == ""
+    readers = {n for n, res in tpl["Resources"].items()
+               if res.get("Type") == "AWS::Serverless::Function"
+               and {"Ref": name} in ((((res.get("Properties") or {}).get("Environment")
+                                     or {}).get("Variables") or {}).values())}
+    assert readers == {"ActionAgentFunction"}
 
 
 def test_the_parameter_defaults_off(tpl):

@@ -159,6 +159,9 @@ class Deps:
     fetcher: object = None                    # web_fetch.Fetcher()
     verify: Optional[Callable] = None         # action_pack_verify.verify
     docs_on: Optional[Callable] = None        # project_doc_flag.on
+    # web_answer.enabled: the web lane honours ENABLE_WEB_ANSWER exactly like Ask -- off
+    # means no planned query is searched and nothing reaches general_answer.
+    web_on: Optional[Callable] = None
     now: Callable = _utcnow
     today: Callable = _nz_today
 
@@ -181,6 +184,9 @@ class Deps:
         if self.docs_on is None:
             import project_doc_flag
             self.docs_on = project_doc_flag.on
+        if self.web_on is None:
+            import web_answer
+            self.web_on = web_answer.enabled
         return self
 
 
@@ -590,6 +596,8 @@ def plan_stage(run: Run) -> Plan:
                 plan.reading = f"{note} {plan.reading}"[:action_pack_view.READING_MAX_CHARS]
                 run.trace["plan_site_not_found"] = True
             run.trace["plan_web_queries"] = len(plan.web.ids)
+            if plan.web.ids and not run.deps.web_on():
+                run.trace["web_disabled"] = len(plan.web.ids)   # planned, never searched
             run.trace["plan_days"] = (plan.date_to - plan.date_from).days + 1
             return plan
         logger.info("action agent plan rejected pack=%s code=%s", ctx.pack_id, code)
@@ -627,6 +635,9 @@ def _items(run, args, rnd, call_id):
 
 
 def _web(run, query_id, rnd):
+    if not run.deps.web_on():                   # belt and braces: validate_round refuses
+        _bump(run.trace, "web_disabled_refused")
+        return
     left = run.ctx.left("gather")
     if left < MIN_WEB_S:
         _bump(run.trace, "web_skipped_time")
@@ -665,7 +676,7 @@ def _tool_catalog(run):
                  if k not in ("site", "site_id")}
         lines.append(f"- {t['name']}: {t['description']} args: "
                      f"{json.dumps(sorted(props))}")
-    if run.plan.web.ids:
+    if run.plan.web.ids and run.deps.web_on():
         lines.append(f"- {WEB_TOOL}: search the web with one of the planned queries, by "
                      f"id. args: [\"query_id\"]. Planned queries: " + "; ".join(
                          f"{qid} = {json.dumps(run.plan.web.text_for(qid))}"
@@ -789,6 +800,7 @@ def validate_round(obj, run):
             or not isinstance(obj.get("done", False), bool) or set(obj) - {"calls", "done"}:
         return None
     docs = run.deps.docs_on()
+    web = run.deps.web_on()
     out, refused = [], 0
     for raw in obj.get("calls", []):
         if len(out) >= MAX_CALLS_PER_ROUND:
@@ -802,6 +814,10 @@ def validate_round(obj, run):
             refused += 1
             continue
         if tool == WEB_TOOL:
+            if not web:
+                refused += 1
+                _bump(run.trace, "web_disabled_refused")
+                continue
             if set(args) != {"query_id"} or not isinstance(args["query_id"], str):
                 refused += 1
                 _bump(run.trace, "web_free_text_refused")

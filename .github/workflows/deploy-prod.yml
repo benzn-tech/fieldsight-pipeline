@@ -221,6 +221,16 @@ jobs:
           if [ -n "${{ vars.PROD_ACTION_PACKS }}" ]; then
             ACTION_PACKS_PARAM="ActionPacks=${{ vars.PROD_ACTION_PACKS }}"
           fi
+          # The pack verifier (spec 2026-11-01 §14 S6): empty = the cheap model in code.
+          # Same bare-"Key=" guard.
+          ACTION_VERIFIER_MODEL_PARAM=""
+          if [ -n "${{ vars.PROD_ACTION_VERIFIER_MODEL }}" ]; then
+            ACTION_VERIFIER_MODEL_PARAM="ActionVerifierModel=${{ vars.PROD_ACTION_VERIFIER_MODEL }}"
+          fi
+          ACTION_VERIFIER_FALLBACKS_PARAM=""
+          if [ -n "${{ vars.PROD_ACTION_VERIFIER_FALLBACKS }}" ]; then
+            ACTION_VERIFIER_FALLBACKS_PARAM="ActionVerifierFallbacks=${{ vars.PROD_ACTION_VERIFIER_FALLBACKS }}"
+          fi
           ASK_JUDGE_MODEL_PARAM=""
           if [ -n "${{ vars.PROD_ASK_JUDGE_MODEL }}" ]; then
             ASK_JUDGE_MODEL_PARAM="AskJudgeModel=${{ vars.PROD_ASK_JUDGE_MODEL }}"
@@ -402,6 +412,8 @@ jobs:
               $ASK_THREADS_PARAM \
               $COMPANY_STATUS_ENFORCE_PARAM \
               $ACTION_PACKS_PARAM \
+              $ACTION_VERIFIER_MODEL_PARAM \
+              $ACTION_VERIFIER_FALLBACKS_PARAM \
               $ASK_JUDGE_MODEL_PARAM \
               $ASK_JUDGE_FALLBACKS_PARAM \
               $ASK_JUDGE_PROVIDER_PARAM \

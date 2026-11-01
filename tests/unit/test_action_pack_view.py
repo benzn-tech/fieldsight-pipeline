@@ -135,3 +135,15 @@ def test_shape_pack_without_trace_or_models_returns_nulls():
     view = v.shape_pack(_pack(run_trace="not a dict", models=["x"]), removed_refs=set(),
                         site_name=None, targets={}, applicable={}, viewer_id="u")
     assert view["run_trace"] is None and view["models"] is None
+
+
+def test_an_oversized_public_trace_is_replaced_by_a_marker():
+    """Each kept key is counts-shaped, but many of them can still add up: over
+    FAIL_TRACE_MAX_BYTES (the cap a failed pack's trace has) GET returns {"dropped": "size"}
+    instead of the trace -- a size marker the eval harness can see, never a silent cut."""
+    big = {f"k{i:03d}": list(range(16)) for i in range(200)}
+    assert all(v.fail_trace_error({k: x}) is None for k, x in big.items())
+    assert len(json.dumps(big)) > v.FAIL_TRACE_MAX_BYTES
+    assert v.public_trace(big) == {"dropped": "size"}
+    small = {"tokens": 1, "ms": {"total": 2}}
+    assert v.public_trace(small) == small

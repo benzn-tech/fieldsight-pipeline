@@ -1,6 +1,9 @@
 """Number the action items that have no task number yet (action packs Task 1, spec §14 D1).
 
 NOT RUN BY THIS BRANCH. Running it on prod is the owner's step, after migration 0093.
+Aurora is not reachable from outside the VPC: on prod run it as the org-api internal task
+`backfill_task_numbers` (docs/runbooks/2026-11-01-action-packs-rollout.md step 9). The logic
+lives in src/task_numbers_backfill.py; this script is the same thing for anyone inside.
 DRY RUN BY DEFAULT: it counts and writes nothing; --apply is the only thing that writes.
 
 WHAT IT NUMBERS
@@ -41,59 +44,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from deleted_predicates import visible_topics_predicate   # noqa: E402
-from repositories.action_items import lock_site_task_numbers   # noqa: E402
-
-# The unnumbered live stable_ids, with the site of their live row and their first appearance.
-# `%(sites)s` is NULL for "every site". Always executed WITH parameters: the deletion
-# predicate carries a literal '%%'.
-_CANDIDATES = (
-    "WITH live AS ("
-    " SELECT DISTINCT ON (a.stable_id) a.stable_id, a.site_id"
-    " FROM action_items a JOIN topics t ON t.id = a.topic_id"
-    f" WHERE {visible_topics_predicate('t')}"
-    " AND (%(sites)s::uuid[] IS NULL OR a.site_id = ANY(%(sites)s::uuid[]))"
-    " ORDER BY a.stable_id, a.created_at DESC"
-    "), cand AS ("
-    " SELECT l.stable_id, l.site_id,"
-    " (SELECT min(a2.created_at) FROM action_items a2 WHERE a2.stable_id = l.stable_id)"
-    " AS first_at"
-    " FROM live l WHERE NOT EXISTS"
-    " (SELECT 1 FROM action_task_numbers n WHERE n.stable_id = l.stable_id)"
-    ")"
-)
-
-_COUNT_BY_SITE = _CANDIDATES + " SELECT site_id, count(*) FROM cand GROUP BY site_id ORDER BY site_id"
-
-_INSERT_FOR_SITE = _CANDIDATES + (
-    " INSERT INTO action_task_numbers (stable_id, site_id, task_no)"
-    " SELECT c.stable_id, c.site_id,"
-    " (SELECT COALESCE(max(n.task_no), 0) FROM action_task_numbers n"
-    "  WHERE n.site_id = %(site)s)"
-    " + row_number() OVER (ORDER BY c.first_at, c.stable_id)"
-    " FROM cand c WHERE c.site_id = %(site)s"
-    " ON CONFLICT (stable_id) DO NOTHING"
-)
-
-
-def run_backfill(conn, *, apply: bool, site_ids=None) -> dict:
-    """Counts (and with `apply`, numbers) the unnumbered live stable_ids.
-
-    Returns {"sites": sites with something to number, "to_number": stable_ids found,
-    "numbered": rows written (0 on a dry run)}. Each site's write is its own
-    `conn.transaction()` -- a transaction on an autocommit connection (main), a savepoint
-    inside a caller's open one (the tests)."""
-    sites = [str(s) for s in site_ids] if site_ids else None
-    per_site = conn.execute(_COUNT_BY_SITE, {"sites": sites}).fetchall()
-    numbered = 0
-    if apply:
-        for site_id, _n in per_site:
-            with conn.transaction():
-                lock_site_task_numbers(conn, site_id)
-                numbered += conn.execute(
-                    _INSERT_FOR_SITE, {"sites": [str(site_id)], "site": site_id}).rowcount
-    return {"sites": len(per_site), "to_number": sum(n for _s, n in per_site),
-            "numbered": numbered}
+from task_numbers_backfill import run_backfill   # noqa: E402,F401 (re-exported)
 
 
 def main(argv=None) -> int:

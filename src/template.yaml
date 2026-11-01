@@ -325,6 +325,24 @@ Parameters:
       tasks; 'internal' opens them to platform_admin only; 'on' to everyone
       with access. Read per call (an env edit is the rollback).
 
+  ActionVerifierModel:
+    Type: String
+    Default: ''
+    Description: >-
+      Action packs verifier model (spec 2026-11-01 §4.4, §14 S6). Empty = the
+      cheap model in code (CORROBORATION_CHEAP_MODEL / web_answer.CHEAP_MODEL).
+      It must be a different model family from the writer (the Ask judge) as
+      actually served, or every pack fails 'model'. Set via
+      TEST_ACTION_VERIFIER_MODEL / PROD_ACTION_VERIFIER_MODEL.
+
+  ActionVerifierFallbacks:
+    Type: String
+    Default: ''
+    Description: >-
+      Action packs verifier fallbacks, comma-separated, tried in order when the
+      verifier is in the writer's family (§14 S6). Empty = none. Set via
+      TEST_ACTION_VERIFIER_FALLBACKS / PROD_ACTION_VERIFIER_FALLBACKS.
+
   CompanyStatusEnforce:
     Type: String
     Default: 'off'
@@ -2689,13 +2707,14 @@ Resources:
       Environment:
         Variables:
           ACTION_PACKS: !Ref ActionPacks
-          # Writer = the Ask judge setting; verifier empty = the cheap model in code
-          # (CORROBORATION_CHEAP_MODEL / web_answer.CHEAP_MODEL). Fallbacks empty: the
-          # verifier must be a different family from the writer actually used (S6), so
-          # any fallback is a deliberate choice, not a default.
+          # Writer = the Ask judge setting; verifier empty (the parameter default) = the
+          # cheap model in code (CORROBORATION_CHEAP_MODEL / web_answer.CHEAP_MODEL).
+          # Fallbacks empty by default: the verifier must be a different family from the
+          # writer actually used (S6), so any fallback is a deliberate choice (repo
+          # variables *_ACTION_VERIFIER_MODEL / *_ACTION_VERIFIER_FALLBACKS).
           ACTION_WRITER_MODEL: !Ref AskJudgeModel
-          ACTION_VERIFIER_MODEL: ''
-          ACTION_VERIFIER_FALLBACKS: ''
+          ACTION_VERIFIER_MODEL: !Ref ActionVerifierModel
+          ACTION_VERIFIER_FALLBACKS: !Ref ActionVerifierFallbacks
           # Per-run token cap (§4.2 cost guard): over it the run stores what is verified
           # as a partial pack (run_trace.truncated).
           ACTION_TOKEN_CAP: '400000'

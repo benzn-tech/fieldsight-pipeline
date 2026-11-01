@@ -105,8 +105,10 @@ def submit(gold, *, base_url, token, client, site_map=None, sleep=None, clock=No
 
 def fetch(prior, *, base_url, token, client) -> dict:
     """Re-GET every pack a prior run recorded (by pack_id or pack.id). A pack the GET does
-    not return keeps pack null and records the status. run_trace/models already attached
-    to the prior pack are kept (GET does not return them)."""
+    not return keeps pack null and records the status. GET returns run_trace (its
+    counts-shaped keys, or {"dropped": "size"} when too large) and models; a body without
+    them (a server from before GET carried them) keeps the ones already attached to the
+    prior pack (attach-traces)."""
     base = base_url.rstrip("/")
     rows = []
     for old in prior.get("packs") or []:

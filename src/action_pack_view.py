@@ -460,10 +460,15 @@ def public_trace(trace):
     """The run trace as GET shows it (spec §1: the trace is part of the pack): only the
     top-level keys that are counts-shaped by fail_trace_error's rule (numbers, booleans,
     short lowercase codes, short lists of those, one level of such objects). Anything else
-    -- free text, deeper nesting -- is left out. None when there is no trace object."""
+    -- free text, deeper nesting -- is left out. None when there is no trace object.
+    When what is left is still over FAIL_TRACE_MAX_BYTES, {"dropped": "size"} is returned
+    instead: a visible marker (the stored trace is untouched), never a silent cut."""
     if not isinstance(trace, dict):
         return None
-    return {k: v for k, v in trace.items() if fail_trace_error({k: v}) is None}
+    out = {k: v for k, v in trace.items() if fail_trace_error({k: v}) is None}
+    if len(json.dumps(out, default=str)) > FAIL_TRACE_MAX_BYTES:
+        return {"dropped": "size"}
+    return out
 
 
 def public_models(models):

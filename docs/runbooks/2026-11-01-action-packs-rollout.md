@@ -125,27 +125,36 @@ sim "$AGENT_ROLE" lambda:InvokeFunction "$(aws lambda get-function --function-na
 What the template sets:
 
 - writer = `ASK_JUDGE_MODEL` (with `ASK_JUDGE_FALLBACKS`);
-- verifier = `ACTION_VERIFIER_MODEL`, **hard-coded `''`** in `src/template.yaml`. It falls
-  back to `CORROBORATION_CHEAP_MODEL` and then `web_answer.CHEAP_MODEL`, which is
-  `google/gemini-3.8-flash`;
-- `ACTION_VERIFIER_FALLBACKS` is also hard-coded `''`.
+- verifier = `ACTION_VERIFIER_MODEL`, from the stack parameter `ActionVerifierModel`. It is
+  set by the repo variables `TEST_ACTION_VERIFIER_MODEL` / `PROD_ACTION_VERIFIER_MODEL`
+  (unset = `''`). When it is empty, the code falls back to `CORROBORATION_CHEAP_MODEL` and
+  then `web_answer.CHEAP_MODEL`, which is `google/gemini-3.8-flash`;
+- `ACTION_VERIFIER_FALLBACKS` (comma-separated), from `ActionVerifierFallbacks`. It is set by
+  `TEST_ACTION_VERIFIER_FALLBACKS` / `PROD_ACTION_VERIFIER_FALLBACKS` (unset = none).
 
 The verifier must be a different model family from the writer **as actually served** (S6).
-So:
+So, with the verifier variables unset:
 
 - If `TEST_ASK_JUDGE_MODEL` / `PROD_ASK_JUDGE_MODEL` is empty, or is a Google model, every
   pack fails with `failure: "model"`.
 - The same happens when the judge falls back onto a Google model at run time.
-- There is **no repo variable** to change the verifier. Fixing it is a template change
-  (make `ActionVerifierModel` / `ActionVerifierFallbacks` parameters, or set the literals).
 
 Check:
 
 ```bash
-gh variable list -R $REPO | grep -E 'ASK_JUDGE_(MODEL|FALLBACKS)'
+gh variable list -R $REPO | grep -E 'ASK_JUDGE_(MODEL|FALLBACKS)|ACTION_VERIFIER_'
 ```
 
-Expected today: a DeepSeek judge on both stages, with no Google model in the fallbacks.
+Expected today: a DeepSeek judge on both stages, with no Google model in the fallbacks, and
+the verifier variables unset (Gemini verifier).
+
+If the judge is, or may fall back onto, the verifier's family, set a verifier from another
+family (**owner-only**, repo variables), then redeploy that stack:
+
+```bash
+gh variable set TEST_ACTION_VERIFIER_MODEL -R $REPO --body '<vendor/model of another family>'
+gh variable set TEST_ACTION_VERIFIER_FALLBACKS -R $REPO --body '<vendor/model>,<vendor/model>'   # optional
+```
 After the first TEST pack, confirm that the family of `models.verifier` differs from the
 families of `models.writer` and `models.writer_served` (GET /action-packs/{id}).
 
@@ -173,8 +182,13 @@ families of `models.writer` and `models.writer_served` (GET /action-packs/{id}).
    - `GET .../sources/W<n>/snapshot` returns the page text.
 
    If every snapshot is skipped, read `run_trace.web` and `snapshots_skipped` and the agent
-   log. A TLS or SNI fault shows as fetch errors, not as a run failure. The web lane does
-   **not** depend on `ENABLE_WEB_ANSWER`; it runs whenever the plan asks for web queries.
+   log. A TLS or SNI fault shows as fetch errors, not as a run failure.
+
+   The web lane honours **`ENABLE_WEB_ANSWER`** (repo variable
+   `TEST_ENABLE_WEB_ANSWER` / `PROD_ENABLE_WEB_ANSWER`), exactly like Ask. While it is off,
+   planned web queries are never searched: `run_trace.web_disabled` counts them, and
+   `web_disabled_refused` counts any web call the round model tried. If you see
+   `web_disabled`, the smoke test did not run. Turn web answers on for TEST first.
 4. **Eval**, per `scripts/action_pack_eval/README.md` ("After merge: the TEST run"):
    1. Write the gold set (≥ 20 instructions, §8.1 composition) to
       `action_pack_eval_runs/gold.json`, then `validate-gold`.
@@ -245,30 +259,38 @@ Then run the step 3 IAM simulations with `fieldsight-prod-*` and
 
 ## 9. Prod `task_no` backfill (owner-only)
 
-The script (dry run by default; `--apply` writes; idempotent; one site per transaction, under
-the writers' per-site lock):
+Aurora is reachable only from inside the VPC, so the backfill runs as an **org-api internal
+task**, `backfill_task_numbers`, in the same way as `collapse_multibound_photos`. The logic is
+`src/task_numbers_backfill.py`; `scripts/backfill_task_numbers.py` is the same thing for
+anyone inside the VPC.
+
+How the task behaves:
+
+- It is a dry run unless `"apply"` is exactly `true`.
+- It is idempotent, and handles one site per transaction under the writers' per-site lock.
+- It is not behind `ACTION_PACKS`, so it runs with the flag off.
+- It returns counts only.
+
+Commands:
 
 ```bash
-python scripts/backfill_task_numbers.py                 # dry run: prints {"sites", "to_number", "numbered": 0}
-python scripts/backfill_task_numbers.py --apply         # writes; a second run should print to_number 0
-python scripts/backfill_task_numbers.py --site <uuid>   # optional, one site (repeatable)
+# 1. dry run: {"applied": false, "sites": N, "to_number": M, "numbered": 0}
+aws lambda invoke --function-name fieldsight-prod-org-api --cli-binary-format raw-in-base64-out   --payload '{"task":"backfill_task_numbers"}' /tmp/tn-dry.json && cat /tmp/tn-dry.json
+
+# 2. apply: {"applied": true, ..., "numbered": M}
+aws lambda invoke --function-name fieldsight-prod-org-api --cli-binary-format raw-in-base64-out   --payload '{"task":"backfill_task_numbers","apply":true}' /tmp/tn-apply.json && cat /tmp/tn-apply.json
+
+# 3. re-run the dry run: to_number must be 0
 ```
 
-**Blocker: this cannot run from a laptop as written.** The script opens a direct psycopg
-connection (`db.connection.get_connection`: `DATABASE_URL`, `PG*`, or
-`DB_SECRET_ARN` + `DB_HOST`). Aurora is not reachable from outside the VPC; that is why
-`collapse_multibound_photos` became an org-api internal task (`src/photo_collapse.py`
-docstring). There is no task_no backfill task in org-api. Options:
-
-1. **Preferred (a code change, before step 9):** expose `run_backfill` as an org-api internal
-   task, the same way as `collapse_multibound_photos`. The owner then runs:
-   ```bash
-   aws lambda invoke --function-name fieldsight-prod-org-api --cli-binary-format raw-in-base64-out \
-     --payload '{"task":"backfill_task_numbers","apply":false}' /tmp/bf.json && cat /tmp/bf.json
-   # then "apply": true; check the body, not only the invoke status
-   ```
-   (The task name is illustrative until that change lands.)
-2. Run the script from something inside the VPC that has the DB secret.
+- Optional `"site_ids": ["<uuid>", ...]` limits it to some sites. A malformed list answers
+  `{"error": "site_ids must be a non-empty list of UUIDs"}` and touches nothing.
+- Read the **body**, not only the invoke status. A `FunctionError` in the invoke metadata, or
+  an `errorMessage` in the body, means nothing useful was committed. The apply commits per
+  site, so a re-run finishes the rest.
+- org-api's **30 s** timeout bounds one call. If prod has many sites and the call times out, the
+  sites already done stay done: re-run it, or pass `site_ids` in batches.
+- TEST first: the same commands with `fieldsight-test-org-api` (the main agent may run TEST).
 
 Run it as soon as possible after step 7's migrate. Items numbered live after migrate get
 lower numbers than older items the backfill numbers later, and the backfill never renumbers.
@@ -331,9 +353,11 @@ From the build ledger's deferred notes and the spec's v1 cuts:
 - **The list returns at most 50 packs**, with no paging. Its action counts and titles are not
   filtered by the removed-source re-check.
 - **One site per pack.** Round-1 day ranges are capped at 28 days.
-- **The verifier model is not configurable** without a template change (step 4). The family
-  check fails open on unrecognised id prefixes (`us.anthropic...`, `models/...`); today's
-  ids are `vendor/model`.
+- **The verifier family check fails open on unrecognised id prefixes** (`us.anthropic...`,
+  `models/...`). Today's ids are `vendor/model`. The verifier itself is set per stage with
+  the `*_ACTION_VERIFIER_MODEL` / `*_ACTION_VERIFIER_FALLBACKS` repo variables (step 4).
+- **GET shows a run trace over 8 kB as `{"dropped": "size"}`.** The stored trace is
+  untouched.
 - **Agent topics show on the first applier's day view only.** Later appliers' created items
   attach to the same per-pack topic. The fieldsight-ui `compliance-aggregator.js` skips
   `is_live=false`, so agent items miss the safety and quality views until the UI fixes it.

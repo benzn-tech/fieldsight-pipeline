@@ -242,3 +242,41 @@ def test_backfill_default_all_sites_run_numbers_and_is_idempotent(db):
     assert backfill.run_backfill(db, apply=False) == {"sites": 0, "to_number": 0, "numbered": 0}
     assert backfill.run_backfill(db, apply=True) == {"sites": 0, "to_number": 0, "numbered": 0}
     assert _ledger(db, s1) == [(b, 1), (a, 2)]
+
+
+def test_org_api_task_runs_the_real_backfill(migrated_db_url, monkeypatch):
+    """The prod path (Aurora is VPC-only): {"task": "backfill_task_numbers"} through org-api's
+    lambda_handler on a real autocommit connection. A dry run writes nothing; apply numbers;
+    a second apply numbers nothing. Scoped to this test's site, so the shared DB's other
+    items are untouched."""
+    import lambda_org_api as org
+    seed = get_connection(migrated_db_url, autocommit=True)
+    site = None
+    try:
+        site = _site(seed, "task")
+        _t, [(_, a), (_, b)] = _topic(seed, site, ["Order timber", "Book crane"])
+        seed.execute("UPDATE action_items SET created_at = now() - interval '1 day' "
+                     "WHERE stable_id=%s", (b,))
+        monkeypatch.setattr(org, "get_connection",
+                            lambda dsn=None, autocommit=False:
+                            get_connection(migrated_db_url, autocommit=autocommit))
+        event = {"task": "backfill_task_numbers", "site_ids": [str(site["id"])]}
+
+        dry = org.lambda_handler(dict(event), None)
+        assert dry == {"applied": False, "sites": 1, "to_number": 2, "numbered": 0}
+        assert _ledger(seed, site) == []
+
+        done = org.lambda_handler(dict(event, apply=True), None)
+        assert done == {"applied": True, "sites": 1, "to_number": 2, "numbered": 2}
+        assert _ledger(seed, site) == [(b, 1), (a, 2)]       # committed (autocommit)
+
+        again = org.lambda_handler(dict(event, apply=True), None)
+        assert again == {"applied": True, "sites": 0, "to_number": 0, "numbered": 0}
+    finally:
+        if site is not None:
+            seed.execute("DELETE FROM action_task_numbers WHERE site_id=%s", (site["id"],))
+            seed.execute("DELETE FROM action_items WHERE site_id=%s", (site["id"],))
+            seed.execute("DELETE FROM topics WHERE site_id=%s", (site["id"],))
+            seed.execute("DELETE FROM sites WHERE id=%s", (site["id"],))
+            seed.execute("DELETE FROM companies WHERE id=%s", (site["company_id"],))
+        seed.close()

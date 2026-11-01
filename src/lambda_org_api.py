@@ -451,6 +451,7 @@ COLLAPSE_PHOTOS_TASK = "collapse_multibound_photos"
 REBIND_DAY_TASK = "rebind_day_photos"
 RESTORE_MARKERS_TASK = "restore_day_markers"
 BACKFILL_LEGACY_TICKS_TASK = "backfill_legacy_ticks"
+BACKFILL_TASK_NUMBERS_TASK = "backfill_task_numbers"
 DRAIN_LAKE_MANIFEST_TASK = "drain_lake_manifest"
 BACKFILL_LAKE_OBJECTS_TASK = "backfill_lake_objects"
 EXPORT_COMPANY_TASK = "export_company"
@@ -562,6 +563,26 @@ def lambda_handler(event, context):
             return {"error": "rows (a list) is required"}
         with get_connection() as conn:
             return legacy_ticks_backfill.run(conn, rows, apply=event.get("apply") is True)
+    # Same envelope rule, same dry-run default. Numbers the live action items that have no
+    # per-site task number yet (action packs spec 2026-11-01 §14 D1, migration 0093) --
+    # task_numbers_backfill. NOT behind ACTION_PACKS: task numbers are a Phase 0 prerequisite
+    # that ships with the flag off. {"task": "backfill_task_numbers", "apply": true?,
+    # "site_ids": [uuid, ...]?}. AUTOCOMMIT, so each site is its own transaction and at most
+    # one site's lock is held at a time. Counts only, in and out.
+    if isinstance(event, dict) and event.get("task") == BACKFILL_TASK_NUMBERS_TASK:
+        import task_numbers_backfill
+        site_ids = event.get("site_ids")
+        if site_ids is not None:
+            if not isinstance(site_ids, list) or not site_ids                     or any(_uuid_or_none(s) is None for s in site_ids):
+                return {"error": "site_ids must be a non-empty list of UUIDs"}
+            site_ids = [_uuid_or_none(s) for s in site_ids]
+        apply = event.get("apply") is True
+        with get_connection(autocommit=True) as conn:
+            summary = task_numbers_backfill.run_backfill(conn, apply=apply, site_ids=site_ids)
+        logger.info("task_no backfill applied=%s sites=%s to_number=%s numbered=%s",
+                       apply, summary.get("sites"), summary.get("to_number"),
+                       summary.get("numbered"))
+        return {"applied": apply, **summary}
     if isinstance(event, dict) and event.get("task") == COLLAPSE_PHOTOS_TASK:
         import photo_collapse
         with get_connection() as conn:
