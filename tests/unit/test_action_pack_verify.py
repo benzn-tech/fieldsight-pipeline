@@ -199,7 +199,10 @@ def test_web_only_claims_are_at_most_weak_and_documents_can_be_supported(monkeyp
                             line("Cure 7 days.", ["D1", "W1"])],
              "actions": [dict(create("Cure the slab for 7 days"), refs=["W1", "W2"]),
                          dict(create("Cure level 2 slab 7 days"), refs=["D1"])]}
-    result, _ = run_verify(draft, monkeypatch)
+    # W1's own source W2 is archived (fixture), so W1 does not cap the D1+W1 line (§6).
+    w1 = entry("W1", "web_answer", "NZS 3109 says cure for 7 days.",
+               item={"ref": "W1", "kind": "web_answer", "sources": ["W2"]})
+    result, _ = run_verify(draft, monkeypatch, extra_registry={"W1": w1})
     assert labels(result, "conclusion", "confidence") == {0: "uncertain", 1: "supported",
                                                           2: "supported"}
     assert labels(result) == {0: "weak", 1: "supported"}

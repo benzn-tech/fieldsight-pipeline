@@ -119,6 +119,8 @@ def offered_tools():
 
 
 _BY_NAME = {t["name"]: t for t in TOOLS}
+_KNOWN_FIELDS = frozenset({k for t in TOOLS for k in t["parameters"]["properties"]}
+                          | {"name", "args", "calls", "tz"})
 _ISO = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -697,6 +699,13 @@ def _execute(calls, ctx):
         args, err = validate_call(call, ctx.today)
         if err:
             envs[i] = _bad(call, cid, dict(err))
+            # Names only: the field is logged when it is a known argument name, never a
+            # model-made key (it could carry anything), and never a value.
+            name = call.get("name") if isinstance(call, dict) else None
+            field = err.get("field")
+            logger.info("ask tool refused name=%s field=%s",
+                        name if name in _BY_NAME else "other",
+                        field if field in _KNOWN_FIELDS else "other")
             continue
         clamped = args.pop("clamped", None)
         if (call["name"] == "latest_activity" and "on_or_before" not in args
