@@ -241,8 +241,7 @@ def test_round_one_is_deterministic_and_pinned_to_the_site():
     assert [(c["args"]["date_from"], c["args"]["date_to"]) for c in first] == [
         ("2026-10-14", "2026-10-20"), ("2026-10-07", "2026-10-13"),
         ("2026-10-01", "2026-10-06")]
-    assert all(c["args"]["site"] == SITE for batch in tools.calls for c in batch
-               if c["name"] != "find_people")
+    assert all(c["args"]["site"] == SITE for batch in tools.calls for c in batch)
     assert tools.items_calls[0] == {"limit": st.ROUND1_ITEMS_LIMIT, "site_id": SITE}
     assert tools.calls[1] == [{"name": ask_tools.DOC_TOOL,
                                "args": {"query": "NZS 3109 curing", "site": SITE}}]
