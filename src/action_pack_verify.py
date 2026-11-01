@@ -74,9 +74,10 @@ What it does
    `unsupported`. If every check fails -> VerifierFailure.
 3. Label caps: a claim citing only web refs (W) is at most weak (A4; counted `web_only_*`
    -- the UI shows "web source, not your project's documents" for an element whose refs are
-   all web provenance; there is no element field for it in the stored shape); a claim citing
-   a web_source with no snapshot is at most weak (§6, `no_snapshot_capped`). Documents and
-   records can be supported.
+   all web provenance; there is no element field for it in the stored shape); a claim resting
+   on web evidence the pack did not archive is at most weak (§6, `no_snapshot_capped`;
+   `not_archived`: a web_answer none of whose own sources has a snapshot, or a web_source
+   cited on its own without one). Documents and records can be supported.
 
 Model selection (S6)
 --------------------
@@ -133,6 +134,10 @@ ATTEMPT_CAP_S = 30.0             # one attempt (the Ask judge's cap): a hang can
 VERIFY_MAX_TOKENS = 200
 FLAGGED = "near_duplicate_flagged"
 REF_MAX_CHARS = 24_000           # one cited ref's text in a prompt (a snapshot can be 200 kB)
+# The archived pages one claim cites share this many characters of its prompt: a claim on
+# a web answer carries every page behind it (up to MAX_SNAPSHOTS), and 8 x REF_MAX_CHARS
+# per check would multiply the verifier's tokens and time.
+WEB_PAGES_MAX_CHARS = 48_000
 
 FAMILY_ALIASES = {"meta-llama": "meta", "x-ai": "xai", "mistral": "mistralai",
                   "moonshot": "moonshotai", "deepseek-ai": "deepseek", "thudm": "z-ai",
@@ -286,9 +291,30 @@ Answer with ONLY a JSON object: {{"label": "supported" | "weak" | "unsupported"}
 """
 
 
-def _ref_text(entry):
+def not_archived(refs, registry, sources) -> bool:
+    """§6 snapshot cap. True when the claim rests on web evidence the pack did not archive:
+    a cited web_answer none of whose own sources (its item's `sources`, brought onto the
+    claim by the stages) was snapshotted, or a web_source cited on its own -- not as a
+    source of a cited answer -- without a snapshot. A source of an answer that failed while
+    another source of the same answer was archived does not cap: the answer is backed."""
+    def snapped(r):
+        return bool((sources.get(r) or {}).get("snapshot_s3_key"))
+    linked = set()
+    for r in refs:
+        e = registry.get(r) or {}
+        if e.get("kind") != "web_answer":
+            continue
+        own = list((e.get("item") or {}).get("sources") or [])
+        linked.update(own)
+        if not any(snapped(s) for s in own):
+            return True
+    return any((registry.get(r) or {}).get("kind") == "web_source" and r not in linked
+               and not snapped(r) for r in refs)
+
+
+def _ref_text(entry, limit=REF_MAX_CHARS):
     text = entry.get("snapshot_text") or entry.get("excerpt") or ""
-    return str(text)[:REF_MAX_CHARS]
+    return str(text)[:limit]
 
 
 def build_prompt(kind, el, *, registry, items):
@@ -309,10 +335,14 @@ def build_prompt(kind, el, *, registry, items):
         lines.append(f"rationale: {sanitize(el.get('rationale'))}")
     lines.append("")
     lines.append("EVIDENCE (the refs it cites)")
-    for ref in dict.fromkeys(el.get("refs") or []):
+    refs = list(dict.fromkeys(el.get("refs") or []))
+    pages = sum(1 for r in refs if registry[r].get("snapshot_text"))
+    page_cap = min(REF_MAX_CHARS, WEB_PAGES_MAX_CHARS // pages) if pages else REF_MAX_CHARS
+    for ref in refs:
         e = registry[ref]
+        cap = page_cap if e.get("snapshot_text") else REF_MAX_CHARS
         lines.append(f"{sanitize(ref)} | {sanitize(e.get('kind'))} | "
-                     f"{sanitize(_ref_text(e))}")
+                     f"{sanitize(_ref_text(e, cap))}")
     return VERIFY_PROMPT.format(what=what, data=_fence(lines))
 
 
@@ -478,8 +508,7 @@ def verify(draft, *, registry, items, sources, ctx, writer_model, deadline,
             _bump(counts, f"web_only_{kind}")
             if label == "supported":
                 label = "weak"
-        no_snap = any(registry[r].get("kind") == "web_source"
-                      and not (sources.get(r) or {}).get("snapshot_s3_key") for r in el["refs"])
+        no_snap = not_archived(el["refs"], registry, sources)
         if no_snap and label == "supported":
             label = "weak"
             _bump(counts, "no_snapshot_capped")

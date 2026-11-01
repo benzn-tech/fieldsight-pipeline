@@ -13,6 +13,13 @@ guard, and the guard decides the address the connection is made to:
   rebinding cannot swap the address between the check and the connect. A connect failure
   tries the next VETTED address (never a new lookup).
 * Redirects are followed by hand, at most MAX_REDIRECTS, every hop through `vet_url` again.
+* Citation redirectors (`CITATION_REDIRECTORS`): the web search vendor hands back every
+  source as a Google grounding redirect (vertexaisearch.cloud.google.com/
+  grounding-api-redirect/...), whose robots.txt disallows that path -- honoured, no cited
+  page could ever be archived. When the URL we were HANDED (hop 0 only) is such a redirect,
+  that one hop skips the redirector's robots check and must answer a redirect (its Location
+  is all we read; a page from it fails 'redirector_no_redirect'). The real page it points
+  to is vetted and robots-checked like any other.
 * A per-page deadline that holds in every phase. A socket timeout bounds one recv only (a
   slow-drip server defeats it), so each hop arms a watchdog timer that shuts the socket
   down at the deadline; the socket timeout is also reset to the time left before every
@@ -61,6 +68,9 @@ PAGE_TIMEOUT_S = 10.0
 MAX_URL_CHARS = 2048
 ALLOWED_TYPES = ("text/html", "text/plain")
 _REDIRECTS = (301, 302, 303, 307, 308)
+# (host, path prefix) of the vendor redirect hops a cited source URL arrives as. Matched on
+# the vetted host (exact) and the vetted path, never on the raw string.
+CITATION_REDIRECTORS = (("vertexaisearch.cloud.google.com", "/grounding-api-redirect/"),)
 _CHUNK = 64 * 1024
 
 # Belt and braces next to `is_global`: a stdlib change must never widen what we dial.
@@ -209,6 +219,20 @@ def vet_url(url, resolver) -> Target:
     # IPv4 first (a Lambda outside a VPC usually has no IPv6 route); order kept otherwise.
     ordered.sort(key=lambda a: ipaddress.ip_address(a).version != 4)
     return Target(url=url, host=host, ips=tuple(ordered), path=path)
+
+
+def _is_redirector(target) -> bool:
+    return any(target.host == host and target.path.startswith(prefix)
+               for host, prefix in CITATION_REDIRECTORS)
+
+
+def is_citation_redirect(url) -> bool:
+    """True when `url` is a vendor citation redirect hop (CITATION_REDIRECTORS). Pure: no DNS."""
+    try:
+        target = vet_url(url, lambda host, port: ["8.8.8.8"])
+    except Refused:
+        return False
+    return _is_redirector(target)
 
 
 class PinnedHTTPSConnection(http.client.HTTPSConnection):
@@ -464,11 +488,16 @@ class Fetcher:
         current = url
         for hop in range(max_redirects + 1):
             target = vet_url(current, self._resolve)
-            if robots:
+            # Only the URL we were handed may be a citation redirect hop (module doc).
+            redirector = robots and hop == 0 and _is_redirector(target)
+            if robots and not redirector:
                 verdict = self._robots_verdict(target)
                 if verdict is not None:
                     raise _Fail(verdict)
-            out = self._exchange(target, deadline, max_bytes=max_bytes, types=types)
+            out = self._exchange(target, deadline, max_bytes=0 if redirector else max_bytes,
+                                 types=types)
+            if redirector and out[0] != "redirect":
+                raise _Fail("redirector_no_redirect", out[1])
             if out[0] == "redirect":
                 _, location, status = out
                 if hop == max_redirects:

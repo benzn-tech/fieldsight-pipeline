@@ -22,7 +22,9 @@
             then documents, then records (A4), newest first -- and the run is truncated.
             Elements that break the schema are dropped and counted; nothing parsing at all
             is reason `model`.
-    Web     each cited web_source (<= 8) is fetched once and snapshotted (action_pack_web).
+    Web     a cited web_answer brings the refs of its own web_source items onto the claim
+            (the writer cites the answer text, never the domain lines); each cited
+            web_source (<= 8) is fetched once and snapshotted (action_pack_web).
     Verify  action_pack_verify.verify (Task 12).
 
 Every model call carries a deadline from the run context (ctx.left(stage)); the rag-search
@@ -352,6 +354,28 @@ def _lang_key(language):
     return "zh" if str(language or "").lower().startswith("zh") else "en"
 
 
+# Tool error reasons (run_trace.tool_error_reasons): "<tool>__<code>[__<field>]", each part
+# from a closed set or "other" -- a model-made argument name or free text never reaches the
+# trace (ids/counts only).
+_REASON_TOOLS = RECORD_TOOLS + (ask_tools.DOC_TOOL, ask_items.TOOL_NAME, "web_search")
+_REASON_CODE = re.compile(r"^[a-z0-9_]{1,24}$")
+_REASON_FIELDS = frozenset(
+    {k for t in ask_tools.TOOLS + [ask_items.ITEMS_TOOL] for k in t["parameters"]["properties"]}
+    | {"calls", "args", "name", "tz"})
+
+
+def tool_error_reason(env) -> str:
+    meta = env.get("meta") or {}
+    tool = env.get("tool") if env.get("tool") in _REASON_TOOLS else "other"
+    code = meta.get("error")
+    code = code if isinstance(code, str) and _REASON_CODE.match(code) else "other"
+    out = f"{tool}__{code}"
+    field = meta.get("field")
+    if field is not None:
+        out += "__" + (field if field in _REASON_FIELDS else "other")
+    return out
+
+
 # ---- the run --------------------------------------------------------------------------
 
 @dataclass
@@ -446,6 +470,7 @@ class Run:
         meta = env.get("meta") or {}
         if meta.get("error"):
             _bump(self.trace, "tool_errors")
+            _bump(self.trace.setdefault("tool_error_reasons", {}), tool_error_reason(env))
         for it in env.get("items") or []:
             if not isinstance(it, dict) or not it.get("ref"):
                 continue
@@ -674,6 +699,25 @@ def round1(run):
         raise agent.ToolsFailure("every round-1 tool failed")
 
 
+def _arg_spec(name, schema, required):
+    """One argument as the round model reads it: its type and bounds, ISO for dates, and
+    whether it is required -- bare names (the first live runs) left the model guessing."""
+    kind = schema.get("type") or "string"
+    if name in ("date_from", "date_to", "on_or_before"):
+        spec = "YYYY-MM-DD"
+    elif kind == "integer" and "minimum" in schema and "maximum" in schema:
+        spec = f"integer {schema['minimum']}-{schema['maximum']}"
+    elif kind == "integer" and "minimum" in schema:
+        spec = f"integer >= {schema['minimum']}"
+    elif kind == "array":
+        spec = f"list of {(schema.get('items') or {}).get('type') or 'string'}"
+    elif schema.get("enum"):
+        spec = "one of " + "|".join(schema["enum"])
+    else:
+        spec = kind
+    return spec + (", required" if required else "")
+
+
 def _tool_catalog(run):
     lines = []
     tools = [t for t in ask_tools.TOOLS if t["name"] in RECORD_TOOLS]
@@ -681,10 +725,11 @@ def _tool_catalog(run):
         tools += [t for t in ask_tools.TOOLS if t["name"] == ask_tools.DOC_TOOL]
     tools.append(ask_items.ITEMS_TOOL)
     for t in tools:
-        props = {k: v for k, v in t["parameters"]["properties"].items()
-                 if k not in ("site", "site_id")}
-        lines.append(f"- {t['name']}: {t['description']} args: "
-                     f"{json.dumps(sorted(props))}")
+        params = t["parameters"]
+        args = {k: _arg_spec(k, v, k in params.get("required", ()))
+                for k, v in sorted(params["properties"].items())
+                if k not in ("site", "site_id")}
+        lines.append(f"- {t['name']}: {t['description']} args: {json.dumps(args)}")
     if run.plan.web.ids and run.deps.web_on():
         lines.append(f"- {WEB_TOOL}: search the web with one of the planned queries, by "
                      f"id. args: [\"query_id\"]. Planned queries: " + "; ".join(
@@ -713,7 +758,7 @@ Tools (every call is limited to this project automatically):
 Rules:
 - At most {max_calls} calls this round; {rounds_left} rounds remain after this one.
 - Prefer the project's own records and documents. Use {web} only for what the records and documents cannot answer, and only by a planned query id.
-- Do not repeat a call already made.
+- Do not repeat a call already made. Leave out an argument you do not need (never send null).
 - Set "done" to true when the evidence is enough to answer the instruction.
 
 Calls already made:
@@ -729,7 +774,8 @@ def _env_header(env):
     meta = env.get("meta") or {}
     tool = sanitize(env.get("tool")) or "?"
     n = len(env.get("items") or [])
-    state = (f"error {sanitize(meta['error'])}" if meta.get("error")
+    field = f" {sanitize(meta['field'])}" if meta.get("error") and meta.get("field") else ""
+    state = (f"error {sanitize(meta['error'])}{field}" if meta.get("error")
              else f"{n} items" if n else f"empty {sanitize(meta.get('empty_reason') or '')}".strip())
     flags = " truncated" if meta.get("truncated") else ""
     status = f" {sanitize(meta['status'])}" if meta.get("status") else ""
@@ -822,6 +868,11 @@ def validate_round(obj, run):
         if not isinstance(args, dict):
             refused += 1
             continue
+        if tool != WEB_TOOL:
+            # A null is "not given" (models fill every listed argument), and the site is
+            # pinned below: neither may reach argument validation as a bad argument.
+            args = {k: v for k, v in args.items()
+                    if v is not None and k not in ("site", "site_id")}
         if tool == WEB_TOOL:
             if not web:
                 refused += 1
@@ -833,7 +884,6 @@ def validate_round(obj, run):
                 continue
             out.append({"kind": "web", "query_id": args["query_id"]})
         elif tool == ask_items.TOOL_NAME:
-            args = {k: v for k, v in args.items() if k != "site_id"}
             out.append({"kind": "items", "args": args})
         elif tool in RECORD_TOOLS or (tool == ask_tools.DOC_TOOL and docs):
             args = dict(args)
@@ -1131,7 +1181,28 @@ def validate_draft(obj, run, citable):
                         "rationale": rationale, "refs": refs})
     if counts:
         run.trace["write_dropped"] = counts
+    added = 0
+    for el in conclusion + actions:
+        el["refs"], n = with_web_sources(el["refs"], run.registry)
+        added += n
+    if added:
+        run.trace["web_refs_added"] = added
     return {"conclusion": conclusion, "actions": actions}
+
+
+def with_web_sources(refs, registry):
+    """(refs + the web_source refs of every cited web_answer, how many were added). The
+    writer cites the answer text; the pages behind it must be cited too, or they are never
+    snapshotted (§6) and the verifier never reads them."""
+    out = list(refs)
+    for r in refs:
+        entry = registry.get(r) or {}
+        if entry.get("kind") != "web_answer":
+            continue
+        for s in (entry.get("item") or {}).get("sources") or []:
+            if s in registry and registry[s].get("kind") == "web_source" and s not in out:
+                out.append(s)
+    return out, len(out) - len(refs)
 
 
 def write_stage(run):
@@ -1260,7 +1331,8 @@ def snapshot_stage(run, sources):
         row = action_pack_web.snapshot_source(
             item, fetcher=_Prefetched(page), s3=ctx.s3, bucket=ctx.lake_bucket,
             company_id=ctx.company_id, pack_id=ctx.pack_id)
-        sources[r].update(fetched_at=row.get("fetched_at"),
+        sources[r].update(url=row.get("url") or sources[r].get("url"),
+                          fetched_at=row.get("fetched_at"),
                           snapshot_s3_key=row.get("snapshot_s3_key"))
         if row.get("snapshot_s3_key"):
             stored += 1

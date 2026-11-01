@@ -7,12 +7,17 @@ D6, S16; Task 9).
 * `web_search` -- wraps web_answer.general_answer. A verified answer becomes Ask-shaped
   items (web_answer + up to 4 web_source, refs W from the run's RefAssigner, provenance
   'web'); anything else is dropped with its sources (D6: never citable, not even weak) and
-  counted in the run trace.
+  counted in the run trace. The web_answer item lists the refs of its own web_source items
+  (`sources`): the writer cites the answer text, and the stages bring those refs onto the
+  claim so the pages behind it are snapshotted (first live TEST run, 2026-11-01: the writer
+  cited only W1/W4 and nothing was ever archived).
 * `snapshot_source` / `put_snapshot` -- fetch a cited web_source page once through
   web_fetch (SSRF-guarded) and store its text on the lake bucket at
   action_packs/<company_id>/<pack_id>/web/<ref>.txt. A failed fetch or put leaves
   snapshot_s3_key null (the verifier then caps the claims at weak). The lake ownership
-  index row is written by org-api's store task (the agent has no database).
+  index row is written by org-api's store task (the agent has no database). A fetched
+  page's own url (`final_url`: the page a vendor citation redirect pointed to) replaces the
+  redirect url on the row.
 
 Logs: ids and counts only -- never query text, answer text, URLs or page text.
 """
@@ -150,8 +155,9 @@ def web_search(queries: WebQueries, query_id, *, refs, budget, trace=None,
                     block.get("status") if block.get("status") in (
                         "verified", "unverified", "too_long") else "other", len(sources))
         return _envelope(query_id, [], dict(meta, status="dropped_unverified"))
-    items = [{"ref": refs.assign("web_answer", query_id, "W"), "kind": "web_answer",
-              "provenance": "web", "text": answer[:WEB_ANSWER_MAX_CHARS]}]
+    answer_item = {"ref": refs.assign("web_answer", query_id, "W"), "kind": "web_answer",
+                   "provenance": "web", "text": answer[:WEB_ANSWER_MAX_CHARS], "sources": []}
+    items = [answer_item]
     for src in sources[:WEB_MAX_SOURCES]:
         url = src.get("url")
         if not url:
@@ -160,6 +166,8 @@ def web_search(queries: WebQueries, query_id, *, refs, budget, trace=None,
                 "provenance": "web", "title": src.get("title"),
                 "text": src.get("domain") or "", "source": url}
         items.append({k: v for k, v in item.items() if v is not None})
+        if item["ref"] not in answer_item["sources"]:
+            answer_item["sources"].append(item["ref"])
     logger.info("action pack web verified query=%s sources=%d", query_id, len(items) - 1)
     return _envelope(query_id, items, dict(meta, status="verified"))
 
@@ -193,7 +201,9 @@ def snapshot_source(item, *, fetcher, s3, bucket, company_id, pack_id) -> dict:
         logger.warning("action pack snapshot put failed ref=%s type=%s", ref,
                        type(exc).__name__)
         return out
-    out.update(fetched_at=page.get("fetched_at"), snapshot_s3_key=key)
+    final = page.get("final_url")
+    out.update(fetched_at=page.get("fetched_at"), snapshot_s3_key=key,
+               url=final if isinstance(final, str) and final else url)
     logger.info("action pack snapshot stored ref=%s truncated=%s", ref,
                 bool(page.get("truncated")))
     return out
