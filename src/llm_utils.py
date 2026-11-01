@@ -210,8 +210,14 @@ def api_key_configured():
 
 
 def call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None,
-             model=None, deadline=None, caller="unknown"):
+             model=None, deadline=None, caller="unknown", info=None):
     """Return (text, None) on success or (None, error_string) on failure.
+
+    `info` (optional dict): on success it receives `model` -- the chain entry that
+    actually answered, after any fallback -- and on the OpenRouter/DashScope path also
+    `served_model` (the vendor's own id) and `usage` ({prompt_tokens, completion_tokens}).
+    A caller that records "the model actually used" (action packs, §14 S6) reads it here;
+    callers that pass nothing see no change.
 
     `deadline` (seconds from now) bounds the whole retry ladder, and is opt-in
     because eight of this module's nine callers are background pipelines where a
@@ -250,12 +256,18 @@ def call_llm(prompt, max_tokens=4096, force_json=False, enable_thinking=None,
     Nearly twice as fast because it stops thinking, not because it writes less.
     """
     if LLM_PROVIDER == "qwen":
+        # Passed only when given, so a stub of the old shape keeps working.
+        _info = {"info": info} if info is not None else {}
         return _call_qwen(prompt, max_tokens, force_json, enable_thinking, model,
-                          deadline=deadline, caller=caller)
+                          deadline=deadline, caller=caller, **_info)
     # Passed only when there IS one, so a stub of the old four-argument shape keeps
     # working -- the same rule `_bound` follows for the deadline below.
     _think = {"enable_thinking": enable_thinking} if enable_thinking is not None else {}
-    return _call_anthropic(prompt, max_tokens, deadline=deadline, caller=caller, **_think)
+    text, err = _call_anthropic(prompt, max_tokens, deadline=deadline, caller=caller,
+                                **_think)
+    if info is not None and err is None:
+        info["model"] = CLAUDE_MODEL
+    return text, err
 
 
 def active_model(enable_thinking=None):
@@ -685,10 +697,13 @@ def build_qwen_payload(prompt, max_tokens, force_json, enable_thinking=None, mod
 
 
 def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
-               deadline=None, caller="unknown"):
+               deadline=None, caller="unknown", info=None):
     if not QWEN_API_KEY:
         logger.error("QWEN_API_KEY / DASHSCOPE_API_KEY not set")
         return None, "QWEN_API_KEY not configured"
+    # call_llm's `info`, handed to each attempt only when given (a stub of the old
+    # _qwen_attempt shape keeps working); the attempt that answers writes it last.
+    _info = {"info": info} if info is not None else {}
     # Per-call override wins; None falls back to the function's env default.
     thinking = QWEN_ENABLE_THINKING if enable_thinking is None else bool(enable_thinking)
     payload = build_qwen_payload(prompt, max_tokens, force_json, enable_thinking, model)
@@ -701,7 +716,7 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
         cb = _chain_budget()
         if cb is not None:
             deadline = cb if deadline is None else min(deadline, cb)
-        text, err, _ = _qwen_attempt(payload, thinking, deadline, caller)
+        text, err, _ = _qwen_attempt(payload, thinking, deadline, caller, **_info)
         return text, err
 
     started = time.monotonic()
@@ -746,7 +761,8 @@ def _call_qwen(prompt, max_tokens, force_json, enable_thinking=None, model=None,
         # The 0.6 share is also this model's whole-ladder deadline: a primary that hangs
         # on attempt 1 must not be retried into the time luna and mimo need.
         text, err, movable = _qwen_attempt(p, thinking, cap if cap is not None else remaining,
-                                           caller, attempts=attempts, timeout_cap=cap)
+                                           caller, attempts=attempts, timeout_cap=cap,
+                                           **_info)
         if err is None:
             return text, None
         failures.append(f"{name} {str(err)[:120]}")
@@ -865,7 +881,9 @@ def _qwen_attempt(payload, thinking, deadline, caller, attempts=None,
     """One model, one request ladder. Returns (text, error, movable): `movable`
     says the failure is the model's, so the next model in the chain may try.
     `info`, when a dict is passed, receives `finish_reason` of a 200 answer (empty
-    or not); callers that pass nothing see no change."""
+    or not), and on a usable answer `model` (this attempt's model, i.e. the chain entry
+    that answered), `served_model` (the vendor's id) and `usage`; callers that pass
+    nothing see no change."""
     # One line per call, on the way OUT, naming what actually goes on the wire.
     #
     # Which model served a call was unanswerable from anywhere: the env says
@@ -981,6 +999,11 @@ def _qwen_attempt(payload, thinking, deadline, caller, attempts=None,
             )
         except Exception:  # noqa: BLE001 - telemetry must never break the call
             logger.warning("LLM_USAGE logging failed (qwen)", exc_info=True)
+        if info is not None:
+            info["model"] = payload["model"]
+            info["served_model"] = data.get("model") or payload["model"]
+            info["usage"] = {"prompt_tokens": usage.get("prompt_tokens"),
+                             "completion_tokens": completion}
         return content, None, False
     err_obj = data.get("error") if isinstance(data.get("error"), dict) else {}
     msg = err_obj.get("message", f"HTTP {resp.status}")

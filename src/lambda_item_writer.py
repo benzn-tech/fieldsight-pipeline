@@ -1716,6 +1716,13 @@ def write_extraction_items(date, user_folder, extraction_key):
             # before anyone is emailed about them.
             member_contexts = _resolve_member_contexts(conn, extraction)
 
+        # Task numbers ("#69", action packs spec §14 D1) for this pass's NEW action items --
+        # after carry-forward (a carried row already wears its predecessor's numbered
+        # stable_id) and as the LAST write of the transaction, so the per-site lock it takes
+        # comes after the source and day locks and is held only for the commit. Own
+        # SAVEPOINT; skipped before migration 0093; never fatal (number_new_items).
+        carry_forward_apply.number_new_items(conn, new_topic_ids, site["id"], extraction_key)
+
     logger.info("item-writer wrote extraction=%s topics=%d", extraction_key, topics_n)
 
     # The updated email, AFTER the connection block commits: the merged topics

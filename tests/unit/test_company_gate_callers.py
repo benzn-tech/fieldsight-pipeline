@@ -244,6 +244,16 @@ def test_rag_search_tools_matrix(rag_wired, monkeypatch, caplog):
                      "meta": {"error": "company_inactive"}}]}
 
 
+def test_rag_search_items_matrix(rag_wired, monkeypatch, caplog):
+    ev = {"mode": "items", "sub": "sub-1", "args": {}}
+    base, shadow, enforced = _run_matrix(monkeypatch, caplog, lambda: rag.lambda_handler(ev, None))
+    assert base == {"rows": [], "meta": {"site_count": 0, "truncated": False,
+                                         "empty_reason": "nothing_visible"}}
+    assert shadow == base
+    assert enforced == {"rows": [], "error": "company_inactive",
+                        "meta": {"error": "company_inactive"}}
+
+
 def test_rag_search_platform_admin_is_exempt(rag_wired, monkeypatch, caplog):
     rag_wired.setattr(rag.users, "get_user_by_sub",
                       lambda conn, sub: dict(RAG_CALLER, global_role="platform_admin"))

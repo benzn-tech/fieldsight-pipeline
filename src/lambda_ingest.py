@@ -932,6 +932,12 @@ def ingest_report(date, user_folder, report_key):
 
         _archive_deleted_chunks(conn, user_folder, date)
 
+        # Task numbers (action packs spec §14 D1) for this report's NEW action items: after
+        # carry-forward, as the last write of the transaction -- same placement and reasons as
+        # lambda_item_writer (the per-site lock is the last lock taken). A defer day wrote no
+        # report topics, so `new_topic_ids` is empty and this is a no-op. Never fatal.
+        carry_forward_apply.number_new_items(conn, new_topic_ids, site["id"], report_key)
+
     topics_n = len(topic_seq_to_id)
     logger.info("ingested report=%s topics=%d chunks=%d", report_key, topics_n, chunks_n)
 

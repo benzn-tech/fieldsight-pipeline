@@ -1,0 +1,13 @@
+{"pack_id": "00000000-0000-4000-8000-0000000000b1", "element": "conclusion:0", "annotator": "ann1", "supported_by_refs": "yes", "is_standards_claim": false}
+{"pack_id": "00000000-0000-4000-8000-0000000000b1", "element": "conclusion:1", "annotator": "ann1", "supported_by_refs": "no", "is_standards_claim": false}
+{"pack_id": "00000000-0000-4000-8000-0000000000b1", "element": "action:1", "annotator": "ann1", "supported_by_refs": "yes", "is_standards_claim": false}
+{"pack_id": "00000000-0000-4000-8000-0000000000b1", "element": "action:2", "annotator": "ann1", "supported_by_refs": "yes", "is_standards_claim": false, "matches_expected": "e2"}
+{"pack_id": "00000000-0000-4000-8000-0000000000b1", "element": "action:3", "annotator": "ann1", "supported_by_refs": "no", "is_standards_claim": false}
+{"pack_id": "00000000-0000-4000-8000-0000000000b2", "element": "conclusion:0", "annotator": "ann1", "supported_by_refs": "yes", "is_standards_claim": false}
+{"pack_id": "00000000-0000-4000-8000-0000000000b2", "element": "action:1", "annotator": "ann1", "supported_by_refs": "yes", "is_standards_claim": false}
+{"pack_id": "00000000-0000-4000-8000-0000000000b2", "element": "action:2", "annotator": "ann1", "supported_by_refs": "yes", "is_standards_claim": false}
+{"pack_id": "00000000-0000-4000-8000-0000000000b2", "element": "action:3", "annotator": "ann1", "supported_by_refs": "yes", "is_standards_claim": false}
+{"pack_id": "00000000-0000-4000-8000-0000000000b3", "element": "conclusion:0", "annotator": "ann1", "supported_by_refs": "no", "is_standards_claim": true}
+{"pack_id": "00000000-0000-4000-8000-0000000000b3", "element": "conclusion:1", "annotator": "ann1", "supported_by_refs": "yes", "is_standards_claim": true}
+{"pack_id": "00000000-0000-4000-8000-0000000000b3", "element": "conclusion:2", "annotator": "ann1", "supported_by_refs": "unclear", "is_standards_claim": true, "expected_uncertain_id": "u1"}
+{"pack_id": "00000000-0000-4000-8000-0000000000b3", "element": "action:1", "annotator": "ann1", "supported_by_refs": "yes", "is_standards_claim": false, "matches_expected": "e1"}

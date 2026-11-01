@@ -74,6 +74,16 @@ def _rows(conn, sql, params):
     return conn.cursor(row_factory=dict_row).execute(sql, params).fetchall()
 
 
+def live_document_ids(conn, ids, site_ids) -> set:
+    """Rule 3, public: the lower-cased ids among `ids` (uuid strings) whose project document
+    still exists (not soft-deleted) on one of `site_ids`. Also used by the action pack
+    source re-check (org-api, spec 2026-11-01 §14 S13)."""
+    if not ids or not site_ids:
+        return set()
+    return {r["id"].lower() for r in _rows(conn, _LIVE_DOCS_SQL,
+                                           {"ids": list(ids), "site_ids": list(site_ids)})}
+
+
 def withheld_turns(conn, caller, turns) -> set:
     """The `turn_id`s to withhold from `caller` now (spec §6 rules 1-4). A turn with
     no record or document source (web only) is never withheld; a turn with no
@@ -106,9 +116,7 @@ def withheld_turns(conn, caller, turns) -> set:
         dead_docs = set()
         if all_docs:
             ids = [d for d in all_docs if _UUID.match(d)]
-            live = (set() if not (ids and site_ids) else
-                    {r["id"].lower() for r in _rows(conn, _LIVE_DOCS_SQL,
-                                                    {"ids": ids, "site_ids": site_ids})})
+            live = live_document_ids(conn, ids, site_ids)
             dead_docs = {d for d in all_docs if d.lower() not in live}
         # Rule 4: a day-level report key survives a deleted session inside that day
         # (its own key is never tombstoned), so any recording tombstone for the

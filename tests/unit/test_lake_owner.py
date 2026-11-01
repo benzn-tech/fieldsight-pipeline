@@ -419,6 +419,12 @@ def test_f2_ambiguous_slug_rejects_a_hint_site_that_is_not_a_candidate():
     assert o["company_id"] is None
 
 
+def test_action_pack_web_snapshot_resolves_to_the_company_in_its_key():
+    key = f"action_packs/{CO_A}/33333333-3333-3333-3333-333333333333/web/W2.txt"
+    o = resolve(world(), key)
+    assert (o["company_id"], o["kind"], o["reason"]) == (CO_A, "action_pack_web", "key")
+
+
 def test_company_summary_resolves_to_the_company_in_its_key_without_a_hint():
     key = f"reports/{DAY}/companies/{CO_A}/summary_report.json"
     o = resolve(world(), key)
