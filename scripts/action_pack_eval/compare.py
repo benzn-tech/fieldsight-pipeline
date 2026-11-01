@@ -33,6 +33,11 @@ def compare(baseline, variants) -> dict:
     shas = {r.get("gold_sha256") for r in list(baseline) + list(variants)}
     if len(shas) != 1 or None in shas:
         raise CompareRefused(f"runs are scored against different gold sets: {sorted(map(str, shas))}")
+    inputs = {r.get("submitted_inputs_sha256") for r in list(baseline) + list(variants)}
+    if len(inputs) != 1:
+        raise CompareRefused("runs were submitted from different instructions (inputs "
+                             f"sha256 {sorted(map(str, inputs))}); the floor needs identical "
+                             "inputs")
     configs = {r.get("config_label") for r in baseline}
     if len(configs) != 1:
         raise CompareRefused(f"baseline runs have different config labels {sorted(map(str, configs))}; "

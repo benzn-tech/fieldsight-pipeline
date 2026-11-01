@@ -44,6 +44,7 @@ def build_report(gold, run, labels, *, prices=None, thresholds=None, second=None
     return {
         "run_id": run.get("run_id"), "config_label": run.get("config_label"),
         "gold_sha256": gold_sha256,
+        "submitted_inputs_sha256": run.get("inputs_sha256"),
         "counts": {"instructions": len(gold), "packs": sum(1 for p in packs if p),
                    "no_pack": sum(1 for p in packs if not p),
                    "by_state": dict(Counter((p or {}).get("state") for p in packs if p))},

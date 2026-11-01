@@ -75,9 +75,10 @@ Default thresholds (spec §8.3; the owner may tighten them):
    or archives an action: `updated_at` is the end-to-end latency clock.
 5. Attach `run_trace` and `models`. **GET does not return them** (`action_pack_view.shape_pack`),
    so export them read-only from TEST's `action_packs` table, one JSON object per line:
-   ```sql
-   SELECT json_build_object('id', id, 'run_trace', run_trace, 'models', models)
-   FROM action_packs WHERE id = ANY(:pack_ids);
+   ```bash
+   psql "$TEST_DATABASE_URL" -At -c "SELECT json_build_object('id', id, 'run_trace',
+     run_trace, 'models', models) FROM action_packs
+     WHERE id = ANY('{<pack uuid>,<pack uuid>}'::uuid[])" > action_pack_eval_runs/base1/traces.jsonl
    ```
    ```bash
    $PY -m scripts.action_pack_eval.cli attach-traces --run action_pack_eval_runs/base1/run.json \
@@ -102,3 +103,10 @@ Default thresholds (spec §8.3; the owner may tighten them):
   lines the verifier rejected are not, so nobody can label them. The report counts them from
   `run_trace.verify` and also gives a raw upper bound that counts each one as a fabrication.
 - **Two-run floor.** A noise floor from two runs is a minimum bar, not a confidence interval.
+- **Latency minimum.** `latency_min_n` defaults to 20, the gold minimum. With exactly 20
+  instructions, a single entry that never produced a pack (`site_unresolved`, `post_4xx`)
+  leaves the latency gate `insufficient` unless `--thresholds` lowers it. Timed-out
+  instructions are not dropped: each one enters the gate as a censored value equal to its
+  client-side wait.
+- **409 at submit.** `submit` does not retry a 409. Make sure no pack of the token's user is
+  queued or running before a run starts; otherwise every POST gets `post_409`.

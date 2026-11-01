@@ -435,3 +435,89 @@ def test_cli_submit_uses_the_client_factory(monkeypatch, runs_dir, no_sockets):
                      "--poll-s", "0", "--out", str(out)]) == 0
     run = json.loads(out.read_text(encoding="utf-8"))
     assert len(run["packs"]) == 3 and api.calls
+
+
+# ---------------------------------------------------------------- fix round 1
+
+def test_latency_counts_a_timed_out_instruction_as_a_censored_value():
+    run = {"packs": [
+        {"gold_id": "G1", "pack": {"id": "p", "state": "ready",
+                                   "created_at": "2026-11-01T00:00:00+00:00",
+                                   "updated_at": "2026-11-01T00:01:40+00:00"}},
+        {"gold_id": "G2", "pack_id": "q", "pack": None, "error": "timeout",
+         "client_elapsed_s": 900.0}]}
+    out = metrics.score_latency(run, max_p90_s=300, min_n=1)
+    # The slowest instruction must not vanish from the tail: 100 s and >= 900 s.
+    assert out["gate_n"] == 2 and out["gate_p90_s"] == 900.0
+    assert out["sources"]["timeout"] == 1
+    assert out["verdict"] == metrics.FAIL
+
+
+def test_submit_records_elapsed_time_on_a_timeout(no_sockets):
+    class Stuck(FakeApi):
+        def __call__(self, method, url, headers, body):
+            if method == "GET":
+                return 200, dict(self.packs[url.rsplit("/", 1)[1]], state="running")
+            return super().__call__(method, url, headers, body)
+    gold = gold_mod.load_gold(EX / "gold.json")[:1]
+    run = live.submit(gold, base_url="https://t/api/org", token="tok", client=Stuck(),
+                      site_map={}, sleep=lambda s: None,
+                      clock=iter(range(0, 10_000, 50)).__next__, poll_s=1, max_wait_s=120)
+    assert run["packs"][0]["error"] == "timeout"
+    assert run["packs"][0]["client_elapsed_s"] >= 120
+
+
+def test_a_label_file_holding_two_annotators_is_refused():
+    rows = ann_mod.load_annotations(EX / "annotations_a.jsonl")
+    both = rows + [dict(rows[0], annotator="ann2", supported_by_refs="no")]
+    errors = ann_mod.validate_annotations(both)
+    assert any("duplicate" in e and "one annotator per file" in e for e in errors)
+
+
+def test_score_refuses_a_run_submitted_from_other_instructions(runs_dir, tmp_path):
+    run = runs_mod.load_run(EX / "run_a.json")
+    run["inputs_sha256"] = "0" * 64
+    rp = tmp_path / "run.json"
+    rp.write_text(json.dumps(run), encoding="utf-8")
+    with pytest.raises(SystemExit, match="different instructions"):
+        cli.main(["score", "--gold", str(EX / "gold.json"), "--run", str(rp),
+                  "--annotations", str(EX / "annotations_a.jsonl"),
+                  "--out", str(runs_dir / "x")])
+    gold = gold_mod.load_gold(EX / "gold.json")
+    run["inputs_sha256"] = gold_mod.inputs_sha256(gold)
+    rp.write_text(json.dumps(run), encoding="utf-8")
+    cli.main(["score", "--gold", str(EX / "gold.json"), "--run", str(rp),
+              "--annotations", str(EX / "annotations_a.jsonl"), "--out", str(runs_dir / "x")])
+    rep = json.loads((runs_dir / "x" / "report.json").read_text(encoding="utf-8"))
+    assert rep["submitted_inputs_sha256"] == gold_mod.inputs_sha256(gold)
+
+
+def test_inputs_hash_ignores_expected_actions_but_not_instruction_text():
+    g = _full_gold()
+    h = gold_mod.inputs_sha256(g)
+    g[0]["expected_actions"] = [{"id": "e1", "type": "create_item", "match_hint": "x"}]
+    assert gold_mod.inputs_sha256(g) == h
+    g[0]["instruction"] = "changed"
+    assert gold_mod.inputs_sha256(g) != h
+
+
+def test_compare_refuses_runs_submitted_from_different_instructions():
+    a, b = _summary(recall=0.6), _summary(recall=0.7)
+    a["submitted_inputs_sha256"], b["submitted_inputs_sha256"] = "x", "y"
+    with pytest.raises(compare_mod.CompareRefused, match="instructions"):
+        compare_mod.compare([a, b], [])
+
+
+def test_cli_fetch_uses_the_client_factory(monkeypatch, runs_dir, no_sockets, tmp_path):
+    api = FakeApi()
+    api.packs = {f"{S}f1": {"id": f"{S}f1", "state": "ready"}}
+    monkeypatch.setenv("ACTION_PACK_EVAL_TOKEN", "tok")
+    monkeypatch.setattr(live, "urllib_client", lambda timeout: api)
+    prior = tmp_path / "prior.json"
+    prior.write_text(json.dumps({"run_id": "r", "packs": [
+        {"gold_id": "G1", "pack_id": f"{S}f1", "pack": None}]}), encoding="utf-8")
+    out = runs_dir / "fetched.json"
+    assert cli.main(["fetch", "--run", str(prior), "--base-url", "https://t/api/org",
+                     "--out", str(out)]) == 0
+    assert [c[:2] for c in api.calls] == [("GET", f"https://t/api/org/action-packs/{S}f1")]
+    assert json.loads(out.read_text(encoding="utf-8"))["packs"][0]["pack"]["state"] == "ready"

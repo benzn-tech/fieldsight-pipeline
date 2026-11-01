@@ -143,7 +143,7 @@ def test_latency_p50_p90(ex):
     assert out["end_to_end"] == {"n": 3, "p50_s": 240.0, "p90_s": 400.0}
     # run_trace.ms.total: 110, 230, 390 s.
     assert out["worker"] == {"n": 3, "p50_s": 230.0, "p90_s": 390.0}
-    assert out["sources"] == {"timestamps": 3, "run_trace": 0, "none": 0}
+    assert out["sources"] == {"timestamps": 3, "run_trace": 0, "timeout": 0, "none": 0}
     assert out["verdict"] == metrics.FAIL
 
 
@@ -151,7 +151,7 @@ def test_latency_falls_back_to_worker_time_and_needs_min_n():
     run = {"packs": [{"gold_id": "G", "pack": {"id": "p", "state": "ready",
                                                "run_trace": {"ms": {"total": 60000}}}}]}
     out = metrics.score_latency(run, max_p90_s=300, min_n=1)
-    assert out["sources"] == {"timestamps": 0, "run_trace": 1, "none": 0}
+    assert out["sources"] == {"timestamps": 0, "run_trace": 1, "timeout": 0, "none": 0}
     assert out["gate_p90_s"] == 60.0 and out["verdict"] == metrics.PASS
     assert metrics.score_latency(run, max_p90_s=300, min_n=20)["verdict"] == metrics.INSUFFICIENT
 

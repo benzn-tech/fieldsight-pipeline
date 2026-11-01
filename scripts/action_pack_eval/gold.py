@@ -49,6 +49,15 @@ def gold_sha256(path) -> str:
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
 
+def inputs_sha256(entries) -> str:
+    """Hash of what `submit` sends for each instruction (id, site, instruction text) and
+    nothing else: two runs with the same inputs hash ran the same instructions, whatever
+    edits were made to expected actions or labels-side fields afterwards."""
+    canon = json.dumps([[e.get("id"), e.get("site"), e.get("instruction")] for e in entries],
+                       ensure_ascii=False)
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
 def _nonempty_str(v):
     return isinstance(v, str) and bool(v.strip())
 

@@ -277,10 +277,21 @@ def score_latency(run, *, max_p90_s=DEFAULT_THRESHOLDS["latency_p90_max_s"],
     """Seconds per finished (ready/failed) pack. end_to_end = updated_at - created_at (the
     reader's wait incl. queue; read before anyone applies or archives); worker =
     run_trace.ms.total (the agent's own time). The gate takes end_to_end and falls back to
-    worker per pack; `sources` says which was used. Insufficient below min_n packs."""
+    worker per pack; `sources` says which was used. An instruction whose pack never
+    finished inside submit's max wait (error "timeout") enters the gate as its client-side
+    elapsed time, a censored value (the real latency is at least that), so the slowest
+    instructions cannot drop out of the tail. Insufficient below min_n values."""
     e2e, worker, gate = [], [], []
-    sources = Counter({"timestamps": 0, "run_trace": 0, "none": 0})
+    sources = Counter({"timestamps": 0, "run_trace": 0, "timeout": 0, "none": 0})
     for row in run.get("packs") or []:
+        waited = row.get("client_elapsed_s")
+        if row.get("error") == "timeout":
+            if isinstance(waited, (int, float)) and not isinstance(waited, bool):
+                gate.append(float(waited))
+                sources["timeout"] += 1
+            else:
+                sources["none"] += 1
+            continue
         pack = row.get("pack") or {}
         if pack.get("state") not in FINISHED_STATES:
             continue

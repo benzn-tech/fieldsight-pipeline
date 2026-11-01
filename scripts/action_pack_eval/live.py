@@ -55,7 +55,7 @@ def resolve_site(site, site_map):
 
 def submit(gold, *, base_url, token, client, site_map=None, sleep=None, clock=None,
            poll_s=15, max_wait_s=900, config_label=None, run_id=None,
-           gold_sha256=None) -> dict:
+           gold_sha256=None, inputs_sha256=None) -> dict:
     sleep = sleep or time.sleep
     clock = clock or time.monotonic
     base = base_url.rstrip("/")
@@ -85,12 +85,14 @@ def submit(gold, *, base_url, token, client, site_map=None, sleep=None, clock=No
                 row["pack"] = body
                 row["client_elapsed_s"] = clock() - start
                 break
-            if clock() - start >= max_wait_s:
+            elapsed = clock() - start
+            if elapsed >= max_wait_s:
                 row["error"] = "timeout"
+                row["client_elapsed_s"] = elapsed     # a censored latency (>= max wait)
                 break
             sleep(poll_s)
     return {"run_id": run_id, "config_label": config_label, "gold_sha256": gold_sha256,
-            "packs": rows}
+            "inputs_sha256": inputs_sha256, "packs": rows}
 
 
 def fetch(prior, *, base_url, token, client) -> dict:

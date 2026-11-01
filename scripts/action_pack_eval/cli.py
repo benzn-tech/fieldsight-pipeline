@@ -66,9 +66,13 @@ def cmd_score(args):
     sha = gold_mod.gold_sha256(args.gold)
     run = runs_mod.load_run(args.run)
     warnings = list(warnings)
+    if run.get("inputs_sha256") and run["inputs_sha256"] != gold_mod.inputs_sha256(gold):
+        raise SystemExit("the run was submitted from different instructions than this gold "
+                         "set (id/site/instruction changed); score it against the gold file "
+                         "it was submitted from")
     if run.get("gold_sha256") and run["gold_sha256"] != sha:
-        warnings.append("the run was submitted from a different gold file "
-                        f"({run['gold_sha256'][:12]} vs {sha[:12]})")
+        warnings.append("the gold file changed since submission (expected actions or other "
+                        f"non-input fields: {run['gold_sha256'][:12]} vs {sha[:12]})")
     known = {e["id"] for e in gold}
     stray = sorted({str(r.get("gold_id")) for r in run["packs"]} - known)
     if stray:
@@ -145,7 +149,8 @@ def cmd_submit(args):
                       sleep=live.time.sleep, clock=live.time.monotonic, poll_s=args.poll_s,
                       max_wait_s=args.max_wait_s, config_label=args.config_label,
                       run_id=args.run_id or Path(dest).stem,
-                      gold_sha256=gold_mod.gold_sha256(args.gold))
+                      gold_sha256=gold_mod.gold_sha256(args.gold),
+                      inputs_sha256=gold_mod.inputs_sha256(gold))
     paths.write_json(dest, run)
     errors = [r for r in run["packs"] if r.get("error")]
     print(f"{len(run['packs'])} instructions, {len(errors)} without a finished pack -> {dest}")

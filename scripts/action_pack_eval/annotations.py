@@ -64,9 +64,12 @@ def validate_annotations(rows, *, run=None, gold=None) -> list:
             errors.append(f"{where}: supported_by_refs must be one of {list(SUPPORT_VALUES)}")
         if not isinstance(r.get("is_standards_claim"), bool):
             errors.append(f"{where}: is_standards_claim must be true or false")
-        k = (str(r["pack_id"]), r["element"], r.get("annotator"))
+        # One annotator per file: a second annotator's row for the same element would
+        # silently replace the first in label_index (last row wins).
+        k = (str(r["pack_id"]), r["element"])
         if k in seen:
-            errors.append(f"{where}: duplicate label for this annotator")
+            errors.append(f"{where}: duplicate label for this element (one annotator per "
+                          f"file; the second annotator's labels go in their own file)")
         seen.add(k)
         if run is None:
             continue

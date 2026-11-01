@@ -33,7 +33,7 @@ Validation:
 ## Recorded run (`--run`)
 
 ```json
-{"run_id": "base1", "config_label": "baseline", "gold_sha256": "...",
+{"run_id": "base1", "config_label": "baseline", "gold_sha256": "...", "inputs_sha256": "...",
  "packs": [{"gold_id": "G1", "pack_id": "<uuid>", "pack": {...}, "error": null}]}
 ```
 
@@ -41,6 +41,11 @@ Validation:
   when they have been attached with `attach-traces`. It is `null` when no finished pack
   exists; that instruction's expectations then count as missed.
 - **`error`** is one of `site_unresolved`, `post_<status>`, `get_<status>` or `timeout`.
+  A timeout row carries `client_elapsed_s`.
+- **`inputs_sha256`** hashes what `submit` sent: each instruction's id, site and text.
+  - `score` refuses a run whose inputs hash differs from the gold file's.
+  - `compare` refuses reports whose submitted inputs differ.
+  - Edits to expected actions after submission only produce a warning.
 - **Run-trace keys read:**
   - `tokens`
   - `ms.total`
@@ -59,9 +64,15 @@ Every stored conclusion line and every stored action is one element:
 An element is **shown** unless it is an action whose verifier label is `unsupported`. Those
 actions are stored for this comparison but are never applicable.
 
+Conclusion keys are positions in the RECORDED list. A later `fetch` can drop lines whose
+sources were removed (S13), and that shifts the positions. Label the run file you score, and
+do not re-fetch between labelling and scoring.
+
 ## Labels (`--annotations`, `--second`)
 
-Labels are JSONL, one row per element per annotator:
+Labels are JSONL, one row per element. A file holds **one annotator**; a second
+annotator's labels go in their own file (`--second`). A repeated (pack, element) is an
+error.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -144,7 +155,8 @@ Latency covers ready and failed packs. Two measures are kept:
 - **Worker time:** `run_trace.ms.total`.
 
 The gate uses end-to-end, and falls back per pack to worker time when the timestamps are
-missing. The p50 and p90 use the nearest rank. The verdict is `insufficient` with fewer than
+missing. A `timeout` row enters the gate as its `client_elapsed_s`, a censored lower bound,
+so the slowest instructions stay in the tail. The p50 and p90 use the nearest rank. The verdict is `insufficient` with fewer than
 `latency_min_n` packs (default 20).
 
 ### Cost
@@ -168,7 +180,8 @@ undefined: no pairs, or chance agreement equal to 1.
 
 `compare` takes the report.json files from the scored runs:
 
-- **Floor:** for each headline metric, the spread (max − min) across the baseline runs. Those
-  runs must share the gold set (sha256) and the config label, and there must be at least two.
+- **Floor:** for each headline metric, the spread (max − min) across the baseline runs. There
+  must be at least two baseline runs, and they must share the config label. Every compared
+  report, baseline or variant, must share the gold set (sha256) and the submitted inputs.
 - **Variant verdict:** the variant's delta is measured against the baseline mean. It is
   `better` or `worse` only when |delta| > floor; otherwise it is `within_noise`.
