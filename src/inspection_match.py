@@ -25,6 +25,8 @@ GENERIC = frozenset((
     "starting", "start", "doing", "now", "new", "form", "sheet", "record", "report", "daily",
     "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "ground",
     "qa", "qc", "itp", "quality", "assurance", "control", "test", "plan",
+    # multi-unit walks name the unit in the opening (spec 2026-11-03)
+    "unit", "units", "lot", "lots", "today",
 ))
 MIN_SCORE = 0.5
 
