@@ -1891,6 +1891,7 @@ def _store_inspections(conn, company_id, user_id, user_folder, date, session, sp
             evidence=w.get("start_quote"))
     _assign_walks(conn, company_id, user_folder, date, session, rows)
     inspection_windows.replace_for_session(conn, company_id, user_folder, date, session, rows)
+    _backfill_walks(conn, company_id, user_folder, date, session, rows)
     return rows
 
 
@@ -1922,6 +1923,29 @@ def _assign_walks(conn, company_id, user_folder, date, session, rows):
         logger.exception("walk keys not assigned for %s/%s %s", user_folder, date, session)
         for r in rows:
             r["walk_key"] = None
+
+
+def _backfill_walks(conn, company_id, user_folder, date, session, rows):
+    """R13: a recording that OPENS a walk may be extracted after a later
+    recording of the same walk, which found no walk and stored none. Each walk
+    this recording opens claims those later, keyless, opening-less windows.
+    The latest opening claims first, so an earlier walk never reaches past a
+    later one. After the windows are stored, in its own savepoint, and never
+    fatal: the windows are already kept."""
+    if conn is None or company_id is None:
+        return
+    opened = [r for r in rows if r.get("walk_key") and r["walk_key"] == units.walk_key(
+        company_id, user_folder, date, r["template_id"], r["start_at"])]
+    for r in sorted(opened, key=lambda r: r["start_at"], reverse=True):
+        try:
+            with conn.transaction():
+                n = inspection_windows.backfill_walk(conn, company_id, user_folder, date,
+                                                     r["template_id"], r["start_at"],
+                                                     r["walk_key"], session)
+            if n:
+                logger.info("walk %s claimed %d later window(s)", r["walk_key"], n)
+        except Exception:  # noqa: BLE001 -- the windows are stored; only the back-fill is lost
+            logger.exception("walk back-fill failed for %s/%s %s", user_folder, date, session)
 
 
 def lambda_handler(event, context):

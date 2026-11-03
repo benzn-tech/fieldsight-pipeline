@@ -236,7 +236,7 @@ def test_item_writer_keys_the_walk_from_other_recordings_only(monkeypatch):
     assert stored["rows"][0]["walk_key"] == old, "its own old row is about to be replaced"
 
 
-def test_item_writer_keeps_the_windows_when_walk_assignment_fails(monkeypatch):
+def test_item_writer_keeps_the_windows_when_walk_assignment_fails(monkeypatch, caplog):
     import pytest
     lam = pytest.importorskip("lambda_item_writer")
     tpl = {"id": "t-1", "name": "Framing Checklist", "scope": "org", "body": {}}
@@ -258,3 +258,36 @@ def test_item_writer_keeps_the_windows_when_walk_assignment_fails(monkeypatch):
         {"name": "framing", "kind": "framing", "start_at": "10:00",
          "units": {"names": ["Lot 1", "Lot 2"], "count": 2}}])
     assert [r["walk_key"] for r in stored["rows"]] == [None]
+    assert any("walk keys not assigned" in r.getMessage() and r.exc_info for r in caplog.records)
+
+
+def test_a_one_name_opening_continues_an_earlier_walk():
+    """R12: one name is not an opening, so it carries on the day's walk."""
+    old = units.walk_key(CO, FOLDER, DAY, TPL, "10:00:00")
+    walks = [{"walk_key": old, "start_at": "10:00:00", "units": {}, "session": "sidA"}]
+    assert units.assign_walk(_window("11:00:00", names=["Lot 153"]), walks, CO, FOLDER, DAY) == old
+
+
+def test_a_later_window_of_the_same_recording_continues_its_walk(monkeypatch):
+    """R11: a walk opened earlier in this recording counts as an open walk."""
+    import contextlib
+    import pytest
+    lam = pytest.importorskip("lambda_item_writer")
+    tpl = {"id": "t-1", "name": "Framing Checklist", "scope": "org", "body": {}}
+    stored = {}
+    monkeypatch.setattr(lam.inspection_windows, "checklist_templates", lambda c, co, u: [tpl])
+    monkeypatch.setattr(lam.inspection_match, "match", lambda w, ts: (tpl, 1.0))
+    monkeypatch.setattr(lam.inspection_windows, "open_walks", lambda *a: [])
+    monkeypatch.setattr(lam.inspection_windows, "backfill_walk", lambda *a: 0, raising=False)
+    monkeypatch.setattr(lam.inspection_windows, "replace_for_session",
+                        lambda c, co, f, d, s, rows: stored.update(rows=rows))
+
+    class Conn:
+        def transaction(self):
+            return contextlib.nullcontext()
+    lam._store_inspections(Conn(), "c-1", "u-1", FOLDER, DAY, "sidA", [
+        {"name": "framing lots", "kind": "framing", "start_at": "10:00", "start_at_s": "10:00:05",
+         "units": {"names": ["Lot 1", "Lot 2"], "count": 2}},
+        {"name": "framing", "kind": "framing", "start_at": "10:30", "start_at_s": "10:30:00"}])
+    first = units.walk_key("c-1", FOLDER, DAY, "t-1", "10:00:05")
+    assert [r["walk_key"] for r in stored["rows"]] == [first, first]

@@ -51,6 +51,27 @@ def replace_for_session(conn, company_id, user_folder, date, session, windows):
     return len(windows or [])
 
 
+def backfill_walk(conn, company_id, user_folder, date, template_id, after_start_at,
+                  walk_key, exclude_session):
+    """A walk extracted AFTER a later recording of it (R13): give its key to the
+    day's later windows on this checklist from other recordings that have no
+    walk yet and no opening of their own (fewer than two names, no count of two
+    or more). Returns how many rows it claimed."""
+    cur = conn.execute(
+        "UPDATE inspection_windows SET walk_key = %s "
+        "WHERE company_id = %s AND user_folder = %s AND report_date = %s "
+        "AND template_id = %s AND start_at > %s AND session <> %s AND walk_key IS NULL "
+        "AND (units IS NULL OR ("
+        "  (CASE WHEN jsonb_typeof(units->'names') = 'array' "
+        "        THEN jsonb_array_length(units->'names') ELSE 0 END) < 2 "
+        "  AND (CASE WHEN jsonb_typeof(units->'count') = 'number' "
+        "        THEN (units->>'count')::numeric ELSE 0 END) < 2))",
+        (walk_key, str(company_id), user_folder, date, str(template_id), after_start_at,
+         exclude_session),
+    )
+    return cur.rowcount
+
+
 def _has_units(units):
     """An opening that named no units and no count is stored as NULL, so a
     single-unit check's row looks exactly as it did before 0096."""
