@@ -82,8 +82,9 @@ evidence. Code checks that each assignment names a unit from the list (or a
 flagged new one), and that each item has at most one answer per unit.
 
 `inspection_match.GENERIC` already drops "room", "level", number words and
-digits when matching a check to its template, so a unit name does not disturb
-template matching. A unit mention must also **not** close the inspection
+digits when matching a check to its template. It must also drop unit / units /
+lot / lots / today (see "Builder-check answers"), or a unit name can push a
+check below `MIN_SCORE`. A unit mention must also **not** close the inspection
 window: `end_source='next_check'` is for a different check, not a different
 unit.
 
@@ -115,8 +116,14 @@ How the answers come back depends on how many items are open:
   note for a reason (no typing in capture, owner rule).
 - Every answer, from the device or the phone, is written to the same report,
   on that unit's item, with its quote or voice note as evidence. Whatever is
-  still unanswered stays "not checked", and the inspector can settle it later on
-  the web.
+  still unanswered stays "not checked" in the report. Settling it later on the
+  web is the next phase (see "Owner decisions").
+- **Wrong unit, fixed on the spot (owner, 2026-11-03).** When a No is read back
+  and he answers "no, that was Unit 2", the finding **moves** to Unit 2. If
+  Unit 2 had that item as Yes, the moved No replaces it. The device confirms
+  the move ("moved to Unit 2"). On the phone, every No has a "move to another
+  unit" option. A move keeps its quote, and the report shows the finding was
+  moved and by which answer.
 
 **Why not a live voice model (GPT-live style):** sites are loud, and the hard
 part is open-mic endpointing. Push-to-talk on the existing Ask key avoids it.
@@ -172,7 +179,7 @@ The **device state** decides, not a backend guess:
 - One report per multi-unit walk: shared header once, a checklist per unit, and
   a summary table.
 - Silence is never Yes. A per-unit "all good" is an explicit, visible Yes.
-- Gaps and No answers are settled on site before he leaves, by voice on the
+- Gaps and No answers (including a wrong unit) are settled on site before he leaves, by voice on the
   device for a few items and on the phone for many.
 
 ## Non-goals
@@ -249,5 +256,25 @@ check.
   sessions is re-extracted.
 - **`inspection_match.GENERIC` must gain** unit / units / lot / lots / today.
   Otherwise "wall framing inspection today, Lot 150 to 154" scores exactly
-  `MIN_SCORE` against "Wall Framing Inspection" (reviewer's finding). The claim
-  in "Unit boundaries" above is corrected by this.
+  `MIN_SCORE` against "Wall Framing Inspection" (reviewer's finding). One more
+  spoken word ("units") would drop it to 0.4 and the match fails. Words such as
+  townhouse / house are to be measured on real openings before adding.
+
+## Owner decisions (2026-11-03, "go with your recommendations")
+
+- **Wrong unit:** moved by voice on the spot, and from the phone (see "The
+  final check").
+- **Web "settle later": next phase, not this one.** On-site settling should
+  leave few items. When built, it needs a write endpoint, per-item controls on
+  the web, and a record of who answered, when and on what basis, so that
+  on-site evidence and later answers stay distinct in a customer record. Who may
+  answer (the inspector, or also the PM/reviewer) is decided then. My lean: both,
+  with the answerer named on the item.
+- **On-site answer vs the full recording.** The on-site check sees only the
+  part of the recording already transcribed. When the full recording is
+  extracted:
+  - an item settled on site as "not checked", which the recording answers, takes
+    the recording's answer;
+  - an item where the on-site answer and the recording **disagree** (Yes on site,
+    "size looks wrong" at 10:05 in the recording) keeps **both**. It is flagged
+    for the inspector to choose. Neither one silently overwrites the other.
