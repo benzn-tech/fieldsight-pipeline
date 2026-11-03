@@ -140,6 +140,22 @@ def walk_companies(conn, user_folder, date, walk_key):
     return sorted(str(r[0]) for r in rows)
 
 
+def walk_rows(conn, user_folder, walk_key):
+    """Every window of walk `walk_key` in this folder, earliest first, with its
+    company -- what a confirmation answer is checked against (Task 11). Never
+    by walk_key alone: the folder is the caller's own, so another person's walk
+    reads as none. The key already names the day (units.walk_key)."""
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT company_id, report_date, session, template_id, start_at, units, entered "
+        "FROM inspection_windows WHERE walk_key = %s AND user_folder = %s "
+        "ORDER BY start_at, session",
+        (walk_key, user_folder),
+    ).fetchall()
+    for r in rows:
+        _parse_json(r, "units", "entered")
+    return rows
+
+
 def open_walks(conn, company_id, user_folder, date, template_id):
     """The day's multi-unit walks on this checklist so far, oldest first: every
     window (from any recording of the day) that carries a walk_key. The caller

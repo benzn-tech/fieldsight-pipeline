@@ -9,15 +9,21 @@ CheckGapsDbFunction (in-VPC, no egress), the AskAgent -> RagSearch split.
 Event:  {"caller_sub", "check_name", "spoken", "pressed_at"}
 Result: check_done.run's response -- always a dict with `status` and `say`.
 
+Event:  {"action": "confirm", "caller_sub", "walk_key", "unit", "item_text", "kind",
+         "audio_b64" | "text", "pressed_at"} -- an answer to a final-check question
+         (multi-unit walks, Task 11): walk_confirm.handle. Never general Ask.
+
 Environment:
     S3_BUCKET               - the lake (transcripts/, users/*/audio/)
     CHECK_GAPS_DB_FUNCTION  - the in-VPC hop
+    ITEM_WRITER_FUNCTION    - re-queues a walk report after a confirmation answer (async)
     ELEVENLABS_ASK_API_KEY  - the Ask STT key; absent = stored transcript only
     LLM_* / QWEN_*          - llm_utils, the Ask worker's fast model
 """
 import json
 import logging
 import os
+from datetime import datetime, timezone
 
 import boto3
 import urllib3
@@ -26,6 +32,7 @@ from botocore.config import Config
 import check_done
 import elevenlabs_utils
 import llm_utils
+import walk_confirm
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -46,6 +53,7 @@ logger.addFilter(_NoAnnouncementText())
 
 S3_BUCKET = os.environ.get("S3_BUCKET", "")
 CHECK_GAPS_DB_FUNCTION = os.environ.get("CHECK_GAPS_DB_FUNCTION", "")
+ITEM_WRITER_FUNCTION = os.environ.get("ITEM_WRITER_FUNCTION", "")
 # The hop's Timeout is 10 s, but a cold VPC start runs its init (psycopg import,
 # ENI) BEFORE that clock starts, so 11 could cut a cold hop that would have
 # answered. 13 still leaves the gap pass its 12 s inside the 30 s run budget
@@ -94,6 +102,19 @@ def db_hop(payload):
     return body
 
 
+def requeue_walk(saved):
+    """The walk report again, with the answer just written: an async (Event)
+    invoke of item-writer, which runs checklist_reports.requeue_walk in the VPC
+    with org-api's code (R31). The hop stays without S3. Raises when it cannot
+    be asked; walk_confirm.handle logs that and keeps the answer."""
+    if not ITEM_WRITER_FUNCTION:
+        raise RuntimeError("ITEM_WRITER_FUNCTION not set")
+    payload = {"action": "requeue_walk"}
+    payload.update({k: saved.get(k) for k in ("company_id", "folder", "date", "walk_key")})
+    _get_lambda().invoke(FunctionName=ITEM_WRITER_FUNCTION, InvocationType="Event",
+                         Payload=json.dumps(payload))
+
+
 def stt_chunk(audio_bytes, filename):
     """One 30 s chunk -> text. Modelled on elevenlabs_utils.stt_short, with three
     differences on purpose:
@@ -140,8 +161,15 @@ def _assemble(bucket, keys):
     return _extraction_module().assemble_deduped_turns(bucket, keys)
 
 
+def _utc_now():
+    return datetime.now(timezone.utc)
+
+
 def lambda_handler(event, context):
     stt = stt_chunk if elevenlabs_utils.ELEVENLABS_ASK_API_KEY else None
+    if (event or {}).get("action") == "confirm":
+        return walk_confirm.handle(event, stt=stt, db_write=db_hop, now=_utc_now,
+                                   requeue=requeue_walk)
     # The run's budget is RUN_BUDGET_S from now, or less when the runtime has less
     # left (a slow cold init): the shaped answer must be returned before the kill.
     budget = None

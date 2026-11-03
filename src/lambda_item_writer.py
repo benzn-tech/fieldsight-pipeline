@@ -53,11 +53,13 @@ Environment Variables:
     S3_BUCKET     - S3 bucket name (the data lake -- IngestBucketName)
     PG*/DATABASE_URL - read by db.connection.get_connection()
 """
+import datetime
 import json
 import todo_collapse
 import logging
 import os
 import re
+import uuid
 from urllib.parse import unquote_plus
 
 import boto3
@@ -1948,8 +1950,61 @@ def _backfill_walks(conn, company_id, user_folder, date, session, rows):
             logger.exception("walk back-fill failed for %s/%s %s", user_folder, date, session)
 
 
+_WALK_KEY_RE = re.compile(r"^walk:[0-9a-f]{40}$")
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _requeue_walk_error(event):
+    """Why a requeue_walk invoke is refused, or None."""
+    key, company, folder, date = (event.get(k) for k in ("walk_key", "company_id", "folder", "date"))
+    if not isinstance(key, str) or not _WALK_KEY_RE.match(key):
+        return "walk_key invalid"
+    try:
+        uuid.UUID(str(company)) if company else None
+    except ValueError:
+        company = None
+    if not company:
+        return "company_id invalid"
+    # The folder spelling item-writer itself files by (users.safe_folder_name), and
+    # one path segment -- an extraction key's folder (EXTRACTION_KEY_RE) has no "/".
+    if (not isinstance(folder, str) or not folder or folder in (".", "..")
+            or users_repo.safe_folder_name(folder) != folder):
+        return "folder invalid"
+    if not isinstance(date, str) or not _ISO_DATE_RE.match(date):
+        return "date invalid"
+    try:
+        datetime.date.fromisoformat(date)
+    except ValueError:
+        return "date invalid"
+    return None
+
+
+def _requeue_walk(event):
+    """A walk report queued again after an on-site answer (multi-unit walks,
+    Task 11, R31): async-invoked by CheckGaps, which is outside the VPC and
+    cannot run org-api's code against Aurora. checklist_reports.requeue_walk
+    never raises; its result (request id or reason) is returned and logged."""
+    err = _requeue_walk_error(event)
+    if err:
+        logger.warning("requeue_walk refused: %s", err)
+        return {"error": err}
+    pipeline_trace.begin("item-writer", user_folder=event["folder"], date=event["date"])
+    try:
+        with get_connection() as conn:
+            result = checklist_reports.requeue_walk(conn, event["company_id"], event["folder"],
+                                                    event["date"], event["walk_key"])
+    finally:
+        pipeline_trace.flush(s3, S3_BUCKET)
+    logger.info("requeue_walk %s: %s", event["walk_key"], result)
+    return {"requeued": result}
+
+
 def lambda_handler(event, context):
     event = event or {}
+    # A direct invoke from CheckGaps. An S3 notification is {"Records": [...]} and
+    # never carries a top-level action; one that has Records is never this.
+    if event.get("action") == "requeue_walk" and "Records" not in event:
+        return _requeue_walk(event)
     results = []
     for record in event.get("Records", []):
         key = unquote_plus(record["s3"]["object"]["key"])
