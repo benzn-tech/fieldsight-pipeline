@@ -18,6 +18,11 @@ for _p in (BENCH_DIR, SRC):
         sys.path.insert(0, _p)
 
 
+@pytest.fixture(autouse=True)
+def _no_grader_pace(monkeypatch):
+    monkeypatch.setattr(grade, "_sleep", lambda s: None)
+
+
 def _load(name):
     spec = importlib.util.spec_from_file_location(name, os.path.join(BENCH_DIR, name + ".py"))
     mod = importlib.util.module_from_spec(spec)
@@ -1028,18 +1033,41 @@ class GraderFake429(GraderFake):
         return r
 
 
-def test_grader_429_retried_once_after_two_seconds():
+def test_grader_429_backs_off_then_gives_up():
     slept = []
     fake = GraderFake429([429])
     g = grade.grade_one("Q?", GOLD, "a", [], call=fake, sleep=slept.append)
     assert g["label"] == "correct" and len(fake.prompts) == 2 and slept == [2.0]
-    fake = GraderFake429([429, 429])
+    slept.clear()
+    fake = GraderFake429([429] * 4)
     g = grade.grade_one("Q?", GOLD, "a", [], call=fake, sleep=slept.append)
-    assert g["label"] == "ungraded" and len(fake.prompts) == 2
+    assert g["label"] == "ungraded" and len(fake.prompts) == 4
+    assert slept == list(grade.RETRY_429_S) and g["grader_http_status"] == 429
     fake = GraderFake429([500])
-    assert grade.grade_one("Q?", GOLD, "a", [], call=fake, sleep=slept.append)["label"] == \
-        "ungraded"
+    assert grade.grade_one("Q?", GOLD, "a", [], call=fake, sleep=slept.append)["label"] ==         "ungraded"
     assert len(fake.prompts) == 1
+
+
+def test_grade_paces_calls_and_stops_on_a_429_streak(tmp_path):
+    _calls_file(tmp_path)
+    args = grade.validate(_g_argv(tmp_path, "--confirm-calls", "28", "--pace-s", "0.5"),
+                          {"CORROBORATION_API_KEY": "k"}, REPO)
+    slept = []
+    fake = GraderFake429([200, 200] + [429] * 100)
+    out = io.StringIO()
+    code, info = grade.run(args, call=fake, stdout=out, sleep=slept.append)
+    assert code == 4 and info["stopped_429"] is True
+    n_rows = 2 + grade.STOP_AFTER_429_ROWS
+    assert len(fake.prompts) == 2 + grade.STOP_AFTER_429_ROWS * (len(grade.RETRY_429_S) + 1)
+    assert slept.count(0.5) == n_rows - 1
+    rows = [json.loads(l) for l in open(tmp_path / "grades_r0.jsonl", encoding="utf-8")]
+    graded = [g for g in rows if g["label"] != "no_answer"]
+    # the streak's rows and the untouched rest stay out, so --only-ungraded picks them up
+    assert len(graded) == 2 and "429" in out.getvalue()
+    args = grade.validate(_g_argv(tmp_path, "--only-ungraded", "--confirm-calls", "26"),
+                          {"CORROBORATION_API_KEY": "k"}, REPO)
+    code, _ = grade.run(args, call=GraderFake(), stdout=io.StringIO(), sleep=slept.append)
+    assert code == 0
 
 
 def test_draft_answers_are_never_source_checked(tmp_path):
