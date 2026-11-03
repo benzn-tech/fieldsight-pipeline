@@ -48,8 +48,15 @@ def test_rule_2_a_pass_is_yes():
 
 
 def test_rule_2_a_read_back_no_confirmed_stays_no():
-    for said in ("Right.", "correct", "Yes"):
+    # R32: on a read-back No every acknowledgement confirms the No.
+    for said in ("Right.", "correct", "Yes", "yeah", "OK", "okay", "Good", "That's right",
+                 "yep"):
         assert wc.parse_answer(said, "confirm_no", UNITS) == {"answer": "No", "confirmed": True}, said
+
+
+def test_rule_2_only_an_explicit_pass_turns_a_read_back_no_into_yes():
+    for said in ("Pass", "passed", "It passes.", "actually it passes"):
+        assert wc.parse_answer(said, "confirm_no", UNITS) == {"answer": "Yes"}, said
 
 
 def test_rule_3_a_fail_is_no_with_the_rest_as_its_comment():
@@ -65,10 +72,34 @@ def test_rule_4_not_applicable_is_na():
         assert wc.parse_answer(said, "not_checked", UNITS) == {"answer": "N/A"}, said
 
 
+def test_rule_4_is_anchored_to_the_start():
+    assert wc.parse_answer("pass, n a for the lintel", "not_checked", UNITS) == {"answer": "Yes"}
+    assert wc.parse_answer("the lintel is na", "not_checked", UNITS) is None
+
+
 def test_rule_5_anything_else_is_a_skip():
     assert wc.parse_answer("what's the weather", "not_checked", UNITS) is None
     assert wc.parse_answer("", "not_checked", UNITS) is None
     assert wc.parse_answer("   ", "confirm_no", UNITS) is None
+
+
+def test_a_unit_mentioned_in_passing_is_not_a_move():
+    assert wc.parse_answer("No, the nogging in Unit 2 is missing", "confirm_no", UNITS) == {
+        "answer": "No", "comment": "the nogging in Unit 2 is missing"}
+    assert wc.parse_answer("That's right, same as unit 2", "confirm_no", UNITS) == {
+        "answer": "No", "confirmed": True}
+    assert wc.parse_answer("yes, no problems, unit 2 too", "confirm_no", UNITS) == {
+        "answer": "No", "confirmed": True}
+
+
+def test_a_whole_answer_naming_a_unit_is_a_move():
+    walk = UNITS + ["Lot 151"]
+    assert wc.parse_answer("no, that was unit two", "confirm_no", walk) == {"move_to": "Unit 2"}
+    assert wc.parse_answer("wrong, it's Lot 151", "confirm_no", walk) == {"move_to": "Lot 151"}
+    assert wc.parse_answer("nope, should be unit 1 actually", "confirm_no", walk) == {
+        "move_to": "Unit 1"}
+    assert wc.parse_answer("Sorry, it belongs to U3.", "confirm_no", walk) == {"move_to": "Unit 3"}
+    assert wc.parse_answer("no, it is unit 2", "confirm_no", walk) == {"move_to": "Unit 2"}
 
 
 def test_a_move_names_only_a_unit_of_the_walk():
@@ -145,6 +176,13 @@ def test_a_skip_writes_nothing():
     out, hop_fn, queued = _run(_event(text="what's the weather"))
     assert out == {"status": "skipped", "say": SAY_SKIP, "next": None}
     assert hop_fn.calls == [] and queued == []
+
+
+def test_blank_text_beside_audio_uses_the_audio():
+    audio = base64.b64encode(b"wav").decode()
+    for blank in ("", "   "):
+        out, hop_fn, _ = _run(_event(text=blank, audio_b64=audio), stt=lambda d, f: "pass")
+        assert out["status"] == "saved" and hop_fn.calls[0]["quote"] == "pass"
 
 
 def test_nothing_heard_is_a_skip():
@@ -432,6 +470,19 @@ def test_a_hop_write_failure_is_an_error_never_a_raise(monkeypatch):
         raise RuntimeError("db down")
     monkeypatch.setattr(hop.walk_answers, "add", boom)
     assert hop.lambda_handler(_write(key), None) == {"error": "db"}
+
+
+def test_a_hop_write_failure_logs_no_exception_text(monkeypatch, caplog):
+    # A psycopg DETAIL can carry the row's values, the quote among them.
+    key, seen = _wire_hop(monkeypatch)
+    def boom(c, row):
+        raise ValueError("DETAIL: Failing row contains (secret quote words)")
+    monkeypatch.setattr(hop.walk_answers, "add", boom)
+    with caplog.at_level(logging.DEBUG):
+        assert hop.lambda_handler(_write(key, quote="secret quote words"), None) == {"error": "db"}
+    assert "secret" not in caplog.text
+    assert "ValueError" in caplog.text and "write_walk_answer" in caplog.text
+    assert all(r.exc_info is None for r in caplog.records)
 
 
 # ---- item-writer: the requeue_walk action, and every other event as today -----

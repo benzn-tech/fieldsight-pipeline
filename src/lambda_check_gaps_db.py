@@ -72,8 +72,14 @@ def lambda_handler(event, context):
         if action is not None:
             return {"error": "unknown action"}
         return _facts(event)
-    except Exception:                                 # noqa: BLE001 -- see "Never raises"
-        logger.exception("check-gaps-db: failed")
+    except Exception as e:                            # noqa: BLE001 -- see "Never raises"
+        if event.get("action") is not None:
+            # Type and action only: a psycopg DETAIL ("Failing row contains ...")
+            # carries the row's values, the spoken quote among them.
+            logger.error("check-gaps-db: failed action=%s error=%s",
+                         event.get("action"), type(e).__name__)
+        else:
+            logger.exception("check-gaps-db: failed")
         return {"error": "db"}
     finally:
         close_cached_connection()

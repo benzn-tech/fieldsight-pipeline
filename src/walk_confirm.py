@@ -32,11 +32,27 @@ SAY_SKIP = "Skipping this one — it's on your phone."
 #: is the authority on the walk's units; handle then answers by the next rule.
 MOVE_NOT_IN_WALK = "move_to_unit not in walk"
 
-_MOVE_AFTER = re.compile(r"\b(?:no|wrong|that was|thats)\b")
+# Rule 1, anchored: the WHOLE answer is a move -- an optional no, an optional
+# "that was", the unit, and nothing else but filler. A unit mentioned in passing
+# ("No, the nogging in Unit 2 is missing") is not a move.
+_MOVE = re.compile(r"^(?:(?:no|nope|wrong(?: one)?) )?"
+                   r"(?:(?:that was|thats|that is|it was|its|it is|should be|belongs to|it belongs to) )?"
+                   r"(?P<unit>.+)$")
+_FILLER = {"actually", "sorry"}
+_NUMBER_WORDS = {"one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+                 "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+                 "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty",
+                 "sixty", "seventy", "eighty", "ninety", "hundred", "and", "oh", "zero", "o"}
+_UNIT_TOKEN = re.compile(r"[a-z]+|\d+[a-z](?![a-z])|\d+")   # units._TOKEN's split
 _YES = {"pass", "passed", "passes", "yes", "good", "ok", "okay", "right", "correct"}
-_CONFIRM = {"right", "correct", "yes"}
+# R32: on a read-back No an acknowledgement confirms the No; only an explicit
+# pass turns it into Yes.
+_CONFIRM = {"right", "correct", "yes", "yeah", "yep", "ok", "okay", "good"}
+_PASS = re.compile(r"^(?:actually )?(?:it )?(?:pass|passed|passes)\b")
 _NO = {"fail", "failed", "fails", "no"}
-_NA = re.compile(r"\bnot applicable\b|\bn a\b|\bna\b|\bdoesnt apply\b|\bdoes not apply\b")
+# Rule 4, anchored to the start like rules 2 and 3.
+_NA = re.compile(r"^(?:(?:it|that|this|its|thats) (?:is )?)?"
+                 r"(?:not applicable|n a|na|doesnt apply|does not apply)\b")
 _NO_REST = re.compile(r"^\W*(?:failed|fails|fail|no)\b[\W_]*(.*)$", re.IGNORECASE | re.DOTALL)
 
 
@@ -47,26 +63,42 @@ def _norm(text):
     return " ".join(re.sub(r"[^\w\s]|_", " ", t).split())
 
 
+def _move_phrase(norm):
+    """The unit the answer moves to when the whole answer is a move, else None:
+    [no | nope | wrong] [that was | that's | it was | it's | should be |
+    belongs to] <unit>, with only filler ("actually", "sorry") besides."""
+    words = " ".join(w for w in norm.split() if w not in _FILLER)
+    m = _MOVE.match(words)
+    if not m:
+        return None
+    tok = _UNIT_TOKEN.findall(m.group("unit"))
+    if not tok or tok[0] not in units_mod.PREFIXES or len(tok) < 2:
+        return None
+    if not all(t[0].isdigit() or t in _NUMBER_WORDS for t in tok[1:]):
+        return None
+    return units_mod.normalize_unit(m.group("unit"))
+
+
 def _move_to(norm, units):
-    """The walk unit named after "no" / "wrong" / "that was" / "that's", or None."""
+    """The walk unit the whole answer moves to, or None."""
     walk = {units_mod.normalize_unit(u) for u in units or [] if isinstance(u, str)}
     walk.discard(None)
-    for m in _MOVE_AFTER.finditer(norm):
-        u = units_mod.normalize_unit(norm[m.end():])
-        if u and u in walk:
-            return u
-    return None
+    u = _move_phrase(norm)
+    return u if u and u in walk else None
 
 
 def parse_answer(text, kind, units):
     """The answer in `text`, by the first rule that applies, or None (skip):
 
-    1. a unit of the walk named after no / wrong / that was / that's -> a move
+    1. the whole answer is a move to a unit of the walk -- [no / wrong / nope]
+       [that was / that's / it was / it's / should be / belongs to] <unit> --
        (a read-back No only);
     2. it starts with pass / yes / good / ok / right / correct -> Yes; for a
-       read-back No, right / correct / yes confirm the No;
+       read-back No (R32) an acknowledgement (right / correct / yes / yeah /
+       ok / okay / good / that's right / yep) confirms the No, and only an
+       explicit pass ("pass", "it passes", "actually it passes") is Yes;
     3. it starts with fail / no / failed -> No, the rest is its comment;
-    4. not applicable / n a / na / doesn't apply -> N/A;
+    4. it starts with not applicable / n a / na / doesn't apply -> N/A;
     5. anything else -> None."""
     norm = _norm(text)
     if not norm:
@@ -76,28 +108,26 @@ def parse_answer(text, kind, units):
         if target:
             return {"move_to": target}
     first = norm.split()[0]
-    if kind == "confirm_no" and first in _CONFIRM:
-        return {"answer": "No", "confirmed": True}
+    if kind == "confirm_no":
+        if _PASS.match(norm):
+            return {"answer": "Yes"}
+        if first in _CONFIRM or norm.startswith("thats right"):
+            return {"answer": "No", "confirmed": True}
     if first in _YES:
         return {"answer": "Yes"}
     if first in _NO:
         m = _NO_REST.match((text or "").strip())
         return {"answer": "No", "comment": (m.group(1) if m else "").strip()}
-    if _NA.search(norm):
+    if _NA.match(norm):
         return {"answer": "N/A"}
     return None
 
 
 def _named_units(text):
-    """Every unit the answer names after a move word: the candidates a move may
-    go to. Whether one is the walk's is the hop's to say (it reads the walk)."""
-    norm = _norm(text)
-    out = []
-    for m in _MOVE_AFTER.finditer(norm):
-        u = units_mod.normalize_unit(norm[m.end():])
-        if u and u not in out:
-            out.append(u)
-    return out
+    """The unit a whole-answer move names, as the one candidate a move may go
+    to. Whether it is the walk's is the hop's to say (it reads the walk)."""
+    u = _move_phrase(_norm(text))
+    return [u] if u else []
 
 
 def _out(status, say):
@@ -106,8 +136,9 @@ def _out(status, say):
 
 def _heard(event, stt):
     """(transcript, None) or (None, reason)."""
-    if isinstance(event.get("text"), str):
-        return event["text"].strip(), None
+    text = event.get("text")
+    if isinstance(text, str) and (text.strip() or not event.get("audio_b64")):
+        return text.strip(), None
     audio = event.get("audio_b64")
     if not isinstance(audio, str) or not audio:
         return None, "no answer"
@@ -119,8 +150,8 @@ def _heard(event, stt):
         return None, "bad audio"
     try:
         return (stt(data, "answer.wav") or "").strip(), None
-    except Exception:                                 # noqa: BLE001 -- a person is waiting
-        logger.warning("walk-confirm: stt failed", exc_info=True)
+    except Exception as e:                            # noqa: BLE001 -- a person is waiting
+        logger.warning("walk-confirm: stt failed: %s", type(e).__name__)
         return None, "stt"
 
 
@@ -170,8 +201,8 @@ def handle(event, *, stt, db_write, now, requeue=None):
                 logger.info("walk-confirm: status=skipped kind=%s chars=%d", kind, len(quote))
                 return _out("skipped", SAY_SKIP)
             saved = db_write(_row(event, parsed, quote, answered_at))
-    except Exception:                                 # noqa: BLE001 -- a person is waiting
-        logger.warning("walk-confirm: write failed", exc_info=True)
+    except Exception as e:                            # noqa: BLE001 -- a person is waiting
+        logger.warning("walk-confirm: write failed: %s", type(e).__name__)
         return _out("error", SAY_SKIP)
     if not isinstance(saved, dict) or saved.get("status") != "saved":
         logger.info("walk-confirm: status=error reason=hop:%s",
