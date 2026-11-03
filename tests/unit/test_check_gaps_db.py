@@ -191,3 +191,89 @@ def test_no_company_anywhere_reads_no_templates_and_is_not_an_error(monkeypatch)
     assert "error" not in out and out["owner_company_id"] is None
     assert out["templates"] == [] and out["live_windows"] == []
     assert "templates_for" not in seen
+
+
+# ---- a multi-unit walk (spec 2026-11-03, Task 10) ------------------------------
+
+from datetime import date as _date, time as _time   # noqa: E402
+
+import units as units_mod                              # noqa: E402
+
+TPL = uuid.uuid4()
+DAY = _date(2026, 10, 20)
+SID_EARLY = "0a1b2c3d4e5f60718293a4b5c6d7e8f9"
+# The walk opened in the earlier recording at 09:30 under the site's company.
+WALK = units_mod.walk_key(SITE_CO, "Ben_Lin", DAY, TPL, _time(9, 30))
+
+
+def _walk_rows():
+    """for_day's rows under the site's company: the walk's opening (09:30, the
+    earlier recording), its continuation in the live one (10:01), and an
+    ordinary check that is not the walk."""
+    return [
+        {"session": "sid" + SID_EARLY, "name": "pre-pour", "template_id": TPL,
+         "start_at": _time(9, 30), "units": {"names": ["Unit 1", "Unit 2"], "count": None},
+         "entered": [{"unit": "Unit 1", "at": "09:31"}], "walk_key": WALK},
+        {"session": "sid" + SID_EARLY, "name": "scaffold", "template_id": uuid.uuid4(),
+         "start_at": _time(9, 50), "units": None, "entered": None, "walk_key": None},
+        {"session": "sid" + SID, "name": "pre-pour", "template_id": TPL,
+         "start_at": _time(10, 1), "units": None,
+         "entered": [{"unit": "Unit 2", "at": "10:02"}], "walk_key": WALK},
+    ]
+
+
+def _wire_walk(monkeypatch, live_windows, day_rows):
+    seen = _wire(monkeypatch, USER, SESSION, site={"id": SITE, "company_id": SITE_CO},
+                 windows=live_windows)
+    seen["day_for"], seen["answers_for"] = [], []
+
+    def day(conn, company_id, folder, date):
+        seen["day_for"].append((str(company_id), folder, str(date)))
+        return [dict(r) for r in day_rows] if str(company_id) == str(SITE_CO) else []
+    monkeypatch.setattr(hop.inspection_windows, "for_day", day)
+
+    def answers(conn, company_ids, walk_key):
+        seen["answers_for"].append((list(company_ids), walk_key))
+        return [{"id": uuid.uuid4(), "company_id": SITE_CO, "unit": "Unit 2",
+                 "item_text": "Wall bracing", "answer": "Yes", "answered_at": _time(10, 4),
+                 "report_date": DAY}]
+    monkeypatch.setattr(hop.walk_answers, "for_walk", answers)
+    return seen
+
+
+def test_a_live_walk_window_brings_the_whole_walk_keyed_by_its_walk_key(monkeypatch):
+    live = [{"name": "pre-pour", "template_id": TPL, "start_at": _time(10, 1), "report_date": DAY,
+             "units": None, "entered": [{"unit": "Unit 2", "at": "10:02"}], "walk_key": WALK}]
+    seen = _wire_walk(monkeypatch, live, _walk_rows())
+    out = hop.lambda_handler({"caller_sub": "sub-1", "pressed_at": 1760000000}, None)
+    json.dumps(out)
+    walk = out["walk"][WALK]
+    assert walk["key"] == WALK
+    assert walk["units"] == {"names": ["Unit 1", "Unit 2"], "count": None}, "the opening's"
+    assert walk["entered"] == [{"unit": "Unit 1", "at": "09:31"}, {"unit": "Unit 2", "at": "10:02"}]
+    assert walk["sessions"] == ["sid" + SID_EARLY, "sid" + SID], "oldest first, each once"
+    assert walk["start_at"] == "09:30:00"
+    assert walk["answers"][0]["item_text"] == "Wall bracing"
+    assert walk["answers"][0]["answered_at"] == "10:04:00"
+    # The day is read in the scope the live windows are read in, on the window's date.
+    assert {c for c, _, _ in seen["day_for"]} == {str(SITE_CO), str(HOME)}
+    assert {(f, d) for _, f, d in seen["day_for"]} == {("Ben_Lin", "2026-10-20")}
+
+
+def test_the_walks_answers_are_read_in_the_walks_own_company_never_the_callers(monkeypatch):
+    live = [{"name": "pre-pour", "template_id": TPL, "start_at": _time(10, 1), "report_date": DAY,
+             "walk_key": WALK}]
+    seen = _wire_walk(monkeypatch, live, _walk_rows())
+    hop.lambda_handler({"caller_sub": "sub-1", "pressed_at": 1760000000}, None)
+    # HOME is in the windows' scope, but the walk's rows are all SITE_CO's (R22).
+    assert seen["answers_for"] == [([str(SITE_CO)], WALK)]
+
+
+def test_no_walk_window_adds_no_walk_and_reads_nothing_more(monkeypatch):
+    live = [{"name": "pre-pour", "template_id": TPL, "start_at": _time(10, 1), "report_date": DAY,
+             "units": None, "entered": None, "walk_key": None}]
+    seen = _wire_walk(monkeypatch, live, _walk_rows())
+    out = hop.lambda_handler({"caller_sub": "sub-1", "pressed_at": 1760000000}, None)
+    assert "walk" not in out
+    assert set(out) == {"user", "owner_company_id", "session", "templates", "live_windows"}
+    assert seen["day_for"] == [] and seen["answers_for"] == []

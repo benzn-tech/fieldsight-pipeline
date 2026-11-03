@@ -13,7 +13,9 @@ Result: {"user": {id, company_id, folder_name} | None,
                      last_segment_at} | None,
          "templates": [{id, name, scope, body}],
          "live_windows": [{name, kind, start_at, end_at, end_source, template_id,
-                           report_date}]}
+                           report_date, units, entered, walk_key}],
+         "walk": {walk_key: {key, units, entered, sessions, start_at, answers}}
+                 -- only when a live window carries a walk_key (spec 2026-11-03)}
         or {"error": "..."}. Never raises: the caller is waiting with a person
         on the other end.
 
@@ -25,8 +27,9 @@ import logging
 
 from db.connection import close_cached_connection, get_cached_connection
 import nz_time
-from repositories import inspection_windows, meeting_session, recordings, sites, users
+from repositories import inspection_windows, meeting_session, recordings, sites, users, walk_answers
 import tenancy_status
+import units as units_mod
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -81,6 +84,48 @@ def _site(conn, user, session):
     return None
 
 
+def _walks(conn, companies, folder, live_windows):
+    """{walk_key: the walk's facts} for each walk among the live windows, or {}.
+
+    check_done chooses the window, so every walk present is returned and it
+    picks the chosen window's. A walk runs across the day's recordings, so its
+    windows are read for the whole day, in the same company scope as the live
+    windows (for_day has one company per call). Its on-site answers are read in
+    the companies its own rows are under -- the site's (R22) -- never the
+    caller's home company just for being in scope.
+
+    key/units/entered/sessions/answers, plus start_at: the walk's opening
+    start, which check_done needs to take the earlier recordings' words (its
+    live window starts later than the walk)."""
+    out = {}
+    days = {}
+    for w in live_windows or []:
+        key = w.get("walk_key")
+        if not key or key in out:
+            continue
+        date = str(w.get("report_date") or "")[:10]
+        rows = []                                  # (company, row), every recording's
+        for c in companies:
+            if (c, date) not in days:
+                days[(c, date)] = inspection_windows.for_day(conn, c, folder, date)
+            rows += [(c, r) for r in days[(c, date)] if r.get("walk_key") == key]
+        if not rows:
+            continue
+        rows.sort(key=lambda cr: str(cr[1].get("start_at") or ""))
+        opening = next((r for c, r in rows if r.get("template_id") and units_mod.walk_key(
+            c, folder, date, r["template_id"], r.get("start_at")) == key), rows[0][1])
+        owners = list(dict.fromkeys(c for c, _ in rows))
+        out[key] = {
+            "key": key,
+            "units": opening.get("units"),
+            "entered": [m for _, r in rows for m in r.get("entered") or [] if isinstance(m, dict)],
+            "sessions": list(dict.fromkeys(r["session"] for _, r in rows if r.get("session"))),
+            "start_at": rows[0][1].get("start_at"),
+            "answers": walk_answers.for_walk(conn, owners, key),
+        }
+    return out
+
+
 def _facts(event):
     sub = event.get("caller_sub")
     if not sub:
@@ -115,6 +160,10 @@ def _facts(event):
                                                         user.get("company_id")) if c))
         out["live_windows"] = inspection_windows.for_session(
             conn, companies, user.get("folder_name"), "sid%s" % session["session_id"])
-    logger.info("check-gaps-db: session=%s templates=%d windows=%d",
-                bool(out["session"]), len(out["templates"]), len(out["live_windows"]))
+        walks = _walks(conn, companies, user.get("folder_name"), out["live_windows"])
+        if walks:
+            out["walk"] = walks
+    logger.info("check-gaps-db: session=%s templates=%d windows=%d walks=%d",
+                bool(out["session"]), len(out["templates"]), len(out["live_windows"]),
+                len(out.get("walk") or {}))
     return _jsonable(out)
