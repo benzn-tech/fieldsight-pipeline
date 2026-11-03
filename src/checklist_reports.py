@@ -28,7 +28,8 @@ from psycopg.rows import dict_row
 import inspection_match
 import pipeline_trace
 import tenancy_status
-from repositories import report_templates, topics as topics_repo, users
+import units
+from repositories import inspection_windows, report_templates, topics as topics_repo, users
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,8 @@ def _title(template_name, check_name, start_at):
     return template_name
 
 
-def already_made(conn, session, template_id, start_at, end_at=None, segments=None):
+def already_made(conn, session, template_id, start_at, end_at=None, segments=None,
+                 walk_key=None):
     """True when this check's report exists FOR THE SAME WINDOW.
 
     The same window, not just the same start: a final extraction often runs
@@ -48,7 +50,18 @@ def already_made(conn, session, template_id, start_at, end_at=None, segments=Non
     first final saw 17:12:52-17:14:13 of a five-minute pre-pour check; keyed on
     the start alone, the re-run's full window was "already made" and the
     report stayed the first 80 seconds. A different end or stretches makes it
-    again, replacing the row (_record)."""
+    again, replacing the row (_record).
+
+    A multi-unit walk (`walk_key`) is one row whatever recording wrote it, so it
+    is found by its key alone and compared on the walk's FULL segments: a second
+    recording of the walk adds segments, and that makes the report again."""
+    if walk_key:
+        row = conn.execute("SELECT segments FROM checklist_reports WHERE walk_key = %s",
+                           (walk_key,)).fetchone()
+        if row is None:
+            return False
+        old = row[0] if not isinstance(row[0], str) else json.loads(row[0])
+        return (old or None) == (segments or None)
     row = conn.execute(
         "SELECT end_at, segments FROM checklist_reports "
         "WHERE session = %s AND template_id = %s AND start_at = %s",
@@ -60,6 +73,9 @@ def already_made(conn, session, template_id, start_at, end_at=None, segments=Non
 
 
 def _record(conn, company_id, folder, date, session, w, tpl_name, request_id, result_key):
+    if w.get("walk_key"):
+        return _record_walk(conn, company_id, folder, date, session, w, tpl_name, request_id,
+                            result_key)
     conn.execute(
         "INSERT INTO checklist_reports (company_id, user_folder, report_date, session, "
         "template_id, template_name, check_name, start_at, end_at, segments, request_id, "
@@ -71,6 +87,43 @@ def _record(conn, company_id, folder, date, session, w, tpl_name, request_id, re
         (str(company_id), folder, date, session, str(w["template_id"]), tpl_name, w["name"],
          w["start_at"], w.get("end_at"), json.dumps(w.get("segments") or None),
          request_id, result_key))
+
+
+def _record_walk(conn, company_id, folder, date, session, w, tpl_name, request_id, result_key):
+    """One row per walk (uq_checklist_reports_walk), recorded under the recording
+    that queued it and the walk's first start.
+
+    The table's older key, checklist_reports_once (session, template_id,
+    start_at), still applies to a walk row, and ON CONFLICT can name only one
+    of the two. It fires when a window was an ordinary check's report before it
+    became part of a walk: the same recording re-extracted, or a later recording
+    a walk claimed afterwards (R13). That report IS this walk's part, so it is
+    removed first. In a savepoint: a failure here costs this report's row, never
+    the extraction that called it."""
+    with conn.transaction():
+        for part_session, part_start in w.get("parts") or []:
+            conn.execute(
+                "DELETE FROM checklist_reports WHERE walk_key IS NULL AND session = %s "
+                "AND template_id = %s AND start_at = %s",
+                (part_session, str(w["template_id"]), part_start))
+        conn.execute(
+            "DELETE FROM checklist_reports WHERE walk_key IS NULL AND session = %s "
+            "AND template_id = %s AND start_at = %s",
+            (session, str(w["template_id"]), w["start_at"]))
+        conn.execute(
+            "INSERT INTO checklist_reports (company_id, user_folder, report_date, session, "
+            "template_id, template_name, check_name, start_at, end_at, segments, request_id, "
+            "result_key, walk_key) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, "
+            "%s, %s) "
+            "ON CONFLICT (walk_key) WHERE walk_key IS NOT NULL DO UPDATE SET "
+            "session = EXCLUDED.session, start_at = EXCLUDED.start_at, "
+            "end_at = EXCLUDED.end_at, segments = EXCLUDED.segments, "
+            "request_id = EXCLUDED.request_id, result_key = EXCLUDED.result_key, "
+            "template_name = EXCLUDED.template_name, check_name = EXCLUDED.check_name, "
+            "created_at = now()",
+            (str(company_id), folder, date, session, str(w["template_id"]), tpl_name, w["name"],
+             w["start_at"], w.get("end_at"), json.dumps(w.get("segments") or None),
+             request_id, result_key, w["walk_key"]))
 
 
 def _clock(hms):
@@ -131,20 +184,9 @@ def request_body(w, template, topic_ids=None):
 _UNREAD = object()
 
 
-def auto_generate(conn, company_id, folder, date, session, windows, generate=None):
-    """Send each matched check of a final extraction to the report worker,
-    once. `windows` are the rows just stored (start_at/end_at to the second,
-    template_id). Returns [(check name, request id or reason)]. Never raises:
-    a report that could not be queued must not cost the extraction."""
-    if generate is None:
-        import lambda_org_api
-        generate = lambda_org_api.day_report_generate
-    out = []
-    matched = [w for w in windows if w.get("template_id")]
-    if not matched:
-        return out
-    session_topics = [t for t in topics_repo.list_day_topics_for_binding(conn, folder, date)
-                      if session in (t.get("source_s3_key") or "")]
+def _recorder(conn, company_id, folder):
+    """(caller, blocked): the recorder as the report's caller, and the
+    offboarding gate's reason when they may not make one (None when they may)."""
     # Global: `company_id` is the SITE's company; the recorder's row stays in their home company.
     user = (users.get_by_folder_name(conn, company_id, folder)
             or users.get_by_folder_name_global(conn, folder) or {})
@@ -154,27 +196,151 @@ def auto_generate(conn, company_id, folder, date, session, windows, generate=Non
     # this is untouched (R6). Flag off: logs and generates as today.
     blocked = (tenancy_status.caller_blocked(conn, caller, where="checklist-auto-report")
                if caller is not None else None)
-    # Company offboarding, Task 9 (spec §5.5): no report for a check recorded on an
-    # inactive company's SITE (`company_id` is the site's company), whoever recorded it.
-    # Read once, inside the per-check try: a failed read costs that check ("error"),
-    # never the extraction. Flag off: logged COMPANY_GATE_WOULD_SUPPRESS, generated.
-    suppressed = _UNREAD
+    return caller, blocked
+
+
+def _gate(conn, company_id, folder, caller, blocked, state, name):
+    """Why this check may not be queued, or None. `state` caches the site
+    company's suppression, read once (Company offboarding, Task 9, spec §5.5:
+    no report for a check recorded on an inactive company's SITE, whoever
+    recorded it). The read happens inside the caller's per-check try: a failed
+    read costs that check ("error"), never the extraction. Flag off: logged
+    COMPANY_GATE_WOULD_SUPPRESS, generated."""
+    if caller is None:
+        pipeline_trace.event("checklist_report", "no_login", detail={"check": name})
+        return "no login for %s" % folder
+    if blocked:
+        pipeline_trace.event("checklist_report", blocked, detail={"check": name})
+        return blocked
+    if state.get("suppressed", _UNREAD) is _UNREAD:
+        state["suppressed"] = tenancy_status.suppress_reason(
+            conn, company_id=company_id, where="checklist-auto-report")
+    if state["suppressed"]:
+        pipeline_trace.event("checklist_report", state["suppressed"], detail={"check": name})
+        return state["suppressed"]
+    return None
+
+
+def _send(conn, generate, caller, company_id, folder, date, session, w, tpl, body):
+    """Queue one report and record it. Returns the request id, or the reason
+    the report dialog's code refused it."""
+    walk = {"walk": w["walk_key"]} if w.get("walk_key") else {}
+    res = generate(conn, caller, date, {"queryStringParameters": {"user": folder},
+                                        "body": json.dumps(body)})
+    payload = json.loads(res.get("body") or "{}")
+    if res.get("statusCode") not in (200, 201, 202) or not payload.get("requestId"):
+        pipeline_trace.event("checklist_report", "refused", detail={
+            "check": w["name"], "template": tpl["name"], "error": payload.get("error"), **walk})
+        return "refused: %s" % payload.get("error")
+    rid = payload["requestId"]
+    result_key = (payload.get("resultKey")
+                  or "session_report_results/%s/%s/day/%s.json" % (folder, date, rid))
+    _record(conn, company_id, folder, date, session, w, tpl["name"], rid, result_key)
+    pipeline_trace.event("checklist_report", "queued", detail={
+        "check": w["name"], "template": tpl["name"], "request": rid,
+        "from": body["from"], "to": body["to"], "stretches": len(w.get("segments") or []),
+        **walk})
+    return rid
+
+
+def _walk_units(value):
+    """The opening's units as the request carries them: a list of names and an
+    int count or None -- `{"names": [], "count": None}` when the walk was opened
+    by entering units, not by naming them (its row stores NULL)."""
+    value = value if isinstance(value, dict) else {}
+    names = [n for n in value.get("names") or [] if isinstance(n, str)]
+    count = value.get("count")
+    return {"names": names,
+            "count": count if isinstance(count, int) and not isinstance(count, bool) else None}
+
+
+def walk_window(company_id, folder, date, key, day):
+    """The walk `key` as ONE window, from every window of it on the day
+    (`day` = inspection_windows.for_day, any recording), or None.
+
+    segments: every finished stretch of every window, in time order -- a
+    recording still running (a stretch with no end) is left out until its own
+    final extraction makes the report again; entered: every mark; units: the
+    opening's (the window whose start gives the key, else the earliest).
+    `parts` are the (session, start_at) of the windows it was made from."""
+    rows = [r for r in day if r.get("walk_key") == key and r.get("template_id")]
+    segs, entered, parts = [], [], []
+    for r in rows:
+        done = [s for s in r.get("segments") or [] if s.get("from") and s.get("to")]
+        if not done:
+            continue
+        segs += done
+        entered += [m for m in r.get("entered") or [] if isinstance(m, dict)]
+        parts.append((r.get("session"), r["start_at"]))
+    if not segs:
+        return None
+    segs.sort(key=lambda s: str(s["from"]))
+    opening = next((r for r in rows if units.walk_key(
+        company_id, folder, date, r["template_id"], r["start_at"]) == key), rows[0])
+    return {"name": opening["name"], "kind": opening.get("kind"),
+            "template_id": opening["template_id"], "session": opening.get("session"),
+            "start_at": segs[0]["from"], "end_at": segs[-1]["to"], "segments": segs,
+            "entered": entered, "units": _walk_units(opening.get("units")),
+            "walk_key": key, "parts": parts}
+
+
+def _queue_walk(conn, generate, caller, company_id, folder, date, session, key, day,
+                day_topics, force=False):
+    """(walk name, request id or reason) for one walk -- the per-walk body that
+    auto_generate and requeue_walk both send. `session` None records it under
+    the opening's recording."""
+    w = walk_window(company_id, folder, date, key, day)
+    if w is None:
+        return None, "no such walk"
+    session = session or w["session"]
+    if not force and already_made(conn, session, w["template_id"], w["start_at"],
+                                  w.get("end_at"), w["segments"], walk_key=key):
+        return w["name"], "already made"
+    tpl = report_templates.get_any(conn, w["template_id"])
+    if not tpl or not tpl.get("current_version"):
+        return w["name"], "template gone"
+    sessions = {s for s, _ in w["parts"]}
+    topics = [t for t in day_topics
+              if any(s and s in (t.get("source_s3_key") or "") for s in sessions)]
+    others = [o for o in day if o.get("walk_key") != key and o.get("session") in sessions]
+    body = request_body(w, tpl, check_topics(w, others, topics) or None)
+    body["walk"] = {"key": key, "units": w["units"], "entered": w["entered"],
+                    "stretches": units.unit_stretches(w)}
+    return w["name"], _send(conn, generate, caller, company_id, folder, date, session, w,
+                            tpl, body)
+
+
+def auto_generate(conn, company_id, folder, date, session, windows, generate=None):
+    """Send each matched check of a final extraction to the report worker,
+    once. `windows` are the rows just stored (start_at/end_at to the second,
+    template_id). Returns [(check name, request id or reason)]. Never raises:
+    a report that could not be queued must not cost the extraction.
+
+    A multi-unit walk (a window with a walk_key, spec 2026-11-03) is ONE report
+    across all its recordings of the day: each walk among these windows is
+    queued once, over every window of it (inspection_windows.for_day). A
+    window with no walk_key takes the path it always did."""
+    if generate is None:
+        import lambda_org_api
+        generate = lambda_org_api.day_report_generate
+    out = []
+    matched = [w for w in windows if w.get("template_id")]
+    if not matched:
+        return out
+    plain = [w for w in matched if not w.get("walk_key")]
+    walks = {}                                       # walk_key -> this recording's first window
     for w in matched:
+        if w.get("walk_key"):
+            walks.setdefault(w["walk_key"], w)
+    day_topics = topics_repo.list_day_topics_for_binding(conn, folder, date)
+    session_topics = [t for t in day_topics if session in (t.get("source_s3_key") or "")]
+    caller, blocked = _recorder(conn, company_id, folder)
+    state = {}
+    for w in plain:
         try:
-            if caller is None:
-                out.append((w["name"], "no login for %s" % folder))
-                pipeline_trace.event("checklist_report", "no_login", detail={"check": w["name"]})
-                continue
-            if blocked:
-                out.append((w["name"], blocked))
-                pipeline_trace.event("checklist_report", blocked, detail={"check": w["name"]})
-                continue
-            if suppressed is _UNREAD:
-                suppressed = tenancy_status.suppress_reason(
-                    conn, company_id=company_id, where="checklist-auto-report")
-            if suppressed:
-                out.append((w["name"], suppressed))
-                pipeline_trace.event("checklist_report", suppressed, detail={"check": w["name"]})
+            reason = _gate(conn, company_id, folder, caller, blocked, state, w["name"])
+            if reason:
+                out.append((w["name"], reason))
                 continue
             if already_made(conn, session, w["template_id"], w["start_at"], w.get("end_at"),
                             w.get("segments")):
@@ -186,26 +352,48 @@ def auto_generate(conn, company_id, folder, date, session, windows, generate=Non
                 continue
             others = [o for o in windows if o is not w]
             body = request_body(w, tpl, check_topics(w, others, session_topics) or None)
-            res = generate(conn, caller, date, {"queryStringParameters": {"user": folder},
-                                                "body": json.dumps(body)})
-            payload = json.loads(res.get("body") or "{}")
-            if res.get("statusCode") not in (200, 201, 202) or not payload.get("requestId"):
-                out.append((w["name"], "refused: %s" % payload.get("error")))
-                pipeline_trace.event("checklist_report", "refused", detail={
-                    "check": w["name"], "template": tpl["name"], "error": payload.get("error")})
-                continue
-            rid = payload["requestId"]
-            result_key = (payload.get("resultKey")
-                          or "session_report_results/%s/%s/day/%s.json" % (folder, date, rid))
-            _record(conn, company_id, folder, date, session, w, tpl["name"], rid, result_key)
-            out.append((w["name"], rid))
-            pipeline_trace.event("checklist_report", "queued", detail={
-                "check": w["name"], "template": tpl["name"], "request": rid,
-                "from": body["from"], "to": body["to"], "stretches": len(w.get("segments") or [])})
+            out.append((w["name"], _send(conn, generate, caller, company_id, folder, date,
+                                         session, w, tpl, body)))
         except Exception:
             logger.exception("checklist report for %r not queued", w.get("name"))
             out.append((w.get("name"), "error"))
+    day = None
+    for key, w in walks.items():
+        try:
+            reason = _gate(conn, company_id, folder, caller, blocked, state, w["name"])
+            if reason:
+                out.append((w["name"], reason))
+                continue
+            if day is None:
+                day = inspection_windows.for_day(conn, company_id, folder, date)
+            name, got = _queue_walk(conn, generate, caller, company_id, folder, date, session,
+                                    key, day, day_topics)
+            out.append((name or w["name"], got))
+        except Exception:
+            logger.exception("walk report for %r not queued", w.get("name"))
+            out.append((w.get("name"), "error"))
     return out
+
+
+def requeue_walk(conn, company_id, folder, date, walk_key, generate=None):
+    """Queue walk `walk_key`'s report again, made or not -- after an on-site
+    answer is written (Tasks 11 and 12), the report must take it. Returns the
+    request id, or the reason it was not queued. Never raises."""
+    if generate is None:
+        import lambda_org_api
+        generate = lambda_org_api.day_report_generate
+    try:
+        caller, blocked = _recorder(conn, company_id, folder)
+        reason = _gate(conn, company_id, folder, caller, blocked, {}, walk_key)
+        if reason:
+            return reason
+        day = inspection_windows.for_day(conn, company_id, folder, date)
+        day_topics = topics_repo.list_day_topics_for_binding(conn, folder, date)
+        return _queue_walk(conn, generate, caller, company_id, folder, date, None, walk_key,
+                           day, day_topics, force=True)[1]
+    except Exception:
+        logger.exception("walk report %s not re-queued", walk_key)
+        return "error"
 
 
 def for_day(conn, company_id, folder, date):

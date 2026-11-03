@@ -124,3 +124,88 @@ def test_a_move_row_needs_no_answer_but_needs_a_target(db):
     with pytest.raises(psycopg.errors.CheckViolation):
         with db.transaction():
             wa.add(db, _answer(cid, uid, "wk-1", answer="Maybe"))
+
+
+# ---- Task 9: one checklist report per walk -------------------------------------------
+
+import json  # noqa: E402
+
+import checklist_reports as cr  # noqa: E402
+import units  # noqa: E402
+
+S1 = [{"from": "10:00:00", "to": "10:20:00"}]
+S2 = [{"from": "13:00:00", "to": "13:15:00"}]
+
+
+def _reports(db, cid):
+    return db.execute("SELECT session, start_at, segments, request_id, walk_key "
+                      "FROM checklist_reports WHERE company_id = %s ORDER BY start_at",
+                      (cid,)).fetchall()
+
+
+def test_a_walk_row_takes_over_a_plain_report_of_the_same_check_without_aborting(db):
+    """Pass 1 saw an ordinary check; pass 2 sees the walk. The walk row lands
+    on checklist_reports_once's triple -- the plain row is its part and goes."""
+    cid, uid, tid = _setup(db)
+    key = units.walk_key(cid, FOLDER, DATE, tid, "10:00:00")
+    plain = {"name": "pre-line", "template_id": tid, "start_at": "10:00:00",
+             "end_at": "10:20:00", "segments": S1}
+    later = dict(plain, start_at="13:00:00", end_at="13:15:00", segments=S2)
+    cr._record(db, cid, FOLDER, DATE, "sidA", plain, "Pre-line", "r0", "k0")
+    cr._record(db, cid, FOLDER, DATE, "sidB", later, "Pre-line", "rB", "kB")  # R13 claims it later
+    assert not cr.already_made(db, "sidA", tid, "10:00:00", "10:20:00", S1, walk_key=key)
+
+    walk = dict(plain, walk_key=key, parts=[("sidA", "10:00:00")])
+    cr._record(db, cid, FOLDER, DATE, "sidA", walk, "Pre-line", "r1", "k1")
+    assert [(r[0], r[1], r[3], r[4]) for r in _reports(db, cid)] == [
+        ("sidA", "10:00:00", "r1", key), ("sidB", "13:00:00", "rB", None)]
+    assert cr.already_made(db, "sidA", tid, "10:00:00", "10:20:00", S1, walk_key=key)
+    assert not cr.already_made(db, "sidB", tid, "10:00:00", "13:15:00", S1 + S2, walk_key=key)
+
+    # the second recording: the same row, now under sidB with both stretches
+    both = dict(walk, end_at="13:15:00", segments=S1 + S2,
+                parts=[("sidA", "10:00:00"), ("sidB", "13:00:00")])
+    cr._record(db, cid, FOLDER, DATE, "sidB", both, "Pre-line", "r2", "k2")
+    rows = _reports(db, cid)
+    assert [(r[0], r[1], r[2], r[3], r[4]) for r in rows] == [
+        ("sidB", "10:00:00", S1 + S2, "r2", key)]
+    assert cr.already_made(db, "sidA", tid, "10:00:00", "13:15:00", S1 + S2, walk_key=key)
+    assert db.execute("SELECT 1").fetchone() == (1,)            # the transaction is alive
+
+
+def test_auto_generate_queues_one_report_for_a_walk_over_two_recordings(db):
+    cid, _, tid = _setup(db)
+    folder = "walk_%s" % uuid.uuid4().hex[:8]
+    db.execute("INSERT INTO users (company_id, email, global_role, folder_name, cognito_sub) "
+               "VALUES (%s, %s, 'gm', %s, %s)",
+               (cid, "%s@example.test" % uuid.uuid4().hex, folder, "sub-%s" % folder))
+    key = units.walk_key(cid, folder, DATE, tid, "10:00:00")
+    opening = {"names": ["Unit 1", "Unit 2", "Unit 3"], "count": 3}
+    a = dict(_window("pre-line units 1 to 3", "10:00:00", tid, "10:20:00", opening,
+                     [{"unit": "Unit 1", "at": "10:01", "at_s": "10:01:00"},
+                      {"unit": "Unit 2", "at": "10:10", "at_s": "10:10:00"}], key))
+    b = dict(_window("pre-line carry on", "13:00:00", tid, "13:15:00", None,
+                     [{"unit": "Unit 3", "at": "13:01", "at_s": "13:01:00"}], key))
+    iw.replace_for_session(db, cid, folder, DATE, "sidA", [a])
+    iw.replace_for_session(db, cid, folder, DATE, "sidB", [b])
+    calls = []
+
+    def generate(conn, caller, date, event):
+        calls.append(json.loads(event["body"]))
+        return {"statusCode": 202, "body": json.dumps({"requestId": "r%d" % len(calls)})}
+
+    out = cr.auto_generate(db, cid, folder, DATE, "sidB", [b], generate=generate)
+    assert out == [("pre-line units 1 to 3", "r1")]
+    body = calls[0]
+    assert body["segments"] == S1 + S2 and (body["from"], body["to"]) == ("10:00:00", "13:15:00")
+    assert body["walk"]["key"] == key and body["walk"]["units"] == opening
+    assert [s["unit"] for s in body["walk"]["stretches"]] == [None, "Unit 1", "Unit 2", None, "Unit 3"]
+    assert [(r[0], r[1], r[2], r[4]) for r in _reports(db, cid)] == [
+        ("sidB", "10:00:00", S1 + S2, key)]
+    # re-extracting the first recording: made already
+    assert cr.auto_generate(db, cid, folder, DATE, "sidA", [a], generate=generate) == [
+        ("pre-line units 1 to 3", "already made")]
+    # an on-site answer: re-queued anyway
+    assert cr.requeue_walk(db, cid, folder, DATE, key, generate=generate) == "r2"
+    assert calls[1] == calls[0]
+    assert [(r[0], r[3]) for r in _reports(db, cid)] == [("sidA", "r2")]   # the opening's recording
