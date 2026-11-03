@@ -56,15 +56,19 @@ def shape_sentence():
 
 # ---- the model's rows, by unit --------------------------------------------------
 
+def _header_cell(c):
+    return " ".join(re.sub(r"[^a-z ]", " ", c.lower()).split())
+
+
 def _is_header(cells):
-    return [c.lower() for c in cells[:2]] == ["unit", "item no"]
+    """"| Unit | Item no |", "| unit | Item No. |" and the like."""
+    return [_header_cell(c) for c in cells[:2]] == ["unit", "item no"]
 
 
-def rows_by_unit(text):
-    """{normalized unit or "General": [pipe rows without the Unit cell]}, in
-    the order units are first seen. Rows whose unit does not normalize go to
-    General."""
-    out = {}
+def _parsed_rows(text):
+    """[(normalized unit or "General", pipe row without the Unit cell)], in
+    row order."""
+    out = []
     for line in (text or "").splitlines():
         if "|" not in line or re.match(r"^[\s|:-]+$", line):
             continue
@@ -73,7 +77,17 @@ def rows_by_unit(text):
             continue
         cells = (cells + [""] * len(MODEL_COLUMNS))[:len(MODEL_COLUMNS)]
         unit = units_mod.normalize_unit(cells[0]) or GENERAL
-        out.setdefault(unit, []).append("| " + " | ".join(cells[1:]) + " |")
+        out.append((unit, "| " + " | ".join(cells[1:]) + " |"))
+    return out
+
+
+def rows_by_unit(text):
+    """{normalized unit or "General": [pipe rows without the Unit cell]}, in
+    the order units are first seen. Rows whose unit does not normalize go to
+    General."""
+    out = {}
+    for unit, row in _parsed_rows(text):
+        out.setdefault(unit, []).append(row)
     return out
 
 
@@ -102,37 +116,57 @@ def summary(units, items):
 
 # ---- all good -------------------------------------------------------------------
 
-def _line_time(quote, transcript_text):
-    """"HH:MM:SS" (or "HH:MM") of the first transcript line holding the quote,
-    or None."""
-    for line in (transcript_text or "").splitlines():
+def _matching_lines(quote, transcript_text):
+    """[(line index, "HH:MM:SS" / "HH:MM" or None)] of every transcript line
+    holding the quote, in transcript order."""
+    out = []
+    for i, line in enumerate((transcript_text or "").splitlines()):
         if checklist.evidence_found(quote, checklist.transcript_words(line)):
             m = _TIME_RE.match(line.strip())
-            return m.group(1) if m else None
-    return None
+            out.append((i, m.group(1) if m else None))
+    return out
 
 
-def _all_good(model_rows, t_words, transcript_text, unit, stretches, report):
+def _is_all(row):
+    return checklist._cells(row)[0].upper() == ALL
+
+
+def _all_good(model_rows, t_words, transcript_text, unit, stretches, claimed, dropped):
     """The first surviving ALL row as (quote, "HH:MM" or None), or None. Each
-    ALL row that does not survive is reported in report["dropped"]."""
+    ALL row that does not survive is added to `dropped`.
+
+    The same words ("this one is all good") are often said in several units,
+    so the line that times a quote is chosen per unit: with stretches, the
+    first matching line inside this unit's stretch; without, the first
+    matching line no earlier unit's all-good has claimed (`claimed`, line
+    indices, updated here)."""
     chosen = None
     for line in model_rows:
-        cells = (checklist._cells(line) + [""] * 6)[:6]
-        if cells[0].upper() != ALL:
+        if not _is_all(line):
             continue
+        cells = (checklist._cells(line) + [""] * 6)[:6]
         answer, quote = cells[1].strip().lower(), cells[5]
+        at, why = None, None
         if checklist.ANSWERS.get(answer) != "Yes":
             why = NOT_YES
         elif not checklist.evidence_found(quote, t_words):
             why = NO_EVIDENCE
         else:
-            at = _line_time(quote, transcript_text)
-            # With stretches, an all-good that cannot be placed inside this
-            # unit's stretch is not shown to be about this unit.
-            why = OUTSIDE if stretches is not None and (
-                not at or units_mod.unit_at(stretches, at) != unit) else None
+            lines = _matching_lines(quote, transcript_text)
+            if stretches is not None:
+                # An all-good that cannot be placed inside this unit's
+                # stretch is not shown to be about this unit.
+                hit = next((ln for ln in lines
+                            if ln[1] and units_mod.unit_at(stretches, ln[1]) == unit), None)
+                if hit is None:
+                    why = OUTSIDE
+            else:
+                hit = next((ln for ln in lines if ln[0] not in claimed), None)
+            if not why and chosen is None and hit is not None:
+                claimed.add(hit[0])
+                at = hit[1]
         if why:
-            report["dropped"].append({"item": ALL, "reason": why})
+            dropped.append({"item": ALL, "reason": why})
             continue
         if chosen is None:
             chosen = (quote, at[:5] if at else None)
@@ -153,7 +187,7 @@ def _apply_all_good(rows, quote, at, report):
 
 # ---- the walk -------------------------------------------------------------------
 
-def _unit_section(unit, model_rows, items, transcript_text, t_words, stretches, report_date):
+def _unit_section(unit, model_rows, items, transcript_text, good, all_dropped, report_date):
     section = {"paragraphs": list(model_rows), "line_refs": [[] for _ in model_rows]}
     paragraphs, line_refs, report = checklist.rebuild(section, items, transcript_text, report_date)
     rows = []
@@ -163,7 +197,7 @@ def _unit_section(unit, model_rows, items, transcript_text, t_words, stretches, 
                      "responsible": responsible, "due": due,
                      "evidence": report["evidence"].get(n, ""), "refs": list(line_refs[n + 1]),
                      "state": "answered" if answer else "not_checked"})
-    good = _all_good(model_rows, t_words, transcript_text, unit, stretches, report)
+    report["dropped"].extend(all_dropped)
     out = {"unit": unit, "rows": rows, "report": report}
     if good:
         _apply_all_good(rows, good[0], good[1], report)
@@ -190,7 +224,10 @@ def build(model_text, items, transcript_text, opening, stretches=None, report_da
     `opening` is the window's units dict ({"names", "count"}); only names are
     flagged against. Units come in walk order: the opening's names, then units
     first seen in the rows."""
-    grouped = rows_by_unit(model_text)
+    parsed = _parsed_rows(model_text)
+    grouped = {}
+    for u, row in parsed:
+        grouped.setdefault(u, []).append(row)
     names = []
     for n in (opening or {}).get("names") or []:
         u = units_mod.normalize_unit(n)
@@ -198,10 +235,17 @@ def build(model_text, items, transcript_text, opening, stretches=None, report_da
             names.append(u)
     order = names + [u for u in grouped if u != GENERAL and u not in names]
     t_words = checklist.transcript_words(transcript_text)
+    # All-good rows are timed in row order, so an earlier unit claims its
+    # line before a later unit that said the same words.
+    goods, all_dropped, claimed = {}, {}, set()
+    for u in dict.fromkeys(u for u, row in parsed if u in order and _is_all(row)):
+        all_dropped[u] = []
+        goods[u] = _all_good(grouped[u], t_words, transcript_text, u, stretches,
+                             claimed, all_dropped[u])
     walk = []
     for u in order:
-        sec = _unit_section(u, grouped.get(u, []), items, transcript_text, t_words,
-                            stretches, report_date)
+        sec = _unit_section(u, grouped.get(u, []), items, transcript_text, goods.get(u),
+                            all_dropped.get(u, []), report_date)
         sec["flagged_unlisted"] = bool(names) and u not in names
         walk.append({k: sec[k] for k in ("unit", "paragraphs", "line_refs", "report",
                                          "flagged_unlisted", "rows")})

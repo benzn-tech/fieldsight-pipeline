@@ -202,3 +202,40 @@ def test_rows_by_unit_strips_the_unit_cell():
         "General": ["|  | No | y |  |  | q |"],
     }
     assert "Unit" in wc.shape_sentence() and "ALL" in wc.shape_sentence() and "General" in wc.shape_sentence()
+
+
+TWICE = "\n".join([
+    "[10:01:10] Ben Lin (spk_1): Unit one, this one is all good.",
+    "[10:05:30] Ben Lin (spk_1): Unit two, the handrail on the stairs is loose.",
+    "[10:10:02] Ben Lin (spk_1): Unit three, this one is all good.",
+])
+TWICE_ROWS = HEADER + ("| Unit 1 | ALL | Yes | | | | this one is all good |\n"
+                       "| Unit 3 | ALL | Yes | | | | this one is all good |\n")
+
+
+def test_the_same_all_good_in_two_stretches_fills_both_units_with_their_own_time():
+    got = wc.build(TWICE_ROWS, ITEMS, TWICE, OPENING, stretches=STRETCHES)
+    assert _unit(got, "Unit 1")["report"]["all_good"] == {"quote": "this one is all good", "at": "10:01"}
+    assert _unit(got, "Unit 3")["report"]["all_good"] == {"quote": "this one is all good", "at": "10:10"}
+    assert _row(_unit(got, "Unit 3"), 1)["comment"] == "covered by 'this one is all good' (10:10)"
+    assert _unit(got, "Unit 3")["report"]["dropped"] == []
+    assert [r["state"] for r in _unit(got, "Unit 2")["rows"]] == ["not_checked"] * 3
+
+
+def test_the_same_all_good_without_stretches_takes_the_next_unclaimed_line():
+    got = wc.build(TWICE_ROWS, ITEMS, TWICE, OPENING)
+    assert _row(_unit(got, "Unit 1"), 1)["comment"] == "covered by 'this one is all good' (10:01)"
+    assert _row(_unit(got, "Unit 3"), 1)["comment"] == "covered by 'this one is all good' (10:10)"
+    # A third unit saying it again finds no line left, so it says no time.
+    got = wc.build(TWICE_ROWS + "| Unit 2 | ALL | Yes | | | | this one is all good |\n",
+                   ITEMS, TWICE, OPENING)
+    assert _row(_unit(got, "Unit 2"), 1)["comment"] == "covered by 'this one is all good'"
+
+
+def test_a_header_with_another_spelling_is_not_a_finding():
+    text = ("| Unit | Item No. | Answer | Comment | Responsible | Due | Evidence |\n"
+            "|---|---|---|---|---|---|---|\n"
+            "| UNIT | item  no | Answer | Comment | Responsible | Due | Evidence |\n")
+    got = wc.build(text, ITEMS, TRANSCRIPT, OPENING)
+    assert got["general"] == [] and got["general_dropped"] == []
+    assert wc.rows_by_unit(text) == {}
