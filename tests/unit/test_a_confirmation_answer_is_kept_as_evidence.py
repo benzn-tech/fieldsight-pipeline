@@ -72,6 +72,13 @@ def test_rule_4_not_applicable_is_na():
         assert wc.parse_answer(said, "not_checked", UNITS) == {"answer": "N/A"}, said
 
 
+def test_an_acknowledgement_with_a_pass_on_a_read_back_no_is_a_skip():
+    # R34: ambiguous -- never a confirmed No, never a Yes; it goes to the phone.
+    for said in ("yes it passes", "ok, passed", "Right, it passes", "that's right, pass"):
+        assert wc.parse_answer(said, "confirm_no", UNITS) is None, said
+    assert wc.parse_answer("actually it passes", "confirm_no", UNITS) == {"answer": "Yes"}
+
+
 def test_rule_4_is_anchored_to_the_start():
     assert wc.parse_answer("pass, n a for the lintel", "not_checked", UNITS) == {"answer": "Yes"}
     assert wc.parse_answer("the lintel is na", "not_checked", UNITS) is None

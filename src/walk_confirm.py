@@ -49,6 +49,7 @@ _YES = {"pass", "passed", "passes", "yes", "good", "ok", "okay", "right", "corre
 # pass turns it into Yes.
 _CONFIRM = {"right", "correct", "yes", "yeah", "yep", "ok", "okay", "good"}
 _PASS = re.compile(r"^(?:actually )?(?:it )?(?:pass|passed|passes)\b")
+_PASS_WORD = re.compile(r"\b(?:pass|passed|passes)\b")
 _NO = {"fail", "failed", "fails", "no"}
 # Rule 4, anchored to the start like rules 2 and 3.
 _NA = re.compile(r"^(?:(?:it|that|this|its|thats) (?:is )?)?"
@@ -96,7 +97,8 @@ def parse_answer(text, kind, units):
     2. it starts with pass / yes / good / ok / right / correct -> Yes; for a
        read-back No (R32) an acknowledgement (right / correct / yes / yeah /
        ok / okay / good / that's right / yep) confirms the No, and only an
-       explicit pass ("pass", "it passes", "actually it passes") is Yes;
+       explicit pass ("pass", "it passes", "actually it passes") is Yes; both
+       at once ("yes it passes") is ambiguous -> None (R34);
     3. it starts with fail / no / failed -> No, the rest is its comment;
     4. it starts with not applicable / n a / na / doesn't apply -> N/A;
     5. anything else -> None."""
@@ -112,6 +114,10 @@ def parse_answer(text, kind, units):
         if _PASS.match(norm):
             return {"answer": "Yes"}
         if first in _CONFIRM or norm.startswith("thats right"):
+            # R34: an acknowledgement that also says it passes ("yes it
+            # passes") is ambiguous -- skipped to the phone, never guessed.
+            if _PASS_WORD.search(norm):
+                return None
             return {"answer": "No", "confirmed": True}
     if first in _YES:
         return {"answer": "Yes"}
