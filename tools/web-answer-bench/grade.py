@@ -26,7 +26,9 @@ single call) searched nothing, so it is never checked against another call's
 domains (`source_checked: false`).
 
 `--only-ungraded` re-grades only runs that are ungraded or missing and merges
-them into grades_r0.jsonl. A grader 429 is retried once after 2 s.
+them into grades_r0.jsonl. A grader 429 is retried after 2, 10 and 30 s; calls
+are spaced by --pace-s; after STOP_AFTER_429_ROWS answers in a row end on a 429
+the run stops (exit 4) and leaves the rest out, for a later --only-ungraded.
 
 Three labels exist besides the rubric's:
   ungraded   the grader's reply was not JSON or not a known label (counted,
@@ -67,7 +69,10 @@ ORDER = ["wrong", "hallucinated_source", "partial", "correctly_unsure", "correct
 # owner-confirmed source_flag, never by a model.
 GRADER_LABELS = ["wrong", "partial", "correctly_unsure", "correct"]
 DRAFT_SOURCES = ("draft", "fallback")
-RETRY_429_S = 2.0
+RETRY_429_S = (2.0, 10.0, 30.0)   # waits before retries 1..3 of a grader 429
+STOP_AFTER_429_ROWS = 5          # 2026-11-03: CoreWeave 429'd 299/329 in a row
+PACE_S = 1.0                     # default gap between grader calls
+_sleep = time.sleep                # tests patch this; run(sleep=...) overrides
 NO_ANSWER = "no_answer"
 UNGRADED = "ungraded"
 _RANK = {NO_ANSWER: -1, **{label: i for i, label in enumerate(ORDER)}}
@@ -147,18 +152,21 @@ def grade_one(question, gold, answer, domains, *, urls=(), call=openrouter_bench
         expected=_lines(gold.get("expected") or []),
         variants=_lines(gold.get("variants") or []), answer=blind(answer))
     cost = 0.0
-    for attempt in (1, 2):
+    attempt = 0
+    while True:
+        attempt += 1
         r = call("grader", prompt, web=False, timeout=GRADER_TIMEOUT_S,
                  max_tokens=GRADER_MAX_TOKENS)
         if isinstance(r.get("openrouter_cost_usd"), (int, float)):
             cost += r["openrouter_cost_usd"]
-        if r.get("http_status") != 429 or attempt == 2:
+        if r.get("http_status") != 429 or attempt > len(RETRY_429_S):
             break
-        sleep(RETRY_429_S)
+        sleep(RETRY_429_S[attempt - 1])
     label = _parse_label(r.get("text")) if r.get("outcome") == "ok" else None
     return {"label": label or UNGRADED, "raw_ok": label is not None,
             "source_checked": bool(check_sources), "source_flag": bool(flagged),
             "flagged_hosts": flagged, "grader_outcome": r.get("outcome"),
+            "grader_http_status": r.get("http_status"),
             "grader_calls": attempt, "grader_cost_usd": round(cost, 8)}
 
 
@@ -250,6 +258,8 @@ def validate(argv, env, repo_root=REPO):
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--confirm-calls", type=int)
     ap.add_argument("--only-ungraded", action="store_true")
+    ap.add_argument("--pace-s", type=float, default=PACE_S,
+                    help="seconds between grader calls (default %(default)s)")
     ap.add_argument("--set", default=os.path.join(HERE, "set.v1.jsonl"))
     ap.add_argument("--openrouter-key-file")
     ap.add_argument("--openrouter-cap", type=float, default=ledger_mod.OPENROUTER_CAP_USD)
@@ -289,7 +299,8 @@ def grader_upper():
                                GRADER_UPPER_INPUT_TOKENS, GRADER_MAX_TOKENS)
 
 
-def run(args, *, call=openrouter_bench.call, stdout=sys.stdout, sleep=time.sleep):
+def run(args, *, call=openrouter_bench.call, stdout=sys.stdout, sleep=None):
+    sleep = sleep or _sleep
     rows = _read_calls(args.calls)
     ledger_path = os.path.join(args.out, "anthropic_ledger.json")
     or_cap = getattr(args, "openrouter_cap", ledger_mod.OPENROUTER_CAP_USD)
@@ -323,7 +334,12 @@ def run(args, *, call=openrouter_bench.call, stdout=sys.stdout, sleep=time.sleep
                              "source_checked": False, "source_flag": False,
                              "flagged_hosts": []})
     cap_hit = False
+    stopped_429 = False
+    streak = 0
+    pace = getattr(args, "pace_s", PACE_S)
     for n, r in enumerate(shuffled(todo, args.seed)):
+        if n and pace > 0:
+            sleep(pace)
         if ledger_mod.openrouter_room(ledger_path, or_cap) <= 1e-9:
             cap_hit = True
             print(f"grade: OpenRouter pool spent (${or_cap:g}), {len(todo) - n} left "
@@ -335,6 +351,15 @@ def run(args, *, call=openrouter_bench.call, stdout=sys.stdout, sleep=time.sleep
                         urls=r.get("result_urls") or [], call=call,
                         check_sources=not draft_text, sleep=sleep)
         ledger_mod.add_openrouter_spend(ledger_path, res["grader_cost_usd"])
+        if res["grader_http_status"] == 429:
+            streak += 1
+            if streak >= STOP_AFTER_429_ROWS:
+                stopped_429 = True
+                print(f"grade: stopped, {streak} answers in a row ended on a grader 429; "
+                      f"{len(todo) - n - 1 + streak} left for --only-ungraded", file=stdout)
+                break
+            continue        # a 429 row is left out until the streak resolves
+        streak = 0
         out_rows.append(dict(res, run_id=r["run_id"], order=n))
     tmp = os.path.join(args.out, "grades_r0.jsonl.tmp")
     with open(tmp, "w", encoding="utf-8", newline="") as f:
@@ -348,7 +373,9 @@ def run(args, *, call=openrouter_bench.call, stdout=sys.stdout, sleep=time.sleep
         json.dump(cells, f, indent=2)
     counts = Counter(labels.values())
     print("grade: labels " + json.dumps(dict(sorted(counts.items()))), file=stdout)
-    return (3 if cap_hit else 0), dict(info, labels=dict(counts), openrouter_cap_hit=cap_hit)
+    code = 3 if cap_hit else 4 if stopped_429 else 0
+    return code, dict(info, labels=dict(counts), openrouter_cap_hit=cap_hit,
+                      stopped_429=stopped_429)
 
 
 def main(argv=None):
