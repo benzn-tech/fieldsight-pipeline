@@ -23,6 +23,7 @@ Three rules carry the design:
 
 Pure: no database, no network, so every rule is tested to the word.
 """
+import hashlib
 import re
 
 PREFIXES = ("unit", "lot", "room", "house", "townhouse", "apartment", "apt", "flat", "villa", "u")
@@ -213,4 +214,47 @@ def unit_at(stretches, hhmmss):
     for s in stretches or []:
         if s["from"] <= t and (s["to"] is None or t < s["to"]):
             return s["unit"]
+    return None
+
+
+def walk_key(company_id, user_folder, date, template_id, start_at):
+    """The walk's identity across its recordings and every re-extraction:
+    who, which day, which checklist, and when the walk opened. Never the row's
+    id, which is new on every re-extraction. The company is in it because the
+    key is unique across all companies' checklist reports."""
+    raw = "|".join(str(v) for v in (company_id, user_folder, date, template_id, start_at))
+    return "walk:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _opens_a_walk(window):
+    """The opening names two or more units or counts two or more. One name is
+    an ordinary check (R8), so it opens nothing."""
+    opening = window.get("units") or {}
+    c = _count(opening.get("count"))
+    return len(opening.get("names") or []) >= 2 or (c is not None and c >= 2)
+
+
+def assign_walk(window, open_walks, company_id, user_folder, date):
+    """The walk_key of one stored window (start_at "HH:MM:SS"), or None.
+
+    `open_walks` are the day's walks on the same checklist from OTHER
+    recordings (inspection_windows.open_walks, the caller leaves its own
+    recording out). In order:
+    - no checklist -> None;
+    - an opening -> a new walk, keyed by its own start;
+    - the latest walk on this checklist that opened earlier that day -> that
+      walk (a later recording with no opening carries on where he left off);
+    - entering two or more units -> a new walk, keyed by its own start;
+    - otherwise an ordinary check -> None."""
+    tid, start = window.get("template_id"), window.get("start_at")
+    if not tid or not start:
+        return None
+    if _opens_a_walk(window):
+        return walk_key(company_id, user_folder, date, tid, start)
+    earlier = [w for w in open_walks or []
+               if w.get("walk_key") and w.get("start_at") and str(w["start_at"]) < str(start)]
+    if earlier:
+        return max(earlier, key=lambda w: str(w["start_at"]))["walk_key"]
+    if is_multi_unit(window):
+        return walk_key(company_id, user_folder, date, tid, start)
     return None

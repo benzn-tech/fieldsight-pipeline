@@ -87,6 +87,7 @@ import inspection_match
 import photo_rebind
 import pipeline_trace
 import thread_match
+import units
 from repositories import inspection_windows, location_markers
 from repositories import memberships
 from repositories import (companies, decision_records, findings, meeting_session,
@@ -1888,8 +1889,39 @@ def _store_inspections(conn, company_id, user_id, user_folder, date, session, sp
             "template": tpl["name"] if tpl else None, "score": round(score, 2),
             "candidates": sum(1 for t in templates if inspection_match.is_checklist(t.get("body")))},
             evidence=w.get("start_quote"))
+    _assign_walks(conn, company_id, user_folder, date, session, rows)
     inspection_windows.replace_for_session(conn, company_id, user_folder, date, session, rows)
     return rows
+
+
+def _assign_walks(conn, company_id, user_folder, date, session, rows):
+    """Give each window of a multi-unit walk the walk's key (units.assign_walk),
+    so the walk's recordings make one report. The open walks are the day's
+    OTHER recordings: this one's rows are about to be replaced, and a window of
+    this recording that opened a walk earlier counts as soon as it has its key.
+    Never costs the windows: on any error they are stored with no walk_key."""
+    for r in rows:
+        r["walk_key"] = None
+    if conn is None or company_id is None:
+        return
+    try:
+        walks = {}
+        for r in sorted(rows, key=lambda r: r["start_at"]):
+            tid = r.get("template_id")
+            if tid is None:
+                continue
+            if tid not in walks:
+                with conn.transaction():          # a failed read must not abort the extraction
+                    walks[tid] = [w for w in inspection_windows.open_walks(
+                        conn, company_id, user_folder, date, tid) if w.get("session") != session]
+            r["walk_key"] = units.assign_walk(r, walks[tid], company_id, user_folder, date)
+            if r["walk_key"]:
+                walks[tid].append({"walk_key": r["walk_key"], "start_at": r["start_at"],
+                                   "units": r.get("units"), "session": session})
+    except Exception:  # noqa: BLE001 -- the windows matter more than the walk
+        logger.exception("walk keys not assigned for %s/%s %s", user_folder, date, session)
+        for r in rows:
+            r["walk_key"] = None
 
 
 def lambda_handler(event, context):

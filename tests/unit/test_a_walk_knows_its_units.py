@@ -144,3 +144,117 @@ def test_before_the_first_unit_is_general():
     assert units.unit_at(st, "10:20") == "Unit 2"
     assert units.unit_at(st, "10:30:00") is None        # the window has ended
     assert units.unit_at(st, "09:00:00") is None
+
+
+# --- walk identity across recordings (Task 5) ---------------------------------
+
+CO, FOLDER, DAY, TPL = "c-1", "Ben_Lin_Test", "2026-11-03", "t-1"
+
+
+def _window(start, names=None, count=None, entered=None, template_id=TPL):
+    return {"start_at": start, "template_id": template_id,
+            "units": {"names": names or [], "count": count}, "entered": entered or []}
+
+
+def test_a_later_recording_without_an_opening_continues_the_walk():
+    first = units.walk_key(CO, FOLDER, DAY, TPL, "10:00:00")
+    second = units.walk_key(CO, FOLDER, DAY, TPL, "10:40:00")
+    walks = [{"walk_key": first, "start_at": "10:00:00", "units": {}, "session": "sidA"},
+             {"walk_key": second, "start_at": "10:40:00", "units": {}, "session": "sidB"},
+             {"walk_key": "walk:later", "start_at": "12:00:00", "units": {}, "session": "sidC"}]
+    got = units.assign_walk(_window("11:00:00"), walks, CO, FOLDER, DAY)
+    assert got == second, "the latest walk that opened before this recording"
+
+
+def test_a_new_opening_starts_a_new_walk():
+    old = units.walk_key(CO, FOLDER, DAY, TPL, "10:00:00")
+    walks = [{"walk_key": old, "start_at": "10:00:00", "units": {}, "session": "sidA"}]
+    got = units.assign_walk(_window("11:00:00", names=["Lot 150", "Lot 151"]), walks, CO, FOLDER, DAY)
+    assert got == units.walk_key(CO, FOLDER, DAY, TPL, "11:00:00") != old
+    assert units.assign_walk(_window("11:30:00", count=3), walks, CO, FOLDER, DAY) == \
+        units.walk_key(CO, FOLDER, DAY, TPL, "11:30:00")
+
+
+def test_the_key_is_stable_across_re_extraction():
+    w = _window("10:00:00", names=["Unit 1", "Unit 2"])
+    a = units.assign_walk(dict(w), [], CO, FOLDER, DAY)
+    b = units.assign_walk(dict(w), [], CO, FOLDER, DAY)
+    assert a == b and a.startswith("walk:") and len(a) == len("walk:") + 40
+    import uuid
+    u = uuid.UUID(int=7)
+    assert units.walk_key(u, FOLDER, DAY, u, "10:00:00") == units.walk_key(str(u), FOLDER, DAY, str(u), "10:00:00")
+
+
+def test_the_key_belongs_to_one_company():
+    assert units.walk_key("c-1", FOLDER, DAY, TPL, "10:00:00") != units.walk_key("c-2", FOLDER, DAY, TPL, "10:00:00")
+
+
+def test_an_ordinary_check_has_no_walk():
+    assert units.assign_walk(_window("10:00:00"), [], CO, FOLDER, DAY) is None
+    assert units.assign_walk(_window("10:00:00", names=["Room 102"]), [], CO, FOLDER, DAY) is None, \
+        "one name in the opening is an ordinary check"
+    assert units.assign_walk(_window("10:00:00", names=["Lot 1", "Lot 2"], template_id=None),
+                             [], CO, FOLDER, DAY) is None, "no checklist, no walk"
+
+
+def test_entering_two_units_without_an_opening_or_open_walk_starts_a_walk():
+    w = _window("10:00:00", entered=[_mark("Unit 1", "10:01"), _mark("Unit 2", "10:05")])
+    assert units.assign_walk(w, [], CO, FOLDER, DAY) == units.walk_key(CO, FOLDER, DAY, TPL, "10:00:00")
+
+
+def test_a_walk_that_opened_later_is_not_continued():
+    walks = [{"walk_key": "walk:x", "start_at": "12:00:00", "units": {}, "session": "sidB"}]
+    assert units.assign_walk(_window("11:00:00"), walks, CO, FOLDER, DAY) is None
+
+
+def test_item_writer_keys_the_walk_from_other_recordings_only(monkeypatch):
+    import pytest
+    lam = pytest.importorskip("lambda_item_writer")
+    tpl = {"id": "t-1", "name": "Framing Checklist", "scope": "org",
+           "body": {"sections": [{"kind": "checklist", "items": ["Studs"]}]}}
+    stored, asked = {}, []
+    monkeypatch.setattr(lam.inspection_windows, "checklist_templates", lambda c, co, u: [tpl])
+    monkeypatch.setattr(lam.inspection_match, "match", lambda w, ts: (tpl, 1.0))
+    old = units.walk_key("c-1", FOLDER, DAY, "t-1", "09:00:00")
+    mine = units.walk_key("c-1", FOLDER, DAY, "t-1", "09:30:00")
+
+    def open_walks(c, co, f, d, t):
+        asked.append(t)
+        return [{"walk_key": old, "start_at": "09:00:00", "units": {}, "session": "sidA"},
+                {"walk_key": mine, "start_at": "09:30:00", "units": {}, "session": "sidB"}]
+    monkeypatch.setattr(lam.inspection_windows, "open_walks", open_walks)
+    monkeypatch.setattr(lam.inspection_windows, "replace_for_session",
+                        lambda c, co, f, d, s, rows: stored.update(rows=rows))
+
+    class Conn:
+        def transaction(self):
+            import contextlib
+            return contextlib.nullcontext()
+    lam._store_inspections(Conn(), "c-1", "u-1", FOLDER, DAY, "sidB", [
+        {"name": "framing", "kind": "framing", "start_at": "10:00", "start_at_s": "10:00:05"}])
+    assert asked == ["t-1"]
+    assert stored["rows"][0]["walk_key"] == old, "its own old row is about to be replaced"
+
+
+def test_item_writer_keeps_the_windows_when_walk_assignment_fails(monkeypatch):
+    import pytest
+    lam = pytest.importorskip("lambda_item_writer")
+    tpl = {"id": "t-1", "name": "Framing Checklist", "scope": "org", "body": {}}
+    stored = {}
+    monkeypatch.setattr(lam.inspection_windows, "checklist_templates", lambda c, co, u: [tpl])
+    monkeypatch.setattr(lam.inspection_match, "match", lambda w, ts: (tpl, 1.0))
+
+    def boom(*a):
+        raise RuntimeError("db down")
+    monkeypatch.setattr(lam.inspection_windows, "open_walks", boom)
+    monkeypatch.setattr(lam.inspection_windows, "replace_for_session",
+                        lambda c, co, f, d, s, rows: stored.update(rows=rows))
+
+    class Conn:
+        def transaction(self):
+            import contextlib
+            return contextlib.nullcontext()
+    lam._store_inspections(Conn(), "c-1", "u-1", FOLDER, DAY, "sidB", [
+        {"name": "framing", "kind": "framing", "start_at": "10:00",
+         "units": {"names": ["Lot 1", "Lot 2"], "count": 2}}])
+    assert [r["walk_key"] for r in stored["rows"]] == [None]
