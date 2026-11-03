@@ -277,6 +277,7 @@ NOT_EXPORTED = (
     ("checklist_reports", "inspection / checklist reports made from a spoken check (status "
                           "and the result file key)"),
     ("inspection_windows", "spoken inspection checks (start / end times per recording)"),
+    ("walk_answers", "answers given on site at a multi-unit inspection walk's final check"),
     ("report_templates", "the company's report templates"),
     ("report_template_versions", "versions of the company's report templates"),
     ("report_template_bindings", "which report template is used where"),

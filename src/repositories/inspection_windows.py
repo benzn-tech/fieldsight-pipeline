@@ -36,15 +36,31 @@ def replace_for_session(conn, company_id, user_folder, date, session, windows):
             conn.execute(
                 "INSERT INTO inspection_windows (company_id, user_folder, report_date, session, "
                 "name, kind, start_at, end_at, end_source, start_quote, end_quote, "
-                "template_id, match_score, segments) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
+                "template_id, match_score, segments, units, entered, walk_key) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, "
+                "%s::jsonb, %s::jsonb, %s)",
                 (str(company_id), user_folder, date, session, w["name"], w.get("kind") or "",
                  w["start_at"], w.get("end_at"), w.get("end_source") or "recording_stop",
                  w.get("start_quote") or "", w.get("end_quote"),
                  str(w["template_id"]) if w.get("template_id") else None,
                  w.get("match_score"),
-                 json.dumps(w["segments"]) if w.get("segments") else None))
+                 json.dumps(w["segments"]) if w.get("segments") else None,
+                 json.dumps(w["units"]) if _has_units(w.get("units")) else None,
+                 json.dumps(w["entered"]) if w.get("entered") else None,
+                 w.get("walk_key") or None))
     return len(windows or [])
+
+
+def _has_units(units):
+    """An opening that named no units and no count is stored as NULL, so a
+    single-unit check's row looks exactly as it did before 0096."""
+    return bool(units) and bool(units.get("names") or units.get("count") is not None)
+
+
+def _parse_json(r, *keys):
+    for k in keys:
+        if isinstance(r.get(k), str):
+            r[k] = json.loads(r[k])
 
 
 def for_day(conn, company_id, user_folder, date):
@@ -55,7 +71,7 @@ def for_day(conn, company_id, user_folder, date):
     rows = conn.cursor(row_factory=dict_row).execute(
         "SELECT w.id, w.session, w.name, w.kind, w.start_at, w.end_at, w.end_source, "
         "       w.start_quote, w.end_quote, w.template_id, w.match_score, w.segments, "
-        "       t.name AS template_name "
+        "       w.units, w.entered, w.walk_key, t.name AS template_name "
         "FROM inspection_windows w LEFT JOIN report_templates t ON t.id = w.template_id "
         "WHERE (%s::uuid IS NULL OR w.company_id = %s::uuid) "
         "AND w.user_folder = %s AND w.report_date = %s "
@@ -64,8 +80,7 @@ def for_day(conn, company_id, user_folder, date):
          user_folder, date),
     ).fetchall()
     for r in rows:
-        if isinstance(r.get("segments"), str):
-            r["segments"] = json.loads(r["segments"])
+        _parse_json(r, "segments", "units", "entered")
         if not r.get("segments"):
             r["segments"] = [{"from": r["start_at"], "to": r["end_at"]}]   # one stretch
     return rows
@@ -80,10 +95,29 @@ def for_session(conn, company_ids, user_folder, session):
     if not ids:
         return []
     rows = conn.cursor(row_factory=dict_row).execute(
-        "SELECT name, kind, start_at, end_at, end_source, template_id, report_date "
+        "SELECT name, kind, start_at, end_at, end_source, template_id, report_date, "
+        "       units, entered, walk_key "
         "FROM inspection_windows "
         "WHERE company_id = ANY(%s::uuid[]) AND user_folder = %s AND session = %s "
         "ORDER BY start_at, name",
         (ids, user_folder, session),
     ).fetchall()
+    for r in rows:
+        _parse_json(r, "units", "entered")
+    return rows
+
+
+def open_walks(conn, company_id, user_folder, date, template_id):
+    """The day's multi-unit walks on this checklist so far, oldest first: every
+    window (from any recording of the day) that carries a walk_key. The caller
+    leaves out its own recording; this does not filter by session."""
+    rows = conn.cursor(row_factory=dict_row).execute(
+        "SELECT walk_key, start_at, units, session FROM inspection_windows "
+        "WHERE company_id = %s AND user_folder = %s AND report_date = %s "
+        "AND template_id = %s AND walk_key IS NOT NULL "
+        "ORDER BY start_at, session",
+        (str(company_id), user_folder, date, str(template_id)),
+    ).fetchall()
+    for r in rows:
+        _parse_json(r, "units")
     return rows
