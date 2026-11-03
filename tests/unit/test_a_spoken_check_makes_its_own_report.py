@@ -317,6 +317,54 @@ def test_requeue_walk_queues_again_even_when_made(walked):
                            generate=walked["generate"]) == "no such walk"
 
 
+def test_requeue_walk_for_a_blocked_recorder_queues_nothing(walked, monkeypatch):
+    monkeypatch.setattr(cr.tenancy_status, "caller_blocked", lambda c, caller, where: "company_inactive")
+    assert cr.requeue_walk(None, "c-1", "Ben_Lin_test2", WDATE, WKEY,
+                           generate=walked["generate"]) == "company_inactive"
+    assert walked["calls"] == [] and walked["walk_recorded"] == []
+
+
+def _org_accepts(walked):
+    """The walked generate, but every body must pass org-api's own walk check."""
+    org = pytest.importorskip("lambda_org_api")
+
+    def generate(conn, caller, date, event):
+        walk, err = org._walk_from_body(json.loads(event["body"]))
+        assert err is None and walk is not None, err
+        return walked["generate"](conn, caller, date, event)
+    return generate
+
+
+def test_a_malformed_mark_is_dropped_before_the_body_is_built(walked, caplog):
+    bad = {"unit": "Unit 3", "at": "10:15", "at_s": "9:01:00", "quote": "unit three"}
+    none = {"unit": "Unit 3", "quote": "no time at all"}
+    a = dict(WALK_A, entered=WALK_A["entered"] + [bad, none])
+    walked["day"] = [a, WALK_B]
+    out = cr.auto_generate(None, "c-1", "Ben_Lin_test2", WDATE, "sidB", [WALK_B],
+                           generate=_org_accepts(walked))
+    assert out == [("pre-line check units 1 to 3", "r1")]
+    walk = walked["calls"][0][3]["walk"]
+    assert walk["entered"] == WALK_A["entered"] + WALK_B["entered"]
+    assert walk["stretches"] == BOTH_STRETCHES
+    assert "dropped 2 mark" in caplog.text
+
+
+@pytest.mark.parametrize("marks", [
+    [{"unit": "Unit %d" % i, "at_s": "10:11:%02d" % i} for i in range(41)],    # 41 units
+    [{"unit": "Unit %d" % (i % 2 + 1), "at_s": "10:%02d:%02d" % (11 + i // 60, i % 60)}
+     for i in range(201)],                                                        # 201 marks
+])
+def test_a_walk_over_the_caps_is_never_sent(walked, marks, caplog):
+    a = dict(WALK_A, entered=WALK_A["entered"] + marks)
+    walked["day"] = [a, WALK_B]
+    out = cr.auto_generate(None, "c-1", "Ben_Lin_test2", WDATE, "sidB", [WALK_B],
+                           generate=_org_accepts(walked))
+    assert walked["calls"] == [] and walked["walk_recorded"] == []
+    assert out[0][0] == "pre-line check units 1 to 3"
+    assert out[0][1].startswith("walk not sent: walk has more than")
+    assert "walk not sent" in caplog.text
+
+
 # ---- org-api: the walk travels to the report worker ----------------------------------
 
 GOOD_WALK = {"key": WKEY, "units": {"names": ["Unit 1", "Unit 2"], "count": 2},
@@ -350,6 +398,14 @@ def org_gen(monkeypatch):
         st["answers_read"].append((company_ids, key))
         return st.get("answers", [])
     monkeypatch.setattr(org.walk_answers, "for_walk", for_walk)
+
+    st["walk_companies"] = ["c-1"]          # the walk's windows' company (the site's)
+    st["walk_lookups"] = []
+
+    def walk_companies(conn, folder, date, key):
+        st["walk_lookups"].append((folder, date, key))
+        return list(st["walk_companies"])
+    monkeypatch.setattr(org.inspection_windows, "walk_companies", walk_companies)
     st["org"] = org
 
     class Conn:                     # the answers are read in a savepoint
@@ -388,7 +444,7 @@ def test_a_malformed_walk_key_is_refused_400(org_gen, walk):
     dict(GOOD_WALK, stretches=[{"unit": "Unit %d" % i, "from": "10:00:00", "to": "10:01:00"}
                                for i in range(41)]),
     dict(GOOD_WALK, units={"names": ["Unit %d" % i for i in range(41)], "count": None}),
-    dict(GOOD_WALK, entered=[{"unit": "Unit 1", "at": "10:01"}] * 41),
+    dict(GOOD_WALK, entered=[{"unit": "Unit 1", "at": "10:01"}] * 201),
     dict(GOOD_WALK, entered="Unit 1"),
     dict(GOOD_WALK, units=None),
     dict(GOOD_WALK, units={"names": "Unit 1", "count": None}),
@@ -414,12 +470,34 @@ def test_a_walk_goes_to_the_worker_with_its_on_site_answers(org_gen):
     res = org_gen["call"](dict(BASE_BODY, walk=GOOD_WALK))
     assert res["statusCode"] == 202
     art = org_gen["put"][0]
-    assert org_gen["answers_read"] == [(["c-1"], WKEY)]
+    assert org_gen["walk_lookups"] == [("Ben_Lin_test2", WDATE, WKEY)]
+    assert org_gen["answers_read"] == [(["c-1"], WKEY)]      # the walk's company
     a = art["walk"]["answers"][0]
     assert (a["company_id"], a["answered_by"], a["report_date"], a["created_at"]) == (
         str(uuid.UUID(int=7)), str(uuid.UUID(int=9)), "2026-11-03", "2026-11-03T10:30:00+00:00")
     assert {k: art["walk"][k] for k in ("key", "units", "entered", "stretches")} == GOOD_WALK
     assert art["window"] == {"from": "10:00:00", "to": "10:20:00"}
+
+
+def test_answers_are_read_in_the_walks_company_not_the_callers(org_gen):
+    """R22: a recorder from another company walks a site of c-site. The answers
+    were written under the walk's company, so that is where they are read."""
+    org_gen["walk_companies"] = ["c-site"]
+    res = org_gen["call"](dict(BASE_BODY, walk=GOOD_WALK))
+    assert res["statusCode"] == 202
+    assert org_gen["answers_read"] == [(["c-site"], WKEY)]
+
+
+def test_a_walk_that_is_not_this_folders_day_is_refused(org_gen):
+    org_gen["walk_companies"] = []
+    res = org_gen["call"](dict(BASE_BODY, walk=GOOD_WALK))
+    assert res["statusCode"] == 400 and "walk" in json.loads(res["body"])["error"]
+    assert org_gen["put"] == [] and org_gen["answers_read"] == []
+
+
+def test_entered_marks_up_to_200_are_accepted(org_gen):
+    walk = dict(GOOD_WALK, entered=[{"unit": "Unit 1", "at": "10:01"}] * 200)
+    assert org_gen["call"](dict(BASE_BODY, walk=walk))["statusCode"] == 202
 
 
 def test_answers_that_cannot_be_read_still_queue_the_walk(org_gen, monkeypatch):
@@ -439,12 +517,16 @@ def test_without_a_walk_the_artifact_is_todays(org_gen):
     assert "walk" not in org_gen["put"][1]
 
 
-def test_a_walk_window_takes_up_to_60_stretches_an_ordinary_one_20():
+def _hms(s):
+    return "%02d:%02d:%02d" % (s // 3600, s % 3600 // 60, s % 60)
+
+
+def test_a_walk_window_takes_up_to_200_stretches_an_ordinary_one_20():
     org = pytest.importorskip("lambda_org_api")
-    segs = [{"from": "10:%02d:00" % i, "to": "10:%02d:30" % i} for i in range(60)]
-    body = {"from": "10:00:00", "to": "10:59:30", "segments": segs}
+    start = 10 * 3600
+    segs = [{"from": _hms(start + 20 * i), "to": _hms(start + 20 * i + 10)} for i in range(201)]
+    body = {"from": segs[0]["from"], "to": segs[199]["to"], "segments": segs[:200]}
     assert "segments" not in org._report_window(body)
     assert org._report_window(dict(body, segments=segs[:20]))["segments"] == segs[:20]
-    assert org._report_window(dict(body, walk=GOOD_WALK))["segments"] == segs
-    assert "segments" not in org._report_window(dict(body, walk=GOOD_WALK,
-                                                     segments=segs + [{"from": "11:00:00", "to": "11:00:30"}]))
+    assert org._report_window(dict(body, walk=GOOD_WALK))["segments"] == segs[:200]
+    assert "segments" not in org._report_window(dict(body, walk=GOOD_WALK, segments=segs))

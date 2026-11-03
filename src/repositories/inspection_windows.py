@@ -128,6 +128,18 @@ def for_session(conn, company_ids, user_folder, session):
     return rows
 
 
+def walk_companies(conn, user_folder, date, walk_key):
+    """The companies of walk `walk_key`'s windows in this folder's day (R22) --
+    the site's company, under which its on-site answers are written. Empty
+    when the walk is not this folder's on this day."""
+    rows = conn.execute(
+        "SELECT DISTINCT company_id FROM inspection_windows "
+        "WHERE walk_key = %s AND user_folder = %s AND report_date = %s",
+        (walk_key, user_folder, date),
+    ).fetchall()
+    return sorted(str(r[0]) for r in rows)
+
+
 def open_walks(conn, company_id, user_folder, date, template_id):
     """The day's multi-unit walks on this checklist so far, oldest first: every
     window (from any recording of the day) that carries a walk_key. The caller

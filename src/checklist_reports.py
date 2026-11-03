@@ -29,6 +29,7 @@ import inspection_match
 import pipeline_trace
 import tenancy_status
 import units
+import walk_body
 from repositories import inspection_windows, report_templates, topics as topics_repo, users
 
 logger = logging.getLogger(__name__)
@@ -83,7 +84,7 @@ def _record(conn, company_id, folder, date, session, w, tpl_name, request_id, re
         "ON CONFLICT (session, template_id, start_at) DO UPDATE SET "
         "end_at = EXCLUDED.end_at, segments = EXCLUDED.segments, "
         "request_id = EXCLUDED.request_id, result_key = EXCLUDED.result_key, "
-        "check_name = EXCLUDED.check_name, created_at = now()",
+        "check_name = EXCLUDED.check_name, walk_key = NULL, created_at = now()",
         (str(company_id), folder, date, session, str(w["template_id"]), tpl_name, w["name"],
          w["start_at"], w.get("end_at"), json.dumps(w.get("segments") or None),
          request_id, result_key))
@@ -303,9 +304,26 @@ def _queue_walk(conn, generate, caller, company_id, folder, date, session, key, 
     topics = [t for t in day_topics
               if any(s and s in (t.get("source_s3_key") or "") for s in sessions)]
     others = [o for o in day if o.get("walk_key") != key and o.get("session") in sessions]
+    # A mark whose time is not HH:MM:SS (a model's "9:01:00") would open a
+    # stretch at a time no clock sorts right: it is dropped, and said so.
+    marks = [m for m in w["entered"] if walk_body.is_hms(units._hhmmss(m))]
+    if len(marks) < len(w["entered"]):
+        logger.warning("walk %s: dropped %d mark(s) with no HH:MM:SS time: %s", key,
+                       len(w["entered"]) - len(marks),
+                       [m for m in w["entered"] if m not in marks])
+    w["entered"] = marks
     body = request_body(w, tpl, check_topics(w, others, topics) or None)
     body["walk"] = {"key": key, "units": w["units"], "entered": w["entered"],
                     "stretches": units.unit_stretches(w)}
+    # Never send what org-api would refuse (walk_body's rules, R23/R24).
+    _, err = walk_body.check(body["walk"])
+    if err is None and len(w["segments"]) > walk_body.MAX_SEGMENTS:
+        err = "walk has more than %d stretches" % walk_body.MAX_SEGMENTS
+    if err:
+        logger.warning("walk not sent: %s (%s)", err, key)
+        pipeline_trace.event("checklist_report", "walk_not_sent",
+                             detail={"check": w["name"], "walk": key, "error": err})
+        return w["name"], "walk not sent: %s" % err
     return w["name"], _send(conn, generate, caller, company_id, folder, date, session, w,
                             tpl, body)
 

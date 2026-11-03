@@ -209,3 +209,35 @@ def test_auto_generate_queues_one_report_for_a_walk_over_two_recordings(db):
     assert cr.requeue_walk(db, cid, folder, DATE, key, generate=generate) == "r2"
     assert calls[1] == calls[0]
     assert [(r[0], r[3]) for r in _reports(db, cid)] == [("sidA", "r2")]   # the opening's recording
+
+
+def test_a_walk_that_turns_back_into_a_plain_check_loses_its_walk_key(db):
+    """Re-extraction finds no walk any more: the plain upsert lands on the walk
+    row's (session, template, start) and must not leave it tagged as a walk."""
+    cid, _, tid = _setup(db)
+    key = units.walk_key(cid, FOLDER, DATE, tid, "10:00:00")
+    plain = {"name": "pre-line", "template_id": tid, "start_at": "10:00:00",
+             "end_at": "10:20:00", "segments": S1}
+    cr._record(db, cid, FOLDER, DATE, "sidA", dict(plain, walk_key=key,
+                                                  parts=[("sidA", "10:00:00")]),
+               "Pre-line", "r1", "k1")
+    cr._record(db, cid, FOLDER, DATE, "sidA", plain, "Pre-line", "r2", "k2")
+    assert [(r[0], r[3], r[4]) for r in _reports(db, cid)] == [("sidA", "r2", None)]
+    assert not cr.already_made(db, "sidA", tid, "10:00:00", "10:20:00", S1, walk_key=key)
+    assert cr.already_made(db, "sidA", tid, "10:00:00", "10:20:00", S1)
+
+
+def test_walk_companies_are_the_walks_windows_for_that_folder_and_day(db):
+    cid, _, tid = _setup(db)
+    other, _, otid = _setup(db)
+    iw.replace_for_session(db, cid, FOLDER, DATE, "sidA", [
+        _window("pre-line", "10:00:00", tid, "10:20:00", walk_key="wk-co")])
+    iw.replace_for_session(db, cid, FOLDER, DATE, "sidB", [
+        _window("pre-line on", "13:00:00", tid, "13:20:00", walk_key="wk-co")])
+    iw.replace_for_session(db, other, "Someone_Else", DATE, "sidC", [
+        _window("pre-line", "10:00:00", otid, "10:20:00", walk_key="wk-other")])
+    assert iw.walk_companies(db, FOLDER, DATE, "wk-co") == [str(cid)]
+    assert iw.walk_companies(db, FOLDER, "2026-11-04", "wk-co") == []
+    assert iw.walk_companies(db, FOLDER, DATE, "wk-other") == []          # not this folder
+    assert iw.walk_companies(db, "Someone_Else", DATE, "wk-other") == [str(other)]
+

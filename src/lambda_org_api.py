@@ -187,6 +187,7 @@ from repositories import (action_items, aliases, chunks, classification_feedback
                           voiceprints)
 from repositories import lake_objects
 from repositories import walk_answers
+import walk_body
 from repositories import action_packs
 import action_pack_view
 from repositories import project_docs
@@ -3381,55 +3382,16 @@ def day_report_preview(conn, caller, date, event):
     })
 
 
-_WALK_KEY_RE = re.compile(r"^walk:[0-9a-f]{40}$")
-_HMS_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d:[0-5]\d$")
-_WALK_MAX_UNITS = 40
-
-
 def _walk_from_body(body):
     """(walk, None) for a multi-unit walk's request (spec 2026-11-03), (None,
     None) when the body carries none, (None, reason) when it is malformed --
-    refused at the door, never handed to the worker that would trust it.
-
-    walk = {"key": "walk:<40 hex>", "units": {"names": [str], "count": int|None},
-            "entered": [mark] (at most 40), "stretches": [{"unit": str|None,
-            "from": "HH:MM:SS", "to": "HH:MM:SS"}]}, at most 40 distinct units."""
+    refused at the door, never handed to the worker that would trust it. The
+    rules are walk_body's, the same ones checklist_reports checks before it
+    sends one."""
     walk = body.get("walk")
     if walk is None:
         return None, None
-    if not isinstance(walk, dict):
-        return None, "walk must be an object"
-    key = walk.get("key")
-    if not isinstance(key, str) or not _WALK_KEY_RE.match(key):
-        return None, "walk key is malformed"
-    opening = walk.get("units")
-    if not isinstance(opening, dict) or not isinstance(opening.get("names"), list) \
-            or not all(isinstance(n, str) for n in opening["names"]):
-        return None, "walk units must name a list of units"
-    count = opening.get("count")
-    if count is not None and (isinstance(count, bool) or not isinstance(count, int)):
-        return None, "walk unit count must be a whole number or null"
-    entered = walk.get("entered")
-    if not isinstance(entered, list) or not all(isinstance(m, dict) for m in entered):
-        return None, "walk entered must be a list of marks"
-    if len(entered) > _WALK_MAX_UNITS:
-        return None, "walk has more than %d entered marks" % _WALK_MAX_UNITS
-    stretches = walk.get("stretches")
-    if not isinstance(stretches, list):
-        return None, "walk stretches must be a list"
-    for s in stretches:
-        if not isinstance(s, dict) or not all(
-                isinstance(s.get(k), str) and _HMS_RE.match(s[k]) for k in ("from", "to")):
-            return None, "walk stretches must run HH:MM:SS to HH:MM:SS"
-        if s.get("unit") is not None and not isinstance(s.get("unit"), str):
-            return None, "walk stretch unit must be a name or null"
-    named = set(opening["names"]) | {s["unit"] for s in stretches if s.get("unit")}
-    if len(named) > _WALK_MAX_UNITS:
-        return None, "walk has more than %d units" % _WALK_MAX_UNITS
-    return {"key": key, "units": {"names": list(opening["names"]), "count": count},
-            "entered": entered,
-            "stretches": [{"unit": s.get("unit"), "from": s["from"], "to": s["to"]}
-                          for s in stretches]}, None
+    return walk_body.check(walk)
 
 
 def _json_safe(value):
@@ -3440,13 +3402,31 @@ def _json_safe(value):
     return value
 
 
-def _walk_answers_for(conn, caller, key):
-    """The walk's on-site answers for the worker, which has no database (R16):
-    read here, within the report's company, as JSON-safe rows. A failed read
-    is logged and the report goes without them -- it must still queue."""
+_UNKNOWN = object()
+
+
+def _walk_companies(conn, folder, date, key):
+    """The companies of the walk's windows in this (already authorized) folder's
+    day -- [] when the walk is not this folder's day; _UNKNOWN, logged, when
+    the lookup failed."""
     try:
         with conn.transaction():
-            rows = walk_answers.for_walk(conn, [caller["company_id"]], key)
+            return inspection_windows.walk_companies(conn, folder, date, key)
+    except Exception:
+        logger.exception("walk %s: its windows could not be read -- no on-site answers", key)
+        return _UNKNOWN
+
+
+def _walk_answers_for(conn, company_ids, key):
+    """The walk's on-site answers for the worker, which has no database (R16):
+    read here as JSON-safe rows, in the WALK's company -- its windows', the
+    site's (R22) -- never the caller's home company. A failed read is logged
+    and the report goes without them -- it must still queue."""
+    if company_ids is _UNKNOWN or not company_ids:
+        return []
+    try:
+        with conn.transaction():
+            rows = walk_answers.for_walk(conn, list(company_ids), key)
         return [{k: _json_safe(v) for k, v in r.items()} for r in rows]
     except Exception:
         logger.exception("walk answers for %s not read -- the report goes without them", key)
@@ -3480,8 +3460,16 @@ def day_report_generate(conn, caller, date, event):
     if gen_error:
         return error(gen_error, 400)
 
-    request_id = uuid.uuid4().hex
     folder = content["folder"]
+    walk_companies = None
+    if walk and generate:
+        # R22: the walk must be this folder's, on this day -- the folder the
+        # assembly above authorized -- before anything of it is read.
+        walk_companies = _walk_companies(conn, folder, date, walk["key"])
+        if walk_companies == []:
+            return error("walk not found for this folder and day", 400)
+
+    request_id = uuid.uuid4().hex
     result_key = f"session_report_results/{folder}/{date}/day/{request_id}.json"
     request_key = f"session_report_requests/{folder}/{date}/day/{request_id}.json"
     artifact = {
@@ -3505,7 +3493,7 @@ def day_report_generate(conn, caller, date, event):
         "resultKey": result_key,
         **({"generate": generate,
             "window": _report_window(body),
-            **({"walk": dict(walk, answers=_walk_answers_for(conn, caller, walk["key"]))}
+            **({"walk": dict(walk, answers=_walk_answers_for(conn, walk_companies, walk["key"]))}
                if walk else {}),
             "excludedTopics": _excluded_topics_for(conn, caller, folder, date),
             "reportFacts": _report_facts(conn, caller["company_id"], folder,
@@ -5291,9 +5279,10 @@ def _report_window(body):
     # covers each and not the gaps. All-or-nothing: one bad stretch and the
     # window is the plain from-to above.
     segs = body.get("segments")
-    # A multi-unit walk (spec 2026-11-03, R21) spans several recordings and
-    # every stop between units, so it may carry up to 60; an ordinary check 20.
-    most = 60 if body.get("walk") else 20
+    # A multi-unit walk (spec 2026-11-03, R21/R24) spans several recordings and
+    # every stop between units, so it may carry up to walk_body.MAX_SEGMENTS
+    # (200); an ordinary check 20.
+    most = walk_body.MAX_SEGMENTS if body.get("walk") else 20
     if isinstance(segs, list) and 1 < len(segs) <= most:
         clean = []
         for sg in segs:
