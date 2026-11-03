@@ -14,7 +14,7 @@ Result: {"user": {id, company_id, folder_name} | None,
          "templates": [{id, name, scope, body}],
          "live_windows": [{name, kind, start_at, end_at, end_source, template_id,
                            report_date, units, entered, walk_key}],
-         "walk": {walk_key: {key, units, entered, sessions, start_at, answers}}
+         "walk": {walk_key: {key, units, entered, sessions, start_at, spans, answers}}
                  -- only when a live window carries a walk_key (spec 2026-11-03)}
         or {"error": "..."}. Never raises: the caller is waiting with a person
         on the other end.
@@ -94,9 +94,11 @@ def _walks(conn, companies, folder, live_windows):
     the companies its own rows are under -- the site's (R22) -- never the
     caller's home company just for being in scope.
 
-    key/units/entered/sessions/answers, plus start_at: the walk's opening
-    start, which check_done needs to take the earlier recordings' words (its
-    live window starts later than the walk)."""
+    key/units/entered/sessions/answers, plus start_at (the opening's start,
+    R27) and spans: [{session, segments: [{from, to}]}], one per window of the
+    walk (its stretches; a window still open has to None), so the gap pass
+    reads only the walk's own speech, never another check done between
+    units (R28)."""
     out = {}
     days = {}
     for w in live_windows or []:
@@ -115,12 +117,18 @@ def _walks(conn, companies, folder, live_windows):
         opening = next((r for c, r in rows if r.get("template_id") and units_mod.walk_key(
             c, folder, date, r["template_id"], r.get("start_at")) == key), rows[0][1])
         owners = list(dict.fromkeys(c for c, _ in rows))
+        spans = [{"session": r.get("session"),
+                  "segments": [{"from": s.get("from"), "to": s.get("to")}
+                               for s in r.get("segments") or [] if isinstance(s, dict)]
+                  or [{"from": r.get("start_at"), "to": r.get("end_at")}]}
+                 for _, r in rows if r.get("session")]
         out[key] = {
             "key": key,
             "units": opening.get("units"),
             "entered": [m for _, r in rows for m in r.get("entered") or [] if isinstance(m, dict)],
             "sessions": list(dict.fromkeys(r["session"] for _, r in rows if r.get("session"))),
-            "start_at": rows[0][1].get("start_at"),
+            "start_at": opening.get("start_at"),
+            "spans": spans,
             "answers": walk_answers.for_walk(conn, owners, key),
         }
     return out
@@ -160,7 +168,13 @@ def _facts(event):
                                                         user.get("company_id")) if c))
         out["live_windows"] = inspection_windows.for_session(
             conn, companies, user.get("folder_name"), "sid%s" % session["session_id"])
-        walks = _walks(conn, companies, user.get("folder_name"), out["live_windows"])
+        try:
+            walks = _walks(conn, companies, user.get("folder_name"), out["live_windows"])
+        except Exception:                             # noqa: BLE001 -- R29
+            # The check still runs, as a single-unit one: a walk that cannot be
+            # read must not cost him the answer.
+            logger.exception("check-gaps-db: walk read failed; answering without the walk")
+            walks = {}
         if walks:
             out["walk"] = walks
     logger.info("check-gaps-db: session=%s templates=%d windows=%d walks=%d",

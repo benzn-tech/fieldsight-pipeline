@@ -19,6 +19,11 @@ number, so they survive a template version that reorders its items. What
 cannot be placed -- an unknown unit, an item no longer in the template, a
 move whose source is not a No -- is kept under `unmatched_answers`.
 
+Each row says where its answer came from: `origin` is "on_site" for a fill,
+an agreement and a move (a move merged into a No keeps that No's origin),
+otherwise "recording" -- what the final check reads to know an item was
+already decided on site.
+
 Each row keeps its BASE (what the recording said, or what a move brought;
 None when not checked) apart from the latest on-site answer, and is redrawn
 from the two whenever an answer lands. So a later answer replaces an earlier
@@ -59,7 +64,7 @@ def _with(comment, note):
 
 def _not_checked(row):
     row.update(answer="", comment=checklist.NOT_COVERED, responsible="", due="",
-               evidence="", refs=[], state="not_checked")
+               evidence="", refs=[], state="not_checked", origin="recording")
 
 
 def _draw(row, base, site, report):
@@ -73,13 +78,14 @@ def _draw(row, base, site, report):
             row.update(copy.deepcopy(base["row"]))
     elif base is None or base["on_site"]:
         at = _hhmm(site)
-        row.update(answer=site["answer"], state="answered", responsible="", due="",
+        row.update(answer=site["answer"], state="answered", responsible="", due="", origin="on_site",
                    comment=_with(site.get("comment"), "(on site%s)" % (", " + at if at else "")),
                    evidence=site.get("quote") or "", refs=[])
     elif base["row"]["answer"] == site["answer"]:
         at = _hhmm(site)
         row.update(copy.deepcopy(base["row"]))
         row["comment"] = _with(row["comment"], "(confirmed on site%s)" % (" " + at if at else ""))
+        row["origin"] = "on_site"
     else:
         rec = base["row"]
         at = _hhmm(site)
@@ -115,9 +121,11 @@ def _moved(src_row, target_row, source, at):
     note = "(moved from %s on site%s)" % (source, ", " + at if at else "")
     moved = copy.deepcopy(src_row)
     moved["comment"] = _with(moved["comment"], note)
+    moved["origin"] = "on_site"
     if target_row["answer"] != "No":
         return moved
     merged = copy.deepcopy(target_row)
+    merged["origin"] = target_row.get("origin") or "recording"
     merged["comment"] = "; ".join(c for c in (target_row["comment"], moved["comment"]) if c)
     merged["refs"] = list(target_row["refs"]) + [r for r in moved["refs"] if r not in target_row["refs"]]
     for k in ("responsible", "due", "evidence"):

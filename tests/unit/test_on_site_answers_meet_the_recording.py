@@ -214,3 +214,46 @@ def test_a_later_answer_replaces_an_earlier_one():
     assert r["state"] == "check"
     assert r["comment"].startswith("On site: Yes (10:22). Recording: No — "
                                    "'The window seal in the bedroom is missing'.")
+
+
+# ---- where each row's answer came from (R25) -------------------------------------
+
+def _origins(got, name):
+    return [r["origin"] for r in _unit(got, name)["rows"]]
+
+
+def test_every_row_the_recording_wrote_says_so():
+    w = _walk()
+    for u in w["units"]:
+        assert {r["origin"] for r in u["rows"]} == {"recording"}
+
+
+def test_a_fill_and_an_agreement_are_on_site():
+    got = overlay.apply(_walk(), [_ans("Unit 1", "Window seals complete", "Yes"),
+                                  _ans("Unit 1", "Handrail fixed", "No")], ITEMS)
+    assert _origins(got, "Unit 1") == ["recording", "on_site", "on_site"]
+
+
+def test_a_disagreement_stays_the_recordings():
+    got = overlay.apply(_walk(), [_ans("Unit 1", "Handrail fixed", "Yes")], ITEMS)
+    assert _row(_unit(got, "Unit 1"), 2)["state"] == "check"
+    assert _origins(got, "Unit 1")[1] == "recording"
+
+
+def test_a_move_is_on_site_and_its_cleared_source_is_not():
+    got = overlay.apply(_walk(), [_ans("Unit 2", "Smoke alarm installed", None, move="Unit 3")],
+                        ITEMS)
+    assert _origins(got, "Unit 3")[0] == "on_site"
+    assert _origins(got, "Unit 2")[0] == "recording"
+
+
+def test_a_move_merged_into_a_no_keeps_that_nos_source():
+    # Onto the recording's own No: still the recording's, so still read back.
+    got = overlay.apply(_walk(), [_ans("Unit 2", "Window seals complete", None, move="Unit 3")],
+                        ITEMS)
+    assert _origins(got, "Unit 3")[2] == "recording"
+    # Onto a No given on site: on site.
+    got = overlay.apply(_walk(), [_ans("Unit 3", "Handrail fixed", "No", comment="loose"),
+                                  _ans("Unit 1", "Handrail fixed", None, move="Unit 3")], ITEMS)
+    row = _row(_unit(got, "Unit 3"), 2)
+    assert row["answer"] == "No" and row["origin"] == "on_site"

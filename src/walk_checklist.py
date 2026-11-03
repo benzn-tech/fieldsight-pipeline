@@ -14,7 +14,8 @@ customer wording and order as an ordinary check. On top of that:
   * a unit named in the opening with no rows still gets its section, every
     item not checked; a unit not named in the opening is flagged.
 
-`rows` is the structured form of each unit's table; `render` turns rows into
+`rows` is the structured form of each unit's table (each row's `origin` is
+"recording"; the on-site overlay changes it); `render` turns rows into
 the table and `summary` into the unit-by-item grid, so a later step that
 rewrites rows (the on-site overlay) re-renders the same way.
 
@@ -196,7 +197,7 @@ def _unit_section(unit, model_rows, items, transcript_text, good, all_dropped, r
         rows.append({"n": n, "item": item, "answer": answer, "comment": comment,
                      "responsible": responsible, "due": due,
                      "evidence": report["evidence"].get(n, ""), "refs": list(line_refs[n + 1]),
-                     "state": "answered" if answer else "not_checked"})
+                     "state": "answered" if answer else "not_checked", "origin": "recording"})
     report["dropped"].extend(all_dropped)
     out = {"unit": unit, "rows": rows, "report": report}
     if good:

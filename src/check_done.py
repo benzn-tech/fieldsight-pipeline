@@ -323,13 +323,6 @@ def say_ok(label, total, not_covered, failed, partial):
     return said
 
 
-# The notes walk_answers_overlay writes on a row an on-site answer decided:
-# "(on site, HH:MM)", "(confirmed on site HH:MM)", "(moved from <unit> on
-# site, HH:MM)". Matched whole, so a recording's comment that merely says
-# "on site" is still read back.
-_ON_SITE_NOTE = re.compile(r"\((?:on site|confirmed on site|moved from [^()]* on site)(?:[ ,][^()]*)?\)")
-
-
 def _fold(text):
     return " ".join((text or "").split()).casefold()
 
@@ -361,7 +354,7 @@ def walk_questions(walk_result, items):
                     open_.append(q)
             elif r["state"] == "not_checked":
                 open_.append(q)
-            elif r.get("answer") == "No" and not _ON_SITE_NOTE.search(r.get("comment") or ""):
+            elif r.get("answer") == "No" and r.get("origin") != "on_site":
                 nos.append(dict(q, kind="confirm_no", comment=r.get("comment") or ""))
         out += open_ + nos
     return out
@@ -525,6 +518,35 @@ def _window_start(window, dates):
         return None
 
 
+def _hms(value):
+    return str(value)[:8] if value else None
+
+
+def walk_spans(walk, current, window):
+    """{session base: [(from "HH:MM:SS", to "HH:MM:SS" or None)]} -- the walk's own
+    windows (R28), so speech of another check done between units is never the
+    walk's. A stretch with no end is still open: it runs to now. The current
+    recording's open window runs from its start to now even when the hop has
+    no span for it."""
+    out = {}
+    for span in (walk or {}).get("spans") or []:
+        base = span.get("session") if isinstance(span, dict) else None
+        if not isinstance(base, str) or not _SESSION_BASE.fullmatch(base):
+            continue
+        for seg in span.get("segments") or []:
+            if isinstance(seg, dict) and _hms(seg.get("from")):
+                out.setdefault(base, []).append((_hms(seg["from"]), _hms(seg.get("to"))))
+    if current not in out and window and _hms(window.get("start_at")):
+        out[current] = [(_hms(window["start_at"]), None)]
+    return out
+
+
+def _in_spans(spans, start, end=None):
+    """`start`..`end` ("HH:MM:SS"; end None = an instant) meets one of `spans`."""
+    end = end or start
+    return bool(start) and any(f <= end and (t is None or start <= t) for f, t in spans or [])
+
+
 def _prompt(template, items, transcript_text, from_window, walk=False):
     # The spoken words are NOT here: what he said is user text, and the only
     # thing that needs naming is the customer's own template. A walk's unit
@@ -629,23 +651,20 @@ def _answer(event, db_hop, s3, bucket, gather, assemble, stt, call_llm, now, tim
     # 3. Transcript so far: stored, plus the uncovered chunks heard here.
     t = now()
     dates = _nz_dates(session, pressed_at)
-    # A walk's earlier recordings: their stored transcripts only, newest
-    # MAX_WALK_SESSIONS with this one. Never heard here (chunk indices are per
-    # recording, so only this one's keys say what is covered).
-    others, walk_partial = [], False
+    # A walk's other recordings: their stored transcripts only, newest
+    # MAX_WALK_SESSIONS with this one, each only where it has a span of the
+    # walk. Never heard here (chunk indices are per recording, so only this
+    # one's keys say what is covered).
+    others, walk_partial, spans = [], False, {}
     if walk:
+        spans = walk_spans(walk, "sid" + sid, window)
         others = [b for b in dict.fromkeys(walk.get("sessions") or [])
-                  if isinstance(b, str) and _SESSION_BASE.fullmatch(b) and b != "sid" + sid]
+                  if isinstance(b, str) and b in spans and b != "sid" + sid]
         walk_partial = len(others) > MAX_WALK_SESSIONS - 1
         others = others[-(MAX_WALK_SESSIONS - 1):]
-        if walk.get("start_at"):
-            window = dict(window, start_at=walk["start_at"])     # the walk opened here
-    other_keys = []
-    for base in others:
-        keys = []
-        for date in dates:
-            keys.extend(gather(bucket, folder, date, base))
-        other_keys.append(keys)
+        # This recording is read from its own first span of the walk.
+        if "sid" + sid in spans:
+            window = dict(window, start_at=min(f for f, _ in spans["sid" + sid]))
     stored_keys = []
     for date in dates:
         stored_keys.extend(gather(bucket, folder, date, "sid" + sid))
@@ -679,14 +698,28 @@ def _answer(event, db_hop, s3, bucket, gather, assemble, stt, call_llm, now, tim
         futures = [(k, pool.submit(_hear, s3, bucket, stt, k)) for k in chosen]
         stt_deadline = stt_end
     # The stored transcript is assembled while the chunks are being heard.
-    turns = []
-    # Each earlier recording on its own: assemble's seam dedup assumes one
-    # session clock. Oldest first, this recording's turns last.
-    for keys in other_keys:
-        keys = _recent_keys(keys, key_floor)
-        if keys:
-            turns.extend(assemble(bucket, keys)[0])
-    turns.extend(assemble(bucket, to_assemble)[0] if to_assemble else [])
+    mine = assemble(bucket, to_assemble)[0] if to_assemble else []
+    # A walk's other recordings, newest first, each on its own (assemble's seam
+    # dedup assumes one session clock), and only while the gap pass would
+    # still get its full LLM_DEADLINE_S (R26); what is not read is partial.
+    read = {}
+    for base in reversed(others):
+        if deadline - now() < LLM_DEADLINE_S + 1:
+            logger.warning("check_gaps: no time left to read %d walk recording(s)",
+                           len(others) - len(read))
+            walk_partial = True
+            break
+        keys = []
+        for date in dates:
+            keys.extend(gather(bucket, folder, date, base))
+        floor_at = _window_start({"start_at": min(f for f, _ in spans[base]),
+                                  "report_date": window.get("report_date")}, dates)
+        keys = _recent_keys(keys, floor_at)
+        read[base] = assemble(bucket, keys)[0] if keys else []
+    # (session base, turn), oldest recording first, this one's last.
+    tagged = [(b, tr) for b in others if b in read for tr in read[b]]
+    tagged += [("sid" + sid, tr) for tr in mine]
+    turns = [tr for _, tr in tagged]
     heard = []
     for key, fut in futures:
         try:
@@ -713,14 +746,25 @@ def _answer(event, db_hop, s3, bucket, gather, assemble, stt, call_llm, now, tim
     times += [chunk_start_local(k) for k, _, _ in heard if chunk_start_local(k)]
     floor = start or (max(times) - timedelta(minutes=LOOKBACK_MIN) if times else None)
     lines = []
-    for tr in turns:
+    for base, tr in tagged:
         at = tr.get("abs_start")
-        if floor is not None and hasattr(at, "strftime") and at < floor:
+        if walk is not None:
+            # A walk: only turns that start inside a span of their own recording.
+            if not (hasattr(at, "strftime") and _in_spans(spans.get(base), _hhmmss(at))):
+                continue
+        elif floor is not None and hasattr(at, "strftime") and at < floor:
             continue
         if (tr.get("text") or "").strip():
             lines.append("[%s] %s" % (_hhmmss(at), tr["text"].strip()))
     # The 2 s chunk overlap is left in: a phrase twice is harmless to evidence_found.
-    for key, text, _ in heard:
+    for key, text, seconds in heard:
+        if walk is not None:
+            # A heard chunk (~30 s) is kept when any of it is inside a span: one
+            # that straddles the window's start holds its first words.
+            began = chunk_start_local(key)
+            ended = began + timedelta(seconds=seconds or 0.0) if began else None
+            if not (began and _in_spans(spans.get("sid" + sid), _hhmmss(began), _hhmmss(ended))):
+                continue
         if text:
             lines.append("[%s] %s" % (_hhmmss(chunk_start_local(key)), text))
     transcript_text = "\n".join(lines)

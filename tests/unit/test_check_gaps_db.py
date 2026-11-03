@@ -213,12 +213,14 @@ def _walk_rows():
     return [
         {"session": "sid" + SID_EARLY, "name": "pre-pour", "template_id": TPL,
          "start_at": _time(9, 30), "units": {"names": ["Unit 1", "Unit 2"], "count": None},
-         "entered": [{"unit": "Unit 1", "at": "09:31"}], "walk_key": WALK},
+         "entered": [{"unit": "Unit 1", "at": "09:31"}], "walk_key": WALK,
+         "segments": [{"from": _time(9, 30), "to": _time(9, 45)}]},
         {"session": "sid" + SID_EARLY, "name": "scaffold", "template_id": uuid.uuid4(),
          "start_at": _time(9, 50), "units": None, "entered": None, "walk_key": None},
         {"session": "sid" + SID, "name": "pre-pour", "template_id": TPL,
          "start_at": _time(10, 1), "units": None,
-         "entered": [{"unit": "Unit 2", "at": "10:02"}], "walk_key": WALK},
+         "entered": [{"unit": "Unit 2", "at": "10:02"}], "walk_key": WALK,
+         "segments": [{"from": _time(10, 1), "to": None}]},
     ]
 
 
@@ -253,6 +255,10 @@ def test_a_live_walk_window_brings_the_whole_walk_keyed_by_its_walk_key(monkeypa
     assert walk["entered"] == [{"unit": "Unit 1", "at": "09:31"}, {"unit": "Unit 2", "at": "10:02"}]
     assert walk["sessions"] == ["sid" + SID_EARLY, "sid" + SID], "oldest first, each once"
     assert walk["start_at"] == "09:30:00"
+    # The walk's own spans, one per window of it: the gap pass reads only these (R28).
+    assert walk["spans"] == [
+        {"session": "sid" + SID_EARLY, "segments": [{"from": "09:30:00", "to": "09:45:00"}]},
+        {"session": "sid" + SID, "segments": [{"from": "10:01:00", "to": None}]}]
     assert walk["answers"][0]["item_text"] == "Wall bracing"
     assert walk["answers"][0]["answered_at"] == "10:04:00"
     # The day is read in the scope the live windows are read in, on the window's date.
@@ -277,3 +283,39 @@ def test_no_walk_window_adds_no_walk_and_reads_nothing_more(monkeypatch):
     assert "walk" not in out
     assert set(out) == {"user", "owner_company_id", "session", "templates", "live_windows"}
     assert seen["day_for"] == [] and seen["answers_for"] == []
+
+
+def test_the_opening_is_found_by_its_key_not_by_being_first(monkeypatch):
+    """A row of the walk earlier than its opening (a backfilled window, another
+    template's) must not lend the walk its units or its start."""
+    early = {"session": "sid" + SID_EARLY, "name": "pre-pour", "template_id": uuid.uuid4(),
+             "start_at": _time(9, 10), "units": {"names": ["Lot 9", "Lot 10"], "count": None},
+             "entered": None, "walk_key": WALK,
+             "segments": [{"from": _time(9, 10), "to": _time(9, 20)}]}
+    live = [{"name": "pre-pour", "template_id": TPL, "start_at": _time(10, 1), "report_date": DAY,
+             "walk_key": WALK}]
+    _wire_walk(monkeypatch, live, [early] + _walk_rows())
+    out = hop.lambda_handler({"caller_sub": "sub-1", "pressed_at": 1760000000}, None)
+    walk = out["walk"][WALK]
+    assert walk["units"] == {"names": ["Unit 1", "Unit 2"], "count": None}
+    assert walk["start_at"] == "09:30:00"
+    assert walk["sessions"] == ["sid" + SID_EARLY, "sid" + SID]
+
+
+def test_a_failed_walk_read_is_a_single_unit_check_not_an_error(monkeypatch, caplog):
+    import logging
+    live = [{"name": "pre-pour", "template_id": TPL, "start_at": _time(10, 1), "report_date": DAY,
+             "walk_key": WALK}]
+    for broken in ("for_day", "for_walk"):
+        _wire_walk(monkeypatch, live, _walk_rows())
+
+        def boom(*a, **k):
+            raise RuntimeError("db down")
+        target = hop.inspection_windows if broken == "for_day" else hop.walk_answers
+        monkeypatch.setattr(target, broken, boom)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            out = hop.lambda_handler({"caller_sub": "sub-1", "pressed_at": 1760000000}, None)
+        assert "error" not in out and "walk" not in out, broken
+        assert out["live_windows"] and out["templates"] is not None
+        assert any("walk" in r.getMessage() for r in caplog.records), broken

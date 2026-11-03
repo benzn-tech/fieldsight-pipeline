@@ -432,10 +432,18 @@ WALK_HEADER = ("Unit | Item no | Answer | Comment | Responsible | Due | Evidence
 EARLIER_WORDS = "unit one formwork braced and plumb"
 
 
+WALK_SPANS = [{"session": "sid" + SID2, "segments": [{"from": "09:30:00", "to": "09:45:00"}]},
+              {"session": "sid" + SID, "segments": [{"from": "10:03:00", "to": None}]}]
+
+
 def walk_facts(sessions=("sid" + SID2, "sid" + SID), answers=(), names=("Unit 1", "Unit 2"),
-               start_at="09:30:00"):
+               start_at="09:30:00", spans=None):
+    if spans is None:
+        spans = [{"session": b, "segments": [{"from": "09:30:00", "to": "09:45:00"}]}
+                 for b in sessions if b != "sid" + SID] + [WALK_SPANS[1]]
     return {WALK: {"key": WALK, "units": {"names": list(names), "count": None}, "entered": [],
-                   "sessions": list(sessions), "start_at": start_at, "answers": list(answers)}}
+                   "sessions": list(sessions), "start_at": start_at, "answers": list(answers),
+                   "spans": spans}}
 
 
 def t2key(i, hhmmss, sid=SID2):
@@ -561,9 +569,9 @@ def test_a_walk_over_two_recordings_reads_both():
     w = WalkWorld(BOTH_UNITS_ROWS)
     out = w.run()
     assert out["status"] == "ok"
-    assert w.gathered == [(FOLDER, DATE, "sid" + SID2), (FOLDER, DATE, "sid" + SID)]
+    assert w.gathered == [(FOLDER, DATE, "sid" + SID), (FOLDER, DATE, "sid" + SID2)]
     # Each recording assembled on its own clock.
-    assert [all(SID2 in k for k in keys) for keys in w.assembled] == [True, False]
+    assert [all(SID2 in k for k in keys) for keys in w.assembled] == [False, True]
     prompt = w.prompts[0][0]
     # The walk opened at 09:30, before this recording's own window (10:03): the
     # earlier recording's words are in, and so is this one's.
@@ -578,7 +586,7 @@ def test_more_than_five_walk_recordings_read_the_newest_five_and_say_partial():
     w = WalkWorld(BOTH_UNITS_ROWS)
     w.db = facts(live_windows=[WALK_WINDOW], walk=walk_facts(sessions=older + ["sid" + SID]))
     out = w.run()
-    assert [g[2] for g in w.gathered] == older[1:] + ["sid" + SID]
+    assert [g[2] for g in w.gathered] == ["sid" + SID] + older[1:][::-1]
     assert out["partial"] is True
 
 
@@ -587,7 +595,7 @@ def test_a_walk_session_that_is_not_a_session_base_is_never_gathered():
     w.db = facts(live_windows=[WALK_WINDOW],
                  walk=walk_facts(sessions=["../../x", "sid" + SID2, "sid" + SID]))
     w.run()
-    assert [g[2] for g in w.gathered] == ["sid" + SID2, "sid" + SID]
+    assert [g[2] for g in w.gathered] == ["sid" + SID, "sid" + SID2]
 
 
 def test_a_walk_with_nothing_heard_leaves_every_unit_open_without_the_model():
@@ -637,6 +645,7 @@ def test_the_walk_log_line_has_counts_and_no_words(caplog):
     body = json.loads(line.split(" ", 1)[1])
     assert body["units"] == 2 and body["questions"] == 5 and body["sessions"] == 2
 
+
 def test_a_recordings_no_that_mentions_the_site_is_still_read_back():
     rows = (DEVICE_ROWS.replace("| north side |", "| not on site yet |")
             + "Unit 2 | 3 | Yes | | | | nothing else here\n")
@@ -657,3 +666,81 @@ def test_the_walk_say_lines_when_nothing_is_open():
         "2 of the 4 units were heard.")
     assert cd.say_walk(label, 3, [], [], False) == (
         "No unit of the Pre-pour Inspection Checklist has been heard yet.")
+
+
+SCAFFOLD_WORDS = "scaffold ties are in and the cover to steel is checked"
+
+
+def test_speech_outside_the_walks_spans_never_answers_a_walk_item():
+    """Between units he did a scaffold check at 09:50 in the earlier recording,
+    and spoke before this recording's walk window opened (10:02:30): neither
+    is the walk's, though both are after its opening."""
+    w = WalkWorld("Unit 1 | 3 | Yes | | | | the cover to steel is checked\n")
+    w.earlier = w.earlier + [{"abs_start": datetime(2026, 10, 20, 9, 50, 0),
+                              "abs_end": datetime(2026, 10, 20, 9, 50, 6), "text": SCAFFOLD_WORDS}]
+    w.turns = [{"abs_start": datetime(2026, 10, 20, 10, 2, 30),
+                "abs_end": datetime(2026, 10, 20, 10, 2, 34),
+                "text": "before the walk window the cover to steel is checked"}] + w.turns
+    out = w.run()
+    prompt = w.prompts[0][0]
+    assert "scaffold" not in prompt and "before the walk window" not in prompt
+    assert EARLIER_WORDS in prompt and SECRET_WORDS in prompt and "north side" in prompt
+    assert {"n": 3, "text": "Cover to steel checked"} in out["walk"]["units"][0]["not_covered"]
+
+
+def test_a_recording_with_no_span_of_the_walk_is_not_read():
+    w = WalkWorld(BOTH_UNITS_ROWS)
+    w.db = facts(live_windows=[WALK_WINDOW], walk=walk_facts(spans=[WALK_SPANS[1]]))
+    w.run()
+    assert [g[2] for g in w.gathered] == ["sid" + SID]
+    assert EARLIER_WORDS not in w.prompts[0][0]
+
+
+class SlowWalkWorld(WalkWorld):
+    """Each assemble costs `cost` seconds of a clock that moves. No raw chunks
+    to hear, and the stored words end 5 s before the press, so nothing else
+    makes the answer partial."""
+
+    def __init__(self, cost, sessions, **over):
+        super().__init__(BOTH_UNITS_ROWS, **over)
+        self.t, self.cost = float(PRESSED + 1), cost
+        self.s3.objects = {k: v for k, v in self.s3.objects.items() if not k.endswith(".wav")}
+        self.turns = [{"abs_start": datetime(2026, 10, 20, 10, 4, 50),
+                       "abs_end": datetime(2026, 10, 20, 10, 4, 55), "text": SECRET_WORDS}]
+        self.db = facts(live_windows=[WALK_WINDOW], walk=walk_facts(sessions=sessions))
+        for b in sessions:
+            self.s3.objects["transcripts/%s/%s/F2SP01_%s_09-35-00_%s_c0000_off0.0_to29.0_srcwav.json"
+                            % (FOLDER, DATE, DATE, b)] = b"{}"
+        for b in sessions:
+            self.s3.objects["transcripts/%s/%s/F2SP01_%s_09-35-00_%s_c0000_off0.0_to29.0_srcwav.json"
+                            % (FOLDER, DATE, DATE, b)] = b"{}"
+
+    def assemble(self, bucket, keys):
+        self.t += self.cost
+        return super().assemble(bucket, keys)
+
+    def run(self, event=None):
+        ev = {"caller_sub": "sub-1", "check_name": "pre-pour check done", "pressed_at": PRESSED}
+        ev.update(event or {})
+        return cd.run(ev, db_hop=self.db_hop, s3=self.s3, bucket="lake", gather=self.gather,
+                      assemble=self.assemble, stt=self.stt, call_llm=self.call_llm,
+                      now=lambda: self.t)
+
+
+def test_walk_reads_stop_in_time_for_the_gap_pass_and_say_partial():
+    older = ["sid%032x" % i for i in range(1, 4)]
+    w = SlowWalkWorld(6, older + ["sid" + SID])
+    out = w.run()
+    # 30 s budget: this recording (t+6), the newest other (t+12), the next
+    # (t+18); then 12 s are left, under LLM_DEADLINE_S + 1, so the oldest is not read.
+    assert [g[2] for g in w.gathered] == ["sid" + SID, older[2], older[1]]
+    assert out["status"] == "ok" and out["partial"] is True
+    assert w.prompts[0][1]["deadline"] == cd.RUN_BUDGET_S - 18 - 1
+
+
+def test_walk_reads_with_time_to_spare_read_every_recording():
+    older = ["sid%032x" % i for i in range(1, 4)]
+    w = SlowWalkWorld(1, older + ["sid" + SID])
+    out = w.run()
+    assert [g[2] for g in w.gathered] == ["sid" + SID] + older[::-1]
+    assert out["partial"] is False
