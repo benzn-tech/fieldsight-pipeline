@@ -8,11 +8,13 @@ owns each moment of it.
 
 Three rules carry the design:
 - A unit is a prefix AND a number. "Unit two", "U2" and "unit-2" are the same
-  unit, so they are written one way ("Unit 2"); "the unit" or "lot of studs" are
-  not a unit. ASR writes numbers as words as often as digits, and inspectors say
+  unit, so they are written one way ("Unit 2"); "the unit", "lot of studs" or
+  "Kitchen" are not a unit. A letter written against the number is kept: "Unit
+  2A" and "Unit 2B" are two townhouses. ASR writes numbers as words as often as digits, and inspectors say
   "lot one fifty" for 150, so both are read.
-- One "room 102" in an ordinary check is not a walk. A walk is an opening that
-  names units or a count, or entering two different units. Anything less
+- One "room 102" in an ordinary check is not a walk, even in the opening. A
+  walk is an opening that names two or more units or a count of two or more, or
+  entering two different units. Anything less
   behaves exactly as checks did before.
 - Time before the first unit, and time a mark cannot reach, is General
   (unit None). A unit's stretch ends at the next mark or at the end of the
@@ -26,7 +28,11 @@ import re
 PREFIXES = ("unit", "lot", "room", "house", "townhouse", "apartment", "apt", "flat", "villa", "u")
 _TITLE = {"u": "Unit"}        # "U2" is how site plans write a unit
 
-_TOKEN = re.compile(r"[a-z]+|\d+")      # "u2" -> "u", "2"; "unit-2" -> "unit", "2"
+# "u2" -> "u", "2"; "unit-2" -> "unit", "2". A number keeps ONE letter written
+# against it ("2a" -> "2a": Unit 2A and Unit 2B are different townhouses), but
+# not a word ("150th" -> "150", "th") and not a letter after a space ("2 a crack").
+_TOKEN = re.compile(r"[a-z]+|\d+[a-z](?![a-z])|\d+")
+_DIGITS = re.compile(r"(\d+)([a-z]?)")
 _ONES = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
          "six": 6, "seven": 7, "eight": 8, "nine": 9}
 _TEENS = {"ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
@@ -84,7 +90,9 @@ def normalize_unit(text):
     for i, w in enumerate(tok):
         if w not in PREFIXES:
             continue
-        n = _number(tok, i + 1)
+        nxt = tok[i + 1] if i + 1 < len(tok) else ""
+        d = _DIGITS.fullmatch(nxt)
+        n = f"{int(d.group(1))}{d.group(2).upper()}" if d else _number(tok, i + 1)
         if n is not None:
             return f"{_TITLE.get(w, w.title())} {n}"
     return None
@@ -113,17 +121,18 @@ def opening_units(names, count):
 
 
 def _entered_unit(mark):
+    """The unit a mark entered, or None. "Kitchen" is not a unit (no number),
+    exactly as in the opening list -- it opens nothing and counts for nothing."""
     u = mark.get("unit") if isinstance(mark, dict) else None
-    if not isinstance(u, str) or not u.strip():
-        return None
-    return normalize_unit(u) or u.strip()
+    return normalize_unit(u) if isinstance(u, str) else None
 
 
 def is_multi_unit(window):
-    """A walk: the opening names units, or counts two or more, or he entered two
-    or more different units. One "room 102" is an ordinary check."""
+    """A walk: the opening names two or more units, or counts two or more, or he
+    entered two or more different units. One "room 102" -- in the opening or
+    spoken along the way -- is an ordinary check (R8)."""
     opening = window.get("units") or {}
-    if opening.get("names"):
+    if len(opening.get("names") or []) >= 2:
         return True
     c = _count(opening.get("count"))
     if c is not None and c >= 2:
@@ -151,29 +160,42 @@ def unit_stretches(window):
 
     Each entered mark opens its unit's stretch; it closes at the next mark or at
     the end of its segment. A segment's time before its first mark is General
-    (unit None) -- the unit he was in before a gap is not assumed. A mark outside
-    every segment opens nothing. "to" None is a window still recording."""
+    (unit None) -- the unit he was in before a gap is not assumed. A mark belongs
+    to at most one segment; one outside every segment opens nothing, except a
+    mark known only to the minute that a segment starts later in that minute.
+    "to" None is a window still recording."""
     segments = window.get("segments") or [{"from": window.get("start_at"),
                                            "to": window.get("end_at")}]
-    marks = []
+    segments = [s for s in segments if s.get("from")]
+
+    def _within(t, s):
+        return t >= s["from"] and (s.get("to") is None or t < s["to"])
+
+    # Each mark belongs to AT MOST ONE segment, so no unit reaches across a gap.
+    placed = []                                   # (segment index, time, unit)
     for m in window.get("entered") or []:
         if not isinstance(m, dict):
             continue
         u, t = _entered_unit(m), _hhmmss(m)
-        if u and t:
-            marks.append((t, u))
-    marks.sort(key=lambda x: x[0])               # stable: same second keeps model order
+        if not (u and t):
+            continue
+        k = next((k for k, s in enumerate(segments) if _within(t, s)), None)
+        if k is None and not m.get("at_s"):
+            # Known only to the minute ("10:41" -> "10:41:00"), inside no
+            # segment: it was spoken in the segment that starts later in that
+            # same minute. A mark with seconds is never moved.
+            k = next((k for k, s in enumerate(segments)
+                      if t < s["from"] and t[:5] == s["from"][:5]), None)
+            if k is not None:
+                t = segments[k]["from"]
+        if k is not None:
+            placed.append((k, t, u))
+    placed.sort(key=lambda x: (x[0], x[1]))      # stable: same second keeps model order
 
     out = []
-    for seg in segments:
-        start, end = seg.get("from"), seg.get("to")
-        if not start:
-            continue
-        # A mark known only to the minute ("10:41" -> "10:41:00") can fall a few
-        # seconds before the segment it was spoken in; inside that minute it
-        # belongs to the segment's start, not to nowhere.
-        inside = [(start if t < start and t[:5] == start[:5] else t, u) for t, u in marks]
-        inside = [(t, u) for t, u in inside if t >= start and (end is None or t < end)]
+    for k, seg in enumerate(segments):
+        start, end = seg["from"], seg.get("to")
+        inside = [(t, u) for j, t, u in placed if j == k]
         cursor, unit = start, None
         for t, u in inside:
             if t > cursor:

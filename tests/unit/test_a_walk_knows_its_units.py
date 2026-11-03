@@ -56,7 +56,27 @@ def test_two_entered_units_make_a_walk():
 def test_a_count_makes_a_walk():
     assert units.is_multi_unit({"units": {"names": [], "count": 5}, "entered": []}) is True
     assert units.is_multi_unit({"units": {"names": [], "count": 1}, "entered": []}) is False
-    assert units.is_multi_unit({"units": {"names": ["Lot 150"], "count": None}}) is True
+    # R8: one unit named in the opening is an ordinary check; two are a walk
+    assert units.is_multi_unit({"units": {"names": ["Lot 150"], "count": None}}) is False
+    assert units.is_multi_unit({"units": {"names": ["Lot 150", "Lot 151"], "count": None}}) is True
+
+
+def test_a_letter_after_the_number_is_part_of_the_unit():
+    """R7: "Unit 2A" and "Unit 2B" are two units; "unit 2 a crack" is Unit 2."""
+    assert units.normalize_unit("unit 2a") == "Unit 2A"
+    assert units.normalize_unit("U2B") == "Unit 2B"
+    assert units.normalize_unit("Unit 2A") == "Unit 2A"
+    assert units.normalize_unit("unit 2 a crack in the plate") == "Unit 2"
+    assert units.normalize_unit("lot 150th") == "Lot 150"
+    w = {"entered": [_mark("Unit 2A", "10:41"), _mark("Unit 2B", "10:52")]}
+    assert units.is_multi_unit(w) is True
+
+
+def test_a_room_name_without_a_number_is_not_an_entered_unit():
+    w = {"start_at": "10:00:00", "end_at": "10:30:00",
+         "entered": [_mark("Kitchen", "10:05"), _mark("Bathroom", "10:15")]}
+    assert units.is_multi_unit(w) is False
+    assert units.unit_stretches(w) == [{"unit": None, "from": "10:00:00", "to": "10:30:00"}]
 
 
 def test_stretches_close_at_the_next_unit_and_at_a_segment_end():
@@ -92,6 +112,26 @@ def test_a_mark_on_the_minute_is_not_lost_before_its_segment():
     """"now in unit one" at 10:00:20, but the model gave only "10:00"."""
     w = {"start_at": "10:00:07", "end_at": "10:30:00", "entered": [_mark("Unit 1", "10:00")]}
     assert units.unit_stretches(w) == [{"unit": "Unit 1", "from": "10:00:07", "to": "10:30:00"}]
+
+
+def test_a_minute_mark_opens_a_stretch_in_one_segment_only():
+    """"10:41" is inside the first segment; the second segment (after a gap)
+    does not inherit Unit 1 through the minute clamp."""
+    w = {"start_at": "10:40:00", "end_at": "10:50:00",
+         "segments": [{"from": "10:40:00", "to": "10:41:05"},
+                      {"from": "10:41:30", "to": "10:50:00"}],
+         "entered": [_mark("Unit 1", "10:41")]}
+    assert units.unit_stretches(w) == [
+        {"unit": None, "from": "10:40:00", "to": "10:41:00"},
+        {"unit": "Unit 1", "from": "10:41:00", "to": "10:41:05"},
+        {"unit": None, "from": "10:41:30", "to": "10:50:00"},
+    ]
+
+
+def test_a_mark_with_seconds_before_a_segment_is_not_moved():
+    w = {"start_at": "10:00:07", "end_at": "10:30:00",
+         "entered": [_mark("Unit 1", "10:00", "10:00:03")]}
+    assert units.unit_stretches(w) == [{"unit": None, "from": "10:00:07", "to": "10:30:00"}]
 
 
 def test_before_the_first_unit_is_general():
