@@ -278,11 +278,135 @@ def test_a_walk_part_that_fails_fails_the_report(monkeypatch):
     assert calls[0]["deadline"] == 30
 
 
-def test_a_walk_template_with_two_checklists_is_refused_not_guessed():
-    two = dict(TEMPLATE, sections=TEMPLATE["sections"] + [
-        {"title": "Second", "purpose": "p", "kind": "checklist", "items": ["x"]}])
-    with pytest.raises(ValueError, match="exactly one checklist"):
-        walk_report.the_checklist(two)
+TWO = dict(TEMPLATE, sections=TEMPLATE["sections"] + [
+    {"title": "Second", "purpose": "p", "kind": "checklist", "items": ["Bracing fixed"]}])
+
+
+def test_a_walk_template_with_two_checklists_walks_all_its_items_under_the_template_name(run):
+    assert walk_report.the_checklist(TWO, "Framing") == ("Framing", ITEMS + ["Bracing fixed"])
+    assert walk_report.the_checklist(TEMPLATE, "Framing") == (TITLE, ITEMS)
+    meta, sections, prompts = run(walk=WALK, template=TWO)
+    one = "Unit 1 — Framing"
+    assert _titles(sections) == ["Inspection Details", "General", one, "Unit 2 — Framing",
+                                 "Unit 3 — Framing", "Summary", "Anything else"]
+    walk_prompt = next(p for p in prompts if IS_WALK in p)
+    assert "4. Bracing fixed" in walk_prompt
+    assert meta["walk"]["summary"]["columns"] == ITEMS + ["Bracing fixed"]
+    assert list(meta["checklists"])[0] == one
+
+
+def test_a_walk_with_no_checklist_is_the_ordinary_report_and_says_so(run, caplog):
+    caplog.set_level(logging.INFO)
+    plain = dict(TEMPLATE, sections=TEMPLATE["sections"][:1])
+    meta, sections, prompts = run(walk=WALK, template=plain)
+    assert "walk" not in meta and len(prompts) == 1
+    assert _titles(sections) == ["Inspection Details", "Anything else"]
+    assert any("no checklist" in r.getMessage() for r in caplog.records)
+    assert walk_report.the_checklist(plain, "Framing") is None
+
+
+# ---- the header stays at the top --------------------------------------------------
+
+HEADER = {"title": "Report Details", "purpose": "Who, where, when.", "kind": "header"}
+
+
+def test_a_header_placed_before_the_checklist_stays_at_the_top(run):
+    tpl = dict(TEMPLATE, sections=[HEADER, TEMPLATE["sections"][1], TEMPLATE["sections"][0]])
+    meta, sections, _ = run(walk=WALK, template=tpl)
+    assert _titles(sections) == ["Report Details", "Inspection Details", "General", U1, U2, U3,
+                                 "Summary", "Anything else"]
+
+
+def test_a_header_right_before_the_checklist_goes_before_general(run):
+    tpl = dict(TEMPLATE, sections=[TEMPLATE["sections"][0], HEADER, TEMPLATE["sections"][1]])
+    meta, sections, _ = run(walk=WALK, template=tpl)
+    assert _titles(sections) == ["Inspection Details", "Report Details", "General", U1, U2, U3,
+                                 "Summary", "Anything else"]
+
+
+def test_a_header_placed_before_the_checklist_stays_at_the_top_without_general(run):
+    answer = "\n".join(WALK_ANSWER.splitlines()[:4])      # no General row
+    tpl = dict(TEMPLATE, sections=[TEMPLATE["sections"][0], HEADER, TEMPLATE["sections"][1]])
+    meta, sections, _ = run(walk=WALK, template=tpl, walk_answer=answer)
+    assert _titles(sections) == ["Inspection Details", "Report Details", U1, U2,
+                                 "Summary", "Anything else"]
+
+
+# ---- the ordinary placement's place hints ---------------------------------------------
+
+def test_an_untimed_photo_is_placed_by_its_own_place_not_a_timed_ones(run, monkeypatch):
+    seen = {}
+    real = sr._place_photos
+
+    def spy(sections, streams, **kw):
+        seen["streams"], seen["places"] = streams, kw.get("places")
+        return real(sections, streams, **kw)
+    monkeypatch.setattr(sr, "_place_photos", spy)
+    monkeypatch.setattr(sr.photo_binding, "place_at",
+                        lambda markers, when: "Kitchen" if when else None)
+    names = ["Ben_2026-11-03_09-02-00.jpg", "IMG_no_time.jpg"]
+    offer = [{"ref": "t0", "title": "Walk", "time_range": "09:00 - 09:05", "category": "x",
+              "content": [], "photos": 2, "photo_names": names, "photos_left_out": 0}]
+    run(walk=WALK, offer=offer, streams={"t0": ["p-unit1", "p-untimed"]})
+    assert seen["streams"] == {"t0": ["p-untimed"]}
+    assert seen["places"] == {"t0": [None]}, "the untimed photo's place, not the timed one's"
+
+
+def test_place_photos_returns_the_names_left():
+    secs = [{"title": U1, "unit": "Unit 1", "paragraphs": [], "line_refs": []}]
+    offer = [{"ref": "t0", "photo_names": ["a_2026-11-03_09-02-00.jpg", "b.jpg"]}]
+    placed, left, names = walk_report.place_photos(
+        secs, {"t0": ["A", "B"]}, offer, STRETCHES, sr.photo_binding.photo_time)
+    assert (placed, left, names) == (1, {"t0": ["B"]}, {"t0": ["b.jpg"]})
+
+
+# ---- calls not left running -------------------------------------------------------------
+
+class FakeFuture:
+    def __init__(self, value=None, error=None):
+        self.value, self.error, self.cancelled, self.waited = value, error, False, False
+
+    def cancel(self):
+        self.cancelled = True
+        return True
+
+    def result(self, timeout=None):
+        self.waited = True
+        if self.error:
+            raise self.error
+        return self.value
+
+
+def test_a_failed_main_call_cancels_the_walk_calls(run, monkeypatch):
+    futures = [FakeFuture("x"), FakeFuture("y")]
+    monkeypatch.setattr(sr, "_start_walk_calls", lambda *a, **k: futures)
+    with pytest.raises(RuntimeError, match="empty answer"):
+        run(walk=WALK, main_answer="")
+    assert all(f.cancelled and not f.waited for f in futures)
+
+
+def test_a_failed_walk_part_cancels_the_rest_and_does_not_wait_on_them(run, monkeypatch):
+    futures = [FakeFuture(error=RuntimeError("walk checklist: down")), FakeFuture("y")]
+    monkeypatch.setattr(sr, "_start_walk_calls", lambda *a, **k: futures)
+    with pytest.raises(RuntimeError, match="walk checklist: down"):
+        run(walk=WALK)
+    assert futures[1].cancelled and not futures[1].waited
+
+
+# ---- assembly edges ---------------------------------------------------------------------
+
+def test_a_catch_all_with_no_title_does_not_crash_the_assembly():
+    tpl = dict(TEMPLATE, catch_all={"title": None, "purpose": "x"})
+    secs = walk_report.sections(tpl, [{"title": "Inspection Details", "paragraphs": ["a"]}],
+                                {"units": [], "general": [], "summary": {"columns": ITEMS, "rows": []}},
+                                "Framing")
+    assert _titles(secs) == ["Inspection Details"]
+
+
+def test_no_unit_rows_means_no_summary():
+    secs = walk_report.sections(TEMPLATE, [], {"units": [], "general": [{"comment": "c", "evidence": "e"}],
+                                               "summary": {"columns": ITEMS, "rows": []}}, "Framing")
+    assert _titles(secs) == ["General"]
 
 
 # ---- no walk: today's report ------------------------------------------------------------

@@ -957,11 +957,27 @@ def _walk_answers(walk):
     return answers
 
 
-def _walk_sections(walk, template, prose, futures, items, turns, date):
+def _cancel(futures):
+    """Cancel the walk calls that have not started; the running ones are not
+    waited on (the pool was shut down without waiting)."""
+    for f in futures or []:
+        f.cancel()
+
+
+def _walk_sections(walk, template, prose, futures, items, turns, date, name=None):
     """(prose, checklist_reports, result) of a walk: the walk calls' texts in
     part order, one checklist per unit (walk_checklist.build), the on-site
-    answers laid over it, and the report's sections (walk_report.sections)."""
-    text = "\n".join(f.result() for f in futures)
+    answers laid over it, and the report's sections (walk_report.sections).
+    A part that failed fails the report, and the parts after it are
+    cancelled rather than waited on."""
+    texts = []
+    for i, f in enumerate(futures):
+        try:
+            texts.append(f.result())
+        except Exception:
+            _cancel(futures[i + 1:])
+            raise
+    text = "\n".join(texts)
     transcript = "\n".join(t["line"] for t in turns)
     built = walk_checklist.build(text, items, transcript, walk.get("units"),
                                  walk.get("stretches"), report_date=date)
@@ -971,7 +987,7 @@ def _walk_sections(walk, template, prose, futures, items, turns, date):
     except Exception:                             # noqa: BLE001 -- the report still goes out
         logger.exception("walk answers: could not be applied -- written without on-site answers")
         laid = walk_answers_overlay.apply(built, [], items)
-    secs = walk_report.sections(template, prose, laid)
+    secs = walk_report.sections(template, prose, laid, name)
     return secs, walk_report.reports(secs), walk_report.result(laid, walk.get("key"))
 
 
@@ -1072,8 +1088,13 @@ def _generate_document(artifact, context=None):
     # call(s), one table for the whole walk, and the main call is given the
     # plan without it. Without `walk` nothing below changes.
     walk = artifact.get("walk") or None
+    walk_name = gen.get("templateName") or template.get("name")
+    walk_list = walk_report.the_checklist(template, walk_name) if walk else None
+    if walk and walk_list is None:
+        logger.warning("walk: the template has no checklist -- written as an ordinary report")
+        walk = None
     if walk:
-        walk_items = walk_report.the_checklist(template)[1]
+        walk_items = walk_list[1]
         model_template = walk_report.without_checklists(model_template)
     code_sections, code_meta = report_facts.build(
         code_placements, artifact, client, S3_BUCKET, nz_time.nz_today().isoformat(),
@@ -1118,6 +1139,8 @@ def _generate_document(artifact, context=None):
             text, err = llm_utils.call_llm(prompt, max_tokens=12000, deadline=left,
                                            enable_thinking=False,
                                            caller="session_report_retry")
+    if walk_calls and (err or not (text or "").strip()):
+        _cancel(walk_calls)
     if err or not (text or "").strip():
         raise RuntimeError(err or "empty answer from model")
 
@@ -1129,7 +1152,7 @@ def _generate_document(artifact, context=None):
     # wording, and every item nobody addressed stays blank (checklist.py).
     if walk:
         prose, checklist_reports, walk_result = _walk_sections(
-            walk, template, prose, walk_calls, walk_items, turns, date)
+            walk, template, prose, walk_calls, walk_items, turns, date, walk_name)
     else:
         checklist_reports = checklist.apply(
             prose, template, "\n".join(t["line"] for t in turns), report_date=date)
@@ -1146,7 +1169,7 @@ def _generate_document(artifact, context=None):
     if walk:
         # Each photograph to the unit he was in when it was taken; what has no
         # time goes through the ordinary placement below.
-        walk_placed, walk_streams_left = walk_report.place_photos(
+        walk_placed, walk_streams_left, walk_names_left = walk_report.place_photos(
             prose, photo_streams, topic_offer, walk.get("stretches"), photo_binding.photo_time)
     at_line, at_section, orphaned = _place_photos(
         prose + ([note] if note else []), walk_streams_left if walk else photo_streams,
@@ -1158,7 +1181,9 @@ def _generate_document(artifact, context=None):
         # the same stays the binding used (photo_binding.place_at).
         places={t["ref"]: [photo_binding.place_at(
                     (artifact.get("reportFacts") or {}).get("locations") or [],
-                    photo_binding.photo_time(n)) for n in t.get("photo_names") or []]
+                    photo_binding.photo_time(n))
+                    for n in ((walk_names_left.get(t["ref"]) or []) if walk
+                              else t.get("photo_names") or [])]
                 for t in topic_offer})
     at_section += walk_placed
     placed = at_line + at_section
@@ -1189,6 +1214,10 @@ def _generate_document(artifact, context=None):
         tail["line_refs"] = list(tail.get("line_refs") or []) + [[]]
 
     # Put in after the photographs were placed, so none can fall to them.
+    if walk:
+        # The header stays at the top of a walk report (R19), before General
+        # and the units, wherever the plan anchored it to the checklist.
+        code_placements = walk_report.anchor_placements(code_placements, template, prose)
     report_facts.insert(prose, code_placements, code_sections,
                         (template.get("catch_all") or {}).get("title"))
 

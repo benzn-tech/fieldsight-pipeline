@@ -45,15 +45,27 @@ def _all(sections):
     return out
 
 
-def the_checklist(template):
-    """(title, items) of the walk's checklist, the title as the customer wrote
-    it. A walk template has exactly one checklist section; with none or more
-    than one this raises rather than guessing a layout (NEEDS_CONTEXT)."""
+def the_checklist(template, name=None):
+    """(title, items) the walk is checked against, or None when the template
+    has no checklist section (the request is then an ordinary report).
+
+    One checklist section: its title as the customer wrote it, and its items.
+    More than one (R18): ALL their items, concatenated in template order, as
+    one walk list, titled with the template's `name` (else the first
+    checklist's title)."""
     found = [s for s in _all((template or {}).get("sections")) if _is_checklist(s)]
-    if len(found) != 1:
-        raise ValueError("a walk report needs exactly one checklist section; "
-                         "this template has %d" % len(found))
-    return (found[0].get("title") or "").strip(), [str(i) for i in found[0]["items"]]
+    if not found:
+        return None
+    first = (found[0].get("title") or "").strip()
+    if len(found) == 1:
+        return first, [str(i) for i in found[0]["items"]]
+    return ((name or "").strip() or first), [str(i) for s in found for i in s["items"]]
+
+
+def checklist_titles(template):
+    """Every checklist section's title, lower-cased."""
+    return {(s.get("title") or "").strip().lower()
+            for s in _all((template or {}).get("sections")) if _is_checklist(s)}
 
 
 def without_checklists(template):
@@ -145,36 +157,66 @@ def general_section(entries):
     return _section(GENERAL, paragraphs, [[] for _ in paragraphs])
 
 
-def sections(template, main_prose, walk):
+def sections(template, main_prose, walk, name=None):
     """The walk report's sections (_prose_sections-shaped), in report order.
 
     `walk` is walk_checklist.build's output, after walk_answers_overlay.apply.
     A section the main call wrote under the checklist's own title is dropped:
     the customer's checklist is the walk's, never a table the model wrote
-    beside it. Each unit section carries `unit` and its `report`."""
-    title, _ = the_checklist(template)
-    catch = ((template or {}).get("catch_all") or {}).get("title", "").strip().lower()
+    beside it. Each unit section carries `unit` and its `report`; every
+    section made here carries `walk: True`. `name` is the template's name
+    (the_checklist)."""
+    title, _ = the_checklist(template, name)
+    drop = checklist_titles(template) | {title.lower()}
+    catch = (((template or {}).get("catch_all") or {}).get("title") or "").strip().lower()
     head, tail = [], []
     for s in main_prose or []:
         t = (s.get("title") or "").strip().lower()
-        if t and t == title.lower():
+        if t and t in drop:
             continue
         (tail if catch and t == catch else head).append(s)
     out = list(head)
     if walk.get("general"):
-        out.append(general_section(walk["general"]))
+        out.append(dict(general_section(walk["general"]), walk=True))
     for u in walk.get("units") or []:
         paragraphs, line_refs = wc.render(u)
         if u.get("flagged_unlisted"):
             paragraphs, line_refs = [UNLISTED] + paragraphs, [[]] + line_refs
         out.append(_section(unit_title(u["unit"], title), paragraphs, line_refs,
-                            unit=u["unit"], report=u["report"]))
+                            unit=u["unit"], report=u["report"], walk=True))
     summ = walk.get("summary") or {"columns": [], "rows": []}
-    cols = ["Unit"] + [_cell(c) for c in summ["columns"]]
-    paragraphs = [" | ".join(cols), " | ".join(["---"] * len(cols))]
-    paragraphs += [" | ".join(_cell(c) for c in row) for row in summ["rows"]]
-    out.append(_section(SUMMARY, paragraphs, [[] for _ in paragraphs]))
+    if summ.get("rows"):
+        cols = ["Unit"] + [_cell(c) for c in summ["columns"]]
+        paragraphs = [" | ".join(cols), " | ".join(["---"] * len(cols))]
+        paragraphs += [" | ".join(_cell(c) for c in row) for row in summ["rows"]]
+        out.append(_section(SUMMARY, paragraphs, [[] for _ in paragraphs], walk=True))
     return out + tail
+
+
+def anchor_placements(placements, template, secs):
+    """The code sections' placements (report_facts.split_plan), re-anchored
+    for the walk report (R19): a header the plan put before the checklist --
+    or before a section the answer does not have -- stays at the TOP, before
+    General and the units. It goes in front of the first section the plan has
+    after its anchor that is still above the walk's sections; else in front
+    of the walk's first section. A placement before the catch-all, or at the
+    end, is left as it is."""
+    first_walk = next((k for k, s in enumerate(secs) if s.get("walk")), None)
+    if first_walk is None:
+        return placements
+    head = [(s.get("title") or "").strip().lower() for s in secs[:first_walk]]
+    catch = (((template or {}).get("catch_all") or {}).get("title") or "").strip().lower()
+    plan = [(s.get("title") or "").strip().lower() for s in (template or {}).get("sections") or []]
+    out = []
+    for p in placements:
+        before = p.get("before")
+        if not before or before in head or before == catch:
+            out.append(p)
+            continue
+        later = plan[plan.index(before) + 1:] if before in plan else []
+        to = next((t for t in later if t in head), None)
+        out.append(dict(p, before=to or (secs[first_walk].get("title") or "").strip().lower()))
+    return out
 
 
 def reports(secs):
@@ -189,11 +231,12 @@ def place_photos(secs, streams_by_ref, offer, stretches, photo_time):
     section -- never guessed into a unit. A General section is added, before
     the first unit, when a photograph needs one and there was none.
 
-    Returns (placed, left): the count placed here, and the streams_by_ref of
-    the photographs whose time is not known, for the ordinary placement."""
+    Returns (placed, left, left_names): the count placed here, and the
+    streams_by_ref of the photographs whose time is not known -- with their
+    file names, aligned -- for the ordinary placement."""
     by_unit = {s["unit"]: s for s in secs if "unit" in s}
-    general = next((s for s in secs if s.get("title") == GENERAL and "unit" not in s), None)
-    placed, left = 0, {}
+    general = next((s for s in secs if s.get("walk") and s.get("title") == GENERAL), None)
+    placed, left, left_names = 0, {}, {}
     for t in offer or []:
         ref = t["ref"]
         streams = list((streams_by_ref or {}).get(ref) or [])
@@ -202,17 +245,18 @@ def place_photos(secs, streams_by_ref, offer, stretches, photo_time):
             when = photo_time(names[i]) if i < len(names) else None
             if not when:
                 left.setdefault(ref, []).append(stream)
+                left_names.setdefault(ref, []).append(names[i] if i < len(names) else None)
                 continue
             target = by_unit.get(units_mod.unit_at(stretches, when))
             if target is None:
                 if general is None:
-                    general = general_section([])
+                    general = dict(general_section([]), walk=True)
                     at = next((k for k, s in enumerate(secs) if "unit" in s), len(secs))
                     secs.insert(at, general)
                 target = general
             target["photo_streams"] = (target.get("photo_streams") or []) + [stream]
             placed += 1
-    return placed, left
+    return placed, left, left_names
 
 
 def result(walk, key):
