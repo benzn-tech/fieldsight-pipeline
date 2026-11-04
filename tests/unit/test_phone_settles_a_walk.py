@@ -564,3 +564,14 @@ def test_a_read_back_answered_on_the_phone_drops_out_of_the_final_checks_list(wo
 def test_neither_a_report_nor_a_final_check_is_not_ready(world):
     world["report"], world["final"] = None, None
     assert _get(world) == (404, {"error": "not ready"})
+
+
+def test_a_newer_final_check_with_nothing_open_empties_the_list(world):
+    """The device said all covered: an older report's open items are not shown."""
+    world["s3"].objects[RESULT_KEY] = _result(
+        [_unit("Unit 1", not_covered=["Insulation"]), _unit("Unit 2"), _unit("Unit 3")])
+    world["final"] = _final(QUEUED + timedelta(minutes=1), [])
+    status, body = _get(world)
+    assert (status, body["source"]) == (200, "final_check")
+    assert body["units"] == [{"unit": "Unit 1", "items": []}, {"unit": "Unit 2", "items": []},
+                             {"unit": "Unit 3", "items": []}]

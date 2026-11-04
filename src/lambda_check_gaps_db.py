@@ -36,15 +36,19 @@ Result: {"status": "saved", "id", "company_id", "folder", "date", "walk_key"}
 Event:  {"action": "store_final_check", "caller_sub", "walk_key",
          "questions": [{"kind": "not_checked" | "confirm_no", "unit", "item_text",
                         "comment"}]}   (at most 400; multi-unit walks, R41)
-Result: {"status": "saved", "id", "walk_key", "questions": <count>}
+Result: {"status": "saved", "id", "walk_key", "questions": <count>, "skipped": <count>}
         or {"error": "..."} with nothing written.
         The hop's second write: one walk_final_checks row, committed -- the
-        open questions a final check left, which GET /open serves to the phone
-        until a newer walk report exists. The same caller and walk checks as
-        write_walk_answer: the walk is the caller's (his folder), every unit is
-        a unit of the walk and every item an item of its checklist (stored in
-        the template's wording, the unit normalized), under the walk's company
-        (R22).
+        open questions a final check left ([] when nothing is open), which GET
+        /open serves to the phone until a newer walk report exists. Sent
+        fire-and-forget (Event) by CheckGaps (R42). The same caller and walk
+        checks as write_walk_answer -- the walk is the caller's (his folder),
+        under the walk's company (R22) -- refuse the write, as does a list that
+        is not one or has over 400 entries. A question that does not fit (unit
+        not of the walk, item not of its checklist, malformed) is skipped and
+        counted; the rest are stored, in the template's wording, the unit
+        normalized. Result also carries "skipped"; a non-empty list of which
+        nothing fits is refused ("no question fits the walk").
 
 The only person this reads about is `caller_sub`, which the Ask worker took from
 the API authorizer. No session, folder or company is accepted from the event.
@@ -229,8 +233,9 @@ def _store_final_check(event):
     """Its own transaction, like _write_walk_answer. Counts only in the log."""
     with get_connection() as conn:
         out = store_final_check(conn, event)
-    logger.info("check-gaps-db: store_final_check status=%s questions=%s",
-                out.get("status") or "error:%s" % out.get("error"), out.get("questions", 0))
+    logger.info("check-gaps-db: store_final_check status=%s questions=%s skipped=%s",
+                out.get("status") or "error:%s" % out.get("error"), out.get("questions", 0),
+                out.get("skipped", 0))
     return _jsonable(out)
 
 
@@ -250,27 +255,33 @@ def store_final_check(conn, event):
     if not isinstance(key, str) or not WALK_KEY_RE.match(key):
         return {"error": "walk_key invalid"}
     questions = event.get("questions")
-    if (not isinstance(questions, list) or len(questions) > MAX_QUESTIONS
-            or not all(_question_shape_ok(q) for q in questions)):
+    if not isinstance(questions, list) or len(questions) > MAX_QUESTIONS:
         return {"error": "questions invalid"}
 
     walk, err = _caller_walk(conn, sub, key)
     if err:
         return err
+    # A question that does not fit (a malformed entry, a unit no longer in the
+    # walk, an item the template lost mid-day) is left out and counted; the
+    # rest are stored. [] is a final check with nothing open, and is stored.
     stored = []
     for q in questions:
+        if not _question_shape_ok(q):
+            continue
         unit, _, why = units_mod.answer_units(walk["units"], q["unit"])
-        if why:
-            return {"error": why}
-        item = checklist.item_in(walk["body"], q["item_text"])
+        item = None if why else checklist.item_in(walk["body"], q["item_text"])
         if item is None:
-            return {"error": "item not in checklist"}
+            continue
         stored.append({"kind": q["kind"], "unit": unit, "item_text": item,
                        "comment": (q.get("comment") or "")[:MAX_COMMENT]})
+    if questions and not stored:
+        # Nothing fits: not "nothing open", which would empty the phone's list.
+        return {"error": "no question fits the walk", "skipped": len(questions)}
     new_id = walk_final_checks.add(conn, {
         "company_id": walk["company"], "user_folder": walk["folder"],
         "report_date": walk["date"], "walk_key": key, "questions": stored})
-    return {"status": "saved", "id": new_id, "walk_key": key, "questions": len(stored)}
+    return {"status": "saved", "id": new_id, "walk_key": key, "questions": len(stored),
+            "skipped": len(questions) - len(stored)}
 
 
 def write_walk_answer(conn, event):

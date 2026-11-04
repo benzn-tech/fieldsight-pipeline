@@ -188,6 +188,21 @@ def test_a_refused_final_check_stores_nothing_in_postgres(db):
     other = _walk(db, folder="Someone")
     assert hop.store_final_check(db, _store(w, walk_key=other["key"])) == {"error": "walk not found"}
     bad = [{"kind": "not_checked", "unit": "Unit 7", "item_text": "wall bracing", "comment": ""}]
-    assert hop.store_final_check(db, _store(w, questions=bad)) == {"error": "unit not in walk"}
+    assert hop.store_final_check(db, _store(w, questions=bad)) == {
+        "error": "no question fits the walk", "skipped": 1}
     assert db.execute("SELECT count(*) FROM walk_final_checks WHERE walk_key IN (%s, %s)",
                       (w["key"], other["key"])).fetchone() == (0,)
+
+
+def test_an_unfit_question_is_skipped_and_the_rest_stored_in_postgres(db):
+    w = _walk(db)
+    qs = [{"kind": "not_checked", "unit": "Unit 7", "item_text": "wall bracing", "comment": ""},
+          {"kind": "confirm_no", "unit": "unit 1", "item_text": "wall bracing", "comment": "c"}]
+    out = hop.store_final_check(db, _store(w, questions=qs))
+    assert (out["questions"], out["skipped"]) == (1, 1)
+    assert wfc.latest(db, [w["site_co"]], w["key"])["questions"] == [
+        {"kind": "confirm_no", "unit": "Unit 1", "item_text": "Wall bracing", "comment": "c"}]
+    db.execute("UPDATE walk_final_checks SET created_at = now() - interval '1 minute' "
+               "WHERE walk_key = %s", (w["key"],))          # one transaction: now() ties
+    assert hop.store_final_check(db, _store(w, questions=[]))["questions"] == 0
+    assert wfc.latest(db, [w["site_co"]], w["key"])["questions"] == []

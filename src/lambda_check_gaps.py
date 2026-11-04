@@ -102,6 +102,18 @@ def db_hop(payload):
     return body
 
 
+def store_final_check(payload):
+    """The final check's questions to the hop's store_final_check, fire and
+    forget (R42): an async (Event) invoke of the same CheckGapsDb function and
+    permission as db_hop, so the person's answer never waits on the write.
+    Returns None; raises when it cannot be sent -- check_done logs that and
+    changes nothing."""
+    if not CHECK_GAPS_DB_FUNCTION:
+        raise RuntimeError("CHECK_GAPS_DB_FUNCTION not set")
+    _get_lambda().invoke(FunctionName=CHECK_GAPS_DB_FUNCTION, InvocationType="Event",
+                         Payload=json.dumps(payload))
+
+
 def requeue_walk(saved):
     """The walk report again, with the answer just written: an async (Event)
     invoke of item-writer, which runs checklist_reports.requeue_walk in the VPC
@@ -177,4 +189,5 @@ def lambda_handler(event, context):
         budget = context.get_remaining_time_in_millis() / 1000.0 - RETURN_RESERVE_S
     return check_done.run(event or {}, db_hop=db_hop, s3=_get_s3(), bucket=S3_BUCKET,
                           gather=_gather, assemble=_assemble, stt=stt,
-                          call_llm=llm_utils.call_llm, budget_s=budget)
+                          call_llm=llm_utils.call_llm, budget_s=budget,
+                          store_final_check=store_final_check)

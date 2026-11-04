@@ -687,14 +687,16 @@ def _prompt(template, items, transcript_text, from_window, walk=False):
 
 
 def run(event, *, db_hop, s3, bucket, gather, assemble, stt, call_llm, now=time.time,
-        budget_s=None):
+        budget_s=None, store_final_check=None):
     """One "check done" ask -> the response dict (spec "Response"). Never raises.
 
     db_hop(payload) -> the CheckGapsDb facts; gather(bucket, folder, date,
     session_base) / assemble(bucket, keys) -> lambda_extract_session's stored
     transcript; stt(bytes, filename) -> text, or None when there is no Ask key;
     call_llm(prompt, **kw) -> (text, error). `budget_s` (the handler's remaining
-    Lambda time) can only shrink RUN_BUDGET_S, never extend it."""
+    Lambda time) can only shrink RUN_BUDGET_S, never extend it.
+    store_final_check(payload) sends a walk's final check to the hop's
+    store_final_check without waiting on it (R42); None stores nothing."""
     started = now()
     timings = {}
     budget = RUN_BUDGET_S if budget_s is None else min(RUN_BUDGET_S, budget_s)
@@ -705,8 +707,10 @@ def run(event, *, db_hop, s3, bucket, gather, assemble, stt, call_llm, now=time.
     except Exception:                                 # noqa: BLE001 -- the device must hear something
         logger.exception("check_gaps: failed")
         out = _result("error", say_error())
-    if out.get("walk") and out.get("questions"):
-        _store_final_check(db_hop, (event or {}).get("caller_sub"), out, deadline, now)
+    if out.get("walk"):
+        # Every walk's final check, nothing open included: an empty list must
+        # replace an older one on the phone (R41).
+        _store_final_check(store_final_check, (event or {}).get("caller_sub"), out)
     timings["total"] = int((now() - started) * 1000)
     # Counts and timings only -- never what was said (the two-phase spec's rule).
     # A walk's unit names are his words too: only how many.
@@ -723,29 +727,22 @@ def run(event, *, db_hop, s3, bucket, gather, assemble, stt, call_llm, now=time.
     return out
 
 
-#: Below this much of RUN_BUDGET_S left, the final check is not stored (R41).
-FINAL_CHECK_STORE_MIN_S = 1.0
-
-
-def _store_final_check(db_hop, caller, out, deadline, now):
-    """The walk's open questions, as the device was given them, stored through
-    the hop (store_final_check) for the phone's list (R41). In either mode.
-    Best effort inside the run's budget: a failure is logged and never changes
-    the response or its say line. Counts only in the log."""
-    left = deadline - now()
-    if left < FINAL_CHECK_STORE_MIN_S:
-        logger.warning("check_gaps: final check not stored -- %.1f s of the budget left", left)
+def _store_final_check(send, caller, out):
+    """The walk's questions as the device was given them -- [] when nothing is
+    open -- sent to the hop's store_final_check for the phone's list (R41), in
+    either mode. Fire and forget (R42): `send` is an async invoke, never the
+    synchronous db_hop, so the answer does not wait on the write. A failure to
+    send is logged (counts only) and changes nothing."""
+    if send is None:
+        logger.warning("check_gaps: final check not stored -- no store wired")
         return
     try:
-        got = db_hop({"action": "store_final_check", "caller_sub": caller,
-                      "walk_key": out["walk"]["key"], "questions": out["questions"]}) or {}
+        send({"action": "store_final_check", "caller_sub": caller,
+              "walk_key": out["walk"]["key"], "questions": out.get("questions") or []})
     except Exception as e:                            # noqa: BLE001 -- the answer stands
-        logger.warning("check_gaps: store_final_check failed: %s", type(e).__name__)
+        logger.warning("check_gaps: store_final_check not sent: %s", type(e).__name__)
         return
-    if got.get("status") != "saved":
-        logger.warning("check_gaps: store_final_check refused: %s", got.get("error"))
-        return
-    logger.info("check_gaps: store_final_check saved questions=%d", len(out["questions"]))
+    logger.info("check_gaps: store_final_check sent questions=%d", len(out.get("questions") or []))
 
 
 def _answer(event, db_hop, s3, bucket, gather, assemble, stt, call_llm, now, timings, deadline):

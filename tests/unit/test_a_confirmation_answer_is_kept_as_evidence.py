@@ -606,7 +606,8 @@ def test_the_hop_stores_the_final_checks_questions_under_the_walks_company(monke
     key, seen = _wire_store(monkeypatch)
     with caplog.at_level(logging.INFO):
         out = hop.lambda_handler(_store(key), None)
-    assert out == {"status": "saved", "id": "fc-id", "walk_key": key, "questions": 2}
+    assert out == {"status": "saved", "id": "fc-id", "walk_key": key, "questions": 2,
+                   "skipped": 0}
     assert seen["stored"] == [{
         "company_id": SITE_CO, "user_folder": "Ben", "report_date": "2026-11-04", "walk_key": key,
         "questions": [{"kind": "not_checked", "unit": "Unit 3", "item_text": "Wall bracing",
@@ -623,14 +624,7 @@ def test_the_hop_stores_the_final_checks_questions_under_the_walks_company(monke
     ({"walk_key": "nope"}, "walk_key invalid"),
     ({"caller_sub": "someone-else"}, "unknown caller"),
     ({"questions": "all of them"}, "questions invalid"),
-    ({"questions": [{"kind": "general", "unit": "Unit 1", "item_text": "Trusses"}]},
-     "questions invalid"),
-    ({"questions": [{"kind": "not_checked", "unit": "Unit 9", "item_text": "Trusses"}]},
-     "unit not in walk"),
-    ({"questions": [{"kind": "not_checked", "unit": "Unit 1", "item_text": "Plumbing"}]},
-     "item not in checklist"),
-    ({"questions": [{"kind": "not_checked", "unit": "Unit 1", "item_text": "Trusses",
-                     "comment": 3}]}, "questions invalid"),
+    ({"questions": None}, "questions invalid"),
     ({"questions": [{"kind": "not_checked", "unit": "Unit 1", "item_text": "Trusses"}] * 401},
      "questions invalid"),
 ])
@@ -639,6 +633,36 @@ def test_a_refused_final_check_stores_nothing(monkeypatch, change, error):
     out = hop.lambda_handler(_store(key, **change), None)
     assert out.get("error") == error, out
     assert seen["stored"] == []
+
+
+def test_a_question_that_no_longer_fits_the_walk_is_skipped_not_the_rest(monkeypatch, caplog):
+    """The template edited mid-day, a unit dropped: those questions are left
+    out and counted; the others are stored."""
+    key, seen = _wire_store(monkeypatch)
+    good = {"kind": "not_checked", "unit": "Unit 1", "item_text": "Trusses", "comment": ""}
+    bad = [{"kind": "general", "unit": "Unit 1", "item_text": "Trusses"},
+           {"kind": "not_checked", "unit": "Unit 9", "item_text": "Trusses"},
+           {"kind": "not_checked", "unit": "Unit 1", "item_text": "Plumbing"},
+           {"kind": "not_checked", "unit": "Unit 1", "item_text": "Trusses", "comment": 3},
+           "not a question"]
+    with caplog.at_level(logging.INFO):
+        out = hop.lambda_handler(_store(key, questions=bad[:2] + [good] + bad[2:]), None)
+    assert out == {"status": "saved", "id": "fc-id", "walk_key": key, "questions": 1,
+                   "skipped": 5}
+    assert seen["stored"][0]["questions"] == [good]
+    assert "skipped=5" in caplog.text and "Plumbing" not in caplog.text
+
+
+def test_an_empty_final_check_is_stored_and_all_unfit_is_refused(monkeypatch):
+    """Nothing open is a list too (it must win over an older one); a list of
+    which nothing fits is not "nothing open" and is refused."""
+    key, seen = _wire_store(monkeypatch)
+    assert hop.lambda_handler(_store(key, questions=[]), None)["questions"] == 0
+    assert seen["stored"][0]["questions"] == []
+    out = hop.lambda_handler(_store(key, questions=[
+        {"kind": "not_checked", "unit": "Unit 9", "item_text": "Trusses"}]), None)
+    assert out == {"error": "no question fits the walk", "skipped": 1}
+    assert len(seen["stored"]) == 1
 
 
 def test_a_blocked_caller_stores_no_final_check(monkeypatch):
