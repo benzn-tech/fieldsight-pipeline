@@ -254,6 +254,46 @@ def test_r47_an_opening_extracted_after_a_self_keyed_later_recording_makes_one_w
                                                                  "Unit 4"]
 
 
+def test_r52_a_reclaimed_walks_on_site_answers_move_to_the_openings_key(db):
+    """B keys itself and gets an on-site No under its own key; then A's
+    opening re-claims it (R47). The answer must follow the windows to A's key
+    (R52), so the merged report keeps it. Another company's rows, and the
+    final check (served by its own key), stay where they are."""
+    import lambda_item_writer as lam
+    from repositories import walk_final_checks as wfc
+    cid, uid, tid = _setup(db)
+    other, other_uid, _ = _setup(db)
+    folder = "walk_%s" % uuid.uuid4().hex[:8]
+    a = {"name": "pre-line units 1 to 4", "kind": "pre-line", "start_at": "10:00",
+         "start_at_s": "10:00:00", "end_at": "10:20", "end_at_s": "10:20:00",
+         "end_source": "said", "start_quote": "q",
+         "units": {"names": ["Unit 1", "Unit 2", "Unit 3", "Unit 4"], "count": 4}}
+    b = {"name": "pre-line", "kind": "pre-line", "start_at": "13:00", "start_at_s": "13:00:00",
+         "end_at": "13:15", "end_at_s": "13:15:00", "end_source": "said", "start_quote": "q",
+         "entered": [{"unit": "Unit 3", "at": "13:01", "at_s": "13:01:00", "quote": "unit three"},
+                     {"unit": "Unit 4", "at": "13:08", "at_s": "13:08:00", "quote": "unit four"}]}
+    lam._store_inspections(db, cid, uid, folder, DATE, "sidB", [b])
+    key_b = units.walk_key(cid, folder, DATE, tid, "13:00:00")
+    key_a = units.walk_key(cid, folder, DATE, tid, "10:00:00")
+    mine = wa.add(db, dict(_answer(cid, uid, key_b, unit="Unit 3", answer="No", comment="gaps"),
+                           user_folder=folder))
+    theirs = wa.add(db, dict(_answer(other, other_uid, key_b), user_folder=folder))
+    fc = wfc.add(db, {"company_id": cid, "user_folder": folder, "report_date": DATE,
+                      "walk_key": key_b, "questions": []})
+
+    lam._store_inspections(db, cid, uid, folder, DATE, "sidA", [a])
+
+    def key_of(table, row_id):
+        return db.execute("SELECT walk_key FROM %s WHERE id = %%s" % table,
+                          (row_id,)).fetchone()[0]
+    assert key_of("walk_answers", mine) == key_a
+    assert [(r["unit"], r["answer"], r["comment"]) for r in wa.for_walk(db, [cid], key_a)] == [
+        ("Unit 3", "No", "gaps")]
+    assert wa.for_walk(db, [cid], key_b) == []
+    assert key_of("walk_answers", theirs) == key_b              # another company: untouched
+    assert key_of("walk_final_checks", fc) == key_b             # R52: final checks stay
+
+
 def test_r47_a_walk_with_its_own_opening_is_never_reclaimed(db):
     """A later recording that OPENS its own walk keeps it."""
     import lambda_item_writer as lam

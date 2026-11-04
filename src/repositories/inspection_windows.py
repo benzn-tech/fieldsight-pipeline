@@ -69,7 +69,8 @@ def backfill_walk(conn, company_id, user_folder, date, template_id, after_start_
     either no walk yet, or -- with `self_key` (start_at -> the key a window
     starting then would give itself) -- a walk they keyed themselves by
     entering two or more units (R47). Such a self-keyed walk is claimed whole:
-    every later window carrying its key. Returns how many rows it claimed."""
+    every later window carrying its key, and its on-site answers with it
+    (R52). Returns how many window rows it claimed."""
     where = (str(company_id), user_folder, date, str(template_id), after_start_at,
              exclude_session)
     cur = conn.execute(
@@ -89,6 +90,15 @@ def backfill_walk(conn, company_id, user_folder, date, template_id, after_start_
             "AND template_id = %s AND start_at > %s AND session <> %s "
             "AND walk_key = ANY(%s)", (walk_key,) + where + (selves,))
         n += cur.rowcount
+        # R52: the on-site answers given under the self-made key follow its
+        # windows, or the merged report drops them. In the same savepoint, in
+        # this company's folder and day. walk_final_checks are NOT re-keyed:
+        # GET /open serves the latest one by its own key.
+        conn.execute(
+            "UPDATE walk_answers SET walk_key = %s "
+            "WHERE company_id = %s AND user_folder = %s AND report_date = %s "
+            "AND walk_key = ANY(%s)",
+            (walk_key, str(company_id), user_folder, date, selves))
     return n
 
 
