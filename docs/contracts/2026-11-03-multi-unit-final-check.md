@@ -80,7 +80,8 @@ This is the case when the chosen live window has a `walk_key`. Example from `tes
 The rules:
 - **`not_covered` / `failed`** keep their step-A meaning across the whole walk. Every entry carries `unit`, so the same `n` repeats from unit to unit. Read `n` as the template's item number. It is not unique.
 - **`walk.key`** is `walk:` followed by 40 hex characters. It is the confirmation key and the phone route's `{walkKey}`. It stays the same when the walk is re-extracted.
-- **`walk.units`** are in walk order.
+- **`walk.units`** are in walk order: the units the opening named, then the units he entered, then any other unit the recording has findings for (R44). A unit he walked into and said nothing about is listed, with every item not checked.
+- **One "all good" covers one unit** (R45). The final check has no unit stretches, so an "all good" counts for a unit only when that unit has its own line saying it. Otherwise that unit's items stay open and are asked.
 - **`questions`** is everything still open, per unit in walk order. Within a unit the not-checked items come first, then the Nos, each in template order. `kind` is one of:
   - `not_checked`, asked as "pass?";
   - `confirm_no`, a No read back for confirmation, with its `comment`.
