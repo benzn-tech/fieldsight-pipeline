@@ -168,7 +168,9 @@ def _row(event, parsed, quote, answered_at):
             "item_text": event["item_text"],
             "answer": None if move else parsed["answer"],
             "comment": parsed.get("comment") or "", "move_to_unit": move,
-            "quote": quote, "answered_at": answered_at}
+            "quote": quote, "answered_at": answered_at,
+            # R36: an answer to a read-back No is the inspector's choice over the recording.
+            "asked_kind": event["kind"]}
 
 
 def handle(event, *, stt, db_write, now, requeue=None):

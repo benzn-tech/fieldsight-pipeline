@@ -7,9 +7,13 @@ answers, oldest first. `apply` lays them over `walk_checklist.build`'s output:
     "<comment> (on site, HH:MM)", its quote as the evidence;
   * agree -- the recording said the same: the recording's row stays, with
     "(confirmed on site HH:MM)";
-  * conflict -- they differ: neither silently wins. Answer is empty, the
-    Comment names both, the summary cell is Check, and the item is listed in
-    `conflicts` for the inspector to choose;
+  * override -- they differ, and the answer was given TO a read-back question
+    (`asked_kind` "confirm_no", R36): that is the inspector's explicit choice.
+    The on-site answer goes in, "<comment> (on site, HH:MM; recording: No --
+    '<quote>')", keeping the recording's basis; no conflict;
+  * conflict -- they differ on an answer to a not-checked question: neither
+    silently wins. Answer is empty, the Comment names both, the summary cell
+    is Check, and the item is listed in `conflicts` for the inspector to choose;
   * move -- `move_to_unit` is set: the source unit's No goes to the named
     unit's same item (replacing a Yes or a not-checked row, merged into a No),
     and the source item becomes not checked.
@@ -43,7 +47,6 @@ UNKNOWN_UNIT = "unit not in the walk"
 UNKNOWN_ITEM = "item not in the template"
 NOT_A_NO = "moved item is not a No"
 NO_ANSWER = "not an answer or a move"
-_ANSWERS = ("Yes", "No", "N/A")
 
 
 def _fold(text):
@@ -86,6 +89,18 @@ def _draw(row, base, site, report):
         row.update(copy.deepcopy(base["row"]))
         row["comment"] = _with(row["comment"], "(confirmed on site%s)" % (" " + at if at else ""))
         row["origin"] = "on_site"
+    elif site.get("asked_kind") == "confirm_no":
+        # R36: read back to him and answered -- his choice, the recording's basis kept.
+        rec = base["row"]
+        at = _hhmm(site)
+        basis = "recording: %s — '%s'" % (rec["answer"], rec["evidence"]) if rec["evidence"]             else "recording: %s" % rec["answer"]
+        row.update(copy.deepcopy(rec))
+        row.update(answer=site["answer"], state="answered", origin="on_site",
+                   comment=_with(site.get("comment"), "(on site%s; %s)" % (
+                       ", " + at if at else "", basis)),
+                   evidence=site.get("quote") or "", refs=[])
+        if site["answer"] != "No":
+            row.update(responsible="", due="")
     else:
         rec = base["row"]
         at = _hhmm(site)
@@ -191,7 +206,7 @@ def apply(walk, answers, items):
                 state[(unit["unit"], src["n"])] = [None, None]
                 redraw(unit, src)
                 redraw(target, dst)
-        elif a.get("answer") in _ANSWERS:
+        elif a.get("answer") in units_mod.ANSWERS:
             row = row_of(unit, text)
             state[(unit["unit"], row["n"])][1] = a
             redraw(unit, row)

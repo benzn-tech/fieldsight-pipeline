@@ -291,3 +291,39 @@ def test_a_later_window_of_the_same_recording_continues_its_walk(monkeypatch):
         {"name": "framing", "kind": "framing", "start_at": "10:30", "start_at_s": "10:30:00"}])
     first = units.walk_key("c-1", FOLDER, DAY, "t-1", "10:00:05")
     assert [r["walk_key"] for r in stored["rows"]] == [first, first]
+
+
+# ---- an on-site answer's walk facts (Tasks 11 and 12: the hop and the phone) -----
+
+def test_answer_rule_is_one_rule_for_every_writer():
+    assert units.ANSWERS == ("Yes", "No", "N/A")
+    assert units.answer_rule("Yes", None) is None
+    assert units.answer_rule(None, "Unit 2") is None
+    assert units.answer_rule("Maybe", None) == "answer invalid"
+    assert units.answer_rule(None, None) == "answer or move_to_unit required"
+    assert units.answer_rule(None, "") == "answer or move_to_unit required"
+    assert units.answer_rule("No", "Unit 2") == "answer with a move_to_unit"
+
+
+def test_the_walks_units_and_an_answers_units_are_checked_together():
+    opening = {"units": {"names": ["unit one", "Unit 2"], "count": 2}}
+    rows = [opening, {"entered": [{"unit": "lot three"}, {"unit": "Kitchen"}]}]
+    walk = units.walk_units(opening, rows)
+    assert walk == ["Unit 1", "Unit 2", "Lot 3"]
+    assert units.answer_units(walk, "unit 2") == ("Unit 2", None, None)
+    assert units.answer_units(walk, "Unit 1", "lot 3") == ("Unit 1", "Lot 3", None)
+    assert units.answer_units(walk, "Unit 9") == (None, None, units.UNIT_NOT_IN_WALK)
+    assert units.answer_units(walk, "Unit 1", "Unit 9") == (None, None, units.MOVE_NOT_IN_WALK)
+    assert units.answer_units(walk, 3) == (None, None, units.UNIT_NOT_IN_WALK)
+
+
+def test_the_walks_opening_names_its_company_or_refuses_to_guess():
+    key = units.walk_key("co-a", "Ben", "2026-11-04", "t1", "10:00:00")
+    a = {"company_id": "co-a", "report_date": "2026-11-04", "template_id": "t1",
+         "start_at": "10:00:00"}
+    b = {"company_id": "co-b", "report_date": "2026-11-04", "template_id": "t1",
+         "start_at": "11:00:00"}
+    assert units.walk_opening([b, a], "Ben", key) == (a, "co-a")
+    assert units.walk_opening([b], "Ben", key) == (b, "co-b")       # one company: its walk
+    assert units.walk_opening([b, dict(b, company_id="co-c")], "Ben", key) == (None, None)
+    assert units.WALK_KEY_RE.match(key) and not units.WALK_KEY_RE.match("walk:xyz")

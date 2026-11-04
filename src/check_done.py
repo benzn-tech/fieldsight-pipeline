@@ -361,9 +361,6 @@ def walk_questions(walk_result, items):
     return out
 
 
-_ON_SITE_ANSWERS = ("Yes", "No", "N/A")
-
-
 def _answer_unit(text):
     return units_mod.normalize_unit(text or "") or _fold(text)
 
@@ -396,7 +393,7 @@ def open_from_result(stored_walk, items, answers, queued_at):
         if a.get("move_to_unit"):
             on_site.discard((u, f))
             on_site.add((_answer_unit(a["move_to_unit"]), f))
-        elif a.get("answer") in _ON_SITE_ANSWERS:
+        elif a.get("answer") in units_mod.ANSWERS:
             on_site.add((u, f))
 
     conflicts = (stored_walk or {}).get("conflicts") or []
@@ -444,7 +441,7 @@ def open_from_result(stored_walk, items, answers, queued_at):
             elif u in names and f in by_text:
                 qs.append({"kind": "not_checked", "unit": names[u], "item_text": by_text[f],
                            "comment": ""})
-        elif a.get("answer") in _ON_SITE_ANSWERS:
+        elif a.get("answer") in units_mod.ANSWERS:
             qs, i = at(u, f)
             if i is not None:
                 qs.pop(i)

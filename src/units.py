@@ -261,6 +261,24 @@ def walk_units(opening, rows):
     return out
 
 
+#: An on-site answer (walk_answers.answer); a move has none.
+ANSWERS = ("Yes", "No", "N/A")
+#: The question an on-site answer was given to (walk_answers.asked_kind, R36).
+ASKED_KINDS = ("not_checked", "confirm_no")
+
+
+def answer_rule(answer, move_to_unit):
+    """Why an on-site answer's answer/move pair is refused, or None: an answer
+    is one of ANSWERS, or None with a move -- never both, never neither."""
+    if answer is not None and answer not in ANSWERS:
+        return "answer invalid"
+    if answer is None and not move_to_unit:
+        return "answer or move_to_unit required"
+    if answer is not None and move_to_unit:
+        return "answer with a move_to_unit"
+    return None
+
+
 UNIT_NOT_IN_WALK = "unit not in walk"
 #: walk_confirm.MOVE_NOT_IN_WALK: the device's handler answers by the next rule.
 MOVE_NOT_IN_WALK = "move_to_unit not in walk"

@@ -84,7 +84,8 @@ def _record(conn, company_id, folder, date, session, w, tpl_name, request_id, re
         "ON CONFLICT (session, template_id, start_at) DO UPDATE SET "
         "end_at = EXCLUDED.end_at, segments = EXCLUDED.segments, "
         "request_id = EXCLUDED.request_id, result_key = EXCLUDED.result_key, "
-        "check_name = EXCLUDED.check_name, walk_key = NULL, created_at = now()",
+        "check_name = EXCLUDED.check_name, walk_key = NULL, previous_result_key = NULL, "
+        "previous_queued_at = NULL, created_at = now()",
         (str(company_id), folder, date, session, str(w["template_id"]), tpl_name, w["name"],
          w["start_at"], w.get("end_at"), json.dumps(w.get("segments") or None),
          request_id, result_key))
@@ -121,7 +122,9 @@ def _record_walk(conn, company_id, folder, date, session, w, tpl_name, request_i
             "end_at = EXCLUDED.end_at, segments = EXCLUDED.segments, "
             "request_id = EXCLUDED.request_id, result_key = EXCLUDED.result_key, "
             "template_name = EXCLUDED.template_name, check_name = EXCLUDED.check_name, "
-            "created_at = now()",
+            # R37: the result it replaces stays readable while the new one is written.
+            "previous_result_key = checklist_reports.result_key, "
+            "previous_queued_at = checklist_reports.created_at, created_at = now()",
             (str(company_id), folder, date, session, str(w["template_id"]), tpl_name, w["name"],
              w["start_at"], w.get("end_at"), json.dumps(w.get("segments") or None),
              request_id, result_key, w["walk_key"]))
@@ -428,10 +431,11 @@ def for_walk(conn, folder, date, walk_key):
     """Walk `walk_key`'s report row in this folder's day (one per walk,
     uq_checklist_reports_walk), or None. Never by walk_key alone: the folder
     and day are the ones the caller was authorized for. `created_at` is when
-    it was last queued -- answers written after it are not in its result."""
+    it was last queued -- answers written after it are not in its result;
+    previous_result_key / previous_queued_at are the result it replaced (R37)."""
     return conn.cursor(row_factory=dict_row).execute(
         "SELECT id, company_id, session, template_id, start_at, request_id, result_key, "
-        "walk_key, created_at FROM checklist_reports "
+        "walk_key, created_at, previous_result_key, previous_queued_at FROM checklist_reports "
         "WHERE walk_key = %s AND user_folder = %s AND report_date = %s",
         (walk_key, folder, date)).fetchone()
 

@@ -160,9 +160,17 @@ def test_a_pass_is_written_through_the_hop_and_the_walk_report_requeued():
     assert hop_fn.calls == [{"action": "write_walk_answer", "caller_sub": "sub-1", "walk_key": KEY,
                              "unit": "Unit 3", "item_text": "Wall bracing", "answer": "Yes",
                              "comment": "", "move_to_unit": None, "quote": "pass",
-                             "answered_at": "10:14:05"}]
+                             "answered_at": "10:14:05", "asked_kind": "not_checked"}]
     assert queued == [{"status": "saved", "company_id": "c1", "folder": "Ben",
                        "date": "2026-11-04", "walk_key": KEY}]
+
+
+def test_the_question_it_answers_goes_with_the_answer():
+    """R36: an answer to a read-back No is the inspector's choice over the
+    recording, so the hop is told which kind of question it answers."""
+    out, hop_fn, _ = _run(_event(kind="confirm_no", text="pass"))
+    assert out["status"] == "saved"
+    assert (hop_fn.calls[0]["answer"], hop_fn.calls[0]["asked_kind"]) == ("Yes", "confirm_no")
 
 
 def test_the_transcript_is_stored_as_the_quote():
@@ -254,7 +262,8 @@ def test_the_event_cannot_name_a_company_folder_or_session():
     out, hop_fn, _ = _run(_event(company_id="other", folder="Someone", session="sidX",
                                  user_folder="Someone"))
     assert set(hop_fn.calls[0]) == {"action", "caller_sub", "walk_key", "unit", "item_text",
-                                    "answer", "comment", "move_to_unit", "quote", "answered_at"}
+                                    "answer", "comment", "move_to_unit", "quote", "answered_at",
+                                    "asked_kind"}
 
 
 def test_an_unknown_kind_or_missing_fields_write_nothing():
@@ -396,7 +405,14 @@ def test_the_hop_writes_the_answer_in_the_walks_company_by_the_caller(monkeypatc
                               "item_text": "Trusses", "answer": "Yes", "comment": "",
                               "move_to_unit": None, "source": "device", "quote": "pass",
                               "voice_note_id": None, "answered_at": "10:14:05",
-                              "answered_by": str(USER["id"])}]
+                              "answered_by": str(USER["id"]), "asked_kind": "not_checked"}]
+
+
+def test_the_hop_stores_the_kind_of_question_answered(monkeypatch):
+    key, seen = _wire_hop(monkeypatch)
+    assert hop.lambda_handler(_write(key, asked_kind="confirm_no", answer="Yes"),
+                              None)["status"] == "saved"
+    assert seen["added"][0]["asked_kind"] == "confirm_no"
 
 
 def test_the_hop_knows_the_entered_units_and_a_move_to_one(monkeypatch):
@@ -418,6 +434,8 @@ def test_the_hop_knows_the_entered_units_and_a_move_to_one(monkeypatch):
     ({"answer": "Maybe"}, "answer"),
     ({"answer": None, "move_to_unit": None}, "answer"),
     ({"answered_at": "10:14"}, "answered_at"),
+    ({"asked_kind": "general"}, "asked_kind invalid"),
+    ({"answer": "No", "move_to_unit": "Unit 1"}, "answer with a move_to_unit"),
 ])
 def test_the_hop_refuses_and_writes_nothing(monkeypatch, change, error):
     key, seen = _wire_hop(monkeypatch)

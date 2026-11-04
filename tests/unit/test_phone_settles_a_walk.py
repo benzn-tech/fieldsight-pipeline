@@ -93,7 +93,7 @@ def world(monkeypatch):
          "report": {"session": "sidA", "result_key": RESULT_KEY, "created_at": QUEUED,
                     "walk_key": KEY},
          "s3": S3({RESULT_KEY: _result([_unit("Unit 1"), _unit("Unit 2"), _unit("Unit 3")])}),
-         "visible": True, "self_folder": FOLDER}
+         "visible": True, "self_folder": FOLDER, "versions": [], "bodies": {}}
 
     def resolve(conn, caller, user, what="media"):
         w["what"].append(what)
@@ -114,8 +114,10 @@ def world(monkeypatch):
                         lambda conn, f, d, k: [SITE_CO] if (f, d, k) == (FOLDER, DATE, KEY) else [])
     monkeypatch.setattr(org.inspection_windows, "walk_rows",
                         lambda conn, f, k: rows if (f, k) == (FOLDER, KEY) else [])
-    monkeypatch.setattr(org.report_templates, "get_version",
-                        lambda conn, tid, v: {"body": TEMPLATE} if str(tid) == TID else None)
+    def get_version(conn, tid, v):
+        w["versions"].append(v)
+        return {"body": w["bodies"].get(v, TEMPLATE)} if str(tid) == TID else None
+    monkeypatch.setattr(org.report_templates, "get_version", get_version)
     monkeypatch.setattr(org.checklist_reports, "for_walk",
                         lambda conn, f, d, k: w["report"] if (f, d, k) == (FOLDER, DATE, KEY) else None)
     monkeypatch.setattr(org.walk_answers, "for_walk",
@@ -205,15 +207,18 @@ def test_the_company_pin_is_the_inspections_routes(world, monkeypatch):
     assert ("for_day", None, FOLDER, DATE) in world["log"]         # own folder: unrestricted
 
 
-def test_only_the_walker_or_an_admin_may_answer(world):
-    world["self_folder"] = "Someone_Else"         # e.g. a site manager who may read Ben's day
-    pm = dict(CALLER, global_role="pm", folder_name="Someone_Else")
-    assert _post(world, {"unit": "Unit 1", "item_text": "Insulation", "answer": "Yes"},
-                 caller=pm)[0] == 403
+def test_only_the_walker_may_answer(world):
+    """R38: the answers are rendered as on-site evidence, so only the person
+    who walked it gives them -- no admin, gm or platform_admin path."""
+    world["self_folder"] = "Someone_Else"         # anyone who may read Ben's day
+    for role in ("pm", "site_manager", "admin", "gm", "platform_admin"):
+        other = dict(CALLER, global_role=role, folder_name="Someone_Else")
+        assert _post(world, {"unit": "Unit 1", "item_text": "Insulation", "answer": "Yes"},
+                     caller=other) == (403, {"error": "only the person who did the walk can "
+                                                      "answer for it"}), role
     assert world["added"] == [] and world["requeued"] == []
-    admin = dict(CALLER, global_role="admin", folder_name="Someone_Else")
-    assert _post(world, {"unit": "Unit 1", "item_text": "Insulation", "answer": "Yes"},
-                 caller=admin)[0] == 201
+    world["self_folder"] = FOLDER
+    assert _post(world, {"unit": "Unit 1", "item_text": "Insulation", "answer": "Yes"})[0] == 201
 
 
 # ---- POST ------------------------------------------------------------------------
@@ -232,6 +237,8 @@ def test_an_answer_for_a_unit_outside_the_walk_is_refused(world):
               "move_to_unit": "Unit 2"}, "answer with a move_to_unit"),
             ({"unit": "Unit 1", "item_text": "Insulation", "answer": "Yes",
               "voice_note_id": "not-a-uuid"}, "voice_note_id invalid"),
+            ({"unit": "Unit 1", "item_text": "Insulation", "answer": "Yes",
+              "asked_kind": "general"}, "asked_kind invalid"),
             ({"unit": 3, "item_text": "Insulation", "answer": "Yes"}, "unit invalid")):
         assert _post(world, body) == (400, {"error": msg}), body
     assert world["added"] == [] and world["requeued"] == []
@@ -252,10 +259,17 @@ def test_a_phone_answer_is_stored_with_the_caller(world, monkeypatch):
         "unit": "Unit 1", "item_text": "Insulation", "answer": "No", "comment": "",
         "move_to_unit": None, "source": "phone", "quote": "",
         "voice_note_id": "55555555-5555-5555-5555-555555555555",
-        "answered_at": "10:31:07", "answered_by": CALLER["id"]}]
+        "answered_at": "10:31:07", "answered_by": CALLER["id"], "asked_kind": "not_checked"}]
     # The answer is durable before the report is queued again, in the walk's company.
     assert world["log"][-3:] == ["add", "commit", "requeue"]
     assert world["requeued"] == [(SITE_CO, FOLDER, DATE, KEY)]
+
+
+def test_the_question_it_answers_is_stored(world):
+    """R36: an answer to a read-back No is the inspector's choice."""
+    assert _post(world, {"unit": "Unit 1", "item_text": "Building wrap", "answer": "Yes",
+                         "asked_kind": "confirm_no"})[0] == 201
+    assert world["added"][0]["asked_kind"] == "confirm_no"
 
 
 def test_a_move_names_the_walks_unit(world):
@@ -273,6 +287,19 @@ def test_a_requeue_failure_still_keeps_the_answer(world, caplog):
     assert world["log"].index("commit") < world["log"].index("requeue")
     # counts only, never what was answered
     assert "Insulation" not in caplog.text
+    # one traceback, not two, and no second line about the same failure
+    assert sum(1 for r in caplog.records if r.exc_info) == 1
+    assert sum(1 for r in caplog.records if r.levelno >= logging.WARNING) == 1
+
+
+def test_a_requeue_that_says_why_logs_no_traceback(world, caplog, monkeypatch):
+    monkeypatch.setattr(org.checklist_reports, "requeue_walk",
+                        lambda conn, co, f, d, k: "template gone")
+    with caplog.at_level(logging.INFO):
+        status, body = _post(world, {"unit": "Unit 1", "item_text": "Insulation", "answer": "Yes"})
+    assert (status, body["requeued"]) == (201, False)
+    assert "template gone" in caplog.text
+    assert not any(r.exc_info for r in caplog.records)
 
 
 def test_an_ambiguous_walk_company_is_refused(world, monkeypatch):
@@ -294,6 +321,49 @@ def test_before_any_report_it_is_not_ready(world):
     world["report"] = {"session": "sidA", "result_key": RESULT_KEY.replace("r1", "r9"),
                        "created_at": QUEUED, "walk_key": KEY}
     assert _get(world) == (404, {"error": "not ready", "status": "pending"})
+
+
+def test_while_the_new_report_is_written_the_previous_one_is_read(world):
+    """R37: a requeue moves the old result to previous_result_key. Until the new
+    result exists the list comes from the previous one, with every answer
+    given since THAT report was queued laid over it."""
+    prev_key = RESULT_KEY.replace("r1", "r0")
+    earlier = QUEUED - timedelta(minutes=10)
+    world["s3"].objects[prev_key] = _result(
+        [_unit("Unit 1", not_covered=["Insulation", "Window flashings"]), _unit("Unit 2")])
+    world["report"] = {"session": "sidA", "result_key": RESULT_KEY.replace("r1", "r9"),
+                       "created_at": QUEUED, "walk_key": KEY,
+                       "previous_result_key": prev_key, "previous_queued_at": earlier}
+    # given after the previous report was queued (and before the new one)
+    world["answers"] = [_answer("Unit 1", "Insulation", "Yes", at=earlier + timedelta(minutes=1))]
+    status, body = _get(world)
+    assert status == 200
+    assert body["units"][0] == {"unit": "Unit 1", "items": [
+        {"item_text": "Window flashings", "kind": "not_checked", "comment": ""}]}
+    # neither written: not ready
+    del world["s3"].objects[prev_key]
+    assert _get(world) == (404, {"error": "not ready", "status": "pending"})
+    # a previous key outside the folder's day is never read
+    world["s3"].reads.clear()
+    world["report"]["previous_result_key"] = "session_report_results/Other/%s/day/r0.json" % DATE
+    assert _get(world)[0] == 404
+    assert world["s3"].reads == [RESULT_KEY.replace("r1", "r9")]
+
+
+def test_the_items_are_the_template_version_the_report_used(world):
+    v1 = {"sections": [{"key": "c", "title": "Pre-line", "kind": "checklist",
+                        "items": ["Insulation"]}]}
+    world["bodies"][1] = v1
+    res = _result([_unit("Unit 1")])
+    res["templateVersion"] = 1
+    world["s3"].objects[RESULT_KEY] = res
+    assert _get(world)[0] == 200
+    assert world["versions"] == [1]
+    # no version recorded: the current one
+    world["versions"].clear()
+    world["s3"].objects[RESULT_KEY] = _result([_unit("Unit 1")])
+    _get(world)
+    assert world["versions"] == [None]
 
 
 def test_a_result_key_outside_the_folders_day_is_never_read(world):

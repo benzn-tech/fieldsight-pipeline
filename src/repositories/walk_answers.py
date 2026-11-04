@@ -8,7 +8,7 @@ from psycopg.rows import dict_row
 
 _COLUMNS = ("company_id", "user_folder", "report_date", "walk_key", "unit", "item_text",
             "answer", "comment", "move_to_unit", "source", "quote", "voice_note_id",
-            "answered_at", "answered_by")
+            "answered_at", "answered_by", "asked_kind")
 
 
 def add(conn, row):
@@ -16,6 +16,8 @@ def add(conn, row):
     vals = {k: row.get(k) for k in _COLUMNS}
     vals["comment"] = vals["comment"] or ""
     vals["quote"] = vals["quote"] or ""
+    # The question it answers (R36): a read-back No's answer is the inspector's choice.
+    vals["asked_kind"] = vals["asked_kind"] or "not_checked"
     for k in ("company_id", "voice_note_id", "answered_by"):
         vals[k] = str(vals[k]) if vals[k] else None
     new_id = conn.execute(

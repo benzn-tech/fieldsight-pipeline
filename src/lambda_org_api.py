@@ -5279,13 +5279,11 @@ def get_day_inspections(conn, caller, date, event):
 # POST /days/{date}/inspections/walks/{walkKey}/answers?user=  -- one answer or a move
 #
 # Read exactly as get_day_inspections reads the day's checks. Answering is for the person
-# who walked it, or a company admin -- the photo selection's write rule
-# (_photo_selection_folder): being able to read someone's day is not being able to
-# answer for them. Company, folder and walk come from the path, the authorized folder
-# and the walk's own windows, never from the body.
+# who walked it and nobody else (R38): the answers are rendered as on-site evidence, so
+# being able to read someone's day -- as an admin, gm or platform_admin too -- is not
+# being able to answer for them. Company, folder and walk come from the path, the
+# authorized folder and the walk's own windows, never from the body.
 
-_WALK_ANSWER_ROLES = _SELECTION_WRITE_ROLES
-_WALK_ANSWERS = ("Yes", "No", "N/A")
 _QUEUED_REQUEST_RE = re.compile(r"^[0-9a-f]{32}$")       # day_report_generate's requestId
 
 
@@ -5323,12 +5321,42 @@ def _phone_walk(conn, caller, date, key, event):
             "opening": opening, "company": company}, None
 
 
-def _walk_template_body(conn, walk):
-    """The walk's checklist template, current version (every window of a walk
-    is on the same template: the key names it)."""
+def _walk_template_body(conn, walk, version=None):
+    """The walk's checklist template (every window of a walk is on the same
+    template: the key names it), at `version`, else -- None, or a version no
+    longer there -- the current one."""
     tid = next((r["template_id"] for r in walk["rows"] if r.get("template_id")), None)
-    version = report_templates.get_version(conn, tid, None) if tid else None
-    return (version or {}).get("body") or {}
+    if not tid:
+        return {}
+    row = report_templates.get_version(conn, tid, version) if version is not None else None
+    if not (row or {}).get("body"):
+        row = report_templates.get_version(conn, tid, None)
+    return (row or {}).get("body") or {}
+
+
+def _result_version(result):
+    """The template version a stored report was written with, or None."""
+    v = result.get("templateVersion")
+    try:
+        return int(v) if v is not None and not isinstance(v, bool) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _walk_result(folder, date, result_key):
+    """(result, None) read from the lake, or (None, "pending") when it is not
+    written yet. Only a result under this folder's day is read; any other key
+    reads as (None, None). AccessDenied (a missing IAM grant) is raised, never
+    "nothing open"."""
+    if not (result_key or "").startswith("session_report_results/%s/%s/" % (folder, date)):
+        return None, None
+    try:
+        obj = s3().get_object(Bucket=LAKE_BUCKET, Key=result_key)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in _LAKE_NOT_FOUND_CODES:
+            return None, "pending"
+        raise
+    return json.loads(obj["Body"].read().decode("utf-8")), None
 
 
 def get_walk_open_items(conn, caller, date, key, event):
@@ -5339,9 +5367,11 @@ def get_walk_open_items(conn, caller, date, key, event):
 
     From the LATEST walk report (its checklist_reports row -> result_key -> the
     stored `walk`), with the answers given since it was queued laid over it.
-    404 {"error": "not ready"} while there is no finished walk report -- none
-    yet, or the re-queued one still being written (`status`: pending) -- and the
-    device's final-check list is what the phone shows (Task 13)."""
+    While a re-queued report is still being written, from the one it replaced
+    (previous_result_key, R37), with every answer since THAT one was queued.
+    404 {"error": "not ready"} when neither is there -- and the device's
+    final-check list is what the phone shows (Task 13). Items are the template
+    version the report was written with (`templateVersion`), else the current."""
     walk, err = _phone_walk(conn, caller, date, key, event)
     if err is not None:
         return err
@@ -5351,26 +5381,25 @@ def get_walk_open_items(conn, caller, date, key, event):
         rep = None
     if not rep:
         return error("not ready", 404)
-    result_key = rep.get("result_key") or ""
-    if not result_key.startswith("session_report_results/%s/%s/" % (folder, date)):
-        logger.warning("walk %s: its report result is not under its folder's day -- not read", key)
-        return error("not ready", 404)
-    try:
-        obj = s3().get_object(Bucket=LAKE_BUCKET, Key=result_key)
-    except ClientError as e:
-        # Only a missing result is "not yet". AccessDenied (a missing IAM grant) is raised,
-        # never an empty list: the phone would read it as "nothing open".
-        if e.response.get("Error", {}).get("Code") in _LAKE_NOT_FOUND_CODES:
-            return error("not ready", 404, {"status": "pending"})
-        raise
-    result = json.loads(obj["Body"].read().decode("utf-8"))
+    result, status = _walk_result(folder, date, rep.get("result_key"))
+    queued_at = rep.get("created_at")
+    if result is None and status == "pending" and rep.get("previous_result_key"):
+        previous, _ = _walk_result(folder, date, rep["previous_result_key"])
+        if previous is not None and previous.get("status") == "done":
+            result, queued_at = previous, rep.get("previous_queued_at")
+    if result is None:
+        if status is None:
+            logger.warning("walk %s: its report result is not under its folder's day -- not read",
+                           key)
+            return error("not ready", 404)
+        return error("not ready", 404, {"status": status})
     stored = result.get("walk") if isinstance(result.get("walk"), dict) else None
     if result.get("status") != "done" or not stored or stored.get("key") != key:
         return error("not ready", 404, {"status": result.get("status") or "pending"})
-    found = walk_report.the_checklist(_walk_template_body(conn, walk))
+    found = walk_report.the_checklist(_walk_template_body(conn, walk, _result_version(result)))
     answers = walk_answers.for_walk(conn, walk["companies"], key)
     units_open = check_done.open_from_result(stored, found[1] if found else [], answers,
-                                             rep.get("created_at"))
+                                             queued_at)
     logger.info("walk open items: units=%d open=%d answers=%d", len(units_open),
                 sum(len(u["items"]) for u in units_open), len(answers))
     return ok({"walkKey": key, "units": units_open})
@@ -5378,19 +5407,20 @@ def get_walk_open_items(conn, caller, date, key, event):
 
 def _requeue_after_answer(conn, walk):
     """checklist_reports.requeue_walk in-process (R17), after the answer is
-    committed. True when a report was queued. A failure is logged and costs
-    only the re-queue: the answer is already durable."""
+    committed. True when a report was queued. A failure is logged once and
+    costs only the re-queue: the answer is already durable."""
     from psycopg import pq
+    got, logged = None, False
     try:
         got = checklist_reports.requeue_walk(conn, walk["company"], walk["folder"],
                                              walk["date"], walk["key"])
     except Exception:
         logger.exception("walk %s: report not re-queued after a phone answer", walk["key"])
-        got = None
+        logged = True
     if conn.info.transaction_status == pq.TransactionStatus.INERROR:
         conn.rollback()
     queued = isinstance(got, str) and bool(_QUEUED_REQUEST_RE.match(got))
-    if not queued:
+    if not queued and not logged:
         logger.warning("walk %s: report not re-queued after a phone answer (%s)",
                        walk["key"], got)
     return queued
@@ -5399,31 +5429,33 @@ def _requeue_after_answer(conn, walk):
 def post_walk_answer(conn, caller, date, key, event):
     """POST /api/org/days/{date}/inspections/walks/{walkKey}/answers?user= --
     body {"unit", "item_text", "answer": "Yes" | "No" | "N/A" | null,
-    "voice_note_id"?, "move_to_unit"?}: one walk_answers row, source 'phone', by
-    the caller, in the walk's company (R22); then the walk report queued again
-    (R17). The unit and move target must be units of the walk and the item an
-    item of its checklist -- the device hop's checks (units.answer_units,
-    checklist.item_in). 201 {"status": "saved", "id", "walkKey", "requeued"}."""
+    "voice_note_id"?, "move_to_unit"?, "asked_kind"?: "not_checked" |
+    "confirm_no"}: one walk_answers row, source 'phone', by the caller -- the
+    walker only (R38) -- in the walk's company (R22); then the walk report
+    queued again (R17). The unit and move target must be units of the walk and
+    the item an item of its checklist -- the device hop's checks
+    (units.answer_rule, units.answer_units, checklist.item_in). `asked_kind` is
+    the question answered (R36), not_checked when absent.
+    201 {"status": "saved", "id", "walkKey", "requeued"}."""
     walk, err = _phone_walk(conn, caller, date, key, event)
     if err is not None:
         return err
     folder, key = walk["folder"], walk["key"]
-    own = folder == scope.visible_scope(conn, caller).get("self_folder")
-    if not own and caller.get("global_role") not in _WALK_ANSWER_ROLES:
-        return error("only the person who did the walk, or an admin, can answer for it", 403)
+    if folder != scope.visible_scope(conn, caller).get("self_folder"):
+        return error("only the person who did the walk can answer for it", 403)
     body = parse_body(event)
     if body is None:
         return error("malformed JSON body", 400)
-    for k in ("unit", "item_text", "move_to_unit", "voice_note_id"):
+    for k in ("unit", "item_text", "move_to_unit", "voice_note_id", "asked_kind"):
         if body.get(k) is not None and not isinstance(body.get(k), str):
             return error("%s invalid" % k, 400)
     answer, move = body.get("answer"), body.get("move_to_unit") or None
-    if answer is not None and answer not in _WALK_ANSWERS:
-        return error("answer invalid", 400)
-    if answer is None and not move:
-        return error("answer or move_to_unit required", 400)
-    if answer is not None and move:
-        return error("answer with a move_to_unit", 400)
+    why = units_mod.answer_rule(answer, move)
+    if why:
+        return error(why, 400)
+    asked = body.get("asked_kind") or "not_checked"
+    if asked not in units_mod.ASKED_KINDS:
+        return error("asked_kind invalid", 400)
     voice = body.get("voice_note_id") or None
     if voice is not None:
         voice = _uuid_or_none(voice)
@@ -5445,10 +5477,11 @@ def post_walk_answer(conn, caller, date, key, event):
             "walk_key": key, "unit": unit, "item_text": item, "answer": answer, "comment": "",
             "move_to_unit": target, "source": "phone", "quote": "", "voice_note_id": voice,
             "answered_at": nz_time.nz_now().strftime("%H:%M:%S"),
-            "answered_by": str(caller["id"])})
+            "answered_by": str(caller["id"]), "asked_kind": asked})
     conn.commit()        # durable BEFORE the re-queue, which must not be able to undo it
     requeued = _requeue_after_answer(conn, walk)
-    logger.info("walk answer saved: source=phone move=%s requeued=%s", bool(target), requeued)
+    logger.info("walk answer saved: source=phone asked=%s move=%s requeued=%s", asked,
+                bool(target), requeued)
     return ok({"status": "saved", "id": new_id, "walkKey": key, "requeued": requeued}, 201)
 
 

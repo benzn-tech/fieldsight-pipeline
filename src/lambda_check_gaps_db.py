@@ -21,7 +21,8 @@ Result: {"user": {id, company_id, folder_name} | None,
 
 Event:  {"action": "write_walk_answer", "caller_sub", "walk_key", "unit", "item_text",
          "answer": "Yes" | "No" | "N/A" | None, "comment", "move_to_unit" | None,
-         "quote", "answered_at": "HH:MM:SS"}   (multi-unit walks, Task 11, R4/R31)
+         "quote", "answered_at": "HH:MM:SS",
+         "asked_kind": "not_checked" | "confirm_no" (default not_checked, R36)}   (multi-unit walks, Task 11, R4/R31)
 Result: {"status": "saved", "id", "company_id", "folder", "date", "walk_key"}
         or {"error": "..."} with nothing written.
         The hop's only write: one walk_answers row, committed. It checks first
@@ -53,7 +54,6 @@ SESSION_WINDOW_S = 300
 
 WALK_KEY_RE = units_mod.WALK_KEY_RE
 HMS_RE = re.compile(r"^\d{2}:\d{2}:\d{2}$")
-ANSWERS = ("Yes", "No", "N/A")
 #: walk_confirm.MOVE_NOT_IN_WALK: the device's handler answers by the next rule.
 MOVE_NOT_IN_WALK = units_mod.MOVE_NOT_IN_WALK
 MAX_QUOTE = 4000
@@ -190,12 +190,13 @@ def write_walk_answer(conn, event):
     if not isinstance(key, str) or not WALK_KEY_RE.match(key):
         return {"error": "walk_key invalid"}
     answer, move = event.get("answer"), event.get("move_to_unit")
-    if answer is not None and answer not in ANSWERS:
-        return {"error": "answer invalid"}
-    if answer is None and not move:
-        return {"error": "answer or move_to_unit required"}
-    if answer is not None and move:
-        return {"error": "answer with a move_to_unit"}
+    why = units_mod.answer_rule(answer, move)
+    if why:
+        return {"error": why}
+    # The question answered (R36); an event from before the field is a not-checked one.
+    asked = event.get("asked_kind") or "not_checked"
+    if asked not in units_mod.ASKED_KINDS:
+        return {"error": "asked_kind invalid"}
     at = event.get("answered_at")
     if not isinstance(at, str) or not HMS_RE.match(at):
         return {"error": "answered_at invalid"}
@@ -237,7 +238,8 @@ def write_walk_answer(conn, event):
         "unit": unit, "item_text": item, "answer": answer,
         "comment": (event.get("comment") or "")[:MAX_COMMENT], "move_to_unit": target,
         "source": "device", "quote": (event.get("quote") or "")[:MAX_QUOTE],
-        "voice_note_id": None, "answered_at": at, "answered_by": str(user["id"])})
+        "voice_note_id": None, "answered_at": at, "answered_by": str(user["id"]),
+        "asked_kind": asked})
     return {"status": "saved", "id": new_id, "company_id": company, "folder": folder,
             "date": date, "walk_key": key}
 

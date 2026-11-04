@@ -257,3 +257,50 @@ def test_a_move_merged_into_a_no_keeps_that_nos_source():
                                   _ans("Unit 1", "Handrail fixed", None, move="Unit 3")], ITEMS)
     row = _row(_unit(got, "Unit 3"), 2)
     assert row["answer"] == "No" and row["origin"] == "on_site"
+
+
+# ---- R36: an answer to a read-back No is the inspector's choice ------------------
+
+def test_a_yes_to_a_read_back_no_overrides_the_recording_and_keeps_its_basis():
+    got = overlay.apply(_walk(), [dict(_ans("Unit 1", "Handrail fixed", "Yes", comment="fixed now",
+                                            quote="pass"), asked_kind="confirm_no")], ITEMS)
+    u1 = _unit(got, "Unit 1")
+    r = _row(u1, 2)
+    assert (r["answer"], r["state"], r["origin"]) == ("Yes", "answered", "on_site")
+    assert r["comment"] == ("fixed now (on site, 10:20; recording: No — "
+                            "'Handrail on the stairs is loose, needs fixing')")
+    assert r["evidence"] == "pass"
+    assert got["conflicts"] == [] and u1["report"]["conflicts"] == []
+    assert u1["report"]["gaps"]["failed"] == []
+    assert got["summary"]["rows"][0][2] == "Yes"
+
+
+def test_a_read_back_answer_with_no_comment_still_names_the_recording():
+    got = overlay.apply(_walk(), [dict(_ans("Unit 2", "Smoke alarm installed", "N/A"),
+                                       asked_kind="confirm_no")], ITEMS)
+    r = _row(_unit(got, "Unit 2"), 1)
+    assert (r["answer"], r["state"]) == ("N/A", "answered")
+    assert r["comment"] == ("(on site, 10:20; recording: No — "
+                            "'no smoke alarm fitted in the hallway')")
+
+
+def test_only_an_answer_to_a_not_checked_question_raises_a_conflict():
+    for kind in (None, "not_checked"):
+        a = _ans("Unit 1", "Handrail fixed", "Yes")
+        if kind:
+            a["asked_kind"] = kind
+        got = overlay.apply(_walk(), [a], ITEMS)
+        assert _row(_unit(got, "Unit 1"), 2)["state"] == "check", kind
+
+
+def test_a_read_back_no_answered_on_site_is_not_asked_again():
+    import check_done
+    import walk_report
+    got = overlay.apply(_walk(), [dict(_ans("Unit 1", "Handrail fixed", "Yes"),
+                                       asked_kind="confirm_no")], ITEMS)
+    asked = [(q["unit"], q["item_text"]) for q in check_done.walk_questions(got, ITEMS)]
+    assert ("Unit 1", "Handrail fixed") not in asked
+    stored = walk_report.result(got, "walk:k")
+    opened = check_done.open_from_result(stored, ITEMS, [], None)
+    assert ("Handrail fixed" not in
+            [i["item_text"] for u in opened if u["unit"] == "Unit 1" for i in u["items"]])

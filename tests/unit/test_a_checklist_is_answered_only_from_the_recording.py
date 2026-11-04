@@ -269,3 +269,16 @@ def test_a_checklist_the_model_left_out_has_every_item_not_covered():
     prose = [{"title": "Other", "paragraphs": [], "line_refs": []}]
     reports = checklist.apply(prose, tpl, TRANSCRIPT_G)
     assert [g["n"] for g in reports["Pre-pour"]["gaps"]["not_covered"]] == [1, 2, 3, 4, 5]
+
+
+def test_an_on_site_answer_names_the_templates_own_item():
+    """checklist.item_in: the device hop and the phone route both check an
+    answer's item here (multi-unit walks, Tasks 11 and 12)."""
+    tpl = {"sections": [{"title": "A", "kind": "checklist", "items": ["Wall  bracing"]},
+                        {"title": "B", "children": [
+                            {"title": "C", "kind": "checklist", "items": ["Trusses"]}]},
+                        {"title": "Notes", "items": ["Not a checklist"]}]}
+    assert checklist.item_in(tpl, " wall bracing ") == "Wall  bracing"
+    assert checklist.item_in(tpl, "TRUSSES") == "Trusses"
+    assert checklist.item_in(tpl, "Not a checklist") is None
+    assert checklist.item_in({}, "Trusses") is None

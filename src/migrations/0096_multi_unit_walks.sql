@@ -12,6 +12,10 @@ ALTER TABLE inspection_windows ADD COLUMN IF NOT EXISTS walk_key text;   -- NULL
 ALTER TABLE checklist_reports ADD COLUMN IF NOT EXISTS walk_key text;
 CREATE UNIQUE INDEX IF NOT EXISTS uq_checklist_reports_walk
   ON checklist_reports (walk_key) WHERE walk_key IS NOT NULL;
+-- Re-queueing a walk replaces its result_key; the result it replaces, and when
+-- that one was queued, stay readable while the new one is written (R37).
+ALTER TABLE checklist_reports ADD COLUMN IF NOT EXISTS previous_result_key text;
+ALTER TABLE checklist_reports ADD COLUMN IF NOT EXISTS previous_queued_at timestamptz;
 
 -- Answers given on site at the final check (device or phone). Each one is
 -- report evidence, stored with its transcript. A move ("that No was unit 3")
@@ -27,6 +31,11 @@ CREATE TABLE IF NOT EXISTS walk_answers (
   quote text NOT NULL DEFAULT '', voice_note_id uuid,
   answered_at text NOT NULL,                                 -- HH:MM:SS NZ, the day's clock
   answered_by uuid REFERENCES users(id),
+  -- The question it answers (R36): an answer to a read-back No ('confirm_no') is
+  -- the inspector's choice over the recording; only an answer to a not-checked
+  -- question can disagree with the recording.
+  asked_kind text NOT NULL DEFAULT 'not_checked'
+    CHECK (asked_kind IN ('not_checked','confirm_no')),
   created_at timestamptz NOT NULL DEFAULT now(),
   CHECK (answer IS NOT NULL OR move_to_unit IS NOT NULL)
 );
