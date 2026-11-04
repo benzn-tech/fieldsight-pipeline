@@ -373,7 +373,7 @@ def _answer_unit(text):
     return units_mod.normalize_unit(text or "") or _fold(text)
 
 
-def open_from_result(stored_walk, items, answers, queued_at):
+def open_from_result(stored_walk, items, answers, queued_at, ask_units=None):
     """What is still open on the walk, per unit in walk order -- the phone's
     list (Task 12): [{"unit", "items": [{"item_text", "kind", "comment"}]}].
 
@@ -388,7 +388,10 @@ def open_from_result(stored_walk, items, answers, queued_at):
     overlay judged them: an answer decides its (unit, item) on site; a move
     decides the target's and reopens its source. Answers after `queued_at` are
     not in the report and are laid over the list: an answer drops its
-    question, a move drops the target's and asks the source as not checked."""
+    question, a move drops the target's and asks the source as not checked.
+
+    `ask_units` (R51), when given, are the only units listed: the walk's units
+    (units.walk_units), as walk_questions takes them. None lists every unit."""
     by_text = {_fold(t): str(t) for t in items or []}
     before, after = [], []
     for a in answers or []:
@@ -428,8 +431,12 @@ def open_from_result(stored_walk, items, answers, queued_at):
             rows.append(row)
         rebuilt.append({"unit": name, "rows": rows})
 
-    asked = {u["unit"]: [] for u in rebuilt}
-    for q in walk_questions({"units": rebuilt, "conflicts": conflicts}, items):
+    # R51: only the walk's units are listed -- the ones the phone route accepts
+    # answers for, the device's ask-set. A unit only in the rows is not listed.
+    keep = None if ask_units is None else {_answer_unit(u) for u in ask_units}
+    asked = {u["unit"]: [] for u in rebuilt if keep is None or _answer_unit(u["unit"]) in keep}
+    for q in walk_questions({"units": rebuilt, "conflicts": conflicts}, items,
+                            ask_units=ask_units):
         asked[q["unit"]].append(q)
     return _laid_over(asked, after, by_text)
 
@@ -995,8 +1002,11 @@ def _walk_result(walk, tpl, items, paragraphs, transcript_text, check, covered_u
     ask = units_mod.walk_units({"units": walk.get("units")}, [{"entered": walk.get("entered")}])
     questions = walk_questions(result, items, ask_units=ask)
     label = "the " + (tpl.get("name") or "checklist")
-    say = say_walk(label, len(items), [u["unit"] for u in units], questions, partial,
-                   (walk.get("units") or {}).get("count"))
+    # R51: the say line counts the asked units only, so "covered in all K
+    # units" is true; a row-only unit with open items is not one of the K.
+    keep = {_answer_unit(u) for u in ask}
+    say = say_walk(label, len(items), [u["unit"] for u in units if _answer_unit(u["unit"]) in keep],
+                   questions, partial, (walk.get("units") or {}).get("count"))
     return _result("ok", say, check=check, items=len(items), covered_until=covered_until,
                    partial=partial,
                    not_covered=[dict(g, unit=u["unit"]) for u in units for g in u["not_covered"]],

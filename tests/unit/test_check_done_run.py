@@ -659,6 +659,38 @@ def test_r51_every_asked_unit_is_one_the_answer_validator_accepts():
         assert cd.units_mod.answer_units(accept, q["unit"])[2] is None, q
 
 
+def test_r51_the_say_line_counts_only_the_asked_units():
+    """Units 1-3 all good; Unit 9 (rows only) has open items but is not asked,
+    so "covered in all 3 units" is true -- never "all 4"."""
+    rows = ("Unit 1 | ALL | Yes | | | | formwork is braced and plumb all good\n"
+            "Unit 2 | ALL | Yes | | | | formwork is braced and plumb all good\n"
+            "Unit 3 | ALL | Yes | | | | formwork is braced and plumb all good\n"
+            "Unit 9 | 1 | Yes | braced | | | formwork is braced and plumb\n")
+    w, _ = _r51_world()
+    w.llm_answer = WALK_HEADER + rows
+    w.earlier = [dict(w.earlier[0], text="unit one formwork is braced and plumb all good"),
+                 dict(w.earlier[0], text="unit two formwork is braced and plumb all good"),
+                 dict(w.earlier[0], text="unit three formwork is braced and plumb all good")]
+    out = w.run()
+    assert out["questions"] == [] and out["mode"] == "device"
+    assert any(g["unit"] == "Unit 9" for g in out["not_covered"])
+    assert out["say"] == ("All 3 items on the Pre-pour Inspection Checklist are covered "
+                          "in all 3 units.")
+
+
+def test_r51_a_count_only_walk_with_nothing_entered_asks_nothing():
+    """No named and no entered unit: nothing is the walk's to ask or accept.
+    The say line is pinned."""
+    w = WalkWorld(BOTH_UNITS_ROWS)
+    facts_ = walk_facts(names=())
+    facts_[WALK]["units"] = {"names": [], "count": 2}
+    w.db = facts(live_windows=[WALK_WINDOW], walk=facts_)
+    out = w.run()
+    assert [u["unit"] for u in out["walk"]["units"]] == ["Unit 1", "Unit 2"]
+    assert out["questions"] == [] and out["mode"] == "device"
+    assert out["say"] == "No unit of the Pre-pour Inspection Checklist has been heard yet."
+
+
 def test_r45_one_all_good_never_silences_another_units_questions():
     # Said once; the model tagged ALL for both units. Unit 2 is asked about.
     rows = ("Unit 1 | ALL | Yes | | | | formwork is braced and plumb all good\n"

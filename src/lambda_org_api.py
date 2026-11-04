@@ -5446,8 +5446,11 @@ def get_walk_open_items(conn, caller, date, key, event):
     else:
         found = walk_report.the_checklist(_walk_template_body(conn, walk,
                                                               _result_version(result)))
+        # R51: the units the answer route below accepts, as the device asks.
+        ask = (units_mod.walk_units(walk["opening"], walk["rows"]) if walk["opening"]
+               else [])
         units_open = check_done.open_from_result(result["walk"], found[1] if found else [],
-                                                 answers, queued_at)
+                                                 answers, queued_at, ask_units=ask)
     source = "final_check" if use_final else "report"
     logger.info("walk open items: source=%s units=%d open=%d answers=%d", source,
                 len(units_open), sum(len(u["items"]) for u in units_open), len(answers))

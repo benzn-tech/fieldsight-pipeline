@@ -450,6 +450,22 @@ def test_open_items_by_unit_from_the_latest_walk_report(world):
             {"item_text": "Building wrap", "kind": "confirm_no", "comment": ""}]}]}
 
 
+def test_r51_a_unit_seen_only_in_the_reports_rows_is_not_listed(world):
+    """The phone asks the units the device asks (R51): the walk's units --
+    opened with (Units 1, 2) or entered (Unit 3). A unit the report has only
+    from the recording's rows (Unit 9) is not listed: its answer is refused."""
+    world["s3"].objects[RESULT_KEY] = _result(
+        [_unit("Unit 1"), _unit("Unit 2"), _unit("Unit 3", not_covered=["Insulation"]),
+         _unit("Unit 9", not_covered=["Insulation", "Building wrap"])])
+    status, body = _get(world)
+    assert status == 200
+    assert [u["unit"] for u in body["units"]] == ["Unit 1", "Unit 2", "Unit 3"]
+    assert body["units"][2]["items"] == [
+        {"item_text": "Insulation", "kind": "not_checked", "comment": ""}]
+    status, _ = _post(world, {"unit": "Unit 9", "item_text": "Insulation", "answer": "Yes"})
+    assert status == 400                                    # the accept-set agrees
+
+
 def test_open_items_drop_what_was_answered(world):
     world["s3"].objects[RESULT_KEY] = _result(
         [_unit("Unit 1", not_covered=["Insulation", "Window flashings"],
@@ -491,7 +507,7 @@ def test_the_open_list_uses_the_final_checks_questions(monkeypatch):
     seen = []
     real = check_done.walk_questions
     monkeypatch.setattr(check_done, "walk_questions",
-                        lambda walk, items: seen.append(items) or real(walk, items))
+                        lambda walk, items, **kw: seen.append(items) or real(walk, items, **kw))
     out = check_done.open_from_result(
         {"key": KEY, "units": [_unit("Unit 1", not_covered=["Insulation"])], "conflicts": []},
         ITEMS, [], QUEUED)

@@ -91,7 +91,7 @@ The rules:
 - **`say`** depends on `mode`:
   - `device` with questions: the first question only, e.g. `"Unit 2: Cover to steel checked — pass?"` or `"Unit 2, Edge protection installed failed, north side — right?"`. It reads the item's text and never its number.
   - `phone`: one line, `"<N> items open across <K> units — the list is on your phone."`
-  - Nothing open: `"All 3 items on the Pre-pour Inspection Checklist are covered in both units."`. If the opening counted more units than were heard, it adds `"…; 2 of the 4 units were heard."`. If no unit was heard at all: `"No unit of … has been heard yet."`.
+  - Nothing open: `"All 3 items on the Pre-pour Inspection Checklist are covered in both units."`. If the opening counted more units than were heard, it adds `"…; 2 of the 4 units were heard."`. If no unit was heard at all: `"No unit of … has been heard yet."`. The units counted are the asked units only (R51). A unit seen only in the rows is not one of them, so a walk whose opening only gave a count, with no unit entered, says `"No unit of … has been heard yet."`.
 - **`partial` / `covered_until`** mean what they do in step A. `covered_until` is the epoch seconds the evidence reaches. A walk is also partial when it has more than 5 recordings (only the newest 5 are read), or when time ran out before every recording could be read.
   - The `"As of a minute ago, "` prefix is added to `say` **only** on the phone line and the nothing-open line. The device's first-question line never has it, even when `partial` is true.
 - The whole run stays inside `check_done.RUN_BUDGET_S` (30 s).
@@ -182,7 +182,7 @@ Both routes read the walk the way `GET /api/org/days/{date}/inspections` reads t
 
 - **Shape.** This list is grouped by unit, and its key is camelCase `walkKey`. The final-check `questions` is a **flat** list with `unit` on each entry. The kinds and the order are the same in both, because both are built by `check_done.walk_questions`.
 - **Source.** `source` says where the list came from. The route serves the newer of two lists (R41):
-  - `"report"`: the latest **finished** walk report. While a re-queued report is still being written, or if it failed, this is the newest finished report it replaced (up to 5 back, R39).
+  - `"report"`: the latest **finished** walk report. While a re-queued report is still being written, or if it failed, this is the newest finished report it replaced (up to 5 back, R39). Only units the walk opened with or entered are listed, the same units the device asks about (R51). A unit the report has only from the recording's rows is not listed, because its answer would be refused.
   - `"final_check"`: the walk's latest final check. Every final check stores its questions, an empty list when nothing is open (the `questions` of the device's response, as the device got them; `walk_final_checks`). A question that no longer fits the walk is left out: for example, the template was edited mid-day. This list is served when it is newer than the chosen report's queue time, or when no report has finished. A final check's time is when it was pressed (the request's `pressed_at`), not when the asynchronous store landed, so a late retried store never outranks a newer list. So **right after the final check the list is there**, before any walk report exists. Every unit of the walk is listed in walk order, and units with nothing open get `"items": []`.
 
   Either way, every answer given after that list was made is laid over it:
