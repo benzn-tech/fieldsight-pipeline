@@ -1,0 +1,296 @@
+{
+  "gold": "blind agent labels + owner adjudication (owner wins)",
+  "measured_on": "2026-11-04",
+  "sets": {
+    "prod": {
+      "bars": {
+        "admission_drift": {
+          "metric": 0.5727969348659004,
+          "tolerance": 0.5818965517241379,
+          "verdict": "pass"
+        },
+        "agent_owner_agreement": {
+          "agreement": 0.9534883720930233,
+          "n": 43,
+          "usable_alone": true,
+          "verdict": "pass"
+        },
+        "carry_recall": {
+          "carry_recall": 0.9898734177215189,
+          "text_only_recall": 0.8113924050632911,
+          "verdict": "pass"
+        },
+        "hard_negative_wrong_carries": {
+          "by_session": {
+            "s01": {
+              "pairs": 85,
+              "wrong": 0
+            },
+            "s03": {
+              "pairs": 44,
+              "wrong": 0
+            },
+            "s08": {
+              "pairs": 27,
+              "wrong": 0
+            },
+            "s09": {
+              "pairs": 25,
+              "wrong": 0
+            }
+          },
+          "pairs": 181,
+          "verdict": "pass",
+          "wrong": 0
+        },
+        "latency_p90": {
+          "n": 90,
+          "p90_ms": 7315,
+          "verdict": "pass"
+        },
+        "transcript_support": {
+          "baseline_only_share": 0.02197802197802198,
+          "baseline_only_total": 728,
+          "block_only_share": 0.0028169014084507044,
+          "block_only_total": 710,
+          "verdict": "pass"
+        },
+        "wrong_carries": {
+          "accepted": 193,
+          "by_session": {
+            "s01": {
+              "accepted": 65,
+              "wrong": 0
+            },
+            "s03": {
+              "accepted": 26,
+              "wrong": 0
+            },
+            "s04": {
+              "accepted": 7,
+              "wrong": 0
+            },
+            "s06": {
+              "accepted": 2,
+              "wrong": 0
+            },
+            "s07": {
+              "accepted": 4,
+              "wrong": 0
+            },
+            "s08": {
+              "accepted": 17,
+              "wrong": 0
+            },
+            "s09": {
+              "accepted": 40,
+              "wrong": 0
+            },
+            "s10": {
+              "accepted": 10,
+              "wrong": 0
+            },
+            "s12": {
+              "accepted": 22,
+              "wrong": 0
+            }
+          },
+          "verdict": "pass",
+          "wrong": 0
+        }
+      },
+      "context": {
+        "drift_cells": 29,
+        "final_pass_n": {
+          "baseline": 87,
+          "with_block": 90
+        },
+        "final_pass_p90_ms": {
+          "baseline": 125971,
+          "with_block": 133286
+        },
+        "gold": "agent+owner",
+        "owner_labels_applied": 45,
+        "owner_labels_dropped_stale_prior": 0,
+        "unsupported_overall": {
+          "baseline": {
+            "total": 944,
+            "unsupported": 17
+          },
+          "with_block": {
+            "total": 881,
+            "unsupported": 3
+          }
+        }
+      },
+      "reported": {
+        "deferred_to_exact_match": 579,
+        "false_rejects_per_guard": {
+          "echo": 2,
+          "one_to_one": 2
+        },
+        "hallucinated_alias_rate": 0.0,
+        "label_rate": 0.9822784810126582,
+        "pre_guard_claim_precision": 1.0
+      },
+      "verdict": "pass"
+    },
+    "test": {
+      "bars": {
+        "admission_drift": {
+          "metric": 1.2019230769230769,
+          "tolerance": 1.2115384615384615,
+          "verdict": "pass"
+        },
+        "agent_owner_agreement": {
+          "agreement": 1.0,
+          "n": 2,
+          "usable_alone": true,
+          "verdict": "pass"
+        },
+        "carry_recall": {
+          "carry_recall": 0.9921259842519685,
+          "text_only_recall": 0.876265466816648,
+          "verdict": "pass"
+        },
+        "hard_negative_wrong_carries": {
+          "by_session": {
+            "s02": {
+              "pairs": 5,
+              "wrong": 0
+            },
+            "s03": {
+              "pairs": 26,
+              "wrong": 0
+            },
+            "s04": {
+              "pairs": 3,
+              "wrong": 0
+            },
+            "s06": {
+              "pairs": 15,
+              "wrong": 0
+            },
+            "s08": {
+              "pairs": 19,
+              "wrong": 0
+            },
+            "s09": {
+              "pairs": 31,
+              "wrong": 0
+            },
+            "s12": {
+              "pairs": 23,
+              "wrong": 0
+            }
+          },
+          "pairs": 122,
+          "verdict": "pass",
+          "wrong": 0
+        },
+        "latency_p90": {
+          "n": 84,
+          "p90_ms": 7467,
+          "verdict": "pass"
+        },
+        "transcript_support": {
+          "baseline_only_share": 0.006756756756756757,
+          "baseline_only_total": 1628,
+          "block_only_share": 0.008454106280193236,
+          "block_only_total": 1656,
+          "verdict": "pass"
+        },
+        "wrong_carries": {
+          "accepted": 323,
+          "by_session": {
+            "s01": {
+              "accepted": 22,
+              "wrong": 0
+            },
+            "s02": {
+              "accepted": 30,
+              "wrong": 0
+            },
+            "s03": {
+              "accepted": 5,
+              "wrong": 0
+            },
+            "s04": {
+              "accepted": 20,
+              "wrong": 0
+            },
+            "s05": {
+              "accepted": 42,
+              "wrong": 0
+            },
+            "s06": {
+              "accepted": 52,
+              "wrong": 0
+            },
+            "s07": {
+              "accepted": 9,
+              "wrong": 0
+            },
+            "s08": {
+              "accepted": 68,
+              "wrong": 0
+            },
+            "s09": {
+              "accepted": 19,
+              "wrong": 0
+            },
+            "s11": {
+              "accepted": 22,
+              "wrong": 0
+            },
+            "s12": {
+              "accepted": 29,
+              "wrong": 0
+            },
+            "s13": {
+              "accepted": 5,
+              "wrong": 0
+            }
+          },
+          "verdict": "pass",
+          "wrong": 0
+        }
+      },
+      "context": {
+        "drift_cells": 26,
+        "final_pass_n": {
+          "baseline": 78,
+          "with_block": 84
+        },
+        "final_pass_p90_ms": {
+          "baseline": 142484,
+          "with_block": 149951
+        },
+        "gold": "agent+owner",
+        "owner_labels_applied": 2,
+        "owner_labels_dropped_stale_prior": 2,
+        "unsupported_overall": {
+          "baseline": {
+            "total": 2329,
+            "unsupported": 14
+          },
+          "with_block": {
+            "total": 2032,
+            "unsupported": 14
+          }
+        }
+      },
+      "reported": {
+        "deferred_to_exact_match": 1360,
+        "false_rejects_per_guard": {
+          "echo": 4
+        },
+        "hallucinated_alias_rate": 0.0,
+        "label_rate": 0.9510686164229472,
+        "pre_guard_claim_precision": 0.9976345357776464
+      },
+      "verdict": "pass"
+    }
+  },
+  "verdict": "pass"
+}
